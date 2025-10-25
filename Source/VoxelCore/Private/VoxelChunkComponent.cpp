@@ -523,24 +523,7 @@ void UVoxelChunkComponent::SnapshotNeighbors(FChunkNeighbors& Out) const
                 return EVoxelBlockID(0);
             }
 
-            auto Rank1Runtime = [&](int32 LinearIndex) -> int32
-                {
-                    const int32 WordIdx = LinearIndex >> 6;
-                    const int32 BitIdx = LinearIndex & 63;
-                    int32 Rank = 0;
-                    for (int32 w = 0; w < WordIdx; ++w)
-                    {
-                        Rank += (int32)FMath::CountBits(C.Occupancy[w]);
-                    }
-                    if (BitIdx > 0 && WordIdx < C.Occupancy.Num())
-                    {
-                        const uint64 LowerMask = (1ULL << BitIdx) - 1ULL;
-                        Rank += (int32)FMath::CountBits(C.Occupancy[WordIdx] & LowerMask);
-                    }
-                    return Rank;
-                };
-
-            const int32 Rank = Rank1Runtime(Linear);
+            const int32 Rank = UVoxelMesher::Rank1_Prefix(C, Linear);
             if ((uint32)Rank >= (uint32)C.Ids.Num())
             {
                 return EVoxelBlockID(0);
