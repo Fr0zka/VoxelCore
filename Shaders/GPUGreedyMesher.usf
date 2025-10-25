@@ -1,0 +1,169 @@
+﻿// Required for all plugin/global shaders
+#include "/Engine/Public/Platform.ush"
+
+// Shader parameters - these must be declared even though they're bound from C++
+StructuredBuffer<uint> InVoxels;
+RWBuffer<uint> OutVerts;
+RWBuffer<uint> OutCount;
+
+uint SizeX;
+uint SizeY;
+uint SizeZ;
+uint XYScale;
+uint DefaultAO;
+
+uint Idx3D(uint x, uint y, uint z)
+{
+    return x + y * SizeX + z * SizeX * SizeY;
+}
+
+uint GetBlock(uint x, uint y, uint z)
+{
+    if (x >= SizeX || y >= SizeY || z >= SizeZ)
+        return 0u;
+    return InVoxels[Idx3D(x, y, z)] & 0xFFu;
+}
+
+bool Solid(int x, int y, int z)
+{
+    if (x < 0 || y < 0 || z < 0)
+        return false;
+
+    uint ux = (uint) x;
+    uint uy = (uint) y;
+    uint uz = (uint) z;
+
+    if (ux >= SizeX || uy >= SizeY || uz >= SizeZ)
+        return false;
+
+    return (InVoxels[Idx3D(ux, uy, uz)] & 0xFFu) != 0u;
+}
+
+uint PackVert(uint px, uint py, uint pz, uint normal, uint ao, uint block)
+{
+    px &= 63u;
+    py &= 63u;
+    pz &= 63u;
+    normal &= 7u;
+    ao &= 3u;
+    block &= 255u;
+
+    uint P = 0u;
+    P |= (px);
+    P |= (py << 6);
+    P |= (pz << 12);
+    P |= (normal << 18);
+    P |= (ao << 21);
+    P |= (block << 23);
+    return P;
+}
+
+groupshared uint FaceMask[64 * 64];
+
+void GreedyEmit(uint3 groupID, uint3 groupThreadID, int3 Base, uint3 FaceNormal, uint3 UAxis, uint3 VAxis, uint NormalCode)
+{
+    const uint lx = groupThreadID.x;
+    const uint ly = groupThreadID.y;
+    const uint threadIdx = lx + ly * 8;
+
+    if (lx < 8 && ly < 8)
+    {
+        const int3 Pos = Base + int3(lx, ly, 0);
+        const uint b = GetBlock(Pos.x, Pos.y, Pos.z);
+        const bool expose = b != 0 && !Solid(Pos.x + FaceNormal.x, Pos.y + FaceNormal.y, Pos.z + FaceNormal.z);
+        FaceMask[ly * 8 + lx] = expose ? b : 0;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (threadIdx == 0)
+    {
+        for (uint v = 0; v < 8; ++v)
+        {
+            uint u = 0;
+            while (u < 8)
+            {
+                const uint idx = v * 8 + u;
+                const uint bid = FaceMask[idx];
+                if (bid == 0)
+                {
+                    ++u;
+                    continue;
+                }
+
+                uint width = 1;
+                while (u + width < 8 && FaceMask[v * 8 + u + width] == bid)
+                    ++width;
+
+                const int3 P = Base + int3(u, v, 0);
+                const int3 F = P + int3(FaceNormal);
+                const int ao = DefaultAO;
+
+                const uint3 V0 = F;
+                const uint3 V1 = F + width * UAxis;
+                const uint3 V2 = F + width * UAxis + VAxis;
+                const uint3 V3 = F + VAxis;
+
+                uint verts[6] =
+                {
+                    PackVert(V0.x, V0.y, V0.z, NormalCode, ao, bid),
+                    PackVert(V2.x, V2.y, V2.z, NormalCode, ao, bid),
+                    PackVert(V1.x, V1.y, V1.z, NormalCode, ao, bid),
+                    PackVert(V0.x, V0.y, V0.z, NormalCode, ao, bid),
+                    PackVert(V3.x, V3.y, V3.z, NormalCode, ao, bid),
+                    PackVert(V2.x, V2.y, V2.z, NormalCode, ao, bid),
+                };
+
+                uint base;
+                InterlockedAdd(OutCount[0], 6u, base);
+                for (uint i = 0; i < 6; i++)
+                    OutVerts[base + i] = verts[i];
+
+                for (uint i = 0; i < width; ++i)
+                    FaceMask[v * 8 + u + i] = 0;
+
+                u += width;
+            }
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 GroupID : SV_GroupID, uint3 GroupThreadID : SV_GroupThreadID, uint3 DTid : SV_DispatchThreadID)
+{
+    const uint gx = GroupID.x * 8;
+    const uint gy = GroupID.y * 8;
+    const uint gz = GroupID.z;
+
+    if (gz < SizeZ)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx, gy, gz), uint3(0, 0, 1), uint3(1, 0, 0), uint3(0, 1, 0), 4); // +Z
+    }
+
+    if (gz > 0 && gz - 1 < SizeZ)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx, gy, gz - 1), uint3(0, 0, -1), uint3(1, 0, 0), uint3(0, 1, 0), 5); // -Z
+    }
+
+    if (gx < SizeX)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx, gy, gz), uint3(1, 0, 0), uint3(0, 1, 0), uint3(0, 0, 1), 0); // +X
+    }
+
+    if (gx > 0 && gx - 1 < SizeX)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx - 1, gy, gz), uint3(-1, 0, 0), uint3(0, 1, 0), uint3(0, 0, 1), 1); // -X
+    }
+
+    if (gy < SizeY)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx, gy, gz), uint3(0, 1, 0), uint3(1, 0, 0), uint3(0, 0, 1), 2); // +Y
+    }
+
+    if (gy > 0 && gy - 1 < SizeY)
+    {
+        GreedyEmit(GroupID, GroupThreadID, int3(gx, gy - 1, gz), uint3(0, -1, 0), uint3(1, 0, 0), uint3(0, 0, 1), 3); // -Y
+    }
+}
