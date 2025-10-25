@@ -474,29 +474,99 @@ void UVoxelChunkComponent::SnapshotNeighbors(FChunkNeighbors& Out) const
     Out.SizeY = (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY;
     Out.SizeZ = Settings->ChunkSizeZ;
 
-    auto CopyXBorder = [&](const TArray<EVoxelBlockID>& Src, int32 SrcSizeX, int32 SrcSizeY, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+    enum class EBorderAxis : uint8 { X, Y };
+
+    auto SampleVoxel = [&](const UVoxelChunkComponent* Chunk, int32 X, int32 Y, int32 Z) -> EVoxelBlockID
         {
-            Dst.SetNumUninitialized(Out.SizeY * Out.SizeZ);
-            int32 k = 0;
-            for (int32 z = 0; z < Out.SizeZ; ++z)
-                for (int32 y = 0; y < Out.SizeY; ++y, ++k)
+            if (!Chunk || !Chunk->Settings) return EVoxelBlockID(0);
+
+            const int32 nSizeX = (Chunk->Settings->ChunkSizeX + Chunk->LODScaleXY - 1) / Chunk->LODScaleXY;
+            const int32 nSizeY = (Chunk->Settings->ChunkSizeY + Chunk->LODScaleXY - 1) / Chunk->LODScaleXY;
+            const int32 nSizeZ = Chunk->Settings->ChunkSizeZ;
+
+            if ((uint32)X >= (uint32)nSizeX || (uint32)Y >= (uint32)nSizeY || (uint32)Z >= (uint32)nSizeZ)
+            {
+                return EVoxelBlockID(0);
+            }
+
+            if (Chunk->VoxelData.Num() > 0)
+            {
+                const int32 DenseIndex = X + Y * nSizeX + Z * nSizeX * nSizeY;
+                if (Chunk->VoxelData.IsValidIndex(DenseIndex))
                 {
-                    const int32 Index = SrcX + y * SrcSizeX + z * SrcSizeX * SrcSizeY;
-                    Dst[k] = Src[Index];
+                    return Chunk->VoxelData[DenseIndex];
                 }
-            bFlag = true;
+            }
+
+            const FCompactVoxelData& C = Chunk->Compact;
+            if (C.SizeX != nSizeX || C.SizeY != nSizeY || C.SizeZ != nSizeZ)
+            {
+                return EVoxelBlockID(0);
+            }
+
+            if (C.Occupancy.Num() == 0)
+            {
+                return EVoxelBlockID(0);
+            }
+
+            const int32 Linear = UVoxelMesher::Idx3D(X, Y, Z, C.SizeX, C.SizeY);
+            const int32 Word = Linear >> 6;
+            const int32 Bit = Linear & 63;
+            if ((uint32)Word >= (uint32)C.Occupancy.Num())
+            {
+                return EVoxelBlockID(0);
+            }
+
+            const uint64 Mask = (1ULL << Bit);
+            if ((C.Occupancy[Word] & Mask) == 0)
+            {
+                return EVoxelBlockID(0);
+            }
+
+            const int32 Rank = UVoxelMesher::Rank1_Prefix(C, Linear);
+            if ((uint32)Rank >= (uint32)C.Ids.Num())
+            {
+                return EVoxelBlockID(0);
+            }
+
+            return static_cast<EVoxelBlockID>(C.Ids[Rank]);
         };
 
-    auto CopyYBorder = [&](const TArray<EVoxelBlockID>& Src, int32 SrcSizeX, int32 SrcSizeY, int32 SrcY, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+    auto CopyBorder = [&](const UVoxelChunkComponent* Neighbor, EBorderAxis Axis, int32 NeighborCoord, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            Dst.SetNumUninitialized(Out.SizeX * Out.SizeZ);
-            int32 k = 0;
-            for (int32 z = 0; z < Out.SizeZ; ++z)
-                for (int32 x = 0; x < Out.SizeX; ++x, ++k)
-                {
-                    const int32 Index = x + SrcY * SrcSizeX + z * SrcSizeX * SrcSizeY;
-                    Dst[k] = Src[Index];
-                }
+            if (!Neighbor)
+            {
+                return;
+            }
+
+            const bool bHasDense = Neighbor->VoxelData.Num() > 0;
+            const bool bHasCompact = Neighbor->Compact.SizeX > 0 && Neighbor->Compact.SizeY > 0 && Neighbor->Compact.SizeZ > 0;
+            if (!bHasDense && !bHasCompact)
+            {
+                return;
+            }
+
+            if (Axis == EBorderAxis::X)
+            {
+                Dst.SetNumUninitialized(Out.SizeY * Out.SizeZ);
+                int32 k = 0;
+                for (int32 z = 0; z < Out.SizeZ; ++z)
+                    for (int32 y = 0; y < Out.SizeY; ++y, ++k)
+                    {
+                        Dst[k] = SampleVoxel(Neighbor, NeighborCoord, y, z);
+                    }
+            }
+            else
+            {
+                Dst.SetNumUninitialized(Out.SizeX * Out.SizeZ);
+                int32 k = 0;
+                for (int32 z = 0; z < Out.SizeZ; ++z)
+                    for (int32 x = 0; x < Out.SizeX; ++x, ++k)
+                    {
+                        Dst[k] = SampleVoxel(Neighbor, x, NeighborCoord, z);
+                    }
+            }
+
             bFlag = true;
         };
 
@@ -505,7 +575,7 @@ void UVoxelChunkComponent::SnapshotNeighbors(FChunkNeighbors& Out) const
 
     if (AVoxelWorld* W = OwnerWorld)
     {
-        auto GetIfSameLOD = [&](int dx, int dy)->UVoxelChunkComponent*
+        auto GetIfSameLOD = [&](int dx, int dy)->const UVoxelChunkComponent*
             {
                 if (UVoxelChunkComponent* N = W->GetChunk(FVoxelCoord(ChunkCoord.Cx + dx, ChunkCoord.Cy + dy, ChunkCoord.Cz)))
                 {
@@ -515,10 +585,10 @@ void UVoxelChunkComponent::SnapshotNeighbors(FChunkNeighbors& Out) const
                 return nullptr;
             };
 
-        if (UVoxelChunkComponent* N = GetIfSameLOD(-1, 0)) { CopyXBorder(N->VoxelData, SX, SY, SX - 1, Out.XNeg, Out.bHasXNeg); }
-        if (UVoxelChunkComponent* N = GetIfSameLOD(1, 0)) { CopyXBorder(N->VoxelData, SX, SY, 0, Out.XPos, Out.bHasXPos); }
-        if (UVoxelChunkComponent* N = GetIfSameLOD(0, -1)) { CopyYBorder(N->VoxelData, SX, SY, SY - 1, Out.YNeg, Out.bHasYNeg); }
-        if (UVoxelChunkComponent* N = GetIfSameLOD(0, 1)) { CopyYBorder(N->VoxelData, SX, SY, 0, Out.YPos, Out.bHasYPos); }
+        if (const UVoxelChunkComponent* N = GetIfSameLOD(-1, 0)) { CopyBorder(N, EBorderAxis::X, SX - 1, Out.XNeg, Out.bHasXNeg); }
+        if (const UVoxelChunkComponent* N = GetIfSameLOD(1, 0))  { CopyBorder(N, EBorderAxis::X, 0, Out.XPos, Out.bHasXPos); }
+        if (const UVoxelChunkComponent* N = GetIfSameLOD(0, -1)) { CopyBorder(N, EBorderAxis::Y, SY - 1, Out.YNeg, Out.bHasYNeg); }
+        if (const UVoxelChunkComponent* N = GetIfSameLOD(0, 1))  { CopyBorder(N, EBorderAxis::Y, 0, Out.YPos, Out.bHasYPos); }
     }
 }
 
@@ -557,7 +627,7 @@ void UVoxelChunkComponent::ConvertDenseToCompact(bool bForLOD0)
 
     UVoxelMesher::RebuildPrefix64(Compact);
 
-    // Free dense storage for this LOD
+    // Free dense storage for this LOD (neighbor halos now read from Compact)
     if (bForLOD0 || LOD == EVoxelLODLevel::LOD1)
         VoxelData.Empty();
 }
