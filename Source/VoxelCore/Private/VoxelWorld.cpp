@@ -4,6 +4,7 @@
 #include "VoxelMesher.h"
 #include "VoxelStats.h"
 #include "VoxelGPUMesher.h"
+#include "VoxelGPUGenerator.h"
 #include "Kismet/GameplayStatics.h"
 #include "ProceduralMeshComponent.h"
 #include "RealtimeMeshComponent.h"
@@ -68,6 +69,9 @@ void AVoxelWorld::Tick(float DeltaTime)
 
 	// Pump GPU async readbacks (decode GPU mesher results)
 	FVoxelGPUMesher::PumpAsyncReadbacks();
+
+	// Pump GPU generation jobs (decode GPU generation results)
+	FVoxelGPUGenerator::TickGPUGenerationJobs();
 
 	// Apply mesh updates to visual/collision components
 	DrainApplyQueue();

@@ -105,6 +105,13 @@ public:
 IMPLEMENT_GLOBAL_SHADER(FVoxelGenerationCS, "/Plugin/VoxelCore/VoxelGenerationCS.usf", "GenerateVoxelChunk", SF_Compute);
 
 // ============================================================================
+// STATIC MEMBERS
+// ============================================================================
+
+TArray<TSharedPtr<FVoxelGPUGenerator::FGPUGenerationJob, ESPMode::ThreadSafe>> FVoxelGPUGenerator::PendingJobs;
+FCriticalSection FVoxelGPUGenerator::JobsMutex;
+
+// ============================================================================
 // PUBLIC API
 // ============================================================================
 
@@ -113,6 +120,78 @@ bool FVoxelGPUGenerator::IsGPUGenerationAvailable()
     // Check if compute shaders are supported on this platform
     // GMaxRHIFeatureLevel must be at least SM5 (ERHIFeatureLevel::SM5) for compute shaders
     return FApp::CanEverRender() && (GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5);
+}
+
+void FVoxelGPUGenerator::TickGPUGenerationJobs()
+{
+    QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelGPU_TickGeneration);
+
+    TArray<TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>> CompletedJobs;
+
+    {
+        FScopeLock Lock(&JobsMutex);
+
+        // Check each pending job
+        for (int32 Index = PendingJobs.Num() - 1; Index >= 0; --Index)
+        {
+            TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = PendingJobs[Index];
+            if (!Job.IsValid() || !Job->Readback)
+            {
+                PendingJobs.RemoveAtSwap(Index);
+                continue;
+            }
+
+            // Check if readback is ready (non-blocking)
+            if (!Job->Readback->IsReady())
+            {
+                continue; // Not ready yet - check next frame
+            }
+
+            // Readback is ready - move to completed list
+            PendingJobs.RemoveAtSwap(Index);
+            CompletedJobs.Add(Job);
+        }
+    }
+
+    // Process completed jobs (lock and copy data on render thread)
+    for (TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>& Job : CompletedJobs)
+    {
+        if (!Job.IsValid())
+            continue;
+
+        TArray<uint8> CategoryData;
+        CategoryData.SetNumUninitialized(Job->BufferSizeBytes);
+
+        FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
+
+        // Enqueue render command to lock and copy data (Lock MUST be on render thread)
+        FRHIGPUBufferReadback* ReadbackPtr = Job->Readback.Get();
+        int32 BufferSize = Job->BufferSizeBytes;
+
+        ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
+            [ReadbackPtr, BufferSize, &CategoryData, ReadbackDone](FRHICommandListImmediate& RHICmdList)
+            {
+                const uint32* BufferPtr = (const uint32*)ReadbackPtr->Lock(BufferSize);
+                if (BufferPtr)
+                {
+                    FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSize);
+                }
+                ReadbackPtr->Unlock();
+                ReadbackDone->Trigger();
+            });
+
+        // Wait for render thread to finish copying
+        ReadbackDone->Wait();
+        FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
+
+        // Call completion callback with generated data
+        if (Job->OnComplete)
+        {
+            Job->OnComplete(MoveTemp(CategoryData));
+        }
+
+        // Readback will be cleaned up when Job is destroyed
+    }
 }
 
 void FVoxelGPUGenerator::GenerateChunkGPU(
@@ -262,42 +341,15 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     GraphBuilder.Execute();
 
-    // Poll for readback completion on game thread, then read on render thread
-    AsyncTask(ENamedThreads::GameThread, [Readback, BufferSizeBytes, OnComplete]()
-        {
-            // Poll until GPU readback is complete (IsReady is safe from game thread)
-            while (!Readback->IsReady())
-            {
-                FPlatformProcess::Sleep(0.001f); // 1ms sleep
-            }
+    // Create job to track async readback (polled each frame, non-blocking)
+    TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = MakeShared<FGPUGenerationJob, ESPMode::ThreadSafe>();
+    Job->Readback = TUniquePtr<FRHIGPUBufferReadback>(Readback);
+    Job->BufferSizeBytes = BufferSizeBytes;
+    Job->OnComplete = OnComplete;
 
-            // Readback is ready - now we must lock on render thread
-            TArray<uint8> CategoryData;
-            CategoryData.SetNumUninitialized(BufferSizeBytes);
-
-            FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
-
-            // Enqueue render command to lock and copy data (Lock MUST be on render thread)
-            ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
-                [Readback, BufferSizeBytes, &CategoryData, ReadbackDone](FRHICommandListImmediate& RHICmdList)
-                {
-                    const uint32* BufferPtr = (const uint32*)Readback->Lock(BufferSizeBytes);
-                    if (BufferPtr)
-                    {
-                        FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
-                    }
-                    Readback->Unlock();
-                    ReadbackDone->Trigger();
-                });
-
-            // Wait for render thread to finish copying
-            ReadbackDone->Wait();
-            FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
-
-            // Cleanup readback
-            delete Readback;
-
-            // Call completion callback with generated data
-            OnComplete(MoveTemp(CategoryData));
-        });
+    // Add to pending jobs list (will be polled by TickGPUGenerationJobs)
+    {
+        FScopeLock Lock(&JobsMutex);
+        PendingJobs.Add(Job);
+    }
 }

@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 #include "VoxelStructs.h"
 #include "VoxelBiome.h"
+#include "RHIGPUReadback.h"
 
 /**
  * GPU Generator - Executes voxel terrain generation on GPU using compute shaders.
@@ -22,7 +23,7 @@
  *
  * Workflow:
  * 1. Dispatch compute shader to generate voxel categories on GPU
- * 2. Async readback results to CPU (continues in background)
+ * 2. Poll for readback completion each frame (non-blocking)
  * 3. Callback when data ready - proceed to meshing
  */
 class VOXELCORE_API FVoxelGPUGenerator
@@ -58,7 +59,27 @@ public:
      */
     static bool IsGPUGenerationAvailable();
 
+    /**
+     * Tick GPU generation jobs (poll for readback completion).
+     * Call this every frame from VoxelWorld to process pending GPU jobs.
+     */
+    static void TickGPUGenerationJobs();
+
 private:
+    /**
+     * GPU generation job - tracks pending async readback.
+     */
+    struct FGPUGenerationJob
+    {
+        TUniquePtr<FRHIGPUBufferReadback> Readback;
+        int32 BufferSizeBytes = 0;
+        TFunction<void(TArray<uint8>&&)> OnComplete;
+    };
+
+    // Pending GPU generation jobs (polled each frame)
+    static TArray<TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>> PendingJobs;
+    static FCriticalSection JobsMutex;
+
     /**
      * Internal implementation - dispatches compute shader on render thread.
      */
@@ -73,3 +94,4 @@ private:
         const FBiomeTerrainParams& BiomeParams,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 };
+
