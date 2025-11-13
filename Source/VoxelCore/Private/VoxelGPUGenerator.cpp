@@ -268,15 +268,16 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->SizeY = SizeY;
     PassParameters->SizeZ = SizeZ;
 
-    // World position (account for -1 halo offset)
+    // World position (account for halo offset)
     // SizeX/Y/Z includes the halo (+2), so actual chunk size is (SizeX-2)
+    // XY halo is scaled by LODScaleXY (e.g., LOD1 chunks have 2-voxel halo in world space)
     const int32 ActualChunkSizeX = SizeX - 2;
     const int32 ActualChunkSizeY = SizeY - 2;
     const int32 ActualChunkSizeZ = SizeZ - 2;
 
-    PassParameters->BaseWX = (Coord.Cx * ActualChunkSizeX) - 1; // -1 for halo
-    PassParameters->BaseWY = (Coord.Cy * ActualChunkSizeY) - 1; // -1 for halo
-    PassParameters->BaseWZ = (Coord.Cz * ActualChunkSizeZ) - 1; // -1 for halo
+    PassParameters->BaseWX = (Coord.Cx * ActualChunkSizeX) - LODScaleXY; // Halo offset scales with LOD
+    PassParameters->BaseWY = (Coord.Cy * ActualChunkSizeY) - LODScaleXY; // Halo offset scales with LOD
+    PassParameters->BaseWZ = (Coord.Cz * ActualChunkSizeZ) - 1;          // Z halo is always 1
 
     // LOD scale
     PassParameters->LODScaleXY = LODScaleXY;

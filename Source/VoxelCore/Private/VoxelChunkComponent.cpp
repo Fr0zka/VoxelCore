@@ -122,7 +122,8 @@ void UVoxelChunkComponent::DoGeneration()
             }
         }
 
-        // Launch GPU generation
+        // Launch GPU generation (use weak pointer to safely handle component destruction)
+        TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
             Params.SizeX + 2, Params.SizeY + 2, Params.SizeZ + 2, // +2 for halo
@@ -132,33 +133,51 @@ void UVoxelChunkComponent::DoGeneration()
             Params.WaterLevel,
             Params.MaxCaveDepth,
             BiomeParams,
-            [this, Params, Coord, ScaleXY](TArray<uint8>&& GPUCategoryData)
+            [WeakThis, Params, Coord, ScaleXY](TArray<uint8>&& GPUCategoryData)
             {
+                // Check if component is still valid (might be destroyed during async generation)
+                UVoxelChunkComponent* This = WeakThis.Get();
+                if (!This || !IsValid(This))
+                {
+                    return; // Component destroyed - discard results
+                }
+
                 // GPU generation complete - copy to CategoryData
-                CategoryData.Data = MoveTemp(GPUCategoryData);
-                CategoryData.SizeX = Params.SizeX + 2;
-                CategoryData.SizeY = Params.SizeY + 2;
-                CategoryData.SizeZ = Params.SizeZ + 2;
+                This->CategoryData.Data = MoveTemp(GPUCategoryData);
+                This->CategoryData.SizeX = Params.SizeX + 2;
+                This->CategoryData.SizeY = Params.SizeY + 2;
+                This->CategoryData.SizeZ = Params.SizeZ + 2;
 
                 // Generate biome grid (still on CPU for now)
-                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);
+                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
 
-                const int64 NumBytes = CategoryData.Data.Num();
+                const int64 NumBytes = This->CategoryData.Data.Num();
                 INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
 
-                if (bCancelPending)
+                if (This->bCancelPending)
                 {
-                    AsyncTask(ENamedThreads::GameThread, [this]()
+                    AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                         {
-                            if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            if (Comp && IsValid(Comp) && IsValid(Comp->OwnerWorld))
+                            {
+                                Comp->OwnerWorld->OnGenerationFinished(Comp);
+                            }
                         });
                     return;
                 }
 
-                AsyncTask(ENamedThreads::GameThread, [this]()
+                AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                     {
-                        OnGenerationComplete();
-                        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+                        UVoxelChunkComponent* Comp = WeakThis.Get();
+                        if (Comp && IsValid(Comp))
+                        {
+                            Comp->OnGenerationComplete();
+                            if (IsValid(Comp->OwnerWorld))
+                            {
+                                Comp->OwnerWorld->OnGenerationFinished(Comp);
+                            }
+                        }
                     });
             });
 
