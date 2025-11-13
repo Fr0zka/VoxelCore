@@ -345,6 +345,11 @@ void UVoxelGenerator::GenerateChunkLOD(
     Macro.SetNumUninitialized(SX * SY);
     BiomeParamsCache.SetNum(SX * SY);
 
+    // OPTIMIZATION: Cache density values between Z iterations to avoid redundant Density3D calls
+    // DUp at Z becomes D at Z+1, cutting ~50% of expensive density evaluations in narrow band
+    TArray<float> DensityCache; // Stores DUp from previous Z iteration
+    DensityCache.Init(TNumericLimits<float>::Lowest(), SX * SY); // Sentinel: invalid cache
+
     for (int32 y = 0; y < SY; ++y)
     {
         const int32 WY = BaseWY + y * LODScaleXY;
@@ -388,6 +393,7 @@ void UVoxelGenerator::GenerateChunkLOD(
                 if (D0 < -Margin)
                 {
                     OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
@@ -418,14 +424,28 @@ void UVoxelGenerator::GenerateChunkLOD(
                     {
                         OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
                     }
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
-                // Narrow band: evaluate full density
-                const float D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
+                // NARROW BAND: Evaluate full density (with caching to avoid redundant calls)
+                // Try to reuse density from previous Z iteration (DUp from Z-1 becomes D at Z)
+                float D;
+                const float CachedDensity = DensityCache[xyIdx];
+                if (CachedDensity > TNumericLimits<float>::Lowest())
+                {
+                    // Cache hit: reuse DUp from previous Z iteration
+                    D = CachedDensity;
+                }
+                else
+                {
+                    // Cache miss: compute fresh density
+                    D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
+                }
                 if (D <= 0.f)
                 {
                     OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
@@ -438,11 +458,13 @@ void UVoxelGenerator::GenerateChunkLOD(
                 if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                 {
                     OutData[Index] = EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
-                // Check if this is a surface
+                // Check if this is a surface (compute DUp and cache for next Z iteration)
                 const float DUp = N.Density3D_FromMacro_Biome((float)WX, (float)WY, ZUp, M, BiomeParams);
+                DensityCache[xyIdx] = DUp; // Store for next Z iteration
                 const bool bSurface = (DUp <= 0.f);
 
                 const UVoxelBiomeDef* B = BiomeAtXY[rowOffset + x];
