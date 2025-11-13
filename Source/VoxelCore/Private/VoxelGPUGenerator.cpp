@@ -262,22 +262,37 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     GraphBuilder.Execute();
 
-    // Poll for readback completion on game thread
+    // Poll for readback completion on game thread, then read on render thread
     AsyncTask(ENamedThreads::GameThread, [Readback, BufferSizeBytes, OnComplete]()
         {
-            // Poll until GPU readback is complete (non-blocking)
+            // Poll until GPU readback is complete (IsReady is safe from game thread)
             while (!Readback->IsReady())
             {
                 FPlatformProcess::Sleep(0.001f); // 1ms sleep
             }
 
-            // Read data from GPU
+            // Readback is ready - now we must lock on render thread
             TArray<uint8> CategoryData;
             CategoryData.SetNumUninitialized(BufferSizeBytes);
 
-            const uint32* BufferPtr = (const uint32*)Readback->Lock(BufferSizeBytes);
-            FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
-            Readback->Unlock();
+            FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
+
+            // Enqueue render command to lock and copy data (Lock MUST be on render thread)
+            ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
+                [Readback, BufferSizeBytes, &CategoryData, ReadbackDone](FRHICommandListImmediate& RHICmdList)
+                {
+                    const uint32* BufferPtr = (const uint32*)Readback->Lock(BufferSizeBytes);
+                    if (BufferPtr)
+                    {
+                        FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
+                    }
+                    Readback->Unlock();
+                    ReadbackDone->Trigger();
+                });
+
+            // Wait for render thread to finish copying
+            ReadbackDone->Wait();
+            FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
 
             // Cleanup readback
             delete Readback;
