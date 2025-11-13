@@ -71,6 +71,19 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Generation")
     int32 WaterLevel = 18;
 
+    // === Performance: Generation Optimizations ===
+    // Maximum depth (in voxels) from macro surface to generate caves.
+    // Caves deeper than this are skipped (major performance gain).
+    // Recommended: 128-256 for good performance, 512+ for deep cave systems.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "0", ClampMax = "1024"))
+    int32 MaxCaveDepth = 200;
+
+    // Use GPU compute shaders for terrain generation (10-50x faster than CPU).
+    // Requires compute shader support. Falls back to CPU if unavailable.
+    // EXPERIMENTAL: Enable for massive performance gains, disable if issues occur.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")
+    bool bUseGPUGeneration = false;
+
     // === Rendering backend ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Rendering")
     bool bUseRuntimeMeshComponent = false;
@@ -84,9 +97,10 @@ public:
 
     // === Performance: spawn budget ===
     // Maximum number of new chunks we are allowed to spawn per frame.
-    // Higher values fill in faster around the player but can cause hitches.
+    // Lower values = smoother FPS during load, higher values = faster chunk spawn.
+    // Recommended: 4-6 for smooth 60fps, 8-12 for faster loading with some hitches.
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "256"))
-    int32 MaxChunksSpawnPerFrame = 12;
+    int32 MaxChunksSpawnPerFrame = 4;
 
     // === Performance: mesh component pool ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")

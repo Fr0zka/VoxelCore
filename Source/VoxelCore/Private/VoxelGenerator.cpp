@@ -222,11 +222,15 @@ void UVoxelGenerator::GenerateChunkLOD_Categories(
                     if (D > 0.f)
                     {
                         // Confirmed solid terrain - now check if cave should carve through it
-                        // Use biome-specific cave density
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        // OPTIMIZATION: Skip cave checks if too deep (major perf gain)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                             Cat = 0; // Cave carved through verified solid terrain
                         else
-                            Cat = 2; // Solid terrain
+                            Cat = 2; // Solid terrain (or too deep for caves)
                     }
                     else
                     {
@@ -241,7 +245,12 @@ void UVoxelGenerator::GenerateChunkLOD_Categories(
                     if (D > 0.f)
                     {
                         // Solid in narrow band - check for caves using biome params
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        // OPTIMIZATION: Narrow band cave checks (within MaxCaveDepth)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                             Cat = 0; // Cave carved through narrow band
                         else
                             Cat = 2; // Solid
@@ -336,6 +345,11 @@ void UVoxelGenerator::GenerateChunkLOD(
     Macro.SetNumUninitialized(SX * SY);
     BiomeParamsCache.SetNum(SX * SY);
 
+    // OPTIMIZATION: Cache density values between Z iterations to avoid redundant Density3D calls
+    // DUp at Z becomes D at Z+1, cutting ~50% of expensive density evaluations in narrow band
+    TArray<float> DensityCache; // Stores DUp from previous Z iteration
+    DensityCache.Init(TNumericLimits<float>::Lowest(), SX * SY); // Sentinel: invalid cache
+
     for (int32 y = 0; y < SY; ++y)
     {
         const int32 WY = BaseWY + y * LODScaleXY;
@@ -379,6 +393,7 @@ void UVoxelGenerator::GenerateChunkLOD(
                 if (D0 < -Margin)
                 {
                     OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
@@ -388,14 +403,19 @@ void UVoxelGenerator::GenerateChunkLOD(
                     const float D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
                     if (D > 0.f)
                     {
+                        // OPTIMIZATION: Skip cave checks if too deep below surface (major perf gain)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
                         // Confirmed solid terrain - check for caves
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                         {
                             OutData[Index] = EVoxelBlockID::Air;
                         }
                         else
                         {
-                            // Deep solid - use deepest subsurface layer (typically stone)
+                            // Deep solid (or too deep for caves) - use deepest subsurface layer (typically stone)
                             const UVoxelBiomeDef* B = BiomeAtXY[xyIdx];
                             OutData[Index] = PickSubsurfaceBlock(B, 999);
                         }
@@ -404,26 +424,47 @@ void UVoxelGenerator::GenerateChunkLOD(
                     {
                         OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
                     }
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
-                // Narrow band: evaluate full density
-                const float D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
+                // NARROW BAND: Evaluate full density (with caching to avoid redundant calls)
+                // Try to reuse density from previous Z iteration (DUp from Z-1 becomes D at Z)
+                float D;
+                const float CachedDensity = DensityCache[xyIdx];
+                if (CachedDensity > TNumericLimits<float>::Lowest())
+                {
+                    // Cache hit: reuse DUp from previous Z iteration
+                    D = CachedDensity;
+                }
+                else
+                {
+                    // Cache miss: compute fresh density
+                    D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
+                }
                 if (D <= 0.f)
                 {
                     OutData[Index] = (Z <= float(P.WaterLevel)) ? EVoxelBlockID::Water : EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
+
+                // OPTIMIZATION: Narrow band cave checks (within MaxCaveDepth)
+                const float DepthFromSurface = M - Z;
+                const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                         (DepthFromSurface <= float(P.MaxCaveDepth));
 
                 // Solid in narrow band - check for caves
-                if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                 {
                     OutData[Index] = EVoxelBlockID::Air;
+                    DensityCache[xyIdx] = TNumericLimits<float>::Lowest(); // Invalidate cache
                     continue;
                 }
 
-                // Check if this is a surface
+                // Check if this is a surface (compute DUp and cache for next Z iteration)
                 const float DUp = N.Density3D_FromMacro_Biome((float)WX, (float)WY, ZUp, M, BiomeParams);
+                DensityCache[xyIdx] = DUp; // Store for next Z iteration
                 const bool bSurface = (DUp <= 0.f);
 
                 const UVoxelBiomeDef* B = BiomeAtXY[rowOffset + x];

@@ -1454,6 +1454,12 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             Out.Normals.Add(normal); Out.Normals.Add(normal);
                             Out.Normals.Add(normal); Out.Normals.Add(normal);
 
+                            // UVs (scaled by quad size for proper texture tiling)
+                            Out.UVs.Add(FVector2D(0, 0));
+                            Out.UVs.Add(FVector2D((float)w, 0));
+                            Out.UVs.Add(FVector2D((float)w, (float)h));
+                            Out.UVs.Add(FVector2D(0, (float)h));
+
                             // AO→bytes, layer in A
                             auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
                             const uint8 AO00 = ToByte(ao00), AO10 = ToByte(ao10), AO11 = ToByte(ao11), AO01 = ToByte(ao01);
