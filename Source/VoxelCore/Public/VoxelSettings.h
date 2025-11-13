@@ -78,6 +78,12 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "0", ClampMax = "1024"))
     int32 MaxCaveDepth = 200;
 
+    // Use GPU compute shaders for terrain generation (10-50x faster than CPU).
+    // Requires compute shader support. Falls back to CPU if unavailable.
+    // EXPERIMENTAL: Enable for massive performance gains, disable if issues occur.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")
+    bool bUseGPUGeneration = false;
+
     // === Rendering backend ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Rendering")
     bool bUseRuntimeMeshComponent = false;

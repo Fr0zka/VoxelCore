@@ -1,0 +1,292 @@
+// VoxelGenerationCS.usf
+// GPU compute shader for voxel terrain generation
+// Implements the same generation logic as VoxelGenerator.cpp but runs on GPU
+
+#include "/Engine/Public/Platform.ush"
+#include "VoxelNoiseGPU.ush"
+
+// ============================================================================
+// SHADER PARAMETERS
+// ============================================================================
+
+// Chunk dimensions
+uint SizeX;
+uint SizeY;
+uint SizeZ;
+
+// World position offset
+int BaseWX;
+int BaseWY;
+int BaseWZ;
+
+// LOD scale (for LOD1 chunks, XY is scaled by this)
+uint LODScaleXY;
+
+// Generation settings
+int WorldSeed;
+int BaseHeight;
+int WaterLevel;
+int MaxCaveDepth;
+
+// Biome terrain parameters
+float HeightAmplitude;
+float HeightFrequency;
+int HeightOctaves;
+float HeightLacunarity;
+float HeightGain;
+
+float MountainAmplitude;
+float MountainFrequency;
+float MountainThreshold;
+float MountainSharpness;
+
+float OverhangAmplitude;
+float OverhangFrequency;
+
+float WarpAmplitude;
+float WarpFrequency;
+
+float IslandAmplitude;
+float IslandFrequency;
+float IslandThreshold;
+
+float CaveDensity;
+float CaveFrequency2D;
+int CaveOctaves2D;
+float CaveLacunarity2D;
+float CaveGain2D;
+float CaveFrequency3D;
+int CaveOctaves3D;
+
+// Output buffer - voxel categories (2 bits per voxel packed into bytes)
+RWStructuredBuffer<uint> OutCategories;
+
+// ============================================================================
+// GENERATION FUNCTIONS
+// ============================================================================
+
+// Custom 2D fBm matching CPU implementation
+float Sample01_2D_Custom(float x, float y, int octaves)
+{
+    float sum = 0.0;
+    float maxAmp = 0.0;
+    float amp = 1.0;
+    float freq = 1.0;
+
+    for (int i = 0; i < octaves; ++i)
+    {
+        sum += PerlinNoise2D(x * freq, y * freq) * amp;
+        maxAmp += amp;
+        freq *= HeightLacunarity;
+        amp *= HeightGain;
+    }
+
+    // Normalize to [0,1]
+    return (sum / maxAmp) * 0.5 + 0.5;
+}
+
+// Compute macro surface height using biome parameters
+float MacroSurfaceZ_Biome(float x, float y)
+{
+    // Base terrain height
+    float n01 = Sample01_2D_Custom(x * HeightFrequency, y * HeightFrequency, HeightOctaves);
+    float H2D = BaseHeight + (n01 - 0.5) * 2.0 * HeightAmplitude;
+
+    // Mountains
+    if (MountainAmplitude > 0.0)
+    {
+        float r = Ridged2D(
+            x * MountainFrequency + WorldSeed * 0.13,
+            y * MountainFrequency + WorldSeed * 0.19
+        );
+
+        float band = max(0.0, r - MountainThreshold);
+        float shaped = pow(band, MountainSharpness);
+        float M = MountainAmplitude * shaped;
+
+        H2D += M;
+    }
+
+    return H2D;
+}
+
+// Check if a voxel is carved by caves
+bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
+{
+    if (CaveDensity <= 0.0)
+        return false;
+
+    float depth = terrainH - zWorld;
+    if (depth < 2.0)
+        return false;
+
+    // Surface modifier
+    float surf = clamp(1.0 - depth / 24.0, 0.0, 1.0);
+
+    // 2D cave mask
+    float sx = x * CaveFrequency2D;
+    float sy = y * CaveFrequency2D;
+    float sum = 0.0;
+    float maxAmp = 0.0;
+    float amp = 1.0;
+    float freq = 1.0;
+
+    for (int i = 0; i < CaveOctaves2D; ++i)
+    {
+        sum += PerlinNoise2D(sx * freq, sy * freq) * amp;
+        maxAmp += amp;
+        freq *= CaveLacunarity2D;
+        amp *= CaveGain2D;
+    }
+
+    float t2d = (sum / maxAmp) * 0.5 + 0.5;
+    float th2d = 0.68 - 0.10 * surf;
+
+    bool mask = (t2d > th2d / CaveDensity);
+    if (!mask)
+        return false;
+
+    // 3D cave tube
+    float sx3d = x * CaveFrequency3D;
+    float sy3d = y * CaveFrequency3D;
+    float sz3d = zWorld * CaveFrequency3D;
+    float sum3d = 0.0;
+    float maxAmp3d = 0.0;
+    float amp3d = 1.0;
+    float freq3d = 1.0;
+
+    for (int j = 0; j < CaveOctaves3D; ++j)
+    {
+        sum3d += PerlinNoise3D(sx3d * freq3d, sy3d * freq3d, sz3d * freq3d) * amp3d;
+        maxAmp3d += amp3d;
+        freq3d *= CaveLacunarity2D;
+        amp3d *= CaveGain2D;
+    }
+
+    float n3d = abs(sum3d / maxAmp3d);
+    float k = clamp(depth / 96.0, 0.0, 1.0);
+    float rad = lerp(0.12, 0.20, k);
+
+    return (n3d < rad);
+}
+
+// Compute 3D density at a world position
+float Density3D_FromMacro_Biome(float x, float y, float zWorld, float macroHeight)
+{
+    // Domain warp
+    float3 pw = DomainWarp3D(x, y, zWorld, WarpAmplitude, WarpFrequency, WorldSeed);
+
+    // Overhangs
+    float Overhang = OverhangAmplitude * PerlinNoise3D(
+        pw.x * OverhangFrequency,
+        pw.y * OverhangFrequency,
+        pw.z * OverhangFrequency
+    );
+
+    // Floating islands
+    float iband = 1.0 - clamp(abs(zWorld - 200.0) / max(1.0, 100.0), 0.0, 1.0);
+    float islandField = 1.0 - abs(PerlinNoise3D(
+        pw.x * IslandFrequency + 11.3,
+        pw.y * IslandFrequency + 27.1,
+        pw.z * IslandFrequency - 5.7
+    ));
+    float Islands = iband * ((islandField - IslandThreshold) * IslandAmplitude);
+
+    // Combine
+    float D = macroHeight - zWorld;
+    D += Overhang;
+
+    // Only union islands if floating above macro surface
+    if (zWorld >= macroHeight + 6.0)
+    {
+        D = max(D, Islands);
+    }
+
+    return D;
+}
+
+// ============================================================================
+// MAIN COMPUTE SHADER
+// ============================================================================
+
+[numthreads(4, 4, 4)]
+void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (ThreadId.x >= SizeX || ThreadId.y >= SizeY || ThreadId.z >= SizeZ)
+        return;
+
+    // Compute world position
+    int WX = BaseWX + (int)ThreadId.x * (int)LODScaleXY;
+    int WY = BaseWY + (int)ThreadId.y * (int)LODScaleXY;
+    int WZ = BaseWZ + (int)ThreadId.z;
+
+    float Z = (float)WZ;
+
+    // Compute macro surface height
+    float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
+
+    // Compute margin for narrow band optimization
+    float Margin = OverhangAmplitude + IslandAmplitude + 3.0;
+    float D0 = M - Z;
+
+    uint Category = 0;
+
+    // Far above surface - air or water
+    if (D0 < -Margin)
+    {
+        Category = (Z <= (float)WaterLevel) ? 1 : 0;
+    }
+    // Deep below surface - could be solid or cave
+    else if (D0 > Margin)
+    {
+        float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M);
+        if (D > 0.0)
+        {
+            // OPTIMIZATION: Skip cave checks if too deep
+            float DepthFromSurface = M - Z;
+            bool bCheckCaves = (CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
+
+            if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z, M))
+                Category = 0; // Cave
+            else
+                Category = 2; // Solid
+        }
+        else
+        {
+            Category = (Z <= (float)WaterLevel) ? 1 : 0;
+        }
+    }
+    // Narrow band - full density evaluation
+    else
+    {
+        float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M);
+        if (D > 0.0)
+        {
+            // OPTIMIZATION: Narrow band cave checks
+            float DepthFromSurface = M - Z;
+            bool bCheckCaves = (CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
+
+            if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z, M))
+                Category = 0; // Cave
+            else
+                Category = 2; // Solid
+        }
+        else
+        {
+            Category = (Z <= (float)WaterLevel) ? 1 : 0;
+        }
+    }
+
+    // Pack category into output buffer (2 bits per voxel)
+    uint LinearIndex = ThreadId.x + ThreadId.y * SizeX + ThreadId.z * SizeX * SizeY;
+    uint ByteIndex = LinearIndex / 4;
+    uint BitOffset = (LinearIndex % 4) * 2;
+
+    // Atomic operation to set the 2-bit category
+    uint Mask = 3u << BitOffset;
+    uint Value = Category << BitOffset;
+
+    InterlockedAnd(OutCategories[ByteIndex], ~Mask);
+    InterlockedOr(OutCategories[ByteIndex], Value);
+}
