@@ -71,6 +71,13 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Generation")
     int32 WaterLevel = 18;
 
+    // === Performance: Generation Optimizations ===
+    // Maximum depth (in voxels) from macro surface to generate caves.
+    // Caves deeper than this are skipped (major performance gain).
+    // Recommended: 128-256 for good performance, 512+ for deep cave systems.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "0", ClampMax = "1024"))
+    int32 MaxCaveDepth = 200;
+
     // === Rendering backend ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Rendering")
     bool bUseRuntimeMeshComponent = false;

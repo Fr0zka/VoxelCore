@@ -222,11 +222,15 @@ void UVoxelGenerator::GenerateChunkLOD_Categories(
                     if (D > 0.f)
                     {
                         // Confirmed solid terrain - now check if cave should carve through it
-                        // Use biome-specific cave density
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        // OPTIMIZATION: Skip cave checks if too deep (major perf gain)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                             Cat = 0; // Cave carved through verified solid terrain
                         else
-                            Cat = 2; // Solid terrain
+                            Cat = 2; // Solid terrain (or too deep for caves)
                     }
                     else
                     {
@@ -241,7 +245,12 @@ void UVoxelGenerator::GenerateChunkLOD_Categories(
                     if (D > 0.f)
                     {
                         // Solid in narrow band - check for caves using biome params
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        // OPTIMIZATION: Narrow band cave checks (within MaxCaveDepth)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                             Cat = 0; // Cave carved through narrow band
                         else
                             Cat = 2; // Solid
@@ -388,14 +397,19 @@ void UVoxelGenerator::GenerateChunkLOD(
                     const float D = N.Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M, BiomeParams);
                     if (D > 0.f)
                     {
+                        // OPTIMIZATION: Skip cave checks if too deep below surface (major perf gain)
+                        const float DepthFromSurface = M - Z;
+                        const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                                 (DepthFromSurface <= float(P.MaxCaveDepth));
+
                         // Confirmed solid terrain - check for caves
-                        if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                        if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                         {
                             OutData[Index] = EVoxelBlockID::Air;
                         }
                         else
                         {
-                            // Deep solid - use deepest subsurface layer (typically stone)
+                            // Deep solid (or too deep for caves) - use deepest subsurface layer (typically stone)
                             const UVoxelBiomeDef* B = BiomeAtXY[xyIdx];
                             OutData[Index] = PickSubsurfaceBlock(B, 999);
                         }
@@ -415,8 +429,13 @@ void UVoxelGenerator::GenerateChunkLOD(
                     continue;
                 }
 
+                // OPTIMIZATION: Narrow band cave checks (within MaxCaveDepth)
+                const float DepthFromSurface = M - Z;
+                const bool bCheckCaves = (BiomeParams.CaveDensity > 0.f) &&
+                                         (DepthFromSurface <= float(P.MaxCaveDepth));
+
                 // Solid in narrow band - check for caves
-                if (N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
+                if (bCheckCaves && N.IsCave_Biome((float)WX, (float)WY, Z, M, BiomeParams))
                 {
                     OutData[Index] = EVoxelBlockID::Air;
                     continue;
