@@ -283,30 +283,12 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint ByteIndex = LinearIndex / 4;
     uint BitOffset = (LinearIndex % 4) * 2;
 
-    // Use atomic CompareExchange to safely set 2-bit category
-    // This is needed because 4 voxels share the same uint32
-    uint Value = Category << BitOffset;
-    uint Mask = 3u << BitOffset;
-
-    // Atomic read-modify-write loop (safe for concurrent access)
-    // HLSL InterlockedCompareExchange signature:
-    // void InterlockedCompareExchange(dest, compare_value, value, out original_value)
-    uint OldValue;
-    uint NewValue;
-    uint OriginalValue;
-
-    InterlockedOr(OutCategories[ByteIndex], 0, OldValue); // Read current value atomically
-
-    do
+    // Fast atomic write (buffer is pre-cleared to zero)
+    // Category 0 (air) is already zero, so skip write
+    // For non-zero categories, just OR the bits in atomically
+    if (Category != 0)
     {
-        NewValue = (OldValue & ~Mask) | Value;
-        InterlockedCompareExchange(OutCategories[ByteIndex], OldValue, NewValue, OriginalValue);
-
-        // If OriginalValue == OldValue, the exchange succeeded
-        // Otherwise, retry with the new value we just read
-        if (OriginalValue == OldValue)
-            break;
-
-        OldValue = OriginalValue;
-    } while (true);
+        uint Value = Category << BitOffset;
+        InterlockedOr(OutCategories[ByteIndex], Value);
+    }
 }
