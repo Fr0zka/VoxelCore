@@ -122,18 +122,24 @@ void UVoxelChunkComponent::DoGeneration()
             }
         }
 
+        // Calculate LOD-scaled grid size (CRITICAL: must match CPU path!)
+        // For LOD1+, the grid is reduced: fewer voxels cover the same world space
+        const int32 ScaledSizeX = (Params.SizeX + ScaleXY - 1) / ScaleXY;
+        const int32 ScaledSizeY = (Params.SizeY + ScaleXY - 1) / ScaleXY;
+        const int32 ScaledSizeZ = Params.SizeZ;
+
         // Launch GPU generation (use weak pointer to safely handle component destruction)
         TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
-            Params.SizeX + 2, Params.SizeY + 2, Params.SizeZ + 2, // +2 for halo
+            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2, // +2 for halo
             ScaleXY,
             Params.Seed,
             Params.BaseHeight,
             Params.WaterLevel,
             Params.MaxCaveDepth,
             BiomeParams,
-            [WeakThis, Params, Coord, ScaleXY](TArray<uint8>&& GPUCategoryData)
+            [WeakThis, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
             {
                 // Check if component is still valid (might be destroyed during async generation)
                 UVoxelChunkComponent* This = WeakThis.Get();
@@ -144,9 +150,9 @@ void UVoxelChunkComponent::DoGeneration()
 
                 // GPU generation complete - copy to CategoryData
                 This->CategoryData.Data = MoveTemp(GPUCategoryData);
-                This->CategoryData.SizeX = Params.SizeX + 2;
-                This->CategoryData.SizeY = Params.SizeY + 2;
-                This->CategoryData.SizeZ = Params.SizeZ + 2;
+                This->CategoryData.SizeX = ScaledSizeX + 2;
+                This->CategoryData.SizeY = ScaledSizeY + 2;
+                This->CategoryData.SizeZ = ScaledSizeZ + 2;
 
                 // Generate biome grid (still on CPU for now)
                 UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);

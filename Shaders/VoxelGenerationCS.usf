@@ -216,21 +216,41 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     if (ThreadId.x >= SizeX || ThreadId.y >= SizeY || ThreadId.z >= SizeZ)
         return;
 
-    // Compute world position
-    int WX = BaseWX + (int)ThreadId.x * (int)LODScaleXY;
-    int WY = BaseWY + (int)ThreadId.y * (int)LODScaleXY;
-    int WZ = BaseWZ + (int)ThreadId.z;
+    // Compute world position (accounting for -1 halo padding)
+    // ThreadId ranges from [0, SizeX-1] but represents voxel indices [-1, SizeX-2]
+    // BaseWX/Y/Z = world coordinate of chunk origin (voxel index 0)
+    int WX = BaseWX + ((int)ThreadId.x - 1) * (int)LODScaleXY;
+    int WY = BaseWY + ((int)ThreadId.y - 1) * (int)LODScaleXY;
+    int WZ = BaseWZ + ((int)ThreadId.z - 1);
 
     float Z = (float)WZ;
 
+    uint Category = 0;
+
+    // DEBUG: Simple flat terrain at BaseHeight to verify coordinates
+    // Uncomment this block and comment out the full generation below for testing
+    /*
+    if (WZ <= BaseHeight)
+    {
+        Category = 2; // Solid
+    }
+    else if (WZ <= WaterLevel)
+    {
+        Category = 1; // Water
+    }
+    else
+    {
+        Category = 0; // Air
+    }
+    */
+
+    // FULL GENERATION (production code):
     // Compute macro surface height
     float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
 
     // Compute margin for narrow band optimization
     float Margin = OverhangAmplitude + IslandAmplitude + 3.0;
     float D0 = M - Z;
-
-    uint Category = 0;
 
     // Far above surface - air or water
     if (D0 < -Margin)

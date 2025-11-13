@@ -268,16 +268,23 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->SizeY = SizeY;
     PassParameters->SizeZ = SizeZ;
 
-    // World position (account for halo offset)
-    // SizeX/Y/Z includes the halo (+2), so actual chunk size is (SizeX-2)
-    // XY halo is scaled by LODScaleXY (e.g., LOD1 chunks have 2-voxel halo in world space)
-    const int32 ActualChunkSizeX = SizeX - 2;
-    const int32 ActualChunkSizeY = SizeY - 2;
-    const int32 ActualChunkSizeZ = SizeZ - 2;
+    // World position calculation
+    // SizeX/Y/Z includes the +2 halo, so (SizeX-2) = actual voxel grid size
+    // Chunk world size = voxel grid size * LOD scale
+    // Example: LOD0 has 16 voxels covering 16 world units (16*1=16)
+    //          LOD1 has 8 voxels covering 16 world units (8*2=16)
+    const int32 VoxelGridSizeX = SizeX - 2;
+    const int32 VoxelGridSizeY = SizeY - 2;
+    const int32 VoxelGridSizeZ = SizeZ - 2;
 
-    PassParameters->BaseWX = (Coord.Cx * ActualChunkSizeX) - LODScaleXY; // Halo offset scales with LOD
-    PassParameters->BaseWY = (Coord.Cy * ActualChunkSizeY) - LODScaleXY; // Halo offset scales with LOD
-    PassParameters->BaseWZ = (Coord.Cz * ActualChunkSizeZ) - 1;          // Z halo is always 1
+    const int32 ChunkWorldSizeX = VoxelGridSizeX * LODScaleXY;
+    const int32 ChunkWorldSizeY = VoxelGridSizeY * LODScaleXY;
+    const int32 ChunkWorldSizeZ = VoxelGridSizeZ; // Z never scales
+
+    // BaseWX/Y/Z = world coordinate of the chunk origin (matches CPU calculation)
+    PassParameters->BaseWX = Coord.Cx * ChunkWorldSizeX;
+    PassParameters->BaseWY = Coord.Cy * ChunkWorldSizeY;
+    PassParameters->BaseWZ = Coord.Cz * ChunkWorldSizeZ;
 
     // LOD scale
     PassParameters->LODScaleXY = LODScaleXY;
