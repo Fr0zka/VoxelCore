@@ -120,7 +120,7 @@ void UVoxelMacroTileComponent::DoGeneration()
 			{
 				AsyncTask(ENamedThreads::GameThread, [this]()
 					{
-						if (OwnerWorld) OwnerWorld->OnGenerationFinished(this);
+						if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
 					});
 				return;
 			}
@@ -133,7 +133,7 @@ void UVoxelMacroTileComponent::DoGeneration()
 					HF_SamplesY = SY;
 
 					State = EVoxelChunkState::Meshing;
-					if (OwnerWorld)
+					if (IsValid(OwnerWorld))
 					{
 						OwnerWorld->OnGenerationFinished(this);
 						OwnerWorld->ScheduleMeshing(this, /*bSeamRemesh=*/false);

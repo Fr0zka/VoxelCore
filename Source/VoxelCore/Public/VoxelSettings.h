@@ -84,9 +84,10 @@ public:
 
     // === Performance: spawn budget ===
     // Maximum number of new chunks we are allowed to spawn per frame.
-    // Higher values fill in faster around the player but can cause hitches.
+    // Lower values = smoother FPS during load, higher values = faster chunk spawn.
+    // Recommended: 4-6 for smooth 60fps, 8-12 for faster loading with some hitches.
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "256"))
-    int32 MaxChunksSpawnPerFrame = 12;
+    int32 MaxChunksSpawnPerFrame = 4;
 
     // === Performance: mesh component pool ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")

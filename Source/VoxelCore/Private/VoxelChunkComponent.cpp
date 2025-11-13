@@ -130,7 +130,7 @@ void UVoxelChunkComponent::DoGeneration()
             {
                 AsyncTask(ENamedThreads::GameThread, [this]()
                     {
-                        if (OwnerWorld) OwnerWorld->OnGenerationFinished(this);
+                        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
                     });
                 return;
             }
@@ -138,7 +138,7 @@ void UVoxelChunkComponent::DoGeneration()
             AsyncTask(ENamedThreads::GameThread, [this]()
                 {
                     OnGenerationComplete();
-                    if (OwnerWorld) OwnerWorld->OnGenerationFinished(this);
+                    if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
                 });
         });
 }
@@ -176,7 +176,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     {
         UE_LOG(LogTemp, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
             ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, CategoryData.Data.Num(), HeightData.Num());
-        if (OwnerWorld) OwnerWorld->OnMeshingFinished(this);
+        if (IsValid(OwnerWorld)) OwnerWorld->OnMeshingFinished(this);
         return;
     }
 
@@ -499,7 +499,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 UVoxelMesher::BuildHeightfieldMesh(HCopy, SamplesX, SamplesY, ChunkSizeX, ChunkSizeY, XYScale, VoxelUU, Buffers);
             }
 
-            if (W)
+            if (IsValid(W))
             {
                 W->OnMeshingFinished(this);
                 W->EnqueueMeshApply(this, MoveTemp(Buffers), bCollision, bSeamRemesh, Seq);
