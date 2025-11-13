@@ -1,0 +1,385 @@
+// GPU GREEDY VOXEL MESHER - FIXED VERSION
+// Pass 1: Count faces per voxel (parallel)
+// Pass 2: Emit faces using prefix-scanned offsets (parallel, no atomics)
+
+#include "/Engine/Public/Platform.ush"
+
+// ============================================================================
+// SHADER PARAMETERS
+// ============================================================================
+StructuredBuffer<uint> InVoxels;
+RWStructuredBuffer<uint> OutVerts;
+RWBuffer<uint> OutCount;
+uint MaxVerts;
+uint DisableGreedyMerge;
+uint DirectionMask;
+uint IgnoreNeighbors;
+uint NeighborLayoutX;
+uint NeighborLayoutY;
+uint NeighborLayoutZ;
+StructuredBuffer<uint> Offsets;
+
+uint SizeX;
+uint SizeY;
+uint SizeZ;
+uint XYScale;
+uint DefaultAO;
+
+uint bHasNeighborXN;
+uint bHasNeighborXP;
+uint bHasNeighborYN;
+uint bHasNeighborYP;
+uint bHasNeighborZN;
+uint bHasNeighborZP;
+
+StructuredBuffer<uint> NeighborXN;
+StructuredBuffer<uint> NeighborXP;
+StructuredBuffer<uint> NeighborYN;
+StructuredBuffer<uint> NeighborYP;
+StructuredBuffer<uint> NeighborZN;
+StructuredBuffer<uint> NeighborZP;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+uint Idx3D(uint x, uint y, uint z)
+{
+    return x + y * SizeX + z * SizeX * SizeY;
+}
+
+uint GetCategoryGlobal(int x, int y, int z)
+{
+    // Inside volume - primary path
+    if (x >= 0 && x < (int) SizeX && y >= 0 && y < (int) SizeY && z >= 0 && z < (int) SizeZ)
+    {
+        return InVoxels[Idx3D((uint) x, (uint) y, (uint) z)] & 0xFFu;
+    }
+    
+    // Handle Z-axis neighbors first (top/bottom)
+    if (z < 0)
+    {
+        // Bottom neighbor (-Z)
+        if (bHasNeighborZN != 0u && x >= 0 && x < (int) SizeX && y >= 0 && y < (int) SizeY)
+        {
+            // ZN neighbor stores the TOP slice of the chunk below us
+            // So we need the XY position as-is
+            uint idx = (uint) x + (uint) y * SizeX;
+            return NeighborZN[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+    
+    if (z >= (int) SizeZ)
+    {
+        // Top neighbor (+Z)
+        if (bHasNeighborZP != 0u && x >= 0 && x < (int) SizeX && y >= 0 && y < (int) SizeY)
+        {
+            // ZP neighbor stores the BOTTOM slice of the chunk above us
+            // So we need the XY position as-is
+            uint idx = (uint) x + (uint) y * SizeX;
+            return NeighborZP[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+
+    // Handle X-axis neighbors (left/right)
+    if (x < 0)
+    {
+        // Left neighbor (-X)
+        if (bHasNeighborXN != 0u && y >= 0 && y < (int) SizeY && z >= 0 && z < (int) SizeZ)
+        {
+            // XN neighbor stores the rightmost YZ slice of the chunk to our left
+            // Layout can vary based on NeighborLayoutX
+            uint idx = (NeighborLayoutX == 0u)
+                ? ((uint) y + (uint) z * SizeY) // YZ layout
+                : ((uint) z + (uint) y * SizeZ); // ZY layout
+            return NeighborXN[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+    
+    if (x >= (int) SizeX)
+    {
+        // Right neighbor (+X)
+        if (bHasNeighborXP != 0u && y >= 0 && y < (int) SizeY && z >= 0 && z < (int) SizeZ)
+        {
+            // XP neighbor stores the leftmost YZ slice of the chunk to our right
+            uint idx = (NeighborLayoutX == 0u)
+                ? ((uint) y + (uint) z * SizeY) // YZ layout
+                : ((uint) z + (uint) y * SizeZ); // ZY layout
+            return NeighborXP[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+
+    // Handle Y-axis neighbors (front/back)
+    if (y < 0)
+    {
+        // Back neighbor (-Y)
+        if (bHasNeighborYN != 0u && x >= 0 && x < (int) SizeX && z >= 0 && z < (int) SizeZ)
+        {
+            // YN neighbor stores the frontmost XZ slice of the chunk behind us
+            uint idx = (NeighborLayoutY == 0u)
+                ? ((uint) x + (uint) z * SizeX) // XZ layout
+                : ((uint) z + (uint) x * SizeZ); // ZX layout
+            return NeighborYN[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+    
+    if (y >= (int) SizeY)
+    {
+        // Front neighbor (+Y)
+        if (bHasNeighborYP != 0u && x >= 0 && x < (int) SizeX && z >= 0 && z < (int) SizeZ)
+        {
+            // YP neighbor stores the backmost XZ slice of the chunk in front of us
+            uint idx = (NeighborLayoutY == 0u)
+                ? ((uint) x + (uint) z * SizeX) // XZ layout
+                : ((uint) z + (uint) x * SizeZ); // ZX layout
+            return NeighborYP[idx] & 0xFFu;
+        }
+        return 0u; // Air if no neighbor data
+    }
+
+    // Shouldn't reach here, but return air as fallback
+    return 0u;
+}
+
+uint PackVert(uint px, uint py, uint pz, uint normal, uint block)
+{
+    uint P = 0u;
+    P |= (px & 0x7Fu);
+    P |= ((py & 0x7Fu) << 7);
+    P |= ((pz & 0x7Fu) << 14);
+    P |= ((normal & 0x7u) << 21);
+    P |= ((block & 0xFFu) << 24);
+    return P;
+}
+
+void WriteFace(
+    inout uint BaseIndex,
+    uint3 Origin,
+    uint3 SpanU,
+    uint3 SpanV,
+    uint NormalCode,
+    uint Block)
+{
+    uint3 corner0 = Origin;
+    uint3 corner1 = Origin + SpanU;
+    uint3 corner2 = Origin + SpanU + SpanV;
+    uint3 corner3 = Origin + SpanV;
+
+    uint p0 = PackVert(corner0.x, corner0.y, corner0.z, NormalCode, Block);
+    uint p1 = PackVert(corner1.x, corner1.y, corner1.z, NormalCode, Block);
+    uint p2 = PackVert(corner2.x, corner2.y, corner2.z, NormalCode, Block);
+    uint p3 = PackVert(corner3.x, corner3.y, corner3.z, NormalCode, Block);
+
+    uint packedVerts[4] = { p0, p1, p2, p3 };
+    uint idx0, idx1, idx2, idx3, idx4, idx5;
+
+    // Winding order per face direction (matches CPU greedy mesher)
+    switch (NormalCode & 7u)
+    {
+        case 0u: // +X
+            idx0 = 0u;
+            idx1 = 2u;
+            idx2 = 1u;
+            idx3 = 0u;
+            idx4 = 3u;
+            idx5 = 2u;
+            break;
+        case 1u: // -X
+            idx0 = 0u;
+            idx1 = 1u;
+            idx2 = 2u;
+            idx3 = 0u;
+            idx4 = 2u;
+            idx5 = 3u;
+            break;
+        case 2u: // +Y
+            idx0 = 0u;
+            idx1 = 1u;
+            idx2 = 2u;
+            idx3 = 0u;
+            idx4 = 2u;
+            idx5 = 3u;
+            break;
+        case 3u: // -Y
+            idx0 = 0u;
+            idx1 = 2u;
+            idx2 = 1u;
+            idx3 = 0u;
+            idx4 = 3u;
+            idx5 = 2u;
+            break;
+        case 4u: // +Z
+            idx0 = 0u;
+            idx1 = 2u;
+            idx2 = 1u;
+            idx3 = 0u;
+            idx4 = 3u;
+            idx5 = 2u;
+            break;
+        default: // -Z (5)
+            idx0 = 0u;
+            idx1 = 1u;
+            idx2 = 2u;
+            idx3 = 0u;
+            idx4 = 2u;
+            idx5 = 3u;
+            break;
+    }
+
+    OutVerts[BaseIndex + 0u] = packedVerts[idx0];
+    OutVerts[BaseIndex + 1u] = packedVerts[idx1];
+    OutVerts[BaseIndex + 2u] = packedVerts[idx2];
+    OutVerts[BaseIndex + 3u] = packedVerts[idx3];
+    OutVerts[BaseIndex + 4u] = packedVerts[idx4];
+    OutVerts[BaseIndex + 5u] = packedVerts[idx5];
+    BaseIndex += 6u;
+}
+
+// ============================================================================
+// PASS 1: COUNT ELEMENTS PER VOXEL
+// ============================================================================
+[numthreads(8, 8, 8)]
+void CountElementsCS(uint3 GroupID : SV_GroupID, uint3 LocalID : SV_GroupThreadID)
+{
+    uint3 tid = GroupID * uint3(8, 8, 8) + LocalID;
+    uint x = tid.x, y = tid.y, z = tid.z;
+    if (x >= SizeX || y >= SizeY || z >= SizeZ)
+        return;
+
+    uint idx = Idx3D(x, y, z);
+    uint cat = InVoxels[idx] & 0xFFu;
+    
+    // Air voxels never generate faces
+    if (cat == 0u)
+    {
+        OutCount[idx] = 0u;
+        return;
+    }
+
+    // Check all 6 neighbors for face generation
+    uint neighCats[6];
+    if (IgnoreNeighbors != 0u)
+    {
+        // Aggressive culling mode: treat all out-of-bounds as air
+        neighCats[0] = (x > 0u) ? (InVoxels[Idx3D(x - 1u, y, z)] & 0xFFu) : 0u;
+        neighCats[1] = (x < SizeX - 1u) ? (InVoxels[Idx3D(x + 1u, y, z)] & 0xFFu) : 0u;
+        neighCats[2] = (y > 0u) ? (InVoxels[Idx3D(x, y - 1u, z)] & 0xFFu) : 0u;
+        neighCats[3] = (y < SizeY - 1u) ? (InVoxels[Idx3D(x, y + 1u, z)] & 0xFFu) : 0u;
+        neighCats[4] = (z > 0u) ? (InVoxels[Idx3D(x, y, z - 1u)] & 0xFFu) : 0u;
+        neighCats[5] = (z < SizeZ - 1u) ? (InVoxels[Idx3D(x, y, z + 1u)] & 0xFFu) : 0u;
+    }
+    else
+    {
+        // Normal mode: use neighbor data for proper culling
+        neighCats[0] = GetCategoryGlobal((int) x - 1, (int) y, (int) z);
+        neighCats[1] = GetCategoryGlobal((int) x + 1, (int) y, (int) z);
+        neighCats[2] = GetCategoryGlobal((int) x, (int) y - 1, (int) z);
+        neighCats[3] = GetCategoryGlobal((int) x, (int) y + 1, (int) z);
+        neighCats[4] = GetCategoryGlobal((int) x, (int) y, (int) z - 1);
+        neighCats[5] = GetCategoryGlobal((int) x, (int) y, (int) z + 1);
+    }
+
+    // Count faces to emit (6 verts per face)
+    // A face is emitted when:
+    // - Current voxel is solid (cat != 0) 
+    // - Neighbor is different category (air vs semi vs solid)
+    uint count = 0u;
+    [unroll]
+    for (uint face = 0u; face < 6u; ++face)
+    {
+        // Only emit face if neighbor is different category
+        // This handles air/solid, air/semi, and semi/solid boundaries
+        if (neighCats[face] != cat)
+            count += 6u;
+    }
+
+    OutCount[idx] = count;
+}
+
+// ============================================================================
+// PASS 2: EMIT ELEMENTS USING PREFIX-SCANNED OFFSETS
+// ============================================================================
+[numthreads(8, 8, 8)]
+void EmitElementsCS(uint3 GroupID : SV_GroupID, uint3 LocalID : SV_GroupThreadID)
+{
+    uint3 tid = GroupID * uint3(8, 8, 8) + LocalID;
+    uint x = tid.x, y = tid.y, z = tid.z;
+    if (x >= SizeX || y >= SizeY || z >= SizeZ)
+        return;
+
+    uint idx = Idx3D(x, y, z);
+    uint cat = InVoxels[idx] & 0xFFu;
+    
+    // Skip air voxels
+    if (cat == 0u)
+        return;
+
+    uint base = Offsets[idx];
+    
+    // Check neighbors again for actual face emission
+    uint neighCats[6];
+    if (IgnoreNeighbors != 0u)
+    {
+        // Aggressive culling mode
+        neighCats[0] = (x > 0u) ? (InVoxels[Idx3D(x - 1u, y, z)] & 0xFFu) : 0u;
+        neighCats[1] = (x < SizeX - 1u) ? (InVoxels[Idx3D(x + 1u, y, z)] & 0xFFu) : 0u;
+        neighCats[2] = (y > 0u) ? (InVoxels[Idx3D(x, y - 1u, z)] & 0xFFu) : 0u;
+        neighCats[3] = (y < SizeY - 1u) ? (InVoxels[Idx3D(x, y + 1u, z)] & 0xFFu) : 0u;
+        neighCats[4] = (z > 0u) ? (InVoxels[Idx3D(x, y, z - 1u)] & 0xFFu) : 0u;
+        neighCats[5] = (z < SizeZ - 1u) ? (InVoxels[Idx3D(x, y, z + 1u)] & 0xFFu) : 0u;
+    }
+    else
+    {
+        // Normal mode with neighbor data
+        neighCats[0] = GetCategoryGlobal((int) x - 1, (int) y, (int) z);
+        neighCats[1] = GetCategoryGlobal((int) x + 1, (int) y, (int) z);
+        neighCats[2] = GetCategoryGlobal((int) x, (int) y - 1, (int) z);
+        neighCats[3] = GetCategoryGlobal((int) x, (int) y + 1, (int) z);
+        neighCats[4] = GetCategoryGlobal((int) x, (int) y, (int) z - 1);
+        neighCats[5] = GetCategoryGlobal((int) x, (int) y, (int) z + 1);
+    }
+
+    // Determine which faces to emit
+    bool emitNegX = (neighCats[0] != cat);
+    bool emitPosX = (neighCats[1] != cat);
+    bool emitNegY = (neighCats[2] != cat);
+    bool emitPosY = (neighCats[3] != cat);
+    bool emitNegZ = (neighCats[4] != cat);
+    bool emitPosZ = (neighCats[5] != cat);
+
+    // Emit faces in deterministic order (must match count pass!)
+    // -X face (normalCode=1)
+    if (emitNegX)
+    {
+        WriteFace(base, uint3(x, y, z), uint3(0u, 1u, 0u), uint3(0u, 0u, 1u), 1u, cat);
+    }
+    // +X face (normalCode=0)
+    if (emitPosX)
+    {
+        WriteFace(base, uint3(x + 1u, y, z), uint3(0u, 1u, 0u), uint3(0u, 0u, 1u), 0u, cat);
+    }
+    // -Y face (normalCode=3)
+    if (emitNegY)
+    {
+        WriteFace(base, uint3(x, y, z), uint3(1u, 0u, 0u), uint3(0u, 0u, 1u), 3u, cat);
+    }
+    // +Y face (normalCode=2)
+    if (emitPosY)
+    {
+        WriteFace(base, uint3(x, y + 1u, z), uint3(1u, 0u, 0u), uint3(0u, 0u, 1u), 2u, cat);
+    }
+    // -Z face (normalCode=5)
+    if (emitNegZ)
+    {
+        WriteFace(base, uint3(x, y, z), uint3(1u, 0u, 0u), uint3(0u, 1u, 0u), 5u, cat);
+    }
+    // +Z face (normalCode=4)
+    if (emitPosZ)
+    {
+        WriteFace(base, uint3(x, y, z + 1u), uint3(1u, 0u, 0u), uint3(0u, 1u, 0u), 4u, cat);
+    }
+}

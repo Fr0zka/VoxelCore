@@ -1,18 +1,19 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "VoxelStructs.h"
 #include "VoxelMesher.h"
+#include <atomic>
+#include "RealtimeMeshComponent.h"
+#include "VoxelMaterialSet.h"
 #include "VoxelChunkComponent.generated.h"
 
 class UProceduralMeshComponent;
 class UVoxelSettings;
 class AVoxelWorld;
+class URealtimeMeshComponent;
 
-#if WITH_RUNTIME_MESHCOMPONENT
-class URuntimeMeshComponent;
-#endif
 
 UENUM()
 enum class EVoxelChunkState : uint8
@@ -65,17 +66,6 @@ public:
     int32 LODScaleXY = 1;
     EVoxelRenderMode RenderMode = EVoxelRenderMode::Voxels;
 
-
-    // --- Mesh section state (keeps apply cheap) ---
-public:
-    int32 MeshSectionIndex = 0;
-    bool  bSectionCreated = false;          // did we call CreateMeshSection yet?
-    bool  bSectionHasCollision = false;     // was the section created with collision?
-    int32 LastVertCount = 0;
-    int32 LastIndexCount = 0;
-    uint32 LastIndexHash = 0;   // NEW
-
-
     // Scheduler priority (distance^2), set by world each UpdateChunks
     int32 PriorityDist2 = TNumericLimits<int32>::Max();
 
@@ -91,25 +81,48 @@ public:
     virtual void DoMeshing(bool bSeamRemesh);
     bool bSeamRemeshQueued = false;
 
+    struct FCachedNeighborBorders
+    {
+        TArray<EVoxelBlockID> XNeg, XPos, YNeg, YPos, ZNeg, ZPos;
+        bool bHasXNeg = false, bHasXPos = false;
+        bool bHasYNeg = false, bHasYPos = false;
+        bool bHasZNeg = false, bHasZPos = false;
+    };
+    bool bNeighborsCacheDirty = true;
+
+    // OPTIMIZATION: Track hash of neighbor borders to skip unnecessary seam remeshes
+    uint32 LastNeighborHash = 0;
+
 protected:
     // Data
-    TArray<EVoxelBlockID>    VoxelData;   // LOD0/1
-    TArray<int32>            HeightData;  // LOD2
+    // Compact category data for voxels.  Each voxel stores a 2‑bit category:
+    // 0 = air, 1 = semi‑solid (e.g. water/leaves), 2 = solid.  This replaces
+    // the previous per‑voxel EVoxelBlockID array and significantly reduces
+    // memory usage.  During meshing the categories are expanded back into
+    // temporary block IDs.
+    FCategoryBitset CategoryData;
+    FBiomeGrid2D BiomeGrid;
+    // Protects CategoryData and HeightData
+    FCachedNeighborBorders CachedNeighborBorders;
+    bool bNeighborBordersCached = false;
+
+    // Heightfield samples for LOD2.  Unchanged.
+    TArray<int32>            HeightData;
     int32 HF_SamplesX = 0;               // LOD2 grid width
     int32 HF_SamplesY = 0;               // LOD2 grid height
 
+    // Cached neighbors (optimization - snapshot once, reuse)
+    FChunkNeighbors CachedNeighbors;
+
     // Components (from world pool)
     UProceduralMeshComponent* PMC = nullptr;
-#if WITH_RUNTIME_MESHCOMPONENT
-    URuntimeMeshComponent* RMC = nullptr;
-#endif
+    URealtimeMeshComponent* RMC = nullptr;
     bool bUsingRMC = false;
 
     // Async control
     FThreadSafeBool bCancelPending = false;
     bool bIsMeshing = false;
     bool bHasAnnouncedReady = false;
-    
 
     // Cache
     TUniquePtr<FMeshBuffers>  CachedBuffers;
@@ -121,17 +134,24 @@ protected:
 
     void SnapshotNeighbors(FChunkNeighbors& Out) const;
 
+    void CacheNeighborBordersFromWorld();
+
+    void EnsureVoxelMaterial_RMC(URealtimeMeshComponent* inRMC, const UVoxelSettings* inSettings, const UVoxelMaterialSet* MatSet);
+
+
     // Components
     void CreateMeshComponent();
     void DestroyMeshComponent();
-    // In UVoxelChunkComponent (private or protected)
-    FCompactVoxelData Compact; // used for LOD0 and LOD1 when sparse is enabled
 
-    // Converts current dense VoxelData → Compact (air not stored). Safe to call many times.
-    void ConvertDenseToCompact(bool bForLOD0);
+    // Meshing/apply sequencing to avoid out-of-order GPU results overwriting newer meshes
+public:
+    int32 BeginMeshingSequence() { return ++MeshingSeqCounter; }
+    void MarkAppliedSequence(int32 Seq) { LastAppliedSeq = FMath::Max(LastAppliedSeq, Seq); }
+    int32 GetLastAppliedSequence() const { return LastAppliedSeq; }
 
-    // Edits
-    bool SetVoxelCompact(int32 X, int32 Y, int32 Z, uint16 Id); // returns true if changed
-    bool ClearVoxelCompact(int32 X, int32 Y, int32 Z);          // returns true if changed
+private:
+    int32 MeshingSeqCounter = 0;
+    int32 LastAppliedSeq = -1;
+    UPROPERTY(Transient) TObjectPtr<UMaterialInstanceDynamic> VoxelMID;
 
 };

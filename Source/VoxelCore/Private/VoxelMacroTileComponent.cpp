@@ -154,7 +154,7 @@ void UVoxelMacroTileComponent::DoMeshing(bool /*bSeamRemesh*/)
             {
                 W->OnMeshingFinished(this); // free slot
                 // No collision for macro-tiles (cheap apply)
-                W->EnqueueMeshApply(this, MoveTemp(Buffers), /*bCreateCollision=*/false, /*bWasSeamRemesh=*/false);
+               // W->EnqueueMeshApply(this, MoveTemp(Buffers), /*bCreateCollision=*/false, /*bWasSeamRemesh=*/false);
             }
         });
 }

@@ -1,0 +1,17 @@
+# Ignore everything
+*
+
+# But keep this gitignore file
+!.gitignore
+
+# Keep Shaders folder and its contents
+!/Shaders/
+!/Shaders/**
+
+# Keep Source folder and its contents
+!/Source/
+!/Source/**
+
+
+!README.md
+!VoxelCore.uplugin

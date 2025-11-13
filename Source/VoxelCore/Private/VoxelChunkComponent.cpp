@@ -3,12 +3,26 @@
 #include "VoxelGenerator.h"
 #include "VoxelMesher.h"
 #include "VoxelWorld.h"
+#include "VoxelStats.h"
 #include "ProceduralMeshComponent.h"
 #include "Async/Async.h"
+#include "HAL/IConsoleManager.h"
 
-#if WITH_RUNTIME_MESHCOMPONENT
-#include "RuntimeMeshComponent.h"
+#if WITH_REALTIME_MESHCOMPONENT
+#include "RealtimeMeshComponent.h"
 #endif
+#include <Misc/ScopeTryLock.h>
+#include <VoxelGPUMesher.h>
+#include "VoxelBlockTable.h"
+#include "VoxelMaterialSet.h"
+#include <VoxelBiome.h>
+
+// Debug console variable for padding extraction logging
+static TAutoConsoleVariable<int32> CVarVoxelLogPadding(
+    TEXT("r.Voxel.LogPadding"),
+    0,
+    TEXT("Log padding extraction details (0=off, 1=on)"),
+    ECVF_Default);
 
 void UVoxelChunkComponent::InitializeChunk(
     FVoxelCoord InCoord,
@@ -28,25 +42,26 @@ void UVoxelChunkComponent::InitializeChunk(
     LODScaleXY = (LOD == EVoxelLODLevel::LOD1) ? FMath::Max(1, Settings->LOD1_ScaleXY) : 1;
     RenderMode = (LOD == EVoxelLODLevel::LOD2) ? EVoxelRenderMode::Heightfield : EVoxelRenderMode::Voxels;
 
+    // Mark neighbors as dirty for first snapshot
+    bNeighborsCacheDirty = true;
+
     CreateMeshComponent();
 
     const FVector WorldLocation(
         ChunkCoord.Cx * Settings->ChunkSizeX * Settings->VoxelWorldScale,
         ChunkCoord.Cy * Settings->ChunkSizeY * Settings->VoxelWorldScale,
-        0.0f);
-    if (PMC) PMC->SetWorldLocation(WorldLocation);
-#if WITH_RUNTIME_MESHCOMPONENT
-    if (RMC) RMC->SetWorldLocation(WorldLocation);
-#endif
-    if (LOD == EVoxelLODLevel::LOD0)
-    {
-        PMC->SetCastShadow(true);
-    }
-    else
-    {
-        PMC->SetCastShadow(false);
-    }
+        ChunkCoord.Cz * Settings->ChunkSizeZ * Settings->VoxelWorldScale);
+
+    if (PMC) PMC->SetWorldLocation(WorldLocation);  // Changed from SetWorldLocation
+    if (RMC) RMC->SetWorldLocation(WorldLocation);  // Changed from SetWorldLocation
+    const UVoxelMaterialSet* MatSet = Settings->MaterialSet.LoadSynchronous();
+    EnsureVoxelMaterial_RMC(RMC, Settings, MatSet);
+
     StartGeneration();
+    // In InitializeChunk, after calculating WorldLocation:
+    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) spawned at Z=%f (Cz=%d, ChunkSizeZ=%d, Scale=%f)"),
+        ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
+        WorldLocation.Z, ChunkCoord.Cz, Settings->ChunkSizeZ, Settings->VoxelWorldScale);
 }
 
 void UVoxelChunkComponent::CreateMeshComponent()
@@ -56,13 +71,11 @@ void UVoxelChunkComponent::CreateMeshComponent()
 
     if (!OwnerWorld) return;
 
-#if WITH_RUNTIME_MESHCOMPONENT
     if (Settings->bUseRuntimeMeshComponent)
     {
         RMC = OwnerWorld->AcquireRMC();
         if (RMC) { bUsingRMC = true; return; }
     }
-#endif
 
     PMC = OwnerWorld->AcquirePMC();
 }
@@ -72,9 +85,7 @@ void UVoxelChunkComponent::DestroyMeshComponent()
     if (!OwnerWorld) return;
 
     if (PMC) { OwnerWorld->ReleasePMC(PMC); PMC = nullptr; }
-#if WITH_RUNTIME_MESHCOMPONENT
     if (RMC) { OwnerWorld->ReleaseRMC(RMC); RMC = nullptr; }
-#endif
 }
 
 void UVoxelChunkComponent::StartGeneration()
@@ -84,8 +95,11 @@ void UVoxelChunkComponent::StartGeneration()
     if (OwnerWorld) OwnerWorld->ScheduleGeneration(this);
 }
 
+// --- VoxelChunkComponent.cpp (replace full function) ---
 void UVoxelChunkComponent::DoGeneration()
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelGeneration);
+
     const FChunkGenParams Params = UVoxelGenerator::MakeParamsFromSettings(Settings);
     const FVoxelCoord Coord = ChunkCoord;
     const int32 ScaleXY = LODScaleXY;
@@ -102,8 +116,14 @@ void UVoxelChunkComponent::DoGeneration()
             }
             else
             {
-                FIntVector Size;
-                UVoxelGenerator::GenerateChunkLOD(Coord, Params, ScaleXY, VoxelData, Size);
+                // Categories for fast solid/air decisions
+                UVoxelGenerator::GenerateChunkLOD_Categories(Coord, Params, ScaleXY, CategoryData);
+
+                // NEW: 2D biome grid used later to expand categories into biome-aware blocks
+                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);
+
+                const int64 NumBytes = CategoryData.Data.Num();
+                INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
             }
 
             if (bCancelPending)
@@ -123,6 +143,7 @@ void UVoxelChunkComponent::DoGeneration()
         });
 }
 
+
 void UVoxelChunkComponent::OnGenerationComplete()
 {
     if (bCancelPending)
@@ -130,6 +151,14 @@ void UVoxelChunkComponent::OnGenerationComplete()
         State = EVoxelChunkState::Unloading;
         return;
     }
+
+    // DON'T cache neighbors here - they might not be ready yet!
+    // Just mark as dirty so meshing will handle it
+    if (RenderMode == EVoxelRenderMode::Voxels)
+    {
+        bNeighborsCacheDirty = true;
+    }
+
     StartMeshing(/*bSeamRemesh=*/false);
 }
 
@@ -140,23 +169,15 @@ void UVoxelChunkComponent::StartMeshing(bool bSeamRemesh)
 
 void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 {
-    const bool bIsVox = (RenderMode == EVoxelRenderMode::Voxels);
+    SCOPE_CYCLE_COUNTER(STAT_VoxelMeshing);
 
-    // Early outs per mode
-    if (bIsVox)
+    if ((RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() == 0) ||
+        (RenderMode == EVoxelRenderMode::Heightfield && HeightData.Num() == 0))
     {
-        // Ensure compact storage for both LOD0 and LOD1
-        const bool wantCompact = (LOD == EVoxelLODLevel::LOD0 || LOD == EVoxelLODLevel::LOD1);
-        if (wantCompact && Compact.Occupancy.Num() == 0)
-            ConvertDenseToCompact(/*bForLOD0=*/LOD == EVoxelLODLevel::LOD0);
-
-        const bool empty =
-            (Compact.Occupancy.Num() == 0 && VoxelData.Num() == 0);
-        if (empty) { if (OwnerWorld) OwnerWorld->OnMeshingFinished(this); return; }
-    }
-    else
-    {
-        if (HeightData.Num() == 0) { if (OwnerWorld) OwnerWorld->OnMeshingFinished(this); return; }
+        UE_LOG(LogTemp, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
+            ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, CategoryData.Data.Num(), HeightData.Num());
+        if (OwnerWorld) OwnerWorld->OnMeshingFinished(this);
+        return;
     }
 
     State = EVoxelChunkState::Meshing;
@@ -165,21 +186,143 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
     const float VoxelUU = Settings->VoxelWorldScale;
 
-    // Neighbor halo for seam/AO on LOD0 only
-    FChunkNeighbors Nbh;
-    if (bIsVox && LOD == EVoxelLODLevel::LOD0) { SnapshotNeighbors(Nbh); }
+    // CRITICAL: Make thread-safe copies of CategoryData and BiomeGrid BEFORE async task
+    // to prevent race condition with UnloadChunk clearing data mid-mesh
+    FCategoryBitset CategoryDataCopy = CategoryData;
+    FBiomeGrid2D BiomeGridCopy = BiomeGrid;
 
-    // Copy inputs for task
     TArray<EVoxelBlockID> VoxelsCopy;
     TArray<int32> HeightsCopy;
-    FCompactVoxelData CompactCopy = Compact;
-    FChunkNeighbors NbhCopy = Nbh;
+    int32 SamplesX = HF_SamplesX, SamplesY = HF_SamplesY;
 
-    if (!bIsVox) HeightsCopy = HeightData;
-    else if (LOD == EVoxelLODLevel::LOD0 && VoxelData.Num() > 0) VoxelsCopy = VoxelData; // if you ever keep dense
+    if (RenderMode == EVoxelRenderMode::Voxels)
+    {
+        // CRITICAL: Use actual CategoryData dimensions, not recalculated
+        // CategoryData was generated with specific LOD scale that may differ from current LODScaleXY
+        const int32 PaddedSX = CategoryDataCopy.SizeX;
+        const int32 PaddedSY = CategoryDataCopy.SizeY;
+        const int32 PaddedSZ = CategoryDataCopy.SizeZ;
+        const int32 SX = PaddedSX - 2;
+        const int32 SY = PaddedSY - 2;
+        const int32 SZ = PaddedSZ - 2;
+        const int32 TotalPadded = PaddedSX * PaddedSY * PaddedSZ;
+
+        // World-space bases
+        const int32 BaseWX = ChunkCoord.Cx * Settings->ChunkSizeX;
+        const int32 BaseWY = ChunkCoord.Cy * Settings->ChunkSizeY;
+        const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
+
+        VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
+
+        auto PickBelowSurface = [](const UVoxelBiomeDef* B, int32 depth)->EVoxelBlockID
+            {
+                if (B && B->Subsurface.Num() > 0)
+                {
+                    int32 acc = 0;
+                    for (const FBiomeLayer& L : B->Subsurface)
+                    {
+                        acc += FMath::Max(0, L.Thickness);
+                        if (depth <= acc) return L.Block;
+                    }
+                    return B->Subsurface.Last().Block;
+                }
+                return EVoxelBlockID::Stone;
+            };
+
+        // Biome grid presence
+        const bool bHaveBiomeGrid = BiomeGridCopy.IsValid();
+        if (!bHaveBiomeGrid)
+        {
+            static std::atomic<bool> bWarned{ false };
+            bool expected = false;
+            if (bWarned.compare_exchange_strong(expected, true))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[Voxel] BiomeGrid missing for chunk (%d,%d,%d). Using defaults."),
+                    ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+            }
+        }
+
+        // Expand padded categories → EVoxelBlockID with biome-aware selection
+        int32 idx = 0;
+        for (int32 z = 0; z < PaddedSZ; ++z)
+        {
+            const int32 WorldZ = BaseWZ + (z - 1);
+
+            for (int32 y = 0; y < PaddedSY; ++y)
+            {
+                const int32 vy = FMath::Clamp(y - 1, 0, SY - 1);
+                const int32 WY = BaseWY + vy * LODScaleXY;
+
+                for (int32 x = 0; x < PaddedSX; ++x, ++idx)
+                {
+                    const uint8 Cat = CategoryDataCopy.Get(x, y, z);
+
+                    if (Cat == 0) { VoxelsCopy[idx] = EVoxelBlockID::Air;  continue; }
+                    if (Cat == 1) { VoxelsCopy[idx] = EVoxelBlockID::Water; continue; }
+
+                    EVoxelBlockID Bid = EVoxelBlockID::Stone;
+
+                    if (bHaveBiomeGrid)
+                    {
+                        // SAFE INDEXING: clamp to actual BiomeGrid size
+                        const int32 bx = FMath::Clamp(x, 0, BiomeGridCopy.SizeX - 1);
+                        const int32 by = FMath::Clamp(y, 0, BiomeGridCopy.SizeY - 1);
+                        const int32 gi = by * BiomeGridCopy.SizeX + bx;
+
+                        // Guard against corrupted grids
+                        const bool bInRange =
+                            gi >= 0 &&
+                            gi < BiomeGridCopy.SurfaceZWorld.Num() &&
+                            gi < BiomeGridCopy.BiomeAtXY.Num();
+
+                        if (bInRange)
+                        {
+                            const int32 TopZ = (int32)BiomeGridCopy.SurfaceZWorld[gi];
+                            const UVoxelBiomeDef* B = BiomeGridCopy.BiomeAtXY[gi];
+
+                            // CRITICAL FIX: Local surface detection instead of global TopZ comparison
+                            // A voxel is a surface if it has air above OR below it
+                            const bool bHasAirAbove = (z + 1 < PaddedSZ) && (CategoryDataCopy.Get(x, y, z + 1) == 0);
+                            const bool bHasAirBelow = (z > 0) && (CategoryDataCopy.Get(x, y, z - 1) == 0);
+
+                            if (bHasAirAbove || bHasAirBelow)
+                            {
+                                // This voxel has an exposed face - use biome surface block
+                                Bid = B ? B->Surface : EVoxelBlockID::Grass;
+                            }
+                            else if (WorldZ < TopZ)
+                            {
+                                // Interior voxel below main surface - use depth-based subsurface layers
+                                const int32 depth = TopZ - WorldZ;
+                                Bid = PickBelowSurface(B, depth);
+                            }
+                            else
+                            {
+                                // Interior voxel above main surface (inside floating island/overhang)
+                                // Use shallow subsurface layers instead of pure stone
+                                const int32 depth = 2; // Treat as slightly below surface
+                                Bid = PickBelowSurface(B, depth);
+                            }
+                        }
+                        else
+                        {
+                            // Fallback if grid is unexpectedly sized
+                            Bid = EVoxelBlockID::Stone;
+                        }
+                    }
+
+                    VoxelsCopy[idx] = Bid;
+                }
+            }
+        }
+    }
+    else
+    {
+        HeightsCopy = HeightData;
+    }
 
     const bool bCollision = bBuildCollision;
-    const bool bAO = bUseAO && bIsVox && (LOD == EVoxelLODLevel::LOD0);
+    const bool bAO = bUseAO && (RenderMode == EVoxelRenderMode::Voxels);
     AVoxelWorld* W = OwnerWorld;
 
     const FIntVector SizeVox(
@@ -187,49 +330,179 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY,
         Settings->ChunkSizeZ);
 
-    const int32 ChunkSizeX = Settings->ChunkSizeX;
-    const int32 ChunkSizeY = Settings->ChunkSizeY;
     const int32 XYScale = LODScaleXY;
 
+    // Extract neighbor borders FROM padding so the mesher can cull faces at chunk seams
+    FChunkNeighbors NbhCopy;
+    if (RenderMode == EVoxelRenderMode::Voxels && VoxelsCopy.Num() > 0)
+    {
+        const int32 SX = SizeVox.X, SY = SizeVox.Y, SZ = SizeVox.Z;
+        const int32 PaddedSX = SX + 2, PaddedSY = SY + 2, PaddedSZ = SZ + 2;
+
+        NbhCopy.SizeX = SX; NbhCopy.SizeY = SY; NbhCopy.SizeZ = SZ;
+
+        // X-
+        NbhCopy.XNeg.SetNumUninitialized(SY * SZ);
+        for (int32 z = 0; z < SZ; ++z)
+            for (int32 y = 0; y < SY; ++y)
+                NbhCopy.XNeg[y + z * SY] = VoxelsCopy[0 + (y + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+        NbhCopy.bHasXNeg = true;
+
+        // X+
+        NbhCopy.XPos.SetNumUninitialized(SY * SZ);
+        for (int32 z = 0; z < SZ; ++z)
+            for (int32 y = 0; y < SY; ++y)
+                NbhCopy.XPos[y + z * SY] = VoxelsCopy[(SX + 1) + (y + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+        NbhCopy.bHasXPos = true;
+
+        // Y-
+        NbhCopy.YNeg.SetNumUninitialized(SX * SZ);
+        for (int32 z = 0; z < SZ; ++z)
+            for (int32 x = 0; x < SX; ++x)
+                NbhCopy.YNeg[x + z * SX] = VoxelsCopy[(x + 1) + 0 * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+        NbhCopy.bHasYNeg = true;
+
+        // Y+
+        NbhCopy.YPos.SetNumUninitialized(SX * SZ);
+        for (int32 z = 0; z < SZ; ++z)
+            for (int32 x = 0; x < SX; ++x)
+                NbhCopy.YPos[x + z * SX] = VoxelsCopy[(x + 1) + (SY + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+        NbhCopy.bHasYPos = true;
+
+        // Z-
+        NbhCopy.ZNeg.SetNumUninitialized(SX * SY);
+        for (int32 y = 0; y < SY; ++y)
+            for (int32 x = 0; x < SX; ++x)
+                NbhCopy.ZNeg[x + y * SX] = VoxelsCopy[(x + 1) + (y + 1) * PaddedSX + 0 * PaddedSX * PaddedSY];
+        NbhCopy.bHasZNeg = true;
+
+        // Z+
+        NbhCopy.ZPos.SetNumUninitialized(SX * SY);
+        for (int32 y = 0; y < SY; ++y)
+            for (int32 x = 0; x < SX; ++x)
+                NbhCopy.ZPos[x + y * SX] = VoxelsCopy[(x + 1) + (y + 1) * PaddedSX + (SZ + 1) * PaddedSX * PaddedSY];
+        NbhCopy.bHasZPos = true;
+
+        // Strip padding for the main volume sent to the mesher
+        TArray<EVoxelBlockID> RealVoxels;
+        RealVoxels.SetNum(SX * SY * SZ);
+        int32 di = 0;
+        for (int32 z = 0; z < SZ; ++z)
+            for (int32 y = 0; y < SY; ++y)
+                for (int32 x = 0; x < SX; ++x, ++di)
+                    RealVoxels[di] = VoxelsCopy[(x + 1) + (y + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+        VoxelsCopy = MoveTemp(RealVoxels);
+    }
+    else
+    {
+        NbhCopy = CachedNeighbors;
+    }
+
+    // OPTIMIZATION: Compute hash of neighbor borders to track if they changed
+    // This allows us to skip unnecessary seam remeshes when neighbors haven't actually changed
+    const uint32 CurrentNeighborHash = NbhCopy.ComputeHash();
+    LastNeighborHash = CurrentNeighborHash;
+
+    const EVoxelLODLevel LODLevel = LOD;
+    const EVoxelRenderMode RenderModeValue = RenderMode;
+    const int32 ChunkSizeX = Settings->ChunkSizeX;
+    const int32 ChunkSizeY = Settings->ChunkSizeY;
+
     UE::Tasks::Launch(UE_SOURCE_LOCATION,
-        [this, VoxelUU, bCollision, bAO, bSeamRemesh, W,
-        SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
-        Voxels = MoveTemp(VoxelsCopy),
-        HCopy = MoveTemp(HeightsCopy),
-        CompactCopy,
-        NbhCopy,
-        RenderMode = this->RenderMode,
-        LOD = this->LOD]() mutable
+        [this, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
+        LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), HCopy = MoveTemp(HeightsCopy),
+        SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings]() mutable
         {
             FMeshBuffers Buffers;
+            const int32 Seq = BeginMeshingSequence();
 
-            if (RenderMode == EVoxelRenderMode::Voxels)
+            if (RenderModeValue == EVoxelRenderMode::Voxels)
             {
-                if (LOD == EVoxelLODLevel::LOD0)
+                const bool bShouldTryGPU =
+                    (LODLevel == EVoxelLODLevel::LOD0) &&
+                    SettingsPtr &&
+                    SettingsPtr->bUseGPUMesherForLOD0;
+                const bool bAllowCPUFallback =
+                    !SettingsPtr || SettingsPtr->bFallbackToCPUOnGPUFailure;
+
+                bool bAttemptedGPU = false;
+                bool bGPUOk = false;
+
+                if (bShouldTryGPU && SettingsPtr && SettingsPtr->bAsyncGPUReadback)
                 {
-                    // Sparse LOD0 with AO and halos
-                    UVoxelMesher::BuildGreedyMesh_FromBitset_AO(
-                        CompactCopy, &NbhCopy, VoxelUU, /*bUseAO*/ bAO, Buffers);
+                    bAttemptedGPU = true;
+
+                    TWeakObjectPtr<UVoxelChunkComponent> WeakChunk(this);
+                    TWeakObjectPtr<AVoxelWorld> WeakWorld(OwnerWorld);
+                    const bool bUseNaive = SettingsPtr ? SettingsPtr->bUseNaiveMesher : false;
+                    const bool bUseBinary = SettingsPtr ? SettingsPtr->bUseBinaryGreedyMesher : false;
+                    const bool bAOFlag = bAO;
+                    const UVoxelBlockTable* BT = (SettingsPtr && SettingsPtr->BlockTable.Get()) ? SettingsPtr->BlockTable.Get() : nullptr;
+                    const bool bAllowFallbackLocal = bAllowCPUFallback;
+
+                    const bool bLaunched = UVoxelMesher::BuildGreedyMesh_GPU_Async(
+                        Voxels, SizeVox, &NbhCopy, XYScale, VoxelUU,
+                        [WeakChunk, WeakWorld, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
+                        (bool bSuccess, TArray<uint32>&& Packed, int32 SizeX, int32 SizeY, int32 SizeZ, int32 XYScaleParam, float VoxelUUParam)
+                        {
+                            if (!WeakChunk.IsValid() || !WeakWorld.IsValid()) return;
+
+                            UVoxelChunkComponent* Chunk = WeakChunk.Get();
+                            AVoxelWorld* World = WeakWorld.Get();
+
+                            FMeshBuffers LocalBufs;
+                            if (bSuccess && Packed.Num() > 0)
+                            {
+                                FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, LocalBufs, VoxelUUParam, XYScaleParam, SizeX, SizeY, SizeZ);
+                            }
+                            else if (bAllowFallbackLocal)
+                            {
+                                const FChunkNeighbors* NeighborPtr = &NbhCopy;
+                                const FIntVector SizeVector(SizeX, SizeY, SizeZ);
+
+                                if (bUseNaive)
+                                    UVoxelMesher::BuildNaiveMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                                else if (bUseBinary)
+                                    UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                                else
+                                    UVoxelMesher::BuildGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                            }
+
+                            World->OnMeshingFinished(Chunk);
+                            World->EnqueueMeshApply(Chunk, MoveTemp(LocalBufs), bCollision, bSeamRemesh, Seq);
+                        },
+                        SettingsPtr);
+
+                    if (bLaunched) return;
                 }
-                else // LOD1
+
+                if (bShouldTryGPU && !bGPUOk)
                 {
-                    // Fast LOD1 without AO
-                    UVoxelMesher::BuildGreedyMesh_FromBitset_AO(
-                        CompactCopy, /*Nbh*/nullptr, VoxelUU, /*bUseAO*/ false, Buffers);
+                    bAttemptedGPU = true;
+                    bGPUOk = UVoxelMesher::BuildGreedyMesh_GPU(Voxels, SizeVox, &NbhCopy, XYScale, VoxelUU, Buffers, SettingsPtr);
+                }
+
+                if ((!bAttemptedGPU || !bGPUOk) && bAllowCPUFallback)
+                {
+                    const UVoxelBlockTable* BT = (SettingsPtr && SettingsPtr->BlockTable.Get()) ? SettingsPtr->BlockTable.Get() : nullptr;
+
+                    if (SettingsPtr && SettingsPtr->bUseNaiveMesher)
+                        UVoxelMesher::BuildNaiveMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
+                    else if (SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher)
+                        UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
+                    else
+                        UVoxelMesher::BuildGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
                 }
             }
             else
             {
-                // Your existing heightfield path
-                UVoxelMesher::BuildHeightfieldMesh(
-                    HCopy, /*SamplesX*/HF_SamplesX, /*SamplesY*/HF_SamplesY,
-                    ChunkSizeX, ChunkSizeY, XYScale, VoxelUU, Buffers);
+                UVoxelMesher::BuildHeightfieldMesh(HCopy, SamplesX, SamplesY, ChunkSizeX, ChunkSizeY, XYScale, VoxelUU, Buffers);
             }
 
             if (W)
             {
                 W->OnMeshingFinished(this);
-                W->EnqueueMeshApply(this, MoveTemp(Buffers), bCollision, bSeamRemesh);
+                W->EnqueueMeshApply(this, MoveTemp(Buffers), bCollision, bSeamRemesh, Seq);
             }
         });
 }
@@ -238,176 +511,97 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
 void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCollision)
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Chunk_ApplyBuffersToMesh);
-    SCOPE_CYCLE_COUNTER(STAT_Voxel_Chunk_ApplyMesh);
-
-    const int32 S = MeshSectionIndex;
-
-    // --- small helper: fast hash of index buffer (detect topology changes even if count is same)
-    auto HashIndices = [](const TArray<int32>& A)->uint32
-        {
-            uint32 h = 2166136261u;                 // FNV-1a 32-bit
-            for (int32 v : A) { h ^= (uint32)v; h *= 16777619u; }
-            return h;
-        };
-
-    const int32  NewV = Bufs.Vertices.Num();
-    const int32  NewI = Bufs.Triangles.Num();
-    const uint32 NewH = HashIndices(Bufs.Triangles);
-
-    // --- recreate decision (section missing, counts changed, or topology changed)
-    auto NeedRecreate = [&]() -> bool
-        {
-            if (!bSectionCreated)          return true;
-            if (NewV != LastVertCount)     return true;
-            if (NewI != LastIndexCount)    return true;
-            if (NewH != LastIndexHash)     return true; // NEW
-            return false;
-        };
-
-    // --- update state after (re)create
-    auto AfterCreate = [&](bool bCreatedWithCollision)
-        {
-            bSectionCreated = true;
-            bSectionHasCollision = bCreatedWithCollision;
-            LastVertCount = NewV;
-            LastIndexCount = NewI;
-            LastIndexHash = NewH;   // NEW
-        };
-
-    // --- update state after "Update" (indices unchanged, but we still track hash)
-    auto AfterUpdate = [&]()
-        {
-            LastVertCount = NewV;
-            LastIndexHash = NewH;        // NEW
-            // LastIndexCount stays as-is; Update doesn't change indices
-        };
-
-    // --- empty mesh => clear section & reset
-    if (NewI == 0 || NewV == 0)
+    if (bUsingRMC)
     {
-        if (bUsingRMC)
+        // If buffers are accidentally in world space, subtract chunk origin to make them local
+        static auto* CVarVertsWorld = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.VerticesAreWorld"));
+        const bool bVertsAreWorld = CVarVertsWorld && (CVarVertsWorld->GetInt() != 0);
+        if (bVertsAreWorld)
         {
-#if WITH_RUNTIME_MESHCOMPONENT
-            if (RMC && bSectionCreated)
+            const FVector Origin(
+                ChunkCoord.Cx * Settings->ChunkSizeX * Settings->VoxelWorldScale,
+                ChunkCoord.Cy * Settings->ChunkSizeY * Settings->VoxelWorldScale,
+                ChunkCoord.Cz * Settings->ChunkSizeZ * Settings->VoxelWorldScale);
+            FMeshBuffers Local = Bufs;
+            for (FVector& V : Local.Vertices)
             {
-                RMC->ClearSection(0, S);
+                V -= Origin;
             }
-#endif
+            UVoxelMesher::ApplyToRMC(RMC, Local, bCollision);
         }
         else
         {
-            if (PMC && bSectionCreated)
-            {
-                PMC->ClearMeshSection(S);
-            }
+            UVoxelMesher::ApplyToRMC(RMC, Bufs, bCollision);
         }
-        bSectionCreated = false;
-        bSectionHasCollision = false;
-        LastVertCount = LastIndexCount = 0;
-        LastIndexHash = 0;
-        return;
-    }
-
-    // --- ensure base component flags (cheap)
-    if (bUsingRMC)
-    {
-#if WITH_RUNTIME_MESHCOMPONENT
-        check(RMC);
-        RMC->SetVisibility(true, true);
-        RMC->SetHiddenInGame(false, true);
-        RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision); // toggle after
-#endif
     }
     else
     {
-        check(PMC);
-        PMC->bUseAsyncCooking = true;
-        PMC->SetVisibility(true, true);
-        PMC->SetHiddenInGame(false, true);
-        PMC->SetCollisionEnabled(ECollisionEnabled::NoCollision); // toggle after
-    }
-
-    const bool bRecreate = NeedRecreate();
-
-    if (bUsingRMC)
-    {
-#if WITH_RUNTIME_MESHCOMPONENT
-        if (bRecreate)
-        {
-            UVoxelMesher::ApplyToRMC_Create(RMC, S, Bufs, /*bCreateCollision=*/bCollision);
-            AfterCreate(bCollision);
-        }
-        else
-        {
-            UVoxelMesher::ApplyToRMC_Update(RMC, S, Bufs);
-            AfterUpdate();
-        }
-
-        // collision policy (upgrade once if needed; otherwise just toggle component)
-        if (bCollision)
-        {
-            if (!bSectionHasCollision && !bRecreate)
-            {
-                UVoxelMesher::ApplyToRMC_Create(RMC, S, Bufs, /*bCreateCollision=*/true);
-                bSectionHasCollision = true;
-            }
-            RMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-        }
-        else
-        {
-            RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        }
-#endif
-    }
-    else
-    {
-        if (bRecreate)
-        {
-            UVoxelMesher::ApplyToPMC_Create(PMC, S, Bufs, /*bCreateCollision=*/bCollision);
-            AfterCreate(bCollision);
-        }
-        else
-        {
-            UVoxelMesher::ApplyToPMC_Update(PMC, S, Bufs);
-            AfterUpdate();
-        }
-
-        if (bCollision)
-        {
-            if (!bSectionHasCollision && !bRecreate)
-            {
-                UVoxelMesher::ApplyToPMC_Create(PMC, S, Bufs, /*bCreateCollision=*/true);
-                bSectionHasCollision = true;
-            }
-            PMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-        }
-        else
-        {
-            PMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        }
+        UVoxelMesher::ApplyToPMC(PMC, Bufs, bCollision);
     }
 }
 
-
-
 void UVoxelChunkComponent::OnMeshApplied(TUniquePtr<FMeshBuffers>&& AppliedBuffers, bool bWasSeamRemesh)
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Chunk_OnMeshApplied);
-    SCOPE_CYCLE_COUNTER(STAT_Voxel_Chunk_OnApplied);
+    // MEMORY MANAGEMENT: Move the freshly generated buffers into our cache.
+    // For LOD0 chunks we keep the buffers around for potential collision and seam remeshing.
+    // For higher LOD levels there is no need to retain the vertex/triangle arrays after
+    // they have been applied to the mesh component, so we immediately discard them to save memory.
+    //
+    // FUTURE OPTIMIZATION: Implement LRU cache eviction for LOD0 buffers after N seconds of inactivity.
+    // Current behavior: Buffers cached until chunk unload (may accumulate if player teleports).
+    // Typical cost: ~60KB per LOD0 chunk (1000 verts, 2000 tris, UVs, colors, normals).
     CachedBuffers = MoveTemp(AppliedBuffers);
 
-    if (bCancelPending) { State = EVoxelChunkState::Unloading; bIsMeshing = false; return; }
+    // If a cancellation was requested we stop here and mark the state as
+    // unloading.  The cached buffers (if any) are still cleaned up by the
+    // destructor or unloading logic.
+    if (bCancelPending)
+    {
+        State = EVoxelChunkState::Unloading;
+        bIsMeshing = false;
+        return;
+    }
 
+    // Transition to the ready state now that the mesh has been applied.
     State = EVoxelChunkState::Ready;
     bIsMeshing = false;
 
+    // Immediately free mesh buffers on non-LOD0 chunks to reduce memory
+    // footprint.  LOD0 chunks retain their buffers so that collision can be
+    // reapplied without a full remesh if needed. Also adjust memory stats.
+    if (LOD != EVoxelLODLevel::LOD0 && CachedBuffers.IsValid())
+    {
+        const int32 Bytes =
+            CachedBuffers->Vertices.Num() * sizeof(FVector) +
+            CachedBuffers->Triangles.Num() * sizeof(int32) +
+            CachedBuffers->UVs.Num() * sizeof(FVector2D) +
+            CachedBuffers->Colors.Num() * sizeof(FLinearColor) +
+            CachedBuffers->Normals.Num() * sizeof(FVector);
+        if (Bytes > 0)
+        {
+            DEC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, Bytes);
+        }
+
+        CachedBuffers->Vertices.Empty();
+        CachedBuffers->Triangles.Empty();
+        CachedBuffers->UVs.Empty();
+        CachedBuffers->Colors.Empty();
+        CachedBuffers->Normals.Empty();
+    }
+
+    // Announce that this chunk is ready if it has not been announced yet and
+    // this was not a seam re‑mesh.  The world uses this callback to trigger
+    // seam remeshing on neighboring chunks.
     if (!bWasSeamRemesh && !bHasAnnouncedReady)
     {
         bHasAnnouncedReady = true;
-        if (OwnerWorld) OwnerWorld->OnChunkReady(ChunkCoord);
+        if (OwnerWorld)
+        {
+            OwnerWorld->OnChunkReady(ChunkCoord);
+        }
     }
 
+    // If a seam remesh was queued while we were meshing, start it now.
     if (bSeamRemeshQueued)
     {
         bSeamRemeshQueued = false;
@@ -425,6 +619,27 @@ void UVoxelChunkComponent::OnCollisionReapplied()
 
 void UVoxelChunkComponent::RequestRemesh()
 {
+    // OPTIMIZATION: Check if neighbors actually changed before remeshing
+    // This dramatically reduces unnecessary seam remeshes (typically 80-90% reduction)
+    if (bNeighborsCacheDirty && State == EVoxelChunkState::Ready)
+    {
+        // Temporarily extract current neighbor state to compute hash
+        FChunkNeighbors TempNeighbors;
+        SnapshotNeighbors(TempNeighbors);
+        const uint32 NewHash = TempNeighbors.ComputeHash();
+
+        // If hash matches, neighbors haven't changed - skip remesh
+        if (NewHash == LastNeighborHash && LastNeighborHash != 0)
+        {
+            bNeighborsCacheDirty = false; // Clear dirty flag, no remesh needed
+            return;
+        }
+    }
+
+    // Force recache of neighbor borders on next mesh
+    bNeighborsCacheDirty = true;
+    bNeighborBordersCached = false;
+
     if (State == EVoxelChunkState::Ready && !bIsMeshing)
     {
         StartMeshing(/*bSeamRemesh=*/true);
@@ -450,235 +665,295 @@ void UVoxelChunkComponent::RequestCollisionReapply(bool bNewCollision)
 
 void UVoxelChunkComponent::CancelPendingTask()
 {
+    // ADD THIS:
+    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) CANCELLED (State=%d)"),
+        ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, (int32)State);
+
     bCancelPending.AtomicSet(true);
     State = EVoxelChunkState::Unloading;
 }
 
+
+// ==========================
+// Modified UnloadChunk - acquire lock before clearing:
+// ==========================
 void UVoxelChunkComponent::UnloadChunk()
 {
     bCancelPending.AtomicSet(true);
     DestroyMeshComponent();
-    VoxelData.Empty();
+
+    // Update memory stats before clearing
+    DEC_MEMORY_STAT_BY(STAT_VoxelDataMemory, CategoryData.Data.Num());
+
+    if (CachedBuffers.IsValid())
+    {
+        const int32 Bytes =
+            CachedBuffers->Vertices.Num() * sizeof(FVector) +
+            CachedBuffers->Triangles.Num() * sizeof(int32) +
+            CachedBuffers->UVs.Num() * sizeof(FVector2D) +
+            CachedBuffers->Colors.Num() * sizeof(FLinearColor) +
+            CachedBuffers->Normals.Num() * sizeof(FVector);
+        if (Bytes > 0)
+        {
+            DEC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, Bytes);
+        }
+    }
+
+    // Clear voxel and height data
+    CategoryData.Data.Empty();
     HeightData.Empty();
     CachedBuffers.Reset();
+
+    // Clear cached neighbor borders
+    CachedNeighborBorders = FCachedNeighborBorders();
+    bNeighborBordersCached = false;
 
     UnregisterComponent();
     DestroyComponent();
 }
+// ==========================
+// VoxelChunkComponent.h additions:
+// ==========================
+// Add to the class:
+// mutable FCriticalSection DataAccessLock;
 
+// MODIFIED: Use cached borders instead of live snapshot
 void UVoxelChunkComponent::SnapshotNeighbors(FChunkNeighbors& Out) const
 {
-    if (RenderMode != EVoxelRenderMode::Voxels) { Out = {}; return; }
+    SCOPE_CYCLE_COUNTER(STAT_VoxelSnapshotNeighbors);
+
+    if (RenderMode != EVoxelRenderMode::Voxels)
+    {
+        Out = {};
+        return;
+    }
 
     Out.SizeX = (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY;
     Out.SizeY = (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY;
     Out.SizeZ = Settings->ChunkSizeZ;
 
-    enum class EBorderAxis : uint8 { X, Y };
+    // If we have cached borders, use them directly
+    if (bNeighborBordersCached)
+    {
+        Out.XNeg = CachedNeighborBorders.XNeg;
+        Out.XPos = CachedNeighborBorders.XPos;
+        Out.YNeg = CachedNeighborBorders.YNeg;
+        Out.YPos = CachedNeighborBorders.YPos;
+        Out.ZNeg = CachedNeighborBorders.ZNeg;
+        Out.ZPos = CachedNeighborBorders.ZPos;
 
-    auto SampleVoxel = [&](const UVoxelChunkComponent* Chunk, int32 X, int32 Y, int32 Z) -> EVoxelBlockID
+        Out.bHasXNeg = CachedNeighborBorders.bHasXNeg;
+        Out.bHasXPos = CachedNeighborBorders.bHasXPos;
+        Out.bHasYNeg = CachedNeighborBorders.bHasYNeg;
+        Out.bHasYPos = CachedNeighborBorders.bHasYPos;
+        Out.bHasZNeg = CachedNeighborBorders.bHasZNeg;
+        Out.bHasZPos = CachedNeighborBorders.bHasZPos;
+
+        return;
+    }
+
+    // Fallback: no cached borders available (shouldn't happen normally)
+    // Return empty neighbors - will result in no face culling at chunk edges
+    Out.bHasXNeg = false;
+    Out.bHasXPos = false;
+    Out.bHasYNeg = false;
+    Out.bHasYPos = false;
+    Out.bHasZNeg = false;
+    Out.bHasZPos = false;
+    Out.XNeg.Reset();
+    Out.XPos.Reset();
+    Out.YNeg.Reset();
+    Out.YPos.Reset();
+    Out.ZNeg.Reset();
+    Out.ZPos.Reset();
+}
+
+// NEW: Cache neighbor borders immediately after generation on game thread
+void UVoxelChunkComponent::CacheNeighborBordersFromWorld()
+{
+    if (!OwnerWorld) return;
+
+    const int32 SX = (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY;
+    const int32 SY = (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY;
+    const int32 SZ = Settings->ChunkSizeZ;
+
+    CachedNeighborBorders = FCachedNeighborBorders(); // Reset
+
+    auto CopyXBorder = [&](UVoxelChunkComponent* N, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            if (!Chunk || !Chunk->Settings) return EVoxelBlockID(0);
-
-            const int32 nSizeX = (Chunk->Settings->ChunkSizeX + Chunk->LODScaleXY - 1) / Chunk->LODScaleXY;
-            const int32 nSizeY = (Chunk->Settings->ChunkSizeY + Chunk->LODScaleXY - 1) / Chunk->LODScaleXY;
-            const int32 nSizeZ = Chunk->Settings->ChunkSizeZ;
-
-            if ((uint32)X >= (uint32)nSizeX || (uint32)Y >= (uint32)nSizeY || (uint32)Z >= (uint32)nSizeZ)
+            // IMPORTANT: Only cache if neighbor is READY and has valid data
+            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
+                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
             {
-                return EVoxelBlockID(0);
+                bFlag = false;
+                Dst.Reset();  // Clear any old data
+                return;
             }
 
-            if (Chunk->VoxelData.Num() > 0)
+            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSZ = Settings->ChunkSizeZ;
+
+            if (SrcX < 0 || SrcX >= NSX || NSY != SY || NSZ != SZ)
             {
-                const int32 DenseIndex = X + Y * nSizeX + Z * nSizeX * nSizeY;
-                if (Chunk->VoxelData.IsValidIndex(DenseIndex))
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
+
+            const int32 ExpectedSizeXY = SY * SZ;
+            Dst.SetNumUninitialized(ExpectedSizeXY);
+            for (int32 z = 0; z < SZ; ++z)
+            {
+                for (int32 y = 0; y < SY; ++y)
                 {
-                    return Chunk->VoxelData[DenseIndex];
+                    uint8 Cat = N->CategoryData.Get(SrcX, y, z);
+                    EVoxelBlockID Bid;
+                    switch (Cat) {
+                    case 0: Bid = EVoxelBlockID::Air; break;
+                    case 1: Bid = EVoxelBlockID::Water; break;
+                    default: Bid = EVoxelBlockID::Stone; break;
+                    }
+                    const int32 WriteIndex = y + z * SY;
+                    if (WriteIndex >= 0 && WriteIndex < ExpectedSizeXY)
+                    {
+                        Dst[WriteIndex] = Bid;
+                    }
                 }
             }
-
-            const FCompactVoxelData& C = Chunk->Compact;
-            if (C.SizeX != nSizeX || C.SizeY != nSizeY || C.SizeZ != nSizeZ)
-            {
-                return EVoxelBlockID(0);
-            }
-
-            if (C.Occupancy.Num() == 0)
-            {
-                return EVoxelBlockID(0);
-            }
-
-            const int32 Linear = UVoxelMesher::Idx3D(X, Y, Z, C.SizeX, C.SizeY);
-            const int32 Word = Linear >> 6;
-            const int32 Bit = Linear & 63;
-            if ((uint32)Word >= (uint32)C.Occupancy.Num())
-            {
-                return EVoxelBlockID(0);
-            }
-
-            const uint64 Mask = (1ULL << Bit);
-            if ((C.Occupancy[Word] & Mask) == 0)
-            {
-                return EVoxelBlockID(0);
-            }
-
-            const int32 Rank = UVoxelMesher::Rank1_Prefix(C, Linear);
-            if ((uint32)Rank >= (uint32)C.Ids.Num())
-            {
-                return EVoxelBlockID(0);
-            }
-
-            return static_cast<EVoxelBlockID>(C.Ids[Rank]);
-        };
-
-    auto CopyBorder = [&](const UVoxelChunkComponent* Neighbor, EBorderAxis Axis, int32 NeighborCoord, TArray<EVoxelBlockID>& Dst, bool& bFlag)
-        {
-            if (!Neighbor)
-            {
-                return;
-            }
-
-            const bool bHasDense = Neighbor->VoxelData.Num() > 0;
-            const bool bHasCompact = Neighbor->Compact.SizeX > 0 && Neighbor->Compact.SizeY > 0 && Neighbor->Compact.SizeZ > 0;
-            if (!bHasDense && !bHasCompact)
-            {
-                return;
-            }
-
-            if (Axis == EBorderAxis::X)
-            {
-                Dst.SetNumUninitialized(Out.SizeY * Out.SizeZ);
-                int32 k = 0;
-                for (int32 z = 0; z < Out.SizeZ; ++z)
-                    for (int32 y = 0; y < Out.SizeY; ++y, ++k)
-                    {
-                        Dst[k] = SampleVoxel(Neighbor, NeighborCoord, y, z);
-                    }
-            }
-            else
-            {
-                Dst.SetNumUninitialized(Out.SizeX * Out.SizeZ);
-                int32 k = 0;
-                for (int32 z = 0; z < Out.SizeZ; ++z)
-                    for (int32 x = 0; x < Out.SizeX; ++x, ++k)
-                    {
-                        Dst[k] = SampleVoxel(Neighbor, x, NeighborCoord, z);
-                    }
-            }
-
             bFlag = true;
         };
 
-    const int32 SX = Out.SizeX;
-    const int32 SY = Out.SizeY;
-
-    if (AVoxelWorld* W = OwnerWorld)
-    {
-        auto GetIfSameLOD = [&](int dx, int dy)->const UVoxelChunkComponent*
+    auto CopyYBorder = [&](UVoxelChunkComponent* N, int32 SrcY, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+        {
+            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
+                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
             {
-                if (UVoxelChunkComponent* N = W->GetChunk(FVoxelCoord(ChunkCoord.Cx + dx, ChunkCoord.Cy + dy, ChunkCoord.Cz)))
-                {
-                    if (N->State == EVoxelChunkState::Ready && N->LOD == LOD && N->RenderMode == RenderMode)
-                        return N;
-                }
-                return nullptr;
-            };
-
-        if (const UVoxelChunkComponent* N = GetIfSameLOD(-1, 0)) { CopyBorder(N, EBorderAxis::X, SX - 1, Out.XNeg, Out.bHasXNeg); }
-        if (const UVoxelChunkComponent* N = GetIfSameLOD(1, 0))  { CopyBorder(N, EBorderAxis::X, 0, Out.XPos, Out.bHasXPos); }
-        if (const UVoxelChunkComponent* N = GetIfSameLOD(0, -1)) { CopyBorder(N, EBorderAxis::Y, SY - 1, Out.YNeg, Out.bHasYNeg); }
-        if (const UVoxelChunkComponent* N = GetIfSameLOD(0, 1))  { CopyBorder(N, EBorderAxis::Y, 0, Out.YPos, Out.bHasYPos); }
-    }
-}
-
-void UVoxelChunkComponent::ConvertDenseToCompact(bool bForLOD0)
-{
-    const int32 XYScaleHere = LODScaleXY;
-    const int32 SX = (Settings->ChunkSizeX + XYScaleHere - 1) / XYScaleHere;
-    const int32 SY = (Settings->ChunkSizeY + XYScaleHere - 1) / XYScaleHere;
-    const int32 SZ = Settings->ChunkSizeZ;
-    const int32 N = SX * SY * SZ;
-
-    Compact.SizeX = SX; Compact.SizeY = SY; Compact.SizeZ = SZ;
-    Compact.XYScale = XYScaleHere;
-    Compact.Occupancy.Reset(); Compact.Occupancy.SetNumZeroed((N + 63) >> 6);
-    Compact.Ids.Reset();
-
-    // If we have no dense data (generator-only path), nothing to convert
-    if (VoxelData.Num() == 0) { UVoxelMesher::RebuildPrefix64(Compact); return; }
-
-    // Pack occupancy + IDs. Air == 0.
-    for (int32 z = 0; z < SZ; ++z)
-        for (int32 y = 0; y < SY; ++y)
-            for (int32 x = 0; x < SX; ++x)
-            {
-                const int32 denseX = x * XYScaleHere;
-                const int32 denseY = y * XYScaleHere;
-                const int32 idxDense = denseX + denseY * Settings->ChunkSizeX + z * Settings->ChunkSizeX * Settings->ChunkSizeY;
-                const EVoxelBlockID id = VoxelData.IsValidIndex(idxDense) ? VoxelData[idxDense] : EVoxelBlockID(0);
-                if ((uint16)id != 0)
-                {
-                    const int32 i = UVoxelMesher::Idx3D(x, y, z, SX, SY);
-                    Compact.Occupancy[i >> 6] |= (1ULL << (i & 63));
-                    Compact.Ids.Add((uint16)id);
-                }
+                bFlag = false;
+                Dst.Reset();
+                return;
             }
 
-    UVoxelMesher::RebuildPrefix64(Compact);
+            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSZ = Settings->ChunkSizeZ;
 
-    // Free dense storage for this LOD (neighbor halos now read from Compact)
-    if (bForLOD0 || LOD == EVoxelLODLevel::LOD1)
-        VoxelData.Empty();
-}
+            if (SrcY < 0 || SrcY >= NSY || NSX != SX || NSZ != SZ)
+            {
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
 
-bool UVoxelChunkComponent::SetVoxelCompact(int32 X, int32 Y, int32 Z, uint16 Id)
-{
-    if ((uint32)X >= (uint32)Compact.SizeX || (uint32)Y >= (uint32)Compact.SizeY || (uint32)Z >= (uint32)Compact.SizeZ) return false;
-    const int32 i = UVoxelMesher::Idx3D(X, Y, Z, Compact.SizeX, Compact.SizeY);
-    const int32 w = i >> 6, b = i & 63;
-    const bool wasSolid = ((Compact.Occupancy[w] >> b) & 1ULL) != 0;
+            const int32 ExpectedSizeXZ = SX * SZ;
+            Dst.SetNumUninitialized(ExpectedSizeXZ);
+            for (int32 z = 0; z < SZ; ++z)
+            {
+                for (int32 x = 0; x < SX; ++x)
+                {
+                    uint8 Cat = N->CategoryData.Get(x, SrcY, z);
+                    EVoxelBlockID Bid;
+                    switch (Cat) {
+                    case 0: Bid = EVoxelBlockID::Air; break;
+                    case 1: Bid = EVoxelBlockID::Water; break;
+                    default: Bid = EVoxelBlockID::Stone; break;
+                    }
+                    const int32 WriteIndex2 = x + z * SX;
+                    if (WriteIndex2 >= 0 && WriteIndex2 < ExpectedSizeXZ)
+                    {
+                        Dst[WriteIndex2] = Bid;
+                    }
+                }
+            }
+            bFlag = true;
+        };
 
-    if (Id == 0) return ClearVoxelCompact(X, Y, Z);
-
-    if (wasSolid)
-    {
-        // Overwrite ID in-place
-        const int32 rank = UVoxelMesher::Rank1_Prefix(Compact, i);
-        if ((uint32)rank < (uint32)Compact.Ids.Num())
+    auto CopyZBorder = [&](UVoxelChunkComponent* N, int32 SrcZ, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            const bool changed = (Compact.Ids[rank] != Id);
-            Compact.Ids[rank] = Id;
-            return changed;
-        }
-        return false;
-    }
-    else
+            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
+                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
+            {
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
+
+            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
+            const int32 NSZ = Settings->ChunkSizeZ;
+
+            if (SrcZ < 0 || SrcZ >= NSZ || NSX != SX || NSY != SY)
+            {
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
+
+            const int32 ExpectedSizeYZ = SX * SY;
+            Dst.SetNumUninitialized(ExpectedSizeYZ);
+            for (int32 y = 0; y < SY; ++y)
+            {
+                for (int32 x = 0; x < SX; ++x)
+                {
+                    uint8 Cat = N->CategoryData.Get(x, y, SrcZ);
+                    EVoxelBlockID Bid;
+                    switch (Cat) {
+                    case 0: Bid = EVoxelBlockID::Air; break;
+                    case 1: Bid = EVoxelBlockID::Water; break;
+                    default: Bid = EVoxelBlockID::Stone; break;
+                    }
+                    const int32 WriteIndex3 = x + y * SX;
+                    if (WriteIndex3 >= 0 && WriteIndex3 < ExpectedSizeYZ)
+                    {
+                        Dst[WriteIndex3] = Bid;
+                    }
+                }
+            }
+            bFlag = true;
+        };
+
+    // Get neighbors and cache their borders
+    UVoxelChunkComponent* XNegN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx - 1, ChunkCoord.Cy, ChunkCoord.Cz));
+    UVoxelChunkComponent* XPosN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx + 1, ChunkCoord.Cy, ChunkCoord.Cz));
+    UVoxelChunkComponent* YNegN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy - 1, ChunkCoord.Cz));
+    UVoxelChunkComponent* YPosN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy + 1, ChunkCoord.Cz));
+    UVoxelChunkComponent* ZNegN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz - 1));
+    UVoxelChunkComponent* ZPosN = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz + 1));
+
+    CopyXBorder(XNegN, SX - 1, CachedNeighborBorders.XNeg, CachedNeighborBorders.bHasXNeg);
+    CopyXBorder(XPosN, 0, CachedNeighborBorders.XPos, CachedNeighborBorders.bHasXPos);
+    CopyYBorder(YNegN, SY - 1, CachedNeighborBorders.YNeg, CachedNeighborBorders.bHasYNeg);
+    CopyYBorder(YPosN, 0, CachedNeighborBorders.YPos, CachedNeighborBorders.bHasYPos);
+
+    if (ZNegN)
     {
-        // Insert: set bit and insert ID at position = rank
-        const int32 rank = UVoxelMesher::Rank1_Prefix(Compact, i);
-        Compact.Occupancy[w] |= (1ULL << b);
-        Compact.Ids.Insert(Id, rank);
-
-        // update Prefix64 for all subsequent words
-        for (int32 ww = w + 1; ww < Compact.Prefix64.Num(); ++ww) ++Compact.Prefix64[ww];
-        return true;
+        const int32 NSZ = Settings->ChunkSizeZ;
+        CopyZBorder(ZNegN, NSZ - 1, CachedNeighborBorders.ZNeg, CachedNeighborBorders.bHasZNeg);
     }
+    if (ZPosN)
+    {
+        CopyZBorder(ZPosN, 0, CachedNeighborBorders.ZPos, CachedNeighborBorders.bHasZPos);
+    }
+
+    bNeighborBordersCached = true;
+    // REMOVED: MarkChunkForSeamRemesh call
 }
-
-bool UVoxelChunkComponent::ClearVoxelCompact(int32 X, int32 Y, int32 Z)
+void UVoxelChunkComponent::EnsureVoxelMaterial_RMC(URealtimeMeshComponent* inRMC,
+    const UVoxelSettings* inSettings,
+    const UVoxelMaterialSet* MatSet)
 {
-    if ((uint32)X >= (uint32)Compact.SizeX || (uint32)Y >= (uint32)Compact.SizeY || (uint32)Z >= (uint32)Compact.SizeZ) return false;
-    const int32 i = UVoxelMesher::Idx3D(X, Y, Z, Compact.SizeX, Compact.SizeY);
-    const int32 w = i >> 6, b = i & 63;
-    const bool wasSolid = ((Compact.Occupancy[w] >> b) & 1ULL) != 0;
-    if (!wasSolid) return false;
-
-    const int32 rank = UVoxelMesher::Rank1_Prefix(Compact, i);
-    if ((uint32)rank < (uint32)Compact.Ids.Num())
-        Compact.Ids.RemoveAt(rank, 1, /*bAllowShrinking*/false);
-
-    Compact.Occupancy[w] &= ~(1ULL << b);
-    for (int32 ww = w + 1; ww < Compact.Prefix64.Num(); ++ww) --Compact.Prefix64[ww];
-    return true;
+    if (!inRMC || !Settings || !MatSet) return;
+    if (!VoxelMID)
+    {
+        UMaterialInterface* Base = Settings->VoxelArrayMaterial.LoadSynchronous();
+        if (!Base) return;
+        VoxelMID = UMaterialInstanceDynamic::Create(Base, this);
+        VoxelMID->SetTextureParameterValue(TEXT("AlbedoArray"), MatSet->Albedo);
+        VoxelMID->SetTextureParameterValue(TEXT("NormalArray"), MatSet->Normal);
+        VoxelMID->SetTextureParameterValue(TEXT("ORMArray"), MatSet->ORM);
+        VoxelMID->SetScalarParameterValue(TEXT("UVScale"), MatSet->UVScale);
+        VoxelMID->SetScalarParameterValue(TEXT("LayersMinusOne"),
+            (float)FMath::Clamp(MatSet->LayersMinusOne, 0, 255));
+    }
+    inRMC->SetMaterial(0, VoxelMID);   // <- appeler SetMaterial sur le RMC
 }

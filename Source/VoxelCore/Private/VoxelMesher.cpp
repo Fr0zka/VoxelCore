@@ -1,10 +1,26 @@
 ﻿#include "VoxelMesher.h"
+#include "VoxelStats.h"
 #include "ProceduralMeshComponent.h"
-#include "GenericPlatform/GenericPlatformMath.h"
-#if WITH_RUNTIME_MESHCOMPONENT
-#include "RuntimeMeshComponent.h"
-#endif
-#include <VoxelGPUMesher.h>
+
+#include "RealtimeMeshComponent.h"
+#include <RealtimeMeshSimple.h>
+#include "VoxelGPUMesher.h"
+#include "VoxelSettings.h"
+#include "HAL/IConsoleManager.h"
+#include <VoxelBlockTable.h>
+
+static void WarnUnsupportedTileSize(const UVoxelSettings* Settings)
+{
+    if (!Settings) return;
+    if (Settings->GPUMesherTileSize == 8) return;
+
+    static bool bWarned = false;
+    if (!bWarned)
+    {
+        bWarned = true;
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU] GPUMesherTileSize is fixed to 8; requested value %d will be ignored."), Settings->GPUMesherTileSize);
+    }
+}
 
 enum class EVoxelFaceDirection : uint8 { XPos, XNeg, YPos, YNeg, ZPos, ZNeg };
 
@@ -35,87 +51,178 @@ static FORCEINLINE bool IsInside(int32 x, int32 y, int32 z, int32 SX, int32 SY, 
     return (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ);
 }
 
-static FORCEINLINE int32 Idx2D(int32 u, int32 v, int32 USize)
+// --- bit ops ---------------------------------------------------------------
+static FORCEINLINE int32 CTZ64(uint64 x)
 {
-    return u + v * USize;
+#if defined(_MSC_VER)
+    unsigned long idx;
+    if (_BitScanForward64(&idx, x)) return (int32)idx;
+    return 64;
+#else
+    return x ? (int32)__builtin_ctzll(x) : 64;
+#endif
 }
 
-void BuildNeighborSolidMasks(
-    const FChunkNeighbors* Neighbors,
-    int32 SizeX, int32 SizeY, int32 SizeZ,
-    FNeighborSolidMasks& MasksOut)
+// Count trailing 1-bits from LSB. Equivalent to CTZ64(~x) with x!=~0ull edge.
+static FORCEINLINE int32 CTONES64(uint64 x)
 {
-    MasksOut.Reset(SizeX, SizeY, SizeZ);
-    if (!Neighbors) return;
+    if (x == ~0ull) return 64;
+    return CTZ64(~x);
+}
 
-    // X- / X+ faces (y,z)
-    if (Neighbors->bHasXNeg && Neighbors->XNeg.Num() == SizeY * SizeZ)
-    {
-        MasksOut.bHasXNeg = true;
-        for (int32 z = 0; z < SizeZ; ++z)
-            for (int32 y = 0; y < SizeY; ++y)
-            {
-                const EVoxelBlockID id = Neighbors->XNeg[Idx2D(y, z, SizeY)];
-                MasksOut.XNeg[Idx2D(y, z, SizeY)] = VoxelIsSolid(id);
-            }
-    }
-    if (Neighbors->bHasXPos && Neighbors->XPos.Num() == SizeY * SizeZ)
-    {
-        MasksOut.bHasXPos = true;
-        for (int32 z = 0; z < SizeZ; ++z)
-            for (int32 y = 0; y < SizeY; ++y)
-            {
-                const EVoxelBlockID id = Neighbors->XPos[Idx2D(y, z, SizeY)];
-                MasksOut.XPos[Idx2D(y, z, SizeY)] = VoxelIsSolid(id);
-            }
-    }
+// --- small math utils ------------------------------------------------------
+static FORCEINLINE FIntVector Neg(const FIntVector& v)
+{
+    return FIntVector(-v.X, -v.Y, -v.Z);
+}
 
-    // Y- / Y+ faces (x,z)
-    if (Neighbors->bHasYNeg && Neighbors->YNeg.Num() == SizeX * SizeZ)
-    {
-        MasksOut.bHasYNeg = true;
-        for (int32 z = 0; z < SizeZ; ++z)
-            for (int32 x = 0; x < SizeX; ++x)
-            {
-                const EVoxelBlockID id = Neighbors->YNeg[Idx2D(x, z, SizeX)];
-                MasksOut.YNeg[Idx2D(x, z, SizeX)] = VoxelIsSolid(id);
-            }
-    }
-    if (Neighbors->bHasYPos && Neighbors->YPos.Num() == SizeX * SizeZ)
-    {
-        MasksOut.bHasYPos = true;
-        for (int32 z = 0; z < SizeZ; ++z)
-            for (int32 x = 0; x < SizeX; ++x)
-            {
-                const EVoxelBlockID id = Neighbors->YPos[Idx2D(x, z, SizeX)];
-                MasksOut.YPos[Idx2D(x, z, SizeX)] = VoxelIsSolid(id);
-            }
-    }
+// ============================================================================
+// UNIFIED TRIANGLE WINDING
+// ============================================================================
+// All CPU meshers should use this function to ensure consistent triangle order.
+//
+// Triangle winding must be consistent with face normal direction to ensure:
+// - Correct backface culling (faces point outward)
+// - Proper lighting calculations
+// - Consistent behavior across all meshing algorithms
+//
+// The winding direction depends on the face normal to ensure CCW winding when
+// viewed from outside the mesh. Different face directions need different index
+// patterns to achieve this.
+// ============================================================================
 
-    // Z- / Z+ faces (x,y)
-    if (Neighbors->bHasZNeg && Neighbors->ZNeg.Num() == SizeX * SizeY)
+static FORCEINLINE void AddTrianglesWithCorrectWinding(
+    FMeshBuffers& Out,
+    int32 baseVertexIndex,
+    const FVector& normal)
+{
+    // Determine winding based on face normal direction
+    // This ensures counter-clockwise winding when viewed from outside
+    const bool useStandardWinding = (normal.X < 0.0f) || (normal.Y > 0.0f) || (normal.Z < 0.0f);
+
+    if (useStandardWinding)
     {
-        MasksOut.bHasZNeg = true;
-        for (int32 y = 0; y < SizeY; ++y)
-            for (int32 x = 0; x < SizeX; ++x)
-            {
-                const EVoxelBlockID id = Neighbors->ZNeg[Idx2D(x, y, SizeX)];
-                MasksOut.ZNeg[Idx2D(x, y, SizeX)] = VoxelIsSolid(id);
-            }
+        // Standard winding: 0->1->2, 0->2->3
+        Out.Triangles.Add(baseVertexIndex + 0);
+        Out.Triangles.Add(baseVertexIndex + 1);
+        Out.Triangles.Add(baseVertexIndex + 2);
+        Out.Triangles.Add(baseVertexIndex + 0);
+        Out.Triangles.Add(baseVertexIndex + 2);
+        Out.Triangles.Add(baseVertexIndex + 3);
     }
-    if (Neighbors->bHasZPos && Neighbors->ZPos.Num() == SizeX * SizeY)
+    else
     {
-        MasksOut.bHasZPos = true;
-        for (int32 y = 0; y < SizeY; ++y)
-            for (int32 x = 0; x < SizeX; ++x)
-            {
-                const EVoxelBlockID id = Neighbors->ZPos[Idx2D(x, y, SizeX)];
-                MasksOut.ZPos[Idx2D(x, y, SizeX)] = VoxelIsSolid(id);
-            }
+        // Flipped winding: 0->2->1, 0->3->2
+        Out.Triangles.Add(baseVertexIndex + 0);
+        Out.Triangles.Add(baseVertexIndex + 2);
+        Out.Triangles.Add(baseVertexIndex + 1);
+        Out.Triangles.Add(baseVertexIndex + 0);
+        Out.Triangles.Add(baseVertexIndex + 3);
+        Out.Triangles.Add(baseVertexIndex + 2);
     }
 }
 
+static FORCEINLINE void EmitQuad_Fast(
+    FMeshBuffers& Out,
+    const FVector& base,
+    const FVector& uvec,
+    const FVector& vvec,
+    const FVector& normal,
+    int32 w, int32 h,
+    bool bTintSemi,
+    float ao00, float ao10, float ao11, float ao01)
+{
+    const int32 v0 = Out.Vertices.Num();
 
+    Out.Vertices.Add(base);
+    Out.Vertices.Add(base + uvec);
+    Out.Vertices.Add(base + uvec + vvec);
+    Out.Vertices.Add(base + vvec);
+
+    // Flip normals to fix inverted faces
+    Out.Normals.Add(-normal); Out.Normals.Add(-normal);
+    Out.Normals.Add(-normal); Out.Normals.Add(-normal);
+
+    Out.UVs.Add({ 0,0 });
+    Out.UVs.Add({ (float)w,0 });
+    Out.UVs.Add({ (float)w,(float)h });
+    Out.UVs.Add({ 0,(float)h });
+
+    const float shade = bTintSemi ? 0.7f : 1.0f;
+    auto addGray = [&](float a) { const float v = shade * a; Out.Colors.Add(FColor(v, v, v, 1)); };
+    addGray(ao00); addGray(ao10); addGray(ao11); addGray(ao01);
+
+    // Use unified winding function
+    AddTrianglesWithCorrectWinding(Out, v0, normal);
+}
+
+
+
+// Category access with neighbor support.
+static FORCEINLINE uint8 CatAt_WithNbh(
+    const TArray<uint8>& Cats, const FIntVector& Size,
+    const FChunkNeighbors* Nbh,
+    int32 x, int32 y, int32 z)
+{
+    const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
+    auto inside = [&](int32 X, int32 Y, int32 Z) { return (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ; };
+    auto idx = [&](int32 X, int32 Y, int32 Z) { return X + Y * SX + Z * SX * SY; };
+
+    if (inside(x, y, z)) return Cats[idx(x, y, z)];
+    if (!Nbh) return 0;
+
+    // Z-
+    if (z < 0) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZNeg) return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]); return 0; }
+    // Z+
+    if (z >= SZ) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZPos) return VoxelBlockCategory(Nbh->ZPos[x + y * SX]); return 0; }
+    // X-
+    if (x < 0) { if ((unsigned)y < (unsigned)SY && Nbh->bHasXNeg) return VoxelBlockCategory(Nbh->XNeg[y + z * SY]); return 2; }
+    // X+
+    if (x >= SX) { if ((unsigned)y < (unsigned)SY && Nbh->bHasXPos) return VoxelBlockCategory(Nbh->XPos[y + z * SY]); return 0; }
+    // Y-
+    if (y < 0) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYNeg) return VoxelBlockCategory(Nbh->YNeg[x + z * SX]); return 0; }
+    // Y+
+    if (y >= SY) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYPos) return VoxelBlockCategory(Nbh->YPos[x + z * SX]); return 0; }
+    return 0;
+}
+
+// Thread-local reusable mask buffer to avoid allocations
+static thread_local TArray<uint8> GReusableMask;
+// Return the solid voxel that owns a face (depends on face direction and chunk borders).
+static FORCEINLINE EVoxelBlockID OwnerBlockForFace(
+    const TArray<EVoxelBlockID>& V, const FIntVector& Size,
+    const FChunkNeighbors* Nbh, int x, int y, int z, EVoxelFaceDir dir)
+{
+    const int SX = Size.X, SY = Size.Y, SZ = Size.Z;
+
+    auto inside = [&](int X, int Y, int Z) {
+        return (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ;
+        };
+    auto at = [&](int X, int Y, int Z)->EVoxelBlockID { return V[X + Y * SX + Z * SX * SY]; };
+
+    auto sample = [&](int X, int Y, int Z)->EVoxelBlockID {
+        if (inside(X, Y, Z)) return at(X, Y, Z);
+        if (!Nbh) return EVoxelBlockID::Air;
+        if (Z < 0)    return (Nbh->bHasZNeg && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZNeg[X + Y * SX] : EVoxelBlockID::Air;
+        if (Z >= SZ)  return (Nbh->bHasZPos && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZPos[X + Y * SX] : EVoxelBlockID::Air;
+        if (X < 0)    return (Nbh->bHasXNeg && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ) ? Nbh->XNeg[Y + Z * SY] : EVoxelBlockID::Air;
+        if (X >= SX)  return (Nbh->bHasXPos && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ) ? Nbh->XPos[Y + Z * SY] : EVoxelBlockID::Air;
+        if (Y < 0)    return (Nbh->bHasYNeg && (unsigned)X < (unsigned)SX && (unsigned)Z < (unsigned)SZ) ? Nbh->YNeg[X + Z * SX] : EVoxelBlockID::Air;
+        return (Nbh->bHasYPos && (unsigned)X < (unsigned)SX && (unsigned)Z < (unsigned)SZ) ? Nbh->YPos[X + Z * SX] : EVoxelBlockID::Air;
+        };
+
+    // “Back” = solid side of the face.  If that is empty, fall back to the other side.
+    switch (dir)
+    {
+    case EVoxelFaceDir::XPos: { EVoxelBlockID back = sample(x - 1, y, z); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::XNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x - 1, y, z); }
+    case EVoxelFaceDir::YPos: { EVoxelBlockID back = sample(x, y - 1, z); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::YNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x, y - 1, z); }
+    case EVoxelFaceDir::ZPos: { EVoxelBlockID back = sample(x, y, z - 1); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::ZNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x, y, z - 1); }
+    }
+    return EVoxelBlockID::Air;
+}
 void UVoxelMesher::BuildGreedyMesh(
     const TArray<EVoxelBlockID>& Voxels,
     const FIntVector& Size,
@@ -123,65 +230,117 @@ void UVoxelMesher::BuildGreedyMesh(
     float VoxelUU,
     int32 XYScale,
     bool bUseAO,
+    const class UVoxelBlockTable* BlockTable,
     FMeshBuffers& Out)
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Mesher_GreedyCPU);
-    SCOPE_CYCLE_COUNTER(STAT_Voxel_GreedyCPU);
+    SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
+
     const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
     Out.Vertices.Reset(); Out.Triangles.Reset(); Out.UVs.Reset(); Out.Colors.Reset(); Out.Normals.Reset();
+
+    // Pre-calculate max mask size needed
+    const int32 MaxMaskSize = FMath::Max3(SX * SY, SY * SZ, SX * SZ);
+    GReusableMask.SetNumUninitialized(MaxMaskSize);
 
     // Anisotropic world scale: XY scaled by XYScale; Z stays 1×
     const double ScaleX = (double)VoxelUU * (double)XYScale;
     const double ScaleY = (double)VoxelUU * (double)XYScale;
     const double ScaleZ = (double)VoxelUU;
 
-    // Build compact 1-bit neighbor masks
-    FNeighborSolidMasks Masks;
-    BuildNeighborSolidMasks(Nbh, SX, SY, SZ, Masks);
+    // Precompute a compact category array for all voxels within this chunk.  This
+    // avoids repeatedly calling VoxelBlockCategory() in the inner loops of the
+    // mesher and improves cache locality.  Each entry is 0 for air, 1 for
+    // semi‑solid and 2 for fully solid voxels.  Note: the neighbour arrays are
+    // not transformed and will still be queried via VoxelBlockCategory().
+    TArray<uint8> LocalCats;
+    LocalCats.SetNumUninitialized(SX * SY * SZ);
+    for (int32 idx = 0; idx < SX * SY * SZ; ++idx)
+    {
+        LocalCats[idx] = VoxelBlockCategory(Voxels[idx]);
+    }
 
-    auto Idx3D = [&](int32 x, int32 y, int32 z) -> int32
-        {
-            return x + y * SX + z * (SX * SY);
-        };
-
+    // Returns true if the voxel at (x,y,z) is non‑transparent (air returns
+    // false).  Uses the precomputed LocalCats array for voxels within the
+    // current chunk.  For neighbours, fall back to VoxelBlockCategory().
     auto Solid = [&](int32 x, int32 y, int32 z) -> bool
         {
-            // Inside the chunk: direct lookup (EVoxelBlockID)
-            if (x >= 0 && x < SX &&
-                y >= 0 && y < SY &&
-                z >= 0 && z < SZ)
+            if (IsInside(x, y, z, SX, SY, SZ))
             {
-                const EVoxelBlockID id = Voxels[Idx3D(x, y, z)];
-                return VoxelIsSolid(id);
+                return LocalCats[Idx(x, y, z, SX, SY)] != 0;
             }
-
-            // Outside: use 1-bit neighbor masks
-            if (z >= 0 && z < SZ)
+            // Out of bounds: sample neighbour chunk categories
+            // Out of bounds: sample neighbour chunk categories.  We handle
+            // vertical neighbours (z) as well as horizontal ones.  Note that
+            // z refers to the index relative to this chunk (0..SZ‑1) but
+            // may fall outside when sampling neighbours.
+            if (!Nbh) return false;
+            // Sample vertical neighbours first
+            if (z < 0)
             {
-                if (x < 0 && y >= 0 && y < SY && Masks.bHasXNeg)
-                    return Masks.XNeg[y + z * SY];
-                if (x >= SX && y >= 0 && y < SY && Masks.bHasXPos)
-                    return Masks.XPos[y + z * SY];
-
-                if (y < 0 && x >= 0 && x < SX && Masks.bHasYNeg)
-                    return Masks.YNeg[x + z * SX];
-                if (y >= SY && x >= 0 && x < SX && Masks.bHasYPos)
-                    return Masks.YPos[x + z * SX];
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
+                    return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]) != 0;
+                return false;
             }
-
-            if (x >= 0 && x < SX && y >= 0 && y < SY)
+            if (z >= SZ)
             {
-                if (z < 0 && Masks.bHasZNeg)
-                    return Masks.ZNeg[x + y * SX];
-                if (z >= SZ && Masks.bHasZPos)
-                    return Masks.ZPos[x + y * SX];
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
+                    return VoxelBlockCategory(Nbh->ZPos[x + y * SX]) != 0;
+                return false;
             }
-
-            // If we don't have that neighbor face, treat as air
+            // Horizontal neighbours
+            if (x < 0 && y >= 0 && y < SY && Nbh->bHasXNeg)
+                return VoxelBlockCategory(Nbh->XNeg[y + z * SY]) != 0;
+            if (x >= SX && y >= 0 && y < SY && Nbh->bHasXPos)
+                return VoxelBlockCategory(Nbh->XPos[y + z * SY]) != 0;
+            if (y < 0 && x >= 0 && x < SX && Nbh->bHasYNeg)
+                return VoxelBlockCategory(Nbh->YNeg[x + z * SX]) != 0;
+            if (y >= SY && x >= 0 && x < SX && Nbh->bHasYPos)
+                return VoxelBlockCategory(Nbh->YPos[x + z * SX]) != 0;
             return false;
         };
 
-    auto Greyscale = [](float V) -> FLinearColor { return FLinearColor(V, V, V, 1.0f); };
+    // Returns a coarse block category for the voxel at (x,y,z).  See
+    // VoxelBlockCategory() for details.  Category 0 means empty/air.
+    auto BlockCategoryAt = [&](int32 x, int32 y, int32 z) -> uint8
+        {
+            if (IsInside(x, y, z, SX, SY, SZ))
+            {
+                return LocalCats[Idx(x, y, z, SX, SY)];
+            }
+            if (!Nbh) return 0;
+            // Vertical neighbours
+            if (z < 0)
+            {
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
+                    return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]);
+                return 0;
+            }
+            if (z >= SZ)
+            {
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
+                    return VoxelBlockCategory(Nbh->ZPos[x + y * SX]);
+                return 0;
+            }
+            // Horizontal neighbours
+            if (x < 0 && y >= 0 && y < SY && Nbh->bHasXNeg)
+                return VoxelBlockCategory(Nbh->XNeg[y + z * SY]);
+            if (x >= SX && y >= 0 && y < SY && Nbh->bHasXPos)
+                return VoxelBlockCategory(Nbh->XPos[y + z * SY]);
+            if (y < 0 && x >= 0 && x < SX && Nbh->bHasYNeg)
+                return VoxelBlockCategory(Nbh->YNeg[x + z * SX]);
+            if (y >= SY && x >= 0 && x < SX && Nbh->bHasYPos)
+                return VoxelBlockCategory(Nbh->YPos[x + z * SX]);
+            return 0;
+        };
+    // decide which block is the “owner” of this face: the solid one
+    auto BlockAt = [&](int X, int Y, int Z)->EVoxelBlockID {
+        const int SX = Size.X, SY = Size.Y, SZ = Size.Z;
+        if ((unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ)
+            return Voxels[X + Y * SX + Z * SX * SY];
+        // optional: fall back to neighbor slices for layer, or default
+        return EVoxelBlockID::Stone;
+        };
+    auto Greyscale = [](float V) -> FColor { return FColor(V, V, V, 1.0f); };
     auto Idx2D = [](int32 u, int32 v, int32 DimU) { return u + v * DimU; };
 
     auto SampleAO = [&](FIntVector P, FIntVector N, FIntVector U, FIntVector V) -> float
@@ -203,7 +362,7 @@ void UVoxelMesher::BuildGreedyMesh(
         const int32 SliceCount = (N.X != 0) ? SX : (N.Y != 0) ? SY : SZ;
         const int32 DimU = (N.X != 0) ? SY : (N.Y != 0) ? SX : SX;
         const int32 DimV = (N.X != 0) ? SZ : (N.Y != 0) ? SZ : SY;
-
+        EVoxelBlockID SolidBlock;
         auto MakeP = [&](int32 s, int32 u, int32 v)->FIntVector
             {
                 if (N.X != 0) return FIntVector(s, u, v);
@@ -213,16 +372,26 @@ void UVoxelMesher::BuildGreedyMesh(
 
         for (int32 slice = 0; slice < SliceCount; ++slice)
         {
-            TArray<uint8> Mask; Mask.SetNumZeroed(DimU * DimV);
+            // Reuse mask buffer - zero only what we need
+            const int32 MaskSize = DimU * DimV;
+            FMemory::Memzero(GReusableMask.GetData(), MaskSize * sizeof(uint8));
 
             for (int32 vv = 0; vv < DimV; ++vv)
                 for (int32 uu = 0; uu < DimU; ++uu)
                 {
                     const FIntVector P = MakeP(slice, uu, vv);
                     const FIntVector Q = P + N;
-                    const bool A = Solid(P.X, P.Y, P.Z);
-                    const bool B = Solid(Q.X, Q.Y, Q.Z);
-                    Mask[Idx2D(uu, vv, DimU)] = (A && !B) ? 1 : 0;
+                    // Determine block categories for the current voxel and its neighbor.
+                    const uint8 CatA = BlockCategoryAt(P.X, P.Y, P.Z);
+                    const uint8 CatB = BlockCategoryAt(Q.X, Q.Y, Q.Z);
+                    // Emit a face only when the categories differ and the current voxel is non‑empty.
+                    const bool bFacesBetweenNonAir = false; // cvar or setting
+                    const bool bExpose = (CatA != 0) && ((CatB == 0) || (bFacesBetweenNonAir && (CatA != CatB)));
+                    const uint8 MaskVal = bExpose ? CatA : 0;
+                    // Owner is the solid voxel A; neighbor B is air
+                    EVoxelBlockID Owner = BlockAt(P.X, P.Y, P.Z);
+                    SolidBlock = (CatA != 0 ? BlockAt(P.X, P.Y, P.Z) : BlockAt(Q.X, Q.Y, Q.Z));
+                    GReusableMask[Idx2D(uu, vv, DimU)] = MaskVal;
                 }
 
             int32 v = 0;
@@ -232,28 +401,51 @@ void UVoxelMesher::BuildGreedyMesh(
                 while (u < DimU)
                 {
                     const int32 idx = Idx2D(u, v, DimU);
-                    if (!Mask[idx]) { ++u; continue; }
+                    const uint8 CurrentType = GReusableMask[idx];
+                    // Skip empty entries (no face)
+                    if (CurrentType == 0)
+                    {
+                        ++u;
+                        continue;
+                    }
 
+                    // Extend the quad along U while the mask value stays the same
                     int32 Width = 1;
-                    while ((u + Width) < DimU && Mask[Idx2D(u + Width, v, DimU)]) ++Width;
+                    while ((u + Width) < DimU && GReusableMask[Idx2D(u + Width, v, DimU)] == CurrentType)
+                    {
+                        ++Width;
+                    }
 
+                    // Extend the quad along V while all mask values in the current row are the same
                     int32 Height = 1;
                     bool Stop = false;
                     while ((v + Height) < DimV && !Stop)
                     {
                         for (int32 w = 0; w < Width; ++w)
-                            if (!Mask[Idx2D(u + w, v + Height, DimU)]) { Stop = true; break; }
-                        if (!Stop) ++Height;
+                        {
+                            if (GReusableMask[Idx2D(u + w, v + Height, DimU)] != CurrentType)
+                            {
+                                Stop = true;
+                                break;
+                            }
+                        }
+                        if (!Stop)
+                        {
+                            ++Height;
+                        }
                     }
 
                     for (int32 dv = 0; dv < Height; ++dv)
                         for (int32 du = 0; du < Width; ++du)
-                            Mask[Idx2D(u + du, v + dv, DimU)] = 0;
+                        {
+                            GReusableMask[Idx2D(u + du, v + dv, DimU)] = 0;
+                        }
 
                     const FIntVector Base = MakeP(slice, u, v);
                     const FIntVector Offset(FMath::Max(0, N.X), FMath::Max(0, N.Y), FMath::Max(0, N.Z));
                     const FIntVector FaceBase = Base + Offset;
 
+                    // Anisotropic scale
                     const FVector WorldBase(
                         FaceBase.X * ScaleX,
                         FaceBase.Y * ScaleY,
@@ -276,22 +468,27 @@ void UVoxelMesher::BuildGreedyMesh(
                     Out.Vertices.Add(WorldBase + VecU + VecV);
                     Out.Vertices.Add(WorldBase + VecV);
 
-                    const FVector FaceNormal = FVector(N);
+                    const FVector FaceNormal = FVector(N); // outward
                     Out.Normals.Add(FaceNormal); Out.Normals.Add(FaceNormal);
                     Out.Normals.Add(FaceNormal); Out.Normals.Add(FaceNormal);
 
-                    const FVector Uf = FVector(U), Vf = FVector(V);
-                    const float Sign = FVector::DotProduct(FVector::CrossProduct(Uf, Vf), FVector(N));
-                    if (Sign < 0.f)
-                    {
-                        Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 1); Out.Triangles.Add(VStart + 2);
-                        Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 2); Out.Triangles.Add(VStart + 3);
-                    }
-                    else
-                    {
-                        Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 2); Out.Triangles.Add(VStart + 1);
-                        Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 3); Out.Triangles.Add(VStart + 2);
-                    }
+                    // Use unified winding function
+                    AddTrianglesWithCorrectWinding(Out, VStart, FaceNormal);
+
+                    auto ToByte = [](float v) { return (uint8)FMath::Clamp(FMath::RoundToInt(v * 255.f), 0, 255); };
+
+                    auto FaceDirToEnum = [](const FIntVector& N)->EVoxelFaceDir {
+                        if (N.X == 1) return EVoxelFaceDir::XPos;
+                        if (N.X == -1) return EVoxelFaceDir::XNeg;
+                        if (N.Y == 1) return EVoxelFaceDir::YPos;
+                        if (N.Y == -1) return EVoxelFaceDir::YNeg;
+                        if (N.Z == 1) return EVoxelFaceDir::ZPos;
+                        return EVoxelFaceDir::ZNeg;
+                        };
+                    const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
+                    const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBase.X, FaceBase.Y, FaceBase.Z, FaceDir);
+                    const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
+
 
                     Out.UVs.Add(FVector2D(0, 0));
                     Out.UVs.Add(FVector2D((float)Width, 0));
@@ -300,503 +497,55 @@ void UVoxelMesher::BuildGreedyMesh(
 
                     const FIntVector UNeg(-U.X, -U.Y, -U.Z), VNeg(-V.X, -V.Y, -V.Z);
                     const FIntVector AOBase = FaceBase;
-                    Out.Colors.Add(Greyscale(SampleAO(AOBase, N, UNeg, VNeg)));
-                    Out.Colors.Add(Greyscale(SampleAO(AOBase + U * Width, N, U, VNeg)));
-                    Out.Colors.Add(Greyscale(SampleAO(AOBase + U * Width + V * Height, N, U, V)));
-                    Out.Colors.Add(Greyscale(SampleAO(AOBase + V * Height, N, UNeg, V)));
+                    // Apply a tint factor based on the block category.  Semi‑solid blocks
+                    // (category 1) are tinted slightly darker to distinguish them visually.
+                    const float ShadeFactor = (CurrentType == 1 ? 0.7f : 1.0f);
+                    const float Shade = (CurrentType == 1 ? 0.7f : 1.0f);
+                    const uint8 AO00 = ToByte(Shade * SampleAO(AOBase, N, UNeg, VNeg));
+                    const uint8 AO10 = ToByte(Shade * SampleAO(AOBase + U * Width, N, U, VNeg));
+                    const uint8 AO11 = ToByte(Shade * SampleAO(AOBase + U * Width + V * Height, N, U, V));
+                    const uint8 AO01 = ToByte(Shade * SampleAO(AOBase + V * Height, N, UNeg, V));
+
+                    Out.Colors.Add(FColor(AO00, AO00, AO00, Layer));
+                    Out.Colors.Add(FColor(AO10, AO10, AO10, Layer));
+                    Out.Colors.Add(FColor(AO11, AO11, AO11, Layer));
+                    Out.Colors.Add(FColor(AO01, AO01, AO01, Layer));
                     u += Width;
                 }
                 ++v;
             }
         }
     }
+
+    // Update memory stats
+    const int32 BufferMemory =
+        Out.Vertices.Num() * sizeof(FVector) +
+        Out.Triangles.Num() * sizeof(int32) +
+        Out.UVs.Num() * sizeof(FVector2D) +
+        Out.Colors.Num() * sizeof(FLinearColor) +
+        Out.Normals.Num() * sizeof(FVector);
+    INC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, BufferMemory);
 }
 
-void UVoxelMesher::BuildGreedyMesh_FaceMask(
+//=== Binary Greedy Mesher ===//
+
+void UVoxelMesher::BuildBinaryGreedyMesh(
     const TArray<EVoxelBlockID>& Voxels,
     const FIntVector& Size,
     const FChunkNeighbors* Nbh,
     float VoxelUU,
     int32 XYScale,
     bool bUseAO,
+    const class UVoxelBlockTable* BlockTable,
     FMeshBuffers& Out)
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Mesher_GreedyCPU);
-    SCOPE_CYCLE_COUNTER(STAT_Voxel_GreedyCPU);
+    const int32 N = Size.X * Size.Y * Size.Z;
+    TArray<uint8> Cats; Cats.SetNumUninitialized(N);
+    for (int32 i = 0; i < N; ++i)
+        Cats[i] = VoxelBlockCategory(Voxels[i]);
 
-    const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
-    Out = FMeshBuffers{};
-    if (SX <= 0 || SY <= 0 || SZ <= 0 || Voxels.Num() != SX * SY * SZ)
-        return;
-
-    // ---- Reserve generous bounds (shell faces) to reduce reallocs
-    const int32 MaxFaces = 2 * (SX * SY + SX * SZ + SY * SZ);
-    Out.Vertices.Reserve(MaxFaces * 4);
-    Out.Normals.Reserve(MaxFaces * 4);
-    Out.UVs.Reserve(MaxFaces * 4);
-    Out.Colors.Reserve(MaxFaces * 4);
-    Out.Triangles.Reserve(MaxFaces * 6);
-
-    // ---- Anisotropic world scale (XY × XYScale, Z × 1)
-    const double ScaleX = (double)VoxelUU * (double)XYScale;
-    const double ScaleY = (double)VoxelUU * (double)XYScale;
-    const double ScaleZ = (double)VoxelUU;
-
-    // ---- Neighbor solid masks
-    FNeighborSolidMasks Masks;
-    BuildNeighborSolidMasks(Nbh, SX, SY, SZ, Masks);
-
-    // ---- Solid bytes inside the chunk
-    auto Idx3D = [&](int32 x, int32 y, int32 z) { return x + y * SX + z * SX * SY; };
-    TArray<uint8> Solid; Solid.SetNumUninitialized(Voxels.Num());
-    for (int32 i = 0; i < Voxels.Num(); ++i)
-        Solid[i] = VoxelIsSolid(Voxels[i]) ? 1 : 0;
-
-    // ---- Fast "solid" including neighbors
-    auto SolidFast = [&](int32 x, int32 y, int32 z) -> bool
-        {
-            if (x >= 0 && x < SX && y >= 0 && y < SY && z >= 0 && z < SZ)
-                return Solid[Idx3D(x, y, z)] != 0;
-
-            if (z >= 0 && z < SZ)
-            {
-                if (x < 0 && y >= 0 && y < SY && Masks.bHasXNeg)  return Masks.XNeg[y + z * SY];
-                if (x >= SX && y >= 0 && y < SY && Masks.bHasXPos)  return Masks.XPos[y + z * SY];
-
-                if (y < 0 && x >= 0 && x < SX && Masks.bHasYNeg)  return Masks.YNeg[x + z * SX];
-                if (y >= SY && x >= 0 && x < SX && Masks.bHasYPos)  return Masks.YPos[x + z * SX];
-            }
-            if (x >= 0 && x < SX && y >= 0 && y < SY)
-            {
-                if (z < 0 && Masks.bHasZNeg) return Masks.ZNeg[x + y * SX];
-                if (z >= SZ && Masks.bHasZPos) return Masks.ZPos[x + y * SX];
-            }
-            return false;
-        };
-
-    // ---- AO (LUT)
-    static const float AOlut[8] = { 1.f, 2.f / 3.f, 2.f / 3.f, 1.f / 3.f, 2.f / 3.f, 1.f / 3.f, 1.f / 3.f, 0.f };
-    auto AO = [&](const FIntVector& P, const FIntVector& N, const FIntVector& U, const FIntVector& V) -> float
-        {
-            if (!bUseAO) return 1.0f;
-            const int Sa = SolidFast((P + U).X, (P + U).Y, (P + U).Z) ? 1 : 0;
-            const int Sb = SolidFast((P + V).X, (P + V).Y, (P + V).Z) ? 1 : 0;
-            const int Sc = SolidFast((P + U + V).X, (P + U + V).Y, (P + U + V).Z) ? 1 : 0;
-            return AOlut[Sa | (Sb << 1) | (Sc << 2)];
-        };
-    auto Grey = [](float V) { return FLinearColor(V, V, V, 1); };
-
-    auto EmitQuad = [&](const FIntVector& FaceBase, const FIntVector& N, const FIntVector& U, const FIntVector& V,
-        int32 W, int32 H)
-        {
-            const FVector WorldBase(FaceBase.X * ScaleX, FaceBase.Y * ScaleY, FaceBase.Z * ScaleZ);
-            const FVector VecU(U.X * (double)W * ScaleX, U.Y * (double)W * ScaleY, U.Z * (double)W * ScaleZ);
-            const FVector VecV(V.X * (double)H * ScaleX, V.Y * (double)H * ScaleY, V.Z * (double)H * ScaleZ);
-
-            const int32 VStart = Out.Vertices.Num();
-            Out.Vertices.Add(WorldBase);
-            Out.Vertices.Add(WorldBase + VecU);
-            Out.Vertices.Add(WorldBase + VecU + VecV);
-            Out.Vertices.Add(WorldBase + VecV);
-
-            const FVector FaceNormal(N);
-            Out.Normals.Add(FaceNormal); Out.Normals.Add(FaceNormal);
-            Out.Normals.Add(FaceNormal); Out.Normals.Add(FaceNormal);
-
-            const float Sign = FVector::DotProduct(FVector::CrossProduct(FVector(U), FVector(V)), FVector(N));
-            if (Sign < 0.f)
-            {
-                Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 1); Out.Triangles.Add(VStart + 2);
-                Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 2); Out.Triangles.Add(VStart + 3);
-            }
-            else
-            {
-                Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 2); Out.Triangles.Add(VStart + 1);
-                Out.Triangles.Add(VStart + 0); Out.Triangles.Add(VStart + 3); Out.Triangles.Add(VStart + 2);
-            }
-
-            const FIntVector UNeg(-U.X, -U.Y, -U.Z), VNeg(-V.X, -V.Y, -V.Z);
-            const FIntVector AOBase = FaceBase;
-            Out.Colors.Add(Grey(AO(AOBase, N, UNeg, VNeg)));
-            Out.Colors.Add(Grey(AO(AOBase + U * W, N, U, VNeg)));
-            Out.Colors.Add(Grey(AO(AOBase + U * W + V * H, N, U, V)));
-            Out.Colors.Add(Grey(AO(AOBase + V * H, N, UNeg, V)));
-        };
-
-    // ---- 64-bit pack/unpack helpers (support strided rows)
-    auto Pack64_Strided = [](const uint8* Base, int32 Stride, int32 Count, int32 StartU) -> uint64
-        {
-            uint64 w = 0;
-            const int32 MaxI = FMath::Min(64, Count - StartU);
-            const uint8* p = Base + StartU * Stride;
-            for (int32 i = 0; i < MaxI; ++i)
-            {
-                w |= (uint64)(p[0] ? 1u : 0u) << i;
-                p += Stride;
-            }
-            return w;
-        };
-    auto Pack64_Contig = [](const uint8* Base, int32 Count, int32 StartU) -> uint64
-        {
-            uint64 w = 0;
-            const int32 MaxI = FMath::Min(64, Count - StartU);
-            const uint8* p = Base + StartU;
-            for (int32 i = 0; i < MaxI; ++i) w |= (uint64)(p[i] ? 1u : 0u) << i;
-            return w;
-        };
-    auto Unpack64_ToBytes = [](uint8* Row, int32 Count, int32 StartU, uint64 Word)
-        {
-            const int32 MaxI = FMath::Min(64, Count - StartU);
-            for (int32 i = 0; i < MaxI; ++i) Row[StartU + i] = (uint8)((Word >> i) & 1ull);
-        };
-
-    // ---- Bit-pack helpers for TBitArray neighbor masks
-    auto Pack64_Bits = [](const TBitArray<>& Bits, int32 StartAbs, int32 EndAbsExclusive) -> uint64
-        {
-            uint64 w = 0;
-            const int32 MaxI = FMath::Min(64, EndAbsExclusive - StartAbs);
-            for (int32 i = 0; i < MaxI; ++i)
-                if (Bits[StartAbs + i]) w |= (1ull << i);
-            return w;
-        };
-    auto Pack64_BitsRow = [&](const TBitArray<>& Bits, int32 RowOffset, int32 StartU, int32 RowLenU) -> uint64
-        {
-            const int32 StartAbs = RowOffset + StartU;
-            const int32 EndAbsExclusive = RowOffset + RowLenU;
-            return Pack64_Bits(Bits, StartAbs, EndAbsExclusive);
-        };
-
-    // ---- RLE greedy (row-runs)
-    struct FRun { int32 U0, U1; }; // [U0,U1)
-
-    auto Greedy2D_RLE = [&](uint8* Mask, int32 DimU, int32 DimV,
-        const FIntVector& N, const FIntVector& U, const FIntVector& V,
-        const TFunction<FIntVector(int32 slice, int32 uu, int32 vv)>& MakeBase,
-        int32 Slice)
-        {
-            TArray<int32> H;  H.Init(0, DimU);
-            TArray<FRun> Prev, Curr; Prev.Reserve(128); Curr.Reserve(128);
-
-            for (int32 vv = 0; vv < DimV; ++vv)
-            {
-                // runs for this row
-                Curr.Reset();
-                uint8* R = Mask + vv * DimU;
-                int32 u = 0;
-                while (u < DimU)
-                {
-                    while (u < DimU && R[u] == 0) ++u;
-                    if (u >= DimU) break;
-                    int32 w = u;
-                    while (w < DimU && R[w] != 0) ++w;
-                    Curr.Add({ u,w });
-                    u = w;
-                }
-
-                // extend heights in overlaps, flush non-overlaps
-                int32 iA = 0, iB = 0;
-                while (iA < Prev.Num() || iB < Curr.Num())
-                {
-                    const int32 a0 = (iA < Prev.Num()) ? Prev[iA].U0 : INT_MAX;
-                    const int32 a1 = (iA < Prev.Num()) ? Prev[iA].U1 : INT_MAX;
-                    const int32 b0 = (iB < Curr.Num()) ? Curr[iB].U0 : INT_MAX;
-                    const int32 b1 = (iB < Curr.Num()) ? Curr[iB].U1 : INT_MAX;
-
-                    if (a0 < b0)
-                    {
-                        const int32 e = FMath::Min(a1, b0);
-                        for (int32 uu = a0; uu < e; ++uu)
-                        {
-                            const int32 hh = H[uu];
-                            if (hh > 0)
-                            {
-                                const FIntVector Base = MakeBase(Slice, uu, vv - hh);
-                                const FIntVector Off(FMath::Max(0, N.X), FMath::Max(0, N.Y), FMath::Max(0, N.Z));
-                                EmitQuad(Base + Off, N, U, V, 1, hh);
-                                H[uu] = 0;
-                            }
-                        }
-                        if (a1 <= b0) { ++iA; continue; }
-                    }
-
-                    if (a0 != INT_MAX && b0 != INT_MAX)
-                    {
-                        const int32 u0 = FMath::Max(a0, b0);
-                        const int32 u1 = FMath::Min(a1, b1);
-                        if (u0 < u1) for (int32 uu = u0; uu < u1; ++uu) H[uu] += 1;
-                    }
-
-                    if (a1 <= b1) ++iA;
-                    if (b1 <= a1) ++iB;
-                }
-
-                // columns that started this row
-                for (const FRun& r : Curr)
-                    for (int32 uu = r.U0; uu < r.U1; ++uu)
-                        if (H[uu] == 0) H[uu] = 1;
-
-                // coalesce equal heights into wide quads
-                int32 uu = 0;
-                while (uu < DimU)
-                {
-                    while (uu < DimU && H[uu] == 0) ++uu;
-                    if (uu >= DimU) break;
-                    const int32 hh = H[uu];
-                    int32 w = uu + 1;
-                    while (w < DimU && H[w] == hh) ++w;
-
-                    const FIntVector Base = MakeBase(Slice, uu, vv - hh + 1);
-                    const FIntVector Off(FMath::Max(0, N.X), FMath::Max(0, N.Y), FMath::Max(0, N.Z));
-                    EmitQuad(Base + Off, N, U, V, w - uu, hh);
-                    for (int32 k = uu; k < w; ++k) H[k] = 0;
-                    uu = w;
-                }
-
-                Prev = MoveTemp(Curr);
-            }
-
-            // flush remaining columns
-            for (int32 uu = 0; uu < DimU; ++uu)
-            {
-                const int32 hh = H[uu];
-                if (hh > 0)
-                {
-                    const FIntVector Base = MakeBase(Slice, uu, DimV - hh);
-                    const FIntVector Off(FMath::Max(0, N.X), FMath::Max(0, N.Y), FMath::Max(0, N.Z));
-                    EmitQuad(Base + Off, N, U, V, 1, hh);
-                }
-            }
-        };
-
-    // Reused 2D byte mask
-    TArray<uint8> Mask;
-
-    // ========================== per-axis, per-slice ==========================
-
-    // +X : mask(u=y, v=z) = S(x,y,z) & !S(x+1,y,z)
-    {
-        const int32 DimU = SY, DimV = SZ;
-        for (int32 x = 0; x < SX; ++x)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                // rows are along y, stride = SX
-                const uint8* ARow = &Solid[Idx3D(x, 0, z)];
-                const uint8* BRow = (x + 1 < SX) ? &Solid[Idx3D(x + 1, 0, z)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + z * DimU;
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Strided(ARow, SX, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Strided(BRow, SX, DimU, u);
-                    }
-                    else if (Masks.bHasXPos)
-                    {
-                        const int32 rowOffset = z * SY;
-                        B = Pack64_BitsRow(Masks.XPos, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(+1, 0, 0), U(0, +1, 0), V(0, 0, +1);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(slice, u, v); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, x);
-        }
-    }
-
-    // -X : mask(u=y, v=z) = S(x,y,z) & !S(x-1,y,z)
-    {
-        const int32 DimU = SY, DimV = SZ;
-        for (int32 x = 0; x < SX; ++x)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                const uint8* ARow = &Solid[Idx3D(x, 0, z)];
-                const uint8* BRow = (x - 1 >= 0) ? &Solid[Idx3D(x - 1, 0, z)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + z * DimU;
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Strided(ARow, SX, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Strided(BRow, SX, DimU, u);
-                    }
-                    else if (Masks.bHasXNeg)
-                    {
-                        const int32 rowOffset = z * SY;
-                        B = Pack64_BitsRow(Masks.XNeg, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(-1, 0, 0), U(0, +1, 0), V(0, 0, +1);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(slice, u, v); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, x);
-        }
-    }
-
-    // +Y : mask(u=x, v=z) = S(x,y,z) & !S(x,y+1,z)
-    {
-        const int32 DimU = SX, DimV = SZ;
-        for (int32 y = 0; y < SY; ++y)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                // rows are along x, stride = 1
-                const uint8* ARow = &Solid[Idx3D(0, y, z)];
-                const uint8* BRow = (y + 1 < SY) ? &Solid[Idx3D(0, y + 1, z)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + z * DimU;
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Contig(ARow, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Contig(BRow, DimU, u);
-                    }
-                    else if (Masks.bHasYPos)
-                    {
-                        const int32 rowOffset = z * SX;
-                        B = Pack64_BitsRow(Masks.YPos, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(0, +1, 0), U(+1, 0, 0), V(0, 0, +1);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(u, slice, v); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, y);
-        }
-    }
-
-    // -Y : mask(u=x, v=z) = S(x,y,z) & !S(x,y-1,z)
-    {
-        const int32 DimU = SX, DimV = SZ;
-        for (int32 y = 0; y < SY; ++y)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                const uint8* ARow = &Solid[Idx3D(0, y, z)];
-                const uint8* BRow = (y - 1 >= 0) ? &Solid[Idx3D(0, y - 1, z)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + z * DimU;
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Contig(ARow, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Contig(BRow, DimU, u);
-                    }
-                    else if (Masks.bHasYNeg)
-                    {
-                        const int32 rowOffset = z * SX;
-                        B = Pack64_BitsRow(Masks.YNeg, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(0, -1, 0), U(+1, 0, 0), V(0, 0, +1);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(u, slice, v); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, y);
-        }
-    }
-
-    // +Z : mask(u=x, v=y) = S(x,y,z) & !S(x,y,z+1)
-    {
-        const int32 DimU = SX, DimV = SY;
-        for (int32 z = 0; z < SZ; ++z)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 y = 0; y < SY; ++y)
-            {
-                // rows are along x, stride = 1
-                const uint8* ARow = &Solid[Idx3D(0, y, z)];
-                const uint8* BRow = (z + 1 < SZ) ? &Solid[Idx3D(0, y, z + 1)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + y * DimU; // v=y
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Contig(ARow, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Contig(BRow, DimU, u);
-                    }
-                    else if (Masks.bHasZPos)
-                    {
-                        const int32 rowOffset = y * SX;
-                        B = Pack64_BitsRow(Masks.ZPos, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(0, 0, +1), U(+1, 0, 0), V(0, +1, 0);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(u, v, slice); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, z);
-        }
-    }
-
-    // -Z : mask(u=x, v=y) = S(x,y,z) & !S(x,y,z-1)
-    {
-        const int32 DimU = SX, DimV = SY;
-        for (int32 z = 0; z < SZ; ++z)
-        {
-            Mask.SetNumZeroed(DimU * DimV);
-
-            for (int32 y = 0; y < SY; ++y)
-            {
-                const uint8* ARow = &Solid[Idx3D(0, y, z)];
-                const uint8* BRow = (z - 1 >= 0) ? &Solid[Idx3D(0, y, z - 1)] : nullptr;
-
-                uint8* MRow = Mask.GetData() + y * DimU; // v=y
-                for (int32 u = 0; u < DimU; u += 64)
-                {
-                    const uint64 A = Pack64_Contig(ARow, DimU, u);
-                    uint64 B = 0ull;
-                    if (BRow)
-                    {
-                        B = Pack64_Contig(BRow, DimU, u);
-                    }
-                    else if (Masks.bHasZNeg)
-                    {
-                        const int32 rowOffset = y * SX;
-                        B = Pack64_BitsRow(Masks.ZNeg, rowOffset, u, DimU);
-                    }
-                    Unpack64_ToBytes(MRow, DimU, u, A & ~B);
-                }
-            }
-
-            const FIntVector N(0, 0, -1), U(+1, 0, 0), V(0, +1, 0);
-            auto MakeBase = [&](int32 slice, int32 u, int32 v) { return FIntVector(u, v, slice); };
-            Greedy2D_RLE(Mask.GetData(), DimU, DimV, N, U, V, MakeBase, z);
-        }
-    }
+    BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 }
-
-
-
-
-
 
 void UVoxelMesher::BuildHeightfieldMesh(
     const TArray<int32>& Heights,
@@ -808,97 +557,13 @@ void UVoxelMesher::BuildHeightfieldMesh(
     float VoxelUU,
     FMeshBuffers& Out)
 {
-    // Build non-uniform sample positions so the last cell exactly reaches the chunk edge
+    SCOPE_CYCLE_COUNTER(STAT_VoxelHeightfieldMesh);
+
+    // Pre-calculate sample positions once
     TArray<double> Xpos, Ypos;
     Xpos.SetNumUninitialized(SamplesX);
     Ypos.SetNumUninitialized(SamplesY);
 
-    // Base LOD0->world scale per voxel
-    const double UU = (double)VoxelUU;
-
-    for (int32 x = 0; x < SamplesX; ++x)
-    {
-        const int32 LocalX = (x == SamplesX - 1) ? ChunkSizeX : FMath::Min(x * XYScale, ChunkSizeX);
-        Xpos[x] = (double)LocalX * UU;
-    }
-    for (int32 y = 0; y < SamplesY; ++y)
-    {
-        const int32 LocalY = (y == SamplesY - 1) ? ChunkSizeY : FMath::Min(y * XYScale, ChunkSizeY);
-        Ypos[y] = (double)LocalY * UU;
-    }
-
-    auto H = [&](int32 x, int32 y)->double
-        {
-            const int32 cx = FMath::Clamp(x, 0, SamplesX - 1);
-            const int32 cy = FMath::Clamp(y, 0, SamplesY - 1);
-            return (double)Heights[cx + cy * SamplesX] * UU; // Z uses base UU (no XYScale)
-        };
-
-    Out.Vertices.Reset(); Out.Triangles.Reset(); Out.UVs.Reset(); Out.Colors.Reset(); Out.Normals.Reset();
-
-    auto Greyscale = [](float V) -> FLinearColor { return FLinearColor(V, V, V, 1.0f); };
-
-    // Quads: (SamplesX-1) * (SamplesY-1) – covers full chunk width, no gap
-    for (int32 y = 0; y < SamplesY - 1; ++y)
-    {
-        for (int32 x = 0; x < SamplesX - 1; ++x)
-        {
-            const FVector P00(Xpos[x], Ypos[y], H(x, y));
-            const FVector P10(Xpos[x + 1], Ypos[y], H(x + 1, y));
-            const FVector P01(Xpos[x], Ypos[y + 1], H(x, y + 1));
-            const FVector P11(Xpos[x + 1], Ypos[y + 1], H(x + 1, y + 1));
-
-            const int32 VStart = Out.Vertices.Num();
-            Out.Vertices.Add(P00); // 0
-            Out.Vertices.Add(P10); // 1
-            Out.Vertices.Add(P11); // 2
-            Out.Vertices.Add(P01); // 3
-
-            const FVector N = FVector::CrossProduct(P10 - P00, P01 - P00).GetSafeNormal();
-            Out.Normals.Add(N); Out.Normals.Add(N); Out.Normals.Add(N); Out.Normals.Add(N);
-
-            Out.UVs.Add(FVector2D(0, 0));
-            Out.UVs.Add(FVector2D(1, 0));
-            Out.UVs.Add(FVector2D(1, 1));
-            Out.UVs.Add(FVector2D(0, 1));
-
-            Out.Colors.Add(Greyscale(1.0f));
-            Out.Colors.Add(Greyscale(1.0f));
-            Out.Colors.Add(Greyscale(1.0f));
-            Out.Colors.Add(Greyscale(1.0f));
-
-            // Same outward winding as voxel quads
-            Out.Triangles.Add(VStart + 0);
-            Out.Triangles.Add(VStart + 2);
-            Out.Triangles.Add(VStart + 1);
-
-            Out.Triangles.Add(VStart + 0);
-            Out.Triangles.Add(VStart + 3);
-            Out.Triangles.Add(VStart + 2);
-        }
-    }
-}
-
-void UVoxelMesher::BuildHeightfieldMesh_Grid(
-    const TArray<int32>& Heights,
-    int32 SamplesX,
-    int32 SamplesY,
-    int32 ChunkSizeX,
-    int32 ChunkSizeY,
-    int32 XYScale,
-    float VoxelUU,
-    const TArray<int32>& SharedIB,
-    FMeshBuffers& Out)
-{
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Mesher_HeightfieldGrid);
-
-    if (SamplesX < 2 || SamplesY < 2) { Out = FMeshBuffers{}; return; }
-    if (Heights.Num() != SamplesX * SamplesY) { Out = FMeshBuffers{}; return; }
-
-    // Precompute non-uniform XY to hit exact chunk edges
-    TArray<double> Xpos, Ypos;
-    Xpos.SetNumUninitialized(SamplesX);
-    Ypos.SetNumUninitialized(SamplesY);
     const double UU = (double)VoxelUU;
 
     for (int32 x = 0; x < SamplesX; ++x)
@@ -919,686 +584,1154 @@ void UVoxelMesher::BuildHeightfieldMesh_Grid(
             return (double)Heights[cx + cy * SamplesX] * UU;
         };
 
-    const int32 VCount = SamplesX * SamplesY;
-    Out.Vertices.SetNumUninitialized(VCount);
-    Out.Normals.SetNumUninitialized(VCount);
-    Out.UVs.SetNumUninitialized(VCount);
-    Out.Colors.SetNumUninitialized(VCount);
+    Out.Vertices.Reset(); Out.Triangles.Reset(); Out.UVs.Reset(); Out.Colors.Reset(); Out.Normals.Reset();
 
-    // Positions, UVs
-    for (int32 y = 0; y < SamplesY; ++y)
+    // Reserve memory to avoid reallocations
+    const int32 QuadCount = (SamplesX - 1) * (SamplesY - 1);
+    Out.Vertices.Reserve(QuadCount * 4);
+    Out.Triangles.Reserve(QuadCount * 6);
+    Out.UVs.Reserve(QuadCount * 4);
+    Out.Colors.Reserve(QuadCount * 4);
+    Out.Normals.Reserve(QuadCount * 4);
+
+    auto Greyscale = [](float V) -> FColor { return FColor(V, V, V, 1.0f); };
+
+    for (int32 y = 0; y < SamplesY - 1; ++y)
     {
-        for (int32 x = 0; x < SamplesX; ++x)
+        for (int32 x = 0; x < SamplesX - 1; ++x)
         {
-            const int32 idx = x + y * SamplesX;
-            Out.Vertices[idx] = FVector((float)Xpos[x], (float)Ypos[y], (float)H(x, y));
-            Out.UVs[idx] = FVector2D(
-                (SamplesX > 1) ? (float)x / (float)(SamplesX - 1) : 0.0f,
-                (SamplesY > 1) ? (float)y / (float)(SamplesY - 1) : 0.0f);
-            Out.Colors[idx] = FLinearColor::White;
+            const FVector P00(Xpos[x], Ypos[y], H(x, y));
+            const FVector P10(Xpos[x + 1], Ypos[y], H(x + 1, y));
+            const FVector P01(Xpos[x], Ypos[y + 1], H(x, y + 1));
+            const FVector P11(Xpos[x + 1], Ypos[y + 1], H(x + 1, y + 1));
+
+            const int32 VStart = Out.Vertices.Num();
+            Out.Vertices.Add(P00);
+            Out.Vertices.Add(P10);
+            Out.Vertices.Add(P11);
+            Out.Vertices.Add(P01);
+
+            // Flip normals to fix inverted faces
+            const FVector N = -FVector::CrossProduct(P10 - P00, P01 - P00).GetSafeNormal();
+            Out.Normals.Add(N); Out.Normals.Add(N); Out.Normals.Add(N); Out.Normals.Add(N);
+
+            Out.UVs.Add(FVector2D(0, 0));
+            Out.UVs.Add(FVector2D(1, 0));
+            Out.UVs.Add(FVector2D(1, 1));
+            Out.UVs.Add(FVector2D(0, 1));
+
+            Out.Colors.Add(Greyscale(1.0f));
+            Out.Colors.Add(Greyscale(1.0f));
+            Out.Colors.Add(Greyscale(1.0f));
+            Out.Colors.Add(Greyscale(1.0f));
+
+            // Use unified winding function
+            AddTrianglesWithCorrectWinding(Out, VStart, N);
         }
     }
 
-    // Vertex normals from central differences
-    for (int32 y = 0; y < SamplesY; ++y)
-    {
-        const int32 ym = FMath::Max(0, y - 1);
-        const int32 yp = FMath::Min(SamplesY - 1, y + 1);
-        for (int32 x = 0; x < SamplesX; ++x)
-        {
-            const int32 xm = FMath::Max(0, x - 1);
-            const int32 xp = FMath::Min(SamplesX - 1, x + 1);
-
-            const FVector PL = FVector((float)Xpos[xm], (float)Ypos[y], (float)H(xm, y));
-            const FVector PR = FVector((float)Xpos[xp], (float)Ypos[y], (float)H(xp, y));
-            const FVector PD = FVector((float)Xpos[x], (float)Ypos[ym], (float)H(x, ym));
-            const FVector PU = FVector((float)Xpos[x], (float)Ypos[yp], (float)H(x, yp));
-
-            const FVector Dx = PR - PL;
-            const FVector Dy = PU - PD;
-            FVector N = FVector::CrossProduct(Dx, Dy).GetSafeNormal();
-            if (!N.IsNormalized()) N = FVector(0, 0, 1);
-            Out.Normals[x + y * SamplesX] = N;
-        }
-    }
-
-    // Reuse shared topology
-    Out.Triangles = SharedIB; // identical every frame for a given SamplesX×SamplesY
+    // Update memory stats
+    const int32 BufferMemory =
+        Out.Vertices.Num() * sizeof(FVector) +
+        Out.Triangles.Num() * sizeof(int32) +
+        Out.UVs.Num() * sizeof(FVector2D) +
+        Out.Colors.Num() * sizeof(FLinearColor) +
+        Out.Normals.Num() * sizeof(FVector);
+    INC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, BufferMemory);
 }
 
-void UVoxelMesher::ApplyToPMC(UProceduralMeshComponent* PMC,
+void UVoxelMesher::ApplyToPMC(
+    UProceduralMeshComponent* PMC,
     const FMeshBuffers& Bufs,
     bool bCreateCollision)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelApplyToPMC);
     if (!PMC) return;
 
-    // Recreate the section (this implicitly rebuilds BodySetup if collision is enabled)
     PMC->ClearAllMeshSections();
 
-    PMC->CreateMeshSection_LinearColor(
-        /*SectionIndex*/ 0,
-        Bufs.Vertices,
-        Bufs.Triangles,
-        Bufs.Normals,
-        Bufs.UVs,
-        Bufs.Colors,
-        TArray<FProcMeshTangent>{},   // tangents
-        bCreateCollision               // <- pass the bool (do NOT assign)
-    );
-
-    PMC->SetCollisionEnabled(
-        bCreateCollision
-        ? ECollisionEnabled::QueryAndPhysics
-        : ECollisionEnabled::NoCollision);
-}
-
-#if WITH_RUNTIME_MESHCOMPONENT
-void UVoxelMesher::ApplyToRMC(
-    URuntimeMeshComponent* RMC,
-    const FMeshBuffers& Bufs,
-    bool bCreateCollision)
-{
-    if (!RMC) return;
-
-    // Best-effort equivalents; tweak if your RMC version differs
-    RMC->ClearAllMeshSections();
-
-    RMC->CreateMeshSection(
+    // Use FColor overload (smaller vertex stream than LinearColor)
+    PMC->CreateMeshSection(
         0,
         Bufs.Vertices,
         Bufs.Triangles,
         Bufs.Normals,
         Bufs.UVs,
         Bufs.Colors,
-        TArray<FRuntimeMeshTangent>(),
-        bCreateCollision);
+        TArray<FProcMeshTangent>{},
+        bCreateCollision
+    );
 
-    RMC->SetCollisionEnabled(bCreateCollision ? ECollisionEnabled::QueryAndPhysics
+    PMC->SetCollisionEnabled(
+        bCreateCollision ? ECollisionEnabled::QueryAndPhysics
         : ECollisionEnabled::NoCollision);
-    RMC->SetCollisionUseComplexAsSimple(bCreateCollision);
-# if WITH_PHYSX || WITH_CHAOS
-    RMC->SetUseAsyncCooking(false);
-# endif
 }
-#endif
-bool UVoxelMesher::BuildGreedyMesh_GPU(const TArray<EVoxelBlockID>& Voxels,
-    FIntVector Size,
+
+static void BuildStreamSetFromBuffers(
+    const FMeshBuffers& Bufs,
+    FRealtimeMeshStreamSet& OutStreams)
+{
+    using FIndexType = uint32;
+    TRealtimeMeshBuilderLocal<FIndexType, FPackedNormal, FVector2DHalf, 1> Builder(OutStreams);
+
+    const int32 NumV = Bufs.Vertices.Num();
+    const bool bHaveNormals = (Bufs.Normals.Num() == NumV);
+    const bool bHaveUV0 = (Bufs.UVs.Num() == NumV);
+    const bool bHaveColors = (Bufs.Colors.Num() == NumV);
+
+    Builder.EnableTangents();
+    Builder.EnableTexCoords();
+    Builder.EnableColors();
+    Builder.EnablePolyGroups();
+
+    // Add all vertices first
+    Builder.ReserveAdditionalVertices(NumV);
+    for (int32 i = 0; i < NumV; ++i)
+    {
+        const FVector3f P = (FVector3f)Bufs.Vertices[i];
+        auto V = Builder.AddVertex(P);
+
+        if (bHaveNormals)
+        {
+            // Use the provided normal as-is, and build a reasonable tangent orthonormal to it.
+            const FVector3f N = ((FVector3f)Bufs.Normals[i]).GetSafeNormal();
+            const FVector3f Up = (FMath::Abs(N.Z) < 0.999f) ? FVector3f(0, 0, 1) : FVector3f(0, 1, 0);
+            const FVector3f T = (Up ^ N).GetSafeNormal();
+            V.SetNormalAndTangent(N, T);
+        }
+
+        // ALWAYS set color - default to white if not provided
+        if (bHaveColors)
+        {
+            V.SetColor(Bufs.Colors[i]);
+        }
+        else
+        {
+            V.SetColor(FColor::White); // Default to white
+        }
+
+        if (bHaveUV0)
+        {
+            V.SetTexCoord((FVector2f)Bufs.UVs[i]);
+        }
+    }
+
+    // Add all triangles
+    const int32 NumI = Bufs.Triangles.Num();
+    Builder.ReserveAdditionalTriangles(NumI / 3);
+
+    for (int32 t = 0; t < NumI; t += 3)
+    {
+        Builder.AddTriangle(
+            (FIndexType)Bufs.Triangles[t + 0],
+            (FIndexType)Bufs.Triangles[t + 1],
+            (FIndexType)Bufs.Triangles[t + 2],
+            /*PolyGroup*/ 0);
+    }
+}
+
+void UVoxelMesher::ApplyToRMC(
+    URealtimeMeshComponent* RMC,
+    const FMeshBuffers& Bufs,
+    bool bCreateCollision)
+{
+    if (!RMC) return;
+
+    // Early out for empty geometry: just remove group, disable collision
+    const int32 NumVertices = Bufs.Vertices.Num();
+    const int32 NumIndices = Bufs.Triangles.Num();
+    const bool bHasGeometry = (NumVertices > 0 && NumIndices >= 3);
+
+    URealtimeMeshSimple* MeshAsset = RMC->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    if (!MeshAsset) return;
+
+    const FRealtimeMeshLODKey LOD0(0);
+    const FRealtimeMeshSectionGroupKey GroupKey =
+        FRealtimeMeshSectionGroupKey::Create(LOD0, FName(*FString::Printf(TEXT("ChunkGroup_%s"), *RMC->GetName())));
+    const FRealtimeMeshSectionKey SectionKey =
+        FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+
+    auto SetCollision = [RMC, bCreateCollision, bHasGeometry]() {
+        RMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        };
+
+    // Always remove first, then recreate (this prevents all races)
+    MeshAsset->RemoveSectionGroup(GroupKey)
+        .Next([MeshAsset, GroupKey, SectionKey, Bufs, bCreateCollision, bHasGeometry, SetCollision](ERealtimeMeshProxyUpdateStatus /*RemoveStatus*/)
+            {
+                if (!bHasGeometry)
+                {
+                    SetCollision();
+                    return;
+                }
+
+                FRealtimeMeshStreamSet Streams;
+                BuildStreamSetFromBuffers(Bufs, Streams);
+
+                MeshAsset->CreateSectionGroup(GroupKey, MoveTemp(Streams))
+                    .Next([MeshAsset, SectionKey, bCreateCollision, bHasGeometry, SetCollision](ERealtimeMeshProxyUpdateStatus Status)
+                        {
+                            if (Status == ERealtimeMeshProxyUpdateStatus::NoUpdate)
+                            {
+                                FRealtimeMeshSectionConfig SectionConfig(0); // Material slot 0
+                                SectionConfig.bIsVisible = bHasGeometry;
+                                //UE_LOG(LogTemp, Warning, TEXT("[ApplyRMC:: Huh, on es passé par la est les collision sont: %s"), (bCreateCollision ? TEXT("true") : TEXT("false")));
+                                MeshAsset->UpdateSectionConfig(SectionKey, SectionConfig, bCreateCollision);
+                            }
+                            SetCollision();
+                        });
+            });
+}
+
+
+
+bool UVoxelMesher::BuildGreedyMesh_GPU(
+    const TArray<EVoxelBlockID>& Voxels,
+    const FIntVector& Size,
+    const FChunkNeighbors* Neighbors,
     int32 XYScale,
     float VoxelUU,
-    FMeshBuffers& Out)
+    FMeshBuffers& Out,
+    const UVoxelSettings* Settings)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelGPUMeshing);
+
     FGPUMeshBuildParams P;
-    P.Voxels = reinterpret_cast<const uint8*>(Voxels.GetData());
+    // Convert the EVoxelBlockID array into a temporary category array on the stack.
+    // Each voxel category is an 8‑bit value: 0 = air, 1 = semi‑solid, 2 = solid.
+    const int32 TotalCount = Size.X * Size.Y * Size.Z;
+    TArray<uint8> CatData;
+    CatData.SetNumUninitialized(TotalCount);
+    for (int32 idx = 0; idx < TotalCount; ++idx)
+    {
+        CatData[idx] = VoxelBlockCategory(Voxels[idx]);
+    }
+
+    P.Voxels = CatData.GetData();
+    P.SizeX = Size.X;
+    P.SizeY = Size.Y;
+    P.SizeZ = Size.Z;
+    P.XYScale = FMath::Max(1, XYScale);
+   P.DefaultAO = 3;
+    P.VoxelUU = VoxelUU;
+    const int32 MaxVertsSetting = (Settings && Settings->MaxGPUVertexBufferSize > 0)
+        ? FMath::Clamp(Settings->MaxGPUVertexBufferSize, 1, INT32_MAX)
+        : INT32_MAX;
+    P.MaxOutputVerts = MaxVertsSetting;
+    P.bAggressiveCulling = Settings && Settings->bGPUAggressiveCulling;
+    WarnUnsupportedTileSize(Settings);
+
+    // Convert neighbour border arrays to category arrays on the fly.  The
+    // neighbour arrays store full EVoxelBlockID values; we must convert them
+    // into categories for the GPU mesher.  These arrays are sized to match
+    // the current chunk’s border dimensions and live until this function
+    // returns.
+    TArray<uint8> NXN, NXP, NYN, NYP;
+    TArray<uint8> NZN, NZP;
+
+    if (Neighbors)
+    {
+        P.bHasNeighborXN = Neighbors->bHasXNeg;
+        P.bHasNeighborXP = Neighbors->bHasXPos;
+        P.bHasNeighborYN = Neighbors->bHasYNeg;
+        P.bHasNeighborYP = Neighbors->bHasYPos;
+
+        // Negative X neighbour: size is SizeY * SizeZ
+        if (P.bHasNeighborXN)
+        {
+            const int32 BorderCount = Size.Y * Size.Z;
+            NXN.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NXN[i] = VoxelBlockCategory(Neighbors->XNeg[i]);
+            }
+            P.NeighborXN = NXN.GetData();
+        }
+        // Positive X neighbour
+        if (P.bHasNeighborXP)
+        {
+            const int32 BorderCount = Size.Y * Size.Z;
+            NXP.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NXP[i] = VoxelBlockCategory(Neighbors->XPos[i]);
+            }
+            P.NeighborXP = NXP.GetData();
+        }
+        // Negative Y neighbour: size is SizeX * SizeZ
+        if (P.bHasNeighborYN)
+        {
+            const int32 BorderCount = Size.X * Size.Z;
+            NYN.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NYN[i] = VoxelBlockCategory(Neighbors->YNeg[i]);
+            }
+            P.NeighborYN = NYN.GetData();
+        }
+        // Positive Y neighbour
+        if (P.bHasNeighborYP)
+        {
+            const int32 BorderCount = Size.X * Size.Z;
+            NYP.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NYP[i] = VoxelBlockCategory(Neighbors->YPos[i]);
+            }
+            P.NeighborYP = NYP.GetData();
+        }
+        // Negative Z neighbour: size is SizeX * SizeY
+        P.bHasNeighborZN = Neighbors->bHasZNeg;
+        if (P.bHasNeighborZN)
+        {
+            const int32 BorderCount = Size.X * Size.Y;
+            NZN.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NZN[i] = VoxelBlockCategory(Neighbors->ZNeg[i]);
+            }
+            P.NeighborZN = NZN.GetData();
+        }
+        // Positive Z neighbour: size is SizeX * SizeY
+        P.bHasNeighborZP = Neighbors->bHasZPos;
+        if (P.bHasNeighborZP)
+        {
+            const int32 BorderCount = Size.X * Size.Y;
+            NZP.SetNumUninitialized(BorderCount);
+            for (int32 i = 0; i < BorderCount; ++i)
+            {
+                NZP[i] = VoxelBlockCategory(Neighbors->ZPos[i]);
+            }
+            P.NeighborZP = NZP.GetData();
+        }
+    }
+
+    TArray<uint32> Packed;
+    const bool bGPUOk = FVoxelGPUMesher::BuildPackedVerts_GPU(P, Packed);
+    const UVoxelBlockTable* BT = (Settings && Settings->BlockTable.Get()) ? Settings->BlockTable.Get() : nullptr;
+    // Optional: Compare against CPU greedy for diagnostics (even on GPU failure)
+    static auto* CVarCompareCPU = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.CompareCPU"));
+    const bool bDoCompare = (CVarCompareCPU && CVarCompareCPU->GetInt() != 0);
+    if (bDoCompare)
+    {
+        FMeshBuffers Cpu;
+        UVoxelMesher::BuildGreedyMesh(Voxels, Size, Neighbors, VoxelUU, XYScale, /*bUseAO=*/false,BT,Cpu);
+        const int32 CTri = Cpu.Triangles.Num() / 3;
+        const int32 GTri = bGPUOk ? (Packed.Num() / 3) : 0;
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU Compare] GPU Tris=%d CPU Tris=%d Size=(%d,%d,%d)"), GTri, CTri, Size.X, Size.Y, Size.Z);
+        if (!bGPUOk && CTri > 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU Compare] GPU path failed while CPU produced triangles."));
+        }
+    }
+
+    if (!bGPUOk)
+    {
+        return false;
+    }
+
+    FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, Out, VoxelUU, XYScale, Size.X, Size.Y, Size.Z);
+
+    // Optional: Compare against CPU greedy for diagnostics
+
+    if (CVarCompareCPU && CVarCompareCPU->GetInt() != 0)
+    {
+        FMeshBuffers Cpu;
+        UVoxelMesher::BuildGreedyMesh(Voxels, Size, Neighbors, VoxelUU, XYScale, /*bUseAO=*/false,BT, Cpu);
+        const int32 GTri = Out.Triangles.Num() / 3;
+        const int32 CTri = Cpu.Triangles.Num() / 3;
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU Compare] GPU Tris=%d CPU Tris=%d Size=(%d,%d,%d)"), GTri, CTri, Size.X, Size.Y, Size.Z);
+        if (CTri > 0 && GTri == 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU Compare] GPU produced empty mesh while CPU has data."));
+        }
+    }
+
+    // Update memory stats
+    const int32 BufferMemory =
+        Out.Vertices.Num() * sizeof(FVector) +
+        Out.Triangles.Num() * sizeof(int32) +
+        Out.UVs.Num() * sizeof(FVector2D) +
+        Out.Colors.Num() * sizeof(FLinearColor) +
+        Out.Normals.Num() * sizeof(FVector);
+    INC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, BufferMemory);
+
+    return true;
+}
+
+bool UVoxelMesher::BuildGreedyMesh_GPU_Async(
+    const TArray<EVoxelBlockID>& Voxels,
+    const FIntVector& Size,
+    const FChunkNeighbors* Neighbors,
+    int32 XYScale,
+    float VoxelUU,
+    TFunction<void(bool bSuccess, TArray<uint32>&& Packed, int32 SizeX, int32 SizeY, int32 SizeZ, int32 XYScaleParam, float VoxelUUParam)> Completion,
+    const UVoxelSettings* Settings)
+{
+    if (!Completion)
+    {
+        return false;
+    }
+
+    const int32 TotalCount = Size.X * Size.Y * Size.Z;
+    if (TotalCount <= 0)
+    {
+        Completion(false, TArray<uint32>(), Size.X, Size.Y, Size.Z, XYScale, VoxelUU);
+        return false;
+    }
+
+    FGPUMeshBuildParams P;
+    TArray<uint8> CatData;
+    CatData.SetNumUninitialized(TotalCount);
+    for (int32 idx = 0; idx < TotalCount; ++idx)
+    {
+        CatData[idx] = VoxelBlockCategory(Voxels[idx]);
+    }
+
+    P.Voxels = CatData.GetData();
     P.SizeX = Size.X;
     P.SizeY = Size.Y;
     P.SizeZ = Size.Z;
     P.XYScale = FMath::Max(1, XYScale);
     P.DefaultAO = 3;
     P.VoxelUU = VoxelUU;
+    const int32 MaxVertsSettingAsync = (Settings && Settings->MaxGPUVertexBufferSize > 0)
+        ? FMath::Clamp(Settings->MaxGPUVertexBufferSize, 1, INT32_MAX)
+        : INT32_MAX;
+    P.MaxOutputVerts = MaxVertsSettingAsync;
+    P.bAggressiveCulling = Settings && Settings->bGPUAggressiveCulling;
+    WarnUnsupportedTileSize(Settings);
 
-    TArray<uint32> Packed;
-    if (!FVoxelGPUMesher::BuildPackedVerts_GPU(P, Packed))
+    TArray<uint8> NXN, NXP, NYN, NYP;
+    TArray<uint8> NZN, NZP;
+
+    if (Neighbors)
     {
-        UE_LOG(LogTemp, Display, TEXT("[VoxelCore] GPU pas dispo"), P.SizeX, P.SizeY, P.SizeZ);
+        P.bHasNeighborXN = Neighbors->bHasXNeg;
+        P.bHasNeighborXP = Neighbors->bHasXPos;
+        P.bHasNeighborYN = Neighbors->bHasYNeg;
+        P.bHasNeighborYP = Neighbors->bHasYPos;
 
-        return false; // GPU path not available or failed — caller should fall back to CPU builder
-    }
-
-    // TEMP: decode packed verts back to your standard mesh buffers so you can keep using PMC/RMC
-    //FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, Out, VoxelUU);
-    FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, Out, VoxelUU, XYScale);
-    UE_LOG(LogTemp, Display, TEXT("[VoxelCore] GPU mesher invoked (%dx%dx%d)"), P.SizeX, P.SizeY, P.SizeZ);
-
-    return true;
-}
-// ---------- ProceduralMeshComponent path ----------
-void UVoxelMesher::ApplyToPMC_Create(
-    UProceduralMeshComponent* PMC, int32 SectionIndex,
-    const FMeshBuffers& B, bool bCreateCollision)
-{
-    check(PMC);
-    // ProceduralMesh wants tangents as FProcMeshTangent if provided; we omit for speed
-    static const TArray<FVector2D> EmptyUV2;
-    static const TArray<FProcMeshTangent> EmptyTangents;
-
-    PMC->CreateMeshSection_LinearColor(
-        SectionIndex,
-        B.Vertices,
-        B.Triangles,
-        B.Normals,
-        B.UVs,
-        B.Colors,
-        EmptyTangents,
-        bCreateCollision);
-
-    PMC->SetMeshSectionVisible(SectionIndex, true);
-}
-
-void UVoxelMesher::ApplyToPMC_Update(
-    UProceduralMeshComponent* PMC, int32 SectionIndex,
-    const FMeshBuffers& B)
-{
-    check(PMC);
-    static const TArray<FVector2D> EmptyUV2;
-    static const TArray<FProcMeshTangent> EmptyTangents;
-
-    PMC->UpdateMeshSection_LinearColor(
-        SectionIndex,
-        B.Vertices,
-        B.Normals,
-        B.UVs,
-        B.Colors,
-        EmptyTangents);
-}
-
-// ---------- RuntimeMeshComponent path ----------
-#if WITH_RUNTIME_MESHCOMPONENT
-void UVoxelMesher::ApplyToRMC_Create(
-    URuntimeMeshComponent* RMC, int32 SectionIndex,
-    const FMeshBuffers& B, bool bCreateCollision)
-{
-    check(RMC);
-
-    // Build a RMC section from components. Choose a simple material slot 0.
-    RMC->CreateSectionFromComponents(
-        0, SectionIndex,
-        B.Vertices, B.Triangles, B.Normals, B.UVs, B.Colors,
-        /*Tangents*/ TArray<FRuntimeMeshTangent>(),
-        /*bCreateCollision*/ bCreateCollision,
-        /*EUpdateFrequency*/ ERuntimeMeshUpdateFrequency::Frequent);
-
-    RMC->SetSectionVisible(0, SectionIndex, true);
-}
-
-void UVoxelMesher::ApplyToRMC_Update(
-    URuntimeMeshComponent* RMC, int32 SectionIndex,
-    const FMeshBuffers& B)
-{
-    check(RMC);
-
-    RMC->UpdateSectionFromComponents(
-        0, SectionIndex,
-        B.Vertices, B.Normals, B.UVs, B.Colors,
-        /*Tangents*/ TArray<FRuntimeMeshTangent>());
-}
-#endif
-
-
-// VoxelMesher.cpp
-void UVoxelMesher::BuildGreedyMesh_FastLOD1(
-    const TArray<EVoxelBlockID>& V,
-    const FIntVector& S,
-    const FChunkNeighbors* /*Nbh*/,
-    float UU,
-    int32 XYScale,
-    FMeshBuffers& Out)
-{
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_GreedyMesh_FastLOD1);
-    SCOPE_CYCLE_COUNTER(STAT_Voxel_GreedyMesh_FastLOD1);
-
-    // reset output (no Out.Clear(); construct-assign instead)
-    Out = FMeshBuffers{};
-
-    if (S.X <= 0 || S.Y <= 0 || S.Z <= 0) return;
-    const int32 Count = S.X * S.Y * S.Z;
-    if (V.Num() != Count) return;
-
-    auto Solid = [&](int32 x, int32 y, int32 z)->bool {
-        return ((uint32)x < (uint32)S.X) & ((uint32)y < (uint32)S.Y) & ((uint32)z < (uint32)S.Z)
-            ? (uint16)V[x + y * S.X + z * S.X * S.Y] != 0
-            : false; // out of bounds -> empty; fast LOD1 ignores neighbors
-        };
-
-    struct Quad { int32 x, y, z, w, h; uint8 dir; };
-    TArray<Quad> Quads; Quads.Reserve(S.X * S.Y + S.Y * S.Z + S.Z * S.X);
-
-    auto MergeLayer = [&](uint8 dir, int32 U, int32 Vdim, int32 Wdim,
-        auto atSolid, auto atOpposite)
+        if (P.bHasNeighborXN)
         {
-            TArray<uint8> mask; mask.SetNumZeroed(Vdim * Wdim);
-
-            for (int32 u = 0; u < U; ++u)
+            const int32 Count = Size.Y * Size.Z;
+            NXN.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
             {
-                // build face mask for this slice
-                for (int32 w = 0; w < Wdim; ++w)
-                    for (int32 v = 0; v < Vdim; ++v)
-                    {
-                        const bool a = atSolid(u, v, w);
-                        const bool b = atOpposite(u, v, w);
-                        // emit only if one side solid and the other empty
-                        mask[v + w * Vdim] = (a ^ b) ? (a ? 1 : 2) : 0; // 1=+dir, 2=-dir
-                    }
-
-                // greedy pack rectangles
-                int32 i = 0;
-                while (i < Vdim * Wdim)
-                {
-                    if (mask[i] == 0) { ++i; continue; }
-                    const uint8 val = mask[i];
-                    const int32 v0 = i % Vdim;
-                    const int32 w0 = i / Vdim;
-
-                    int32 width = 1;
-                    while (v0 + width < Vdim && mask[i + width] == val) ++width;
-
-                    int32 height = 1; bool extend = true;
-                    while (w0 + height < Wdim && extend)
-                    {
-                        for (int32 k = 0; k < width; ++k)
-                            if (mask[i + k + height * Vdim] != val) { extend = false; break; }
-                        if (extend) ++height;
-                    }
-
-                    // clear mask
-                    for (int32 hh = 0; hh < height; ++hh)
-                        FMemory::Memset(mask.GetData() + (i + hh * Vdim), 0, width);
-
-                    Quad q; q.dir = (val == 1) ? dir : (dir ^ 1);
-                    if (dir < 2) { q.x = u; q.y = v0; q.z = w0; q.w = width; q.h = height; }          // ±X
-                    else if (dir < 4) { q.x = v0; q.y = u; q.z = w0; q.w = width; q.h = height; }     // ±Y
-                    else { q.x = v0; q.y = w0; q.z = u; q.w = width; q.h = height; }                // ±Z
-                    Quads.Add(q);
-                }
+                NXN[i] = VoxelBlockCategory(Neighbors->XNeg[i]);
             }
-        };
-
-    // ±X
-    MergeLayer(/*+X*/0, S.X, S.Y, S.Z,
-        [&](int32 u, int32 v, int32 w) { return Solid(u, v, w); },
-        [&](int32 u, int32 v, int32 w) { return Solid(u + 1, v, w); });
-    // ±Y
-    MergeLayer(/*+Y*/2, S.Y, S.X, S.Z,
-        [&](int32 u, int32 v, int32 w) { return Solid(v, u, w); },
-        [&](int32 u, int32 v, int32 w) { return Solid(v, u + 1, w); });
-    // ±Z
-    MergeLayer(/*+Z*/4, S.Z, S.X, S.Y,
-        [&](int32 u, int32 v, int32 w) { return Solid(v, w, u); },
-        [&](int32 u, int32 v, int32 w) { return Solid(v, w, u + 1); });
-
-    const int32 reserveVerts = Quads.Num() * 4;
-    const int32 reserveIdx = Quads.Num() * 6;
-    Out.Vertices.Reserve(reserveVerts);
-    Out.Normals.Reserve(reserveVerts);
-    Out.UVs.Reserve(reserveVerts);
-    Out.Triangles.Reserve(reserveIdx);
-
-    auto pushQuad = [&](const Quad& q)
+            P.NeighborXN = NXN.GetData();
+        }
+        if (P.bHasNeighborXP)
         {
-            const float sx = UU * float(XYScale);
-            const float sy = UU * float(XYScale);
-            const float sz = UU;
-
-            FVector o, ux, vy, n;
-            switch (q.dir)
+            const int32 Count = Size.Y * Size.Z;
+            NXP.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
             {
-            case 0: o = FVector((q.x + 1) * sx, q.y * sy, q.z * sz); ux = FVector(0, q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(+1, 0, 0); break;
-            case 1: o = FVector(q.x * sx, (q.y + q.w) * sy, q.z * sz); ux = FVector(0, -q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(-1, 0, 0); break;
-            case 2: o = FVector(q.x * sx, (q.y + 1) * sy, q.z * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, +1, 0); break;
-            case 3: o = FVector((q.x + q.w) * sx, q.y * sy, q.z * sz); ux = FVector(-q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, -1, 0); break;
-            case 4: o = FVector(q.x * sx, q.y * sy, (q.z + 1) * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, q.h * sy, 0); n = FVector(0, 0, +1); break;
-            default:o = FVector(q.x * sx, (q.y + q.h) * sy, q.z * sz);   ux = FVector(q.w * sx, 0, 0); vy = FVector(0, -q.h * sy, 0); n = FVector(0, 0, -1); break;
+                NXP[i] = VoxelBlockCategory(Neighbors->XPos[i]);
             }
-
-            const int32 i0 = Out.Vertices.Num();
-            Out.Vertices.Add(o);
-            Out.Vertices.Add(o + ux);
-            Out.Vertices.Add(o + ux + vy);
-            Out.Vertices.Add(o + vy);
-
-            Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n);
-            Out.UVs.Add(FVector2D(0, 0)); Out.UVs.Add(FVector2D(1, 0)); Out.UVs.Add(FVector2D(1, 1)); Out.UVs.Add(FVector2D(0, 1));
-
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 2); Out.Triangles.Add(i0 + 1);
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 3); Out.Triangles.Add(i0 + 2);
-        };
-
-    for (const Quad& q : Quads) pushQuad(q);
-}
-namespace
-{
-    FORCEINLINE int32 VoxIndex3D(int32 x, int32 y, int32 z, int32 SX, int32 SY)
-    {
-        return x + y * SX + z * SX * SY;
-    }
-
-    // rank1 = number of set bits in [0..idx)
-    FORCEINLINE int32 Rank1(const TArray<uint64>& Bits, int32 idx)
-    {
-        const int32 w = idx >> 6;
-        const int32 b = idx & 63;
-
-        int32 r = 0;
-        for (int32 i = 0; i < w; ++i) r += FMath::CountBits(Bits[i]);
-        if (b) { const uint64 m = (b == 64) ? ~0ULL : ((1ULL << b) - 1ULL); r += FMath::CountBits(Bits[w] & m); }
-        return r;
-    }
-    FORCEINLINE bool BitGet(const TArray<uint64>& Bits, int32 bitIndex)
-    {
-        const int32 w = bitIndex >> 6;
-        const int32 b = bitIndex & 63;
-        return ((uint32)w < (uint32)Bits.Num()) ? ((Bits[w] >> b) & 1ULL) != 0 : false;
-    }
-}
-
-void UVoxelMesher::BuildGreedyMesh_FromBitset(
-    const FCompactVoxelData& C,
-    float VoxelUU,
-    FMeshBuffers& Out)
-{
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Mesher_FastLOD1_Bitset);
-
-    Out = FMeshBuffers{};
-    const int32 SX = C.SizeX, SY = C.SizeY, SZ = C.SizeZ;
-    if (SX <= 0 || SY <= 0 || SZ <= 0) return;
-
-    auto Solid = [&](int32 x, int32 y, int32 z)->bool
+            P.NeighborXP = NXP.GetData();
+        }
+        if (P.bHasNeighborYN)
         {
-            if ((uint32)x >= (uint32)SX || (uint32)y >= (uint32)SY || (uint32)z >= (uint32)SZ) return false;
-            const int32 i = VoxIndex3D(x, y, z, SX, SY);
-            return BitGet(C.Occupancy, i);
-        };
-
-    struct Quad { int32 x, y, z, w, h; uint8 dir; };
-    TArray<Quad> Q; Q.Reserve(SX * SY + SY * SZ + SZ * SX);
-
-    auto MergeLayer = [&](uint8 dir, int32 U, int32 Vd, int32 Wd,
-        auto atSolid, auto atOpp)
-        {
-            TArray<uint8> mask; mask.SetNumZeroed(Vd * Wd);
-
-            for (int32 u = 0; u < U; ++u)
+            const int32 Count = Size.X * Size.Z;
+            NYN.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
             {
-                // build face mask for slice u
-                for (int32 w = 0; w < Wd; ++w)
-                    for (int32 v = 0; v < Vd; ++v)
-                    {
-                        const bool a = atSolid(u, v, w);
-                        const bool b = atOpp(u, v, w);
-                        mask[v + w * Vd] = (a ^ b) ? (a ? 1 : 2) : 0;
-                    }
-
-                int32 i = 0;
-                while (i < Vd * Wd)
-                {
-                    if (mask[i] == 0) { ++i; continue; }
-                    const uint8 val = mask[i];
-                    const int32 v0 = i % Vd;
-                    const int32 w0 = i / Vd;
-
-                    int32 width = 1;  while (v0 + width < Vd && mask[i + width] == val) ++width;
-                    int32 height = 1; bool ok = true;
-                    while (w0 + height < Wd && ok)
-                    {
-                        for (int32 k = 0; k < width; ++k)
-                            if (mask[i + k + height * Vd] != val) { ok = false; break; }
-                        if (ok) ++height;
-                    }
-                    for (int32 hh = 0; hh < height; ++hh)
-                        FMemory::Memset(mask.GetData() + (i + hh * Vd), 0, width);
-
-                    Quad q; q.dir = (val == 1) ? dir : (dir ^ 1);
-                    if (dir < 2) { q.x = u; q.y = v0; q.z = w0; q.w = width; q.h = height; }       // ±X
-                    else if (dir < 4) { q.x = v0; q.y = u; q.z = w0; q.w = width; q.h = height; }  // ±Y
-                    else { q.x = v0; q.y = w0; q.z = u; q.w = width; q.h = height; }  // ±Z
-                    Q.Add(q);
-                }
+                NYN[i] = VoxelBlockCategory(Neighbors->YNeg[i]);
             }
-        };
-
-    // ±X
-    MergeLayer(/*+X*/0, SX, SY, SZ,
-        [&](int32 u, int32 v, int32 w) { return Solid(u, v, w); },
-        [&](int32 u, int32 v, int32 w) { return Solid(u + 1, v, w); });
-    // ±Y
-    MergeLayer(/*+Y*/2, SY, SX, SZ,
-        [&](int32 u, int32 v, int32 w) { return Solid(v, u, w); },
-        [&](int32 u, int32 v, int32 w) { return Solid(v, u + 1, w); });
-    // ±Z
-    MergeLayer(/*+Z*/4, SZ, SX, SY,
-        [&](int32 u, int32 v, int32 w) { return Solid(v, w, u); },
-        [&](int32 u, int32 v, int32 w) { return Solid(v, w, u + 1); });
-
-    const float sx = VoxelUU * float(C.XYScale);
-    const float sy = VoxelUU * float(C.XYScale);
-    const float sz = VoxelUU;
-
-    Out.Vertices.Reserve(Q.Num() * 4);
-    Out.Normals.Reserve(Q.Num() * 4);
-    Out.UVs.Reserve(Q.Num() * 4);
-    Out.Triangles.Reserve(Q.Num() * 6);
-
-    auto pushQuad = [&](const Quad& q)
+            P.NeighborYN = NYN.GetData();
+        }
+        if (P.bHasNeighborYP)
         {
-            FVector o, ux, vy, n;
-            switch (q.dir)
+            const int32 Count = Size.X * Size.Z;
+            NYP.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
             {
-            case 0: o = FVector((q.x + 1) * sx, q.y * sy, q.z * sz); ux = FVector(0, q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(+1, 0, 0); break;
-            case 1: o = FVector(q.x * sx, (q.y + q.w) * sy, q.z * sz); ux = FVector(0, -q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(-1, 0, 0); break;
-            case 2: o = FVector(q.x * sx, (q.y + 1) * sy, q.z * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, +1, 0); break;
-            case 3: o = FVector((q.x + q.w) * sx, q.y * sy, q.z * sz); ux = FVector(-q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, -1, 0); break;
-            case 4: o = FVector(q.x * sx, q.y * sy, (q.z + 1) * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, q.h * sy, 0); n = FVector(0, 0, +1); break;
-            default:o = FVector(q.x * sx, (q.y + q.h) * sy, q.z * sz);   ux = FVector(q.w * sx, 0, 0); vy = FVector(0, -q.h * sy, 0); n = FVector(0, 0, -1); break;
+                NYP[i] = VoxelBlockCategory(Neighbors->YPos[i]);
             }
-
-            const int32 i0 = Out.Vertices.Num();
-            Out.Vertices.Add(o);
-            Out.Vertices.Add(o + ux);
-            Out.Vertices.Add(o + ux + vy);
-            Out.Vertices.Add(o + vy);
-
-            Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n);
-            Out.UVs.Add(FVector2D(0, 0)); Out.UVs.Add(FVector2D(1, 0)); Out.UVs.Add(FVector2D(1, 1)); Out.UVs.Add(FVector2D(0, 1));
-
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 2); Out.Triangles.Add(i0 + 1);
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 3); Out.Triangles.Add(i0 + 2);
-        };
-
-    for (const Quad& q : Q) pushQuad(q);
-}
-namespace
-{
-
-    // popcount of lower b bits
-    FORCEINLINE int32 PopCountLower(uint64 word, int32 b)
-    {
-        if (b >= 64) return FMath::CountBits(word);
-        const uint64 mask = (b == 0) ? 0ULL : ((1ULL << b) - 1ULL);
-        return FMath::CountBits(word & mask);
+            P.NeighborYP = NYP.GetData();
+        }
+        P.bHasNeighborZN = Neighbors->bHasZNeg;
+        if (P.bHasNeighborZN)
+        {
+            const int32 Count = Size.X * Size.Y;
+            NZN.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
+            {
+                NZN[i] = VoxelBlockCategory(Neighbors->ZNeg[i]);
+            }
+            P.NeighborZN = NZN.GetData();
+        }
+        P.bHasNeighborZP = Neighbors->bHasZPos;
+        if (P.bHasNeighborZP)
+        {
+            const int32 Count = Size.X * Size.Y;
+            NZP.SetNumUninitialized(Count);
+            for (int32 i = 0; i < Count; ++i)
+            {
+                NZP[i] = VoxelBlockCategory(Neighbors->ZPos[i]);
+            }
+            P.NeighborZP = NZP.GetData();
+        }
     }
+
+    const bool bLaunched = FVoxelGPUMesher::BuildPackedVerts_GPU_Async(P,
+        [Completion, SizeX = Size.X, SizeY = Size.Y, SizeZ = Size.Z, XYParam = XYScale, VoxelUUParam = VoxelUU](bool bSuccess, TArray<uint32>&& Packed)
+        {
+            Completion(bSuccess, MoveTemp(Packed), SizeX, SizeY, SizeZ, XYParam, VoxelUUParam);
+        });
+
+    return bLaunched;
 }
 
-void UVoxelMesher::RebuildPrefix64(FCompactVoxelData& C)
-{
-    const int32 W = C.Occupancy.Num();
-    C.Prefix64.SetNumUninitialized(W);
-    uint32 acc = 0;
-    for (int32 i = 0; i < W; ++i)
-    {
-        C.Prefix64[i] = acc;
-        acc += (uint32)FMath::CountBits(C.Occupancy[i]);
-    }
-}
-
-int32 UVoxelMesher::Rank1_Prefix(const FCompactVoxelData& C, int32 linearIdx)
-{
-    const int32 w = linearIdx >> 6;
-    const int32 b = linearIdx & 63;
-    const uint32 pref = (uint32)((uint32)w < (uint32)C.Prefix64.Num() ? C.Prefix64[w] : 0u);
-    const uint64 word = ((uint32)w < (uint32)C.Occupancy.Num()) ? C.Occupancy[w] : 0ULL;
-    return (int32)(pref + PopCountLower(word, b));
-}
-
-int32 UVoxelMesher::Idx3D(int32 x, int32 y, int32 z, int32 SX, int32 SY)
-{
-    return x + y * SX + z * SX * SY;
-}
-
-void UVoxelMesher::BuildGreedyMesh_FromBitset_AO(
-    const FCompactVoxelData& C,
+void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
+    const TArray<uint8>& Cats,                 // 0=air,1=semi,2=solid
+    const TArray<EVoxelBlockID>& Voxels,       // full IDs for layer lookups
+    const FIntVector& Size,
     const FChunkNeighbors* Nbh,
-    float UU,
+    float VoxelUU,
+    int32 XYScale,
     bool bUseAO,
+    const class UVoxelBlockTable* BlockTable,  // face→layer map
     FMeshBuffers& Out)
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(Voxel_Mesher_LOD0_BitsetAO);
+    SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
 
-    Out = FMeshBuffers{};
-    const int32 SX = C.SizeX, SY = C.SizeY, SZ = C.SizeZ;
-    if (SX <= 0 || SY <= 0 || SZ <= 0 || C.Occupancy.Num() == 0) return;
+    const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
 
-    // --- neighbor solid masks (your existing helper) ---
-    FNeighborSolidMasks Masks;
-    BuildNeighborSolidMasks(Nbh, SX, SY, SZ, Masks);
+    // SAFETY: Validate input dimensions
+    if (SX <= 0 || SY <= 0 || SZ <= 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelMesher] Invalid chunk dimensions: %dx%dx%d"), SX, SY, SZ);
+        return;
+    }
 
-    auto SolidLocal = [&](int32 x, int32 y, int32 z)->bool
+    if (Cats.Num() != SX * SY * SZ)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelMesher] Category array size mismatch: got %d, expected %d"),
+            Cats.Num(), SX * SY * SZ);
+        return;
+    }
+
+    Out.Vertices.Reset();
+    Out.Triangles.Reset();
+    Out.UVs.Reset();
+    Out.Colors.Reset();
+    Out.Normals.Reset();
+
+    const int32 approxQuads = FMath::Max(1, (SX * SY + SY * SZ + SX * SZ) / 2);
+    Out.Vertices.Reserve(approxQuads * 4);
+    Out.Triangles.Reserve(approxQuads * 6);
+    Out.UVs.Reserve(approxQuads * 4);
+    Out.Colors.Reserve(approxQuads * 4);
+    Out.Normals.Reserve(approxQuads * 4);
+
+    const double Sx = (double)VoxelUU * (double)XYScale;
+    const double Sy = (double)VoxelUU * (double)XYScale;
+    const double Sz = (double)VoxelUU;
+
+    auto Idx3 = [&](int32 x, int32 y, int32 z) -> int32
         {
-            if ((uint32)x >= (uint32)SX || (uint32)y >= (uint32)SY || (uint32)z >= (uint32)SZ) return false;
-            const int32 i = x + y * SX + z * SX * SY;
-            const int32 w = i >> 6, b = i & 63;
-            return (C.Occupancy[w] >> b) & 1ULL;
+            // SAFETY: Bounds checking
+            if (x < 0 || y < 0 || z < 0 || x >= SX || y >= SY || z >= SZ)
+                return -1;
+            return x + y * SX + z * SX * SY;
         };
 
-    auto SolidWithHalo = [&](int32 x, int32 y, int32 z)->bool
+    auto Inside = [&](int32 x, int32 y, int32 z) -> bool
         {
-            // inside chunk
-            if ((uint32)x < (uint32)SX && (uint32)y < (uint32)SY && (uint32)z < (uint32)SZ)
-                return SolidLocal(x, y, z);
+            return (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ);
+        };
+    auto BlockAt = [&](int x, int y, int z)->EVoxelBlockID
+        {
+            if (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ)
+                return Voxels[x + y * SX + z * SX * SY];
+            if (!Nbh) return EVoxelBlockID::Air;
 
-            // outside → use 1-bit neighbor masks like in BuildGreedyMesh_FaceMask
-            if (z >= 0 && z < SZ)
-            {
-                if (x < 0 && y >= 0 && y < SY && Masks.bHasXNeg) return Masks.XNeg[y + z * SY];
-                if (x >= SX && y >= 0 && y < SY && Masks.bHasXPos) return Masks.XPos[y + z * SY];
-
-                if (y < 0 && x >= 0 && x < SX && Masks.bHasYNeg) return Masks.YNeg[x + z * SX];
-                if (y >= SY && x >= 0 && x < SX && Masks.bHasYPos) return Masks.YPos[x + z * SX];
-            }
-            if (x >= 0 && x < SX && y >= 0 && y < SY)
-            {
-                if (z < 0 && Masks.bHasZNeg) return Masks.ZNeg[x + y * SX];
-                if (z >= SZ && Masks.bHasZPos) return Masks.ZPos[x + y * SX];
-            }
-            return false;
+            if (z < 0)       return (Nbh->bHasZNeg && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZNeg[x + y * SX] : EVoxelBlockID::Air;
+            if (z >= SZ)     return (Nbh->bHasZPos && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZPos[x + y * SX] : EVoxelBlockID::Air;
+            if (x < 0)       return (Nbh->bHasXNeg && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XNeg[y + z * SY] : EVoxelBlockID::Air;
+            if (x >= SX)     return (Nbh->bHasXPos && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XPos[y + z * SY] : EVoxelBlockID::Air;
+            if (y < 0)       return (Nbh->bHasYNeg && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YNeg[x + z * SX] : EVoxelBlockID::Air;
+            /* y >= SY */    return (Nbh->bHasYPos && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
         };
 
-    struct Quad { int32 x, y, z, w, h; uint8 dir; };
-    TArray<Quad> Q; Q.Reserve(SX * SY + SY * SZ + SZ * SX);
-
-    auto MergeLayer = [&](uint8 dir, int32 U, int32 Vd, int32 Wd,
-        auto atSolid, auto atOpp)
+    auto CatAt = [&](int32 x, int32 y, int32 z) -> uint8
         {
-            TArray<uint8> mask; mask.SetNumZeroed(Vd * Wd);
-
-            for (int32 u = 0; u < U; ++u)
+            if (Inside(x, y, z))
             {
-                // face mask for slice u
-                for (int32 w = 0; w < Wd; ++w)
-                    for (int32 v = 0; v < Vd; ++v)
-                    {
-                        const bool a = atSolid(u, v, w);
-                        const bool b = atOpp(u, v, w);
-                        mask[v + w * Vd] = (a ^ b) ? (a ? 1 : 2) : 0; // 1=+dir,2=-dir
-                    }
+                const int32 idx = Idx3(x, y, z);
+                if (idx >= 0 && idx < Cats.Num())
+                    return Cats[idx];
+                return 0;
+            }
 
-                int32 i = 0;
-                while (i < Vd * Wd)
+            if (!Nbh) return 0;
+
+            // Vertical neighbors
+            if (z < 0)
+            {
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
                 {
-                    if (mask[i] == 0) { ++i; continue; }
-                    const uint8 val = mask[i];
-                    const int32 v0 = i % Vd;
-                    const int32 w0 = i / Vd;
+                    const int32 nbIdx = x + y * SX;
+                    if (nbIdx >= 0 && nbIdx < Nbh->ZNeg.Num())
+                        return VoxelBlockCategory(Nbh->ZNeg[nbIdx]);
+                }
+                return 0;
+            }
+            if (z >= SZ)
+            {
+                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
+                {
+                    const int32 nbIdx = x + y * SX;
+                    if (nbIdx >= 0 && nbIdx < Nbh->ZPos.Num())
+                        return VoxelBlockCategory(Nbh->ZPos[nbIdx]);
+                }
+                return 0;
+            }
 
-                    int32 width = 1;  while (v0 + width < Vd && mask[i + width] == val) ++width;
-                    int32 height = 1; bool ok = true;
-                    while (w0 + height < Wd && ok)
+            // Horizontal neighbors
+            if (x < 0)
+            {
+                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXNeg)
+                {
+                    const int32 nbIdx = y + z * SY;
+                    if (nbIdx >= 0 && nbIdx < Nbh->XNeg.Num())
+                        return VoxelBlockCategory(Nbh->XNeg[nbIdx]);
+                }
+                return 0;
+            }
+            if (x >= SX)
+            {
+                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXPos)
+                {
+                    const int32 nbIdx = y + z * SY;
+                    if (nbIdx >= 0 && nbIdx < Nbh->XPos.Num())
+                        return VoxelBlockCategory(Nbh->XPos[nbIdx]);
+                }
+                return 0;
+            }
+            if (y < 0)
+            {
+                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYNeg)
+                {
+                    const int32 nbIdx = x + z * SX;
+                    if (nbIdx >= 0 && nbIdx < Nbh->YNeg.Num())
+                        return VoxelBlockCategory(Nbh->YNeg[nbIdx]);
+                }
+                return 0;
+            }
+            if (y >= SY)
+            {
+                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYPos)
+                {
+                    const int32 nbIdx = x + z * SX;
+                    if (nbIdx >= 0 && nbIdx < Nbh->YPos.Num())
+                        return VoxelBlockCategory(Nbh->YPos[nbIdx]);
+                }
+                return 0;
+            }
+
+            return 0;
+        };
+
+    auto SampleAO = [&](const FIntVector& P, const FIntVector& U, const FIntVector& V) -> float
+        {
+            if (!bUseAO) return 1.f;
+
+            auto solid = [&](const FIntVector& Q) { return CatAt(Q.X, Q.Y, Q.Z) != 0; };
+            const bool SA = solid(P + U);
+            const bool SB = solid(P + V);
+            const bool SC = solid(P + U + V);
+            if (SA && SB) return 0.f;
+            return 1.f - (int(SA) + int(SB) + int(SC)) / 3.f;
+        };
+
+    auto Neg = [](const FIntVector& v) -> FIntVector
+        {
+            return FIntVector(-v.X, -v.Y, -v.Z);
+        };
+
+    struct Axis
+    {
+        FIntVector N, U, V;
+        int32 Slice, DimU, DimV;
+    };
+
+    auto Axes = [&](int dir) -> Axis
+        {
+            switch (dir)
+            {
+            case 0: return { { 1,0,0},{0,1,0},{0,0,1}, SX, SY, SZ };
+            case 1: return { {-1,0,0},{0,1,0},{0,0,1}, SX, SY, SZ };
+            case 2: return { {0, 1,0},{1,0,0},{0,0,1}, SY, SX, SZ };
+            case 3: return { {0,-1,0},{1,0,0},{0,0,1}, SY, SX, SZ };
+            case 4: return { {0,0, 1},{1,0,0},{0,1,0}, SZ, SX, SY };
+            default:return { {0,0,-1},{1,0,0},{0,1,0}, SZ, SX, SY };
+            }
+        };
+
+    auto MakeP = [&](const FIntVector& Nrm, int s, int u, int v) -> FIntVector
+        {
+            if (Nrm.X) return { s, u, v };
+            if (Nrm.Y) return { u, s, v };
+            return { u, v, s };
+        };
+
+    // Use thread-safe local buffer instead of thread_local to prevent race conditions
+    TArray<uint64> Rows;
+
+    // Process categories: solids then semis
+    for (uint8 CatType : { uint8(2), uint8(1) })
+    {
+        const bool bTintSemi = (CatType == 1);
+
+        for (int dir = 0; dir < 6; ++dir)
+        {
+            const Axis A = Axes(dir);
+            const FIntVector Udir = A.U;
+            const FIntVector Vdir = A.V;
+            const FIntVector Nrm = A.N;
+
+            for (int s = 0; s < A.Slice; ++s)
+            {
+                // SAFETY: Limit tile width to prevent overflow
+                const int32 MaxTileWidth = FMath::Min(64, A.DimU);
+
+                for (int uTile = 0; uTile < A.DimU; uTile += MaxTileWidth)
+                {
+                    const int uCount = FMath::Min(MaxTileWidth, A.DimU - uTile);
+
+                    // SAFETY: Initialize rows array
+                    Rows.Reset();
+                    Rows.SetNumZeroed(A.DimV);
+
+                    // Build face-visibility masks
+                    for (int v = 0; v < A.DimV; ++v)
                     {
-                        for (int32 k = 0; k < width; ++k)
-                            if (mask[i + k + height * Vd] != val) { ok = false; break; }
-                        if (ok) ++height;
+                        uint64 bits = 0ull;
+                        for (int du = 0; du < uCount; ++du)
+                        {
+                            const int u = uTile + du;
+                            const FIntVector P = MakeP(Nrm, s, u, v);
+                            const FIntVector Q = P + Nrm;
+                            const uint8 Ac = CatAt(P.X, P.Y, P.Z);
+                            const uint8 Bc = CatAt(Q.X, Q.Y, Q.Z);
+                            const bool visible = (Ac == CatType) && (Bc == 0);
+                            bits |= (uint64)visible << du;
+                        }
+
+                        // SAFETY: Bounds check
+                        if (v >= 0 && v < Rows.Num())
+                            Rows[v] = bits;
                     }
 
-                    for (int32 hh = 0; hh < height; ++hh)
-                        FMemory::Memset(mask.GetData() + (i + hh * Vd), 0, width);
+                    // Greedy merge rectangles
+                    for (int v = 0; v < A.DimV; ++v)
+                    {
+                        // SAFETY: Bounds check
+                        if (v < 0 || v >= Rows.Num())
+                            continue;
 
-                    Quad q; q.dir = (val == 1) ? dir : (dir ^ 1);
-                    if (dir < 2) { q.x = u; q.y = v0; q.z = w0; q.w = width; q.h = height; }       // ±X
-                    else if (dir < 4) { q.x = v0; q.y = u; q.z = w0; q.w = width; q.h = height; }  // ±Y
-                    else { q.x = v0; q.y = w0; q.z = u; q.w = width; q.h = height; }  // ±Z
-                    Q.Add(q);
+                        uint64 row = Rows[v];
+
+                        while (row)
+                        {
+                            // Count trailing zeros (find first set bit)
+                            int du0 = 0;
+                            uint64 temp = row;
+                            while ((temp & 1ull) == 0ull && du0 < 64)
+                            {
+                                temp >>= 1;
+                                ++du0;
+                            }
+                            if (du0 >= 64) break;
+
+                            // Count consecutive ones - but stop if block ID changes
+                            const uint64 run = row >> du0;
+                            int w = 0;
+                            temp = run;
+
+                            // Get the base block ID for the first visible face
+                            const int u0 = uTile + du0;
+                            const FIntVector P0 = MakeP(Nrm, s, u0, v);
+                            const EVoxelBlockID baseBlockID = BlockAt(P0.X, P0.Y, P0.Z);
+
+                            while ((temp & 1ull) != 0ull && w < uCount - du0)
+                            {
+                                // Check if this voxel has the same block ID
+                                const int uCheck = u0 + w;
+                                const FIntVector PCheck = MakeP(Nrm, s, uCheck, v);
+                                const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
+
+                                if (checkBlockID != baseBlockID)
+                                    break; // Don't merge different block types
+
+                                temp >>= 1;
+                                ++w;
+                            }
+                            if (w == 0) break;
+
+                            // SAFETY: Clamp width
+                            w = FMath::Min(w, uCount - du0);
+                            const uint64 colMask = (w >= 64) ? ~0ull : ((1ull << w) - 1);
+
+                            // Find height - stop if block ID changes
+                            int h = 1;
+                            while ((v + h) < A.DimV && (v + h) < Rows.Num())
+                            {
+                                const uint64 checkMask = (Rows[v + h] >> du0) & colMask;
+                                if (checkMask != colMask)
+                                    break;
+
+                                // CRITICAL: Check all voxels in the row have same block ID
+                                bool blockIDMatches = true;
+                                for (int du = 0; du < w; ++du)
+                                {
+                                    const int uCheck = u0 + du;
+                                    const FIntVector PCheck = MakeP(Nrm, s, uCheck, v + h);
+                                    const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
+                                    if (checkBlockID != baseBlockID)
+                                    {
+                                        blockIDMatches = false;
+                                        break;
+                                    }
+                                }
+
+                                if (!blockIDMatches)
+                                    break;
+
+                                ++h;
+                            }
+
+                            // Clear consumed bits
+                            const uint64 clearMask = ~(colMask << du0);
+                            for (int dv = 0; dv < h; ++dv)
+                            {
+                                const int vIdx = v + dv;
+                                if (vIdx >= 0 && vIdx < Rows.Num())
+                                    Rows[vIdx] &= clearMask;
+                            }
+                            row = Rows[v];
+
+                            // Emit quad
+                            const FIntVector FaceBaseGrid = MakeP(Nrm, s, u0, v)
+                                + FIntVector(FMath::Max(0, Nrm.X), FMath::Max(0, Nrm.Y), FMath::Max(0, Nrm.Z));
+                            auto FaceDirFromNormal = [](const FIntVector& n)->EVoxelFaceDir {
+                                if (n.X == 1) return EVoxelFaceDir::XPos; if (n.X == -1) return EVoxelFaceDir::XNeg;
+                                if (n.Y == 1) return EVoxelFaceDir::YPos; if (n.Y == -1) return EVoxelFaceDir::YNeg;
+                                return n.Z == 1 ? EVoxelFaceDir::ZPos : EVoxelFaceDir::ZNeg;
+                                };
+                            const EVoxelFaceDir FaceDir = FaceDirFromNormal(Nrm);
+                            const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBaseGrid.X, FaceBaseGrid.Y, FaceBaseGrid.Z, FaceDir);
+                            const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
+
+                            // prepare vectors
+                            const FVector base(FaceBaseGrid.X * Sx, FaceBaseGrid.Y * Sy, FaceBaseGrid.Z * Sz);
+                            const FVector uvec(Udir.X * w * Sx, Udir.Y * w * Sy, Udir.Z * w * Sz);
+                            const FVector vvec(Vdir.X * h * Sx, Vdir.Y * h * Sy, Vdir.Z * h * Sz);
+                            const FVector normal(Nrm);                      // outward
+
+                            // AO as floats in [0,1]
+                            float ao00 = 1, ao10 = 1, ao11 = 1, ao01 = 1;
+                            if (bUseAO) {
+                                ao00 = SampleAO(FaceBaseGrid, Neg(Udir), Neg(Vdir));
+                                ao10 = SampleAO(FaceBaseGrid + Udir * w, Udir, Neg(Vdir));
+                                ao11 = SampleAO(FaceBaseGrid + Udir * w + Vdir * h, Udir, Vdir);
+                                ao01 = SampleAO(FaceBaseGrid + Vdir * h, Neg(Udir), Vdir);
+                            }
+
+
+                            // add verts
+                            const int v0 = Out.Vertices.Num();
+                            Out.Vertices.Add(base);
+                            Out.Vertices.Add(base + uvec);
+                            Out.Vertices.Add(base + uvec + vvec);
+                            Out.Vertices.Add(base + vvec);
+
+                            // Flip normals to fix inverted faces
+                            Out.Normals.Add(normal); Out.Normals.Add(normal);
+                            Out.Normals.Add(normal); Out.Normals.Add(normal);
+
+                            // AO→bytes, layer in A
+                            auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
+                            const uint8 AO00 = ToByte(ao00), AO10 = ToByte(ao10), AO11 = ToByte(ao11), AO01 = ToByte(ao01);
+                            Out.Colors.Add(FColor(AO00, AO00, AO00, Layer));
+                            Out.Colors.Add(FColor(AO10, AO10, AO10, Layer));
+                            Out.Colors.Add(FColor(AO11, AO11, AO11, Layer));
+                            Out.Colors.Add(FColor(AO01, AO01, AO01, Layer));
+
+                            // robust CCW winding relative to outward normal
+                            const FVector Uf = FVector(uvec).GetSafeNormal();
+                            const FVector Vf = FVector(vvec).GetSafeNormal();
+                            const float sign = FVector::DotProduct(FVector::CrossProduct(Uf, Vf), normal);
+                            if (sign < 0.f)
+                            {
+                                Out.Triangles.Add(v0 + 0); Out.Triangles.Add(v0 + 1); Out.Triangles.Add(v0 + 2);
+                                Out.Triangles.Add(v0 + 0); Out.Triangles.Add(v0 + 2); Out.Triangles.Add(v0 + 3);
+                            }
+                            else
+                            {
+                                Out.Triangles.Add(v0 + 0); Out.Triangles.Add(v0 + 2); Out.Triangles.Add(v0 + 1);
+                                Out.Triangles.Add(v0 + 0); Out.Triangles.Add(v0 + 3); Out.Triangles.Add(v0 + 2);
+                            }
+
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    const int32 bytes =
+        Out.Vertices.Num() * sizeof(FVector) +
+        Out.Triangles.Num() * sizeof(int32) +
+        Out.UVs.Num() * sizeof(FVector2D) +
+        Out.Colors.Num() * sizeof(FColor)+
+        Out.Normals.Num() * sizeof(FVector);
+    INC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, bytes);
+}
+
+// ============================================================================
+// NAIVE MESHER (DEBUG ONLY - NO GREEDY OPTIMIZATION)
+// ============================================================================
+
+void UVoxelMesher::BuildNaiveMesh(
+    const TArray<EVoxelBlockID>& Voxels,
+    const FIntVector& Size,
+    const FChunkNeighbors* Nbh,
+    float VoxelUU,
+    int32 XYScale,
+    bool bUseAO,
+    const class UVoxelBlockTable* BlockTable,
+    FMeshBuffers& Out)
+{
+    SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
+
+    const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
+
+    if (SX <= 0 || SY <= 0 || SZ <= 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[NaiveMesher] Invalid chunk dimensions: %dx%dx%d"), SX, SY, SZ);
+        return;
+    }
+
+    if (Voxels.Num() != SX * SY * SZ)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[NaiveMesher] Voxel array size mismatch: got %d, expected %d"),
+            Voxels.Num(), SX * SY * SZ);
+        return;
+    }
+
+    Out.Vertices.Reset();
+    Out.Triangles.Reset();
+    Out.UVs.Reset();
+    Out.Colors.Reset();
+    Out.Normals.Reset();
+
+    const double Sx = (double)VoxelUU * (double)XYScale;
+    const double Sy = (double)VoxelUU * (double)XYScale;
+    const double Sz = (double)VoxelUU;
+
+    // Helper: get voxel at position (handles neighbors)
+    auto GetVoxel = [&](int32 x, int32 y, int32 z) -> EVoxelBlockID
+    {
+        // Inside chunk
+        if (x >= 0 && x < SX && y >= 0 && y < SY && z >= 0 && z < SZ)
+            return Voxels[x + y * SX + z * SX * SY];
+
+        // Check neighbors
+        if (!Nbh) return EVoxelBlockID::Air;
+
+        if (z < 0 && x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
+            return Nbh->ZNeg[x + y * SX];
+        if (z >= SZ && x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
+            return Nbh->ZPos[x + y * SX];
+        if (x < 0 && y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXNeg)
+            return Nbh->XNeg[y + z * SY];
+        if (x >= SX && y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXPos)
+            return Nbh->XPos[y + z * SY];
+        if (y < 0 && x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYNeg)
+            return Nbh->YNeg[x + z * SX];
+        if (y >= SY && x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYPos)
+            return Nbh->YPos[x + z * SX];
+
+        return EVoxelBlockID::Air;
+    };
+
+    // Helper: check if voxel is solid
+    auto IsSolid = [](EVoxelBlockID id) -> bool
+    {
+        return VoxelBlockCategory(id) != 0; // 0 = air
+    };
+
+    // Helper: emit a quad face
+// Outward normals, CCW from outside. No flipping.
+    auto EmitFace = [&](const FVector& v0, const FVector& v1, const FVector& v2, const FVector& v3,
+        const FVector& normal, EVoxelBlockID blockId, EVoxelFaceDir faceDir)
+        {
+            const int32 baseIdx = Out.Vertices.Num();
+
+            Out.Vertices.Add(v0);
+            Out.Vertices.Add(v1);
+            Out.Vertices.Add(v2);
+            Out.Vertices.Add(v3);
+
+            Out.Normals.Add(normal);
+            Out.Normals.Add(normal);
+            Out.Normals.Add(normal);
+            Out.Normals.Add(normal);
+
+            Out.UVs.Add(FVector2D(0, 0));
+            Out.UVs.Add(FVector2D(1, 0));
+            Out.UVs.Add(FVector2D(1, 1));
+            Out.UVs.Add(FVector2D(0, 1));
+
+            const uint8 layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(faceDir, blockId), 0, 255) : 0;
+            const uint8 ao = bUseAO ? 200 : 255;
+            Out.Colors.Add(FColor(ao, ao, ao, layer));
+            Out.Colors.Add(FColor(ao, ao, ao, layer));
+            Out.Colors.Add(FColor(ao, ao, ao, layer));
+            Out.Colors.Add(FColor(ao, ao, ao, layer));
+
+            // CCW winding for front faces
+            Out.Triangles.Add(baseIdx + 0);
+            Out.Triangles.Add(baseIdx + 1);
+            Out.Triangles.Add(baseIdx + 2);
+            Out.Triangles.Add(baseIdx + 0);
+            Out.Triangles.Add(baseIdx + 2);
+            Out.Triangles.Add(baseIdx + 3);
         };
 
-    // ±X
-    MergeLayer(/*+X*/0, SX, SY, SZ,
-        [&](int32 u, int32 v, int32 w) { return SolidLocal(u, v, w); },
-        [&](int32 u, int32 v, int32 w) { return SolidWithHalo(u + 1, v, w); });
-    // ±Y
-    MergeLayer(/*+Y*/2, SY, SX, SZ,
-        [&](int32 u, int32 v, int32 w) { return SolidLocal(v, u, w); },
-        [&](int32 u, int32 v, int32 w) { return SolidWithHalo(v, u + 1, w); });
-    // ±Z
-    MergeLayer(/*+Z*/4, SZ, SX, SY,
-        [&](int32 u, int32 v, int32 w) { return SolidLocal(v, w, u); },
-        [&](int32 u, int32 v, int32 w) { return SolidWithHalo(v, w, u + 1); });
 
-    const float sx = UU * float(C.XYScale);
-    const float sy = UU * float(C.XYScale);
-    const float sz = UU;
+    // DEBUG: Count air voxels that should be solid
+    int32 AirCount = 0, SolidCount = 0;
 
-    Out.Vertices.Reserve(Q.Num() * 4);
-    Out.Normals.Reserve(Q.Num() * 4);
-    Out.UVs.Reserve(Q.Num() * 4);
-    Out.Colors.Reserve(Q.Num() * 4);
-    Out.Triangles.Reserve(Q.Num() * 6);
-
-    auto AOShade = [&](int32 x, int32 y, int32 z, const FVector& n)->float
+    // Iterate through all voxels and emit faces
+    for (int32 z = 0; z < SZ; ++z)
+    {
+        for (int32 y = 0; y < SY; ++y)
         {
-            if (!bUseAO) return 1.0f;
-            // simple 7-sample AO
-            const int ax = (n.X > 0) - (n.X < 0), ay = (n.Y > 0) - (n.Y < 0), az = (n.Z > 0) - (n.Z < 0);
-            const bool s1 = SolidWithHalo(x + ax, y, z);
-            const bool s2 = SolidWithHalo(x, y + ay, z);
-            const bool c1 = SolidWithHalo(x + ax, y + ay, z);
-            const bool s3 = SolidWithHalo(x, y, z + az);
-            const bool s4 = SolidWithHalo(x + ax, y, z + az);
-            const bool s5 = SolidWithHalo(x, y + ay, z + az);
-            const bool c2 = SolidWithHalo(x + ax, y + ay, z + az);
-            int occ = (s1 ? 1 : 0) + (s2 ? 1 : 0) + (c1 ? 1 : 0) + (s3 ? 1 : 0) + (s4 ? 1 : 0) + (s5 ? 1 : 0) + (c2 ? 1 : 0);
-            return FMath::Clamp(1.0f - 0.07f * occ, 0.5f, 1.0f);
-        };
-
-    auto pushQuad = [&](const Quad& q)
-        {
-            FVector o, ux, vy, n;
-            switch (q.dir)
+            for (int32 x = 0; x < SX; ++x)
             {
-            case 0: o = FVector((q.x + 1) * sx, q.y * sy, q.z * sz); ux = FVector(0, q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(+1, 0, 0); break;
-            case 1: o = FVector(q.x * sx, (q.y + q.w) * sy, q.z * sz); ux = FVector(0, -q.w * sy, 0); vy = FVector(0, 0, q.h * sz); n = FVector(-1, 0, 0); break;
-            case 2: o = FVector(q.x * sx, (q.y + 1) * sy, q.z * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, +1, 0); break;
-            case 3: o = FVector((q.x + q.w) * sx, q.y * sy, q.z * sz); ux = FVector(-q.w * sx, 0, 0); vy = FVector(0, 0, q.h * sz); n = FVector(0, -1, 0); break;
-            case 4: o = FVector(q.x * sx, q.y * sy, (q.z + 1) * sz); ux = FVector(q.w * sx, 0, 0); vy = FVector(0, q.h * sy, 0); n = FVector(0, 0, +1); break;
-            default:o = FVector(q.x * sx, (q.y + q.h) * sy, q.z * sz);   ux = FVector(q.w * sx, 0, 0); vy = FVector(0, -q.h * sy, 0); n = FVector(0, 0, -1); break;
+                const EVoxelBlockID current = GetVoxel(x, y, z);
+                if (!IsSolid(current))
+                {
+                    AirCount++;
+                    // DEBUG: Log unexpected air blocks at surface level
+                    if (z >= SZ / 2 && z <= SZ / 2 + 10)
+                    {
+                        const EVoxelBlockID below = GetVoxel(x, y, z - 1);
+                        if (IsSolid(below))
+                        {
+                            UE_LOG(LogTemp, Warning, TEXT("[NaiveMesher] Unexpected air at (%d,%d,%d), below is solid"), x, y, z);
+                        }
+                    }
+                    continue; // Skip air
+                }
+
+                SolidCount++;
+                const FVector basePos(x * Sx, y * Sy, z * Sz);
+
+                // Check all 6 faces
+                // X- face (looking from -X toward +X, CCW from outside)
+                if (!IsSolid(GetVoxel(x - 1, y, z)))
+                {
+                    EmitFace(
+                        basePos + FVector(0, 0, 0),
+                        basePos + FVector(0, Sy, 0),
+                        basePos + FVector(0, Sy, Sz),
+                        basePos + FVector(0, 0, Sz),
+                        FVector(-1, 0, 0),
+                        current,
+                        EVoxelFaceDir::XNeg
+                    );
+                }
+
+                // X+ face (looking from +X toward -X, CCW from outside)
+                if (!IsSolid(GetVoxel(x + 1, y, z)))
+                {
+                    EmitFace(
+                        basePos + FVector(Sx, 0, 0),
+                        basePos + FVector(Sx, 0, Sz),
+                        basePos + FVector(Sx, Sy, Sz),
+                        basePos + FVector(Sx, Sy, 0),
+                        FVector(1, 0, 0),
+                        current,
+                        EVoxelFaceDir::XPos
+                    );
+                }
+
+                // Y- face (looking from -Y toward +Y, CCW from outside)
+                if (!IsSolid(GetVoxel(x, y - 1, z)))
+                {
+                    EmitFace(
+                        basePos + FVector(0, 0, 0),
+                        basePos + FVector(0, 0, Sz),
+                        basePos + FVector(Sx, 0, Sz),
+                        basePos + FVector(Sx, 0, 0),
+                        FVector(0, -1, 0),
+                        current,
+                        EVoxelFaceDir::YNeg
+                    );
+                }
+
+                // Y+ face (looking from +Y toward -Y, CCW from outside)
+                if (!IsSolid(GetVoxel(x, y + 1, z)))
+                {
+                    EmitFace(
+                        basePos + FVector(0, Sy, 0),
+                        basePos + FVector(Sx, Sy, 0),
+                        basePos + FVector(Sx, Sy, Sz),
+                        basePos + FVector(0, Sy, Sz),
+                        FVector(0, 1, 0),
+                        current,
+                        EVoxelFaceDir::YPos
+                    );
+                }
+
+                // Z- face (bottom, looking from -Z toward +Z, CCW from outside)
+                if (!IsSolid(GetVoxel(x, y, z - 1)))
+                {
+                    EmitFace(
+                        basePos + FVector(0, 0, 0),
+                        basePos + FVector(Sx, 0, 0),
+                        basePos + FVector(Sx, Sy, 0),
+                        basePos + FVector(0, Sy, 0),
+                        FVector(0, 0, -1),
+                        current,
+                        EVoxelFaceDir::ZNeg
+                    );
+                }
+
+                // Z+ face (top, looking from +Z toward -Z, CCW from outside)
+                if (!IsSolid(GetVoxel(x, y, z + 1)))
+                {
+                    EmitFace(
+                        basePos + FVector(0, 0, Sz),
+                        basePos + FVector(0, Sy, Sz),
+                        basePos + FVector(Sx, Sy, Sz),
+                        basePos + FVector(Sx, 0, Sz),
+                        FVector(0, 0, 1),
+                        current,
+                        EVoxelFaceDir::ZPos
+                    );
+                }
             }
+        }
+    }
 
-            const int32 i0 = Out.Vertices.Num();
-            Out.Vertices.Add(o);
-            Out.Vertices.Add(o + ux);
-            Out.Vertices.Add(o + ux + vy);
-            Out.Vertices.Add(o + vy);
+    const int32 bufferMemory =
+        Out.Vertices.Num() * sizeof(FVector) +
+        Out.Triangles.Num() * sizeof(int32) +
+        Out.UVs.Num() * sizeof(FVector2D) +
+        Out.Colors.Num() * sizeof(FColor) +
+        Out.Normals.Num() * sizeof(FVector);
+    INC_MEMORY_STAT_BY(STAT_VoxelMeshBufferMemory, bufferMemory);
 
-            Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n); Out.Normals.Add(n);
-            Out.UVs.Add(FVector2D(0, 0)); Out.UVs.Add(FVector2D(1, 0)); Out.UVs.Add(FVector2D(1, 1)); Out.UVs.Add(FVector2D(0, 1));
-
-            const float a0 = AOShade(q.x, q.y, q.z, n);
-            Out.Colors.Add(FLinearColor(a0, a0, a0, 1));
-            Out.Colors.Add(FLinearColor(a0, a0, a0, 1));
-            Out.Colors.Add(FLinearColor(a0, a0, a0, 1));
-            Out.Colors.Add(FLinearColor(a0, a0, a0, 1));
-
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 2); Out.Triangles.Add(i0 + 1);
-            Out.Triangles.Add(i0 + 0); Out.Triangles.Add(i0 + 3); Out.Triangles.Add(i0 + 2);
-        };
-
-    for (const Quad& q : Q) pushQuad(q);
+    const int32 TotalVoxels = SX * SY * SZ;
+    const float AirPercent = (float)AirCount / TotalVoxels * 100.0f;
+    UE_LOG(LogTemp, Warning, TEXT("[NaiveMesher] Chunk %dx%dx%d: %d vertices, %d tris | Air: %d (%.1f%%), Solid: %d"),
+        SX, SY, SZ, Out.Vertices.Num(), Out.Triangles.Num() / 3, AirCount, AirPercent, SolidCount);
 }

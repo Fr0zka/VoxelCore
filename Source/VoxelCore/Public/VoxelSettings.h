@@ -12,7 +12,7 @@ class VOXELCORE_API UVoxelSettings : public UObject
 public:
     // === Scale & base chunk shape ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Scale")
-    float VoxelWorldScale = 100.0f; // UU per LOD0 voxel
+    float VoxelWorldScale = 100.0f;
 
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Chunk")
     int32 ChunkSizeX = 16;
@@ -23,32 +23,29 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Chunk")
     int32 ChunkSizeZ = 64;
 
-    // Legacy fallback if LOD2_Radius <= 0
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming")
     int32 ViewDistanceChunks = 6;
+
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
+    int32 ViewDistanceChunksZ = 6;
 
     // === LOD rings ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD", meta = (ClampMin = "1"))
     int32 LOD0_Radius = 3;
 
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD", meta = (ClampMin = "1"))
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD", meta = (ClampMin = "0"))
     int32 LOD1_Radius = 8;
 
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD")
     int32 LOD2_Radius = 12;
 
-    // Coarsening factor for LOD1 in XY (Z stays 1×)
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD", meta = (ClampMin = "1"))
     int32 LOD1_ScaleXY = 2;
 
-    // Heightfield tessellation for LOD2
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD", meta = (ClampMin = "2", ClampMax = "128"))
     int32 LOD2_Tessellation = 16;
 
     // === Streaming policy ===
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "64"))
-    int32 MaxMeshAppliesPerTick = 2;
-
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming")
     bool bDiskShapedLoading = true;
 
@@ -58,20 +55,7 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
     int32 AORadiusChunks = 3;
 
-    // === Directional streaming (currently unused, kept for future) ===
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Directional")
-    bool bDirectionalStreaming = false;
-
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Directional", meta = (ClampMin = "1.0", ClampMax = "179.0"))
-    float ForwardHalfAngleDeg = 80.0f;
-
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Directional", meta = (ClampMin = "0.0", ClampMax = "90.0"))
-    float RearHalfAngleDeg = 25.0f;
-
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Directional")
-    bool bUseControllerForward = true;
-
-    // === Generation parameters (example) ===
+    // === Generation parameters ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Generation")
     int32 Seed = 1337;
 
@@ -98,6 +82,12 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "64"))
     int32 MaxConcurrentMeshingTasks = 2;
 
+    // === Performance: spawn budget ===
+    // Maximum number of new chunks we are allowed to spawn per frame.
+    // Higher values fill in faster around the player but can cause hitches.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "256"))
+    int32 MaxChunksSpawnPerFrame = 12;
+
     // === Performance: mesh component pool ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")
     bool bEnableMeshComponentPooling = true;
@@ -105,44 +95,164 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "0", ClampMax = "1024"))
     int32 MeshComponentPoolPrewarm = 0;
 
-    // === LOD2 macro-tiles (NEW) ===
-    // Merge far-ring LOD2 into one heightfield mesh per macro-tile
+    // === LOD2 macro-tiles ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD2 MacroTiles")
     bool bUseLOD2MacroTiles = true;
 
-    // Size in *chunks* per side (e.g., 8 = 8×8 chunks merged)
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD2 MacroTiles", meta = (ClampMin = "2", ClampMax = "64"))
     int32 LOD2_MacroTileSize = 8;
 
-    // XY downsample step in voxels for LOD2 heightfield sampling; match LOD1 scale by default
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|LOD2 MacroTiles", meta = (ClampMin = "1", ClampMax = "64"))
     int32 LOD2_SampleXY = 2;
 
+    // ===================================================================
+    // GPU MESHER OPTIMIZATION OPTIONS (NEW)
+    // ===================================================================
+
+    /**
+     * Enable GPU mesher for LOD0 (experimental, optional).
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing")
+    bool bUseGPUMesherForLOD0 = false;
+
+    /**
+     * GPU mesher tile size. Larger = more shared memory usage but better occupancy.
+     * FIXED: Currently hardcoded to 8 in the compute shader and cannot be changed.
+     * This setting is kept for future parameterization but currently has no effect.
+     * WARNING: Changing this value will log a warning but will not affect GPU meshing.
+     */
+    UPROPERTY(VisibleAnywhere, Config, BlueprintReadOnly, Category = "Voxel|GPU Meshing",
+        meta = (EditCondition = "false"))
+    int32 GPUMesherTileSize = 8;
+
+    /**
+     * [DEPRECATED - DO NOT ENABLE] Use aggressive GPU culling (ignores neighbor borders).
+     * WARNING: Enabling this creates visible WALLS between chunks!
+     * This setting should remain FALSE for proper seamless meshing.
+     * When false: GPU properly culls faces between chunks using neighbor border data.
+     * When true: GPU treats chunk boundaries as solid walls (broken behavior).
+     * This setting exists only for debugging and should be removed in future versions.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing|Advanced",
+        meta = (EditCondition = "bUseGPUMesherForLOD0", DisplayName = "[BROKEN] Aggressive Culling (Creates Walls)"))
+    bool bGPUAggressiveCulling = false;
+
+    /**
+     * Enable asynchronous GPU mesh readback (reduces CPU stalls).
+     * WARNING: Slightly increases latency but massively improves throughput.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing",
+        meta = (EditCondition = "bUseGPUMesherForLOD0"))
+    bool bAsyncGPUReadback = true;
+
+    /**
+     * Fallback to CPU mesher if GPU fails (useful for debugging).
+     * Disable this in shipping builds for better error detection.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing",
+        meta = (EditCondition = "bUseGPUMesherForLOD0"))
+    bool bFallbackToCPUOnGPUFailure = true;
+
+    /**
+     * EXPERIMENTAL: Use binary greedy mesher on CPU (faster but less stable).
+     * Only used when GPU mesher is disabled or fails.
+     * DEFAULT: false (use stable greedy mesher).
+     */
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Rendering")
-    bool bUseGPUMesherForLOD1 = true;
+    // Default ON: project binary greedy mesher is faster here than the normal mesher.
+    bool bUseBinaryGreedyMesher = true;
 
-    // Conservative caps so spikes recover fast
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    int32 MaxGenHardCap = 8;
+    /**
+     * Use naive face culler (no greedy meshing optimization).
+     * This generates one quad per visible face - useful for debugging mesh generation issues.
+     * WARNING: Produces MUCH higher vertex/triangle counts. Only use for debugging.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Rendering")
+    bool bUseNaiveMesher = false;
 
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    int32 MaxMeshHardCap = 8;
+    // ===================================================================
+    // PROFILING & DIAGNOSTICS (NEW)
+    // ===================================================================
 
-    // Target frame time window and allocation
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    float TargetFrameMs = 16.0f;
+    /**
+     * Log detailed GPU meshing performance stats to console.
+     * Shows: GPU time, readback time, vertex count, etc.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Profiling")
+    bool bLogGPUMeshingStats = false;
 
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    float BackoffFrameMs = 18.0f;
+    /**
+     * Log warnings when GPU mesh generation takes longer than this (ms).
+     * Set to 0 to disable. Useful for detecting performance bottlenecks.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Profiling",
+        meta = (ClampMin = "0.0", ClampMax = "100.0"))
+    float GPUMeshWarningThresholdMS = 5.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    float BudgetForGen = 0.25f;   // 25% of frame for gen
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance")
-    float BudgetForMesh = 0.25f;  // 25% of frame for mesh
+    /**
+     * Dump first N GPU mesh outputs to log for debugging.
+     * Shows packed vertex data. Set to 0 to disable.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Profiling",
+        meta = (ClampMin = "0", ClampMax = "10"))
+    int32 DebugDumpFirstNMeshes = 0;
 
-    UPROPERTY(EditAnywhere, Category = "Voxel|Streaming")
-    float FreezeSpeedThreshold = 1200.0f; // UU/s
+    // ===================================================================
+    // MEMORY OPTIMIZATION (NEW)
+    // ===================================================================
 
-    UPROPERTY(EditAnywhere, Category = "Voxel|Streaming")
-    int32 FreezeOuterLodRings = 1; // freeze last N rings
+    /**
+     * Maximum GPU vertex buffer size (vertices). Prevents OOM on huge chunks.
+     * GPU allocates this much per chunk. Reduce if you have GPU memory issues.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Memory")
+    int32 MaxGPUVertexBufferSize = 1048576; // 1M verts = ~4MB
+
+    /**
+     * Aggressively free mesh buffers after upload to GPU.
+     * Reduces RAM but prevents collision-only reapply optimization.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Memory")
+    bool bAggressivelyFreeMeshBuffers = false;
+
+    /**
+     * Pool size for GPU readback resources (reduces allocation overhead).
+     * Higher = more memory but less stutter. 0 = no pooling.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Memory",
+        meta = (ClampMin = "0", ClampMax = "64"))
+    int32 GPUReadbackPoolSize = 8;
+
+    // near other UPROPERTY
+    UPROPERTY(EditAnywhere, Config, Category = "Voxel|Materials")
+    TSoftObjectPtr<class UVoxelMaterialSet> MaterialSet;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Voxel|Materials")
+    TSoftObjectPtr<class UVoxelBlockTable> BlockTable;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Voxel|Generation")
+    TSoftObjectPtr<class UVoxelBiomeTable> BiomeTable;
+    UPROPERTY(EditAnywhere, Config, Category = "Voxel|Materials")
+    TSoftObjectPtr<class UMaterialInterface> VoxelArrayMaterial;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Voxel|Generation")
+    TSoftObjectPtr<class UVoxelNoiseProfile> NoiseProfile;
+
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Debug")
+    bool bVisualizeNoiseFields = false;
+
+    /** Which field to debug: 0=Temp, 1=Moist, 2=Height, 3=Biome, 4=TempMoist2D */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Debug")
+    int32 NoiseDebugMode = 0;
+
+    /** If true, remeshes all chunks every tick for live preview (dev only) */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Debug")
+    bool bLiveNoisePreview = false;
+
+    // Validation functions
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+    virtual void PostLoad() override;
+    void ValidateSettings();
 };
