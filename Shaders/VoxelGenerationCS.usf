@@ -227,9 +227,13 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
     uint Category = 0;
 
-    // DEBUG: Simple flat terrain at BaseHeight to verify coordinates
-    // Uncomment this block and comment out the full generation below for testing
-    /*
+    // ========================================================================
+    // DEBUG MODE: Simple flat terrain to test data pipeline
+    // Change this to 0 to enable full terrain generation
+    // ========================================================================
+    #if 1
+
+    // Simple flat terrain at BaseHeight (no noise, no caves)
     if (WZ <= BaseHeight)
     {
         Category = 2; // Solid
@@ -242,9 +246,13 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     {
         Category = 0; // Air
     }
-    */
 
-    // FULL GENERATION (production code):
+    #else
+
+    // ========================================================================
+    // FULL GENERATION (production code)
+    // ========================================================================
+
     // Compute macro surface height
     float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
 
@@ -297,6 +305,8 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
             Category = (Z <= (float)WaterLevel) ? 1 : 0;
         }
     }
+
+    #endif // End debug mode / full generation
 
     // Pack category into output buffer (2 bits per voxel)
     uint LinearIndex = ThreadId.x + ThreadId.y * SizeX + ThreadId.z * SizeX * SizeY;

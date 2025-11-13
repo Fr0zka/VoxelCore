@@ -338,6 +338,14 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     const uint32 NumGroupsY = FMath::DivideAndRoundUp((uint32)SizeY, ThreadGroupSizeY);
     const uint32 NumGroupsZ = FMath::DivideAndRoundUp((uint32)SizeZ, ThreadGroupSizeZ);
 
+    // Log GPU generation parameters (can be disabled for performance)
+    UE_LOG(LogTemp, Warning, TEXT("GPU Gen: Coord(%d,%d,%d) Size(%d,%d,%d) LOD=%d BaseW(%d,%d,%d) Groups(%d,%d,%d)"),
+        Coord.Cx, Coord.Cy, Coord.Cz,
+        SizeX, SizeY, SizeZ,
+        LODScaleXY,
+        PassParameters->BaseWX, PassParameters->BaseWY, PassParameters->BaseWZ,
+        NumGroupsX, NumGroupsY, NumGroupsZ);
+
     // Dispatch compute shader
     FComputeShaderUtils::AddPass(
         GraphBuilder,
