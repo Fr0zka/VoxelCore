@@ -110,16 +110,12 @@ void UVoxelChunkComponent::DoGeneration()
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
-        // Get biome parameters (simplified - using default biome for now)
+        // Get biome parameters (simplified - using first biome or default)
         FBiomeTerrainParams BiomeParams;
-        if (Params.BiomeTable.IsValid())
+        if (Params.BiomeTable.IsValid() && Params.BiomeTable->Biomes.Num() > 0)
         {
-            // Sample climate at chunk center to determine biome
-            const int32 CenterWX = Coord.Cx * Params.ChunkSizeX + Params.ChunkSizeX / 2;
-            const int32 CenterWY = Coord.Cy * Params.ChunkSizeY + Params.ChunkSizeY / 2;
-
-            // Use default biome params (could be improved to sample actual biome)
-            const UVoxelBiomeDef* Biome = Params.BiomeTable->DefaultBiome;
+            // Use first biome as default (could be improved to sample actual biome)
+            const UVoxelBiomeDef* Biome = Params.BiomeTable->Biomes[0].Get();
             if (Biome)
             {
                 BiomeParams = Biome->TerrainParams;
@@ -129,7 +125,7 @@ void UVoxelChunkComponent::DoGeneration()
         // Launch GPU generation
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
-            Params.ChunkSizeX + 2, Params.ChunkSizeY + 2, Params.ChunkSizeZ + 2, // +2 for halo
+            Params.SizeX + 2, Params.SizeY + 2, Params.SizeZ + 2, // +2 for halo
             ScaleXY,
             Params.Seed,
             Params.BaseHeight,
@@ -140,9 +136,9 @@ void UVoxelChunkComponent::DoGeneration()
             {
                 // GPU generation complete - copy to CategoryData
                 CategoryData.Data = MoveTemp(GPUCategoryData);
-                CategoryData.SizeX = Params.ChunkSizeX + 2;
-                CategoryData.SizeY = Params.ChunkSizeY + 2;
-                CategoryData.SizeZ = Params.ChunkSizeZ + 2;
+                CategoryData.SizeX = Params.SizeX + 2;
+                CategoryData.SizeY = Params.SizeY + 2;
+                CategoryData.SizeZ = Params.SizeZ + 2;
 
                 // Generate biome grid (still on CPU for now)
                 UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);

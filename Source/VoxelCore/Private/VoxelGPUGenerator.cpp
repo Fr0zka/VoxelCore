@@ -111,7 +111,8 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelGenerationCS, "/Plugin/VoxelCore/VoxelGenerationCS
 bool FVoxelGPUGenerator::IsGPUGenerationAvailable()
 {
     // Check if compute shaders are supported on this platform
-    return GSupportsComputeShaders && FApp::CanEverRender();
+    // GMaxRHIFeatureLevel must be at least SM5 (ERHIFeatureLevel::SM5) for compute shaders
+    return FApp::CanEverRender() && (GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5);
 }
 
 void FVoxelGPUGenerator::GenerateChunkGPU(
