@@ -9,124 +9,239 @@
 class UVoxelChunkComponent;
 class UVoxelMacroTileComponent;
 class UProceduralMeshComponent;
+class URealtimeMeshComponent;
 struct FMeshBuffers;
 
-class URealtimeMeshComponent;
-
+/**
+ * AVoxelWorld: Main orchestrator for voxel terrain streaming.
+ *
+ * **Responsibilities:**
+ * - Chunk lifecycle management (spawn, LOD selection, teardown)
+ * - Progressive loading with per-frame spawn budgets
+ * - Task scheduling with concurrency limits and priority queues
+ * - Mesh apply queue with collision prioritization
+ * - Mesh component pooling for performance
+ *
+ * **LOD System:**
+ * - LOD0: Full resolution chunks (16×16×64 default)
+ * - LOD1: Coarsened XY chunks (same vertical resolution)
+ * - LOD2: Macro-tiles (heightfield impostors)
+ *
+ * **Chunk States:**
+ * - Pending: Loading in background (generation/meshing in progress)
+ * - Active: Visible and rendered
+ * - Transition: Pending → Active via PromoteReadyPendings()
+ *
+ * **Threading Model:**
+ * - GameThread: Tick(), apply queue, chunk management
+ * - TaskGraph: Generation and meshing tasks (concurrency-limited)
+ * - RenderThread: GPU mesh readbacks
+ */
 UCLASS()
 class VOXELCORE_API AVoxelWorld : public AActor
 {
-    GENERATED_BODY()
+	GENERATED_BODY()
 
 public:
-    AVoxelWorld();
+	AVoxelWorld();
 
 protected:
-    virtual void BeginPlay() override;
-    virtual void Tick(float DeltaTime) override;
-    virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaTime) override;
+	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 
 public:
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel")
-    TSubclassOf<UVoxelSettings> Settings;
+	// ==================== CONFIGURATION ====================
 
-    // Max CreateMeshSection applies per tick (collision prioritized)
-    UPROPERTY(EditAnywhere, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "64"))
-    int32 MaxMeshAppliesPerTick = 4;
+	/** Voxel world settings (chunk size, LOD radii, generation params, etc.) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel")
+	TSubclassOf<UVoxelSettings> Settings;
 
-    // Called by chunks on first Ready (not for seam-only remesh)
-    void OnChunkReady(const FVoxelCoord& Coord);
+	/** Max mesh apply operations per tick (collision prioritized over visual-only) */
+	UPROPERTY(EditAnywhere, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "64"))
+	int32 MaxMeshAppliesPerTick = 4;
 
-    // Lookup active LOD0/LOD1 chunk at coord
-    UVoxelChunkComponent* GetChunk(const FVoxelCoord& Coord) const;
+	// ==================== PUBLIC API ====================
 
-    // Worker thread: enqueue a fresh mesh apply (world owns buffers during apply)
-    void EnqueueMeshApply(UVoxelChunkComponent* Chunk, FMeshBuffers&& Buffers, bool bCreateCollision, bool bWasSeamRemesh, int32 Sequence);
+	/**
+	 * Called by chunks when they first become Ready (not for seam-only remesh).
+	 * Marks all 6 neighboring chunks as dirty for seamless edge remeshing.
+	 */
+	void OnChunkReady(const FVoxelCoord& Coord);
 
-    // GT: enqueue collision-only reapply using cached buffers
-    void EnqueueReapplyUsingCache(UVoxelChunkComponent* Chunk, bool bCreateCollision);
+	/** Lookup active LOD0/LOD1 chunk at given coordinate (nullptr if not active). */
+	UVoxelChunkComponent* GetChunk(const FVoxelCoord& Coord) const;
 
-    void MarkChunkForSeamRemesh(const FVoxelCoord& C);
+	/**
+	 * Worker thread: enqueue fresh mesh apply (world owns buffers during apply).
+	 * @param Chunk Target chunk component
+	 * @param Buffers Mesh data (moved, owned by world until applied)
+	 * @param bCreateCollision Whether to build collision mesh
+	 * @param bWasSeamRemesh True if this is a seam-only remesh (not initial generation)
+	 * @param Sequence Apply sequence number (for out-of-order GPU result handling)
+	 */
+	void EnqueueMeshApply(UVoxelChunkComponent* Chunk, FMeshBuffers&& Buffers, bool bCreateCollision, bool bWasSeamRemesh, int32 Sequence);
 
-    // === Schedulers (concurrency-limited with priority queues) ===
-    void ScheduleGeneration(UVoxelChunkComponent* Chunk);
-    void OnGenerationFinished(UVoxelChunkComponent* Chunk);
+	/**
+	 * GameThread: enqueue collision-only reapply using chunk's cached buffers.
+	 * Used when collision policy changes without regenerating mesh.
+	 */
+	void EnqueueReapplyUsingCache(UVoxelChunkComponent* Chunk, bool bCreateCollision);
 
-    void ScheduleMeshing(UVoxelChunkComponent* Chunk, bool bSeamRemesh);
-    void OnMeshingFinished(UVoxelChunkComponent* Chunk);
+	/** Mark chunk for deferred seam remesh (processed during DrainApplyQueue). */
+	void MarkChunkForSeamRemesh(const FVoxelCoord& Coord);
 
-    // === Mesh component pool ===
-    UProceduralMeshComponent* AcquirePMC();
-    void ReleasePMC(UProceduralMeshComponent* PMC);
+	// ==================== TASK SCHEDULING (CONCURRENCY-LIMITED) ====================
 
-    URealtimeMeshComponent* AcquireRMC();
-    void ReleaseRMC(URealtimeMeshComponent* RMC);
-    FORCEINLINE bool IsShuttingDown() const { return bShuttingDown.Load(); }
+	/**
+	 * Schedule chunk generation with concurrency limit and distance-based priority.
+	 * Runs immediately if slots available, otherwise queues by distance.
+	 */
+	void ScheduleGeneration(UVoxelChunkComponent* Chunk);
 
+	/** Called when generation finishes - launches next queued task if available. */
+	void OnGenerationFinished(UVoxelChunkComponent* Chunk);
 
-private:
-    // Active visible LOD0/LOD1 chunks
-    TMap<FVoxelCoord, UVoxelChunkComponent*> ActiveChunks;
+	/**
+	 * Schedule chunk meshing with concurrency limit and distance-based priority.
+	 * @param bSeamRemesh True if this is a seam-only remesh (reuses generation data)
+	 */
+	void ScheduleMeshing(UVoxelChunkComponent* Chunk, bool bSeamRemesh);
 
-    // Pending chunks for gated LOD swap (LOD0/1)
-    TMap<FVoxelCoord, UVoxelChunkComponent*> PendingChunks;
+	/** Called when meshing finishes - launches next queued task if available. */
+	void OnMeshingFinished(UVoxelChunkComponent* Chunk);
 
-    // LOD2 macro-tiles (keyed by tile coords)
-    TMap<FIntPoint, UVoxelMacroTileComponent*> ActiveMacro;
-    TMap<FIntPoint, UVoxelMacroTileComponent*> PendingMacro;
+	// ==================== MESH COMPONENT POOLING ====================
 
-    // Last player center
-    bool bHasLastCenter = false;
-    FVoxelCoord LastCenterChunk;
+	/** Acquire a ProceduralMeshComponent from pool (creates new if pool empty). */
+	UProceduralMeshComponent* AcquirePMC();
 
-    // Apply queue (GT)
-    struct FPendingApply
-    {
-        TWeakObjectPtr<UVoxelChunkComponent> Chunk;
-        TUniquePtr<FMeshBuffers> OwnedBuffers; // present for fresh meshes/remeshes
-        bool bUseChunkCache = false;           // true for collision-only reapply
-        bool bCollision = false;
-        bool bWasSeamRemesh = false;
-        int32 Sequence = 0;
-    };
+	/** Return ProceduralMeshComponent to pool (clears data, hides). */
+	void ReleasePMC(UProceduralMeshComponent* PMC);
 
-    FCriticalSection ApplyQueueMutex;
-    TArray<FPendingApply> ApplyQueue;
-    TQueue< FVoxelCoord>PendingSeamRemesh;
+	/** Acquire a RealtimeMeshComponent from pool (creates new if pool empty). */
+	URealtimeMeshComponent* AcquireRMC();
 
-    // Scheduling state with priority queues (distance^2 -> chunks)
-    int32 ActiveGenTasks = 0;
-    int32 ActiveMeshTasks = 0;
-    TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>> GenWaitByDistance;
-    TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>> MeshWaitByDistance;
+	/** Return RealtimeMeshComponent to pool (clears data, hides). */
+	void ReleaseRMC(URealtimeMeshComponent* RMC);
 
-    FCriticalSection GenMutex;
-    FCriticalSection MeshMutex;
-
-    // Mesh component pool
-    TArray<UProceduralMeshComponent*> PMCPool;
-    TArray<URealtimeMeshComponent*> RMCPool;
-
+	/** Check if world is shutting down (used by chunks to cancel async operations). */
+	FORCEINLINE bool IsShuttingDown() const { return bShuttingDown.Load(); }
 
 private:
-    void DrainApplyQueue();      // up to MaxMeshAppliesPerTick (collision first)
-    void PromoteReadyPendings(); // gated LOD swap for chunks
+	// ==================== CHUNK STORAGE ====================
 
-    void UpdateChunks();         // create/teardown (chunks + macro-tiles)
-    FVoxelCoord WorldToChunkCoord(const FVector& Location) const;
+	/** Active visible LOD0/LOD1 chunks (promoted from Pending when Ready). */
+	TMap<FVoxelCoord, UVoxelChunkComponent*> ActiveChunks;
 
-    EVoxelLODLevel PickLOD(int32 Dist2, const UVoxelSettings* S) const;
+	/** Pending chunks awaiting promotion (generation/meshing in progress). */
+	TMap<FVoxelCoord, UVoxelChunkComponent*> PendingChunks;
 
-    // Helper: pop lowest-distance item from priority queue
-    static TWeakObjectPtr<UVoxelChunkComponent> PopClosest(TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>>& QueueByDistance);
+	/** Active LOD2 macro-tiles (keyed by tile coordinates). */
+	TMap<FIntPoint, UVoxelMacroTileComponent*> ActiveMacro;
 
-    // Helpers
-    static int32 FloorDiv(int32 A, int32 B) { const int32 q = A / B; const int32 r = A % B; return q - ((r != 0) && ((r < 0) != (B < 0))); }
-    bool bNeedsMoreSpawning = false;
-    int32 ChunksSpawnedThisFrame = 0;
-    bool bInitialLoadComplete = false;
-    TAtomic<bool> bShuttingDown{ false };
-    int32 NoisePreviewFrameCounter = 0;
+	/** Pending macro-tiles awaiting promotion. */
+	TMap<FIntPoint, UVoxelMacroTileComponent*> PendingMacro;
 
+	// ==================== PLAYER TRACKING ====================
 
+	bool bHasLastCenter = false;
+	FVoxelCoord LastCenterChunk;
+
+	// ==================== APPLY QUEUE (GAMETHREAD) ====================
+
+	/**
+	 * Pending mesh apply operation.
+	 * Contains either owned buffers (fresh mesh) or uses chunk's cached buffers.
+	 */
+	struct FPendingApply
+	{
+		TWeakObjectPtr<UVoxelChunkComponent> Chunk;
+		TUniquePtr<FMeshBuffers> OwnedBuffers; ///< Present for fresh meshes/remeshes
+		bool bUseChunkCache = false;           ///< True for collision-only reapply
+		bool bCollision = false;
+		bool bWasSeamRemesh = false;
+		int32 Sequence = 0;
+	};
+
+	FCriticalSection ApplyQueueMutex;
+	TArray<FPendingApply> ApplyQueue;
+	TQueue<FVoxelCoord> PendingSeamRemesh;
+
+	// ==================== TASK SCHEDULING STATE ====================
+
+	/** Current number of active generation tasks. */
+	int32 ActiveGenTasks = 0;
+
+	/** Current number of active meshing tasks. */
+	int32 ActiveMeshTasks = 0;
+
+	/** Generation wait queue (buckets by squared distance for priority). */
+	TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>> GenWaitByDistance;
+
+	/** Meshing wait queue (buckets by squared distance for priority). */
+	TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>> MeshWaitByDistance;
+
+	FCriticalSection GenMutex;
+	FCriticalSection MeshMutex;
+
+	// ==================== MESH COMPONENT POOL ====================
+
+	TArray<UProceduralMeshComponent*> PMCPool;
+	TArray<URealtimeMeshComponent*> RMCPool;
+
+private:
+	// ==================== INTERNAL HELPERS ====================
+
+	/**
+	 * Drain apply queue up to MaxMeshAppliesPerTick (collision first).
+	 * Processes pending seam remesh requests.
+	 */
+	void DrainApplyQueue();
+
+	/** Promote chunks from Pending to Active when they reach Ready state. */
+	void PromoteReadyPendings();
+
+	/**
+	 * Main chunk management loop - creates/tears down chunks and macro-tiles.
+	 * Implements progressive loading with per-frame spawn budget.
+	 */
+	void UpdateChunks();
+
+	/** Convert world position to chunk coordinate. */
+	FVoxelCoord WorldToChunkCoord(const FVector& Location) const;
+
+	/** Select LOD level based on squared distance from player. */
+	EVoxelLODLevel PickLOD(int32 Dist2, const UVoxelSettings* S) const;
+
+	/**
+	 * Pop closest chunk from priority queue (pops lowest-distance bucket).
+	 * Skips invalid/stale entries automatically.
+	 */
+	static TWeakObjectPtr<UVoxelChunkComponent> PopClosest(TMap<int32, TArray<TWeakObjectPtr<UVoxelChunkComponent>>>& QueueByDistance);
+
+	/** Floor division for tile coordinate computation (handles negative correctly). */
+	static int32 FloorDiv(int32 A, int32 B)
+	{
+		const int32 q = A / B;
+		const int32 r = A % B;
+		return q - ((r != 0) && ((r < 0) != (B < 0)));
+	}
+
+	// ==================== PROGRESSIVE LOADING STATE ====================
+
+	/** True if more chunks need spawning (hit budget this frame). */
+	bool bNeedsMoreSpawning = false;
+
+	/** Number of chunks spawned this frame (limited by budget). */
+	int32 ChunksSpawnedThisFrame = 0;
+
+	/** True once all initial chunks have been spawned. */
+	bool bInitialLoadComplete = false;
+
+	/** True during EndPlay (used by chunks to cancel async ops). */
+	TAtomic<bool> bShuttingDown{ false };
+
+	/** Frame counter for live noise preview (reloads chunks periodically). */
+	int32 NoisePreviewFrameCounter = 0;
 };
