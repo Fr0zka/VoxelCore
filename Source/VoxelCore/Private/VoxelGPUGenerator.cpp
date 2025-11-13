@@ -254,6 +254,9 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     FRDGBufferUAVRef OutputUAV = GraphBuilder.CreateUAV(OutputBuffer, PF_R32_UINT);
 
+    // CRITICAL: Clear output buffer to zero (prevents garbage data)
+    AddClearUAVPass(GraphBuilder, OutputUAV, 0u);
+
     // Get shader from global shader map
     TShaderMapRef<FVoxelGenerationCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
@@ -265,10 +268,15 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->SizeY = SizeY;
     PassParameters->SizeZ = SizeZ;
 
-    // World position
-    PassParameters->BaseWX = Coord.Cx * SizeX;
-    PassParameters->BaseWY = Coord.Cy * SizeY;
-    PassParameters->BaseWZ = Coord.Cz * SizeZ;
+    // World position (account for -1 halo offset)
+    // SizeX/Y/Z includes the halo (+2), so actual chunk size is (SizeX-2)
+    const int32 ActualChunkSizeX = SizeX - 2;
+    const int32 ActualChunkSizeY = SizeY - 2;
+    const int32 ActualChunkSizeZ = SizeZ - 2;
+
+    PassParameters->BaseWX = (Coord.Cx * ActualChunkSizeX) - 1; // -1 for halo
+    PassParameters->BaseWY = (Coord.Cy * ActualChunkSizeY) - 1; // -1 for halo
+    PassParameters->BaseWZ = (Coord.Cz * ActualChunkSizeZ) - 1; // -1 for halo
 
     // LOD scale
     PassParameters->LODScaleXY = LODScaleXY;

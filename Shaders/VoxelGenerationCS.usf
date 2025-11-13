@@ -283,10 +283,17 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint ByteIndex = LinearIndex / 4;
     uint BitOffset = (LinearIndex % 4) * 2;
 
-    // Atomic operation to set the 2-bit category
-    uint Mask = 3u << BitOffset;
+    // Use atomic CompareExchange to safely set 2-bit category
+    // This is needed because 4 voxels share the same uint32
     uint Value = Category << BitOffset;
+    uint Mask = 3u << BitOffset;
 
-    InterlockedAnd(OutCategories[ByteIndex], ~Mask);
-    InterlockedOr(OutCategories[ByteIndex], Value);
+    // Atomic read-modify-write loop (safe for concurrent access)
+    uint OldValue = 0;
+    uint NewValue = 0;
+    do
+    {
+        OldValue = OutCategories[ByteIndex];
+        NewValue = (OldValue & ~Mask) | Value;
+    } while (OldValue != InterlockedCompareExchange(OutCategories[ByteIndex], OldValue, NewValue));
 }
