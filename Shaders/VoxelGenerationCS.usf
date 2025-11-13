@@ -289,11 +289,24 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint Mask = 3u << BitOffset;
 
     // Atomic read-modify-write loop (safe for concurrent access)
-    uint OldValue = 0;
-    uint NewValue = 0;
+    // HLSL InterlockedCompareExchange signature:
+    // void InterlockedCompareExchange(dest, compare_value, value, out original_value)
+    uint OldValue;
+    uint NewValue;
+    uint OriginalValue;
+
+    InterlockedOr(OutCategories[ByteIndex], 0, OldValue); // Read current value atomically
+
     do
     {
-        OldValue = OutCategories[ByteIndex];
         NewValue = (OldValue & ~Mask) | Value;
-    } while (OldValue != InterlockedCompareExchange(OutCategories[ByteIndex], OldValue, NewValue));
+        InterlockedCompareExchange(OutCategories[ByteIndex], OldValue, NewValue, OriginalValue);
+
+        // If OriginalValue == OldValue, the exchange succeeded
+        // Otherwise, retry with the new value we just read
+        if (OriginalValue == OldValue)
+            break;
+
+        OldValue = OriginalValue;
+    } while (true);
 }
