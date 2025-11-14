@@ -231,7 +231,7 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // DEBUG MODE: Checkerboard pattern to verify shader compilation
     // Change this to 0 to enable full terrain generation
     // ========================================================================
-    #if 1
+    #if 0
 
     // CHECKERBOARD PATTERN: Alternating solid/air every other voxel
     // This creates an obvious visual pattern that's impossible to miss
