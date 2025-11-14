@@ -9,6 +9,51 @@
 // SHADER PARAMETERS
 // ============================================================================
 
+// ============================================================================
+// BIOME DATA STRUCTURE (must match CPU FBiomeTerrainParams layout)
+// ============================================================================
+struct BiomeData
+{
+    // Climate ranges for biome selection
+    float TempMin;
+    float TempMax;
+    float MoistMin;
+    float MoistMax;
+
+    // Height parameters
+    float HeightAmplitude;
+    float HeightFrequency;
+    int HeightOctaves;
+    float HeightLacunarity;
+    float HeightGain;
+
+    // Mountain parameters
+    float MountainAmplitude;
+    float MountainFrequency;
+    float MountainThreshold;
+    float MountainSharpness;
+
+    // 3D features
+    float OverhangAmplitude;
+    float OverhangFrequency;
+    float WarpAmplitude;
+    float WarpFrequency;
+    float IslandAmplitude;
+    float IslandFrequency;
+    float IslandThreshold;
+    float IslandBandCenterZ;
+    float IslandBandHalfThickness;
+
+    // Cave parameters
+    float CaveDensity;
+    float CaveFrequency2D;
+    int CaveOctaves2D;
+    float CaveLacunarity2D;
+    float CaveGain2D;
+    float CaveFrequency3D;
+    int CaveOctaves3D;
+};
+
 // Chunk dimensions
 uint SizeX;
 uint SizeY;
@@ -28,37 +73,9 @@ int BaseHeight;
 int WaterLevel;
 int MaxCaveDepth;
 
-// Biome terrain parameters
-float HeightAmplitude;
-float HeightFrequency;
-int HeightOctaves;
-float HeightLacunarity;
-float HeightGain;
-
-float MountainAmplitude;
-float MountainFrequency;
-float MountainThreshold;
-float MountainSharpness;
-
-float OverhangAmplitude;
-float OverhangFrequency;
-
-float WarpAmplitude;
-float WarpFrequency;
-
-float IslandAmplitude;
-float IslandFrequency;
-float IslandThreshold;
-float IslandBandCenterZ;
-float IslandBandHalfThickness;
-
-float CaveDensity;
-float CaveFrequency2D;
-int CaveOctaves2D;
-float CaveLacunarity2D;
-float CaveGain2D;
-float CaveFrequency3D;
-int CaveOctaves3D;
+// Biome array (structured buffer for dynamic number of biomes)
+StructuredBuffer<BiomeData> Biomes;
+uint BiomeCount;
 
 // Output buffer - voxel categories (2 bits per voxel packed into bytes)
 RWStructuredBuffer<uint> OutCategories;
@@ -100,26 +117,91 @@ void SampleClimate(float WX, float WY, out float outTemp, out float outMoist)
     outMoist = clamp(PerlinNoise2D(WX * fM, WY * fM) * 0.5 + 0.5, 0.0, 1.0);
 }
 
-// Compute macro surface height using biome parameters
-// TODO: Implement per-column biome picking like CPU does
-// Currently uses single biome for entire chunk (passed from chunk center)
+// Pick biome based on temperature and moisture
+// Matches CPU implementation in VoxelBiome.h:218-245 (BiomeTable::Pick)
+int PickBiome(float Temp, float Moist)
+{
+    int bestBiome = 0;
+    float bestDistance = 1000000.0;
+
+    // First pass: Look for exact match (inside biome ranges)
+    for (uint i = 0; i < BiomeCount; ++i)
+    {
+        BiomeData biome = Biomes[i];
+        bool inside = (Temp >= biome.TempMin && Temp <= biome.TempMax) &&
+                      (Moist >= biome.MoistMin && Moist <= biome.MoistMax);
+        if (inside)
+            return (int)i;
+    }
+
+    // Second pass: Find nearest biome by distance (fallback)
+    for (uint i = 0; i < BiomeCount; ++i)
+    {
+        BiomeData biome = Biomes[i];
+
+        // Clamp to biome's climate range
+        float clampedT = clamp(Temp, biome.TempMin, biome.TempMax);
+        float clampedM = clamp(Moist, biome.MoistMin, biome.MoistMax);
+
+        // Calculate squared distance
+        float dT = Temp - clampedT;
+        float dM = Moist - clampedM;
+        float dist2 = dT * dT + dM * dM;
+
+        if (dist2 < bestDistance)
+        {
+            bestDistance = dist2;
+            bestBiome = (int)i;
+        }
+    }
+
+    return bestBiome;
+}
+
+// Compute macro surface height using PER-COLUMN biome selection
+// Matches CPU implementation in VoxelGenerator.cpp:173-182
 float MacroSurfaceZ_Biome(float x, float y)
 {
-    // Base terrain height
-    float n01 = Sample01_2D_Custom(x * HeightFrequency, y * HeightFrequency, HeightOctaves);
-    float H2D = BaseHeight + (n01 - 0.5) * 2.0 * HeightAmplitude;
+    // Sample climate and pick biome for this XY column
+    float Temp, Moist;
+    SampleClimate(x, y, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
 
-    // Mountains
-    if (MountainAmplitude > 0.0)
+    // Get biome-specific parameters
+    BiomeData biome = Biomes[biomeIdx];
+
+    // Base terrain height using biome-specific parameters
+    float n01 = 0.5;
+    if (biome.HeightOctaves > 0)
+    {
+        float sum = 0.0;
+        float maxAmp = 0.0;
+        float amp = 1.0;
+        float freq = 1.0;
+
+        for (int i = 0; i < biome.HeightOctaves; ++i)
+        {
+            sum += PerlinNoise2D(x * biome.HeightFrequency * freq, y * biome.HeightFrequency * freq) * amp;
+            maxAmp += amp;
+            freq *= biome.HeightLacunarity;
+            amp *= biome.HeightGain;
+        }
+        n01 = (sum / maxAmp) * 0.5 + 0.5;
+    }
+
+    float H2D = BaseHeight + (n01 - 0.5) * 2.0 * biome.HeightAmplitude;
+
+    // Mountains using biome-specific parameters
+    if (biome.MountainAmplitude > 0.0)
     {
         float r = Ridged2D(
-            x * MountainFrequency + WorldSeed * 0.13,
-            y * MountainFrequency + WorldSeed * 0.19
+            x * biome.MountainFrequency + WorldSeed * 0.13,
+            y * biome.MountainFrequency + WorldSeed * 0.19
         );
 
-        float band = max(0.0, r - MountainThreshold);
-        float shaped = pow(band, MountainSharpness);
-        float M = MountainAmplitude * shaped;
+        float band = max(0.0, r - biome.MountainThreshold);
+        float shaped = pow(band, biome.MountainSharpness);
+        float M = biome.MountainAmplitude * shaped;
 
         H2D += M;
     }
@@ -127,10 +209,18 @@ float MacroSurfaceZ_Biome(float x, float y)
     return H2D;
 }
 
-// Check if a voxel is carved by caves
+// Check if a voxel is carved by caves (using per-column biome parameters)
 bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
 {
-    if (CaveDensity <= 0.0)
+    // Sample climate and pick biome for this XY column (same as MacroSurfaceZ_Biome)
+    float Temp, Moist;
+    SampleClimate(x, y, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
+
+    // Get biome-specific cave parameters
+    BiomeData biome = Biomes[biomeIdx];
+
+    if (biome.CaveDensity <= 0.0)
         return false;
 
     float depth = terrainH - zWorld;
@@ -140,75 +230,83 @@ bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
     // Surface modifier
     float surf = clamp(1.0 - depth / 24.0, 0.0, 1.0);
 
-    // 2D cave mask
-    float sx = x * CaveFrequency2D;
-    float sy = y * CaveFrequency2D;
+    // 2D cave mask using biome-specific parameters
+    float sx = x * biome.CaveFrequency2D;
+    float sy = y * biome.CaveFrequency2D;
     float sum = 0.0;
     float maxAmp = 0.0;
     float amp = 1.0;
     float freq = 1.0;
 
-    for (int i = 0; i < CaveOctaves2D; ++i)
+    for (int i = 0; i < biome.CaveOctaves2D; ++i)
     {
         sum += PerlinNoise2D(sx * freq, sy * freq) * amp;
         maxAmp += amp;
-        freq *= CaveLacunarity2D;
-        amp *= CaveGain2D;
+        freq *= biome.CaveLacunarity2D;
+        amp *= biome.CaveGain2D;
     }
 
     float t2d = (sum / maxAmp) * 0.5 + 0.5;
     float th2d = 0.68 - 0.10 * surf;
 
-    bool mask = (t2d > th2d / CaveDensity);
+    bool mask = (t2d > th2d / biome.CaveDensity);
     if (!mask)
         return false;
 
-    // 3D cave tube
-    float sx3d = x * CaveFrequency3D;
-    float sy3d = y * CaveFrequency3D;
-    float sz3d = zWorld * CaveFrequency3D;
+    // 3D cave tube using biome-specific parameters
+    float sx3d = x * biome.CaveFrequency3D;
+    float sy3d = y * biome.CaveFrequency3D;
+    float sz3d = zWorld * biome.CaveFrequency3D;
     float sum3d = 0.0;
     float maxAmp3d = 0.0;
     float amp3d = 1.0;
     float freq3d = 1.0;
 
-    for (int j = 0; j < CaveOctaves3D; ++j)
+    for (int j = 0; j < biome.CaveOctaves3D; ++j)
     {
         sum3d += PerlinNoise3D(sx3d * freq3d, sy3d * freq3d, sz3d * freq3d) * amp3d;
         maxAmp3d += amp3d;
-        freq3d *= CaveLacunarity2D;
-        amp3d *= CaveGain2D;
+        freq3d *= biome.CaveLacunarity2D;
+        amp3d *= biome.CaveGain2D;
     }
 
     float n3d = abs(sum3d / maxAmp3d);
     float k = clamp(depth / 96.0, 0.0, 1.0);
     float baseRad = lerp(0.12, 0.20, k);
-    float rad = baseRad * sqrt(CaveDensity); // CRITICAL: Apply density scaling to match CPU
+    float rad = baseRad * sqrt(biome.CaveDensity); // CRITICAL: Apply density scaling to match CPU
 
     return (n3d < rad);
 }
 
-// Compute 3D density at a world position
+// Compute 3D density at a world position (using per-column biome parameters)
 float Density3D_FromMacro_Biome(float x, float y, float zWorld, float macroHeight)
 {
-    // Domain warp
-    float3 pw = DomainWarp3D(x, y, zWorld, WarpAmplitude, WarpFrequency, WorldSeed);
+    // Sample climate and pick biome for this XY column
+    float Temp, Moist;
+    SampleClimate(x, y, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
 
-    // Overhangs
-    float Overhang = OverhangAmplitude * PerlinNoise3D(
-        pw.x * OverhangFrequency,
-        pw.y * OverhangFrequency,
-        pw.z * OverhangFrequency
+    // Get biome-specific 3D feature parameters
+    BiomeData biome = Biomes[biomeIdx];
+
+    // Domain warp
+    float3 pw = DomainWarp3D(x, y, zWorld, biome.WarpAmplitude, biome.WarpFrequency, WorldSeed);
+
+    // Overhangs using biome-specific parameters
+    float Overhang = biome.OverhangAmplitude * PerlinNoise3D(
+        pw.x * biome.OverhangFrequency,
+        pw.y * biome.OverhangFrequency,
+        pw.z * biome.OverhangFrequency
     );
 
-    // Floating islands (band restricts altitude range where islands appear)
-    float iband = 1.0 - clamp(abs(zWorld - IslandBandCenterZ) / max(1.0, IslandBandHalfThickness), 0.0, 1.0);
+    // Floating islands using biome-specific parameters (band restricts altitude range)
+    float iband = 1.0 - clamp(abs(zWorld - biome.IslandBandCenterZ) / max(1.0, biome.IslandBandHalfThickness), 0.0, 1.0);
     float islandField = 1.0 - abs(PerlinNoise3D(
-        pw.x * IslandFrequency + 11.3,
-        pw.y * IslandFrequency + 27.1,
-        pw.z * IslandFrequency - 5.7
+        pw.x * biome.IslandFrequency + 11.3,
+        pw.y * biome.IslandFrequency + 27.1,
+        pw.z * biome.IslandFrequency - 5.7
     ));
-    float Islands = iband * ((islandField - IslandThreshold) * IslandAmplitude);
+    float Islands = iband * ((islandField - biome.IslandThreshold) * biome.IslandAmplitude);
 
     // Combine
     float D = macroHeight - zWorld;
@@ -299,8 +397,14 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // Compute macro surface height
     float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
 
-    // Compute margin for narrow band optimization
-    float Margin = OverhangAmplitude + IslandAmplitude + 3.0;
+    // Sample climate and pick biome for narrow band optimization
+    float Temp, Moist;
+    SampleClimate((float)WX, (float)WY, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
+    BiomeData biome = Biomes[biomeIdx];
+
+    // Compute margin for narrow band optimization using biome-specific parameters
+    float Margin = biome.OverhangAmplitude + biome.IslandAmplitude + 3.0;
     float D0 = M - Z;
 
     // Far above surface - air or water
@@ -314,9 +418,9 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M);
         if (D > 0.0)
         {
-            // OPTIMIZATION: Skip cave checks if too deep
+            // OPTIMIZATION: Skip cave checks if too deep (using biome-specific cave density)
             float DepthFromSurface = M - Z;
-            bool bCheckCaves = (CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
+            bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
 
             if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z, M))
                 Category = 0; // Cave
@@ -334,9 +438,9 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z, M);
         if (D > 0.0)
         {
-            // OPTIMIZATION: Narrow band cave checks
+            // OPTIMIZATION: Narrow band cave checks (using biome-specific cave density)
             float DepthFromSurface = M - Z;
-            bool bCheckCaves = (CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
+            bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
 
             if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z, M))
                 Category = 0; // Cave

@@ -52,7 +52,7 @@ public:
         int32 BaseHeight,
         int32 WaterLevel,
         int32 MaxCaveDepth,
-        const FBiomeTerrainParams& BiomeParams,
+        const class UVoxelBiomeTable* BiomeTable,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 
     /**
@@ -94,7 +94,7 @@ private:
         int32 BaseHeight,
         int32 WaterLevel,
         int32 MaxCaveDepth,
-        const FBiomeTerrainParams& BiomeParams,
+        const TArray<struct FGPUBiomeData>& BiomeDataArray,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 };
 

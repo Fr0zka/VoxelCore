@@ -111,42 +111,13 @@ void UVoxelChunkComponent::DoGeneration()
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
-        // Sample biome at chunk center (matches CPU's per-column biome sampling approach)
-        FBiomeTerrainParams BiomeParams;
-        if (Params.BiomeTable.IsValid() && Params.BiomeTable->Biomes.Num() > 0 && Params.NoiseProfile)
-        {
-            // Calculate chunk center world position
-            const int32 ChunkCenterWX = Coord.Cx * Params.SizeX + Params.SizeX / 2;
-            const int32 ChunkCenterWY = Coord.Cy * Params.SizeY + Params.SizeY / 2;
-
-            // Sample climate at chunk center using noise profile
-            FVoxelNoiseContext NoiseCtx(Params.Seed, Params.NoiseProfile);
-            float Temperature, Moisture;
-            NoiseCtx.SampleClimate((float)ChunkCenterWX, (float)ChunkCenterWY, Temperature, Moisture);
-
-            // Pick biome based on climate
-            const UVoxelBiomeDef* Biome = Params.BiomeTable->Pick(Temperature, Moisture);
-            if (Biome)
-            {
-                BiomeParams = Biome->TerrainParams;
-                UE_LOG(LogTemp, Log, TEXT("GPU Gen Chunk(%d,%d,%d): Sampled biome '%s' at center (%d,%d) - Temp=%.2f Moist=%.2f"),
-                    Coord.Cx, Coord.Cy, Coord.Cz, *Biome->BiomeName.ToString(),
-                    ChunkCenterWX, ChunkCenterWY, Temperature, Moisture);
-            }
-        }
-        else
-        {
-            // Fallback to default parameters if no biome table available
-            BiomeParams = FBiomeTerrainParams();
-        }
-
         // Calculate LOD-scaled grid size (CRITICAL: must match CPU path!)
         // For LOD1+, the grid is reduced: fewer voxels cover the same world space
         const int32 ScaledSizeX = (Params.SizeX + ScaleXY - 1) / ScaleXY;
         const int32 ScaledSizeY = (Params.SizeY + ScaleXY - 1) / ScaleXY;
         const int32 ScaledSizeZ = Params.SizeZ;
 
-        // Launch GPU generation (use weak pointer to safely handle component destruction)
+        // Launch GPU generation with entire BiomeTable for per-column selection
         TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
@@ -157,7 +128,7 @@ void UVoxelChunkComponent::DoGeneration()
             Params.BaseHeight,
             Params.WaterLevel,
             Params.MaxCaveDepth,
-            BiomeParams,
+            Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
             [WeakThis, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
             {
                 // Check if component is still valid (might be destroyed during async generation)
