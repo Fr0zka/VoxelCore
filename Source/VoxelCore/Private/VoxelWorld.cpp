@@ -938,6 +938,7 @@ void AVoxelWorld::UpdateChunks()
 			{
 				C->CancelPendingTask();
 				C->UnloadChunk();
+				C->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
 			}
 			ActiveMacro.Remove(T);
 		}
@@ -947,6 +948,7 @@ void AVoxelWorld::UpdateChunks()
 			{
 				C->CancelPendingTask();
 				C->UnloadChunk();
+				C->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
 			}
 			PendingMacro.Remove(T);
 		}
@@ -978,6 +980,7 @@ void AVoxelWorld::UpdateChunks()
 		{
 			Chunk->CancelPendingTask();
 			Chunk->UnloadChunk();
+			Chunk->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
 		}
 		ActiveChunks.Remove(C);
 	}
@@ -987,6 +990,7 @@ void AVoxelWorld::UpdateChunks()
 		{
 			Chunk->CancelPendingTask();
 			Chunk->UnloadChunk();
+			Chunk->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
 		}
 		PendingChunks.Remove(C);
 	}

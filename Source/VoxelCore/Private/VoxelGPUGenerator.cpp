@@ -316,6 +316,8 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->IslandAmplitude = BiomeParams.IslandAmplitude;
     PassParameters->IslandFrequency = BiomeParams.IslandFrequency;
     PassParameters->IslandThreshold = BiomeParams.IslandThreshold;
+    PassParameters->IslandBandCenterZ = BiomeParams.IslandBandCenterZ;
+    PassParameters->IslandBandHalfThickness = BiomeParams.IslandBandHalfThickness;
 
     // Biome parameters - Caves
     PassParameters->CaveDensity = BiomeParams.CaveDensity;

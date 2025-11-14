@@ -49,6 +49,8 @@ float WarpFrequency;
 float IslandAmplitude;
 float IslandFrequency;
 float IslandThreshold;
+float IslandBandCenterZ;
+float IslandBandHalfThickness;
 
 float CaveDensity;
 float CaveFrequency2D;
@@ -165,7 +167,8 @@ bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
 
     float n3d = abs(sum3d / maxAmp3d);
     float k = clamp(depth / 96.0, 0.0, 1.0);
-    float rad = lerp(0.12, 0.20, k);
+    float baseRad = lerp(0.12, 0.20, k);
+    float rad = baseRad * sqrt(CaveDensity); // CRITICAL: Apply density scaling to match CPU
 
     return (n3d < rad);
 }
@@ -183,8 +186,8 @@ float Density3D_FromMacro_Biome(float x, float y, float zWorld, float macroHeigh
         pw.z * OverhangFrequency
     );
 
-    // Floating islands
-    float iband = 1.0 - clamp(abs(zWorld - 200.0) / max(1.0, 100.0), 0.0, 1.0);
+    // Floating islands (band restricts altitude range where islands appear)
+    float iband = 1.0 - clamp(abs(zWorld - IslandBandCenterZ) / max(1.0, IslandBandHalfThickness), 0.0, 1.0);
     float islandField = 1.0 - abs(PerlinNoise3D(
         pw.x * IslandFrequency + 11.3,
         pw.y * IslandFrequency + 27.1,

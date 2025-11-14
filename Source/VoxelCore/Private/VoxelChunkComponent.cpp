@@ -101,25 +101,10 @@ void UVoxelChunkComponent::DoGeneration()
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelGeneration);
 
-    // Safety check: If data already exists, skip regeneration (can happen when chunks reload)
-    const bool bHeight = (RenderMode == EVoxelRenderMode::Heightfield);
-    if (!bHeight && CategoryData.Data.Num() > 0)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) already has data, skipping regeneration"), ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
-        OnGenerationComplete();
-        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
-        return;
-    }
-    if (bHeight && HeightData.Num() > 0)
-    {
-        OnGenerationComplete();
-        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
-        return;
-    }
-
     const FChunkGenParams Params = UVoxelGenerator::MakeParamsFromSettings(Settings);
     const FVoxelCoord Coord = ChunkCoord;
     const int32 ScaleXY = LODScaleXY;
+    const bool bHeight = (RenderMode == EVoxelRenderMode::Heightfield);
     const bool bUseGPU = Settings->bUseGPUGeneration && !bHeight; // GPU path only for voxel chunks
 
     // GPU GENERATION PATH (10-50x faster)
