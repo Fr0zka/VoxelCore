@@ -75,6 +75,8 @@ public:
         SHADER_PARAMETER(float, IslandAmplitude)
         SHADER_PARAMETER(float, IslandFrequency)
         SHADER_PARAMETER(float, IslandThreshold)
+        SHADER_PARAMETER(float, IslandBandCenterZ)
+        SHADER_PARAMETER(float, IslandBandHalfThickness)
 
         // Biome terrain parameters - Caves
         SHADER_PARAMETER(float, CaveDensity)
