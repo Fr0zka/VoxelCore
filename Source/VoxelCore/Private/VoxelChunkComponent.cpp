@@ -537,12 +537,22 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                 const FChunkNeighbors* NeighborPtr = &NbhCopy;
                                 const FIntVector SizeVector(SizeX, SizeY, SizeZ);
 
+                                // PROFILING: Measure async meshing time
+                                const double StartTime = FPlatformTime::Seconds();
+
                                 if (bUseNaive)
                                     UVoxelMesher::BuildNaiveMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
                                 else if (bUseBinary)
                                     UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
                                 else
                                     UVoxelMesher::BuildGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+
+                                const double EndTime = FPlatformTime::Seconds();
+                                const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
+
+                                UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
+                                    MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
+                                    bUseBinary ? TEXT("Binary") : TEXT("Standard"));
                             }
 
                             World->OnMeshingFinished(Chunk);
@@ -563,12 +573,24 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 {
                     const UVoxelBlockTable* BT = (SettingsPtr && SettingsPtr->BlockTable.Get()) ? SettingsPtr->BlockTable.Get() : nullptr;
 
+                    // PROFILING: Measure meshing time
+                    const double StartTime = FPlatformTime::Seconds();
+
                     if (SettingsPtr && SettingsPtr->bUseNaiveMesher)
                         UVoxelMesher::BuildNaiveMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
                     else if (SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher)
                         UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
                     else
                         UVoxelMesher::BuildGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
+
+                    const double EndTime = FPlatformTime::Seconds();
+                    const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
+                    const int32 VertCount = Buffers.Vertices.Num();
+                    const int32 TriCount = Buffers.Triangles.Num() / 3;
+
+                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
+                        MeshingMs, VertCount, TriCount, SizeVox.X, SizeVox.Y, SizeVox.Z, XYScale,
+                        SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher ? TEXT("Binary") : TEXT("Standard"));
                 }
             }
             else
@@ -588,6 +610,9 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
 void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCollision)
 {
+    // PROFILING: Measure mesh apply time
+    const double StartTime = FPlatformTime::Seconds();
+
     if (bUsingRMC)
     {
         // If buffers are accidentally in world space, subtract chunk origin to make them local
@@ -615,6 +640,14 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
     {
         UVoxelMesher::ApplyToPMC(PMC, Bufs, bCollision);
     }
+
+    const double EndTime = FPlatformTime::Seconds();
+    const float ApplyMs = (float)((EndTime - StartTime) * 1000.0);
+
+    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
+        ApplyMs, Bufs.Vertices.Num(), Bufs.Triangles.Num() / 3,
+        bCollision ? TEXT("Yes") : TEXT("No"),
+        bUsingRMC ? TEXT("RMC") : TEXT("PMC"));
 }
 
 void UVoxelChunkComponent::OnMeshApplied(TUniquePtr<FMeshBuffers>&& AppliedBuffers, bool bWasSeamRemesh)
