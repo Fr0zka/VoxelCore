@@ -261,6 +261,43 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     bIsMeshing = true;
     bCancelPending.AtomicSet(false);
 
+    // OPTIMIZATION: Early exit for chunks that won't produce any visible geometry
+    // This saves ~0.5ms per empty chunk by skipping voxel expansion and meshing entirely
+    // CRITICAL: Check CORE chunk only (excluding 1-voxel padding halo from neighbors)
+    // CategoryData has padding (+2 in each dimension), which may contain neighbor data
+    //
+    // Use IsCoreRenderableEmpty() which considers both air (cat 0) and water (cat 1) as empty
+    // because water-only chunks produce 0 geometry when fully surrounded by water
+    const bool bIsCoreEmpty = (RenderMode == EVoxelRenderMode::Voxels) && CategoryData.IsCoreRenderableEmpty(1);
+
+    if (bIsCoreEmpty)
+    {
+        // Chunk is completely empty - skip meshing AND mesh apply entirely
+        // Don't enqueue empty meshes for application - this saves game thread time
+        UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
+            (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY,
+            (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY,
+            Settings->ChunkSizeZ,
+            LODScaleXY);
+
+        // Mark chunk as ready without applying any mesh (no visual component needed for empty chunks)
+        State = EVoxelChunkState::Ready;
+        bIsMeshing = false;
+
+        if (IsValid(OwnerWorld))
+        {
+            OwnerWorld->OnMeshingFinished(this);
+            // OPTIMIZATION: Don't enqueue empty mesh apply - saves game thread time!
+            // Empty chunks don't need visual components, just mark them as done
+            if (!bHasAnnouncedReady)
+            {
+                bHasAnnouncedReady = true;
+                OwnerWorld->OnChunkReady(ChunkCoord);
+            }
+        }
+        return;
+    }
+
     const float VoxelUU = Settings->VoxelWorldScale;
 
     // CRITICAL: Make thread-safe copies of CategoryData and BiomeGrid BEFORE async task

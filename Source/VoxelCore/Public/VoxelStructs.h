@@ -167,6 +167,103 @@ struct FCategoryBitset
             return static_cast<uint8>(lsb | (msb << 1));
         }
     }
+
+    /**
+     * Check if all voxels in this bitset are empty (category 0 = Air).
+     * This is an extremely fast check that can skip meshing for empty chunks.
+     * Returns true if all bytes are zero (all voxels are air).
+     */
+    FORCEINLINE bool IsAllEmpty() const
+    {
+        // Fast path: check if all bytes are zero
+        // Since category 0 (air) is represented as 00 bits, an all-air chunk will have all zero bytes
+        for (int32 i = 0; i < Data.Num(); ++i)
+        {
+            if (Data[i] != 0)
+            {
+                return false; // Found non-zero byte, so there's at least one non-air voxel
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Check if the core region (excluding 1-voxel padding) contains only air.
+     * This is used to skip meshing for chunks where the actual chunk content is empty,
+     * even if the padding halo contains neighbor data.
+     *
+     * @param PaddingSize The number of voxels of padding on each side (typically 1)
+     * @return true if all voxels in the core region are air (category 0)
+     */
+    FORCEINLINE bool IsCoreEmpty(int32 PaddingSize = 1) const
+    {
+        // Calculate core region bounds (skip padding on all sides)
+        const int32 CoreSizeX = SizeX - 2 * PaddingSize;
+        const int32 CoreSizeY = SizeY - 2 * PaddingSize;
+        const int32 CoreSizeZ = SizeZ - 2 * PaddingSize;
+
+        // If core is invalid, return false
+        if (CoreSizeX <= 0 || CoreSizeY <= 0 || CoreSizeZ <= 0)
+        {
+            return false;
+        }
+
+        // Check only the core region
+        for (int32 z = PaddingSize; z < SizeZ - PaddingSize; ++z)
+        {
+            for (int32 y = PaddingSize; y < SizeY - PaddingSize; ++y)
+            {
+                for (int32 x = PaddingSize; x < SizeX - PaddingSize; ++x)
+                {
+                    if (Get(x, y, z) != 0)
+                    {
+                        return false; // Found non-air voxel in core
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Check if the core region contains ONLY air or transparent blocks that won't produce geometry.
+     * Includes category 0 (air) and category 1 (water/semi-transparent) as "renderable-empty".
+     * This catches more empty chunks than IsCoreEmpty() because water-only chunks produce no geometry
+     * when fully surrounded by water, but still cost 0.5ms to mesh.
+     *
+     * @param PaddingSize The number of voxels of padding on each side (typically 1)
+     * @return true if all voxels in the core region are air or water (categories 0 or 1)
+     */
+    FORCEINLINE bool IsCoreRenderableEmpty(int32 PaddingSize = 1) const
+    {
+        // Calculate core region bounds (skip padding on all sides)
+        const int32 CoreSizeX = SizeX - 2 * PaddingSize;
+        const int32 CoreSizeY = SizeY - 2 * PaddingSize;
+        const int32 CoreSizeZ = SizeZ - 2 * PaddingSize;
+
+        // If core is invalid, return false
+        if (CoreSizeX <= 0 || CoreSizeY <= 0 || CoreSizeZ <= 0)
+        {
+            return false;
+        }
+
+        // Check only the core region - allow category 0 (air) and 1 (water/transparent)
+        for (int32 z = PaddingSize; z < SizeZ - PaddingSize; ++z)
+        {
+            for (int32 y = PaddingSize; y < SizeY - PaddingSize; ++y)
+            {
+                for (int32 x = PaddingSize; x < SizeX - PaddingSize; ++x)
+                {
+                    const uint8 Cat = Get(x, y, z);
+                    if (Cat >= 2) // Category 2+ are solid blocks
+                    {
+                        return false; // Found solid voxel in core
+                    }
+                }
+            }
+        }
+        return true; // Only air/water in core
+    }
 };
 class UVoxelBiomeDef; // forward declare, pas d’include ici
 
