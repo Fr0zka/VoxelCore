@@ -634,6 +634,20 @@ static bool BuildPackedVerts_GPU_SinglePass(
 	uint32 FinalVertexCount = 0;
 	uint32 FinalIndexCount = 0;
 
+	// Flush commands but DON'T block the entire GPU
+	ENQUEUE_RENDER_COMMAND(VoxelGPU_SinglePass_Flush)(
+		[](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.SubmitCommandsAndFlushGPU();
+			// Removed BlockUntilGPUIdle() - was causing FPS to drop to 50!
+		});
+
+	// Poll for readback completion (yields to other threads)
+	while (!VertexCounterReadback->IsReady())
+	{
+		FPlatformProcess::Sleep(0.001f); // 1ms sleep, allows other work
+	}
+
 	ENQUEUE_RENDER_COMMAND(VoxelGPU_SinglePass_Readback)(
 		[VertCountRB = VertexCounterReadback.Get(),
 		 IdxCountRB = IndexCounterReadback.Get(),
@@ -643,8 +657,7 @@ static bool BuildPackedVerts_GPU_SinglePass(
 		 ActualMaxVerts, ActualMaxIndices, bUseIndexBuffer, Done]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			RHICmdList.SubmitCommandsAndFlushGPU();
-			RHICmdList.BlockUntilGPUIdle();
+			// Readback is ready, just read the data
 
 			// Read vertex count
 			const void* VertCountPtr = VertCountRB->Lock(sizeof(uint32));
@@ -865,13 +878,25 @@ static bool BuildPackedVerts_GPU_TwoPass(const FGPUMeshBuildParams& Params, TArr
 			GraphBuilder.Execute();
 		});
 
+	// Flush GPU commands
+	ENQUEUE_RENDER_COMMAND(VoxelGPU_TwoPass_CountFlush)(
+		[](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.SubmitCommandsAndFlushGPU();
+		});
+
+	// Poll for count readback (non-blocking wait)
+	while (!CountReadback->IsReady())
+	{
+		FPlatformProcess::Sleep(0.001f);
+	}
+
 	// Readback count results to CPU
 	ENQUEUE_RENDER_COMMAND(VoxelGPU_TwoPass_CountReadback)(
 		[CountRB = CountReadback.Get(), CountsPtr = CountsCPU.GetData(), VolCount, CountDone]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			RHICmdList.SubmitCommandsAndFlushGPU();
-			RHICmdList.BlockUntilGPUIdle();
+			// Readback is ready
 			const void* Ptr = CountRB->Lock(static_cast<int64>(VolCount) * sizeof(uint32));
 			if (Ptr)
 			{
@@ -1027,13 +1052,25 @@ static bool BuildPackedVerts_GPU_TwoPass(const FGPUMeshBuildParams& Params, TArr
 			GraphBuilder.Execute();
 		});
 
+	// Flush GPU commands
+	ENQUEUE_RENDER_COMMAND(VoxelGPU_TwoPass_EmitFlush)(
+		[](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.SubmitCommandsAndFlushGPU();
+		});
+
+	// Poll for vertex readback (non-blocking wait)
+	while (!VertsReadback->IsReady())
+	{
+		FPlatformProcess::Sleep(0.001f);
+	}
+
 	// Readback vertex results to CPU
 	ENQUEUE_RENDER_COMMAND(VoxelGPU_TwoPass_EmitReadback)(
 		[VertsRB = VertsReadback.Get(), PackedPtr = PackedCPU.GetData(), TotalElems, EmitDone]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			RHICmdList.SubmitCommandsAndFlushGPU();
-			RHICmdList.BlockUntilGPUIdle();
+			// Readback is ready
 			const void* Ptr = VertsRB->Lock(static_cast<int64>(TotalElems) * sizeof(uint32));
 			if (Ptr)
 			{
