@@ -292,19 +292,18 @@ static void CopyNeighborArrays(const FGPUMeshBuildParams& Params, FGPUNeighborAr
 // ============================================================================
 
 /**
- * Async job stages (two-pass GPU meshing).
+ * Async job stages (single-pass GPU meshing).
  */
 enum class EVoxelGPUAsyncStage : uint8
 {
-	WaitingForCounts,   // Pass 1: count readback in progress
-	WaitingForVertices  // Pass 2: vertex emission readback in progress
+	WaitingForSinglePass  // Single-pass: waiting for readback of counters + vertices
 };
 
 /**
  * Async GPU meshing job.
  *
- * Tracks the state of an async two-pass GPU meshing operation:
- * 1. Count pass → CPU prefix scan → Emit pass
+ * Tracks the state of an async single-pass GPU meshing operation:
+ * 1. Single-pass shader with atomic allocation
  * 2. Readbacks poll until ready, then invoke completion callback
  */
 struct FVoxelGPUAsyncJob : public TSharedFromThis<FVoxelGPUAsyncJob, ESPMode::ThreadSafe>
@@ -314,13 +313,11 @@ struct FVoxelGPUAsyncJob : public TSharedFromThis<FVoxelGPUAsyncJob, ESPMode::Th
 	TSharedPtr<FGPUNeighborArrays, ESPMode::ThreadSafe> Neighbors;
 
 	// GPU readback handles
-	TUniquePtr<FRHIGPUBufferReadback> CountReadback;
+	TUniquePtr<FRHIGPUBufferReadback> VertexCounterReadback;
 	TUniquePtr<FRHIGPUBufferReadback> VertsReadback;
 
-	// Intermediate CPU data
-	TArray<uint32> CountsCPU;       // Per-voxel vertex counts (from count pass)
-	TArray<uint32> OffsetsCPU;      // Prefix scan offsets for emit pass
-	TArray<uint32> PackedResult;    // Final packed vertices
+	// Final packed vertices
+	TArray<uint32> PackedResult;
 
 	// Job metadata
 	int32 SizeX = 0;
@@ -329,7 +326,7 @@ struct FVoxelGPUAsyncJob : public TSharedFromThis<FVoxelGPUAsyncJob, ESPMode::Th
 	int32 XYScale = 1;
 	uint8 DefaultAO = 3;
 	int32 VolCount = 0;             // Total voxels (SizeX × SizeY × SizeZ)
-	int32 TotalElements = 0;        // Total vertices to emit
+	int32 TotalElements = 0;        // Total vertices emitted (from counter)
 
 	// Settings
 	int32 MaxOutputVerts = INT32_MAX;
@@ -339,7 +336,7 @@ struct FVoxelGPUAsyncJob : public TSharedFromThis<FVoxelGPUAsyncJob, ESPMode::Th
 	TFunction<void(bool, TArray<uint32>&&)> Completion;
 
 	// State
-	EVoxelGPUAsyncStage Stage = EVoxelGPUAsyncStage::WaitingForCounts;
+	EVoxelGPUAsyncStage Stage = EVoxelGPUAsyncStage::WaitingForSinglePass;
 	bool bSuccess = true;
 };
 
@@ -1206,6 +1203,15 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 
 	const int32 VolCount = Params.SizeX * Params.SizeY * Params.SizeZ;
 
+	// Estimate maximum output size (worst case: all voxels emit 6 faces)
+	const int32 MaxFaces = VolCount * 6;
+	const int32 MaxOutputVerts = MaxFaces * 6;  // 6 vertices per face (2 triangles)
+
+	// Apply capacity limit
+	const int32 ActualMaxVerts = (Params.MaxOutputVerts > 0)
+		? FMath::Min(MaxOutputVerts, Params.MaxOutputVerts)
+		: MaxOutputVerts;
+
 	// Create async job
 	TSharedPtr<FVoxelGPUAsyncJob, ESPMode::ThreadSafe> Job = MakeShared<FVoxelGPUAsyncJob, ESPMode::ThreadSafe>();
 	Job->SizeX = Params.SizeX;
@@ -1217,8 +1223,6 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 	Job->MaxOutputVerts = Params.MaxOutputVerts;
 	Job->bAggressiveCulling = Params.bAggressiveCulling;
 	Job->Completion = MoveTemp(Completion);
-	Job->CountsCPU.SetNumUninitialized(VolCount);
-	Job->OffsetsCPU.SetNumUninitialized(VolCount);
 
 	// Copy voxel data to shared ptr (avoid dangling pointers)
 	Job->Voxels = MakeShared<TArray<uint32>, ESPMode::ThreadSafe>();
@@ -1232,26 +1236,26 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 	Job->Neighbors = MakeShared<FGPUNeighborArrays, ESPMode::ThreadSafe>();
 	CopyNeighborArrays(Params, *Job->Neighbors);
 
-	// Allocate count readback
-	Job->CountReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelGPU_CountsAsync"));
+	// Allocate readbacks for single-pass
+	Job->VertexCounterReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelGPU_VertexCounterAsync"));
+	Job->VertsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelGPU_VertsAsync"));
 
-	// Enqueue count pass on render thread
+	// Enqueue single-pass shader on render thread
 	TSharedPtr<FVoxelGPUAsyncJob, ESPMode::ThreadSafe> JobPtr = Job;
 	TSharedPtr<TArray<uint32>, ESPMode::ThreadSafe> VoxelsShared = Job->Voxels;
 	TSharedPtr<FGPUNeighborArrays, ESPMode::ThreadSafe> NeighborsShared = Job->Neighbors;
-	FRHIGPUBufferReadback* CountReadbackPtr = Job->CountReadback.Get();
+	FRHIGPUBufferReadback* VertCountRBPtr = Job->VertexCounterReadback.Get();
+	FRHIGPUBufferReadback* VertsRBPtr = Job->VertsReadback.Get();
 	const uint32 SizeX = static_cast<uint32>(Job->SizeX);
 	const uint32 SizeY = static_cast<uint32>(Job->SizeY);
 	const uint32 SizeZ = static_cast<uint32>(Job->SizeZ);
 	const uint32 XYScale = static_cast<uint32>(Params.XYScale);
 	const uint32 DefaultAO = static_cast<uint32>(Params.DefaultAO);
 
-	ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncCount)(
-		[JobPtr, VoxelsShared, NeighborsShared, CountReadbackPtr, SizeX, SizeY, SizeZ, XYScale, DefaultAO]
+	ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncSinglePass)(
+		[JobPtr, VoxelsShared, NeighborsShared, VertCountRBPtr, VertsRBPtr, SizeX, SizeY, SizeZ, XYScale, DefaultAO, ActualMaxVerts]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			const uint32 VolCountRT = SizeX * SizeY * SizeZ;
-
 			FRDGBuilder GraphBuilder(RHICmdList);
 
 			// Input voxel buffer
@@ -1259,54 +1263,50 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 				sizeof(uint32), VoxelsShared->Num(), VoxelsShared->GetData(), VoxelsShared->Num() * sizeof(uint32), ERDGInitialDataFlags::None);
 			FRDGBufferSRVRef VoxSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(VoxBuf));
 
-			// Helper to create neighbor SRV (empty buffer if no data)
-			auto CreateNeighborSRV = [&](const TCHAR* Name, const TArray<uint32>& Data) -> FRDGBufferSRVRef
-				{
-					if (Data.Num() == 0)
-					{
-						FRDGBufferRef EmptyBuf = CreateStructuredBuffer(GraphBuilder, Name, sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
-						FRDGBufferUAVRef EmptyUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(EmptyBuf));
-						AddClearUAVPass(GraphBuilder, EmptyUAV, 0u);
-						return GraphBuilder.CreateSRV(FRDGBufferSRVDesc(EmptyBuf));
-					}
-					FRDGBufferRef Buf = CreateStructuredBuffer(GraphBuilder, Name, sizeof(uint32), Data.Num(),
-						Data.GetData(), Data.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-					return GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Buf));
-				};
+			// Output vertex buffer (pre-allocated to max size)
+			FRDGBufferRef OutVertsBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.OutVerts"),
+				sizeof(uint32), ActualMaxVerts, nullptr, 0, ERDGInitialDataFlags::None);
+			FRDGBufferUAVRef OutVertsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutVertsBuf));
+			AddClearUAVPass(GraphBuilder, OutVertsUAV, 0u);
 
-			FRDGBufferSRVRef NeighborXNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborXN"), NeighborsShared->XN);
-			FRDGBufferSRVRef NeighborXPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborXP"), NeighborsShared->XP);
-			FRDGBufferSRVRef NeighborYNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborYN"), NeighborsShared->YN);
-			FRDGBufferSRVRef NeighborYPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborYP"), NeighborsShared->YP);
-			FRDGBufferSRVRef NeighborZNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborZN"), NeighborsShared->ZN);
-			FRDGBufferSRVRef NeighborZPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborZP"), NeighborsShared->ZP);
-
-			// Output count buffer
-			FRDGBufferRef CountsBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.Counts"),
-				sizeof(uint32), VolCountRT, nullptr, 0, ERDGInitialDataFlags::None);
-			FRDGBufferUAVRef CountsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CountsBuf, PF_R32_UINT));
-			AddClearUAVPass(GraphBuilder, CountsUAV, 0u);
-
-			// Dummy outputs for count pass
-			FRDGBufferRef DummyOutBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.AsyncDummyOut"),
+			// Global vertex counter (atomic allocation)
+			FRDGBufferRef VertexCounterBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.VertexCounter"),
 				sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
-			FRDGBufferUAVRef DummyOutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DummyOutBuf));
-			AddClearUAVPass(GraphBuilder, DummyOutUAV, 0u);
+			FRDGBufferUAVRef VertexCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(VertexCounterBuf, PF_R32_UINT));
+			AddClearUAVPass(GraphBuilder, VertexCounterUAV, 0u);
 
-			FRDGBufferRef DummyOffsetsBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.AsyncDummyOffsets"),
+			// Dummy index buffer (not used in async mode)
+			FRDGBufferRef DummyIndicesBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.DummyIndices"),
 				sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
-			FRDGBufferSRVRef DummyOffsetsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(DummyOffsetsBuf));
+			FRDGBufferUAVRef DummyIndicesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DummyIndicesBuf));
+			AddClearUAVPass(GraphBuilder, DummyIndicesUAV, 0u);
+
+			FRDGBufferRef DummyIndexCounterBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.DummyIndexCounter"),
+				sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
+			FRDGBufferUAVRef DummyIndexCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DummyIndexCounterBuf, PF_R32_UINT));
+			AddClearUAVPass(GraphBuilder, DummyIndexCounterUAV, 0u);
+
+			// Neighbor buffers
+			FRDGBufferSRVRef NeighborXNSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborXN"), NeighborsShared->XN, NeighborsShared->XN.Num() > 0);
+			FRDGBufferSRVRef NeighborXPSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborXP"), NeighborsShared->XP, NeighborsShared->XP.Num() > 0);
+			FRDGBufferSRVRef NeighborYNSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborYN"), NeighborsShared->YN, NeighborsShared->YN.Num() > 0);
+			FRDGBufferSRVRef NeighborYPSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborYP"), NeighborsShared->YP, NeighborsShared->YP.Num() > 0);
+			FRDGBufferSRVRef NeighborZNSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborZN"), NeighborsShared->ZN, NeighborsShared->ZN.Num() > 0);
+			FRDGBufferSRVRef NeighborZPSRV = CreateNeighborBufferSRV(GraphBuilder, TEXT("VoxelGPU.NeighborZP"), NeighborsShared->ZP, NeighborsShared->ZP.Num() > 0);
 
 			// Shader parameters
-			TShaderMapRef<FGPUCountElementsCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FGPUCountElementsCS::FParameters* ShaderParams = GraphBuilder.AllocParameters<FGPUCountElementsCS::FParameters>();
+			TShaderMapRef<FGPUSinglePassMeshCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FGPUSinglePassMeshCS::FParameters* ShaderParams = GraphBuilder.AllocParameters<FGPUSinglePassMeshCS::FParameters>();
 			ShaderParams->SizeX = SizeX;
 			ShaderParams->SizeY = SizeY;
 			ShaderParams->SizeZ = SizeZ;
 			ShaderParams->XYScale = XYScale;
 			ShaderParams->DefaultAO = DefaultAO;
 			ShaderParams->InVoxels = VoxSRV;
-			ShaderParams->OutCount = CountsUAV;
+			ShaderParams->OutVerts = OutVertsUAV;
+			ShaderParams->OutIndices = DummyIndicesUAV;
+			ShaderParams->GlobalVertexCounter = VertexCounterUAV;
+			ShaderParams->GlobalIndexCounter = DummyIndexCounterUAV;
 			ShaderParams->NeighborXN = NeighborXNSRV;
 			ShaderParams->NeighborXP = NeighborXPSRV;
 			ShaderParams->NeighborYN = NeighborYNSRV;
@@ -1319,28 +1319,27 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 			ShaderParams->bHasNeighborYP = NeighborsShared->YP.Num() > 0 ? 1u : 0u;
 			ShaderParams->bHasNeighborZN = NeighborsShared->ZN.Num() > 0 ? 1u : 0u;
 			ShaderParams->bHasNeighborZP = NeighborsShared->ZP.Num() > 0 ? 1u : 0u;
-			ShaderParams->OutVerts = DummyOutUAV;
-			ShaderParams->MaxVerts = 0u;
+			ShaderParams->MaxVerts = static_cast<uint32>(ActualMaxVerts);
+			ShaderParams->MaxIndices = 0u;  // Not using index buffer in async mode
+			ShaderParams->bUseIndexBuffer = 0u;
 			ShaderParams->DisableGreedyMerge = 0u;
+			ShaderParams->DirectionMask = 0x3Fu;  // All 6 directions
 
 			static auto* CVarIgnNbh = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.IgnoreNeighbors"));
 			const bool bIgnoreNeighbors = JobPtr->bAggressiveCulling || (CVarIgnNbh && CVarIgnNbh->GetInt() != 0);
 			ShaderParams->IgnoreNeighbors = bIgnoreNeighbors ? 1u : 0u;
 
-			ShaderParams->NeighborLayoutX = 0u;
-			ShaderParams->NeighborLayoutY = 0u;
-			ShaderParams->NeighborLayoutZ = 0u;
-			ShaderParams->DirectionMask = 0u;
-			ShaderParams->Offsets = DummyOffsetsSRV;
-
-			// Dispatch count shader
+			// Dispatch single-pass shader
 			const FIntVector Groups(
 				FMath::DivideAndRoundUp(static_cast<int32>(SizeX), 8),
 				FMath::DivideAndRoundUp(static_cast<int32>(SizeY), 8),
 				FMath::DivideAndRoundUp(static_cast<int32>(SizeZ), 8));
 
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU Count Async"), CS, ShaderParams, Groups);
-			AddEnqueueCopyPass(GraphBuilder, CountReadbackPtr, CountsBuf, 0);
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU SinglePass Async"), CS, ShaderParams, Groups);
+
+			// Readback counters and vertices
+			AddEnqueueCopyPass(GraphBuilder, VertCountRBPtr, VertexCounterBuf, 0);
+			AddEnqueueCopyPass(GraphBuilder, VertsRBPtr, OutVertsBuf, 0);
 			GraphBuilder.Execute();
 		});
 
@@ -1370,203 +1369,78 @@ void FVoxelGPUMesher::PumpAsyncReadbacks()
 				continue;
 			}
 
-			// ========== STAGE 1: WAITING FOR COUNT READBACK ==========
-			if (Job->Stage == EVoxelGPUAsyncStage::WaitingForCounts)
+			// ========== SINGLE-PASS: WAITING FOR READBACK ==========
+			if (Job->Stage == EVoxelGPUAsyncStage::WaitingForSinglePass)
 			{
-				if (!Job->CountReadback || !Job->CountReadback->IsReady())
+				// Check if both readbacks are ready
+				if (!Job->VertexCounterReadback || !Job->VertsReadback)
+				{
+					continue;  // Not ready yet
+				}
+				if (!Job->VertexCounterReadback->IsReady() || !Job->VertsReadback->IsReady())
 				{
 					continue;  // Not ready yet
 				}
 
-				// Readback count results to CPU
-				FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
-				ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncCountReadback)(
-					[Job, ReadbackDone](FRHICommandListImmediate& RHICmdList)
+				// Readback counter to get actual vertex count
+				uint32 ActualVertexCount = 0;
+				FEvent* CounterDone = FPlatformProcess::GetSynchEventFromPool(false);
+				ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncCounterReadback)(
+					[Job, &ActualVertexCount, CounterDone](FRHICommandListImmediate& RHICmdList)
 					{
-						if (Job->CountReadback && Job->VolCount > 0 && Job->CountsCPU.Num() == Job->VolCount)
+						if (Job->VertexCounterReadback)
 						{
-							const void* Ptr = Job->CountReadback->Lock(static_cast<int64>(Job->VolCount) * sizeof(uint32));
+							const void* Ptr = Job->VertexCounterReadback->Lock(sizeof(uint32));
 							if (Ptr)
 							{
-								FMemory::Memcpy(Job->CountsCPU.GetData(), Ptr, static_cast<int64>(Job->VolCount) * sizeof(uint32));
+								FMemory::Memcpy(&ActualVertexCount, Ptr, sizeof(uint32));
 							}
-							Job->CountReadback->Unlock();
+							Job->VertexCounterReadback->Unlock();
 						}
-						ReadbackDone->Trigger();
+						CounterDone->Trigger();
 					});
 
-				ReadbackDone->Wait();
-				FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
-				Job->CountReadback.Reset();
+				CounterDone->Wait();
+				FPlatformProcess::ReturnSynchEventToPool(CounterDone);
+				Job->VertexCounterReadback.Reset();
 
-				// CPU prefix scan
-				uint64 Total = 0;
-				for (int32 i = 0; i < Job->VolCount; ++i)
-				{
-					Job->OffsetsCPU[i] = static_cast<uint32>(Total);
-					Total += Job->CountsCPU[i];
-				}
-				Job->CountsCPU.Reset();  // No longer needed
-
-				const uint64 MaxAllowed = (Job->MaxOutputVerts > 0)
-					? FMath::Min<uint64>(static_cast<uint64>(Job->MaxOutputVerts), static_cast<uint64>(INT32_MAX))
-					: static_cast<uint64>(INT32_MAX);
+				// Validate vertex count
+				const uint32 MaxAllowed = (Job->MaxOutputVerts > 0)
+					? static_cast<uint32>(FMath::Min(Job->MaxOutputVerts, INT32_MAX))
+					: static_cast<uint32>(INT32_MAX);
 
 				// Empty chunk - complete successfully
-				if (Total == 0)
+				if (ActualVertexCount == 0)
 				{
 					Job->TotalElements = 0;
 					Job->PackedResult.Reset();
 					Job->bSuccess = true;
+					Job->VertsReadback.Reset();
 					GVoxelGPUAsyncJobs.RemoveAtSwap(Index);
 					CompletedJobs.Add(Job);
+					UE_LOG(LogTemp, Log, TEXT("[VoxelGPU SinglePass Async] Empty chunk, 0 vertices"));
 					continue;
 				}
 
 				// Overflow - fail and fallback to CPU
-				if (Total > MaxAllowed)
+				if (ActualVertexCount > MaxAllowed)
 				{
-					UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU] Async mesher exceeded vertex cap (%llu >= %llu); falling back to CPU."),
-						Total, MaxAllowed);
+					UE_LOG(LogTemp, Warning, TEXT("[VoxelGPU SinglePass Async] Exceeded vertex cap (%u > %u); falling back to CPU."),
+						ActualVertexCount, MaxAllowed);
 					Job->PackedResult.Reset();
 					Job->bSuccess = false;
+					Job->VertsReadback.Reset();
 					GVoxelGPUAsyncJobs.RemoveAtSwap(Index);
 					CompletedJobs.Add(Job);
 					continue;
 				}
 
-				// Overflow beyond uint32 range
-				if (Total > MAX_uint32)
-				{
-					Job->PackedResult.Reset();
-					Job->bSuccess = false;
-					GVoxelGPUAsyncJobs.RemoveAtSwap(Index);
-					CompletedJobs.Add(Job);
-					continue;
-				}
+				Job->TotalElements = static_cast<int32>(ActualVertexCount);
 
-				Job->TotalElements = static_cast<int32>(Total);
-
-				// Allocate vertex readback and enqueue emit pass
-				Job->VertsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelGPU_VertsAsync"));
-				Job->Stage = EVoxelGPUAsyncStage::WaitingForVertices;
-
-				TSharedPtr<FVoxelGPUAsyncJob, ESPMode::ThreadSafe> JobPtr = Job;
-				ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncEmit)(
-					[JobPtr](FRHICommandListImmediate& RHICmdList)
-					{
-						FRDGBuilder GraphBuilder(RHICmdList);
-
-						// Input voxel buffer
-						FRDGBufferRef VoxBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.InVoxels"),
-							sizeof(uint32), JobPtr->Voxels->Num(), JobPtr->Voxels->GetData(),
-							JobPtr->Voxels->Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-						FRDGBufferSRVRef VoxSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(VoxBuf));
-
-						// Helper to create neighbor SRV
-						auto CreateNeighborSRV = [&](const TCHAR* Name, const TArray<uint32>& Data) -> FRDGBufferSRVRef
-							{
-								if (Data.Num() == 0)
-								{
-									FRDGBufferRef EmptyBuf = CreateStructuredBuffer(GraphBuilder, Name, sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
-									FRDGBufferUAVRef EmptyUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(EmptyBuf));
-									AddClearUAVPass(GraphBuilder, EmptyUAV, 0u);
-									return GraphBuilder.CreateSRV(FRDGBufferSRVDesc(EmptyBuf));
-								}
-								FRDGBufferRef Buf = CreateStructuredBuffer(GraphBuilder, Name, sizeof(uint32), Data.Num(),
-									Data.GetData(), Data.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-								return GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Buf));
-							};
-
-						FRDGBufferSRVRef NeighborXNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborXN"), JobPtr->Neighbors->XN);
-						FRDGBufferSRVRef NeighborXPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborXP"), JobPtr->Neighbors->XP);
-						FRDGBufferSRVRef NeighborYNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborYN"), JobPtr->Neighbors->YN);
-						FRDGBufferSRVRef NeighborYPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborYP"), JobPtr->Neighbors->YP);
-						FRDGBufferSRVRef NeighborZNSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborZN"), JobPtr->Neighbors->ZN);
-						FRDGBufferSRVRef NeighborZPSRV = CreateNeighborSRV(TEXT("VoxelGPU.NeighborZP"), JobPtr->Neighbors->ZP);
-
-						// Offset buffer (from CPU prefix scan)
-						FRDGBufferRef OffsBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.Offsets"),
-							sizeof(uint32), JobPtr->OffsetsCPU.Num(), JobPtr->OffsetsCPU.GetData(),
-							JobPtr->OffsetsCPU.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-						FRDGBufferSRVRef OffsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OffsBuf));
-
-						// Output vertex buffer
-						FRDGBufferRef OutBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.OutVerts"),
-							sizeof(uint32), JobPtr->TotalElements, nullptr, 0, ERDGInitialDataFlags::None);
-						FRDGBufferUAVRef OutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutBuf));
-						AddClearUAVPass(GraphBuilder, OutUAV, 0u);
-
-						// Dummy count buffer
-						FRDGBufferRef DummyCountBuf = CreateStructuredBuffer(GraphBuilder, TEXT("VoxelGPU.AsyncDummyCount"),
-							sizeof(uint32), 1, nullptr, 0, ERDGInitialDataFlags::None);
-						FRDGBufferUAVRef DummyCountUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DummyCountBuf, PF_R32_UINT));
-						AddClearUAVPass(GraphBuilder, DummyCountUAV, 0u);
-
-						// Shader parameters
-						TShaderMapRef<FGPUEmitElementsCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FGPUEmitElementsCS::FParameters* ShaderParams = GraphBuilder.AllocParameters<FGPUEmitElementsCS::FParameters>();
-						ShaderParams->SizeX = static_cast<uint32>(JobPtr->SizeX);
-						ShaderParams->SizeY = static_cast<uint32>(JobPtr->SizeY);
-						ShaderParams->SizeZ = static_cast<uint32>(JobPtr->SizeZ);
-						ShaderParams->XYScale = static_cast<uint32>(JobPtr->XYScale);
-						ShaderParams->DefaultAO = static_cast<uint32>(JobPtr->DefaultAO);
-						ShaderParams->InVoxels = VoxSRV;
-						ShaderParams->Offsets = OffsSRV;
-						ShaderParams->OutVerts = OutUAV;
-						ShaderParams->NeighborXN = NeighborXNSRV;
-						ShaderParams->NeighborXP = NeighborXPSRV;
-						ShaderParams->NeighborYN = NeighborYNSRV;
-						ShaderParams->NeighborYP = NeighborYPSRV;
-						ShaderParams->NeighborZN = NeighborZNSRV;
-						ShaderParams->NeighborZP = NeighborZPSRV;
-						ShaderParams->bHasNeighborXN = JobPtr->Neighbors->XN.Num() > 0 ? 1u : 0u;
-						ShaderParams->bHasNeighborXP = JobPtr->Neighbors->XP.Num() > 0 ? 1u : 0u;
-						ShaderParams->bHasNeighborYN = JobPtr->Neighbors->YN.Num() > 0 ? 1u : 0u;
-						ShaderParams->bHasNeighborYP = JobPtr->Neighbors->YP.Num() > 0 ? 1u : 0u;
-						ShaderParams->bHasNeighborZN = JobPtr->Neighbors->ZN.Num() > 0 ? 1u : 0u;
-						ShaderParams->bHasNeighborZP = JobPtr->Neighbors->ZP.Num() > 0 ? 1u : 0u;
-						ShaderParams->OutCount = DummyCountUAV;
-						ShaderParams->MaxVerts = static_cast<uint32>(JobPtr->TotalElements);
-						ShaderParams->DisableGreedyMerge = 0u;
-
-						static auto* CVarIgnNbh = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.IgnoreNeighbors"));
-						const bool bIgnoreNeighbors = JobPtr->bAggressiveCulling || (CVarIgnNbh && CVarIgnNbh->GetInt() != 0);
-						ShaderParams->IgnoreNeighbors = bIgnoreNeighbors ? 1u : 0u;
-
-						ShaderParams->NeighborLayoutX = 0u;
-						ShaderParams->NeighborLayoutY = 0u;
-						ShaderParams->NeighborLayoutZ = 0u;
-						ShaderParams->DirectionMask = 0x3Fu;  // All 6 directions
-
-						// Dispatch emit shader
-						const FIntVector Groups(
-							FMath::DivideAndRoundUp(JobPtr->SizeX, 8),
-							FMath::DivideAndRoundUp(JobPtr->SizeY, 8),
-							FMath::DivideAndRoundUp(JobPtr->SizeZ, 8));
-
-						FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU Emit Async"), CS, ShaderParams, Groups);
-						AddEnqueueCopyPass(GraphBuilder, JobPtr->VertsReadback.Get(), OutBuf, 0);
-						GraphBuilder.Execute();
-
-						// Release intermediate data
-						JobPtr->OffsetsCPU.Reset();
-						JobPtr->Voxels.Reset();
-						JobPtr->Neighbors.Reset();
-					});
-			}
-			// ========== STAGE 2: WAITING FOR VERTEX READBACK ==========
-			else if (Job->Stage == EVoxelGPUAsyncStage::WaitingForVertices)
-			{
-				if (!Job->VertsReadback || !Job->VertsReadback->IsReady())
-				{
-					continue;  // Not ready yet
-				}
-
-				// Readback vertex results to CPU
-				FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
+				// Readback vertices
+				FEvent* VertsDone = FPlatformProcess::GetSynchEventFromPool(false);
 				ENQUEUE_RENDER_COMMAND(VoxelGPU_AsyncVertsReadback)(
-					[Job, ReadbackDone](FRHICommandListImmediate& RHICmdList)
+					[Job, VertsDone](FRHICommandListImmediate& RHICmdList)
 					{
 						if (Job->VertsReadback && Job->TotalElements > 0)
 						{
@@ -1586,12 +1460,18 @@ void FVoxelGPUMesher::PumpAsyncReadbacks()
 						{
 							Job->PackedResult.Reset();
 						}
-						ReadbackDone->Trigger();
+						VertsDone->Trigger();
 					});
 
-				ReadbackDone->Wait();
-				FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
+				VertsDone->Wait();
+				FPlatformProcess::ReturnSynchEventToPool(VertsDone);
 				Job->VertsReadback.Reset();
+
+				// Release shared data
+				Job->Voxels.Reset();
+				Job->Neighbors.Reset();
+
+				UE_LOG(LogTemp, Log, TEXT("[VoxelGPU SinglePass Async] Generated %d vertices"), Job->TotalElements);
 
 				GVoxelGPUAsyncJobs.RemoveAtSwap(Index);
 				CompletedJobs.Add(Job);
