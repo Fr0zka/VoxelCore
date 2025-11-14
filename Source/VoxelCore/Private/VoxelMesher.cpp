@@ -1299,6 +1299,14 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
     // Use thread-safe local buffer instead of thread_local to prevent race conditions
     TArray<uint64> Rows;
 
+    // OPTIMIZATION: Hoist hot-path lambdas outside loops
+    auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
+    auto FaceDirFromNormal = [](const FIntVector& n)->EVoxelFaceDir {
+        if (n.X == 1) return EVoxelFaceDir::XPos; if (n.X == -1) return EVoxelFaceDir::XNeg;
+        if (n.Y == 1) return EVoxelFaceDir::YPos; if (n.Y == -1) return EVoxelFaceDir::YNeg;
+        return n.Z == 1 ? EVoxelFaceDir::ZPos : EVoxelFaceDir::ZNeg;
+    };
+
     // Process categories: solids then semis
     for (uint8 CatType : { uint8(2), uint8(1) })
     {
@@ -1310,6 +1318,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
             const FIntVector Udir = A.U;
             const FIntVector Vdir = A.V;
             const FIntVector Nrm = A.N;
+            // OPTIMIZATION: Compute face direction once per face direction
+            const EVoxelFaceDir FaceDir = FaceDirFromNormal(Nrm);
 
             for (int s = 0; s < A.Slice; ++s)
             {
@@ -1355,20 +1365,14 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
 
                         while (row)
                         {
-                            // Count trailing zeros (find first set bit)
-                            int du0 = 0;
-                            uint64 temp = row;
-                            while ((temp & 1ull) == 0ull && du0 < 64)
-                            {
-                                temp >>= 1;
-                                ++du0;
-                            }
+                            // OPTIMIZATION: Use CTZ64 intrinsic instead of manual loop
+                            const int du0 = CTZ64(row);
                             if (du0 >= 64) break;
 
                             // Count consecutive ones - but stop if block ID changes
                             const uint64 run = row >> du0;
                             int w = 0;
-                            temp = run;
+                            uint64 temp = run;
 
                             // Get the base block ID for the first visible face
                             const int u0 = uTile + du0;
@@ -1435,12 +1439,6 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             // Emit quad
                             const FIntVector FaceBaseGrid = MakeP(Nrm, s, u0, v)
                                 + FIntVector(FMath::Max(0, Nrm.X), FMath::Max(0, Nrm.Y), FMath::Max(0, Nrm.Z));
-                            auto FaceDirFromNormal = [](const FIntVector& n)->EVoxelFaceDir {
-                                if (n.X == 1) return EVoxelFaceDir::XPos; if (n.X == -1) return EVoxelFaceDir::XNeg;
-                                if (n.Y == 1) return EVoxelFaceDir::YPos; if (n.Y == -1) return EVoxelFaceDir::YNeg;
-                                return n.Z == 1 ? EVoxelFaceDir::ZPos : EVoxelFaceDir::ZNeg;
-                                };
-                            const EVoxelFaceDir FaceDir = FaceDirFromNormal(Nrm);
                             const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBaseGrid.X, FaceBaseGrid.Y, FaceBaseGrid.Z, FaceDir);
                             const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
 
@@ -1478,7 +1476,6 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             Out.UVs.Add(FVector2D(0, (float)h));
 
                             // AO→bytes, layer in A
-                            auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
                             const uint8 AO00 = ToByte(ao00), AO10 = ToByte(ao10), AO11 = ToByte(ao11), AO01 = ToByte(ao01);
                             Out.Colors.Add(FColor(AO00, AO00, AO00, Layer));
                             Out.Colors.Add(FColor(AO10, AO10, AO10, Layer));
