@@ -238,6 +238,15 @@ void UVoxelMesher::BuildGreedyMesh(
     const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
     Out.Vertices.Reset(); Out.Triangles.Reset(); Out.UVs.Reset(); Out.Colors.Reset(); Out.Normals.Reset();
 
+    // OPTIMIZATION: Pre-allocate output buffers to avoid reallocations
+    // Estimate: each slice can have at most DimU*DimV quads, but greedy merging reduces this significantly
+    const int32 approxQuads = FMath::Max(1, (SX * SY + SY * SZ + SX * SZ) / 4);
+    Out.Vertices.Reserve(approxQuads * 4);
+    Out.Triangles.Reserve(approxQuads * 6);
+    Out.UVs.Reserve(approxQuads * 4);
+    Out.Colors.Reserve(approxQuads * 4);
+    Out.Normals.Reserve(approxQuads * 4);
+
     // Pre-calculate max mask size needed
     const int32 MaxMaskSize = FMath::Max3(SX * SY, SY * SZ, SX * SZ);
     GReusableMask.SetNumUninitialized(MaxMaskSize);
@@ -356,12 +365,25 @@ void UVoxelMesher::BuildGreedyMesh(
             return 1.0f - ((int32)SolidA + (int32)SolidB + (int32)SolidC) / 3.0f;
         };
 
+    // OPTIMIZATION: Define hot-path lambdas once instead of per-quad
+    auto ToByte = [](float v) { return (uint8)FMath::Clamp(FMath::RoundToInt(v * 255.f), 0, 255); };
+    auto FaceDirToEnum = [](const FIntVector& N)->EVoxelFaceDir {
+        if (N.X == 1) return EVoxelFaceDir::XPos;
+        if (N.X == -1) return EVoxelFaceDir::XNeg;
+        if (N.Y == 1) return EVoxelFaceDir::YPos;
+        if (N.Y == -1) return EVoxelFaceDir::YNeg;
+        if (N.Z == 1) return EVoxelFaceDir::ZPos;
+        return EVoxelFaceDir::ZNeg;
+    };
+
     for (const FFaceData& Face : GFaceDefs)
     {
         const FIntVector N = Face.Normal, U = Face.TangentU, V = Face.TangentV;
         const int32 SliceCount = (N.X != 0) ? SX : (N.Y != 0) ? SY : SZ;
         const int32 DimU = (N.X != 0) ? SY : (N.Y != 0) ? SX : SX;
         const int32 DimV = (N.X != 0) ? SZ : (N.Y != 0) ? SZ : SY;
+        // OPTIMIZATION: Compute face direction once per face instead of per quad
+        const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
         EVoxelBlockID SolidBlock;
         auto MakeP = [&](int32 s, int32 u, int32 v)->FIntVector
             {
@@ -376,6 +398,8 @@ void UVoxelMesher::BuildGreedyMesh(
             const int32 MaskSize = DimU * DimV;
             FMemory::Memzero(GReusableMask.GetData(), MaskSize * sizeof(uint8));
 
+            // OPTIMIZATION: Track if slice has any faces to avoid empty slice processing
+            bool bHasAnyFaces = false;
             for (int32 vv = 0; vv < DimV; ++vv)
                 for (int32 uu = 0; uu < DimU; ++uu)
                 {
@@ -392,7 +416,12 @@ void UVoxelMesher::BuildGreedyMesh(
                     EVoxelBlockID Owner = BlockAt(P.X, P.Y, P.Z);
                     SolidBlock = (CatA != 0 ? BlockAt(P.X, P.Y, P.Z) : BlockAt(Q.X, Q.Y, Q.Z));
                     GReusableMask[Idx2D(uu, vv, DimU)] = MaskVal;
+                    bHasAnyFaces |= (MaskVal != 0);
                 }
+
+            // OPTIMIZATION: Skip greedy merging entirely if this slice has no faces
+            if (!bHasAnyFaces)
+                continue;
 
             int32 v = 0;
             while (v < DimV)
@@ -475,17 +504,6 @@ void UVoxelMesher::BuildGreedyMesh(
                     // Use unified winding function
                     AddTrianglesWithCorrectWinding(Out, VStart, FaceNormal);
 
-                    auto ToByte = [](float v) { return (uint8)FMath::Clamp(FMath::RoundToInt(v * 255.f), 0, 255); };
-
-                    auto FaceDirToEnum = [](const FIntVector& N)->EVoxelFaceDir {
-                        if (N.X == 1) return EVoxelFaceDir::XPos;
-                        if (N.X == -1) return EVoxelFaceDir::XNeg;
-                        if (N.Y == 1) return EVoxelFaceDir::YPos;
-                        if (N.Y == -1) return EVoxelFaceDir::YNeg;
-                        if (N.Z == 1) return EVoxelFaceDir::ZPos;
-                        return EVoxelFaceDir::ZNeg;
-                        };
-                    const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
                     const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBase.X, FaceBase.Y, FaceBase.Z, FaceDir);
                     const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
 
@@ -499,7 +517,6 @@ void UVoxelMesher::BuildGreedyMesh(
                     const FIntVector AOBase = FaceBase;
                     // Apply a tint factor based on the block category.  Semi‑solid blocks
                     // (category 1) are tinted slightly darker to distinguish them visually.
-                    const float ShadeFactor = (CurrentType == 1 ? 0.7f : 1.0f);
                     const float Shade = (CurrentType == 1 ? 0.7f : 1.0f);
                     const uint8 AO00 = ToByte(Shade * SampleAO(AOBase, N, UNeg, VNeg));
                     const uint8 AO10 = ToByte(Shade * SampleAO(AOBase + U * Width, N, U, VNeg));
