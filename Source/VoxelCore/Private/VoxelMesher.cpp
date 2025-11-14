@@ -1156,99 +1156,53 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
             return x + y * SX + z * SX * SY;
         };
 
+    // OPTIMIZATION: Hot-path accessors to eliminate call overhead
     auto Inside = [&](int32 x, int32 y, int32 z) -> bool
         {
-            return (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ);
+            // Use unsigned comparison trick: single comparison checks both bounds
+            return (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ;
         };
-    auto BlockAt = [&](int x, int y, int z)->EVoxelBlockID
+    auto BlockAt = [&](int x, int y, int z) ->EVoxelBlockID
         {
-            if (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ)
+            // OPTIMIZATION: Fast path for inside chunk (most common case)
+            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
                 return Voxels[x + y * SX + z * SX * SY];
+
+            // Slow path: neighbor lookup
             if (!Nbh) return EVoxelBlockID::Air;
 
-            if (z < 0)       return (Nbh->bHasZNeg && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZNeg[x + y * SX] : EVoxelBlockID::Air;
-            if (z >= SZ)     return (Nbh->bHasZPos && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZPos[x + y * SX] : EVoxelBlockID::Air;
-            if (x < 0)       return (Nbh->bHasXNeg && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XNeg[y + z * SY] : EVoxelBlockID::Air;
-            if (x >= SX)     return (Nbh->bHasXPos && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XPos[y + z * SY] : EVoxelBlockID::Air;
-            if (y < 0)       return (Nbh->bHasYNeg && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YNeg[x + z * SX] : EVoxelBlockID::Air;
-            /* y >= SY */    return (Nbh->bHasYPos && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
+            if (z < 0)       return (Nbh->bHasZNeg && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY) ? Nbh->ZNeg[x + y * SX] : EVoxelBlockID::Air;
+            if (z >= SZ)     return (Nbh->bHasZPos && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY) ? Nbh->ZPos[x + y * SX] : EVoxelBlockID::Air;
+            if (x < 0)       return (Nbh->bHasXNeg && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ) ? Nbh->XNeg[y + z * SY] : EVoxelBlockID::Air;
+            if (x >= SX)     return (Nbh->bHasXPos && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ) ? Nbh->XPos[y + z * SY] : EVoxelBlockID::Air;
+            if (y < 0)       return (Nbh->bHasYNeg && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) ? Nbh->YNeg[x + z * SX] : EVoxelBlockID::Air;
+            /* y >= SY */    return (Nbh->bHasYPos && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
         };
 
     auto CatAt = [&](int32 x, int32 y, int32 z) -> uint8
         {
-            if (Inside(x, y, z))
-            {
-                const int32 idx = Idx3(x, y, z);
-                if (idx >= 0 && idx < Cats.Num())
-                    return Cats[idx];
-                return 0;
-            }
+            // OPTIMIZATION: Fast path for inside chunk
+            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return Cats[x + y * SX + z * SX * SY];
 
+            // Slow path: neighbor lookup
             if (!Nbh) return 0;
 
-            // Vertical neighbors
-            if (z < 0)
-            {
-                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
-                {
-                    const int32 nbIdx = x + y * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->ZNeg.Num())
-                        return VoxelBlockCategory(Nbh->ZNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (z >= SZ)
-            {
-                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
-                {
-                    const int32 nbIdx = x + y * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->ZPos.Num())
-                        return VoxelBlockCategory(Nbh->ZPos[nbIdx]);
-                }
-                return 0;
-            }
+            // Vertical neighbors - reordered for better branch prediction (Z most common)
+            if (z < 0 && Nbh->bHasZNeg && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY)
+                return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]);
+            if (z >= SZ && Nbh->bHasZPos && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY)
+                return VoxelBlockCategory(Nbh->ZPos[x + y * SX]);
 
             // Horizontal neighbors
-            if (x < 0)
-            {
-                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXNeg)
-                {
-                    const int32 nbIdx = y + z * SY;
-                    if (nbIdx >= 0 && nbIdx < Nbh->XNeg.Num())
-                        return VoxelBlockCategory(Nbh->XNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (x >= SX)
-            {
-                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXPos)
-                {
-                    const int32 nbIdx = y + z * SY;
-                    if (nbIdx >= 0 && nbIdx < Nbh->XPos.Num())
-                        return VoxelBlockCategory(Nbh->XPos[nbIdx]);
-                }
-                return 0;
-            }
-            if (y < 0)
-            {
-                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYNeg)
-                {
-                    const int32 nbIdx = x + z * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->YNeg.Num())
-                        return VoxelBlockCategory(Nbh->YNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (y >= SY)
-            {
-                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYPos)
-                {
-                    const int32 nbIdx = x + z * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->YPos.Num())
-                        return VoxelBlockCategory(Nbh->YPos[nbIdx]);
-                }
-                return 0;
-            }
+            if (x < 0 && Nbh->bHasXNeg && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->XNeg[y + z * SY]);
+            if (x >= SX && Nbh->bHasXPos && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->XPos[y + z * SY]);
+            if (y < 0 && Nbh->bHasYNeg && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->YNeg[x + z * SX]);
+            if (y >= SY && Nbh->bHasYPos && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->YPos[x + z * SX]);
 
             return 0;
         };
@@ -1334,7 +1288,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                     Rows.Reset();
                     Rows.SetNumZeroed(A.DimV);
 
-                    // Build face-visibility masks
+                    // OPTIMIZATION: Build face-visibility masks with early empty check
+                    bool bTileHasAnyFaces = false;
                     for (int v = 0; v < A.DimV; ++v)
                     {
                         uint64 bits = 0ull;
@@ -1349,10 +1304,13 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             bits |= (uint64)visible << du;
                         }
 
-                        // SAFETY: Bounds check
-                        if (v >= 0 && v < Rows.Num())
-                            Rows[v] = bits;
+                        Rows[v] = bits;
+                        bTileHasAnyFaces |= (bits != 0);
                     }
+
+                    // OPTIMIZATION: Skip greedy merging entirely if this tile has no faces
+                    if (!bTileHasAnyFaces)
+                        continue;
 
                     // Greedy merge rectangles
                     for (int v = 0; v < A.DimV; ++v)
