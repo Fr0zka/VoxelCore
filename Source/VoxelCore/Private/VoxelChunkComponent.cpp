@@ -128,6 +128,14 @@ void UVoxelChunkComponent::DoGeneration()
         const int32 ScaledSizeY = (Params.SizeY + ScaleXY - 1) / ScaleXY;
         const int32 ScaledSizeZ = Params.SizeZ;
 
+        // DIAGNOSTIC: Log buffer size calculation to verify LOD scaling
+        UE_LOG(LogTemp, Warning, TEXT("DIAGNOSTIC Coord(%d,%d,%d): Params.Size(%d,%d,%d) ScaleXY=%d -> Scaled(%d,%d,%d) -> WithHalo(%d,%d,%d)"),
+            Coord.Cx, Coord.Cy, Coord.Cz,
+            Params.SizeX, Params.SizeY, Params.SizeZ,
+            ScaleXY,
+            ScaledSizeX, ScaledSizeY, ScaledSizeZ,
+            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2);
+
         // Launch GPU generation (use weak pointer to safely handle component destruction)
         TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
