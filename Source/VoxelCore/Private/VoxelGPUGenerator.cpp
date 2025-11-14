@@ -156,45 +156,54 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
     }
 
     // Process completed jobs (lock and copy data on render thread)
+    // IMPORTANT: Jobs in CompletedJobs have already passed IsReady() check,
+    // so they are safe to lock on the render thread
     for (TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>& Job : CompletedJobs)
     {
         if (!Job.IsValid())
             continue;
 
-        // Allocate category data on heap (captured by lambda, no need to wait)
-        TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> CategoryData = MakeShared<TArray<uint8>, ESPMode::ThreadSafe>();
-        CategoryData->SetNumUninitialized(Job->BufferSizeBytes);
+        // Capture job data for async processing
+        TFunction<void(TArray<uint8>&&)> OnComplete = Job->OnComplete;
+        int32 BufferSizeBytes = Job->BufferSizeBytes;
+
+        // CRITICAL: Move ownership of readback to render thread command
+        // This keeps the readback alive until the command executes
+        FRHIGPUBufferReadback* ReadbackPtr = Job->Readback.Release();
 
         // Enqueue render command to lock and copy data (Lock MUST be on render thread)
-        FRHIGPUBufferReadback* ReadbackPtr = Job->Readback.Get();
-        TFunction<void(TArray<uint8>&&)> OnComplete = Job->OnComplete;
-
         ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
-            [ReadbackPtr, CategoryData, OnComplete](FRHICommandListImmediate& RHICmdList)
+            [ReadbackPtr, BufferSizeBytes, OnComplete](FRHICommandListImmediate& RHICmdList)
             {
-                // Lock and copy GPU data to our heap-allocated array
-                const int32 BufferSize = CategoryData->Num();
-                const uint32* BufferPtr = (const uint32*)ReadbackPtr->Lock(BufferSize);
+                // Allocate output buffer on render thread
+                TArray<uint8> CategoryData;
+                CategoryData.SetNumUninitialized(BufferSizeBytes);
+
+                // Lock and copy GPU data (safe because IsReady() already passed)
+                const uint32* BufferPtr = (const uint32*)ReadbackPtr->Lock(BufferSizeBytes);
                 if (BufferPtr)
                 {
-                    FMemory::Memcpy(CategoryData->GetData(), BufferPtr, BufferSize);
-                }
-                ReadbackPtr->Unlock();
+                    FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
+                    ReadbackPtr->Unlock();
 
-                // Call completion callback on game thread (async task)
-                if (OnComplete)
-                {
-                    AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData]()
+                    // Call completion callback on game thread (async task)
+                    if (OnComplete)
                     {
-                        OnComplete(MoveTemp(*CategoryData));
-                    });
+                        AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData = MoveTemp(CategoryData)]() mutable
+                        {
+                            OnComplete(MoveTemp(CategoryData));
+                        });
+                    }
                 }
+                else
+                {
+                    // Lock failed - log error
+                    UE_LOG(LogTemp, Error, TEXT("VoxelGPU: Failed to lock readback buffer!"));
+                }
+
+                // Clean up readback buffer (we own it now)
+                delete ReadbackPtr;
             });
-
-        // NO WAIT - render thread will complete asynchronously and invoke callback
-        // This eliminates the blocking wait that was causing stuttering!
-
-        // Readback will be cleaned up when Job is destroyed
     }
 }
 
