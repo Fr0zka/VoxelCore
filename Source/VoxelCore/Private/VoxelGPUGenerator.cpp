@@ -306,6 +306,11 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->HeightLacunarity = BiomeParams.HeightLacunarity;
     PassParameters->HeightGain = BiomeParams.HeightGain;
 
+    // DIAGNOSTIC: Log biome height parameters
+    UE_LOG(LogTemp, Warning, TEXT("GPU Biome: HeightAmp=%.1f Freq=%.4f Oct=%d Lac=%.2f Gain=%.2f"),
+        BiomeParams.HeightAmplitude, BiomeParams.HeightFrequency, BiomeParams.HeightOctaves,
+        BiomeParams.HeightLacunarity, BiomeParams.HeightGain);
+
     // Biome parameters - Mountains
     PassParameters->MountainAmplitude = BiomeParams.MountainAmplitude;
     PassParameters->MountainFrequency = BiomeParams.MountainFrequency;

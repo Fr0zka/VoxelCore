@@ -231,10 +231,14 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint Category = 0;
 
     // ========================================================================
-    // DEBUG MODE: Checkerboard pattern to verify shader compilation
-    // Change this to 0 to enable full terrain generation
+    // DEBUG MODE OPTIONS:
+    // 0 = Full terrain generation
+    // 1 = Checkerboard pattern (verify shader compilation)
+    // 2 = Simple Perlin test (verify noise implementation)
     // ========================================================================
-    #if 0
+    #define DEBUG_MODE 0
+
+    #if DEBUG_MODE == 1
 
     // CHECKERBOARD PATTERN: Alternating solid/air every other voxel
     // This creates an obvious visual pattern that's impossible to miss
@@ -249,6 +253,26 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     else
     {
         Category = 0; // Air (empty squares)
+    }
+
+    #elif DEBUG_MODE == 2
+
+    // SIMPLE PERLIN TEST: Use raw Perlin noise to generate height
+    // This isolates the Perlin implementation from all other terrain logic
+    float perlinValue = PerlinNoise2D((float)WX * 0.01, (float)WY * 0.01);  // [-1, 1]
+    float testHeight = BaseHeight + perlinValue * 20.0;  // Simple height variation
+
+    if (WZ <= testHeight)
+    {
+        Category = 2; // Solid
+    }
+    else if (WZ <= WaterLevel)
+    {
+        Category = 1; // Water
+    }
+    else
+    {
+        Category = 0; // Air
     }
 
     #else
