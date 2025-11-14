@@ -17,6 +17,7 @@
 #include "VoxelBlockTable.h"
 #include "VoxelMaterialSet.h"
 #include <VoxelBiome.h>
+#include <VoxelNoise.h>
 
 // Debug console variable for padding extraction logging
 static TAutoConsoleVariable<int32> CVarVoxelLogPadding(
@@ -110,18 +111,33 @@ void UVoxelChunkComponent::DoGeneration()
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
-        UE_LOG(LogTemp, Warning, TEXT("==== GPU PATH ENTERED for Coord(%d,%d,%d) ===="), Coord.Cx, Coord.Cy, Coord.Cz);
-
-        // Get biome parameters (simplified - using first biome or default)
+        // Sample biome at chunk center (matches CPU's per-column biome sampling approach)
         FBiomeTerrainParams BiomeParams;
-        if (Params.BiomeTable.IsValid() && Params.BiomeTable->Biomes.Num() > 0)
+        if (Params.BiomeTable.IsValid() && Params.BiomeTable->Biomes.Num() > 0 && Params.NoiseProfile)
         {
-            // Use first biome as default (could be improved to sample actual biome)
-            const UVoxelBiomeDef* Biome = Params.BiomeTable->Biomes[0].Get();
+            // Calculate chunk center world position
+            const int32 ChunkCenterWX = Coord.Cx * Params.SizeX + Params.SizeX / 2;
+            const int32 ChunkCenterWY = Coord.Cy * Params.SizeY + Params.SizeY / 2;
+
+            // Sample climate at chunk center using noise profile
+            FVoxelNoiseContext NoiseCtx(Params.Seed, Params.NoiseProfile);
+            float Temperature, Moisture;
+            NoiseCtx.SampleClimate((float)ChunkCenterWX, (float)ChunkCenterWY, Temperature, Moisture);
+
+            // Pick biome based on climate
+            const UVoxelBiomeDef* Biome = Params.BiomeTable->Pick(Temperature, Moisture);
             if (Biome)
             {
                 BiomeParams = Biome->TerrainParams;
+                UE_LOG(LogTemp, Log, TEXT("GPU Gen Chunk(%d,%d,%d): Sampled biome '%s' at center (%d,%d) - Temp=%.2f Moist=%.2f"),
+                    Coord.Cx, Coord.Cy, Coord.Cz, *Biome->BiomeName.ToString(),
+                    ChunkCenterWX, ChunkCenterWY, Temperature, Moisture);
             }
+        }
+        else
+        {
+            // Fallback to default parameters if no biome table available
+            BiomeParams = FBiomeTerrainParams();
         }
 
         // Calculate LOD-scaled grid size (CRITICAL: must match CPU path!)
@@ -129,14 +145,6 @@ void UVoxelChunkComponent::DoGeneration()
         const int32 ScaledSizeX = (Params.SizeX + ScaleXY - 1) / ScaleXY;
         const int32 ScaledSizeY = (Params.SizeY + ScaleXY - 1) / ScaleXY;
         const int32 ScaledSizeZ = Params.SizeZ;
-
-        // DIAGNOSTIC: Log buffer size calculation to verify LOD scaling
-        UE_LOG(LogTemp, Warning, TEXT("DIAGNOSTIC Coord(%d,%d,%d): Params.Size(%d,%d,%d) ScaleXY=%d -> Scaled(%d,%d,%d) -> WithHalo(%d,%d,%d)"),
-            Coord.Cx, Coord.Cy, Coord.Cz,
-            Params.SizeX, Params.SizeY, Params.SizeZ,
-            ScaleXY,
-            ScaledSizeX, ScaledSizeY, ScaledSizeZ,
-            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2);
 
         // Launch GPU generation (use weak pointer to safely handle component destruction)
         TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);

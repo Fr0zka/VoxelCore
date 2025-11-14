@@ -161,36 +161,38 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
         if (!Job.IsValid())
             continue;
 
-        TArray<uint8> CategoryData;
-        CategoryData.SetNumUninitialized(Job->BufferSizeBytes);
-
-        FEvent* ReadbackDone = FPlatformProcess::GetSynchEventFromPool(false);
+        // Allocate category data on heap (captured by lambda, no need to wait)
+        TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> CategoryData = MakeShared<TArray<uint8>, ESPMode::ThreadSafe>();
+        CategoryData->SetNumUninitialized(Job->BufferSizeBytes);
 
         // Enqueue render command to lock and copy data (Lock MUST be on render thread)
         FRHIGPUBufferReadback* ReadbackPtr = Job->Readback.Get();
-        int32 BufferSize = Job->BufferSizeBytes;
+        TFunction<void(TArray<uint8>&&)> OnComplete = Job->OnComplete;
 
         ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
-            [ReadbackPtr, BufferSize, &CategoryData, ReadbackDone](FRHICommandListImmediate& RHICmdList)
+            [ReadbackPtr, CategoryData, OnComplete](FRHICommandListImmediate& RHICmdList)
             {
+                // Lock and copy GPU data to our heap-allocated array
+                const int32 BufferSize = CategoryData->Num();
                 const uint32* BufferPtr = (const uint32*)ReadbackPtr->Lock(BufferSize);
                 if (BufferPtr)
                 {
-                    FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSize);
+                    FMemory::Memcpy(CategoryData->GetData(), BufferPtr, BufferSize);
                 }
                 ReadbackPtr->Unlock();
-                ReadbackDone->Trigger();
+
+                // Call completion callback on game thread (async task)
+                if (OnComplete)
+                {
+                    AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData]()
+                    {
+                        OnComplete(MoveTemp(*CategoryData));
+                    });
+                }
             });
 
-        // Wait for render thread to finish copying
-        ReadbackDone->Wait();
-        FPlatformProcess::ReturnSynchEventToPool(ReadbackDone);
-
-        // Call completion callback with generated data
-        if (Job->OnComplete)
-        {
-            Job->OnComplete(MoveTemp(CategoryData));
-        }
+        // NO WAIT - render thread will complete asynchronously and invoke callback
+        // This eliminates the blocking wait that was causing stuttering!
 
         // Readback will be cleaned up when Job is destroyed
     }
@@ -341,14 +343,6 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     const uint32 NumGroupsX = FMath::DivideAndRoundUp((uint32)SizeX, ThreadGroupSizeX);
     const uint32 NumGroupsY = FMath::DivideAndRoundUp((uint32)SizeY, ThreadGroupSizeY);
     const uint32 NumGroupsZ = FMath::DivideAndRoundUp((uint32)SizeZ, ThreadGroupSizeZ);
-
-    // Log GPU generation parameters (can be disabled for performance)
-    UE_LOG(LogTemp, Warning, TEXT("GPU Gen: Coord(%d,%d,%d) Size(%d,%d,%d) LOD=%d BaseW(%d,%d,%d) Groups(%d,%d,%d)"),
-        Coord.Cx, Coord.Cy, Coord.Cz,
-        SizeX, SizeY, SizeZ,
-        LODScaleXY,
-        PassParameters->BaseWX, PassParameters->BaseWY, PassParameters->BaseWZ,
-        NumGroupsX, NumGroupsY, NumGroupsZ);
 
     // Dispatch compute shader
     FComputeShaderUtils::AddPass(
