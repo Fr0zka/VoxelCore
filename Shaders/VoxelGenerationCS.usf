@@ -87,14 +87,41 @@ float Sample01_2D_Custom(float x, float y, int octaves)
     return (sum / maxAmp) * 0.5 + 0.5;
 }
 
+// Sample climate (Temperature and Moisture) for biome selection
+// Matches CPU implementation in VoxelGenerator.cpp:46-61
+void SampleClimate(float WX, float WY, out float outTemp, out float outMoist)
+{
+    // Simple Perlin-based climate (fallback when no NoiseProfile)
+    // Matches CPU: fT = 1/256, fM = 1/192
+    const float fT = 1.0 / 256.0;
+    const float fM = 1.0 / 192.0;
+
+    outTemp = clamp(PerlinNoise2D(WX * fT, WY * fT) * 0.5 + 0.5, 0.0, 1.0);
+    outMoist = clamp(PerlinNoise2D(WX * fM, WY * fM) * 0.5 + 0.5, 0.0, 1.0);
+}
+
 // Compute macro surface height using biome parameters
+// NOW WITH PER-COLUMN CLIMATE SAMPLING for biome variation
 float MacroSurfaceZ_Biome(float x, float y)
 {
-    // Base terrain height
-    float n01 = Sample01_2D_Custom(x * HeightFrequency, y * HeightFrequency, HeightOctaves);
-    float H2D = BaseHeight + (n01 - 0.5) * 2.0 * HeightAmplitude;
+    // Sample climate at this XY position (matches CPU per-column sampling)
+    float Temp, Moist;
+    SampleClimate(x, y, Temp, Moist);
 
-    // Mountains
+    // Modulate biome parameters based on climate
+    // This creates per-column variation instead of per-chunk
+    // Hot climates (Temp > 0.5) = flatter, more desert-like
+    // Cold climates (Temp < 0.5) = more mountainous
+    // Wet climates (Moist > 0.5) = more height variation
+    // Dry climates (Moist < 0.5) = flatter
+    float ClimateHeightScale = lerp(0.7, 1.3, Moist);  // Wet = more dramatic
+    float ClimateMountainScale = lerp(0.5, 1.5, 1.0 - Temp);  // Cold = more mountains
+
+    // Base terrain height with climate modulation
+    float n01 = Sample01_2D_Custom(x * HeightFrequency, y * HeightFrequency, HeightOctaves);
+    float H2D = BaseHeight + (n01 - 0.5) * 2.0 * HeightAmplitude * ClimateHeightScale;
+
+    // Mountains with climate modulation
     if (MountainAmplitude > 0.0)
     {
         float r = Ridged2D(
@@ -104,7 +131,7 @@ float MacroSurfaceZ_Biome(float x, float y)
 
         float band = max(0.0, r - MountainThreshold);
         float shaped = pow(band, MountainSharpness);
-        float M = MountainAmplitude * shaped;
+        float M = MountainAmplitude * shaped * ClimateMountainScale;
 
         H2D += M;
     }
