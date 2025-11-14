@@ -53,6 +53,7 @@ public:
         int32 WaterLevel,
         int32 MaxCaveDepth,
         const class UVoxelBiomeTable* BiomeTable,
+        const class UVoxelNoiseProfile* NoiseProfile,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 
     /**

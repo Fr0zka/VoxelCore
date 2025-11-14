@@ -100,6 +100,22 @@ public:
         SHADER_PARAMETER(int32, WaterLevel)
         SHADER_PARAMETER(int32, MaxCaveDepth)
 
+        // Climate noise parameters (Temperature)
+        SHADER_PARAMETER(float, TempBaseFreq)
+        SHADER_PARAMETER(int32, TempOctaves)
+        SHADER_PARAMETER(float, TempLacunarity)
+        SHADER_PARAMETER(float, TempGain)
+        SHADER_PARAMETER(float, TempWarpStrength)
+        SHADER_PARAMETER(int32, TempSeedOffset)
+
+        // Climate noise parameters (Moisture)
+        SHADER_PARAMETER(float, MoistBaseFreq)
+        SHADER_PARAMETER(int32, MoistOctaves)
+        SHADER_PARAMETER(float, MoistLacunarity)
+        SHADER_PARAMETER(float, MoistGain)
+        SHADER_PARAMETER(float, MoistWarpStrength)
+        SHADER_PARAMETER(int32, MoistSeedOffset)
+
         // Biome array (structured buffer for per-column biome selection)
         SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUBiomeData>, Biomes)
         SHADER_PARAMETER(uint32, BiomeCount)
@@ -234,6 +250,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
     int32 WaterLevel,
     int32 MaxCaveDepth,
     const UVoxelBiomeTable* BiomeTable,
+    const UVoxelNoiseProfile* NoiseProfile,
     TFunction<void(TArray<uint8>&&)> OnComplete)
 {
     // Validate GPU availability
@@ -317,11 +334,49 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         BiomeDataArray.Add(DefaultData);
     }
 
+    // Extract climate noise parameters from NoiseProfile (if available)
+    float TempBaseFreq = 1.0f / 256.0f;      // Default fallback
+    int32 TempOctaves = 3;
+    float TempLacunarity = 2.0f;
+    float TempGain = 0.5f;
+    float TempWarpStrength = 0.0f;
+    int32 TempSeedOffset = 0;
+
+    float MoistBaseFreq = 1.0f / 192.0f;     // Default fallback
+    int32 MoistOctaves = 3;
+    float MoistLacunarity = 2.0f;
+    float MoistGain = 0.5f;
+    float MoistWarpStrength = 0.0f;
+    int32 MoistSeedOffset = 0;
+
+    if (NoiseProfile)
+    {
+        TempBaseFreq = NoiseProfile->Temperature.BaseFreq;
+        TempOctaves = NoiseProfile->Temperature.Octaves;
+        TempLacunarity = NoiseProfile->Temperature.Lacunarity;
+        TempGain = NoiseProfile->Temperature.Gain;
+        TempWarpStrength = NoiseProfile->Temperature.WarpStrength;
+        TempSeedOffset = NoiseProfile->Temperature.SeedOffset;
+
+        MoistBaseFreq = NoiseProfile->Moisture.BaseFreq;
+        MoistOctaves = NoiseProfile->Moisture.Octaves;
+        MoistLacunarity = NoiseProfile->Moisture.Lacunarity;
+        MoistGain = NoiseProfile->Moisture.Gain;
+        MoistWarpStrength = NoiseProfile->Moisture.WarpStrength;
+        MoistSeedOffset = NoiseProfile->Moisture.SeedOffset;
+    }
+
     // Enqueue work on render thread
     ENQUEUE_RENDER_COMMAND(VoxelGPUGeneration)(
-        [Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeDataArray, OnComplete](FRHICommandListImmediate& RHICmdList)
+        [Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
+         TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
+         MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
+         BiomeDataArray, OnComplete](FRHICommandListImmediate& RHICmdList)
         {
-            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeDataArray, OnComplete);
+            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
+                TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
+                MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
+                BiomeDataArray, OnComplete);
         });
 }
 
@@ -338,6 +393,8 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     int32 BaseHeight,
     int32 WaterLevel,
     int32 MaxCaveDepth,
+    float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
+    float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
     const TArray<FGPUBiomeData>& BiomeDataArray,
     TFunction<void(TArray<uint8>&&)> OnComplete)
 {
@@ -400,6 +457,21 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->BaseHeight = BaseHeight;
     PassParameters->WaterLevel = WaterLevel;
     PassParameters->MaxCaveDepth = MaxCaveDepth;
+
+    // Climate noise parameters
+    PassParameters->TempBaseFreq = TempBaseFreq;
+    PassParameters->TempOctaves = TempOctaves;
+    PassParameters->TempLacunarity = TempLacunarity;
+    PassParameters->TempGain = TempGain;
+    PassParameters->TempWarpStrength = TempWarpStrength;
+    PassParameters->TempSeedOffset = TempSeedOffset;
+
+    PassParameters->MoistBaseFreq = MoistBaseFreq;
+    PassParameters->MoistOctaves = MoistOctaves;
+    PassParameters->MoistLacunarity = MoistLacunarity;
+    PassParameters->MoistGain = MoistGain;
+    PassParameters->MoistWarpStrength = MoistWarpStrength;
+    PassParameters->MoistSeedOffset = MoistSeedOffset;
 
     // Biome array for per-column selection
     PassParameters->Biomes = BiomeSRV;

@@ -73,6 +73,22 @@ int BaseHeight;
 int WaterLevel;
 int MaxCaveDepth;
 
+// Climate noise parameters (Temperature)
+float TempBaseFreq;
+int TempOctaves;
+float TempLacunarity;
+float TempGain;
+float TempWarpStrength;
+int TempSeedOffset;
+
+// Climate noise parameters (Moisture)
+float MoistBaseFreq;
+int MoistOctaves;
+float MoistLacunarity;
+float MoistGain;
+float MoistWarpStrength;
+int MoistSeedOffset;
+
 // Biome array (structured buffer for dynamic number of biomes)
 StructuredBuffer<BiomeData> Biomes;
 uint BiomeCount;
@@ -105,16 +121,52 @@ float Sample01_2D_Custom(float x, float y, int octaves)
 }
 
 // Sample climate (Temperature and Moisture) for biome selection
-// Matches CPU implementation in VoxelGenerator.cpp:46-61
+// Matches CPU implementation in VoxelNoise.cpp:135-153 (Sample01_2D)
 void SampleClimate(float WX, float WY, out float outTemp, out float outMoist)
 {
-    // Simple Perlin-based climate (fallback when no NoiseProfile)
-    // Matches CPU: fT = 1/256, fM = 1/192
-    const float fT = 1.0 / 256.0;
-    const float fM = 1.0 / 192.0;
+    // ============================================================================
+    // TEMPERATURE CHANNEL
+    // ============================================================================
 
-    outTemp = clamp(PerlinNoise2D(WX * fT, WY * fT) * 0.5 + 0.5, 0.0, 1.0);
-    outMoist = clamp(PerlinNoise2D(WX * fM, WY * fM) * 0.5 + 0.5, 0.0, 1.0);
+    // Apply seed offset and base frequency (matches CPU: sx = (x + (WorldSeed + SeedOffset) * 11) * BaseFreq)
+    float sx = (WX + (float)(WorldSeed + TempSeedOffset) * 11.0) * TempBaseFreq;
+    float sy = (WY + (float)(WorldSeed + TempSeedOffset) * 13.0) * TempBaseFreq;
+
+    float nx = sx;
+    float ny = sy;
+
+    // Optional domain warping for organic variation
+    if (TempWarpStrength > 0.0)
+    {
+        float wx = fBm2D(sx + 17.0, sy + 23.0, TempOctaves, TempLacunarity, TempGain) - 0.5;
+        float wy = fBm2D(sx + 31.0, sy + 37.0, TempOctaves, TempLacunarity, TempGain) - 0.5;
+        nx += TempWarpStrength * wx;
+        ny += TempWarpStrength * wy;
+    }
+
+    outTemp = fBm2D(nx, ny, TempOctaves, TempLacunarity, TempGain);
+
+    // ============================================================================
+    // MOISTURE CHANNEL
+    // ============================================================================
+
+    // Apply seed offset and base frequency
+    sx = (WX + (float)(WorldSeed + MoistSeedOffset) * 11.0) * MoistBaseFreq;
+    sy = (WY + (float)(WorldSeed + MoistSeedOffset) * 13.0) * MoistBaseFreq;
+
+    nx = sx;
+    ny = sy;
+
+    // Optional domain warping
+    if (MoistWarpStrength > 0.0)
+    {
+        float wx = fBm2D(sx + 17.0, sy + 23.0, MoistOctaves, MoistLacunarity, MoistGain) - 0.5;
+        float wy = fBm2D(sx + 31.0, sy + 37.0, MoistOctaves, MoistLacunarity, MoistGain) - 0.5;
+        nx += MoistWarpStrength * wx;
+        ny += MoistWarpStrength * wy;
+    }
+
+    outMoist = fBm2D(nx, ny, MoistOctaves, MoistLacunarity, MoistGain);
 }
 
 // Pick biome based on temperature and moisture

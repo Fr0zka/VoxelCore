@@ -129,6 +129,7 @@ void UVoxelChunkComponent::DoGeneration()
             Params.WaterLevel,
             Params.MaxCaveDepth,
             Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
+            Params.NoiseProfile,      // Pass NoiseProfile for climate noise generation
             [WeakThis, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
             {
                 // Check if component is still valid (might be destroyed during async generation)
