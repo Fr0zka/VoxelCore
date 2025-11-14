@@ -14,7 +14,7 @@
 #include "ShaderParameterStruct.h"
 #include "GlobalShader.h"
 #include "RenderingThread.h"
-
+#include "VoxelNoise.h"
 // Async and Threading
 #include "Async/Async.h"
 
@@ -22,47 +22,7 @@
 // BIOME DATA STRUCTURE (must match shader BiomeData struct layout exactly)
 // ============================================================================
 
-struct FGPUBiomeData
-{
-    // Climate ranges for biome selection
-    float TempMin;
-    float TempMax;
-    float MoistMin;
-    float MoistMax;
 
-    // Height parameters
-    float HeightAmplitude;
-    float HeightFrequency;
-    int32 HeightOctaves;
-    float HeightLacunarity;
-    float HeightGain;
-
-    // Mountain parameters
-    float MountainAmplitude;
-    float MountainFrequency;
-    float MountainThreshold;
-    float MountainSharpness;
-
-    // 3D features
-    float OverhangAmplitude;
-    float OverhangFrequency;
-    float WarpAmplitude;
-    float WarpFrequency;
-    float IslandAmplitude;
-    float IslandFrequency;
-    float IslandThreshold;
-    float IslandBandCenterZ;
-    float IslandBandHalfThickness;
-
-    // Cave parameters
-    float CaveDensity;
-    float CaveFrequency2D;
-    int32 CaveOctaves2D;
-    float CaveLacunarity2D;
-    float CaveGain2D;
-    float CaveFrequency3D;
-    int32 CaveOctaves3D;
-};
 
 // ============================================================================
 // COMPUTE SHADER BINDING

@@ -69,6 +69,47 @@ public:
     static void TickGPUGenerationJobs();
 
 private:
+    struct FGPUBiomeData
+    {
+        // Climate ranges for biome selection
+        float TempMin;
+        float TempMax;
+        float MoistMin;
+        float MoistMax;
+
+        // Height parameters
+        float HeightAmplitude;
+        float HeightFrequency;
+        int32 HeightOctaves;
+        float HeightLacunarity;
+        float HeightGain;
+
+        // Mountain parameters
+        float MountainAmplitude;
+        float MountainFrequency;
+        float MountainThreshold;
+        float MountainSharpness;
+
+        // 3D features
+        float OverhangAmplitude;
+        float OverhangFrequency;
+        float WarpAmplitude;
+        float WarpFrequency;
+        float IslandAmplitude;
+        float IslandFrequency;
+        float IslandThreshold;
+        float IslandBandCenterZ;
+        float IslandBandHalfThickness;
+
+        // Cave parameters
+        float CaveDensity;
+        float CaveFrequency2D;
+        int32 CaveOctaves2D;
+        float CaveLacunarity2D;
+        float CaveGain2D;
+        float CaveFrequency3D;
+        int32 CaveOctaves3D;
+    };
     /**
      * GPU generation job - tracks pending async readback.
      */
@@ -95,7 +136,9 @@ private:
         int32 BaseHeight,
         int32 WaterLevel,
         int32 MaxCaveDepth,
-        const TArray<struct FGPUBiomeData>& BiomeDataArray,
+        float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
+        float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
+        const TArray<FGPUBiomeData>& BiomeDataArray,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 };
 
