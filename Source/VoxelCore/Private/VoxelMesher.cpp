@@ -238,6 +238,15 @@ void UVoxelMesher::BuildGreedyMesh(
     const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
     Out.Vertices.Reset(); Out.Triangles.Reset(); Out.UVs.Reset(); Out.Colors.Reset(); Out.Normals.Reset();
 
+    // OPTIMIZATION: Pre-allocate output buffers to avoid reallocations
+    // Estimate: each slice can have at most DimU*DimV quads, but greedy merging reduces this significantly
+    const int32 approxQuads = FMath::Max(1, (SX * SY + SY * SZ + SX * SZ) / 4);
+    Out.Vertices.Reserve(approxQuads * 4);
+    Out.Triangles.Reserve(approxQuads * 6);
+    Out.UVs.Reserve(approxQuads * 4);
+    Out.Colors.Reserve(approxQuads * 4);
+    Out.Normals.Reserve(approxQuads * 4);
+
     // Pre-calculate max mask size needed
     const int32 MaxMaskSize = FMath::Max3(SX * SY, SY * SZ, SX * SZ);
     GReusableMask.SetNumUninitialized(MaxMaskSize);
@@ -356,12 +365,25 @@ void UVoxelMesher::BuildGreedyMesh(
             return 1.0f - ((int32)SolidA + (int32)SolidB + (int32)SolidC) / 3.0f;
         };
 
+    // OPTIMIZATION: Define hot-path lambdas once instead of per-quad
+    auto ToByte = [](float v) { return (uint8)FMath::Clamp(FMath::RoundToInt(v * 255.f), 0, 255); };
+    auto FaceDirToEnum = [](const FIntVector& N)->EVoxelFaceDir {
+        if (N.X == 1) return EVoxelFaceDir::XPos;
+        if (N.X == -1) return EVoxelFaceDir::XNeg;
+        if (N.Y == 1) return EVoxelFaceDir::YPos;
+        if (N.Y == -1) return EVoxelFaceDir::YNeg;
+        if (N.Z == 1) return EVoxelFaceDir::ZPos;
+        return EVoxelFaceDir::ZNeg;
+    };
+
     for (const FFaceData& Face : GFaceDefs)
     {
         const FIntVector N = Face.Normal, U = Face.TangentU, V = Face.TangentV;
         const int32 SliceCount = (N.X != 0) ? SX : (N.Y != 0) ? SY : SZ;
         const int32 DimU = (N.X != 0) ? SY : (N.Y != 0) ? SX : SX;
         const int32 DimV = (N.X != 0) ? SZ : (N.Y != 0) ? SZ : SY;
+        // OPTIMIZATION: Compute face direction once per face instead of per quad
+        const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
         EVoxelBlockID SolidBlock;
         auto MakeP = [&](int32 s, int32 u, int32 v)->FIntVector
             {
@@ -376,6 +398,8 @@ void UVoxelMesher::BuildGreedyMesh(
             const int32 MaskSize = DimU * DimV;
             FMemory::Memzero(GReusableMask.GetData(), MaskSize * sizeof(uint8));
 
+            // OPTIMIZATION: Track if slice has any faces to avoid empty slice processing
+            bool bHasAnyFaces = false;
             for (int32 vv = 0; vv < DimV; ++vv)
                 for (int32 uu = 0; uu < DimU; ++uu)
                 {
@@ -392,7 +416,12 @@ void UVoxelMesher::BuildGreedyMesh(
                     EVoxelBlockID Owner = BlockAt(P.X, P.Y, P.Z);
                     SolidBlock = (CatA != 0 ? BlockAt(P.X, P.Y, P.Z) : BlockAt(Q.X, Q.Y, Q.Z));
                     GReusableMask[Idx2D(uu, vv, DimU)] = MaskVal;
+                    bHasAnyFaces |= (MaskVal != 0);
                 }
+
+            // OPTIMIZATION: Skip greedy merging entirely if this slice has no faces
+            if (!bHasAnyFaces)
+                continue;
 
             int32 v = 0;
             while (v < DimV)
@@ -475,17 +504,6 @@ void UVoxelMesher::BuildGreedyMesh(
                     // Use unified winding function
                     AddTrianglesWithCorrectWinding(Out, VStart, FaceNormal);
 
-                    auto ToByte = [](float v) { return (uint8)FMath::Clamp(FMath::RoundToInt(v * 255.f), 0, 255); };
-
-                    auto FaceDirToEnum = [](const FIntVector& N)->EVoxelFaceDir {
-                        if (N.X == 1) return EVoxelFaceDir::XPos;
-                        if (N.X == -1) return EVoxelFaceDir::XNeg;
-                        if (N.Y == 1) return EVoxelFaceDir::YPos;
-                        if (N.Y == -1) return EVoxelFaceDir::YNeg;
-                        if (N.Z == 1) return EVoxelFaceDir::ZPos;
-                        return EVoxelFaceDir::ZNeg;
-                        };
-                    const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
                     const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBase.X, FaceBase.Y, FaceBase.Z, FaceDir);
                     const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
 
@@ -499,7 +517,6 @@ void UVoxelMesher::BuildGreedyMesh(
                     const FIntVector AOBase = FaceBase;
                     // Apply a tint factor based on the block category.  Semi‑solid blocks
                     // (category 1) are tinted slightly darker to distinguish them visually.
-                    const float ShadeFactor = (CurrentType == 1 ? 0.7f : 1.0f);
                     const float Shade = (CurrentType == 1 ? 0.7f : 1.0f);
                     const uint8 AO00 = ToByte(Shade * SampleAO(AOBase, N, UNeg, VNeg));
                     const uint8 AO10 = ToByte(Shade * SampleAO(AOBase + U * Width, N, U, VNeg));
@@ -1139,99 +1156,53 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
             return x + y * SX + z * SX * SY;
         };
 
+    // OPTIMIZATION: Hot-path accessors to eliminate call overhead
     auto Inside = [&](int32 x, int32 y, int32 z) -> bool
         {
-            return (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ);
+            // Use unsigned comparison trick: single comparison checks both bounds
+            return (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ;
         };
-    auto BlockAt = [&](int x, int y, int z)->EVoxelBlockID
+    auto BlockAt = [&](int x, int y, int z) ->EVoxelBlockID
         {
-            if (x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ)
+            // OPTIMIZATION: Fast path for inside chunk (most common case)
+            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
                 return Voxels[x + y * SX + z * SX * SY];
+
+            // Slow path: neighbor lookup
             if (!Nbh) return EVoxelBlockID::Air;
 
-            if (z < 0)       return (Nbh->bHasZNeg && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZNeg[x + y * SX] : EVoxelBlockID::Air;
-            if (z >= SZ)     return (Nbh->bHasZPos && x >= 0 && x < SX && y >= 0 && y < SY) ? Nbh->ZPos[x + y * SX] : EVoxelBlockID::Air;
-            if (x < 0)       return (Nbh->bHasXNeg && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XNeg[y + z * SY] : EVoxelBlockID::Air;
-            if (x >= SX)     return (Nbh->bHasXPos && y >= 0 && y < SY && z >= 0 && z < SZ) ? Nbh->XPos[y + z * SY] : EVoxelBlockID::Air;
-            if (y < 0)       return (Nbh->bHasYNeg && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YNeg[x + z * SX] : EVoxelBlockID::Air;
-            /* y >= SY */    return (Nbh->bHasYPos && x >= 0 && x < SX && z >= 0 && z < SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
+            if (z < 0)       return (Nbh->bHasZNeg && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY) ? Nbh->ZNeg[x + y * SX] : EVoxelBlockID::Air;
+            if (z >= SZ)     return (Nbh->bHasZPos && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY) ? Nbh->ZPos[x + y * SX] : EVoxelBlockID::Air;
+            if (x < 0)       return (Nbh->bHasXNeg && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ) ? Nbh->XNeg[y + z * SY] : EVoxelBlockID::Air;
+            if (x >= SX)     return (Nbh->bHasXPos && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ) ? Nbh->XPos[y + z * SY] : EVoxelBlockID::Air;
+            if (y < 0)       return (Nbh->bHasYNeg && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) ? Nbh->YNeg[x + z * SX] : EVoxelBlockID::Air;
+            /* y >= SY */    return (Nbh->bHasYPos && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
         };
 
     auto CatAt = [&](int32 x, int32 y, int32 z) -> uint8
         {
-            if (Inside(x, y, z))
-            {
-                const int32 idx = Idx3(x, y, z);
-                if (idx >= 0 && idx < Cats.Num())
-                    return Cats[idx];
-                return 0;
-            }
+            // OPTIMIZATION: Fast path for inside chunk
+            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return Cats[x + y * SX + z * SX * SY];
 
+            // Slow path: neighbor lookup
             if (!Nbh) return 0;
 
-            // Vertical neighbors
-            if (z < 0)
-            {
-                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZNeg)
-                {
-                    const int32 nbIdx = x + y * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->ZNeg.Num())
-                        return VoxelBlockCategory(Nbh->ZNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (z >= SZ)
-            {
-                if (x >= 0 && x < SX && y >= 0 && y < SY && Nbh->bHasZPos)
-                {
-                    const int32 nbIdx = x + y * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->ZPos.Num())
-                        return VoxelBlockCategory(Nbh->ZPos[nbIdx]);
-                }
-                return 0;
-            }
+            // Vertical neighbors - reordered for better branch prediction (Z most common)
+            if (z < 0 && Nbh->bHasZNeg && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY)
+                return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]);
+            if (z >= SZ && Nbh->bHasZPos && (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY)
+                return VoxelBlockCategory(Nbh->ZPos[x + y * SX]);
 
             // Horizontal neighbors
-            if (x < 0)
-            {
-                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXNeg)
-                {
-                    const int32 nbIdx = y + z * SY;
-                    if (nbIdx >= 0 && nbIdx < Nbh->XNeg.Num())
-                        return VoxelBlockCategory(Nbh->XNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (x >= SX)
-            {
-                if (y >= 0 && y < SY && z >= 0 && z < SZ && Nbh->bHasXPos)
-                {
-                    const int32 nbIdx = y + z * SY;
-                    if (nbIdx >= 0 && nbIdx < Nbh->XPos.Num())
-                        return VoxelBlockCategory(Nbh->XPos[nbIdx]);
-                }
-                return 0;
-            }
-            if (y < 0)
-            {
-                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYNeg)
-                {
-                    const int32 nbIdx = x + z * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->YNeg.Num())
-                        return VoxelBlockCategory(Nbh->YNeg[nbIdx]);
-                }
-                return 0;
-            }
-            if (y >= SY)
-            {
-                if (x >= 0 && x < SX && z >= 0 && z < SZ && Nbh->bHasYPos)
-                {
-                    const int32 nbIdx = x + z * SX;
-                    if (nbIdx >= 0 && nbIdx < Nbh->YPos.Num())
-                        return VoxelBlockCategory(Nbh->YPos[nbIdx]);
-                }
-                return 0;
-            }
+            if (x < 0 && Nbh->bHasXNeg && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->XNeg[y + z * SY]);
+            if (x >= SX && Nbh->bHasXPos && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->XPos[y + z * SY]);
+            if (y < 0 && Nbh->bHasYNeg && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->YNeg[x + z * SX]);
+            if (y >= SY && Nbh->bHasYPos && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ)
+                return VoxelBlockCategory(Nbh->YPos[x + z * SX]);
 
             return 0;
         };
@@ -1282,6 +1253,14 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
     // Use thread-safe local buffer instead of thread_local to prevent race conditions
     TArray<uint64> Rows;
 
+    // OPTIMIZATION: Hoist hot-path lambdas outside loops
+    auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
+    auto FaceDirFromNormal = [](const FIntVector& n)->EVoxelFaceDir {
+        if (n.X == 1) return EVoxelFaceDir::XPos; if (n.X == -1) return EVoxelFaceDir::XNeg;
+        if (n.Y == 1) return EVoxelFaceDir::YPos; if (n.Y == -1) return EVoxelFaceDir::YNeg;
+        return n.Z == 1 ? EVoxelFaceDir::ZPos : EVoxelFaceDir::ZNeg;
+    };
+
     // Process categories: solids then semis
     for (uint8 CatType : { uint8(2), uint8(1) })
     {
@@ -1293,6 +1272,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
             const FIntVector Udir = A.U;
             const FIntVector Vdir = A.V;
             const FIntVector Nrm = A.N;
+            // OPTIMIZATION: Compute face direction once per face direction
+            const EVoxelFaceDir FaceDir = FaceDirFromNormal(Nrm);
 
             for (int s = 0; s < A.Slice; ++s)
             {
@@ -1307,7 +1288,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                     Rows.Reset();
                     Rows.SetNumZeroed(A.DimV);
 
-                    // Build face-visibility masks
+                    // OPTIMIZATION: Build face-visibility masks with early empty check
+                    bool bTileHasAnyFaces = false;
                     for (int v = 0; v < A.DimV; ++v)
                     {
                         uint64 bits = 0ull;
@@ -1322,10 +1304,13 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             bits |= (uint64)visible << du;
                         }
 
-                        // SAFETY: Bounds check
-                        if (v >= 0 && v < Rows.Num())
-                            Rows[v] = bits;
+                        Rows[v] = bits;
+                        bTileHasAnyFaces |= (bits != 0);
                     }
+
+                    // OPTIMIZATION: Skip greedy merging entirely if this tile has no faces
+                    if (!bTileHasAnyFaces)
+                        continue;
 
                     // Greedy merge rectangles
                     for (int v = 0; v < A.DimV; ++v)
@@ -1338,20 +1323,14 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
 
                         while (row)
                         {
-                            // Count trailing zeros (find first set bit)
-                            int du0 = 0;
-                            uint64 temp = row;
-                            while ((temp & 1ull) == 0ull && du0 < 64)
-                            {
-                                temp >>= 1;
-                                ++du0;
-                            }
+                            // OPTIMIZATION: Use CTZ64 intrinsic instead of manual loop
+                            const int du0 = CTZ64(row);
                             if (du0 >= 64) break;
 
                             // Count consecutive ones - but stop if block ID changes
                             const uint64 run = row >> du0;
                             int w = 0;
-                            temp = run;
+                            uint64 temp = run;
 
                             // Get the base block ID for the first visible face
                             const int u0 = uTile + du0;
@@ -1418,12 +1397,6 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             // Emit quad
                             const FIntVector FaceBaseGrid = MakeP(Nrm, s, u0, v)
                                 + FIntVector(FMath::Max(0, Nrm.X), FMath::Max(0, Nrm.Y), FMath::Max(0, Nrm.Z));
-                            auto FaceDirFromNormal = [](const FIntVector& n)->EVoxelFaceDir {
-                                if (n.X == 1) return EVoxelFaceDir::XPos; if (n.X == -1) return EVoxelFaceDir::XNeg;
-                                if (n.Y == 1) return EVoxelFaceDir::YPos; if (n.Y == -1) return EVoxelFaceDir::YNeg;
-                                return n.Z == 1 ? EVoxelFaceDir::ZPos : EVoxelFaceDir::ZNeg;
-                                };
-                            const EVoxelFaceDir FaceDir = FaceDirFromNormal(Nrm);
                             const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBaseGrid.X, FaceBaseGrid.Y, FaceBaseGrid.Z, FaceDir);
                             const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, Owner), 0, 255) : 0;
 
@@ -1461,7 +1434,6 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
                             Out.UVs.Add(FVector2D(0, (float)h));
 
                             // AO→bytes, layer in A
-                            auto ToByte = [](float v)->uint8 { return (uint8)FMath::Clamp((int32)(v * 255.f + 0.5f), 0, 255); };
                             const uint8 AO00 = ToByte(ao00), AO10 = ToByte(ao10), AO11 = ToByte(ao11), AO01 = ToByte(ao01);
                             Out.Colors.Add(FColor(AO00, AO00, AO00, Layer));
                             Out.Colors.Add(FColor(AO10, AO10, AO10, Layer));
