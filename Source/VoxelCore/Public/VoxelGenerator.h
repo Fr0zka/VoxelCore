@@ -21,6 +21,7 @@ struct FChunkGenParams
     float NoiseAmplitude = 10.f;
     int32 BaseHeight = 20;
     int32 WaterLevel = 18;
+    int32 MaxCaveDepth = 200; // Maximum cave generation depth
     TWeakObjectPtr<class UVoxelMaterialSet> MaterialSet;
     TWeakObjectPtr<class UVoxelBlockTable>  BlockTable;
     TWeakObjectPtr<class UVoxelBiomeTable>  BiomeTable;

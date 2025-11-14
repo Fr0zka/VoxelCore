@@ -265,7 +265,7 @@ float FVoxelNoiseContext::Density3D(float x, float y, float zWorld,
 // BIOME-AWARE TERRAIN GENERATION (Per-Biome Parameters)
 // ============================================================================
 
-float FVoxelNoiseContext::Sample01_2D_Custom(float x, float y, int32 octaves) const
+float FVoxelNoiseContext::Sample01_2D_Custom(float x, float y, int32 octaves, float lacunarity, float gain) const
 {
 	if (octaves <= 0) return 0.5f;
 
@@ -274,9 +274,7 @@ float FVoxelNoiseContext::Sample01_2D_Custom(float x, float y, int32 octaves) co
 	float amp = 1.f;
 	float freq = 1.f;
 
-	const float lacunarity = 2.0f;
-	const float gain = 0.5f;
-
+	// Use biome-specific lacunarity and gain (passed as parameters)
 	for (int32 i = 0; i < octaves; ++i)
 	{
 		sum += FMath::PerlinNoise2D(FVector2D(x * freq, y * freq)) * amp;
@@ -291,11 +289,13 @@ float FVoxelNoiseContext::Sample01_2D_Custom(float x, float y, int32 octaves) co
 
 float FVoxelNoiseContext::HeightAbs_Biome(float x, float y, int32 baseH, const FBiomeTerrainParams& Params) const
 {
-	// Use biome-specific frequency, octaves, and amplitude
+	// Use biome-specific frequency, octaves, amplitude, lacunarity, and gain
 	const float n01 = Sample01_2D_Custom(
 		x * Params.HeightFrequency,
 		y * Params.HeightFrequency,
-		Params.HeightOctaves);
+		Params.HeightOctaves,
+		Params.HeightLacunarity,
+		Params.HeightGain);
 
 	return baseH + (n01 - 0.5f) * 2.0f * Params.HeightAmplitude;
 }

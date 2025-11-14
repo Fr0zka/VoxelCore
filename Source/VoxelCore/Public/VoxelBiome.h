@@ -103,6 +103,14 @@ struct VOXELCORE_API FBiomeTerrainParams {
     UPROPERTY(EditAnywhere, Category="Terrain|3D Features|Islands", meta=(ClampMin="0.0", ClampMax="1.0"))
     float IslandThreshold = 0.55f;
 
+    // Floating island vertical band center (altitude where islands are most common)
+    UPROPERTY(EditAnywhere, Category="Terrain|3D Features|Islands", meta=(ClampMin="-500.0", ClampMax="500.0"))
+    float IslandBandCenterZ = 72.0f;
+
+    // Floating island vertical band half-thickness (vertical range where islands can spawn)
+    UPROPERTY(EditAnywhere, Category="Terrain|3D Features|Islands", meta=(ClampMin="1.0", ClampMax="200.0"))
+    float IslandBandHalfThickness = 18.0f;
+
     // ==================== CAVES ====================
 
     // Cave density multiplier

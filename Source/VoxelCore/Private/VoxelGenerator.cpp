@@ -92,6 +92,7 @@ FChunkGenParams UVoxelGenerator::MakeParamsFromSettings(const UVoxelSettings* S)
     P.NoiseAmplitude = S ? S->NoiseAmplitude : 10.f;
     P.BaseHeight = S ? S->BaseHeight : 20;
     P.WaterLevel = S ? S->WaterLevel : 18;
+    P.MaxCaveDepth = S ? S->MaxCaveDepth : 200;
 
     P.MaterialSet = LoadSoft(S ? S->MaterialSet : TSoftObjectPtr<UVoxelMaterialSet>{}, TEXT("MaterialSet"));
     P.BlockTable = LoadSoft(S ? S->BlockTable : TSoftObjectPtr<UVoxelBlockTable>{}, TEXT("BlockTable"));

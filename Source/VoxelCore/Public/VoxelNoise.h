@@ -103,7 +103,7 @@ struct FVoxelNoiseContext
     float MacroSurfaceZ(float x, float y, int32 BaseHeight, float HeightAmp) const; // H2D + mountains
 
     // NEW: Biome-aware terrain generation functions
-    float Sample01_2D_Custom(float x, float y, int32 octaves) const;
+    float Sample01_2D_Custom(float x, float y, int32 octaves, float lacunarity, float gain) const;
     float HeightAbs_Biome(float x, float y, int32 baseH, const struct FBiomeTerrainParams& Params) const;
     float MacroSurfaceZ_Biome(float x, float y, int32 BaseHeight, const struct FBiomeTerrainParams& Params) const;
     bool  IsCave_Biome(float x, float y, float zWorld, float terrainH, const struct FBiomeTerrainParams& Params) const;

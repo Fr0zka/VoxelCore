@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 #include "VoxelStructs.h"
 #include "VoxelBiome.h"
+#include "RHIGPUReadback.h"
 
 /**
  * GPU Generator - Executes voxel terrain generation on GPU using compute shaders.
@@ -22,7 +23,7 @@
  *
  * Workflow:
  * 1. Dispatch compute shader to generate voxel categories on GPU
- * 2. Async readback results to CPU (continues in background)
+ * 2. Poll for readback completion each frame (non-blocking)
  * 3. Callback when data ready - proceed to meshing
  */
 class VOXELCORE_API FVoxelGPUGenerator
@@ -32,7 +33,8 @@ public:
      * Generate voxel chunk categories using GPU compute shader.
      *
      * @param Coord - Chunk coordinate
-     * @param SizeX/Y/Z - Chunk dimensions
+     * @param SizeX/Y/Z - Chunk dimensions (LOD-scaled + halo)
+     * @param BaseSizeX/Y/Z - Base chunk size (unscaled, for world coordinate calculation)
      * @param LODScaleXY - LOD scale factor (1 for LOD0, 2+ for LOD1)
      * @param Seed - World seed for noise generation
      * @param BaseHeight - Base terrain height
@@ -44,12 +46,14 @@ public:
     static void GenerateChunkGPU(
         const FVoxelCoord& Coord,
         int32 SizeX, int32 SizeY, int32 SizeZ,
+        int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
         int32 LODScaleXY,
         int32 Seed,
         int32 BaseHeight,
         int32 WaterLevel,
         int32 MaxCaveDepth,
-        const FBiomeTerrainParams& BiomeParams,
+        const class UVoxelBiomeTable* BiomeTable,
+        const class UVoxelNoiseProfile* NoiseProfile,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 
     /**
@@ -58,18 +62,83 @@ public:
      */
     static bool IsGPUGenerationAvailable();
 
+    /**
+     * Tick GPU generation jobs (poll for readback completion).
+     * Call this every frame from VoxelWorld to process pending GPU jobs.
+     */
+    static void TickGPUGenerationJobs();
+
 private:
+    struct FGPUBiomeData
+    {
+        // Climate ranges for biome selection
+        float TempMin;
+        float TempMax;
+        float MoistMin;
+        float MoistMax;
+
+        // Height parameters
+        float HeightAmplitude;
+        float HeightFrequency;
+        int32 HeightOctaves;
+        float HeightLacunarity;
+        float HeightGain;
+
+        // Mountain parameters
+        float MountainAmplitude;
+        float MountainFrequency;
+        float MountainThreshold;
+        float MountainSharpness;
+
+        // 3D features
+        float OverhangAmplitude;
+        float OverhangFrequency;
+        float WarpAmplitude;
+        float WarpFrequency;
+        float IslandAmplitude;
+        float IslandFrequency;
+        float IslandThreshold;
+        float IslandBandCenterZ;
+        float IslandBandHalfThickness;
+
+        // Cave parameters
+        float CaveDensity;
+        float CaveFrequency2D;
+        int32 CaveOctaves2D;
+        float CaveLacunarity2D;
+        float CaveGain2D;
+        float CaveFrequency3D;
+        int32 CaveOctaves3D;
+    };
+    /**
+     * GPU generation job - tracks pending async readback.
+     */
+    struct FGPUGenerationJob
+    {
+        TUniquePtr<FRHIGPUBufferReadback> Readback;
+        int32 BufferSizeBytes = 0;
+        TFunction<void(TArray<uint8>&&)> OnComplete;
+    };
+
+    // Pending GPU generation jobs (polled each frame)
+    static TArray<TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>> PendingJobs;
+    static FCriticalSection JobsMutex;
+
     /**
      * Internal implementation - dispatches compute shader on render thread.
      */
     static void DispatchGenerationShader_RenderThread(
         const FVoxelCoord& Coord,
         int32 SizeX, int32 SizeY, int32 SizeZ,
+        int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
         int32 LODScaleXY,
         int32 Seed,
         int32 BaseHeight,
         int32 WaterLevel,
         int32 MaxCaveDepth,
-        const FBiomeTerrainParams& BiomeParams,
+        float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
+        float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
+        const TArray<FGPUBiomeData>& BiomeDataArray,
         TFunction<void(TArray<uint8>&&)> OnComplete);
 };
+

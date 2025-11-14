@@ -14,9 +14,15 @@
 #include "ShaderParameterStruct.h"
 #include "GlobalShader.h"
 #include "RenderingThread.h"
-
+#include "VoxelNoise.h"
 // Async and Threading
 #include "Async/Async.h"
+
+// ============================================================================
+// BIOME DATA STRUCTURE (must match shader BiomeData struct layout exactly)
+// ============================================================================
+
+
 
 // ============================================================================
 // COMPUTE SHADER BINDING
@@ -54,36 +60,25 @@ public:
         SHADER_PARAMETER(int32, WaterLevel)
         SHADER_PARAMETER(int32, MaxCaveDepth)
 
-        // Biome terrain parameters - Height
-        SHADER_PARAMETER(float, HeightAmplitude)
-        SHADER_PARAMETER(float, HeightFrequency)
-        SHADER_PARAMETER(int32, HeightOctaves)
-        SHADER_PARAMETER(float, HeightLacunarity)
-        SHADER_PARAMETER(float, HeightGain)
+        // Climate noise parameters (Temperature)
+        SHADER_PARAMETER(float, TempBaseFreq)
+        SHADER_PARAMETER(int32, TempOctaves)
+        SHADER_PARAMETER(float, TempLacunarity)
+        SHADER_PARAMETER(float, TempGain)
+        SHADER_PARAMETER(float, TempWarpStrength)
+        SHADER_PARAMETER(int32, TempSeedOffset)
 
-        // Biome terrain parameters - Mountains
-        SHADER_PARAMETER(float, MountainAmplitude)
-        SHADER_PARAMETER(float, MountainFrequency)
-        SHADER_PARAMETER(float, MountainThreshold)
-        SHADER_PARAMETER(float, MountainSharpness)
+        // Climate noise parameters (Moisture)
+        SHADER_PARAMETER(float, MoistBaseFreq)
+        SHADER_PARAMETER(int32, MoistOctaves)
+        SHADER_PARAMETER(float, MoistLacunarity)
+        SHADER_PARAMETER(float, MoistGain)
+        SHADER_PARAMETER(float, MoistWarpStrength)
+        SHADER_PARAMETER(int32, MoistSeedOffset)
 
-        // Biome terrain parameters - 3D Features
-        SHADER_PARAMETER(float, OverhangAmplitude)
-        SHADER_PARAMETER(float, OverhangFrequency)
-        SHADER_PARAMETER(float, WarpAmplitude)
-        SHADER_PARAMETER(float, WarpFrequency)
-        SHADER_PARAMETER(float, IslandAmplitude)
-        SHADER_PARAMETER(float, IslandFrequency)
-        SHADER_PARAMETER(float, IslandThreshold)
-
-        // Biome terrain parameters - Caves
-        SHADER_PARAMETER(float, CaveDensity)
-        SHADER_PARAMETER(float, CaveFrequency2D)
-        SHADER_PARAMETER(int32, CaveOctaves2D)
-        SHADER_PARAMETER(float, CaveLacunarity2D)
-        SHADER_PARAMETER(float, CaveGain2D)
-        SHADER_PARAMETER(float, CaveFrequency3D)
-        SHADER_PARAMETER(int32, CaveOctaves3D)
+        // Biome array (structured buffer for per-column biome selection)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUBiomeData>, Biomes)
+        SHADER_PARAMETER(uint32, BiomeCount)
 
         // Output buffer
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCategories)
@@ -105,24 +100,117 @@ public:
 IMPLEMENT_GLOBAL_SHADER(FVoxelGenerationCS, "/Plugin/VoxelCore/VoxelGenerationCS.usf", "GenerateVoxelChunk", SF_Compute);
 
 // ============================================================================
+// STATIC MEMBERS
+// ============================================================================
+
+TArray<TSharedPtr<FVoxelGPUGenerator::FGPUGenerationJob, ESPMode::ThreadSafe>> FVoxelGPUGenerator::PendingJobs;
+FCriticalSection FVoxelGPUGenerator::JobsMutex;
+
+// ============================================================================
 // PUBLIC API
 // ============================================================================
 
 bool FVoxelGPUGenerator::IsGPUGenerationAvailable()
 {
     // Check if compute shaders are supported on this platform
-    return GSupportsComputeShaders && FApp::CanEverRender();
+    // GMaxRHIFeatureLevel must be at least SM5 (ERHIFeatureLevel::SM5) for compute shaders
+    return FApp::CanEverRender() && (GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5);
+}
+
+void FVoxelGPUGenerator::TickGPUGenerationJobs()
+{
+    QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelGPU_TickGeneration);
+
+    TArray<TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>> CompletedJobs;
+
+    {
+        FScopeLock Lock(&JobsMutex);
+
+        // Check each pending job
+        for (int32 Index = PendingJobs.Num() - 1; Index >= 0; --Index)
+        {
+            TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = PendingJobs[Index];
+            if (!Job.IsValid() || !Job->Readback)
+            {
+                PendingJobs.RemoveAtSwap(Index);
+                continue;
+            }
+
+            // Check if readback is ready (non-blocking)
+            if (!Job->Readback->IsReady())
+            {
+                continue; // Not ready yet - check next frame
+            }
+
+            // Readback is ready - move to completed list
+            PendingJobs.RemoveAtSwap(Index);
+            CompletedJobs.Add(Job);
+        }
+    }
+
+    // Process completed jobs (lock and copy data on render thread)
+    // IMPORTANT: Jobs in CompletedJobs have already passed IsReady() check,
+    // so they are safe to lock on the render thread
+    for (TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>& Job : CompletedJobs)
+    {
+        if (!Job.IsValid())
+            continue;
+
+        // Capture job data for async processing
+        TFunction<void(TArray<uint8>&&)> OnComplete = Job->OnComplete;
+        int32 BufferSizeBytes = Job->BufferSizeBytes;
+
+        // CRITICAL: Move ownership of readback to render thread command
+        // This keeps the readback alive until the command executes
+        FRHIGPUBufferReadback* ReadbackPtr = Job->Readback.Release();
+
+        // Enqueue render command to lock and copy data (Lock MUST be on render thread)
+        ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
+            [ReadbackPtr, BufferSizeBytes, OnComplete](FRHICommandListImmediate& RHICmdList)
+            {
+                // Allocate output buffer on render thread
+                TArray<uint8> CategoryData;
+                CategoryData.SetNumUninitialized(BufferSizeBytes);
+
+                // Lock and copy GPU data (safe because IsReady() already passed)
+                const uint32* BufferPtr = (const uint32*)ReadbackPtr->Lock(BufferSizeBytes);
+                if (BufferPtr)
+                {
+                    FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
+                    ReadbackPtr->Unlock();
+
+                    // Call completion callback on game thread (async task)
+                    if (OnComplete)
+                    {
+                        AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData = MoveTemp(CategoryData)]() mutable
+                        {
+                            OnComplete(MoveTemp(CategoryData));
+                        });
+                    }
+                }
+                else
+                {
+                    // Lock failed - log error
+                    UE_LOG(LogTemp, Error, TEXT("VoxelGPU: Failed to lock readback buffer!"));
+                }
+
+                // Clean up readback buffer (we own it now)
+                delete ReadbackPtr;
+            });
+    }
 }
 
 void FVoxelGPUGenerator::GenerateChunkGPU(
     const FVoxelCoord& Coord,
     int32 SizeX, int32 SizeY, int32 SizeZ,
+    int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
     int32 LODScaleXY,
     int32 Seed,
     int32 BaseHeight,
     int32 WaterLevel,
     int32 MaxCaveDepth,
-    const FBiomeTerrainParams& BiomeParams,
+    const UVoxelBiomeTable* BiomeTable,
+    const UVoxelNoiseProfile* NoiseProfile,
     TFunction<void(TArray<uint8>&&)> OnComplete)
 {
     // Validate GPU availability
@@ -133,11 +221,122 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         return;
     }
 
+    // Convert UVoxelBiomeTable to TArray<FGPUBiomeData> on game thread
+    TArray<FGPUBiomeData> BiomeDataArray;
+    if (BiomeTable && BiomeTable->Biomes.Num() > 0)
+    {
+        for (const UVoxelBiomeDef* Biome : BiomeTable->Biomes)
+        {
+            if (!Biome)
+                continue;
+
+            FGPUBiomeData Data;
+            Data.TempMin = Biome->TempMin;
+            Data.TempMax = Biome->TempMax;
+            Data.MoistMin = Biome->MoistMin;
+            Data.MoistMax = Biome->MoistMax;
+
+            // Copy all terrain parameters
+            const FBiomeTerrainParams& P = Biome->TerrainParams;
+            Data.HeightAmplitude = P.HeightAmplitude;
+            Data.HeightFrequency = P.HeightFrequency;
+            Data.HeightOctaves = P.HeightOctaves;
+            Data.HeightLacunarity = P.HeightLacunarity;
+            Data.HeightGain = P.HeightGain;
+
+            Data.MountainAmplitude = P.MountainAmplitude;
+            Data.MountainFrequency = P.MountainFrequency;
+            Data.MountainThreshold = P.MountainThreshold;
+            Data.MountainSharpness = P.MountainSharpness;
+
+            Data.OverhangAmplitude = P.OverhangAmplitude;
+            Data.OverhangFrequency = P.OverhangFrequency;
+            Data.WarpAmplitude = P.WarpAmplitude;
+            Data.WarpFrequency = P.WarpFrequency;
+            Data.IslandAmplitude = P.IslandAmplitude;
+            Data.IslandFrequency = P.IslandFrequency;
+            Data.IslandThreshold = P.IslandThreshold;
+            Data.IslandBandCenterZ = P.IslandBandCenterZ;
+            Data.IslandBandHalfThickness = P.IslandBandHalfThickness;
+
+            Data.CaveDensity = P.CaveDensity;
+            Data.CaveFrequency2D = P.CaveFrequency2D;
+            Data.CaveOctaves2D = P.CaveOctaves2D;
+            Data.CaveLacunarity2D = P.CaveLacunarity2D;
+            Data.CaveGain2D = P.CaveGain2D;
+            Data.CaveFrequency3D = P.CaveFrequency3D;
+            Data.CaveOctaves3D = P.CaveOctaves3D;
+
+            BiomeDataArray.Add(Data);
+        }
+    }
+
+    // Fallback: Create default biome if table is empty
+    if (BiomeDataArray.Num() == 0)
+    {
+        FGPUBiomeData DefaultData;
+        FMemory::Memzero(DefaultData);
+
+        // Default climate range (accepts all)
+        DefaultData.TempMin = 0.0f;
+        DefaultData.TempMax = 1.0f;
+        DefaultData.MoistMin = 0.0f;
+        DefaultData.MoistMax = 1.0f;
+
+        // Default terrain parameters
+        FBiomeTerrainParams DefaultParams;
+        DefaultData.HeightAmplitude = DefaultParams.HeightAmplitude;
+        DefaultData.HeightFrequency = DefaultParams.HeightFrequency;
+        DefaultData.HeightOctaves = DefaultParams.HeightOctaves;
+        DefaultData.HeightLacunarity = DefaultParams.HeightLacunarity;
+        DefaultData.HeightGain = DefaultParams.HeightGain;
+
+        BiomeDataArray.Add(DefaultData);
+    }
+
+    // Extract climate noise parameters from NoiseProfile (if available)
+    float TempBaseFreq = 1.0f / 256.0f;      // Default fallback
+    int32 TempOctaves = 3;
+    float TempLacunarity = 2.0f;
+    float TempGain = 0.5f;
+    float TempWarpStrength = 0.0f;
+    int32 TempSeedOffset = 0;
+
+    float MoistBaseFreq = 1.0f / 192.0f;     // Default fallback
+    int32 MoistOctaves = 3;
+    float MoistLacunarity = 2.0f;
+    float MoistGain = 0.5f;
+    float MoistWarpStrength = 0.0f;
+    int32 MoistSeedOffset = 0;
+
+    if (NoiseProfile)
+    {
+        TempBaseFreq = NoiseProfile->Temperature.BaseFreq;
+        TempOctaves = NoiseProfile->Temperature.Octaves;
+        TempLacunarity = NoiseProfile->Temperature.Lacunarity;
+        TempGain = NoiseProfile->Temperature.Gain;
+        TempWarpStrength = NoiseProfile->Temperature.WarpStrength;
+        TempSeedOffset = NoiseProfile->Temperature.SeedOffset;
+
+        MoistBaseFreq = NoiseProfile->Moisture.BaseFreq;
+        MoistOctaves = NoiseProfile->Moisture.Octaves;
+        MoistLacunarity = NoiseProfile->Moisture.Lacunarity;
+        MoistGain = NoiseProfile->Moisture.Gain;
+        MoistWarpStrength = NoiseProfile->Moisture.WarpStrength;
+        MoistSeedOffset = NoiseProfile->Moisture.SeedOffset;
+    }
+
     // Enqueue work on render thread
     ENQUEUE_RENDER_COMMAND(VoxelGPUGeneration)(
-        [Coord, SizeX, SizeY, SizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete](FRHICommandListImmediate& RHICmdList)
+        [Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
+         TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
+         MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
+         BiomeDataArray, OnComplete](FRHICommandListImmediate& RHICmdList)
         {
-            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete);
+            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
+                TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
+                MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
+                BiomeDataArray, OnComplete);
         });
 }
 
@@ -148,12 +347,15 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
 void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     const FVoxelCoord& Coord,
     int32 SizeX, int32 SizeY, int32 SizeZ,
+    int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
     int32 LODScaleXY,
     int32 Seed,
     int32 BaseHeight,
     int32 WaterLevel,
     int32 MaxCaveDepth,
-    const FBiomeTerrainParams& BiomeParams,
+    float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
+    float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
+    const TArray<FGPUBiomeData>& BiomeDataArray,
     TFunction<void(TArray<uint8>&&)> OnComplete)
 {
     check(IsInRenderingThread());
@@ -174,6 +376,21 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     FRDGBufferUAVRef OutputUAV = GraphBuilder.CreateUAV(OutputBuffer, PF_R32_UINT);
 
+    // CRITICAL: Clear output buffer to zero (prevents garbage data)
+    AddClearUAVPass(GraphBuilder, OutputUAV, 0u);
+
+    // Create biome data buffer
+    const int32 BiomeCount = BiomeDataArray.Num();
+    FRDGBufferRef BiomeBuffer = GraphBuilder.CreateBuffer(
+        FRDGBufferDesc::CreateStructuredDesc(sizeof(FGPUBiomeData), BiomeCount),
+        TEXT("BiomeDataBuffer"));
+
+    // Upload biome data to GPU
+    GraphBuilder.QueueBufferUpload(BiomeBuffer, BiomeDataArray.GetData(),
+        BiomeCount * sizeof(FGPUBiomeData));
+
+    FRDGBufferSRVRef BiomeSRV = GraphBuilder.CreateSRV(BiomeBuffer);
+
     // Get shader from global shader map
     TShaderMapRef<FVoxelGenerationCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
@@ -185,10 +402,12 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->SizeY = SizeY;
     PassParameters->SizeZ = SizeZ;
 
-    // World position
-    PassParameters->BaseWX = Coord.Cx * SizeX;
-    PassParameters->BaseWY = Coord.Cy * SizeY;
-    PassParameters->BaseWZ = Coord.Cz * SizeZ;
+    // World position calculation (CRITICAL: must match CPU exactly!)
+    // CPU uses: BaseWX = Coord.Cx * P.SizeX (base unscaled chunk size)
+    // GPU must do the same - use BaseSizeX/Y/Z (NOT VoxelGridSize * LODScale!)
+    PassParameters->BaseWX = Coord.Cx * BaseSizeX;
+    PassParameters->BaseWY = Coord.Cy * BaseSizeY;
+    PassParameters->BaseWZ = Coord.Cz * BaseSizeZ;
 
     // LOD scale
     PassParameters->LODScaleXY = LODScaleXY;
@@ -199,36 +418,27 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->WaterLevel = WaterLevel;
     PassParameters->MaxCaveDepth = MaxCaveDepth;
 
-    // Biome parameters - Height
-    PassParameters->HeightAmplitude = BiomeParams.HeightAmplitude;
-    PassParameters->HeightFrequency = BiomeParams.HeightFrequency;
-    PassParameters->HeightOctaves = BiomeParams.HeightOctaves;
-    PassParameters->HeightLacunarity = BiomeParams.HeightLacunarity;
-    PassParameters->HeightGain = BiomeParams.HeightGain;
+    // Climate noise parameters
+    PassParameters->TempBaseFreq = TempBaseFreq;
+    PassParameters->TempOctaves = TempOctaves;
+    PassParameters->TempLacunarity = TempLacunarity;
+    PassParameters->TempGain = TempGain;
+    PassParameters->TempWarpStrength = TempWarpStrength;
+    PassParameters->TempSeedOffset = TempSeedOffset;
 
-    // Biome parameters - Mountains
-    PassParameters->MountainAmplitude = BiomeParams.MountainAmplitude;
-    PassParameters->MountainFrequency = BiomeParams.MountainFrequency;
-    PassParameters->MountainThreshold = BiomeParams.MountainThreshold;
-    PassParameters->MountainSharpness = BiomeParams.MountainSharpness;
+    PassParameters->MoistBaseFreq = MoistBaseFreq;
+    PassParameters->MoistOctaves = MoistOctaves;
+    PassParameters->MoistLacunarity = MoistLacunarity;
+    PassParameters->MoistGain = MoistGain;
+    PassParameters->MoistWarpStrength = MoistWarpStrength;
+    PassParameters->MoistSeedOffset = MoistSeedOffset;
 
-    // Biome parameters - 3D Features
-    PassParameters->OverhangAmplitude = BiomeParams.OverhangAmplitude;
-    PassParameters->OverhangFrequency = BiomeParams.OverhangFrequency;
-    PassParameters->WarpAmplitude = BiomeParams.WarpAmplitude;
-    PassParameters->WarpFrequency = BiomeParams.WarpFrequency;
-    PassParameters->IslandAmplitude = BiomeParams.IslandAmplitude;
-    PassParameters->IslandFrequency = BiomeParams.IslandFrequency;
-    PassParameters->IslandThreshold = BiomeParams.IslandThreshold;
+    // Biome array for per-column selection
+    PassParameters->Biomes = BiomeSRV;
+    PassParameters->BiomeCount = BiomeCount;
 
-    // Biome parameters - Caves
-    PassParameters->CaveDensity = BiomeParams.CaveDensity;
-    PassParameters->CaveFrequency2D = BiomeParams.CaveFrequency2D;
-    PassParameters->CaveOctaves2D = BiomeParams.CaveOctaves2D;
-    PassParameters->CaveLacunarity2D = BiomeParams.CaveLacunarity2D;
-    PassParameters->CaveGain2D = BiomeParams.CaveGain2D;
-    PassParameters->CaveFrequency3D = BiomeParams.CaveFrequency3D;
-    PassParameters->CaveOctaves3D = BiomeParams.CaveOctaves3D;
+    // DIAGNOSTIC: Log biome count
+    UE_LOG(LogTemp, Warning, TEXT("GPU Generation: Using %d biomes for per-column selection"), BiomeCount);
 
     // Output buffer
     PassParameters->OutCategories = OutputUAV;
@@ -261,27 +471,15 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     GraphBuilder.Execute();
 
-    // Poll for readback completion on game thread
-    AsyncTask(ENamedThreads::GameThread, [Readback, BufferSizeBytes, OnComplete]()
-        {
-            // Poll until GPU readback is complete (non-blocking)
-            while (!Readback->IsReady())
-            {
-                FPlatformProcess::Sleep(0.001f); // 1ms sleep
-            }
+    // Create job to track async readback (polled each frame, non-blocking)
+    TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = MakeShared<FGPUGenerationJob, ESPMode::ThreadSafe>();
+    Job->Readback = TUniquePtr<FRHIGPUBufferReadback>(Readback);
+    Job->BufferSizeBytes = BufferSizeBytes;
+    Job->OnComplete = OnComplete;
 
-            // Read data from GPU
-            TArray<uint8> CategoryData;
-            CategoryData.SetNumUninitialized(BufferSizeBytes);
-
-            const uint32* BufferPtr = (const uint32*)Readback->Lock(BufferSizeBytes);
-            FMemory::Memcpy(CategoryData.GetData(), BufferPtr, BufferSizeBytes);
-            Readback->Unlock();
-
-            // Cleanup readback
-            delete Readback;
-
-            // Call completion callback with generated data
-            OnComplete(MoveTemp(CategoryData));
-        });
+    // Add to pending jobs list (will be polled by TickGPUGenerationJobs)
+    {
+        FScopeLock Lock(&JobsMutex);
+        PendingJobs.Add(Job);
+    }
 }

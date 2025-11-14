@@ -17,6 +17,7 @@
 #include "VoxelBlockTable.h"
 #include "VoxelMaterialSet.h"
 #include <VoxelBiome.h>
+#include <VoxelNoise.h>
 
 // Debug console variable for padding extraction logging
 static TAutoConsoleVariable<int32> CVarVoxelLogPadding(
@@ -110,59 +111,70 @@ void UVoxelChunkComponent::DoGeneration()
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
-        // Get biome parameters (simplified - using default biome for now)
-        FBiomeTerrainParams BiomeParams;
-        if (Params.BiomeTable.IsValid())
-        {
-            // Sample climate at chunk center to determine biome
-            const int32 CenterWX = Coord.Cx * Params.ChunkSizeX + Params.ChunkSizeX / 2;
-            const int32 CenterWY = Coord.Cy * Params.ChunkSizeY + Params.ChunkSizeY / 2;
+        // Calculate LOD-scaled grid size (CRITICAL: must match CPU path!)
+        // For LOD1+, the grid is reduced: fewer voxels cover the same world space
+        const int32 ScaledSizeX = (Params.SizeX + ScaleXY - 1) / ScaleXY;
+        const int32 ScaledSizeY = (Params.SizeY + ScaleXY - 1) / ScaleXY;
+        const int32 ScaledSizeZ = Params.SizeZ;
 
-            // Use default biome params (could be improved to sample actual biome)
-            const UVoxelBiomeDef* Biome = Params.BiomeTable->DefaultBiome;
-            if (Biome)
-            {
-                BiomeParams = Biome->TerrainParams;
-            }
-        }
-
-        // Launch GPU generation
+        // Launch GPU generation with entire BiomeTable for per-column selection
+        TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
-            Params.ChunkSizeX + 2, Params.ChunkSizeY + 2, Params.ChunkSizeZ + 2, // +2 for halo
+            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2, // +2 for halo (LOD-scaled dimensions)
+            Params.SizeX, Params.SizeY, Params.SizeZ, // Base unscaled chunk size (for world coordinate calculation)
             ScaleXY,
             Params.Seed,
             Params.BaseHeight,
             Params.WaterLevel,
             Params.MaxCaveDepth,
-            BiomeParams,
-            [this, Params, Coord, ScaleXY](TArray<uint8>&& GPUCategoryData)
+            Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
+            Params.NoiseProfile,      // Pass NoiseProfile for climate noise generation
+            [WeakThis, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
             {
+                // Check if component is still valid (might be destroyed during async generation)
+                UVoxelChunkComponent* This = WeakThis.Get();
+                if (!This || !IsValid(This))
+                {
+                    return; // Component destroyed - discard results
+                }
+
                 // GPU generation complete - copy to CategoryData
-                CategoryData.Data = MoveTemp(GPUCategoryData);
-                CategoryData.SizeX = Params.ChunkSizeX + 2;
-                CategoryData.SizeY = Params.ChunkSizeY + 2;
-                CategoryData.SizeZ = Params.ChunkSizeZ + 2;
+                This->CategoryData.Data = MoveTemp(GPUCategoryData);
+                This->CategoryData.SizeX = ScaledSizeX + 2;
+                This->CategoryData.SizeY = ScaledSizeY + 2;
+                This->CategoryData.SizeZ = ScaledSizeZ + 2;
 
                 // Generate biome grid (still on CPU for now)
-                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);
+                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
 
-                const int64 NumBytes = CategoryData.Data.Num();
+                const int64 NumBytes = This->CategoryData.Data.Num();
                 INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
 
-                if (bCancelPending)
+                if (This->bCancelPending)
                 {
-                    AsyncTask(ENamedThreads::GameThread, [this]()
+                    AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                         {
-                            if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            if (Comp && IsValid(Comp) && IsValid(Comp->OwnerWorld))
+                            {
+                                Comp->OwnerWorld->OnGenerationFinished(Comp);
+                            }
                         });
                     return;
                 }
 
-                AsyncTask(ENamedThreads::GameThread, [this]()
+                AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                     {
-                        OnGenerationComplete();
-                        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+                        UVoxelChunkComponent* Comp = WeakThis.Get();
+                        if (Comp && IsValid(Comp))
+                        {
+                            Comp->OnGenerationComplete();
+                            if (IsValid(Comp->OwnerWorld))
+                            {
+                                Comp->OwnerWorld->OnGenerationFinished(Comp);
+                            }
+                        }
                     });
             });
 
