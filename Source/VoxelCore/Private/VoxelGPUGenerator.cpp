@@ -210,6 +210,7 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
 void FVoxelGPUGenerator::GenerateChunkGPU(
     const FVoxelCoord& Coord,
     int32 SizeX, int32 SizeY, int32 SizeZ,
+    int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
     int32 LODScaleXY,
     int32 Seed,
     int32 BaseHeight,
@@ -228,9 +229,9 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
 
     // Enqueue work on render thread
     ENQUEUE_RENDER_COMMAND(VoxelGPUGeneration)(
-        [Coord, SizeX, SizeY, SizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete](FRHICommandListImmediate& RHICmdList)
+        [Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete](FRHICommandListImmediate& RHICmdList)
         {
-            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete);
+            DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth, BiomeParams, OnComplete);
         });
 }
 
@@ -241,6 +242,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
 void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     const FVoxelCoord& Coord,
     int32 SizeX, int32 SizeY, int32 SizeZ,
+    int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
     int32 LODScaleXY,
     int32 Seed,
     int32 BaseHeight,
@@ -281,23 +283,12 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     PassParameters->SizeY = SizeY;
     PassParameters->SizeZ = SizeZ;
 
-    // World position calculation
-    // SizeX/Y/Z includes the +2 halo, so (SizeX-2) = actual voxel grid size
-    // Chunk world size = voxel grid size * LOD scale
-    // Example: LOD0 has 16 voxels covering 16 world units (16*1=16)
-    //          LOD1 has 8 voxels covering 16 world units (8*2=16)
-    const int32 VoxelGridSizeX = SizeX - 2;
-    const int32 VoxelGridSizeY = SizeY - 2;
-    const int32 VoxelGridSizeZ = SizeZ - 2;
-
-    const int32 ChunkWorldSizeX = VoxelGridSizeX * LODScaleXY;
-    const int32 ChunkWorldSizeY = VoxelGridSizeY * LODScaleXY;
-    const int32 ChunkWorldSizeZ = VoxelGridSizeZ; // Z never scales
-
-    // BaseWX/Y/Z = world coordinate of the chunk origin (matches CPU calculation)
-    PassParameters->BaseWX = Coord.Cx * ChunkWorldSizeX;
-    PassParameters->BaseWY = Coord.Cy * ChunkWorldSizeY;
-    PassParameters->BaseWZ = Coord.Cz * ChunkWorldSizeZ;
+    // World position calculation (CRITICAL: must match CPU exactly!)
+    // CPU uses: BaseWX = Coord.Cx * P.SizeX (base unscaled chunk size)
+    // GPU must do the same - use BaseSizeX/Y/Z (NOT VoxelGridSize * LODScale!)
+    PassParameters->BaseWX = Coord.Cx * BaseSizeX;
+    PassParameters->BaseWY = Coord.Cy * BaseSizeY;
+    PassParameters->BaseWZ = Coord.Cz * BaseSizeZ;
 
     // LOD scale
     PassParameters->LODScaleXY = LODScaleXY;

@@ -150,7 +150,8 @@ void UVoxelChunkComponent::DoGeneration()
         TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
         FVoxelGPUGenerator::GenerateChunkGPU(
             Coord,
-            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2, // +2 for halo
+            ScaledSizeX + 2, ScaledSizeY + 2, ScaledSizeZ + 2, // +2 for halo (LOD-scaled dimensions)
+            Params.SizeX, Params.SizeY, Params.SizeZ, // Base unscaled chunk size (for world coordinate calculation)
             ScaleXY,
             Params.Seed,
             Params.BaseHeight,

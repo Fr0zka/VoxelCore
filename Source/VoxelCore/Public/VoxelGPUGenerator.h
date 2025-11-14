@@ -33,7 +33,8 @@ public:
      * Generate voxel chunk categories using GPU compute shader.
      *
      * @param Coord - Chunk coordinate
-     * @param SizeX/Y/Z - Chunk dimensions
+     * @param SizeX/Y/Z - Chunk dimensions (LOD-scaled + halo)
+     * @param BaseSizeX/Y/Z - Base chunk size (unscaled, for world coordinate calculation)
      * @param LODScaleXY - LOD scale factor (1 for LOD0, 2+ for LOD1)
      * @param Seed - World seed for noise generation
      * @param BaseHeight - Base terrain height
@@ -45,6 +46,7 @@ public:
     static void GenerateChunkGPU(
         const FVoxelCoord& Coord,
         int32 SizeX, int32 SizeY, int32 SizeZ,
+        int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
         int32 LODScaleXY,
         int32 Seed,
         int32 BaseHeight,
@@ -86,6 +88,7 @@ private:
     static void DispatchGenerationShader_RenderThread(
         const FVoxelCoord& Coord,
         int32 SizeX, int32 SizeY, int32 SizeZ,
+        int32 BaseSizeX, int32 BaseSizeY, int32 BaseSizeZ,
         int32 LODScaleXY,
         int32 Seed,
         int32 BaseHeight,
