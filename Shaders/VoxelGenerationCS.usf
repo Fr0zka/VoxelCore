@@ -310,9 +310,12 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     #endif // End debug mode / full generation
 
     // Pack category into output buffer (2 bits per voxel)
+    // The buffer is uint32[], but we're packing to match CPU's byte-array layout
+    // 4 voxels per byte = 16 voxels per uint32
     uint LinearIndex = ThreadId.x + ThreadId.y * SizeX + ThreadId.z * SizeX * SizeY;
-    uint ByteIndex = LinearIndex / 4;
-    uint BitOffset = (LinearIndex % 4) * 2;
+    uint BitIndex = LinearIndex * 2;  // Each voxel uses 2 bits
+    uint Uint32Index = BitIndex / 32; // Which uint32 in the buffer
+    uint BitOffset = BitIndex % 32;   // Bit position within that uint32
 
     // Fast atomic write (buffer is pre-cleared to zero)
     // Category 0 (air) is already zero, so skip write
@@ -320,6 +323,6 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     if (Category != 0)
     {
         uint Value = Category << BitOffset;
-        InterlockedOr(OutCategories[ByteIndex], Value);
+        InterlockedOr(OutCategories[Uint32Index], Value);
     }
 }
