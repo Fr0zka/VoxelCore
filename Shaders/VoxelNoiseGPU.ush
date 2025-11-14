@@ -55,13 +55,17 @@ float Grad(int hash, float x, float y, float z)
     return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
 }
 
-// 2D gradient
+// 2D gradient - matches Ken Perlin's improved noise reference implementation
+// This should closely match Unreal's FMath::PerlinNoise2D
 float Grad2D(int hash, float x, float y)
 {
-    int h = hash & 7;
-    float u = h < 4 ? x : y;
-    float v = h < 4 ? y : x;
-    return ((h & 1) ? -u : u) + ((h & 2) ? -2.0 * v : 2.0 * v);
+    // Ken Perlin's gradient selection for 2D
+    // Uses 4 gradient vectors: (1,1), (-1,1), (1,-1), (-1,-1)
+    // These are the diagonals of a square
+    int h = hash & 3;  // Modulo 4
+    float u = (h == 0 || h == 2) ? x : -x;  // h=0,2: x,  h=1,3: -x
+    float v = (h == 0 || h == 1) ? y : -y;  // h=0,1: y,  h=2,3: -y
+    return u + v;
 }
 
 // Hash lookup with wrapping
@@ -97,7 +101,10 @@ float PerlinNoise2D(float x, float y)
         Lerp(u, Grad2D(Hash(A + 1), x, y - 1), Grad2D(Hash(B + 1), x - 1, y - 1))
     );
 
-    return res;
+    // Scale to [-1, 1] range
+    // With diagonal gradients (1,1), (-1,1), (1,-1), (-1,-1), max output is 2
+    // So we scale by 0.5 to normalize to [-1, 1]
+    return res * 0.5;
 }
 
 // ============================================================================
