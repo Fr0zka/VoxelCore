@@ -228,23 +228,24 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint Category = 0;
 
     // ========================================================================
-    // DEBUG MODE: Simple flat terrain to test data pipeline
+    // DEBUG MODE: Checkerboard pattern to verify shader compilation
     // Change this to 0 to enable full terrain generation
     // ========================================================================
     #if 1
 
-    // Simple flat terrain at BaseHeight (no noise, no caves)
-    if (WZ <= BaseHeight)
+    // CHECKERBOARD PATTERN: Alternating solid/air every other voxel
+    // This creates an obvious visual pattern that's impossible to miss
+    // If you see ANY terrain generation that's not a perfect checkerboard,
+    // the shader DID NOT RECOMPILE and is using cached/old code!
+    bool isCheckerboard = ((WX + WY + WZ) & 1) == 0;
+
+    if (isCheckerboard)
     {
-        Category = 2; // Solid
-    }
-    else if (WZ <= WaterLevel)
-    {
-        Category = 1; // Water
+        Category = 2; // Solid (checkerboard squares)
     }
     else
     {
-        Category = 0; // Air
+        Category = 0; // Air (empty squares)
     }
 
     #else

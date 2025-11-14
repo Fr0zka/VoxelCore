@@ -110,6 +110,8 @@ void UVoxelChunkComponent::DoGeneration()
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
+        UE_LOG(LogTemp, Warning, TEXT("==== GPU PATH ENTERED for Coord(%d,%d,%d) ===="), Coord.Cx, Coord.Cy, Coord.Cz);
+
         // Get biome parameters (simplified - using first biome or default)
         FBiomeTerrainParams BiomeParams;
         if (Params.BiomeTable.IsValid() && Params.BiomeTable->Biomes.Num() > 0)
