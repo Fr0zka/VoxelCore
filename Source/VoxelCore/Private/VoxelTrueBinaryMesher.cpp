@@ -212,6 +212,11 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
         return (Nbh->bHasYPos && (unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) ? Nbh->YPos[x + z * SX] : EVoxelBlockID::Air;
     };
 
+    auto Neg = [](const FIntVector& v) -> FIntVector
+    {
+        return FIntVector(-v.X, -v.Y, -v.Z);
+    };
+
     auto SampleAO = [&](const FIntVector& P, const FIntVector& U, const FIntVector& V) -> float
     {
         if (!bUseAO) return 1.f;
@@ -274,21 +279,13 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
         const FVector Norm = FVector(Normal.X, Normal.Y, Normal.Z);
 
         // Get texture layer for this block + face
-        int32 Layer = 0;
-        if (BlockTable)
-        {
-            const FVoxelBlockDef* BlockDef = BlockTable->GetBlockDef(BlockID);
-            if (BlockDef)
-            {
-                Layer = BlockTable->GetLayerForFace(BlockID, FaceDir);
-            }
-        }
+        const uint8 Layer = BlockTable ? (uint8)FMath::Clamp(BlockTable->GetLayer(FaceDir, BlockID), 0, 255) : 0;
 
-        // AO samples
-        const float AO0 = SampleAO(Origin, SpanU, SpanV);
-        const float AO1 = SampleAO(Origin + SpanU, -SpanU, SpanV);
-        const float AO2 = SampleAO(Origin + SpanU + SpanV, -SpanU, -SpanV);
-        const float AO3 = SampleAO(Origin + SpanV, SpanU, -SpanV);
+        // AO samples (using Neg() helper to negate vectors)
+        const float AO0 = SampleAO(Origin, Neg(SpanU), Neg(SpanV));
+        const float AO1 = SampleAO(Origin + SpanU, SpanU, Neg(SpanV));
+        const float AO2 = SampleAO(Origin + SpanU + SpanV, SpanU, SpanV);
+        const float AO3 = SampleAO(Origin + SpanV, Neg(SpanU), SpanV);
 
         // Vertex positions
         const FVector V0 = BasePos;
