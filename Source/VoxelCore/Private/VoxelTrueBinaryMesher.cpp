@@ -385,7 +385,7 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                     for (int v = 0; v < A.DimV; ++v)
                     {
                         uint64 CurrentMask = 0;
-                        uint64 NeighborMask = 0;
+                        uint64 AirNeighborMask = 0;  // Tracks which neighbors are AIR (not just different)
                         const int32 RowOffset = v * uCount;
 
                         for (int du = 0; du < uCount; ++du)
@@ -400,14 +400,15 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             // Cache block ID (we'll need it for texturing)
                             BlockIDCache[RowOffset + du] = BlockAt(P.X, P.Y, P.Z);
 
-                            // Set bit if this voxel matches our category
+                            // CRITICAL FIX: Match standard greedy mesher logic
+                            // A face is visible ONLY if current=CatType AND neighbor=AIR (not just different!)
+                            // This prevents showing semi-transparent faces when neighbor is solid
                             if (VOXEL_LIKELY(Ac == CatType)) CurrentMask |= (1ull << du);
-                            if (Bc == CatType) NeighborMask |= (1ull << du);
+                            if (Bc == 0) AirNeighborMask |= (1ull << du);  // Track AIR neighbors only
                         }
 
-                        // Find visible faces using bitwise operation
-                        // A face is visible if current=CatType AND neighbor!=CatType
-                        const uint64 Visible = CurrentMask & ~NeighborMask;
+                        // Find visible faces: current=CatType AND neighbor=AIR
+                        const uint64 Visible = CurrentMask & AirNeighborMask;
 
                         VisibleMasks[v] = Visible;
                         bTileHasAnyFaces |= (Visible != 0);
