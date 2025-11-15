@@ -32,18 +32,8 @@ public class VoxelCore : ModuleRules
             bUseRTTI = true;
             bEnableExceptions = true;
 
-            // Enable fast floating-point math (SIMD-friendly)
-            // Trades strict IEEE 754 compliance for speed
-            bEnableFastMath = true;
-
-            // Enable function-level linking (better optimization)
-            bFunctionLevelLinking = true;
-
-            // Enable whole program optimization in shipping builds
-            if (Target.Configuration == UnrealTargetConfiguration.Shipping)
-            {
-                bEnableWholeProgramOptimization = true;
-            }
+            // Note: bEnableFastMath, bFunctionLevelLinking, bEnableWholeProgramOptimization
+            // are not available in this UE version - using OptimizeCode=Always instead
         }
     }
 }
