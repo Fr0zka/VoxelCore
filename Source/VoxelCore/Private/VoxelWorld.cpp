@@ -957,13 +957,12 @@ void AVoxelWorld::UpdateChunks()
 	// PROGRESSIVE LOADING: Reset spawn counter each frame
 	ChunksSpawnedThisFrame = 0;
 	const int32 SpawnBudget = FMath::Max(1, S->MaxChunksSpawnPerFrame);
-	bNeedsMoreSpawning = false;
 
 	int32 MissingChunks = 0; // Track how many chunks are not yet spawned
 
 	// MEGA OPTIMIZATION: When player hasn't moved or rotated, skip the entire update loop
 	// All chunks are already correct, so no need to check every chunk's settings
-	// This is the common case when player is standing still observing the world
+	// CRITICAL: Check bNeedsMoreSpawning BEFORE resetting it, to preserve previous frame's state
 	const bool bPlayerStandingStill = !bCenterChanged && !bRotationChanged;
 	const bool bAllChunksLoaded = bInitialLoadComplete && !bNeedsMoreSpawning;
 
@@ -973,6 +972,9 @@ void AVoxelWorld::UpdateChunks()
 		// Skip expensive chunk iteration entirely
 		return;
 	}
+
+	// Now reset for this frame's processing
+	bNeedsMoreSpawning = false;
 
 	// OPTIMIZATION: Process ALL desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
