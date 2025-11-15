@@ -1,6 +1,7 @@
 #include "VoxelGPUMesher.h"
 #include "VoxelStructs.h"
 #include "VoxelMesher.h"
+#include "VoxelSettings.h"
 
 // Unreal Rendering Headers
 #include "RenderCore.h"
