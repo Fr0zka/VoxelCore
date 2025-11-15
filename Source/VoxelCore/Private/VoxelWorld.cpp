@@ -676,51 +676,66 @@ void AVoxelWorld::UpdateChunks()
 	// OPTIMIZATION: Reuse static arrays to avoid allocations per frame
 	static TArray<TPair<FVoxelCoord, int32>> Desired;
 	static TSet<FVoxelCoord> Visible;
+	static FVoxelCoord LastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);  // Cache center
 
-	Desired.Reset(0);  // Keep capacity, just clear count
-	Visible.Reset();
+	// OPTIMIZATION: Only rebuild Desired list when player moves to different chunk
+	// This eliminates expensive nested loops + sort when player stays in same chunk
+	const bool bCenterChanged = !(CenterChunk == LastDesiredCenter);
 
-	const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
-
-	// OPTIMIZATION: Only reserve if current capacity is insufficient (TArray only)
-	if (Desired.GetSlack() < EstimatedSize)
+	if (bCenterChanged || Desired.Num() == 0)
 	{
-		Desired.Reserve(EstimatedSize);
-	}
-	// TSet doesn't have GetSlack, just reserve directly (hash set has different allocation behavior)
-	Visible.Reserve(EstimatedSize);
+		Desired.Reset(0);  // Keep capacity, just clear count
 
-	// Build desired list around player's current vertical chunk
-	const int32 VerticalCenter = CenterChunk.Cz;
+		const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
 
-	for (int32 dx = -R2; dx <= R2; ++dx)
-	{
-		for (int32 dy = -R2; dy <= R2; ++dy)
+		// OPTIMIZATION: Only reserve if current capacity is insufficient (TArray only)
+		if (Desired.GetSlack() < EstimatedSize)
 		{
-			for (int32 dz = -Rz; dz <= Rz; ++dz)
+			Desired.Reserve(EstimatedSize);
+		}
+
+		// Build desired list around player's current vertical chunk
+		const int32 VerticalCenter = CenterChunk.Cz;
+
+		for (int32 dx = -R2; dx <= R2; ++dx)
+		{
+			for (int32 dy = -R2; dy <= R2; ++dy)
 			{
-				const int32 d2 = dx * dx + dy * dy + dz * dz;
-				if (!S->bDiskShapedLoading || d2 <= R2Sq)
+				for (int32 dz = -Rz; dz <= Rz; ++dz)
 				{
-					Desired.Emplace(FVoxelCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz), d2);
+					const int32 d2 = dx * dx + dy * dy + dz * dz;
+					if (!S->bDiskShapedLoading || d2 <= R2Sq)
+					{
+						Desired.Emplace(FVoxelCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz), d2);
+					}
 				}
 			}
 		}
+
+		// OPTIMIZATION: Simplified sort comparator - just distance-squared (primary) and Z-priority (secondary)
+		// Removed expensive Manhattan distance calculation - not critical for chunk spawning order
+		const int32 Czc = CenterChunk.Cz;
+		Desired.Sort([Czc](const TPair<FVoxelCoord, int32>& A, const TPair<FVoxelCoord, int32>& B)
+		{
+			// Primary: distance-squared (closest first)
+			if (A.Value != B.Value) return A.Value < B.Value;
+
+			// Secondary: prefer same vertical level (reduces vertical pop-in)
+			const int32 Az = FMath::Abs(A.Key.Cz - Czc);
+			const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
+			return Az < Bz;
+		});
+
+		LastDesiredCenter = CenterChunk;
 	}
 
-	// OPTIMIZATION: Simplified sort comparator - just distance-squared (primary) and Z-priority (secondary)
-	// Removed expensive Manhattan distance calculation - not critical for chunk spawning order
-	const int32 Czc = CenterChunk.Cz;
-	Desired.Sort([Czc](const TPair<FVoxelCoord, int32>& A, const TPair<FVoxelCoord, int32>& B)
+	// OPTIMIZATION: Build Visible set from Desired list (fast - just hash insertions from existing list)
+	Visible.Reset();
+	Visible.Reserve(Desired.Num());
+	for (const auto& Pair : Desired)
 	{
-		// Primary: distance-squared (closest first)
-		if (A.Value != B.Value) return A.Value < B.Value;
-
-		// Secondary: prefer same vertical level (reduces vertical pop-in)
-		const int32 Az = FMath::Abs(A.Key.Cz - Czc);
-		const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
-		return Az < Bz;
-	});
+		Visible.Add(Pair.Key);
+	}
 
 	// Collision and AO radii
 	const int32 CollisionR = S->CollisionViewDistance;
