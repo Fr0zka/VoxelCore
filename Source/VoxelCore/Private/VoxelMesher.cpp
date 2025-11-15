@@ -8,6 +8,7 @@
 #include "VoxelSettings.h"
 #include "HAL/IConsoleManager.h"
 #include <VoxelBlockTable.h>
+#include "VoxelOptimizationMacros.h"  // OPTIMIZATION: Branch hints, restrict, prefetch
 
 static void WarnUnsupportedTileSize(const UVoxelSettings* Settings)
 {
@@ -159,16 +160,19 @@ static FORCEINLINE void EmitQuad_Fast(
 
 
 // Category access with neighbor support.
+// OPTIMIZATION: RESTRICT keyword tells compiler that Cats pointer doesn't alias with Nbh
 static FORCEINLINE uint8 CatAt_WithNbh(
     const TArray<uint8>& Cats, const FIntVector& Size,
-    const FChunkNeighbors* Nbh,
+    const FChunkNeighbors* VOXEL_RESTRICT Nbh,
     int32 x, int32 y, int32 z)
 {
     const int32 SX = Size.X, SY = Size.Y, SZ = Size.Z;
+
+    // OPTIMIZATION: Use LIKELY hint for common case (inside chunk)
     auto inside = [&](int32 X, int32 Y, int32 Z) { return (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ; };
     auto idx = [&](int32 X, int32 Y, int32 Z) { return X + Y * SX + Z * SX * SY; };
 
-    if (inside(x, y, z)) return Cats[idx(x, y, z)];
+    if (VOXEL_LIKELY(inside(x, y, z))) return Cats[idx(x, y, z)];
     if (!Nbh) return 0;
 
     // Z-
@@ -189,19 +193,21 @@ static FORCEINLINE uint8 CatAt_WithNbh(
 // Thread-local reusable mask buffer to avoid allocations
 static thread_local TArray<uint8> GReusableMask;
 // Return the solid voxel that owns a face (depends on face direction and chunk borders).
+// OPTIMIZATION: RESTRICT keyword enables better vectorization
 static FORCEINLINE EVoxelBlockID OwnerBlockForFace(
     const TArray<EVoxelBlockID>& V, const FIntVector& Size,
-    const FChunkNeighbors* Nbh, int x, int y, int z, EVoxelFaceDir dir)
+    const FChunkNeighbors* VOXEL_RESTRICT Nbh, int x, int y, int z, EVoxelFaceDir dir)
 {
     const int SX = Size.X, SY = Size.Y, SZ = Size.Z;
 
+    // OPTIMIZATION: Mark common case as LIKELY for better branch prediction
     auto inside = [&](int X, int Y, int Z) {
         return (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ;
         };
     auto at = [&](int X, int Y, int Z)->EVoxelBlockID { return V[X + Y * SX + Z * SX * SY]; };
 
     auto sample = [&](int X, int Y, int Z)->EVoxelBlockID {
-        if (inside(X, Y, Z)) return at(X, Y, Z);
+        if (VOXEL_LIKELY(inside(X, Y, Z))) return at(X, Y, Z);
         if (!Nbh) return EVoxelBlockID::Air;
         if (Z < 0)    return (Nbh->bHasZNeg && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZNeg[X + Y * SX] : EVoxelBlockID::Air;
         if (Z >= SZ)  return (Nbh->bHasZPos && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZPos[X + Y * SX] : EVoxelBlockID::Air;
@@ -223,14 +229,15 @@ static FORCEINLINE EVoxelBlockID OwnerBlockForFace(
     }
     return EVoxelBlockID::Air;
 }
+// OPTIMIZATION: RESTRICT keywords on pointer parameters for better vectorization
 void UVoxelMesher::BuildGreedyMesh(
     const TArray<EVoxelBlockID>& Voxels,
     const FIntVector& Size,
-    const FChunkNeighbors* Nbh,
+    const FChunkNeighbors* VOXEL_RESTRICT Nbh,
     float VoxelUU,
     int32 XYScale,
     bool bUseAO,
-    const class UVoxelBlockTable* BlockTable,
+    const class UVoxelBlockTable* VOXEL_RESTRICT BlockTable,
     FMeshBuffers& Out)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
@@ -1102,15 +1109,16 @@ bool UVoxelMesher::BuildGreedyMesh_GPU_Async(
     return bLaunched;
 }
 
+// OPTIMIZATION: RESTRICT keywords on pointer parameters for better vectorization
 void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
     const TArray<uint8>& Cats,                 // 0=air,1=semi,2=solid
     const TArray<EVoxelBlockID>& Voxels,       // full IDs for layer lookups
     const FIntVector& Size,
-    const FChunkNeighbors* Nbh,
+    const FChunkNeighbors* VOXEL_RESTRICT Nbh,
     float VoxelUU,
     int32 XYScale,
     bool bUseAO,
-    const class UVoxelBlockTable* BlockTable,  // face→layer map
+    const class UVoxelBlockTable* VOXEL_RESTRICT BlockTable,  // face→layer map
     FMeshBuffers& Out)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
@@ -1156,7 +1164,7 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
             return x + y * SX + z * SX * SY;
         };
 
-    // OPTIMIZATION: Hot-path accessors to eliminate call overhead
+    // OPTIMIZATION: Hot-path accessors with branch hints to eliminate call overhead
     auto Inside = [&](int32 x, int32 y, int32 z) -> bool
         {
             // Use unsigned comparison trick: single comparison checks both bounds
@@ -1164,8 +1172,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
         };
     auto BlockAt = [&](int x, int y, int z) ->EVoxelBlockID
         {
-            // OPTIMIZATION: Fast path for inside chunk (most common case)
-            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+            // OPTIMIZATION: Fast path for inside chunk (most common case) - mark as LIKELY
+            if (VOXEL_LIKELY((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ))
                 return Voxels[x + y * SX + z * SX * SY];
 
             // Slow path: neighbor lookup
@@ -1181,8 +1189,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh_Cats(
 
     auto CatAt = [&](int32 x, int32 y, int32 z) -> uint8
         {
-            // OPTIMIZATION: Fast path for inside chunk
-            if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ)
+            // OPTIMIZATION: Fast path for inside chunk - mark as LIKELY
+            if (VOXEL_LIKELY((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ))
                 return Cats[x + y * SX + z * SX * SY];
 
             // Slow path: neighbor lookup

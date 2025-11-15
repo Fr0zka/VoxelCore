@@ -8,6 +8,16 @@ public class VoxelCore : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
+        // ============================================================================
+        // AGGRESSIVE PERFORMANCE OPTIMIZATIONS
+        // ============================================================================
+
+        // Enable aggressive code optimization
+        OptimizeCode = CodeOptimization.Always;  // Always optimize, even in dev builds
+
+        // Enable AVX/AVX2 SIMD instructions (requires CPU support)
+        bUseAVX = true;
+
         PublicDependencyModuleNames.AddRange(new string[] {
             "Core", "CoreUObject", "Engine", "InputCore",
             "RenderCore", "RHI", "ProceduralMeshComponent", "UMG", "RHICore", "RealtimeMeshComponent"
@@ -21,6 +31,19 @@ public class VoxelCore : ModuleRules
         {
             bUseRTTI = true;
             bEnableExceptions = true;
+
+            // Enable fast floating-point math (SIMD-friendly)
+            // Trades strict IEEE 754 compliance for speed
+            bEnableFastMath = true;
+
+            // Enable function-level linking (better optimization)
+            bFunctionLevelLinking = true;
+
+            // Enable whole program optimization in shipping builds
+            if (Target.Configuration == UnrealTargetConfiguration.Shipping)
+            {
+                bEnableWholeProgramOptimization = true;
+            }
         }
     }
 }
