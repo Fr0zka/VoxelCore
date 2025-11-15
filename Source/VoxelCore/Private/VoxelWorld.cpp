@@ -675,15 +675,13 @@ void AVoxelWorld::UpdateChunks()
 
 	const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
 
-	// OPTIMIZATION: Only reserve if current capacity is insufficient
+	// OPTIMIZATION: Only reserve if current capacity is insufficient (TArray only)
 	if (Desired.GetSlack() < EstimatedSize)
 	{
 		Desired.Reserve(EstimatedSize);
 	}
-	if (Visible.GetSlack() < EstimatedSize)
-	{
-		Visible.Reserve(EstimatedSize);
-	}
+	// TSet doesn't have GetSlack, just reserve directly (hash set has different allocation behavior)
+	Visible.Reserve(EstimatedSize);
 
 	// Build desired list around player's current vertical chunk
 	const int32 VerticalCenter = CenterChunk.Cz;
