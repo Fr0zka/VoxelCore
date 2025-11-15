@@ -961,6 +961,19 @@ void AVoxelWorld::UpdateChunks()
 
 	int32 MissingChunks = 0; // Track how many chunks are not yet spawned
 
+	// MEGA OPTIMIZATION: When player hasn't moved or rotated, skip the entire update loop
+	// All chunks are already correct, so no need to check every chunk's settings
+	// This is the common case when player is standing still observing the world
+	const bool bPlayerStandingStill = !bCenterChanged && !bRotationChanged;
+	const bool bAllChunksLoaded = bInitialLoadComplete && !bNeedsMoreSpawning;
+
+	if (bPlayerStandingStill && bAllChunksLoaded)
+	{
+		// Player standing still, all chunks loaded - nothing to do!
+		// Skip expensive chunk iteration entirely
+		return;
+	}
+
 	// OPTIMIZATION: Process ALL desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
 	{
