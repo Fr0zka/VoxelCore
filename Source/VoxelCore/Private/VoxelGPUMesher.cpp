@@ -383,6 +383,13 @@ static TAutoConsoleVariable<int32> CVarVoxelGPU_UseSinglePass(
 	TEXT("Use single-pass GPU mesher with atomic allocation (1=enabled, 0=use two-pass)."),
 	ECVF_Default);
 
+/** Frame budget for GPU mesh readbacks. */
+static TAutoConsoleVariable<int32> CVarVoxelGPU_MaxReadbacksPerFrame(
+	TEXT("r.Voxel.GPU.MaxReadbacksPerFrame"),
+	-1,
+	TEXT("Max GPU mesh readbacks per frame. -1=use setting, 0=unlimited, >0=throttle. Adjust for FPS/throughput balance."),
+	ECVF_Default);
+
 /** Use index buffer for GPU mesher (33% vertex reduction). */
 static TAutoConsoleVariable<int32> CVarVoxelGPU_UseIndexBuffer(
 	TEXT("r.Voxel.GPU.UseIndexBuffer"),
@@ -1354,6 +1361,20 @@ bool FVoxelGPUMesher::BuildPackedVerts_GPU_Async(const FGPUMeshBuildParams& Para
 
 void FVoxelGPUMesher::PumpAsyncReadbacks()
 {
+	// Get frame budget for GPU readbacks (0 = unlimited)
+	// Priority: console variable > settings > default
+	static auto* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.MaxReadbacksPerFrame"));
+	int32 MaxReadbacksPerFrame = CVar ? CVar->GetInt() : -1;
+
+	if (MaxReadbacksPerFrame < 0)
+	{
+		// Use settings value
+		const UVoxelSettings* Settings = GetDefault<UVoxelSettings>();
+		MaxReadbacksPerFrame = Settings ? Settings->MaxGPUMeshReadbacksPerFrame : 20;
+	}
+
+	int32 ProcessedThisFrame = 0;
+
 	TArray<TSharedPtr<FVoxelGPUAsyncJob, ESPMode::ThreadSafe>> CompletedJobs;
 
 	{
@@ -1362,6 +1383,12 @@ void FVoxelGPUMesher::PumpAsyncReadbacks()
 		// Iterate backwards to allow safe removal
 		for (int32 Index = GVoxelGPUAsyncJobs.Num() - 1; Index >= 0; --Index)
 		{
+			// Frame budget check: stop processing if we hit the limit
+			if (MaxReadbacksPerFrame > 0 && ProcessedThisFrame >= MaxReadbacksPerFrame)
+			{
+				break;  // Defer remaining readbacks to next frame
+			}
+
 			TSharedPtr<FVoxelGPUAsyncJob, ESPMode::ThreadSafe> Job = GVoxelGPUAsyncJobs[Index];
 			if (!Job.IsValid())
 			{
@@ -1381,6 +1408,9 @@ void FVoxelGPUMesher::PumpAsyncReadbacks()
 				{
 					continue;  // Not ready yet
 				}
+
+				// Count this as processed
+				ProcessedThisFrame++;
 
 				// Readback counter to get actual vertex count
 				uint32 ActualVertexCount = 0;
@@ -1489,6 +1519,26 @@ void FVoxelGPUMesher::PumpAsyncReadbacks()
 		if (Job->Completion)
 		{
 			Job->Completion(Job->bSuccess, MoveTemp(Job->PackedResult));
+		}
+	}
+
+	// Diagnostic logging (throttled to avoid spam)
+	if (ProcessedThisFrame > 0)
+	{
+		static int32 LogCounter = 0;
+		if (++LogCounter % 60 == 0)  // Log every 60 frames (~1 second at 60 FPS)
+		{
+			int32 PendingJobs = 0;
+			{
+				FScopeLock Lock(&GVoxelGPUAsyncMutex);
+				PendingJobs = GVoxelGPUAsyncJobs.Num();
+			}
+
+			if (PendingJobs > 0)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[VoxelGPU Frame Budget] Processed %d/%d readbacks, %d pending"),
+					ProcessedThisFrame, MaxReadbacksPerFrame, PendingJobs);
+			}
 		}
 	}
 }

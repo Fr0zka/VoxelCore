@@ -124,6 +124,23 @@ public:
     // ===================================================================
 
     /**
+     * Maximum GPU mesh readbacks to process per frame.
+     *
+     * Controls frame-time budget for GPU meshing results. Lower values = smoother FPS,
+     * higher values = faster chunk loading but potential frame spikes.
+     *
+     * Recommended values:
+     * - 10-20: Smooth 144 FPS with minimal hitches
+     * - 30-50: Balanced performance
+     * - 100+: Maximum throughput, may cause frame drops
+     *
+     * Set to 0 for unlimited (process all ready readbacks).
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing",
+        meta = (ClampMin = "0", ClampMax = "500"))
+    int32 MaxGPUMeshReadbacksPerFrame = 20;
+
+    /**
      * Enable GPU mesher for LOD0 (experimental, optional).
      */
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing")
