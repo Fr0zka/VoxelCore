@@ -446,26 +446,42 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 	if (ActiveGenTasks < MaxGen)
 	{
 		++ActiveGenTasks;
+		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		Chunk->DoGeneration();
 		return;
 	}
 
 	// Slow path: queue by distance-squared (closer chunks prioritized)
 	GenWaitByDistance.FindOrAdd(Chunk->PriorityDist2).Add(Chunk);
+
+	// DEBUG: Log queue growth
+	static int32 LastQueueSize = 0;
+	const int32 CurrentQueueSize = GenWaitByDistance.Num();
+	if (CurrentQueueSize > LastQueueSize && CurrentQueueSize % 10 == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] QUEUED (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d (GROWING!)"),
+			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, CurrentQueueSize);
+		LastQueueSize = CurrentQueueSize;
+	}
 }
 
-void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* /*Chunk*/)
+void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* Chunk)
 {
 	const UVoxelSettings* S = Settings.GetDefaultObject();
 	const int32 MaxGen = (S->MaxConcurrentGenerationTasks > 1) ? S->MaxConcurrentGenerationTasks : 1;
 
 	// Pop next closest chunk from priority queue (if available)
 	TWeakObjectPtr<UVoxelChunkComponent> Next;
+	int32 NewActiveCount = 0;
+	int32 QueueSize = 0;
 	{
 		FScopeLock Lock(&GenMutex);
 
 		// Decrement active count
 		ActiveGenTasks = FMath::Max(0, ActiveGenTasks - 1);
+		NewActiveCount = ActiveGenTasks;
+		QueueSize = GenWaitByDistance.Num();
 
 		// Try to pop next task if we have capacity
 		if (ActiveGenTasks < MaxGen)
@@ -480,9 +496,23 @@ void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* /*Chunk*/)
 		}
 	}
 
+	// DEBUG: Log completion
+	if (Chunk)
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] FINISH (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, NewActiveCount, QueueSize);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] FINISH (NULL chunk!) - ActiveGenTasks=%d, QueueSize=%d"),
+			NewActiveCount, QueueSize);
+	}
+
 	// Launch task outside lock (DoGeneration may enqueue callbacks)
 	if (UVoxelChunkComponent* N = Next.Get())
 	{
+		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+			N->ChunkCoord.Cx, N->ChunkCoord.Cy, N->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		N->DoGeneration();
 	}
 }
