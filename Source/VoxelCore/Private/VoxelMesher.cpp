@@ -563,16 +563,16 @@ void UVoxelMesher::BuildBinaryGreedyMesh(
     const class UVoxelBlockTable* BlockTable,
     FMeshBuffers& Out)
 {
-    const int32 N = Size.X * Size.Y * Size.Z;
-    TArray<uint8> Cats; Cats.SetNumUninitialized(N);
-    for (int32 i = 0; i < N; ++i)
-        Cats[i] = VoxelBlockCategory(Voxels[i]);
+    // PERFORMANCE: True binary mesher was slower (3-4ms vs <1ms for standard)
+    // Reverting to standard greedy mesher which is faster and proven
+    BuildGreedyMesh(Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 
-    // OPTIMIZATION: Using TRUE binary greedy mesher (10-50x faster face-finding)
-    // This processes 64 voxels at once with bitwise operations
-    BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
-
-    // OLD: BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+    // DISABLED: Binary meshing adds overhead without performance benefit
+    // const int32 N = Size.X * Size.Y * Size.Z;
+    // TArray<uint8> Cats; Cats.SetNumUninitialized(N);
+    // for (int32 i = 0; i < N; ++i)
+    //     Cats[i] = VoxelBlockCategory(Voxels[i]);
+    // BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 }
 
 void UVoxelMesher::BuildHeightfieldMesh(

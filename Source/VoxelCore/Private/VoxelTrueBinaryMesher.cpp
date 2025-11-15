@@ -319,23 +319,28 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
         Out.Normals.Add(Norm);
 
         // Indices (winding depends on normal direction)
-        if (Normal.X > 0 || Normal.Y < 0 || Normal.Z > 0)
+        // Match the working greedy mesher: useStandardWinding = (normal.X < 0) || (normal.Y > 0) || (normal.Z < 0)
+        const bool useStandardWinding = (Normal.X < 0 || Normal.Y > 0 || Normal.Z < 0);
+
+        if (useStandardWinding)
         {
+            // Standard winding: 0->1->2, 0->2->3
             Out.Triangles.Add(BaseIdx + 0);
-            Out.Triangles.Add(BaseIdx + 2);
             Out.Triangles.Add(BaseIdx + 1);
-            Out.Triangles.Add(BaseIdx + 0);
-            Out.Triangles.Add(BaseIdx + 3);
             Out.Triangles.Add(BaseIdx + 2);
+            Out.Triangles.Add(BaseIdx + 0);
+            Out.Triangles.Add(BaseIdx + 2);
+            Out.Triangles.Add(BaseIdx + 3);
         }
         else
         {
+            // Flipped winding: 0->2->1, 0->3->2
             Out.Triangles.Add(BaseIdx + 0);
+            Out.Triangles.Add(BaseIdx + 2);
             Out.Triangles.Add(BaseIdx + 1);
-            Out.Triangles.Add(BaseIdx + 2);
             Out.Triangles.Add(BaseIdx + 0);
-            Out.Triangles.Add(BaseIdx + 2);
             Out.Triangles.Add(BaseIdx + 3);
+            Out.Triangles.Add(BaseIdx + 2);
         }
     };
 
