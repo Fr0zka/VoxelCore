@@ -155,22 +155,22 @@ void AVoxelWorld::Tick(float DeltaTime)
 		}
 	}
 
-	// Update chunks based on player movement
+	// ALWAYS call UpdateChunks every frame to update collision/visibility based on player position
+	// The function is optimized internally with caching (only rebuilds Desired list when player changes chunks)
+	UpdateChunks();
+
+	// Track last center for initial load completion
 	const AActor* Player = UGameplayStatics::GetPlayerPawn(this, 0);
-	if (!Player)
+	if (Player)
 	{
-		return;
-	}
+		const FVector PlayerPos = Player->GetActorLocation();
+		const FVoxelCoord Center = WorldToChunkCoord(PlayerPos);
 
-	const FVector PlayerPos = Player->GetActorLocation();
-	const FVoxelCoord Center = WorldToChunkCoord(PlayerPos);
-
-	const bool bCenterChanged = (!bHasLastCenter || !(Center == LastCenterChunk));
-	if (bCenterChanged || bNeedsMoreSpawning || !bInitialLoadComplete)
-	{
-		UpdateChunks();
-		LastCenterChunk = Center;
-		bHasLastCenter = true;
+		if (!bHasLastCenter || !(Center == LastCenterChunk))
+		{
+			LastCenterChunk = Center;
+			bHasLastCenter = true;
+		}
 	}
 }
 
@@ -737,6 +737,18 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerLocation = PrimarySource ? PrimarySource->GetSourceLocation() : PrimaryActor->GetActorLocation();
 	const FVoxelCoord CenterChunk = WorldToChunkCoord(PlayerLocation);
 
+	// DEBUG: Log player position and center chunk every 60 frames
+	static int32 DebugFrameCounter = 0;
+	if (++DebugFrameCounter >= 60)
+	{
+		DebugFrameCounter = 0;
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
+			PlayerLocation.X, PlayerLocation.Y, PlayerLocation.Z,
+			CenterChunk.Cx, CenterChunk.Cy, CenterChunk.Cz,
+			PrimarySource ? PrimarySource->CollisionRadius : S->CollisionViewDistance,
+			PrimarySource ? TEXT("YES") : TEXT("NO"));
+	}
+
 	// Get view direction for frustum priority
 	const FRotator PlayerRotation = PrimarySource ? PrimarySource->GetSourceRotation() : PrimaryActor->GetActorRotation();
 	const FVector PlayerForward = PrimarySource ? PrimarySource->GetForwardVector() : PlayerRotation.Vector();
@@ -1120,6 +1132,15 @@ void AVoxelWorld::UpdateChunks()
 					// Collision policy changed: reapply collision using cached mesh
 					if (Active->bBuildCollision != bDesiredCollision)
 					{
+						// DEBUG: Log collision changes
+						if (d2 <= 16) // Log for chunks within 4-chunk radius
+						{
+							UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
+								C.Cx, C.Cy, C.Cz, d2,
+								Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
+								bDesiredCollision ? TEXT("YES") : TEXT("NO"),
+								CollisionR);
+						}
 						Active->RequestCollisionReapply(bDesiredCollision);
 					}
 
