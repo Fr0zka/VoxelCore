@@ -568,8 +568,8 @@ void UVoxelMesher::BuildBinaryGreedyMesh(
     for (int32 i = 0; i < N; ++i)
         Cats[i] = VoxelBlockCategory(Voxels[i]);
 
-    // Using optimized TRUE binary greedy mesher
-    BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+    // Use OLD binary greedy mesher (simpler and faster)
+    BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 }
 
 void UVoxelMesher::BuildHeightfieldMesh(
