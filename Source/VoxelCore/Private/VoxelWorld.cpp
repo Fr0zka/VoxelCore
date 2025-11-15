@@ -5,9 +5,11 @@
 #include "VoxelStats.h"
 #include "VoxelGPUMesher.h"
 #include "VoxelGPUGenerator.h"
+#include "VoxelStreamingSourceComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "ProceduralMeshComponent.h"
 #include "RealtimeMeshComponent.h"
+#include "EngineUtils.h"
 #include <RealtimeMeshSimple.h>
 
 // ============================================================================
@@ -655,6 +657,53 @@ void AVoxelWorld::ReleaseRMC(URealtimeMeshComponent* RMC)
 }
 
 // ============================================================================
+// STREAMING SOURCE MANAGEMENT
+// ============================================================================
+
+void AVoxelWorld::GatherStreamingSources()
+{
+	StreamingSources.Reset();
+
+	// Scan world for all active streaming source components
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor) continue;
+
+		// Find all streaming source components on this actor
+		TArray<UVoxelStreamingSourceComponent*> Components;
+		Actor->GetComponents<UVoxelStreamingSourceComponent>(Components);
+
+		for (UVoxelStreamingSourceComponent* Source : Components)
+		{
+			if (Source && Source->IsActiveSource())
+			{
+				StreamingSources.Add(Source);
+			}
+		}
+	}
+
+	// Log when streaming sources change (helps debugging)
+	static int32 LastCount = -1;
+	if (StreamingSources.Num() != LastCount)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Found %d active streaming source(s)"), StreamingSources.Num());
+		for (UVoxelStreamingSourceComponent* Source : StreamingSources)
+		{
+			UE_LOG(LogTemp, Log, TEXT("  - %s (Player=%d, Priority=%.2f, ViewDist=%d)"),
+				*Source->GetOwner()->GetName(),
+				Source->bIsPlayerSource ? 1 : 0,
+				Source->PriorityWeight,
+				Source->ViewDistanceChunks);
+		}
+		LastCount = StreamingSources.Num();
+	}
+}
+
+// ============================================================================
 // CHUNK MANAGEMENT (PROGRESSIVE LOADING)
 // ============================================================================
 
@@ -665,31 +714,59 @@ void AVoxelWorld::UpdateChunks()
 	const UVoxelSettings* S = Settings.GetDefaultObject();
 	if (!S) return;
 
-	const AActor* Player = UGameplayStatics::GetPlayerPawn(this, 0);
-	if (!Player) return;
+	// Gather all active streaming sources
+	GatherStreamingSources();
 
-	const FVector PlayerLocation = Player->GetActorLocation();
+	// Fallback to GetPlayerPawn if no streaming sources found (backwards compatibility)
+	UVoxelStreamingSourceComponent* PrimarySource = nullptr;
+	const AActor* PrimaryActor = nullptr;
+
+	if (StreamingSources.Num() > 0)
+	{
+		// Use first streaming source as primary (TODO: support multiple sources)
+		PrimarySource = StreamingSources[0];
+		PrimaryActor = PrimarySource->GetOwner();
+	}
+	else
+	{
+		// Backwards compatibility: Use player pawn if no streaming sources
+		PrimaryActor = UGameplayStatics::GetPlayerPawn(this, 0);
+		if (!PrimaryActor) return;
+	}
+
+	const FVector PlayerLocation = PrimarySource ? PrimarySource->GetSourceLocation() : PrimaryActor->GetActorLocation();
 	const FVoxelCoord CenterChunk = WorldToChunkCoord(PlayerLocation);
 
-	// Get player view direction for frustum culling
-	const FRotator PlayerRotation = Player->GetActorRotation();
-	const FVector PlayerForward = PlayerRotation.Vector();
+	// Get view direction for frustum priority
+	const FRotator PlayerRotation = PrimarySource ? PrimarySource->GetSourceRotation() : PrimaryActor->GetActorRotation();
+	const FVector PlayerForward = PrimarySource ? PrimarySource->GetForwardVector() : PlayerRotation.Vector();
 
-	// Compute view ranges
-	const int32 R2 = (S->LOD2_Radius > 0) ? S->LOD2_Radius : S->ViewDistanceChunks;
+	// Compute view ranges from streaming source (or fallback to global settings)
+	const int32 R2 = PrimarySource ? PrimarySource->ViewDistanceChunks :
+		((S->LOD2_Radius > 0) ? S->LOD2_Radius : S->ViewDistanceChunks);
 	const int32 R2Sq = R2 * R2;
-	const int32 Rz = FMath::Max(0, S->ViewDistanceChunksZ);
+	const int32 Rz = PrimarySource ? (PrimarySource->ViewDistanceChunksZ > 0 ? PrimarySource->ViewDistanceChunksZ : R2) :
+		FMath::Max(0, S->ViewDistanceChunksZ);
 
-	// OPTIMIZATION: Cache both Desired list and Visible set to avoid rebuilding every frame
-	static TArray<TPair<FVoxelCoord, int32>> Desired;
+	// Frustum priority settings
+	const bool bUseFrustumPriority = PrimarySource ? PrimarySource->bUseFrustumPriority : S->bUseFrustumBasedGeneration;
+	const float FrustumHFOV = PrimarySource ? PrimarySource->FrustumHorizontalFOV : S->FrustumHorizontalFOV;
+	const bool bFrustumVertical = PrimarySource ? PrimarySource->bFrustumPriorityVertical : S->bFrustumCullVertical;
+	const float FrustumVFOV = PrimarySource ? PrimarySource->FrustumVerticalFOV : S->FrustumVerticalFOV;
+	const bool bDiskLoading = PrimarySource ? PrimarySource->bDiskShapedLoading : S->bDiskShapedLoading;
+
+	// OPTIMIZATION: Cache both Desired list (with priority) and Visible set to avoid rebuilding every frame
+	static TArray<TPair<FVoxelCoord, float>> Desired; // Coord → Priority (higher = more important)
 	static TSet<FVoxelCoord> Visible;
 	static FVoxelCoord LastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
-	static FRotator LastPlayerRotation = FRotator::ZeroRotator;
+	static float LastPlayerYaw = 0.0f;
 	static bool bVisibleCached = false;
 
-	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates significantly
+	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates horizontally (ignore pitch for jumping)
 	const bool bCenterChanged = !(CenterChunk == LastDesiredCenter);
-	const bool bRotationChanged = S->bUseFrustumBasedGeneration && !PlayerRotation.Equals(LastPlayerRotation, 5.0f);
+	const float CurrentYaw = PlayerRotation.Yaw;
+	const float YawDelta = FMath::Abs(FRotator::NormalizeAxis(CurrentYaw - LastPlayerYaw));
+	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > 10.0f); // 10° threshold, horizontal only
 	const bool bNeedsRebuild = bCenterChanged || bRotationChanged;
 
 	if (bNeedsRebuild || Desired.Num() == 0)
@@ -705,14 +782,20 @@ void AVoxelWorld::UpdateChunks()
 
 		const int32 VerticalCenter = CenterChunk.Cz;
 
-		// OPTIMIZATION: Frustum culling - precompute cos(HalfFOV) for dot product comparison
-		const bool bUseFrustum = S->bUseFrustumBasedGeneration && S->FrustumHorizontalFOV < 360.0f;
-		const float CosHalfHorizontalFOV = bUseFrustum ? FMath::Cos(FMath::DegreesToRadians(S->FrustumHorizontalFOV * 0.5f)) : -1.0f;
-		const float CosHalfVerticalFOV = (bUseFrustum && S->bFrustumCullVertical)
-			? FMath::Cos(FMath::DegreesToRadians(S->FrustumVerticalFOV * 0.5f)) : -1.0f;
+		// OPTIMIZATION: Frustum PRIORITY (not hard-culling) - precompute cos(HalfFOV) for dot product comparison
+		const bool bApplyFrustumPriority = bUseFrustumPriority && FrustumHFOV < 360.0f;
+		const float CosHalfHorizontalFOV = bApplyFrustumPriority ? FMath::Cos(FMath::DegreesToRadians(FrustumHFOV * 0.5f)) : -1.0f;
+		const float CosHalfVerticalFOV = (bApplyFrustumPriority && bFrustumVertical)
+			? FMath::Cos(FMath::DegreesToRadians(FrustumVFOV * 0.5f)) : -1.0f;
 
 		// Project player forward to XY plane for horizontal frustum check
 		const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
+
+		// Cache chunk world size for frustum calculations
+		const float VoxelUU = S->VoxelWorldScale;
+		const float ChunkWorldSizeX = S->ChunkSizeX * VoxelUU;
+		const float ChunkWorldSizeY = S->ChunkSizeY * VoxelUU;
+		const float ChunkWorldSizeZ = S->ChunkSizeZ * VoxelUU;
 
 		for (int32 dx = -R2; dx <= R2; ++dx)
 		{
@@ -721,19 +804,21 @@ void AVoxelWorld::UpdateChunks()
 				for (int32 dz = -Rz; dz <= Rz; ++dz)
 				{
 					const int32 d2 = dx * dx + dy * dy + dz * dz;
-					if (!S->bDiskShapedLoading || d2 <= R2Sq)
+					if (!bDiskLoading || d2 <= R2Sq)
 					{
 						const FVoxelCoord ChunkCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz);
 
-						// OPTIMIZATION: Frustum culling - only generate chunks in player's view cone
-						if (bUseFrustum)
+						// Calculate base priority (inverse distance - closer = higher priority)
+						// Priority range: [0.0 ... 1.0] where 1.0 = at player position, 0.0 = max distance
+						const float Distance = FMath::Sqrt(static_cast<float>(d2));
+						const float MaxDistance = FMath::Sqrt(static_cast<float>(R2Sq + Rz * Rz));
+						float Priority = 1.0f - (Distance / (MaxDistance + 1.0f));
+
+						// OPTIMIZATION: Frustum PRIORITY BOOST (not hard-culling)
+						// Chunks in frustum get 2x priority (loaded first), chunks outside get normal priority (loaded later)
+						if (bApplyFrustumPriority)
 						{
 							// Calculate chunk center in world space
-							const float VoxelUU = S->VoxelWorldScale;
-							const float ChunkWorldSizeX = S->ChunkSizeX * VoxelUU;
-							const float ChunkWorldSizeY = S->ChunkSizeY * VoxelUU;
-							const float ChunkWorldSizeZ = S->ChunkSizeZ * VoxelUU;
-
 							const FVector ChunkWorldPos(
 								ChunkCoord.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
 								ChunkCoord.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
@@ -743,8 +828,7 @@ void AVoxelWorld::UpdateChunks()
 							const FVector ToChunk = ChunkWorldPos - PlayerLocation;
 							const float DistanceSq = ToChunk.SizeSquared();
 
-							// Skip frustum check for very close chunks (always keep chunks around player)
-							// Use chunk world size (not voxel size) for threshold
+							// Close chunks always get max priority (no frustum check needed)
 							const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
 							const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
 
@@ -756,40 +840,52 @@ void AVoxelWorld::UpdateChunks()
 								const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
 								const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
 
-								if (DotHorizontal < CosHalfHorizontalFOV)
-								{
-									continue; // Outside horizontal frustum, skip this chunk
-								}
+								bool bInFrustum = (DotHorizontal >= CosHalfHorizontalFOV);
 
 								// Vertical frustum check (optional)
-								if (S->bFrustumCullVertical && CosHalfVerticalFOV > -1.0f)
+								if (bInFrustum && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
 								{
 									const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
-									if (DotVertical < CosHalfVerticalFOV)
-									{
-										continue; // Outside vertical frustum, skip this chunk
-									}
+									bInFrustum = (DotVertical >= CosHalfVerticalFOV);
 								}
+
+								// 2x priority boost for chunks in frustum
+								if (bInFrustum)
+								{
+									Priority *= 2.0f;
+								}
+							}
+							else
+							{
+								// Very close chunks always get 2x priority
+								Priority *= 2.0f;
 							}
 						}
 
-						Desired.Emplace(ChunkCoord, d2);
+						Desired.Emplace(ChunkCoord, Priority);
 					}
 				}
 			}
 		}
 
+		// Sort by PRIORITY (higher = load first), then by vertical distance
 		const int32 Czc = CenterChunk.Cz;
-		Desired.Sort([Czc](const TPair<FVoxelCoord, int32>& A, const TPair<FVoxelCoord, int32>& B)
+		Desired.Sort([Czc](const TPair<FVoxelCoord, float>& A, const TPair<FVoxelCoord, float>& B)
 		{
-			if (A.Value != B.Value) return A.Value < B.Value;
+			// Higher priority first (reverse sort on priority)
+			if (!FMath::IsNearlyEqual(A.Value, B.Value, 0.001f))
+			{
+				return A.Value > B.Value; // Higher priority = earlier in list
+			}
+
+			// If priorities are equal, prefer chunks closer to player's vertical position
 			const int32 Az = FMath::Abs(A.Key.Cz - Czc);
 			const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
 			return Az < Bz;
 		});
 
 		LastDesiredCenter = CenterChunk;
-		LastPlayerRotation = PlayerRotation;  // Cache rotation to detect camera turns
+		LastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
 		bVisibleCached = false;  // Invalidate Visible cache when Desired changes
 	}
 
@@ -806,10 +902,10 @@ void AVoxelWorld::UpdateChunks()
 		bVisibleCached = true;
 	}
 
-	// Collision and AO radii
-	const int32 CollisionR = S->CollisionViewDistance;
+	// Collision and AO radii (use streaming source settings if available)
+	const int32 CollisionR = PrimarySource ? PrimarySource->CollisionRadius : S->CollisionViewDistance;
 	const int32 CollisionR2 = CollisionR * CollisionR;
-	const int32 AOR = S->AORadiusChunks;
+	const int32 AOR = PrimarySource ? PrimarySource->AORadius : S->AORadiusChunks;
 	const int32 AOR2 = AOR * AOR;
 	const int32 CollisionDropR2 = (CollisionR + 1) * (CollisionR + 1); // Hysteresis for collision drop
 
@@ -822,11 +918,15 @@ void AVoxelWorld::UpdateChunks()
 
 	int32 MissingChunks = 0; // Track how many chunks are not yet spawned
 
-	// OPTIMIZATION: Process ALL desired chunks (Visible already built from Desired above)
+	// OPTIMIZATION: Process ALL desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
 	{
 		const FVoxelCoord& C = Pair.Key;
-		const int32 d2 = Pair.Value;
+		// NOTE: Pair.Value is now priority (float), not distance! Recalculate distance from chunk coord
+		const int32 dx = C.Cx - CenterChunk.Cx;
+		const int32 dy = C.Cy - CenterChunk.Cy;
+		const int32 dz = C.Cz - CenterChunk.Cz;
+		const int32 d2 = dx * dx + dy * dy + dz * dz;
 
 		const EVoxelLODLevel DesiredLOD = PickLOD(d2, S);
 
