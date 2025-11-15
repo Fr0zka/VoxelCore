@@ -114,36 +114,43 @@ void AVoxelWorld::Tick(float DeltaTime)
 		}
 	}
 
-	// Update stats
-	SET_DWORD_STAT(STAT_VoxelActiveChunks, ActiveChunks.Num());
-	SET_DWORD_STAT(STAT_VoxelPendingChunks, PendingChunks.Num());
-	SET_DWORD_STAT(STAT_VoxelActiveMacroTiles, ActiveMacro.Num());
-	SET_DWORD_STAT(STAT_VoxelGenTasksRunning, ActiveGenTasks);
-	SET_DWORD_STAT(STAT_VoxelMeshTasksRunning, ActiveMeshTasks);
-
+	// OPTIMIZATION: Update stats less frequently (every 10 frames instead of every frame)
+	// Stats are for profiling, don't need real-time precision
+	static int32 StatsFrameCounter = 0;
+	if (++StatsFrameCounter >= 10)
 	{
-		FScopeLock L1(&GenMutex);
-		int32 GenQSize = 0;
-		for (const auto& Pair : GenWaitByDistance)
+		StatsFrameCounter = 0;
+
+		SET_DWORD_STAT(STAT_VoxelActiveChunks, ActiveChunks.Num());
+		SET_DWORD_STAT(STAT_VoxelPendingChunks, PendingChunks.Num());
+		SET_DWORD_STAT(STAT_VoxelActiveMacroTiles, ActiveMacro.Num());
+		SET_DWORD_STAT(STAT_VoxelGenTasksRunning, ActiveGenTasks);
+		SET_DWORD_STAT(STAT_VoxelMeshTasksRunning, ActiveMeshTasks);
+
 		{
-			GenQSize += Pair.Value.Num();
+			FScopeLock L1(&GenMutex);
+			int32 GenQSize = 0;
+			for (const auto& Pair : GenWaitByDistance)
+			{
+				GenQSize += Pair.Value.Num();
+			}
+			SET_DWORD_STAT(STAT_VoxelGenQueueSize, GenQSize);
 		}
-		SET_DWORD_STAT(STAT_VoxelGenQueueSize, GenQSize);
-	}
 
-	{
-		FScopeLock L2(&MeshMutex);
-		int32 MeshQSize = 0;
-		for (const auto& Pair : MeshWaitByDistance)
 		{
-			MeshQSize += Pair.Value.Num();
+			FScopeLock L2(&MeshMutex);
+			int32 MeshQSize = 0;
+			for (const auto& Pair : MeshWaitByDistance)
+			{
+				MeshQSize += Pair.Value.Num();
+			}
+			SET_DWORD_STAT(STAT_VoxelMeshQueueSize, MeshQSize);
 		}
-		SET_DWORD_STAT(STAT_VoxelMeshQueueSize, MeshQSize);
-	}
 
-	{
-		FScopeLock L3(&ApplyQueueMutex);
-		SET_DWORD_STAT(STAT_VoxelApplyQueueSize, ApplyQueue.Num());
+		{
+			FScopeLock L3(&ApplyQueueMutex);
+			SET_DWORD_STAT(STAT_VoxelApplyQueueSize, ApplyQueue.Num());
+		}
 	}
 
 	// Update chunks based on player movement
@@ -918,85 +925,91 @@ void AVoxelWorld::UpdateChunks()
 			}
 		}
 
-		// Unload invisible macro-tiles
-		TArray<FIntPoint> ToRemoveActive, ToRemovePending;
+		// OPTIMIZATION: Single-pass macro-tile unloading (reuse static array)
+		static TArray<FIntPoint> ToRemoveTiles;
+		ToRemoveTiles.Reset(0);
+
+		// Unload invisible active macro-tiles
 		for (const auto& Pair : ActiveMacro)
 		{
 			if (!VisibleTilesMinD2.Contains(Pair.Key))
 			{
-				if (Pair.Value) Pair.Value->CancelPendingTask();
-				ToRemoveActive.Add(Pair.Key);
+				if (UVoxelMacroTileComponent* C = Pair.Value)
+				{
+					C->CancelPendingTask();
+					C->UnloadChunk();
+					C->DestroyComponent();
+				}
+				ToRemoveTiles.Add(Pair.Key);
 			}
 		}
+		for (const FIntPoint& T : ToRemoveTiles)
+		{
+			ActiveMacro.Remove(T);
+		}
+
+		// Unload invisible pending macro-tiles
+		ToRemoveTiles.Reset(0);
 		for (const auto& Pair : PendingMacro)
 		{
 			if (!VisibleTilesMinD2.Contains(Pair.Key))
 			{
-				if (Pair.Value) Pair.Value->CancelPendingTask();
-				ToRemovePending.Add(Pair.Key);
+				if (UVoxelMacroTileComponent* C = Pair.Value)
+				{
+					C->CancelPendingTask();
+					C->UnloadChunk();
+					C->DestroyComponent();
+				}
+				ToRemoveTiles.Add(Pair.Key);
 			}
 		}
-
-		for (const FIntPoint& T : ToRemoveActive)
+		for (const FIntPoint& T : ToRemoveTiles)
 		{
-			if (UVoxelMacroTileComponent* C = ActiveMacro[T])
-			{
-				C->CancelPendingTask();
-				C->UnloadChunk();
-				C->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
-			}
-			ActiveMacro.Remove(T);
-		}
-		for (const FIntPoint& T : ToRemovePending)
-		{
-			if (UVoxelMacroTileComponent* C = PendingMacro[T])
-			{
-				C->CancelPendingTask();
-				C->UnloadChunk();
-				C->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
-			}
 			PendingMacro.Remove(T);
 		}
 	}
 
-	// Unload invisible chunks
-	TArray<FVoxelCoord> ToRemoveA, ToRemoveP;
+	// OPTIMIZATION: Single-pass chunk unloading (build removal list while unloading)
+	// Reuse static array to avoid allocations
+	static TArray<FVoxelCoord> ToRemoveChunks;
+	ToRemoveChunks.Reset(0);
 
+	// Unload invisible active chunks
 	for (const auto& Pair : ActiveChunks)
 	{
 		if (!Visible.Contains(Pair.Key))
 		{
-			if (UVoxelChunkComponent* C = Pair.Value) { C->CancelPendingTask(); }
-			ToRemoveA.Add(Pair.Key);
+			if (UVoxelChunkComponent* Chunk = Pair.Value)
+			{
+				Chunk->CancelPendingTask();
+				Chunk->UnloadChunk();
+				Chunk->DestroyComponent();
+			}
+			ToRemoveChunks.Add(Pair.Key);
 		}
 	}
+	for (const FVoxelCoord& C : ToRemoveChunks)
+	{
+		ActiveChunks.Remove(C);
+	}
+
+	// Unload invisible pending chunks
+	ToRemoveChunks.Reset(0);
 	for (const auto& Pair : PendingChunks)
 	{
 		if (!Visible.Contains(Pair.Key))
 		{
-			if (UVoxelChunkComponent* C = Pair.Value) { C->CancelPendingTask(); }
-			ToRemoveP.Add(Pair.Key);
+			if (UVoxelChunkComponent* Chunk = Pair.Value)
+			{
+				Chunk->CancelPendingTask();
+				Chunk->UnloadChunk();
+				Chunk->DestroyComponent();
+			}
+			ToRemoveChunks.Add(Pair.Key);
 		}
 	}
-
-	for (const FVoxelCoord& C : ToRemoveA)
+	for (const FVoxelCoord& C : ToRemoveChunks)
 	{
-		if (UVoxelChunkComponent* Chunk = ActiveChunks[C])
-		{
-			Chunk->CancelPendingTask();
-			Chunk->UnloadChunk();
-			Chunk->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
-		}
-		ActiveChunks.Remove(C);
-	}
-	for (const FVoxelCoord& C : ToRemoveP)
-	{
-		if (UVoxelChunkComponent* Chunk = PendingChunks[C])
-		{
-			Chunk->CancelPendingTask();
-			Chunk->UnloadChunk();
-			Chunk->DestroyComponent(); // CRITICAL: Destroy component to allow respawning
-		}
 		PendingChunks.Remove(C);
 	}
 }
