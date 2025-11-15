@@ -372,6 +372,28 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                 {
                     const int32 uCount = FMath::Min(TileWidth, A.DimU - uTile);
 
+                    // OPTIMIZATION: Pre-fetch block IDs for entire tile to avoid repeated BlockAt() calls
+                    // This converts random access into linear reads (much faster)
+                    TArray<EVoxelBlockID> TileBlockIDs;
+                    TileBlockIDs.SetNumUninitialized(uCount * A.DimV);
+                    EVoxelBlockID* VOXEL_RESTRICT BlockIDPtr = TileBlockIDs.GetData();
+
+                    for (int v = 0; v < A.DimV; ++v)
+                    {
+                        // OPTIMIZATION: Prefetch next row while processing current row
+                        if (VOXEL_LIKELY(v + 1 < A.DimV))
+                        {
+                            VOXEL_PREFETCH(&BlockIDPtr[(v + 1) * uCount]);
+                        }
+
+                        for (int du = 0; du < uCount; ++du)
+                        {
+                            const int u = uTile + du;
+                            const FIntVector P = MakePos(A.N, s, u, v);
+                            BlockIDPtr[v * uCount + du] = BlockAt(P.X, P.Y, P.Z);
+                        }
+                    }
+
                     // Build face visibility masks for this tile using bitwise operations
                     TArray<uint64> VisibleMasks;
                     TArray<bool> HasData;
@@ -434,28 +456,43 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const uint64 RunStart = Row >> du0;
                             int32 Width = 0;
 
-                            // Get base block ID for texturing
-                            const int u0 = uTile + du0;
-                            const FIntVector P0 = MakePos(A.N, s, u0, v);
-                            const EVoxelBlockID BaseBlockID = BlockAt(P0.X, P0.Y, P0.Z);
+                            // OPTIMIZATION: Get base block ID from pre-fetched array (no function call)
+                            const EVoxelBlockID BaseBlockID = BlockIDPtr[v * uCount + du0];
 
-                            // Count consecutive faces with same block ID
+                            // OPTIMIZATION: Count consecutive faces with same block ID using pre-fetched array
+                            // Process multiple voxels at once for better throughput
                             uint64 Temp = RunStart;
+                            const EVoxelBlockID* VOXEL_RESTRICT RowPtr = BlockIDPtr + v * uCount + du0;
+
+                            // OPTIMIZATION: Unroll loop for better performance (process 4 at a time)
+                            while ((Temp & 1ull) && Width + 3 < (uCount - du0))
+                            {
+                                // Check 4 block IDs at once (compiler can vectorize this)
+                                if (VOXEL_LIKELY(RowPtr[Width] == BaseBlockID &&
+                                                 RowPtr[Width + 1] == BaseBlockID &&
+                                                 RowPtr[Width + 2] == BaseBlockID &&
+                                                 RowPtr[Width + 3] == BaseBlockID))
+                                {
+                                    Width += 4;
+                                    Temp >>= 4;
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+
+                            // Handle remaining voxels
                             while ((Temp & 1ull) && Width < (uCount - du0))
                             {
-                                // Check if block ID matches
-                                const int u = uTile + du0 + Width;
-                                const FIntVector P = MakePos(A.N, s, u, v);
-                                const EVoxelBlockID BlockID = BlockAt(P.X, P.Y, P.Z);
-
-                                if (BlockID != BaseBlockID)
+                                if (VOXEL_UNLIKELY(RowPtr[Width] != BaseBlockID))
                                     break;
 
                                 Width++;
                                 Temp >>= 1;
                             }
 
-                            if (Width == 0) Width = 1;
+                            if (VOXEL_UNLIKELY(Width == 0)) Width = 1;
 
                             // Try to extend vertically (greedy merge in V direction)
                             int32 Height = 1;
@@ -466,26 +503,25 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                                 const uint64 NextRow = VisibleMasks[v + dv] & ~ProcessedMasks[v + dv];
                                 const uint64 Match = (NextRow & RunMask);
 
-                                // Check if all bits in the run match AND all block IDs match
-                                if (Match != RunMask)
+                                // OPTIMIZATION: Check if all bits in the run match first (fast bitwise op)
+                                if (VOXEL_UNLIKELY(Match != RunMask))
                                     break;
 
-                                // Verify block IDs match
+                                // OPTIMIZATION: Verify block IDs using pre-fetched array (no function calls)
                                 bool bAllMatch = true;
+                                const int32 RowOffset = (v + dv) * uCount;
                                 for (int du = 0; du < Width; ++du)
                                 {
-                                    const int u = uTile + du0 + du;
-                                    const FIntVector P = MakePos(A.N, s, u, v + dv);
-                                    const EVoxelBlockID BlockID = BlockAt(P.X, P.Y, P.Z);
+                                    const EVoxelBlockID BlockID = BlockIDPtr[RowOffset + du0 + du];
 
-                                    if (BlockID != BaseBlockID)
+                                    if (VOXEL_UNLIKELY(BlockID != BaseBlockID))
                                     {
                                         bAllMatch = false;
                                         break;
                                     }
                                 }
 
-                                if (!bAllMatch)
+                                if (VOXEL_UNLIKELY(!bAllMatch))
                                     break;
 
                                 Height++;
