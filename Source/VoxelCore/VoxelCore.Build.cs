@@ -15,8 +15,8 @@ public class VoxelCore : ModuleRules
         // Enable aggressive code optimization
         OptimizeCode = CodeOptimization.Always;  // Always optimize, even in dev builds
 
-        // Enable AVX/AVX2 SIMD instructions (requires CPU support)
-        bUseAVX = true;
+        // Note: bUseAVX causes type conflicts with Unreal's VectorRegister types
+        // Our SIMD optimizations use SSE2 (always available on x64) instead
 
         PublicDependencyModuleNames.AddRange(new string[] {
             "Core", "CoreUObject", "Engine", "InputCore",
@@ -31,9 +31,6 @@ public class VoxelCore : ModuleRules
         {
             bUseRTTI = true;
             bEnableExceptions = true;
-
-            // Note: bEnableFastMath, bFunctionLevelLinking, bEnableWholeProgramOptimization
-            // are not available in this UE version - using OptimizeCode=Always instead
         }
     }
 }

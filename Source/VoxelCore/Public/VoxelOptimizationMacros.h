@@ -85,7 +85,13 @@
 // Tell the compiler about memory alignment (enables SIMD)
 
 #define VOXEL_ALIGN(n) alignas(n)
-#define VOXEL_ASSUME_ALIGNED(ptr, alignment) __builtin_assume_aligned(ptr, alignment)
+
+#if defined(__GNUC__) || defined(__clang__)
+    #define VOXEL_ASSUME_ALIGNED(ptr, alignment) __builtin_assume_aligned(ptr, alignment)
+#else
+    // MSVC doesn't have __builtin_assume_aligned, just return the pointer
+    #define VOXEL_ASSUME_ALIGNED(ptr, alignment) (ptr)
+#endif
 
 // ============================================================================
 // CACHE LINE SIZE
