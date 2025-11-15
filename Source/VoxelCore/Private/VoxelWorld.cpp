@@ -728,13 +728,27 @@ void AVoxelWorld::UpdateChunks()
 						// OPTIMIZATION: Frustum culling - only generate chunks in player's view cone
 						if (bUseFrustum)
 						{
-							// Calculate direction from player to chunk center
-							const FVector ChunkWorldPos = ChunkCoordToWorld(ChunkCoord);
+							// Calculate chunk center in world space
+							const float VoxelUU = S->VoxelWorldScale;
+							const float ChunkWorldSizeX = S->ChunkSizeX * VoxelUU;
+							const float ChunkWorldSizeY = S->ChunkSizeY * VoxelUU;
+							const float ChunkWorldSizeZ = S->ChunkSizeZ * VoxelUU;
+
+							const FVector ChunkWorldPos(
+								ChunkCoord.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
+								ChunkCoord.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
+								ChunkCoord.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
+							);
+
 							const FVector ToChunk = ChunkWorldPos - PlayerLocation;
 							const float DistanceSq = ToChunk.SizeSquared();
 
 							// Skip frustum check for very close chunks (always keep chunks around player)
-							if (DistanceSq > ChunkSize * ChunkSize * 4.0f)
+							// Use chunk world size (not voxel size) for threshold
+							const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
+							const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
+
+							if (DistanceSq > CloseChunkThreshold)
 							{
 								const FVector ToChunkDir = ToChunk.GetSafeNormal();
 
