@@ -187,9 +187,18 @@ public:
      * No bounds checks are performed.
      *
      * OPTIMIZED: Uses lookup table (10-20% faster than shift+mask)
+     * Set VOXEL_USE_ORIGINAL_GET=1 to use original implementation for debugging
      */
     VOXEL_FORCE_INLINE uint8 Get(int32 X, int32 Y, int32 Z) const
     {
+#ifndef VOXEL_USE_ORIGINAL_GET
+        // OPTIMIZED VERSION: Uses lookup table
+        // Safety: Ensure LUT is initialized (should already be done in Init(), but be safe)
+        if (VOXEL_UNLIKELY(!bLUTInitialized))
+        {
+            const_cast<FCategoryBitset*>(this)->InitializeLUT();
+        }
+
         const int64 idx = LinearIndex(X, Y, Z);
         const int64 bitIndex = idx * 2;
         const int64 byteIndex = bitIndex >> 3;
@@ -210,6 +219,24 @@ public:
             const uint8 msb = Data[byteIndex + 1] & 0x1u;
             return lsb | (msb << 1);
         }
+#else
+        // ORIGINAL VERSION: Direct bit manipulation (fallback for debugging)
+        const int64 idx = LinearIndex(X, Y, Z);
+        const int64 bitIndex = idx * 2;
+        const int64 byteIndex = bitIndex >> 3;
+        const int32 bitOffset = static_cast<int32>(bitIndex & 7);
+
+        if (bitOffset <= 6)
+        {
+            return (Data[byteIndex] >> bitOffset) & 0x3u;
+        }
+        else
+        {
+            const uint8 lsb = (Data[byteIndex] >> 7) & 0x1u;
+            const uint8 msb = Data[byteIndex + 1] & 0x1u;
+            return lsb | (msb << 1);
+        }
+#endif
     }
 
     /**
@@ -218,9 +245,12 @@ public:
      * Returns true if all bytes are zero (all voxels are air).
      *
      * OPTIMIZED: SIMD version (8-16x faster than scalar loop)
+     * Set VOXEL_USE_ORIGINAL_ISEMPTY=1 to use original implementation for debugging
      */
     VOXEL_FORCE_INLINE bool IsAllEmpty() const
     {
+#ifndef VOXEL_USE_ORIGINAL_ISEMPTY
+        // OPTIMIZED VERSION: Uses SIMD (SSE2)
         const uint8* VOXEL_RESTRICT Ptr = Data.GetData();
         const int32 NumBytes = Data.Num();
 
@@ -256,6 +286,21 @@ public:
         }
 
         return true;
+#else
+        // ORIGINAL VERSION: Scalar loop (fallback for debugging)
+        const uint8* Ptr = Data.GetData();
+        const int32 NumBytes = Data.Num();
+
+        for (int32 i = 0; i < NumBytes; ++i)
+        {
+            if (Ptr[i] != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+#endif
     }
 
     /**
