@@ -135,6 +135,25 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Streaming|Shape")
 	bool bDiskShapedLoading = true;
 
+	// ==================== OCCLUSION CULLING ====================
+
+	/**
+	 * Enable simple height-based occlusion culling (hide chunks behind mountains).
+	 * WARNING: Experimental! May hide chunks incorrectly in some cases.
+	 * Recommended: false (disabled until fully tested)
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Streaming|Occlusion")
+	bool bEnableOcclusionCulling = false;
+
+	/**
+	 * Minimum distance before occlusion culling applies (in chunks).
+	 * Chunks closer than this are never occluded (prevents glitches near player).
+	 * Recommended: 4-8 chunks
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Streaming|Occlusion",
+		meta = (ClampMin = "0", ClampMax = "32", EditCondition = "bEnableOcclusionCulling"))
+	int32 OcclusionMinDistance = 8;
+
 	// ==================== PUBLIC API ====================
 
 	/** Get current actor location (cached for performance) */

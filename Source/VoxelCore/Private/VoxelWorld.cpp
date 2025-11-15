@@ -953,6 +953,85 @@ void AVoxelWorld::UpdateChunks()
 		UVoxelChunkComponent* Active = ActiveChunks.FindRef(C);
 		UVoxelChunkComponent* Pending = PendingChunks.FindRef(C);
 
+		// VISIBILITY CULLING: Update visibility for player sources (saves GPU draw calls)
+		// Only apply if this is a player source (non-players don't control visibility)
+		if (Active && PrimarySource && PrimarySource->bIsPlayerSource)
+		{
+			// Calculate if chunk is in frustum (reuse earlier frustum logic)
+			bool bShouldBeVisible = true; // Default: visible
+
+			// Calculate chunk center in world space (used by both frustum and occlusion checks)
+			const FVector ChunkWorldPos(
+				C.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
+				C.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
+				C.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
+			);
+
+			const FVector ToChunk = ChunkWorldPos - PlayerLocation;
+			const float DistanceSq = ToChunk.SizeSquared();
+
+			// FRUSTUM CULLING
+			if (bApplyFrustumPriority && FrustumHFOV < 360.0f)
+			{
+				// Close chunks always visible
+				const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
+				const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
+
+				if (DistanceSq > CloseChunkThreshold)
+				{
+					const FVector ToChunkDir = ToChunk.GetSafeNormal();
+
+					// Horizontal frustum check
+					const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
+					const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
+
+					bShouldBeVisible = (DotHorizontal >= CosHalfHorizontalFOV);
+
+					// Vertical frustum check (optional)
+					if (bShouldBeVisible && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
+					{
+						const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
+						bShouldBeVisible = (DotVertical >= CosHalfVerticalFOV);
+					}
+				}
+			}
+
+			// OCCLUSION CULLING (simple height-based check)
+			if (bShouldBeVisible && PrimarySource->bEnableOcclusionCulling)
+			{
+				const int32 OcclusionMinDistSq = PrimarySource->OcclusionMinDistance * PrimarySource->OcclusionMinDistance;
+
+				// Only occlude chunks beyond minimum distance
+				if (d2 > OcclusionMinDistSq)
+				{
+					// Simple occlusion: Hide chunks significantly below player height and far away
+					// This catches chunks on the other side of mountains/hills
+					const float ChunkTopZ = ChunkWorldPos.Z + (ChunkWorldSizeZ * 0.5f);
+					const float PlayerZ = PlayerLocation.Z;
+
+					// If chunk's top is more than 2 chunk heights below player, likely occluded
+					const float HeightDifference = PlayerZ - ChunkTopZ;
+					if (HeightDifference > ChunkWorldSizeZ * 2.0f)
+					{
+						bShouldBeVisible = false;
+						// TODO: More sophisticated occlusion with terrain raycasting
+					}
+				}
+			}
+
+			// Apply visibility to mesh component
+			if (Active->bUsingRMC && Active->RMC)
+			{
+				Active->RMC->SetVisibility(bShouldBeVisible, true);
+				Active->RMC->SetHiddenInGame(!bShouldBeVisible, true);
+			}
+			else if (Active->PMC)
+			{
+				Active->PMC->SetVisibility(bShouldBeVisible, true);
+				Active->PMC->SetHiddenInGame(!bShouldBeVisible, true);
+			}
+		}
+
 		// OPTIMIZATION: Early exit if chunk exists and already correct
 		// Update priority distance if chunk exists
 		if (Active)
@@ -1004,6 +1083,14 @@ void AVoxelWorld::UpdateChunks()
 
 			Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 			ActiveChunks.Add(C, Chunk);
+
+			// DEBUG: Log collision settings for chunks near player
+			if (d2 <= 4) // Log for chunks within 2-chunk radius
+			{
+				UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d, CollisionR2=%d)"),
+					C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR, CollisionR2);
+			}
+
 			continue;
 		}
 

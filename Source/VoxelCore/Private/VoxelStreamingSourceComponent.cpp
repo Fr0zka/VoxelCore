@@ -20,6 +20,8 @@ UVoxelStreamingSourceComponent::UVoxelStreamingSourceComponent()
 	PriorityWeight = 1.0f;
 	bIsPlayerSource = false;
 	bDiskShapedLoading = true;
+	bEnableOcclusionCulling = false;
+	OcclusionMinDistance = 8;
 	bIsActive = false;
 
 	// Initialize cached data
