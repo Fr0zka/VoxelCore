@@ -391,7 +391,6 @@ void UVoxelMesher::BuildGreedyMesh(
         const int32 DimV = (N.X != 0) ? SZ : (N.Y != 0) ? SZ : SY;
         // OPTIMIZATION: Compute face direction once per face instead of per quad
         const EVoxelFaceDir FaceDir = FaceDirToEnum(N);
-        EVoxelBlockID SolidBlock;
         auto MakeP = [&](int32 s, int32 u, int32 v)->FIntVector
             {
                 if (N.X != 0) return FIntVector(s, u, v);
@@ -408,6 +407,10 @@ void UVoxelMesher::BuildGreedyMesh(
             // OPTIMIZATION: Track if slice has any faces to avoid empty slice processing
             bool bHasAnyFaces = false;
             for (int32 vv = 0; vv < DimV; ++vv)
+            {
+                // OPTIMIZATION: Row-level early exit for fully air rows
+                bool bRowHasFaces = false;
+
                 for (int32 uu = 0; uu < DimU; ++uu)
                 {
                     const FIntVector P = MakeP(slice, uu, vv);
@@ -419,12 +422,13 @@ void UVoxelMesher::BuildGreedyMesh(
                     const bool bFacesBetweenNonAir = false; // cvar or setting
                     const bool bExpose = (CatA != 0) && ((CatB == 0) || (bFacesBetweenNonAir && (CatA != CatB)));
                     const uint8 MaskVal = bExpose ? CatA : 0;
-                    // Owner is the solid voxel A; neighbor B is air
-                    EVoxelBlockID Owner = BlockAt(P.X, P.Y, P.Z);
-                    SolidBlock = (CatA != 0 ? BlockAt(P.X, P.Y, P.Z) : BlockAt(Q.X, Q.Y, Q.Z));
+
                     GReusableMask[Idx2D(uu, vv, DimU)] = MaskVal;
-                    bHasAnyFaces |= (MaskVal != 0);
+                    bRowHasFaces |= (MaskVal != 0);
                 }
+
+                bHasAnyFaces |= bRowHasFaces;
+            }
 
             // OPTIMIZATION: Skip greedy merging entirely if this slice has no faces
             if (!bHasAnyFaces)
@@ -433,6 +437,23 @@ void UVoxelMesher::BuildGreedyMesh(
             int32 v = 0;
             while (v < DimV)
             {
+                // OPTIMIZATION: Skip entirely empty rows (common in sparse voxel data)
+                bool bRowHasData = false;
+                for (int32 uu = 0; uu < DimU; ++uu)
+                {
+                    if (GReusableMask[Idx2D(uu, v, DimU)] != 0)
+                    {
+                        bRowHasData = true;
+                        break;
+                    }
+                }
+
+                if (!bRowHasData)
+                {
+                    ++v;
+                    continue;
+                }
+
                 int32 u = 0;
                 while (u < DimU)
                 {
