@@ -372,41 +372,21 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                 {
                     const int32 uCount = FMath::Min(TileWidth, A.DimU - uTile);
 
-                    // OPTIMIZATION: Pre-fetch block IDs for entire tile to avoid repeated BlockAt() calls
-                    // This converts random access into linear reads (much faster)
-                    TArray<EVoxelBlockID> TileBlockIDs;
-                    TileBlockIDs.SetNumUninitialized(uCount * A.DimV);
-                    EVoxelBlockID* VOXEL_RESTRICT BlockIDPtr = TileBlockIDs.GetData();
-
-                    for (int v = 0; v < A.DimV; ++v)
-                    {
-                        // OPTIMIZATION: Prefetch next row while processing current row
-                        if (VOXEL_LIKELY(v + 1 < A.DimV))
-                        {
-                            VOXEL_PREFETCH(&BlockIDPtr[(v + 1) * uCount]);
-                        }
-
-                        for (int du = 0; du < uCount; ++du)
-                        {
-                            const int u = uTile + du;
-                            const FIntVector P = MakePos(A.N, s, u, v);
-                            BlockIDPtr[v * uCount + du] = BlockAt(P.X, P.Y, P.Z);
-                        }
-                    }
-
-                    // Build face visibility masks for this tile using bitwise operations
+                    // Build face visibility masks AND block ID cache for this tile
+                    // OPTIMIZATION: Cache block IDs as we build masks to avoid duplicate lookups
                     TArray<uint64> VisibleMasks;
-                    TArray<bool> HasData;
+                    TArray<EVoxelBlockID> BlockIDCache;  // Cache block IDs as we scan
                     VisibleMasks.SetNumZeroed(A.DimV);
-                    HasData.SetNumZeroed(A.DimV);
+                    BlockIDCache.SetNumUninitialized(uCount * A.DimV);
 
                     bool bTileHasAnyFaces = false;
 
+                    // OPTIMIZATION: Build visibility masks AND cache block IDs in single pass
                     for (int v = 0; v < A.DimV; ++v)
                     {
-                        // Build bitmasks for current and neighbor rows
                         uint64 CurrentMask = 0;
                         uint64 NeighborMask = 0;
+                        const int32 RowOffset = v * uCount;
 
                         for (int du = 0; du < uCount; ++du)
                         {
@@ -417,17 +397,19 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const uint8 Ac = CatAt(P.X, P.Y, P.Z);
                             const uint8 Bc = CatAt(Q.X, Q.Y, Q.Z);
 
+                            // Cache block ID (we'll need it for texturing)
+                            BlockIDCache[RowOffset + du] = BlockAt(P.X, P.Y, P.Z);
+
                             // Set bit if this voxel matches our category
-                            if (Ac == CatType) CurrentMask |= (1ull << du);
+                            if (VOXEL_LIKELY(Ac == CatType)) CurrentMask |= (1ull << du);
                             if (Bc == CatType) NeighborMask |= (1ull << du);
                         }
 
-                        // Find visible faces using bitwise operation (FAST!)
-                        // A face is visible if current is solid AND neighbor is air
-                        uint64 Visible = CurrentMask & ~NeighborMask;
+                        // Find visible faces using bitwise operation
+                        // A face is visible if current=CatType AND neighbor!=CatType
+                        const uint64 Visible = CurrentMask & ~NeighborMask;
 
                         VisibleMasks[v] = Visible;
-                        HasData[v] = (Visible != 0);
                         bTileHasAnyFaces |= (Visible != 0);
                     }
 
@@ -456,36 +438,19 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const uint64 RunStart = Row >> du0;
                             int32 Width = 0;
 
-                            // OPTIMIZATION: Get base block ID from pre-fetched array (no function call)
-                            const EVoxelBlockID BaseBlockID = BlockIDPtr[v * uCount + du0];
+                            // OPTIMIZATION: Get base block ID from cache (single lookup)
+                            const int32 BaseIdx = v * uCount + du0;
+                            const EVoxelBlockID BaseBlockID = BlockIDCache[BaseIdx];
 
-                            // OPTIMIZATION: Count consecutive faces with same block ID using pre-fetched array
-                            // Process multiple voxels at once for better throughput
+                            // OPTIMIZATION: Count consecutive faces with same block ID
+                            // Use CTZ to skip over runs quickly
                             uint64 Temp = RunStart;
-                            const EVoxelBlockID* VOXEL_RESTRICT RowPtr = BlockIDPtr + v * uCount + du0;
 
-                            // OPTIMIZATION: Unroll loop for better performance (process 4 at a time)
-                            while ((Temp & 1ull) && Width + 3 < (uCount - du0))
-                            {
-                                // Check 4 block IDs at once (compiler can vectorize this)
-                                if (VOXEL_LIKELY(RowPtr[Width] == BaseBlockID &&
-                                                 RowPtr[Width + 1] == BaseBlockID &&
-                                                 RowPtr[Width + 2] == BaseBlockID &&
-                                                 RowPtr[Width + 3] == BaseBlockID))
-                                {
-                                    Width += 4;
-                                    Temp >>= 4;
-                                }
-                                else
-                                {
-                                    break;
-                                }
-                            }
-
-                            // Handle remaining voxels
                             while ((Temp & 1ull) && Width < (uCount - du0))
                             {
-                                if (VOXEL_UNLIKELY(RowPtr[Width] != BaseBlockID))
+                                const EVoxelBlockID BlockID = BlockIDCache[BaseIdx + Width];
+
+                                if (VOXEL_UNLIKELY(BlockID != BaseBlockID))
                                     break;
 
                                 Width++;
@@ -507,12 +472,12 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                                 if (VOXEL_UNLIKELY(Match != RunMask))
                                     break;
 
-                                // OPTIMIZATION: Verify block IDs using pre-fetched array (no function calls)
+                                // OPTIMIZATION: Verify block IDs using cached array
                                 bool bAllMatch = true;
-                                const int32 RowOffset = (v + dv) * uCount;
+                                const int32 NextRowOffset = (v + dv) * uCount;
                                 for (int du = 0; du < Width; ++du)
                                 {
-                                    const EVoxelBlockID BlockID = BlockIDPtr[RowOffset + du0 + du];
+                                    const EVoxelBlockID BlockID = BlockIDCache[NextRowOffset + du0 + du];
 
                                     if (VOXEL_UNLIKELY(BlockID != BaseBlockID))
                                     {
