@@ -666,16 +666,24 @@ void AVoxelWorld::UpdateChunks()
 	const int32 R2Sq = R2 * R2;
 	const int32 Rz = FMath::Max(0, S->ViewDistanceChunksZ);
 
-	// Build desired chunk list (reuse static arrays to avoid allocations)
+	// OPTIMIZATION: Reuse static arrays to avoid allocations per frame
 	static TArray<TPair<FVoxelCoord, int32>> Desired;
 	static TSet<FVoxelCoord> Visible;
 
-	Desired.Reset(0);
+	Desired.Reset(0);  // Keep capacity, just clear count
 	Visible.Reset();
 
 	const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
-	Desired.Reserve(EstimatedSize);
-	Visible.Reserve(EstimatedSize);
+
+	// OPTIMIZATION: Only reserve if current capacity is insufficient
+	if (Desired.GetSlack() < EstimatedSize)
+	{
+		Desired.Reserve(EstimatedSize);
+	}
+	if (Visible.GetSlack() < EstimatedSize)
+	{
+		Visible.Reserve(EstimatedSize);
+	}
 
 	// Build desired list around player's current vertical chunk
 	const int32 VerticalCenter = CenterChunk.Cz;
@@ -695,19 +703,18 @@ void AVoxelWorld::UpdateChunks()
 		}
 	}
 
-	// Sort by distance-squared (closest first), then prefer same-height, then smaller |dx|+|dy|
-	const int32 Cxc = CenterChunk.Cx;
-	const int32 Cyc = CenterChunk.Cy;
+	// OPTIMIZATION: Simplified sort comparator - just distance-squared (primary) and Z-priority (secondary)
+	// Removed expensive Manhattan distance calculation - not critical for chunk spawning order
 	const int32 Czc = CenterChunk.Cz;
-	Desired.Sort([Cxc, Cyc, Czc](const TPair<FVoxelCoord, int32>& A, const TPair<FVoxelCoord, int32>& B)
+	Desired.Sort([Czc](const TPair<FVoxelCoord, int32>& A, const TPair<FVoxelCoord, int32>& B)
 	{
+		// Primary: distance-squared (closest first)
 		if (A.Value != B.Value) return A.Value < B.Value;
+
+		// Secondary: prefer same vertical level (reduces vertical pop-in)
 		const int32 Az = FMath::Abs(A.Key.Cz - Czc);
 		const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
-		if (Az != Bz) return Az < Bz;
-		const int32 Axy = FMath::Abs(A.Key.Cx - Cxc) + FMath::Abs(A.Key.Cy - Cyc);
-		const int32 Bxy = FMath::Abs(B.Key.Cx - Cxc) + FMath::Abs(B.Key.Cy - Cyc);
-		return Axy < Bxy;
+		return Az < Bz;
 	});
 
 	// Collision and AO radii
