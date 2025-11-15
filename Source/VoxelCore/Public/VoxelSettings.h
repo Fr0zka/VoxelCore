@@ -130,15 +130,19 @@ public:
      * higher values = faster chunk loading but potential frame spikes.
      *
      * Recommended values:
-     * - 10-20: Smooth 144 FPS with minimal hitches
+     * - 0: Unlimited (best for editor, prevents queue backup)
+     * - 10-20: Smooth 144 FPS in shipped games with minimal hitches
      * - 30-50: Balanced performance
      * - 100+: Maximum throughput, may cause frame drops
      *
      * Set to 0 for unlimited (process all ready readbacks).
+     *
+     * IMPORTANT: Use 0 (unlimited) in editor to prevent queue backup and chunk generation deadlock.
+     * In shipping builds, consider 10-20 for smooth frame times.
      */
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing",
         meta = (ClampMin = "0", ClampMax = "500"))
-    int32 MaxGPUMeshReadbacksPerFrame = 20;
+    int32 MaxGPUMeshReadbacksPerFrame = 0;  // Changed from 20 to 0 (unlimited) to prevent editor queue backup
 
     /**
      * Enable GPU mesher for LOD0 (experimental, optional).
