@@ -554,7 +554,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     const int32 ChunkSizeY = Settings->ChunkSizeY;
 
     UE::Tasks::Launch(UE_SOURCE_LOCATION,
-        [this, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
+        [this, WeakWorld, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
         LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), HCopy = MoveTemp(HeightsCopy),
         SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings]() mutable
         {
@@ -578,7 +578,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     bAttemptedGPU = true;
 
                     TWeakObjectPtr<UVoxelChunkComponent> WeakChunk(this);
-                    TWeakObjectPtr<AVoxelWorld> WeakWorld(OwnerWorld);
+                    TWeakObjectPtr<AVoxelWorld> WeakWorldGPU(OwnerWorld);
                     const bool bUseNaive = SettingsPtr ? SettingsPtr->bUseNaiveMesher : false;
                     const bool bUseBinary = SettingsPtr ? SettingsPtr->bUseBinaryGreedyMesher : false;
                     const bool bAOFlag = bAO;
@@ -587,11 +587,11 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
                     const bool bLaunched = UVoxelMesher::BuildGreedyMesh_GPU_Async(
                         Voxels, SizeVox, &NbhCopy, XYScale, VoxelUU,
-                        [WeakChunk, WeakWorld, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
+                        [WeakChunk, WeakWorldGPU, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
                         (bool bSuccess, TArray<uint32>&& Packed, int32 SizeX, int32 SizeY, int32 SizeZ, int32 XYScaleParam, float VoxelUUParam)
                         {
                             UVoxelChunkComponent* Chunk = WeakChunk.Get();
-                            AVoxelWorld* World = WeakWorld.Get();
+                            AVoxelWorld* World = WeakWorldGPU.Get();
 
                             // CRITICAL: ALWAYS call OnMeshingFinished, even if chunk/world invalid
                             // This ensures ActiveMeshTasks is decremented and queue slots are freed
