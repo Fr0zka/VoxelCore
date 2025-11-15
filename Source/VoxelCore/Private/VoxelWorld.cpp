@@ -671,6 +671,10 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerLocation = Player->GetActorLocation();
 	const FVoxelCoord CenterChunk = WorldToChunkCoord(PlayerLocation);
 
+	// Get player view direction for frustum culling
+	const FRotator PlayerRotation = Player->GetActorRotation();
+	const FVector PlayerForward = PlayerRotation.Vector();
+
 	// Compute view ranges
 	const int32 R2 = (S->LOD2_Radius > 0) ? S->LOD2_Radius : S->ViewDistanceChunks;
 	const int32 R2Sq = R2 * R2;
@@ -680,12 +684,15 @@ void AVoxelWorld::UpdateChunks()
 	static TArray<TPair<FVoxelCoord, int32>> Desired;
 	static TSet<FVoxelCoord> Visible;
 	static FVoxelCoord LastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
+	static FRotator LastPlayerRotation = FRotator::ZeroRotator;
 	static bool bVisibleCached = false;
 
-	// OPTIMIZATION: Only rebuild when player moves chunks
+	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates significantly
 	const bool bCenterChanged = !(CenterChunk == LastDesiredCenter);
+	const bool bRotationChanged = S->bUseFrustumBasedGeneration && !PlayerRotation.Equals(LastPlayerRotation, 5.0f);
+	const bool bNeedsRebuild = bCenterChanged || bRotationChanged;
 
-	if (bCenterChanged || Desired.Num() == 0)
+	if (bNeedsRebuild || Desired.Num() == 0)
 	{
 		Desired.Reset(0);
 
@@ -698,6 +705,15 @@ void AVoxelWorld::UpdateChunks()
 
 		const int32 VerticalCenter = CenterChunk.Cz;
 
+		// OPTIMIZATION: Frustum culling - precompute cos(HalfFOV) for dot product comparison
+		const bool bUseFrustum = S->bUseFrustumBasedGeneration && S->FrustumHorizontalFOV < 360.0f;
+		const float CosHalfHorizontalFOV = bUseFrustum ? FMath::Cos(FMath::DegreesToRadians(S->FrustumHorizontalFOV * 0.5f)) : -1.0f;
+		const float CosHalfVerticalFOV = (bUseFrustum && S->bFrustumCullVertical)
+			? FMath::Cos(FMath::DegreesToRadians(S->FrustumVerticalFOV * 0.5f)) : -1.0f;
+
+		// Project player forward to XY plane for horizontal frustum check
+		const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
+
 		for (int32 dx = -R2; dx <= R2; ++dx)
 		{
 			for (int32 dy = -R2; dy <= R2; ++dy)
@@ -707,7 +723,43 @@ void AVoxelWorld::UpdateChunks()
 					const int32 d2 = dx * dx + dy * dy + dz * dz;
 					if (!S->bDiskShapedLoading || d2 <= R2Sq)
 					{
-						Desired.Emplace(FVoxelCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz), d2);
+						const FVoxelCoord ChunkCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz);
+
+						// OPTIMIZATION: Frustum culling - only generate chunks in player's view cone
+						if (bUseFrustum)
+						{
+							// Calculate direction from player to chunk center
+							const FVector ChunkWorldPos = ChunkCoordToWorld(ChunkCoord);
+							const FVector ToChunk = ChunkWorldPos - PlayerLocation;
+							const float DistanceSq = ToChunk.SizeSquared();
+
+							// Skip frustum check for very close chunks (always keep chunks around player)
+							if (DistanceSq > ChunkSize * ChunkSize * 4.0f)
+							{
+								const FVector ToChunkDir = ToChunk.GetSafeNormal();
+
+								// Horizontal frustum check (XY plane)
+								const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
+								const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
+
+								if (DotHorizontal < CosHalfHorizontalFOV)
+								{
+									continue; // Outside horizontal frustum, skip this chunk
+								}
+
+								// Vertical frustum check (optional)
+								if (S->bFrustumCullVertical && CosHalfVerticalFOV > -1.0f)
+								{
+									const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
+									if (DotVertical < CosHalfVerticalFOV)
+									{
+										continue; // Outside vertical frustum, skip this chunk
+									}
+								}
+							}
+						}
+
+						Desired.Emplace(ChunkCoord, d2);
 					}
 				}
 			}
@@ -723,6 +775,7 @@ void AVoxelWorld::UpdateChunks()
 		});
 
 		LastDesiredCenter = CenterChunk;
+		LastPlayerRotation = PlayerRotation;  // Cache rotation to detect camera turns
 		bVisibleCached = false;  // Invalidate Visible cache when Desired changes
 	}
 
