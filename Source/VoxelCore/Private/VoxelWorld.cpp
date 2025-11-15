@@ -755,6 +755,19 @@ void AVoxelWorld::UpdateChunks()
 	const float FrustumVFOV = PrimarySource ? PrimarySource->FrustumVerticalFOV : S->FrustumVerticalFOV;
 	const bool bDiskLoading = PrimarySource ? PrimarySource->bDiskShapedLoading : S->bDiskShapedLoading;
 
+	// Cache chunk world size for visibility culling (needed outside rebuild block)
+	const float VoxelUU = S->VoxelWorldScale;
+	const float ChunkWorldSizeX = S->ChunkSizeX * VoxelUU;
+	const float ChunkWorldSizeY = S->ChunkSizeY * VoxelUU;
+	const float ChunkWorldSizeZ = S->ChunkSizeZ * VoxelUU;
+
+	// Precompute frustum parameters for visibility culling (needed outside rebuild block)
+	const bool bApplyFrustumPriority = bUseFrustumPriority && FrustumHFOV < 360.0f;
+	const float CosHalfHorizontalFOV = bApplyFrustumPriority ? FMath::Cos(FMath::DegreesToRadians(FrustumHFOV * 0.5f)) : -1.0f;
+	const float CosHalfVerticalFOV = (bApplyFrustumPriority && bFrustumVertical)
+		? FMath::Cos(FMath::DegreesToRadians(FrustumVFOV * 0.5f)) : -1.0f;
+	const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
+
 	// OPTIMIZATION: Cache both Desired list (with priority) and Visible set to avoid rebuilding every frame
 	static TArray<TPair<FVoxelCoord, float>> Desired; // Coord → Priority (higher = more important)
 	static TSet<FVoxelCoord> Visible;
@@ -782,20 +795,8 @@ void AVoxelWorld::UpdateChunks()
 
 		const int32 VerticalCenter = CenterChunk.Cz;
 
-		// OPTIMIZATION: Frustum PRIORITY (not hard-culling) - precompute cos(HalfFOV) for dot product comparison
-		const bool bApplyFrustumPriority = bUseFrustumPriority && FrustumHFOV < 360.0f;
-		const float CosHalfHorizontalFOV = bApplyFrustumPriority ? FMath::Cos(FMath::DegreesToRadians(FrustumHFOV * 0.5f)) : -1.0f;
-		const float CosHalfVerticalFOV = (bApplyFrustumPriority && bFrustumVertical)
-			? FMath::Cos(FMath::DegreesToRadians(FrustumVFOV * 0.5f)) : -1.0f;
-
-		// Project player forward to XY plane for horizontal frustum check
-		const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
-
-		// Cache chunk world size for frustum calculations
-		const float VoxelUU = S->VoxelWorldScale;
-		const float ChunkWorldSizeX = S->ChunkSizeX * VoxelUU;
-		const float ChunkWorldSizeY = S->ChunkSizeY * VoxelUU;
-		const float ChunkWorldSizeZ = S->ChunkSizeZ * VoxelUU;
+		// NOTE: Frustum and chunk size variables are now declared outside the rebuild block
+		// so they're accessible for visibility culling later
 
 		for (int32 dx = -R2; dx <= R2; ++dx)
 		{
@@ -1020,15 +1021,15 @@ void AVoxelWorld::UpdateChunks()
 			}
 
 			// Apply visibility to mesh component
-			if (Active->bUsingRMC && Active->RMC)
+			if (Active->IsUsingRMC() && Active->GetRMC())
 			{
-				Active->RMC->SetVisibility(bShouldBeVisible, true);
-				Active->RMC->SetHiddenInGame(!bShouldBeVisible, true);
+				Active->GetRMC()->SetVisibility(bShouldBeVisible, true);
+				Active->GetRMC()->SetHiddenInGame(!bShouldBeVisible, true);
 			}
-			else if (Active->PMC)
+			else if (Active->GetPMC())
 			{
-				Active->PMC->SetVisibility(bShouldBeVisible, true);
-				Active->PMC->SetHiddenInGame(!bShouldBeVisible, true);
+				Active->GetPMC()->SetVisibility(bShouldBeVisible, true);
+				Active->GetPMC()->SetHiddenInGame(!bShouldBeVisible, true);
 			}
 		}
 
