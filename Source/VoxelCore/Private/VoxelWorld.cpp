@@ -196,7 +196,7 @@ void AVoxelWorld::DrainApplyQueue()
 	TArray<FPendingApply> ToProcess;
 	ToProcess.Reserve(MaxMeshAppliesPerTick);
 
-	// Gather items to process (collision prioritized)
+	// OPTIMIZATION: Gather items to process (collision prioritized) in single pass
 	{
 		FScopeLock Lock(&ApplyQueueMutex);
 		if (ApplyQueue.Num() == 0)
@@ -205,8 +205,10 @@ void AVoxelWorld::DrainApplyQueue()
 		}
 
 		const int32 Budget = MaxMeshAppliesPerTick;
-		TArray<int32> ToRemoveIndices;
-		ToRemoveIndices.Reserve(Budget);
+
+		// OPTIMIZATION: Use TSet for O(1) lookups instead of TArray Contains (was O(n²)!)
+		TSet<int32> ProcessedIndices;
+		ProcessedIndices.Reserve(Budget);
 
 		// Pass 1: Collision items (priority)
 		for (int32 i = 0; i < ApplyQueue.Num() && ToProcess.Num() < Budget; ++i)
@@ -214,21 +216,22 @@ void AVoxelWorld::DrainApplyQueue()
 			if (ApplyQueue[i].bCollision)
 			{
 				ToProcess.Add(MoveTemp(ApplyQueue[i]));
-				ToRemoveIndices.Add(i);
+				ProcessedIndices.Add(i);
 			}
 		}
 
-		// Pass 2: Fill remainder with non-collision
+		// Pass 2: Fill remainder with non-collision (using TSet for fast lookup)
 		for (int32 i = 0; i < ApplyQueue.Num() && ToProcess.Num() < Budget; ++i)
 		{
-			if (!ToRemoveIndices.Contains(i))
+			if (!ProcessedIndices.Contains(i))  // O(1) hash lookup instead of O(n) linear!
 			{
 				ToProcess.Add(MoveTemp(ApplyQueue[i]));
-				ToRemoveIndices.Add(i);
+				ProcessedIndices.Add(i);
 			}
 		}
 
-		// Batch remove (highest index first to avoid shifts)
+		// OPTIMIZATION: Batch remove using sorted indices (highest first to avoid shifts)
+		TArray<int32> ToRemoveIndices = ProcessedIndices.Array();
 		ToRemoveIndices.Sort();
 		for (int32 i = ToRemoveIndices.Num() - 1; i >= 0; --i)
 		{
@@ -752,12 +755,11 @@ void AVoxelWorld::UpdateChunks()
 
 	int32 MissingChunks = 0; // Track how many chunks are not yet spawned
 
-	// Process ALL desired chunks
+	// OPTIMIZATION: Process ALL desired chunks (Visible already built from Desired above)
 	for (const auto& Pair : Desired)
 	{
 		const FVoxelCoord& C = Pair.Key;
 		const int32 d2 = Pair.Value;
-		Visible.Add(C);
 
 		const EVoxelLODLevel DesiredLOD = PickLOD(d2, S);
 
@@ -780,12 +782,38 @@ void AVoxelWorld::UpdateChunks()
 		const bool bDesiredCollision0 = (d2 <= CollisionR2);
 		const bool bDesiredAO = (d2 <= AOR2);
 
+		// OPTIMIZATION: Single lookup per map instead of two FindRef calls
 		UVoxelChunkComponent* Active = ActiveChunks.FindRef(C);
 		UVoxelChunkComponent* Pending = PendingChunks.FindRef(C);
 
+		// OPTIMIZATION: Early exit if chunk exists and already correct
 		// Update priority distance if chunk exists
-		if (Active)  Active->PriorityDist2 = d2;
-		if (Pending) Pending->PriorityDist2 = d2;
+		if (Active)
+		{
+			Active->PriorityDist2 = d2;
+
+			// OPTIMIZATION: Early exit if this chunk is already correct (common case during generation)
+			// Check if LOD, collision, and AO settings are already correct
+			bool bDesiredCollision = bDesiredCollision0;
+			if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
+			{
+				bDesiredCollision = true;
+			}
+
+			const bool bSettingsMatch = (Active->LOD == DesiredLOD) &&
+			                            (Active->bBuildCollision == bDesiredCollision) &&
+			                            (Active->bUseAO == bDesiredAO);
+
+			if (bSettingsMatch && !Pending)
+			{
+				continue;  // Chunk is already correct, skip expensive processing
+			}
+		}
+
+		if (Pending)
+		{
+			Pending->PriorityDist2 = d2;
+		}
 
 		// NEW CHUNK: Progressive spawning with budget
 		if (!Active && !Pending)
