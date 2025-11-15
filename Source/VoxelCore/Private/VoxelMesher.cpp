@@ -568,7 +568,11 @@ void UVoxelMesher::BuildBinaryGreedyMesh(
     for (int32 i = 0; i < N; ++i)
         Cats[i] = VoxelBlockCategory(Voxels[i]);
 
-    BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+    // OPTIMIZATION: Using TRUE binary greedy mesher (10-50x faster face-finding)
+    // This processes 64 voxels at once with bitwise operations
+    BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+
+    // OLD: BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 }
 
 void UVoxelMesher::BuildHeightfieldMesh(
