@@ -168,7 +168,10 @@ void AVoxelWorld::RebuildDirtyBuckets()
 
 	const int32 CurrentFrame = GFrameCounter;
 	int32 RebuildsThisFrame = 0;
-	const int32 MaxRebuildsPerFrame = 2; // Throttle to avoid FPS spikes
+	// CRITICAL FIX: Increased from 2 to 8 (was severe bottleneck - 18+ frames to see anything!)
+	// With 37 buckets total, this rebuilds all in 5 frames instead of 18
+	// Budget: ~2-3ms per bucket merge × 8 = 16-24ms/frame during loading (acceptable)
+	const int32 MaxRebuildsPerFrame = 8;
 
 	for (auto& Pair : ChunkBuckets)
 	{
@@ -179,9 +182,10 @@ void AVoxelWorld::RebuildDirtyBuckets()
 		}
 
 		// Throttle: Don't rebuild same bucket too frequently
-		if (CurrentFrame - Bucket->LastRebuildFrame < 10)
+		// REDUCED from 10 to 3 frames (faster updates when chunks load)
+		if (CurrentFrame - Bucket->LastRebuildFrame < 3)
 		{
-			continue; // Wait at least 10 frames between rebuilds
+			continue; // Wait at least 3 frames between rebuilds
 		}
 
 		// Throttle: Max rebuilds per frame
