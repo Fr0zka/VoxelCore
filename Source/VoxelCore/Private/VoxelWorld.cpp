@@ -1283,7 +1283,7 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->PriorityDist2 = d2;
 
 				Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
-				ActiveChunks.Add(C, Chunk);
+				PendingChunks.Add(C, Chunk);  // Start as PENDING, promote to Active when ready
 
 				// Add to bucket if batching enabled
 				if (S && S->bEnableChunkBatching)
