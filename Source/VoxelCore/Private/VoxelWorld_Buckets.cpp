@@ -168,11 +168,10 @@ void AVoxelWorld::RebuildDirtyBuckets()
 
 	const int32 CurrentFrame = GFrameCounter;
 	int32 RebuildsThisFrame = 0;
-	// CRITICAL FIX: Increased from 2 to 16 for 40uu voxels (6.25x more chunks!)
-	// With 200+ buckets (40uu scale), need aggressive rebuilds
-	// Budget: ~2-3ms per bucket × 16 = 32-48ms/frame during loading
-	// 5800X3D can handle this easily - worth the brief FPS dip for fast visibility
-	const int32 MaxRebuildsPerFrame = 16;
+
+	// Get rebuild limits from settings (now configurable in editor!)
+	const int32 MaxRebuildsPerFrame = S->MaxBucketRebuildsPerFrame;
+	const int32 ThrottleFrames = S->BucketRebuildThrottleFrames;
 
 	for (auto& Pair : ChunkBuckets)
 	{
@@ -183,10 +182,9 @@ void AVoxelWorld::RebuildDirtyBuckets()
 		}
 
 		// Throttle: Don't rebuild same bucket too frequently
-		// REDUCED from 10 to 3 frames (faster updates when chunks load)
-		if (CurrentFrame - Bucket->LastRebuildFrame < 3)
+		if (CurrentFrame - Bucket->LastRebuildFrame < ThrottleFrames)
 		{
-			continue; // Wait at least 3 frames between rebuilds
+			continue; // Wait configured frames between rebuilds
 		}
 
 		// Throttle: Max rebuilds per frame

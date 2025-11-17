@@ -240,6 +240,52 @@ public:
     int32 MaxGPUMeshReadbacksPerFrame = 0;
 
     /**
+     * Maximum bucket mesh rebuilds per frame (when chunk batching enabled).
+     * Bucket rebuilds merge multiple chunk meshes into single batched mesh.
+     * Lower values = smoother FPS, higher values = faster visibility after chunk changes.
+     *
+     * Recommended values:
+     * - 2-4: Smooth 120+ FPS (mid-range hardware: 3700X + RTX 3070)
+     * - 8-12: Balanced 60 FPS (high-end hardware)
+     * - 16+: Maximum throughput (may cause hitches on lower-end hardware)
+     *
+     * Only applies when bEnableChunkBatching = true.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
+        meta = (ClampMin = "1", ClampMax = "64"))
+    int32 MaxBucketRebuildsPerFrame = 4;
+
+    /**
+     * Minimum frames between bucket rebuilds (throttle to prevent rebuild spam).
+     * Higher values = less CPU overhead but slower updates when chunks change.
+     * Lower values = faster updates but more CPU work.
+     *
+     * Recommended: 2-3 frames for responsive updates without overhead.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
+        meta = (ClampMin = "0", ClampMax = "60"))
+    int32 BucketRebuildThrottleFrames = 3;
+
+    /**
+     * Maximum chunks to check per frame during update loop.
+     * Prevents FPS drops when iterating 10,000+ chunks (40uu voxels at large view distances).
+     * Chunks are sorted by priority, so closest chunks always checked first.
+     *
+     * Lower values = smoother FPS but slower to process all chunks.
+     * Higher values = faster processing but potential frame drops.
+     *
+     * Recommended values:
+     * - 256-512: Smooth 120 FPS (mid-range hardware)
+     * - 1024-2048: Balanced 60 FPS
+     * - 4096+: Maximum throughput (high-end hardware only)
+     *
+     * NOTE: Already-correct chunks are skipped "for free" without counting toward limit.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
+        meta = (ClampMin = "64", ClampMax = "8192"))
+    int32 MaxChunksToCheckPerFrame = 512;
+
+    /**
      * GPU mesher tile size. Larger = more shared memory usage but better occupancy.
      * FIXED: Currently hardcoded to 8 in the compute shader and cannot be changed.
      * This setting is kept for future parameterization but currently has no effect.

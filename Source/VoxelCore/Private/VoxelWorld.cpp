@@ -1146,7 +1146,7 @@ void AVoxelWorld::UpdateChunks()
 	// CRITICAL OPTIMIZATION: Limit chunk iteration during initial load to prevent FPS drops
 	// With 10,000+ chunks (40uu voxels), iterating all chunks every frame kills performance
 	// Process chunks in batches - prioritized chunks first (already sorted by priority)
-	const int32 MaxChunksToCheckPerFrame = 512; // Check up to 512 chunks/frame (balance speed vs FPS)
+	const int32 MaxChunksToCheckPerFrame = S->MaxChunksToCheckPerFrame; // Now configurable in editor!
 	int32 ChunksCheckedThisFrame = 0;
 
 	// DEBUG: Log spawn progress
