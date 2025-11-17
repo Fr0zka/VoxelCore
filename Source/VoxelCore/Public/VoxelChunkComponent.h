@@ -149,6 +149,11 @@ public:
     void MarkAppliedSequence(int32 Seq) { LastAppliedSeq = FMath::Max(LastAppliedSeq, Seq); }
     int32 GetLastAppliedSequence() const { return LastAppliedSeq; }
 
+    // Mesh component access (for visibility culling)
+    FORCEINLINE UProceduralMeshComponent* GetPMC() const { return PMC; }
+    FORCEINLINE URealtimeMeshComponent* GetRMC() const { return RMC; }
+    FORCEINLINE bool IsUsingRMC() const { return bUsingRMC; }
+
 private:
     int32 MeshingSeqCounter = 0;
     int32 LastAppliedSeq = -1;

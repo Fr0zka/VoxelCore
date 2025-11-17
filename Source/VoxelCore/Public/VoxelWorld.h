@@ -10,6 +10,7 @@ class UVoxelChunkComponent;
 class UVoxelMacroTileComponent;
 class UProceduralMeshComponent;
 class URealtimeMeshComponent;
+class UVoxelStreamingSourceComponent;
 struct FMeshBuffers;
 
 /**
@@ -143,8 +144,12 @@ private:
 	/** Pending macro-tiles awaiting promotion. */
 	TMap<FIntPoint, UVoxelMacroTileComponent*> PendingMacro;
 
-	// ==================== PLAYER TRACKING ====================
+	// ==================== STREAMING SOURCE TRACKING ====================
 
+	/** Cached list of active streaming sources (updated each frame). */
+	TArray<UVoxelStreamingSourceComponent*> StreamingSources;
+
+	/** Last known center chunk (for detecting movement). */
 	bool bHasLastCenter = false;
 	FVoxelCoord LastCenterChunk;
 
@@ -192,6 +197,9 @@ private:
 
 private:
 	// ==================== INTERNAL HELPERS ====================
+
+	/** Gather all active streaming sources in the world (called each frame). */
+	void GatherStreamingSources();
 
 	/**
 	 * Drain apply queue up to MaxMeshAppliesPerTick (collision first).

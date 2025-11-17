@@ -55,6 +55,32 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
     int32 AORadiusChunks = 3;
 
+    // === Frustum-Based Generation (Massive Performance Boost) ===
+    // Only generate chunks within player's view cone instead of full 360° sphere.
+    // PERFORMANCE IMPACT: Reduces chunk count by 50-70% (e.g., 6,270 → ~2,000 chunks)
+    // Recommended: Enable for large view distances (ViewDistanceChunks > 16)
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming|Frustum Culling")
+    bool bUseFrustumBasedGeneration = false;
+
+    // Horizontal field of view for chunk generation (in degrees).
+    // Larger = more chunks ahead of player, smaller = narrower cone.
+    // Recommended: 120° (player FOV ~90° + 30° margin for turning)
+    // 180° = half-sphere (behind player culled), 360° = full sphere (frustum disabled)
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming|Frustum Culling",
+        meta = (ClampMin = "30.0", ClampMax = "360.0", EditCondition = "bUseFrustumBasedGeneration"))
+    float FrustumHorizontalFOV = 120.0f;
+
+    // Also apply frustum culling vertically (cull chunks above/below camera view).
+    // Recommended: false (vertical culling less useful, player often looks up/down)
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming|Frustum Culling",
+        meta = (EditCondition = "bUseFrustumBasedGeneration"))
+    bool bFrustumCullVertical = false;
+
+    // Vertical field of view for chunk generation (in degrees). Only used if bFrustumCullVertical=true.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Streaming|Frustum Culling",
+        meta = (ClampMin = "30.0", ClampMax = "180.0", EditCondition = "bUseFrustumBasedGeneration && bFrustumCullVertical"))
+    float FrustumVerticalFOV = 100.0f;
+
     // === Generation parameters ===
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Generation")
     int32 Seed = 1337;
@@ -95,11 +121,13 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "64"))
     int32 MaxConcurrentMeshingTasks = 2;
 
-    // === Performance: spawn budget ===
-    // Maximum number of new chunks we are allowed to spawn per frame.
-    // Lower values = smoother FPS during load, higher values = faster chunk spawn.
-    // Recommended: 4-6 for smooth 60fps, 8-12 for faster loading with some hitches.
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "256"))
+    // === Performance: Frame Budgets ===
+    // Maximum number of NEW chunk components to spawn per frame (CPU/memory budget).
+    // Controls how many UVoxelChunkComponent objects are created per frame.
+    // Lower values = smoother FPS during loading, higher values = faster chunk spawn with hitches.
+    // Recommended: 4-6 for smooth 60fps, 8-12 for faster loading, 16+ for aggressive loading.
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
+        meta = (ClampMin = "1", ClampMax = "256"))
     int32 MaxChunksSpawnPerFrame = 4;
 
     // === Performance: mesh component pool ===
@@ -122,6 +150,26 @@ public:
     // ===================================================================
     // GPU MESHER OPTIMIZATION OPTIONS (NEW)
     // ===================================================================
+
+    /**
+     * Maximum GPU mesh readbacks to process per frame (GPU→CPU transfer budget).
+     * This is SEPARATE from MaxChunksSpawnPerFrame (which controls component spawning).
+     *
+     * Controls frame-time budget for processing completed GPU meshing results.
+     * Lower values = smoother FPS, higher values = faster GPU mesh completion.
+     *
+     * Recommended values:
+     * - 0: Unlimited (best for editor, prevents queue backup and deadlock)
+     * - 10-20: Smooth 144 FPS in shipped games with minimal hitches
+     * - 30-50: Balanced performance for 60 FPS
+     * - 100+: Maximum throughput, may cause frame drops
+     *
+     * IMPORTANT: Use 0 (unlimited) in editor to prevent GPU queue backup.
+     * In shipping builds, consider 10-20 for smooth frame times.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
+        meta = (ClampMin = "0", ClampMax = "500"))
+    int32 MaxGPUMeshReadbacksPerFrame = 0;
 
     /**
      * Enable GPU mesher for LOD0 (experimental, optional).

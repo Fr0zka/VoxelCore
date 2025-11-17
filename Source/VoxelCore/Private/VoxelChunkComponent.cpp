@@ -108,6 +108,10 @@ void UVoxelChunkComponent::DoGeneration()
     const bool bHeight = (RenderMode == EVoxelRenderMode::Heightfield);
     const bool bUseGPU = Settings->bUseGPUGeneration && !bHeight; // GPU path only for voxel chunks
 
+    // CRITICAL: Capture OwnerWorld to ALWAYS call OnGenerationFinished, even if component is destroyed
+    // This prevents ActiveGenTasks from staying inflated and generation queue from growing infinitely
+    TWeakObjectPtr<AVoxelWorld> WeakWorld(OwnerWorld);
+
     // GPU GENERATION PATH (10-50x faster)
     if (bUseGPU && FVoxelGPUGenerator::IsGPUGenerationAvailable())
     {
@@ -130,13 +134,32 @@ void UVoxelChunkComponent::DoGeneration()
             Params.MaxCaveDepth,
             Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
             Params.NoiseProfile,      // Pass NoiseProfile for climate noise generation
-            [WeakThis, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
+            [WeakThis, WeakWorld, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
             {
                 // Check if component is still valid (might be destroyed during async generation)
                 UVoxelChunkComponent* This = WeakThis.Get();
+
+                // CRITICAL: ALWAYS call OnGenerationFinished, even if component is destroyed
+                // This ensures ActiveGenTasks is decremented and queue slots are freed
+                auto NotifyWorldLambda = [WeakThis, WeakWorld]()
+                {
+                    AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
+                    {
+                        if (AVoxelWorld* World = WeakWorld.Get())
+                        {
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            World->OnGenerationFinished(Comp); // Comp may be nullptr if destroyed - that's OK
+                        }
+                    });
+                };
+
                 if (!This || !IsValid(This))
                 {
-                    return; // Component destroyed - discard results
+                    // Component destroyed - discard results BUT notify world to free queue slot
+                    UE_LOG(LogTemp, Warning, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
+                        Coord.Cx, Coord.Cy, Coord.Cz);
+                    NotifyWorldLambda();
+                    return;
                 }
 
                 // GPU generation complete - copy to CategoryData
@@ -153,27 +176,22 @@ void UVoxelChunkComponent::DoGeneration()
 
                 if (This->bCancelPending)
                 {
-                    AsyncTask(ENamedThreads::GameThread, [WeakThis]()
-                        {
-                            UVoxelChunkComponent* Comp = WeakThis.Get();
-                            if (Comp && IsValid(Comp) && IsValid(Comp->OwnerWorld))
-                            {
-                                Comp->OwnerWorld->OnGenerationFinished(Comp);
-                            }
-                        });
+                    NotifyWorldLambda();
                     return;
                 }
 
-                AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
                     {
                         UVoxelChunkComponent* Comp = WeakThis.Get();
                         if (Comp && IsValid(Comp))
                         {
                             Comp->OnGenerationComplete();
-                            if (IsValid(Comp->OwnerWorld))
-                            {
-                                Comp->OwnerWorld->OnGenerationFinished(Comp);
-                            }
+                        }
+
+                        // ALWAYS notify world, even if component became invalid
+                        if (AVoxelWorld* World = WeakWorld.Get())
+                        {
+                            World->OnGenerationFinished(Comp); // Comp may be nullptr - that's OK
                         }
                     });
             });
@@ -182,7 +200,7 @@ void UVoxelChunkComponent::DoGeneration()
     }
 
     // CPU GENERATION PATH (legacy, always available)
-    UE::Tasks::Launch(UE_SOURCE_LOCATION, [this, Params, Coord, ScaleXY, bHeight]()
+    UE::Tasks::Launch(UE_SOURCE_LOCATION, [this, WeakWorld, Params, Coord, ScaleXY, bHeight]()
         {
             if (bHeight)
             {
@@ -205,17 +223,26 @@ void UVoxelChunkComponent::DoGeneration()
 
             if (bCancelPending)
             {
-                AsyncTask(ENamedThreads::GameThread, [this]()
+                AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
                     {
-                        if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+                        // ALWAYS notify world, even if OwnerWorld changed
+                        if (AVoxelWorld* World = WeakWorld.Get())
+                        {
+                            World->OnGenerationFinished(this);
+                        }
                     });
                 return;
             }
 
-            AsyncTask(ENamedThreads::GameThread, [this]()
+            AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
                 {
                     OnGenerationComplete();
-                    if (IsValid(OwnerWorld)) OwnerWorld->OnGenerationFinished(this);
+
+                    // ALWAYS notify world, even if OwnerWorld changed
+                    if (AVoxelWorld* World = WeakWorld.Get())
+                    {
+                        World->OnGenerationFinished(this);
+                    }
                 });
         });
 }
@@ -437,6 +464,10 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
     const bool bCollision = bBuildCollision;
     const bool bAO = bUseAO && (RenderMode == EVoxelRenderMode::Voxels);
+
+    // CRITICAL: Capture OwnerWorld to ALWAYS call OnMeshingFinished, even if world is destroyed
+    // This prevents ActiveMeshTasks from staying inflated and meshing queue from growing infinitely
+    TWeakObjectPtr<AVoxelWorld> WeakWorld(OwnerWorld);
     AVoxelWorld* W = OwnerWorld;
 
     const FIntVector SizeVox(
@@ -523,7 +554,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     const int32 ChunkSizeY = Settings->ChunkSizeY;
 
     UE::Tasks::Launch(UE_SOURCE_LOCATION,
-        [this, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
+        [this, WeakWorld, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
         LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), HCopy = MoveTemp(HeightsCopy),
         SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings]() mutable
         {
@@ -547,7 +578,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     bAttemptedGPU = true;
 
                     TWeakObjectPtr<UVoxelChunkComponent> WeakChunk(this);
-                    TWeakObjectPtr<AVoxelWorld> WeakWorld(OwnerWorld);
+                    TWeakObjectPtr<AVoxelWorld> WeakWorldGPU(OwnerWorld);
                     const bool bUseNaive = SettingsPtr ? SettingsPtr->bUseNaiveMesher : false;
                     const bool bUseBinary = SettingsPtr ? SettingsPtr->bUseBinaryGreedyMesher : false;
                     const bool bAOFlag = bAO;
@@ -556,44 +587,61 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
                     const bool bLaunched = UVoxelMesher::BuildGreedyMesh_GPU_Async(
                         Voxels, SizeVox, &NbhCopy, XYScale, VoxelUU,
-                        [WeakChunk, WeakWorld, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
+                        [WeakChunk, WeakWorldGPU, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
                         (bool bSuccess, TArray<uint32>&& Packed, int32 SizeX, int32 SizeY, int32 SizeZ, int32 XYScaleParam, float VoxelUUParam)
                         {
-                            if (!WeakChunk.IsValid() || !WeakWorld.IsValid()) return;
-
                             UVoxelChunkComponent* Chunk = WeakChunk.Get();
-                            AVoxelWorld* World = WeakWorld.Get();
+                            AVoxelWorld* World = WeakWorldGPU.Get();
+
+                            // CRITICAL: ALWAYS call OnMeshingFinished, even if chunk/world invalid
+                            // This ensures ActiveMeshTasks is decremented and queue slots are freed
+                            if (!World)
+                            {
+                                UE_LOG(LogTemp, Warning, TEXT("[MeshQueue] Async GPU meshing completed but world destroyed - discarding"));
+                                return;
+                            }
 
                             FMeshBuffers LocalBufs;
-                            if (bSuccess && Packed.Num() > 0)
+                            bool bShouldApply = (Chunk != nullptr && IsValid(Chunk));
+
+                            if (bShouldApply)
                             {
-                                FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, LocalBufs, VoxelUUParam, XYScaleParam, SizeX, SizeY, SizeZ);
+                                if (bSuccess && Packed.Num() > 0)
+                                {
+                                    FVoxelGPUMesher::DecodePackedVertsToMeshBuffers(Packed, LocalBufs, VoxelUUParam, XYScaleParam, SizeX, SizeY, SizeZ);
+                                }
+                                else if (bAllowFallbackLocal)
+                                {
+                                    const FChunkNeighbors* NeighborPtr = &NbhCopy;
+                                    const FIntVector SizeVector(SizeX, SizeY, SizeZ);
+
+                                    // PROFILING: Measure async meshing time
+                                    const double StartTime = FPlatformTime::Seconds();
+
+                                    if (bUseNaive)
+                                        UVoxelMesher::BuildNaiveMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                                    else if (bUseBinary)
+                                        UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                                    else
+                                        UVoxelMesher::BuildGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+
+                                    const double EndTime = FPlatformTime::Seconds();
+                                    const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
+
+                                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
+                                        MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
+                                        bUseBinary ? TEXT("Binary") : TEXT("Standard"));
+                                }
                             }
-                            else if (bAllowFallbackLocal)
-                            {
-                                const FChunkNeighbors* NeighborPtr = &NbhCopy;
-                                const FIntVector SizeVector(SizeX, SizeY, SizeZ);
 
-                                // PROFILING: Measure async meshing time
-                                const double StartTime = FPlatformTime::Seconds();
-
-                                if (bUseNaive)
-                                    UVoxelMesher::BuildNaiveMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
-                                else if (bUseBinary)
-                                    UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
-                                else
-                                    UVoxelMesher::BuildGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
-
-                                const double EndTime = FPlatformTime::Seconds();
-                                const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
-
-                                UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
-                                    MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
-                                    bUseBinary ? TEXT("Binary") : TEXT("Standard"));
-                            }
-
+                            // ALWAYS call OnMeshingFinished
                             World->OnMeshingFinished(Chunk);
-                            World->EnqueueMeshApply(Chunk, MoveTemp(LocalBufs), bCollision, bSeamRemesh, Seq);
+
+                            // Only apply mesh if chunk still valid
+                            if (bShouldApply)
+                            {
+                                World->EnqueueMeshApply(Chunk, MoveTemp(LocalBufs), bCollision, bSeamRemesh, Seq);
+                            }
                         },
                         SettingsPtr);
 
@@ -635,10 +683,15 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 UVoxelMesher::BuildHeightfieldMesh(HCopy, SamplesX, SamplesY, ChunkSizeX, ChunkSizeY, XYScale, VoxelUU, Buffers);
             }
 
-            if (IsValid(W))
+            // ALWAYS notify world, even if W is now invalid
+            AVoxelWorld* World = WeakWorld.Get();
+            if (World)
             {
-                W->OnMeshingFinished(this);
-                W->EnqueueMeshApply(this, MoveTemp(Buffers), bCollision, bSeamRemesh, Seq);
+                World->OnMeshingFinished(this);
+                if (IsValid(W))
+                {
+                    World->EnqueueMeshApply(this, MoveTemp(Buffers), bCollision, bSeamRemesh, Seq);
+                }
             }
         });
 }

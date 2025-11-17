@@ -8,6 +8,16 @@ public class VoxelCore : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
+        // ============================================================================
+        // AGGRESSIVE PERFORMANCE OPTIMIZATIONS
+        // ============================================================================
+
+        // Enable aggressive code optimization
+        OptimizeCode = CodeOptimization.Always;  // Always optimize, even in dev builds
+
+        // Note: bUseAVX causes type conflicts with Unreal's VectorRegister types
+        // Our SIMD optimizations use SSE2 (always available on x64) instead
+
         PublicDependencyModuleNames.AddRange(new string[] {
             "Core", "CoreUObject", "Engine", "InputCore",
             "RenderCore", "RHI", "ProceduralMeshComponent", "UMG", "RHICore", "RealtimeMeshComponent"
