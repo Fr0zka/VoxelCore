@@ -1003,43 +1003,56 @@ void UVoxelChunkComponent::CacheNeighborBordersFromWorld()
 
     CachedNeighborBorders = FCachedNeighborBorders(); // Reset
 
-    auto CopyXBorder = [&](UVoxelChunkComponent* N, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+    // Generic border copy helper - eliminates code duplication across X/Y/Z borders
+    // FixedAxis: 0=X, 1=Y, 2=Z (which coordinate is held constant)
+    auto CopyBorderGeneric = [&](UVoxelChunkComponent* N, int32 FixedAxis, int32 SrcCoord,
+                                   int32 Size0, int32 Size1, int32 NeighborSize0, int32 NeighborSize1, int32 NeighborSizeFixed,
+                                   TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            // IMPORTANT: Only cache if neighbor is READY and has valid data
+            // Validate neighbor state
             if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
                 N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();  // Clear any old data
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcX < 0 || SrcX >= NSX || NSY != SY || NSZ != SZ)
             {
                 bFlag = false;
                 Dst.Reset();
                 return;
             }
 
-            const int32 ExpectedSizeXY = SY * SZ;
-            Dst.SetNumUninitialized(ExpectedSizeXY);
-            for (int32 z = 0; z < SZ; ++z)
+            // Validate coordinate ranges
+            if (SrcCoord < 0 || SrcCoord >= NeighborSizeFixed || NeighborSize0 != Size0 || NeighborSize1 != Size1)
             {
-                for (int32 y = 0; y < SY; ++y)
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
+
+            // Copy border slice
+            const int32 ExpectedSize = Size0 * Size1;
+            Dst.SetNumUninitialized(ExpectedSize);
+
+            for (int32 i1 = 0; i1 < Size1; ++i1)
+            {
+                for (int32 i0 = 0; i0 < Size0; ++i0)
                 {
-                    uint8 Cat = N->CategoryData.Get(SrcX, y, z);
+                    // Map (i0, i1) to (x, y, z) based on fixed axis
+                    int32 x, y, z;
+                    switch (FixedAxis)
+                    {
+                        case 0: x = SrcCoord; y = i0; z = i1; break; // X fixed: iterate YZ
+                        case 1: x = i0; y = SrcCoord; z = i1; break; // Y fixed: iterate XZ
+                        default: x = i0; y = i1; z = SrcCoord; break; // Z fixed: iterate XY
+                    }
+
+                    uint8 Cat = N->CategoryData.Get(x, y, z);
                     EVoxelBlockID Bid;
                     switch (Cat) {
                     case 0: Bid = EVoxelBlockID::Air; break;
                     case 1: Bid = EVoxelBlockID::Water; break;
                     default: Bid = EVoxelBlockID::Stone; break;
                     }
-                    const int32 WriteIndex = y + z * SY;
-                    if (WriteIndex >= 0 && WriteIndex < ExpectedSizeXY)
+
+                    const int32 WriteIndex = i0 + i1 * Size0;
+                    if (WriteIndex >= 0 && WriteIndex < ExpectedSize)
                     {
                         Dst[WriteIndex] = Bid;
                     }
@@ -1048,92 +1061,29 @@ void UVoxelChunkComponent::CacheNeighborBordersFromWorld()
             bFlag = true;
         };
 
+    // Specialized wrappers for clarity at call sites
+    auto CopyXBorder = [&](UVoxelChunkComponent* N, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+        {
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 0, SrcX, SY, SZ, NSY, NSZ, NSX, Dst, bFlag);
+        };
+
     auto CopyYBorder = [&](UVoxelChunkComponent* N, int32 SrcY, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
-                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcY < 0 || SrcY >= NSY || NSX != SX || NSZ != SZ)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 ExpectedSizeXZ = SX * SZ;
-            Dst.SetNumUninitialized(ExpectedSizeXZ);
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                for (int32 x = 0; x < SX; ++x)
-                {
-                    uint8 Cat = N->CategoryData.Get(x, SrcY, z);
-                    EVoxelBlockID Bid;
-                    switch (Cat) {
-                    case 0: Bid = EVoxelBlockID::Air; break;
-                    case 1: Bid = EVoxelBlockID::Water; break;
-                    default: Bid = EVoxelBlockID::Stone; break;
-                    }
-                    const int32 WriteIndex2 = x + z * SX;
-                    if (WriteIndex2 >= 0 && WriteIndex2 < ExpectedSizeXZ)
-                    {
-                        Dst[WriteIndex2] = Bid;
-                    }
-                }
-            }
-            bFlag = true;
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 1, SrcY, SX, SZ, NSX, NSZ, NSY, Dst, bFlag);
         };
 
     auto CopyZBorder = [&](UVoxelChunkComponent* N, int32 SrcZ, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
-                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcZ < 0 || SrcZ >= NSZ || NSX != SX || NSY != SY)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 ExpectedSizeYZ = SX * SY;
-            Dst.SetNumUninitialized(ExpectedSizeYZ);
-            for (int32 y = 0; y < SY; ++y)
-            {
-                for (int32 x = 0; x < SX; ++x)
-                {
-                    uint8 Cat = N->CategoryData.Get(x, y, SrcZ);
-                    EVoxelBlockID Bid;
-                    switch (Cat) {
-                    case 0: Bid = EVoxelBlockID::Air; break;
-                    case 1: Bid = EVoxelBlockID::Water; break;
-                    default: Bid = EVoxelBlockID::Stone; break;
-                    }
-                    const int32 WriteIndex3 = x + y * SX;
-                    if (WriteIndex3 >= 0 && WriteIndex3 < ExpectedSizeYZ)
-                    {
-                        Dst[WriteIndex3] = Bid;
-                    }
-                }
-            }
-            bFlag = true;
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 2, SrcZ, SX, SY, NSX, NSY, NSZ, Dst, bFlag);
         };
 
     // Get neighbors and cache their borders
