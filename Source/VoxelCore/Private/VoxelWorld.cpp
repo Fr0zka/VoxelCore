@@ -13,6 +13,14 @@
 #include <RealtimeMeshSimple.h>
 
 // ============================================================================
+// LOGGING CATEGORIES
+// ============================================================================
+
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelWorld, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelChunk, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelStreaming, Log, All);
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 
@@ -463,7 +471,7 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 	if (ActiveGenTasks < MaxGen)
 	{
 		++ActiveGenTasks;
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+		UE_LOG(LogVoxelWorld, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
 			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		Chunk->DoGeneration();
 		return;
@@ -477,7 +485,7 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 	const int32 CurrentQueueSize = GenWaitByDistance.Num();
 	if (CurrentQueueSize > LastQueueSize && CurrentQueueSize % 10 == 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] QUEUED (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d (GROWING!)"),
+		UE_LOG(LogVoxelWorld, Warning, TEXT("[GenQueue] QUEUED (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d (GROWING!)"),
 			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, CurrentQueueSize);
 		LastQueueSize = CurrentQueueSize;
 	}
@@ -516,19 +524,19 @@ void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* Chunk)
 	// DEBUG: Log completion
 	if (Chunk)
 	{
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] FINISH (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+		UE_LOG(LogVoxelWorld, Verbose, TEXT("[GenQueue] FINISH (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
 			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, NewActiveCount, QueueSize);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] FINISH (NULL chunk!) - ActiveGenTasks=%d, QueueSize=%d"),
+		UE_LOG(LogVoxelWorld, Warning, TEXT("[GenQueue] FINISH (NULL chunk!) - ActiveGenTasks=%d, QueueSize=%d"),
 			NewActiveCount, QueueSize);
 	}
 
 	// Launch task outside lock (DoGeneration may enqueue callbacks)
 	if (UVoxelChunkComponent* N = Next.Get())
 	{
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
+		UE_LOG(LogVoxelWorld, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
 			N->ChunkCoord.Cx, N->ChunkCoord.Cy, N->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		N->DoGeneration();
 	}
@@ -737,7 +745,7 @@ void AVoxelWorld::GatherStreamingSources()
 	static int32 LastCount = -1;
 	if (StreamingSources.Num() != LastCount)
 	{
-		UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Found %d active streaming source(s)"), StreamingSources.Num());
+		UE_LOG(LogVoxelWorld, Log, TEXT("[VoxelWorld] Found %d active streaming source(s)"), StreamingSources.Num());
 		for (UVoxelStreamingSourceComponent* Source : StreamingSources)
 		{
 			UE_LOG(LogTemp, Log, TEXT("  - %s (Player=%d, Priority=%.2f, ViewDist=%d)"),
@@ -789,7 +797,7 @@ void AVoxelWorld::UpdateChunks()
 	if (++DebugFrameCounter >= VoxelConstants::FramesBetweenDebugLog)
 	{
 		DebugFrameCounter = 0;
-		UE_LOG(LogTemp, Verbose, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
+		UE_LOG(LogVoxelWorld, Verbose, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
 			PlayerLocation.X, PlayerLocation.Y, PlayerLocation.Z,
 			CenterChunk.Cx, CenterChunk.Cy, CenterChunk.Cz,
 			PrimarySource ? PrimarySource->CollisionRadius : S->CollisionViewDistance,
@@ -1191,7 +1199,7 @@ void AVoxelWorld::ProcessDesiredChunks(
 
 			if (d2 <= 4)
 			{
-				UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d)"),
+				UE_LOG(LogVoxelWorld, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d)"),
 					C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR);
 			}
 
@@ -1222,7 +1230,7 @@ void AVoxelWorld::ProcessDesiredChunks(
 					{
 						if (d2 <= 16)
 						{
-							UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s"),
+							UE_LOG(LogVoxelWorld, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s"),
 								C.Cx, C.Cy, C.Cz, d2,
 								Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
 								bDesiredCollision ? TEXT("YES") : TEXT("NO"));
@@ -1281,8 +1289,8 @@ void AVoxelWorld::ProcessDesiredChunks(
 		{
 			bNeedsMoreSpawning = false;
 			bInitialLoadComplete = true;
-			UE_LOG(LogTemp, Warning, TEXT("=== INITIAL CHUNK LOAD COMPLETE ==="));
-			UE_LOG(LogTemp, Warning, TEXT("Total chunks loaded: %d"), ActiveChunks.Num() + PendingChunks.Num());
+			UE_LOG(LogVoxelStreaming, Warning, TEXT("=== INITIAL CHUNK LOAD COMPLETE ==="));
+			UE_LOG(LogVoxelStreaming, Log, TEXT("Total chunks loaded: %d"), ActiveChunks.Num() + PendingChunks.Num());
 		}
 		else
 		{
@@ -1293,7 +1301,7 @@ void AVoxelWorld::ProcessDesiredChunks(
 				const int32 TotalNeeded = CachedDesiredChunks.Num();
 				const int32 CurrentLoaded = ActiveChunks.Num() + PendingChunks.Num();
 				const float Progress = (float)CurrentLoaded / (float)TotalNeeded * 100.0f;
-				UE_LOG(LogTemp, Warning, TEXT("Loading chunks: %d/%d (%.1f%%) - Missing: %d, Spawned this frame: %d (Budget %d)"),
+				UE_LOG(LogVoxelStreaming, Log, TEXT("Loading chunks: %d/%d (%.1f%%) - Missing: %d, Spawned this frame: %d (Budget %d)"),
 					CurrentLoaded, TotalNeeded, Progress, OutMissingChunks, ChunksSpawnedThisFrame, SpawnBudget);
 			}
 		}

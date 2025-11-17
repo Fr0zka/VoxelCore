@@ -19,6 +19,12 @@
 #include <VoxelBiome.h>
 #include <VoxelNoise.h>
 
+// ============================================================================
+// LOGGING CATEGORIES
+// ============================================================================
+
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelChunk, Log, All);
+
 // Debug console variable for padding extraction logging
 static TAutoConsoleVariable<int32> CVarVoxelLogPadding(
     TEXT("r.Voxel.LogPadding"),
@@ -61,7 +67,7 @@ void UVoxelChunkComponent::InitializeChunk(
 
     StartGeneration();
     // In InitializeChunk, after calculating WorldLocation:
-    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) spawned at Z=%f (Cz=%d, ChunkSizeZ=%d, Scale=%f)"),
+    UE_LOG(LogVoxelChunk, Warning, TEXT("Chunk (%d,%d,%d) spawned at Z=%f (Cz=%d, ChunkSizeZ=%d, Scale=%f)"),
         ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
         WorldLocation.Z, ChunkCoord.Cz, Settings->ChunkSizeZ, Settings->VoxelWorldScale);
 }
@@ -156,7 +162,7 @@ void UVoxelChunkComponent::DoGeneration()
                 if (!This || !IsValid(This))
                 {
                     // Component destroyed - discard results BUT notify world to free queue slot
-                    UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
+                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
                         Coord.Cx, Coord.Cy, Coord.Cz);
                     NotifyWorldLambda();
                     return;
@@ -302,7 +308,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     if ((RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() == 0) ||
         (RenderMode == EVoxelRenderMode::Heightfield && HeightData.Num() == 0))
     {
-        UE_LOG(LogTemp, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
+        UE_LOG(LogVoxelChunk, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
             ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, CategoryData.Data.Num(), HeightData.Num());
         if (IsValid(OwnerWorld)) OwnerWorld->OnMeshingFinished(this);
         return;
@@ -325,7 +331,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     {
         // Chunk is completely empty - skip meshing AND mesh apply entirely
         // Don't enqueue empty meshes for application - this saves game thread time
-        UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
+        UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
             (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY,
             (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY,
             Settings->ChunkSizeZ,
@@ -402,7 +408,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
             bool expected = false;
             if (bWarned.compare_exchange_strong(expected, true))
             {
-                UE_LOG(LogTemp, Warning, TEXT("[Voxel] BiomeGrid missing for chunk (%d,%d,%d). Using defaults."),
+                UE_LOG(LogVoxelChunk, Warning, TEXT("[Voxel] BiomeGrid missing for chunk (%d,%d,%d). Using defaults."),
                     ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
             }
         }
@@ -621,7 +627,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                             // This ensures ActiveMeshTasks is decremented and queue slots are freed
                             if (!World)
                             {
-                                UE_LOG(LogTemp, Warning, TEXT("[MeshQueue] Async GPU meshing completed but world destroyed - discarding"));
+                                UE_LOG(LogVoxelChunk, Warning, TEXT("[MeshQueue] Async GPU meshing completed but world destroyed - discarding"));
                                 return;
                             }
 
@@ -652,7 +658,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                     const double EndTime = FPlatformTime::Seconds();
                                     const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
 
-                                    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
+                                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
                                         MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
                                         bUseBinary ? TEXT("Binary") : TEXT("Standard"));
                                 }
@@ -697,7 +703,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     const int32 VertCount = Buffers.Vertices.Num();
                     const int32 TriCount = Buffers.Triangles.Num() / 3;
 
-                    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
+                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
                         MeshingMs, VertCount, TriCount, SizeVox.X, SizeVox.Y, SizeVox.Z, XYScale,
                         SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher ? TEXT("Binary") : TEXT("Standard"));
                 }
@@ -758,7 +764,7 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
     const double EndTime = FPlatformTime::Seconds();
     const float ApplyMs = (float)((EndTime - StartTime) * 1000.0);
 
-    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
+    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
         ApplyMs, Bufs.Vertices.Num(), Bufs.Triangles.Num() / 3,
         bCollision ? TEXT("Yes") : TEXT("No"),
         bUsingRMC ? TEXT("RMC") : TEXT("PMC"));
@@ -890,7 +896,7 @@ void UVoxelChunkComponent::RequestCollisionReapply(bool bNewCollision)
 void UVoxelChunkComponent::CancelPendingTask()
 {
     // ADD THIS:
-    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) CANCELLED (State=%d)"),
+    UE_LOG(LogVoxelChunk, Warning, TEXT("Chunk (%d,%d,%d) CANCELLED (State=%d)"),
         ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, (int32)State);
 
     bCancelPending.AtomicSet(true);
