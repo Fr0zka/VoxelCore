@@ -2,7 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "VoxelOptimizationMacros.h"
-#include <emmintrin.h>  // SSE2 for SIMD optimizations
+
+// Platform-specific SIMD includes (SSE2 for x86/x64)
+#if PLATFORM_CPU_X86_FAMILY
+	#include <emmintrin.h>  // SSE2 for SIMD optimizations on x86/x64
+#endif
+
 #include "VoxelStructs.generated.h"
 
 USTRUCT(BlueprintType)

@@ -252,4 +252,29 @@ private:
 
 	/** Frame counter for live noise preview (reloads chunks periodically). */
 	int32 NoisePreviewFrameCounter = 0;
+
+	// ==================== CHUNK UPDATE CACHE (OPTIMIZATION) ====================
+	// These were previously static variables (caused memory leak + multi-world bugs).
+	// Now instance members to properly scope lifetime and support multiple worlds.
+
+	/** Cached list of desired chunks with priority (rebuilt when player moves/rotates). */
+	TArray<TPair<FVoxelCoord, float>> CachedDesiredChunks;
+
+	/** Cached set of visible chunks (used for fast lookup during unload pass). */
+	TSet<FVoxelCoord> CachedVisibleChunks;
+
+	/** Last center chunk coordinate used for cache (for detecting movement). */
+	FVoxelCoord CachedLastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
+
+	/** Last player yaw rotation used for cache (for detecting rotation changes). */
+	float CachedLastPlayerYaw = 0.0f;
+
+	/** True if visibility cache is still valid this frame. */
+	bool bVisibilityCacheValid = false;
+
+	/** Temporary array for macro-tile removal (reused to avoid allocations). */
+	TArray<FIntPoint> TempRemoveTiles;
+
+	/** Temporary array for chunk removal (reused to avoid allocations). */
+	TArray<FVoxelCoord> TempRemoveChunks;
 };

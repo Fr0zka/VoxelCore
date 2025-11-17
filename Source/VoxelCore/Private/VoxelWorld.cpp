@@ -13,6 +13,23 @@
 #include <RealtimeMeshSimple.h>
 
 // ============================================================================
+// CONSTANTS
+// ============================================================================
+
+namespace VoxelConstants
+{
+	// Stats update intervals (frames between updates)
+	constexpr int32 FramesBetweenStatsReset = 10;
+	constexpr int32 FramesBetweenStatsUpdate = 10;
+
+	// Debug logging intervals
+	constexpr int32 FramesBetweenDebugLog = 60;
+
+	// Rotation change threshold for frustum invalidation (degrees)
+	constexpr float RotationChangeThresholdDegrees = 10.0f;
+}
+
+// ============================================================================
 // LIFECYCLE
 // ============================================================================
 
@@ -767,12 +784,12 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerLocation = PrimarySource ? PrimarySource->GetSourceLocation() : PrimaryActor->GetActorLocation();
 	const FVoxelCoord CenterChunk = WorldToChunkCoord(PlayerLocation);
 
-	// DEBUG: Log player position and center chunk every 60 frames
+	// DEBUG: Log player position and center chunk periodically (reduced to Verbose)
 	static int32 DebugFrameCounter = 0;
-	if (++DebugFrameCounter >= 60)
+	if (++DebugFrameCounter >= VoxelConstants::FramesBetweenDebugLog)
 	{
 		DebugFrameCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
+		UE_LOG(LogTemp, Verbose, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
 			PlayerLocation.X, PlayerLocation.Y, PlayerLocation.Z,
 			CenterChunk.Cx, CenterChunk.Cy, CenterChunk.Cz,
 			PrimarySource ? PrimarySource->CollisionRadius : S->CollisionViewDistance,
@@ -811,17 +828,15 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
 
 	// OPTIMIZATION: Cache both Desired list (with priority) and Visible set to avoid rebuilding every frame
-	static TArray<TPair<FVoxelCoord, float>> Desired; // Coord → Priority (higher = more important)
-	static TSet<FVoxelCoord> Visible;
-	static FVoxelCoord LastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
-	static float LastPlayerYaw = 0.0f;
-	static bool bVisibleCached = false;
+	// FIXED: Moved from static to instance members to fix memory leak and support multiple worlds
+	TArray<TPair<FVoxelCoord, float>>& Desired = CachedDesiredChunks; // Coord → Priority (higher = more important)
+	TSet<FVoxelCoord>& Visible = CachedVisibleChunks;
 
 	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates horizontally (ignore pitch for jumping)
-	const bool bCenterChanged = !(CenterChunk == LastDesiredCenter);
+	const bool bCenterChanged = !(CenterChunk == CachedLastDesiredCenter);
 	const float CurrentYaw = PlayerRotation.Yaw;
-	const float YawDelta = FMath::Abs(FRotator::NormalizeAxis(CurrentYaw - LastPlayerYaw));
-	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > 10.0f); // 10° threshold, horizontal only
+	const float YawDelta = FMath::Abs(FRotator::NormalizeAxis(CurrentYaw - CachedLastPlayerYaw));
+	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > VoxelConstants::RotationChangeThresholdDegrees);
 	const bool bNeedsRebuild = bCenterChanged || bRotationChanged;
 
 	if (bNeedsRebuild || Desired.Num() == 0)
@@ -927,14 +942,14 @@ void AVoxelWorld::UpdateChunks()
 			return Az < Bz;
 		});
 
-		LastDesiredCenter = CenterChunk;
-		LastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
-		bVisibleCached = false;  // Invalidate Visible cache when Desired changes
+		CachedLastDesiredCenter = CenterChunk;
+		CachedLastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
+		bVisibilityCacheValid = false;  // Invalidate Visible cache when Desired changes
 	}
 
 	// OPTIMIZATION: Cache Visible set too (only rebuild if Desired changed)
 	// Eliminates 3000+ hash insertions every frame during chunk loading
-	if (!bVisibleCached)
+	if (!bVisibilityCacheValid)
 	{
 		Visible.Reset();
 		Visible.Reserve(Desired.Num());
@@ -942,7 +957,7 @@ void AVoxelWorld::UpdateChunks()
 		{
 			Visible.Add(Pair.Key);
 		}
-		bVisibleCached = true;
+		bVisibilityCacheValid = true;
 	}
 
 	// Collision and AO radii (use streaming source settings if available)
@@ -1294,9 +1309,9 @@ void AVoxelWorld::UpdateChunks()
 			}
 		}
 
-		// OPTIMIZATION: Single-pass macro-tile unloading (reuse static array)
-		static TArray<FIntPoint> ToRemoveTiles;
-		ToRemoveTiles.Reset(0);
+		// OPTIMIZATION: Single-pass macro-tile unloading (reuse instance member array)
+		// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
+		TempRemoveTiles.Reset(0);
 
 		// Unload invisible active macro-tiles
 		for (const auto& Pair : ActiveMacro)
@@ -1309,16 +1324,16 @@ void AVoxelWorld::UpdateChunks()
 					C->UnloadChunk();
 					C->DestroyComponent();
 				}
-				ToRemoveTiles.Add(Pair.Key);
+				TempRemoveTiles.Add(Pair.Key);
 			}
 		}
-		for (const FIntPoint& T : ToRemoveTiles)
+		for (const FIntPoint& T : TempRemoveTiles)
 		{
 			ActiveMacro.Remove(T);
 		}
 
 		// Unload invisible pending macro-tiles
-		ToRemoveTiles.Reset(0);
+		TempRemoveTiles.Reset(0);
 		for (const auto& Pair : PendingMacro)
 		{
 			if (!VisibleTilesMinD2.Contains(Pair.Key))
@@ -1329,19 +1344,18 @@ void AVoxelWorld::UpdateChunks()
 					C->UnloadChunk();
 					C->DestroyComponent();
 				}
-				ToRemoveTiles.Add(Pair.Key);
+				TempRemoveTiles.Add(Pair.Key);
 			}
 		}
-		for (const FIntPoint& T : ToRemoveTiles)
+		for (const FIntPoint& T : TempRemoveTiles)
 		{
 			PendingMacro.Remove(T);
 		}
 	}
 
 	// OPTIMIZATION: Single-pass chunk unloading (build removal list while unloading)
-	// Reuse static array to avoid allocations
-	static TArray<FVoxelCoord> ToRemoveChunks;
-	ToRemoveChunks.Reset(0);
+	// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
+	TempRemoveChunks.Reset(0);
 
 	// Unload invisible active chunks
 	for (const auto& Pair : ActiveChunks)
@@ -1354,16 +1368,16 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
 			}
-			ToRemoveChunks.Add(Pair.Key);
+			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
-	for (const FVoxelCoord& C : ToRemoveChunks)
+	for (const FVoxelCoord& C : TempRemoveChunks)
 	{
 		ActiveChunks.Remove(C);
 	}
 
 	// Unload invisible pending chunks
-	ToRemoveChunks.Reset(0);
+	TempRemoveChunks.Reset(0);
 	for (const auto& Pair : PendingChunks)
 	{
 		if (!Visible.Contains(Pair.Key))
@@ -1374,10 +1388,10 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
 			}
-			ToRemoveChunks.Add(Pair.Key);
+			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
-	for (const FVoxelCoord& C : ToRemoveChunks)
+	for (const FVoxelCoord& C : TempRemoveChunks)
 	{
 		PendingChunks.Remove(C);
 	}

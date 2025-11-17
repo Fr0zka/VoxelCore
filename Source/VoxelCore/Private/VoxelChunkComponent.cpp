@@ -156,7 +156,7 @@ void UVoxelChunkComponent::DoGeneration()
                 if (!This || !IsValid(This))
                 {
                     // Component destroyed - discard results BUT notify world to free queue slot
-                    UE_LOG(LogTemp, Warning, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
+                    UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
                         Coord.Cx, Coord.Cy, Coord.Cz);
                     NotifyWorldLambda();
                     return;
@@ -200,48 +200,72 @@ void UVoxelChunkComponent::DoGeneration()
     }
 
     // CPU GENERATION PATH (legacy, always available)
-    UE::Tasks::Launch(UE_SOURCE_LOCATION, [this, WeakWorld, Params, Coord, ScaleXY, bHeight]()
+    // FIXED: Capture WeakThis instead of raw 'this' to prevent use-after-free if component destroyed
+    TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
+    UE::Tasks::Launch(UE_SOURCE_LOCATION, [WeakThis, WeakWorld, Params, Coord, ScaleXY, bHeight]()
         {
-            if (bHeight)
+            // SAFETY: Get raw pointer upfront - if component is destroyed during generation,
+            // we'll detect it via bCancelPending or IsValid() check before accessing members
+            UVoxelChunkComponent* This = WeakThis.Get();
+            if (!This || !IsValid(This))
             {
-                FIntPoint Samples;
-                UVoxelGenerator::GenerateHeightmap(Coord, Params, ScaleXY, HeightData, Samples);
-                HF_SamplesX = Samples.X;
-                HF_SamplesY = Samples.Y;
-            }
-            else
-            {
-                // Categories for fast solid/air decisions
-                UVoxelGenerator::GenerateChunkLOD_Categories(Coord, Params, ScaleXY, CategoryData);
-
-                // NEW: 2D biome grid used later to expand categories into biome-aware blocks
-                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);
-
-                const int64 NumBytes = CategoryData.Data.Num();
-                INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
-            }
-
-            if (bCancelPending)
-            {
-                AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
+                // Component destroyed during generation - notify world to free queue slot
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
                     {
-                        // ALWAYS notify world, even if OwnerWorld changed
                         if (AVoxelWorld* World = WeakWorld.Get())
                         {
-                            World->OnGenerationFinished(this);
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            World->OnGenerationFinished(Comp); // Comp may be nullptr - that's OK
                         }
                     });
                 return;
             }
 
-            AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
+            if (bHeight)
+            {
+                FIntPoint Samples;
+                UVoxelGenerator::GenerateHeightmap(Coord, Params, ScaleXY, This->HeightData, Samples);
+                This->HF_SamplesX = Samples.X;
+                This->HF_SamplesY = Samples.Y;
+            }
+            else
+            {
+                // Categories for fast solid/air decisions
+                UVoxelGenerator::GenerateChunkLOD_Categories(Coord, Params, ScaleXY, This->CategoryData);
+
+                // NEW: 2D biome grid used later to expand categories into biome-aware blocks
+                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
+
+                const int64 NumBytes = This->CategoryData.Data.Num();
+                INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
+            }
+
+            if (This->bCancelPending)
+            {
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
+                    {
+                        // ALWAYS notify world, even if OwnerWorld changed
+                        if (AVoxelWorld* World = WeakWorld.Get())
+                        {
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            World->OnGenerationFinished(Comp);
+                        }
+                    });
+                return;
+            }
+
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
                 {
-                    OnGenerationComplete();
+                    UVoxelChunkComponent* Comp = WeakThis.Get();
+                    if (Comp && IsValid(Comp))
+                    {
+                        Comp->OnGenerationComplete();
+                    }
 
                     // ALWAYS notify world, even if OwnerWorld changed
                     if (AVoxelWorld* World = WeakWorld.Get())
                     {
-                        World->OnGenerationFinished(this);
+                        World->OnGenerationFinished(Comp);
                     }
                 });
         });
@@ -301,7 +325,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     {
         // Chunk is completely empty - skip meshing AND mesh apply entirely
         // Don't enqueue empty meshes for application - this saves game thread time
-        UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
+        UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
             (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY,
             (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY,
             Settings->ChunkSizeZ,
@@ -628,7 +652,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                     const double EndTime = FPlatformTime::Seconds();
                                     const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
 
-                                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
+                                    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
                                         MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
                                         bUseBinary ? TEXT("Binary") : TEXT("Standard"));
                                 }
@@ -673,7 +697,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     const int32 VertCount = Buffers.Vertices.Num();
                     const int32 TriCount = Buffers.Triangles.Num() / 3;
 
-                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
+                    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
                         MeshingMs, VertCount, TriCount, SizeVox.X, SizeVox.Y, SizeVox.Z, XYScale,
                         SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher ? TEXT("Binary") : TEXT("Standard"));
                 }
@@ -734,7 +758,7 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
     const double EndTime = FPlatformTime::Seconds();
     const float ApplyMs = (float)((EndTime - StartTime) * 1000.0);
 
-    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
+    UE_LOG(LogTemp, Verbose, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
         ApplyMs, Bufs.Vertices.Num(), Bufs.Triangles.Num() / 3,
         bCollision ? TEXT("Yes") : TEXT("No"),
         bUsingRMC ? TEXT("RMC") : TEXT("PMC"));
