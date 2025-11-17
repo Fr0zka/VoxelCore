@@ -1330,6 +1330,17 @@ void AVoxelWorld::UpdateChunks()
 			Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 			ActiveChunks.Add(C, Chunk);
 
+			// Add to bucket if batching enabled (chunks added directly to Active skip promotion code!)
+			if (S && S->bEnableChunkBatching)
+			{
+				FVoxelChunkBucket* Bucket = GetOrCreateBucket(C);
+				if (Bucket)
+				{
+					Bucket->ContainedChunks.Add(C);
+					Bucket->MarkDirty();
+				}
+			}
+
 			// DEBUG: Log collision settings for chunks near player
 			if (d2 <= 4) // Log for chunks within 2-chunk radius
 			{
