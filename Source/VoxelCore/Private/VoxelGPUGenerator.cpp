@@ -117,6 +117,12 @@ bool FVoxelGPUGenerator::IsGPUGenerationAvailable()
     return FApp::CanEverRender() && (GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5);
 }
 
+int32 FVoxelGPUGenerator::GetPendingJobCount()
+{
+    FScopeLock Lock(&JobsMutex);
+    return PendingJobs.Num();
+}
+
 void FVoxelGPUGenerator::TickGPUGenerationJobs()
 {
     QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelGPU_TickGeneration);

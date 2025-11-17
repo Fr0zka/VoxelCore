@@ -174,6 +174,62 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FGPUSinglePassMeshCS, "/Plugin/VoxelCore/GPUGreedyMesher_SinglePass.usf", "SinglePassMeshCS", SF_Compute);
 
+/**
+ * True Greedy Mesh Shader - Implements proper greedy quad merging.
+ *
+ * Uses slice-based parallelization:
+ * - Each thread group processes one Z-slice
+ * - Builds face mask in shared memory
+ * - Greedily merges quads (horizontal + vertical)
+ * - Reduces triangle count by 60-90% vs naive approach
+ */
+class FGPUTrueGreedyMeshCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FGPUTrueGreedyMeshCS);
+	SHADER_USE_PARAMETER_STRUCT(FGPUTrueGreedyMeshCS, FGlobalShader);
+
+public:
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		// Chunk dimensions and LOD
+		SHADER_PARAMETER(uint32, SizeX)
+		SHADER_PARAMETER(uint32, SizeY)
+		SHADER_PARAMETER(uint32, SizeZ)
+		SHADER_PARAMETER(uint32, XYScale)
+		SHADER_PARAMETER(uint32, DefaultAO)
+
+		// Neighbor availability flags
+		SHADER_PARAMETER(uint32, bHasNeighborXN)
+		SHADER_PARAMETER(uint32, bHasNeighborXP)
+		SHADER_PARAMETER(uint32, bHasNeighborYN)
+		SHADER_PARAMETER(uint32, bHasNeighborYP)
+		SHADER_PARAMETER(uint32, bHasNeighborZN)
+		SHADER_PARAMETER(uint32, bHasNeighborZP)
+
+		// Input voxel data and neighbor slices
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InVoxels)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborXN)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborXP)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborYN)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborYP)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborZN)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NeighborZP)
+
+		// Output buffers
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutVerts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, GlobalVertexCounter)
+
+		// Capacity limit
+		SHADER_PARAMETER(uint32, MaxVerts)
+
+		// Control flags
+		SHADER_PARAMETER(uint32, IgnoreNeighbors)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters&) { return true; }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FGPUTrueGreedyMeshCS, "/Plugin/VoxelCore/GPUGreedyMesher_TrueGreedy.usf", "TrueGreedyMeshCS", SF_Compute);
+
 // ============================================================================
 // NEIGHBOR DATA STRUCTURES
 // ============================================================================
@@ -382,6 +438,13 @@ static TAutoConsoleVariable<int32> CVarVoxelGPU_UseSinglePass(
 	TEXT("r.Voxel.GPU.UseSinglePass"),
 	1,
 	TEXT("Use single-pass GPU mesher with atomic allocation (1=enabled, 0=use two-pass)."),
+	ECVF_Default);
+
+/** Use true greedy meshing algorithm on GPU (reduces triangles by 60-90%). */
+static TAutoConsoleVariable<int32> CVarVoxelGPU_UseTrueGreedy(
+	TEXT("r.Voxel.GPU.UseTrueGreedy"),
+	1,
+	TEXT("Use true greedy meshing on GPU with quad merging (1=greedy, 0=naive face culling). Significantly reduces triangle count."),
 	ECVF_Default);
 
 /** Frame budget for GPU mesh readbacks. */
@@ -613,13 +676,57 @@ static bool BuildPackedVerts_GPU_SinglePass(
 			const bool bIgnoreNeighbors = Params.bAggressiveCulling || (CVarIgnNbh && CVarIgnNbh->GetInt() != 0);
 			ShaderParams->IgnoreNeighbors = bIgnoreNeighbors ? 1u : 0u;
 
-			// Dispatch single-pass shader
-			const FIntVector Groups(
-				FMath::DivideAndRoundUp(Params.SizeX, 8),
-				FMath::DivideAndRoundUp(Params.SizeY, 8),
-				FMath::DivideAndRoundUp(Params.SizeZ, 8));
+			// Check if we should use true greedy meshing (CVar or setting)
+			static auto* CVarUseGreedy = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Voxel.GPU.UseTrueGreedy"));
+			const bool bUseTrueGreedyCVar = CVarUseGreedy && CVarUseGreedy->GetInt() != 0;
+			const bool bUseTrueGreedy = bUseTrueGreedyCVar; // CVar takes precedence for now
 
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU SinglePass"), CS, ShaderParams, Groups);
+			if (bUseTrueGreedy)
+			{
+				// TRUE GREEDY MESHING PATH - Slice-based parallel algorithm
+				// Dispatch one thread group per Z-slice (each group = 32 threads)
+				TShaderMapRef<FGPUTrueGreedyMeshCS> GreedyCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FGPUTrueGreedyMeshCS::FParameters* GreedyParams = GraphBuilder.AllocParameters<FGPUTrueGreedyMeshCS::FParameters>();
+
+				// Copy common parameters
+				GreedyParams->SizeX = ShaderParams->SizeX;
+				GreedyParams->SizeY = ShaderParams->SizeY;
+				GreedyParams->SizeZ = ShaderParams->SizeZ;
+				GreedyParams->XYScale = ShaderParams->XYScale;
+				GreedyParams->DefaultAO = ShaderParams->DefaultAO;
+				GreedyParams->InVoxels = ShaderParams->InVoxels;
+				GreedyParams->NeighborXN = ShaderParams->NeighborXN;
+				GreedyParams->NeighborXP = ShaderParams->NeighborXP;
+				GreedyParams->NeighborYN = ShaderParams->NeighborYN;
+				GreedyParams->NeighborYP = ShaderParams->NeighborYP;
+				GreedyParams->NeighborZN = ShaderParams->NeighborZN;
+				GreedyParams->NeighborZP = ShaderParams->NeighborZP;
+				GreedyParams->bHasNeighborXN = ShaderParams->bHasNeighborXN;
+				GreedyParams->bHasNeighborXP = ShaderParams->bHasNeighborXP;
+				GreedyParams->bHasNeighborYN = ShaderParams->bHasNeighborYN;
+				GreedyParams->bHasNeighborYP = ShaderParams->bHasNeighborYP;
+				GreedyParams->bHasNeighborZN = ShaderParams->bHasNeighborZN;
+				GreedyParams->bHasNeighborZP = ShaderParams->bHasNeighborZP;
+				GreedyParams->OutVerts = ShaderParams->OutVerts;
+				GreedyParams->GlobalVertexCounter = ShaderParams->GlobalVertexCounter;
+				GreedyParams->MaxVerts = ShaderParams->MaxVerts;
+				GreedyParams->IgnoreNeighbors = ShaderParams->IgnoreNeighbors;
+
+				// Dispatch: One group per Z-slice (32 threads per group)
+				const FIntVector GreedyGroups(Params.SizeZ, 1, 1);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU TrueGreedy"), GreedyCS, GreedyParams, GreedyGroups);
+			}
+			else
+			{
+				// NAIVE SINGLE-PASS PATH - Original 1×1 quad per face
+				// Dispatch 8×8×8 thread groups
+				const FIntVector Groups(
+					FMath::DivideAndRoundUp(Params.SizeX, 8),
+					FMath::DivideAndRoundUp(Params.SizeY, 8),
+					FMath::DivideAndRoundUp(Params.SizeZ, 8));
+
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelGPU SinglePass"), CS, ShaderParams, Groups);
+			}
 
 			// Readback counters and buffers
 			AddEnqueueCopyPass(GraphBuilder, VertCountRB, VertexCounterBuf, 0);

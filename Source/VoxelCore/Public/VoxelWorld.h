@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelStructs.h"
 #include "VoxelSettings.h"
+#include "VoxelChunkBucket.h"
 #include "VoxelWorld.generated.h"
 
 class UVoxelChunkComponent;
@@ -195,6 +196,14 @@ private:
 	TArray<UProceduralMeshComponent*> PMCPool;
 	TArray<URealtimeMeshComponent*> RMCPool;
 
+	// ==================== CHUNK BATCHING SYSTEM ====================
+
+	/** Spatial buckets (only used when bEnableChunkBatching = true) */
+	TMap<FIntVector, FVoxelChunkBucket*> ChunkBuckets;
+
+	/** Bucket manager helper */
+	FVoxelBucketManager BucketManager;
+
 private:
 	// ==================== INTERNAL HELPERS ====================
 
@@ -215,6 +224,75 @@ private:
 	 * Implements progressive loading with per-frame spawn budget.
 	 */
 	void UpdateChunks();
+
+	/** Build list of desired chunks sorted by priority (distance + frustum). */
+	void BuildDesiredChunkList(
+		const FVoxelCoord& CenterChunk,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelSettings* Settings,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		int32 R2, int32 R2Sq, int32 Rz,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bDiskLoading, bool bFrustumVertical);
+
+	/** Rebuild visibility cache from desired chunk list. */
+	void RebuildVisibilityCache();
+
+	/** Update chunk mesh visibility based on frustum/occlusion culling. */
+	void UpdateChunkVisibility(
+		UVoxelChunkComponent* Active,
+		const FVoxelCoord& ChunkCoord,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bFrustumVertical);
+
+	/** Process desired chunks (spawn new, update settings, handle LOD transitions). */
+	void ProcessDesiredChunks(
+		const FVoxelCoord& CenterChunk,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelSettings* Settings,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		int32 CollisionR, int32 CollisionR2, int32 CollisionDropR2,
+		int32 AOR2, int32 SpawnBudget,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bFrustumVertical, bool bRotationChanged,
+		TMap<FIntPoint, int32>& OutVisibleTilesMinD2,
+		int32& OutMissingChunks);
+
+	/** Update LOD2 macro-tiles (spawn, update, unload). */
+	void UpdateMacroTiles(
+		const UVoxelSettings* Settings,
+		const TMap<FIntPoint, int32>& VisibleTilesMinD2);
+
+	/** Unload chunks that are no longer visible. */
+	void UnloadInvisibleChunks();
+
+	// ==================== CHUNK BATCHING HELPERS ====================
+
+	/** Get or create bucket for given chunk coordinate */
+	struct FVoxelChunkBucket* GetOrCreateBucket(const FVoxelCoord& ChunkCoord);
+
+	/** Mark bucket dirty when chunk changes */
+	void MarkBucketDirty(const FVoxelCoord& ChunkCoord);
+
+	/** Rebuild all dirty buckets (merge chunk meshes) */
+	void RebuildDirtyBuckets();
+
+	/** Remove chunk from its bucket */
+	void RemoveChunkFromBucket(const FVoxelCoord& ChunkCoord);
+
+	/** Rebuild single bucket mesh (merge all contained chunks) */
+	void RebuildBucketMesh(struct FVoxelChunkBucket* Bucket);
 
 	/** Convert world position to chunk coordinate. */
 	FVoxelCoord WorldToChunkCoord(const FVector& Location) const;
@@ -252,4 +330,29 @@ private:
 
 	/** Frame counter for live noise preview (reloads chunks periodically). */
 	int32 NoisePreviewFrameCounter = 0;
+
+	// ==================== CHUNK UPDATE CACHE (OPTIMIZATION) ====================
+	// These were previously static variables (caused memory leak + multi-world bugs).
+	// Now instance members to properly scope lifetime and support multiple worlds.
+
+	/** Cached list of desired chunks with priority (rebuilt when player moves/rotates). */
+	TArray<TPair<FVoxelCoord, float>> CachedDesiredChunks;
+
+	/** Cached set of visible chunks (used for fast lookup during unload pass). */
+	TSet<FVoxelCoord> CachedVisibleChunks;
+
+	/** Last center chunk coordinate used for cache (for detecting movement). */
+	FVoxelCoord CachedLastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
+
+	/** Last player yaw rotation used for cache (for detecting rotation changes). */
+	float CachedLastPlayerYaw = 0.0f;
+
+	/** True if visibility cache is still valid this frame. */
+	bool bVisibilityCacheValid = false;
+
+	/** Temporary array for macro-tile removal (reused to avoid allocations). */
+	TArray<FIntPoint> TempRemoveTiles;
+
+	/** Temporary array for chunk removal (reused to avoid allocations). */
+	TArray<FVoxelCoord> TempRemoveChunks;
 };

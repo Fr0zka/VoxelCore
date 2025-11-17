@@ -6,11 +6,29 @@
 #include "VoxelGPUMesher.h"
 #include "VoxelGPUGenerator.h"
 #include "VoxelStreamingSourceComponent.h"
+#include "VoxelChunkBucket.h"
 #include "Kismet/GameplayStatics.h"
 #include "ProceduralMeshComponent.h"
 #include "RealtimeMeshComponent.h"
 #include "EngineUtils.h"
 #include <RealtimeMeshSimple.h>
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+namespace VoxelConstants
+{
+	// Stats update intervals (frames between updates)
+	constexpr int32 FramesBetweenStatsReset = 10;
+	constexpr int32 FramesBetweenStatsUpdate = 10;
+
+	// Debug logging intervals
+	constexpr int32 FramesBetweenDebugLog = 60;
+
+	// Rotation change threshold for frustum invalidation (degrees)
+	constexpr float RotationChangeThresholdDegrees = 10.0f;
+}
 
 // ============================================================================
 // LIFECYCLE
@@ -81,6 +99,9 @@ void AVoxelWorld::Tick(float DeltaTime)
 	// Promote Ready chunks from Pending to Active
 	PromoteReadyPendings();
 
+	// Rebuild dirty chunk buckets (if batching enabled)
+	RebuildDirtyBuckets();
+
 	// Live noise preview: reload all chunks periodically
 	if (Settings.GetDefaultObject()->bLiveNoisePreview)
 	{
@@ -128,6 +149,7 @@ void AVoxelWorld::Tick(float DeltaTime)
 		SET_DWORD_STAT(STAT_VoxelActiveMacroTiles, ActiveMacro.Num());
 		SET_DWORD_STAT(STAT_VoxelGenTasksRunning, ActiveGenTasks);
 		SET_DWORD_STAT(STAT_VoxelMeshTasksRunning, ActiveMeshTasks);
+		SET_DWORD_STAT(STAT_VoxelGPUGenJobsPending, FVoxelGPUGenerator::GetPendingJobCount());
 
 		{
 			FScopeLock L1(&GenMutex);
@@ -335,6 +357,17 @@ void AVoxelWorld::PromoteReadyPendings()
 			ActiveChunks.Add(Coord, NewChunk);
 			PendingChunks.Remove(Coord);
 
+			// Add to bucket if batching enabled
+			if (Settings.GetDefaultObject() && Settings.GetDefaultObject()->bEnableChunkBatching)
+			{
+				FVoxelChunkBucket* Bucket = GetOrCreateBucket(Coord);
+				if (Bucket)
+				{
+					Bucket->ContainedChunks.Add(Coord);
+					Bucket->MarkDirty();
+				}
+			}
+
 			// Trigger neighbor seam remesh after promotion
 			OnChunkReady(Coord);
 		}
@@ -441,6 +474,23 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 	const int32 MaxGen = (S->MaxConcurrentGenerationTasks > 1) ? S->MaxConcurrentGenerationTasks : 1;
 
 	FScopeLock Lock(&GenMutex);
+
+	// GPU job limit check: Prevent GPU generation queue from growing unbounded
+	// If too many GPU jobs are pending readback, queue this chunk instead of dispatching
+	if (S->bUseGPUGeneration)
+	{
+		const int32 MaxGPUJobs = FMath::Max(1, S->MaxGPUGenerationJobsInFlight);
+		const int32 PendingGPUJobs = FVoxelGPUGenerator::GetPendingJobCount();
+
+		if (PendingGPUJobs >= MaxGPUJobs)
+		{
+			// GPU saturated - queue for later
+			GenWaitByDistance.FindOrAdd(Chunk->PriorityDist2).Add(Chunk);
+			UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] GPU SATURATED (%d,%d,%d) - PendingGPUJobs=%d, MaxGPUJobs=%d, Queued"),
+				Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, PendingGPUJobs, MaxGPUJobs);
+			return;
+		}
+	}
 
 	// Fast path: slot available, run immediately
 	if (ActiveGenTasks < MaxGen)
@@ -641,6 +691,19 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC()
 	{
 		// Pool empty - create new component
 		RMC = NewObject<URealtimeMeshComponent>(this);
+
+		// PERFORMANCE: Disable expensive features for voxel chunks
+		RMC->SetCastShadow(true); // Shadows ON (looks better)
+		RMC->bCastDynamicShadow = false; // But disable dynamic shadows (static only)
+		RMC->bAffectDistanceFieldLighting = false; // Distance field disabled (expensive)
+		RMC->bAffectDynamicIndirectLighting = false; // GI disabled (static terrain)
+		RMC->bCastFarShadow = false; // No far shadows (close only)
+		RMC->bCastInsetShadow = false; // No inset shadows
+		RMC->bCastContactShadow = false; // No contact shadows
+		RMC->bCastHiddenShadow = false; // Don't shadow when hidden
+		RMC->SetComponentTickEnabled(false); // Never tick (static mesh)
+		RMC->bNeverDistanceCull = false; // Allow distance culling
+
 		RMC->RegisterComponent();
 		RMC->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
 	}
@@ -767,12 +830,12 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerLocation = PrimarySource ? PrimarySource->GetSourceLocation() : PrimaryActor->GetActorLocation();
 	const FVoxelCoord CenterChunk = WorldToChunkCoord(PlayerLocation);
 
-	// DEBUG: Log player position and center chunk every 60 frames
+	// DEBUG: Log player position and center chunk periodically (reduced to Verbose)
 	static int32 DebugFrameCounter = 0;
-	if (++DebugFrameCounter >= 60)
+	if (++DebugFrameCounter >= VoxelConstants::FramesBetweenDebugLog)
 	{
 		DebugFrameCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
+		UE_LOG(LogTemp, Verbose, TEXT("[VoxelWorld] Player at World(%.1f,%.1f,%.1f) Chunk(%d,%d,%d) - CollisionR=%d, Using StreamingSource=%s"),
 			PlayerLocation.X, PlayerLocation.Y, PlayerLocation.Z,
 			CenterChunk.Cx, CenterChunk.Cy, CenterChunk.Cz,
 			PrimarySource ? PrimarySource->CollisionRadius : S->CollisionViewDistance,
@@ -787,8 +850,20 @@ void AVoxelWorld::UpdateChunks()
 	const int32 R2 = PrimarySource ? PrimarySource->ViewDistanceChunks :
 		((S->LOD2_Radius > 0) ? S->LOD2_Radius : S->ViewDistanceChunks);
 	const int32 R2Sq = R2 * R2;
-	const int32 Rz = PrimarySource ? (PrimarySource->ViewDistanceChunksZ > 0 ? PrimarySource->ViewDistanceChunksZ : R2) :
-		FMath::Max(0, S->ViewDistanceChunksZ);
+	// Asymmetric vertical radii: separate up/down for performance (air chunks cheap, solid chunks expensive)
+	int32 RzUp, RzDown;
+	if (PrimarySource)
+	{
+		RzUp = PrimarySource->ViewDistanceChunksZ > 0 ? PrimarySource->ViewDistanceChunksZ : R2;
+		RzDown = RzUp; // StreamingSource doesn't support asymmetric yet
+	}
+	else
+	{
+		// Use asymmetric if configured (non-zero), otherwise fall back to symmetric ViewDistanceChunksZ
+		RzUp = (S->ViewDistanceChunksUp > 0) ? S->ViewDistanceChunksUp : S->ViewDistanceChunksZ;
+		RzDown = (S->ViewDistanceChunksDown > 0) ? S->ViewDistanceChunksDown : S->ViewDistanceChunksZ;
+	}
+	const int32 Rz = FMath::Max(RzUp, RzDown); // For legacy compatibility (used in size calculations)
 
 	// Frustum priority settings
 	const bool bUseFrustumPriority = PrimarySource ? PrimarySource->bUseFrustumPriority : S->bUseFrustumBasedGeneration;
@@ -811,17 +886,15 @@ void AVoxelWorld::UpdateChunks()
 	const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
 
 	// OPTIMIZATION: Cache both Desired list (with priority) and Visible set to avoid rebuilding every frame
-	static TArray<TPair<FVoxelCoord, float>> Desired; // Coord → Priority (higher = more important)
-	static TSet<FVoxelCoord> Visible;
-	static FVoxelCoord LastDesiredCenter = FVoxelCoord(INT32_MAX, INT32_MAX, INT32_MAX);
-	static float LastPlayerYaw = 0.0f;
-	static bool bVisibleCached = false;
+	// FIXED: Moved from static to instance members to fix memory leak and support multiple worlds
+	TArray<TPair<FVoxelCoord, float>>& Desired = CachedDesiredChunks; // Coord → Priority (higher = more important)
+	TSet<FVoxelCoord>& Visible = CachedVisibleChunks;
 
 	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates horizontally (ignore pitch for jumping)
-	const bool bCenterChanged = !(CenterChunk == LastDesiredCenter);
+	const bool bCenterChanged = !(CenterChunk == CachedLastDesiredCenter);
 	const float CurrentYaw = PlayerRotation.Yaw;
-	const float YawDelta = FMath::Abs(FRotator::NormalizeAxis(CurrentYaw - LastPlayerYaw));
-	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > 10.0f); // 10° threshold, horizontal only
+	const float YawDelta = FMath::Abs(FRotator::NormalizeAxis(CurrentYaw - CachedLastPlayerYaw));
+	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > VoxelConstants::RotationChangeThresholdDegrees);
 	const bool bNeedsRebuild = bCenterChanged || bRotationChanged;
 
 	if (bNeedsRebuild || Desired.Num() == 0)
@@ -844,7 +917,8 @@ void AVoxelWorld::UpdateChunks()
 		{
 			for (int32 dy = -R2; dy <= R2; ++dy)
 			{
-				for (int32 dz = -Rz; dz <= Rz; ++dz)
+				// Asymmetric vertical loop: -RzDown to +RzUp
+				for (int32 dz = -RzDown; dz <= RzUp; ++dz)
 				{
 					const int32 d2 = dx * dx + dy * dy + dz * dz;
 					if (!bDiskLoading || d2 <= R2Sq)
@@ -927,14 +1001,14 @@ void AVoxelWorld::UpdateChunks()
 			return Az < Bz;
 		});
 
-		LastDesiredCenter = CenterChunk;
-		LastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
-		bVisibleCached = false;  // Invalidate Visible cache when Desired changes
+		CachedLastDesiredCenter = CenterChunk;
+		CachedLastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
+		bVisibilityCacheValid = false;  // Invalidate Visible cache when Desired changes
 	}
 
 	// OPTIMIZATION: Cache Visible set too (only rebuild if Desired changed)
 	// Eliminates 3000+ hash insertions every frame during chunk loading
-	if (!bVisibleCached)
+	if (!bVisibilityCacheValid)
 	{
 		Visible.Reset();
 		Visible.Reserve(Desired.Num());
@@ -942,7 +1016,7 @@ void AVoxelWorld::UpdateChunks()
 		{
 			Visible.Add(Pair.Key);
 		}
-		bVisibleCached = true;
+		bVisibilityCacheValid = true;
 	}
 
 	// Collision and AO radii (use streaming source settings if available)
@@ -1004,7 +1078,13 @@ void AVoxelWorld::UpdateChunks()
 			}
 		}
 
-		const bool bDesiredCollision0 = (d2 <= CollisionR2);
+		// Collision decision: within range AND (if optimization enabled) only for non-empty chunks
+		// This is huge for sky chunks - they never need collision!
+		bool bDesiredCollision0 = (d2 <= CollisionR2);
+
+		// OPTIMIZATION: Skip collision for air chunks (will be checked after generation)
+		// For now, assume collision wanted if within range (chunk will disable if empty)
+
 		const bool bDesiredAO = (d2 <= AOR2);
 
 		// OPTIMIZATION: Single lookup per map instead of two FindRef calls
@@ -1294,9 +1374,9 @@ void AVoxelWorld::UpdateChunks()
 			}
 		}
 
-		// OPTIMIZATION: Single-pass macro-tile unloading (reuse static array)
-		static TArray<FIntPoint> ToRemoveTiles;
-		ToRemoveTiles.Reset(0);
+		// OPTIMIZATION: Single-pass macro-tile unloading (reuse instance member array)
+		// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
+		TempRemoveTiles.Reset(0);
 
 		// Unload invisible active macro-tiles
 		for (const auto& Pair : ActiveMacro)
@@ -1309,16 +1389,16 @@ void AVoxelWorld::UpdateChunks()
 					C->UnloadChunk();
 					C->DestroyComponent();
 				}
-				ToRemoveTiles.Add(Pair.Key);
+				TempRemoveTiles.Add(Pair.Key);
 			}
 		}
-		for (const FIntPoint& T : ToRemoveTiles)
+		for (const FIntPoint& T : TempRemoveTiles)
 		{
 			ActiveMacro.Remove(T);
 		}
 
 		// Unload invisible pending macro-tiles
-		ToRemoveTiles.Reset(0);
+		TempRemoveTiles.Reset(0);
 		for (const auto& Pair : PendingMacro)
 		{
 			if (!VisibleTilesMinD2.Contains(Pair.Key))
@@ -1329,19 +1409,18 @@ void AVoxelWorld::UpdateChunks()
 					C->UnloadChunk();
 					C->DestroyComponent();
 				}
-				ToRemoveTiles.Add(Pair.Key);
+				TempRemoveTiles.Add(Pair.Key);
 			}
 		}
-		for (const FIntPoint& T : ToRemoveTiles)
+		for (const FIntPoint& T : TempRemoveTiles)
 		{
 			PendingMacro.Remove(T);
 		}
 	}
 
 	// OPTIMIZATION: Single-pass chunk unloading (build removal list while unloading)
-	// Reuse static array to avoid allocations
-	static TArray<FVoxelCoord> ToRemoveChunks;
-	ToRemoveChunks.Reset(0);
+	// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
+	TempRemoveChunks.Reset(0);
 
 	// Unload invisible active chunks
 	for (const auto& Pair : ActiveChunks)
@@ -1354,16 +1433,22 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
 			}
-			ToRemoveChunks.Add(Pair.Key);
+			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
-	for (const FVoxelCoord& C : ToRemoveChunks)
+	for (const FVoxelCoord& C : TempRemoveChunks)
 	{
+		// Remove from bucket if batching enabled
+		if (Settings.GetDefaultObject() && Settings.GetDefaultObject()->bEnableChunkBatching)
+		{
+			RemoveChunkFromBucket(C);
+		}
+
 		ActiveChunks.Remove(C);
 	}
 
 	// Unload invisible pending chunks
-	ToRemoveChunks.Reset(0);
+	TempRemoveChunks.Reset(0);
 	for (const auto& Pair : PendingChunks)
 	{
 		if (!Visible.Contains(Pair.Key))
@@ -1374,10 +1459,10 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
 			}
-			ToRemoveChunks.Add(Pair.Key);
+			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
-	for (const FVoxelCoord& C : ToRemoveChunks)
+	for (const FVoxelCoord& C : TempRemoveChunks)
 	{
 		PendingChunks.Remove(C);
 	}

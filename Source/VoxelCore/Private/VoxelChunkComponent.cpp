@@ -19,6 +19,12 @@
 #include <VoxelBiome.h>
 #include <VoxelNoise.h>
 
+// ============================================================================
+// LOGGING CATEGORIES
+// ============================================================================
+
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelChunk, Log, All);
+
 // Debug console variable for padding extraction logging
 static TAutoConsoleVariable<int32> CVarVoxelLogPadding(
     TEXT("r.Voxel.LogPadding"),
@@ -61,7 +67,7 @@ void UVoxelChunkComponent::InitializeChunk(
 
     StartGeneration();
     // In InitializeChunk, after calculating WorldLocation:
-    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) spawned at Z=%f (Cz=%d, ChunkSizeZ=%d, Scale=%f)"),
+    UE_LOG(LogVoxelChunk, Warning, TEXT("Chunk (%d,%d,%d) spawned at Z=%f (Cz=%d, ChunkSizeZ=%d, Scale=%f)"),
         ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
         WorldLocation.Z, ChunkCoord.Cz, Settings->ChunkSizeZ, Settings->VoxelWorldScale);
 }
@@ -156,7 +162,7 @@ void UVoxelChunkComponent::DoGeneration()
                 if (!This || !IsValid(This))
                 {
                     // Component destroyed - discard results BUT notify world to free queue slot
-                    UE_LOG(LogTemp, Warning, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
+                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[GenQueue] GPU generation completed but chunk (%d,%d,%d) destroyed - notifying world"),
                         Coord.Cx, Coord.Cy, Coord.Cz);
                     NotifyWorldLambda();
                     return;
@@ -200,48 +206,72 @@ void UVoxelChunkComponent::DoGeneration()
     }
 
     // CPU GENERATION PATH (legacy, always available)
-    UE::Tasks::Launch(UE_SOURCE_LOCATION, [this, WeakWorld, Params, Coord, ScaleXY, bHeight]()
+    // FIXED: Capture WeakThis instead of raw 'this' to prevent use-after-free if component destroyed
+    TWeakObjectPtr<UVoxelChunkComponent> WeakThis(this);
+    UE::Tasks::Launch(UE_SOURCE_LOCATION, [WeakThis, WeakWorld, Params, Coord, ScaleXY, bHeight]()
         {
-            if (bHeight)
+            // SAFETY: Get raw pointer upfront - if component is destroyed during generation,
+            // we'll detect it via bCancelPending or IsValid() check before accessing members
+            UVoxelChunkComponent* This = WeakThis.Get();
+            if (!This || !IsValid(This))
             {
-                FIntPoint Samples;
-                UVoxelGenerator::GenerateHeightmap(Coord, Params, ScaleXY, HeightData, Samples);
-                HF_SamplesX = Samples.X;
-                HF_SamplesY = Samples.Y;
-            }
-            else
-            {
-                // Categories for fast solid/air decisions
-                UVoxelGenerator::GenerateChunkLOD_Categories(Coord, Params, ScaleXY, CategoryData);
-
-                // NEW: 2D biome grid used later to expand categories into biome-aware blocks
-                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, BiomeGrid);
-
-                const int64 NumBytes = CategoryData.Data.Num();
-                INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
-            }
-
-            if (bCancelPending)
-            {
-                AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
+                // Component destroyed during generation - notify world to free queue slot
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
                     {
-                        // ALWAYS notify world, even if OwnerWorld changed
                         if (AVoxelWorld* World = WeakWorld.Get())
                         {
-                            World->OnGenerationFinished(this);
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            World->OnGenerationFinished(Comp); // Comp may be nullptr - that's OK
                         }
                     });
                 return;
             }
 
-            AsyncTask(ENamedThreads::GameThread, [this, WeakWorld]()
+            if (bHeight)
+            {
+                FIntPoint Samples;
+                UVoxelGenerator::GenerateHeightmap(Coord, Params, ScaleXY, This->HeightData, Samples);
+                This->HF_SamplesX = Samples.X;
+                This->HF_SamplesY = Samples.Y;
+            }
+            else
+            {
+                // Categories for fast solid/air decisions
+                UVoxelGenerator::GenerateChunkLOD_Categories(Coord, Params, ScaleXY, This->CategoryData);
+
+                // NEW: 2D biome grid used later to expand categories into biome-aware blocks
+                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
+
+                const int64 NumBytes = This->CategoryData.Data.Num();
+                INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
+            }
+
+            if (This->bCancelPending)
+            {
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
+                    {
+                        // ALWAYS notify world, even if OwnerWorld changed
+                        if (AVoxelWorld* World = WeakWorld.Get())
+                        {
+                            UVoxelChunkComponent* Comp = WeakThis.Get();
+                            World->OnGenerationFinished(Comp);
+                        }
+                    });
+                return;
+            }
+
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakWorld]()
                 {
-                    OnGenerationComplete();
+                    UVoxelChunkComponent* Comp = WeakThis.Get();
+                    if (Comp && IsValid(Comp))
+                    {
+                        Comp->OnGenerationComplete();
+                    }
 
                     // ALWAYS notify world, even if OwnerWorld changed
                     if (AVoxelWorld* World = WeakWorld.Get())
                     {
-                        World->OnGenerationFinished(this);
+                        World->OnGenerationFinished(Comp);
                     }
                 });
         });
@@ -254,6 +284,80 @@ void UVoxelChunkComponent::OnGenerationComplete()
     {
         State = EVoxelChunkState::Unloading;
         return;
+    }
+
+    // CRITICAL OPTIMIZATION: Skip meshing for empty/solid chunks
+    // This is Minecraft's #1 performance trick - don't render what you can't see!
+    if (RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() > 0)
+    {
+        // Quick scan: Check if chunk is entirely air OR entirely solid
+        // CategoryData stores 2-bit categories: 0=air, 1=semi-solid, 2=solid
+        bool bIsEmpty = true;
+        bool bIsSolid = true;
+        uint8 FirstNonAir = 0; // 0 = air
+
+        const int32 TotalVoxels = CategoryData.SizeX * CategoryData.SizeY * CategoryData.SizeZ;
+
+        // Sample every N voxels for speed (checking all voxels is too slow for large chunks)
+        // Step of 4 means we check ~1/64th of voxels (still very accurate for uniform chunks)
+        const int32 Step = 4;
+
+        for (int32 z = 0; z < CategoryData.SizeZ; z += Step)
+        {
+            for (int32 y = 0; y < CategoryData.SizeY; y += Step)
+            {
+                for (int32 x = 0; x < CategoryData.SizeX; x += Step)
+                {
+                    const uint8 Cat = CategoryData.Get(x, y, z);
+
+                    if (Cat != 0) // Not air
+                    {
+                        bIsEmpty = false;
+                        if (FirstNonAir == 0)
+                        {
+                            FirstNonAir = Cat;
+                        }
+                        else if (Cat != FirstNonAir)
+                        {
+                            bIsSolid = false;
+                            goto BreakAllLoops; // Not uniform - need full mesh
+                        }
+                    }
+                    else
+                    {
+                        bIsSolid = false; // Has air - not solid
+                    }
+                }
+            }
+        }
+        BreakAllLoops:;
+
+        // OPTIMIZATION 1: Empty chunks (100% air)
+        if (bIsEmpty)
+        {
+            UE_LOG(LogVoxelChunk, Verbose, TEXT("[EmptyCull] Chunk (%d,%d,%d) is 100%% air - skipping mesh + collision"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+
+            // Disable collision for air chunks (massive performance save!)
+            bBuildCollision = false;
+
+            State = EVoxelChunkState::Ready;
+            if (OwnerWorld) OwnerWorld->OnChunkReady(ChunkCoord);
+            return;
+        }
+
+        // OPTIMIZATION 2: Solid chunks (100% same category)
+        // Only render surface faces (neighbors will handle interior culling)
+        // This is HUGE for underground stone chunks - only mesh the edges!
+        if (bIsSolid && FirstNonAir != 0)
+        {
+            UE_LOG(LogVoxelChunk, Verbose, TEXT("[SolidCull] Chunk (%d,%d,%d) is 100%% solid (category %d) - surface-only mesh"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, (int32)FirstNonAir);
+
+            // Mark as solid for surface-only meshing
+            // The mesher will only generate faces on chunk boundaries
+            bIsSolidChunk = true;
+        }
     }
 
     // DON'T cache neighbors here - they might not be ready yet!
@@ -278,7 +382,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     if ((RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() == 0) ||
         (RenderMode == EVoxelRenderMode::Heightfield && HeightData.Num() == 0))
     {
-        UE_LOG(LogTemp, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
+        UE_LOG(LogVoxelChunk, Error, TEXT("Chunk (%d,%d,%d) FAILED to mesh - no data! CatData=%d HeightData=%d"),
             ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, CategoryData.Data.Num(), HeightData.Num());
         if (IsValid(OwnerWorld)) OwnerWorld->OnMeshingFinished(this);
         return;
@@ -301,7 +405,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     {
         // Chunk is completely empty - skip meshing AND mesh apply entirely
         // Don't enqueue empty meshes for application - this saves game thread time
-        UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
+        UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Meshing: 0.00ms | Verts: 0 | Tris: 0 | ChunkSize: %dx%dx%d | LOD: %d | Mesher: EarlyExit (Empty)"),
             (Settings->ChunkSizeX + LODScaleXY - 1) / LODScaleXY,
             (Settings->ChunkSizeY + LODScaleXY - 1) / LODScaleXY,
             Settings->ChunkSizeZ,
@@ -378,7 +482,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
             bool expected = false;
             if (bWarned.compare_exchange_strong(expected, true))
             {
-                UE_LOG(LogTemp, Warning, TEXT("[Voxel] BiomeGrid missing for chunk (%d,%d,%d). Using defaults."),
+                UE_LOG(LogVoxelChunk, Warning, TEXT("[Voxel] BiomeGrid missing for chunk (%d,%d,%d). Using defaults."),
                     ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
             }
         }
@@ -597,7 +701,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                             // This ensures ActiveMeshTasks is decremented and queue slots are freed
                             if (!World)
                             {
-                                UE_LOG(LogTemp, Warning, TEXT("[MeshQueue] Async GPU meshing completed but world destroyed - discarding"));
+                                UE_LOG(LogVoxelChunk, Warning, TEXT("[MeshQueue] Async GPU meshing completed but world destroyed - discarding"));
                                 return;
                             }
 
@@ -628,7 +732,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                     const double EndTime = FPlatformTime::Seconds();
                                     const float MeshingMs = (float)((EndTime - StartTime) * 1000.0);
 
-                                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
+                                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Async Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | Mesher: %s"),
                                         MeshingMs, LocalBufs.Vertices.Num(), LocalBufs.Triangles.Num() / 3, SizeX, SizeY, SizeZ,
                                         bUseBinary ? TEXT("Binary") : TEXT("Standard"));
                                 }
@@ -673,7 +777,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     const int32 VertCount = Buffers.Vertices.Num();
                     const int32 TriCount = Buffers.Triangles.Num() / 3;
 
-                    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
+                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
                         MeshingMs, VertCount, TriCount, SizeVox.X, SizeVox.Y, SizeVox.Z, XYScale,
                         SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher ? TEXT("Binary") : TEXT("Standard"));
                 }
@@ -734,7 +838,7 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
     const double EndTime = FPlatformTime::Seconds();
     const float ApplyMs = (float)((EndTime - StartTime) * 1000.0);
 
-    UE_LOG(LogTemp, Warning, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
+    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Mesh Apply: %.2fms | Verts: %d | Tris: %d | Collision: %s | Component: %s"),
         ApplyMs, Bufs.Vertices.Num(), Bufs.Triangles.Num() / 3,
         bCollision ? TEXT("Yes") : TEXT("No"),
         bUsingRMC ? TEXT("RMC") : TEXT("PMC"));
@@ -866,7 +970,7 @@ void UVoxelChunkComponent::RequestCollisionReapply(bool bNewCollision)
 void UVoxelChunkComponent::CancelPendingTask()
 {
     // ADD THIS:
-    UE_LOG(LogTemp, Warning, TEXT("Chunk (%d,%d,%d) CANCELLED (State=%d)"),
+    UE_LOG(LogVoxelChunk, Warning, TEXT("Chunk (%d,%d,%d) CANCELLED (State=%d)"),
         ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, (int32)State);
 
     bCancelPending.AtomicSet(true);
@@ -979,43 +1083,56 @@ void UVoxelChunkComponent::CacheNeighborBordersFromWorld()
 
     CachedNeighborBorders = FCachedNeighborBorders(); // Reset
 
-    auto CopyXBorder = [&](UVoxelChunkComponent* N, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+    // Generic border copy helper - eliminates code duplication across X/Y/Z borders
+    // FixedAxis: 0=X, 1=Y, 2=Z (which coordinate is held constant)
+    auto CopyBorderGeneric = [&](UVoxelChunkComponent* N, int32 FixedAxis, int32 SrcCoord,
+                                   int32 Size0, int32 Size1, int32 NeighborSize0, int32 NeighborSize1, int32 NeighborSizeFixed,
+                                   TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            // IMPORTANT: Only cache if neighbor is READY and has valid data
+            // Validate neighbor state
             if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
                 N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();  // Clear any old data
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcX < 0 || SrcX >= NSX || NSY != SY || NSZ != SZ)
             {
                 bFlag = false;
                 Dst.Reset();
                 return;
             }
 
-            const int32 ExpectedSizeXY = SY * SZ;
-            Dst.SetNumUninitialized(ExpectedSizeXY);
-            for (int32 z = 0; z < SZ; ++z)
+            // Validate coordinate ranges
+            if (SrcCoord < 0 || SrcCoord >= NeighborSizeFixed || NeighborSize0 != Size0 || NeighborSize1 != Size1)
             {
-                for (int32 y = 0; y < SY; ++y)
+                bFlag = false;
+                Dst.Reset();
+                return;
+            }
+
+            // Copy border slice
+            const int32 ExpectedSize = Size0 * Size1;
+            Dst.SetNumUninitialized(ExpectedSize);
+
+            for (int32 i1 = 0; i1 < Size1; ++i1)
+            {
+                for (int32 i0 = 0; i0 < Size0; ++i0)
                 {
-                    uint8 Cat = N->CategoryData.Get(SrcX, y, z);
+                    // Map (i0, i1) to (x, y, z) based on fixed axis
+                    int32 x, y, z;
+                    switch (FixedAxis)
+                    {
+                        case 0: x = SrcCoord; y = i0; z = i1; break; // X fixed: iterate YZ
+                        case 1: x = i0; y = SrcCoord; z = i1; break; // Y fixed: iterate XZ
+                        default: x = i0; y = i1; z = SrcCoord; break; // Z fixed: iterate XY
+                    }
+
+                    uint8 Cat = N->CategoryData.Get(x, y, z);
                     EVoxelBlockID Bid;
                     switch (Cat) {
                     case 0: Bid = EVoxelBlockID::Air; break;
                     case 1: Bid = EVoxelBlockID::Water; break;
                     default: Bid = EVoxelBlockID::Stone; break;
                     }
-                    const int32 WriteIndex = y + z * SY;
-                    if (WriteIndex >= 0 && WriteIndex < ExpectedSizeXY)
+
+                    const int32 WriteIndex = i0 + i1 * Size0;
+                    if (WriteIndex >= 0 && WriteIndex < ExpectedSize)
                     {
                         Dst[WriteIndex] = Bid;
                     }
@@ -1024,92 +1141,29 @@ void UVoxelChunkComponent::CacheNeighborBordersFromWorld()
             bFlag = true;
         };
 
+    // Specialized wrappers for clarity at call sites
+    auto CopyXBorder = [&](UVoxelChunkComponent* N, int32 SrcX, TArray<EVoxelBlockID>& Dst, bool& bFlag)
+        {
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 0, SrcX, SY, SZ, NSY, NSZ, NSX, Dst, bFlag);
+        };
+
     auto CopyYBorder = [&](UVoxelChunkComponent* N, int32 SrcY, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
-                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcY < 0 || SrcY >= NSY || NSX != SX || NSZ != SZ)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 ExpectedSizeXZ = SX * SZ;
-            Dst.SetNumUninitialized(ExpectedSizeXZ);
-            for (int32 z = 0; z < SZ; ++z)
-            {
-                for (int32 x = 0; x < SX; ++x)
-                {
-                    uint8 Cat = N->CategoryData.Get(x, SrcY, z);
-                    EVoxelBlockID Bid;
-                    switch (Cat) {
-                    case 0: Bid = EVoxelBlockID::Air; break;
-                    case 1: Bid = EVoxelBlockID::Water; break;
-                    default: Bid = EVoxelBlockID::Stone; break;
-                    }
-                    const int32 WriteIndex2 = x + z * SX;
-                    if (WriteIndex2 >= 0 && WriteIndex2 < ExpectedSizeXZ)
-                    {
-                        Dst[WriteIndex2] = Bid;
-                    }
-                }
-            }
-            bFlag = true;
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 1, SrcY, SX, SZ, NSX, NSZ, NSY, Dst, bFlag);
         };
 
     auto CopyZBorder = [&](UVoxelChunkComponent* N, int32 SrcZ, TArray<EVoxelBlockID>& Dst, bool& bFlag)
         {
-            if (!N || N->State != EVoxelChunkState::Ready || N->LOD != LOD ||
-                N->RenderMode != RenderMode || N->CategoryData.Data.Num() == 0)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 NSX = (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSY = (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY;
-            const int32 NSZ = Settings->ChunkSizeZ;
-
-            if (SrcZ < 0 || SrcZ >= NSZ || NSX != SX || NSY != SY)
-            {
-                bFlag = false;
-                Dst.Reset();
-                return;
-            }
-
-            const int32 ExpectedSizeYZ = SX * SY;
-            Dst.SetNumUninitialized(ExpectedSizeYZ);
-            for (int32 y = 0; y < SY; ++y)
-            {
-                for (int32 x = 0; x < SX; ++x)
-                {
-                    uint8 Cat = N->CategoryData.Get(x, y, SrcZ);
-                    EVoxelBlockID Bid;
-                    switch (Cat) {
-                    case 0: Bid = EVoxelBlockID::Air; break;
-                    case 1: Bid = EVoxelBlockID::Water; break;
-                    default: Bid = EVoxelBlockID::Stone; break;
-                    }
-                    const int32 WriteIndex3 = x + y * SX;
-                    if (WriteIndex3 >= 0 && WriteIndex3 < ExpectedSizeYZ)
-                    {
-                        Dst[WriteIndex3] = Bid;
-                    }
-                }
-            }
-            bFlag = true;
+            const int32 NSX = N ? (Settings->ChunkSizeX + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSY = N ? (Settings->ChunkSizeY + N->LODScaleXY - 1) / N->LODScaleXY : 0;
+            const int32 NSZ = N ? Settings->ChunkSizeZ : 0;
+            CopyBorderGeneric(N, 2, SrcZ, SX, SY, NSX, NSY, NSZ, Dst, bFlag);
         };
 
     // Get neighbors and cache their borders
