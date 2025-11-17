@@ -113,14 +113,14 @@ public:
     // Use GPU compute shaders for mesh generation (experimental).
     // Requires compute shader support. Disabled by default for stability.
     // Enable only if CPU meshing is a bottleneck.
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance")
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing")
     bool bUseGPUMesherForLOD0 = false;
 
     // Use true greedy meshing algorithm on GPU (reduces triangles by 60-90%).
     // Only applies when bUseGPUMesherForLOD0 is enabled.
     // True = proper greedy quad merging (slower GPU, fewer triangles, better rendering).
     // False = naive face culling (faster GPU, more triangles, worse rendering).
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance",
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing",
         meta = (EditCondition = "bUseGPUMesherForLOD0", EditConditionHides))
     bool bUseGPUGreedyMeshing = true;
 
@@ -184,12 +184,6 @@ public:
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Performance|Frame Budgets",
         meta = (ClampMin = "0", ClampMax = "500"))
     int32 MaxGPUMeshReadbacksPerFrame = 0;
-
-    /**
-     * Enable GPU mesher for LOD0 (experimental, optional).
-     */
-    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|GPU Meshing")
-    bool bUseGPUMesherForLOD0 = false;
 
     /**
      * GPU mesher tile size. Larger = more shared memory usage but better occupancy.
