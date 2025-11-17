@@ -173,6 +173,28 @@ void AVoxelWorld::RebuildDirtyBuckets()
 	const int32 MaxRebuildsPerFrame = S->MaxBucketRebuildsPerFrame;
 	const int32 ThrottleFrames = S->BucketRebuildThrottleFrames;
 
+	// PASS 1: Rebuild first-time buckets immediately (prevent flicker!)
+	// First-time rebuilds don't count toward frame budget
+	for (auto& Pair : ChunkBuckets)
+	{
+		FVoxelChunkBucket* Bucket = Pair.Value;
+		if (!Bucket || !Bucket->bNeedsRebuild)
+		{
+			continue;
+		}
+
+		// First-time rebuild? (LastRebuildFrame == -1 means never rebuilt)
+		if (Bucket->LastRebuildFrame == -1)
+		{
+			// Rebuild immediately without throttling or counting
+			RebuildBucketMesh(Bucket);
+			Bucket->bNeedsRebuild = false;
+			Bucket->LastRebuildFrame = CurrentFrame;
+			// Don't increment RebuildsThisFrame - these are "free"!
+		}
+	}
+
+	// PASS 2: Rebuild throttled updates (subsequent changes to existing buckets)
 	for (auto& Pair : ChunkBuckets)
 	{
 		FVoxelChunkBucket* Bucket = Pair.Value;
@@ -187,7 +209,7 @@ void AVoxelWorld::RebuildDirtyBuckets()
 			continue; // Wait configured frames between rebuilds
 		}
 
-		// Throttle: Max rebuilds per frame
+		// Throttle: Max rebuilds per frame (only for subsequent updates)
 		if (RebuildsThisFrame >= MaxRebuildsPerFrame)
 		{
 			break; // Continue next frame
