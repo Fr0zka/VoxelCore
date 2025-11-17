@@ -55,6 +55,16 @@ FVoxelChunkBucket* AVoxelWorld::GetOrCreateBucket(const FVoxelCoord& ChunkCoord)
 	// Create RealtimeMeshComponent for this bucket (bForBucket=true means always visible)
 	NewBucket->MeshComponent = AcquireRMC(true);
 
+	// CRITICAL: Assign voxel material to bucket (otherwise textures won't show!)
+	if (UMaterialInterface* VoxelMat = S->VoxelArrayMaterial.LoadSynchronous())
+	{
+		NewBucket->MeshComponent->SetMaterial(0, VoxelMat);
+	}
+	else
+	{
+		UE_LOG(LogVoxelBuckets, Error, TEXT("[Bucket] CRITICAL: VoxelArrayMaterial is NULL! Bucket will have no texture!"));
+	}
+
 	// Calculate world bounds for this bucket
 	const float ChunkWorldSizeX = S->ChunkSizeX * S->VoxelWorldScale;
 	const float ChunkWorldSizeY = S->ChunkSizeY * S->VoxelWorldScale;

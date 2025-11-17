@@ -873,7 +873,13 @@ void UVoxelChunkComponent::OnMeshApplied(TUniquePtr<FMeshBuffers>&& AppliedBuffe
     // Immediately free mesh buffers on non-LOD0 chunks to reduce memory
     // footprint.  LOD0 chunks retain their buffers so that collision can be
     // reapplied without a full remesh if needed. Also adjust memory stats.
-    if (LOD != EVoxelLODLevel::LOD0 && CachedBuffers.IsValid())
+    //
+    // CRITICAL: When chunk batching is enabled, we MUST keep ALL LOD0 buffers
+    // so buckets can merge them! Never free LOD0 buffers when batching is on.
+    const bool bBatchingEnabled = (Settings && Settings->bEnableChunkBatching);
+    const bool bShouldFreeBuffers = (LOD != EVoxelLODLevel::LOD0) && !bBatchingEnabled;
+
+    if (bShouldFreeBuffers && CachedBuffers.IsValid())
     {
         const int32 Bytes =
             CachedBuffers->Vertices.Num() * sizeof(FVector) +
