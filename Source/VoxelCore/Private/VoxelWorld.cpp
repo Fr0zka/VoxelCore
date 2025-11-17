@@ -348,6 +348,17 @@ void AVoxelWorld::PromoteReadyPendings()
 {
 	SCOPE_CYCLE_COUNTER(STAT_VoxelPromotePendings);
 
+	// DEBUG: Log promotion flow (first 10 frames only)
+	static int32 PromotionFrameCount = 0;
+	const bool bShouldLog = (PromotionFrameCount < 10);
+
+	if (bShouldLog)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] Frame %d: PendingChunks=%d, ActiveChunks=%d"),
+			PromotionFrameCount, PendingChunks.Num(), ActiveChunks.Num());
+		PromotionFrameCount++;
+	}
+
 	// Promote chunks (LOD0/1)
 	{
 		TArray<FVoxelCoord> ToPromote;
@@ -368,6 +379,32 @@ void AVoxelWorld::PromoteReadyPendings()
 			{
 				ToPromote.Add(Coord);
 			}
+		}
+
+		// DEBUG: Log promotion stats
+		if (bShouldLog && ToPromote.Num() > 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] Found %d ready chunks to promote"), ToPromote.Num());
+		}
+		else if (bShouldLog && PendingChunks.Num() > 0 && ToPromote.Num() == 0)
+		{
+			// Show chunk states to debug why nothing is ready
+			int32 CountGenerating = 0, CountMeshing = 0, CountEmpty = 0, CountUnloading = 0;
+			for (const auto& Pair : PendingChunks)
+			{
+				if (Pair.Value)
+				{
+					switch (Pair.Value->State)
+					{
+						case EVoxelChunkState::Generating: CountGenerating++; break;
+						case EVoxelChunkState::Meshing: CountMeshing++; break;
+						case EVoxelChunkState::Empty: CountEmpty++; break;
+						case EVoxelChunkState::Unloading: CountUnloading++; break;
+					}
+				}
+			}
+			UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] No ready chunks! States: Generating=%d, Meshing=%d, Empty=%d, Unloading=%d"),
+				CountGenerating, CountMeshing, CountEmpty, CountUnloading);
 		}
 
 		for (const FVoxelCoord& Coord : ToDrop)
