@@ -168,9 +168,11 @@ void WriteFace(uint VertexBase, uint3 Origin, uint3 SpanU, uint3 SpanV, uint Nor
 // ============================================================================
 
 // Shared memory for face mask (one Z-slice worth of data)
-// Maximum chunk size is typically 32×32, so we allocate 32×32×6 directions
-groupshared uint FaceMask[32][32][6];  // [x][y][direction]
-groupshared uint FaceMerged[32][32][6]; // Track which faces have been merged
+// NOTE: Limited to 16×16 to stay under 32KB shared memory limit
+// 16×16×6 directions × 4 bytes × 2 arrays = 12,288 bytes (safe!)
+// For chunks larger than 16×16, this shader will fail - use naive mesher instead
+groupshared uint FaceMask[16][16][6];  // [x][y][direction]
+groupshared uint FaceMerged[16][16][6]; // Track which faces have been merged
 
 // Thread group processes one Z-slice
 // numthreads(32,1,1) = 32 threads per group (one warp)
@@ -181,6 +183,10 @@ void TrueGreedyMeshCS(uint3 GroupID : SV_GroupID, uint3 LocalID : SV_GroupThread
     uint z = GroupID.x; // Each group = one Z-slice
     if (z >= SizeZ)
         return;
+
+    // Safety check: Reject chunks larger than 16×16 (shared memory limit)
+    if (SizeX > 16 || SizeY > 16)
+        return; // Fallback to naive mesher for large chunks
 
     uint threadIdx = LocalID.x;
 
