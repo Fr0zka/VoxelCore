@@ -1282,142 +1282,145 @@ void AVoxelWorld::UpdateChunks()
 
 			if (bSettingsMatch && !Pending)
 			{
-				ChunksCheckedThisFrame++; // Count towards batch limit
-				continue;  // Chunk is already correct, skip expensive processing
-			}
-		}
-
-		if (Pending)
-		{
-			Pending->PriorityDist2 = d2;
-		}
-
-		// BATCH LIMIT: Stop checking chunks if we've hit frame budget
-		// This prevents 30fps drops when iterating 10,000+ chunks
-		// Chunks are sorted by priority, so closest chunks are checked first
-		ChunksCheckedThisFrame++;
-		if (ChunksCheckedThisFrame >= MaxChunksToCheckPerFrame)
-		{
-			bNeedsMoreSpawning = true; // Continue next frame
-			break; // Exit loop to preserve FPS
-		}
-
-		// NEW CHUNK: Progressive spawning with budget
-		if (!Active && !Pending)
-		{
-			++MissingChunks;
-
-			// BUDGET: Only spawn up to SpawnBudget new chunks per frame
-			if (ChunksSpawnedThisFrame >= SpawnBudget)
-			{
-				bNeedsMoreSpawning = true;
-				continue; // Skip this chunk this frame, will spawn next frame
-			}
-
-			++ChunksSpawnedThisFrame;
-
-			// Spawn new chunk component
-			UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
-			Chunk->RegisterComponent();
-			AddInstanceComponent(Chunk);
-			Chunk->PriorityDist2 = d2;
-
-			Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
-			ActiveChunks.Add(C, Chunk);
-
-			// Add to bucket if batching enabled (chunks added directly to Active skip promotion code!)
-			if (S && S->bEnableChunkBatching)
-			{
-				FVoxelChunkBucket* Bucket = GetOrCreateBucket(C);
-				if (Bucket)
-				{
-					Bucket->ContainedChunks.Add(C);
-					Bucket->MarkDirty();
-				}
-			}
-
-			// DEBUG: Log collision settings for chunks near player
-			if (d2 <= 4) // Log for chunks within 2-chunk radius
-			{
-				UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d, CollisionR2=%d)"),
-					C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR, CollisionR2);
-			}
-
-			continue;
-		}
-
-		// EXISTING CHUNK: Update settings (collision, AO, LOD transitions)
-		if (Active)
-		{
-			// Collision hysteresis: keep collision enabled for one extra ring
-			bool bDesiredCollision = bDesiredCollision0;
-			if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
-			{
-				bDesiredCollision = true;
-			}
-
-			// Same LOD: check for policy changes (collision/AO)
-			if (Active->LOD == DesiredLOD)
-			{
-				const bool bPolicyChanged =
-					(Active->bBuildCollision != bDesiredCollision) ||
-					(Active->bUseAO != bDesiredAO);
-
-				if (bPolicyChanged)
-				{
-					const bool AOChanged = (Active->bUseAO != bDesiredAO);
-					Active->bUseAO = bDesiredAO;
-
-					// Collision policy changed: reapply collision using cached mesh
-					if (Active->bBuildCollision != bDesiredCollision)
-					{
-						// DEBUG: Log collision changes
-						if (d2 <= 16) // Log for chunks within 4-chunk radius
-						{
-							UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
-								C.Cx, C.Cy, C.Cz, d2,
-								Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
-								bDesiredCollision ? TEXT("YES") : TEXT("NO"),
-								CollisionR);
-						}
-						Active->RequestCollisionReapply(bDesiredCollision);
-					}
-
-					// AO policy changed: full remesh required
-					if (AOChanged)
-					{
-						Active->RequestRemesh();
-					}
-				}
+				// Chunk is already correct - skip expensive processing but count iteration
+				// Fall through to batch limit check at end of loop
 			}
 			else
 			{
-				// LOD changed: spawn Pending replacement
-				if (!Pending)
+				// Chunk needs processing
+				if (Pending)
 				{
-					UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
-					NewP->RegisterComponent();
-					AddInstanceComponent(NewP);
-					NewP->PriorityDist2 = d2;
+					Pending->PriorityDist2 = d2;
+				}
 
-					NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
-					PendingChunks.Add(C, NewP);
+				// NEW CHUNK: Progressive spawning with budget
+				if (!Active && !Pending)
+				{
+					++MissingChunks;
+
+					// BUDGET: Only spawn up to SpawnBudget new chunks per frame
+					if (ChunksSpawnedThisFrame < SpawnBudget)
+					{
+						++ChunksSpawnedThisFrame;
+
+						// Spawn new chunk component
+						UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
+						Chunk->RegisterComponent();
+						AddInstanceComponent(Chunk);
+						Chunk->PriorityDist2 = d2;
+
+						Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+						ActiveChunks.Add(C, Chunk);
+
+						// Add to bucket if batching enabled (chunks added directly to Active skip promotion code!)
+						if (S && S->bEnableChunkBatching)
+						{
+							FVoxelChunkBucket* Bucket = GetOrCreateBucket(C);
+							if (Bucket)
+							{
+								Bucket->ContainedChunks.Add(C);
+								Bucket->MarkDirty();
+							}
+						}
+
+						// DEBUG: Log collision settings for chunks near player
+						if (d2 <= 4) // Log for chunks within 2-chunk radius
+						{
+							UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d, CollisionR2=%d)"),
+								C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR, CollisionR2);
+						}
+					}
+					else
+					{
+						bNeedsMoreSpawning = true; // Hit spawn budget, continue next frame
+					}
 				}
 				else
 				{
-					// Pending already exists - update its settings
-					Pending->bBuildCollision = bDesiredCollision0;
-					Pending->bUseAO = bDesiredAO;
-					Pending->PriorityDist2 = d2;
-				}
-			}
-		}
-		else if (Pending)
+					// EXISTING CHUNK: Update settings (collision, AO, LOD transitions)
+					if (Active)
+					{
+						// Collision hysteresis: keep collision enabled for one extra ring
+						bool bDesiredCollision = bDesiredCollision0;
+						if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
+						{
+							bDesiredCollision = true;
+						}
+
+						// Same LOD: check for policy changes (collision/AO)
+						if (Active->LOD == DesiredLOD)
+						{
+							const bool bPolicyChanged =
+								(Active->bBuildCollision != bDesiredCollision) ||
+								(Active->bUseAO != bDesiredAO);
+
+							if (bPolicyChanged)
+							{
+								const bool AOChanged = (Active->bUseAO != bDesiredAO);
+								Active->bUseAO = bDesiredAO;
+
+								// Collision policy changed: reapply collision using cached mesh
+								if (Active->bBuildCollision != bDesiredCollision)
+								{
+									// DEBUG: Log collision changes
+									if (d2 <= 16) // Log for chunks within 4-chunk radius
+									{
+										UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
+											C.Cx, C.Cy, C.Cz, d2,
+											Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
+											bDesiredCollision ? TEXT("YES") : TEXT("NO"),
+											CollisionR);
+									}
+									Active->RequestCollisionReapply(bDesiredCollision);
+								}
+
+								// AO policy changed: full remesh required
+								if (AOChanged)
+								{
+									Active->RequestRemesh();
+								}
+							}
+						}
+						else
+						{
+							// LOD changed: spawn Pending replacement
+							if (!Pending)
+							{
+								UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
+								NewP->RegisterComponent();
+								AddInstanceComponent(NewP);
+								NewP->PriorityDist2 = d2;
+
+								NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+								PendingChunks.Add(C, NewP);
+							}
+							else
+							{
+								// Pending already exists - update its settings
+								Pending->bBuildCollision = bDesiredCollision0;
+								Pending->bUseAO = bDesiredAO;
+								Pending->PriorityDist2 = d2;
+							}
+						}
+					}
+					else if (Pending)
+					{
+						// Update pending chunk settings
+						Pending->bBuildCollision = bDesiredCollision0;
+						Pending->bUseAO = bDesiredAO;
+						Pending->PriorityDist2 = d2;
+					}
+				} // end else (Active processing)
+			} // end else (chunk needs processing)
+		} // end if (Active exists)
+
+		// BATCH LIMIT: Check at end of EVERY iteration to prevent FPS drops
+		// This prevents 30fps drops when iterating 10,000+ chunks with 40uu voxels
+		ChunksCheckedThisFrame++;
+		if (ChunksCheckedThisFrame >= MaxChunksToCheckPerFrame)
 		{
-			// Update pending chunk settings
-			Pending->bBuildCollision = bDesiredCollision0;
-			Pending->bUseAO = bDesiredAO;
-			Pending->PriorityDist2 = d2;
+			bNeedsMoreSpawning = true; // Continue next frame from where we left off
+			break; // Exit loop to preserve FPS
 		}
 	}
 
