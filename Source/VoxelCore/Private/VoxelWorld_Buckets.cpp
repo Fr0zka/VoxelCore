@@ -168,10 +168,11 @@ void AVoxelWorld::RebuildDirtyBuckets()
 
 	const int32 CurrentFrame = GFrameCounter;
 	int32 RebuildsThisFrame = 0;
-	// CRITICAL FIX: Increased from 2 to 8 (was severe bottleneck - 18+ frames to see anything!)
-	// With 37 buckets total, this rebuilds all in 5 frames instead of 18
-	// Budget: ~2-3ms per bucket merge × 8 = 16-24ms/frame during loading (acceptable)
-	const int32 MaxRebuildsPerFrame = 8;
+	// CRITICAL FIX: Increased from 2 to 16 for 40uu voxels (6.25x more chunks!)
+	// With 200+ buckets (40uu scale), need aggressive rebuilds
+	// Budget: ~2-3ms per bucket × 16 = 32-48ms/frame during loading
+	// 5800X3D can handle this easily - worth the brief FPS dip for fast visibility
+	const int32 MaxRebuildsPerFrame = 16;
 
 	for (auto& Pair : ChunkBuckets)
 	{

@@ -1130,7 +1130,13 @@ void AVoxelWorld::UpdateChunks()
 	// Now reset for this frame's processing
 	bNeedsMoreSpawning = false;
 
-	// OPTIMIZATION: Process ALL desired chunks (sorted by priority)
+	// CRITICAL OPTIMIZATION: Limit chunk iteration during initial load to prevent FPS drops
+	// With 10,000+ chunks (40uu voxels), iterating all chunks every frame kills performance
+	// Process chunks in batches - prioritized chunks first (already sorted by priority)
+	const int32 MaxChunksToCheckPerFrame = 512; // Check up to 512 chunks/frame (balance speed vs FPS)
+	int32 ChunksCheckedThisFrame = 0;
+
+	// OPTIMIZATION: Process desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
 	{
 		const FVoxelCoord& C = Pair.Key;
@@ -1276,6 +1282,7 @@ void AVoxelWorld::UpdateChunks()
 
 			if (bSettingsMatch && !Pending)
 			{
+				ChunksCheckedThisFrame++; // Count towards batch limit
 				continue;  // Chunk is already correct, skip expensive processing
 			}
 		}
@@ -1283,6 +1290,16 @@ void AVoxelWorld::UpdateChunks()
 		if (Pending)
 		{
 			Pending->PriorityDist2 = d2;
+		}
+
+		// BATCH LIMIT: Stop checking chunks if we've hit frame budget
+		// This prevents 30fps drops when iterating 10,000+ chunks
+		// Chunks are sorted by priority, so closest chunks are checked first
+		ChunksCheckedThisFrame++;
+		if (ChunksCheckedThisFrame >= MaxChunksToCheckPerFrame)
+		{
+			bNeedsMoreSpawning = true; // Continue next frame
+			break; // Exit loop to preserve FPS
 		}
 
 		// NEW CHUNK: Progressive spawning with budget

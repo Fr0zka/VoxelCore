@@ -61,11 +61,18 @@ public:
 
 	/** Max mesh apply operations per tick (collision prioritized over visual-only)
 	 * CRITICAL: This was a SEVERE bottleneck at 4 (taking 79 seconds to load 19k chunks!)
-	 * Increased to 32 for 8x faster loading. Minecraft uses 20-50 chunks/frame.
-	 * Adjust based on target FPS: 16=smooth 60fps, 32=balanced, 64=fast loading
+	 * For 40uu voxels (6.25x more chunks), need MUCH higher throughput.
+	 *
+	 * Recommended values:
+	 * - 128: Aggressive loading (5800X3D + 7900XTX can handle it!)
+	 * - 64: Balanced (good for most high-end PCs)
+	 * - 32: Conservative (original "fixed" value, still too low for 40uu)
+	 *
+	 * With batching ON, individual chunk applies are cheap (just caching buffers).
+	 * The real work happens in bucket rebuilds, so we can push this MUCH higher.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "128"))
-	int32 MaxMeshAppliesPerTick = 32;
+	UPROPERTY(EditAnywhere, Category = "Voxel|Performance", meta = (ClampMin = "1", ClampMax = "512"))
+	int32 MaxMeshAppliesPerTick = 128;
 
 	// ==================== PUBLIC API ====================
 
