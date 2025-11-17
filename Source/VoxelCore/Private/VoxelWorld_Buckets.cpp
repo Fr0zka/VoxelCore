@@ -192,7 +192,18 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 {
 	if (!Bucket || !Bucket->MeshComponent)
 	{
+		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] RebuildBucketMesh called with NULL bucket or component!"));
 		return;
+	}
+
+	// DEBUG: Log rebuild attempt
+	static int32 DebugRebuildCount = 0;
+	if (DebugRebuildCount < 5)
+	{
+		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] Rebuilding bucket (%d,%d,%d) with %d contained chunks"),
+			Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
+			Bucket->ContainedChunks.Num());
+		DebugRebuildCount++;
 	}
 
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelRebuildBucketMesh);
@@ -209,18 +220,30 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 	const float ChunkWorldSizeZ = S->ChunkSizeZ * S->VoxelWorldScale;
 
 	// Iterate through all chunks in this bucket and merge their meshes
+	int32 SkippedNotReady = 0;
+	int32 SkippedNoBuffers = 0;
+	int32 SkippedEmpty = 0;
+
 	for (const FVoxelCoord& ChunkCoord : Bucket->ContainedChunks)
 	{
 		UVoxelChunkComponent* Chunk = ActiveChunks.FindRef(ChunkCoord);
 		if (!Chunk || Chunk->State != EVoxelChunkState::Ready)
 		{
+			SkippedNotReady++;
 			continue; // Skip chunks that aren't ready yet
 		}
 
 		// Get cached mesh data from chunk
 		const FMeshBuffers* ChunkBuffers = Chunk->GetCachedBuffers();
-		if (!ChunkBuffers || ChunkBuffers->Vertices.Num() == 0)
+		if (!ChunkBuffers)
 		{
+			SkippedNoBuffers++;
+			continue; // Skip chunks without buffers
+		}
+
+		if (ChunkBuffers->Vertices.Num() == 0)
+		{
+			SkippedEmpty++;
 			continue; // Skip empty chunks
 		}
 
@@ -271,6 +294,15 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 
 		VertexOffset += ChunkVertCount;
 		ChunksMerged++;
+	}
+
+	// DEBUG: Log merge stats
+	if (DebugRebuildCount <= 5)
+	{
+		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] Bucket (%d,%d,%d) merge results: %d merged, %d verts | Skipped: %d not ready, %d no buffers, %d empty"),
+			Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
+			ChunksMerged, MergedBuffers.Vertices.Num(),
+			SkippedNotReady, SkippedNoBuffers, SkippedEmpty);
 	}
 
 	// Apply merged mesh to RealtimeMeshComponent

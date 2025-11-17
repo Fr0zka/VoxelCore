@@ -369,13 +369,36 @@ void AVoxelWorld::PromoteReadyPendings()
 			PendingChunks.Remove(Coord);
 
 			// Add to bucket if batching enabled
-			if (Settings.GetDefaultObject() && Settings.GetDefaultObject()->bEnableChunkBatching)
+			const UVoxelSettings* S = Settings.GetDefaultObject();
+			if (S && S->bEnableChunkBatching)
 			{
+				// DEBUG: Log first few chunk promotions to verify flow
+				static int32 DebugPromotionCount = 0;
+				if (DebugPromotionCount < 5)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[DEBUG] Promoting chunk (%d,%d,%d) to bucket - calling GetOrCreateBucket"),
+						Coord.Cx, Coord.Cy, Coord.Cz);
+					DebugPromotionCount++;
+				}
+
 				FVoxelChunkBucket* Bucket = GetOrCreateBucket(Coord);
 				if (Bucket)
 				{
 					Bucket->ContainedChunks.Add(Coord);
 					Bucket->MarkDirty();
+
+					if (DebugPromotionCount <= 5)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("[DEBUG] Added chunk (%d,%d,%d) to bucket (%d,%d,%d), now has %d chunks"),
+							Coord.Cx, Coord.Cy, Coord.Cz,
+							Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
+							Bucket->ContainedChunks.Num());
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error, TEXT("[DEBUG] GetOrCreateBucket returned NULL for chunk (%d,%d,%d)!"),
+						Coord.Cx, Coord.Cy, Coord.Cz);
 				}
 			}
 
