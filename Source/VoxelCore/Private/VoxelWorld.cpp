@@ -820,6 +820,19 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC(bool bForBucket)
 	RMC->SetHiddenInGame(bShouldHide, true);
 	RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
+	// DEBUG: Log first few RMC acquisitions to verify hide logic
+	static int32 RMCAcquireCount = 0;
+	if (RMCAcquireCount < 5)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[DEBUG RMC] Acquired #%d | ForBucket:%s | Batching:%s | ShouldHide:%s | Visible:%s | Hidden:%s"),
+			RMCAcquireCount, bForBucket ? TEXT("Y") : TEXT("N"),
+			(S && S->bEnableChunkBatching) ? TEXT("Y") : TEXT("N"),
+			bShouldHide ? TEXT("Y") : TEXT("N"),
+			RMC->IsVisible() ? TEXT("Y") : TEXT("N"),
+			RMC->bHiddenInGame ? TEXT("Y") : TEXT("N"));
+		RMCAcquireCount++;
+	}
+
 	// Clear any previous mesh data without recreating shared resources
 	// (avoids lock-destruction assert when pooling)
 	if (URealtimeMesh* MeshAsset = RMC->GetRealtimeMesh())
