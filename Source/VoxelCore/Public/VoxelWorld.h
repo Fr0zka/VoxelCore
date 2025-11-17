@@ -216,6 +216,58 @@ private:
 	 */
 	void UpdateChunks();
 
+	/** Build list of desired chunks sorted by priority (distance + frustum). */
+	void BuildDesiredChunkList(
+		const FVoxelCoord& CenterChunk,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelSettings* Settings,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		int32 R2, int32 R2Sq, int32 Rz,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bDiskLoading, bool bFrustumVertical);
+
+	/** Rebuild visibility cache from desired chunk list. */
+	void RebuildVisibilityCache();
+
+	/** Update chunk mesh visibility based on frustum/occlusion culling. */
+	void UpdateChunkVisibility(
+		UVoxelChunkComponent* Active,
+		const FVoxelCoord& ChunkCoord,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bFrustumVertical);
+
+	/** Process desired chunks (spawn new, update settings, handle LOD transitions). */
+	void ProcessDesiredChunks(
+		const FVoxelCoord& CenterChunk,
+		const FVector& PlayerLocation,
+		const FVector& PlayerForward,
+		const FVector& PlayerForwardXY,
+		const UVoxelSettings* Settings,
+		const UVoxelStreamingSourceComponent* PrimarySource,
+		int32 CollisionR, int32 CollisionR2, int32 CollisionDropR2,
+		int32 AOR2, int32 SpawnBudget,
+		float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+		bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+		bool bFrustumVertical, bool bRotationChanged,
+		TMap<FIntPoint, int32>& OutVisibleTilesMinD2,
+		int32& OutMissingChunks);
+
+	/** Update LOD2 macro-tiles (spawn, update, unload). */
+	void UpdateMacroTiles(
+		const UVoxelSettings* Settings,
+		const TMap<FIntPoint, int32>& VisibleTilesMinD2);
+
+	/** Unload chunks that are no longer visible. */
+	void UnloadInvisibleChunks();
+
 	/** Convert world position to chunk coordinate. */
 	FVoxelCoord WorldToChunkCoord(const FVector& Location) const;
 

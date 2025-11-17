@@ -827,11 +827,6 @@ void AVoxelWorld::UpdateChunks()
 		? FMath::Cos(FMath::DegreesToRadians(FrustumVFOV * 0.5f)) : -1.0f;
 	const FVector PlayerForwardXY = FVector(PlayerForward.X, PlayerForward.Y, 0.0f).GetSafeNormal();
 
-	// OPTIMIZATION: Cache both Desired list (with priority) and Visible set to avoid rebuilding every frame
-	// FIXED: Moved from static to instance members to fix memory leak and support multiple worlds
-	TArray<TPair<FVoxelCoord, float>>& Desired = CachedDesiredChunks; // Coord → Priority (higher = more important)
-	TSet<FVoxelCoord>& Visible = CachedVisibleChunks;
-
 	// OPTIMIZATION: Only rebuild when player moves chunks OR rotates horizontally (ignore pitch for jumping)
 	const bool bCenterChanged = !(CenterChunk == CachedLastDesiredCenter);
 	const float CurrentYaw = PlayerRotation.Yaw;
@@ -839,125 +834,20 @@ void AVoxelWorld::UpdateChunks()
 	const bool bRotationChanged = bUseFrustumPriority && (YawDelta > VoxelConstants::RotationChangeThresholdDegrees);
 	const bool bNeedsRebuild = bCenterChanged || bRotationChanged;
 
-	if (bNeedsRebuild || Desired.Num() == 0)
+	// Build desired chunk list if player moved/rotated
+	if (bNeedsRebuild || CachedDesiredChunks.Num() == 0)
 	{
-		Desired.Reset(0);
+		BuildDesiredChunkList(CenterChunk, PlayerLocation, PlayerForward, PlayerForwardXY, S, PrimarySource,
+			R2, R2Sq, Rz, ChunkWorldSizeX, ChunkWorldSizeY, ChunkWorldSizeZ,
+			bApplyFrustumPriority, CosHalfHorizontalFOV, CosHalfVerticalFOV, bDiskLoading, bFrustumVertical);
 
-		const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
-
-		if (Desired.GetSlack() < EstimatedSize)
-		{
-			Desired.Reserve(EstimatedSize);
-		}
-
-		const int32 VerticalCenter = CenterChunk.Cz;
-
-		// NOTE: Frustum and chunk size variables are now declared outside the rebuild block
-		// so they're accessible for visibility culling later
-
-		for (int32 dx = -R2; dx <= R2; ++dx)
-		{
-			for (int32 dy = -R2; dy <= R2; ++dy)
-			{
-				for (int32 dz = -Rz; dz <= Rz; ++dz)
-				{
-					const int32 d2 = dx * dx + dy * dy + dz * dz;
-					if (!bDiskLoading || d2 <= R2Sq)
-					{
-						const FVoxelCoord ChunkCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz);
-
-						// Calculate base priority (inverse distance - closer = higher priority)
-						// Priority range: [0.0 ... 1.0] where 1.0 = at player position, 0.0 = max distance
-						const float Distance = FMath::Sqrt(static_cast<float>(d2));
-						const float MaxDistance = FMath::Sqrt(static_cast<float>(R2Sq + Rz * Rz));
-						float Priority = 1.0f - (Distance / (MaxDistance + 1.0f));
-
-						// OPTIMIZATION: Frustum PRIORITY BOOST (not hard-culling)
-						// Chunks in frustum get 2x priority (loaded first), chunks outside get normal priority (loaded later)
-						if (bApplyFrustumPriority)
-						{
-							// Calculate chunk center in world space
-							const FVector ChunkWorldPos(
-								ChunkCoord.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
-								ChunkCoord.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
-								ChunkCoord.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
-							);
-
-							const FVector ToChunk = ChunkWorldPos - PlayerLocation;
-							const float DistanceSq = ToChunk.SizeSquared();
-
-							// Close chunks always get max priority (no frustum check needed)
-							const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
-							const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
-
-							if (DistanceSq > CloseChunkThreshold)
-							{
-								const FVector ToChunkDir = ToChunk.GetSafeNormal();
-
-								// Horizontal frustum check (XY plane)
-								const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
-								const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
-
-								bool bInFrustum = (DotHorizontal >= CosHalfHorizontalFOV);
-
-								// Vertical frustum check (optional)
-								if (bInFrustum && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
-								{
-									const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
-									bInFrustum = (DotVertical >= CosHalfVerticalFOV);
-								}
-
-								// 2x priority boost for chunks in frustum
-								if (bInFrustum)
-								{
-									Priority *= 2.0f;
-								}
-							}
-							else
-							{
-								// Very close chunks always get 2x priority
-								Priority *= 2.0f;
-							}
-						}
-
-						Desired.Emplace(ChunkCoord, Priority);
-					}
-				}
-			}
-		}
-
-		// Sort by PRIORITY (higher = load first), then by vertical distance
-		const int32 Czc = CenterChunk.Cz;
-		Desired.Sort([Czc](const TPair<FVoxelCoord, float>& A, const TPair<FVoxelCoord, float>& B)
-		{
-			// Higher priority first (reverse sort on priority)
-			if (!FMath::IsNearlyEqual(A.Value, B.Value, 0.001f))
-			{
-				return A.Value > B.Value; // Higher priority = earlier in list
-			}
-
-			// If priorities are equal, prefer chunks closer to player's vertical position
-			const int32 Az = FMath::Abs(A.Key.Cz - Czc);
-			const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
-			return Az < Bz;
-		});
-
-		CachedLastDesiredCenter = CenterChunk;
-		CachedLastPlayerYaw = CurrentYaw;  // Cache yaw to detect horizontal camera rotation
-		bVisibilityCacheValid = false;  // Invalidate Visible cache when Desired changes
+		CachedLastPlayerYaw = CurrentYaw;
 	}
 
-	// OPTIMIZATION: Cache Visible set too (only rebuild if Desired changed)
-	// Eliminates 3000+ hash insertions every frame during chunk loading
+	// Rebuild visibility cache if needed
 	if (!bVisibilityCacheValid)
 	{
-		Visible.Reset();
-		Visible.Reserve(Desired.Num());
-		for (const auto& Pair : Desired)
-		{
-			Visible.Add(Pair.Key);
-		}
-		bVisibilityCacheValid = true;
+		RebuildVisibilityCache();
 	}
 
 	// Collision and AO radii (use streaming source settings if available)
@@ -966,159 +856,297 @@ void AVoxelWorld::UpdateChunks()
 	const int32 AOR = PrimarySource ? PrimarySource->AORadius : S->AORadiusChunks;
 	const int32 AOR2 = AOR * AOR;
 	const int32 CollisionDropR2 = (CollisionR + 1) * (CollisionR + 1); // Hysteresis for collision drop
-
-	TMap<FIntPoint, int32> VisibleTilesMinD2; // LOD2 macro-tiles
-
-	// PROGRESSIVE LOADING: Reset spawn counter each frame
-	ChunksSpawnedThisFrame = 0;
 	const int32 SpawnBudget = FMath::Max(1, S->MaxChunksSpawnPerFrame);
 
-	int32 MissingChunks = 0; // Track how many chunks are not yet spawned
-
 	// MEGA OPTIMIZATION: When player hasn't moved or rotated, skip the entire update loop
-	// All chunks are already correct, so no need to check every chunk's settings
-	// CRITICAL: Check bNeedsMoreSpawning BEFORE resetting it, to preserve previous frame's state
 	const bool bPlayerStandingStill = !bCenterChanged && !bRotationChanged;
 	const bool bAllChunksLoaded = bInitialLoadComplete && !bNeedsMoreSpawning;
 
 	if (bPlayerStandingStill && bAllChunksLoaded)
 	{
-		// Player standing still, all chunks loaded - nothing to do!
-		// Skip expensive chunk iteration entirely
-		return;
+		return; // Skip expensive chunk iteration entirely
 	}
 
-	// Now reset for this frame's processing
+	// Reset for this frame's processing
 	bNeedsMoreSpawning = false;
 
-	// OPTIMIZATION: Process ALL desired chunks (sorted by priority)
-	for (const auto& Pair : Desired)
+	// Process desired chunks (spawn, update, LOD transitions)
+	TMap<FIntPoint, int32> VisibleTilesMinD2;
+	int32 MissingChunks = 0;
+	ProcessDesiredChunks(CenterChunk, PlayerLocation, PlayerForward, PlayerForwardXY, S, PrimarySource,
+		CollisionR, CollisionR2, CollisionDropR2, AOR2, SpawnBudget,
+		ChunkWorldSizeX, ChunkWorldSizeY, ChunkWorldSizeZ,
+		bApplyFrustumPriority, CosHalfHorizontalFOV, CosHalfVerticalFOV, bFrustumVertical, bRotationChanged,
+		VisibleTilesMinD2, MissingChunks);
+
+	// Update macro-tiles
+	UpdateMacroTiles(S, VisibleTilesMinD2);
+
+	// Unload invisible chunks
+	UnloadInvisibleChunks();
+}
+
+// ============================================================================
+// UPDATECHUNKS HELPER FUNCTIONS (Code Quality Refactor)
+// ============================================================================
+
+void AVoxelWorld::BuildDesiredChunkList(
+	const FVoxelCoord& CenterChunk,
+	const FVector& PlayerLocation,
+	const FVector& PlayerForward,
+	const FVector& PlayerForwardXY,
+	const UVoxelSettings* Settings,
+	const UVoxelStreamingSourceComponent* PrimarySource,
+	int32 R2, int32 R2Sq, int32 Rz,
+	float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+	bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+	bool bDiskLoading, bool bFrustumVertical)
+{
+	CachedDesiredChunks.Reset(0);
+
+	const int32 EstimatedSize = (2 * R2 + 1) * (2 * R2 + 1) * (2 * Rz + 1);
+	if (CachedDesiredChunks.GetSlack() < EstimatedSize)
+	{
+		CachedDesiredChunks.Reserve(EstimatedSize);
+	}
+
+	const int32 VerticalCenter = CenterChunk.Cz;
+
+	for (int32 dx = -R2; dx <= R2; ++dx)
+	{
+		for (int32 dy = -R2; dy <= R2; ++dy)
+		{
+			for (int32 dz = -Rz; dz <= Rz; ++dz)
+			{
+				const int32 d2 = dx * dx + dy * dy + dz * dz;
+				if (!bDiskLoading || d2 <= R2Sq)
+				{
+					const FVoxelCoord ChunkCoord(CenterChunk.Cx + dx, CenterChunk.Cy + dy, VerticalCenter + dz);
+
+					// Calculate base priority (inverse distance - closer = higher priority)
+					const float Distance = FMath::Sqrt(static_cast<float>(d2));
+					const float MaxDistance = FMath::Sqrt(static_cast<float>(R2Sq + Rz * Rz));
+					float Priority = 1.0f - (Distance / (MaxDistance + 1.0f));
+
+					// Frustum priority boost (2x for chunks in frustum)
+					if (bApplyFrustumPriority)
+					{
+						const FVector ChunkWorldPos(
+							ChunkCoord.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
+							ChunkCoord.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
+							ChunkCoord.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
+						);
+
+						const FVector ToChunk = ChunkWorldPos - PlayerLocation;
+						const float DistanceSq = ToChunk.SizeSquared();
+
+						const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
+						const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
+
+						if (DistanceSq > CloseChunkThreshold)
+						{
+							const FVector ToChunkDir = ToChunk.GetSafeNormal();
+							const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
+							const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
+
+							bool bInFrustum = (DotHorizontal >= CosHalfHorizontalFOV);
+
+							if (bInFrustum && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
+							{
+								const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
+								bInFrustum = (DotVertical >= CosHalfVerticalFOV);
+							}
+
+							if (bInFrustum)
+							{
+								Priority *= 2.0f;
+							}
+						}
+						else
+						{
+							Priority *= 2.0f; // Close chunks always get 2x priority
+						}
+					}
+
+					CachedDesiredChunks.Emplace(ChunkCoord, Priority);
+				}
+			}
+		}
+	}
+
+	// Sort by priority (higher = load first), then by vertical distance
+	const int32 Czc = CenterChunk.Cz;
+	CachedDesiredChunks.Sort([Czc](const TPair<FVoxelCoord, float>& A, const TPair<FVoxelCoord, float>& B)
+	{
+		if (!FMath::IsNearlyEqual(A.Value, B.Value, 0.001f))
+		{
+			return A.Value > B.Value; // Higher priority first
+		}
+
+		const int32 Az = FMath::Abs(A.Key.Cz - Czc);
+		const int32 Bz = FMath::Abs(B.Key.Cz - Czc);
+		return Az < Bz;
+	});
+
+	CachedLastDesiredCenter = CenterChunk;
+	bVisibilityCacheValid = false;
+}
+
+void AVoxelWorld::RebuildVisibilityCache()
+{
+	CachedVisibleChunks.Reset();
+	CachedVisibleChunks.Reserve(CachedDesiredChunks.Num());
+	for (const auto& Pair : CachedDesiredChunks)
+	{
+		CachedVisibleChunks.Add(Pair.Key);
+	}
+	bVisibilityCacheValid = true;
+}
+
+void AVoxelWorld::UpdateChunkVisibility(
+	UVoxelChunkComponent* Active,
+	const FVoxelCoord& ChunkCoord,
+	const FVector& PlayerLocation,
+	const FVector& PlayerForward,
+	const FVector& PlayerForwardXY,
+	const UVoxelStreamingSourceComponent* PrimarySource,
+	float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+	bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+	bool bFrustumVertical)
+{
+	if (!Active || !PrimarySource || !PrimarySource->bIsPlayerSource)
+		return;
+
+	bool bShouldBeVisible = true;
+
+	const FVector ChunkWorldPos(
+		ChunkCoord.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
+		ChunkCoord.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
+		ChunkCoord.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
+	);
+
+	const FVector ToChunk = ChunkWorldPos - PlayerLocation;
+	const float DistanceSq = ToChunk.SizeSquared();
+
+	// Frustum culling
+	if (bApplyFrustumPriority && CosHalfHorizontalFOV > -1.0f)
+	{
+		const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
+		const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
+
+		if (DistanceSq > CloseChunkThreshold)
+		{
+			const FVector ToChunkDir = ToChunk.GetSafeNormal();
+			const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
+			const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
+
+			bShouldBeVisible = (DotHorizontal >= CosHalfHorizontalFOV);
+
+			if (bShouldBeVisible && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
+			{
+				const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
+				bShouldBeVisible = (DotVertical >= CosHalfVerticalFOV);
+			}
+		}
+	}
+
+	// Occlusion culling
+	if (bShouldBeVisible && PrimarySource->bEnableOcclusionCulling)
+	{
+		const int32 dx = ChunkCoord.Cx - CachedLastDesiredCenter.Cx;
+		const int32 dy = ChunkCoord.Cy - CachedLastDesiredCenter.Cy;
+		const int32 dz = ChunkCoord.Cz - CachedLastDesiredCenter.Cz;
+		const int32 d2 = dx * dx + dy * dy + dz * dz;
+		const int32 OcclusionMinDistSq = PrimarySource->OcclusionMinDistance * PrimarySource->OcclusionMinDistance;
+
+		if (d2 > OcclusionMinDistSq)
+		{
+			const float ChunkTopZ = ChunkWorldPos.Z + (ChunkWorldSizeZ * 0.5f);
+			const float HeightDifference = PlayerLocation.Z - ChunkTopZ;
+			if (HeightDifference > ChunkWorldSizeZ * 2.0f)
+			{
+				bShouldBeVisible = false;
+			}
+		}
+	}
+
+	// Apply visibility
+	if (Active->IsUsingRMC() && Active->GetRMC())
+	{
+		Active->GetRMC()->SetVisibility(bShouldBeVisible, true);
+		Active->GetRMC()->SetHiddenInGame(!bShouldBeVisible, true);
+	}
+	else if (Active->GetPMC())
+	{
+		Active->GetPMC()->SetVisibility(bShouldBeVisible, true);
+		Active->GetPMC()->SetHiddenInGame(!bShouldBeVisible, true);
+	}
+}
+
+void AVoxelWorld::ProcessDesiredChunks(
+	const FVoxelCoord& CenterChunk,
+	const FVector& PlayerLocation,
+	const FVector& PlayerForward,
+	const FVector& PlayerForwardXY,
+	const UVoxelSettings* Settings,
+	const UVoxelStreamingSourceComponent* PrimarySource,
+	int32 CollisionR, int32 CollisionR2, int32 CollisionDropR2,
+	int32 AOR2, int32 SpawnBudget,
+	float ChunkWorldSizeX, float ChunkWorldSizeY, float ChunkWorldSizeZ,
+	bool bApplyFrustumPriority, float CosHalfHorizontalFOV, float CosHalfVerticalFOV,
+	bool bFrustumVertical, bool bRotationChanged,
+	TMap<FIntPoint, int32>& OutVisibleTilesMinD2,
+	int32& OutMissingChunks)
+{
+	ChunksSpawnedThisFrame = 0;
+	OutMissingChunks = 0;
+
+	for (const auto& Pair : CachedDesiredChunks)
 	{
 		const FVoxelCoord& C = Pair.Key;
-		// NOTE: Pair.Value is now priority (float), not distance! Recalculate distance from chunk coord
 		const int32 dx = C.Cx - CenterChunk.Cx;
 		const int32 dy = C.Cy - CenterChunk.Cy;
 		const int32 dz = C.Cz - CenterChunk.Cz;
 		const int32 d2 = dx * dx + dy * dy + dz * dz;
 
-		const EVoxelLODLevel DesiredLOD = PickLOD(d2, S);
+		const EVoxelLODLevel DesiredLOD = PickLOD(d2, Settings);
 
-		// LOD2 macro-tile handling (heightfield impostors)
-		if (DesiredLOD == EVoxelLODLevel::LOD2 && S->bUseLOD2MacroTiles)
+		// LOD2 macro-tile handling
+		if (DesiredLOD == EVoxelLODLevel::LOD2 && Settings->bUseLOD2MacroTiles)
 		{
 			if (C.Cz == CenterChunk.Cz)
 			{
-				const int32 M = (S->LOD2_MacroTileSize > 2) ? S->LOD2_MacroTileSize : 2;
+				const int32 M = (Settings->LOD2_MacroTileSize > 2) ? Settings->LOD2_MacroTileSize : 2;
 				const int32 Tx = FloorDiv(C.Cx, M);
 				const int32 Ty = FloorDiv(C.Cy, M);
 				const FIntPoint Tile(Tx, Ty);
 
-				int32& MinD2 = VisibleTilesMinD2.FindOrAdd(Tile, d2);
+				int32& MinD2 = OutVisibleTilesMinD2.FindOrAdd(Tile, d2);
 				MinD2 = FMath::Min(MinD2, d2);
-				continue; // Skip regular chunk processing for LOD2
+				continue;
 			}
 		}
 
 		const bool bDesiredCollision0 = (d2 <= CollisionR2);
 		const bool bDesiredAO = (d2 <= AOR2);
 
-		// OPTIMIZATION: Single lookup per map instead of two FindRef calls
 		UVoxelChunkComponent* Active = ActiveChunks.FindRef(C);
 		UVoxelChunkComponent* Pending = PendingChunks.FindRef(C);
 
-		// VISIBILITY CULLING: Only update visibility when player rotates (saves massive CPU time)
-		// CRITICAL OPTIMIZATION: Skip expensive visibility calculations unless player rotated
-		// This reduces UpdateChunks from 3.5ms to <0.5ms when all chunks loaded and player standing still
-		const bool bNeedsVisibilityUpdate = bRotationChanged &&
-		                                     Active &&
-		                                     PrimarySource &&
-		                                     PrimarySource->bIsPlayerSource;
-
-		if (bNeedsVisibilityUpdate)
+		// Update visibility if rotation changed
+		if (bRotationChanged && Active)
 		{
-			// Calculate if chunk is in frustum (reuse earlier frustum logic)
-			bool bShouldBeVisible = true; // Default: visible
-
-			// Calculate chunk center in world space (used by both frustum and occlusion checks)
-			const FVector ChunkWorldPos(
-				C.Cx * ChunkWorldSizeX + ChunkWorldSizeX * 0.5f,
-				C.Cy * ChunkWorldSizeY + ChunkWorldSizeY * 0.5f,
-				C.Cz * ChunkWorldSizeZ + ChunkWorldSizeZ * 0.5f
-			);
-
-			const FVector ToChunk = ChunkWorldPos - PlayerLocation;
-			const float DistanceSq = ToChunk.SizeSquared();
-
-			// FRUSTUM CULLING
-			if (bApplyFrustumPriority && FrustumHFOV < 360.0f)
-			{
-				// Close chunks always visible
-				const float CloseChunkThresholdSq = FMath::Max(ChunkWorldSizeX, FMath::Max(ChunkWorldSizeY, ChunkWorldSizeZ));
-				const float CloseChunkThreshold = CloseChunkThresholdSq * CloseChunkThresholdSq * 4.0f;
-
-				if (DistanceSq > CloseChunkThreshold)
-				{
-					const FVector ToChunkDir = ToChunk.GetSafeNormal();
-
-					// Horizontal frustum check
-					const FVector ToChunkXY = FVector(ToChunkDir.X, ToChunkDir.Y, 0.0f).GetSafeNormal();
-					const float DotHorizontal = FVector::DotProduct(PlayerForwardXY, ToChunkXY);
-
-					bShouldBeVisible = (DotHorizontal >= CosHalfHorizontalFOV);
-
-					// Vertical frustum check (optional)
-					if (bShouldBeVisible && bFrustumVertical && CosHalfVerticalFOV > -1.0f)
-					{
-						const float DotVertical = FVector::DotProduct(PlayerForward, ToChunkDir);
-						bShouldBeVisible = (DotVertical >= CosHalfVerticalFOV);
-					}
-				}
-			}
-
-			// OCCLUSION CULLING (simple height-based check)
-			if (bShouldBeVisible && PrimarySource->bEnableOcclusionCulling)
-			{
-				const int32 OcclusionMinDistSq = PrimarySource->OcclusionMinDistance * PrimarySource->OcclusionMinDistance;
-
-				// Only occlude chunks beyond minimum distance
-				if (d2 > OcclusionMinDistSq)
-				{
-					// Simple occlusion: Hide chunks significantly below player height and far away
-					// This catches chunks on the other side of mountains/hills
-					const float ChunkTopZ = ChunkWorldPos.Z + (ChunkWorldSizeZ * 0.5f);
-					const float PlayerZ = PlayerLocation.Z;
-
-					// If chunk's top is more than 2 chunk heights below player, likely occluded
-					const float HeightDifference = PlayerZ - ChunkTopZ;
-					if (HeightDifference > ChunkWorldSizeZ * 2.0f)
-					{
-						bShouldBeVisible = false;
-						// TODO: More sophisticated occlusion with terrain raycasting
-					}
-				}
-			}
-
-			// Apply visibility to mesh component
-			if (Active->IsUsingRMC() && Active->GetRMC())
-			{
-				Active->GetRMC()->SetVisibility(bShouldBeVisible, true);
-				Active->GetRMC()->SetHiddenInGame(!bShouldBeVisible, true);
-			}
-			else if (Active->GetPMC())
-			{
-				Active->GetPMC()->SetVisibility(bShouldBeVisible, true);
-				Active->GetPMC()->SetHiddenInGame(!bShouldBeVisible, true);
-			}
+			UpdateChunkVisibility(Active, C, PlayerLocation, PlayerForward, PlayerForwardXY,
+				PrimarySource, ChunkWorldSizeX, ChunkWorldSizeY, ChunkWorldSizeZ,
+				bApplyFrustumPriority, CosHalfHorizontalFOV, CosHalfVerticalFOV, bFrustumVertical);
 		}
 
-		// OPTIMIZATION: Early exit if chunk exists and already correct
-		// Update priority distance if chunk exists
+		// Update priority distance
 		if (Active)
 		{
 			Active->PriorityDist2 = d2;
 
-			// OPTIMIZATION: Early exit if this chunk is already correct (common case during generation)
-			// Check if LOD, collision, and AO settings are already correct
+			// Early exit if chunk already correct
 			bool bDesiredCollision = bDesiredCollision0;
 			if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
 			{
@@ -1126,12 +1154,12 @@ void AVoxelWorld::UpdateChunks()
 			}
 
 			const bool bSettingsMatch = (Active->LOD == DesiredLOD) &&
-			                            (Active->bBuildCollision == bDesiredCollision) &&
-			                            (Active->bUseAO == bDesiredAO);
+				(Active->bBuildCollision == bDesiredCollision) &&
+				(Active->bUseAO == bDesiredAO);
 
 			if (bSettingsMatch && !Pending)
 			{
-				continue;  // Chunk is already correct, skip expensive processing
+				continue;
 			}
 		}
 
@@ -1140,50 +1168,45 @@ void AVoxelWorld::UpdateChunks()
 			Pending->PriorityDist2 = d2;
 		}
 
-		// NEW CHUNK: Progressive spawning with budget
+		// Spawn new chunk
 		if (!Active && !Pending)
 		{
-			++MissingChunks;
+			++OutMissingChunks;
 
-			// BUDGET: Only spawn up to SpawnBudget new chunks per frame
 			if (ChunksSpawnedThisFrame >= SpawnBudget)
 			{
 				bNeedsMoreSpawning = true;
-				continue; // Skip this chunk this frame, will spawn next frame
+				continue;
 			}
 
 			++ChunksSpawnedThisFrame;
 
-			// Spawn new chunk component
 			UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
 			Chunk->RegisterComponent();
 			AddInstanceComponent(Chunk);
 			Chunk->PriorityDist2 = d2;
 
-			Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+			Chunk->InitializeChunk(C, Settings, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 			ActiveChunks.Add(C, Chunk);
 
-			// DEBUG: Log collision settings for chunks near player
-			if (d2 <= 4) // Log for chunks within 2-chunk radius
+			if (d2 <= 4)
 			{
-				UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d, CollisionR2=%d)"),
-					C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR, CollisionR2);
+				UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d)"),
+					C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR);
 			}
 
 			continue;
 		}
 
-		// EXISTING CHUNK: Update settings (collision, AO, LOD transitions)
+		// Update existing chunk
 		if (Active)
 		{
-			// Collision hysteresis: keep collision enabled for one extra ring
 			bool bDesiredCollision = bDesiredCollision0;
 			if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
 			{
 				bDesiredCollision = true;
 			}
 
-			// Same LOD: check for policy changes (collision/AO)
 			if (Active->LOD == DesiredLOD)
 			{
 				const bool bPolicyChanged =
@@ -1195,22 +1218,18 @@ void AVoxelWorld::UpdateChunks()
 					const bool AOChanged = (Active->bUseAO != bDesiredAO);
 					Active->bUseAO = bDesiredAO;
 
-					// Collision policy changed: reapply collision using cached mesh
 					if (Active->bBuildCollision != bDesiredCollision)
 					{
-						// DEBUG: Log collision changes
-						if (d2 <= 16) // Log for chunks within 4-chunk radius
+						if (d2 <= 16)
 						{
-							UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
+							UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s"),
 								C.Cx, C.Cy, C.Cz, d2,
 								Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
-								bDesiredCollision ? TEXT("YES") : TEXT("NO"),
-								CollisionR);
+								bDesiredCollision ? TEXT("YES") : TEXT("NO"));
 						}
 						Active->RequestCollisionReapply(bDesiredCollision);
 					}
 
-					// AO policy changed: full remesh required
 					if (AOChanged)
 					{
 						Active->RequestRemesh();
@@ -1219,7 +1238,7 @@ void AVoxelWorld::UpdateChunks()
 			}
 			else
 			{
-				// LOD changed: spawn Pending replacement
+				// LOD changed - spawn pending replacement
 				if (!Pending)
 				{
 					UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
@@ -1227,12 +1246,11 @@ void AVoxelWorld::UpdateChunks()
 					AddInstanceComponent(NewP);
 					NewP->PriorityDist2 = d2;
 
-					NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+					NewP->InitializeChunk(C, Settings, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 					PendingChunks.Add(C, NewP);
 				}
 				else
 				{
-					// Pending already exists - update its settings
 					Pending->bBuildCollision = bDesiredCollision0;
 					Pending->bUseAO = bDesiredAO;
 					Pending->PriorityDist2 = d2;
@@ -1241,26 +1259,25 @@ void AVoxelWorld::UpdateChunks()
 		}
 		else if (Pending)
 		{
-			// Update pending chunk settings
 			Pending->bBuildCollision = bDesiredCollision0;
 			Pending->bUseAO = bDesiredAO;
 			Pending->PriorityDist2 = d2;
 		}
 	}
 
-	// Track initial load progress
-	if (MissingChunks > 0 && ChunksSpawnedThisFrame >= SpawnBudget)
+	// Track progress
+	if (OutMissingChunks > 0 && ChunksSpawnedThisFrame >= SpawnBudget)
 	{
 		bNeedsMoreSpawning = true;
 	}
-	else if (MissingChunks == 0)
+	else if (OutMissingChunks == 0)
 	{
 		bNeedsMoreSpawning = false;
 	}
 
 	if (!bInitialLoadComplete)
 	{
-		if (MissingChunks == 0)
+		if (OutMissingChunks == 0)
 		{
 			bNeedsMoreSpawning = false;
 			bInitialLoadComplete = true;
@@ -1269,98 +1286,99 @@ void AVoxelWorld::UpdateChunks()
 		}
 		else
 		{
-			// Log progress during initial load
 			static int32 LogCounter = 0;
-			if (++LogCounter >= 60) // Every 60 frames (~1 second)
+			if (++LogCounter >= 60)
 			{
 				LogCounter = 0;
-				const int32 TotalNeeded = Desired.Num();
+				const int32 TotalNeeded = CachedDesiredChunks.Num();
 				const int32 CurrentLoaded = ActiveChunks.Num() + PendingChunks.Num();
 				const float Progress = (float)CurrentLoaded / (float)TotalNeeded * 100.0f;
 				UE_LOG(LogTemp, Warning, TEXT("Loading chunks: %d/%d (%.1f%%) - Missing: %d, Spawned this frame: %d (Budget %d)"),
-					CurrentLoaded, TotalNeeded, Progress, MissingChunks, ChunksSpawnedThisFrame, SpawnBudget);
+					CurrentLoaded, TotalNeeded, Progress, OutMissingChunks, ChunksSpawnedThisFrame, SpawnBudget);
 			}
 		}
 	}
+}
 
-	// Spawn/update macro-tiles (LOD2)
-	if (S->bUseLOD2MacroTiles)
+void AVoxelWorld::UpdateMacroTiles(
+	const UVoxelSettings* Settings,
+	const TMap<FIntPoint, int32>& VisibleTilesMinD2)
+{
+	if (!Settings->bUseLOD2MacroTiles)
+		return;
+
+	// Spawn/update visible tiles
+	for (const TPair<FIntPoint, int32>& TPairMin : VisibleTilesMinD2)
 	{
-		for (const TPair<FIntPoint, int32>& TPairMin : VisibleTilesMinD2)
+		const FIntPoint& Tile = TPairMin.Key;
+		const int32 d2 = TPairMin.Value;
+
+		UVoxelMacroTileComponent* ActiveT = ActiveMacro.FindRef(Tile);
+		UVoxelMacroTileComponent* PendingT = PendingMacro.FindRef(Tile);
+
+		if (ActiveT)  ActiveT->PriorityDist2 = d2;
+		if (PendingT) PendingT->PriorityDist2 = d2;
+
+		if (!ActiveT && !PendingT)
 		{
-			const FIntPoint& Tile = TPairMin.Key;
-			const int32 d2 = TPairMin.Value;
+			auto* TileComp = NewObject<UVoxelMacroTileComponent>(this);
+			TileComp->RegisterComponent();
+			AddInstanceComponent(TileComp);
+			TileComp->PriorityDist2 = d2;
 
-			UVoxelMacroTileComponent* ActiveT = ActiveMacro.FindRef(Tile);
-			UVoxelMacroTileComponent* PendingT = PendingMacro.FindRef(Tile);
-
-			if (ActiveT)  ActiveT->PriorityDist2 = d2;
-			if (PendingT) PendingT->PriorityDist2 = d2;
-
-			if (!ActiveT && !PendingT)
-			{
-				auto* TileComp = NewObject<UVoxelMacroTileComponent>(this);
-				TileComp->RegisterComponent();
-				AddInstanceComponent(TileComp);
-				TileComp->PriorityDist2 = d2;
-
-				TileComp->InitializeMacroTile(Tile, S, this);
-				ActiveMacro.Add(Tile, TileComp);
-			}
-		}
-
-		// OPTIMIZATION: Single-pass macro-tile unloading (reuse instance member array)
-		// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
-		TempRemoveTiles.Reset(0);
-
-		// Unload invisible active macro-tiles
-		for (const auto& Pair : ActiveMacro)
-		{
-			if (!VisibleTilesMinD2.Contains(Pair.Key))
-			{
-				if (UVoxelMacroTileComponent* C = Pair.Value)
-				{
-					C->CancelPendingTask();
-					C->UnloadChunk();
-					C->DestroyComponent();
-				}
-				TempRemoveTiles.Add(Pair.Key);
-			}
-		}
-		for (const FIntPoint& T : TempRemoveTiles)
-		{
-			ActiveMacro.Remove(T);
-		}
-
-		// Unload invisible pending macro-tiles
-		TempRemoveTiles.Reset(0);
-		for (const auto& Pair : PendingMacro)
-		{
-			if (!VisibleTilesMinD2.Contains(Pair.Key))
-			{
-				if (UVoxelMacroTileComponent* C = Pair.Value)
-				{
-					C->CancelPendingTask();
-					C->UnloadChunk();
-					C->DestroyComponent();
-				}
-				TempRemoveTiles.Add(Pair.Key);
-			}
-		}
-		for (const FIntPoint& T : TempRemoveTiles)
-		{
-			PendingMacro.Remove(T);
+			TileComp->InitializeMacroTile(Tile, Settings, this);
+			ActiveMacro.Add(Tile, TileComp);
 		}
 	}
 
-	// OPTIMIZATION: Single-pass chunk unloading (build removal list while unloading)
-	// FIXED: Moved from static to instance member to fix memory leak and support multiple worlds
-	TempRemoveChunks.Reset(0);
+	// Unload invisible active tiles
+	TempRemoveTiles.Reset(0);
+	for (const auto& Pair : ActiveMacro)
+	{
+		if (!VisibleTilesMinD2.Contains(Pair.Key))
+		{
+			if (UVoxelMacroTileComponent* C = Pair.Value)
+			{
+				C->CancelPendingTask();
+				C->UnloadChunk();
+				C->DestroyComponent();
+			}
+			TempRemoveTiles.Add(Pair.Key);
+		}
+	}
+	for (const FIntPoint& T : TempRemoveTiles)
+	{
+		ActiveMacro.Remove(T);
+	}
 
+	// Unload invisible pending tiles
+	TempRemoveTiles.Reset(0);
+	for (const auto& Pair : PendingMacro)
+	{
+		if (!VisibleTilesMinD2.Contains(Pair.Key))
+		{
+			if (UVoxelMacroTileComponent* C = Pair.Value)
+			{
+				C->CancelPendingTask();
+				C->UnloadChunk();
+				C->DestroyComponent();
+			}
+			TempRemoveTiles.Add(Pair.Key);
+		}
+	}
+	for (const FIntPoint& T : TempRemoveTiles)
+	{
+		PendingMacro.Remove(T);
+	}
+}
+
+void AVoxelWorld::UnloadInvisibleChunks()
+{
 	// Unload invisible active chunks
+	TempRemoveChunks.Reset(0);
 	for (const auto& Pair : ActiveChunks)
 	{
-		if (!Visible.Contains(Pair.Key))
+		if (!CachedVisibleChunks.Contains(Pair.Key))
 		{
 			if (UVoxelChunkComponent* Chunk = Pair.Value)
 			{
@@ -1380,7 +1398,7 @@ void AVoxelWorld::UpdateChunks()
 	TempRemoveChunks.Reset(0);
 	for (const auto& Pair : PendingChunks)
 	{
-		if (!Visible.Contains(Pair.Key))
+		if (!CachedVisibleChunks.Contains(Pair.Key))
 		{
 			if (UVoxelChunkComponent* Chunk = Pair.Value)
 			{
