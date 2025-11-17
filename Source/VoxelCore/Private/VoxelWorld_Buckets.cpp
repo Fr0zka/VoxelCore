@@ -76,12 +76,20 @@ FVoxelChunkBucket* AVoxelWorld::GetOrCreateBucket(const FVoxelCoord& ChunkCoord)
 	// Set mesh component position to bucket origin
 	NewBucket->MeshComponent->SetRelativeLocation(NewBucket->WorldBounds.Min);
 
+	// CRITICAL: Ensure bucket component is registered and visible
+	if (!NewBucket->MeshComponent->IsRegistered())
+	{
+		UE_LOG(LogVoxelBuckets, Error, TEXT("[Bucket] ERROR: Bucket RMC not registered! This will cause invisible buckets!"));
+	}
+
 	ChunkBuckets.Add(BucketCoord, NewBucket);
 
 	// Always log bucket creation when batching is enabled (not gated by bEnableDebugLogging)
-	UE_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Created bucket (%d,%d,%d) at world pos (%.1f,%.1f,%.1f)"),
+	UE_LOG(LogVoxelBuckets, Warning, TEXT("[Bucket] Created bucket (%d,%d,%d) | Pos: (%.0f,%.0f,%.0f) | Visible: %s | Hidden: %s"),
 		BucketCoord.X, BucketCoord.Y, BucketCoord.Z,
-		NewBucket->WorldBounds.Min.X, NewBucket->WorldBounds.Min.Y, NewBucket->WorldBounds.Min.Z);
+		NewBucket->WorldBounds.Min.X, NewBucket->WorldBounds.Min.Y, NewBucket->WorldBounds.Min.Z,
+		NewBucket->MeshComponent->IsVisible() ? TEXT("YES") : TEXT("NO"),
+		NewBucket->MeshComponent->bHiddenInGame ? TEXT("YES") : TEXT("NO"));
 
 	return NewBucket;
 }
