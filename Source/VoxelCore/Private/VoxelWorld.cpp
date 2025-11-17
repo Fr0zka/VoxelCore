@@ -1120,6 +1120,17 @@ void AVoxelWorld::UpdateChunks()
 	const bool bPlayerStandingStill = !bCenterChanged && !bRotationChanged;
 	const bool bAllChunksLoaded = bInitialLoadComplete && !bNeedsMoreSpawning;
 
+	// DEBUG: Log why we might skip update
+	static int32 SkipLogCounter = 0;
+	if (++SkipLogCounter >= 60)
+	{
+		SkipLogCounter = 0;
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UpdateChunks: R2=%d, RzUp=%d, RzDown=%d, Desired.Num=%d, Active=%d, Pending=%d, StandingStill=%s, AllLoaded=%s"),
+			R2, RzUp, RzDown, Desired.Num(), ActiveChunks.Num(), PendingChunks.Num(),
+			bPlayerStandingStill ? TEXT("YES") : TEXT("NO"),
+			bAllChunksLoaded ? TEXT("YES") : TEXT("NO"));
+	}
+
 	if (bPlayerStandingStill && bAllChunksLoaded)
 	{
 		// Player standing still, all chunks loaded - nothing to do!
@@ -1135,6 +1146,15 @@ void AVoxelWorld::UpdateChunks()
 	// Process chunks in batches - prioritized chunks first (already sorted by priority)
 	const int32 MaxChunksToCheckPerFrame = 512; // Check up to 512 chunks/frame (balance speed vs FPS)
 	int32 ChunksCheckedThisFrame = 0;
+
+	// DEBUG: Log spawn progress
+	static int32 SpawnLogCounter = 0;
+	if (++SpawnLogCounter >= 60)
+	{
+		SpawnLogCounter = 0;
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] ProcessDesired: SpawnBudget=%d, MaxCheck=%d, Desired.Num=%d"),
+			SpawnBudget, MaxChunksToCheckPerFrame, Desired.Num());
+	}
 
 	// OPTIMIZATION: Process desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
@@ -1388,6 +1408,16 @@ void AVoxelWorld::UpdateChunks()
 			bNeedsMoreSpawning = true; // Continue next frame from where we left off
 			break; // Exit loop to preserve FPS
 		}
+	}
+
+	// DEBUG: Log spawn results
+	static int32 ResultLogCounter = 0;
+	if (++ResultLogCounter >= 60)
+	{
+		ResultLogCounter = 0;
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] SpawnResults: Spawned=%d/%d, Checked=%d/%d, Missing=%d, NeedsMore=%s"),
+			ChunksSpawnedThisFrame, SpawnBudget, ChunksCheckedThisFrame, MaxChunksToCheckPerFrame,
+			MissingChunks, bNeedsMoreSpawning ? TEXT("YES") : TEXT("NO"));
 	}
 
 	// Track initial load progress
