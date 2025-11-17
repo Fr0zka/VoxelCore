@@ -76,6 +76,17 @@ void AVoxelWorld::BeginPlay()
 				}
 			}
 		}
+
+		// Log chunk batching status
+		if (S->bEnableChunkBatching)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Chunk batching ENABLED (BucketSize=%d) - individual chunks will be hidden, only buckets visible"),
+				S->ChunkBucketSize);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Chunk batching DISABLED - each chunk uses separate mesh component"));
+		}
 	}
 
 	// Initial chunk loading
@@ -657,8 +668,12 @@ UProceduralMeshComponent* AVoxelWorld::AcquirePMC()
 	}
 
 	// Reset component state for reuse
-	PMC->SetVisibility(true, true);
-	PMC->SetHiddenInGame(false, true);
+	// When batching is enabled, hide individual chunk components (only buckets should be visible)
+	const UVoxelSettings* S = Settings.GetDefaultObject();
+	const bool bBatchingEnabled = (S && S->bEnableChunkBatching);
+
+	PMC->SetVisibility(!bBatchingEnabled, true);
+	PMC->SetHiddenInGame(bBatchingEnabled, true);
 	PMC->ClearAllMeshSections();
 	PMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
@@ -714,8 +729,12 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC()
 	RMC->SetRelativeScale3D(FVector::OneVector);
 
 	// Reset component state for reuse
-	RMC->SetVisibility(true, true);
-	RMC->SetHiddenInGame(false, true);
+	// When batching is enabled, hide individual chunk components (only buckets should be visible)
+	const UVoxelSettings* S = Settings.GetDefaultObject();
+	const bool bBatchingEnabled = (S && S->bEnableChunkBatching);
+
+	RMC->SetVisibility(!bBatchingEnabled, true);
+	RMC->SetHiddenInGame(bBatchingEnabled, true);
 	RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
 	// Clear any previous mesh data without recreating shared resources

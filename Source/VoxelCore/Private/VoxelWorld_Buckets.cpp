@@ -6,12 +6,23 @@
 #include "VoxelChunkComponent.h"
 #include "VoxelChunkBucket.h"
 #include "VoxelMesher.h"
+#include "VoxelSettings.h"
 #include "RealtimeMeshComponent.h"
 #include "RealtimeMeshSimple.h"
 #include "ProceduralMeshComponent.h"
 #include "RealtimeMeshCore.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelBuckets, Log, All);
+
+// Helper macro for conditional logging based on bEnableDebugLogging
+#define VOXEL_LOG(Category, Verbosity, Format, ...) \
+	do { \
+		const UVoxelSettings* LogSettings = Settings.GetDefaultObject(); \
+		if (LogSettings && LogSettings->bEnableDebugLogging) \
+		{ \
+			UE_LOG(Category, Verbosity, Format, ##__VA_ARGS__); \
+		} \
+	} while(0)
 
 // ============================================================================
 // BUCKET MANAGEMENT
@@ -57,6 +68,7 @@ FVoxelChunkBucket* AVoxelWorld::GetOrCreateBucket(const FVoxelCoord& ChunkCoord)
 
 	ChunkBuckets.Add(BucketCoord, NewBucket);
 
+	// Always log bucket creation when batching is enabled (not gated by bEnableDebugLogging)
 	UE_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Created bucket (%d,%d,%d) at world pos (%.1f,%.1f,%.1f)"),
 		BucketCoord.X, BucketCoord.Y, BucketCoord.Z,
 		NewBucket->WorldBounds.Min.X, NewBucket->WorldBounds.Min.Y, NewBucket->WorldBounds.Min.Z);
@@ -76,7 +88,7 @@ void AVoxelWorld::MarkBucketDirty(const FVoxelCoord& ChunkCoord)
 	if (Bucket)
 	{
 		Bucket->MarkDirty();
-		UE_LOG(LogVoxelBuckets, Verbose, TEXT("[Bucket] Marked bucket (%d,%d,%d) dirty due to chunk (%d,%d,%d)"),
+		VOXEL_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Marked bucket (%d,%d,%d) dirty due to chunk (%d,%d,%d)"),
 			Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
 			ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
 	}
@@ -99,7 +111,7 @@ void AVoxelWorld::RemoveChunkFromBucket(const FVoxelCoord& ChunkCoord)
 		Bucket->ContainedChunks.Remove(ChunkCoord);
 		Bucket->MarkDirty();
 
-		UE_LOG(LogVoxelBuckets, Verbose, TEXT("[Bucket] Removed chunk (%d,%d,%d) from bucket (%d,%d,%d), %d chunks remain"),
+		VOXEL_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Removed chunk (%d,%d,%d) from bucket (%d,%d,%d), %d chunks remain"),
 			ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
 			BucketCoord.X, BucketCoord.Y, BucketCoord.Z,
 			Bucket->ContainedChunks.Num());
@@ -107,6 +119,7 @@ void AVoxelWorld::RemoveChunkFromBucket(const FVoxelCoord& ChunkCoord)
 		// If bucket is now empty, destroy it
 		if (Bucket->IsEmpty())
 		{
+			// Always log bucket destruction (not gated by bEnableDebugLogging)
 			UE_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Destroying empty bucket (%d,%d,%d)"),
 				BucketCoord.X, BucketCoord.Y, BucketCoord.Z);
 
@@ -170,7 +183,8 @@ void AVoxelWorld::RebuildDirtyBuckets()
 
 	if (RebuildsThisFrame > 0)
 	{
-		UE_LOG(LogVoxelBuckets, Verbose, TEXT("[Bucket] Rebuilt %d buckets this frame"), RebuildsThisFrame);
+		// Always log bucket rebuilds (not gated by bEnableDebugLogging)
+		UE_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Rebuilt %d buckets this frame"), RebuildsThisFrame);
 	}
 }
 
@@ -346,6 +360,7 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 							MeshAsset->UpdateSectionConfig(SectionKey, SectionConfig, false); // No collision on buckets (too expensive)
 						}
 
+						// Always log successful bucket rebuilds (not gated by bEnableDebugLogging)
 						UE_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Rebuilt bucket (%d,%d,%d): %d chunks merged, %d vertices"),
 							Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
 							ChunksMerged, NumVerts);
@@ -358,7 +373,7 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 		if (URealtimeMesh* Mesh = Bucket->MeshComponent->GetRealtimeMesh())
 		{
 			Mesh->Reset();
-			UE_LOG(LogVoxelBuckets, Verbose, TEXT("[Bucket] Cleared empty bucket (%d,%d,%d)"),
+			VOXEL_LOG(LogVoxelBuckets, Log, TEXT("[Bucket] Cleared empty bucket (%d,%d,%d)"),
 				Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z);
 		}
 	}

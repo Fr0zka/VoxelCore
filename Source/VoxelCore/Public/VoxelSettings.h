@@ -362,6 +362,22 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Voxel|Generation")
     TSoftObjectPtr<class UVoxelNoiseProfile> NoiseProfile;
 
+    // === Debug & Logging ===
+    /**
+     * Enable ALL debug logging throughout the entire voxel codebase.
+     * When enabled, shows detailed logs for:
+     * - Chunk generation and meshing
+     * - Bucket creation and rebuilding
+     * - GPU operations
+     * - Streaming and LOD transitions
+     * - Performance warnings and stats
+     *
+     * WARNING: Enabling this will generate LOTS of console output and may impact performance.
+     * Recommended: Enable only when debugging specific issues.
+     */
+    UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Debug")
+    bool bEnableDebugLogging = false;
+
     UPROPERTY(EditAnywhere, Config, BlueprintReadWrite, Category = "Voxel|Debug")
     bool bVisualizeNoiseFields = false;
 
