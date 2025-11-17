@@ -1116,16 +1116,18 @@ void AVoxelWorld::UpdateChunks()
 
 	// MEGA OPTIMIZATION: When player hasn't moved or rotated, skip the entire update loop
 	// All chunks are already correct, so no need to check every chunk's settings
-	// CRITICAL: Check bNeedsMoreSpawning BEFORE resetting it, to preserve previous frame's state
+	// CRITICAL FIX: Check ACTUAL chunk count vs desired, not bNeedsMoreSpawning
+	// (bNeedsMoreSpawning gets confused by batch limit - only checks first 512 chunks!)
 	const bool bPlayerStandingStill = !bCenterChanged && !bRotationChanged;
-	const bool bAllChunksLoaded = bInitialLoadComplete && !bNeedsMoreSpawning;
+	const int32 TotalChunks = ActiveChunks.Num() + PendingChunks.Num();
+	const bool bAllChunksLoaded = (TotalChunks >= Desired.Num());  // FIXED: Compare actual counts!
 
 	// DEBUG: Log why we might skip update
 	static int32 SkipLogCounter = 0;
 	if (++SkipLogCounter >= 60)
 	{
 		SkipLogCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UpdateChunks: R2=%d, RzUp=%d, RzDown=%d, Desired.Num=%d, Active=%d, Pending=%d, StandingStill=%s, AllLoaded=%s"),
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UpdateChunks: R2=%d, RzUp=%d, RzDown=%d, Desired=%d, Active=%d, Pending=%d, StandingStill=%s, AllLoaded=%s"),
 			R2, RzUp, RzDown, Desired.Num(), ActiveChunks.Num(), PendingChunks.Num(),
 			bPlayerStandingStill ? TEXT("YES") : TEXT("NO"),
 			bAllChunksLoaded ? TEXT("YES") : TEXT("NO"));
