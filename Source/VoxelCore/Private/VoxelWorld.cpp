@@ -650,7 +650,7 @@ void AVoxelWorld::OnMeshingFinished(UVoxelChunkComponent* /*Chunk*/)
 // MESH COMPONENT POOLING
 // ============================================================================
 
-UProceduralMeshComponent* AVoxelWorld::AcquirePMC()
+UProceduralMeshComponent* AVoxelWorld::AcquirePMC(bool bForBucket)
 {
 	UProceduralMeshComponent* PMC = nullptr;
 
@@ -669,11 +669,12 @@ UProceduralMeshComponent* AVoxelWorld::AcquirePMC()
 
 	// Reset component state for reuse
 	// When batching is enabled, hide individual chunk components (only buckets should be visible)
+	// Bucket components are ALWAYS visible regardless of batching setting
 	const UVoxelSettings* S = Settings.GetDefaultObject();
-	const bool bBatchingEnabled = (S && S->bEnableChunkBatching);
+	const bool bShouldHide = !bForBucket && (S && S->bEnableChunkBatching);
 
-	PMC->SetVisibility(!bBatchingEnabled, true);
-	PMC->SetHiddenInGame(bBatchingEnabled, true);
+	PMC->SetVisibility(!bShouldHide, true);
+	PMC->SetHiddenInGame(bShouldHide, true);
 	PMC->ClearAllMeshSections();
 	PMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
@@ -693,7 +694,7 @@ void AVoxelWorld::ReleasePMC(UProceduralMeshComponent* PMC)
 	PMCPool.Add(PMC);
 }
 
-URealtimeMeshComponent* AVoxelWorld::AcquireRMC()
+URealtimeMeshComponent* AVoxelWorld::AcquireRMC(bool bForBucket)
 {
 	URealtimeMeshComponent* RMC = nullptr;
 
@@ -730,11 +731,12 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC()
 
 	// Reset component state for reuse
 	// When batching is enabled, hide individual chunk components (only buckets should be visible)
+	// Bucket components are ALWAYS visible regardless of batching setting
 	const UVoxelSettings* S = Settings.GetDefaultObject();
-	const bool bBatchingEnabled = (S && S->bEnableChunkBatching);
+	const bool bShouldHide = !bForBucket && (S && S->bEnableChunkBatching);
 
-	RMC->SetVisibility(!bBatchingEnabled, true);
-	RMC->SetHiddenInGame(bBatchingEnabled, true);
+	RMC->SetVisibility(!bShouldHide, true);
+	RMC->SetHiddenInGame(bShouldHide, true);
 	RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
 	// Clear any previous mesh data without recreating shared resources

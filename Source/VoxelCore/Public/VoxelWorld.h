@@ -116,13 +116,13 @@ public:
 	// ==================== MESH COMPONENT POOLING ====================
 
 	/** Acquire a ProceduralMeshComponent from pool (creates new if pool empty). */
-	UProceduralMeshComponent* AcquirePMC();
+	UProceduralMeshComponent* AcquirePMC(bool bForBucket = false);
 
 	/** Return ProceduralMeshComponent to pool (clears data, hides). */
 	void ReleasePMC(UProceduralMeshComponent* PMC);
 
 	/** Acquire a RealtimeMeshComponent from pool (creates new if pool empty). */
-	URealtimeMeshComponent* AcquireRMC();
+	URealtimeMeshComponent* AcquireRMC(bool bForBucket = false);
 
 	/** Return RealtimeMeshComponent to pool (clears data, hides). */
 	void ReleaseRMC(URealtimeMeshComponent* RMC);

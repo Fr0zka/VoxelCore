@@ -52,8 +52,8 @@ FVoxelChunkBucket* AVoxelWorld::GetOrCreateBucket(const FVoxelCoord& ChunkCoord)
 	// Create new bucket
 	FVoxelChunkBucket* NewBucket = new FVoxelChunkBucket(BucketCoord);
 
-	// Create RealtimeMeshComponent for this bucket
-	NewBucket->MeshComponent = AcquireRMC();
+	// Create RealtimeMeshComponent for this bucket (bForBucket=true means always visible)
+	NewBucket->MeshComponent = AcquireRMC(true);
 
 	// Calculate world bounds for this bucket
 	const float ChunkWorldSizeX = S->ChunkSizeX * S->VoxelWorldScale;
