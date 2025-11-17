@@ -430,33 +430,11 @@ void AVoxelWorld::PromoteReadyPendings()
 			const UVoxelSettings* S = Settings.GetDefaultObject();
 			if (S && S->bEnableChunkBatching)
 			{
-				// DEBUG: Log first few chunk promotions to verify flow
-				static int32 DebugPromotionCount = 0;
-				if (DebugPromotionCount < 5)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("[DEBUG] Promoting chunk (%d,%d,%d) to bucket - calling GetOrCreateBucket"),
-						Coord.Cx, Coord.Cy, Coord.Cz);
-					DebugPromotionCount++;
-				}
-
 				FVoxelChunkBucket* Bucket = GetOrCreateBucket(Coord);
 				if (Bucket)
 				{
 					Bucket->ContainedChunks.Add(Coord);
 					Bucket->MarkDirty();
-
-					if (DebugPromotionCount <= 5)
-					{
-						UE_LOG(LogTemp, Warning, TEXT("[DEBUG] Added chunk (%d,%d,%d) to bucket (%d,%d,%d), now has %d chunks"),
-							Coord.Cx, Coord.Cy, Coord.Cz,
-							Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
-							Bucket->ContainedChunks.Num());
-					}
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error, TEXT("[DEBUG] GetOrCreateBucket returned NULL for chunk (%d,%d,%d)!"),
-						Coord.Cx, Coord.Cy, Coord.Cz);
 				}
 			}
 
@@ -819,19 +797,6 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC(bool bForBucket)
 	RMC->SetVisibility(!bShouldHide, true);
 	RMC->SetHiddenInGame(bShouldHide, true);
 	RMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-
-	// DEBUG: Log first few RMC acquisitions to verify hide logic
-	static int32 RMCAcquireCount = 0;
-	if (RMCAcquireCount < 5)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[DEBUG RMC] Acquired #%d | ForBucket:%s | Batching:%s | ShouldHide:%s | Visible:%s | Hidden:%s"),
-			RMCAcquireCount, bForBucket ? TEXT("Y") : TEXT("N"),
-			(S && S->bEnableChunkBatching) ? TEXT("Y") : TEXT("N"),
-			bShouldHide ? TEXT("Y") : TEXT("N"),
-			RMC->IsVisible() ? TEXT("Y") : TEXT("N"),
-			RMC->bHiddenInGame ? TEXT("Y") : TEXT("N"));
-		RMCAcquireCount++;
-	}
 
 	// Clear any previous mesh data without recreating shared resources
 	// (avoids lock-destruction assert when pooling)

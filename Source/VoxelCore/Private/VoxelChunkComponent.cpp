@@ -835,6 +835,24 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
         UVoxelMesher::ApplyToPMC(PMC, Bufs, bCollision);
     }
 
+    // CRITICAL FIX: Hide individual chunk components when batching is enabled
+    // This must happen AFTER mesh apply (not at component acquisition) because
+    // Settings may not be loaded yet when components are first created.
+    // Only buckets should be visible when batching is on.
+    if (Settings && Settings->bEnableChunkBatching)
+    {
+        if (RMC)
+        {
+            RMC->SetVisibility(false, true);
+            RMC->SetHiddenInGame(true, true);
+        }
+        if (PMC)
+        {
+            PMC->SetVisibility(false, true);
+            PMC->SetHiddenInGame(true, true);
+        }
+    }
+
     const double EndTime = FPlatformTime::Seconds();
     const float ApplyMs = (float)((EndTime - StartTime) * 1000.0);
 

@@ -84,12 +84,11 @@ FVoxelChunkBucket* AVoxelWorld::GetOrCreateBucket(const FVoxelCoord& ChunkCoord)
 
 	ChunkBuckets.Add(BucketCoord, NewBucket);
 
-	// Always log bucket creation when batching is enabled (not gated by bEnableDebugLogging)
-	UE_LOG(LogVoxelBuckets, Warning, TEXT("[Bucket] Created bucket (%d,%d,%d) | Pos: (%.0f,%.0f,%.0f) | Visible: %s | Hidden: %s"),
+	// Log bucket creation for monitoring batching system
+	VOXEL_LOG(LogVoxelBuckets, Log, TEXT("Created bucket (%d,%d,%d) | Bounds: (%.0f,%.0f,%.0f) to (%.0f,%.0f,%.0f)"),
 		BucketCoord.X, BucketCoord.Y, BucketCoord.Z,
 		NewBucket->WorldBounds.Min.X, NewBucket->WorldBounds.Min.Y, NewBucket->WorldBounds.Min.Z,
-		NewBucket->MeshComponent->IsVisible() ? TEXT("YES") : TEXT("NO"),
-		NewBucket->MeshComponent->bHiddenInGame ? TEXT("YES") : TEXT("NO"));
+		NewBucket->WorldBounds.Max.X, NewBucket->WorldBounds.Max.Y, NewBucket->WorldBounds.Max.Z);
 
 	return NewBucket;
 }
@@ -210,18 +209,8 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 {
 	if (!Bucket || !Bucket->MeshComponent)
 	{
-		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] RebuildBucketMesh called with NULL bucket or component!"));
+		UE_LOG(LogVoxelBuckets, Warning, TEXT("RebuildBucketMesh called with NULL bucket or component!"));
 		return;
-	}
-
-	// DEBUG: Log rebuild attempt
-	static int32 DebugRebuildCount = 0;
-	if (DebugRebuildCount < 5)
-	{
-		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] Rebuilding bucket (%d,%d,%d) with %d contained chunks"),
-			Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
-			Bucket->ContainedChunks.Num());
-		DebugRebuildCount++;
 	}
 
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelRebuildBucketMesh);
@@ -314,14 +303,11 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 		ChunksMerged++;
 	}
 
-	// DEBUG: Log merge stats
-	if (DebugRebuildCount <= 5)
-	{
-		UE_LOG(LogVoxelBuckets, Warning, TEXT("[DEBUG] Bucket (%d,%d,%d) merge results: %d merged, %d verts | Skipped: %d not ready, %d no buffers, %d empty"),
-			Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
-			ChunksMerged, MergedBuffers.Vertices.Num(),
-			SkippedNotReady, SkippedNoBuffers, SkippedEmpty);
-	}
+	// Log merge statistics for monitoring bucket performance
+	VOXEL_LOG(LogVoxelBuckets, Log, TEXT("Bucket (%d,%d,%d) merged: %d chunks, %d verts | Skipped: %d not ready, %d no buffers, %d empty"),
+		Bucket->BucketCoord.X, Bucket->BucketCoord.Y, Bucket->BucketCoord.Z,
+		ChunksMerged, MergedBuffers.Vertices.Num(),
+		SkippedNotReady, SkippedNoBuffers, SkippedEmpty);
 
 	// Apply merged mesh to RealtimeMeshComponent
 	const bool bHasGeometry = (MergedBuffers.Vertices.Num() > 0 && MergedBuffers.Triangles.Num() >= 3);
