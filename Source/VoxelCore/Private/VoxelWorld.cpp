@@ -44,6 +44,18 @@ void AVoxelWorld::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// CRITICAL: Check if Settings class is assigned
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BeginPlay called - checking Settings..."));
+
+	if (!Settings)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] CRITICAL ERROR: Settings class is NULL!"));
+		UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] Please assign a VoxelSettings class in the VoxelWorld actor details panel!"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Settings class is assigned: %s"), *Settings->GetName());
+
 	// Prewarm mesh component pool (reduces allocation hitches during gameplay)
 	if (const UVoxelSettings* S = Settings.GetDefaultObject())
 	{
@@ -77,16 +89,25 @@ void AVoxelWorld::BeginPlay()
 			}
 		}
 
-		// Log chunk batching status
-		if (S->bEnableChunkBatching)
+		// ALWAYS log batching status (unconditional - for debugging)
+		UE_LOG(LogTemp, Warning, TEXT("========================================"));
+		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BeginPlay - Settings object: %s"), S ? TEXT("VALID") : TEXT("NULL"));
+		if (S)
 		{
-			UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Chunk batching ENABLED (BucketSize=%d) - individual chunks will be hidden, only buckets visible"),
-				S->ChunkBucketSize);
+			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] bEnableChunkBatching = %s"), S->bEnableChunkBatching ? TEXT("TRUE") : TEXT("FALSE"));
+			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] ChunkBucketSize = %d"), S->ChunkBucketSize);
+			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] bUseRuntimeMeshComponent = %s"), S->bUseRuntimeMeshComponent ? TEXT("TRUE") : TEXT("FALSE"));
+
+			if (S->bEnableChunkBatching)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Chunk batching ENABLED - individual chunks will be HIDDEN"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Chunk batching DISABLED - normal rendering"));
+			}
 		}
-		else
-		{
-			UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Chunk batching DISABLED - each chunk uses separate mesh component"));
-		}
+		UE_LOG(LogTemp, Warning, TEXT("========================================"));
 	}
 
 	// Initial chunk loading
