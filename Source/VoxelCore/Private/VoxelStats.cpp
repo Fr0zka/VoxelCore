@@ -20,6 +20,7 @@ DEFINE_STAT(STAT_VoxelMeshTasksRunning);
 DEFINE_STAT(STAT_VoxelGenQueueSize);
 DEFINE_STAT(STAT_VoxelMeshQueueSize);
 DEFINE_STAT(STAT_VoxelApplyQueueSize);
+DEFINE_STAT(STAT_VoxelGPUGenJobsPending);
 
 // === TIMING STATS ===
 // Performance profiling for each pipeline stage

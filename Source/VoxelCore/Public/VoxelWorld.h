@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelStructs.h"
 #include "VoxelSettings.h"
+#include "VoxelChunkBucket.h"
 #include "VoxelWorld.generated.h"
 
 class UVoxelChunkComponent;
@@ -195,6 +196,14 @@ private:
 	TArray<UProceduralMeshComponent*> PMCPool;
 	TArray<URealtimeMeshComponent*> RMCPool;
 
+	// ==================== CHUNK BATCHING SYSTEM ====================
+
+	/** Spatial buckets (only used when bEnableChunkBatching = true) */
+	TMap<FIntVector, FVoxelChunkBucket*> ChunkBuckets;
+
+	/** Bucket manager helper */
+	FVoxelBucketManager BucketManager;
+
 private:
 	// ==================== INTERNAL HELPERS ====================
 
@@ -267,6 +276,23 @@ private:
 
 	/** Unload chunks that are no longer visible. */
 	void UnloadInvisibleChunks();
+
+	// ==================== CHUNK BATCHING HELPERS ====================
+
+	/** Get or create bucket for given chunk coordinate */
+	struct FVoxelChunkBucket* GetOrCreateBucket(const FVoxelCoord& ChunkCoord);
+
+	/** Mark bucket dirty when chunk changes */
+	void MarkBucketDirty(const FVoxelCoord& ChunkCoord);
+
+	/** Rebuild all dirty buckets (merge chunk meshes) */
+	void RebuildDirtyBuckets();
+
+	/** Remove chunk from its bucket */
+	void RemoveChunkFromBucket(const FVoxelCoord& ChunkCoord);
+
+	/** Rebuild single bucket mesh (merge all contained chunks) */
+	void RebuildBucketMesh(struct FVoxelChunkBucket* Bucket);
 
 	/** Convert world position to chunk coordinate. */
 	FVoxelCoord WorldToChunkCoord(const FVector& Location) const;

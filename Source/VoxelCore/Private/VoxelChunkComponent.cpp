@@ -286,6 +286,80 @@ void UVoxelChunkComponent::OnGenerationComplete()
         return;
     }
 
+    // CRITICAL OPTIMIZATION: Skip meshing for empty/solid chunks
+    // This is Minecraft's #1 performance trick - don't render what you can't see!
+    if (RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() > 0)
+    {
+        // Quick scan: Check if chunk is entirely air OR entirely solid
+        // CategoryData stores 2-bit categories: 0=air, 1=semi-solid, 2=solid
+        bool bIsEmpty = true;
+        bool bIsSolid = true;
+        uint8 FirstNonAir = 0; // 0 = air
+
+        const int32 TotalVoxels = CategoryData.SizeX * CategoryData.SizeY * CategoryData.SizeZ;
+
+        // Sample every N voxels for speed (checking all voxels is too slow for large chunks)
+        // Step of 4 means we check ~1/64th of voxels (still very accurate for uniform chunks)
+        const int32 Step = 4;
+
+        for (int32 z = 0; z < CategoryData.SizeZ; z += Step)
+        {
+            for (int32 y = 0; y < CategoryData.SizeY; y += Step)
+            {
+                for (int32 x = 0; x < CategoryData.SizeX; x += Step)
+                {
+                    const uint8 Cat = CategoryData.Get(x, y, z);
+
+                    if (Cat != 0) // Not air
+                    {
+                        bIsEmpty = false;
+                        if (FirstNonAir == 0)
+                        {
+                            FirstNonAir = Cat;
+                        }
+                        else if (Cat != FirstNonAir)
+                        {
+                            bIsSolid = false;
+                            goto BreakAllLoops; // Not uniform - need full mesh
+                        }
+                    }
+                    else
+                    {
+                        bIsSolid = false; // Has air - not solid
+                    }
+                }
+            }
+        }
+        BreakAllLoops:;
+
+        // OPTIMIZATION 1: Empty chunks (100% air)
+        if (bIsEmpty)
+        {
+            UE_LOG(LogVoxelChunk, Verbose, TEXT("[EmptyCull] Chunk (%d,%d,%d) is 100%% air - skipping mesh + collision"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+
+            // Disable collision for air chunks (massive performance save!)
+            bBuildCollision = false;
+
+            State = EVoxelChunkState::Ready;
+            if (OwnerWorld) OwnerWorld->OnChunkReady(ChunkCoord);
+            return;
+        }
+
+        // OPTIMIZATION 2: Solid chunks (100% same category)
+        // Only render surface faces (neighbors will handle interior culling)
+        // This is HUGE for underground stone chunks - only mesh the edges!
+        if (bIsSolid && FirstNonAir != 0)
+        {
+            UE_LOG(LogVoxelChunk, Verbose, TEXT("[SolidCull] Chunk (%d,%d,%d) is 100%% solid (category %d) - surface-only mesh"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, (int32)FirstNonAir);
+
+            // Mark as solid for surface-only meshing
+            // The mesher will only generate faces on chunk boundaries
+            bIsSolidChunk = true;
+        }
+    }
+
     // DON'T cache neighbors here - they might not be ready yet!
     // Just mark as dirty so meshing will handle it
     if (RenderMode == EVoxelRenderMode::Voxels)

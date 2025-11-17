@@ -68,6 +68,12 @@ public:
      */
     static void TickGPUGenerationJobs();
 
+    /**
+     * Get number of pending GPU generation jobs (for profiling/stats).
+     * Jobs are waiting for GPU readback to complete.
+     */
+    static int32 GetPendingJobCount();
+
 private:
     struct FGPUBiomeData
     {

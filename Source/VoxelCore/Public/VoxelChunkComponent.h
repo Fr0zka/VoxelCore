@@ -124,6 +124,9 @@ protected:
     bool bIsMeshing = false;
     bool bHasAnnouncedReady = false;
 
+    // Optimization flags
+    bool bIsSolidChunk = false;  // 100% uniform solid block (only mesh surface faces)
+
     // Cache
     TUniquePtr<FMeshBuffers>  CachedBuffers;
 
