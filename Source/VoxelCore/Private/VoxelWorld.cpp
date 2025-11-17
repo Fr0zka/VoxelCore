@@ -1341,17 +1341,17 @@ void AVoxelWorld::UpdateChunks()
 					if (Active)
 					{
 						// Collision hysteresis: keep collision enabled for one extra ring
-						bool bDesiredCollision = bDesiredCollision0;
-						if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
+						bool bDesiredCollisionUpdate = bDesiredCollision0;
+						if (!bDesiredCollisionUpdate && Active->bBuildCollision && d2 <= CollisionDropR2)
 						{
-							bDesiredCollision = true;
+							bDesiredCollisionUpdate = true;
 						}
 
 						// Same LOD: check for policy changes (collision/AO)
 						if (Active->LOD == DesiredLOD)
 						{
 							const bool bPolicyChanged =
-								(Active->bBuildCollision != bDesiredCollision) ||
+								(Active->bBuildCollision != bDesiredCollisionUpdate) ||
 								(Active->bUseAO != bDesiredAO);
 
 							if (bPolicyChanged)
@@ -1360,7 +1360,7 @@ void AVoxelWorld::UpdateChunks()
 								Active->bUseAO = bDesiredAO;
 
 								// Collision policy changed: reapply collision using cached mesh
-								if (Active->bBuildCollision != bDesiredCollision)
+								if (Active->bBuildCollision != bDesiredCollisionUpdate)
 								{
 									// DEBUG: Log collision changes
 									if (d2 <= 16) // Log for chunks within 4-chunk radius
@@ -1368,10 +1368,10 @@ void AVoxelWorld::UpdateChunks()
 										UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
 											C.Cx, C.Cy, C.Cz, d2,
 											Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
-											bDesiredCollision ? TEXT("YES") : TEXT("NO"),
+											bDesiredCollisionUpdate ? TEXT("YES") : TEXT("NO"),
 											CollisionR);
 									}
-									Active->RequestCollisionReapply(bDesiredCollision);
+									Active->RequestCollisionReapply(bDesiredCollisionUpdate);
 								}
 
 								// AO policy changed: full remesh required
