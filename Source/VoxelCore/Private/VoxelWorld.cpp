@@ -1348,6 +1348,8 @@ void AVoxelWorld::UpdateChunks()
 			if (bSettingsMatch && !Pending)
 			{
 				// Chunk already correct, nothing to do
+				// CRITICAL: Don't count towards batch limit! This lets us skip past already-loaded chunks
+				continue;
 			}
 			else if (Active->LOD == DesiredLOD)
 			{
