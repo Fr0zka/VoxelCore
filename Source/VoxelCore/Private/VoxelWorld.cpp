@@ -1262,157 +1262,123 @@ void AVoxelWorld::UpdateChunks()
 			}
 		}
 
-		// OPTIMIZATION: Early exit if chunk exists and already correct
-		// Update priority distance if chunk exists
-		if (Active)
-		{
-			Active->PriorityDist2 = d2;
+		// Update priority distances if chunk exists
+		if (Active)  Active->PriorityDist2 = d2;
+		if (Pending) Pending->PriorityDist2 = d2;
 
-			// OPTIMIZATION: Early exit if this chunk is already correct (common case during generation)
-			// Check if LOD, collision, and AO settings are already correct
+		// CASE 1: NEW CHUNK - Neither Active nor Pending exists
+		if (!Active && !Pending)
+		{
+			++MissingChunks;
+
+			// BUDGET: Only spawn up to SpawnBudget new chunks per frame
+			if (ChunksSpawnedThisFrame < SpawnBudget)
+			{
+				++ChunksSpawnedThisFrame;
+
+				// Spawn new chunk component
+				UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
+				Chunk->RegisterComponent();
+				AddInstanceComponent(Chunk);
+				Chunk->PriorityDist2 = d2;
+
+				Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+				ActiveChunks.Add(C, Chunk);
+
+				// Add to bucket if batching enabled
+				if (S && S->bEnableChunkBatching)
+				{
+					FVoxelChunkBucket* Bucket = GetOrCreateBucket(C);
+					if (Bucket)
+					{
+						Bucket->ContainedChunks.Add(C);
+						Bucket->MarkDirty();
+					}
+				}
+
+				// DEBUG: Log spawns near player
+				if (d2 <= 4)
+				{
+					UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s"),
+						C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"));
+				}
+			}
+			else
+			{
+				bNeedsMoreSpawning = true; // Hit spawn budget, continue next frame
+			}
+		}
+		// CASE 2: EXISTING ACTIVE CHUNK - Check if settings need updating
+		else if (Active)
+		{
+			// Collision hysteresis: keep collision enabled for one extra ring
 			bool bDesiredCollision = bDesiredCollision0;
 			if (!bDesiredCollision && Active->bBuildCollision && d2 <= CollisionDropR2)
 			{
 				bDesiredCollision = true;
 			}
 
+			// Check if chunk is already correct
 			const bool bSettingsMatch = (Active->LOD == DesiredLOD) &&
 			                            (Active->bBuildCollision == bDesiredCollision) &&
 			                            (Active->bUseAO == bDesiredAO);
 
 			if (bSettingsMatch && !Pending)
 			{
-				// Chunk is already correct - skip expensive processing but count iteration
-				// Fall through to batch limit check at end of loop
+				// Chunk already correct, nothing to do
+			}
+			else if (Active->LOD == DesiredLOD)
+			{
+				// Same LOD: check for policy changes (collision/AO)
+				const bool bPolicyChanged =
+					(Active->bBuildCollision != bDesiredCollision) ||
+					(Active->bUseAO != bDesiredAO);
+
+				if (bPolicyChanged)
+				{
+					const bool AOChanged = (Active->bUseAO != bDesiredAO);
+					Active->bUseAO = bDesiredAO;
+
+					// Collision policy changed
+					if (Active->bBuildCollision != bDesiredCollision)
+					{
+						Active->RequestCollisionReapply(bDesiredCollision);
+					}
+
+					// AO policy changed
+					if (AOChanged)
+					{
+						Active->RequestRemesh();
+					}
+				}
 			}
 			else
 			{
-				// Chunk needs processing
-				if (Pending)
+				// LOD changed: spawn Pending replacement
+				if (!Pending)
 				{
-					Pending->PriorityDist2 = d2;
-				}
+					UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
+					NewP->RegisterComponent();
+					AddInstanceComponent(NewP);
+					NewP->PriorityDist2 = d2;
 
-				// NEW CHUNK: Progressive spawning with budget
-				if (!Active && !Pending)
-				{
-					++MissingChunks;
-
-					// BUDGET: Only spawn up to SpawnBudget new chunks per frame
-					if (ChunksSpawnedThisFrame < SpawnBudget)
-					{
-						++ChunksSpawnedThisFrame;
-
-						// Spawn new chunk component
-						UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
-						Chunk->RegisterComponent();
-						AddInstanceComponent(Chunk);
-						Chunk->PriorityDist2 = d2;
-
-						Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
-						ActiveChunks.Add(C, Chunk);
-
-						// Add to bucket if batching enabled (chunks added directly to Active skip promotion code!)
-						if (S && S->bEnableChunkBatching)
-						{
-							FVoxelChunkBucket* Bucket = GetOrCreateBucket(C);
-							if (Bucket)
-							{
-								Bucket->ContainedChunks.Add(C);
-								Bucket->MarkDirty();
-							}
-						}
-
-						// DEBUG: Log collision settings for chunks near player
-						if (d2 <= 4) // Log for chunks within 2-chunk radius
-						{
-							UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Spawned chunk (%d,%d,%d) - d2=%d, Collision=%s (CollisionR=%d, CollisionR2=%d)"),
-								C.Cx, C.Cy, C.Cz, d2, bDesiredCollision0 ? TEXT("YES") : TEXT("NO"), CollisionR, CollisionR2);
-						}
-					}
-					else
-					{
-						bNeedsMoreSpawning = true; // Hit spawn budget, continue next frame
-					}
+					NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
+					PendingChunks.Add(C, NewP);
 				}
 				else
 				{
-					// EXISTING CHUNK: Update settings (collision, AO, LOD transitions)
-					if (Active)
-					{
-						// Collision hysteresis: keep collision enabled for one extra ring
-						bool bDesiredCollisionUpdate = bDesiredCollision0;
-						if (!bDesiredCollisionUpdate && Active->bBuildCollision && d2 <= CollisionDropR2)
-						{
-							bDesiredCollisionUpdate = true;
-						}
-
-						// Same LOD: check for policy changes (collision/AO)
-						if (Active->LOD == DesiredLOD)
-						{
-							const bool bPolicyChanged =
-								(Active->bBuildCollision != bDesiredCollisionUpdate) ||
-								(Active->bUseAO != bDesiredAO);
-
-							if (bPolicyChanged)
-							{
-								const bool AOChanged = (Active->bUseAO != bDesiredAO);
-								Active->bUseAO = bDesiredAO;
-
-								// Collision policy changed: reapply collision using cached mesh
-								if (Active->bBuildCollision != bDesiredCollisionUpdate)
-								{
-									// DEBUG: Log collision changes
-									if (d2 <= 16) // Log for chunks within 4-chunk radius
-									{
-										UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UPDATING collision for chunk (%d,%d,%d) - d2=%d, Old=%s, New=%s (CollisionR=%d)"),
-											C.Cx, C.Cy, C.Cz, d2,
-											Active->bBuildCollision ? TEXT("YES") : TEXT("NO"),
-											bDesiredCollisionUpdate ? TEXT("YES") : TEXT("NO"),
-											CollisionR);
-									}
-									Active->RequestCollisionReapply(bDesiredCollisionUpdate);
-								}
-
-								// AO policy changed: full remesh required
-								if (AOChanged)
-								{
-									Active->RequestRemesh();
-								}
-							}
-						}
-						else
-						{
-							// LOD changed: spawn Pending replacement
-							if (!Pending)
-							{
-								UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
-								NewP->RegisterComponent();
-								AddInstanceComponent(NewP);
-								NewP->PriorityDist2 = d2;
-
-								NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
-								PendingChunks.Add(C, NewP);
-							}
-							else
-							{
-								// Pending already exists - update its settings
-								Pending->bBuildCollision = bDesiredCollision0;
-								Pending->bUseAO = bDesiredAO;
-								Pending->PriorityDist2 = d2;
-							}
-						}
-					}
-					else if (Pending)
-					{
-						// Update pending chunk settings
-						Pending->bBuildCollision = bDesiredCollision0;
-						Pending->bUseAO = bDesiredAO;
-						Pending->PriorityDist2 = d2;
-					}
-				} // end else (Active processing)
-			} // end else (chunk needs processing)
-		} // end if (Active exists)
+					// Pending already exists - update settings
+					Pending->bBuildCollision = bDesiredCollision0;
+					Pending->bUseAO = bDesiredAO;
+				}
+			}
+		}
+		// CASE 3: PENDING CHUNK - Update settings
+		else if (Pending)
+		{
+			Pending->bBuildCollision = bDesiredCollision0;
+			Pending->bUseAO = bDesiredAO;
+		}
 
 		// BATCH LIMIT: Check at end of EVERY iteration to prevent FPS drops
 		// This prevents 30fps drops when iterating 10,000+ chunks with 40uu voxels
