@@ -105,8 +105,9 @@ uint BiomeCount;
 // Output buffer - voxel categories (2 bits per voxel packed into bytes)
 RWStructuredBuffer<uint> OutCategories;
 
-// OPTION 3: Output buffer - block IDs (uint16 per voxel, 2 per uint32)
-RWStructuredBuffer<uint> OutBlockIDs;
+// OPTION B: Output buffer - BiomeGrid2D data per XY column
+// Packed format per column: lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
+RWStructuredBuffer<uint> OutBiomeGrid;
 
 // ============================================================================
 // GENERATION FUNCTIONS
@@ -568,168 +569,6 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
     #endif // End debug mode / full generation
 
-    // ========================================================================
-    // OPTION 3: BLOCK ID GENERATION ON GPU
-    // ========================================================================
-    // Replicates CPU logic from VoxelChunkComponent.cpp:535-638
-    uint BlockID = 0; // Air by default
-
-    if (Category == 1)
-    {
-        BlockID = 1; // EVoxelBlockID::Water
-    }
-    else if (Category == 2)
-    {
-        // Solid voxel - need to determine which block type
-        // Sample climate and pick biome (reuse from above if in full generation mode)
-        #if DEBUG_MODE != 0
-        float Temp, Moist;
-        SampleClimate((float)WX, (float)WY, Temp, Moist);
-        int biomeIdx = PickBiome(Temp, Moist);
-        float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
-        #endif
-
-        BiomeData biome = Biomes[biomeIdx];
-
-        // CPU LOGIC: Check if has air above/below by reading CategoryData neighbors
-        // GPU: Can't read Categories from other threads, so recalculate using EXACT category logic
-        //
-        // This matches CPU:
-        // const bool bHasAirAbove = (z + 1 < PaddedSZ) && (CategoryDataCopy.Get(x, y, z + 1) == 0);
-
-        bool hasAirAbove = false;
-        bool hasAirBelow = false;
-
-        // Check voxel above (Z+1)
-        if ((int)ThreadId.z + 1 < (int)SizeZ)
-        {
-            float Z_Above = Z + 1.0;
-            float D0_Above = M - Z_Above;
-            float Margin = biome.OverhangAmplitude + biome.IslandAmplitude + 3.0;
-
-            // Recalculate category for neighbor using EXACT CPU logic
-            uint CatAbove;
-            if (D0_Above < -Margin)
-            {
-                CatAbove = (Z_Above <= (float)WaterLevel) ? 1 : 0;
-            }
-            else if (D0_Above > Margin)
-            {
-                float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z_Above, M);
-                if (D > 0.0)
-                {
-                    float DepthFromSurface = M - Z_Above;
-                    bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
-                    if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z_Above, M))
-                        CatAbove = 0;
-                    else
-                        CatAbove = 2;
-                }
-                else
-                {
-                    CatAbove = (Z_Above <= (float)WaterLevel) ? 1 : 0;
-                }
-            }
-            else  // Narrow band
-            {
-                float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z_Above, M);
-                if (D > 0.0)
-                {
-                    float DepthFromSurface = M - Z_Above;
-                    bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
-                    if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z_Above, M))
-                        CatAbove = 0;
-                    else
-                        CatAbove = 2;
-                }
-                else
-                    CatAbove = (Z_Above <= (float)WaterLevel) ? 1 : 0;
-            }
-
-            hasAirAbove = (CatAbove == 0);
-        }
-
-        // Check voxel below (Z-1)
-        if ((int)ThreadId.z > 0)
-        {
-            float Z_Below = Z - 1.0;
-            float D0_Below = M - Z_Below;
-            float Margin = biome.OverhangAmplitude + biome.IslandAmplitude + 3.0;
-
-            // Recalculate category for neighbor using EXACT CPU logic
-            uint CatBelow;
-            if (D0_Below < -Margin)
-            {
-                CatBelow = (Z_Below <= (float)WaterLevel) ? 1 : 0;
-            }
-            else if (D0_Below > Margin)
-            {
-                float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z_Below, M);
-                if (D > 0.0)
-                {
-                    float DepthFromSurface = M - Z_Below;
-                    bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
-                    if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z_Below, M))
-                        CatBelow = 0;
-                    else
-                        CatBelow = 2;
-                }
-                else
-                {
-                    CatBelow = (Z_Below <= (float)WaterLevel) ? 1 : 0;
-                }
-            }
-            else  // Narrow band
-            {
-                float D = Density3D_FromMacro_Biome((float)WX, (float)WY, Z_Below, M);
-                if (D > 0.0)
-                {
-                    float DepthFromSurface = M - Z_Below;
-                    bool bCheckCaves = (biome.CaveDensity > 0.0) && (DepthFromSurface <= (float)MaxCaveDepth);
-                    if (bCheckCaves && IsCave_Biome((float)WX, (float)WY, Z_Below, M))
-                        CatBelow = 0;
-                    else
-                        CatBelow = 2;
-                }
-                else
-                    CatBelow = (Z_Below <= (float)WaterLevel) ? 1 : 0;
-            }
-
-            hasAirBelow = (CatBelow == 0);
-        }
-
-        // CPU LOGIC: Surface detection and block assignment
-        // if (bHasAirAbove || bHasAirBelow) → Surface block
-        // else if (WorldZ < TopZ) → Subsurface by depth
-        // else → Shallow subsurface
-
-        if (hasAirAbove || hasAirBelow)
-        {
-            // Surface voxel - has exposed face - use surface block
-            BlockID = biome.SurfaceBlock;
-        }
-        else
-        {
-            // Interior voxel - need to compute surface height for depth calculation
-            // OPTIMIZATION: Only raymarch for interior voxels, not surfaces
-            // This reduces raycasts from ~16K to ~8K per chunk
-            float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
-
-            if (Z < SurfaceZWorld)  // WorldZ < TopZ
-            {
-                // Interior voxel below main surface - use depth-based subsurface layers
-                float depthBelowSurface = SurfaceZWorld - Z;
-                BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
-            }
-            else
-            {
-                // Interior voxel above main surface (inside floating island/overhang)
-                // Use shallow subsurface layers (depth=2 matches CPU)
-                BlockID = PickSubsurfaceBlock(biome, 2.0);
-            }
-        }
-    }
-
     // Pack category into output buffer (2 bits per voxel)
     // The buffer is uint32[], but we're packing to match CPU's byte-array layout
     // 4 voxels per byte = 16 voxels per uint32
@@ -748,17 +587,34 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     }
 
     // ========================================================================
-    // OPTION 3: WRITE BLOCK ID TO OUTPUT BUFFER
+    // OPTION B: BIOME GRID 2D GENERATION (per XY column, not per voxel)
     // ========================================================================
-    // Pack BlockIDs: 2 per uint32 (uint16 each)
-    // Even indices: lower 16 bits, Odd indices: upper 16 bits
-    uint BlockIDIndex = LinearIndex / 2;  // Which uint32
-    uint BlockIDOffset = (LinearIndex % 2) * 16;  // 0 or 16 bits
-
-    // Write block ID (atomic OR since buffer is zero-initialized)
-    if (BlockID != 0)
+    // Only the first thread in each XY column computes BiomeGrid data
+    // This dramatically reduces work: SizeX*SizeY columns instead of SizeX*SizeY*SizeZ voxels
+    if (ThreadId.z == 0)
     {
-        uint BlockValue = BlockID << BlockIDOffset;
-        InterlockedOr(OutBlockIDs[BlockIDIndex], BlockValue);
+        // Sample climate and pick biome for this XY column
+        #if DEBUG_MODE == 0
+        // Reuse biomeIdx and M from category generation above (already computed)
+        // ComputeSurfaceZWorld by raymarching to find actual topmost solid voxel
+        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
+        #else
+        // Debug modes: use default values
+        float Temp, Moist;
+        SampleClimate((float)WX, (float)WY, Temp, Moist);
+        int biomeIdx = PickBiome(Temp, Moist);
+        BiomeData biome = Biomes[biomeIdx];
+        float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
+        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
+        #endif
+
+        // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
+        int16 surfaceZ = (int16)clamp(SurfaceZWorld, -32768.0, 32767.0);
+        uint8 biomeIndex = (uint8)clamp(biomeIdx, 0, 255);
+
+        uint BiomeGridIndex = ThreadId.x + ThreadId.y * SizeX;
+        uint PackedValue = ((uint)surfaceZ & 0xFFFF) | (((uint)biomeIndex & 0xFF) << 16);
+
+        OutBiomeGrid[BiomeGridIndex] = PackedValue;
     }
 }

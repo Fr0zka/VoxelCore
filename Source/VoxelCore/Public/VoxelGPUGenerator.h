@@ -30,8 +30,8 @@ class VOXELCORE_API FVoxelGPUGenerator
 {
 public:
     /**
-     * Generate voxel chunk categories AND block IDs using GPU compute shader.
-     * OPTION 3: Now generates both category and block ID data in parallel on GPU
+     * Generate voxel chunk categories AND BiomeGrid2D using GPU compute shader.
+     * OPTION B: GPU generates Categories + BiomeGrid, CPU generates blocks
      *
      * @param Coord - Chunk coordinate
      * @param SizeX/Y/Z - Chunk dimensions (LOD-scaled + halo)
@@ -43,7 +43,7 @@ public:
      * @param MaxCaveDepth - Maximum cave depth (performance optimization)
      * @param BiomeTable - Biome definitions (terrain params + block types)
      * @param NoiseProfile - Climate noise parameters
-     * @param OnComplete - Callback when generation complete (receives category + blockID data)
+     * @param OnComplete - Callback when generation complete (receives category + BiomeGrid data)
      */
     static void GenerateChunkGPU(
         const FVoxelCoord& Coord,
@@ -56,7 +56,7 @@ public:
         int32 MaxCaveDepth,
         const class UVoxelBiomeTable* BiomeTable,
         const class UVoxelNoiseProfile* NoiseProfile,
-        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete);
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete);
 
     /**
      * Check if GPU generation is available on this platform.
@@ -118,29 +118,22 @@ private:
         float CaveFrequency3D;
         int32 CaveOctaves3D;
 
-        // OPTION 3: Block ID Generation
-        // Surface block (grass, sand, snow, etc.) - MUST match shader layout
-        uint32 SurfaceBlock;
-
-        // Subsurface layers (up to 8 layers: dirt, stone, etc.)
-        // Each layer: lower 16 bits = BlockID, upper 16 bits = Thickness
-        uint32 SubsurfaceLayers[8];
-        int32 SubsurfaceLayerCount;
-
-        // Padding to match shader alignment (if needed)
-        uint32 _Padding[1];
+        // No block data needed - OPTION B generates BiomeGrid on GPU, blocks on CPU
     };
     /**
      * GPU generation job - tracks pending async readback.
-     * OPTION 3: Now tracks BOTH category and blockID readbacks
+     * OPTION B: Tracks category and BiomeGrid readbacks
      */
     struct FGPUGenerationJob
     {
         TUniquePtr<FRHIGPUBufferReadback> CategoryReadback;
-        TUniquePtr<FRHIGPUBufferReadback> BlockIDReadback;  // OPTION 3: Added
+        TUniquePtr<FRHIGPUBufferReadback> BiomeGridReadback;  // OPTION B: BiomeGrid data
         int32 CategoryBufferSizeBytes = 0;
-        int32 BlockIDBufferSizeBytes = 0;  // OPTION 3: Added
-        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete;  // OPTION 3: Updated signature
+        int32 BiomeGridBufferSizeBytes = 0;  // OPTION B: BiomeGrid size
+        int32 BiomeGridSizeX = 0;  // Needed for unpacking
+        int32 BiomeGridSizeY = 0;  // Needed for unpacking
+        const UVoxelBiomeTable* BiomeTable = nullptr;  // Needed to map BiomeIndex → BiomeDef*
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete;  // OPTION B: Updated signature
     };
 
     // Pending GPU generation jobs (polled each frame)
@@ -162,6 +155,7 @@ private:
         float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
         float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
         const TArray<FGPUBiomeData>& BiomeDataArray,
-        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete);  // OPTION 3: Updated signature
+        const UVoxelBiomeTable* BiomeTable,
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete);  // OPTION B: Updated signature
 };
 

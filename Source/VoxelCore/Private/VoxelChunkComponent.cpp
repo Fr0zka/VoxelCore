@@ -140,7 +140,7 @@ void UVoxelChunkComponent::DoGeneration()
             Params.MaxCaveDepth,
             Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
             Params.NoiseProfile,      // Pass NoiseProfile for climate noise generation
-            [WeakThis, WeakWorld, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData, TArray<EVoxelBlockID>&& GPUBlockIDData)
+            [WeakThis, WeakWorld, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData, FBiomeGrid2D&& GPUBiomeGrid)
             {
                 // Check if component is still valid (might be destroyed during async generation)
                 UVoxelChunkComponent* This = WeakThis.Get();
@@ -168,37 +168,20 @@ void UVoxelChunkComponent::DoGeneration()
                     return;
                 }
 
-                // GPU generation complete - copy to CategoryData
+                // GPU generation complete - store CategoryData and BiomeGrid
                 This->CategoryData.Data = MoveTemp(GPUCategoryData);
                 This->CategoryData.SizeX = ScaledSizeX + 2;
                 This->CategoryData.SizeY = ScaledSizeY + 2;
                 This->CategoryData.SizeZ = ScaledSizeZ + 2;
 
-                // OPTION 3: Store GPU-generated block IDs for direct use in meshing
-                This->GPUVoxelData = MoveTemp(GPUBlockIDData);
-                This->GPUVoxelDataSizeX = ScaledSizeX + 2;
-                This->GPUVoxelDataSizeY = ScaledSizeY + 2;
-                This->GPUVoxelDataSizeZ = ScaledSizeZ + 2;
+                // OPTION B: Store GPU-generated BiomeGrid (SurfaceZ + Biome per XY column)
+                This->BiomeGrid = MoveTemp(GPUBiomeGrid);
 
-                // DIAGNOSTIC: Log GPU data received and sample some block IDs
-                int32 NumGrass = 0, NumDirt = 0, NumStone = 0, NumAir = 0, NumWater = 0, NumOther = 0;
-                for (int32 i = 0; i < FMath::Min(1000, This->GPUVoxelData.Num()); ++i)
-                {
-                    EVoxelBlockID Block = This->GPUVoxelData[i];
-                    if (Block == EVoxelBlockID::Grass) NumGrass++;
-                    else if (Block == EVoxelBlockID::Dirt) NumDirt++;
-                    else if (Block == EVoxelBlockID::Stone) NumStone++;
-                    else if (Block == EVoxelBlockID::Air) NumAir++;
-                    else if (Block == EVoxelBlockID::Water) NumWater++;
-                    else NumOther++;
-                }
-                UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) GPU callback: Received %d blocks | Sample(1000): Grass=%d Dirt=%d Stone=%d Air=%d Water=%d Other=%d"),
+                // DIAGNOSTIC: Log GPU BiomeGrid received
+                UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTIONB] Chunk (%d,%d,%d) GPU callback: Received BiomeGrid %dx%d (%d columns)"),
                     Coord.Cx, Coord.Cy, Coord.Cz,
-                    This->GPUVoxelData.Num(),
-                    NumGrass, NumDirt, NumStone, NumAir, NumWater, NumOther);
-
-                // Generate biome grid (still on CPU for now)
-                UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
+                    This->BiomeGrid.SizeX, This->BiomeGrid.SizeY,
+                    This->BiomeGrid.SurfaceZWorld.Num());
 
                 const int64 NumBytes = This->CategoryData.Data.Num();
                 INC_MEMORY_STAT_BY(STAT_VoxelDataMemory, NumBytes);
@@ -476,76 +459,34 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         const int32 SZ = PaddedSZ - 2;
         const int32 TotalPadded = PaddedSX * PaddedSY * PaddedSZ;
 
-        // OPTION 3: Check if GPU-generated voxel data is available
-        // If so, use it directly and skip expensive CPU voxel generation
-        const bool bHaveGPUVoxelData = (GPUVoxelData.Num() == TotalPadded) &&
-                                        (GPUVoxelDataSizeX == PaddedSX) &&
-                                        (GPUVoxelDataSizeY == PaddedSY) &&
-                                        (GPUVoxelDataSizeZ == PaddedSZ);
+        // OPTION B: GPU provides Categories + BiomeGrid, CPU generates blocks
+        // This ensures perfect CPU-GPU parity while maintaining good performance
 
-        // DIAGNOSTIC: Log GPU data availability
-        if (GPUVoxelData.Num() > 0)
-        {
-            UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) DoMeshing: GPUVoxelData.Num=%d (expected %d), SizeMatch=%d,%d,%d"),
-                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
-                GPUVoxelData.Num(), TotalPadded,
-                GPUVoxelDataSizeX == PaddedSX, GPUVoxelDataSizeY == PaddedSY, GPUVoxelDataSizeZ == PaddedSZ);
-        }
-        else
-        {
-            UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) DoMeshing: NO GPU data available - using CPU fallback"),
-                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
-        }
+        // World-space bases
+        const int32 BaseWX = ChunkCoord.Cx * Settings->ChunkSizeX;
+        const int32 BaseWY = ChunkCoord.Cy * Settings->ChunkSizeY;
+        const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
 
-        if (bHaveGPUVoxelData)
-        {
-            // GPU path: Use pre-generated voxel data directly (MASSIVE performance win!)
-            VoxelsCopy = GPUVoxelData; // Copy instead of move - keep for potential remeshes
-            // NOTE: Don't clear GPU data yet - might be needed for seam remeshing
-            // It will be cleared when chunk is unloaded or regenerated
+        VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
 
-            // Still need to expand categories for the mesher
-            CatsExpanded.SetNumUninitialized(TotalPadded);
-            for (int32 i = 0; i < TotalPadded; ++i)
-            {
-                const int32 z = i / (PaddedSX * PaddedSY);
-                const int32 rem = i % (PaddedSX * PaddedSY);
-                const int32 y = rem / PaddedSX;
-                const int32 x = rem % PaddedSX;
-                CatsExpanded[i] = CategoryDataCopy.Get(x, y, z);
-            }
-
-            UE_LOG(LogVoxelChunk, Verbose, TEXT("[OPTION3] Chunk (%d,%d,%d) using GPU-generated voxel data - skipped CPU generation!"),
-                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
-        }
-        else
-        {
-            // CPU path: Generate voxels from categories (fallback when GPU unavailable)
-            // World-space bases
-            const int32 BaseWX = ChunkCoord.Cx * Settings->ChunkSizeX;
-            const int32 BaseWY = ChunkCoord.Cy * Settings->ChunkSizeY;
-            const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
-
-            VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
-
-            // OPTIMIZATION: Cache expanded categories to avoid Voxels→Cats conversion later
-            // This eliminates a full 32K+ iteration loop in BuildBinaryGreedyMesh
-            CatsExpanded.SetNumUninitialized(TotalPadded);
+        // OPTIMIZATION: Cache expanded categories to avoid Voxels→Cats conversion later
+        // This eliminates a full 32K+ iteration loop in BuildBinaryGreedyMesh
+        CatsExpanded.SetNumUninitialized(TotalPadded);
 
         auto PickBelowSurface = [](const UVoxelBiomeDef* B, int32 depth)->EVoxelBlockID
+        {
+            if (B && B->Subsurface.Num() > 0)
             {
-                if (B && B->Subsurface.Num() > 0)
+                int32 acc = 0;
+                for (const FBiomeLayer& L : B->Subsurface)
                 {
-                    int32 acc = 0;
-                    for (const FBiomeLayer& L : B->Subsurface)
-                    {
-                        acc += FMath::Max(0, L.Thickness);
-                        if (depth <= acc) return L.Block;
-                    }
-                    return B->Subsurface.Last().Block;
+                    acc += FMath::Max(0, L.Thickness);
+                    if (depth <= acc) return L.Block;
                 }
-                return EVoxelBlockID::Stone;
-            };
+                return B->Subsurface.Last().Block;
+            }
+            return EVoxelBlockID::Stone;
+        };
 
         // Biome grid presence
         const bool bHaveBiomeGrid = BiomeGridCopy.IsValid();
@@ -636,7 +577,6 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 }
             }
         }
-        } // End of CPU path else block
     }
     else
     {

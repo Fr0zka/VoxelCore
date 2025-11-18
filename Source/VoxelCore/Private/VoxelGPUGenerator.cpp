@@ -82,7 +82,7 @@ public:
 
         // Output buffers
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCategories)
-        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBlockIDs)  // OPTION 3: Added
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBiomeGrid)  // OPTION B: BiomeGrid data
     END_SHADER_PARAMETER_STRUCT()
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters&)
@@ -137,14 +137,14 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
         for (int32 Index = PendingJobs.Num() - 1; Index >= 0; --Index)
         {
             TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = PendingJobs[Index];
-            if (!Job.IsValid() || !Job->CategoryReadback || !Job->BlockIDReadback)  // OPTION 3: Check both
+            if (!Job.IsValid() || !Job->CategoryReadback || !Job->BiomeGridReadback)  // OPTION B: Check both
             {
                 PendingJobs.RemoveAtSwap(Index);
                 continue;
             }
 
-            // OPTION 3: Check if BOTH readbacks are ready (non-blocking)
-            if (!Job->CategoryReadback->IsReady() || !Job->BlockIDReadback->IsReady())
+            // OPTION B: Check if BOTH readbacks are ready (non-blocking)
+            if (!Job->CategoryReadback->IsReady() || !Job->BiomeGridReadback->IsReady())
             {
                 continue; // Not ready yet - check next frame
             }
@@ -158,35 +158,35 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
     // Process completed jobs (lock and copy data on render thread)
     // IMPORTANT: Jobs in CompletedJobs have already passed IsReady() check,
     // so they are safe to lock on the render thread
-    // OPTION 3: Now processes BOTH category and blockID buffers
+    // OPTION B: Now processes category and BiomeGrid buffers
     for (TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe>& Job : CompletedJobs)
     {
         if (!Job.IsValid())
             continue;
 
         // Capture job data for async processing
-        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete = Job->OnComplete;
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete = Job->OnComplete;
         int32 CategoryBufferSizeBytes = Job->CategoryBufferSizeBytes;
-        int32 BlockIDBufferSizeBytes = Job->BlockIDBufferSizeBytes;
+        int32 BiomeGridBufferSizeBytes = Job->BiomeGridBufferSizeBytes;
+        int32 BiomeGridSizeX = Job->BiomeGridSizeX;
+        int32 BiomeGridSizeY = Job->BiomeGridSizeY;
+        const UVoxelBiomeTable* BiomeTable = Job->BiomeTable;
 
         // CRITICAL: Move ownership of readbacks to render thread command
         // This keeps the readbacks alive until the command executes
         FRHIGPUBufferReadback* CategoryReadbackPtr = Job->CategoryReadback.Release();
-        FRHIGPUBufferReadback* BlockIDReadbackPtr = Job->BlockIDReadback.Release();
+        FRHIGPUBufferReadback* BiomeGridReadbackPtr = Job->BiomeGridReadback.Release();
 
         // Enqueue render command to lock and copy data (Lock MUST be on render thread)
         ENQUEUE_RENDER_COMMAND(VoxelGeneration_ReadbackData)(
-            [CategoryReadbackPtr, BlockIDReadbackPtr, CategoryBufferSizeBytes, BlockIDBufferSizeBytes, OnComplete](FRHICommandListImmediate& RHICmdList)
+            [CategoryReadbackPtr, BiomeGridReadbackPtr, CategoryBufferSizeBytes, BiomeGridBufferSizeBytes,
+             BiomeGridSizeX, BiomeGridSizeY, BiomeTable, OnComplete](FRHICommandListImmediate& RHICmdList)
             {
                 // Allocate output buffers on render thread
                 TArray<uint8> CategoryData;
-                TArray<EVoxelBlockID> BlockIDData;
+                FBiomeGrid2D BiomeGridData;
                 CategoryData.SetNumUninitialized(CategoryBufferSizeBytes);
-
-                // Calculate number of voxels from packed buffer size
-                // BlockIDs are packed 2 per uint32, so BufferSizeBytes = (NumVoxels/2) * 4
-                const int32 NumVoxels = (BlockIDBufferSizeBytes / sizeof(uint32)) * 2;
-                BlockIDData.SetNumUninitialized(NumVoxels);
+                BiomeGridData.Init(BiomeGridSizeX, BiomeGridSizeY);
 
                 // Lock and copy category data
                 const uint32* CategoryPtr = (const uint32*)CategoryReadbackPtr->Lock(CategoryBufferSizeBytes);
@@ -198,40 +198,56 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     bCategorySuccess = true;
                 }
 
-                // Lock and copy block ID data, then unpack
-                const uint32* BlockIDPtr = (const uint32*)BlockIDReadbackPtr->Lock(BlockIDBufferSizeBytes);
-                bool bBlockIDSuccess = false;
-                if (BlockIDPtr)
+                // Lock and unpack BiomeGrid data
+                const uint32* BiomeGridPtr = (const uint32*)BiomeGridReadbackPtr->Lock(BiomeGridBufferSizeBytes);
+                bool bBiomeGridSuccess = false;
+                if (BiomeGridPtr)
                 {
-                    // Unpack BlockIDs: 2 per uint32 (uint16 each)
-                    for (int32 i = 0; i < NumVoxels; ++i)
+                    // Unpack BiomeGrid: packed format per column
+                    // Lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
+                    const int32 NumColumns = BiomeGridSizeX * BiomeGridSizeY;
+                    for (int32 i = 0; i < NumColumns; ++i)
                     {
-                        const uint32 PackedValue = BlockIDPtr[i / 2];
-                        const uint32 Shift = (i % 2) * 16;
-                        const uint16 BlockID = (PackedValue >> Shift) & 0xFFFF;
-                        BlockIDData[i] = (EVoxelBlockID)BlockID;
+                        const uint32 PackedValue = BiomeGridPtr[i];
+
+                        // Unpack SurfaceZWorld (lower 16 bits, signed)
+                        const int16 SurfaceZ = (int16)(PackedValue & 0xFFFF);
+                        BiomeGridData.SurfaceZWorld[i] = SurfaceZ;
+
+                        // Unpack BiomeIndex (upper 16 bits, actually only 8 bits used)
+                        const uint8 BiomeIndex = (uint8)((PackedValue >> 16) & 0xFF);
+
+                        // Map BiomeIndex back to UVoxelBiomeDef* pointer
+                        if (BiomeTable && BiomeIndex < (uint8)BiomeTable->Biomes.Num())
+                        {
+                            BiomeGridData.BiomeAtXY[i] = BiomeTable->Biomes[BiomeIndex];
+                        }
+                        else
+                        {
+                            BiomeGridData.BiomeAtXY[i] = nullptr;
+                        }
                     }
-                    BlockIDReadbackPtr->Unlock();
-                    bBlockIDSuccess = true;
+                    BiomeGridReadbackPtr->Unlock();
+                    bBiomeGridSuccess = true;
                 }
 
                 // Call completion callback on game thread (async task)
-                if (bCategorySuccess && bBlockIDSuccess && OnComplete)
+                if (bCategorySuccess && bBiomeGridSuccess && OnComplete)
                 {
-                    AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData = MoveTemp(CategoryData), BlockIDData = MoveTemp(BlockIDData)]() mutable
+                    AsyncTask(ENamedThreads::GameThread, [OnComplete, CategoryData = MoveTemp(CategoryData), BiomeGridData = MoveTemp(BiomeGridData)]() mutable
                     {
-                        OnComplete(MoveTemp(CategoryData), MoveTemp(BlockIDData));
+                        OnComplete(MoveTemp(CategoryData), MoveTemp(BiomeGridData));
                     });
                 }
                 else
                 {
                     // Lock failed - log error
-                    UE_LOG(LogTemp, Error, TEXT("VoxelGPU: Failed to lock readback buffers! Category=%d BlockID=%d"), bCategorySuccess, bBlockIDSuccess);
+                    UE_LOG(LogTemp, Error, TEXT("VoxelGPU: Failed to lock readback buffers! Category=%d BiomeGrid=%d"), bCategorySuccess, bBiomeGridSuccess);
                 }
 
                 // Clean up readback buffers (we own them now)
                 delete CategoryReadbackPtr;
-                delete BlockIDReadbackPtr;
+                delete BiomeGridReadbackPtr;
             });
     }
 }
@@ -247,7 +263,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
     int32 MaxCaveDepth,
     const UVoxelBiomeTable* BiomeTable,
     const UVoxelNoiseProfile* NoiseProfile,
-    TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete)  // OPTION 3: Updated signature
+    TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete)  // OPTION B: Updated signature
 {
     // Validate GPU availability
     if (!IsGPUGenerationAvailable())
@@ -303,26 +319,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
             Data.CaveFrequency3D = P.CaveFrequency3D;
             Data.CaveOctaves3D = P.CaveOctaves3D;
 
-            // OPTION 3: Pack block data for GPU generation
-            Data.SurfaceBlock = (uint32)Biome->Surface;
-
-            // Pack subsurface layers (up to 8)
-            Data.SubsurfaceLayerCount = FMath::Min(Biome->Subsurface.Num(), 8);
-            FMemory::Memzero(Data.SubsurfaceLayers, sizeof(Data.SubsurfaceLayers));
-            for (int32 i = 0; i < Data.SubsurfaceLayerCount; ++i)
-            {
-                const FBiomeLayer& Layer = Biome->Subsurface[i];
-                uint32 BlockID = (uint32)Layer.Block & 0xFFFF;
-                uint32 Thickness = FMath::Clamp(Layer.Thickness, 0, 65535) & 0xFFFF;
-                Data.SubsurfaceLayers[i] = BlockID | (Thickness << 16);
-            }
-
-            // DIAGNOSTIC: Log biome block data
-            UE_LOG(LogTemp, Warning, TEXT("[OPTION3] Biome '%s': Surface=%d, SubsurfaceLayers=%d"),
-                *Biome->GetName(),  // Dereference FString to TCHAR*
-                (int32)Biome->Surface,
-                Data.SubsurfaceLayerCount);
-
+            // OPTION B: No block data packing needed (blocks generated on CPU)
             BiomeDataArray.Add(Data);
         }
     }
@@ -347,14 +344,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         DefaultData.HeightLacunarity = DefaultParams.HeightLacunarity;
         DefaultData.HeightGain = DefaultParams.HeightGain;
 
-        // OPTION 3: Default block data (Grass → Dirt → Stone)
-        DefaultData.SurfaceBlock = (uint32)EVoxelBlockID::Grass;
-        DefaultData.SubsurfaceLayerCount = 2;
-        // Layer 0: Dirt (4 blocks thick)
-        DefaultData.SubsurfaceLayers[0] = (uint32)EVoxelBlockID::Dirt | (4 << 16);
-        // Layer 1: Stone (infinite)
-        DefaultData.SubsurfaceLayers[1] = (uint32)EVoxelBlockID::Stone | (9999 << 16);
-
+        // OPTION B: No block data needed (blocks generated on CPU)
         BiomeDataArray.Add(DefaultData);
     }
 
@@ -395,12 +385,12 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         [Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
          TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
          MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
-         BiomeDataArray, OnComplete](FRHICommandListImmediate& RHICmdList)
+         BiomeDataArray, BiomeTable, OnComplete](FRHICommandListImmediate& RHICmdList)
         {
             DispatchGenerationShader_RenderThread(Coord, SizeX, SizeY, SizeZ, BaseSizeX, BaseSizeY, BaseSizeZ, LODScaleXY, Seed, BaseHeight, WaterLevel, MaxCaveDepth,
                 TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
                 MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset,
-                BiomeDataArray, OnComplete);
+                BiomeDataArray, BiomeTable, OnComplete);
         });
 }
 
@@ -420,7 +410,8 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
     float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
     const TArray<FGPUBiomeData>& BiomeDataArray,
-    TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete)  // OPTION 3: Updated
+    const UVoxelBiomeTable* BiomeTable,
+    TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete)  // OPTION B: Updated
 {
     check(IsInRenderingThread());
 
@@ -434,10 +425,11 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     const int32 CategoryBufferSizeBytes = FMath::DivideAndRoundUp(TotalVoxels * 2, 32) * 4; // Round up to uint32s
     const int32 CategoryBufferSizeUints = CategoryBufferSizeBytes / 4;
 
-    // OPTION 3: BlockIDs are packed 2 per uint32 (uint16 each)
-    // So we need TotalVoxels / 2 uint32s, rounded up
-    const int32 BlockIDBufferSizeUints = FMath::DivideAndRoundUp(TotalVoxels, 2);
-    const int32 BlockIDBufferSizeBytes = BlockIDBufferSizeUints * sizeof(uint32);
+    // OPTION B: BiomeGrid is one entry per XY column (not per voxel)
+    // Each entry is one uint32: lower 16 bits = SurfaceZWorld, upper 16 bits = BiomeIndex
+    const int32 BiomeGridSize = SizeX * SizeY;
+    const int32 BiomeGridBufferSizeBytes = BiomeGridSize * sizeof(uint32);
+    const int32 BiomeGridBufferSizeUints = BiomeGridSize;
 
     // Create category output buffer (RDG managed)
     FRDGBufferRef CategoryBuffer = GraphBuilder.CreateBuffer(
@@ -446,16 +438,16 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     FRDGBufferUAVRef CategoryUAV = GraphBuilder.CreateUAV(CategoryBuffer, PF_R32_UINT);
 
-    // OPTION 3: Create block ID output buffer (RDG managed)
-    FRDGBufferRef BlockIDBuffer = GraphBuilder.CreateBuffer(
-        FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), BlockIDBufferSizeUints),
-        TEXT("VoxelGenerationBlockIDs"));
+    // OPTION B: Create BiomeGrid output buffer (RDG managed)
+    FRDGBufferRef BiomeGridBuffer = GraphBuilder.CreateBuffer(
+        FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), BiomeGridBufferSizeUints),
+        TEXT("VoxelGenerationBiomeGrid"));
 
-    FRDGBufferUAVRef BlockIDUAV = GraphBuilder.CreateUAV(BlockIDBuffer, PF_R32_UINT);
+    FRDGBufferUAVRef BiomeGridUAV = GraphBuilder.CreateUAV(BiomeGridBuffer, PF_R32_UINT);
 
     // CRITICAL: Clear both output buffers to zero (prevents garbage data)
     AddClearUAVPass(GraphBuilder, CategoryUAV, 0u);
-    AddClearUAVPass(GraphBuilder, BlockIDUAV, 0u);
+    AddClearUAVPass(GraphBuilder, BiomeGridUAV, 0u);
 
     // Create biome data buffer
     const int32 BiomeCount = BiomeDataArray.Num();
@@ -518,9 +510,9 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
     // DIAGNOSTIC: Log biome count
     UE_LOG(LogTemp, Warning, TEXT("GPU Generation: Using %d biomes for per-column selection"), BiomeCount);
 
-    // Output buffers (OPTION 3: Now binding both Categories and BlockIDs)
+    // Output buffers (OPTION B: Categories and BiomeGrid)
     PassParameters->OutCategories = CategoryUAV;
-    PassParameters->OutBlockIDs = BlockIDUAV;
+    PassParameters->OutBiomeGrid = BiomeGridUAV;
 
     // Calculate dispatch dimensions (4x4x4 thread groups)
     const uint32 ThreadGroupSizeX = 4;
@@ -539,9 +531,9 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
         PassParameters,
         FIntVector(NumGroupsX, NumGroupsY, NumGroupsZ));
 
-    // OPTION 3: Setup async GPU readbacks for BOTH buffers
+    // OPTION B: Setup async GPU readbacks for BOTH buffers
     FRHIGPUBufferReadback* CategoryReadback = new FRHIGPUBufferReadback(TEXT("VoxelCategoryReadback"));
-    FRHIGPUBufferReadback* BlockIDReadback = new FRHIGPUBufferReadback(TEXT("VoxelBlockIDReadback"));
+    FRHIGPUBufferReadback* BiomeGridReadback = new FRHIGPUBufferReadback(TEXT("VoxelBiomeGridReadback"));
 
     // Enqueue category readback
     AddReadbackBufferPass(GraphBuilder, RDG_EVENT_NAME("ReadbackVoxelCategories"), CategoryBuffer,
@@ -550,21 +542,24 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
             CategoryReadback->EnqueueCopy(RHICmdList, CategoryBuffer->GetRHI(), 0u);
         });
 
-    // Enqueue block ID readback
-    AddReadbackBufferPass(GraphBuilder, RDG_EVENT_NAME("ReadbackVoxelBlockIDs"), BlockIDBuffer,
-        [BlockIDReadback, BlockIDBuffer](FRHICommandList& RHICmdList)
+    // Enqueue BiomeGrid readback
+    AddReadbackBufferPass(GraphBuilder, RDG_EVENT_NAME("ReadbackVoxelBiomeGrid"), BiomeGridBuffer,
+        [BiomeGridReadback, BiomeGridBuffer](FRHICommandList& RHICmdList)
         {
-            BlockIDReadback->EnqueueCopy(RHICmdList, BlockIDBuffer->GetRHI(), 0u);
+            BiomeGridReadback->EnqueueCopy(RHICmdList, BiomeGridBuffer->GetRHI(), 0u);
         });
 
     GraphBuilder.Execute();
 
-    // OPTION 3: Create job to track BOTH async readbacks (polled each frame, non-blocking)
+    // OPTION B: Create job to track BOTH async readbacks (polled each frame, non-blocking)
     TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = MakeShared<FGPUGenerationJob, ESPMode::ThreadSafe>();
     Job->CategoryReadback = TUniquePtr<FRHIGPUBufferReadback>(CategoryReadback);
-    Job->BlockIDReadback = TUniquePtr<FRHIGPUBufferReadback>(BlockIDReadback);
+    Job->BiomeGridReadback = TUniquePtr<FRHIGPUBufferReadback>(BiomeGridReadback);
     Job->CategoryBufferSizeBytes = CategoryBufferSizeBytes;
-    Job->BlockIDBufferSizeBytes = BlockIDBufferSizeBytes;
+    Job->BiomeGridBufferSizeBytes = BiomeGridBufferSizeBytes;
+    Job->BiomeGridSizeX = SizeX;
+    Job->BiomeGridSizeY = SizeY;
+    Job->BiomeTable = BiomeTable;
     Job->OnComplete = OnComplete;
 
     // Add to pending jobs list (will be polled by TickGPUGenerationJobs)
