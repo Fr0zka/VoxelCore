@@ -3,17 +3,21 @@
 // ============================================================================
 //
 // This implementation uses bitwise operations to process 64 voxels at once,
-// achieving 10-50x speedup over traditional per-voxel processing.
+// achieving significant speedup over traditional per-voxel processing.
 //
 // Algorithm:
-// 1. Convert category arrays to bitmasks (1 bit per voxel)
-// 2. Use XOR to find face boundaries (where categories change)
-// 3. Use AND to mask visible faces (current solid, neighbor air)
-// 4. Use CTZ (count trailing zeros) to find runs
-// 5. Merge runs greedily in both U and V directions
+// 1. Convert category arrays to bitmasks (1 bit per voxel, 64 voxels per uint64)
+// 2. Use bitwise AND to find visible faces (current=solid AND neighbor=air)
+// 3. Use CTZ (count trailing zeros) to find first face in a row
+// 4. Use bit shifting to count consecutive runs
+// 5. Merge runs greedily in both U and V directions using block ID matching
 //
-// Performance: Processes 64 voxels per comparison instead of 1
-// Expected: 10-50x faster face-finding, 3-10x faster overall meshing
+// Performance Optimizations:
+// - Single array allocation per slice (not per tile)
+// - Direct bit manipulation instead of separate processed masks
+// - Simplified visibility logic (single check instead of multiple masks)
+// - CTZ64 intrinsics for fast bit scanning
+// - Block ID verification only when extending quads
 //
 // ============================================================================
 
@@ -365,53 +369,44 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                 // BINARY OPTIMIZATION: Process rows of up to 64 voxels at once
                 // ============================================================
 
+                // OPTIMIZATION: Allocate ONCE per slice instead of per tile
+                const int32 MaxTileWidth = FMath::Min(64, A.DimU);
+
+                // Single array allocation per slice (not per tile!)
+                TArray<uint64> Rows;
+                Rows.SetNumZeroed(A.DimV);
+
                 // Process rows in chunks of 64
-                const int32 TileWidth = 64;
-
-                for (int uTile = 0; uTile < A.DimU; uTile += TileWidth)
+                for (int uTile = 0; uTile < A.DimU; uTile += MaxTileWidth)
                 {
-                    const int32 uCount = FMath::Min(TileWidth, A.DimU - uTile);
+                    const int32 uCount = FMath::Min(MaxTileWidth, A.DimU - uTile);
 
-                    // Build face visibility masks AND block ID cache for this tile
-                    // OPTIMIZATION: Cache block IDs as we build masks to avoid duplicate lookups
-                    TArray<uint64> VisibleMasks;
-                    TArray<EVoxelBlockID> BlockIDCache;  // Cache block IDs as we scan
-                    VisibleMasks.SetNumZeroed(A.DimV);
-                    BlockIDCache.SetNumUninitialized(uCount * A.DimV);
-
-                    bool bTileHasAnyFaces = false;
-
-                    // OPTIMIZATION: Build visibility masks AND cache block IDs in single pass
+                    // Reset rows for this tile
                     for (int v = 0; v < A.DimV; ++v)
                     {
-                        uint64 CurrentMask = 0;
-                        uint64 AirNeighborMask = 0;  // Tracks which neighbors are AIR (not just different)
-                        const int32 RowOffset = v * uCount;
+                        Rows[v] = 0;
+                    }
 
+                    // OPTIMIZATION: Build face-visibility masks with simplified logic
+                    bool bTileHasAnyFaces = false;
+                    for (int v = 0; v < A.DimV; ++v)
+                    {
+                        uint64 bits = 0ull;
                         for (int du = 0; du < uCount; ++du)
                         {
                             const int u = uTile + du;
                             const FIntVector P = MakePos(A.N, s, u, v);
                             const FIntVector Q = P + A.N;
-
                             const uint8 Ac = CatAt(P.X, P.Y, P.Z);
                             const uint8 Bc = CatAt(Q.X, Q.Y, Q.Z);
 
-                            // Cache block ID (we'll need it for texturing)
-                            BlockIDCache[RowOffset + du] = BlockAt(P.X, P.Y, P.Z);
-
-                            // CRITICAL FIX: Match standard greedy mesher logic
-                            // A face is visible ONLY if current=CatType AND neighbor=AIR (not just different!)
-                            // This prevents showing semi-transparent faces when neighbor is solid
-                            if (VOXEL_LIKELY(Ac == CatType)) CurrentMask |= (1ull << du);
-                            if (Bc == 0) AirNeighborMask |= (1ull << du);  // Track AIR neighbors only
+                            // CRITICAL: A face is visible ONLY if current=CatType AND neighbor=AIR
+                            const bool visible = (Ac == CatType) && (Bc == 0);
+                            bits |= (uint64)visible << du;
                         }
 
-                        // Find visible faces: current=CatType AND neighbor=AIR
-                        const uint64 Visible = CurrentMask & AirNeighborMask;
-
-                        VisibleMasks[v] = Visible;
-                        bTileHasAnyFaces |= (Visible != 0);
+                        Rows[v] = bits;
+                        bTileHasAnyFaces |= (bits != 0);
                     }
 
                     // Skip this tile if no faces
@@ -422,92 +417,87 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                     // GREEDY MESHING: Merge adjacent faces using bit manipulation
                     // ========================================================
 
-                    TArray<uint64> ProcessedMasks;
-                    ProcessedMasks.SetNumZeroed(A.DimV);
-
                     for (int v = 0; v < A.DimV; ++v)
                     {
-                        uint64 Row = VisibleMasks[v] & ~ProcessedMasks[v];
+                        uint64 row = Rows[v];
 
-                        while (Row != 0)
+                        while (row)
                         {
-                            // Find first set bit (CTZ - count trailing zeros)
-                            const int32 du0 = CountTrailingZeros64(Row);
-                            if (du0 >= uCount) break;
+                            // OPTIMIZATION: Use CTZ64 intrinsic to find first set bit
+                            const int32 du0 = CountTrailingZeros64(row);
+                            if (du0 >= 64) break;
 
-                            // Find run width using bit manipulation
-                            const uint64 RunStart = Row >> du0;
-                            int32 Width = 0;
+                            // Get base block ID for the first visible face
+                            const int32 u0 = uTile + du0;
+                            const FIntVector P0 = MakePos(A.N, s, u0, v);
+                            const EVoxelBlockID baseBlockID = BlockAt(P0.X, P0.Y, P0.Z);
 
-                            // OPTIMIZATION: Get base block ID from cache (single lookup)
-                            const int32 BaseIdx = v * uCount + du0;
-                            const EVoxelBlockID BaseBlockID = BlockIDCache[BaseIdx];
+                            // Count consecutive ones - but stop if block ID changes
+                            const uint64 run = row >> du0;
+                            int32 w = 0;
+                            uint64 temp = run;
 
-                            // OPTIMIZATION: Count consecutive faces with same block ID
-                            // Use CTZ to skip over runs quickly
-                            uint64 Temp = RunStart;
-
-                            while ((Temp & 1ull) && Width < (uCount - du0))
+                            while ((temp & 1ull) != 0ull && w < uCount - du0)
                             {
-                                const EVoxelBlockID BlockID = BlockIDCache[BaseIdx + Width];
+                                // Check if this voxel has the same block ID
+                                const int uCheck = u0 + w;
+                                const FIntVector PCheck = MakePos(A.N, s, uCheck, v);
+                                const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
 
-                                if (VOXEL_UNLIKELY(BlockID != BaseBlockID))
-                                    break;
+                                if (checkBlockID != baseBlockID)
+                                    break; // Don't merge different block types
 
-                                Width++;
-                                Temp >>= 1;
+                                temp >>= 1;
+                                ++w;
                             }
+                            if (w == 0) break;
 
-                            if (VOXEL_UNLIKELY(Width == 0)) Width = 1;
+                            // Clamp width
+                            w = FMath::Min(w, uCount - du0);
+                            const uint64 colMask = (w >= 64) ? ~0ull : ((1ull << w) - 1);
 
-                            // Try to extend vertically (greedy merge in V direction)
-                            int32 Height = 1;
-                            const uint64 RunMask = ((1ull << Width) - 1) << du0;
-
-                            for (int dv = 1; dv < A.DimV - v; ++dv)
+                            // Find height - stop if block ID changes
+                            int32 h = 1;
+                            while ((v + h) < A.DimV)
                             {
-                                const uint64 NextRow = VisibleMasks[v + dv] & ~ProcessedMasks[v + dv];
-                                const uint64 Match = (NextRow & RunMask);
-
-                                // OPTIMIZATION: Check if all bits in the run match first (fast bitwise op)
-                                if (VOXEL_UNLIKELY(Match != RunMask))
+                                const uint64 checkMask = (Rows[v + h] >> du0) & colMask;
+                                if (checkMask != colMask)
                                     break;
 
-                                // OPTIMIZATION: Verify block IDs using cached array
-                                bool bAllMatch = true;
-                                const int32 NextRowOffset = (v + dv) * uCount;
-                                for (int du = 0; du < Width; ++du)
+                                // CRITICAL: Check all voxels in the row have same block ID
+                                bool blockIDMatches = true;
+                                for (int du = 0; du < w; ++du)
                                 {
-                                    const EVoxelBlockID BlockID = BlockIDCache[NextRowOffset + du0 + du];
-
-                                    if (VOXEL_UNLIKELY(BlockID != BaseBlockID))
+                                    const int uCheck = u0 + du;
+                                    const FIntVector PCheck = MakePos(A.N, s, uCheck, v + h);
+                                    const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
+                                    if (checkBlockID != baseBlockID)
                                     {
-                                        bAllMatch = false;
+                                        blockIDMatches = false;
                                         break;
                                     }
                                 }
 
-                                if (VOXEL_UNLIKELY(!bAllMatch))
+                                if (!blockIDMatches)
                                     break;
 
-                                Height++;
+                                ++h;
                             }
 
-                            // Mark processed bits
-                            for (int dv = 0; dv < Height; ++dv)
+                            // Clear consumed bits directly in Rows array
+                            const uint64 clearMask = ~(colMask << du0);
+                            for (int dv = 0; dv < h; ++dv)
                             {
-                                ProcessedMasks[v + dv] |= RunMask;
+                                Rows[v + dv] &= clearMask;
                             }
+                            row = Rows[v];
 
                             // Emit the merged quad
-                            const FIntVector Origin = MakePos(A.N, s, uTile + du0, v);
-                            const FIntVector SpanU = A.U * Width;
-                            const FIntVector SpanV = A.V * Height;
+                            const FIntVector Origin = MakePos(A.N, s, u0, v);
+                            const FIntVector SpanU = A.U * w;
+                            const FIntVector SpanV = A.V * h;
 
-                            EmitQuad(Origin, SpanU, SpanV, A.N, BaseBlockID, A.FaceDir);
-
-                            // Clear processed bits from current row
-                            Row &= ~RunMask;
+                            EmitQuad(Origin, SpanU, SpanV, A.N, baseBlockID, A.FaceDir);
                         }
                     }
                 }
