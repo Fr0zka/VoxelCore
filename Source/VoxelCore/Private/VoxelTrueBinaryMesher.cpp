@@ -119,6 +119,45 @@ FORCEINLINE static uint64 CategoriesToBitmask(const uint8* VOXEL_RESTRICT Cats, 
     return Mask;
 }
 
+/**
+ * Returns the solid voxel that owns a face (depends on face direction and chunk borders).
+ * The "owner" is the solid block on the back side of the face, or the front side if back is air.
+ */
+static FORCEINLINE EVoxelBlockID OwnerBlockForFace(
+    const TArray<EVoxelBlockID>& V, const FIntVector& Size,
+    const FChunkNeighbors* VOXEL_RESTRICT Nbh, int x, int y, int z, EVoxelFaceDir dir)
+{
+    const int SX = Size.X, SY = Size.Y, SZ = Size.Z;
+
+    auto inside = [&](int X, int Y, int Z) {
+        return (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ;
+    };
+    auto at = [&](int X, int Y, int Z)->EVoxelBlockID { return V[X + Y * SX + Z * SX * SY]; };
+
+    auto sample = [&](int X, int Y, int Z)->EVoxelBlockID {
+        if (VOXEL_LIKELY(inside(X, Y, Z))) return at(X, Y, Z);
+        if (!Nbh) return EVoxelBlockID::Air;
+        if (Z < 0)    return (Nbh->bHasZNeg && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZNeg[X + Y * SX] : EVoxelBlockID::Air;
+        if (Z >= SZ)  return (Nbh->bHasZPos && (unsigned)X < (unsigned)SX && (unsigned)Y < (unsigned)SY) ? Nbh->ZPos[X + Y * SX] : EVoxelBlockID::Air;
+        if (X < 0)    return (Nbh->bHasXNeg && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ) ? Nbh->XNeg[Y + Z * SY] : EVoxelBlockID::Air;
+        if (X >= SX)  return (Nbh->bHasXPos && (unsigned)Y < (unsigned)SY && (unsigned)Z < (unsigned)SZ) ? Nbh->XPos[Y + Z * SY] : EVoxelBlockID::Air;
+        if (Y < 0)    return (Nbh->bHasYNeg && (unsigned)X < (unsigned)SX && (unsigned)Z < (unsigned)SZ) ? Nbh->YNeg[X + Z * SX] : EVoxelBlockID::Air;
+        return (Nbh->bHasYPos && (unsigned)X < (unsigned)SX && (unsigned)Z < (unsigned)SZ) ? Nbh->YPos[X + Z * SX] : EVoxelBlockID::Air;
+    };
+
+    // "Back" = solid side of the face. If that is empty, fall back to the other side.
+    switch (dir)
+    {
+    case EVoxelFaceDir::XPos: { EVoxelBlockID back = sample(x - 1, y, z); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::XNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x - 1, y, z); }
+    case EVoxelFaceDir::YPos: { EVoxelBlockID back = sample(x, y - 1, z); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::YNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x, y - 1, z); }
+    case EVoxelFaceDir::ZPos: { EVoxelBlockID back = sample(x, y, z - 1); return VoxelBlockCategory(back) ? back : sample(x, y, z); }
+    case EVoxelFaceDir::ZNeg: { EVoxelBlockID back = sample(x, y, z);   return VoxelBlockCategory(back) ? back : sample(x, y, z - 1); }
+    }
+    return EVoxelBlockID::Air;
+}
+
 // ============================================================================
 // TRUE BINARY GREEDY MESHER IMPLEMENTATION
 // ============================================================================
@@ -310,11 +349,15 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
         Out.UVs.Add(FVector2D(1, 1));
         Out.UVs.Add(FVector2D(0, 1));
 
-        // Colors (pack layer in R, AO in G)
-        Out.Colors.Add(FColor(Layer, ToByte(AO0), 0, 255));
-        Out.Colors.Add(FColor(Layer, ToByte(AO1), 0, 255));
-        Out.Colors.Add(FColor(Layer, ToByte(AO2), 0, 255));
-        Out.Colors.Add(FColor(Layer, ToByte(AO3), 0, 255));
+        // Colors (AO in RGB, Layer in Alpha) - matches BuildBinaryGreedyMesh_Cats
+        const uint8 AO0_Byte = ToByte(AO0);
+        const uint8 AO1_Byte = ToByte(AO1);
+        const uint8 AO2_Byte = ToByte(AO2);
+        const uint8 AO3_Byte = ToByte(AO3);
+        Out.Colors.Add(FColor(AO0_Byte, AO0_Byte, AO0_Byte, Layer));
+        Out.Colors.Add(FColor(AO1_Byte, AO1_Byte, AO1_Byte, Layer));
+        Out.Colors.Add(FColor(AO2_Byte, AO2_Byte, AO2_Byte, Layer));
+        Out.Colors.Add(FColor(AO3_Byte, AO3_Byte, AO3_Byte, Layer));
 
         // Normals
         Out.Normals.Add(Norm);
@@ -493,11 +536,17 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             row = Rows[v];
 
                             // Emit the merged quad
-                            const FIntVector Origin = MakePos(A.N, s, u0, v);
+                            // CRITICAL: Add offset for positive normals (matches BuildBinaryGreedyMesh_Cats)
+                            const FIntVector FaceBaseGrid = MakePos(A.N, s, u0, v)
+                                + FIntVector(FMath::Max(0, A.N.X), FMath::Max(0, A.N.Y), FMath::Max(0, A.N.Z));
+
+                            // CRITICAL: Use OwnerBlockForFace to get correct block owner (not direct BlockAt!)
+                            const EVoxelBlockID Owner = OwnerBlockForFace(Voxels, Size, Nbh, FaceBaseGrid.X, FaceBaseGrid.Y, FaceBaseGrid.Z, A.FaceDir);
+
                             const FIntVector SpanU = A.U * w;
                             const FIntVector SpanV = A.V * h;
 
-                            EmitQuad(Origin, SpanU, SpanV, A.N, baseBlockID, A.FaceDir);
+                            EmitQuad(FaceBaseGrid, SpanU, SpanV, A.N, Owner, A.FaceDir);
                         }
                     }
                 }
