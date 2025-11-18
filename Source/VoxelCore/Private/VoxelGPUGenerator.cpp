@@ -207,10 +207,14 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     // Lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
                     const int32 NumColumns = BiomeGridSizeX * BiomeGridSizeY;
 
-                    // DIAGNOSTIC: Track unique biome indices
+                    // DIAGNOSTIC: Track unique biome indices and sample corners
                     TSet<uint8> UniqueBiomes;
+                    TMap<uint8, int32> BiomeCount; // Count how many columns per biome
                     int32 MinSurfaceZ = INT32_MAX;
                     int32 MaxSurfaceZ = INT32_MIN;
+
+                    // Sample corner biome indices for detailed logging
+                    TArray<uint8> CornerBiomes;
 
                     for (int32 i = 0; i < NumColumns; ++i)
                     {
@@ -226,6 +230,19 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                         // Unpack BiomeIndex (upper 16 bits, actually only 8 bits used)
                         const uint8 BiomeIndex = (uint8)((PackedValue >> 16) & 0xFF);
                         UniqueBiomes.Add(BiomeIndex);
+                        BiomeCount.FindOrAdd(BiomeIndex)++;
+
+                        // Sample corners (0,0), (SizeX-1,0), (0,SizeY-1), (SizeX-1,SizeY-1), center
+                        int32 x = i % BiomeGridSizeX;
+                        int32 y = i / BiomeGridSizeX;
+                        if ((x == 0 && y == 0) ||
+                            (x == BiomeGridSizeX-1 && y == 0) ||
+                            (x == 0 && y == BiomeGridSizeY-1) ||
+                            (x == BiomeGridSizeX-1 && y == BiomeGridSizeY-1) ||
+                            (x == BiomeGridSizeX/2 && y == BiomeGridSizeY/2))
+                        {
+                            CornerBiomes.Add(BiomeIndex);
+                        }
 
                         // Map BiomeIndex back to UVoxelBiomeDef* pointer
                         if (BiomeTable && BiomeIndex < (uint8)BiomeTable->Biomes.Num())
@@ -240,10 +257,25 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     BiomeGridReadbackPtr->Unlock();
                     bBiomeGridSuccess = true;
 
-                    // DIAGNOSTIC: Log biome variety
-                    UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] BiomeGrid unpacked: %d unique biomes (from %d biomes in table), SurfaceZ range [%d, %d]"),
+                    // DIAGNOSTIC: Log biome variety with detailed breakdown
+                    FString BiomeBreakdown;
+                    for (const auto& Pair : BiomeCount)
+                    {
+                        FString BiomeName = (BiomeTable && Pair.Key < BiomeTable->Biomes.Num() && BiomeTable->Biomes[Pair.Key])
+                            ? BiomeTable->Biomes[Pair.Key]->GetName()
+                            : FString::Printf(TEXT("Index%d"), Pair.Key);
+                        BiomeBreakdown += FString::Printf(TEXT("%s:%d "), *BiomeName, Pair.Value);
+                    }
+
+                    UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] BiomeGrid: %d unique biomes (from %d total) | SurfaceZ[%d,%d] | Corners[%d,%d,%d,%d,C:%d] | Breakdown: %s"),
                         UniqueBiomes.Num(), BiomeTable ? BiomeTable->Biomes.Num() : 0,
-                        MinSurfaceZ, MaxSurfaceZ);
+                        MinSurfaceZ, MaxSurfaceZ,
+                        CornerBiomes.Num() > 0 ? CornerBiomes[0] : 255,
+                        CornerBiomes.Num() > 1 ? CornerBiomes[1] : 255,
+                        CornerBiomes.Num() > 2 ? CornerBiomes[2] : 255,
+                        CornerBiomes.Num() > 3 ? CornerBiomes[3] : 255,
+                        CornerBiomes.Num() > 4 ? CornerBiomes[4] : 255,
+                        *BiomeBreakdown);
                 }
 
                 // Call completion callback on game thread (async task)
@@ -333,6 +365,11 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
             Data.CaveGain2D = P.CaveGain2D;
             Data.CaveFrequency3D = P.CaveFrequency3D;
             Data.CaveOctaves3D = P.CaveOctaves3D;
+
+            // DIAGNOSTIC: Log biome climate ranges
+            UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] Biome[%d] '%s': Temp[%.3f,%.3f] Moist[%.3f,%.3f]"),
+                BiomeDataArray.Num(), *Biome->GetName(),
+                Data.TempMin, Data.TempMax, Data.MoistMin, Data.MoistMax);
 
             // OPTION B: No block data packing needed (blocks generated on CPU)
             BiomeDataArray.Add(Data);
