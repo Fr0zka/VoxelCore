@@ -52,6 +52,15 @@ struct BiomeData
     float CaveGain2D;
     float CaveFrequency3D;
     int CaveOctaves3D;
+
+    // OPTION 3: Block ID Generation
+    // Surface block (grass, sand, snow, etc.)
+    uint SurfaceBlock;
+
+    // Subsurface layers (up to 8 layers: dirt, stone, etc.)
+    // Each layer: lower 16 bits = BlockID, upper 16 bits = Thickness
+    uint SubsurfaceLayers[8];
+    int SubsurfaceLayerCount;
 };
 
 // Chunk dimensions
@@ -95,6 +104,9 @@ uint BiomeCount;
 
 // Output buffer - voxel categories (2 bits per voxel packed into bytes)
 RWStructuredBuffer<uint> OutCategories;
+
+// OPTION 3: Output buffer - block IDs (uint16 per voxel, 2 per uint32)
+RWStructuredBuffer<uint> OutBlockIDs;
 
 // ============================================================================
 // GENERATION FUNCTIONS
@@ -373,6 +385,30 @@ float Density3D_FromMacro_Biome(float x, float y, float zWorld, float macroHeigh
     return D;
 }
 
+// Pick subsurface block based on depth below surface
+uint PickSubsurfaceBlock(BiomeData biome, float depthBelowSurface)
+{
+    // Default to stone if no layers defined
+    if (biome.SubsurfaceLayerCount == 0)
+        return 3; // EVoxelBlockID::Stone
+
+    int accumulated = 0;
+    for (int i = 0; i < biome.SubsurfaceLayerCount; ++i)
+    {
+        uint packed = biome.SubsurfaceLayers[i];
+        uint blockID = packed & 0xFFFF;
+        int thickness = (int)(packed >> 16);
+
+        accumulated += max(0, thickness);
+        if (depthBelowSurface <= (float)accumulated)
+            return blockID;
+    }
+
+    // Beyond all layers: use last layer's block
+    uint lastPacked = biome.SubsurfaceLayers[biome.SubsurfaceLayerCount - 1];
+    return lastPacked & 0xFFFF;
+}
+
 // ============================================================================
 // MAIN COMPUTE SHADER
 // ============================================================================
@@ -507,6 +543,66 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
     #endif // End debug mode / full generation
 
+    // ========================================================================
+    // OPTION 3: BLOCK ID GENERATION ON GPU
+    // ========================================================================
+    uint BlockID = 0; // Air by default
+
+    if (Category == 1)
+    {
+        BlockID = 1; // EVoxelBlockID::Water
+    }
+    else if (Category == 2)
+    {
+        // Solid voxel - need to determine which block type
+        // Sample climate and pick biome (reuse from above if in full generation mode)
+        #if DEBUG_MODE != 0
+        float Temp, Moist;
+        SampleClimate((float)WX, (float)WY, Temp, Moist);
+        int biomeIdx = PickBiome(Temp, Moist);
+        float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
+        #endif
+
+        BiomeData biome = Biomes[biomeIdx];
+
+        // Surface detection: Check if this voxel has air above or below
+        // We need to sample the category buffer, but it's being written in parallel
+        // Instead, regenerate category for neighbors (cheaper than sync)
+        bool hasAirAbove = false;
+        bool hasAirBelow = false;
+
+        // Check voxel above (Z+1)
+        if ((int)ThreadId.z + 1 < (int)SizeZ)
+        {
+            int WZ_Above = BaseWZ + ((int)ThreadId.z); // +1 from current -1 offset
+            float M_Above = MacroSurfaceZ_Biome((float)WX, (float)WY);
+            float D_Above = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Above, M_Above);
+            hasAirAbove = (D_Above <= 0.0) || (WZ_Above > (int)WaterLevel && WZ_Above > M_Above + 10.0);
+        }
+
+        // Check voxel below (Z-1)
+        if ((int)ThreadId.z > 0)
+        {
+            int WZ_Below = BaseWZ + ((int)ThreadId.z - 2); // -1 from current -1 offset
+            float M_Below = MacroSurfaceZ_Biome((float)WX, (float)WY);
+            float D_Below = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Below, M_Below);
+            hasAirBelow = (D_Below <= 0.0);
+        }
+
+        // Determine block type
+        if (hasAirAbove || hasAirBelow)
+        {
+            // Surface voxel - use biome surface block
+            BlockID = biome.SurfaceBlock;
+        }
+        else
+        {
+            // Interior voxel - use subsurface layers based on depth
+            float depthBelowSurface = M - Z;
+            BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
+        }
+    }
+
     // Pack category into output buffer (2 bits per voxel)
     // The buffer is uint32[], but we're packing to match CPU's byte-array layout
     // 4 voxels per byte = 16 voxels per uint32
@@ -522,5 +618,20 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     {
         uint Value = Category << BitOffset;
         InterlockedOr(OutCategories[Uint32Index], Value);
+    }
+
+    // ========================================================================
+    // OPTION 3: WRITE BLOCK ID TO OUTPUT BUFFER
+    // ========================================================================
+    // Pack BlockIDs: 2 per uint32 (uint16 each)
+    // Even indices: lower 16 bits, Odd indices: upper 16 bits
+    uint BlockIDIndex = LinearIndex / 2;  // Which uint32
+    uint BlockIDOffset = (LinearIndex % 2) * 16;  // 0 or 16 bits
+
+    // Write block ID (atomic OR since buffer is zero-initialized)
+    if (BlockID != 0)
+    {
+        uint BlockValue = BlockID << BlockIDOffset;
+        InterlockedOr(OutBlockIDs[BlockIDIndex], BlockValue);
     }
 }
