@@ -608,12 +608,12 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
         #endif
 
-        // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
-        int16 surfaceZ = (int16)clamp(SurfaceZWorld, -32768.0, 32767.0);
-        uint8 biomeIndex = (uint8)clamp(biomeIdx, 0, 255);
+        // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (signed int16), upper 16 bits = BiomeIndex (uint8)
+        int surfaceZ = (int)clamp(SurfaceZWorld, -32768.0, 32767.0);
+        uint biomeIndex = (uint)clamp(biomeIdx, 0, 255);
 
         uint BiomeGridIndex = ThreadId.x + ThreadId.y * SizeX;
-        uint PackedValue = ((uint)surfaceZ & 0xFFFF) | (((uint)biomeIndex & 0xFF) << 16);
+        uint PackedValue = ((uint)surfaceZ & 0xFFFF) | ((biomeIndex & 0xFF) << 16);
 
         OutBiomeGrid[BiomeGridIndex] = PackedValue;
     }
