@@ -424,22 +424,28 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                 {
                     const int32 uCount = FMath::Min(MaxTileWidth, A.DimU - uTile);
 
-                    // Reset rows for this tile
-                    for (int v = 0; v < A.DimV; ++v)
-                    {
-                        Rows[v] = 0;
-                    }
+                    // CRITICAL OPTIMIZATION: Pre-cache ALL block IDs for this tile
+                    // This eliminates hundreds of BlockAt() calls during greedy merging
+                    TArray<EVoxelBlockID> BlockIDCache;
+                    BlockIDCache.SetNumUninitialized(uCount * A.DimV);
 
-                    // OPTIMIZATION: Build face-visibility masks with simplified logic
+                    // OPTIMIZATION: Build visibility masks AND cache block IDs in single pass
+                    // This avoids double lookups (once for visibility, once for merging)
                     bool bTileHasAnyFaces = false;
                     for (int v = 0; v < A.DimV; ++v)
                     {
                         uint64 bits = 0ull;
+                        const int32 RowOffset = v * uCount;
+
                         for (int du = 0; du < uCount; ++du)
                         {
                             const int u = uTile + du;
                             const FIntVector P = MakePos(A.N, s, u, v);
                             const FIntVector Q = P + A.N;
+
+                            // Cache block ID for later use (single lookup!)
+                            BlockIDCache[RowOffset + du] = BlockAt(P.X, P.Y, P.Z);
+
                             const uint8 Ac = CatAt(P.X, P.Y, P.Z);
                             const uint8 Bc = CatAt(Q.X, Q.Y, Q.Z);
 
@@ -457,7 +463,7 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                         continue;
 
                     // ========================================================
-                    // GREEDY MESHING: Merge adjacent faces using bit manipulation
+                    // GREEDY MESHING: Merge adjacent faces using CACHED data
                     // ========================================================
 
                     for (int v = 0; v < A.DimV; ++v)
@@ -470,22 +476,21 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const int32 du0 = CountTrailingZeros64(row);
                             if (du0 >= 64) break;
 
-                            // Get base block ID for the first visible face
+                            // Get base block ID from CACHE (not BlockAt!)
                             const int32 u0 = uTile + du0;
-                            const FIntVector P0 = MakePos(A.N, s, u0, v);
-                            const EVoxelBlockID baseBlockID = BlockAt(P0.X, P0.Y, P0.Z);
+                            const int32 baseIdx = v * uCount + du0;
+                            const EVoxelBlockID baseBlockID = BlockIDCache[baseIdx];
 
                             // Count consecutive ones - but stop if block ID changes
+                            // OPTIMIZATION: Use CACHED block IDs (simple array lookup)
                             const uint64 run = row >> du0;
                             int32 w = 0;
                             uint64 temp = run;
 
                             while ((temp & 1ull) != 0ull && w < uCount - du0)
                             {
-                                // Check if this voxel has the same block ID
-                                const int uCheck = u0 + w;
-                                const FIntVector PCheck = MakePos(A.N, s, uCheck, v);
-                                const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
+                                // FAST: Array lookup instead of BlockAt() call!
+                                const EVoxelBlockID checkBlockID = BlockIDCache[baseIdx + w];
 
                                 if (checkBlockID != baseBlockID)
                                     break; // Don't merge different block types
@@ -500,6 +505,7 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const uint64 colMask = (w >= 64) ? ~0ull : ((1ull << w) - 1);
 
                             // Find height - stop if block ID changes
+                            // OPTIMIZATION: Use CACHED block IDs (no BlockAt calls!)
                             int32 h = 1;
                             while ((v + h) < A.DimV)
                             {
@@ -508,12 +514,12 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                                     break;
 
                                 // CRITICAL: Check all voxels in the row have same block ID
+                                // FAST: Use cached array instead of BlockAt()
                                 bool blockIDMatches = true;
+                                const int32 nextRowOffset = (v + h) * uCount;
                                 for (int du = 0; du < w; ++du)
                                 {
-                                    const int uCheck = u0 + du;
-                                    const FIntVector PCheck = MakePos(A.N, s, uCheck, v + h);
-                                    const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
+                                    const EVoxelBlockID checkBlockID = BlockIDCache[nextRowOffset + du0 + du];
                                     if (checkBlockID != baseBlockID)
                                     {
                                         blockIDMatches = false;
