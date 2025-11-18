@@ -643,12 +643,23 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         // Strip padding for the main volume sent to the mesher
         TArray<EVoxelBlockID> RealVoxels;
         RealVoxels.SetNum(SX * SY * SZ);
+
+        // CRITICAL: Also strip padding from categories array
+        TArray<uint8> RealCats;
+        RealCats.SetNum(SX * SY * SZ);
+
         int32 di = 0;
         for (int32 z = 0; z < SZ; ++z)
             for (int32 y = 0; y < SY; ++y)
                 for (int32 x = 0; x < SX; ++x, ++di)
-                    RealVoxels[di] = VoxelsCopy[(x + 1) + (y + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY];
+                {
+                    const int32 paddedIdx = (x + 1) + (y + 1) * PaddedSX + (z + 1) * PaddedSX * PaddedSY;
+                    RealVoxels[di] = VoxelsCopy[paddedIdx];
+                    RealCats[di] = CatsExpanded[paddedIdx];
+                }
+
         VoxelsCopy = MoveTemp(RealVoxels);
+        CatsExpanded = MoveTemp(RealCats);
     }
     else
     {
