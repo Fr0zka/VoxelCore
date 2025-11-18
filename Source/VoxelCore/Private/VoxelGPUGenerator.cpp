@@ -393,6 +393,15 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         MoistGain = NoiseProfile->Moisture.Gain;
         MoistWarpStrength = NoiseProfile->Moisture.WarpStrength;
         MoistSeedOffset = NoiseProfile->Moisture.SeedOffset;
+
+        // DIAGNOSTIC: Log climate noise settings being sent to GPU
+        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] Climate Noise: Temp(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d) Moist(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d)"),
+            TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
+            MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] No NoiseProfile provided - using default climate noise settings"));
     }
 
     // Enqueue work on render thread
