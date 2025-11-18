@@ -438,6 +438,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
     TArray<EVoxelBlockID> VoxelsCopy;
     TArray<int32> HeightsCopy;
+    TArray<uint8> CatsExpanded;  // OPTIMIZATION: Cached categories
     int32 SamplesX = HF_SamplesX, SamplesY = HF_SamplesY;
 
     if (RenderMode == EVoxelRenderMode::Voxels)
@@ -458,6 +459,10 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
 
         VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
+
+        // OPTIMIZATION: Cache expanded categories to avoid Voxels→Cats conversion later
+        // This eliminates a full 32K+ iteration loop in BuildBinaryGreedyMesh
+        CatsExpanded.SetNumUninitialized(TotalPadded);
 
         auto PickBelowSurface = [](const UVoxelBiomeDef* B, int32 depth)->EVoxelBlockID
             {
@@ -501,6 +506,9 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 for (int32 x = 0; x < PaddedSX; ++x, ++idx)
                 {
                     const uint8 Cat = CategoryDataCopy.Get(x, y, z);
+
+                    // OPTIMIZATION: Cache category as we generate voxels (single pass)
+                    CatsExpanded[idx] = Cat;
 
                     if (Cat == 0) { VoxelsCopy[idx] = EVoxelBlockID::Air;  continue; }
                     if (Cat == 1) { VoxelsCopy[idx] = EVoxelBlockID::Water; continue; }
@@ -659,7 +667,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
     UE::Tasks::Launch(UE_SOURCE_LOCATION,
         [this, WeakWorld, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
-        LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), HCopy = MoveTemp(HeightsCopy),
+        LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), Cats = MoveTemp(CatsExpanded), HCopy = MoveTemp(HeightsCopy),
         SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings]() mutable
         {
             FMeshBuffers Buffers;
@@ -691,7 +699,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
 
                     const bool bLaunched = UVoxelMesher::BuildGreedyMesh_GPU_Async(
                         Voxels, SizeVox, &NbhCopy, XYScale, VoxelUU,
-                        [WeakChunk, WeakWorldGPU, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
+                        [WeakChunk, WeakWorldGPU, Cats, Voxels, NbhCopy, bCollision, bSeamRemesh, Seq, bUseNaive, bUseBinary, bAOFlag, bAllowFallbackLocal, BT]
                         (bool bSuccess, TArray<uint32>&& Packed, int32 SizeX, int32 SizeY, int32 SizeZ, int32 XYScaleParam, float VoxelUUParam)
                         {
                             UVoxelChunkComponent* Chunk = WeakChunk.Get();
@@ -725,7 +733,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                     if (bUseNaive)
                                         UVoxelMesher::BuildNaiveMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
                                     else if (bUseBinary)
-                                        UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
+                                        UVoxelMesher::BuildBinaryGreedyMesh(Cats, Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
                                     else
                                         UVoxelMesher::BuildGreedyMesh(Voxels, SizeVector, NeighborPtr, VoxelUUParam, XYScaleParam, bAOFlag, BT, LocalBufs);
 
@@ -768,7 +776,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     if (SettingsPtr && SettingsPtr->bUseNaiveMesher)
                         UVoxelMesher::BuildNaiveMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
                     else if (SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher)
-                        UVoxelMesher::BuildBinaryGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
+                        UVoxelMesher::BuildBinaryGreedyMesh(Cats, Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
                     else
                         UVoxelMesher::BuildGreedyMesh(Voxels, SizeVox, &NbhCopy, VoxelUU, XYScale, bAO, BT, Buffers);
 
