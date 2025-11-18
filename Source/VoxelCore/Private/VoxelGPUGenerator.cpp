@@ -435,6 +435,38 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] Climate Noise: Temp(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d) Moist(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d)"),
             TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
             MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset);
+
+        // DIAGNOSTIC: Sample CPU climate values at specific world coordinates for comparison
+        FVoxelNoiseContext CPUNoise(Seed, NoiseProfile);
+        const int32 BaseWX = Coord.Cx * BaseSizeX;
+        const int32 BaseWY = Coord.Cy * BaseSizeY;
+
+        // Sample 5 positions: 4 corners + center
+        TArray<TPair<int32, int32>> SamplePositions;
+        SamplePositions.Add(TPair<int32, int32>(BaseWX, BaseWY));                                      // Corner (0,0)
+        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX - 1, BaseWY));                    // Corner (SizeX-1, 0)
+        SamplePositions.Add(TPair<int32, int32>(BaseWX, BaseWY + BaseSizeY - 1));                    // Corner (0, SizeY-1)
+        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX - 1, BaseWY + BaseSizeY - 1));    // Corner (SizeX-1, SizeY-1)
+        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX/2, BaseWY + BaseSizeY/2));        // Center
+
+        FString CPUSamples;
+        for (int32 i = 0; i < SamplePositions.Num(); ++i)
+        {
+            float WX = (float)SamplePositions[i].Key;
+            float WY = (float)SamplePositions[i].Value;
+
+            float TempCPU, MoistCPU;
+            CPUNoise.SampleClimate(WX, WY, TempCPU, MoistCPU);
+
+            const UVoxelBiomeDef* BiomeCPU = BiomeTable ? BiomeTable->Pick(TempCPU, MoistCPU) : nullptr;
+            int32 BiomeIdxCPU = BiomeTable && BiomeCPU ? BiomeTable->IndexOf(BiomeCPU) : -1;
+
+            CPUSamples += FString::Printf(TEXT("[%d,%d:T=%.3f M=%.3f B=%d] "),
+                SamplePositions[i].Key, SamplePositions[i].Value,
+                TempCPU, MoistCPU, BiomeIdxCPU);
+        }
+
+        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] CPU Climate Samples: %s"), *CPUSamples);
     }
     else
     {
