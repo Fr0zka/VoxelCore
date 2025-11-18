@@ -180,6 +180,23 @@ void UVoxelChunkComponent::DoGeneration()
                 This->GPUVoxelDataSizeY = ScaledSizeY + 2;
                 This->GPUVoxelDataSizeZ = ScaledSizeZ + 2;
 
+                // DIAGNOSTIC: Log GPU data received and sample some block IDs
+                int32 NumGrass = 0, NumDirt = 0, NumStone = 0, NumAir = 0, NumWater = 0, NumOther = 0;
+                for (int32 i = 0; i < FMath::Min(1000, This->GPUVoxelData.Num()); ++i)
+                {
+                    EVoxelBlockID Block = This->GPUVoxelData[i];
+                    if (Block == EVoxelBlockID::Grass) NumGrass++;
+                    else if (Block == EVoxelBlockID::Dirt) NumDirt++;
+                    else if (Block == EVoxelBlockID::Stone) NumStone++;
+                    else if (Block == EVoxelBlockID::Air) NumAir++;
+                    else if (Block == EVoxelBlockID::Water) NumWater++;
+                    else NumOther++;
+                }
+                UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) GPU callback: Received %d blocks | Sample(1000): Grass=%d Dirt=%d Stone=%d Air=%d Water=%d Other=%d"),
+                    Coord.Cx, Coord.Cy, Coord.Cz,
+                    This->GPUVoxelData.Num(),
+                    NumGrass, NumDirt, NumStone, NumAir, NumWater, NumOther);
+
                 // Generate biome grid (still on CPU for now)
                 UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
 
@@ -465,6 +482,20 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                                         (GPUVoxelDataSizeX == PaddedSX) &&
                                         (GPUVoxelDataSizeY == PaddedSY) &&
                                         (GPUVoxelDataSizeZ == PaddedSZ);
+
+        // DIAGNOSTIC: Log GPU data availability
+        if (GPUVoxelData.Num() > 0)
+        {
+            UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) DoMeshing: GPUVoxelData.Num=%d (expected %d), SizeMatch=%d,%d,%d"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
+                GPUVoxelData.Num(), TotalPadded,
+                GPUVoxelDataSizeX == PaddedSX, GPUVoxelDataSizeY == PaddedSY, GPUVoxelDataSizeZ == PaddedSZ);
+        }
+        else
+        {
+            UE_LOG(LogVoxelChunk, Warning, TEXT("[OPTION3] Chunk (%d,%d,%d) DoMeshing: NO GPU data available - using CPU fallback"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+        }
 
         if (bHaveGPUVoxelData)
         {
