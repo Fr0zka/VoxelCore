@@ -500,12 +500,9 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         if (bHaveGPUVoxelData)
         {
             // GPU path: Use pre-generated voxel data directly (MASSIVE performance win!)
-            VoxelsCopy = MoveTemp(GPUVoxelData);
-            // Clear GPU data to free memory (it's been moved to VoxelsCopy)
-            GPUVoxelData.Empty();
-            GPUVoxelDataSizeX = 0;
-            GPUVoxelDataSizeY = 0;
-            GPUVoxelDataSizeZ = 0;
+            VoxelsCopy = GPUVoxelData; // Copy instead of move - keep for potential remeshes
+            // NOTE: Don't clear GPU data yet - might be needed for seam remeshing
+            // It will be cleared when chunk is unloaded or regenerated
 
             // Still need to expand categories for the mesher
             CatsExpanded.SetNumUninitialized(TotalPadded);
