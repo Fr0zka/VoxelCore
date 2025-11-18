@@ -319,7 +319,7 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
 
             // DIAGNOSTIC: Log biome block data
             UE_LOG(LogTemp, Warning, TEXT("[OPTION3] Biome '%s': Surface=%d, SubsurfaceLayers=%d"),
-                Biome->GetName(),
+                *Biome->GetName(),  // Dereference FString to TCHAR*
                 (int32)Biome->Surface,
                 Data.SubsurfaceLayerCount);
 
