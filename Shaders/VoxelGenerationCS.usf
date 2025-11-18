@@ -449,6 +449,16 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // Compute world position (accounting for -1 halo padding)
     // ThreadId ranges from [0, SizeX-1] but represents voxel indices [-1, SizeX-2]
     // BaseWX/Y/Z = world coordinate of chunk origin (voxel index 0)
+
+    // CRITICAL: For BiomeGrid and climate sampling, we must CLAMP halo coordinates to interior
+    // to match CPU behavior (CPU: vx = Clamp(x - 1, 0, SX - 1))
+    // SizeX/Y are padded sizes (SX + 2), so interior logical size is (SizeX - 2)
+    int vx = clamp((int)ThreadId.x - 1, 0, (int)SizeX - 3);
+    int vy = clamp((int)ThreadId.y - 1, 0, (int)SizeY - 3);
+    int WX_BiomeGrid = BaseWX + vx * (int)LODScaleXY;
+    int WY_BiomeGrid = BaseWY + vy * (int)LODScaleXY;
+
+    // For voxel generation (categories), use unclamped coordinates (halo extends outside)
     int WX = BaseWX + ((int)ThreadId.x - 1) * (int)LODScaleXY;
     int WY = BaseWY + ((int)ThreadId.y - 1) * (int)LODScaleXY;
     int WZ = BaseWZ + ((int)ThreadId.z - 1);
@@ -460,15 +470,15 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // ========================================================================
     // PRE-COMPUTE BIOME DATA (needed for both category generation and BiomeGrid)
     // ========================================================================
-    // Sample climate and pick biome for this XY position
-    // This is computed once per thread and reused in both category and BiomeGrid generation
+    // Sample climate and pick biome for this XY position using CLAMPED coordinates
+    // This matches CPU's clamping behavior for BiomeGrid generation
     float Temp, Moist;
-    SampleClimate((float)WX, (float)WY, Temp, Moist);
+    SampleClimate((float)WX_BiomeGrid, (float)WY_BiomeGrid, Temp, Moist);
     int biomeIdx = PickBiome(Temp, Moist);
     BiomeData biome = Biomes[biomeIdx];
 
-    // Compute macro surface height (needed for narrow band optimization and BiomeGrid)
-    float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
+    // Compute macro surface height using CLAMPED coordinates (needed for BiomeGrid)
+    float M = MacroSurfaceZ_Biome((float)WX_BiomeGrid, (float)WY_BiomeGrid);
 
     // ========================================================================
     // DEBUG MODE OPTIONS:
@@ -598,9 +608,10 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // This dramatically reduces work: SizeX*SizeY columns instead of SizeX*SizeY*SizeZ voxels
     if (ThreadId.z == 0)
     {
-        // Use pre-computed biomeIdx, biome, and M (computed above before DEBUG_MODE blocks)
+        // Use pre-computed biomeIdx, biome, and M (computed above with CLAMPED coordinates)
         // ComputeSurfaceZWorld by raymarching to find actual topmost solid voxel
-        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
+        // Uses CLAMPED coordinates to match CPU BiomeGrid generation
+        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX_BiomeGrid, (float)WY_BiomeGrid, M, biome);
 
         // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (signed int16), upper 16 bits = BiomeIndex (uint8)
         int surfaceZ = (int)clamp(SurfaceZWorld, -32768.0, 32767.0);
