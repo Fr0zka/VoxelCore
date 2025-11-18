@@ -591,11 +591,6 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
         BiomeData biome = Biomes[biomeIdx];
 
-        // CRITICAL: Compute actual surface height by raymarching (like GenerateBiomeGrid2D)
-        // This is NOT the same as macro surface M!
-        // CPU uses BiomeGrid.SurfaceZWorld which is raymarched actual surface
-        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
-
         // CPU LOGIC: Check if has air above/below by reading CategoryData neighbors
         // GPU: Can't read Categories from other threads, so recalculate using EXACT category logic
         //
@@ -710,20 +705,28 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
         if (hasAirAbove || hasAirBelow)
         {
-            // Surface voxel - has exposed face
+            // Surface voxel - has exposed face - use surface block
             BlockID = biome.SurfaceBlock;
-        }
-        else if (Z < SurfaceZWorld)  // WorldZ < TopZ (using raymarched surface, not macro M!)
-        {
-            // Interior voxel below main surface - use depth-based subsurface layers
-            float depthBelowSurface = SurfaceZWorld - Z;
-            BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
         }
         else
         {
-            // Interior voxel above main surface (inside floating island/overhang)
-            // Use shallow subsurface layers (depth=2 matches CPU)
-            BlockID = PickSubsurfaceBlock(biome, 2.0);
+            // Interior voxel - need to compute surface height for depth calculation
+            // OPTIMIZATION: Only raymarch for interior voxels, not surfaces
+            // This reduces raycasts from ~16K to ~8K per chunk
+            float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
+
+            if (Z < SurfaceZWorld)  // WorldZ < TopZ
+            {
+                // Interior voxel below main surface - use depth-based subsurface layers
+                float depthBelowSurface = SurfaceZWorld - Z;
+                BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
+            }
+            else
+            {
+                // Interior voxel above main surface (inside floating island/overhang)
+                // Use shallow subsurface layers (depth=2 matches CPU)
+                BlockID = PickSubsurfaceBlock(biome, 2.0);
+            }
         }
     }
 
