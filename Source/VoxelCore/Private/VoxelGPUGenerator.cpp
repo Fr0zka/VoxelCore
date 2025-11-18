@@ -206,6 +206,12 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     // Unpack BiomeGrid: packed format per column
                     // Lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
                     const int32 NumColumns = BiomeGridSizeX * BiomeGridSizeY;
+
+                    // DIAGNOSTIC: Track unique biome indices
+                    TSet<uint8> UniqueBiomes;
+                    int32 MinSurfaceZ = INT32_MAX;
+                    int32 MaxSurfaceZ = INT32_MIN;
+
                     for (int32 i = 0; i < NumColumns; ++i)
                     {
                         const uint32 PackedValue = BiomeGridPtr[i];
@@ -214,8 +220,12 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                         const int16 SurfaceZ = (int16)(PackedValue & 0xFFFF);
                         BiomeGridData.SurfaceZWorld[i] = SurfaceZ;
 
+                        MinSurfaceZ = FMath::Min(MinSurfaceZ, (int32)SurfaceZ);
+                        MaxSurfaceZ = FMath::Max(MaxSurfaceZ, (int32)SurfaceZ);
+
                         // Unpack BiomeIndex (upper 16 bits, actually only 8 bits used)
                         const uint8 BiomeIndex = (uint8)((PackedValue >> 16) & 0xFF);
+                        UniqueBiomes.Add(BiomeIndex);
 
                         // Map BiomeIndex back to UVoxelBiomeDef* pointer
                         if (BiomeTable && BiomeIndex < (uint8)BiomeTable->Biomes.Num())
@@ -229,6 +239,11 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     }
                     BiomeGridReadbackPtr->Unlock();
                     bBiomeGridSuccess = true;
+
+                    // DIAGNOSTIC: Log biome variety
+                    UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] BiomeGrid unpacked: %d unique biomes (from %d biomes in table), SurfaceZ range [%d, %d]"),
+                        UniqueBiomes.Num(), BiomeTable ? BiomeTable->Biomes.Num() : 0,
+                        MinSurfaceZ, MaxSurfaceZ);
                 }
 
                 // Call completion callback on game thread (async task)

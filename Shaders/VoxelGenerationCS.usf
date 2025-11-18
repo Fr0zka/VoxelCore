@@ -458,6 +458,19 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     uint Category = 0;
 
     // ========================================================================
+    // PRE-COMPUTE BIOME DATA (needed for both category generation and BiomeGrid)
+    // ========================================================================
+    // Sample climate and pick biome for this XY position
+    // This is computed once per thread and reused in both category and BiomeGrid generation
+    float Temp, Moist;
+    SampleClimate((float)WX, (float)WY, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
+    BiomeData biome = Biomes[biomeIdx];
+
+    // Compute macro surface height (needed for narrow band optimization and BiomeGrid)
+    float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
+
+    // ========================================================================
     // DEBUG MODE OPTIONS:
     // 0 = Full terrain generation
     // 1 = Checkerboard pattern (verify shader compilation)
@@ -507,15 +520,7 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // ========================================================================
     // FULL GENERATION (production code)
     // ========================================================================
-
-    // Compute macro surface height
-    float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
-
-    // Sample climate and pick biome for narrow band optimization
-    float Temp, Moist;
-    SampleClimate((float)WX, (float)WY, Temp, Moist);
-    int biomeIdx = PickBiome(Temp, Moist);
-    BiomeData biome = Biomes[biomeIdx];
+    // Note: biomeIdx, biome, and M are pre-computed above before DEBUG_MODE blocks
 
     // Compute margin for narrow band optimization using biome-specific parameters
     float Margin = biome.OverhangAmplitude + biome.IslandAmplitude + 3.0;
@@ -593,20 +598,9 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // This dramatically reduces work: SizeX*SizeY columns instead of SizeX*SizeY*SizeZ voxels
     if (ThreadId.z == 0)
     {
-        // Sample climate and pick biome for this XY column
-        #if DEBUG_MODE == 0
-        // Reuse biomeIdx and M from category generation above (already computed)
+        // Use pre-computed biomeIdx, biome, and M (computed above before DEBUG_MODE blocks)
         // ComputeSurfaceZWorld by raymarching to find actual topmost solid voxel
         float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
-        #else
-        // Debug modes: use default values
-        float Temp, Moist;
-        SampleClimate((float)WX, (float)WY, Temp, Moist);
-        int biomeIdx = PickBiome(Temp, Moist);
-        BiomeData biome = Biomes[biomeIdx];
-        float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
-        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX, (float)WY, M, biome);
-        #endif
 
         // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (signed int16), upper 16 bits = BiomeIndex (uint8)
         int surfaceZ = (int)clamp(SurfaceZWorld, -32768.0, 32767.0);
