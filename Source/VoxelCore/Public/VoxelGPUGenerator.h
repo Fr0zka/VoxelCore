@@ -30,7 +30,8 @@ class VOXELCORE_API FVoxelGPUGenerator
 {
 public:
     /**
-     * Generate voxel chunk categories using GPU compute shader.
+     * Generate voxel chunk categories AND block IDs using GPU compute shader.
+     * OPTION 3: Now generates both category and block ID data in parallel on GPU
      *
      * @param Coord - Chunk coordinate
      * @param SizeX/Y/Z - Chunk dimensions (LOD-scaled + halo)
@@ -40,8 +41,9 @@ public:
      * @param BaseHeight - Base terrain height
      * @param WaterLevel - Water level cutoff
      * @param MaxCaveDepth - Maximum cave depth (performance optimization)
-     * @param BiomeParams - Biome-specific terrain parameters
-     * @param OnComplete - Callback when generation complete (receives category data)
+     * @param BiomeTable - Biome definitions (terrain params + block types)
+     * @param NoiseProfile - Climate noise parameters
+     * @param OnComplete - Callback when generation complete (receives category + blockID data)
      */
     static void GenerateChunkGPU(
         const FVoxelCoord& Coord,
@@ -54,7 +56,7 @@ public:
         int32 MaxCaveDepth,
         const class UVoxelBiomeTable* BiomeTable,
         const class UVoxelNoiseProfile* NoiseProfile,
-        TFunction<void(TArray<uint8>&&)> OnComplete);
+        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete);
 
     /**
      * Check if GPU generation is available on this platform.
@@ -115,15 +117,30 @@ private:
         float CaveGain2D;
         float CaveFrequency3D;
         int32 CaveOctaves3D;
+
+        // OPTION 3: Block ID Generation
+        // Surface block (grass, sand, snow, etc.) - MUST match shader layout
+        uint32 SurfaceBlock;
+
+        // Subsurface layers (up to 8 layers: dirt, stone, etc.)
+        // Each layer: lower 16 bits = BlockID, upper 16 bits = Thickness
+        uint32 SubsurfaceLayers[8];
+        int32 SubsurfaceLayerCount;
+
+        // Padding to match shader alignment (if needed)
+        uint32 _Padding[1];
     };
     /**
      * GPU generation job - tracks pending async readback.
+     * OPTION 3: Now tracks BOTH category and blockID readbacks
      */
     struct FGPUGenerationJob
     {
-        TUniquePtr<FRHIGPUBufferReadback> Readback;
-        int32 BufferSizeBytes = 0;
-        TFunction<void(TArray<uint8>&&)> OnComplete;
+        TUniquePtr<FRHIGPUBufferReadback> CategoryReadback;
+        TUniquePtr<FRHIGPUBufferReadback> BlockIDReadback;  // OPTION 3: Added
+        int32 CategoryBufferSizeBytes = 0;
+        int32 BlockIDBufferSizeBytes = 0;  // OPTION 3: Added
+        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete;  // OPTION 3: Updated signature
     };
 
     // Pending GPU generation jobs (polled each frame)

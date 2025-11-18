@@ -140,7 +140,7 @@ void UVoxelChunkComponent::DoGeneration()
             Params.MaxCaveDepth,
             Params.BiomeTable.Get(),  // Pass entire BiomeTable for per-column biome selection
             Params.NoiseProfile,      // Pass NoiseProfile for climate noise generation
-            [WeakThis, WeakWorld, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData)
+            [WeakThis, WeakWorld, Params, ScaleXY, Coord, ScaledSizeX, ScaledSizeY, ScaledSizeZ](TArray<uint8>&& GPUCategoryData, TArray<EVoxelBlockID>&& GPUBlockIDData)
             {
                 // Check if component is still valid (might be destroyed during async generation)
                 UVoxelChunkComponent* This = WeakThis.Get();
@@ -173,6 +173,12 @@ void UVoxelChunkComponent::DoGeneration()
                 This->CategoryData.SizeX = ScaledSizeX + 2;
                 This->CategoryData.SizeY = ScaledSizeY + 2;
                 This->CategoryData.SizeZ = ScaledSizeZ + 2;
+
+                // OPTION 3: Store GPU-generated block IDs for direct use in meshing
+                This->GPUVoxelData = MoveTemp(GPUBlockIDData);
+                This->GPUVoxelDataSizeX = ScaledSizeX + 2;
+                This->GPUVoxelDataSizeY = ScaledSizeY + 2;
+                This->GPUVoxelDataSizeZ = ScaledSizeZ + 2;
 
                 // Generate biome grid (still on CPU for now)
                 UVoxelGenerator::GenerateBiomeGrid2D(Coord, Params, ScaleXY, This->BiomeGrid);
@@ -453,16 +459,50 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
         const int32 SZ = PaddedSZ - 2;
         const int32 TotalPadded = PaddedSX * PaddedSY * PaddedSZ;
 
-        // World-space bases
-        const int32 BaseWX = ChunkCoord.Cx * Settings->ChunkSizeX;
-        const int32 BaseWY = ChunkCoord.Cy * Settings->ChunkSizeY;
-        const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
+        // OPTION 3: Check if GPU-generated voxel data is available
+        // If so, use it directly and skip expensive CPU voxel generation
+        const bool bHaveGPUVoxelData = (GPUVoxelData.Num() == TotalPadded) &&
+                                        (GPUVoxelDataSizeX == PaddedSX) &&
+                                        (GPUVoxelDataSizeY == PaddedSY) &&
+                                        (GPUVoxelDataSizeZ == PaddedSZ);
 
-        VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
+        if (bHaveGPUVoxelData)
+        {
+            // GPU path: Use pre-generated voxel data directly (MASSIVE performance win!)
+            VoxelsCopy = MoveTemp(GPUVoxelData);
+            // Clear GPU data to free memory (it's been moved to VoxelsCopy)
+            GPUVoxelData.Empty();
+            GPUVoxelDataSizeX = 0;
+            GPUVoxelDataSizeY = 0;
+            GPUVoxelDataSizeZ = 0;
 
-        // OPTIMIZATION: Cache expanded categories to avoid Voxels→Cats conversion later
-        // This eliminates a full 32K+ iteration loop in BuildBinaryGreedyMesh
-        CatsExpanded.SetNumUninitialized(TotalPadded);
+            // Still need to expand categories for the mesher
+            CatsExpanded.SetNumUninitialized(TotalPadded);
+            for (int32 i = 0; i < TotalPadded; ++i)
+            {
+                const int32 z = i / (PaddedSX * PaddedSY);
+                const int32 rem = i % (PaddedSX * PaddedSY);
+                const int32 y = rem / PaddedSX;
+                const int32 x = rem % PaddedSX;
+                CatsExpanded[i] = CategoryDataCopy.Get(x, y, z);
+            }
+
+            UE_LOG(LogVoxelChunk, Verbose, TEXT("[OPTION3] Chunk (%d,%d,%d) using GPU-generated voxel data - skipped CPU generation!"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+        }
+        else
+        {
+            // CPU path: Generate voxels from categories (fallback when GPU unavailable)
+            // World-space bases
+            const int32 BaseWX = ChunkCoord.Cx * Settings->ChunkSizeX;
+            const int32 BaseWY = ChunkCoord.Cy * Settings->ChunkSizeY;
+            const int32 BaseWZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
+
+            VoxelsCopy.Init(EVoxelBlockID::Air, TotalPadded);
+
+            // OPTIMIZATION: Cache expanded categories to avoid Voxels→Cats conversion later
+            // This eliminates a full 32K+ iteration loop in BuildBinaryGreedyMesh
+            CatsExpanded.SetNumUninitialized(TotalPadded);
 
         auto PickBelowSurface = [](const UVoxelBiomeDef* B, int32 depth)->EVoxelBlockID
             {
@@ -568,6 +608,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                 }
             }
         }
+        } // End of CPU path else block
     }
     else
     {

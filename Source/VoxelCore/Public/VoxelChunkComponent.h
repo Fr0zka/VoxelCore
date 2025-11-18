@@ -102,6 +102,12 @@ protected:
     // temporary block IDs.
     FCategoryBitset CategoryData;
     FBiomeGrid2D BiomeGrid;
+    // OPTION 3: GPU-generated voxel data (when GPU generation enabled)
+    // If populated, DoMeshing will use this directly instead of regenerating on CPU
+    TArray<EVoxelBlockID> GPUVoxelData;
+    int32 GPUVoxelDataSizeX = 0;
+    int32 GPUVoxelDataSizeY = 0;
+    int32 GPUVoxelDataSizeZ = 0;
     // Protects CategoryData and HeightData
     FCachedNeighborBorders CachedNeighborBorders;
     bool bNeighborBordersCached = false;
