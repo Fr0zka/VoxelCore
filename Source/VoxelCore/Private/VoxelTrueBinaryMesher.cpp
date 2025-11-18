@@ -424,27 +424,17 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                 {
                     const int32 uCount = FMath::Min(MaxTileWidth, A.DimU - uTile);
 
-                    // CRITICAL OPTIMIZATION: Pre-cache ALL block IDs for this tile
-                    // This eliminates hundreds of BlockAt() calls during greedy merging
-                    TArray<EVoxelBlockID> BlockIDCache;
-                    BlockIDCache.SetNumUninitialized(uCount * A.DimV);
-
-                    // OPTIMIZATION: Build visibility masks AND cache block IDs in single pass
-                    // This avoids double lookups (once for visibility, once for merging)
+                    // OPTIMIZATION: Build visibility masks - no caching overhead
+                    // On-demand BlockAt() with VOXEL_LIKELY hints is fast enough
                     bool bTileHasAnyFaces = false;
                     for (int v = 0; v < A.DimV; ++v)
                     {
                         uint64 bits = 0ull;
-                        const int32 RowOffset = v * uCount;
-
                         for (int du = 0; du < uCount; ++du)
                         {
                             const int u = uTile + du;
                             const FIntVector P = MakePos(A.N, s, u, v);
                             const FIntVector Q = P + A.N;
-
-                            // Cache block ID for later use (single lookup!)
-                            BlockIDCache[RowOffset + du] = BlockAt(P.X, P.Y, P.Z);
 
                             const uint8 Ac = CatAt(P.X, P.Y, P.Z);
                             const uint8 Bc = CatAt(Q.X, Q.Y, Q.Z);
@@ -476,21 +466,22 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const int32 du0 = CountTrailingZeros64(row);
                             if (du0 >= 64) break;
 
-                            // Get base block ID from CACHE (not BlockAt!)
+                            // Get base block ID (on-demand lookup - fast with VOXEL_LIKELY hints)
                             const int32 u0 = uTile + du0;
-                            const int32 baseIdx = v * uCount + du0;
-                            const EVoxelBlockID baseBlockID = BlockIDCache[baseIdx];
+                            const FIntVector P0 = MakePos(A.N, s, u0, v);
+                            const EVoxelBlockID baseBlockID = BlockAt(P0.X, P0.Y, P0.Z);
 
                             // Count consecutive ones - but stop if block ID changes
-                            // OPTIMIZATION: Use CACHED block IDs (simple array lookup)
                             const uint64 run = row >> du0;
                             int32 w = 0;
                             uint64 temp = run;
 
                             while ((temp & 1ull) != 0ull && w < uCount - du0)
                             {
-                                // FAST: Array lookup instead of BlockAt() call!
-                                const EVoxelBlockID checkBlockID = BlockIDCache[baseIdx + w];
+                                // On-demand lookup (fast with inlining + branch hints)
+                                const int uCheck = u0 + w;
+                                const FIntVector PCheck = MakePos(A.N, s, uCheck, v);
+                                const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
 
                                 if (checkBlockID != baseBlockID)
                                     break; // Don't merge different block types
@@ -505,7 +496,6 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                             const uint64 colMask = (w >= 64) ? ~0ull : ((1ull << w) - 1);
 
                             // Find height - stop if block ID changes
-                            // OPTIMIZATION: Use CACHED block IDs (no BlockAt calls!)
                             int32 h = 1;
                             while ((v + h) < A.DimV)
                             {
@@ -513,13 +503,13 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                                 if (checkMask != colMask)
                                     break;
 
-                                // CRITICAL: Check all voxels in the row have same block ID
-                                // FAST: Use cached array instead of BlockAt()
+                                // Check all voxels in the row have same block ID (on-demand)
                                 bool blockIDMatches = true;
-                                const int32 nextRowOffset = (v + h) * uCount;
                                 for (int du = 0; du < w; ++du)
                                 {
-                                    const EVoxelBlockID checkBlockID = BlockIDCache[nextRowOffset + du0 + du];
+                                    const int uCheck = u0 + du;
+                                    const FIntVector PCheck = MakePos(A.N, s, uCheck, v + h);
+                                    const EVoxelBlockID checkBlockID = BlockAt(PCheck.X, PCheck.Y, PCheck.Z);
                                     if (checkBlockID != baseBlockID)
                                     {
                                         blockIDMatches = false;
