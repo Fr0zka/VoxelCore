@@ -565,42 +565,24 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
         BiomeData biome = Biomes[biomeIdx];
 
-        // Surface detection: A voxel is a "surface" if it has AIR adjacent to it
-        // We check neighbors by sampling densities (cheaper than reading category buffer)
-        // This correctly handles caves, overhangs, and chunk boundaries
-        bool hasAirAbove = false;
-        bool hasAirBelow = false;
+        // FIXED Surface detection: Use macro surface height M directly
+        // A voxel is a "surface" if it's the topmost solid voxel at the terrain surface
+        //
+        // The macro surface M is the continuous terrain height (float)
+        // The surface voxel is the one containing M: floor(M) <= Z <= ceil(M)
+        //
+        // This matches CPU logic without needing to check neighbors
+        // (CPU checks categories which we can't read here due to parallel writes)
 
-        // Check voxel above (Z+1)
-        if ((int)ThreadId.z + 1 < (int)SizeZ)
-        {
-            int WZ_Above = BaseWZ + ((int)ThreadId.z); // +1 from current -1 offset
-            float D_Above = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Above, M);
-            hasAirAbove = (D_Above <= 0.0);
-        }
-        else
-        {
-            // At top of chunk - check if we're at/above the macro surface
-            // If current voxel Z >= M, then there's air above
-            hasAirAbove = (WZ >= M);
-        }
+        float surfaceZ = M;  // Macro surface height for this XY column
+        float distFromSurface = Z - surfaceZ;
 
-        // Check voxel below (Z-1)
-        if ((int)ThreadId.z > 0)
-        {
-            int WZ_Below = BaseWZ + ((int)ThreadId.z - 2); // -1 from current -1 offset
-            float D_Below = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Below, M);
-            hasAirBelow = (D_Below <= 0.0);
-        }
-        else
-        {
-            // At bottom of chunk - assume solid below (bedrock)
-            hasAirBelow = false;
-        }
+        // A voxel is a surface if it's within 0.5 blocks of the macro surface
+        // This catches the topmost solid layer
+        bool isSurfaceVoxel = (distFromSurface >= -0.5 && distFromSurface <= 0.5);
 
         // Determine block type
-        // Use surface block ONLY if has air directly adjacent (true surface)
-        if (hasAirAbove || hasAirBelow)
+        if (isSurfaceVoxel)
         {
             // Surface voxel - use biome surface block (Grass, Sand, etc.)
             BlockID = biome.SurfaceBlock;
@@ -608,7 +590,7 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         else
         {
             // Interior voxel - use subsurface layers based on depth below surface M
-            float depthBelowSurface = M - Z;
+            float depthBelowSurface = surfaceZ - Z;
             BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
         }
     }
