@@ -565,20 +565,9 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
         BiomeData biome = Biomes[biomeIdx];
 
-        // IMPROVED Surface detection: Use macro surface height M to determine surface
-        // M is the terrain surface height for this X,Y column
-        // Instead of checking neighbors (which fails at chunk boundaries),
-        // check if this voxel is NEAR the surface (within 1-2 blocks)
-
-        // A voxel is a surface if:
-        // 1. It's solid (Category == 2)
-        // 2. It's within 1 block of the macro surface M
-
-        float distanceFromSurface = abs(Z - M);
-        bool isSurface = (distanceFromSurface <= 1.5); // Within 1.5 blocks of surface
-
-        // Also check if we're at a local surface by checking immediate neighbors
-        // This catches overhangs and floating islands
+        // Surface detection: A voxel is a "surface" if it has AIR adjacent to it
+        // We check neighbors by sampling densities (cheaper than reading category buffer)
+        // This correctly handles caves, overhangs, and chunk boundaries
         bool hasAirAbove = false;
         bool hasAirBelow = false;
 
@@ -591,8 +580,9 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         }
         else
         {
-            // At top of chunk - assume air above if we're above or near the macro surface
-            hasAirAbove = (WZ >= M - 1.0);
+            // At top of chunk - check if we're at/above the macro surface
+            // If current voxel Z >= M, then there's air above
+            hasAirAbove = (WZ >= M);
         }
 
         // Check voxel below (Z-1)
@@ -604,20 +594,20 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         }
         else
         {
-            // At bottom of chunk - assume solid below unless we're way below terrain
+            // At bottom of chunk - assume solid below (bedrock)
             hasAirBelow = false;
         }
 
         // Determine block type
-        // Use surface block if: near macro surface OR has air adjacent
-        if (isSurface || hasAirAbove || hasAirBelow)
+        // Use surface block ONLY if has air directly adjacent (true surface)
+        if (hasAirAbove || hasAirBelow)
         {
-            // Surface voxel - use biome surface block
+            // Surface voxel - use biome surface block (Grass, Sand, etc.)
             BlockID = biome.SurfaceBlock;
         }
         else
         {
-            // Interior voxel - use subsurface layers based on depth
+            // Interior voxel - use subsurface layers based on depth below surface M
             float depthBelowSurface = M - Z;
             BlockID = PickSubsurfaceBlock(biome, depthBelowSurface);
         }
