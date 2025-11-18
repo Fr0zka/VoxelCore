@@ -565,9 +565,20 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
 
         BiomeData biome = Biomes[biomeIdx];
 
-        // Surface detection: Check if this voxel has air above or below
-        // We need to sample the category buffer, but it's being written in parallel
-        // Instead, regenerate category for neighbors (cheaper than sync)
+        // IMPROVED Surface detection: Use macro surface height M to determine surface
+        // M is the terrain surface height for this X,Y column
+        // Instead of checking neighbors (which fails at chunk boundaries),
+        // check if this voxel is NEAR the surface (within 1-2 blocks)
+
+        // A voxel is a surface if:
+        // 1. It's solid (Category == 2)
+        // 2. It's within 1 block of the macro surface M
+
+        float distanceFromSurface = abs(Z - M);
+        bool isSurface = (distanceFromSurface <= 1.5); // Within 1.5 blocks of surface
+
+        // Also check if we're at a local surface by checking immediate neighbors
+        // This catches overhangs and floating islands
         bool hasAirAbove = false;
         bool hasAirBelow = false;
 
@@ -575,22 +586,31 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
         if ((int)ThreadId.z + 1 < (int)SizeZ)
         {
             int WZ_Above = BaseWZ + ((int)ThreadId.z); // +1 from current -1 offset
-            float M_Above = MacroSurfaceZ_Biome((float)WX, (float)WY);
-            float D_Above = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Above, M_Above);
-            hasAirAbove = (D_Above <= 0.0) || (WZ_Above > (int)WaterLevel && WZ_Above > M_Above + 10.0);
+            float D_Above = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Above, M);
+            hasAirAbove = (D_Above <= 0.0);
+        }
+        else
+        {
+            // At top of chunk - assume air above if we're above or near the macro surface
+            hasAirAbove = (WZ >= M - 1.0);
         }
 
         // Check voxel below (Z-1)
         if ((int)ThreadId.z > 0)
         {
             int WZ_Below = BaseWZ + ((int)ThreadId.z - 2); // -1 from current -1 offset
-            float M_Below = MacroSurfaceZ_Biome((float)WX, (float)WY);
-            float D_Below = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Below, M_Below);
+            float D_Below = Density3D_FromMacro_Biome((float)WX, (float)WY, (float)WZ_Below, M);
             hasAirBelow = (D_Below <= 0.0);
+        }
+        else
+        {
+            // At bottom of chunk - assume solid below unless we're way below terrain
+            hasAirBelow = false;
         }
 
         // Determine block type
-        if (hasAirAbove || hasAirBelow)
+        // Use surface block if: near macro surface OR has air adjacent
+        if (isSurface || hasAirAbove || hasAirBelow)
         {
             // Surface voxel - use biome surface block
             BlockID = biome.SurfaceBlock;

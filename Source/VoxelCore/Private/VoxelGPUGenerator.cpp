@@ -317,6 +317,12 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
                 Data.SubsurfaceLayers[i] = BlockID | (Thickness << 16);
             }
 
+            // DIAGNOSTIC: Log biome block data
+            UE_LOG(LogTemp, Warning, TEXT("[OPTION3] Biome '%s': Surface=%d, SubsurfaceLayers=%d"),
+                Biome->GetName(),
+                (int32)Biome->Surface,
+                Data.SubsurfaceLayerCount);
+
             BiomeDataArray.Add(Data);
         }
     }
