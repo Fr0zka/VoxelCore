@@ -162,6 +162,6 @@ private:
         float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
         float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
         const TArray<FGPUBiomeData>& BiomeDataArray,
-        TFunction<void(TArray<uint8>&&)> OnComplete);
+        TFunction<void(TArray<uint8>&&, TArray<EVoxelBlockID>&&)> OnComplete);  // OPTION 3: Updated signature
 };
 
