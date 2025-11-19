@@ -47,6 +47,12 @@ void UVoxelChunkComponent::InitializeChunk(
     bBuildCollision = bInBuildCollision;
     bUseAO = bInUseAO;
 
+    // DEBUG: Log chunk initialization
+    UE_LOG(LogVoxelChunk, Log, TEXT("[SPAWN] Chunk (%d,%d,%d) initialized | LOD: %d | Collision: %s"),
+        ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
+        (int32)LOD,
+        bBuildCollision ? TEXT("YES") : TEXT("NO"));
+
     LODScaleXY = (LOD == EVoxelLODLevel::LOD1) ? FMath::Max(1, Settings->LOD1_ScaleXY) : 1;
     RenderMode = (LOD == EVoxelLODLevel::LOD2) ? EVoxelRenderMode::Heightfield : EVoxelRenderMode::Voxels;
 
@@ -276,6 +282,12 @@ void UVoxelChunkComponent::DoGeneration()
 
 void UVoxelChunkComponent::OnGenerationComplete()
 {
+    // DEBUG: Log generation completion
+    UE_LOG(LogVoxelChunk, Log, TEXT("[GEN] Chunk (%d,%d,%d) generation complete | CatData: %d bytes | RenderMode: %d"),
+        ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz,
+        CategoryData.Data.Num(),
+        (int32)RenderMode);
+
     if (bCancelPending)
     {
         State = EVoxelChunkState::Unloading;
@@ -294,9 +306,11 @@ void UVoxelChunkComponent::OnGenerationComplete()
 
         const int32 TotalVoxels = CategoryData.SizeX * CategoryData.SizeY * CategoryData.SizeZ;
 
-        // Sample every N voxels for speed (checking all voxels is too slow for large chunks)
-        // Step of 4 means we check ~1/64th of voxels (still very accurate for uniform chunks)
-        const int32 Step = 4;
+        // CRITICAL FIX: Use Step=1 to check ALL voxels for accurate empty detection
+        // Previous Step=4 caused holes in sparse terrain by missing voxels between samples
+        // For 32^3 chunks this is only ~32K checks - negligible compared to meshing cost
+        // For dense terrain, the loop exits early on first non-air voxel (fast!)
+        const int32 Step = 1;
 
         for (int32 z = 0; z < CategoryData.SizeZ; z += Step)
         {
@@ -322,6 +336,13 @@ void UVoxelChunkComponent::OnGenerationComplete()
                     else
                     {
                         bIsSolid = false; // Has air - not solid
+
+                        // OPTIMIZATION: Early exit if we know it's not empty AND not solid
+                        // No point continuing to check if we already know we need full meshing
+                        if (!bIsEmpty && !bIsSolid)
+                        {
+                            goto BreakAllLoops;
+                        }
                     }
                 }
             }
@@ -331,11 +352,25 @@ void UVoxelChunkComponent::OnGenerationComplete()
         // OPTIMIZATION 1: Empty chunks (100% air)
         if (bIsEmpty)
         {
-            UE_LOG(LogVoxelChunk, Verbose, TEXT("[EmptyCull] Chunk (%d,%d,%d) is 100%% air - skipping mesh + collision"),
-                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz);
+            UE_LOG(LogVoxelChunk, Log, TEXT("[EmptyCull] Chunk (%d,%d,%d) is 100%% air - skipping mesh | CatData: %d bytes"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, CategoryData.Data.Num());
 
             // Disable collision for air chunks (massive performance save!)
             bBuildCollision = false;
+
+            // CRITICAL FIX: Clear mesh components for empty chunks
+            // This ensures components from the pool don't show old geometry
+            if (RMC)
+            {
+                if (URealtimeMesh* MeshAsset = RMC->GetRealtimeMesh())
+                {
+                    MeshAsset->Reset();
+                }
+            }
+            if (PMC)
+            {
+                PMC->ClearAllMeshSections();
+            }
 
             State = EVoxelChunkState::Ready;
             if (OwnerWorld) OwnerWorld->OnChunkReady(ChunkCoord);
@@ -677,7 +712,7 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
     UE::Tasks::Launch(UE_SOURCE_LOCATION,
         [this, WeakWorld, VoxelUU, bCollision, bAO, bSeamRemesh, W, SizeVox, ChunkSizeX, ChunkSizeY, XYScale,
         LODLevel, RenderModeValue, Voxels = MoveTemp(VoxelsCopy), Cats = MoveTemp(CatsExpanded), HCopy = MoveTemp(HeightsCopy),
-        SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings]() mutable
+        SamplesX, SamplesY, NbhCopy = MoveTemp(NbhCopy), SettingsPtr = Settings, Coord = ChunkCoord]() mutable
         {
             FMeshBuffers Buffers;
             const int32 Seq = BeginMeshingSequence();
@@ -794,8 +829,9 @@ void UVoxelChunkComponent::DoMeshing(bool bSeamRemesh)
                     const int32 VertCount = Buffers.Vertices.Num();
                     const int32 TriCount = Buffers.Triangles.Num() / 3;
 
-                    UE_LOG(LogVoxelChunk, Verbose, TEXT("[PROFILING] Meshing: %.2fms | Verts: %d | Tris: %d | ChunkSize: %dx%dx%d | LOD: %d | Mesher: %s"),
-                        MeshingMs, VertCount, TriCount, SizeVox.X, SizeVox.Y, SizeVox.Z, XYScale,
+                    UE_LOG(LogVoxelChunk, Log, TEXT("[MESH] Chunk (%d,%d,%d): %.2fms | Verts: %d | Tris: %d | Mesher: %s"),
+                        Coord.Cx, Coord.Cy, Coord.Cz,
+                        MeshingMs, VertCount, TriCount,
                         SettingsPtr && SettingsPtr->bUseBinaryGreedyMesher ? TEXT("Binary") : TEXT("Standard"));
                 }
             }
@@ -852,12 +888,16 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
         UVoxelMesher::ApplyToPMC(PMC, Bufs, bCollision);
     }
 
-    // CRITICAL FIX: Hide individual chunk components when batching is enabled
+    // CRITICAL FIX: Manage chunk component visibility based on batching mode
     // This must happen AFTER mesh apply (not at component acquisition) because
     // Settings may not be loaded yet when components are first created.
-    // Only buckets should be visible when batching is on.
-    if (Settings && Settings->bEnableChunkBatching)
+    // When batching is ON: Hide individual chunks (only buckets visible)
+    // When batching is OFF: Show individual chunks (no buckets)
+    const bool bBatchingEnabled = (Settings && Settings->bEnableChunkBatching);
+
+    if (bBatchingEnabled)
     {
+        // Batching ON: Hide individual chunk components
         if (RMC)
         {
             RMC->SetVisibility(false, true);
@@ -867,6 +907,33 @@ void UVoxelChunkComponent::ApplyBuffersToMesh(const FMeshBuffers& Bufs, bool bCo
         {
             PMC->SetVisibility(false, true);
             PMC->SetHiddenInGame(true, true);
+        }
+    }
+    else
+    {
+        // Batching OFF: Show individual chunk components
+        // CRITICAL: This fixes holes when batching is disabled or toggled off
+        // Components from the pool might have been previously hidden
+        const bool bHasGeometry = (Bufs.Vertices.Num() > 0 && Bufs.Triangles.Num() >= 3);
+
+        if (RMC)
+        {
+            // Only show if chunk has geometry
+            RMC->SetVisibility(bHasGeometry, true);
+            RMC->SetHiddenInGame(!bHasGeometry, true);
+        }
+        if (PMC)
+        {
+            // Only show if chunk has geometry
+            PMC->SetVisibility(bHasGeometry, true);
+            PMC->SetHiddenInGame(!bHasGeometry, true);
+        }
+
+        // Debug log for chunks with geometry but still invisible
+        if (bHasGeometry && RMC && !RMC->IsVisible())
+        {
+            UE_LOG(LogVoxelChunk, Warning, TEXT("[VISIBILITY BUG] Chunk (%d,%d,%d) has geometry (%d verts) but RMC invisible!"),
+                ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, Bufs.Vertices.Num());
         }
     }
 
@@ -944,6 +1011,13 @@ void UVoxelChunkComponent::OnMeshApplied(TUniquePtr<FMeshBuffers>&& AppliedBuffe
         {
             OwnerWorld->OnChunkReady(ChunkCoord);
         }
+    }
+    else if (bWasSeamRemesh && OwnerWorld)
+    {
+        // CRITICAL FIX: For seam remeshes, mark bucket dirty since mesh data changed
+        // OnChunkReady is not called for seam remeshes, so we need to explicitly
+        // mark the bucket dirty here so it gets rebuilt with the updated mesh
+        OwnerWorld->MarkBucketDirty(ChunkCoord);
     }
 
     // If a seam remesh was queued while we were meshing, start it now.
