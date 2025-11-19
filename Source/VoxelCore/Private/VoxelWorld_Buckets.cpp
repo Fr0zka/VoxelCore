@@ -10,7 +10,10 @@
 #include "RealtimeMeshComponent.h"
 #include "RealtimeMeshSimple.h"
 #include "ProceduralMeshComponent.h"
-#include "RealtimeMeshCore.h"
+#include "Core/RealtimeMeshBuilder.h"
+#include "Core/RealtimeMeshDataStream.h"
+#include "Mesh/RealtimeMeshAlgo.h"
+
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelBuckets, Log, All);
 
@@ -355,10 +358,10 @@ void AVoxelWorld::RebuildBucketMesh(FVoxelChunkBucket* Bucket)
 		const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
 
 		// Build stream set from merged buffers (using existing helper function)
-		FRealtimeMeshStreamSet Streams;
+		RealtimeMesh::FRealtimeMeshStreamSet Streams;
 		{
 			using FIndexType = uint32;
-			TRealtimeMeshBuilderLocal<FIndexType, FPackedNormal, FVector2DHalf, 1> Builder(Streams);
+			RealtimeMesh::TRealtimeMeshBuilderLocal<FIndexType, FPackedNormal, FVector2DHalf, 1> Builder(Streams);
 
 			const int32 NumV = MergedBuffers.Vertices.Num();
 			const bool bHaveNormals = (MergedBuffers.Normals.Num() == NumV);

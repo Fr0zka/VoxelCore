@@ -606,8 +606,9 @@ void UVoxelMesher::BuildTrueBinaryGreedyMesh(
                                 const int32 rowBaseIdx = LinearIndex(PRowBase.X, PRowBase.Y, PRowBase.Z);
 
                                 // OPTIMIZATION: Use stride for consecutive voxels in same row
-                                // All voxels in a row differ by +1 in the fastest-changing dimension
-                                const int32 stride = (A.N.X != 0) ? 1 : (A.N.Y != 0) ? SX : (SX * SY);
+                                // Stride is based on U direction (width), not normal direction
+                                // U along X: stride=1, U along Y: stride=SX, U along Z: stride=SX*SY
+                                const int32 stride = (A.U.X != 0) ? 1 : (A.U.Y != 0) ? SX : (SX * SY);
 
                                 bool blockIDMatches = true;
                                 for (int du = 0; du < w; ++du)

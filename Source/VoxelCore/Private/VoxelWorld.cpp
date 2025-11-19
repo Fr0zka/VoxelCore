@@ -268,7 +268,7 @@ void AVoxelWorld::DrainApplyQueue()
 		ToRemoveIndices.Sort();
 		for (int32 i = ToRemoveIndices.Num() - 1; i >= 0; --i)
 		{
-			ApplyQueue.RemoveAtSwap(ToRemoveIndices[i], 1, false);
+			ApplyQueue.RemoveAtSwap(ToRemoveIndices[i], EAllowShrinking::No);
 		}
 	}
 
@@ -459,7 +459,7 @@ TWeakObjectPtr<UVoxelChunkComponent> AVoxelWorld::PopClosest(TMap<int32, TArray<
 		// Pop invalid/stale entries until we find a valid one
 		while (Bucket.Num() > 0)
 		{
-			TWeakObjectPtr<UVoxelChunkComponent> Candidate = Bucket.Pop(false);
+			TWeakObjectPtr<UVoxelChunkComponent> Candidate = Bucket.Pop(EAllowShrinking::No);
 			if (UVoxelChunkComponent* C = Candidate.Get())
 			{
 				// Found a live chunk - remove bucket if now empty
@@ -630,7 +630,7 @@ UProceduralMeshComponent* AVoxelWorld::AcquirePMC(bool bForBucket)
 	// Try to reuse from pool first
 	if (PMCPool.Num() > 0)
 	{
-		PMC = PMCPool.Pop(false);
+		PMC = PMCPool.Pop(EAllowShrinking::No);
 	}
 	else
 	{
@@ -674,7 +674,7 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC(bool bForBucket)
 	// Try to reuse from pool first
 	if (RMCPool.Num() > 0)
 	{
-		RMC = RMCPool.Pop(false);
+		RMC = RMCPool.Pop(EAllowShrinking::No);
 	}
 	else
 	{
@@ -716,7 +716,7 @@ URealtimeMeshComponent* AVoxelWorld::AcquireRMC(bool bForBucket)
 	// (avoids lock-destruction assert when pooling)
 	if (URealtimeMesh* MeshAsset = RMC->GetRealtimeMesh())
 	{
-		MeshAsset->Reset(false);
+		MeshAsset->Reset();
 	}
 
 	return RMC;
@@ -729,7 +729,7 @@ void AVoxelWorld::ReleaseRMC(URealtimeMeshComponent* RMC)
 	// Clear mesh data before pooling (do not recreate shared resources while locked)
 	if (URealtimeMesh* MeshAsset = RMC->GetRealtimeMesh())
 	{
-		MeshAsset->Reset(false);
+		MeshAsset->Reset();
 	}
 
 	// Hide and disable collision
@@ -1546,6 +1546,11 @@ void AVoxelWorld::OnChunkReady(const FVoxelCoord& Coord)
 			}
 		}
 	}
+
+	// CRITICAL FIX: Mark bucket dirty when chunk becomes Ready
+	// This ensures the chunk gets included in the bucket mesh even if the bucket
+	// was previously rebuilt while this chunk was still generating/meshing
+	MarkBucketDirty(Coord);
 }
 
 void AVoxelWorld::EnqueueMeshApply(UVoxelChunkComponent* Chunk, FMeshBuffers&& Buffers, bool bCreateCollision, bool bWasSeamRemesh, int32 Sequence)

@@ -3,7 +3,9 @@
 #include "ProceduralMeshComponent.h"
 
 #include "RealtimeMeshComponent.h"
-#include <RealtimeMeshSimple.h>
+#include "RealtimeMeshSimple.h"
+#include "Core/RealtimeMeshBuilder.h"
+#include "Core/RealtimeMeshDataStream.h"
 #include "VoxelGPUMesher.h"
 #include "VoxelSettings.h"
 #include "HAL/IConsoleManager.h"
@@ -712,10 +714,10 @@ void UVoxelMesher::ApplyToPMC(
 
 static void BuildStreamSetFromBuffers(
     const FMeshBuffers& Bufs,
-    FRealtimeMeshStreamSet& OutStreams)
+    RealtimeMesh::FRealtimeMeshStreamSet& OutStreams)
 {
     using FIndexType = uint32;
-    TRealtimeMeshBuilderLocal<FIndexType, FPackedNormal, FVector2DHalf, 1> Builder(OutStreams);
+    RealtimeMesh::TRealtimeMeshBuilderLocal<FIndexType, FPackedNormal, FVector2DHalf, 1> Builder(OutStreams);
 
     const int32 NumV = Bufs.Vertices.Num();
     const bool bHaveNormals = (Bufs.Normals.Num() == NumV);
@@ -808,7 +810,7 @@ void UVoxelMesher::ApplyToRMC(
                     return;
                 }
 
-                FRealtimeMeshStreamSet Streams;
+                RealtimeMesh::FRealtimeMeshStreamSet Streams;
                 BuildStreamSetFromBuffers(Bufs, Streams);
 
                 MeshAsset->CreateSectionGroup(GroupKey, MoveTemp(Streams))

@@ -141,6 +141,8 @@ public:
 	/** Check if world is shutting down (used by chunks to cancel async operations). */
 	FORCEINLINE bool IsShuttingDown() const { return bShuttingDown.Load(); }
 
+	/** Mark bucket dirty when chunk changes */
+	void MarkBucketDirty(const FVoxelCoord& ChunkCoord);
 private:
 	// ==================== CHUNK STORAGE ====================
 
@@ -214,6 +216,7 @@ private:
 
 	/** Bucket manager helper */
 	FVoxelBucketManager BucketManager;
+
 
 private:
 	// ==================== INTERNAL HELPERS ====================
@@ -292,9 +295,6 @@ private:
 
 	/** Get or create bucket for given chunk coordinate */
 	struct FVoxelChunkBucket* GetOrCreateBucket(const FVoxelCoord& ChunkCoord);
-
-	/** Mark bucket dirty when chunk changes */
-	void MarkBucketDirty(const FVoxelCoord& ChunkCoord);
 
 	/** Rebuild all dirty buckets (merge chunk meshes) */
 	void RebuildDirtyBuckets();
