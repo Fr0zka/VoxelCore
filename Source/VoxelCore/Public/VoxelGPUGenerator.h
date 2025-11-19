@@ -30,7 +30,8 @@ class VOXELCORE_API FVoxelGPUGenerator
 {
 public:
     /**
-     * Generate voxel chunk categories using GPU compute shader.
+     * Generate voxel chunk categories AND BiomeGrid2D using GPU compute shader.
+     * OPTION B: GPU generates Categories + BiomeGrid, CPU generates blocks
      *
      * @param Coord - Chunk coordinate
      * @param SizeX/Y/Z - Chunk dimensions (LOD-scaled + halo)
@@ -40,8 +41,9 @@ public:
      * @param BaseHeight - Base terrain height
      * @param WaterLevel - Water level cutoff
      * @param MaxCaveDepth - Maximum cave depth (performance optimization)
-     * @param BiomeParams - Biome-specific terrain parameters
-     * @param OnComplete - Callback when generation complete (receives category data)
+     * @param BiomeTable - Biome definitions (terrain params + block types)
+     * @param NoiseProfile - Climate noise parameters
+     * @param OnComplete - Callback when generation complete (receives category + BiomeGrid data)
      */
     static void GenerateChunkGPU(
         const FVoxelCoord& Coord,
@@ -54,7 +56,7 @@ public:
         int32 MaxCaveDepth,
         const class UVoxelBiomeTable* BiomeTable,
         const class UVoxelNoiseProfile* NoiseProfile,
-        TFunction<void(TArray<uint8>&&)> OnComplete);
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete);
 
     /**
      * Check if GPU generation is available on this platform.
@@ -115,15 +117,23 @@ private:
         float CaveGain2D;
         float CaveFrequency3D;
         int32 CaveOctaves3D;
+
+        // No block data needed - OPTION B generates BiomeGrid on GPU, blocks on CPU
     };
     /**
      * GPU generation job - tracks pending async readback.
+     * OPTION B: Tracks category and BiomeGrid readbacks
      */
     struct FGPUGenerationJob
     {
-        TUniquePtr<FRHIGPUBufferReadback> Readback;
-        int32 BufferSizeBytes = 0;
-        TFunction<void(TArray<uint8>&&)> OnComplete;
+        TUniquePtr<FRHIGPUBufferReadback> CategoryReadback;
+        TUniquePtr<FRHIGPUBufferReadback> BiomeGridReadback;  // OPTION B: BiomeGrid data
+        int32 CategoryBufferSizeBytes = 0;
+        int32 BiomeGridBufferSizeBytes = 0;  // OPTION B: BiomeGrid size
+        int32 BiomeGridSizeX = 0;  // Needed for unpacking
+        int32 BiomeGridSizeY = 0;  // Needed for unpacking
+        const UVoxelBiomeTable* BiomeTable = nullptr;  // Needed to map BiomeIndex → BiomeDef*
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete;  // OPTION B: Updated signature
     };
 
     // Pending GPU generation jobs (polled each frame)
@@ -145,6 +155,7 @@ private:
         float TempBaseFreq, int32 TempOctaves, float TempLacunarity, float TempGain, float TempWarpStrength, int32 TempSeedOffset,
         float MoistBaseFreq, int32 MoistOctaves, float MoistLacunarity, float MoistGain, float MoistWarpStrength, int32 MoistSeedOffset,
         const TArray<FGPUBiomeData>& BiomeDataArray,
-        TFunction<void(TArray<uint8>&&)> OnComplete);
+        const UVoxelBiomeTable* BiomeTable,
+        TFunction<void(TArray<uint8>&&, FBiomeGrid2D&&)> OnComplete);  // OPTION B: Updated signature
 };
 

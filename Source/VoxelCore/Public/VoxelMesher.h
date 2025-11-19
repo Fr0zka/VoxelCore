@@ -94,8 +94,11 @@ public:
      * by block category (semi‑solid vs solid) and will generate quads only
      * within each category.  It can provide a modest speedup over the
      * standard greedy mesher on dense chunks.
+     *
+     * OPTIMIZATION: Now accepts pre-computed Cats array to eliminate conversion overhead.
      */
     static void BuildBinaryGreedyMesh(
+        const TArray<uint8>& Cats,               // Pre-computed categories (0=air,1=semi,2=solid)
         const TArray<EVoxelBlockID>& Voxels,
         const FIntVector& Size,
         const FChunkNeighbors* Neighbors,

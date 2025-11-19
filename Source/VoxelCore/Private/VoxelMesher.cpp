@@ -575,6 +575,7 @@ void UVoxelMesher::BuildGreedyMesh(
 //=== Binary Greedy Mesher ===//
 
 void UVoxelMesher::BuildBinaryGreedyMesh(
+    const TArray<uint8>& Cats,
     const TArray<EVoxelBlockID>& Voxels,
     const FIntVector& Size,
     const FChunkNeighbors* Nbh,
@@ -584,13 +585,9 @@ void UVoxelMesher::BuildBinaryGreedyMesh(
     const class UVoxelBlockTable* BlockTable,
     FMeshBuffers& Out)
 {
-    const int32 N = Size.X * Size.Y * Size.Z;
-    TArray<uint8> Cats; Cats.SetNumUninitialized(N);
-    for (int32 i = 0; i < N; ++i)
-        Cats[i] = VoxelBlockCategory(Voxels[i]);
-
-    // Use OLD binary greedy mesher (simpler and faster)
-    BuildBinaryGreedyMesh_Cats(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+    // OPTIMIZATION: Use pre-computed Cats array (eliminates 32K+ conversion loop)
+    // Now directly call TrueBinaryMesher
+    BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
 }
 
 void UVoxelMesher::BuildHeightfieldMesh(

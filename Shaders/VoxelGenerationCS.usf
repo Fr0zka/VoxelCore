@@ -52,6 +52,8 @@ struct BiomeData
     float CaveGain2D;
     float CaveFrequency3D;
     int CaveOctaves3D;
+
+    // OPTION B: No block data needed (blocks generated on CPU)
 };
 
 // Chunk dimensions
@@ -95,6 +97,10 @@ uint BiomeCount;
 
 // Output buffer - voxel categories (2 bits per voxel packed into bytes)
 RWStructuredBuffer<uint> OutCategories;
+
+// OPTION B: Output buffer - BiomeGrid2D data per XY column
+// Packed format per column: lower 16 bits = SurfaceZWorld (int16), upper 16 bits = BiomeIndex (uint8)
+RWStructuredBuffer<uint> OutBiomeGrid;
 
 // ============================================================================
 // GENERATION FUNCTIONS
@@ -373,6 +379,55 @@ float Density3D_FromMacro_Biome(float x, float y, float zWorld, float macroHeigh
     return D;
 }
 
+// Pick subsurface block based on depth below surface
+uint PickSubsurfaceBlock(BiomeData biome, float depthBelowSurface)
+{
+    // Default to stone if no layers defined
+    if (biome.SubsurfaceLayerCount == 0)
+        return 3; // EVoxelBlockID::Stone
+
+    int accumulated = 0;
+    for (int i = 0; i < biome.SubsurfaceLayerCount; ++i)
+    {
+        uint packed = biome.SubsurfaceLayers[i];
+        uint blockID = packed & 0xFFFF;
+        int thickness = (int)(packed >> 16);
+
+        accumulated += max(0, thickness);
+        if (depthBelowSurface <= (float)accumulated)
+            return blockID;
+    }
+
+    // Beyond all layers: use last layer's block
+    uint lastPacked = biome.SubsurfaceLayers[biome.SubsurfaceLayerCount - 1];
+    return lastPacked & 0xFFFF;
+}
+
+// Compute actual surface Z by raymarching (replicates GenerateBiomeGrid2D logic)
+// This finds the topmost solid voxel, not just the continuous macro surface
+// Returns world Z coordinate of surface
+float ComputeSurfaceZWorld(float WX, float WY, float macroSurface, BiomeData biome)
+{
+    // Replicate CPU logic from GenerateBiomeGrid2D lines 624-637
+    // Scan a small window around Macro: from Macro+8 down to Macro-16
+    // Find first solid voxel from above
+
+    float bestZ = macroSurface; // default if none found
+
+    // Scan downward from above macro surface
+    for (float z = macroSurface + 8.0; z >= macroSurface - 16.0; z -= 1.0)
+    {
+        float D = Density3D_FromMacro_Biome(WX, WY, z, macroSurface);
+        if (D > 0.0)
+        {
+            bestZ = z; // First solid from above
+            break;
+        }
+    }
+
+    return bestZ;
+}
+
 // ============================================================================
 // MAIN COMPUTE SHADER
 // ============================================================================
@@ -387,13 +442,34 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // Compute world position (accounting for -1 halo padding)
     // ThreadId ranges from [0, SizeX-1] but represents voxel indices [-1, SizeX-2]
     // BaseWX/Y/Z = world coordinate of chunk origin (voxel index 0)
+
+    // CRITICAL FIX: Use UNCLAMPED coordinates for padding voxels
+    // Padding must use true world coordinates to match adjacent chunks
+    // Clamping causes biome/surface mismatches at chunk boundaries → holes
     int WX = BaseWX + ((int)ThreadId.x - 1) * (int)LODScaleXY;
     int WY = BaseWY + ((int)ThreadId.y - 1) * (int)LODScaleXY;
     int WZ = BaseWZ + ((int)ThreadId.z - 1);
 
+    // Use same coordinates for both BiomeGrid and voxel generation
+    int WX_BiomeGrid = WX;
+    int WY_BiomeGrid = WY;
+
     float Z = (float)WZ;
 
     uint Category = 0;
+
+    // ========================================================================
+    // PRE-COMPUTE BIOME DATA (needed for both category generation and BiomeGrid)
+    // ========================================================================
+    // Sample climate and pick biome for this XY position using CLAMPED coordinates
+    // This matches CPU's clamping behavior for BiomeGrid generation
+    float Temp, Moist;
+    SampleClimate((float)WX_BiomeGrid, (float)WY_BiomeGrid, Temp, Moist);
+    int biomeIdx = PickBiome(Temp, Moist);
+    BiomeData biome = Biomes[biomeIdx];
+
+    // Compute macro surface height using CLAMPED coordinates (needed for BiomeGrid)
+    float M = MacroSurfaceZ_Biome((float)WX_BiomeGrid, (float)WY_BiomeGrid);
 
     // ========================================================================
     // DEBUG MODE OPTIONS:
@@ -445,15 +521,7 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // ========================================================================
     // FULL GENERATION (production code)
     // ========================================================================
-
-    // Compute macro surface height
-    float M = MacroSurfaceZ_Biome((float)WX, (float)WY);
-
-    // Sample climate and pick biome for narrow band optimization
-    float Temp, Moist;
-    SampleClimate((float)WX, (float)WY, Temp, Moist);
-    int biomeIdx = PickBiome(Temp, Moist);
-    BiomeData biome = Biomes[biomeIdx];
+    // Note: biomeIdx, biome, and M are pre-computed above before DEBUG_MODE blocks
 
     // Compute margin for narrow band optimization using biome-specific parameters
     float Margin = biome.OverhangAmplitude + biome.IslandAmplitude + 3.0;
@@ -522,5 +590,27 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     {
         uint Value = Category << BitOffset;
         InterlockedOr(OutCategories[Uint32Index], Value);
+    }
+
+    // ========================================================================
+    // OPTION B: BIOME GRID 2D GENERATION (per XY column, not per voxel)
+    // ========================================================================
+    // Only the first thread in each XY column computes BiomeGrid data
+    // This dramatically reduces work: SizeX*SizeY columns instead of SizeX*SizeY*SizeZ voxels
+    if (ThreadId.z == 0)
+    {
+        // Use pre-computed biomeIdx, biome, and M (computed above with CLAMPED coordinates)
+        // ComputeSurfaceZWorld by raymarching to find actual topmost solid voxel
+        // Uses CLAMPED coordinates to match CPU BiomeGrid generation
+        float SurfaceZWorld = ComputeSurfaceZWorld((float)WX_BiomeGrid, (float)WY_BiomeGrid, M, biome);
+
+        // Pack BiomeGrid data: lower 16 bits = SurfaceZWorld (signed int16), upper 16 bits = BiomeIndex (uint8)
+        int surfaceZ = (int)clamp(SurfaceZWorld, -32768.0, 32767.0);
+        uint biomeIndex = (uint)clamp(biomeIdx, 0, 255);
+
+        uint BiomeGridIndex = ThreadId.x + ThreadId.y * SizeX;
+        uint PackedValue = ((uint)surfaceZ & 0xFFFF) | ((biomeIndex & 0xFF) << 16);
+
+        OutBiomeGrid[BiomeGridIndex] = PackedValue;
     }
 }

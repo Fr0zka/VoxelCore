@@ -45,16 +45,11 @@ void AVoxelWorld::BeginPlay()
 	Super::BeginPlay();
 
 	// CRITICAL: Check if Settings class is assigned
-	UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BeginPlay called - checking Settings..."));
-
 	if (!Settings)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] CRITICAL ERROR: Settings class is NULL!"));
-		UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] Please assign a VoxelSettings class in the VoxelWorld actor details panel!"));
+		UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] CRITICAL ERROR: Settings class is NULL! Please assign VoxelSettings in actor details panel!"));
 		return;
 	}
-
-	UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Settings class is assigned: %s"), *Settings->GetName());
 
 	// Prewarm mesh component pool (reduces allocation hitches during gameplay)
 	if (const UVoxelSettings* S = Settings.GetDefaultObject())
@@ -89,25 +84,7 @@ void AVoxelWorld::BeginPlay()
 			}
 		}
 
-		// ALWAYS log batching status (unconditional - for debugging)
-		UE_LOG(LogTemp, Warning, TEXT("========================================"));
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BeginPlay - Settings object: %s"), S ? TEXT("VALID") : TEXT("NULL"));
-		if (S)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] bEnableChunkBatching = %s"), S->bEnableChunkBatching ? TEXT("TRUE") : TEXT("FALSE"));
-			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] ChunkBucketSize = %d"), S->ChunkBucketSize);
-			UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] bUseRuntimeMeshComponent = %s"), S->bUseRuntimeMeshComponent ? TEXT("TRUE") : TEXT("FALSE"));
-
-			if (S->bEnableChunkBatching)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Chunk batching ENABLED - individual chunks will be HIDDEN"));
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] Chunk batching DISABLED - normal rendering"));
-			}
-		}
-		UE_LOG(LogTemp, Warning, TEXT("========================================"));
+		// Batching status logging removed for performance
 	}
 
 	// Initial chunk loading
@@ -348,16 +325,7 @@ void AVoxelWorld::PromoteReadyPendings()
 {
 	SCOPE_CYCLE_COUNTER(STAT_VoxelPromotePendings);
 
-	// DEBUG: Log promotion flow (first 10 frames only)
-	static int32 PromotionFrameCount = 0;
-	const bool bShouldLog = (PromotionFrameCount < 10);
-
-	if (bShouldLog)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] Frame %d: PendingChunks=%d, ActiveChunks=%d"),
-			PromotionFrameCount, PendingChunks.Num(), ActiveChunks.Num());
-		PromotionFrameCount++;
-	}
+	// Promotion flow (debug logs removed for performance)
 
 	// Promote chunks (LOD0/1)
 	{
@@ -379,32 +347,6 @@ void AVoxelWorld::PromoteReadyPendings()
 			{
 				ToPromote.Add(Coord);
 			}
-		}
-
-		// DEBUG: Log promotion stats
-		if (bShouldLog && ToPromote.Num() > 0)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] Found %d ready chunks to promote"), ToPromote.Num());
-		}
-		else if (bShouldLog && PendingChunks.Num() > 0 && ToPromote.Num() == 0)
-		{
-			// Show chunk states to debug why nothing is ready
-			int32 CountGenerating = 0, CountMeshing = 0, CountEmpty = 0, CountUnloading = 0;
-			for (const auto& Pair : PendingChunks)
-			{
-				if (Pair.Value)
-				{
-					switch (Pair.Value->State)
-					{
-						case EVoxelChunkState::Generating: CountGenerating++; break;
-						case EVoxelChunkState::Meshing: CountMeshing++; break;
-						case EVoxelChunkState::Empty: CountEmpty++; break;
-						case EVoxelChunkState::Unloading: CountUnloading++; break;
-					}
-				}
-			}
-			UE_LOG(LogTemp, Warning, TEXT("[DEBUG PROMOTE] No ready chunks! States: Generating=%d, Meshing=%d, Empty=%d, Unloading=%d"),
-				CountGenerating, CountMeshing, CountEmpty, CountUnloading);
 		}
 
 		for (const FVoxelCoord& Coord : ToDrop)
@@ -556,8 +498,6 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 		{
 			// GPU saturated - queue for later
 			GenWaitByDistance.FindOrAdd(Chunk->PriorityDist2).Add(Chunk);
-			UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] GPU SATURATED (%d,%d,%d) - PendingGPUJobs=%d, MaxGPUJobs=%d, Queued"),
-				Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, PendingGPUJobs, MaxGPUJobs);
 			return;
 		}
 	}
@@ -566,24 +506,12 @@ void AVoxelWorld::ScheduleGeneration(UVoxelChunkComponent* Chunk)
 	if (ActiveGenTasks < MaxGen)
 	{
 		++ActiveGenTasks;
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
-			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		Chunk->DoGeneration();
 		return;
 	}
 
 	// Slow path: queue by distance-squared (closer chunks prioritized)
 	GenWaitByDistance.FindOrAdd(Chunk->PriorityDist2).Add(Chunk);
-
-	// DEBUG: Log queue growth
-	static int32 LastQueueSize = 0;
-	const int32 CurrentQueueSize = GenWaitByDistance.Num();
-	if (CurrentQueueSize > LastQueueSize && CurrentQueueSize % 10 == 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] QUEUED (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d (GROWING!)"),
-			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, ActiveGenTasks, CurrentQueueSize);
-		LastQueueSize = CurrentQueueSize;
-	}
 }
 
 void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* Chunk)
@@ -616,23 +544,9 @@ void AVoxelWorld::OnGenerationFinished(UVoxelChunkComponent* Chunk)
 		}
 	}
 
-	// DEBUG: Log completion
-	if (Chunk)
-	{
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] FINISH (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
-			Chunk->ChunkCoord.Cx, Chunk->ChunkCoord.Cy, Chunk->ChunkCoord.Cz, NewActiveCount, QueueSize);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[GenQueue] FINISH (NULL chunk!) - ActiveGenTasks=%d, QueueSize=%d"),
-			NewActiveCount, QueueSize);
-	}
-
 	// Launch task outside lock (DoGeneration may enqueue callbacks)
 	if (UVoxelChunkComponent* N = Next.Get())
 	{
-		UE_LOG(LogTemp, Verbose, TEXT("[GenQueue] START (%d,%d,%d) - ActiveGenTasks=%d, QueueSize=%d"),
-			N->ChunkCoord.Cx, N->ChunkCoord.Cy, N->ChunkCoord.Cz, ActiveGenTasks, GenWaitByDistance.Num());
 		N->DoGeneration();
 	}
 }
@@ -1122,17 +1036,6 @@ void AVoxelWorld::UpdateChunks()
 	const int32 TotalChunks = ActiveChunks.Num() + PendingChunks.Num();
 	const bool bAllChunksLoaded = (TotalChunks >= Desired.Num());  // FIXED: Compare actual counts!
 
-	// DEBUG: Log why we might skip update
-	static int32 SkipLogCounter = 0;
-	if (++SkipLogCounter >= 60)
-	{
-		SkipLogCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] UpdateChunks: R2=%d, RzUp=%d, RzDown=%d, Desired=%d, Active=%d, Pending=%d, StandingStill=%s, AllLoaded=%s"),
-			R2, RzUp, RzDown, Desired.Num(), ActiveChunks.Num(), PendingChunks.Num(),
-			bPlayerStandingStill ? TEXT("YES") : TEXT("NO"),
-			bAllChunksLoaded ? TEXT("YES") : TEXT("NO"));
-	}
-
 	if (bPlayerStandingStill && bAllChunksLoaded)
 	{
 		// Player standing still, all chunks loaded - nothing to do!
@@ -1149,15 +1052,6 @@ void AVoxelWorld::UpdateChunks()
 	const int32 MaxChunksToCheckPerFrame = S->MaxChunksToCheckPerFrame; // Now configurable in editor!
 	int32 ChunksCheckedThisFrame = 0;
 
-	// DEBUG: Log spawn progress
-	static int32 SpawnLogCounter = 0;
-	if (++SpawnLogCounter >= 60)
-	{
-		SpawnLogCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] ProcessDesired: SpawnBudget=%d, MaxCheck=%d, Desired.Num=%d"),
-			SpawnBudget, MaxChunksToCheckPerFrame, Desired.Num());
-	}
-
 	// OPTIMIZATION: Process desired chunks (sorted by priority)
 	for (const auto& Pair : Desired)
 	{
@@ -1167,6 +1061,14 @@ void AVoxelWorld::UpdateChunks()
 		const int32 dy = C.Cy - CenterChunk.Cy;
 		const int32 dz = C.Cz - CenterChunk.Cz;
 		const int32 d2 = dx * dx + dy * dy + dz * dz;
+
+		// CRITICAL FIX: Convert Priority to queue priority (lower value = higher priority in queue)
+		// Pair.Value is Priority from frustum calculation [0.0 ... 2.0]
+		// - Priority 2.0 = chunk in frustum, very close → QueuePriority 0 (highest priority)
+		// - Priority 1.0 = close chunk, not in frustum → QueuePriority 100000
+		// - Priority 0.0 = far chunk → QueuePriority 200000 (lowest priority)
+		// This ensures chunks IN FRONT of you always generate before chunks BEHIND you
+		const int32 QueuePriority = (int32)((2.0f - Pair.Value) * 100000.0f);
 
 		const EVoxelLODLevel DesiredLOD = PickLOD(d2, S);
 
@@ -1285,8 +1187,9 @@ void AVoxelWorld::UpdateChunks()
 		}
 
 		// Update priority distances if chunk exists
-		if (Active)  Active->PriorityDist2 = d2;
-		if (Pending) Pending->PriorityDist2 = d2;
+		// CRITICAL: Use QueuePriority (frustum-aware) instead of d2 (distance only)
+		if (Active)  Active->PriorityDist2 = QueuePriority;
+		if (Pending) Pending->PriorityDist2 = QueuePriority;
 
 		// CASE 1: NEW CHUNK - Neither Active nor Pending exists
 		if (!Active && !Pending)
@@ -1302,7 +1205,8 @@ void AVoxelWorld::UpdateChunks()
 				UVoxelChunkComponent* Chunk = NewObject<UVoxelChunkComponent>(this);
 				Chunk->RegisterComponent();
 				AddInstanceComponent(Chunk);
-				Chunk->PriorityDist2 = d2;
+				// CRITICAL: Use QueuePriority (frustum-aware) for proper generation ordering
+				Chunk->PriorityDist2 = QueuePriority;
 
 				Chunk->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 				PendingChunks.Add(C, Chunk);  // Start as PENDING, promote to Active when ready
@@ -1384,7 +1288,8 @@ void AVoxelWorld::UpdateChunks()
 					UVoxelChunkComponent* NewP = NewObject<UVoxelChunkComponent>(this);
 					NewP->RegisterComponent();
 					AddInstanceComponent(NewP);
-					NewP->PriorityDist2 = d2;
+					// CRITICAL: Use QueuePriority (frustum-aware) for proper generation ordering
+					NewP->PriorityDist2 = QueuePriority;
 
 					NewP->InitializeChunk(C, S, this, DesiredLOD, bDesiredCollision0, bDesiredAO);
 					PendingChunks.Add(C, NewP);
@@ -1414,16 +1319,6 @@ void AVoxelWorld::UpdateChunks()
 		}
 	}
 
-	// DEBUG: Log spawn results
-	static int32 ResultLogCounter = 0;
-	if (++ResultLogCounter >= 60)
-	{
-		ResultLogCounter = 0;
-		UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] SpawnResults: Spawned=%d/%d, Checked=%d/%d, Missing=%d, NeedsMore=%s"),
-			ChunksSpawnedThisFrame, SpawnBudget, ChunksCheckedThisFrame, MaxChunksToCheckPerFrame,
-			MissingChunks, bNeedsMoreSpawning ? TEXT("YES") : TEXT("NO"));
-	}
-
 	// Track initial load progress
 	if (MissingChunks > 0 && ChunksSpawnedThisFrame >= SpawnBudget)
 	{
@@ -1440,22 +1335,6 @@ void AVoxelWorld::UpdateChunks()
 		{
 			bNeedsMoreSpawning = false;
 			bInitialLoadComplete = true;
-			UE_LOG(LogTemp, Warning, TEXT("=== INITIAL CHUNK LOAD COMPLETE ==="));
-			UE_LOG(LogTemp, Warning, TEXT("Total chunks loaded: %d"), ActiveChunks.Num() + PendingChunks.Num());
-		}
-		else
-		{
-			// Log progress during initial load
-			static int32 LogCounter = 0;
-			if (++LogCounter >= 60) // Every 60 frames (~1 second)
-			{
-				LogCounter = 0;
-				const int32 TotalNeeded = Desired.Num();
-				const int32 CurrentLoaded = ActiveChunks.Num() + PendingChunks.Num();
-				const float Progress = (float)CurrentLoaded / (float)TotalNeeded * 100.0f;
-				UE_LOG(LogTemp, Warning, TEXT("Loading chunks: %d/%d (%.1f%%) - Missing: %d, Spawned this frame: %d (Budget %d)"),
-					CurrentLoaded, TotalNeeded, Progress, MissingChunks, ChunksSpawnedThisFrame, SpawnBudget);
-			}
 		}
 	}
 
@@ -1534,6 +1413,8 @@ void AVoxelWorld::UpdateChunks()
 	TempRemoveChunks.Reset(0);
 
 	// Unload invisible active chunks
+	// CRITICAL FIX: Don't cancel chunks that are currently meshing
+	// This prevents holes when moving fast - let in-progress work finish
 	for (const auto& Pair : ActiveChunks)
 	{
 		if (!Visible.Contains(Pair.Key))
@@ -1543,8 +1424,8 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->CancelPendingTask();
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
+				TempRemoveChunks.Add(Pair.Key);
 			}
-			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
 	for (const FVoxelCoord& C : TempRemoveChunks)
@@ -1569,8 +1450,8 @@ void AVoxelWorld::UpdateChunks()
 				Chunk->CancelPendingTask();
 				Chunk->UnloadChunk();
 				Chunk->DestroyComponent();
+				TempRemoveChunks.Add(Pair.Key);
 			}
-			TempRemoveChunks.Add(Pair.Key);
 		}
 	}
 	for (const FVoxelCoord& C : TempRemoveChunks)
@@ -1602,13 +1483,31 @@ EVoxelLODLevel AVoxelWorld::PickLOD(int32 Dist2, const UVoxelSettings* S) const
 	const int32 R2 = S->LOD2_Radius;
 
 	const int32 R0_2 = R0 * R0;
-	const int32 R1_2 = R1 * R1;
-	const int32 R2_2 = R2 * R2;
 
+	// Always check LOD0 first
 	if (Dist2 <= R0_2) return EVoxelLODLevel::LOD0;
-	if (Dist2 <= R1_2) return EVoxelLODLevel::LOD1;
-	if (Dist2 <= R2_2) return EVoxelLODLevel::LOD2;
-	return EVoxelLODLevel::LOD2;
+
+	// Check LOD1 only if enabled (radius > 0)
+	if (R1 > 0)
+	{
+		const int32 R1_2 = R1 * R1;
+		if (Dist2 <= R1_2) return EVoxelLODLevel::LOD1;
+	}
+
+	// Check LOD2 only if enabled (radius > 0)
+	if (R2 > 0)
+	{
+		const int32 R2_2 = R2 * R2;
+		if (Dist2 <= R2_2) return EVoxelLODLevel::LOD2;
+	}
+
+	// Fallback: Use highest enabled LOD
+	// If LOD2 is enabled, use it for far distances
+	// If only LOD1 is enabled, use it
+	// If only LOD0 is enabled, use it
+	if (R2 > 0) return EVoxelLODLevel::LOD2;
+	if (R1 > 0) return EVoxelLODLevel::LOD1;
+	return EVoxelLODLevel::LOD0;
 }
 
 // ============================================================================
