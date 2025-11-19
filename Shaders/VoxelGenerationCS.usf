@@ -53,14 +53,7 @@ struct BiomeData
     float CaveFrequency3D;
     int CaveOctaves3D;
 
-    // OPTION 3: Block ID Generation
-    // Surface block (grass, sand, snow, etc.)
-    uint SurfaceBlock;
-
-    // Subsurface layers (up to 8 layers: dirt, stone, etc.)
-    // Each layer: lower 16 bits = BlockID, upper 16 bits = Thickness
-    uint SubsurfaceLayers[8];
-    int SubsurfaceLayerCount;
+    // OPTION B: No block data needed (blocks generated on CPU)
 };
 
 // Chunk dimensions
@@ -450,18 +443,16 @@ void GenerateVoxelChunk(uint3 ThreadId : SV_DispatchThreadID)
     // ThreadId ranges from [0, SizeX-1] but represents voxel indices [-1, SizeX-2]
     // BaseWX/Y/Z = world coordinate of chunk origin (voxel index 0)
 
-    // CRITICAL: For BiomeGrid and climate sampling, we must CLAMP halo coordinates to interior
-    // to match CPU behavior (CPU: vx = Clamp(x - 1, 0, SX - 1))
-    // SizeX/Y are padded sizes (SX + 2), so interior logical size is (SizeX - 2)
-    int vx = clamp((int)ThreadId.x - 1, 0, (int)SizeX - 3);
-    int vy = clamp((int)ThreadId.y - 1, 0, (int)SizeY - 3);
-    int WX_BiomeGrid = BaseWX + vx * (int)LODScaleXY;
-    int WY_BiomeGrid = BaseWY + vy * (int)LODScaleXY;
-
-    // For voxel generation (categories), use unclamped coordinates (halo extends outside)
+    // CRITICAL FIX: Use UNCLAMPED coordinates for padding voxels
+    // Padding must use true world coordinates to match adjacent chunks
+    // Clamping causes biome/surface mismatches at chunk boundaries → holes
     int WX = BaseWX + ((int)ThreadId.x - 1) * (int)LODScaleXY;
     int WY = BaseWY + ((int)ThreadId.y - 1) * (int)LODScaleXY;
     int WZ = BaseWZ + ((int)ThreadId.z - 1);
+
+    // Use same coordinates for both BiomeGrid and voxel generation
+    int WX_BiomeGrid = WX;
+    int WY_BiomeGrid = WY;
 
     float Z = (float)WZ;
 

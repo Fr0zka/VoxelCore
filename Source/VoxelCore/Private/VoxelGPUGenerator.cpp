@@ -137,13 +137,13 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
         for (int32 Index = PendingJobs.Num() - 1; Index >= 0; --Index)
         {
             TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = PendingJobs[Index];
-            if (!Job.IsValid() || !Job->CategoryReadback || !Job->BiomeGridReadback)  // OPTION B: Check both
+            if (!Job.IsValid() || !Job->CategoryReadback || !Job->BiomeGridReadback)
             {
                 PendingJobs.RemoveAtSwap(Index);
                 continue;
             }
 
-            // OPTION B: Check if BOTH readbacks are ready (non-blocking)
+            // Check if BOTH readbacks are ready (non-blocking)
             if (!Job->CategoryReadback->IsReady() || !Job->BiomeGridReadback->IsReady())
             {
                 continue; // Not ready yet - check next frame
@@ -256,26 +256,6 @@ void FVoxelGPUGenerator::TickGPUGenerationJobs()
                     }
                     BiomeGridReadbackPtr->Unlock();
                     bBiomeGridSuccess = true;
-
-                    // DIAGNOSTIC: Log biome variety with detailed breakdown
-                    FString BiomeBreakdown;
-                    for (const auto& Pair : BiomeCount)
-                    {
-                        FString BiomeName = (BiomeTable && Pair.Key < BiomeTable->Biomes.Num() && BiomeTable->Biomes[Pair.Key])
-                            ? BiomeTable->Biomes[Pair.Key]->GetName()
-                            : FString::Printf(TEXT("Index%d"), Pair.Key);
-                        BiomeBreakdown += FString::Printf(TEXT("%s:%d "), *BiomeName, Pair.Value);
-                    }
-
-                    UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] BiomeGrid: %d unique biomes (from %d total) | SurfaceZ[%d,%d] | Corners[%d,%d,%d,%d,C:%d] | Breakdown: %s"),
-                        UniqueBiomes.Num(), BiomeTable ? BiomeTable->Biomes.Num() : 0,
-                        MinSurfaceZ, MaxSurfaceZ,
-                        CornerBiomes.Num() > 0 ? CornerBiomes[0] : 255,
-                        CornerBiomes.Num() > 1 ? CornerBiomes[1] : 255,
-                        CornerBiomes.Num() > 2 ? CornerBiomes[2] : 255,
-                        CornerBiomes.Num() > 3 ? CornerBiomes[3] : 255,
-                        CornerBiomes.Num() > 4 ? CornerBiomes[4] : 255,
-                        *BiomeBreakdown);
                 }
 
                 // Call completion callback on game thread (async task)
@@ -366,11 +346,6 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
             Data.CaveFrequency3D = P.CaveFrequency3D;
             Data.CaveOctaves3D = P.CaveOctaves3D;
 
-            // DIAGNOSTIC: Log biome climate ranges
-            UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] Biome[%d] '%s': Temp[%.3f,%.3f] Moist[%.3f,%.3f]"),
-                BiomeDataArray.Num(), *Biome->GetName(),
-                Data.TempMin, Data.TempMax, Data.MoistMin, Data.MoistMax);
-
             // OPTION B: No block data packing needed (blocks generated on CPU)
             BiomeDataArray.Add(Data);
         }
@@ -430,47 +405,6 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
         MoistGain = NoiseProfile->Moisture.Gain;
         MoistWarpStrength = NoiseProfile->Moisture.WarpStrength;
         MoistSeedOffset = NoiseProfile->Moisture.SeedOffset;
-
-        // DIAGNOSTIC: Log climate noise settings being sent to GPU
-        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] Climate Noise: Temp(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d) Moist(Freq=%.6f Oct=%d Lac=%.2f Gain=%.2f Warp=%.2f SeedOff=%d)"),
-            TempBaseFreq, TempOctaves, TempLacunarity, TempGain, TempWarpStrength, TempSeedOffset,
-            MoistBaseFreq, MoistOctaves, MoistLacunarity, MoistGain, MoistWarpStrength, MoistSeedOffset);
-
-        // DIAGNOSTIC: Sample CPU climate values at specific world coordinates for comparison
-        FVoxelNoiseContext CPUNoise(Seed, NoiseProfile);
-        const int32 BaseWX = Coord.Cx * BaseSizeX;
-        const int32 BaseWY = Coord.Cy * BaseSizeY;
-
-        // Sample 5 positions: 4 corners + center
-        TArray<TPair<int32, int32>> SamplePositions;
-        SamplePositions.Add(TPair<int32, int32>(BaseWX, BaseWY));                                      // Corner (0,0)
-        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX - 1, BaseWY));                    // Corner (SizeX-1, 0)
-        SamplePositions.Add(TPair<int32, int32>(BaseWX, BaseWY + BaseSizeY - 1));                    // Corner (0, SizeY-1)
-        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX - 1, BaseWY + BaseSizeY - 1));    // Corner (SizeX-1, SizeY-1)
-        SamplePositions.Add(TPair<int32, int32>(BaseWX + BaseSizeX/2, BaseWY + BaseSizeY/2));        // Center
-
-        FString CPUSamples;
-        for (int32 i = 0; i < SamplePositions.Num(); ++i)
-        {
-            float WX = (float)SamplePositions[i].Key;
-            float WY = (float)SamplePositions[i].Value;
-
-            float TempCPU, MoistCPU;
-            CPUNoise.SampleClimate(WX, WY, TempCPU, MoistCPU);
-
-            const UVoxelBiomeDef* BiomeCPU = BiomeTable ? BiomeTable->Pick(TempCPU, MoistCPU) : nullptr;
-            int32 BiomeIdxCPU = BiomeTable && BiomeCPU ? BiomeTable->IndexOf(BiomeCPU) : -1;
-
-            CPUSamples += FString::Printf(TEXT("[%d,%d:T=%.3f M=%.3f B=%d] "),
-                SamplePositions[i].Key, SamplePositions[i].Value,
-                TempCPU, MoistCPU, BiomeIdxCPU);
-        }
-
-        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] CPU Climate Samples: %s"), *CPUSamples);
-    }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[OPTIONB] No NoiseProfile provided - using default climate noise settings"));
     }
 
     // Enqueue work on render thread
@@ -538,7 +472,7 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     FRDGBufferUAVRef BiomeGridUAV = GraphBuilder.CreateUAV(BiomeGridBuffer, PF_R32_UINT);
 
-    // CRITICAL: Clear both output buffers to zero (prevents garbage data)
+    // CRITICAL: Clear output buffers to zero (prevents garbage data)
     AddClearUAVPass(GraphBuilder, CategoryUAV, 0u);
     AddClearUAVPass(GraphBuilder, BiomeGridUAV, 0u);
 
@@ -644,7 +578,7 @@ void FVoxelGPUGenerator::DispatchGenerationShader_RenderThread(
 
     GraphBuilder.Execute();
 
-    // OPTION B: Create job to track BOTH async readbacks (polled each frame, non-blocking)
+    // OPTION B: Create job to track async readbacks (polled each frame, non-blocking)
     TSharedPtr<FGPUGenerationJob, ESPMode::ThreadSafe> Job = MakeShared<FGPUGenerationJob, ESPMode::ThreadSafe>();
     Job->CategoryReadback = TUniquePtr<FRHIGPUBufferReadback>(CategoryReadback);
     Job->BiomeGridReadback = TUniquePtr<FRHIGPUBufferReadback>(BiomeGridReadback);

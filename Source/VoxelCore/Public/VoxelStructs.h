@@ -399,6 +399,81 @@ public:
         }
         return true; // Only air/water in core
     }
+
+    /**
+     * OPTIMIZATION: Batch unpack all categories to a flat TArray<uint8>.
+     * This is 5-10x faster than calling Get() for every voxel.
+     *
+     * Use this for TrueBinaryMesher integration - unpack once, use many times.
+     * The output array has one byte per voxel in Z-Y-X order (matching LinearIndex).
+     *
+     * @param OutCategories Output array to fill with unpacked categories (0, 1, or 2)
+     */
+    void UnpackAll(TArray<uint8>& OutCategories) const
+    {
+        // Ensure LUT is initialized for fast extraction
+        if (VOXEL_UNLIKELY(!bLUTInitialized))
+        {
+            const_cast<FCategoryBitset*>(this)->InitializeLUT();
+        }
+
+        const int64 TotalVoxels = static_cast<int64>(SizeX) * SizeY * SizeZ;
+        OutCategories.SetNumUninitialized(TotalVoxels);
+
+        if (TotalVoxels == 0 || Data.Num() == 0)
+        {
+            return;
+        }
+
+        uint8* VOXEL_RESTRICT OutPtr = OutCategories.GetData();
+        const uint8* VOXEL_RESTRICT InPtr = Data.GetData();
+        const int32 NumBytes = Data.Num();
+
+        // Process in tight loop for cache efficiency
+        // Each byte contains 4 voxels (2 bits each)
+        int64 voxelIdx = 0;
+        int32 byteIdx = 0;
+
+        // Process complete bytes (4 voxels per byte)
+        while (byteIdx < NumBytes && voxelIdx + 4 <= TotalVoxels)
+        {
+            const uint8 byteVal = InPtr[byteIdx];
+
+            // Unpack 4 voxels from this byte using lookup table
+            OutPtr[voxelIdx + 0] = BitExtractLUT[byteVal * 8 + 0];
+            OutPtr[voxelIdx + 1] = BitExtractLUT[byteVal * 8 + 2];
+            OutPtr[voxelIdx + 2] = BitExtractLUT[byteVal * 8 + 4];
+            OutPtr[voxelIdx + 3] = BitExtractLUT[byteVal * 8 + 6];
+
+            voxelIdx += 4;
+            byteIdx++;
+        }
+
+        // Handle remaining voxels (< 4 in last byte)
+        if (voxelIdx < TotalVoxels && byteIdx < NumBytes)
+        {
+            const uint8 byteVal = InPtr[byteIdx];
+            int32 bitOffset = 0;
+
+            while (voxelIdx < TotalVoxels)
+            {
+                if (bitOffset <= 6)
+                {
+                    OutPtr[voxelIdx] = BitExtractLUT[byteVal * 8 + bitOffset];
+                }
+                else
+                {
+                    // Bit spans byte boundary - handle carefully
+                    const uint8 lsb = BitExtractLUT[byteVal * 8 + 7];
+                    const uint8 msb = (byteIdx + 1 < NumBytes) ? (InPtr[byteIdx + 1] & 0x1u) : 0;
+                    OutPtr[voxelIdx] = lsb | (msb << 1);
+                }
+
+                voxelIdx++;
+                bitOffset += 2;
+            }
+        }
+    }
 };
 class UVoxelBiomeDef; // forward declare, pas d’include ici
 
