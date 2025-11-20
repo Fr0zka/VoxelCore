@@ -85,7 +85,8 @@ public:
         int32 XYScale,                       // 1 for LOD0; 2/3/... for LOD1
         bool bUseAO,
         const class UVoxelBlockTable* BlockTable,
-        FMeshBuffers& OutBuffers);
+        FMeshBuffers& OutBuffers,
+        const FVoxelLightData* LightData = nullptr);  // Optional voxel lighting
 
     /**
      * Binary greedy mesher for voxel volumes.  This variant precomputes
@@ -106,7 +107,8 @@ public:
         int32 XYScale,
         bool bUseAO,
         const class UVoxelBlockTable* BlockTable,
-        FMeshBuffers& OutBuffers);
+        FMeshBuffers& OutBuffers,
+        const FVoxelLightData* LightData = nullptr);  // Optional voxel lighting
 
     /** Heightfield impostor (surface only), using (CellsX+1)*(CellsY+1) samples. */
     static void BuildHeightfieldMesh(

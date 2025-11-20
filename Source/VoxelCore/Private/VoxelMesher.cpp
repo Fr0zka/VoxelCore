@@ -240,7 +240,8 @@ void UVoxelMesher::BuildGreedyMesh(
     int32 XYScale,
     bool bUseAO,
     const class UVoxelBlockTable* VOXEL_RESTRICT BlockTable,
-    FMeshBuffers& Out)
+    FMeshBuffers& Out,
+    const FVoxelLightData* LightData)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelGreedyMesh);
 
@@ -564,6 +565,38 @@ void UVoxelMesher::BuildGreedyMesh(
         }
     }
 
+    // VOXEL LIGHTING: Apply light values to vertex colors
+    if (LightData && LightData->Data.Num() > 0)
+    {
+        const float VoxelScale = VoxelUU * XYScale;
+        for (int32 i = 0; i < Out.Vertices.Num(); ++i)
+        {
+            // Convert vertex world position back to voxel coordinates
+            const FVector& WorldPos = Out.Vertices[i];
+            const int32 VX = FMath::FloorToInt(WorldPos.X / VoxelScale);
+            const int32 VY = FMath::FloorToInt(WorldPos.Y / VoxelScale);
+            const int32 VZ = FMath::FloorToInt(WorldPos.Z / VoxelUU);  // Z scale is always 1x
+
+            // Sample light value (with bounds check)
+            uint8 LightValue = 15;  // Default to full brightness
+            if (VX >= 0 && VX < LightData->SizeX && VY >= 0 && VY < LightData->SizeY && VZ >= 0 && VZ < LightData->SizeZ)
+            {
+                LightValue = LightData->GetCombinedLight(VX, VY, VZ);
+            }
+
+            // Convert light (0-15) to brightness (0.0-1.0)
+            // Add minimum ambient light to avoid pure black (creative choice)
+            const float MinAmbient = 0.05f;  // 5% minimum visibility
+            const float LightBrightness = MinAmbient + (1.0f - MinAmbient) * (LightValue / 15.0f);
+
+            // Multiply existing vertex color (which contains AO) by light brightness
+            FColor& Col = Out.Colors[i];
+            Col.R = FMath::Clamp(FMath::RoundToInt(Col.R * LightBrightness), 0, 255);
+            Col.G = FMath::Clamp(FMath::RoundToInt(Col.G * LightBrightness), 0, 255);
+            Col.B = FMath::Clamp(FMath::RoundToInt(Col.B * LightBrightness), 0, 255);
+        }
+    }
+
     // Update memory stats
     const int32 BufferMemory =
         Out.Vertices.Num() * sizeof(FVector) +
@@ -585,11 +618,39 @@ void UVoxelMesher::BuildBinaryGreedyMesh(
     int32 XYScale,
     bool bUseAO,
     const class UVoxelBlockTable* BlockTable,
-    FMeshBuffers& Out)
+    FMeshBuffers& Out,
+    const FVoxelLightData* LightData)
 {
     // OPTIMIZATION: Use pre-computed Cats array (eliminates 32K+ conversion loop)
     // Now directly call TrueBinaryMesher
     BuildTrueBinaryGreedyMesh(Cats, Voxels, Size, Nbh, VoxelUU, XYScale, bUseAO, BlockTable, Out);
+
+    // VOXEL LIGHTING: Apply light values to vertex colors
+    if (LightData && LightData->Data.Num() > 0)
+    {
+        const float VoxelScale = VoxelUU * XYScale;
+        for (int32 i = 0; i < Out.Vertices.Num(); ++i)
+        {
+            const FVector& WorldPos = Out.Vertices[i];
+            const int32 VX = FMath::FloorToInt(WorldPos.X / VoxelScale);
+            const int32 VY = FMath::FloorToInt(WorldPos.Y / VoxelScale);
+            const int32 VZ = FMath::FloorToInt(WorldPos.Z / VoxelUU);
+
+            uint8 LightValue = 15;
+            if (VX >= 0 && VX < LightData->SizeX && VY >= 0 && VY < LightData->SizeY && VZ >= 0 && VZ < LightData->SizeZ)
+            {
+                LightValue = LightData->GetCombinedLight(VX, VY, VZ);
+            }
+
+            const float MinAmbient = 0.05f;
+            const float LightBrightness = MinAmbient + (1.0f - MinAmbient) * (LightValue / 15.0f);
+
+            FColor& Col = Out.Colors[i];
+            Col.R = FMath::Clamp(FMath::RoundToInt(Col.R * LightBrightness), 0, 255);
+            Col.G = FMath::Clamp(FMath::RoundToInt(Col.G * LightBrightness), 0, 255);
+            Col.B = FMath::Clamp(FMath::RoundToInt(Col.B * LightBrightness), 0, 255);
+        }
+    }
 }
 
 void UVoxelMesher::BuildHeightfieldMesh(
