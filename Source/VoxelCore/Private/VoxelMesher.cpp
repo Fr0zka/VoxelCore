@@ -175,21 +175,23 @@ static FORCEINLINE uint8 CatAt_WithNbh(
     auto idx = [&](int32 X, int32 Y, int32 Z) { return X + Y * SX + Z * SX * SY; };
 
     if (VOXEL_LIKELY(inside(x, y, z))) return Cats[idx(x, y, z)];
-    if (!Nbh) return 0;
+    if (!Nbh) return 2;  // No neighbor data at all → treat as solid
 
+    // WORLD EDGE CULLING: Return 2 (solid) when neighbor doesn't exist
+    // This prevents cave openings at world boundaries - edges appear solid until neighbors load
     // Z-
-    if (z < 0) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZNeg) return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]); return 0; }
+    if (z < 0) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZNeg) return VoxelBlockCategory(Nbh->ZNeg[x + y * SX]); return 2; }
     // Z+
-    if (z >= SZ) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZPos) return VoxelBlockCategory(Nbh->ZPos[x + y * SX]); return 0; }
+    if (z >= SZ) { if ((unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && Nbh->bHasZPos) return VoxelBlockCategory(Nbh->ZPos[x + y * SX]); return 2; }
     // X-
     if (x < 0) { if ((unsigned)y < (unsigned)SY && Nbh->bHasXNeg) return VoxelBlockCategory(Nbh->XNeg[y + z * SY]); return 2; }
     // X+
-    if (x >= SX) { if ((unsigned)y < (unsigned)SY && Nbh->bHasXPos) return VoxelBlockCategory(Nbh->XPos[y + z * SY]); return 0; }
+    if (x >= SX) { if ((unsigned)y < (unsigned)SY && Nbh->bHasXPos) return VoxelBlockCategory(Nbh->XPos[y + z * SY]); return 2; }
     // Y-
-    if (y < 0) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYNeg) return VoxelBlockCategory(Nbh->YNeg[x + z * SX]); return 0; }
+    if (y < 0) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYNeg) return VoxelBlockCategory(Nbh->YNeg[x + z * SX]); return 2; }
     // Y+
-    if (y >= SY) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYPos) return VoxelBlockCategory(Nbh->YPos[x + z * SX]); return 0; }
-    return 0;
+    if (y >= SY) { if ((unsigned)x < (unsigned)SX && Nbh->bHasYPos) return VoxelBlockCategory(Nbh->YPos[x + z * SX]); return 2; }
+    return 2;  // Fallback → treat as solid
 }
 
 // Thread-local reusable mask buffer to avoid allocations
