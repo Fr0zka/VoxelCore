@@ -322,4 +322,197 @@ namespace VoxelLighting
 			}
 		}
 	}
+
+	// CROSS-CHUNK PROPAGATION: Extract boundary light values
+	void ExtractBoundaryLight(
+		const FVoxelLightData& LightData,
+		TArray<uint8>& OutXNeg, TArray<uint8>& OutXPos,
+		TArray<uint8>& OutYNeg, TArray<uint8>& OutYPos,
+		TArray<uint8>& OutZNeg, TArray<uint8>& OutZPos)
+	{
+		const int32 SX = LightData.SizeX;
+		const int32 SY = LightData.SizeY;
+		const int32 SZ = LightData.SizeZ;
+
+		// Resize output arrays
+		OutXNeg.SetNumZeroed(SY * SZ);
+		OutXPos.SetNumZeroed(SY * SZ);
+		OutYNeg.SetNumZeroed(SX * SZ);
+		OutYPos.SetNumZeroed(SX * SZ);
+		OutZNeg.SetNumZeroed(SX * SY);
+		OutZPos.SetNumZeroed(SX * SY);
+
+		// Extract X faces
+		for (int32 z = 0; z < SZ; ++z)
+		{
+			for (int32 y = 0; y < SY; ++y)
+			{
+				OutXNeg[y + z * SY] = LightData.GetCombinedLight(0, y, z);
+				OutXPos[y + z * SY] = LightData.GetCombinedLight(SX - 1, y, z);
+			}
+		}
+
+		// Extract Y faces
+		for (int32 z = 0; z < SZ; ++z)
+		{
+			for (int32 x = 0; x < SX; ++x)
+			{
+				OutYNeg[x + z * SX] = LightData.GetCombinedLight(x, 0, z);
+				OutYPos[x + z * SX] = LightData.GetCombinedLight(x, SY - 1, z);
+			}
+		}
+
+		// Extract Z faces
+		for (int32 y = 0; y < SY; ++y)
+		{
+			for (int32 x = 0; x < SX; ++x)
+			{
+				OutZNeg[x + y * SX] = LightData.GetCombinedLight(x, y, 0);
+				OutZPos[x + y * SX] = LightData.GetCombinedLight(x, y, SZ - 1);
+			}
+		}
+	}
+
+	// CROSS-CHUNK PROPAGATION: Apply boundary light and propagate inward
+	void ApplyBoundaryLightFromNeighbors(
+		FVoxelLightData& LightData,
+		const FCategoryBitset& Categories,
+		const TArray<uint8>& InXNeg, const TArray<uint8>& InXPos,
+		const TArray<uint8>& InYNeg, const TArray<uint8>& InYPos,
+		const TArray<uint8>& InZNeg, const TArray<uint8>& InZPos)
+	{
+		const int32 SX = LightData.SizeX;
+		const int32 SY = LightData.SizeY;
+		const int32 SZ = LightData.SizeZ;
+
+		TQueue<TPair<FIntVector, uint8>> PropagationQueue;
+
+		// Helper to apply boundary light at a position
+		auto ApplyBoundary = [&](int32 x, int32 y, int32 z, uint8 IncomingLight)
+		{
+			if (IncomingLight == 0) return;
+
+			// Check if this voxel blocks light
+			const uint8 Cat = Categories.Get(x, y, z);
+			if (Cat == 2) return;  // Solid - blocks light
+
+			// Get current light at this position
+			const uint8 CurrentLight = LightData.GetCombinedLight(x, y, z);
+
+			// Only apply if incoming light is brighter
+			if (IncomingLight > CurrentLight)
+			{
+				// Split into sky and block light (for now, assume it's all sky light)
+				// TODO: Later we can store sky/block separately in boundary arrays
+				LightData.SetSkyLight(x, y, z, IncomingLight);
+				PropagationQueue.Enqueue(TPair<FIntVector, uint8>(FIntVector(x, y, z), IncomingLight));
+			}
+		};
+
+		// Apply X faces
+		if (InXNeg.Num() == SY * SZ)
+		{
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 y = 0; y < SY; ++y)
+				{
+					const uint8 Light = InXNeg[y + z * SY];
+					if (Light > 1) ApplyBoundary(0, y, z, Light - 1);  // Reduce by 1 per block distance
+				}
+			}
+		}
+		if (InXPos.Num() == SY * SZ)
+		{
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 y = 0; y < SY; ++y)
+				{
+					const uint8 Light = InXPos[y + z * SY];
+					if (Light > 1) ApplyBoundary(SX - 1, y, z, Light - 1);
+				}
+			}
+		}
+
+		// Apply Y faces
+		if (InYNeg.Num() == SX * SZ)
+		{
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					const uint8 Light = InYNeg[x + z * SX];
+					if (Light > 1) ApplyBoundary(x, 0, z, Light - 1);
+				}
+			}
+		}
+		if (InYPos.Num() == SX * SZ)
+		{
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					const uint8 Light = InYPos[x + z * SX];
+					if (Light > 1) ApplyBoundary(x, SY - 1, z, Light - 1);
+				}
+			}
+		}
+
+		// Apply Z faces
+		if (InZNeg.Num() == SX * SY)
+		{
+			for (int32 y = 0; y < SY; ++y)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					const uint8 Light = InZNeg[x + y * SX];
+					if (Light > 1) ApplyBoundary(x, y, 0, Light - 1);
+				}
+			}
+		}
+		if (InZPos.Num() == SX * SY)
+		{
+			for (int32 y = 0; y < SY; ++y)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					const uint8 Light = InZPos[x + y * SX];
+					if (Light > 1) ApplyBoundary(x, y, SZ - 1, Light - 1);
+				}
+			}
+		}
+
+		// Propagate the boundary light inward using flood-fill
+		while (!PropagationQueue.IsEmpty())
+		{
+			TPair<FIntVector, uint8> Item;
+			PropagationQueue.Dequeue(Item);
+
+			const FIntVector& Pos = Item.Key;
+			const uint8 CurrentLight = Item.Value;
+
+			if (CurrentLight <= 1) continue;
+
+			const uint8 PropagatedLight = CurrentLight - 1;
+
+			// Check all 6 neighbors
+			for (int32 i = 0; i < 6; ++i)
+			{
+				const FIntVector NeighborPos = Pos + Neighbors[i];
+
+				if (!IsValidPos(NeighborPos, SX, SY, SZ))
+					continue;
+
+				const uint8 NeighborCat = Categories.Get(NeighborPos.X, NeighborPos.Y, NeighborPos.Z);
+				if (NeighborCat == 2) continue;
+
+				const uint8 NeighborLight = LightData.GetCombinedLight(NeighborPos.X, NeighborPos.Y, NeighborPos.Z);
+
+				if (PropagatedLight > NeighborLight)
+				{
+					LightData.SetSkyLight(NeighborPos.X, NeighborPos.Y, NeighborPos.Z, PropagatedLight);
+					PropagationQueue.Enqueue(TPair<FIntVector, uint8>(NeighborPos, PropagatedLight));
+				}
+			}
+		}
+	}
 }

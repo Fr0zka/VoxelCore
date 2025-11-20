@@ -73,6 +73,35 @@ namespace VoxelLighting
 	                          const TArray<EVoxelBlockID>& BlockTypes, bool bTopExposed);
 
 	/**
+	 * CROSS-CHUNK PROPAGATION (Option B - Smart Approach)
+	 * Extract boundary light values from chunk faces for neighbor seeding.
+	 * Call this AFTER RebuildChunkLighting() to extract outgoing light.
+	 *
+	 * @param LightData       Source light data
+	 * @param OutXNeg/etc     Output arrays (will be resized and filled)
+	 */
+	void ExtractBoundaryLight(
+		const FVoxelLightData& LightData,
+		TArray<uint8>& OutXNeg, TArray<uint8>& OutXPos,
+		TArray<uint8>& OutYNeg, TArray<uint8>& OutYPos,
+		TArray<uint8>& OutZNeg, TArray<uint8>& OutZPos);
+
+	/**
+	 * Apply boundary light from neighboring chunks and propagate inward.
+	 * Call this AFTER RebuildChunkLighting() but BEFORE meshing.
+	 *
+	 * @param LightData       Light data to update (already has internal lighting)
+	 * @param Categories      Voxel categories (for propagation)
+	 * @param InXNeg/etc      Boundary light from neighbors (empty if neighbor not loaded)
+	 */
+	void ApplyBoundaryLightFromNeighbors(
+		FVoxelLightData& LightData,
+		const FCategoryBitset& Categories,
+		const TArray<uint8>& InXNeg, const TArray<uint8>& InXPos,
+		const TArray<uint8>& InYNeg, const TArray<uint8>& InYPos,
+		const TArray<uint8>& InZNeg, const TArray<uint8>& InZPos);
+
+	/**
 	 * Check if a block type emits light (torch, lava, glowstone, etc.).
 	 * Returns light strength (0-15), or 0 if block doesn't emit light.
 	 */

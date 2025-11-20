@@ -107,6 +107,30 @@ protected:
     // torches, lava, and other emissive blocks, with flood-fill propagation.
     FVoxelLightData LightData;
 
+    // Boundary light values for cross-chunk propagation (Option B - smart approach)
+    // Stores light values at each chunk face to seed neighboring chunks when they load.
+    // Memory cost: ~6 × (32×32) = 6KB per chunk for boundaries
+    struct FBoundaryLight
+    {
+        TArray<uint8> XNeg, XPos, YNeg, YPos, ZNeg, ZPos;  // Combined light (0-15)
+
+        void InitForSize(int32 SizeX, int32 SizeY, int32 SizeZ)
+        {
+            XNeg.SetNumZeroed(SizeY * SizeZ);
+            XPos.SetNumZeroed(SizeY * SizeZ);
+            YNeg.SetNumZeroed(SizeX * SizeZ);
+            YPos.SetNumZeroed(SizeX * SizeZ);
+            ZNeg.SetNumZeroed(SizeX * SizeY);
+            ZPos.SetNumZeroed(SizeX * SizeY);
+        }
+
+        void Clear()
+        {
+            XNeg.Empty(); XPos.Empty(); YNeg.Empty(); YPos.Empty(); ZNeg.Empty(); ZPos.Empty();
+        }
+    };
+    FBoundaryLight BoundaryLight;
+
     // OPTION B: BiomeGrid2D provided by GPU (or CPU fallback)
     // Contains SurfaceZWorld and Biome pointer per XY column
     // Used by CPU for block generation from categories

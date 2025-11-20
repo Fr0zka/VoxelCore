@@ -441,6 +441,37 @@ void UVoxelChunkComponent::OnGenerationComplete()
         // Rebuild lighting for the chunk
         VoxelLighting::RebuildChunkLighting(LightData, CategoryData, BlockTypes, bTopExposed);
 
+        // CROSS-CHUNK PROPAGATION (Option B): Extract boundary light for neighbors
+        BoundaryLight.InitForSize(CategoryData.SizeX, CategoryData.SizeY, CategoryData.SizeZ);
+        VoxelLighting::ExtractBoundaryLight(LightData,
+            BoundaryLight.XNeg, BoundaryLight.XPos,
+            BoundaryLight.YNeg, BoundaryLight.YPos,
+            BoundaryLight.ZNeg, BoundaryLight.ZPos);
+
+        // Apply boundary light from already-loaded neighbors
+        if (OwnerWorld)
+        {
+            TArray<uint8> NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos;
+
+            // Gather boundary light from neighbors
+            if (UVoxelChunkComponent* NBX = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx - 1, ChunkCoord.Cy, ChunkCoord.Cz)))
+                if (NBX->LightData.Data.Num() > 0) NeighborXNeg = NBX->BoundaryLight.XPos;
+            if (UVoxelChunkComponent* PBX = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx + 1, ChunkCoord.Cy, ChunkCoord.Cz)))
+                if (PBX->LightData.Data.Num() > 0) NeighborXPos = PBX->BoundaryLight.XNeg;
+            if (UVoxelChunkComponent* NBY = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy - 1, ChunkCoord.Cz)))
+                if (NBY->LightData.Data.Num() > 0) NeighborYNeg = NBY->BoundaryLight.YPos;
+            if (UVoxelChunkComponent* PBY = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy + 1, ChunkCoord.Cz)))
+                if (PBY->LightData.Data.Num() > 0) NeighborYPos = PBY->BoundaryLight.YNeg;
+            if (UVoxelChunkComponent* NBZ = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz - 1)))
+                if (NBZ->LightData.Data.Num() > 0) NeighborZNeg = NBZ->BoundaryLight.ZPos;
+            if (UVoxelChunkComponent* PBZ = OwnerWorld->GetChunkAt(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz + 1)))
+                if (PBZ->LightData.Data.Num() > 0) NeighborZPos = PBZ->BoundaryLight.ZNeg;
+
+            // Apply neighbor boundary light
+            VoxelLighting::ApplyBoundaryLightFromNeighbors(LightData, CategoryData,
+                NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos);
+        }
+
         UE_LOG(LogVoxelChunk, Verbose, TEXT("[LIGHT] Chunk (%d,%d,%d) rebuilt | Exposed: %d | Data: %d bytes"),
             ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, bTopExposed, LightData.Data.Num());
     }
