@@ -102,6 +102,11 @@ protected:
     // temporary block IDs.
     FCategoryBitset CategoryData;
 
+    // Voxel lighting data: stores sky light (0-15) and block light (0-15) for each voxel.
+    // Uses 1 byte per voxel (4 bits per channel). Supports dynamic lighting from
+    // torches, lava, and other emissive blocks, with flood-fill propagation.
+    FVoxelLightData LightData;
+
     // OPTION B: BiomeGrid2D provided by GPU (or CPU fallback)
     // Contains SurfaceZWorld and Biome pointer per XY column
     // Used by CPU for block generation from categories

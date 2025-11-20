@@ -5,6 +5,7 @@
 #include "VoxelMesher.h"
 #include "VoxelWorld.h"
 #include "VoxelStats.h"
+#include "VoxelLightPropagation.h"
 #include "ProceduralMeshComponent.h"
 #include "Async/Async.h"
 #include "HAL/IConsoleManager.h"
@@ -396,6 +397,72 @@ void UVoxelChunkComponent::OnGenerationComplete()
     if (RenderMode == EVoxelRenderMode::Voxels)
     {
         bNeighborsCacheDirty = true;
+    }
+
+    // LIGHTING: Rebuild voxel lighting after generation
+    if (RenderMode == EVoxelRenderMode::Voxels && CategoryData.Data.Num() > 0)
+    {
+        // Initialize light data with same dimensions as category data
+        LightData.Init(CategoryData.SizeX, CategoryData.SizeY, CategoryData.SizeZ);
+
+        // Determine if chunk has sky exposure
+        // Check if chunk's top Z coordinate is at or above any surface in the BiomeGrid
+        const int32 ChunkWorldX = ChunkCoord.Cx * Settings->ChunkSize;
+        const int32 ChunkWorldY = ChunkCoord.Cy * Settings->ChunkSize;
+        const int32 ChunkWorldZ = ChunkCoord.Cz * Settings->ChunkSize;
+        const int32 ChunkTopZ = ChunkWorldZ + Settings->ChunkSize;
+
+        bool bTopExposed = false;
+        if (BiomeGrid.SizeX > 0 && BiomeGrid.SizeY > 0)
+        {
+            // Check if any surface point in the chunk is below the chunk top
+            for (int32 y = 0; y < BiomeGrid.SizeY; ++y)
+            {
+                for (int32 x = 0; x < BiomeGrid.SizeX; ++x)
+                {
+                    const int32 SurfaceZ = BiomeGrid.GetSurfaceZ(x, y);
+                    if (SurfaceZ >= ChunkWorldZ && SurfaceZ < ChunkTopZ)
+                    {
+                        // Surface intersects this chunk - has sky exposure
+                        bTopExposed = true;
+                        break;
+                    }
+                }
+                if (bTopExposed) break;
+            }
+        }
+        else
+        {
+            // No BiomeGrid data - assume exposed if chunk is near world top
+            bTopExposed = (ChunkWorldZ >= Settings->WaterLevel - Settings->ChunkSize);
+        }
+
+        // Create temporary BlockTypes array for light emission detection
+        // For now, just convert categories to basic block types
+        // TODO: When block ID storage is added, use actual block types
+        const int64 TotalVoxels = static_cast<int64>(CategoryData.SizeX) * CategoryData.SizeY * CategoryData.SizeZ;
+        TArray<EVoxelBlockID> BlockTypes;
+        BlockTypes.SetNum(TotalVoxels);
+
+        for (int64 i = 0; i < TotalVoxels; ++i)
+        {
+            const int32 x = i % CategoryData.SizeX;
+            const int32 y = (i / CategoryData.SizeX) % CategoryData.SizeY;
+            const int32 z = i / (CategoryData.SizeX * CategoryData.SizeY);
+            const uint8 Cat = CategoryData.Get(x, y, z);
+
+            // Map categories to basic block types
+            // 0=air, 1=semi-solid (water), 2=solid (stone)
+            BlockTypes[i] = (Cat == 0) ? EVoxelBlockID::Air :
+                           (Cat == 1) ? EVoxelBlockID::Water :
+                           EVoxelBlockID::Stone;
+        }
+
+        // Rebuild lighting for the chunk
+        VoxelLighting::RebuildChunkLighting(LightData, CategoryData, BlockTypes, bTopExposed);
+
+        UE_LOG(LogVoxelChunk, Log, TEXT("[LIGHT] Chunk (%d,%d,%d) lighting rebuilt | TopExposed: %d | LightData: %d bytes"),
+            ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz, bTopExposed, LightData.Data.Num());
     }
 
     StartMeshing(/*bSeamRemesh=*/false);

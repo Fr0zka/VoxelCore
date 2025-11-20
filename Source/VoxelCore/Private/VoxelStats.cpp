@@ -37,6 +37,13 @@ DEFINE_STAT(STAT_VoxelGPUMeshing);       // GPU mesher (if enabled)
 DEFINE_STAT(STAT_VoxelApplyToPMC);       // Mesh buffer → ProceduralMeshComponent
 DEFINE_STAT(STAT_VoxelSnapshotNeighbors);// Neighbor data extraction
 
+// === LIGHTING STATS ===
+// Voxel lighting propagation performance
+DEFINE_STAT(STAT_VoxelLightPropagate);      // Sky light propagation (flood-fill)
+DEFINE_STAT(STAT_VoxelLightPropagateBlock); // Block light propagation (torches, lava)
+DEFINE_STAT(STAT_VoxelLightRemove);         // Light removal (when source destroyed)
+DEFINE_STAT(STAT_VoxelLightRebuild);        // Full chunk lighting rebuild
+
 // === MEMORY STATS ===
 // Track memory usage for voxel data and mesh buffers
 DEFINE_STAT(STAT_VoxelDataMemory);       // Voxel data arrays (categories, block IDs)
