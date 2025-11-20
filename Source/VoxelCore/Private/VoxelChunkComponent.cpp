@@ -438,8 +438,19 @@ void UVoxelChunkComponent::OnGenerationComplete()
         TArray<EVoxelBlockID> BlockTypes;
         BlockTypes.SetNum(0);  // Empty for now - no emissive blocks yet
 
-        // Rebuild lighting for the chunk
-        VoxelLighting::RebuildChunkLighting(LightData, CategoryData, BlockTypes, bTopExposed);
+        // SMART LIGHTING APPROACH: Underground chunks start dark, only get light from neighbors
+        // This is WAY more efficient than filling with light then removing it!
+        if (bTopExposed)
+        {
+            // Surface chunk: Rebuild lighting normally (sky light propagates down)
+            VoxelLighting::RebuildChunkLighting(LightData, CategoryData, BlockTypes, true);
+        }
+        else
+        {
+            // Underground chunk: Start pitch black, only receive light from neighbors
+            // Don't call RebuildChunkLighting - it would fill everything with fake skylight
+            LightData.Clear();  // All voxels start at light=0
+        }
 
         // CROSS-CHUNK PROPAGATION (Option B): Extract boundary light for neighbors
         BoundaryLight.InitForSize(CategoryData.SizeX, CategoryData.SizeY, CategoryData.SizeZ);
@@ -448,68 +459,28 @@ void UVoxelChunkComponent::OnGenerationComplete()
             BoundaryLight.YNeg, BoundaryLight.YPos,
             BoundaryLight.ZNeg, BoundaryLight.ZPos);
 
-        // Apply boundary light from already-loaded neighbors
+        // Apply boundary light from already-loaded neighbors (works for both surface and underground)
         if (OwnerWorld)
         {
             TArray<uint8> NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos;
 
-            // Gather boundary light from neighbors (only if they exist and have lighting)
-            bool bHasXNeg = false, bHasXPos = false, bHasYNeg = false, bHasYPos = false;
+            // Gather boundary light from neighbors
             if (UVoxelChunkComponent* NBX = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx - 1, ChunkCoord.Cy, ChunkCoord.Cz)))
-                if (NBX->LightData.Data.Num() > 0) { NeighborXNeg = NBX->BoundaryLight.XPos; bHasXNeg = true; }
+                if (NBX->LightData.Data.Num() > 0) NeighborXNeg = NBX->BoundaryLight.XPos;
             if (UVoxelChunkComponent* PBX = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx + 1, ChunkCoord.Cy, ChunkCoord.Cz)))
-                if (PBX->LightData.Data.Num() > 0) { NeighborXPos = PBX->BoundaryLight.XNeg; bHasXPos = true; }
+                if (PBX->LightData.Data.Num() > 0) NeighborXPos = PBX->BoundaryLight.XNeg;
             if (UVoxelChunkComponent* NBY = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy - 1, ChunkCoord.Cz)))
-                if (NBY->LightData.Data.Num() > 0) { NeighborYNeg = NBY->BoundaryLight.YPos; bHasYNeg = true; }
+                if (NBY->LightData.Data.Num() > 0) NeighborYNeg = NBY->BoundaryLight.YPos;
             if (UVoxelChunkComponent* PBY = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy + 1, ChunkCoord.Cz)))
-                if (PBY->LightData.Data.Num() > 0) { NeighborYPos = PBY->BoundaryLight.YNeg; bHasYPos = true; }
-
-            // Vertical neighbors always exist or are truly at world top/bottom
+                if (PBY->LightData.Data.Num() > 0) NeighborYPos = PBY->BoundaryLight.YNeg;
             if (UVoxelChunkComponent* NBZ = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz - 1)))
                 if (NBZ->LightData.Data.Num() > 0) NeighborZNeg = NBZ->BoundaryLight.ZPos;
             if (UVoxelChunkComponent* PBZ = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz + 1)))
                 if (PBZ->LightData.Data.Num() > 0) NeighborZPos = PBZ->BoundaryLight.ZNeg;
 
-            // Apply neighbor boundary light
+            // Apply neighbor boundary light (flood-fills inward from edges)
             VoxelLighting::ApplyBoundaryLightFromNeighbors(LightData, CategoryData,
                 NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos);
-
-            // WORLD EDGE FIX: Remove light from faces at world boundary
-            // Problem: Edges without neighbors get treated as "exposed to sky"
-            // Solution: Remove light from any face that's exposed to unloaded chunks
-            if (!bHasXNeg || !bHasXPos || !bHasYNeg || !bHasYPos)
-            {
-                TArray<FIntVector> DarkenPositions;
-
-                // Collect positions to darken
-                for (int32 z = 0; z < LightData.SizeZ; ++z)
-                {
-                    for (int32 y = 0; y < LightData.SizeY; ++y)
-                    {
-                        // Check XNeg face - darken if no neighbor (regardless of solid/air)
-                        if (!bHasXNeg && LightData.GetSkyLight(0, y, z) > 0)
-                            DarkenPositions.Add(FIntVector(0, y, z));
-                        // Check XPos face
-                        if (!bHasXPos && LightData.GetSkyLight(LightData.SizeX - 1, y, z) > 0)
-                            DarkenPositions.Add(FIntVector(LightData.SizeX - 1, y, z));
-                    }
-                    for (int32 x = 0; x < LightData.SizeX; ++x)
-                    {
-                        // Check YNeg face
-                        if (!bHasYNeg && LightData.GetSkyLight(x, 0, z) > 0)
-                            DarkenPositions.Add(FIntVector(x, 0, z));
-                        // Check YPos face
-                        if (!bHasYPos && LightData.GetSkyLight(x, LightData.SizeY - 1, z) > 0)
-                            DarkenPositions.Add(FIntVector(x, LightData.SizeY - 1, z));
-                    }
-                }
-
-                // Remove light from collected positions using the proper algorithm
-                for (const FIntVector& Pos : DarkenPositions)
-                {
-                    VoxelLighting::RemoveLightFrom(LightData, CategoryData, Pos, true);
-                }
-            }
         }
 
         UE_LOG(LogVoxelChunk, Verbose, TEXT("[LIGHT] Chunk (%d,%d,%d) rebuilt | Exposed: %d | Data: %d bytes"),
