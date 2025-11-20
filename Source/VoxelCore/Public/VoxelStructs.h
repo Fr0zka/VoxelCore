@@ -475,7 +475,166 @@ public:
         }
     }
 };
-class UVoxelBiomeDef; // forward declare, pas d’include ici
+// ============================================================================
+// VOXEL LIGHTING SYSTEM
+// ============================================================================
+// Stores per-voxel lighting in a compact format.
+// Each voxel has:
+//   - Sky Light (4 bits): 0-15, sunlight from above
+//   - Block Light (4 bits): 0-15, from torches/lava/glowing blocks
+//
+// Total: 1 byte per voxel (vs 2 bits for category)
+//
+// Design Philosophy:
+//   - Minecraft-style flood-fill propagation (no light leaking)
+//   - Separate from category data (optional per chunk)
+//   - Cache-friendly linear layout
+//   - SIMD-friendly for batch operations
+// ============================================================================
+
+struct FVoxelLightData
+{
+    int32 SizeX = 0;
+    int32 SizeY = 0;
+    int32 SizeZ = 0;
+
+    // Packed light data: 1 byte per voxel
+    // Low nibble (bits 0-3): Sky Light (0-15)
+    // High nibble (bits 4-7): Block Light (0-15)
+    TArray<uint8> Data;
+
+    /**
+     * Initialize the light data with the given dimensions.
+     * All lights start at 0 (pitch black).
+     */
+    void Init(int32 InX, int32 InY, int32 InZ)
+    {
+        SizeX = InX;
+        SizeY = InY;
+        SizeZ = InZ;
+        const int64 TotalVoxels = static_cast<int64>(SizeX) * SizeY * SizeZ;
+        Data.SetNumZeroed(static_cast<int32>(TotalVoxels));
+    }
+
+    /**
+     * Compute the linear index for voxel (x,y,z).
+     * Same layout as FCategoryBitset for consistency.
+     */
+    FORCEINLINE int64 LinearIndex(int32 X, int32 Y, int32 Z) const
+    {
+        return static_cast<int64>(X) + static_cast<int64>(Y) * SizeX + static_cast<int64>(Z) * SizeX * SizeY;
+    }
+
+    /**
+     * Set sky light value (0-15) for voxel (x,y,z).
+     * No bounds checking.
+     */
+    FORCEINLINE void SetSkyLight(int32 X, int32 Y, int32 Z, uint8 Light)
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        Light = FMath::Clamp(Light, (uint8)0, (uint8)15);
+        Data[idx] = (Data[idx] & 0xF0) | Light;  // Preserve block light, set sky light
+    }
+
+    /**
+     * Set block light value (0-15) for voxel (x,y,z).
+     * No bounds checking.
+     */
+    FORCEINLINE void SetBlockLight(int32 X, int32 Y, int32 Z, uint8 Light)
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        Light = FMath::Clamp(Light, (uint8)0, (uint8)15);
+        Data[idx] = (Data[idx] & 0x0F) | (Light << 4);  // Preserve sky light, set block light
+    }
+
+    /**
+     * Set both lights at once (more efficient than two calls).
+     */
+    FORCEINLINE void SetLights(int32 X, int32 Y, int32 Z, uint8 SkyLight, uint8 BlockLight)
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        SkyLight = FMath::Clamp(SkyLight, (uint8)0, (uint8)15);
+        BlockLight = FMath::Clamp(BlockLight, (uint8)0, (uint8)15);
+        Data[idx] = SkyLight | (BlockLight << 4);
+    }
+
+    /**
+     * Get sky light value (0-15) for voxel (x,y,z).
+     */
+    FORCEINLINE uint8 GetSkyLight(int32 X, int32 Y, int32 Z) const
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        return Data[idx] & 0x0F;
+    }
+
+    /**
+     * Get block light value (0-15) for voxel (x,y,z).
+     */
+    FORCEINLINE uint8 GetBlockLight(int32 X, int32 Y, int32 Z) const
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        return (Data[idx] >> 4) & 0x0F;
+    }
+
+    /**
+     * Get combined light value (max of sky and block).
+     * This is what shaders typically use for final lighting.
+     */
+    FORCEINLINE uint8 GetCombinedLight(int32 X, int32 Y, int32 Z) const
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        const uint8 packed = Data[idx];
+        const uint8 sky = packed & 0x0F;
+        const uint8 block = (packed >> 4) & 0x0F;
+        return FMath::Max(sky, block);
+    }
+
+    /**
+     * Get both lights at once (for algorithms that need both).
+     * Returns packed byte: low nibble = sky, high nibble = block.
+     */
+    FORCEINLINE uint8 GetPackedLight(int32 X, int32 Y, int32 Z) const
+    {
+        const int64 idx = LinearIndex(X, Y, Z);
+        return Data[idx];
+    }
+
+    /**
+     * Check if voxel is fully lit (sky light = 15).
+     */
+    FORCEINLINE bool IsFullyLit(int32 X, int32 Y, int32 Z) const
+    {
+        return GetSkyLight(X, Y, Z) == 15;
+    }
+
+    /**
+     * Check if voxel is pitch black (no light at all).
+     */
+    FORCEINLINE bool IsPitchBlack(int32 X, int32 Y, int32 Z) const
+    {
+        return Data[LinearIndex(X, Y, Z)] == 0;
+    }
+
+    /**
+     * Fill entire chunk with a specific light level (for initialization).
+     */
+    void Fill(uint8 SkyLight, uint8 BlockLight)
+    {
+        const uint8 packed = (SkyLight & 0x0F) | ((BlockLight & 0x0F) << 4);
+        FMemory::Memset(Data.GetData(), packed, Data.Num());
+    }
+
+    /**
+     * Clear all lighting (set everything to 0).
+     */
+    void Clear()
+    {
+        FMemory::Memzero(Data.GetData(), Data.Num());
+    }
+};
+
+
+class UVoxelBiomeDef; // forward declare, pas d'include ici
 
 // Grille 2D paddée (SX+2 x SY+2) : Z de surface en monde + pointeur sur le biome choisi
 struct FBiomeGrid2D
