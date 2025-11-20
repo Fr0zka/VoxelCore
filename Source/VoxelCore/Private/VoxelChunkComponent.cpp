@@ -474,22 +474,30 @@ void UVoxelChunkComponent::OnGenerationComplete()
             VoxelLighting::ApplyBoundaryLightFromNeighbors(LightData, CategoryData,
                 NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos);
 
-            // WORLD EDGE FIX: Darken horizontal edges that have no neighbor (prevents light leaking at world boundary)
-            // Only darken if chunk is underground (below surface) - surface chunks should stay lit
-            if (!bTopExposed && (!bHasXNeg || !bHasXPos || !bHasYNeg || !bHasYPos))
+            // WORLD EDGE FIX: Darken solid voxels at edges without neighbors
+            // This prevents light leaking at world boundaries for cave faces
+            // We check each voxel individually - only darken if it's solid (not air)
+            if (!bHasXNeg || !bHasXPos || !bHasYNeg || !bHasYPos)
             {
-                // This is an underground chunk at world edge - darken the exposed faces
                 for (int32 z = 0; z < LightData.SizeZ; ++z)
                 {
                     for (int32 y = 0; y < LightData.SizeY; ++y)
                     {
-                        if (!bHasXNeg) LightData.SetSkyLight(0, y, z, 0);
-                        if (!bHasXPos) LightData.SetSkyLight(LightData.SizeX - 1, y, z, 0);
+                        // Darken XNeg face if no neighbor and voxel is solid
+                        if (!bHasXNeg && CategoryData.Get(0, y, z) != 0)
+                            LightData.SetSkyLight(0, y, z, 0);
+                        // Darken XPos face if no neighbor and voxel is solid
+                        if (!bHasXPos && CategoryData.Get(LightData.SizeX - 1, y, z) != 0)
+                            LightData.SetSkyLight(LightData.SizeX - 1, y, z, 0);
                     }
                     for (int32 x = 0; x < LightData.SizeX; ++x)
                     {
-                        if (!bHasYNeg) LightData.SetSkyLight(x, 0, z, 0);
-                        if (!bHasYPos) LightData.SetSkyLight(x, LightData.SizeY - 1, z, 0);
+                        // Darken YNeg face if no neighbor and voxel is solid
+                        if (!bHasYNeg && CategoryData.Get(x, 0, z) != 0)
+                            LightData.SetSkyLight(x, 0, z, 0);
+                        // Darken YPos face if no neighbor and voxel is solid
+                        if (!bHasYPos && CategoryData.Get(x, LightData.SizeY - 1, z) != 0)
+                            LightData.SetSkyLight(x, LightData.SizeY - 1, z, 0);
                     }
                 }
             }
