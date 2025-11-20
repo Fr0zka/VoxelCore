@@ -66,9 +66,9 @@ uint GetCategoryGlobal(int x, int y, int z)
             uint idx = (uint) x + (uint) y * SizeX;
             return NeighborZN[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
-    
+
     if (z >= (int) SizeZ)
     {
         // Top neighbor (+Z)
@@ -79,7 +79,7 @@ uint GetCategoryGlobal(int x, int y, int z)
             uint idx = (uint) x + (uint) y * SizeX;
             return NeighborZP[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
 
     // Handle X-axis neighbors (left/right)
@@ -95,9 +95,9 @@ uint GetCategoryGlobal(int x, int y, int z)
                 : ((uint) z + (uint) y * SizeZ); // ZY layout
             return NeighborXN[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
-    
+
     if (x >= (int) SizeX)
     {
         // Right neighbor (+X)
@@ -109,7 +109,7 @@ uint GetCategoryGlobal(int x, int y, int z)
                 : ((uint) z + (uint) y * SizeZ); // ZY layout
             return NeighborXP[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
 
     // Handle Y-axis neighbors (front/back)
@@ -124,9 +124,9 @@ uint GetCategoryGlobal(int x, int y, int z)
                 : ((uint) z + (uint) x * SizeZ); // ZX layout
             return NeighborYN[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
-    
+
     if (y >= (int) SizeY)
     {
         // Front neighbor (+Y)
@@ -138,11 +138,11 @@ uint GetCategoryGlobal(int x, int y, int z)
                 : ((uint) z + (uint) x * SizeZ); // ZX layout
             return NeighborYP[idx] & 0xFFu;
         }
-        return 0u; // Air if no neighbor data
+        return 2u; // WORLD EDGE CULLING: Solid if no neighbor (prevents cave openings at edges)
     }
 
-    // Shouldn't reach here, but return air as fallback
-    return 0u;
+    // Shouldn't reach here, but return solid as fallback
+    return 2u; // WORLD EDGE CULLING: Treat unknown edges as solid
 }
 
 uint PackVert(uint px, uint py, uint pz, uint normal, uint block)
