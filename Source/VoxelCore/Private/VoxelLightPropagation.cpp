@@ -421,6 +421,18 @@ namespace VoxelLighting
 				}
 			}
 		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 y = 0; y < SY; ++y)
+				{
+					LightData.SetSkyLight(0, y, z, 0);
+					LightData.SetBlockLight(0, y, z, 0);
+				}
+			}
+		}
 		if (InXPos.Num() == SY * SZ)
 		{
 			for (int32 z = 0; z < SZ; ++z)
@@ -429,6 +441,18 @@ namespace VoxelLighting
 				{
 					const uint8 Light = InXPos[y + z * SY];
 					if (Light > 1) ApplyBoundary(SX - 1, y, z, Light - 1);
+				}
+			}
+		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 y = 0; y < SY; ++y)
+				{
+					LightData.SetSkyLight(SX - 1, y, z, 0);
+					LightData.SetBlockLight(SX - 1, y, z, 0);
 				}
 			}
 		}
@@ -445,6 +469,18 @@ namespace VoxelLighting
 				}
 			}
 		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					LightData.SetSkyLight(x, 0, z, 0);
+					LightData.SetBlockLight(x, 0, z, 0);
+				}
+			}
+		}
 		if (InYPos.Num() == SX * SZ)
 		{
 			for (int32 z = 0; z < SZ; ++z)
@@ -453,6 +489,18 @@ namespace VoxelLighting
 				{
 					const uint8 Light = InYPos[x + z * SX];
 					if (Light > 1) ApplyBoundary(x, SY - 1, z, Light - 1);
+				}
+			}
+		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 z = 0; z < SZ; ++z)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					LightData.SetSkyLight(x, SY - 1, z, 0);
+					LightData.SetBlockLight(x, SY - 1, z, 0);
 				}
 			}
 		}
@@ -469,6 +517,18 @@ namespace VoxelLighting
 				}
 			}
 		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 y = 0; y < SY; ++y)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					LightData.SetSkyLight(x, y, 0, 0);
+					LightData.SetBlockLight(x, y, 0, 0);
+				}
+			}
+		}
 		if (InZPos.Num() == SX * SY)
 		{
 			for (int32 y = 0; y < SY; ++y)
@@ -477,6 +537,18 @@ namespace VoxelLighting
 				{
 					const uint8 Light = InZPos[x + y * SX];
 					if (Light > 1) ApplyBoundary(x, y, SZ - 1, Light - 1);
+				}
+			}
+		}
+		else
+		{
+			// No neighbor: this face borders the void, so it should be dark
+			for (int32 y = 0; y < SY; ++y)
+			{
+				for (int32 x = 0; x < SX; ++x)
+				{
+					LightData.SetSkyLight(x, y, SZ - 1, 0);
+					LightData.SetBlockLight(x, y, SZ - 1, 0);
 				}
 			}
 		}
