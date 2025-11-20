@@ -112,35 +112,61 @@ struct VOXELCORE_API FBiomeTerrainParams {
     float IslandBandHalfThickness = 18.0f;
 
     // ==================== CAVES ====================
+    // New 3D cave system: realistic chambers and tunnels
+    // Uses pure world-space noise to avoid surface correlation artifacts
 
     // Cave density multiplier
     // 0.0 = no caves, 1.0 = normal caves, 2.0+ = swiss cheese terrain
     UPROPERTY(EditAnywhere, Category="Terrain|Caves", meta=(ClampMin="0.0", ClampMax="5.0", UIMin="0.0", UIMax="3.0"))
     float CaveDensity = 1.0f;
 
-    // 2D cave mask frequency
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="0.0001", ClampMax="0.01"))
-    float CaveFrequency2D = 0.002f;
+    // Base threshold for cave carving (higher = fewer/smaller caves)
+    // Perlin noise is in range [-1, 1], so threshold 0.0 = ~50% caves, 0.3 = ~35% caves
+    // Range: -0.5 to 0.5, typical values -0.1 to 0.2
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves", meta=(ClampMin="-0.5", ClampMax="0.5", UIMin="-0.2", UIMax="0.3"))
+    float CaveThreshold = 0.0f;
 
-    // 2D cave mask octaves
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="1", ClampMax="6"))
-    int32 CaveOctaves2D = 3;
+    // === CHAMBER PARAMETERS (Large open spaces) ===
 
-    // 2D cave lacunarity
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="1.0", ClampMax="4.0"))
-    float CaveLacunarity2D = 2.0f;
+    // Chamber frequency (lower = larger chambers)
+    // Frequency of 0.004 = wavelength ~250 voxels = medium-large chambers
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Chambers", meta=(ClampMin="0.0001", ClampMax="0.01", UIMin="0.0005", UIMax="0.005"))
+    float CaveChamberFrequency = 0.004f;
 
-    // 2D cave gain
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float CaveGain2D = 0.5f;
+    // Chamber detail octaves
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Chambers", meta=(ClampMin="1", ClampMax="4"))
+    int32 CaveChamberOctaves = 3;
 
-    // 3D cave tube frequency
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="0.0001", ClampMax="0.01"))
-    float CaveFrequency3D = 0.002f;
+    // === TUNNEL PARAMETERS (Connecting passages) ===
 
-    // 3D cave tube octaves
-    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Advanced", meta=(ClampMin="1", ClampMax="6"))
-    int32 CaveOctaves3D = 3;
+    // Tunnel frequency (higher = more intricate tunnels)
+    // Frequency of 0.008 = wavelength ~125 voxels = medium tunnels
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Tunnels", meta=(ClampMin="0.0001", ClampMax="0.01", UIMin="0.001", UIMax="0.008"))
+    float CaveTunnelFrequency = 0.008f;
+
+    // Tunnel detail octaves
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Tunnels", meta=(ClampMin="1", ClampMax="4"))
+    int32 CaveTunnelOctaves = 4;
+
+    // === DOMAIN WARPING (Creates organic, curvy shapes) ===
+
+    // Warp frequency (controls curvature scale)
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Warping", meta=(ClampMin="0.0001", ClampMax="0.01", UIMin="0.001", UIMax="0.005"))
+    float CaveWarpFrequency = 0.002f;
+
+    // Warp amplitude (controls how much caves curve)
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Warping", meta=(ClampMin="0.0", ClampMax="500.0", UIMin="10.0", UIMax="200.0"))
+    float CaveWarpAmplitude = 80.0f;
+
+    // === NOISE PARAMETERS ===
+
+    // Lacunarity for cave noise (frequency multiplier per octave)
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Noise", meta=(ClampMin="1.0", ClampMax="4.0"))
+    float CaveLacunarity = 2.0f;
+
+    // Gain for cave noise (amplitude multiplier per octave)
+    UPROPERTY(EditAnywhere, Category="Terrain|Caves|Noise", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float CaveGain = 0.5f;
 
     // Constructor with default values
     FBiomeTerrainParams()
@@ -163,12 +189,15 @@ struct VOXELCORE_API FBiomeTerrainParams {
         , IslandFrequency(1.f / 48.f)
         , IslandThreshold(0.55f)
         , CaveDensity(1.0f)
-        , CaveFrequency2D(0.002f)
-        , CaveOctaves2D(3)
-        , CaveLacunarity2D(2.0f)
-        , CaveGain2D(0.5f)
-        , CaveFrequency3D(0.002f)
-        , CaveOctaves3D(3)
+        , CaveThreshold(0.0f)
+        , CaveChamberFrequency(0.004f)
+        , CaveChamberOctaves(3)
+        , CaveTunnelFrequency(0.008f)
+        , CaveTunnelOctaves(4)
+        , CaveWarpFrequency(0.002f)
+        , CaveWarpAmplitude(80.0f)
+        , CaveLacunarity(2.0f)
+        , CaveGain(0.5f)
     {}
 };
 

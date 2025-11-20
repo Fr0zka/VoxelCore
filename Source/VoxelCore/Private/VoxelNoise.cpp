@@ -324,62 +324,95 @@ float FVoxelNoiseContext::MacroSurfaceZ_Biome(float x, float y, int32 BaseHeight
 
 bool FVoxelNoiseContext::IsCave_Biome(float x, float y, float zWorld, float terrainH, const FBiomeTerrainParams& Params) const
 {
-	// Skip caves entirely if density is 0 in this biome
+	// === NEW 3D CAVE SYSTEM: Realistic chambers and tunnels ===
+	// CRITICAL DESIGN: Uses ONLY world coordinates (x, y, zWorld) for noise generation
+	// NEVER uses terrainH or depth in noise calculations to avoid surface topology replication
+
 	if (Params.CaveDensity <= 0.f) return false;
 
 	const float depth = terrainH - zWorld;
-	if (depth < 2.f) return false; // No caves too close to surface
+	if (depth < 2.f) return false; // No caves within 2 voxels of surface
 
-	// Surface modifier: fewer caves near surface
-	const float surf = FMath::Clamp(1.f - depth / 24.f, 0.f, 1.f);
+	// === STEP 1: Domain Warping (creates organic, curvy cave shapes) ===
+	// Apply 3D displacement to break up grid-aligned patterns and create natural curves
+	const float warpFreq = Params.CaveWarpFrequency;
+	const float warpAmp = Params.CaveWarpAmplitude;
 
-	// === STAGE 1: 2D cave mask (horizontal tunnels) ===
-	// Custom 2D noise sampling with biome cave parameters
-	const float sx = x * Params.CaveFrequency2D;
-	const float sy = y * Params.CaveFrequency2D;
-	float sum = 0.f, maxAmp = 0.f, amp = 1.f, freq = 1.f;
+	const float warpX = x + FMath::PerlinNoise3D(FVector(x * warpFreq, y * warpFreq, zWorld * warpFreq)) * warpAmp;
+	const float warpY = y + FMath::PerlinNoise3D(FVector(x * warpFreq + 731.f, y * warpFreq + 731.f, zWorld * warpFreq + 731.f)) * warpAmp;
+	const float warpZ = zWorld + FMath::PerlinNoise3D(FVector(x * warpFreq + 1499.f, y * warpFreq + 1499.f, zWorld * warpFreq + 1499.f)) * warpAmp;
 
-	for (int32 i = 0; i < Params.CaveOctaves2D; ++i)
+	// === STEP 2: Large-scale chamber noise (low frequency = big open spaces) ===
+	float chamberSum = 0.f, chamberMaxAmp = 0.f, chamberAmp = 1.f, chamberFreq = 1.f;
+	const float chamberBaseFreq = Params.CaveChamberFrequency;
+
+	for (int32 i = 0; i < Params.CaveChamberOctaves; ++i)
 	{
-		sum += FMath::PerlinNoise2D(FVector2D(sx * freq, sy * freq)) * amp;
-		maxAmp += amp;
-		freq *= Params.CaveLacunarity2D;
-		amp *= Params.CaveGain2D;
+		chamberSum += FMath::PerlinNoise3D(FVector(
+			warpX * chamberBaseFreq * chamberFreq,
+			warpY * chamberBaseFreq * chamberFreq,
+			warpZ * chamberBaseFreq * chamberFreq
+		)) * chamberAmp;
+
+		chamberMaxAmp += chamberAmp;
+		chamberFreq *= Params.CaveLacunarity;
+		chamberAmp *= Params.CaveGain;
 	}
 
-	const float t2d = (sum / maxAmp) * 0.5f + 0.5f; // Normalize to [0,1]
-	const float th2d = 0.68f - 0.10f * surf;
+	const float chamberNoise = chamberSum / chamberMaxAmp; // Range: [-1, 1]
 
-	// Adjust threshold by cave density (higher density = easier to pass threshold)
-	const bool mask = (t2d > th2d / Params.CaveDensity);
-	if (!mask) return false;
+	// === STEP 3: Medium-scale tunnel noise (higher frequency = intricate passages) ===
+	float tunnelSum = 0.f, tunnelMaxAmp = 0.f, tunnelAmp = 1.f, tunnelFreq = 1.f;
+	const float tunnelBaseFreq = Params.CaveTunnelFrequency;
 
-	// === STAGE 2: 3D cave tube (vertical variation) ===
-	// Custom 3D noise sampling with biome cave parameters
-	const float sx3d = x * Params.CaveFrequency3D;
-	const float sy3d = y * Params.CaveFrequency3D;
-	const float sz3d = zWorld * Params.CaveFrequency3D;
-	float sum3d = 0.f, maxAmp3d = 0.f, amp3d = 1.f, freq3d = 1.f;
-
-	for (int32 i = 0; i < Params.CaveOctaves3D; ++i)
+	for (int32 i = 0; i < Params.CaveTunnelOctaves; ++i)
 	{
-		sum3d += FMath::PerlinNoise3D(FVector(sx3d * freq3d, sy3d * freq3d, sz3d * freq3d)) * amp3d;
-		maxAmp3d += amp3d;
-		freq3d *= Params.CaveLacunarity2D; // Reuse 2D lacunarity for consistency
-		amp3d *= Params.CaveGain2D;
+		tunnelSum += FMath::PerlinNoise3D(FVector(
+			warpX * tunnelBaseFreq * tunnelFreq,
+			warpY * tunnelBaseFreq * tunnelFreq,
+			warpZ * tunnelBaseFreq * tunnelFreq
+		)) * tunnelAmp;
+
+		tunnelMaxAmp += tunnelAmp;
+		tunnelFreq *= Params.CaveLacunarity;
+		tunnelAmp *= Params.CaveGain;
 	}
 
-	const float n3d = FMath::Abs(sum3d / maxAmp3d);
+	const float tunnelNoise = tunnelSum / tunnelMaxAmp; // Range: [-1, 1]
 
-	// Cave radius increases with depth
-	const float k = FMath::Clamp(depth / 96.f, 0.f, 1.f);
-	const float baseRad = FMath::Lerp(0.12f, 0.20f, k);
+	// === STEP 4: Combine chambers and tunnels ===
+	// Use max() to create union: cave exists if EITHER chamber OR tunnel is present
+	// Scale tunnel contribution to make tunnels slightly smaller than chambers
+	const float caveNoise = FMath::Max(chamberNoise, tunnelNoise * 0.7f);
 
-	// Scale radius by square root of density (more caves = larger radius)
-	const float rad = baseRad * FMath::Sqrt(Params.CaveDensity);
-	const bool tube = (n3d < rad);
+	// === STEP 5: Apply threshold with density scaling ===
+	// Higher density = lower effective threshold = more caves
+	float threshold = Params.CaveThreshold / Params.CaveDensity;
 
-	return tube;
+	// === STEP 6: Top surface suppression (smooth fade near surface) ===
+	// NOTE: This uses depth BUT only for local fade effect, NOT for pattern generation
+	// Applied to threshold (not noise), so caves smoothly disappear near surface
+	if (depth < 24.f)
+	{
+		// Smoothly suppress caves from 2 to 24 voxels below surface
+		const float surfaceFade = FMath::SmoothStep(2.f, 24.f, depth);
+		threshold += (1.f - surfaceFade) * 0.3f; // Increase threshold = fewer caves near surface
+	}
+
+	// === STEP 7: Bottom fade zone (prevents surface replication at MaxCaveDepth boundary) ===
+	// CRITICAL: Must use ABSOLUTE world Z coordinates, NOT depth from surface!
+	// Using depth would make the fade boundary follow surface contours, causing replication.
+	// Fade from Z = 50 (caves present) to Z = 0 (no caves) - horizontal fade plane
+	if (zWorld < 50.f)
+	{
+		// Smoothly suppress caves from absolute Z = 50 down to Z = 0
+		const float bottomFade = 1.f - FMath::SmoothStep(0.f, 50.f, zWorld);
+		threshold += bottomFade * 2.0f; // Strong suppression - caves fade out completely
+	}
+
+	// === FINAL CAVE CHECK ===
+	// Cave exists where noise value exceeds threshold
+	return (caveNoise > threshold);
 }
 
 void FVoxelNoiseContext::SampleClimate(float x, float y, float& outTemp, float& outMoist) const

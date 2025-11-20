@@ -339,12 +339,15 @@ void FVoxelGPUGenerator::GenerateChunkGPU(
             Data.IslandBandHalfThickness = P.IslandBandHalfThickness;
 
             Data.CaveDensity = P.CaveDensity;
-            Data.CaveFrequency2D = P.CaveFrequency2D;
-            Data.CaveOctaves2D = P.CaveOctaves2D;
-            Data.CaveLacunarity2D = P.CaveLacunarity2D;
-            Data.CaveGain2D = P.CaveGain2D;
-            Data.CaveFrequency3D = P.CaveFrequency3D;
-            Data.CaveOctaves3D = P.CaveOctaves3D;
+            Data.CaveThreshold = P.CaveThreshold;
+            Data.CaveChamberFrequency = P.CaveChamberFrequency;
+            Data.CaveChamberOctaves = P.CaveChamberOctaves;
+            Data.CaveTunnelFrequency = P.CaveTunnelFrequency;
+            Data.CaveTunnelOctaves = P.CaveTunnelOctaves;
+            Data.CaveWarpFrequency = P.CaveWarpFrequency;
+            Data.CaveWarpAmplitude = P.CaveWarpAmplitude;
+            Data.CaveLacunarity = P.CaveLacunarity;
+            Data.CaveGain = P.CaveGain;
 
             // OPTION B: No block data packing needed (blocks generated on CPU)
             BiomeDataArray.Add(Data);

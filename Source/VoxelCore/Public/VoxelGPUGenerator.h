@@ -109,14 +109,17 @@ private:
         float IslandBandCenterZ;
         float IslandBandHalfThickness;
 
-        // Cave parameters
+        // Cave parameters (New 3D system)
         float CaveDensity;
-        float CaveFrequency2D;
-        int32 CaveOctaves2D;
-        float CaveLacunarity2D;
-        float CaveGain2D;
-        float CaveFrequency3D;
-        int32 CaveOctaves3D;
+        float CaveThreshold;
+        float CaveChamberFrequency;
+        int32 CaveChamberOctaves;
+        float CaveTunnelFrequency;
+        int32 CaveTunnelOctaves;
+        float CaveWarpFrequency;
+        float CaveWarpAmplitude;
+        float CaveLacunarity;
+        float CaveGain;
 
         // No block data needed - OPTION B generates BiomeGrid on GPU, blocks on CPU
     };

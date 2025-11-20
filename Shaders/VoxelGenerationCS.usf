@@ -44,14 +44,17 @@ struct BiomeData
     float IslandBandCenterZ;
     float IslandBandHalfThickness;
 
-    // Cave parameters
+    // Cave parameters (New 3D system)
     float CaveDensity;
-    float CaveFrequency2D;
-    int CaveOctaves2D;
-    float CaveLacunarity2D;
-    float CaveGain2D;
-    float CaveFrequency3D;
-    int CaveOctaves3D;
+    float CaveThreshold;
+    float CaveChamberFrequency;
+    int CaveChamberOctaves;
+    float CaveTunnelFrequency;
+    int CaveTunnelOctaves;
+    float CaveWarpFrequency;
+    float CaveWarpAmplitude;
+    float CaveLacunarity;
+    float CaveGain;
 
     // OPTION B: No block data needed (blocks generated on CPU)
 };
@@ -268,9 +271,12 @@ float MacroSurfaceZ_Biome(float x, float y)
 }
 
 // Check if a voxel is carved by caves (using per-column biome parameters)
+// NEW 3D CAVE SYSTEM: Realistic chambers and tunnels
+// CRITICAL DESIGN: Uses ONLY world coordinates (x, y, zWorld) for noise generation
+// NEVER uses terrainH or depth in noise calculations to avoid surface topology replication
 bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
 {
-    // Sample climate and pick biome for this XY column (same as MacroSurfaceZ_Biome)
+    // Sample climate and pick biome for this XY column
     float Temp, Moist;
     SampleClimate(x, y, Temp, Moist);
     int biomeIdx = PickBiome(Temp, Moist);
@@ -283,57 +289,94 @@ bool IsCave_Biome(float x, float y, float zWorld, float terrainH)
 
     float depth = terrainH - zWorld;
     if (depth < 2.0)
-        return false;
+        return false; // No caves within 2 voxels of surface
 
-    // Surface modifier
-    float surf = clamp(1.0 - depth / 24.0, 0.0, 1.0);
+    // === STEP 1: Domain Warping (creates organic, curvy cave shapes) ===
+    // Apply 3D displacement to break up grid-aligned patterns
+    float warpFreq = biome.CaveWarpFrequency;
+    float warpAmp = biome.CaveWarpAmplitude;
 
-    // 2D cave mask using biome-specific parameters
-    float sx = x * biome.CaveFrequency2D;
-    float sy = y * biome.CaveFrequency2D;
-    float sum = 0.0;
-    float maxAmp = 0.0;
-    float amp = 1.0;
-    float freq = 1.0;
+    float warpX = x + PerlinNoise3D(x * warpFreq, y * warpFreq, zWorld * warpFreq) * warpAmp;
+    float warpY = y + PerlinNoise3D(x * warpFreq + 731.0, y * warpFreq + 731.0, zWorld * warpFreq + 731.0) * warpAmp;
+    float warpZ = zWorld + PerlinNoise3D(x * warpFreq + 1499.0, y * warpFreq + 1499.0, zWorld * warpFreq + 1499.0) * warpAmp;
 
-    for (int i = 0; i < biome.CaveOctaves2D; ++i)
+    // === STEP 2: Large-scale chamber noise (low frequency = big open spaces) ===
+    float chamberSum = 0.0;
+    float chamberMaxAmp = 0.0;
+    float chamberAmp = 1.0;
+    float chamberFreq = 1.0;
+    float chamberBaseFreq = biome.CaveChamberFrequency;
+
+    for (int i = 0; i < biome.CaveChamberOctaves; ++i)
     {
-        sum += PerlinNoise2D(sx * freq, sy * freq) * amp;
-        maxAmp += amp;
-        freq *= biome.CaveLacunarity2D;
-        amp *= biome.CaveGain2D;
+        chamberSum += PerlinNoise3D(
+            warpX * chamberBaseFreq * chamberFreq,
+            warpY * chamberBaseFreq * chamberFreq,
+            warpZ * chamberBaseFreq * chamberFreq
+        ) * chamberAmp;
+
+        chamberMaxAmp += chamberAmp;
+        chamberFreq *= biome.CaveLacunarity;
+        chamberAmp *= biome.CaveGain;
     }
 
-    float t2d = (sum / maxAmp) * 0.5 + 0.5;
-    float th2d = 0.68 - 0.10 * surf;
+    float chamberNoise = chamberSum / chamberMaxAmp; // Range: [-1, 1]
 
-    bool mask = (t2d > th2d / biome.CaveDensity);
-    if (!mask)
-        return false;
+    // === STEP 3: Medium-scale tunnel noise (higher frequency = intricate passages) ===
+    float tunnelSum = 0.0;
+    float tunnelMaxAmp = 0.0;
+    float tunnelAmp = 1.0;
+    float tunnelFreq = 1.0;
+    float tunnelBaseFreq = biome.CaveTunnelFrequency;
 
-    // 3D cave tube using biome-specific parameters
-    float sx3d = x * biome.CaveFrequency3D;
-    float sy3d = y * biome.CaveFrequency3D;
-    float sz3d = zWorld * biome.CaveFrequency3D;
-    float sum3d = 0.0;
-    float maxAmp3d = 0.0;
-    float amp3d = 1.0;
-    float freq3d = 1.0;
-
-    for (int j = 0; j < biome.CaveOctaves3D; ++j)
+    for (int j = 0; j < biome.CaveTunnelOctaves; ++j)
     {
-        sum3d += PerlinNoise3D(sx3d * freq3d, sy3d * freq3d, sz3d * freq3d) * amp3d;
-        maxAmp3d += amp3d;
-        freq3d *= biome.CaveLacunarity2D;
-        amp3d *= biome.CaveGain2D;
+        tunnelSum += PerlinNoise3D(
+            warpX * tunnelBaseFreq * tunnelFreq,
+            warpY * tunnelBaseFreq * tunnelFreq,
+            warpZ * tunnelBaseFreq * tunnelFreq
+        ) * tunnelAmp;
+
+        tunnelMaxAmp += tunnelAmp;
+        tunnelFreq *= biome.CaveLacunarity;
+        tunnelAmp *= biome.CaveGain;
     }
 
-    float n3d = abs(sum3d / maxAmp3d);
-    float k = clamp(depth / 96.0, 0.0, 1.0);
-    float baseRad = lerp(0.12, 0.20, k);
-    float rad = baseRad * sqrt(biome.CaveDensity); // CRITICAL: Apply density scaling to match CPU
+    float tunnelNoise = tunnelSum / tunnelMaxAmp; // Range: [-1, 1]
 
-    return (n3d < rad);
+    // === STEP 4: Combine chambers and tunnels ===
+    // Use max() to create union: cave exists if EITHER chamber OR tunnel is present
+    // Scale tunnel contribution to make tunnels slightly smaller than chambers
+    float caveNoise = max(chamberNoise, tunnelNoise * 0.7);
+
+    // === STEP 5: Apply threshold with density scaling ===
+    // Higher density = lower effective threshold = more caves
+    float threshold = biome.CaveThreshold / biome.CaveDensity;
+
+    // === STEP 6: Top surface suppression (smooth fade near surface) ===
+    // NOTE: This uses depth BUT only for local fade effect, NOT for pattern generation
+    // Applied to threshold (not noise), so caves smoothly disappear near surface
+    if (depth < 24.0)
+    {
+        // Smoothly suppress caves from 2 to 24 voxels below surface
+        float surfaceFade = smoothstep(2.0, 24.0, depth);
+        threshold += (1.0 - surfaceFade) * 0.3; // Increase threshold = fewer caves near surface
+    }
+
+    // === STEP 7: Bottom fade zone (prevents surface replication at MaxCaveDepth boundary) ===
+    // CRITICAL: Must use ABSOLUTE world Z coordinates, NOT depth from surface!
+    // Using depth would make the fade boundary follow surface contours, causing replication.
+    // Fade from Z = 50 (caves present) to Z = 0 (no caves) - horizontal fade plane
+    if (zWorld < 50.0)
+    {
+        // Smoothly suppress caves from absolute Z = 50 down to Z = 0
+        float bottomFade = 1.0 - smoothstep(0.0, 50.0, zWorld);
+        threshold += bottomFade * 2.0; // Strong suppression - caves fade out completely
+    }
+
+    // === FINAL CAVE CHECK ===
+    // Cave exists where noise value exceeds threshold
+    return (caveNoise > threshold);
 }
 
 // Compute 3D density at a world position (using per-column biome parameters)
