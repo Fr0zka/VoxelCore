@@ -453,15 +453,18 @@ void UVoxelChunkComponent::OnGenerationComplete()
         {
             TArray<uint8> NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos;
 
-            // Gather boundary light from neighbors
+            // Gather boundary light from neighbors (only if they exist and have lighting)
+            bool bHasXNeg = false, bHasXPos = false, bHasYNeg = false, bHasYPos = false;
             if (UVoxelChunkComponent* NBX = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx - 1, ChunkCoord.Cy, ChunkCoord.Cz)))
-                if (NBX->LightData.Data.Num() > 0) NeighborXNeg = NBX->BoundaryLight.XPos;
+                if (NBX->LightData.Data.Num() > 0) { NeighborXNeg = NBX->BoundaryLight.XPos; bHasXNeg = true; }
             if (UVoxelChunkComponent* PBX = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx + 1, ChunkCoord.Cy, ChunkCoord.Cz)))
-                if (PBX->LightData.Data.Num() > 0) NeighborXPos = PBX->BoundaryLight.XNeg;
+                if (PBX->LightData.Data.Num() > 0) { NeighborXPos = PBX->BoundaryLight.XNeg; bHasXPos = true; }
             if (UVoxelChunkComponent* NBY = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy - 1, ChunkCoord.Cz)))
-                if (NBY->LightData.Data.Num() > 0) NeighborYNeg = NBY->BoundaryLight.YPos;
+                if (NBY->LightData.Data.Num() > 0) { NeighborYNeg = NBY->BoundaryLight.YPos; bHasYNeg = true; }
             if (UVoxelChunkComponent* PBY = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy + 1, ChunkCoord.Cz)))
-                if (PBY->LightData.Data.Num() > 0) NeighborYPos = PBY->BoundaryLight.YNeg;
+                if (PBY->LightData.Data.Num() > 0) { NeighborYPos = PBY->BoundaryLight.YNeg; bHasYPos = true; }
+
+            // Vertical neighbors always exist or are truly at world top/bottom
             if (UVoxelChunkComponent* NBZ = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz - 1)))
                 if (NBZ->LightData.Data.Num() > 0) NeighborZNeg = NBZ->BoundaryLight.ZPos;
             if (UVoxelChunkComponent* PBZ = OwnerWorld->GetChunk(FVoxelCoord(ChunkCoord.Cx, ChunkCoord.Cy, ChunkCoord.Cz + 1)))
@@ -470,6 +473,26 @@ void UVoxelChunkComponent::OnGenerationComplete()
             // Apply neighbor boundary light
             VoxelLighting::ApplyBoundaryLightFromNeighbors(LightData, CategoryData,
                 NeighborXNeg, NeighborXPos, NeighborYNeg, NeighborYPos, NeighborZNeg, NeighborZPos);
+
+            // WORLD EDGE FIX: Darken horizontal edges that have no neighbor (prevents light leaking at world boundary)
+            // Only darken if chunk is underground (below surface) - surface chunks should stay lit
+            if (!bTopExposed && (!bHasXNeg || !bHasXPos || !bHasYNeg || !bHasYPos))
+            {
+                // This is an underground chunk at world edge - darken the exposed faces
+                for (int32 z = 0; z < LightData.SizeZ; ++z)
+                {
+                    for (int32 y = 0; y < LightData.SizeY; ++y)
+                    {
+                        if (!bHasXNeg) LightData.SetSkyLight(0, y, z, 0);
+                        if (!bHasXPos) LightData.SetSkyLight(LightData.SizeX - 1, y, z, 0);
+                    }
+                    for (int32 x = 0; x < LightData.SizeX; ++x)
+                    {
+                        if (!bHasYNeg) LightData.SetSkyLight(x, 0, z, 0);
+                        if (!bHasYPos) LightData.SetSkyLight(x, LightData.SizeY - 1, z, 0);
+                    }
+                }
+            }
         }
 
         UE_LOG(LogVoxelChunk, Verbose, TEXT("[LIGHT] Chunk (%d,%d,%d) rebuilt | Exposed: %d | Data: %d bytes"),
