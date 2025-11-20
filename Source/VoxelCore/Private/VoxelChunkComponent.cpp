@@ -405,26 +405,28 @@ void UVoxelChunkComponent::OnGenerationComplete()
         // Initialize light data with same dimensions as category data
         LightData.Init(CategoryData.SizeX, CategoryData.SizeY, CategoryData.SizeZ);
 
-        // SMART SKY EXPOSURE DETECTION:
-        // Instead of complex surface checking, use simple heuristic:
-        // - If BiomeGrid has data, check if surface intersects this chunk
-        // - Otherwise, chunks above water level are exposed
+        // STRICT SKY EXPOSURE DETECTION:
+        // Only mark chunk as "exposed" if it's at or above the surface
+        // This prevents underground caves from getting fake skylight
         const int32 ChunkWorldZ = ChunkCoord.Cz * Settings->ChunkSizeZ;
         bool bTopExposed = false;
 
         if (BiomeGrid.IsValid())
         {
-            // Quick scan: if ANY surface point falls within this chunk's Z range, it's exposed
-            const int32 ChunkTopZ = ChunkWorldZ + Settings->ChunkSizeZ;
+            // Find the HIGHEST surface point in this chunk's XY area
+            int32 MaxSurfaceZ = INT32_MIN;
             for (int32 i = 0; i < BiomeGrid.SurfaceZWorld.Num(); ++i)
             {
                 const int16 SurfaceZ = BiomeGrid.SurfaceZWorld[i];
-                if (SurfaceZ >= ChunkWorldZ && SurfaceZ < ChunkTopZ)
+                if (SurfaceZ > MaxSurfaceZ)
                 {
-                    bTopExposed = true;
-                    break;
+                    MaxSurfaceZ = SurfaceZ;
                 }
             }
+
+            // Chunk is "exposed" only if its BOTTOM is at or above the highest surface
+            // This ensures only chunks fully above ground get sky light
+            bTopExposed = (ChunkWorldZ >= MaxSurfaceZ);
         }
         else
         {
