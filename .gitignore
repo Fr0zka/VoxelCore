@@ -1,0 +1,13 @@
+# Ignore everything
+*
+
+# But keep this gitignore file
+!.gitignore
+
+
+# Keep Source folder and its contents
+!/Source/
+!/Source/**
+
+!VoxelForge.uplugin
+!CODEMAP.md
