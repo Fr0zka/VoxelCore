@@ -4,7 +4,7 @@
 > without re-reading the whole plugin. Anchors are `File:line` — line numbers drift
 > as code is edited, so trust the **symbol name** first and the line as a hint.
 >
-> Plugin root: `Source/VoxelForge/` · ~8,300 lines of C++ across 22 files.
+> Plugin root: `Source/VoxelForge/` · ~8,300 lines of C++ across 25 files.
 > Comments in the code are mixed **French + English**. UE module = `VoxelForge` (Runtime).
 
 ---
@@ -83,7 +83,7 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 ### 3.2 Foundational types — `Public/VoxelTypes.h` (no UClass, everyone includes it)
 | Symbol | Line | Notes |
 |--------|------|-------|
-| `CHUNK_SIZE` (32), `CHUNK_SIZE_SQUARED`, `CHUNK_VOLUME` | 19-21 | Chunk dimensions. |
+| `CHUNK_SIZE` (32), `CHUNK_SIZE_SQUARED`, `CHUNK_VOLUME` | 19-21 | Chunk dimensions. (64³ tried for fewer draws → reverted: streaming too bursty. fps is fixed render-side instead.) |
 | `VOXEL_SIZE` (25.0f cm) | 23 | World scale. |
 | `EVoxelFace` enum + `GetFaceDirection` / `GetFaceNormal` | 33-61 | 6 cube faces. |
 | `WorldToChunkCoord` / `WorldToLocalCoord` / `ChunkToWorldPos` | 74-104 | Coord-space conversions (handle negatives via floor/positive-modulo). |
@@ -101,8 +101,8 @@ per-chunk info later.
 `UVoxelSettings : UPrimaryDataAsset` — the single tuning asset assigned on `AVoxelWorld`.
 | Group | Fields (line) |
 |-------|---------------|
-| Streaming | `ViewDistanceXY=16` (26), `ViewDistanceUp/Down=5` (29/32), `MaxConcurrentTasks=16` (36), `MaxMeshAppliesPerFrame=4` (40) |
-| LOD | `LOD0Distance=4` (48), `LOD1Distance=8` (53) |
+| Streaming | `ViewDistanceXY=16`, `ViewDistanceUp/Down=5`, `MaxConcurrentTasks=16`, `MaxMeshAppliesPerFrame=4` (defaults — actual values live on the data asset) |
+| LOD | `LOD0Distance=4`, `LOD1Distance=8` |
 | Rendering | `VoxelMaterial` (61) |
 | Strates | `Seed` (69), `CurrentSeason=1` (73), `StratePool` (78), `FixedStrates` map (83), `TotalStrates=10` (87) |
 | Carving budget | `MaxModifications=0` (97), `MaxBrushRadius=15` (102), `MaxTotalVolume=0` (107). 0 = unlimited. |
@@ -155,6 +155,11 @@ per-chunk info later.
 | **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, dispatches, adds diff offset. |
 | **`GetDensityWithParams`** | 277 | TunnelNetwork pipeline (~1000 lines). See §4. |
 | **`GetSlabDensity`** | 1306 | FlatPlain/CrystalChamber pipeline. See §4.2. |
+| `ComputeSurfaceTerrainZ` / `GetSurfaceDensity` | — | SurfaceWorld heightfield → terrain Z, then density; biome **output-blend** lerps dominant/neighbour heights (`ParamsD`/`ParamsN`/weight). §8.14. |
+| `SampleRelief` / `SampleMoisture` | — | Climate fields (pure XY, [0,1]). Relief = shared source of truth for the relief map M. §8.14. |
+| `SampleBiomeAt` | — | Warped-Voronoi + climate biome query (dominant + neighbour + weight). Reference used by the preview bake + `GetDominantBiomeAt`. §8.14. |
+| `ResolveBiomeSampleAt` / `RebuildBiomeGrid` | — | Hot-path biome resolve (FBiomeSample) via a box-validated per-chunk cell-grid cache. Bit-identical to `SampleBiomeAt`. §8.14, §8.10. |
+| `GetDominantBiomeAt` | — | Game-thread query → dominant biome ASSET (content/atmosphere). §8.14. |
 
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`
 Header is rich with inline docs. Two namespaces + a per-chunk cache system.
@@ -168,7 +173,7 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
 - `namespace VoxelCaveMorphology`:
   | Function | .cpp line | Role |
   |----------|-----------|------|
-  | `BuildChunkCache` | 47 | **Phase 1** (once/chunk): collect rooms, nearest-neighbor backbone, decide tunnels, pre-bake pits/chimneys/columns, hash-roll per-room terrain op. |
+  | `BuildChunkCache` | 47 | **Phase 1** (once/chunk): collect rooms, guaranteed backbone (`bTunnelsFlowTowardOrigin`: tree rooted at the (0,0) hub — every room reachable, links flow inward; false = legacy NN forest), slope-aware link metric (`TunnelHorizontalBias` now applies to backbone too), decide tunnels, **cull zero-connection rooms** (no sealed bubbles), store rooms by their OWN reach (fixes origin-room clipping at `MaxInfluence`), pre-bake pits/chimneys/columns, hash-roll per-room terrain op. |
   | `EvaluateSDFCached` | 589 | **Phase 2** (per voxel): SmoothMin over cached rooms/tunnels; returns nearest room idx for terrain-op lookup. |
   | `EvaluateSDF` | 738 | Convenience wrapper (builds temp cache) for one-off queries. |
 
@@ -192,7 +197,8 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
 **`Public/VoxelStrateDefinition.h`** — `UVoxelStrateDefinition : UPrimaryDataAsset`
 (line 36). One asset = one strate *type*. Fields: identity, `StrateHeightInChunks`(60),
 `TransitionType`(79)/`TransitionBlendChunks`(89), `GeneratorType`(102),
-`GenerationParams`(113), `SlabParams`(124), `TerrainOperations`(147), visuals/fog/light,
+`GenerationParams`(113), `SlabParams`(124), `Biomes[]`+`BiomeMapParams` (the biome list +
+field tuning — empty ⇒ unchanged world, §8.14), `TerrainOperations`(147), visuals/fog/light,
 content lists, audio, `GameplayTags`(223). EditConditions show/hide param groups by generator type.
 
 **`Public/VoxelStrateManager.h` + `.cpp`** — `UVoxelStrateManager : UObject` (h:108).
@@ -209,6 +215,7 @@ Maps depth→strate at runtime; owns passages.
 | `GetStrateForChunk` | 466 | Chunk → definition. |
 | `GetGeneratorTypeForChunk` | 476 | Chunk → generator type. |
 | `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
+| `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
 | `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
 | `BuildParamsFromDefinition` (static) | 771 | Base params + merge all referenced terrain op assets. The one place ops fold into params. |
 
@@ -217,6 +224,17 @@ Maps depth→strate at runtime; owns passages.
 Ribbing, Cliff, Scallop, Overhang, Arch, Column, Pit, Chimney, Dome, Pinch. Per-type
 param groups gated by EditCondition. `ApplyTo(OutParams, Weight)` (.cpp:6) copies only
 the active type's fields into `FStrateGenerationParams`, scaled by Weight.
+
+**`Public/VoxelBiomeTypes.h`** (NEW) — biome vocabulary. `FBiomeMapParams` (Voronoi cell size /
+border warp+blend / climate field freqs), `EBiomePreviewChannel` (preview-bake selector), and plain
+runtime PODs `FBiomeResolved` / `FBiomeContext` / `FBiomeSample` / `FChunkBiomeCache` (the
+box-validated per-chunk grid cache). See §8.14.
+
+**`Public/VoxelBiomeDefinition.h` + `.cpp`** (NEW) — `UVoxelBiomeDefinition : UPrimaryDataAsset`.
+One asset = one biome: identity + `DebugColor`, climate placement box (`ReliefMin/Max`,
+`MoistureMin/Max`), terrain override (`bOverrideTerrain` + `GeneratorType` + archetype params), content profile (`Decorations`/`AmbientActors`,
+atmosphere override, `WaterMaterial`, reserved `MaterialPaletteIndex`), `GameplayTags`. Referenced from
+`UVoxelStrateDefinition::Biomes[]`. Generator-agnostic (surface biomes now, cave biomes later). §8.14.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
 `UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
@@ -279,7 +297,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | 4d — Columns | 1053 | Pre-baked vertical cylinders. |
 | 4g — Domes | 1077 | Room-relative hemispherical ceilings. |
 | 4h — Pinch | 1142 | Passage bottlenecks. |
-| 5 — Worm tunnels | 1241 | abs(noise1)+abs(noise2) connectivity. |
+| 5 — Worm tunnels | 1241 | abs(noise1)+abs(noise2), masked by distance-to-network (`WormNetworkRange`: braids hugging rooms/tunnels, no far-field speckle; 0 = legacy unmasked). |
 | 6 — Boundary seal | 1274 | Solid top/bottom shells (`ApplyBoundarySeal`). |
 | 7 — Inter-strate passages | 1281 | Carve passages/elevator (`ApplyPassageCarving`). |
 
@@ -312,6 +330,9 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:691/709 → `UVoxelDiffLayer::ApplyModification` :63. |
 | Mesh smoothness / normals | `UVoxelMarchingCubesMesher::ComputeGradientNormal` :48, `IsoLevel`/`GradientOffset` (h:51/55). |
 | New slab/flat-world generator | `GetSlabDensity` Generator.cpp:1306 + `FSlabGenerationParams` (StrateTypes.h:1019). |
+| Biome placement / layout | `BiomeMapParams` on the strate (cell size, warp, climate freqs) + each biome's climate box. Bake `AVoxelWorld::BakeBiomePreview` to tune. §8.14. |
+| What a biome does to terrain | A full archetype param override on the biome (`bOverrideTerrain` + `SurfaceParams`); surface output-blends dominant/neighbour heights in `GetSurfaceDensity`. Caves = content/atmosphere only (determinism, §8.14). |
+| Add a biome / biome content | New `UVoxelBiomeDefinition` asset → add to the strate's `Biomes[]`. §8.14 / §8.12. |
 | Season reset | `AVoxelWorld::ChangeSeed` :740. |
 
 ---
@@ -357,7 +378,7 @@ by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispat
 | TunnelNetwork | `FStrateGenerationParams` | `GetDensityWithParams` | rooms+tunnels (original) |
 | FlatPlain / CrystalChamber | `FSlabGenerationParams` | `GetSlabDensity` | floor/ceiling void (original) |
 | Maze | `FMazeGenerationParams` | `GetMazeDensity` | tight corridors on a 3D lattice (per-voxel, no cache; edge = lower node + axis hash) |
-| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain (continents+ridged mtns+detail), beaches at water line, high sky-cap ceiling |
+| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, opt-in plateau **terracing**, beaches at water line, high sky-cap ceiling. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) |
 | VerticalShafts | `FVerticalShaftParams` | `GetVerticalShaftDensity` | full-height shafts + horizontal connectors + partial ledges |
 | FloatingIslands | `FFloatingIslandParams` | `GetFloatingIslandDensity` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
 | Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
@@ -366,6 +387,8 @@ All density fns share the convention: internal **positive=solid**, apply origin 
 boundary seal → inter-strate passages, then `return -Density` (MC: negative=solid).
 StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/FloatingIslandParamsForChunk`
 (macro `VF_ARCHETYPE_PARAMS_GETTER`) — no cross-boundary blend (Hard transitions between archetypes).
+On top of the archetype, an optional **biome** layer (§8.14) modulates terrain & content WITHIN a
+strate via a window-invariant XY field — currently wired into SurfaceWorld.
 
 ### 8.2 (0,0) spine & hybrid connections
 - `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) carves a guaranteed open vertical
@@ -395,12 +418,24 @@ max edge reach, and decisions must not depend on the stored window.**
 ### 8.5 Content scatter & water — `VoxelContentManager.h/.cpp` (NEW)
 `UVoxelContentManager` (owned by `AVoxelWorld`, game-thread). Chunk lifecycle:
 `PopulateChunk(coord, mesh, LOD)` in `ApplyMeshToChunk`, `ClearChunk` in `UnloadChunk`,
-`ClearAll`/`SetSeed` in `ChangeSeed`. Deterministic decoration scatter on mesh vertices
-(surface-type / water-relative / align-to-normal / random-yaw / scale / `MaxPerChunk`, from
-`FStrateDecoration`) — **only at LOD 0** (perf). Aesthetic water = one scaled engine plane
-(`/Engine/BasicShapes/Plane`) per water-surface chunk (any LOD), material
-`UVoxelStrateDefinition::WaterMaterial`. Water Z: `bHasWater` + `WaterLevelRelative`
-(Surface/tunnel params) → `StrateManager::GetWaterLevelWorldZForChunk`.
+`ClearAll`/`SetSeed` in `ChangeSeed`, `SetActiveStrate(GetStrateAtPosition(player))` each Tick.
+Deterministic decoration scatter on mesh vertices (surface-type / water-relative /
+align-to-normal / random-yaw / scale / `MaxPerChunk`, from `FStrateDecoration`).
+**Two render paths per entry:** `ActorClass` (real actors — lights/logic/interaction,
+keep `MaxLODLevel=0`) vs `InstancedMesh` (batched per-chunk **HISM**, no tick/actor cost,
+no collision; safe at `MaxLODLevel` 1-2 so visual props don't pop out with LOD0 — emissive
+materials still glow at distance). Placement samples the LOD's vertices ⇒ instances
+re-scatter slightly on LOD swap (masked by terrain pop). **Strate light culling:**
+light components on decoration actors are visible only while the player is in the SAME
+strate (`SetActiveStrate`, no-op until strate change) — analytical occlusion: seals+gap are
+light-tight, and shadowless lights otherwise BLEED through rock (shadowed ones render black
+at full cost). Aesthetic water = one scaled engine plane (`/Engine/BasicShapes/Plane`) per
+water-surface chunk (any LOD), material `UVoxelStrateDefinition::WaterMaterial`. Water Z:
+`bHasWater` + `WaterLevelRelative` (Surface/tunnel params) → `StrateManager::GetWaterLevelWorldZForChunk`.
+**Per-biome content (§8.14):** when the chunk's dominant biome (`Generator::GetDominantBiomeAt`)
+supplies decorations they REPLACE the strate's; biome `WaterMaterial` overrides the plane's material
+(level stays strate-global). NOTE: `GetChunkStrateIndex` (light culling) feeds `GetStrateIndex` which
+expects Unreal **cm** — it now passes `chunkZ*CHUNK_SIZE*VOXEL_SIZE` (was voxel-Z, a latent strate-match bug).
 
 ### 8.6 Atmosphere — `VoxelAtmosphereManager.h/.cpp` (NEW)
 `UVoxelAtmosphereManager` (owned by `AVoxelWorld`, gated by `bManageAtmosphere`).
@@ -412,6 +447,10 @@ PERSISTENT ceiling/floor "layer" actors (`Def->CeilingLayerActor`/`FloorLayerAct
 `Def->AtmosphereActor` (a full BP with your own fog/sky/postprocess) OVERRIDES the managed
 fog+sky for that strate. `Reset()` on ChangeSeed/EndPlay. (Skylight ambient underground is
 weak — captures a dark scene; fog is the strong visual.)
+**Per-biome atmosphere (§8.14):** `UpdateForPlayer` also resolves the player's dominant biome and,
+when the biome has `bOverrideAtmosphere`, its fog/sky beats the strate's (reacts on biome change, not
+just strate change). `ApplyFogSky(Def, Biome)` is the shared path; layer actors + the full `AtmosphereActor`
+BP stay strate-level. Needs the generator injected (`Initialize(..., Generator)`).
 
 ### 8.7 Inter-strate bedrock gap
 `VoxelSettings::InterStrateGapChunks` (N) inserts N chunks of SOLID bedrock between consecutive
@@ -451,12 +490,50 @@ driven by `EditorBrush*` props.
   sampling must not thrash the (expensive) rebuild.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
   thread-locally per chunk; don't move the fetch/blend back to per-voxel.
+- **Biome cache** (`ResolveBiomeSampleAt`/`FChunkBiomeCache`, §8.14): validity is a world-XY BOX +
+  ChunkZ + Seed, NOT a chunk key — same reason as the SDF cache. The cell classification is
+  noise-heavy; a chunk-key would thrash it on gradient-normal / +X/+Y boundary samples. Keep
+  the box halo (≥ CHUNK_SIZE) + cell margin (warp + CellSize) so the 3x3 lookup never misses.
 - **Passage cull** (§8.8) + **morphology two-region** (§8.4): both are per-voxel-cost critical.
-- **Mesher density grid** (`GenerateMesh`): sample each grid point ONCE into a flat
-  `(CHUNK_SIZE/Step + 1)³` array, then the cell loop reads its 8 corners from it. Adjacent
-  cells share corners, so per-cell sampling calls `GetDensityAt` ~8× too often (262k→36k at
-  LOD0). Output is bit-identical (`GetDensityAt` is pure in world coords). Don't refactor
-  back to per-corner `GetDensity` calls inside the cell loop.
+- **Mesher density grid + margin ring** (`GenerateMesh`): sample each grid point ONCE into a flat
+  `(CHUNK_SIZE/Step + 1 + 2)³` array (the `+2` is a 1-point MARGIN ring, indices −1..GridDim, for
+  T1.b normals). The cell loop reads 8 corners from it; per-cell sampling would call `GetDensityAt`
+  ~8× too often. Geometry is bit-identical (edge positions unchanged). Don't refactor back to
+  per-corner `GetDensity` and don't drop the margin ring (normals + seamless borders need it).
+- **Normals from the density grid (T1.b)** (`GenerateMesh`): corner gradients = central differences
+  on the (margin) grid; edge normals interpolate the two corner gradients by the SAME `t` as the
+  position → seamless across chunk borders (both sides use identical pure samples). NO per-vertex
+  `GetDensityAt` (was ~6/vertex, often as costly as the whole grid). `ComputeGradientNormal` is now
+  unused. Only NORMALS changed vs the old path; geometry is identical.
+- **Surface column cache (T1.a)** (`FSurfaceColumnCache`, `GetDensityAt` SurfaceWorld branch):
+  the heightfield + sky-cap + biome blend are XY-only but sampled ~33× per column (once per Z
+  grid-point). Cached per integer XY (box-valid, like the SDF cache) and reused down the column.
+  Box `Halo = CHUNK_SIZE + 8` each side so the T1.b margin ring stays inside (no thrash). **Used
+  ONLY for integer-XY queries**; fractional queries compute directly → bit-identical. Don't key it
+  by chunk and don't feed it fractional coords.
+- **Collision only at LOD0 (T1.c)** (`ApplyMeshToChunk`): `UpdateSectionConfig(..., LOD==0)`.
+  LOD1/2 chunks are unreachable (the §8.10 reconciliation hot-swaps to LOD0 before the player
+  arrives), so cooking their Chaos collision is waste. Don't force collision on for all LODs.
+- **No shadows on LOD2 (draw-call cut)** (`ApplyMeshToChunk`): `MeshComp->SetCastShadow(LOD <= 1)`.
+  Every shadow-casting chunk emits a SECOND draw in the shadow-depth pass; the farthest tier
+  (LOD2, blocky) doesn't need it. Re-applied every apply (LOD hot-swaps reuse the component).
+  Pulling `LOD0Distance`/`LOD1Distance` inward pushes more chunks into the shadowless LOD2 band
+  → fewer draws (free fps knob). Widen to `<= 0` (drop LOD1 shadows too) if still draw-bound.
+  NOTE: fps is a RENDER-side problem (draw calls ≈ visible chunk count × passes) — generation
+  cost (worker threads) and LOD *resolution* (cuts triangles, not draws) don't move it.
+- **Insights scopes** `VoxelForge_GenerateMesh` / `VoxelForge_ApplyMeshToChunk` (Perf 0) bracket
+  the worker gen + game-thread apply — capture a trace to see if we're density- or upload-bound.
+- **Float SIMD noise core (T2.a)** (`Public/VoxelNoise.h`): the density hot path uses
+  `VoxelNoise::Perlin3D` (single-sample, float, table-free hash-gradient) and `VoxelNoise::FBM` /
+  `Ridged` (octaves evaluated **4-wide via SSE** `Perlin3D_x4`) — NOT `FMath::PerlinNoise3D`
+  (double-precision, the old ~6.6 ms/chunk noise cost). `FractalNoise3D` / `RidgedNoise3D` in
+  `VoxelGenerator.cpp` are now thin wrappers over it; every call site is unchanged. It's a
+  DIFFERENT noise field than FMath's ⇒ a ONE-TIME world re-tune (fBm/Ridged contracts/[-1,1] are
+  identical). Pure function of (x,y,z) ⇒ every box-validity cache stays valid. Scalar `Perlin3D`
+  and SSE `Perlin3D_x4` are op-for-op identical (bit-identical on x86) — the SIMD path is a free
+  speedup; `#define VF_NOISE_USE_SIMD 0` falls back to scalar with no re-tune if a toolchain
+  rejects the SSE4.1 intrinsics. StrateManager's passage/transition Perlin calls were left on
+  `FMath` (layout-time, not per-voxel). Don't reintroduce `FMath::PerlinNoise3D` on the density path.
 - **`ProcessQueue` MUST be `EQueueMode::Mpsc`** (`VoxelWorld.h`): up to `MaxConcurrentTasks`
   `ChunkGen` worker threads `Enqueue` concurrently; the game thread is the sole consumer.
   The default `Spsc` is single-producer — concurrent enqueues race the tail link and silently
@@ -476,14 +553,66 @@ driven by `EditorBrush*` props.
 4. Atmosphere: `FogColor/Density`, `AmbientLight*`, `bVolumetricFog`, or a full `AtmosphereActor` BP;
    `CeilingLayerActor`/`FloorLayerActor` (+offsets/rotations) for cloud seas.
 5. `Decorations`/`AmbientActors` (placement rules) for content + lights.
-6. Reference from `VoxelSettings` (`StratePool`/`FixedStrates`). Global knobs there:
+6. (Optional) `Biomes[]` + `BiomeMapParams` to vary terrain/content within the strate (§8.14).
+   Author `UVoxelBiomeDefinition` assets (climate box + modulation + content), then tune layout
+   with `AVoxelWorld::BakeBiomePreview`. Turn `ReliefStrength` down when biomes drive elevation.
+7. Reference from `VoxelSettings` (`StratePool`/`FixedStrates`). Global knobs there:
    `OriginSpineRadius`, `bOpenSurfaceEntry`, `InterStrateGapChunks`, view distances, LOD, carving budget.
 
 ### 8.13 New files this redesign
-`Public/Private/VoxelContentManager.h/.cpp` (§8.5) · `Public/Private/VoxelAtmosphereManager.h/.cpp` (§8.6).
+`Public/Private/VoxelContentManager.h/.cpp` (§8.5) · `Public/Private/VoxelAtmosphereManager.h/.cpp` (§8.6) ·
+`Public/VoxelBiomeTypes.h` + `Public/VoxelBiomeDefinition.h`/`Private/VoxelBiomeDefinition.cpp` (§8.14).
 Everything else extended existing files: `VoxelStrateTypes.h` (archetype params, disturbance,
 `FStratePassageConfig`, enums), `VoxelStrateDefinition.h`, `VoxelGenerator.h/.cpp` (archetype
 density fns + spine/disturbance/param-cache), `VoxelStrateManager.h/.cpp` (per-archetype getters,
 passages, gap, atmosphere Z helper), `VoxelWorld.h/.cpp` (managers, streaming perf, brush API,
 editor buttons), `VoxelDiffLayer.h/.cpp` (brush shapes), `VoxelSettings.h`, `VoxelCaveMorphology.cpp`
 (two-region determinism). Status: compiles & runs in-editor.
+
+### 8.14 Biome system (Stage 1 — climate-driven, full-param overrides)
+Biomes vary terrain **and** content WITHIN a strate. A biome is a **"mini-strate-variant"**: it
+can carry a FULL archetype param override (its own `FSurfaceGenerationParams`, …) plus a content
+profile, placed by a deterministic, window-invariant world-XY field. Empty `Biomes[]` ⇒ bit-identical
+to the pre-biome world. (Replaces the earlier `FBiomeModulation` scalar bag — full params let a biome
+change *anything*, e.g. frequencies, which scalar multipliers couldn't.)
+
+- **Assets/data.** `UVoxelBiomeDefinition` (one per biome): `DebugColor`, climate box (relief,
+  moisture), `bOverrideTerrain` + `GeneratorType` + the matching archetype param struct (Surface
+  wired), content profile (decorations/atmosphere/water). + `UVoxelStrateDefinition::Biomes[]` &
+  `BiomeMapParams`. Types in `VoxelBiomeTypes.h` (§3.8).
+- **The field (pure XY, window-invariant — §8.4).** `SampleBiomeAt` (VoxelGenerator.cpp): warped
+  **Voronoi** over a jittered grid → dominant cell + nearest neighbour (F1/F2) + border blend weight.
+  Each cell's biome is chosen by `ClassifyBiomeAtSite` from the site's **climate** = `SampleRelief`
+  (the relief map M, shared with SurfaceWorld terrain) + `SampleMoisture`, matched against each
+  biome's (relief, moisture) box → coherent geography. **Climate must vary much slower than
+  `CellSize`** (~4-6 cells/feature) or it's salt-and-pepper.
+- **Per-chunk resolution (perf — §8.10).** `ResolveBiomeSampleAt`/`RebuildBiomeGrid` build a
+  `FChunkBiomeCache`: the expensive cell classification is done ONCE into a small grid; per voxel only
+  a warp + 3x3 lookup, returning `FBiomeSample` (dominant + neighbour + weight). **Cache validity is a
+  world-XY BOX + ChunkZ + Seed (NOT a chunk key)** — gradient-normal + boundary samples stay inside
+  the box and don't thrash the noise-heavy rebuild (same as the SDF cache). Bit-identical to
+  `SampleBiomeAt`, so the baked preview matches the terrain. `GetBiomeContextForChunk` supplies the
+  flattened POD context per chunk (thread-local `CP_BiomeCtx`).
+- **Consumption — SURFACE (output-blend).** Per chunk, `CP_SurfaceBiomeParams[]` holds each biome's
+  resolved surface params (its override when `bOverrideTerrain` + GeneratorType matches, else the
+  strate's) with **structural fields forced from the strate** (Z bounds, seal, base density, water
+  level). Per voxel: `ResolveBiomeSampleAt` → dominant `PD` (+ neighbour `PN`); `GetSurfaceDensity`
+  computes `ComputeSurfaceTerrainZ` for `PD` and, in the border band, for `PN`, and **lerps the
+  resulting HEIGHTS**. Blending heights (not params) is seamless across *any* difference (frequencies
+  included) — what per-param blend never could. `PD==PN`, weight 0 ⇒ bit-identical, no biomes.
+- **Consumption — CAVES: structural overrides are NOT applied (determinism).** Rooms/tunnels are
+  decided over a wide COLLECT region spanning chunks (§8.4); making room params vary by region would
+  need the biome sampled per *room site* inside `BuildChunkCache`, or it breaks window-invariance
+  (a room near a border resolves differently per querying chunk → seams/holes). So SDF archetypes
+  (Tunnel/Maze/Shaft/Islands) keep strate-level structure; biomes affect them via **content +
+  atmosphere only** (below). Per-room-site biome params = a future deep task.
+- **Consumption (content/atmosphere).** `GetDominantBiomeAt(x,y,chunkZ)` (game-thread, uncached) →
+  biome ASSET. ContentManager: dominant biome's decorations (else strate's) + water material override.
+  AtmosphereManager: player's dominant biome fog/sky (`bOverrideAtmosphere`). Works for ANY archetype.
+  Water LEVEL stays strate-global (continuous plane); biomes retint material only.
+- **Preview tool.** `AVoxelWorld::BakeBiomePreview()` (CallInEditor) bakes biome / relief / moisture
+  to `Saved/BiomePreview.png` via a transient generator (no PIE). Needs the `ImageWrapper` module.
+- **Status:** A (field+asset+preview), B (terrain), C (content/atmosphere) verified in-editor.
+  Full-param redesign (surface output-blend) code-complete, pending build. Cave structural biomes
+  deferred (determinism, see above). Per-voxel biome warp (+2 Perlin) & content `GetDominantBiomeAt`
+  are future T1.a column-cache candidates.

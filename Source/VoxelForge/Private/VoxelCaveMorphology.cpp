@@ -94,14 +94,10 @@ void VoxelCaveMorphology::BuildChunkCache(
     const float MaxTunnelLen = FMath::Max(Params.MaxTunnelLength, 0.0f);
 
     //=========================================================================
-    // STORE region — what we keep for the per-voxel loop.
+    // STORE decision — what we keep for the per-voxel loop.
     //=========================================================================
-    // A room/tunnel whose influence overlaps the search box is RELEVANT to this
-    // chunk. STORE box = search box + MaxInfluence. (Per-voxel culling refines this.)
-    const float StoreMinX = SearchMinX - MaxInfluence;
-    const float StoreMinY = SearchMinY - MaxInfluence;
-    const float StoreMaxX = SearchMaxX + MaxInfluence;
-    const float StoreMaxY = SearchMaxY + MaxInfluence;
+    // A room/tunnel is stored iff its OWN influence sphere can overlap the search box
+    // (RoomReachesSearchBox / tunnel bounding spheres below). Per-voxel culling refines.
 
     //=========================================================================
     // COLLECT region — what we hash into existence for the connectivity decision.
@@ -142,13 +138,19 @@ void VoxelCaveMorphology::BuildChunkCache(
 
     const float BlendK = Params.SDFBlendRadius;
 
-    // Conservative "this room can reach the STORE box" test. A room's cull sphere
-    // radius is <= MaxInfluence, and STORE box already includes a MaxInfluence
-    // margin, so testing the center against the STORE box is a correct superset.
-    auto CenterInStoreBox = [&](const FVector& C) -> bool
+    // "This room can reach the search box" test, using the room's OWN reach — the same
+    // extent formula as its per-voxel cull sphere (1.5x radius for capsule-stretched
+    // variants + blend margin). The old test compared the center against a box inflated
+    // by the SHARED MaxInfluence, which silently assumed every room's reach <= MaxInfluence.
+    // That's FALSE for the origin room (OriginRoomRadius >> MaxRoomRadius) — chunks inside
+    // the big room but > MaxInfluence from (0,0) didn't store it, so its carve clipped at an
+    // arbitrary chunk-aligned radius — and slightly false even for hash rooms (1.5x stretch).
+    auto RoomReachesSearchBox = [&](const FVector& C, float RadiusXY, float RadiusZ) -> bool
     {
-        return C.X >= StoreMinX && C.X <= StoreMaxX
-            && C.Y >= StoreMinY && C.Y <= StoreMaxY;
+        const float Reach = FMath::Max(RadiusXY * 1.5f, RadiusZ) + BlendK * 3.0f;
+        const float dx = FMath::Max3((float)(SearchMinX - C.X), 0.0f, (float)(C.X - SearchMaxX));
+        const float dy = FMath::Max3((float)(SearchMinY - C.Y), 0.0f, (float)(C.Y - SearchMaxY));
+        return (dx * dx + dy * dy) <= Reach * Reach;
     };
 
     // Sphere-vs-search-box test in XY (treated as infinite in Z; per-voxel culling
@@ -170,8 +172,14 @@ void VoxelCaveMorphology::BuildChunkCache(
     int32 OriginIdx = -1;
     if (Params.OriginRoomRadius > 0.0f)
     {
-        if (0.0f >= CollectMinX && 0.0f <= CollectMaxX &&
-            0.0f >= CollectMinY && 0.0f <= CollectMaxY)
+        // Collected when (0,0) is in the COLLECT region (connectivity) OR when the room's
+        // own body can reach this chunk (store) — its radius may exceed the collect margin.
+        const bool bOriginInCollect =
+            0.0f >= CollectMinX && 0.0f <= CollectMaxX &&
+            0.0f >= CollectMinY && 0.0f <= CollectMaxY;
+        const float OriginRZ = Params.OriginRoomRadius * Params.RoomHeightRatio;
+        if (bOriginInCollect ||
+            RoomReachesSearchBox(FVector(0.0f, 0.0f, StrateCenterZ), Params.OriginRoomRadius, OriginRZ))
         {
             FBuildRoom OriginRoom;
             OriginRoom.CellX = INT32_MAX;  // Sentinel — never matches a real grid cell
@@ -181,7 +189,7 @@ void VoxelCaveMorphology::BuildChunkCache(
             OriginRoom.RadiusXY = Params.OriginRoomRadius;
             OriginRoom.RadiusZ = Params.OriginRoomRadius * Params.RoomHeightRatio;
             OriginRoom.bIsOrigin = true;
-            OriginRoom.bStore = CenterInStoreBox(OriginRoom.Center);
+            OriginRoom.bStore = RoomReachesSearchBox(OriginRoom.Center, OriginRoom.RadiusXY, OriginRoom.RadiusZ);
             OriginIdx = BuildRooms.Add(OriginRoom);
         }
     }
@@ -216,7 +224,7 @@ void VoxelCaveMorphology::BuildChunkCache(
             Room.RadiusXY = FMath::Lerp(Params.MinRoomRadius, Params.MaxRoomRadius, SizeFactor);
             Room.RadiusZ = Room.RadiusXY * Params.RoomHeightRatio;
             Room.bIsOrigin = false;
-            Room.bStore = CenterInStoreBox(Room.Center);
+            Room.bStore = RoomReachesSearchBox(Room.Center, Room.RadiusXY, Room.RadiusZ);
 
             BuildRooms.Add(Room);
         }
@@ -226,35 +234,70 @@ void VoxelCaveMorphology::BuildChunkCache(
     if (NumRooms == 0) return;
 
     //=========================================================================
-    // Window-invariant nearest-neighbor backbone
+    // Window-invariant guaranteed backbone
     //=========================================================================
-    // Each room's nearest neighbor (among rooms within MaxTunnelLength) is a
-    // GUARANTEED tunnel connection. Filtering candidates to <= MaxTunnelLength is
-    // what makes the result identical across chunks: rooms beyond MaxTunnelLength
-    // can never be a tunnel anyway, so excluding them removes the only source of
-    // window dependence. This builds a connected tree backbone; TunnelDensity adds
-    // loops on top.
+    // Each room gets ONE guaranteed link, chosen among candidates within MaxTunnelLength
+    // (that reach filter is what keeps the decision identical across chunk windows).
+    //
+    // bTunnelsFlowTowardOrigin = true (default): the link target is the best candidate
+    // among rooms STRICTLY CLOSER to (0,0) in XY. Every chain of links then descends in
+    // origin-distance and terminates at the origin room → the network is a TREE ROOTED AT
+    // THE SPINE HUB: every room is reachable, tunnels flow inward like tributaries.
+    // (Frontier rooms with no closer candidate in reach fall back to plain NN — a far
+    // cluster stays internally chained even when it can't bridge to the origin side.)
+    //
+    // bTunnelsFlowTowardOrigin = false (legacy): plain nearest-neighbor pairing. NOTE:
+    // despite what this comment used to claim, an NN-graph is a FOREST of small clusters,
+    // not a connected tree — isolated cave pockets are expected in this mode.
+    //
+    // Selection metric (not the reach filter) penalizes vertical separation via
+    // TunnelHorizontalBias, so the GUARANTEED links also prefer walkable slopes —
+    // previously only the random TunnelDensity extras were biased, which is why
+    // backbone tunnels could come out absurdly steep.
     TArray<int32, TInlineAllocator<64>> NearestNeighbor;
     NearestNeighbor.SetNumUninitialized(NumRooms);
 
     const float MaxTunnelLenSq = MaxTunnelLen * MaxTunnelLen;
+    const bool bFlowToOrigin = Params.bTunnelsFlowTowardOrigin;
+
+    auto LinkMetric = [&](int32 I, int32 J) -> float
+    {
+        const float D = FVector::Dist(BuildRooms[I].Center, BuildRooms[J].Center);
+        const float VertSep = FMath::Abs(BuildRooms[I].Center.Z - BuildRooms[J].Center.Z);
+        return D + VertSep * Params.TunnelHorizontalBias * 5.0f;
+    };
+    // Squared XY distance to the (0,0) spine — the "inward" ordering. Purely positional,
+    // so it is window-invariant by construction.
+    auto OriginKeySq = [&](int32 I) -> float
+    {
+        const FVector& C = BuildRooms[I].Center;
+        return C.X * C.X + C.Y * C.Y;
+    };
+
+    // ExcludeJ: used by the origin-cap redirect below (re-pick ignoring the origin room).
+    auto PickNeighbor = [&](int32 I, int32 ExcludeJ) -> int32
+    {
+        const float MyKeySq = OriginKeySq(I);
+        float BestInward = FLT_MAX;  int32 BestInwardJ = -1;
+        float BestAny    = FLT_MAX;  int32 BestAnyJ    = -1;
+        for (int32 J = 0; J < NumRooms; J++)
+        {
+            if (J == I || J == ExcludeJ) continue;
+            const float DSq = FVector::DistSquared(BuildRooms[I].Center, BuildRooms[J].Center);
+            if (DSq > MaxTunnelLenSq) continue;       // out of reach — never a tunnel
+            const float M = LinkMetric(I, J);
+            if (M < BestAny) { BestAny = M; BestAnyJ = J; }
+            if (bFlowToOrigin && OriginKeySq(J) < MyKeySq && M < BestInward)
+            {
+                BestInward = M; BestInwardJ = J;
+            }
+        }
+        return (bFlowToOrigin && BestInwardJ != -1) ? BestInwardJ : BestAnyJ;
+    };
 
     for (int32 I = 0; I < NumRooms; I++)
     {
-        float BestDistSq = FLT_MAX;
-        int32 BestJ = -1;
-        for (int32 J = 0; J < NumRooms; J++)
-        {
-            if (I == J) continue;
-            const float DSq = FVector::DistSquared(BuildRooms[I].Center, BuildRooms[J].Center);
-            if (DSq > MaxTunnelLenSq) continue;       // out of reach — never a tunnel
-            if (DSq < BestDistSq)
-            {
-                BestDistSq = DSq;
-                BestJ = J;
-            }
-        }
-        NearestNeighbor[I] = BestJ;
+        NearestNeighbor[I] = PickNeighbor(I, /*ExcludeJ=*/INDEX_NONE);
     }
 
     //=========================================================================
@@ -293,6 +336,19 @@ void VoxelCaveMorphology::BuildChunkCache(
         {
             OriginDowngraded.Add(OriginLinks[R].Value);
         }
+
+        // REDIRECT, don't strand: a downgraded room whose guaranteed link pointed at the
+        // origin re-picks its best target EXCLUDING origin. It keeps a guaranteed link
+        // (chains to the hub through another room instead of directly), which matters
+        // doubly now that rooms with zero connections are culled below. Deterministic:
+        // same candidate set, same metric, one exclusion.
+        for (int32 DowngradedI : OriginDowngraded)
+        {
+            if (NearestNeighbor[DowngradedI] == OriginIdx)
+            {
+                NearestNeighbor[DowngradedI] = PickNeighbor(DowngradedI, /*ExcludeJ=*/OriginIdx);
+            }
+        }
     }
 
     //=========================================================================
@@ -304,6 +360,15 @@ void VoxelCaveMorphology::BuildChunkCache(
     //   2. The pair hash passes TunnelDensity (random extra loops).
     // Both must pass the distance check (MaxTunnelLength). Only tunnels whose bounding
     // sphere reaches the search box are stored for the per-voxel loop.
+    // Tracks whether each room ends up with at least one tunnel — DECIDED connections,
+    // independent of whether the tunnel itself is stored for this chunk (a room near the
+    // window edge may have all its tunnels outside the box; it's still "connected").
+    // Stored rooms with zero connections are culled at emission: they'd be sealed air
+    // pockets no tunnel ever reaches. Window-invariant: a stored room's full candidate
+    // set (and each candidate's own candidates) lies inside the COLLECT region.
+    TArray<bool, TInlineAllocator<64>> RoomConnected;
+    RoomConnected.Init(false, NumRooms);
+
     for (int32 I = 0; I < NumRooms; I++)
     {
         for (int32 J = I + 1; J < NumRooms; J++)
@@ -346,6 +411,10 @@ void VoxelCaveMorphology::BuildChunkCache(
                 const float ConnectChance = VoxelHash::ToFloat01(PairHash);
                 if (ConnectChance >= Params.TunnelDensity) continue;
             }
+
+            // Connection DECIDED (backbone or density roll) — both rooms are reachable.
+            RoomConnected[I] = true;
+            RoomConnected[J] = true;
 
             // --- TUNNEL HASH (for deriving all tunnel properties) ---
             const uint32 TunnelHash = VoxelHash::Pair(
@@ -451,9 +520,14 @@ void VoxelCaveMorphology::BuildChunkCache(
 
     OutCache.Rooms.Reserve(NumRooms);
 
-    for (const FBuildRoom& BR : BuildRooms)
+    for (int32 RoomIdx = 0; RoomIdx < NumRooms; RoomIdx++)
     {
+        const FBuildRoom& BR = BuildRooms[RoomIdx];
         if (!BR.bStore) continue;  // Far room — collected for connectivity only
+
+        // Sealed-bubble cull: a room no tunnel ever reaches would be an isolated air
+        // pocket — don't carve it at all. The origin room is always kept (spine hub).
+        if (!RoomConnected[RoomIdx] && !BR.bIsOrigin) continue;
 
         FCachedRoom CR;
         CR.Center = BR.Center;

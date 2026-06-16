@@ -14,7 +14,13 @@
 //
 // Taille de chunk: 32^3 = 32 768 voxels.
 // Pourquoi 32 ? Puissance de 2 → astuces bit à bit + bon alignement GPU.
-// VOXEL_SIZE = 25 cm/voxel (Unreal travaille en centimètres).
+// VOXEL_SIZE = 25 cm/voxel (Unreal travaille en centimètres). 1 chunk = 8 m.
+//
+// NOTE: 64³ a été essayé ("B", 2026-06-16) pour couper les draw calls (8× moins de
+// chunks) mais le streaming devenait trop saccadé (briques 8× plus lourdes → applies
+// + spawns de contenu en gros à-coups sur le game thread). Reverté à 32³ : le fps se
+// règle côté RENDU (ombres off sur LOD lointain, voir ApplyMeshToChunk), pas via la
+// taille de chunk. La taille de chunk reste le levier streaming-vs-draws si besoin.
 
 constexpr int32 CHUNK_SIZE         = 32;
 constexpr int32 CHUNK_SIZE_SQUARED = CHUNK_SIZE * CHUNK_SIZE;     // 1024
@@ -142,8 +148,8 @@ inline float SmoothStep01(float x)
     return x * x * (3.0f - 2.0f * x);
 }
 
-// UE's PerlinNoise3D renvoie ~[-0.8, 0.8] — ce facteur remet à ~[-1, 1]
-// pour correspondre aux attentes des formules de densité.
+// Le coeur de bruit (VoxelNoise::Perlin3D, T2.a) renvoie ~[-0.8, 0.8] comme l'ancien
+// FMath::PerlinNoise3D — ce facteur remet à ~[-1, 1] pour les formules de densité.
 constexpr float VOXEL_NOISE_SCALE = 1.25f;
 
 //=============================================================================

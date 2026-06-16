@@ -7,10 +7,17 @@
 #include "RealtimeMeshSimple.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelStrateDefinition.h"
+#include "VoxelBiomeDefinition.h"
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelContentManager.h"
 #include "VoxelAtmosphereManager.h"
 #include "DrawDebugHelpers.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Modules/ModuleManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
 AVoxelWorld::AVoxelWorld()
 {
@@ -241,13 +248,13 @@ void AVoxelWorld::BeginPlay()
 
     // Content manager — scatters decorations/actors + water per chunk as they stream in.
     ContentManager = NewObject<UVoxelContentManager>(this);
-    ContentManager->Initialize(this, StrateManager, Settings->Seed);
+    ContentManager->Initialize(this, StrateManager, Generator, Settings->Seed);
 
     // Atmosphere manager — per-strate fog + ambient + persistent ceiling/floor layers.
     if (bManageAtmosphere && StrateManager)
     {
         AtmosphereManager = NewObject<UVoxelAtmosphereManager>(this);
-        AtmosphereManager->Initialize(this, StrateManager);
+        AtmosphereManager->Initialize(this, StrateManager, Generator);
     }
 
 #if WITH_EDITOR
@@ -269,6 +276,11 @@ void AVoxelWorld::Tick(float DeltaTime)
         if (AtmosphereManager)
         {
             AtmosphereManager->UpdateForPlayer(PlayerLastPos);
+        }
+        if (ContentManager)
+        {
+            // Strate light culling — no-op unless the player changed strate.
+            ContentManager->SetActiveStrate(GetStrateAtPosition(PlayerLastPos));
         }
     }
     ProcessPendingChunks();
@@ -595,7 +607,10 @@ void AVoxelWorld::LoadChunk(const FIntVector& ChunkCoord)
         Result.Chunk      = Chunk;
         Result.LODLevel   = LODLevel;
         Result.Epoch      = TaskEpoch;
-        Result.MeshData   = Mesher->GenerateMesh(Chunk, Step);
+        {
+            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
+            Result.MeshData = Mesher->GenerateMesh(Chunk, Step);
+        }
 
         if (!bShuttingDown.load(std::memory_order_relaxed))
         {
@@ -622,6 +637,8 @@ void AVoxelWorld::UnloadChunk(const FIntVector& ChunkCoord)
 
 void AVoxelWorld::ApplyMeshToChunk(const FIntVector& ChunkCoord, const FVoxelMeshData& MeshData)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ApplyMeshToChunk);
+
     //==========================================================================
     // STEP 1: EARLY EXIT IF NO MESH DATA
     //==========================================================================
@@ -651,6 +668,17 @@ void AVoxelWorld::ApplyMeshToChunk(const FIntVector& ChunkCoord, const FVoxelMes
         // NewObject<T>(Outer) creates a new UObject of type T
         // 'this' (AVoxelWorld) is the "outer" - it owns this component
         MeshComp = NewObject<URealtimeMeshComponent>(this);
+
+        // 40k+ chunk components hammer the GAME THREAD, not the GPU. Kill per-component
+        // bookkeeping the engine would otherwise do every frame for each of them:
+        //  - overlap events: chunks never use overlap callbacks (gameplay uses raycasts
+        //    against the LOD0 collision), and UpdateOverlaps over tens of thousands of
+        //    components is a classic game-thread sink.
+        //  - navigation: terrain isn't navmesh-driven here.
+        // (The real fix for component COUNT is the chunk-LOD clipmap; this trims the
+        //  per-component cost meanwhile and survives that refactor.)
+        MeshComp->SetGenerateOverlapEvents(false);
+        MeshComp->SetCanEverAffectNavigation(false);
 
         // RegisterComponent() tells Unreal "this component is ready to use"
         // Without this, the component won't tick, render, or do anything
@@ -789,7 +817,21 @@ void AVoxelWorld::ApplyMeshToChunk(const FIntVector& ChunkCoord, const FVoxelMes
     }
 
     RTMesh->SetupMaterialSlot(0, "Main", ChunkMaterial);
-    RTMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+
+    // Collision only at LOD0. Distant chunks are unreachable by definition (the LOD
+    // reconciliation loop §8.10 hot-swaps a chunk to LOD0 before the player can touch it),
+    // so cooking Chaos tri-mesh collision for LOD1/2 is pure waste — kills the cook cost +
+    // collision memory for the large majority of loaded chunks. (T1.c)
+    const int32 ChunkLOD = ChunkLODs.FindRef(ChunkCoord);
+    const bool bWantCollision = (ChunkLOD == 0);
+    RTMesh->UpdateSectionConfig(SectionKey, SectionConfig, bWantCollision);
+
+    // Shadow casting: the FARTHEST tier (LOD2) does NOT cast shadows. Each shadow-casting
+    // chunk adds a SECOND draw call in the shadow-depth pass (~doubles the draw cost of the
+    // terrain), and crisp shadows on distant blocky LOD2 geometry aren't worth it. LOD0/1
+    // keep shadows. Conservative first cut — widen to `<= 0` (LOD1 too) if still draw-bound.
+    // Re-applied every time because LOD hot-swaps reuse the same component.
+    MeshComp->SetCastShadow(ChunkLOD <= 1);
 
     //==========================================================================
     // STEP 11: POPULATE CONTENT (decorations + water)
@@ -923,6 +965,118 @@ void AVoxelWorld::EditorFillSphere()
         return;
     }
     FillAtPosition(EditorBrushCenter, EditorBrushRadius, EditorBrushStrength);
+}
+
+//=============================================================================
+// BIOME MAP PREVIEW — bake the XY biome field to Saved/BiomePreview.png
+//=============================================================================
+
+void AVoxelWorld::BakeBiomePreview()
+{
+    if (!BiomePreviewStrate)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BakeBiomePreview: assign BiomePreviewStrate first."));
+        return;
+    }
+    if (BiomePreviewChannel == EBiomePreviewChannel::Biome && BiomePreviewStrate->Biomes.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] BakeBiomePreview: '%s' has no Biomes — bake Relief/Moisture instead, or add biomes."),
+            *BiomePreviewStrate->GetName());
+        return;
+    }
+
+    // Transient generator so this works in the editor without PIE.
+    UVoxelGenerator* Gen = NewObject<UVoxelGenerator>(this);
+    Gen->Seed = Settings ? Settings->Seed : 0;
+
+    // Flatten the strate's biomes into a context (mirrors StrateManager::GetBiomeContextForChunk).
+    FBiomeContext Ctx;
+    Ctx.Map = BiomePreviewStrate->BiomeMapParams;
+    for (int32 i = 0; i < BiomePreviewStrate->Biomes.Num(); ++i)
+    {
+        const UVoxelBiomeDefinition* B = BiomePreviewStrate->Biomes[i];
+        if (!B) continue;
+        FBiomeResolved R;
+        R.Index       = i;
+        R.ReliefMin   = B->ReliefMin;   R.ReliefMax   = B->ReliefMax;
+        R.MoistureMin = B->MoistureMin; R.MoistureMax = B->MoistureMax;
+        R.DebugColor  = B->DebugColor.ToFColor(true);
+        Ctx.Biomes.Add(R);
+    }
+
+    const int32 Res    = FMath::Clamp(BiomePreviewResolution, 64, 2048);
+    const float Size   = FMath::Max(BiomePreviewWorldSize, 1.0f);
+    const float Step   = Size / (float)Res;
+    const float OriginX = BiomePreviewCenter.X - Size * 0.5f;
+    const float OriginY = BiomePreviewCenter.Y - Size * 0.5f;
+
+    TArray<FColor> Pixels;
+    Pixels.SetNumUninitialized(Res * Res);
+
+    for (int32 py = 0; py < Res; ++py)
+    for (int32 px = 0; px < Res; ++px)
+    {
+        const float wx = OriginX + (px + 0.5f) * Step;
+        const float wy = OriginY + (py + 0.5f) * Step;
+
+        FColor C = FColor::Black;
+        switch (BiomePreviewChannel)
+        {
+        case EBiomePreviewChannel::Relief:
+        {
+            const float r = Gen->SampleRelief(wx, wy, Ctx.Map.ReliefFrequency, Ctx.Map.ReliefContrast);
+            const uint8 v = (uint8)FMath::Clamp(r * 255.0f, 0.0f, 255.0f);
+            C = FColor(v, v, v);
+            break;
+        }
+        case EBiomePreviewChannel::Moisture:
+        {
+            const float m = Gen->SampleMoisture(wx, wy, Ctx.Map.MoistureFrequency);
+            const uint8 v = (uint8)FMath::Clamp(m * 255.0f, 0.0f, 255.0f);
+            C = FColor(0, v, (uint8)(255 - v));   // dry=blue → wet=green
+            break;
+        }
+        default: // Biome
+        {
+            const FBiomeSample S = Gen->SampleBiomeAt(wx, wy, Ctx);
+            if (Ctx.Biomes.IsValidIndex(S.DominantIndex))
+            {
+                C = Ctx.Biomes[S.DominantIndex].DebugColor;
+                if (S.NeighborWeight > 0.0f && Ctx.Biomes.IsValidIndex(S.NeighborIndex))
+                {
+                    const FLinearColor A(C);
+                    const FLinearColor Bn(Ctx.Biomes[S.NeighborIndex].DebugColor);
+                    C = FLinearColor::LerpUsingHSV(A, Bn, S.NeighborWeight).ToFColor(true);
+                }
+            }
+            break;
+        }
+        }
+        C.A = 255;
+        Pixels[py * Res + px] = C;
+    }
+
+    // Encode PNG and write to Saved/.
+    IImageWrapperModule& Module = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+    const TSharedPtr<IImageWrapper> Wrapper = Module.CreateImageWrapper(EImageFormat::PNG);
+    if (!Wrapper.IsValid() ||
+        !Wrapper->SetRaw(Pixels.GetData(), (int64)Pixels.Num() * sizeof(FColor), Res, Res, ERGBFormat::BGRA, 8))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] BakeBiomePreview: failed to encode image."));
+        return;
+    }
+
+    const TArray64<uint8>& Png = Wrapper->GetCompressed(100);
+    const FString Path = FPaths::ProjectSavedDir() / TEXT("BiomePreview.png");
+    if (FFileHelper::SaveArrayToFile(Png, *Path))
+    {
+        UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] Biome preview (%dx%d, %s) saved to %s"),
+            Res, Res, *UEnum::GetValueAsString(BiomePreviewChannel), *FPaths::ConvertRelativePathToFull(Path));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] BakeBiomePreview: failed to write %s"), *Path);
+    }
 }
 
 void AVoxelWorld::ClearAllModifications()

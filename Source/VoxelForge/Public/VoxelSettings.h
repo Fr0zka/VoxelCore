@@ -22,6 +22,7 @@ public:
 	// STREAMING (distance de vue)
 	//=========================================================================
 
+	// En CHUNKS (CHUNK_SIZE=32). Couverture linéaire = ViewDistanceXY × 32 × 25 cm.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming")
 	int32 ViewDistanceXY = 16;
 
@@ -35,7 +36,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming")
 	int32 MaxConcurrentTasks = 16;
 
-	// Nombre max de meshes appliqués par frame (évite les stutters d'upload GPU).
+	// Nombre max de meshes appliqués (upload GPU) par frame. Seuls les vrais applies
+	// comptent (chunks vides/périmés se vident gratuitement). À 32³ chaque apply est léger
+	// (~0.1 ms) — tunable en live sur l'asset : montez (8-16) si le remplissage traîne,
+	// baissez si l'apparition des chunks fait des à-coups.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming")
 	int32 MaxMeshAppliesPerFrame = 4;
 
@@ -47,8 +51,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|LOD")
 	int32 LOD0Distance = 4;
 
-	// Distance en chunks pour LOD1 (demi-résolution, step=2).
-	// Au-delà → LOD2 (quart-résolution, step=4).
+	// Distance en chunks pour LOD1 (demi-résolution, step=2). Au-delà → LOD2 (quart-rés,
+	// step=4). LOD2 = le plus lointain ; ces chunks ne projettent PLUS d'ombre (cf.
+	// ApplyMeshToChunk) → rapprocher LOD0/LOD1 pousse plus de chunks dans la bande
+	// LOD2 sans-ombre = moins de draws (levier fps gratuit, à doser visuellement).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|LOD")
 	int32 LOD1Distance = 8;
 

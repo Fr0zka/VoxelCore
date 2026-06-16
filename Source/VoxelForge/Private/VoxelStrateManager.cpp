@@ -6,6 +6,7 @@
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
+#include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 
 // Fractal Brownian Motion (layered Perlin) along a 1D parameter, ~[-1,1].
 // Independent octaves at increasing frequency / decreasing amplitude give an organic,
@@ -535,6 +536,33 @@ VF_ARCHETYPE_PARAMS_GETTER(GetVerticalShaftParamsForChunk,  FVerticalShaftParams
 VF_ARCHETYPE_PARAMS_GETTER(GetFloatingIslandParamsForChunk, FFloatingIslandParams,    FloatingIslandParams)
 
 #undef VF_ARCHETYPE_PARAMS_GETTER
+
+FBiomeContext UVoxelStrateManager::GetBiomeContextForChunk(const FIntVector& ChunkCoord) const
+{
+    FBiomeContext Out;
+
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) return Out;
+
+    const UVoxelStrateDefinition* Def = StrateLayout[SlotIdx].Definition;
+    if (Def->Biomes.Num() == 0) return Out;   // biomes disabled for this strate
+
+    Out.Map = Def->BiomeMapParams;
+    Out.Biomes.Reserve(Def->Biomes.Num());
+    for (int32 i = 0; i < Def->Biomes.Num(); ++i)
+    {
+        const UVoxelBiomeDefinition* B = Def->Biomes[i];
+        if (!B) continue;   // skip null entries (keep original index for content lookup)
+
+        FBiomeResolved R;
+        R.Index       = i;
+        R.ReliefMin   = B->ReliefMin;   R.ReliefMax   = B->ReliefMax;
+        R.MoistureMin = B->MoistureMin; R.MoistureMax = B->MoistureMax;
+        R.DebugColor  = B->DebugColor.ToFColor(true);
+        Out.Biomes.Add(R);
+    }
+    return Out;
+}
 
 bool UVoxelStrateManager::GetStrateUnrealZRange(float WorldZ, float& OutTopZ, float& OutBottomZ) const
 {

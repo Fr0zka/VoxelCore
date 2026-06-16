@@ -304,6 +304,16 @@ struct VOXELFORGE_API FStrateGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worm Tunnels")
     float WormStrength = 10.0f;
 
+    // Worms only carve within this distance (voxels) of the room/tunnel network, fading
+    // smoothly to zero at the edge. Keeps worms as organic braids and shortcuts that HUG
+    // the cave system instead of spraying disconnected noise pockets through the whole
+    // strate (the far-field "confetti"). 0 = unlimited (legacy unmasked behaviour).
+    //   16  → tight braiding right along rooms/tunnels
+    //   24  → braids + short noodle shortcuts (good default)
+    //   48+ → loose, wandering side-passages
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worm Tunnels", meta = (ClampMin = "0.0"))
+    float WormNetworkRange = 24.0f;
+
     // ===== CAVE MORPHOLOGY (room-and-corridor) =====
     //
     // Cave shape is defined by SDF (Signed Distance Field) primitives:
@@ -488,6 +498,16 @@ struct VOXELFORGE_API FStrateGenerationParams
     //   1.0 → strongly horizontal — vertical connections very unlikely
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float TunnelHorizontalBias = 0.5f;
+
+    // Topology of the guaranteed tunnel network.
+    // true  → each room links to its best candidate among rooms CLOSER to (0,0): the whole
+    //         network becomes a tree rooted at the origin room — every cave is reachable
+    //         from the spine hub, tunnels flow inward like tributaries (intentional descent
+    //         structure). TunnelDensity still adds loops on top.
+    // false → legacy nearest-neighbor pairing: organic scattered clusters, but connectivity
+    //         between clusters is NOT guaranteed (isolated pockets are common).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
+    bool bTunnelsFlowTowardOrigin = true;
 
     // How much tunnel endpoints shift up/down within rooms (0-1).
     // Fraction of the room's vertical radius. Each tunnel endpoint gets
@@ -884,6 +904,7 @@ struct VOXELFORGE_API FStrateGenerationParams
         Result.WormHorizontalBias         = FMath::Lerp(A.WormHorizontalBias, B.WormHorizontalBias, Alpha);
         Result.WormThreshold              = FMath::Lerp(A.WormThreshold, B.WormThreshold, Alpha);
         Result.WormStrength               = FMath::Lerp(A.WormStrength, B.WormStrength, Alpha);
+        Result.WormNetworkRange           = FMath::Lerp(A.WormNetworkRange, B.WormNetworkRange, Alpha);
         // Cave morphology
         Result.RoomSpacing                = FMath::Lerp(A.RoomSpacing, B.RoomSpacing, Alpha);
         Result.RoomDensity                = FMath::Lerp(A.RoomDensity, B.RoomDensity, Alpha);
@@ -903,6 +924,7 @@ struct VOXELFORGE_API FStrateGenerationParams
         Result.MaxTunnelLength            = FMath::Lerp(A.MaxTunnelLength, B.MaxTunnelLength, Alpha);
         Result.TunnelWarpStrength         = FMath::Lerp(A.TunnelWarpStrength, B.TunnelWarpStrength, Alpha);
         Result.TunnelHorizontalBias       = FMath::Lerp(A.TunnelHorizontalBias, B.TunnelHorizontalBias, Alpha);
+        Result.bTunnelsFlowTowardOrigin   = (Alpha < 0.5f) ? A.bTunnelsFlowTowardOrigin : B.bTunnelsFlowTowardOrigin;
         Result.TunnelEndpointZOffset      = FMath::Lerp(A.TunnelEndpointZOffset, B.TunnelEndpointZOffset, Alpha);
         Result.SDFBlendRadius             = FMath::Lerp(A.SDFBlendRadius, B.SDFBlendRadius, Alpha);
         Result.WaterLevelRelative         = FMath::Lerp(A.WaterLevelRelative, B.WaterLevelRelative, Alpha);
@@ -976,6 +998,7 @@ struct VOXELFORGE_API FStrateGenerationParams
 // Forward declaration — the actual data asset lives in VoxelTerrainOpDefinition.h.
 // We only need a soft pointer here, so no #include needed.
 class UVoxelTerrainOpDefinition;
+class UStaticMesh;
 
 /**
  * FStrateTerrainOpEntry — A reference to a terrain operation with a weight.
@@ -1275,6 +1298,43 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     // Small-scale surface roughness in voxels (rocks, bumps).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape", meta = (ClampMin = "0.0"))
     float SurfaceRoughness = 3.0f;
+
+    // ----- Macro relief & landforms -----
+
+    // Domain-warp the heightfield query by this many voxels of XY displacement before
+    // sampling continents/mountains. Bends straight coastlines and ridgelines into winding,
+    // organic landforms. 0 = no warp (axis-aligned blobby noise, the old look).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0"))
+    float HeightWarpStrength = 35.0f;
+
+    // Frequency of the domain-warp noise. Lower = broader, sweeping bends.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro")
+    float HeightWarpFrequency = 0.008f;
+
+    // Macro "relief" map frequency: a very-low-frequency field that makes some regions flat
+    // plains and others mountainous highlands — distinct terrain depending on where you
+    // stand. (The cheap, continuous precursor to a full biome system.) Lower = larger regions.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro")
+    float ReliefFrequency = 0.0015f;
+
+    // How strongly the relief map modulates terrain (0-1). 0 = uniform everywhere (old
+    // behaviour); 1 = full plains <-> mountains variation across the world.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float ReliefStrength = 0.7f;
+
+    // Contrast of the relief map. >1 sharpens the plains/highland boundary (more distinct
+    // regions); ~1 keeps it a gradual blend.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.25", ClampMax = "4.0"))
+    float ReliefContrast = 1.6f;
+
+    // Plateau/mesa terracing strength (0-1), applied in high-relief regions only. 0 = off
+    // (smooth slopes). Crank up for stepped mesas and layered cliffs in the mountainous areas.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float TerraceStrength = 0.0f;
+
+    // Height of each terrace step in voxels (when TerraceStrength > 0).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "1.0"))
+    float TerraceHeight = 12.0f;
 
     // ----- Water -----
 
@@ -1600,9 +1660,25 @@ struct VOXELFORGE_API FStrateDecoration
 {
     GENERATED_BODY()
 
-    // The actor class to spawn (e.g., BP_Stalactite, BP_CrystalCluster)
+    // The actor class to spawn (e.g., BP_Stalactite, BP_CrystalCluster).
+    // Real actors: lights, logic, interaction. They cost game-thread time per instance —
+    // keep MaxLODLevel at 0 for these, and prefer InstancedMesh for pure visual props.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     TSubclassOf<AActor> ActorClass;
+
+    // INSTANCED path: if set, this entry renders as batched HISM instances instead of
+    // spawning ActorClass (which is then ignored). No tick, no per-actor overhead,
+    // engine-culled — orders of magnitude cheaper. Use for everything that doesn't need
+    // logic/lights/interaction; an emissive material still glows at distance without a light.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
+    UStaticMesh* InstancedMesh = nullptr;
+
+    // Spawn while the chunk's LOD <= this (0 = LOD0 only, the old behaviour).
+    // Lets instanced visual props persist on LOD1-2 chunks instead of popping out with
+    // LOD0. NOTE: placement samples the LOD's mesh vertices, so instances re-scatter
+    // slightly on LOD transitions (masked by the terrain's own LOD pop).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0", ClampMax = "2"))
+    int32 MaxLODLevel = 0;
 
     // Which surface type this decoration can be placed on
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")

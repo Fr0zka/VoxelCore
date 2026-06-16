@@ -228,6 +228,14 @@ public:
     FFloatingIslandParams        GetFloatingIslandParamsForChunk(const FIntVector& ChunkCoord) const;
 
     /**
+     * Flatten the strate's Biomes[] + BiomeMapParams into a POD FBiomeContext for the
+     * biome field. Returns an empty (invalid) context when the strate has no biomes —
+     * callers treat that as "biomes disabled" and fall back to base params. The result
+     * is window-invariant (depends only on the strate at this Z, not the chunk window).
+     */
+    FBiomeContext GetBiomeContextForChunk(const FIntVector& ChunkCoord) const;
+
+    /**
      * World-space Z (voxel coords) of this strate's water surface, or -FLT_MAX if the
      * strate has no water. Derived from the active archetype's WaterLevelRelative and
      * the strate's Z range. Used by the water render system.

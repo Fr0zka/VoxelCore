@@ -30,7 +30,7 @@ public class VoxelForge : ModuleRules
 		// Private dependencies - only used in our .cpp files, not exposed in headers
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			// None for now - we'll add more as needed
+			"ImageWrapper",  // PNG encode for the biome-map preview bake (BakeBiomePreview)
 		});
 	}
 }

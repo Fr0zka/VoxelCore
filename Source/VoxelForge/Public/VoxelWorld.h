@@ -273,6 +273,37 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel World|Debug")
     bool bDebugDrawPassages = false;
 
+    //=========================================================================
+    // BIOME MAP PREVIEW (bake the XY biome field to a PNG — works without PIE)
+    //=========================================================================
+    // Tune biome layout (cell size, warp, climate boxes) without flying around: set
+    // the strate + window, click Bake, open Saved/BiomePreview.png. Uses a transient
+    // generator seeded from VoxelSettings, so it works in the editor with no PIE.
+
+    /** The strate whose Biomes[] + BiomeMapParams to preview. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Preview")
+    UVoxelStrateDefinition* BiomePreviewStrate = nullptr;
+
+    /** Width/height of the sampled window in VOXELS (centred on BiomePreviewCenter). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Preview", meta = (ClampMin = "1.0"))
+    float BiomePreviewWorldSize = 16000.0f;
+
+    /** Centre of the preview window in voxel coords (X,Y). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Preview")
+    FVector2D BiomePreviewCenter = FVector2D::ZeroVector;
+
+    /** Output image resolution (pixels per side). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Preview", meta = (ClampMin = "64", ClampMax = "2048"))
+    int32 BiomePreviewResolution = 512;
+
+    /** Which field to visualise: biome debug colours, relief, or moisture. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Preview")
+    EBiomePreviewChannel BiomePreviewChannel = EBiomePreviewChannel::Biome;
+
+    /** Bake the selected channel to Saved/BiomePreview.png. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Biome Preview")
+    void BakeBiomePreview();
+
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 

@@ -11,6 +11,34 @@
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelCaveMorphology.h"
 #include "VoxelDiffLayer.h"
+#include "VoxelBiomeDefinition.h"
+#include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
+
+//=============================================================================
+// SURFACE COLUMN CACHE (T1.a) — kill the per-Z heightfield redundancy
+//=============================================================================
+// The SurfaceWorld heightfield + sky-cap + biome blend are functions of XY ONLY, but
+// the mesher samples ~33 Z grid-points per column, each re-running that XY work. We cache
+// the column (terrain Z + ceiling Z) once per integer XY and reuse it down the column.
+// Used ONLY for integer-XY queries (the density grid); fractional queries (gradient
+// normals at interpolated vertices) fall through and compute directly → bit-identical.
+// Validity is a world-XY BOX (chunk footprint) + ChunkZ + Seed, same discipline as the
+// SDF/biome caches (§8.10) so the +X/+Y boundary plane doesn't thrash it.
+struct FSurfaceColumn { float TerrainZ = 0.0f; float CeilSurf = 0.0f; };
+
+struct FSurfaceColumnCache
+{
+    // Box covers a chunk footprint + a margin on every side (≥ the LOD margin ring the
+    // mesher samples for grid-based normals, ±Step ≤ 4, plus slack). Symmetric around the
+    // first (rebuild-triggering) sample so the whole chunk's column queries stay in one box.
+    static constexpr int32 Halo = CHUNK_SIZE + 8;
+    static constexpr int32 Dim  = 2 * Halo + 1;
+    int32 BaseX = 0, BaseY = 0;                     // box origin (voxel coords)
+    int32 ChunkZ = MIN_int32, Seed = MIN_int32;
+    bool  bValid = false;
+    FSurfaceColumn Cols[Dim * Dim];
+    bool  Computed[Dim * Dim];
+};
 
 //=============================================================================
 // FRACTAL NOISE (fBm — fractional Brownian motion)
@@ -22,23 +50,15 @@
 // Lacunarity = x freq par octave (2 = double à chaque fois)
 // Persistence = x amp par octave (0.5 = moitié)
 
+// NOTE (T2.a): the fBm/Ridged bodies moved to VoxelNoise.h, where octaves are evaluated
+// 4-wide via SSE (Perlin3D_x4). These thin wrappers keep every call site unchanged. They
+// sample a DIFFERENT (float hash-gradient) noise field than the old FMath::PerlinNoise3D,
+// so worlds re-tune once — but the fBm/Ridged math/contracts ([-1,1]) are identical.
 static float FractalNoise3D(const FVector& Position, int32 Octaves = 4,
                              float Lacunarity = 2.0f, float Persistence = 0.5f)
 {
-    float Total = 0.0f;
-    float Frequency = 1.0f;
-    float Amplitude = 1.0f;
-    float MaxValue = 0.0f;
-
-    for (int32 i = 0; i < Octaves; i++)
-    {
-        Total += FMath::PerlinNoise3D(Position * Frequency) * Amplitude;
-        MaxValue += Amplitude;
-        Frequency *= Lacunarity;
-        Amplitude *= Persistence;
-    }
-
-    return Total / MaxValue;
+    return VoxelNoise::FBM((float)Position.X, (float)Position.Y, (float)Position.Z,
+                           Octaves, Lacunarity, Persistence);
 }
 
 //=============================================================================
@@ -55,32 +75,8 @@ static float FractalNoise3D(const FVector& Position, int32 Octaves = 4,
 static float RidgedNoise3D(const FVector& Position, int32 Octaves = 4,
                             float Lacunarity = 2.0f, float Persistence = 0.5f)
 {
-    // UE's PerlinNoise3D returns ~[-0.8, 0.8]; scale to [-1, 1]
-    static constexpr float NS = 1.25f;
-
-    float Total = 0.0f;
-    float Frequency = 1.0f;
-    float Amplitude = 1.0f;
-    float MaxValue = 0.0f;
-    float Weight = 1.0f;  // Weight feedback from previous octave
-
-    for (int32 i = 0; i < Octaves; i++)
-    {
-        // Sample Perlin and fold at zero → ridge at zero-crossings
-        float N = FMath::PerlinNoise3D(Position * Frequency) * NS;
-        N = 1.0f - FMath::Abs(N);  // Fold: [−1,1] → [0,1] with ridges at N=0
-        N = N * N;                   // Sharpen ridges (quadratic falloff)
-        N *= Weight;                 // Weight by previous octave → detail follows ridges
-        Weight = FMath::Clamp(N * 2.0f, 0.0f, 1.0f);  // Feedback for next octave
-
-        Total += N * Amplitude;
-        MaxValue += Amplitude;
-        Frequency *= Lacunarity;
-        Amplitude *= Persistence;
-    }
-
-    // Shift from [0, 1] to [-1, 1] to match FractalNoise3D's range
-    return (Total / MaxValue) * 2.0f - 1.0f;
+    return VoxelNoise::Ridged((float)Position.X, (float)Position.Y, (float)Position.Z,
+                              Octaves, Lacunarity, Persistence);
 }
 
 //=============================================================================
@@ -401,6 +397,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FVerticalShaftParams    CP_Vert;
         thread_local FFloatingIslandParams   CP_Float;
         thread_local FStrateDisturbanceParams CP_Dist;
+        // Biomes (SurfaceWorld for now): CP_BiomeCtx is the cheap per-chunk flatten;
+        // CP_BiomeCache is the box-validated grid; CP_SurfaceBiomeParams holds each biome's
+        // resolved surface params (override or strate fallback) parallel to CP_BiomeCtx.Biomes.
+        thread_local FBiomeContext            CP_BiomeCtx;
+        thread_local FChunkBiomeCache         CP_BiomeCache;
+        thread_local TArray<FSurfaceGenerationParams> CP_SurfaceBiomeParams;
+        thread_local FSurfaceColumnCache      CP_SurfCol;   // T1.a per-column surface cache
 
         if (ChunkCoord != CP_Chunk)
         {
@@ -414,7 +417,37 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             case ECaveGeneratorType::Maze:
                 CP_Maze    = StrateManager->GetMazeParamsForChunk(ChunkCoord);            break;
             case ECaveGeneratorType::SurfaceWorld:
-                CP_Surface = StrateManager->GetSurfaceParamsForChunk(ChunkCoord);         break;
+            {
+                CP_Surface  = StrateManager->GetSurfaceParamsForChunk(ChunkCoord);
+                CP_BiomeCtx = StrateManager->GetBiomeContextForChunk(ChunkCoord);
+
+                // Per-biome surface params: each biome's override (when it overrides
+                // SurfaceWorld) else the strate's, with STRUCTURAL fields forced from the
+                // strate (Z bounds, seal, base, water level) so seals/spine/water stay intact.
+                CP_SurfaceBiomeParams.Reset();
+                if (CP_BiomeCtx.IsValid())
+                {
+                    const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(ChunkCoord);
+                    CP_SurfaceBiomeParams.Reserve(CP_BiomeCtx.Biomes.Num());
+                    for (const FBiomeResolved& BR : CP_BiomeCtx.Biomes)
+                    {
+                        FSurfaceGenerationParams P = CP_Surface;   // strate base (+ structural)
+                        const UVoxelBiomeDefinition* B =
+                            (Def && Def->Biomes.IsValidIndex(BR.Index)) ? Def->Biomes[BR.Index] : nullptr;
+                        if (B && B->bOverrideTerrain && B->GeneratorType == ECaveGeneratorType::SurfaceWorld)
+                        {
+                            P = B->SurfaceParams;                  // biome shape
+                            P.StrateTopWorldZ      = CP_Surface.StrateTopWorldZ;
+                            P.StrateBottomWorldZ   = CP_Surface.StrateBottomWorldZ;
+                            P.BoundarySealThickness = CP_Surface.BoundarySealThickness;
+                            P.BaseDensity          = CP_Surface.BaseDensity;
+                            P.WaterLevelRelative   = CP_Surface.WaterLevelRelative;  // shared water plane
+                        }
+                        CP_SurfaceBiomeParams.Add(P);
+                    }
+                }
+                break;
+            }
             case ECaveGeneratorType::VerticalShafts:
                 CP_Vert    = StrateManager->GetVerticalShaftParamsForChunk(ChunkCoord);   break;
             case ECaveGeneratorType::FloatingIslands:
@@ -433,7 +466,69 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         case ECaveGeneratorType::Maze:
             Result = GetMazeDensity(WorldX, WorldY, WorldZ, CP_Maze);                 break;
         case ECaveGeneratorType::SurfaceWorld:
-            Result = GetSurfaceDensity(WorldX, WorldY, WorldZ, CP_Surface);           break;
+        {
+            // The XY-only surface field (biome-blended terrain Z + sky-cap ceiling) for one
+            // column. Resolves the biome sample here so it's cached per column too.
+            auto ComputeColumn = [&](float X, float Y) -> FSurfaceColumn
+            {
+                const FSurfaceGenerationParams* PD = &CP_Surface;
+                const FSurfaceGenerationParams* PN = &CP_Surface;
+                float W = 0.0f;
+                if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
+                {
+                    const FBiomeSample Smp = ResolveBiomeSampleAt(X, Y, ChunkCoord.Z, CP_BiomeCtx, CP_BiomeCache);
+                    const int32 Di = CP_SurfaceBiomeParams.IsValidIndex(Smp.DominantIndex) ? Smp.DominantIndex : 0;
+                    PD = &CP_SurfaceBiomeParams[Di];
+                    if (Smp.NeighborWeight > 0.0f && CP_SurfaceBiomeParams.IsValidIndex(Smp.NeighborIndex))
+                    {
+                        PN = &CP_SurfaceBiomeParams[Smp.NeighborIndex];
+                        W = Smp.NeighborWeight;
+                    }
+                }
+                FSurfaceColumn Col;
+                Col.TerrainZ = ComputeSurfaceTerrainZ(X, Y, *PD);
+                if (W > 0.0f) Col.TerrainZ = FMath::Lerp(Col.TerrainZ, ComputeSurfaceTerrainZ(X, Y, *PN), W);
+                Col.CeilSurf = ComputeSurfaceCeiling(X, Y, *PD);
+                return Col;
+            };
+
+            FSurfaceColumn Col;
+            // Integer XY (the density grid) → reuse the column down its whole Z extent.
+            // Fractional XY (gradient-normal samples) → compute directly (no cache key).
+            if (WorldX == FMath::FloorToFloat(WorldX) && WorldY == FMath::FloorToFloat(WorldY))
+            {
+                const int32 IX = (int32)WorldX, IY = (int32)WorldY;
+                const bool bInBox = CP_SurfCol.bValid
+                    && CP_SurfCol.ChunkZ == ChunkCoord.Z && CP_SurfCol.Seed == Seed
+                    && IX >= CP_SurfCol.BaseX && IX < CP_SurfCol.BaseX + FSurfaceColumnCache::Dim
+                    && IY >= CP_SurfCol.BaseY && IY < CP_SurfCol.BaseY + FSurfaceColumnCache::Dim;
+                if (!bInBox)
+                {
+                    // Centre the box on this (first / boundary-crossing) sample so the rest of
+                    // the chunk's column queries — including the ±Step margin ring — fall inside.
+                    CP_SurfCol.BaseX  = IX - FSurfaceColumnCache::Halo;
+                    CP_SurfCol.BaseY  = IY - FSurfaceColumnCache::Halo;
+                    CP_SurfCol.ChunkZ = ChunkCoord.Z;
+                    CP_SurfCol.Seed   = Seed;
+                    CP_SurfCol.bValid = true;
+                    FMemory::Memzero(CP_SurfCol.Computed, sizeof(CP_SurfCol.Computed));
+                }
+                const int32 CI = (IY - CP_SurfCol.BaseY) * FSurfaceColumnCache::Dim + (IX - CP_SurfCol.BaseX);
+                if (!CP_SurfCol.Computed[CI])
+                {
+                    CP_SurfCol.Cols[CI] = ComputeColumn(WorldX, WorldY);
+                    CP_SurfCol.Computed[CI] = true;
+                }
+                Col = CP_SurfCol.Cols[CI];
+            }
+            else
+            {
+                Col = ComputeColumn(WorldX, WorldY);
+            }
+
+            Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, Col.TerrainZ, Col.CeilSurf, CP_Surface);
+            break;
+        }
         case ECaveGeneratorType::VerticalShafts:
             Result = GetVerticalShaftDensity(WorldX, WorldY, WorldZ, CP_Vert);        break;
         case ECaveGeneratorType::FloatingIslands:
@@ -549,15 +644,15 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // Three independent Perlin fields offset by irrational-ish numbers
         // so the X/Y/Z warp channels don't correlate with each other.
         // Single octave to keep per-voxel cost low (3 Perlin calls total).
-        WarpedX += FMath::PerlinNoise3D(FVector(
+        WarpedX += VoxelNoise::Perlin3D(FVector(
             WorldX * WF + SeedF * 0.37f,
             WorldY * WF + 1.3f,
             EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedY += FMath::PerlinNoise3D(FVector(
+        WarpedY += VoxelNoise::Perlin3D(FVector(
             WorldX * WF + 7.1f,
             WorldY * WF + SeedF * 0.59f,
             EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedZ += FMath::PerlinNoise3D(FVector(
+        WarpedZ += VoxelNoise::Perlin3D(FVector(
             WorldX * WF + 11.3f,
             WorldY * WF + 9.7f,
             EffectiveZ * WF + SeedF * 0.41f)) * VOXEL_NOISE_SCALE * WS;
@@ -814,19 +909,19 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 float WS = Params.DomainWarpStrength;
 
                 // Sample three independent noise fields for X, Y, Z warp
-                float WarpX = FMath::PerlinNoise3D(FVector(
+                float WarpX = VoxelNoise::Perlin3D(FVector(
                     WorldX * WF + SeedF * 5.2f,
                     WorldY * WF + SeedF * 1.3f,
                     EffectiveZ * WF + SeedF * 9.7f
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                float WarpY = FMath::PerlinNoise3D(FVector(
+                float WarpY = VoxelNoise::Perlin3D(FVector(
                     WorldX * WF + 100.0f + SeedF * 7.7f,
                     WorldY * WF + 200.0f + SeedF * 3.1f,
                     EffectiveZ * WF + 300.0f
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                float WarpZ = FMath::PerlinNoise3D(FVector(
+                float WarpZ = VoxelNoise::Perlin3D(FVector(
                     WorldX * WF + 400.0f,
                     WorldY * WF + 500.0f + SeedF * 11.9f,
                     EffectiveZ * WF + 600.0f + SeedF * 13.3f
@@ -1149,7 +1244,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // Near the surface (CaveSDF ≈ 0), the sign of CaveSDF tells us which
             // side we're on: negative = inside cave, positive = solid rock.
             // We use a noise-modulated vertical gradient to detect steep faces.
-            float VertGrad = FMath::PerlinNoise3D(FVector(
+            float VertGrad = VoxelNoise::Perlin3D(FVector(
                 WorldX * 0.05f + SeedF * 71.3f,
                 WorldY * 0.05f + SeedF * 73.7f,
                 EffectiveZ * 0.15f + SeedF * 79.1f  // 3x faster in Z → detects vertical features
@@ -1458,28 +1553,52 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // produce natural winding paths that complement the room-and-corridor structure.
     //
     // HORIZONTAL BIAS: Z frequency is scaled up so tunnels prefer horizontal paths.
+    //
+    // NETWORK MASK: |N1|+|N2| < threshold carves tubes near the intersection of two noise
+    // zero-surfaces — but wherever the fields merely GRAZE the threshold it leaves pinhole
+    // pockets, and none of it is connected to anything (the far-field "confetti").
+    // WormNetworkRange masks the carve by distance to the room/tunnel network (CaveSDF is
+    // already computed by Step 4 — free): full strength at the network, smooth fade to zero
+    // at Range. Worms become braids/shortcuts hugging the cave system; no isolated speckle.
+    // Range = 0 → unmasked legacy behaviour. Bonus: fully-masked voxels skip both Perlins.
     if (Params.WormStrength > 0.0f && Params.WormThreshold > 0.0f)
     {
-        float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
-
-        float N1 = FMath::Abs(FMath::PerlinNoise3D(FVector(
-            WorldX * Params.WormFrequency + SeedF,
-            WorldY * Params.WormFrequency + SeedF * 1.7f,
-            EffectiveZ * WormZFreq + SeedF * 2.3f
-        )) * VOXEL_NOISE_SCALE);
-
-        float N2 = FMath::Abs(FMath::PerlinNoise3D(FVector(
-            WorldX * Params.WormFrequency + SeedF + 137.0f,
-            WorldY * Params.WormFrequency + SeedF * 1.7f + 259.0f,
-            EffectiveZ * WormZFreq + SeedF * 2.3f + 431.0f
-        )) * VOXEL_NOISE_SCALE);
-
-        float WormValue = N1 + N2;
-
-        if (WormValue < Params.WormThreshold)
+        float NetworkMask = 1.0f;
+        if (Params.WormNetworkRange > 0.0f)
         {
-            float t = 1.0f - (WormValue / Params.WormThreshold);
-            Density -= t * Params.WormStrength;
+            if (CaveSDF >= Params.WormNetworkRange)  // also true when no network (FLT_MAX)
+            {
+                NetworkMask = 0.0f;
+            }
+            else if (CaveSDF > 0.0f)
+            {
+                NetworkMask = 1.0f - SmoothStep01(CaveSDF / Params.WormNetworkRange);
+            }
+        }
+
+        if (NetworkMask > 0.0f)
+        {
+            float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
+
+            float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                WorldX * Params.WormFrequency + SeedF,
+                WorldY * Params.WormFrequency + SeedF * 1.7f,
+                EffectiveZ * WormZFreq + SeedF * 2.3f
+            )) * VOXEL_NOISE_SCALE);
+
+            float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                WorldX * Params.WormFrequency + SeedF + 137.0f,
+                WorldY * Params.WormFrequency + SeedF * 1.7f + 259.0f,
+                EffectiveZ * WormZFreq + SeedF * 2.3f + 431.0f
+            )) * VOXEL_NOISE_SCALE);
+
+            float WormValue = N1 + N2;
+
+            if (WormValue < Params.WormThreshold)
+            {
+                float t = 1.0f - (WormValue / Params.WormThreshold);
+                Density -= t * Params.WormStrength * NetworkMask;
+            }
         }
     }
 
@@ -1792,21 +1911,37 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
 // high solid "sky cap" ceiling, with a flattened beach band around the water line.
 // Open air fills the gap between ground and ceiling; water is a render-side overlay.
 
-float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
-                                         const FSurfaceGenerationParams& Params) const
+float UVoxelGenerator::ComputeSurfaceTerrainZ(float WorldX, float WorldY,
+                                              const FSurfaceGenerationParams& Params) const
 {
     const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    if (H <= 0.0f) return 1.0f;
-
     const float SeedF = (float)Seed;
     const float BottomZ = Params.StrateBottomWorldZ;
 
     // --- Heightfield (a function of XY only — Z is a fixed seed slice) ---
     const float GroundBase = BottomZ + H * Params.BaseGroundRelative;
 
+    // Domain-warp the STRUCTURAL query coords (continents + mountains) so coastlines and
+    // ridgelines wind organically instead of looking like axis-aligned noise blobs. Detail
+    // noise stays on the real XY so fine bumps remain crisp and uncorrelated with the warp.
+    float QX = WorldX, QY = WorldY;
+    if (Params.HeightWarpStrength > 0.0f)
+    {
+        const float WF = Params.HeightWarpFrequency;
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.31f, WorldY * WF + 4.2f, SeedF * 1.7f));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + SeedF * 0.53f, SeedF * 2.9f));
+        QX += wx * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
+        QY += wy * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
+    }
+
+    // Macro relief map [0,1]: where this XY sits on the plains <-> mountains spectrum.
+    // M is the "mountainous-ness"; ReliefStrength=0 → M=1 everywhere (uniform terrain).
+    const float Relief = SampleRelief(WorldX, WorldY, Params.ReliefFrequency, Params.ReliefContrast);
+    const float M = FMath::Lerp(1.0f, Relief, Params.ReliefStrength);
+
     float Cont = FractalNoise3D(FVector(
-        WorldX * Params.ContinentFrequency + SeedF * 3.1f,
-        WorldY * Params.ContinentFrequency + SeedF * 5.7f,
+        QX * Params.ContinentFrequency + SeedF * 3.1f,
+        QY * Params.ContinentFrequency + SeedF * 5.7f,
         SeedF * 0.7f), 4);  // [-1,1]
 
     float Detail = FractalNoise3D(FVector(
@@ -1818,19 +1953,31 @@ float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float World
     if (Params.MountainStrength > 0.0f)
     {
         float Ridge = RidgedNoise3D(FVector(
-            WorldX * Params.MountainFrequency + 99.0f,
-            WorldY * Params.MountainFrequency + 77.0f,
+            QX * Params.MountainFrequency + 99.0f,
+            QY * Params.MountainFrequency + 77.0f,
             SeedF * 0.9f), 4);     // [-1,1]
         Ridge = Ridge * 0.5f + 0.5f;  // [0,1] peaks
-        Mountain = Ridge * Params.MountainStrength;
+        Mountain = Ridge * Params.MountainStrength * M;   // mountains rise only in high-relief regions
     }
 
+    // Plains keep a fraction of the continental swell; highlands get the full range.
+    const float ContScale = FMath::Lerp(0.45f, 1.0f, M);
+
     float Terrain = GroundBase
-        + Cont * Params.ElevationRange * 0.5f
+        + Cont * Params.ElevationRange * 0.5f * ContScale
         + Mountain * Params.ElevationRange
         + Detail * Params.SurfaceRoughness;
 
-    // Beach: flatten terrain toward the water line within BeachWidth.
+    // Plateau/mesa terracing — quantize height into steps, but only in high-relief areas and
+    // only as strongly as TerraceStrength asks. Layered cliffs/mesas up top, smooth lowlands.
+    if (Params.TerraceStrength > 0.0f && Params.TerraceHeight > 0.0f)
+    {
+        const float Stepped = FMath::RoundToFloat(Terrain / Params.TerraceHeight) * Params.TerraceHeight;
+        Terrain = FMath::Lerp(Terrain, Stepped, Params.TerraceStrength * M);
+    }
+
+    // Beach: flatten terrain toward the water line within BeachWidth. (Water level is
+    // strate-global — forced from the strate — so the water plane stays continuous.)
     const float WaterZ = BottomZ + H * Params.WaterLevelRelative;
     if (Params.WaterLevelRelative > 0.0f && Params.BeachWidth > 0.0f)
     {
@@ -1842,11 +1989,15 @@ float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float World
         }
     }
 
-    // Solid below the terrain surface (positive = solid).
-    float Density = Terrain - WorldZ;
+    return Terrain;
+}
 
-    // Sky cap: solid ceiling near the top of the strate, bumpy downward.
-    const float CeilZ = BottomZ + H * Params.CeilingRelative;
+float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
+                                             const FSurfaceGenerationParams& Params) const
+{
+    const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
+    const float SeedF = (float)Seed;
+    const float CeilZ = Params.StrateBottomWorldZ + H * Params.CeilingRelative;
     float CeilNoise = 0.0f;
     if (Params.CeilingRoughness > 0.0f)
     {
@@ -1854,24 +2005,321 @@ float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float World
             WorldX * 0.04f + 5.0f, WorldY * 0.04f + 6.0f, SeedF * 2.1f), 3))
             * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
     }
-    const float CeilSurface = CeilZ - CeilNoise;
-    Density = FMath::Max(Density, WorldZ - CeilSurface);  // add solid above the ceiling
+    return CeilZ - CeilNoise;
+}
 
+float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
+                                                float TerrainZ, float CeilSurf,
+                                                const FSurfaceGenerationParams& S) const
+{
+    // Solid below the terrain surface; solid above the sky-cap ceiling.
+    float Density = TerrainZ - WorldZ;
+    Density = FMath::Max(Density, WorldZ - CeilSurf);
+
+    // Structural fields (Z bounds, seal, base) are forced equal across biomes → S is safe.
     ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
+        S.StrateTopWorldZ, S.StrateBottomWorldZ,
+        S.BoundarySealThickness, S.BaseDensity, OriginSpineRadius);
 
     ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
+        S.StrateTopWorldZ, S.StrateBottomWorldZ,
+        S.BoundarySealThickness, S.BaseDensity);
 
     if (StrateManager)
     {
         const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        ApplyPassageCarving(Density, ModSDF, S.BaseDensity, S.BoundarySealThickness);
     }
 
     return -Density;
+}
+
+float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
+                                         const FSurfaceGenerationParams& ParamsD,
+                                         const FSurfaceGenerationParams& ParamsN,
+                                         float NeighborWeight) const
+{
+    if (ParamsD.StrateTopWorldZ - ParamsD.StrateBottomWorldZ <= 0.0f) return 1.0f;
+
+    // Heightfield: dominant biome, OUTPUT-BLENDED toward the nearest neighbour in the
+    // border band. Blending heights (not params) keeps borders seamless across any param
+    // difference. ParamsD == ParamsN, weight 0 ⇒ single eval (bit-identical, no biomes).
+    float TerrainZ = ComputeSurfaceTerrainZ(WorldX, WorldY, ParamsD);
+    if (NeighborWeight > 0.0f)
+    {
+        TerrainZ = FMath::Lerp(TerrainZ, ComputeSurfaceTerrainZ(WorldX, WorldY, ParamsN), NeighborWeight);
+    }
+    const float CeilSurf = ComputeSurfaceCeiling(WorldX, WorldY, ParamsD);
+
+    return SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, TerrainZ, CeilSurf, ParamsD);
+}
+
+//=============================================================================
+// CLIMATE & BIOME FIELDS
+//=============================================================================
+// Pure functions of world XY (+ seed). The relief field is shared with SurfaceWorld
+// terrain so the biome map and the terrain it modulates stay in agreement. The biome
+// field is a warped Voronoi whose cells are assigned a biome by climate — coherent
+// geography (mountains cluster in high relief), window-invariant by construction.
+
+float UVoxelGenerator::SampleRelief(float WorldX, float WorldY, float Frequency, float Contrast) const
+{
+    const float SeedF = (float)Seed;
+    // Same offsets/octaves as the original SurfaceWorld relief so existing worlds are
+    // unchanged (this is the function that code path now calls).
+    float R = FractalNoise3D(FVector(
+        WorldX * Frequency + SeedF * 7.3f,
+        WorldY * Frequency + SeedF * 2.1f,
+        SeedF * 0.5f), 2) * 0.5f + 0.5f;                 // [0,1]
+    R = FMath::Clamp((R - 0.5f) * Contrast + 0.5f, 0.0f, 1.0f);
+    return SmoothStep01(R);
+}
+
+float UVoxelGenerator::SampleMoisture(float WorldX, float WorldY, float Frequency) const
+{
+    const float SeedF = (float)Seed;
+    const float N = FractalNoise3D(FVector(
+        WorldX * Frequency + SeedF * 4.7f,
+        WorldY * Frequency + SeedF * 8.9f,
+        SeedF * 1.3f), 2) * 0.5f + 0.5f;                 // [0,1]
+    return FMath::Clamp(N, 0.0f, 1.0f);
+}
+
+int32 UVoxelGenerator::ClassifyBiomeAtSite(float SiteX, float SiteY,
+                                           const FBiomeContext& Ctx, uint32 SiteHash) const
+{
+    const float R  = SampleRelief(SiteX, SiteY, Ctx.Map.ReliefFrequency, Ctx.Map.ReliefContrast);
+    const float Mo = SampleMoisture(SiteX, SiteY, Ctx.Map.MoistureFrequency);
+
+    int32 Best = 0;
+    float BestScore = FLT_MAX;
+    for (int32 i = 0; i < Ctx.Biomes.Num(); ++i)
+    {
+        const FBiomeResolved& B = Ctx.Biomes[i];
+        // Distance in climate space to the biome's box (0 when inside it).
+        const float dr = (R  < B.ReliefMin)   ? (B.ReliefMin - R)
+                       : (R  > B.ReliefMax)   ? (R - B.ReliefMax)   : 0.0f;
+        const float dm = (Mo < B.MoistureMin) ? (B.MoistureMin - Mo)
+                       : (Mo > B.MoistureMax) ? (Mo - B.MoistureMax) : 0.0f;
+        float Score = dr * dr + dm * dm;
+        // Tiny deterministic jitter so overlapping boxes don't all collapse to biome 0.
+        Score += VoxelHash::ToFloat01(VoxelHash::Mix(SiteHash ^ (0x9e3779b9u * (uint32)(i + 1)))) * 1.0e-4f;
+        if (Score < BestScore) { BestScore = Score; Best = i; }
+    }
+    return Best;
+}
+
+FBiomeSample UVoxelGenerator::SampleBiomeAt(float WorldX, float WorldY, const FBiomeContext& Ctx) const
+{
+    FBiomeSample Out;
+    if (Ctx.Biomes.Num() == 0) return Out;                    // biomes disabled
+    if (Ctx.Biomes.Num() == 1) { Out.DominantIndex = 0; return Out; }
+
+    const FBiomeMapParams& MP = Ctx.Map;
+    const float Cell = FMath::Max(MP.CellSize, 1.0f);
+    const uint32 S = (uint32)Seed ^ 0x42494f4du;             // 'BIOM'
+
+    // Domain-warp the query so cell borders wind organically (not a hex grid).
+    float QX = WorldX, QY = WorldY;
+    if (MP.WarpStrength > 0.0f)
+    {
+        const float SeedF = (float)Seed;
+        const float WF = MP.WarpFrequency;
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.27f, WorldY * WF + 3.1f, SeedF * 1.1f));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + SeedF * 0.61f, SeedF * 2.3f));
+        QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
+        QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
+    }
+
+    const int32 CX = FMath::FloorToInt(QX / Cell);
+    const int32 CY = FMath::FloorToInt(QY / Cell);
+
+    // Worley F1/F2 over the 3x3 neighbourhood of the (warped) cell. With jitter confined
+    // to [0,1) of a cell, the nearest site is always within this neighbourhood.
+    float BestD2 = FLT_MAX, SecondD2 = FLT_MAX;
+    int32 BestBiome = 0, SecondBiome = 0;
+    for (int32 dy = -1; dy <= 1; ++dy)
+    for (int32 dx = -1; dx <= 1; ++dx)
+    {
+        const int32 nx = CX + dx, ny = CY + dy;
+        const uint32 h = VoxelHash::Cell(nx, ny, S);
+        const float jx = VoxelHash::ToFloat01(h);
+        const float jy = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x68bc21ebu));
+        const float sx = (nx + jx) * Cell;
+        const float sy = (ny + jy) * Cell;
+        const float ddx = sx - QX, ddy = sy - QY;
+        const float d2 = ddx * ddx + ddy * ddy;
+
+        if (d2 < BestD2)
+        {
+            SecondD2 = BestD2; SecondBiome = BestBiome;
+            BestD2 = d2; BestBiome = ClassifyBiomeAtSite(sx, sy, Ctx, h);
+        }
+        else if (d2 < SecondD2)
+        {
+            SecondD2 = d2; SecondBiome = ClassifyBiomeAtSite(sx, sy, Ctx, h);
+        }
+    }
+
+    Out.DominantIndex = BestBiome;
+    Out.NeighborIndex = SecondBiome;
+
+    // Blend weight: 0.5 at the shared border (d1≈d2), fading to 0 a BorderBlend-wide
+    // band inside the dominant cell. Only blend when the neighbour is a DIFFERENT biome.
+    if (MP.BorderBlend > 0.0f && SecondD2 < FLT_MAX && BestBiome != SecondBiome)
+    {
+        const float d1 = FMath::Sqrt(BestD2);
+        const float d2 = FMath::Sqrt(SecondD2);
+        const float t = FMath::Clamp((d2 - d1) / FMath::Max(MP.BorderBlend, 1.0f), 0.0f, 1.0f);
+        Out.NeighborWeight = 0.5f * (1.0f - SmoothStep01(t));
+    }
+    return Out;
+}
+
+void UVoxelGenerator::RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,
+                                       const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const
+{
+    Cache.ChunkZ  = ChunkZ;
+    Cache.Seed    = Seed;
+    Cache.bActive = Ctx.IsValid();
+    Cache.Ctx     = Ctx;
+    Cache.CellBiome.Reset();
+
+    if (!Cache.bActive)
+    {
+        // Mark the whole chunk footprint valid so non-biome chunks don't rebuild per voxel.
+        Cache.ValidMinX = (float)ChunkX * CHUNK_SIZE - (float)CHUNK_SIZE;
+        Cache.ValidMaxX = (float)(ChunkX + 1) * CHUNK_SIZE + (float)CHUNK_SIZE;
+        Cache.ValidMinY = (float)ChunkY * CHUNK_SIZE - (float)CHUNK_SIZE;
+        Cache.ValidMaxY = (float)(ChunkY + 1) * CHUNK_SIZE + (float)CHUNK_SIZE;
+        return;
+    }
+
+    const FBiomeMapParams& MP = Ctx.Map;
+    const float Cell = FMath::Max(MP.CellSize, 1.0f);
+    const uint32 S = (uint32)Seed ^ 0x42494f4du;             // 'BIOM' (must match SampleBiomeAt)
+
+    // Validity halo: one chunk beyond the footprint, so the +X/+Y boundary corners and
+    // ±1 gradient-normal samples stay inside the valid box (no rebuild thrash, §8.10).
+    const float Halo = (float)CHUNK_SIZE;
+    Cache.ValidMinX = (float)ChunkX * CHUNK_SIZE - Halo;
+    Cache.ValidMaxX = (float)(ChunkX + 1) * CHUNK_SIZE + Halo;
+    Cache.ValidMinY = (float)ChunkY * CHUNK_SIZE - Halo;
+    Cache.ValidMaxY = (float)(ChunkY + 1) * CHUNK_SIZE + Halo;
+
+    // Cell-grid coverage: the valid box expanded by the max warp displacement + one cell,
+    // so the 3x3 search around any in-box query's warped point is fully present.
+    const float CellMargin = MP.WarpStrength * VOXEL_NOISE_SCALE + Cell + 1.0f;
+    Cache.BaseCellX = FMath::FloorToInt((Cache.ValidMinX - CellMargin) / Cell);
+    Cache.BaseCellY = FMath::FloorToInt((Cache.ValidMinY - CellMargin) / Cell);
+    const int32 MaxCellX = FMath::FloorToInt((Cache.ValidMaxX + CellMargin) / Cell);
+    const int32 MaxCellY = FMath::FloorToInt((Cache.ValidMaxY + CellMargin) / Cell);
+    Cache.CellsX = MaxCellX - Cache.BaseCellX + 1;
+    Cache.CellsY = MaxCellY - Cache.BaseCellY + 1;
+    Cache.CellBiome.SetNumUninitialized(Cache.CellsX * Cache.CellsY);
+
+    for (int32 cy = 0; cy < Cache.CellsY; ++cy)
+    for (int32 cx = 0; cx < Cache.CellsX; ++cx)
+    {
+        const int32 nx = Cache.BaseCellX + cx;
+        const int32 ny = Cache.BaseCellY + cy;
+        const uint32 h = VoxelHash::Cell(nx, ny, S);
+        const float jx = VoxelHash::ToFloat01(h);
+        const float jy = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x68bc21ebu));
+        const float sx = (nx + jx) * Cell;
+        const float sy = (ny + jy) * Cell;
+        Cache.CellBiome[cy * Cache.CellsX + cx] = ClassifyBiomeAtSite(sx, sy, Ctx, h);
+    }
+}
+
+FBiomeSample UVoxelGenerator::ResolveBiomeSampleAt(float WorldX, float WorldY, int32 ChunkZ,
+                                                   const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const
+{
+    FBiomeSample Out;
+
+    // Box-validated rebuild (perf-only; result is the pure function of XY either way).
+    if (!Cache.Contains(WorldX, WorldY, ChunkZ, Seed))
+    {
+        RebuildBiomeGrid(FMath::FloorToInt(WorldX / CHUNK_SIZE),
+                         FMath::FloorToInt(WorldY / CHUNK_SIZE), ChunkZ, Ctx, Cache);
+    }
+
+    if (!Cache.bActive) return Out;
+    if (Cache.Ctx.Biomes.Num() == 1) { Out.DominantIndex = 0; return Out; }
+
+    const FBiomeMapParams& MP = Cache.Ctx.Map;
+    const float Cell = FMath::Max(MP.CellSize, 1.0f);
+    const uint32 S = (uint32)Seed ^ 0x42494f4du;
+
+    // Same warp + 3x3 Worley as SampleBiomeAt → identical assignment (matches the preview).
+    float QX = WorldX, QY = WorldY;
+    if (MP.WarpStrength > 0.0f)
+    {
+        const float SeedF = (float)Seed;
+        const float WF = MP.WarpFrequency;
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.27f, WorldY * WF + 3.1f, SeedF * 1.1f));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + SeedF * 0.61f, SeedF * 2.3f));
+        QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
+        QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
+    }
+
+    const int32 CX = FMath::FloorToInt(QX / Cell);
+    const int32 CY = FMath::FloorToInt(QY / Cell);
+
+    float BestD2 = FLT_MAX, SecondD2 = FLT_MAX;
+    int32 BestBiome = 0, SecondBiome = 0;
+    for (int32 dy = -1; dy <= 1; ++dy)
+    for (int32 dx = -1; dx <= 1; ++dx)
+    {
+        const int32 nx = CX + dx, ny = CY + dy;
+        const uint32 h = VoxelHash::Cell(nx, ny, S);
+        const float jx = VoxelHash::ToFloat01(h);
+        const float jy = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x68bc21ebu));
+        const float sx = (nx + jx) * Cell;
+        const float sy = (ny + jy) * Cell;
+        const float ddx = sx - QX, ddy = sy - QY;
+        const float d2 = ddx * ddx + ddy * ddy;
+
+        // Cached biome index (fallback to classify on the rare margin miss → still correct).
+        const int32 gx = nx - Cache.BaseCellX;
+        const int32 gy = ny - Cache.BaseCellY;
+        const int32 BiomeIdx = (gx >= 0 && gx < Cache.CellsX && gy >= 0 && gy < Cache.CellsY)
+            ? Cache.CellBiome[gy * Cache.CellsX + gx]
+            : ClassifyBiomeAtSite(sx, sy, Cache.Ctx, h);
+
+        if (d2 < BestD2)        { SecondD2 = BestD2; SecondBiome = BestBiome; BestD2 = d2; BestBiome = BiomeIdx; }
+        else if (d2 < SecondD2) { SecondD2 = d2; SecondBiome = BiomeIdx; }
+    }
+
+    Out.DominantIndex = BestBiome;
+    Out.NeighborIndex = SecondBiome;
+    if (MP.BorderBlend > 0.0f && SecondD2 < FLT_MAX && BestBiome != SecondBiome)
+    {
+        const float d1 = FMath::Sqrt(BestD2);
+        const float d2 = FMath::Sqrt(SecondD2);
+        const float t = FMath::Clamp((d2 - d1) / FMath::Max(MP.BorderBlend, 1.0f), 0.0f, 1.0f);
+        Out.NeighborWeight = 0.5f * (1.0f - SmoothStep01(t));
+    }
+    return Out;
+}
+
+const UVoxelBiomeDefinition* UVoxelGenerator::GetDominantBiomeAt(float WorldX, float WorldY, int32 ChunkZ) const
+{
+    if (!StrateManager) return nullptr;
+
+    const FIntVector Coord(FMath::FloorToInt(WorldX / CHUNK_SIZE),
+                           FMath::FloorToInt(WorldY / CHUNK_SIZE), ChunkZ);
+
+    const FBiomeContext Ctx = StrateManager->GetBiomeContextForChunk(Coord);
+    if (!Ctx.IsValid()) return nullptr;
+
+    const FBiomeSample S = SampleBiomeAt(WorldX, WorldY, Ctx);
+    if (!Ctx.Biomes.IsValidIndex(S.DominantIndex)) return nullptr;
+
+    // Map the context position back to the strate's Biomes[] asset.
+    const int32 StrateBiomeIdx = Ctx.Biomes[S.DominantIndex].Index;
+    const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(Coord);
+    return (Def && Def->Biomes.IsValidIndex(StrateBiomeIdx)) ? Def->Biomes[StrateBiomeIdx] : nullptr;
 }
 
 //=============================================================================

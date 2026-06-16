@@ -89,7 +89,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
     // Les vertices partagés permettent des normales lisses et réduisent le count ~3x.
     TMap<FIntVector, int32> VertexMap;
 
-    auto GetOrCreateVertex = [&](const FVector& WorldPos) -> int32
+    // Normale fournie par l'appelant (gradient lu dans la grille de densité, T1.b) —
+    // plus d'échantillonnage de densité par vertex. RawNormal pointe solide→air ; on la
+    // normalise ici (fallback up si dégénérée).
+    auto GetOrCreateVertex = [&](const FVector& WorldPos, const FVector& RawNormal) -> int32
     {
         const FIntVector Key(
             FMath::RoundToInt(WorldPos.X * 100.0f),
@@ -107,18 +110,12 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
 
         MeshData.Vertices.Add(WorldPos);
 
-        // Normale par gradient de densité (shading lisse).
-        if (Generator)
+        FVector Normal = RawNormal;
+        if (!Normal.Normalize())
         {
-            const float VoxelX = WorldPos.X / VOXEL_SIZE;
-            const float VoxelY = WorldPos.Y / VOXEL_SIZE;
-            const float VoxelZ = WorldPos.Z / VOXEL_SIZE;
-            MeshData.Normals.Add(ComputeGradientNormal(VoxelX, VoxelY, VoxelZ));
+            Normal = FVector(0.0f, 0.0f, 1.0f);  // dégénéré (zone plate)
         }
-        else
-        {
-            MeshData.Normals.Add(FVector(0.0f, 0.0f, 1.0f));
-        }
+        MeshData.Normals.Add(Normal);
 
         // UVs planaires — le triplanar mapping se fait dans le matériau.
         MeshData.UVs.Add(FVector2D(WorldPos.X / VOXEL_SIZE, WorldPos.Y / VOXEL_SIZE));
@@ -161,22 +158,43 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
     // CellsPerAxis = nombre de cellules par axe ; GridDim = points de grille (+1).
     // Le point de grille (gx,gy,gz) correspond au voxel monde (gx,gy,gz)*Step.
     // Ordre de remplissage z→y→x : garde le cache SDF (search-box) bien chaud.
+    // On échantillonne avec un anneau de marge de 1 point de chaque côté (indices -1..GridDim)
+    // pour pouvoir calculer les normales par GRADIENT DE GRILLE (T1.b) — différences centrales
+    // sur la grille au lieu de 6 appels densité frais par vertex. La marge utilise les mêmes
+    // échantillons monde purs qu'un chunk voisin, donc les normales restent continues aux bords
+    // de chunk (pas de couture de shading). La géométrie est inchangée au bit près (mêmes
+    // positions d'arête) ; seules les normales changent.
     const int32 CellsPerAxis = CHUNK_SIZE / Step;
     const int32 GridDim      = CellsPerAxis + 1;
+    const int32 MDim         = GridDim + 2;            // +1 marge de chaque côté
 
     TArray<float> DensityGrid;
-    DensityGrid.SetNumUninitialized(GridDim * GridDim * GridDim);
-    for (int32 gz = 0; gz < GridDim; gz++)
+    DensityGrid.SetNumUninitialized(MDim * MDim * MDim);
+    for (int32 gz = -1; gz <= GridDim; gz++)
     {
-        for (int32 gy = 0; gy < GridDim; gy++)
+        for (int32 gy = -1; gy <= GridDim; gy++)
         {
-            for (int32 gx = 0; gx < GridDim; gx++)
+            for (int32 gx = -1; gx <= GridDim; gx++)
             {
-                DensityGrid[(gz * GridDim + gy) * GridDim + gx] =
+                DensityGrid[((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1)] =
                     GetDensity(Chunk, gx * Step, gy * Step, gz * Step);
             }
         }
     }
+
+    // Lecture grille (avec offset de marge) + gradient central depuis la grille.
+    auto SampleG = [&](int32 gx, int32 gy, int32 gz) -> float
+    {
+        return DensityGrid[((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1)];
+    };
+    auto GradAt = [&](int32 gx, int32 gy, int32 gz) -> FVector
+    {
+        // Densité négative=solide, positive=air → le gradient pointe vers l'air (sortant).
+        return FVector(
+            SampleG(gx + 1, gy, gz) - SampleG(gx - 1, gy, gz),
+            SampleG(gx, gy + 1, gz) - SampleG(gx, gy - 1, gz),
+            SampleG(gx, gy, gz + 1) - SampleG(gx, gy, gz - 1));
+    };
 
     //=========================================================================
     // ITÉRATION SUR LES CELLULES
@@ -190,9 +208,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
         {
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
-                // Densités + positions aux 8 coins (lues dans la grille pré-calculée)
+                // Densités + positions + gradients aux 8 coins (lus dans la grille).
                 float Densities[8];
                 FVector Positions[8];
+                FVector Gradients[8];
 
                 for (int32 i = 0; i < 8; i++)
                 {
@@ -200,9 +219,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
                     const int32 GY = cy + CornerOffsets[i].Y;
                     const int32 GZ = cz + CornerOffsets[i].Z;
 
-                    Densities[i] = DensityGrid[(GZ * GridDim + GY) * GridDim + GX];
-                    Positions[i] = ChunkWorldPos
+                    Densities[i]  = SampleG(GX, GY, GZ);
+                    Positions[i]  = ChunkWorldPos
                         + FVector(GX * Step, GY * Step, GZ * Step) * VOXEL_SIZE;
+                    Gradients[i]  = GradAt(GX, GY, GZ);
                 }
 
                 // Index de cas MC (8 bits, un par coin)
@@ -217,18 +237,23 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
 
                 if (MCEdgeTable[CaseIndex] == 0) continue;  // Pas de surface ici
 
-                // Interpolation des positions sur les arêtes traversées
+                // Interpolation des positions + normales sur les arêtes traversées. Le t est
+                // calculé exactement comme InterpolateEdge → positions bit-identiques (topologie
+                // inchangée) ; la normale interpole les gradients de coin par le même t.
                 FVector EdgeVertices[12];
+                FVector EdgeNormals[12];
                 for (int32 i = 0; i < 12; i++)
                 {
                     if (MCEdgeTable[CaseIndex] & (1 << i))
                     {
                         const int32 A = EdgeCorners[i][0];
                         const int32 B = EdgeCorners[i][1];
-                        EdgeVertices[i] = InterpolateEdge(
-                            Positions[A], Positions[B],
-                            Densities[A], Densities[B]
-                        );
+                        const float D1 = Densities[A], D2 = Densities[B];
+                        const float T = (FMath::Abs(D2 - D1) < KINDA_SMALL_NUMBER)
+                            ? 0.5f
+                            : FMath::Clamp((IsoLevel - D1) / (D2 - D1), 0.0f, 1.0f);
+                        EdgeVertices[i] = Positions[A] + T * (Positions[B] - Positions[A]);
+                        EdgeNormals[i]  = Gradients[A] + T * (Gradients[B] - Gradients[A]);
                     }
                 }
 
@@ -236,9 +261,12 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
                 // Ordre 0, 2, 1 (pas 0, 1, 2) pour le winding attendu par RealtimeMesh.
                 for (int32 i = 0; MCTriTable[CaseIndex][i] != -1; i += 3)
                 {
-                    const int32 Idx0 = GetOrCreateVertex(EdgeVertices[MCTriTable[CaseIndex][i]]);
-                    const int32 Idx1 = GetOrCreateVertex(EdgeVertices[MCTriTable[CaseIndex][i + 1]]);
-                    const int32 Idx2 = GetOrCreateVertex(EdgeVertices[MCTriTable[CaseIndex][i + 2]]);
+                    const int32 E0 = MCTriTable[CaseIndex][i];
+                    const int32 E1 = MCTriTable[CaseIndex][i + 1];
+                    const int32 E2 = MCTriTable[CaseIndex][i + 2];
+                    const int32 Idx0 = GetOrCreateVertex(EdgeVertices[E0], EdgeNormals[E0]);
+                    const int32 Idx1 = GetOrCreateVertex(EdgeVertices[E1], EdgeNormals[E1]);
+                    const int32 Idx2 = GetOrCreateVertex(EdgeVertices[E2], EdgeNormals[E2]);
 
                     MeshData.Triangles.Add(Idx0);
                     MeshData.Triangles.Add(Idx2);

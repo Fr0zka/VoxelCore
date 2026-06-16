@@ -14,6 +14,8 @@
 
 class UVoxelStrateManager;
 class UVoxelStrateDefinition;
+class UVoxelBiomeDefinition;
+class UVoxelGenerator;
 class UExponentialHeightFogComponent;
 class USkyLightComponent;
 
@@ -23,22 +25,30 @@ class VOXELFORGE_API UVoxelAtmosphereManager : public UObject
     GENERATED_BODY()
 
 public:
-    /** Create the managed fog + skylight components on the owner actor. */
-    void Initialize(AActor* InOwner, UVoxelStrateManager* InStrateManager);
+    /** Create the managed fog + skylight components on the owner actor. Generator supplies
+     *  the dominant-biome query so atmosphere can vary by biome within a strate. */
+    void Initialize(AActor* InOwner, UVoxelStrateManager* InStrateManager, UVoxelGenerator* InGenerator);
 
-    /** Call each frame with the player's world position. Cheap: only reacts on strate change. */
+    /** Call each frame with the player's world position. Cheap: only reacts on strate OR
+     *  dominant-biome change. */
     void UpdateForPlayer(const FVector& PlayerWorldPos);
 
     /** Tear down spawned layer actors + reset (season reset / shutdown). */
     void Reset();
 
 private:
-    void ApplyStrate(const UVoxelStrateDefinition* Def);
+    // Full strate apply: layer actors + atmosphere BP + fog/sky. Biome retints fog/sky.
+    void ApplyStrate(const UVoxelStrateDefinition* Def, const UVoxelBiomeDefinition* Biome);
+    // Just the managed fog + skylight (biome override beats strate when set).
+    void ApplyFogSky(const UVoxelStrateDefinition* Def, const UVoxelBiomeDefinition* Biome);
 
     TWeakObjectPtr<AActor> Owner;
 
     UPROPERTY()
     UVoxelStrateManager* StrateManager = nullptr;
+
+    UPROPERTY()
+    UVoxelGenerator* Generator = nullptr;
 
     UPROPERTY()
     UExponentialHeightFogComponent* Fog = nullptr;
@@ -59,4 +69,7 @@ private:
 
     // Which strate's atmosphere is currently applied (INT32_MIN = none yet).
     int32 CurrentStrateIndex = INT32_MIN;
+
+    // Dominant biome currently driving fog/sky (identity token for change detection).
+    TWeakObjectPtr<const UVoxelBiomeDefinition> CurrentBiome;
 };

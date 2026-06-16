@@ -17,7 +17,10 @@
 #include "Engine/DataAsset.h"
 #include "GameplayTagContainer.h"
 #include "VoxelStrateTypes.h"
+#include "VoxelBiomeTypes.h"
 #include "VoxelStrateDefinition.generated.h"
+
+class UVoxelBiomeDefinition;
 
 /**
  * UVoxelStrateDefinition — The content bag for a strate type.
@@ -146,6 +149,24 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Generation",
         meta = (EditCondition = "GeneratorType == ECaveGeneratorType::FloatingIslands"))
     FFloatingIslandParams FloatingIslandParams;
+
+    //=========================================================================
+    // BIOMES (vary terrain & content WITHIN this strate — any archetype)
+    //=========================================================================
+    // Optional. When empty, this strate generates exactly as before (no biome field,
+    // bit-identical output). When populated, a deterministic world-XY biome field
+    // (warped Voronoi + climate, see FBiomeMapParams) assigns regions; each biome can
+    // supply its OWN archetype params (a mini-strate-variant, output-blended for surface)
+    // plus its own decorations / atmosphere / water. Surface terrain wired today;
+    // content/atmosphere work for any archetype.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Biomes")
+    TArray<UVoxelBiomeDefinition*> Biomes;
+
+    // World-XY biome field tuning (cell size, border warp/blend, climate fields).
+    // Only relevant when Biomes is non-empty. Bake AVoxelWorld::BakeBiomePreview to
+    // see the resulting map before regenerating the world.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Biomes")
+    FBiomeMapParams BiomeMapParams;
 
     //=========================================================================
     // DISTURBANCES (the "wow" layer — applies on top of ANY archetype)
