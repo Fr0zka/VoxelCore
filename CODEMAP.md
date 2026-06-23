@@ -90,7 +90,7 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 | `LocalToIndex` / `IndexToLocal` / `IsValidLocalCoord` | 107-131 | Flat-array 3D↔1D indexing. |
 | `SmoothStep01` | 140 | 3x²-2x³ — used everywhere for blends. |
 | `VOXEL_NOISE_SCALE` (1.25f) | 147 | Rescales UE PerlinNoise3D to ~[-1,1]. |
-| `FVoxelMeshData` struct | 157-173 | Mesher output (Vertices/Triangles/UVs/Normals). Plain C++, not USTRUCT. |
+| `FVoxelMeshData` struct | 157-173 | Mesher output (Vertices/Triangles/UVs/Normals/**Colors**). Plain C++, not USTRUCT. `Colors` = F6 material masks (R=dominant biome palette, G=slope, B=border blend weight, A=neighbour biome palette). §8.15. |
 
 ### 3.3 Chunk identity — `Public/VoxelChunk.h`
 `FVoxelChunk` (USTRUCT, line 19): just a `ChunkCoord` + `GetWorldPosition()`. In a
@@ -132,13 +132,16 @@ per-chunk info later.
 | `UpdateChunksAroundPosition` | 362 | Builds desired set, sorts by distance, loads/unloads, handles LOD changes. |
 | `LoadChunk` | 445 | Budget check → `UE::Tasks::Launch` background gen+mesh; RAII task guard. |
 | `UnloadChunk` | 493 | Destroys mesh component + map entries. |
-| `ApplyMeshToChunk` | 503 | Get/create RealtimeMeshComponent, upload geometry, assign material. |
+| `ApplyMeshToChunk` | — | Upload geometry. **LOD0 → own component (`ChunkMeshes`, collision); LOD1/2 → batched into one component per region (`ChunkRegions`), each chunk a SectionGroup, no collision.** Handles LOD promote/demote between the two. §8.10. |
+| `ChunkToRegion` / `ChunkSectionGroupName` / `RemoveChunkFromRegion` / `DestroyIndividualChunkComponent` | — | Plumbing for the batched far-chunk scheme. |
 | `GetStrateAtPosition` | 679 | Gameplay query → strate index. |
 | `CarveAtPosition` / `FillAtPosition` | 691 / 709 | Build `FVoxelModification` → DiffLayer → RemeshDirtyChunks. |
 | `ClearAllModifications` | 726 | Clears diff layer, regenerates. |
 | `ChangeSeed` | 740 | **Season reset**: new seed everywhere, clear diffs, bump season, reload. |
 | `GetCurrentSeed` / `GetCurrentSeason` | 784 / 789 | Accessors. |
 | `RemeshDirtyChunks` | 798 | Re-queue loaded chunks for async re-mesh (no visual pop). |
+
+> **Game-thread profiling (Perf):** `AVoxelWorld::Tick` and its sub-steps are wrapped in `TRACE_CPUPROFILER_EVENT_SCOPE` — `VoxelForge_Tick / UpdateChunks / BuildDesiredTiles / CullTiles / SubmitTiles / ProcessPending / ProcessUnload / UpdateDecorations / UpdateWater`. Capture a `Count/Incl/Excl` Insights timer export and read the `Excl` column to see which step owns the per-frame cost (the actor tick shows as `BP_VoxelWorld_C` if subclassed in BP). `VoxelForge_GenerateMesh` is worker-side (off the frame).
 
 ### 3.6 Density generator — `Public/VoxelGenerator.h` + `Private/VoxelGenerator.cpp`
 `UVoxelGenerator : UObject` — lightweight; holds `Seed`, and injected services
@@ -209,7 +212,7 @@ Maps depth→strate at runtime; owns passages.
 |--------|-----------|------|
 | `Initialize` | 10 | Builds the stacked layout from settings+seed (fixed slots + shuffled pool), then `GeneratePassages`. |
 | `GeneratePassages` | 146 | Deterministic passages between consecutive strates (per-type control points). |
-| `EvaluateModifierSDF` | 371 | SDF of all passages + elevator shaft at a point (for carving). |
+| `EvaluateModifierSDF` | 357 | SDF of passages at a point (for carving). Per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`. §8.10. |
 | `FindSlotIndexForChunkZ` | 427 | Z → layout index. |
 | `GetStrateAt` / `GetStrateIndex` | 443 / 455 | World-Z queries. |
 | `GetStrateForChunk` | 466 | Chunk → definition. |
@@ -233,7 +236,7 @@ box-validated per-chunk grid cache). See §8.14.
 **`Public/VoxelBiomeDefinition.h` + `.cpp`** (NEW) — `UVoxelBiomeDefinition : UPrimaryDataAsset`.
 One asset = one biome: identity + `DebugColor`, climate placement box (`ReliefMin/Max`,
 `MoistureMin/Max`), terrain override (`bOverrideTerrain` + `GeneratorType` + archetype params), content profile (`Decorations`/`AmbientActors`,
-atmosphere override, `WaterMaterial`, reserved `MaterialPaletteIndex`), `GameplayTags`. Referenced from
+atmosphere override, `WaterMaterial`, `MaterialPaletteIndex` (F6 — baked to vertex colour, §8.15)), `GameplayTags`. Referenced from
 `UVoxelStrateDefinition::Biomes[]`. Generator-agnostic (surface biomes now, cave biomes later). §8.14.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
@@ -266,7 +269,7 @@ Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs ed
 ### 3.11 Per-chunk content & per-strate atmosphere (2026 redesign — see §8)
 | File | Role |
 |------|------|
-| `Public/Private/VoxelContentManager.h/.cpp` | `UVoxelContentManager` — deterministic decoration scatter (LOD0) + aesthetic water planes, per chunk. Owned by `AVoxelWorld`. §8.5. |
+| `Public/Private/VoxelContentManager.h/.cpp` | `UVoxelContentManager` — distance-based world-grid decoration scatter (no LOD pop, surface-snapped via `GetDensityAt`) + level-0 water planes. Owned by `AVoxelWorld`. §8.5. |
 | `Public/Private/VoxelAtmosphereManager.h/.cpp` | `UVoxelAtmosphereManager` — per-strate fog/skylight + persistent ceiling/floor layer actors + full `AtmosphereActor` override. Owned by `AVoxelWorld`. §8.6. |
 
 > The big 2026 redesign (8 archetypes, (0,0) spine, inter-strate gap, per-strate passages,
@@ -378,7 +381,7 @@ by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispat
 | TunnelNetwork | `FStrateGenerationParams` | `GetDensityWithParams` | rooms+tunnels (original) |
 | FlatPlain / CrystalChamber | `FSlabGenerationParams` | `GetSlabDensity` | floor/ceiling void (original) |
 | Maze | `FMazeGenerationParams` | `GetMazeDensity` | tight corridors on a 3D lattice (per-voxel, no cache; edge = lower node + axis hash) |
-| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, opt-in plateau **terracing**, beaches at water line, high sky-cap ceiling. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) |
+| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, opt-in plateau **terracing**, beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap tiles don't cast shadows**: `ApplyMeshToTile` classifies a near tile as ceiling (centre above the terrain↔cap midpoint via the `GetSurfaceHeightAt` oracle) and drives the **RMC per-section** `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired). So the rock ceiling never shadows the terrain below it (cap and ground are one mesh but live in different clipmap tiles). The same `bIsCeiling` classification (now computed at every LOD, not just near tiles) also selects the strate's `CeilingMaterial` when set, so the shadowless overhead rock can be tinted/darkened separately from the ground instead of reading flat/bright. |
 | VerticalShafts | `FVerticalShaftParams` | `GetVerticalShaftDensity` | full-height shafts + horizontal connectors + partial ledges |
 | FloatingIslands | `FFloatingIslandParams` | `GetFloatingIslandDensity` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
 | Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
@@ -416,26 +419,88 @@ Provided per chunk by `StrateManager::GetDisturbanceParamsForChunk`.
 max edge reach, and decisions must not depend on the stored window.**
 
 ### 8.5 Content scatter & water — `VoxelContentManager.h/.cpp` (NEW)
-`UVoxelContentManager` (owned by `AVoxelWorld`, game-thread). Chunk lifecycle:
-`PopulateChunk(coord, mesh, LOD)` in `ApplyMeshToChunk`, `ClearChunk` in `UnloadChunk`,
-`ClearAll`/`SetSeed` in `ChangeSeed`, `SetActiveStrate(GetStrateAtPosition(player))` each Tick.
-Deterministic decoration scatter on mesh vertices (surface-type / water-relative /
-align-to-normal / random-yaw / scale / `MaxPerChunk`, from `FStrateDecoration`).
-**Two render paths per entry:** `ActorClass` (real actors — lights/logic/interaction,
-keep `MaxLODLevel=0`) vs `InstancedMesh` (batched per-chunk **HISM**, no tick/actor cost,
-no collision; safe at `MaxLODLevel` 1-2 so visual props don't pop out with LOD0 — emissive
-materials still glow at distance). Placement samples the LOD's vertices ⇒ instances
-re-scatter slightly on LOD swap (masked by terrain pop). **Strate light culling:**
-light components on decoration actors are visible only while the player is in the SAME
-strate (`SetActiveStrate`, no-op until strate change) — analytical occlusion: seals+gap are
-light-tight, and shadowless lights otherwise BLEED through rock (shadowed ones render black
-at full cost). Aesthetic water = one scaled engine plane (`/Engine/BasicShapes/Plane`) per
-water-surface chunk (any LOD), material `UVoxelStrateDefinition::WaterMaterial`. Water Z:
-`bHasWater` + `WaterLevelRelative` (Surface/tunnel params) → `StrateManager::GetWaterLevelWorldZForChunk`.
-**Per-biome content (§8.14):** when the chunk's dominant biome (`Generator::GetDominantBiomeAt`)
-supplies decorations they REPLACE the strate's; biome `WaterMaterial` overrides the plane's material
-(level stays strate-global). NOTE: `GetChunkStrateIndex` (light culling) feeds `GetStrateIndex` which
-expects Unreal **cm** — it now passes `chunkZ*CHUNK_SIZE*VOXEL_SIZE` (was voxel-Z, a latent strate-match bug).
+`UVoxelContentManager` (owned by `AVoxelWorld`, game-thread). TWO INDEPENDENT subsystems:
+
+**(A) DECORATIONS — distance-based WORLD GRID (the no-pop system, 2026-06-17).** Decorations are placed
+on a fixed world XY cell grid (**1 cell = 1 chunk footprint**, `DECO_CELL_VOXELS = CHUNK_SIZE`) and streamed
+by DISTANCE from the player, **fully decoupled from clipmap tiles / LOD**. **THE MARCH RUNS ASYNC ON WORKER
+THREADS** (mirrors mesh gen — `GetDensityAt` is thread-safe; the synchronous-on-game-thread first cut was a
+perf disaster + starved streaming → seams, so it was moved off-thread). Driven by `AVoxelWorld::Tick →
+UpdateDecorations(playerWorldPos)`, three phases: **(1)** recompute the desired cell set (`RebuildDesiredCells`)
+only when the player crosses a cell boundary OR changes strate — clears out-of-range loaded cells, queues
+cells that are NOT loaded and NOT in flight (`PendingLaunch`, nearest-first). **SINGLE radius, NO near/far tiers:**
+a loaded cell is NEVER re-streamed in place while it stays in range (only cleared when it leaves), so
+decorations don't FLICKER as the player moves / as terrain LOD shells shift (re-streaming on tier crossings was
+the flicker cause — tiers removed). **(2)** `LaunchDecoTasks`:
+resolve the cell's decoration list on the GAME thread (biome — see below) then fire an async `UE::Tasks` march
+(`BuildCellSpawns`, `BackgroundNormal`, capped at `MaxConcurrentDecorationTasks` in flight via `InFlightCells`).
+**(3)** `ProcessDecoResults`: drain finished tasks' results (`Mpsc` queue → `ReadyResults`), epoch-guarded
+(`DecoEpoch`, bumped on clear/strate-change so stale in-flight results are discarded) + range-checked, and
+**apply (spawn) budgeted** (`MaxDecorationCellsPerFrame` — the only game-thread cost, SpawnActor/AddInstance).
+`BuildCellSpawns` (worker) finds each column's surface point(s) and rolls the entries there (shared
+`PlaceAtCrossing`). Candidate columns are **snapped to INTEGER voxel XY** (integer jitter) so the generator's
+surface-column cache (T1.a, §8.10) applies — FRACTIONAL XY bypasses it and recomputes the noise-heavy
+heightfield+biome on every sample. **TWO column strategies by archetype:**
+**(a) SurfaceWorld → HEIGHT ORACLE (`Ctx.bSurfaceWorld`), NO marching.** `Generator::GetSurfaceHeightAt(x,y,
+chunkZ → TerrainZ, CeilSurf)` returns the heightfield surface + sky-cap ceiling in O(1) (it shares the density
+path's `ResolveSurfaceChunkParams`/`ComputeSurfaceColumn` via its own thread_local per-chunk cache, so it's
+bit-identical to the rendered ground). Per column: query centre + 4 neighbours (gradient → floor/ceiling
+normals), place a Floor crossing at `TerrainZ` and a Ceiling crossing at `CeilSurf` (if open space below). A
+single `GetDensityAt` at the surface verifies the column isn't CARVED (passage/spine/diff make it air → skip;
+the oracle is the raw heightfield and doesn't know carving). ~5 height evals + 1-2 density samples/column vs
+hundreds marched. **(b) other archetypes (caves/shafts/islands) → ray-march** the strate Z-band
+(`GetStrateUnrealZRange`, voxel coords) via `GetDensityAt` at a COARSE step (`DecorationMarchStepVoxels`), each
+air↔solid sign change **bisection-refined** (4 iters → accuracy independent of step). Either way **a prop sits at
+the SAME world position at every LOD → no pop**. (march) The top cap/seal + the open air are always marched first; the scan only stops after
+`DecorationColumnDepthVoxels` of CONTIGUOUS solid once it has ENTERED the open space (trims dead bedrock below
+the ground without ever stopping short of it — a "below the first crossing" cap was wrong: on a surface world
+the first crossing is the high CEILING, so it stopped mid-air before reaching the ground = no floor props).
+Outward normal = normalized density gradient (solid→air, matches the mesher), classified
+Floor/Wall/Ceiling by `normal.Z`. Each crossing rolls every `FStrateDecoration` independently: surface-type,
+density gate (`DecoHash(cell,column,crossing,entry,seed)`), water-relative, align/yaw/scale, per-cell
+`MaxPerChunk` + global actor cap → a `FDecoSpawn{EntryIdx, bInstanced, Xf}`. The game thread spawns from the
+result's `Entries` snapshot. `DecorationMaxCrossingsPerColumn` caps cave columns (surface worlds have 1).
+**Shutdown:** `NotifyShutdown()` (called from `AVoxelWorld::EndPlay`) flags + spin-waits on the in-flight
+task count before UObject teardown (tasks read the Generator); `BeginDestroy` is the backstop. **Determinism:**
+pure hash of (cell, column, crossing, entry, seed) + the density surface snap. **Decorations exist ONLY in
+the player's current strate** (march is strate-bounded) → a strate change wipes + rebuilds them, and there
+is **no cross-strate light bleed to cull** (the old `SetActiveStrate` light-culling pass is SUBSUMED — gone).
+**Render paths:** `ActorClass` → real actors (lights/logic, pricey game-thread spawn); `InstancedMesh` → HISM
+(no tick/actor/collision, emissive glows far), per-cell-per-entry. **Per-entry HISM tuning for dense groundcover**
+(`FStrateDecoration`, only the InstancedMesh path): `CullDistance` (cm; 0 = no cull — the lever that makes dense
+grass affordable: placed thickly, drawn only near → GPU cost bounded by area-within-cull, NOT the stream radius),
+`bCastShadow` (default true; turn OFF for grass — dense instanced shadows are the dominant foliage cost),
+`MaxSlopeAngle` (deg from flat = acos(|N.Z|); 90 = no filter, ~35 keeps grass off cliffs — applied in the worker's
+`PlaceAtCrossing`). `ApplyDecoResult` buckets spawns per entry and builds each HISM with ONE batched `AddInstances`
+(single cluster-tree build, set cull/shadow BEFORE `RegisterComponent`) — the game-thread hitch-killer for dense cells.
+Note: NO per-entry placement radius (it would fight the no-re-stream cell model — cells stream once at the outer ring
+and persist, so a smaller radius would never populate already-loaded far cells as the player approaches; CullDistance
+covers the render cost instead). **All entries stream within ONE radius**
+(`DecorationRadiusChunks`) — the old near/far tier split was removed (it caused flicker). `MaxLODLevel` and
+`DecorationActorRadiusChunks` are now LEGACY/unused. **No LOD area-density compensation** (placement is per real
+surface point, density-stable with distance). **SpawnDensity semantics CHANGED** vs the old vertex scatter: it
+rolls per column surface-point (not per mesh vertex) → expect a one-time density re-tune. **Settings
+(`Voxel|Content`):** `DecorationRadiusChunks` (6 — reach in cells), `DecorationSpacingVoxels` (4 → 8×8 cols/cell),
+`DecorationMarchStepVoxels` (2 — coarse, bisection-refined; cave march only), `DecorationMaxCrossingsPerColumn`
+(4 — cave march only), `DecorationColumnDepthVoxels` (160 — bedrock march cap; cave march only),
+`MaxDecorationCellsPerFrame` (2 — apply/spawn budget), `MaxConcurrentDecorationTasks` (4 — in-flight task cap;
+0 disables decorations). **COST:** surface worlds now use the O(1) oracle (cheap); caves ray-march. The work is
+OFF the frame (worker threads) — game thread only pays the budgeted spawn. If streaming slows, lower
+`MaxConcurrentDecorationTasks` / raise `DecorationMarchStepVoxels` / shrink radii/spacing. Default
+`DecorationRadiusChunks=6` ≈ props ~48 m out — raise for far flora (cost ~r²).
+
+**(B) WATER — tile-driven, level-0 only (continuous plane, never pops).** `PopulateTileWater(tile)` in
+`ApplyMeshToTile` (level-0 tiles), `ClearTileWater(tile)` in `UnloadTile`. One scaled engine plane
+(`/Engine/BasicShapes/Plane`) per water-surface chunk (per-chunk-Z plane logic assumes a single chunk's
+vertical span — hence level-0 only), keyed `TMap<FIntVector, UStaticMeshComponent*>` (reflected UPROPERTY).
+Water Z: `bHasWater` + `WaterLevelRelative` → `StrateManager::GetWaterLevelWorldZForChunk`. Biome
+`WaterMaterial` overrides `UVoxelStrateDefinition::WaterMaterial` (level stays strate-global).
+
+`ClearAll`/`SetSeed` on `ChangeSeed`/regenerate clears both subsystems (decorations re-stream on the next
+Tick via the INT_MIN sentinels). **Per-biome content (§8.14):** the cell-centre (decorations) / chunk-centre
+(water) dominant biome (`Generator::GetDominantBiomeAt`, game-thread, uncached — once per cell, NOT per
+column) supplies the decoration list (replaces the strate's) + water material. `Initialize` now also takes
+`UVoxelSettings*` (for the grid tunables). `ContentMaxLevel` is now legacy/dead for decorations.
 
 ### 8.6 Atmosphere — `VoxelAtmosphereManager.h/.cpp` (NEW)
 `UVoxelAtmosphereManager` (owned by `AVoxelWorld`, gated by `bManageAtmosphere`).
@@ -466,9 +531,11 @@ below: `Connections`, `Style` (`EVoxelPassageStyle`: Straight/Worm/Spiral/Cascad
 `Segments`, `VerticalWobble`, Spiral/Cascade params. Built in `StrateManager::GeneratePassages`
 as control-point chains. **Worm = independent fBM per horizontal axis** (`PassageFBM` static)
 with a flat-top envelope → organic squirm (NOT a 1D zigzag, NOT a same-freq 2-channel spiral).
-`EvaluateModifierSDF` (per voxel) **bounding-sphere-culls** each passage
-(`FVoxelPassage::BoundCenter/BoundRadiusSq`) — perf-critical. The (0,0) surface entry is a
-simple straight tube. Global passage settings were removed from `VoxelSettings`.
+`EvaluateModifierSDF` (per voxel) first builds a `thread_local` **per-chunk shortlist** of passages
+whose bounds reach this chunk (rebuilt on chunk change / `PassagesVersion` bump) — chunks with no
+passage near return `FLT_MAX` immediately — then **bounding-sphere-culls** each shortlisted passage
+(`FVoxelPassage::BoundCenter/BoundRadiusSq`). Both are perf-critical (§8.10). The (0,0) surface entry
+is a simple straight tube. Global passage settings were removed from `VoxelSettings`.
 
 ### 8.9 Carving — brush shapes + editor controls
 `FVoxelModification` has `EVoxelBrushShape {Sphere,Box,Capsule}` + `BoxExtent`/`CapsuleEnd`/
@@ -495,32 +562,102 @@ driven by `EditorBrush*` props.
   noise-heavy; a chunk-key would thrash it on gradient-normal / +X/+Y boundary samples. Keep
   the box halo (≥ CHUNK_SIZE) + cell margin (warp + CellSize) so the 3x3 lookup never misses.
 - **Passage cull** (§8.8) + **morphology two-region** (§8.4): both are per-voxel-cost critical.
+- **Per-chunk passage shortlist** (`EvaluateModifierSDF`): runs per voxel and is called from every
+  archetype's `ApplyPassageCarving`. Keeps a `thread_local` shortlist (passage INDICES) of passages
+  whose bounds reach the current chunk, rebuilt only on chunk change or `PassagesVersion` bump
+  (incremented in `GeneratePassages`). Most chunks have NO passage near → instant `FLT_MAX` return
+  instead of walking the whole `Passages` array per voxel. Conservative superset (chunk bounding
+  sphere vs passage bound) ⇒ bit-identical carve. Store indices + version, never pointers (the array
+  is rebuilt on `RebuildStrates`).
+- **Gen tasks run at `UE::Tasks::ETaskPriority::BackgroundNormal`** (`LoadTile`): worker gen yields
+  to foreground game/render tasks. Without it, raising `MaxConcurrentTasks` past the spare-core count
+  saturates the scheduler and starves the frame (the "concurrency > ~12 = stutter" symptom). Keep gen
+  at background priority so the frame keeps its cores.
 - **Mesher density grid + margin ring** (`GenerateMesh`): sample each grid point ONCE into a flat
   `(CHUNK_SIZE/Step + 1 + 2)³` array (the `+2` is a 1-point MARGIN ring, indices −1..GridDim, for
   T1.b normals). The cell loop reads 8 corners from it; per-cell sampling would call `GetDensityAt`
   ~8× too often. Geometry is bit-identical (edge positions unchanged). Don't refactor back to
   per-corner `GetDensity` and don't drop the margin ring (normals + seamless borders need it).
+  The cell loop is **two-pass**: pass 1 reads the 8 corner densities + builds the MC case index and
+  `continue`s on no-surface cells (≈70% of cells); pass 2 computes the 8 positions + grid-gradients
+  ONLY for surface cells. Don't hoist position/gradient back above the case-index test. The
+  `DensityGrid` and vertex-dedup `TMap` are `thread_local` and reused per worker (Reset / keep
+  capacity) — don't make them per-call locals (re-allocates ~170 KB + a hash map every tile).
 - **Normals from the density grid (T1.b)** (`GenerateMesh`): corner gradients = central differences
   on the (margin) grid; edge normals interpolate the two corner gradients by the SAME `t` as the
   position → seamless across chunk borders (both sides use identical pure samples). NO per-vertex
   `GetDensityAt` (was ~6/vertex, often as costly as the whole grid). `ComputeGradientNormal` is now
   unused. Only NORMALS changed vs the old path; geometry is identical.
-- **Surface column cache (T1.a)** (`FSurfaceColumnCache`, `GetDensityAt` SurfaceWorld branch):
-  the heightfield + sky-cap + biome blend are XY-only but sampled ~33× per column (once per Z
-  grid-point). Cached per integer XY (box-valid, like the SDF cache) and reused down the column.
-  Box `Halo = CHUNK_SIZE + 8` each side so the T1.b margin ring stays inside (no thrash). **Used
-  ONLY for integer-XY queries**; fractional queries compute directly → bit-identical. Don't key it
-  by chunk and don't feed it fractional coords.
+- **Surface column cache (T1.a)** (`FSurfaceColumnCache` = LRU of `FSurfaceColumnBox`, `GetDensityAt`
+  SurfaceWorld branch): the heightfield + sky-cap + biome blend are a PURE function of (XY, seed,
+  strate) — **ZERO Z dependence** (climate/Voronoi are pure-XY; surface params are per-strate constant
+  under Hard transitions) — yet sampled ~33× per column (once per Z grid-point). Cached per integer XY
+  (box-valid, like the SDF cache) and reused down the column. **Keyed by (XY box, StrateKey, Seed), NOT
+  ChunkZ** (`StrateKey = round(StrateBottomWorldZ)`, taken from the params so it can't disagree with
+  them) and held as a small **LRU of 6 boxes** so the WHOLE vertical view-distance stack — and XY
+  neighbours the scheduler interleaves — share one another's heavy column noise instead of each
+  recomputing it ~once per vertical chunk (this was the dominant `GenerateMesh` cost: the same 2D
+  heightfield recomputed per altitude). It also makes pure-air / pure-solid chunks cheap (they hit the
+  shared box). Box `Halo = CHUNK_SIZE + 8` each side so the T1.b margin ring stays inside (no thrash).
+  **Used ONLY for integer-XY queries**; fractional queries compute directly → bit-identical. Don't
+  re-introduce a ChunkZ key, don't feed it fractional coords. (`GetSurfaceHeightAt`'s own `OC_*` oracle
+  cache is separate and still per-chunk — lower volume, not worth the LRU.)
 - **Collision only at LOD0 (T1.c)** (`ApplyMeshToChunk`): `UpdateSectionConfig(..., LOD==0)`.
   LOD1/2 chunks are unreachable (the §8.10 reconciliation hot-swaps to LOD0 before the player
   arrives), so cooking their Chaos collision is waste. Don't force collision on for all LODs.
-- **No shadows on LOD2 (draw-call cut)** (`ApplyMeshToChunk`): `MeshComp->SetCastShadow(LOD <= 1)`.
-  Every shadow-casting chunk emits a SECOND draw in the shadow-depth pass; the farthest tier
-  (LOD2, blocky) doesn't need it. Re-applied every apply (LOD hot-swaps reuse the component).
-  Pulling `LOD0Distance`/`LOD1Distance` inward pushes more chunks into the shadowless LOD2 band
-  → fewer draws (free fps knob). Widen to `<= 0` (drop LOD1 shadows too) if still draw-bound.
-  NOTE: fps is a RENDER-side problem (draw calls ≈ visible chunk count × passes) — generation
-  cost (worker threads) and LOD *resolution* (cuts triangles, not draws) don't move it.
+- **CHUNKED-LOD CLIPMAP — the streaming model** (`FVoxelTileKey` in VoxelTypes.h; `UpdateChunksAroundPosition`
+  / `BuildDesiredTiles` / `IsTileInClipRange` / `LoadTile` / `UnloadTile` / `ApplyMeshToTile`; mesher
+  `GenerateMesh(OriginVoxels, Step)`). Replaces the fixed-32³-chunk + LOD-step-on-fixed-extent model
+  AND supersedes the old region-batching / strate-Z-clamp / wide-ceiling (all removed). A **level-L tile**
+  spans `CHUNK_SIZE<<L` voxels meshed at `step 1<<L` → constant 32³-cell mesh, ONE component, ONE draw,
+  covering 8^L× the volume. Streaming loads **concentric shells** (level 0 near, each coarser level a 2×
+  larger shell beyond; inner hole of level L = the region the finer level covers). **Total tile count
+  stays ~flat regardless of view distance** — that's why see-far (ceiling, horizon) is cheap AND why
+  per-tile components are fine for the game thread (no batching: ~1-2k tiles, not 40k). **Load-before-
+  unload cull** (no holes, STRICT): out-of-range tiles cull now; in-range LOD-transition tiles cull only
+  once EVERY desired tile overlapping their footprint is loaded — tested as "no UNLOADED desired tile
+  overlaps T" (`ReplacementsReady` + `FootprintsOverlap` vs the `DesiredPending` list, built once per
+  crossing = desired-minus-loaded, usually tiny). Scanning all of `DesiredSorted` per candidate was an
+  O(loaded×desired) game-thread spike when fast movement turned many tiles non-desired at once. A coarse
+  tile is replaced by several finer tiles, so the old center-owner
+  check (`ReplacementLoaded`) dropped it as soon as the ONE tile over its centre loaded → the not-yet-
+  ready edges flashed a hole; the full-coverage check keeps the old tile at its current resolution until
+  the better mesh is wholly in, then swaps. In-flight (pending) tiles are NEVER cancelled on a rebuild —
+  they finish, apply, and are culled later if no longer desired. Collision level-0 only; water level-0
+  only; shadows off for level≥2. **Decorations are NO LONGER tied to tiles** — they stream on a fixed world
+  grid by distance (§8.5), so they don't pop on LOD swaps. Settings: `VoxelSettings::ClipRadius` (full-res near radius, tiles/level),
+  `MaxClipLevel` (far reach). **NEAR-FIELD GEN COST levers** (`LoadTile`): levels `< FullResClipLevels`
+  mesh at full `CHUNK_SIZE` cells (≈35³ `GetDensityAt` incl. margin ring), coarser levels at
+  `CoarseTileCells` (Step = Extent/Cells) for far-cheaper gen. A level-1 tile at `FullResClipLevels=2`
+  costs the SAME gen as a level-0 tile (same cell count, 8× extent) — set `FullResClipLevels=1` to drop
+  level 1 to `CoarseTileCells` (~6× cheaper) when the near field is gen-bound (slightly harder L0→L1
+  seam, hidden by skirts). `ClipRadius` bounds the full-res level-0 tile COUNT independently of reach.
+  `GetLODForChunk` / `LODToStep` / `IsChunkInRange` / `GetStrateChunkZBounds` and the
+  ViewDistance/LOD/strate-Z/ceiling settings are now DEAD/unused (left in place).
+- **SKIRTS — LOD-seam crack filler** (`GenerateMesh`, after the cell loop; `VoxelSettings::bGenerateSkirts`
+  + `SkirtCells`, wired onto the mesher at setup). Neighbouring shells mesh at different resolutions so
+  their iso-surfaces don't meet along the shared face → a thin see-through crack. After meshing, every
+  triangle edge whose BOTH endpoints lie on one of the tile's 6 outer boundary planes (exact float compare
+  — MC keeps the face-axis coordinate fixed) is a surface-contour edge on that face; a skirt quad hangs
+  from it INTO the solid along the inverted vertex normals by `SkirtCells × Step × VOXEL_SIZE` (~one cell,
+  ≥ the gap to a one-level-coarser neighbour). Emitted DOUBLE-SIDED (both windings) so it shows regardless
+  of camera side / material two-sidedness; buried elsewhere → invisible. Adds verts/tris ONLY on boundary
+  contour edges (small). Tune `SkirtCells` up if cracks persist, down if skirts peek out on convex edges.
+- **Budgeted teardown** (`PendingUnload` + `ProcessUnloadQueue`, called from `Tick` after the apply
+  drain; `VoxelSettings::MaxUnloadsPerFrame`): the cull APPROVES removals (strict load-before-unload) but
+  doesn't destroy in place — it queues them. `ProcessUnloadQueue` runs at most `MaxUnloadsPerFrame`
+  `UnloadTile`s/frame (scaled up to 4× with backlog, capped so a huge backlog can't re-spike). WHY: a
+  fast traversal culls a whole shell's worth of tiles in ONE frame, and each `UnloadTile` does
+  `DestroyComponent` + (level 0) `ContentManager::ClearChunk` → `Destroy()` of every decoration actor —
+  an unbudgeted burst = a game-thread spike ("stuff torn down behind you" at speed). Mesh APPLIES were
+  already budgeted; this matches it for DESTROYS. Re-desired tiles are cancelled out of the queue (still
+  loaded → no reload). `PendingUnload` is cleared in `RegenerateAllChunks`/`EndPlay` (tiles already gone).
+- **Collision only at LEVEL 0** (`ApplyMeshToTile`): `UpdateSectionConfig(..., Tile.Level==0)`. Far tiles
+  are unreachable; cooking their Chaos collision is waste. (Was T1.c, now per-tile-level.)
+- **No shadows on far tiles (draw cut)** (`ApplyMeshToTile`): `SetCastShadow(Tile.Level <= 1)`. Each
+  shadow-casting tile emits a second shadow-pass draw; the far coarse tiles don't need it. NOTE: fps is
+  RENDER-side (draws ≈ visible tile count × passes); generation cost (workers) and tile *resolution*
+  (cuts triangles, not draws/components) don't move the game thread — tile COUNT does (hence the clipmap).
 - **Insights scopes** `VoxelForge_GenerateMesh` / `VoxelForge_ApplyMeshToChunk` (Perf 0) bracket
   the worker gen + game-thread apply — capture a trace to see if we're density- or upload-bound.
 - **Float SIMD noise core (T2.a)** (`Public/VoxelNoise.h`): the density hot path uses
@@ -616,3 +753,33 @@ change *anything*, e.g. frequencies, which scalar multipliers couldn't.)
   Full-param redesign (surface output-blend) code-complete, pending build. Cave structural biomes
   deferred (determinism, see above). Per-voxel biome warp (+2 Perlin) & content `GetDominantBiomeAt`
   are future T1.a column-cache candidates.
+
+### 8.15 Biome material identity — vertex-colour palette (F6, Stage 1)
+A biome re-skins the terrain SURFACE (not just content/atmosphere) through a single master material,
+with NO extra draw calls / material slots and NO per-tile material swap (which would seam at tile
+borders). The biome's `MaterialPaletteIndex` (0-255) is **baked into the mesh vertex colour** and a
+master triplanar material switches/blends its layers on it. Works for ANY archetype (it rides the
+generic biome field), not just SurfaceWorld. Empty `Biomes[]` ⇒ all-zero colour ⇒ bit-identical look.
+
+- **Vertex-colour layout** (`FVoxelMeshData::Colors`, packed in `UVoxelMarchingCubesMesher::GenerateMesh`
+  `GetOrCreateVertex`): **R** = dominant biome `MaterialPaletteIndex`; **G** = slope (`1-|N.z|`: 0 flat
+  floor/ceiling, 1 vertical wall — for rock-on-cliffs); **B** = biome border blend weight (0 deep in a
+  cell → ~0.5 at the border); **A** = NEIGHBOUR biome `MaterialPaletteIndex`. The master material does
+  `lerp(layer[R], layer[A], B)` for a seamless cross-fade along the biome field's own border (B peaks at
+  ~0.5 = 50/50 at the border; the identities swap across it, so 50/50 both sides ⇒ no discontinuity —
+  do NOT rescale B to reach 1.0 or the swap becomes a hard seam).
+  Height/snow-line is derived in-material from `WorldPosition.Z` (no channel needed). Skirt verts inherit
+  their source vertex's colour (`AddSkirtVert` takes the colour) so the `Colors` array stays parallel.
+- **Data path.** `UVoxelBiomeDefinition::MaterialPaletteIndex` → `FBiomeResolved::MaterialPaletteIndex`
+  (set in `StrateManager::GetBiomeContextForChunk`) → `UVoxelGenerator::GetBiomeMaterialAt(x,y,z →
+  dominant/neighbour palette + weight)`. That method mirrors `GetDensityAt`'s biome caching: a
+  thread_local per-chunk `FBiomeContext` + box-validated `FChunkBiomeCache`, so the noise-heavy classify
+  is reused across a tile's vertices. Resolved per UNIQUE vertex (after dedup), not per triangle corner.
+  Window-invariant (`ResolveBiomeSampleAt`, bit-identical to `SampleBiomeAt`).
+- **Apply.** `AVoxelWorld::ApplyMeshToTile` calls `Builder.EnableColors()` + `Vertex.SetColor(...)`.
+  The terrain material slot is still strate `OverrideMaterial` / `Settings->VoxelMaterial` — author THAT
+  as the master palette material. No biome terrain-material asset field (palette index is the contract).
+- **Perf.** Free where a strate has no biomes (`GetBiomeMaterialAt` early-outs to palette 0). Otherwise
+  one biome resolve per unique vertex, bounded by the per-chunk biome cache (don't feed it a chunk key —
+  keep the box validity, §8.10). Coarse far tiles have few vertices.
+- **Status:** C++ code-complete, pending in-editor build + the master material graph (editor-side work).

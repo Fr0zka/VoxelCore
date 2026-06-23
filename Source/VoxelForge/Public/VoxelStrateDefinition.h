@@ -60,7 +60,9 @@ public:
     // How many chunks tall this strate is.
     // Each strate can have a different height!
     // Big open caverns = 6-8 chunks, tight tunnels = 3, vertical shaft = 12+
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Dimensions", meta = (ClampMin = "1", ClampMax = "32"))
+    // Surface/sky worlds want a high sky-cap ceiling, so they go much taller.
+    // 1 chunk = 32 voxels x 25cm = 8 m, so 256 chunks ~= 2 km of vertical strate.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Dimensions", meta = (ClampMin = "1", ClampMax = "256"))
     int32 StrateHeightInChunks = 4;
 
     //=========================================================================
@@ -237,6 +239,14 @@ public:
     // Allows each strate to have its own rock/ground look
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Visuals")
     UMaterialInterface* OverrideMaterial = nullptr;
+
+    // Material for the SKY-CAP CEILING tiles of a surface-like strate (the rocky "night sky" overhead).
+    // Null = ceiling uses the same material as the ground (OverrideMaterial / default VoxelMaterial).
+    // The ceiling casts no shadow, so under it the ground material reads as flat/bright — give the
+    // ceiling its own darker/tinted material (or a tinted instance of the terrain material) to sell the
+    // "lit from within, dark rock overhead" look. Applies only to tiles classified as ceiling.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Visuals")
+    UMaterialInterface* CeilingMaterial = nullptr;
 
     // Fog color for this strate (used by a future fog system or post-process)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Visuals")

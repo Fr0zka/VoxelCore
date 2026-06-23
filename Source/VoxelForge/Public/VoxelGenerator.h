@@ -173,6 +173,30 @@ public:
      */
     const UVoxelBiomeDefinition* GetDominantBiomeAt(float WorldX, float WorldY, int32 ChunkZ) const;
 
+    /**
+     * Per-vertex material data for the master triplanar palette material (F6). Resolves the
+     * biome field at a world XY/Z and returns the dominant + neighbour MaterialPaletteIndex
+     * and the border blend weight (0 deep in a cell → 0.5 at the border). The mesher packs
+     * these into vertex colour so one material re-skins terrain per biome and cross-fades
+     * across biome borders. No biomes ⇒ Dominant=Neighbour=0, Weight=0 (default palette).
+     * Thread-safe: own per-chunk thread_local context + box cache (clustered tile queries
+     * stay warm). Window-invariant (ResolveBiomeSampleAt is bit-identical to SampleBiomeAt).
+     */
+    void GetBiomeMaterialAt(float WorldX, float WorldY, float WorldZ,
+                            int32& OutDominantPalette, int32& OutNeighborPalette,
+                            float& OutBlendWeight) const;
+
+    /**
+     * SurfaceWorld HEIGHT ORACLE: the terrain surface Z + sky-cap ceiling Z (voxel coords) at a world
+     * XY for the given strate slice (ChunkZ), WITHOUT ray-marching the density column. Returns false
+     * (outs untouched) when the chunk is NOT a SurfaceWorld heightfield — callers fall back to marching.
+     * Shares the density path's surface helpers, so a decoration snapped to OutTerrainZ sits exactly on
+     * the rendered ground. Does NOT include passage/spine/seal carving — verify with one GetDensityAt at
+     * the result if a column might be carved. Thread-safe (own per-chunk thread_local cache).
+     */
+    bool GetSurfaceHeightAt(float WorldX, float WorldY, int32 ChunkZ,
+                            float& OutTerrainZ, float& OutCeilSurf) const;
+
 private:
     /** Pick the biome (index into Ctx.Biomes) for a Voronoi site, by its climate. */
     int32 ClassifyBiomeAtSite(float SiteX, float SiteY, const FBiomeContext& Ctx, uint32 SiteHash) const;
@@ -183,6 +207,20 @@ private:
 
     /** The SurfaceWorld sky-cap ceiling surface Z at a world XY (also pure per-XY). */
     float ComputeSurfaceCeiling(float WorldX, float WorldY, const FSurfaceGenerationParams& Params) const;
+
+    /** Resolve a chunk's SurfaceWorld params (strate base + per-biome overrides, structural fields
+     *  forced from the strate). Shared by GetDensityAt's per-chunk cache and the GetSurfaceHeightAt
+     *  oracle so both produce the SAME surface. */
+    void ResolveSurfaceChunkParams(const FIntVector& ChunkCoord,
+                                   FSurfaceGenerationParams& OutSurface, FBiomeContext& OutBiomeCtx,
+                                   TArray<FSurfaceGenerationParams>& OutBiomeParams) const;
+
+    /** Biome-blended terrain Z + sky-cap ceiling Z for one column (the XY-only surface field). Shared
+     *  by the density column cache (T1.a) and the oracle. */
+    void ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
+                              const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
+                              const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
+                              float& OutTerrainZ, float& OutCeilSurf) const;
 
     /** Final SurfaceWorld density from a column's precomputed terrain Z + ceiling: the
      *  cheap per-voxel Z-combine + origin spine + boundary seal + passage carving. The

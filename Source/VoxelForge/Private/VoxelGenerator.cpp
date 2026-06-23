@@ -22,22 +22,66 @@
 // the column (terrain Z + ceiling Z) once per integer XY and reuse it down the column.
 // Used ONLY for integer-XY queries (the density grid); fractional queries (gradient
 // normals at interpolated vertices) fall through and compute directly → bit-identical.
-// Validity is a world-XY BOX (chunk footprint) + ChunkZ + Seed, same discipline as the
-// SDF/biome caches (§8.10) so the +X/+Y boundary plane doesn't thrash it.
+// The surface heightfield (TerrainZ + sky-cap CeilSurf) is a PURE function of (worldX, worldY,
+// seed, strate) — ZERO Z dependence: the climate/Voronoi fields are pure-XY (see ResolveBiomeSampleAt:
+// "result is the pure function of XY either way") and surface params are constant within a strate (Hard
+// transitions). So a column computed for one chunk is valid for EVERY chunk stacked above/below it in
+// the same strate. This cache is therefore keyed by (XY box, StrateKey, Seed) — NOT ChunkZ — and held as
+// a small LRU of boxes so the whole vertical view-distance stack (and XY neighbours interleaved by the
+// task scheduler) reuse one another's heavy column noise instead of each recomputing it ~once per
+// vertical chunk in view. Validity stays a world-XY BOX (chunk footprint + margin) so the ±1 gradient /
+// +X/+Y boundary samples don't thrash it (same discipline as the SDF/biome caches, §8.10).
 struct FSurfaceColumn { float TerrainZ = 0.0f; float CeilSurf = 0.0f; };
 
-struct FSurfaceColumnCache
+struct FSurfaceColumnBox
 {
-    // Box covers a chunk footprint + a margin on every side (≥ the LOD margin ring the
-    // mesher samples for grid-based normals, ±Step ≤ 4, plus slack). Symmetric around the
-    // first (rebuild-triggering) sample so the whole chunk's column queries stay in one box.
+    // Covers a chunk footprint + a margin on every side (≥ the LOD margin ring the mesher samples for
+    // grid-based normals). Symmetric around the first (allocating) sample so a whole chunk's column
+    // queries — including the ±Step margin ring — stay inside one box.
     static constexpr int32 Halo = CHUNK_SIZE + 8;
     static constexpr int32 Dim  = 2 * Halo + 1;
-    int32 BaseX = 0, BaseY = 0;                     // box origin (voxel coords)
-    int32 ChunkZ = MIN_int32, Seed = MIN_int32;
+    int32 BaseX = 0, BaseY = 0;                        // box origin (voxel coords)
+    int32 StrateKey = MIN_int32, Seed = MIN_int32;     // key: same strate ⇒ identical heightfield params
+    uint32 LastUse = 0;                                // LRU stamp
     bool  bValid = false;
     FSurfaceColumn Cols[Dim * Dim];
     bool  Computed[Dim * Dim];
+};
+
+struct FSurfaceColumnCache
+{
+    // A handful of boxes keeps the player's column + a few XY neighbours warm across interleaved tasks,
+    // so vertical reuse survives whatever order the worker pulls chunks in. ~59 KB/box.
+    static constexpr int32 NumBoxes = 6;
+    FSurfaceColumnBox Boxes[NumBoxes];
+    uint32 Clock = 0;
+
+    // Return the box covering (IX,IY) for this (StrateKey,Seed); allocate by evicting the LRU box on miss.
+    FSurfaceColumnBox& Acquire(int32 IX, int32 IY, int32 InStrateKey, int32 InSeed)
+    {
+        ++Clock;
+        for (FSurfaceColumnBox& B : Boxes)
+        {
+            if (B.bValid && B.StrateKey == InStrateKey && B.Seed == InSeed
+                && IX >= B.BaseX && IX < B.BaseX + FSurfaceColumnBox::Dim
+                && IY >= B.BaseY && IY < B.BaseY + FSurfaceColumnBox::Dim)
+            {
+                B.LastUse = Clock;
+                return B;
+            }
+        }
+        // Miss → reuse the least-recently-used box, recentred on this sample.
+        FSurfaceColumnBox* Victim = &Boxes[0];
+        for (FSurfaceColumnBox& B : Boxes) { if (B.LastUse < Victim->LastUse) Victim = &B; }
+        Victim->BaseX     = IX - FSurfaceColumnBox::Halo;
+        Victim->BaseY     = IY - FSurfaceColumnBox::Halo;
+        Victim->StrateKey = InStrateKey;
+        Victim->Seed      = InSeed;
+        Victim->bValid    = true;
+        Victim->LastUse   = Clock;
+        FMemory::Memzero(Victim->Computed, sizeof(Victim->Computed));
+        return *Victim;
+    }
 };
 
 //=============================================================================
@@ -403,7 +447,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FBiomeContext            CP_BiomeCtx;
         thread_local FChunkBiomeCache         CP_BiomeCache;
         thread_local TArray<FSurfaceGenerationParams> CP_SurfaceBiomeParams;
-        thread_local FSurfaceColumnCache      CP_SurfCol;   // T1.a per-column surface cache
+        thread_local FSurfaceColumnCache      CP_SurfCol;   // T1.a per-column surface cache (XY-keyed LRU)
+        // Discriminates the surface cache by strate: same strate ⇒ identical heightfield params ⇒ columns
+        // are shareable across the whole vertical chunk stack. Taken from the params themselves
+        // (StrateBottomWorldZ is unique per stacked strate) so the key can never disagree with CP_Surface.
+        thread_local int32                    CP_StrateKey = MIN_int32;
 
         if (ChunkCoord != CP_Chunk)
         {
@@ -417,37 +465,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             case ECaveGeneratorType::Maze:
                 CP_Maze    = StrateManager->GetMazeParamsForChunk(ChunkCoord);            break;
             case ECaveGeneratorType::SurfaceWorld:
-            {
-                CP_Surface  = StrateManager->GetSurfaceParamsForChunk(ChunkCoord);
-                CP_BiomeCtx = StrateManager->GetBiomeContextForChunk(ChunkCoord);
-
-                // Per-biome surface params: each biome's override (when it overrides
-                // SurfaceWorld) else the strate's, with STRUCTURAL fields forced from the
-                // strate (Z bounds, seal, base, water level) so seals/spine/water stay intact.
-                CP_SurfaceBiomeParams.Reset();
-                if (CP_BiomeCtx.IsValid())
-                {
-                    const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(ChunkCoord);
-                    CP_SurfaceBiomeParams.Reserve(CP_BiomeCtx.Biomes.Num());
-                    for (const FBiomeResolved& BR : CP_BiomeCtx.Biomes)
-                    {
-                        FSurfaceGenerationParams P = CP_Surface;   // strate base (+ structural)
-                        const UVoxelBiomeDefinition* B =
-                            (Def && Def->Biomes.IsValidIndex(BR.Index)) ? Def->Biomes[BR.Index] : nullptr;
-                        if (B && B->bOverrideTerrain && B->GeneratorType == ECaveGeneratorType::SurfaceWorld)
-                        {
-                            P = B->SurfaceParams;                  // biome shape
-                            P.StrateTopWorldZ      = CP_Surface.StrateTopWorldZ;
-                            P.StrateBottomWorldZ   = CP_Surface.StrateBottomWorldZ;
-                            P.BoundarySealThickness = CP_Surface.BoundarySealThickness;
-                            P.BaseDensity          = CP_Surface.BaseDensity;
-                            P.WaterLevelRelative   = CP_Surface.WaterLevelRelative;  // shared water plane
-                        }
-                        CP_SurfaceBiomeParams.Add(P);
-                    }
-                }
+                ResolveSurfaceChunkParams(ChunkCoord, CP_Surface, CP_BiomeCtx, CP_SurfaceBiomeParams);
+                CP_StrateKey = FMath::RoundToInt(CP_Surface.StrateBottomWorldZ);
                 break;
-            }
             case ECaveGeneratorType::VerticalShafts:
                 CP_Vert    = StrateManager->GetVerticalShaftParamsForChunk(ChunkCoord);   break;
             case ECaveGeneratorType::FloatingIslands:
@@ -467,63 +487,29 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             Result = GetMazeDensity(WorldX, WorldY, WorldZ, CP_Maze);                 break;
         case ECaveGeneratorType::SurfaceWorld:
         {
-            // The XY-only surface field (biome-blended terrain Z + sky-cap ceiling) for one
-            // column. Resolves the biome sample here so it's cached per column too.
-            auto ComputeColumn = [&](float X, float Y) -> FSurfaceColumn
-            {
-                const FSurfaceGenerationParams* PD = &CP_Surface;
-                const FSurfaceGenerationParams* PN = &CP_Surface;
-                float W = 0.0f;
-                if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
-                {
-                    const FBiomeSample Smp = ResolveBiomeSampleAt(X, Y, ChunkCoord.Z, CP_BiomeCtx, CP_BiomeCache);
-                    const int32 Di = CP_SurfaceBiomeParams.IsValidIndex(Smp.DominantIndex) ? Smp.DominantIndex : 0;
-                    PD = &CP_SurfaceBiomeParams[Di];
-                    if (Smp.NeighborWeight > 0.0f && CP_SurfaceBiomeParams.IsValidIndex(Smp.NeighborIndex))
-                    {
-                        PN = &CP_SurfaceBiomeParams[Smp.NeighborIndex];
-                        W = Smp.NeighborWeight;
-                    }
-                }
-                FSurfaceColumn Col;
-                Col.TerrainZ = ComputeSurfaceTerrainZ(X, Y, *PD);
-                if (W > 0.0f) Col.TerrainZ = FMath::Lerp(Col.TerrainZ, ComputeSurfaceTerrainZ(X, Y, *PN), W);
-                Col.CeilSurf = ComputeSurfaceCeiling(X, Y, *PD);
-                return Col;
-            };
-
             FSurfaceColumn Col;
-            // Integer XY (the density grid) → reuse the column down its whole Z extent.
+            // Integer XY (the density grid) → reuse the column down its whole Z extent (T1.a).
             // Fractional XY (gradient-normal samples) → compute directly (no cache key).
             if (WorldX == FMath::FloorToFloat(WorldX) && WorldY == FMath::FloorToFloat(WorldY))
             {
                 const int32 IX = (int32)WorldX, IY = (int32)WorldY;
-                const bool bInBox = CP_SurfCol.bValid
-                    && CP_SurfCol.ChunkZ == ChunkCoord.Z && CP_SurfCol.Seed == Seed
-                    && IX >= CP_SurfCol.BaseX && IX < CP_SurfCol.BaseX + FSurfaceColumnCache::Dim
-                    && IY >= CP_SurfCol.BaseY && IY < CP_SurfCol.BaseY + FSurfaceColumnCache::Dim;
-                if (!bInBox)
+                // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
+                // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
+                FSurfaceColumnBox& Box = CP_SurfCol.Acquire(IX, IY, CP_StrateKey, Seed);
+                const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
+                if (!Box.Computed[CI])
                 {
-                    // Centre the box on this (first / boundary-crossing) sample so the rest of
-                    // the chunk's column queries — including the ±Step margin ring — fall inside.
-                    CP_SurfCol.BaseX  = IX - FSurfaceColumnCache::Halo;
-                    CP_SurfCol.BaseY  = IY - FSurfaceColumnCache::Halo;
-                    CP_SurfCol.ChunkZ = ChunkCoord.Z;
-                    CP_SurfCol.Seed   = Seed;
-                    CP_SurfCol.bValid = true;
-                    FMemory::Memzero(CP_SurfCol.Computed, sizeof(CP_SurfCol.Computed));
+                    ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
+                        CP_SurfaceBiomeParams, CP_BiomeCache,
+                        Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf);
+                    Box.Computed[CI] = true;
                 }
-                const int32 CI = (IY - CP_SurfCol.BaseY) * FSurfaceColumnCache::Dim + (IX - CP_SurfCol.BaseX);
-                if (!CP_SurfCol.Computed[CI])
-                {
-                    CP_SurfCol.Cols[CI] = ComputeColumn(WorldX, WorldY);
-                    CP_SurfCol.Computed[CI] = true;
-                }
-                Col = CP_SurfCol.Cols[CI];
+                Col = Box.Cols[CI];
             }
             else
             {
-                Col = ComputeColumn(WorldX, WorldY);
+                ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
+                    CP_SurfaceBiomeParams, CP_BiomeCache, Col.TerrainZ, Col.CeilSurf);
             }
 
             Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, Col.TerrainZ, Col.CeilSurf, CP_Surface);
@@ -1997,15 +1983,52 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
 {
     const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
     const float SeedF = (float)Seed;
-    const float CeilZ = Params.StrateBottomWorldZ + H * Params.CeilingRelative;
-    float CeilNoise = 0.0f;
+    float CeilZ = Params.StrateBottomWorldZ + H * Params.CeilingRelative;
+
+    // Domain-warp the broad/ridge query coords so ceiling ridgelines and valleys wind
+    // organically (mirrors the ground heightfield's HeightWarp). Fine bumps below stay on the
+    // true XY so detail remains crisp and uncorrelated. 0 ⇒ no warp.
+    float QX = WorldX, QY = WorldY;
+    if (Params.CeilingWarpStrength > 0.0f)
+    {
+        const float WF = Params.CeilingWarpFrequency;
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.71f, WorldY * WF + 2.3f,  SeedF * 3.3f));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + SeedF * 0.19f, SeedF * 4.7f));
+        QX += wx * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
+        QY += wy * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
+    }
+
+    // Broad SIGNED swell: raises/lowers the whole cap → big inverted hills and valleys.
+    if (Params.CeilingUndulation > 0.0f)
+    {
+        const float Swell = FractalNoise3D(FVector(
+            QX * Params.CeilingUndulationFrequency + SeedF * 1.9f,
+            QY * Params.CeilingUndulationFrequency + 13.0f,
+            SeedF * 0.5f), 3);   // [-1,1]
+        CeilZ += Swell * VOXEL_NOISE_SCALE * Params.CeilingUndulation;
+    }
+
+    // Downward hang: everything here is >= 0 so features only protrude into the void (never
+    // punch up into the seal). Fine bumps + sharp ridged blades sum together.
+    float Hang = 0.0f;
     if (Params.CeilingRoughness > 0.0f)
     {
-        CeilNoise = FMath::Abs(FractalNoise3D(FVector(
-            WorldX * 0.04f + 5.0f, WorldY * 0.04f + 6.0f, SeedF * 2.1f), 3))
-            * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
+        Hang += FMath::Abs(FractalNoise3D(FVector(
+            WorldX * Params.CeilingRoughnessFrequency + 5.0f,
+            WorldY * Params.CeilingRoughnessFrequency + 6.0f,
+            SeedF * 2.1f), 3)) * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
     }
-    return CeilZ - CeilNoise;
+    if (Params.CeilingRidgeStrength > 0.0f)
+    {
+        float Ridge = RidgedNoise3D(FVector(
+            QX * Params.CeilingRidgeFrequency + 31.0f,
+            QY * Params.CeilingRidgeFrequency + 47.0f,
+            SeedF * 1.1f), 4);            // [-1,1]
+        Ridge = Ridge * 0.5f + 0.5f;      // [0,1] hanging ridgelines
+        Hang += Ridge * Params.CeilingRidgeStrength;
+    }
+
+    return CeilZ - Hang;
 }
 
 float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
@@ -2032,6 +2055,94 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
     }
 
     return -Density;
+}
+
+void UVoxelGenerator::ResolveSurfaceChunkParams(const FIntVector& ChunkCoord,
+    FSurfaceGenerationParams& OutSurface, FBiomeContext& OutBiomeCtx,
+    TArray<FSurfaceGenerationParams>& OutBiomeParams) const
+{
+    OutSurface  = StrateManager->GetSurfaceParamsForChunk(ChunkCoord);
+    OutBiomeCtx = StrateManager->GetBiomeContextForChunk(ChunkCoord);
+
+    // Per-biome surface params: each biome's override (when it overrides SurfaceWorld) else the
+    // strate's, with STRUCTURAL fields forced from the strate (Z bounds, seal, base, water level)
+    // so seals/spine/water stay intact.
+    OutBiomeParams.Reset();
+    if (OutBiomeCtx.IsValid())
+    {
+        const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(ChunkCoord);
+        OutBiomeParams.Reserve(OutBiomeCtx.Biomes.Num());
+        for (const FBiomeResolved& BR : OutBiomeCtx.Biomes)
+        {
+            FSurfaceGenerationParams P = OutSurface;   // strate base (+ structural)
+            const UVoxelBiomeDefinition* B =
+                (Def && Def->Biomes.IsValidIndex(BR.Index)) ? Def->Biomes[BR.Index] : nullptr;
+            if (B && B->bOverrideTerrain && B->GeneratorType == ECaveGeneratorType::SurfaceWorld)
+            {
+                P = B->SurfaceParams;                  // biome shape
+                P.StrateTopWorldZ       = OutSurface.StrateTopWorldZ;
+                P.StrateBottomWorldZ    = OutSurface.StrateBottomWorldZ;
+                P.BoundarySealThickness = OutSurface.BoundarySealThickness;
+                P.BaseDensity           = OutSurface.BaseDensity;
+                P.WaterLevelRelative    = OutSurface.WaterLevelRelative;  // shared water plane
+            }
+            OutBiomeParams.Add(P);
+        }
+    }
+}
+
+void UVoxelGenerator::ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
+    const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
+    const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
+    float& OutTerrainZ, float& OutCeilSurf) const
+{
+    const FSurfaceGenerationParams* PD = &BaseSurface;
+    const FSurfaceGenerationParams* PN = &BaseSurface;
+    float W = 0.0f;
+    if (BiomeCtx.IsValid() && BiomeParams.Num() > 0)
+    {
+        const FBiomeSample Smp = ResolveBiomeSampleAt(WorldX, WorldY, ChunkZ, BiomeCtx, BiomeCache);
+        const int32 Di = BiomeParams.IsValidIndex(Smp.DominantIndex) ? Smp.DominantIndex : 0;
+        PD = &BiomeParams[Di];
+        if (Smp.NeighborWeight > 0.0f && BiomeParams.IsValidIndex(Smp.NeighborIndex))
+        {
+            PN = &BiomeParams[Smp.NeighborIndex];
+            W = Smp.NeighborWeight;
+        }
+    }
+    OutTerrainZ = ComputeSurfaceTerrainZ(WorldX, WorldY, *PD);
+    if (W > 0.0f) OutTerrainZ = FMath::Lerp(OutTerrainZ, ComputeSurfaceTerrainZ(WorldX, WorldY, *PN), W);
+    OutCeilSurf = ComputeSurfaceCeiling(WorldX, WorldY, *PD);
+}
+
+bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 ChunkZ,
+                                         float& OutTerrainZ, float& OutCeilSurf) const
+{
+    if (!StrateManager) return false;
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        ChunkZ);
+    if (StrateManager->GetGeneratorTypeForChunk(ChunkCoord) != ECaveGeneratorType::SurfaceWorld)
+    {
+        return false;
+    }
+
+    // Own per-chunk cache (independent of GetDensityAt's CP_*) so interleaved gen/deco tasks on the
+    // same worker don't thrash each other. All columns of one deco cell share one chunk ⇒ resolve once.
+    thread_local FIntVector OC_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
+    thread_local FSurfaceGenerationParams        OC_Surface;
+    thread_local FBiomeContext                   OC_BiomeCtx;
+    thread_local TArray<FSurfaceGenerationParams> OC_BiomeParams;
+    thread_local FChunkBiomeCache                OC_BiomeCache;
+    if (ChunkCoord != OC_Chunk)
+    {
+        OC_Chunk = ChunkCoord;
+        ResolveSurfaceChunkParams(ChunkCoord, OC_Surface, OC_BiomeCtx, OC_BiomeParams);
+    }
+    ComputeSurfaceColumn(WorldX, WorldY, ChunkZ, OC_Surface, OC_BiomeCtx, OC_BiomeParams, OC_BiomeCache,
+                         OutTerrainZ, OutCeilSurf);
+    return true;
 }
 
 float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
@@ -2320,6 +2431,43 @@ const UVoxelBiomeDefinition* UVoxelGenerator::GetDominantBiomeAt(float WorldX, f
     const int32 StrateBiomeIdx = Ctx.Biomes[S.DominantIndex].Index;
     const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(Coord);
     return (Def && Def->Biomes.IsValidIndex(StrateBiomeIdx)) ? Def->Biomes[StrateBiomeIdx] : nullptr;
+}
+
+void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float WorldZ,
+    int32& OutDominantPalette, int32& OutNeighborPalette, float& OutBlendWeight) const
+{
+    OutDominantPalette = 0;
+    OutNeighborPalette = 0;
+    OutBlendWeight     = 0.0f;
+    if (!StrateManager) return;
+
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / CHUNK_SIZE));
+
+    // Per-chunk biome context cache, mirroring GetDensityAt: mesher vertices cluster by chunk,
+    // so the (cheap) flatten + (noise-heavy, box-validated) grid stay warm across a tile.
+    thread_local FIntVector       BM_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
+    thread_local FBiomeContext    BM_Ctx;
+    thread_local FChunkBiomeCache BM_Cache;
+    if (ChunkCoord != BM_Chunk)
+    {
+        BM_Chunk = ChunkCoord;
+        BM_Ctx   = StrateManager->GetBiomeContextForChunk(ChunkCoord);
+    }
+    if (!BM_Ctx.IsValid()) return;   // strate has no biomes → default palette
+
+    const FBiomeSample S = ResolveBiomeSampleAt(WorldX, WorldY, ChunkCoord.Z, BM_Ctx, BM_Cache);
+    if (BM_Ctx.Biomes.IsValidIndex(S.DominantIndex))
+    {
+        OutDominantPalette = BM_Ctx.Biomes[S.DominantIndex].MaterialPaletteIndex;
+        // Neighbour defaults to the dominant so an interior vertex blends to itself (no seam).
+        OutNeighborPalette = BM_Ctx.Biomes.IsValidIndex(S.NeighborIndex)
+            ? BM_Ctx.Biomes[S.NeighborIndex].MaterialPaletteIndex
+            : OutDominantPalette;
+        OutBlendWeight = S.NeighborWeight;   // 0 inside a cell → ~0.5 at the border
+    }
 }
 
 //=============================================================================

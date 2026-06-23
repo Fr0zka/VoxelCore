@@ -1358,6 +1358,46 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
     float CeilingRoughness = 6.0f;
 
+    // Frequency of the fine downward bumpiness above. Higher = smaller, denser bumps.
+    // (Was hard-coded to 0.04 — exposed so the cap detail scale is tunable.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingRoughnessFrequency = 0.04f;
+
+    // Broad ceiling undulation (voxels): a low-frequency SIGNED swell that raises and lowers
+    // the WHOLE sky-cap, giving big inverted "hills and valleys" overhead — the ceiling reads
+    // like terrain instead of a flat lid. Independent of the fine bumps. 0 = level cap height.
+    //   0    → flat cap (old look)
+    //   30   → gentle rolling ceiling
+    //   80+  → dramatic overhead valleys and rises
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingUndulation = 0.0f;
+
+    // Frequency of the broad undulation. Lower = larger, sweeping ceiling valleys.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingUndulationFrequency = 0.004f;
+
+    // Ridged hanging formations (voxels): sharp downward ridges/blades carved into the cap —
+    // the "valley-like ridges" / inverted-mountain-range look. Adds to the downward hang.
+    //   0    → none
+    //   20   → clear ridgelines across the ceiling
+    //   50+  → dramatic hanging ranges
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingRidgeStrength = 0.0f;
+
+    // Frequency of the ridged ceiling formations. Lower = broader ridges.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingRidgeFrequency = 0.02f;
+
+    // Domain-warp the ceiling ridge/undulation query by this many voxels so ridgelines wind
+    // organically instead of looking like axis-aligned noise. 0 = no warp (fine bumps are
+    // unaffected, like the ground heightfield's detail layer).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingWarpStrength = 0.0f;
+
+    // Frequency of the ceiling warp noise. Lower = broader bends.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
+    float CeilingWarpFrequency = 0.01f;
+
     // Solid shell thickness at strate top/bottom (voxels).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Boundary", meta = (ClampMin = "0.0"))
     float BoundarySealThickness = 4.0f;
@@ -1673,16 +1713,22 @@ struct VOXELFORGE_API FStrateDecoration
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     UStaticMesh* InstancedMesh = nullptr;
 
-    // Spawn while the chunk's LOD <= this (0 = LOD0 only, the old behaviour).
-    // Lets instanced visual props persist on LOD1-2 chunks instead of popping out with
-    // LOD0. NOTE: placement samples the LOD's mesh vertices, so instances re-scatter
-    // slightly on LOD transitions (masked by the terrain's own LOD pop).
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0", ClampMax = "2"))
+    // LEGACY / UNUSED by the world-grid decoration system (§8.5). It once meant a clipmap tile level,
+    // then a near/far distance tier — both removed. All decorations now stream within a single radius
+    // (VoxelSettings::DecorationRadiusChunks) and never re-stream in place. Kept to avoid breaking assets.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0", ClampMax = "8"))
     int32 MaxLODLevel = 0;
 
     // Which surface type this decoration can be placed on
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     ESurfaceType SurfacePlacement = ESurfaceType::Any;
+
+    // Maximum surface tilt (degrees from flat) this decoration tolerates. The surface tilt is
+    // acos(|normal.Z|): 0 = perfectly flat floor/ceiling, 90 = vertical wall. Grass on gentle
+    // ground → ~30-40; rock/lichen that clings to slopes → 90 (no filter, the default).
+    //   90 → place anywhere (default, no filter) · 35 → grass that avoids cliffs · 15 → flats only
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MaxSlopeAngle = 90.0f;
 
     // Chance per valid surface point to spawn this decoration (0-1)
     // 0.01 = rare, 0.1 = common, 0.5 = very dense
@@ -1725,6 +1771,24 @@ struct VOXELFORGE_API FStrateDecoration
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
         meta = (EditCondition = "bRequireWaterRelative"))
     bool bPlaceBelowWater = false;
+
+    // ----- Performance (HISM render tuning — only affects the InstancedMesh path) -----
+
+    // Distance (world units / cm) past which instances stop rendering. This is THE lever that makes
+    // DENSE groundcover affordable: grass can be placed thickly but only drawn near the player, so the
+    // GPU cost is bounded by area-within-cull, not by the whole streaming radius. 0 = never cull (the
+    // default — correct for trees / large props you want visible to the horizon).
+    //   0     → no cull (props, trees)
+    //   2000  → ~20 m, typical grass / small ground clutter
+    //   4000  → ~40 m, taller plants you want visible a bit further
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Performance", meta = (ClampMin = "0.0"))
+    float CullDistance = 0.0f;
+
+    // Whether these instances cast dynamic shadows. Dense instanced shadows are the single biggest cost
+    // of heavy foliage — turn this OFF for grass / small clutter (an unlit-from-below tuft loses almost
+    // nothing visually). Leave ON for trees and anything large enough that its shadow reads as grounding.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Performance")
+    bool bCastShadow = true;
 };
 
 /**

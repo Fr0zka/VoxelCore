@@ -153,6 +153,48 @@ inline float SmoothStep01(float x)
 constexpr float VOXEL_NOISE_SCALE = 1.25f;
 
 //=============================================================================
+// CLIPMAP TILE KEY
+//=============================================================================
+//
+// A "tile" generalises a chunk for the chunked-LOD clipmap. A level-L tile spans
+// (CHUNK_SIZE << Level) voxels per axis and is meshed at step (1 << Level), so it always
+// produces a constant CHUNK_SIZE³-cell mesh (one component, one draw) but covers 8^Level ×
+// the volume. Level 0 = a full-resolution chunk; each level up doubles linear size.
+// Streaming loads concentric shells: level 0 near the player, coarser levels farther out,
+// so chunk/draw count stays ~flat regardless of view distance.
+
+struct FVoxelTileKey
+{
+    FIntVector Coord = FIntVector::ZeroValue;   // in units of (CHUNK_SIZE << Level) voxels
+    int32      Level = 0;                        // 0 = full res
+
+    FVoxelTileKey() = default;
+    FVoxelTileKey(const FIntVector& InCoord, int32 InLevel) : Coord(InCoord), Level(InLevel) {}
+
+    // Cell size (sampling step) in voxels, and tile extent in voxels per axis.
+    int32 StepVoxels()   const { return 1 << Level; }
+    int32 ExtentVoxels() const { return CHUNK_SIZE << Level; }
+
+    // Min-corner of the tile in VOXEL coords (what the mesher takes).
+    FIntVector OriginVoxels() const { return Coord * (CHUNK_SIZE << Level); }
+
+    // Tile centre in world cm (for distance sorting / LOD selection).
+    FVector CenterCm() const
+    {
+        const double Ext = (double)(CHUNK_SIZE << Level) * (double)VOXEL_SIZE;
+        return FVector((Coord.X + 0.5) * Ext, (Coord.Y + 0.5) * Ext, (Coord.Z + 0.5) * Ext);
+    }
+
+    bool operator==(const FVoxelTileKey& O) const { return Level == O.Level && Coord == O.Coord; }
+    bool operator!=(const FVoxelTileKey& O) const { return !(*this == O); }
+};
+
+FORCEINLINE uint32 GetTypeHash(const FVoxelTileKey& K)
+{
+    return HashCombine(GetTypeHash(K.Coord), ::GetTypeHash(K.Level));
+}
+
+//=============================================================================
 // MESH DATA
 //=============================================================================
 //
@@ -166,6 +208,8 @@ struct FVoxelMeshData
     TArray<int32>     Triangles;  // Indices, 3 par triangle
     TArray<FVector2D> UVs;        // Coords de texture (une par vertex)
     TArray<FVector>   Normals;    // Normale lissée (gradient de densité)
+    TArray<FColor>    Colors;     // Masques matériau F6 (R=palette biome dominant, G=pente,
+                                  // B=poids de fondu de bordure, A=palette biome voisin)
 
     void Clear()
     {
@@ -173,6 +217,7 @@ struct FVoxelMeshData
         Triangles.Empty();
         UVs.Empty();
         Normals.Empty();
+        Colors.Empty();
     }
 
     bool IsEmpty() const { return Vertices.Num() == 0; }

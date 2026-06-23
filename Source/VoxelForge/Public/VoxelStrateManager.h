@@ -171,6 +171,14 @@ public:
     UVoxelStrateDefinition* GetStrateForChunk(const FIntVector& ChunkCoord) const;
 
     /**
+     * Strate-aware vertical streaming: fills the chunk-Z span of the strate containing
+     * ChunkZ. Returns false if ChunkZ is in the inter-strate bedrock gap (or outside the
+     * layout) — the caller then leaves the vertical view unclamped (the gap is a brief
+     * see-both-sides descent transition). TopChunkZ > BottomChunkZ (Z decreases downward).
+     */
+    bool GetStrateChunkZBounds(int32 ChunkZ, int32& OutTopChunkZ, int32& OutBottomChunkZ) const;
+
+    /**
      * Get generation params for a chunk, with boundary blending.
      *
      * BLENDING CONCEPT:
@@ -292,6 +300,11 @@ protected:
 
     // Passages connecting consecutive strates
     TArray<FVoxelPassage> Passages;
+
+    // Bumped every time Passages is rebuilt (GeneratePassages). EvaluateModifierSDF keeps a
+    // thread_local per-chunk shortlist of nearby passages and uses this to invalidate it when
+    // the passage set changes — so stale indices are never read after a rebuild.
+    uint32 PassagesVersion = 0;
 
     // How many chunks at strate boundaries are blended (transition zone)
     int32 BlendChunks = 2;

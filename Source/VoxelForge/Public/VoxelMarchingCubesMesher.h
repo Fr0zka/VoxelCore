@@ -24,13 +24,15 @@ class VOXELFORGE_API UVoxelMarchingCubesMesher : public UObject
 
 public:
     /**
-     * Génère le mesh d'un chunk.
+     * Génère le mesh d'une TUILE de clipmap (voir FVoxelTileKey).
      *
-     * @param Chunk - Le chunk à mesher (on n'utilise que ChunkCoord pour
-     *                calculer les positions monde; la densité vient du générateur).
-     * @param Step  - Pas d'échantillonnage (1=LOD0, 2=LOD1, 4=LOD2).
+     * @param OriginVoxels - Coin min de la tuile en coords VOXEL (= Tile.OriginVoxels()).
+     * @param Step         - Taille de cellule en voxels. La tuile couvre CellsPerAxis*Step voxels.
+     * @param CellsPerAxis - Nombre de cellules par axe. Les tuiles GROSSIÈRES en utilisent MOINS
+     *                       (gen moins chère, maillage plus grossier au loin) tout en couvrant la
+     *                       même étendue (extent = CellsPerAxis*Step). Niveau 0 = CHUNK_SIZE.
      */
-    FVoxelMeshData GenerateMesh(const FVoxelChunk& Chunk, int32 Step = 1);
+    FVoxelMeshData GenerateMesh(FIntVector OriginVoxels, int32 Step = 1, int32 CellsPerAxis = CHUNK_SIZE);
 
     //=========================================================================
     // SERVICES (injectés par AVoxelWorld)
@@ -53,6 +55,15 @@ public:
     // Distance d'échantillonnage (en voxels) pour calculer la normale par
     // différence centrée du gradient. Plus petit = plus détaillé mais bruité.
     float GradientOffset = 1.0f;
+
+    // SKIRTS — bouchent les fissures aux frontières de tuiles entre niveaux de clipmap voisins
+    // (résolutions différentes → les iso-surfaces ne se rejoignent pas exactement). Une jupe
+    // (mur court) est extrudée vers le solide depuis chaque arête de surface posée sur une des 6
+    // faces externes de la tuile. Voir GenerateMesh.
+    bool  bGenerateSkirts = true;
+    // Profondeur de la jupe, en CELLULES de la tuile (× Step × VOXEL_SIZE). ~2 cellules couvrent
+    // l'écart vers un voisin un niveau plus grossier (cellule 2×). Monter si des fissures persistent.
+    float SkirtCells = 2.0f;
 
 protected:
     //=========================================================================

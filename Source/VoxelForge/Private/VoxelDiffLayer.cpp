@@ -95,21 +95,28 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
     const int32 MinCZ = FMath::FloorToInt(BoundsMin.Z / CHUNK_SIZE);
     const int32 MaxCZ = FMath::FloorToInt(BoundsMax.Z / CHUNK_SIZE);
 
-    for (int32 CZ = MinCZ; CZ <= MaxCZ; CZ++)
     {
-        for (int32 CY = MinCY; CY <= MaxCY; CY++)
+        // Write lock: blocks worker-thread readers (HasModifications / GetDensityOffset) while the map
+        // is mutated/rehashed. AffectedChunks is local; populate it in the same pass.
+        FWriteScopeLock Lock(ModsLock);
+        for (int32 CZ = MinCZ; CZ <= MaxCZ; CZ++)
         {
-            for (int32 CX = MinCX; CX <= MaxCX; CX++)
+            for (int32 CY = MinCY; CY <= MaxCY; CY++)
             {
-                FIntVector ChunkCoord(CX, CY, CZ);
+                for (int32 CX = MinCX; CX <= MaxCX; CX++)
+                {
+                    FIntVector ChunkCoord(CX, CY, CZ);
 
-                // Store the modification in this chunk's list
-                ChunkMods.FindOrAdd(ChunkCoord).Add(ClampedMod);
+                    // Store the modification in this chunk's list
+                    ChunkMods.FindOrAdd(ChunkCoord).Add(ClampedMod);
 
-                // Track which chunks need re-meshing
-                AffectedChunks.Add(ChunkCoord);
+                    // Track which chunks need re-meshing
+                    AffectedChunks.Add(ChunkCoord);
+                }
             }
         }
+        // Publish: subsequent readers must now take the lock instead of fast-rejecting.
+        bHasAnyMods.store(true, std::memory_order_release);
     }
 
     UE_LOG(LogTemp, Log,
@@ -131,6 +138,13 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
 float UVoxelDiffLayer::GetDensityOffset(const FIntVector& ChunkCoord,
                                          float WorldX, float WorldY, float WorldZ) const
 {
+    // Lock-free fast reject: no carves anywhere -> nothing to offset.
+    if (!bHasAnyMods.load(std::memory_order_acquire)) return 0.0f;
+
+    // Hold the read lock for the whole body: Mods points INTO the map and is dereferenced through the
+    // falloff loop below, so the map must not be rehashed by a concurrent writer meanwhile.
+    FReadScopeLock Lock(ModsLock);
+
     // Fast path: if this chunk has no modifications, return 0
     const TArray<FVoxelModification>* Mods = ChunkMods.Find(ChunkCoord);
     if (!Mods || Mods->Num() == 0) return 0.0f;
@@ -194,6 +208,10 @@ float UVoxelDiffLayer::GetDensityOffset(const FIntVector& ChunkCoord,
 
 bool UVoxelDiffLayer::HasModifications(const FIntVector& ChunkCoord) const
 {
+    // Lock-free fast reject: no carves anywhere -> the map is empty, skip lock + lookup entirely.
+    if (!bHasAnyMods.load(std::memory_order_acquire)) return false;
+
+    FReadScopeLock Lock(ModsLock);   // worker threads read concurrently; serialised vs. writers
     const TArray<FVoxelModification>* Mods = ChunkMods.Find(ChunkCoord);
     return Mods && Mods->Num() > 0;
 }
@@ -205,7 +223,13 @@ bool UVoxelDiffLayer::HasModifications(const FIntVector& ChunkCoord) const
 void UVoxelDiffLayer::Clear()
 {
     int32 Count = GetTotalModificationCount();
-    ChunkMods.Empty();
+    {
+        // Write lock: workers may be mid-read. Flip the fast-path flag false BEFORE emptying so any
+        // reader that loads it afterwards skips the map without locking.
+        FWriteScopeLock Lock(ModsLock);
+        bHasAnyMods.store(false, std::memory_order_release);
+        ChunkMods.Empty();
+    }
 
     // Reset budget counters — player gets a fresh budget after clear/season reset
     ModificationCount = 0;
@@ -216,6 +240,7 @@ void UVoxelDiffLayer::Clear()
 
 int32 UVoxelDiffLayer::GetTotalModificationCount() const
 {
+    FReadScopeLock Lock(ModsLock);
     int32 Total = 0;
     for (const auto& Pair : ChunkMods)
     {
@@ -226,5 +251,6 @@ int32 UVoxelDiffLayer::GetTotalModificationCount() const
 
 int32 UVoxelDiffLayer::GetModifiedChunkCount() const
 {
+    FReadScopeLock Lock(ModsLock);
     return ChunkMods.Num();
 }

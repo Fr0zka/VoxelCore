@@ -72,14 +72,17 @@ FVector UVoxelMarchingCubesMesher::ComputeGradientNormal(float WorldX, float Wor
 // MAIN ALGORITHM
 //=============================================================================
 
-FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk, int32 Step)
+FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, int32 Step, int32 InCellsPerAxis)
 {
     FVoxelMeshData MeshData;
+    if (!Generator) return MeshData;
 
-    // Step valide = puissance de 2 dans [1, 4]
-    Step = FMath::Clamp(Step, 1, 4);
+    // Cell size in voxels. No upper clamp: coarse clipmap levels use bigger steps (the EXTENT
+    // grows). Coarse tiles also use FEWER cells (InCellsPerAxis) for cheaper gen.
+    Step = FMath::Max(1, Step);
 
-    const FVector ChunkWorldPos = Chunk.GetWorldPosition();
+    // World-cm origin of the tile's min corner (positions are built relative to this).
+    const FVector ChunkWorldPos = FVector(OriginVoxels) * VOXEL_SIZE;
 
     //=========================================================================
     // VERTEX DEDUPLICATION MAP
@@ -87,7 +90,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
     // Clé = position quantifiée au 0.01 unité (FIntVector).
     // Valeur = index dans MeshData.Vertices.
     // Les vertices partagés permettent des normales lisses et réduisent le count ~3x.
-    TMap<FIntVector, int32> VertexMap;
+    // Réutilisé d'une tuile à l'autre (thread_local) : Reset garde les buckets alloués →
+    // plus de (ré)allocation de hash-map par tuile (chaque worker a son propre exemplaire).
+    static thread_local TMap<FIntVector, int32> VertexMap;
+    VertexMap.Reset();
 
     // Normale fournie par l'appelant (gradient lu dans la grille de densité, T1.b) —
     // plus d'échantillonnage de densité par vertex. RawNormal pointe solide→air ; on la
@@ -119,6 +125,24 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
 
         // UVs planaires — le triplanar mapping se fait dans le matériau.
         MeshData.UVs.Add(FVector2D(WorldPos.X / VOXEL_SIZE, WorldPos.Y / VOXEL_SIZE));
+
+        //---------------------------------------------------------------------
+        // VERTEX COLOUR — masques pour le matériau triplanar maître (F6).
+        //   R = index de palette du biome DOMINANT (0-255) — re-skin par biome.
+        //   G = pente (0 = sol/plafond plat, 1 = paroi verticale) — roche sur falaises.
+        //   B = poids de fondu de bordure (0 au cœur d'un biome → ~0.5 à la frontière).
+        //   A = index de palette du biome VOISIN — le matériau lerp(R,A) par B → bords sans couture.
+        // La hauteur/snow-line se déduit de WorldPosition.Z dans le matériau (pas besoin de canal).
+        // Coût: une résolution biome par vertex UNIQUE (déduplication) ; nul si la strate n'a pas
+        // de biomes (GetBiomeMaterialAt sort en O(1) → palette 0 partout).
+        int32 PalD = 0, PalN = 0; float BlendW = 0.0f;
+        Generator->GetBiomeMaterialAt(WorldPos.X / VOXEL_SIZE, WorldPos.Y / VOXEL_SIZE,
+                                      WorldPos.Z / VOXEL_SIZE, PalD, PalN, BlendW);
+        const uint8 R = (uint8)FMath::Clamp(PalD, 0, 255);
+        const uint8 A = (uint8)FMath::Clamp(PalN, 0, 255);
+        const uint8 G = (uint8)FMath::Clamp(FMath::RoundToInt((1.0f - FMath::Abs((float)Normal.Z)) * 255.0f), 0, 255);
+        const uint8 Bc = (uint8)FMath::Clamp(FMath::RoundToInt(BlendW * 255.0f), 0, 255);
+        MeshData.Colors.Add(FColor(R, G, Bc, A));
 
         return NewIndex;
     };
@@ -164,11 +188,13 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
     // échantillons monde purs qu'un chunk voisin, donc les normales restent continues aux bords
     // de chunk (pas de couture de shading). La géométrie est inchangée au bit près (mêmes
     // positions d'arête) ; seules les normales changent.
-    const int32 CellsPerAxis = CHUNK_SIZE / Step;
+    const int32 CellsPerAxis = FMath::Clamp(InCellsPerAxis, 2, CHUNK_SIZE);  // coarse tiles use fewer
     const int32 GridDim      = CellsPerAxis + 1;
     const int32 MDim         = GridDim + 2;            // +1 marge de chaque côté
 
-    TArray<float> DensityGrid;
+    // Réutilise le tampon entre tuiles (thread_local) : SetNumUninitialized garde la
+    // capacité, donc plus de malloc/free de ~170 Ko (35³ floats) par tuile.
+    static thread_local TArray<float> DensityGrid;
     DensityGrid.SetNumUninitialized(MDim * MDim * MDim);
     for (int32 gz = -1; gz <= GridDim; gz++)
     {
@@ -176,8 +202,12 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
         {
             for (int32 gx = -1; gx <= GridDim; gx++)
             {
+                // World voxel = tile origin + grid offset scaled by the cell size (Step).
                 DensityGrid[((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1)] =
-                    GetDensity(Chunk, gx * Step, gy * Step, gz * Step);
+                    Generator->GetDensityAt(
+                        OriginVoxels.X + gx * Step,
+                        OriginVoxels.Y + gy * Step,
+                        OriginVoxels.Z + gz * Step);
             }
         }
     }
@@ -208,34 +238,36 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
         {
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
-                // Densités + positions + gradients aux 8 coins (lus dans la grille).
+                // PASSE 1 : densités aux 8 coins + index de cas MC SEULEMENT.
+                // ~70% des cellules d'un chunk sont tout-roc ou tout-air (aucune surface) ;
+                // on les rejette ICI, AVANT de payer les 8 positions + 8 gradients (48 lectures
+                // grille + maths vectorielles). Sortie bit-identique : positions et gradients ne
+                // servent qu'aux cellules réellement traversées par l'isosurface.
                 float Densities[8];
+                int32 CaseIndex = 0;
+                for (int32 i = 0; i < 8; i++)
+                {
+                    const float D = SampleG(cx + CornerOffsets[i].X,
+                                            cy + CornerOffsets[i].Y,
+                                            cz + CornerOffsets[i].Z);
+                    Densities[i] = D;
+                    if (D >= IsoLevel) CaseIndex |= (1 << i);
+                }
+
+                if (MCEdgeTable[CaseIndex] == 0) continue;  // Pas de surface ici → skip
+
+                // PASSE 2 : positions + gradients aux 8 coins (uniquement si surface présente).
                 FVector Positions[8];
                 FVector Gradients[8];
-
                 for (int32 i = 0; i < 8; i++)
                 {
                     const int32 GX = cx + CornerOffsets[i].X;
                     const int32 GY = cy + CornerOffsets[i].Y;
                     const int32 GZ = cz + CornerOffsets[i].Z;
-
-                    Densities[i]  = SampleG(GX, GY, GZ);
-                    Positions[i]  = ChunkWorldPos
+                    Positions[i] = ChunkWorldPos
                         + FVector(GX * Step, GY * Step, GZ * Step) * VOXEL_SIZE;
-                    Gradients[i]  = GradAt(GX, GY, GZ);
+                    Gradients[i] = GradAt(GX, GY, GZ);
                 }
-
-                // Index de cas MC (8 bits, un par coin)
-                int32 CaseIndex = 0;
-                for (int32 i = 0; i < 8; i++)
-                {
-                    if (Densities[i] >= IsoLevel)
-                    {
-                        CaseIndex |= (1 << i);
-                    }
-                }
-
-                if (MCEdgeTable[CaseIndex] == 0) continue;  // Pas de surface ici
 
                 // Interpolation des positions + normales sur les arêtes traversées. Le t est
                 // calculé exactement comme InterpolateEdge → positions bit-identiques (topologie
@@ -272,6 +304,71 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(const FVoxelChunk& Chunk,
                     MeshData.Triangles.Add(Idx2);
                     MeshData.Triangles.Add(Idx1);
                 }
+            }
+        }
+    }
+
+    //=========================================================================
+    // SKIRTS — boucheurs de fissures aux coutures de LOD (clipmap)
+    //=========================================================================
+    // Deux tuiles de niveaux voisins maillent à des résolutions différentes : leurs iso-surfaces
+    // ne se rejoignent pas parfaitement le long de la face partagée → une fine fissure traversante.
+    // On la scelle en suspendant une courte « jupe » (mur) sous chaque arête de surface posée sur
+    // l'une des 6 faces externes de la tuile, extrudée VERS LE SOLIDE le long de la normale inversée
+    // sur ~une taille de cellule. Là où la surface du voisin est décalée, les jupes des deux tuiles
+    // se recouvrent dans la roche et ferment le trou ; ailleurs la jupe est enterrée et invisible.
+    // Émis en DOUBLE FACE (deux orientations) pour s'afficher quel que soit le côté caméra / le
+    // matériau. Une arête de surface posée sur une face de frontière a sa coordonnée d'axe EXACTE
+    // (l'interpolation MC garde fixe l'axe de la face) → comparaison flottante exacte fiable.
+    if (bGenerateSkirts && MeshData.Triangles.Num() > 0)
+    {
+        const float ExtentCm = (float)(CellsPerAxis * Step) * VOXEL_SIZE;
+        const float MinX = ChunkWorldPos.X, MinY = ChunkWorldPos.Y, MinZ = ChunkWorldPos.Z;
+        const float MaxX = MinX + ExtentCm, MaxY = MinY + ExtentCm, MaxZ = MinZ + ExtentCm;
+        const float SkirtDepth = FMath::Max(1.0f, SkirtCells) * (float)Step * VOXEL_SIZE;
+
+        auto OnBoundaryPlane = [&](const FVector& A, const FVector& B) -> bool
+        {
+            return (A.X == MinX && B.X == MinX) || (A.X == MaxX && B.X == MaxX)
+                || (A.Y == MinY && B.Y == MinY) || (A.Y == MaxY && B.Y == MaxY)
+                || (A.Z == MinZ && B.Z == MinZ) || (A.Z == MaxZ && B.Z == MaxZ);
+        };
+
+        auto AddSkirtVert = [&](const FVector& Pos, const FVector& Nrm, const FColor& Col) -> int32
+        {
+            const int32 Idx = MeshData.Vertices.Num();
+            MeshData.Vertices.Add(Pos);
+            MeshData.Normals.Add(Nrm);
+            MeshData.UVs.Add(FVector2D(Pos.X / VOXEL_SIZE, Pos.Y / VOXEL_SIZE));
+            MeshData.Colors.Add(Col);   // hérite la couleur du vertex source (parallèle aux autres tableaux)
+            return Idx;
+        };
+
+        // On ajoute en itérant : on fige le nombre de triangles de surface et on n'ajoute qu'au-delà.
+        const int32 BaseTriNum = MeshData.Triangles.Num();
+        for (int32 t = 0; t + 2 < BaseTriNum; t += 3)
+        {
+            const int32 Tri[3] = { MeshData.Triangles[t], MeshData.Triangles[t + 1], MeshData.Triangles[t + 2] };
+            for (int32 e = 0; e < 3; ++e)
+            {
+                const int32 iA = Tri[e], iB = Tri[(e + 1) % 3];
+                // COPIES par valeur — AddSkirtVert réalloue Vertices/Normals (invaliderait des refs).
+                const FVector PA = MeshData.Vertices[iA];
+                const FVector PB = MeshData.Vertices[iB];
+                if (!OnBoundaryPlane(PA, PB)) continue;
+
+                const FVector NA = MeshData.Normals[iA];
+                const FVector NB = MeshData.Normals[iB];
+                const FColor  CA = MeshData.Colors[iA];
+                const FColor  CB = MeshData.Colors[iB];
+                const int32 iA2 = AddSkirtVert(PA - NA * SkirtDepth, NA, CA);
+                const int32 iB2 = AddSkirtVert(PB - NB * SkirtDepth, NB, CB);
+
+                // Quad (iA, iB, iB2, iA2) → 2 triangles, émis dans LES DEUX orientations.
+                MeshData.Triangles.Add(iA);  MeshData.Triangles.Add(iB);  MeshData.Triangles.Add(iB2);
+                MeshData.Triangles.Add(iA);  MeshData.Triangles.Add(iB2); MeshData.Triangles.Add(iA2);
+                MeshData.Triangles.Add(iA);  MeshData.Triangles.Add(iB2); MeshData.Triangles.Add(iB);
+                MeshData.Triangles.Add(iA);  MeshData.Triangles.Add(iA2); MeshData.Triangles.Add(iB2);
             }
         }
     }

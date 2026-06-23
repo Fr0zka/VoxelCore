@@ -21,6 +21,7 @@ class URealtimeMeshSimple;
 class UVoxelDiffLayer;
 class UVoxelContentManager;
 class UVoxelAtmosphereManager;
+class UMaterialInterface;
 
 /**
  * AVoxelWorld - The main voxel terrain actor
@@ -37,11 +38,9 @@ class UVoxelAtmosphereManager;
  */
 struct FChunkResult
 {
-    FIntVector ChunkCoord;
-    FVoxelChunk Chunk;
+    FVoxelTileKey Tile;       // which clipmap tile this mesh is for (carries coord + level)
     FVoxelMeshData MeshData;
-    int32 LODLevel = 0;  // 0=full, 1=half, 2=quarter resolution
-    uint32 Epoch = 0;    // Generation epoch — discard if stale
+    uint32 Epoch = 0;         // Generation epoch — discard if stale
 };
 
 UCLASS()
@@ -101,12 +100,22 @@ public:
     // CHUNK STORAGE
     //=========================================================================
 
-    /** All currently loaded chunks, keyed by chunk coordinate */
-    TMap<FIntVector, FVoxelChunk> Chunks;
+    //=========================================================================
+    // CLIPMAP TILE STORAGE (chunked-LOD)
+    //=========================================================================
+    // A level-L tile spans (CHUNK_SIZE<<L) voxels meshed at step (1<<L) → constant 32³-cell
+    // mesh, one component, one draw, covering 8^L× the volume. Streaming loads concentric
+    // shells (level 0 near, coarser far), so total tile count stays low (~1-2k) regardless
+    // of view distance. That low count is WHY each tile can have its own component without a
+    // game-thread problem (this supersedes the earlier region-batching). Collision + content
+    // are level-0 only.
 
-    /** Mesh components for each chunk, keyed by chunk coordinate */
-    UPROPERTY()
-    TMap<FIntVector, URealtimeMeshComponent*> ChunkMeshes;
+    /** Tiles fully loaded — INCLUDING empty/all-air tiles, so we never re-submit them. */
+    TSet<FVoxelTileKey> LoadedTiles;
+
+    /** Render component per NON-empty loaded tile (GC-safe via actor ownership; not UPROPERTY
+     *  because FVoxelTileKey isn't a USTRUCT key). */
+    TMap<FVoxelTileKey, URealtimeMeshComponent*> TileComponents;
 
 
 
@@ -351,7 +360,7 @@ public:
      *
      * @param ChunkCoord - Which chunk to load
      */
-    void LoadChunk(const FIntVector& ChunkCoord);
+    void LoadTile(const FVoxelTileKey& Tile);
 
     /**
      * Unload a single chunk.
@@ -362,7 +371,7 @@ public:
      *
      * @param ChunkCoord - Which chunk to unload
      */
-    void UnloadChunk(const FIntVector& ChunkCoord);
+    void UnloadTile(const FVoxelTileKey& Tile);
 
     /**
      * Apply mesh data to a RealtimeMesh component.
@@ -374,7 +383,15 @@ public:
      * @param ChunkCoord - Which chunk this mesh belongs to
      * @param MeshData - The generated mesh data
      */
-    void ApplyMeshToChunk(const FIntVector& ChunkCoord, const FVoxelMeshData& MeshData);
+    void ApplyMeshToTile(const FVoxelTileKey& Tile, const FVoxelMeshData& MeshData);
+
+    /** Build the clipmap desired-tile set (concentric shells) around the player tile. */
+    void BuildDesiredTiles(const FIntVector& CenterChunkCoord);
+
+    /** True if a tile's world footprint is still within the outermost clip shell (so a
+     *  not-desired loaded tile there is mid-LOD-transition and must wait for its replacement,
+     *  vs. one that has left the view entirely and can be culled immediately). */
+    bool IsTileInClipRange(const FVoxelTileKey& Tile, const FIntVector& CenterChunkCoord) const;
 
     //=========================================================================
     // HELPERS
@@ -418,7 +435,7 @@ public:
     // link and silently drop results, which leaks PendingChunkCoord slots until the
     // budget is exhausted and streaming stalls permanently. Mpsc guards the producer side.
     TQueue<FChunkResult, EQueueMode::Mpsc> ProcessQueue;
-    TSet<FIntVector> PendingChunkCoord;
+    TSet<FVoxelTileKey> PendingTiles;   // tiles with a gen task in flight
 
     // Set to true during EndPlay — async tasks check this before accessing UObjects
     std::atomic<bool> bShuttingDown{false};
@@ -426,22 +443,25 @@ public:
     // Number of async tasks currently running — EndPlay waits for this to reach 0
     std::atomic<int32> ActiveTaskCount{0};
 
-    // Last known player chunk coord — used by LoadChunk to compute LOD
+    // Player's level-0 tile coord (= chunk coord). The desired set is rebuilt when this changes.
     FIntVector CurrentCenterChunk = FIntVector::ZeroValue;
 
-    // Track current LOD per loaded chunk (for LOD transitions)
-    TMap<FIntVector, int32> ChunkLODs;
-
     // --- Streaming work-avoidance (perf) ---
-    // The desired chunk set only changes when the player crosses a chunk boundary.
-    // We cache it and only rebuild/cull/sort on a real move, and go idle once every
-    // desired chunk is streamed in — so a stationary player costs ~nothing per frame.
+    // The desired tile set only changes when the player crosses a level-0 tile boundary.
+    // We cache it and only rebuild/cull/sort on a real move, and go idle once every desired
+    // tile is streamed in — so a stationary player costs ~nothing per frame.
     FIntVector LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bool bAllChunksLoaded = false;
-    TArray<FIntVector> DesiredSorted;   // desired coords, nearest-first
-    TSet<FIntVector> DesiredSet;        // O(1) membership for the cull pass
+    TArray<FVoxelTileKey> DesiredSorted;   // desired tiles, nearest-first
+    TSet<FVoxelTileKey> DesiredSet;        // O(1) membership for the cull pass
+
+    // Tiles approved for removal but whose teardown (component destroy + content actor Destroy())
+    // is spread across frames. Unbudgeted, a fast traversal culls a whole shell's worth of tiles in
+    // ONE frame → a game-thread teardown spike. Drained by ProcessUnloadQueue (catch-up scaled).
+    TSet<FVoxelTileKey> PendingUnload;
 
     void ProcessPendingChunks();
+    void ProcessUnloadQueue();   // budgeted teardown drain (see PendingUnload)
 
     /**
      * Re-queue loaded chunks for async re-generation + re-meshing.

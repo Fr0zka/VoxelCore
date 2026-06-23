@@ -26,7 +26,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/CriticalSection.h"   // FRWLock
+#include "Misc/ScopeRWLock.h"      // FReadScopeLock / FWriteScopeLock
 #include "VoxelTypes.h"
+#include <atomic>
 #include "VoxelDiffLayer.generated.h"
 
 /**
@@ -243,7 +246,16 @@ private:
     // Modifications grouped by chunk coordinate.
     // Each chunk's list contains ALL modifications that overlap it
     // (including mods centered in neighboring chunks whose radius reaches here).
+    //
+    // THREADING: written on the game thread (ApplyModification / Clear) but read by MANY mesher
+    // WORKER threads (GetDensityAt -> HasModifications / GetDensityOffset). TMap is not thread-safe —
+    // a read landing during a write's rehash reads freed hash memory (EXCEPTION_ACCESS_VIOLATION in
+    // TSet::FindId). All access to ChunkMods MUST hold ModsLock (read lock for queries, write lock for
+    // mutation). bHasAnyMods is a lock-free fast reject: while it's false (the common streaming case,
+    // no carves) readers skip the map AND the lock entirely, so unmodified worlds pay nothing.
     TMap<FIntVector, TArray<FVoxelModification>> ChunkMods;
+    mutable FRWLock ModsLock;
+    std::atomic<bool> bHasAnyMods{ false };
 
     //=========================================================================
     // BUDGET TRACKING

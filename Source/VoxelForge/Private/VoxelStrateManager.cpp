@@ -348,6 +348,9 @@ void UVoxelStrateManager::GeneratePassages()
         UE_LOG(LogTemp, Log, TEXT("[StrateManager] Surface entry shaft at (0,0) topZ=%.0f R=%.1f"),
             TopZ, Entry.Radius);
     }
+
+    // Invalidate any thread_local per-chunk passage shortlists (see EvaluateModifierSDF).
+    ++PassagesVersion;
 }
 
 //=============================================================================
@@ -356,6 +359,53 @@ void UVoxelStrateManager::GeneratePassages()
 
 float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const
 {
+    //=========================================================================
+    // PER-CHUNK PASSAGE SHORTLIST
+    //=========================================================================
+    // This runs PER VOXEL (35³ per tile). The vast majority of chunks are nowhere near a
+    // descent passage, yet every voxel still walked the WHOLE Passages array just to reject
+    // each one on a squared-distance test (Passages.Num() × 35³ rejects per tile, all wasted).
+    // Cache, per chunk, the shortlist of passages whose bounds actually reach this chunk —
+    // usually EMPTY → instant FLT_MAX return (no carve). Indices (not pointers) + a version
+    // stamp keep it safe across a GeneratePassages rebuild. Output is bit-identical: the
+    // shortlist is a conservative superset (chunk bounding sphere vs each passage bound).
+    thread_local FIntVector    SL_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
+    thread_local uint32        SL_Version = 0xFFFFFFFFu;
+    thread_local TArray<int32> SL_Nearby;
+
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+
+    if (ChunkCoord != SL_Chunk || SL_Version != PassagesVersion)
+    {
+        SL_Chunk   = ChunkCoord;
+        SL_Version = PassagesVersion;
+        SL_Nearby.Reset();
+
+        // Chunk bounding sphere (centre + half-diagonal), padded by the blend radius. A passage
+        // is kept iff its bounding sphere overlaps the chunk's — i.e. some voxel here could be
+        // inside its per-voxel reject radius. √3/2 · CHUNK_SIZE ≈ 0.866 · size.
+        const FVector CCenter(
+            (ChunkCoord.X + 0.5f) * (float)CHUNK_SIZE,
+            (ChunkCoord.Y + 0.5f) * (float)CHUNK_SIZE,
+            (ChunkCoord.Z + 0.5f) * (float)CHUNK_SIZE);
+        const float ChunkR = (float)CHUNK_SIZE * 0.8660254f + 3.0f;  // +BlendK
+
+        for (int32 i = 0; i < Passages.Num(); ++i)
+        {
+            const FVoxelPassage& P = Passages[i];
+            const float Reach = FMath::Sqrt(P.BoundRadiusSq) + ChunkR;
+            if (FVector::DistSquared(CCenter, P.BoundCenter) <= Reach * Reach)
+            {
+                SL_Nearby.Add(i);
+            }
+        }
+    }
+
+    if (SL_Nearby.Num() == 0) return FLT_MAX;   // no passage near this chunk → no carve
+
     float MinSDF = FLT_MAX;
     const float BlendK = 3.0f;  // Smooth blend for passage junctions
 
@@ -365,8 +415,9 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     // entry is a simple straight tube. A bounding-sphere reject skips far passages.
     //=========================================================================
     const FVector Pos(WorldX, WorldY, WorldZ);
-    for (const FVoxelPassage& P : Passages)
+    for (int32 PIdx : SL_Nearby)
     {
+        const FVoxelPassage& P = Passages[PIdx];
         // BOUNDING-SPHERE REJECT: skip passages this voxel can't possibly be inside.
         // EvaluateModifierSDF runs PER VOXEL and used to evaluate every passage's full
         // capsule chain unconditionally — the dominant lag source once passages became
@@ -452,6 +503,22 @@ UVoxelStrateDefinition* UVoxelStrateManager::GetStrateForChunk(const FIntVector&
         return StrateLayout[SlotIdx].Definition;
     }
     return nullptr;
+}
+
+bool UVoxelStrateManager::GetStrateChunkZBounds(int32 ChunkZ, int32& OutTopChunkZ, int32& OutBottomChunkZ) const
+{
+    // Strate-aware vertical streaming. Returns the chunk-Z span of the strate containing
+    // ChunkZ; false if ChunkZ is in the inter-strate gap (or outside the layout) — there the
+    // caller leaves the vertical view UNCLAMPED, since the gap is a brief see-both-sides
+    // descent transition. TopChunkZ > BottomChunkZ (Z decreases downward).
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkZ);
+    if (SlotIdx < 0)
+    {
+        return false;
+    }
+    OutTopChunkZ    = StrateLayout[SlotIdx].TopChunkZ;
+    OutBottomChunkZ = StrateLayout[SlotIdx].BottomChunkZ;
+    return true;
 }
 
 ECaveGeneratorType UVoxelStrateManager::GetGeneratorTypeForChunk(const FIntVector& ChunkCoord) const
@@ -559,6 +626,7 @@ FBiomeContext UVoxelStrateManager::GetBiomeContextForChunk(const FIntVector& Chu
         R.ReliefMin   = B->ReliefMin;   R.ReliefMax   = B->ReliefMax;
         R.MoistureMin = B->MoistureMin; R.MoistureMax = B->MoistureMax;
         R.DebugColor  = B->DebugColor.ToFColor(true);
+        R.MaterialPaletteIndex = B->MaterialPaletteIndex;
         Out.Biomes.Add(R);
     }
     return Out;
