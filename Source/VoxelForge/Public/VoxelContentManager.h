@@ -36,6 +36,7 @@
 #include "Containers/Queue.h"
 #include "VoxelTypes.h"
 #include "VoxelStrateTypes.h"   // FStrateDecoration (resolved per dominant biome)
+#include "VoxelBiomeTypes.h"    // FBiomeContext (per-column biome resolve on the worker)
 #include <atomic>
 #include "VoxelContentManager.generated.h"
 
@@ -80,6 +81,14 @@ public:
     /** Destroy all spawned content (decorations + water). Regenerate / season reset. Bumps the deco
      *  epoch so any in-flight march tasks' results are discarded. */
     void ClearAll();
+
+    /** DIAGNOSTIC: report the decoration streaming state of the region covering an actor-LOCAL XY, so a
+     *  line-trace probe can tell apart a render drop / an empty march / a stuck build / a never-requested
+     *  region for a visibly-bare patch. LocalPos is in actor-local cm (the caller undoes the actor xf).
+     *  Game-thread only (reads DecoRegions / RegionBuilds). */
+    void QueryDecoDebugAt(const FVector& LocalPos, bool& bApplied, int32& InstanceCount,
+                          bool& bBuilding, int32& CellsAccounted, int32& CellsTotal,
+                          int32& LiveMarchSpawns, int32& InstancesInCell) const;
 
     virtual void BeginDestroy() override;   // flag shutdown so in-flight march tasks don't touch us
 
@@ -135,6 +144,12 @@ private:
         TArray<FRegionActorSpawn> ActorSpawns;
         int32  CellsRemaining = 0;    // cells still to account for before this region can apply
         uint32 BuildId        = 0;    // unique, monotonic — stale in-flight cell results fail to match
+        // Cells already counted toward completion. A cell can spawn TWO worker tasks (a stale cell from a
+        // discarded build re-enters range, gets re-enqueued, and launches again once its first task frees
+        // the InFlightCells slot). Accounting per-cell here (not a blind --CellsRemaining) makes completion
+        // IDEMPOTENT so the second task can't double-decrement and apply the region before every cell has
+        // actually reported — which left a permanent empty chunk until a regen re-marched it.
+        TSet<FIntPoint> AccountedCells;
     };
 
     // Constant per-update strate context (a strate is a horizontal slab → same for every cell). Carries
@@ -148,21 +163,29 @@ private:
         float  WaterLocalZ    = -FLT_MAX;   // water surface, actor-local cm (-FLT_MAX = no water)
         bool   bHasWater      = false;
         bool   bSurfaceWorld  = false;      // heightfield archetype → use the GetSurfaceHeightAt oracle
+
+        // Strate biome field (PODs only → worker-safe). Empty ⇒ biomes disabled for this strate. The
+        // worker resolves the dominant biome PER COLUMN (ResolveBiomeSampleAt) so decoration borders
+        // follow the warped-Voronoi field instead of snapping to the chunk-footprint cell grid (§8.5).
+        FBiomeContext BiomeCtx;
     };
 
     /** WORKER-THREAD surface find → fills OutSpawns for one cell. SurfaceWorld uses the height oracle
      *  (cheap, O(1)/column); other archetypes ray-march the density column. No UObject access except
-     *  Generator (thread-safe). Determinism-critical. */
+     *  Generator (thread-safe). Determinism-critical. Resolves the dominant biome PER COLUMN
+     *  (ResolveBiomeSampleAt via Ctx.BiomeCtx) and rolls only the entries that biome owns — EntryBiome[i]
+     *  is the context-biome index for Entries[i] (-1 = strate fallback, always matches). */
     static void BuildCellSpawns(const UVoxelGenerator* Gen, const FTransform& OwnerXf,
                                 const FIntPoint& Cell, const FDecoContext& Ctx,
-                                const TArray<FStrateDecoration>& Entries, uint32 InSeed,
+                                const TArray<FStrateDecoration>& Entries,
+                                const TArray<int32>& EntryBiome, uint32 InSeed,
                                 int32 Spacing, float Step, int32 MaxCrossings, float ColumnDepth,
                                 TArray<FDecoSpawn>& OutSpawns);
 
     void LaunchDecoTasks(const FIntPoint& PlayerCell);
     void ProcessDecoResults(const FIntPoint& PlayerCell, int32 FarR);
     void MergeCellResult(const FDecoCellResult& Result);   // fold one cell's spawns into its region build
-    void MarkCellDone(const FIntPoint& Region, uint32 BuildId);  // decrement region's remaining-cell count
+    void MarkCellDone(const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId);  // idempotent per-cell accounting
     void ApplyRegion(const FIntPoint& Region, FDecoRegionBuild& Build);
     void RebuildDesiredCells(const FIntPoint& PlayerCell);
     void ClearDecorationRegion(const FIntPoint& Region);
@@ -220,6 +243,14 @@ private:
     // Shared strate context for the current update (recomputed each UpdateDecorations; the launch step
     // copies the PODs into each task).
     FDecoContext CurrentCtx;
+
+    // Decoration palette for the current update, built ONCE (a strate's biome field is XY-global, so the
+    // flat list is the same for every cell — only the per-COLUMN biome pick varies). CurrentEntries is the
+    // concatenation of every biome's decoration list (or the strate's when a biome has none / biomes are
+    // disabled); CurrentEntryBiome[i] is the context-biome index that owns entry i (-1 = strate fallback,
+    // always matches). The worker resolves a column's dominant biome and rolls only the entries it owns.
+    TArray<FStrateDecoration> CurrentEntries;
+    TArray<int32>             CurrentEntryBiome;
 
     // Single strate-global ocean plane, repositioned to follow the player (see UpdateWater).
     UPROPERTY()

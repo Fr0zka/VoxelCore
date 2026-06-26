@@ -2433,6 +2433,54 @@ const UVoxelBiomeDefinition* UVoxelGenerator::GetDominantBiomeAt(float WorldX, f
     return (Def && Def->Biomes.IsValidIndex(StrateBiomeIdx)) ? Def->Biomes[StrateBiomeIdx] : nullptr;
 }
 
+void UVoxelGenerator::QueryBiomeAt(float WorldX, float WorldY, int32 ChunkZ, FVoxelBiomeQuery& Out) const
+{
+    Out = FVoxelBiomeQuery();
+    if (!StrateManager) return;
+
+    const FIntVector Coord(FMath::FloorToInt(WorldX / CHUNK_SIZE),
+                           FMath::FloorToInt(WorldY / CHUNK_SIZE), ChunkZ);
+    const FBiomeContext Ctx = StrateManager->GetBiomeContextForChunk(Coord);
+
+    // Climate fields are always meaningful (use the strate's map freqs, or defaults when no biomes).
+    const FBiomeMapParams MP = Ctx.IsValid() ? Ctx.Map : FBiomeMapParams();
+    Out.Relief   = SampleRelief(WorldX, WorldY, MP.ReliefFrequency, MP.ReliefContrast);
+    Out.Moisture = SampleMoisture(WorldX, WorldY, MP.MoistureFrequency);
+
+    if (!Ctx.IsValid()) return;   // bHasBiomes stays false → BP knows this strate has no biome field
+    Out.bHasBiomes = true;
+
+    const FBiomeSample S = SampleBiomeAt(WorldX, WorldY, Ctx);
+    Out.NeighborWeight       = S.NeighborWeight;
+    Out.DominantContextIndex = S.DominantIndex;
+
+    const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(Coord);
+
+    if (Ctx.Biomes.IsValidIndex(S.DominantIndex))
+    {
+        const int32 DomStrateIdx = Ctx.Biomes[S.DominantIndex].Index;
+        if (Def && Def->Biomes.IsValidIndex(DomStrateIdx))
+        {
+            UVoxelBiomeDefinition* Bio = Def->Biomes[DomStrateIdx];
+            Out.DominantBiome = Bio;
+            if (Bio)
+            {
+                Out.DebugColor   = Bio->DebugColor;
+                Out.DominantName = Bio->BiomeName.IsEmpty() ? FText::FromName(Bio->GetFName()) : Bio->BiomeName;
+                // Effective list = the biome's decorations, or the strate's when the biome has none
+                // (this is exactly what the per-column scatter falls back to). 0 ⇒ empty band.
+                Out.DominantDecorationCount =
+                    (Bio->Decorations.Num() > 0) ? Bio->Decorations.Num() : Def->Decorations.Num();
+            }
+        }
+    }
+    if (Ctx.Biomes.IsValidIndex(S.NeighborIndex))
+    {
+        const int32 NbStrateIdx = Ctx.Biomes[S.NeighborIndex].Index;
+        if (Def && Def->Biomes.IsValidIndex(NbStrateIdx)) { Out.NeighborBiome = Def->Biomes[NbStrateIdx]; }
+    }
+}
+
 void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float WorldZ,
     int32& OutDominantPalette, int32& OutNeighborPalette, float& OutBlendWeight) const
 {

@@ -87,19 +87,30 @@ int32 UVoxelContentManager::RegionSize() const
     return FMath::Max(1, Settings ? Settings->DecorationRegionSizeCells : 4);
 }
 
+// TRUE floor division (rounds toward -infinity). DO NOT use FMath::DivideAndRoundDown for cell↔region
+// mapping: it is `A / B`, which TRUNCATES toward zero for negatives (a UE naming footgun). Cells are
+// assigned to a region by the exact inverse `region*R + offset`, so the mapping back MUST floor — with
+// truncation, a negative-coord cell is queued under one region but routed back to another → its march
+// result is dropped → blank chunk. Truncation == floor for A>=0 and for R==1, which is exactly why only
+// NEGATIVE coordinates at R>=2 were affected. R (region size) is always > 0 here.
+static FORCEINLINE int32 FloorDivPos(int32 A, int32 R)
+{
+    return (A >= 0) ? (A / R) : -(((-A) + R - 1) / R);
+}
+
 static FORCEINLINE FIntPoint CellToRegion(const FIntPoint& Cell, int32 R)
 {
-    return FIntPoint(FMath::DivideAndRoundDown(Cell.X, R), FMath::DivideAndRoundDown(Cell.Y, R));
+    return FIntPoint(FloorDivPos(Cell.X, R), FloorDivPos(Cell.Y, R));
 }
 
 // Region is desired iff its cell footprint intersects the radius-FarR cell box around the player.
 static FORCEINLINE bool IsRegionDesired(const FIntPoint& Region, const FIntPoint& PlayerCell,
                                         int32 FarR, int32 R)
 {
-    const int32 MinX = FMath::DivideAndRoundDown(PlayerCell.X - FarR, R);
-    const int32 MaxX = FMath::DivideAndRoundDown(PlayerCell.X + FarR, R);
-    const int32 MinY = FMath::DivideAndRoundDown(PlayerCell.Y - FarR, R);
-    const int32 MaxY = FMath::DivideAndRoundDown(PlayerCell.Y + FarR, R);
+    const int32 MinX = FloorDivPos(PlayerCell.X - FarR, R);
+    const int32 MaxX = FloorDivPos(PlayerCell.X + FarR, R);
+    const int32 MinY = FloorDivPos(PlayerCell.Y - FarR, R);
+    const int32 MaxY = FloorDivPos(PlayerCell.Y + FarR, R);
     return Region.X >= MinX && Region.X <= MaxX && Region.Y >= MinY && Region.Y <= MaxY;
 }
 
@@ -161,6 +172,44 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
         CurrentCtx.bHasWater   = (Wv != -FLT_MAX);
         CurrentCtx.WaterLocalZ = CurrentCtx.bHasWater ? Wv * VOXEL_SIZE : -FLT_MAX;
     }
+    // Strate biome field (XY-global → resolved once; the worker picks the dominant biome per COLUMN).
+    CurrentCtx.BiomeCtx = StrateManager->GetBiomeContextForChunk(RepChunk);
+
+    // Build the decoration palette ONCE for this update. With biomes, concatenate every biome's deco list
+    // and tag each entry with its context-biome index; the worker resolves a column's biome and rolls only
+    // the entries it owns → borders follow the warped-Voronoi field, not the 8 m cell grid (Task 1, §8.5).
+    // Without biomes, fall back to the strate's single list tagged -1 (always matches → legacy behaviour).
+    CurrentEntries.Reset();
+    CurrentEntryBiome.Reset();
+    if (CurrentCtx.Def)
+    {
+        if (CurrentCtx.BiomeCtx.IsValid())
+        {
+            for (int32 ci = 0; ci < CurrentCtx.BiomeCtx.Biomes.Num(); ++ci)
+            {
+                const int32 StrateBiomeIdx = CurrentCtx.BiomeCtx.Biomes[ci].Index;
+                const UVoxelBiomeDefinition* Bio =
+                    CurrentCtx.Def->Biomes.IsValidIndex(StrateBiomeIdx) ? CurrentCtx.Def->Biomes[StrateBiomeIdx] : nullptr;
+                // A biome with no decorations inherits the strate's list (still tagged with THIS biome's
+                // index so it only fires inside that biome's columns — no cross-biome bleed).
+                const TArray<FStrateDecoration>& Src =
+                    (Bio && Bio->Decorations.Num() > 0) ? Bio->Decorations : CurrentCtx.Def->Decorations;
+                for (const FStrateDecoration& D : Src)
+                {
+                    CurrentEntries.Add(D);
+                    CurrentEntryBiome.Add(ci);
+                }
+            }
+        }
+        else
+        {
+            for (const FStrateDecoration& D : CurrentCtx.Def->Decorations)
+            {
+                CurrentEntries.Add(D);
+                CurrentEntryBiome.Add(-1);   // no biome field → matches the column's ColBiome (-1)
+            }
+        }
+    }
 
     // Strate change → wipe + force a full rebuild (bumps epoch so old in-flight tasks are discarded).
     if (StrateIndex != LastStrateIndex)
@@ -191,10 +240,10 @@ void UVoxelContentManager::RebuildDesiredCells(const FIntPoint& PlayerCell)
     const int32 R    = RegionSize();
 
     // Desired regions = every region whose footprint touches the radius-FarR cell box around the player.
-    const FIntPoint RMin(FMath::DivideAndRoundDown(PlayerCell.X - FarR, R),
-                         FMath::DivideAndRoundDown(PlayerCell.Y - FarR, R));
-    const FIntPoint RMax(FMath::DivideAndRoundDown(PlayerCell.X + FarR, R),
-                         FMath::DivideAndRoundDown(PlayerCell.Y + FarR, R));
+    const FIntPoint RMin(FloorDivPos(PlayerCell.X - FarR, R),
+                         FloorDivPos(PlayerCell.Y - FarR, R));
+    const FIntPoint RMax(FloorDivPos(PlayerCell.X + FarR, R),
+                         FloorDivPos(PlayerCell.Y + FarR, R));
 
     TSet<FIntPoint> DesiredRegions;
     DesiredRegions.Reserve((RMax.X - RMin.X + 1) * (RMax.Y - RMin.Y + 1));
@@ -280,20 +329,17 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
         if (!Build) continue;
         const uint32 BuildId = Build->BuildId;
 
-        // Resolve the decoration list on the GAME THREAD (GetDominantBiomeAt is game-thread).
-        const float CX = ((float)Cell.X + 0.5f) * CHUNK_SIZE;
-        const float CY = ((float)Cell.Y + 0.5f) * CHUNK_SIZE;
-        const UVoxelBiomeDefinition* Biome = Generator->GetDominantBiomeAt(CX, CY, CurrentCtx.RepChunkZ);
-        const TArray<FStrateDecoration>& SrcDecos =
-            (Biome && Biome->Decorations.Num() > 0) ? Biome->Decorations : CurrentCtx.Def->Decorations;
-
-        if (SrcDecos.Num() == 0)
+        // The decoration palette (all biomes' lists, flattened + tagged) is built ONCE per update in
+        // UpdateDecorations; the per-COLUMN biome pick happens on the worker. Snapshot the flat list +
+        // tags for this cell's task (the biome context rides in Ctx).
+        if (CurrentEntries.Num() == 0)
         {
-            MarkCellDone(Region, BuildId);   // empty cell still counts toward the region's completion
+            MarkCellDone(Region, Cell, BuildId);   // empty cell still counts toward the region's completion
             continue;
         }
 
-        TArray<FStrateDecoration> EntriesCopy = SrcDecos;   // snapshot for the worker + the spawner
+        TArray<FStrateDecoration> EntriesCopy   = CurrentEntries;     // snapshot for the worker + the spawner
+        TArray<int32>             EntryBiomeCopy = CurrentEntryBiome;  // parallel: ctx-biome owner per entry
         const FDecoContext Ctx = CurrentCtx;                // PODs only used on the worker
         const uint32 LocalSeed = (uint32)Seed;
         UVoxelGenerator* Gen = Generator;
@@ -303,7 +349,7 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
 
         UE::Tasks::Launch(TEXT("DecoMarch"),
             [this, Gen, OwnerXf, Cell, Ctx, LocalSeed, Spacing, Step, MaxCross, ColDepth, BuildId,
-             Entries = MoveTemp(EntriesCopy)]() mutable
+             Entries = MoveTemp(EntriesCopy), EntryBiome = MoveTemp(EntryBiomeCopy)]() mutable
             {
                 struct FGuard { ~FGuard() { GActiveDecoTasks.fetch_sub(1, std::memory_order_relaxed); } } Guard;
 
@@ -313,7 +359,7 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
                 Result.Cell    = Cell;
                 Result.BuildId = BuildId;
                 Result.Entries = MoveTemp(Entries);
-                BuildCellSpawns(Gen, OwnerXf, Cell, Ctx, Result.Entries, LocalSeed,
+                BuildCellSpawns(Gen, OwnerXf, Cell, Ctx, Result.Entries, EntryBiome, LocalSeed,
                                 Spacing, Step, MaxCross, ColDepth, Result.Spawns);
 
                 if (!bShuttingDown.load(std::memory_order_relaxed))
@@ -327,7 +373,8 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
 // ---- WORKER THREAD: find each column's surface points → spawn commands. ----
 void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTransform& OwnerXf,
                                            const FIntPoint& Cell, const FDecoContext& Ctx,
-                                           const TArray<FStrateDecoration>& Entries, uint32 InSeed,
+                                           const TArray<FStrateDecoration>& Entries,
+                                           const TArray<int32>& EntryBiome, uint32 InSeed,
                                            int32 Spacing, float Step, int32 MaxCrossings, float ColumnDepth,
                                            TArray<FDecoSpawn>& OutSpawns)
 {
@@ -340,12 +387,20 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
     TArray<int32> EntryCount; EntryCount.Init(0, Entries.Num());
     int32 TotalActors = 0;
 
+    // Per-COLUMN biome cache: ResolveBiomeSampleAt's noise-heavy cell classification is box-validated
+    // (one rebuild per chunk footprint), so resolving the dominant biome at every column in this cell is
+    // cheap. The cache is local to this worker task (determinism-safe — pure function of XY/seed/Ctx).
+    FChunkBiomeCache BiomeCache;
+    const bool bHasBiomes = Ctx.BiomeCtx.IsValid();
+
     auto D = [&](float VX, float VY, float VZ) { return Gen->GetDensityAt(VX, VY, VZ); };
 
     // Shared: roll every decoration entry at one surface point (voxel XY, voxel Z, outward world normal)
     // and append the passing ones to OutSpawns. CrossingIdx salts the hash so stacked surfaces differ.
+    // ColBiome = the column's dominant context-biome index (-1 when biomes are off); an entry is rolled
+    // only if it belongs to that biome (EntryBiome[EntryIdx] == ColBiome) → organic, per-column borders.
     auto PlaceAtCrossing = [&](float VX, float VY, int32 gx, int32 gy, float ZC,
-                               const FVector& NormalWorld, int32 CrossingIdx)
+                               const FVector& NormalWorld, int32 CrossingIdx, int32 ColBiome)
     {
         const bool bFloor   = NormalWorld.Z >  0.5f;
         const bool bCeiling = NormalWorld.Z < -0.5f;
@@ -357,6 +412,10 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
 
         for (int32 EntryIdx = 0; EntryIdx < Entries.Num(); ++EntryIdx)
         {
+            // Per-column biome gate: only this column's dominant biome owns its entries. -1-tagged
+            // entries (no biome field) match the -1 ColBiome, so the legacy single-list path is intact.
+            if (EntryBiome[EntryIdx] != ColBiome) continue;
+
             const FStrateDecoration& Deco = Entries[EntryIdx];
             const bool bInstanced = (Deco.InstancedMesh != nullptr);
             if (!bInstanced && !Deco.ActorClass) continue;
@@ -374,11 +433,24 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             }
             if (!bMatches) continue;
 
+            // Strict-wall overhang gate: a "wall" point also covers surfaces that lean slightly downward
+            // (N.Z in [-0.5, 0)). For props flagged wall-only-upright, drop those so overhangs don't take
+            // wall decals. Applies whenever the point IS a wall (independent of Floor/Wall/Any setting).
+            if (bWall && Deco.bWallExcludeOverhangs && NormalWorld.Z < 0.0f) continue;
+
             // Surface-tilt gate: tilt = acos(|N.Z|) (0 = flat, 90 = vertical). Skip surfaces steeper than
             // MaxSlopeAngle. cos is monotone-decreasing, so |N.Z| < cos(MaxSlope) ⇔ tilt > MaxSlope.
             // Guarded so the default (90°, cos = 0) costs no trig and never rejects anything.
             if (Deco.MaxSlopeAngle < 89.99f &&
                 FMath::Abs(NormalWorld.Z) < FMath::Cos(FMath::DegreesToRadians(Deco.MaxSlopeAngle)))
+            {
+                continue;
+            }
+
+            // Lower-bound tilt gate (companion to the above): skip surfaces FLATTER than MinSlopeAngle.
+            // tilt < MinSlope ⇔ |N.Z| > cos(MinSlope). Guarded so the default (0°, cos = 1) never rejects.
+            if (Deco.MinSlopeAngle > 0.01f &&
+                FMath::Abs(NormalWorld.Z) > FMath::Cos(FMath::DegreesToRadians(Deco.MinSlopeAngle)))
             {
                 continue;
             }
@@ -397,7 +469,10 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                 : FQuat::Identity;
             if (Deco.bRandomYaw)
             {
-                const float Yaw = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x59415721u)) * 2.0f * PI;
+                // Roll within [MinYaw, MaxYaw]; the default 0..360 reproduces the legacy full-turn roll
+                // bit-for-bit (Lerp(0,360,t)° == t·2π rad), so existing assets are unchanged.
+                const float YawT   = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x59415721u));
+                const float Yaw    = FMath::DegreesToRadians(FMath::Lerp(Deco.MinYaw, Deco.MaxYaw, YawT));
                 const FVector Axis = Deco.bAlignToSurface ? NormalWorld : FVector::UpVector;
                 BaseQ = FQuat(Axis, Yaw) * BaseQ;
             }
@@ -425,6 +500,25 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
         const float VX = (float)(CellOriginVX + gx * Spacing + JX);
         const float VY = (float)(CellOriginVY + gy * Spacing + JY);
 
+        // Resolve the column's biome ONCE (constant over the column's whole Z range). -1 when the strate
+        // has no biome field → matches the -1-tagged legacy entries.
+        int32 ColBiome = -1;
+        if (bHasBiomes)
+        {
+            const FBiomeSample BS = Gen->ResolveBiomeSampleAt(VX, VY, Ctx.RepChunkZ, Ctx.BiomeCtx, BiomeCache);
+            ColBiome = BS.DominantIndex;   // index into Ctx.BiomeCtx.Biomes == the entry tag
+
+            // SOFTEN THE BORDER: a hard dominant pick still switches deco sets on a crisp line. In the
+            // blend band (NeighborWeight rises 0 → ~0.5 toward the shared border) flip a hash-decided
+            // fraction of columns to the NEIGHBOUR biome, so the two deco sets DITHER across the seam
+            // instead of snapping. Deterministic (pure hash of cell/column/seed) → no flicker/perf cost.
+            if (BS.NeighborWeight > 0.0f && BS.NeighborIndex >= 0)
+            {
+                const uint32 HBlend = DecoHash(Cell.X, Cell.Y, gx, gy, -7, 0, InSeed, 0xB1E2u);
+                if (VoxelHash::ToFloat01(HBlend) < BS.NeighborWeight) { ColBiome = BS.NeighborIndex; }
+            }
+        }
+
         if (Ctx.bSurfaceWorld)
         {
             // HEIGHTFIELD ORACLE — O(1)/column instead of marching the whole band. Query the surface
@@ -445,7 +539,7 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                 const float dHdy = (hYp - hYm) * 0.5f;
                 FVector N = OwnerXf.TransformVectorNoScale(FVector(-dHdx, -dHdy, 1.0f)).GetSafeNormal();
                 if (N.IsNearlyZero()) N = FVector::UpVector;
-                PlaceAtCrossing(VX, VY, gx, gy, hC, N, 0);
+                PlaceAtCrossing(VX, VY, gx, gy, hC, N, 0, ColBiome);
             }
 
             // Sky-cap ceiling underside: outward normal = (dC/dx, dC/dy, -1). Only if open space below.
@@ -455,7 +549,7 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                 const float dCdy = (cYp - cYm) * 0.5f;
                 FVector N = OwnerXf.TransformVectorNoScale(FVector(dCdx, dCdy, -1.0f)).GetSafeNormal();
                 if (N.IsNearlyZero()) N = FVector::DownVector;
-                PlaceAtCrossing(VX, VY, gx, gy, cC, N, 1);
+                PlaceAtCrossing(VX, VY, gx, gy, cC, N, 1, ColBiome);
             }
             continue;
         }
@@ -491,7 +585,7 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                 FVector NormalWorld = OwnerXf.TransformVectorNoScale(LocalGrad).GetSafeNormal();
                 if (NormalWorld.IsNearlyZero()) NormalWorld = FVector::UpVector;
 
-                PlaceAtCrossing(VX, VY, gx, gy, ZC, NormalWorld, Crossings);
+                PlaceAtCrossing(VX, VY, gx, gy, ZC, NormalWorld, Crossings, ColBiome);
                 ++Crossings;
             }
 
@@ -550,7 +644,16 @@ void UVoxelContentManager::MergeCellResult(const FDecoCellResult& Result)
 {
     const FIntPoint Region = CellToRegion(Result.Cell, RegionSize());
     FDecoRegionBuild* Build = RegionBuilds.Find(Region);
-    if (!Build || Build->BuildId != Result.BuildId) return;
+    if (!Build || Build->BuildId != Result.BuildId)
+    {
+        return;
+    }
+    // Already counted this cell (a duplicate task for the same cell+build landed first) → drop this
+    // result whole, or we'd append its spawns twice (double decorations at the same spots).
+    if (Build->AccountedCells.Contains(Result.Cell))
+    {
+        return;
+    }
 
     for (const FDecoSpawn& S : Result.Spawns)
     {
@@ -574,14 +677,21 @@ void UVoxelContentManager::MergeCellResult(const FDecoCellResult& Result)
         }
     }
 
-    MarkCellDone(Region, Result.BuildId);
+    MarkCellDone(Region, Result.Cell, Result.BuildId);
 }
 
-// Account one cell against its region's remaining-cell count; queue the region for apply once all are in.
-void UVoxelContentManager::MarkCellDone(const FIntPoint& Region, uint32 BuildId)
+// Account one cell against its region — IDEMPOTENT per cell, so a duplicate task for the same cell can't
+// double-decrement and apply the region early (which left a permanently-empty chunk until a regen). Queues
+// the region for apply once every distinct cell has reported.
+void UVoxelContentManager::MarkCellDone(const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId)
 {
     FDecoRegionBuild* Build = RegionBuilds.Find(Region);
     if (!Build || Build->BuildId != BuildId) return;
+
+    bool bAlreadyAccounted = false;
+    Build->AccountedCells.Add(Cell, &bAlreadyAccounted);
+    if (bAlreadyAccounted) return;   // this cell already counted → ignore the duplicate
+
     if (--Build->CellsRemaining <= 0)
     {
         CompletedRegions.Add(Region);   // ready for budgeted apply in ProcessDecoResults
@@ -781,4 +891,77 @@ void UVoxelContentManager::ClearAll()
     // Force a full decoration rebuild on the next update.
     LastDecoCell    = FIntPoint(INT32_MIN, INT32_MIN);
     LastStrateIndex = INT32_MIN;
+}
+
+//=============================================================================
+// DIAGNOSTIC — decoration streaming state under a point
+//=============================================================================
+
+void UVoxelContentManager::QueryDecoDebugAt(const FVector& LocalPos, bool& bApplied, int32& InstanceCount,
+                                            bool& bBuilding, int32& CellsAccounted, int32& CellsTotal,
+                                            int32& LiveMarchSpawns, int32& InstancesInCell) const
+{
+    bApplied = false; InstanceCount = 0; bBuilding = false; CellsAccounted = 0;
+    LiveMarchSpawns = -1; InstancesInCell = 0;
+
+    const int32 R = RegionSize();
+    CellsTotal = R * R;
+
+    // World-LOCAL XY → deco cell → region (same math the scatter uses).
+    const float CellWorld = (float)DECO_CELL_VOXELS * VOXEL_SIZE;
+    const FIntPoint Cell(FMath::FloorToInt(LocalPos.X / CellWorld),
+                         FMath::FloorToInt(LocalPos.Y / CellWorld));
+    const FIntPoint Region = CellToRegion(Cell, R);
+
+    // Actor-LOCAL XY footprint of the probed cell (instances are stored component-local; the HISM sits at
+    // the actor transform with identity relative, so component-local == actor-local cell space).
+    const float CellMinX = (float)Cell.X * CellWorld, CellMaxX = CellMinX + CellWorld;
+    const float CellMinY = (float)Cell.Y * CellWorld, CellMaxY = CellMinY + CellWorld;
+
+    if (const FDecoRegionContent* Content = DecoRegions.Find(Region))
+    {
+        bApplied = true;
+        for (const TWeakObjectPtr<UHierarchicalInstancedStaticMeshComponent>& C : Content->Instances)
+        {
+            const UHierarchicalInstancedStaticMeshComponent* Comp = C.Get();
+            if (!Comp) continue;
+            const int32 N = Comp->GetInstanceCount();
+            InstanceCount += N;
+            // Count the ones actually inside the probed cell → tells a blank cell apart from a blank region.
+            for (int32 i = 0; i < N; ++i)
+            {
+                FTransform Xf;
+                if (!Comp->GetInstanceTransform(i, Xf, /*bWorldSpace=*/false)) continue;
+                const FVector P = Xf.GetLocation();
+                if (P.X >= CellMinX && P.X < CellMaxX && P.Y >= CellMinY && P.Y < CellMaxY)
+                {
+                    ++InstancesInCell;
+                }
+            }
+        }
+    }
+    if (const FDecoRegionBuild* Build = RegionBuilds.Find(Region))
+    {
+        bBuilding      = true;
+        CellsAccounted = Build->AccountedCells.Num();
+    }
+
+    // PER-CELL decisive probe: re-run the march for THIS cell synchronously with the current strate
+    // context (set each UpdateDecorations). Same inputs the worker uses → byte-identical result, so it
+    // reports exactly what the scatter decides for this cell right now. Only valid when the probed point
+    // shares the player's current strate (CurrentCtx/CurrentEntries reflect that); else leave -1.
+    AActor* OwnerActor = Owner.Get();
+    if (Generator && Settings && OwnerActor && CurrentCtx.Def && CurrentEntries.Num() > 0)
+    {
+        const int32 Spacing  = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
+        const float Step     = (float)FMath::Max(1, Settings->DecorationMarchStepVoxels);
+        const int32 MaxCross = FMath::Max(1, Settings->DecorationMaxCrossingsPerColumn);
+        const float ColDepth = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);
+
+        TArray<FDecoSpawn> Spawns;
+        BuildCellSpawns(Generator, OwnerActor->GetActorTransform(), Cell, CurrentCtx,
+                        CurrentEntries, CurrentEntryBiome, (uint32)Seed,
+                        Spacing, Step, MaxCross, ColDepth, Spawns);
+        LiveMarchSpawns = Spawns.Num();
+    }
 }

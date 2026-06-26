@@ -1730,6 +1730,14 @@ struct VOXELFORGE_API FStrateDecoration
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "90.0"))
     float MaxSlopeAngle = 90.0f;
 
+    // Minimum surface tilt (degrees from flat) — the LOWER companion to MaxSlopeAngle. Rejects surfaces
+    // FLATTER than this, so a prop can be kept OFF flat ground and restricted to slopes / walls. Same
+    // metric as MaxSlopeAngle: acos(|normal.Z|), 0 = flat, 90 = vertical. Pair the two to band a prop
+    // onto a tilt range (e.g. 30..70 = slopes only, never flats or sheer walls).
+    //   0 → no filter (default) · 45 → slopes & walls only · 70 → near-vertical only
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MinSlopeAngle = 0.0f;
+
     // Chance per valid surface point to spawn this decoration (0-1)
     // 0.01 = rare, 0.1 = common, 0.5 = very dense
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -1752,6 +1760,25 @@ struct VOXELFORGE_API FStrateDecoration
     // Apply a deterministic random yaw so instances don't all face the same way.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
     bool bRandomYaw = true;
+
+    // When bRandomYaw is set, constrain the random yaw to [MinYaw, MaxYaw] degrees instead of a full
+    // turn. Lets a prop face roughly one way with a little variation (wind-bent grass: 80..100). The
+    // default 0..360 is a full unrestricted turn — byte-identical to the legacy behaviour. Ignored when
+    // bRandomYaw is false.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
+        meta = (EditCondition = "bRandomYaw", ClampMin = "0.0", ClampMax = "360.0"))
+    float MinYaw = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
+        meta = (EditCondition = "bRandomYaw", ClampMin = "0.0", ClampMax = "360.0"))
+    float MaxYaw = 360.0f;
+
+    // Wall props only: exclude downward-facing OVERHANGS. A "wall" is any surface between floor and
+    // ceiling (|normal.Z| <= 0.5), which still includes surfaces that lean slightly DOWNWARD (overhang
+    // ceilings). For props that must sit on upright walls (vines, wall torches) set this so only normals
+    // with Z >= 0 (vertical or up-leaning) qualify. Ignored unless the point resolves as a wall.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
+    bool bWallExcludeOverhangs = false;
 
     // Offset along the surface normal (world units). Positive = lift off the surface,
     // negative = sink into it. Useful to embed roots or float crystals slightly.

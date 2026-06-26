@@ -22,6 +22,7 @@ class UVoxelDiffLayer;
 class UVoxelContentManager;
 class UVoxelAtmosphereManager;
 class UMaterialInterface;
+namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
 /**
  * AVoxelWorld - The main voxel terrain actor
@@ -39,8 +40,19 @@ class UMaterialInterface;
 struct FChunkResult
 {
     FVoxelTileKey Tile;       // which clipmap tile this mesh is for (carries coord + level)
-    FVoxelMeshData MeshData;
+    // T1.f: the RMC geometry buffers are BUILT ON THE WORKER (BuildTileStreamSet in the gen task)
+    // so the game thread only uploads them — the per-vertex builder loop was the dominant
+    // game-thread cost while moving (the apply drain). TSharedPtr (not a by-value StreamSet) so
+    // FChunkResult stays movable through the MPSC queue with the type only FORWARD-DECLARED here.
+    // Null ⇒ empty/all-air tile (no component).
+    TSharedPtr<RealtimeMesh::FRealtimeMeshStreamSet> Streams;
     uint32 Epoch = 0;         // Generation epoch — discard if stale
+    bool bEmpty = true;       // true ⇒ all-air tile (Streams null); still marked loaded so we don't re-submit
+    // Ceiling classification from the ACTUAL mesh normals (down-facing geometry = sky-cap ceiling),
+    // computed on the worker where Normals are free. Authoritative — can't disagree with the rendered
+    // view the way a game-thread height-oracle sample did (it misclassified coarse far tiles). The
+    // game thread still gates this to SurfaceWorld strates before applying CeilingMaterial / no-shadow.
+    bool bIsCeiling = false;
 };
 
 UCLASS()
@@ -227,6 +239,16 @@ public:
     UFUNCTION(BlueprintPure, Category = "Voxel World|Strate")
     int32 GetStrateAtPosition(FVector WorldPosition) const;
 
+    /**
+     * Probe the biome field at a world location (e.g. a mouse line-trace hit). Returns the dominant +
+     * neighbour biome, the climate fields, the border blend weight, and the dominant biome's decoration
+     * count — the SAME resolution the decoration scatter uses per column. Use it to debug placement:
+     * a returned DominantDecorationCount of 0 means that biome has no decorations (an empty region),
+     * NOT a bug. WorldLocation is full world space (the actor transform is undone internally).
+     */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Biome")
+    FVoxelBiomeQuery GetBiomeAtWorldLocation(FVector WorldLocation) const;
+
     //=========================================================================
     // LIVE EDIT (debug tuning in PIE)
     //=========================================================================
@@ -374,16 +396,18 @@ public:
     void UnloadTile(const FVoxelTileKey& Tile);
 
     /**
-     * Apply mesh data to a RealtimeMesh component.
+     * Upload a tile's geometry to its RealtimeMesh component (game thread).
      *
-     * CONCEPT:
-     * - Get or create the mesh component for this chunk
-     * - Set the mesh data (vertices, triangles, etc.)
+     * The vertex/index buffers (Streams) are already BUILT on the worker (T1.f — see
+     * BuildTileStreamSet / FChunkResult), so this only does the game-thread-only work:
+     * ceiling/material resolution, get-or-create the component, CreateSectionGroup(MoveTemp),
+     * and section config (collision/shadow). Never called for empty tiles.
      *
-     * @param ChunkCoord - Which chunk this mesh belongs to
-     * @param MeshData - The generated mesh data
+     * @param Tile        - Which clipmap tile this mesh belongs to
+     * @param Streams     - Pre-built RMC geometry buffers (consumed/moved)
+     * @param bGeomCeiling - Worker's geometry-normal ceiling vote (gated to SurfaceWorld here)
      */
-    void ApplyMeshToTile(const FVoxelTileKey& Tile, const FVoxelMeshData& MeshData);
+    void ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, bool bGeomCeiling);
 
     /** Build the clipmap desired-tile set (concentric shells) around the player tile. */
     void BuildDesiredTiles(const FIntVector& CenterChunkCoord);

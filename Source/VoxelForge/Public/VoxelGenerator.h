@@ -174,6 +174,14 @@ public:
     const UVoxelBiomeDefinition* GetDominantBiomeAt(float WorldX, float WorldY, int32 ChunkZ) const;
 
     /**
+     * Rich biome probe at a world XY for a strate slice (ChunkZ): dominant + neighbour biome assets,
+     * climate fields, border blend weight, and the dominant biome's EFFECTIVE decoration count. Mirrors
+     * exactly what the decoration scatter resolves per column, so it is a faithful "what's under here?"
+     * diagnostic (DominantDecorationCount == 0 explains an empty biome region). Game-thread, uncached.
+     */
+    void QueryBiomeAt(float WorldX, float WorldY, int32 ChunkZ, FVoxelBiomeQuery& Out) const;
+
+    /**
      * Per-vertex material data for the master triplanar palette material (F6). Resolves the
      * biome field at a world XY/Z and returns the dominant + neighbour MaterialPaletteIndex
      * and the border blend weight (0 deep in a cell → 0.5 at the border). The mesher packs

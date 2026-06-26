@@ -25,6 +25,51 @@ AVoxelWorld::AVoxelWorld()
 }
 
 //=============================================================================
+// T1.f — build the RMC geometry buffers OFF the game thread.
+//=============================================================================
+// FRealtimeMeshStreamSet is plain CPU data; the per-vertex/per-triangle builder loop used to run
+// in ApplyMeshToTile ON THE GAME THREAD, where it was the dominant streaming cost (game thread
+// >6 ms while moving, GPU/draw idle). It touches ONLY the POD MeshData arrays — no UObject, no
+// generator — so it's safe on the gen worker. The game thread then just uploads the finished
+// streams (CreateSectionGroup). Byte-identical geometry; the only thing that moved is WHERE it runs.
+static void BuildTileStreamSet(RealtimeMesh::FRealtimeMeshStreamSet& Streams, const FVoxelMeshData& MeshData)
+{
+    RealtimeMesh::TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2DHalf, 1> Builder(Streams);
+    Builder.EnableTangents();
+    Builder.EnableTexCoords();
+    Builder.EnableColors();        // masques matériau F6 (palette biome / pente / fondu) — voir le mesher
+    Builder.EnablePolyGroups();
+
+    const int32 NumVertices = MeshData.Vertices.Num();
+    Builder.ReserveAdditionalVertices(NumVertices);
+    for (int32 i = 0; i < NumVertices; i++)
+    {
+        auto Vertex = Builder.AddVertex((FVector3f)MeshData.Vertices[i]);
+        if (MeshData.Normals.IsValidIndex(i))
+        {
+            Vertex.SetNormalAndTangent((FVector3f)MeshData.Normals[i], FVector3f(1, 0, 0));
+        }
+        if (MeshData.UVs.IsValidIndex(i))
+        {
+            Vertex.SetTexCoord(0, (FVector2f)MeshData.UVs[i]);
+        }
+        if (MeshData.Colors.IsValidIndex(i))
+        {
+            Vertex.SetColor(MeshData.Colors[i]);
+        }
+    }
+
+    const int32 NumIndices = MeshData.Triangles.Num();
+    Builder.ReserveAdditionalTriangles(NumIndices / 3);
+    for (int32 i = 0; i < NumIndices; i += 3)
+    {
+        Builder.AddTriangle((uint32)MeshData.Triangles[i],
+                            (uint32)MeshData.Triangles[i + 1],
+                            (uint32)MeshData.Triangles[i + 2], 0 /*poly group*/);
+    }
+}
+
+//=============================================================================
 // LIVE EDIT — regenerate all chunks when params change in the Details panel
 //=============================================================================
 
@@ -465,13 +510,14 @@ void AVoxelWorld::ProcessPendingChunks()
         LoadedTiles.Add(DequeuedChunk.Tile);
 
         // Empty mesh = all-air tile — nothing to render, but still "loaded".
-        if (DequeuedChunk.MeshData.IsEmpty())
+        if (DequeuedChunk.bEmpty || !DequeuedChunk.Streams)
         {
             continue;
         }
 
-        // Apply mesh (GPU upload) — this is the expensive part we budget.
-        ApplyMeshToTile(DequeuedChunk.Tile, DequeuedChunk.MeshData);
+        // Apply mesh (GPU upload) — this is the budgeted part. The vertex/index buffers were
+        // already built on the worker (T1.f); the game thread only uploads them here.
+        ApplyMeshToTile(DequeuedChunk.Tile, MoveTemp(*DequeuedChunk.Streams), DequeuedChunk.bIsCeiling);
         MeshesApplied++;
 
         if (MeshesApplied >= MaxApplies)
@@ -781,14 +827,43 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
         FChunkResult Result;
         Result.Tile  = Tile;
         Result.Epoch = TaskEpoch;
+
+        FVoxelMeshData MeshData;
         {
             TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
-            Result.MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells);
+            MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells);
+        }
+
+        // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air
+        // tiles carry no streams (Result.bEmpty stays true) → no component on apply.
+        if (!MeshData.IsEmpty())
+        {
+            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
+            Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
+            BuildTileStreamSet(*Result.Streams, MeshData);
+            Result.bEmpty = false;
+
+            // Classify ceiling from the ACTUAL mesh normals (smoothed density gradient, solid→air):
+            // a ceiling surface faces DOWN (N.Z < 0), ground faces UP. This is the rendered geometry,
+            // so it can't disagree with the view — unlike the old game-thread height-oracle sample,
+            // which misclassified coarse far tiles (terrain material on the sky-cap underside). Vote
+            // down-vs-up over the verts; near-vertical wall normals (|N.Z| small) abstain. The game
+            // thread gates this to SurfaceWorld strates before it actually swaps material / shadow.
+            // STOPGAP (fable-idea F17): orientation only works while NO CAVES EXIST — down == sky-cap.
+            // A future cave roof is also down-facing; distinguishing it needs a generator-stamped surface
+            // class (CeilSurf vs carve-below-TerrainZ) carried as a polygroup → material slot. See F17.
+            int32 DownVerts = 0, UpVerts = 0;
+            for (const FVector& N : MeshData.Normals)
+            {
+                if (N.Z < -0.1f)      { ++DownVerts; }
+                else if (N.Z > 0.1f)  { ++UpVerts; }
+            }
+            Result.bIsCeiling = (DownVerts > UpVerts);
         }
 
         if (!bShuttingDown.load(std::memory_order_relaxed))
         {
-            ProcessQueue.Enqueue(Result);
+            ProcessQueue.Enqueue(MoveTemp(Result));   // move: don't copy the geometry payload
         }
     }, UE::Tasks::ETaskPriority::BackgroundNormal);
 }
@@ -806,29 +881,24 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
     PendingTiles.Remove(Tile);
 }
 
-void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, const FVoxelMeshData& MeshData)
+void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, bool bGeomCeiling)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ApplyMeshToChunk);
 
-    if (MeshData.IsEmpty())
-    {
-        // Became empty (e.g. fully carved) — drop any prior component for this tile.
-        if (URealtimeMeshComponent** C = TileComponents.Find(Tile))
-        {
-            if (*C) { (*C)->DestroyComponent(); }
-            TileComponents.Remove(Tile);
-        }
-        return;
-    }
-
+    // Streams are pre-built on the worker (T1.f) and guaranteed non-empty by the caller
+    // (ProcessPendingChunks skips empty tiles). This path is now game-thread-CHEAP: O(1) classify +
+    // material + component get/create + the upload. No per-vertex work here anymore.
     const bool bLevel0 = (Tile.Level == 0);
 
-    // SKY-CAP CEILING classification (computed once, used for BOTH shadow + material). A tile is a
-    // ceiling tile if its centre sits in the upper half of the open span between the ground surface and
-    // the cap (the tile grid keeps ceiling tiles separate from ground tiles — they're far apart in Z).
-    // The oracle is O(1) and returns false for non-surface strates, so this is cheap at every level.
+    // SKY-CAP CEILING classification (used for BOTH shadow + material). WHAT it is — down-facing geometry
+    // — is decided on the worker by voting the tile's ACTUAL mesh normals (bGeomCeiling); that's the
+    // rendered surface, so it can't disagree with the view the way the old centre height-oracle sample did
+    // (it misclassified coarse far tiles → terrain material on the sky-cap underside). WHETHER a tile may
+    // be a sky-cap ceiling at all is still gated to SurfaceWorld strates: one O(1) oracle probe at the tile
+    // centre (the oracle returns false for non-surface strates), so cave ceilings keep their prior material
+    // + shadow. The probed heights themselves are unused now — only the success/fail gate matters.
     bool bIsCeiling = false;
-    if (Generator)
+    if (Generator && bGeomCeiling)
     {
         const int32 VoxelsPerTile = CHUNK_SIZE << Tile.Level;
         const FIntVector MinVoxel = Tile.Coord * VoxelsPerTile;
@@ -838,11 +908,7 @@ void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, const FVoxelMeshDat
         const int32 CenterChunkZ = FMath::FloorToInt(CenterZ / (float)CHUNK_SIZE);
 
         float TerrainZ = 0.0f, CeilSurf = 0.0f;
-        if (Generator->GetSurfaceHeightAt(CenterX, CenterY, CenterChunkZ, TerrainZ, CeilSurf))
-        {
-            const float Mid = (TerrainZ + CeilSurf) * 0.5f;
-            bIsCeiling = (CenterZ > Mid);
-        }
+        bIsCeiling = Generator->GetSurfaceHeightAt(CenterX, CenterY, CenterChunkZ, TerrainZ, CeilSurf);
     }
 
     // Material: strate override (by the tile's min-corner chunk coord) else the global default. Ceiling
@@ -859,43 +925,8 @@ void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, const FVoxelMeshDat
         }
     }
 
-    // Build the geometry stream set. Vertices are world-space; the component sits at the actor origin.
-    RealtimeMesh::FRealtimeMeshStreamSet Streams;
-    {
-        RealtimeMesh::TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2DHalf, 1> Builder(Streams);
-        Builder.EnableTangents();
-        Builder.EnableTexCoords();
-        Builder.EnableColors();        // masques matériau F6 (palette biome / pente / fondu) — voir le mesher
-        Builder.EnablePolyGroups();
-
-        const int32 NumVertices = MeshData.Vertices.Num();
-        Builder.ReserveAdditionalVertices(NumVertices);
-        for (int32 i = 0; i < NumVertices; i++)
-        {
-            auto Vertex = Builder.AddVertex((FVector3f)MeshData.Vertices[i]);
-            if (MeshData.Normals.IsValidIndex(i))
-            {
-                Vertex.SetNormalAndTangent((FVector3f)MeshData.Normals[i], FVector3f(1, 0, 0));
-            }
-            if (MeshData.UVs.IsValidIndex(i))
-            {
-                Vertex.SetTexCoord(0, (FVector2f)MeshData.UVs[i]);
-            }
-            if (MeshData.Colors.IsValidIndex(i))
-            {
-                Vertex.SetColor(MeshData.Colors[i]);
-            }
-        }
-
-        const int32 NumIndices = MeshData.Triangles.Num();
-        Builder.ReserveAdditionalTriangles(NumIndices / 3);
-        for (int32 i = 0; i < NumIndices; i += 3)
-        {
-            Builder.AddTriangle((uint32)MeshData.Triangles[i],
-                                (uint32)MeshData.Triangles[i + 1],
-                                (uint32)MeshData.Triangles[i + 2], 0 /*poly group*/);
-        }
-    }
+    // The geometry stream set was built on the worker (BuildTileStreamSet, T1.f); we just upload it.
+    // Vertices are world-space; the component sits at the actor origin.
 
     // One component per tile — the clipmap keeps the total tile count low (~1-2k), so this is
     // cheap on the game thread (no batching needed). Collision + content are level-0 only.
@@ -953,6 +984,31 @@ int32 AVoxelWorld::GetStrateAtPosition(FVector WorldPosition) const
 
     // GetStrateIndex expects Unreal world units — it converts internally.
     return StrateManager->GetStrateIndex(WorldPosition.Z);
+}
+
+FVoxelBiomeQuery AVoxelWorld::GetBiomeAtWorldLocation(FVector WorldLocation) const
+{
+    FVoxelBiomeQuery Out;
+    if (!Generator) return Out;
+
+    // Bring the world point into actor-LOCAL voxel space — the SAME transform the decoration scatter
+    // applies (UpdateDecorations), so the probe agrees with where props actually land.
+    const FVector Local = GetActorTransform().InverseTransformPosition(WorldLocation);
+    const float VX = Local.X / VOXEL_SIZE;
+    const float VY = Local.Y / VOXEL_SIZE;
+    const int32 ChunkZ = FMath::FloorToInt((Local.Z / VOXEL_SIZE) / (float)CHUNK_SIZE);
+
+    Generator->QueryBiomeAt(VX, VY, ChunkZ, Out);
+
+    // Decoration streaming state of the region under this point — discriminates a render drop / empty
+    // march / stuck build / never-requested region for a visibly-bare patch (see FVoxelBiomeQuery).
+    if (ContentManager)
+    {
+        ContentManager->QueryDecoDebugAt(Local, Out.bDecoRegionApplied, Out.DecoAppliedInstances,
+                                         Out.bDecoRegionBuilding, Out.DecoCellsAccounted, Out.DecoCellsTotal,
+                                         Out.DecoLiveMarchSpawns, Out.DecoInstancesInCell);
+    }
+    return Out;
 }
 
 //=============================================================================
