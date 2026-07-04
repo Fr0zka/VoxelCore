@@ -29,6 +29,26 @@ constexpr int32 CHUNK_VOLUME       = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 32
 constexpr float VOXEL_SIZE = 25.0f;
 
 //=============================================================================
+// DENSITY → R8 QUANTIZATION (density clipmap / mini-sun shadows)
+//=============================================================================
+//
+// MC convention: NÉGATIF = solide, POSITIF = air, 0 = isosurface. On encode la densité
+// dans un R8 où SOLIDE = HAUT, AIR = BAS, iso ≈ 0.5 (128), clampé ±1 autour de la surface
+// (loin de la surface ⇒ sature plein solide / plein air). Le trilinear garde la traversée
+// iso sub-voxel nette.
+//
+// SHARED entre deux producteurs qui DOIVENT rester bit-identiques :
+//   1. UVoxelDensityVolume (fill worker re-évaluant GetDensityAt),
+//   2. UVoxelMarchingCubesMesher (capture-during-meshing : réutilise la grille déjà
+//      échantillonnée par le mesher au lieu de re-sampler — voir GenerateMesh OutCaptureGrid).
+// Même densité d'entrée ⇒ même octet. Ne PAS dupliquer cette formule ailleurs.
+FORCEINLINE uint8 VF_QuantizeDensity(float MCDensity)
+{
+    const float S = FMath::Clamp(0.5f - 0.5f * MCDensity, 0.0f, 1.0f);
+    return (uint8)FMath::RoundToInt(S * 255.0f);
+}
+
+//=============================================================================
 // FACE DIRECTIONS
 //=============================================================================
 //

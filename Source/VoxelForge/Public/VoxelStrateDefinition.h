@@ -323,6 +323,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Content")
     TArray<FStrateDecoration> Decorations;
 
+    // Landmarks: RARE, large, far-visible objects placed on a coarse hash lattice (the underground
+    // "mini-suns" etc.). Strate-wide; each entry has its own spacing/biome/placement/transform settings.
+    // Cheap at any radius — see FStrateLandmark / §8.5. (NOT part of the per-chunk decoration grid.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Content")
+    TArray<FStrateLandmark> Landmarks;
+
     // Ambient actors: things floating in cave space (fog volumes, particles, lights)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Content")
     TArray<FStrateAmbientActor> AmbientActors;

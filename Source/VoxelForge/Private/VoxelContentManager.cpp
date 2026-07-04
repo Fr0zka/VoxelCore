@@ -70,12 +70,23 @@ void UVoxelContentManager::NotifyShutdown()
         FPlatformProcess::Yield();
     }
 
+    DrainDecoResults();
+    ResetGridBuildState(NearGrid);
+    ResetGridBuildState(FarGrid);
+}
+
+void UVoxelContentManager::DrainDecoResults()
+{
     FDecoCellResult Discard;
     while (DecoResults.Dequeue(Discard)) {}
-    RegionBuilds.Reset();
-    CompletedRegions.Reset();
-    PendingLaunch.Reset();
-    InFlightCells.Reset();
+}
+
+void UVoxelContentManager::ResetGridBuildState(FDecoGrid& G)
+{
+    G.Builds.Reset();
+    G.Completed.Reset();
+    G.PendingLaunch.Reset();
+    G.InFlightCells.Reset();
 }
 
 //=============================================================================
@@ -175,12 +186,28 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
     // Strate biome field (XY-global → resolved once; the worker picks the dominant biome per COLUMN).
     CurrentCtx.BiomeCtx = StrateManager->GetBiomeContextForChunk(RepChunk);
 
-    // Build the decoration palette ONCE for this update. With biomes, concatenate every biome's deco list
-    // and tag each entry with its context-biome index; the worker resolves a column's biome and rolls only
-    // the entries it owns → borders follow the warped-Voronoi field, not the 8 m cell grid (Task 1, §8.5).
-    // Without biomes, fall back to the strate's single list tagged -1 (always matches → legacy behaviour).
-    CurrentEntries.Reset();
-    CurrentEntryBiome.Reset();
+    // Refresh each grid's (tier, radius, spacing) from settings for this update. Radius/spacing are read
+    // every frame so live edits to the data asset take effect; the grids themselves persist across updates.
+    NearGrid.Tier    = EDecoStreamTier::Near;
+    NearGrid.Radius  = FMath::Max(1, Settings->DecorationNearRadiusChunks);
+    NearGrid.Spacing = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
+    FarGrid.Tier     = EDecoStreamTier::Far;
+    FarGrid.Radius   = FMath::Max(1, Settings->DecorationRadiusChunks);
+    FarGrid.Spacing  = FMath::Clamp(Settings->DecorationFarSpacingVoxels, 1, CHUNK_SIZE);
+
+    // Build the decoration palette ONCE for this update, PARTITIONED by tier. With biomes, concatenate every
+    // biome's deco list and tag each entry with its context-biome index; the worker resolves a column's biome
+    // and rolls only the entries it owns → borders follow the warped-Voronoi field, not the 8 m cell grid
+    // (Task 1, §8.5). Without biomes, fall back to the strate's single list tagged -1 (always matches). Each
+    // entry routes to NearGrid/FarGrid by its StreamTier, so each grid marches only its own subset.
+    NearGrid.Entries.Reset();  NearGrid.EntryBiome.Reset();
+    FarGrid.Entries.Reset();   FarGrid.EntryBiome.Reset();
+    auto AddEntry = [&](const FStrateDecoration& D, int32 ci)
+    {
+        FDecoGrid& G = (D.StreamTier == EDecoStreamTier::Near) ? NearGrid : FarGrid;
+        G.Entries.Add(D);
+        G.EntryBiome.Add(ci);
+    };
     if (CurrentCtx.Def)
     {
         if (CurrentCtx.BiomeCtx.IsValid())
@@ -194,20 +221,12 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
                 // index so it only fires inside that biome's columns — no cross-biome bleed).
                 const TArray<FStrateDecoration>& Src =
                     (Bio && Bio->Decorations.Num() > 0) ? Bio->Decorations : CurrentCtx.Def->Decorations;
-                for (const FStrateDecoration& D : Src)
-                {
-                    CurrentEntries.Add(D);
-                    CurrentEntryBiome.Add(ci);
-                }
+                for (const FStrateDecoration& D : Src) { AddEntry(D, ci); }
             }
         }
         else
         {
-            for (const FStrateDecoration& D : CurrentCtx.Def->Decorations)
-            {
-                CurrentEntries.Add(D);
-                CurrentEntryBiome.Add(-1);   // no biome field → matches the column's ColBiome (-1)
-            }
+            for (const FStrateDecoration& D : CurrentCtx.Def->Decorations) { AddEntry(D, -1); }   // -1 → matches ColBiome -1
         }
     }
 
@@ -221,22 +240,26 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
 
     if (PlayerCell != LastDecoCell)
     {
-        RebuildDesiredCells(PlayerCell);
+        RebuildDesiredCells(NearGrid, PlayerCell);
+        RebuildDesiredCells(FarGrid,  PlayerCell);
         LastDecoCell = PlayerCell;
     }
 
-    const int32 FarR = FMath::Max(1, Settings->DecorationRadiusChunks);
-    LaunchDecoTasks(PlayerCell);
-    ProcessDecoResults(PlayerCell, FarR);
+    // Both grids share ONE concurrency budget; throttle each against the other's current in-flight count.
+    const int32 MaxConc = Settings->MaxConcurrentDecorationTasks;
+    LaunchDecoTasks(NearGrid, PlayerCell, FarGrid.InFlightCells.Num(),  MaxConc);
+    LaunchDecoTasks(FarGrid,  PlayerCell, NearGrid.InFlightCells.Num(), MaxConc);
+    ProcessDecoResults(PlayerCell);
 }
 
-void UVoxelContentManager::RebuildDesiredCells(const FIntPoint& PlayerCell)
+void UVoxelContentManager::RebuildDesiredCells(FDecoGrid& G, const FIntPoint& PlayerCell)
 {
-    // REGION-granular streaming. Decoration cells are grouped into RxR regions; a region is the load/
-    // unload unit and shares ONE HISM per mesh, so the render thread walks ~R^2 fewer components. A
+    // REGION-granular streaming, per grid. Decoration cells are grouped into RxR regions; a region is the
+    // load/unload unit and shares ONE HISM per mesh, so the render thread walks ~R^2 fewer components. A
     // region, once desired, marches ALL of its cells (so it is self-contained and NEVER re-streamed in
-    // place while it stays in range — same no-flicker guarantee the per-cell grid had, now per region).
-    const int32 FarR = FMath::Max(1, Settings->DecorationRadiusChunks);
+    // place while it stays in range — same no-flicker guarantee the per-cell grid had, now per region). The
+    // radius is G.Radius (this grid's tier), so Near and Far stream to different distances independently.
+    const int32 FarR = G.Radius;
     const int32 R    = RegionSize();
 
     // Desired regions = every region whose footprint touches the radius-FarR cell box around the player.
@@ -255,10 +278,10 @@ void UVoxelContentManager::RebuildDesiredCells(const FIntPoint& PlayerCell)
 
     // Unload loaded regions no longer desired (plain DestroyComponent — no per-instance removal).
     {
-        TArray<FIntPoint> Loaded; DecoRegions.GetKeys(Loaded);
+        TArray<FIntPoint> Loaded; G.Regions.GetKeys(Loaded);
         for (const FIntPoint& K : Loaded)
         {
-            if (!DesiredRegions.Contains(K)) ClearDecorationRegion(K);
+            if (!DesiredRegions.Contains(K)) ClearDecorationRegion(G, K);
         }
     }
 
@@ -268,39 +291,38 @@ void UVoxelContentManager::RebuildDesiredCells(const FIntPoint& PlayerCell)
     // enqueues all RxR of its cells once — a building region is never re-queued (no duplicate launches).
     for (const FIntPoint& Region : DesiredRegions)
     {
-        if (DecoRegions.Contains(Region)) continue;     // already applied → leave it (no re-stream)
-        if (RegionBuilds.Contains(Region)) continue;    // already marching its cells
+        if (G.Regions.Contains(Region)) continue;     // already applied → leave it (no re-stream)
+        if (G.Builds.Contains(Region)) continue;      // already marching its cells
 
-        FDecoRegionBuild& Build = RegionBuilds.Add(Region);
-        Build.BuildId        = NextBuildId++;
+        FDecoRegionBuild& Build = G.Builds.Add(Region);
+        Build.BuildId        = G.NextBuildId++;
         Build.CellsRemaining = R * R;
 
         const int32 BaseX = Region.X * R, BaseY = Region.Y * R;
         for (int32 cy = 0; cy < R; ++cy)
         for (int32 cx = 0; cx < R; ++cx)
         {
-            PendingLaunch.Add(FIntPoint(BaseX + cx, BaseY + cy));
+            G.PendingLaunch.Add(FIntPoint(BaseX + cx, BaseY + cy));
         }
     }
 
     // Nearest-first so the region under the player fills in before the fringe. Stale entries (cells whose
     // build was already discarded) are cheaply skipped at launch, so PendingLaunch self-cleans as it drains.
-    PendingLaunch.Sort([PlayerCell](const FIntPoint& A, const FIntPoint& B)
+    G.PendingLaunch.Sort([PlayerCell](const FIntPoint& A, const FIntPoint& B)
     {
         return CellChebyshev(A, PlayerCell) < CellChebyshev(B, PlayerCell);
     });
 }
 
-void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
+void UVoxelContentManager::LaunchDecoTasks(FDecoGrid& G, const FIntPoint& PlayerCell, int32 OtherInFlight, int32 MaxConc)
 {
     if (!CurrentCtx.Def || !Generator) return;
-    const int32 MaxConc = Settings->MaxConcurrentDecorationTasks;
     if (MaxConc <= 0)
     {
-        // Decorations disabled at runtime — drop all queued/pending build state so nothing is stranded.
-        PendingLaunch.Reset();
-        RegionBuilds.Reset();
-        CompletedRegions.Reset();
+        // Decorations disabled at runtime — drop THIS grid's queued/pending build state so nothing is stranded.
+        G.PendingLaunch.Reset();
+        G.Builds.Reset();
+        G.Completed.Reset();
         return;
     }
 
@@ -309,46 +331,54 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
     const FTransform OwnerXf = OwnerActor->GetActorTransform();
 
     const int32 R         = RegionSize();
-    const int32 Spacing   = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
+    const int32 Spacing   = G.Spacing;   // fine (Near) or coarse (Far) — the per-grid column grid
     const float Step      = (float)FMath::Max(1, Settings->DecorationMarchStepVoxels);
     const int32 MaxCross  = FMath::Max(1, Settings->DecorationMaxCrossingsPerColumn);
     const float ColDepth  = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);
+    const EDecoStreamTier GridTier = G.Tier;   // stamped on each result so it routes back to this grid
 
-    while (PendingLaunch.Num() > 0 && InFlightCells.Num() < MaxConc)
+    // Throttle against the COMBINED in-flight count (this grid + the other) so both grids share MaxConc.
+    // Drain from the head by INDEX — RemoveAt(0) per pop shifted the whole array every time (O(N) each,
+    // quadratic on a long queue); now it's one compaction at the end. A cell still in flight from a
+    // PREVIOUS build (its build was dropped while the task was airborne — e.g. the MaxConc==0 reset path)
+    // is DEFERRED instead of dropped: dropping it would leave the NEW build waiting forever for a cell
+    // that never reports (a permanently blank, never-reapplied region).
+    int32 Head = 0;
+    TArray<FIntPoint> Deferred;
+    while (Head < G.PendingLaunch.Num() && (G.InFlightCells.Num() + OtherInFlight) < MaxConc)
     {
-        const FIntPoint Cell = PendingLaunch[0];
-        PendingLaunch.RemoveAt(0);
+        const FIntPoint Cell = G.PendingLaunch[Head++];
 
-        if (InFlightCells.Contains(Cell)) continue;
+        if (G.InFlightCells.Contains(Cell)) { Deferred.Add(Cell); continue; }
 
         // The cell's region build drives completion. If it's gone (region applied or discarded since this
         // cell was queued), drop the cell — no range check here: a region intentionally marches all its
         // cells (some sit just past FarR), and discarding the build is the only "no longer wanted" signal.
         const FIntPoint Region = CellToRegion(Cell, R);
-        FDecoRegionBuild* Build = RegionBuilds.Find(Region);
+        FDecoRegionBuild* Build = G.Builds.Find(Region);
         if (!Build) continue;
         const uint32 BuildId = Build->BuildId;
 
-        // The decoration palette (all biomes' lists, flattened + tagged) is built ONCE per update in
+        // This grid's palette (its tier's entries, flattened + biome-tagged) is built ONCE per update in
         // UpdateDecorations; the per-COLUMN biome pick happens on the worker. Snapshot the flat list +
         // tags for this cell's task (the biome context rides in Ctx).
-        if (CurrentEntries.Num() == 0)
+        if (G.Entries.Num() == 0)
         {
-            MarkCellDone(Region, Cell, BuildId);   // empty cell still counts toward the region's completion
+            MarkCellDone(G, Region, Cell, BuildId);   // empty cell still counts toward the region's completion
             continue;
         }
 
-        TArray<FStrateDecoration> EntriesCopy   = CurrentEntries;     // snapshot for the worker + the spawner
-        TArray<int32>             EntryBiomeCopy = CurrentEntryBiome;  // parallel: ctx-biome owner per entry
+        TArray<FStrateDecoration> EntriesCopy   = G.Entries;     // snapshot for the worker + the spawner
+        TArray<int32>             EntryBiomeCopy = G.EntryBiome;  // parallel: ctx-biome owner per entry
         const FDecoContext Ctx = CurrentCtx;                // PODs only used on the worker
         const uint32 LocalSeed = (uint32)Seed;
         UVoxelGenerator* Gen = Generator;
 
-        InFlightCells.Add(Cell);
+        G.InFlightCells.Add(Cell);
         GActiveDecoTasks.fetch_add(1, std::memory_order_relaxed);
 
         UE::Tasks::Launch(TEXT("DecoMarch"),
-            [this, Gen, OwnerXf, Cell, Ctx, LocalSeed, Spacing, Step, MaxCross, ColDepth, BuildId,
+            [this, Gen, OwnerXf, Cell, Ctx, LocalSeed, Spacing, Step, MaxCross, ColDepth, BuildId, GridTier,
              Entries = MoveTemp(EntriesCopy), EntryBiome = MoveTemp(EntryBiomeCopy)]() mutable
             {
                 struct FGuard { ~FGuard() { GActiveDecoTasks.fetch_sub(1, std::memory_order_relaxed); } } Guard;
@@ -358,6 +388,7 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
                 FDecoCellResult Result;
                 Result.Cell    = Cell;
                 Result.BuildId = BuildId;
+                Result.Grid    = GridTier;
                 Result.Entries = MoveTemp(Entries);
                 BuildCellSpawns(Gen, OwnerXf, Cell, Ctx, Result.Entries, EntryBiome, LocalSeed,
                                 Spacing, Step, MaxCross, ColDepth, Result.Spawns);
@@ -368,6 +399,9 @@ void UVoxelContentManager::LaunchDecoTasks(const FIntPoint& PlayerCell)
                 }
             }, UE::Tasks::ETaskPriority::BackgroundNormal);
     }
+
+    if (Head > 0) { G.PendingLaunch.RemoveAt(0, Head); }
+    G.PendingLaunch.Append(Deferred);   // retry next update, once the old task frees the cell
 }
 
 // ---- WORKER THREAD: find each column's surface points → spawn commands. ----
@@ -386,6 +420,20 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
 
     TArray<int32> EntryCount; EntryCount.Init(0, Entries.Num());
     int32 TotalActors = 0;
+
+    // Per-entry slope-gate cosines, hoisted out of PlaceAtCrossing (they were recomputed per crossing
+    // × entry). Same cos of the same angle → bit-identical gating. Sentinel < 0 = gate disabled
+    // (default angles), so the common case still costs no trig and never rejects.
+    TArray<float> CosMaxSlope, CosMinSlope;
+    CosMaxSlope.SetNumUninitialized(Entries.Num());
+    CosMinSlope.SetNumUninitialized(Entries.Num());
+    for (int32 e = 0; e < Entries.Num(); ++e)
+    {
+        CosMaxSlope[e] = (Entries[e].MaxSlopeAngle < 89.99f)
+            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].MaxSlopeAngle)) : -1.0f;
+        CosMinSlope[e] = (Entries[e].MinSlopeAngle > 0.01f)
+            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].MinSlopeAngle)) : -1.0f;
+    }
 
     // Per-COLUMN biome cache: ResolveBiomeSampleAt's noise-heavy cell classification is box-validated
     // (one rebuild per chunk footprint), so resolving the dominant biome at every column in this cell is
@@ -438,22 +486,11 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             // wall decals. Applies whenever the point IS a wall (independent of Floor/Wall/Any setting).
             if (bWall && Deco.bWallExcludeOverhangs && NormalWorld.Z < 0.0f) continue;
 
-            // Surface-tilt gate: tilt = acos(|N.Z|) (0 = flat, 90 = vertical). Skip surfaces steeper than
-            // MaxSlopeAngle. cos is monotone-decreasing, so |N.Z| < cos(MaxSlope) ⇔ tilt > MaxSlope.
-            // Guarded so the default (90°, cos = 0) costs no trig and never rejects anything.
-            if (Deco.MaxSlopeAngle < 89.99f &&
-                FMath::Abs(NormalWorld.Z) < FMath::Cos(FMath::DegreesToRadians(Deco.MaxSlopeAngle)))
-            {
-                continue;
-            }
-
-            // Lower-bound tilt gate (companion to the above): skip surfaces FLATTER than MinSlopeAngle.
-            // tilt < MinSlope ⇔ |N.Z| > cos(MinSlope). Guarded so the default (0°, cos = 1) never rejects.
-            if (Deco.MinSlopeAngle > 0.01f &&
-                FMath::Abs(NormalWorld.Z) > FMath::Cos(FMath::DegreesToRadians(Deco.MinSlopeAngle)))
-            {
-                continue;
-            }
+            // Surface-tilt gates: tilt = acos(|N.Z|) (0 = flat, 90 = vertical). |N.Z| < cos(MaxSlope) ⇔
+            // tilt > MaxSlope (skip steeper); |N.Z| > cos(MinSlope) ⇔ tilt < MinSlope (skip flatter).
+            // Cosines are precomputed per entry above; < 0 = gate disabled (default angles).
+            if (CosMaxSlope[EntryIdx] >= 0.0f && FMath::Abs(NormalWorld.Z) < CosMaxSlope[EntryIdx]) continue;
+            if (CosMinSlope[EntryIdx] >= 0.0f && FMath::Abs(NormalWorld.Z) > CosMinSlope[EntryIdx]) continue;
 
             const uint32 H = DecoHash(Cell.X, Cell.Y, gx, gy, CrossingIdx, EntryIdx, InSeed, 0xDEC0u);
             if (VoxelHash::ToFloat01(H) > Deco.SpawnDensity) continue;
@@ -601,49 +638,56 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
 }
 
 // ---- GAME THREAD: drain finished marches → merge into region builds, apply completed regions budgeted. ----
-void UVoxelContentManager::ProcessDecoResults(const FIntPoint& PlayerCell, int32 FarR)
+void UVoxelContentManager::ProcessDecoResults(const FIntPoint& PlayerCell)
 {
-    // Drain every finished cell march and fold it into its region build. Merging is cheap (transform
-    // appends) so it isn't budgeted; the expensive HISM build is budgeted below at region granularity.
+    // Drain every finished cell march and route it to its grid by Result.Grid, folding it into that grid's
+    // region build. Merging is cheap (transform appends) so it isn't budgeted; the expensive HISM build is
+    // budgeted below at region granularity.
     FDecoCellResult R;
     while (DecoResults.Dequeue(R))
     {
-        InFlightCells.Remove(R.Cell);   // free the concurrency slot regardless of whether it still matters
-        MergeCellResult(R);
+        FDecoGrid& G = (R.Grid == EDecoStreamTier::Near) ? NearGrid : FarGrid;
+        G.InFlightCells.Remove(R.Cell);   // free the concurrency slot regardless of whether it still matters
+        MergeCellResult(G, R);
     }
 
-    // Apply completed regions (one batched HISM-per-mesh build), budgeted. A region whose build finished
-    // but is no longer desired (player moved on while it marched) is discarded instead of applied — that
-    // keeps an out-of-range region from flashing in for a frame before the next unload pass.
+    // Apply completed regions across BOTH grids under ONE shared frame budget (one batched HISM-per-mesh
+    // build per region). A region whose build finished but is no longer desired (player moved on while it
+    // marched) is discarded instead of applied — keeps an out-of-range region from flashing in for a frame.
     const int32 R_ = RegionSize();
     const int32 Budget = FMath::Max(1, Settings->MaxDecorationCellsPerFrame);
     int32 Applied = 0;
-    while (CompletedRegions.Num() > 0 && Applied < Budget)
+    for (FDecoGrid* GP : { &NearGrid, &FarGrid })
     {
-        const FIntPoint Region = CompletedRegions[0];
-        CompletedRegions.RemoveAt(0);
-
-        FDecoRegionBuild* Build = RegionBuilds.Find(Region);
-        if (!Build) continue;   // already cleared
-
-        if (!IsRegionDesired(Region, PlayerCell, FarR, R_))
+        FDecoGrid& G = *GP;
+        while (G.Completed.Num() > 0 && Applied < Budget)
         {
-            RegionBuilds.Remove(Region);   // wandered out of range while building → drop it unbuilt
-            continue;
-        }
+            const FIntPoint Region = G.Completed[0];
+            G.Completed.RemoveAt(0);
 
-        ApplyRegion(Region, *Build);
-        RegionBuilds.Remove(Region);
-        ++Applied;
+            FDecoRegionBuild* Build = G.Builds.Find(Region);
+            if (!Build) continue;   // already cleared
+
+            if (!IsRegionDesired(Region, PlayerCell, G.Radius, R_))
+            {
+                G.Builds.Remove(Region);   // wandered out of range while building → drop it unbuilt
+                continue;
+            }
+
+            ApplyRegion(G, Region, *Build);
+            G.Builds.Remove(Region);
+            ++Applied;
+        }
+        if (Applied >= Budget) break;
     }
 }
 
 // Fold one finished cell's spawns into its region build, then mark the cell accounted for. A result whose
 // region build is gone or whose BuildId no longer matches (region was cleared + re-marched) is discarded.
-void UVoxelContentManager::MergeCellResult(const FDecoCellResult& Result)
+void UVoxelContentManager::MergeCellResult(FDecoGrid& G, const FDecoCellResult& Result)
 {
     const FIntPoint Region = CellToRegion(Result.Cell, RegionSize());
-    FDecoRegionBuild* Build = RegionBuilds.Find(Region);
+    FDecoRegionBuild* Build = G.Builds.Find(Region);
     if (!Build || Build->BuildId != Result.BuildId)
     {
         return;
@@ -677,15 +721,15 @@ void UVoxelContentManager::MergeCellResult(const FDecoCellResult& Result)
         }
     }
 
-    MarkCellDone(Region, Result.Cell, Result.BuildId);
+    MarkCellDone(G, Region, Result.Cell, Result.BuildId);
 }
 
 // Account one cell against its region — IDEMPOTENT per cell, so a duplicate task for the same cell can't
 // double-decrement and apply the region early (which left a permanently-empty chunk until a regen). Queues
 // the region for apply once every distinct cell has reported.
-void UVoxelContentManager::MarkCellDone(const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId)
+void UVoxelContentManager::MarkCellDone(FDecoGrid& G, const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId)
 {
-    FDecoRegionBuild* Build = RegionBuilds.Find(Region);
+    FDecoRegionBuild* Build = G.Builds.Find(Region);
     if (!Build || Build->BuildId != BuildId) return;
 
     bool bAlreadyAccounted = false;
@@ -694,13 +738,13 @@ void UVoxelContentManager::MarkCellDone(const FIntPoint& Region, const FIntPoint
 
     if (--Build->CellsRemaining <= 0)
     {
-        CompletedRegions.Add(Region);   // ready for budgeted apply in ProcessDecoResults
+        G.Completed.Add(Region);   // ready for budgeted apply in ProcessDecoResults
     }
 }
 
 // Build the region's components: one HISM per mesh (all cells merged → one batched AddInstances), actors
-// spawned inline. Moves the region into DecoRegions; the build is removed by the caller.
-void UVoxelContentManager::ApplyRegion(const FIntPoint& Region, FDecoRegionBuild& Build)
+// spawned inline. Moves the region into G.Regions; the build is removed by the caller.
+void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FDecoRegionBuild& Build)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_DecoApply);   // total game-thread cost to apply one region
 
@@ -709,7 +753,7 @@ void UVoxelContentManager::ApplyRegion(const FIntPoint& Region, FDecoRegionBuild
     UWorld* World = OwnerActor->GetWorld();
     if (!World) return;
 
-    FDecoRegionContent& Content = DecoRegions.Add(Region);
+    FDecoRegionContent& Content = G.Regions.Add(Region);
 
     // Non-instanced actors — spawn each (no batch path). Decorations live only in the player's strate
     // (the march is strate-bounded), so their lights are always legitimately visible — no extra culling.
@@ -773,9 +817,9 @@ void UVoxelContentManager::ApplyRegion(const FIntPoint& Region, FDecoRegionBuild
     }
 }
 
-void UVoxelContentManager::ClearDecorationRegion(const FIntPoint& Region)
+void UVoxelContentManager::ClearDecorationRegion(FDecoGrid& G, const FIntPoint& Region)
 {
-    FDecoRegionContent* Content = DecoRegions.Find(Region);
+    FDecoRegionContent* Content = G.Regions.Find(Region);
     if (!Content) return;
 
     for (const TWeakObjectPtr<AActor>& A : Content->Actors)
@@ -786,22 +830,338 @@ void UVoxelContentManager::ClearDecorationRegion(const FIntPoint& Region)
     {
         if (UHierarchicalInstancedStaticMeshComponent* Comp = C.Get()) { Comp->DestroyComponent(); }
     }
-    DecoRegions.Remove(Region);
+    G.Regions.Remove(Region);
 }
 
 void UVoxelContentManager::ClearAllDecorations()
 {
-    TArray<FIntPoint> Keys; DecoRegions.GetKeys(Keys);
-    for (const FIntPoint& K : Keys) ClearDecorationRegion(K);
-
-    RegionBuilds.Reset();      // abandon any in-progress builds
-    CompletedRegions.Reset();
-    PendingLaunch.Reset();
-    InFlightCells.Reset();
+    for (FDecoGrid* GP : { &NearGrid, &FarGrid })
+    {
+        FDecoGrid& G = *GP;
+        TArray<FIntPoint> Keys; G.Regions.GetKeys(Keys);
+        for (const FIntPoint& K : Keys) ClearDecorationRegion(G, K);
+        ResetGridBuildState(G);   // abandon any in-progress builds
+    }
     // Drain any results already enqueued by in-flight tasks. No epoch bump needed: their BuildIds are now
-    // gone from RegionBuilds, so any straggler result is discarded on merge; new builds get fresh BuildIds.
-    FDecoCellResult Discard;
-    while (DecoResults.Dequeue(Discard)) {}
+    // gone from the grids' Builds, so any straggler result is discarded on merge; new builds get fresh BuildIds.
+    DrainDecoResults();
+}
+
+//=============================================================================
+// LANDMARKS — rare large objects on a coarse hash lattice (the "mini-suns")
+//=============================================================================
+// Cost scales with the NUMBER of landmarks in range, not the area: cell = SpacingChunks chunks, so a huge
+// StreamRadiusChunks is only ~(radius/spacing)² candidates. Placement is synchronous (so few candidates it
+// never hitches) and deterministic (hash of cell+entry+seed → pop-free). Strate-bounded like decorations.
+
+// Single-column surface find for a landmark. SurfaceWorld → height oracle (floor TerrainZ / ceiling CeilSurf
+// by Surf); else ray-march the strate band top-down for the first crossing whose orientation matches Surf.
+bool UVoxelContentManager::FindLandmarkColumn(const UVoxelGenerator* Gen, const FTransform& OwnerXf,
+                                              const FDecoContext& Ctx, float VX, float VY, ESurfaceType Surf,
+                                              float Step, float ColDepth, float& OutZ, FVector& OutNormal)
+{
+    if (!Gen) return false;
+
+    if (Ctx.bSurfaceWorld)
+    {
+        float hC, cC;
+        if (!Gen->GetSurfaceHeightAt(VX, VY, Ctx.RepChunkZ, hC, cC)) return false;
+
+        if (Surf == ESurfaceType::Ceiling)
+        {
+            if (!(cC > hC + 1.0f && cC <= Ctx.TopVoxelZ)) return false;
+            float d, cXp, cXm, cYp, cYm;
+            Gen->GetSurfaceHeightAt(VX + 1.0f, VY, Ctx.RepChunkZ, d, cXp);
+            Gen->GetSurfaceHeightAt(VX - 1.0f, VY, Ctx.RepChunkZ, d, cXm);
+            Gen->GetSurfaceHeightAt(VX, VY + 1.0f, Ctx.RepChunkZ, d, cYp);
+            Gen->GetSurfaceHeightAt(VX, VY - 1.0f, Ctx.RepChunkZ, d, cYm);
+            FVector N = OwnerXf.TransformVectorNoScale(
+                FVector((cXp - cXm) * 0.5f, (cYp - cYm) * 0.5f, -1.0f)).GetSafeNormal();
+            if (N.IsNearlyZero()) N = FVector::DownVector;
+            OutZ = cC; OutNormal = N; return true;
+        }
+        // Floor / Wall / Any → the terrain top.
+        if (!(hC >= Ctx.BottomVoxelZ && hC <= Ctx.TopVoxelZ)) return false;
+        if (Gen->GetDensityAt(VX, VY, hC) > 0.5f) return false;   // carved away (passage/spine/diff)
+        float d, hXp, hXm, hYp, hYm;
+        Gen->GetSurfaceHeightAt(VX + 1.0f, VY, Ctx.RepChunkZ, hXp, d);
+        Gen->GetSurfaceHeightAt(VX - 1.0f, VY, Ctx.RepChunkZ, hXm, d);
+        Gen->GetSurfaceHeightAt(VX, VY + 1.0f, Ctx.RepChunkZ, hYp, d);
+        Gen->GetSurfaceHeightAt(VX, VY - 1.0f, Ctx.RepChunkZ, hYm, d);
+        FVector N = OwnerXf.TransformVectorNoScale(
+            FVector(-(hXp - hXm) * 0.5f, -(hYp - hYm) * 0.5f, 1.0f)).GetSafeNormal();
+        if (N.IsNearlyZero()) N = FVector::UpVector;
+        OutZ = hC; OutNormal = N; return true;
+    }
+
+    // Cave/shaft/island archetypes: march the column from the top for the first matching crossing.
+    // Bounded by ColDepth like the decoration march (this runs SYNCHRONOUSLY on the game thread):
+    // once past open air, a solid run longer than ColDepth means bedrock down to the strate floor —
+    // stop instead of paying GetDensityAt across the whole remaining band.
+    float PrevD = Gen->GetDensityAt(VX, VY, Ctx.TopVoxelZ);
+    bool  bSeenAir = (PrevD >= 0.0f);
+    float SolidRun = 0.0f;
+    for (float Z = Ctx.TopVoxelZ - Step; Z >= Ctx.BottomVoxelZ; Z -= Step)
+    {
+        const float Dz = Gen->GetDensityAt(VX, VY, Z);
+        if ((PrevD >= 0.0f) != (Dz >= 0.0f))   // air ↔ solid crossing
+        {
+            float ZLo = Z, ZHi = Z + Step, DHi = PrevD, DLo = Dz;
+            for (int32 It = 0; It < 4; ++It)
+            {
+                const float ZM = 0.5f * (ZLo + ZHi);
+                const float DM = Gen->GetDensityAt(VX, VY, ZM);
+                if ((DM >= 0.0f) == (DHi >= 0.0f)) { ZHi = ZM; DHi = DM; }
+                else                               { ZLo = ZM; DLo = DM; }
+            }
+            const float Denom = (DLo - DHi);
+            const float T = (FMath::Abs(Denom) > KINDA_SMALL_NUMBER) ? (DLo / Denom) : 0.5f;
+            const float ZC = ZLo + (ZHi - ZLo) * T;
+
+            const FVector LocalGrad(
+                Gen->GetDensityAt(VX + 1.0f, VY, ZC) - Gen->GetDensityAt(VX - 1.0f, VY, ZC),
+                Gen->GetDensityAt(VX, VY + 1.0f, ZC) - Gen->GetDensityAt(VX, VY - 1.0f, ZC),
+                Gen->GetDensityAt(VX, VY, ZC + 1.0f) - Gen->GetDensityAt(VX, VY, ZC - 1.0f));
+            FVector N = OwnerXf.TransformVectorNoScale(LocalGrad).GetSafeNormal();
+            if (N.IsNearlyZero()) N = FVector::UpVector;
+
+            const bool bFloor   = N.Z >  0.5f;
+            const bool bCeiling = N.Z < -0.5f;
+            const bool bWall    = !bFloor && !bCeiling;
+            const bool bMatch =
+                (Surf == ESurfaceType::Floor   && bFloor)   ||
+                (Surf == ESurfaceType::Ceiling && bCeiling) ||
+                (Surf == ESurfaceType::Wall    && bWall)    ||
+                (Surf == ESurfaceType::Any);
+            if (bMatch) { OutZ = ZC; OutNormal = N; return true; }
+        }
+
+        if (Dz >= 0.0f) { bSeenAir = true; SolidRun = 0.0f; }
+        else            { SolidRun += Step; }
+        if (bSeenAir && SolidRun > ColDepth) break;   // long bedrock below open space → nothing deeper
+
+        PrevD = Dz;
+    }
+    return false;
+}
+
+void UVoxelContentManager::SpawnLandmarkInstance(const FStrateLandmark& L, uint32 H, const FDecoContext& Ctx,
+                                                 const FTransform& OwnerXf, AActor* OwnerActor,
+                                                 float LocalX, float LocalY, float Step, float ColDepth,
+                                                 FLandmarkInstance& Out)
+{
+    if (!Generator) return;
+    const float VX = LocalX / VOXEL_SIZE;
+    const float VY = LocalY / VOXEL_SIZE;
+
+    // Biome filter (resolved at the candidate XY, same field the density/deco paths use).
+    if (L.RequiredBiome)
+    {
+        const UVoxelBiomeDefinition* Bio = Generator->GetDominantBiomeAt(VX, VY, Ctx.RepChunkZ);
+        if (Bio != L.RequiredBiome) return;   // leaves Out empty → evaluated, nothing placed
+    }
+
+    float ZC; FVector N;
+    if (!FindLandmarkColumn(Generator, OwnerXf, Ctx, VX, VY, L.SurfacePlacement, Step, ColDepth, ZC, N))
+        return;
+
+    // Surface-tilt gates (acos(|N.Z|); guarded so defaults cost no trig).
+    if (L.MaxSlopeAngle < 89.99f &&
+        FMath::Abs(N.Z) < FMath::Cos(FMath::DegreesToRadians(L.MaxSlopeAngle))) return;
+    if (L.MinSlopeAngle > 0.01f &&
+        FMath::Abs(N.Z) > FMath::Cos(FMath::DegreesToRadians(L.MinSlopeAngle))) return;
+
+    const FVector LocalPos(LocalX, LocalY, ZC * VOXEL_SIZE);
+    if (L.bRequireWaterRelative && Ctx.bHasWater)
+    {
+        const bool bBelowWater = (LocalPos.Z < Ctx.WaterLocalZ);
+        if (bBelowWater != L.bPlaceBelowWater) return;
+    }
+
+    // Rotation: optional surface-align → fixed offset → per-axis hash random.
+    FQuat Q = L.bAlignToSurface ? FRotationMatrix::MakeFromZ(N).ToQuat() : FQuat::Identity;
+    Q = Q * L.RotationOffset.Quaternion();
+    if (!L.RandomRotation.IsNearlyZero())
+    {
+        const float rp = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x1111A1u)) - 0.5f) * L.RandomRotation.Pitch;
+        const float ry = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x2222B2u)) - 0.5f) * L.RandomRotation.Yaw;
+        const float rr = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x3333C3u)) - 0.5f) * L.RandomRotation.Roll;
+        Q = Q * FRotator(rp, ry, rr).Quaternion();
+    }
+
+    const float ScaleT = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x5CA1E777u));
+    const float Scale  = FMath::Lerp(L.MinScale, L.MaxScale, ScaleT);
+
+    // World-space position + XYZ offset (e.g. +Z lifts a sun off the sky-cap into the cavern).
+    const FVector WorldPos = OwnerXf.TransformPosition(LocalPos) + L.LocationOffset;
+    const FTransform Xf(Q, WorldPos, FVector(Scale));
+
+    // Mini-sun light orb: record world-space data for the terrain material's raymarched shadows. Distances
+    // convert voxels→cm (×VOXEL_SIZE); the emitter radius scales with the instance scale too.
+    if (L.bIsLightOrb)
+    {
+        Out.bIsOrb = true;
+        Out.Orb.WorldPos = WorldPos;
+        Out.Orb.Color = L.OrbColor;
+        Out.Orb.Intensity = L.OrbIntensity;
+        Out.Orb.RadiusWorld = L.OrbRadiusVoxels * VOXEL_SIZE * Scale;
+        Out.Orb.FalloffWorld = L.OrbFalloffVoxels * VOXEL_SIZE;
+        Out.Orb.MaxShadowDistWorld = L.OrbMaxShadowDistanceVoxels * VOXEL_SIZE;
+    }
+
+    if (L.ActorClass)
+    {
+        UWorld* World = OwnerActor->GetWorld();
+        if (!World) return;
+        FActorSpawnParameters SP;
+        SP.Owner = OwnerActor;
+        SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        if (AActor* A = World->SpawnActor<AActor>(L.ActorClass, Xf, SP)) { Out.Actor = A; }
+        return;
+    }
+    if (L.InstancedMesh)
+    {
+        UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(OwnerActor);
+        C->SetStaticMesh(L.InstancedMesh);
+        C->SetMobility(EComponentMobility::Static);   // placed once, never moves → cached draw + VSM shadow
+        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        C->SetCastShadow(L.bCastShadow);
+        if (L.CullDistance > 0.0f) { C->SetCullDistance(L.CullDistance); }   // 0 = never cull (far sun)
+        C->SetWorldTransform(Xf);
+        C->RegisterComponent();
+        C->AttachToComponent(OwnerActor->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform);
+        Out.Component = C;
+    }
+}
+
+void UVoxelContentManager::GetActiveOrbs(TArray<FVoxelActiveOrb>& OutOrbs) const
+{
+    OutOrbs.Reset();
+    for (const TPair<FIntVector, FLandmarkInstance>& Pair : LandmarkInstances)
+    {
+        if (Pair.Value.bIsOrb) { OutOrbs.Add(Pair.Value.Orb); }
+    }
+}
+
+void UVoxelContentManager::DestroyLandmarkInstance(FLandmarkInstance& Inst)
+{
+    if (AActor* A = Inst.Actor.Get()) { A->Destroy(); }
+    if (UStaticMeshComponent* C = Inst.Component.Get()) { C->DestroyComponent(); }
+    Inst.Actor = nullptr;
+    Inst.Component = nullptr;
+}
+
+void UVoxelContentManager::ClearAllLandmarks()
+{
+    for (TPair<FIntVector, FLandmarkInstance>& Pair : LandmarkInstances) { DestroyLandmarkInstance(Pair.Value); }
+    LandmarkInstances.Reset();
+}
+
+void UVoxelContentManager::UpdateLandmarks(const FVector& PlayerWorldPos)
+{
+    if (!StrateManager || !Generator || !Settings) return;
+    AActor* OwnerActor = Owner.Get();
+    if (!OwnerActor) return;
+
+    const FTransform OwnerXf = OwnerActor->GetActorTransform();
+    const FVector LocalPlayer = OwnerXf.InverseTransformPosition(PlayerWorldPos);
+
+    float TopZ, BotZ;
+    const bool bInStrate = StrateManager->GetStrateUnrealZRange(LocalPlayer.Z, TopZ, BotZ);
+    const int32 StrateIndex = bInStrate ? StrateManager->GetStrateIndex(LocalPlayer.Z) : INT32_MIN;
+
+    if (!bInStrate)
+    {
+        if (LandmarkInstances.Num() > 0) { ClearAllLandmarks(); }
+        LastLandmarkStrate = INT32_MIN;
+        return;
+    }
+    if (StrateIndex != LastLandmarkStrate)
+    {
+        ClearAllLandmarks();
+        LastLandmarkStrate = StrateIndex;
+    }
+
+    const float ChunkWorld = (float)CHUNK_SIZE * VOXEL_SIZE;   // one chunk footprint in cm
+
+    // Shared strate context (a strate is a horizontal slab → same everywhere this update).
+    FDecoContext Ctx;
+    Ctx.TopVoxelZ    = TopZ / VOXEL_SIZE;
+    Ctx.BottomVoxelZ = BotZ / VOXEL_SIZE;
+    Ctx.RepChunkZ    = FMath::FloorToInt(((TopZ + BotZ) * 0.5f / VOXEL_SIZE) / (float)CHUNK_SIZE);
+    const FIntVector RepChunk(FMath::FloorToInt(LocalPlayer.X / ChunkWorld),
+                              FMath::FloorToInt(LocalPlayer.Y / ChunkWorld), Ctx.RepChunkZ);
+    const UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(RepChunk);
+    if (!Def || Def->Landmarks.Num() == 0)
+    {
+        if (LandmarkInstances.Num() > 0) { ClearAllLandmarks(); }
+        return;
+    }
+    Ctx.Def          = Def;
+    Ctx.bSurfaceWorld = (StrateManager->GetGeneratorTypeForChunk(RepChunk) == ECaveGeneratorType::SurfaceWorld);
+    {
+        const float Wv = StrateManager->GetWaterLevelWorldZForChunk(RepChunk);
+        Ctx.bHasWater   = (Wv != -FLT_MAX);
+        Ctx.WaterLocalZ = Ctx.bHasWater ? Wv * VOXEL_SIZE : -FLT_MAX;
+    }
+
+    const float Step     = (float)FMath::Max(1, Settings->DecorationMarchStepVoxels);
+    const float ColDepth = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);
+    const uint32 LocalSeed = (uint32)Seed;
+
+    // Walk each entry's lattice within its radius (a tiny box), spawn newly-entered cells, drop exited ones.
+    TSet<FIntVector> Desired;
+    for (int32 EntryIdx = 0; EntryIdx < Def->Landmarks.Num(); ++EntryIdx)
+    {
+        const FStrateLandmark& L = Def->Landmarks[EntryIdx];
+        if (!L.ActorClass && !L.InstancedMesh) continue;
+
+        const float SpacingChunks = FMath::Max(1.0f, L.SpacingChunks);
+        const int32 RadiusChunks  = FMath::Max(1, L.StreamRadiusChunks);
+        const float CellWorld     = SpacingChunks * ChunkWorld;          // lattice cell size in cm
+        const float RadiusWorld   = (float)RadiusChunks * ChunkWorld;
+        const float JitterRange   = FMath::Clamp(L.JitterFraction, 0.0f, 1.0f);
+
+        const FIntPoint PlayerLCell(FMath::FloorToInt(LocalPlayer.X / CellWorld),
+                                    FMath::FloorToInt(LocalPlayer.Y / CellWorld));
+        const int32 CellRange = FMath::CeilToInt((float)RadiusChunks / SpacingChunks);
+
+        for (int32 dy = -CellRange; dy <= CellRange; ++dy)
+        for (int32 dx = -CellRange; dx <= CellRange; ++dx)
+        {
+            const FIntPoint LCell(PlayerLCell.X + dx, PlayerLCell.Y + dy);
+
+            // Existence roll for this lattice cell + entry.
+            const uint32 H = DecoHash(LCell.X, LCell.Y, 0, 0, 0, EntryIdx, LocalSeed, 0x1A2D5u);
+            if (VoxelHash::ToFloat01(H) > L.SpawnProbability) continue;
+
+            // Jittered position inside the cell (centred so two neighbours stay ≥ Spacing·(1-Jitter) apart).
+            const float jx = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x51A3F1u)) - 0.5f) * JitterRange;
+            const float jy = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x7C2B93u)) - 0.5f) * JitterRange;
+            const float LocalX = ((float)LCell.X + 0.5f + jx) * CellWorld;
+            const float LocalY = ((float)LCell.Y + 0.5f + jy) * CellWorld;
+
+            // Radius is a true disk (the lattice box corners would otherwise overshoot it).
+            const float ddx = LocalX - LocalPlayer.X, ddy = LocalY - LocalPlayer.Y;
+            if (ddx * ddx + ddy * ddy > RadiusWorld * RadiusWorld) continue;
+
+            const FIntVector Key(LCell.X, LCell.Y, EntryIdx);
+            Desired.Add(Key);
+            if (LandmarkInstances.Contains(Key)) continue;   // already evaluated (spawned OR empty)
+
+            FLandmarkInstance Inst;
+            SpawnLandmarkInstance(L, H, Ctx, OwnerXf, OwnerActor, LocalX, LocalY, Step, ColDepth, Inst);
+            LandmarkInstances.Add(Key, Inst);   // stored even if empty → never re-evaluated while in range
+        }
+    }
+
+    // Drop instances no longer desired (player moved away, strate's list shrank, etc.).
+    for (auto It = LandmarkInstances.CreateIterator(); It; ++It)
+    {
+        if (Desired.Contains(It.Key())) continue;
+        DestroyLandmarkInstance(It.Value());
+        It.RemoveCurrent();
+    }
 }
 
 //=============================================================================
@@ -883,14 +1243,16 @@ void UVoxelContentManager::UpdateWater(const FVector& PlayerWorldPos)
 void UVoxelContentManager::ClearAll()
 {
     ClearAllDecorations();
+    ClearAllLandmarks();
 
     if (WaterPlane) { WaterPlane->DestroyComponent(); WaterPlane = nullptr; }
     LastWaterZ    = -FLT_MAX;
     LastWaterCell = FIntPoint(INT32_MIN, INT32_MIN);
 
-    // Force a full decoration rebuild on the next update.
-    LastDecoCell    = FIntPoint(INT32_MIN, INT32_MIN);
-    LastStrateIndex = INT32_MIN;
+    // Force a full decoration + landmark rebuild on the next update.
+    LastDecoCell     = FIntPoint(INT32_MIN, INT32_MIN);
+    LastStrateIndex  = INT32_MIN;
+    LastLandmarkStrate = INT32_MIN;
 }
 
 //=============================================================================
@@ -918,50 +1280,63 @@ void UVoxelContentManager::QueryDecoDebugAt(const FVector& LocalPos, bool& bAppl
     const float CellMinX = (float)Cell.X * CellWorld, CellMaxX = CellMinX + CellWorld;
     const float CellMinY = (float)Cell.Y * CellWorld, CellMaxY = CellMinY + CellWorld;
 
-    if (const FDecoRegionContent* Content = DecoRegions.Find(Region))
+    // Probe BOTH grids: a point is covered by a Far region always, plus a Near region when close. Aggregate
+    // applied instances + per-cell counts + building state across the two.
+    for (const FDecoGrid* GP : { &NearGrid, &FarGrid })
     {
-        bApplied = true;
-        for (const TWeakObjectPtr<UHierarchicalInstancedStaticMeshComponent>& C : Content->Instances)
+        const FDecoGrid& G = *GP;
+        if (const FDecoRegionContent* Content = G.Regions.Find(Region))
         {
-            const UHierarchicalInstancedStaticMeshComponent* Comp = C.Get();
-            if (!Comp) continue;
-            const int32 N = Comp->GetInstanceCount();
-            InstanceCount += N;
-            // Count the ones actually inside the probed cell → tells a blank cell apart from a blank region.
-            for (int32 i = 0; i < N; ++i)
+            bApplied = true;
+            for (const TWeakObjectPtr<UHierarchicalInstancedStaticMeshComponent>& C : Content->Instances)
             {
-                FTransform Xf;
-                if (!Comp->GetInstanceTransform(i, Xf, /*bWorldSpace=*/false)) continue;
-                const FVector P = Xf.GetLocation();
-                if (P.X >= CellMinX && P.X < CellMaxX && P.Y >= CellMinY && P.Y < CellMaxY)
+                const UHierarchicalInstancedStaticMeshComponent* Comp = C.Get();
+                if (!Comp) continue;
+                const int32 N = Comp->GetInstanceCount();
+                InstanceCount += N;
+                // Count the ones actually inside the probed cell → tells a blank cell apart from a blank region.
+                for (int32 i = 0; i < N; ++i)
                 {
-                    ++InstancesInCell;
+                    FTransform Xf;
+                    if (!Comp->GetInstanceTransform(i, Xf, /*bWorldSpace=*/false)) continue;
+                    const FVector P = Xf.GetLocation();
+                    if (P.X >= CellMinX && P.X < CellMaxX && P.Y >= CellMinY && P.Y < CellMaxY)
+                    {
+                        ++InstancesInCell;
+                    }
                 }
             }
         }
-    }
-    if (const FDecoRegionBuild* Build = RegionBuilds.Find(Region))
-    {
-        bBuilding      = true;
-        CellsAccounted = Build->AccountedCells.Num();
+        if (const FDecoRegionBuild* Build = G.Builds.Find(Region))
+        {
+            bBuilding       = true;
+            CellsAccounted += Build->AccountedCells.Num();
+        }
     }
 
-    // PER-CELL decisive probe: re-run the march for THIS cell synchronously with the current strate
-    // context (set each UpdateDecorations). Same inputs the worker uses → byte-identical result, so it
-    // reports exactly what the scatter decides for this cell right now. Only valid when the probed point
-    // shares the player's current strate (CurrentCtx/CurrentEntries reflect that); else leave -1.
+    // PER-CELL decisive probe: re-run the march for THIS cell synchronously with the current strate context
+    // (set each UpdateDecorations), for BOTH grids' palettes summed. Same inputs the worker uses →
+    // byte-identical result, so it reports exactly what the scatter decides for this cell right now. Only
+    // valid when the probed point shares the player's current strate (CurrentCtx reflects that); else -1.
     AActor* OwnerActor = Owner.Get();
-    if (Generator && Settings && OwnerActor && CurrentCtx.Def && CurrentEntries.Num() > 0)
+    if (Generator && Settings && OwnerActor && CurrentCtx.Def)
     {
-        const int32 Spacing  = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
         const float Step     = (float)FMath::Max(1, Settings->DecorationMarchStepVoxels);
         const int32 MaxCross = FMath::Max(1, Settings->DecorationMaxCrossingsPerColumn);
         const float ColDepth = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);
 
-        TArray<FDecoSpawn> Spawns;
-        BuildCellSpawns(Generator, OwnerActor->GetActorTransform(), Cell, CurrentCtx,
-                        CurrentEntries, CurrentEntryBiome, (uint32)Seed,
-                        Spacing, Step, MaxCross, ColDepth, Spawns);
-        LiveMarchSpawns = Spawns.Num();
+        int32 Total = 0; bool bAny = false;
+        for (const FDecoGrid* GP : { &NearGrid, &FarGrid })
+        {
+            const FDecoGrid& G = *GP;
+            if (G.Entries.Num() == 0) continue;
+            bAny = true;
+            TArray<FDecoSpawn> Spawns;
+            BuildCellSpawns(Generator, OwnerActor->GetActorTransform(), Cell, CurrentCtx,
+                            G.Entries, G.EntryBiome, (uint32)Seed,
+                            G.Spacing, Step, MaxCross, ColDepth, Spawns);
+            Total += Spawns.Num();
+        }
+        if (bAny) { LiveMarchSpawns = Total; }
     }
 }

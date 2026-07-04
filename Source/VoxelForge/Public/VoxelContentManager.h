@@ -24,9 +24,17 @@
 // 2) WATER — ONE strate-global ocean plane that follows the player (UpdateWater). Terrain pokes
 //    through it, so it reads as water at every LOD / to the horizon with no per-tile gaps. One draw.
 //
-// RENDERING PATHS / DISTANCE TIERS per entry (FStrateDecoration): non-instanced ActorClass entries with
-// MaxLODLevel==0 are near-only (DecorationActorRadiusChunks — pricey actors stay close); InstancedMesh
-// (HISM) entries + MaxLODLevel>=1 actor entries are any-distance (DecorationRadiusChunks).
+// TWO STREAMING GRIDS (FStrateDecoration::StreamTier, §8.5). To stay flicker-free the stream RADIUS must
+// be a property of the grid, not the entry (mixing radii in one grid would re-stream a region in place as
+// the player crosses an entry's radius — the old tier system's flicker bug). So there are exactly two
+// self-contained region streams, and an entry picks one:
+//   • FarGrid  — DecorationRadiusChunks radius + DecorationFarSpacingVoxels (COARSE) grid. Default. Cheap
+//                for rare/large props visible everywhere (sparse marching across the full radius).
+//   • NearGrid — DecorationNearRadiusChunks radius + DecorationSpacingVoxels (FINE) grid. Dense groundcover
+//                near the player only; bounding its radius keeps far-region HISM build + memory small.
+// Each grid owns its own region/build/queue-routing state (FDecoGrid) and its own subset of the palette;
+// the two never share a HISM, so crossing the near boundary loads/unloads a near region without touching
+// the far one (no flicker). A given world XY is covered by a far region always, plus a near region when close.
 //
 // DETERMINISM: same seed + world ⇒ identical placement. Spawning runs on the game thread.
 
@@ -48,6 +56,19 @@ class UStaticMesh;
 class UStaticMeshComponent;
 class UHierarchicalInstancedStaticMeshComponent;
 class UMaterialInterface;
+
+// An active mini-sun light orb (a placed FStrateLandmark with bIsLightOrb). The terrain material marches
+// the density volume toward the nearest of these for raymarched shadows. Plain struct (not reflected);
+// distances are in WORLD cm (already converted from the landmark's voxel units). See FStrateLandmark.
+struct FVoxelActiveOrb
+{
+    FVector      WorldPos = FVector::ZeroVector;
+    FLinearColor Color = FLinearColor::White;
+    float        Intensity = 1.0f;
+    float        RadiusWorld = 400.0f;        // cm
+    float        FalloffWorld = 50000.0f;     // cm
+    float        MaxShadowDistWorld = 25000.0f; // cm
+};
 
 UCLASS()
 class VOXELFORGE_API UVoxelContentManager : public UObject
@@ -77,6 +98,20 @@ public:
     /** Stream decoration cells around the player: recompute the desired set on cell/strate change,
      *  launch async march tasks (capped), and apply finished results budgeted. Call every Tick. */
     void UpdateDecorations(const FVector& PlayerWorldPos);
+
+    //--- LANDMARKS (rare large objects on a coarse hash lattice — the "mini-suns") -----------
+    /** Stream rare landmark objects around the player. Unlike decorations, these sit on a COARSE hash
+     *  lattice (cell = `FStrateLandmark::SpacingChunks` chunks), so cost scales with the number of
+     *  landmarks in range, not the area — a huge StreamRadiusChunks stays cheap (no per-chunk enumeration,
+     *  no freeze). Synchronous game-thread placement (a surface-find runs only when a NEW lattice cell
+     *  enters range; there are very few). Deterministic (hash of cell+entry+seed) → pop-free. Call every
+     *  Tick. Strate-bounded like decorations (wiped + rebuilt on strate change). */
+    void UpdateLandmarks(const FVector& PlayerWorldPos);
+
+    /** Collect the currently-placed mini-sun light orbs (landmarks with bIsLightOrb). Cheap — iterates
+     *  the small LandmarkInstances map. AVoxelWorld picks the nearest to feed the terrain material's
+     *  raymarched shadows. */
+    void GetActiveOrbs(TArray<FVoxelActiveOrb>& OutOrbs) const;
 
     /** Destroy all spawned content (decorations + water). Regenerate / season reset. Bumps the deco
      *  epoch so any in-flight march tasks' results are discarded. */
@@ -109,6 +144,7 @@ public:
     {
         FIntPoint Cell    = FIntPoint::ZeroValue;
         uint32    BuildId = 0;                // identity of the region build this cell belongs to
+        EDecoStreamTier Grid = EDecoStreamTier::Far;  // which grid (Near/Far) this result routes back to
         TArray<FStrateDecoration> Entries;   // snapshot the game thread spawns from (by EntryIdx)
         TArray<FDecoSpawn>        Spawns;
     };
@@ -152,6 +188,29 @@ private:
         TSet<FIntPoint> AccountedCells;
     };
 
+    // All per-grid streaming state, instantiated once per tier (NearGrid / FarGrid). Each grid is a fully
+    // self-contained region stream: its own loaded regions, in-progress builds, launch/in-flight queues,
+    // completed list, build-id counter, palette subset, and (radius, spacing) config. The two grids never
+    // share a HISM, so they load/unload independently with no cross-tier flicker (see the file header).
+    struct FDecoGrid
+    {
+        EDecoStreamTier Tier = EDecoStreamTier::Far;   // identity (stamped on results so they route back here)
+        int32 Radius  = 6;   // stream radius in cells (= chunks)
+        int32 Spacing = 4;   // march column spacing in voxels (fine for Near, coarse for Far)
+
+        TMap<FIntPoint, FDecoRegionContent> Regions;     // loaded regions
+        TMap<FIntPoint, FDecoRegionBuild>   Builds;      // regions being marched
+        TArray<FIntPoint> PendingLaunch;                 // cells awaiting a march task (nearest-first)
+        TSet<FIntPoint>   InFlightCells;                 // cells with a task in flight
+        TArray<FIntPoint> Completed;                     // regions whose last cell landed, awaiting apply
+        uint32 NextBuildId = 1;                          // monotonic build id (per grid)
+
+        // Palette subset for THIS tier, rebuilt each update. Entries[i] is owned by context-biome
+        // EntryBiome[i] (-1 = strate fallback, always matches). EntryIdx in a result indexes this snapshot.
+        TArray<FStrateDecoration> Entries;
+        TArray<int32>             EntryBiome;
+    };
+
     // Constant per-update strate context (a strate is a horizontal slab → same for every cell). Carries
     // only PODs/Z-bounds so it is safe to copy into a worker task (no UObject deref on the worker).
     struct FDecoContext
@@ -170,6 +229,19 @@ private:
         FBiomeContext BiomeCtx;
     };
 
+    // One spawned landmark (rare hash-lattice object). Weak — the owner actor keeps it alive. BOTH null
+    // means the cell was evaluated but placed nothing (gate failed) — kept so we don't re-evaluate it.
+    struct FLandmarkInstance
+    {
+        TWeakObjectPtr<AActor>               Actor;       // set when the entry uses ActorClass
+        TWeakObjectPtr<UStaticMeshComponent> Component;   // set when the entry uses InstancedMesh
+
+        // Mini-sun light orb data (set in SpawnLandmarkInstance when the landmark has bIsLightOrb). The
+        // terrain material consumes the nearest active orb for raymarched shadows (see GetActiveOrbs).
+        bool         bIsOrb = false;
+        FVoxelActiveOrb Orb;
+    };
+
     /** WORKER-THREAD surface find → fills OutSpawns for one cell. SurfaceWorld uses the height oracle
      *  (cheap, O(1)/column); other archetypes ray-march the density column. No UObject access except
      *  Generator (thread-safe). Determinism-critical. Resolves the dominant biome PER COLUMN
@@ -182,16 +254,37 @@ private:
                                 int32 Spacing, float Step, int32 MaxCrossings, float ColumnDepth,
                                 TArray<FDecoSpawn>& OutSpawns);
 
-    void LaunchDecoTasks(const FIntPoint& PlayerCell);
-    void ProcessDecoResults(const FIntPoint& PlayerCell, int32 FarR);
-    void MergeCellResult(const FDecoCellResult& Result);   // fold one cell's spawns into its region build
-    void MarkCellDone(const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId);  // idempotent per-cell accounting
-    void ApplyRegion(const FIntPoint& Region, FDecoRegionBuild& Build);
-    void RebuildDesiredCells(const FIntPoint& PlayerCell);
-    void ClearDecorationRegion(const FIntPoint& Region);
+    // Each step operates on ONE grid (G = NearGrid or FarGrid). LaunchDecoTasks throttles against the
+    // COMBINED in-flight count (OtherInFlight = the other grid's in-flight cells) so the two grids share
+    // one concurrency budget. ProcessDecoResults drains the shared result queue, routing each result to its
+    // grid by FDecoCellResult::Grid, then applies both grids' completed regions under one frame budget.
+    void LaunchDecoTasks(FDecoGrid& G, const FIntPoint& PlayerCell, int32 OtherInFlight, int32 MaxConc);
+    void ProcessDecoResults(const FIntPoint& PlayerCell);
+    void MergeCellResult(FDecoGrid& G, const FDecoCellResult& Result);   // fold one cell's spawns into its region build
+    void MarkCellDone(FDecoGrid& G, const FIntPoint& Region, const FIntPoint& Cell, uint32 BuildId);  // idempotent per-cell accounting
+    void ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FDecoRegionBuild& Build);
+    void RebuildDesiredCells(FDecoGrid& G, const FIntPoint& PlayerCell);
+    void ClearDecorationRegion(FDecoGrid& G, const FIntPoint& Region);
     void ClearAllDecorations();
+    void DrainDecoResults();                          // discard every queued march result
+    static void ResetGridBuildState(FDecoGrid& G);    // drop builds/queues (loaded regions untouched)
     // Region size in cells, clamped (>=1). Cell↔region math lives in file-static helpers in the .cpp.
     int32 RegionSize() const;
+
+    //--- LANDMARKS (hash-lattice rare objects) -------------------------------------------------
+    // Evaluate ONE lattice cell's landmark: biome/surface/slope/water gates, then spawn the actor/mesh.
+    // Leaves Out empty (null) when the cell is "evaluated but nothing placed" so it is never re-evaluated
+    // while it stays in range. H = the cell's existence hash (drives jitter/rotation/scale determinism).
+    void SpawnLandmarkInstance(const FStrateLandmark& L, uint32 H, const FDecoContext& Ctx,
+                               const FTransform& OwnerXf, AActor* OwnerActor,
+                               float LocalX, float LocalY, float Step, float ColDepth, FLandmarkInstance& Out);
+    void DestroyLandmarkInstance(FLandmarkInstance& Inst);
+    void ClearAllLandmarks();
+    // Single-column surface find for a landmark (voxel XY): SurfaceWorld → height oracle, else ray-march the
+    // strate band for the first crossing whose orientation matches Surf. Fills Z (voxel) + outward world normal.
+    static bool FindLandmarkColumn(const UVoxelGenerator* Gen, const FTransform& OwnerXf,
+                                   const FDecoContext& Ctx, float VX, float VY, ESurfaceType Surf,
+                                   float Step, float ColDepth, float& OutZ, FVector& OutNormal);
 
 
     TWeakObjectPtr<AActor> Owner;
@@ -211,27 +304,22 @@ private:
     UPROPERTY()
     UStaticMesh* PlaneMesh = nullptr;
 
-    // Loaded decoration regions (FIntPoint = region XY). One HISM per mesh per region. Not a UPROPERTY
-    // (weak ptrs inside; the owner actor keeps the components alive).
-    TMap<FIntPoint, FDecoRegionContent> DecoRegions;
+    // The two streaming grids. Each owns its loaded regions, in-progress builds, launch/in-flight queues,
+    // completed list, build-id counter, palette subset, and (radius, spacing) config — see FDecoGrid. The
+    // (radius, spacing) are refreshed from VoxelSettings each update; the regions are NOT UPROPERTYs (weak
+    // ptrs inside; the owner actor keeps the spawned components alive).
+    FDecoGrid NearGrid;
+    FDecoGrid FarGrid;
 
-    // Regions currently being marched cell-by-cell; merged here until every cell reports, then applied.
-    TMap<FIntPoint, FDecoRegionBuild> RegionBuilds;
-
-    // Cells that are desired but need a march task launched (nearest-first).
-    TArray<FIntPoint> PendingLaunch;
-    // Cells with a march task in flight (awaiting a result).
-    TSet<FIntPoint> InFlightCells;
-
-    // Worker tasks enqueue here (Mpsc: many workers, one game-thread consumer).
+    // Worker tasks enqueue here (Mpsc: many workers, one game-thread consumer). SHARED across both grids;
+    // each result carries its FDecoCellResult::Grid so ProcessDecoResults routes it to the right grid.
     TQueue<FDecoCellResult, EQueueMode::Mpsc> DecoResults;
-    // Regions whose last cell just landed, awaiting budgeted game-thread apply (HISM build + actor spawn).
-    TArray<FIntPoint> CompletedRegions;
 
-    // Monotonic id stamped on each region build + the cell tasks it launches. A cell result merges only
-    // if its BuildId still matches the live build for that region → a region that was cleared and later
-    // re-marched (same coords, new BuildId) never absorbs a stale in-flight cell from its prior life.
-    uint32 NextBuildId = 1;
+    // Spawned landmarks, keyed by FIntVector(latticeCellX, latticeCellY, entryIndex) — FIntVector already
+    // hashes, so no custom key type is needed. An entry with both ptrs null = "evaluated, nothing placed"
+    // (kept until the cell leaves range so the surface-find isn't repeated). Strate-bounded.
+    TMap<FIntVector, FLandmarkInstance> LandmarkInstances;
+    int32 LastLandmarkStrate = INT32_MIN;   // strate change → wipe + rebuild landmarks
 
     // Set in BeginDestroy; worker tasks check it before touching us.
     std::atomic<bool> bShuttingDown{false};
@@ -241,16 +329,13 @@ private:
     int32     LastStrateIndex = INT32_MIN;
 
     // Shared strate context for the current update (recomputed each UpdateDecorations; the launch step
-    // copies the PODs into each task).
+    // copies the PODs into each task). Same for both grids — a strate is a horizontal slab.
     FDecoContext CurrentCtx;
 
-    // Decoration palette for the current update, built ONCE (a strate's biome field is XY-global, so the
-    // flat list is the same for every cell — only the per-COLUMN biome pick varies). CurrentEntries is the
-    // concatenation of every biome's decoration list (or the strate's when a biome has none / biomes are
-    // disabled); CurrentEntryBiome[i] is the context-biome index that owns entry i (-1 = strate fallback,
-    // always matches). The worker resolves a column's dominant biome and rolls only the entries it owns.
-    TArray<FStrateDecoration> CurrentEntries;
-    TArray<int32>             CurrentEntryBiome;
+    // The decoration palette is built ONCE per update (a strate's biome field is XY-global, so the flat
+    // list is the same for every cell — only the per-COLUMN biome pick varies) and PARTITIONED by tier into
+    // NearGrid.Entries / FarGrid.Entries (with parallel EntryBiome). Each list is the concatenation of every
+    // biome's decoration entries of that tier (or the strate's when a biome has none / biomes are disabled).
 
     // Single strate-global ocean plane, repositioned to follow the player (see UpdateWater).
     UPROPERTY()

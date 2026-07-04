@@ -92,17 +92,17 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 | `VOXEL_NOISE_SCALE` (1.25f) | 147 | Rescales UE PerlinNoise3D to ~[-1,1]. |
 | `FVoxelMeshData` struct | 157-173 | Mesher output (Vertices/Triangles/UVs/Normals/**Colors**). Plain C++, not USTRUCT. `Colors` = F6 material masks (R=dominant biome palette, G=slope, B=border blend weight, A=neighbour biome palette). §8.15. |
 
-### 3.3 Chunk identity — `Public/VoxelChunk.h`
-`FVoxelChunk` (USTRUCT, line 19): just a `ChunkCoord` + `GetWorldPosition()`. In a
-density-only world the chunk stores no voxels — it's a coord wrapper. Room to cache
-per-chunk info later.
+### 3.3 Chunk identity
+`VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
+redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
 
 ### 3.4 Settings — `Public/VoxelSettings.h`
 `UVoxelSettings : UPrimaryDataAsset` — the single tuning asset assigned on `AVoxelWorld`.
 | Group | Fields (line) |
 |-------|---------------|
 | Streaming | `ViewDistanceXY=16`, `ViewDistanceUp/Down=5`, `MaxConcurrentTasks=16`, `MaxMeshAppliesPerFrame=4` (defaults — actual values live on the data asset) |
-| LOD | `LOD0Distance=4`, `LOD1Distance=8` |
+| Clipmap | `ClipRadius`, `MaxClipLevel`, `FullResClipLevels`, `CoarseTileCells`, skirts (the old `LOD0/1Distance` + `ContentMaxLevel` were dead → removed) |
+| Lighting | `bEnableDensityVolume` + DensityVolume* tunables (§3.11 density clipmap / mini-sun shadows) |
 | Rendering | `VoxelMaterial` (61) |
 | Strates | `Seed` (69), `CurrentSeason=1` (73), `StratePool` (78), `FixedStrates` map (83), `TotalStrates=10` (87) |
 | Carving budget | `MaxModifications=0` (97), `MaxBrushRadius=15` (102), `MaxTotalVolume=0` (107). 0 = unlimited. |
@@ -125,9 +125,7 @@ per-chunk info later.
 | `EndPlay` | 140 | Sets `bShuttingDown`, **waits for `ActiveTaskCount`→0**, unbinds delegate. |
 | `BeginPlay` | 177 | Constructs Generator/Mesher/StrateManager/DiffLayer, wires services, seeds. |
 | `Tick` | 220 | `UpdateChunksAroundPosition(player)` + `ProcessPendingChunks()`. |
-| `GetPlayerPosition` | 231 | Pawn position or zero. |
-| `GetLODForChunk` / `LODToStep` | 242 / 268 | Distance→LOD (0/1/2) → step (1/2/4). |
-| `IsChunkInRange` | 275 | View-distance test. |
+| `GetPlayerPosition` | 231 | Pawn position or zero. (`GetLODForChunk`/`LODToStep`/`IsChunkInRange` removed — dead since the clipmap.) |
 | `ProcessPendingChunks` | 301 | Drains ProcessQueue under per-frame budget; **discards stale epochs**; applies meshes. |
 | `UpdateChunksAroundPosition` | 362 | Builds desired set, sorts by distance, loads/unloads, handles LOD changes. |
 | `LoadChunk` | 445 | Budget check → `UE::Tasks::Launch` background gen+mesh; RAII task guard. |
@@ -257,14 +255,12 @@ atmosphere override, `WaterMaterial`, `MaterialPaletteIndex` (F6 — baked to ve
 | `GetTotalModificationCount` / `GetModifiedChunkCount` | 182 / 192 | Stats. |
 
 ### 3.10 Mesher — `Public/VoxelMarchingCubesMesher.h` + `.cpp`
-`UVoxelMarchingCubesMesher : UObject` (h:21). Holds `Generator` ptr, `IsoLevel=0`,
-`GradientOffset=1`.
+`UVoxelMarchingCubesMesher : UObject` (h:21). Holds `Generator` ptr, `IsoLevel=0`, skirt params.
+(The dead trio `GetDensity`/`InterpolateEdge`/`ComputeGradientNormal` + `GradientOffset` was
+removed — since T1.b the pre-sampled grid supplies positions AND gradients inline.)
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| `GetDensity` | 11 | Local coord → world → `Generator->GetDensityAt`. |
-| `InterpolateEdge` | 28 | Linear edge crossing between two corner densities. |
-| `ComputeGradientNormal` | 48 | Central-difference gradient → smooth normal. |
-| **`GenerateMesh`** | 75 | The MC loop over cells; `Step` controls LOD sampling. |
+| **`GenerateMesh`** | ~15 | The MC loop over cells; `Step` controls LOD sampling. Edge `t` + grid-gradient normals computed inline (`SampleG`/`GradAt`). Optional `OutCaptureGrid` (4th arg) = CAPTURE-DURING-MESHING: when non-null + full-res (`CellsPerAxis==CHUNK_SIZE`), copies the already-sampled `CHUNK_SIZE³` density grid (quantized via `VF_QuantizeDensity`, VoxelTypes.h) so the density clipmap reuses it instead of re-sampling `GetDensityAt`. Pure read of the grid — §8.10 untouched. |
 
 **`Public/MarchingCubesTables.h`** — `EdgeTable` + `TriTable` reference data (Paul
 Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs editing.
@@ -272,8 +268,9 @@ Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs ed
 ### 3.11 Per-chunk content & per-strate atmosphere (2026 redesign — see §8)
 | File | Role |
 |------|------|
-| `Public/Private/VoxelContentManager.h/.cpp` | `UVoxelContentManager` — distance-based world-grid decoration scatter (no LOD pop, surface-snapped via `GetDensityAt`) + level-0 water planes. Owned by `AVoxelWorld`. §8.5. |
+| `Public/Private/VoxelContentManager.h/.cpp` | `UVoxelContentManager` — distance-based world-grid decoration scatter (no LOD pop, surface-snapped via `GetDensityAt`) + level-0 water planes. **TWO streaming grids** (`FDecoGrid` Near/Far, picked per entry via `FStrateDecoration::StreamTier`): NearGrid = short radius + fine column grid (groundcover); FarGrid = full radius + coarse grid (cheap rare/large props). **Plus `UpdateLandmarks`** — rare far-visible objects (the "mini-suns") on a coarse HASH LATTICE (`FStrateLandmark`, cell = SpacingChunks chunks → cheap at any radius, no per-chunk freeze); synchronous, deterministic, strate-wide. Owned by `AVoxelWorld`. §8.5. |
 | `Public/Private/VoxelAtmosphereManager.h/.cpp` | `UVoxelAtmosphereManager` — per-strate fog/skylight + persistent ceiling/floor layer actors + full `AtmosphereActor` override. Owned by `AVoxelWorld`. §8.6. |
+| `Public/Private/VoxelDensityVolume.h/.cpp` | `UVoxelDensityVolume` — player-centred DENSITY CLIPMAP (N toroidal R8 levels, fine near / coarse far) streamed to GPU `UVolumeTexture`s for the mini-sun raymarched shadow march. Fills run on ONE dedicated thread (`FVoxelDensityFillRunnable`, off the task pool); level 0 is mostly fed by CAPTURE-DURING-MESHING (mesher grid reuse, gated by `IsTileCaptureUseful` so only tiles near the shadow window pay the capture). Carve → `MarkDirtyVoxelBox` refills locally. `VolumeEpoch` drops stale fills. Owned by `AVoxelWorld` (`bEnableDensityVolume`); shader params pushed via shared per-base-material MIDs (`AVoxelWorld::UpdateTerrainMaterialParams`, change-detected). |
 
 > The big 2026 redesign (8 archetypes, (0,0) spine, inter-strate gap, per-strate passages,
 > disturbances, content/atmosphere, brush shapes, perf invariants) is documented in **§8** —
@@ -334,7 +331,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | Boundary blend between strates | `GetGenerationParams` :515 + `FStrateGenerationParams::Lerp` (StrateTypes.h:844). |
 | Passages between strates | `GeneratePassages` :146 + `EvaluateModifierSDF` :371 + `ApplyPassageCarving` (Generator.cpp:197). |
 | Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:691/709 → `UVoxelDiffLayer::ApplyModification` :63. |
-| Mesh smoothness / normals | `UVoxelMarchingCubesMesher::ComputeGradientNormal` :48, `IsoLevel`/`GradientOffset` (h:51/55). |
+| Mesh smoothness / normals | Grid-gradient in `GenerateMesh` (`GradAt` lambda), `IsoLevel` (h). |
 | New slab/flat-world generator | `GetSlabDensity` Generator.cpp:1306 + `FSlabGenerationParams` (StrateTypes.h:1019). |
 | Biome placement / layout | `BiomeMapParams` on the strate (cell size, warp, climate freqs) + each biome's climate box. Bake `AVoxelWorld::BakeBiomePreview` to tune. §8.14. |
 | What a biome does to terrain | A full archetype param override on the biome (`bOverrideTerrain` + `SurfaceParams`); surface output-blends dominant/neighbour heights in `GetSurfaceDensity`. Caves = content/atmosphere only (determinism, §8.14). |

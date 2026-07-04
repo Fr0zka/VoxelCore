@@ -16,6 +16,8 @@
 #include "GameplayTagContainer.h"
 #include "VoxelStrateTypes.generated.h"
 
+class UVoxelBiomeDefinition;   // FStrateLandmark::RequiredBiome (optional per-landmark biome filter)
+
 //=============================================================================
 // ENUMS
 //=============================================================================
@@ -81,6 +83,32 @@ enum class ESurfaceType : uint8
     Wall     UMETA(DisplayName = "Wall (normal horizontal)"),
     Ceiling  UMETA(DisplayName = "Ceiling (normal down)"),
     Any      UMETA(DisplayName = "Any surface")
+};
+
+/**
+ * EDecoStreamTier — Which of the two decoration streaming grids an entry uses (§8.5).
+ *
+ * Decorations stream on a fixed world XY grid by distance (no LOD pop). To keep that flicker-free,
+ * the STREAM RADIUS is a property of the GRID, never of an entry — mixing radii inside one grid would
+ * force a region to re-stream in place when the player crosses an entry's radius (the old tier system's
+ * flicker bug). So there are exactly two grids, and an entry just PICKS one:
+ *
+ *   Far  — full radius (VoxelSettings::DecorationRadiusChunks) + COARSE column spacing
+ *          (DecorationFarSpacingVoxels). The coarse grid is what makes a RARE prop you want visible at
+ *          every distance cheap: the worker ray-march cost scales with column count, and a sparse prop
+ *          does not need the dense near grid. Default — and the far spacing defaults to the fine value,
+ *          so existing assets are byte-identical until you opt in to a coarser far grid. Trees, landmarks.
+ *
+ *   Near  — short radius (DecorationNearRadiusChunks) + FINE column spacing (DecorationSpacingVoxels).
+ *          For dense groundcover (grass, small clutter) that only needs to exist near the player: keeping
+ *          it out of the far regions saves their HISM cluster-tree build + instance memory. Pair with the
+ *          per-entry CullDistance (GPU draw bound) for the full picture.
+ */
+UENUM(BlueprintType)
+enum class EDecoStreamTier : uint8
+{
+    Far  UMETA(DisplayName = "Far (full radius, coarse grid — trees/landmarks/rare props)"),
+    Near UMETA(DisplayName = "Near (short radius, fine grid — dense groundcover)")
 };
 
 //=============================================================================
@@ -1702,7 +1730,8 @@ struct VOXELFORGE_API FStrateDecoration
 
     // The actor class to spawn (e.g., BP_Stalactite, BP_CrystalCluster).
     // Real actors: lights, logic, interaction. They cost game-thread time per instance —
-    // keep MaxLODLevel at 0 for these, and prefer InstancedMesh for pure visual props.
+    // prefer InstancedMesh for pure visual props, and consider the Far tier so the coarse grid keeps
+    // their spawn count down.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     TSubclassOf<AActor> ActorClass;
 
@@ -1713,11 +1742,13 @@ struct VOXELFORGE_API FStrateDecoration
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     UStaticMesh* InstancedMesh = nullptr;
 
-    // LEGACY / UNUSED by the world-grid decoration system (§8.5). It once meant a clipmap tile level,
-    // then a near/far distance tier — both removed. All decorations now stream within a single radius
-    // (VoxelSettings::DecorationRadiusChunks) and never re-stream in place. Kept to avoid breaking assets.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0", ClampMax = "8"))
-    int32 MaxLODLevel = 0;
+    // Which of the two decoration streaming grids this entry uses (§8.5). Far (default) = full radius +
+    // coarse column grid (cheap for rare/large props visible everywhere); Near = short radius + fine
+    // column grid (dense groundcover near the player only). The radius/spacing presets live on
+    // VoxelSettings; this only PICKS a grid. Defaults reproduce the legacy single-radius fine grid until
+    // you opt into a coarser far spacing or move an entry to Near. (Replaces the old vestigial MaxLODLevel.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
+    EDecoStreamTier StreamTier = EDecoStreamTier::Far;
 
     // Which surface type this decoration can be placed on
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
@@ -1816,6 +1847,158 @@ struct VOXELFORGE_API FStrateDecoration
     // nothing visually). Leave ON for trees and anything large enough that its shadow reads as grounding.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Performance")
     bool bCastShadow = true;
+};
+
+/**
+ * FStrateLandmark — A RARE, large, far-visible object placed on a coarse HASH LATTICE (§8.5).
+ *
+ * This is the right primitive for things like the underground "mini-suns" (in-lore light sources): one
+ * object per ~`SpacingChunks` lattice cell, so the work scales with how MANY landmarks are in range
+ * (a handful), NOT with the streamed area. That makes a HUGE stream radius (e.g. visible 16 km out so it
+ * never pops) cheap — unlike the per-chunk decoration grid, which enumerates every chunk in the disk and
+ * freezes at large radius. Placement is deterministic (pure hash of cell + entry + seed → no pop, same
+ * landmark in the same place forever), evaluated synchronously on the game thread only when a NEW lattice
+ * cell enters range (there are so few candidates this never hitches). Strate-wide (listed on the strate
+ * definition), with an optional per-landmark biome filter. Foliage-style transform tweaks are exposed.
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FStrateLandmark
+{
+    GENERATED_BODY()
+
+    // ----- What to spawn (one of these; ActorClass wins if both set) -----
+
+    // Real actor — use this for a sun that carries its own LIGHT / logic. Rare, so the per-actor cost is fine.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark")
+    TSubclassOf<AActor> ActorClass;
+
+    // OR a plain static mesh (spawned as one StaticMeshComponent — no actor/tick overhead). An emissive
+    // material glows at distance without a light. Ignored if ActorClass is set.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark")
+    UStaticMesh* InstancedMesh = nullptr;
+
+    // ----- Rarity / spacing (the hash lattice — this is what makes it cheap) -----
+
+    // Average spacing between landmarks, IN CHUNKS. This is the lattice cell size: exactly one candidate is
+    // considered per SpacingChunks×SpacingChunks cell, so cost scales with (radius/spacing)². This is also
+    // the primary "distance between two instances" control. Large = rare & far apart.
+    //   16  → fairly frequent landmarks · 64 → sparse (good default) · 256+ → one every few km
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "1.0"))
+    float SpacingChunks = 64.0f;
+
+    // How far within its cell a candidate may wander (0 = dead-centre grid, 1 = anywhere in the cell).
+    // The effective MINIMUM spacing between two instances ≈ SpacingChunks·(1 − JitterFraction); keep it
+    // below 1 to preserve a spacing guarantee while still breaking up the grid regularity.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float JitterFraction = 0.5f;
+
+    // Probability that a lattice cell actually contains this landmark (0-1). Combine with SpacingChunks for
+    // "rare AND well-spaced": SpacingChunks sets the grid, SpawnProbability sets how many slots fill.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float SpawnProbability = 1.0f;
+
+    // How far out (in chunks) landmarks stream / stay visible. CHEAP to make large here (the lattice means a
+    // 2048-chunk radius is still only ~(2048/Spacing)² candidates). Set big enough that a massive object
+    // never pops in at a jarring distance.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "1"))
+    int32 StreamRadiusChunks = 256;
+
+    // ----- Placement restriction (mirrors the base decoration gates) -----
+
+    // Optional: only place inside this biome (resolved at the candidate XY). Null = any biome in the strate.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
+    UVoxelBiomeDefinition* RequiredBiome = nullptr;
+
+    // Which surface to snap to. Suns typically sit on the sky-cap CEILING; set Floor for ground monuments,
+    // Any for the first surface found. Wall-leaning surfaces are matched by the same normal test as decos.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
+    ESurfaceType SurfacePlacement = ESurfaceType::Ceiling;
+
+    // Surface-tilt band (deg from flat = acos(|normal.Z|); 0 = flat, 90 = vertical). MaxSlopeAngle rejects
+    // surfaces STEEPER than it (90 = no filter); MinSlopeAngle rejects surfaces FLATTER than it (0 = none).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MaxSlopeAngle = 90.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MinSlopeAngle = 0.0f;
+
+    // Water-relative gate (ignored unless the strate has a water table): place only below (true) / above
+    // (false) the water line when bRequireWaterRelative is set.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
+    bool bRequireWaterRelative = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (EditCondition = "bRequireWaterRelative"))
+    bool bPlaceBelowWater = false;
+
+    // ----- Transform tweaks (foliage-style) -----
+
+    // Rotate the object so its up-axis follows the surface normal. OFF by default — a sun usually wants to
+    // stay world-upright regardless of the ceiling tilt. ON makes it lie against the surface.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    bool bAlignToSurface = false;
+
+    // WORLD-space position offset (cm) added after the surface snap. E.g. +Z lifts a sun up off the
+    // sky-cap into the open cavern; use X/Y to nudge it off the exact column.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    FVector LocationOffset = FVector::ZeroVector;
+
+    // Fixed rotation applied on top of the (optional) surface alignment.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    FRotator RotationOffset = FRotator::ZeroRotator;
+
+    // Per-axis RANDOM rotation range (degrees) — each instance gets a hash-deterministic ±value/2 on each
+    // axis (Pitch/Yaw/Roll). 0 on an axis = no randomisation there. Yaw alone = spin variety; all three =
+    // tumbled debris look.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    FRotator RandomRotation = FRotator::ZeroRotator;
+
+    // Uniform scale range (hash-random per instance).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    float MinScale = 1.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
+    float MaxScale = 1.0f;
+
+    // ----- Render tuning (the InstancedMesh / StaticMeshComponent path) -----
+
+    // Distance (cm) past which the mesh stops drawing. 0 = NEVER cull (the right choice for a far-visible
+    // sun). Only affects the InstancedMesh path.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Performance", meta = (ClampMin = "0.0"))
+    float CullDistance = 0.0f;
+
+    // Whether the mesh casts a shadow. Only affects the InstancedMesh path.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Performance")
+    bool bCastShadow = true;
+
+    // ----- MINI-SUN LIGHT ORB (feeds the terrain material's raymarched shadows) -----
+    // When set, this landmark is also a LIGHT SOURCE: the terrain material marches the density volume
+    // toward it for from-the-orb, crisp, dynamic shadows (forward rendering). The visible glowing mesh is
+    // still the InstancedMesh/ActorClass above — this just declares the lighting. NOT a UE light actor.
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb")
+    bool bIsLightOrb = false;
+
+    // Light colour of the orb.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb", meta = (EditCondition = "bIsLightOrb"))
+    FLinearColor OrbColor = FLinearColor(1.0f, 0.95f, 0.85f, 1.0f);
+
+    // Overall brightness multiplier.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb", meta = (EditCondition = "bIsLightOrb", ClampMin = "0.0"))
+    float OrbIntensity = 3.0f;
+
+    // Orb emitter radius in VOXELS (visual/softness reference; falloff origin).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb", meta = (EditCondition = "bIsLightOrb", ClampMin = "0.0"))
+    float OrbRadiusVoxels = 16.0f;
+
+    // Distance in VOXELS over which the orb's light falls to zero. YOU author this (no inverse-square
+    // blowout) — bigger = lights a wider area. (1 voxel = 25 cm.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb", meta = (EditCondition = "bIsLightOrb", ClampMin = "1.0"))
+    float OrbFalloffVoxels = 2000.0f;
+
+    // Max distance in VOXELS along the shadow ray we test for occlusion (bounds the per-pixel march cost;
+    // past this the point is treated as lit). Keep ≤ the level-0 volume reach for crisp contact shadows.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Light Orb", meta = (EditCondition = "bIsLightOrb", ClampMin = "1.0"))
+    float OrbMaxShadowDistanceVoxels = 1000.0f;
 };
 
 /**

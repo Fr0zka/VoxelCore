@@ -294,7 +294,6 @@ void UVoxelStrateManager::GeneratePassages()
                 Passage.ControlRadii.Add(RadiusAt(T));
             }
 
-            Passage.bHasMidPoint = false;
             Passage.UpperPoint = Passage.ControlPoints[0];
             Passage.LowerPoint = Passage.ControlPoints.Last();
             Passage.Radius = FMath::Max(Cfg.MouthRadius, Cfg.MidRadius);  // fallback / bounds
@@ -309,6 +308,7 @@ void UVoxelStrateManager::GeneratePassages()
                     MaxDistSq = FMath::Max(MaxDistSq, (float)FVector::DistSquared(Center, CP));
                 const float R = FMath::Sqrt(MaxDistSq) + Passage.Radius + 4.0f;
                 Passage.BoundCenter = Center;
+                Passage.BoundRadius = R;
                 Passage.BoundRadiusSq = R * R;
             }
 
@@ -336,11 +336,11 @@ void UVoxelStrateManager::GeneratePassages()
         // past the seal into the interior, so the seal at (0,0) is breached.
         Entry.UpperPoint = FVector(0.0f, 0.0f, TopZ + CHUNK_SIZE);
         Entry.LowerPoint = FVector(0.0f, 0.0f, TopZ - CHUNK_SIZE);
-        Entry.bHasMidPoint = false;
         {
             const FVector C = (Entry.UpperPoint + Entry.LowerPoint) * 0.5f;
             const float R = (float)FVector::Dist(C, Entry.UpperPoint) + Entry.Radius + 4.0f;
             Entry.BoundCenter = C;
+            Entry.BoundRadius = R;
             Entry.BoundRadiusSq = R * R;
         }
         Passages.Add(Entry);
@@ -396,7 +396,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         for (int32 i = 0; i < Passages.Num(); ++i)
         {
             const FVoxelPassage& P = Passages[i];
-            const float Reach = FMath::Sqrt(P.BoundRadiusSq) + ChunkR;
+            const float Reach = P.BoundRadius + ChunkR;
             if (FVector::DistSquared(CCenter, P.BoundCenter) <= Reach * Reach)
             {
                 SL_Nearby.Add(i);

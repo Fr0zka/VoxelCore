@@ -81,22 +81,7 @@ public:
 	int32 CeilingBandChunks = 4;
 
 	//=========================================================================
-	// LOD
-	//=========================================================================
-
-	// Distance en chunks pour LOD0 (pleine résolution, step=1).
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|LOD")
-	int32 LOD0Distance = 4;
-
-	// Distance en chunks pour LOD1 (demi-résolution, step=2). Au-delà → LOD2 (quart-rés,
-	// step=4). LOD2 = le plus lointain ; ces chunks ne projettent PLUS d'ombre (cf.
-	// ApplyMeshToChunk) → rapprocher LOD0/LOD1 pousse plus de chunks dans la bande
-	// LOD2 sans-ombre = moins de draws (levier fps gratuit, à doser visuellement).
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|LOD")
-	int32 LOD1Distance = 8;
-
-	//=========================================================================
-	// CLIPMAP (chunked-LOD streaming — supersedes the ViewDistance/LOD box above)
+	// CLIPMAP (chunked-LOD streaming — supersedes the ViewDistance box above)
 	//=========================================================================
 	// Streaming loads concentric shells of tiles: level 0 = full-res chunks near the player,
 	// each coarser level doubles tile size (and reach). Total tile/draw/gen count stays ~flat
@@ -138,13 +123,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0.5", ClampMax = "8.0"))
 	float SkirtCells = 2.0f;
 
-	// LEGACY / WATER ONLY. Decorations no longer ride clipmap tiles (see Voxel|Content below —
-	// they stream on a fixed world grid by distance, so they don't pop on LOD swaps). This now only
-	// bounds the tile level at which the level-0 WATER plane is considered (water is level-0 anyway,
-	// so its practical effect is nil). Left in place; safe to ignore.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0", ClampMax = "8"))
-	int32 ContentMaxLevel = 2;
-
 	//=========================================================================
 	// CONTENT — distance-based decoration grid (no LOD pop)
 	//=========================================================================
@@ -154,10 +132,18 @@ public:
 	// density field and snapped to the real surface — so a given prop keeps the SAME world position at
 	// every LOD (no teleport/pop on tile swaps). Decorations exist only in the player's current strate.
 
-	// Far stream radius in cells (= chunks) for "any-distance" entries (instanced/HISM visual props,
-	// and actor entries with MaxLODLevel >= 1). Bigger = props visible farther + more spawn/march cost.
+	// FAR-tier stream radius in cells (= chunks): how far FStrateDecoration entries set to EDecoStreamTier::Far
+	// (the default — trees, landmarks, rare props) stream out. Bigger = props visible farther + more
+	// spawn/march cost (but the far grid is COARSE — see DecorationFarSpacingVoxels — so far cost is cheap).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1"))
 	int32 DecorationRadiusChunks = 6;
+
+	// NEAR-tier stream radius in cells (= chunks): how far EDecoStreamTier::Near entries (dense groundcover
+	// like grass) stream out. Keep this SHORT — near entries use the FINE grid (DecorationSpacingVoxels), so
+	// their cost is the steep one; bounding their radius keeps the far-region HISM build + memory small.
+	// (Repurposes the old vestigial DecorationActorRadiusChunks; same default.)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1"))
+	int32 DecorationNearRadiusChunks = 3;
 
 	// Decoration cells are grouped into REGIONS of RxR cells, and ALL placements in a region share ONE
 	// HISM per mesh (instead of one HISM per cell per mesh). Regions load/unload as a unit, so clearing
@@ -168,18 +154,19 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1", ClampMax = "16"))
 	int32 DecorationRegionSizeCells = 4;
 
-	// LEGACY / UNUSED. The near/far tier system was removed (it re-streamed cells at the tier boundary
-	// as the player moved → decoration flicker). All entries now stream within DecorationRadiusChunks and
-	// a loaded cell is never re-streamed in place. Kept only to avoid breaking the asset; safe to ignore.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1"))
-	int32 DecorationActorRadiusChunks = 3;
-
-	// Spacing (in voxels) of candidate columns within a cell. MUST divide CHUNK_SIZE (32): 4 → 8×8=64
-	// columns/cell. Smaller = denser placement potential + more march cost. SpawnDensity then rolls per
-	// column-crossing (NOTE: this changes the meaning of SpawnDensity vs the old per-vertex scatter —
-	// expect to re-tune decoration densities once).
+	// NEAR-tier column spacing (in voxels) within a cell — the FINE grid. MUST divide CHUNK_SIZE (32):
+	// 4 → 8×8=64 columns/cell. Smaller = denser placement potential + more march cost. SpawnDensity rolls
+	// per column-crossing. Used by EDecoStreamTier::Near entries (and is the legacy single-grid spacing).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1", ClampMax = "32"))
 	int32 DecorationSpacingVoxels = 4;
+
+	// FAR-tier column spacing (in voxels) within a cell — the COARSE grid. MUST divide CHUNK_SIZE (32):
+	// 16 → 2×2=4 columns/cell (16× fewer worker ray-marches than a spacing-4 grid). This is the lever that
+	// makes a RARE prop visible at every distance cheap: the far grid samples sparsely, so supporting a
+	// low-SpawnDensity landmark across the full radius costs a fraction of the fine grid. DEFAULTS to the
+	// fine value (4) so existing worlds are byte-identical until you raise it; bump to 8–16 for cheap far props.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1", ClampMax = "32"))
+	int32 DecorationFarSpacingVoxels = 4;
 
 	// COARSE vertical march step (in voxels) when searching a column for surface crossings. The crossing
 	// Z is then bisection-refined, so accuracy is independent of this — raise it (4-8) to cut the scan
@@ -210,6 +197,64 @@ public:
 	// mesh-gen workers (which are the streaming bottleneck). 0 disables decorations entirely.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "0"))
 	int32 MaxConcurrentDecorationTasks = 4;
+
+	//=========================================================================
+	// LIGHTING — DENSITY VOLUME (mini-sun raymarched shadows)
+	//=========================================================================
+	// A player-centred CLIPMAP of the density field, uploaded to the GPU so the terrain
+	// material can RAYMARCH it toward the "mini-sun" orbs → from-the-orb, crisp, dynamic
+	// shadows under FORWARD rendering (Lumen/DF off the table). The volume is the load-bearing
+	// prerequisite: density is CPU-only (GetDensityAt), so we stream it onto the GPU here.
+	// Concentric levels: level 0 = full-res near the player (step 1), each level up doubles the
+	// sampling step & reach (fine near / coarse far — exactly what shadow rays want). Filled on
+	// WORKER threads (re-evaluating GetDensityAt → deterministic, carves auto-picked-up), with
+	// toroidal incremental refill on movement and localized refill on carve. See VoxelDensityVolume.
+
+	// Master switch. OFF = no volume built, no fill tasks, no GPU cost (terrain unlit by orbs).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting")
+	bool bEnableDensityVolume = true;
+
+	// Per-axis resolution of EACH clip level (cells). Memory per level ≈ Res³ bytes (R8). 128 →
+	// ~2 MB/level; 192 → ~7 MB; 256 → ~16 MB. Higher = crisper near shadows + bigger startup fill.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "32", ClampMax = "256"))
+	int32 DensityVolumeResolution = 128;
+
+	// Number of concentric clip levels. Level L samples every (1<<L) voxels and covers
+	// Res·(1<<L) voxels. 3 levels at Res=128 → near 32 m (full-res) out to ~128 m (coarse).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "1", ClampMax = "5"))
+	int32 DensityVolumeLevels = 3;
+
+	// DEPRECATED / unused: the volume fill no longer runs on the shared UE::Tasks pool (where it
+	// starved behind mesh-gen). It now runs on ONE dedicated thread off the pool, so there's no task
+	// budget to cap. Kept only so existing saved assets don't error; safe to ignore.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 DensityVolumeMaxTasks = 4;
+
+	// A fill box is split into Z-slabs of at most this many cells per task, so no single task is
+	// huge (a full level refill on startup/teleport fans out across workers). Lower = more, smaller
+	// tasks (better parallelism / latency); higher = fewer, fatter tasks.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "1", ClampMax = "64"))
+	int32 DensityVolumeFillSlabCells = 8;
+
+	// Per-pixel shadow-march step count toward the orb (the terrain material reads this). More = crisper
+	// occlusion at grazing angles but higher GPU cost. 64 is a sane start; tune against the look/cost.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "4", ClampMax = "256"))
+	int32 DensityVolumeMarchSteps = 64;
+
+	// Upload the clipmap to GPU R8 volume textures (so the terrain material can march it). OFF = the
+	// CPU volume still streams (debug-draw works) but nothing reaches the GPU — the safe fallback if
+	// the runtime Texture3D RHI path misbehaves on a given engine build.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting")
+	bool bDensityVolumeGPUUpload = true;
+
+	// DEBUG (step 1a verification, no GPU): draw small boxes for SOLID cells of level 0 within
+	// DensityVolumeDebugRadiusCells of the player, so you can confirm the volume holds terrain-shaped
+	// solidity, follows you, and updates on carve — BEFORE the GPU upload + material march land.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting|Debug")
+	bool bDebugDrawDensityVolume = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting|Debug", meta = (ClampMin = "1", ClampMax = "32"))
+	int32 DensityVolumeDebugRadiusCells = 6;
 
 	//=========================================================================
 	// RENDERING

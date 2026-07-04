@@ -13,7 +13,6 @@
 
 #include "CoreMinimal.h"
 #include "VoxelTypes.h"   // Pour FVoxelMeshData, CHUNK_SIZE, VOXEL_SIZE, etc.
-#include "VoxelChunk.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.generated.h"
 
@@ -31,8 +30,15 @@ public:
      * @param CellsPerAxis - Nombre de cellules par axe. Les tuiles GROSSIÈRES en utilisent MOINS
      *                       (gen moins chère, maillage plus grossier au loin) tout en couvrant la
      *                       même étendue (extent = CellsPerAxis*Step). Niveau 0 = CHUNK_SIZE.
+     * @param OutCaptureGrid - CAPTURE-DURING-MESHING (optionnel). Si non-null ET CellsPerAxis==CHUNK_SIZE
+     *                       (tuile pleine résolution, Step==1<<Level, donc 1:1 avec une cellule du clipmap
+     *                       de densité), on y recopie les CHUNK_SIZE³ points intérieurs de la grille de
+     *                       densité déjà échantillonnée, quantifiés via VF_QuantizeDensity. Cela évite à
+     *                       UVoxelDensityVolume de re-sampler GetDensityAt pour ces cellules (le mesher
+     *                       les a déjà calculées). Vidé puis rempli ; reste vide si non éligible.
      */
-    FVoxelMeshData GenerateMesh(FIntVector OriginVoxels, int32 Step = 1, int32 CellsPerAxis = CHUNK_SIZE);
+    FVoxelMeshData GenerateMesh(FIntVector OriginVoxels, int32 Step = 1, int32 CellsPerAxis = CHUNK_SIZE,
+                                TArray<uint8>* OutCaptureGrid = nullptr);
 
     //=========================================================================
     // SERVICES (injectés par AVoxelWorld)
@@ -52,10 +58,6 @@ public:
     // Convention MC: densité < IsoLevel = solide, >= = air.
     float IsoLevel = 0.0f;
 
-    // Distance d'échantillonnage (en voxels) pour calculer la normale par
-    // différence centrée du gradient. Plus petit = plus détaillé mais bruité.
-    float GradientOffset = 1.0f;
-
     // SKIRTS — bouchent les fissures aux frontières de tuiles entre niveaux de clipmap voisins
     // (résolutions différentes → les iso-surfaces ne se rejoignent pas exactement). Une jupe
     // (mur court) est extrudée vers le solide depuis chaque arête de surface posée sur une des 6
@@ -64,19 +66,4 @@ public:
     // Profondeur de la jupe, en CELLULES de la tuile (× Step × VOXEL_SIZE). ~2 cellules couvrent
     // l'écart vers un voisin un niveau plus grossier (cellule 2×). Monter si des fissures persistent.
     float SkirtCells = 2.0f;
-
-protected:
-    //=========================================================================
-    // DENSITY + NORMAL SAMPLING
-    //=========================================================================
-
-    // Lit la densité à une position locale (via le générateur en coords monde).
-    float GetDensity(const FVoxelChunk& Chunk, int32 X, int32 Y, int32 Z) const;
-
-    // Normale lissée: gradient central du champ de densité (pointe solide→air).
-    FVector ComputeGradientNormal(float WorldX, float WorldY, float WorldZ) const;
-
-    // Interpolation linéaire le long d'une arête: trouve où la surface
-    // traverse entre P1 (densité D1) et P2 (densité D2).
-    FVector InterpolateEdge(const FVector& P1, const FVector& P2, float D1, float D2) const;
 };

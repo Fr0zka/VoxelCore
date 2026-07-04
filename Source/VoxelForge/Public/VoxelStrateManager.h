@@ -48,18 +48,9 @@ struct FVoxelPassage
     FVector UpperPoint = FVector::ZeroVector;  // Entry in upper strate
     FVector LowerPoint = FVector::ZeroVector;  // Exit in lower strate
 
-    // An optional midpoint for non-straight passages (sloped, curved).
-    // Used by SlopedTunnel and CrackCrevice types. Ignored when ControlPoints is populated.
-    FVector MidPoint = FVector::ZeroVector;
-
     // Passage dimensions — how wide the carved tunnel is (in voxels).
     // Varies by type: VerticalShaft ~7-8, SpiralDescent ~4, CrackCrevice ~2-3, others ~5.
     float Radius = 5.0f;
-
-    // Whether this passage uses a midpoint (curved/sloped) or is straight.
-    // Only relevant when ControlPoints is empty — if ControlPoints has entries,
-    // the passage is evaluated as a capsule chain along those points instead.
-    bool bHasMidPoint = false;
 
     // The shape/style of this passage. Determines how control points are generated
     // and how the passage feels to navigate (shaft, spiral, ledges, crack, etc.).
@@ -80,7 +71,9 @@ struct FVoxelPassage
     // Bounding sphere enclosing the whole passage (+ radius + blend), in voxel coords.
     // Computed once in GeneratePassages; lets EvaluateModifierSDF reject far voxels with
     // a single squared-distance test instead of walking every segment per voxel.
+    // BoundRadius (linear) feeds the per-chunk shortlist reach; BoundRadiusSq the per-voxel test.
     FVector BoundCenter = FVector::ZeroVector;
+    float BoundRadius = 0.0f;
     float BoundRadiusSq = 0.0f;
 };
 

@@ -7,7 +7,6 @@
 #include "GameFramework/Actor.h"
 #include <atomic>
 #include "VoxelTypes.h"
-#include "VoxelChunk.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelSettings.h"
@@ -21,7 +20,11 @@ class URealtimeMeshSimple;
 class UVoxelDiffLayer;
 class UVoxelContentManager;
 class UVoxelAtmosphereManager;
+class UVoxelDensityVolume;
+class UMaterialParameterCollection;
+class UVolumeTexture;
 class UMaterialInterface;
+class UMaterialInstanceDynamic;
 namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
 /**
@@ -53,6 +56,11 @@ struct FChunkResult
     // view the way a game-thread height-oracle sample did (it misclassified coarse far tiles). The
     // game thread still gates this to SurfaceWorld strates before applying CeilingMaterial / no-shadow.
     bool bIsCeiling = false;
+    // CAPTURE-DURING-MESHING: the tile's CHUNK_SIZE³ R8 density grid, captured by the mesher (no extra
+    // GetDensityAt). Non-empty only for capture-eligible tiles (level 0, full-res). The game thread hands
+    // it to UVoxelDensityVolume::IngestTileCapture so the density clipmap reuses the mesher's samples
+    // instead of re-sampling. Moved (not copied) through the MPSC queue. See UVoxelDensityVolume.
+    TArray<uint8> CaptureGrid;
 };
 
 UCLASS()
@@ -101,6 +109,20 @@ public:
      *  when bManageAtmosphere is true. */
     UPROPERTY()
     UVoxelAtmosphereManager* AtmosphereManager;
+
+    /** Player-centred density CLIPMAP streamed onto the GPU for the mini-sun raymarched shadow
+     *  system (forward rendering). Created in BeginPlay when Settings->bEnableDensityVolume is on.
+     *  Filled on worker threads (re-evaluating GetDensityAt), recentred toroidally as the player
+     *  moves, refilled locally on carve. See UVoxelDensityVolume. */
+    UPROPERTY()
+    UVoxelDensityVolume* DensityVolume;
+
+    /** Shared Material Instance Dynamics that bind the density-volume textures + per-frame shadow params
+     *  (clipmap transform + nearest orb) onto the terrain material(s). Keyed by BASE material so every
+     *  tile of a given base shares ONE MID (no batching cost). Created lazily in ApplyMeshToTile,
+     *  refreshed each Tick by UpdateTerrainMaterialParams. */
+    UPROPERTY()
+    TMap<TObjectPtr<UMaterialInterface>, TObjectPtr<UMaterialInstanceDynamic>> TerrainMIDs;
 
     /** When true, VoxelForge spawns & drives its own height fog + skylight + ceiling/floor
      *  layer actors from each strate's settings. Turn OFF if you manage fog/lighting
@@ -248,6 +270,50 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Voxel World|Biome")
     FVoxelBiomeQuery GetBiomeAtWorldLocation(FVector WorldLocation) const;
+
+    //=========================================================================
+    // LIGHTING — DENSITY VOLUME (debug / material wiring)
+    //=========================================================================
+
+    /** The GPU R8 density volume texture for a clip level (0 = finest, near the player). Null until the
+     *  volume has streamed in / if GPU upload is off. STEP 1b-i validation: in a debug BP, create a
+     *  dynamic material instance of a Volume-Texture-sampling material and SetTextureParameterValue from
+     *  this — you should see the density field, centred on the player, updating as you move & carve. */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Lighting")
+    UVolumeTexture* GetDensityVolumeTexture(int32 Level = 0) const;
+
+private:
+    /** Get/create the shared MID wrapping a base terrain material (binds volume textures + shadow params).
+     *  Returns Base unchanged-wrapped, or nullptr if Base is null. */
+    UMaterialInstanceDynamic* GetOrCreateTerrainMID(UMaterialInterface* Base);
+
+    /** Recompute the packed volume/orb shader params (TVP0..4) from the density volume + nearest orb, and
+     *  push them (and the volume textures) onto every terrain MID. Called each Tick. */
+    void UpdateTerrainMaterialParams();
+
+    /** Apply the current TVP0..4 + level-0 volume texture to one MID (also used on MID creation). */
+    void SetVolumeParamsOnMID(UMaterialInstanceDynamic* MID) const;
+
+    // Packed shader params, recomputed each Tick. ALL meaningful data is in .xyz — a material Vector
+    // Parameter only delivers float3 (RGB) into a Custom node (the alpha is dropped), so we never use .w.
+    //   TVP0 = L0 WindowOrigin.xyz (world cm)   TVP1 = L0 OriginMod.xyz (cells)
+    //   TVP2 = OrbPos.xyz (world cm)            TVP3 = OrbColor.rgb * OrbIntensity (premultiplied)
+    //   TVP4 = (OrbMaxDist, OrbFalloff, MarchSteps)   TVP5 = (Res, L0 CellWorldSize, OrbEnable)
+    //   TVP6 = L1 WindowOrigin.xyz   TVP7 = L1 OriginMod.xyz
+    //   TVP8 = L2 WindowOrigin.xyz   TVP9 = L2 OriginMod.xyz
+    // Coarser levels' cell size is derived in-shader (cell_L = L0Cell * 2^L); Res is shared.
+    FLinearColor TVP0 = FLinearColor::Black, TVP1 = FLinearColor::Black, TVP2 = FLinearColor::Black,
+                 TVP3 = FLinearColor::Black, TVP4 = FLinearColor::Black, TVP5 = FLinearColor::Black,
+                 TVP6 = FLinearColor::Black, TVP7 = FLinearColor::Black,
+                 TVP8 = FLinearColor::Black, TVP9 = FLinearColor::Black;
+
+    // Change-detection for the per-Tick pushes: MID vector/texture sets and MPC writes each enqueue
+    // render-thread updates, so skip them entirely on the (common) frames where nothing moved.
+    TWeakObjectPtr<UVolumeTexture> LastBoundVolTex0;              // re-push MIDs if the L0 texture was recreated
+    FLinearColor LastOrbMPC[4] = { FLinearColor(FLT_MAX, 0, 0, 0), FLinearColor(FLT_MAX, 0, 0, 0),
+                                   FLinearColor(FLT_MAX, 0, 0, 0), FLinearColor(FLT_MAX, 0, 0, 0) };
+
+public:
 
     //=========================================================================
     // LIVE EDIT (debug tuning in PIE)
@@ -409,6 +475,17 @@ public:
      */
     void ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, bool bGeomCeiling);
 
+    /** Mini-sun lighting (bounded directional). Each frame writes the nearest 4 active orbs' WORLD
+     *  positions (+ reach radius in .w) into OrbLightMPC's Orb0..3 vector params; the Directional
+     *  Light's Light Function material reads them to mask its contribution into a pool around each
+     *  orb. No-op until OrbLightMPC is assigned. Replaces the density-volume raymarch. */
+    void UpdateOrbLightMPC();
+
+    /** The Material Parameter Collection (MPC_VoxelOrbs) the orb Light Function reads. Assign in the
+     *  AVoxelWorld details. Params expected: Vector Orb0,Orb1,Orb2,Orb3 = (x,y,z, reachRadiusCm). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting")
+    UMaterialParameterCollection* OrbLightMPC = nullptr;
+
     /** Build the clipmap desired-tile set (concentric shells) around the player tile. */
     void BuildDesiredTiles(const FIntVector& CenterChunkCoord);
 
@@ -424,31 +501,8 @@ public:
     /** Get the current player position (or zero if no player) */
     FVector GetPlayerPosition() const;
 
-    /** Check if a chunk coordinate is within view distance of a center chunk */
-    bool IsChunkInRange(const FIntVector& ChunkCoord, const FIntVector& CenterChunk) const;
-
-    /**
-     * Determine LOD level for a chunk based on its distance from the center.
-     *
-     * LOD CONCEPT:
-     * Chunks close to the player get full resolution (LOD0, Step=1).
-     * Chunks further away get coarser resolution (LOD1=Step 2, LOD2=Step 4).
-     * This dramatically reduces triangle count for distant terrain without
-     * visible quality loss (they're far away!).
-     *
-     * @param ChunkCoord - The chunk to evaluate
-     * @param CenterChunk - The player's current chunk
-     * @return LOD level: 0 (full), 1 (half), 2 (quarter)
-     */
-    int32 GetLODForChunk(const FIntVector& ChunkCoord, const FIntVector& CenterChunk) const;
-
-    /**
-     * Convert LOD level to marching cubes step size.
-     * LOD0 → Step 1 (every voxel)
-     * LOD1 → Step 2 (every 2nd voxel)
-     * LOD2 → Step 4 (every 4th voxel)
-     */
-    static int32 LODToStep(int32 LODLevel);
+    // (GetLODForChunk / LODToStep / IsChunkInRange removed — dead since the clipmap
+    //  streaming replaced the distance-LOD scheme; the level lives in FVoxelTileKey.)
 
     //=========================================================================
     // ASYNC

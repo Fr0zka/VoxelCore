@@ -5,76 +5,16 @@
 #include "MarchingCubesTables.h"
 
 //=============================================================================
-// DENSITY SAMPLING
-//=============================================================================
-
-float UVoxelMarchingCubesMesher::GetDensity(const FVoxelChunk& Chunk, int32 X, int32 Y, int32 Z) const
-{
-    // On n'utilise plus de stockage de blocs — densité demandée directement
-    // au générateur, qui produit la valeur pour TOUTE coordonnée monde.
-    // Si le générateur manque, le chunk est considéré tout-air (IsoLevel par défaut = 0).
-    if (!Generator) return 0.0f;
-
-    const float WorldX = Chunk.ChunkCoord.X * CHUNK_SIZE + X;
-    const float WorldY = Chunk.ChunkCoord.Y * CHUNK_SIZE + Y;
-    const float WorldZ = Chunk.ChunkCoord.Z * CHUNK_SIZE + Z;
-    return Generator->GetDensityAt(WorldX, WorldY, WorldZ);
-}
-
-//=============================================================================
-// EDGE INTERPOLATION
-//=============================================================================
-
-FVector UVoxelMarchingCubesMesher::InterpolateEdge(
-    const FVector& P1, const FVector& P2,
-    float D1, float D2) const
-{
-    // Densités quasi-égales → on prend le milieu (évite division par ~0).
-    if (FMath::Abs(D2 - D1) < KINDA_SMALL_NUMBER)
-    {
-        return (P1 + P2) * 0.5f;
-    }
-
-    // t = 0 → surface en P1; t = 1 → surface en P2.
-    float T = (IsoLevel - D1) / (D2 - D1);
-    T = FMath::Clamp(T, 0.0f, 1.0f);
-    return P1 + T * (P2 - P1);
-}
-
-//=============================================================================
-// NORMAL (gradient central de densité)
-//=============================================================================
-
-FVector UVoxelMarchingCubesMesher::ComputeGradientNormal(float WorldX, float WorldY, float WorldZ) const
-{
-    // Convention: densité négative = solide, positive = air.
-    // Le gradient pointe solide→air = vers l'extérieur de la surface.
-    // Pas de négation à faire.
-    const float Dx = Generator->GetDensityAt(WorldX + GradientOffset, WorldY, WorldZ)
-                   - Generator->GetDensityAt(WorldX - GradientOffset, WorldY, WorldZ);
-    const float Dy = Generator->GetDensityAt(WorldX, WorldY + GradientOffset, WorldZ)
-                   - Generator->GetDensityAt(WorldX, WorldY - GradientOffset, WorldZ);
-    const float Dz = Generator->GetDensityAt(WorldX, WorldY, WorldZ + GradientOffset)
-                   - Generator->GetDensityAt(WorldX, WorldY, WorldZ - GradientOffset);
-
-    FVector Normal(Dx, Dy, Dz);
-    Normal.Normalize();
-
-    // Fallback si le gradient est dégénéré (zone plate).
-    if (Normal.IsNearlyZero())
-    {
-        Normal = FVector(0.0f, 0.0f, 1.0f);
-    }
-    return Normal;
-}
-
-//=============================================================================
 // MAIN ALGORITHM
 //=============================================================================
+// (L'ancien trio GetDensity / InterpolateEdge / ComputeGradientNormal a été retiré :
+//  mort depuis T1.b — la grille pré-échantillonnée fournit positions ET gradients.)
 
-FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, int32 Step, int32 InCellsPerAxis)
+FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, int32 Step, int32 InCellsPerAxis,
+                                                       TArray<uint8>* OutCaptureGrid)
 {
     FVoxelMeshData MeshData;
+    if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (!Generator) return MeshData;
 
     // Cell size in voxels. No upper clamp: coarse clipmap levels use bigger steps (the EXTENT
@@ -212,6 +152,27 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         }
     }
 
+    // ── CAPTURE-DURING-MESHING ──
+    // Si demandé et que la tuile est pleine résolution (CellsPerAxis==CHUNK_SIZE ⇒ Step==1<<Level,
+    // donc chaque point de grille = exactement une cellule du clipmap de densité), on recopie les
+    // CHUNK_SIZE³ points INTÉRIEURS (g=0..CHUNK_SIZE-1, on exclut le point frontière +1 — il
+    // appartient à la tuile voisine — et l'anneau de marge ±1) dans OutCaptureGrid, quantifiés.
+    // UVoxelDensityVolume réutilise ces octets au lieu de re-sampler GetDensityAt. Pure lecture de
+    // DensityGrid : la forme de grille, la boucle deux passes, l'anneau de marge et la réutilisation
+    // thread_local restent intacts (§8.10). Ordre X→Y→Z (x rapide) = layout attendu par l'ingest.
+    if (OutCaptureGrid && CellsPerAxis == CHUNK_SIZE)
+    {
+        OutCaptureGrid->SetNumUninitialized(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+        uint8* Cap = OutCaptureGrid->GetData();
+        int32 ci = 0;
+        for (int32 gz = 0; gz < CHUNK_SIZE; ++gz)
+        for (int32 gy = 0; gy < CHUNK_SIZE; ++gy)
+        for (int32 gx = 0; gx < CHUNK_SIZE; ++gx)
+        {
+            Cap[ci++] = VF_QuantizeDensity(DensityGrid[((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1)]);
+        }
+    }
+
     // Lecture grille (avec offset de marge) + gradient central depuis la grille.
     auto SampleG = [&](int32 gx, int32 gy, int32 gz) -> float
     {
@@ -269,9 +230,9 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     Gradients[i] = GradAt(GX, GY, GZ);
                 }
 
-                // Interpolation des positions + normales sur les arêtes traversées. Le t est
-                // calculé exactement comme InterpolateEdge → positions bit-identiques (topologie
-                // inchangée) ; la normale interpole les gradients de coin par le même t.
+                // Interpolation des positions + normales sur les arêtes traversées. t = point de
+                // traversée de l'iso entre les deux coins (clampé, milieu si densités quasi-égales) ;
+                // la normale interpole les gradients de coin par le même t.
                 FVector EdgeVertices[12];
                 FVector EdgeNormals[12];
                 for (int32 i = 0; i < 12; i++)

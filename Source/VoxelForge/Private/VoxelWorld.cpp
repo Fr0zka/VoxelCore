@@ -10,6 +10,11 @@
 #include "VoxelBiomeDefinition.h"
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelContentManager.h"
+#include "VoxelDensityVolume.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Kismet/KismetMaterialLibrary.h"
+#include "Engine/VolumeTexture.h"
 #include "VoxelAtmosphereManager.h"
 #include "DrawDebugHelpers.h"
 #include "IImageWrapper.h"
@@ -88,6 +93,9 @@ void AVoxelWorld::RegenerateAllChunks()
 
     // Decorations/water are keyed per level-0 chunk — clear them all.
     if (ContentManager) { ContentManager->ClearAll(); }
+
+    // Density volume: bump epoch (drop in-flight fills) + drop data → full refill next Tick.
+    if (DensityVolume) { DensityVolume->Reset(); }
 
     // Clear pending set — stale tasks will be discarded by the epoch check.
     PendingTiles.Empty();
@@ -249,6 +257,12 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         ContentManager->NotifyShutdown();
     }
 
+    // Stop + drain the density-volume fill tasks (they read the Generator) before UObject teardown.
+    if (DensityVolume)
+    {
+        DensityVolume->NotifyShutdown();
+    }
+
     // Destroy any spawned atmosphere layer actors.
     if (AtmosphereManager)
     {
@@ -328,6 +342,13 @@ void AVoxelWorld::BeginPlay()
         AtmosphereManager->Initialize(this, StrateManager, Generator);
     }
 
+    // Density volume — player-centred clipmap streamed to the GPU for mini-sun raymarched shadows.
+    if (Settings->bEnableDensityVolume)
+    {
+        DensityVolume = NewObject<UVoxelDensityVolume>(this);
+        DensityVolume->Initialize(this, Generator, Settings);
+    }
+
 #if WITH_EDITOR
     // Listen for data asset edits during PIE so live edit can detect
     // strate definition changes (PostEditChangeProperty only fires for
@@ -354,14 +375,31 @@ void AVoxelWorld::Tick(float DeltaTime)
             // Distance-based decoration streaming (no LOD pop). Cheap no-op unless the player crosses
             // a decoration cell boundary or changes strate; otherwise just drains the spawn budget.
             { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateDecorations); ContentManager->UpdateDecorations(PlayerLastPos); }
+            // Rare hash-lattice landmarks (the "mini-suns") — cheap at any radius (scales with count, not area).
+            { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateLandmarks); ContentManager->UpdateLandmarks(PlayerLastPos); }
             // One strate-global ocean plane following the player (water at every LOD, to the horizon).
             { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateWater); ContentManager->UpdateWater(PlayerLastPos); }
         }
+        if (DensityVolume)
+        {
+            // Density clipmap for mini-sun shadows: recentre + queue/launch/drain worker fills.
+            // Cheap unless the player crossed a level-0 cell boundary or a carve dirtied cells.
+            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateDensityVolume);
+            DensityVolume->Update(PlayerLastPos);
+            // Push the clipmap transform + nearest orb to the terrain MIDs (the material's shadow march).
+            UpdateTerrainMaterialParams();
+        }
+        // Bounded-directional mini-sun lighting: stream the nearest orbs into the Light Function MPC.
+        // Independent of the density volume (self-guards on OrbLightMPC); this is the replacement path.
+        UpdateOrbLightMPC();
     }
     ProcessPendingChunks();
     ProcessUnloadQueue();
 
 #if ENABLE_DRAW_DEBUG
+    // Density-volume overlay (step 1a): cyan boxes for solid level-0 cells near the player.
+    if (DensityVolume) { DensityVolume->DebugDraw(); }
+
     // Inter-strate passage overlay (cyan path, green=upper / red=lower endpoints).
     // Points are in voxel coords → world units (×VOXEL_SIZE) → actor space.
     if (bDebugDrawPassages && StrateManager)
@@ -379,11 +417,6 @@ void AVoxelWorld::Tick(float DeltaTime)
             {
                 for (int32 j = 0; j < P.ControlPoints.Num() - 1; ++j)
                     DrawSeg(P.ControlPoints[j], P.ControlPoints[j + 1]);
-            }
-            else if (P.bHasMidPoint)
-            {
-                DrawSeg(P.UpperPoint, P.MidPoint);
-                DrawSeg(P.MidPoint, P.LowerPoint);
             }
             else
             {
@@ -406,65 +439,6 @@ FVector AVoxelWorld::GetPlayerPosition() const
         return PC->GetPawn()->GetActorLocation();
     }
     return FVector::ZeroVector;
-}
-
-int32 AVoxelWorld::GetLODForChunk(const FIntVector& ChunkCoord, const FIntVector& CenterChunk) const
-{
-    // Chebyshev distance (max of absolute differences on each axis)
-    // This gives a cubic LOD zone instead of spherical — simpler and
-    // matches how chunks are loaded (cubic view distance).
-    FIntVector Delta = ChunkCoord - CenterChunk;
-    int32 Distance = FMath::Max3(
-        FMath::Abs(Delta.X),
-        FMath::Abs(Delta.Y),
-        FMath::Abs(Delta.Z)
-    );
-
-    if (Distance <= Settings->LOD0Distance)
-    {
-        return 0;  // Full resolution
-    }
-    else if (Distance <= Settings->LOD1Distance)
-    {
-        return 1;  // Half resolution
-    }
-    else
-    {
-        return 2;  // Quarter resolution
-    }
-}
-
-int32 AVoxelWorld::LODToStep(int32 LODLevel)
-{
-    // LOD0 → 1, LOD1 → 2, LOD2 → 4
-    // Using bit shift: 1 << LODLevel
-    return 1 << FMath::Clamp(LODLevel, 0, 2);
-}
-
-bool AVoxelWorld::IsChunkInRange(const FIntVector& ChunkCoord, const FIntVector& CenterChunk) const
-{
-    const int32 ViewXY = Settings->ViewDistanceXY;
-    const int32 ViewUp = Settings->ViewDistanceUp;
-    const int32 ViewDown = Settings->ViewDistanceDown;
-    FIntVector Range = ChunkCoord - CenterChunk;
-
-    if ((FMath::Abs(Range.X) <= ViewXY) and (FMath::Abs(Range.Y) <= ViewXY)) {
-        if (Range.Z > 0)
-        {
-            if (FMath::Abs(Range.Z) <= ViewUp)
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (FMath::Abs(Range.Z) <= ViewDown)
-            {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 void AVoxelWorld::ProcessPendingChunks()
@@ -508,6 +482,14 @@ void AVoxelWorld::ProcessPendingChunks()
 
         // Mark the tile loaded (even if empty — so we don't re-submit it).
         LoadedTiles.Add(DequeuedChunk.Tile);
+
+        // CAPTURE-DURING-MESHING: hand the mesher's captured density grid to the clipmap BEFORE the
+        // empty-tile early-out — all-air / all-solid tiles are exactly the uniform cells the volume
+        // needs, and they carry a valid CaptureGrid even though they render nothing.
+        if (DensityVolume && DequeuedChunk.CaptureGrid.Num() > 0)
+        {
+            DensityVolume->IngestTileCapture(DequeuedChunk.Tile.Coord, MoveTemp(DequeuedChunk.CaptureGrid));
+        }
 
         // Empty mesh = all-air tile — nothing to render, but still "loaded".
         if (DequeuedChunk.bEmpty || !DequeuedChunk.Streams)
@@ -807,13 +789,22 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
     const int32 Step    = FMath::Max(1, Extent / Cells);
     const uint32 TaskEpoch = GenerationEpoch;
 
+    // CAPTURE-DURING-MESHING: only level-0 full-res tiles map 1:1 onto a density-clipmap level
+    // (Step == 1<<Level, Cells == CHUNK_SIZE). When the density volume is active, ask the mesher to
+    // emit the captured R8 grid so the volume reuses it instead of re-sampling GetDensityAt. Gated to
+    // tiles the volume can actually consume (its shadow window is much smaller than the streaming
+    // ring) — the rest shouldn't pay the quantize + 32 KB queue payload for a grid it would refuse.
+    const bool bWantCapture = (Tile.Level == 0) && (Cells == CHUNK_SIZE)
+        && DensityVolume != nullptr && Settings && Settings->bEnableDensityVolume
+        && DensityVolume->IsTileCaptureUseful(Tile.Coord);
+
     ActiveTaskCount.fetch_add(1, std::memory_order_relaxed);
 
     // BackgroundNormal priority: gen runs on background workers that YIELD to foreground
     // (game/render-thread) tasks. Without this, raising MaxConcurrentTasks past the spare
     // core count saturates the scheduler and starves the frame (the "over 12 = lag" symptom).
     // At background priority the frame keeps its cores; gen just fills in around it.
-    UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch]()
+    UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -831,7 +822,8 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
         FVoxelMeshData MeshData;
         {
             TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
-            MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells);
+            MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells,
+                                            bWantCapture ? &Result.CaptureGrid : nullptr);
         }
 
         // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air
@@ -925,6 +917,17 @@ void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FReal
         }
     }
 
+    // Mini-sun shadows: route the resolved base material through a shared MID that binds the density-volume
+    // textures + per-frame shadow params (the material marches them for raymarched orb shadows). One MID
+    // per base material, so all tiles of a base still share one material (no batching cost).
+    if (DensityVolume && Settings && Settings->bEnableDensityVolume)
+    {
+        if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(ChunkMaterial))
+        {
+            ChunkMaterial = MID;
+        }
+    }
+
     // The geometry stream set was built on the worker (BuildTileStreamSet, T1.f); we just upload it.
     // Vertices are world-space; the component sits at the actor origin.
 
@@ -1015,39 +1018,25 @@ FVoxelBiomeQuery AVoxelWorld::GetBiomeAtWorldLocation(FVector WorldLocation) con
 // TERRAIN MODIFICATION — player carving & filling
 //=============================================================================
 
+// All brush entry points below build an FVoxelModification and funnel through ApplyModification
+// (diff layer + re-mesh). Strength sign convention: NEGATIVE = carve (air), POSITIVE = fill (solid).
+
 void AVoxelWorld::CarveAtPosition(FVector Position, float Radius, float Strength)
 {
-    if (!DiffLayer) return;
-
-    // Convert world position (Unreal units) to voxel space.
-    // VOXEL_SIZE = 25 in VoxelForge, so divide by it.
-    const FVector VoxelPos = Position / VOXEL_SIZE;
-
-    // Carve = negative strength (subtracts density → creates air)
     FVoxelModification Mod;
-    Mod.Center = VoxelPos;
+    Mod.Center = Position / VOXEL_SIZE;    // world cm → voxel space
     Mod.Radius = Radius;
-    Mod.Strength = -FMath::Abs(Strength);  // Force negative for carving
-
-    TArray<FIntVector> AffectedChunks = DiffLayer->ApplyModification(Mod);
-    RemeshDirtyChunks(AffectedChunks);
+    Mod.Strength = -FMath::Abs(Strength);  // force negative for carving
+    ApplyModification(Mod);
 }
 
 void AVoxelWorld::FillAtPosition(FVector Position, float Radius, float Strength)
 {
-    if (!DiffLayer) return;
-
-    // Convert world position to voxel space
-    const FVector VoxelPos = Position / VOXEL_SIZE;
-
-    // Fill = positive strength (adds density → creates solid)
     FVoxelModification Mod;
-    Mod.Center = VoxelPos;
+    Mod.Center = Position / VOXEL_SIZE;
     Mod.Radius = Radius;
-    Mod.Strength = FMath::Abs(Strength);  // Force positive for filling
-
-    TArray<FIntVector> AffectedChunks = DiffLayer->ApplyModification(Mod);
-    RemeshDirtyChunks(AffectedChunks);
+    Mod.Strength = FMath::Abs(Strength);   // force positive for filling
+    ApplyModification(Mod);
 }
 
 void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
@@ -1342,6 +1331,180 @@ void AVoxelWorld::RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords)
         LoadTile(Tile);
     }
 
+    // Density volume: refill the clipmap cells overlapping each carved chunk so the shadow march
+    // sees the edit (GetDensityAt includes the diff layer). Cheap + local; covers all carve shapes.
+    if (DensityVolume)
+    {
+        for (const FIntVector& Coord : DirtyCoords)
+        {
+            const FIntVector MinV = Coord * CHUNK_SIZE;
+            const FIntVector MaxV = MinV + FIntVector(CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE);
+            DensityVolume->MarkDirtyVoxelBox(MinV, MaxV);
+        }
+    }
+
     UE_LOG(LogTemp, Verbose, TEXT("[VoxelWorld] RemeshDirtyChunks: %d coords, %d pending"),
         DirtyCoords.Num(), PendingTiles.Num());
+}
+
+UVolumeTexture* AVoxelWorld::GetDensityVolumeTexture(int32 Level) const
+{
+    return DensityVolume ? DensityVolume->GetLevelTexture(Level) : nullptr;
+}
+
+//=============================================================================
+// TERRAIN MATERIAL — density-volume / orb shadow params (MID-driven, see ApplyMeshToTile)
+//=============================================================================
+
+UMaterialInstanceDynamic* AVoxelWorld::GetOrCreateTerrainMID(UMaterialInterface* Base)
+{
+    if (!Base) return nullptr;
+    if (TObjectPtr<UMaterialInstanceDynamic>* Found = TerrainMIDs.Find(Base))
+    {
+        return Found->Get();
+    }
+    UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Base, this);
+    if (MID)
+    {
+        TerrainMIDs.Add(Base, MID);
+        SetVolumeParamsOnMID(MID);   // seed with the current frame's params
+    }
+    return MID;
+}
+
+void AVoxelWorld::SetVolumeParamsOnMID(UMaterialInstanceDynamic* MID) const
+{
+    if (!MID) return;
+    // Static FNames — this runs per MID on every param change; no per-call FName construction.
+    static const FName VolPNames[10] = {
+        FName("VolP0"), FName("VolP1"), FName("VolP2"), FName("VolP3"), FName("VolP4"),
+        FName("VolP5"), FName("VolP6"), FName("VolP7"), FName("VolP8"), FName("VolP9") };
+    static const FName VolTexNames[3] = { FName("VolTex0"), FName("VolTex1"), FName("VolTex2") };
+
+    const FLinearColor* TVPs[10] = { &TVP0, &TVP1, &TVP2, &TVP3, &TVP4, &TVP5, &TVP6, &TVP7, &TVP8, &TVP9 };
+    for (int32 i = 0; i < 10; ++i) { MID->SetVectorParameterValue(VolPNames[i], *TVPs[i]); }
+    if (DensityVolume)
+    {
+        for (int32 L = 0; L < 3; ++L)
+        {
+            if (UVolumeTexture* T = DensityVolume->GetLevelTexture(L)) { MID->SetTextureParameterValue(VolTexNames[L], T); }
+        }
+    }
+}
+
+void AVoxelWorld::UpdateTerrainMaterialParams()
+{
+    if (!DensityVolume || !Settings || !Settings->bEnableDensityVolume) return;
+
+    // --- Per-level clipmap transforms (L0 = finest/near; L1-2 = coarser for shadow REACH) ---
+    // For each level the material maps WorldPos → RelPos = WorldPos - WindowOrigin → cellF = RelPos/Cell →
+    // toroidal UVW = frac((OriginMod + cellF + 0.5)/Res). OriginMod = OriginCells mod Res precomputed here
+    // so the shader never touches the large absolute cell coord (no float precision loss). The shader
+    // derives each level's cell size from L0's (cell_L = L0Cell * 2^L); Res is shared across levels.
+    const FTransform Xf = GetActorTransform();
+    int32 Res = 0;
+    bool bHave = false;
+    float CellWorldSize = VOXEL_SIZE;   // L0 cm per cell
+
+    FLinearColor OriginC[3] = { FLinearColor::Black, FLinearColor::Black, FLinearColor::Black };
+    FLinearColor ModC[3]    = { FLinearColor::Black, FLinearColor::Black, FLinearColor::Black };
+    for (int32 L = 0; L < 3; ++L)
+    {
+        FIntVector OriginCells(0, 0, 0);
+        float StepF = 1.0f;
+        int32 LRes = 0;
+        if (DensityVolume->GetLevelShaderParams(L, OriginCells, StepF, LRes) && LRes > 0)
+        {
+            const FVector OriginLocalCm = FVector(OriginCells.X, OriginCells.Y, OriginCells.Z) * (StepF * VOXEL_SIZE);
+            const FVector OW = Xf.TransformPosition(OriginLocalCm);
+            auto Mod = [LRes](int32 v) { const int32 m = v % LRes; return (float)((m < 0) ? m + LRes : m); };
+            OriginC[L] = FLinearColor(OW.X, OW.Y, OW.Z, 0.0f);
+            ModC[L]    = FLinearColor(Mod(OriginCells.X), Mod(OriginCells.Y), Mod(OriginCells.Z), 0.0f);
+            if (L == 0) { bHave = true; Res = LRes; CellWorldSize = VOXEL_SIZE * StepF; }
+        }
+    }
+    // Track whether anything actually changed — the push below enqueues render-thread updates per MID,
+    // so on the (common) idle frames where the window didn't scroll and the orb didn't change, skip it.
+    bool bDirty = false;
+    auto SetTVP = [&bDirty](FLinearColor& Dst, const FLinearColor& V)
+    {
+        if (Dst != V) { Dst = V; bDirty = true; }
+    };
+    SetTVP(TVP0, OriginC[0]);  SetTVP(TVP1, ModC[0]);
+    SetTVP(TVP6, OriginC[1]);  SetTVP(TVP7, ModC[1]);
+    SetTVP(TVP8, OriginC[2]);  SetTVP(TVP9, ModC[2]);
+
+    // --- Nearest active orb ---
+    FVoxelActiveOrb Best;
+    bool bHaveOrb = false;
+    if (ContentManager)
+    {
+        TArray<FVoxelActiveOrb> Orbs;
+        ContentManager->GetActiveOrbs(Orbs);
+        if (Orbs.Num() > 0)
+        {
+            const FVector P = GetPlayerPosition();
+            float BestD = FLT_MAX;
+            for (const FVoxelActiveOrb& O : Orbs)
+            {
+                const float D = FVector::DistSquared(O.WorldPos, P);
+                if (D < BestD) { BestD = D; Best = O; bHaveOrb = true; }
+            }
+        }
+    }
+
+    // All data lives in .xyz (a Vector Parameter only delivers float3 into a Custom node). Intensity is
+    // premultiplied into the colour; Res / CellWorldSize / Enable go in TVP5.
+    const float Enable = (bHave && bHaveOrb && Res > 0) ? 1.0f : 0.0f;
+    const float Steps = (float)FMath::Clamp(Settings->DensityVolumeMarchSteps, 4, 256);
+    SetTVP(TVP2, FLinearColor(Best.WorldPos.X, Best.WorldPos.Y, Best.WorldPos.Z, 0.0f));
+    SetTVP(TVP3, FLinearColor(Best.Color.R * Best.Intensity, Best.Color.G * Best.Intensity, Best.Color.B * Best.Intensity, 0.0f));
+    SetTVP(TVP4, FLinearColor(Best.MaxShadowDistWorld, Best.FalloffWorld, Steps, 0.0f));
+    SetTVP(TVP5, FLinearColor((float)FMath::Max(Res, 0), CellWorldSize, Enable, 0.0f));
+
+    // Re-push if the L0 texture object itself was recreated (resolution change) even when the packed
+    // params happen to be identical — otherwise the MIDs would keep sampling the dropped texture.
+    UVolumeTexture* Tex0 = DensityVolume->GetLevelTexture(0);
+    if (LastBoundVolTex0.Get() != Tex0) { LastBoundVolTex0 = Tex0; bDirty = true; }
+    if (!bDirty) return;
+
+    // Push to every terrain MID (new MIDs are seeded on creation in GetOrCreateTerrainMID).
+    for (TPair<TObjectPtr<UMaterialInterface>, TObjectPtr<UMaterialInstanceDynamic>>& Pair : TerrainMIDs)
+    {
+        SetVolumeParamsOnMID(Pair.Value.Get());
+    }
+}
+
+void AVoxelWorld::UpdateOrbLightMPC()
+{
+    if (!OrbLightMPC || !ContentManager) return;
+
+    TArray<FVoxelActiveOrb> Orbs;
+    ContentManager->GetActiveOrbs(Orbs);
+
+    // Nearest-first so Orb0..3 are the 4 closest orbs (the Light Function unions their pools; 4 is
+    // plenty since only nearby pools are visible and the player sits inside one or two at a time).
+    const FVector P = GetPlayerPosition();
+    Orbs.Sort([&P](const FVoxelActiveOrb& A, const FVoxelActiveOrb& B)
+    {
+        return FVector::DistSquared(A.WorldPos, P) < FVector::DistSquared(B.WorldPos, P);
+    });
+
+    static const FName OrbNames[4] = { FName("Orb0"), FName("Orb1"), FName("Orb2"), FName("Orb3") };
+    for (int32 i = 0; i < 4; ++i)
+    {
+        // (x,y,z) = orb WORLD position, .w = reach radius in cm (FalloffWorld = how far the pool
+        // extends). Unused slots = all-zero → radius 0 → the mask yields no pool for them.
+        FLinearColor V(0.f, 0.f, 0.f, 0.f);
+        if (i < Orbs.Num())
+        {
+            const FVoxelActiveOrb& O = Orbs[i];
+            V = FLinearColor((float)O.WorldPos.X, (float)O.WorldPos.Y, (float)O.WorldPos.Z, O.FalloffWorld);
+        }
+        // Orbs are static once placed, so most frames change nothing — skip the MPC write (it
+        // dirties the collection's uniform buffer for every material that reads it).
+        if (LastOrbMPC[i] == V) continue;
+        LastOrbMPC[i] = V;
+        UKismetMaterialLibrary::SetVectorParameterValue(this, OrbLightMPC, OrbNames[i], V);
+    }
 }
