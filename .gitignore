@@ -10,4 +10,6 @@
 !/Source/**
 
 !VoxelForge.uplugin
-!CODEMAP.md
+
+# Keep every design / doc markdown at any depth (AUDIT P1 — these were untracked)
+!*.md
