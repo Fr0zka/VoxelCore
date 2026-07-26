@@ -243,4 +243,16 @@ struct FChunkBiomeCache
             && X >= ValidMinX && X <= ValidMaxX
             && Y >= ValidMinY && Y <= ValidMaxY;
     }
+
+    /** AUDIT C2 — force a rebuild on the next query. The validity box says nothing about the
+     *  FBiomeContext the cells were classified AGAINST, so when the strate layout is rebuilt
+     *  (RebuildStrates / an editor live edit) the grid is stale even though the box still
+     *  covers the query. Callers that key on GetLayoutVersion() call this on a version change.
+     *  Le box de validité ne dit rien du contexte de biome ayant servi à classer les cellules :
+     *  après un rebuild de layout, la grille est périmée alors que la boîte couvre encore. */
+    void Invalidate()
+    {
+        ValidMinX = 1.0f; ValidMaxX = -1.0f;   // min > max ⇒ Contains() is false everywhere
+        ChunkZ = MIN_int32;
+    }
 };

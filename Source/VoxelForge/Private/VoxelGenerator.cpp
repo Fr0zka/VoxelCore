@@ -50,6 +50,13 @@ struct FSurfaceColumnBox
     static constexpr int32 Dim  = 2 * Halo + 1;
     int32 BaseX = 0, BaseY = 0;                        // box origin (voxel coords)
     int32 StrateKey = MIN_int32, Seed = MIN_int32;     // key: same strate ⇒ identical heightfield params
+    // AUDIT C2, étendu : StrateKey vaut round(StrateBottomWorldZ), donc une édition à chaud qui
+    // change les params de terrain SANS déplacer la strate (fréquence de bruit, hauteur de
+    // montagne, un biome…) laisse la clé identique et sert des colonnes périmées. C'est la forme
+    // la plus visible du bug : « j'ai retouché le terrain et une zone a gardé l'ancienne forme ».
+    // StrateKey is round(StrateBottomWorldZ), so a live edit that changes terrain params WITHOUT
+    // moving the strate leaves the key unchanged and serves stale columns.
+    uint32 LayoutVersion = 0xFFFFFFFFu;
     uint32 LastUse = 0;                                // LRU stamp
     bool  bValid = false;
     FSurfaceColumn Cols[Dim * Dim];
@@ -64,13 +71,15 @@ struct FSurfaceColumnCache
     FSurfaceColumnBox Boxes[NumBoxes];
     uint32 Clock = 0;
 
-    // Return the box covering (IX,IY) for this (StrateKey,Seed); allocate by evicting the LRU box on miss.
-    FSurfaceColumnBox& Acquire(int32 IX, int32 IY, int32 InStrateKey, int32 InSeed)
+    // Return the box covering (IX,IY) for this (StrateKey,Seed,LayoutVersion); allocate by
+    // evicting the LRU box on miss.
+    FSurfaceColumnBox& Acquire(int32 IX, int32 IY, int32 InStrateKey, int32 InSeed, uint32 InLayoutVersion)
     {
         ++Clock;
         for (FSurfaceColumnBox& B : Boxes)
         {
             if (B.bValid && B.StrateKey == InStrateKey && B.Seed == InSeed
+                && B.LayoutVersion == InLayoutVersion
                 && IX >= B.BaseX && IX < B.BaseX + FSurfaceColumnBox::Dim
                 && IY >= B.BaseY && IY < B.BaseY + FSurfaceColumnBox::Dim)
             {
@@ -81,12 +90,13 @@ struct FSurfaceColumnCache
         // Miss → reuse the least-recently-used box, recentred on this sample.
         FSurfaceColumnBox* Victim = &Boxes[0];
         for (FSurfaceColumnBox& B : Boxes) { if (B.LastUse < Victim->LastUse) Victim = &B; }
-        Victim->BaseX     = IX - FSurfaceColumnBox::Halo;
-        Victim->BaseY     = IY - FSurfaceColumnBox::Halo;
-        Victim->StrateKey = InStrateKey;
-        Victim->Seed      = InSeed;
-        Victim->bValid    = true;
-        Victim->LastUse   = Clock;
+        Victim->BaseX         = IX - FSurfaceColumnBox::Halo;
+        Victim->BaseY         = IY - FSurfaceColumnBox::Halo;
+        Victim->StrateKey     = InStrateKey;
+        Victim->Seed          = InSeed;
+        Victim->LayoutVersion = InLayoutVersion;
+        Victim->bValid        = true;
+        Victim->LastUse       = Clock;
         FMemory::Memzero(Victim->Computed, sizeof(Victim->Computed));
         return *Victim;
     }
@@ -520,9 +530,23 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // are shareable across the whole vertical chunk stack. Taken from the params themselves
         // (StrateBottomWorldZ is unique per stacked strate) so the key can never disagree with CP_Surface.
         thread_local int32                    CP_StrateKey = MIN_int32;
+        // AUDIT C2 — la clé DOIT contenir la version de layout, pas seulement le chunk. Après un
+        // RebuildStrates / une édition à chaud, StrateManager reconstruit le layout et bumpe la
+        // version ; un worker dont CP_Chunk vaut encore ce chunk sauterait le refetch et
+        // générerait avec les ANCIENS params. Comme RegenerateAllChunks recharge les MÊMES coords
+        // de tuile, souvent sur les MÊMES workers, le cas est probable plutôt qu'exotique.
+        // The key MUST include the layout version, not just the chunk coord. Symptom without it:
+        // "I tweaked the strate asset, regenerated, and one patch kept the old shape."
+        thread_local uint32                   CP_Version = 0xFFFFFFFFu;
 
-        if (ChunkCoord != CP_Chunk)
+        const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
+        if (ChunkCoord != CP_Chunk || LayoutVersion != CP_Version)
         {
+            // La grille de biome est validée par une BOÎTE XY, qui ne dit rien du FBiomeContext
+            // ayant servi à classer ses cellules : sur un changement de version elle est périmée
+            // même si la boîte couvre encore la requête.
+            if (LayoutVersion != CP_Version) { CP_BiomeCache.Invalidate(); }
+            CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
             switch (CP_GenType)
@@ -563,7 +587,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 const int32 IX = (int32)WorldX, IY = (int32)WorldY;
                 // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
                 // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
-                FSurfaceColumnBox& Box = GSurfColCache.Acquire(IX, IY, CP_StrateKey, Seed);
+                FSurfaceColumnBox& Box = GSurfColCache.Acquire(IX, IY, CP_StrateKey, Seed, LayoutVersion);
                 const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
                 if (!Box.Computed[CI])
                 {
@@ -2422,8 +2446,13 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
     thread_local FBiomeContext                   OC_BiomeCtx;
     thread_local TArray<FSurfaceGenerationParams> OC_BiomeParams;
     thread_local FChunkBiomeCache                OC_BiomeCache;
-    if (ChunkCoord != OC_Chunk)
+    thread_local uint32                          OC_Version = 0xFFFFFFFFu;   // AUDIT C2
+
+    const uint32 OC_LayoutVersion = StrateManager->GetLayoutVersion();
+    if (ChunkCoord != OC_Chunk || OC_LayoutVersion != OC_Version)
     {
+        if (OC_LayoutVersion != OC_Version) { OC_BiomeCache.Invalidate(); }
+        OC_Version = OC_LayoutVersion;
         OC_Chunk = ChunkCoord;
         ResolveSurfaceChunkParams(ChunkCoord, OC_Surface, OC_BiomeCtx, OC_BiomeParams);
     }
@@ -2509,6 +2538,15 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     // thread_local : les TArray gardent leur capacité d'un appel à l'autre (zéro malloc/tuile).
     static thread_local FSurfSlot Slots[2];
     static thread_local FChunkBiomeCache TC_BiomeCache;   // biome grid du classifieur (valeurs ≡ CP_BiomeCache)
+    // AUDIT C2 — même discipline que le chemin densité : la grille de biome du classifieur survit
+    // d'un appel à l'autre et sa boîte de validité ne dit rien du contexte qui l'a produite.
+    static thread_local uint32 TC_SeenVersion = 0xFFFFFFFFu;
+    const uint32 TC_LayoutVersion = StrateManager->GetLayoutVersion();
+    if (TC_LayoutVersion != TC_SeenVersion)
+    {
+        TC_SeenVersion = TC_LayoutVersion;
+        TC_BiomeCache.Invalidate();
+    }
     int32 NumSlots = 0;
 
     int32 MemoChunkZ  = INT32_MAX;
@@ -2607,7 +2645,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         {
             FSurfSlot& S = Slots[s];
             if (S.InteriorZ.Num() == 0) continue;
-            FSurfaceColumnBox& Box = GSurfColCache.Acquire(Xi, Yi, S.StrateKey, Seed);
+            FSurfaceColumnBox& Box = GSurfColCache.Acquire(Xi, Yi, S.StrateKey, Seed, TC_LayoutVersion);
             const int32 CI = (Yi - Box.BaseY) * FSurfaceColumnBox::Dim + (Xi - Box.BaseX);
             if (!Box.Computed[CI])
             {
@@ -3045,8 +3083,13 @@ void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float World
     thread_local FIntVector       BM_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
     thread_local FBiomeContext    BM_Ctx;
     thread_local FChunkBiomeCache BM_Cache;
-    if (ChunkCoord != BM_Chunk)
+    thread_local uint32           BM_Version = 0xFFFFFFFFu;   // AUDIT C2
+
+    const uint32 BM_LayoutVersion = StrateManager->GetLayoutVersion();
+    if (ChunkCoord != BM_Chunk || BM_LayoutVersion != BM_Version)
     {
+        if (BM_LayoutVersion != BM_Version) { BM_Cache.Invalidate(); }
+        BM_Version = BM_LayoutVersion;
         BM_Chunk = ChunkCoord;
         BM_Ctx   = StrateManager->GetBiomeContextForChunk(ChunkCoord);
     }
