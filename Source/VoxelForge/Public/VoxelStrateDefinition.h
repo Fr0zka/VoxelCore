@@ -326,6 +326,8 @@ public:
     // Landmarks: RARE, large, far-visible objects placed on a coarse hash lattice (the underground
     // "mini-suns" etc.). Strate-wide; each entry has its own spacing/biome/placement/transform settings.
     // Cheap at any radius — see FStrateLandmark / §8.5. (NOT part of the per-chunk decoration grid.)
+    // Landmarks now cover set-pieces too (AnchorMode HashLattice/PassageMouth + exclusion + orb). See
+    // FStrateLandmark / §8.5 (F7).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Content")
     TArray<FStrateLandmark> Landmarks;
 

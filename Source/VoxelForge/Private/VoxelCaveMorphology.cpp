@@ -50,6 +50,44 @@ struct FBuildRoom
 };
 
 //=============================================================================
+// INTERNAL: Shared hash-placement skeleton for the per-room baked features
+// (pits / chimneys / columns). Squelette commun de placement par hash — les
+// trois boucles de bake étaient des copies quasi identiques de ce motif.
+//
+// Rolls EXACTLY the hash chain the hand-written loops used (bit-identical):
+//   H  = Mix(RoomHash ^ (SaltBase + i * SaltStep))  → density gate
+//   H2 = Mix(H ^ Salt2)                             → XY offset (X: H2, Y: Mix(H2))
+//   H3 = Mix(H2 ^ Salt3)                            → radius lerp [MinRadius, MaxRadius]
+// Type-specific work (Z anchor, flare, bounds, struct fill) lives in the Emit
+// lambda; it receives H3 so pits/chimneys can chain their 4th hash from it.
+//=============================================================================
+template <typename FEmit>
+static void BakeRoomFeature(
+    const FCachedRoom& CR,
+    int32 MaxCount, float Density,
+    uint32 SaltBase, uint32 SaltStep, uint32 Salt2, uint32 Salt3,
+    float XYScale, float MinRadius, float MaxRadius,
+    FEmit&& Emit)   // Emit(X, Y, Radius, H3)
+{
+    if (Density <= 0.0f) return;
+
+    for (int32 i = 0; i < MaxCount; i++)
+    {
+        const uint32 H = VoxelHash::Mix(CR.Hash ^ (SaltBase + (uint32)i * SaltStep));
+        if (VoxelHash::ToFloat01(H) > Density) continue;
+
+        const uint32 H2 = VoxelHash::Mix(H ^ Salt2);
+        const uint32 H3 = VoxelHash::Mix(H2 ^ Salt3);
+
+        const float X = CR.Center.X + VoxelHash::ToFloatSigned(H2) * CR.RadiusXY * XYScale;
+        const float Y = CR.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(H2)) * CR.RadiusXY * XYScale;
+        const float R = FMath::Lerp(MinRadius, MaxRadius, VoxelHash::ToFloat01(H3));
+
+        Emit(X, Y, R, H3);
+    }
+}
+
+//=============================================================================
 // PHASE 1: BUILD CHUNK CACHE
 //=============================================================================
 // Collects all rooms in the COLLECT region, computes a window-invariant
@@ -541,6 +579,41 @@ void VoxelCaveMorphology::BuildChunkCache(
         float MaxExtent = FMath::Max(BR.RadiusXY * 1.5f, BR.RadiusZ) + BlendK * 3.0f;
         CR.CullRadiusSq = MaxExtent * MaxExtent;
 
+        // --- PRE-BAKED SHAPE ---
+        // Same hash roll + thresholds + capsule trig the evaluator used to redo PER VOXEL;
+        // done once here → EvaluateSDFCached just switches on ShapeType. Bit-identical output.
+        {
+            const uint32 ShapeHash = VoxelHash::Mix(CR.Hash ^ 0xDEADBEEFu);
+            const float ShapeRoll = CR.bIsOrigin ? 0.0f : VoxelHash::ToFloat01(ShapeHash);
+            const float BoxThreshold     = 1.0f - Params.RoomShapeVariety * 0.5f;
+            const float CapsuleThreshold = 1.0f - Params.RoomShapeVariety * 0.2f;
+
+            if (ShapeRoll >= BoxThreshold && ShapeRoll < CapsuleThreshold)
+            {
+                // ROUNDED BOX: angular chamber with smooth corners
+                CR.ShapeType = 1;
+                CR.ShapeA = FVector(CR.RadiusXY * 0.8f, CR.RadiusXY * 0.8f, CR.RadiusZ * 0.8f);
+                CR.ShapeR = CR.RadiusXY * 0.25f;
+            }
+            else if (ShapeRoll >= CapsuleThreshold)
+            {
+                // ELONGATED CAPSULE: stretched hall/corridor-room
+                CR.ShapeType = 2;
+                const float DirAngle = VoxelHash::ToFloat01(VoxelHash::Mix(CR.Hash ^ 0xCAFEBABEu)) * 2.0f * PI;
+                const float StretchDist = CR.RadiusXY * 0.7f;
+                const FVector Dir(FMath::Cos(DirAngle), FMath::Sin(DirAngle), 0.0f);
+                CR.ShapeA = CR.Center + Dir * StretchDist;
+                CR.ShapeB = CR.Center - Dir * StretchDist;
+                CR.ShapeR = FMath::Min(CR.RadiusXY * 0.6f, CR.RadiusZ);
+            }
+            else
+            {
+                // ELLIPSOID (default): smooth oval chamber
+                CR.ShapeType = 0;
+                CR.ShapeA = FVector(CR.RadiusXY, CR.RadiusXY, CR.RadiusZ);
+            }
+        }
+
         // Flat floor cut: soft floor plane per room, hash-rolled from [Min, Max].
         // SmoothMax applied in EvaluateSDFCached so tunnels/pits don't create hard seams.
         // Sentinel -FLT_MAX means "no cut" so the per-voxel check is a single compare.
@@ -604,110 +677,67 @@ void VoxelCaveMorphology::BuildChunkCache(
         OpParams = FStrateGenerationParams{};
         CR.RoomOp->ApplyTo(OpParams, CR.RoomOpWeight);
 
-        // PITS
-        if (OpParams.PitDensity > 0.0f)
-        {
-            const int32 MaxPits = 2;
-            for (int32 i = 0; i < MaxPits; i++)
+        // PITS — downward shafts anchored in the room's lower half.
+        BakeRoomFeature(CR, /*Max*/2, OpParams.PitDensity,
+            0xDE1A7Eu, 6271u, 0xABCDu, 0x5EEDu,
+            /*XYScale*/0.6f, OpParams.PitMinRadius, OpParams.PitMaxRadius,
+            [&](float PX, float PY, float PitRadius, uint32 PH3)
             {
-                uint32 PH  = VoxelHash::Mix(BR.Hash ^ (0xDE1A7Eu + (uint32)i * 6271u));
-                if (VoxelHash::ToFloat01(PH) > OpParams.PitDensity) continue;
-
-                uint32 PH2 = VoxelHash::Mix(PH  ^ 0xABCDu);
-                uint32 PH3 = VoxelHash::Mix(PH2 ^ 0x5EEDu);
-                uint32 PH4 = VoxelHash::Mix(PH3 ^ 0xF00Du);
-
-                float PX = CR.Center.X + VoxelHash::ToFloatSigned(PH2) * CR.RadiusXY * 0.6f;
-                float PY = CR.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(PH2)) * CR.RadiusXY * 0.6f;
-
-                float PitRadius = FMath::Lerp(OpParams.PitMinRadius, OpParams.PitMaxRadius,
-                                              VoxelHash::ToFloat01(PH3));
-
-                float PitTopZ = CR.Center.Z - CR.RadiusZ * 0.5f
-                                + VoxelHash::ToFloat01(PH4) * CR.RadiusZ * 0.2f;
-
+                const uint32 PH4 = VoxelHash::Mix(PH3 ^ 0xF00Du);
                 FCachedPit Pit;
                 Pit.CenterX       = PX;
                 Pit.CenterY       = PY;
-                Pit.TopZ          = PitTopZ;
+                Pit.TopZ          = CR.Center.Z - CR.RadiusZ * 0.5f
+                                    + VoxelHash::ToFloat01(PH4) * CR.RadiusZ * 0.2f;
                 Pit.Radius        = PitRadius;
                 Pit.Depth         = OpParams.PitDepth;
                 Pit.FlareDist     = PitRadius * 2.0f;
                 Pit.FlareExtra    = PitRadius * 1.0f;
                 Pit.BaseDensity   = Params.BaseDensity;
                 Pit.BlendK        = Params.SDFBlendRadius;
-                float MaxXYR      = PitRadius + PitRadius + Params.SDFBlendRadius + 4.0f;
+                const float MaxXYR = PitRadius + PitRadius + Params.SDFBlendRadius + 4.0f;
                 Pit.BoundXYRadiusSq = MaxXYR * MaxXYR;
                 OutCache.Pits.Add(Pit);
-            }
-        }
+            });
 
-        // CHIMNEYS
-        if (OpParams.ChimneyDensity > 0.0f)
-        {
-            const int32 MaxChimneys = 2;
-            for (int32 i = 0; i < MaxChimneys; i++)
+        // CHIMNEYS — mirror of pits: upward tubes anchored in the room's upper half.
+        BakeRoomFeature(CR, /*Max*/2, OpParams.ChimneyDensity,
+            0xC4F007u, 7919u, 0x1337u, 0xCAFEu,
+            /*XYScale*/0.6f, OpParams.ChimneyMinRadius, OpParams.ChimneyMaxRadius,
+            [&](float CX, float CY, float ChmRadius, uint32 CH3)
             {
-                uint32 CH  = VoxelHash::Mix(BR.Hash ^ (0xC4F007u + (uint32)i * 7919u));
-                if (VoxelHash::ToFloat01(CH) > OpParams.ChimneyDensity) continue;
-
-                uint32 CH2 = VoxelHash::Mix(CH  ^ 0x1337u);
-                uint32 CH3 = VoxelHash::Mix(CH2 ^ 0xCAFEu);
-                uint32 CH4 = VoxelHash::Mix(CH3 ^ 0xD00Du);
-
-                float CX = CR.Center.X + VoxelHash::ToFloatSigned(CH2) * CR.RadiusXY * 0.6f;
-                float CY = CR.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(CH2)) * CR.RadiusXY * 0.6f;
-
-                float ChmRadius = FMath::Lerp(OpParams.ChimneyMinRadius, OpParams.ChimneyMaxRadius,
-                                              VoxelHash::ToFloat01(CH3));
-
-                float ChmBottomZ = CR.Center.Z + CR.RadiusZ * 0.5f
-                                   - VoxelHash::ToFloat01(CH4) * CR.RadiusZ * 0.2f;
-
+                const uint32 CH4 = VoxelHash::Mix(CH3 ^ 0xD00Du);
                 FCachedChimney Chim;
                 Chim.CenterX       = CX;
                 Chim.CenterY       = CY;
-                Chim.BottomZ       = ChmBottomZ;
+                Chim.BottomZ       = CR.Center.Z + CR.RadiusZ * 0.5f
+                                     - VoxelHash::ToFloat01(CH4) * CR.RadiusZ * 0.2f;
                 Chim.Radius        = ChmRadius;
                 Chim.Height        = OpParams.ChimneyHeight;
                 Chim.FlareDist     = ChmRadius * 2.0f;
                 Chim.FlareExtra    = ChmRadius * 1.0f;
                 Chim.BaseDensity   = Params.BaseDensity;
                 Chim.BlendK        = Params.SDFBlendRadius;
-                float MaxXYR       = ChmRadius + ChmRadius + Params.SDFBlendRadius + 4.0f;
+                const float MaxXYR = ChmRadius + ChmRadius + Params.SDFBlendRadius + 4.0f;
                 Chim.BoundXYRadiusSq = MaxXYR * MaxXYR;
                 OutCache.Chimneys.Add(Chim);
-            }
-        }
+            });
 
-        // COLUMNS
-        if (OpParams.ColumnDensity > 0.0f)
-        {
-            const int32 MaxCols = 4;
-            for (int32 i = 0; i < MaxCols; i++)
+        // COLUMNS — full-height solid cylinders (no Z anchor, no flare).
+        BakeRoomFeature(CR, /*Max*/4, OpParams.ColumnDensity,
+            0xC01C01u, 3571u, 0x1A2B3Cu, 0xBEEFu,
+            /*XYScale*/0.75f, OpParams.ColumnMinRadius, OpParams.ColumnMaxRadius,
+            [&](float ColX, float ColY, float ColR, uint32 /*H3*/)
             {
-                uint32 H  = VoxelHash::Mix(BR.Hash ^ (0xC01C01u + (uint32)i * 3571u));
-                if (VoxelHash::ToFloat01(H) > OpParams.ColumnDensity) continue;
-
-                uint32 H2 = VoxelHash::Mix(H  ^ 0x1A2B3Cu);
-
-                float ColX = CR.Center.X + VoxelHash::ToFloatSigned(H2) * CR.RadiusXY * 0.75f;
-                float ColY = CR.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(H2)) * CR.RadiusXY * 0.75f;
-
-                uint32 H3     = VoxelHash::Mix(H2 ^ 0xBEEFu);
-                float ColR    = FMath::Lerp(OpParams.ColumnMinRadius, OpParams.ColumnMaxRadius,
-                                            VoxelHash::ToFloat01(H3));
-
                 FCachedColumn Col;
                 Col.CenterX       = ColX;
                 Col.CenterY       = ColY;
                 Col.Radius        = ColR;
                 Col.BaseDensity   = Params.BaseDensity;
-                float MaxXYR      = ColR + 6.0f;
+                const float MaxXYR = ColR + 6.0f;
                 Col.BoundXYRadiusSq = MaxXYR * MaxXYR;
                 OutCache.Columns.Add(Col);
-            }
-        }
+            });
     }
 }
 
@@ -723,7 +753,6 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache,
     float SDFBlendRadius,
-    float RoomShapeVariety,
     int32* OutNearestRoomIdx)
 {
     float MinSDF = FLT_MAX;
@@ -748,42 +777,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         const float DistSq = FVector::DistSquared(Pos, Room.Center);
         if (DistSq > Room.CullRadiusSq) continue;
 
-        // --- SHAPE SELECTION ---
+        // --- SHAPE (pre-baked in BuildChunkCache — no per-voxel hash roll / trig) ---
         float RoomSDF;
-        const uint32 ShapeHash = VoxelHash::Mix(Room.Hash ^ 0xDEADBEEFu);
-        const float ShapeRoll = Room.bIsOrigin ? 0.0f : VoxelHash::ToFloat01(ShapeHash);
-
-        // Thresholds: Variety=0 → all ellipsoid. Variety=1 → 50/30/20 split.
-        const float BoxThreshold = 1.0f - RoomShapeVariety * 0.5f;
-        const float CapsuleThreshold = 1.0f - RoomShapeVariety * 0.2f;
-
-        if (ShapeRoll >= BoxThreshold && ShapeRoll < CapsuleThreshold)
+        switch (Room.ShapeType)
         {
-            // ROUNDED BOX: angular chamber with smooth corners
-            FVector HalfExtent(
-                Room.RadiusXY * 0.8f,
-                Room.RadiusXY * 0.8f,
-                Room.RadiusZ * 0.8f
-            );
-            float Rounding = Room.RadiusXY * 0.25f;
-            RoomSDF = VoxelSDF::RoundedBox(Pos, Room.Center, HalfExtent, Rounding);
-        }
-        else if (ShapeRoll >= CapsuleThreshold)
-        {
-            // ELONGATED CAPSULE: stretched hall/corridor-room
-            float DirAngle = VoxelHash::ToFloat01(VoxelHash::Mix(Room.Hash ^ 0xCAFEBABEu)) * 2.0f * PI;
-            float StretchDist = Room.RadiusXY * 0.7f;
-            FVector Dir(FMath::Cos(DirAngle), FMath::Sin(DirAngle), 0.0f);
-            FVector EndA = Room.Center + Dir * StretchDist;
-            FVector EndB = Room.Center - Dir * StretchDist;
-            float CapsuleR = FMath::Min(Room.RadiusXY * 0.6f, Room.RadiusZ);
-            RoomSDF = VoxelSDF::Capsule(Pos, EndA, EndB, CapsuleR);
-        }
-        else
-        {
-            // ELLIPSOID (default): smooth oval chamber
-            const FVector Radii(Room.RadiusXY, Room.RadiusXY, Room.RadiusZ);
-            RoomSDF = VoxelSDF::Ellipsoid(Pos, Room.Center, Radii);
+        case 1:  RoomSDF = VoxelSDF::RoundedBox(Pos, Room.Center, Room.ShapeA, Room.ShapeR); break;
+        case 2:  RoomSDF = VoxelSDF::Capsule(Pos, Room.ShapeA, Room.ShapeB, Room.ShapeR);    break;
+        default: RoomSDF = VoxelSDF::Ellipsoid(Pos, Room.Center, Room.ShapeA);               break;
         }
 
         // Soft floor: SmoothMax of the room SDF and the floor half-space.
@@ -883,6 +883,6 @@ float VoxelCaveMorphology::EvaluateSDF(
 
     return EvaluateSDFCached(
         WorldX, WorldY, WorldZ,
-        TempCache, Params.SDFBlendRadius, Params.RoomShapeVariety
+        TempCache, Params.SDFBlendRadius
     );
 }

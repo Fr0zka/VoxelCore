@@ -452,6 +452,27 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     return MinSDF;
 }
 
+bool UVoxelStrateManager::AnyPassageNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const
+{
+    // Le carve d'un passage atteint ModSDF < PASSAGE_BLEND_RADIUS (4, VoxelGenerator.cpp) au-delà de
+    // sa surface ; BoundRadius inclut déjà rayon + blend, on re-pad par sécurité (conservatif).
+    constexpr float CarvePad = 4.0f;
+    for (const FVoxelPassage& P : Passages)
+    {
+        // Point de la boîte le plus proche du centre de la sphère → test sphère/AABB.
+        const FVector C(
+            FMath::Clamp(P.BoundCenter.X, MinVoxel.X, MaxVoxel.X),
+            FMath::Clamp(P.BoundCenter.Y, MinVoxel.Y, MaxVoxel.Y),
+            FMath::Clamp(P.BoundCenter.Z, MinVoxel.Z, MaxVoxel.Z));
+        const float Reach = P.BoundRadius + CarvePad;
+        if (FVector::DistSquared(C, P.BoundCenter) <= Reach * Reach)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 //=============================================================================
 // QUERIES
 //=============================================================================

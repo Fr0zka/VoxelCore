@@ -36,9 +36,47 @@ public:
      *                       densité déjà échantillonnée, quantifiés via VF_QuantizeDensity. Cela évite à
      *                       UVoxelDensityVolume de re-sampler GetDensityAt pour ces cellules (le mesher
      *                       les a déjà calculées). Vidé puis rempli ; reste vide si non éligible.
+     * @param BandZMinVox / BandZMaxVox - COUPE DE CONTENU PAR STRATE (optionnel, voxels Z INCLUSIFS,
+     *                       cf. UVoxelSettings::StrateContentCutMinLevel) : seules les cellules dont
+     *                       l'intervalle Z chevauche la bande sont maillées. Une tuile grossière qui
+     *                       chevauche une frontière de strate ne maille que la strate du joueur —
+     *                       supprime les trous d'aliasing (le bouchon seal/gap plus fin que Step
+     *                       tombait entre deux points du treillis) et le mélange de matériaux entre
+     *                       strates. Les cellules maillées restent identiques au bit près (mêmes
+     *                       échantillons monde purs). Jamais combiné avec OutCaptureGrid.
      */
     FVoxelMeshData GenerateMesh(FIntVector OriginVoxels, int32 Step = 1, int32 CellsPerAxis = CHUNK_SIZE,
-                                TArray<uint8>* OutCaptureGrid = nullptr);
+                                TArray<uint8>* OutCaptureGrid = nullptr,
+                                int32 BandZMinVox = INT32_MIN, int32 BandZMaxVox = INT32_MAX);
+
+    /**
+     * F18 — FEUILLE de champ lointain (anneau render-distance, cf. UVoxelSettings::bFarSheetRing).
+     * Dans une strate ouverte (SurfaceWorld) le champ lointain est exactement DEUX heightfields —
+     * TerrainZ (sol) et CeilSurf (plafond sky-cap), déjà calculés par colonne par l'oracle
+     * GetSurfaceHeightAt. On construit donc deux grilles déplacées régulières au lieu d'un marching
+     * cubes 3D : sol = polygroup 0, cap = polygroup 1 (classes vraies PAR CONSTRUCTION — pas de vote,
+     * pas de sonde de classification), mêmes conventions que GenerateMesh (positions monde cm, UVs
+     * planaires, masques couleur F6 biome/pente/fondu, normales du gradient de hauteur, jupes
+     * périmètre par seau, run d'indices sol‖cap + NumCeilingTriangles).
+     *
+     * @param OriginVoxels  - Coin min de la tuile (voxels). Seul XY est utilisé (les hauteurs sont absolues).
+     * @param StepXY        - Pas d'échantillonnage XY en voxels (aligné sur l'anneau MC pour la continuité).
+     * @param CellsXY       - Cellules par axe XY (extent = CellsXY × StepXY).
+     * @param StrateChunkZ  - Chunk Z DANS la strate de référence (le cœur de la bande) — identifie la
+     *                        strate dont on maille sol+cap. Hors SurfaceWorld ⇒ mesh vide.
+     * @param HoleMin/MaxX/YVox - TROU XY (voxels, Max EXCLUSIF ; sentinelles MAX/MIN = pas de trou) :
+     *                        les cellules ENTIÈREMENT dans ce rectangle (la zone couverte par les
+     *                        coquilles MC autour du joueur) sont sautées — sinon la feuille recouvre
+     *                        le terrain proche avec son échantillonnage grossier. Les cellules à
+     *                        cheval restent (anneau de recouvrement au raccord) ; pas de jupe sur
+     *                        les bords du trou (le terrain MC remplit derrière).
+     * Non couvert (accepté, cf. fable-idea F18) : passages/spine/chasms creusés (le heightfield pur ne
+     * les contient pas), diff layer — invisibles à distance de feuille, l'anneau MC proche les garde.
+     */
+    FVoxelMeshData GenerateSheetMesh(FIntVector OriginVoxels, int32 StepXY, int32 CellsXY,
+                                     int32 StrateChunkZ,
+                                     int32 HoleMinXVox = INT32_MAX, int32 HoleMinYVox = INT32_MAX,
+                                     int32 HoleMaxXVox = INT32_MIN, int32 HoleMaxYVox = INT32_MIN);
 
     //=========================================================================
     // SERVICES (injectés par AVoxelWorld)
@@ -66,4 +104,11 @@ public:
     // Profondeur de la jupe, en CELLULES de la tuile (× Step × VOXEL_SIZE). ~2 cellules couvrent
     // l'écart vers un voisin un niveau plus grossier (cellule 2×). Monter si des fissures persistent.
     float SkirtCells = 2.0f;
+
+    // T2.b — LOD-aware octave reduction (opt-in, copied from UVoxelSettings::LODOctaveDrop).
+    // Octaves dropped from per-voxel volumetric noise PER Step doubling: a tile at Step=S
+    // drops LODOctaveDrop * log2(S) octaves (see VoxelGenLOD in VoxelGenerator.h).
+    // 0 (default) = off — every LOD samples full octaves, byte-identical to before.
+    // Réduction d'octaves sur les tuiles grossières ; 0 = désactivé.
+    int32 LODOctaveDrop = 0;
 };

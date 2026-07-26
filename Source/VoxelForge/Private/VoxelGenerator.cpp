@@ -31,7 +31,15 @@
 // task scheduler) reuse one another's heavy column noise instead of each recomputing it ~once per
 // vertical chunk in view. Validity stays a world-XY BOX (chunk footprint + margin) so the ±1 gradient /
 // +X/+Y boundary samples don't thrash it (same discipline as the SDF/biome caches, §8.10).
-struct FSurfaceColumn { float TerrainZ = 0.0f; float CeilSurf = 0.0f; };
+// F20 phase 2 OVERHANG, resolved once per column (biome-blended, slope-gated) so the per-voxel
+// density path is cheap: OverhangAmp = strength · slope-gate (0 ⇒ no overhang here); (DirX,DirY) =
+// the UNIT UPHILL direction of the terrain gradient (the lip extends downhill, borrowing rock from
+// uphill). See SurfaceDensityFromColumn for the warped-terrain union that makes the shelf.
+struct FSurfaceColumn
+{
+    float TerrainZ = 0.0f; float CeilSurf = 0.0f;
+    float OverhangAmp = 0.0f; float DirX = 0.0f; float DirY = 0.0f;
+};
 
 struct FSurfaceColumnBox
 {
@@ -84,6 +92,11 @@ struct FSurfaceColumnCache
     }
 };
 
+// Cache de colonnes PARTAGÉ par thread : GetDensityAt (hot path, T1.a) + ClassifyTile (T1.d).
+// Les deux stockent des valeurs bit-identiques (même ComputeSurfaceColumn, champs purs en XY),
+// donc un ClassifyTile qui rend Mixed laisse ses colonnes chaudes pour le GenerateMesh qui suit.
+static thread_local FSurfaceColumnCache GSurfColCache;
+
 //=============================================================================
 // FRACTAL NOISE (fBm — fractional Brownian motion)
 //=============================================================================
@@ -93,6 +106,10 @@ struct FSurfaceColumnCache
 //   Octave 3: freq=4f, amp=0.25  → petits cailloux
 // Lacunarity = x freq par octave (2 = double à chaque fois)
 // Persistence = x amp par octave (0.5 = moitié)
+
+// T2.b — per-thread octave bias for the tile being meshed (see VoxelGenerator.h).
+// 0 = full quality; set by the mesher per tile from Step + Settings->LODOctaveDrop.
+thread_local int32 VoxelGenLOD::OctaveBias = 0;
 
 // NOTE (T2.a): the fBm/Ridged bodies moved to VoxelNoise.h, where octaves are evaluated
 // 4-wide via SSE (Perlin3D_x4). These thin wrappers keep every call site unchanged. They
@@ -305,23 +322,42 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
         return FMath::Sqrt(FMath::Square(px - cx) + FMath::Square(py - cy));
     };
 
+    // Each feature's 3×3 lattice candidates (existence roll, jitter, angle trig, Z anchor) are pure
+    // functions of (cell, seed, params) yet were re-hashed PER VOXEL — including Cos/Sin per bridge/
+    // ridge candidate. Bake each feature's nearby primitives once per centre cell (thread_local);
+    // the per-voxel work is just the distance math. Bit-identical (same hashes, same math).
+
     // --- CHASMS: vertical rifts carve open air ---
     if (D.ChasmDensity > 0.0f && D.ChasmSpacing > 0.0f)
     {
         const float Sp = D.ChasmSpacing;
         const int32 cx = FMath::FloorToInt(X / Sp), cy = FMath::FloorToInt(Y / Sp);
-        float sdf = FLT_MAX;
-        for (int32 dy = -1; dy <= 1; dy++)
-        for (int32 dx = -1; dx <= 1; dx++)
+
+        struct FChasm { float X, Y; };
+        thread_local TArray<FChasm, TInlineAllocator<9>> Chasms;
+        thread_local int32  CH_CX = INT32_MAX, CH_CY = INT32_MAX;
+        thread_local uint32 CH_Seed = 0xFFFFFFFFu;
+        thread_local float  CH_Sp = -1.0f, CH_Dens = -1.0f;
+        if (cx != CH_CX || cy != CH_CY || Seed != CH_Seed || Sp != CH_Sp || D.ChasmDensity != CH_Dens)
         {
-            const int32 nx = cx + dx, ny = cy + dy;
-            const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x43480001u);
-            if (VoxelHash::ToFloat01(h) > D.ChasmDensity) continue;
-            const float jx = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x12345678u));
-            const float jy = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x9ABCDEF0u));
-            const float ccx = (nx + 0.15f + jx * 0.7f) * Sp;
-            const float ccy = (ny + 0.15f + jy * 0.7f) * Sp;
-            sdf = FMath::Min(sdf, FMath::Sqrt(FMath::Square(X - ccx) + FMath::Square(Y - ccy)) - D.ChasmRadius);
+            CH_CX = cx;  CH_CY = cy;  CH_Seed = Seed;  CH_Sp = Sp;  CH_Dens = D.ChasmDensity;
+            Chasms.Reset();
+            for (int32 dy = -1; dy <= 1; dy++)
+            for (int32 dx = -1; dx <= 1; dx++)
+            {
+                const int32 nx = cx + dx, ny = cy + dy;
+                const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x43480001u);
+                if (VoxelHash::ToFloat01(h) > D.ChasmDensity) continue;
+                const float jx = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x12345678u));
+                const float jy = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x9ABCDEF0u));
+                Chasms.Add({ (nx + 0.15f + jx * 0.7f) * Sp, (ny + 0.15f + jy * 0.7f) * Sp });
+            }
+        }
+
+        float sdf = FLT_MAX;
+        for (const FChasm& C : Chasms)
+        {
+            sdf = FMath::Min(sdf, FMath::Sqrt(FMath::Square(X - C.X) + FMath::Square(Y - C.Y)) - D.ChasmRadius);
         }
         if (sdf < Blend)
         {
@@ -336,22 +372,39 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     {
         const float Sp = D.BridgeSpacing;
         const int32 cx = FMath::FloorToInt(X / Sp), cy = FMath::FloorToInt(Y / Sp);
-        float sdf = FLT_MAX;
-        for (int32 dy = -1; dy <= 1; dy++)
-        for (int32 dx = -1; dx <= 1; dx++)
+
+        struct FBridge { FVector A, B; };
+        thread_local TArray<FBridge, TInlineAllocator<9>> Bridges;
+        thread_local int32  BR_CX = INT32_MAX, BR_CY = INT32_MAX;
+        thread_local uint32 BR_Seed = 0xFFFFFFFFu;
+        thread_local float  BR_Sp = -1.0f, BR_Dens = -1.0f, BR_Bot = FLT_MAX, BR_Top = FLT_MAX;
+        if (cx != BR_CX || cy != BR_CY || Seed != BR_Seed || Sp != BR_Sp ||
+            D.BridgeDensity != BR_Dens || InnerBot != BR_Bot || InnerTop != BR_Top)
         {
-            const int32 nx = cx + dx, ny = cy + dy;
-            const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x42520001u);
-            if (VoxelHash::ToFloat01(h) > D.BridgeDensity) continue;
-            const float zc = FMath::Lerp(InnerBot + 8.0f, InnerTop - 8.0f,
-                                         VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB1u)));
-            const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB2u)) * PI;
-            const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
-            const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
-            const float half = Sp * 0.6f;
-            const FVector A(bx - dxu * half, by - dyu * half, zc);
-            const FVector B(bx + dxu * half, by + dyu * half, zc);
-            sdf = FMath::Min(sdf, VoxelSDF::Capsule(P, A, B, D.BridgeRadius));
+            BR_CX = cx;  BR_CY = cy;  BR_Seed = Seed;  BR_Sp = Sp;
+            BR_Dens = D.BridgeDensity;  BR_Bot = InnerBot;  BR_Top = InnerTop;
+            Bridges.Reset();
+            for (int32 dy = -1; dy <= 1; dy++)
+            for (int32 dx = -1; dx <= 1; dx++)
+            {
+                const int32 nx = cx + dx, ny = cy + dy;
+                const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x42520001u);
+                if (VoxelHash::ToFloat01(h) > D.BridgeDensity) continue;
+                const float zc = FMath::Lerp(InnerBot + 8.0f, InnerTop - 8.0f,
+                                             VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB1u)));
+                const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB2u)) * PI;
+                const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
+                const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
+                const float half = Sp * 0.6f;
+                Bridges.Add({ FVector(bx - dxu * half, by - dyu * half, zc),
+                              FVector(bx + dxu * half, by + dyu * half, zc) });
+            }
+        }
+
+        float sdf = FLT_MAX;
+        for (const FBridge& Br : Bridges)
+        {
+            sdf = FMath::Min(sdf, VoxelSDF::Capsule(P, Br.A, Br.B, D.BridgeRadius));
         }
         if (sdf < Blend)
         {
@@ -369,19 +422,34 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
         if (Z < TopZ)
         {
             const int32 cx = FMath::FloorToInt(X / Sp), cy = FMath::FloorToInt(Y / Sp);
-            float best = -FLT_MAX;  // strongest fill across nearby blades
-            for (int32 dy = -1; dy <= 1; dy++)
-            for (int32 dx = -1; dx <= 1; dx++)
+
+            struct FRidge { float AX, AY, BX, BY; };
+            thread_local TArray<FRidge, TInlineAllocator<9>> Ridges;
+            thread_local int32  RG_CX = INT32_MAX, RG_CY = INT32_MAX;
+            thread_local uint32 RG_Seed = 0xFFFFFFFFu;
+            thread_local float  RG_Sp = -1.0f, RG_Dens = -1.0f;
+            if (cx != RG_CX || cy != RG_CY || Seed != RG_Seed || Sp != RG_Sp || D.RidgeDensity != RG_Dens)
             {
-                const int32 nx = cx + dx, ny = cy + dy;
-                const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x52470001u);
-                if (VoxelHash::ToFloat01(h) > D.RidgeDensity) continue;
-                const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x9001u)) * PI;
-                const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
-                const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
-                const float half = Sp * 0.45f;
-                const float d2d = Dist2DSeg(X, Y, bx - dxu * half, by - dyu * half,
-                                            bx + dxu * half, by + dyu * half);
+                RG_CX = cx;  RG_CY = cy;  RG_Seed = Seed;  RG_Sp = Sp;  RG_Dens = D.RidgeDensity;
+                Ridges.Reset();
+                for (int32 dy = -1; dy <= 1; dy++)
+                for (int32 dx = -1; dx <= 1; dx++)
+                {
+                    const int32 nx = cx + dx, ny = cy + dy;
+                    const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x52470001u);
+                    if (VoxelHash::ToFloat01(h) > D.RidgeDensity) continue;
+                    const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x9001u)) * PI;
+                    const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
+                    const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
+                    const float half = Sp * 0.45f;
+                    Ridges.Add({ bx - dxu * half, by - dyu * half, bx + dxu * half, by + dyu * half });
+                }
+            }
+
+            float best = -FLT_MAX;  // strongest fill across nearby blades
+            for (const FRidge& R : Ridges)
+            {
+                const float d2d = Dist2DSeg(X, Y, R.AX, R.AY, R.BX, R.BY);
                 const float wallSDF = d2d - D.RidgeThickness;     // <0 inside the blade footprint
                 if (wallSDF >= Blend) continue;
                 const float zFade = 1.0f - FMath::Clamp((Z - InnerBot) / FMath::Max(D.RidgeHeight, 1.0f), 0.0f, 1.0f);
@@ -447,7 +515,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FBiomeContext            CP_BiomeCtx;
         thread_local FChunkBiomeCache         CP_BiomeCache;
         thread_local TArray<FSurfaceGenerationParams> CP_SurfaceBiomeParams;
-        thread_local FSurfaceColumnCache      CP_SurfCol;   // T1.a per-column surface cache (XY-keyed LRU)
+        // T1.a per-column surface cache: GSurfColCache (file-scope, shared with ClassifyTile).
         // Discriminates the surface cache by strate: same strate ⇒ identical heightfield params ⇒ columns
         // are shareable across the whole vertical chunk stack. Taken from the params themselves
         // (StrateBottomWorldZ is unique per stacked strate) so the key can never disagree with CP_Surface.
@@ -495,13 +563,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 const int32 IX = (int32)WorldX, IY = (int32)WorldY;
                 // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
                 // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
-                FSurfaceColumnBox& Box = CP_SurfCol.Acquire(IX, IY, CP_StrateKey, Seed);
+                FSurfaceColumnBox& Box = GSurfColCache.Acquire(IX, IY, CP_StrateKey, Seed);
                 const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
                 if (!Box.Computed[CI])
                 {
                     ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
                         CP_SurfaceBiomeParams, CP_BiomeCache,
-                        Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf);
+                        Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf,
+                        Box.Cols[CI].OverhangAmp, Box.Cols[CI].DirX, Box.Cols[CI].DirY);
                     Box.Computed[CI] = true;
                 }
                 Col = Box.Cols[CI];
@@ -509,10 +578,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             else
             {
                 ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                    CP_SurfaceBiomeParams, CP_BiomeCache, Col.TerrainZ, Col.CeilSurf);
+                    CP_SurfaceBiomeParams, CP_BiomeCache, Col.TerrainZ, Col.CeilSurf,
+                    Col.OverhangAmp, Col.DirX, Col.DirY);
             }
 
-            Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, Col.TerrainZ, Col.CeilSurf, CP_Surface);
+            Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
+                Col.TerrainZ, Col.CeilSurf, Col.OverhangAmp, Col.DirX, Col.DirY, CP_Surface);
             break;
         }
         case ECaveGeneratorType::VerticalShafts:
@@ -546,9 +617,36 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     // we subtract the diff offset:
     //   Carve (diff < 0) → Result -= negative → Result increases → more air ✓
     //   Fill  (diff > 0) → Result -= positive → Result decreases → more solid ✓
-    if (DiffLayer && DiffLayer->HasModifications(ChunkCoord))
+    if (DiffLayer && DiffLayer->HasAnyMods())
     {
-        Result -= DiffLayer->GetDensityOffset(ChunkCoord, WorldX, WorldY, WorldZ);
+        // ── PER-CHUNK MOD SNAPSHOT ──
+        // The old HasModifications + GetDensityOffset pair took the diff layer's RWLock + a TMap find
+        // TWICE per voxel once any carve existed (~86k lock ops per tile task — during carve gameplay,
+        // exactly when re-mesh latency matters). Snapshot a chunk's mod list ONCE per (chunk, version)
+        // on this worker and evaluate it lock-free. DIRECT-MAPPED by the chunk coord's low bits (2 bits
+        // per axis → 64 slots): the mesher's ±1 margin ring touches up to 27 neighbouring chunk coords
+        // per tile, and any two coords within ±3 of each other land in DIFFERENT slots — so a tile task
+        // never thrashes its own working set. Version bump (carve / clear) invalidates lazily per slot.
+        struct FDiffSlot
+        {
+            FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+            uint32     Version = 0;
+            TArray<FVoxelModification> Mods;
+        };
+        static thread_local FDiffSlot DiffSlots[64];
+
+        const uint32 V = DiffLayer->GetModsVersion();
+        FDiffSlot& Slot = DiffSlots[(ChunkCoord.X & 3) | ((ChunkCoord.Y & 3) << 2) | ((ChunkCoord.Z & 3) << 4)];
+        if (Slot.Chunk != ChunkCoord || Slot.Version != V)
+        {
+            Slot.Chunk = ChunkCoord;
+            Slot.Version = V;
+            DiffLayer->GetChunkModsSnapshot(ChunkCoord, Slot.Mods);   // ONE lock per chunk, not per voxel
+        }
+        if (Slot.Mods.Num() > 0)
+        {
+            Result -= UVoxelDiffLayer::EvaluateMods(Slot.Mods, WorldX, WorldY, WorldZ);
+        }
     }
 
     return Result;
@@ -683,12 +781,27 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     if (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
     {
         // Get strate index for unique caves per strate.
-        // GetStrateIndex expects Unreal world units (divides by VOXEL_SIZE internally),
-        // but our WorldZ is in voxel coordinates, so multiply by VOXEL_SIZE.
+        // MEMOISED: the index only changes at chunk-Z boundaries, yet this ran the strate layout's
+        // linear scan PER VOXEL. Key = (chunk-Z, layout version) — the version guards against editor
+        // rebuilds (RebuildStrates / live edit) serving a stale index. The lookup queries the BAND
+        // CENTRE so the result is a pure function of the key (order-independent, window-invariant).
         int32 StrateIdx = 0;
         if (StrateManager)
         {
-            StrateIdx = StrateManager->GetStrateIndex(WorldZ * VOXEL_SIZE);
+            thread_local int32  SI_ChunkZ  = INT32_MAX;
+            thread_local uint32 SI_Version = 0xFFFFFFFFu;
+            thread_local int32  SI_Index   = 0;
+            const int32 QZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+            const uint32 LV = StrateManager->GetLayoutVersion();
+            if (QZ != SI_ChunkZ || LV != SI_Version)
+            {
+                SI_ChunkZ  = QZ;
+                SI_Version = LV;
+                // GetStrateIndex expects Unreal world units (divides by VOXEL_SIZE internally);
+                // WorldZ here is in voxels, so multiply by VOXEL_SIZE.
+                SI_Index = StrateManager->GetStrateIndex(((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+            }
+            StrateIdx = SI_Index;
         }
 
         // Rebuild only when the WARPED query (what EvaluateSDFCached uses) leaves the
@@ -746,7 +859,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         NearestRoomIdx = -1;
         CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
             WarpedX, WarpedY, WarpedZ,
-            SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety,
+            SDFCache, Params.SDFBlendRadius,
             &NearestRoomIdx
         );
 
@@ -919,23 +1032,27 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 FinePos += WarpOffset;
             }
 
-            // NOISE TYPE SELECTION: sample the right noise function
+            // NOISE TYPE SELECTION: sample the right noise function.
+            // Octave counts go through VoxelGenLOD::Eff — far tiles (Step>1) drop
+            // the sub-cell tail octaves (T2.b); LOD0 keeps the full counts.
             float RoughNoise, FineNoise;
+            const int32 Oct3 = VoxelGenLOD::Eff(3);
+            const int32 Oct2 = VoxelGenLOD::Eff(2);
 
             switch (Params.RoughnessNoiseType)
             {
             case EVoxelNoiseType::Ridged:
                 // Ridged multifractal: sharp, craggy features
-                RoughNoise = RidgedNoise3D(MainPos, 3);
-                FineNoise = RidgedNoise3D(FinePos, 2);
+                RoughNoise = RidgedNoise3D(MainPos, Oct3);
+                FineNoise = RidgedNoise3D(FinePos, Oct2);
                 break;
 
             case EVoxelNoiseType::Mixed:
                 // Blend: ridged structure softened by fBM
-                RoughNoise = FractalNoise3D(MainPos, 3) * 0.5f
-                           + RidgedNoise3D(MainPos, 3) * 0.5f;
-                FineNoise = FractalNoise3D(FinePos, 2) * 0.5f
-                          + RidgedNoise3D(FinePos, 2) * 0.5f;
+                RoughNoise = FractalNoise3D(MainPos, Oct3) * 0.5f
+                           + RidgedNoise3D(MainPos, Oct3) * 0.5f;
+                FineNoise = FractalNoise3D(FinePos, Oct2) * 0.5f
+                          + RidgedNoise3D(FinePos, Oct2) * 0.5f;
                 break;
 
             case EVoxelNoiseType::Cellular:
@@ -948,8 +1065,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             case EVoxelNoiseType::FBM:
             default:
                 // Standard fBM: smooth, organic
-                RoughNoise = FractalNoise3D(MainPos, 3);
-                FineNoise = FractalNoise3D(FinePos, 2);
+                RoughNoise = FractalNoise3D(MainPos, Oct3);
+                FineNoise = FractalNoise3D(FinePos, Oct2);
                 break;
             }
 
@@ -1010,7 +1127,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     }
     // Shadow outer Params inside this block so all terrain op code below
     // automatically uses the per-room values without any other changes.
+    // The shadow is deliberate (per-room override), so silence C4457 here only.
+    PRAGMA_DISABLE_SHADOW_VARIABLE_WARNINGS
     const FStrateGenerationParams& Params = LocalTerrainParams;
+    PRAGMA_ENABLE_SHADOW_VARIABLE_WARNINGS
 
     // Geological features applied after roughness. These modify the density
     // field near cave surfaces to create specific shapes: terracing (step-like
@@ -1037,26 +1157,21 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             // Surface orientation test: terracing only makes sense on horizontal surfaces
             // (cave floors). On vertical walls (pit shafts, tunnel sides) it creates ugly
-            // horizontal ridges. We sample the SDF gradient in Z by querying Z±1 and
-            // measure how much the SDF changes vertically vs. how much it'd change on a
-            // perfectly horizontal surface. GradZ near 1 = floor/ceiling, near 0 = wall.
+            // horizontal ridges. We sample the SDF gradient in Z by querying Z±1:
+            // an SDF has ≈unit gradient, so |dSDF/dZ| alone IS the normalized vertical
+            // component — near 1 = floor/ceiling, near 0 = wall. (Z-only approximation:
+            // the full 6-sample gradient normalization was 3× the SDF cost for the same
+            // orientation signal; SmoothMin regions where |∇SDF| < 1 read slightly
+            // "flatter", shifting where terraces fade on slopes — accepted visual delta.)
             //
             // We use the cached SDF so this costs two extra SDF evaluations per voxel,
             // only when near a surface — the common case is cheap (DistFromSurface > TerraceRange).
-            float SDF_Zp1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY, WorldZ + 1.0f, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            float SDF_Zm1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY, WorldZ - 1.0f, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            // Central difference gradient in Z, approximate magnitude via all-axis samples
-            float SDF_Xp1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX + 1.0f, WorldY, WorldZ, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            float SDF_Xm1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX - 1.0f, WorldY, WorldZ, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            float SDF_Yp1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY + 1.0f, WorldZ, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            float SDF_Ym1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY - 1.0f, WorldZ, SDFCache, Params.SDFBlendRadius, Params.RoomShapeVariety);
-            float GX = (SDF_Xp1 - SDF_Xm1) * 0.5f;
-            float GY = (SDF_Yp1 - SDF_Ym1) * 0.5f;
+            float SDF_Zp1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY, WorldZ + 1.0f, SDFCache, Params.SDFBlendRadius);
+            float SDF_Zm1 = VoxelCaveMorphology::EvaluateSDFCached(WorldX, WorldY, WorldZ - 1.0f, SDFCache, Params.SDFBlendRadius);
             float GZ = (SDF_Zp1 - SDF_Zm1) * 0.5f;
-            float GLen = FMath::Sqrt(GX*GX + GY*GY + GZ*GZ);
             // Normalized vertical component: 1 = perfectly horizontal surface (floor/ceiling)
             //                               0 = perfectly vertical surface (wall)
-            float SurfaceHorizontality = (GLen > KINDA_SMALL_NUMBER) ? FMath::Abs(GZ) / GLen : 0.0f;
+            float SurfaceHorizontality = FMath::Clamp(FMath::Abs(GZ), 0.0f, 1.0f);
             // Only apply terrace where the surface is mostly horizontal (> ~45 degrees)
             // Smooth transition to avoid a hard cutoff at exactly 45 degrees
             float TerraceOrientFactor = FMath::Clamp((SurfaceHorizontality - 0.3f) / 0.4f, 0.0f, 1.0f);
@@ -1068,7 +1183,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                     WorldX * 0.04f + SeedF * 31.1f,
                     WorldY * 0.04f + SeedF * 37.3f,
                     WorldZ * 0.02f + SeedF * 41.7f
-                ), 2) * VOXEL_NOISE_SCALE;
+                ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
                 NoisedZ += DispNoise * Params.TerraceNoiseDisplacement * StepH;
             }
 
@@ -1194,7 +1309,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 WorldX * Params.OverhangFrequency + SeedF * 53.1f,
                 WorldY * Params.OverhangFrequency + SeedF * 59.3f,
                 EffectiveZ * Params.OverhangFrequency * 0.15f + SeedF * 61.7f
-            ), 2) * VOXEL_NOISE_SCALE;
+            ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
 
             // Only where noise is positive → protrusions (not recesses)
             if (OverhangNoise > 0.0f)
@@ -1572,18 +1687,23 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 EffectiveZ * WormZFreq + SeedF * 2.3f
             )) * VOXEL_NOISE_SCALE);
 
-            float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
-                WorldX * Params.WormFrequency + SeedF + 137.0f,
-                WorldY * Params.WormFrequency + SeedF * 1.7f + 259.0f,
-                EffectiveZ * WormZFreq + SeedF * 2.3f + 431.0f
-            )) * VOXEL_NOISE_SCALE);
-
-            float WormValue = N1 + N2;
-
-            if (WormValue < Params.WormThreshold)
+            // N2 >= 0, so if N1 alone already clears the threshold the sum can't carve —
+            // skip the second Perlin entirely (most voxels; bit-identical output).
+            if (N1 < Params.WormThreshold)
             {
-                float t = 1.0f - (WormValue / Params.WormThreshold);
-                Density -= t * Params.WormStrength * NetworkMask;
+                float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                    WorldX * Params.WormFrequency + SeedF + 137.0f,
+                    WorldY * Params.WormFrequency + SeedF * 1.7f + 259.0f,
+                    EffectiveZ * WormZFreq + SeedF * 2.3f + 431.0f
+                )) * VOXEL_NOISE_SCALE);
+
+                float WormValue = N1 + N2;
+
+                if (WormValue < Params.WormThreshold)
+                {
+                    float t = 1.0f - (WormValue / Params.WormThreshold);
+                    Density -= t * Params.WormStrength * NetworkMask;
+                }
             }
         }
     }
@@ -1655,7 +1775,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
             WorldX * FF + SeedF * 7.3f,
             WorldY * FF + SeedF * 11.1f,
             WorldZ * FF * 0.05f           // Very low Z freq → horizontal ground features
-        ), 3) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
+        ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
     }
 
     // Actual floor surface Z after noise displacement.
@@ -1685,7 +1805,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
             WorldX * CF + SeedF * 17.3f + 1000.0f,
             WorldY * CF + SeedF * 19.7f + 2000.0f,
             WorldZ * CF * 0.08f + 3000.0f   // Low Z freq → formations extend horizontally
-        ), 3) * VOXEL_NOISE_SCALE;
+        ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE;
 
         // abs() → formations ONLY hang down, never push ceiling up into solid rock.
         // Result: every noise peak creates a downward protrusion (crystal/stalactite).
@@ -1733,40 +1853,59 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
         const int32 ColCX = FMath::FloorToInt(WorldX / Spacing);
         const int32 ColCY = FMath::FloorToInt(WorldY / Spacing);
 
-        float ColumnSDF = FLT_MAX;
+        // The 3×3 neighbourhood's columns (existence roll, jitter, radius) are a pure function of
+        // (cell, seed, params) yet were re-derived PER VOXEL — 9 hash rolls + mixes in the slab hot
+        // loop. Bake them once per centre cell (thread_local); rebuild only when the query crosses a
+        // cell border or the seed/params change. Bit-identical (same hashes, same math).
+        struct FSlabColumn { float X, Y, R; };
+        thread_local TArray<FSlabColumn, TInlineAllocator<9>> SC_Cols;
+        thread_local int32  SC_CX = INT32_MAX, SC_CY = INT32_MAX;
+        thread_local uint32 SC_Seed = 0xFFFFFFFFu;
+        thread_local float  SC_Spacing = -1.0f, SC_Dens = -1.0f, SC_MinR = -1.0f, SC_MaxR = -1.0f;
 
-        // Check 3x3 neighborhood so we never miss a column in an adjacent cell.
-        for (int32 DY = -1; DY <= 1; DY++)
+        if (ColCX != SC_CX || ColCY != SC_CY || (uint32)Seed != SC_Seed || Spacing != SC_Spacing ||
+            Params.ColumnDensity != SC_Dens || Params.ColumnMinRadius != SC_MinR || Params.ColumnMaxRadius != SC_MaxR)
         {
-            for (int32 DX = -1; DX <= 1; DX++)
+            SC_CX = ColCX;  SC_CY = ColCY;  SC_Seed = (uint32)Seed;  SC_Spacing = Spacing;
+            SC_Dens = Params.ColumnDensity;  SC_MinR = Params.ColumnMinRadius;  SC_MaxR = Params.ColumnMaxRadius;
+            SC_Cols.Reset();
+
+            for (int32 DY = -1; DY <= 1; DY++)
             {
-                int32 NCX = ColCX + DX;
-                int32 NCY = ColCY + DY;
+                for (int32 DX = -1; DX <= 1; DX++)
+                {
+                    const int32 NCX = ColCX + DX;
+                    const int32 NCY = ColCY + DY;
 
-                // Deterministic: same seed → same column pattern every session.
-                // XOR with a prime salt so columns don't correlate with room placement.
-                uint32 H = VoxelHash::Cell(NCX, NCY, (uint32)Seed ^ 0xC01C01u);
+                    // Deterministic: same seed → same column pattern every session.
+                    // XOR with a prime salt so columns don't correlate with room placement.
+                    const uint32 H = VoxelHash::Cell(NCX, NCY, (uint32)Seed ^ 0xC01C01u);
 
-                // ColumnDensity is the probability this cell has a column.
-                if (VoxelHash::ToFloat01(H) > Params.ColumnDensity) continue;
+                    // ColumnDensity is the probability this cell has a column.
+                    if (VoxelHash::ToFloat01(H) > Params.ColumnDensity) continue;
 
-                // Jitter the column center within the cell (15%-85% of cell extent)
-                // to avoid a perfectly regular grid pattern.
-                float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
-                float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
-                float ColX = (NCX + 0.15f + JX * 0.7f) * Spacing;
-                float ColY = (NCY + 0.15f + JY * 0.7f) * Spacing;
+                    // Jitter the column center within the cell (15%-85% of cell extent)
+                    // to avoid a perfectly regular grid pattern.
+                    const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
+                    const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
 
-                // Column radius: hash-derived within configured range.
-                float ColRadius = FMath::Lerp(Params.ColumnMinRadius, Params.ColumnMaxRadius,
-                    VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
-
-                // 2D cylinder SDF (infinite height — void field handles top/bottom).
-                float DX2D = WorldX - ColX;
-                float DY2D = WorldY - ColY;
-                float CylSDF = FMath::Sqrt(DX2D * DX2D + DY2D * DY2D) - ColRadius;
-                ColumnSDF = FMath::Min(ColumnSDF, CylSDF);
+                    FSlabColumn& Col = SC_Cols.AddDefaulted_GetRef();
+                    Col.X = (NCX + 0.15f + JX * 0.7f) * Spacing;
+                    Col.Y = (NCY + 0.15f + JY * 0.7f) * Spacing;
+                    // Column radius: hash-derived within configured range.
+                    Col.R = FMath::Lerp(Params.ColumnMinRadius, Params.ColumnMaxRadius,
+                        VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+                }
             }
+        }
+
+        float ColumnSDF = FLT_MAX;
+        for (const FSlabColumn& Col : SC_Cols)
+        {
+            // 2D cylinder SDF (infinite height — void field handles top/bottom).
+            const float DX2D = WorldX - Col.X;
+            const float DY2D = WorldY - Col.Y;
+            ColumnSDF = FMath::Min(ColumnSDF, FMath::Sqrt(DX2D * DX2D + DY2D * DY2D) - Col.R);
         }
 
         // Smoothstep blend zone around the column edge (avoids hard MC aliasing).
@@ -1826,41 +1965,64 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
     const int32 CY = FMath::FloorToInt(WorldY / CS);
     const int32 CZ = FMath::FloorToInt(WorldZ / CS);
 
-    auto NodeCenter = [CS](int32 X, int32 Y, int32 Z)
+    // The open-edge set reachable from this voxel's cell is a pure function of (cell, seed,
+    // probabilities) yet was re-hashed PER VOXEL (8 nodes × 3 edges = 24 hash rolls). Bake the
+    // open edges' capsule endpoints once per cell (thread_local); the per-voxel work is just
+    // the capsule SDFs. Rebuilds only on a cell crossing / param change — bit-identical.
+    struct FMazeEdge { FVector A, B; };
+    thread_local TArray<FMazeEdge, TInlineAllocator<24>> MZ_Edges;
+    thread_local FIntVector MZ_Cell(INT32_MAX, INT32_MAX, INT32_MAX);
+    thread_local uint32 MZ_Seed = 0xFFFFFFFFu;
+    thread_local float  MZ_CS = -1.0f, MZ_Branch = -1.0f, MZ_Vert = -1.0f;
+
+    const FIntVector Cell(CX, CY, CZ);
+    if (Cell != MZ_Cell || S != MZ_Seed || CS != MZ_CS ||
+        Params.BranchProbability != MZ_Branch || Params.Verticality != MZ_Vert)
     {
-        return FVector((X + 0.5f) * CS, (Y + 0.5f) * CS, (Z + 0.5f) * CS);
-    };
-    // Deterministic hash of a 3D lattice edge, keyed on its lower node + axis salt.
-    auto EdgeOpen = [S](int32 X, int32 Y, int32 Z, uint32 AxisSalt, float Threshold) -> bool
-    {
-        uint32 H = VoxelHash::Cell(X, Y, S ^ AxisSalt);
-        H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
-        return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
-    };
+        MZ_Cell = Cell;  MZ_Seed = S;  MZ_CS = CS;
+        MZ_Branch = Params.BranchProbability;  MZ_Vert = Params.Verticality;
+        MZ_Edges.Reset();
+
+        auto NodeCenter = [CS](int32 X, int32 Y, int32 Z)
+        {
+            return FVector((X + 0.5f) * CS, (Y + 0.5f) * CS, (Z + 0.5f) * CS);
+        };
+        // Deterministic hash of a 3D lattice edge, keyed on its lower node + axis salt.
+        auto EdgeOpen = [S](int32 X, int32 Y, int32 Z, uint32 AxisSalt, float Threshold) -> bool
+        {
+            uint32 H = VoxelHash::Cell(X, Y, S ^ AxisSalt);
+            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
+            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
+        };
+
+        // Nodes in {-1,0} per axis cover every edge that can reach this voxel's cell.
+        for (int32 dz = -1; dz <= 0; dz++)
+        for (int32 dy = -1; dy <= 0; dy++)
+        for (int32 dx = -1; dx <= 0; dx++)
+        {
+            const int32 nx = CX + dx, ny = CY + dy, nz = CZ + dz;
+            const FVector A = NodeCenter(nx, ny, nz);
+
+            if (EdgeOpen(nx, ny, nz, 0xA1u, Params.BranchProbability))
+                MZ_Edges.Add({ A, NodeCenter(nx + 1, ny, nz) });
+            if (EdgeOpen(nx, ny, nz, 0xB2u, Params.BranchProbability))
+                MZ_Edges.Add({ A, NodeCenter(nx, ny + 1, nz) });
+            if (EdgeOpen(nx, ny, nz, 0xC3u, Params.Verticality))
+                MZ_Edges.Add({ A, NodeCenter(nx, ny, nz + 1) });
+        }
+    }
 
     const float R = FMath::Max(Params.CorridorRadius, 0.5f);
     float MazeSDF = FLT_MAX;
-
-    // Nodes in {-1,0} per axis cover every edge that can reach this voxel's cell.
-    for (int32 dz = -1; dz <= 0; dz++)
-    for (int32 dy = -1; dy <= 0; dy++)
-    for (int32 dx = -1; dx <= 0; dx++)
+    for (const FMazeEdge& E : MZ_Edges)
     {
-        const int32 nx = CX + dx, ny = CY + dy, nz = CZ + dz;
-        const FVector A = NodeCenter(nx, ny, nz);
-
-        if (EdgeOpen(nx, ny, nz, 0xA1u, Params.BranchProbability))
-            MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, A, NodeCenter(nx + 1, ny, nz), R));
-        if (EdgeOpen(nx, ny, nz, 0xB2u, Params.BranchProbability))
-            MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, A, NodeCenter(nx, ny + 1, nz), R));
-        if (EdgeOpen(nx, ny, nz, 0xC3u, Params.Verticality))
-            MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, A, NodeCenter(nx, ny, nz + 1), R));
+        MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, E.A, E.B, R));
     }
 
     // Wall roughness: perturb the corridor surface.
     if (Params.SurfaceRoughness > 0.0f && MazeSDF < R + Params.SurfaceRoughness + 2.0f)
     {
-        MazeSDF += FractalNoise3D(FVector(WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f), 3)
+        MazeSDF += FractalNoise3D(FVector(WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f), VoxelGenLOD::Eff(3))
                  * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 
@@ -1897,8 +2059,8 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
 // high solid "sky cap" ceiling, with a flattened beach band around the water line.
 // Open air fills the gap between ground and ceiling; water is a render-side overlay.
 
-float UVoxelGenerator::ComputeSurfaceTerrainZ(float WorldX, float WorldY,
-                                              const FSurfaceGenerationParams& Params) const
+float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
+                                                const FSurfaceGenerationParams& Params, float& OutM) const
 {
     const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
     const float SeedF = (float)Seed;
@@ -1954,17 +2116,78 @@ float UVoxelGenerator::ComputeSurfaceTerrainZ(float WorldX, float WorldY,
         + Mountain * Params.ElevationRange
         + Detail * Params.SurfaceRoughness;
 
-    // Plateau/mesa terracing — quantize height into steps, but only in high-relief areas and
-    // only as strongly as TerraceStrength asks. Layered cliffs/mesas up top, smooth lowlands.
+    OutM = M;
+    return Terrain;
+}
+
+float UVoxelGenerator::ComputeSurfaceTerrainZ(float WorldX, float WorldY,
+                                              const FSurfaceGenerationParams& Params) const
+{
+    // Raw structural ground + the relief "mountainous-ness" M (reused to relief-gate the ops).
+    float M = 1.0f;
+    float Terrain = SampleSurfaceStructuralZ(WorldX, WorldY, Params, M);
+
+    // --- F20 heightfield terrain ops (all off by default → byte-identical when unset) ---
+
+    // CLIFF (slope-conditioned STEEPENING): where the surface is already steep, push the height
+    // AWAY from the local mean so gentle slopes become sheer walls / canyon faces; gentle ground
+    // stays untouched. Slope + local mean come from central differences of the STRUCTURAL field
+    // (no op feedback), so it tracks the real landform. The one op that costs extra samples —
+    // only when enabled (4 structural resamples, per-column-cheap).
+    if (Params.CliffStrength > 0.0f)
+    {
+        const float D = FMath::Max(Params.CliffSampleDist, 0.5f);
+        float Ms;   // relief scratch (unused — we only need the heights)
+        const float Zxp = SampleSurfaceStructuralZ(WorldX + D, WorldY, Params, Ms);
+        const float Zxm = SampleSurfaceStructuralZ(WorldX - D, WorldY, Params, Ms);
+        const float Zyp = SampleSurfaceStructuralZ(WorldX, WorldY + D, Params, Ms);
+        const float Zym = SampleSurfaceStructuralZ(WorldX, WorldY - D, Params, Ms);
+        const float dZdX = (Zxp - Zxm) / (2.0f * D);
+        const float dZdY = (Zyp - Zym) / (2.0f * D);
+        const float Slope = FMath::Sqrt(dZdX * dZdX + dZdY * dZdY);   // rise per voxel of XY
+
+        const float Thr = FMath::Max(Params.CliffSlopeThreshold, 0.05f);
+        // 0 below the threshold, ramps to 1 within one threshold-width above it.
+        const float SlopeGate = FMath::Clamp((Slope - Thr) / Thr, 0.0f, 1.0f);
+        if (SlopeGate > 0.0f)
+        {
+            // Local smoothed reference; push the true height away from it → steepen the wall.
+            const float Ref  = 0.25f * (Zxp + Zxm + Zyp + Zym);
+            const float Gain = Params.CliffStrength * SlopeGate * Params.CliffSharpness;
+            Terrain += (Terrain - Ref) * Gain;
+        }
+    }
+
+    // TERRACE (relief-gated): quantize height into plateaus, only in high-relief regions and only
+    // as strongly as TerraceStrength asks. TerraceHardness controls the riser: soft rounded steps
+    // (0) → crisp flat-topped mesas with near-vertical walls (1). Layered cliffs/mesas up top,
+    // smooth lowlands.
     if (Params.TerraceStrength > 0.0f && Params.TerraceHeight > 0.0f)
     {
-        const float Stepped = FMath::RoundToFloat(Terrain / Params.TerraceHeight) * Params.TerraceHeight;
+        const float StepH = Params.TerraceHeight;
+        const float T     = Terrain / StepH;
+        const float K     = FMath::FloorToFloat(T);
+        const float Frac  = T - K;                       // [0,1) position within the step
+        // Hardness widens the flat plateau and sharpens the riser: half-transition width goes
+        // from 0.5 (a smooth S-curve, no plateau) at Hardness=0 to ~0.03 (sharp wall) at 1.
+        const float W  = FMath::Lerp(0.5f, 0.03f, FMath::Clamp(Params.TerraceHardness, 0.0f, 1.0f));
+        const float Fs = SmoothStep01(FMath::Clamp((Frac - (0.5f - W)) / (2.0f * W), 0.0f, 1.0f));
+        const float Stepped = (K + Fs) * StepH;
         Terrain = FMath::Lerp(Terrain, Stepped, Params.TerraceStrength * M);
+    }
+
+    // LAYER LINES: fine sedimentary shelves cut into slopes (exposed rock strata). Pull the
+    // surface weakly toward each band plane; reads on slopes, invisible on flats (uniform shift).
+    if (Params.LayerLineDepth > 0.0f && Params.LayerLineSpacing > 0.0f)
+    {
+        const float Phase = Terrain * (2.0f * PI / Params.LayerLineSpacing);
+        Terrain -= FMath::Sin(Phase) * Params.LayerLineDepth;
     }
 
     // Beach: flatten terrain toward the water line within BeachWidth. (Water level is
     // strate-global — forced from the strate — so the water plane stays continuous.)
-    const float WaterZ = BottomZ + H * Params.WaterLevelRelative;
+    const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
+    const float WaterZ = Params.StrateBottomWorldZ + H * Params.WaterLevelRelative;
     if (Params.WaterLevelRelative > 0.0f && Params.BeachWidth > 0.0f)
     {
         const float DAbs = FMath::Abs(Terrain - WaterZ);
@@ -2033,11 +2256,43 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
 
 float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
                                                 float TerrainZ, float CeilSurf,
+                                                float OverhangAmp, float DirX, float DirY,
                                                 const FSurfaceGenerationParams& S) const
 {
     // Solid below the terrain surface; solid above the sky-cap ceiling.
     float Density = TerrainZ - WorldZ;
     Density = FMath::Max(Density, WorldZ - CeilSurf);
+
+    // F20 phase 2 — OVERHANG shelf (warped-terrain union): for AIR voxels in a window just above a
+    // steep slope, re-sample the heightfield UPHILL (toward the cliff) by a height-varying amount and
+    // union that rock in → the cliff-top rock juts OUT over the void below, self-capping at the cliff's
+    // height. Genuine 3D (per-voxel re-eval), so it's gated hard: only steep overhang columns (amp>0),
+    // only air voxels within OverhangHeight of the local ground, only when the shift is ≥ a voxel.
+    // The lip is capped at TerrainZ+OverhangHeight, which ClassifyTile treats as ambiguous (no holes).
+    if (OverhangAmp > 0.0f && S.OverhangHeight > 0.0f
+        && WorldZ > TerrainZ && WorldZ <= TerrainZ + S.OverhangHeight)
+    {
+        const float SeedF = (float)Seed;
+        const float f     = S.OverhangFrequency;
+        // Shelf-shape noise [0,1]; the Z term makes the reach fold/curl with height (ragged, not a lip).
+        const float Ns = FractalNoise3D(FVector(
+            WorldX * f + SeedF * 17.3f,
+            WorldY * f + SeedF * 23.9f,
+            WorldZ * f * S.OverhangZScale + SeedF * 5.1f), 3) * 0.5f + 0.5f;   // [0,1]
+        // KEY: the uphill reach GROWS with height in the window (Frac: 0 at ground → 1 at the cap). Low
+        // down the shift is tiny ⇒ borrows nearby low rock ⇒ stays AIR over the void; high up the shift
+        // reaches the far cliff ⇒ solid ⇒ the lip sits on top with air UNDERNEATH = a real overhang.
+        const float Frac   = (WorldZ - TerrainZ) / S.OverhangHeight;            // (0,1] inside the window
+        const float ShiftV = S.OverhangReach * OverhangAmp * Frac * Ns;         // uphill reach (voxels)
+        if (ShiftV > 0.5f)
+        {
+            // Borrow the uphill STRUCTURAL height (not the full op'd surface): the shelf underside doesn't
+            // need cliff/terrace refinement, and this avoids re-running Cliff's resamples per lip voxel.
+            float Ms;
+            const float ShiftedTZ = SampleSurfaceStructuralZ(WorldX + DirX * ShiftV, WorldY + DirY * ShiftV, S, Ms);
+            Density = FMath::Max(Density, ShiftedTZ - WorldZ);   // union: solid where uphill rock covers Z
+        }
+    }
 
     // Structural fields (Z bounds, seal, base) are forced equal across biomes → S is safe.
     ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
@@ -2094,7 +2349,8 @@ void UVoxelGenerator::ResolveSurfaceChunkParams(const FIntVector& ChunkCoord,
 void UVoxelGenerator::ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
     const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
     const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
-    float& OutTerrainZ, float& OutCeilSurf) const
+    float& OutTerrainZ, float& OutCeilSurf,
+    float& OutOverhangAmp, float& OutDirX, float& OutDirY) const
 {
     const FSurfaceGenerationParams* PD = &BaseSurface;
     const FSurfaceGenerationParams* PN = &BaseSurface;
@@ -2113,6 +2369,37 @@ void UVoxelGenerator::ComputeSurfaceColumn(float WorldX, float WorldY, int32 Chu
     OutTerrainZ = ComputeSurfaceTerrainZ(WorldX, WorldY, *PD);
     if (W > 0.0f) OutTerrainZ = FMath::Lerp(OutTerrainZ, ComputeSurfaceTerrainZ(WorldX, WorldY, *PN), W);
     OutCeilSurf = ComputeSurfaceCeiling(WorldX, WorldY, *PD);
+
+    // F20 phase 2 — resolve the per-column OVERHANG gate (strength·slope-gate, biome-blended) and the
+    // UPHILL direction. Slope + gradient come from a forward-diff of the STRUCTURAL field (the real
+    // landform), computed ONCE here. Off ⇒ amp 0 and the whole block is skipped (no extra samples).
+    OutOverhangAmp = 0.0f;
+    OutDirX = 0.0f; OutDirY = 0.0f;
+    if (PD->OverhangStrength > 0.0f || (W > 0.0f && PN->OverhangStrength > 0.0f))
+    {
+        // Sample the gradient at ~reach scale (a spot over the void must "see" the nearby cliff to know
+        // uphill), but CLAMPED to [4,16] — an un-clamped large Reach would average the slope over a huge
+        // span and read even a real cliff as flat (killing the gate; the "big Reach = nothing" bug).
+        const float SD = FMath::Clamp(PD->OverhangReach, 4.0f, 16.0f);
+        float Ms;
+        const float Z0 = SampleSurfaceStructuralZ(WorldX, WorldY, *PD, Ms);
+        const float GX = (SampleSurfaceStructuralZ(WorldX + SD, WorldY, *PD, Ms) - Z0) / SD;   // dZ/dX
+        const float GY = (SampleSurfaceStructuralZ(WorldX, WorldY + SD, *PD, Ms) - Z0) / SD;   // dZ/dY
+        const float Slope = FMath::Sqrt(GX * GX + GY * GY);
+
+        auto Amp = [Slope](const FSurfaceGenerationParams& P) -> float
+        {
+            if (P.OverhangStrength <= 0.0f) return 0.0f;
+            const float Thr  = FMath::Max(P.OverhangSlopeThreshold, 0.05f);
+            const float Gate = FMath::Clamp((Slope - Thr) / Thr, 0.0f, 1.0f);
+            return P.OverhangStrength * Gate;   // [0,1]; reach comes from the param at apply time
+        };
+        OutOverhangAmp = (W > 0.0f) ? FMath::Lerp(Amp(*PD), Amp(*PN), W) : Amp(*PD);
+
+        // Unit UPHILL direction (the gradient points uphill). The shelf borrows rock from uphill and
+        // extends it downhill over the void. Degenerate on flats — amp is 0 there anyway.
+        if (Slope > KINDA_SMALL_NUMBER) { OutDirX = GX / Slope; OutDirY = GY / Slope; }
+    }
 }
 
 bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 ChunkZ,
@@ -2140,9 +2427,230 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
         OC_Chunk = ChunkCoord;
         ResolveSurfaceChunkParams(ChunkCoord, OC_Surface, OC_BiomeCtx, OC_BiomeParams);
     }
+    float OcAmp, OcDirX, OcDirY;   // overhang is a density-only 3D shelf; the height oracle ignores it
     ComputeSurfaceColumn(WorldX, WorldY, ChunkZ, OC_Surface, OC_BiomeCtx, OC_BiomeParams, OC_BiomeCache,
-                         OutTerrainZ, OutCeilSurf);
+                         OutTerrainZ, OutCeilSurf, OcAmp, OcDirX, OcDirY);
     return true;
+}
+
+//=============================================================================
+// TRIVIAL-TILE CLASSIFICATION (T1.d)
+//=============================================================================
+// ~84 % des tuiles générées sortent VIDES (tout-roc sous le terrain, tout-air
+// au-dessus, cap solide) mais payaient quand même le pré-échantillonnage 33³+
+// complet (trace 2026-07-05 : 83 925 GenerateMesh pour 13 227 maillages réels).
+// Une 1re tentative (2026-06-26) a été REVERTÉE : borne analytique GLOBALE du
+// plafond pas assez conservative (cap bas ⇒ trous dans le toit). Ici on suit la
+// prescription du revert : les colonnes sont ÉCHANTILLONNÉES sur le treillis
+// exact du mesher (mêmes fonctions ⇒ mêmes floats ⇒ verdict exact, pas une
+// estimation), et le cas tout-solide porte des gardes spine/passages/
+// disturbances/diff. Tout ce qui n'est pas prouvable ⇒ Mixed (le seul coût d'un
+// faux Mixed est du CPU ; un faux AllSolid/AllAir serait un trou).
+
+EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
+{
+    if (!StrateManager) return EVoxelTileClass::Mixed;
+
+    // Mêmes clamps que GenerateMesh — le verdict doit couvrir le treillis réellement échantillonné.
+    Step = FMath::Max(1, Step);
+    const int32 CPA     = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
+    const int32 GridDim = CPA + 1;   // g ∈ [-1, GridDim] par axe (marge des normales incluse)
+
+    // Boîte voxel englobant tous les échantillons du treillis.
+    const int32 MinX = OriginVoxels.X - Step, MaxX = OriginVoxels.X + GridDim * Step;
+    const int32 MinY = OriginVoxels.Y - Step, MaxY = OriginVoxels.Y + GridDim * Step;
+    const int32 MinZ = OriginVoxels.Z - Step, MaxZ = OriginVoxels.Z + GridDim * Step;
+
+    // Division entière PLANCHER (les coords négatives tronquent vers 0 en C++ — pas floor).
+    auto FloorDivC = [](int32 A, int32 B) -> int32
+    {
+        const int32 Q = A / B, R = A % B;
+        return (R != 0 && ((R < 0) != (B < 0))) ? Q - 1 : Q;
+    };
+
+    // ── Garde diff layer : un mod joueur peut creuser OU remplir n'importe où. ──
+    if (DiffLayer && DiffLayer->HasAnyMods())
+    {
+        const FIntVector MinChunk(FloorDivC(MinX, CHUNK_SIZE), FloorDivC(MinY, CHUNK_SIZE), FloorDivC(MinZ, CHUNK_SIZE));
+        const FIntVector MaxChunk(FloorDivC(MaxX, CHUNK_SIZE), FloorDivC(MaxY, CHUNK_SIZE), FloorDivC(MaxZ, CHUNK_SIZE));
+        if (DiffLayer->HasAnyModInChunkRange(MinChunk, MaxChunk)) return EVoxelTileClass::Mixed;
+    }
+
+    bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
+    bool bCanAir   = true;   // "tout le treillis est air" encore prouvable
+
+    // ── Gardes "carveurs d'air" : cassent AllSolid, jamais AllAir (ils n'ajoutent pas de roche). ──
+    if (StrateManager->AnyPassageNearBox(FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
+    {
+        bCanSolid = false;
+    }
+    if (OriginSpineRadius > 0.0f)
+    {
+        // Spine (0,0) : colonne XY rayon R + blend 3 (cf. ApplyOriginSpine). Test cercle/boîte XY.
+        const float Reach = OriginSpineRadius + 3.0f;
+        const float CX = FMath::Clamp(0.0f, (float)MinX, (float)MaxX);
+        const float CY = FMath::Clamp(0.0f, (float)MinY, (float)MaxY);
+        if (CX * CX + CY * CY <= Reach * Reach) bCanSolid = false;
+    }
+
+    // ── Catégorisation par Z de treillis. v1 : gap bedrock = solide ; SurfaceWorld = test
+    //    colonne ; tout le reste (intérieurs de caves, hors layout) = Mixed immédiat. ──
+    struct FSurfSlot
+    {
+        int32 BotChunkZ = INT32_MAX;   // identité du slot (borne basse de la strate, en chunks)
+        int32 RepChunkZ = 0;           // chunk Z représentatif pour la résolution des params
+        int32 StrateKey = MIN_int32;   // même clé que GetDensityAt (StrateBottomWorldZ arrondi)
+        float OverhangMargin = 0.0f;   // F20 : hauteur max de corniche (= max OverhangHeight strate+biomes)
+        FSurfaceGenerationParams         Params;
+        FBiomeContext                    BiomeCtx;
+        TArray<FSurfaceGenerationParams> BiomeParams;
+        TArray<float>                    InteriorZ;   // z hors bandes de seal → testés par colonne
+    };
+    // thread_local : les TArray gardent leur capacité d'un appel à l'autre (zéro malloc/tuile).
+    static thread_local FSurfSlot Slots[2];
+    static thread_local FChunkBiomeCache TC_BiomeCache;   // biome grid du classifieur (valeurs ≡ CP_BiomeCache)
+    int32 NumSlots = 0;
+
+    int32 MemoChunkZ  = INT32_MAX;
+    int32 MemoCat     = -1;            // 0 = gap, 1 = surface
+    int32 MemoSlotIdx = -1;
+    for (int32 g = -1; g <= GridDim; ++g)
+    {
+        const int32 Zi = OriginVoxels.Z + g * Step;
+        const int32 ChunkZ = FloorDivC(Zi, CHUNK_SIZE);
+        if (ChunkZ != MemoChunkZ)
+        {
+            MemoChunkZ = ChunkZ;
+            const FIntVector CC(0, 0, ChunkZ);   // les requêtes de layout ne dépendent que de Z
+            if (StrateManager->IsGapChunk(CC))
+            {
+                MemoCat = 0;
+            }
+            else if (StrateManager->GetGeneratorTypeForChunk(CC) == ECaveGeneratorType::SurfaceWorld)
+            {
+                // Retrouve (ou résout) le slot de strate — l'identité vient des bornes chunk-Z du layout.
+                int32 TopCZ = 0, BotCZ = 0;
+                if (!StrateManager->GetStrateChunkZBounds(ChunkZ, TopCZ, BotCZ)) return EVoxelTileClass::Mixed;
+                MemoSlotIdx = -1;
+                for (int32 s = 0; s < NumSlots; ++s)
+                {
+                    if (Slots[s].BotChunkZ == BotCZ) { MemoSlotIdx = s; break; }
+                }
+                if (MemoSlotIdx < 0)
+                {
+                    if (NumSlots >= 2) return EVoxelTileClass::Mixed;   // >2 strates surface dans une tuile : improbable
+                    MemoSlotIdx = NumSlots++;
+                    FSurfSlot& S = Slots[MemoSlotIdx];
+                    S.BotChunkZ  = BotCZ;
+                    S.RepChunkZ  = ChunkZ;
+                    S.InteriorZ.Reset();
+                    ResolveSurfaceChunkParams(CC, S.Params, S.BiomeCtx, S.BiomeParams);
+                    S.StrateKey  = FMath::RoundToInt(S.Params.StrateBottomWorldZ);
+
+                    // F20 : marge d'overhang = hauteur max (OverhangHeight) sur laquelle une corniche
+                    // peut AJOUTER de la roche AU-DESSUS du sol. La corniche est plafonnée à
+                    // TerrainZ+Height ⇒ au-delà, air prouvable ; dans (TerrainZ, TerrainZ+Height], ni air
+                    // ni solide prouvable → colonne forcée en Mixed. (L'union n'enlève jamais de roche ⇒
+                    // sous le terrain reste solide prouvable : marge vers le HAUT uniquement.)
+                    S.OverhangMargin = (S.Params.OverhangStrength > 0.0f) ? S.Params.OverhangHeight : 0.0f;
+                    for (const FSurfaceGenerationParams& BP : S.BiomeParams)
+                    {
+                        if (BP.OverhangStrength > 0.0f)
+                            S.OverhangMargin = FMath::Max(S.OverhangMargin, BP.OverhangHeight);
+                    }
+
+                    // Disturbances de cette strate : les chasms CREUSENT (cassent AllSolid), les
+                    // ponts/arêtes AJOUTENT de la roche dans l'intérieur (cassent AllAir).
+                    const FStrateDisturbanceParams D = StrateManager->GetDisturbanceParamsForChunk(CC);
+                    if (D.ChasmDensity  > 0.0f) bCanSolid = false;
+                    if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) bCanAir = false;
+                }
+                MemoCat = 1;
+            }
+            else
+            {
+                return EVoxelTileClass::Mixed;   // archétype cave / hors layout : pas prouvable en v1
+            }
+        }
+
+        if (MemoCat == 0)
+        {
+            bCanAir = false;   // bedrock du gap = solide (le carve des passages est déjà gardé)
+        }
+        else
+        {
+            FSurfSlot& S = Slots[MemoSlotIdx];
+            // Bande de seal ? Mêmes inégalités qu'ApplyBoundarySeal : à l'intérieur, la densité est
+            // Max(…, SealFactor·BaseDensity) avec SealFactor > 0 ⇒ solide garanti si BaseDensity > 0.
+            const float Z       = (float)Zi;
+            const float DistTop = S.Params.StrateTopWorldZ - Z;
+            const float DistBot = Z - S.Params.StrateBottomWorldZ;
+            const float Th      = S.Params.BoundarySealThickness;
+            const bool bInBand  = Th > 0.0f && S.Params.BaseDensity > 0.0f
+                && ((DistTop >= 0.0f && DistTop < Th) || (DistBot >= 0.0f && DistBot < Th));
+            if (bInBand) { bCanAir = false; }
+            else         { S.InteriorZ.Add(Z); }
+        }
+        if (!bCanSolid && !bCanAir) return EVoxelTileClass::Mixed;
+    }
+
+    // ── Balayage des colonnes XY sur le treillis exact du mesher (marge incluse). Une colonne
+    //    tranche chaque z intérieur : air côté MC ⇔ TerrainZ ≤ z ≤ CeilSurf (D = −interne ≥ 0,
+    //    cf. SurfaceDensityFromColumn ; spine/passages ne font QUE de l'air → gardés plus haut).
+    //    Pré-passe clairsemée ~5×5 pour tuer vite les tuiles traversées par la surface, puis
+    //    passe complète — les colonnes recalculées par la pré-passe restent chaudes dans la boîte.
+    auto TestColumn = [&](int32 gx, int32 gy) -> bool   // false ⇒ les deux hypothèses sont mortes
+    {
+        const int32 Xi = OriginVoxels.X + gx * Step;
+        const int32 Yi = OriginVoxels.Y + gy * Step;
+        for (int32 s = 0; s < NumSlots; ++s)
+        {
+            FSurfSlot& S = Slots[s];
+            if (S.InteriorZ.Num() == 0) continue;
+            FSurfaceColumnBox& Box = GSurfColCache.Acquire(Xi, Yi, S.StrateKey, Seed);
+            const int32 CI = (Yi - Box.BaseY) * FSurfaceColumnBox::Dim + (Xi - Box.BaseX);
+            if (!Box.Computed[CI])
+            {
+                ComputeSurfaceColumn((float)Xi, (float)Yi, S.RepChunkZ, S.Params, S.BiomeCtx,
+                                     S.BiomeParams, TC_BiomeCache,
+                                     Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf,
+                                     Box.Cols[CI].OverhangAmp, Box.Cols[CI].DirX, Box.Cols[CI].DirY);
+                Box.Computed[CI] = true;
+            }
+            const float T = Box.Cols[CI].TerrainZ;
+            const float C = Box.Cols[CI].CeilSurf;
+            const float M = S.OverhangMargin;
+            for (const float Z : S.InteriorZ)
+            {
+                // F20 : juste au-dessus du sol (jusqu'à +OverhangHeight) une corniche peut ajouter de la
+                // roche ⇒ ni air ni solide prouvable → tuile Mixed. (Vers le haut uniquement : l'union
+                // n'enlève rien sous le terrain ; le cap n'est pas affecté.)
+                if (M > 0.0f && Z > T && Z <= T + M) return false;
+                if (Z >= T && Z <= C) { bCanSolid = false; }   // point côté air (surface incluse)
+                else                  { bCanAir   = false; }   // sous le terrain / dans le cap
+                if (!bCanSolid && !bCanAir) return false;
+            }
+        }
+        return true;
+    };
+
+    const bool bNeedColumns = (NumSlots > 0)
+        && (Slots[0].InteriorZ.Num() > 0 || (NumSlots > 1 && Slots[1].InteriorZ.Num() > 0));
+    if (bNeedColumns)
+    {
+        const int32 PreStride = FMath::Max(1, (GridDim + 1) / 4);
+        for (int32 gy = -1; gy <= GridDim; gy += PreStride)
+            for (int32 gx = -1; gx <= GridDim; gx += PreStride)
+                if (!TestColumn(gx, gy)) return EVoxelTileClass::Mixed;
+        for (int32 gy = -1; gy <= GridDim; ++gy)
+            for (int32 gx = -1; gx <= GridDim; ++gx)
+                if (!TestColumn(gx, gy)) return EVoxelTileClass::Mixed;
+    }
+
+    // Ici exactement UNE hypothèse doit survivre (chaque point testé en tue une ; les tuiles
+    // sans point intérieur ont tué AllAir via gap/seal). Égalité = prudence → Mixed.
+    if (bCanSolid == bCanAir) return EVoxelTileClass::Mixed;
+    return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
 }
 
 float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
@@ -2162,7 +2670,8 @@ float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float World
     }
     const float CeilSurf = ComputeSurfaceCeiling(WorldX, WorldY, ParamsD);
 
-    return SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, TerrainZ, CeilSurf, ParamsD);
+    return SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, TerrainZ, CeilSurf,
+                                    /*OverhangAmp*/0.0f, /*DirX*/0.0f, /*DirY*/0.0f, ParamsD);
 }
 
 //=============================================================================
@@ -2194,6 +2703,43 @@ float UVoxelGenerator::SampleMoisture(float WorldX, float WorldY, float Frequenc
         WorldY * Frequency + SeedF * 8.9f,
         SeedF * 1.3f), 2) * 0.5f + 0.5f;                 // [0,1]
     return FMath::Clamp(N, 0.0f, 1.0f);
+}
+
+bool UVoxelGenerator::EvaluateTerrainConditions(const TArray<FTerrainCondition>& Conditions,
+                                                float WorldX, float WorldY, const FBiomeContext& BiomeCtx) const
+{
+    if (Conditions.Num() == 0) return true;   // zero-cost default (the common case)
+
+    // Freq/contrast come from the strate's biome map (defaults when the strate has no biomes) — the same
+    // params SampleRelief/SampleMoisture are given everywhere else, so a condition agrees with the terrain.
+    const FBiomeMapParams MP = BiomeCtx.IsValid() ? BiomeCtx.Map : FBiomeMapParams();
+
+    // Lazily sample each field only if a condition references it (BiomeBorder's Voronoi is the pricey one).
+    float Relief = 0.0f, Moisture = 0.0f, Border = 0.0f;
+    bool bHaveRelief = false, bHaveMoisture = false, bHaveBorder = false;
+
+    for (const FTerrainCondition& C : Conditions)
+    {
+        float V = 0.0f;
+        switch (C.Type)
+        {
+        case ETerrainConditionType::Relief:
+            if (!bHaveRelief)   { Relief   = SampleRelief(WorldX, WorldY, MP.ReliefFrequency, MP.ReliefContrast); bHaveRelief = true; }
+            V = Relief;   break;
+        case ETerrainConditionType::Moisture:
+            if (!bHaveMoisture) { Moisture = SampleMoisture(WorldX, WorldY, MP.MoistureFrequency); bHaveMoisture = true; }
+            V = Moisture; break;
+        case ETerrainConditionType::BiomeBorder:
+            if (!bHaveBorder)   { Border = SampleBiomeAt(WorldX, WorldY, BiomeCtx).NeighborWeight; bHaveBorder = true; }
+            V = Border;   break;
+        default: break;
+        }
+
+        bool bPass = (V >= C.Min && V <= C.Max);
+        if (C.bInvert) bPass = !bPass;
+        if (!bPass) return false;   // AND semantics: any failing condition rejects the candidate
+    }
+    return true;
 }
 
 int32 UVoxelGenerator::ClassifyBiomeAtSite(float SiteX, float SiteY,
@@ -2540,25 +3086,71 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     const int32 CX = FMath::FloorToInt(WorldX / Spacing);
     const int32 CY = FMath::FloorToInt(WorldY / Spacing);
 
-    // Collect shafts in the 3x3 neighbourhood (XY).
+    // Shafts + cross-connectors of the 3×3 neighbourhood are pure functions of (cell, seed,
+    // params) yet were re-hashed PER VOXEL (9 cell rolls + a pair hash per shaft pair). Bake
+    // them once per centre cell (thread_local); per-voxel work = the cylinder/capsule SDFs.
     struct FLocalShaft { float X, Y, R; };
-    TArray<FLocalShaft, TInlineAllocator<9>> Shafts;
+    struct FLocalConn  { FVector A, B; };
+    thread_local TArray<FLocalShaft, TInlineAllocator<9>> Shafts;
+    thread_local TArray<FLocalConn, TInlineAllocator<8>>  Conns;
+    thread_local int32  VS_CX = INT32_MAX, VS_CY = INT32_MAX;
+    thread_local uint32 VS_Seed = 0xFFFFFFFFu;
+    thread_local float  VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f, VS_MaxR = -1.0f,
+                        VS_Cross = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX;
 
-    for (int32 dy = -1; dy <= 1; dy++)
-    for (int32 dx = -1; dx <= 1; dx++)
+    if (CX != VS_CX || CY != VS_CY || S != VS_Seed || Spacing != VS_Spacing ||
+        Params.ShaftDensity != VS_Dens || Params.ShaftMinRadius != VS_MinR || Params.ShaftMaxRadius != VS_MaxR ||
+        Params.CrossConnectChance != VS_Cross ||
+        Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ)
     {
-        const int32 nx = CX + dx, ny = CY + dy;
-        const uint32 Hh = VoxelHash::Cell(nx, ny, S);
-        if (VoxelHash::ToFloat01(Hh) > Params.ShaftDensity) continue;
+        VS_CX = CX;  VS_CY = CY;  VS_Seed = S;  VS_Spacing = Spacing;
+        VS_Dens = Params.ShaftDensity;  VS_MinR = Params.ShaftMinRadius;  VS_MaxR = Params.ShaftMaxRadius;
+        VS_Cross = Params.CrossConnectChance;
+        VS_BotZ = Params.StrateBottomWorldZ;  VS_TopZ = Params.StrateTopWorldZ;
+        Shafts.Reset();
+        Conns.Reset();
 
-        const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
-        const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
-        FLocalShaft Sh;
-        Sh.X = (nx + 0.15f + JX * 0.7f) * Spacing;
-        Sh.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
-        Sh.R = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
-                           VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
-        Shafts.Add(Sh);
+        // Collect shafts in the 3x3 neighbourhood (XY).
+        for (int32 dy = -1; dy <= 1; dy++)
+        for (int32 dx = -1; dx <= 1; dx++)
+        {
+            const int32 nx = CX + dx, ny = CY + dy;
+            const uint32 Hh = VoxelHash::Cell(nx, ny, S);
+            if (VoxelHash::ToFloat01(Hh) > Params.ShaftDensity) continue;
+
+            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
+            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
+            FLocalShaft Sh;
+            Sh.X = (nx + 0.15f + JX * 0.7f) * Spacing;
+            Sh.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
+            Sh.R = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
+                               VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            Shafts.Add(Sh);
+        }
+
+        // Horizontal connectors between nearby shaft pairs (hash-gated).
+        if (Params.CrossConnectChance > 0.0f && Shafts.Num() >= 2)
+        {
+            const float BottomZ = Params.StrateBottomWorldZ + Params.BoundarySealThickness;
+            const float TopZ    = Params.StrateTopWorldZ    - Params.BoundarySealThickness;
+            for (int32 i = 0; i < Shafts.Num(); i++)
+            for (int32 j = i + 1; j < Shafts.Num(); j++)
+            {
+                const FLocalShaft& A = Shafts[i];
+                const FLocalShaft& B = Shafts[j];
+                const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
+                if (DSq > FMath::Square(Spacing * 1.6f)) continue;  // only neighbours
+
+                // Symmetric pair hash from quantised endpoints.
+                const uint32 PH = VoxelHash::Pair(
+                    FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
+                    FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), S ^ 0xC04Eu);
+                if (VoxelHash::ToFloat01(PH) >= Params.CrossConnectChance) continue;
+
+                const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
+                Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc) });
+            }
+        }
     }
 
     float CaveSDF = FLT_MAX;
@@ -2570,36 +3162,15 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
         const float DY = WorldY - Sh.Y;
         CaveSDF = FMath::Min(CaveSDF, FMath::Sqrt(DX * DX + DY * DY) - Sh.R);
     }
-
-    // Horizontal connectors between nearby shaft pairs (hash-gated).
-    if (Params.CrossConnectChance > 0.0f && Shafts.Num() >= 2)
+    for (const FLocalConn& C : Conns)
     {
-        const float BottomZ = Params.StrateBottomWorldZ + Params.BoundarySealThickness;
-        const float TopZ    = Params.StrateTopWorldZ    - Params.BoundarySealThickness;
-        for (int32 i = 0; i < Shafts.Num(); i++)
-        for (int32 j = i + 1; j < Shafts.Num(); j++)
-        {
-            const FLocalShaft& A = Shafts[i];
-            const FLocalShaft& B = Shafts[j];
-            const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
-            if (DSq > FMath::Square(Spacing * 1.6f)) continue;  // only neighbours
-
-            // Symmetric pair hash from quantised endpoints.
-            const uint32 PH = VoxelHash::Pair(
-                FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
-                FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), S ^ 0xC04Eu);
-            if (VoxelHash::ToFloat01(PH) >= Params.CrossConnectChance) continue;
-
-            const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-            CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos,
-                FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), Params.ConnectorRadius));
-        }
+        CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, C.A, C.B, Params.ConnectorRadius));
     }
 
     // Wall roughness.
     if (Params.SurfaceRoughness > 0.0f && CaveSDF < Params.SurfaceRoughness + 4.0f)
     {
-        CaveSDF += FractalNoise3D(FVector(WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f), 3)
+        CaveSDF += FractalNoise3D(FVector(WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f), VoxelGenLOD::Eff(3))
                  * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 
@@ -2681,55 +3252,84 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // organic instead of perfect circles. Computed once per voxel and shared by all nearby
     // islands (each samples a different part of the field → distinct silhouettes).
     const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
-    const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + (float)S * 0.0007f, WorldY * 0.04f, WorldZ * 0.012f), 3)
+    const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + (float)S * 0.0007f, WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;
-    const float WY = WorldY + FractalNoise3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), 3)
+    const float WY = WorldY + FractalNoise3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;
 
-    for (int32 dy = -1; dy <= 1; dy++)
-    for (int32 dx = -1; dx <= 1; dx++)
+    // Per-island constants (existence roll, jitter, radius, Z anchor, taper) are pure functions
+    // of (cell, seed, params) yet were re-hashed PER VOXEL. Bake the 3×3 neighbourhood's islands
+    // once per centre cell (thread_local); the per-voxel work keeps only the warped-frame
+    // distance / taper / top-surface math (those genuinely vary per voxel).
+    struct FLocalIsland { float X, Y, Rxy, TopHalf, TopZ, BotZ, TaperEnd; };
+    thread_local TArray<FLocalIsland, TInlineAllocator<9>> Islands;
+    thread_local int32  FI_CX = INT32_MAX, FI_CY = INT32_MAX;
+    thread_local uint32 FI_Seed = 0xFFFFFFFFu;
+    thread_local float  FI_Spacing = -1.0f, FI_Dens = -1.0f, FI_MinR = -1.0f, FI_MaxR = -1.0f,
+                        FI_Thick = -1.0f, FI_VJit = -1.0f, FI_BotZ = FLT_MAX, FI_TopZ = FLT_MAX;
+
+    if (CX != FI_CX || CY != FI_CY || S != FI_Seed || Spacing != FI_Spacing ||
+        Params.IslandDensity != FI_Dens || Params.IslandMinRadius != FI_MinR || Params.IslandMaxRadius != FI_MaxR ||
+        Params.ThicknessRatio != FI_Thick || Params.VerticalJitter != FI_VJit ||
+        Params.StrateBottomWorldZ != FI_BotZ || Params.StrateTopWorldZ != FI_TopZ)
     {
-        const int32 nx = CX + dx, ny = CY + dy;
-        const uint32 Hh = VoxelHash::Cell(nx, ny, S);
-        if (VoxelHash::ToFloat01(Hh) > Params.IslandDensity) continue;
+        FI_CX = CX;  FI_CY = CY;  FI_Seed = S;  FI_Spacing = Spacing;
+        FI_Dens = Params.IslandDensity;  FI_MinR = Params.IslandMinRadius;  FI_MaxR = Params.IslandMaxRadius;
+        FI_Thick = Params.ThicknessRatio;  FI_VJit = Params.VerticalJitter;
+        FI_BotZ = Params.StrateBottomWorldZ;  FI_TopZ = Params.StrateTopWorldZ;
+        Islands.Reset();
 
-        const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
-        const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
-        const float IslX = (nx + 0.15f + JX * 0.7f) * Spacing;
-        const float IslY = (ny + 0.15f + JY * 0.7f) * Spacing;
+        for (int32 dy = -1; dy <= 1; dy++)
+        for (int32 dx = -1; dx <= 1; dx++)
+        {
+            const int32 nx = CX + dx, ny = CY + dy;
+            const uint32 Hh = VoxelHash::Cell(nx, ny, S);
+            if (VoxelHash::ToFloat01(Hh) > Params.IslandDensity) continue;
 
-        const float Rxy = FMath::Lerp(Params.IslandMinRadius, Params.IslandMaxRadius,
-                                      VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x5A5Au)));
+            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
+            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
 
-        // ASYMMETRIC ISLAND PROFILE: a fairly flat land slab on TOP, and an underside that
-        // tapers DOWN to a rough point (the hanging "roots"). ThicknessRatio scales how deep
-        // the underside hangs. This is what reads as a floating island vs. a sphere.
-        const float TopHalf    = Rxy * 0.20f;                                   // land slab above centre
-        const float UnderDepth = Rxy * FMath::Max(Params.ThicknessRatio, 0.25f); // tapering underside
+            FLocalIsland& Isl = Islands.AddDefaulted_GetRef();
+            Isl.X = (nx + 0.15f + JX * 0.7f) * Spacing;
+            Isl.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
+            Isl.Rxy = FMath::Lerp(Params.IslandMinRadius, Params.IslandMaxRadius,
+                                  VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x5A5Au)));
 
-        const float SpreadZ = FMath::Max(H * 0.5f - FMath::Max(TopHalf, UnderDepth) - Params.BoundarySealThickness, 0.0f)
-                              * Params.VerticalJitter;
-        const float Cz = MidZ + VoxelHash::ToFloatSigned(VoxelHash::Mix(Hh ^ 0xB17Du)) * SpreadZ;
-        const float TopZ = Cz + TopHalf;
-        const float BotZ = Cz - UnderDepth;
+            // ASYMMETRIC ISLAND PROFILE: a fairly flat land slab on TOP, and an underside that
+            // tapers DOWN to a rough point (the hanging "roots"). ThicknessRatio scales how deep
+            // the underside hangs. This is what reads as a floating island vs. a sphere.
+            Isl.TopHalf = Isl.Rxy * 0.20f;                                          // land slab above centre
+            const float UnderDepth = Isl.Rxy * FMath::Max(Params.ThicknessRatio, 0.25f); // tapering underside
 
+            const float SpreadZ = FMath::Max(H * 0.5f - FMath::Max(Isl.TopHalf, UnderDepth) - Params.BoundarySealThickness, 0.0f)
+                                  * Params.VerticalJitter;
+            const float Cz = MidZ + VoxelHash::ToFloatSigned(VoxelHash::Mix(Hh ^ 0xB17Du)) * SpreadZ;
+            Isl.TopZ = Cz + Isl.TopHalf;
+            Isl.BotZ = Cz - UnderDepth;
+
+            // Per-island taper sharpness (SmoothStep end point) for varied silhouettes.
+            Isl.TaperEnd = FMath::Lerp(0.45f, 0.7f, VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x7A1Eu)));
+        }
+    }
+
+    for (const FLocalIsland& Isl : Islands)
+    {
         // Horizontal distance in the WARPED (lobed) frame so the outline isn't a circle.
-        const float Dxw = WX - IslX, Dyw = WY - IslY;
+        const float Dxw = WX - Isl.X, Dyw = WY - Isl.Y;
         const float DistXY = FMath::Sqrt(Dxw * Dxw + Dyw * Dyw);
 
         // Radius envelope by height: full width across the top, narrowing to a point at the
-        // bottom tip (SmoothStep taper). Per-island hash gives slightly different taper sharpness.
-        const float TaperEnd = FMath::Lerp(0.45f, 0.7f, VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x7A1Eu)));
-        const float Hgt = FMath::Clamp((WorldZ - BotZ) / FMath::Max(TopZ - BotZ, 1.0f), 0.0f, 1.0f);
-        const float Taper = SmoothStep01(FMath::Clamp(Hgt / TaperEnd, 0.0f, 1.0f));
-        const float Env = Rxy * Taper;
+        // bottom tip (SmoothStep taper).
+        const float Hgt = FMath::Clamp((WorldZ - Isl.BotZ) / FMath::Max(Isl.TopZ - Isl.BotZ, 1.0f), 0.0f, 1.0f);
+        const float Taper = SmoothStep01(FMath::Clamp(Hgt / Isl.TaperEnd, 0.0f, 1.0f));
+        const float Env = Isl.Rxy * Taper;
 
         // Top surface: flat by default; dome the edges down when TopFlatten < 1.
-        float TopSurf = TopZ;
+        float TopSurf = Isl.TopZ;
         if (Params.TopFlatten < 1.0f)
         {
-            const float Edge = FMath::Clamp(DistXY / FMath::Max(Rxy, 1.0f), 0.0f, 1.0f);
-            TopSurf = TopZ - (1.0f - Params.TopFlatten) * TopHalf * 2.0f * Edge * Edge;
+            const float Edge = FMath::Clamp(DistXY / FMath::Max(Isl.Rxy, 1.0f), 0.0f, 1.0f);
+            TopSurf = Isl.TopZ - (1.0f - Params.TopFlatten) * Isl.TopHalf * 2.0f * Edge * Edge;
         }
 
         // Pseudo-SDF: outside if beyond the radial envelope OR above the top surface.
@@ -2741,7 +3341,7 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // Craggy shells.
     if (Params.SurfaceRoughness > 0.0f && IslandSDF < Params.SurfaceRoughness + BlendK + 2.0f)
     {
-        IslandSDF += FractalNoise3D(FVector(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f), 4)
+        IslandSDF += FractalNoise3D(FVector(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f), VoxelGenLOD::Eff(4))
                    * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 

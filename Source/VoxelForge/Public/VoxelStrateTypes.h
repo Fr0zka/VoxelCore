@@ -16,7 +16,7 @@
 #include "GameplayTagContainer.h"
 #include "VoxelStrateTypes.generated.h"
 
-class UVoxelBiomeDefinition;   // FStrateLandmark::RequiredBiome (optional per-landmark biome filter)
+class UVoxelBiomeDefinition;   // FPlacementProfile::RequiredBiome (optional per-entry biome filter)
 
 //=============================================================================
 // ENUMS
@@ -242,6 +242,113 @@ enum class EVoxelStrateTransition : uint8
 //=============================================================================
 // GENERATION PARAMS
 //=============================================================================
+
+// X-macro field list for FStrateGenerationParams — the ONE place that enumerates
+// every param participating in strate-boundary blending (Lerp expands it below).
+// ADDING A FIELD TO THE STRUCT? ADD IT HERE TOO — with the old hand-written Lerp,
+// a forgotten field silently reset to its default value inside blend zones.
+// Liste X-macro des champs blendés aux frontières de strates (une seule source).
+//   LERPF(Name) — continuous value, FMath::Lerp between the two strates
+//   SNAPF(Name) — discrete value (bool / int / enum), snaps at Alpha = 0.5
+#define VF_STRATE_PARAM_FIELDS(LERPF, SNAPF) \
+    /* Rock */ \
+    LERPF(BaseDensity) \
+    LERPF(VerticalScale) \
+    /* Worm tunnels */ \
+    LERPF(WormFrequency) \
+    LERPF(WormHorizontalBias) \
+    LERPF(WormThreshold) \
+    LERPF(WormStrength) \
+    LERPF(WormNetworkRange) \
+    /* Cave morphology — rooms */ \
+    LERPF(RoomSpacing) \
+    LERPF(RoomDensity) \
+    LERPF(MinRoomRadius) \
+    LERPF(MaxRoomRadius) \
+    LERPF(RoomHeightRatio) \
+    LERPF(RoomShapeVariety) \
+    LERPF(RoomFloorCutMin) \
+    LERPF(RoomFloorCutMax) \
+    LERPF(FloorReliefStrength) \
+    LERPF(FloorReliefFrequency) \
+    LERPF(OriginRoomRadius) \
+    SNAPF(OriginRoomMaxConnections) \
+    /* Cave morphology — tunnels */ \
+    LERPF(TunnelMinRadius) \
+    LERPF(TunnelMaxRadius) \
+    LERPF(TunnelDensity) \
+    LERPF(MaxTunnelLength) \
+    LERPF(TunnelWarpStrength) \
+    LERPF(TunnelHorizontalBias) \
+    SNAPF(bTunnelsFlowTowardOrigin) \
+    LERPF(TunnelEndpointZOffset) \
+    LERPF(SDFBlendRadius) \
+    LERPF(WaterLevelRelative) \
+    /* Cave warp */ \
+    LERPF(CaveWarpStrength) \
+    LERPF(CaveWarpFrequency) \
+    /* Roughness */ \
+    LERPF(SurfaceRoughness) \
+    LERPF(RoughnessFrequency) \
+    /* Boundary seal + runtime Z range */ \
+    LERPF(BoundarySealThickness) \
+    LERPF(StrateTopWorldZ) \
+    LERPF(StrateBottomWorldZ) \
+    /* Noise profile */ \
+    SNAPF(RoughnessNoiseType) \
+    LERPF(DomainWarpStrength) \
+    LERPF(DomainWarpFrequency) \
+    LERPF(FloorBias) \
+    /* Terrain ops — terracing / layer lines / overhangs */ \
+    LERPF(TerraceStepHeight) \
+    LERPF(TerraceHardness) \
+    LERPF(TerraceNoiseDisplacement) \
+    LERPF(LayerLineSpacing) \
+    LERPF(LayerLineDepth) \
+    LERPF(OverhangStrength) \
+    LERPF(OverhangDepth) \
+    LERPF(OverhangFrequency) \
+    /* Ribbing */ \
+    LERPF(RibbingSpacing) \
+    LERPF(RibbingDepth) \
+    /* Cliff */ \
+    LERPF(CliffStrength) \
+    /* Scallop */ \
+    LERPF(ScallopStrength) \
+    LERPF(ScallopFrequency) \
+    /* Arch */ \
+    LERPF(ArchDensity) \
+    LERPF(ArchMinRadius) \
+    LERPF(ArchMaxRadius) \
+    /* Columns */ \
+    LERPF(ColumnDensity) \
+    LERPF(ColumnMinRadius) \
+    LERPF(ColumnMaxRadius) \
+    /* Pits */ \
+    LERPF(PitDensity) \
+    LERPF(PitMinRadius) \
+    LERPF(PitMaxRadius) \
+    LERPF(PitDepth) \
+    /* Chimneys */ \
+    LERPF(ChimneyDensity) \
+    LERPF(ChimneyMinRadius) \
+    LERPF(ChimneyMaxRadius) \
+    LERPF(ChimneyHeight) \
+    /* Domes */ \
+    LERPF(DomeDensity) \
+    LERPF(DomeMinRadius) \
+    LERPF(DomeMaxRadius) \
+    LERPF(DomeHeightRatio) \
+    /* Pinch */ \
+    LERPF(PinchDensity) \
+    LERPF(PinchStrength) \
+    LERPF(PinchLength)
+
+// Per-field expansions used by FStrateGenerationParams::Lerp. They reference the
+// locals A / B / Alpha / Result of that function (lexical expansion). Defined at
+// file scope so no preprocessor directive sits inside the USTRUCT body (UHT-safe).
+#define VF_PARAM_LERP(Name) Result.Name = FMath::Lerp(A.Name, B.Name, Alpha);
+#define VF_PARAM_SNAP(Name) Result.Name = (Alpha < 0.5f) ? A.Name : B.Name;
 
 /**
  * FStrateGenerationParams — Cave generation parameters for one strate.
@@ -924,97 +1031,10 @@ struct VOXELFORGE_API FStrateGenerationParams
         float Alpha)
     {
         FStrateGenerationParams Result;
-        // Rock
-        Result.BaseDensity                = FMath::Lerp(A.BaseDensity, B.BaseDensity, Alpha);
-        Result.VerticalScale              = FMath::Lerp(A.VerticalScale, B.VerticalScale, Alpha);
-        // Worm tunnels
-        Result.WormFrequency              = FMath::Lerp(A.WormFrequency, B.WormFrequency, Alpha);
-        Result.WormHorizontalBias         = FMath::Lerp(A.WormHorizontalBias, B.WormHorizontalBias, Alpha);
-        Result.WormThreshold              = FMath::Lerp(A.WormThreshold, B.WormThreshold, Alpha);
-        Result.WormStrength               = FMath::Lerp(A.WormStrength, B.WormStrength, Alpha);
-        Result.WormNetworkRange           = FMath::Lerp(A.WormNetworkRange, B.WormNetworkRange, Alpha);
-        // Cave morphology
-        Result.RoomSpacing                = FMath::Lerp(A.RoomSpacing, B.RoomSpacing, Alpha);
-        Result.RoomDensity                = FMath::Lerp(A.RoomDensity, B.RoomDensity, Alpha);
-        Result.MinRoomRadius              = FMath::Lerp(A.MinRoomRadius, B.MinRoomRadius, Alpha);
-        Result.MaxRoomRadius              = FMath::Lerp(A.MaxRoomRadius, B.MaxRoomRadius, Alpha);
-        Result.RoomHeightRatio            = FMath::Lerp(A.RoomHeightRatio, B.RoomHeightRatio, Alpha);
-        Result.RoomShapeVariety           = FMath::Lerp(A.RoomShapeVariety, B.RoomShapeVariety, Alpha);
-        Result.RoomFloorCutMin            = FMath::Lerp(A.RoomFloorCutMin, B.RoomFloorCutMin, Alpha);
-        Result.RoomFloorCutMax            = FMath::Lerp(A.RoomFloorCutMax, B.RoomFloorCutMax, Alpha);
-        Result.FloorReliefStrength        = FMath::Lerp(A.FloorReliefStrength, B.FloorReliefStrength, Alpha);
-        Result.FloorReliefFrequency       = FMath::Lerp(A.FloorReliefFrequency, B.FloorReliefFrequency, Alpha);
-        Result.OriginRoomRadius           = FMath::Lerp(A.OriginRoomRadius, B.OriginRoomRadius, Alpha);
-        Result.OriginRoomMaxConnections   = (Alpha < 0.5f) ? A.OriginRoomMaxConnections : B.OriginRoomMaxConnections;
-        Result.TunnelMinRadius            = FMath::Lerp(A.TunnelMinRadius, B.TunnelMinRadius, Alpha);
-        Result.TunnelMaxRadius            = FMath::Lerp(A.TunnelMaxRadius, B.TunnelMaxRadius, Alpha);
-        Result.TunnelDensity              = FMath::Lerp(A.TunnelDensity, B.TunnelDensity, Alpha);
-        Result.MaxTunnelLength            = FMath::Lerp(A.MaxTunnelLength, B.MaxTunnelLength, Alpha);
-        Result.TunnelWarpStrength         = FMath::Lerp(A.TunnelWarpStrength, B.TunnelWarpStrength, Alpha);
-        Result.TunnelHorizontalBias       = FMath::Lerp(A.TunnelHorizontalBias, B.TunnelHorizontalBias, Alpha);
-        Result.bTunnelsFlowTowardOrigin   = (Alpha < 0.5f) ? A.bTunnelsFlowTowardOrigin : B.bTunnelsFlowTowardOrigin;
-        Result.TunnelEndpointZOffset      = FMath::Lerp(A.TunnelEndpointZOffset, B.TunnelEndpointZOffset, Alpha);
-        Result.SDFBlendRadius             = FMath::Lerp(A.SDFBlendRadius, B.SDFBlendRadius, Alpha);
-        Result.WaterLevelRelative         = FMath::Lerp(A.WaterLevelRelative, B.WaterLevelRelative, Alpha);
-        // Cave warp
-        Result.CaveWarpStrength           = FMath::Lerp(A.CaveWarpStrength, B.CaveWarpStrength, Alpha);
-        Result.CaveWarpFrequency          = FMath::Lerp(A.CaveWarpFrequency, B.CaveWarpFrequency, Alpha);
-        // Roughness
-        Result.SurfaceRoughness           = FMath::Lerp(A.SurfaceRoughness, B.SurfaceRoughness, Alpha);
-        Result.RoughnessFrequency         = FMath::Lerp(A.RoughnessFrequency, B.RoughnessFrequency, Alpha);
-        // Boundary seal
-        Result.BoundarySealThickness      = FMath::Lerp(A.BoundarySealThickness, B.BoundarySealThickness, Alpha);
-        Result.StrateTopWorldZ            = FMath::Lerp(A.StrateTopWorldZ, B.StrateTopWorldZ, Alpha);
-        Result.StrateBottomWorldZ         = FMath::Lerp(A.StrateBottomWorldZ, B.StrateBottomWorldZ, Alpha);
-        // Noise profile
-        Result.RoughnessNoiseType         = (Alpha < 0.5f) ? A.RoughnessNoiseType : B.RoughnessNoiseType;
-        Result.DomainWarpStrength         = FMath::Lerp(A.DomainWarpStrength, B.DomainWarpStrength, Alpha);
-        Result.DomainWarpFrequency        = FMath::Lerp(A.DomainWarpFrequency, B.DomainWarpFrequency, Alpha);
-        Result.FloorBias                  = FMath::Lerp(A.FloorBias, B.FloorBias, Alpha);
-        // Terrain ops
-        Result.TerraceStepHeight          = FMath::Lerp(A.TerraceStepHeight, B.TerraceStepHeight, Alpha);
-        Result.TerraceHardness            = FMath::Lerp(A.TerraceHardness, B.TerraceHardness, Alpha);
-        Result.TerraceNoiseDisplacement   = FMath::Lerp(A.TerraceNoiseDisplacement, B.TerraceNoiseDisplacement, Alpha);
-        Result.LayerLineSpacing           = FMath::Lerp(A.LayerLineSpacing, B.LayerLineSpacing, Alpha);
-        Result.LayerLineDepth             = FMath::Lerp(A.LayerLineDepth, B.LayerLineDepth, Alpha);
-        Result.OverhangStrength           = FMath::Lerp(A.OverhangStrength, B.OverhangStrength, Alpha);
-        Result.OverhangDepth              = FMath::Lerp(A.OverhangDepth, B.OverhangDepth, Alpha);
-        Result.OverhangFrequency          = FMath::Lerp(A.OverhangFrequency, B.OverhangFrequency, Alpha);
-        // Ribbing
-        Result.RibbingSpacing             = FMath::Lerp(A.RibbingSpacing, B.RibbingSpacing, Alpha);
-        Result.RibbingDepth               = FMath::Lerp(A.RibbingDepth, B.RibbingDepth, Alpha);
-        // Cliff
-        Result.CliffStrength              = FMath::Lerp(A.CliffStrength, B.CliffStrength, Alpha);
-        // Scallop
-        Result.ScallopStrength            = FMath::Lerp(A.ScallopStrength, B.ScallopStrength, Alpha);
-        Result.ScallopFrequency           = FMath::Lerp(A.ScallopFrequency, B.ScallopFrequency, Alpha);
-        // Arch
-        Result.ArchDensity                = FMath::Lerp(A.ArchDensity, B.ArchDensity, Alpha);
-        Result.ArchMinRadius              = FMath::Lerp(A.ArchMinRadius, B.ArchMinRadius, Alpha);
-        Result.ArchMaxRadius              = FMath::Lerp(A.ArchMaxRadius, B.ArchMaxRadius, Alpha);
-        // Columns
-        Result.ColumnDensity              = FMath::Lerp(A.ColumnDensity, B.ColumnDensity, Alpha);
-        Result.ColumnMinRadius            = FMath::Lerp(A.ColumnMinRadius, B.ColumnMinRadius, Alpha);
-        Result.ColumnMaxRadius            = FMath::Lerp(A.ColumnMaxRadius, B.ColumnMaxRadius, Alpha);
-        // Pits
-        Result.PitDensity                 = FMath::Lerp(A.PitDensity, B.PitDensity, Alpha);
-        Result.PitMinRadius               = FMath::Lerp(A.PitMinRadius, B.PitMinRadius, Alpha);
-        Result.PitMaxRadius               = FMath::Lerp(A.PitMaxRadius, B.PitMaxRadius, Alpha);
-        Result.PitDepth                   = FMath::Lerp(A.PitDepth, B.PitDepth, Alpha);
-        // Chimneys
-        Result.ChimneyDensity             = FMath::Lerp(A.ChimneyDensity, B.ChimneyDensity, Alpha);
-        Result.ChimneyMinRadius           = FMath::Lerp(A.ChimneyMinRadius, B.ChimneyMinRadius, Alpha);
-        Result.ChimneyMaxRadius           = FMath::Lerp(A.ChimneyMaxRadius, B.ChimneyMaxRadius, Alpha);
-        Result.ChimneyHeight              = FMath::Lerp(A.ChimneyHeight, B.ChimneyHeight, Alpha);
-        // Domes
-        Result.DomeDensity                = FMath::Lerp(A.DomeDensity, B.DomeDensity, Alpha);
-        Result.DomeMinRadius              = FMath::Lerp(A.DomeMinRadius, B.DomeMinRadius, Alpha);
-        Result.DomeMaxRadius              = FMath::Lerp(A.DomeMaxRadius, B.DomeMaxRadius, Alpha);
-        Result.DomeHeightRatio            = FMath::Lerp(A.DomeHeightRatio, B.DomeHeightRatio, Alpha);
-        // Pinch
-        Result.PinchDensity               = FMath::Lerp(A.PinchDensity, B.PinchDensity, Alpha);
-        Result.PinchStrength              = FMath::Lerp(A.PinchStrength, B.PinchStrength, Alpha);
-        Result.PinchLength                = FMath::Lerp(A.PinchLength, B.PinchLength, Alpha);
+        // One assignment per field, expanded from VF_STRATE_PARAM_FIELDS (defined
+        // above the struct). Bit-identical to the old hand-written list — same
+        // FMath::Lerp calls, same Alpha-0.5 snap for discrete fields.
+        VF_STRATE_PARAM_FIELDS(VF_PARAM_LERP, VF_PARAM_SNAP)
         return Result;
     }
 };
@@ -1363,6 +1383,93 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     // Height of each terrace step in voxels (when TerraceStrength > 0).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "1.0"))
     float TerraceHeight = 12.0f;
+
+    // Terrace edge sharpness (0-1). 0 = soft rounded steps; 1 = crisp flat mesas with near-
+    // vertical risers. Only matters when TerraceStrength > 0. (F20 — the plateau tops flatten
+    // and the risers steepen as this rises.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float TerraceHardness = 0.5f;
+
+    // ----- F20 surface terrain ops (heightfield tier — biome-selected, slope/relief aware) -----
+    // These reshape the ground HEIGHT as a function of XY. All default OFF (0) so a strate/biome
+    // that doesn't set them is byte-identical to before. Cheap: pure per-column height remaps
+    // (no extra 3D density sampling). Each biome carries its own set; the surface blend lerps the
+    // final heights between the dominant and neighbour biome for free.
+
+    // Sedimentary "layer lines": fine repeating shelves cut into slopes (exposed rock strata).
+    // Depth = voxels the surface is nudged toward each band plane; 0 = off. Reads on slopes,
+    // invisible on flats (a flat area shifts uniformly). Pair with a small Spacing for dense
+    // banding. Un-gated by relief so the geology reads everywhere.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float LayerLineDepth = 0.0f;
+
+    // Vertical spacing between layer lines in voxels (band period).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "1.0"))
+    float LayerLineSpacing = 4.0f;
+
+    // Cliff STEEPENING (0-1 master): where the surface is already STEEP (slope > threshold),
+    // push the height away from the local mean so gentle slopes become sheer walls / canyon
+    // faces, while gentle ground stays untouched. 0 = off. This is the slope-CONDITIONED op —
+    // it hugs real steep terrain instead of scattering cliffs at random. Costs 4 extra structural
+    // samples per column ONLY when > 0 (the priciest phase-1 op, still per-column-cheap).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float CliffStrength = 0.0f;
+
+    // Slope (rise in voxels per voxel of XY) at which cliffs begin. Below this the ground is
+    // untouched; the effect ramps in above it. ~0.3 = 17°, ~0.5 = 27° (default), ~1.0 = 45°.
+    // Lower = more of the terrain qualifies as "cliff".
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.05"))
+    float CliffSlopeThreshold = 0.5f;
+
+    // Extra steepness multiplier at full effect: how far the height is pushed from the local mean.
+    // 1 = up to ~2× the local relief on the steepest gated slopes; 3 = dramatic vertical walls.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float CliffSharpness = 2.0f;
+
+    // XY distance (voxels) used to measure the slope / local mean for Cliff. Larger = smoother,
+    // broader cliff faces; smaller = reacts to finer bumps. Keep a few voxels.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.5"))
+    float CliffSampleDist = 2.0f;
+
+    // ----- F20 phase 2: OVERHANG (volumetric — the first true-3D surface op) -----
+    // Real jutting rock shelves: for air voxels just above a steep slope, the heightfield is re-sampled
+    // UPHILL (toward the cliff) by a height-varying amount and unioned in — so cliff rock extends OUT
+    // over the void below, self-capping at the cliff's height. This is genuine 3D (per-voxel re-eval on
+    // steep overhang columns only), costlier than the heightfield ops. 0 = off ⇒ byte-identical.
+    // Biome-selected: each biome's strength blends across borders.
+
+    // Master overhang strength (0-1). 0 = off. Also the biome selector — a biome with 0 has no overhangs.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float OverhangStrength = 0.0f;
+
+    // Horizontal REACH (voxels): how far the shelf juts out over the void from the cliff, and the scale
+    // at which the terrain gradient is measured (so a spot over the void can "see" the cliff). Bigger =
+    // deeper overhangs reaching further out (and a bit more cost). ~8-20.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float OverhangReach = 12.0f;
+
+    // Vertical HEIGHT (voxels) of the overhang zone above the local ground — where the shelf sits above
+    // the ground/void directly under it, AND the band ClassifyTile treats as ambiguous (so it never holes
+    // a trivially-skipped tile). Larger = taller/higher shelves but more woken air tiles near cliffs.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float OverhangHeight = 20.0f;
+
+    // Horizontal frequency of the shelf-shape noise (breaks the reach up so shelves are ragged, not a
+    // uniform lip). Lower = broader, smoother shelves.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float OverhangFrequency = 0.02f;
+
+    // Vertical frequency RATIO of the shelf noise (× the horizontal frequency). Higher = the shelf folds/
+    // curls more as it rises (more dramatic undercuts); near 0 = a flatter lip. ~0.4-0.8.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
+    float OverhangZScale = 0.5f;
+
+    // Slope (rise per voxel of XY, measured over ~Reach) at which overhangs begin. Below this, none.
+    // Lowered default so it triggers on merely-steep ground, not only near-vertical walls. ~0.2 = 11°,
+    // ~0.3 = 17° (default), ~0.6 = 31°. NOTE: a DRAMATIC jutting shelf still needs a near-vertical cliff
+    // (slope » 1) next to a drop — smooth hills can only get subtle folds; use Cliff to MAKE walls first.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.05"))
+    float OverhangSlopeThreshold = 0.3f;
 
     // ----- Water -----
 
@@ -1716,141 +1823,318 @@ struct VOXELFORGE_API FStratePassageConfig
 //=============================================================================
 
 /**
+ * ETerrainConditionType — which analytic terrain field an FTerrainCondition tests.
+ * All are DERIVED PREDICATES (pure functions of XY + seed + strate), evaluated on demand — NOT stored
+ * terrain annotations (see the F7 design: "conditions, not annotations"). More types (water-edge,
+ * relief-peak local-max) land in later passes.
+ */
+UENUM(BlueprintType)
+enum class ETerrainConditionType : uint8
+{
+    Relief       UMETA(DisplayName = "Relief (elevation 0-1)"),   // SampleRelief — peaks/mesas/lowlands
+    Moisture     UMETA(DisplayName = "Moisture (0-1)"),           // SampleMoisture — wet/dry
+    BiomeBorder  UMETA(DisplayName = "Biome border (0=deep, ~0.5=edge)"), // near a biome boundary
+};
+
+/**
+ * FTerrainCondition — one relational "aware placement" predicate (F7). The candidate point's derived
+ * field (Relief/Moisture/biome-border weight) must fall in [Min,Max] (or OUTSIDE it when bInvert).
+ * Multiple conditions on one entry are AND-ed. Empty list = no test (zero cost). Deterministic +
+ * worker-safe (pure query of the analytic fields, no stored state). Also drives the future quest
+ * FindFeature locator (same predicate, run as a search).
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FTerrainCondition
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Condition")
+    ETerrainConditionType Type = ETerrainConditionType::Relief;
+
+    // Inclusive lower/upper bound of the accepted band. All fields read 0..1; BiomeBorder is ~0 deep in a
+    // biome cell and approaches ~0.5 exactly on a border, so "near a border" ≈ Min 0.35.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Condition", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float Min = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Condition", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float Max = 1.0f;
+
+    // Accept OUTSIDE [Min,Max] instead of inside (avoid peaks, keep off borders, …).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Condition")
+    bool bInvert = false;
+};
+
+/**
+ * FPlacementProfile — shared placement settings for every scatter primitive
+ * (FStrateDecoration and FStrateLandmark — the latter also covers set-pieces: ruins/shrines/monuments).
+ *
+ * Each primitive keeps only its own DISTRIBUTION fields (HOW candidates are enumerated —
+ * a per-column grid, a hash lattice, an anchor mode). Everything about "can it go here",
+ * "what spawns", and "how it looks" lives HERE, once, so all three primitives are authored
+ * with one identical vocabulary. The awareness layer (FTerrainCondition Conditions[]) lands
+ * in the Filter section in a later pass.
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FPlacementProfile
+{
+    GENERATED_BODY()
+
+    // ----- Spawn (one of these; ActorClass wins if both set) -----
+
+    // Real actor — lights, logic, interaction. Costs game-thread time per instance: prefer InstancedMesh
+    // for pure visual props (dense decoration especially — an actor per groundcover instance is ruinous).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement")
+    TSubclassOf<AActor> ActorClass;
+
+    // INSTANCED path: if set, renders as batched instances (decoration) or one StaticMeshComponent
+    // (landmark/set-piece) instead of spawning ActorClass (which is then ignored). No tick, no per-actor
+    // overhead, engine-culled. An emissive material still glows at distance without a light.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement")
+    UStaticMesh* InstancedMesh = nullptr;
+
+    // ----- Filter (can it go here) -----
+
+    // Which surface type this entry snaps to. (Decoration defaults Any; landmarks default Ceiling — set in
+    // each primitive's constructor.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter")
+    ESurfaceType SurfacePlacement = ESurfaceType::Any;
+
+    // Surface-tilt band (degrees from flat = acos(|normal.Z|); 0 = flat, 90 = vertical). MaxSlopeAngle
+    // rejects surfaces STEEPER than it (90 = no filter); MinSlopeAngle rejects surfaces FLATTER than it
+    // (0 = no filter). Pair them to band a prop onto a tilt range (e.g. 30..70 = slopes only).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MaxSlopeAngle = 90.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MinSlopeAngle = 0.0f;
+
+    // Wall entries only: exclude downward-facing OVERHANGS. A "wall" (|normal.Z| <= 0.5) still includes
+    // surfaces leaning slightly DOWNWARD; set this so only normals with Z >= 0 (upright walls) qualify.
+    // Ignored unless the point resolves as a wall.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter")
+    bool bWallExcludeOverhangs = false;
+
+    // Water-relative gate (ignored unless the strate has a water table): place only below (true) / above
+    // (false) the water line when bRequireWaterRelative is set.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter")
+    bool bRequireWaterRelative = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter",
+        meta = (EditCondition = "bRequireWaterRelative"))
+    bool bPlaceBelowWater = false;
+
+    // Optional: only place inside this biome (resolved at the candidate XY). Null = any biome in the
+    // strate. (Decoration entries are already scoped to a biome by being listed under it, so this is
+    // mostly for the strate-wide landmark / set-piece primitives.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter")
+    UVoxelBiomeDefinition* RequiredBiome = nullptr;
+
+    // Relational "aware placement" (F7): derived predicates the candidate must satisfy (relief/moisture/
+    // biome-border), all AND-ed and evaluated by pure query — temples on peaks, oasis in wet lowlands,
+    // markers on biome borders. Empty = no test (zero cost). Deterministic + worker-safe.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Filter")
+    TArray<FTerrainCondition> Conditions;
+
+    // ----- Transform -----
+
+    // Rotate the object so its up-axis follows the surface normal (plants stand up on floors, stalactites
+    // point down on ceilings). If false, keeps world-up. (Decoration defaults true; landmarks default
+    // false — set per primitive.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    bool bAlignToSurface = true;
+
+    // Offset along the surface normal (cm). Positive = lift off the surface, negative = sink in.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    float SurfaceOffset = 0.0f;
+
+    // WORLD-space position offset (cm) added after the surface snap (e.g. +Z lifts a sun off the sky-cap).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    FVector LocationOffset = FVector::ZeroVector;
+
+    // Fixed rotation applied on top of the (optional) surface alignment. Use Yaw here to face a prop
+    // roughly one way (pair with RandomRotation.Yaw for banded variation — replaces the old MinYaw/MaxYaw).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    FRotator RotationOffset = FRotator::ZeroRotator;
+
+    // Per-axis RANDOM rotation range (degrees) — each instance gets a hash-deterministic ±value/2 on each
+    // axis. Yaw alone = spin variety (360 = full random heading, the decoration default); all three =
+    // tumbled-debris look. 0 on an axis = no randomisation there.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    FRotator RandomRotation = FRotator::ZeroRotator;
+
+    // Uniform scale range (hash-random per instance).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    float MinScale = 1.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Transform")
+    float MaxScale = 1.0f;
+
+    // ----- Render (InstancedMesh / StaticMeshComponent path) -----
+
+    // Distance (cm) past which the mesh stops drawing. 0 = never cull (correct for trees / far-visible
+    // suns). THE lever that makes dense groundcover affordable — grass drawn only near the player.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Render", meta = (ClampMin = "0.0"))
+    float CullDistance = 0.0f;
+
+    // Whether the instances cast dynamic shadows. Dense instanced shadows are the single biggest cost of
+    // heavy foliage — turn OFF for grass / small clutter, leave ON for trees and large props.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Placement|Render")
+    bool bCastShadow = true;
+};
+
+/**
+ * FDecoSubCompanion — a LEVEL-2 satellite: clutter that spawns ON a level-1 companion (moss on a rock).
+ * Distinct type (not a self-recursive FDecoCompanion, which UHT can't reflect) so nesting caps at 2 levels.
+ * Always INHERITS its level-1 parent's snapped surface point (no per-satellite re-solve → nesting stays cheap);
+ * may still gate on its own Profile.Conditions. Small radii — it sits on its parent.
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FDecoSubCompanion
+{
+    GENERATED_BODY()
+
+    FDecoSubCompanion()
+    {
+        Profile.MinScale = 0.8f;
+        Profile.MaxScale = 1.2f;
+        Profile.RandomRotation.Yaw = 360.0f;
+    }
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ShowOnlyInnerProperties))
+    FPlacementProfile Profile;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ClampMin = "0.0"))
+    float RadiusMinVox = 1.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ClampMin = "0.0"))
+    float RadiusMaxVox = 3.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ClampMin = "0"))
+    int32 CountMin = 1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ClampMin = "0"))
+    int32 CountMax = 2;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SubCompanion", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float Probability = 1.0f;
+};
+
+/**
+ * FDecoCompanion — a level-1 cluster satellite that spawns near each placed instance of its parent decoration
+ * (F7 relational placement). Deterministic (pure function of the parent's hash → no search), re-snaps to the
+ * real surface at its own XY (bSnapToSurface), may gate on its own Conditions, and may itself carry LEVEL-2
+ * `SubCompanions` (moss on a rock). E.g. a tree lists rocks + mushrooms; a rock lists moss. Two levels max
+ * (per-parent budget caps the total); deeper nesting is a later concern.
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FDecoCompanion
+{
+    GENERATED_BODY()
+
+    FDecoCompanion()
+    {
+        // Same clutter defaults as a decoration entry (variety scale + full random yaw).
+        Profile.MinScale = 0.8f;
+        Profile.MaxScale = 1.2f;
+        Profile.RandomRotation.Yaw = 360.0f;
+    }
+
+    // What to spawn + how it looks (mesh/actor, transform, render). Same vocabulary as the parent.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ShowOnlyInnerProperties))
+    FPlacementProfile Profile;
+
+    // Disk (in VOXELS) around the parent that satellites scatter into.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ClampMin = "0.0"))
+    float RadiusMinVox = 2.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ClampMin = "0.0"))
+    float RadiusMaxVox = 6.0f;
+
+    // How many satellites per parent (inclusive range, deterministic per parent).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ClampMin = "0"))
+    int32 CountMin = 1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ClampMin = "0"))
+    int32 CountMax = 3;
+
+    // Chance this companion type fires at all, per parent (0-1).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float Probability = 1.0f;
+
+    // Snap each satellite to the REAL surface at its own XY (fixes floaters on uneven ground; respects the
+    // companion's own SurfacePlacement). Cheap on SurfaceWorld (height oracle), a short ray-march in caves.
+    // OFF = inherit the parent's exact height + normal (cheapest — fine only on flat ground). A satellite
+    // that finds no surface at its spot is simply skipped (no floater).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion")
+    bool bSnapToSurface = true;
+
+    // LEVEL-2 clutter that spawns ON each of THIS companion's satellites (e.g. this = rock, sub = moss).
+    // Inherits the satellite's surface point (no extra surface find). Capped by the per-parent budget.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companion")
+    TArray<FDecoSubCompanion> SubCompanions;
+};
+
+/**
  * FStrateDecoration — One decoration type that can spawn on surfaces.
  *
- * Decorations are actors placed ON the cave surface (stalactites on ceilings,
- * mushrooms on floors, crystals on walls, etc.).
- * The decoration placer (future system) reads these entries from the active
- * strate definition and spawns actors accordingly.
+ * Placed ON the cave surface (stalactites on ceilings, mushrooms on floors, crystals on walls).
+ * All the placement/transform/render settings live on the shared `Profile`; this struct adds only
+ * decoration's own DISTRIBUTION fields (per-column dense grid, spawn density, per-chunk cap).
  */
 USTRUCT(BlueprintType)
 struct VOXELFORGE_API FStrateDecoration
 {
     GENERATED_BODY()
 
-    // The actor class to spawn (e.g., BP_Stalactite, BP_CrystalCluster).
-    // Real actors: lights, logic, interaction. They cost game-thread time per instance —
-    // prefer InstancedMesh for pure visual props, and consider the Far tier so the coarse grid keeps
-    // their spawn count down.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
-    TSubclassOf<AActor> ActorClass;
+    FStrateDecoration()
+    {
+        // Decoration defaults that differ from FPlacementProfile's neutral defaults: variety scale range
+        // and a full random yaw (reproduces the legacy bRandomYaw = true, MinYaw/MaxYaw = 0..360 look).
+        Profile.MinScale = 0.8f;
+        Profile.MaxScale = 1.2f;
+        Profile.RandomRotation.Yaw = 360.0f;
+    }
 
-    // INSTANCED path: if set, this entry renders as batched HISM instances instead of
-    // spawning ActorClass (which is then ignored). No tick, no per-actor overhead,
-    // engine-culled — orders of magnitude cheaper. Use for everything that doesn't need
-    // logic/lights/interaction; an emissive material still glows at distance without a light.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
-    UStaticMesh* InstancedMesh = nullptr;
+    // Shared placement/transform/render settings.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ShowOnlyInnerProperties))
+    FPlacementProfile Profile;
 
     // Which of the two decoration streaming grids this entry uses (§8.5). Far (default) = full radius +
     // coarse column grid (cheap for rare/large props visible everywhere); Near = short radius + fine
     // column grid (dense groundcover near the player only). The radius/spacing presets live on
-    // VoxelSettings; this only PICKS a grid. Defaults reproduce the legacy single-radius fine grid until
-    // you opt into a coarser far spacing or move an entry to Near. (Replaces the old vestigial MaxLODLevel.)
+    // VoxelSettings; this only PICKS a grid.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
     EDecoStreamTier StreamTier = EDecoStreamTier::Far;
 
-    // Which surface type this decoration can be placed on
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
-    ESurfaceType SurfacePlacement = ESurfaceType::Any;
-
-    // Maximum surface tilt (degrees from flat) this decoration tolerates. The surface tilt is
-    // acos(|normal.Z|): 0 = perfectly flat floor/ceiling, 90 = vertical wall. Grass on gentle
-    // ground → ~30-40; rock/lichen that clings to slopes → 90 (no filter, the default).
-    //   90 → place anywhere (default, no filter) · 35 → grass that avoids cliffs · 15 → flats only
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "90.0"))
-    float MaxSlopeAngle = 90.0f;
-
-    // Minimum surface tilt (degrees from flat) — the LOWER companion to MaxSlopeAngle. Rejects surfaces
-    // FLATTER than this, so a prop can be kept OFF flat ground and restricted to slopes / walls. Same
-    // metric as MaxSlopeAngle: acos(|normal.Z|), 0 = flat, 90 = vertical. Pair the two to band a prop
-    // onto a tilt range (e.g. 30..70 = slopes only, never flats or sheer walls).
-    //   0 → no filter (default) · 45 → slopes & walls only · 70 → near-vertical only
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "90.0"))
-    float MinSlopeAngle = 0.0f;
-
-    // Chance per valid surface point to spawn this decoration (0-1)
-    // 0.01 = rare, 0.1 = common, 0.5 = very dense
+    // Chance per valid surface point to spawn this decoration (0-1).
+    // 0.01 = rare, 0.1 = common, 0.5 = very dense.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float SpawnDensity = 0.05f;
 
-    // Random scale range for variety
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
-    float MinScale = 0.8f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration")
-    float MaxScale = 1.2f;
-
-    // ----- Placement rules -----
-
-    // Rotate the actor so its up-axis follows the surface normal (stalactites point
-    // down on ceilings, plants stand up on floors). If false, keeps world-up.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
-    bool bAlignToSurface = true;
-
-    // Apply a deterministic random yaw so instances don't all face the same way.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
-    bool bRandomYaw = true;
-
-    // When bRandomYaw is set, constrain the random yaw to [MinYaw, MaxYaw] degrees instead of a full
-    // turn. Lets a prop face roughly one way with a little variation (wind-bent grass: 80..100). The
-    // default 0..360 is a full unrestricted turn — byte-identical to the legacy behaviour. Ignored when
-    // bRandomYaw is false.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
-        meta = (EditCondition = "bRandomYaw", ClampMin = "0.0", ClampMax = "360.0"))
-    float MinYaw = 0.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
-        meta = (EditCondition = "bRandomYaw", ClampMin = "0.0", ClampMax = "360.0"))
-    float MaxYaw = 360.0f;
-
-    // Wall props only: exclude downward-facing OVERHANGS. A "wall" is any surface between floor and
-    // ceiling (|normal.Z| <= 0.5), which still includes surfaces that lean slightly DOWNWARD (overhang
-    // ceilings). For props that must sit on upright walls (vines, wall torches) set this so only normals
-    // with Z >= 0 (vertical or up-leaning) qualify. Ignored unless the point resolves as a wall.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
-    bool bWallExcludeOverhangs = false;
-
-    // Offset along the surface normal (world units). Positive = lift off the surface,
-    // negative = sink into it. Useful to embed roots or float crystals slightly.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
-    float SurfaceOffset = 0.0f;
-
     // Hard cap on how many of THIS decoration spawn per chunk (perf safety).
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement", meta = (ClampMin = "1"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration", meta = (ClampMin = "1"))
     int32 MaxPerChunk = 40;
 
-    // Only place where this is below the strate water line (true) or above it (false).
-    // Ignored unless RequireWaterRelative is set. Lets you put seaweed underwater and
-    // grass above water in the same strate.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement")
-    bool bRequireWaterRelative = false;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Placement",
-        meta = (EditCondition = "bRequireWaterRelative"))
-    bool bPlaceBelowWater = false;
-
-    // ----- Performance (HISM render tuning — only affects the InstancedMesh path) -----
-
-    // Distance (world units / cm) past which instances stop rendering. This is THE lever that makes
-    // DENSE groundcover affordable: grass can be placed thickly but only drawn near the player, so the
-    // GPU cost is bounded by area-within-cull, not by the whole streaming radius. 0 = never cull (the
-    // default — correct for trees / large props you want visible to the horizon).
-    //   0     → no cull (props, trees)
-    //   2000  → ~20 m, typical grass / small ground clutter
-    //   4000  → ~40 m, taller plants you want visible a bit further
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Performance", meta = (ClampMin = "0.0"))
-    float CullDistance = 0.0f;
-
-    // Whether these instances cast dynamic shadows. Dense instanced shadows are the single biggest cost
-    // of heavy foliage — turn this OFF for grass / small clutter (an unlit-from-below tuft loses almost
-    // nothing visually). Leave ON for trees and anything large enough that its shadow reads as grounding.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Performance")
-    bool bCastShadow = true;
+    // Cluster satellites scattered around each placed instance of THIS decoration (F7 relational placement) —
+    // e.g. a tree → rocks + mushrooms. Deterministic, one level, inherits this entry's surface point.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Decoration|Companions")
+    TArray<FDecoCompanion> Companions;
 };
 
 /**
- * FStrateLandmark — A RARE, large, far-visible object placed on a coarse HASH LATTICE (§8.5).
+ * ELandmarkAnchor — how a landmark's candidate anchor points are chosen. Feature-conditioning
+ * (peaks / wet lowlands / biome edges) rides on TOP of either mode via Profile.Conditions.
+ */
+UENUM(BlueprintType)
+enum class ELandmarkAnchor : uint8
+{
+    HashLattice   UMETA(DisplayName = "Hash Lattice (scattered)"),    // scatter on a coarse lattice
+    PassageMouth  UMETA(DisplayName = "Passage Mouth (at descents)"),  // at passage endpoints in this strate
+};
+
+/**
+ * FStrateLandmark — a RARE, deliberately-placed object: mini-suns, ruins, shrines, monuments (§8.5, F7).
+ * The one placement primitive for "notable things you navigate by" (set-pieces folded in here 2026-07-06).
  *
  * This is the right primitive for things like the underground "mini-suns" (in-lore light sources): one
  * object per ~`SpacingChunks` lattice cell, so the work scales with how MANY landmarks are in range
@@ -1866,109 +2150,97 @@ struct VOXELFORGE_API FStrateLandmark
 {
     GENERATED_BODY()
 
-    // ----- What to spawn (one of these; ActorClass wins if both set) -----
+    FStrateLandmark()
+    {
+        // Landmark defaults that differ from FPlacementProfile's neutral defaults: suns sit on the sky-cap
+        // ceiling and stay world-upright regardless of the ceiling tilt.
+        Profile.SurfacePlacement = ESurfaceType::Ceiling;
+        Profile.bAlignToSurface  = false;
+    }
 
-    // Real actor — use this for a sun that carries its own LIGHT / logic. Rare, so the per-actor cost is fine.
+    // Shared placement/transform/render settings (what to spawn, surface/slope/water gates, transform,
+    // cull/shadow). A sun that carries its own light/logic goes in Profile.ActorClass; a plain glowing mesh
+    // in Profile.InstancedMesh.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark", meta = (ShowOnlyInnerProperties))
+    FPlacementProfile Profile;
+
+    // How candidate anchor points are chosen. Feature-conditioning (peaks / wet lowlands / biome edges)
+    // rides on TOP of either mode via Profile.Conditions.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark")
-    TSubclassOf<AActor> ActorClass;
+    ELandmarkAnchor AnchorMode = ELandmarkAnchor::HashLattice;
 
-    // OR a plain static mesh (spawned as one StaticMeshComponent — no actor/tick overhead). An emissive
-    // material glows at distance without a light. Ignored if ActorClass is set.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark")
-    UStaticMesh* InstancedMesh = nullptr;
+    // ----- Hash lattice (AnchorMode == HashLattice — scattered placement; cheap at any radius) -----
 
-    // ----- Rarity / spacing (the hash lattice — this is what makes it cheap) -----
-
-    // Average spacing between landmarks, IN CHUNKS. This is the lattice cell size: exactly one candidate is
-    // considered per SpacingChunks×SpacingChunks cell, so cost scales with (radius/spacing)². This is also
-    // the primary "distance between two instances" control. Large = rare & far apart.
-    //   16  → fairly frequent landmarks · 64 → sparse (good default) · 256+ → one every few km
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "1.0"))
+    // Average spacing between instances, IN CHUNKS = the lattice cell size (one candidate per cell, so cost
+    // scales with (radius/spacing)²). Large = rare & far apart.  16 → frequent · 64 → sparse · 256+ → km-scale
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Lattice",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::HashLattice", EditConditionHides, ClampMin = "1.0"))
     float SpacingChunks = 64.0f;
 
-    // How far within its cell a candidate may wander (0 = dead-centre grid, 1 = anywhere in the cell).
-    // The effective MINIMUM spacing between two instances ≈ SpacingChunks·(1 − JitterFraction); keep it
-    // below 1 to preserve a spacing guarantee while still breaking up the grid regularity.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    // How far within its cell a candidate may wander (0 = dead-centre, 1 = anywhere). Min spacing between two
+    // ≈ SpacingChunks·(1 − JitterFraction).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Lattice",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::HashLattice", EditConditionHides, ClampMin = "0.0", ClampMax = "1.0"))
     float JitterFraction = 0.5f;
 
-    // Probability that a lattice cell actually contains this landmark (0-1). Combine with SpacingChunks for
-    // "rare AND well-spaced": SpacingChunks sets the grid, SpawnProbability sets how many slots fill.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    // Probability that a lattice cell actually contains this instance (0-1).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Lattice",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::HashLattice", EditConditionHides, ClampMin = "0.0", ClampMax = "1.0"))
     float SpawnProbability = 1.0f;
 
-    // How far out (in chunks) landmarks stream / stay visible. CHEAP to make large here (the lattice means a
-    // 2048-chunk radius is still only ~(2048/Spacing)² candidates). Set big enough that a massive object
-    // never pops in at a jarring distance.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Spacing", meta = (ClampMin = "1"))
+    // ----- Passage mouths (AnchorMode == PassageMouth — at the passages threading this strate) -----
+
+    // Place at the DESCENT mouth — where a passage LEAVES this strate downward (the hole going down; e.g. a
+    // guardian over the descent).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Passage",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::PassageMouth", EditConditionHides))
+    bool bAtDescentMouths = true;
+
+    // Place at the ARRIVAL mouth — where a passage ENTERS this strate from above (where you land; e.g. a
+    // shrine at the bottom of the climb).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Passage",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::PassageMouth", EditConditionHides))
+    bool bAtArrivalMouths = true;
+
+    // Per-mouth chance to place (0-1). Deterministic.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Passage",
+        meta = (EditCondition = "AnchorMode == ELandmarkAnchor::PassageMouth", EditConditionHides, ClampMin = "0.0", ClampMax = "1.0"))
+    float MouthProbability = 1.0f;
+
+    // ----- Shared -----
+
+    // How far out (in chunks) instances stream / stay visible. Cheap to make large (lattice candidate count
+    // scales with (radius/spacing)²; the passage list is finite).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark", meta = (ClampMin = "1"))
     int32 StreamRadiusChunks = 256;
 
-    // ----- Placement restriction (mirrors the base decoration gates) -----
+    // ----- Exclusion (relational self-awareness — optional) -----
 
-    // Optional: only place inside this biome (resolved at the candidate XY). Null = any biome in the strate.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
-    UVoxelBiomeDefinition* RequiredBiome = nullptr;
+    // A placed instance suppresses OTHERS whose anchor falls within this radius (chunks) so two never overlap.
+    // 0 = OFF (the default — pure scatter; mini-suns don't exclude). Conflicts resolve deterministically:
+    // higher Priority wins, ties by hash. (v1 resolves within the streamed set; a fully position-independent,
+    // pop-free resolve is a planned follow-up.)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Exclusion", meta = (ClampMin = "0.0"))
+    float ExclusionRadiusChunks = 0.0f;
 
-    // Which surface to snap to. Suns typically sit on the sky-cap CEILING; set Floor for ground monuments,
-    // Any for the first surface found. Wall-leaning surfaces are matched by the same normal test as decos.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
-    ESurfaceType SurfacePlacement = ESurfaceType::Ceiling;
+    // Higher wins an exclusion conflict (a major shrine outranks scattered ruins).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Exclusion")
+    int32 Priority = 0;
 
-    // Surface-tilt band (deg from flat = acos(|normal.Z|); 0 = flat, 90 = vertical). MaxSlopeAngle rejects
-    // surfaces STEEPER than it (90 = no filter); MinSlopeAngle rejects surfaces FLATTER than it (0 = none).
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (ClampMin = "0.0", ClampMax = "90.0"))
-    float MaxSlopeAngle = 90.0f;
+    // ----- Decoration footprint (clear groundcover under the object so it doesn't clip through) -----
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (ClampMin = "0.0", ClampMax = "90.0"))
-    float MinSlopeAngle = 0.0f;
+    // Remove decorations (grass etc.) within a radius of this landmark, so foliage doesn't poke through a
+    // temple floor. Uses the same instance-removal as player digging (cleared on spawn AND when decorations
+    // stream in near it). A landmark mesh doesn't change density, so this is the only thing that clears under it.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Footprint")
+    bool bSuppressDecorationsUnder = false;
 
-    // Water-relative gate (ignored unless the strate has a water table): place only below (true) / above
-    // (false) the water line when bRequireWaterRelative is set.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement")
-    bool bRequireWaterRelative = false;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Footprint",
+        meta = (EditCondition = "bSuppressDecorationsUnder", ClampMin = "0.0"))
+    float SuppressRadiusChunks = 2.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Placement", meta = (EditCondition = "bRequireWaterRelative"))
-    bool bPlaceBelowWater = false;
-
-    // ----- Transform tweaks (foliage-style) -----
-
-    // Rotate the object so its up-axis follows the surface normal. OFF by default — a sun usually wants to
-    // stay world-upright regardless of the ceiling tilt. ON makes it lie against the surface.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    bool bAlignToSurface = false;
-
-    // WORLD-space position offset (cm) added after the surface snap. E.g. +Z lifts a sun up off the
-    // sky-cap into the open cavern; use X/Y to nudge it off the exact column.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    FVector LocationOffset = FVector::ZeroVector;
-
-    // Fixed rotation applied on top of the (optional) surface alignment.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    FRotator RotationOffset = FRotator::ZeroRotator;
-
-    // Per-axis RANDOM rotation range (degrees) — each instance gets a hash-deterministic ±value/2 on each
-    // axis (Pitch/Yaw/Roll). 0 on an axis = no randomisation there. Yaw alone = spin variety; all three =
-    // tumbled debris look.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    FRotator RandomRotation = FRotator::ZeroRotator;
-
-    // Uniform scale range (hash-random per instance).
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    float MinScale = 1.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Transform")
-    float MaxScale = 1.0f;
-
-    // ----- Render tuning (the InstancedMesh / StaticMeshComponent path) -----
-
-    // Distance (cm) past which the mesh stops drawing. 0 = NEVER cull (the right choice for a far-visible
-    // sun). Only affects the InstancedMesh path.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Performance", meta = (ClampMin = "0.0"))
-    float CullDistance = 0.0f;
-
-    // Whether the mesh casts a shadow. Only affects the InstancedMesh path.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landmark|Performance")
-    bool bCastShadow = true;
+    // (Placement gates, transform tweaks, and cull/shadow render tuning live on the shared `Profile` above —
+    // see FPlacementProfile. Landmark-specific defaults: Ceiling surface + no surface-align.)
 
     // ----- MINI-SUN LIGHT ORB (feeds the terrain material's raymarched shadows) -----
     // When set, this landmark is also a LIGHT SOURCE: the terrain material marches the density volume

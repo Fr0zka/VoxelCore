@@ -23,6 +23,10 @@
 // HISM instances are exempt — they're batched render data, capped per entry by MaxPerChunk.
 static constexpr int32 GMaxDecorationActorsPerCell = 400;
 
+// Hard cap on total companion satellites (level 1 + level 2) spawned per placed PARENT — the safety net that
+// makes 2-level nesting impossible to blow up regardless of authored counts.
+static constexpr int32 GMaxCompanionsPerParent = 256;
+
 // One cell = one chunk XY footprint (so DecorationRadiusChunks reads as a radius in chunks, and a
 // decoration's per-cell MaxPerChunk keeps its "per chunk" meaning).
 static constexpr int32 DECO_CELL_VOXELS = CHUNK_SIZE;
@@ -429,10 +433,10 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
     CosMinSlope.SetNumUninitialized(Entries.Num());
     for (int32 e = 0; e < Entries.Num(); ++e)
     {
-        CosMaxSlope[e] = (Entries[e].MaxSlopeAngle < 89.99f)
-            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].MaxSlopeAngle)) : -1.0f;
-        CosMinSlope[e] = (Entries[e].MinSlopeAngle > 0.01f)
-            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].MinSlopeAngle)) : -1.0f;
+        CosMaxSlope[e] = (Entries[e].Profile.MaxSlopeAngle < 89.99f)
+            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].Profile.MaxSlopeAngle)) : -1.0f;
+        CosMinSlope[e] = (Entries[e].Profile.MinSlopeAngle > 0.01f)
+            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].Profile.MinSlopeAngle)) : -1.0f;
     }
 
     // Per-COLUMN biome cache: ResolveBiomeSampleAt's noise-heavy cell classification is box-validated
@@ -442,6 +446,26 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
     const bool bHasBiomes = Ctx.BiomeCtx.IsValid();
 
     auto D = [&](float VX, float VY, float VZ) { return Gen->GetDensityAt(VX, VY, VZ); };
+
+    // Build a companion satellite's transform from its profile + per-instance hash at a snapped surface point
+    // (voxel XY/Z + outward normal). Shared by level-1 and level-2 companions.
+    auto MakeCompanionXf = [&](const FPlacementProfile& P, uint32 IHash,
+                               float sVX, float sVY, float sZ, const FVector& sN) -> FTransform
+    {
+        const FVector Local(sVX * VOXEL_SIZE, sVY * VOXEL_SIZE, sZ * VOXEL_SIZE);
+        const FVector Pos = OwnerXf.TransformPosition(Local) + sN * P.SurfaceOffset + P.LocationOffset;
+        FQuat Q = P.bAlignToSurface ? FRotationMatrix::MakeFromZ(sN).ToQuat() : FQuat::Identity;
+        Q = Q * P.RotationOffset.Quaternion();
+        if (!P.RandomRotation.IsNearlyZero())
+        {
+            const float rp = (VoxelHash::ToFloat01(VoxelHash::Mix(IHash ^ 0x1111A1u)) - 0.5f) * P.RandomRotation.Pitch;
+            const float ry = (VoxelHash::ToFloat01(VoxelHash::Mix(IHash ^ 0x2222B2u)) - 0.5f) * P.RandomRotation.Yaw;
+            const float rr = (VoxelHash::ToFloat01(VoxelHash::Mix(IHash ^ 0x3333C3u)) - 0.5f) * P.RandomRotation.Roll;
+            Q = Q * FRotator(rp, ry, rr).Quaternion();
+        }
+        const float Sc = FMath::Lerp(P.MinScale, P.MaxScale, VoxelHash::ToFloat01(VoxelHash::Mix(IHash ^ 0x5CA1E000u)));
+        return FTransform(Q, Pos, FVector(Sc));
+    };
 
     // Shared: roll every decoration entry at one surface point (voxel XY, voxel Z, outward world normal)
     // and append the passing ones to OutSpawns. CrossingIdx salts the hash so stacked surfaces differ.
@@ -465,14 +489,14 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             if (EntryBiome[EntryIdx] != ColBiome) continue;
 
             const FStrateDecoration& Deco = Entries[EntryIdx];
-            const bool bInstanced = (Deco.InstancedMesh != nullptr);
-            if (!bInstanced && !Deco.ActorClass) continue;
+            const bool bInstanced = (Deco.Profile.InstancedMesh != nullptr);
+            if (!bInstanced && !Deco.Profile.ActorClass) continue;
             if (Deco.SpawnDensity <= 0.0f) continue;
             if (EntryCount[EntryIdx] >= Deco.MaxPerChunk) continue;
             if (!bInstanced && TotalActors >= GMaxDecorationActorsPerCell) continue;
 
             bool bMatches = true;
-            switch (Deco.SurfacePlacement)
+            switch (Deco.Profile.SurfacePlacement)
             {
             case ESurfaceType::Floor:   bMatches = bFloor;   break;
             case ESurfaceType::Wall:    bMatches = bWall;    break;
@@ -484,7 +508,7 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             // Strict-wall overhang gate: a "wall" point also covers surfaces that lean slightly downward
             // (N.Z in [-0.5, 0)). For props flagged wall-only-upright, drop those so overhangs don't take
             // wall decals. Applies whenever the point IS a wall (independent of Floor/Wall/Any setting).
-            if (bWall && Deco.bWallExcludeOverhangs && NormalWorld.Z < 0.0f) continue;
+            if (bWall && Deco.Profile.bWallExcludeOverhangs && NormalWorld.Z < 0.0f) continue;
 
             // Surface-tilt gates: tilt = acos(|N.Z|) (0 = flat, 90 = vertical). |N.Z| < cos(MaxSlope) ⇔
             // tilt > MaxSlope (skip steeper); |N.Z| > cos(MinSlope) ⇔ tilt < MinSlope (skip flatter).
@@ -495,26 +519,34 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             const uint32 H = DecoHash(Cell.X, Cell.Y, gx, gy, CrossingIdx, EntryIdx, InSeed, 0xDEC0u);
             if (VoxelHash::ToFloat01(H) > Deco.SpawnDensity) continue;
 
-            if (Deco.bRequireWaterRelative && Ctx.bHasWater)
+            if (Deco.Profile.bRequireWaterRelative && Ctx.bHasWater)
             {
-                if (bBelowWater != Deco.bPlaceBelowWater) continue;
+                if (bBelowWater != Deco.Profile.bPlaceBelowWater) continue;
             }
 
-            const FVector SpawnPos = PosWorld + NormalWorld * Deco.SurfaceOffset;
-            FQuat BaseQ = Deco.bAlignToSurface
+            // F7 aware placement: relational conditions (relief/moisture/biome-border). Opt-in per entry —
+            // skipped entirely when the list is empty. Worker-safe pure query; uses the cell's biome context.
+            if (Deco.Profile.Conditions.Num() > 0 &&
+                !Gen->EvaluateTerrainConditions(Deco.Profile.Conditions, VX, VY, Ctx.BiomeCtx)) continue;
+
+            const FVector SpawnPos = PosWorld + NormalWorld * Deco.Profile.SurfaceOffset + Deco.Profile.LocationOffset;
+            // Rotation: optional surface-align → fixed offset → per-axis hash random (same model as landmarks).
+            // RandomRotation.Yaw defaults to 360 for decoration (see FStrateDecoration ctor) = full random
+            // heading, reproducing the legacy random-yaw look; the exact per-instance yaw values reshuffle
+            // once (different hash mix) but the distribution is identical.
+            FQuat BaseQ = Deco.Profile.bAlignToSurface
                 ? FRotationMatrix::MakeFromZ(NormalWorld).ToQuat()
                 : FQuat::Identity;
-            if (Deco.bRandomYaw)
+            BaseQ = BaseQ * Deco.Profile.RotationOffset.Quaternion();
+            if (!Deco.Profile.RandomRotation.IsNearlyZero())
             {
-                // Roll within [MinYaw, MaxYaw]; the default 0..360 reproduces the legacy full-turn roll
-                // bit-for-bit (Lerp(0,360,t)° == t·2π rad), so existing assets are unchanged.
-                const float YawT   = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x59415721u));
-                const float Yaw    = FMath::DegreesToRadians(FMath::Lerp(Deco.MinYaw, Deco.MaxYaw, YawT));
-                const FVector Axis = Deco.bAlignToSurface ? NormalWorld : FVector::UpVector;
-                BaseQ = FQuat(Axis, Yaw) * BaseQ;
+                const float rp = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x1111A1u)) - 0.5f) * Deco.Profile.RandomRotation.Pitch;
+                const float ry = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x2222B2u)) - 0.5f) * Deco.Profile.RandomRotation.Yaw;
+                const float rr = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x3333C3u)) - 0.5f) * Deco.Profile.RandomRotation.Roll;
+                BaseQ = BaseQ * FRotator(rp, ry, rr).Quaternion();
             }
             const float ScaleT = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x5CA1E000u));
-            const float Scale  = FMath::Lerp(Deco.MinScale, Deco.MaxScale, ScaleT);
+            const float Scale  = FMath::Lerp(Deco.Profile.MinScale, Deco.Profile.MaxScale, ScaleT);
 
             FDecoSpawn& Out = OutSpawns.AddDefaulted_GetRef();
             Out.EntryIdx   = EntryIdx;
@@ -522,6 +554,96 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
             Out.Xf         = FTransform(BaseQ, SpawnPos, FVector(Scale));
             ++EntryCount[EntryIdx];
             if (!bInstanced) ++TotalActors;
+
+            // ---- Companions (F7 relational placement): deterministic cluster satellites around this parent.
+            // Level 1 re-snaps to the real surface at its own XY; level-2 SubCompanions inherit their L1
+            // satellite's point (no re-snap → cheap). A per-parent budget caps the total so nesting can't blow
+            // up. Pure function of the parent hash H → no "did a tree spawn here?" search.
+            int32 CompBudget = GMaxCompanionsPerParent;
+            for (int32 ci = 0; ci < Deco.Companions.Num() && CompBudget > 0; ++ci)
+            {
+                const FDecoCompanion& Comp = Deco.Companions[ci];
+                const bool bCompInst = (Comp.Profile.InstancedMesh != nullptr);
+                if (!bCompInst && !Comp.Profile.ActorClass) continue;
+
+                const uint32 CH = VoxelHash::Mix(H ^ (0x00C0FFEEu + (uint32)ci * 0x9E3779B1u));
+                if (VoxelHash::ToFloat01(CH) > Comp.Probability) continue;
+
+                const int32 Span  = FMath::Max(0, Comp.CountMax - Comp.CountMin);
+                const int32 Count = Comp.CountMin + (int32)(VoxelHash::ToFloat01(VoxelHash::Mix(CH ^ 0x1234u)) * (float)(Span + 1));
+                for (int32 ii = 0; ii < Count; ++ii)
+                {
+                    if (CompBudget <= 0) break;
+                    if (!bCompInst && TotalActors >= GMaxDecorationActorsPerCell) break;   // actor budget
+
+                    const uint32 IH = VoxelHash::Mix(CH ^ ((uint32)ii * 0x85EBCA77u + 0x2545F491u));
+                    const float Ang    = VoxelHash::ToFloat01(IH) * 2.0f * PI;
+                    const float RadVox = FMath::Lerp(Comp.RadiusMinVox, Comp.RadiusMaxVox,
+                                                     VoxelHash::ToFloat01(VoxelHash::Mix(IH ^ 0x77u)));
+                    const float SatVX = VX + FMath::Cos(Ang) * RadVox;   // voxel, actor-local
+                    const float SatVY = VY + FMath::Sin(Ang) * RadVox;
+
+                    // Optional per-satellite gating (relief/moisture/biome-border at ITS own XY).
+                    if (Comp.Profile.Conditions.Num() > 0 &&
+                        !Gen->EvaluateTerrainConditions(Comp.Profile.Conditions, SatVX, SatVY, Ctx.BiomeCtx)) continue;
+
+                    // Surface: SNAP to the real ground/ceiling at the satellite XY (kills floaters); or inherit.
+                    float SatZ; FVector SatN;
+                    if (Comp.bSnapToSurface)
+                    {
+                        if (!FindLandmarkColumn(Gen, OwnerXf, Ctx, SatVX, SatVY, Comp.Profile.SurfacePlacement,
+                                                Step, ColumnDepth, SatZ, SatN)) continue;   // no surface → no floater
+                    }
+                    else { SatZ = ZC; SatN = NormalWorld; }
+
+                    FDecoSpawn& CO = OutSpawns.AddDefaulted_GetRef();
+                    CO.EntryIdx     = EntryIdx;
+                    CO.CompanionIdx = ci;
+                    CO.bInstanced   = bCompInst;
+                    CO.Xf           = MakeCompanionXf(Comp.Profile, IH, SatVX, SatVY, SatZ, SatN);
+                    if (!bCompInst) ++TotalActors;
+                    --CompBudget;
+
+                    // ---- Level 2: SubCompanions ON this satellite (moss on a rock). Inherit the L1 satellite's
+                    // snapped point (SatZ, SatN) — no re-snap, so nesting stays cheap. Small disk around it.
+                    for (int32 si = 0; si < Comp.SubCompanions.Num() && CompBudget > 0; ++si)
+                    {
+                        const FDecoSubCompanion& Sub = Comp.SubCompanions[si];
+                        const bool bSubInst = (Sub.Profile.InstancedMesh != nullptr);
+                        if (!bSubInst && !Sub.Profile.ActorClass) continue;
+
+                        const uint32 SH = VoxelHash::Mix(IH ^ (0x0000544Bu + (uint32)si * 0x27D4EB2Fu));
+                        if (VoxelHash::ToFloat01(SH) > Sub.Probability) continue;
+
+                        const int32 SubSpan  = FMath::Max(0, Sub.CountMax - Sub.CountMin);
+                        const int32 SubCount = Sub.CountMin + (int32)(VoxelHash::ToFloat01(VoxelHash::Mix(SH ^ 0x1234u)) * (float)(SubSpan + 1));
+                        for (int32 sj = 0; sj < SubCount; ++sj)
+                        {
+                            if (CompBudget <= 0) break;
+                            if (!bSubInst && TotalActors >= GMaxDecorationActorsPerCell) break;
+
+                            const uint32 JH = VoxelHash::Mix(SH ^ ((uint32)sj * 0x85EBCA77u + 0x165667B1u));
+                            const float SAng    = VoxelHash::ToFloat01(JH) * 2.0f * PI;
+                            const float SRadVox = FMath::Lerp(Sub.RadiusMinVox, Sub.RadiusMaxVox,
+                                                              VoxelHash::ToFloat01(VoxelHash::Mix(JH ^ 0x77u)));
+                            const float SubVX = SatVX + FMath::Cos(SAng) * SRadVox;
+                            const float SubVY = SatVY + FMath::Sin(SAng) * SRadVox;
+
+                            if (Sub.Profile.Conditions.Num() > 0 &&
+                                !Gen->EvaluateTerrainConditions(Sub.Profile.Conditions, SubVX, SubVY, Ctx.BiomeCtx)) continue;
+
+                            FDecoSpawn& SO = OutSpawns.AddDefaulted_GetRef();
+                            SO.EntryIdx     = EntryIdx;
+                            SO.CompanionIdx = ci;
+                            SO.SubIdx       = si;
+                            SO.bInstanced   = bSubInst;
+                            SO.Xf           = MakeCompanionXf(Sub.Profile, JH, SubVX, SubVY, SatZ, SatN);
+                            if (!bSubInst) ++TotalActors;
+                            --CompBudget;
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -703,20 +825,30 @@ void UVoxelContentManager::MergeCellResult(FDecoGrid& G, const FDecoCellResult& 
     {
         if (!Result.Entries.IsValidIndex(S.EntryIdx)) continue;
         const FStrateDecoration& Deco = Result.Entries[S.EntryIdx];
+        // Resolve which profile owns this spawn: the entry itself (CompanionIdx<0), a level-1 companion, or a
+        // level-2 sub-companion (F7). Each carries its own mesh/actor + render tuning.
+        const FPlacementProfile* ProfPtr = &Deco.Profile;
+        if (S.CompanionIdx >= 0 && Deco.Companions.IsValidIndex(S.CompanionIdx))
+        {
+            const FDecoCompanion& Comp = Deco.Companions[S.CompanionIdx];
+            ProfPtr = (S.SubIdx >= 0 && Comp.SubCompanions.IsValidIndex(S.SubIdx))
+                ? &Comp.SubCompanions[S.SubIdx].Profile : &Comp.Profile;
+        }
+        const FPlacementProfile& Prof = *ProfPtr;
 
         if (S.bInstanced)
         {
-            if (!Deco.InstancedMesh) continue;
+            if (!Prof.InstancedMesh) continue;
             // Bucket by MESH so cells (and biomes) sharing a mesh collapse into one region HISM. The first
             // contributor sets the render tuning (cull/shadow/scale) for the whole region's instances.
-            FRegionMeshBucket& Bucket = Build->MeshBuckets.FindOrAdd(Deco.InstancedMesh);
-            if (Bucket.Xforms.Num() == 0) { Bucket.Deco = Deco; }
+            FRegionMeshBucket& Bucket = Build->MeshBuckets.FindOrAdd(Prof.InstancedMesh);
+            if (Bucket.Xforms.Num() == 0) { Bucket.Profile = Prof; }
             Bucket.Xforms.Add(S.Xf);
         }
-        else if (Deco.ActorClass)
+        else if (Prof.ActorClass)
         {
             FRegionActorSpawn& A = Build->ActorSpawns.AddDefaulted_GetRef();
-            A.ActorClass = Deco.ActorClass;
+            A.ActorClass = Prof.ActorClass;
             A.Xf         = S.Xf;
         }
     }
@@ -776,7 +908,7 @@ void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FD
         FRegionMeshBucket& Bucket = Pair.Value;
         UStaticMesh* Mesh = Pair.Key.Get();
         if (!Mesh || Bucket.Xforms.Num() == 0) continue;
-        const FStrateDecoration& Deco = Bucket.Deco;
+        const FPlacementProfile& Prof = Bucket.Profile;
 
         UHierarchicalInstancedStaticMeshComponent* HISM =
             NewObject<UHierarchicalInstancedStaticMeshComponent>(OwnerActor);
@@ -792,11 +924,11 @@ void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FD
         // so the render proxy is created once with the final state (no rebuild):
         //   • CullDistance bounds GPU cost — grass is drawn only near the player even when placed thickly.
         //   • bCastShadow off removes the dominant cost of dense instanced foliage.
-        HISM->SetCastShadow(Deco.bCastShadow);
-        if (Deco.CullDistance > 0.0f)
+        HISM->SetCastShadow(Prof.bCastShadow);
+        if (Prof.CullDistance > 0.0f)
         {
-            const int32 End   = FMath::Max(1, (int32)Deco.CullDistance);
-            const int32 Start = FMath::Max(1, (int32)(Deco.CullDistance * 0.8f));
+            const int32 End   = FMath::Max(1, (int32)Prof.CullDistance);
+            const int32 Start = FMath::Max(1, (int32)(Prof.CullDistance * 0.8f));
             HISM->SetCullDistances(Start, End);   // fade band 0.8x→1.0x, then gone
         }
 
@@ -814,6 +946,21 @@ void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FD
             HISM->AddInstances(Bucket.Xforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
         }
         Content.Instances.Add(HISM);
+    }
+
+    // Landmark footprints (F7): a suppressing landmark cleared whatever decorations existed when it spawned,
+    // but this region just streamed in FRESH → re-clear under any loaded suppressing landmark overlapping it
+    // (the per-HISM spatial query early-outs for the non-overlapping majority). Keeps temple floors clear as
+    // you leave and return.
+    if (Content.Instances.Num() > 0)
+    {
+        for (const TPair<FIntVector, FLandmarkInstance>& LP : LandmarkInstances)
+        {
+            if (LP.Value.SuppressRadiusWorld > 0.0f)
+            {
+                RemoveInstancesInContent(Content, LP.Value.SuppressCenter, LP.Value.SuppressRadiusWorld);
+            }
+        }
     }
 }
 
@@ -945,92 +1092,110 @@ bool UVoxelContentManager::FindLandmarkColumn(const UVoxelGenerator* Gen, const 
     return false;
 }
 
+bool UVoxelContentManager::SpawnFromProfile(const FPlacementProfile& P, uint32 H, const FDecoContext& Ctx,
+                                            const FTransform& OwnerXf, AActor* OwnerActor,
+                                            float LocalX, float LocalY, float Step, float ColDepth,
+                                            FTransform& OutXf, FLandmarkInstance& Out)
+{
+    if (!Generator) return false;
+    const float VX = LocalX / VOXEL_SIZE;
+    const float VY = LocalY / VOXEL_SIZE;
+
+    // Biome filter (resolved at the candidate XY, same field the density/deco paths use).
+    if (P.RequiredBiome)
+    {
+        const UVoxelBiomeDefinition* Bio = Generator->GetDominantBiomeAt(VX, VY, Ctx.RepChunkZ);
+        if (Bio != P.RequiredBiome) return false;   // leaves Out empty → evaluated, nothing placed
+    }
+
+    float ZC; FVector N;
+    if (!FindLandmarkColumn(Generator, OwnerXf, Ctx, VX, VY, P.SurfacePlacement, Step, ColDepth, ZC, N))
+        return false;
+
+    // Surface-tilt gates (acos(|N.Z|); guarded so defaults cost no trig).
+    if (P.MaxSlopeAngle < 89.99f &&
+        FMath::Abs(N.Z) < FMath::Cos(FMath::DegreesToRadians(P.MaxSlopeAngle))) return false;
+    if (P.MinSlopeAngle > 0.01f &&
+        FMath::Abs(N.Z) > FMath::Cos(FMath::DegreesToRadians(P.MinSlopeAngle))) return false;
+
+    const FVector LocalPos(LocalX, LocalY, ZC * VOXEL_SIZE);
+    if (P.bRequireWaterRelative && Ctx.bHasWater)
+    {
+        const bool bBelowWater = (LocalPos.Z < Ctx.WaterLocalZ);
+        if (bBelowWater != P.bPlaceBelowWater) return false;
+    }
+
+    // F7 aware placement: relational conditions (relief/moisture/biome-border), evaluated at the candidate
+    // XY. Opt-in — empty list is free. "A monument only on high mesas / near a biome edge" lives here.
+    if (P.Conditions.Num() > 0 &&
+        !Generator->EvaluateTerrainConditions(P.Conditions, VX, VY, Ctx.BiomeCtx)) return false;
+
+    // Rotation: optional surface-align → fixed offset → per-axis hash random.
+    FQuat Q = P.bAlignToSurface ? FRotationMatrix::MakeFromZ(N).ToQuat() : FQuat::Identity;
+    Q = Q * P.RotationOffset.Quaternion();
+    if (!P.RandomRotation.IsNearlyZero())
+    {
+        const float rp = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x1111A1u)) - 0.5f) * P.RandomRotation.Pitch;
+        const float ry = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x2222B2u)) - 0.5f) * P.RandomRotation.Yaw;
+        const float rr = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x3333C3u)) - 0.5f) * P.RandomRotation.Roll;
+        Q = Q * FRotator(rp, ry, rr).Quaternion();
+    }
+
+    const float ScaleT = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x5CA1E777u));
+    const float Scale  = FMath::Lerp(P.MinScale, P.MaxScale, ScaleT);
+
+    // World-space position + XYZ offset (e.g. +Z lifts a sun off the sky-cap into the cavern).
+    const FVector WorldPos = OwnerXf.TransformPosition(LocalPos) + P.LocationOffset;
+    OutXf = FTransform(Q, WorldPos, FVector(Scale));
+
+    if (P.ActorClass)
+    {
+        UWorld* World = OwnerActor->GetWorld();
+        if (!World) return false;
+        FActorSpawnParameters SP;
+        SP.Owner = OwnerActor;
+        SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        if (AActor* A = World->SpawnActor<AActor>(P.ActorClass, OutXf, SP)) { Out.Actor = A; }
+        return true;
+    }
+    if (P.InstancedMesh)
+    {
+        UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(OwnerActor);
+        C->SetStaticMesh(P.InstancedMesh);
+        C->SetMobility(EComponentMobility::Static);   // placed once, never moves → cached draw + VSM shadow
+        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        C->SetCastShadow(P.bCastShadow);
+        if (P.CullDistance > 0.0f) { C->SetCullDistance(P.CullDistance); }   // 0 = never cull (far sun)
+        C->SetWorldTransform(OutXf);
+        C->RegisterComponent();
+        C->AttachToComponent(OwnerActor->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform);
+        Out.Component = C;
+        return true;
+    }
+    return false;
+}
+
 void UVoxelContentManager::SpawnLandmarkInstance(const FStrateLandmark& L, uint32 H, const FDecoContext& Ctx,
                                                  const FTransform& OwnerXf, AActor* OwnerActor,
                                                  float LocalX, float LocalY, float Step, float ColDepth,
                                                  FLandmarkInstance& Out)
 {
-    if (!Generator) return;
-    const float VX = LocalX / VOXEL_SIZE;
-    const float VY = LocalY / VOXEL_SIZE;
+    FTransform Xf;
+    if (!SpawnFromProfile(L.Profile, H, Ctx, OwnerXf, OwnerActor, LocalX, LocalY, Step, ColDepth, Xf, Out))
+        return;   // Out stays empty → evaluated, nothing placed
 
-    // Biome filter (resolved at the candidate XY, same field the density/deco paths use).
-    if (L.RequiredBiome)
-    {
-        const UVoxelBiomeDefinition* Bio = Generator->GetDominantBiomeAt(VX, VY, Ctx.RepChunkZ);
-        if (Bio != L.RequiredBiome) return;   // leaves Out empty → evaluated, nothing placed
-    }
-
-    float ZC; FVector N;
-    if (!FindLandmarkColumn(Generator, OwnerXf, Ctx, VX, VY, L.SurfacePlacement, Step, ColDepth, ZC, N))
-        return;
-
-    // Surface-tilt gates (acos(|N.Z|); guarded so defaults cost no trig).
-    if (L.MaxSlopeAngle < 89.99f &&
-        FMath::Abs(N.Z) < FMath::Cos(FMath::DegreesToRadians(L.MaxSlopeAngle))) return;
-    if (L.MinSlopeAngle > 0.01f &&
-        FMath::Abs(N.Z) > FMath::Cos(FMath::DegreesToRadians(L.MinSlopeAngle))) return;
-
-    const FVector LocalPos(LocalX, LocalY, ZC * VOXEL_SIZE);
-    if (L.bRequireWaterRelative && Ctx.bHasWater)
-    {
-        const bool bBelowWater = (LocalPos.Z < Ctx.WaterLocalZ);
-        if (bBelowWater != L.bPlaceBelowWater) return;
-    }
-
-    // Rotation: optional surface-align → fixed offset → per-axis hash random.
-    FQuat Q = L.bAlignToSurface ? FRotationMatrix::MakeFromZ(N).ToQuat() : FQuat::Identity;
-    Q = Q * L.RotationOffset.Quaternion();
-    if (!L.RandomRotation.IsNearlyZero())
-    {
-        const float rp = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x1111A1u)) - 0.5f) * L.RandomRotation.Pitch;
-        const float ry = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x2222B2u)) - 0.5f) * L.RandomRotation.Yaw;
-        const float rr = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x3333C3u)) - 0.5f) * L.RandomRotation.Roll;
-        Q = Q * FRotator(rp, ry, rr).Quaternion();
-    }
-
-    const float ScaleT = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x5CA1E777u));
-    const float Scale  = FMath::Lerp(L.MinScale, L.MaxScale, ScaleT);
-
-    // World-space position + XYZ offset (e.g. +Z lifts a sun off the sky-cap into the cavern).
-    const FVector WorldPos = OwnerXf.TransformPosition(LocalPos) + L.LocationOffset;
-    const FTransform Xf(Q, WorldPos, FVector(Scale));
-
-    // Mini-sun light orb: record world-space data for the terrain material's raymarched shadows. Distances
-    // convert voxels→cm (×VOXEL_SIZE); the emitter radius scales with the instance scale too.
+    // Mini-sun light orb (landmark-only): record world-space data for the terrain material's raymarched
+    // shadows. Distances convert voxels→cm (×VOXEL_SIZE); the emitter radius scales with the instance too.
     if (L.bIsLightOrb)
     {
+        const float Scale = Xf.GetScale3D().X;
         Out.bIsOrb = true;
-        Out.Orb.WorldPos = WorldPos;
+        Out.Orb.WorldPos = Xf.GetLocation();
         Out.Orb.Color = L.OrbColor;
         Out.Orb.Intensity = L.OrbIntensity;
         Out.Orb.RadiusWorld = L.OrbRadiusVoxels * VOXEL_SIZE * Scale;
         Out.Orb.FalloffWorld = L.OrbFalloffVoxels * VOXEL_SIZE;
         Out.Orb.MaxShadowDistWorld = L.OrbMaxShadowDistanceVoxels * VOXEL_SIZE;
-    }
-
-    if (L.ActorClass)
-    {
-        UWorld* World = OwnerActor->GetWorld();
-        if (!World) return;
-        FActorSpawnParameters SP;
-        SP.Owner = OwnerActor;
-        SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        if (AActor* A = World->SpawnActor<AActor>(L.ActorClass, Xf, SP)) { Out.Actor = A; }
-        return;
-    }
-    if (L.InstancedMesh)
-    {
-        UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(OwnerActor);
-        C->SetStaticMesh(L.InstancedMesh);
-        C->SetMobility(EComponentMobility::Static);   // placed once, never moves → cached draw + VSM shadow
-        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        C->SetCastShadow(L.bCastShadow);
-        if (L.CullDistance > 0.0f) { C->SetCullDistance(L.CullDistance); }   // 0 = never cull (far sun)
-        C->SetWorldTransform(Xf);
-        C->RegisterComponent();
-        C->AttachToComponent(OwnerActor->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform);
-        Out.Component = C;
     }
 }
 
@@ -1055,6 +1220,38 @@ void UVoxelContentManager::ClearAllLandmarks()
 {
     for (TPair<FIntVector, FLandmarkInstance>& Pair : LandmarkInstances) { DestroyLandmarkInstance(Pair.Value); }
     LandmarkInstances.Reset();
+}
+
+int32 UVoxelContentManager::RemoveInstancesInContent(FDecoRegionContent& Content, const FVector& Center, float Radius)
+{
+    int32 Removed = 0;
+    for (TWeakObjectPtr<UHierarchicalInstancedStaticMeshComponent>& WP : Content.Instances)
+    {
+        UHierarchicalInstancedStaticMeshComponent* HISM = WP.Get();
+        if (!HISM || HISM->GetInstanceCount() == 0) continue;
+        // Fast bounds-tested spatial query → the vast majority of region HISMs return empty immediately.
+        TArray<int32> Hits = HISM->GetInstancesOverlappingSphere(Center, Radius, /*bSphereInWorldSpace*/ true);
+        if (Hits.Num() > 0)
+        {
+            HISM->RemoveInstances(Hits);   // handles index shifting; marks render state dirty
+            Removed += Hits.Num();
+        }
+    }
+    return Removed;
+}
+
+int32 UVoxelContentManager::RemoveDecorationsInSphere(const FVector& WorldCenter, float WorldRadius)
+{
+    if (WorldRadius <= 0.0f) return 0;
+    int32 Removed = 0;
+    for (FDecoGrid* G : { &NearGrid, &FarGrid })
+    {
+        for (TPair<FIntPoint, FDecoRegionContent>& RP : G->Regions)
+        {
+            Removed += RemoveInstancesInContent(RP.Value, WorldCenter, WorldRadius);
+        }
+    }
+    return Removed;
 }
 
 void UVoxelContentManager::UpdateLandmarks(const FVector& PlayerWorldPos)
@@ -1109,53 +1306,141 @@ void UVoxelContentManager::UpdateLandmarks(const FVector& PlayerWorldPos)
     const float ColDepth = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);
     const uint32 LocalSeed = (uint32)Seed;
 
-    // Walk each entry's lattice within its radius (a tiny box), spawn newly-entered cells, drop exited ones.
-    TSet<FIntVector> Desired;
+    // ---- Gather candidates (a small set) across every entry + anchor mode. Local XY (actor-space cm) is
+    // enough for the exclusion test — the surface-find only moves Z. ----
+    // bSpawnable = within the entry's real stream radius. POP-FREE EXCLUSION: we gather each entry in
+    // (radius + MaxExcl) so every conflictor of an in-range candidate is present regardless of player
+    // position; the extra "ring" candidates only SUPPRESS (never spawn), so a candidate's fate is a pure
+    // function of (seed, layout) → no edge-of-radius flicker.
+    struct FCand { FIntVector Key; int32 EntryIdx; uint32 H; float LocalX, LocalY; float ExclWorld; int32 Priority; bool bSpawnable; };
+    TArray<FCand> Cands;
+    bool bAnyExclusion = false;   // pure scatter (all radii 0) skips the O(n²) resolve → same cost as before
+
+    float MaxExclChunks = 0.0f;
+    for (const FStrateLandmark& LE : Def->Landmarks) { MaxExclChunks = FMath::Max(MaxExclChunks, FMath::Max(0.0f, LE.ExclusionRadiusChunks)); }
+    const float MaxExclWorld = MaxExclChunks * ChunkWorld;
+
     for (int32 EntryIdx = 0; EntryIdx < Def->Landmarks.Num(); ++EntryIdx)
     {
         const FStrateLandmark& L = Def->Landmarks[EntryIdx];
-        if (!L.ActorClass && !L.InstancedMesh) continue;
+        if (!L.Profile.ActorClass && !L.Profile.InstancedMesh) continue;
 
-        const float SpacingChunks = FMath::Max(1.0f, L.SpacingChunks);
-        const int32 RadiusChunks  = FMath::Max(1, L.StreamRadiusChunks);
-        const float CellWorld     = SpacingChunks * ChunkWorld;          // lattice cell size in cm
-        const float RadiusWorld   = (float)RadiusChunks * ChunkWorld;
-        const float JitterRange   = FMath::Clamp(L.JitterFraction, 0.0f, 1.0f);
+        const int32 RadiusChunks = FMath::Max(1, L.StreamRadiusChunks);
+        const float RadiusWorld  = (float)RadiusChunks * ChunkWorld;
+        const float GatherWorld  = RadiusWorld + MaxExclWorld;   // widened so all conflictors are gathered
+        const float ExclWorld    = FMath::Max(0.0f, L.ExclusionRadiusChunks) * ChunkWorld;
+        if (ExclWorld > 0.0f) bAnyExclusion = true;
 
-        const FIntPoint PlayerLCell(FMath::FloorToInt(LocalPlayer.X / CellWorld),
-                                    FMath::FloorToInt(LocalPlayer.Y / CellWorld));
-        const int32 CellRange = FMath::CeilToInt((float)RadiusChunks / SpacingChunks);
-
-        for (int32 dy = -CellRange; dy <= CellRange; ++dy)
-        for (int32 dx = -CellRange; dx <= CellRange; ++dx)
+        if (L.AnchorMode == ELandmarkAnchor::HashLattice)
         {
-            const FIntPoint LCell(PlayerLCell.X + dx, PlayerLCell.Y + dy);
+            const float SpacingChunks = FMath::Max(1.0f, L.SpacingChunks);
+            const float CellWorld     = SpacingChunks * ChunkWorld;          // lattice cell size in cm
+            const float JitterRange   = FMath::Clamp(L.JitterFraction, 0.0f, 1.0f);
+            const FIntPoint PlayerLCell(FMath::FloorToInt(LocalPlayer.X / CellWorld),
+                                        FMath::FloorToInt(LocalPlayer.Y / CellWorld));
+            const int32 CellRange = FMath::CeilToInt(((float)RadiusChunks + MaxExclChunks) / SpacingChunks);
 
-            // Existence roll for this lattice cell + entry.
-            const uint32 H = DecoHash(LCell.X, LCell.Y, 0, 0, 0, EntryIdx, LocalSeed, 0x1A2D5u);
-            if (VoxelHash::ToFloat01(H) > L.SpawnProbability) continue;
+            for (int32 dy = -CellRange; dy <= CellRange; ++dy)
+            for (int32 dx = -CellRange; dx <= CellRange; ++dx)
+            {
+                const FIntPoint LCell(PlayerLCell.X + dx, PlayerLCell.Y + dy);
 
-            // Jittered position inside the cell (centred so two neighbours stay ≥ Spacing·(1-Jitter) apart).
-            const float jx = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x51A3F1u)) - 0.5f) * JitterRange;
-            const float jy = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x7C2B93u)) - 0.5f) * JitterRange;
-            const float LocalX = ((float)LCell.X + 0.5f + jx) * CellWorld;
-            const float LocalY = ((float)LCell.Y + 0.5f + jy) * CellWorld;
+                // Existence roll (salt 0x1A2D5u kept from the original landmark path → positions unchanged).
+                const uint32 H = DecoHash(LCell.X, LCell.Y, 0, 0, 0, EntryIdx, LocalSeed, 0x1A2D5u);
+                if (VoxelHash::ToFloat01(H) > L.SpawnProbability) continue;
 
-            // Radius is a true disk (the lattice box corners would otherwise overshoot it).
-            const float ddx = LocalX - LocalPlayer.X, ddy = LocalY - LocalPlayer.Y;
-            if (ddx * ddx + ddy * ddy > RadiusWorld * RadiusWorld) continue;
+                const float jx = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x51A3F1u)) - 0.5f) * JitterRange;
+                const float jy = (VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x7C2B93u)) - 0.5f) * JitterRange;
+                const float LocalX = ((float)LCell.X + 0.5f + jx) * CellWorld;
+                const float LocalY = ((float)LCell.Y + 0.5f + jy) * CellWorld;
 
-            const FIntVector Key(LCell.X, LCell.Y, EntryIdx);
-            Desired.Add(Key);
-            if (LandmarkInstances.Contains(Key)) continue;   // already evaluated (spawned OR empty)
+                const float ddx = LocalX - LocalPlayer.X, ddy = LocalY - LocalPlayer.Y;
+                const float DistSq = ddx * ddx + ddy * ddy;
+                if (DistSq > GatherWorld * GatherWorld) continue;
 
-            FLandmarkInstance Inst;
-            SpawnLandmarkInstance(L, H, Ctx, OwnerXf, OwnerActor, LocalX, LocalY, Step, ColDepth, Inst);
-            LandmarkInstances.Add(Key, Inst);   // stored even if empty → never re-evaluated while in range
+                Cands.Add({ FIntVector(LCell.X, LCell.Y, EntryIdx), EntryIdx, H, LocalX, LocalY, ExclWorld, L.Priority,
+                            DistSq <= RadiusWorld * RadiusWorld });
+            }
+        }
+        else   // PassageMouth — enumerate the finite passage list, keep endpoints that land in THIS strate.
+        {
+            const TArray<FVoxelPassage>& Passages = StrateManager->GetPassages();
+            for (int32 pi = 0; pi < Passages.Num(); ++pi)
+            {
+                const FVoxelPassage& Pg = Passages[pi];
+                for (int32 side = 0; side < 2; ++side)
+                {
+                    const bool bDescent = (side == 0);   // 0 = this strate is the passage's UPPER (hole DOWN)
+                    if (bDescent  && !(L.bAtDescentMouths && Pg.UpperStrateIndex == StrateIndex)) continue;
+                    if (!bDescent && !(L.bAtArrivalMouths && Pg.LowerStrateIndex == StrateIndex)) continue;
+
+                    // Passage endpoints are GLOBAL VOXEL coords (same space as the SDF path) → local cm.
+                    const FVector MouthVox = bDescent ? Pg.UpperPoint : Pg.LowerPoint;
+                    const float LocalX = MouthVox.X * VOXEL_SIZE;
+                    const float LocalY = MouthVox.Y * VOXEL_SIZE;
+
+                    const float ddx = LocalX - LocalPlayer.X, ddy = LocalY - LocalPlayer.Y;
+                    const float DistSq = ddx * ddx + ddy * ddy;
+                    if (DistSq > GatherWorld * GatherWorld) continue;
+
+                    const uint32 H = DecoHash(pi, side, 0, 0, 0, EntryIdx, LocalSeed, 0x5E7C9u);
+                    if (VoxelHash::ToFloat01(H) > L.MouthProbability) continue;
+
+                    Cands.Add({ FIntVector(pi, side, EntryIdx), EntryIdx, H, LocalX, LocalY, ExclWorld, L.Priority,
+                                DistSq <= RadiusWorld * RadiusWorld });
+                }
+            }
         }
     }
 
-    // Drop instances no longer desired (player moved away, strate's list shrank, etc.).
+    // ---- Resolve exclusion (only if any entry opts in): a candidate is suppressed when a HIGHER-RANKED one's
+    // disk covers it. Rank = (Priority, then hash) → deterministic. v1 resolves within the in-range set. ----
+    TSet<FIntVector> Desired;
+    Desired.Reserve(Cands.Num());
+    for (int32 i = 0; i < Cands.Num(); ++i)
+    {
+        const FCand& C = Cands[i];
+        if (!C.bSpawnable) continue;   // ring-only conflictor (gathered for pop-free resolve, never spawned)
+        if (bAnyExclusion)
+        {
+            bool bSuppressed = false;
+            for (int32 j = 0; j < Cands.Num(); ++j)
+            {
+                if (j == i) continue;
+                const FCand& D = Cands[j];
+                if (D.ExclWorld <= 0.0f) continue;
+                const bool bDOutranks = (D.Priority != C.Priority) ? (D.Priority > C.Priority) : (D.H > C.H);
+                if (!bDOutranks) continue;
+                const float dxl = D.LocalX - C.LocalX, dyl = D.LocalY - C.LocalY;
+                if (dxl * dxl + dyl * dyl < D.ExclWorld * D.ExclWorld) { bSuppressed = true; break; }
+            }
+            if (bSuppressed) continue;
+        }
+
+        Desired.Add(C.Key);
+        if (LandmarkInstances.Contains(C.Key)) continue;   // already evaluated (spawned OR empty)
+
+        FLandmarkInstance Inst;
+        SpawnLandmarkInstance(Def->Landmarks[C.EntryIdx], C.H, Ctx, OwnerXf, OwnerActor,
+                              C.LocalX, C.LocalY, Step, ColDepth, Inst);
+
+        // Decoration footprint (F7): clear groundcover under a placed suppressing landmark now, and remember
+        // the footprint so a deco region streaming in near it re-clears too (see ApplyRegion).
+        const FStrateLandmark& LE = Def->Landmarks[C.EntryIdx];
+        if (LE.bSuppressDecorationsUnder && LE.SuppressRadiusChunks > 0.0f
+            && (Inst.Actor.IsValid() || Inst.Component.IsValid()))
+        {
+            const FVector WP = Inst.Actor.IsValid() ? Inst.Actor.Get()->GetActorLocation()
+                                                    : Inst.Component.Get()->GetComponentLocation();
+            Inst.SuppressCenter      = WP;
+            Inst.SuppressRadiusWorld = LE.SuppressRadiusChunks * ChunkWorld;
+            RemoveDecorationsInSphere(WP, Inst.SuppressRadiusWorld);
+        }
+
+        LandmarkInstances.Add(C.Key, Inst);   // stored even if empty → never re-evaluated while in range
+    }
+
+    // Drop instances no longer desired (player moved away, list shrank, lost an exclusion conflict).
     for (auto It = LandmarkInstances.CreateIterator(); It; ++It)
     {
         if (Desired.Contains(It.Key())) continue;

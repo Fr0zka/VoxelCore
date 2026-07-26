@@ -64,13 +64,18 @@ static void BuildTileStreamSet(RealtimeMesh::FRealtimeMeshStreamSet& Streams, co
         }
     }
 
-    const int32 NumIndices = MeshData.Triangles.Num();
+    // F17 — the mesher packs the index buffer as [ground run | sky-cap run] (see
+    // FVoxelMeshData::NumCeilingTriangles): polygroup 0 = ground, 1 = sky-cap ceiling.
+    // RMC derives one section per contiguous group run (material slot = group index).
+    const int32 NumIndices    = MeshData.Triangles.Num();
+    const int32 FirstCapIndex = NumIndices - MeshData.NumCeilingTriangles * 3;
     Builder.ReserveAdditionalTriangles(NumIndices / 3);
     for (int32 i = 0; i < NumIndices; i += 3)
     {
         Builder.AddTriangle((uint32)MeshData.Triangles[i],
                             (uint32)MeshData.Triangles[i + 1],
-                            (uint32)MeshData.Triangles[i + 2], 0 /*poly group*/);
+                            (uint32)MeshData.Triangles[i + 2],
+                            (i >= FirstCapIndex) ? 1 : 0 /*poly group*/);
     }
 }
 
@@ -85,9 +90,10 @@ void AVoxelWorld::RegenerateAllChunks()
     GenerationEpoch++;
 
     // Tear down every tile component, then clear all tile state. Components are GC-safe via
-    // actor ownership; destroying them here is immediate.
+    // actor ownership. T2.c: PARK them instead of destroying — the reload right after this
+    // is exactly the burst the pool exists for (overflow past the cap is destroyed).
     const int32 Count = LoadedTiles.Num();
-    for (auto& Pair : TileComponents) { if (Pair.Value) Pair.Value->DestroyComponent(); }
+    for (auto& Pair : TileComponents) { if (Pair.Value) ReleaseTileComponent(Pair.Value); }
     TileComponents.Empty();
     LoadedTiles.Empty();
 
@@ -102,12 +108,21 @@ void AVoxelWorld::RegenerateAllChunks()
     // Tiles are already destroyed above — drop any deferred-teardown keys so the drain doesn't
     // try to UnloadTile coords that no longer exist.
     PendingUnload.Empty();
+    // Re-mesh queues reference now-unloaded tiles — drop them (they'd be skipped anyway).
+    DirtyRemeshQueue.Empty();
+    BandRemeshQueue.Empty();
+    // §9.4 collision-only tracking references destroyed tiles — clear (rebuilt on the next crossing).
+    CollisionOnlyTiles.Empty();
+    PrevCollisionOnlyTiles.Empty();
 
     // Reset streaming state so the next Tick rebuilds the desired set and reloads.
     LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bAllChunksLoaded = false;
     DesiredSorted.Reset();
-    DesiredSet.Reset();
+    DesiredStamped.Reset();
+    TransitionHold.Reset();
+    TransitionHoldQueue.Reset();
+    TransitionHoldCursor = 0;
 
     // Tick will reload all tiles on the next frame with fresh params.
     UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] RegenerateAllChunks (epoch %u): cleared %d tiles"), GenerationEpoch, Count);
@@ -127,6 +142,74 @@ void AVoxelWorld::RebuildStrates()
     RegenerateAllChunks();
 
     UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] RebuildStrates: strate layout + passages rebuilt from settings."));
+}
+
+void AVoxelWorld::ValidateDeterminism()
+{
+    // F2 — window-invariance regression test (§8.4). The density function must return the SAME
+    // value for a coordinate no matter which chunk's thread_local caches (SDF rooms, strate
+    // memo, biome grid, surface columns, lattice bakes) happen to be warm. Historically THE
+    // source of chunk seams — and the invariant every "bit-identical" hot-path refactor claims
+    // to preserve. This runs on the game thread, whose caches are isolated from the workers.
+    if (!Generator)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelForge] ValidateDeterminism: no Generator — run during PIE."));
+        return;
+    }
+
+    const FIntVector CenterChunk = WorldToChunkCoord(GetPlayerPosition());
+
+    float MaxRepeatDelta = 0.0f;   // same alignment sampled twice — must be 0 (statelessness)
+    float MaxWindowDelta = 0.0f;   // left-warmed vs right-warmed — must be 0 (window invariance)
+    FVector WorstP = FVector::ZeroVector;
+    int32 Mismatches = 0, Points = 0;
+
+    // Points hugging the X boundary between chunk (CX,CY) and (CX+1,CY): they sit inside BOTH
+    // chunks' cache search boxes (box = chunk extent + margin), so either alignment may legally
+    // serve them — exactly the cross-window case that seams when an invariant breaks.
+    const float BoundaryX = (float)((CenterChunk.X + 1) * CHUNK_SIZE);
+    for (int32 iy = 0; iy < 16; ++iy)
+    {
+        for (int32 iz = 0; iz < 8; ++iz)
+        {
+            const float Y = (float)(CenterChunk.Y * CHUNK_SIZE) + (float)iy * 2.0f + 0.5f;
+            const float Z = (float)(CenterChunk.Z * CHUNK_SIZE) + (float)iz * 4.0f + 0.5f;
+            for (const float Side : { -0.5f, 0.5f })   // just left / just right of the boundary
+            {
+                const float X = BoundaryX + Side;
+                ++Points;
+
+                // Warm every cache from the LEFT chunk's middle, sample the point twice.
+                Generator->GetDensityAt(BoundaryX - (float)CHUNK_SIZE * 0.5f, Y, Z);
+                const float DLeft  = Generator->GetDensityAt(X, Y, Z);
+                const float DLeft2 = Generator->GetDensityAt(X, Y, Z);
+
+                // Re-warm from the RIGHT chunk (rebuilds the boxes centred there), resample.
+                Generator->GetDensityAt(BoundaryX + (float)CHUNK_SIZE * 0.5f, Y, Z);
+                const float DRight = Generator->GetDensityAt(X, Y, Z);
+
+                MaxRepeatDelta = FMath::Max(MaxRepeatDelta, FMath::Abs(DLeft - DLeft2));
+                const float WDelta = FMath::Abs(DLeft - DRight);
+                if (WDelta > MaxWindowDelta)
+                {
+                    MaxWindowDelta = WDelta;
+                    WorstP = FVector(X, Y, Z);
+                }
+                if (WDelta > 0.0f) { ++Mismatches; }
+            }
+        }
+    }
+
+    if (MaxWindowDelta == 0.0f && MaxRepeatDelta == 0.0f)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[VoxelForge] ValidateDeterminism: OK — %d boundary points at chunk (%d,%d,%d), window delta 0, repeat delta 0."),
+            Points, CenterChunk.X, CenterChunk.Y, CenterChunk.Z);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForge] ValidateDeterminism: FAIL — %d/%d points mismatch, max window delta %.6f (repeat %.6f) at voxel (%.1f, %.1f, %.1f). Window-invariance regression — see ARCHITECTURE §8.4."),
+            Mismatches, Points, MaxWindowDelta, MaxRepeatDelta, WorstP.X, WorstP.Y, WorstP.Z);
+    }
 }
 
 #if WITH_EDITOR
@@ -250,6 +333,8 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     while (ProcessQueue.Dequeue(Discard)) {}
     PendingTiles.Empty();
     PendingUnload.Empty();
+    DirtyRemeshQueue.Empty();
+    BandRemeshQueue.Empty();
 
     // Stop + drain the decoration march tasks (they read the Generator) before UObject teardown.
     if (ContentManager)
@@ -314,6 +399,7 @@ void AVoxelWorld::BeginPlay()
     Mesher->SetGenerator(Generator);
     Mesher->bGenerateSkirts = Settings->bGenerateSkirts;
     Mesher->SkirtCells      = Settings->SkirtCells;
+    Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
 
     // Système de strates — piloté par le pool et les fixed entries dans Settings.
     if (Settings->StratePool.Num() > 0)
@@ -376,6 +462,7 @@ void AVoxelWorld::Tick(float DeltaTime)
             // a decoration cell boundary or changes strate; otherwise just drains the spawn budget.
             { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateDecorations); ContentManager->UpdateDecorations(PlayerLastPos); }
             // Rare hash-lattice landmarks (the "mini-suns") — cheap at any radius (scales with count, not area).
+            // Landmarks now cover F7 set-pieces too (AnchorMode HashLattice/PassageMouth + exclusion).
             { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateLandmarks); ContentManager->UpdateLandmarks(PlayerLastPos); }
             // One strate-global ocean plane following the player (water at every LOD, to the horizon).
             { TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateWater); ContentManager->UpdateWater(PlayerLastPos); }
@@ -474,40 +561,98 @@ void AVoxelWorld::ProcessPendingChunks()
     {
         PendingTiles.Remove(DequeuedChunk.Tile);
 
-        // Discard results from a previous generation epoch (stale).
-        if (DequeuedChunk.Epoch != GenerationEpoch)
+        // ApplyTileResult does epoch check, mark-loaded, capture ingest, empty-release / mesh upload.
+        // Only a real (visible) upload counts against the per-frame budget — stale/empty drain free.
+        if (ApplyTileResult(DequeuedChunk))
         {
-            continue;
-        }
-
-        // Mark the tile loaded (even if empty — so we don't re-submit it).
-        LoadedTiles.Add(DequeuedChunk.Tile);
-
-        // CAPTURE-DURING-MESHING: hand the mesher's captured density grid to the clipmap BEFORE the
-        // empty-tile early-out — all-air / all-solid tiles are exactly the uniform cells the volume
-        // needs, and they carry a valid CaptureGrid even though they render nothing.
-        if (DensityVolume && DequeuedChunk.CaptureGrid.Num() > 0)
-        {
-            DensityVolume->IngestTileCapture(DequeuedChunk.Tile.Coord, MoveTemp(DequeuedChunk.CaptureGrid));
-        }
-
-        // Empty mesh = all-air tile — nothing to render, but still "loaded".
-        if (DequeuedChunk.bEmpty || !DequeuedChunk.Streams)
-        {
-            continue;
-        }
-
-        // Apply mesh (GPU upload) — this is the budgeted part. The vertex/index buffers were
-        // already built on the worker (T1.f); the game thread only uploads them here.
-        ApplyMeshToTile(DequeuedChunk.Tile, MoveTemp(*DequeuedChunk.Streams), DequeuedChunk.bIsCeiling);
-        MeshesApplied++;
-
-        if (MeshesApplied >= MaxApplies)
-        {
-            break;
+            if (++MeshesApplied >= MaxApplies)
+            {
+                break;
+            }
         }
     }
 
+}
+
+// Game-thread apply for one gen result. Shared by ProcessPendingChunks (async drain) and
+// SyncRemeshTile (synchronous carve). Returns true iff a visible mesh was uploaded (budget).
+bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
+{
+    // Discard results from a previous generation epoch (stale).
+    if (Result.Epoch != GenerationEpoch)
+    {
+        return false;
+    }
+
+    // Mark the tile loaded (even if empty — so we don't re-submit it).
+    LoadedTiles.Add(Result.Tile);
+
+    // Une tuile en vol n'est JAMAIS annulée : si le desired set a bougé pendant sa gen, elle
+    // arrive ici hors desired — le delta cull ne re-scanne plus tout, donc on l'inscrit en
+    // TransitionHold pour qu'elle soit re-considérée au prochain crossing (ou au settled cull).
+    if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
+
+    // CAPTURE-DURING-MESHING: hand the mesher's captured density grid to the clipmap BEFORE the
+    // empty-tile early-out — all-air / all-solid tiles are exactly the uniform cells the volume
+    // needs, and they carry a valid CaptureGrid even though they render nothing.
+    if (DensityVolume && Result.CaptureGrid.Num() > 0)
+    {
+        DensityVolume->IngestTileCapture(Result.Tile.Coord, MoveTemp(Result.CaptureGrid));
+    }
+
+    // Empty mesh = all-air tile — nothing to render, but still "loaded".
+    if (Result.bEmpty || !Result.Streams)
+    {
+        // Une RE-GEN (BandRemeshQueue / RemeshDirtyChunks) peut passer de "contenu" à "vide" :
+        // bande déplacée hors de la tuile, ou skip cellule-plus-haute-que-la-bande après un
+        // changement de strate (LoadTile). L'ancien composant doit tomber, sinon sa vieille
+        // géométrie (l'autre strate !) reste affichée. Première gen vide : Find rate, no-op.
+        if (URealtimeMeshComponent** OldComp = TileComponents.Find(Result.Tile))
+        {
+            if (*OldComp) { ReleaseTileComponent(*OldComp); }
+            TileComponents.Remove(Result.Tile);
+        }
+        return false;
+    }
+
+    // Apply mesh (GPU upload). The vertex/index buffers were already built (T1.f, on the worker for
+    // the async path or inline for the sync carve path); the game thread only uploads them here.
+    ApplyMeshToTile(Result);
+    return true;
+}
+
+// Same-frame level-0 re-mesh on the game thread (see header). Mirrors LoadTile's level-0 parameters
+// (Cells = CHUNK_SIZE, Step = 1) + the strate content band; skips density-volume capture (the volume
+// is refilled from the diff via MarkDirtyVoxelBox in RemeshDirtyChunks).
+void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
+{
+    if (!Generator || !Mesher || bShuttingDown.load(std::memory_order_relaxed)) return;
+
+    const FIntVector OriginVoxels = Tile.OriginVoxels();
+    const int32 Cells = CHUNK_SIZE;   // level 0 is always full-res (level 0 < FullResClipLevels)
+    const int32 Step  = 1;            // Extent(=CHUNK_SIZE) / Cells
+
+    // STRATE CONTENT CUT — identical to LoadTile (Tile.Level >= CutMin; for a level-0 tile inside the
+    // player strate the clamp is a no-op, but keep it bit-identical to the async path). Too-coarse
+    // skip never fires at Step 1.
+    int32 BandVoxLo = INT32_MIN, BandVoxHi = INT32_MAX;
+    int32 BandChunkLo = MIN_int32, BandChunkHi = MAX_int32;
+    const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+    if (Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
+    {
+        BandChunkLo = MeshBandChunkLo;
+        BandChunkHi = MeshBandChunkHi;
+        BandVoxLo   = MeshBandChunkLo * CHUNK_SIZE;
+        BandVoxHi   = (MeshBandChunkHi + 1) * CHUNK_SIZE - 1;
+    }
+
+    FChunkResult Result;
+    GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
+                       BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
+                       /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
+                       /*Hole*/ 0, 0, 0, 0, Result);   // hole unused (not a sheet tile)
+
+    ApplyTileResult(Result);
 }
 
 void AVoxelWorld::ProcessUnloadQueue()
@@ -527,7 +672,7 @@ void AVoxelWorld::ProcessUnloadQueue()
     TArray<FVoxelTileKey> Dequeued;   // removed from the queue this frame (destroyed OR cancelled)
     for (const FVoxelTileKey& T : PendingUnload)
     {
-        if (DesiredSet.Contains(T))
+        if (IsDesired(T))
         {
             // Re-desired before its turn (player reversed) — keep it; it's still loaded, just drop
             // it from the queue. Doesn't count against the destroy budget.
@@ -551,14 +696,52 @@ static FORCEINLINE FIntVector VF_FloorDiv(const FIntVector& V, int32 D)
     return FIntVector(VF_FloorDiv(V.X, D), VF_FloorDiv(V.Y, D), VF_FloorDiv(V.Z, D));
 }
 
-void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center)
+// RENDER DISTANCE — rayon (en tuiles niveau-MaxLevel) de la coquille EXTERNE : ClipRadius, élargi
+// si `RenderDistanceChunks` demande une portée horizontale au-delà du naturel R·2^MaxLevel. Partagé
+// par BuildDesiredTiles (le desired set) et IsTileInClipRange (le même horizon pour le cull).
+static FORCEINLINE int32 VF_OuterShellRadius(const UVoxelSettings* Settings, int32 R, int32 MaxLevel)
+{
+    const int32 Dist = Settings ? Settings->RenderDistanceChunks : 0;
+    if (Dist <= 0) return R;
+    return FMath::Max(R, (Dist + (1 << MaxLevel) - 1) >> MaxLevel);   // ceil(Dist / 2^MaxLevel)
+}
+
+// F18 — la coquille LA PLUS EXTERNE : niveau + rayon. Sans anneau feuille = (MaxLevel, rayon
+// render-distance). Avec (`bFarSheetRing` et distance > portée naturelle) = l'anneau FEUILLE :
+// niveau MaxLevel + FarSheetSpanLevels (une feuille couvre 2^span empreintes MC par axe), rayon
+// re-dérivé à ce niveau. Partagé par BuildDesiredTiles et IsTileInClipRange (même horizon).
+static FORCEINLINE void VF_OuterShell(const UVoxelSettings* Settings, int32 R, int32 MaxLevel,
+                                      int32& OutLevel, int32& OutRadius)
+{
+    OutLevel  = MaxLevel;
+    OutRadius = VF_OuterShellRadius(Settings, R, MaxLevel);
+    if (Settings && Settings->bFarSheetRing && OutRadius > R)
+    {
+        OutLevel  = MaxLevel + FMath::Clamp(Settings->FarSheetSpanLevels, 1, 4);
+        OutRadius = FMath::Max(1, (Settings->RenderDistanceChunks + (1 << OutLevel) - 1) >> OutLevel);
+    }
+}
+
+void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, TArray<FVoxelTileKey>& OutLeavers)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildDesiredTiles);
     DesiredSorted.Reset();
-    DesiredSet.Reset();
+    OutLeavers.Reset();
+    CollisionOnlyTiles.Reset();   // §9.4 — rebuilt by AddAnchorDesiredTiles below
+    ++DesiredStamp;   // les upserts ci-dessous marquent le crossing courant
 
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
     const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+
+    // RENDER DISTANCE (`RenderDistanceChunks`) : la coquille EXTERNE continue au-delà du rayon
+    // naturel jusqu'à couvrir la distance demandée — en tuiles MC niveau-MaxClipLevel, ou (F18,
+    // `bFarSheetRing`) en tuiles FEUILLE plus grandes (niveau MaxLevel+span, deux heightfields
+    // sol/cap au lieu de marching cubes — cf. GenerateSheetMesh). IsTileInClipRange partage
+    // VF_OuterShell pour que le cull voie le même horizon.
+    const int32 ROuter = VF_OuterShellRadius(Settings, R, MaxLevel);
+    int32 SheetLevel = MaxLevel, RSheet = ROuter;
+    VF_OuterShell(Settings, R, MaxLevel, SheetLevel, RSheet);
+    const bool bSheetRing = SheetLevel > MaxLevel;
 
     // Strate-aware VERTICAL band (in level-0 chunk-Z). Without this the clipmap generates the
     // occluded volume above/below (sealed strates are light-tight, §8.7) AND the full underground
@@ -592,9 +775,24 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center)
         const FIntVector CL = VF_FloorDiv(Center, Pow);   // player's level-L tile coord
         const FIntVector CF = (L > 0) ? VF_FloorDiv(Center, Pow >> 1) : FIntVector::ZeroValue;
 
-        for (int32 dz = -R; dz <= R; ++dz)
-        for (int32 dy = -R; dy <= R; ++dy)
-        for (int32 dx = -R; dx <= R; ++dx)
+        // Rayon de CE niveau : R partout, sauf la coquille externe (render distance) — qui, si
+        // l'anneau FEUILLE est actif (F18), est émise à part plus bas (le niveau MaxLevel reste
+        // alors à R). Le test "covered by finer" garde R (le niveau plus fin n'est jamais étendu).
+        const int32 RL = (L == MaxLevel && !bSheetRing) ? ROuter : R;
+
+        // Anneau étendu : le balayage naïf serait (2·RL+1)³ — on restreint dz à la fenêtre de la
+        // clamp verticale AVANT la boucle (mêmes tuiles retenues : le `continue` Z ci-dessous
+        // rejetterait tout le reste). Sentinelles MIN/MAX (pas de clamp) ⇒ balayage plein.
+        int32 DzMin = -RL, DzMax = RL;
+        if (RL > R && ZLo != MIN_int32)
+        {
+            DzMin = FMath::Max(DzMin, VF_FloorDiv(ZLo, Pow) - CL.Z);
+            DzMax = FMath::Min(DzMax, VF_FloorDiv(ZHi, Pow) - CL.Z);
+        }
+
+        for (int32 dz = DzMin; dz <= DzMax; ++dz)
+        for (int32 dy = -RL; dy <= RL; ++dy)
+        for (int32 dx = -RL; dx <= RL; ++dx)
         {
             const FIntVector T = CL + FIntVector(dx, dy, dz);
 
@@ -616,7 +814,63 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center)
             }
             const FVoxelTileKey Key(T, L);
             DesiredSorted.Add(Key);
-            DesiredSet.Add(Key);
+            DesiredStamped.FindOrAdd(Key) = DesiredStamp;
+        }
+    }
+
+    // F18 — ANNEAU FEUILLE : la portée render-distance est couverte par des tuiles feuille
+    // (niveau SheetLevel > MaxLevel, LoadTile route niveau > MaxClipLevel vers GenerateSheetMesh).
+    // Trou intérieur = la boîte MC niveau-MaxLevel (rayon R), pas le niveau SheetLevel−1.
+    if (bSheetRing)
+    {
+        const int32 SPow = 1 << SheetLevel;
+        const FIntVector CS = VF_FloorDiv(Center, SPow);
+        const FIntVector CM = VF_FloorDiv(Center, 1 << MaxLevel);
+        const int32 K = SheetLevel - MaxLevel;   // 1 feuille = 2^K tuiles MC par axe
+
+        int32 DzMin = -RSheet, DzMax = RSheet;
+        if (ZLo != MIN_int32)
+        {
+            DzMin = FMath::Max(DzMin, VF_FloorDiv(ZLo, SPow) - CS.Z);
+            DzMax = FMath::Min(DzMax, VF_FloorDiv(ZHi, SPow) - CS.Z);
+        }
+
+        for (int32 dz = DzMin; dz <= DzMax; ++dz)
+        for (int32 dy = -RSheet; dy <= RSheet; ++dy)
+        for (int32 dx = -RSheet; dx <= RSheet; ++dx)
+        {
+            const FIntVector T = CS + FIntVector(dx, dy, dz);
+            const int32 TZLo = T.Z << SheetLevel;
+            const int32 TZHi = ((T.Z + 1) << SheetLevel) - 1;
+            if (TZHi < ZLo || TZLo > ZHi) continue;
+
+            // Couverte par la boîte MC (empreinte entièrement dans [CM−R, CM+R] au niveau MaxLevel).
+            const bool bCovered =
+                ((T.X << K) >= CM.X - R) && ((((T.X + 1) << K) - 1) <= CM.X + R) &&
+                ((T.Y << K) >= CM.Y - R) && ((((T.Y + 1) << K) - 1) <= CM.Y + R) &&
+                ((T.Z << K) >= CM.Z - R) && ((((T.Z + 1) << K) - 1) <= CM.Z + R);
+            if (bCovered) continue;
+
+            const FVoxelTileKey Key(T, SheetLevel);
+            DesiredSorted.Add(Key);
+            DesiredStamped.FindOrAdd(Key) = DesiredStamp;
+        }
+    }
+
+    // Streaming anchors (AI / remote players, §9.3): fold each one's small level-0 box into the SAME
+    // desired set BEFORE the leaver sweep, so the delta cull releases an anchor's tiles automatically
+    // once it moves away or is unregistered. No-op (zero cost) when there are no anchors.
+    AddAnchorDesiredTiles();
+
+    // Balayage UNIQUE de la map : les entrées à stamp périmé viennent de quitter le desired set —
+    // ce sont les seuls candidats au cull de ce crossing (avec la TransitionHold). On les retire
+    // ici même (RemoveCurrent est sûr en itérant), la map reste donc == desired set courant.
+    for (auto It = DesiredStamped.CreateIterator(); It; ++It)
+    {
+        if (It.Value() != DesiredStamp)
+        {
+            OutLeavers.Add(It.Key());
+            It.RemoveCurrent();
         }
     }
 
@@ -630,13 +884,126 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center)
     });
 }
 
+// Fold every registered anchor's small level-0 box into the current desired set (§9.3). Runs inside
+// BuildDesiredTiles after the player clipmap + sheet ring, keyed on the same DesiredStamp so the leaver
+// sweep + delta cull handle anchor tiles leaving. Level-0 only (collision lives on level-0 tiles); empty
+// tiles in the box are ~free (the trivial-tile reject skips gen). Dedup vs the player clipmap by stamp.
+// §9.4: a tile the player clipmap did NOT stamp (bNew) that only a CollisionOnly anchor wants goes into
+// CollisionOnlyTiles → hidden at apply. A FullVisual anchor (or the clipmap) forces it rendered.
+void AVoxelWorld::AddAnchorDesiredTiles()
+{
+    for (const FVoxelStreamingAnchor& Anchor : StreamingAnchors)
+    {
+        if (!Anchor.Actor.IsValid()) continue;   // dead ptr — pruned in UpdateChunksAroundPosition
+        const FIntVector AC = Anchor.LastChunk;   // set this Tick by the move-detection pass
+        const int32 RXY = FMath::Clamp(Anchor.XYRadiusChunks, 0, 4);   // guard the box small
+        const int32 RZLo = FMath::Clamp(Anchor.ZBelowChunks, 0, 4);
+        const int32 RZHi = FMath::Clamp(Anchor.ZAboveChunks, 0, 4);
+        const bool bColl = (Anchor.Policy == EVoxelAnchorPolicy::CollisionOnly);
+        for (int32 dz = -RZLo; dz <= RZHi; ++dz)
+        for (int32 dy = -RXY;  dy <= RXY;  ++dy)
+        for (int32 dx = -RXY;  dx <= RXY;  ++dx)
+        {
+            const FVoxelTileKey Key(AC + FIntVector(dx, dy, dz), 0);
+            uint32& S = DesiredStamped.FindOrAdd(Key);
+            const bool bNew = (S != DesiredStamp);   // false ⇒ already desired (clipmap / earlier anchor)
+            if (bNew)
+            {
+                S = DesiredStamp;
+                DesiredSorted.Add(Key);
+            }
+            if (bColl)
+            {
+                // Collision-only only if NOTHING full-visual claimed this exact level-0 tile this
+                // crossing (bNew). If the clipmap or a FullVisual anchor stamped it first, leave it rendered.
+                if (bNew) { CollisionOnlyTiles.Add(Key); }
+            }
+            else
+            {
+                CollisionOnlyTiles.Remove(Key);   // FullVisual anchor → force rendered (undo a prior coll mark)
+            }
+        }
+    }
+}
+
+// §9.4 — apply visibility flips to ALREADY-LOADED tiles when a tile changed render↔collision-only this
+// crossing (player walked toward/away from a CollisionOnly cluster). Bounded by the collision-only set
+// (small); a no-op when there are no CollisionOnly anchors. Newly-loaded tiles get their state at apply
+// (ApplyMeshToTile reads CollisionOnlyTiles). Called after BuildDesiredTiles rebuilt CollisionOnlyTiles.
+void AVoxelWorld::ReconcileAnchorTileVisibility()
+{
+    if (CollisionOnlyTiles.Num() == 0 && PrevCollisionOnlyTiles.Num() == 0) return;   // fast path
+
+    // Became collision-only → hide (if loaded).
+    for (const FVoxelTileKey& Key : CollisionOnlyTiles)
+    {
+        if (!PrevCollisionOnlyTiles.Contains(Key))
+        {
+            if (URealtimeMeshComponent* Comp = TileComponents.FindRef(Key)) { Comp->SetVisibility(false); }
+        }
+    }
+    // Stopped being collision-only → show, but only if still desired (else it's a leaver being culled —
+    // don't flash it visible on its way out).
+    for (const FVoxelTileKey& Key : PrevCollisionOnlyTiles)
+    {
+        if (!CollisionOnlyTiles.Contains(Key) && IsDesired(Key))
+        {
+            if (URealtimeMeshComponent* Comp = TileComponents.FindRef(Key)) { Comp->SetVisibility(true); }
+        }
+    }
+    PrevCollisionOnlyTiles = CollisionOnlyTiles;
+}
+
+void AVoxelWorld::RegisterStreamingAnchor(AActor* Actor, EVoxelAnchorPolicy Policy,
+                                          int32 XYRadiusChunks, int32 ZBelowChunks, int32 ZAboveChunks)
+{
+    if (!Actor) return;
+    for (FVoxelStreamingAnchor& Existing : StreamingAnchors)
+    {
+        if (Existing.Actor.Get() == Actor)   // already registered → update policy/box in place
+        {
+            Existing.Policy         = Policy;
+            Existing.XYRadiusChunks = XYRadiusChunks;
+            Existing.ZBelowChunks   = ZBelowChunks;
+            Existing.ZAboveChunks   = ZAboveChunks;
+            bForceDesiredRebuild    = true;
+            return;
+        }
+    }
+    FVoxelStreamingAnchor A;
+    A.Actor          = Actor;
+    A.Policy         = Policy;
+    A.XYRadiusChunks = XYRadiusChunks;
+    A.ZBelowChunks   = ZBelowChunks;
+    A.ZAboveChunks   = ZAboveChunks;
+    // LastChunk stays at its sentinel → next Tick's move detection sets it + triggers the rebuild.
+    StreamingAnchors.Add(A);
+    bForceDesiredRebuild = true;
+}
+
+void AVoxelWorld::UnregisterStreamingAnchor(AActor* Actor)
+{
+    if (!Actor) return;
+    for (int32 i = StreamingAnchors.Num() - 1; i >= 0; --i)
+    {
+        if (StreamingAnchors[i].Actor.Get() == Actor)
+        {
+            StreamingAnchors.RemoveAtSwap(i);
+            bForceDesiredRebuild = true;   // rebuild next Tick so its now-unwanted tiles become leavers
+        }
+    }
+}
+
 bool AVoxelWorld::IsTileInClipRange(const FVoxelTileKey& Tile, const FIntVector& Center) const
 {
-    // In range = the tile's centre falls within the OUTERMOST shell (level MaxLevel ± R). A
-    // loaded-but-not-desired tile in range is mid-LOD-transition (wait for its replacement);
-    // one out of range has left the view entirely (cull immediately).
+    // In range = the tile's centre falls within the OUTERMOST shell (VF_OuterShell — the
+    // render-distance/sheet-ring level+radius, same as BuildDesiredTiles). A loaded-but-not-
+    // desired tile in range is mid-LOD-transition (wait for its replacement); one out of range
+    // has left the view entirely (cull immediately).
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
-    const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+    const int32 MaxLevelBase = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+    int32 MaxLevel = MaxLevelBase, ROuter = R;
+    VF_OuterShell(Settings, R, MaxLevelBase, MaxLevel, ROuter);
     const int32 PowMax   = 1 << MaxLevel;
     const FIntVector CMax = VF_FloorDiv(Center, PowMax);
 
@@ -647,88 +1014,262 @@ bool AVoxelWorld::IsTileInClipRange(const FVoxelTileKey& Tile, const FIntVector&
         VF_FloorDiv(FMath::FloorToInt(CV.Y), SizeMax),
         VF_FloorDiv(FMath::FloorToInt(CV.Z), SizeMax));
 
-    return FMath::Abs(TMax.X - CMax.X) <= R
-        && FMath::Abs(TMax.Y - CMax.Y) <= R
-        && FMath::Abs(TMax.Z - CMax.Z) <= R;
+    return FMath::Abs(TMax.X - CMax.X) <= ROuter
+        && FMath::Abs(TMax.Y - CMax.Y) <= ROuter
+        && FMath::Abs(TMax.Z - CMax.Z) <= ROuter;
+}
+
+int32 AVoxelWorld::GetMaxConcurrentTasks() const
+{
+    // T2.d — the asset value, capped to the spare LOGICAL cores. BackgroundNormal priority
+    // (see LoadTile) already stops gen from starving the frame; this cap stops a flat 16 from
+    // thrashing context switches on small CPUs where 16 > the machine's spare parallelism.
+    const int32 Asset = Settings ? Settings->MaxConcurrentTasks : 16;
+    const int32 SpareCores = FMath::Max(2, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 2);
+    return FMath::Clamp(Asset, 1, SpareCores);
 }
 
 void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
-    const int32 MaxTasks = Settings ? Settings->MaxConcurrentTasks : 16;
+    const int32 MaxTasks = GetMaxConcurrentTasks();
 
     const FIntVector CenterChunk = WorldToChunkCoord(CenterPosition);  // player's level-0 tile
     CurrentCenterChunk = CenterChunk;
 
+    // Streaming anchors (AI / remote players, §9.3): prune dead ones + detect chunk crossings so the
+    // desired set rebuilds when an anchor moves (its box of collision tiles follows it). Cheap: a few
+    // WorldToChunkCoord per anchor, and empty (no anchors) is a zero-iteration loop.
+    bool bAnchorsMoved = false;
+    for (int32 i = StreamingAnchors.Num() - 1; i >= 0; --i)
+    {
+        AActor* A = StreamingAnchors[i].Actor.Get();
+        if (!A)
+        {
+            StreamingAnchors.RemoveAtSwap(i);   // destroyed → drop it; its tiles must be culled
+            bAnchorsMoved = true;
+            continue;
+        }
+        const FIntVector AC = WorldToChunkCoord(A->GetActorLocation());
+        if (AC != StreamingAnchors[i].LastChunk)
+        {
+            StreamingAnchors[i].LastChunk = AC;
+            bAnchorsMoved = true;
+        }
+    }
+
     //=========================================================================
-    // Rebuild the desired tile set only when the player crosses a level-0 tile boundary.
+    // Rebuild the desired tile set when the player crosses a level-0 tile boundary — or when a
+    // streaming anchor moved / (un)registered (bAnchorsMoved / bForceDesiredRebuild).
     //=========================================================================
-    if (CenterChunk != LastUpdateCenter)
+    if (CenterChunk != LastUpdateCenter || bAnchorsMoved || bForceDesiredRebuild)
     {
         LastUpdateCenter = CenterChunk;
         bAllChunksLoaded = false;
+        bForceDesiredRebuild = false;   // consumed
 
-        BuildDesiredTiles(CenterChunk);
+        // DELTA CULL: BuildDesiredTiles renvoie les LEAVERS (désirées au crossing précédent, plus
+        // maintenant). Seuls candidats au cull : ces leavers + la TransitionHold (retenues des
+        // crossings passés). Fini le re-scan de TOUTES les tuiles chargées à chaque crossing —
+        // c'était le spike CullTiles ~1.6 ms/crossing (trace 2026-07-05). Les tuiles en vol qui
+        // finissent hors desired sont capturées à l'apply (ProcessPendingChunks → TransitionHold),
+        // et le settled cull (tout chargé) reste le filet de sécurité plein-scan.
+        TArray<FVoxelTileKey> Leavers;
+        BuildDesiredTiles(CenterChunk, Leavers);
 
-        // Cull loaded tiles that are no longer desired — STRICT LOAD-BEFORE-UNLOAD so crossing a
-        // shell boundary NEVER leaves a hole and we never drop a tile before its replacement exists:
+        // §9.4 — toggle visibility on already-loaded tiles that flipped render↔collision-only this
+        // crossing (a CollisionOnly cluster the player just walked toward/away from). No-op w/o anchors.
+        ReconcileAnchorTileVisibility();
+
+        // STRATE CONTENT CUT — the band coarse tiles are meshed to = the player strate's EXACT
+        // chunk-Z bounds (no margin: that's the view clamp's job — selection vs content). In the
+        // inter-strate gap: no band (full tiles, you can see both sides through the descent).
+        // On band change (strate transition), re-queue the loaded coarse tiles whose mesh depends
+        // on it — fully inside BOTH bands ⇒ identical either way; fully outside both ⇒ empty
+        // either way; everything else re-gens in place via BandRemeshQueue (no visual pop).
+        {
+            const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+            // F18 — l'anneau feuille dépend aussi de la bande (sa strate de référence) : on l'arme
+            // dès que les feuilles sont actives, même si la coupe de contenu MC est désactivée.
+            const bool bSheetsWantBand = Settings && Settings->bFarSheetRing
+                                      && Settings->RenderDistanceChunks > 0;
+            const int32 TopMC = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+            int32 NewLo = MIN_int32, NewHi = MAX_int32;
+            if ((CutMin <= 8 || bSheetsWantBand) && StrateManager)
+            {
+                int32 StrTopZ = 0, StrBotZ = 0;
+                if (StrateManager->GetStrateChunkZBounds(CenterChunk.Z, StrTopZ, StrBotZ))
+                {
+                    NewLo = StrBotZ;
+                    NewHi = StrTopZ;
+                }
+            }
+            if (NewLo != MeshBandChunkLo || NewHi != MeshBandChunkHi)
+            {
+                // Diagnostic volontairement VISIBLE : si cette ligne n'apparaît JAMAIS dans
+                // l'Output Log, la coupe de contenu ne s'est jamais armée (bounds de strate
+                // introuvables pour la position du PION → tout se maille plein, comme avant).
+                UE_LOG(LogTemp, Warning,
+                    TEXT("[VoxelWorld] Strate content band -> chunks [%d..%d] (was [%d..%d]), CutMinLevel=%d, pawn chunk Z=%d"),
+                    NewLo, NewHi, MeshBandChunkLo, MeshBandChunkHi, CutMin, CenterChunk.Z);
+                for (const FVoxelTileKey& T : LoadedTiles)
+                {
+                    // Feuilles (niveau > MaxClipLevel) : toujours dépendantes de la bande.
+                    if (T.Level < CutMin && T.Level <= TopMC) continue;
+                    const int32 CLo = T.Coord.Z << T.Level;
+                    const int32 CHi = ((T.Coord.Z + 1) << T.Level) - 1;
+                    const bool bInOld  = CLo >= MeshBandChunkLo && CHi <= MeshBandChunkHi;
+                    const bool bInNew  = CLo >= NewLo && CHi <= NewHi;
+                    const bool bOutOld = CHi < MeshBandChunkLo || CLo > MeshBandChunkHi;
+                    const bool bOutNew = CHi < NewLo || CLo > NewHi;
+                    if ((bInOld && bInNew) || (bOutOld && bOutNew)) continue;   // même contenu
+                    if (!IsDesired(T)) continue;                                // sera cull, pas re-gen
+                    BandRemeshQueue.Add(T);
+                }
+                MeshBandChunkLo = NewLo;
+                MeshBandChunkHi = NewHi;
+                bAllChunksLoaded = false;   // le drain de BandRemeshQueue vit dans le bloc submit
+            }
+        }
+
+        // F18 — TROU XY de l'anneau feuille (voir VoxelWorld.h) : boîte MC niveau-MaxClipLevel
+        // autour du joueur, rétrécie d'UNE tuile — le raccord feuille↔anneau MC garde une tuile
+        // MC pleine de recouvrement (même pas d'échantillonnage des deux côtés → discret), et en
+        // avançant, les tuiles MC de la zone nouvellement découpée étaient déjà desired au
+        // crossing précédent (chargées avant que le trou ne les découvre). Changement (crossing
+        // de tuile MaxClipLevel, ~tous les 2^L chunks) ⇒ re-queue des feuilles chevauchant
+        // l'ancien OU le nouveau trou.
+        {
+            int32 NewMinX = MAX_int32, NewMinY = MAX_int32;
+            int32 NewMaxX = MIN_int32, NewMaxY = MIN_int32;
+            const int32 TopMCLvl = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+            if (Settings && Settings->bFarSheetRing && Settings->RenderDistanceChunks > 0)
+            {
+                const int32 RClip  = FMath::Max(1, Settings->ClipRadius);
+                const int32 Shrink = FMath::Max(0, RClip - 1);
+                const int32 ExtM   = CHUNK_SIZE << TopMCLvl;                      // tuile MaxLevel en voxels
+                const FIntVector CM = VF_FloorDiv(CenterChunk, 1 << TopMCLvl);    // tuile MaxLevel du joueur
+                NewMinX = (CM.X - Shrink) * ExtM;
+                NewMinY = (CM.Y - Shrink) * ExtM;
+                NewMaxX = (CM.X + Shrink + 1) * ExtM;   // EXCLUSIF
+                NewMaxY = (CM.Y + Shrink + 1) * ExtM;
+            }
+            if (NewMinX != SheetHoleMinXVox || NewMinY != SheetHoleMinYVox
+                || NewMaxX != SheetHoleMaxXVox || NewMaxY != SheetHoleMaxYVox)
+            {
+                for (const FVoxelTileKey& T : LoadedTiles)
+                {
+                    if (T.Level <= TopMCLvl) continue;   // seules les feuilles portent le trou
+                    const int32 Ext   = CHUNK_SIZE << T.Level;
+                    const int32 TMinX = T.Coord.X * Ext, TMinY = T.Coord.Y * Ext;
+                    const bool bOldOv = TMinX < SheetHoleMaxXVox && TMinX + Ext > SheetHoleMinXVox
+                                     && TMinY < SheetHoleMaxYVox && TMinY + Ext > SheetHoleMinYVox;
+                    const bool bNewOv = TMinX < NewMaxX && TMinX + Ext > NewMinX
+                                     && TMinY < NewMaxY && TMinY + Ext > NewMinY;
+                    if ((bOldOv || bNewOv) && IsDesired(T)) BandRemeshQueue.Add(T);
+                }
+                SheetHoleMinXVox = NewMinX; SheetHoleMinYVox = NewMinY;
+                SheetHoleMaxXVox = NewMaxX; SheetHoleMaxYVox = NewMaxY;
+                bAllChunksLoaded = false;
+            }
+        }
+
+        // Cull rules — STRICT LOAD-BEFORE-UNLOAD so crossing a shell boundary NEVER leaves a hole:
         //  - out of clip range → left the view entirely, no replacement coming → cull now.
         //  - in range (mid-LOD-transition) → cull ONLY once EVERY desired tile that overlaps its
-        //    footprint is loaded. A coarse tile is replaced by several finer tiles; the old
-        //    center-owner check culled it as soon as the ONE tile over its centre was ready, so the
-        //    not-yet-ready edges flashed a hole. Checking the whole covering set fixes that: the old
-        //    tile stays at its current resolution until the better mesh is fully in, then drops.
-        auto FootprintsOverlap = [](const FVoxelTileKey& A, const FVoxelTileKey& B) -> bool
-        {
-            const int32 ea = A.ExtentVoxels(), eb = B.ExtentVoxels();
-            const FIntVector aMin = A.OriginVoxels(), bMin = B.OriginVoxels();
-            return aMin.X < bMin.X + eb && bMin.X < aMin.X + ea
-                && aMin.Y < bMin.Y + eb && bMin.Y < aMin.Y + ea
-                && aMin.Z < bMin.Z + eb && bMin.Z < aMin.Z + ea;
-        };
-        // Only a desired tile that ISN'T loaded yet can block a cull (an old tile must stay until its
-        // replacement is in). That set is small — just the few newly-needed tiles this crossing — so
-        // build it ONCE and test each candidate against it (was: scan ALL of DesiredSorted per tile,
-        // an O(loaded×desired) game-thread spike when fast movement turns many tiles non-desired).
-        // "Every covering desired tile loaded" ⟺ "no unloaded desired tile overlaps T" — equivalent.
-        TArray<FVoxelTileKey> DesiredPending;
-        for (const FVoxelTileKey& D : DesiredSorted)
-        {
-            if (!LoadedTiles.Contains(D)) DesiredPending.Add(D);
-        }
-        auto ReplacementsReady = [&](const FVoxelTileKey& T) -> bool
-        {
-            for (const FVoxelTileKey& D : DesiredPending)
-            {
-                if (FootprintsOverlap(T, D)) return false;   // a covering tile isn't ready → keep T
-            }
-            return true;
-        };
-
-        // ReplacementsReady is O(DesiredPending); calling it for every loaded tile is O(loaded × pending),
-        // which goes QUADRATIC exactly when streaming falls behind (sprinting → DesiredPending balloons) —
-        // the measured 53 ms/cross CullTiles spike and a death spiral (behind → stall → further behind).
-        // KEEPING a transition tile longer is always hole-safe (the conservative direction), so when pending
-        // is large we skip the overlap test and just keep in-range transition tiles; the settled cull (once
-        // bAllChunksLoaded) + ProcessUnloadQueue reclaim them when streaming catches up. Out-of-range tiles
-        // still cull unconditionally (bounds memory). This caps the cull at O(loaded) and breaks the spiral.
-        const bool bDoOverlapCull = DesiredPending.Num() <= 48;
-
-        TArray<FVoxelTileKey> ToRemove;
-        auto Consider = [&](const FVoxelTileKey& T)
-        {
-            if (DesiredSet.Contains(T)) return;
-            // T comes from TileComponents keys then LoadedTiles-not-in-TileComponents → never twice.
-            if (!IsTileInClipRange(T, CenterChunk)) { ToRemove.Add(T); return; }   // left the view → cull now
-            if (bDoOverlapCull && ReplacementsReady(T)) ToRemove.Add(T);           // transition → cull when safe
-        };
+        //    footprint is loaded (a coarse tile is replaced by several finer tiles — the whole
+        //    covering set must be in before it drops). Otherwise it goes to TransitionHold.
         {
             TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_CullTiles);
-            for (const auto& Pair : TileComponents) Consider(Pair.Key);
-            for (const FVoxelTileKey& T : LoadedTiles) { if (!TileComponents.Contains(T)) Consider(T); }
-            // Defer the actual teardown — ProcessUnloadQueue spreads it across frames so a fast
-            // traversal's whole-shell cull doesn't destroy dozens of components + actors in one frame.
-            for (const FVoxelTileKey& T : ToRemove) PendingUnload.Add(T);
+
+            auto FootprintsOverlap = [](const FVoxelTileKey& A, const FVoxelTileKey& B) -> bool
+            {
+                const int32 ea = A.ExtentVoxels(), eb = B.ExtentVoxels();
+                const FIntVector aMin = A.OriginVoxels(), bMin = B.OriginVoxels();
+                return aMin.X < bMin.X + eb && bMin.X < aMin.X + ea
+                    && aMin.Y < bMin.Y + eb && bMin.Y < aMin.Y + ea
+                    && aMin.Z < bMin.Z + eb && bMin.Z < aMin.Z + ea;
+            };
+            // "Every covering desired tile loaded" ⟺ "no unloaded desired tile overlaps T".
+            // Built LAZILY: only needed if an in-range transition candidate actually exists.
+            TArray<FVoxelTileKey> DesiredPending;
+            bool bPendingBuilt = false;
+            auto EnsurePending = [&]()
+            {
+                if (bPendingBuilt) return;
+                bPendingBuilt = true;
+                for (const FVoxelTileKey& D : DesiredSorted)
+                {
+                    if (!LoadedTiles.Contains(D)) DesiredPending.Add(D);
+                }
+            };
+            auto ReplacementsReady = [&](const FVoxelTileKey& T) -> bool
+            {
+                for (const FVoxelTileKey& D : DesiredPending)
+                {
+                    if (FootprintsOverlap(T, D)) return false;   // a covering tile isn't ready → keep T
+                }
+                return true;
+            };
+
+            // true = la tuile doit être RETENUE (transition en attente de ses remplaçants) ;
+            // false = rien à retenir (cullée, re-désirée, ou jamais chargée).
+            auto NeedsHold = [&](const FVoxelTileKey& T) -> bool
+            {
+                if (IsDesired(T)) { return false; }                                    // re-désirée
+                if (!LoadedTiles.Contains(T) && !TileComponents.Contains(T))
+                {
+                    return false;   // jamais chargée / rien d'appliqué → rien à cull
+                }
+                if (!IsTileInClipRange(T, CenterChunk))   // left the view → cull now
+                {
+                    PendingUnload.Add(T);
+                    return false;
+                }
+                // In-range transition. Quand le backlog est gros (sprint), sauter le test de
+                // recouvrement et RETENIR est la direction hole-safe ; le settled cull ramassera.
+                EnsurePending();
+                if (DesiredPending.Num() <= 48 && ReplacementsReady(T))
+                {
+                    PendingUnload.Add(T);
+                    return false;
+                }
+                return true;
+            };
+
+            for (const FVoxelTileKey& T : Leavers)
+            {
+                if (NeedsHold(T)) { AddToTransitionHold(T); }
+            }
+
+            // Hold : re-évaluation à BUDGET tournant. Re-scanner toute la hold par crossing
+            // redevient le vieux scan O(loaded) dès que le streaming ne settle jamais (mesuré
+            // 2.47 ms/crossing packagé) ; retenir plus longtemps est hole-safe, chaque tuile
+            // repasse sous le curseur en quelques crossings.
+            int32 HoldBudget = FMath::Min(TransitionHoldQueue.Num(), 256);
+            while (HoldBudget > 0 && TransitionHoldQueue.Num() > 0)
+            {
+                if (TransitionHoldCursor >= TransitionHoldQueue.Num()) { TransitionHoldCursor = 0; }
+                const FVoxelTileKey T = TransitionHoldQueue[TransitionHoldCursor];
+                if (!TransitionHold.Contains(T))
+                {
+                    // Clé périmée (déchargée / settled-cullée) — retrait paresseux, ne consomme
+                    // pas le budget (la queue rétrécit ⇒ la boucle termine).
+                    TransitionHoldQueue.RemoveAtSwap(TransitionHoldCursor);
+                    continue;
+                }
+                --HoldBudget;
+                if (!NeedsHold(T))
+                {
+                    TransitionHold.Remove(T);
+                    TransitionHoldQueue.RemoveAtSwap(TransitionHoldCursor);
+                }
+                else
+                {
+                    ++TransitionHoldCursor;
+                }
+            }
+            // Teardown différé — ProcessUnloadQueue étale les destructions sur plusieurs frames.
         }
     }
 
@@ -740,6 +1281,21 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_SubmitTiles);
         int32 Submitted = 0;
+
+        // DIG RESPONSIVENESS — drain player-carve re-meshes FIRST (ahead of streaming + band) at
+        // BackgroundHigh, so a dig gets the task budget before any streaming gen. A tile that's still
+        // in flight is KEPT queued (retried next frame) so its stale pre-carve result is corrected.
+        for (auto It = DirtyRemeshQueue.CreateIterator(); It; ++It)
+        {
+            if (PendingTiles.Num() >= MaxTasks) break;
+            const FVoxelTileKey T = *It;
+            if (!LoadedTiles.Contains(T)) { It.RemoveCurrent(); continue; }  // unloaded — drop
+            if (PendingTiles.Contains(T)) { continue; }                     // in flight — retry after it lands
+            It.RemoveCurrent();
+            LoadTile(T, /*bHighPriority*/ true);
+            ++Submitted;
+        }
+
         for (const FVoxelTileKey& T : DesiredSorted)
         {
             if (PendingTiles.Num() >= MaxTasks) break;
@@ -749,14 +1305,27 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
             ++Submitted;
         }
 
-        if (Submitted == 0 && PendingTiles.Num() == 0)
+        // Bande de strate changée : re-gen budgétée des tuiles grossières concernées (le vieux
+        // mesh reste visible jusqu'au résultat — même schéma que RemeshDirtyChunks).
+        for (auto It = BandRemeshQueue.CreateIterator(); It; ++It)
+        {
+            if (PendingTiles.Num() >= MaxTasks) break;
+            const FVoxelTileKey T = *It;
+            It.RemoveCurrent();
+            if (PendingTiles.Contains(T) || !LoadedTiles.Contains(T)) continue;
+            LoadTile(T);
+            ++Submitted;
+        }
+
+        if (Submitted == 0 && PendingTiles.Num() == 0 && BandRemeshQueue.Num() == 0 && DirtyRemeshQueue.Num() == 0)
         {
             // Everything desired is loaded → load-before-unload is satisfied: drop the
-            // deferred (in-range, not-desired) transition tiles now. No holes.
+            // deferred (in-range, not-desired) transition tiles now. No holes. Full scan —
+            // rare (once per settle), and the safety net behind the delta cull above.
             for (const auto& Pair : TileComponents)
-                if (!DesiredSet.Contains(Pair.Key)) PendingUnload.Add(Pair.Key);
+                if (!IsDesired(Pair.Key)) PendingUnload.Add(Pair.Key);
             for (const FVoxelTileKey& T : LoadedTiles)
-                if (!DesiredSet.Contains(T) && !TileComponents.Contains(T)) PendingUnload.Add(T);
+                if (!IsDesired(T) && !TileComponents.Contains(T)) PendingUnload.Add(T);
             // Teardown is drained by ProcessUnloadQueue (budgeted) — single spike-free path.
 
             bAllChunksLoaded = true;
@@ -764,11 +1333,11 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
     }
 }
 
-void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
+void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
 {
     if (PendingTiles.Contains(Tile)) return;
 
-    const int32 MaxTasks = Settings ? Settings->MaxConcurrentTasks : 16;
+    const int32 MaxTasks = GetMaxConcurrentTasks();   // T2.d — core-clamped
     if (PendingTiles.Num() >= MaxTasks)
     {
         return;  // Budget full — wait for a task to finish.
@@ -782,10 +1351,23 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
     // Extent stays CHUNK_SIZE<<Level (so the shell tiling is unchanged) — only the cell count and
     // step change: Step = Extent / Cells.
     const int32 FullRes = Settings ? FMath::Max(1, Settings->FullResClipLevels) : 2;
-    const int32 Cells   = (Tile.Level < FullRes)
+    const int32 Extent  = CHUNK_SIZE << Tile.Level;
+
+    // F18 — tuile FEUILLE : BuildDesiredTiles n'émet des clés au-delà de MaxClipLevel que pour
+    // l'anneau feuille (render distance) — elles se maillent en deux heightfields (GenerateSheetMesh),
+    // pas en marching cubes. Densité d'échantillonnage = celle de l'anneau MC niveau-MaxClipLevel
+    // (le nombre de cellules grandit avec la feuille, plafonné à 128/axe — au-delà le pas grossit).
+    const int32 TopMC = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+    const bool bSheetTile = Tile.Level > TopMC;
+
+    int32 Cells = (Tile.Level < FullRes)
         ? CHUNK_SIZE
         : (Settings ? FMath::Clamp(Settings->CoarseTileCells, 4, CHUNK_SIZE) : 16);
-    const int32 Extent  = CHUNK_SIZE << Tile.Level;
+    if (bSheetTile)
+    {
+        const int32 StepMC = FMath::Max(1, (CHUNK_SIZE << TopMC) / Cells);
+        Cells = FMath::Clamp(Extent / StepMC, 4, 128);
+    }
     const int32 Step    = FMath::Max(1, Extent / Cells);
     const uint32 TaskEpoch = GenerationEpoch;
 
@@ -798,13 +1380,73 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
         && DensityVolume != nullptr && Settings && Settings->bEnableDensityVolume
         && DensityVolume->IsTileCaptureUseful(Tile.Coord);
 
+    // STRATE CONTENT CUT — coarse tiles mesh only the player-strate band (see the band update in
+    // UpdateChunksAroundPosition + UVoxelSettings::StrateContentCutMinLevel). Chunk band → voxels
+    // (inclusive). Fine tiles / no band (gap, feature off) mesh full.
+    int32 BandVoxLo = INT32_MIN, BandVoxHi = INT32_MAX;
+    int32 BandChunkLo = MIN_int32, BandChunkHi = MAX_int32;
+    int32 SheetChunkZ = 0;
+    if (bSheetTile)
+    {
+        // F18 — la feuille a besoin de la STRATE de référence (les deux heightfields sont ceux de
+        // la strate du joueur) : pas de bande armée (gap inter-strates, ou bounds introuvables)
+        // ⇒ rien à mailler, tuile vide (re-queue automatique via BandRemeshQueue en atterrissant).
+        if (MeshBandChunkLo == MIN_int32)
+        {
+            FChunkResult Empty;
+            Empty.Tile  = Tile;
+            Empty.Epoch = TaskEpoch;
+            ProcessQueue.Enqueue(MoveTemp(Empty));
+            return;
+        }
+        BandChunkLo = MeshBandChunkLo;   // pour la résolution matériaux sol/cap dans ApplyMeshToTile
+        BandChunkHi = MeshBandChunkHi;
+        SheetChunkZ = MeshBandChunkLo + (MeshBandChunkHi - MeshBandChunkLo) / 2;   // chunk au cœur de la strate
+    }
+    // F18 — trou XY courant (zone couverte par les coquilles MC, découpée des feuilles).
+    const int32 HoleMinX = SheetHoleMinXVox, HoleMinY = SheetHoleMinYVox;
+    const int32 HoleMaxX = SheetHoleMaxXVox, HoleMaxY = SheetHoleMaxYVox;
+    const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+    if (!bSheetTile && Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
+    {
+        BandChunkLo = MeshBandChunkLo;
+        BandChunkHi = MeshBandChunkHi;
+        BandVoxLo   = MeshBandChunkLo * CHUNK_SIZE;
+        BandVoxHi   = (MeshBandChunkHi + 1) * CHUNK_SIZE - 1;
+
+        // Résidu ultra-grossier (niveaux ≥7) : la coupe est à la granularité de la CELLULE. Si
+        // UNE cellule (Step voxels de haut) est plus haute que la bande entière, toute cellule
+        // qui chevauche la bande échantillonne quand même les airs des DEUX strates (mêmes trous
+        // et mélanges de matériaux qu'avant la coupe) — la tuile ne peut rendre que des artefacts
+        // ⇒ on n'émet RIEN. Résultat vide via ProcessQueue (bookkeeping normal : PendingTiles,
+        // LoadedTiles, epoch) ; jamais figé — le changement de bande re-queue via BandRemeshQueue.
+        if (Step > (BandChunkHi - BandChunkLo + 1) * CHUNK_SIZE)
+        {
+            FChunkResult Empty;
+            Empty.Tile        = Tile;
+            Empty.Epoch       = TaskEpoch;
+            Empty.BandChunkLo = BandChunkLo;
+            Empty.BandChunkHi = BandChunkHi;
+            ProcessQueue.Enqueue(MoveTemp(Empty));
+            return;
+        }
+    }
+
     ActiveTaskCount.fetch_add(1, std::memory_order_relaxed);
 
     // BackgroundNormal priority: gen runs on background workers that YIELD to foreground
     // (game/render-thread) tasks. Without this, raising MaxConcurrentTasks past the spare
     // core count saturates the scheduler and starves the frame (the "over 12 = lag" symptom).
     // At background priority the frame keeps its cores; gen just fills in around it.
-    UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture]()
+    // DIG RESPONSIVENESS: player carves launch at BackgroundHigh (bHighPriority) — still a background
+    // worker (yields to the frame, keeps the invariant) but jumps AHEAD of all pending streaming gen,
+    // so a dig is never queued behind a shell of streaming tasks.
+    const UE::Tasks::ETaskPriority TaskPriority = bHighPriority
+        ? UE::Tasks::ETaskPriority::BackgroundHigh
+        : UE::Tasks::ETaskPriority::BackgroundNormal;
+    UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
+                                         BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
+                                         bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -816,48 +1458,137 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile)
         if (bShuttingDown.load(std::memory_order_relaxed)) return;
 
         FChunkResult Result;
-        Result.Tile  = Tile;
-        Result.Epoch = TaskEpoch;
-
-        FVoxelMeshData MeshData;
-        {
-            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
-            MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells,
-                                            bWantCapture ? &Result.CaptureGrid : nullptr);
-        }
-
-        // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air
-        // tiles carry no streams (Result.bEmpty stays true) → no component on apply.
-        if (!MeshData.IsEmpty())
-        {
-            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
-            Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
-            BuildTileStreamSet(*Result.Streams, MeshData);
-            Result.bEmpty = false;
-
-            // Classify ceiling from the ACTUAL mesh normals (smoothed density gradient, solid→air):
-            // a ceiling surface faces DOWN (N.Z < 0), ground faces UP. This is the rendered geometry,
-            // so it can't disagree with the view — unlike the old game-thread height-oracle sample,
-            // which misclassified coarse far tiles (terrain material on the sky-cap underside). Vote
-            // down-vs-up over the verts; near-vertical wall normals (|N.Z| small) abstain. The game
-            // thread gates this to SurfaceWorld strates before it actually swaps material / shadow.
-            // STOPGAP (fable-idea F17): orientation only works while NO CAVES EXIST — down == sky-cap.
-            // A future cave roof is also down-facing; distinguishing it needs a generator-stamped surface
-            // class (CeilSurf vs carve-below-TerrainZ) carried as a polygroup → material slot. See F17.
-            int32 DownVerts = 0, UpVerts = 0;
-            for (const FVector& N : MeshData.Normals)
-            {
-                if (N.Z < -0.1f)      { ++DownVerts; }
-                else if (N.Z > 0.1f)  { ++UpVerts; }
-            }
-            Result.bIsCeiling = (DownVerts > UpVerts);
-        }
+        GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
+                           BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
+                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY, Result);
 
         if (!bShuttingDown.load(std::memory_order_relaxed))
         {
             ProcessQueue.Enqueue(MoveTemp(Result));   // move: don't copy the geometry payload
         }
-    }, UE::Tasks::ETaskPriority::BackgroundNormal);
+    }, TaskPriority);
+}
+
+// Worker-side gen for one tile (shared by the async ChunkGen task and the synchronous carve path).
+// READS Generator/Mesher only — safe on a worker or the game thread. Fills Result; no enqueue.
+void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
+                                     int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
+                                     int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
+                                     bool bSheetTile, int32 SheetChunkZ,
+                                     int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
+                                     FChunkResult& Result)
+{
+    Result.Tile  = Tile;
+    Result.Epoch = Epoch;
+    Result.BandChunkLo = BandChunkLo;   // strate content cut (MIN/MAX = uncut)
+    Result.BandChunkHi = BandChunkHi;
+
+    // T1.d — TRIVIAL-TILE REJECT: ~84 % des tuiles générées sortaient vides (tout-roc /
+    // tout-air) en payant quand même le pré-échantillonnage complet. Le classifieur prouve
+    // (bornes exactes sur le treillis du mesher + gardes conservatives) qu'une tuile est
+    // uniforme → on saute GenerateMesh, Result reste bEmpty. Mixed = génération normale.
+    // Les tuiles à capture (density volume) génèrent toujours : le volume veut la grille
+    // même pour les cellules uniformes, et ces tuiles sont rares (fenêtre d'ombre).
+    // (Gate IsoLevel == 0 : les verdicts du classifieur supposent l'iso MC à zéro exactement.)
+    bool bTrivialEmpty = false;
+    if (!bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
+    {
+        TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
+        bTrivialEmpty = (Generator->ClassifyTile(OriginVoxels, Step, Cells) != EVoxelTileClass::Mixed);
+    }
+
+    // F18 — feuille : deux heightfields sol/cap échantillonnés par colonne (pas de marching
+    // cubes, pas de classifieur — la classe de surface est vraie par construction).
+    FVoxelMeshData MeshData;
+    if (!bTrivialEmpty)
+    {
+        TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
+        MeshData = bSheetTile
+            ? Mesher->GenerateSheetMesh(OriginVoxels, Step, Cells, SheetChunkZ,
+                                        HoleMinX, HoleMinY, HoleMaxX, HoleMaxY)
+            : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
+                                   bWantCapture ? &Result.CaptureGrid : nullptr,
+                                   BandVoxLo, BandVoxHi);
+    }
+
+    // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air
+    // tiles carry no streams (Result.bEmpty stays true) → no component on apply.
+    if (!MeshData.IsEmpty())
+    {
+        TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
+        Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
+        BuildTileStreamSet(*Result.Streams, MeshData);
+        Result.bEmpty = false;
+
+        // F17 — the mesher classified every triangle semantically (sky-cap vs ground, per
+        // vertex against the column's TerrainZ/CeilSurf) and packed them as two contiguous
+        // polygroup runs. Here we only record which sections exist for the apply path.
+        // (Replaces the whole-tile normal VOTE, which painted mixed coarse tiles — terrain
+        // AND cap in one tile — entirely with the winner's material.)
+        const int32 NumTris = MeshData.Triangles.Num() / 3;
+        Result.bHasCeilingTris = MeshData.NumCeilingTriangles > 0;
+        Result.bHasGroundTris  = NumTris > MeshData.NumCeilingTriangles;
+    }
+}
+
+// Section-group key shared by every tile component ("the" tile geometry group).
+static FRealtimeMeshSectionGroupKey VoxelTileGroupKey()
+{
+    return FRealtimeMeshSectionGroupKey::Create(FRealtimeMeshLODKey(0), FName("Tile"));
+}
+
+//=============================================================================
+// TILE COMPONENT POOL (T2.c)
+//=============================================================================
+// Recycler les composants de tuile au lieu de les détruire/recréer.
+
+URealtimeMeshComponent* AVoxelWorld::AcquireTileComponent()
+{
+    // Reuse a parked component when one is available — skips NewObject + RegisterComponent
+    // (and the full proxy teardown/GC of a destroy) during fast travel & regen bursts.
+    while (TileComponentPool.Num() > 0)
+    {
+        URealtimeMeshComponent* Pooled = TileComponentPool.Pop();
+        if (IsValid(Pooled))
+        {
+            Pooled->SetVisibility(true);
+            return Pooled;
+        }
+    }
+
+    URealtimeMeshComponent* MeshComp = NewObject<URealtimeMeshComponent>(this);
+    // Generated once, never moves → Static so RMC's cached static draw path + VSM shadow
+    // caching apply (see the root SetMobility note in BeginPlay). Must be set before register.
+    // Re-mesh on carve recreates the section-group proxy (RMC's Static path already does this),
+    // which is fine for an infrequent action.
+    MeshComp->SetMobility(EComponentMobility::Static);
+    MeshComp->SetGenerateOverlapEvents(false);   // chunks use raycasts, not overlaps
+    MeshComp->SetCanEverAffectNavigation(false);
+    MeshComp->RegisterComponent();
+    MeshComp->AttachToComponent(GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+    return MeshComp;
+}
+
+void AVoxelWorld::ReleaseTileComponent(URealtimeMeshComponent* Comp)
+{
+    if (!IsValid(Comp)) { return; }
+
+    if (TileComponentPool.Num() >= MaxPooledTileComponents)
+    {
+        Comp->DestroyComponent();
+        return;
+    }
+
+    // Strip the tile's geometry NOW, not at reuse: removing the section group drops its
+    // sections and their cooked collision, so a parked (hidden) component can't be collided
+    // with and its render memory is released while it waits. The mesh OBJECT is kept — reuse
+    // goes through the same RemoveSectionGroup/CreateSectionGroup path as a re-mesh.
+    if (URealtimeMeshSimple* RTMesh = Comp->GetRealtimeMeshAs<URealtimeMeshSimple>())
+    {
+        RTMesh->RemoveSectionGroup(VoxelTileGroupKey());
+    }
+    Comp->SetVisibility(false);
+    TileComponentPool.Add(Comp);
 }
 
 void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
@@ -866,66 +1597,73 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
     // UpdateWater; decorations stream by distance via UpdateDecorations) — nothing to clear per tile.
     if (URealtimeMeshComponent** Comp = TileComponents.Find(Tile))
     {
-        if (*Comp) { (*Comp)->DestroyComponent(); }
+        if (*Comp) { ReleaseTileComponent(*Comp); }   // T2.c — park, don't destroy
         TileComponents.Remove(Tile);
     }
     LoadedTiles.Remove(Tile);
     PendingTiles.Remove(Tile);
+    TransitionHold.Remove(Tile);   // couvre aussi le settled cull (qui ne tient pas la hold à jour)
 }
 
-void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, bool bGeomCeiling)
+void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ApplyMeshToChunk);
 
     // Streams are pre-built on the worker (T1.f) and guaranteed non-empty by the caller
-    // (ProcessPendingChunks skips empty tiles). This path is now game-thread-CHEAP: O(1) classify +
-    // material + component get/create + the upload. No per-vertex work here anymore.
+    // (ProcessPendingChunks skips empty tiles). This path is game-thread-CHEAP: material lookup +
+    // component get/create + the upload + per-section config. No per-vertex work here.
+    const FVoxelTileKey& Tile = Result.Tile;
+    RealtimeMesh::FRealtimeMeshStreamSet& Streams = *Result.Streams;
+    const bool bHasGroundTris  = Result.bHasGroundTris;
+    const bool bHasCeilingTris = Result.bHasCeilingTris;
     const bool bLevel0 = (Tile.Level == 0);
 
-    // SKY-CAP CEILING classification (used for BOTH shadow + material). WHAT it is — down-facing geometry
-    // — is decided on the worker by voting the tile's ACTUAL mesh normals (bGeomCeiling); that's the
-    // rendered surface, so it can't disagree with the view the way the old centre height-oracle sample did
-    // (it misclassified coarse far tiles → terrain material on the sky-cap underside). WHETHER a tile may
-    // be a sky-cap ceiling at all is still gated to SurfaceWorld strates: one O(1) oracle probe at the tile
-    // centre (the oracle returns false for non-surface strates), so cave ceilings keep their prior material
-    // + shadow. The probed heights themselves are unused now — only the success/fail gate matters.
-    bool bIsCeiling = false;
-    if (Generator && bGeomCeiling)
-    {
-        const int32 VoxelsPerTile = CHUNK_SIZE << Tile.Level;
-        const FIntVector MinVoxel = Tile.Coord * VoxelsPerTile;
-        const float CenterX = (float)MinVoxel.X + VoxelsPerTile * 0.5f;
-        const float CenterY = (float)MinVoxel.Y + VoxelsPerTile * 0.5f;
-        const float CenterZ = (float)MinVoxel.Z + VoxelsPerTile * 0.5f;
-        const int32 CenterChunkZ = FMath::FloorToInt(CenterZ / (float)CHUNK_SIZE);
-
-        float TerrainZ = 0.0f, CeilSurf = 0.0f;
-        bIsCeiling = Generator->GetSurfaceHeightAt(CenterX, CenterY, CenterChunkZ, TerrainZ, CeilSurf);
-    }
-
-    // Material: strate override (by the tile's min-corner chunk coord) else the global default. Ceiling
-    // tiles take the strate's CeilingMaterial when set (the rocky "night sky" overhead reads flat/bright
-    // otherwise, since it casts no shadow).
-    UMaterialInterface* ChunkMaterial = Settings ? Settings->VoxelMaterial : nullptr;
+    // F17 — materials per POLYGROUP, not per tile. The mesher classified each triangle
+    // semantically (sky-cap = down-facing near the column's CeilSurf; terrain overhangs and
+    // future cave roofs stay ground) and packed two contiguous runs → RMC creates one section
+    // per non-empty group. Ground (group 0): strate override else global default. Sky-cap
+    // (group 1): the strate's CeilingMaterial when set (the rocky "night sky" overhead reads
+    // flat/bright otherwise, since it casts no shadow) else same as ground. A coarse tile
+    // spanning BOTH surfaces now renders both correctly (the old whole-tile vote painted the
+    // loser with the winner's material — Jahni's "terrain and ceiling become one" artifact).
+    UMaterialInterface* GroundMaterial = Settings ? Settings->VoxelMaterial : nullptr;
+    UMaterialInterface* CeilingMaterial = nullptr;
     if (StrateManager)
     {
-        const FIntVector ChunkCoord = Tile.Coord * (1 << Tile.Level);   // level-0-equivalent min corner
-        if (UVoxelStrateDefinition* StrateDef = StrateManager->GetStrateForChunk(ChunkCoord))
+        // F17 — a coarse tile is 2^level CHUNKS TALL: its raw min/max corners can sit in a
+        // NEIGHBOUR strate (or the inter-strate gap → null) that the mesh doesn't even contain
+        // (strate content cut). Clamp the lookup Zs into the band the tile was MESHED with, then
+        // resolve: ground at the (clamped) BOTTOM chunk, sky-cap at the (clamped) TOP chunk —
+        // the cap is by definition the topmost surface in the tile (mid as a gap fallback).
+        // This was the "far cap renders with the ground material" residue: the min-corner lookup
+        // missed the surface strate entirely on tall far tiles.
+        const FIntVector MinChunk = Tile.Coord * (1 << Tile.Level);     // level-0-equivalent min corner
+        const int32 TileChunks = 1 << Tile.Level;
+        const int32 ZLoC = FMath::Max(MinChunk.Z, Result.BandChunkLo);
+        const int32 ZHiC = FMath::Min(MinChunk.Z + TileChunks - 1, Result.BandChunkHi);
+        if (UVoxelStrateDefinition* StrateDef =
+                StrateManager->GetStrateForChunk(FIntVector(MinChunk.X, MinChunk.Y, ZLoC)))
         {
-            if (StrateDef->OverrideMaterial) { ChunkMaterial = StrateDef->OverrideMaterial; }
-            if (bIsCeiling && StrateDef->CeilingMaterial) { ChunkMaterial = StrateDef->CeilingMaterial; }
+            if (StrateDef->OverrideMaterial) { GroundMaterial = StrateDef->OverrideMaterial; }
+            if (StrateDef->CeilingMaterial)  { CeilingMaterial = StrateDef->CeilingMaterial; }
         }
+        UVoxelStrateDefinition* CapDef =
+            StrateManager->GetStrateForChunk(FIntVector(MinChunk.X, MinChunk.Y, ZHiC));
+        if (!CapDef || !CapDef->CeilingMaterial)
+        {
+            CapDef = StrateManager->GetStrateForChunk(FIntVector(MinChunk.X, MinChunk.Y, (ZLoC + ZHiC) / 2));
+        }
+        if (CapDef && CapDef->CeilingMaterial) { CeilingMaterial = CapDef->CeilingMaterial; }
     }
+    if (!CeilingMaterial) { CeilingMaterial = GroundMaterial; }
 
-    // Mini-sun shadows: route the resolved base material through a shared MID that binds the density-volume
-    // textures + per-frame shadow params (the material marches them for raymarched orb shadows). One MID
-    // per base material, so all tiles of a base still share one material (no batching cost).
+    // Mini-sun shadows: route the resolved base materials through a shared MID that binds the
+    // density-volume textures + per-frame shadow params (the material marches them for raymarched
+    // orb shadows). One MID per base material, so tiles of a base still share one material.
     if (DensityVolume && Settings && Settings->bEnableDensityVolume)
     {
-        if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(ChunkMaterial))
-        {
-            ChunkMaterial = MID;
-        }
+        if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(GroundMaterial))  { GroundMaterial = MID; }
+        if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(CeilingMaterial)) { CeilingMaterial = MID; }
     }
 
     // The geometry stream set was built on the worker (BuildTileStreamSet, T1.f); we just upload it.
@@ -933,45 +1671,60 @@ void AVoxelWorld::ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FReal
 
     // One component per tile — the clipmap keeps the total tile count low (~1-2k), so this is
     // cheap on the game thread (no batching needed). Collision + content are level-0 only.
+    // T2.c: the component comes from the pool when one is parked (see AcquireTileComponent).
     URealtimeMeshComponent* MeshComp = TileComponents.FindRef(Tile);
     if (!MeshComp)
     {
-        MeshComp = NewObject<URealtimeMeshComponent>(this);
-        // Generated once, never moves → Static so RMC's cached static draw path + VSM shadow
-        // caching apply (see the root SetMobility note in BeginPlay). Must be set before register.
-        // Re-mesh on carve recreates the section-group proxy (RMC's Static path already does this),
-        // which is fine for an infrequent action.
-        MeshComp->SetMobility(EComponentMobility::Static);
-        MeshComp->SetGenerateOverlapEvents(false);   // chunks use raycasts, not overlaps
-        MeshComp->SetCanEverAffectNavigation(false);
-        MeshComp->RegisterComponent();
-        MeshComp->AttachToComponent(GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+        MeshComp = AcquireTileComponent();
         TileComponents.Add(Tile, MeshComp);
     }
 
-    URealtimeMeshSimple* RTMesh = MeshComp->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    // §9.4 RENDER-SKIP — a tile only a CollisionOnly anchor wants (not the player clipmap) cooks its
+    // collision below but is hidden (no draw / VSM). Set every apply (overrides the pool's default-
+    // visible state); ReconcileAnchorTileVisibility handles later flips on already-loaded tiles.
+    MeshComp->SetVisibility(!CollisionOnlyTiles.Contains(Tile));
+
+    // Reuse the component's existing mesh object when it has one (pooled component or carve
+    // re-mesh) — InitializeRealtimeMesh allocates a brand-new URealtimeMesh EVERY call, so
+    // calling it unconditionally (as before) orphaned one mesh object per re-apply to the GC.
+    // The RemoveSectionGroup below does the actual geometry clearing on reuse.
+    URealtimeMeshSimple* RTMesh = MeshComp->GetRealtimeMeshAs<URealtimeMeshSimple>();
+    if (!RTMesh) { RTMesh = MeshComp->InitializeRealtimeMesh<URealtimeMeshSimple>(); }
     if (!RTMesh) { return; }
-    // Shadow casting: far (level >= 2) tiles never cast; the SurfaceWorld SKY-CAP CEILING never casts
-    // either — otherwise the high rock ceiling shadows the entire terrain below it (one mesh, so we
-    // can't split it). bIsCeiling was classified above via the O(1) oracle.
-    const bool bCastShadow = (Tile.Level <= 1) && !bIsCeiling;
+    // Shadow casting: far (level >= 2) tiles never cast; the sky-cap SECTION never casts either
+    // — otherwise the high rock ceiling shadows the entire terrain below it. F17: shadow is now
+    // PER SECTION, so a mixed tile keeps its ground shadow while its cap stays shadowless.
+    const bool bCastShadow = (Tile.Level <= 1);
     MeshComp->SetCastShadow(bCastShadow);
 
-    const FRealtimeMeshSectionGroupKey GroupKey =
-        FRealtimeMeshSectionGroupKey::Create(FRealtimeMeshLODKey(0), FName("Tile"));
+    const FRealtimeMeshSectionGroupKey GroupKey = VoxelTileGroupKey();
     RTMesh->RemoveSectionGroup(GroupKey);                    // clear old geometry on re-mesh
-    RTMesh->SetupMaterialSlot(0, "Main", ChunkMaterial);
+                                                             // (no-op on a fresh/pooled mesh)
+    RTMesh->SetupMaterialSlot(0, "Main",   GroundMaterial);
+    RTMesh->SetupMaterialSlot(1, "SkyCap", CeilingMaterial);
     RTMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
 
-    FRealtimeMeshSectionConfig SectionConfig(0);
     // RMC casts shadows PER SECTION (FRealtimeMeshSectionConfig::bCastsShadow, default true) — the
-    // component-level UPrimitiveComponent::CastShadow is NOT honored by the RMC proxy. So the real
-    // shadow lever is here: drive the section flag from the same decision (far tiles + sky-cap ceiling
-    // → no cast). SetCastShadow above is kept only to keep the component flag consistent.
-    SectionConfig.bCastsShadow = bCastShadow;
-    RTMesh->UpdateSectionConfig(
-        FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0),
-        SectionConfig, /*bShouldCreateCollision*/ bLevel0);  // collision at level 0 only (T1.c)
+    // component-level UPrimitiveComponent::CastShadow is NOT honored by the RMC proxy, so the real
+    // shadow lever is the section flag. RMC auto-created one section per non-empty polygroup above
+    // (default config already maps material slot = polygroup index); only config sections that
+    // exist — the bHas* flags come from the worker. Collision at level 0 only (T1.c), both groups.
+    if (bHasGroundTris)
+    {
+        FRealtimeMeshSectionConfig GroundConfig(0);
+        GroundConfig.bCastsShadow = bCastShadow;
+        RTMesh->UpdateSectionConfig(
+            FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0),
+            GroundConfig, /*bShouldCreateCollision*/ bLevel0);
+    }
+    if (bHasCeilingTris)
+    {
+        FRealtimeMeshSectionConfig CapConfig(1);
+        CapConfig.bCastsShadow = false;                      // the cap never casts (see above)
+        RTMesh->UpdateSectionConfig(
+            FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 1),
+            CapConfig, /*bShouldCreateCollision*/ bLevel0);
+    }
 
     // Water is no longer spawned per tile — it's a single player-following ocean plane (UpdateWater,
     // driven from Tick), so it renders at every LOD and to the horizon with no per-tile gaps.
@@ -1014,6 +1767,27 @@ FVoxelBiomeQuery AVoxelWorld::GetBiomeAtWorldLocation(FVector WorldLocation) con
     return Out;
 }
 
+bool AVoxelWorld::GetVoxelSurfaceHeightAt(FVector WorldLocation, float& OutSurfaceWorldZ, float& OutCeilingWorldZ) const
+{
+    OutSurfaceWorldZ = WorldLocation.Z;   // sensible fallback: unchanged Z
+    OutCeilingWorldZ = WorldLocation.Z;
+    if (!Generator) return false;
+
+    // Undo the actor transform → voxel space (same convention as GetBiomeAtWorldLocation / the deco scatter).
+    const FVector Local = GetActorTransform().InverseTransformPosition(WorldLocation);
+    const float VX = Local.X / VOXEL_SIZE;
+    const float VY = Local.Y / VOXEL_SIZE;
+    const int32 ChunkZ = FMath::FloorToInt((Local.Z / VOXEL_SIZE) / (float)CHUNK_SIZE);
+
+    float TerrainVZ, CeilVZ;
+    if (!Generator->GetSurfaceHeightAt(VX, VY, ChunkZ, TerrainVZ, CeilVZ)) return false;   // not a heightfield
+
+    // Voxel Z → actor-local cm → world, keeping the query's XY so a tilted/scaled actor stays consistent.
+    OutSurfaceWorldZ = GetActorTransform().TransformPosition(FVector(Local.X, Local.Y, TerrainVZ * VOXEL_SIZE)).Z;
+    OutCeilingWorldZ = GetActorTransform().TransformPosition(FVector(Local.X, Local.Y, CeilVZ    * VOXEL_SIZE)).Z;
+    return true;
+}
+
 //=============================================================================
 // TERRAIN MODIFICATION — player carving & filling
 //=============================================================================
@@ -1043,7 +1817,35 @@ void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
 {
     if (!DiffLayer) return;
     TArray<FIntVector> AffectedChunks = DiffLayer->ApplyModification(Modification);
-    RemeshDirtyChunks(AffectedChunks);
+
+    // INSTANT DIG FEEL — synchronously re-mesh the level-0 tile the brush CENTRE sits in, so the hole
+    // appears THIS frame right where the player is looking. Neighbour tiles (brush edge) re-mesh async
+    // and prioritised (RemeshDirtyChunks → DirtyRemeshQueue @ BackgroundHigh), a frame or two behind —
+    // imperceptible. One full-res tile gen on the game thread; only for the common case.
+    // SKIP the sync when the centre tile is already mid-gen (an async task owns it): syncing would race
+    // the in-flight stale result (which lands with no hole and would clobber ours). Instead let it flow
+    // through the async queue, which now KEEPS in-flight tiles queued and re-gens them once the stale
+    // result lands. The centre tile must be loaded to remesh in place (else it streams in with the diff).
+    const FVoxelTileKey CenterTile(WorldToChunkCoord(Modification.Center * VOXEL_SIZE), 0);
+    bool bSyncedCenter = false;
+    if (AffectedChunks.Contains(CenterTile.Coord)
+        && LoadedTiles.Contains(CenterTile)
+        && !PendingTiles.Contains(CenterTile))
+    {
+        SyncRemeshTile(CenterTile);
+        bSyncedCenter = true;
+    }
+
+    RemeshDirtyChunks(AffectedChunks, bSyncedCenter ? &CenterTile : nullptr);
+
+    // Remove decorations inside the modified volume so grass doesn't float over a dug hole (or bury under a
+    // fill). Instant + flicker-free (only the affected instances go); the placer already skips carved columns
+    // on any future rebuild. Center/Radius are in voxels → world cm. Box/capsule use their bounding sphere.
+    if (ContentManager && AffectedChunks.Num() > 0)
+    {
+        const FVector WorldCenter = Modification.Center * VOXEL_SIZE;   // Center was WorldPos/VOXEL_SIZE
+        ContentManager->RemoveDecorationsInSphere(WorldCenter, Modification.Radius * VOXEL_SIZE);
+    }
 }
 
 void AVoxelWorld::CarveBox(FVector Position, FVector ExtentVoxels, float Strength)
@@ -1307,28 +2109,31 @@ int32 AVoxelWorld::GetCurrentSeason() const
 // REMESH DIRTY CHUNKS — re-queue affected chunks after terrain modification
 //=============================================================================
 
-void AVoxelWorld::RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords)
+void AVoxelWorld::RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords, const FVoxelTileKey* ExcludeTile)
 {
-    // For each affected chunk that's currently loaded, re-queue it for
-    // async generation + meshing. The old mesh stays visible until the
-    // new result arrives in ProcessPendingChunks, so no visual pop.
-    //
-    // Chunks that aren't loaded are ignored — when they eventually load
-    // through normal streaming, they'll include the diff layer automatically.
-
     // Edits only affect LEVEL-0 tiles (collision + visible detail are full-res near the player;
     // coarse far tiles sample too sparsely to show small carves, and pick up the diff naturally
-    // when they next stream). Re-queue the loaded level-0 tile for each dirty coord — LoadTile
-    // re-runs gen (density includes the DiffLayer via GetDensityAt) and ProcessPendingChunks
-    // updates the existing component in place (old mesh stays visible until then, no pop).
-    const int32 MaxTasks = Settings ? Settings->MaxConcurrentTasks : 16;
+    // when they next stream). Queue each loaded level-0 dirty tile onto DirtyRemeshQueue — drained
+    // FIRST in the submit loop and launched at BackgroundHigh (ahead of streaming), so a dig never
+    // waits behind a shell of streaming tasks. LoadTile re-runs gen (density includes the DiffLayer
+    // via GetDensityAt) and ProcessPendingChunks updates the existing component in place (old mesh
+    // stays visible until then, no pop).
+    //
+    // Tiles that are currently mid-gen are STILL queued (not skipped): their in-flight result was
+    // sampled BEFORE this carve, so it lands with no hole — keeping the tile queued re-gens it once
+    // that stale result drains. (The old inline path dropped both over-budget and in-flight tiles,
+    // which is why a dig could show up a beat late or not until the player moved.)
     for (const FIntVector& Coord : DirtyCoords)
     {
         const FVoxelTileKey Tile(Coord, 0);
-        if (!LoadedTiles.Contains(Tile)) continue;     // only re-mesh loaded full-res tiles
-        if (PendingTiles.Contains(Tile)) continue;     // already queued
-        if (PendingTiles.Num() >= MaxTasks) break;     // task budget
-        LoadTile(Tile);
+        if (ExcludeTile && Tile == *ExcludeTile) continue;  // handled synchronously this frame
+        if (!LoadedTiles.Contains(Tile)) continue;          // only re-mesh loaded full-res tiles
+        DirtyRemeshQueue.Add(Tile);
+    }
+    if (DirtyRemeshQueue.Num() > 0)
+    {
+        // Wake the submit loop even if the streaming set had settled (idle player digging).
+        bAllChunksLoaded = false;
     }
 
     // Density volume: refill the clipmap cells overlapping each carved chunk so the shadow march
@@ -1501,10 +2306,10 @@ void AVoxelWorld::UpdateOrbLightMPC()
             const FVoxelActiveOrb& O = Orbs[i];
             V = FLinearColor((float)O.WorldPos.X, (float)O.WorldPos.Y, (float)O.WorldPos.Z, O.FalloffWorld);
         }
-        // Orbs are static once placed, so most frames change nothing — skip the MPC write (it
-        // dirties the collection's uniform buffer for every material that reads it).
-        if (LastOrbMPC[i] == V) continue;
-        LastOrbMPC[i] = V;
+        // ALWAYS write, even when unchanged. A skip-if-identical cache was tried here and BROKE the
+        // lighting: the MPC's world INSTANCE can be reset/recreated behind our back (PIE init order,
+        // asset recompile), and a cached skip then leaves it holding defaults forever. The per-frame
+        // rewrite is what makes the collection self-healing — and 4 vector writes cost nothing.
         UKismetMaterialLibrary::SetVectorParameterValue(this, OrbLightMPC, OrbNames[i], V);
     }
 }

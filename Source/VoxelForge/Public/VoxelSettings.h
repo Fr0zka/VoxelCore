@@ -65,6 +65,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
 	int32 StrateViewMarginChunks = 3;
 
+	// STRATE CONTENT CUT (F17 separation) — a level-L tile is 2^L chunks TALL and can straddle a
+	// strate boundary: at coarse Steps the thin seal/gap solid between two strates' airs falls
+	// between lattice points (⇒ holes into the neighbour strate at far LOD) and one tile mixes
+	// both strates' materials. From this clip level UP, the mesher only meshes cells inside the
+	// PLAYER's strate Z-band (the other strates are sealed/enclosed ⇒ invisible from here anyway);
+	// loaded coarse tiles re-queue automatically when the band changes (strate transition).
+	// Default 0 = cut at EVERY level (tested verdict 2026-07-05: level 0/1 straddler tiles were
+	// the visible mixers — a higher floor left them mixing and looked like "no improvement").
+	// Raise only if the descent/passage transition needs full tiles near the player. 9 = off.
+	// At ultra-coarse levels where one CELL is taller than the band itself, the tile is skipped
+	// entirely (see LoadTile) — cell-granular cutting there could only render garbage.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0", ClampMax = "9"))
+	int32 StrateContentCutMinLevel = 0;
+
 	// Open-world SKY reach: the sky-cap ceiling of an open strate (SurfaceWorld / FloatingIslands)
 	// is FAR, so the ceiling BAND is streamed across a wider horizontal radius = ViewDistanceXY ×
 	// this, so the sky reaches toward the horizon instead of being a patch over the player's head.
@@ -113,6 +127,35 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "4", ClampMax = "32"))
 	int32 CoarseTileCells = 16;
 
+	// RENDER DISTANCE — custom horizontal reach, in CHUNKS (1 chunk = 8 m; 128 ≈ 1 km, 768 ≈ 6 km).
+	// When > 0 and farther than the natural clipmap reach (ClipRadius × 2^MaxClipLevel chunks), the
+	// OUTERMOST shell keeps generating level-MaxClipLevel tiles outward until it covers this
+	// distance. Pick MaxClipLevel = the coarsest level that still renders strates correctly (one
+	// cell must fit inside a strate band — level ≥7 blanks via the too-coarse skip) and buy the
+	// remaining horizon here. Cost: the extra ring is all same-level tiles — tile/draw/gen count
+	// grows with (distance / 2^MaxClipLevel)², so each MaxClipLevel step down quadruples the ring.
+	// 0 = off (natural reach, byte-identical streaming).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0"))
+	int32 RenderDistanceChunks = 0;
+
+	// F18 — the render-distance ring streams per-surface SHEETS instead of MC tiles: in an open
+	// strate the far field is exactly two heightfields (TerrainZ + sky-cap CeilSurf, both already
+	// computed per column), so each far tile becomes two displaced grids (ground polygroup 0 /
+	// cap polygroup 1 — same materials), ~3-6× cheaper to generate and far fewer components (one
+	// sheet spans 2^FarSheetSpanLevels MC-tile footprints per axis). Non-open strates produce
+	// empty sheets (their far ring was enclosed rock anyway). Carved features (passages, chasms,
+	// spine) don't show at sheet distance. Needs the strate band armed (StrateContentCutMinLevel
+	// active); in the inter-strate gap the sheet ring blanks until you land. Off = the ring stays
+	// MC tiles at level MaxClipLevel (pre-F18 behaviour). Only matters when RenderDistanceChunks > 0.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap")
+	bool bFarSheetRing = true;
+
+	// Sheet tile size = MaxClipLevel + this many levels (2 → one sheet covers 4×4 MC-tile
+	// footprints → ~16× fewer far components). Sampling density stays that of the MaxClipLevel
+	// MC ring (cell count grows instead), capped at 128 cells/axis (beyond, cells coarsen).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "1", ClampMax = "4", EditCondition = "bFarSheetRing"))
+	int32 FarSheetSpanLevels = 2;
+
 	// SKIRTS — seal the thin cracks where neighbouring clipmap shells (different resolutions) meet.
 	// A short wall is extruded into the solid from each surface edge on the tile's outer faces.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap")
@@ -122,6 +165,16 @@ public:
 	// neighbour (2× cell). Raise if cracks still show; lower if skirts peek out on convex edges.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0.5", ClampMax = "8.0"))
 	float SkirtCells = 2.0f;
+
+	// T2.b — LOD-aware octave reduction. Octaves DROPPED from per-voxel volumetric noise
+	// (roughness, worms displacement, slab/maze/shaft/island detail) per Step doubling on
+	// coarse tiles: a Step=4 tile drops 2×this. Sub-cell octaves can't shape a coarse
+	// isosurface — they only cost CPU — so 1 shaves 30-50% off far-tile gen for a sub-cell
+	// isosurface shift (skirts already stitch bigger LOD seams). LOD0 is NEVER affected.
+	// 0 = off (every LOD samples full octaves — byte-identical to before this setting).
+	// Réduction d'octaves sur les tuiles lointaines ; 0 = désactivé, LOD0 jamais touché.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0", ClampMax = "3"))
+	int32 LODOctaveDrop = 0;
 
 	//=========================================================================
 	// CONTENT — distance-based decoration grid (no LOD pop)

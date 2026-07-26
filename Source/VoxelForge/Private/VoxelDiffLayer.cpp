@@ -115,8 +115,10 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
                 }
             }
         }
-        // Publish: subsequent readers must now take the lock instead of fast-rejecting.
+        // Publish: subsequent readers must now take the lock instead of fast-rejecting, and
+        // worker-side snapshots keyed on the version re-copy their chunk's list.
         bHasAnyMods.store(true, std::memory_order_release);
+        ModsVersion.fetch_add(1, std::memory_order_release);
     }
 
     UE_LOG(LogTemp, Log,
@@ -142,13 +144,53 @@ float UVoxelDiffLayer::GetDensityOffset(const FIntVector& ChunkCoord,
     if (!bHasAnyMods.load(std::memory_order_acquire)) return 0.0f;
 
     // Hold the read lock for the whole body: Mods points INTO the map and is dereferenced through the
-    // falloff loop below, so the map must not be rehashed by a concurrent writer meanwhile.
+    // falloff loop, so the map must not be rehashed by a concurrent writer meanwhile. NOTE: hot-path
+    // callers (the generator) should prefer GetChunkModsSnapshot + EvaluateMods — one lock per chunk
+    // instead of one per voxel.
     FReadScopeLock Lock(ModsLock);
 
-    // Fast path: if this chunk has no modifications, return 0
     const TArray<FVoxelModification>* Mods = ChunkMods.Find(ChunkCoord);
     if (!Mods || Mods->Num() == 0) return 0.0f;
 
+    return EvaluateMods(*Mods, WorldX, WorldY, WorldZ);
+}
+
+void UVoxelDiffLayer::GetChunkModsSnapshot(const FIntVector& ChunkCoord, TArray<FVoxelModification>& Out) const
+{
+    Out.Reset();
+    if (!bHasAnyMods.load(std::memory_order_acquire)) return;
+
+    FReadScopeLock Lock(ModsLock);
+    if (const TArray<FVoxelModification>* Mods = ChunkMods.Find(ChunkCoord))
+    {
+        Out = *Mods;
+    }
+}
+
+bool UVoxelDiffLayer::HasAnyModInChunkRange(const FIntVector& MinChunk, const FIntVector& MaxChunk) const
+{
+    if (!bHasAnyMods.load(std::memory_order_acquire)) return false;
+
+    // Walk the modified-chunk KEYS under one read lock. Conservative: a mod is registered in every
+    // chunk its radius overlaps (ApplyModification), so key-in-range ⟺ the mod can reach the range.
+    FReadScopeLock Lock(ModsLock);
+    for (const auto& Pair : ChunkMods)
+    {
+        const FIntVector& C = Pair.Key;
+        if (C.X >= MinChunk.X && C.X <= MaxChunk.X &&
+            C.Y >= MinChunk.Y && C.Y <= MaxChunk.Y &&
+            C.Z >= MinChunk.Z && C.Z <= MaxChunk.Z &&
+            Pair.Value.Num() > 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+float UVoxelDiffLayer::EvaluateMods(const TArray<FVoxelModification>& Mods,
+                                    float WorldX, float WorldY, float WorldZ)
+{
     float TotalOffset = 0.0f;
     const FVector Pos(WorldX, WorldY, WorldZ);
 
@@ -159,7 +201,7 @@ float UVoxelDiffLayer::GetDensityOffset(const FIntVector& ChunkCoord,
         return 1.0f - T * T * (3.0f - 2.0f * T);
     };
 
-    for (const FVoxelModification& Mod : *Mods)
+    for (const FVoxelModification& Mod : Mods)
     {
         float Falloff = 0.0f;
 
@@ -229,6 +271,7 @@ void UVoxelDiffLayer::Clear()
         FWriteScopeLock Lock(ModsLock);
         bHasAnyMods.store(false, std::memory_order_release);
         ChunkMods.Empty();
+        ModsVersion.fetch_add(1, std::memory_order_release);   // invalidate worker snapshots
     }
 
     // Reset budget counters — player gets a fresh budget after clear/season reset

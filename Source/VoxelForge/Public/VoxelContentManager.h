@@ -113,6 +113,11 @@ public:
      *  raymarched shadows. */
     void GetActiveOrbs(TArray<FVoxelActiveOrb>& OutOrbs) const;
 
+    /** Remove decoration instances inside a world-space sphere (both grids). Used by player digging (grass
+     *  shouldn't float over a hole) and landmark footprints. The placer already skips carved columns on any
+     *  future rebuild — this patches the LIVE instances. Returns how many were removed. Game-thread. */
+    int32 RemoveDecorationsInSphere(const FVector& WorldCenter, float WorldRadius);
+
     /** Destroy all spawned content (decorations + water). Regenerate / season reset. Bumps the deco
      *  epoch so any in-flight march tasks' results are discarded. */
     void ClearAll();
@@ -136,6 +141,8 @@ public:
     struct FDecoSpawn
     {
         int32      EntryIdx = 0;
+        int32      CompanionIdx = -1;   // -1 = the entry itself; else index into Entries[EntryIdx].Companions (F7)
+        int32      SubIdx = -1;         // when CompanionIdx>=0: -1 = the companion; else its SubCompanions[SubIdx]
         bool       bInstanced = false;
         FTransform Xf = FTransform::Identity;
     };
@@ -163,7 +170,8 @@ private:
     // Instanced transforms for one mesh, accumulated across all of a region's cells → one batched HISM.
     struct FRegionMeshBucket
     {
-        FStrateDecoration  Deco;      // representative entry (mesh + HISM render tuning: cull/shadow/scale)
+        FPlacementProfile  Profile;   // representative profile (mesh + HISM render tuning: cull/shadow) —
+                                      // may be a decoration entry's OR a companion's (F7).
         TArray<FTransform> Xforms;
     };
     // A non-instanced actor placement, spawned when the region is applied.
@@ -240,6 +248,11 @@ private:
         // terrain material consumes the nearest active orb for raymarched shadows (see GetActiveOrbs).
         bool         bIsOrb = false;
         FVoxelActiveOrb Orb;
+
+        // Decoration footprint (F7): >0 = clear decorations within this world sphere. Set when the landmark
+        // has bSuppressDecorationsUnder, so a newly-applied deco region can re-clear under it too.
+        FVector SuppressCenter = FVector::ZeroVector;
+        float   SuppressRadiusWorld = 0.0f;
     };
 
     /** WORKER-THREAD surface find → fills OutSpawns for one cell. SurfaceWorld uses the height oracle
@@ -278,8 +291,18 @@ private:
     void SpawnLandmarkInstance(const FStrateLandmark& L, uint32 H, const FDecoContext& Ctx,
                                const FTransform& OwnerXf, AActor* OwnerActor,
                                float LocalX, float LocalY, float Step, float ColDepth, FLandmarkInstance& Out);
+    // Shared spawn core for landmarks AND set-pieces: surface-find + all FPlacementProfile gates (biome/
+    // slope/water/Conditions) → transform → spawn actor OR one static mesh into Out. Returns true (OutXf
+    // = final transform) when placed; false (Out untouched) on any gate fail = "evaluated, nothing placed".
+    bool SpawnFromProfile(const FPlacementProfile& P, uint32 H, const FDecoContext& Ctx,
+                          const FTransform& OwnerXf, AActor* OwnerActor,
+                          float LocalX, float LocalY, float Step, float ColDepth,
+                          FTransform& OutXf, FLandmarkInstance& Out);
     void DestroyLandmarkInstance(FLandmarkInstance& Inst);
     void ClearAllLandmarks();
+    // Remove instances within a world sphere from ONE region's HISMs (the per-region core of
+    // RemoveDecorationsInSphere; also used by ApplyRegion to clear under a landmark footprint). Returns count.
+    static int32 RemoveInstancesInContent(FDecoRegionContent& Content, const FVector& Center, float Radius);
     // Single-column surface find for a landmark (voxel XY): SurfaceWorld → height oracle, else ray-march the
     // strate band for the first crossing whose orientation matches Surf. Fills Z (voxel) + outward world normal.
     static bool FindLandmarkColumn(const UVoxelGenerator* Gen, const FTransform& OwnerXf,
@@ -318,6 +341,7 @@ private:
     // Spawned landmarks, keyed by FIntVector(latticeCellX, latticeCellY, entryIndex) — FIntVector already
     // hashes, so no custom key type is needed. An entry with both ptrs null = "evaluated, nothing placed"
     // (kept until the cell leaves range so the surface-find isn't repeated). Strate-bounded.
+    // Keyed by FIntVector(cellX|passageIdx, cellY|side, entryIndex) — lattice cell OR passage endpoint.
     TMap<FIntVector, FLandmarkInstance> LandmarkInstances;
     int32 LastLandmarkStrate = INT32_MIN;   // strate change → wipe + rebuild landmarks
 

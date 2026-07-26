@@ -28,6 +28,39 @@ class UMaterialInstanceDynamic;
 namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
 /**
+ * How a streaming anchor wants its tiles built (ARCHITECTURE §9.3). The local player is an implicit
+ * FullVisual anchor (the clipmap). Extra anchors — AI, and later remote players — are registered so
+ * their surroundings stream too (so they physically exist away from the local camera).
+ *
+ * `CollisionOnly` tiles cook collision but are hidden (`SetVisibility(false)`) — no draw / VSM cost —
+ * UNLESS the player clipmap also wants that exact level-0 tile (then it renders normally). This is the
+ * §9.4 render-skip: it kills the cost of terrain around AI/remote players far from the local camera.
+ * (Geometry streams are still built on the worker — off the frame; a deeper "no stream build at all"
+ * collision-only path is a later optimization.)
+ */
+UENUM(BlueprintType)
+enum class EVoxelAnchorPolicy : uint8
+{
+    CollisionOnly UMETA(DisplayName = "Collision Only"),   // enough to stand / pathfind / hit
+    FullVisual    UMETA(DisplayName = "Full Visual")       // rendered too (a second local viewpoint)
+};
+
+/** A non-player streaming center: keep a small box of level-0 tiles loaded around Actor so it has
+ *  collision wherever it is. Plain internal struct (weak ptr is GC-safe without reflection). */
+struct FVoxelStreamingAnchor
+{
+    TWeakObjectPtr<AActor> Actor;
+    EVoxelAnchorPolicy Policy = EVoxelAnchorPolicy::CollisionOnly;
+    // Thin box around the anchor (level-0 chunks). Default = the chunk it's in + 1 on each horizontal
+    // edge (3×3) + 1 chunk BELOW (ground safety when its capsule sits near a chunk's bottom); nothing
+    // above (a grounded NPC doesn't need it — raise ZAbove for flyers). Empty tiles in the box are ~free.
+    int32 XYRadiusChunks = 1;   // horizontal Chebyshev radius (0 = its own column)
+    int32 ZBelowChunks   = 1;   // chunks below the anchor's chunk
+    int32 ZAboveChunks   = 0;   // chunks above
+    FIntVector LastChunk = FIntVector(MAX_int32, MAX_int32, MAX_int32);   // move detection (rebuild trigger)
+};
+
+/**
  * AVoxelWorld - The main voxel terrain actor
  *
  * RESPONSIBILITIES:
@@ -51,11 +84,18 @@ struct FChunkResult
     TSharedPtr<RealtimeMesh::FRealtimeMeshStreamSet> Streams;
     uint32 Epoch = 0;         // Generation epoch — discard if stale
     bool bEmpty = true;       // true ⇒ all-air tile (Streams null); still marked loaded so we don't re-submit
-    // Ceiling classification from the ACTUAL mesh normals (down-facing geometry = sky-cap ceiling),
-    // computed on the worker where Normals are free. Authoritative — can't disagree with the rendered
-    // view the way a game-thread height-oracle sample did (it misclassified coarse far tiles). The
-    // game thread still gates this to SurfaceWorld strates before applying CeilingMaterial / no-shadow.
-    bool bIsCeiling = false;
+    // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
+    // column's CeilSurf; overhangs/cave roofs stay ground) and packs them as two contiguous runs
+    // (ground then cap) in the index buffer → polygroups 0/1 → two RMC sections with their own
+    // material + shadow flag. These tell the apply path which sections exist (RMC only creates a
+    // section for a non-empty polygroup — configuring a missing one is invalid).
+    bool bHasGroundTris  = false;
+    bool bHasCeilingTris = false;
+    // STRATE CONTENT CUT — the chunk-Z band this tile was MESHED with (MIN/MAX = uncut). The
+    // apply path clamps its strate/material lookups into it (a coarse tile's raw min corner can
+    // sit in a strate whose content was cut out of the mesh entirely).
+    int32 BandChunkLo = MIN_int32;
+    int32 BandChunkHi = MAX_int32;
     // CAPTURE-DURING-MESHING: the tile's CHUNK_SIZE³ R8 density grid, captured by the mesher (no extra
     // GetDensityAt). Non-empty only for capture-eligible tiles (level 0, full-res). The game thread hands
     // it to UVoxelDensityVolume::IngestTileCapture so the density clipmap reuses the mesher's samples
@@ -151,7 +191,26 @@ public:
      *  because FVoxelTileKey isn't a USTRUCT key). */
     TMap<FVoxelTileKey, URealtimeMeshComponent*> TileComponents;
 
+    /** T2.c — COMPONENT POOL. Unloading a tile parks its component here (geometry + collision
+     *  stripped via RemoveSectionGroup, hidden, still registered) instead of DestroyComponent;
+     *  ApplyMeshToTile pops from here instead of NewObject + RegisterComponent. Kills the
+     *  create/register/GC churn of fast travel and regen bursts. Same GC-safety rationale as
+     *  TileComponents (registered components are owned by the actor). Bounded — overflow is
+     *  destroyed for real. */
+    TArray<URealtimeMeshComponent*> TileComponentPool;
+    static constexpr int32 MaxPooledTileComponents = 256;
 
+    /** Pop a pooled tile component (made visible again) or create + register a fresh one. */
+    URealtimeMeshComponent* AcquireTileComponent();
+
+    /** Park a tile component in the pool (strip geometry/collision, hide) — or destroy it
+     *  for real when the pool is full. */
+    void ReleaseTileComponent(URealtimeMeshComponent* Comp);
+
+    /** T2.d — the effective concurrent gen-task budget: the asset's MaxConcurrentTasks,
+     *  capped to (logical cores − 2) so small CPUs don't thrash on a flat 16 (background
+     *  priority stops frame starvation, not the context-switch overhead). */
+    int32 GetMaxConcurrentTasks() const;
 
     //=========================================================================
     // TERRAIN MODIFICATION (player carving & filling)
@@ -271,6 +330,37 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Voxel World|Biome")
     FVoxelBiomeQuery GetBiomeAtWorldLocation(FVector WorldLocation) const;
 
+    /**
+     * SurfaceWorld ground finder for self-arranging prefabs (ruins/set-pieces authored as Blueprints):
+     * the terrain surface + sky-cap ceiling world-Z under WorldLocation's XY, WITHOUT any line trace or
+     * streamed collision. Deterministic and available before the area meshes. Returns false (outs = the
+     * input Z) when the point isn't a SurfaceWorld heightfield (cave strates) — fall back to a trace there.
+     * Does NOT account for passage/spine carving; re-check with a trace if the spot might be carved.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Query")
+    bool GetVoxelSurfaceHeightAt(FVector WorldLocation, float& OutSurfaceWorldZ, float& OutCeilingWorldZ) const;
+
+    //=========================================================================
+    // STREAMING ANCHORS — keep terrain (collision) loaded around actors that aren't the local player
+    // (AI now; remote players later). ARCHITECTURE §9.3. Registering an actor folds a small box of
+    // level-0 tiles around it into the desired set, so it has ground to stand on / pathfind / be hit
+    // even far from the camera. Idempotent per actor (re-register updates the policy/radius).
+    //=========================================================================
+
+    /** Start streaming terrain around Actor. Default box = its chunk + 1 horizontal ring + 1 chunk below
+     *  (ground safety), nothing above. Empty tiles are ~free (trivial-tile reject); with the CollisionOnly
+     *  policy the SOLID tiles cook collision but don't render (§9.4). Raise ZAbove for flyers/tall NPCs. */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Streaming")
+    void RegisterStreamingAnchor(AActor* Actor,
+                                 EVoxelAnchorPolicy Policy = EVoxelAnchorPolicy::CollisionOnly,
+                                 int32 XYRadiusChunks = 1,
+                                 int32 ZBelowChunks = 1,
+                                 int32 ZAboveChunks = 0);
+
+    /** Stop streaming terrain around Actor. Its tiles are released by the normal delta cull. */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Streaming")
+    void UnregisterStreamingAnchor(AActor* Actor);
+
     //=========================================================================
     // LIGHTING — DENSITY VOLUME (debug / material wiring)
     //=========================================================================
@@ -307,11 +397,10 @@ private:
                  TVP6 = FLinearColor::Black, TVP7 = FLinearColor::Black,
                  TVP8 = FLinearColor::Black, TVP9 = FLinearColor::Black;
 
-    // Change-detection for the per-Tick pushes: MID vector/texture sets and MPC writes each enqueue
-    // render-thread updates, so skip them entirely on the (common) frames where nothing moved.
+    // Change-detection for the per-Tick MID pushes (MIDs OWN their param values, so skip-if-identical
+    // is safe there — unlike the MPC, whose world instance can reset behind our back; see
+    // UpdateOrbLightMPC, which deliberately rewrites every frame).
     TWeakObjectPtr<UVolumeTexture> LastBoundVolTex0;              // re-push MIDs if the L0 texture was recreated
-    FLinearColor LastOrbMPC[4] = { FLinearColor(FLT_MAX, 0, 0, 0), FLinearColor(FLT_MAX, 0, 0, 0),
-                                   FLinearColor(FLT_MAX, 0, 0, 0), FLinearColor(FLT_MAX, 0, 0, 0) };
 
 public:
 
@@ -335,6 +424,15 @@ public:
      *  RegenerateAllChunks alone keeps the existing layout & passages. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Live Edit")
     void RebuildStrates();
+
+    /** F2 — DETERMINISM VALIDATOR (run during PIE, takes ~a second). Samples a band of
+     *  densities at a chunk boundary near the player through TWO cache-window alignments
+     *  (thread_local chunk caches warmed from the left chunk, then from the right one, same
+     *  points re-sampled) plus a same-alignment repeat. Every delta MUST be exactly 0 —
+     *  anything else is a window-invariance regression (ARCHITECTURE §8.4). Logs the verdict
+     *  and the first offending voxel. Run it after any "bit-identical" hot-path refactor. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Live Edit")
+    void ValidateDeterminism();
 
     //=========================================================================
     // EDITOR BRUSH (manual carve/fill from the Details panel, works in PIE)
@@ -448,7 +546,35 @@ public:
      *
      * @param ChunkCoord - Which chunk to load
      */
-    void LoadTile(const FVoxelTileKey& Tile);
+    void LoadTile(const FVoxelTileKey& Tile, bool bHighPriority = false);
+
+    /**
+     * Worker-side gen for one tile: classify → GenerateMesh/GenerateSheetMesh → BuildTileStreamSet.
+     * Fills Result (no enqueue, no bookkeeping). Called from the async ChunkGen task AND from the
+     * synchronous carve path (SyncRemeshTile) — reads Generator/Mesher only, so it's safe on either
+     * thread. See LoadTile for how the parameters are derived.
+     */
+    void GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
+                            int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
+                            int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
+                            bool bSheetTile, int32 SheetChunkZ,
+                            int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
+                            FChunkResult& Result);
+
+    /**
+     * Game-thread apply for one gen result (shared by ProcessPendingChunks + SyncRemeshTile):
+     * epoch check, mark loaded, ingest capture, then either release the tile's component (empty) or
+     * ApplyMeshToTile. Returns true iff a VISIBLE mesh was uploaded (counts against the apply budget).
+     * Does NOT touch PendingTiles — the caller owns that.
+     */
+    bool ApplyTileResult(FChunkResult& Result);
+
+    /**
+     * Same-frame level-0 re-mesh on the game thread: gen + apply INLINE so a player carve is visible
+     * THIS frame (no async round-trip). Used for the tile under the brush centre; neighbours re-mesh
+     * async (prioritised) via RemeshDirtyChunks. One full-res tile gen on the game thread — bounded.
+     */
+    void SyncRemeshTile(const FVoxelTileKey& Tile);
 
     /**
      * Unload a single chunk.
@@ -466,14 +592,19 @@ public:
      *
      * The vertex/index buffers (Streams) are already BUILT on the worker (T1.f — see
      * BuildTileStreamSet / FChunkResult), so this only does the game-thread-only work:
-     * ceiling/material resolution, get-or-create the component, CreateSectionGroup(MoveTemp),
-     * and section config (collision/shadow). Never called for empty tiles.
+     * material resolution, get-or-create the component, CreateSectionGroup(MoveTemp),
+     * and per-section config (collision/shadow). Never called for empty tiles.
      *
-     * @param Tile        - Which clipmap tile this mesh belongs to
-     * @param Streams     - Pre-built RMC geometry buffers (consumed/moved)
-     * @param bGeomCeiling - Worker's geometry-normal ceiling vote (gated to SurfaceWorld here)
+     * F17 — the streams carry TWO polygroups (0 = ground, 1 = sky-cap ceiling, classified
+     * semantically per triangle on the worker): RMC auto-creates one section per non-empty
+     * group, so a coarse tile spanning both the terrain and the cap gets BOTH materials
+     * (the old whole-tile vote painted the loser with the winner's material).
+     *
+     * Takes the whole FChunkResult (tile key, streams — consumed/moved —, per-group flags and
+     * the strate content band the mesh was cut to; material lookups clamp into that band).
+     * Never called for empty results.
      */
-    void ApplyMeshToTile(const FVoxelTileKey& Tile, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, bool bGeomCeiling);
+    void ApplyMeshToTile(FChunkResult& Result);
 
     /** Mini-sun lighting (bounded directional). Each frame writes the nearest 4 active orbs' WORLD
      *  positions (+ reach radius in .w) into OrbLightMPC's Orb0..3 vector params; the Directional
@@ -486,8 +617,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting")
     UMaterialParameterCollection* OrbLightMPC = nullptr;
 
-    /** Build the clipmap desired-tile set (concentric shells) around the player tile. */
-    void BuildDesiredTiles(const FIntVector& CenterChunkCoord);
+    /** Build the clipmap desired-tile set (concentric shells) around the player tile.
+     *  OutLeavers = les tuiles désirées au crossing PRÉCÉDENT qui ne le sont plus — les seuls
+     *  candidats au cull (delta), au lieu de re-scanner TOUTES les tuiles chargées par crossing. */
+    void BuildDesiredTiles(const FIntVector& CenterChunkCoord, TArray<FVoxelTileKey>& OutLeavers);
 
     /** True if a tile's world footprint is still within the outermost clip shell (so a
      *  not-desired loaded tile there is mid-LOD-transition and must wait for its replacement,
@@ -515,6 +648,32 @@ public:
     TQueue<FChunkResult, EQueueMode::Mpsc> ProcessQueue;
     TSet<FVoxelTileKey> PendingTiles;   // tiles with a gen task in flight
 
+    // STRATE CONTENT CUT (see UVoxelSettings::StrateContentCutMinLevel) — the player-strate
+    // chunk-Z band coarse tiles are meshed to (MIN/MAX sentinels = no cut, e.g. in the gap).
+    // Updated each crossing in UpdateChunksAroundPosition; on change (strate transition) the
+    // loaded coarse tiles whose content depends on it are re-queued through BandRemeshQueue
+    // (drained by the budgeted submit loop — LoadTile re-gens in place, no visual pop).
+    int32 MeshBandChunkLo = MIN_int32;
+    int32 MeshBandChunkHi = MAX_int32;
+    TSet<FVoxelTileKey> BandRemeshQueue;
+
+    // DIG RESPONSIVENESS — loaded level-0 tiles touched by a player carve/fill that still need an
+    // async re-mesh (the neighbours of the synchronously-remeshed centre tile, plus any tile that was
+    // mid-gen at carve time). Drained FIRST in the submit loop (ahead of streaming + band) and launched
+    // at BackgroundHigh so a dig never waits behind streaming. Unlike the old inline RemeshDirtyChunks,
+    // a tile that's in flight is KEPT queued (not dropped) so the stale pre-carve result is corrected
+    // once it lands — the source of "the hole shows up a beat late, or not until I move".
+    TSet<FVoxelTileKey> DirtyRemeshQueue;
+
+    // F18 — TROU XY de l'anneau feuille (voxels ; Max EXCLUSIF ; sentinelles MAX/MIN = pas de
+    // trou) : la zone couverte par les coquilles MC (boîte niveau-MaxClipLevel autour du joueur,
+    // rétrécie d'une tuile pour garder un anneau de recouvrement au raccord) est DÉCOUPÉE des
+    // feuilles — sinon une feuille partiellement couverte recouvre le terrain proche avec son
+    // échantillonnage grossier. Mis à jour par crossing ; changement ⇒ re-queue des feuilles
+    // chevauchantes via BandRemeshQueue (re-gen en place).
+    int32 SheetHoleMinXVox = MAX_int32, SheetHoleMinYVox = MAX_int32;
+    int32 SheetHoleMaxXVox = MIN_int32, SheetHoleMaxYVox = MIN_int32;
+
     // Set to true during EndPlay — async tasks check this before accessing UObjects
     std::atomic<bool> bShuttingDown{false};
 
@@ -524,6 +683,27 @@ public:
     // Player's level-0 tile coord (= chunk coord). The desired set is rebuilt when this changes.
     FIntVector CurrentCenterChunk = FIntVector::ZeroValue;
 
+    // Non-player streaming anchors (AI now, remote players later — ARCHITECTURE §9.3). BuildDesiredTiles
+    // folds each anchor's small level-0 box into the desired set (same DesiredStamped machinery → the
+    // delta cull releases an anchor's tiles automatically when it moves away / is unregistered). The
+    // desired-set rebuild also fires when any anchor crosses a chunk boundary (UpdateChunksAroundPosition).
+    TArray<FVoxelStreamingAnchor> StreamingAnchors;
+    // Adds each anchor's level-0 tiles to DesiredSorted/DesiredStamped (dedup vs the player clipmap)
+    // and records the ones ONLY a CollisionOnly anchor wants in CollisionOnlyTiles.
+    void AddAnchorDesiredTiles();
+    // Forces a desired-set rebuild next Tick even if neither the player nor an anchor crossed a tile
+    // boundary (set by UnregisterStreamingAnchor so a removed anchor's tiles get culled).
+    bool bForceDesiredRebuild = false;
+
+    // §9.4 RENDER-SKIP — level-0 tiles wanted ONLY by CollisionOnly anchors (no player-clipmap / no
+    // FullVisual desirer this crossing): they cook collision but are hidden. Rebuilt each crossing in
+    // BuildDesiredTiles. `Prev` lets ReconcileAnchorTileVisibility toggle just the DELTA on already-
+    // loaded tiles when a tile flips render↔collision-only (player walks toward/away from a cluster),
+    // without an O(loaded) scan. Both empty when there are no CollisionOnly anchors → zero cost.
+    TSet<FVoxelTileKey> CollisionOnlyTiles;
+    TSet<FVoxelTileKey> PrevCollisionOnlyTiles;
+    void ReconcileAnchorTileVisibility();
+
     // --- Streaming work-avoidance (perf) ---
     // The desired tile set only changes when the player crosses a level-0 tile boundary.
     // We cache it and only rebuild/cull/sort on a real move, and go idle once every desired
@@ -531,7 +711,36 @@ public:
     FIntVector LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bool bAllChunksLoaded = false;
     TArray<FVoxelTileKey> DesiredSorted;   // desired tiles, nearest-first
-    TSet<FVoxelTileKey> DesiredSet;        // O(1) membership for the cull pass
+
+    // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
+    // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp
+    // périmé sont les "leavers" (retirées + renvoyées). Le cull ne considère que ces leavers + la
+    // TransitionHold — fini le scan O(toutes-les-tuiles-chargées) à chaque crossing (le spike
+    // CullTiles ~1.6 ms/crossing de la trace 2026-07-05).
+    TMap<FVoxelTileKey, uint32> DesiredStamped;
+    uint32 DesiredStamp = 0;
+    bool IsDesired(const FVoxelTileKey& T) const
+    {
+        const uint32* S = DesiredStamped.Find(T);
+        return S && *S == DesiredStamp;
+    }
+
+    // Tuiles chargées qui ont quitté le desired set mais sont RETENUES (load-before-unload : leur
+    // remplacement n'est pas encore complet, ou le backlog a sauté le test de recouvrement).
+    // Re-considérées par BUDGET tournant (curseur sur la queue, ~256/crossing) — re-scanner TOUTE
+    // la hold par crossing redevient le vieux scan O(loaded) dès que le streaming ne "settle"
+    // jamais (mesuré 2.47 ms/crossing en packagé). Garder une tuile plus longtemps est toujours
+    // hole-safe. Le set est la MEMBERSHIP autoritaire ; la queue peut contenir des clés périmées
+    // (retirées paresseusement au scan). Le "settled cull" reste le filet de sécurité plein-scan.
+    TSet<FVoxelTileKey> TransitionHold;
+    TArray<FVoxelTileKey> TransitionHoldQueue;
+    int32 TransitionHoldCursor = 0;
+    void AddToTransitionHold(const FVoxelTileKey& T)
+    {
+        bool bAlready = false;
+        TransitionHold.Add(T, &bAlready);
+        if (!bAlready) { TransitionHoldQueue.Add(T); }
+    }
 
     // Tiles approved for removal but whose teardown (component destroy + content actor Destroy())
     // is spread across frames. Unbudgeted, a fast traversal culls a whole shell's worth of tiles in
@@ -550,6 +759,9 @@ public:
      * fresh with the diff layer when loaded normally).
      *
      * @param DirtyCoords - Chunk coordinates that need re-meshing
+     * @param ExcludeTile - optional level-0 tile already handled synchronously this frame
+     *                      (SyncRemeshTile): skipped for the async re-queue, but still marked dirty
+     *                      for the density volume.
      */
-    void RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords);
+    void RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords, const FVoxelTileKey* ExcludeTile = nullptr);
 };

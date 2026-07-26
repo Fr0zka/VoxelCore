@@ -251,6 +251,18 @@ struct FCachedRoom
     // Intensity scale for this room's op (from FStrateTerrainOpEntry::Weight).
     // 1.0 = use op as configured, 0.5 = half intensity, 2.0 = double.
     float RoomOpWeight = 1.0f;
+
+    // PRE-BAKED SHAPE (BuildChunkCache). The shape roll, variety thresholds and the capsule's
+    // Cos/Sin direction used to be re-derived PER VOXEL per room inside EvaluateSDFCached — hash
+    // mixes + trig in the hottest loop of the plugin for values that are constants of the room.
+    // Bit-identical to the old per-voxel roll (same hashes, same math, done once per chunk).
+    //   0 = ellipsoid    → ShapeA = radii (x=y=RadiusXY, z=RadiusZ)
+    //   1 = rounded box  → ShapeA = half-extents, ShapeR = corner rounding
+    //   2 = capsule      → ShapeA/ShapeB = world endpoints, ShapeR = tube radius
+    uint8   ShapeType = 0;
+    FVector ShapeA = FVector::ZeroVector;
+    FVector ShapeB = FVector::ZeroVector;
+    float   ShapeR = 0.0f;
 };
 
 // A pre-computed tunnel segment — all connection decisions and hash-derived
@@ -370,17 +382,16 @@ namespace VoxelCaveMorphology
     // @param WorldX, WorldY, WorldZ  — position in voxel coordinates (may be warped)
     // @param Cache                   — pre-built cache from BuildChunkCache
     // @param SDFBlendRadius          — SmoothMin blend radius (from Params.SDFBlendRadius)
-    // @param RoomShapeVariety        — shape variety factor (from Params.RoomShapeVariety)
     // @param OutNearestRoomIdx       — optional out: index of the room with minimum SDF
     //                                  contribution. -1 if no room passed the cull test.
     //                                  Used by the terrain ops system to look up the
     //                                  per-room terrain op assigned to this voxel's room.
+    // (Room shape variety is baked into FCachedRoom by BuildChunkCache — no per-voxel roll.)
     // @return negative = inside cave, positive = solid rock
     float EvaluateSDFCached(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
         float SDFBlendRadius,
-        float RoomShapeVariety,
         int32* OutNearestRoomIdx = nullptr
     );
 

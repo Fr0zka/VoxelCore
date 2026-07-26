@@ -196,7 +196,12 @@ void UVoxelDensityVolume::EnsureTextures()
         T->Filter = TF_Trilinear;                 // smooth iso crossing (sub-voxel crisp edge)
         T->CompressionSettings = TC_Grayscale;    // single-channel
         T->NeverStream = true;
-        T->MipGenSettings = TMGS_NoMipmaps;       // 1b-i: base mip only; solidity mips come with the march
+#if WITH_EDITORONLY_DATA
+        // MipGenSettings n'existe que dans les builds éditeur (WITH_EDITORONLY_DATA) — c'est un hint
+        // pour le mip-builder du cooker. En packagé le PlatformData construit ici n'a qu'UN mip de
+        // toute façon (1b-i: base mip only; solidity mips come with the march).
+        T->MipGenSettings = TMGS_NoMipmaps;
+#endif
 
         // Runtime platform data: one R8 (PF_G8) mip, zero-initialised. NOTE (UE5.7 API surface — flag if
         // the build rejects any of these): FTexturePlatformData / SetNumSlices / SetPlatformData /

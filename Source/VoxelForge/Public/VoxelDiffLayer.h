@@ -226,6 +226,36 @@ public:
     bool HasModifications(const FIntVector& ChunkCoord) const;
 
     //=========================================================================
+    // HOT-PATH SNAPSHOT API (per-chunk, lock-amortised)
+    //=========================================================================
+    // Once ANY carve exists, calling HasModifications + GetDensityOffset per voxel costs two
+    // ModsLock acquisitions + two TMap finds per density sample (~86k lock ops per tile task —
+    // during carve gameplay, exactly when re-mesh latency matters). Instead, a worker snapshots a
+    // chunk's mod list ONCE per (chunk, version) and evaluates it lock-free via EvaluateMods; the
+    // version bump on ApplyModification/Clear invalidates worker-side caches.
+
+    /** Lock-free: true once any modification exists anywhere (false = the common streaming case). */
+    bool HasAnyMods() const { return bHasAnyMods.load(std::memory_order_acquire); }
+
+    /** Monotonic mod-state version — bumped by ApplyModification and Clear. */
+    uint32 GetModsVersion() const { return ModsVersion.load(std::memory_order_acquire); }
+
+    /** Copy this chunk's modification list under ONE read lock (Out emptied if none). */
+    void GetChunkModsSnapshot(const FIntVector& ChunkCoord, TArray<FVoxelModification>& Out) const;
+
+    /** True si un chunk modifié intersecte [MinChunk, MaxChunk] (inclusif). Conservatif par
+     *  construction : ApplyModification enregistre le mod dans TOUS les chunks que son rayon
+     *  touche, donc le test par clé de chunk suffit. Une passe de lecture sur les clés (les
+     *  mondes édités ont peu de chunks modifiés) — utilisé par ClassifyTile, PAS par voxel. */
+    bool HasAnyModInChunkRange(const FIntVector& MinChunk, const FIntVector& MaxChunk) const;
+
+    /** Evaluate a mod list at a voxel — the lock-free core shared by GetDensityOffset and the
+     *  generator's snapshot path. Pure function (deterministic). Returns the combined offset
+     *  (negative = carve, positive = fill). */
+    static float EvaluateMods(const TArray<FVoxelModification>& Mods,
+                              float WorldX, float WorldY, float WorldZ);
+
+    //=========================================================================
     // MANAGEMENT
     //=========================================================================
 
@@ -256,6 +286,7 @@ private:
     TMap<FIntVector, TArray<FVoxelModification>> ChunkMods;
     mutable FRWLock ModsLock;
     std::atomic<bool> bHasAnyMods{ false };
+    std::atomic<uint32> ModsVersion{ 1 };   // see the snapshot API above
 
     //=========================================================================
     // BUDGET TRACKING

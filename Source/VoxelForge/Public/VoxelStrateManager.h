@@ -155,6 +155,11 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Strate")
     int32 GetStrateIndex(float WorldZ) const;
 
+    /** Layout/passage generation counter (bumped by every Initialize → GeneratePassages).
+     *  Hot-path callers key thread_local memos on this so an editor rebuild (RebuildStrates /
+     *  live edit) can never serve a stale strate index or passage shortlist. */
+    uint32 GetLayoutVersion() const { return PassagesVersion; }
+
     /**
      * Get the strate definition for a specific chunk coordinate.
      *
@@ -278,6 +283,13 @@ public:
      * FLT_MAX = no modifier nearby.
      */
     float EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const;
+
+    /**
+     * True si la sphère englobante d'un passage (élargie du rayon de blend de carve) touche la
+     * boîte VOXEL [MinVoxel, MaxVoxel]. Test conservatif O(Passages) — utilisé par ClassifyTile
+     * (rejet des tuiles trivialement pleines) une fois PAR TUILE, jamais par voxel.
+     */
+    bool AnyPassageNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
 
     /** Get all generated passages (for debug display). */
     const TArray<FVoxelPassage>& GetPassages() const { return Passages; }

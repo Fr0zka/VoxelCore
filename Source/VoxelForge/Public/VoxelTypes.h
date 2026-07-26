@@ -231,6 +231,12 @@ struct FVoxelMeshData
     TArray<FColor>    Colors;     // Masques matériau F6 (R=palette biome dominant, G=pente,
                                   // B=poids de fondu de bordure, A=palette biome voisin)
 
+    // F17 — classe de surface par TRIANGLE, portée par l'ORDRE du buffer d'indices : les
+    // NumCeilingTriangles DERNIERS triangles de Triangles sont la classe "plafond sky-cap"
+    // (polygroup 1 → slot matériau 1, sans ombre) ; tout ce qui précède est "sol/roche"
+    // (polygroup 0). Runs contigus exigés par RMC (une section par polygroup).
+    int32 NumCeilingTriangles = 0;
+
     void Clear()
     {
         Vertices.Empty();
@@ -238,6 +244,7 @@ struct FVoxelMeshData
         UVs.Empty();
         Normals.Empty();
         Colors.Empty();
+        NumCeilingTriangles = 0;
     }
 
     bool IsEmpty() const { return Vertices.Num() == 0; }
