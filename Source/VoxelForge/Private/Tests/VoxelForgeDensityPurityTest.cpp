@@ -268,4 +268,120 @@ bool FVoxelForgeDensityPurityTest::RunTest(const FString& Parameters)
     return true;
 }
 
+//=============================================================================
+// AUDIT C2 — L'INVALIDATION APRÈS ÉDITION À CHAUD / live-edit invalidation
+//=============================================================================
+// La pureté ci-dessus teste « le même monde répond toujours pareil ». Ce test-ci teste l'inverse,
+// et c'est le bug réellement observé : après un RebuildStrates / une édition d'asset dans
+// l'éditeur, un worker dont le cache par-chunk est encore chaud pour ce chunk DOIT re-résoudre ses
+// params. Sinon il génère avec les ANCIENS — symptôme : « j'ai retouché la strate, régénéré, et une
+// zone a gardé l'ancienne forme ».
+//
+// The purity test above checks "the same world always answers the same". This checks the opposite,
+// and it is the bug actually observed: after a layout rebuild, a warm per-chunk cache MUST refetch.
+//
+// Le test échantillonne D0, mute un param de terrain qui NE déplace PAS la strate (donc StrateKey
+// et toutes les autres clés existantes restent identiques), ré-initialise, et exige que la densité
+// AIT CHANGÉ au même point sur le MÊME thread. Sans le correctif de version de layout, elle ne
+// change pas et ce test échoue.
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeLiveEditInvalidationTest,
+    "VoxelForge.Determinism.LiveEditInvalidation",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FVoxelForgeLiveEditInvalidationTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+
+    FTestWorld World;
+    World.Build();
+    if (!World.IsValid())
+    {
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    int32 SurfTopZ = 0, SurfBotZ = 0;
+    if (!World.GetSlotVoxelZRange(FTestWorld::SlotSurfaceWorld, SurfTopZ, SurfBotZ))
+    {
+        AddError(TEXT("The fixture layout has no SurfaceWorld slot, so there is no heightfield to ")
+                 TEXT("live-edit. Check FTestWorld::Build's Archetypes[] against the slot constants."));
+        return false;
+    }
+
+    const UVoxelGenerator* Gen = World.Generator.Get();
+
+    // Colonne bien à l'écart de (0,0) : la spine et l'entrée de surface y forcent de l'air et
+    // masqueraient un changement de heightfield.
+    TArray<FVector> Probes;
+    for (int32 i = 0; i < 64; ++i)
+    {
+        Probes.Add(FVector(200.0f + i * 7.0f, -140.0f + i * 5.0f,
+                           (float)((SurfTopZ + SurfBotZ) / 2)));
+    }
+
+    TArray<float> Before;
+    Before.Reserve(Probes.Num());
+    for (const FVector& P : Probes)
+    {
+        Before.Add(Gen->GetDensityAt((float)P.X, (float)P.Y, (float)P.Z));
+    }
+
+    // ── L'édition. Choisie pour NE PAS bouger la strate : StrateBottomWorldZ est inchangé, donc
+    //    StrateKey, le seed et les coords de chunk sont tous identiques à avant. La SEULE chose
+    //    qui bouge est la version de layout. / The edit is chosen NOT to move the strate: the only
+    //    thing that changes is the layout version.
+    UVoxelStrateDefinition* SurfDef = World.Definitions[FTestWorld::SlotSurfaceWorld].Get();
+    SurfDef->SurfaceParams.ElevationRange   *= 2.5f;
+    SurfDef->SurfaceParams.MountainStrength  = FMath::Min(1.0f, SurfDef->SurfaceParams.MountainStrength + 0.4f);
+    SurfDef->SurfaceParams.ContinentFrequency *= 1.7f;
+    World.Reinitialize();
+
+    int32 NumChanged = 0;
+    for (int32 i = 0; i < Probes.Num(); ++i)
+    {
+        const float After = Gen->GetDensityAt((float)Probes[i].X, (float)Probes[i].Y, (float)Probes[i].Z);
+        if (!BitEqual(After, Before[i])) { ++NumChanged; }
+    }
+
+    if (NumChanged == 0)
+    {
+        AddError(FString::Printf(
+            TEXT("STALE PARAMS (AUDIT C2): the SurfaceWorld heightfield params were tripled and the ")
+            TEXT("layout rebuilt, yet all %d probe densities are bit-identical. A per-chunk cache is ")
+            TEXT("still keyed on ChunkCoord alone and skipped its refetch. Suspects, in order: ")
+            TEXT("CP_Chunk/CP_Version in GetDensityAt, the GSurfColCache box key, and the ")
+            TEXT("FChunkBiomeCache validity box (which says nothing about the FBiomeContext its ")
+            TEXT("cells were classified against)."), Probes.Num()));
+    }
+    else
+    {
+        AddInfo(FString::Printf(TEXT("%d of %d probes moved after the live edit — caches refetched."),
+                                NumChanged, Probes.Num()));
+    }
+
+    // Et le monde édité doit rester pur : une invalidation qui laisse un cache à moitié chaud
+    // produirait des valeurs dépendantes de l'ordre. / And the edited world must stay pure.
+    {
+        TArray<int32> Order;
+        BuildShuffledOrder(Probes.Num(), 555, Order);
+        TArray<float> After;
+        After.SetNumZeroed(Probes.Num());
+        for (const int32 i : Order)
+        {
+            After[i] = Gen->GetDensityAt((float)Probes[i].X, (float)Probes[i].Y, (float)Probes[i].Z);
+        }
+        int32 Impure = 0;
+        for (const int32 i : Order)
+        {
+            const float Again = Gen->GetDensityAt((float)Probes[i].X, (float)Probes[i].Y, (float)Probes[i].Z);
+            if (!BitEqual(Again, After[i])) { ++Impure; }
+        }
+        TestEqual(TEXT("the world is still order-independent after a live edit"), Impure, 0);
+    }
+
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
