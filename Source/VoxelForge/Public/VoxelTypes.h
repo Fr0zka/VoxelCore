@@ -29,6 +29,29 @@ constexpr int32 CHUNK_VOLUME       = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 32
 constexpr float VOXEL_SIZE = 25.0f;
 
 //=============================================================================
+// TRIVIAL-TILE CLASSIFICATION (T1.d)
+//=============================================================================
+// Verdict de ClassifyTile pour une tuile AVANT le pré-échantillonnage 33³+ :
+// AllSolid / AllAir garantissent que CHAQUE point du treillis du mesher (marge
+// ±1 incluse) est du même côté de l'iso ⇒ maillage vide, GenerateMesh est
+// sautée. Mixed = "je ne peux pas le prouver" ⇒ génération normale. Un faux
+// Mixed coûte juste du CPU ; un faux AllSolid/AllAir ferait un TROU — les
+// verdicts ne sont donc émis que sur des bornes exactes (colonnes surface
+// échantillonnées au MÊME treillis que le mesher) + gardes conservatives sur
+// tout ce qui peut creuser/remplir (spine, passages, disturbances, diff layer).
+//
+// Vit ici plutôt que dans VoxelGenerator.h pour que VoxelDensityOp.h (le contrat
+// de la pile d'opérateurs) puisse s'en servir sans tirer un header UCLASS.
+// Lives here rather than in VoxelGenerator.h so VoxelDensityOp.h (the operator-stack
+// contract) can use it without pulling in a UCLASS header.
+enum class EVoxelTileClass : uint8
+{
+    Mixed,      // peut contenir une surface → mesher normalement
+    AllSolid,   // chaque échantillon prouvé solide → maillage vide
+    AllAir,     // chaque échantillon prouvé air   → maillage vide
+};
+
+//=============================================================================
 // DENSITY → R8 QUANTIZATION (density clipmap / mini-sun shadows)
 //=============================================================================
 //

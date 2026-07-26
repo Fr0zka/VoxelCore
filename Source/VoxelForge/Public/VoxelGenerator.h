@@ -50,23 +50,9 @@ namespace VoxelGenLOD
     FORCEINLINE int32 Eff(int32 Octaves) { return FMath::Max(1, Octaves - OctaveBias); }
 }
 
-//=============================================================================
-// TRIVIAL-TILE CLASSIFICATION (T1.d)
-//=============================================================================
-// Verdict de ClassifyTile pour une tuile AVANT le pré-échantillonnage 33³+ :
-// AllSolid / AllAir garantissent que CHAQUE point du treillis du mesher (marge
-// ±1 incluse) est du même côté de l'iso ⇒ maillage vide, GenerateMesh est
-// sautée. Mixed = "je ne peux pas le prouver" ⇒ génération normale. Un faux
-// Mixed coûte juste du CPU ; un faux AllSolid/AllAir ferait un TROU — les
-// verdicts ne sont donc émis que sur des bornes exactes (colonnes surface
-// échantillonnées au MÊME treillis que le mesher) + gardes conservatives sur
-// tout ce qui peut creuser/remplir (spine, passages, disturbances, diff layer).
-enum class EVoxelTileClass : uint8
-{
-    Mixed,      // peut contenir une surface → mesher normalement
-    AllSolid,   // chaque échantillon prouvé solide → maillage vide
-    AllAir,     // chaque échantillon prouvé air   → maillage vide
-};
+// NOTE: EVoxelTileClass (le verdict T1.d) a déménagé dans VoxelTypes.h — inclus ci-dessus —
+// pour que VoxelDensityOp.h puisse le partager sans dépendre d'un header UCLASS.
+// EVoxelTileClass (the T1.d verdict) moved to VoxelTypes.h, included above.
 
 /**
  * UVoxelGenerator
