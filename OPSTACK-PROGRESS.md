@@ -1382,3 +1382,50 @@ keeping a raw pointer; and the two newly-public generator methods.
 `GSurfColCache`. `§C1` still open.
 
 ---
+
+## 2026-07-27 — SurfaceWorld WIRED (no biomes yet). And a perf trap caught before it shipped.
+
+All six checks green, **9399 samples deliberately inside the overhang window** — the op was genuinely
+exercised rather than skipped.
+
+### ⚠️ The one-entry column memo would have been a disaster, not a slowdown
+
+`FSurfaceColumnSource`'s memo held a single entry. That is correct **only if the caller walks a whole
+Z column before changing XY** — and the mesher promises nothing of the sort. If it iterates X first
+within a Z slice, *every* voxel misses and the full height stack re-runs per voxel, **including the
+cliff's four structural resamples**. On the most expensive archetype in the plugin that is an order
+of magnitude, not a few percent.
+
+It would also have been invisible in the tests: they sample random XY, where a one-entry memo and a
+256-entry one behave identically. **The tests could not have caught this; only reading the access
+pattern could.**
+
+Replaced with a **direct-mapped 256-entry table**, `thread_local`, hashed on the XY bit patterns,
+with the **full key compared on hit** — a collision can only cost a recompute, never return the
+wrong column. Robust to any iteration order the mesher chooses.
+
+### Wired, with the biome guard in one place
+
+`UsesOperatorStackForChunk` now returns true for `SurfaceWorld` **only when the strate has no
+biomes**. The original evaluates the dominant biome and interpolates the *heights* toward the
+neighbour across the border band; the stack evaluates one param set. Without the `Mask` combiner a
+biome strate would not shift subtly — it would get **a hard seam at every biome border**.
+
+The guard lives in `UsesOperatorStackForChunk`, beside the archetype list, so "can this strate take
+the stack?" stays one question asked in one place. `GetDensityAt` carries a second, defensive check
+on `CP_BiomeCtx.IsValid()`: if the two ever disagree it falls back to the `switch`, because an
+unported world is recoverable and a wrong one is not.
+
+**UNVERIFIED:** not compiled. Likely spots: the `FSlot` struct + `thread_local` array inside a const
+method; `return S.C` (the previous `return C` referred to a name now scoped inside the `if`); the
+new `SurfaceWorld` case in `GetDensityAt`'s op-stack switch.
+
+**What to try in the editor after the build:** tick `bUseOperatorStack` on a **biome-less**
+SurfaceWorld strate and compare. Both paths compute the same function, so this is a wiring check,
+not a look change — expect it identical. **A biome strate will silently ignore the flag**, by design.
+
+**Next single action:** build, then the visual A/B. After that the remaining SurfaceWorld work is
+the `Mask` combiner (biome blending, §5's Phase 3 prototype) and integrating `GSurfColCache` so the
+stack path reuses the existing box cache rather than only its own table. `§C1` still open.
+
+---

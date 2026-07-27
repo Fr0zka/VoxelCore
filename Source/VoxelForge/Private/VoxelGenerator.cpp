@@ -578,6 +578,26 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     VoxelDensityOps::BuildSlabStack(CP_OpStack, CP_Slab, Seed,
                                                     OriginSpineRadius, StrateManager);
                     break;
+
+                case ECaveGeneratorType::SurfaceWorld:
+                    // Même garde dégénérée que les autres, et une SECONDE garde : la pile ne sait
+                    // pas encore mélanger les biomes. `UsesOperatorStackForChunk` refuse déjà les
+                    // strates à biomes, mais un `CP_BiomeCtx` valide ici voudrait dire que les deux
+                    // sources d'information se contredisent — auquel cas on retombe sur le `switch`,
+                    // parce qu'un monde non porté est récupérable et un monde faux ne l'est pas.
+                    // A valid biome context here would mean the two sources of truth disagree; fall
+                    // back rather than generate a world with seams at every biome border.
+                    if (CP_Surface.StrateTopWorldZ - CP_Surface.StrateBottomWorldZ <= 0.0f
+                        || CP_BiomeCtx.IsValid())
+                    {
+                        CP_UseOpStack = false;
+                        break;
+                    }
+                    OpCtx.StrateTopWorldZ    = CP_Surface.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Surface.StrateBottomWorldZ;
+                    VoxelDensityOps::BuildSurfaceStack(CP_OpStack, CP_Surface, Seed,
+                                                       OriginSpineRadius, StrateManager);
+                    break;
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`

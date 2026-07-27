@@ -449,13 +449,31 @@ namespace
 
         const FColumn& GetColumn(float WorldX, float WorldY) const
         {
-            thread_local FColumn C{};
-            thread_local uint64  CachedId = 0;
-            thread_local float   CachedX = FLT_MAX, CachedY = FLT_MAX;
+            // ⚠️ POURQUOI UNE TABLE ET PAS UNE SEULE ENTRÉE. Un mémo à une entrée n'est correct que
+            // si l'appelant descend une colonne Z avant de changer de XY. Le mesher n'en promet
+            // RIEN — s'il itère X en premier dans une tranche Z, chaque voxel raterait et on
+            // relancerait toute la pile de hauteur par voxel, cliff compris (4 resamples
+            // structurels). Ce n'est pas « un peu plus lent », c'est un ordre de grandeur sur
+            // l'archétype le plus cher du plugin.
+            //
+            // Table à correspondance directe, 256 entrées, clé COMPLÈTE comparée sur touche : une
+            // collision ne peut que coûter un recalcul, jamais rendre une mauvaise colonne.
+            //
+            // A single-entry memo is only correct-by-luck: it assumes the caller walks a Z column
+            // before changing XY, which the mesher does not promise. Direct-mapped 256-entry table
+            // with the FULL key compared on hit — a collision costs a recompute, never a wrong column.
+            struct FSlot { uint64 Id; float X, Y; FColumn C; };
+            thread_local FSlot Slots[256] = {};
 
-            if (CachedId != InstanceId || CachedX != WorldX || CachedY != WorldY)
+            const uint32 HX = *reinterpret_cast<const uint32*>(&WorldX);
+            const uint32 HY = *reinterpret_cast<const uint32*>(&WorldY);
+            const uint32 Idx = (HX * 0x9E3779B9u ^ HY * 0x85EBCA6Bu) >> 24;   // [0,255]
+
+            FSlot& S = Slots[Idx];
+            if (S.Id != InstanceId || S.X != WorldX || S.Y != WorldY)
             {
-                CachedId = InstanceId;  CachedX = WorldX;  CachedY = WorldY;
+                S.Id = InstanceId;  S.X = WorldX;  S.Y = WorldY;
+                FColumn& C = S.C;
 
                 C.TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
                 C.CeilSurf = CeilingStack.EvalHeight(WorldX, WorldY);
@@ -482,7 +500,7 @@ namespace
                     if (Slope > KINDA_SMALL_NUMBER) { C.DirX = GX / Slope; C.DirY = GY / Slope; }
                 }
             }
-            return C;
+            return S.C;
         }
 
         /** Le champ structurel nu — l'overhang s'en sert pour emprunter la roche amont. */
