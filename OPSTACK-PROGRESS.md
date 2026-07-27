@@ -680,3 +680,50 @@ scaffolding, and **resume Phase 1 step 3** — the port is proven correct (SDF e
 the final rounding differs, 0 isosurface crossings).
 
 ---
+
+## 2026-07-27 — hypothesis 5 dead too. One unambiguous check left, then I stop chasing.
+
+```
+CONST-Blend   ==  verbatim      : 4874 / 5000
+CONST-Blend   !=  runtime-Blend : 0
+```
+
+`Blend`'s constness is **not** the variable: the const and runtime carve forms are bit-identical to
+each other, and both miss the verbatim on the same 126. Five hypotheses, five dead.
+
+**Worse, one of the numbers I reasoned from was circular.** `FORCENOINLINE == operator stack :
+5000/5000` cannot fail by construction — it feeds `S.Sdf` to a carve and compares against the density
+the stack computed *from that same `S.Sdf`*. It measures nothing. I read it as corroboration.
+
+The two carve bodies have now been dumped from the file and diffed: **character-identical, same
+translation unit.** So of the three things I keep calling identical — expression, TU, input — one is
+false, and the counters cannot say which, because the SDF comparison only ran *inside* the mismatch
+branch.
+
+**The unambiguous check added:** feed my carve the SDF the verbatim reports using, compare to the
+verbatim's own output, and count `S.Sdf != VerbSdf` **directly, with no enclosing condition**.
+
+- `Recon == Ver` everywhere **and** SDFs equal everywhere ⇒ same function, same input, different
+  output ⇒ the difference is a measurement artefact, not a code one.
+- SDFs differ ⇒ they were never equal outside the mismatch set, the earlier counter was misleading,
+  and the fault is back in the lattice after all.
+
+### Proportion check — this is the last build I would spend on it
+
+**The port is already verified on every axis that affects the game:** SDF bit-exact on 126/126, the
+lattice/hashes/`Capsule` exactly right, **0 isosurface crossings out of 20000**, geometry identical,
+window-invariant across threads, and every box verdict survives brute force. The open question is why
+the *final rounding* differs by 1-2 ULP — and no decision anywhere in this project turns on the
+answer.
+
+**So: if this check doesn't resolve it, accept and move to Phase 1 step 3.** An unexplained
+deterministic difference deserves real effort — it is a real bug often enough to be worth six builds —
+but not unbounded effort when every consequence of it is already measured and benign.
+
+**UNVERIFIED:** the check.
+
+**Next single action:** rebuild, read `UNAMBIGUOUS DISCRIMINATOR`. Then either fix or accept, and in
+both cases correct `OPSTACK-PLAN §2.6` / `AUDIT §C9` / the test's INFO text, strip the diagnostic
+scaffolding, and resume step 3.
+
+---

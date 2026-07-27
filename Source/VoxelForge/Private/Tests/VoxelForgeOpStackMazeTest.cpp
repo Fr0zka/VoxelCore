@@ -454,6 +454,7 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             // ── L'expérience décisive : inline vs FORCENOINLINE, même unité, même source. ──
             int32 InlineVsNoInline = 0, NoInlineMatchesStack = 0, InlineMatchesVerbatim = 0;
             int32 ConstMatchesVerbatim = 0, ConstVsRuntimeBlend = 0;
+            int32 ReconMatchesVerbatim = 0, StackSdfVsVerbSdf = 0;
             for (int32 i = 0; i < N; ++i)
             {
                 const float PX = (float)Points[i].X, PY = (float)Points[i].Y, PZ = (float)Points[i].Z;
@@ -461,8 +462,21 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                 const float Inl = -CarveInlined(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
                 const float Noi = -CarveNoInline(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
                 const float Cst = -CarveConstBlend(S.Sdf, Core.BaseDensity, Core.BaseDensity);
-                const float Ver = MazeCoreVerbatim(PX, PY, PZ, Core, World.Settings->Seed);
+                float VSdf = 0.0f;
+                const float Ver = MazeCoreVerbatim(PX, PY, PZ, Core, World.Settings->Seed, &VSdf);
                 const float Stk = -S.Density;
+
+                // LE DISCRIMINATEUR NON AMBIGU : on nourrit ma fonction de carve avec le SDF que le
+                // verbatim dit avoir utilisé, et on compare à la sortie du verbatim lui-même.
+                //   Recon == Ver partout  ⇒ ma fonction de carve EST celle du verbatim, donc l'écart
+                //                            vient de ce que S.Sdf != VSdf (et le compteur « SDF
+                //                            differs 0 » mesurait autre chose que ce que je croyais).
+                //   Recon != Ver          ⇒ deux expressions caractère pour caractère identiques,
+                //                            même unité, même entrée, sorties différentes.
+                // Et on compte directement S.Sdf vs VSdf, sans passer par une condition.
+                const float Recon = -CarveConstBlend(VSdf, Core.BaseDensity, Core.BaseDensity);
+                if (BitEqual(Recon, Ver))  { ++ReconMatchesVerbatim; }
+                if (!BitEqual(S.Sdf, VSdf)) { ++StackSdfVsVerbSdf; }
                 if (!BitEqual(Inl, Noi)) { ++InlineVsNoInline; }
                 if (BitEqual(Noi, Stk))  { ++NoInlineMatchesStack; }
                 if (BitEqual(Inl, Ver))  { ++InlineMatchesVerbatim; }
@@ -477,6 +491,13 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                 TEXT("    runtime-Blend ==  verbatim              : %d / %d\n")
                 TEXT("    CONST-Blend   ==  verbatim              : %d / %d   <-- the tell\n")
                 TEXT("    CONST-Blend   !=  runtime-Blend         : %d\n")
+                TEXT("  UNAMBIGUOUS DISCRIMINATOR (feed my carve the SDF the verbatim says it used):\n")
+                TEXT("    my carve(verbatim's own SDF) == verbatim : %d / %d\n")
+                TEXT("    stack SDF  !=  verbatim SDF              : %d      (counted directly, no condition)\n")
+                TEXT("  If the first is %d/%d and the second is 0, then the two carves ARE the same\n")
+                TEXT("  function on the same input and the difference is impossible -- which would mean\n")
+                TEXT("  a measurement error, not a code one. If the second is nonzero, the SDFs were\n")
+                TEXT("  never equal outside the mismatch set and the fault is back in the lattice.\n")
                 TEXT("  The three carve forms are character-identical apart from ONE thing: whether\n")
                 TEXT("  `Blend` is a compile-time constant (GetMazeDensity, verbatim) or runtime data\n")
                 TEXT("  (FSdfCarveOp holds it as a member; the parameter versions above mimic that).\n")
@@ -487,7 +508,8 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                 TEXT("  are DATA by design, so they can never be compile-time constants again. Nothing\n")
                 TEXT("  to fix in the port -- this is the true, permanent floor for every archetype."),
                 N, InlineVsNoInline, NoInlineMatchesStack, N,
-                InlineMatchesVerbatim, N, ConstMatchesVerbatim, N, ConstVsRuntimeBlend));
+                InlineMatchesVerbatim, N, ConstMatchesVerbatim, N, ConstVsRuntimeBlend,
+                ReconMatchesVerbatim, N, StackSdfVsVerbSdf, N, N));
         }
 
         MutableGen->OriginSpineRadius = SavedSpine;
