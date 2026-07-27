@@ -33,6 +33,8 @@
 
 #include "VoxelForgeTestFixture.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelTerrainOpDefinition.h"   // pits/chimneys n'existent QUE via un op par salle
+#include "VoxelCaveMorphology.h"        // FChunkSDFCache — le contrôle 3b regarde la cuisson
 
 #include <atomic>
 
@@ -71,28 +73,83 @@ namespace
     }
 
     /**
-     * Pits et cheminées sont à 0 par défaut — or ce sont précisément les deux boucles que `§2`
-     * annonçait comme « le plus retors de toute la décomposition » (coordonnées NON warpées
-     * mélangées au SDF warpé). Les laisser au repos testerait tout sauf le morceau difficile.
+     * ⚠️ DENSIFIÉ après le premier run vert. Aux défauts (`RoomSpacing = 80`, `RoomDensity = 0.35`)
+     * le premier passage a rendu **65 échantillons en grotte sur 6000, soit 1,1 %** : bit-identique,
+     * oui, mais en comparant surtout du roc plein à du roc plein, là où le carve et les vers ne
+     * s'exécutent même pas. Le compteur avait été écrit exactement pour dire ça, et il l'a dit ;
+     * l'avertissement, lui, ne se déclenchait qu'à ZÉRO. Les deux sont corrigés. → 21 %.
      *
-     * ⚠️ ET ON DENSIFIE LE RÉSEAU, corrigé après le premier run vert. Aux défauts
-     * (`RoomSpacing = 80`, `RoomDensity = 0.35`) le premier passage a rendu **65 échantillons en
-     * grotte sur 6000, soit 1,1 %** : bit-identique, oui, mais en comparant surtout du roc plein à
-     * du roc plein, là où le carve, les pits, les cheminées et les vers ne s'exécutent même pas.
-     * Le compteur avait été écrit exactement pour dire ça, et il l'a dit ; l'avertissement, lui, ne
-     * se déclenchait qu'à ZÉRO — trop tard pour être utile. Les deux sont corrigés ici.
+     * ⚠️⚠️ CE QUI N'EST **PAS** ICI : `PitDensity` et `ChimneyDensity`. Les y mettre était une
+     * ERREUR, et le contrôle 3b l'a attrapée (0 point sur 1500 bougeait en les remettant à zéro).
+     * `BuildChunkCache` ouvre sa cuisson par `if (!CR.RoomOp) continue;` puis lit `OpParams`, un
+     * `FStrateGenerationParams` NEUF sur lequel seul l'op de la salle a été appliqué. **Les champs
+     * pit/cheminée/colonne de la strate ne sont donc jamais lus** — ces primitives n'existent QUE
+     * via un `UVoxelTerrainOpDefinition` tiré par salle. (Ils n'ont pas d'`UPROPERTY` sur
+     * `FStrateGenerationParams`, donc ce n'est pas un piège d'éditeur : c'est un struct de transport,
+     * pas un réglage. Rien à corriger côté produit — c'était ma lecture qui était fausse.)
      *
-     * Densified after the first green run: 65 of 6000 samples in open cave (1.1%) means the port was
-     * mostly compared solid-rock-to-solid-rock. The counter said so; the warning threshold (only at
-     * zero) did not. Both fixed.
+     * NOT here: PitDensity / ChimneyDensity. Setting them was a mistake that check 3b caught — the
+     * bake reads a FRESH param struct with only the room's op applied, so those fields are never
+     * read. Pits exist only through a per-room terrain-op asset. See MakeShaftOpPool below.
      */
     void EnableTunnelFeatures(FStrateGenerationParams& P)
     {
         P.RoomSpacing     = 42.0f;   // 80 → 42 : des salles à portée de chaque chunk échantillonné
         P.RoomDensity     = 0.85f;   // 0.35 → 0.85
-        P.PitDensity      = 0.55f;
-        P.ChimneyDensity  = 0.55f;
         P.VerticalScale   = 1.35f;   // ≠ 1 ⇒ le Z « effectif » diverge du Z monde partout
+    }
+
+    /**
+     * Le SEUL moyen d'obtenir des pits et des cheminées : donner à la strate un pool d'ops de
+     * terrain, que `BuildChunkCache` tire par salle. Deux entrées à `Probability = 0.5` ⇒ le pool
+     * est entièrement réclamé, donc **chaque salle reçoit un op** (moitié pits, moitié cheminées).
+     *
+     * ⚠️ SÛR POUR L'ÉTAPE A, et ce n'est pas une évidence : l'override par salle du chemin d'origine
+     * applique l'op de la salle sur une COPIE des params, laquelle pilote les 13 modificateurs de
+     * détail — ceux que l'étape A n'a pas portés. Mais `ApplyTo` n'écrit, pour `Pit`, que les quatre
+     * champs de pit (idem `Chimney`). Aucun champ de détail n'est touché, donc aucun modificateur ne
+     * s'allume et l'équivalence de l'étape A tient. Un op `Terrace` ici la casserait — c'est
+     * exactement ce que l'étape B ajoutera, exprès.
+     *
+     * Safe at stage A because ApplyTo(Pit) writes only the four pit fields: no detail modifier wakes
+     * up. A Terrace op here WOULD break stage A — which is precisely what stage B will add.
+     *
+     * @param OutKeepAlive  les assets transitoires, à garder vivants pour la durée du test.
+     */
+    void MakeShaftOpPool(UVoxelStrateDefinition* Def,
+                         TArray<TStrongObjectPtr<UVoxelTerrainOpDefinition>>& OutKeepAlive)
+    {
+        UVoxelTerrainOpDefinition* PitOp = NewObject<UVoxelTerrainOpDefinition>(
+            GetTransientPackage(), NAME_None, RF_Transient);
+        PitOp->Type          = EVoxelTerrainOpType::Pit;
+        PitOp->PitDensity    = 0.9f;    // par salle, pas par cellule de hash : on en veut vraiment
+        PitOp->PitMinRadius  = 5.0f;
+        PitOp->PitMaxRadius  = 11.0f;
+        PitOp->PitDepth      = 22.0f;
+        OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(PitOp));
+
+        UVoxelTerrainOpDefinition* ChimOp = NewObject<UVoxelTerrainOpDefinition>(
+            GetTransientPackage(), NAME_None, RF_Transient);
+        ChimOp->Type             = EVoxelTerrainOpType::Chimney;
+        ChimOp->ChimneyDensity   = 0.9f;
+        ChimOp->ChimneyMinRadius = 3.0f;
+        ChimOp->ChimneyMaxRadius = 6.0f;
+        ChimOp->ChimneyHeight    = 18.0f;
+        OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(ChimOp));
+
+        FStrateTerrainOpEntry PitEntry;
+        PitEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(PitOp);
+        PitEntry.Weight      = 1.0f;
+        PitEntry.Probability = 0.5f;
+
+        FStrateTerrainOpEntry ChimEntry;
+        ChimEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(ChimOp);
+        ChimEntry.Weight      = 1.0f;
+        ChimEntry.Probability = 0.5f;
+
+        Def->TerrainOperations.Reset();
+        Def->TerrainOperations.Add(PitEntry);
+        Def->TerrainOperations.Add(ChimEntry);
     }
 
     /** Fraction minimale d'échantillons devant tomber en grotte ouverte pour que l'équivalence
@@ -113,6 +170,23 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     }
 
     const UVoxelGenerator* Gen = World.Generator.Get();
+
+    // ⚠️ AVANT LA MOINDRE ÉVALUATION. Le pool d'ops est lu au moment où `BuildChunkCache` construit
+    // le cache ; le muter après coup laisserait un cache `thread_local` déjà chaud, bâti sans pits,
+    // et les deux chemins ne seraient plus comparables. On le pose donc pendant que rien n'est chaud.
+    TArray<TStrongObjectPtr<UVoxelTerrainOpDefinition>> OpAssets;
+    if (World.Definitions.IsValidIndex(FTestWorld::SlotTunnelNetwork)
+        && World.Definitions[FTestWorld::SlotTunnelNetwork].IsValid())
+    {
+        MakeShaftOpPool(World.Definitions[FTestWorld::SlotTunnelNetwork].Get(), OpAssets);
+    }
+    else
+    {
+        AddError(TEXT("The fixture has no definition object for the TunnelNetwork slot, so no ")
+                 TEXT("terrain-op pool could be attached -- pits and chimneys would silently not ")
+                 TEXT("exist and check 3b would report zero for the wrong reason."));
+        return false;
+    }
 
     int32 TopVoxelZ = 0, BottomVoxelZ = 0;
     if (!World.GetSlotVoxelZRange(FTestWorld::SlotTunnelNetwork, TopVoxelZ, BottomVoxelZ))
@@ -211,9 +285,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("TunnelNetwork STAGE A: bit-identical across %d samples in %d chunks (%d in open ")
             TEXT("cave, %d in rock, away from the seal bands). Exercised: vertical scale (1.35, so ")
             TEXT("effective Z differs from world Z everywhere), cave warp, the room/tunnel SDF via ")
-            TEXT("the SHARED BuildChunkCache, pits and chimneys at UNWARPED coords, the carve with ")
-            TEXT("its floored divisor, and the worm carve with its network mask. NOT covered: the ")
-            TEXT("13 detail modifiers, the per-room op override, and any tile verdict."),
+            TEXT("the SHARED BuildChunkCache, the carve with its floored divisor, and the worm carve ")
+            TEXT("with its network mask. Pits and chimneys are covered only if the bake-coverage ")
+            TEXT("line below reports non-zero -- this message used to claim them outright, and was ")
+            TEXT("wrong for a whole run. NOT covered at all: the 13 detail modifiers, the per-room ")
+            TEXT("op override, and any tile verdict."),
             NumTunnelSamples, NumTunnelChunks, NumInCave, NumInRock));
 
         AddInfo(FString::Printf(
@@ -385,54 +461,71 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // activer dans les params ne prouve pas qu'elles ont changé quoi que ce soit — un test peut très
     // bien être vert avec `SDFCache.Pits` vide.
     //
-    // On le MESURE : la même pile avec `PitDensity = ChimneyDensity = 0`, et on compte les points où
-    // la densité bouge. Zéro ⇒ les deux boucles n'ont rien fait et le morceau difficile n'est pas
-    // couvert, quelle que soit la couleur du test.
+    // ⚠️ ON INTERROGE LA CUISSON, PAS LA DENSITÉ — et le premier essai a échoué exactement là.
+    // La v1 de ce contrôle reconstruisait la pile avec `PitDensity = ChimneyDensity = 0` et comptait
+    // les points qui bougent : **0 sur 1500**. Cause : ces champs-là ne sont jamais lus. La v2 par
+    // « pile sans pits » ne marche pas non plus, pour une raison plus subtile — le pool d'ops n'est
+    // PAS dans la clé du cache SDF (en production c'est `LayoutVersion` qui couvre son édition), donc
+    // deux piles ne différant que par le pool se serviraient le même cache `thread_local`.
     //
-    // Enabling a feature in the params is not evidence it fired. This measures it.
+    // On demande donc directement à `BuildChunkCache` ce qu'elle a cuit. C'est la structure dont la
+    // vacuité était la cause suspectée : autant la regarder plutôt que d'en inférer l'existence
+    // depuis une densité. Aucun risque de clé, aucun ordre à respecter.
+    //
+    // Ask the bake what it baked, instead of inferring it from a density: the suspected cause was an
+    // empty SDFCache.Pits, and that is a structure this test can simply look at. (v1 zeroed params
+    // nothing reads; a "stack without pits" would share the thread_local cache, since the op pool is
+    // not in its key — LayoutVersion covers pool edits in production.)
     {
-        FStrateGenerationParams PNoShafts = P;
-        PNoShafts.PitDensity     = 0.0f;
-        PNoShafts.ChimneyDensity = 0.0f;
-
-        FVoxelOpStack StackNoShafts;
-        VoxelDensityOps::BuildTunnelNetworkStack(StackNoShafts, PNoShafts, World.Settings->Seed,
-                                                 Gen->OriginSpineRadius, World.StrateManager.Get());
-        StackNoShafts.PrepareChunk(Ctx);
-
-        const int32 Probe = FMath::Min(1500, NumTunnelSamples);
-
-        // Deux passes SOLO (pas d'alternance) : on ne teste pas une clé de cache ici, seulement une
-        // contribution — et alterner ferait reconstruire le cache SDF à chaque point pour rien.
-        TArray<float> WithShafts;
-        WithShafts.SetNumUninitialized(Probe);
-        for (int32 i = 0; i < Probe; ++i)
+        int32 StrateIdx = 0;
         {
-            WithShafts[i] = Stack.EvalMC((float)Points[i].X, (float)Points[i].Y, (float)Points[i].Z);
+            const int32 QZ = FMath::FloorToInt((float)((TopVoxelZ + BottomVoxelZ) / 2) / (float)CHUNK_SIZE);
+            StrateIdx = World.StrateManager->GetStrateIndex(
+                ((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
         }
 
-        int32 NumMoved = 0;
-        for (int32 i = 0; i < Probe; ++i)
+        const UVoxelStrateDefinition* Def = World.Definitions[FTestWorld::SlotTunnelNetwork].Get();
+
+        int32 TotalPits = 0, TotalChimneys = 0, TotalRooms = 0, TotalColumns = 0;
+        for (int32 c = 0; c < 6; ++c)
         {
-            const float V = StackNoShafts.EvalMC((float)Points[i].X, (float)Points[i].Y,
-                                                 (float)Points[i].Z);
-            if (!BitEqual(V, WithShafts[i])) { ++NumMoved; }
+            const float Expansion = P.CaveWarpStrength + 2.0f;
+            const float MinX = (c - 3) * (float)CHUNK_SIZE - Expansion;
+            const float MinY = (c - 3) * (float)CHUNK_SIZE - Expansion;
+
+            FChunkSDFCache ProbeCache;
+            VoxelCaveMorphology::BuildChunkCache(
+                ProbeCache, MinX, MinY, MinX + CHUNK_SIZE + 2.0f * Expansion,
+                MinY + CHUNK_SIZE + 2.0f * Expansion,
+                P, (uint32)World.Settings->Seed, StrateIdx, &Def->TerrainOperations);
+
+            TotalRooms     += ProbeCache.Rooms.Num();
+            TotalPits      += ProbeCache.Pits.Num();
+            TotalChimneys  += ProbeCache.Chimneys.Num();
+            TotalColumns   += ProbeCache.Columns.Num();
         }
 
         AddInfo(FString::Printf(
-            TEXT("Pit/chimney contribution: %d of %d probe points move when PitDensity and ")
-            TEXT("ChimneyDensity are zeroed. These are the two loops OPSTACK-DECOMPOSITION 2 calls ")
-            TEXT("the fiddliest thing in the decomposition (unwarped coords SmoothMin'd into the ")
-            TEXT("warped room SDF), so this number is the difference between covering them and ")
-            TEXT("merely having switched them on."),
-            NumMoved, Probe));
+            TEXT("Bake coverage over 6 search boxes: %d rooms, %d pits, %d chimneys, %d columns. ")
+            TEXT("Pits and chimneys are the two loops OPSTACK-DECOMPOSITION 2 calls the fiddliest ")
+            TEXT("thing in the decomposition (unwarped coords SmoothMin'd into the warped room SDF); ")
+            TEXT("a zero here means the 6000-sample equivalence above says NOTHING about them, ")
+            TEXT("whatever colour it reports."),
+            TotalRooms, TotalPits, TotalChimneys, TotalColumns));
 
-        if (NumMoved == 0)
+        TestTrue(TEXT("the bake produced rooms at all"), TotalRooms > 0);
+        TestTrue(TEXT("the bake produced pits, so the pit loop has data to run on"), TotalPits > 0);
+        TestTrue(TEXT("the bake produced chimneys, so the chimney loop has data to run on"),
+                 TotalChimneys > 0);
+
+        if (TotalColumns > 0)
         {
-            AddWarning(TEXT("Zeroing PitDensity and ChimneyDensity changed nothing, so those two ")
-                       TEXT("loops never contributed a single voxel and the equivalence says ")
-                       TEXT("NOTHING about them. Most likely BuildChunkCache baked no pits at this ")
-                       TEXT("RoomSpacing/strate height -- check SDFCache.Pits, not the params."));
+            AddError(FString::Printf(
+                TEXT("The bake produced %d columns, but stage A has NOT ported the column loop ")
+                TEXT("(STEP 4d). The equivalence above should have failed; if it did not, the ")
+                TEXT("sample points simply missed every column. Remove the column op from the pool ")
+                TEXT("until stage B."),
+                TotalColumns));
         }
     }
 

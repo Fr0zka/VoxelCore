@@ -2046,3 +2046,63 @@ the tens of percent, a fingerprint check in the double digits, and a non-zero pi
 Then stage B — the 13 detail modifiers.
 
 ---
+
+## 2026-07-28 — the coverage fixes landed, and check 3b caught a real gap on its first run.
+
+```
+Cave coverage        : 21.0 %      (was 1.1 %)   ✅
+Params-fingerprint   : 383/400 = 95.8 % differ   (was 0.75 %)   ✅
+Equivalence          : bit-identical, 6000 samples, 1259 in open cave   ✅
+Box verdicts         : 0 proved, 40 Mixed        (asserted)
+Pit/chimney          : 0 of 1500 points move     ❌ ← the new check, earning its keep immediately
+```
+
+### Pits and chimneys never ran, and the params said they would
+
+`BuildChunkCache` bakes them inside `if (!CR.RoomOp) continue;`, then reads **`OpParams`** — a
+*fresh* `FStrateGenerationParams` with only that room's terrain op applied. So
+`FStrateGenerationParams::PitDensity`, which the test set to 0.55, **is never read by the bake at
+all**. Pits, chimneys and columns exist *only* through a `UVoxelTerrainOpDefinition` rolled per room,
+and the fixture's definitions have an empty `TerrainOperations`. Zero pits, every run.
+
+**Not a product bug, and worth stating so I don't "fix" it later:** those fields carry no `UPROPERTY`
+on `FStrateGenerationParams`. It is a transport struct written by `ApplyTo`, not a settings surface —
+nothing in the editor offers Jahni a `PitDensity` that quietly does nothing. My reading was wrong,
+not the code.
+
+**Consequence for stage C:** the per-room op override is not an optional refinement. It is the *only*
+path by which pits, chimneys and columns exist at all.
+
+### The fix took three attempts, and the second one was the instructive failure
+
+1. ~~Zero `PitDensity` on the params~~ — the fields nothing reads.
+2. ~~Build a second stack with an empty op pool and diff the densities~~ — **would have silently
+   lied.** The op pool is *not* in the SDF cache key (in production `LayoutVersion` covers pool
+   edits, which is why the original gets away with it), so two stacks differing only by the pool
+   would share the same `thread_local` cache and produce identical output — reported as "pits
+   contribute nothing", for the second time, for a third reason.
+3. **Ask the bake what it baked.** The suspected cause was an empty `SDFCache.Pits`; that is a
+   structure the test can simply *look at*. `BuildChunkCache` over six search boxes, then assert
+   rooms > 0, pits > 0, chimneys > 0. No cache key involved, no ordering to respect, and it fails
+   for exactly one reason.
+
+The test now attaches a real two-entry op pool (Pit 0.5 / Chimney 0.5, so every room draws one).
+**Safe at stage A on a non-obvious ground:** the per-room override applies the op to a copy of the
+params that drives the 13 unported detail modifiers — but `ApplyTo(Pit)` writes only the four pit
+fields, so no modifier wakes. A `Terrace` op there *would* break stage A, which is precisely what
+stage B will add. There is also a guard that errors out if the bake ever produces **columns**, since
+stage A has not ported `STEP 4d`.
+
+### And a message that lied for a whole run
+
+The green equivalence line said *"Exercised: … pits and chimneys at UNWARPED coords"*. It was false —
+zero pits existed. A success message that asserts coverage instead of reporting it is the same
+failure as a guard that only trips at zero: it reads as evidence while measuring nothing. Reworded to
+point at the bake-coverage number rather than claim the coverage.
+
+**UNVERIFIED:** test file only; operators untouched and already proven bit-identical.
+
+**Next single action:** re-run. Expect non-zero pits and chimneys, zero columns, and the equivalence
+still bit-identical — *that* run is the one where stage A is genuinely covered. Then stage B.
+
+---
