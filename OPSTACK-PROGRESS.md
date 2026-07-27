@@ -164,3 +164,14 @@ fixture's `TSoftObjectPtr` → transient-`UVoxelStrateDefinition` resolve has ne
 `OPSTACK-DECOMPOSITION.md §11`, then port Maze. Do not write more plugin C++ before the build.
 
 ---
+
+## 2026-07-27 — correction to the 3rd entry above
+
+The entry *"starting Phase 0.5"* says the `ClassifyTile` test **self-skips** if the fixture's
+`TSoftObjectPtr` resolve fails headless. That was the plan; it is **not** what was written. All four
+tests call `AddError(World.WhyInvalid())` and FAIL, with a message that says explicitly it is a
+fixture failure and not a density bug. Failing is the right behaviour — a skip that reads as a pass
+is exactly what hides bugs — but the earlier entry describes code that does not exist, so it is
+corrected here rather than edited (this log is append-only).
+
+---
