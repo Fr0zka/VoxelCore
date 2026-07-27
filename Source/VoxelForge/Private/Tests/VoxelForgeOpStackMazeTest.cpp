@@ -128,8 +128,34 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
     }
 
     // ── L'ÉQUIVALENCE. ──
+    //
+    // ⚠️ CE QUE « ÉQUIVALENT » PEUT VOULOIR DIRE ICI — conclusion mesurée, 2026-07-27.
+    // Le plugin est compilé en **/fp:fast** : c'est le défaut d'UnrealBuildTool sur Windows
+    // (`VCToolChain.cs` : `case FPSemanticsMode.Default: // Default is imprecise FP semantics`),
+    // et la doc de UBT le dit noir sur blanc : « FP math isn't IEEE-754 compliant: the compiler is
+    // allowed to transform math expressions in ways that might result in differently rounded
+    // results ». Le compilateur a donc le DROIT de réassocier/contracter la MÊME expression
+    // différemment selon l'unité de compilation et le contexte d'inlining.
+    //
+    // Donc : deux transcriptions littérales du même calcul, l'une dans VoxelGenerator.cpp et
+    // l'autre dans VoxelDensityOpStack.cpp, peuvent légitimement différer de ~1 ULP.
+    // **L'identité binaire n'est PAS atteignable en principe pour ces portages**, et ce n'est pas
+    // un défaut de la décomposition. C'est mesuré, pas supposé : le bisect ci-dessous a montré
+    // l'écart survivant jusqu'à « corridors + carve ONLY », c'est-à-dire du code identique
+    // caractère pour caractère.
+    //
+    // Le critère d'acceptation est donc celui que OPSTACK-PLAN §2.6 demandait déjà :
+    //   • DUR   : aucun échantillon ne change de CÔTÉ de l'isosurface (sinon la géométrie bouge) ;
+    //   • SOUPLE: les écarts restent à l'échelle de l'ULP. Un écart plus grand n'est PAS du bruit
+    //             de compilateur — c'est une vraie dérive de portage, et là il faut chercher.
+    //
+    // The plugin builds with /fp:fast (UBT's Windows default), which explicitly licenses the
+    // compiler to reassociate identical source differently per translation unit. Bit-identity is
+    // therefore NOT achievable in principle for these ports. Hard gate: no isosurface crossings.
+    // Soft gate: differences stay at ULP scale — anything larger is real drift, not compiler noise.
     int32 NumDiff = 0, WorstIdx = -1;
     float WorstDelta = 0.0f;
+    int32 NumBeyondUlpNoise = 0;       // écarts TROP GRANDS pour être du bruit de compilateur
     int32 NumSolidDisagreements = 0;   // le seul écart qui compte VRAIMENT : un côté d'iso différent
     for (int32 i = 0; i < NumMazeSamples; ++i)
     {
@@ -143,6 +169,12 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             ++NumDiff;
             const float Delta = FMath::Abs(Old - New);
             if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
+
+            // Tolérance : quelques ULP à la magnitude locale. `Blend - Sdf` amplifie fortement un
+            // écart d'ULP sur le SDF quand on est au bord de la zone de blend (annulation
+            // catastrophique), d'où une marge généreuse — mais bornée.
+            const float UlpNoise = 16.0f * FMath::Max(FMath::Abs(Old), 1.0f) * FLT_EPSILON;
+            if (Delta > UlpNoise) { ++NumBeyondUlpNoise; }
         }
         // Le mesher ne lit que le SIGNE (D >= IsoLevel ⇒ air). Deux valeurs peuvent différer d'un
         // ULP sans changer un seul triangle ; un désaccord de CÔTÉ change la géométrie.
@@ -157,17 +189,35 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             TEXT("GetMazeDensity exactly, which is as strong a signal as Phase 1 can get that the ")
             TEXT("source/modifier split is real and not imposed."), NumMazeSamples));
     }
+    else if (NumBeyondUlpNoise == 0)
+    {
+        // Attendu, et compris. Pas un avertissement : crier au loup à chaque portage ferait
+        // ignorer le jour où l'écart est réel.
+        AddInfo(FString::Printf(
+            TEXT("%d of %d samples differ, ALL at ULP scale (largest |delta| %.9g at (%.0f, %.0f, ")
+            TEXT("%.0f)), and 0 cross the isosurface -- so not one triangle would move. This is the ")
+            TEXT("expected floor: the plugin builds with /fp:fast (UnrealBuildTool's Windows ")
+            TEXT("default -- VCToolChain.cs, \"Default is imprecise FP semantics\"), which lets the ")
+            TEXT("compiler reassociate identical source differently per translation unit. The ")
+            TEXT("bisect below confirmed it empirically: the residue survives into \"corridors + ")
+            TEXT("carve ONLY\", which is character-for-character transcribed code. Bit-identity is ")
+            TEXT("not achievable in principle here; OPSTACK-PLAN 2.6's bar (same PLACE, not same ")
+            TEXT("bits) is the right one and it is met."),
+            NumDiff, NumMazeSamples, WorstDelta,
+            WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
+            WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
+            WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f));
+    }
     else
     {
         AddWarning(FString::Printf(
-            TEXT("%d of %d samples differ (largest |delta| %.9g at (%.0f, %.0f, %.0f)); %d of them ")
-            TEXT("land on the OPPOSITE side of the isosurface. OPSTACK-PLAN section 2.6 does not ")
-            TEXT("require bit-identity, so this is a warning, not a failure -- but Maze SHOULD be ")
-            TEXT("reproducible exactly, so a nonzero count means the port drifted somewhere. Check, ")
-            TEXT("in order: the roughness apply-window (R + SurfaceRoughness + 2), the carve blend ")
-            TEXT("(2.0), the noise frequency (0.12) and octave count (3), and the order of the ")
-            TEXT("structural post ops."),
-            NumDiff, NumMazeSamples, WorstDelta,
+            TEXT("%d of %d samples differ and %d of them are TOO LARGE to be /fp:fast rounding ")
+            TEXT("noise (largest |delta| %.9g at (%.0f, %.0f, %.0f)); %d cross the isosurface. ")
+            TEXT("Unlike the ULP-scale floor, this IS port drift. Check, in order: the roughness ")
+            TEXT("apply-window (R + SurfaceRoughness + 2), the carve blend (2.0), the noise ")
+            TEXT("frequency (0.12) and octave count (3), and the order of the structural post ops. ")
+            TEXT("The bisect below narrows it to a stage."),
+            NumDiff, NumMazeSamples, NumBeyondUlpNoise, WorstDelta,
             WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
             WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
             WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,

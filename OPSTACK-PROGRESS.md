@@ -352,3 +352,62 @@ conclusion worth having explicitly rather than re-deriving per port.
 wire the stack into `GetDensityAt` behind a per-strate opt-in.
 
 ---
+
+## 2026-07-27 (afternoon) — the residue is the COMPILER. Measured, not guessed.
+
+**Bisect result:**
+
+```
+roughness off                  ->  151 / 5000 differ (max |delta| 1.907e-06)
+roughness + seal off           ->  155 / 5000 differ (max |delta| 9.537e-07)
+roughness + seal + spine off   ->  126 / 5000 differ (max |delta| 9.537e-07)
+corridors + carve ONLY         ->  126 / 5000 differ (max |delta| 9.537e-07)
+```
+
+The residue survives every stage removal, down to **constant rock + capsule SDF + carve** — code
+that is a character-for-character transcription. So it is not in anything the decomposition added.
+
+**Cause, from the engine source rather than from memory** (`VCToolChain.cs`):
+
+```csharp
+case FPSemanticsMode.Default: // Default is imprecise FP semantics.
+case FPSemanticsMode.Imprecise: Arguments.Add("/fp:fast"); break;
+```
+
+UBT's own doc for that mode: *"FP math isn't IEEE-754 compliant: the compiler is allowed to transform
+math expressions in ways that might result in differently rounded results."* The plugin sets no
+override, so identical source in `VoxelGenerator.cpp` and `VoxelDensityOpStack.cpp` may legitimately
+reassociate differently — worth about 1 ULP.
+
+Two prior hypotheses were wrong (the `FVector` round-trip, then "check the roughness window / carve
+blend"). The bisect cost one build and settled it. **Noted as a working lesson: on a numeric
+discrepancy, bisect before hypothesising a third time.**
+
+**Why exactly ~2.3% of samples:** `Blend - Sdf` catastrophically cancels at the edge of the blend
+shell, amplifying a 1-ULP SDF difference into a 1-ULP density difference. Outside that thin shell
+`Carve` is exactly 0 or exactly 1 and both paths agree bit for bit.
+
+### Consequences recorded
+
+1. **`OPSTACK-PLAN §2.6`** — bit-identity is not achievable in principle for these ports, at any
+   level of care. The operational bar for every remaining archetype, now encoded in the test:
+   **hard-fail on isosurface crossings · tolerate ULP-scale deltas · warn on anything larger**
+   (that last one is real port drift, and the test no longer cries wolf about the floor).
+2. **`AUDIT-2026-07.md §C9` (new)** — the part that matters more than the port: `ARCHITECTURE §9.1`'s
+   multiplayer model is "replicate the seed, every peer regenerates identically", and under
+   `/fp:fast` that holds **only between bit-identical binaries**. Same build, same platform: fine
+   (`DensityPurity` proves it). Windows client + Linux dedicated server both regenerating
+   authoritative geometry: a real desync source, presenting as rare unreproducible geometry-only
+   divergence. The knob is `FPSemantics = FPSemanticsMode.Precise` in `VoxelForge.Build.cs`, and
+   **it should not be turned speculatively** — it blocks the vectorisation T2.a was chasing, on the
+   plugin's hot loop, for an unmeasured cost. Decision needs a profile and a confirmed
+   cross-platform requirement.
+
+**UNVERIFIED:** the test's new ULP-tolerance branch (expect `MazeEquivalence` to report the same 454
+samples as INFO rather than WARNING next run).
+
+**Next single action:** Phase 1 step 3 — wire the stack into `GetDensityAt` behind a per-strate
+opt-in. Phase 1's question is fully answered: Maze decomposes cleanly, the stack is
+window-invariant, and it proves 23/60 tiles uniform where `ClassifyTile` proves zero.
+
+---
