@@ -411,3 +411,43 @@ opt-in. Phase 1's question is fully answered: Maze decomposes cleanly, the stack
 window-invariant, and it proves 23/60 tiles uniform where `ClassifyTile` proves zero.
 
 ---
+
+## 2026-07-27 — /fp:fast hypothesis DEAD. Third wrong guess. Switching to instrumentation.
+
+**Jahni built with `FPSemantics = FPSemanticsMode.Precise` and got a BYTE-IDENTICAL result:** same
+454 samples, same `1.90734863e-06`, same `(-23, 55, -660)`. A different float model producing
+identical output is not "the same rounding error twice" — it is proof that **rounding is not the
+cause at all.** The residue is a real, deterministic LOGIC difference somewhere in a transcription I
+have read three times and believe to be identical.
+
+**Track record on this one discrepancy, recorded because the pattern matters more than the bug:**
+
+| # | Hypothesis | Killed by |
+|---|---|---|
+| 1 | `FVector` float→double→float round-trip | re-run returned the identical result |
+| 2 | "check the roughness window / carve blend / octave count" | the bisect: residue survives to `corridors + carve ONLY` |
+| 3 | `/fp:fast` cross-TU reassociation | `/fp:precise` build returned the identical result |
+
+Three hypotheses, all plausible, all reasoned from *what could explain it* rather than from
+measurement. Each cost a build cycle. **The lesson is not "be smarter", it is "instrument earlier":**
+the bisect (measurement) produced more information in one run than two hypotheses did in three.
+
+**Corrected in the docs:** `AUDIT-2026-07.md §C9` and `OPSTACK-PLAN §2.6` both assert the `/fp:fast`
+story as the explanation for the residue. **That specific claim is now falsified and must be walked
+back** — see the next entry. (The *separate* C9 finding, that UBT's FP default differs by toolchain
+and the MP model assumes bit-reproducible terrain, still stands on its own: it was read out of
+`VCToolChain.cs` / `ClangToolChain.cs`, not inferred from this test.)
+
+**What changed in code:** `FVoxelOpStack::EvalSample` now exposes the full `FVoxelOpSample`, and
+`MazeEquivalence` dumps the worst point in raw hex — both densities, the stack's internal SDF, and
+the carve factor reconstructed from each side. That last one localises the divergence: identical
+recovered carve with differing density ⇒ the fault is after the conversion; differing carve ⇒ it is
+in the SDF (lattice edges or `VoxelSDF::Capsule`) or in `SmoothStep01`.
+
+**UNVERIFIED:** the instrumentation itself.
+
+**Next single action:** re-run `MazeEquivalence` and read the WORST-POINT DUMP. Phase 1 step 3
+(wiring the stack into `GetDensityAt`) is deliberately **paused** until this is understood — it is a
+small unexplained numeric difference, and those do not get smaller when you build on them.
+
+---

@@ -84,9 +84,18 @@ public:
      */
     float EvalInternal(float WorldX, float WorldY, float WorldZ) const
     {
+        return EvalSample(WorldX, WorldY, WorldZ).Density;
+    }
+
+    /** L'état COMPLET (densité + SDF) après toute la pile. Diagnostic : quand une comparaison
+     *  avec l'ancien chemin diverge, c'est le canal SDF qui dit si l'écart naît avant ou après
+     *  la conversion. / The full state after the stack — the SDF channel is what says whether a
+     *  divergence is born before or after the carve. */
+    FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
+    {
         FVoxelOpSample S;
         for (const TUniquePtr<IVoxelDensityOp>& Op : Ops) { Op->Eval(WorldX, WorldY, WorldZ, S); }
-        return S.Density;
+        return S;
     }
 
     /** Le même, négaté pour le mesher (négatif = solide). */

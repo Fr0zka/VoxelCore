@@ -181,6 +181,56 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
         if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSolidDisagreements; }
     }
 
+    //=========================================================================
+    // INSTRUMENTATION — pas une hypothèse de plus.
+    //=========================================================================
+    // Trois hypothèses ont déjà échoué sur ces 454 échantillons : (1) l'aller-retour FVector
+    // float→double, (2) « vérifie la fenêtre de rugosité / le blend », (3) /fp:fast. La troisième
+    // est morte quand un build en **/fp:precise** a rendu EXACTEMENT le même résultat — même
+    // compte, même delta, même coordonnée. Un modèle flottant différent qui produit une sortie
+    // identique au bit près, ce n'est pas « la même erreur d'arrondi » : c'est la preuve que
+    // l'arrondi n'y est pour rien.
+    //
+    // Donc on arrête de raisonner et on IMPRIME. Au pire point : les bits bruts des deux densités,
+    // le SDF interne de la pile, et le Carve implicite reconstruit depuis chaque densité. Le canal
+    // SDF tranche la question qui compte — l'écart naît-il AVANT la conversion (donc dans les
+    // capsules / le treillis) ou APRÈS (dans l'arithmétique du carve) ?
+    //
+    // Three hypotheses have already died on these 454 samples, the last when an /fp:precise build
+    // returned a byte-identical result — a different float model producing identical output is
+    // proof that rounding is not the cause. So: print, don't reason. The SDF channel settles the
+    // question that matters — is the divergence born before the carve (lattice/capsule) or after?
+    if (NumDiff > 0 && WorstIdx >= 0)
+    {
+        const float X = (float)Points[WorstIdx].X, Y = (float)Points[WorstIdx].Y, Z = (float)Points[WorstIdx].Z;
+        const float Old = Gen->GetMazeDensity(X, Y, Z, MazeParams);
+        const FVoxelOpSample S = Stack.EvalSample(X, Y, Z);
+        const float New = -S.Density;
+
+        // Carve reconstruit : MC = -Base + Carve·Base·2  ⇒  Carve = (MC + Base) / (2·Base).
+        // Si les deux Carve sont identiques mais les densités non, l'écart est APRÈS le carve.
+        // Si les Carve diffèrent, il est dans le SDF ou dans le smoothstep.
+        const float Base = MazeParams.BaseDensity;
+        const float CarveOld = (Base > 0.0f) ? (Old + Base) / (2.0f * Base) : 0.0f;
+        const float CarveNew = (Base > 0.0f) ? (New + Base) / (2.0f * Base) : 0.0f;
+
+        auto Bits = [](float V) { return *reinterpret_cast<const uint32*>(&V); };
+
+        AddInfo(FString::Printf(
+            TEXT("WORST-POINT DUMP at (%.0f, %.0f, %.0f) — raw bits, so a 1-ULP story is checkable ")
+            TEXT("rather than assertable:\n")
+            TEXT("    GetMazeDensity  = %.9g  [0x%08X]\n")
+            TEXT("    stack EvalMC    = %.9g  [0x%08X]\n")
+            TEXT("    stack SDF       = %.9g  [0x%08X]   (BaseDensity %.9g, carve blend 2.0)\n")
+            TEXT("    carve recovered : old %.9g  vs  new %.9g\n")
+            TEXT("  READ IT LIKE THIS: identical recovered carve + differing density ⇒ the divergence ")
+            TEXT("is AFTER the conversion, in the carve arithmetic. Differing carve ⇒ it is in the SDF ")
+            TEXT("(lattice edges or VoxelSDF::Capsule) or in SmoothStep01. Either way it is a LOGIC ")
+            TEXT("difference, because the /fp:precise run reproduced this byte for byte."),
+            X, Y, Z,
+            Old, Bits(Old), New, Bits(New), S.Sdf, Bits(S.Sdf), Base, CarveOld, CarveNew));
+    }
+
     if (NumDiff == 0)
     {
         AddInfo(FString::Printf(
