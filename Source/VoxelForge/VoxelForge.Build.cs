@@ -54,6 +54,8 @@ public class VoxelForge : ModuleRules
 		// it — never to revert FPSemantics, which is now load-bearing for cross-platform play.
 		// Headers fixed on 2026-07-27: VoxelBiomeDefinition, VoxelSettings, VoxelStrateDefinition,
 		// VoxelStrateTypes, VoxelContentManager, VoxelAtmosphereManager, VoxelDensityVolume.
+		// Plus VoxelWorld.cpp (GameFramework/Pawn.h) — the .cpp files needed auditing too, not just
+		// the public headers. That was the whole residual tail: one site, found in one build.
 		// Expect a residual tail: the shared PCH hid these for years and only a build enumerates
 		// them all. VoxelDensityVolume's was the nasty one — ENABLE_DRAW_DEBUG is used in an #if,
 		// and an undefined macro there is silently 0 rather than an error.

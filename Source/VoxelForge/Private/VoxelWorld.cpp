@@ -11,6 +11,14 @@
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelContentManager.h"
 #include "VoxelDensityVolume.h"
+// IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
+// APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
+// complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
+// qu'on est en train de retirer.
+// GetPlayerPosition dereferences the pawn, so APawn must be COMPLETE — Casts.h only forward-declares
+// it. APlayerController was complete transitively only; include it explicitly.
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Kismet/KismetMaterialLibrary.h"

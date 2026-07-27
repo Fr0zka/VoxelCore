@@ -1190,3 +1190,20 @@ exact-lattice `ClassifyTile` bound must both survive the port. `§C1` (bounded s
 open and still wants doing before too many more archetypes copy it.
 
 ---
+
+## 2026-07-27 — the IWYU tail was exactly one site.
+
+`VoxelWorld.cpp:526` — `PC->GetPawn()->GetActorLocation()` needs **`APawn` complete**, and `Casts.h`
+only forward-declares it. Added `GameFramework/Pawn.h`, plus `GameFramework/PlayerController.h`
+which was only complete *transitively* — the same fragility this whole change exists to remove.
+
+**My scan missed it because I only audited `Public/`.** The shared PCH served `.cpp` files too, and
+`APawn` was named in `Build.cs`'s original error list — I read that list and still scanned only the
+headers. Everything else in the module compiled, so this is the whole tail: one site, one build.
+
+**UNVERIFIED:** the fix.
+
+**Next single action:** rebuild. Then watch the perf number — `/fp:precise` on a noise-heavy hot
+path, checked against `ARCHITECTURE §8.10`. Then back to the opstack: `SurfaceWorld` (§5).
+
+---
