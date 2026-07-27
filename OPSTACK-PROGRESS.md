@@ -631,3 +631,52 @@ translation unit, once `FORCEINLINE` and once `FORCENOINLINE`.
 inputs are proven bit-identical, so only the evaluation can differ.
 
 ---
+
+## 2026-07-27 — the variable is COMPILE-TIME CONSTANT vs RUNTIME DATA. One line left to confirm.
+
+**The inlining experiment partitioned the measurements perfectly, just not the way it was framed:**
+
+```
+inlined carve  !=  FORCENOINLINE carve : 0          <-- inlining is NOT the variable
+FORCENOINLINE  ==  operator stack      : 5000/5000  <-- test-TU carve == other-TU op, ALWAYS
+inlined        ==  verbatim            : 4874/5000  <-- 126 differ, IN THE SAME TU
+```
+
+The test-TU carve matches the operator stack **in a different TU** perfectly, yet disagrees with the
+verbatim **in its own TU**. So neither the TU boundary nor inlining is the variable. Sorting the five
+implementations by the one remaining difference:
+
+| Implementation | `Blend` is | Group |
+|---|---|---|
+| `GetMazeDensity` (A) | `const float Blend = 2.0f` | **compile-time constant** |
+| `MazeCoreVerbatim` (C) | `const float Blend = 2.0f` | **compile-time constant** |
+| `FSdfCarveOp` (B) | a class member | **runtime data** |
+| `CarveInlined` | a parameter | **runtime data** |
+| `CarveNoInline` | a parameter | **runtime data** |
+
+A == C. B == CarveInlined == CarveNoInline. The two groups differ. **Every single observation from
+today fits that split, and nothing else does.**
+
+**Mechanism:** under `/fp:fast`, folding `Blend * 2.0f` to the literal `4.0f` at compile time enables
+a contraction in `SmoothStep01`'s `3.0f - 2.0f*x` — one rounding instead of two — that the runtime
+form cannot get. ~1 ULP.
+
+**Why this matters far beyond the bug:** an operator's parameters are **data by design** — that is
+the entire point of the refactor. They can never go back to being compile-time literals. So this
+ULP-level difference is **inherent and permanent** for every archetype port, and no amount of care in
+transcription will remove it. That is the real, precise reason bit-identity is unachievable here —
+not the vague `/fp:fast` hand-wave I put in the docs earlier, which happened to name the right
+compiler flag for the wrong reason.
+
+**Confirming line added:** `CarveConstBlend` — identical to `CarveInlined` except `Blend` is a
+compile-time constant. Predicted: matches the verbatim 5000/5000, differs from the runtime form on
+exactly 126.
+
+**UNVERIFIED:** that prediction.
+
+**Next single action:** rebuild, read `CARVE VARIABLE ISOLATION`. If it lands as predicted: correct
+`OPSTACK-PLAN §2.6`, `AUDIT §C9` and the test's INFO text with the real reason, delete the diagnostic
+scaffolding, and **resume Phase 1 step 3** — the port is proven correct (SDF exact on 126/126, only
+the final rounding differs, 0 isosurface crossings).
+
+---

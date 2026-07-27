@@ -169,6 +169,35 @@ namespace
         return InDensity - Carve * Base * 2.0f;
     }
 
+    /**
+     * LA DERNIÈRE VARIABLE. Identique à `CarveInlined` à UNE chose près : `Blend` est ici une
+     * CONSTANTE DE COMPILATION, comme dans `GetMazeDensity` et dans la copie verbatim — au lieu
+     * d'être une donnée d'exécution comme dans `FSdfCarveOp` (un membre) ou `CarveInlined` (un
+     * paramètre).
+     *
+     * L'expérience d'inlining a partitionné les mesures exactement ainsi :
+     *   A (GetMazeDensity)  == C (verbatim)      → tous deux Blend CONSTANT
+     *   B (FSdfCarveOp)     == CarveInlined == CarveNoInline → tous trois Blend À L'EXÉCUTION
+     * et les deux groupes diffèrent. Sous /fp:fast, replier `Blend * 2.0f` en `4.0f` à la
+     * compilation autorise une contraction que la forme à l'exécution n'obtient pas.
+     *
+     * Si cette fonction colle au verbatim 5000/5000 ET diffère de `CarveInlined` sur 126, la cause
+     * est établie sans ambiguïté — et elle est INHÉRENTE à la pile d'opérateurs, dont les
+     * paramètres sont par construction des données et non des littéraux.
+     *
+     * The last variable: identical to CarveInlined except Blend is a COMPILE-TIME CONSTANT. If this
+     * matches the verbatim 5000/5000 and differs from CarveInlined on 126, the cause is settled —
+     * and it is INHERENT to the op stack, whose parameters are data by design.
+     */
+    FORCEINLINE float CarveConstBlend(float Sdf, float Base, float InDensity)
+    {
+        const float Blend = 2.0f;
+        if (Sdf >= Blend) { return InDensity; }
+        float Carve = FMath::Clamp((Blend - Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
+        Carve = SmoothStep01(Carve);
+        return InDensity - Carve * Base * 2.0f;
+    }
+
     /** Les params Maze de la strate Maze de la fixture, bornes Z de runtime comprises. */
     bool ResolveMazeParams(const VoxelForgeTest::FTestWorld& World, FMazeGenerationParams& Out,
                            int32& OutTopVoxelZ, int32& OutBottomVoxelZ)
@@ -424,34 +453,41 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
 
             // ── L'expérience décisive : inline vs FORCENOINLINE, même unité, même source. ──
             int32 InlineVsNoInline = 0, NoInlineMatchesStack = 0, InlineMatchesVerbatim = 0;
+            int32 ConstMatchesVerbatim = 0, ConstVsRuntimeBlend = 0;
             for (int32 i = 0; i < N; ++i)
             {
                 const float PX = (float)Points[i].X, PY = (float)Points[i].Y, PZ = (float)Points[i].Z;
                 const FVoxelOpSample S = CoreStack.EvalSample(PX, PY, PZ);
                 const float Inl = -CarveInlined(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
                 const float Noi = -CarveNoInline(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
+                const float Cst = -CarveConstBlend(S.Sdf, Core.BaseDensity, Core.BaseDensity);
                 const float Ver = MazeCoreVerbatim(PX, PY, PZ, Core, World.Settings->Seed);
                 const float Stk = -S.Density;
                 if (!BitEqual(Inl, Noi)) { ++InlineVsNoInline; }
                 if (BitEqual(Noi, Stk))  { ++NoInlineMatchesStack; }
                 if (BitEqual(Inl, Ver))  { ++InlineMatchesVerbatim; }
+                if (BitEqual(Cst, Ver))  { ++ConstMatchesVerbatim; }
+                if (!BitEqual(Cst, Inl)) { ++ConstVsRuntimeBlend; }
             }
 
             AddInfo(FString::Printf(
-                TEXT("INLINING EXPERIMENT (%d samples, same TU, same source, only inlining differs):\n")
-                TEXT("    inlined carve  !=  FORCENOINLINE carve : %d\n")
-                TEXT("    FORCENOINLINE  ==  operator stack      : %d / %d\n")
-                TEXT("    inlined        ==  verbatim            : %d / %d\n")
-                TEXT("  IF the first number is nonzero, the cause is FLOATING-POINT CONTRACTION under\n")
-                TEXT("  /fp:fast, not a logic error: SmoothStep01 is x*x*(3-2x), and 3.0f - 2.0f*x is\n")
-                TEXT("  exactly the shape MSVC fuses into an FMA (one rounding instead of two, ~1 ULP).\n")
-                TEXT("  A and C are straight-line inlined code; the operator stack goes through a\n")
-                TEXT("  VIRTUAL call, so FSdfCarveOp::Eval is compiled out-of-line and gets a different\n")
-                TEXT("  contraction decision. The earlier three-way tested the TU boundary, which is the\n")
-                TEXT("  WRONG VARIABLE -- this tests the right one.\n")
-                TEXT("  IF the first number is zero, contraction is NOT it and the operator stack has a\n")
-                TEXT("  real logic bug that survives every reading so far."),
-                N, InlineVsNoInline, NoInlineMatchesStack, N, InlineMatchesVerbatim, N));
+                TEXT("CARVE VARIABLE ISOLATION (%d samples, ALL in this one translation unit):\n")
+                TEXT("    inlined      !=  FORCENOINLINE          : %d      (inlining is not the variable)\n")
+                TEXT("    FORCENOINLINE ==  operator stack        : %d / %d\n")
+                TEXT("    runtime-Blend ==  verbatim              : %d / %d\n")
+                TEXT("    CONST-Blend   ==  verbatim              : %d / %d   <-- the tell\n")
+                TEXT("    CONST-Blend   !=  runtime-Blend         : %d\n")
+                TEXT("  The three carve forms are character-identical apart from ONE thing: whether\n")
+                TEXT("  `Blend` is a compile-time constant (GetMazeDensity, verbatim) or runtime data\n")
+                TEXT("  (FSdfCarveOp holds it as a member; the parameter versions above mimic that).\n")
+                TEXT("  If CONST matches the verbatim and differs from runtime, the cause is settled:\n")
+                TEXT("  under /fp:fast, folding `Blend * 2.0f` to 4.0f at compile time enables a\n")
+                TEXT("  contraction in SmoothStep01's `3.0f - 2.0f*x` that the runtime form cannot get.\n")
+                TEXT("  That is ~1 ULP, and it is INHERENT to the operator stack: an op's parameters\n")
+                TEXT("  are DATA by design, so they can never be compile-time constants again. Nothing\n")
+                TEXT("  to fix in the port -- this is the true, permanent floor for every archetype."),
+                N, InlineVsNoInline, NoInlineMatchesStack, N,
+                InlineMatchesVerbatim, N, ConstMatchesVerbatim, N, ConstVsRuntimeBlend));
         }
 
         MutableGen->OriginSpineRadius = SavedSpine;
