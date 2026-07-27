@@ -275,7 +275,6 @@ namespace
     private:
         FSurfaceGenerationParams P;
     };
-}
 
     //=========================================================================
     // SOURCE — LE CIEL / SKY CAP  (c'est une ALTITUDE, donc c'est un op de hauteur)
@@ -351,6 +350,7 @@ namespace
         float SeedF;
     };
 }
+
 
 //=============================================================================
 // FABRIQUES / FACTORIES
