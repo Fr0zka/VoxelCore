@@ -8,8 +8,26 @@
 // sans contorsion, le SDF est reproduit BIT POUR BIT, et aucun échantillon ne change de côté de
 // l'isosurface.
 //
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// ✅ MISE À JOUR 2026-07-27 : LE PLANCHER ULP N'EXISTE PLUS. C'ÉTAIT `/fp:fast`.
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// `FPSemantics = Precise` sur le module (AUDIT §C9, posé pour le cross-play Linux/Windows) fait
+// passer ce test à **BIT-IDENTIQUE**. La section ci-dessous décrit un état RÉVOLU ; elle est gardée
+// parce qu'elle explique pourquoi les cinq expériences d'isolation avaient toutes échoué (sous
+// `/fp:fast` le compilateur transforme selon le CONTEXTE — il n'y avait aucune variable à isoler)
+// et parce qu'elle dit quoi regarder si la bit-identité régresse un jour.
+//
+// **Conséquence pratique : ce test est maintenant un instrument BEAUCOUP plus fin.** Le moindre
+// écart est désormais une vraie trouvaille, pas du bruit à noter. La machinerie de gradation ULP
+// est conservée exprès — c'est elle qui signalerait une régression du modèle flottant.
+//
+// UPDATE: the ULP floor is GONE — FPSemantics = Precise makes this test bit-identical. The section
+// below describes a past state, kept because it explains why five isolation experiments all failed
+// (under /fp:fast the compiler transforms by CONTEXT — there was no variable to isolate) and what to
+// look at if bit-identity ever regresses.
+//
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// ⚠️ LE PLANCHER ULP — lire ceci avant de « corriger » un écart résiduel
+// ⚠️ LE PLANCHER ULP (HISTORIQUE) — lire ceci avant de « corriger » un écart résiduel
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // La pile reproduit `GetMazeDensity` à ~1-2 ULP près sur ~2 % des échantillons (ceux qui tombent
 // dans la coquille de blend du SDF, où `Blend - Sdf` annule catastrophiquement et amplifie le

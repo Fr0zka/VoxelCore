@@ -140,6 +140,26 @@ inherent (AUDIT §C10). The acceptance bar is visual (OPSTACK-PLAN §2.6).
 | `VoxelDensityOps::BuildSlabStack` | — | 5 ops, **no branch on archetype**: FlatPlain and CrystalChamber differ only in defaults, exactly as `GetSlabDensity` already had it. 8 archetypes → 7. |
 | `VoxelDensityOps::BuildMazeStack` | — | The 7-op Maze stack. If this ever becomes one op, the refactor failed its own test (§2.5). Callers must skip it on a **degenerate strate** (top−bottom ≤ 0): `GetMazeDensity` early-outs to air there and the stack has no such early-out by design — `GetDensityAt` falls back to the `switch`. |
 
+### 3.2e Height-space operators — `Public/VoxelHeightOp.h` + `Private/VoxelHeightOpStack.cpp`
+⚠️ **Feeds nothing yet** — built and exercised only by `VoxelForge.OpStack.SurfaceHeightEquivalence`.
+**A SECOND op family, and it exists for a reason worth knowing:** SurfaceWorld's terrain ops (cliff /
+terrace / layer lines / beach) read and write an **altitude**, not a density. They have no input Z
+(they produce one), are XY-pure (once per column, not per voxel), and touch neither density nor SDF —
+so they do not fit `IVoxelDensityOp` at all. Forcing them in would need a per-voxel channel for what
+is a **column** property, or one opaque op (`OPSTACK-PLAN §2.5`'s failure mode). Same lesson as
+`§0.1` one step further: some things are not another channel, they are another **space**.
+
+| Symbol | Notes |
+|--------|-------|
+| `FVoxelHeightSample` | Two channels: `Height` (voxel Z) + `Relief` (the original's `M`). Relief is produced by the structural source and consumed by the terrace gate — threading it beats resampling it. |
+| `IVoxelHeightOp` | `Eval(X, Y, FVoxelHeightSample&)`. No `IsXYPure` (XY-purity is structural here — there is no Z to wrongly put in), no `PrepareChunk` (already per-column). `MaxDisplacement()` is the conservative vertical bound for a future heightfield `ClassifyBox`. |
+| `FVoxelHeightStack` | Move-only, like `FVoxelOpStack`. `EvalHeight` / `EvalSample` / `MaxTotalDisplacement`. |
+| `VoxelHeightOps::MakeStructuralHeightSource` | Continents + mountains + detail under a warp frame. Hands back a **non-owning pointer** so the cliff mod can resample it. |
+| `VoxelHeightOps::MakeCliffHeightMod` | Slope-gated steepening; 4 resamples of the **structural** field (never the modified height — that would feed back). |
+| `VoxelHeightOps::MakeTerraceHeightMod` | Relief-gated plateaus. The `* Relief` is the original's `* M`. |
+| `VoxelHeightOps::MakeLayerLineHeightMod` / `MakeBeachHeightMod` | Sine bands; flatten toward the water line. Both have exact `MaxDisplacement`. |
+| `VoxelHeightOps::BuildSurfaceHeightStack` | 5 ops in `ComputeSurfaceTerrainZ`'s order — structural → cliff → terrace → layer lines → beach. **Order is not negotiable.** |
+
 ### 3.3 Chunk identity
 `VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
 redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
@@ -380,6 +400,8 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.Determinism.ClassifyTileSoundness` | Scans for a non-`Mixed` verdict, then brute-forces the exact mesher lattice (`g ∈ [-1, Cells+1]`). **A false verdict is an invisible, collisionless hole** — T1.d v1 was reverted for exactly this. Errors out rather than passing if it found nothing to check. |
 | `VoxelForgeDiffLayerTest.cpp` | `VoxelForge.Determinism.DiffLayerContention` | N readers running the worker call mix while the game thread writes and `Clear()`s. Survival + monotonic `ModsVersion`. |
 | `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.OpStack.BoxVerdictFold` | Pure-logic walk of the fold in `VoxelDensityOp.h`, case by case — including the seal-forces-AllSolid case that justifies `ClassifyBox` existing. Also the only `.cpp` that includes the op header, so the build actually sees it. |
+| `VoxelForgeHeightStackTest.cpp` | `VoxelForge.OpStack.SurfaceHeightEquivalence` | The height-space stack vs `ComputeSurfaceTerrainZ`, in **altitudes**. Runs twice: defaults, then **all F20 terrain ops ON** — the load-bearing pass, since the ops are off by default and the defaults pass exercises only the structural source. Also brute-forces `MaxDisplacement` (a false bound would be a hole). Bar is bit-identity; a height delta is a visibly different world, not rounding. |
+| `VoxelForgeCrossPlatformTest.cpp` | `VoxelForge.Determinism.CrossPlatformDigest` | SHAPE digest (sign of density = the world) + FIELD digest (bit-for-bit) over a fixed integer grid, plus `NearIso` bounding how many samples could flip sign. Reports rather than asserts until pinned. Run on Windows and Linux and compare. |
 | `VoxelForgeOpStackSlabTest.cpp` | `VoxelForge.OpStack.SlabEquivalence` | **Phase 2's first port.** The same 5-op slab stack vs `GetSlabDensity` over 20k points, run twice — FlatPlain **and** CrystalChamber — which is what demonstrates the two archetypes really are one op. Plus window-invariance and box-verdict brute force. Compares against the reference **as it is now** (post Z-term removal), so green = pure refactor and any visual delta is attributable to §3.1 alone. |
 | `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
 

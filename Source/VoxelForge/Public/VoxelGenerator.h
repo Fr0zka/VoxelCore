@@ -178,6 +178,17 @@ public:
     float SampleRelief(float WorldX, float WorldY, float Frequency, float Contrast) const;
 
     /**
+     * La chaîne de hauteur complète de SurfaceWorld : structural → cliff → terrace → layer lines →
+     * plage. Rend une ALTITUDE monde en voxels, pas une densité.
+     *
+     * PUBLIQUE pour la même raison que `GetSlabDensity` / `GetMazeDensity` : permettre un test
+     * isolé. C'est la référence de `VoxelForge.OpStack.SurfaceHeightEquivalence`, qui compare la
+     * pile d'opérateurs de hauteur (`VoxelHeightOp.h`) à cette fonction point par point.
+     * Public so the height-op stack can be measured against it — same reason as GetSlabDensity.
+     */
+    float ComputeSurfaceTerrainZ(float WorldX, float WorldY, const FSurfaceGenerationParams& Params) const;
+
+    /**
      * Moisture field at a world XY → [0,1]. The second climate axis for biome placement.
      */
     float SampleMoisture(float WorldX, float WorldY, float Frequency) const;
@@ -267,9 +278,9 @@ private:
     /** Pick the biome (index into Ctx.Biomes) for a Voronoi site, by its climate. */
     int32 ClassifyBiomeAtSite(float SiteX, float SiteY, const FBiomeContext& Ctx, uint32 SiteHash) const;
 
-    /** The SurfaceWorld heightfield: world XY → terrain surface Z (voxel coords). Pure
-     *  per-XY; the part that's evaluated per biome and blended in GetSurfaceDensity. */
-    float ComputeSurfaceTerrainZ(float WorldX, float WorldY, const FSurfaceGenerationParams& Params) const;
+    // ComputeSurfaceTerrainZ a été DÉPLACÉE en `public` (voir plus haut) pour que
+    // VoxelForge.OpStack.SurfaceHeightEquivalence puisse s'y comparer. Une seule déclaration.
+    // Moved to public above so the height-stack test can compare against it. One declaration only.
 
     /** F20 — the RAW structural heightfield (continents + mountains + detail), BEFORE any
      *  terrain op (cliff/terrace/layer-lines/beach). Ops in ComputeSurfaceTerrainZ build on

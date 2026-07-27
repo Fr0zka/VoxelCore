@@ -5,8 +5,10 @@
 // CE QUE CE TEST DOIT PROUVER / WHAT THIS TEST HAS TO PROVE
 // Trois choses, et la troisième est la raison d'être du portage :
 //
-//   1. ÉQUIVALENCE — la pile reproduit `GetSlabDensity`. Même barre que Maze : un changement de
-//      côté d'isosurface est un ÉCHEC DUR, un écart d'ULP est le plancher accepté.
+//   1. ÉQUIVALENCE — la pile reproduit `GetSlabDensity`. ✅ **BIT-IDENTIQUE depuis 2026-07-27**,
+//      quand `FPSemantics = Precise` (AUDIT §C9/§C10) a supprimé le résidu d'ULP : il venait de
+//      `/fp:fast`. Un changement de côté d'isosurface reste l'ÉCHEC DUR ; la gradation ULP est
+//      gardée comme détecteur de régression du modèle flottant, pas comme tolérance attendue.
 //   2. UN OPÉRATEUR, DEUX ARCHÉTYPES — la MÊME pile est vérifiée contre FlatPlain ET
 //      CrystalChamber. `GetSlabDensity` ne les distingue par aucun branchement ; si la pile a
 //      besoin d'en faire un, la fusion est fausse et ce test le dit.

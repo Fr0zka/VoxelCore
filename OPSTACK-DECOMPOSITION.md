@@ -361,6 +361,28 @@ FOverhangShelfMod              Union      ⚠️ per-voxel, NOT XY-pure — the 
 [structural post ×4]
 ```
 
+> ### ⚠️ RESOLVED 2026-07-27 — the height ops needed a SECOND OP FAMILY, not a sub-list
+>
+> This section says the height ops *"operate on Z values in the column, not on density"* and then
+> lists them as children of `FHeightfieldSource`. Writing them made the consequence unavoidable:
+> **they do not fit `IVoxelDensityOp` at all.** Its signature is `Eval(x, y, z, FVoxelOpSample&)` —
+> per voxel, density + SDF. A height op has **no input Z** (it produces one), is XY-pure (once per
+> column), and writes neither channel.
+>
+> The two ways to force it were both bad: a per-voxel third channel for what is a **column**
+> property, or collapsing all five into one opaque op — `OPSTACK-PLAN §2.5`'s explicit failure mode.
+>
+> **So height space got its own contract: `VoxelHeightOp.h`** (`FVoxelHeightSample` with
+> `Height` + `Relief`, `IVoxelHeightOp`, `FVoxelHeightStack`). Same lesson as `§0.1`, one step
+> further: §0.1 found that density needed a second *channel*; this found that terrain needs a second
+> *space*. Verified by `VoxelForge.OpStack.SurfaceHeightEquivalence` before anything was built on
+> top of it — deliberately, so a wrong answer would have cost one test rather than a whole port.
+>
+> **Bonus the type system gives for free:** a height stack cannot contain Z-dependent data, because
+> there is no Z in the signature to put there. `AUDIT §6.3` warns that Z-dependent data smuggled into
+> `FSurfaceColumn` silently corrupts every chunk in the vertical stack and that `ValidateDeterminism`
+> would not catch it. Here the *type* forbids it rather than a convention.
+
 **Critical distinction the port must preserve:** the height ops (`FCliffHeightMod` and friends)
 operate on **Z values in the column**, not on density. They are XY-pure and belong in
 `PrepareChunk`/the column cache. `FOverhangShelfMod` operates per voxel and re-samples the

@@ -1207,3 +1207,71 @@ headers. Everything else in the module compiled, so this is the whole tail: one 
 path, checked against `ARCHITECTURE §8.10`. Then back to the opstack: `SurfaceWorld` (§5).
 
 ---
+
+## 2026-07-27 — ✅ C10 SOLVED (it WAS /fp:fast). SurfaceWorld opened: height space needed its own family.
+
+**Maze and Slab are now BIT-IDENTICAL to their originals.** `FPSemantics = Precise`, set for
+cross-platform play, dissolved the ULP residue.
+
+**So hypothesis 3 had the right mechanism all along, and every experiment built on it was doomed by
+construction.** Under `/fp:fast` the compiler reassociates and contracts *by surrounding context*,
+with **no single isolable axis** — which is exactly why five carefully-designed one-variable tests
+all came back negative while the difference stayed. There was no variable to find. Removing the
+*permission* removed the difference.
+
+**The lesson is not the one I expected.** Nobody solved C10; C9 got fixed for an unrelated
+requirement and C10 fell out of it. Six more builds of bisecting source would have found nothing,
+because the answer was a **build setting nobody was looking at**. Parking a question whose every
+consequence is measured and benign was right on its own terms *and* right in hindsight — the
+information was not obtainable along the path I was on, at any price. Recorded in `AUDIT §C10`.
+
+**Immediate consequence:** the equivalence tests are now much sharper instruments. Any diff at all is
+a real finding rather than noise to grade. The ULP machinery stays as a float-model regression alarm.
+
+### SurfaceWorld, step 1 of 2 — and it forced an architectural decision
+
+`§5` says the height ops *"operate on Z values in the column, not on density"* and then lists them as
+children of `FHeightfieldSource`. Writing them made the consequence unavoidable: **they do not fit
+`IVoxelDensityOp` at all.** No input Z (they produce one), XY-pure per column rather than per voxel,
+and they write neither density nor SDF. The two ways to force them in were a per-voxel third channel
+for what is a **column** property, or one opaque op — `§2.5`'s named failure mode.
+
+**So height space got its own contract:** `VoxelHeightOp.h` — `FVoxelHeightSample` (`Height` +
+`Relief`), `IVoxelHeightOp`, `FVoxelHeightStack`, and five ops in `VoxelHeightOpStack.cpp`.
+`Relief` is the original's `M`: produced by the structural source, consumed by the terrace gate.
+Same shape of lesson as `§0.1` — that one found density needed a second *channel*; this found
+terrain needs a second *space*.
+
+**A property the type system now gives for free:** a height stack **cannot** hold Z-dependent data,
+because there is no Z in the signature to put there. `AUDIT §6.3` warns that Z-dependent data
+smuggled into `FSurfaceColumn` silently corrupts every chunk in the vertical stack and that
+`ValidateDeterminism` would not catch it. That hazard is now a type error instead of a convention.
+
+**Deliberately staged.** This step touches **nothing** on the density path — no `FHeightfieldSource`
+adapter, no `FSkyCapSource`, no `FOverhangShelfMod`, no column cache, no wiring. If height space had
+not decomposed cleanly, that would show up here for the price of one test rather than after building
+the adapter, the cache integration and the dispatch on top of it. Same method Phase 1 used on
+density, applied to the question Phase 2 actually raised.
+
+**The test runs twice, and the second pass is the one that matters:** the F20 terrain ops are **off
+by default**, so a defaults-only run would exercise the structural source and leave all four
+modifiers — i.e. everything new — untested. The second pass turns them all on. It also brute-forces
+`MaxDisplacement` against observed movement, because a false bound would later be a hole.
+`WaterLevelRelative` must be set for that pass or `FBeachHeightMod` early-outs and the fifth op is
+never touched — a green test that measured nothing.
+
+**Also:** `ComputeSurfaceTerrainZ` moved from private to public on `UVoxelGenerator` (same
+justification as `GetSlabDensity` / `GetMazeDensity` — exposed for isolated tests). Its old private
+declaration was removed; two declarations of one member would not compile.
+
+**UNVERIFIED:** none of this is compiled. Likely error spots: the new `.cpp`/`.h` pair being picked
+up; `FVoxelHeightStack` as a move-only local; the non-owning `const IVoxelHeightOp**` out-param in
+`MakeStructuralHeightSource` and its `static_cast` back down in `MakeCliffHeightMod`; `FVector2D`
+members being double in UE5 (cast at every use); and the `ComputeSurfaceTerrainZ` access move.
+
+**Next single action:** build + run `SurfaceHeightEquivalence`. If green, step 2 — `FHeightfieldSource`
+(the adapter that turns a column into density, preserving the T1.a cache), `FSkyCapSource`,
+`FOverhangShelfMod` (the one genuinely 3D op here), then biome blending and the wiring. `§C1`
+(bounded seed offsets) still open.
+
+---
