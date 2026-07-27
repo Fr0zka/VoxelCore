@@ -263,6 +263,15 @@ FGridColumnMod                 Add        world-grid jittered cylinders, infinit
 That is the entire archetype. Two of the eight collapse into one, and the ceiling's `abs(noise)`
 (formations hang down only, never punch up) is a two-line flag on the source.
 
+> **Observed in-editor 2026-07-27, and it settles the question:** Jahni reports FlatPlain and
+> CrystalChamber render **identical** in the live world. They should — they share
+> `FSlabGenerationParams`, and nothing in the content sets them apart. **The enum promised a
+> difference the data never delivered**, in the shipped world as well as in the test fixture.
+> So the merge does not lose a distinction; it *reveals* that there was none. Making CrystalChamber
+> look like a crystal chamber is a **params** job — raise `CeilingRoughness` (6 → ~20, what
+> `SlabEquivalence`'s tuned pass uses) and drop `CeilingRelativeHeight` a little. That is authoring,
+> which is exactly the outcome the whole refactor is aiming at.
+
 ### 3.1 ✅ RESOLVED 2026-07-27 — Jahni: the Z term can go. Removed.
 
 **Decision:** the Z term was not intentional character. It is gone from `GetSlabDensity` (both

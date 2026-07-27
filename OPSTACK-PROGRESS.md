@@ -990,3 +990,72 @@ question is whether it still reads as the same kind of place. Then `SurfaceWorld
 (OPSTACK-DECOMPOSITION §5) — biggest payoff, most care.
 
 ---
+
+## 2026-07-27 — the tuned pass cried wolf. The TEST was wrong, not the port.
+
+```
+CrystalChamber(tuned): 121/20000 differ, 6 exceed the bound, worst |delta| 1.71661377e-05
+                       0 cross the isosurface;  box verdicts 32/60 proved, 0 unsound
+```
+
+**The port is fine. The yardstick was wrong, and it was wrong in a way that only shows up under
+large amplitudes — which is precisely why the tuned pass was worth adding.**
+
+The old bound was `16 · max(|Old|, 1) · FLT_EPSILON` — ULPs measured on the **output density**.
+But the density is `min(Z - Floor, Ceil - Z)`, so **near the isosurface the output tends to 0 while
+the intermediates (surfaces, world Z, noise amplitudes) are in the HUNDREDS.** A rounding born at
+scale ~400 was being judged against a yardstick of scale 1: 400× too tight, and tightest exactly
+where the test looks hardest.
+
+**Measured, not assumed:**
+
+| | roughness | worst \|delta\| | in ULP of \|Z\| |
+|---|---|---|---|
+| gentle passes | ceil 6, floor 4 | 3.81e-06 | ~0.08 |
+| tuned pass | ceil 20, floor 9 | 1.72e-05 | **0.345** |
+
+Amplitudes went up ×2.25–3.33, the deltas went up **×4.5**, and the worst one is **sub-ULP at the
+scale it is born in**. Error proportional to amplitude is the signature of ordinary rounding, not of
+a wrong transcription — a wrong offset or a missing `abs()` would move the surface by **voxels**,
+four orders of magnitude above this, not by a factor of four.
+
+**Fixed:** the bound now scales with the magnitude the error is born in (`max(|Old|, |Z|, strate Z
+bounds)`), and — more importantly — **the warning now prints the discriminator instead of just the
+alarm**: the density at the offending sample and the delta expressed in ULPs of the working scale.
+A few ULP with a near-zero density is cancellation; thousands of ULP is drift. The next context
+reads that off the message instead of re-deriving it at a build apiece.
+
+The test stays discriminating: real drift is 4 orders of magnitude above the new bound.
+
+### The box verdicts held under the worst case — that is the result that mattered
+
+32 of 60 proved uniform with **0 unsound**, under tripled ceiling roughness and 3× the columns.
+That was the specific thing the tuned pass existed to attack (a wide ceiling band makes the
+`Max(CeilZ - noise, FloorSurface + 2)` clamp bind, which is where a false verdict would be a HOLE),
+and the bound survived it. Fewer tiles proved than the gentle passes (32 vs 36/40), which is correct
+— wider bands mean more genuinely Mixed tiles.
+
+### Visual A/B — and a content finding worth more than the A/B
+
+Jahni: *"visually, crystal and plain are identical, same for when opting on or off from the
+opstack."*
+
+**Opt-in on/off identical = the port is confirmed a pure refactor.** Note this is the expected
+result and my earlier framing was sloppy: **both** paths compute the post-§3.1 function, so the
+Z-term change is invisible in the A/B by construction. It is only visible against the world as it
+looked *before* this build.
+
+**FlatPlain and CrystalChamber rendering identical is the real finding.** They share
+`FSlabGenerationParams` and nothing in the content distinguishes them — **the enum promised a
+difference the data never delivered**, in the shipped world exactly as in the test fixture. So the
+merge loses no distinction; it reveals there was none. Recorded in `OPSTACK-DECOMPOSITION §3`.
+Making a crystal chamber look like one is now a **params** job (`CeilingRoughness` 6 → ~20), which
+is precisely the outcome the refactor is for.
+
+**UNVERIFIED:** the corrected bound and the new warning text.
+
+**Next single action:** rebuild; the tuned pass should drop to INFO with all three passes reporting
+sub-ULP-of-scale deltas. Then `SurfaceWorld` (§5) — biggest payoff, most care: the T1.a column cache
+and the exact-lattice `ClassifyTile` bound must both survive the port.
+
+---

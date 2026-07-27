@@ -128,8 +128,38 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         //=====================================================================
         // 1. ÉQUIVALENCE — géométrie d'abord, bits ensuite.
         //=====================================================================
+        // ─────────────────────────────────────────────────────────────────────
+        // LE BON MÈTRE — corrigé 2026-07-27 après que la passe `tuned` a crié au loup
+        // ─────────────────────────────────────────────────────────────────────
+        // Première version : `16 · max(|Old|, 1) · FLT_EPSILON`, c.-à-d. l'ULP mesuré sur la
+        // DENSITÉ DE SORTIE. C'est le mauvais mètre, et il se trompe exactement là où le test
+        // regarde le plus : la densité vaut `min(Z - Sol, Plafond - Z)`, donc PRÈS DE L'ISOSURFACE
+        // la sortie tend vers 0 pendant que les intermédiaires (surfaces, Z monde, amplitudes de
+        // bruit) valent des CENTAINES. Un arrondi né à l'échelle 400 était jugé contre un mètre
+        // à l'échelle 1 — 400× trop serré.
+        //
+        // Mesuré : la passe `tuned` (rugosités ×2.25 et ×3.33) a vu ses écarts croître ×4.5, et
+        // son pire écart valait **0.345 ULP de |Z|**. Sous-ULP à l'échelle où l'erreur naît.
+        // L'erreur est donc proportionnelle à l'AMPLITUDE, ce qui est la signature d'un arrondi
+        // ordinaire, pas d'une transcription fausse.
+        //
+        // Le mètre correct est la magnitude des quantités D'OÙ VIENT l'erreur. Le test reste
+        // discriminant : une vraie dérive de portage (offset de bruit faux, `abs()` manquant,
+        // clamp oublié) déplace la surface de plusieurs VOXELS — 4 ordres de grandeur au-dessus
+        // de ce seuil, pas 4 fois.
+        //
+        // The first yardstick measured ULPs on the OUTPUT density, which tends to 0 near the
+        // isosurface while the intermediates are in the hundreds. Rounding born at scale ~400 was
+        // judged against a yardstick of scale 1. Real port drift moves the surface by voxels —
+        // four orders of magnitude above this bound, so the test stays discriminating.
+        const float SurfaceScale = FMath::Max(FMath::Abs(SlabParams.StrateTopWorldZ),
+                                              FMath::Abs(SlabParams.StrateBottomWorldZ));
+
         int32 NumDiff = 0, WorstIdx = -1, NumBeyondUlpNoise = 0, NumSolidDisagreements = 0;
-        float WorstDelta = 0.0f;
+        float WorstDelta = 0.0f, WorstOld = 0.0f, WorstUlpsOfScale = 0.0f;
+        // Le pire cas PARMI LES DÉPASSEMENTS — c'est lui qui dit si un WARN est du bruit ou une dérive.
+        float WorstOutlierDelta = 0.0f, WorstOutlierOld = 0.0f, WorstOutlierUlps = 0.0f;
+
         for (int32 i = 0; i < NumSlabSamples; ++i)
         {
             const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
@@ -141,13 +171,26 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
             {
                 ++NumDiff;
                 const float Delta = FMath::Abs(Old - New);
-                if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
 
-                // Même forme que le carve de Maze : `(ColBlend - ColumnSDF)` annule au bord de la
-                // coquille de blend des colonnes, donc un ULP amont ressort amplifié. Marge
-                // généreuse mais BORNÉE — au-delà, c'est une vraie dérive de portage.
-                const float UlpNoise = 16.0f * FMath::Max(FMath::Abs(Old), 1.0f) * FLT_EPSILON;
-                if (Delta > UlpNoise) { ++NumBeyondUlpNoise; }
+                // L'échelle à laquelle CET échantillon calcule : la sortie, sa propre altitude, et
+                // les bornes de la strate. C'est le plus grand des trois qui porte l'arrondi.
+                const float Scale = FMath::Max3(FMath::Abs(Old), FMath::Abs(Z),
+                                                FMath::Max(SurfaceScale, 1.0f));
+                const float Ulps  = Delta / (Scale * FLT_EPSILON);
+
+                if (Delta > WorstDelta)
+                {
+                    WorstDelta = Delta; WorstIdx = i; WorstOld = Old; WorstUlpsOfScale = Ulps;
+                }
+
+                if (Delta > 16.0f * Scale * FLT_EPSILON)
+                {
+                    ++NumBeyondUlpNoise;
+                    if (Delta > WorstOutlierDelta)
+                    {
+                        WorstOutlierDelta = Delta; WorstOutlierOld = Old; WorstOutlierUlps = Ulps;
+                    }
+                }
             }
             // Le mesher ne lit que le SIGNE. Un désaccord de CÔTÉ bouge la géométrie.
             if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSolidDisagreements; }
@@ -161,23 +204,32 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         else if (NumBeyondUlpNoise == 0)
         {
             AddInfo(FString::Printf(
-                TEXT("%s: %d of %d samples differ, ALL at ULP scale (largest |delta| %.9g at ")
-                TEXT("(%.0f, %.0f, %.0f)), and 0 cross the isosurface. Same accepted floor as Maze ")
-                TEXT("-- see AUDIT-2026-07.md C10 before hunting it."),
-                SlotName, NumDiff, NumSlabSamples, WorstDelta,
+                TEXT("%s: %d of %d samples differ, ALL at ULP scale (largest |delta| %.9g = %.3f ULP ")
+                TEXT("of the working scale, where density = %.6g, at (%.0f, %.0f, %.0f)), and 0 cross ")
+                TEXT("the isosurface. Same accepted floor as Maze -- see AUDIT-2026-07.md C10."),
+                SlotName, NumDiff, NumSlabSamples, WorstDelta, WorstUlpsOfScale, WorstOld,
                 WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
                 WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
                 WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f));
         }
         else
         {
+            // Le message porte maintenant LE DISCRIMINANT, pas seulement l'alarme : la densité au
+            // point fautif et l'écart exprimé en ULP de l'échelle de travail. Un dépassement à
+            // quelques ULP avec une densité proche de 0 est un artefact de mètre ; un dépassement
+            // à des milliers d'ULP est une vraie dérive. La différence se lit, elle ne se devine pas.
             AddWarning(FString::Printf(
-                TEXT("%s: %d of %d samples differ and %d are TOO LARGE to be the accepted ULP floor ")
-                TEXT("(largest |delta| %.9g at (%.0f, %.0f, %.0f)); %d cross the isosurface. THIS is ")
-                TEXT("real port drift. Check, in order: the floor/ceiling noise offsets (7.3/11.1 and ")
-                TEXT("17.3+1000/19.7+2000/3000), the abs() on the ceiling noise, the ceiling clamp ")
-                TEXT("(FloorSurface + 2), the column blend (2.0) and the 0.15/0.7 jitter."),
-                SlotName, NumDiff, NumSlabSamples, NumBeyondUlpNoise, WorstDelta,
+                TEXT("%s: %d of %d samples differ and %d exceed the ULP bound. Worst OUTLIER: ")
+                TEXT("|delta| %.9g = %.1f ULP of the working scale, where density = %.6g. ")
+                TEXT("(Worst overall: |delta| %.9g at (%.0f, %.0f, %.0f).) %d cross the isosurface. ")
+                TEXT("READ THE ULP FIGURE BEFORE INVESTIGATING: a few ULP with a near-zero density is ")
+                TEXT("cancellation near the isosurface, not drift. Thousands of ULP IS drift -- check, ")
+                TEXT("in order: the floor/ceiling noise offsets (7.3/11.1 and 17.3+1000/19.7+2000/3000), ")
+                TEXT("the abs() on the ceiling noise, the ceiling clamp (FloorSurface + 2), the column ")
+                TEXT("blend (2.0) and the 0.15/0.7 jitter."),
+                SlotName, NumDiff, NumSlabSamples, NumBeyondUlpNoise,
+                WorstOutlierDelta, WorstOutlierUlps, WorstOutlierOld,
+                WorstDelta,
                 WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
                 WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
                 WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
