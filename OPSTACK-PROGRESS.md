@@ -1337,3 +1337,48 @@ referenced against the cached path), biome blending as the `Mask` combiner, and 
 reuses `GSurfColCache`. `§C1` still open.
 
 ---
+
+## 2026-07-27 — step 2b: the overhang, the one op that could NOT live in height space.
+
+Step 2a came back green on all four counts, including the density-side bridge
+(`FSurfaceColumnSource` bit-identical to `GetSurfaceDensity` over 20 000 samples).
+
+**`FOverhangShelfMod` is the boundary case that justifies where the two spaces were split.** Its
+uphill reach *grows with altitude* (`Frac = (Z - TerrainZ) / OverhangHeight`), so it is essentially
+Z-dependent — it is the only SurfaceWorld op that could not have gone into `VoxelHeightOp.h`. The
+line between the two spaces falls where the code changes nature, not where it was convenient.
+
+**The per-column problem, and how it is solved.** The overhang needs `TerrainZ` plus a per-column
+gate (`OverhangAmp`, `DirX`, `DirY`) that the source computes. Three ways to get it, two bad:
+- recompute the height stack per voxel — correct but pays the cliff's four resamples per lip voxel;
+- add a third channel to `FVoxelOpSample` — a per-voxel slot for a **column** property, and
+  archetype-specific pollution of a shared contract (`§11` has this open, unresolved);
+- **chosen:** the source memoises the column and the overhang reads it, same as `cliff → structural`.
+
+**The memo key is the part worth getting right.** Keyed on `(InstanceId, X, Y)` where `InstanceId`
+comes from a monotonic atomic counter — **not** on `this`. A freed stack and a newly allocated one
+can share an address; a counter that never goes backwards cannot collide. Since the stack evaluates
+every Z of a column at the same XY, the hit rate is ~1, so this also recovers the per-column reuse
+without inventing a second cross-chunk cache.
+
+**Two functions exposed** (`ComputeSurfaceColumn`, `SurfaceDensityFromColumn`) because they are the
+**only** oracle for the overhang — `GetSurfaceDensity` passes `OverhangAmp = 0` and computes none.
+Their private declarations were removed; two declarations of one member will not compile.
+
+**The test's third pass is written to avoid measuring nothing.** A uniform Z draw over the whole
+strate would almost never land in the overhang window, so the test would pass green having never run
+the op — the same trap as `WaterLevelRelative` in the height pass. Half the samples are now placed
+*inside* the window deliberately, the count is reported, and it warns if it is zero.
+
+**Still missing before wiring: BIOME BLENDING.** The ground is evaluated for the dominant biome and
+lerped toward the neighbour — the `Mask` combiner, and `§5` calls it the Phase 3 prototype. **Do not
+tick `bUseOperatorStack` on a SurfaceWorld strate with biomes until then.**
+
+**UNVERIFIED:** step 2b is not compiled. Likely spots: `std::atomic` include; `HFractal3D` newly
+added to the density TU; `MakeUnique<FSurfaceColumnSource>` then `MoveTemp` into the stack while
+keeping a raw pointer; and the two newly-public generator methods.
+
+**Next single action:** build. Then biome blending as the `Mask` combiner + the wiring that reuses
+`GSurfColCache`. `§C1` still open.
+
+---

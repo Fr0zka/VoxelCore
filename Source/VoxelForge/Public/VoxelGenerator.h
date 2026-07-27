@@ -189,6 +189,26 @@ public:
     float ComputeSurfaceTerrainZ(float WorldX, float WorldY, const FSurfaceGenerationParams& Params) const;
 
     /**
+     * La colonne de surface : terrain Z, plafond, et le gate d'OVERHANG résolu par colonne
+     * (amplitude + direction amont). PUBLIQUES toutes deux pour la même raison que ci-dessus :
+     * c'est le seul chemin qui calcule l'overhang — `GetSurfaceDensity` passe `OverhangAmp = 0` —
+     * donc c'est la seule référence possible pour `FOverhangShelfMod`.
+     * Public because this is the ONLY path that computes the overhang (GetSurfaceDensity passes 0),
+     * so it is the only possible reference for the ported op.
+     */
+    void ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
+        const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
+        const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
+        float& OutTerrainZ, float& OutCeilSurf,
+        float& OutOverhangAmp, float& OutDirX, float& OutDirY) const;
+
+    /** Le combine par voxel : colonne → densité, overhang compris, puis le post structurel. */
+    float SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
+                                   float TerrainZ, float CeilSurf,
+                                   float OverhangAmp, float DirX, float DirY,
+                                   const FSurfaceGenerationParams& S) const;
+
+    /**
      * Moisture field at a world XY → [0,1]. The second climate axis for biome placement.
      */
     float SampleMoisture(float WorldX, float WorldY, float Frequency) const;
@@ -299,22 +319,10 @@ private:
                                    FSurfaceGenerationParams& OutSurface, FBiomeContext& OutBiomeCtx,
                                    TArray<FSurfaceGenerationParams>& OutBiomeParams) const;
 
-    /** Biome-blended terrain Z + sky-cap ceiling Z for one column (the XY-only surface field). Shared
-     *  by the density column cache (T1.a) and the oracle. F20 phase 2 overhang, resolved per column:
-     *  `OutOverhangAmp` = strength·slope-gate (0 = off), `(OutDirX,OutDirY)` = unit UPHILL gradient dir. */
-    void ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
-                              const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
-                              const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
-                              float& OutTerrainZ, float& OutCeilSurf,
-                              float& OutOverhangAmp, float& OutDirX, float& OutDirY) const;
-
-    /** Final SurfaceWorld density from a column's precomputed terrain Z + ceiling: the cheap per-voxel
-     *  Z-combine + F20 overhang shelf (warped-terrain union, uphill dir) + origin spine + seal + passages.
-     *  The XY-only work (terrain/ceiling/overhang amp+dir) is done once per column and cached (T1.a). */
-    float SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
-                                   float TerrainZ, float CeilSurf,
-                                   float OverhangAmp, float DirX, float DirY,
-                                   const FSurfaceGenerationParams& Structural) const;
+    // ComputeSurfaceColumn et SurfaceDensityFromColumn ont été DÉPLACÉES en `public` (voir plus
+    // haut) : c'est le seul chemin qui calcule l'overhang, donc la seule référence possible pour
+    // VoxelForge.OpStack.SurfaceHeightEquivalence. Une seule déclaration chacune.
+    // Moved to public above — the only path that computes the overhang, hence the only oracle.
 
     /** (Re)build the per-chunk biome cell grid covering chunk (X,Y) footprint + margin. */
     void RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,

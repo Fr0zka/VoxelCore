@@ -28,8 +28,19 @@
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
 #include "VoxelTypes.h"               // SmoothStep01, VOXEL_NOISE_SCALE
 
+#include <atomic>                     // l'id d'instance non recyclé du mémo de colonne
+
 namespace
 {
+    /** La même enveloppe que `FractalNoise3D` de VoxelGenerator.cpp (qui y est `static`, donc
+     *  invisible ici). Le détour par `FVector` est délibéré — voir l'en-tête de ce fichier. */
+    FORCEINLINE float HFractal3D(const FVector& Position, int32 Octaves = 4,
+                                 float Lacunarity = 2.0f, float Persistence = 0.5f)
+    {
+        return VoxelNoise::FBM((float)Position.X, (float)Position.Y, (float)Position.Z,
+                               Octaves, Lacunarity, Persistence);
+    }
+
     //=========================================================================
     // RÔLE 1 — SOURCE : ROC CONSTANT / CONSTANT ROCK
     //=========================================================================
@@ -406,11 +417,83 @@ namespace
     class FSurfaceColumnSource final : public IVoxelDensityOp
     {
     public:
-        FSurfaceColumnSource(const FSurfaceGenerationParams& P, int32 Seed)
+        FSurfaceColumnSource(const FSurfaceGenerationParams& InP, int32 Seed)
+            : P(InP)
         {
-            VoxelHeightOps::BuildSurfaceHeightStack(TerrainStack, P, Seed);
-            VoxelHeightOps::BuildSurfaceCeilingStack(CeilingStack, P, Seed);
+            // Construite à la main (pas via BuildSurfaceHeightStack) pour GARDER le pointeur vers la
+            // source structurelle : l'overhang en a besoin, pour son gradient de pente comme pour
+            // son ré-échantillonnage amont. Même dépendance que le cliff, même raison.
+            TerrainStack.Add(VoxelHeightOps::MakeStructuralHeightSource(InP, Seed, &Structural));
+            TerrainStack.Add(VoxelHeightOps::MakeCliffHeightMod(InP, Structural));
+            TerrainStack.Add(VoxelHeightOps::MakeTerraceHeightMod(InP));
+            TerrainStack.Add(VoxelHeightOps::MakeLayerLineHeightMod(InP));
+            TerrainStack.Add(VoxelHeightOps::MakeBeachHeightMod(InP));
+
+            VoxelHeightOps::BuildSurfaceCeilingStack(CeilingStack, InP, Seed);
+
+            // Identité unique et NON RECYCLÉE. Clé du mémo par colonne ci-dessous : `this` ne
+            // suffirait pas — une pile détruite puis une autre allouée à la même adresse avec
+            // d'autres params donnerait un faux positif silencieux. Un compteur qui ne redescend
+            // jamais rend ça impossible.
+            // A unique, never-recycled id: `this` would allow a freed-then-reallocated stack to
+            // collide with the previous one's memo. A monotonic counter cannot.
+            static std::atomic<uint64> NextId{ 1 };
+            InstanceId = NextId.fetch_add(1, std::memory_order_relaxed);
         }
+
+        /** La colonne complète, exactement les cinq sorties de `ComputeSurfaceColumn`.
+         *  Mémoïsée par (instance, X, Y) : la pile évalue tous les Z d'une colonne au même XY, donc
+         *  le taux de succès est ~1 et l'overhang lit la MÊME colonne que la source, par
+         *  construction plutôt que par convention. */
+        struct FColumn { float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY; };
+
+        const FColumn& GetColumn(float WorldX, float WorldY) const
+        {
+            thread_local FColumn C{};
+            thread_local uint64  CachedId = 0;
+            thread_local float   CachedX = FLT_MAX, CachedY = FLT_MAX;
+
+            if (CachedId != InstanceId || CachedX != WorldX || CachedY != WorldY)
+            {
+                CachedId = InstanceId;  CachedX = WorldX;  CachedY = WorldY;
+
+                C.TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
+                C.CeilSurf = CeilingStack.EvalHeight(WorldX, WorldY);
+                C.OverhangAmp = 0.0f;  C.DirX = 0.0f;  C.DirY = 0.0f;
+
+                // Gate d'overhang par colonne : pente issue d'une différence AVANT du champ
+                // STRUCTUREL, à l'échelle de la portée mais CLAMPÉE à [4,16]. Sans ce clamp, une
+                // grande `Reach` moyenne la pente sur une énorme portée et lit même une vraie
+                // falaise comme plate — le bug « grande Reach = rien ». Transcrit tel quel.
+                if (P.OverhangStrength > 0.0f && Structural != nullptr)
+                {
+                    const float SD = FMath::Clamp(P.OverhangReach, 4.0f, 16.0f);
+                    const float Z0 = SampleStructural(WorldX, WorldY);
+                    const float GX = (SampleStructural(WorldX + SD, WorldY) - Z0) / SD;
+                    const float GY = (SampleStructural(WorldX, WorldY + SD) - Z0) / SD;
+                    const float Slope = FMath::Sqrt(GX * GX + GY * GY);
+
+                    const float Thr  = FMath::Max(P.OverhangSlopeThreshold, 0.05f);
+                    const float Gate = FMath::Clamp((Slope - Thr) / Thr, 0.0f, 1.0f);
+                    C.OverhangAmp = P.OverhangStrength * Gate;   // [0,1]
+
+                    // Direction amont unitaire (le gradient pointe vers le haut). Dégénérée sur le
+                    // plat — mais l'amplitude y vaut 0 de toute façon.
+                    if (Slope > KINDA_SMALL_NUMBER) { C.DirX = GX / Slope; C.DirY = GY / Slope; }
+                }
+            }
+            return C;
+        }
+
+        /** Le champ structurel nu — l'overhang s'en sert pour emprunter la roche amont. */
+        float SampleStructural(float WorldX, float WorldY) const
+        {
+            FVoxelHeightSample S;
+            Structural->Eval(WorldX, WorldY, S);
+            return S.Height;
+        }
+
+        const FSurfaceGenerationParams& GetParams() const { return P; }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -426,11 +509,10 @@ namespace
             // existant plutôt que d'en inventer un second.
             // No per-column memo here on purpose: T1.a already exists one level up, and a second
             // cache key is a second thing to get wrong.
-            const float TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
-            const float CeilSurf = CeilingStack.EvalHeight(WorldX, WorldY);
+            const FColumn& C = GetColumn(WorldX, WorldY);
 
-            float Density = TerrainZ - WorldZ;
-            Density = FMath::Max(Density, WorldZ - CeilSurf);
+            float Density = C.TerrainZ - WorldZ;
+            Density = FMath::Max(Density, WorldZ - C.CeilSurf);
             InOut.Density = Density;   // Replace : interne, positif = solide
         }
 
@@ -445,8 +527,89 @@ namespace
         }
 
     private:
+        FSurfaceGenerationParams P;
         FVoxelHeightStack TerrainStack;
         FVoxelHeightStack CeilingStack;
+        const IVoxelHeightOp* Structural = nullptr;   // NON possédant : la pile terrain le possède
+        uint64 InstanceId = 0;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : ÉTAGÈRE D'OVERHANG / OVERHANG SHELF  (le seul op vraiment 3D)
+    //=========================================================================
+    // Pour les voxels d'AIR dans une fenêtre juste au-dessus d'une pente raide, ré-échantillonne le
+    // heightfield EN AMONT (vers la falaise) d'une distance qui CROÎT avec la hauteur, et fait
+    // l'union de cette roche → la roche du haut de falaise déborde AU-DESSUS du vide, avec de l'air
+    // EN DESSOUS : un vrai surplomb.
+    //
+    // ⚠️ Il dépend de Z de façon essentielle — `Frac` fait varier la portée avec l'altitude. C'est
+    // le seul op de SurfaceWorld qui ne pouvait PAS vivre en espace-hauteur, et c'est exactement
+    // pour ça que la frontière entre les deux espaces est utile : elle est passée là où le code
+    // change de nature, pas là où c'était commode.
+    //
+    // The one op here that genuinely depends on Z (the uphill reach grows with height), which is
+    // precisely why it could not live in height space. The boundary between the two spaces falls
+    // where the code changes nature.
+    class FOverhangShelfMod final : public IVoxelDensityOp
+    {
+    public:
+        FOverhangShelfMod(const FSurfaceGenerationParams& InP, int32 Seed,
+                          const FSurfaceColumnSource* InColumn)
+            : P(InP), SeedF((float)Seed), Column(InColumn) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+        bool IsXYPure() const override { return false; }   // franchement non : voir `Frac`
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            if (Column == nullptr || P.OverhangHeight <= 0.0f) { return; }
+
+            // Même colonne que la source, garantie par le mémo : pas une seconde évaluation.
+            const FSurfaceColumnSource::FColumn& C = Column->GetColumn(WorldX, WorldY);
+            if (C.OverhangAmp <= 0.0f) { return; }
+
+            // Gate dur, transcrit : seulement les voxels d'air dans `OverhangHeight` du sol local.
+            if (!(WorldZ > C.TerrainZ && WorldZ <= C.TerrainZ + P.OverhangHeight)) { return; }
+
+            const float f = P.OverhangFrequency;
+            // Bruit de forme d'étagère [0,1] ; le terme en Z fait onduler la portée avec la hauteur
+            // (déchiqueté, pas une lèvre lisse).
+            const float Ns = HFractal3D(FVector(
+                WorldX * f + SeedF * 17.3f,
+                WorldY * f + SeedF * 23.9f,
+                WorldZ * f * P.OverhangZScale + SeedF * 5.1f), 3) * 0.5f + 0.5f;   // [0,1]
+
+            // LA CLÉ : la portée amont CROÎT avec la hauteur dans la fenêtre (Frac : 0 au sol → 1
+            // au plafond de la fenêtre). En bas le décalage est minuscule ⇒ on emprunte de la roche
+            // basse voisine ⇒ ça reste de l'AIR au-dessus du vide ; en haut le décalage atteint la
+            // falaise ⇒ solide ⇒ la lèvre se pose dessus avec de l'air DESSOUS = un vrai surplomb.
+            const float Frac   = (WorldZ - C.TerrainZ) / P.OverhangHeight;
+            const float ShiftV = P.OverhangReach * C.OverhangAmp * Frac * Ns;
+            if (ShiftV > 0.5f)
+            {
+                // On emprunte la hauteur STRUCTURELLE amont (pas la surface complète avec ops) :
+                // le dessous de l'étagère n'a pas besoin du raffinement cliff/terrace, et ça évite
+                // de relancer les 4 resamples du cliff par voxel de lèvre.
+                const float ShiftedTZ = Column->SampleStructural(WorldX + C.DirX * ShiftV,
+                                                                 WorldY + C.DirY * ShiftV);
+                InOut.Density = FMath::Max(InOut.Density, ShiftedTZ - WorldZ);   // union
+            }
+        }
+
+        // N'ajoute que du solide (`Max`) ⇒ tue AllAir, jamais AllSolid. Conservateur : on ne sait
+        // pas sans échantillonner si une colonne d'overhang touche la boîte, donc FillOnly partout
+        // où l'archétype peut en produire, Identity quand il est éteint.
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.OverhangStrength > 0.0f && P.OverhangHeight > 0.0f)
+                 ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FSurfaceGenerationParams P;
+        float SeedF;
+        const FSurfaceColumnSource* Column;   // NON possédant : la pile possède la source
     };
 
     //=========================================================================
@@ -876,17 +1039,19 @@ namespace VoxelDensityOps
     void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
                            int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ PAS ENCORE L'ARCHÉTYPE COMPLET, et il faut le savoir avant de brancher :
-        //   • pas d'OVERHANG — `FOverhangShelfMod`, le seul op vraiment 3D d'ici, a besoin d'une
-        //     donnée PAR COLONNE (amp + direction amont) que `GetSurfaceDensity` ne calcule même
-        //     pas (il passe `OverhangAmp = 0`). Sa référence est le chemin caché, pas celui-ci ;
-        //   • pas de MÉLANGE DE BIOMES — le sol est évalué pour le biome dominant puis lerpé vers
-        //     le voisin. En termes de pile c'est le combiner `Mask`, et c'est le prototype de la
-        //     Phase 3 (§5) : ça mérite sa propre étape, pas un paramètre de plus ici.
+        // ⚠️ PAS ENCORE L'ARCHÉTYPE COMPLET : il manque le **MÉLANGE DE BIOMES** — le sol est
+        // évalué pour le biome dominant puis lerpé vers le voisin. En termes de pile c'est le
+        // combiner `Mask`, et `§5` en fait le prototype de la Phase 3 : ça mérite sa propre étape,
+        // pas un paramètre de plus ici. **Ne pas brancher dans un monde à biomes avant.**
         //
-        // Donc cette pile == `GetSurfaceDensity` exactement, qui est la version SANS overhang et
-        // SANS biomes. C'est ce que le test compare, et c'est pour ça que la comparaison est nette.
-        OutStack.Add(MakeSurfaceColumnSource(P, Seed));
+        // L'overhang, lui, est là depuis l'étape 2b.
+        TUniquePtr<FSurfaceColumnSource> ColumnSource = MakeUnique<FSurfaceColumnSource>(P, Seed);
+        const FSurfaceColumnSource* ColumnPtr = ColumnSource.Get();
+        OutStack.Add(MoveTemp(ColumnSource));
+
+        // L'overhang lit la colonne de la source (mémo partagé, même XY par construction). Même
+        // motif que cliff → structural : un modificateur qui a besoin de ce que la source a produit.
+        OutStack.Add(MakeUnique<FOverhangShelfMod>(P, Seed, ColumnPtr));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);

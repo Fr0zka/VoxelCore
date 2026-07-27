@@ -304,15 +304,21 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
     // de biomes. Tous deux arrivent à l'étape 2b, avec le chemin CACHÉ pour référence — c'est le
     // seul qui les calcule.
     {
-        const FSurfaceGenerationParams& P = AllOps;
+        // ⚠️ `OverhangStrength = 0` EXPLICITEMENT : `GetSurfaceDensity` passe `OverhangAmp = 0`,
+        // donc il n'en calcule aucun. Comparer une pile qui en produit à une référence qui n'en
+        // produit pas ferait échouer le test pour la seule raison que la référence est incomplète.
+        // L'overhang a sa propre passe juste en dessous, avec le bon oracle.
+        FSurfaceGenerationParams P = AllOps;
+        P.OverhangStrength = 0.0f;
 
         FVoxelOpStack Stack;
         VoxelDensityOps::BuildSurfaceStack(Stack, P, World.Settings->Seed,
                                            Gen->OriginSpineRadius, World.StrateManager.Get());
 
-        // 1 source + 3 structurels. Pas encore d'overhang : voir l'avertissement ci-dessus.
-        TestEqual(TEXT("the surface density stack is source + 3 structural (no overhang yet)"),
-                  Stack.Num(), 4);
+        // 1 source + 1 overhang + 3 structurels. L'op overhang est présent mais inerte ici
+        // (amp 0 ⇒ sortie immédiate) — la décomposition ne change pas selon les params.
+        TestEqual(TEXT("the surface density stack is source + overhang + 3 structural"),
+                  Stack.Num(), 5);
 
         FVoxelOpContext Ctx;
         Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -365,6 +371,113 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
 
         TestEqual(TEXT("surface: no sample lands on the opposite side of the isosurface"),
                   NumSideDisagree, 0);
+    }
+
+    //=========================================================================
+    // ÉTAPE 2b — L'OVERHANG, contre le SEUL oracle qui le calcule
+    //=========================================================================
+    // `GetSurfaceDensity` passe `OverhangAmp = 0`. La seule référence est donc le chemin caché :
+    // `ComputeSurfaceColumn` (qui résout le gate et la direction amont par colonne) suivi de
+    // `SurfaceDensityFromColumn` (qui applique l'union par voxel). Les deux viennent d'être
+    // exposées pour ça.
+    //
+    // C'est aussi la passe qui vérifie le MÉMO DE COLONNE de `FSurfaceColumnSource` : l'op overhang
+    // lit la colonne produite par la source, et s'ils divergeaient d'un XY, l'union se ferait au
+    // mauvais endroit. Un mémo mal clé se verrait ici.
+    {
+        FSurfaceGenerationParams P = AllOps;
+        P.OverhangStrength        = 0.8f;
+        P.OverhangSlopeThreshold  = 0.12f;
+        P.OverhangHeight          = 14.0f;
+        P.OverhangReach           = 10.0f;
+        P.OverhangFrequency       = 0.05f;
+        P.OverhangZScale          = 0.6f;
+
+        FVoxelOpStack Stack;
+        VoxelDensityOps::BuildSurfaceStack(Stack, P, World.Settings->Seed,
+                                           Gen->OriginSpineRadius, World.StrateManager.Get());
+
+        FVoxelOpContext Ctx;
+        Ctx.Seed               = (uint32)World.Settings->Seed;
+        Ctx.LayoutVersion      = World.StrateManager->GetLayoutVersion();
+        Ctx.StrateTopWorldZ    = P.StrateTopWorldZ;
+        Ctx.StrateBottomWorldZ = P.StrateBottomWorldZ;
+        Stack.PrepareChunk(Ctx);
+
+        // Pas de biomes : contexte vide ⇒ ComputeSurfaceColumn retombe sur BaseSurface pour les
+        // deux côtés, poids 0. C'est exactement ce que la pile fait aujourd'hui.
+        FBiomeContext EmptyCtx;
+        TArray<FSurfaceGenerationParams> NoBiomeParams;
+        FChunkBiomeCache BiomeCache;
+
+        int32 NumDiff = 0, NumSideDisagree = 0, NumInWindow = 0;
+        float WorstDelta = 0.0f;
+
+        FRandomStream Rng(1337);
+        for (int32 i = 0; i < NumHeightSamples; ++i)
+        {
+            const float X = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
+            const float Y = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
+
+            float TerrainZ = 0.0f, CeilSurf = 0.0f, Amp = 0.0f, DirX = 0.0f, DirY = 0.0f;
+            Gen->ComputeSurfaceColumn(X, Y, MidChunkZ, P, EmptyCtx, NoBiomeParams, BiomeCache,
+                                      TerrainZ, CeilSurf, Amp, DirX, DirY);
+
+            // Échantillonner DANS la fenêtre d'overhang la moitié du temps : un tirage uniforme sur
+            // toute la strate la raterait presque toujours, et le test serait vert sans avoir
+            // exercé l'op une seule fois — le même piège que `WaterLevelRelative` plus haut.
+            float Z;
+            if ((i & 1) && Amp > 0.0f)
+            {
+                Z = TerrainZ + P.OverhangHeight * ((float)(i % 97) / 97.0f);
+                ++NumInWindow;
+            }
+            else
+            {
+                Z = (float)Rng.RandRange(BottomVoxelZ, TopVoxelZ);
+            }
+
+            const float Old = Gen->SurfaceDensityFromColumn(X, Y, Z, TerrainZ, CeilSurf,
+                                                            Amp, DirX, DirY, P);
+            const float New = Stack.EvalMC(X, Y, Z);
+
+            if (!BitEqual(Old, New))
+            {
+                ++NumDiff;
+                WorstDelta = FMath::Max(WorstDelta, FMath::Abs(Old - New));
+            }
+            if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
+        }
+
+        if (NumDiff == 0)
+        {
+            AddInfo(FString::Printf(
+                TEXT("Overhang: bit-identical to SurfaceDensityFromColumn across %d samples, %d of ")
+                TEXT("them deliberately inside the overhang window. The per-column memo hands the ")
+                TEXT("source's column to the overhang op correctly."),
+                NumHeightSamples, NumInWindow));
+        }
+        else
+        {
+            AddError(FString::Printf(
+                TEXT("Overhang: %d of %d samples differ (largest |delta| %.9g); %d cross the ")
+                TEXT("isosurface; %d samples were inside the window. Check, in order: the column ")
+                TEXT("memo key (does the overhang op see the SAME column as the source?), the ")
+                TEXT("window gate (Z > TerrainZ && Z <= TerrainZ + OverhangHeight), Frac and the ")
+                TEXT("ShiftV > 0.5 threshold, the shelf noise offsets (17.3/23.9/5.1 with the ")
+                TEXT("OverhangZScale Z term), and that the shift resamples the STRUCTURAL height."),
+                NumDiff, NumHeightSamples, WorstDelta, NumSideDisagree, NumInWindow));
+        }
+
+        TestEqual(TEXT("overhang: no sample lands on the opposite side of the isosurface"),
+                  NumSideDisagree, 0);
+
+        if (NumInWindow == 0)
+        {
+            AddWarning(TEXT("No sample landed inside the overhang window, so the op was never ")
+                       TEXT("actually exercised. Raise OverhangStrength or lower ")
+                       TEXT("OverhangSlopeThreshold until this is well above zero."));
+        }
     }
 
     return true;
