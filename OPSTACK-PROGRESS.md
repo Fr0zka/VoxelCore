@@ -1530,3 +1530,58 @@ that could actually flip a sign. Recorded in `AUDIT §C9`.
 (the `Mask` combiner = biome blending, `§5`'s Phase 3 prototype), then `VerticalShafts` (`§6`).
 
 ---
+
+## 2026-07-27 — the `Mask` combiner (biome blending) in height space. §5's Phase 3 prototype.
+
+All 10 tests green on the previous build, and the reworded digest confirms the point that mattered:
+
+```
+NearIso profile over 115000 samples: 2 within 1e-4, 0 within 1e-5, 0 within 1e-6
+```
+
+**Zero in the tight band** — no sampled voxel sits close enough to the isosurface for a libm
+difference to flip its side. The residual `§C9` library half is real in principle and, on this grid,
+carries no measured risk. The wide band's "2" was the ~100× over-statement, exactly as predicted.
+
+### The design decision worth recording: `IVoxelBiomeField`
+
+Biome blending needs to ask "which biome is at this XY?", and the real answer is a warped Voronoi
+with a per-chunk cache living on `UVoxelGenerator`. **The op must not hold a `UVoxelGenerator*`** —
+Phase 3 wants operators to become *assets*, and an op that owns a generator pointer never can.
+
+So the op depends on `IVoxelBiomeField`, a two-line interface returning `(dominant, neighbour,
+weight)`. The adapter that knows the generator stays on the generator's side. This is the same move
+as `cliff → structural source`: depend on the *capability*, not on the owner.
+
+### The combiner itself
+
+`FBiomeBlendHeightSource` — **one complete height stack per biome**, heights lerped in the border
+band. Each biome's stack computes its **own** relief `M` and gates its **own** terrace with it,
+which is exactly what the original does (two independent full `ComputeSurfaceTerrainZ` calls, only
+the OUTPUTS blended). Blending *heights* rather than *params* is what keeps borders continuous
+across any param difference — interpolating params would drag a terrace through intermediate states
+that mean nothing.
+
+**The ceiling SELECTS instead of blending**, because the original takes the dominant biome's ceiling
+alone. Reproduced as-is rather than "improved": a blended sky cap would change the world's
+silhouette, and a port is not where that gets decided.
+
+### Tested against a synthetic field, on purpose
+
+The real Voronoi resolver has its own coverage; a synthetic field lets the weight sweep 0 → 1
+**continuously**, which is where an inverted lerp (`1-w` for `w`) hides — it looks right in the
+middle and wrong only at the ends. Two deliberately dissimilar biomes, five weights × 400 points,
+bit-exact against `FMath::Lerp` of the two full stacks. Plus a check that the ceiling still returns
+the dominant's at weight 1.0, which is the case a "blend everything" refactor would silently break.
+
+**UNVERIFIED:** not compiled. Likely spots: the local `class FFixedWeightField` declared inside a
+function body and used as an interface; `TArray<FVoxelHeightStack>` (move-only element type — needs
+`MoveTemp` on insert, which it has).
+
+**Next single action:** build. Then the density-side integration — `FSurfaceColumnSource` takes the
+per-biome params + field, blends the overhang amp (`Lerp(Amp(PD), Amp(PN), W)` with slope from PD),
+and the generator-side adapter wraps `ResolveBiomeSampleAt`. That drops the biome guard in
+`UsesOperatorStackForChunk` and finishes SurfaceWorld. Then `VerticalShafts` (§6), which reuses
+`FConstantRockSource` + `FSdfRoughnessMod` + `FSdfCarve` and should be the cheapest port yet.
+
+---

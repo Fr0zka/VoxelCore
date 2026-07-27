@@ -480,6 +480,113 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
         }
     }
 
+    //=========================================================================
+    // LE COMBINER `Mask` — mélange de biomes (§5 : le prototype de la Phase 3)
+    //=========================================================================
+    // Testé contre un champ de biomes SYNTHÉTIQUE plutôt que contre le résolveur Voronoï réel, et
+    // c'est le bon choix ici : le vrai résolveur est déjà couvert par ses propres tests, alors
+    // qu'un champ synthétique permet de balayer le poids de 0 à 1 de façon CONTINUE et de vérifier
+    // l'identité `blend(w) == lerp(A, B, w)` sur toute la plage — y compris les deux bouts, où une
+    // erreur d'inversion (`1-w` au lieu de `w`) se cache le mieux.
+    //
+    // Tested against a SYNTHETIC field rather than the real Voronoi resolver: the resolver has its
+    // own tests, while a synthetic field lets the weight be swept continuously from 0 to 1, which is
+    // where an inverted lerp hides.
+    {
+        // Deux jeux de params franchement différents : si le mélange était un no-op, ou prenait le
+        // mauvais côté, l'écart serait énorme plutôt que subtil.
+        FSurfaceGenerationParams A = Defaults;
+        FSurfaceGenerationParams B = Defaults;
+        A.ElevationRange   = 40.0f;   A.MountainStrength = 0.2f;
+        B.ElevationRange   = 12.0f;   B.MountainStrength = 0.9f;
+        B.BaseGroundRelative = FMath::Clamp(A.BaseGroundRelative + 0.15f, 0.0f, 1.0f);
+
+        TArray<FSurfaceGenerationParams> PerBiome;
+        PerBiome.Add(A);
+        PerBiome.Add(B);
+
+        /** Champ synthétique : biome 0 dominant, biome 1 voisin, poids imposé par le test. */
+        class FFixedWeightField final : public IVoxelBiomeField
+        {
+        public:
+            float W = 0.0f;
+            FVoxelBiomeWeights SampleAt(float, float) const override
+            {
+                FVoxelBiomeWeights Out;
+                Out.Dominant = 0;  Out.Neighbor = 1;  Out.NeighborWeight = W;
+                return Out;
+            }
+        };
+        FFixedWeightField FieldA;
+
+        // Les deux piles de référence, non mélangées.
+        FVoxelHeightStack StackA, StackB;
+        VoxelHeightOps::BuildSurfaceHeightStack(StackA, A, World.Settings->Seed);
+        VoxelHeightOps::BuildSurfaceHeightStack(StackB, B, World.Settings->Seed);
+
+        FVoxelHeightStack Blended;
+        Blended.Add(VoxelHeightOps::MakeBiomeBlendHeightSource(PerBiome, World.Settings->Seed, &FieldA));
+
+        const float Weights[] = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
+        int32 NumWrong = 0;
+        float WorstDelta = 0.0f;
+
+        for (const float W : Weights)
+        {
+            FieldA.W = W;
+            for (int32 i = 0; i < 400; ++i)
+            {
+                const float X = (float)((i % 20) * 11);
+                const float Y = (float)((i / 20) * 13);
+
+                const float HA = StackA.EvalHeight(X, Y);
+                const float HB = StackB.EvalHeight(X, Y);
+                // ⚠️ L'attendu doit reproduire la MÊME expression que l'op, `FMath::Lerp` compris :
+                // écrire `HA + (HB - HA) * W` à la place testerait l'algèbre, pas le code.
+                const float Expect = (W > 0.0f) ? FMath::Lerp(HA, HB, W) : HA;
+                const float Got    = Blended.EvalHeight(X, Y);
+
+                if (!BitEqual(Expect, Got))
+                {
+                    ++NumWrong;
+                    WorstDelta = FMath::Max(WorstDelta, FMath::Abs(Expect - Got));
+                }
+            }
+        }
+
+        TestEqual(TEXT("biome blend: heights lerp between the two biomes' full stacks, bit-exactly"),
+                  NumWrong, 0);
+
+        if (NumWrong > 0)
+        {
+            AddError(FString::Printf(
+                TEXT("Biome blend wrong on %d of 2000 (weight, point) pairs, worst |delta| %.6g. ")
+                TEXT("Check: is the lerp toward the NEIGHBOUR (weight 0 must give the dominant ")
+                TEXT("untouched, weight 1 the neighbour), and does each biome's stack compute its ")
+                TEXT("OWN relief for its OWN terrace gate rather than sharing the dominant's?"),
+                NumWrong, WorstDelta));
+        }
+
+        // Le plafond SÉLECTIONNE au lieu de mélanger — comportement d'origine, reproduit tel quel.
+        {
+            FieldA.W = 1.0f;   // le voisin l'emporterait si le plafond mélangeait
+            FVoxelHeightStack CeilSel;
+            CeilSel.Add(VoxelHeightOps::MakeBiomeSelectCeilingSource(PerBiome, World.Settings->Seed, &FieldA));
+
+            FVoxelHeightStack CeilDominant;
+            VoxelHeightOps::BuildSurfaceCeilingStack(CeilDominant, A, World.Settings->Seed);
+
+            int32 NumCeilWrong = 0;
+            for (int32 i = 0; i < 200; ++i)
+            {
+                const float X = (float)((i % 20) * 11), Y = (float)((i / 20) * 13);
+                if (!BitEqual(CeilSel.EvalHeight(X, Y), CeilDominant.EvalHeight(X, Y))) { ++NumCeilWrong; }
+            }
+            TestEqual(TEXT("biome ceiling SELECTS the dominant (never blends), even at weight 1"),
+                      NumCeilWrong, 0);
+        }
+    }
+
     return true;
 }
 

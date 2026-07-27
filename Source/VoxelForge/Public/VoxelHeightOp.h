@@ -80,6 +80,41 @@ struct FVoxelHeightSample
 };
 
 /**
+ * Le résultat d'une requête de champ de biome en un XY : qui domine, qui est le voisin, et à quel
+ * poids on va vers lui dans la bande de frontière.
+ */
+struct FVoxelBiomeWeights
+{
+    int32 Dominant       = 0;
+    int32 Neighbor       = -1;
+    float NeighborWeight = 0.0f;   // 0 ⇒ pas de mélange, le dominant seul
+};
+
+/**
+ * LE CHAMP DE BIOMES, VU COMME UNE INTERFACE — et c'est délibérément une interface, pas un pointeur
+ * vers `UVoxelGenerator`.
+ *
+ * Le résolveur de biome réel est une Voronoï warpée avec un cache par chunk, qui vit sur le
+ * générateur. Un opérateur ne doit PAS en dépendre : la Phase 3 veut que les opérateurs deviennent
+ * des DONNÉES (des assets), et un op qui tient un `UVoxelGenerator*` ne peut pas le devenir. En
+ * passant par cette interface, l'adaptateur qui connaît le générateur reste du côté du générateur,
+ * et l'opérateur ne connaît qu'« un truc qui répond (dominant, voisin, poids) en XY ».
+ *
+ * Deliberately an interface rather than a UVoxelGenerator*: Phase 3 wants ops to become data, and an
+ * op holding a generator pointer never can. The adapter that knows the generator stays on the
+ * generator's side; the op only knows "something that answers (dominant, neighbour, weight) at XY".
+ */
+class IVoxelBiomeField
+{
+public:
+    virtual ~IVoxelBiomeField() = default;
+
+    /** PURE en XY, et bit-identique quel que soit le thread ou l'ordre — même contrat que le reste
+     *  de l'espace-hauteur, puisque le résultat alimente le cache de colonne T1.a. */
+    virtual FVoxelBiomeWeights SampleAt(float WorldX, float WorldY) const = 0;
+};
+
+/**
  * Un opérateur d'espace-hauteur. Trois différences avec `IVoxelDensityOp`, toutes voulues :
  *   • pas de Z d'entrée — la pile en PRODUIT un ;
  *   • XY-pur par construction, donc pas de `IsXYPure()` à déclarer ni à oublier ;
@@ -209,4 +244,30 @@ namespace VoxelHeightOps
      *  plafond n'a pas d'équivalent des quatre modificateurs du sol. */
     VOXELFORGE_API void BuildSurfaceCeilingStack(FVoxelHeightStack& OutStack,
                                                  const FSurfaceGenerationParams& P, int32 Seed);
+
+    /**
+     * LE COMBINER `Mask` — mélange de biomes, et `OPSTACK-DECOMPOSITION §5` en fait le prototype
+     * de la Phase 3 entière : « unifier strates et biomes » EST ce mécanisme, généralisé.
+     *
+     * Une pile de hauteur COMPLÈTE par biome, plus un champ qui dit lequel domine en (X,Y). Ce sont
+     * les **HAUTEURS** qui sont interpolées, pas les params — c'est ce que fait déjà le code
+     * d'origine, et c'est ce qui rend les frontières continues quelle que soit la différence de
+     * params entre deux biomes (interpoler des params ferait passer un terrace de « fort » à
+     * « faible » à travers des états intermédiaires qui n'ont de sens pour personne).
+     *
+     * Each biome gets a COMPLETE height stack; the HEIGHTS are lerped, not the params — which is
+     * what keeps borders continuous across any param difference.
+     *
+     * @param Field  non possédé, doit survivre à la pile. `nullptr` ⇒ biome 0 partout.
+     */
+    VOXELFORGE_API TUniquePtr<IVoxelHeightOp> MakeBiomeBlendHeightSource(
+        const TArray<FSurfaceGenerationParams>& PerBiomeParams, int32 Seed,
+        const IVoxelBiomeField* Field);
+
+    /** Idem pour le plafond — mais le plafond N'EST PAS mélangé : le code d'origine prend celui du
+     *  biome DOMINANT seul. Reproduit tel quel, pas « amélioré » : une voûte interpolée changerait
+     *  la silhouette du monde et ce portage n'est pas l'endroit pour décider ça. */
+    VOXELFORGE_API TUniquePtr<IVoxelHeightOp> MakeBiomeSelectCeilingSource(
+        const TArray<FSurfaceGenerationParams>& PerBiomeParams, int32 Seed,
+        const IVoxelBiomeField* Field);
 }

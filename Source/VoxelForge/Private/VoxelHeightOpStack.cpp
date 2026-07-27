@@ -353,12 +353,85 @@ namespace
 }
 
 
+    //=========================================================================
+    // COMBINER `Mask` — MÉLANGE DE BIOMES / BIOME BLEND
+    //=========================================================================
+    // Une pile complète par biome ; le champ dit lequel domine ; on interpole les HAUTEURS.
+    //
+    // ⚠️ Chaque pile calcule SON PROPRE relief `M` en interne et l'utilise pour son propre gate de
+    // terrace — exactement comme l'original, où `ComputeSurfaceTerrainZ(X, Y, *PD)` et
+    // `(…, *PN)` sont deux appels complets et indépendants dont seules les SORTIES sont mêlées.
+    // Le canal `Relief` qui ressort ici est celui du DOMINANT : il est informatif, personne en aval
+    // ne s'en sert pour re-gater quoi que ce soit.
+    //
+    // Each biome stack computes its own relief internally and gates its own terrace with it, exactly
+    // as the original makes two independent full calls and blends only the OUTPUTS.
+    class FBiomeBlendHeightSource final : public IVoxelHeightOp
+    {
+    public:
+        FBiomeBlendHeightSource(const TArray<FSurfaceGenerationParams>& PerBiome, int32 Seed,
+                                const IVoxelBiomeField* InField, bool bCeilingOnly)
+            : Field(InField)
+        {
+            Stacks.Reserve(PerBiome.Num());
+            for (const FSurfaceGenerationParams& BP : PerBiome)
+            {
+                FVoxelHeightStack S;
+                if (bCeilingOnly) { VoxelHeightOps::BuildSurfaceCeilingStack(S, BP, Seed); }
+                else              { VoxelHeightOps::BuildSurfaceHeightStack(S, BP, Seed); }
+                Stacks.Add(MoveTemp(S));
+            }
+            bBlend = !bCeilingOnly;   // le plafond SÉLECTIONNE, il ne mélange pas
+        }
+
+        void Eval(float WorldX, float WorldY, FVoxelHeightSample& InOut) const override
+        {
+            if (Stacks.Num() == 0) { return; }
+
+            FVoxelBiomeWeights W;
+            if (Field) { W = Field->SampleAt(WorldX, WorldY); }
+
+            const int32 D = Stacks.IsValidIndex(W.Dominant) ? W.Dominant : 0;
+            InOut = Stacks[D].EvalSample(WorldX, WorldY);
+
+            // Le plafond ne se mélange pas (voir la fabrique) ; le sol si, et seulement dans la
+            // bande de frontière où le poids est non nul.
+            if (bBlend && W.NeighborWeight > 0.0f && Stacks.IsValidIndex(W.Neighbor))
+            {
+                const float HN = Stacks[W.Neighbor].EvalHeight(WorldX, WorldY);
+                InOut.Height = FMath::Lerp(InOut.Height, HN, W.NeighborWeight);
+            }
+        }
+
+        float MaxDisplacement() const override { return FLT_MAX; }   // source composite
+
+    private:
+        TArray<FVoxelHeightStack> Stacks;
+        const IVoxelBiomeField*   Field;
+        bool                      bBlend = true;
+    };
+}
+
 //=============================================================================
 // FABRIQUES / FACTORIES
 //=============================================================================
 
 namespace VoxelHeightOps
 {
+    TUniquePtr<IVoxelHeightOp> MakeBiomeBlendHeightSource(
+        const TArray<FSurfaceGenerationParams>& PerBiomeParams, int32 Seed,
+        const IVoxelBiomeField* Field)
+    {
+        return MakeUnique<FBiomeBlendHeightSource>(PerBiomeParams, Seed, Field, /*bCeilingOnly*/false);
+    }
+
+    TUniquePtr<IVoxelHeightOp> MakeBiomeSelectCeilingSource(
+        const TArray<FSurfaceGenerationParams>& PerBiomeParams, int32 Seed,
+        const IVoxelBiomeField* Field)
+    {
+        return MakeUnique<FBiomeBlendHeightSource>(PerBiomeParams, Seed, Field, /*bCeilingOnly*/true);
+    }
+
     TUniquePtr<IVoxelHeightOp> MakeSkyCapHeightSource(const FSurfaceGenerationParams& P, int32 Seed)
     {
         return MakeUnique<FSkyCapHeightSource>(P, Seed);
