@@ -15,6 +15,51 @@
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
 #include "VoxelDensityPrimitives.h"   // spine / seal / passage — shared with the operator stack
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
+#include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
+
+//=============================================================================
+// L'ADAPTATEUR DE CHAMP DE BIOMES / THE BIOME FIELD ADAPTER
+//=============================================================================
+// Il vit ICI, du côté qui connaît le générateur, et PAS dans la pile d'opérateurs. C'est tout
+// l'intérêt de `IVoxelBiomeField` : le résolveur réel est une Voronoï warpée avec un cache par
+// chunk sur `UVoxelGenerator`, et un opérateur qui tiendrait ce pointeur ne pourrait jamais devenir
+// un asset (Phase 3). En le confinant ici, l'opérateur ne connaît qu'une capacité, pas un
+// propriétaire.
+//
+// ⚠️ DURÉES DE VIE : cet adaptateur pointe vers les `thread_local` `CP_BiomeCtx` / `CP_BiomeCache`
+// de `GetDensityAt`. Il est POSSÉDÉ par la pile, elle-même `thread_local` et reconstruite dans le
+// MÊME bloc de refetch que ces deux caches — les trois naissent et meurent ensemble, sur le même
+// thread. Un pointeur vers un thread_local depuis un objet thread_local du même bloc est sûr ;
+// l'échapper ailleurs ne le serait pas.
+//
+// Lives here, not in the op stack: the real resolver is generator state, and an op holding that
+// pointer could never become an asset. LIFETIME: it points at GetDensityAt's thread_locals and is
+// owned by the stack, which is itself thread_local and rebuilt in the same refetch block.
+class FGeneratorBiomeField final : public IVoxelBiomeField
+{
+public:
+    FGeneratorBiomeField(const UVoxelGenerator* InGen, const FBiomeContext* InCtx,
+                         FChunkBiomeCache* InCache, int32 InChunkZ)
+        : Gen(InGen), Ctx(InCtx), Cache(InCache), ChunkZ(InChunkZ) {}
+
+    FVoxelBiomeWeights SampleAt(float WorldX, float WorldY) const override
+    {
+        FVoxelBiomeWeights Out;
+        if (!Gen || !Ctx || !Cache) { return Out; }   // dégradation sûre : biome 0 partout
+
+        const FBiomeSample S = Gen->ResolveBiomeSampleAt(WorldX, WorldY, ChunkZ, *Ctx, *Cache);
+        Out.Dominant       = FMath::Max(S.DominantIndex, 0);   // -1 ⇒ 0, comme le chemin d'origine
+        Out.Neighbor       = S.NeighborIndex;
+        Out.NeighborWeight = S.NeighborWeight;
+        return Out;
+    }
+
+private:
+    const UVoxelGenerator* Gen;
+    const FBiomeContext*   Ctx;
+    FChunkBiomeCache*      Cache;
+    int32                  ChunkZ;
+};
 
 //=============================================================================
 // SURFACE COLUMN CACHE (T1.a) — kill the per-Z heightfield redundancy
@@ -580,24 +625,33 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     break;
 
                 case ECaveGeneratorType::SurfaceWorld:
-                    // Même garde dégénérée que les autres, et une SECONDE garde : la pile ne sait
-                    // pas encore mélanger les biomes. `UsesOperatorStackForChunk` refuse déjà les
-                    // strates à biomes, mais un `CP_BiomeCtx` valide ici voudrait dire que les deux
-                    // sources d'information se contredisent — auquel cas on retombe sur le `switch`,
-                    // parce qu'un monde non porté est récupérable et un monde faux ne l'est pas.
-                    // A valid biome context here would mean the two sources of truth disagree; fall
-                    // back rather than generate a world with seams at every biome border.
-                    if (CP_Surface.StrateTopWorldZ - CP_Surface.StrateBottomWorldZ <= 0.0f
-                        || CP_BiomeCtx.IsValid())
+                {
+                    if (CP_Surface.StrateTopWorldZ - CP_Surface.StrateBottomWorldZ <= 0.0f)
                     {
                         CP_UseOpStack = false;
                         break;
                     }
                     OpCtx.StrateTopWorldZ    = CP_Surface.StrateTopWorldZ;
                     OpCtx.StrateBottomWorldZ = CP_Surface.StrateBottomWorldZ;
+
+                    // Le champ de biomes est fabriqué ICI, du côté qui connaît le générateur, et
+                    // TRANSFÉRÉ à la pile. L'opérateur ne voit qu'une `IVoxelBiomeField` : c'est ce
+                    // qui lui permet de devenir un asset en Phase 3 sans traîner le générateur.
+                    // Built here, on the side that knows the generator, and handed to the stack.
+                    TUniquePtr<IVoxelBiomeField> Field;
+                    TArray<FSurfaceGenerationParams> PerBiome;
+                    if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
+                    {
+                        PerBiome = CP_SurfaceBiomeParams;
+                        Field = MakeUnique<FGeneratorBiomeField>(
+                            this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
+                    }
+
                     VoxelDensityOps::BuildSurfaceStack(CP_OpStack, CP_Surface, Seed,
-                                                       OriginSpineRadius, StrateManager);
+                                                       OriginSpineRadius, StrateManager,
+                                                       PerBiome, MoveTemp(Field));
                     break;
+                }
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`

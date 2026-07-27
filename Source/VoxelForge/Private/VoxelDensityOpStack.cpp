@@ -417,8 +417,59 @@ namespace
     class FSurfaceColumnSource final : public IVoxelDensityOp
     {
     public:
+        /**
+         * @param PerBiome  vide ⇒ pas de biomes, chemin d'origine inchangé. Non vide ⇒ le sol est
+         *                  mélangé et le plafond sélectionné par `InField`.
+         * @param InField   **POSSÉDÉ** — délibérément, plutôt qu'un pointeur nu. L'adaptateur réel
+         *                  pointe vers des `thread_local` du générateur ; lier sa durée de vie à
+         *                  celle de la pile (elle-même `thread_local`, reconstruite au même moment)
+         *                  rend la question de survie structurelle au lieu de la laisser à une
+         *                  convention que le prochain lecteur devrait deviner.
+         *                  OWNED on purpose rather than borrowed: tying its lifetime to the stack's
+         *                  makes the survival question structural instead of conventional.
+         */
+        FSurfaceColumnSource(const FSurfaceGenerationParams& InP, int32 Seed,
+                             const TArray<FSurfaceGenerationParams>& PerBiome,
+                             TUniquePtr<IVoxelBiomeField> InField)
+            : P(InP), BiomeParams(PerBiome), Field(MoveTemp(InField))
+        {
+            if (BiomeParams.Num() > 0)
+            {
+                // Chemin BIOMES : une pile complète par biome, sol mélangé / plafond sélectionné.
+                TerrainStack.Add(VoxelHeightOps::MakeBiomeBlendHeightSource(BiomeParams, Seed, Field.Get()));
+                CeilingStack.Add(VoxelHeightOps::MakeBiomeSelectCeilingSource(BiomeParams, Seed, Field.Get()));
+
+                // Un champ structurel PAR BIOME : la pente de l'overhang doit venir du champ du
+                // biome DOMINANT (l'original échantillonne `*PD`), pas d'un champ moyen.
+                PerBiomeStructural.Reserve(BiomeParams.Num());
+                for (const FSurfaceGenerationParams& BP : BiomeParams)
+                {
+                    const IVoxelHeightOp* Raw = nullptr;
+                    PerBiomeStructural.Add(VoxelHeightOps::MakeStructuralHeightSource(BP, Seed, &Raw));
+                }
+                Structural = PerBiomeStructural.Num() > 0 ? PerBiomeStructural[0].Get() : nullptr;
+            }
+            else
+            {
+                BuildSingleBiome(InP, Seed);
+            }
+
+            // Identité unique et NON RECYCLÉE — la clé du mémo par colonne. `this` ne suffirait
+            // pas : une pile détruite puis une autre allouée à la même adresse avec d'autres params
+            // donnerait un faux positif silencieux. Un compteur qui ne redescend jamais l'interdit.
+            // Assignée ICI et nulle part ailleurs : l'autre constructeur délègue à celui-ci.
+            // A unique, never-recycled id — assigned here only; the other ctor delegates.
+            static std::atomic<uint64> NextId{ 1 };
+            InstanceId = NextId.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        /** Sans biomes — délègue, pour qu'il n'existe qu'UN corps de construction et UN compteur
+         *  d'identité. Deux constructeurs qui s'initialisent chacun de leur côté, c'est deux
+         *  endroits où oublier un membre. */
         FSurfaceColumnSource(const FSurfaceGenerationParams& InP, int32 Seed)
-            : P(InP)
+            : FSurfaceColumnSource(InP, Seed, TArray<FSurfaceGenerationParams>(), nullptr) {}
+
+        void BuildSingleBiome(const FSurfaceGenerationParams& InP, int32 Seed)
         {
             // Construite à la main (pas via BuildSurfaceHeightStack) pour GARDER le pointeur vers la
             // source structurelle : l'overhang en a besoin, pour son gradient de pente comme pour
@@ -430,15 +481,6 @@ namespace
             TerrainStack.Add(VoxelHeightOps::MakeBeachHeightMod(InP));
 
             VoxelHeightOps::BuildSurfaceCeilingStack(CeilingStack, InP, Seed);
-
-            // Identité unique et NON RECYCLÉE. Clé du mémo par colonne ci-dessous : `this` ne
-            // suffirait pas — une pile détruite puis une autre allouée à la même adresse avec
-            // d'autres params donnerait un faux positif silencieux. Un compteur qui ne redescend
-            // jamais rend ça impossible.
-            // A unique, never-recycled id: `this` would allow a freed-then-reallocated stack to
-            // collide with the previous one's memo. A monotonic counter cannot.
-            static std::atomic<uint64> NextId{ 1 };
-            InstanceId = NextId.fetch_add(1, std::memory_order_relaxed);
         }
 
         /** La colonne complète, exactement les cinq sorties de `ComputeSurfaceColumn`.
@@ -483,17 +525,48 @@ namespace
                 // STRUCTUREL, à l'échelle de la portée mais CLAMPÉE à [4,16]. Sans ce clamp, une
                 // grande `Reach` moyenne la pente sur une énorme portée et lit même une vraie
                 // falaise comme plate — le bug « grande Reach = rien ». Transcrit tel quel.
-                if (P.OverhangStrength > 0.0f && Structural != nullptr)
+                // Quel jeu de params gouverne cette colonne ? Sans biomes, `P`. Avec, le DOMINANT
+                // pour la pente et le seuil, et une interpolation de l'AMPLITUDE vers le voisin —
+                // exactement ce que fait `ComputeSurfaceColumn` (`Lerp(Amp(PD), Amp(PN), W)`, pente
+                // depuis `*PD` seul). Interpoler la pente n'aurait pas de sens : c'est une mesure du
+                // terrain, pas un réglage.
+                const FSurfaceGenerationParams* PD = &P;
+                const FSurfaceGenerationParams* PN = nullptr;
+                float W = 0.0f;
+                const IVoxelHeightOp* SlopeField = Structural;
+
+                if (BiomeParams.Num() > 0 && Field)
                 {
-                    const float SD = FMath::Clamp(P.OverhangReach, 4.0f, 16.0f);
-                    const float Z0 = SampleStructural(WorldX, WorldY);
-                    const float GX = (SampleStructural(WorldX + SD, WorldY) - Z0) / SD;
-                    const float GY = (SampleStructural(WorldX, WorldY + SD) - Z0) / SD;
+                    const FVoxelBiomeWeights BW = Field->SampleAt(WorldX, WorldY);
+                    const int32 Di = BiomeParams.IsValidIndex(BW.Dominant) ? BW.Dominant : 0;
+                    PD = &BiomeParams[Di];
+                    if (PerBiomeStructural.IsValidIndex(Di)) { SlopeField = PerBiomeStructural[Di].Get(); }
+                    if (BW.NeighborWeight > 0.0f && BiomeParams.IsValidIndex(BW.Neighbor))
+                    {
+                        PN = &BiomeParams[BW.Neighbor];
+                        W  = BW.NeighborWeight;
+                    }
+                }
+
+                const bool bAnyOverhang = (PD->OverhangStrength > 0.0f)
+                                       || (PN && PN->OverhangStrength > 0.0f);
+
+                if (bAnyOverhang && SlopeField != nullptr)
+                {
+                    const float SD = FMath::Clamp(PD->OverhangReach, 4.0f, 16.0f);
+                    const float Z0 = SampleStructuralOf(SlopeField, WorldX, WorldY);
+                    const float GX = (SampleStructuralOf(SlopeField, WorldX + SD, WorldY) - Z0) / SD;
+                    const float GY = (SampleStructuralOf(SlopeField, WorldX, WorldY + SD) - Z0) / SD;
                     const float Slope = FMath::Sqrt(GX * GX + GY * GY);
 
-                    const float Thr  = FMath::Max(P.OverhangSlopeThreshold, 0.05f);
-                    const float Gate = FMath::Clamp((Slope - Thr) / Thr, 0.0f, 1.0f);
-                    C.OverhangAmp = P.OverhangStrength * Gate;   // [0,1]
+                    auto Amp = [Slope](const FSurfaceGenerationParams& Q) -> float
+                    {
+                        if (Q.OverhangStrength <= 0.0f) { return 0.0f; }
+                        const float Thr  = FMath::Max(Q.OverhangSlopeThreshold, 0.05f);
+                        const float Gate = FMath::Clamp((Slope - Thr) / Thr, 0.0f, 1.0f);
+                        return Q.OverhangStrength * Gate;   // [0,1]
+                    };
+                    C.OverhangAmp = (W > 0.0f && PN) ? FMath::Lerp(Amp(*PD), Amp(*PN), W) : Amp(*PD);
 
                     // Direction amont unitaire (le gradient pointe vers le haut). Dégénérée sur le
                     // plat — mais l'amplitude y vaut 0 de toute façon.
@@ -503,11 +576,25 @@ namespace
             return S.C;
         }
 
-        /** Le champ structurel nu — l'overhang s'en sert pour emprunter la roche amont. */
+        /** Le champ structurel nu — l'overhang s'en sert pour emprunter la roche amont.
+         *  Avec des biomes, c'est celui du biome DOMINANT en ce point (l'original emprunte à `*PD`). */
         float SampleStructural(float WorldX, float WorldY) const
         {
+            const IVoxelHeightOp* Src = Structural;
+            if (BiomeParams.Num() > 0 && Field)
+            {
+                const FVoxelBiomeWeights BW = Field->SampleAt(WorldX, WorldY);
+                const int32 Di = PerBiomeStructural.IsValidIndex(BW.Dominant) ? BW.Dominant : 0;
+                if (PerBiomeStructural.IsValidIndex(Di)) { Src = PerBiomeStructural[Di].Get(); }
+            }
+            return SampleStructuralOf(Src, WorldX, WorldY);
+        }
+
+        static float SampleStructuralOf(const IVoxelHeightOp* Src, float WorldX, float WorldY)
+        {
+            if (!Src) { return 0.0f; }
             FVoxelHeightSample S;
-            Structural->Eval(WorldX, WorldY, S);
+            Src->Eval(WorldX, WorldY, S);
             return S.Height;
         }
 
@@ -549,6 +636,12 @@ namespace
         FVoxelHeightStack TerrainStack;
         FVoxelHeightStack CeilingStack;
         const IVoxelHeightOp* Structural = nullptr;   // NON possédant : la pile terrain le possède
+
+        // Chemin BIOMES. Vide ⇒ chemin d'origine, inchangé bit pour bit.
+        TArray<FSurfaceGenerationParams>     BiomeParams;
+        TUniquePtr<IVoxelBiomeField>         Field;              // POSSÉDÉ (voir le constructeur)
+        TArray<TUniquePtr<IVoxelHeightOp>>   PerBiomeStructural; // pente d'overhang par biome
+
         uint64 InstanceId = 0;
     };
 
@@ -1060,15 +1153,14 @@ namespace VoxelDensityOps
     }
 
     void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
-                           int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                           int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                           const TArray<FSurfaceGenerationParams>& PerBiomeParams,
+                           TUniquePtr<IVoxelBiomeField> BiomeField)
     {
-        // ⚠️ PAS ENCORE L'ARCHÉTYPE COMPLET : il manque le **MÉLANGE DE BIOMES** — le sol est
-        // évalué pour le biome dominant puis lerpé vers le voisin. En termes de pile c'est le
-        // combiner `Mask`, et `§5` en fait le prototype de la Phase 3 : ça mérite sa propre étape,
-        // pas un paramètre de plus ici. **Ne pas brancher dans un monde à biomes avant.**
-        //
-        // L'overhang, lui, est là depuis l'étape 2b.
-        TUniquePtr<FSurfaceColumnSource> ColumnSource = MakeUnique<FSurfaceColumnSource>(P, Seed);
+        // ARCHÉTYPE COMPLET depuis l'étape 2c : vide + overhang + mélange de biomes.
+        // `PerBiomeParams` vide ⇒ chemin sans biomes, strictement inchangé.
+        TUniquePtr<FSurfaceColumnSource> ColumnSource =
+            MakeUnique<FSurfaceColumnSource>(P, Seed, PerBiomeParams, MoveTemp(BiomeField));
         const FSurfaceColumnSource* ColumnPtr = ColumnSource.Get();
         OutStack.Add(MoveTemp(ColumnSource));
 

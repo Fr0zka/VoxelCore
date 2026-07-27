@@ -1585,3 +1585,49 @@ and the generator-side adapter wraps `ResolveBiomeSampleAt`. That drops the biom
 `FConstantRockSource` + `FSdfRoughnessMod` + `FSdfCarve` and should be the cheapest port yet.
 
 ---
+
+## 2026-07-27 — SurfaceWorld COMPLETE (biomes included). 5 of 8 archetypes ported.
+
+All 10 tests green again. **But the two new biome checks printed nothing** — because I wrote them to
+report only on failure. **That is the exact flaw I flagged twice in this session** (the
+`WaterLevelRelative` early-out, the overhang window count) and then committed myself: a silent pass
+is indistinguishable from a check that never ran. Both now `AddInfo` their coverage, so the next run
+shows the blend actually executed over 2000 (weight, point) pairs.
+
+### Step 2c — the density side, and SurfaceWorld is closed
+
+- **`FSurfaceColumnSource` takes per-biome params + an owned `IVoxelBiomeField`.** Empty params ⇒
+  the original path, bit-for-bit unchanged (which is why the existing tests should stay green).
+- **The field is OWNED by the stack, not borrowed.** The real adapter points at `GetDensityAt`'s
+  `thread_local` `CP_BiomeCtx` / `CP_BiomeCache`; the stack is itself `thread_local` and rebuilt in
+  the *same* refetch block, so all three are born and die together on one thread. Making ownership
+  structural beats leaving survival to a convention the next reader has to infer.
+- **The overhang amp now blends across biomes** — `Lerp(Amp(PD), Amp(PN), W)` with the slope and
+  threshold from the **dominant** only, exactly as `ComputeSurfaceColumn` does. Interpolating the
+  *slope* would be meaningless: it is a measurement of the terrain, not a setting.
+- **`FGeneratorBiomeField` lives in `VoxelGenerator.cpp`,** on the side that knows the generator.
+  That is the whole point of the interface — the op sees a *capability*, never an owner, which is
+  what lets it become an asset in Phase 3.
+- **The biome guard is gone** from `UsesOperatorStackForChunk`.
+
+Also cleaned up while there: the two constructors now **delegate to one body with one id counter**
+instead of each initialising separately (two init paths is two places to forget a member — the first
+draft already had two competing counters, one of them tagged with a high bit to avoid collision,
+which is a smell rather than a design).
+
+**5 of 8 archetypes ported:** Maze · FlatPlain · CrystalChamber · SurfaceWorld.
+
+**UNVERIFIED:** not compiled. Likely spots: the delegating constructor; `TUniquePtr<IVoxelBiomeField>`
+as a defaulted parameter in the public header; `VoxelHeightOp.h` newly included by
+`VoxelDensityOpStack.h` (a public→public include); the `case` block now needing braces for its local
+declarations; and `FGeneratorBiomeField` being defined before `UVoxelGenerator`'s member functions
+while calling `ResolveBiomeSampleAt`.
+
+**What to try after the build:** tick `bUseOperatorStack` on a SurfaceWorld strate **with biomes**
+now. Both paths compute the same function, so expect it identical — biome borders included, which is
+the case that was guarded off until now.
+
+**Next single action:** build. Then `VerticalShafts` (§6) — it reuses `FConstantRockSource`,
+`FSdfRoughnessMod` and `FSdfCarve` unchanged from Maze, so it should be the cheapest of the eight.
+
+---

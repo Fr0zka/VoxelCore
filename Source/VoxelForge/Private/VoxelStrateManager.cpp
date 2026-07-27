@@ -576,19 +576,12 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
     case ECaveGeneratorType::CrystalChamber:  return true;   //   UNE seule pile (BuildSlabStack)
 
     case ECaveGeneratorType::SurfaceWorld:
-        // ⚠️ PORTÉ, MAIS PAS AVEC LES BIOMES. `BuildSurfaceStack` évalue UN jeu de params ; le
-        // chemin d'origine évalue le biome dominant puis interpole les HAUTEURS vers le voisin
-        // dans la bande de frontière (le combiner `Mask`, prototype de la Phase 3 — §5). Sans lui,
-        // une strate à biomes perdrait ses transitions : pas un décalage subtil, une couture nette
-        // à chaque frontière de biome.
-        //
-        // Donc la garde est ici, dans la MÊME fonction que la liste des archétypes portés, plutôt
-        // que dispersée dans `GetDensityAt` : « cette strate peut-elle prendre la pile ? » reste
-        // une seule question, posée à un seul endroit.
-        // Ported, but NOT with biomes: the stack evaluates ONE param set, while the original blends
-        // heights toward the neighbouring biome. Without the Mask combiner a biome strate would lose
-        // its transitions — a hard seam at every biome border, not a subtle shift.
-        return Def->Biomes.Num() == 0;
+        // ✅ La garde « pas de biomes » est TOMBÉE (étape 2c) : le combiner `Mask` existe, donc une
+        // strate à biomes mélange bien ses hauteurs comme le chemin d'origine. Les trois archétypes
+        // du dessus plus celui-ci font 5 des 8 portés.
+        // The no-biome guard is GONE: the Mask combiner exists, so a biome strate blends its heights
+        // exactly as the original path does.
+        return true;
 
     default:                                  return false;
     }

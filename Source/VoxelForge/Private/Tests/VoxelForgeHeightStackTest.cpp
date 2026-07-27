@@ -557,6 +557,18 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("biome blend: heights lerp between the two biomes' full stacks, bit-exactly"),
                   NumWrong, 0);
 
+        // ⚠️ Rapporter le SUCCÈS, pas seulement l'échec. Un `TestEqual` qui passe n'écrit rien, et
+        // une vérification silencieuse est indiscernable d'une vérification qui n'a jamais tourné —
+        // exactement le piège signalé pour `WaterLevelRelative` et la fenêtre d'overhang, dans
+        // lequel ce bloc-ci était tombé au premier jet. Le compte rend l'exécution visible.
+        // Report success, not just failure: a silent pass is indistinguishable from a check that
+        // never ran.
+        AddInfo(FString::Printf(
+            TEXT("Biome blend: %d (weight, point) pairs across weights 0/0.25/0.5/0.75/1.0 all match ")
+            TEXT("Lerp of the two biomes' full height stacks bit-exactly. Weight 0 returns the ")
+            TEXT("dominant untouched and weight 1 the neighbour, so the lerp is not inverted."),
+            (int32)UE_ARRAY_COUNT(Weights) * 400));
+
         if (NumWrong > 0)
         {
             AddError(FString::Printf(
@@ -584,6 +596,11 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
             }
             TestEqual(TEXT("biome ceiling SELECTS the dominant (never blends), even at weight 1"),
                       NumCeilWrong, 0);
+
+            AddInfo(TEXT("Biome ceiling: 200 points at neighbour-weight 1.0 still return the ")
+                    TEXT("DOMINANT biome's sky cap, i.e. it selects rather than blends -- the "
+                         "original's behaviour, and the case a \"blend everything\" refactor would "
+                         "silently break."));
         }
     }
 

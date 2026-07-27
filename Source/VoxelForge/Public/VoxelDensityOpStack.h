@@ -29,6 +29,7 @@
 #include "CoreMinimal.h"
 #include "VoxelDensityOp.h"
 #include "VoxelStrateTypes.h"   // FMazeGenerationParams
+#include "VoxelHeightOp.h"      // IVoxelBiomeField — BuildSurfaceStack takes ownership of one
 
 class UVoxelStrateManager;
 
@@ -200,16 +201,22 @@ namespace VoxelDensityOps
                                                                        int32 Seed);
 
     /**
-     * SurfaceWorld — ⚠️ PAS ENCORE COMPLET, et c'est délibéré. Équivaut exactement à
-     * `GetSurfaceDensity`, c.-à-d. la version **sans overhang** et **sans mélange de biomes** :
-     *   • l'overhang a besoin d'une donnée par colonne que `GetSurfaceDensity` ne calcule pas
-     *     (il passe `OverhangAmp = 0`) — sa référence est le chemin caché ;
-     *   • le mélange de biomes est le combiner `Mask`, prototype de la Phase 3 (§5).
-     * Les deux arrivent à l'étape 2b. Ne pas brancher dans un monde à biomes avant.
+     * SurfaceWorld, COMPLET : colonne (sol + voûte) → densité, overhang 3D, post structurel, et le
+     * mélange de biomes quand `PerBiomeParams` est non vide.
+     *
+     * @param PerBiomeParams  vide ⇒ pas de biomes, chemin d'origine strictement inchangé. Non vide
+     *                        ⇒ une pile de hauteur COMPLÈTE par biome, sol mélangé / voûte
+     *                        sélectionnée, amplitude d'overhang interpolée (§5, combiner `Mask`).
+     * @param BiomeField      **transféré** à la pile, qui le possède. Doit répondre pour les mêmes
+     *                        indices que `PerBiomeParams`. `nullptr` avec des params non vides ⇒
+     *                        biome 0 partout (dégradation sûre, pas un crash).
      */
     VOXELFORGE_API void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
                                           int32 Seed, float SpineRadius,
-                                          const UVoxelStrateManager* StrateManager);
+                                          const UVoxelStrateManager* StrateManager,
+                                          const TArray<FSurfaceGenerationParams>& PerBiomeParams =
+                                              TArray<FSurfaceGenerationParams>(),
+                                          TUniquePtr<IVoxelBiomeField> BiomeField = nullptr);
 
     /**
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
