@@ -5,18 +5,24 @@
 // ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN (depuis OPSTACK-PLAN §4, Phase 1, point 3).
 // `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
 // UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
-// strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés (Maze
-// seul aujourd'hui). Toute autre strate passe encore par le `switch`, inchangé.
+// strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés :
+// **Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands (6 sur 8)**.
+// Toute autre strate passe encore par le `switch`, inchangé.
 // `ClassifyTile` n'est PAS branché : il utilise toujours ses gardes écrites à la main, pas
 // `ClassifyBox`. C'est la Phase 2.
 //
 // THIS FEEDS THE GAME, BUT ONLY BEHIND AN OPT-IN. GetDensityAt builds the stack per chunk and
-// evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate
-// ticked bUseOperatorStack AND its archetype is ported — Maze only, today). ClassifyTile is NOT
-// wired: it still uses its hand-written guards rather than ClassifyBox. That is Phase 2.
+// evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate ticked
+// bUseOperatorStack AND its archetype ported — 6 of 8). ClassifyTile is NOT wired: it still uses its
+// hand-written guards rather than ClassifyBox. That is Phase 2.
 //
-// ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde, ni les comparer pour l'égalité :
-// le résidu de ~1 ULP est INHÉRENT et documenté (AUDIT-2026-07 §C10). La barre est visuelle (§2.6).
+// ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde.
+// ⚠️ EN REVANCHE, LES COMPARER EST DEVENU LÉGITIME — cette ligne disait l'inverse et elle est
+// périmée. `AUDIT §C10` (le résidu ~1 ULP) est CLOS depuis `FPSemantics = Precise` : les cinq tests
+// d'équivalence comparent bit à bit et sont verts. Ils ne sont plus des contrôles de FIDÉLITÉ (la
+// barre `§2.6.1` n'exige aucune ressemblance avec l'ancien monde) mais des oracles de
+// CORRECTION DE PORTAGE — une faute de transcription reste un vrai bug, et l'ancienne fonction est
+// le moyen le moins cher de l'attraper.
 //
 // POURQUOI CETTE FORME / WHY THIS SHAPE
 // La question à laquelle la Phase 1 doit répondre n'est pas « est-ce que ça marche ? » mais
@@ -161,6 +167,12 @@ namespace VoxelDensityOps
      *  Racine de TunnelNetwork, Maze, VerticalShafts et des gaps de bedrock. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeConstantRockSource(float BaseDensity);
 
+    /** Rôle 1 — le MÊME opérateur au signe près : `Density = -BaseDensity`, un grand vide ouvert.
+     *  `ClassifyBox` → **AllAir**, ce qu'aucune source n'avait encore su rendre — c'est ce qui rend
+     *  une strate d'îles flottantes (surtout vide) sautable là où aucune île n'arrive. Racine de
+     *  FloatingIslands. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeConstantVoidSource(float BaseDensity);
+
     /** Rôle 1 — les couloirs de Maze : capsules sur les arêtes ouvertes d'un treillis 3D.
      *  Écrit le canal SDF uniquement. Identité d'arête = hash(nœud inférieur, axe), donc deux
      *  chunks adjacents NE PEUVENT PAS être en désaccord : pas de cache de chunk, pas de région
@@ -183,6 +195,11 @@ namespace VoxelDensityOps
     /** Rôle 2 — conversion SDF → densité : creuse de l'air là où le SDF est à l'intérieur.
      *  Les six mêmes lignes apparaissent aujourd'hui dans TunnelNetwork, Maze et VerticalShafts. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity);
+
+    /** Rôle 2 — la même conversion, signe opposé : REMPLIT du solide là où le SDF est à l'intérieur.
+     *  C'est ce que fait FloatingIslands (`Density += Fill·Base·2`), et la multiplication par ±1
+     *  étant exacte en IEEE-754, le chemin carve reste bit pour bit ce qu'il était. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSdfFill(float Blend, float BaseDensity);
 
     /** Rôle 1 — la dalle : surface de sol + surface de plafond → champ de vide. **XY-PUR** depuis
      *  OPSTACK-DECOMPOSITION §3.1 (le terme en Z des deux bruits est parti), ce qui lui donne un
@@ -242,6 +259,22 @@ namespace VoxelDensityOps
     VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
                                                 int32 Seed, float SpineRadius,
                                                 const UVoxelStrateManager* StrateManager);
+
+    /**
+     * FloatingIslands — 7 ops, et **la pile tourne à l'ENVERS** :
+     *   ConstantVoid → IslandBlob → SdfRoughness → SdfFill → [structural post ×3]
+     *
+     * Les quatre archétypes portés jusqu'ici partent de ROC et CREUSENT ; celui-ci part du VIDE et
+     * REMPLIT. Aucune des deux extrémités n'a demandé d'opérateur neuf — `FConstantFieldSource` et
+     * `FSdfConvertOp` sont les mêmes classes au signe près, et `FSdfRoughnessMod` est repris sans
+     * une ligne de changement (4ᵉ archétype). Seul le blob d'île est nouveau.
+     *
+     * The stack that runs backwards: void source + fill instead of rock source + carve, using the
+     * SAME operators with the opposite sign.
+     */
+    VOXELFORGE_API void BuildFloatingIslandStack(FVoxelOpStack& OutStack, const FFloatingIslandParams& P,
+                                                 int32 Seed, float SpineRadius,
+                                                 const UVoxelStrateManager* StrateManager);
 
     /**
      * La pile Maze complète, décomposée — PAS un `FMazeOp` monolithique :

@@ -33,6 +33,13 @@ StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/Float
 On top of the archetype, an optional **biome** layer (§8.14) modulates terrain & content WITHIN a
 strate via a window-invariant XY field — currently wired into SurfaceWorld.
 
+⚠️ **The `switch` above is no longer the only density path.** 6 of the 8 archetypes (all but
+TunnelNetwork and Underwater) also exist as **operator stacks**, selected per strate by
+`bUseOperatorStack` and evaluated instead of the `switch`; each is bit-identical to the function in
+its row. The design lives in `OPSTACK-PLAN.md` / `OPSTACK-DECOMPOSITION.md`, the symbol index in
+`CODEMAP §3.2d` — not repeated here. What matters for *this* document: the archetype table describes
+what the world IS, and both paths compute it.
+
 ### 8.2 (0,0) spine & hybrid connections
 - `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) carves a guaranteed open vertical
   column at XY (0,0) in every strate's **interior** (seals untouched). Radius =

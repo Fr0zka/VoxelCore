@@ -585,6 +585,11 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
 
     case ECaveGeneratorType::VerticalShafts:  return true;   // Phase 2 — 3 ops repris de Maze tels quels
 
+    case ECaveGeneratorType::FloatingIslands:
+        // Phase 2 — la pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
+        // + carve, avec les MÊMES opérateurs au signe près. 6 des 8 portés.
+        return true;
+
     default:                                  return false;
     }
 }

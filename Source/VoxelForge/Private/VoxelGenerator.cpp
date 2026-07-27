@@ -664,6 +664,20 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     VoxelDensityOps::BuildVerticalShaftStack(CP_OpStack, CP_Vert, Seed,
                                                              OriginSpineRadius, StrateManager);
                     break;
+
+                case ECaveGeneratorType::FloatingIslands:
+                    // Même garde de strate dégénérée : GetFloatingIslandDensity court-circuite sur
+                    // `return 1.0f` (= air) quand la hauteur est nulle ou négative.
+                    if (CP_Float.StrateTopWorldZ - CP_Float.StrateBottomWorldZ <= 0.0f)
+                    {
+                        CP_UseOpStack = false;
+                        break;
+                    }
+                    OpCtx.StrateTopWorldZ    = CP_Float.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Float.StrateBottomWorldZ;
+                    VoxelDensityOps::BuildFloatingIslandStack(CP_OpStack, CP_Float, Seed,
+                                                              OriginSpineRadius, StrateManager);
+                    break;
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`
@@ -3428,7 +3442,16 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // organic instead of perfect circles. Computed once per voxel and shared by all nearby
     // islands (each samples a different part of the field → distinct silhouettes).
     const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
-    const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + (float)S * 0.0007f, WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
+    // ⚠️ AUDIT §C1 — DERNIER SITE DU PLUGIN, trouvé en portant cet archétype (2026-07-28). Le
+    // balayage du 2026-07-27 cherchait le motif `SeedF * K` et celui-ci s'écrit `(float)S * K`, donc
+    // il a survécu : à Seed = 2e9 le terme atteint ~1.4e6, où l'ULP du float vaut 0.125 contre un pas
+    // de 0.04 par voxel — le warp s'aplatit et les îles redeviennent des cercles parfaits. Corrigé
+    // dans les DEUX chemins (ici et FIslandBlobSource) en une passe, pour que le test d'équivalence
+    // reste un oracle valable.
+    // NOTE : `SeedOffset` quantifie la clé de site par ×100, donc 0.0007 → site 0. Unique aujourd'hui
+    // (toutes les autres clés du plugin sont ≥ 0.19) ; la prochaine clé sous 0.005 devra en choisir
+    // une autre plutôt que de collisionner en silence.
+    const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + VoxelHash::SeedOffset(S, 0.0007f), WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;
     const float WY = WorldY + FractalNoise3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;

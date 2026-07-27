@@ -445,6 +445,30 @@ untouched — and since a floating-island strate is *mostly* empty void, that is
 with `FConstantVoidSource`'s `ClassifyBox → AllAir`, a FloatingIslands strate could go from skipping
 zero tiles to skipping the large majority of them.
 
+#### ✅ PORTED 2026-07-28 — three deviations from the sketch above, all deliberate
+
+1. **`FConstantVoidSource` and `FSdfFill` are not new classes.** Each is the class it mirrors, with
+   the opposite **sign**: `FConstantFieldSource(±Base)` and `FSdfConvertOp(Sign = ±1)`, two factories
+   each. The table above listed them as separate ops; writing them separately would have duplicated
+   the classifier and the six-line formula for nothing. Multiplying by ±1 is exact in IEEE-754, so
+   the three already-green ports are bit-for-bit untouched by the generalisation.
+   **This is the port's actual result:** reuse **by inversion** rather than by identity — evidence
+   that the abstract axis (the sign of the internal density) is the right one, not just that two
+   archetypes happened to look alike.
+2. **The warp stays inside the source; no `FRAME` op was built.** Frames are worth building at the
+   second real user, and two of the three (`TunnelNetwork`'s cave warp, its tunnel warp) are not
+   ported yet. Designing the abstraction against a single example is what this refactor has avoided
+   throughout — cf. `IVoxelBiomeField`, which was born from a concrete second need. Revisit with
+   TunnelNetwork.
+3. **`AUDIT §C1`'s last surviving site was in this archetype** and was fixed in both paths in the
+   same pass (the warp's `(float)S * 0.0007f`; the 2026-07-27 sweep matched `SeedF * K` and missed
+   the `(float)S` spelling).
+
+**The `Identity` bound is one-sided, and that matters:** `Sdf ≥ WorldZ − TopSurf` bounds an island
+from **above** only. Below `BotZ` the SDF degenerates to ≈ `DistXY`, so a hairline thread of matter
+hangs down each island's axis to the strate floor. Rejecting a box because it sits below an island
+would be a hole. Only the top rejects.
+
 ---
 
 ## 8. Underwater

@@ -42,14 +42,24 @@ namespace
     }
 
     //=========================================================================
-    // RÔLE 1 — SOURCE : ROC CONSTANT / CONSTANT ROCK
+    // RÔLE 1 — SOURCE : CHAMP CONSTANT / CONSTANT FIELD  (roc ET vide)
     //=========================================================================
     // `float Density = Params.BaseDensity;  // start solid` — la première ligne de TunnelNetwork,
-    // de Maze ET de VerticalShafts. Trois archétypes, une ligne, désormais un opérateur.
-    class FConstantRockSource final : public IVoxelDensityOp
+    // de Maze ET de VerticalShafts. Et `float Density = -Params.BaseDensity;  // open air (void)` —
+    // la première ligne de FloatingIslands. **C'est le MÊME opérateur au signe près**, et le signe
+    // n'est pas un détail : il décide du verdict de boîte de départ (AllSolid contre AllAir), donc
+    // de ce que la strate saura sauter.
+    //
+    // Quatre archétypes, une ligne, un opérateur. Deux fabriques (`MakeConstantRockSource` /
+    // `MakeConstantVoidSource`) parce que « roc » et « vide » sont ce que l'auteur veut DIRE ; la
+    // classe, elle, n'a aucune raison d'exister en deux exemplaires.
+    //
+    // One operator, two factories: rock and void are the same constant field with opposite signs,
+    // and the sign is what decides the starting box verdict (AllSolid vs AllAir).
+    class FConstantFieldSource final : public IVoxelDensityOp
     {
     public:
-        explicit FConstantRockSource(float InBaseDensity) : BaseDensity(InBaseDensity) {}
+        explicit FConstantFieldSource(float InValue) : Value(InValue) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -57,23 +67,28 @@ namespace
 
         void Eval(float, float, float, FVoxelOpSample& InOut) const override
         {
-            InOut.Density = BaseDensity;   // Replace : racine de pile, ignore l'entrée
+            InOut.Density = Value;   // Replace : racine de pile, ignore l'entrée
         }
 
-        // Exact et gratuit : une constante positive est solide partout. C'est ce qui donne aux
-        // strates de grotte une hypothèse AllSolid de départ — elles n'en ont jamais eu.
+        // Exact et gratuit, dans les DEUX sens (convention interne : positif = solide).
+        // Positif ⇒ AllSolid : c'est ce qui donne aux strates de grotte une hypothèse de départ
+        // qu'elles n'ont jamais eue. Négatif ⇒ AllAir : c'est ce qui rend une strate d'îles
+        // flottantes — un grand vide surtout vide — sautable là où aucune île n'arrive.
         EVoxelTileClass ClassifyBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return (BaseDensity > 0.0f) ? EVoxelTileClass::AllSolid : EVoxelTileClass::Mixed;
+            if (Value > 0.0f) { return EVoxelTileClass::AllSolid; }
+            if (Value < 0.0f) { return EVoxelTileClass::AllAir; }
+            return EVoxelTileClass::Mixed;   // exactement 0 : le mesher le compte du côté AIR,
+                                             // mais un champ nul n'est pas une hypothèse utile.
         }
 
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return EVoxelOpEffect::Both;   // jamais atteint : ClassifyBox répond avant
+            return EVoxelOpEffect::Both;   // jamais atteint sauf Value == 0 : ClassifyBox répond avant
         }
 
     private:
-        float BaseDensity;
+        float Value;
     };
 
     //=========================================================================
@@ -1003,13 +1018,26 @@ namespace
     };
 
     //=========================================================================
-    // RÔLE 2 — COMBINER : SDF → DENSITÉ (CARVE)
+    // RÔLE 2 — COMBINER : SDF → DENSITÉ (CARVE et FILL)
     //=========================================================================
-    // Les six mêmes lignes dans TunnelNetwork, Maze et VerticalShafts. Une fois ici, plus jamais.
-    class FSdfCarveOp final : public IVoxelDensityOp
+    // Les six mêmes lignes dans TunnelNetwork, Maze, VerticalShafts — et FloatingIslands, où le
+    // SEUL changement est `Density += Fill·Base·2` au lieu de `Density -= Carve·Base·2`.
+    //
+    // Un archétype qui CREUSE dans du roc et un archétype qui REMPLIT du vide sont donc le même
+    // opérateur au signe près, exactement comme la source constante au-dessus. C'est la symétrie
+    // que le `switch` ne pouvait pas montrer : les deux blocs y sont à 900 lignes l'un de l'autre.
+    //
+    // ⚠️ `Sign` vaut ±1.0f et rien d'autre. La multiplication par ±1 est EXACTE en IEEE-754, donc
+    // `D += (-1·F)·B·2` rend bit pour bit ce que `D -= F·B·2` rendait — l'égalité binaire des trois
+    // portages déjà verts en dépend.
+    //
+    // Same operator, opposite sign. Multiplying by ±1 is exact in IEEE-754, so the carve path is
+    // bit-for-bit what it was before this generalisation — the three green ports depend on that.
+    class FSdfConvertOp final : public IVoxelDensityOp
     {
     public:
-        FSdfCarveOp(float InBlend, float InBaseDensity) : Blend(InBlend), BaseDensity(InBaseDensity) {}
+        FSdfConvertOp(float InBlend, float InBaseDensity, float InSign)
+            : Blend(InBlend), BaseDensity(InBaseDensity), Sign(InSign) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::Combiner; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -1017,9 +1045,9 @@ namespace
         void Eval(float, float, float, FVoxelOpSample& InOut) const override
         {
             if (InOut.Sdf >= Blend) { return; }
-            float Carve = FMath::Clamp((Blend - InOut.Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
-            Carve = SmoothStep01(Carve);
-            InOut.Density -= Carve * BaseDensity * 2.0f;   // interne : baisser = vers l'air
+            float T = FMath::Clamp((Blend - InOut.Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
+            T = SmoothStep01(T);
+            InOut.Density += Sign * T * BaseDensity * 2.0f;   // interne : monter = vers le solide
         }
 
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
@@ -1028,7 +1056,7 @@ namespace
         }
 
     private:
-        float Blend, BaseDensity;
+        float Blend, BaseDensity, Sign;
     };
 
     //=========================================================================
@@ -1429,6 +1457,240 @@ namespace
         const FShaftFieldSource* Field;   // NON possédant : la pile possède la source
     };
 
+    //=========================================================================
+    // RÔLE 1 — SOURCE : ÎLES FLOTTANTES / FLOATING ISLAND BLOBS
+    //=========================================================================
+    // Le SEUL archétype dont la source est de l'AIR : `FConstantFieldSource(-BaseDensity)` pose un
+    // grand vide, et cet opérateur y suspend des blobs. C'est ce qui en fait le bon test de
+    // composition — tous les autres portages partent de roc et creusent.
+    //
+    // FORME D'UNE ÎLE : une dalle assez plate au-dessus du centre (`TopHalf = 0.20·Rxy`) et un
+    // dessous qui s'effile vers une pointe (`ThicknessRatio·Rxy`). C'est l'asymétrie qui se lit
+    // comme une île flottante plutôt que comme une sphère.
+    //
+    // ⚠️ ÉCART ASSUMÉ AVEC `OPSTACK-DECOMPOSITION §7`, qui décrivait un `FRAME IslandWarp` enveloppant
+    // la source. Le warp reste À L'INTÉRIEUR de l'opérateur, et c'est délibéré : `§7` compte trois
+    // usages de frames (îles, caves de TunnelNetwork, tunnels), mais **deux d'entre eux ne sont pas
+    // encore portés**. Inventer l'infrastructure de frame pour son unique utilisateur actuel, c'est
+    // la concevoir contre un seul exemple — précisément ce que ce refactor a évité jusqu'ici en
+    // n'abstrayant qu'à la deuxième occurrence (cf. `IVoxelBiomeField`, né d'un besoin réel).
+    // À reprendre quand TunnelNetwork arrivera avec le deuxième usage réel.
+    //
+    // The warp stays INSIDE the op against §7's FRAME suggestion: two of the three frame users are
+    // not ported yet, and designing the abstraction against a single example is what this refactor
+    // has deliberately avoided. Revisit when TunnelNetwork brings the second real use.
+    class FIslandBlobSource final : public IVoxelDensityOp
+    {
+    public:
+        FIslandBlobSource(const FFloatingIslandParams& InP, int32 Seed, float InExtraReach)
+            : P(InP), Salt((uint32)Seed ^ 0x49736C64u)   // 'Isld' — identique à GetFloatingIslandDensity
+            , ExtraReach(InExtraReach) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        struct FIsland { float X, Y, Rxy, TopHalf, TopZ, BotZ, TaperEnd; };
+
+        // ⚠️ DÉCLARÉE ICI, avant toute fonction qui la renvoie — même piège que `FShaftFieldSource`
+        // (C4430 : les corps de méthodes sont différés, les types de retour non).
+        struct FCells { TArray<FIsland, TInlineAllocator<9>> Islands; };
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float BlendK = FMath::Max(P.SDFBlendRadius, 0.01f);
+            const FCells& C = GetCells(WorldX, WorldY);
+
+            // CONTOUR IRRÉGULIER : on déforme la requête HORIZONTALE pour que les bords des îles
+            // soient lobés au lieu d'être des cercles parfaits. Calculé une fois par voxel et
+            // partagé par toutes les îles proches — chacune échantillonne une autre partie du champ,
+            // d'où des silhouettes distinctes.
+            const float WarpAmp = (P.IslandMinRadius + P.IslandMaxRadius) * 0.5f * 0.35f;
+            const float WX = WorldX + HFractal3D(FVector(WorldX * 0.04f + VoxelHash::SeedOffset(Salt, 0.0007f),
+                                                         WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
+                                      * VOXEL_NOISE_SCALE * WarpAmp;
+            const float WY = WorldY + HFractal3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f,
+                                                         WorldZ * 0.012f), VoxelGenLOD::Eff(3))
+                                      * VOXEL_NOISE_SCALE * WarpAmp;
+
+            float IslandSDF = FLT_MAX;
+            for (const FIsland& Isl : C.Islands)
+            {
+                // Distance horizontale dans le repère DÉFORMÉ, donc le contour n'est pas un cercle.
+                const float Dxw = WX - Isl.X, Dyw = WY - Isl.Y;
+                const float DistXY = FMath::Sqrt(Dxw * Dxw + Dyw * Dyw);
+
+                // Enveloppe de rayon par la hauteur : pleine largeur en haut, resserrée jusqu'à une
+                // pointe en bas (taper SmoothStep).
+                const float Hgt = FMath::Clamp((WorldZ - Isl.BotZ) / FMath::Max(Isl.TopZ - Isl.BotZ, 1.0f),
+                                               0.0f, 1.0f);
+                const float Taper = SmoothStep01(FMath::Clamp(Hgt / Isl.TaperEnd, 0.0f, 1.0f));
+                const float Env = Isl.Rxy * Taper;
+
+                // Surface du dessus : plate par défaut ; les bords retombent en dôme si TopFlatten < 1.
+                float TopSurf = Isl.TopZ;
+                if (P.TopFlatten < 1.0f)
+                {
+                    const float Edge = FMath::Clamp(DistXY / FMath::Max(Isl.Rxy, 1.0f), 0.0f, 1.0f);
+                    TopSurf = Isl.TopZ - (1.0f - P.TopFlatten) * Isl.TopHalf * 2.0f * Edge * Edge;
+                }
+
+                // Pseudo-SDF : dehors si au-delà de l'enveloppe radiale OU au-dessus du dessus.
+                const float Sdf = FMath::Max(DistXY - Env, WorldZ - TopSurf);
+
+                IslandSDF = VoxelSDF::SmoothMin(IslandSDF, Sdf, BlendK);
+            }
+
+            InOut.Sdf = IslandSDF;
+        }
+
+        /**
+         * `FillOnly` si une île peut atteindre la boîte, `Identity` sinon — et sur une strate d'îles
+         * `Identity` est le cas COURANT, ce qui est tout l'intérêt : combiné à l'`AllAir` de la
+         * source constante, c'est la première fois qu'un archétype de grotte peut prouver « tout air »
+         * (`OPSTACK-DECOMPOSITION §7`).
+         *
+         * BORNE, et pourquoi elle est sûre dans les deux directions :
+         *   • en XY, `Sdf ≥ DistXY − Rxy` (l'enveloppe ne dépasse jamais `Rxy`), et le warp déplace
+         *     le POINT de `WarpAmp · VOXEL_NOISE_SCALE · √2` au plus (FBM ∈ [−1,1] sur DEUX axes
+         *     indépendants — voir la note √2 dans le corps) ;
+         *   • en Z, `Sdf ≥ WorldZ − TopSurf ≥ WorldZ − TopZ`, donc au-dessus du sommet + marge il
+         *     n'y a plus rien à faire. **En dessous, il n'y a PAS de borne** : sous une île, le SDF
+         *     vaut ≈ `DistXY` à toute profondeur, donc un mince fil de matière descend le long de
+         *     l'axe. C'est le comportement de l'original ; le confondre avec « rien en dessous »
+         *     serait un TROU, et c'est pourquoi seule la borne HAUTE est testée.
+         *   • `ExtraReach` couvre l'aval (rugosité, blend du fill, creux du SmoothMin ≤ K/6).
+         */
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        {
+            // ⚠️ √2, PAS 1×. Le warp déplace X et Y par DEUX échantillons de bruit INDÉPENDANTS,
+            // chacun borné par `WarpAmp · VOXEL_NOISE_SCALE`. Le déplacement du POINT est donc la
+            // diagonale, `WarpMax·√2`, et non `WarpMax`. Une marge à 1× serait fausse de 41 % dans
+            // le pire cas — c'est-à-dire un trou dans le coin exact où les deux bruits saturent
+            // ensemble. Rare, et c'est précisément ce qui rendrait le bug injoignable en test.
+            // TWO independent noise samples ⇒ the point displacement is the diagonal, not one axis.
+            constexpr float Sqrt2 = 1.4142136f;
+            const float WarpMax = (P.IslandMinRadius + P.IslandMaxRadius) * 0.5f * 0.35f
+                                  * VOXEL_NOISE_SCALE * Sqrt2;
+            const float Pad = ExtraReach + FMath::Abs(WarpMax);
+            const float MaxR = FMath::Max(P.IslandMinRadius, P.IslandMaxRadius);
+
+            const float Spacing = FMath::Max(P.IslandSpacing, 1.0f);
+            const FBox Padded = VoxelBox.ExpandBy(MaxR + Pad);
+            const int32 CX0 = FMath::FloorToInt((float)Padded.Min.X / Spacing);
+            const int32 CX1 = FMath::FloorToInt((float)Padded.Max.X / Spacing);
+            const int32 CY0 = FMath::FloorToInt((float)Padded.Min.Y / Spacing);
+            const int32 CY1 = FMath::FloorToInt((float)Padded.Max.Y / Spacing);
+
+            for (int32 cy = CY0; cy <= CY1; ++cy)
+            for (int32 cx = CX0; cx <= CX1; ++cx)
+            {
+                FIsland Isl;
+                if (!RollIsland(cx, cy, Isl)) { continue; }
+
+                // Entièrement au-dessus du sommet de l'île (+ marge) ⇒ hors d'atteinte.
+                if ((float)VoxelBox.Min.Z > Isl.TopZ + Pad) { continue; }
+
+                const float R  = Isl.Rxy + Pad;
+                const float QX = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.X - Isl.X,
+                                                             Isl.X - (float)VoxelBox.Max.X));
+                const float QY = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.Y - Isl.Y,
+                                                             Isl.Y - (float)VoxelBox.Max.Y));
+                if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::FillOnly; }
+            }
+
+            return EVoxelOpEffect::Identity;
+        }
+
+    private:
+        /** Tirage d'une cellule. PURE en (cellule, seed, params) ⇒ `Eval` et `EffectOverBox` ne
+         *  peuvent pas voir des îles différentes. Transcription littérale du bloc de cuisson de
+         *  `GetFloatingIslandDensity`. */
+        bool RollIsland(int32 nx, int32 ny, FIsland& Out) const
+        {
+            const float H = P.StrateTopWorldZ - P.StrateBottomWorldZ;
+            const float Spacing = FMath::Max(P.IslandSpacing, 1.0f);
+            const float MidZ = (P.StrateTopWorldZ + P.StrateBottomWorldZ) * 0.5f;
+
+            const uint32 Hh = VoxelHash::Cell(nx, ny, Salt);
+            if (VoxelHash::ToFloat01(Hh) > P.IslandDensity) { return false; }
+
+            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
+            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
+
+            Out.X = (nx + 0.15f + JX * 0.7f) * Spacing;
+            Out.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
+            Out.Rxy = FMath::Lerp(P.IslandMinRadius, P.IslandMaxRadius,
+                                  VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x5A5Au)));
+
+            // PROFIL ASYMÉTRIQUE : dalle de terre au-dessus, dessous qui s'effile en pointe.
+            Out.TopHalf = Out.Rxy * 0.20f;
+            const float UnderDepth = Out.Rxy * FMath::Max(P.ThicknessRatio, 0.25f);
+
+            const float SpreadZ = FMath::Max(H * 0.5f - FMath::Max(Out.TopHalf, UnderDepth)
+                                             - P.BoundarySealThickness, 0.0f) * P.VerticalJitter;
+            const float Cz = MidZ + VoxelHash::ToFloatSigned(VoxelHash::Mix(Hh ^ 0xB17Du)) * SpreadZ;
+            Out.TopZ = Cz + Out.TopHalf;
+            Out.BotZ = Cz - UnderDepth;
+
+            // Netteté du taper par île (point d'arrivée du SmoothStep) → silhouettes variées.
+            Out.TaperEnd = FMath::Lerp(0.45f, 0.7f, VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x7A1Eu)));
+            return true;
+        }
+
+        /**
+         * Le voisinage 3×3, mémoïsé par worker — la même cuisson `thread_local` que l'original.
+         *
+         * ⚠️ LA CLÉ INCLUT `BoundarySealThickness`, QUE L'ORIGINAL OMET. `SpreadZ` s'en sert
+         * (`H·0.5 − max(TopHalf, UnderDepth) − Seal`), donc dans `GetFloatingIslandDensity` une
+         * édition à chaud qui ne change QUE l'épaisseur de seal sert des îles périmées. Même famille
+         * que `AUDIT §C2` et que la régression d'overhang du 2026-07-27 : une clé de cache
+         * incomplète ne se voit pas, elle produit du terrain plausible. Ajouter le champ ne coûte
+         * qu'un recalcul, jamais une valeur différente — donc l'égalité binaire tient.
+         *
+         * The key includes BoundarySealThickness, which the original omits although SpreadZ reads it.
+         * Adding it can only cost a recompute, never change a value — bit-equality is unaffected.
+         */
+        const FCells& GetCells(float WorldX, float WorldY) const
+        {
+            const float Spacing = FMath::Max(P.IslandSpacing, 1.0f);
+            const int32 CX = FMath::FloorToInt(WorldX / Spacing);
+            const int32 CY = FMath::FloorToInt(WorldY / Spacing);
+
+            thread_local FCells  Cache;
+            thread_local int32   FI_CX = INT32_MAX, FI_CY = INT32_MAX;
+            thread_local uint32  FI_Salt = 0xFFFFFFFFu;
+            thread_local float   FI_Spacing = -1.0f, FI_Dens = -1.0f, FI_MinR = -1.0f, FI_MaxR = -1.0f,
+                                 FI_Thick = -1.0f, FI_VJit = -1.0f, FI_Seal = -1.0f,
+                                 FI_BotZ = FLT_MAX, FI_TopZ = FLT_MAX;
+
+            if (CX != FI_CX || CY != FI_CY || Salt != FI_Salt || Spacing != FI_Spacing ||
+                P.IslandDensity != FI_Dens || P.IslandMinRadius != FI_MinR ||
+                P.IslandMaxRadius != FI_MaxR || P.ThicknessRatio != FI_Thick ||
+                P.VerticalJitter != FI_VJit || P.BoundarySealThickness != FI_Seal ||
+                P.StrateBottomWorldZ != FI_BotZ || P.StrateTopWorldZ != FI_TopZ)
+            {
+                FI_CX = CX;  FI_CY = CY;  FI_Salt = Salt;  FI_Spacing = Spacing;
+                FI_Dens = P.IslandDensity;  FI_MinR = P.IslandMinRadius;  FI_MaxR = P.IslandMaxRadius;
+                FI_Thick = P.ThicknessRatio;  FI_VJit = P.VerticalJitter;
+                FI_Seal = P.BoundarySealThickness;
+                FI_BotZ = P.StrateBottomWorldZ;  FI_TopZ = P.StrateTopWorldZ;
+                Cache.Islands.Reset();
+
+                for (int32 dy = -1; dy <= 1; dy++)
+                for (int32 dx = -1; dx <= 1; dx++)
+                {
+                    FIsland Isl;
+                    if (RollIsland(CX + dx, CY + dy, Isl)) { Cache.Islands.Add(Isl); }
+                }
+            }
+            return Cache;
+        }
+
+        FFloatingIslandParams P;
+        uint32 Salt;
+        float  ExtraReach;
+    };
+
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
     // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
     // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
@@ -1459,7 +1721,14 @@ namespace VoxelDensityOps
 {
     TUniquePtr<IVoxelDensityOp> MakeConstantRockSource(float BaseDensity)
     {
-        return MakeUnique<FConstantRockSource>(BaseDensity);
+        return MakeUnique<FConstantFieldSource>(BaseDensity);
+    }
+
+    TUniquePtr<IVoxelDensityOp> MakeConstantVoidSource(float BaseDensity)
+    {
+        // `float Density = -Params.BaseDensity;  // start as open air (void)` — la négation unaire
+        // est exacte, donc c'est littéralement la première ligne de GetFloatingIslandDensity.
+        return MakeUnique<FConstantFieldSource>(-BaseDensity);
     }
 
     TUniquePtr<IVoxelDensityOp> MakeLatticeCorridorSource(const FMazeGenerationParams& P, int32 Seed, float ExtraReach)
@@ -1475,7 +1744,12 @@ namespace VoxelDensityOps
 
     TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity)
     {
-        return MakeUnique<FSdfCarveOp>(Blend, BaseDensity);
+        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, -1.0f);
+    }
+
+    TUniquePtr<IVoxelDensityOp> MakeSdfFill(float Blend, float BaseDensity)
+    {
+        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, +1.0f);
     }
 
     TUniquePtr<IVoxelDensityOp> MakeSlabVoidSource(const FSlabGenerationParams& P, int32 Seed)
@@ -1558,6 +1832,39 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.1f, 3, P.SurfaceRoughness + 4.0f));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
         OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
+
+        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+    }
+
+    void BuildFloatingIslandStack(FVoxelOpStack& OutStack, const FFloatingIslandParams& P,
+                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+    {
+        // ⚠️ LA PILE QUI S'INVERSE, et c'est la mesure que ce portage-ci ajoute : les quatre autres
+        // archétypes partent de ROC et CREUSENT ; celui-ci part du VIDE et REMPLIT. Aucune des deux
+        // extrémités n'a demandé un opérateur neuf — la source constante et la conversion SDF→densité
+        // sont les MÊMES classes, au signe près (`FConstantFieldSource`, `FSdfConvertOp`). Un
+        // opérateur qui se réutilise en s'inversant est une preuve plus forte qu'un opérateur qui se
+        // réutilise à l'identique : ça veut dire que l'axe abstrait (le signe de la densité) est le
+        // bon, pas seulement que deux archétypes se ressemblaient.
+        //
+        // The stack that runs BACKWARDS: four archetypes start from rock and carve, this one starts
+        // from void and fills — and neither end needed a new operator, only the opposite sign.
+        const float BlendK = FMath::Max(P.SDFBlendRadius, 0.01f);
+
+        // Portée que la source doit déclarer pour la paire source+fill : la rugosité peut abaisser
+        // le SDF de `Rough·VOXEL_NOISE_SCALE` (FBM ∈ [-1,1]), le SmoothMin de `K/6` de plus, et le
+        // fill s'applique dès `Sdf < BlendK`. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
+        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
+                               + BlendK * 2.0f + 1.0f;
+
+        OutStack.Add(MakeConstantVoidSource(P.BaseDensity));
+        OutStack.Add(MakeUnique<FIslandBlobSource>(P, Seed, ExtraReach));
+        // Fréquence 0.08 et 4 octaves — les constantes de `GetFloatingIslandDensity`. Quatrième
+        // archétype à réutiliser cet opérateur (Maze 0.12/3, VerticalShafts 0.1/3).
+        OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.08f, 4,
+                                         P.SurfaceRoughness + BlendK + 2.0f));
+        OutStack.Add(MakeSdfFill(BlendK, P.BaseDensity));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);

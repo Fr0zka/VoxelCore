@@ -400,10 +400,18 @@ Port each archetype **the next time a feature makes you open it anyway**. The sw
 Suggested order when there's a free choice — cheapest and least risky first:
 
 ✅ `Maze` (P1) → ✅ `FlatPlain`/`CrystalChamber` (one op, two default sets — the first real win: two
-archetypes collapse into one; **done**, `BuildSlabStack`, 8 archetypes → 7) → ✅ `SurfaceWorld` (**done**, incl. biomes — needed a whole second op family, `VoxelHeightOp.h`) → ✅ `VerticalShafts` (**done**, 3 ops reused from Maze unchanged) (biggest payoff, biggest care: the T1.a column cache and the exact-
-lattice `ClassifyTile` bound must both survive) → `VerticalShafts` → `FloatingIslands` → `TunnelNetwork`
+archetypes collapse into one; **done**, `BuildSlabStack`, 8 archetypes → 7) → ✅ `SurfaceWorld`
+(**done**, incl. biomes — needed a whole second op family, `VoxelHeightOp.h`; biggest payoff, biggest
+care: the T1.a column cache and the exact-lattice `ClassifyTile` bound both survived) →
+✅ `VerticalShafts` (**done**, 3 ops reused from Maze unchanged) →
+✅ `FloatingIslands` (**done**, `BuildFloatingIslandStack` — the stack that runs **backwards**: void
+source + fill instead of rock source + carve, the *same* classes with the opposite sign; only the
+blob source is new) → `Underwater` (TunnelNetwork + a flag) → `TunnelNetwork`
 (**last** — it owns `BuildChunkCache`'s two-region window-invariance discipline, §8.4, the most delicate
 code in the plugin).
+
+**6 of 8 ported.** The two that remain are really one: `Underwater` *is* TunnelNetwork plus
+`WaterLevelRelative` (§8), so the switch loses its last two cases in a single port.
 
 Along the way, `FStrateGenerationParams`' 74 fields decompose into per-op structs, which retires the
 `VF_STRATE_PARAM_FIELDS` X-macro drift problem for free.

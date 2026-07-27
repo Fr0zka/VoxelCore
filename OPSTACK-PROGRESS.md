@@ -1797,3 +1797,109 @@ things Phase 2 invented (height space, `IVoxelBiomeField`), and the method lesso
 in build cycles.
 
 ---
+
+## 2026-07-28 — FloatingIslands ported. 6 of 8. The stack runs BACKWARDS, and §C1 was NOT closed.
+
+**The portage that tests the AXIS, not the fidelity.** `VerticalShafts` measured reuse *by identity*
+— three of Maze's ops, not a line changed. This one measures something stronger and riskier for the
+abstraction: **reuse by INVERSION**.
+
+The four archetypes ported so far all start from ROC and CARVE. FloatingIslands starts from the VOID
+and FILLS. If the abstract axis chosen back in §0.1 — the *sign* of the internal density — is the
+right one, then both ends of the pile must be the same operators negated:
+
+```
+FConstantFieldSource(+Base)   ←→   FConstantFieldSource(-Base)      ClassifyBox: AllSolid ←→ AllAir
+FSdfConvertOp(Sign = -1)      ←→   FSdfConvertOp(Sign = +1)         carve         ←→ fill
+FSdfRoughnessMod              ←→   FSdfRoughnessMod                 4ᵉ archétype, inchangé
+```
+
+And it holds: **the only new operator in this port is the island blob.** 7 ops total.
+
+Two classes were merged rather than duplicated (`FConstantRockSource` → `FConstantFieldSource`,
+`FSdfCarveOp` → `FSdfConvertOp`), each with two factories so the *authoring* vocabulary keeps saying
+"rock"/"void" and "carve"/"fill". Multiplying by ±1 is exact in IEEE-754, so the three green ports
+are bit-for-bit untouched — that claim is load-bearing and the next run tests it.
+
+### `ClassifyBox` can say **AllAir** for the first time
+
+No cave archetype has ever proved "all air"; `FConstantVoidSource` can, trivially and exactly, and a
+floating-island strate is *by construction* mostly empty. That is `OPSTACK-DECOMPOSITION §7`'s claim,
+and the test counts AllSolid and AllAir **separately** — an aggregate "N proved" would have hidden
+precisely the number that matters. If AllAir comes back 0, the stack is still sound and the perf
+argument simply did not fire (the VerticalShafts situation); the test says so out loud rather than
+looking green.
+
+### ⚠️ The bound is ONE-SIDED, and assuming otherwise would have been a hole
+
+`Sdf ≥ WorldZ − TopSurf` bounds an island from above. **There is no bound from below:** under an
+island the SDF degenerates to ≈ `DistXY`, so a hairline thread of matter hangs down the axis to the
+strate floor. Rejecting a box for sitting below an island would be a hole in the original's own
+geometry. Only the top rejects.
+
+Second trap, caught by doing the arithmetic rather than eyeballing it: the domain warp displaces X
+and Y with **two independent** noise samples, so the point moves along the diagonal — the pad needs
+`WarpAmp·√2`, not `WarpAmp`. A 1× pad is wrong by 41 % exactly where both noises saturate together:
+rare, plausible-looking, and effectively unreachable by random testing.
+
+### ⚠️⚠️ `AUDIT §C1` was reported closed on 2026-07-27. It was one site short.
+
+Found by reading `GetFloatingIslandDensity` line by line to port it:
+
+```cpp
+const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + (float)S * 0.0007f, ...));
+```
+
+**The sweep matched `SeedF * K`; this site spells it `(float)S * K`.** A textual sweep finds a
+spelling, not a bug. And the property test could not compensate — `LargeSeedSurvives` asserts the
+*heightfield* still varies, while this site perturbs an *island outline*: at seed 2e9 the term hits
+~1.4e6, ULP 0.125 against a 0.04 voxel step, so the warp flattens and every island snaps back to a
+perfect circle. Cosmetic, not catastrophic, which is exactly why nothing screamed for two days.
+
+Fixed in **both** paths in one pass so `FloatingIslandEquivalence` stays a valid oracle. Recorded in
+`AUDIT §C1` with the sharp edge that came with it: `SeedOffset` quantises its site key by ×100, so
+`0.0007f` lands on site **0** — unique today (every other key is ≥ 0.19), silently collidable
+tomorrow.
+
+**This is the third time this session that a confident premise failed a check.** C1's *documented*
+fix was wrong; "C9 is gone after FPSemantics" was wrong; now "C1 is closed, 0 left behind" was wrong.
+The pattern is stable enough to plan around: **a claim about the code is evidence about whatever was
+actually examined, and nothing else.**
+
+### Deviation from `§7`, stated
+
+`§7` sketched a `FRAME IslandWarp` wrapping the source. The warp stays **inside** the op. Frames are
+worth building at the *second* real user, and two of the three (TunnelNetwork's cave warp, its tunnel
+warp) are not ported. Designing an abstraction against one example is what this refactor has avoided
+throughout — `IVoxelBiomeField` exists because a second, concrete need appeared. Revisit at
+TunnelNetwork.
+
+Also carried over from the shaft port: the 3×3 memo key includes `BoundarySealThickness`, **which the
+original omits** although `SpreadZ` reads it. Same family as `§C2` and as the overhang regression of
+2026-07-27. Adding a field to a cache key can only cost a recompute; leaving one out costs a wrong
+world, invisibly.
+
+**Ported: Maze · FlatPlain · CrystalChamber · SurfaceWorld (biomes incl.) · VerticalShafts ·
+FloatingIslands — 6 of 8.** The two remaining are really one: `Underwater` *is* TunnelNetwork plus
+`WaterLevelRelative` (§8), so the `switch` loses both cases in a single port.
+
+**UNVERIFIED:** nothing here is compiled. Likely spots, in order: the two class renames
+(`FConstantRockSource` / `FSdfCarveOp` no longer exist — every reference should go through a factory,
+but a missed one is a clean C2065); `FFloatingIslandParams` reaching `VoxelDensityOpStack.cpp`
+(it comes via `VoxelStrateTypes.h`, already included, so this should be free); the nested `FCells`
+declared before its returning functions (the `FShaftFieldSource` C4430 trap, avoided deliberately);
+and `MakeUnique<FIslandBlobSource>` being called from the factory namespace, which is fine only
+because the class sits above the end-of-anonymous-namespace line.
+
+**Next single action:** build, run the `VoxelForge` filter — **12 tests** now, the new one is
+`VoxelForge.OpStack.FloatingIslandEquivalence`. Watch three numbers in its output: samples inside
+island rock (0 ⇒ the equivalence proved only that two voids agree), the AllAir verdict count (0 ⇒ the
+perf argument did not fire), and of course the diff count.
+
+**⚠️ EXPECT ISLAND SILHOUETTES TO CHANGE** wherever the seed is large — that is the C1 fix, it is
+intended, and §2.6.1 covers it.
+
+Then `Underwater` + `TunnelNetwork` (§8 / §2, **last**, with §8.4's window-invariance discipline).
+Perf still parked by Jahni until the transition is complete.
+
+---
