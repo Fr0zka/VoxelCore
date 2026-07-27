@@ -1774,3 +1774,26 @@ instead of "a shaft exists nearby", which is `§6`'s split argument arriving thr
 Then `FloatingIslands` (§7) → `Underwater` (§8) → `TunnelNetwork` (§2, **last**). Perf still parked.
 
 ---
+
+## 2026-07-27 — END OF DAY 2. All 11 tests green. 5 of 8 archetypes ported.
+
+The params fingerprint fixed the overhang regression; the full `VoxelForge` filter is green.
+
+**Ported and wired, all bit-identical to their originals:** Maze · FlatPlain · CrystalChamber ·
+SurfaceWorld (biomes included) · VerticalShafts.
+
+**Remaining ports:** `FloatingIslands` (§7) → `Underwater` (§8) → `TunnelNetwork` (§2, **last**).
+
+**Open items, none blocking:**
+- **Perf** — op path is slower; parked by Jahni until the transition is complete. One cause fixed.
+- **`§C9` library half** — `sinf`/`cosf` not IEEE-754; 0 samples measured at risk. Run the digest on
+  Linux and pin it when the platforms agree.
+- **VerticalShafts proves 0 of 60 tiles** — pessimistic `EffectOverBox`, not a hole.
+- **`ClassifyTile` still hand-written** — `ClassifyBox` is verified but unconsumed. This is where the
+  measured tile-skipping becomes actual frames, and it is arguably the biggest win left.
+
+`OPSTACK-HANDOFF.md` rewritten for a fresh context: current state, what is left in order, the two
+things Phase 2 invented (height space, `IVoxelBiomeField`), and the method lessons that were paid for
+in build cycles.
+
+---

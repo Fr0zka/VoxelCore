@@ -1,4 +1,4 @@
-# Handoff — VoxelForge operator stack, 2026-07-27
+# Handoff — VoxelForge operator stack, 2026-07-27 (end of day 2)
 
 > Paste the block below into a fresh session. Everything it refers to is on disk and in git.
 
@@ -15,89 +15,92 @@ don't re-derive them.
    compile-error spots, and wait.
 2. **`OPSTACK-PROGRESS.md` — THE LAST ENTRY FIRST.** Append-only log of what is built vs merely
    written. This is the resume point.
-3. **`OPSTACK-PLAN.md`** — the plan. §2.5 op taxonomy, §2.6 acceptance bar, §4 phases, §5 invariants.
-4. **`OPSTACK-DECOMPOSITION.md`** — all 8 archetypes broken into ops, every param traced. §10.4 is
-   the port order, §11 the open questions.
-5. **`AUDIT-2026-07.md` §C10** — read before touching the Maze equivalence test. Six builds were
-   spent there; it is parked deliberately.
+3. **`OPSTACK-PLAN.md`** — the plan. **§2.6.1 is the current acceptance bar** and supersedes §2.6.
+4. **`OPSTACK-DECOMPOSITION.md`** — all 8 archetypes broken into ops. §5 SurfaceWorld, §6 shafts,
+   §7 islands, §2 TunnelNetwork.
+5. **`AUDIT-2026-07.md`** — §C9 is the top open risk (half fixed). **§C10 is SOLVED — don't reopen.**
 6. **`CODEMAP.md`** — navigation. Trust symbol names over line numbers.
 
-## Where things stand
+## Where things stand — 5 of 8 archetypes ported, 11 tests green
 
-**Phase 0.5 — DONE, green.** Five automation tests, all passing (Session Frontend → Automation,
-filter `VoxelForge`): `DensityPurity`, `ClassifyTileSoundness`, `DiffLayerContention`,
-`LiveEditInvalidation`, `OpStack.BoxVerdictFold`, `OpStack.MazeEquivalence`. They found and fixed a
-real bug (AUDIT C2 — five caches missing `LayoutVersion`).
+| Archetype | State |
+|---|---|
+| `Maze` | ✅ ported, bit-identical, wired |
+| `FlatPlain` + `CrystalChamber` | ✅ **one op for both**, bit-identical, wired |
+| `SurfaceWorld` | ✅ ported incl. **biome blending**, bit-identical, wired |
+| `VerticalShafts` | ✅ ported, bit-identical, wired — **3 ops reused from Maze unchanged** |
+| `FloatingIslands` | ❌ next (§7) |
+| `Underwater` | ❌ (§8 — TunnelNetwork + a water flag) |
+| `TunnelNetwork` | ❌ **LAST**, deliberately — owns `BuildChunkCache`'s two-region window-invariance discipline (§8.4), the most delicate code in the plugin |
 
-**Phase 1 — DONE and verified.** `Maze` decomposes into **seven** ops with no contortion:
-`ConstantRock → LatticeCorridor → SdfRoughness → SdfCarve → Spine → Seal → Passage`. Measured:
-SDF reproduced **bit for bit**, **zero isosurface crossings** out of 20 000, window-invariant across
-worker threads, every box verdict survives brute force, and **23 of 60 tiles proved uniform** where
-`ClassifyTile` proves zero for any cave archetype. That last number is the perf case for the whole
-refactor, measured rather than argued.
+Everything is behind `UVoxelStrateDefinition::bUseOperatorStack`; the ported list lives **only** in
+`UVoxelStrateManager::UsesOperatorStackForChunk`. Un-ported archetypes ignore the flag, so ticking it
+anywhere is harmless.
 
-**Phase 1 step 3 — WRITTEN, NOT COMPILED.** The stack is wired into `GetDensityAt` behind
-`UVoxelStrateDefinition::bUseOperatorStack`, with the ported-archetype list living only in
-`UVoxelStrateManager::UsesOperatorStackForChunk()`. **This is the immediate next thing to build.**
+## Two things Phase 2 invented that were not in the original design
 
-### The immediate next action
+1. **Height space** (`VoxelHeightOp.h`) — a *second operator family*. SurfaceWorld's terrain ops
+   (cliff/terrace/layer-lines/beach) read and write an **altitude**, not a density: no input Z,
+   XY-pure per column, neither density nor SDF touched. They do not fit `IVoxelDensityOp`. §0.1 found
+   density needed a second *channel*; this found terrain needs a second **space**. Bonus: a height
+   stack *cannot* hold Z-dependent data because there is no Z in the signature — `AUDIT §6.3`'s
+   hazard became a type error instead of a convention.
+2. **`IVoxelBiomeField`** — ops depend on a *capability*, never on `UVoxelGenerator`. The adapter
+   (`FGeneratorBiomeField`) lives in `VoxelGenerator.cpp`. This is what lets ops become assets in
+   Phase 3; an op holding a generator pointer never could.
 
-1. I build. Likely error spots: the `else switch` form in `GetDensityAt`, `FVoxelOpStack` as a
-   `thread_local` (it is move-only, reset by move-assigning a temporary), the new include.
-2. Then the **visual A/B**, which is the last thing Phase 1 needs: tick `bUseOperatorStack` on a Maze
-   strate, regenerate, compare against the same seed with it off. **Pass = recognisably the same
-   maze** (same corridor scale, connectivity, feel). That is `OPSTACK-PLAN §2.6`'s bar — judged on a
-   screenshot, not a diff.
-3. Then **Phase 2**, starting with the cheapest win: `FlatPlain` + `CrystalChamber` collapse into one
-   op (`OPSTACK-DECOMPOSITION §3`). Ask me §3.1 first — whether the slab floor noise's Z term is
-   intentional; if it can go, both archetypes become XY-pure and start skipping tiles.
+## What is left, in the order I'd do it
+
+1. **`FloatingIslands`** (§7) — next port.
+2. **`Underwater`** (§8) — TunnelNetwork + a flag; fold in once TunnelNetwork is done.
+3. **`TunnelNetwork`** (§2) — last, and take §8.4's window-invariance discipline seriously.
+4. **PERF — deliberately parked by Jahni until the transition is complete.** Generation is measurably
+   slower on the op path. One cause found and fixed (the column memo was discarding itself every
+   chunk). Remaining suspects in order: the hashed column lookup vs. `GSurfColCache`'s direct-indexed
+   box, then per-voxel virtual dispatch. **Measure before optimising** — that is the C10 lesson.
+5. **`AUDIT §C9` library half** — `FPSemantics = Precise` fixed the compiler half; `sinf`/`cosf` are
+   not IEEE-754 specified, so MSVC's CRT and glibc's libm can still differ. Currently **0 samples
+   within 1e-6 of the isosurface**, i.e. no measured risk. If it ever must be zero *by construction*,
+   the fix is a deterministic in-house sin/cos, not a build flag. Also: run
+   `CrossPlatformDigest` on Linux and compare the SHAPE digest, then pin it.
+6. **VerticalShafts proves 0 of 60 tiles** (Maze 23, slabs 36-40). Pessimistic, not wrong: its
+   `EffectOverBox` returns `CarveOnly` whenever any shaft is within a `Spacing*1.6` halo instead of
+   testing real connector capsules. Lost CPU, never a hole.
+7. **`ClassifyTile` still uses hand-written guards.** `ClassifyBox` exists and is brute-force verified
+   per archetype, but **nothing consumes it in production yet**. That is where the measured
+   tile-skipping (23 / 36 / 40 of 60, against today's zero) actually turns into frames — arguably the
+   biggest single win still on the table.
 
 ## Hard rules that prevent real bugs
 
-- **Density sign:** negative = solid, positive = air *at the mesher*. Inside the op stack the
-  convention is INTERNAL (**positive = solid**), negated once by the caller. The SDF channel uses
-  standard SDF convention, so `min()` means opposite things on the two channels. This is the #1
-  source of confusion in the plugin — `VoxelDensityOp.h` explains it.
-- **Never run both density paths in one world**, and never compare them for equality (§C10).
-- Every cache key includes `LayoutVersion`; `ProcessQueue` stays `EQueueMode::Mpsc`; `Epoch` carries
-  through every async path; don't "optimize" the `ARCHITECTURE §8.10` perf invariants.
-- Never edit `Binaries/`, `Intermediate/`, `*.generated.h`. Comments are French + English — match the
-  surrounding file.
-- Commit per coherent unit with a real message. Never push. `main` is the known-good fallback.
-- Update `CODEMAP §3` for new/renamed symbols, `ARCHITECTURE §8` for design changes, tick phases in
-  `OPSTACK-PLAN.md`, and append to `OPSTACK-PROGRESS.md`.
+- **Density sign:** negative = solid at the mesher. Inside the op stack the convention is INTERNAL
+  (**positive = solid**), negated once by the caller. The SDF channel uses standard SDF convention.
+- **Never run both density paths in one world.**
+- **The acceptance bar is `§2.6.1`:** *same seed ⇒ same world on every peer*. Resemblance to the
+  pre-refactor world is **not** required. The equivalence tests are **port-correctness oracles**, not
+  fidelity checks — keep them for that reason.
+- **Every cache key includes `LayoutVersion` AND the params.** See the §C2 note and the overhang
+  regression of 2026-07-27, where omitting the params silently deleted the overhang and only 1 sample
+  in 20 000 crossed the isosurface.
+- `ProcessQueue` stays `EQueueMode::Mpsc`; `Epoch` carries through every async path; don't "optimize"
+  the `ARCHITECTURE §8.10` invariants.
+- Commit per coherent unit with a real message. **Never push.** `main` is the known-good fallback.
+- Update `CODEMAP §3`, `ARCHITECTURE §8`, tick `OPSTACK-PLAN`, append to `OPSTACK-PROGRESS.md`.
 
-## ⚠️ The lesson from this session — it cost six builds
+## Method lessons this refactor actually paid for
 
-Chasing a 1-ULP difference in the Maze port, I proposed **five** hypotheses and every one was refuted
-by measurement: the `FVector` round-trip, a transcription slip, `/fp:fast` across translation units,
-inlining context, and compile-time-constant vs runtime parameters. Each was plausible. Each cost a
-build. What actually produced information was instrumenting — a bisect, a three-way comparison, a
-variable-isolation harness.
-
-Worse, twice I reasoned confidently from a premise I hadn't checked (a build flag that had landed in
-the wrong module; a comparison that was circular by construction and could not fail).
-
-**So: on any numeric discrepancy, instrument before hypothesising, and verify the premise before
-reasoning from it.** And know when to stop — Jahni called it, correctly, once the port was proven
-correct on every axis that affects the game and only the last rounding was unexplained.
-
-## New this session: 39 Unreal skills are installed
-
-`.claude/skills/<name>/SKILL.md` — they were nested one level too deep and invisible; now flattened
-and loading. Directly relevant: `automation-and-testing`, `coding-standards`,
-`module-and-build-system` (covers `PCHUsage` / shared PCH / IWYU — the exact thing that blocked
-§C10's settling experiment), `game-thread-performance`, `memory-and-gc`, `navigating-engine-source`.
-**Use them** — the one that would have explained the shared-PCH failure was sitting in the repo,
-undiscovered, while I worked it out the slow way.
-
-## Known open items, deliberately not done
-
-- **AUDIT C1** — unbounded `SeedF`, one line at six sites. Dormant at small seeds; applying it
-  re-rolls the world's noise and forces a re-tune, so it wants its own build. **Still a real bug.**
-- **IWYU debt** — seven headers use engine types they never include; the plugin only compiles because
-  of the shared PCH. Blocks `FPSemantics` experiments. Worth clearing on its own terms.
-- **AUDIT C10** — the parked ULP residue. Read it before reopening; five hypotheses are already
-  refuted in a table there.
-- `OPSTACK-DECOMPOSITION §11` — five design questions for me, most importantly whether the two-channel
-  `Eval` (already implemented) stays.
+- **Instrument before hypothesising.** §C10 cost six builds and five refuted hypotheses, then was
+  solved for free by a build setting changed for an unrelated reason. Park a question whose
+  consequences are measured and benign.
+- **Verify the premise before reasoning from it.** Twice, a confident chain rested on an unchecked
+  assumption, and twice the check reversed the answer — C1's *documented* fix was wrong, and "C9's
+  risk is gone after FPSemantics" was wrong.
+- **A test that prints nothing on success is indistinguishable from one that never ran.** Report
+  coverage counts, not just failures. This bit three times before it stuck.
+- **A perf change can be a correctness change.** The column-memo optimisation silently deleted the
+  overhang; the test suite caught it the same day. This is the concrete answer to "why all these
+  tests" — the failure was invisible to inspection and produced plausible terrain.
+- **When inserting a class into `VoxelDensityOpStack.cpp` / `VoxelHeightOpStack.cpp`, put it ABOVE
+  the labelled end of the anonymous namespace.** Anchoring on the FACTORIES banner puts it outside,
+  and the brace added with it closes nothing. Made that mistake twice; both files now say so at the
+  exact line.
