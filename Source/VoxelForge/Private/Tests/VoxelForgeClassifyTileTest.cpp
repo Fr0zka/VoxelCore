@@ -37,6 +37,13 @@
 #include "Misc/AutomationTest.h"
 
 #include "VoxelForgeTestFixture.h"
+// Inclus ici DÉLIBÉRÉMENT : VoxelDensityOp.h n'est encore inclus par aucun .cpp, donc le
+// compilateur ne le verrait jamais. Le fold qu'il définit prétend reproduire ClassifyTile — ce
+// fichier est l'endroit naturel pour que cette prétention soit à la fois COMPILÉE et TESTÉE.
+// Deliberately included here: VoxelDensityOp.h is not yet included by any .cpp, so the compiler
+// would never see it. Its fold claims to reproduce ClassifyTile, so this is the natural place for
+// that claim to be both compiled and tested.
+#include "VoxelDensityOp.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FVoxelForgeClassifyTileTest,
@@ -220,6 +227,99 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
                 TEXT("calls disagreed (%d vs %d). The classifier is reading state that GetDensityAt ")
                 TEXT("mutates — the shared column cache is the prime suspect."),
                 Spec.Origin.X, Spec.Origin.Y, Spec.Origin.Z, Spec.Step, (int32)A, (int32)B));
+        }
+    }
+
+    return true;
+}
+
+//=============================================================================
+// LE FOLD DE LA PILE D'OPÉRATEURS / the op-stack fold
+//=============================================================================
+// `VoxelDensityOp.h` affirme que son fold reproduit le ClassifyTile écrit à la main. C'est de la
+// logique pure — pas de monde, pas de bruit, pas de thread — donc elle peut être vérifiée
+// exhaustivement, et elle doit l'être : c'est elle qui décidera un jour si une tuile est maillée.
+//
+// `VoxelDensityOp.h` claims its fold reproduces the hand-written ClassifyTile. That is pure logic —
+// no world, no noise, no threads — so it can be checked exhaustively, and it should be: this is what
+// will one day decide whether a tile gets meshed at all.
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeOpFoldTest,
+    "VoxelForge.OpStack.BoxVerdictFold",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FVoxelForgeOpFoldTest::RunTest(const FString& Parameters)
+{
+    // Un état neuf ne prouve rien ⇒ Mixed (les deux hypothèses vivantes = égalité = prudence).
+    {
+        FVoxelBoxHypotheses H;
+        TestEqual(TEXT("a fresh state proves nothing"), (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // Une source qui affirme un côté tue l'autre hypothèse.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid);
+        TestEqual(TEXT("a solid source yields AllSolid"), (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
+        VF_FoldEffect(H, EVoxelOpEffect::Identity);
+        TestEqual(TEXT("Identity changes nothing"), (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
+    }
+
+    // ≡ « AnyPassageNearBox ⇒ bCanSolid = false » : un carve tue AllSolid.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid);
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly);
+        TestEqual(TEXT("a passage over solid rock forces Mixed"), (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // ≡ « bande de seal ⇒ bCanAir = false » : un fill tue AllAir.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllAir);
+        VF_FoldEffect(H, EVoxelOpEffect::FillOnly);
+        TestEqual(TEXT("a fill over open air forces Mixed"), (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // LE CAS QUI JUSTIFIE ClassifyBox : au-dessus du terrain mais DANS la bande de seal supérieure,
+    // la source dit « tout air » et le seal FORCE « tout solide ». Aujourd'hui ClassifyTile rend
+    // AllSolid ici. Un simple FillOnly rendrait Mixed et perdrait la tuile.
+    // THE CASE THAT JUSTIFIES ClassifyBox — a pure FillOnly would lose this tile.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllAir);      // source: above the terrain
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid);    // seal: forcing, inside its band
+        TestEqual(TEXT("a forcing seal recovers AllSolid over an air source"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
+
+        // …et un passage qui traverse cette même boîte la reprend, exactement comme aujourd'hui.
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly);
+        TestEqual(TEXT("a passage still takes the sealed verdict back"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // Le diff layer : Both tue tout, ce qui est le comportement voulu (une édition joueur peut
+    // creuser OU remplir n'importe où).
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid);
+        VF_FoldEffect(H, EVoxelOpEffect::Both);
+        TestTrue(TEXT("Both kills every hypothesis"), H.IsDead());
+        TestEqual(TEXT("a player edit in range forces Mixed"), (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // Une source qui ne sait rien (Mixed) ne peut jamais être ressuscitée par un opérateur
+    // directionnel — seul un opérateur FORÇANT le peut. C'est la propriété de sûreté.
+    {
+        for (const EVoxelOpEffect E : { EVoxelOpEffect::Identity, EVoxelOpEffect::CarveOnly,
+                                        EVoxelOpEffect::FillOnly, EVoxelOpEffect::Both })
+        {
+            FVoxelBoxHypotheses H;
+            VF_ForceHypotheses(H, EVoxelTileClass::Mixed);
+            VF_FoldEffect(H, E);
+            TestEqual(TEXT("a directional op can never resurrect an unprovable box"),
+                      (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
         }
     }
 

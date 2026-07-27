@@ -90,7 +90,8 @@ namespace VoxelForgeTest
                 ECaveGeneratorType::Underwater,
             };
 
-            for (int32 i = 0; i < UE_ARRAY_COUNT(Archetypes); ++i)
+            const int32 NumArchetypes = (int32)UE_ARRAY_COUNT(Archetypes);
+            for (int32 i = 0; i < NumArchetypes; ++i)
             {
                 UVoxelStrateDefinition* Def = NewObject<UVoxelStrateDefinition>(
                     GetTransientPackage(), NAME_None, RF_Transient);
@@ -105,7 +106,7 @@ namespace VoxelForgeTest
                 Settings->FixedStrates.Add(i, SoftDef);
                 Settings->StratePool.Add(SoftDef);   // fallback if a fixed entry fails to resolve
             }
-            Settings->TotalStrates = UE_ARRAY_COUNT(Archetypes);
+            Settings->TotalStrates = NumArchetypes;
 
             StrateManager = TStrongObjectPtr<UVoxelStrateManager>(
                 NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
