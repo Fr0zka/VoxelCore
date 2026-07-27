@@ -175,3 +175,39 @@ is exactly what hides bugs — but the earlier entry describes code that does no
 corrected here rather than edited (this log is append-only).
 
 ---
+
+## 2026-07-27 — starting Phase 1: the Maze port, OFF the hot path
+
+**Jahni said continue and build later, delegating the open design calls. Two decided, with reasons:**
+
+**(1) `Eval` becomes two-channel** — `FVoxelOpSample { Density, Sdf }` — per
+`OPSTACK-DECOMPOSITION.md §0.1`. Maze itself forces the question: its roughness perturbs the **SDF**
+(`MazeSDF += noise·Rough`), not the density. Applied to density instead, the same noise scales with
+the local gradient and is a visibly different effect. Single-channel could not port Maze faithfully,
+never mind compose two sources with `SmoothMin` later. Cost: one float.
+
+**(2) The stack's density channel is INTERNAL convention (positive = SOLID), negated once by the
+caller.** This **reverses what `VoxelDensityOp.h` said yesterday** (it specified MC). Reason: every
+existing archetype body is written in internal convention and negates on `return`. Porting in MC
+would mean flipping the sign of every line at transcription time — on the plugin's documented #1
+source of confusion. Internal makes each port a literal transcription instead. `ApplyDisturbances`
+and the diff layer genuinely are MC-space, but they live in `GetDensityAt` *after* the archetype
+today and are NOT in this stack, so the question is deferred, not dodged.
+
+**The shape of this batch, and why it is not "unverified code on unverified code":** the ops, the
+stack and the Maze port are **all new files**, plus one mechanical extraction. **`GetDensityAt` and
+`ClassifyTile` are NOT touched** — nothing in the running game can change. The port is validated by
+a test that runs the op stack against `GetMazeDensity` over thousands of points and asserts
+bit-equality, so Phase 1's real question ("does the source/modifier split fall out naturally?") gets
+an empirical answer instead of an opinion. Wiring the stack into `GetDensityAt` waits for the build.
+
+**Files:** `Public/VoxelDensityPrimitives.h` (spine/seal/passage lifted out of `VoxelGenerator.cpp`
+so ops and the generator share ONE copy) · `Public/VoxelDensityOpStack.h` +
+`Private/VoxelDensityOpStack.cpp` · `Private/Tests/VoxelForgeOpStackMazeTest.cpp` ·
+edits to `VoxelDensityOp.h` and `VoxelGenerator.cpp` (include the primitives, delete the local copies).
+
+**UNVERIFIED:** all of it, plus everything from the previous batch.
+
+**Next single action:** write those files, then STOP.
+
+---
