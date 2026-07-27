@@ -308,3 +308,47 @@ samples. Then wire the stack into `GetDensityAt` behind a per-strate opt-in — 
 was deliberately held back until the build went green. It now has.
 
 ---
+
+## 2026-07-27 (afternoon) — ALL SIX TESTS GREEN. One hypothesis killed.
+
+Run at 12:02 today (in `Saved/Logs/VoxelM.log`; the CSV export was taken later).
+
+| Test | Result |
+|---|---|
+| `ClassifyTileSoundness` | ✅ |
+| `DensityPurity` | ✅ |
+| `DiffLayerContention` | ✅ **now passes** — the assertion fix was right; 33.3M read rounds |
+| `LiveEditInvalidation` | ✅ 64/64 probes moved |
+| `BoxVerdictFold` | ✅ |
+| `MazeEquivalence` | ✅ (same warning) |
+
+**Phase 0.5's gate is met.** All three original tests plus the two op-stack ones are green on the
+current code, so the op stack is no longer being built on unverified ground.
+
+### The `FVector` rounding hypothesis was WRONG — and the way it was wrong is informative
+
+The previous entry predicted the fix would take `MazeEquivalence` from 454 differing samples to 0.
+The re-run returned **exactly 454 samples, exactly `1.90734863e-06`, at exactly `(-23, 55, -660)`** —
+bit-for-bit the same result. The `float → double → float` detour is a no-op, which is what
+`/fp:precise` semantics say it should be. Hypothesis eliminated cleanly; the detour is harmless and
+stays (it costs nothing and documents the original's shape), but it is **not** the cause.
+
+**Stopped guessing, added a bisect** to `MazeEquivalence`: it re-runs the comparison four times,
+disabling roughness → seal → spine → passages, on **both sides**, and reports which stage's removal
+makes it bit-exact. One run now answers a question two guesses failed to.
+
+**Standing hypothesis, to be confirmed or killed by that bisect:** the residue is compiler
+float-contraction across translation units (`/fp:fast` lets the same expression reassociate
+differently in `VoxelGenerator.cpp` and `VoxelDensityOpStack.cpp`), worth ~1 ULP. It fits the
+~2% hit rate: **only voxels inside the narrow SDF blend shell have an unsaturated carve factor** —
+everywhere else `Carve` is exactly 0 or exactly 1 and both paths agree bit for bit. If that is
+confirmed, **bit-identity is not achievable in principle for these ports**, and the standard for
+every later archetype becomes "zero isosurface crossings", not "zero differing floats". That is a
+conclusion worth having explicitly rather than re-deriving per port.
+
+**UNVERIFIED:** the bisect itself.
+
+**Next single action:** re-run `MazeEquivalence` and read the bisect table. Then Phase 1 step 3 —
+wire the stack into `GetDensityAt` behind a per-strate opt-in.
+
+---

@@ -172,6 +172,86 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
             WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
             NumSolidDisagreements));
+
+        //=====================================================================
+        // LE BISECT — quelle ÉTAPE introduit l'écart ?
+        //=====================================================================
+        // Deviner a déjà échoué une fois : l'hypothèse « aller-retour float→double par FVector »
+        // prédisait 0 écart et le run suivant a rendu EXACTEMENT les mêmes 454 échantillons, le
+        // même delta, la même coordonnée. Donc on arrête de deviner et on MESURE.
+        //
+        // On rejoue la comparaison en désactivant les étages un par un, DES DEUX CÔTÉS pour que la
+        // comparaison reste honnête. La première variante bit-exacte désigne l'étage fautif :
+        // celui qui vient d'être retiré.
+        //
+        // Guessing already failed once — the FVector hypothesis predicted 0 and the next run
+        // returned the exact same 454 samples, delta and coordinate. So: measure. Each variant
+        // disables one more stage ON BOTH SIDES; the first bit-exact variant names the culprit.
+        {
+            struct FVariant
+            {
+                const TCHAR* Name;
+                bool bNoRoughness, bNoSeal, bNoSpine, bNoPassages;
+            };
+            static const FVariant Variants[] = {
+                { TEXT("roughness off"),                    true, false, false, false },
+                { TEXT("roughness + seal off"),             true, true,  false, false },
+                { TEXT("roughness + seal + spine off"),     true, true,  true,  false },
+                { TEXT("corridors + carve ONLY"),           true, true,  true,  true  },
+            };
+
+            // Ces deux-là vivent sur le GÉNÉRATEUR, pas dans les params, donc pour les faire varier
+            // des deux côtés il faut les muter puis les restaurer.
+            UVoxelGenerator* MutableGen = World.Generator.Get();
+            const float SavedSpineRadius = MutableGen->OriginSpineRadius;
+            const UVoxelStrateManager* SavedManager = MutableGen->StrateManager;
+
+            const int32 BisectSamples = FMath::Min(NumMazeSamples, 5000);
+            FString Report;
+
+            for (const FVariant& V : Variants)
+            {
+                FMazeGenerationParams P = MazeParams;
+                if (V.bNoRoughness) { P.SurfaceRoughness = 0.0f; }
+                if (V.bNoSeal)      { P.BoundarySealThickness = 0.0f; }
+
+                const float SpineR = V.bNoSpine ? 0.0f : SavedSpineRadius;
+                const UVoxelStrateManager* Mgr = V.bNoPassages ? nullptr : SavedManager;
+
+                MutableGen->OriginSpineRadius = SpineR;
+                MutableGen->SetStrateManager(Mgr);
+
+                FVoxelOpStack VarStack;
+                VoxelDensityOps::BuildMazeStack(VarStack, P, World.Settings->Seed, SpineR, Mgr);
+
+                int32 VarDiff = 0;
+                float VarWorst = 0.0f;
+                for (int32 i = 0; i < BisectSamples; ++i)
+                {
+                    const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+                    const float A = MutableGen->GetMazeDensity(X, Y, Z, P);
+                    const float B = VarStack.EvalMC(X, Y, Z);
+                    if (!BitEqual(A, B)) { ++VarDiff; VarWorst = FMath::Max(VarWorst, FMath::Abs(A - B)); }
+                }
+                Report += FString::Printf(TEXT("\n    %-34s -> %5d / %d differ (max |delta| %.9g)"),
+                                          V.Name, VarDiff, BisectSamples, VarWorst);
+            }
+
+            MutableGen->OriginSpineRadius = SavedSpineRadius;
+            MutableGen->SetStrateManager(SavedManager);
+
+            AddInfo(FString::Printf(
+                TEXT("BISECT of the residual difference (each row disables one MORE stage, on both ")
+                TEXT("sides; the first row reading 0 names the stage removed just before it):%s")
+                TEXT("\n  If even \"corridors + carve ONLY\" differs, the residue is in the lattice/")
+                TEXT("capsule/carve core -- and since that code is a literal transcription, the cause ")
+                TEXT("is the COMPILER, not the port: same expressions in two translation units are ")
+                TEXT("free to contract/reassociate differently under /fp:fast, which is worth about ")
+                TEXT("1 ULP. That would also explain why only ~2%% of samples differ: only voxels ")
+                TEXT("inside the narrow SDF blend shell have an unsaturated carve factor. Everywhere ")
+                TEXT("else Carve is exactly 0 or exactly 1 and both paths agree bit for bit."),
+                *Report));
+        }
     }
 
     // Un désaccord de côté d'iso EST une différence de géométrie. C'est la seule chose ici qui
