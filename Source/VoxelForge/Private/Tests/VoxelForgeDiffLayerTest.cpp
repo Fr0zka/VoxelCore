@@ -128,6 +128,17 @@ bool FVoxelForgeDiffLayerContentionTest::RunTest(const FString& Parameters)
     }
 
     // ── Phase 1 : écritures pures. L'état final doit être exact. ──
+    // ⚠️ `GetTotalModificationCount()` ne compte PAS les opérations : il somme les entrées
+    // STOCKÉES, et un coup de pinceau est rangé dans CHAQUE chunk que son AABB recouvre. 400
+    // sphères de rayon 6 posées à cheval sur des coins de chunk donnent 3200 entrées, pas 400.
+    // (Le compteur d'opérations est le membre privé `ModificationCount`, non exposé.)
+    // C'est d'ailleurs la métrique qui compte pour AUDIT C6 : ce sont les ENTRÉES stockées qui
+    // grossissent sans borne, pas le nombre de coups de pioche. Le nom du getter induit en erreur.
+    //
+    // GetTotalModificationCount() does NOT count operations: it sums STORED entries, and a stroke
+    // is filed under EVERY chunk its AABB overlaps. It is also the metric that matters for AUDIT C6
+    // — stored entries are what grow without bound. The getter's name misleads.
+    int32 ExpectedEntries = 0;
     for (int32 i = 0; i < NumWrites; ++i)
     {
         const TArray<FIntVector> Touched = Diff->ApplyModification(MakeCarve(i));
@@ -138,9 +149,14 @@ bool FVoxelForgeDiffLayerContentionTest::RunTest(const FString& Parameters)
                 TEXT("if this fires, SetBudget(0, ...) no longer means 'no cap'."), i));
             break;
         }
+        ExpectedEntries += Touched.Num();
     }
 
-    TestEqual(TEXT("every carve was recorded"), Diff->GetTotalModificationCount(), NumWrites);
+    // Vérifie que le fan-out RÉELLEMENT stocké correspond à ce qu'ApplyModification a rapporté —
+    // un désaccord voudrait dire que la liste de chunks rendue à l'appelant (celle qui décide quoi
+    // re-mailler) ne décrit pas ce qui a été écrit. C'est un bien meilleur test que « == 400 ».
+    TestEqual(TEXT("stored diff entries match the chunk fan-out ApplyModification reported"),
+              Diff->GetTotalModificationCount(), ExpectedEntries);
     TestTrue(TEXT("the lock-free bHasAnyMods fast-path agrees with the map"), Diff->HasAnyMods());
     TestTrue(TEXT("at least one chunk holds mods"), Diff->GetModifiedChunkCount() > 0);
 

@@ -240,10 +240,24 @@ namespace
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             if (Strength <= 0.0f || InOut.Sdf >= ApplyWithin) { return; }
-            // VoxelNoise::FBM est exactement ce que FractalNoise3D appelle (VoxelGenerator.cpp) —
-            // le wrapper ne fait que transtyper. T2.b : les octaves passent par Eff() pour que les
-            // tuiles lointaines perdent les octaves sous-cellule.
-            InOut.Sdf += VoxelNoise::FBM(WorldX * Frequency, WorldY * Frequency, WorldZ * Frequency,
+
+            // ⚠️ LE DÉTOUR PAR FVector EST DÉLIBÉRÉ — ne pas « simplifier ».
+            // L'original écrit `FractalNoise3D(FVector(WorldX * 0.12f, ...), Eff(3))`, et
+            // FractalNoise3D fait `VoxelNoise::FBM((float)Position.X, ...)`. FVector étant en
+            // DOUBLE (UE5), le produit flottant y transite par un double avant d'être re-arrondi
+            // en float. Passer directement des floats saute cet aller-retour, et sous /fp:fast
+            // les deux chemins ne s'arrondissent pas au même endroit : ~1 ULP d'écart sur le SDF,
+            // qui ressort en 1 ULP sur la densité finale. Reproduire le détour, c'est reproduire
+            // l'arrondi. HYPOTHÈSE NON ENCORE VÉRIFIÉE : elle prédit que MazeEquivalence passe de
+            // 454 écarts à 0. Si le prochain run montre encore des écarts, c'est que la divergence
+            // vient d'ailleurs (candidat suivant : contraction FMA entre unités de compilation).
+            //
+            // THE FVector ROUND-TRIP IS DELIBERATE — do not "simplify" it. The original goes
+            // float -> double (FVector is double in UE5) -> float; going straight through floats
+            // skips a rounding step, and under /fp:fast the two paths round in different places.
+            // Reproducing the detour reproduces the rounding.
+            const FVector NoisePos(WorldX * Frequency, WorldY * Frequency, WorldZ * Frequency);
+            InOut.Sdf += VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
                                          VoxelGenLOD::Eff(BaseOctaves), 2.0f, 0.5f)
                        * VOXEL_NOISE_SCALE * Strength;
         }

@@ -256,3 +256,55 @@ hole. The **new** seal op keeps a 1-voxel safety margin before it forces. The ol
 uniform) → only then wire the stack into `GetDensityAt` behind a per-strate opt-in.
 
 ---
+
+## 2026-07-27 — FIRST GREEN BUILD. Six tests ran. Five passed.
+
+**The plugin compiles and the tests execute.** Results
+(`VoxelM/Saved/Automation/Automation2026.07.27-02.36.57.csv`):
+
+| Test | Result | What it means |
+|---|---|---|
+| `ClassifyTileSoundness` | ✅ | 600 tiles: 471 Mixed, 76 AllSolid, 53 AllAir. 24 brute-forced against the exact mesher lattice, **zero holes**. T1.d's soundness is machine-checked for the first time. |
+| `DensityPurity` | ✅ | 10k points, shuffled order, multi-threaded, with and without carves — **bit-identical throughout**. No cache-key bug of the AUDIT C2 family survives in the density path. |
+| `LiveEditInvalidation` | ✅ | 64/64 probes moved after a live edit. The C2 fix works. |
+| `BoxVerdictFold` | ✅ | The op-stack fold's logic, case by case. |
+| `MazeEquivalence` | ✅ (with warning) | see below |
+| `DiffLayerContention` | ❌ | **my test was wrong, not the plugin** — see below |
+
+### The two numbers that mattered
+
+**454 of 20000 Maze samples differ, largest |delta| 1.907e-06, and ZERO land on the opposite side
+of the isosurface.** 1.907e-06 is exactly one ULP at a float of magnitude 16 — i.e. the ports are
+*geometrically identical*: not one triangle would move. §2.6 accepts this. Leading hypothesis for
+the residue, now fixed and awaiting a re-run: the original routes the noise coordinates through an
+`FVector` (double in UE5) before casting back to float, so it rounds float→double→float, while the
+op passed floats straight through. Under `/fp:fast` those round in different places. The op now
+reproduces the detour deliberately, with a comment saying not to "simplify" it. **If the next run
+still shows drift, the next candidate is FMA contraction differing across translation units.**
+
+**23 of 60 Maze tiles proved uniform.** Today's `ClassifyTile` proves **zero** for Maze — every cave
+archetype falls through to `"pas prouvable en v1"`. That is ~38% of tiles becoming skippable for an
+archetype that has never skipped one, and it is the first hard evidence for the perf half of the
+whole refactor.
+
+### The failure was mine
+
+`Expected 'every carve was recorded' to be 400, but it was 3200.` `GetTotalModificationCount()` sums
+**stored entries**, not operations — a stroke is filed under every chunk its AABB overlaps, and 400
+radius-6 spheres straddling chunk corners store 8 entries each. The concurrency the test actually
+exists to check all passed: **7 reader threads, 28.7 million read rounds against 760 writes and 6
+`Clear()`s, no crash, monotonic version, clean state afterwards.** Assertion rewritten to compare
+the stored count against the fan-out `ApplyModification` itself reported, which is a stronger check.
+
+Worth noting for AUDIT C6: that getter is the right metric for the diff-layer scaling wall (stored
+entries are what grow without bound) and the wrong name for it.
+
+**UNVERIFIED:** the three fixes in this entry (the diff-layer assertion, the `FVector` rounding
+detour, and the `FVoxelOpStack` move-only/dllexport fix that made the build pass) have not been
+re-run.
+
+**Next single action:** rebuild, re-run, and check whether `MazeEquivalence` now reports 0 differing
+samples. Then wire the stack into `GetDensityAt` behind a per-strate opt-in — Phase 1 step 3, which
+was deliberately held back until the build went green. It now has.
+
+---
