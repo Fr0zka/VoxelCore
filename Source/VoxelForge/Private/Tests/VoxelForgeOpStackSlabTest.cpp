@@ -1,0 +1,312 @@
+// VoxelForgeOpStackSlabTest.cpp
+// PHASE 2, PREMIER PORTAGE — la pile Slab contre GetSlabDensity, sur LES DEUX archétypes.
+// PHASE 2'S FIRST PORT — the Slab operator stack against GetSlabDensity, on BOTH archetypes.
+//
+// CE QUE CE TEST DOIT PROUVER / WHAT THIS TEST HAS TO PROVE
+// Trois choses, et la troisième est la raison d'être du portage :
+//
+//   1. ÉQUIVALENCE — la pile reproduit `GetSlabDensity`. Même barre que Maze : un changement de
+//      côté d'isosurface est un ÉCHEC DUR, un écart d'ULP est le plancher accepté.
+//   2. UN OPÉRATEUR, DEUX ARCHÉTYPES — la MÊME pile est vérifiée contre FlatPlain ET
+//      CrystalChamber. `GetSlabDensity` ne les distingue par aucun branchement ; si la pile a
+//      besoin d'en faire un, la fusion est fausse et ce test le dit.
+//   3. LE VERDICT DE BOÎTE — et c'est ici que §3.1 se paie. `ClassifyTile` prouve ZÉRO tuile pour
+//      FlatPlain et CrystalChamber aujourd'hui. Depuis que les deux surfaces sont XY-PURES, leurs
+//      bornes en Z sont connues exactement (contrat [-1,1] de FBM), donc toute tuile entièrement
+//      sous le sol ou entre les deux bandes se prouve SANS échantillonner.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// ⚠️ CE TEST NE PEUT PAS DÉTECTER LE RETRAIT DU TERME EN Z — et c'est voulu
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// `GetSlabDensity` a perdu son terme en Z en même temps que ce portage était écrit
+// (OPSTACK-DECOMPOSITION §3.1, tranché par Jahni). La pile est comparée à la fonction TELLE
+// QU'ELLE EST MAINTENANT, donc ce test dit « le portage est fidèle » et ne dit RIEN sur le
+// changement de génération — c'est exactement la séparation voulue :
+//
+//   • ce test vert          ⇒ la pile == la fonction de référence. Le portage est un refactor pur.
+//   • le monde a changé     ⇒ imputable au retrait du terme en Z, ET À RIEN D'AUTRE.
+//
+// Sans cette séparation, un écart visuel serait inattribuable entre « j'ai changé le design » et
+// « j'ai raté le portage ». C'est le test qui fait l'attribution, pas l'ordre des builds.
+//
+// This test compares the stack against the reference function AS IT IS NOW, so green here means the
+// port is a pure refactor and ANY visual delta is attributable to the Z-term removal alone.
+//
+// ⚠️ Et la règle de §C10 tient toujours : ne jamais faire tourner les deux chemins dans le même
+// monde, ne jamais comparer leurs sorties pour égalité ailleurs qu'ici.
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+#include "Misc/AutomationTest.h"
+#include "Async/ParallelFor.h"
+#include "HAL/PlatformMisc.h"
+
+#include "VoxelForgeTestFixture.h"
+#include "VoxelDensityOpStack.h"
+
+#include <atomic>
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeOpStackSlabTest,
+    "VoxelForge.OpStack.SlabEquivalence",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+namespace
+{
+    constexpr int32 NumSlabSamples = 20000;
+    constexpr int32 NumSlabTiles   = 60;
+}
+
+bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+
+    FTestWorld World;
+    World.Build();
+    if (!World.IsValid())
+    {
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    const UVoxelGenerator* Gen = World.Generator.Get();
+
+    //=========================================================================
+    // LA BATTERIE, PARAMÉTRÉE PAR ARCHÉTYPE
+    //=========================================================================
+    // Exécutée à l'identique sur FlatPlain et CrystalChamber. Si les deux passent avec la MÊME
+    // pile et la MÊME fabrique, la fusion des deux archétypes est démontrée plutôt qu'affirmée.
+    auto RunForSlot = [&](int32 SlotIndex, const TCHAR* SlotName)
+    {
+        int32 TopVoxelZ = 0, BottomVoxelZ = 0;
+        if (!World.GetSlotVoxelZRange(SlotIndex, TopVoxelZ, BottomVoxelZ))
+        {
+            AddError(FString::Printf(
+                TEXT("The fixture layout has no %s slot. Check FTestWorld::Build's Archetypes[] ")
+                TEXT("against FTestWorld::Slot%s."), SlotName, SlotName));
+            return;
+        }
+
+        const int32 MidChunkZ = ((TopVoxelZ + BottomVoxelZ) / 2) / CHUNK_SIZE;
+        const FSlabGenerationParams SlabParams =
+            World.StrateManager->GetSlabParamsForChunk(FIntVector(0, 0, MidChunkZ));
+
+        // `GetSlabDensity` court-circuite sur une strate dégénérée (`return 1.0f`). Cette garde
+        // appartient à la fonction d'archétype, pas à un opérateur ; la pile suppose une strate
+        // valide, et `GetDensityAt` retombe sur le `switch` dans ce cas.
+        if (SlabParams.StrateTopWorldZ - SlabParams.StrateBottomWorldZ <= 0.0f)
+        {
+            AddError(FString::Printf(
+                TEXT("%s has degenerate Z bounds (top %.1f, bottom %.1f), which sends GetSlabDensity ")
+                TEXT("down its early-out. The op stack has no such early-out by design."),
+                SlotName, SlabParams.StrateTopWorldZ, SlabParams.StrateBottomWorldZ));
+            return;
+        }
+
+        FVoxelOpStack Stack;
+        VoxelDensityOps::BuildSlabStack(Stack, SlabParams, World.Settings->Seed,
+                                        Gen->OriginSpineRadius, World.StrateManager.Get());
+
+        // La décomposition doit rester une DÉCOMPOSITION : vide + colonnes + 3 structurels.
+        TestEqual(*FString::Printf(TEXT("%s decomposes into void + columns + 3 structural"), SlotName),
+                  Stack.Num(), 5);
+
+        FVoxelOpContext Ctx;
+        Ctx.Seed               = (uint32)World.Settings->Seed;
+        Ctx.LayoutVersion      = World.StrateManager->GetLayoutVersion();
+        Ctx.StrateTopWorldZ    = SlabParams.StrateTopWorldZ;
+        Ctx.StrateBottomWorldZ = SlabParams.StrateBottomWorldZ;
+        Stack.PrepareChunk(Ctx);
+
+        TArray<FVector> Points;
+        Points.Reserve(NumSlabSamples);
+        {
+            FRandomStream Rng(31337 + SlotIndex);
+            for (int32 i = 0; i < NumSlabSamples; ++i)
+            {
+                Points.Add(FVector(
+                    (float)Rng.RandRange(-3 * CHUNK_SIZE, 3 * CHUNK_SIZE),
+                    (float)Rng.RandRange(-3 * CHUNK_SIZE, 3 * CHUNK_SIZE),
+                    (float)Rng.RandRange(BottomVoxelZ, TopVoxelZ)));
+            }
+        }
+
+        //=====================================================================
+        // 1. ÉQUIVALENCE — géométrie d'abord, bits ensuite.
+        //=====================================================================
+        int32 NumDiff = 0, WorstIdx = -1, NumBeyondUlpNoise = 0, NumSolidDisagreements = 0;
+        float WorstDelta = 0.0f;
+        for (int32 i = 0; i < NumSlabSamples; ++i)
+        {
+            const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+
+            const float Old = Gen->GetSlabDensity(X, Y, Z, SlabParams);   // MC : négatif = solide
+            const float New = Stack.EvalMC(X, Y, Z);
+
+            if (!BitEqual(Old, New))
+            {
+                ++NumDiff;
+                const float Delta = FMath::Abs(Old - New);
+                if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
+
+                // Même forme que le carve de Maze : `(ColBlend - ColumnSDF)` annule au bord de la
+                // coquille de blend des colonnes, donc un ULP amont ressort amplifié. Marge
+                // généreuse mais BORNÉE — au-delà, c'est une vraie dérive de portage.
+                const float UlpNoise = 16.0f * FMath::Max(FMath::Abs(Old), 1.0f) * FLT_EPSILON;
+                if (Delta > UlpNoise) { ++NumBeyondUlpNoise; }
+            }
+            // Le mesher ne lit que le SIGNE. Un désaccord de CÔTÉ bouge la géométrie.
+            if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSolidDisagreements; }
+        }
+
+        if (NumDiff == 0)
+        {
+            AddInfo(FString::Printf(TEXT("%s: bit-identical across %d samples."),
+                                    SlotName, NumSlabSamples));
+        }
+        else if (NumBeyondUlpNoise == 0)
+        {
+            AddInfo(FString::Printf(
+                TEXT("%s: %d of %d samples differ, ALL at ULP scale (largest |delta| %.9g at ")
+                TEXT("(%.0f, %.0f, %.0f)), and 0 cross the isosurface. Same accepted floor as Maze ")
+                TEXT("-- see AUDIT-2026-07.md C10 before hunting it."),
+                SlotName, NumDiff, NumSlabSamples, WorstDelta,
+                WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
+                WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
+                WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f));
+        }
+        else
+        {
+            AddWarning(FString::Printf(
+                TEXT("%s: %d of %d samples differ and %d are TOO LARGE to be the accepted ULP floor ")
+                TEXT("(largest |delta| %.9g at (%.0f, %.0f, %.0f)); %d cross the isosurface. THIS is ")
+                TEXT("real port drift. Check, in order: the floor/ceiling noise offsets (7.3/11.1 and ")
+                TEXT("17.3+1000/19.7+2000/3000), the abs() on the ceiling noise, the ceiling clamp ")
+                TEXT("(FloorSurface + 2), the column blend (2.0) and the 0.15/0.7 jitter."),
+                SlotName, NumDiff, NumSlabSamples, NumBeyondUlpNoise, WorstDelta,
+                WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
+                WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
+                WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
+                NumSolidDisagreements));
+        }
+
+        TestEqual(*FString::Printf(
+                      TEXT("%s: no sample lands on the opposite side of the isosurface"), SlotName),
+                  NumSolidDisagreements, 0);
+
+        //=====================================================================
+        // 2. INVARIANCE DE FENÊTRE
+        //=====================================================================
+        // Le cache 3×3 des colonnes est `thread_local` et sa clé n'est PAS le chunk mais le jeu de
+        // params + le seed. Si cette clé est incomplète, la couture apparaît ici.
+        {
+            std::atomic<int32> Impure{ 0 };
+            const int32 NumBlocks = FMath::Max(4, FMath::Min(16, FPlatformMisc::NumberOfCores()));
+
+            TArray<float> Ref;
+            Ref.SetNumUninitialized(NumSlabSamples);
+            for (int32 i = 0; i < NumSlabSamples; ++i)
+            {
+                Ref[i] = Stack.EvalMC((float)Points[i].X, (float)Points[i].Y, (float)Points[i].Z);
+            }
+
+            ParallelFor(NumBlocks, [&](int32 Block)
+            {
+                TArray<int32> LocalOrder;
+                BuildShuffledOrder(NumSlabSamples, 700 + Block + SlotIndex * 32, LocalOrder);
+                for (const int32 i : LocalOrder)
+                {
+                    const float V = Stack.EvalMC((float)Points[i].X, (float)Points[i].Y, (float)Points[i].Z);
+                    if (!BitEqual(V, Ref[i])) { Impure.fetch_add(1, std::memory_order_relaxed); }
+                }
+            });
+
+            TestEqual(*FString::Printf(
+                          TEXT("%s: the op stack is window-invariant across order and threads"), SlotName),
+                      Impure.load(), 0);
+        }
+
+        //=====================================================================
+        // 3. LE VERDICT DE BOÎTE — ce que §3.1 a acheté
+        //=====================================================================
+        {
+            int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
+            FRandomStream Rng(24680 + SlotIndex);
+
+            for (int32 t = 0; t < NumSlabTiles; ++t)
+            {
+                const int32 Step = 1, Cells = 8;
+                const int32 Extent = Step * Cells;
+                const FIntVector Origin(
+                    Rng.RandRange(-6, 6) * Extent,
+                    Rng.RandRange(-6, 6) * Extent,
+                    FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
+
+                const int32 GridDim = Cells + 1;   // le MÊME treillis que le mesher, marge ±1 comprise
+                const FBox Box(
+                    FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
+                    FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
+
+                const EVoxelTileClass Verdict = Stack.ClassifyBox(Box, Ctx);
+                if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
+                ++NumProved;
+
+                const bool bClaimsSolid = (Verdict == EVoxelTileClass::AllSolid);
+                for (int32 gz = -1; gz <= GridDim; ++gz)
+                for (int32 gy = -1; gy <= GridDim; ++gy)
+                for (int32 gx = -1; gx <= GridDim; ++gx)
+                {
+                    const float X = (float)(Origin.X + gx * Step);
+                    const float Y = (float)(Origin.Y + gy * Step);
+                    const float Z = (float)(Origin.Z + gz * Step);
+                    const float D = Stack.EvalMC(X, Y, Z);
+                    if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f))
+                    {
+                        if (NumUnsound == 0)
+                        {
+                            AddError(FString::Printf(
+                                TEXT("HOLE: %s claimed %s for the box at (%d,%d,%d) but ")
+                                TEXT("EvalMC(%.0f, %.0f, %.0f) = %.6g is on the %s side. One of the ")
+                                TEXT("ops is not conservative. Suspects, in order: the slab source's ")
+                                TEXT("noise amplitude bounds (does FBM really honour [-1,1]?), the ")
+                                TEXT("ceiling clamp raising CeilSurface above CeilZ, then the column ")
+                                TEXT("mod's reach (MaxRadius + blend)."),
+                                SlotName, bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
+                                Origin.X, Origin.Y, Origin.Z, X, Y, Z, D,
+                                (D >= 0.0f) ? TEXT("AIR") : TEXT("SOLID")));
+                        }
+                        ++NumUnsound;
+                        gz = gy = gx = GridDim + 1;
+                    }
+                }
+            }
+
+            TestEqual(*FString::Printf(
+                          TEXT("%s: every box verdict survives brute force (a false verdict is a hole)"),
+                          SlotName),
+                      NumUnsound, 0);
+
+            AddInfo(FString::Printf(
+                TEXT("%s box verdicts over %d tiles: %d proved uniform, %d Mixed. Today's ")
+                TEXT("ClassifyTile proves ZERO of these. This number is the whole point of making ")
+                TEXT("the slab surfaces XY-pure (OPSTACK-DECOMPOSITION 3.1)."),
+                SlotName, NumSlabTiles, NumProved, NumMixed));
+
+            if (NumProved == 0)
+            {
+                AddWarning(FString::Printf(
+                    TEXT("%s proved no tile uniform. Not a correctness problem, but the entire perf ")
+                    TEXT("case for dropping the Z term rests on this number being well above zero -- ")
+                    TEXT("a slab is mostly solid rock below the floor. Check that the sampled tile Z ")
+                    TEXT("range actually reaches below FloorZ - FloorAmp."), SlotName));
+            }
+        }
+    };
+
+    RunForSlot(FTestWorld::SlotFlatPlain,      TEXT("FlatPlain"));
+    RunForSlot(FTestWorld::SlotCrystalChamber, TEXT("CrystalChamber"));
+
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS

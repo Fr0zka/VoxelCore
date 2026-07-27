@@ -562,6 +562,22 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     VoxelDensityOps::BuildMazeStack(CP_OpStack, CP_Maze, Seed,
                                                     OriginSpineRadius, StrateManager);
                     break;
+
+                case ECaveGeneratorType::FlatPlain:
+                case ECaveGeneratorType::CrystalChamber:
+                    // UN SEUL cas pour les deux, comme le `switch` de production juste en dessous :
+                    // `GetSlabDensity` ne les distingue pas non plus. Voir BuildSlabStack.
+                    // Même garde de strate dégénérée : GetSlabDensity court-circuite sur `1.0f`.
+                    if (CP_Slab.StrateTopWorldZ - CP_Slab.StrateBottomWorldZ <= 0.0f)
+                    {
+                        CP_UseOpStack = false;
+                        break;
+                    }
+                    OpCtx.StrateTopWorldZ    = CP_Slab.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Slab.StrateBottomWorldZ;
+                    VoxelDensityOps::BuildSlabStack(CP_OpStack, CP_Slab, Seed,
+                                                    OriginSpineRadius, StrateManager);
+                    break;
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`
@@ -1807,8 +1823,17 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     // Signed noise allows both hills (noise > 0 → floor rises) and
     // valleys (noise < 0 → floor dips) for natural rolling ground.
     //
-    // Z frequency is set very low (5% of XY) so the floor features are
-    // broad and horizontal — like natural geological ground, not bumpy walls.
+    // ⚠️ XY-PUR / XY-PURE (OPSTACK-DECOMPOSITION §3.1, tranché par Jahni 2026-07-27).
+    // La 3e coordonnée était `WorldZ * FF * 0.05f` : une hauteur de sol qui dépendait de
+    // l'altitude d'où on la demandait. Le coefficient était minuscule, donc ça se lisait comme un
+    // léger étirement vertical plutôt que comme un bug — mais ça bloquait le cache de colonnes T1.a
+    // et rendait toute classification de boîte inexacte. Constante ⇒ la surface est une vraie
+    // fonction de (X,Y). Le monde se re-tune une fois : on échantillonne une autre tranche du champ
+    // de bruit, donc la forme du sol change (elle ne se dégrade pas).
+    //
+    // The 3rd coord was WorldZ * FF * 0.05f — a floor height that depended on the altitude you
+    // asked from. Now a constant, so the surface is a genuine function of (X,Y): the T1.a column
+    // cache and an exact box verdict both become available. Worlds re-tune once.
 
     const float FloorZ = Params.StrateBottomWorldZ + StrateHeight * Params.FloorRelativeHeight;
 
@@ -1819,7 +1844,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
         FloorNoise = FractalNoise3D(FVector(
             WorldX * FF + SeedF * 7.3f,
             WorldY * FF + SeedF * 11.1f,
-            WorldZ * FF * 0.05f           // Very low Z freq → horizontal ground features
+            0.0f                          // XY-pur : plus aucune dépendance en Z / no Z dependence
         ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
     }
 
@@ -1836,9 +1861,10 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     // This asymmetry (only downward protrusions, never upward pockets) creates
     // the crystal-forest / stalactite silhouette from below.
     //
-    // Z frequency is also low so formations have horizontal extent — each
-    // "crystal" or "stalactite" is wide and sweeps across the ceiling, not
-    // a sharp spike (use high frequency for spike-like features if desired).
+    // XY-PUR, même raison que le sol ci-dessus (§3.1). Le `+ 3000.0f` RESTE : ce n'est pas un
+    // terme en Z, c'est le décalage qui décorrèle le champ du plafond de celui du sol.
+    // XY-pure for the same reason as the floor. The + 3000.0f STAYS — it is not a Z term, it is
+    // the offset that decorrelates the ceiling's noise field from the floor's.
 
     const float CeilZ = Params.StrateBottomWorldZ + StrateHeight * Params.CeilingRelativeHeight;
 
@@ -1849,7 +1875,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
         float RawNoise = FractalNoise3D(FVector(
             WorldX * CF + SeedF * 17.3f + 1000.0f,
             WorldY * CF + SeedF * 19.7f + 2000.0f,
-            WorldZ * CF * 0.08f + 3000.0f   // Low Z freq → formations extend horizontally
+            3000.0f                         // XY-pur : décalage de décorrélation seul / offset only
         ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE;
 
         // abs() → formations ONLY hang down, never push ceiling up into solid rock.

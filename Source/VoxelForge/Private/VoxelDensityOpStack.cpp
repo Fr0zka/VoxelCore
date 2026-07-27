@@ -222,6 +222,152 @@ namespace
     };
 
     //=========================================================================
+    // RÔLE 1 — SOURCE : DALLE / SLAB VOID  (FlatPlain ET CrystalChamber)
+    //=========================================================================
+    // Transcription littérale des ÉTAPES 1-3 de `GetSlabDensity` : surface de sol, surface de
+    // plafond, puis `Density = -min(distAuSol, distAuPlafond)`.
+    //
+    // DEUX archétypes, UN opérateur. `GetSlabDensity` est appelé pour FlatPlain et
+    // CrystalChamber sans le moindre branchement sur le type — CrystalChamber n'est rien d'autre
+    // que FlatPlain avec un `CeilingRoughness` plus grand. C'est le premier vrai gain du refactor
+    // (OPSTACK-PLAN §4) : deux des huit archétypes disparaissent dans un seul opérateur, et la
+    // différence entre eux redevient ce qu'elle a toujours été — un jeu de valeurs par défaut.
+    //
+    // Two archetypes, ONE op: GetSlabDensity is called for both with no branch on the type.
+    // CrystalChamber IS FlatPlain with a bigger CeilingRoughness.
+    //
+    // XY-PUR depuis §3.1 (le terme en Z des deux bruits est parti). C'est ce qui rend
+    // `ClassifyBox` exact plutôt qu'estimé — voir plus bas.
+    class FSlabVoidSource final : public IVoxelDensityOp
+    {
+    public:
+        FSlabVoidSource(const FSlabGenerationParams& P, int32 Seed)
+            : SeedF((float)Seed)
+            , FloorRoughness(P.FloorRoughness)
+            , FloorFrequency(P.FloorRoughnessFrequency)
+            , CeilRoughness(P.CeilingRoughness)
+            , CeilFrequency(P.CeilingRoughnessFrequency)
+        {
+            const float StrateHeight = P.StrateTopWorldZ - P.StrateBottomWorldZ;
+            FloorZ = P.StrateBottomWorldZ + StrateHeight * P.FloorRelativeHeight;
+            CeilZ  = P.StrateBottomWorldZ + StrateHeight * P.CeilingRelativeHeight;
+
+            // Amplitudes MAXIMALES des deux bruits. Le contrat de `VoxelNoise::FBM` est [-1,1]
+            // (noté à sa définition), donc ces bornes sont des garanties, pas des estimations —
+            // c'est exactement ce qui autorise un verdict de boîte SÛR.
+            // FBM's contract is [-1,1], so these bounds are guarantees, not estimates.
+            FloorAmp = VOXEL_NOISE_SCALE * FMath::Max(FloorRoughness, 0.0f);
+            CeilAmp  = VOXEL_NOISE_SCALE * FMath::Max(CeilRoughness,  0.0f);
+        }
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        // ⚠️ LE point de §3.1. Faux avant le retrait du terme en Z ; le déclarer alors aurait
+        // corrompu silencieusement toute la pile verticale de chunks (voir l'avertissement sur
+        // `IsXYPure` dans VoxelDensityOp.h).
+        bool IsXYPure() const override { return true; }
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float FloorSurface = SurfaceFloor(WorldX, WorldY);
+            const float CeilSurface  = SurfaceCeil(WorldX, WorldY, FloorSurface);
+
+            const float DistAboveFloor = WorldZ - FloorSurface;
+            const float DistBelowCeil  = CeilSurface - WorldZ;
+            const float VoidField      = FMath::Min(DistAboveFloor, DistBelowCeil);
+
+            InOut.Density = -VoidField;   // Replace : interne, positif = solide
+        }
+
+        //---------------------------------------------------------------------
+        // LE VERDICT QUE FLATPLAIN N'A JAMAIS EU
+        //---------------------------------------------------------------------
+        // `ClassifyTile` ne prouve AUCUNE tuile pour les archétypes de grotte aujourd'hui. Ici la
+        // preuve est immédiate et n'exige aucun échantillonnage : les deux surfaces vivent dans des
+        // BANDES en Z dont on connaît les bornes exactes, donc une boîte entièrement sous la bande
+        // du sol est solide, et une boîte entièrement entre les deux bandes est de l'air.
+        //
+        // ⚠️ Conservatif dans le bon sens : rendre `Mixed` ne coûte que du CPU, rendre le mauvais
+        // verdict est un TROU. Toutes les comparaisons ci-dessous sont donc strictes et prennent le
+        // pire cas des deux bruits.
+        EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        {
+            const float ZMin = (float)VoxelBox.Min.Z;
+            const float ZMax = (float)VoxelBox.Max.Z;
+
+            // Bornes de la surface de sol : FloorZ ± FloorAmp.
+            const float FloorLo = FloorZ - FloorAmp;
+            const float FloorHi = FloorZ + FloorAmp;
+
+            // Bornes du plafond. `CeilNoise = |bruit| · rugosité` ∈ [0, CeilAmp] ⇒ la surface ne
+            // peut que DESCENDRE depuis CeilZ… sauf que le clamp `Max(…, FloorSurface + 2)` peut la
+            // remonter. Le majorant honnête est donc le max des deux possibilités.
+            const float CeilLo = CeilZ - CeilAmp;
+            const float CeilHi = FMath::Max(CeilZ, FloorHi + 2.0f);
+
+            // Sous le sol le plus bas possible ⇒ distAuSol < 0 partout ⇒ densité > 0 ⇒ SOLIDE.
+            if (ZMax < FloorLo) { return EVoxelTileClass::AllSolid; }
+
+            // Au-dessus du plafond le plus haut possible ⇒ distAuPlafond < 0 ⇒ SOLIDE.
+            if (ZMin > CeilHi)  { return EVoxelTileClass::AllSolid; }
+
+            // Strictement entre les deux bandes ⇒ les deux distances sont > 0 ⇒ densité < 0 ⇒ AIR.
+            // (Les colonnes peuvent re-remplir cet air : c'est FGridColumnMod qui le déclare, en
+            //  rendant FillOnly quand une colonne atteint la boîte. Le pliage s'en charge.)
+            if (ZMin > FloorHi && ZMax < CeilLo) { return EVoxelTileClass::AllAir; }
+
+            return EVoxelTileClass::Mixed;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return EVoxelOpEffect::Both;   // jamais atteint : ClassifyBox répond avant
+        }
+
+    private:
+        // Les deux surfaces, transcrites au caractère près depuis GetSlabDensity — y compris le
+        // détour par FVector, qui est le même piège d'arrondi que dans FSdfRoughnessMod
+        // (float → double → float sous /fp:fast). Ne pas « simplifier ».
+        float SurfaceFloor(float WorldX, float WorldY) const
+        {
+            if (FloorRoughness <= 0.0f) { return FloorZ; }
+            const float FF = FloorFrequency;
+            const FVector NoisePos(WorldX * FF + SeedF * 7.3f,
+                                   WorldY * FF + SeedF * 11.1f,
+                                   0.0f);
+            const float N = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                                            VoxelGenLOD::Eff(3), 2.0f, 0.5f)
+                          * VOXEL_NOISE_SCALE * FloorRoughness;
+            return FloorZ + N;
+        }
+
+        float SurfaceCeil(float WorldX, float WorldY, float FloorSurface) const
+        {
+            float CeilNoise = 0.0f;
+            if (CeilRoughness > 0.0f)
+            {
+                const float CF = CeilFrequency;
+                const FVector NoisePos(WorldX * CF + SeedF * 17.3f + 1000.0f,
+                                       WorldY * CF + SeedF * 19.7f + 2000.0f,
+                                       3000.0f);
+                const float Raw = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                                                  VoxelGenLOD::Eff(3), 2.0f, 0.5f)
+                                * VOXEL_NOISE_SCALE;
+                // abs() ⇒ les formations ne pendent QUE vers le bas.
+                CeilNoise = FMath::Abs(Raw) * CeilRoughness;
+            }
+            return FMath::Max(CeilZ - CeilNoise, FloorSurface + 2.0f);
+        }
+
+        float SeedF;
+        float FloorZ = 0.0f, CeilZ = 0.0f;
+        float FloorRoughness, FloorFrequency;
+        float CeilRoughness,  CeilFrequency;
+        float FloorAmp = 0.0f, CeilAmp = 0.0f;
+    };
+
+    //=========================================================================
     // RÔLE 3 — MODIFIER : RUGOSITÉ DE PAROI, ESPACE SDF
     //=========================================================================
     // La variante SDF (Maze / VerticalShafts / FloatingIslands) : `Sdf += bruit · échelle · force`.
@@ -273,6 +419,148 @@ namespace
         float Strength, Frequency;
         int32 BaseOctaves;
         float ApplyWithin;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : COLONNES SUR GRILLE MONDE / WORLD-GRID COLUMNS
+    //=========================================================================
+    // ÉTAPE 4 de `GetSlabDensity`. Des cylindres de hauteur infinie posés sur une grille de
+    // `ColumnSpacing`, un tirage d'existence et un jitter par cellule. Le champ de vide décide déjà
+    // où est le solide, donc la colonne n'a qu'à AJOUTER de la densité le long de son XY — elle
+    // n'est visible que là où le vide avait creusé autour d'elle.
+    //
+    // Le cache 3×3 par cellule est repris tel quel (il était déjà `thread_local` dans l'original,
+    // et c'est exactement ce que la note de threading de VoxelDensityOp.h autorise). Sa clé
+    // contient tous les paramètres qui influent sur le résultat + le seed, donc un changement de
+    // layout qui change un param invalide bien ; un changement qui n'en touche aucun produirait
+    // des colonnes identiques (cf. AUDIT C2 — la clé est complète, pas seulement le coord).
+    class FGridColumnMod final : public IVoxelDensityOp
+    {
+    public:
+        explicit FGridColumnMod(const FSlabGenerationParams& P, int32 InSeed)
+            : Seed((uint32)InSeed)
+            , Spacing(P.ColumnSpacing)
+            , ColDensity(P.ColumnDensity)
+            , MinRadius(P.ColumnMinRadius)
+            , MaxRadius(P.ColumnMaxRadius)
+            , BaseDensity(P.BaseDensity)
+        {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+        bool IsXYPure() const override { return true; }   // cylindres de hauteur infinie
+
+        void Eval(float WorldX, float WorldY, float, FVoxelOpSample& InOut) const override
+        {
+            if (ColDensity <= 0.0f || Spacing <= 0.0f) { return; }
+
+            const int32 ColCX = FMath::FloorToInt(WorldX / Spacing);
+            const int32 ColCY = FMath::FloorToInt(WorldY / Spacing);
+
+            const TArray<FSlabColumn, TInlineAllocator<9>>& Cols = GetCells(ColCX, ColCY);
+
+            float ColumnSDF = FLT_MAX;
+            for (const FSlabColumn& Col : Cols)
+            {
+                const float DX2D = WorldX - Col.X;
+                const float DY2D = WorldY - Col.Y;
+                ColumnSDF = FMath::Min(ColumnSDF, FMath::Sqrt(DX2D * DX2D + DY2D * DY2D) - Col.R);
+            }
+
+            if (ColumnSDF < ColBlend && ColumnSDF < FLT_MAX)
+            {
+                float Fill = FMath::Clamp((ColBlend - ColumnSDF) / (ColBlend * 2.0f), 0.0f, 1.0f);
+                Fill = SmoothStep01(Fill);
+                InOut.Density += Fill * BaseDensity * 1.5f;
+            }
+        }
+
+        // N'AJOUTE que du solide ⇒ tue AllAir, jamais AllSolid. `Identity` dès qu'aucune colonne
+        // n'atteint la boîte — ce qui, pour un `ColumnDensity` de 0.08, est l'écrasante majorité du
+        // volume. C'est cet `Identity` qui laisse survivre le verdict AllAir de la source.
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        {
+            if (ColDensity <= 0.0f || Spacing <= 0.0f) { return EVoxelOpEffect::Identity; }
+
+            // Marge : le centre d'une colonne vit dans sa cellule, son influence porte au plus
+            // MaxRadius + ColBlend. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
+            const float Reach = FMath::Max(MaxRadius, 0.0f) + ColBlend;
+
+            const int32 CX0 = FMath::FloorToInt(((float)VoxelBox.Min.X - Reach) / Spacing);
+            const int32 CX1 = FMath::FloorToInt(((float)VoxelBox.Max.X + Reach) / Spacing);
+            const int32 CY0 = FMath::FloorToInt(((float)VoxelBox.Min.Y - Reach) / Spacing);
+            const int32 CY1 = FMath::FloorToInt(((float)VoxelBox.Max.Y + Reach) / Spacing);
+
+            for (int32 CY = CY0; CY <= CY1; ++CY)
+            {
+                for (int32 CX = CX0; CX <= CX1; ++CX)
+                {
+                    FSlabColumn Col;
+                    if (!RollColumn(CX, CY, Col)) { continue; }
+
+                    // Cercle (rayon + blend) contre le rectangle XY de la boîte.
+                    const float R  = Col.R + ColBlend;
+                    const float QX = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.X - Col.X,
+                                                                 Col.X - (float)VoxelBox.Max.X));
+                    const float QY = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.Y - Col.Y,
+                                                                 Col.Y - (float)VoxelBox.Max.Y));
+                    if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::FillOnly; }
+                }
+            }
+            return EVoxelOpEffect::Identity;
+        }
+
+    private:
+        struct FSlabColumn { float X, Y, R; };
+
+        static constexpr float ColBlend = 2.0f;   // identique à GetSlabDensity
+
+        /** Le tirage d'une cellule : existence, jitter, rayon. Fonction PURE de (cellule, seed,
+         *  params) — donc `Eval` et `EffectOverBox` voient forcément la même colonne. */
+        bool RollColumn(int32 CX, int32 CY, FSlabColumn& Out) const
+        {
+            const uint32 H = VoxelHash::Cell(CX, CY, Seed ^ 0xC01C01u);
+            if (VoxelHash::ToFloat01(H) > ColDensity) { return false; }
+
+            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
+            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
+
+            Out.X = (CX + 0.15f + JX * 0.7f) * Spacing;
+            Out.Y = (CY + 0.15f + JY * 0.7f) * Spacing;
+            Out.R = FMath::Lerp(MinRadius, MaxRadius,
+                                VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+            return true;
+        }
+
+        /** Le voisinage 3×3 de la cellule centrale, mémoïsé par worker. */
+        const TArray<FSlabColumn, TInlineAllocator<9>>& GetCells(int32 ColCX, int32 ColCY) const
+        {
+            thread_local TArray<FSlabColumn, TInlineAllocator<9>> SC_Cols;
+            thread_local int32  SC_CX = INT32_MAX, SC_CY = INT32_MAX;
+            thread_local uint32 SC_Seed = 0xFFFFFFFFu;
+            thread_local float  SC_Spacing = -1.0f, SC_Dens = -1.0f, SC_MinR = -1.0f, SC_MaxR = -1.0f;
+
+            if (ColCX != SC_CX || ColCY != SC_CY || Seed != SC_Seed || Spacing != SC_Spacing ||
+                ColDensity != SC_Dens || MinRadius != SC_MinR || MaxRadius != SC_MaxR)
+            {
+                SC_CX = ColCX;  SC_CY = ColCY;  SC_Seed = Seed;  SC_Spacing = Spacing;
+                SC_Dens = ColDensity;  SC_MinR = MinRadius;  SC_MaxR = MaxRadius;
+                SC_Cols.Reset();
+
+                for (int32 DY = -1; DY <= 1; DY++)
+                {
+                    for (int32 DX = -1; DX <= 1; DX++)
+                    {
+                        FSlabColumn Col;
+                        if (RollColumn(ColCX + DX, ColCY + DY, Col)) { SC_Cols.Add(Col); }
+                    }
+                }
+            }
+            return SC_Cols;
+        }
+
+        uint32 Seed;
+        float  Spacing, ColDensity, MinRadius, MaxRadius, BaseDensity;
     };
 
     //=========================================================================
@@ -486,6 +774,30 @@ namespace VoxelDensityOps
     TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity)
     {
         return MakeUnique<FSdfCarveOp>(Blend, BaseDensity);
+    }
+
+    TUniquePtr<IVoxelDensityOp> MakeSlabVoidSource(const FSlabGenerationParams& P, int32 Seed)
+    {
+        return MakeUnique<FSlabVoidSource>(P, Seed);
+    }
+
+    TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed)
+    {
+        return MakeUnique<FGridColumnMod>(P, Seed);
+    }
+
+    void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
+                        int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+    {
+        // DEUX archétypes entrent ici, aucun branchement ne les distingue — parce que
+        // `GetSlabDensity` n'en fait aucun non plus. FlatPlain et CrystalChamber ne diffèrent que
+        // par leurs valeurs par défaut, et c'est maintenant visible dans le code plutôt que dans
+        // un commentaire. 8 archétypes → 7.
+        OutStack.Add(MakeSlabVoidSource(P, Seed));
+        OutStack.Add(MakeGridColumnMod(P, Seed));
+
+        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
     }
 
     void BuildMazeStack(FVoxelOpStack& OutStack, const FMazeGenerationParams& P,

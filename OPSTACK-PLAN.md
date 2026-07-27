@@ -4,9 +4,11 @@
 > *composable density pipeline*, so new world ideas become authoring instead of C++. Written
 > 2026-07-26 as a handoff for a future context — read this instead of re-deriving it.
 >
-> **Status (2026-07-27):** Phase 0.5 (tests) and the Phase 1 skeleton header are WRITTEN AND
-> COMMITTED but **NOT YET COMPILED**. No operator exists; `GetDensityAt`'s archetype `switch` is
-> untouched. Live state and the next action live in
+> **Status (2026-07-27):** **Phase 0.5 and Phase 1 are DONE and verified** — five green tests, Maze
+> decomposed into seven ops, wired into `GetDensityAt` behind `bUseOperatorStack`, and the visual
+> A/B passed (Jahni: *"pretty similar, if not entirely similar"*). **Phase 2 is in progress:**
+> FlatPlain + CrystalChamber are ported into ONE op (`BuildSlabStack`), their §3.1 Z term is gone,
+> and both are wired — **written, not yet compiled.** Live state and the next action live in
 > [OPSTACK-PROGRESS.md](OPSTACK-PROGRESS.md) — read its last entry first. The per-archetype
 > breakdown is in [OPSTACK-DECOMPOSITION.md](OPSTACK-DECOMPOSITION.md).
 >
@@ -356,8 +358,8 @@ Lipschitz-1 off a lattice), and it's the least-used archetype so a mistake is ch
 Port each archetype **the next time a feature makes you open it anyway**. The switch shrinks on its own.
 Suggested order when there's a free choice — cheapest and least risky first:
 
-`Maze` (P1) → `FlatPlain`/`CrystalChamber` (one op, two default sets — the first real win: two archetypes
-collapse into one) → `SurfaceWorld` (biggest payoff, biggest care: the T1.a column cache and the exact-
+✅ `Maze` (P1) → ✅ `FlatPlain`/`CrystalChamber` (one op, two default sets — the first real win: two
+archetypes collapse into one; **done 2026-07-27**, `BuildSlabStack`, 8 archetypes → 7) → `SurfaceWorld` (biggest payoff, biggest care: the T1.a column cache and the exact-
 lattice `ClassifyTile` bound must both survive) → `VerticalShafts` → `FloatingIslands` → `TunnelNetwork`
 (**last** — it owns `BuildChunkCache`'s two-region window-invariance discipline, §8.4, the most delicate
 code in the plugin).

@@ -876,3 +876,69 @@ field rename would show up here.
 recognisably the same maze, judged on a screenshot). Then Phase 2, starting with the §3.1 question.
 
 ---
+
+## 2026-07-27 — PHASE 1 CLOSED (visual A/B passed). Phase 2 opened: the slab collapse.
+
+**Phase 1's acceptance bar is met.** Jahni built step 3, ticked `bUseOperatorStack` on the Maze
+strate and compared: *"it's hard to see with our current maze (which is simple in architecture) but
+seems like it's pretty similar, if not entirely similar."* That is §2.6's bar — recognisably the
+same maze — and it is worth being precise about how much weight it carries.
+
+**The screenshot is the weakest evidence Phase 1 has, and that is fine, because it was never
+carrying the argument.** A simple maze is a poor visual discriminator: "hard to tell apart" is
+*exactly* what the measurements already predicted, since **0 of 20 000 samples cross the
+isosurface** — no triangle can move. The A/B's job was to catch the class of error the numbers
+cannot see (wrong params reaching the stack, wrong strate, wrong wiring), and it did that. The
+geometric claim rests on the numbers, and always did.
+
+### Phase 2, first port: FlatPlain + CrystalChamber → ONE op
+
+**§3.1 answered by Jahni: the Z term can go.** So it is gone, and this is the change that makes the
+rest worth doing.
+
+**Two separate changes landed together, deliberately, and the test is what keeps them attributable:**
+
+1. **The design change** — `GetSlabDensity`'s floor and ceiling noise lost their Z terms
+   (`WorldZ * FF * 0.05f` → `0.0f`; `WorldZ * CF * 0.08f + 3000.0f` → `3000.0f`, keeping the
+   decorrelation offset). The world **re-tunes once**: a different slice of the noise field means a
+   different floor/ceiling shape. Not a degradation — a different draw.
+2. **The refactor** — the now-XY-pure function ported to `FSlabVoidSource` + `FGridColumnMod`,
+   plus the three structural ops. Five ops.
+
+`SlabEquivalence` compares the stack against `GetSlabDensity` **as it is now**, so: green ⇒ the port
+is a pure refactor ⇒ **any visual delta is attributable to the Z-term removal and nothing else.**
+That is why both could go in one build without losing the ability to say which one caused what —
+the attribution comes from the test, not from the build order.
+
+**Why this port matters more than its size:** `BuildSlabStack` has **no branch on archetype**,
+because `GetSlabDensity` never had one either — CrystalChamber IS FlatPlain with a bigger
+`CeilingRoughness`. The test runs the identical battery on both slots, so "two archetypes are one
+op" is demonstrated rather than asserted. **8 archetypes → 7.**
+
+**And the perf claim, which is what §3.1 was really about:** `FSlabVoidSource::ClassifyBox` is
+**exact and needs no sampling**. `VoxelNoise::FBM` is contractually `[-1,1]`, so both surfaces live
+in Z bands with known bounds — a tile below `FloorZ - FloorAmp` is provably solid, a tile strictly
+between the bands is provably air. A slab strate is mostly solid rock below its floor, so this
+should prove a large fraction of tiles. `ClassifyTile` proves **zero** today. The test prints the
+count per archetype; that number is the whole return on the Z term.
+
+`FGridColumnMod` returning `Identity` when no column reaches the box is what lets the source's
+`AllAir` survive the fold — otherwise columns would kill every air verdict in the strate.
+
+**UNVERIFIED: none of this is compiled.** Likely error spots, in order:
+- `VoxelForgeOpStackSlabTest.cpp` is new — check it is picked up by the module's build.
+- The lambda `RunForSlot` captures `World`/`Gen` by reference and calls `AddError`/`TestEqual` on
+  the test instance; `TestEqual`'s name argument is built with `*FString::Printf(...)`.
+- `FGridColumnMod::GetCells` returns a reference to a `thread_local` — intentional (same pattern as
+  `FLatticeCorridorSource::GetCellEdges`), but it is `const` while mutating the thread_local.
+- `static constexpr float ColBlend` used inside `FMath::Max`/comparisons — may need a definition
+  under older MSVC ODR rules if it is ever odr-used.
+- `FSlabGenerationParams` must be complete in `VoxelDensityOpStack.h` (it comes via
+  `VoxelStrateTypes.h`, already included).
+
+**Next single action:** build, run `VoxelForge.OpStack.SlabEquivalence`, and **read the two
+"proved uniform" numbers** — they are the measured payoff of §3.1. Then tick `bUseOperatorStack` on
+a FlatPlain or CrystalChamber strate for the visual A/B. Expect the floor/ceiling shape to have
+changed from the Z-term removal; the question is whether it still reads as the same *kind* of place.
+
+---

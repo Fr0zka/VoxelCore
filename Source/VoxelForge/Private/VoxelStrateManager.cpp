@@ -571,8 +571,10 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
     // and falls back to the switch, so the box can be ticked anywhere without breaking anything.
     switch (Def->GeneratorType)
     {
-    case ECaveGeneratorType::Maze:  return true;
-    default:                        return false;
+    case ECaveGeneratorType::Maze:            return true;   // Phase 1
+    case ECaveGeneratorType::FlatPlain:                      // Phase 2 — les deux partagent
+    case ECaveGeneratorType::CrystalChamber:  return true;   //   UNE seule pile (BuildSlabStack)
+    default:                                  return false;
     }
 }
 

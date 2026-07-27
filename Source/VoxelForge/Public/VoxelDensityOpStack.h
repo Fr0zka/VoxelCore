@@ -183,6 +183,28 @@ namespace VoxelDensityOps
      *  Les six mêmes lignes apparaissent aujourd'hui dans TunnelNetwork, Maze et VerticalShafts. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity);
 
+    /** Rôle 1 — la dalle : surface de sol + surface de plafond → champ de vide. **XY-PUR** depuis
+     *  OPSTACK-DECOMPOSITION §3.1 (le terme en Z des deux bruits est parti), ce qui lui donne un
+     *  `ClassifyBox` EXACT sans échantillonnage : les deux surfaces vivent dans des bandes en Z
+     *  bornées par le contrat [-1,1] de FBM. Sert FlatPlain **et** CrystalChamber. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSlabVoidSource(const FSlabGenerationParams& P, int32 Seed);
+
+    /** Rôle 3 — cylindres de hauteur infinie sur une grille monde. N'ajoute que du solide ⇒
+     *  `FillOnly` quand une colonne atteint la boîte, `Identity` (le cas courant) sinon. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed);
+
+    /**
+     * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
+     *   SlabVoidSource → GridColumnMod → [structural post ×3]
+     *
+     * C'est le premier vrai gain du refactor (OPSTACK-PLAN §4) : deux des huit archétypes
+     * disparaissent dans un opérateur, et leur différence redevient ce qu'elle était déjà dans
+     * `GetSlabDensity` — un jeu de valeurs par défaut, pas du code.
+     */
+    VOXELFORGE_API void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
+                                       int32 Seed, float SpineRadius,
+                                       const UVoxelStrateManager* StrateManager);
+
     /**
      * La pile Maze complète, décomposée — PAS un `FMazeOp` monolithique :
      *   ConstantRockSource → LatticeCorridorSource → SdfRoughnessMod → SdfCarve → [structural post]

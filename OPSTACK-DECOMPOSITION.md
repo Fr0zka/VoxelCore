@@ -263,7 +263,22 @@ FGridColumnMod                 Add        world-grid jittered cylinders, infinit
 That is the entire archetype. Two of the eight collapse into one, and the ceiling's `abs(noise)`
 (formations hang down only, never punch up) is a two-line flag on the source.
 
-### 3.1 A finding to raise with Jahni before porting
+### 3.1 ✅ RESOLVED 2026-07-27 — Jahni: the Z term can go. Removed.
+
+**Decision:** the Z term was not intentional character. It is gone from `GetSlabDensity` (both
+surfaces), `FSlabVoidSource` is XY-pure, and FlatPlain + CrystalChamber are ported and wired.
+
+**What that bought, and what it cost:**
+- `IsXYPure() == true` ⇒ the T1.a column-cache treatment becomes available generically.
+- An **exact `ClassifyBox` with no sampling**: `VoxelNoise::FBM`'s contract is `[-1,1]`, so both
+  surfaces live in Z bands with known bounds — a tile entirely below the floor band is provably
+  solid, a tile strictly between the bands is provably air. These two archetypes proved **zero**
+  tiles before. `VoxelForge.OpStack.SlabEquivalence` reports the count.
+- **Cost: the world re-tunes once.** Dropping the term samples a different slice of the noise
+  field, so floor and ceiling shapes change (they do not degrade). Covered by §2.6's explicit
+  permission to re-tune.
+
+The original finding, kept because it explains why the answer mattered:
 
 `FSlabVoidSource` is **not XY-pure, and probably should be.** Both surfaces sample noise with a
 small Z term:
@@ -284,6 +299,8 @@ But it blocks the T1.a column-cache treatment and it makes an exact `ClassifyBox
 for free, and gets an exact box classification — which means FlatPlain and CrystalChamber start
 skipping trivial tiles, which they never have. That is a large win for a one-character change, so
 it is worth asking rather than assuming either way.
+
+**Answered: it can go.** See the resolution above.
 
 ---
 
