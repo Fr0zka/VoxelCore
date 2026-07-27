@@ -942,3 +942,51 @@ a FlatPlain or CrystalChamber strate for the visual A/B. Expect the floor/ceilin
 changed from the Z-term removal; the question is whether it still reads as the same *kind* of place.
 
 ---
+
+## 2026-07-27 — SlabEquivalence GREEN. The §3.1 payoff is measured: 36 and 40 of 60 tiles.
+
+```
+FlatPlain      box verdicts over 60 tiles: 36 proved uniform, 24 Mixed
+CrystalChamber box verdicts over 60 tiles: 40 proved uniform, 20 Mixed
+both: 52 of 20000 samples differ, ALL at ULP scale, 0 cross the isosurface
+```
+
+**This is the number the whole §3.1 question was about, and it is better than Maze's.** Maze proved
+23 of 60; the slab archetypes prove **36 and 40** — 60-67 % of tiles, where `ClassifyTile` proves
+**zero** for these two today. The reason is structural rather than lucky: a slab strate is mostly
+solid rock below its floor, and now that both surfaces are XY-pure their Z bands are known exactly,
+so "this tile is entirely below the floor band" is a comparison rather than a sample.
+
+**The ULP residue is the known C10 floor** — 52/20000, 0 isosurface crossings, worst delta 2⁻¹⁸
+(exactly 1 ULP at a density magnitude of ~32). **Not investigated, on purpose.** Same shape as C10:
+deterministic, ULP-scale, zero consequence, and six builds were already spent proving that shape is
+not worth chasing.
+
+### The output exposed a real weakness in my own test — fixed
+
+Both archetypes reported **the same 52 and the same worst delta**. The explanation is in the
+fixture: `FTestWorld::Build` sets only `GeneratorType`, so **FlatPlain and CrystalChamber both get
+DEFAULT `FSlabGenerationParams`.** They are the same configuration at two depths.
+
+So the test's claim #2 was overstated. It demonstrated "the slab stack works at two depths", not
+"one op serves two archetypes with different defaults" — **`CeilingRoughness`, the one field that
+actually distinguishes CrystalChamber, was never varied.** The differing tile counts (36 vs 40)
+come from the two slots' Z ranges, not from the archetypes differing.
+
+**A third pass added: `CrystalChamber(tuned)`** — `CeilingRoughness` 6 → 20, plus a rougher floor
+and 3× the columns. It varies what actually matters, and it is deliberately the **worst case for
+`ClassifyBox`**: a large `CeilingRoughness` widens the ceiling band and makes the
+`Max(CeilZ - noise, FloorSurface + 2)` clamp far more likely to bind, which is exactly where a
+false verdict — a HOLE — would appear. The default params were too gentle to stress that bound.
+
+**UNVERIFIED:** the third pass. Its box-verdict brute force is the part that matters; expect fewer
+tiles proved uniform than the gentle passes (wider bands ⇒ more Mixed), and **zero** unsound
+verdicts. If `NumUnsound > 0` here, the `CeilHi` bound in `FSlabVoidSource::ClassifyBox` is the
+first suspect, not the noise contract.
+
+**Next single action:** rebuild, confirm the tuned pass is green, then the visual A/B on a FlatPlain
+or CrystalChamber strate. The floor/ceiling shape WILL differ from before (the Z-term removal); the
+question is whether it still reads as the same kind of place. Then `SurfaceWorld`
+(OPSTACK-DECOMPOSITION §5) — biggest payoff, most care.
+
+---

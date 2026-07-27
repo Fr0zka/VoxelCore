@@ -10,6 +10,11 @@
 //   2. UN OPÉRATEUR, DEUX ARCHÉTYPES — la MÊME pile est vérifiée contre FlatPlain ET
 //      CrystalChamber. `GetSlabDensity` ne les distingue par aucun branchement ; si la pile a
 //      besoin d'en faire un, la fusion est fausse et ce test le dit.
+//      ⚠️ La fixture ne règle que `GeneratorType`, donc les deux slots portent des params PAR
+//      DÉFAUT : à eux seuls ils exécutent la même configuration à deux profondeurs. C'est la
+//      TROISIÈME passe (`CrystalChamber(tuned)`, `CeilingRoughness` 6 → 20) qui fait réellement
+//      varier ce qui distingue les deux archétypes — et qui sert en même temps de pire cas aux
+//      bornes d'amplitude de `ClassifyBox`. Voir le bloc en bas de fichier.
 //   3. LE VERDICT DE BOÎTE — et c'est ici que §3.1 se paie. `ClassifyTile` prouve ZÉRO tuile pour
 //      FlatPlain et CrystalChamber aujourd'hui. Depuis que les deux surfaces sont XY-PURES, leurs
 //      bornes en Z sont connues exactement (contrat [-1,1] de FBM), donc toute tuile entièrement
@@ -76,21 +81,10 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
     //=========================================================================
     // Exécutée à l'identique sur FlatPlain et CrystalChamber. Si les deux passent avec la MÊME
     // pile et la MÊME fabrique, la fusion des deux archétypes est démontrée plutôt qu'affirmée.
-    auto RunForSlot = [&](int32 SlotIndex, const TCHAR* SlotName)
+    auto RunBattery = [&](const FSlabGenerationParams& SlabParams,
+                          int32 TopVoxelZ, int32 BottomVoxelZ,
+                          int32 SlotIndex, const TCHAR* SlotName)
     {
-        int32 TopVoxelZ = 0, BottomVoxelZ = 0;
-        if (!World.GetSlotVoxelZRange(SlotIndex, TopVoxelZ, BottomVoxelZ))
-        {
-            AddError(FString::Printf(
-                TEXT("The fixture layout has no %s slot. Check FTestWorld::Build's Archetypes[] ")
-                TEXT("against FTestWorld::Slot%s."), SlotName, SlotName));
-            return;
-        }
-
-        const int32 MidChunkZ = ((TopVoxelZ + BottomVoxelZ) / 2) / CHUNK_SIZE;
-        const FSlabGenerationParams SlabParams =
-            World.StrateManager->GetSlabParamsForChunk(FIntVector(0, 0, MidChunkZ));
-
         // `GetSlabDensity` court-circuite sur une strate dégénérée (`return 1.0f`). Cette garde
         // appartient à la fonction d'archétype, pas à un opérateur ; la pile suppose une strate
         // valide, et `GetDensityAt` retombe sur le `switch` dans ce cas.
@@ -303,8 +297,66 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         }
     };
 
-    RunForSlot(FTestWorld::SlotFlatPlain,      TEXT("FlatPlain"));
-    RunForSlot(FTestWorld::SlotCrystalChamber, TEXT("CrystalChamber"));
+    //=========================================================================
+    // LES TROIS PASSES
+    //=========================================================================
+    auto ResolveSlot = [&](int32 SlotIndex, const TCHAR* SlotName,
+                           FSlabGenerationParams& OutParams, int32& OutTop, int32& OutBottom) -> bool
+    {
+        if (!World.GetSlotVoxelZRange(SlotIndex, OutTop, OutBottom))
+        {
+            AddError(FString::Printf(
+                TEXT("The fixture layout has no %s slot. Check FTestWorld::Build's Archetypes[] ")
+                TEXT("against FTestWorld::Slot%s."), SlotName, SlotName));
+            return false;
+        }
+        const int32 MidChunkZ = ((OutTop + OutBottom) / 2) / CHUNK_SIZE;
+        OutParams = World.StrateManager->GetSlabParamsForChunk(FIntVector(0, 0, MidChunkZ));
+        return true;
+    };
+
+    FSlabGenerationParams FlatParams, CrystalParams;
+    int32 FlatTop = 0, FlatBottom = 0, CrystalTop = 0, CrystalBottom = 0;
+
+    if (ResolveSlot(FTestWorld::SlotFlatPlain, TEXT("FlatPlain"), FlatParams, FlatTop, FlatBottom))
+    {
+        RunBattery(FlatParams, FlatTop, FlatBottom, FTestWorld::SlotFlatPlain, TEXT("FlatPlain"));
+    }
+
+    if (ResolveSlot(FTestWorld::SlotCrystalChamber, TEXT("CrystalChamber"),
+                    CrystalParams, CrystalTop, CrystalBottom))
+    {
+        RunBattery(CrystalParams, CrystalTop, CrystalBottom,
+                   FTestWorld::SlotCrystalChamber, TEXT("CrystalChamber"));
+
+        //=====================================================================
+        // LA PASSE QUI FAIT VRAIMENT LA DÉMONSTRATION
+        //=====================================================================
+        // ⚠️ La fixture ne règle QUE `GeneratorType` : FlatPlain et CrystalChamber y reçoivent des
+        // `FSlabGenerationParams` PAR DÉFAUT, donc identiques. Les deux passes ci-dessus exécutent
+        // en réalité la même configuration à deux profondeurs — ce qui est un test utile, mais qui
+        // ne démontre PAS « un opérateur, deux jeux de défauts » : `CeilingRoughness`, la seule
+        // chose qui distingue réellement CrystalChamber, n'y varie jamais.
+        //
+        // Cette passe-ci fait varier ce qui compte, et elle est aussi le PIRE CAS pour les bornes
+        // d'amplitude de `ClassifyBox` : un `CeilingRoughness` élevé élargit la bande du plafond et
+        // rend le clamp `Max(CeilZ - bruit, FloorSurface + 2)` beaucoup plus susceptible de mordre.
+        // Si un verdict de boîte est faux quelque part, c'est ici qu'il apparaît.
+        //
+        // The fixture only sets GeneratorType, so both slots get DEFAULT slab params — the two
+        // passes above are the same configuration at two depths. This pass varies what actually
+        // distinguishes CrystalChamber, and is simultaneously the worst case for the ClassifyBox
+        // amplitude bounds: a large CeilingRoughness widens the ceiling band and makes the
+        // FloorSurface + 2 clamp far more likely to bind.
+        FSlabGenerationParams Tuned = CrystalParams;
+        Tuned.CeilingRoughness         = 20.0f;   // vs 6.0 par défaut — de vraies stalactites
+        Tuned.CeilingRoughnessFrequency = 0.09f;
+        Tuned.FloorRoughness           = 9.0f;
+        Tuned.ColumnDensity            = 0.25f;   // beaucoup plus de colonnes ⇒ FillOnly plus souvent
+        Tuned.ColumnMaxRadius          = 11.0f;
+
+        RunBattery(Tuned, CrystalTop, CrystalBottom, 64, TEXT("CrystalChamber(tuned)"));
+    }
 
     return true;
 }
