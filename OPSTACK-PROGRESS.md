@@ -811,3 +811,28 @@ connectivity, same feel. That is §2.6's bar, and it is the last thing Phase 1 n
 `OPSTACK-DECOMPOSITION §10.4` starts with FlatPlain + CrystalChamber collapsing into one op.
 
 ---
+
+## 2026-07-27 — session handoff written. 39 UE skills installed.
+
+**`OPSTACK-HANDOFF.md`** added at the plugin root: a pasteable resume prompt for a fresh session.
+Read order, exact current state, the immediate next action, the hard rules, the open items, and the
+method lesson from this session.
+
+**39 Unreal skills installed.** Jahni dropped a UE skills library into `.claude/skills/`, but nested
+as `.claude/skills/core/<name>/SKILL.md` — two levels deep, where Claude Code discovers skills one
+level deep at `.claude/skills/<name>/SKILL.md`. None were being loaded. Flattened (39 SKILL.md, 124
+reference files, all frontmatter valid, folder names already matched `name:`); `core/category.md`
+left in place as documentation. Confirmed loading.
+
+⚠️ **They are untracked**: `.gitignore` starts with `*`, and git cannot re-include a file whose parent
+directory is excluded, so nothing under `.claude/` can be tracked without un-ignoring the directory
+itself. Same shape as AUDIT P1. Flagged to Jahni, not actioned — vendoring a reference library into
+the plugin repo is his call.
+
+**Immediately relevant to open work:** `module-and-build-system` documents `PCHUsage` / shared PCH /
+IWYU — i.e. the exact mechanism that blocked §C10's settling experiment. That skill was in the repo,
+undiscovered, while it was worked out the slow way. Worth reading before clearing the IWYU debt.
+
+**Next single action unchanged:** build Phase 1 step 3, then the visual A/B on a Maze strate.
+
+---
