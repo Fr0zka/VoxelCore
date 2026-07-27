@@ -4,7 +4,11 @@
 > *composable density pipeline*, so new world ideas become authoring instead of C++. Written
 > 2026-07-26 as a handoff for a future context — read this instead of re-deriving it.
 >
-> **Status:** DESIGN AGREED, NOT STARTED. Nothing in the codebase implements this yet.
+> **Status (2026-07-27):** Phase 0.5 (tests) and the Phase 1 skeleton header are WRITTEN AND
+> COMMITTED but **NOT YET COMPILED**. No operator exists; `GetDensityAt`'s archetype `switch` is
+> untouched. Live state and the next action live in
+> [OPSTACK-PROGRESS.md](OPSTACK-PROGRESS.md) — read its last entry first. The per-archetype
+> breakdown is in [OPSTACK-DECOMPOSITION.md](OPSTACK-DECOMPOSITION.md).
 >
 > **Read first:** `CODEMAP.md` (navigation) · `ARCHITECTURE.md §8.10` (the perf invariants this must not
 > break) · `AUDIT-2026-07.md §6` (the 3D hazards this is designed to kill permanently).
@@ -277,6 +281,9 @@ T1.d's 44% worker-CPU win. A global 3D noise field makes every deep tile `Mixed`
 ---
 
 ### Phase 0.5 — The safety net. ~1 day. Do this before Phase 1, not after.
+> **✅ WRITTEN 2026-07-27 — ⏳ NOT YET COMPILED OR RUN.** Four tests in `Private/Tests/` (the three
+> below, plus a live-edit regression test for `AUDIT C2`). The gate below is NOT met until Jahni
+> builds and runs them. See `OPSTACK-PROGRESS.md`.
 
 Three automation tests (`Source/VoxelForge/Private/Tests/`, `IMPLEMENT_SIMPLE_AUTOMATION_TEST`).
 There are currently **zero tests**, and nothing machine-checks the dozens of "bit-identical" claims in
@@ -300,8 +307,12 @@ the docs.
 **Pick `Maze`.** ~100 lines, no cross-chunk connectivity decision, trivial bound (corridor SDF is
 Lipschitz-1 off a lattice), and it's the least-used archetype so a mistake is cheap.
 
-1. Add `IVoxelDensityOp` + `EVoxelOpEffect` + `FVoxelOpContext` + the four role tags (new file:
-   `Public/VoxelDensityOp.h`).
+1. ✅ **DONE 2026-07-27 (uncompiled):** `IVoxelDensityOp` + `EVoxelOpEffect` + `FVoxelOpContext` +
+   the four role tags + the box-verdict fold, in `Public/VoxelDensityOp.h`. **One addition beyond
+   this spec:** `ClassifyBox` is not source-only — forcing ops (the boundary seal inside its band)
+   overwrite the input, which pure direction cannot express. Rationale in the header.
+   **One open question the decomposition raised:** `Eval` probably needs an SDF channel as well as
+   a density channel — see `OPSTACK-DECOMPOSITION.md §0.1`. Decide before porting Maze.
 2. **DECOMPOSE, don't wrap** (§2.5, §2.6). Maze becomes a stack, not one op:
    `FLatticeCorridorSource` (role 1 — the capsule field off the 3D lattice) → `Subtract` →
    `FSurfaceRoughnessMod` (role 3 — the existing `SurfaceRoughness` perturbation) → then the four
@@ -410,19 +421,32 @@ From `AUDIT-2026-07.md §5`. None depend on this plan; all become harder inside 
 1. **Bound `SeedF`** (`AUDIT C1`) — `const float SeedF = (float)(VoxelHash::Mix((uint32)Seed) & 0x3FFF);`
    at all 6 definition sites. Large seeds currently collapse noise terms to constants. One world re-tune.
    **Do it before tuning 3D caves against a seed you might later randomise.**
-2. **Add `GetLayoutVersion()` to `CP_Chunk` / `OC_Chunk` / `BM_Chunk`** (`AUDIT C2`).
+2. ✅ **DONE 2026-07-27 (uncompiled)** — `GetLayoutVersion()` added to `CP_Chunk` / `OC_Chunk` /
+   `BM_Chunk`, **plus two the audit missed**: `TC_BiomeCache` in `ClassifyTile`, and the
+   `GSurfColCache` box key (whose `StrateKey` is `round(StrateBottomWorldZ)`, so a live edit that
+   changes terrain params without moving the strate served stale columns — the most visible form of
+   the bug). `FChunkBiomeCache::Invalidate()` added, since a validity BOX says nothing about the
+   `FBiomeContext` its cells were classified against. (`AUDIT C2`.)
 3. **`GetPlayerPosition` no-player flag** (`AUDIT C4`) — `(0,0,0)` is the designed spine landing and
    currently stalls all streaming.
 4. **Unbounded joins on shutdown** (`AUDIT C5`).
-5. **Track the `.md` files** (`AUDIT P1`) — `!*.md` in `.gitignore`. This file is currently untracked.
-6. **Branch the experimental 3D work** (`AUDIT §6.6`) — `git switch -c 3d-density`.
+5. ✅ **DONE 2026-07-27** — `!*.md` in `.gitignore`; all nine design docs are tracked (commit `3128852`).
+6. ✅ **DONE** — the work lives on branch `experimental`; `main` is the known-good fallback.
 
 ---
 
 ## 9. Resume here
 
-**Next action:** Phase 0 — ship the 3D caves with `CaveSystemEffectOverBox` as a standalone function.
-Nothing in this plan is started.
+**Next action (2026-07-27): BUILD.** Phase 0.5's four tests and the Phase 1 skeleton header are
+committed and unverified. Nothing else should be written until they compile and the tests are green
+— writing unverified code on top of unverified code is the exact pattern `AUDIT §P3` documents.
+
+After the build, in order: (1) fix whatever the tests report, (2) answer the five questions in
+`OPSTACK-DECOMPOSITION.md §11` — especially the SDF channel, which changes the contract and is
+cheapest to decide before any port, (3) port `Maze` per `OPSTACK-DECOMPOSITION.md §4`.
+
+`AUDIT C1` (unbounded `SeedF`) is deliberately still open — see the progress log for why it was held
+back rather than forgotten.
 
 When picking this up cold: read §0, §2 (the direction-only insight — that's what makes step 1 small),
 and §4. The rest is reference. If the plan feels too big, re-read §2: **Phase 1 needs no numeric bounds

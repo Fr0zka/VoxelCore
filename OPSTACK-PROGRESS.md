@@ -119,3 +119,48 @@ own, deliberately, when he has an hour to re-tune. **It is still a real bug — 
 **Next single action:** build-free queue. Q1 (`OPSTACK-DECOMPOSITION.md`), then Q2, then Q3.
 
 ---
+
+## 2026-07-27 — build-free queue done. END OF UNATTENDED SESSION.
+
+**What (queue items, all zero-build-risk):**
+
+- **Q1 — `OPSTACK-DECOMPOSITION.md`** (commit `c188ee8`). All 8 archetypes read line by line and
+  broken into source / combiners / modifiers / structural post, with every `FStrateGenerationParams`
+  field traced to its destination op. Three findings that change sequencing are in its §0.
+- **Q2 — the param audit** is §9 of that same file. Every field is claimed except
+  `WaterLevelRelative`, which is a render/water property misfiled in the density struct (and `Lerp`'d
+  across strate boundaries, where a water plane arguably shouldn't be). Reported, not deleted.
+- **Q3 — stale markers ticked** (commit `831ee2f`): `fable-idea` F20 phases 1/2 + F18,
+  `REVIEW_FINDINGS` perf pass 2 + batch 3, `ARCHITECTURE`'s biome full-param redesign. NOT ticked:
+  `ARCHITECTURE`'s F6 master material graph — its C++ half is built but the graph is editor-side
+  work that is genuinely still open.
+- **Q4 — `.gitignore`** (commit `3128852`, done first out of order because progress-log commits
+  depended on it).
+- CODEMAP §3 rows for every new/moved symbol; `OPSTACK-PLAN` phase markers ticked.
+
+**The three findings, so they are not lost if only this file is read:**
+
+1. **The op contract probably needs an SDF channel as well as a density channel.** Rooms, pits and
+   chimneys are `SmoothMin`'d in SDF space before a *single* carve, and three of the four SDF
+   archetypes add roughness to the SDF, not to density. A single-channel `Eval` can only overwrite —
+   which is also why cross-source `SmoothUnion` (*"a maze inside a mountain that looks like it
+   belongs"*) is not expressible without it. **Decide before porting Maze**; it is far cheaper now
+   than after four ports. Not applied — it is Jahni's call.
+2. **Worm tunnels are why TunnelNetwork can never skip a tile.** A fielded 3D-noise carve with no
+   bounds forces `CarveOnly` everywhere, killing `AllSolid` for the most-used archetype. Its
+   amplitude is trivially capped by `WormStrength`, so ~10 lines of scalar bound recovers deep-rock
+   skipping. Suggests one numeric bound belongs in Phase 2, not Phase 3 as the plan has it.
+3. **Disturbances already carry lattice bounds `ClassifyTile` discards** (it only tests
+   `ChasmDensity > 0` strate-wide). A win available to SurfaceWorld independently of everything else.
+
+**Believed true:** the working tree is a coherent, committed state. Nine commits on `experimental`,
+`main` untouched.
+
+**UNVERIFIED — the whole C++ batch.** Nothing has been compiled. Specifically at risk:
+`Private/Tests/` is a new directory, the module has never included `AutomationTest.h`, and the test
+fixture's `TSoftObjectPtr` → transient-`UVoxelStrateDefinition` resolve has never run.
+
+**Next single action: BUILD.** Then fix what the tests say, then answer
+`OPSTACK-DECOMPOSITION.md §11`, then port Maze. Do not write more plugin C++ before the build.
+
+---
