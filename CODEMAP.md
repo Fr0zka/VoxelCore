@@ -90,7 +90,23 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 | `LocalToIndex` / `IndexToLocal` / `IsValidLocalCoord` | 107-131 | Flat-array 3D↔1D indexing. |
 | `SmoothStep01` | 140 | 3x²-2x³ — used everywhere for blends. |
 | `VOXEL_NOISE_SCALE` (1.25f) | 147 | Rescales UE PerlinNoise3D to ~[-1,1]. |
+| `EVoxelTileClass` enum (`Mixed`/`AllSolid`/`AllAir`) | — | T1.d verdict. **MOVED here from `VoxelGenerator.h` 2026-07-27** so `VoxelDensityOp.h` can share it without a UCLASS dependency. A false `AllSolid`/`AllAir` is a HOLE; a false `Mixed` only costs CPU. |
 | `FVoxelMeshData` struct | 157-173 | Mesher output (Vertices/Triangles/UVs/Normals/**Colors**). Plain C++, not USTRUCT. `Colors` = F6 material masks (R=dominant biome palette, G=slope, B=border blend weight, A=neighbour biome palette). §8.15. |
+
+### 3.2b Density operator stack contract — `Public/VoxelDensityOp.h` (plain C++, no UHT)
+**Phase 1 skeleton, added 2026-07-27. Nothing is wired in yet** — `GetDensityAt`'s archetype
+`switch` is untouched and no operator exists. See [OPSTACK-PLAN.md](OPSTACK-PLAN.md) for the plan and
+[OPSTACK-DECOMPOSITION.md](OPSTACK-DECOMPOSITION.md) for the per-archetype breakdown.
+
+| Symbol | Notes |
+|--------|-------|
+| `EVoxelOpRole` | The four roles: `FieldSource` (what the field IS) · `Combiner` (how fields merge) · `DetailModifier` (today's `UVoxelTerrainOpDefinition`) · `StructuralPost` (spine→seal→passage→diff, appended automatically, never author-omittable). |
+| `EVoxelOpCombine` | `Replace`/`Union`(min)/`Subtract`(max)/`SmoothUnion`/`SmoothSubtract`/`Add`/`Mask`. Sign reminder: negative = solid, so "add solid" is `min`. |
+| `EVoxelOpEffect` | `Identity`/`CarveOnly`/`FillOnly`/`Both`. Conservative: `Both` is always safe, the wrong one is a hole. |
+| `FVoxelOpContext` | Chunk-constant inputs. **Carries `LayoutVersion` by construction** so a new op cannot forget it (AUDIT C2). |
+| `IVoxelDensityOp` | `PrepareChunk` / `Eval` / `EffectOverBox` / `ClassifyBox` / `IsXYPure`. |
+| `IVoxelDensityOp::ClassifyBox` | ⚠️ **not source-only.** Forcing ops (the boundary seal inside its band) overwrite the input entirely, which pure direction cannot express. |
+| `FVoxelBoxHypotheses` + `VF_ForceHypotheses` / `VF_FoldEffect` / `VF_FoldOp` | The fold that turns a stack into an `EVoxelTileClass`. Reproduces today's hand-written `ClassifyTile` line for line — the mapping is written out in the header. |
 
 ### 3.3 Chunk identity
 `VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
@@ -263,6 +279,10 @@ border warp+blend / climate field freqs), `EBiomePreviewChannel` (preview-bake s
 `FVoxelBiomeQuery` (BlueprintType result of `GetBiomeAtWorldLocation` — dominant/neighbour asset,
 climate, blend weight, deco count), and plain runtime PODs `FBiomeResolved` / `FBiomeContext` /
 `FBiomeSample` / `FChunkBiomeCache` (the box-validated per-chunk grid cache). See §8.14.
+`FChunkBiomeCache::Invalidate()` (added 2026-07-27, AUDIT C2) — force a rebuild when the strate
+layout version moves. The validity BOX says nothing about the `FBiomeContext` the cells were
+classified against, so after a `RebuildStrates` the grid is stale even though the box still covers
+the query. Called by all four callers on a `GetLayoutVersion()` change.
 
 **`Public/VoxelBiomeDefinition.h` + `.cpp`** (NEW) — `UVoxelBiomeDefinition : UPrimaryDataAsset`.
 One asset = one biome: identity + `DebugColor`, climate placement box (`ReliefMin/Max`,
@@ -312,6 +332,18 @@ Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs ed
 > read it first when touching generation/strates/passages.
 
 ---
+
+### 3.12 Automation tests — `Private/Tests/` (added 2026-07-27, `#if WITH_DEV_AUTOMATION_TESTS`)
+The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor's
+**Session Frontend → Automation**, filter `VoxelForge`.
+
+| File | Test name | What it proves |
+|------|-----------|----------------|
+| `VoxelForgeTestFixture.h` | — | `FTestWorld`: a headless world (transient strate definitions → `UVoxelSettings` → a real `UVoxelStrateManager::Initialize`) so tests hit `GetDensityAt`, where the thread_local caches live. One strate per archetype, **pinned via `FixedStrates`** so slot index → archetype is stable across seeds (`SlotSurfaceWorld` etc.). |
+| `VoxelForgeDensityPurityTest.cpp` | `VoxelForge.Determinism.DensityPurity` | 10k points re-sampled in shuffled order, same thread **and** on N workers, asserting BIT equality. `ValidateDeterminism` is game-thread only and cannot see worker-cache divergence. Includes a flat-field canary (AUDIT C1) and a diff-layer pass. |
+| ″ | `VoxelForge.Determinism.LiveEditInvalidation` | AUDIT C2 regression: triple the heightfield params, `Initialize` again, require the density to MOVE. The edit does not move the strate, so only `LayoutVersion` changes. |
+| `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.Determinism.ClassifyTileSoundness` | Scans for a non-`Mixed` verdict, then brute-forces the exact mesher lattice (`g ∈ [-1, Cells+1]`). **A false verdict is an invisible, collisionless hole** — T1.d v1 was reverted for exactly this. Errors out rather than passing if it found nothing to check. |
+| `VoxelForgeDiffLayerTest.cpp` | `VoxelForge.Determinism.DiffLayerContention` | N readers running the worker call mix while the game thread writes and `Clear()`s. Survival + monotonic `ModsVersion`. |
 
 ## 4. The density pipeline (most-edited hot path)
 

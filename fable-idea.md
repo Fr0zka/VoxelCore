@@ -116,8 +116,8 @@ Voronoi field).** Original sketch (kept for the cave-biome extension): Determini
 
 **F17 — Generator surface-class tag (ceiling/ground/cave material the *right* way). ✅ DONE 2026-07-05** (per-vertex semantic class in the mesher — down-facing verts query a memoized `GetSurfaceHeightAt`, nearer CeilSurf ⇒ sky-cap — per-tri majority → two contiguous polygroup runs → RMC section per group, slot 1 = `CeilingMaterial`, per-section shadow. Trigger: the whole-tile normal vote painted mixed coarse tiles with one material. Cave-roof discrimination hook is in place: down-facing below TerrainZ ⇒ ground/rock. Remaining polish idea: fully sideways cap-fold tris (all 3 verts |N.Z|≤0.1) default to ground.) Original design note: ★ do this when caves land. Today `ApplyMeshToTile` picks one material per tile from a ceiling test — first a height-oracle sample (midpoint), now a worker-side **normal vote** over the tile's mesh normals (down-facing ⇒ `bIsCeiling` ⇒ `CeilingMaterial` + no shadow; gated to SurfaceWorld by one `GetSurfaceHeightAt` probe). That's a **stopgap that only works because down-facing == sky-cap *while no caves exist*.** The moment a mountain-biome cave uses the same density/mesh system, its roof is also down-facing and would wrongly get the sky-cap material — orientation can't tell a cave ceiling from a surface ceiling. **The discriminator is semantic, not geometric, and only the generator knows it:** a sky-cap surface is the `ComputeSurfaceCeiling` (`CeilSurf`) boundary; a cave ceiling is a 3D-noise **carve** below `TerrainZ`. Cheap test the generator already has the inputs for — at a down-facing surface vertex, compare world Z to the column's `TerrainZ`/`CeilSurf` (both from the surface-column cache the mesher already holds): near `CeilSurf` ⇒ sky-cap, below `TerrainZ` ⇒ cave. **Plan:** stamp a discrete *surface class* (ground / sky-cap / cave-ceiling / cave-wall…) per vertex/triangle **at mesh time** in the mesher → carry it as the **polygroup** (already enabled, `Builder.EnablePolyGroups()`, every tri currently group 0) → `ApplyMeshToTile` maps polygroup → material slot (slot 0 terrain, slot 1 sky-cap, slot 2 cave-rock, biome-specific via the F5 palette mask) and sets per-section shadow. Discrete "which material" → polygroup/slot; continuous masks (biome blend, slope — F6) stay in `Colors`. This **subsumes** the current ground/ceiling split (it falls out as a special case), fixes the coarse mixed-tile horizon artifact exactly (per-triangle, not per-tile dominant-wins), and is the only version that survives caves. Pairs naturally with F5/F6/F8 (all want generator-stamped per-vertex material identity). Cost: a per-tri classify in the mesher (cheap, has the cache) + multi-slot setup in the apply path (RMC supports it; confirm the v5 per-section `UpdateSectionConfig` / slot-per-polygroup calls + empty-polygroup = no draw). Until then: the normal vote is fine — it's commented as "no caves yet → down == cap."
 
-**F18 — Far-field per-surface SHEETS (the render-distance ring, cheap). ✅ code-complete 2026-07-06
-(pending build).** With `RenderDistanceChunks` the
+**F18 — Far-field per-surface SHEETS (the render-distance ring, cheap). ✅ BUILT & WORKING 2026-07-06**
+(marker ticked 2026-07-27). With `RenderDistanceChunks` the
 outermost ring can reach many km — as MC tiles that's 600-1000 primitives paying per-frame visibility/VSM
 forever, and each far tile runs full 3D marching cubes just to rediscover two heightfields. In an open
 strate the far field IS two heightfields the generator already computes per column (`GetSurfaceHeightAt`:
@@ -204,7 +204,7 @@ fade with slope ⇒ seamless at biome borders; placement hashes are pure `(seed,
 "ops finally work on the surface" win; **(2)** overhang (3D band, slope-conditioned); **(3)** spike/hole (placed +
 shortlist + ClassifyTile guard) — most cost, do last.
 
-**PHASE 1 — CODE-COMPLETE, PENDING BUILD (2026-07-08).** Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
+**PHASE 1 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
 push height from the local mean where steep ⇒ sheer walls; the slope-conditioned one, hugs steep terrain;
 v1 band-snap was too subtle, reformulated to steepening after Jahni's "doesn't change much"), **Terrace** (relief-gated plateau quantize, now with
 `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed). *Design
@@ -221,7 +221,7 @@ height oracle `ComputeSurfaceTerrainZ` (new `SampleSurfaceStructuralZ` helper = 
 an XY offset for Cliff's slope) so MC/sheets/ClassifyTile/deco/BP-bridge all agree, no T1.d interference. Revisit
 the array+condition model for **phase 2 (overhangs)** where per-entry slope-gating earns its keep.
 
-**PHASE 2 — CODE-COMPLETE, PENDING BUILD (2026-07-08).** Overhang (first VOLUMETRIC op) as
+**PHASE 2 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Overhang (first VOLUMETRIC op) as
 `FSurfaceGenerationParams` fields (`OverhangStrength/Reach/Height/Frequency/ZScale/SlopeThreshold`, default
 off). **Design NOTE — v1 additive-noise-band was WRONG (Jahni: "does nothing" + sketch of a real cliff lip):
 band-additive noise can only bump the surface where it already is, never make rock jut OUT over a void.**

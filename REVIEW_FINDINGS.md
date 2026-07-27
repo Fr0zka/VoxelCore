@@ -25,7 +25,7 @@ Legend: ✅ verified against code · ◻️ checklist box.
 > • **`UploadDirtyTextures` now calls `EnsureTextures`** — GPU upload toggled ON at runtime works.
 > Deliberately NOT done: the big behavior-preserving splits below (un-built tree; compile risk).
 
-> **2026-07-04 perf pass 2 (per-voxel hot path, Fable 5)** — CODE-COMPLETE, pending build. All
+> **2026-07-04 perf pass 2 (per-voxel hot path, Fable 5)** — ✅ BUILT & WORKING (ticked 2026-07-27). All
 > bit-identical (same hashes/math, hoisted per chunk/cell):
 > • **DiffLayer snapshot API** (`HasAnyMods`/`GetModsVersion`/`GetChunkModsSnapshot`/static
 >   `EvaluateMods` + `ModsVersion` atomic) — `GetDensityAt` snapshots a chunk's mods once per
@@ -46,7 +46,7 @@ Legend: ✅ verified against code · ◻️ checklist box.
 > detection stays (MIDs own their values).
 
 > **2026-07-04 batch 3 (Fable 5)** — Jahni green-lit multiple changes per build + visual deltas
-> ("nothing is set in stone"). PENDING BUILD together with pass 2:
+> ("nothing is set in stone"). ✅ BUILT & WORKING together with pass 2 (ticked 2026-07-27):
 > • **Terracing gradient Z-only** (6→2 SDF samples — see the ticked item above).
 > • **Lerp X-macro** + **BakeRoomFeature dedupe** (both ticked above, bit-identical).
 > • **T2.b LOD octave drop** — opt-in `UVoxelSettings::LODOctaveDrop` (default 0 = byte-identical);

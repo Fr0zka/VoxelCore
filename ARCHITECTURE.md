@@ -625,7 +625,7 @@ change *anything*, e.g. frequencies, which scalar multipliers couldn't.)
 - **Preview tool.** `AVoxelWorld::BakeBiomePreview()` (CallInEditor) bakes biome / relief / moisture
   to `Saved/BiomePreview.png` via a transient generator (no PIE). Needs the `ImageWrapper` module.
 - **Status:** A (field+asset+preview), B (terrain), C (content/atmosphere) verified in-editor.
-  Full-param redesign (surface output-blend) code-complete, pending build. Cave structural biomes
+  Full-param redesign (surface output-blend) ✅ BUILT & WORKING (ticked 2026-07-27). Cave structural biomes
   deferred (determinism, see above). Per-voxel biome warp (+2 Perlin) & content `GetDominantBiomeAt`
   are future T1.a column-cache candidates.
 
@@ -657,7 +657,8 @@ generic biome field), not just SurfaceWorld. Empty `Biomes[]` ⇒ all-zero colou
 - **Perf.** Free where a strate has no biomes (`GetBiomeMaterialAt` early-outs to palette 0). Otherwise
   one biome resolve per unique vertex, bounded by the per-chunk biome cache (don't feed it a chunk key —
   keep the box validity, §8.10). Coarse far tiles have few vertices.
-- **Status:** C++ code-complete, pending in-editor build + the master material graph (editor-side work).
+- **Status:** C++ ✅ BUILT & WORKING (ticked 2026-07-27). The master material graph is still
+  editor-side work and is deliberately NOT ticked — that half is Jahni's, not the code's.
 
 ## 9. Multiplayer model (listen-server first, dedicated-friendly)
 
