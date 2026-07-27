@@ -589,3 +589,45 @@ immediately.
 **Next single action:** rebuild, read `FIRST B-vs-C MISMATCH`. It names the file to open.
 
 ---
+
+## 2026-07-27 — LOCALISED to the carve. Testing the right variable this time.
+
+**The diagnostic pinned it exactly:**
+
+```
+SDF   stack -1.76393199 [0xBFE1C886]   verbatim -1.76393199 [0xBFE1C886]   IDENTICAL
+MC    stack  7.83939362 [0x40FADC50]   verbatim  7.83939266 [0x40FADC4E]   2 ULP apart
+across all mismatches: SDF differs 0, SDF identical but density differs 126
+```
+
+So the lattice, the hashes, the edge set and `VoxelSDF::Capsule` are all **exactly right** — 126 of
+126. The entire difference is in `FSdfCarveOp`, whose expression is character-identical to the
+original and whose inputs (`Sdf`, `Blend` 2.0, `BaseDensity` 8) are bit-identical.
+
+**Identical inputs + identical expression + different output ⇒ the arithmetic is being *evaluated*
+differently.** And `SmoothStep01` is `x * x * (3.0f - 2.0f * x)` — `3.0f - 2.0f*x` is exactly the
+shape MSVC fuses into an FMA, which is one rounding instead of two: **~1 ULP.**
+
+**Why the three-way missed it — worth recording, because it is a reasoning error, not a coding one.**
+`A` (GetMazeDensity) and `C` (the verbatim copy) are both straight-line, inlined code. `B` goes
+through a **virtual** `IVoxelDensityOp` call, so `FSdfCarveOp::Eval` is compiled out-of-line and can
+get a different contraction decision. The three-way tested *"does the translation-unit boundary
+change the result?"* — it does not — but the real variable is *"does the optimisation context change
+the result?"*. **I designed a clean experiment for the wrong variable, and then believed its answer.**
+Hypothesis 3 was not wrong about the mechanism (`/fp:fast` contraction); it was wrong about the test.
+
+**The experiment now added** isolates exactly that variable: the same carve expression, in the same
+translation unit, once `FORCEINLINE` and once `FORCENOINLINE`.
+
+- **inlined != FORCENOINLINE** ⇒ FP contraction confirmed. **The port has no bug** — the operator
+  stack is arithmetically correct and the residue is unavoidable wherever an op is a virtual call.
+  Then: correct the docs with the *real* reason, accept the ULP floor, move on to step 3.
+- **inlined == FORCENOINLINE** ⇒ contraction is not it, and there is a real logic bug in
+  `FSdfCarveOp` that has now survived four readings.
+
+**UNVERIFIED:** the experiment.
+
+**Next single action:** rebuild, read `INLINING EXPERIMENT`. Either way the answer is final — the
+inputs are proven bit-identical, so only the evaluation can differ.
+
+---

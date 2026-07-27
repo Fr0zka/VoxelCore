@@ -132,6 +132,43 @@ namespace
         return -Density;   // convention MC
     }
 
+    /**
+     * L'EXPÉRIENCE DÉCISIVE sur le carve — même unité de compilation, même source, SEUL le contexte
+     * d'inlining change.
+     *
+     * Le diagnostic a montré : SDF bit-identique, densité différente de 1 ULP, sur 126/126 des
+     * écarts. Or `SmoothStep01` est `x * x * (3.0f - 2.0f * x)`, et `3.0f - 2.0f * x` est exactement
+     * la forme qu'un compilateur fusionne en FMA — un seul arrondi au lieu de deux, soit ~1 ULP.
+     *
+     * A (GetMazeDensity) et C (la copie verbatim) sont tous deux du code DROIT, inliné. B passe par
+     * un appel VIRTUEL sur `IVoxelDensityOp`, donc `FSdfCarveOp::Eval` est compilé hors-ligne, dans
+     * un contexte d'optimisation différent. Le test à trois voies a donc répondu à « la frontière
+     * d'unité de compilation change-t-elle le résultat ? » (non) alors que la vraie variable est
+     * « le contexte d'optimisation change-t-il le résultat ? ».
+     *
+     * Ici on isole EXACTEMENT cette variable : deux fois la même expression, dans la même unité,
+     * l'une inlinable et l'autre FORCENOINLINE. Si elles diffèrent, la cause est établie et le
+     * portage n'a aucun bug.
+     *
+     * Same TU, same source, only the inlining context differs. If these two disagree, the cause is
+     * established and there is no bug in the port.
+     */
+    FORCENOINLINE float CarveNoInline(float Sdf, float Blend, float Base, float InDensity)
+    {
+        if (Sdf >= Blend) { return InDensity; }
+        float Carve = FMath::Clamp((Blend - Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
+        Carve = SmoothStep01(Carve);
+        return InDensity - Carve * Base * 2.0f;
+    }
+
+    FORCEINLINE float CarveInlined(float Sdf, float Blend, float Base, float InDensity)
+    {
+        if (Sdf >= Blend) { return InDensity; }
+        float Carve = FMath::Clamp((Blend - Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
+        Carve = SmoothStep01(Carve);
+        return InDensity - Carve * Base * 2.0f;
+    }
+
     /** Les params Maze de la strate Maze de la fixture, bornes Z de runtime comprises. */
     bool ResolveMazeParams(const VoxelForgeTest::FTestWorld& World, FMazeGenerationParams& Out,
                            int32& OutTopVoxelZ, int32& OutBottomVoxelZ)
@@ -384,6 +421,37 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                 BMC, Bits(BMC), C, Bits(C),
                 VerbEdges, Core.CellSize, Core.CorridorRadius, Core.BaseDensity,
                 SdfDiffers, SdfSame_DensityDiffers));
+
+            // ── L'expérience décisive : inline vs FORCENOINLINE, même unité, même source. ──
+            int32 InlineVsNoInline = 0, NoInlineMatchesStack = 0, InlineMatchesVerbatim = 0;
+            for (int32 i = 0; i < N; ++i)
+            {
+                const float PX = (float)Points[i].X, PY = (float)Points[i].Y, PZ = (float)Points[i].Z;
+                const FVoxelOpSample S = CoreStack.EvalSample(PX, PY, PZ);
+                const float Inl = -CarveInlined(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
+                const float Noi = -CarveNoInline(S.Sdf, 2.0f, Core.BaseDensity, Core.BaseDensity);
+                const float Ver = MazeCoreVerbatim(PX, PY, PZ, Core, World.Settings->Seed);
+                const float Stk = -S.Density;
+                if (!BitEqual(Inl, Noi)) { ++InlineVsNoInline; }
+                if (BitEqual(Noi, Stk))  { ++NoInlineMatchesStack; }
+                if (BitEqual(Inl, Ver))  { ++InlineMatchesVerbatim; }
+            }
+
+            AddInfo(FString::Printf(
+                TEXT("INLINING EXPERIMENT (%d samples, same TU, same source, only inlining differs):\n")
+                TEXT("    inlined carve  !=  FORCENOINLINE carve : %d\n")
+                TEXT("    FORCENOINLINE  ==  operator stack      : %d / %d\n")
+                TEXT("    inlined        ==  verbatim            : %d / %d\n")
+                TEXT("  IF the first number is nonzero, the cause is FLOATING-POINT CONTRACTION under\n")
+                TEXT("  /fp:fast, not a logic error: SmoothStep01 is x*x*(3-2x), and 3.0f - 2.0f*x is\n")
+                TEXT("  exactly the shape MSVC fuses into an FMA (one rounding instead of two, ~1 ULP).\n")
+                TEXT("  A and C are straight-line inlined code; the operator stack goes through a\n")
+                TEXT("  VIRTUAL call, so FSdfCarveOp::Eval is compiled out-of-line and gets a different\n")
+                TEXT("  contraction decision. The earlier three-way tested the TU boundary, which is the\n")
+                TEXT("  WRONG VARIABLE -- this tests the right one.\n")
+                TEXT("  IF the first number is zero, contraction is NOT it and the operator stack has a\n")
+                TEXT("  real logic bug that survives every reading so far."),
+                N, InlineVsNoInline, NoInlineMatchesStack, N, InlineMatchesVerbatim, N));
         }
 
         MutableGen->OriginSpineRadius = SavedSpine;
