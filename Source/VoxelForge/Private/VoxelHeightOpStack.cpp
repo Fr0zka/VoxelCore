@@ -350,8 +350,6 @@ namespace
         FSurfaceGenerationParams P;
         uint32 SeedU;
     };
-}
-
 
     //=========================================================================
     // COMBINER `Mask` — MÉLANGE DE BIOMES / BIOME BLEND
@@ -410,7 +408,14 @@ namespace
         const IVoxelBiomeField*   Field;
         bool                      bBlend = true;
     };
-}
+
+}   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
+    // En dessous commence `namespace VoxelHeightOps` (les fabriques). Y insérer une classe la sort
+    // de la liaison interne, et l'accolade qu'on ajoute avec elle ne ferme rien → C2059. Erreur
+    // commise DEUX fois (7cd2bed, puis à nouveau ici) en s'ancrant sur la bannière « FABRIQUES »,
+    // qui est de l'autre côté de cette accolade.
+    // END OF THE ANONYMOUS NAMESPACE — new operators go ABOVE this line. Anchoring on the FACTORIES
+    // banner below puts them outside it, and the brace added with them closes nothing.
 
 //=============================================================================
 // FABRIQUES / FACTORIES

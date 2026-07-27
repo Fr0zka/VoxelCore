@@ -994,7 +994,12 @@ namespace
         const UVoxelStrateManager* Manager;
         float Base, Seal;
     };
-}
+
+}   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
+    // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
+    // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
+    // ajoutée avec elle ne ferme rien → C2059.
+    // END OF THE ANONYMOUS NAMESPACE — new operators go ABOVE this line.
 
 //=============================================================================
 // FVoxelOpStack
