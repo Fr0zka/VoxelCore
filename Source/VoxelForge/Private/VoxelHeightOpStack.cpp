@@ -17,6 +17,7 @@
 
 #include "VoxelHeightOp.h"
 
+#include "VoxelCaveMorphology.h"   // VoxelHash::SeedOffset — AUDIT §C1 (bounded, site-salted)
 #include "VoxelNoise.h"    // VoxelNoise::FBM / Ridged / Perlin3D
 #include "VoxelTypes.h"    // SmoothStep01, VOXEL_NOISE_SCALE
 
@@ -45,13 +46,13 @@ namespace
 
     /** Transcription de `UVoxelGenerator::SampleRelief`. Champ [0,1] partagé avec la carte de
      *  biomes, pour que la géographie et le terrain qu'elle module restent d'accord. */
-    FORCEINLINE float HSampleRelief(float WorldX, float WorldY, float SeedF,
+    FORCEINLINE float HSampleRelief(float WorldX, float WorldY, uint32 SeedU,
                                     float Frequency, float Contrast)
     {
         float R = HFractalNoise3D(FVector(
-            WorldX * Frequency + SeedF * 7.3f,
-            WorldY * Frequency + SeedF * 2.1f,
-            SeedF * 0.5f), 2) * 0.5f + 0.5f;                 // [0,1]
+            WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 7.3f),
+            WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 2.1f),
+            VoxelHash::SeedOffset(SeedU, 0.5f)), 2) * 0.5f + 0.5f;                 // [0,1]
         R = FMath::Clamp((R - 0.5f) * Contrast + 0.5f, 0.0f, 1.0f);
         return SmoothStep01(R);
     }
@@ -64,7 +65,7 @@ namespace
     {
     public:
         FStructuralHeightSource(const FSurfaceGenerationParams& InP, int32 InSeed)
-            : P(InP), SeedF((float)InSeed) {}
+            : P(InP), SeedU((uint32)InSeed) {}
 
         void Eval(float WorldX, float WorldY, FVoxelHeightSample& InOut) const override
         {
@@ -92,24 +93,24 @@ namespace
             if (P.HeightWarpStrength > 0.0f)
             {
                 const float WF = P.HeightWarpFrequency;
-                const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.31f, WorldY * WF + 4.2f, SeedF * 1.7f));
-                const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + SeedF * 0.53f, SeedF * 2.9f));
+                const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.31f), WorldY * WF + 4.2f, VoxelHash::SeedOffset(SeedU, 1.7f)));
+                const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.53f), VoxelHash::SeedOffset(SeedU, 2.9f)));
                 QX += wx * VOXEL_NOISE_SCALE * P.HeightWarpStrength;
                 QY += wy * VOXEL_NOISE_SCALE * P.HeightWarpStrength;
             }
 
-            const float Relief = HSampleRelief(WorldX, WorldY, SeedF, P.ReliefFrequency, P.ReliefContrast);
+            const float Relief = HSampleRelief(WorldX, WorldY, SeedU, P.ReliefFrequency, P.ReliefContrast);
             const float M = FMath::Lerp(1.0f, Relief, P.ReliefStrength);
 
             float Cont = HFractalNoise3D(FVector(
-                QX * P.ContinentFrequency + SeedF * 3.1f,
-                QY * P.ContinentFrequency + SeedF * 5.7f,
-                SeedF * 0.7f), 4);  // [-1,1]
+                QX * P.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 3.1f),
+                QY * P.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 5.7f),
+                VoxelHash::SeedOffset(SeedU, 0.7f)), 4);  // [-1,1]
 
             float Detail = HFractalNoise3D(FVector(
                 WorldX * P.DetailFrequency + 11.0f,
                 WorldY * P.DetailFrequency + 22.0f,
-                SeedF * 1.3f), 3);  // [-1,1]
+                VoxelHash::SeedOffset(SeedU, 1.3f)), 3);  // [-1,1]
 
             float Mountain = 0.0f;
             if (P.MountainStrength > 0.0f)
@@ -117,7 +118,7 @@ namespace
                 float Ridge = HRidgedNoise3D(FVector(
                     QX * P.MountainFrequency + 99.0f,
                     QY * P.MountainFrequency + 77.0f,
-                    SeedF * 0.9f), 4);     // [-1,1]
+                    VoxelHash::SeedOffset(SeedU, 0.9f)), 4);     // [-1,1]
                 Ridge = Ridge * 0.5f + 0.5f;  // [0,1] sommets
                 Mountain = Ridge * P.MountainStrength * M;   // les montagnes ne montent qu'en haut relief
             }
@@ -141,7 +142,7 @@ namespace
 
     private:
         FSurfaceGenerationParams P;
-        float SeedF;
+        uint32 SeedU;
     };
 
     //=========================================================================
@@ -290,7 +291,7 @@ namespace
     {
     public:
         FSkyCapHeightSource(const FSurfaceGenerationParams& InP, int32 InSeed)
-            : P(InP), SeedF((float)InSeed) {}
+            : P(InP), SeedU((uint32)InSeed) {}
 
         void Eval(float WorldX, float WorldY, FVoxelHeightSample& InOut) const override
         {
@@ -303,8 +304,8 @@ namespace
             if (P.CeilingWarpStrength > 0.0f)
             {
                 const float WF = P.CeilingWarpFrequency;
-                const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.71f, WorldY * WF + 2.3f,  SeedF * 3.3f));
-                const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + SeedF * 0.19f, SeedF * 4.7f));
+                const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.71f), WorldY * WF + 2.3f,  VoxelHash::SeedOffset(SeedU, 3.3f)));
+                const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.19f), VoxelHash::SeedOffset(SeedU, 4.7f)));
                 QX += wx * VOXEL_NOISE_SCALE * P.CeilingWarpStrength;
                 QY += wy * VOXEL_NOISE_SCALE * P.CeilingWarpStrength;
             }
@@ -313,9 +314,9 @@ namespace
             if (P.CeilingUndulation > 0.0f)
             {
                 const float Swell = HFractalNoise3D(FVector(
-                    QX * P.CeilingUndulationFrequency + SeedF * 1.9f,
+                    QX * P.CeilingUndulationFrequency + VoxelHash::SeedOffset(SeedU, 1.9f),
                     QY * P.CeilingUndulationFrequency + 13.0f,
-                    SeedF * 0.5f), 3);   // [-1,1]
+                    VoxelHash::SeedOffset(SeedU, 0.5f)), 3);   // [-1,1]
                 CeilZ += Swell * VOXEL_NOISE_SCALE * P.CeilingUndulation;
             }
 
@@ -327,14 +328,14 @@ namespace
                 Hang += FMath::Abs(HFractalNoise3D(FVector(
                     WorldX * P.CeilingRoughnessFrequency + 5.0f,
                     WorldY * P.CeilingRoughnessFrequency + 6.0f,
-                    SeedF * 2.1f), 3)) * VOXEL_NOISE_SCALE * P.CeilingRoughness;
+                    VoxelHash::SeedOffset(SeedU, 2.1f)), 3)) * VOXEL_NOISE_SCALE * P.CeilingRoughness;
             }
             if (P.CeilingRidgeStrength > 0.0f)
             {
                 float Ridge = HRidgedNoise3D(FVector(
                     QX * P.CeilingRidgeFrequency + 31.0f,
                     QY * P.CeilingRidgeFrequency + 47.0f,
-                    SeedF * 1.1f), 4);            // [-1,1]
+                    VoxelHash::SeedOffset(SeedU, 1.1f)), 4);            // [-1,1]
                 Ridge = Ridge * 0.5f + 0.5f;      // [0,1] lignes de crête pendantes
                 Hang += Ridge * P.CeilingRidgeStrength;
             }
@@ -347,7 +348,7 @@ namespace
 
     private:
         FSurfaceGenerationParams P;
-        float SeedF;
+        uint32 SeedU;
     };
 }
 

@@ -254,7 +254,7 @@ namespace
     {
     public:
         FSlabVoidSource(const FSlabGenerationParams& P, int32 Seed)
-            : SeedF((float)Seed)
+            : SeedU((uint32)Seed)
             , FloorRoughness(P.FloorRoughness)
             , FloorFrequency(P.FloorRoughnessFrequency)
             , CeilRoughness(P.CeilingRoughness)
@@ -364,8 +364,8 @@ namespace
         {
             if (FloorRoughness <= 0.0f) { return FloorZ; }
             const float FF = FloorFrequency;
-            const FVector NoisePos(WorldX * FF + SeedF * 7.3f,
-                                   WorldY * FF + SeedF * 11.1f,
+            const FVector NoisePos(WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
+                                   WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
                                    0.0f);
             const float N = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
                                             VoxelGenLOD::Eff(3), 2.0f, 0.5f)
@@ -379,8 +379,8 @@ namespace
             if (CeilRoughness > 0.0f)
             {
                 const float CF = CeilFrequency;
-                const FVector NoisePos(WorldX * CF + SeedF * 17.3f + 1000.0f,
-                                       WorldY * CF + SeedF * 19.7f + 2000.0f,
+                const FVector NoisePos(WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
+                                       WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
                                        3000.0f);
                 const float Raw = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
                                                   VoxelGenLOD::Eff(3), 2.0f, 0.5f)
@@ -391,7 +391,7 @@ namespace
             return FMath::Max(CeilZ - CeilNoise, FloorSurface + 2.0f);
         }
 
-        float SeedF;
+        uint32 SeedU;
         float FloorZ = 0.0f, CeilZ = 0.0f;
         float FloorRoughness, FloorFrequency;
         float CeilRoughness,  CeilFrequency;
@@ -573,7 +573,7 @@ namespace
     public:
         FOverhangShelfMod(const FSurfaceGenerationParams& InP, int32 Seed,
                           const FSurfaceColumnSource* InColumn)
-            : P(InP), SeedF((float)Seed), Column(InColumn) {}
+            : P(InP), SeedU((uint32)Seed), Column(InColumn) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -594,9 +594,9 @@ namespace
             // Bruit de forme d'étagère [0,1] ; le terme en Z fait onduler la portée avec la hauteur
             // (déchiqueté, pas une lèvre lisse).
             const float Ns = HFractal3D(FVector(
-                WorldX * f + SeedF * 17.3f,
-                WorldY * f + SeedF * 23.9f,
-                WorldZ * f * P.OverhangZScale + SeedF * 5.1f), 3) * 0.5f + 0.5f;   // [0,1]
+                WorldX * f + VoxelHash::SeedOffset(SeedU, 17.3f),
+                WorldY * f + VoxelHash::SeedOffset(SeedU, 23.9f),
+                WorldZ * f * P.OverhangZScale + VoxelHash::SeedOffset(SeedU, 5.1f)), 3) * 0.5f + 0.5f;   // [0,1]
 
             // LA CLÉ : la portée amont CROÎT avec la hauteur dans la fenêtre (Frac : 0 au sol → 1
             // au plafond de la fenêtre). En bas le décalage est minuscule ⇒ on emprunte de la roche
@@ -626,7 +626,7 @@ namespace
 
     private:
         FSurfaceGenerationParams P;
-        float SeedF;
+        uint32 SeedU;
         const FSurfaceColumnSource* Column;   // NON possédant : la pile possède la source
     };
 

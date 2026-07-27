@@ -168,6 +168,43 @@ namespace VoxelHash
         return X;
     }
 
+    /**
+     * AUDIT §C1 — décalage de bruit BORNÉ et salé par site. Remplace le motif `SeedF * K`.
+     *
+     * LE BUG QUE ÇA CORRIGE : les sites de bruit s'écrivaient
+     * `WorldX * Freq + (float)Seed * 97.7f`. Le float a 24 bits de mantisse, donc à magnitude `V`
+     * l'ULP vaut `V · 2⁻²³`. Avec `Seed = 10⁷` le terme atteint 10⁹, où l'ULP vaut **117** — la
+     * coordonnée du voxel (qui avance de ~0.02 par voxel) est **entièrement absorbée** et le champ
+     * de bruit devient CONSTANT. Terrain plat. `ChangeSeed` est `BlueprintCallable`, donc un
+     * `FMath::Rand()` suffit à déclencher ça. Ça ne marchait que parce que les seeds restaient petits.
+     *
+     * ⚠️ LE CORRECTIF ÉVIDENT EST FAUX. Borner `SeedF` à 16383 en gardant le `· 97.7` laisse le
+     * terme atteindre 1.6e6, où l'ULP vaut 0.19 — **9.5× le pas par voxel**. Ça rend le bug moins
+     * spectaculaire tout en le laissant vivant, et referme le ticket. C'est le multiplicateur qu'il
+     * faut supprimer, pas le seed qu'il faut réduire.
+     *
+     * CE QUE FAIT CETTE FONCTION : le multiplicateur ne SERT plus à décorréler par amplification —
+     * il IDENTIFIE le site, et c'est le hash qui décorrèle. La sortie est déjà dans les unités
+     * finales, bornée à [0, 16383] : l'ULP y vaut 0.002, soit 10 % d'un pas de voxel.
+     *
+     * ET C'EST PLUS SÛR QU'UN SEEDF BORNÉ PARTAGÉ : avec un offset unique par monde, deux seeds qui
+     * collident donneraient un bruit identique PARTOUT. Salé par site, il faudrait qu'ils
+     * collident sur les ~50 sites à la fois — c'est-à-dire jamais.
+     *
+     * The multiplier no longer decorrelates by amplifying — it IDENTIFIES the site, and the hash
+     * decorrelates. Output is already in final units and bounded, so the ULP is 10% of a voxel step.
+     *
+     * @param SiteKey  la constante littérale d'origine (`7.3f`, `97.7f`, …). Gardée VISIBLE au site
+     *                 d'appel pour que la correspondance avec le code d'avant reste vérifiable à l'œil.
+     */
+    FORCEINLINE float SeedOffset(uint32 Seed, float SiteKey)
+    {
+        // ×100 puis arrondi : les constantes ont au plus 2 décimales, donc `0.31f` → 31 et
+        // `3.1f` → 310 restent distincts. Le site est une identité entière, pas un flottant.
+        const uint32 Site = (uint32)(SiteKey * 100.0f + 0.5f);
+        return (float)(Mix(Seed ^ (Site * 2654435761u)) & 0x3FFFu);   // [0, 16383]
+    }
+
     // Hash a 2D cell coordinate with a seed → deterministic uint32
     FORCEINLINE uint32 Cell(int32 CellX, int32 CellY, uint32 Seed)
     {

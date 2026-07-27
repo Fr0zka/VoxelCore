@@ -62,9 +62,16 @@ namespace VoxelForgeTest
         int32 BottomChunkZ = 0;
 
         /**
-         * Build the world. Seed stays SMALL on purpose: AUDIT C1 (unbounded SeedF) is a real
-         * open bug and a large seed would collapse the noise fields to constants, which would
-         * make a purity test pass trivially for the wrong reason.
+         * Build the world.
+         *
+         * The default seed stays SMALL, but the reason has changed. It USED to be a workaround:
+         * AUDIT §C1 (unbounded `SeedF`) meant a large seed collapsed the noise fields to constants,
+         * which would have made a purity test pass trivially for the wrong reason.
+         *
+         * **§C1 is fixed** (`VoxelHash::SeedOffset` — bounded and site-salted). The small default
+         * now just keeps failure messages comparable across tests. A large seed is no longer
+         * dangerous — and `VoxelForge.Determinism.LargeSeedSurvives` deliberately passes big ones
+         * (up to 2e9) to prove it stays that way.
          */
         void Build(int32 InSeed = 1337, int32 InGapChunks = 2)
         {

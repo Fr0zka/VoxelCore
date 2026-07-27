@@ -1429,3 +1429,53 @@ the `Mask` combiner (biome blending, §5's Phase 3 prototype) and integrating `G
 stack path reuses the existing box cache rather than only its own table. `§C1` still open.
 
 ---
+
+## 2026-07-27 — AUDIT §C1 FIXED. 85 noise sites, mechanically, in both paths at once.
+
+SurfaceWorld's wiring came back fine, so I took `§C1` next — **not a detour any more**: the op stack
+had already inherited the bug three times, and every remaining port (`VerticalShafts`,
+`FloatingIslands`, `TunnelNetwork`) would copy it again. Fixing it now means those get written
+correctly instead of needing a follow-up pass.
+
+**The fix, and why the documented one was wrong.** The audit proposed bounding `SeedF` to 16383
+while keeping the `· 97.7f` multiplier — which still reaches 1.6e6, where the ULP is 0.19, **9.5× the
+per-voxel step**. Less spectacular, still broken, ticket closed. The multiplier is the problem.
+
+`VoxelHash::SeedOffset(Seed, SiteKey)` inverts the roles: **the multiplier no longer decorrelates by
+amplifying — it IDENTIFIES the site, and the hash decorrelates.** Output is already in final units,
+bounded to [0, 16383], so the ULP is 0.002 = 10 % of a voxel step. Site-salted, so two seeds must
+collide at **all ~50 sites** to give the same world, rather than sharing one global bucket.
+
+**Why the 85-site edit was safe to do without compiling:** the transformation is a pure regex —
+`SeedF * K.Kf` → `VoxelHash::SeedOffset(SeedU, K.Kf)` — and **the literal stays visible at the call
+site**, so every line can still be eye-checked against the original. Applied to all three files in
+one pass, so the archetype `switch` and the ported ops changed *identically*; if they had not, the
+three equivalence tests would say so loudly. 62 + 7 + 16 sites, 0 left behind, plus 2 bare `+ SeedF`
+worm sites handled by hand (site key `1.0f`).
+
+### ⚠️ The new test exists because the equivalence tests are structurally blind here
+
+`VoxelForge.Determinism.LargeSeedSurvives` — seeds 1337, 1e5, 1e7, 2e9; asserts the heightfield still
+produces ≥ 50 distinct heights over 400 samples.
+
+**The equivalence tests could never have caught C1.** They compare the op stack against the archetype
+switch, and both read the *same* faulty expression — so at a large seed both collapse **identically**:
+bit-identical, green, and both perfectly flat. An oracle that shares the implementation's bug cannot
+see the bug. This test compares nothing to nothing; it asserts a **property** — the terrain must vary.
+That distinction is worth keeping in mind for the ports still to come.
+
+The fixture's own comment said the small seed was a *workaround* for C1; corrected, since the reason
+is now just message comparability.
+
+**UNVERIFIED:** not compiled. Likely spots: a missed `SeedU` declaration in one of the 9 functions
+(the awk sweep found none, but it is a heuristic); `VoxelCaveMorphology.h` newly included in
+`VoxelHeightOpStack.cpp`; and the `uint32`/`float` swap on two op members.
+
+**⚠️ EXPECT EVERY WORLD TO LOOK DIFFERENT.** This re-rolls every noise offset in the plugin. That is
+the intended consequence and it is covered by §2.6.1 — nothing depends on the old shapes any more.
+The three equivalence tests should stay green (both paths changed together); the visual is new.
+
+**Next single action:** build, run the full `VoxelForge` filter — six tests now. Then back to the
+op stack: the `Mask` combiner (biome blending) to finish SurfaceWorld, or `VerticalShafts` next.
+
+---

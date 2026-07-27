@@ -760,7 +760,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // At the end, we negate for the MC table (negative = solid there).
     //=========================================================================
 
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
 
     //=========================================================================
     // STEP 1: VERTICAL SCALE
@@ -810,17 +810,17 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // so the X/Y/Z warp channels don't correlate with each other.
         // Single octave to keep per-voxel cost low (3 Perlin calls total).
         WarpedX += VoxelNoise::Perlin3D(FVector(
-            WorldX * WF + SeedF * 0.37f,
+            WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
             WorldY * WF + 1.3f,
             EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
         WarpedY += VoxelNoise::Perlin3D(FVector(
             WorldX * WF + 7.1f,
-            WorldY * WF + SeedF * 0.59f,
+            WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
             EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
         WarpedZ += VoxelNoise::Perlin3D(FVector(
             WorldX * WF + 11.3f,
             WorldY * WF + 9.7f,
-            EffectiveZ * WF + SeedF * 0.41f)) * VOXEL_NOISE_SCALE * WS;
+            EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
     }
 
     //=========================================================================
@@ -1069,14 +1069,14 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
             // Base noise input positions (with seed offsets for uniqueness)
             FVector MainPos(
-                WorldX * RF + SeedF * 11.3f,
-                WorldY * RF + SeedF * 13.7f,
-                EffectiveZ * RF + SeedF * 17.1f
+                WorldX * RF + VoxelHash::SeedOffset(SeedU, 11.3f),
+                WorldY * RF + VoxelHash::SeedOffset(SeedU, 13.7f),
+                EffectiveZ * RF + VoxelHash::SeedOffset(SeedU, 17.1f)
             );
             FVector FinePos(
-                WorldX * RF * 3.0f + SeedF * 19.1f + 2000.0f,
-                WorldY * RF * 3.0f + SeedF * 23.7f + 2500.0f,
-                EffectiveZ * RF * 3.0f + SeedF * 29.3f + 3000.0f
+                WorldX * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 19.1f) + 2000.0f,
+                WorldY * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 23.7f) + 2500.0f,
+                EffectiveZ * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 29.3f) + 3000.0f
             );
 
             // DOMAIN WARPING: distort noise coordinates with a secondary field.
@@ -1090,21 +1090,21 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
                 // Sample three independent noise fields for X, Y, Z warp
                 float WarpX = VoxelNoise::Perlin3D(FVector(
-                    WorldX * WF + SeedF * 5.2f,
-                    WorldY * WF + SeedF * 1.3f,
-                    EffectiveZ * WF + SeedF * 9.7f
+                    WorldX * WF + VoxelHash::SeedOffset(SeedU, 5.2f),
+                    WorldY * WF + VoxelHash::SeedOffset(SeedU, 1.3f),
+                    EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 9.7f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
                 float WarpY = VoxelNoise::Perlin3D(FVector(
-                    WorldX * WF + 100.0f + SeedF * 7.7f,
-                    WorldY * WF + 200.0f + SeedF * 3.1f,
+                    WorldX * WF + 100.0f + VoxelHash::SeedOffset(SeedU, 7.7f),
+                    WorldY * WF + 200.0f + VoxelHash::SeedOffset(SeedU, 3.1f),
                     EffectiveZ * WF + 300.0f
                 )) * VOXEL_NOISE_SCALE * WS;
 
                 float WarpZ = VoxelNoise::Perlin3D(FVector(
                     WorldX * WF + 400.0f,
-                    WorldY * WF + 500.0f + SeedF * 11.9f,
-                    EffectiveZ * WF + 600.0f + SeedF * 13.3f
+                    WorldY * WF + 500.0f + VoxelHash::SeedOffset(SeedU, 11.9f),
+                    EffectiveZ * WF + 600.0f + VoxelHash::SeedOffset(SeedU, 13.3f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
                 // Apply warp to both noise positions
@@ -1261,9 +1261,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             if (Params.TerraceNoiseDisplacement > 0.0f)
             {
                 float DispNoise = FractalNoise3D(FVector(
-                    WorldX * 0.04f + SeedF * 31.1f,
-                    WorldY * 0.04f + SeedF * 37.3f,
-                    WorldZ * 0.02f + SeedF * 41.7f
+                    WorldX * 0.04f + VoxelHash::SeedOffset(SeedU, 31.1f),
+                    WorldY * 0.04f + VoxelHash::SeedOffset(SeedU, 37.3f),
+                    WorldZ * 0.02f + VoxelHash::SeedOffset(SeedU, 41.7f)
                 ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
                 NoisedZ += DispNoise * Params.TerraceNoiseDisplacement * StepH;
             }
@@ -1387,9 +1387,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             // Low Z frequency (0.15x of XY) → features extend horizontally
             float OverhangNoise = FractalNoise3D(FVector(
-                WorldX * Params.OverhangFrequency + SeedF * 53.1f,
-                WorldY * Params.OverhangFrequency + SeedF * 59.3f,
-                EffectiveZ * Params.OverhangFrequency * 0.15f + SeedF * 61.7f
+                WorldX * Params.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
+                WorldY * Params.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
+                EffectiveZ * Params.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
             ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
 
             // Only where noise is positive → protrusions (not recesses)
@@ -1427,9 +1427,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // side we're on: negative = inside cave, positive = solid rock.
             // We use a noise-modulated vertical gradient to detect steep faces.
             float VertGrad = VoxelNoise::Perlin3D(FVector(
-                WorldX * 0.05f + SeedF * 71.3f,
-                WorldY * 0.05f + SeedF * 73.7f,
-                EffectiveZ * 0.15f + SeedF * 79.1f  // 3x faster in Z → detects vertical features
+                WorldX * 0.05f + VoxelHash::SeedOffset(SeedU, 71.3f),
+                WorldY * 0.05f + VoxelHash::SeedOffset(SeedU, 73.7f),
+                EffectiveZ * 0.15f + VoxelHash::SeedOffset(SeedU, 79.1f)  // 3x faster in Z → detects vertical features
             )) * VOXEL_NOISE_SCALE;
 
             // VertGrad near ±1 means terrain is changing fast vertically.
@@ -1468,9 +1468,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // Cellular noise: returns ~[-1, 1] where positive = cell interior (bowl)
             float SF = Params.ScallopFrequency;
             float ScallopNoise = CellularNoise3D(FVector(
-                WorldX * SF + SeedF * 83.1f,
-                WorldY * SF + SeedF * 89.3f,
-                EffectiveZ * SF + SeedF * 97.7f
+                WorldX * SF + VoxelHash::SeedOffset(SeedU, 83.1f),
+                WorldY * SF + VoxelHash::SeedOffset(SeedU, 89.3f),
+                EffectiveZ * SF + VoxelHash::SeedOffset(SeedU, 97.7f)
             ));
 
             // Only carve where noise is positive (cell interiors = bowl centers)
@@ -1763,9 +1763,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
 
             float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
-                WorldX * Params.WormFrequency + SeedF,
-                WorldY * Params.WormFrequency + SeedF * 1.7f,
-                EffectiveZ * WormZFreq + SeedF * 2.3f
+                WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
+                WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
+                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
             )) * VOXEL_NOISE_SCALE);
 
             // N2 >= 0, so if N1 alone already clears the threshold the sum can't carve —
@@ -1773,9 +1773,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             if (N1 < Params.WormThreshold)
             {
                 float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
-                    WorldX * Params.WormFrequency + SeedF + 137.0f,
-                    WorldY * Params.WormFrequency + SeedF * 1.7f + 259.0f,
-                    EffectiveZ * WormZFreq + SeedF * 2.3f + 431.0f
+                    WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
+                    WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
+                    EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
                 )) * VOXEL_NOISE_SCALE);
 
                 float WormValue = N1 + N2;
@@ -1834,7 +1834,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     // Degenerate strate (zero or inverted bounds) — return solid.
     if (StrateHeight <= 0.0f) return 1.0f;
 
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
 
     //=========================================================================
     // STEP 1: FLOOR SURFACE
@@ -1862,8 +1862,8 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     {
         float FF = Params.FloorRoughnessFrequency;
         FloorNoise = FractalNoise3D(FVector(
-            WorldX * FF + SeedF * 7.3f,
-            WorldY * FF + SeedF * 11.1f,
+            WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
+            WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
             0.0f                          // XY-pur : plus aucune dépendance en Z / no Z dependence
         ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
     }
@@ -1893,8 +1893,8 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     {
         float CF = Params.CeilingRoughnessFrequency;
         float RawNoise = FractalNoise3D(FVector(
-            WorldX * CF + SeedF * 17.3f + 1000.0f,
-            WorldY * CF + SeedF * 19.7f + 2000.0f,
+            WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
+            WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
             3000.0f                         // XY-pur : décalage de décorrélation seul / offset only
         ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE;
 
@@ -2154,7 +2154,7 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
                                                 const FSurfaceGenerationParams& Params, float& OutM) const
 {
     const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
     const float BottomZ = Params.StrateBottomWorldZ;
 
     // --- Heightfield (a function of XY only — Z is a fixed seed slice) ---
@@ -2167,8 +2167,8 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
     if (Params.HeightWarpStrength > 0.0f)
     {
         const float WF = Params.HeightWarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.31f, WorldY * WF + 4.2f, SeedF * 1.7f));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + SeedF * 0.53f, SeedF * 2.9f));
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.31f), WorldY * WF + 4.2f, VoxelHash::SeedOffset(SeedU, 1.7f)));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.53f), VoxelHash::SeedOffset(SeedU, 2.9f)));
         QX += wx * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
     }
@@ -2179,14 +2179,14 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
     const float M = FMath::Lerp(1.0f, Relief, Params.ReliefStrength);
 
     float Cont = FractalNoise3D(FVector(
-        QX * Params.ContinentFrequency + SeedF * 3.1f,
-        QY * Params.ContinentFrequency + SeedF * 5.7f,
-        SeedF * 0.7f), 4);  // [-1,1]
+        QX * Params.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 3.1f),
+        QY * Params.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 5.7f),
+        VoxelHash::SeedOffset(SeedU, 0.7f)), 4);  // [-1,1]
 
     float Detail = FractalNoise3D(FVector(
         WorldX * Params.DetailFrequency + 11.0f,
         WorldY * Params.DetailFrequency + 22.0f,
-        SeedF * 1.3f), 3);  // [-1,1]
+        VoxelHash::SeedOffset(SeedU, 1.3f)), 3);  // [-1,1]
 
     float Mountain = 0.0f;
     if (Params.MountainStrength > 0.0f)
@@ -2194,7 +2194,7 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
         float Ridge = RidgedNoise3D(FVector(
             QX * Params.MountainFrequency + 99.0f,
             QY * Params.MountainFrequency + 77.0f,
-            SeedF * 0.9f), 4);     // [-1,1]
+            VoxelHash::SeedOffset(SeedU, 0.9f)), 4);     // [-1,1]
         Ridge = Ridge * 0.5f + 0.5f;  // [0,1] peaks
         Mountain = Ridge * Params.MountainStrength * M;   // mountains rise only in high-relief regions
     }
@@ -2296,7 +2296,7 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
                                              const FSurfaceGenerationParams& Params) const
 {
     const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
     float CeilZ = Params.StrateBottomWorldZ + H * Params.CeilingRelative;
 
     // Domain-warp the broad/ridge query coords so ceiling ridgelines and valleys wind
@@ -2306,8 +2306,8 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     if (Params.CeilingWarpStrength > 0.0f)
     {
         const float WF = Params.CeilingWarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.71f, WorldY * WF + 2.3f,  SeedF * 3.3f));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + SeedF * 0.19f, SeedF * 4.7f));
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.71f), WorldY * WF + 2.3f,  VoxelHash::SeedOffset(SeedU, 3.3f)));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.19f), VoxelHash::SeedOffset(SeedU, 4.7f)));
         QX += wx * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
     }
@@ -2316,9 +2316,9 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     if (Params.CeilingUndulation > 0.0f)
     {
         const float Swell = FractalNoise3D(FVector(
-            QX * Params.CeilingUndulationFrequency + SeedF * 1.9f,
+            QX * Params.CeilingUndulationFrequency + VoxelHash::SeedOffset(SeedU, 1.9f),
             QY * Params.CeilingUndulationFrequency + 13.0f,
-            SeedF * 0.5f), 3);   // [-1,1]
+            VoxelHash::SeedOffset(SeedU, 0.5f)), 3);   // [-1,1]
         CeilZ += Swell * VOXEL_NOISE_SCALE * Params.CeilingUndulation;
     }
 
@@ -2330,14 +2330,14 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
         Hang += FMath::Abs(FractalNoise3D(FVector(
             WorldX * Params.CeilingRoughnessFrequency + 5.0f,
             WorldY * Params.CeilingRoughnessFrequency + 6.0f,
-            SeedF * 2.1f), 3)) * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
+            VoxelHash::SeedOffset(SeedU, 2.1f)), 3)) * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
     }
     if (Params.CeilingRidgeStrength > 0.0f)
     {
         float Ridge = RidgedNoise3D(FVector(
             QX * Params.CeilingRidgeFrequency + 31.0f,
             QY * Params.CeilingRidgeFrequency + 47.0f,
-            SeedF * 1.1f), 4);            // [-1,1]
+            VoxelHash::SeedOffset(SeedU, 1.1f)), 4);            // [-1,1]
         Ridge = Ridge * 0.5f + 0.5f;      // [0,1] hanging ridgelines
         Hang += Ridge * Params.CeilingRidgeStrength;
     }
@@ -2363,13 +2363,13 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
     if (OverhangAmp > 0.0f && S.OverhangHeight > 0.0f
         && WorldZ > TerrainZ && WorldZ <= TerrainZ + S.OverhangHeight)
     {
-        const float SeedF = (float)Seed;
+        const uint32 SeedU = (uint32)Seed;
         const float f     = S.OverhangFrequency;
         // Shelf-shape noise [0,1]; the Z term makes the reach fold/curl with height (ragged, not a lip).
         const float Ns = FractalNoise3D(FVector(
-            WorldX * f + SeedF * 17.3f,
-            WorldY * f + SeedF * 23.9f,
-            WorldZ * f * S.OverhangZScale + SeedF * 5.1f), 3) * 0.5f + 0.5f;   // [0,1]
+            WorldX * f + VoxelHash::SeedOffset(SeedU, 17.3f),
+            WorldY * f + VoxelHash::SeedOffset(SeedU, 23.9f),
+            WorldZ * f * S.OverhangZScale + VoxelHash::SeedOffset(SeedU, 5.1f)), 3) * 0.5f + 0.5f;   // [0,1]
         // KEY: the uphill reach GROWS with height in the window (Frac: 0 at ground → 1 at the cap). Low
         // down the shift is tiny ⇒ borrows nearby low rock ⇒ stays AIR over the void; high up the shift
         // reaches the far cliff ⇒ solid ⇒ the lip sits on top with air UNDERNEATH = a real overhang.
@@ -2789,24 +2789,24 @@ float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float World
 
 float UVoxelGenerator::SampleRelief(float WorldX, float WorldY, float Frequency, float Contrast) const
 {
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
     // Same offsets/octaves as the original SurfaceWorld relief so existing worlds are
     // unchanged (this is the function that code path now calls).
     float R = FractalNoise3D(FVector(
-        WorldX * Frequency + SeedF * 7.3f,
-        WorldY * Frequency + SeedF * 2.1f,
-        SeedF * 0.5f), 2) * 0.5f + 0.5f;                 // [0,1]
+        WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 7.3f),
+        WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 2.1f),
+        VoxelHash::SeedOffset(SeedU, 0.5f)), 2) * 0.5f + 0.5f;                 // [0,1]
     R = FMath::Clamp((R - 0.5f) * Contrast + 0.5f, 0.0f, 1.0f);
     return SmoothStep01(R);
 }
 
 float UVoxelGenerator::SampleMoisture(float WorldX, float WorldY, float Frequency) const
 {
-    const float SeedF = (float)Seed;
+    const uint32 SeedU = (uint32)Seed;
     const float N = FractalNoise3D(FVector(
-        WorldX * Frequency + SeedF * 4.7f,
-        WorldY * Frequency + SeedF * 8.9f,
-        SeedF * 1.3f), 2) * 0.5f + 0.5f;                 // [0,1]
+        WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 4.7f),
+        WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 8.9f),
+        VoxelHash::SeedOffset(SeedU, 1.3f)), 2) * 0.5f + 0.5f;                 // [0,1]
     return FMath::Clamp(N, 0.0f, 1.0f);
 }
 
@@ -2885,10 +2885,10 @@ FBiomeSample UVoxelGenerator::SampleBiomeAt(float WorldX, float WorldY, const FB
     float QX = WorldX, QY = WorldY;
     if (MP.WarpStrength > 0.0f)
     {
-        const float SeedF = (float)Seed;
+        const uint32 SeedU = (uint32)Seed;
         const float WF = MP.WarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.27f, WorldY * WF + 3.1f, SeedF * 1.1f));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + SeedF * 0.61f, SeedF * 2.3f));
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
         QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
     }
@@ -3017,10 +3017,10 @@ FBiomeSample UVoxelGenerator::ResolveBiomeSampleAt(float WorldX, float WorldY, i
     float QX = WorldX, QY = WorldY;
     if (MP.WarpStrength > 0.0f)
     {
-        const float SeedF = (float)Seed;
+        const uint32 SeedU = (uint32)Seed;
         const float WF = MP.WarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.27f, WorldY * WF + 3.1f, SeedF * 1.1f));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + SeedF * 0.61f, SeedF * 2.3f));
+        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
+        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
         QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
     }
