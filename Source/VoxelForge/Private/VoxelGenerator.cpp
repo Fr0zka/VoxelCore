@@ -537,9 +537,28 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (CP_UseOpStack)
             {
                 CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
+                FVoxelOpContext OpCtx;
+                OpCtx.ChunkCoord    = ChunkCoord;
+                OpCtx.Seed          = (uint32)Seed;
+                OpCtx.LayoutVersion = LayoutVersion;
+
                 switch (CP_GenType)
                 {
                 case ECaveGeneratorType::Maze:
+                    // GARDE DE STRATE DÉGÉNÉRÉE : GetMazeDensity court-circuite sur `return 1.0f`
+                    // (= air) quand la hauteur est nulle ou négative ; cette garde appartient à la
+                    // fonction d'archétype et la pile n'en a pas, par conception. Sans ce test, une
+                    // strate dégénérée donnerait de l'air sur un chemin et de la géométrie sur
+                    // l'autre. On retombe sur le `switch`, qui EST le comportement de référence.
+                    // Degenerate-strate guard: the archetype early-outs to air, the stack has no
+                    // such early-out by design. Fall back to the switch, which is the reference.
+                    if (CP_Maze.StrateTopWorldZ - CP_Maze.StrateBottomWorldZ <= 0.0f)
+                    {
+                        CP_UseOpStack = false;
+                        break;
+                    }
+                    OpCtx.StrateTopWorldZ    = CP_Maze.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Maze.StrateBottomWorldZ;
                     VoxelDensityOps::BuildMazeStack(CP_OpStack, CP_Maze, Seed,
                                                     OriginSpineRadius, StrateManager);
                     break;
@@ -550,6 +569,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     CP_UseOpStack = false;
                     break;
                 }
+
+                // Le test appelle PrepareChunk, pas la production : c'est exactement la divergence
+                // qui rend un opérateur vert en test et faux en jeu. Les sept `PrepareChunk`
+                // actuels sont vides, donc ceci ne change RIEN aujourd'hui — c'est le point : le
+                // premier opérateur qui hisse vraiment du travail par chunk doit trouver l'appel
+                // déjà là. `Step` reste 1 : GetDensityAt ne connaît pas le pas d'échantillonnage
+                // du mesher (voir le contrat T2.b dans VoxelDensityOp.h).
+                // The test calls PrepareChunk and production did not — the exact divergence that
+                // makes an op green in test and wrong in game. All seven bodies are empty today,
+                // which is the point: the first op that hoists real per-chunk work must find the
+                // call already here.
+                if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
             }
         }
 

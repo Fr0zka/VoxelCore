@@ -118,8 +118,13 @@ stack share ONE copy. `VoxelGenerator.cpp` keeps same-named `static FORCEINLINE`
 **Convention: INTERNAL (positive = solid).**
 
 ### 3.2d Operator stack — `Public/VoxelDensityOpStack.h` + `Private/VoxelDensityOpStack.cpp`
-⚠️ **Feeds nothing yet.** `GetDensityAt`/`ClassifyTile` are untouched; the archetype `switch` is
-still the only production path. Exercised solely by `VoxelForge.OpStack.MazeEquivalence`.
+⚠️ **Feeds the game, behind a per-strate opt-in** (Phase 1 step 3). `GetDensityAt` builds the stack
+in its per-chunk refetch block and evaluates it *instead of* the `switch` only when
+`UVoxelStrateManager::UsesOperatorStackForChunk` says so — strate ticked `bUseOperatorStack` **and**
+archetype in the ported list (**Maze only**). Everything else still takes the `switch`, unchanged.
+**`ClassifyTile` is NOT wired** — still hand-written guards, not `ClassifyBox`. That is Phase 2.
+⛔ Never run both paths in one world, and never compare them for equality: the ~1 ULP residue is
+inherent (AUDIT §C10). The acceptance bar is visual (OPSTACK-PLAN §2.6).
 
 | Symbol | Role | Notes |
 |--------|------|-------|
@@ -129,7 +134,7 @@ still the only production path. Exercised solely by `VoxelForge.OpStack.MazeEqui
 | `VoxelDensityOps::MakeLatticeCorridorSource` | 1 | Maze corridors, SDF channel. Edge identity = `hash(lower node, axis)` ⇒ adjacent chunks cannot disagree (AUDIT §6.4's preferred pattern). Its `EffectOverBox` answers for the source+carve **pair** (Phase 1 simplification) so it must be told the downstream `ExtraReach`. |
 | `VoxelDensityOps::MakeSdfRoughnessMod` | 3 | Wall roughness in **SDF** space (Maze/Shafts/Islands variant). TunnelNetwork's density-space roughness is a **different op** — see OPSTACK-DECOMPOSITION §1. |
 | `VoxelDensityOps::MakeSdfCarve` | 2 | SDF → density carve. The same six lines currently copied in three archetypes. |
-| `VoxelDensityOps::BuildMazeStack` | — | The 7-op Maze stack. If this ever becomes one op, the refactor failed its own test (§2.5). |
+| `VoxelDensityOps::BuildMazeStack` | — | The 7-op Maze stack. If this ever becomes one op, the refactor failed its own test (§2.5). Callers must skip it on a **degenerate strate** (top−bottom ≤ 0): `GetMazeDensity` early-outs to air there and the stack has no such early-out by design — `GetDensityAt` falls back to the `switch`. |
 
 ### 3.3 Chunk identity
 `VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
@@ -269,7 +274,9 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
 `TransitionType`(79)/`TransitionBlendChunks`(89), `GeneratorType`(102),
 `GenerationParams`(113), `SlabParams`(124), `Biomes[]`+`BiomeMapParams` (the biome list +
 field tuning — empty ⇒ unchanged world, §8.14), `TerrainOperations`(147), visuals/fog/light,
-content lists, audio, `GameplayTags`(223). EditConditions show/hide param groups by generator type.
+content lists, audio, `GameplayTags`(223), `bUseOperatorStack` (the OPSTACK A/B opt-in — only bites
+if the archetype is in `UsesOperatorStackForChunk`'s ported list). EditConditions show/hide param
+groups by generator type.
 
 **`Public/VoxelStrateManager.h` + `.cpp`** — `UVoxelStrateManager : UObject` (h:108).
 Maps depth→strate at runtime; owns passages.
@@ -286,6 +293,7 @@ Maps depth→strate at runtime; owns passages.
 | `GetLayoutVersion` | h:161 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize`). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so editor rebuilds never serve stale data. |
 | `GetStrateForChunk` | 466 | Chunk → definition. |
 | `GetGeneratorTypeForChunk` | 476 | Chunk → generator type. |
+| `UsesOperatorStackForChunk` | 559 | Chunk → should `GetDensityAt` take the operator stack? `bUseOperatorStack` on the definition **AND** archetype in the ported list. **That list is written down here and nowhere else** — an unported archetype ignores the flag, so ticking the box anywhere is harmless. Add a row here when you port one. |
 | `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
 | `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
 | `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |

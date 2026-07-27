@@ -836,3 +836,43 @@ undiscovered, while it was worked out the slow way. Worth reading before clearin
 **Next single action unchanged:** build Phase 1 step 3, then the visual A/B on a Maze strate.
 
 ---
+
+## 2026-07-27 — fresh context: two gaps closed in the step-3 wiring BEFORE the build.
+
+Resumed from `OPSTACK-HANDOFF.md`. Read the step-3 diff against the test path instead of taking
+"not compiled" as "nothing to check first" — the symbols all line up (`BuildMazeStack`'s five params
+match, `Seed`/`OriginSpineRadius` are generator members, `FVoxelOpContext` comes in transitively via
+`VoxelDensityOp.h`), but **the production path and the test path did not agree on two things.**
+
+**1. `PrepareChunk` was never called in production.** The test calls it (`…MazeTest.cpp:133`);
+`GetDensityAt` did not. All seven concrete `PrepareChunk` bodies are empty today, so this changes
+**nothing** now — which is exactly why it was worth fixing before it could bite. The first op that
+hoists real per-chunk work would have been **green in test and silently wrong in game**, and that
+class of bug is expensive to find precisely because the test says yes. `GetDensityAt` now builds an
+`FVoxelOpContext` (chunk, seed, layout version, strate Z bounds) in the same refetch block and calls
+`PrepareChunk` on it. `Step` stays 1 — `GetDensityAt` genuinely does not know the mesher's sampling
+step (T2.b contract); noted rather than guessed.
+
+**2. The degenerate-strate early-out had no counterpart.** `GetMazeDensity` opens with
+`if (StrateHeight <= 0.0f) return 1.0f;` — air. The stack has no such early-out **by design** (the
+test asserts this and refuses to run on a degenerate strate). Unguarded, a zero-height Maze strate
+would give **air on one path and whatever the spine/seal ops make of a zero-height band on the
+other**. `GetDensityAt` now falls back to the `switch` in that case, so the reference behaviour is
+the behaviour. Reachability is not the point — the archetype guard exists, so its port needs one.
+
+**Docs corrected, since both were now actively false:**
+- `VoxelDensityOpStack.h`'s banner still said "NOTHING HERE FEEDS THE GAME". It does feed the game
+  now, behind the opt-in. Rewritten to say exactly what is wired (`GetDensityAt`) and what is not
+  (`ClassifyTile` — still hand-written guards, that is Phase 2), plus the §C10 "never compare the
+  two paths" rule at the point of use.
+- `CODEMAP §3.2d` had the same stale claim; `§3` gained rows for `UsesOperatorStackForChunk` and
+  `bUseOperatorStack`, and the `BuildMazeStack` row now carries the degenerate-strate precondition.
+
+**UNVERIFIED:** still not compiled — that is Jahni's call and it is the immediate next action.
+Error spots unchanged, plus one: `FVoxelOpContext` is aggregate-initialised field-by-field, so a
+field rename would show up here.
+
+**Next single action unchanged:** build, then the visual A/B on a Maze strate (§2.6's bar —
+recognisably the same maze, judged on a screenshot). Then Phase 2, starting with the §3.1 question.
+
+---

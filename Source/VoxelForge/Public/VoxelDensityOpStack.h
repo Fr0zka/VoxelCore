@@ -2,13 +2,21 @@
 // La PILE : un conteneur ordonné d'opérateurs, plus les fabriques d'opérateurs concrets.
 // The STACK: an ordered container of operators, plus the concrete-operator factories.
 //
-// ⚠️ RIEN ICI N'ALIMENTE LE JEU. `UVoxelGenerator::GetDensityAt` et `ClassifyTile` ne sont pas
-// touchés ; le `switch` par archétype reste le seul chemin de production. Cette pile est construite
-// et exercée UNIQUEMENT par le test `VoxelForge.OpStack.MazeEquivalence`, qui la compare point par
-// point à `GetMazeDensity`. Le branchement attend un build vert (OPSTACK-PLAN §4, Phase 1, point 3).
+// ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN (depuis OPSTACK-PLAN §4, Phase 1, point 3).
+// `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
+// UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
+// strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés (Maze
+// seul aujourd'hui). Toute autre strate passe encore par le `switch`, inchangé.
+// `ClassifyTile` n'est PAS branché : il utilise toujours ses gardes écrites à la main, pas
+// `ClassifyBox`. C'est la Phase 2.
 //
-// NOTHING HERE FEEDS THE GAME. GetDensityAt and ClassifyTile are untouched; the archetype switch is
-// still the only production path. This stack is built and exercised only by the equivalence test.
+// THIS FEEDS THE GAME, BUT ONLY BEHIND AN OPT-IN. GetDensityAt builds the stack per chunk and
+// evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate
+// ticked bUseOperatorStack AND its archetype is ported — Maze only, today). ClassifyTile is NOT
+// wired: it still uses its hand-written guards rather than ClassifyBox. That is Phase 2.
+//
+// ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde, ni les comparer pour l'égalité :
+// le résidu de ~1 ULP est INHÉRENT et documenté (AUDIT-2026-07 §C10). La barre est visuelle (§2.6).
 //
 // POURQUOI CETTE FORME / WHY THIS SHAPE
 // La question à laquelle la Phase 1 doit répondre n'est pas « est-ce que ça marche ? » mais
