@@ -14,6 +14,7 @@
 #include "VoxelBiomeDefinition.h"
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
 #include "VoxelDensityPrimitives.h"   // spine / seal / passage — shared with the operator stack
+#include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 
 //=============================================================================
 // SURFACE COLUMN CACHE (T1.a) — kill the per-Z heightfield redundancy
@@ -493,6 +494,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // The key MUST include the layout version, not just the chunk coord. Symptom without it:
         // "I tweaked the strate asset, regenerated, and one patch kept the old shape."
         thread_local uint32                   CP_Version = 0xFFFFFFFFu;
+        // OPSTACK Phase 1 — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
+        // params (donc même clé chunk+version, aucune logique d'invalidation en plus). Vide tant que
+        // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
+        thread_local FVoxelOpStack            CP_OpStack;
+        thread_local bool                     CP_UseOpStack = false;
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
         if (ChunkCoord != CP_Chunk || LayoutVersion != CP_Version)
@@ -523,9 +529,38 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_Tunnel  = StrateManager->GetGenerationParams(ChunkCoord);              break;
             }
             CP_Dist = StrateManager->GetDisturbanceParamsForChunk(ChunkCoord);
+
+            // ── OPSTACK Phase 1 : (re)construire la pile si cette strate l'a demandée. ──
+            // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
+            // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
+            CP_UseOpStack = StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+            if (CP_UseOpStack)
+            {
+                CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
+                switch (CP_GenType)
+                {
+                case ECaveGeneratorType::Maze:
+                    VoxelDensityOps::BuildMazeStack(CP_OpStack, CP_Maze, Seed,
+                                                    OriginSpineRadius, StrateManager);
+                    break;
+                default:
+                    // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
+                    // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`
+                    // plutôt que générer du vide — un monde faux est pire qu'un monde non porté.
+                    CP_UseOpStack = false;
+                    break;
+                }
+            }
         }
 
-        switch (CP_GenType)
+        // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
+        // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
+        // de diff qui suivent ne voient aucune différence.
+        if (CP_UseOpStack)
+        {
+            Result = CP_OpStack.EvalMC(WorldX, WorldY, WorldZ);
+        }
+        else switch (CP_GenType)
         {
         case ECaveGeneratorType::FlatPlain:
         case ECaveGeneratorType::CrystalChamber:

@@ -773,3 +773,41 @@ brute force.
 opt-in, so a Maze strate can be A/B-switched in the editor and judged on a screenshot (§2.6's bar).
 
 ---
+
+## 2026-07-27 — Phase 1 step 3: the stack is WIRED IN, behind a per-strate opt-in.
+
+**`OPSTACK-PLAN §4` Phase 1 step 3 done.** `GetDensityAt` gains exactly one branch, as the plan
+specified, and both systems now coexist.
+
+**Files:**
+- `VoxelStrateDefinition.h` — `bool bUseOperatorStack` (EditAnywhere, "Use Operator Stack
+  (experimental)"). The A/B switch §2.6's acceptance bar needs: flip it, regenerate, judge the
+  screenshot.
+- `VoxelStrateManager.{h,cpp}` — `UsesOperatorStackForChunk()`. **The ported-archetype list lives
+  here and nowhere else**, so an unported archetype ignores the flag and falls back to the switch.
+  Ticking the box on any strate is therefore harmless today; only `Maze` changes behaviour.
+- `VoxelGenerator.cpp` — `CP_OpStack` / `CP_UseOpStack` built in the SAME refetch block as the
+  params (so the chunk+`LayoutVersion` key already covers it, no new invalidation logic), plus one
+  `if (CP_UseOpStack)` on the dispatch.
+
+**Cost on the hot path: one bool test per voxel.** The stack is built per chunk, never per voxel —
+the same cadence as the existing param refetch. `ApplyDisturbances` and the diff layer are
+deliberately left OUTSIDE the stack and run once for both paths, exactly as before, so the tail of
+the pipeline is untouched.
+
+**Defensive choice worth noting:** if `UsesOperatorStackForChunk` ever returns true for an archetype
+with no builder, the code clears the flag and falls back to the switch rather than generating an
+empty stack. A world that is *unported* is recoverable; a world that is *wrong* is not.
+
+**UNVERIFIED:** not compiled. Likely error spots: the `else switch` form in `GetDensityAt`,
+`FVoxelOpStack` as a `thread_local` (it is move-only — move-assign from a temporary is used to
+reset it), and the new include in `VoxelGenerator.cpp`.
+
+**What to look at in the editor:** set a Maze strate's `bUseOperatorStack`, regenerate, and compare
+against the same seed with it off. **Pass = recognisably the same maze** — same corridor scale, same
+connectivity, same feel. That is §2.6's bar, and it is the last thing Phase 1 needs.
+
+**Next single action:** build, then the visual A/B. After that, Phase 2 — the port order in
+`OPSTACK-DECOMPOSITION §10.4` starts with FlatPlain + CrystalChamber collapsing into one op.
+
+---

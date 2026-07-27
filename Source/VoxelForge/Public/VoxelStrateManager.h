@@ -202,6 +202,16 @@ public:
     ECaveGeneratorType GetGeneratorTypeForChunk(const FIntVector& ChunkCoord) const;
 
     /**
+     * True when this chunk's strate opts into the density OPERATOR STACK instead of the hardcoded
+     * archetype switch (`UVoxelStrateDefinition::bUseOperatorStack`).
+     *
+     * Returns false for archetypes that have no port yet, so the flag can be set on any strate
+     * without changing its output until that archetype lands. Only `Maze` is ported today — this
+     * predicate is where that list grows, and it is deliberately the ONLY place it is written down.
+     */
+    bool UsesOperatorStackForChunk(const FIntVector& ChunkCoord) const;
+
+    /**
      * True if this chunk is in the solid-bedrock GAP between two strates (inside the
      * overall stack's Z range but not in any strate slot). Chunks above the top strate
      * or below the bottom strate are NOT gaps (they're open air). Driven by

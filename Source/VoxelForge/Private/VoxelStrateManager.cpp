@@ -556,6 +556,26 @@ ECaveGeneratorType UVoxelStrateManager::GetGeneratorTypeForChunk(const FIntVecto
     return StrateLayout[SlotIdx].Definition->GeneratorType;
 }
 
+bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) { return false; }
+
+    const UVoxelStrateDefinition* Def = StrateLayout[SlotIdx].Definition;
+    if (!Def->bUseOperatorStack) { return false; }
+
+    // LA LISTE DES ARCHÉTYPES PORTÉS — le seul endroit où elle est écrite. Un archétype non porté
+    // ignore le drapeau et retombe sur le `switch`, pour qu'on puisse cocher la case sur n'importe
+    // quelle strate sans rien casser en attendant son portage.
+    // THE PORTED-ARCHETYPE LIST, written down exactly once. An unported archetype ignores the flag
+    // and falls back to the switch, so the box can be ticked anywhere without breaking anything.
+    switch (Def->GeneratorType)
+    {
+    case ECaveGeneratorType::Maze:  return true;
+    default:                        return false;
+    }
+}
+
 bool UVoxelStrateManager::IsGapChunk(const FIntVector& ChunkCoord) const
 {
     if (StrateLayout.Num() == 0) return false;
