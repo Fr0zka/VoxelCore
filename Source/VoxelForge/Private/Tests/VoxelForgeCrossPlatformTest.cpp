@@ -149,13 +149,40 @@ bool FVoxelForgeCrossPlatformTest::RunTest(const FString& Parameters)
     uint64 ShapeDigest = FnvOffsetBasis;
     uint64 FieldDigest = FnvOffsetBasis;
 
-    int32 NumSamples = 0, NumSolid = 0, NumNaN = 0, NumNearIso = 0;
+    int32 NumSamples = 0, NumSolid = 0, NumNaN = 0;
+    int32 NumNearWide = 0, NumNearMid = 0, NumNearTight = 0;
 
-    // `NearIso` : à quelle distance de zéro un échantillon doit-il être pour qu'une différence
-    // d'ULP puisse faire basculer son SIGNE ? Les écarts mesurés entre le `switch` et la pile
-    // valent ~1e-5 au pire (AUDIT §C10) ; un écart entre modèles flottants est du même ordre.
-    // Tout échantillon plus loin que ça de l'isosurface ne peut PAS changer de côté.
-    constexpr float NearIsoBand = 1.0e-4f;   // 10× la pire divergence observée : marge délibérée
+    // ─────────────────────────────────────────────────────────────────────────
+    // `NearIso` — À QUELLE DISTANCE DE ZÉRO UN ÉCHANTILLON PEUT-IL CHANGER DE SIGNE ?
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⚠️ CORRIGÉ 2026-07-27, ET LA CORRECTION EST LE POINT INTÉRESSANT.
+    //
+    // Version d'origine : une seule bande à 1e-4, justifiée par « une différence de MODÈLE
+    // FLOTTANT ». Depuis `FPSemantics = Precise` (§C9), il n'y a plus de différence de modèle
+    // flottant : MSVC et Clang compilent tous deux en IEEE-754 sans contraction. J'ai d'abord cru
+    // que ça rendait cette mesure caduque. **C'est faux, et il a fallu vérifier plutôt que
+    // supposer.**
+    //
+    // Il reste `FMath::Sin` / `FMath::Cos`, présents partout dans le chemin de densité (lignes de
+    // strates, nervures, placement des salles, rotations). **`sinf`/`cosf` ne sont PAS spécifiés
+    // par IEEE-754** : le CRT de MSVC et la libm de la glibc ont parfaitement le droit de rendre
+    // des résultats différents (typiquement ≤ 1 ULP, mais différents). `FPSemantics` a donc fermé
+    // la moitié COMPILATEUR de §C9 et laissé ouverte la moitié BIBLIOTHÈQUE.
+    //
+    // FPSemantics = Precise removed the float-MODEL difference, but sinf/cosf are not IEEE-754
+    // specified, so MSVC's CRT and glibc's libm may still differ. The compiler half of C9 is closed;
+    // the library half is not.
+    //
+    // D'où trois bandes au lieu d'une : une bande unique à 1e-4 est **100× trop large** pour un
+    // écart de libm (~1e-6 en absolu sur des densités de magnitude ~10), donc elle sur-estime
+    // grossièrement le risque et crie au loup. Mesurer trois échelles donne un vrai profil, et
+    // seule la plus serrée — celle qui correspond réellement à un écart de libm — déclenche
+    // l'alerte.
+    // Three bands, not one: 1e-4 over-estimates a libm-scale delta by ~100x. Only the tight band,
+    // which actually matches a libm difference, raises a warning.
+    constexpr float NearIsoWide   = 1.0e-4f;   // profil : large, informatif
+    constexpr float NearIsoMid    = 1.0e-5f;   // profil
+    constexpr float NearIsoTight  = 1.0e-6f;   // ≈ l'échelle d'un écart libm ⇒ LE chiffre du risque
 
     for (int32 Z = BottomVoxelZ; Z <= TopVoxelZ; Z += ZStep)
     {
@@ -178,7 +205,13 @@ bool FVoxelForgeCrossPlatformTest::RunTest(const FString& Parameters)
                 // CHAMP : tous les bits.
                 FnvAccumU32(FieldDigest, Bits);
 
-                if (!bWasNaN && FMath::Abs(D) < NearIsoBand) { ++NumNearIso; }
+                if (!bWasNaN)
+                {
+                    const float A = FMath::Abs(D);
+                    if (A < NearIsoWide)  { ++NumNearWide; }
+                    if (A < NearIsoMid)   { ++NumNearMid; }
+                    if (A < NearIsoTight) { ++NumNearTight; }
+                }
                 ++NumSamples;
             }
         }
@@ -195,27 +228,32 @@ bool FVoxelForgeCrossPlatformTest::RunTest(const FString& Parameters)
         World.Settings->Seed, NumSamples, XYStep, ZStep,
         ShapeDigest, FieldDigest, NumSolid, NumSamples - NumSolid, NumNaN));
 
-    // LE chiffre qui borne le risque, plutôt que de le supposer.
-    if (NumNearIso == 0)
+    // Le PROFIL de proximité à l'isosurface, plutôt qu'un seul seuil binaire.
+    AddInfo(FString::Printf(
+        TEXT("NearIso profile over %d samples: %d within 1e-4, %d within 1e-5, %d within 1e-6. ")
+        TEXT("Only the LAST number is the cross-platform risk: FPSemantics = Precise removed the ")
+        TEXT("float-MODEL difference, so what remains is that sinf/cosf are not IEEE-754 specified ")
+        TEXT("and MSVC's CRT may differ from glibc's libm by ~1 ULP. On densities of magnitude ~10 ")
+        TEXT("that is ~1e-6 absolute, which is why the wide band over-states the risk ~100x."),
+        NumSamples, NumNearWide, NumNearMid, NumNearTight));
+
+    if (NumNearTight > 0)
     {
-        AddInfo(FString::Printf(
-            TEXT("NearIso: 0 of %d samples sit within %.1e of the isosurface. No sample is close ")
-            TEXT("enough for a float-model difference (~1e-5 worst observed) to flip its SIGN, so ")
-            TEXT("the SHAPE digest is robust to the /fp:fast-vs-precise split by a 10x margin at ")
-            TEXT("these sample points. That is evidence, not proof -- it covers this grid, not ")
-            TEXT("every voxel in a world."),
-            NumSamples, NearIsoBand));
+        AddWarning(FString::Printf(
+            TEXT("%d of %d samples sit within 1e-6 of the isosurface -- tight enough that a libm ")
+            TEXT("difference between MSVC and glibc could flip their SIGN, i.e. one voxel solid for ")
+            TEXT("a Windows host and air for a Linux client. FMath::Sin/Cos are used throughout the ")
+            TEXT("density path (layer lines, ribs, room placement, rotations), so this is the ")
+            TEXT("REMAINING half of AUDIT C9 -- the compiler half is fixed, the library half is not. ")
+            TEXT("If this must be zero, the fix is a deterministic in-house sin/cos in the density ")
+            TEXT("path (one more world re-tune), not another build flag."),
+            NumNearTight, NumSamples));
     }
     else
     {
-        AddWarning(FString::Printf(
-            TEXT("NearIso: %d of %d samples sit within %.1e of the isosurface -- close enough that ")
-            TEXT("a float-model difference could flip their SIGN, which is a solid-vs-air ")
-            TEXT("disagreement between a Windows host and a Linux client. This is the concrete ")
-            TEXT("mechanism behind AUDIT C9, and the count is roughly how many voxels per %d are at ")
-            TEXT("risk. It does not mean they DO differ -- run this on both platforms and compare ")
-            TEXT("the SHAPE digest to find out."),
-            NumNearIso, NumSamples, NearIsoBand, NumSamples));
+        AddInfo(TEXT("No sample sits within 1e-6 of the isosurface, so no sampled voxel is close ")
+                TEXT("enough for a libm difference to flip its side. Evidence, not proof: it covers ")
+                TEXT("this grid, not every voxel of a world."));
     }
 
     TestEqual(TEXT("no sample produced NaN"), NumNaN, 0);

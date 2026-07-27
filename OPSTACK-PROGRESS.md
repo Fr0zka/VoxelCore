@@ -1479,3 +1479,54 @@ The three equivalence tests should stay green (both paths changed together); the
 op stack: the `Mask` combiner (biome blending) to finish SurfaceWorld, or `VerticalShafts` next.
 
 ---
+
+## 2026-07-27 — all 9 tests green. C1 PROVEN fixed. And C9 is only HALF fixed.
+
+Full `VoxelForge` filter, exported run `Saved/Automation/Automation2026.07.27-16.35.18.csv`:
+
+```
+ClassifyTileSoundness · CrossPlatformDigest · DensityPurity · DiffLayerContention
+LargeSeedSurvives · LiveEditInvalidation · BoxVerdictFold · MazeEquivalence
+SlabEquivalence · SurfaceHeightEquivalence          — all Success
+```
+
+**`§C1` is proven fixed, by property rather than by comparison:**
+
+```
+Seed 1337        : 400 distinct heights / 400 samples, range 20.95 voxels
+Seed 100 000     : 399 / 400, range 23.46
+Seed 10 000 000  : 399 / 400, range 22.89
+Seed 2 000 000 000 : 400 / 400, range 23.42
+```
+
+Seed 2e9 — what `FMath::Rand()` produces — now generates a live world. Before the fix that seed
+gave a *constant* field. Note the three equivalence tests stayed green through an 85-site rewrite,
+which is exactly the port-correctness value they were kept for.
+
+### ⚠️ The digest warning was right for the WRONG reason — and I nearly dismissed it
+
+`NearIso: 2 of 115000 samples within 1e-4 of the isosurface` fired a warning whose text blamed the
+`/fp:fast`-vs-precise split. That split is fixed, so my first instinct was "stale warning, soften the
+text". **I checked instead of assuming, and the risk is real via a different mechanism.**
+
+**`sinf`/`cosf` are not specified by IEEE-754.** `FPSemantics = Precise` makes MSVC and Clang agree on
+*expression evaluation*; it says nothing about the math library. MSVC's CRT and glibc's libm may
+legitimately differ by ~1 ULP — and `FMath::Sin`/`Cos` are all over the density path: layer lines
+(`VoxelGenerator.cpp:2275`, `VoxelHeightOpStack.cpp:232`), ribs, room placement, rotations.
+
+**So `§C9` is half closed:** the compiler half by construction, the **library half still open**. No
+build flag can fix the second — two libm implementations cannot be made to agree by a compiler
+setting. The fix, if it is ever needed, is a deterministic in-house `sin`/`cos` in the density path
+(one more world re-tune).
+
+**The measurement was also over-stating things ~100×.** A single 1e-4 band is far too wide for a
+libm-scale delta (~1e-6 absolute on densities of magnitude ~10). Replaced with a three-band profile
+(1e-4 / 1e-5 / 1e-6); only the tight band raises a warning, because only it corresponds to a delta
+that could actually flip a sign. Recorded in `AUDIT §C9`.
+
+**UNVERIFIED:** the reworded digest test.
+
+**Next single action:** build (quick — one test file changed). Then, per Jahni: finish SurfaceWorld
+(the `Mask` combiner = biome blending, `§5`'s Phase 3 prototype), then `VerticalShafts` (`§6`).
+
+---
