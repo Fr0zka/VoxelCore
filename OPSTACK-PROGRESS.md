@@ -1992,3 +1992,57 @@ and the test's `GetGenerationParams` signature.
 `VoxelForge.OpStack.TunnelNetworkSpineEquivalence`. Then stage B (the 13 modifiers).
 
 ---
+
+## 2026-07-28 — Stage A is bit-identical. And its own counters say the test was thin.
+
+```
+TunnelNetwork STAGE A: bit-identical across 6000 samples in 24 chunks
+                       (65 in open cave, 5636 in rock)
+Params-fingerprint   : 3 of 400 probe points genuinely differ, 0 served wrong
+Box verdicts         : 0 proved, 40 Mixed          ← asserted, expected
+Op count             : expected 6, got 7           ← FAIL
+```
+
+**The port is correct.** Vertical scale, cave warp, the shared `BuildChunkCache`, pits and chimneys
+at unwarped coords, the floored carve divisor and the worm network mask all reproduce the original
+bit for bit. The only failure was **my arithmetic in the assertion**: 4 ops + 3 structural = 7, and I
+wrote 6. Fixed.
+
+### The two numbers that matter are the ones that passed
+
+**65 of 6000 samples in open cave — 1.1 %.** Green, and mostly comparing solid rock to solid rock:
+the carve, the pits, the chimneys and the worm carve only run near the network. At `RoomSpacing = 80`
+/ `RoomDensity = 0.35` a 32-voxel chunk usually contains no cave at all.
+
+**3 of 400 probe points differ between the two param sets — 0.75 %.** So the stale-cache check asked
+its question three times and answered "not stale" 397 times about points that could never have
+revealed staleness.
+
+Both counters exist precisely to say this, and both said it. **Both guards, however, only fired at
+ZERO** — so the run was green with the coverage of a much smaller test. That is the same lesson as
+"a test that prints nothing on success is indistinguishable from one that never ran", one notch
+finer: *a coverage guard that only trips at zero does not measure coverage, it only notices absence.*
+Both are now **fraction thresholds** (≥ 10 % cave, ≥ 5 % differing probes) and both print a
+percentage.
+
+Fixes applied: `RoomSpacing 80 → 42`, `RoomDensity 0.35 → 0.85`.
+
+### New check 3b — did the pits and chimneys actually fire?
+
+`§2` calls those two loops the fiddliest thing in the whole decomposition (unwarped coords
+`SmoothMin`'d into the warped room SDF). Setting `PitDensity = 0.55` proves nothing: `SDFCache.Pits`
+can still come back empty and the test stays green. So the new check builds the same stack with
+`PitDensity = ChimneyDensity = 0` and counts the points that MOVE. Zero ⇒ those loops contributed
+nothing and the equivalence says nothing about them, whatever colour the test is.
+
+Same move as the FloatingIslands "samples inside island rock" counter, applied to a sub-feature
+instead of a whole archetype: **enabling a feature is not evidence it fired.**
+
+**UNVERIFIED:** the strengthened test is not compiled. Only the test file changed; the operators are
+untouched and already proven bit-identical.
+
+**Next single action:** re-run the filter (13 tests). Expect stage A green with a cave fraction in
+the tens of percent, a fingerprint check in the double digits, and a non-zero pit/chimney count.
+Then stage B — the 13 detail modifiers.
+
+---

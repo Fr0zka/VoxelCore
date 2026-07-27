@@ -70,15 +70,34 @@ namespace
         P.FloorBias                 = 0.0f;
     }
 
-    /** Pits et cheminées sont à 0 par défaut — or ce sont précisément les deux boucles que `§2`
-     *  annonçait comme « le plus retors de toute la décomposition » (coordonnées NON warpées
-     *  mélangées au SDF warpé). Les laisser au repos testerait tout sauf le morceau difficile. */
+    /**
+     * Pits et cheminées sont à 0 par défaut — or ce sont précisément les deux boucles que `§2`
+     * annonçait comme « le plus retors de toute la décomposition » (coordonnées NON warpées
+     * mélangées au SDF warpé). Les laisser au repos testerait tout sauf le morceau difficile.
+     *
+     * ⚠️ ET ON DENSIFIE LE RÉSEAU, corrigé après le premier run vert. Aux défauts
+     * (`RoomSpacing = 80`, `RoomDensity = 0.35`) le premier passage a rendu **65 échantillons en
+     * grotte sur 6000, soit 1,1 %** : bit-identique, oui, mais en comparant surtout du roc plein à
+     * du roc plein, là où le carve, les pits, les cheminées et les vers ne s'exécutent même pas.
+     * Le compteur avait été écrit exactement pour dire ça, et il l'a dit ; l'avertissement, lui, ne
+     * se déclenchait qu'à ZÉRO — trop tard pour être utile. Les deux sont corrigés ici.
+     *
+     * Densified after the first green run: 65 of 6000 samples in open cave (1.1%) means the port was
+     * mostly compared solid-rock-to-solid-rock. The counter said so; the warning threshold (only at
+     * zero) did not. Both fixed.
+     */
     void EnableTunnelFeatures(FStrateGenerationParams& P)
     {
+        P.RoomSpacing     = 42.0f;   // 80 → 42 : des salles à portée de chaque chunk échantillonné
+        P.RoomDensity     = 0.85f;   // 0.35 → 0.85
         P.PitDensity      = 0.55f;
         P.ChimneyDensity  = 0.55f;
         P.VerticalScale   = 1.35f;   // ≠ 1 ⇒ le Z « effectif » diverge du Z monde partout
     }
+
+    /** Fraction minimale d'échantillons devant tomber en grotte ouverte pour que l'équivalence
+     *  signifie quelque chose. 10 % est modeste et très au-dessus du 1,1 % observé. */
+    constexpr float MinCaveFraction = 0.10f;
 }
 
 bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
@@ -119,9 +138,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + worms + 3 structurels. Les 13 modificateurs de détail viendront
-    // s'insérer entre le carve et les vers — ce nombre DOIT bouger à l'étape B.
-    TestEqual(TEXT("the stage-A tunnel stack is decomposed into 6 ops"), Stack.Num(), 6);
+    // rock + roomgraph + carve + worms + 3 structurels = 7. (Le premier run a dit 7 contre un 6
+    // attendu : faute d'arithmétique dans l'attente, pas dans la pile — 4 + 3, comme les îles.)
+    // Les 13 modificateurs de détail viendront s'insérer entre le carve et les vers, donc ce nombre
+    // DOIT bouger à l'étape B.
+    TestEqual(TEXT("the stage-A tunnel stack is decomposed into 7 ops"), Stack.Num(), 7);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -194,6 +215,13 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("its floored divisor, and the worm carve with its network mask. NOT covered: the ")
             TEXT("13 detail modifiers, the per-room op override, and any tile verdict."),
             NumTunnelSamples, NumTunnelChunks, NumInCave, NumInRock));
+
+        AddInfo(FString::Printf(
+            TEXT("Cave coverage: %.1f%% of samples are in open cave (floor %.0f%%). This is the ")
+            TEXT("number that says whether the equivalence MEANS anything -- the carve, the pits, ")
+            TEXT("the chimneys and the worm carve only execute near the network, so a run dominated ")
+            TEXT("by deep rock would be green while proving almost nothing."),
+            100.0f * (float)NumInCave / (float)NumTunnelSamples, 100.0f * MinCaveFraction));
     }
     else
     {
@@ -216,12 +244,17 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
 
     TestEqual(TEXT("no sample lands on the opposite side of the isosurface"), NumSideDisagree, 0);
 
-    if (NumInCave == 0)
+    // ⚠️ SEUIL EN FRACTION, PAS « > 0 ». La version « == 0 » de ce garde-fou a laissé passer un run
+    // à 1,1 % en silence. Un test qui ne se plaint qu'au zéro absolu ne mesure pas la couverture,
+    // il constate seulement qu'elle n'est pas vide.
+    if ((float)NumInCave < MinCaveFraction * (float)NumTunnelSamples)
     {
-        AddWarning(TEXT("No sample landed in open cave away from the seal bands: the room graph, ")
-                   TEXT("the carve, the pits and the worms were never meaningfully exercised, so ")
-                   TEXT("the equivalence above mostly compares solid rock to solid rock. Raise ")
-                   TEXT("RoomDensity or lower RoomSpacing."));
+        AddWarning(FString::Printf(
+            TEXT("Only %.1f%% of samples landed in open cave (want >= %.0f%%): the carve, the pits, ")
+            TEXT("the chimneys and the worm carve were barely exercised, so the equivalence above ")
+            TEXT("mostly compares solid rock to solid rock. Lower RoomSpacing or raise RoomDensity ")
+            TEXT("in EnableTunnelFeatures."),
+            100.0f * (float)NumInCave / (float)NumTunnelSamples, 100.0f * MinCaveFraction));
     }
 
     //=========================================================================
@@ -324,17 +357,82 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                   NumWrong, 0);
 
         AddInfo(FString::Printf(
-            TEXT("Params-fingerprint check: %d of %d probe points genuinely differ between the two ")
-            TEXT("param sets, and %d were served wrong under A/B interleaving. A zero in the FIRST ")
-            TEXT("number would mean the check proved nothing -- the two param sets must actually ")
-            TEXT("produce different rock for a stale cache to be detectable."),
-            NumActuallyDifferent, Probe, NumWrong));
+            TEXT("Params-fingerprint check: %d of %d probe points (%.1f%%) genuinely differ between ")
+            TEXT("the two param sets, and %d were served wrong under A/B interleaving. The FIRST ")
+            TEXT("number is the check's real strength: only those points could ever reveal a stale ")
+            TEXT("cache, so it is a count of how many times the question was actually asked."),
+            NumActuallyDifferent, Probe, 100.0f * (float)NumActuallyDifferent / (float)Probe,
+            NumWrong));
 
-        if (NumActuallyDifferent == 0)
+        // Le premier run a donné 3 sur 400 (0,75 %) : 397 sondes ne pouvaient RIEN distinguer. Même
+        // correction que la couverture de grotte — un seuil en fraction, pas « non nul ».
+        if ((float)NumActuallyDifferent < 0.05f * (float)Probe)
         {
-            AddWarning(TEXT("The two param sets produced identical density at every probe point, so ")
-                       TEXT("this check cannot distinguish a correct cache from a stale one. Make ")
-                       TEXT("P2 differ more."));
+            AddWarning(FString::Printf(
+                TEXT("Only %d of %d probe points differ between the two param sets (want >= 5%%), so ")
+                TEXT("this check asked its question %d times, not %d. A stale cache would go ")
+                TEXT("unnoticed at every other point. Make P2 differ more, or probe nearer the ")
+                TEXT("network."),
+                NumActuallyDifferent, Probe, NumActuallyDifferent, Probe));
+        }
+    }
+
+    //=========================================================================
+    // 3b. LES PITS ET LES CHEMINÉES ONT-ILS RÉELLEMENT CONTRIBUÉ ?
+    //=========================================================================
+    // `§2` désigne ces deux boucles comme « le plus retors de toute la décomposition » : elles
+    // écrivent le MÊME canal SDF que le graphe de salles mais à des coordonnées NON warpées. Les
+    // activer dans les params ne prouve pas qu'elles ont changé quoi que ce soit — un test peut très
+    // bien être vert avec `SDFCache.Pits` vide.
+    //
+    // On le MESURE : la même pile avec `PitDensity = ChimneyDensity = 0`, et on compte les points où
+    // la densité bouge. Zéro ⇒ les deux boucles n'ont rien fait et le morceau difficile n'est pas
+    // couvert, quelle que soit la couleur du test.
+    //
+    // Enabling a feature in the params is not evidence it fired. This measures it.
+    {
+        FStrateGenerationParams PNoShafts = P;
+        PNoShafts.PitDensity     = 0.0f;
+        PNoShafts.ChimneyDensity = 0.0f;
+
+        FVoxelOpStack StackNoShafts;
+        VoxelDensityOps::BuildTunnelNetworkStack(StackNoShafts, PNoShafts, World.Settings->Seed,
+                                                 Gen->OriginSpineRadius, World.StrateManager.Get());
+        StackNoShafts.PrepareChunk(Ctx);
+
+        const int32 Probe = FMath::Min(1500, NumTunnelSamples);
+
+        // Deux passes SOLO (pas d'alternance) : on ne teste pas une clé de cache ici, seulement une
+        // contribution — et alterner ferait reconstruire le cache SDF à chaque point pour rien.
+        TArray<float> WithShafts;
+        WithShafts.SetNumUninitialized(Probe);
+        for (int32 i = 0; i < Probe; ++i)
+        {
+            WithShafts[i] = Stack.EvalMC((float)Points[i].X, (float)Points[i].Y, (float)Points[i].Z);
+        }
+
+        int32 NumMoved = 0;
+        for (int32 i = 0; i < Probe; ++i)
+        {
+            const float V = StackNoShafts.EvalMC((float)Points[i].X, (float)Points[i].Y,
+                                                 (float)Points[i].Z);
+            if (!BitEqual(V, WithShafts[i])) { ++NumMoved; }
+        }
+
+        AddInfo(FString::Printf(
+            TEXT("Pit/chimney contribution: %d of %d probe points move when PitDensity and ")
+            TEXT("ChimneyDensity are zeroed. These are the two loops OPSTACK-DECOMPOSITION 2 calls ")
+            TEXT("the fiddliest thing in the decomposition (unwarped coords SmoothMin'd into the ")
+            TEXT("warped room SDF), so this number is the difference between covering them and ")
+            TEXT("merely having switched them on."),
+            NumMoved, Probe));
+
+        if (NumMoved == 0)
+        {
+            AddWarning(TEXT("Zeroing PitDensity and ChimneyDensity changed nothing, so those two ")
+                       TEXT("loops never contributed a single voxel and the equivalence says ")
+                       TEXT("NOTHING about them. Most likely BuildChunkCache baked no pits at this ")
+                       TEXT("RoomSpacing/strate height -- check SDFCache.Pits, not the params."));
         }
     }
 
