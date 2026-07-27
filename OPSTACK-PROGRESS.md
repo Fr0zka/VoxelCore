@@ -1059,3 +1059,63 @@ sub-ULP-of-scale deltas. Then `SurfaceWorld` (§5) — biggest payoff, most care
 and the exact-lattice `ClassifyTile` bound must both survive the port.
 
 ---
+
+## 2026-07-27 — the acceptance bar changed, and it invalidated the audit's own fix for C1.
+
+**Jahni:** *"I do not need your work to be identical or near identical to what I had before, only
+having it 99.99% at worst reproducible if two people share the same seed, since everyone rebuilds it
+on multiplayer."*
+
+The bar is **peer agreement in the present**, not fidelity to the past. Recorded as
+`OPSTACK-PLAN §2.6.1`, which supersedes §2.6's "recognisably the same place".
+
+**Four consequences, all recorded where they will be found:**
+
+1. **`§C10` closed permanently, not parked.** It measures old-path vs new-path agreement, and the
+   two paths never coexist in a shipped world. No requirement depends on it.
+2. **The equivalence tests keep their value for a different reason** — they are **port-correctness**
+   checks (a transcription slip is a real bug), not fidelity checks. Hard-fail on isosurface
+   crossings stays; the ULP grading is now diagnostic only.
+3. **`§C9` promoted to the top open risk.** "Two people share a seed" is exactly what `/fp:fast`
+   weakens across toolchains, and a **Linux dedicated server** generating collision/nav against
+   Windows clients compiles the same density code under *opposite* float models. The fix
+   (`FPSemantics = Precise`) is blocked behind the IWYU debt, which now has a real justification
+   rather than a tidiness one.
+4. **`§C1` is unblocked** — it was deferred *only* because it re-rolls the world's noise.
+
+### ⛔ And then C1's documented fix turned out to be wrong
+
+Before applying the one-liner the audit has carried since it was written, I did its arithmetic:
+
+```
+proposed:  SeedF bounded to 16383, multiplier * 97.7 KEPT
+           max coord term = 1.6e6  ->  ULP = 0.19  ->  9.5x the ~0.02/voxel step
+```
+
+**It bounds the seed but not the offset, and the multiplier is where the magnitude comes from.** The
+fix would have made the bug less catastrophic while leaving it live for mid-range seeds — and, worse,
+**closed the ticket**. Cost to discover after applying: one build plus a world re-roll.
+
+**The real fix is to delete the multipliers.** The `· 7.3f … · 97.7f` factors exist only to
+decorrelate the ~40 noise sites from each other; that is a hashing job, and hashing does it better:
+`VoxelHash::SeedOffset(Seed, Site)` returns a **site-salted, bounded, final-units** offset. Bounding
+`SeedF` alone would also funnel every seed through 16384 offsets *shared by all sites*, so two
+colliding seeds would give identical noise everywhere; per-site salting means two seeds must collide
+at **all ~40 sites**, which is never.
+
+**And the op stack has already inherited the bug** — `FSlabVoidSource::SeedF` is a faithful
+transcription of `const float SeedF = (float)Seed`. It must be fixed in **both** paths in one change
+or the equivalence tests will correctly scream. **Every further archetype port copies it again**,
+which is the argument for doing it before `SurfaceWorld` rather than after.
+
+Corrected in `AUDIT §C1` with the arithmetic, so the wrong fix cannot be applied later from the doc.
+
+**UNVERIFIED:** nothing new in code this entry — docs only. The C1 fix itself is NOT written; it
+needs Jahni's go-ahead on scope (~40 sites, re-rolls every world, one build).
+
+**Next single action — Jahni's call between two:**
+- **`§C1`** (recommended first): ~40 mechanical sites + the op stack, one build, kills the
+  highest-severity latent bug before more ports copy it.
+- **`SurfaceWorld`** (`OPSTACK-DECOMPOSITION §5`): the biggest op-stack payoff, most care.
+
+---

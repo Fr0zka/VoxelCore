@@ -220,6 +220,38 @@ SIMD noise switch required.
 
 ---
 
+### 2.6.1 ⚠️ RELAXED FURTHER, 2026-07-27 — resemblance to the old world is NOT a requirement at all
+
+**Jahni, verbatim:** *"I do not need your work to be identical or near identical to what I had
+before, only having it 99.99% at worst reproducible if two people share the same seed, since
+everyone rebuilds it on multiplayer."*
+
+**This replaces the "recognisably the same place" bar above.** The requirement is not fidelity to the
+past — it is **agreement between peers in the present**. Restated as the only two properties that
+now matter:
+
+| Property | Required? | Enforced by |
+|---|---|---|
+| **Same seed ⇒ same world, on every peer** | **YES — this is the whole bar** | `DensityPurity` within a binary; **`§C9`** across binaries/platforms |
+| Resemblance to the pre-refactor world | **NO** | nothing; freely re-tunable |
+| Bit-identity with the archetype `switch` | **NO** | nothing; never compare them |
+
+**What this changes, concretely:**
+
+1. **`§C10` is closed, not parked.** It measures old-path vs new-path agreement, and the two paths
+   will never both exist in a shipped world. The residue cannot affect anything Jahni requires.
+2. **The equivalence tests keep their value, but for a different reason.** They are no longer
+   *fidelity* checks; they are **port-correctness** checks — a transcription slip is still a real
+   bug, and comparing against the old function is the cheapest way to catch one. Read them that way.
+   The hard-fail (isosurface crossing) stays; the ULP grading is now diagnostic only.
+3. **`§C9` is promoted from a footnote to THE risk.** "Two people share a seed" is exactly the
+   guarantee `/fp:fast` weakens across toolchains, and a Linux dedicated server generating collision
+   geometry against Windows clients is the concrete case.
+4. **Changes that re-roll the world's noise are no longer expensive.** `§C1` in particular was
+   deferred *only* because it forces a re-tune. That objection is gone.
+
+---
+
 ## 3. The contract
 
 ```cpp
