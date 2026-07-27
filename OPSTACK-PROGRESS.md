@@ -537,3 +537,55 @@ diagnostic-only and comes out once the answer is in.
 the THREE-WAY block. Phase 1 step 3 still paused.
 
 ---
+
+## 2026-07-27 — THREE-WAY VERDICT: the fault is MINE, in the operator stack.
+
+```
+A generator TU  vs  B opstack TU : 126 differ
+A generator TU  vs  C test TU    : 0 differ      <-- identical source, different TU, SAME result
+B opstack TU    vs  C test TU    : 126 differ
+```
+
+**A == C settles it: the source is stable across translation units.** So the compiler was never the
+cause, and the operator stack differs for a **logic** reason. Fourth hypothesis dead — but this one
+points at code I own, which is the first time the answer has been actionable.
+
+**Correction to walk back in the docs** (not yet done — do it once the cause is known, so it is
+corrected with the right explanation rather than twice):
+- `OPSTACK-PLAN §2.6`'s green note claims bit-identity is unachievable because of `/fp:fast`.
+  **False.** `A == C` proves identical source reproduces exactly across TUs here.
+- `AUDIT-2026-07.md §C9`'s *first* consequence ("refactors cannot be bit-identical") is likewise
+  false and must go. **C9's second half stands** — UBT's FP default genuinely differs by toolchain,
+  read straight out of `VCToolChain.cs` / `ClangToolChain.cs`, and the MP model does assume
+  bit-reproducible terrain. That half was never inferred from this test.
+- The test's own INFO text ("this is the expected floor... /fp:fast") is wrong for the same reason
+  and gets rewritten with the real cause.
+
+**Also learned, and worth keeping:** setting `FPSemantics` on VoxelForge costs the module the
+engine's shared PCH and exposes ~30 missing includes across seven files. Recorded in `Build.cs`.
+
+### Where the fault is NOT
+
+Read line by line against the verbatim copy, all identical: the ctor's `FMath::Max` clamps, the
+cell `FloorToInt`, `NodeCenter`, `EdgeOpen`'s hashes and salts, the `{-1,0}³` sweep and its add
+order, the capsule loop, the `FMath::Min` fold, the carve's clamp/smoothstep/subtract, and the four
+structural-post no-ops. Three readings said "identical" and the measurement disagrees, so **reading
+is not going to find it** — hence more instrument, less staring.
+
+### The instrument now in place
+
+`MazeCoreVerbatim` optionally returns its **SDF** and edge count, and the three-way compares the SDF
+channels directly instead of inferring from densities:
+
+- **SDF identical, density differs** ⇒ fault is in `FSdfCarveOp`.
+- **SDF differs** ⇒ fault is in `FLatticeCorridorSource` (edge set or capsule fold).
+
+It also reports the split across all 126 mismatches, and dumps the first one with raw hex plus the
+verbatim edge count — so if the edge SETS differ (a cache-key bug) that shows up as a count mismatch
+immediately.
+
+**UNVERIFIED:** the instrumentation.
+
+**Next single action:** rebuild, read `FIRST B-vs-C MISMATCH`. It names the file to open.
+
+---

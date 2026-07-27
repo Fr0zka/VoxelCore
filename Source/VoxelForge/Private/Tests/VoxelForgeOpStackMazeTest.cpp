@@ -68,7 +68,8 @@ namespace
      * passages omis), parce que c'est là que le bisect a montré l'écart survivre.
      */
     float MazeCoreVerbatim(float WorldX, float WorldY, float WorldZ,
-                           const FMazeGenerationParams& Params, int32 Seed)
+                           const FMazeGenerationParams& Params, int32 Seed,
+                           float* OutSdf = nullptr, int32* OutNumEdges = nullptr)
     {
         const float CS = FMath::Max(Params.CellSize, 1.0f);
         const FVector Pos(WorldX, WorldY, WorldZ);
@@ -115,6 +116,9 @@ namespace
         {
             MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, E.A, E.B, R));
         }
+
+        if (OutSdf)      { *OutSdf = MazeSDF; }
+        if (OutNumEdges) { *OutNumEdges = Edges.Num(); }
 
         // Rugosité omise volontairement (variante du bisect).
         const float Blend = 2.0f;
@@ -336,15 +340,50 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
 
         const int32 N = FMath::Min(NumMazeSamples, 5000);
         int32 DiffAB = 0, DiffAC = 0, DiffBC = 0;
+        int32 SdfDiffers = 0, SdfSame_DensityDiffers = 0, FirstBad = -1;
         for (int32 i = 0; i < N; ++i)
         {
             const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+
+            float VerbSdf = 0.0f; int32 VerbEdges = 0;
             const float A = MutableGen->GetMazeDensity(X, Y, Z, Core);
-            const float B = CoreStack.EvalMC(X, Y, Z);
-            const float C = MazeCoreVerbatim(X, Y, Z, Core, World.Settings->Seed);
+            const FVoxelOpSample BS = CoreStack.EvalSample(X, Y, Z);
+            const float B = -BS.Density;
+            const float C = MazeCoreVerbatim(X, Y, Z, Core, World.Settings->Seed, &VerbSdf, &VerbEdges);
+
             if (!BitEqual(A, B)) { ++DiffAB; }
             if (!BitEqual(A, C)) { ++DiffAC; }
-            if (!BitEqual(B, C)) { ++DiffBC; }
+            if (!BitEqual(B, C))
+            {
+                ++DiffBC;
+                if (FirstBad < 0) { FirstBad = i; }
+                // LA question, posée directement au lieu d'être déduite d'une densité :
+                // les deux SDF sont-ils identiques ? Si oui, la faute est dans le carve.
+                if (BitEqual(BS.Sdf, VerbSdf)) { ++SdfSame_DensityDiffers; } else { ++SdfDiffers; }
+            }
+        }
+
+        if (FirstBad >= 0)
+        {
+            const float X = (float)Points[FirstBad].X, Y = (float)Points[FirstBad].Y, Z = (float)Points[FirstBad].Z;
+            float VerbSdf = 0.0f; int32 VerbEdges = 0;
+            const float C = MazeCoreVerbatim(X, Y, Z, Core, World.Settings->Seed, &VerbSdf, &VerbEdges);
+            const FVoxelOpSample BS = CoreStack.EvalSample(X, Y, Z);
+            const float BMC = -BS.Density;
+            auto Bits = [](float V) { return *reinterpret_cast<const uint32*>(&V); };
+            AddInfo(FString::Printf(
+                TEXT("FIRST B-vs-C MISMATCH at (%.0f, %.0f, %.0f):\n")
+                TEXT("    SDF   stack %.9g [0x%08X]   verbatim %.9g [0x%08X]   %s\n")
+                TEXT("    MC    stack %.9g [0x%08X]   verbatim %.9g [0x%08X]\n")
+                TEXT("    verbatim edge count %d - CellSize %.9g - CorridorRadius %.9g - BaseDensity %.9g\n")
+                TEXT("    across all mismatches: SDF differs %d, SDF identical but density differs %d"),
+                X, Y, Z,
+                BS.Sdf, Bits(BS.Sdf), VerbSdf, Bits(VerbSdf),
+                BitEqual(BS.Sdf, VerbSdf) ? TEXT("<- SDF IDENTICAL, fault is in the CARVE")
+                                          : TEXT("<- SDF DIFFERS, fault is in the lattice/capsule"),
+                BMC, Bits(BMC), C, Bits(C),
+                VerbEdges, Core.CellSize, Core.CorridorRadius, Core.BaseDensity,
+                SdfDiffers, SdfSame_DensityDiffers));
         }
 
         MutableGen->OriginSpineRadius = SavedSpine;
