@@ -1903,3 +1903,92 @@ Then `Underwater` + `TunnelNetwork` (§8 / §2, **last**, with §8.4's window-in
 Perf still parked by Jahni until the transition is complete.
 
 ---
+
+## 2026-07-28 — 12 tests green. TunnelNetwork STAGE A (of three) written.
+
+Jahni: *"everything's green."* FloatingIslands is bit-identical and wired; 6 of 8 ported.
+**Worth asking for explicitly next run:** the three coverage numbers that test prints — samples
+inside island rock, the AllAir verdict count, and the diff count. Green with zero samples inside
+island rock would mean the equivalence proved that two empty voids agree.
+
+### The last archetype, staged deliberately
+
+`GetDensityWithParams` is ~1080 lines, 13 detail modifiers, a two-region cache and a per-room op
+override. Porting all of it before anything can be verified would be ~600 unverified lines on top of
+~200 unverified ones — the `AUDIT §P3` pattern this refactor has dodged six times.
+
+**The way in:** every detail modifier is amplitude-gated, and `FStrateGenerationParams` already
+leaves all of them at **zero** by default (`BuildParamsFromDefinition` stopped merging them globally
+— they arrive as per-room ops). One exception, `SurfaceRoughness = 5`. So zeroing those amplitudes
+sends the ORIGINAL down exactly the path stage A ported, and stage A is verifiable **today**, bit for
+bit, against the real function. Same discipline as the height-stack test's "defaults, then all ops
+ON", taken in the other direction.
+
+- **Stage A (this commit):** vertical scale · base rock · cave warp · room graph (+ pits + chimneys)
+  · carve · worms · structural post. 6 ops.
+- **Stage B:** the 13 detail modifiers, gated on `Sdf < SDFBlendRadius·3`.
+- **Stage C:** the per-room op override (`§2`'s option (a)), the `Underwater` water flag, and only
+  then does `UsesOperatorStackForChunk` return true for either.
+
+### ⚠️ The one decision that matters: the op CALLS `BuildChunkCache`, it does not transcribe it
+
+Every other port is a literal transcription. This one must not be. `BuildChunkCache` carries the
+two-region window-invariance discipline (`ARCHITECTURE §8.4`) and is the most delicate code in the
+plugin; transcribing it would **fork** it — two copies of one invariant, drifting, with the copy
+"validated" by a test that compares it to the original. What *is* transcribed is the ~60 lines of
+glue around it (strate-index memo, search-box key, warp, pit/chimney loops).
+
+### `FRAME` ops are retired, and porting is what retired them
+
+`§2` described two nested frames (`VerticalScale`, `CaveWarp`) and `§7` a third (the island warp).
+Porting all three dissolved all three:
+
+- **`CaveWarp` wraps exactly ONE operator.** Pits and chimneys explicitly read *unwarped* coords.
+  A transform whose scope is one op is a local variable, not a frame.
+- **`VerticalScale` is `Z / Scale`** — a pure function of a scalar and a param, one line wherever it
+  is needed. A frame would add a channel to avoid a division.
+- **The island warp** was already kept local for the same reason.
+
+**Zero frames out of three candidates.** It was never missing infrastructure; it was the same thing
+seen three times from a distance. Recorded in the builder rather than left as a permanent TODO.
+
+Also found: TunnelNetwork's carve divides by `Max(SDFBlendRadius·2, 1)` where Maze/Shafts/Islands
+divide by `Blend·2`. The formulas diverge once `Blend·2 < 1`, so `FSdfConvertOp` gained an explicit
+`MinDivisor` instead of letting the two look interchangeable. `Max(x, 0) == x` for positive Blend, so
+the green ports are untouched.
+
+### ⚠️ A test that compares against the original would have measured the ORIGINAL'S bug
+
+Check 3 (two stacks, different params, evaluated A/B/A/B at the same point) was written comparing
+both against `GetDensityWithParams`. **It would have failed** — and not because of the port. The
+original's SDF cache key is `(XY box, strate, seed)` with **no params**, so under interleaving it
+serves B the rooms it built for A. Comparing to it there measures its staleness, not my operator.
+Rewritten to compare each stack against **itself evaluated alone**: an oracle that does not share the
+defect under test.
+
+That in turn raises a **suspicion, filed as a suspicion**: `GetGenerationParams` blends params across
+Gradient transitions, so two chunk Zs inside one strate can hold different params with the same XY
+box, strate index and seed ⇒ no rebuild ⇒ the lower chunk gets the upper chunk's rooms. In
+production, with no live edit needed. Recorded in `AUDIT §C2` **with the check that would confirm
+it**, because the whole chain rests on "Gradient blending actually varies within a strate", which I
+have not verified. The port does not inherit it — the params fingerprint forces the rebuild.
+
+### What stage A deliberately does NOT prove
+
+Box verdicts: **zero proved, and the test asserts zero.** `FRoomGraphSource` answers `Both` (its
+bounds are in the SDF cache, which it would have to build for the queried box — worth doing only
+once `ClassifyTile` actually consumes `ClassifyBox`), and `FWormFieldSource` answers `CarveOnly`
+*everywhere*, because a fielded-noise carve has no spatial bound. That is `§0.2`'s point, and the
+amplitude cap that fixes it (`t ∈ [0,1]`, `Mask ∈ [0,1]` ⇒ at most `WormStrength` toward air) now has
+a home in `FWormFieldSource::MaxCarveAmplitude()`, waiting for a fold that carries numbers.
+
+**UNVERIFIED:** not compiled. Likely spots: `FStrateTerrainOpEntry` / `UVoxelStrateDefinition` newly
+reachable from `VoxelDensityOpStack.cpp` (added the include); `MakeSdfCarve`'s new defaulted third
+parameter (declared in the header, so the three existing call sites still compile); `FCrc` needing
+`Misc/Crc.h` (it comes via `CoreMinimal.h`, and `FSurfaceColumnSource` already uses it in this file);
+and the test's `GetGenerationParams` signature.
+
+**Next single action:** build, run the filter — **13 tests**, the new one is
+`VoxelForge.OpStack.TunnelNetworkSpineEquivalence`. Then stage B (the 13 modifiers).
+
+---

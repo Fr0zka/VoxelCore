@@ -170,6 +170,22 @@ The order is load-bearing and is the order the code already uses: spine carves t
 the seal then re-solidifies its bands (the spine deliberately never touches them), passages punch
 through everything including the seal, and the player wins last.
 
+> ### ⛔ RETIRED 2026-07-28 — frames were never a fifth thing. Porting all three candidates killed it.
+>
+> The section below argues for a `FRAME` op family from three examples. All three are now ported,
+> and none of them turned out to need one:
+>
+> - **`CaveWarp` wraps exactly ONE operator.** Pits and chimneys explicitly read *unwarped* coords
+>   while writing the same SDF channel — the thing this document called "the single fiddliest thing
+>   in the whole decomposition". Inside one operator the difficulty evaporates: the warp is a local
+>   variable, not an inherited context. A transform whose scope is one op is not a frame.
+> - **`VerticalScale` is `Z / Scale`** — a pure function of a scalar and a param, recomputed in one
+>   line by each op that needs it. A frame would add a channel to avoid a division.
+> - **The island warp (§7)** was kept local for the same reason, before the other two were even read.
+>
+> **Zero frames out of three candidates.** It was not missing infrastructure; it was one idea seen
+> three times from a distance. Kept below as the reasoning that was superseded, not as a plan.
+
 ### A fifth thing the plan doesn't name: FRAME OPS
 
 Two archetypes transform the *query coordinates* rather than the field:

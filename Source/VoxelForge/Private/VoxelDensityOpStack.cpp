@@ -25,6 +25,7 @@
 #include "VoxelGenerator.h"           // VoxelGenLOD::Eff
 #include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
 #include "VoxelNoise.h"               // VoxelNoise::FBM
+#include "VoxelStrateDefinition.h"    // TerrainOperations — le pool que BuildChunkCache tire par salle
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
 #include "VoxelTypes.h"               // SmoothStep01, VOXEL_NOISE_SCALE
 
@@ -1036,8 +1037,8 @@ namespace
     class FSdfConvertOp final : public IVoxelDensityOp
     {
     public:
-        FSdfConvertOp(float InBlend, float InBaseDensity, float InSign)
-            : Blend(InBlend), BaseDensity(InBaseDensity), Sign(InSign) {}
+        FSdfConvertOp(float InBlend, float InBaseDensity, float InSign, float InMinDivisor)
+            : Blend(InBlend), BaseDensity(InBaseDensity), Sign(InSign), MinDivisor(InMinDivisor) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::Combiner; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -1045,7 +1046,14 @@ namespace
         void Eval(float, float, float, FVoxelOpSample& InOut) const override
         {
             if (InOut.Sdf >= Blend) { return; }
-            float T = FMath::Clamp((Blend - InOut.Sdf) / (Blend * 2.0f), 0.0f, 1.0f);
+            // ⚠️ `MinDivisor` n'est PAS une précaution ajoutée : TunnelNetwork écrit
+            // `/ FMath::Max(SDFBlendRadius * 2, 1.0f)` là où Maze/Shafts/Islands écrivent `/ (Blend*2)`.
+            // Les deux formules DIVERGENT dès que `Blend·2 < 1`, donc les confondre serait une faute
+            // de portage silencieuse. Avec `MinDivisor = 0` et un Blend positif, `Max(x, 0) == x`
+            // exactement — les trois portages déjà verts ne bougent pas d'un bit.
+            // Not a safety tweak: TunnelNetwork genuinely floors this divisor at 1 and the others
+            // do not. Max(x, 0) is exactly x for positive Blend, so existing ports are untouched.
+            float T = FMath::Clamp((Blend - InOut.Sdf) / FMath::Max(Blend * 2.0f, MinDivisor), 0.0f, 1.0f);
             T = SmoothStep01(T);
             InOut.Density += Sign * T * BaseDensity * 2.0f;   // interne : monter = vers le solide
         }
@@ -1056,7 +1064,7 @@ namespace
         }
 
     private:
-        float Blend, BaseDensity, Sign;
+        float Blend, BaseDensity, Sign, MinDivisor;
     };
 
     //=========================================================================
@@ -1691,6 +1699,370 @@ namespace
         float  ExtraReach;
     };
 
+    //=========================================================================
+    // RÔLE 1 — SOURCE : GRAPHE DE SALLES / ROOM GRAPH  (TunnelNetwork)
+    //=========================================================================
+    // ⚠️⚠️ CET OPÉRATEUR N'A PAS RÉÉCRIT `BuildChunkCache` / `EvaluateSDFCached` : IL LES APPELLE.
+    //
+    // C'est LA décision de ce portage, et elle mérite d'être dite explicitement parce que la
+    // tentation inverse est forte : les six autres portages sont des transcriptions littérales.
+    // Celui-ci ne peut pas l'être. `BuildChunkCache` porte la discipline d'invariance de fenêtre à
+    // deux régions (ARCHITECTURE §8.4) — la région COLLECT (plus large, décide QUELLES primitives
+    // existent) et la région STORE (ce qu'on garde) — et c'est le code le plus délicat du plugin.
+    // Le transcrire, ce serait le FORKER : deux copies d'un invariant qui dérivent, dont l'une n'est
+    // testée que par un test d'équivalence qui compare... la copie à l'original.
+    //
+    // Ce qui EST transcrit ici, c'est la glu autour : la mémo d'index de strate, la clé de cache par
+    // BOÎTE DE RECHERCHE (pas par chunk — voir plus bas), le warp, et les boucles pits/cheminées.
+    // ~60 lignes déjà relues, contre ~400 lignes d'algorithme qu'on ne touche pas.
+    //
+    // This op CALLS the morphology cache rather than transcribing it: BuildChunkCache carries the
+    // two-region window-invariance discipline (§8.4) and forking it would be the worst possible
+    // outcome of a refactor whose whole point is to have ONE definition of each idea.
+    class FRoomGraphSource final : public IVoxelDensityOp
+    {
+    public:
+        FRoomGraphSource(const FStrateGenerationParams& InP, int32 InSeed,
+                         const UVoxelStrateManager* InManager)
+            : P(InP), Seed(InSeed), SeedU((uint32)InSeed), Manager(InManager)
+            , ParamsFingerprint(FCrc::MemCrc32(&InP, sizeof(InP)))
+        {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+
+        void PrepareChunk(const FVoxelOpContext& Ctx) override
+        {
+            // La seule chose vraiment constante par chunk ET dépendante du contexte. Le reste
+            // (index de strate, pool d'ops) est résolu paresseusement dans `Eval` comme l'original,
+            // parce que le cache SDF se ré-clé sur une BOÎTE, pas sur un chunk.
+            LayoutVersion = Ctx.LayoutVersion;
+        }
+
+        /** Le Z « effectif » : `VerticalScale` étire le monde AVANT le bruit. Pure fonction de Z et
+         *  d'un param — c'est pourquoi ce portage n'a PAS eu besoin d'un opérateur « frame »
+         *  (voir la note de conception dans BuildTunnelNetworkStack). */
+        FORCEINLINE float EffZ(float WorldZ) const
+        {
+            return (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f) ? (WorldZ / P.VerticalScale)
+                                                                       : WorldZ;
+        }
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return; }   // Sdf reste FLT_MAX
+
+            const float EffectiveZ = EffZ(WorldZ);
+
+            //---------------------------------------------------------------
+            // WARP DE CAVE — coordonnées de REQUÊTE uniquement
+            //---------------------------------------------------------------
+            // ⚠️ Le warp ne s'applique QU'À la requête du graphe de salles. Les pits et les cheminées
+            // plus bas lisent les coordonnées RÉELLES, et c'est délibéré dans l'original : leurs
+            // ancres viennent de centres de salles NON warpés. C'est aussi pourquoi le warp n'est pas
+            // un « frame » : sa portée est exactement UN opérateur, donc elle appartient à cet
+            // opérateur.
+            float WarpedX = WorldX, WarpedY = WorldY, WarpedZ = EffectiveZ;
+            if (P.CaveWarpStrength > 0.0f)
+            {
+                const float WF = P.CaveWarpFrequency;
+                const float WS = P.CaveWarpStrength;
+                WarpedX += VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
+                    WorldY * WF + 1.3f,
+                    EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
+                WarpedY += VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + 7.1f,
+                    WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
+                    EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
+                WarpedZ += VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + 11.3f,
+                    WorldY * WF + 9.7f,
+                    EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
+            }
+
+            //---------------------------------------------------------------
+            // LE CACHE PAR BOÎTE DE RECHERCHE
+            //---------------------------------------------------------------
+            // ⚠️ CLÉ PAR BOÎTE, PAS PAR CHUNK, et c'est un INVARIANT DE PERF (§8.10) : les
+            // échantillons de gradient interrogent `WorldX ± 1` et le warp déplace encore, donc une
+            // clé « égalité de chunk » se retournait à chaque cellule de bord et reconstruisait le
+            // cache (coûteux) en boucle. Comme le cache couvre la boîte + MaxInfluence, toute requête
+            // DANS la boîte est correcte. Ne pas « simplifier » en clé de chunk.
+            thread_local FChunkSDFCache SDFCache;
+            thread_local float  CachedSMinX = 1.0f, CachedSMaxX = -1.0f;   // invalide au départ
+            thread_local float  CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
+            thread_local int32  CachedStrate = INT32_MIN;
+            thread_local uint32 CachedSeed = 0;
+            // ⚠️ AJOUTÉ PAR RAPPORT À L'ORIGINAL — la leçon du 2026-07-27 (régression d'overhang).
+            // L'original ne clé QUE sur (boîte, strate, seed) : deux jeux de params différents dans
+            // la MÊME strate au MÊME seed se servent mutuellement leur cache. En production
+            // `RebuildStrates` masque le trou en bougeant la strate ; en test, deux piles construites
+            // côte à côte le déclenchent immédiatement. Empreinte CRC des params + LayoutVersion.
+            // `FStrateGenerationParams` est du POD pur (aucun TArray/FString/pointeur), donc une CRC
+            // mémoire ne peut pas donner un FAUX POSITIF ; au pire un padding donne un faux MANQUE,
+            // c'est-à-dire un recalcul. On se trompe du côté du CPU, jamais du côté d'une salle fausse.
+            thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
+            thread_local uint32 CachedLayout = 0xFFFFFFFFu;
+
+            // Index de strate — mémo (chunk-Z, version de layout), transcrit tel quel. La requête
+            // vise le CENTRE de la bande, donc le résultat est une fonction pure de la clé.
+            int32 StrateIdx = 0;
+            if (Manager)
+            {
+                thread_local int32  SI_ChunkZ  = INT32_MAX;
+                thread_local uint32 SI_Version = 0xFFFFFFFFu;
+                thread_local int32  SI_Index   = 0;
+                const int32 QZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+                const uint32 LV = Manager->GetLayoutVersion();
+                if (QZ != SI_ChunkZ || LV != SI_Version)
+                {
+                    SI_ChunkZ  = QZ;
+                    SI_Version = LV;
+                    SI_Index = Manager->GetStrateIndex(((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+                }
+                StrateIdx = SI_Index;
+            }
+
+            const bool bNeedRebuild =
+                StrateIdx != CachedStrate || SeedU != CachedSeed ||
+                ParamsFingerprint != CachedFingerprint || LayoutVersion != CachedLayout ||
+                WarpedX < CachedSMinX || WarpedX > CachedSMaxX ||
+                WarpedY < CachedSMinY || WarpedY > CachedSMaxY;
+
+            if (bNeedRebuild)
+            {
+                const int32 CacheChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
+                const int32 CacheChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
+                const float ChunkMinX = CacheChunkX * (float)CHUNK_SIZE;
+                const float ChunkMinY = CacheChunkY * (float)CHUNK_SIZE;
+                const float ChunkMaxX = ChunkMinX + (float)CHUNK_SIZE;
+                const float ChunkMaxY = ChunkMinY + (float)CHUNK_SIZE;
+                const float Expansion = P.CaveWarpStrength + 2.0f;
+
+                const float SMinX = ChunkMinX - Expansion;
+                const float SMinY = ChunkMinY - Expansion;
+                const float SMaxX = ChunkMaxX + Expansion;
+                const float SMaxY = ChunkMaxY + Expansion;
+
+                const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+                if (Manager)
+                {
+                    const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+                    UVoxelStrateDefinition* Def = Manager->GetStrateForChunk(
+                        FIntVector(CacheChunkX, CacheChunkY, ChunkZ));
+                    if (Def) { TerrainOps = &Def->TerrainOperations; }
+                }
+
+                VoxelCaveMorphology::BuildChunkCache(
+                    SDFCache, SMinX, SMinY, SMaxX, SMaxY, P, SeedU, StrateIdx, TerrainOps);
+
+                CachedSMinX = SMinX; CachedSMaxX = SMaxX;
+                CachedSMinY = SMinY; CachedSMaxY = SMaxY;
+                CachedStrate = StrateIdx;
+                CachedSeed = SeedU;
+                CachedFingerprint = ParamsFingerprint;
+                CachedLayout = LayoutVersion;
+            }
+
+            int32 NearestRoom = -1;
+            float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
+                WarpedX, WarpedY, WarpedZ, SDFCache, P.SDFBlendRadius, &NearestRoom);
+
+            //---------------------------------------------------------------
+            // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
+            //---------------------------------------------------------------
+            // C'est le point que `OPSTACK-DECOMPOSITION §2` annonçait comme « le plus retors de toute
+            // la décomposition » : deux primitives qui écrivent le MÊME canal que le graphe de salles
+            // mais à des coordonnées NON warpées. Sous un modèle de frames il aurait fallu les sortir
+            // du frame tout en gardant le canal — exprimable, mais tordu. Dans un opérateur unique la
+            // difficulté disparaît : le warp est une variable locale, pas un contexte hérité.
+            for (const FCachedPit& Pit : SDFCache.Pits)
+            {
+                const float DZ = WorldZ - Pit.TopZ;
+                if (DZ >= Pit.BlendK) { continue; }
+                if (-DZ > Pit.Depth + Pit.BlendK) { continue; }
+
+                const float DX = WorldX - Pit.CenterX;
+                const float DY = WorldY - Pit.CenterY;
+                const float XYDistSq = DX * DX + DY * DY;
+                if (XYDistSq > Pit.BoundXYRadiusSq) { continue; }
+
+                float PitSDF;
+                if (DZ <= 0.0f)
+                {
+                    const float DepthBelow  = -DZ;
+                    float FlareFactor = FMath::Clamp(1.0f - DepthBelow / Pit.FlareDist, 0.0f, 1.0f);
+                    FlareFactor       = FlareFactor * FlareFactor;
+                    const float EffRadius = Pit.Radius + Pit.FlareExtra * FlareFactor;
+                    PitSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                }
+                else
+                {
+                    PitSDF = FMath::Sqrt(XYDistSq) - (Pit.Radius + Pit.FlareExtra);
+                }
+
+                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
+            }
+
+            for (const FCachedChimney& Chim : SDFCache.Chimneys)
+            {
+                const float DZ = WorldZ - Chim.BottomZ;
+                if (-DZ >= Chim.BlendK) { continue; }
+                if (DZ > Chim.Height + Chim.BlendK) { continue; }
+
+                const float DX = WorldX - Chim.CenterX;
+                const float DY = WorldY - Chim.CenterY;
+                const float XYDistSq = DX * DX + DY * DY;
+                if (XYDistSq > Chim.BoundXYRadiusSq) { continue; }
+
+                float ChmSDF;
+                if (DZ >= 0.0f)
+                {
+                    float FlareFactor = FMath::Clamp(1.0f - DZ / Chim.FlareDist, 0.0f, 1.0f);
+                    FlareFactor       = FlareFactor * FlareFactor;
+                    const float EffRadius = Chim.Radius + Chim.FlareExtra * FlareFactor;
+                    ChmSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                }
+                else
+                {
+                    ChmSDF = FMath::Sqrt(XYDistSq) - (Chim.Radius + Chim.FlareExtra);
+                }
+
+                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
+            }
+
+            InOut.Sdf = CaveSDF;
+        }
+
+        /**
+         * ⚠️ `Both` POUR L'INSTANT, ET C'EST UNE DETTE ASSUMÉE, PAS UN OUBLI.
+         *
+         * Les bornes existent pourtant : `FCachedRoom` / `FCachedTunnel` portent déjà leurs
+         * `Bound*` (c'est ce dont `§2` dit qu'il rend le bedrock profond prouvable, « le plus gros
+         * poste de perf de tout le plan »). Ce qui manque, c'est que répondre honnêtement demande de
+         * consulter le cache — donc de le CONSTRUIRE pour la boîte interrogée, sur le thread qui
+         * interroge, ce qui n'est raisonnable qu'une fois `ClassifyBox` réellement branché dans
+         * `ClassifyTile` (il ne l'est toujours pas). Rendre `Both` coûte du CPU et ne peut pas faire
+         * de trou ; rendre le mauvais en ferait un.
+         *
+         * Conservative placeholder: the room/tunnel bounds needed for a real answer are already in
+         * the cache, but answering means building that cache for the queried box, which only pays
+         * once ClassifyTile actually consumes ClassifyBox. Both is always safe.
+         */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f) ? EVoxelOpEffect::Both
+                                                                  : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        int32  Seed;
+        uint32 SeedU;
+        const UVoxelStrateManager* Manager;   // NON possédant
+        uint32 ParamsFingerprint;
+        uint32 LayoutVersion = 0;
+    };
+
+    //=========================================================================
+    // RÔLE 1 — SOURCE : VERS / WORM TUNNELS  (TunnelNetwork)
+    //=========================================================================
+    // Un carve par SEUIL sur du bruit 3D, masqué par la distance au réseau de salles. Il écrit la
+    // DENSITÉ directement (pas le canal SDF) : c'est une source « fieldée », pas une primitive
+    // placée — la distinction que `AUDIT §6.2` pose et que `OPSTACK-DECOMPOSITION §0.2` chiffre.
+    //
+    // ⚠️ IL LIT `InOut.Sdf` : le masque de réseau est une fonction de `CaveSDF` APRÈS pits et
+    // cheminées. C'est encore le canal SDF utilisé comme ce pour quoi il existe — transporter une
+    // information géométrique entre deux opérateurs au lieu de la recalculer.
+    class FWormFieldSource final : public IVoxelDensityOp
+    {
+    public:
+        FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return; }
+
+            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
+                                   ? (WorldZ / P.VerticalScale) : WorldZ;
+            const float CaveSDF = InOut.Sdf;
+
+            float NetworkMask = 1.0f;
+            if (P.WormNetworkRange > 0.0f)
+            {
+                if (CaveSDF >= P.WormNetworkRange)   // vrai aussi quand il n'y a pas de réseau (FLT_MAX)
+                {
+                    NetworkMask = 0.0f;
+                }
+                else if (CaveSDF > 0.0f)
+                {
+                    NetworkMask = 1.0f - SmoothStep01(CaveSDF / P.WormNetworkRange);
+                }
+            }
+
+            if (NetworkMask <= 0.0f) { return; }
+
+            const float WormZFreq = P.WormFrequency * P.WormHorizontalBias;
+
+            const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
+                WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
+                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
+            )) * VOXEL_NOISE_SCALE);
+
+            // N2 ≥ 0, donc si N1 dépasse déjà le seuil la somme ne peut plus creuser — on saute le
+            // second Perlin (le cas courant ; sortie bit-identique). Transcrit tel quel.
+            if (N1 >= P.WormThreshold) { return; }
+
+            const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
+                WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
+                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
+            )) * VOXEL_NOISE_SCALE);
+
+            const float WormValue = N1 + N2;
+            if (WormValue < P.WormThreshold)
+            {
+                const float t = 1.0f - (WormValue / P.WormThreshold);
+                InOut.Density -= t * P.WormStrength * NetworkMask;
+            }
+        }
+
+        /**
+         * ⚠️ `CarveOnly` PARTOUT quand les vers sont actifs — et c'est exactement le problème que
+         * `OPSTACK-DECOMPOSITION §0.2` isole : un carve fieldé n'a AUCUNE borne spatiale, donc il tue
+         * l'hypothèse `AllSolid` sur CHAQUE tuile de CHAQUE strate à vers. La direction seule ne peut
+         * pas le récupérer.
+         *
+         * **Mais l'amplitude, elle, est bornée et triviale** : `t ∈ [0,1]`, `NetworkMask ∈ [0,1]`,
+         * donc ce ver ne peut déplacer la densité vers l'air que de `WormStrength` au plus. Dès que
+         * le pliage saura porter un INTERVALLE numérique et pas seulement une direction, « le rocher
+         * est solide de plus que la somme des carves restants » redevient prouvable — et c'est le
+         * plus gros poste de perf du plan. Noté ici, au point exact où la borne manque.
+         */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? EVoxelOpEffect::CarveOnly
+                                                                     : EVoxelOpEffect::Identity;
+        }
+
+        /** L'amplitude max de carve, en unités de densité. Pas encore consommée par le pliage —
+         *  posée ici pour que la borne de `§0.2` ait déjà un domicile quand les intervalles
+         *  arriveront. / The bound §0.2 needs, given a home before it has a consumer. */
+        float MaxCarveAmplitude() const
+        {
+            return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? P.WormStrength : 0.0f;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+    };
+
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
     // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
     // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
@@ -1742,14 +2114,14 @@ namespace VoxelDensityOps
         return MakeUnique<FSdfRoughnessMod>(Strength, Frequency, BaseOctaves, ApplyWithin);
     }
 
-    TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity)
+    TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity, float MinDivisor)
     {
-        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, -1.0f);
+        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, -1.0f, MinDivisor);
     }
 
     TUniquePtr<IVoxelDensityOp> MakeSdfFill(float Blend, float BaseDensity)
     {
-        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, +1.0f);
+        return MakeUnique<FSdfConvertOp>(Blend, BaseDensity, +1.0f, 0.0f);
     }
 
     TUniquePtr<IVoxelDensityOp> MakeSlabVoidSource(const FSlabGenerationParams& P, int32 Seed)
@@ -1832,6 +2204,52 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.1f, 3, P.SurfaceRoughness + 4.0f));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
         OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
+
+        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+    }
+
+    void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
+                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+    {
+        // ⚠️ ÉTAPE A SUR TROIS — LA PILE EST INCOMPLÈTE, ET DÉLIBÉRÉMENT.
+        // Sont portés : l'échelle verticale, le roc de base, le warp, le graphe de salles (+ pits
+        // + cheminées), le carve, les vers, le post structurel. **NE SONT PAS ENCORE PORTÉS** les
+        // treize modificateurs de détail de l'étape 4b-4h (rugosité, terrasses, lignes de strates,
+        // nervures, surplombs, falaise, festons, arches, colonnes, dômes, pincement, biais de sol),
+        // ni l'override d'op PAR SALLE.
+        //
+        // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
+        // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
+        // avec ces amplitudes MISES À ZÉRO, donc l'étape A est entièrement vérifiable dès
+        // maintenant au lieu d'attendre ~600 lignes de plus — c'est la même discipline que la passe
+        // « défauts puis tous les ops ON » du test de la pile de hauteur.
+        //
+        // STAGE A OF THREE, deliberately incomplete: the 13 detail modifiers and the per-room op
+        // override are not ported yet, which is why the archetype is still off in
+        // UsesOperatorStackForChunk. The test zeroes those amplitudes so stage A is verifiable now.
+        //
+        //---------------------------------------------------------------------
+        // ⚠️ CE PORTAGE RETIRE L'IDÉE DE « FRAME OPS » (OPSTACK-DECOMPOSITION §1)
+        //---------------------------------------------------------------------
+        // `§2` décrivait deux frames imbriqués : `VerticalScale` et `CaveWarp`. En les portant pour
+        // de vrai, les deux se sont dissous :
+        //   • `CaveWarp` a une portée d'EXACTEMENT UN opérateur (le graphe de salles — pits et
+        //     cheminées lisent explicitement les coordonnées non warpées). Une transformation qui
+        //     n'enveloppe qu'un opérateur n'est pas un frame, c'est une variable locale.
+        //   • `VerticalScale` est `Z / Scale` : une fonction PURE d'un scalaire et d'un param, que
+        //     chaque opérateur qui en a besoin recalcule en une ligne. Un frame ne ferait
+        //     qu'ajouter un canal pour éviter une division.
+        // Il restait le warp d'îles (§7), déjà gardé local pour la même raison. **Zéro frame sur
+        // trois candidats** : ce n'était pas une infrastructure manquante, c'était trois fois la
+        // même chose vue de loin. Noté ici plutôt que laissé en TODO permanent.
+        constexpr float CarveMinDivisor = 1.0f;   // TunnelNetwork plancher son diviseur, cf. FSdfConvertOp
+
+        OutStack.Add(MakeConstantRockSource(P.BaseDensity));
+        OutStack.Add(MakeUnique<FRoomGraphSource>(P, Seed, StrateManager));
+        OutStack.Add(MakeSdfCarve(P.SDFBlendRadius, P.BaseDensity, CarveMinDivisor));
+        // [ÉTAPE B ira ici : les 13 modificateurs de détail, gated sur `Sdf < SDFBlendRadius·3`]
+        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);

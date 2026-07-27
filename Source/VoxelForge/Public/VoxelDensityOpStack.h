@@ -193,8 +193,13 @@ namespace VoxelDensityOps
                                                                    int32 BaseOctaves, float ApplyWithin);
 
     /** Rôle 2 — conversion SDF → densité : creuse de l'air là où le SDF est à l'intérieur.
-     *  Les six mêmes lignes apparaissent aujourd'hui dans TunnelNetwork, Maze et VerticalShafts. */
-    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity);
+     *  Les six mêmes lignes apparaissent aujourd'hui dans TunnelNetwork, Maze et VerticalShafts.
+     *  @param MinDivisor  plancher du diviseur `Blend·2`. **TunnelNetwork passe 1.0** (son original
+     *                     écrit `FMath::Max(SDFBlendRadius·2, 1)`) ; Maze/Shafts laissent 0, où
+     *                     `Max(x,0) == x` exactement. Les deux formules divergent si `Blend·2 < 1`,
+     *                     donc ce paramètre est une vraie différence, pas une précaution. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSdfCarve(float Blend, float BaseDensity,
+                                                            float MinDivisor = 0.0f);
 
     /** Rôle 2 — la même conversion, signe opposé : REMPLIT du solide là où le SDF est à l'intérieur.
      *  C'est ce que fait FloatingIslands (`Density += Fill·Base·2`), et la multiplication par ±1
@@ -257,6 +262,24 @@ namespace VoxelDensityOps
      * fenêtre `rough + 4` au lieu de `R + rough + 2`).
      */
     VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
+                                                int32 Seed, float SpineRadius,
+                                                const UVoxelStrateManager* StrateManager);
+
+    /**
+     * TunnelNetwork — **ÉTAPE A SUR TROIS, PILE INCOMPLÈTE** :
+     *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → Worms → [structural ×3]
+     *
+     * ⛔ NE PAS brancher cet archétype dans `UsesOperatorStackForChunk` avant l'étape C : les 13
+     * modificateurs de détail (4b–4h) et l'override d'op par salle ne sont pas portés, donc le monde
+     * y perdrait tout son détail. Le test compare avec ces amplitudes à zéro.
+     *
+     * ⚠️ `FRoomGraphSource` **APPELLE** `BuildChunkCache`/`EvaluateSDFCached`, il ne les transcrit
+     * pas : c'est là que vit la discipline d'invariance de fenêtre à deux régions (`ARCHITECTURE
+     * §8.4`), et en faire une copie serait le pire résultat possible pour un refactor dont le but est
+     * d'avoir UNE définition de chaque idée.
+     */
+    VOXELFORGE_API void BuildTunnelNetworkStack(FVoxelOpStack& OutStack,
+                                                const FStrateGenerationParams& P,
                                                 int32 Seed, float SpineRadius,
                                                 const UVoxelStrateManager* StrateManager);
 
