@@ -583,6 +583,8 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
         // exactly as the original path does.
         return true;
 
+    case ECaveGeneratorType::VerticalShafts:  return true;   // Phase 2 — 3 ops repris de Maze tels quels
+
     default:                                  return false;
     }
 }

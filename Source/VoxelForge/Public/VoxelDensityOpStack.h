@@ -231,6 +231,19 @@ namespace VoxelDensityOps
                                        const UVoxelStrateManager* StrateManager);
 
     /**
+     * VerticalShafts — 8 ops, et **TROIS viennent de Maze sans une ligne de changement** :
+     *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge → [structural post ×3]
+     *
+     * C'est la démonstration que `§2.5` promettait : dans le `switch`, Maze et VerticalShafts sont
+     * deux fonctions de ~100 lignes sans rien de commun à l'œil ; en opérateurs, ce sont les mêmes
+     * trois ops avec une source différente et d'autres réglages (fréquence 0.1 au lieu de 0.12,
+     * fenêtre `rough + 4` au lieu de `R + rough + 2`).
+     */
+    VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
+                                                int32 Seed, float SpineRadius,
+                                                const UVoxelStrateManager* StrateManager);
+
+    /**
      * La pile Maze complète, décomposée — PAS un `FMazeOp` monolithique :
      *   ConstantRockSource → LatticeCorridorSource → SdfRoughnessMod → SdfCarve → [structural post]
      *

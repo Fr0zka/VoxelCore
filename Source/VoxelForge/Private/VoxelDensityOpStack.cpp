@@ -1138,6 +1138,264 @@ namespace
         float Base, Seal;
     };
 
+    //=========================================================================
+    // RÔLE 1 — SOURCE : PUITS VERTICAUX / VERTICAL SHAFTS
+    //=========================================================================
+    // Cylindres infinis sur une grille XY jitterée + connecteurs horizontaux entre paires proches,
+    // ouverts par un hash de paire symétrique. Écrit le canal SDF uniquement.
+    //
+    // ⚠️ ÉCART ASSUMÉ AVEC `OPSTACK-DECOMPOSITION §6`, qui suggérait DEUX sources (colonnes XY-pures
+    // + connecteurs) pour que la moitié cylindrique reçoive le traitement du cache de colonne et un
+    // `ClassifyBox` exact en XY. Gardé en UN opérateur, et voici pourquoi :
+    //   • les connecteurs se dérivent de la MÊME liste 3×3 que les puits (il faut les paires), donc
+    //     séparer imposerait soit de rouler les cellules deux fois, soit un cache partagé entre
+    //     deux ops — c'est-à-dire la complexité qu'on voulait éviter ;
+    //   • le `FShaftLedgeMod` en aval a de toute façon besoin de la liste des puits, donc il faut
+    //     l'exposer depuis une source ; l'exposer depuis deux serait pire.
+    // Ce qui est perdu : le verdict de boîte exact sur la seule moitié cylindrique. Ce qui est
+    // gardé : un `EffectOverBox` conservatif qui teste cercles ET capsules, ce que la version
+    // séparée aurait dû faire aussi. À revoir si le profil montre que ça compte.
+    //
+    // Kept as ONE op against §6's suggestion: the connectors derive from the same 3×3 roll as the
+    // shafts, and the downstream ledge mod needs the shaft list anyway. What is forfeited is an
+    // exact XY box verdict on the cylinder half alone.
+    class FShaftFieldSource final : public IVoxelDensityOp
+    {
+    public:
+        FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InExtraReach)
+            : P(InP), Salt((uint32)Seed ^ 0x53686674u)   // 'Shft' — identique à GetVerticalShaftDensity
+            , ExtraReach(InExtraReach) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        struct FShaft { float X, Y, R; };
+        struct FConn  { FVector A, B; };
+
+        // ⚠️ DÉCLARÉE ICI, avant toute fonction qui la renvoie. Un type imbriqué doit exister au
+        // moment où le COMPILATEUR lit la SIGNATURE — les corps de méthodes sont différés, pas les
+        // types de retour. La mettre en bas de la classe donne un C4430 « int par défaut » suivi
+        // d'une cascade illisible, ce qui masque une cause pourtant triviale.
+        // Declared here, before any function returning it: a nested type must exist when the
+        // compiler reads the SIGNATURE — bodies are deferred, return types are not.
+        struct FCells
+        {
+            TArray<FShaft, TInlineAllocator<9>> Shafts;
+            TArray<FConn,  TInlineAllocator<8>> Conns;
+        };
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const FCells& C = GetCells(WorldX, WorldY);
+
+            float CaveSDF = FLT_MAX;
+            for (const FShaft& Sh : C.Shafts)
+            {
+                const float DX = WorldX - Sh.X;
+                const float DY = WorldY - Sh.Y;
+                CaveSDF = FMath::Min(CaveSDF, FMath::Sqrt(DX * DX + DY * DY) - Sh.R);
+            }
+            const FVector Pos(WorldX, WorldY, WorldZ);
+            for (const FConn& Cn : C.Conns)
+            {
+                CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, Cn.A, Cn.B, P.ConnectorRadius));
+            }
+            InOut.Sdf = CaveSDF;
+        }
+
+        /** La liste des puits proches — `FShaftLedgeMod` doit trouver le PLUS PROCHE pour ne
+         *  poser d'étagère que sur sa moitié +X/+Y. Même motif que colonne → overhang. */
+        const FCells& GetCellsAt(float WorldX, float WorldY) const { return GetCells(WorldX, WorldY); }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        {
+            // La source répond pour la paire source+carve (SIMPLIFICATION DE PHASE 1) : `CarveOnly`
+            // si une primitive atteint la boîte, `Identity` sinon. `ExtraReach` couvre la rugosité
+            // et le blend en aval — le sous-estimer serait un TROU.
+            const float Pad = FMath::Max(P.ShaftMaxRadius, P.ConnectorRadius) + ExtraReach;
+            const FBox Padded = VoxelBox.ExpandBy(Pad);
+
+            const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
+            const int32 CX0 = FMath::FloorToInt((float)Padded.Min.X / Spacing);
+            const int32 CX1 = FMath::FloorToInt((float)Padded.Max.X / Spacing);
+            const int32 CY0 = FMath::FloorToInt((float)Padded.Min.Y / Spacing);
+            const int32 CY1 = FMath::FloorToInt((float)Padded.Max.Y / Spacing);
+
+            for (int32 cy = CY0; cy <= CY1; ++cy)
+            for (int32 cx = CX0; cx <= CX1; ++cx)
+            {
+                FShaft Sh;
+                if (!RollShaft(cx, cy, Sh)) { continue; }
+                // Cercle (rayon + marge) contre le rectangle XY : un cylindre est infini en Z, donc
+                // la question est purement XY.
+                const float R  = Sh.R + ExtraReach;
+                const float QX = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.X - Sh.X,
+                                                             Sh.X - (float)VoxelBox.Max.X));
+                const float QY = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.Y - Sh.Y,
+                                                             Sh.Y - (float)VoxelBox.Max.Y));
+                if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::CarveOnly; }
+            }
+
+            // ⚠️ Les connecteurs ne sont PAS testés ici, et c'est délibérément conservatif dans le
+            // mauvais sens si on n'y prend pas garde : un connecteur ne peut exister qu'entre deux
+            // puits d'un voisinage, donc si AUCUN puits n'atteint la boîte élargie de `Spacing*1.6`
+            // (la portée max d'une paire), aucun connecteur ne peut l'atteindre non plus.
+            const FBox ConnBox = VoxelBox.ExpandBy(Spacing * 1.6f + Pad);
+            const int32 KX0 = FMath::FloorToInt((float)ConnBox.Min.X / Spacing);
+            const int32 KX1 = FMath::FloorToInt((float)ConnBox.Max.X / Spacing);
+            const int32 KY0 = FMath::FloorToInt((float)ConnBox.Min.Y / Spacing);
+            const int32 KY1 = FMath::FloorToInt((float)ConnBox.Max.Y / Spacing);
+            for (int32 cy = KY0; cy <= KY1; ++cy)
+            for (int32 cx = KX0; cx <= KX1; ++cx)
+            {
+                FShaft Sh;
+                if (RollShaft(cx, cy, Sh)) { return EVoxelOpEffect::CarveOnly; }   // prudent
+            }
+
+            return EVoxelOpEffect::Identity;
+        }
+
+    private:
+        /** Tirage d'une cellule. PURE en (cellule, seed, params) ⇒ `Eval` et `EffectOverBox` ne
+         *  peuvent pas voir des puits différents. */
+        bool RollShaft(int32 nx, int32 ny, FShaft& Out) const
+        {
+            const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
+            const uint32 Hh = VoxelHash::Cell(nx, ny, Salt);
+            if (VoxelHash::ToFloat01(Hh) > P.ShaftDensity) { return false; }
+
+            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
+            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
+            Out.X = (nx + 0.15f + JX * 0.7f) * Spacing;
+            Out.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
+            Out.R = FMath::Lerp(P.ShaftMinRadius, P.ShaftMaxRadius,
+                                VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            return true;
+        }
+
+        /** Le voisinage 3×3 + ses connecteurs, mémoïsés par worker. Clé = cellule + tous les params
+         *  qui influent (comme l'original) : stable à travers les reconstructions de pile, ce qui
+         *  est la leçon retenue du mémo de colonne de SurfaceWorld. */
+        const FCells& GetCells(float WorldX, float WorldY) const
+        {
+            const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
+            const int32 CX = FMath::FloorToInt(WorldX / Spacing);
+            const int32 CY = FMath::FloorToInt(WorldY / Spacing);
+
+            thread_local FCells  Cache;
+            thread_local int32   VS_CX = INT32_MAX, VS_CY = INT32_MAX;
+            thread_local uint32  VS_Salt = 0xFFFFFFFFu;
+            thread_local float   VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f,
+                                 VS_MaxR = -1.0f, VS_Cross = -1.0f,
+                                 VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX, VS_Seal = -1.0f;
+
+            if (CX != VS_CX || CY != VS_CY || Salt != VS_Salt || Spacing != VS_Spacing ||
+                P.ShaftDensity != VS_Dens || P.ShaftMinRadius != VS_MinR || P.ShaftMaxRadius != VS_MaxR ||
+                P.CrossConnectChance != VS_Cross ||
+                P.StrateBottomWorldZ != VS_BotZ || P.StrateTopWorldZ != VS_TopZ ||
+                P.BoundarySealThickness != VS_Seal)
+            {
+                VS_CX = CX;  VS_CY = CY;  VS_Salt = Salt;  VS_Spacing = Spacing;
+                VS_Dens = P.ShaftDensity;  VS_MinR = P.ShaftMinRadius;  VS_MaxR = P.ShaftMaxRadius;
+                VS_Cross = P.CrossConnectChance;
+                VS_BotZ = P.StrateBottomWorldZ;  VS_TopZ = P.StrateTopWorldZ;
+                VS_Seal = P.BoundarySealThickness;
+                Cache.Shafts.Reset();
+                Cache.Conns.Reset();
+
+                for (int32 dy = -1; dy <= 1; dy++)
+                for (int32 dx = -1; dx <= 1; dx++)
+                {
+                    FShaft Sh;
+                    if (RollShaft(CX + dx, CY + dy, Sh)) { Cache.Shafts.Add(Sh); }
+                }
+
+                if (P.CrossConnectChance > 0.0f && Cache.Shafts.Num() >= 2)
+                {
+                    const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
+                    const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
+                    for (int32 i = 0; i < Cache.Shafts.Num(); i++)
+                    for (int32 j = i + 1; j < Cache.Shafts.Num(); j++)
+                    {
+                        const FShaft& A = Cache.Shafts[i];
+                        const FShaft& B = Cache.Shafts[j];
+                        const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
+                        if (DSq > FMath::Square(Spacing * 1.6f)) { continue; }
+
+                        const uint32 PH = VoxelHash::Pair(
+                            FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
+                            FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), Salt ^ 0xC04Eu);
+                        if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance) { continue; }
+
+                        const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
+                        Cache.Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc) });
+                    }
+                }
+            }
+            return Cache;
+        }
+
+        FVerticalShaftParams P;
+        uint32 Salt;
+        float  ExtraReach;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : ÉTAGÈRES DE PUITS / SHAFT LEDGES
+    //=========================================================================
+    // Des tablettes fines à intervalles réguliers en Z, posées UNIQUEMENT sur la moitié +X/+Y du
+    // puits le plus proche — pour que la moitié opposée reste libre et le puits franchissable.
+    // C'est un op FORÇANT (`Max`) : il ne peut qu'ajouter du solide.
+    class FShaftLedgeMod final : public IVoxelDensityOp
+    {
+    public:
+        FShaftLedgeMod(const FVerticalShaftParams& InP, const FShaftFieldSource* InField)
+            : P(InP), Field(InField) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            if (P.LedgeSpacing <= 0.0f || P.LedgeDepth <= 0.0f || Field == nullptr) { return; }
+            // ⚠️ La garde de l'original est `CaveSDF < 0` — le SDF APRÈS rugosité, tel que la pile
+            // l'a laissé. C'est bien `InOut.Sdf` ici, pas une re-évaluation : re-calculer donnerait
+            // le SDF SANS rugosité et déplacerait les étagères.
+            if (InOut.Sdf >= 0.0f) { return; }
+
+            const float Phase = FMath::Frac((WorldZ - P.StrateBottomWorldZ) / P.LedgeSpacing);
+            const float BandT = FMath::Min(Phase, 1.0f - Phase) * P.LedgeSpacing;
+            if (BandT >= P.LedgeDepth) { return; }
+
+            const FShaftFieldSource::FCells& C = Field->GetCellsAt(WorldX, WorldY);
+            if (C.Shafts.Num() == 0) { return; }
+
+            const FShaftFieldSource::FShaft* Near = nullptr;
+            float BestSq = FLT_MAX;
+            for (const FShaftFieldSource::FShaft& Sh : C.Shafts)
+            {
+                const float D2 = FMath::Square(WorldX - Sh.X) + FMath::Square(WorldY - Sh.Y);
+                if (D2 < BestSq) { BestSq = D2; Near = &Sh; }
+            }
+            if (Near && (WorldX - Near->X) + (WorldY - Near->Y) > 0.0f)
+            {
+                const float Shelf = 1.0f - SmoothStep01(BandT / P.LedgeDepth);
+                InOut.Density = FMath::Max(InOut.Density, Shelf * P.BaseDensity);
+            }
+        }
+
+        // N'ajoute que du solide ⇒ tue AllAir, jamais AllSolid.
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.LedgeSpacing > 0.0f && P.LedgeDepth > 0.0f)
+                 ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FVerticalShaftParams P;
+        const FShaftFieldSource* Field;   // NON possédant : la pile possède la source
+    };
+
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
     // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
     // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
@@ -1231,6 +1489,42 @@ namespace VoxelDensityOps
         // un commentaire. 8 archétypes → 7.
         OutStack.Add(MakeSlabVoidSource(P, Seed));
         OutStack.Add(MakeGridColumnMod(P, Seed));
+
+        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+    }
+
+    void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
+                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+    {
+        // ⚠️ LA PREUVE QUE L'ABSTRACTION EST RÉELLE, et elle vaut d'être dite : TROIS des cinq
+        // opérateurs ci-dessous sont ceux de Maze, **repris sans une ligne de changement** —
+        // `ConstantRock`, `SdfRoughness`, `SdfCarve`. Dans le `switch`, Maze et VerticalShafts sont
+        // deux fonctions de ~100 lignes qui n'ont rien en commun à l'œil ; en opérateurs, ce sont
+        // les MÊMES trois ops avec une source différente. C'est exactement ce que `§2.5` prédisait
+        // et ce que la Phase 1 avait parié.
+        //
+        // THREE of the five ops below are Maze's, reused without a line changed. In the switch,
+        // Maze and VerticalShafts are two unrelated ~100-line functions; as operators they are the
+        // same three ops with a different source.
+        constexpr float CarveBlend = 2.0f;
+
+        // Portée que la source doit déclarer pour la paire source+carve : la rugosité peut élargir
+        // le puits (FBM ∈ [-1,1] ⇒ ±Strength·VOXEL_NOISE_SCALE), puis le blend du carve. Sur-estimer
+        // coûte du CPU ; sous-estimer serait un trou.
+        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE + CarveBlend + 1.0f;
+
+        TUniquePtr<FShaftFieldSource> ShaftSource = MakeUnique<FShaftFieldSource>(P, Seed, ExtraReach);
+        const FShaftFieldSource* ShaftPtr = ShaftSource.Get();
+
+        OutStack.Add(MakeConstantRockSource(P.BaseDensity));
+        OutStack.Add(MoveTemp(ShaftSource));
+        // Fréquence 0.1 et fenêtre `SurfaceRoughness + 4` — les constantes de
+        // `GetVerticalShaftDensity`, PAS celles de Maze (0.12 / `R + rough + 2`). Même opérateur,
+        // réglages différents : c'est le point.
+        OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.1f, 3, P.SurfaceRoughness + 4.0f));
+        OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
+        OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);

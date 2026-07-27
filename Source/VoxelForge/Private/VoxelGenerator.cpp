@@ -652,6 +652,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                                                        PerBiome, MoveTemp(Field));
                     break;
                 }
+
+                case ECaveGeneratorType::VerticalShafts:
+                    if (CP_Vert.StrateTopWorldZ - CP_Vert.StrateBottomWorldZ <= 0.0f)
+                    {
+                        CP_UseOpStack = false;
+                        break;
+                    }
+                    OpCtx.StrateTopWorldZ    = CP_Vert.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Vert.StrateBottomWorldZ;
+                    VoxelDensityOps::BuildVerticalShaftStack(CP_OpStack, CP_Vert, Seed,
+                                                             OriginSpineRadius, StrateManager);
+                    break;
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`

@@ -1676,3 +1676,50 @@ cache's direct indexing vs. my hash, then per-voxel virtual calls.
 the flag off. Then `VerticalShafts` (§6).
 
 ---
+
+## 2026-07-27 — VerticalShafts ported. 5 of 8, and operator reuse is now MEASURED.
+
+**The port that tests the thesis rather than the fidelity.** Every previous port asked "does the
+decomposition reproduce the original?". This one asks **"do operators actually get reused across
+archetypes?"** — which is `OPSTACK-PLAN §2.5`'s claim and the only reason to do this refactor rather
+than tidy the `switch`.
+
+**Three of the five ops are Maze's, reused without a line changed:** `ConstantRock`, `SdfRoughness`,
+`SdfCarve`. In the `switch`, `GetMazeDensity` and `GetVerticalShaftDensity` are two ~100-line
+functions with nothing visibly in common. As operators they are the **same three ops with a
+different source and different tuning** — frequency 0.1 instead of 0.12, window `rough + 4` instead
+of `R + rough + 2`. If the test is bit-identical, reuse stops being an intention and becomes a
+measurement.
+
+**Two new ops:** `FShaftFieldSource` (infinite cylinders + hash-gated connectors → SDF) and
+`FShaftLedgeMod` (banded shelves on the +X/+Y half only, so the shaft stays climbable).
+
+**Deviation from `§6`, stated:** it suggested splitting the source in two (XY-pure cylinders +
+connectors) so the cylinder half could get an exact XY box verdict. Kept as one op, because the
+connectors derive from the *same* 3×3 roll as the shafts and the ledge mod needs the shaft list
+anyway — splitting would mean rolling twice or sharing a cache between two ops. What is forfeited is
+the exact verdict on the cylinder half alone; what is kept is a conservative `EffectOverBox` that
+tests circles *and* connector reach. Revisit if the profile says it matters.
+
+**One subtlety worth flagging:** `FShaftLedgeMod` gates on `InOut.Sdf < 0` — the SDF **after**
+roughness, as the pile left it. Re-deriving the SDF there would give the pre-roughness value and
+shift every ledge. The op reads the channel rather than recomputing, which is exactly what the
+two-channel `FVoxelOpSample` is for.
+
+**Compile fix on the way in:** `FCells` was declared at the bottom of the class but returned by
+functions above it. Member *bodies* are deferred; *return types* are not — C4430 plus an unreadable
+cascade from a trivial cause. Moved up beside `FShaft`/`FConn`, with a note.
+
+**Ported: Maze · FlatPlain · CrystalChamber · SurfaceWorld (biomes incl.) · VerticalShafts — 5 of 8.**
+Remaining: `FloatingIslands` (§7), `Underwater` (§8, TunnelNetwork + a flag), and `TunnelNetwork`
+(§2) **last**, because it owns `BuildChunkCache`'s two-region window-invariance discipline (§8.4),
+the most delicate code in the plugin.
+
+**UNVERIFIED:** the shaft port is not compiled past the `FCells` fix.
+
+**Next single action:** build, run the `VoxelForge` filter — 11 tests now, the new one is
+`VoxelForge.OpStack.VerticalShaftEquivalence`. Then `FloatingIslands`. **Perf is deliberately parked
+until the transition is complete** (Jahni's call); the open item is that the op path is slower, with
+virtual dispatch and the hashed column lookup as the remaining suspects.
+
+---

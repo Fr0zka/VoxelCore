@@ -4,11 +4,20 @@
 > *composable density pipeline*, so new world ideas become authoring instead of C++. Written
 > 2026-07-26 as a handoff for a future context — read this instead of re-deriving it.
 >
-> **Status (2026-07-27):** **Phase 0.5 and Phase 1 are DONE and verified** — five green tests, Maze
-> decomposed into seven ops, wired into `GetDensityAt` behind `bUseOperatorStack`, and the visual
-> A/B passed (Jahni: *"pretty similar, if not entirely similar"*). **Phase 2 is in progress:**
-> FlatPlain + CrystalChamber are ported into ONE op (`BuildSlabStack`), their §3.1 Z term is gone,
-> and both are wired — **written, not yet compiled.** Live state and the next action live in
+> **Status (2026-07-27):** **Phases 0.5 and 1 DONE and verified. Phase 2 is 5 of 8 archetypes in**,
+> all bit-identical to their originals and all wired behind `bUseOperatorStack`:
+> **Maze · FlatPlain · CrystalChamber · SurfaceWorld (biomes included) · VerticalShafts.**
+> Remaining: `FloatingIslands`, `TunnelNetwork` (**last** — it owns the §8.4 window-invariance
+> discipline), `Underwater` (TunnelNetwork + a flag).
+>
+> Two things came out of Phase 2 that were not in the original design: **height space**
+> (`VoxelHeightOp.h`, a second operator family — some things are not another channel but another
+> *space*) and **`IVoxelBiomeField`** (ops depend on a capability, never on the generator, which is
+> what lets them become assets in Phase 3). Both are described in `OPSTACK-DECOMPOSITION §5`.
+>
+> **Known open:** generation is measurably slower on the op path (one fix landed — the column memo
+> was discarding itself every chunk; virtual dispatch and the hashed lookup remain). Deferred by
+> Jahni until the transition is complete. Live state and the next action live in
 > [OPSTACK-PROGRESS.md](OPSTACK-PROGRESS.md) — read its last entry first. The per-archetype
 > breakdown is in [OPSTACK-DECOMPOSITION.md](OPSTACK-DECOMPOSITION.md).
 >
@@ -391,7 +400,7 @@ Port each archetype **the next time a feature makes you open it anyway**. The sw
 Suggested order when there's a free choice — cheapest and least risky first:
 
 ✅ `Maze` (P1) → ✅ `FlatPlain`/`CrystalChamber` (one op, two default sets — the first real win: two
-archetypes collapse into one; **done 2026-07-27**, `BuildSlabStack`, 8 archetypes → 7) → `SurfaceWorld` (biggest payoff, biggest care: the T1.a column cache and the exact-
+archetypes collapse into one; **done**, `BuildSlabStack`, 8 archetypes → 7) → ✅ `SurfaceWorld` (**done**, incl. biomes — needed a whole second op family, `VoxelHeightOp.h`) → ✅ `VerticalShafts` (**done**, 3 ops reused from Maze unchanged) (biggest payoff, biggest care: the T1.a column cache and the exact-
 lattice `ClassifyTile` bound must both survive) → `VerticalShafts` → `FloatingIslands` → `TunnelNetwork`
 (**last** — it owns `BuildChunkCache`'s two-region window-invariance discipline, §8.4, the most delicate
 code in the plugin).
