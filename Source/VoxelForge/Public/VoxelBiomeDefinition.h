@@ -22,6 +22,11 @@
 #include "VoxelStrateTypes.h"   // FStrateDecoration / FStrateAmbientActor
 #include "VoxelBiomeDefinition.generated.h"
 
+// IWYU : utilisé en pointeur seulement ⇒ déclaration avant. Fournie gratuitement par le PCH
+// partagé jusqu'ici ; `FPSemantics = Precise` nous en sort. / Pointer-only use, so a forward
+// declaration is enough. The shared PCH used to provide this for free.
+class UMaterialInterface;
+
 /**
  * UVoxelBiomeDefinition — one biome's identity, placement, terrain modulation and content.
  */

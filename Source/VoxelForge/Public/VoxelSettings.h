@@ -11,6 +11,9 @@
 #include "VoxelStrateDefinition.h"
 #include "VoxelSettings.generated.h"
 
+// IWYU : pointeur seulement (VoxelMaterial). / Pointer-only use.
+class UMaterialInterface;
+
 UCLASS(BlueprintType)
 class UVoxelSettings : public UPrimaryDataAsset
 {

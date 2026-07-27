@@ -45,9 +45,11 @@
 #include "VoxelTypes.h"
 #include "VoxelStrateTypes.h"   // FStrateDecoration (resolved per dominant biome)
 #include "VoxelBiomeTypes.h"    // FBiomeContext (per-column biome resolve on the worker)
+#include "Templates/SubclassOf.h"   // IWYU : TSubclassOf<AActor> (FRegionActorBucket & co)
 #include <atomic>
 #include "VoxelContentManager.generated.h"
 
+class AActor;                   // IWYU : pointeur / TWeakObjectPtr / TSubclassOf seulement
 class UVoxelStrateManager;
 class UVoxelStrateDefinition;
 class UVoxelGenerator;

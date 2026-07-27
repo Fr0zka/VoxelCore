@@ -18,9 +18,16 @@
 #include "GameplayTagContainer.h"
 #include "VoxelStrateTypes.h"
 #include "VoxelBiomeTypes.h"
+#include "Templates/SubclassOf.h"   // IWYU : TSubclassOf<AActor> (Atmosphere/Ceiling/FloorLayerActor)
 #include "VoxelStrateDefinition.generated.h"
 
 class UVoxelBiomeDefinition;
+// IWYU : tous en pointeur ou en paramètre de TSubclassOf ⇒ déclarations avant suffisantes.
+// Le PCH partagé les fournissait ; `FPSemantics = Precise` (AUDIT §C9) nous en prive.
+// All pointer-only or TSubclassOf parameters, so forward declarations suffice.
+class UMaterialInterface;
+class USoundBase;
+class AActor;
 
 /**
  * UVoxelStrateDefinition — The content bag for a strate type.

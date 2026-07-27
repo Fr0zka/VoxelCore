@@ -12,6 +12,7 @@
 #include "CoreMinimal.h"
 #include "VoxelAtmosphereManager.generated.h"
 
+class AActor;                   // IWYU : pointeur / TWeakObjectPtr seulement / pointer-only
 class UVoxelStrateManager;
 class UVoxelStrateDefinition;
 class UVoxelBiomeDefinition;

@@ -37,9 +37,17 @@
 #include "CoreMinimal.h"
 #include "Containers/Queue.h"
 #include "VoxelTypes.h"
+// ⚠️ IWYU, ET CELUI-CI EST PIÉGEUX : `ENABLE_DRAW_DEBUG` est utilisé en `#if` plus bas. Un macro
+// NON DÉFINI vaut 0 dans un `#if` — donc sans cet include le bloc de debug disparaît EN SILENCE au
+// lieu de provoquer une erreur de compilation. Il venait du PCH partagé ; `FPSemantics = Precise`
+// (AUDIT §C9) nous en prive. Défini par DrawDebugHelpers.h (vérifié dans UE 5.7).
+// An UNDEFINED macro evaluates to 0 in an #if, so without this include the debug block vanishes
+// SILENTLY instead of failing the build. Defined by DrawDebugHelpers.h (verified in UE 5.7).
+#include "DrawDebugHelpers.h"
 #include <atomic>
 #include "VoxelDensityVolume.generated.h"
 
+class AActor;                   // IWYU : pointeur / TWeakObjectPtr seulement / pointer-only
 class UVoxelGenerator;
 class UVoxelSettings;
 class UVolumeTexture;

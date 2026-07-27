@@ -14,9 +14,11 @@
 
 #include "CoreMinimal.h"
 #include "GameplayTagContainer.h"
+#include "Templates/SubclassOf.h"   // IWYU : TSubclassOf<AActor> (FPlacementProfile & co)
 #include "VoxelStrateTypes.generated.h"
 
 class UVoxelBiomeDefinition;   // FPlacementProfile::RequiredBiome (optional per-entry biome filter)
+class AActor;                  // IWYU : paramètre de TSubclassOf seulement / TSubclassOf param only
 
 //=============================================================================
 // ENUMS

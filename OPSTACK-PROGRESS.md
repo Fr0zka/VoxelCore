@@ -1119,3 +1119,74 @@ needs Jahni's go-ahead on scope (~40 sites, re-rolls every world, one build).
 - **`SurfaceWorld`** (`OPSTACK-DECOMPOSITION §5`): the biggest op-stack payoff, most care.
 
 ---
+
+## 2026-07-27 — C9 FIXED AT THE CAUSE: FPSemantics = Precise, IWYU debt cleared.
+
+**Jahni's call, and the right one:** *"I believe we could put FPSemantics to precise? Clearing up
+anything that makes us not use it, then skip on the cross-platform same result for now and continue
+on the rework of the opstack."* Fix the cause rather than measure the symptom — if both toolchains
+compile IEEE-754 with no contraction, they agree **by construction** and there is nothing left to
+compare.
+
+**Verified in the UE 5.7 source rather than assumed** (`E:\Program Files\Epic Games\UE_5.7`):
+
+| | `Default` | `Precise` |
+|---|---|---|
+| `VCToolChain.cs:1264` (Windows/MSVC) | `/fp:fast` | **`/fp:precise`** |
+| `ClangToolChain.cs:712` (Linux/Mac) | `-ffp-contract=off` | **`-ffp-contract=off`** |
+
+So `Default` really did mean **opposite** float models per platform, and `Precise` collapses them
+onto the same one. `FPSemantics` is a `ModuleRules` property (`ModuleRules.cs:777`), so per-module
+is the right granularity.
+
+### The IWYU debt, cleared
+
+Losing the shared PCH is what the debt was hiding behind. All uses turned out to be pointers,
+`TWeakObjectPtr` or `TSubclassOf` parameters, so **forward declarations suffice** — only the
+templates and macros needed real includes:
+
+| Header | Added |
+|---|---|
+| `VoxelBiomeDefinition.h` | `class UMaterialInterface;` |
+| `VoxelSettings.h` | `class UMaterialInterface;` |
+| `VoxelStrateDefinition.h` | `Templates/SubclassOf.h` + `UMaterialInterface`, `USoundBase`, `AActor` |
+| `VoxelStrateTypes.h` | `Templates/SubclassOf.h` + `AActor` |
+| `VoxelContentManager.h` | `Templates/SubclassOf.h` + `AActor` |
+| `VoxelAtmosphereManager.h` | `class AActor;` |
+| `VoxelDensityVolume.h` | **`DrawDebugHelpers.h`** + `class AActor;` |
+
+**`VoxelDensityVolume.h` was the one worth catching.** It uses `ENABLE_DRAW_DEBUG` in an `#if`, and
+an **undefined macro in an `#if` is silently 0** — so without the include the debug block would have
+vanished without a single warning, rather than failing the build. Include paths verified against the
+engine tree (`Engine/Public/DrawDebugHelpers.h`, `CoreUObject/Public/Templates/SubclassOf.h`), not
+guessed.
+
+**Expect a residual tail.** The shared PCH hid these for years and only a real build enumerates them
+all. Any further "undefined type" error from this build is IWYU, **not** the float setting — the fix
+is to add the include, never to revert `FPSemantics`. That instruction is now written into
+`VoxelForge.Build.cs` where the next person will hit it.
+
+### Also landed: the cross-platform instrument (kept, not blocking)
+
+`VoxelForge.Determinism.CrossPlatformDigest` — two FNV-1a digests over a fixed integer grid (no RNG,
+so the sample set cannot itself diverge):
+- **SHAPE** — the sign of density only. This is all the mesher reads, so it *is* the world: same
+  shape digest ⇒ same cavities, same walls, same collision. Jahni's "99.99% reproducible", literally.
+- **FIELD** — every float bit. Differing while SHAPE matches ⇒ sub-voxel vertex wobble, harmless.
+
+Plus `NearIso`: how many samples sit within 1e-4 of the isosurface, i.e. how many could *possibly*
+flip sign under a float-model change. That **bounds** the risk instead of assuming it. Digests are
+reported, not asserted, until pinned — pinning before the platforms agree would just carve the
+divergence into the test. Per Jahni, the cross-platform comparison is deferred; the test costs
+nothing to leave in and becomes a permanent regression guard the day someone runs it on Linux.
+
+**UNVERIFIED:** none of this is compiled. **Expect a perf regression** — `/fp:precise` forbids the
+reassociation and FMA contraction `/fp:fast` allowed, on a noise-heavy hot path. Worth measuring
+against `ARCHITECTURE §8.10` rather than assuming it is small.
+
+**Next single action:** build. Then, per Jahni, back to the opstack — `SurfaceWorld`
+(`OPSTACK-DECOMPOSITION §5`), the biggest payoff and the most care: the T1.a column cache and the
+exact-lattice `ClassifyTile` bound must both survive the port. `§C1` (bounded seed offsets) stays
+open and still wants doing before too many more archetypes copy it.
+
+---

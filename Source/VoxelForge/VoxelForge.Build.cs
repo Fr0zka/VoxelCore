@@ -12,25 +12,51 @@ public class VoxelForge : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
 		// ============================================================================
-		// ⚠️ DO NOT SET `FPSemantics` HERE — tried 2026-07-27, it does not build.
+		// FLOAT MODEL — pinned to Precise so Windows and Linux compute the SAME WORLD.
 		// ============================================================================
-		// Setting FPSemantics (or any other property that alters this module's compile
-		// environment) makes VoxelForge ineligible for the ENGINE'S SHARED PCH: UBT can only
-		// share a precompiled header between modules whose compile environments match. The
-		// build then fails with ~30 "undefined type" errors — UMaterialInterface, USoundBase,
-		// TSubclassOf<AActor>, APawn, ENABLE_DRAW_DEBUG — none of which are FP-related. They
-		// are includes this plugin has always relied on the shared PCH to provide for free.
+		// Jahni, 2026-07-27: the game must be playable on both Linux and Windows, either side
+		// hosting. The MP design replicates the SEED and has every peer regenerate the terrain, so
+		// a Windows host and a Linux client must agree on the density field.
 		//
-		// So the plugin has a latent IWYU (include-what-you-use) debt: several public headers
-		// use engine types they never include. That is worth fixing on its own terms one day
-		// (UE has been moving away from implicit shared-PCH includes for years), but it is a
-		// real chunk of work and must not be attempted inside an unrelated diagnostic.
+		// They did not, by construction. UBT resolves FPSemanticsMode.Default differently per
+		// toolchain (verified in UE 5.7 source, not assumed):
+		//     VCToolChain.cs:1264   Default/Imprecise -> "/fp:fast"       (Windows/MSVC)
+		//     ClangToolChain.cs:712 Default/Precise   -> "-ffp-contract=off"  (Linux/Mac/Clang)
+		// So the same source was compiled under OPPOSITE float rules depending on who built it.
 		//
-		// The FP question it was meant to settle — whether identical source reassociates
-		// differently per translation unit under /fp:fast — is now answered inside
-		// VoxelForge.OpStack.MazeEquivalence instead, by compiling a verbatim copy of the
-		// Maze core into the TEST's translation unit and comparing all three. No build
-		// settings involved, and it cannot break anything.
+		// Precise resolves to "/fp:precise" on MSVC and "-ffp-contract=off" on Clang — both
+		// IEEE-754 compliant with no FMA contraction, so the two toolchains agree BY CONSTRUCTION
+		// rather than by luck. That is the fix for AUDIT-2026-07.md C9.
+		//
+		// COST: /fp:precise forbids the reassociation and contraction /fp:fast allowed, on a
+		// noise-heavy hot path. Expect a measurable perf regression and check it against
+		// ARCHITECTURE 8.10 — determinism across platforms is worth paying for, but the price
+		// should be known, not assumed.
+		//
+		// VERIFY: run VoxelForge.Determinism.CrossPlatformDigest on both platforms and compare the
+		// SHAPE digest (sign of density = the world) and the FIELD digest (bit-for-bit). Pin the
+		// values in that test once they agree, and it guards this forever after.
+		FPSemantics = FPSemanticsMode.Precise;
+
+		// ============================================================================
+		// ⚠️ HISTORY — why this took a second attempt (kept: it explains the includes below)
+		// ============================================================================
+		// Setting FPSemantics (or any property that alters this module's compile environment)
+		// makes VoxelForge ineligible for the ENGINE'S SHARED PCH — UBT can only share a
+		// precompiled header between modules whose compile environments match. The first attempt
+		// (2026-07-27) was therefore reverted: it failed with ~30 "undefined type" errors that
+		// were not FP-related at all — UMaterialInterface, USoundBase, TSubclassOf<AActor>,
+		// ENABLE_DRAW_DEBUG — i.e. includes this plugin had always taken from the shared PCH for
+		// free. That is a latent IWYU debt, not an FP problem.
+		//
+		// ⚠️ SO IF YOU SEE "undefined type" ERRORS HERE, THEY ARE IWYU, NOT FLOAT SETTINGS.
+		// The fix is to add the missing include or forward declaration to the header that needs
+		// it — never to revert FPSemantics, which is now load-bearing for cross-platform play.
+		// Headers fixed on 2026-07-27: VoxelBiomeDefinition, VoxelSettings, VoxelStrateDefinition,
+		// VoxelStrateTypes, VoxelContentManager, VoxelAtmosphereManager, VoxelDensityVolume.
+		// Expect a residual tail: the shared PCH hid these for years and only a build enumerates
+		// them all. VoxelDensityVolume's was the nasty one — ENABLE_DRAW_DEBUG is used in an #if,
+		// and an undefined macro there is silently 0 rather than an error.
 
 		// Modules we depend on:
 		// - Core: Basic types (TArray, FString, etc.)
