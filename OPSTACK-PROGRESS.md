@@ -211,3 +211,48 @@ edits to `VoxelDensityOp.h` and `VoxelGenerator.cpp` (include the primitives, de
 **Next single action:** write those files, then STOP.
 
 ---
+
+## 2026-07-27 — Phase 1 done (written, not built). Maze DOES decompose.
+
+**The Phase 1 question is answered.** `OPSTACK-PLAN §4`'s stop-trigger asked whether the
+source/modifier split falls out naturally from the existing code. It does — Maze becomes seven ops
+with no contortion, and three of them are already shared with other archetypes:
+
+```
+FConstantRockSource      ← also TunnelNetwork's and VerticalShafts' first line
+FLatticeCorridorSource   ← Maze only (role 1: what makes a maze a maze)
+FSdfRoughnessMod         ← also VerticalShafts, FloatingIslands
+FSdfCarveOp              ← the same six lines currently copied in three archetypes
+FOriginSpineOp ─┐
+FBoundarySealOp ├─ identical in all six density functions
+FPassageCarveOp ┘
+```
+
+No revert, no stop-trigger. Commit `4c53d3b`.
+
+**What is deliberately NOT wired:** `GetDensityAt` and `ClassifyTile` are untouched, so nothing in a
+running world can change. `OPSTACK-PLAN §4` Phase 1 step 3 ("GetDensityAt gains one branch") is
+**held back until the build is green** — wiring an uncompiled stack into the hot path would be
+exactly the stacked-unverified-work pattern `AUDIT §P3` documents. The port is validated instead by
+`VoxelForge.OpStack.MazeEquivalence`.
+
+**Two contract decisions taken (Jahni delegated them):** two-channel `Eval`, and INTERNAL sign
+convention inside the stack. Both are argued in the previous entry and in the commit message. The
+second **reverses** what `VoxelDensityOp.h` said on 2026-07-26 — if a later context finds MC-in-stack
+written anywhere, that text is stale.
+
+**One pre-existing hairline bug found and NOT silently patched:** at the inner edge of a seal band,
+`1 - Dist/Thickness` can round to exactly `0.0f`, so `SealFactor·BaseDensity` is 0, internal density
+lands on 0, and the mesher's `D >= IsoLevel` counts that point as AIR. Today's `ClassifyTile`
+excludes those z from column testing and can therefore emit `AllSolid` over them. It needs the
+archetype to produce air at exactly that z, so the window is hairline — but a false `AllSolid` is a
+hole. The **new** seal op keeps a 1-voxel safety margin before it forces. The old path is untouched;
+`VoxelForge.Determinism.ClassifyTileSoundness` would catch it if it ever fires.
+
+**UNVERIFIED:** everything, still. Nothing has been compiled.
+
+**Next single action: BUILD.** Then, in order: fix what the tests report → read
+`MazeEquivalence`'s two numbers (how many samples differ, and how many tiles the stack can prove
+uniform) → only then wire the stack into `GetDensityAt` behind a per-strate opt-in.
+
+---

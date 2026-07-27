@@ -106,7 +106,30 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 | `FVoxelOpContext` | Chunk-constant inputs. **Carries `LayoutVersion` by construction** so a new op cannot forget it (AUDIT C2). |
 | `IVoxelDensityOp` | `PrepareChunk` / `Eval` / `EffectOverBox` / `ClassifyBox` / `IsXYPure`. |
 | `IVoxelDensityOp::ClassifyBox` | ⚠️ **not source-only.** Forcing ops (the boundary seal inside its band) overwrite the input entirely, which pure direction cannot express. |
+| `FVoxelOpSample` | The state threaded through the stack: **two** channels, `Density` (INTERNAL convention, **positive = SOLID**, negated to MC once by the caller) and `Sdf` (standard SDF, negative = inside). ⚠️ `min()` therefore means opposite things on the two channels. |
 | `FVoxelBoxHypotheses` + `VF_ForceHypotheses` / `VF_FoldEffect` / `VF_FoldOp` | The fold that turns a stack into an `EVoxelTileClass`. Reproduces today's hand-written `ClassifyTile` line for line — the mapping is written out in the header. |
+
+### 3.2c Structural primitives — `Public/VoxelDensityPrimitives.h`
+`VF_ApplyOriginSpine` · `VF_ApplyBoundarySeal` · `VF_ApplyPassageCarving` — the three world
+invariants every archetype appends, **moved here 2026-07-27** so the generator and the operator
+stack share ONE copy. `VoxelGenerator.cpp` keeps same-named `static FORCEINLINE` forwarders so its
+~20 call sites are unchanged; bodies are byte-identical. Also `VoxelDensityReach::SpineBlend` /
+`PassageBlend`, the blend radii `ClassifyTile` currently hand-duplicates.
+**Convention: INTERNAL (positive = solid).**
+
+### 3.2d Operator stack — `Public/VoxelDensityOpStack.h` + `Private/VoxelDensityOpStack.cpp`
+⚠️ **Feeds nothing yet.** `GetDensityAt`/`ClassifyTile` are untouched; the archetype `switch` is
+still the only production path. Exercised solely by `VoxelForge.OpStack.MazeEquivalence`.
+
+| Symbol | Role | Notes |
+|--------|------|-------|
+| `FVoxelOpStack` | — | Ordered `TUniquePtr` list. `PrepareChunk` / `EvalInternal` / `EvalMC` / `ClassifyBox` (the fold, with an early-out when both hypotheses die). |
+| `FVoxelOpStack::AppendStructuralPost` | 4 | Appends spine → seal → passage **in that fixed order**. An author cannot omit or reorder them. The diff layer is NOT here yet — it still lives in `GetDensityAt` after the MC negate, with disturbances. |
+| `VoxelDensityOps::MakeConstantRockSource` | 1 | `Density = BaseDensity`. `ClassifyBox` → **AllSolid**, exact and free. Shared by TunnelNetwork, Maze, VerticalShafts and bedrock gaps. |
+| `VoxelDensityOps::MakeLatticeCorridorSource` | 1 | Maze corridors, SDF channel. Edge identity = `hash(lower node, axis)` ⇒ adjacent chunks cannot disagree (AUDIT §6.4's preferred pattern). Its `EffectOverBox` answers for the source+carve **pair** (Phase 1 simplification) so it must be told the downstream `ExtraReach`. |
+| `VoxelDensityOps::MakeSdfRoughnessMod` | 3 | Wall roughness in **SDF** space (Maze/Shafts/Islands variant). TunnelNetwork's density-space roughness is a **different op** — see OPSTACK-DECOMPOSITION §1. |
+| `VoxelDensityOps::MakeSdfCarve` | 2 | SDF → density carve. The same six lines currently copied in three archetypes. |
+| `VoxelDensityOps::BuildMazeStack` | — | The 7-op Maze stack. If this ever becomes one op, the refactor failed its own test (§2.5). |
 
 ### 3.3 Chunk identity
 `VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
@@ -344,6 +367,8 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | ″ | `VoxelForge.Determinism.LiveEditInvalidation` | AUDIT C2 regression: triple the heightfield params, `Initialize` again, require the density to MOVE. The edit does not move the strate, so only `LayoutVersion` changes. |
 | `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.Determinism.ClassifyTileSoundness` | Scans for a non-`Mixed` verdict, then brute-forces the exact mesher lattice (`g ∈ [-1, Cells+1]`). **A false verdict is an invisible, collisionless hole** — T1.d v1 was reverted for exactly this. Errors out rather than passing if it found nothing to check. |
 | `VoxelForgeDiffLayerTest.cpp` | `VoxelForge.Determinism.DiffLayerContention` | N readers running the worker call mix while the game thread writes and `Clear()`s. Survival + monotonic `ModsVersion`. |
+| `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.OpStack.BoxVerdictFold` | Pure-logic walk of the fold in `VoxelDensityOp.h`, case by case — including the seal-forces-AllSolid case that justifies `ClassifyBox` existing. Also the only `.cpp` that includes the op header, so the build actually sees it. |
+| `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
 
 ## 4. The density pipeline (most-edited hot path)
 
