@@ -727,3 +727,49 @@ both cases correct `OPSTACK-PLAN §2.6` / `AUDIT §C9` / the test's INFO text, s
 scaffolding, and resume step 3.
 
 ---
+
+## 2026-07-27 — ULP residue PARKED by decision. Phase 1 closed. Moving to step 3.
+
+**Jahni's call, and the right one:** pin it and move on. Six builds spent; the information stopped
+being worth the cost.
+
+**The final run did close it as far as it can be closed:**
+
+```
+my carve(verbatim's own SDF) == verbatim : 4874 / 5000
+stack SDF  !=  verbatim SDF              : 0      (counted directly, no condition)
+```
+
+SDFs identical **everywhere**, not just among mismatches. Two character-identical carve
+implementations, in the **same translation unit**, fed a **provably identical** input, differ by
+1 ULP on 126/5000. For deterministic code that is only possible if they compile to different
+instruction sequences — which is exactly what `/fp:fast` permits based on surrounding context, with
+no single isolable axis. **Hypothesis 3 was right about the mechanism and wrong about every clean
+variable I proposed for it**, which is why four carefully-designed isolation tests all came back
+negative.
+
+The one experiment that would settle it (`FPSemantics = Precise` on this module) is blocked behind
+the shared-PCH / IWYU debt. Worth clearing on its own terms; not worth clearing to chase 1 ULP.
+
+**Recorded as `AUDIT-2026-07.md §C10`** with the full refutation table, so the next context cannot
+re-derive the same five hypotheses at a build each. `OPSTACK-PLAN §2.6` and `§C9` corrected — my
+earlier `/fp:fast`-across-TUs explanation was wrong and is gone.
+
+**Scaffolding stripped** from `MazeEquivalence`: the verbatim copy, the three-way, the bisect, the
+inlining/constness experiments and the worst-point dump are all out. What remains is the permanent
+value: the equivalence check with ULP grading, the window-invariance check, and the box-verdict
+brute force.
+
+### Phase 1 is closed. What it proved
+
+- Maze decomposes into **seven** ops with no contortion; three are already shared with other archetypes.
+- The **SDF is bit-exact** — lattice, hashes, `Capsule` all correct.
+- **Zero isosurface crossings** — geometrically identical to the original.
+- **Window-invariant** across query order and worker threads.
+- **Every box verdict survives brute force**, and **23 of 60 tiles prove uniform** where
+  `ClassifyTile` proves zero for any cave archetype. That is the perf case, measured.
+
+**Next single action:** Phase 1 step 3 — wire the stack into `GetDensityAt` behind a per-strate
+opt-in, so a Maze strate can be A/B-switched in the editor and judged on a screenshot (§2.6's bar).
+
+---

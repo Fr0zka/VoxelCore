@@ -196,19 +196,20 @@ strategically:** if bit-identity were required, the cheap path would be to wrap 
 as one monolithic op — 8 opaque ops that don't compose, i.e. **the switch with extra steps and zero
 gain.** Releasing that constraint is what permits *real* decomposition into the primitives in §2.5.
 
-> **✅ CONFIRMED THE HARD WAY, 2026-07-27 — and it turns out bit-identity was never available anyway.**
-> The Maze port reproduced `GetMazeDensity` to within 1 ULP on 2.3% of samples, with **zero
-> isosurface crossings**. A four-stage bisect showed the residue surviving into code that is
-> character-for-character transcribed, which pointed at the toolchain: the plugin compiles with
-> **`/fp:fast`** (UnrealBuildTool's Windows default), which explicitly licenses the compiler to
-> reassociate the same expression differently per translation unit. So **no port of this kind can be
-> bit-identical, at any level of care.** See `AUDIT-2026-07.md §C9` — which also flags the part that
-> matters more than this plan does: the multiplayer model's "every peer regenerates identically"
-> holds only between bit-identical binaries.
+> **✅ CONFIRMED THE HARD WAY, 2026-07-27.** The Maze port reproduces `GetMazeDensity`'s **SDF bit for
+> bit**, and its final density to within 1-2 ULP on ~2% of samples, with **zero isosurface
+> crossings** — geometrically identical, not one triangle moved. The exact origin of that last
+> rounding was chased through five measured-and-refuted hypotheses and then **parked by decision**;
+> the full evidence is in `AUDIT-2026-07.md §C10`. **Read C10 before ever reopening it.**
 >
 > **The operational bar for every remaining archetype port, encoded in
 > `VoxelForge.OpStack.MazeEquivalence`:** hard-fail on any isosurface crossing (that moves geometry);
-> tolerate ULP-scale deltas (unavoidable); warn on anything larger (that is real port drift).
+> tolerate ULP-scale deltas (the accepted floor); warn on anything larger (that is real port drift).
+>
+> **And the rule that came out of it:** never run the archetype `switch` and the operator stack in the
+> same world, and never compare their outputs for equality — a half-migrated strate would seam. Not a
+> client-desync risk (the field is proven bit-pure within a binary); the cross-platform concern is
+> `§C9`.
 
 **The bar instead:** for each ported archetype, an authored op stack must reproduce the *character* of the
 old one — same scale, same navigability, same feel, recognisably the same kind of place. Judged by Jahni
