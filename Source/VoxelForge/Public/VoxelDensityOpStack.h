@@ -41,9 +41,29 @@ class UVoxelStrateManager;
  * thread_local inside Eval, exactly as every archetype function already does. Phase 3 (ops as shared
  * assets) will need a per-worker state object — flagged here so it is not a surprise.
  */
-class VOXELFORGE_API FVoxelOpStack
+class FVoxelOpStack
 {
 public:
+    // DÉPLAÇABLE, PAS COPIABLE — et c'est la bonne sémantique, pas un contournement de compilateur :
+    // une pile POSSÈDE ses opérateurs de façon unique. La copier voudrait dire cloner des opérateurs
+    // polymorphes, ce qui n'a pas de sens ici (une pile n'existe qu'une fois par strate).
+    //
+    // ⚠️ NOTE COMPILATEUR : ne PAS remettre `VOXELFORGE_API` sur la classe. Sous MSVC, dllexport sur
+    // une classe force l'instanciation de TOUS ses membres implicites, y compris l'opérateur
+    // d'affectation par copie — impossible à générer pour un `TArray<TUniquePtr<...>>`, d'où
+    // l'erreur C2280 « fonction supprimée ». L'export va sur la seule méthode hors-ligne.
+    //
+    // MOVE-ONLY, and that is the correct semantics rather than a compiler workaround: a stack
+    // uniquely OWNS its operators. Do NOT put VOXELFORGE_API back on the class — under MSVC,
+    // dllexport forces instantiation of every implicit member including copy-assignment, which
+    // cannot be generated for a TArray<TUniquePtr<...>> (error C2280). Export the out-of-line
+    // method instead.
+    FVoxelOpStack() = default;
+    FVoxelOpStack(FVoxelOpStack&&) = default;
+    FVoxelOpStack& operator=(FVoxelOpStack&&) = default;
+    FVoxelOpStack(const FVoxelOpStack&) = delete;
+    FVoxelOpStack& operator=(const FVoxelOpStack&) = delete;
+
     void Add(TUniquePtr<IVoxelDensityOp> Op) { Ops.Add(MoveTemp(Op)); }
 
     int32 Num() const { return Ops.Num(); }
@@ -105,9 +125,9 @@ public:
      *
      * @param StrateManager  peut être nullptr → pas de carve de passage (comme le fallback actuel).
      */
-    void AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
-                              float SealThickness, float BaseDensity, float SpineRadius,
-                              const UVoxelStrateManager* StrateManager);
+    VOXELFORGE_API void AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
+                                             float SealThickness, float BaseDensity, float SpineRadius,
+                                             const UVoxelStrateManager* StrateManager);
 
 private:
     TArray<TUniquePtr<IVoxelDensityOp>> Ops;
@@ -127,7 +147,7 @@ namespace VoxelDensityOps
      *  Écrit le canal SDF uniquement. Identité d'arête = hash(nœud inférieur, axe), donc deux
      *  chunks adjacents NE PEUVENT PAS être en désaccord : pas de cache de chunk, pas de région
      *  COLLECT, zéro risque de couture (AUDIT §6.4 — le motif à préférer). */
-     *  `ExtraReach` = tout ce qui peut ÉLARGIR la portée du couloir en aval (amplitude de rugosité +
+    /*  `ExtraReach` = tout ce qui peut eLARGIR la portée du couloir en aval (amplitude de rugosité
      *  rayon de blend du carve). La source répond pour la paire source+conversion dans
      *  `EffectOverBox` (voir la note « SIMPLIFICATION DE PHASE 1 » dans VoxelDensityOp.h), donc elle
      *  doit connaître cette marge, sinon sa réponse `Identity` serait un MENSONGE — c'est-à-dire un
