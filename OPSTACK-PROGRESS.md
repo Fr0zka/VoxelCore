@@ -1275,3 +1275,65 @@ members being double in UE5 (cast at every use); and the `ComputeSurfaceTerrainZ
 (bounded seed offsets) still open.
 
 ---
+
+## 2026-07-27 — height stack GREEN (bit-identical, both passes). Step 2a + a real bug in my own §3.1 work.
+
+```
+SurfaceWorld(defaults):            bit-identical across 20000 samples
+SurfaceWorld(all terrain ops on):  bit-identical across 20000 samples
+MaxDisplacement: claims 16.300, worst observed 4.441 (27% of claim)
+```
+
+**The second op family was the right call** — height space decomposes as cleanly as density did,
+including with all four F20 terrain ops on. `MaxDisplacement` is loose (27% used) because it sums
+each op's independent maximum and they never peak at the same XY. **Left loose deliberately:** a
+loose bound only costs CPU when the heightfield eventually gets a `ClassifyBox`; a tight-but-wrong
+one is a hole in the world.
+
+### ⚠️ `FSlabVoidSource::IsXYPure()` was `true`, and that was WRONG
+
+Found while writing `FSurfaceColumnSource` and having to decide the same flag.
+
+The contract is *"**`Eval`** does not depend on Z"*. `FSlabVoidSource::Eval` computes
+`min(Z - floor, ceil - Z)` — Z-dependent in the most direct way possible. **§3.1 made the SURFACES
+XY-pure; the DENSITY never was and cannot be** — it is a distance to a surface. I conflated the two
+while writing the very operator that quotes the warning against doing so.
+
+**Latent only because nothing reads the flag yet** — and step 2b is exactly where it would have gone
+live: a generic T1.a column cache keyed on (XY box, StrateKey, Seed) with **no ChunkZ** would have
+shared one density value down the entire vertical chunk stack. `AUDIT §6.3` says this corrupts every
+chunk silently and that `ValidateDeterminism` would not catch it, because it samples along an X
+boundary. Fixed, with the distinction written at the site.
+
+**This is the clearest argument yet for the height-space split:** the thing that is XY-pure is the
+HEIGHT, and in `VoxelHeightOp.h` it lives in a type with no Z to get wrong. The bug is unrepresentable
+there.
+
+### Step 2a — the bridge into density space
+
+- `FSkyCapHeightSource` — the ceiling is an **altitude**, so it belongs in height space, not in
+  density space as `§5` had it. Same category slip as the terrain ops; the subtraction happens later,
+  in the combine. It gets tested window-invariance and type-enforced XY purity for free.
+- `FSurfaceColumnSource` — consumes both height stacks, produces
+  `Density = max(TerrainZ - Z, Z - CeilSurf)`. `IsXYPure() = false`, correctly this time.
+- `BuildSurfaceStack` — source + 3 structural. **No per-column memo inside the op, on purpose:**
+  T1.a already exists one level up in `GetDensityAt`, and a second cache key is a second thing to get
+  wrong in exactly the way described above. Step 2b reuses the existing cache rather than inventing a
+  second one.
+
+**What step 2a does NOT cover, and the test now says so at the top:** the **overhang** (found while
+reading: `GetSurfaceDensity` passes `OverhangAmp = 0`, so it computes none — the only reference is
+the *cached* path, `ComputeSurfaceColumn`) and **biome blending** (weight 0 here; it is the `Mask`
+combiner and `§5`'s Phase 3 prototype). **Do not wire SurfaceWorld into a world with biomes or
+overhangs until 2b**, because nothing currently in the tests would say it is wrong.
+
+**UNVERIFIED:** step 2a is not compiled. Likely spots: `FVoxelHeightStack` as a member of
+`FSurfaceColumnSource` (move-only member ⇒ the enclosing op is move-only too, which is fine since it
+lives behind `TUniquePtr`); the new `VoxelHeightOp.h` include in `VoxelDensityOpStack.cpp`; and
+`Gen->GetSurfaceDensity` taking two param refs plus a weight.
+
+**Next single action:** build. Then step 2b — the overhang op (per-column gate + per-voxel union,
+referenced against the cached path), biome blending as the `Mask` combiner, and the wiring that
+reuses `GSurfColCache`. `§C1` still open.
+
+---

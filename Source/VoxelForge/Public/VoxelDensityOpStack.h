@@ -193,6 +193,24 @@ namespace VoxelDensityOps
      *  `FillOnly` quand une colonne atteint la boîte, `Identity` (le cas courant) sinon. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed);
 
+    /** Rôle 1 — le pont entre les deux espaces : consomme les piles de HAUTEUR (sol + voûte,
+     *  `VoxelHeightOp.h`) et en fait une densité. `IsXYPure()` est **false** — les hauteurs sont
+     *  pures en XY, la densité est une distance à celles-ci et ne peut pas l'être. */
+    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSurfaceColumnSource(const FSurfaceGenerationParams& P,
+                                                                       int32 Seed);
+
+    /**
+     * SurfaceWorld — ⚠️ PAS ENCORE COMPLET, et c'est délibéré. Équivaut exactement à
+     * `GetSurfaceDensity`, c.-à-d. la version **sans overhang** et **sans mélange de biomes** :
+     *   • l'overhang a besoin d'une donnée par colonne que `GetSurfaceDensity` ne calcule pas
+     *     (il passe `OverhangAmp = 0`) — sa référence est le chemin caché ;
+     *   • le mélange de biomes est le combiner `Mask`, prototype de la Phase 3 (§5).
+     * Les deux arrivent à l'étape 2b. Ne pas brancher dans un monde à biomes avant.
+     */
+    VOXELFORGE_API void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
+                                          int32 Seed, float SpineRadius,
+                                          const UVoxelStrateManager* StrateManager);
+
     /**
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
      *   SlabVoidSource → GridColumnMod → [structural post ×3]

@@ -12,10 +12,24 @@
 // idée** — la même méthode que la Phase 1 a appliquée à la densité : décomposer, puis MESURER
 // contre l'original, avant de construire par-dessus.
 //
-// ⚠️ Ce test ne touche PAS au chemin densité. `FHeightfieldSource` / `FSkyCapSource` /
-// `FOverhangShelfMod` (OPSTACK-DECOMPOSITION §5) sont l'étape SUIVANTE, délibérément séparée : si
-// l'espace-hauteur ne se décomposait pas proprement, on l'apprendrait ici, pour le prix d'un test,
-// et pas après avoir écrit l'adaptateur, le cache de colonne et le branchement.
+// ⚠️ CE QUE CE TEST COUVRE, ET SURTOUT CE QU'IL NE COUVRE PAS
+//   ✅ la pile de HAUTEUR du sol, contre `ComputeSurfaceTerrainZ` (2 passes : défauts, puis tous
+//      les ops F20 allumés — c'est la seconde qui porte le test) ;
+//   ✅ la pile de HAUTEUR de la voûte + le pont vers l'espace densité (`FSurfaceColumnSource`),
+//      contre `GetSurfaceDensity` ;
+//   ❌ **l'OVERHANG** — `GetSurfaceDensity` passe `OverhangAmp = 0`, donc il n'en calcule aucun.
+//      Sa seule référence est le chemin CACHÉ (`ComputeSurfaceColumn`), qui résout le gate et la
+//      direction amont par colonne ;
+//   ❌ **le MÉLANGE DE BIOMES** — ici `ParamsD == ParamsN`, poids 0. C'est le combiner `Mask`, et
+//      `§5` en fait le prototype de la Phase 3 : ça mérite son étape.
+//
+// Les deux manques sont l'étape 2b. **Ne pas brancher SurfaceWorld dans un monde à biomes ou à
+// overhang avant**, parce que rien ici ne dirait que c'est faux.
+//
+// COVERED: the ground height stack vs ComputeSurfaceTerrainZ, and the ceiling stack + the bridge
+// into density space vs GetSurfaceDensity. NOT COVERED: the overhang (GetSurfaceDensity passes
+// OverhangAmp = 0, so only the cached path computes it) and biome blending (weight 0 here). Both
+// are step 2b — do not wire SurfaceWorld into a world with biomes or overhangs before then.
 //
 // LA BARRE : **bit à bit.** Depuis `FPSemantics = Precise` (AUDIT §C9/§C10), Maze et Slab sont
 // bit-identiques à leur original ; il n'y a plus de « plancher ULP » à tolérer. Un écart ici est
@@ -31,6 +45,7 @@
 
 #include "VoxelForgeTestFixture.h"
 #include "VoxelHeightOp.h"
+#include "VoxelDensityOpStack.h"
 
 #include <atomic>
 
@@ -276,6 +291,81 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
     FSurfaceGenerationParams AllOps = Defaults;
     EnableAllTerrainOps(AllOps);
     RunForParams(AllOps, TEXT("SurfaceWorld(all terrain ops on)"), 64);
+
+    //=========================================================================
+    // ÉTAPE 2a — LE PONT VERS L'ESPACE DENSITÉ
+    //=========================================================================
+    // `FSurfaceColumnSource` consomme les DEUX piles de hauteur (sol + voûte) et rend une densité.
+    // La référence est `GetSurfaceDensity`, qui est exactement la variante **sans overhang**
+    // (il passe `OverhangAmp = 0`) et **sans biomes** (ParamsD == ParamsN, poids 0) — donc la
+    // comparaison est nette plutôt qu'approximative.
+    //
+    // ⚠️ Ce que ce bloc NE teste PAS, et qu'il ne faut pas croire testé : l'overhang et le mélange
+    // de biomes. Tous deux arrivent à l'étape 2b, avec le chemin CACHÉ pour référence — c'est le
+    // seul qui les calcule.
+    {
+        const FSurfaceGenerationParams& P = AllOps;
+
+        FVoxelOpStack Stack;
+        VoxelDensityOps::BuildSurfaceStack(Stack, P, World.Settings->Seed,
+                                           Gen->OriginSpineRadius, World.StrateManager.Get());
+
+        // 1 source + 3 structurels. Pas encore d'overhang : voir l'avertissement ci-dessus.
+        TestEqual(TEXT("the surface density stack is source + 3 structural (no overhang yet)"),
+                  Stack.Num(), 4);
+
+        FVoxelOpContext Ctx;
+        Ctx.Seed               = (uint32)World.Settings->Seed;
+        Ctx.LayoutVersion      = World.StrateManager->GetLayoutVersion();
+        Ctx.StrateTopWorldZ    = P.StrateTopWorldZ;
+        Ctx.StrateBottomWorldZ = P.StrateBottomWorldZ;
+        Stack.PrepareChunk(Ctx);
+
+        int32 NumDiff = 0, NumSideDisagree = 0, WorstIdx = -1;
+        float WorstDelta = 0.0f;
+
+        FRandomStream Rng(5150);
+        for (int32 i = 0; i < NumHeightSamples; ++i)
+        {
+            const float X = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
+            const float Y = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
+            const float Z = (float)Rng.RandRange(BottomVoxelZ, TopVoxelZ);
+
+            // ParamsD == ParamsN, poids 0 ⇒ une seule évaluation, pas de biomes.
+            const float Old = Gen->GetSurfaceDensity(X, Y, Z, P, P, 0.0f);
+            const float New = Stack.EvalMC(X, Y, Z);
+
+            if (!BitEqual(Old, New))
+            {
+                ++NumDiff;
+                const float Delta = FMath::Abs(Old - New);
+                if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
+            }
+            if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
+        }
+
+        if (NumDiff == 0)
+        {
+            AddInfo(FString::Printf(
+                TEXT("SurfaceWorld density stack: bit-identical to GetSurfaceDensity across %d ")
+                TEXT("samples. The height stacks feed the density space correctly."),
+                NumHeightSamples));
+        }
+        else
+        {
+            AddError(FString::Printf(
+                TEXT("SurfaceWorld density stack: %d of %d samples differ (largest |delta| %.9g); ")
+                TEXT("%d cross the isosurface. Since /fp:precise the bar is bit-identity, so this ")
+                TEXT("is a real port error. Check, in order: the combine (Density = max(TerrainZ - Z, ")
+                TEXT("Z - CeilSurf)), the sky-cap transcription (warp offsets 0.71/2.3/3.3 and ")
+                TEXT("6.1/0.19/4.7, the abs() on roughness, the ridge *0.5+0.5), and the order of ")
+                TEXT("the structural post ops."),
+                NumDiff, NumHeightSamples, WorstDelta, NumSideDisagree));
+        }
+
+        TestEqual(TEXT("surface: no sample lands on the opposite side of the isosurface"),
+                  NumSideDisagree, 0);
+    }
 
     return true;
 }

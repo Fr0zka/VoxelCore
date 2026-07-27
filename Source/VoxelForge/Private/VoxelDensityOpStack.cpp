@@ -23,6 +23,7 @@
 #include "VoxelDensityPrimitives.h"   // VF_ApplyOriginSpine / Seal / PassageCarving
 #include "VoxelCaveMorphology.h"      // VoxelSDF::Capsule, VoxelHash
 #include "VoxelGenerator.h"           // VoxelGenLOD::Eff
+#include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
 #include "VoxelNoise.h"               // VoxelNoise::FBM
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
 #include "VoxelTypes.h"               // SmoothStep01, VOXEL_NOISE_SCALE
@@ -263,10 +264,29 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
-        // ⚠️ LE point de §3.1. Faux avant le retrait du terme en Z ; le déclarer alors aurait
-        // corrompu silencieusement toute la pile verticale de chunks (voir l'avertissement sur
-        // `IsXYPure` dans VoxelDensityOp.h).
-        bool IsXYPure() const override { return true; }
+        // ⚠️⚠️ CORRIGÉ 2026-07-27 : c'était `true`, ET C'ÉTAIT FAUX.
+        //
+        // Le contrat de `IsXYPure` est « **`Eval`** ne dépend pas de Z » — pas « les surfaces ne
+        // dépendent pas de Z ». Or `Eval` calcule `min(Z - sol, plafond - Z)` : il dépend de Z de
+        // la façon la plus directe qui soit. §3.1 a rendu les SURFACES pures en XY ; la DENSITÉ,
+        // elle, ne l'a jamais été et ne peut pas l'être — c'est une distance à une surface.
+        //
+        // Latent seulement parce que personne ne lit encore ce drapeau. Le jour où le cache de
+        // colonnes T1.a devient générique (l'étape suivante), un `true` ici ferait partager UNE
+        // valeur de densité sur TOUTE la pile verticale de chunks — un monde silencieusement faux,
+        // que `ValidateDeterminism` ne verrait pas parce qu'il échantillonne le long d'un bord X.
+        // C'est exactement le piège que l'avertissement de `VoxelDensityOp.h` décrit, et je suis
+        // tombé dedans en écrivant l'opérateur qui le cite.
+        //
+        // ⚠️ FIXED: this said `true` and was WRONG. The contract is "**Eval** does not depend on Z",
+        // and Eval computes min(Z - floor, ceil - Z). §3.1 made the SURFACES XY-pure; the DENSITY
+        // never was and cannot be — it is a distance to a surface. Latent only because nothing reads
+        // the flag yet; a generic T1.a column cache would have shared one density down the whole
+        // vertical chunk stack.
+        //
+        // C'est précisément cette distinction qui justifie l'espace-hauteur (`VoxelHeightOp.h`) :
+        // ce qui est pur en XY, ce sont les HAUTEURS, et elles y sont dans un type qui n'a pas de Z.
+        bool IsXYPure() const override { return false; }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -365,6 +385,68 @@ namespace
         float FloorRoughness, FloorFrequency;
         float CeilRoughness,  CeilFrequency;
         float FloorAmp = 0.0f, CeilAmp = 0.0f;
+    };
+
+    //=========================================================================
+    // RÔLE 1 — SOURCE : COLONNE DE SURFACE / SURFACE COLUMN  (SurfaceWorld)
+    //=========================================================================
+    // Le pont entre les deux espaces : consomme DEUX piles de hauteur (sol et voûte) et en fait une
+    // densité. C'est tout le combine de `SurfaceDensityFromColumn` :
+    //
+    //     Density = TerrainZ - Z                 ← solide sous le sol
+    //     Density = max(Density, Z - CeilSurf)   ← solide au-dessus de la voûte
+    //
+    // ⚠️ `IsXYPure()` est **false**, et la distinction est LE point de tout ce découpage : les
+    // HAUTEURS sont pures en XY (elles vivent dans `VoxelHeightOp.h`, un type sans Z), la DENSITÉ
+    // ne l'est pas et ne peut pas l'être — c'est une distance à une surface. Confondre les deux est
+    // exactement le bug que `FSlabVoidSource` portait jusqu'à aujourd'hui.
+    //
+    // The bridge between the two spaces: consumes two HEIGHT stacks and turns them into density.
+    // IsXYPure is false — the heights are XY-pure, the density is a distance to them and never can be.
+    class FSurfaceColumnSource final : public IVoxelDensityOp
+    {
+    public:
+        FSurfaceColumnSource(const FSurfaceGenerationParams& P, int32 Seed)
+        {
+            VoxelHeightOps::BuildSurfaceHeightStack(TerrainStack, P, Seed);
+            VoxelHeightOps::BuildSurfaceCeilingStack(CeilingStack, P, Seed);
+        }
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+        bool IsXYPure() const override { return false; }   // voir le bloc ci-dessus
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            // ⚠️ PAS de mémo par colonne ICI, délibérément. Le cache T1.a existe déjà UN NIVEAU
+            // AU-DESSUS (`GSurfColCache` dans `GetDensityAt`), clé sur (boîte XY, StrateKey, Seed).
+            // En rajouter un ici demanderait une seconde clé de cache à tenir juste — et une clé de
+            // cache fausse dans un op partagé sur toute la pile verticale est précisément le mode de
+            // défaillance qu'`AUDIT §6.3` décrit. Le branchement (étape 2b) réutilise le cache
+            // existant plutôt que d'en inventer un second.
+            // No per-column memo here on purpose: T1.a already exists one level up, and a second
+            // cache key is a second thing to get wrong.
+            const float TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
+            const float CeilSurf = CeilingStack.EvalHeight(WorldX, WorldY);
+
+            float Density = TerrainZ - WorldZ;
+            Density = FMath::Max(Density, WorldZ - CeilSurf);
+            InOut.Density = Density;   // Replace : interne, positif = solide
+        }
+
+        // Mixed, honnêtement. Un verdict exact demanderait de borner le heightfield structurel sur
+        // la boîte XY (continents + montagnes + détail sous un domain-warp) — faisable, mais c'est
+        // une vraie borne à dériver, pas une constante à lire comme pour la dalle. Rendre Mixed ne
+        // coûte que du CPU ; rendre faux serait un trou. À faire quand `MaxDisplacement` saura
+        // répondre pour la source structurelle.
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return EVoxelOpEffect::Both;
+        }
+
+    private:
+        FVoxelHeightStack TerrainStack;
+        FVoxelHeightStack CeilingStack;
     };
 
     //=========================================================================
@@ -784,6 +866,30 @@ namespace VoxelDensityOps
     TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed)
     {
         return MakeUnique<FGridColumnMod>(P, Seed);
+    }
+
+    TUniquePtr<IVoxelDensityOp> MakeSurfaceColumnSource(const FSurfaceGenerationParams& P, int32 Seed)
+    {
+        return MakeUnique<FSurfaceColumnSource>(P, Seed);
+    }
+
+    void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
+                           int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+    {
+        // ⚠️ PAS ENCORE L'ARCHÉTYPE COMPLET, et il faut le savoir avant de brancher :
+        //   • pas d'OVERHANG — `FOverhangShelfMod`, le seul op vraiment 3D d'ici, a besoin d'une
+        //     donnée PAR COLONNE (amp + direction amont) que `GetSurfaceDensity` ne calcule même
+        //     pas (il passe `OverhangAmp = 0`). Sa référence est le chemin caché, pas celui-ci ;
+        //   • pas de MÉLANGE DE BIOMES — le sol est évalué pour le biome dominant puis lerpé vers
+        //     le voisin. En termes de pile c'est le combiner `Mask`, et c'est le prototype de la
+        //     Phase 3 (§5) : ça mérite sa propre étape, pas un paramètre de plus ici.
+        //
+        // Donc cette pile == `GetSurfaceDensity` exactement, qui est la version SANS overhang et
+        // SANS biomes. C'est ce que le test compare, et c'est pour ça que la comparaison est nette.
+        OutStack.Add(MakeSurfaceColumnSource(P, Seed));
+
+        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
     }
 
     void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,

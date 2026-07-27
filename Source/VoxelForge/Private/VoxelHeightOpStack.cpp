@@ -277,12 +277,100 @@ namespace
     };
 }
 
+    //=========================================================================
+    // SOURCE — LE CIEL / SKY CAP  (c'est une ALTITUDE, donc c'est un op de hauteur)
+    //=========================================================================
+    // `ComputeSurfaceCeiling` rend un Z, exactement comme le terrain. `OPSTACK-DECOMPOSITION §5` le
+    // range en `FSkyCapSource` côté DENSITÉ (« Subtract »), mais c'est le même glissement que pour
+    // les ops de terrain : ce que la fonction produit est une hauteur, et la soustraction n'arrive
+    // qu'après, dans le combine. Le mettre ici lui donne gratuitement l'invariance de fenêtre
+    // testée, la pureté XY garantie par le type, et le cache de colonne.
+    // The sky cap returns a Z, so it belongs in height space; the subtraction happens later, in the
+    // density-side combine.
+    class FSkyCapHeightSource final : public IVoxelHeightOp
+    {
+    public:
+        FSkyCapHeightSource(const FSurfaceGenerationParams& InP, int32 InSeed)
+            : P(InP), SeedF((float)InSeed) {}
+
+        void Eval(float WorldX, float WorldY, FVoxelHeightSample& InOut) const override
+        {
+            const float H = P.StrateTopWorldZ - P.StrateBottomWorldZ;
+            float CeilZ = P.StrateBottomWorldZ + H * P.CeilingRelative;
+
+            // Domain-warp des coords larges/ridge (miroir du HeightWarp du sol). Les bosses fines
+            // restent sur le vrai XY pour rester nettes et décorrélées. 0 ⇒ pas de warp.
+            float QX = WorldX, QY = WorldY;
+            if (P.CeilingWarpStrength > 0.0f)
+            {
+                const float WF = P.CeilingWarpFrequency;
+                const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + SeedF * 0.71f, WorldY * WF + 2.3f,  SeedF * 3.3f));
+                const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + SeedF * 0.19f, SeedF * 4.7f));
+                QX += wx * VOXEL_NOISE_SCALE * P.CeilingWarpStrength;
+                QY += wy * VOXEL_NOISE_SCALE * P.CeilingWarpStrength;
+            }
+
+            // Gonflement large SIGNÉ : monte/descend toute la voûte.
+            if (P.CeilingUndulation > 0.0f)
+            {
+                const float Swell = HFractalNoise3D(FVector(
+                    QX * P.CeilingUndulationFrequency + SeedF * 1.9f,
+                    QY * P.CeilingUndulationFrequency + 13.0f,
+                    SeedF * 0.5f), 3);   // [-1,1]
+                CeilZ += Swell * VOXEL_NOISE_SCALE * P.CeilingUndulation;
+            }
+
+            // Pendage vers le BAS uniquement : tout est >= 0, donc rien ne perce vers le haut dans
+            // le seal. Bosses fines + lames ridgées s'additionnent.
+            float Hang = 0.0f;
+            if (P.CeilingRoughness > 0.0f)
+            {
+                Hang += FMath::Abs(HFractalNoise3D(FVector(
+                    WorldX * P.CeilingRoughnessFrequency + 5.0f,
+                    WorldY * P.CeilingRoughnessFrequency + 6.0f,
+                    SeedF * 2.1f), 3)) * VOXEL_NOISE_SCALE * P.CeilingRoughness;
+            }
+            if (P.CeilingRidgeStrength > 0.0f)
+            {
+                float Ridge = HRidgedNoise3D(FVector(
+                    QX * P.CeilingRidgeFrequency + 31.0f,
+                    QY * P.CeilingRidgeFrequency + 47.0f,
+                    SeedF * 1.1f), 4);            // [-1,1]
+                Ridge = Ridge * 0.5f + 0.5f;      // [0,1] lignes de crête pendantes
+                Hang += Ridge * P.CeilingRidgeStrength;
+            }
+
+            InOut.Height = CeilZ - Hang;   // Replace : racine de sa propre pile
+            // Relief laissé intact : le ciel n'en produit pas et personne ne le lui demande.
+        }
+
+        float MaxDisplacement() const override { return FLT_MAX; }   // source, pas modificateur
+
+    private:
+        FSurfaceGenerationParams P;
+        float SeedF;
+    };
+}
+
 //=============================================================================
 // FABRIQUES / FACTORIES
 //=============================================================================
 
 namespace VoxelHeightOps
 {
+    TUniquePtr<IVoxelHeightOp> MakeSkyCapHeightSource(const FSurfaceGenerationParams& P, int32 Seed)
+    {
+        return MakeUnique<FSkyCapHeightSource>(P, Seed);
+    }
+
+    void BuildSurfaceCeilingStack(FVoxelHeightStack& OutStack, const FSurfaceGenerationParams& P, int32 Seed)
+    {
+        // Un seul op aujourd'hui — et c'est une information, pas un manque : le plafond n'a pas
+        // d'équivalent des quatre modificateurs du sol. Le jour où on veut des terrasses au
+        // plafond, on ajoute la ligne ; c'est exactement le genre de composition que le refactor
+        // existe pour rendre possible.
+        OutStack.Add(MakeSkyCapHeightSource(P, Seed));
+    }
     TUniquePtr<IVoxelHeightOp> MakeStructuralHeightSource(const FSurfaceGenerationParams& P, int32 Seed,
                                                           const IVoxelHeightOp** OutSource)
     {

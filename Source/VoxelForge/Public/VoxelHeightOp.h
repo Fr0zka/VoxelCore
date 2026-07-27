@@ -199,4 +199,14 @@ namespace VoxelHeightOps
      */
     VOXELFORGE_API void BuildSurfaceHeightStack(FVoxelHeightStack& OutStack,
                                                 const FSurfaceGenerationParams& P, int32 Seed);
+
+    /** La voûte : warp + gonflement signé + pendage vers le bas uniquement. C'est une ALTITUDE,
+     *  donc un op de hauteur — la soustraction n'arrive qu'au combine côté densité. */
+    VOXELFORGE_API TUniquePtr<IVoxelHeightOp> MakeSkyCapHeightSource(const FSurfaceGenerationParams& P,
+                                                                     int32 Seed);
+
+    /** La pile de plafond de SurfaceWorld. Un seul op aujourd'hui, et c'est une information : le
+     *  plafond n'a pas d'équivalent des quatre modificateurs du sol. */
+    VOXELFORGE_API void BuildSurfaceCeilingStack(FVoxelHeightStack& OutStack,
+                                                 const FSurfaceGenerationParams& P, int32 Seed);
 }
