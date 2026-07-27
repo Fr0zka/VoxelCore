@@ -451,3 +451,43 @@ in the SDF (lattice edges or `VoxelSDF::Capsule`) or in `SmoothStep01`.
 small unexplained numeric difference, and those do not get smaller when you build on them.
 
 ---
+
+## 2026-07-27 — CORRECTION: hypothesis 3 was never tested. My error, not Jahni's.
+
+**`FPSemantics = FPSemanticsMode.Precise` was set in `Source/VoxelM/VoxelM.Build.cs` — the GAME
+module.** `FPSemantics` is a `ModuleRules` property, i.e. **per module**. Every line of density code
+lives in the `VoxelForge` module, which was still compiling `/fp:fast`. The float model never
+changed for the code under test.
+
+**So the previous entry is wrong and is retracted:** `/fp:fast` is NOT eliminated. The run that
+"reproduced the residue under precise semantics" reproduced it under *fast* semantics, which is
+exactly what it should have done and proves nothing.
+
+**The failure mode, stated plainly because it is the third time in one day:** I accepted "it's with
+fpsemantics precise" as fact and reasoned a confident conclusion from it — one paragraph after
+writing that the lesson was to instrument rather than assume. The check took one `grep` and I did it
+only after Jahni suggested it. **Verify the premise before reasoning from it, especially when the
+premise is what makes the conclusion interesting.**
+
+**Consequently:** the notes in the previous entry saying `AUDIT §C9` and `OPSTACK-PLAN §2.6` are
+falsified are themselves withdrawn. Those documents' `/fp:fast` explanation is back to *plausible
+and now genuinely about to be tested*. Nothing in them needs changing yet.
+
+**What changed:** `FPSemantics = FPSemanticsMode.Precise` added to **`VoxelForge.Build.cs`**, clearly
+marked as a temporary experiment with removal instructions and a read-the-result guide.
+
+`VoxelM.Build.cs` can keep or drop its copy — it is harmless either way and irrelevant to this test.
+
+**One build now answers everything**, because the WORST-POINT DUMP instrumentation is already in:
+
+| Result | Meaning | Next |
+|---|---|---|
+| 454 → **0** | the FP model WAS the cause | remove the line; decide separately whether precise is worth its cost on the hot path (needs a profile) |
+| 454 → **454** | real logic difference | remove the line; read the dump — identical recovered carve ⇒ fault after the conversion, differing carve ⇒ fault in the SDF or `SmoothStep01` |
+
+**UNVERIFIED:** everything about this experiment.
+
+**Next single action:** rebuild, re-run `MazeEquivalence`, read the two numbers. Phase 1 step 3 stays
+paused.
+
+---
