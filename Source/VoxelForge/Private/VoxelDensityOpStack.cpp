@@ -470,6 +470,19 @@ namespace
             // would falsely hit the pristine slot at (0,0). PrepareChunk upgrades this to the shared
             // strate key; without it we simply cache per instance. Degrade, never lie.
             ColumnKey = InstanceId;
+
+            // Empreinte des params qui déterminent une colonne. `FSurfaceGenerationParams` est du
+            // POD pur (que des float/int/bool, vérifié : aucun TArray, FString ni pointeur), donc
+            // un CRC mémoire ne peut pas produire de FAUX POSITIF — au pire du padding non
+            // initialisé donne un faux NÉGATIF, c'est-à-dire un recalcul. Se tromper du côté qui
+            // coûte du CPU plutôt que du côté qui rend une mauvaise colonne.
+            // Pure POD (verified: no TArray/FString/pointer), so a memory CRC cannot produce a false
+            // HIT; at worst padding causes a false miss, i.e. a recompute. Err toward CPU, not lies.
+            ParamsFingerprint = FCrc::MemCrc32(&P, sizeof(P));
+            for (const FSurfaceGenerationParams& BP : BiomeParams)
+            {
+                ParamsFingerprint = VoxelHash::Mix(ParamsFingerprint ^ FCrc::MemCrc32(&BP, sizeof(BP)));
+            }
         }
 
         /** Sans biomes — délègue, pour qu'il n'existe qu'UN corps de construction et UN compteur
@@ -648,8 +661,27 @@ namespace
             const uint32 A = (uint32)FMath::RoundToInt(Ctx.StrateBottomWorldZ);
             const uint32 B = Ctx.LayoutVersion;
             const uint32 C = Ctx.Seed;
+
+            // ⚠️ `ParamsFingerprint` EST OBLIGATOIRE, et son absence a été un vrai bug — attrapé par
+            // `SurfaceHeightEquivalence` au build suivant (69/20000 écarts, 1 traversée d'iso).
+            //
+            // Sans lui, la clé ne contenait que (strate, layout, seed). Deux piles de la MÊME strate
+            // avec des params DIFFÉRENTS obtenaient donc la même clé et se partageaient les colonnes :
+            // la seconde lisait les colonnes de la première, calculées avec `OverhangAmp = 0`, et
+            // l'overhang disparaissait purement et simplement.
+            //
+            // ET CE N'EST PAS QU'UN ARTEFACT DE TEST : c'est exactement la faiblesse que le code
+            // documente déjà pour `GSurfColCache` (VoxelGenerator.cpp, note AUDIT §C2 étendue) —
+            // « une édition à chaud qui change les params SANS déplacer la strate laisse la clé
+            // identique et sert des colonnes périmées ». En production `LayoutVersion` bouge à chaque
+            // `RebuildStrates`, ce qui masque le trou ; ma clé en avait hérité, et le test l'a trouvé
+            // tout de suite. Empreinte incluse ⇒ le trou est fermé ici, pas seulement masqué.
+            //
+            // The fingerprint is REQUIRED: without it two stacks of the same strate with different
+            // params shared columns, and the overhang silently vanished. Same weakness the codebase
+            // already documents for GSurfColCache, which LayoutVersion merely masks.
             ColumnKey = ((uint64)VoxelHash::Mix(A ^ VoxelHash::Mix(B)) << 32)
-                      |  (uint64)VoxelHash::Mix(C ^ VoxelHash::Mix(A));
+                      |  (uint64)VoxelHash::Mix(C ^ VoxelHash::Mix(A) ^ ParamsFingerprint);
             if (ColumnKey == 0) { ColumnKey = 1; }   // 0 = « jamais préparé »
         }
 
@@ -692,7 +724,8 @@ namespace
         TArray<TUniquePtr<IVoxelHeightOp>>   PerBiomeStructural; // pente d'overhang par biome
 
         uint64 InstanceId = 0;   // unique, jamais recyclée — le repli quand PrepareChunk n'a pas eu lieu
-        uint64 ColumnKey  = 0;   // l'identité PARTAGÉE (strate + layout + seed) : voir PrepareChunk
+        uint64 ColumnKey  = 0;   // l'identité PARTAGÉE (strate + layout + seed + params) : voir PrepareChunk
+        uint32 ParamsFingerprint = 0;   // sans lui, deux piles de la même strate se volaient leurs colonnes
     };
 
     //=========================================================================

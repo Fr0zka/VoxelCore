@@ -1723,3 +1723,54 @@ until the transition is complete** (Jahni's call); the open item is that the op 
 virtual dispatch and the hashed column lookup as the remaining suspects.
 
 ---
+
+## 2026-07-27 — VerticalShafts bit-identical. And the perf fix had introduced a REAL bug.
+
+**`VerticalShaftEquivalence`: bit-identical over 20 000 samples, 966 inside a shaft.** So the
+cylinders, connectors, roughness, carve and ledges all ran, and **operator reuse across archetypes is
+now measured rather than intended** — three of the five ops are Maze's, unchanged.
+
+### ⚠️ `SurfaceHeightEquivalence` FAILED, and it was my own perf fix
+
+```
+Overhang: 69 of 20000 samples differ (largest |delta| 5.84); 1 crosses the isosurface
+```
+
+**Cause: the `ColumnKey` I introduced in `f3faa3b` did not include the params.** It was
+`hash(StrateBottomWorldZ, LayoutVersion, Seed)`. The test builds two stacks in the **same** strate,
+same layout version, same seed, differing only in overhang settings — identical keys, so the second
+stack read the first's cached columns, which had been computed with `OverhangAmp = 0`. The overhang
+silently vanished wherever a column was already cached.
+
+**This is not a test artefact.** It is precisely the weakness the codebase already documents for
+`GSurfColCache` (the extended `AUDIT §C2` note in `VoxelGenerator.cpp`): *"StrateKey is
+round(StrateBottomWorldZ), so a live edit that changes terrain params WITHOUT moving the strate
+leaves the key unchanged and serves stale columns."* Production merely **masks** it, because
+`RebuildStrates` bumps `LayoutVersion`. My key inherited the same hole, and the test found it in one
+build.
+
+**Fixed** by folding a `FCrc::MemCrc32` fingerprint of the params (plus every per-biome param set)
+into the key. `FSurfaceGenerationParams` is verified pure POD — no `TArray`, `FString` or pointer —
+so a memory CRC **cannot** produce a false hit; at worst padding causes a false *miss*, i.e. a
+recompute. Erring toward CPU cost rather than toward a wrong column.
+
+**Worth stating plainly: a perf optimisation introduced a correctness bug, and the test suite caught
+it the same day.** That is the clearest answer yet to "what are all these tests for" — the failure
+was invisible to inspection, produced *plausible* terrain, and only one of 20 000 samples actually
+crossed the isosurface.
+
+### Known, not fixed: VerticalShafts proves 0 of 60 tiles
+
+Maze proves 23, the slabs 36-40, shafts **zero**. Expected from the choice recorded last commit: my
+`EffectOverBox` returns `CarveOnly` if *any* shaft exists within a `Spacing*1.6` halo, rather than
+testing the actual connector capsules. At default `ShaftDensity` almost every box has a shaft in that
+halo, so `AllSolid` is always killed and nothing is provable. **Correct but pessimistic** — a false
+verdict would be a hole, this is only lost CPU. The improvement is to test real connector capsules
+instead of "a shaft exists nearby", which is `§6`'s split argument arriving through the back door.
+
+**UNVERIFIED:** the fingerprint fix.
+
+**Next single action:** build, confirm `SurfaceHeightEquivalence` is green again (all 11 tests).
+Then `FloatingIslands` (§7) → `Underwater` (§8) → `TunnelNetwork` (§2, **last**). Perf still parked.
+
+---
