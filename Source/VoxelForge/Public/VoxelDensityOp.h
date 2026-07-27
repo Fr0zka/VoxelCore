@@ -73,11 +73,14 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // ÉTAT / STATUS
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// Phase 1, header seul. Aucun opérateur n'existe encore, GetDensityAt n'a pas changé, le `switch`
-// est intact. Prochaine étape : porter Maze en le DÉCOMPOSANT (source réseau de couloirs + modifier
-// de rugosité), pas en l'emballant. Voir OPSTACK-DECOMPOSITION.md pour le plan par archétype.
+// Phase 1. Le premier archétype (Maze) EST porté, dans VoxelDensityOpStack.{h,cpp} — mais
+// **GetDensityAt et ClassifyTile ne sont PAS touchés** : le `switch` reste le seul chemin qui
+// alimente le jeu. La pile est validée par un test qui la compare à GetMazeDensity point par point.
+// Le branchement dans GetDensityAt attend un build vert.
 //
-// Phase 1, header only. No operator exists yet, GetDensityAt is unchanged, the switch is intact.
+// Phase 1. Maze IS ported (VoxelDensityOpStack.{h,cpp}) but **GetDensityAt and ClassifyTile are NOT
+// touched** — the switch is still the only path feeding the game. The stack is validated by a test
+// that compares it to GetMazeDensity point by point. Wiring it in waits for a green build.
 //
 // NOTE sur les UENUM : ces types sont volontairement du C++ nu (pas d'UHT, pas de .generated.h).
 // Ils deviendront UENUM/USTRUCT en Phase 3, quand les opérateurs deviendront des data assets et
@@ -120,16 +123,30 @@ enum class EVoxelOpRole : uint8
 // Vocabulaire délibérément petit, et il réutilise ce qui existe déjà
 // (VoxelSDF::SmoothMin / SmoothMax).
 //
-// RAPPEL DE SIGNE — la source n°1 de confusion du plugin :
-//   au mesher, NÉGATIF = SOLIDE, POSITIF = AIR (IsoLevel 0).
-//   Donc « ajouter du solide » = prendre le MIN, « creuser de l'air » = prendre le MAX.
-//   SIGN REMINDER: at the mesher NEGATIVE = SOLID, POSITIVE = AIR. So "add solid" is min(),
-//   "carve air" is max(). Getting this backwards inverts the world.
+// ⚠️⚠️ RAPPEL DE SIGNE — LA source n°1 de confusion du plugin, et il y a DEUX conventions en jeu.
+// Lire ceci en entier avant d'écrire un opérateur.
+//
+//   • CANAL DENSITÉ, à l'intérieur de la pile : convention INTERNE, **POSITIF = SOLIDE**.
+//     C'est celle dans laquelle CHAQUE fonction d'archétype est écrite aujourd'hui. La négation
+//     vers la convention marching-cubes (négatif = solide) se fait UNE FOIS, tout à la fin, par
+//     l'appelant. Donc ici : « ajouter du solide » = MAX, « creuser de l'air » = MIN.
+//
+//   • CANAL SDF : convention SDF standard, **NÉGATIF = À L'INTÉRIEUR de la primitive**.
+//     Réunir deux formes = MIN (c'est `SmoothMin`, ce que fait déjà le code pour salle+puits).
+//     Le sens de « min » est donc l'INVERSE d'un canal à l'autre. Ce n'est pas une incohérence :
+//     un SDF décrit une FORME, une densité décrit de la MATIÈRE.
+//
+//   DENSITY channel inside the stack: INTERNAL convention, **POSITIVE = SOLID** (what every
+//   archetype body already uses; the MC negate happens once, at the end, in the caller). So
+//   "add solid" is max(), "carve air" is min().
+//   SDF channel: standard SDF, **NEGATIVE = INSIDE the primitive**; unioning shapes is min().
+//   The meaning of min() is therefore opposite between the two channels — an SDF describes a
+//   SHAPE, a density describes MATTER.
 enum class EVoxelOpCombine : uint8
 {
     Replace,         // ignore l'entrée — racine de pile (heightfield, densité de base)
-    Union,           // min() — ajoute du solide : ponts, îles, colonnes
-    Subtract,        // max() — creuse de l'air : salles, tunnels, passages, spine
+    Union,           // max() sur la DENSITÉ — ajoute du solide : ponts, îles, colonnes
+    Subtract,        // min() sur la DENSITÉ — creuse de l'air : salles, tunnels, passages, spine
     SmoothUnion,     // VoxelSDF::SmoothMin(k) — jonctions organiques
     SmoothSubtract,  // VoxelSDF::SmoothMax(k)
     Add,             // accumulation scalaire — termes de bruit / rugosité
@@ -202,6 +219,41 @@ struct FVoxelOpContext
 };
 
 //=============================================================================
+// L'ÉTAT QUI TRAVERSE LA PILE / THE STATE THE STACK THREADS THROUGH
+//=============================================================================
+// DEUX canaux, pas un. Ce n'est pas de la généralité gratuite — c'est ce que le code fait déjà :
+//
+//   CaveSDF = EvaluateSDFCached(salles + tunnels)          ← espace SDF
+//   CaveSDF = SmoothMin(CaveSDF, PitSDF,     BlendK)       ← espace SDF
+//   CaveSDF = SmoothMin(CaveSDF, ChimneySDF, BlendK)       ← espace SDF
+//   → UN SEUL carve à la fin : Density -= CarveFactor · BaseDensity · 2
+//
+// Maze, VerticalShafts et FloatingIslands ont la même forme, et TROIS d'entre eux appliquent la
+// rugosité au **SDF** (`MazeSDF += bruit·Rough`), pas à la densité. Sur la densité, le même bruit
+// est mis à l'échelle par le gradient local : effet visiblement différent.
+//
+// Avec un seul canal, un opérateur ne peut qu'ÉCRASER le précédent — les jonctions SmoothMin
+// (salle↔puits, et demain « un graphe de salles creusé DANS une montagne ») sont impossibles.
+// Un `SmoothMin` entre deux SOURCES différentes est précisément ce qui fait qu'une idée composée
+// a l'air d'appartenir au lieu au lieu d'y avoir été percée. Coût : un float.
+//
+// Two channels, not one — because that is what the code already does, and because SmoothMin between
+// two different SOURCES is precisely what makes a composed idea look like it belongs there rather
+// than like a hole punched in something else. Cost: one float.
+struct FVoxelOpSample
+{
+    // Convention INTERNE : POSITIF = SOLIDE. Négation vers MC une seule fois, par l'appelant.
+    // INTERNAL convention: POSITIVE = SOLID. Negated to MC once, by the caller.
+    float Density = 0.0f;
+
+    // Convention SDF standard : NÉGATIF = à l'intérieur de la primitive.
+    // FLT_MAX = « aucune surface à proximité » (l'état initial, et le early-out des sources
+    // placées quand aucune primitive n'atteint ce voxel).
+    // FLT_MAX = "no surface nearby" — the initial state, and the early-out placed sources use.
+    float Sdf = FLT_MAX;
+};
+
+//=============================================================================
 // L'INTERFACE / THE INTERFACE
 //=============================================================================
 // Trois méthodes, et elles FORMALISENT CE QUE LE CODE FAIT DÉJÀ À LA MAIN : chaque archétype
@@ -228,8 +280,8 @@ public:
     virtual void PrepareChunk(const FVoxelOpContext& Ctx) = 0;
 
     /**
-     * Par voxel. InDensity = ce que la pile a produit jusqu'ici, convention MC
-     * (négatif = solide, positif = air). Coordonnées en VOXELS, pas en cm.
+     * Par voxel. `InOut` est l'état que la pile a produit jusqu'ici (voir FVoxelOpSample).
+     * Coordonnées en VOXELS, pas en cm.
      *
      * INVARIANCE DE FENÊTRE (ARCHITECTURE §8.4) : fonction PURE de (coords monde, seed, layout).
      * Le même point évalué depuis une autre tuile, un autre ordre, un autre thread doit rendre le
@@ -237,7 +289,7 @@ public:
      * visible, et en multijoueur une divergence de monde. Le test
      * VoxelForge.Determinism.DensityPurity vérifie cela.
      */
-    virtual float Eval(float WorldX, float WorldY, float WorldZ, float InDensity) const = 0;
+    virtual void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const = 0;
 
     /**
      * CONSERVATIF. Phase 1 : direction seule. Phase 3 : surcharge avec intervalle numérique.
@@ -249,6 +301,18 @@ public:
      * fonctions, mêmes floats, donc verdict exact plutôt qu'estimé. Cela DOIT survivre au portage.
      *
      * The contract is "conservative", not "closed-form": an op MAY sample to answer.
+     *
+     * ⚠️ SIMPLIFICATION DE PHASE 1, à connaître : une source qui n'écrit QUE le canal SDF ne touche
+     * pas la densité par elle-même — c'est l'opérateur de conversion (`FSdfCarve`/`FSdfFill`) qui le
+     * fait. Répondre honnêtement demanderait de propager un INTERVALLE de SDF à travers la requête
+     * de boîte, exactement comme `Eval` propage une valeur de SDF. En attendant, **la source répond
+     * pour la paire** (elle rend `CarveOnly`/`FillOnly` quand une primitive atteint la boîte,
+     * `Identity` sinon) et la conversion rend `Identity`. Conservatif et correct ; à remplacer par
+     * une requête de boîte à deux canaux quand les intervalles numériques arriveront (Phase 3).
+     *
+     * PHASE 1 SIMPLIFICATION: an SDF-only source answers for itself AND its conversion op; the
+     * conversion returns Identity. Answering honestly needs an SDF INTERVAL threaded through the box
+     * query, mirroring how Eval threads an SDF value. Conservative and correct meanwhile.
      */
     virtual EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const = 0;
 

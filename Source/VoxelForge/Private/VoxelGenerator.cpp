@@ -13,6 +13,7 @@
 #include "VoxelDiffLayer.h"
 #include "VoxelBiomeDefinition.h"
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
+#include "VoxelDensityPrimitives.h"   // spine / seal / passage — shared with the operator stack
 
 //=============================================================================
 // SURFACE COLUMN CACHE (T1.a) — kill the per-Z heightfield redundancy
@@ -230,80 +231,34 @@ static float CellularNoise3D(const FVector& Position)
 // DENSITY PIPELINE HELPERS (partagés entre TunnelNetwork et Slab)
 //=============================================================================
 
-// Seal solide aux bords haut et bas de la strate. Fade smoothstep sur
-// `Thickness` voxels depuis chaque bord. N'AJOUTE que de la densité
-// (FMath::Max), jamais en enlève → le joueur ne peut jamais percer le seal
-// "par accident", seulement via les passages.
-static void ApplyBoundarySeal(float& Density, float WorldZ,
-    float StrateTopZ, float StrateBottomZ,
-    float Thickness, float BaseDensity)
+// Les CORPS de ces trois helpers ont déménagé dans Public/VoxelDensityPrimitives.h : la pile
+// d'opérateurs (VoxelDensityOpStack) a besoin exactement des mêmes, et deux copies de trois
+// INVARIANTS de monde (descente possible, seals qui tiennent, passages qui percent) finiraient par
+// diverger. Ces trois lignes gardent les noms locaux pour que les ~20 sites d'appel ci-dessous ne
+// bougent pas d'un caractère — le déplacement ne change AUCUN comportement.
+//
+// The BODIES moved to Public/VoxelDensityPrimitives.h; the operator stack needs the same three, and
+// two copies of three world invariants would eventually drift. These forwarders keep the local names
+// so not one of the ~20 call sites below changes. No behavioural change.
+//
+// Convention INTERNE ici : positif = SOLIDE. La négation vers MC se fait sur le `return`.
+static FORCEINLINE void ApplyBoundarySeal(float& Density, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float Thickness, float BaseDensity)
 {
-    if (Thickness <= 0.0f) return;
-
-    const float DistTop = StrateTopZ - WorldZ;     // + si on est sous le plafond
-    const float DistBot = WorldZ - StrateBottomZ;  // + si on est au-dessus du sol
-
-    if (DistTop >= 0.0f && DistTop < Thickness)
-    {
-        float SealFactor = 1.0f - (DistTop / Thickness);
-        SealFactor = SmoothStep01(SealFactor);
-        Density = FMath::Max(Density, SealFactor * BaseDensity);
-    }
-    if (DistBot >= 0.0f && DistBot < Thickness)
-    {
-        float SealFactor = 1.0f - (DistBot / Thickness);
-        SealFactor = SmoothStep01(SealFactor);
-        Density = FMath::Max(Density, SealFactor * BaseDensity);
-    }
+    VF_ApplyBoundarySeal(Density, WorldZ, StrateTopZ, StrateBottomZ, Thickness, BaseDensity);
 }
 
-// Creuse un passage inter-strates. Évalué APRÈS le seal pour que les passages
-// puissent percer à travers le bouchon solide.
-// Le rayon de blend hard-codé à 4.0f correspond à l'ancienne valeur —
-// à exposer via UVoxelSettings si on veut pouvoir le tweaker.
-static void ApplyPassageCarving(float& Density, float ModSDF,
+static FORCEINLINE void ApplyPassageCarving(float& Density, float ModSDF,
     float BaseDensity, float SealThickness)
 {
-    constexpr float PASSAGE_BLEND_RADIUS = 4.0f;
-    if (ModSDF >= PASSAGE_BLEND_RADIUS) return;
-
-    float CarveFactor = FMath::Clamp(
-        (PASSAGE_BLEND_RADIUS - ModSDF) / (PASSAGE_BLEND_RADIUS * 2.0f),
-        0.0f, 1.0f);
-    CarveFactor = SmoothStep01(CarveFactor);
-
-    // FORCE the density toward guaranteed AIR so the passage punches through ANYTHING in
-    // its path (seals, columns, surface roughness, terrain ops). A plain subtraction can
-    // be out-paced by stacked density additions, leaving solid plugs mid-tunnel — which is
-    // why the shaft "didn't go all the way through". Lerp toward a strongly negative target
-    // and take the min so we only ever make it MORE air (never refill an existing cave).
-    const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
-    Density = FMath::Min(Density, FMath::Lerp(Density, AirTarget, CarveFactor));
+    VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
 }
 
-// (0,0) DESCENT SPINE — carve a guaranteed open vertical column at world XY (0,0)
-// inside the strate INTERIOR (between the top and bottom seals). The seals are left
-// intact so the player still has to dig through them to descend — this just makes a
-// clean, archetype-independent landing space aligned across every strate.
-static void ApplyOriginSpine(float& Density, float WorldX, float WorldY, float WorldZ,
+static FORCEINLINE void ApplyOriginSpine(float& Density, float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
-    if (Radius <= 0.0f) return;
-
-    // Stay within the interior — never touch the seal bands.
-    const float InnerTop = StrateTopZ - SealThickness;
-    const float InnerBot = StrateBottomZ + SealThickness;
-    if (WorldZ <= InnerBot || WorldZ >= InnerTop) return;
-
-    const float DistXY = FMath::Sqrt(WorldX * WorldX + WorldY * WorldY);
-    const float SDF = DistXY - Radius;  // < 0 inside the column
-    const float Blend = 3.0f;
-    if (SDF < Blend)
-    {
-        float Carve = FMath::Clamp((Blend - SDF) / (Blend * 2.0f), 0.0f, 1.0f);
-        Carve = SmoothStep01(Carve);
-        Density -= Carve * (BaseDensity * 2.0f + SealThickness);
-    }
+    VF_ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
+        StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
 }
 
 // DISTURBANCE LAYER — the "wow" post-process. Operates on the FINAL MC density
