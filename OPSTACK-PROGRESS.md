@@ -491,3 +491,49 @@ marked as a temporary experiment with removal instructions and a read-the-result
 paused.
 
 ---
+
+## 2026-07-27 — FPSemantics on VoxelForge does not build. Reverted; measuring a safer way.
+
+**What happened:** setting `FPSemantics` on the VoxelForge module broke the build with ~30 errors —
+`UMaterialInterface`, `USoundBase`, `TSubclassOf<AActor>`, `APawn`, `ENABLE_DRAW_DEBUG` all
+"undefined type". **None of them are FP-related.**
+
+**Why:** UBT can only share a precompiled header between modules whose **compile environments
+match**. Changing `FPSemantics` changed VoxelForge's environment, so it lost eligibility for the
+engine's shared PCH — and with it ~30 includes the plugin has always been getting for free.
+
+**Genuine latent finding, worth its own item some day:** several public headers use engine types they
+never include (`VoxelBiomeDefinition.h`, `VoxelStrateDefinition.h`, `VoxelSettings.h`,
+`VoxelStrateTypes.h`, `VoxelContentManager.h`, `VoxelDensityVolume.h`, and `VoxelWorld.cpp`). The
+plugin compiles today only because the shared PCH supplies them. UE has been moving away from
+implicit shared-PCH includes for years, so this will need doing eventually — **but not inside an
+unrelated diagnostic**, which is why it was reverted rather than chased.
+
+**Reverted**, with the reason written into `VoxelForge.Build.cs` so nobody retries it blind.
+
+### The FP question, answered without touching build settings
+
+`MazeEquivalence` now compiles a **verbatim copy of the Maze core into the TEST's translation unit**
+and compares three implementations of the same source:
+
+```
+A = GetMazeDensity        (VoxelGenerator.cpp TU)
+B = the operator stack    (VoxelDensityOpStack.cpp TU)
+C = MazeCoreVerbatim      (the test's own TU)
+```
+
+- **A != C** ⇒ identical source, different TU, different result ⇒ the compiler, not the port.
+  Nothing to fix; record it and move on.
+- **A == C, B != C** ⇒ the source IS stable across TUs ⇒ the operator stack differs for a **logic**
+  reason, and it is in `FLatticeCorridorSource` or `FSdfCarveOp`.
+
+Duplicating code is normally a fault; here it is the only instrument that answers the question,
+because three careful readings all concluded "identical" and the test disagrees. It is marked
+diagnostic-only and comes out once the answer is in.
+
+**UNVERIFIED:** everything in this entry.
+
+**Next single action:** rebuild (normal incremental now — the Build.cs change is reverted) and read
+the THREE-WAY block. Phase 1 step 3 still paused.
+
+---

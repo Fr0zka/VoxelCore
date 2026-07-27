@@ -33,6 +33,7 @@
 
 #include "VoxelForgeTestFixture.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelCaveMorphology.h"   // VoxelSDF::Capsule, VoxelHash — for the verbatim copy below
 
 #include <atomic>
 
@@ -44,6 +45,88 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 namespace
 {
     constexpr int32 NumMazeSamples = 20000;
+
+    /**
+     * COPIE VERBATIM du cœur de `GetMazeDensity` (VoxelGenerator.cpp), compilée dans CETTE unité
+     * de compilation. Diagnostic uniquement — à supprimer une fois la question tranchée.
+     *
+     * POURQUOI DUPLIQUER DU CODE, ce qui est normalement une faute :
+     * la question ouverte est « du code SOURCE IDENTIQUE donne-t-il un résultat différent selon
+     * l'unité de compilation ? ». On ne peut pas y répondre en relisant le code — trois lectures
+     * ont conclu « identique » et le test dit le contraire. Il faut un TROISIÈME point de mesure.
+     *
+     *   A = GetMazeDensity        (unité VoxelGenerator.cpp)
+     *   B = la pile d'opérateurs  (unité VoxelDensityOpStack.cpp)
+     *   C = cette copie           (unité du test)
+     *
+     *   A != C  ⇒ même source, unités différentes, résultats différents ⇒ c'est le COMPILATEUR,
+     *             et cela explique entièrement A != B. Rien à corriger dans le portage.
+     *   A == C  ⇒ la source est stable d'une unité à l'autre ⇒ B diffère pour une raison de
+     *             LOGIQUE, et il faut la trouver dans les opérateurs.
+     *
+     * Reproduit la variante « corridors + carve ONLY » du bisect (rugosité / seal / spine /
+     * passages omis), parce que c'est là que le bisect a montré l'écart survivre.
+     */
+    float MazeCoreVerbatim(float WorldX, float WorldY, float WorldZ,
+                           const FMazeGenerationParams& Params, int32 Seed)
+    {
+        const float CS = FMath::Max(Params.CellSize, 1.0f);
+        const FVector Pos(WorldX, WorldY, WorldZ);
+        const uint32 S = (uint32)Seed ^ 0x4D617A65u;  // 'Maze'
+
+        float Density = Params.BaseDensity;
+
+        const int32 CX = FMath::FloorToInt(WorldX / CS);
+        const int32 CY = FMath::FloorToInt(WorldY / CS);
+        const int32 CZ = FMath::FloorToInt(WorldZ / CS);
+
+        struct FMazeEdge { FVector A, B; };
+        TArray<FMazeEdge, TInlineAllocator<24>> Edges;
+
+        auto NodeCenter = [CS](int32 X, int32 Y, int32 Z)
+        {
+            return FVector((X + 0.5f) * CS, (Y + 0.5f) * CS, (Z + 0.5f) * CS);
+        };
+        auto EdgeOpen = [S](int32 X, int32 Y, int32 Z, uint32 AxisSalt, float Threshold) -> bool
+        {
+            uint32 H = VoxelHash::Cell(X, Y, S ^ AxisSalt);
+            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
+            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
+        };
+
+        for (int32 dz = -1; dz <= 0; dz++)
+        for (int32 dy = -1; dy <= 0; dy++)
+        for (int32 dx = -1; dx <= 0; dx++)
+        {
+            const int32 nx = CX + dx, ny = CY + dy, nz = CZ + dz;
+            const FVector A = NodeCenter(nx, ny, nz);
+
+            if (EdgeOpen(nx, ny, nz, 0xA1u, Params.BranchProbability))
+                Edges.Add({ A, NodeCenter(nx + 1, ny, nz) });
+            if (EdgeOpen(nx, ny, nz, 0xB2u, Params.BranchProbability))
+                Edges.Add({ A, NodeCenter(nx, ny + 1, nz) });
+            if (EdgeOpen(nx, ny, nz, 0xC3u, Params.Verticality))
+                Edges.Add({ A, NodeCenter(nx, ny, nz + 1) });
+        }
+
+        const float R = FMath::Max(Params.CorridorRadius, 0.5f);
+        float MazeSDF = FLT_MAX;
+        for (const FMazeEdge& E : Edges)
+        {
+            MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, E.A, E.B, R));
+        }
+
+        // Rugosité omise volontairement (variante du bisect).
+        const float Blend = 2.0f;
+        if (MazeSDF < Blend)
+        {
+            float Carve = FMath::Clamp((Blend - MazeSDF) / (Blend * 2.0f), 0.0f, 1.0f);
+            Carve = SmoothStep01(Carve);
+            Density -= Carve * Params.BaseDensity * 2.0f;
+        }
+
+        return -Density;   // convention MC
+    }
 
     /** Les params Maze de la strate Maze de la fixture, bornes Z de runtime comprises. */
     bool ResolveMazeParams(const VoxelForgeTest::FTestWorld& World, FMazeGenerationParams& Out,
@@ -229,6 +312,64 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             TEXT("difference, because the /fp:precise run reproduced this byte for byte."),
             X, Y, Z,
             Old, Bits(Old), New, Bits(New), S.Sdf, Bits(S.Sdf), Base, CarveOld, CarveNew));
+    }
+
+    //=========================================================================
+    // LE TEST À TROIS VOIES — la mesure qui tranche
+    //=========================================================================
+    // A = GetMazeDensity (unité VoxelGenerator.cpp) · B = la pile (unité VoxelDensityOpStack.cpp)
+    // C = MazeCoreVerbatim (unité DE CE TEST). Voir le commentaire de MazeCoreVerbatim.
+    if (NumDiff > 0)
+    {
+        FMazeGenerationParams Core = MazeParams;
+        Core.SurfaceRoughness       = 0.0f;   // variante « corridors + carve ONLY » du bisect
+        Core.BoundarySealThickness  = 0.0f;
+
+        UVoxelGenerator* MutableGen = World.Generator.Get();
+        const float SavedSpine = MutableGen->OriginSpineRadius;
+        const UVoxelStrateManager* SavedMgr = MutableGen->StrateManager;
+        MutableGen->OriginSpineRadius = 0.0f;
+        MutableGen->SetStrateManager(nullptr);
+
+        FVoxelOpStack CoreStack;
+        VoxelDensityOps::BuildMazeStack(CoreStack, Core, World.Settings->Seed, 0.0f, nullptr);
+
+        const int32 N = FMath::Min(NumMazeSamples, 5000);
+        int32 DiffAB = 0, DiffAC = 0, DiffBC = 0;
+        for (int32 i = 0; i < N; ++i)
+        {
+            const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+            const float A = MutableGen->GetMazeDensity(X, Y, Z, Core);
+            const float B = CoreStack.EvalMC(X, Y, Z);
+            const float C = MazeCoreVerbatim(X, Y, Z, Core, World.Settings->Seed);
+            if (!BitEqual(A, B)) { ++DiffAB; }
+            if (!BitEqual(A, C)) { ++DiffAC; }
+            if (!BitEqual(B, C)) { ++DiffBC; }
+        }
+
+        MutableGen->OriginSpineRadius = SavedSpine;
+        MutableGen->SetStrateManager(SavedMgr);
+
+        const TCHAR* Verdict =
+            (DiffAC > 0)
+                ? TEXT("A != C: IDENTICAL SOURCE, DIFFERENT TRANSLATION UNIT, DIFFERENT RESULT. The "
+                       "cause is the compiler, not the port. Nothing to fix in the operator stack -- "
+                       "record it and move on.")
+                : ((DiffBC > 0)
+                    ? TEXT("A == C but B != C: the source IS stable across translation units, so the "
+                           "operator stack differs for a LOGIC reason. Hunt it in the ops -- start "
+                           "with FLatticeCorridorSource's edge sweep and FSdfCarveOp.")
+                    : TEXT("All three agree here, so whatever causes the full-stack difference lives "
+                           "in a stage this core variant switched off (roughness / seal / spine / "
+                           "passages). Re-run the bisect with that in mind."));
+
+        AddInfo(FString::Printf(
+            TEXT("THREE-WAY (corridors + carve only, %d samples):\n")
+            TEXT("    A generator TU  vs  B opstack TU : %d differ\n")
+            TEXT("    A generator TU  vs  C test TU    : %d differ\n")
+            TEXT("    B opstack TU    vs  C test TU    : %d differ\n")
+            TEXT("  VERDICT: %s"),
+            N, DiffAB, DiffAC, DiffBC, Verdict));
     }
 
     if (NumDiff == 0)

@@ -12,31 +12,25 @@ public class VoxelForge : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
 		// ============================================================================
-		// ⚠️ TEMPORARY EXPERIMENT — 2026-07-27. REMOVE THIS LINE WHEN THE ANSWER IS IN.
+		// ⚠️ DO NOT SET `FPSemantics` HERE — tried 2026-07-27, it does not build.
 		// ============================================================================
-		// Testing whether the ~1 ULP residue between GetMazeDensity and its operator-stack
-		// port (VoxelForge.OpStack.MazeEquivalence: 454 of 20000 samples, 0 crossing the
-		// isosurface) is caused by the compiler being allowed to reassociate identical
-		// source differently per translation unit.
+		// Setting FPSemantics (or any other property that alters this module's compile
+		// environment) makes VoxelForge ineligible for the ENGINE'S SHARED PCH: UBT can only
+		// share a precompiled header between modules whose compile environments match. The
+		// build then fails with ~30 "undefined type" errors — UMaterialInterface, USoundBase,
+		// TSubclassOf<AActor>, APawn, ENABLE_DRAW_DEBUG — none of which are FP-related. They
+		// are includes this plugin has always relied on the shared PCH to provide for free.
 		//
-		// FPSemantics is a PER-MODULE property. Setting it on the VoxelM game module does
-		// NOT affect this one — every line of density code lives in VoxelForge, so the
-		// switch has to be here to mean anything. (That mistake already cost one build and
-		// one wrong conclusion.)
+		// So the plugin has a latent IWYU (include-what-you-use) debt: several public headers
+		// use engine types they never include. That is worth fixing on its own terms one day
+		// (UE has been moving away from implicit shared-PCH includes for years), but it is a
+		// real chunk of work and must not be attempted inside an unrelated diagnostic.
 		//
-		// UnrealBuildTool's Windows default is /fp:fast ("Default is imprecise FP
-		// semantics", VCToolChain.cs); every Clang target defaults to precise instead.
-		//
-		// READ THE RESULT LIKE THIS:
-		//   454 -> 0    : the FP model WAS the cause. Then decide separately whether to keep
-		//                 precise (it costs vectorisation on the density hot path — the thing
-		//                 T2.a's SIMD noise work was buying — for an unmeasured amount).
-		//   454 -> 454  : the FP model is NOT the cause and the difference is real logic.
-		//                 Read the WORST-POINT DUMP the test now prints.
-		//
-		// EITHER WAY THIS LINE COMES BACK OUT once measured. Keeping /fp:precise on the hot
-		// path is a decision that needs a profile, not a leftover from a diagnostic.
-		FPSemantics = FPSemanticsMode.Precise;
+		// The FP question it was meant to settle — whether identical source reassociates
+		// differently per translation unit under /fp:fast — is now answered inside
+		// VoxelForge.OpStack.MazeEquivalence instead, by compiling a verbatim copy of the
+		// Maze core into the TEST's translation unit and comparing all three. No build
+		// settings involved, and it cannot break anything.
 
 		// Modules we depend on:
 		// - Core: Basic types (TArray, FString, etc.)
