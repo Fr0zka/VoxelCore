@@ -1631,3 +1631,48 @@ the case that was guarded off until now.
 `FSdfRoughnessMod` and `FSdfCarve` unchanged from Maze, so it should be the cheapest of the eight.
 
 ---
+
+## 2026-07-27 — SurfaceWorld verified visually. And Jahni measured the thing I had only flagged.
+
+All 10 green, biome checks now visible and correct (blend bit-exact across the whole weight sweep;
+ceiling selects rather than blends at weight 1.0). Jahni: *"the opstack looks similar if not
+identical to the old terrain"* — the biome case included, which is what step 2c added.
+
+**And: *"it took a bit more time generating with the opstack."*** That is a real regression, it was
+predictable, and I had flagged it as "pending" rather than fixed. Diagnosed, two compounding causes:
+
+**1. The memo key invalidated on every chunk.** It was keyed on `InstanceId`, which changes on every
+stack rebuild — i.e. every chunk. `GSurfColCache`, the path it replaced, is keyed on
+`(XY box, StrateKey, Seed, LayoutVersion)` with **no ChunkZ**, deliberately *"shared down the whole
+vertical strate stack"*. So a 4-chunk-tall strate recomputed **every column four times**, cliff
+resamples included — and the cliff costs four extra structural samples per column.
+
+**2. The table could not hold one chunk.** A chunk is `CHUNK_SIZE²` = 1024 columns; the table had
+**256** entries. It thrashed against itself *within a single tile*, before any cross-chunk question.
+
+**Fixed:** `PrepareChunk` now derives a **shared** `ColumnKey` from `(StrateBottomWorldZ,
+LayoutVersion, Seed)` — the same identity `GSurfColCache` uses — and the table is 4096 entries
+(~150 KB/worker, in line with `GSurfColCache`'s 6 × 59 KB). The memo is `thread_local`, so it
+already survived stack rebuilds; **only the key was throwing the contents away.**
+
+**Why sharing across chunk Z is sound:** heights are XY-pure *by type* (the whole point of
+`VoxelHeightOp.h` — there is no Z in the signature), and the biome field is documented
+Z-independent (*"ZERO Z dependence: the climate/Voronoi fields are pure-XY"*). That is precisely the
+justification `GSurfColCache` already rests on.
+
+**Un-prepared safety:** `ColumnKey` starts at `InstanceId` rather than 0, because slots initialise to
+`Key = 0` and a zero key would falsely hit the pristine slot at (0,0). Without `PrepareChunk` you
+get per-instance caching — less sharing, still correct. Degrade, never lie.
+
+**⚠️ This may not close the gap entirely, and I am not claiming it does.** Virtual dispatch (5 ops
+per voxel) and the hashed lookup versus the original's direct-indexed box both remain. Those are
+smaller than a 4× column recompute, but "smaller" is a guess until measured. **The next generation
+timing is the measurement** — if it is still slower, the remaining suspects in order are: the box
+cache's direct indexing vs. my hash, then per-voxel virtual calls.
+
+**UNVERIFIED:** not compiled.
+
+**Next single action:** build, regenerate, and compare generation time against the switch path with
+the flag off. Then `VerticalShafts` (§6).
+
+---

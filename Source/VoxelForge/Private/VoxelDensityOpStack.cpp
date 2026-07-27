@@ -461,6 +461,15 @@ namespace
             // A unique, never-recycled id — assigned here only; the other ctor delegates.
             static std::atomic<uint64> NextId{ 1 };
             InstanceId = NextId.fetch_add(1, std::memory_order_relaxed);
+
+            // Départ sur l'identité D'INSTANCE, pas sur 0 : les entrées du mémo s'initialisent à
+            // `Key = 0`, donc une clé nulle ferait FAUSSEMENT toucher le slot vierge en (0,0).
+            // `PrepareChunk` remplacera ceci par la clé partagée de strate ; sans lui, on garde un
+            // cache par instance — moins de partage, mais correct. Dégrader, jamais mentir.
+            // Starting at the INSTANCE id rather than 0: slots initialise to Key = 0, so a zero key
+            // would falsely hit the pristine slot at (0,0). PrepareChunk upgrades this to the shared
+            // strate key; without it we simply cache per instance. Degrade, never lie.
+            ColumnKey = InstanceId;
         }
 
         /** Sans biomes — délègue, pour qu'il n'existe qu'UN corps de construction et UN compteur
@@ -498,23 +507,27 @@ namespace
             // structurels). Ce n'est pas « un peu plus lent », c'est un ordre de grandeur sur
             // l'archétype le plus cher du plugin.
             //
-            // Table à correspondance directe, 256 entrées, clé COMPLÈTE comparée sur touche : une
-            // collision ne peut que coûter un recalcul, jamais rendre une mauvaise colonne.
+            // Table à correspondance directe, clé COMPLÈTE comparée sur touche : une collision ne
+            // peut que coûter un recalcul, jamais rendre une mauvaise colonne.
             //
-            // A single-entry memo is only correct-by-luck: it assumes the caller walks a Z column
-            // before changing XY, which the mesher does not promise. Direct-mapped 256-entry table
-            // with the FULL key compared on hit — a collision costs a recompute, never a wrong column.
-            struct FSlot { uint64 Id; float X, Y; FColumn C; };
-            thread_local FSlot Slots[256] = {};
+            // TAILLE : un chunk fait CHUNK_SIZE² colonnes (1024 à 32³). Les 256 entrées du premier
+            // jet ne tenaient donc même pas UN chunk — la table se piétinait elle-même à
+            // l'intérieur d'une seule tuile. 4096 entrées couvrent quatre chunks de front, pour
+            // ~150 Ko par worker : du même ordre qu'une boîte de `GSurfColCache` (~59 Ko × 6).
+            //
+            // A chunk is CHUNK_SIZE² columns (1024), so the first draft's 256 entries could not
+            // even hold one chunk and thrashed inside a single tile. 4096 covers four chunks.
+            struct FSlot { uint64 Key; float X, Y; FColumn C; };
+            thread_local FSlot Slots[4096] = {};
 
             const uint32 HX = *reinterpret_cast<const uint32*>(&WorldX);
             const uint32 HY = *reinterpret_cast<const uint32*>(&WorldY);
-            const uint32 Idx = (HX * 0x9E3779B9u ^ HY * 0x85EBCA6Bu) >> 24;   // [0,255]
+            const uint32 Idx = ((HX * 0x9E3779B9u) ^ (HY * 0x85EBCA6Bu)) >> 20;   // [0,4095]
 
             FSlot& S = Slots[Idx];
-            if (S.Id != InstanceId || S.X != WorldX || S.Y != WorldY)
+            if (S.Key != ColumnKey || S.X != WorldX || S.Y != WorldY)
             {
-                S.Id = InstanceId;  S.X = WorldX;  S.Y = WorldY;
+                S.Key = ColumnKey;  S.X = WorldX;  S.Y = WorldY;
                 FColumn& C = S.C;
 
                 C.TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
@@ -601,8 +614,44 @@ namespace
         const FSurfaceGenerationParams& GetParams() const { return P; }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
-        void PrepareChunk(const FVoxelOpContext&) override {}
         bool IsXYPure() const override { return false; }   // voir le bloc ci-dessus
+
+        /**
+         * ⚠️ C'EST ICI QUE SE JOUE LA PERF DE CET ARCHÉTYPE — corrigé 2026-07-27 après mesure.
+         *
+         * Le mémo de colonne était clé sur `InstanceId`, qui change à CHAQUE reconstruction de pile,
+         * c'est-à-dire à chaque chunk. Résultat : une strate haute de 4 chunks recalculait ses
+         * colonnes **4 fois**, resamples du cliff compris. Le chemin d'origine ne fait pas ça —
+         * `GSurfColCache` est clé sur `(boîte XY, StrateKey, Seed, LayoutVersion)` **SANS ChunkZ**,
+         * délibérément, « shared down the whole vertical strate stack ».
+         *
+         * Donc la clé devient la même identité : ce qui rend deux colonnes interchangeables, c'est
+         * la STRATE et la version de layout, pas le chunk. Le mémo étant `thread_local`, il SURVIT
+         * à la reconstruction de la pile — seule la clé l'invalidait.
+         *
+         * POURQUOI C'EST SÛR : les hauteurs sont XY-pures par construction (c'est tout l'objet de
+         * `VoxelHeightOp.h`, où le type n'a pas de Z), et le champ de biomes est documenté
+         * XY-pur — « ZERO Z dependence: the climate/Voronoi fields are pure-XY ». C'est exactement
+         * la justification sur laquelle `GSurfColCache` repose déjà.
+         *
+         * The memo was keyed on InstanceId, which changes every chunk, so a 4-chunk strate recomputed
+         * every column 4x. GSurfColCache deliberately omits ChunkZ and shares down the whole vertical
+         * stack; this now keys on the same identity. Safe because heights are XY-pure by type and the
+         * biome field is documented Z-independent.
+         */
+        void PrepareChunk(const FVoxelOpContext& Ctx) override
+        {
+            // `StrateBottomWorldZ` est unique par strate empilée — la même valeur que
+            // `CP_StrateKey` utilise dans `GetDensityAt`. La version de layout entre dans la clé
+            // (AUDIT §C2) : une édition à chaud qui change les params sans déplacer la strate doit
+            // invalider, sinon on sert des colonnes périmées.
+            const uint32 A = (uint32)FMath::RoundToInt(Ctx.StrateBottomWorldZ);
+            const uint32 B = Ctx.LayoutVersion;
+            const uint32 C = Ctx.Seed;
+            ColumnKey = ((uint64)VoxelHash::Mix(A ^ VoxelHash::Mix(B)) << 32)
+                      |  (uint64)VoxelHash::Mix(C ^ VoxelHash::Mix(A));
+            if (ColumnKey == 0) { ColumnKey = 1; }   // 0 = « jamais préparé »
+        }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -642,7 +691,8 @@ namespace
         TUniquePtr<IVoxelBiomeField>         Field;              // POSSÉDÉ (voir le constructeur)
         TArray<TUniquePtr<IVoxelHeightOp>>   PerBiomeStructural; // pente d'overhang par biome
 
-        uint64 InstanceId = 0;
+        uint64 InstanceId = 0;   // unique, jamais recyclée — le repli quand PrepareChunk n'a pas eu lieu
+        uint64 ColumnKey  = 0;   // l'identité PARTAGÉE (strate + layout + seed) : voir PrepareChunk
     };
 
     //=========================================================================
