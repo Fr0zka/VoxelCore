@@ -73,7 +73,7 @@ namespace VoxelForgeTest
          * dangerous — and `VoxelForge.Determinism.LargeSeedSurvives` deliberately passes big ones
          * (up to 2e9) to prove it stays that way.
          */
-        void Build(int32 InSeed = 1337, int32 InGapChunks = 2)
+        void Build(int32 InSeed = 1337, int32 InGapChunks = 2, bool bUseOperatorStack = false)
         {
             Settings = TStrongObjectPtr<UVoxelSettings>(
                 NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
@@ -104,6 +104,10 @@ namespace VoxelForgeTest
                     GetTransientPackage(), NAME_None, RF_Transient);
                 Def->GeneratorType = Archetypes[i];
                 Def->StrateHeightInChunks = 4;
+                // L'OPT-IN de la pile d'opérateurs. Faux par défaut : les treize tests existants
+                // doivent continuer à exercer le `switch`, qui reste le comportement de référence.
+                // Seul le test de solidité de ClassifyTie côté pile le passe à vrai.
+                Def->bUseOperatorStack = bUseOperatorStack;
                 // Hard transitions: param blending across a boundary would make "which archetype
                 // owns this chunk" ambiguous, and these tests want an unambiguous mapping.
                 Def->TransitionType = EVoxelStrateTransition::Hard;
@@ -117,7 +121,36 @@ namespace VoxelForgeTest
 
             StrateManager = TStrongObjectPtr<UVoxelStrateManager>(
                 NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
-            StrateManager->Initialize(Settings.Get(), Settings->Seed);
+
+            //=================================================================
+            // ⚠️ CHAQUE MONDE DE TEST OBTIENT UNE `LayoutVersion` UNIQUE DANS LE PROCESSUS
+            //=================================================================
+            // Ce n'est pas de la cosmétique, c'est une CONTAMINATION CROISÉE réelle entre tests, et
+            // elle n'était jusqu'ici masquée que par un accident.
+            //
+            // `PassagesVersion` est PAR INSTANCE et part de 0, donc deux `FTestWorld` successifs
+            // rendaient tous les deux **1**. Or les caches par chunk de `GetDensityAt` sont clés sur
+            // `(ChunkCoord, LayoutVersion)` : deux mondes différents, même version, même chunk ⇒ le
+            // second se voit servir les params — ET le drapeau `CP_UseOpStack` — du premier.
+            // Personne ne l'a vu parce que `bUseOperatorStack` valait false partout : les deux
+            // mondes étaient d'accord par défaut. Le premier monde qui coche la case fait tomber
+            // cette coïncidence, dans les DEUX sens (il contamine, et il est contaminé).
+            //
+            // Un compteur de processus donne à chaque monde une version distincte, donc tout cache
+            // survivant d'un test à l'autre est forcément invalidé. `Initialize` est déterministe
+            // (le pool est mélangé par le seed, les fixed strates sont épinglées), donc le rappeler
+            // ne change pas le layout — seulement le compteur.
+            //
+            // Each test world gets a process-unique LayoutVersion. Two worlds both reporting 1 made
+            // GetDensityAt's per-chunk caches serve the previous world's params — and its
+            // CP_UseOpStack flag — for the same chunk coord. Invisible while every world agreed that
+            // the flag was false.
+            static int32 GWorldSerial = 0;
+            const int32 Bumps = ++GWorldSerial;
+            for (int32 b = 0; b < Bumps; ++b)
+            {
+                StrateManager->Initialize(Settings.Get(), Settings->Seed);
+            }
 
             DiffLayer = TStrongObjectPtr<UVoxelDiffLayer>(
                 NewObject<UVoxelDiffLayer>(GetTransientPackage(), NAME_None, RF_Transient));

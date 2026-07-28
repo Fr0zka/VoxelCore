@@ -423,6 +423,124 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     }
 }
 
+//=============================================================================
+// LE MAPPING « ARCHÉTYPE → PILE D'OPÉRATEURS » — UNE SEULE DÉFINITION
+//=============================================================================
+// ⚠️ EXTRAIT DE `GetDensityAt` PARCE QUE `ClassifyTile` EN A BESOIN AUSSI, ET QU'UNE DEUXIÈME COPIE
+// SERAIT LA PIRE FORME DE BUG DISPONIBLE ICI.
+//
+// `ClassifyTile` décide si une tuile est maillée DU TOUT. Si son verdict venait d'une pile
+// construite autrement que celle qui produit la densité — ne serait-ce qu'un paramètre de
+// construction différent — la tuile serait sautée sur la foi d'un champ qui n'est pas celui que le
+// mesher aurait vu. C'est-à-dire un TROU : pas de géométrie, pas de collision, invisible.
+// Un commentaire « garder les deux en phase » n'aurait pas suffi ; il fallait qu'il n'y en ait
+// qu'une.
+//
+// Les params ne sont PAS cherchés ici : les deux appelants les ont déjà (le chemin densité les tient
+// dans ses `CP_*`, le classifieur les cherche pour son slot). On ne passe que des pointeurs.
+//
+// ONE definition of the archetype → stack mapping, because ClassifyTile decides whether a tile is
+// meshed at all: a verdict from a differently-built stack would be a hole. Params are passed in,
+// never fetched here — both callers already have them.
+namespace
+{
+    struct FVoxelStackParamRefs
+    {
+        const FSlabGenerationParams*   Slab    = nullptr;
+        const FMazeGenerationParams*   Maze    = nullptr;
+        const FVerticalShaftParams*    Vert    = nullptr;
+        const FFloatingIslandParams*   Float   = nullptr;
+        const FStrateGenerationParams* Tunnel  = nullptr;
+
+        // SurfaceWorld uniquement. `Surface == nullptr` ⇒ la fabrique REFUSE cet archétype, ce qui
+        // est exactement ce que veut `ClassifyTile` : il prouve SurfaceWorld lui-même, sur le
+        // treillis exact du mesher, et n'a aucune raison de passer par la pile pour ça.
+        const FSurfaceGenerationParams*         Surface            = nullptr;
+        const TArray<FSurfaceGenerationParams>* SurfaceBiomeParams = nullptr;
+        TUniquePtr<IVoxelBiomeField>            BiomeField;
+    };
+
+    /**
+     * Construit la pile de cet archétype dans `OutStack` et remplit les bornes Z de `OutCtx`.
+     *
+     * @return false quand la pile NE DOIT PAS être utilisée — archétype non porté, params absents,
+     *         ou **strate dégénérée**. Ce dernier cas n'est pas de la prudence : cinq fonctions
+     *         d'archétype court-circuitent sur `return 1.0f` (= air) quand la hauteur est nulle,
+     *         et la pile n'a pas cet early-out, par conception. L'appelant retombe sur le `switch`,
+     *         qui EST le comportement de référence. (`GetDensityWithParams`, lui, n'a aucun
+     *         early-out de ce genre : TunnelNetwork/Underwater n'ont donc pas cette garde.)
+     */
+    bool VF_BuildOpStackForChunk(ECaveGeneratorType Type, FVoxelStackParamRefs& Refs,
+                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* SM,
+                                 FVoxelOpStack& OutStack, FVoxelOpContext& OutCtx)
+    {
+        switch (Type)
+        {
+        case ECaveGeneratorType::Maze:
+            if (!Refs.Maze) { return false; }
+            if (Refs.Maze->StrateTopWorldZ - Refs.Maze->StrateBottomWorldZ <= 0.0f) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Maze->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Maze->StrateBottomWorldZ;
+            VoxelDensityOps::BuildMazeStack(OutStack, *Refs.Maze, Seed, SpineRadius, SM);
+            return true;
+
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            // UN SEUL cas pour les deux, comme le `switch` de production : `GetSlabDensity` ne les
+            // distingue pas non plus. Voir BuildSlabStack.
+            if (!Refs.Slab) { return false; }
+            if (Refs.Slab->StrateTopWorldZ - Refs.Slab->StrateBottomWorldZ <= 0.0f) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Slab->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Slab->StrateBottomWorldZ;
+            VoxelDensityOps::BuildSlabStack(OutStack, *Refs.Slab, Seed, SpineRadius, SM);
+            return true;
+
+        case ECaveGeneratorType::SurfaceWorld:
+            if (!Refs.Surface) { return false; }
+            if (Refs.Surface->StrateTopWorldZ - Refs.Surface->StrateBottomWorldZ <= 0.0f) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Surface->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Surface->StrateBottomWorldZ;
+            VoxelDensityOps::BuildSurfaceStack(
+                OutStack, *Refs.Surface, Seed, SpineRadius, SM,
+                Refs.SurfaceBiomeParams ? *Refs.SurfaceBiomeParams : TArray<FSurfaceGenerationParams>(),
+                MoveTemp(Refs.BiomeField));
+            return true;
+
+        case ECaveGeneratorType::VerticalShafts:
+            if (!Refs.Vert) { return false; }
+            if (Refs.Vert->StrateTopWorldZ - Refs.Vert->StrateBottomWorldZ <= 0.0f) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Vert->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Vert->StrateBottomWorldZ;
+            VoxelDensityOps::BuildVerticalShaftStack(OutStack, *Refs.Vert, Seed, SpineRadius, SM);
+            return true;
+
+        case ECaveGeneratorType::FloatingIslands:
+            if (!Refs.Float) { return false; }
+            if (Refs.Float->StrateTopWorldZ - Refs.Float->StrateBottomWorldZ <= 0.0f) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Float->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Float->StrateBottomWorldZ;
+            VoxelDensityOps::BuildFloatingIslandStack(OutStack, *Refs.Float, Seed, SpineRadius, SM);
+            return true;
+
+        case ECaveGeneratorType::Underwater:
+        case ECaveGeneratorType::TunnelNetwork:
+            // Underwater EST TunnelNetwork plus un drapeau d'eau consommé côté rendu. Pas de garde
+            // de strate dégénérée : `GetDensityWithParams` n'a pas d'early-out à reproduire.
+            if (!Refs.Tunnel) { return false; }
+            OutCtx.StrateTopWorldZ    = Refs.Tunnel->StrateTopWorldZ;
+            OutCtx.StrateBottomWorldZ = Refs.Tunnel->StrateBottomWorldZ;
+            VoxelDensityOps::BuildTunnelNetworkStack(OutStack, *Refs.Tunnel, Seed, SpineRadius, SM);
+            return true;
+
+        default:
+            // `UsesOperatorStackForChunk` ne rend true que pour les archétypes portés (les 8), donc
+            // on ne devrait jamais arriver ici. Si ça arrive : retomber sur le `switch` plutôt que
+            // générer du vide — un monde faux est pire qu'un monde non porté.
+            return false;
+        }
+    }
+}
+
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
     // Seul le seed est copié ici. Tout le reste (params de cave, transitions,
@@ -537,124 +655,35 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 OpCtx.Seed          = (uint32)Seed;
                 OpCtx.LayoutVersion = LayoutVersion;
 
-                switch (CP_GenType)
+                // ⚠️ LE MAPPING VIT DANS `VF_BuildOpStackForChunk` (haut de ce fichier) ET NULLE
+                // PART AILLEURS — `ClassifyTile` appelle la MÊME fabrique. Un verdict de tuile issu
+                // d'une pile construite autrement serait un trou. Ici on ne fait que fournir les
+                // params déjà cherchés juste au-dessus.
+                FVoxelStackParamRefs Refs;
+                Refs.Slab   = &CP_Slab;
+                Refs.Maze   = &CP_Maze;
+                Refs.Vert   = &CP_Vert;
+                Refs.Float  = &CP_Float;
+                Refs.Tunnel = &CP_Tunnel;
+
+                // SurfaceWorld : le champ de biomes est fabriqué ICI, du côté qui connaît le
+                // générateur, et TRANSFÉRÉ à la pile. L'opérateur ne voit qu'une `IVoxelBiomeField`,
+                // ce qui lui permet de devenir un asset en Phase 3 sans traîner le générateur.
+                TArray<FSurfaceGenerationParams> PerBiome;
+                if (CP_GenType == ECaveGeneratorType::SurfaceWorld)
                 {
-                case ECaveGeneratorType::Maze:
-                    // GARDE DE STRATE DÉGÉNÉRÉE : GetMazeDensity court-circuite sur `return 1.0f`
-                    // (= air) quand la hauteur est nulle ou négative ; cette garde appartient à la
-                    // fonction d'archétype et la pile n'en a pas, par conception. Sans ce test, une
-                    // strate dégénérée donnerait de l'air sur un chemin et de la géométrie sur
-                    // l'autre. On retombe sur le `switch`, qui EST le comportement de référence.
-                    // Degenerate-strate guard: the archetype early-outs to air, the stack has no
-                    // such early-out by design. Fall back to the switch, which is the reference.
-                    if (CP_Maze.StrateTopWorldZ - CP_Maze.StrateBottomWorldZ <= 0.0f)
-                    {
-                        CP_UseOpStack = false;
-                        break;
-                    }
-                    OpCtx.StrateTopWorldZ    = CP_Maze.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Maze.StrateBottomWorldZ;
-                    VoxelDensityOps::BuildMazeStack(CP_OpStack, CP_Maze, Seed,
-                                                    OriginSpineRadius, StrateManager);
-                    break;
-
-                case ECaveGeneratorType::FlatPlain:
-                case ECaveGeneratorType::CrystalChamber:
-                    // UN SEUL cas pour les deux, comme le `switch` de production juste en dessous :
-                    // `GetSlabDensity` ne les distingue pas non plus. Voir BuildSlabStack.
-                    // Même garde de strate dégénérée : GetSlabDensity court-circuite sur `1.0f`.
-                    if (CP_Slab.StrateTopWorldZ - CP_Slab.StrateBottomWorldZ <= 0.0f)
-                    {
-                        CP_UseOpStack = false;
-                        break;
-                    }
-                    OpCtx.StrateTopWorldZ    = CP_Slab.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Slab.StrateBottomWorldZ;
-                    VoxelDensityOps::BuildSlabStack(CP_OpStack, CP_Slab, Seed,
-                                                    OriginSpineRadius, StrateManager);
-                    break;
-
-                case ECaveGeneratorType::SurfaceWorld:
-                {
-                    if (CP_Surface.StrateTopWorldZ - CP_Surface.StrateBottomWorldZ <= 0.0f)
-                    {
-                        CP_UseOpStack = false;
-                        break;
-                    }
-                    OpCtx.StrateTopWorldZ    = CP_Surface.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Surface.StrateBottomWorldZ;
-
-                    // Le champ de biomes est fabriqué ICI, du côté qui connaît le générateur, et
-                    // TRANSFÉRÉ à la pile. L'opérateur ne voit qu'une `IVoxelBiomeField` : c'est ce
-                    // qui lui permet de devenir un asset en Phase 3 sans traîner le générateur.
-                    // Built here, on the side that knows the generator, and handed to the stack.
-                    TUniquePtr<IVoxelBiomeField> Field;
-                    TArray<FSurfaceGenerationParams> PerBiome;
+                    Refs.Surface = &CP_Surface;
                     if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
                     {
                         PerBiome = CP_SurfaceBiomeParams;
-                        Field = MakeUnique<FGeneratorBiomeField>(
+                        Refs.SurfaceBiomeParams = &PerBiome;
+                        Refs.BiomeField = MakeUnique<FGeneratorBiomeField>(
                             this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
                     }
-
-                    VoxelDensityOps::BuildSurfaceStack(CP_OpStack, CP_Surface, Seed,
-                                                       OriginSpineRadius, StrateManager,
-                                                       PerBiome, MoveTemp(Field));
-                    break;
                 }
 
-                case ECaveGeneratorType::VerticalShafts:
-                    if (CP_Vert.StrateTopWorldZ - CP_Vert.StrateBottomWorldZ <= 0.0f)
-                    {
-                        CP_UseOpStack = false;
-                        break;
-                    }
-                    OpCtx.StrateTopWorldZ    = CP_Vert.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Vert.StrateBottomWorldZ;
-                    VoxelDensityOps::BuildVerticalShaftStack(CP_OpStack, CP_Vert, Seed,
-                                                             OriginSpineRadius, StrateManager);
-                    break;
-
-                case ECaveGeneratorType::FloatingIslands:
-                    // Même garde de strate dégénérée : GetFloatingIslandDensity court-circuite sur
-                    // `return 1.0f` (= air) quand la hauteur est nulle ou négative.
-                    if (CP_Float.StrateTopWorldZ - CP_Float.StrateBottomWorldZ <= 0.0f)
-                    {
-                        CP_UseOpStack = false;
-                        break;
-                    }
-                    OpCtx.StrateTopWorldZ    = CP_Float.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Float.StrateBottomWorldZ;
-                    VoxelDensityOps::BuildFloatingIslandStack(CP_OpStack, CP_Float, Seed,
-                                                              OriginSpineRadius, StrateManager);
-                    break;
-
-                case ECaveGeneratorType::Underwater:
-                case ECaveGeneratorType::TunnelNetwork:
-                    // ⚠️ UN SEUL CAS POUR LES DEUX, exactement comme le `switch` de production
-                    // vingt lignes plus bas : `GetDensityAt` route déjà `Underwater` vers
-                    // `GetDensityWithParams`, et `WaterLevelRelative` n'est lu que par
-                    // `UVoxelStrateManager` (côté rendu / requête), JAMAIS par la densité — vérifié
-                    // par recherche, pas supposé. Underwater EST TunnelNetwork plus un drapeau d'eau.
-                    //
-                    // ⚠️ PAS DE GARDE DE STRATE DÉGÉNÉRÉE ICI, et c'est une différence RÉELLE avec
-                    // les cinq cas au-dessus : eux la portent parce que leur fonction d'archétype
-                    // court-circuite sur `return 1.0f` quand la hauteur est nulle. Lu ligne à ligne :
-                    // `GetDensityWithParams` n'a AUCUN early-out de ce genre. Ajouter la garde ici
-                    // ferait diverger la pile du `switch` sur les strates dégénérées, dans le sens
-                    // exact que la garde était censée empêcher ailleurs.
-                    OpCtx.StrateTopWorldZ    = CP_Tunnel.StrateTopWorldZ;
-                    OpCtx.StrateBottomWorldZ = CP_Tunnel.StrateBottomWorldZ;
-                    VoxelDensityOps::BuildTunnelNetworkStack(CP_OpStack, CP_Tunnel, Seed,
-                                                             OriginSpineRadius, StrateManager);
-                    break;
-                default:
-                    // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
-                    // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`
-                    // plutôt que générer du vide — un monde faux est pire qu'un monde non porté.
-                    CP_UseOpStack = false;
-                    break;
-                }
+                CP_UseOpStack = VF_BuildOpStackForChunk(CP_GenType, Refs, Seed, OriginSpineRadius,
+                                                        StrateManager, CP_OpStack, OpCtx);
 
                 // Le test appelle PrepareChunk, pas la production : c'est exactement la divergence
                 // qui rend un opérateur vert en test et faux en jeu. Les sept `PrepareChunk`
@@ -2666,8 +2695,17 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     }
     int32 NumSlots = 0;
 
+    // ── T1.d GÉNÉRIQUE : la pile d'opérateurs classe les archétypes de CAVE ──
+    // Ces trois-là suivent le slot de cave que la tuile touche. Le verdict de la pile porte sur la
+    // BOÎTE ENTIÈRE, pas sur un z, donc il ne peut être calculé qu'après la boucle — et il n'est
+    // valable que si la tuile ne touche QUE ce slot-là (voir la garde `bAnyNonCave`).
+    int32 CaveBotChunkZ = INT32_MAX;   // identité du slot de cave (borne basse, en chunks)
+    int32 CaveRepChunkZ = 0;
+    bool  bAnyCave      = false;
+    bool  bAnyNonCave   = false;       // gap ou SurfaceWorld dans la même tuile ⇒ on abandonne
+
     int32 MemoChunkZ  = INT32_MAX;
-    int32 MemoCat     = -1;            // 0 = gap, 1 = surface
+    int32 MemoCat     = -1;            // 0 = gap, 1 = surface, 2 = cave (pile d'opérateurs)
     int32 MemoSlotIdx = -1;
     for (int32 g = -1; g <= GridDim; ++g)
     {
@@ -2680,6 +2718,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             if (StrateManager->IsGapChunk(CC))
             {
                 MemoCat = 0;
+                bAnyNonCave = true;
             }
             else if (StrateManager->GetGeneratorTypeForChunk(CC) == ECaveGeneratorType::SurfaceWorld)
             {
@@ -2721,14 +2760,42 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                     if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) bCanAir = false;
                 }
                 MemoCat = 1;
+                bAnyNonCave = true;
             }
             else
             {
-                return EVoxelTileClass::Mixed;   // archétype cave / hors layout : pas prouvable en v1
+                // ── ARCHÉTYPE DE CAVE ── Jusqu'ici : `return Mixed`, sans appel. Désormais on tente
+                // le pliage générique de la pile — mais SEULEMENT sous des conditions vérifiables,
+                // parce qu'un faux verdict ici est un trou (pas de géométrie, pas de collision).
+                //
+                // Condition 1 : la strate doit RÉELLEMENT être générée par la pile. Sinon on
+                // classerait un champ que le mesher ne produira pas. C'est le même drapeau, lu au
+                // même endroit, que `GetDensityAt`.
+                if (!StrateManager->UsesOperatorStackForChunk(CC)) { return EVoxelTileClass::Mixed; }
+
+                // Condition 2 : un seul slot de cave par tuile. Deux slots = deux jeux de params =
+                // deux piles, et une pile ne sait répondre que pour SA strate.
+                int32 CaveTopCZ = 0, CaveBotCZ = 0;
+                if (!StrateManager->GetStrateChunkZBounds(ChunkZ, CaveTopCZ, CaveBotCZ))
+                {
+                    return EVoxelTileClass::Mixed;   // hors layout
+                }
+                if (CaveBotChunkZ != INT32_MAX && CaveBotChunkZ != CaveBotCZ)
+                {
+                    return EVoxelTileClass::Mixed;
+                }
+                CaveBotChunkZ = CaveBotCZ;
+                CaveRepChunkZ = ChunkZ;
+                bAnyCave = true;
+                MemoCat  = 2;
             }
         }
 
-        if (MemoCat == 0)
+        if (MemoCat == 2)
+        {
+            // Rien par z : la pile répond pour la boîte entière, après la boucle.
+        }
+        else if (MemoCat == 0)
         {
             bCanAir = false;   // bedrock du gap = solide (le carve des passages est déjà gardé)
         }
@@ -2747,6 +2814,165 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             else         { S.InteriorZ.Add(Z); }
         }
         if (!bCanSolid && !bCanAir) return EVoxelTileClass::Mixed;
+    }
+
+    //=========================================================================
+    // ── LE PLIAGE DE LA PILE D'OPÉRATEURS, POUR LES ARCHÉTYPES DE CAVE ──
+    //=========================================================================
+    // ⚠️ ERREUR ICI = TROU, PAS RÉGRESSION. Un verdict non-Mixed fait SAUTER `GenerateMesh` : pas
+    // de triangles, pas de collision, invisible jusqu'à ce qu'un joueur tombe au travers. Toutes les
+    // gardes ci-dessous ÉCHOUENT EN MIXED ; aucune ne donne le bénéfice du doute.
+    //
+    // Le verdict lui-même ne peut pas être meilleur que la pile : `FVoxelOpStack::ClassifyBox` plie
+    // chaque opérateur avec `VF_FoldOp` et rend `Mixed` dès que les deux hypothèses meurent. Ce que
+    // ce bloc ajoute, c'est la vérification que la pile interrogée est bien CELLE QUI PRODUIRA LA
+    // DENSITÉ de cette tuile — même fabrique, mêmes params, même drapeau.
+    if (bAnyCave)
+    {
+        // Une tuile mi-cave mi-surface (ou mi-gap) n'est pas classable ainsi : la pile de cave ne
+        // répond que pour SA strate, et sa boîte couvrirait des z appartenant à une autre.
+        if (bAnyNonCave) { return EVoxelTileClass::Mixed; }
+
+        const FIntVector RepCC(0, 0, CaveRepChunkZ);
+        const ECaveGeneratorType CaveType = StrateManager->GetGeneratorTypeForChunk(RepCC);
+
+        //---------------------------------------------------------------------
+        // ⚠️ LA GARDE QUI COMPTE : LES PARAMS DOIVENT ÊTRE LES MÊMES SUR TOUTE LA TUILE
+        //---------------------------------------------------------------------
+        // `GetGenerationParams` et ses homologues BLENDENT les params dans les bandes de transition :
+        // `Alpha` dépend du chunk Z pour `Gradient`, et du chunk XY EN PLUS pour `Interleaved`. Deux
+        // chunks d'une même tuile peuvent donc porter des params différents — c'est le constat de
+        // `AUDIT §C2`, confirmé par lecture le 2026-07-28 — et UNE pile ne peut pas représenter DEUX
+        // champs. On construit donc les params pour CHAQUE coordonnée de chunk que la boîte touche et
+        // on exige qu'ils soient identiques bit à bit.
+        //
+        // `Memcmp` sur un POD : un padding différent ne peut produire qu'un FAUX ÉCART, donc un
+        // `Mixed` de trop. On se trompe du côté du CPU, jamais du côté du trou.
+        const int32 CX0 = FloorDivC(MinX, CHUNK_SIZE), CX1 = FloorDivC(MaxX, CHUNK_SIZE);
+        const int32 CY0 = FloorDivC(MinY, CHUNK_SIZE), CY1 = FloorDivC(MaxY, CHUNK_SIZE);
+        const int32 CZ0 = FloorDivC(MinZ, CHUNK_SIZE), CZ1 = FloorDivC(MaxZ, CHUNK_SIZE);
+
+        // Une tuile très étalée (Step élevé) toucherait trop de chunks pour que cette vérification
+        // reste bon marché. Au-delà, `Mixed` — on renonce au gain, jamais à la sûreté.
+        const int64 NumChunkCoords = (int64)(CX1 - CX0 + 1) * (int64)(CY1 - CY0 + 1) * (int64)(CZ1 - CZ0 + 1);
+        if (NumChunkCoords > 27) { return EVoxelTileClass::Mixed; }
+
+        FSlabGenerationParams   TileSlab;
+        FMazeGenerationParams   TileMaze;
+        FVerticalShaftParams    TileVert;
+        FFloatingIslandParams   TileFloat;
+        FStrateGenerationParams TileTunnel;
+        bool bFirst = true;
+
+        for (int32 cz = CZ0; cz <= CZ1; ++cz)
+        for (int32 cy = CY0; cy <= CY1; ++cy)
+        for (int32 cx = CX0; cx <= CX1; ++cx)
+        {
+            const FIntVector CC(cx, cy, cz);
+            if (StrateManager->GetGeneratorTypeForChunk(CC) != CaveType)
+            {
+                return EVoxelTileClass::Mixed;   // la boîte déborde sur un autre archétype
+            }
+
+            // Le drapeau doit tenir sur TOUS les chunks de la boîte, pas seulement sur celui qui a
+            // déclenché la tentative : un seul chunk hors pile invaliderait le verdict.
+            if (!StrateManager->UsesOperatorStackForChunk(CC)) { return EVoxelTileClass::Mixed; }
+
+            switch (CaveType)
+            {
+            case ECaveGeneratorType::FlatPlain:
+            case ECaveGeneratorType::CrystalChamber:
+            {
+                const FSlabGenerationParams Q = StrateManager->GetSlabParamsForChunk(CC);
+                if (bFirst) { TileSlab = Q; }
+                else if (FMemory::Memcmp(&Q, &TileSlab, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                break;
+            }
+            case ECaveGeneratorType::Maze:
+            {
+                const FMazeGenerationParams Q = StrateManager->GetMazeParamsForChunk(CC);
+                if (bFirst) { TileMaze = Q; }
+                else if (FMemory::Memcmp(&Q, &TileMaze, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                break;
+            }
+            case ECaveGeneratorType::VerticalShafts:
+            {
+                const FVerticalShaftParams Q = StrateManager->GetVerticalShaftParamsForChunk(CC);
+                if (bFirst) { TileVert = Q; }
+                else if (FMemory::Memcmp(&Q, &TileVert, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                break;
+            }
+            case ECaveGeneratorType::FloatingIslands:
+            {
+                const FFloatingIslandParams Q = StrateManager->GetFloatingIslandParamsForChunk(CC);
+                if (bFirst) { TileFloat = Q; }
+                else if (FMemory::Memcmp(&Q, &TileFloat, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                break;
+            }
+            case ECaveGeneratorType::Underwater:
+            case ECaveGeneratorType::TunnelNetwork:
+            {
+                const FStrateGenerationParams Q = StrateManager->GetGenerationParams(CC);
+                if (bFirst) { TileTunnel = Q; }
+                else if (FMemory::Memcmp(&Q, &TileTunnel, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                break;
+            }
+            default:
+                return EVoxelTileClass::Mixed;   // SurfaceWorld ne peut pas arriver ici (bAnyNonCave)
+            }
+
+            bFirst = false;
+        }
+
+        //---------------------------------------------------------------------
+        // La pile — construite par la MÊME fabrique que `GetDensityAt`.
+        //---------------------------------------------------------------------
+        FVoxelStackParamRefs Refs;
+        Refs.Slab   = &TileSlab;
+        Refs.Maze   = &TileMaze;
+        Refs.Vert   = &TileVert;
+        Refs.Float  = &TileFloat;
+        Refs.Tunnel = &TileTunnel;
+        // `Refs.Surface` reste nul — la fabrique refuse alors SurfaceWorld, et c'est voulu : cette
+        // fonction le prouve elle-même sur le treillis EXACT du mesher, ce qu'aucune borne de boîte
+        // ne fera mieux.
+
+        FVoxelOpContext OpCtx;
+        OpCtx.ChunkCoord    = RepCC;
+        OpCtx.Seed          = (uint32)Seed;
+        OpCtx.LayoutVersion = TC_LayoutVersion;
+        OpCtx.Step          = Step;
+
+        FVoxelOpStack TileStack;
+        if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
+                                     StrateManager, TileStack, OpCtx))
+        {
+            // Strate dégénérée ou archétype non porté : `GetDensityAt` retomberait sur le `switch`,
+            // donc la pile ne décrit pas ce que le mesher verra. Aucun verdict.
+            return EVoxelTileClass::Mixed;
+        }
+        TileStack.PrepareChunk(OpCtx);
+
+        const FBox TileBox(FVector((float)MinX, (float)MinY, (float)MinZ),
+                           FVector((float)MaxX, (float)MaxY, (float)MaxZ));
+        const EVoxelTileClass StackVerdict = TileStack.ClassifyBox(TileBox, OpCtx);
+        if (StackVerdict == EVoxelTileClass::Mixed) { return EVoxelTileClass::Mixed; }
+
+        if (StackVerdict == EVoxelTileClass::AllSolid) { bCanAir = false; }
+        else                                           { bCanSolid = false; }
+
+        //---------------------------------------------------------------------
+        // ⚠️ LES DISTURBANCES NE SONT PAS DANS LA PILE (`OPSTACK-DECOMPOSITION §10.2`) :
+        // `GetDensityAt` les applique APRÈS, sur la densité déjà négatée. Un verdict qui les
+        // ignorerait serait faux exactement là où elles agissent. Mêmes inégalités que la branche
+        // SurfaceWorld plus haut, pour la même raison.
+        //---------------------------------------------------------------------
+        const FStrateDisturbanceParams D = StrateManager->GetDisturbanceParamsForChunk(RepCC);
+        if (D.ChasmDensity  > 0.0f) { bCanSolid = false; }
+        if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) { bCanAir = false; }
+
+        if (bCanSolid == bCanAir) { return EVoxelTileClass::Mixed; }
+        return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
     }
 
     // ── Balayage des colonnes XY sur le treillis exact du mesher (marge incluse). Une colonne

@@ -234,6 +234,169 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
 }
 
 //=============================================================================
+// LE CHEMIN PILE D'OPÉRATEURS DE ClassifyTile — MÊME FORCE BRUTE, MONDE OPT-IN
+//=============================================================================
+// `ClassifyTile` rendait `Mixed` sans appel pour tout archétype de CAVE. Il consulte désormais
+// `FVoxelOpStack::ClassifyBox` quand la strate a coché `bUseOperatorStack` — donc **un tout nouveau
+// chemin peut faire sauter le maillage d'une tuile**, et son erreur est un TROU : pas de triangles,
+// pas de collision, invisible jusqu'à ce qu'un joueur tombe au travers.
+//
+// Ce test est le même oracle par force brute que `ClassifyTileSoundness`, sur un monde dont TOUTES
+// les strates ont coché la case. Il ne vérifie pas le pliage (c'est `BoxVerdictFold`) ni les
+// opérateurs (ce sont les huit tests d'équivalence) : il vérifie le **câblage** — que la pile
+// interrogée par le classifieur est bien celle qui produit la densité, params, drapeau et
+// disturbances compris.
+//
+// ⚠️ LE COMPTEUR À LIRE EN PREMIER est le nombre de tuiles réellement brute-forcées. Un run vert
+// avec zéro verdict non-Mixed ne prouverait RIEN — exactement le piège que ce fichier documente
+// depuis sa première version, et la raison pour laquelle l'absence de verdict est une ERREUR ici.
+//
+// Same brute-force oracle as ClassifyTileSoundness, on a world where every strate has opted in.
+// It checks the WIRING, not the fold and not the operators.
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeOpStackClassifyTileTest,
+    "VoxelForge.OpStack.ClassifyTileSoundness",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FVoxelForgeOpStackClassifyTileTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+
+    // ⚠️ `bUseOperatorStack = true` sur toutes les strates : c'est LE point du test. La fixture
+    // donne à ce monde une `LayoutVersion` unique dans le processus, sans quoi les caches par chunk
+    // de `GetDensityAt` — dont `CP_UseOpStack` — pourraient encore porter ceux d'un autre test.
+    FTestWorld World;
+    World.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    if (!World.IsValid())
+    {
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    const UVoxelGenerator* Gen = World.Generator.Get();
+
+    FRandomStream Rng(20260728);
+    TArray<FTileSpec> ToVerify;
+    int32 NumMixed = 0, NumAllSolid = 0, NumAllAir = 0;
+
+    const int32 TopVoxelZ    = World.TopChunkZ    * CHUNK_SIZE;
+    const int32 BottomVoxelZ = World.BottomChunkZ * CHUNK_SIZE;
+
+    // Tirage uniforme sur tout le layout, PAS biaisé vers SurfaceWorld comme l'autre test : ici ce
+    // sont précisément les strates de cave qui intéressent, puisque ce sont elles qui passent par le
+    // nouveau chemin. SurfaceWorld continue d'être prouvé par le code écrit à la main.
+    for (int32 t = 0; t < NumTilesScanned; ++t)
+    {
+        FTileSpec Spec;
+        Spec.Step  = 1 << Rng.RandRange(0, 2);
+        Spec.Cells = (t % 8 == 0) ? CHUNK_SIZE : 16;
+        const int32 Extent = Spec.Step * Spec.Cells;
+
+        auto FloorDiv = [](int32 A, int32 B) { const int32 Q = A / B, R = A % B; return (R != 0 && (R < 0) != (B < 0)) ? Q - 1 : Q; };
+        const int32 LoTile = FloorDiv(BottomVoxelZ, Extent);
+        const int32 HiTile = FMath::Max(LoTile, FloorDiv(TopVoxelZ, Extent));
+
+        Spec.Origin = FIntVector(
+            Rng.RandRange(-4, 4) * Extent,
+            Rng.RandRange(-4, 4) * Extent,
+            Rng.RandRange(LoTile, HiTile) * Extent);
+
+        const EVoxelTileClass Verdict = Gen->ClassifyTile(Spec.Origin, Spec.Step, Spec.Cells);
+        switch (Verdict)
+        {
+        case EVoxelTileClass::Mixed:    ++NumMixed;                                                   break;
+        case EVoxelTileClass::AllSolid: ++NumAllSolid; if (ToVerify.Num() < MaxTilesVerified) ToVerify.Add(Spec); break;
+        case EVoxelTileClass::AllAir:   ++NumAllAir;   if (ToVerify.Num() < MaxTilesVerified) ToVerify.Add(Spec); break;
+        }
+    }
+
+    AddInfo(FString::Printf(
+        TEXT("ClassifyTile ON THE OPERATOR-STACK PATH, %d scanned tiles: Mixed %d, AllSolid %d, ")
+        TEXT("AllAir %d (brute-forcing %d). Compare with VoxelForge.Determinism.ClassifyTileSoundness, ")
+        TEXT("which runs the SAME scan on a world that has NOT opted in: every verdict beyond what ")
+        TEXT("that test reports is a tile the mesher now skips and did not before. That difference ")
+        TEXT("IS the T1.d prize OPSTACK-PLAN has been aiming at -- and every one of those tiles is a ")
+        TEXT("hole if the wiring is wrong, which is what the brute force below is for."),
+        NumTilesScanned, NumMixed, NumAllSolid, NumAllAir, ToVerify.Num()));
+
+    if (ToVerify.Num() == 0)
+    {
+        AddError(TEXT("VACUOUS: not one tile got a non-Mixed verdict on the operator-stack path, so ")
+                 TEXT("this test verified NOTHING about the new wiring. Either no strate actually ")
+                 TEXT("opted in (check FTestWorld::Build's bUseOperatorStack), or every guard in the ")
+                 TEXT("cave branch of ClassifyTile bailed to Mixed -- the params-identical check and ")
+                 TEXT("the 27-chunk-coord cap are the likeliest. Do NOT read a green run as proof."));
+        return false;
+    }
+
+    int32 NumHoles = 0;
+    for (const FTileSpec& Spec : ToVerify)
+    {
+        const EVoxelTileClass Verdict = Gen->ClassifyTile(Spec.Origin, Spec.Step, Spec.Cells);
+        if (Verdict == EVoxelTileClass::Mixed) { continue; }
+
+        const int32 CPA     = FMath::Clamp(Spec.Cells, 2, CHUNK_SIZE);
+        const int32 GridDim = CPA + 1;
+        const bool  bClaimsSolid = (Verdict == EVoxelTileClass::AllSolid);
+
+        bool bTileBad = false;
+        for (int32 gz = -1; gz <= GridDim && !bTileBad; ++gz)
+        for (int32 gy = -1; gy <= GridDim && !bTileBad; ++gy)
+        for (int32 gx = -1; gx <= GridDim && !bTileBad; ++gx)
+        {
+            const float X = (float)(Spec.Origin.X + gx * Spec.Step);
+            const float Y = (float)(Spec.Origin.Y + gy * Spec.Step);
+            const float Z = (float)(Spec.Origin.Z + gz * Spec.Step);
+            const float D = Gen->GetDensityAt(X, Y, Z);
+
+            const bool bAgrees = bClaimsSolid ? (D < 0.0f) : (D >= 0.0f);
+            if (!bAgrees)
+            {
+                bTileBad = true;
+                ++NumHoles;
+                AddError(FString::Printf(
+                    TEXT("HOLE ON THE OPERATOR-STACK PATH: ClassifyTile said %s for tile (%d,%d,%d) ")
+                    TEXT("Step=%d Cells=%d, but GetDensityAt(%.0f, %.0f, %.0f) = %.6g is on the %s ")
+                    TEXT("side. Check, in order: (1) does GetDensityAt for this chunk actually take ")
+                    TEXT("the stack (CP_UseOpStack), or did the classifier judge a field the mesher ")
+                    TEXT("will not produce; (2) the params-identical check -- a blended transition ")
+                    TEXT("band means one stack cannot represent the whole tile (AUDIT C2); (3) the ")
+                    TEXT("disturbance fold, since disturbances are applied AFTER the stack and are ")
+                    TEXT("not part of it; (4) an operator's EffectOverBox claiming Identity where it ")
+                    TEXT("can act -- the per-room op override can ENABLE a modifier the strate had ")
+                    TEXT("switched off, which makes a box bound too optimistic."),
+                    bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
+                    Spec.Origin.X, Spec.Origin.Y, Spec.Origin.Z, Spec.Step, Spec.Cells,
+                    X, Y, Z, D, (D >= 0.0f) ? TEXT("AIR") : TEXT("SOLID")));
+            }
+        }
+    }
+
+    TestEqual(TEXT("no tile was classified uniform on the operator-stack path while containing a ")
+              TEXT("surface (a false verdict is a hole)"), NumHoles, 0);
+
+    // Même contrôle de stabilité que sur l'autre chemin : la pile est reconstruite à chaque appel,
+    // et `FRoomGraphSource` partage un cache `thread_local` avec le chemin densité — deux appels
+    // successifs doivent malgré tout rendre le même verdict.
+    for (const FTileSpec& Spec : ToVerify)
+    {
+        const EVoxelTileClass A = Gen->ClassifyTile(Spec.Origin, Spec.Step, Spec.Cells);
+        const EVoxelTileClass B = Gen->ClassifyTile(Spec.Origin, Spec.Step, Spec.Cells);
+        if (A != B)
+        {
+            AddError(FString::Printf(
+                TEXT("UNSTABLE VERDICT on the operator-stack path at tile (%d,%d,%d) Step=%d: %d vs ")
+                TEXT("%d. The classifier builds a fresh stack per call, so a difference means an ")
+                TEXT("operator is reading thread_local state the density path mutates."),
+                Spec.Origin.X, Spec.Origin.Y, Spec.Origin.Z, Spec.Step, (int32)A, (int32)B));
+        }
+    }
+
+    return true;
+}
+
+//=============================================================================
 // LE FOLD DE LA PILE D'OPÉRATEURS / the op-stack fold
 //=============================================================================
 // `VoxelDensityOp.h` affirme que son fold reproduit le ClassifyTile écrit à la main. C'est de la
