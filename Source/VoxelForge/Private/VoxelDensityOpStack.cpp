@@ -2155,6 +2155,40 @@ namespace
     };
 
     //=========================================================================
+    // LA CLÉ QUI REND LE PLIAGE NUMÉRIQUE PAYANT : hériter du verdict de la source
+    //=========================================================================
+    // ⚠️ SANS CECI, LES BORNES D'AMPLITUDE NE SERVENT À RIEN SUR CET ARCHÉTYPE, et c'est le point
+    // que `OPSTACK-DECOMPOSITION §0.2` ne dit pas explicitement.
+    //
+    // Les douze modificateurs de détail sont TOUS gated sur `bNearCaveSurface`, c'est-à-dire sur
+    // `Sdf < SDFBlendRadius·3`. Or `Sdf` ne devient fini que si le graphe de salles a écrit quelque
+    // chose. **Là où la source prouve qu'aucune salle ni tunnel n'atteint la boîte, `Sdf` reste
+    // `FLT_MAX` sur toute la boîte, donc les douze sont l'IDENTITÉ** — et pas seulement « bornés ».
+    //
+    // Chacun le sait déjà par voxel (son premier `if`) mais le déclarait `Both`/`FillOnly` par boîte,
+    // ce qui tuait l'hypothèse `AllSolid` du roc profond aussi sûrement qu'un opérateur réellement
+    // actif. Douze déclarations trop prudentes, une seule cause : ils ne consultaient pas la source
+    // dont ils dépendent, alors qu'ils en tiennent déjà le pointeur (étape C1).
+    //
+    // ⚠️ AUJOURD'HUI CE SHORT-CIRCUIT NE TIRE PRESQUE JAMAIS : `FRoomGraphSource::EffectOverBox`
+    // rend `Identity` uniquement quand `RoomDensity <= 0`. Il devient l'interrupteur du bedrock
+    // profond le jour où la source répond SPATIALEMENT (ses bornes de salles et de tunnels sont déjà
+    // dans le cache — il faut le construire pour la boîte interrogée, ce qui ne se paie qu'une fois
+    // `ClassifyTile` branché sur `ClassifyBox`). Le câblage est posé maintenant pour que ce jour-là
+    // il n'y ait qu'UN endroit à changer, pas treize.
+    //
+    // Without this, the amplitude bounds buy nothing here: all twelve modifiers are gated on the SDF
+    // the room source writes, so where the source proves no cave reaches the box they are IDENTITY,
+    // not merely bounded. They already hold the pointer; they simply were not asking.
+    FORCEINLINE bool VF_NoCaveOverBox(const FRoomGraphSource* Rooms, const FBox& VoxelBox,
+                                      const FVoxelOpContext& Ctx)
+    {
+        // Pas de source ⇒ `Sdf` reste FLT_MAX ⇒ le gate est faux partout ⇒ identité. Conservatif
+        // dans le bon sens : on ne rend `Identity` que quand la source elle-même le rend.
+        return Rooms == nullptr || Rooms->EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity;
+    }
+
+    //=========================================================================
     // RÔLE 3 — MODIFIER : RUGOSITÉ DE PAROI, ESPACE DENSITÉ  (TunnelNetwork, STEP 4b)
     //=========================================================================
     // ⚠️ CE N'EST PAS `FSdfRoughnessMod`, ET C'EST LE PIÈGE QUE `OPSTACK-DECOMPOSITION §1` SIGNALE.
@@ -2184,8 +2218,12 @@ namespace
     class FCaveRoughnessMod final : public IVoxelDensityOp
     {
     public:
-        FCaveRoughnessMod(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+        /** @param InRoomsForBox  ⚠️ UNIQUEMENT pour `EffectOverBox`. Cet opérateur lit délibérément
+         *  les params de la STRATE et NON `LocalParams()` (voir la note d'en-tête) ; le pointeur ne
+         *  sert qu'à hériter du verdict de boîte de la source. Ne pas s'en servir dans `Eval`. */
+        FCaveRoughnessMod(const FStrateGenerationParams& InP, int32 Seed,
+                          const FRoomGraphSource* InRoomsForBox)
+            : P(InP), SeedU((uint32)Seed), RoomsForBox(InRoomsForBox) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2310,8 +2348,9 @@ namespace
          * Deuxième client pour le pliage numérique de `OPSTACK-DECOMPOSITION §0.2`, noté au point
          * exact où la borne manque (le premier est `FWormFieldSource::MaxCarveAmplitude`).
          */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
+            if (VF_NoCaveOverBox(RoomsForBox, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.SurfaceRoughness > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
@@ -2335,6 +2374,7 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        const FRoomGraphSource* RoomsForBox;   // NON possédant, et NON lu par Eval
     };
 
     //=========================================================================
@@ -2429,9 +2469,10 @@ namespace
 
         /** `Both` : `Offset` change de signe d'une demi-marche à l'autre. Amplitude bornée par
          *  `StepH/2` — troisième client du pliage numérique de `OPSTACK-DECOMPOSITION §0.2`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.TerraceStepHeight > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
@@ -2482,7 +2523,7 @@ namespace
 
         /** Ne SOUSTRAIT que (`LineValue ≥ 0`, `Depth ≥ 0`) ⇒ `CarveOnly`, jamais `Both`. Un des
          *  rares modificateurs de détail qui garde une DIRECTION exploitable par le pliage. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // ⚠️ VERDICT DE BOÎTE ET OVERRIDE PAR SALLE : la borne se lit sur les params de la
             // STRATE, pas sur ceux d'une salle — une boîte couvre plusieurs salles, donc aucune
@@ -2492,6 +2533,7 @@ namespace
             // être TROP OPTIMISTE. Aucun risque aujourd'hui : rien ne consomme `ClassifyBox` en
             // production (cf. la file d'attente post-8/8), et il faudra le régler AVANT que
             // `ClassifyTile` ne le consomme. Noté dans OPSTACK-PROGRESS.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.LayerLineSpacing > 0.0f && P.LayerLineDepth > 0.0f)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
@@ -2556,9 +2598,10 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.RibbingSpacing > 0.0f && P.RibbingDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
@@ -2626,9 +2669,10 @@ namespace
         }
 
         /** Lobe positif seulement ⇒ n'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
@@ -2705,9 +2749,10 @@ namespace
         }
 
         /** `Both` : le signe suit celui de `VertGrad · CaveSDF`, donc les deux directions. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.CliffStrength > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
@@ -2767,9 +2812,10 @@ namespace
         }
 
         /** Lobe positif seulement, SOUSTRAIT ⇒ `CarveOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.ScallopStrength > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
@@ -2875,9 +2921,10 @@ namespace
         /** N'AJOUTE que du solide ⇒ `FillOnly`. Une vraie borne spatiale existe (les arches vivent
          *  dans le rayon d'une salle) mais elle demande le cache pour la boîte interrogée — même
          *  dette que `FRoomGraphSource::EffectOverBox`, et elle se paiera au même moment. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.ArchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -2937,8 +2984,9 @@ namespace
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. On ne peut pas rendre `Identity` sans consulter le
          *  cache pour la boîte interrogée — même dette que le graphe de salles. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return EVoxelOpEffect::FillOnly;
         }
 
@@ -3029,9 +3077,10 @@ namespace
         }
 
         /** Ne SOUSTRAIT que ⇒ `CarveOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.DomeDensity > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
@@ -3127,9 +3176,10 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.PinchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -3182,9 +3232,10 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
+            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.FloorBias > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -3508,7 +3559,7 @@ namespace VoxelDensityOps
         //    `Sdf < SDFBlendRadius·3` via VF_NearCaveSurface. Voir la note de l'étape B5 là-bas.
         //    L'ORDRE EST CELUI DE L'ORIGINAL et il compte : chacun lit la densité que le précédent
         //    a laissée (le biais de sol, en particulier, existe pour rattraper la rugosité).
-        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));            // 4b
+        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed, RoomPtr));   // 4b
         OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
         OutStack.Add(MakeUnique<FLayerLineMod>(P, RoomPtr));             // 4c — lignes de strates
         OutStack.Add(MakeUnique<FRibbingMod>(P, RoomPtr));               // 4c — nervures
