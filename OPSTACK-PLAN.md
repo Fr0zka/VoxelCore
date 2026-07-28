@@ -10,9 +10,11 @@
 > FloatingIslands · TunnelNetwork · Underwater.** The archetype `switch` now has a complete
 > operator-stack twin, opt-in per strate.
 >
-> ⚠️ **The last three groups (stage B, C1, C2, C3) are UNVERIFIED — written, committed, never
-> compiled.** Run the `VoxelForge` filter; `OPSTACK-PROGRESS.md`'s last entry lists every commit and
-> what breaks first if one is wrong.
+> ✅ **BUILT AND GREEN, 2026-07-28 — 14 tests.** TunnelNetwork A+B bit-identical over 6000 samples
+> with all twelve group-coverage probes non-zero, all four noise branches covered, 0 gate leaks, and
+> C1 proved by 10 Terrace-op rooms containing 1119 samples. One open warning: the `Underwater` check
+> landed 0 samples in open cave, so its bit-identity proves little — diagnosed, not guessed, in
+> `OPSTACK-PROGRESS.md`'s last entry.
 >
 > **Not done, and it is the next real prize:** `ClassifyTile` still uses hand-written guards and does
 > not consume `ClassifyBox`. That is where measured tile-skipping becomes frames.

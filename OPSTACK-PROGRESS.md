@@ -2395,3 +2395,75 @@ difference *is* the T1.d gain.
 
 After that: make `FRoomGraphSource::EffectOverBox` answer spatially. Everything else is now waiting
 on it, and the two commits above were built to receive it.
+
+---
+
+## 2026-07-28 — **IT ALL COMPILES AND IT IS ALL GREEN.** 14 tests. 8 of 8, verified.
+
+Jahni built it. Everything written across the unattended run is now verified except one number.
+
+```
+TunnelNetwork STAGE A+B ... bit-identical, 6000 samples (1002 open cave, 4699 rock)
+Cave coverage ............ 16.7 %                         (floor 10 %)
+Group coverage ........... roughness 64.8 % · terrace 60.2 % · layer lines 25.7 %
+                           ribbing 13.4 % · overhang 39.4 % · cliff 26.2 %
+                           scallop 1.6 % · arches 3.4 % · domes 1.6 % · pinch 1.0 %
+                           floor bias 18.2 %              ← ALL TWELVE NON-ZERO
+Roughness noise sweep .... 8/8 variants bit-identical over 1500 samples
+Gate check (B5) .......... 979 outside the gate, 0 leaked; 4880 inside move
+Params fingerprint ....... 395/400 = 98.8 % differ, 0 served wrong
+Bake coverage ............ 49 rooms, 26 pits, 30 chimneys, 39 columns
+Per-room override (C1) ... 51/51 rooms carry an op, 10 Terrace, 1119 samples inside them
+Box verdicts ............. 0 proved, 40 Mixed             (asserted)
+Underwater (C2) .......... bit-identical, 2000 samples — 0 in open cave  ⚠️
+```
+
+**Every claim this run made about correctness now has a measurement behind it.** The twelve
+modifiers are transcribed correctly *and* each demonstrably fired; the four noise branches are
+covered, not just the one; the gate suppresses everything outside it with zero leaks; and C1 is
+proved by the only check that could prove it — 10 rooms drawing a `Terrace` op whose params
+overwrite the strate's, with 1119 samples inside them, still bit-identical.
+
+### The one number that is a warning, and it is the test working
+
+`Underwater: 0 of 2000 samples in open cave.` **A green bit-identity over 2000 samples of solid rock
+is not evidence** — it is exactly what two agreeing voids look like. Same failure as stage A's 1.1 %
+run, in a different slot, caught by a counter written for precisely that.
+
+**A real bug surfaced while diagnosing it.** The sampled chunk-Z range used `Z / CHUNK_SIZE`, and
+C++ integer division **truncates toward zero**. TunnelNetwork sits at the top of the layout in
+positive Z, where truncation and floor agree — so the bug could not show there. Underwater sits at
+the **bottom, in negative Z**: `-1 / 32` is `0` truncated and `-1` floored, so the upper chunk bound
+starts a notch too high and the `Clamp` piles the excess onto the strate's last voxel, inside the
+top seal band, i.e. solid rock. Fixed in both point builders (`FloorDivChunk`). Same family as the
+`DivideAndRoundDown` lesson already in the project notes.
+
+That is a **candidate**, not a conclusion, so the fix does not stand alone: new **check 5b** gives
+each of the three possible causes its own number — rooms baked for the Underwater strate index (the
+bake), samples landing inside the seal-free interior (the Z range), and both non-zero (the XY
+spread) — and prints how to read them. Sampling also widens 8 → 24 clusters. **Unverified: this
+commit has not been built.**
+
+### What the green run settles, beyond the tests
+
+- `AUDIT §C10` stays closed: eight archetypes now compare **bit for bit** against their originals
+  across every detail path, including four noise types and a domain warp.
+- The `FRoomGraphSource::FState` hoist, the lazy `LocalParams()` memo and the whole C1 mechanism are
+  compiled and exercised — the pattern "one op owns the state, the rest read it" now has three
+  users, all green.
+- The extraction of `VF_BuildOpStackForChunk` did not disturb `GetDensityAt`: the equivalence tests
+  that route through it are unchanged.
+- `0 proved, 40 Mixed` remains **asserted** for TunnelNetwork. That is not a defect and not stale:
+  the chain still dies at `FRoomGraphSource::EffectOverBox`, which is the next piece of work.
+
+### Next single action
+
+Re-run the filter and read **one line**: `Underwater diagnosis`. It names which of the three causes
+produced the 0 %, and the fix follows from that rather than from a guess.
+
+Then the one thing everything else is now waiting on: **make `FRoomGraphSource::EffectOverBox`
+answer spatially.** Its room and tunnel bounds are already in the SDF cache; what it costs is
+building that cache for the queried box, and that is now clearly worth it — a skipped tile saves
+30 000+ density evaluations, `ClassifyTile` consumes `ClassifyBox` in production, the numeric
+amplitude fold is in place, and the twelve modifiers already inherit the source's verdict. Every
+piece is built to receive it and nothing else moves until it lands.
