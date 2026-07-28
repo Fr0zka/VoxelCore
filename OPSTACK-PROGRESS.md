@@ -2850,3 +2850,88 @@ tunnels.
 
 `SpanCells` / `SpanVoxelsReported` / `NumTilesAwayFromSpine` are new locals hoisted **outside** the
 tile loop (the report line needs them); `P.OriginRoomRadius` and `P.RoomSpacing` are read in check 4.
+
+## 2026-07-28 — the sampler fix worked, the prediction failed, and the fixture is the reason
+
+The widened sampler did exactly what it was meant to: **39 of 40 tiles now land clear of the (0,0)
+spine.** And the verdict did not move.
+
+```
+[before] rooms 40, tunnels 40 | 4.9 of 7.2 rooms, 69.2 of 80.4 tunnels   (XY ±32)
+[after ] rooms 40, tunnels 40 | 6.3 of 8.3 rooms, 78.0 of 87.7 tunnels   (XY ±320, 39/40 off-spine)
+```
+
+My stated prediction was *"rooms should stop hitting every tile."* **They did not.** By my own
+pre-registered rule that means the room-lattice model was wrong — and it was, for a reason printed in
+the report I had been reading past for three runs:
+
+> `= 7.6 x RoomSpacing 42`
+
+**`RoomSpacing` is 42 here, not the 80 I computed with.** I read the `UPROPERTY` default out of the
+header instead of the fixture, which overrides it. Fifth premise this refactor that reversed on being
+checked, and the plainest one: *the number was on screen.*
+
+### Why the fixture cannot ever prove a tile — arithmetic, not opinion
+
+`EnableTunnelFeatures` densifies **on purpose**, and says so: `RoomSpacing` 80 → 42,
+`RoomDensity` 0.35 → 0.85, because at the defaults the first run had **1.1 %** of samples in open
+cave and the equivalence was comparing solid rock to solid rock. That densification is what makes
+check 1 mean anything.
+
+It is also exactly antagonistic to provability:
+
+```
+room cull radius = max(R·1.5, R·HeightRatio) + 3·SDFBlendRadius
+                 = 1.5R + 12      for R ∈ [10,30]  ⇒  27 … 57,  mean ≈ 42
+lattice spacing  = 42,  occupancy 0.85
+```
+
+**The mean cull radius equals the lattice spacing.** Sphere volume over cell volume gives ~3.6×
+redundant coverage — *no box in that world can be outside all room cull spheres.* `6.3 of 8.3 rooms
+reach` is not a symptom of a loose test; it is the world being saturated. No sampler change and no
+tightening of tunnels can move it, which is why widening the sampler correctly changed nothing.
+
+**So `0 proved` on this fixture is the right answer**, and it is informative: the tile-skipping prize
+shrinks to nothing as caves saturate. What it is *not* is an answer about production.
+
+### Both worlds, one criterion
+
+Check 4 is now a lambda run twice — **parameterised, not copy-pasted**, because two copies of the
+criterion would drift and the second one would lie:
+
+- **`[dense fixture]`** — as before. Expected to keep reporting ~0, and that is now written down as
+  the correct result rather than read as a failure.
+- **`[production defaults]`** — the same 40 tiles against `RoomSpacing 80 / RoomDensity 0.35`, the
+  actual `UVoxelStrateDefinition` defaults, which is the world the question "how many tiles can we
+  skip" is really about. At that spacing, cull spheres of mean radius 42 on an 80-lattice at 35 %
+  occupancy cover roughly a fifth of space.
+
+Both are brute-forced voxel by voxel. This is **not** "widen it until it passes": the dense run stays
+in the report and must stay ~0, and a false verdict in either run still fails the assertion. The two
+stacks deliberately share `FRoomGraphSource`'s `thread_local` caches — the params fingerprint in the
+key is what keeps them apart, so this run and check 3 now watch each other.
+
+### The lesson, and it is not the one I expected to write
+
+Three runs in a row I reasoned from `RoomSpacing = 80` while the test printed 42 at me. The
+instrument was right, the arithmetic done on it was right, and the *input to the arithmetic* was
+taken from the wrong file. **"Verify the premise" has to include the premises you are confident
+enough about not to look up** — especially a default, when a fixture exists whose entire job is to
+override defaults.
+
+### Ready to build. Compile-error spots
+
+1. Check 4 is now `auto RunTileScan = [&](const FVoxelOpStack& S, const FStrateGenerationParams& TP,
+   const FVoxelOpContext& TCtx, const TCHAR* Label)`, called twice. Verified mechanically: zero bare
+   `Stack` / `P.` / `Ctx` references survive inside the lambda body, braces and parens balance.
+2. Five `FString::Printf` sites gained a leading `%s` **and** the matching `Label` argument — the
+   mismatch was caught and fixed before commit; worth re-checking if the log looks scrambled.
+3. `SparseStack` is a second `FVoxelOpStack` built by `BuildTunnelNetworkStack` and `PrepareChunk`ed.
+
+### What to read
+
+**`[production defaults] Box verdicts`** — the only new number that matters. Non-zero is the first
+real T1.d saving in the plugin. If it is *also* zero, then the per-class line under it says whether
+rooms still saturate at 80 spacing (my model is wrong again, look there) or whether tunnels are
+finally alone (the segment-vs-box disjunction from the previous entry is then the whole remaining
+job, and its three unverified premises are listed there).

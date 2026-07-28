@@ -1102,193 +1102,250 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // would now forbid the very gain this change makes. What replaces it is the assertion that
     // actually matters — every proved tile is brute-forced voxel by voxel, because a false verdict
     // means no geometry and NO COLLISION until a player falls through it.
+    // ⚠️ UNE SEULE DÉFINITION DU BALAYAGE, DEUX MONDES. Voir le commentaire d'appel plus bas :
+    // la densité de la fixture rend ce verdict STRUCTURELLEMENT impossible, donc mesurer sur elle
+    // seule ne dit rien de la production. Copier-coller le balayage aurait donné deux critères qui
+    // divergent ; c'est un paramètre, pas un doublon.
+    auto RunTileScan = [&](const FVoxelOpStack& S, const FStrateGenerationParams& TP,
+                           const FVoxelOpContext& TCtx, const TCHAR* Label)
     {
-        int32 NumProved = 0, NumMixed = 0, NumSolid = 0, NumAir = 0;
-        int32 NumBruteSamples = 0, NumViolations = 0;
-        float WorstViolation = 0.0f;
-        TMap<FString, int32> SolidKillerCounts;
-        int32 NumRoomKilled = 0, NumTilesAwayFromSpine = 0;
-        // ±320 voxels = 4 x RoomSpacing. Hors de la boucle : la ligne de rapport en a besoin, et
-        // une étendue d'échantillonnage qu'on ne peut pas citer est une étendue qu'on ne surveille pas.
-        const int32 SpanCells = 40;
-        const int32 SpanVoxelsReported = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
-        int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
-        int32 SumHitRooms = 0, SumNumRooms = 0, SumHitTunnels = 0, SumNumTunnels = 0;
+            int32 NumProved = 0, NumMixed = 0, NumSolid = 0, NumAir = 0;
+            int32 NumBruteSamples = 0, NumViolations = 0;
+            float WorstViolation = 0.0f;
+            TMap<FString, int32> SolidKillerCounts;
+            int32 NumRoomKilled = 0, NumTilesAwayFromSpine = 0;
+            // ±320 voxels = 4 x RoomSpacing. Hors de la boucle : la ligne de rapport en a besoin, et
+            // une étendue d'échantillonnage qu'on ne peut pas citer est une étendue qu'on ne surveille pas.
+            const int32 SpanCells = 40;
+            const int32 SpanVoxelsReported = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
+            int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
+            int32 SumHitRooms = 0, SumNumRooms = 0, SumHitTunnels = 0, SumNumTunnels = 0;
 
-        FRandomStream Rng(97531);
-        for (int32 t = 0; t < 40; ++t)
-        {
-            const int32 Step = 1, Cells = 8;
-            const int32 Extent = Step * Cells;
-
-            // ⚠️ L'ÉTENDUE XY ÉTAIT ±32 VOXELS, ET C'EST CE QUI RENDAIT CE BLOC INEXPLOITABLE.
-            // `RandRange(-4, 4) * 8` échantillonnait 40 tuiles dans un cube de ±32 voxels autour de
-            // (0,0) — c'est-à-dire l'endroit le PLUS creusé du monde entier, et de loin :
-            //   • `RoomSpacing = 80`, donc ±32 ne couvre même pas la moitié d'UNE cellule de salle ;
-            //   • `OriginRoomRadius = 20` garantit une grosse salle exactement à (0,0), de rayon de
-            //     cull `max(20·1.5, 8) + 3·4 = 42` — qui avale la quasi-totalité de la fenêtre ;
-            //   • la spine (0,0) descend précisément là.
-            // La mesure « 4.9 salles sur 7.2 atteignent la boîte » ne décrivait donc pas la densité
-            // de grottes du monde, elle décrivait le hub de la spine. Aucune conclusion sur la
-            // prouvabilité du roc profond ne pouvait sortir de cet échantillon.
-            //
-            // ⚠️ CE N'EST PAS « ÉLARGIR JUSQU'À CE QUE ÇA PASSE ». Le verdict de chaque tuile reste
-            // brute-forcé voxel par voxel juste en dessous : un échantillonneur plus large qui
-            // produirait un verdict FAUX échoue exactement comme avant. On corrige ce que la mesure
-            // REGARDE, pas ce qu'elle exige.
-            //
-            // The XY extent was ±32 voxels around (0,0) -- with RoomSpacing = 80 and a guaranteed
-            // OriginRoomRadius = 20 room at the origin, that samples the single most cave-dense spot
-            // in the world and says nothing about deep rock. Widening changes what the measurement
-            // LOOKS AT, not what it demands: every verdict is still brute-forced below.
-            const FIntVector Origin(
-                Rng.RandRange(-SpanCells, SpanCells) * Extent,
-                Rng.RandRange(-SpanCells, SpanCells) * Extent,
-                FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
-
-            // Combien de tuiles échappent vraiment au hub de la spine : sans ce compte, un futur
-            // resserrement de l'étendue redeviendrait invisible.
-            if (FMath::Square((float)Origin.X) + FMath::Square((float)Origin.Y)
-                > FMath::Square(3.0f * P.OriginRoomRadius))
+            FRandomStream Rng(97531);
+            for (int32 t = 0; t < 40; ++t)
             {
-                ++NumTilesAwayFromSpine;
-            }
-            const int32 GridDim = Cells + 1;
-            const FBox Box(
-                FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
-                FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
+                const int32 Step = 1, Cells = 8;
+                const int32 Extent = Step * Cells;
 
-            // ATTRIBUTION — le même pliage, mais il dit QUI tue chaque hypothèse. Le premier build
-            // de l'`EffectOverBox` spatial est revenu vert avec 0 tuile prouvée, et le rapport ne
-            // savait nommer aucun coupable : les deux causes que la mise en garde proposait étaient
-            // toutes les deux fausses, la vraie étant un troisième opérateur. On ne redevine pas.
-            int32 SolidKiller = INDEX_NONE, AirKiller = INDEX_NONE;
-            const EVoxelTileClass Verdict = Stack.ClassifyBoxAttributed(Box, Ctx, SolidKiller, AirKiller);
+                // ⚠️ L'ÉTENDUE XY ÉTAIT ±32 VOXELS, ET C'EST CE QUI RENDAIT CE BLOC INEXPLOITABLE.
+                // `RandRange(-4, 4) * 8` échantillonnait 40 tuiles dans un cube de ±32 voxels autour de
+                // (0,0) — c'est-à-dire l'endroit le PLUS creusé du monde entier, et de loin :
+                //   • `RoomSpacing = 80`, donc ±32 ne couvre même pas la moitié d'UNE cellule de salle ;
+                //   • `OriginRoomRadius = 20` garantit une grosse salle exactement à (0,0), de rayon de
+                //     cull `max(20·1.5, 8) + 3·4 = 42` — qui avale la quasi-totalité de la fenêtre ;
+                //   • la spine (0,0) descend précisément là.
+                // La mesure « 4.9 salles sur 7.2 atteignent la boîte » ne décrivait donc pas la densité
+                // de grottes du monde, elle décrivait le hub de la spine. Aucune conclusion sur la
+                // prouvabilité du roc profond ne pouvait sortir de cet échantillon.
+                //
+                // ⚠️ CE N'EST PAS « ÉLARGIR JUSQU'À CE QUE ÇA PASSE ». Le verdict de chaque tuile reste
+                // brute-forcé voxel par voxel juste en dessous : un échantillonneur plus large qui
+                // produirait un verdict FAUX échoue exactement comme avant. On corrige ce que la mesure
+                // REGARDE, pas ce qu'elle exige.
+                //
+                // The XY extent was ±32 voxels around (0,0) -- with RoomSpacing = 80 and a guaranteed
+                // OriginRoomRadius = 20 room at the origin, that samples the single most cave-dense spot
+                // in the world and says nothing about deep rock. Widening changes what the measurement
+                // LOOKS AT, not what it demands: every verdict is still brute-forced below.
+                const FIntVector Origin(
+                    Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                    Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                    FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
 
-            if (SolidKiller != INDEX_NONE)
-            {
-                const FString KillerName = Stack.GetOpDebugName(SolidKiller);
-                SolidKillerCounts.FindOrAdd(KillerName)++;
-
-                // VENTILATION PAR CLASSE DE PRIMITIVE. Quand c'est la source de salles qui tue,
-                // « les tuiles traversent une grotte » n'est pas une réponse : les salles, les
-                // tunnels, les pits et les cheminées ont chacun leur borne, de finesse très
-                // différente (une sphère englobante de capsule est un très mauvais tunnel). On lit
-                // ce que l'opérateur a RÉELLEMENT calculé plutôt que de rejouer le critère ici.
-                if (KillerName == TEXT("RoomGraphSource"))
+                // Combien de tuiles échappent vraiment au hub de la spine : sans ce compte, un futur
+                // resserrement de l'étendue redeviendrait invisible.
+                if (FMath::Square((float)Origin.X) + FMath::Square((float)Origin.Y)
+                    > FMath::Square(3.0f * TP.OriginRoomRadius))
                 {
-                    const VoxelDensityOps::FRoomBoxDiagnostic D =
-                        VoxelDensityOps::GetLastRoomBoxDiagnostic();
-                    ++NumRoomKilled;
-                    if (D.HitRooms    > 0) { ++TilesHitByRooms; }
-                    if (D.HitTunnels  > 0) { ++TilesHitByTunnels; }
-                    if (D.HitPits     > 0) { ++TilesHitByPits; }
-                    if (D.HitChimneys > 0) { ++TilesHitByChimneys; }
-                    SumHitRooms   += D.HitRooms;   SumNumRooms   += D.NumRooms;
-                    SumHitTunnels += D.HitTunnels; SumNumTunnels += D.NumTunnels;
+                    ++NumTilesAwayFromSpine;
+                }
+                const int32 GridDim = Cells + 1;
+                const FBox Box(
+                    FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
+                    FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
+
+                // ATTRIBUTION — le même pliage, mais il dit QUI tue chaque hypothèse. Le premier build
+                // de l'`EffectOverBox` spatial est revenu vert avec 0 tuile prouvée, et le rapport ne
+                // savait nommer aucun coupable : les deux causes que la mise en garde proposait étaient
+                // toutes les deux fausses, la vraie étant un troisième opérateur. On ne redevine pas.
+                int32 SolidKiller = INDEX_NONE, AirKiller = INDEX_NONE;
+                const EVoxelTileClass Verdict = S.ClassifyBoxAttributed(Box, TCtx, SolidKiller, AirKiller);
+
+                if (SolidKiller != INDEX_NONE)
+                {
+                    const FString KillerName = S.GetOpDebugName(SolidKiller);
+                    SolidKillerCounts.FindOrAdd(KillerName)++;
+
+                    // VENTILATION PAR CLASSE DE PRIMITIVE. Quand c'est la source de salles qui tue,
+                    // « les tuiles traversent une grotte » n'est pas une réponse : les salles, les
+                    // tunnels, les pits et les cheminées ont chacun leur borne, de finesse très
+                    // différente (une sphère englobante de capsule est un très mauvais tunnel). On lit
+                    // ce que l'opérateur a RÉELLEMENT calculé plutôt que de rejouer le critère ici.
+                    if (KillerName == TEXT("RoomGraphSource"))
+                    {
+                        const VoxelDensityOps::FRoomBoxDiagnostic D =
+                            VoxelDensityOps::GetLastRoomBoxDiagnostic();
+                        ++NumRoomKilled;
+                        if (D.HitRooms    > 0) { ++TilesHitByRooms; }
+                        if (D.HitTunnels  > 0) { ++TilesHitByTunnels; }
+                        if (D.HitPits     > 0) { ++TilesHitByPits; }
+                        if (D.HitChimneys > 0) { ++TilesHitByChimneys; }
+                        SumHitRooms   += D.HitRooms;   SumNumRooms   += D.NumRooms;
+                        SumHitTunnels += D.HitTunnels; SumNumTunnels += D.NumTunnels;
+                    }
+                }
+
+                if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
+
+                ++NumProved;
+                const bool bClaimSolid = (Verdict == EVoxelTileClass::AllSolid);
+                if (bClaimSolid) { ++NumSolid; } else { ++NumAir; }
+
+                // BRUTE FORCE — la boîte entière, pas un échantillonnage. `EvalMC` rend la convention
+                // du mesher (négatif = solide), donc « tout solide » veut dire qu'aucun échantillon
+                // n'est du côté air. On teste le SIGNE, c'est-à-dire l'existence d'une traversée
+                // d'isosurface : c'est exactement la propriété sur laquelle le mesher est sauté.
+                for (float Z = (float)Box.Min.Z; Z <= (float)Box.Max.Z; Z += 1.0f)
+                for (float Y = (float)Box.Min.Y; Y <= (float)Box.Max.Y; Y += 1.0f)
+                for (float X = (float)Box.Min.X; X <= (float)Box.Max.X; X += 1.0f)
+                {
+                    const float D = S.EvalMC(X, Y, Z);
+                    ++NumBruteSamples;
+                    const bool bViolates = bClaimSolid ? (D > 0.0f) : (D < 0.0f);
+                    if (bViolates)
+                    {
+                        ++NumViolations;
+                        WorstViolation = FMath::Max(WorstViolation, FMath::Abs(D));
+                    }
                 }
             }
-
-            if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
-
-            ++NumProved;
-            const bool bClaimSolid = (Verdict == EVoxelTileClass::AllSolid);
-            if (bClaimSolid) { ++NumSolid; } else { ++NumAir; }
-
-            // BRUTE FORCE — la boîte entière, pas un échantillonnage. `EvalMC` rend la convention
-            // du mesher (négatif = solide), donc « tout solide » veut dire qu'aucun échantillon
-            // n'est du côté air. On teste le SIGNE, c'est-à-dire l'existence d'une traversée
-            // d'isosurface : c'est exactement la propriété sur laquelle le mesher est sauté.
-            for (float Z = (float)Box.Min.Z; Z <= (float)Box.Max.Z; Z += 1.0f)
-            for (float Y = (float)Box.Min.Y; Y <= (float)Box.Max.Y; Y += 1.0f)
-            for (float X = (float)Box.Min.X; X <= (float)Box.Max.X; X += 1.0f)
-            {
-                const float D = Stack.EvalMC(X, Y, Z);
-                ++NumBruteSamples;
-                const bool bViolates = bClaimSolid ? (D > 0.0f) : (D < 0.0f);
-                if (bViolates)
-                {
-                    ++NumViolations;
-                    WorstViolation = FMath::Max(WorstViolation, FMath::Abs(D));
-                }
-            }
-        }
-
-        AddInfo(FString::Printf(
-            TEXT("Tile sampler: 40 tiles of 10 voxels, XY drawn from +/-%d voxels (= %.1f x ")
-            TEXT("RoomSpacing %.0f), Z across the strate; %d of 40 landed further than 3 x ")
-            TEXT("OriginRoomRadius from the (0,0) spine. THIS LINE EXISTS BECAUSE THE SAMPLER WAS ")
-            TEXT("THE BUG ONCE: it drew XY from +/-32 voxels, i.e. entirely inside the origin room's ")
-            TEXT("cull sphere, so every number below described the spine hub rather than the world. ")
-            TEXT("If the last count is low, nothing below says anything about deep rock."),
-            SpanVoxelsReported, (float)SpanVoxelsReported / FMath::Max(P.RoomSpacing, 1.0f),
-            P.RoomSpacing, NumTilesAwayFromSpine));
-
-        AddInfo(FString::Printf(
-            TEXT("Box verdicts over 40 TunnelNetwork tiles: %d proved (%d AllSolid, %d AllAir), ")
-            TEXT("%d Mixed -- brute-forced over %d voxels, %d violations. This number was 0 proved / ")
-            TEXT("40 Mixed until FRoomGraphSource::EffectOverBox learned to answer spatially, and it ")
-            TEXT("is the single largest perf item of the whole plan (OPSTACK-DECOMPOSITION 0.2): a ")
-            TEXT("proved tile skips GenerateMesh entirely, so it trades one BuildChunkCache against ")
-            TEXT("30000+ density evaluations. Read the PROVED count as a measurement, never as a ")
-            TEXT("contract -- what is asserted below is that none of them is WRONG, because a false ")
-            TEXT("verdict leaves no geometry and no collision behind it."),
-            NumProved, NumSolid, NumAir, NumMixed, NumBruteSamples, NumViolations));
-
-        // QUI TUE `AllSolid`, ET COMBIEN DE FOIS. Toujours imprimé, pas seulement en cas d'échec :
-        // c'est aussi la ligne qui dit, quand des tuiles SONT prouvées, ce qui bloque les autres.
-        {
-            SolidKillerCounts.ValueSort([](int32 A, int32 B) { return A > B; });
-            FString Breakdown;
-            for (const TPair<FString, int32>& Kv : SolidKillerCounts)
-            {
-                if (!Breakdown.IsEmpty()) { Breakdown += TEXT(", "); }
-                Breakdown += FString::Printf(TEXT("%s x%d"), *Kv.Key, Kv.Value);
-            }
-            if (Breakdown.IsEmpty()) { Breakdown = TEXT("nothing -- AllSolid survived every tile"); }
 
             AddInfo(FString::Printf(
-                TEXT("AllSolid killed by: %s. This is the line that replaced a guess. The first ")
-                TEXT("build of the spatial EffectOverBox reported 0 proved of 40, and the warning ")
-                TEXT("offered two candidate causes -- BOTH WRONG. The real one was a third operator ")
-                TEXT("nobody was looking at: FWormFieldSource answered CarveOnly everywhere, and ")
-                TEXT("since BaseDensity=8 < WormStrength=10 BY DEFAULT, its provable amplitude bound ")
-                TEXT("alone drove SolidMargin negative on every tile in the world. Attribution is ")
-                TEXT("cheap; a second wrong guess is not."),
-                *Breakdown));
+                TEXT("[%s] Tile sampler: 40 tiles of 10 voxels, XY drawn from +/-%d voxels (= %.1f x ")
+                TEXT("RoomSpacing %.0f), Z across the strate; %d of 40 landed further than 3 x ")
+                TEXT("OriginRoomRadius from the (0,0) spine. THIS LINE EXISTS BECAUSE THE SAMPLER WAS ")
+                TEXT("THE BUG ONCE: it drew XY from +/-32 voxels, i.e. entirely inside the origin room's ")
+                TEXT("cull sphere, so every number below described the spine hub rather than the world. ")
+                TEXT("If the last count is low, nothing below says anything about deep rock."),
+                Label, SpanVoxelsReported, (float)SpanVoxelsReported / FMath::Max(TP.RoomSpacing, 1.0f),
+                TP.RoomSpacing, NumTilesAwayFromSpine));
 
-            if (NumRoomKilled > 0)
+            AddInfo(FString::Printf(
+                TEXT("[%s] Box verdicts over 40 TunnelNetwork tiles: %d proved (%d AllSolid, %d AllAir), ")
+                TEXT("%d Mixed -- brute-forced over %d voxels, %d violations. This number was 0 proved / ")
+                TEXT("40 Mixed until FRoomGraphSource::EffectOverBox learned to answer spatially, and it ")
+                TEXT("is the single largest perf item of the whole plan (OPSTACK-DECOMPOSITION 0.2): a ")
+                TEXT("proved tile skips GenerateMesh entirely, so it trades one BuildChunkCache against ")
+                TEXT("30000+ density evaluations. Read the PROVED count as a measurement, never as a ")
+                TEXT("contract -- what is asserted below is that none of them is WRONG, because a false ")
+                TEXT("verdict leaves no geometry and no collision behind it."),
+                Label, NumProved, NumSolid, NumAir, NumMixed, NumBruteSamples, NumViolations));
+
+            // QUI TUE `AllSolid`, ET COMBIEN DE FOIS. Toujours imprimé, pas seulement en cas d'échec :
+            // c'est aussi la ligne qui dit, quand des tuiles SONT prouvées, ce qui bloque les autres.
             {
+                SolidKillerCounts.ValueSort([](int32 A, int32 B) { return A > B; });
+                FString Breakdown;
+                for (const TPair<FString, int32>& Kv : SolidKillerCounts)
+                {
+                    if (!Breakdown.IsEmpty()) { Breakdown += TEXT(", "); }
+                    Breakdown += FString::Printf(TEXT("%s x%d"), *Kv.Key, Kv.Value);
+                }
+                if (Breakdown.IsEmpty()) { Breakdown = TEXT("nothing -- AllSolid survived every tile"); }
+
                 AddInfo(FString::Printf(
-                    TEXT("...and when RoomGraphSource is the killer (%d tiles), WHICH primitive class ")
-                    TEXT("reaches the box: rooms %d, tunnels %d, pits %d, chimneys %d (tiles, not ")
-                    TEXT("primitives -- a tile can be hit by several). Averages per killed tile: ")
-                    TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. THIS is the line that ")
-                    TEXT("says what to tighten. A tunnel is culled per voxel by its BOUNDING SPHERE, ")
-                    TEXT("which for a long thin capsule is an enormous over-estimate; a room's cull ")
-                    TEXT("sphere is a fair fit. So tunnels >> rooms here would mean the box test is ")
-                    TEXT("losing to capsule bounding spheres, not to real cave -- and the fix would ")
-                    TEXT("be a segment-vs-box distance, not anything about the sampler."),
-                    NumRoomKilled, TilesHitByRooms, TilesHitByTunnels, TilesHitByPits, TilesHitByChimneys,
-                    (float)SumHitRooms   / (float)NumRoomKilled, (float)SumNumRooms   / (float)NumRoomKilled,
-                    (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled));
+                    TEXT("[%s] AllSolid killed by: %s. This is the line that replaced a guess. The first ")
+                    TEXT("build of the spatial EffectOverBox reported 0 proved of 40, and the warning ")
+                    TEXT("offered two candidate causes -- BOTH WRONG. The real one was a third operator ")
+                    TEXT("nobody was looking at: FWormFieldSource answered CarveOnly everywhere, and ")
+                    TEXT("since BaseDensity=8 < WormStrength=10 BY DEFAULT, its provable amplitude bound ")
+                    TEXT("alone drove SolidMargin negative on every tile in the world. Attribution is ")
+                    TEXT("cheap; a second wrong guess is not."),
+                    Label, *Breakdown));
+
+                if (NumRoomKilled > 0)
+                {
+                    AddInfo(FString::Printf(
+                        TEXT("[%s] ...and when RoomGraphSource is the killer (%d tiles), WHICH primitive class ")
+                        TEXT("reaches the box: rooms %d, tunnels %d, pits %d, chimneys %d (tiles, not ")
+                        TEXT("primitives -- a tile can be hit by several). Averages per killed tile: ")
+                        TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. THIS is the line that ")
+                        TEXT("says what to tighten. A tunnel is culled per voxel by its BOUNDING SPHERE, ")
+                        TEXT("which for a long thin capsule is an enormous over-estimate; a room's cull ")
+                        TEXT("sphere is a fair fit. So tunnels >> rooms here would mean the box test is ")
+                        TEXT("losing to capsule bounding spheres, not to real cave -- and the fix would ")
+                        TEXT("be a segment-vs-box distance, not anything about the sampler."),
+                        Label, NumRoomKilled, TilesHitByRooms, TilesHitByTunnels, TilesHitByPits, TilesHitByChimneys,
+                        (float)SumHitRooms   / (float)NumRoomKilled, (float)SumNumRooms   / (float)NumRoomKilled,
+                        (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled));
+                }
             }
-        }
 
-        if (NumProved == 0)
-        {
-            AddWarning(TEXT("No TunnelNetwork tile was proved, so the brute force below verified ")
-                       TEXT("nothing -- it has no verdict to contradict. Do NOT re-derive the cause: ")
-                       TEXT("read the 'AllSolid killed by' line above, which names the operator and ")
-                       TEXT("counts how often. If it names RoomGraphSource, the tiles genuinely ")
-                       TEXT("straddle cave (check the bake-coverage line of 5b); anything else is an ")
-                       TEXT("operator whose box answer is more pessimistic than its Eval."));
-        }
+            if (NumProved == 0)
+            {
+                AddWarning(FString::Printf(
+                    TEXT("[%s] No tile was proved, so the brute force verified nothing -- it has no ")
+                    TEXT("verdict to contradict. Do NOT re-derive the cause: read the two lines above, ")
+                    TEXT("which name the operator and then the primitive class. ⚠️ On the DENSE ")
+                    TEXT("FIXTURE this is the EXPECTED and correct result, not a defect: room cull ")
+                    TEXT("radius (1.5R + 3*SDFBlendRadius, mean ~42) equals RoomSpacing 42 at 85%% ")
+                    TEXT("occupancy, so cull spheres cover that world ~3.6x over and no box can be ")
+                    TEXT("outside all of them. It is the 'production defaults' run that answers ")
+                    TEXT("whether real worlds have skippable rock."),
+                    Label));
+            }
 
-        TestEqual(FString::Printf(
-                      TEXT("every proved TunnelNetwork tile survives brute force (worst |density| ")
-                      TEXT("on the wrong side: %.9g)"), WorstViolation),
-                  NumViolations, 0);
+            TestEqual(FString::Printf(
+                          TEXT("[%s] every proved TunnelNetwork tile survives brute force (worst ")
+                          TEXT("|density| on the wrong side: %.9g)"), Label, WorstViolation),
+                      NumViolations, 0);
+    };
+
+    //-------------------------------------------------------------------------
+    // LES DEUX MONDES, ET POURQUOI IL EN FAUT DEUX
+    //-------------------------------------------------------------------------
+    // ⚠️ LA FIXTURE REND CE VERDICT STRUCTURELLEMENT IMPOSSIBLE, ET CE N'EST PAS UN DÉFAUT DE LA
+    // FIXTURE. `EnableTunnelFeatures` densifie délibérément (`RoomSpacing` 80 → 42,
+    // `RoomDensity` 0.35 → 0.85) parce qu'aux défauts le premier run n'avait que 1,1 % des
+    // échantillons en grotte — l'équivalence comparait du roc plein à du roc plein. Cette
+    // densification est ce qui rend le contrôle 1 SIGNIFIANT.
+    //
+    // Mais elle est exactement ANTAGONISTE de la prouvabilité, et l'arithmétique le dit sans
+    // ambiguïté : le rayon de cull d'une salle vaut `max(R·1.5, R·HeightRatio) + 3·SDFBlendRadius`,
+    // soit `1.5R + 12` ⇒ entre 27 et 57 pour `R ∈ [10, 30]`, moyenne ≈ 42 — c'est-à-dire
+    // **exactement le pas du réseau**, à 85 % d'occupation. Des sphères de cull de rayon égal au pas
+    // du réseau recouvrent l'espace ~3,6 fois. **Aucune boîte de ce monde ne peut être hors de
+    // toutes les sphères de cull.** Le « 6.3 salles sur 8.3 atteignent la boîte » mesuré est
+    // exactement ça, et élargir l'échantillonneur n'y a rien changé (39 tuiles sur 40 étaient déjà
+    // loin de la spine, et le compte est resté 40 sur 40).
+    //
+    // Donc on mesure les DEUX : la fixture dense, où `0 prouvé` est le résultat CORRECT et
+    // informatif (le gain disparaît quand les grottes saturent), et un jeu de params aux DÉFAUTS
+    // DE PRODUCTION, qui est le monde dont la question « combien de tuiles peut-on sauter » parle
+    // réellement. Ce n'est pas « élargir jusqu'à ce que ça passe » : les deux sont rapportés, les
+    // deux sont brute-forcés, et le dense DOIT continuer à rendre ~0.
+    //
+    // Two worlds on purpose: the fixture is deliberately densified so the equivalence check means
+    // something, and that same densification makes tile-proving structurally impossible (room cull
+    // radius ~= the lattice spacing, at 85% occupancy). Both are measured and both are brute-forced;
+    // the dense one reporting ~0 is the correct answer, not a failure.
+    RunTileScan(Stack, P, Ctx, TEXT("dense fixture"));
+
+    {
+        FStrateGenerationParams SparseP = P;
+        SparseP.RoomSpacing = 80.0f;   // le défaut d'`UVoxelStrateDefinition`
+        SparseP.RoomDensity = 0.35f;   // idem — voir `EnableTunnelFeatures`
+
+        FVoxelOpStack SparseStack;
+        VoxelDensityOps::BuildTunnelNetworkStack(SparseStack, SparseP, World.Settings->Seed,
+                                                 Gen->OriginSpineRadius, World.StrateManager.Get());
+        SparseStack.PrepareChunk(Ctx);
+
+        // ⚠️ Les deux piles partagent les caches `thread_local` de `FRoomGraphSource`. C'est VOULU,
+        // et c'est exactement ce que le contrôle 3 vérifie : l'empreinte de params est dans la clé,
+        // donc l'une ne peut pas se servir les salles de l'autre. Le jour où ce contrôle tombe,
+        // cette ligne-ci devient fausse en même temps — elles se surveillent mutuellement.
+        RunTileScan(SparseStack, SparseP, Ctx, TEXT("production defaults"));
     }
 
     //=========================================================================
