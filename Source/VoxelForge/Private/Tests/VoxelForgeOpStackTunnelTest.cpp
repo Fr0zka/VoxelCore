@@ -1,6 +1,6 @@
 // VoxelForgeOpStackTunnelTest.cpp
-// TunnelNetwork — ÉTAPE A : le squelette SDF, sans les modificateurs de détail.
-// TunnelNetwork — STAGE A: the SDF spine, without the detail modifiers.
+// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPE B1 (rugosité de paroi, 4b).
+// TunnelNetwork — STAGE A (the SDF spine) + STAGE B1 (wall roughness, 4b).
 //
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
 // `GetDensityWithParams` fait ~1080 lignes et treize modificateurs de détail. Tout porter avant de
@@ -15,9 +15,14 @@
 // Même discipline que la passe « défauts puis tous les ops ON » du test de pile de hauteur, prise
 // dans l'autre sens.
 //
-// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les 13 modificateurs, rien sur l'override d'op
-// par salle, et rien sur le saut de tuile — `FRoomGraphSource::EffectOverBox` rend `Both`, donc
-// aucun verdict n'est prouvable à ce stade. Ces trois manques sont l'étape B et l'étape C.
+// L'ÉTAPE B REMONTE CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté sort
+// de `DisableStageBModifiers` et entre dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
+// qui prouve qu'il a réellement bougé quelque chose et (ii) le compte d'ops de la pile qui augmente.
+//   • B1 (ce commit) : rugosité de paroi, STEP 4b.
+//
+// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les onze modificateurs restants (4c–4h), rien
+// sur l'override d'op par salle, et rien sur le saut de tuile — `FRoomGraphSource::EffectOverBox`
+// rend `Both`, donc aucun verdict n'est prouvable à ce stade. Ce sont les étapes B2–B5 et C.
 //
 // ⚠️ ÉCHANTILLONNAGE PAR GRAPPES, PAS UNIFORME. Le cache SDF se reconstruit quand la requête sort de
 // sa boîte de recherche ; 20 000 points uniformément aléatoires feraient ~20 000 `BuildChunkCache`
@@ -50,14 +55,17 @@ namespace
     constexpr int32 NumTunnelSamples = NumTunnelChunks * PointsPerChunk;
 
     /**
-     * Met à zéro tout ce que l'étape A n'a pas encore porté, pour que l'original prenne le même
-     * chemin. Tout sauf `SurfaceRoughness` est DÉJÀ à zéro par défaut ; on l'écrit quand même, parce
-     * qu'un test qui dépend d'un défaut se casse le jour où le défaut change, et silencieusement.
+     * Met à zéro tout ce qui n'est PAS ENCORE porté, pour que l'original prenne le même chemin.
+     * Ces champs-là sont déjà à zéro par défaut ; on les écrit quand même, parce qu'un test qui
+     * dépend d'un défaut se casse le jour où le défaut change, et silencieusement.
+     *
+     * ⚠️ CETTE LISTE RÉTRÉCIT À CHAQUE GROUPE DE L'ÉTAPE B. Une ligne qui part d'ici doit arriver
+     * dans `EnableTunnelFeatures` ET dans `FeatureProbes` : la déplacer sans la sonder rendrait le
+     * groupe « activé » sans aucune preuve qu'il s'exécute. `SurfaceRoughness` (B1) est le premier
+     * à avoir fait le trajet — c'était le seul non nul par défaut (5.0).
      */
     void DisableStageBModifiers(FStrateGenerationParams& P)
     {
-        P.SurfaceRoughness          = 0.0f;   // le seul non nul par défaut (5.0)
-        P.DomainWarpStrength        = 0.0f;
         P.TerraceStepHeight         = 0.0f;
         P.TerraceNoiseDisplacement  = 0.0f;
         P.LayerLineSpacing          = 0.0f;
@@ -97,6 +105,16 @@ namespace
         P.RoomSpacing     = 42.0f;   // 80 → 42 : des salles à portée de chaque chunk échantillonné
         P.RoomDensity     = 0.85f;   // 0.35 → 0.85
         P.VerticalScale   = 1.35f;   // ≠ 1 ⇒ le Z « effectif » diverge du Z monde partout
+
+        // ── ÉTAPE B1 : rugosité de paroi (4b) ────────────────────────────────────────────────
+        // Écrits EXPLICITEMENT, pas laissés au défaut : un test qui dépend d'un défaut se casse en
+        // silence le jour où le défaut change. `SurfaceRoughness` était le seul de ces champs non nul
+        // par défaut (5.0), et l'étape A le remettait à zéro — c'est ce zéro qui disparaît ici.
+        P.SurfaceRoughness    = 5.0f;
+        P.RoughnessFrequency  = 0.1f;
+        P.RoughnessNoiseType  = EVoxelNoiseType::FBM;   // les 4 types sont balayés au contrôle 1c
+        P.DomainWarpStrength  = 3.0f;                   // ≠ 0 ⇒ le chemin de warp de domaine est pris
+        P.DomainWarpFrequency = 0.03f;
     }
 
     /**
@@ -155,6 +173,66 @@ namespace
     /** Fraction minimale d'échantillons devant tomber en grotte ouverte pour que l'équivalence
      *  signifie quelque chose. 10 % est modeste et très au-dessus du 1,1 % observé. */
     constexpr float MinCaveFraction = 0.10f;
+
+    //=========================================================================
+    // COUVERTURE PAR GROUPE — une entrée par groupe de l'étape B
+    //=========================================================================
+    // ⚠️ LA LEÇON DES PITS, GÉNÉRALISÉE : **activer une fonctionnalité n'est pas une preuve qu'elle
+    // a tiré.** `PitDensity = 0.55` n'a rien fait pendant tout un run (mauvais struct) et le test
+    // restait vert. Ici la question « le groupe B_n a-t-il changé quelque chose ? » se pose de la
+    // seule façon qui ne puisse répondre juste par hasard : reconstruire la pile avec CE groupe
+    // éteint et COMPTER LES POINTS QUI BOUGENT.
+    //
+    // ⚠️⚠️ POURQUOI CE DIFF-DE-PILES EST LÉGITIME ICI ALORS QU'IL AURAIT MENTI POUR LES PITS :
+    // le pool d'ops de terrain n'est PAS dans la clé du cache SDF, donc deux piles n'en différant
+    // que par lui se servaient le même cache `thread_local` et rendaient exactement la même chose.
+    // Les champs ci-dessous, eux, sont des params — et l'empreinte CRC des params EST dans la clé.
+    // Deux piles qui n'en diffèrent que par un de ces champs se reconstruisent donc bien chacune.
+    //
+    // Enabling a feature is not evidence it fired. Each entry rebuilds the stack with that group
+    // OFF and counts moved points. Legitimate here (unlike for the op pool) because these are
+    // params, and the params CRC is part of the SDF cache key.
+    struct FFeatureProbe
+    {
+        const TCHAR* Name;
+        void (*Disable)(FStrateGenerationParams&);   // lambda sans capture ⇒ pointeur de fonction
+    };
+
+    const FFeatureProbe FeatureProbes[] =
+    {
+        { TEXT("B1 surface roughness (STEP 4b)"),
+          [](FStrateGenerationParams& Q) { Q.SurfaceRoughness = 0.0f; } },
+    };
+
+    //=========================================================================
+    // LE `switch` SUR LE TYPE DE BRUIT — quatre branches, et une seule serait testée
+    //=========================================================================
+    // L'équivalence principale tourne en FBM. Les trois autres branches (Ridged, Mixed, Cellular)
+    // et les deux chemins de warp de domaine ne seraient JAMAIS exécutés — une transcription fausse
+    // dans `case Cellular:` passerait tout l'étage B sans un mot. Ce balayage les prend une par une.
+    struct FRoughVariant
+    {
+        const TCHAR*     Name;
+        EVoxelNoiseType  Type;
+        float            WarpStrength;
+    };
+
+    const FRoughVariant RoughVariants[] =
+    {
+        { TEXT("FBM, no domain warp"),      EVoxelNoiseType::FBM,      0.0f },
+        { TEXT("FBM, domain warp"),         EVoxelNoiseType::FBM,      3.0f },
+        { TEXT("Ridged, no domain warp"),   EVoxelNoiseType::Ridged,   0.0f },
+        { TEXT("Ridged, domain warp"),      EVoxelNoiseType::Ridged,   3.0f },
+        { TEXT("Mixed, no domain warp"),    EVoxelNoiseType::Mixed,    0.0f },
+        { TEXT("Mixed, domain warp"),       EVoxelNoiseType::Mixed,    3.0f },
+        { TEXT("Cellular, no domain warp"), EVoxelNoiseType::Cellular, 0.0f },
+        { TEXT("Cellular, domain warp"),    EVoxelNoiseType::Cellular, 3.0f },
+    };
+
+    /** Le balayage ne relit pas les 6000 points : les branches de bruit sont par-voxel et sans
+     *  état, donc un sous-ensemble les couvre autant. Ce qui coûte, c'est la reconstruction du
+     *  cache SDF à chaque changement de chunk, et elle est proportionnelle aux chunks visités. */
+    constexpr int32 RoughSweepPoints = 1500;
 }
 
 bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
@@ -212,11 +290,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + worms + 3 structurels = 7. (Le premier run a dit 7 contre un 6
-    // attendu : faute d'arithmétique dans l'attente, pas dans la pile — 4 + 3, comme les îles.)
-    // Les 13 modificateurs de détail viendront s'insérer entre le carve et les vers, donc ce nombre
-    // DOIT bouger à l'étape B.
-    TestEqual(TEXT("the stage-A tunnel stack is decomposed into 7 ops"), Stack.Num(), 7);
+    // rock + roomgraph + carve + **rugosité (B1)** + worms + 3 structurels = 8.
+    // Les onze modificateurs restants viendront s'insérer entre la rugosité et les vers, donc ce
+    // nombre DOIT bouger à chaque groupe de l'étape B — c'est un compteur de progression, pas une
+    // formalité : une pile qui ne grandit pas est une pile dont l'opérateur n'a pas été ajouté.
+    TestEqual(TEXT("the stage-A+B1 tunnel stack is decomposed into 8 ops"), Stack.Num(), 8);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -259,12 +337,18 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     int32 NumInCave = 0, NumInRock = 0;
     float WorstDelta = 0.0f;
 
+    // Gardé pour le contrôle 1b : la référence « pile complète » que chaque sonde de couverture
+    // compare à une pile dont UN groupe est éteint. Rempli ici pour ne pas repayer une passe.
+    TArray<float> FullVals;
+    FullVals.SetNumUninitialized(NumTunnelSamples);
+
     for (int32 i = 0; i < NumTunnelSamples; ++i)
     {
         const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
 
         const float Old = Gen->GetDensityWithParams(X, Y, Z, P);
         const float New = Stack.EvalMC(X, Y, Z);
+        FullVals[i] = New;
 
         const bool bInterior = (Z > InnerBot && Z < InnerTop);
         if (bInterior && Old >= 0.0f) { ++NumInCave; }   // air loin des seals ⇒ salle/tunnel/ver
@@ -282,14 +366,15 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     if (NumDiff == 0)
     {
         AddInfo(FString::Printf(
-            TEXT("TunnelNetwork STAGE A: bit-identical across %d samples in %d chunks (%d in open ")
-            TEXT("cave, %d in rock, away from the seal bands). Exercised: vertical scale (1.35, so ")
-            TEXT("effective Z differs from world Z everywhere), cave warp, the room/tunnel SDF via ")
-            TEXT("the SHARED BuildChunkCache, the carve with its floored divisor, and the worm carve ")
-            TEXT("with its network mask. Pits and chimneys are covered only if the bake-coverage ")
-            TEXT("line below reports non-zero -- this message used to claim them outright, and was ")
-            TEXT("wrong for a whole run. NOT covered at all: the 13 detail modifiers, the per-room ")
-            TEXT("op override, and any tile verdict."),
+            TEXT("TunnelNetwork STAGE A+B1: bit-identical across %d samples in %d chunks (%d in ")
+            TEXT("open cave, %d in rock, away from the seal bands). Exercised: vertical scale (1.35, ")
+            TEXT("so effective Z differs from world Z everywhere), cave warp, the room/tunnel SDF via ")
+            TEXT("the SHARED BuildChunkCache, the carve with its floored divisor, wall roughness ")
+            TEXT("(4b, density-space variant), and the worm carve with its network mask. Pits, ")
+            TEXT("chimneys and roughness are covered only insofar as the bake-coverage and ")
+            TEXT("group-coverage lines below report non-zero -- this message used to CLAIM coverage ")
+            TEXT("outright, and was wrong for a whole run. NOT covered at all: the eleven remaining ")
+            TEXT("detail modifiers (4c-4h), the per-room op override, and any tile verdict."),
             NumTunnelSamples, NumTunnelChunks, NumInCave, NumInRock));
 
         AddInfo(FString::Printf(
@@ -310,7 +395,14 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("or chimney Z), then the pit/chimney loops reading UNWARPED coords while the room ")
             TEXT("SDF reads warped ones, then the SDF cache key (it now includes a params ")
             TEXT("fingerprint the original lacks -- that can cost a rebuild, never a wrong room), ")
-            TEXT("then the worm early-out on N1 >= threshold."),
+            TEXT("then the worm early-out on N1 >= threshold. NEW AT B1, so suspect these first: ")
+            TEXT("the roughness gate is bNearCaveSurface (SDF < BlendRadius*3) AND ")
+            TEXT("|SDF| < SurfaceRoughness*2 -- two different windows; the domain warp adds ONE ")
+            TEXT("shared offset to BOTH noise positions (two independent warps would be tidier and ")
+            TEXT("wrong); the fine octave set is frequency*3 with +2000/+2500/+3000 offsets; the ")
+            TEXT("anti-fill clamp is min(TotalRough, 0) only where SDF < 0; and the fade is ")
+            TEXT("quadratic in DistFromSurface/RoughnessDepth. Roughness also reads EffectiveZ, ")
+            TEXT("not WorldZ."),
             NumDiff, NumTunnelSamples, WorstDelta,
             WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
             WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
@@ -331,6 +423,102 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("mostly compares solid rock to solid rock. Lower RoomSpacing or raise RoomDensity ")
             TEXT("in EnableTunnelFeatures."),
             100.0f * (float)NumInCave / (float)NumTunnelSamples, 100.0f * MinCaveFraction));
+    }
+
+    //=========================================================================
+    // 1b. CHAQUE GROUPE DE L'ÉTAPE B A-T-IL RÉELLEMENT TIRÉ ?
+    //=========================================================================
+    // Voir `FeatureProbes` : on rebâtit la pile avec un groupe éteint et on compte les points qui
+    // BOUGENT. Zéro ⇒ l'équivalence ci-dessus ne dit rien de ce groupe, quelle que soit sa couleur.
+    // C'est une ERREUR, pas un avertissement : un groupe porté et jamais exécuté est exactement
+    // l'état dans lequel une faute de transcription traverse tout un run sans se faire voir.
+    for (const FFeatureProbe& Probe : FeatureProbes)
+    {
+        FStrateGenerationParams PWithout = P;
+        Probe.Disable(PWithout);
+
+        FVoxelOpStack StackWithout;
+        VoxelDensityOps::BuildTunnelNetworkStack(StackWithout, PWithout, World.Settings->Seed,
+                                                 Gen->OriginSpineRadius, World.StrateManager.Get());
+        StackWithout.PrepareChunk(Ctx);
+
+        int32 NumMoved = 0;
+        for (int32 i = 0; i < NumTunnelSamples; ++i)
+        {
+            const float V = StackWithout.EvalMC((float)Points[i].X, (float)Points[i].Y,
+                                                (float)Points[i].Z);
+            if (!BitEqual(V, FullVals[i])) { ++NumMoved; }
+        }
+
+        if (NumMoved > 0)
+        {
+            AddInfo(FString::Printf(
+                TEXT("Group coverage -- %s: %d of %d samples (%.1f%%) move when this group is ")
+                TEXT("switched off, so the equivalence above genuinely covers it."),
+                Probe.Name, NumMoved, NumTunnelSamples,
+                100.0f * (float)NumMoved / (float)NumTunnelSamples));
+        }
+        else
+        {
+            AddError(FString::Printf(
+                TEXT("Group coverage -- %s: ZERO of %d samples move when this group is switched ")
+                TEXT("off. The group contributed NOTHING to the 6000-sample equivalence, so that ")
+                TEXT("equivalence says nothing about it. Either its params never reach the op (the ")
+                TEXT("PitDensity mistake, second time), or its gate never opens at these sample ")
+                TEXT("points. Do not read the green equivalence as covering this group."),
+                Probe.Name, NumTunnelSamples));
+        }
+    }
+
+    //=========================================================================
+    // 1c. LES QUATRE BRANCHES DU `switch` DE BRUIT, ET LES DEUX CHEMINS DE WARP
+    //=========================================================================
+    // L'équivalence principale ne prend QU'UNE branche (FBM). Une transcription fausse dans
+    // `case Cellular:` ou `case Mixed:` la traverserait sans un mot. Chaque variante est donc
+    // comparée à l'original sur un sous-ensemble des mêmes points.
+    {
+        int32 TotalVariantDiffs = 0;
+        for (const FRoughVariant& V : RoughVariants)
+        {
+            FStrateGenerationParams PV = P;
+            PV.RoughnessNoiseType = V.Type;
+            PV.DomainWarpStrength = V.WarpStrength;
+
+            FVoxelOpStack VStack;
+            VoxelDensityOps::BuildTunnelNetworkStack(VStack, PV, World.Settings->Seed,
+                                                     Gen->OriginSpineRadius, World.StrateManager.Get());
+            VStack.PrepareChunk(Ctx);
+
+            int32 VDiff = 0;
+            for (int32 i = 0; i < RoughSweepPoints; ++i)
+            {
+                const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+                if (!BitEqual(Gen->GetDensityWithParams(X, Y, Z, PV), VStack.EvalMC(X, Y, Z)))
+                {
+                    ++VDiff;
+                }
+            }
+
+            TotalVariantDiffs += VDiff;
+            if (VDiff > 0)
+            {
+                AddError(FString::Printf(
+                    TEXT("Roughness variant '%s': %d of %d samples differ from the original. Only ")
+                    TEXT("this branch of the noise switch is implicated -- the other variants and ")
+                    TEXT("the main equivalence use the same code either side of it."),
+                    V.Name, VDiff, RoughSweepPoints));
+            }
+        }
+
+        if (TotalVariantDiffs == 0)
+        {
+            AddInfo(FString::Printf(
+                TEXT("Roughness noise sweep: all %d variants (FBM / Ridged / Mixed / Cellular, each ")
+                TEXT("with and without the domain warp) are bit-identical over %d samples. This is ")
+                TEXT("what makes the three unused branches of the 4b switch mean anything -- the ")
+                TEXT("main equivalence only ever takes the FBM one."),
+                (int32)UE_ARRAY_COUNT(RoughVariants), RoughSweepPoints));
+        }
     }
 
     //=========================================================================

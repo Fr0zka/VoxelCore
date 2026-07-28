@@ -42,6 +42,51 @@ namespace
                                Octaves, Lacunarity, Persistence);
     }
 
+    /** Idem pour `RidgedNoise3D` (également `static` dans VoxelGenerator.cpp). Le bruit cellulaire,
+     *  lui, n'a pas besoin d'enveloppe : son corps a migré dans VoxelCaveMorphology.h et s'appelle
+     *  `VoxelNoise::Cellular3D`, avec la MÊME signature `const FVector&` que l'original. */
+    FORCEINLINE float HRidged3D(const FVector& Position, int32 Octaves = 4,
+                                float Lacunarity = 2.0f, float Persistence = 0.5f)
+    {
+        return VoxelNoise::Ridged((float)Position.X, (float)Position.Y, (float)Position.Z,
+                                  Octaves, Lacunarity, Persistence);
+    }
+
+    //=========================================================================
+    // LE GATE `bNearCaveSurface` — ÉTAPE B
+    //=========================================================================
+    // ⚠️ DÉCISION DE L'ÉTAPE B5, ÉCRITE ICI PARCE QUE C'EST LE POINT OÙ ELLE SE LIT.
+    // Dans l'original, les douze modificateurs de détail vivent dans UN SEUL `if (bNearCaveSurface)`.
+    // Deux façons de porter ça : (a) un opérateur « conteneur » qui enveloppe ses enfants, (b) le
+    // même early-out répété dans chaque opérateur. **C'est (b), délibérément :**
+    //
+    //   • La pile est une LISTE PLATE, et `FVoxelOpStack::ClassifyBox` plie les opérateurs un par un.
+    //     Un conteneur devrait replier ses enfants lui-même — donc reproduire `VF_FoldOp` — et ses
+    //     enfants deviendraient invisibles au pliage. On paierait une abstraction pour en casser une.
+    //   • Un opérateur qui n'existe QUE dans un conteneur n'est pas composable, donc pas transposable
+    //     en asset (Phase 3). Le motif « chaque op teste son propre gate » est déjà celui de
+    //     `FSdfRoughnessMod` (`InOut.Sdf >= ApplyWithin`) et de `FShaftLedgeMod`.
+    //   • Le gate n'est de toute façon PAS uniforme : chaque modificateur a EN PLUS sa propre fenêtre
+    //     (`RoughnessDepth`, `TerraceRange`, `LineRange`…). Le gate partagé n'est qu'un early-out
+    //     commun, pas la condition réelle de chacun.
+    //
+    // ⚠️ CE QUE ÇA COÛTE, dit franchement : l'original teste UNE fois et saute les douze ; la pile
+    // teste douze fois. Douze comparaisons flottantes parfaitement prédites par voxel de roc profond
+    // — mesurable, mais c'est exactement le genre de chose que `AUDIT §C10` dit de MESURER avant
+    // d'optimiser. Noté dans OPSTACK-PROGRESS comme poste de perf, pas « corrigé » à l'aveugle.
+    //
+    // STAGE B5 DECISION: repeated early-out in each op, NOT a scoping container — the stack is a flat
+    // list that ClassifyBox folds op by op, and an op that only exists inside a container is not
+    // composable. Cost stated honestly: twelve predictable compares instead of one branch.
+    FORCEINLINE bool VF_NearCaveSurface(float Sdf, float SDFBlendRadius)
+    {
+        // Transcrit tel quel, ordre des comparaisons compris :
+        //   const float DetailThreshold = Params.SDFBlendRadius * 3.0f;
+        //   const bool bNearCaveSurface = (CaveSDF < DetailThreshold) && (CaveSDF < FLT_MAX);
+        const float DetailThreshold = SDFBlendRadius * 3.0f;
+        return (Sdf < DetailThreshold) && (Sdf < FLT_MAX);
+    }
+
     //=========================================================================
     // RÔLE 1 — SOURCE : CHAMP CONSTANT / CONSTANT FIELD  (roc ET vide)
     //=========================================================================
@@ -1965,6 +2010,179 @@ namespace
     };
 
     //=========================================================================
+    // RÔLE 3 — MODIFIER : RUGOSITÉ DE PAROI, ESPACE DENSITÉ  (TunnelNetwork, STEP 4b)
+    //=========================================================================
+    // ⚠️ CE N'EST PAS `FSdfRoughnessMod`, ET C'EST LE PIÈGE QUE `OPSTACK-DECOMPOSITION §1` SIGNALE.
+    // Les deux s'appellent « rugosité de surface » et lisent le même champ de params, mais :
+    //
+    //   • variante SDF (Maze / VerticalShafts / FloatingIslands) : `Sdf += bruit·SCALE·Force`.
+    //     Brut, sans fade, sans clamp, fréquence codée en dur au site d'appel. Déplace la SURFACE.
+    //   • variante DENSITÉ (ici) : DEUX jeux d'octaves (principal + fin ×3), warp de domaine
+    //     optionnel, QUATRE types de bruit, un `Min(…, 0)` anti-remplissage, et un fade QUADRATIQUE
+    //     par distance à la surface. Déplace la MATIÈRE, mise à l'échelle par le gradient local.
+    //
+    // Les fusionner sous un enum `Space` était la suggestion du §1 ; en les portant, ils n'ont
+    // presque aucune ligne en commun (le clamp, le fade et le second jeu d'octaves n'ont pas
+    // d'équivalent dans l'autre). Deux opérateurs, un nom partagé — comme `FGridColumnMod` et le
+    // futur `FRoomColumnMod`, que le §1 sépare pour la même raison.
+    //
+    // ⚠️⚠️ CET OPÉRATEUR EST **HORS** DE L'OVERRIDE D'OP PAR SALLE, et ce n'est pas un oubli.
+    // Dans l'original, le shadow `const FStrateGenerationParams& Params = LocalTerrainParams;` est
+    // déclaré à l'INTÉRIEUR du bloc `if (bNearCaveSurface)` qui commence APRÈS l'étape 4b. La
+    // rugosité lit donc les params de la STRATE, jamais ceux de la salle la plus proche. Onze
+    // modificateurs sur douze lisent la copie par salle ; celui-ci non. À NE PAS « uniformiser »
+    // à l'étape C1.
+    //
+    // This op reads STRATE params, not the per-room copy: the original's shadow is declared inside
+    // the `if (bNearCaveSurface)` block that starts AFTER step 4b. Eleven of twelve modifiers read
+    // the shadowed copy; this one does not.
+    class FCaveRoughnessMod final : public IVoxelDensityOp
+    {
+    public:
+        FCaveRoughnessMod(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.SurfaceRoughness > 0.0f)) { return; }
+
+            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
+                                   ? (WorldZ / P.VerticalScale) : WorldZ;
+
+            const float RoughnessDepth  = P.SurfaceRoughness * 2.0f;
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            if (!(DistFromSurface < RoughnessDepth)) { return; }
+
+            const float RF = P.RoughnessFrequency;
+
+            // ⚠️ LE DÉTOUR PAR FVector EST DÉLIBÉRÉ (même raison que dans FSdfRoughnessMod) :
+            // FVector est en DOUBLE, donc chaque produit transite par un double avant d'être
+            // re-arrondi en float à l'appel du bruit. Sauter l'aller-retour change l'arrondi.
+            FVector MainPos(
+                WorldX * RF + VoxelHash::SeedOffset(SeedU, 11.3f),
+                WorldY * RF + VoxelHash::SeedOffset(SeedU, 13.7f),
+                EffectiveZ * RF + VoxelHash::SeedOffset(SeedU, 17.1f)
+            );
+            FVector FinePos(
+                WorldX * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 19.1f) + 2000.0f,
+                WorldY * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 23.7f) + 2500.0f,
+                EffectiveZ * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 29.3f) + 3000.0f
+            );
+
+            // WARP DE DOMAINE : le MÊME offset est ajouté aux DEUX positions (une seule
+            // `FVector WarpOffset`, deux `+=`). Transcrit tel quel — appliquer deux warps
+            // indépendants serait plus « propre » et donnerait un autre monde.
+            if (P.DomainWarpStrength > 0.0f)
+            {
+                const float WF = P.DomainWarpFrequency;
+                const float WS = P.DomainWarpStrength;
+
+                const float WarpX = VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + VoxelHash::SeedOffset(SeedU, 5.2f),
+                    WorldY * WF + VoxelHash::SeedOffset(SeedU, 1.3f),
+                    EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 9.7f)
+                )) * VOXEL_NOISE_SCALE * WS;
+
+                const float WarpY = VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + 100.0f + VoxelHash::SeedOffset(SeedU, 7.7f),
+                    WorldY * WF + 200.0f + VoxelHash::SeedOffset(SeedU, 3.1f),
+                    EffectiveZ * WF + 300.0f
+                )) * VOXEL_NOISE_SCALE * WS;
+
+                const float WarpZ = VoxelNoise::Perlin3D(FVector(
+                    WorldX * WF + 400.0f,
+                    WorldY * WF + 500.0f + VoxelHash::SeedOffset(SeedU, 11.9f),
+                    EffectiveZ * WF + 600.0f + VoxelHash::SeedOffset(SeedU, 13.3f)
+                )) * VOXEL_NOISE_SCALE * WS;
+
+                const FVector WarpOffset(WarpX, WarpY, WarpZ);
+                MainPos += WarpOffset;
+                FinePos += WarpOffset;
+            }
+
+            // Les comptes d'octaves passent par VoxelGenLOD::Eff — contrat T2.b, les tuiles
+            // lointaines perdent les octaves sous-cellulaires.
+            float RoughNoise, FineNoise;
+            const int32 Oct3 = VoxelGenLOD::Eff(3);
+            const int32 Oct2 = VoxelGenLOD::Eff(2);
+
+            switch (P.RoughnessNoiseType)
+            {
+            case EVoxelNoiseType::Ridged:
+                RoughNoise = HRidged3D(MainPos, Oct3);
+                FineNoise  = HRidged3D(FinePos, Oct2);
+                break;
+
+            case EVoxelNoiseType::Mixed:
+                RoughNoise = HFractal3D(MainPos, Oct3) * 0.5f
+                           + HRidged3D(MainPos, Oct3) * 0.5f;
+                FineNoise  = HFractal3D(FinePos, Oct2) * 0.5f
+                           + HRidged3D(FinePos, Oct2) * 0.5f;
+                break;
+
+            case EVoxelNoiseType::Cellular:
+                RoughNoise = VoxelNoise::Cellular3D(MainPos);
+                FineNoise  = VoxelNoise::Cellular3D(FinePos);
+                break;
+
+            case EVoxelNoiseType::FBM:
+            default:
+                RoughNoise = HFractal3D(MainPos, Oct3);
+                FineNoise  = HFractal3D(FinePos, Oct2);
+                break;
+            }
+
+            RoughNoise *= VOXEL_NOISE_SCALE;
+            FineNoise  *= VOXEL_NOISE_SCALE;
+
+            float TotalRough = RoughNoise * P.SurfaceRoughness
+                             + FineNoise * P.SurfaceRoughness * 0.4f;
+
+            // CLAMP ANTI-REMPLISSAGE : dans l'air certain (SDF < 0) la rugosité ne doit JAMAIS
+            // rajouter du solide — sinon lucarnes, membranes, coutures aux jonctions et aux lèvres
+            // de puits. Elle peut encore creuser plus loin dans la paroi.
+            if (CaveSDF < 0.0f)
+            {
+                TotalRough = FMath::Min(TotalRough, 0.0f);
+            }
+
+            float SurfaceFade = 1.0f - (DistFromSurface / RoughnessDepth);
+            SurfaceFade = SurfaceFade * SurfaceFade;   // quadratique : concentre près de la surface
+
+            InOut.Density += TotalRough * SurfaceFade;
+        }
+
+        /**
+         * `Both` : la rugosité peut pousser dans les deux sens (le clamp ne s'applique que dans
+         * l'air certain). Conservatif et donc correct, mais coûteux — comme les vers, c'est un
+         * opérateur dont l'AMPLITUDE est bornée alors que sa DIRECTION ne l'est pas :
+         *   |TotalRough| ≤ 1.4 · SurfaceRoughness · VOXEL_NOISE_SCALE,  fade ∈ [0,1].
+         * Deuxième client pour le pliage numérique de `OPSTACK-DECOMPOSITION §0.2`, noté au point
+         * exact où la borne manque (le premier est `FWormFieldSource::MaxCarveAmplitude`).
+         */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.SurfaceRoughness > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+        /** La borne d'amplitude, en unités de densité. Pas encore consommée par le pliage. */
+        float MaxAmplitude() const
+        {
+            return (P.SurfaceRoughness > 0.0f)
+                 ? (1.4f * P.SurfaceRoughness * VOXEL_NOISE_SCALE) : 0.0f;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+    };
+
+    //=========================================================================
     // RÔLE 1 — SOURCE : VERS / WORM TUNNELS  (TunnelNetwork)
     //=========================================================================
     // Un carve par SEUIL sur du bruit 3D, masqué par la distance au réseau de salles. Il écrit la
@@ -2212,12 +2430,12 @@ namespace VoxelDensityOps
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ ÉTAPE A SUR TROIS — LA PILE EST INCOMPLÈTE, ET DÉLIBÉRÉMENT.
+        // ⚠️ ÉTAPES A + B1 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
         // Sont portés : l'échelle verticale, le roc de base, le warp, le graphe de salles (+ pits
-        // + cheminées), le carve, les vers, le post structurel. **NE SONT PAS ENCORE PORTÉS** les
-        // treize modificateurs de détail de l'étape 4b-4h (rugosité, terrasses, lignes de strates,
-        // nervures, surplombs, falaise, festons, arches, colonnes, dômes, pincement, biais de sol),
-        // ni l'override d'op PAR SALLE.
+        // + cheminées), le carve, **la rugosité de paroi (4b)**, les vers, le post structurel.
+        // **NE SONT PAS ENCORE PORTÉS** les onze modificateurs restants de l'étape 4c-4h (terrasses,
+        // lignes de strates, nervures, surplombs, falaise, festons, arches, colonnes, dômes,
+        // pincement, biais de sol), ni l'override d'op PAR SALLE.
         //
         // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
         // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
@@ -2248,7 +2466,11 @@ namespace VoxelDensityOps
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
         OutStack.Add(MakeUnique<FRoomGraphSource>(P, Seed, StrateManager));
         OutStack.Add(MakeSdfCarve(P.SDFBlendRadius, P.BaseDensity, CarveMinDivisor));
-        // [ÉTAPE B ira ici : les 13 modificateurs de détail, gated sur `Sdf < SDFBlendRadius·3`]
+        // ── ÉTAPE B : les modificateurs de détail (4b–4h), chacun gated sur
+        //    `Sdf < SDFBlendRadius·3` via VF_NearCaveSurface. Voir la note de l'étape B5 là-bas.
+        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));       // 4b
+        // [ÉTAPES B2–B4 iront ici : terrasses, lignes, nervures, surplombs, falaise, festons,
+        //  arches, colonnes, dômes, pincement, biais de sol]
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,

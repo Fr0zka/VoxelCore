@@ -243,6 +243,88 @@ namespace VoxelHash
 }
 
 //=============================================================================
+// BRUIT CELLULAIRE / CELLULAR (WORLEY) NOISE — 3D
+//=============================================================================
+// ⚠️ POURQUOI CE CORPS VIT ICI ET NON DANS VoxelNoise.h.
+// Il a besoin de `VoxelHash::Mix` / `ToFloat01`, qui vivent dans CE fichier. Faire dépendre
+// VoxelNoise.h (le socle bas niveau, inclus partout) du header de morphologie de grotte serait une
+// inversion de dépendance ; dupliquer les 50 lignes serait un FORK d'une fonction pure — exactement
+// le motif qui a produit `AUDIT §C1` (un correctif appliqué à une copie sur deux). Il monte donc au
+// point le plus bas qui voit déjà le hash, et le générateur comme la pile d'opérateurs l'appellent.
+//
+// Ce corps était `static float CellularNoise3D(const FVector&)` dans VoxelGenerator.cpp, invisible
+// à la pile d'opérateurs. Déplacement LITTÉRAL : mêmes opérations, même ordre, même passage par
+// `FVector` (donc par des doubles) — l'égalité binaire du portage TunnelNetwork en dépend.
+// `UVoxelGenerator`'s copy is now a one-line forwarder; the body moved verbatim.
+//
+// Algorithme : distance au point-feature le plus proche dans une grille hachée.
+//   1. cellule entière du point   2. voisinage 3×3×3   3. rendre (F2 − F1), normalisé ~[-1, 1]
+// F2−F1 donne des frontières de cellules lisses avec des arêtes entre elles.
+namespace VoxelNoise
+{
+    FORCEINLINE float Cellular3D(const FVector& Position)
+    {
+        // Integer cell coordinates
+        int32 CellX = FMath::FloorToInt(Position.X);
+        int32 CellY = FMath::FloorToInt(Position.Y);
+        int32 CellZ = FMath::FloorToInt(Position.Z);
+
+        // Fractional position within cell
+        float FracX = Position.X - CellX;
+        float FracY = Position.Y - CellY;
+        float FracZ = Position.Z - CellZ;
+
+        float F1 = FLT_MAX;  // Distance to nearest feature point
+        float F2 = FLT_MAX;  // Distance to 2nd nearest
+
+        // Search 3x3x3 neighborhood
+        for (int32 DZ = -1; DZ <= 1; DZ++)
+        {
+            for (int32 DY = -1; DY <= 1; DY++)
+            {
+                for (int32 DX = -1; DX <= 1; DX++)
+                {
+                    int32 NX = CellX + DX;
+                    int32 NY = CellY + DY;
+                    int32 NZ = CellZ + DZ;
+
+                    // Hash the neighbor cell to get a feature point position [0,1)
+                    // Using three different hash mixes for X, Y, Z offsets
+                    uint32 H = VoxelHash::Mix(
+                        (uint32)(NX + 0x7FFFFFFF)
+                        ^ VoxelHash::Mix((uint32)(NY + 0x7FFFFFFF) * 2654435761u)
+                        ^ VoxelHash::Mix((uint32)(NZ + 0x7FFFFFFF) * 374761393u)
+                    );
+
+                    float FPX = (float)DX + VoxelHash::ToFloat01(H) - FracX;
+                    float FPY = (float)DY + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u)) - FracY;
+                    float FPZ = (float)DZ + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u)) - FracZ;
+
+                    float DistSq = FPX * FPX + FPY * FPY + FPZ * FPZ;
+
+                    // Track closest two distances
+                    if (DistSq < F1)
+                    {
+                        F2 = F1;
+                        F1 = DistSq;
+                    }
+                    else if (DistSq < F2)
+                    {
+                        F2 = DistSq;
+                    }
+                }
+            }
+        }
+
+        // F2 - F1: smooth cell boundaries with ridges between cells
+        // Sqrt for actual distance, then normalize to ~[-1, 1]
+        float Result = FMath::Sqrt(F2) - FMath::Sqrt(F1);
+        // Result is in [0, ~1.0]. Map to [-1, 1] for compatibility with other noise types.
+        return Result * 2.0f - 1.0f;
+    }
+}
+
+//=============================================================================
 // PER-CHUNK SDF CACHE
 //=============================================================================
 // The room list and tunnel connections are IDENTICAL for all voxels in a chunk.

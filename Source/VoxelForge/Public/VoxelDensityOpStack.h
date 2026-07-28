@@ -266,12 +266,13 @@ namespace VoxelDensityOps
                                                 const UVoxelStrateManager* StrateManager);
 
     /**
-     * TunnelNetwork — **ÉTAPE A SUR TROIS, PILE INCOMPLÈTE** :
-     *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → Worms → [structural ×3]
+     * TunnelNetwork — **ÉTAPES A + B1, PILE ENCORE INCOMPLÈTE** :
+     *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → CaveRoughness(4b)
+     *   → Worms → [structural ×3]
      *
-     * ⛔ NE PAS brancher cet archétype dans `UsesOperatorStackForChunk` avant l'étape C : les 13
-     * modificateurs de détail (4b–4h) et l'override d'op par salle ne sont pas portés, donc le monde
-     * y perdrait tout son détail. Le test compare avec ces amplitudes à zéro.
+     * ⛔ NE PAS brancher cet archétype dans `UsesOperatorStackForChunk` avant l'étape C : les onze
+     * modificateurs de détail restants (4c–4h) et l'override d'op par salle ne sont pas portés, donc
+     * le monde y perdrait du détail. Le test compare avec ces amplitudes à zéro.
      *
      * ⚠️ `FRoomGraphSource` **APPELLE** `BuildChunkCache`/`EvaluateSDFCached`, il ne les transcrit
      * pas : c'est là que vit la discipline d'invariance de fenêtre à deux régions (`ARCHITECTURE

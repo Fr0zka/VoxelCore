@@ -212,65 +212,15 @@ static float RidgedNoise3D(const FVector& Position, int32 Octaves = 4,
 // Using F2-F1 (difference of two closest distances) gives smooth cell
 // boundaries with ridges between cells — more interesting than raw distance.
 
+// Le CORPS a déménagé dans Public/VoxelCaveMorphology.h (namespace VoxelNoise), au plus bas point
+// qui voit déjà `VoxelHash` : la pile d'opérateurs a besoin exactement du même bruit pour la
+// rugosité (4b, type Cellular) et pour les festons (4f), et deux copies d'une fonction pure finissent
+// par diverger — c'est littéralement `AUDIT §C1`. Ce forwarder garde les ~3 sites d'appel ci-dessous
+// inchangés, comme l'ont fait FractalNoise3D et RidgedNoise3D lors de T2.a. Aucun changement de
+// comportement : corps identique, mêmes doubles de `FVector`, même ordre d'opérations.
 static float CellularNoise3D(const FVector& Position)
 {
-    // Integer cell coordinates
-    int32 CellX = FMath::FloorToInt(Position.X);
-    int32 CellY = FMath::FloorToInt(Position.Y);
-    int32 CellZ = FMath::FloorToInt(Position.Z);
-
-    // Fractional position within cell
-    float FracX = Position.X - CellX;
-    float FracY = Position.Y - CellY;
-    float FracZ = Position.Z - CellZ;
-
-    float F1 = FLT_MAX;  // Distance to nearest feature point
-    float F2 = FLT_MAX;  // Distance to 2nd nearest
-
-    // Search 3x3x3 neighborhood
-    for (int32 DZ = -1; DZ <= 1; DZ++)
-    {
-        for (int32 DY = -1; DY <= 1; DY++)
-        {
-            for (int32 DX = -1; DX <= 1; DX++)
-            {
-                int32 NX = CellX + DX;
-                int32 NY = CellY + DY;
-                int32 NZ = CellZ + DZ;
-
-                // Hash the neighbor cell to get a feature point position [0,1)
-                // Using three different hash mixes for X, Y, Z offsets
-                uint32 H = VoxelHash::Mix(
-                    (uint32)(NX + 0x7FFFFFFF)
-                    ^ VoxelHash::Mix((uint32)(NY + 0x7FFFFFFF) * 2654435761u)
-                    ^ VoxelHash::Mix((uint32)(NZ + 0x7FFFFFFF) * 374761393u)
-                );
-
-                float FPX = (float)DX + VoxelHash::ToFloat01(H) - FracX;
-                float FPY = (float)DY + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u)) - FracY;
-                float FPZ = (float)DZ + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u)) - FracZ;
-
-                float DistSq = FPX * FPX + FPY * FPY + FPZ * FPZ;
-
-                // Track closest two distances
-                if (DistSq < F1)
-                {
-                    F2 = F1;
-                    F1 = DistSq;
-                }
-                else if (DistSq < F2)
-                {
-                    F2 = DistSq;
-                }
-            }
-        }
-    }
-
-    // F2 - F1: smooth cell boundaries with ridges between cells
-    // Sqrt for actual distance, then normalize to ~[-1, 1]
-    float Result = FMath::Sqrt(F2) - FMath::Sqrt(F1);
-    // Result is in [0, ~1.0]. Map to [-1, 1] for compatibility with other noise types.
-    return Result * 2.0f - 1.0f;
+    return VoxelNoise::Cellular3D(Position);
 }
 
 //=============================================================================
