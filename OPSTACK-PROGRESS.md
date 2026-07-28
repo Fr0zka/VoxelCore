@@ -2139,3 +2139,147 @@ amplitudes back ON one group at a time (a `Terrace` op in the room pool will be 
 break stage A's equivalence, by design).
 
 ---
+
+## 2026-07-28 — **8 OF 8.** TunnelNetwork + Underwater ported. Unattended run, 8 commits, zero builds.
+
+Jahni started this session and left. Rule #1 held: nothing was compiled, nothing was launched,
+nothing was pushed. **Everything below is written and committed but UNVERIFIED.** He reverts by sha,
+which is why the one-commit-per-group rule was the one thing not bent.
+
+```
+6e29cbf  B1  surface roughness (4b) + VoxelNoise::Cellular3D shared out of VoxelGenerator.cpp
+ab1a996  B2  Terrace · LayerLines · Ribbing (4c) + FRoomGraphSource::FState hoisted out of Eval
+6ec6009  B3  cave Overhang · Cliff · Scallop · Arch (4c)
+b063d43  B4  Columns (4d) · Domes (4g) · Pinch (4h) · FloorBias + Column op in the test pool
+8a303cc  B5  the gate itself — test only, proves a voxel outside it is bit-identically untouched
+9591088  C1  per-room op override — eleven detail ops read FRoomGraphSource::LocalParams()
+e479fcd  C2  Underwater wired to the same builder + its own equivalence check
+(this)   C3  UsesOperatorStackForChunk returns true for both — 8 of 8 — + CODEMAP / PLAN / PROGRESS
+```
+
+**Test filter: `VoxelForge`. Still 13 tests** — no test file was added; the TunnelNetwork test grew
+five new checks. `VoxelForge.OpStack.TunnelNetworkSpineEquivalence` is the one to read.
+
+### What the archetype switch looks like now
+
+`ConstantRock → RoomGraph(warp + pits + chimneys) → SdfCarve → Roughness → Terrace → LayerLines →
+Ribbing → Overhang → Cliff → Scallop → Arch → RoomColumn → Dome → Pinch → FloorBias → Worms →
+[spine → seal → passage]` — **19 ops, one builder, two archetypes.** Every one of the eight
+archetypes now has an operator-stack twin, per-strate opt-in, each equivalence-tested bit for bit
+against its original function.
+
+⚠️ `UsesOperatorStackForChunk` returning true for TunnelNetwork/Underwater **changes nothing by
+itself** — it still requires `bUseOperatorStack` ticked on a strate asset, which is Jahni's call and
+was deliberately not done. What *has* changed: the flag is no longer a no-op anywhere. Ticking it on
+any strate now really switches that strate onto the operator stack.
+
+### Five things found by reading the original, ported as-is, and worth knowing
+
+Each of these looked like a bug or an oversight. None was fixed, because with no test feedback a
+"cleanup" is an unfalsifiable guess — and three of them are load-bearing for the look of the world.
+
+1. **There are TWELVE detail modifiers, not thirteen** — and only **ELEVEN** read the per-room param
+   copy. The `const FStrateGenerationParams& Params = LocalTerrainParams;` shadow is declared *inside*
+   the `if (bNearCaveSurface)` block, which begins **after** STEP 4b, so **surface roughness reads
+   strate params**. Both numbers were carried wrong in the handoff and both matter for C1.
+2. **The cliff modifier's comment describes code that does not exist.** It promises "sample density at
+   Z±1 and compute the vertical gradient"; the code samples nothing and uses a Perlin with 3× Z
+   frequency as a proxy it calls `VertGrad`. Multiplying by `CaveSDF` still gives it the right sign
+   either side of the surface, which is why it produces steeper faces at all.
+3. **Terrace's two SDF gradient probes query unwarped X/Y and raw Z**, while the field they probe was
+   evaluated at warped coordinates and effective Z — and they exclude pits and chimneys. The probe
+   does not sample the field whose slope it measures.
+4. **`ColumnDensity` on `FStrateGenerationParams` is read by nothing.** Neither the bake (which reads
+   a fresh `OpParams` with only the room's op applied) nor the per-voxel loop. Columns exist *only*
+   through a `Column` terrain-op asset in the strate's pool. Same shape as the `PitDensity` finding,
+   and the reason B4's coverage had to be an assertion about the bake rather than a params probe.
+5. **The per-voxel ~74-field param copy** of the override is transcribed as-is. Real perf item.
+
+### Two decisions this run made that are not reversible by taste
+
+**B5 — the gate is a repeated early-out per operator, not a scoping container.** The stack is a flat
+list that `ClassifyBox` folds op by op; a container would have to re-implement `VF_FoldOp` and would
+hide its children from the fold, and an op that only exists inside a container cannot become a Phase-3
+asset. The cost is stated rather than hidden: the original tests once and skips twelve, the stack
+tests twelve times. Predictable branches, but measure before optimising — that is the §C10 lesson.
+
+**C1 — one op owns the shared state, eleven read it.** `DECOMPOSITION §2` called the per-room override
+"the piece with no clean home" and proposed a per-modifier scoping predicate. The difficulty came
+entirely from assuming each modifier must *own* its params. `FRoomGraphSource::LocalParams()` publishes
+the strate params with the nearest room's op applied, memoised once per voxel (invalidated at the top
+of every `Eval`, before any early-out), and the modifiers read it. **No scoping predicate was
+invented** — this is the third use of a pattern already in the file (`FOverhangShelfMod` ←
+`FSurfaceColumnSource`, `FShaftLedgeMod` ← `FShaftFieldSource`). Same shape as the pit/chimney
+resolution: the problem was in the framing, not the code.
+
+### ⚠️ One thing C1 broke that nothing consumes yet — fix before `ClassifyTile` does
+
+`EffectOverBox` still answers from **strate** params, because a box spans many rooms and a per-voxel
+copy has no meaning there. But `ApplyTo` writes the op's value even where the strate's was `0`, so a
+room op can **enable a modifier the strate had switched off**. On a strate with a terrain-op pool, a
+box verdict can therefore be too optimistic. Harmless today — nothing consumes `ClassifyBox` in
+production — and **it must be fixed before `ClassifyTile` starts to.** Noted at
+`FLayerLineMod::EffectOverBox`, which is where a reader would land.
+
+### The coverage discipline, extended — and why the checks grew faster than the code
+
+Every group added an operator *and* a way to be told it did nothing. The test now reports:
+
+- **group coverage** (check 1b): rebuild the stack with one group off, count moved samples. **Zero is
+  an error, not a warning.** Legitimate as a stack-diff here — unlike for the op pool — because these
+  are params, and the params CRC *is* in the SDF cache key.
+- **the noise switch** (1c): all four roughness noise types × warp on/off. The main equivalence only
+  ever takes the FBM branch; three of four cases were otherwise untested.
+- **the gate** (1d): outside-gate samples must be bit-identical to a modifier-free stack, *and* the
+  inside-gate move count must be non-zero — otherwise "nothing leaked" only means "nothing happened".
+- **the bake** (3b): rooms, pits, chimneys and now **columns**, which is the only sound way to cover an
+  operator that has no parameter. The stage-A guard that errored on `TotalColumns > 0` is inverted.
+- **the override** (3c): how many baked rooms drew a `Terrace` op, and how many samples land inside
+  one of those rooms. Both non-zero, or check 1's green means only that two paths agree where the
+  override never applies — which is what stage B already proved.
+- **Underwater** (5): 2000 samples in the Underwater *slot*, which is a different strate index, hence
+  a different bake seed and a different entry in the strate-index memo — something six chunks of slot
+  0 cannot exercise.
+
+That is the pit lesson applied a fourth and fifth time: **enabling a feature is not evidence it
+fired, and the check that proves it must be able to fail for exactly one reason.**
+
+### What breaks first, per group, if a group is wrong
+
+- **B1** — diffs concentrated in open cave within `|SDF| < SurfaceRoughness·2`. If instead only check
+  1c fails, exactly one branch of the noise switch is implicated and nothing else.
+- **B2** — diffs near horizontal surfaces (terrace) or in thin Z bands (lines/ribs). If the *whole*
+  equivalence collapses everywhere, suspect the `FState` hoist, not the three new ops.
+- **B3** — a band `|SDF| < range`, or inside open cave for the arch.
+- **B4** — dome/pinch near room centres and perimeters; a column error is a ring of diffs at fixed XY
+  through a whole room height.
+- **C1** — diffs confined to the subset of rooms that drew `Terrace`, with terrace-shaped Z banding,
+  while check 3c still reports non-zero coverage.
+- **C2** — if the TunnelNetwork equivalence is green and only this fails, **the operators are fine**
+  and the finding is a real density difference between Underwater and TunnelNetwork. That would
+  contradict `DECOMPOSITION §8` and is worth more written down than patched.
+
+### Likely compile-error spots, in order
+
+1. `VoxelNoise::Cellular3D` in `VoxelCaveMorphology.h` — it reopens `namespace VoxelNoise` in a header
+   that does not include `VoxelNoise.h`. Legal, but it is the newest structural change.
+2. `#include "VoxelTerrainOpDefinition.h"` newly needed in `VoxelDensityOpStack.cpp` for `ApplyTo`
+   (added). `FCachedRoom::RoomOp` was only forward-declared before.
+3. The five modifier constructors that gained a `const FRoomGraphSource*` parameter — a missed call
+   site is a clean argument-count error at `BuildTunnelNetworkStack`.
+4. `FRoomGraphSource::FState` is declared *after* `PrepareChunk` and used inside `Eval` further down;
+   in-class member functions see the whole class, so this is fine, but it is the `C4430` shape that
+   bit the shaft port.
+5. The test's `EVoxelTerrainOpType::Terrace` / `Column` and `FTestWorld::SlotUnderwater` — all exist,
+   all newly referenced from this file.
+
+### Next single action
+
+Build, run the `VoxelForge` filter, and read three numbers before anything else: the **group-coverage
+percentages** (1b), the **Terrace-room sample count** (3c), and the **inside-gate move count** (1d).
+A green run with a zero in any of those is a green run that proved much less than it looks.
+
+Then, in the order agreed: settle `AUDIT §C2`'s suspected item (answerable by reading
+`GetGenerationParams` and `FStrateGenerationParams::Lerp` — no build needed), the worm amplitude cap
+(`DECOMPOSITION §0.2`, its own commit, extends `BoxVerdictFold`), and then make `ClassifyTile` consume
+`ClassifyBox`. Perf stays parked until Jahni unparks it.

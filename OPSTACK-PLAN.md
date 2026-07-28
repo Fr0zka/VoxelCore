@@ -4,11 +4,18 @@
 > *composable density pipeline*, so new world ideas become authoring instead of C++. Written
 > 2026-07-26 as a handoff for a future context — read this instead of re-deriving it.
 >
-> **Status (2026-07-27):** **Phases 0.5 and 1 DONE and verified. Phase 2 is 5 of 8 archetypes in**,
-> all bit-identical to their originals and all wired behind `bUseOperatorStack`:
-> **Maze · FlatPlain · CrystalChamber · SurfaceWorld (biomes included) · VerticalShafts.**
-> Remaining: `FloatingIslands`, `TunnelNetwork` (**last** — it owns the §8.4 window-invariance
-> discipline), `Underwater` (TunnelNetwork + a flag).
+> **Status (2026-07-28):** **Phases 0.5, 1 and 2 CODE-COMPLETE — 8 of 8 archetypes ported**, each
+> bit-identical to its original in an equivalence test, all wired behind `bUseOperatorStack`:
+> **Maze · FlatPlain · CrystalChamber · SurfaceWorld (biomes included) · VerticalShafts ·
+> FloatingIslands · TunnelNetwork · Underwater.** The archetype `switch` now has a complete
+> operator-stack twin, opt-in per strate.
+>
+> ⚠️ **The last three groups (stage B, C1, C2, C3) are UNVERIFIED — written, committed, never
+> compiled.** Run the `VoxelForge` filter; `OPSTACK-PROGRESS.md`'s last entry lists every commit and
+> what breaks first if one is wrong.
+>
+> **Not done, and it is the next real prize:** `ClassifyTile` still uses hand-written guards and does
+> not consume `ClassifyBox`. That is where measured tile-skipping becomes frames.
 >
 > Two things came out of Phase 2 that were not in the original design: **height space**
 > (`VoxelHeightOp.h`, a second operator family — some things are not another channel but another
@@ -406,12 +413,27 @@ care: the T1.a column cache and the exact-lattice `ClassifyTile` bound both surv
 ✅ `VerticalShafts` (**done**, 3 ops reused from Maze unchanged) →
 ✅ `FloatingIslands` (**done**, `BuildFloatingIslandStack` — the stack that runs **backwards**: void
 source + fill instead of rock source + carve, the *same* classes with the opposite sign; only the
-blob source is new) → `Underwater` (TunnelNetwork + a flag) → `TunnelNetwork`
-(**last** — it owns `BuildChunkCache`'s two-region window-invariance discipline, §8.4, the most delicate
-code in the plugin).
+blob source is new) → ✅ `TunnelNetwork` + `Underwater` (**done**, one builder for both —
+`BuildTunnelNetworkStack`, 19 ops).
 
-**6 of 8 ported.** The two that remain are really one: `Underwater` *is* TunnelNetwork plus
-`WaterLevelRelative` (§8), so the switch loses its last two cases in a single port.
+**8 of 8 ported.** The last two were really one: `Underwater` *is* TunnelNetwork plus
+`WaterLevelRelative` (§8, re-verified before relying on it), so the switch lost its last two cases in
+a single port.
+
+TunnelNetwork was ~1080 lines and was taken in **three stages, each verifiable on its own** rather
+than as ~600 unverified lines on top of ~200 (the `AUDIT §P3` pattern):
+* **A** — SDF spine: vertical scale, base rock, cave warp, room graph (+ pits + chimneys), carve,
+  worms, structural post. Verifiable *while incomplete* because every detail modifier is
+  amplitude-gated and defaults to zero, so zeroing them sends the ORIGINAL down exactly stage A's path.
+* **B** — the twelve detail modifiers of `STEP 4b–4h`, one group per commit, each with a coverage
+  probe that proves the group actually moved something (`B1` roughness, `B2` terrace/lines/ribs,
+  `B3` overhang/cliff/scallop/arch, `B4` columns/domes/pinch/floor-bias, `B5` the gate itself).
+* **C** — the per-room op override (`§2`'s option (a), and it needed no scoping predicate: one op
+  owns the state, eleven read it), `Underwater`, and the flag flip.
+
+⚠️ **`FRoomGraphSource` CALLS `BuildChunkCache`/`EvaluateSDFCached`; it does not transcribe them.**
+That is where §8.4's two-region window-invariance discipline lives, and a copy would fork it — with
+the fork "validated" by a test that compares it to the original.
 
 Along the way, `FStrateGenerationParams`' 74 fields decompose into per-op structs, which retires the
 `VF_STRATE_PARAM_FIELDS` X-macro drift problem for free.

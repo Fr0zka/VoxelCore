@@ -587,7 +587,23 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
 
     case ECaveGeneratorType::FloatingIslands:
         // Phase 2 — la pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
-        // + carve, avec les MÊMES opérateurs au signe près. 6 des 8 portés.
+        // + carve, avec les MÊMES opérateurs au signe près.
+        return true;
+
+    case ECaveGeneratorType::Underwater:
+        // ⚠️ AUCUNE PILE À ELLE : `Underwater` EST `TunnelNetwork` plus un drapeau d'eau consommé
+        // côté rendu. `GetDensityAt` les met dans le même `case`, et `WaterLevelRelative` n'est lu
+        // que par `GetWaterLevel*` de ce manager — jamais par la densité (vérifié, pas supposé).
+    case ECaveGeneratorType::TunnelNetwork:
+        // Phase 2, LE DERNIER, et le plus gros : ~1080 lignes portées en trois étapes (squelette
+        // SDF → douze modificateurs de détail → override d'op par salle), 19 opérateurs, dont
+        // `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached` au lieu de les
+        // transcrire — c'est là que vit la discipline d'invariance de fenêtre d'ARCHITECTURE §8.4,
+        // et en forker une copie aurait été le pire résultat possible de ce refactor.
+        //
+        // **8 SUR 8.** Le `switch` d'archétypes a désormais un jumeau en pile d'opérateurs, opt-in
+        // par strate, chacun vérifié par un test d'équivalence bit à bit contre sa fonction
+        // d'origine. Ce qui n'est PAS fait : `ClassifyTile` n'utilise toujours pas `ClassifyBox`.
         return true;
 
     default:                                  return false;
