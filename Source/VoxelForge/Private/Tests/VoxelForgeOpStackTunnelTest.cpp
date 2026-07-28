@@ -356,6 +356,28 @@ namespace
         { TEXT("Cellular, domain warp"),    EVoxelNoiseType::Cellular, 3.0f },
     };
 
+    /**
+     * ⚠️ DIVISION ENTIÈRE **PLANCHER**, ET C'EST UN VRAI BUG QU'ELLE CORRIGE, PAS UNE PRÉCAUTION.
+     *
+     * En C++ `/` TRONQUE vers zéro. Pour la strate TunnelNetwork, qui est en HAUT du layout et donc
+     * en Z positif, tronquer et plancher donnent le même résultat — le bug ne pouvait pas se voir.
+     * La strate Underwater est en BAS, en Z NÉGATIF : `-1 / 32` vaut `0` par troncature contre `-1`
+     * par plancher, donc la borne haute de chunk part un cran trop haut, et le `Clamp` qui suit
+     * entasse les points en trop sur le tout dernier voxel de la strate — en pleine bande de seal,
+     * c'est-à-dire dans du roc plein.
+     *
+     * C'est un candidat pour le « 0 de 2000 échantillons en grotte ouverte » qu'a rapporté le premier
+     * run vert du contrôle 5. Candidat, pas conclusion : le bloc de diagnostic du contrôle 5
+     * INTERROGE désormais la cuisson et l'intervalle réellement échantillonné plutôt que de l'inférer.
+     * (Même famille que `DivideAndRoundDown` dans les notes de projet : la troncature coûte des
+     * cycles de build à chaque fois qu'on la suppose être un plancher.)
+     */
+    FORCEINLINE int32 FloorDivChunk(int32 A)
+    {
+        const int32 Q = A / CHUNK_SIZE, R = A % CHUNK_SIZE;
+        return (R != 0 && R < 0) ? Q - 1 : Q;
+    }
+
     /** Le balayage ne relit pas les 6000 points : les branches de bruit sont par-voxel et sans
      *  état, donc un sous-ensemble les couvre autant. Ce qui coûte, c'est la reconstruction du
      *  cache SDF à chaque changement de chunk, et elle est proportionnelle aux chunks visités. */
@@ -444,8 +466,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     Points.Reserve(NumTunnelSamples);
     {
         FRandomStream Rng(1080601);
-        const int32 ChunkZ0 = BottomVoxelZ / CHUNK_SIZE;
-        const int32 ChunkZ1 = FMath::Max(ChunkZ0, (TopVoxelZ / CHUNK_SIZE) - 1);
+        const int32 ChunkZ0 = FloorDivChunk(BottomVoxelZ);
+        const int32 ChunkZ1 = FMath::Max(ChunkZ0, FloorDivChunk(TopVoxelZ) - 1);
         for (int32 c = 0; c < NumTunnelChunks; ++c)
         {
             const int32 CX = Rng.RandRange(-3, 3);
@@ -1113,15 +1135,19 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
 
             TestEqual(TEXT("the Underwater stack is the tunnel stack: same 19 ops"), UWStack.Num(), 19);
 
-            const int32 UWChunks = 8, UWPerChunk = 250;
+            // 8 → 24 chunks, comme le balayage principal. Le premier run vert a rapporté **0 de 2000
+            // échantillons en grotte ouverte** là où le slot TunnelNetwork en avait 16,7 % : trop peu de
+            // grappes est l'une des explications possibles, la troncature de la division en est une
+            // autre, et le bloc de diagnostic plus bas dit laquelle.
+            const int32 UWChunks = 24, UWPerChunk = 250;
             const int32 UWSamples = UWChunks * UWPerChunk;
 
             TArray<FVector> UWPoints;
             UWPoints.Reserve(UWSamples);
             {
                 FRandomStream Rng(20260728);
-                const int32 CZ0 = UWBottom / CHUNK_SIZE;
-                const int32 CZ1 = FMath::Max(CZ0, (UWTop / CHUNK_SIZE) - 1);
+                const int32 CZ0 = FloorDivChunk(UWBottom);
+                const int32 CZ1 = FMath::Max(CZ0, FloorDivChunk(UWTop) - 1);
                 for (int32 c = 0; c < UWChunks; ++c)
                 {
                     const int32 CX = Rng.RandRange(-3, 3);
@@ -1180,11 +1206,73 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                     UWDiff, UWSamples, UWWorst));
             }
 
-            if (UWInCave == 0)
+            //-----------------------------------------------------------------
+            // 5b. POURQUOI ? — ON INTERROGE, ON N'INFÈRE PAS  (le premier run vert a dit 0,0 %)
+            //-----------------------------------------------------------------
+            // ⚠️ Trois causes possibles à « aucun échantillon en grotte ouverte », et elles se
+            // corrigent différemment. Plutôt que d'en choisir une au jugé — la faute que ce fichier
+            // documente trois fois déjà — chacune a désormais son propre nombre :
+            //   (a) la cuisson n'a produit AUCUNE salle pour cet index de strate ⇒ `Rooms == 0` ;
+            //   (b) les points échantillonnés ne sont pas dans l'INTÉRIEUR de la strate (bandes de
+            //       seal, ou intervalle de chunks mal calculé) ⇒ `interior` faible ;
+            //   (c) il y a des salles et l'intervalle est bon, mais elles ne croisent pas ces XY
+            //       ⇒ `Rooms > 0` et `interior` élevé, et il faut alors élargir les XY.
             {
-                AddWarning(TEXT("No Underwater sample landed in open cave, so this check compared ")
-                           TEXT("solid rock to solid rock and proves almost nothing about the ")
-                           TEXT("archetype. Same failure mode as the 1.1% run of stage A."));
+                const int32 UWStrateIdx = World.StrateManager->GetStrateIndex(
+                    ((float)FloorDivChunk((UWTop + UWBottom) / 2) + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+
+                const UVoxelStrateDefinition* UWDef =
+                    World.Definitions.IsValidIndex(FTestWorld::SlotUnderwater)
+                        ? World.Definitions[FTestWorld::SlotUnderwater].Get() : nullptr;
+
+                int32 UWRooms = 0, UWPits = 0, UWChims = 0, UWCols = 0;
+                if (UWDef)
+                {
+                    const float Expansion = UP.CaveWarpStrength + 2.0f;
+                    for (int32 c = 0; c < 6; ++c)
+                    {
+                        const float MinX = (c - 3) * (float)CHUNK_SIZE - Expansion;
+                        const float MinY = (c - 3) * (float)CHUNK_SIZE - Expansion;
+
+                        FChunkSDFCache UWProbe;
+                        VoxelCaveMorphology::BuildChunkCache(
+                            UWProbe, MinX, MinY, MinX + CHUNK_SIZE + 2.0f * Expansion,
+                            MinY + CHUNK_SIZE + 2.0f * Expansion,
+                            UP, (uint32)World.Settings->Seed, UWStrateIdx, &UWDef->TerrainOperations);
+                        UWRooms += UWProbe.Rooms.Num();
+                        UWPits  += UWProbe.Pits.Num();
+                        UWChims += UWProbe.Chimneys.Num();
+                        UWCols  += UWProbe.Columns.Num();
+                    }
+                }
+
+                int32 UWInterior = 0;
+                for (int32 i = 0; i < UWSamples; ++i)
+                {
+                    const float Z = (float)UWPoints[i].Z;
+                    if (Z > UWInnerBot && Z < UWInnerTop) { ++UWInterior; }
+                }
+
+                AddInfo(FString::Printf(
+                    TEXT("Underwater diagnosis: strate index %d, voxel Z range [%d, %d], seal-free ")
+                    TEXT("interior (%.0f, %.0f); %d of %d samples are inside that interior; the bake ")
+                    TEXT("produced %d rooms, %d pits, %d chimneys, %d columns over 6 search boxes. ")
+                    TEXT("Read it as: 0 rooms means the bake, a low interior count means the sampled ")
+                    TEXT("Z range, and rooms>0 with a high interior count means the XY spread."),
+                    UWStrateIdx, UWBottom, UWTop, UWInnerBot, UWInnerTop,
+                    UWInterior, UWSamples, UWRooms, UWPits, UWChims, UWCols));
+
+                if (UWInCave == 0)
+                {
+                    AddWarning(FString::Printf(
+                        TEXT("No Underwater sample landed in open cave (%d in the seal-free interior, ")
+                        TEXT("%d rooms baked), so check 5 compared solid rock to solid rock and proves ")
+                        TEXT("almost nothing about this slot. Same failure mode as the 1.1%% run of ")
+                        TEXT("stage A -- and the equivalence being bit-identical is NOT evidence ")
+                        TEXT("against it, it is exactly what two agreeing voids look like. The ")
+                        TEXT("diagnosis line above says which of the three causes it is."),
+                        UWInterior, UWRooms));
+                }
             }
         }
     }
