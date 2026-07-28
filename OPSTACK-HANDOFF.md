@@ -2,8 +2,9 @@
 
 > Paste the block below into a fresh session. Everything it refers to is on disk and in git.
 >
-> **State:** Phase 2 is **DONE — 8 of 8 archetypes ported, built, and green** (14 tests).
-> `ClassifyTile` consumes `ClassifyBox`. One open warning, one clear next task.
+> **State:** Phase 2 is **DONE — 8 of 8 archetypes ported, built, and green** (14 tests, two
+> consecutive green builds). `ClassifyTile` consumes `ClassifyBox`. **Everything in git is compiled
+> and tested.** One question to confirm in the first run, then one clear next task.
 
 ---
 
@@ -40,7 +41,7 @@ interchangeable implementations.
 | `VerticalShafts` | ✅ ported, bit-identical, wired |
 | `FloatingIslands` | ✅ ported, bit-identical, wired — the stack that runs **backwards** |
 | `TunnelNetwork` | ✅ **19 ops**, bit-identical incl. all 12 detail modifiers + per-room override |
-| `Underwater` | ✅ same builder, second `case` — ⚠️ its check has a coverage gap, see below |
+| `Underwater` | ✅ same builder, second `case` — confirm its coverage number once, see below |
 
 Everything sits behind `UVoxelStrateDefinition::bUseOperatorStack`; the ported list lives **only** in
 `UVoxelStrateManager::UsesOperatorStackForChunk` (now all 8). **No strate asset has the box ticked**
@@ -51,7 +52,10 @@ really switches that strate onto the stack, for density *and* for tile classific
 their hand-written exact-lattice proofs). `GetDensityAt` and `ClassifyTile` build the stack through
 the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole, not a bug.
 
-## The one open warning
+## The one number to confirm, and it takes one run
+
+The first green build reported this, and it is the one result worth understanding before trusting
+anything about `Underwater`:
 
 ```
 Underwater (stage C2): bit-identical across 2000 samples — 0 of them in open cave (0.0%)
@@ -61,15 +65,28 @@ Underwater (stage C2): bit-identical across 2000 samples — 0 of them in open c
 agreeing voids look like. Same failure as stage A's 1.1 % run, in a different slot, caught by a
 counter written for it.
 
-A real bug surfaced while diagnosing: the sampled chunk-Z range used `Z / CHUNK_SIZE`, and C++
+A real bug surfaced while diagnosing it: the sampled chunk-Z range used `Z / CHUNK_SIZE`, and C++
 integer division **truncates toward zero**. TunnelNetwork is at the top of the layout in positive Z
 where truncation == floor, so it could not show there; Underwater is at the **bottom, in negative
 Z**, where it shifts the upper chunk bound a notch high and the `Clamp` piles samples into the top
-seal band. Fixed (`FloorDivChunk`), sampling widened 8 → 24 clusters, **and not trusted**: new
-**check 5b** gives each of the three possible causes its own number and prints how to read them.
+seal band. Fixed (`FloorDivChunk`), sampling widened 8 → 24 clusters, **and not trusted**: check 5b
+gives each of the three possible causes (the bake / the sampled Z range / the XY spread) its own
+number and prints how to read them.
 
-**⚠️ That commit (`ce409e7`) is written but NOT BUILT.** First action: build, run the `VoxelForge`
-filter, read the `Underwater diagnosis` line. It names the cause; the fix follows from it.
+**That fix is built — the second build was green too. What I did not see is the number.** So:
+
+> **First action: run the `VoxelForge` filter and read the `Underwater diagnosis` line, plus the
+> cave-coverage percentage on the line above it.**
+>
+> - **Non-zero cave coverage** ⇒ the truncation *was* the cause, `Underwater` is genuinely covered,
+>   and this whole section is closed. Say so in `OPSTACK-PROGRESS.md` and move on to the next
+>   section — do not go looking for a bug that no longer exists.
+> - **Still 0.0 %** ⇒ the diagnosis line names which of the three causes it is, and the fix follows
+>   from that rather than from a guess.
+>
+> Either way it is one run, and the answer is printed. Do not infer it from the fact that the suite
+> is green: a bit-identity over solid rock is green for the wrong reason, which is the entire point
+> of that counter existing.
 
 ## Then the one task everything is waiting on
 
