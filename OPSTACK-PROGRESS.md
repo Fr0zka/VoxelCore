@@ -2106,3 +2106,36 @@ point at the bake-coverage number rather than claim the coverage.
 still bit-identical — *that* run is the one where stage A is genuinely covered. Then stage B.
 
 ---
+
+## 2026-07-28 — STAGE A GENUINELY COVERED. 13 tests green. Handoff rewritten.
+
+```
+TunnelNetworkSpineEquivalence ......................... Success
+  Equivalence   : bit-identical, 6000 samples, 1431 in open cave
+  Cave coverage : 23.9 %                     (floor 10 %)
+  Bake coverage : 49 rooms, 56 pits, 28 chimneys, 0 columns
+  Fingerprint   : 383/400 = 95.8 % differ, 0 served wrong
+  Box verdicts  : 0 proved, 40 Mixed         (asserted — §0.2's worm bound)
+```
+
+**This is the run where stage A means something.** The previous green one did not: it compared
+mostly solid rock to solid rock, its stale-cache check asked its question three times out of 400, and
+its pit/chimney loops ran on an empty list while the success message claimed otherwise. Same code,
+same colour, three different strengths of evidence — which is the whole argument for printing
+coverage numbers instead of pass/fail.
+
+56 pits and 28 chimneys now exist in the bake, so the two loops `§2` calls the fiddliest thing in the
+decomposition (unwarped coords `SmoothMin`'d into the warped room SDF) were exercised by 6000
+bit-identical samples. 0 columns confirms `STEP 4d` stayed dormant, as stage A requires.
+
+`OPSTACK-HANDOFF.md` rewritten for a fresh context: the three-stage TunnelNetwork plan and why stage
+A is verifiable while incomplete, the `FRoomGraphSource` calls-not-transcribes rule, `FRAME` ops
+recorded as retired, and the method lessons regrouped — notably the three coverage traps and
+"enabling a feature is not evidence it fired".
+
+**Next single action:** stage B — the 13 detail modifiers of `STEP 4b–4h`, inserted between the carve
+and the worms. The test's op-count assertion moves, and its `EnableTunnelFeatures` starts turning the
+amplitudes back ON one group at a time (a `Terrace` op in the room pool will be the first thing to
+break stage A's equivalence, by design).
+
+---
