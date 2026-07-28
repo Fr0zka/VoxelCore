@@ -1,6 +1,6 @@
 // VoxelForgeOpStackTunnelTest.cpp
-// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPE B COMPLÈTE (les douze modificateurs, 4b–4h).
-// TunnelNetwork — STAGE A (the SDF spine) + ALL OF STAGE B (the twelve detail modifiers, 4b-4h).
+// TunnelNetwork — ÉTAPES A + B + C1 : l'archétype ENTIER, override d'op par salle compris.
+// TunnelNetwork — STAGES A + B + C1: the WHOLE archetype, per-room op override included.
 //
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
 // `GetDensityWithParams` fait ~1080 lignes et douze modificateurs de détail (le chiffre « treize »
@@ -24,17 +24,16 @@
 //   • B3 : surplombs, falaise, festons, arches — STEP 4c.
 //   • B4 : colonnes (4d), dômes (4g), pincement (4h), biais de sol. La liste des amplitudes
 //     éteintes est vide : les douze modificateurs sont portés.
-//   • B5 (ce commit) : le GATE lui-même. Aucun opérateur ajouté — la décision (early-out répété par
-//     opérateur plutôt que conteneur de portée) est écrite dans `VF_NearCaveSurface`, et le
-//     contrôle 1d la paie : hors gate, la pile complète doit être BIT À BIT celle sans modificateurs.
+//   • B5 : le GATE lui-même. Aucun opérateur ajouté — la décision (early-out répété par opérateur
+//     plutôt que conteneur de portée) est écrite dans `VF_NearCaveSurface`, et le contrôle 1d la
+//     paie : hors gate, la pile complète doit être BIT À BIT celle sans modificateurs.
+//   • C1 (ce commit) : l'override d'op PAR SALLE. Aucun opérateur ajouté non plus — onze des douze
+//     modificateurs lisent désormais `FRoomGraphSource::LocalParams()`. Le pool du test reçoit un op
+//     `Terrace` dont les valeurs écrasent celles de la strate : **une pile qui ignorerait l'override
+//     ne peut plus être bit-identique**, ce qu'aucun test de l'étape B ne pouvait exiger.
 //
-// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur l'override d'op PAR SALLE — onze des douze
-// modificateurs lisent, dans l'original, une copie des params où l'op de la salle la plus proche a
-// été appliqué, et la pile lit les params de la strate. Les deux coïncident **uniquement** parce que
-// le pool du test ne contient que Pit / Chimney / Column, dont les `ApplyTo` n'écrivent aucun champ
-// de détail. Un op `Terrace` dans ce pool casserait l'équivalence : c'est exactement le test que C1
-// ajoutera, et c'est la seule preuve possible de l'override. Rien non plus sur le saut de tuile —
-// `FRoomGraphSource::EffectOverBox` rend `Both`.
+// CE QUE CE TEST NE PROUVE TOUJOURS PAS : le saut de tuile — `FRoomGraphSource::EffectOverBox` rend
+// `Both` et le ver `CarveOnly` partout, donc zéro verdict prouvé, ce que le contrôle 4 ASSERTE.
 //
 // ⚠️ ÉCHANTILLONNAGE PAR GRAPPES, PAS UNIFORME. Le cache SDF se reconstruit quand la requête sort de
 // sa boîte de recherche ; 20 000 points uniformément aléatoires feraient ~20 000 `BuildChunkCache`
@@ -204,6 +203,26 @@ namespace
         ChimOp->ChimneyHeight    = 18.0f;
         OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(ChimOp));
 
+        // ⚠️⚠️ AJOUTÉ À L'ÉTAPE C1, ET C'EST *LE* TEST DE L'OVERRIDE PAR SALLE.
+        // Jusqu'ici le pool était volontairement limité aux types Pit / Chimney / Column, dont les
+        // `ApplyTo` n'écrivent AUCUN champ de détail : c'est ce qui rendait l'étape B vérifiable
+        // alors même que les onze modificateurs lisaient les params de la strate au lieu de ceux de
+        // la salle. Un op `Terrace` change exactement ça — les salles qui le tirent voient
+        // `TerraceStepHeight/Hardness/NoiseDisplacement` ÉCRASÉS par ceux de l'op. Une pile qui
+        // ignorerait l'override rendrait donc une densité différente **sur ces salles-là**, et
+        // l'équivalence tomberait. C'est la seule preuve possible de C1.
+        //
+        // Valeurs délibérément TRÈS différentes de celles de la strate (6.0 / 0.6 / 0.5) : un
+        // override qui n'écrase qu'avec des valeurs proches serait indétectable au bit près sur peu
+        // de points, et « peu de points » est une couverture qu'on ne saurait pas lire.
+        UVoxelTerrainOpDefinition* TerraceOp = NewObject<UVoxelTerrainOpDefinition>(
+            GetTransientPackage(), NAME_None, RF_Transient);
+        TerraceOp->Type                     = EVoxelTerrainOpType::Terrace;
+        TerraceOp->TerraceStepHeight        = 3.0f;    // strate : 6.0
+        TerraceOp->TerraceHardness          = 0.95f;   // strate : 0.6
+        TerraceOp->TerraceNoiseDisplacement = 1.4f;    // strate : 0.5
+        OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(TerraceOp));
+
         // ⚠️ AJOUTÉ À L'ÉTAPE B4 : sans cette entrée, `SDFCache.Columns` reste VIDE et l'opérateur
         // de colonnes ne s'exécute sur rien — ce que le contrôle 3b exigeait à l'étape A et qu'il
         // exige désormais dans l'autre sens.
@@ -215,8 +234,8 @@ namespace
         ColOp->ColumnMaxRadius = 5.0f;
         OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(ColOp));
 
-        // `Probability = 1.0` sur les trois : la somme dépasse 1, donc la sélection est normalisée
-        // et chaque salle tire exactement un op parmi les trois, à parts égales.
+        // `Probability = 1.0` sur les quatre : la somme dépasse 1, donc la sélection est normalisée
+        // et chaque salle tire exactement un op parmi les quatre, à parts égales.
         FStrateTerrainOpEntry PitEntry;
         PitEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(PitOp);
         PitEntry.Weight      = 1.0f;
@@ -232,10 +251,19 @@ namespace
         ColEntry.Weight      = 1.0f;
         ColEntry.Probability = 1.0f;
 
+        // ⚠️ `Weight = 1.0` et pas autre chose : `ApplyTo` multiplie le champ d'ACTIVATION par le
+        // poids (`TerraceStepHeight * Weight`) et copie les autres tels quels. Un poids ≠ 1 rendrait
+        // la valeur attendue moins lisible dans un diff sans rien prouver de plus.
+        FStrateTerrainOpEntry TerraceEntry;
+        TerraceEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(TerraceOp);
+        TerraceEntry.Weight      = 1.0f;
+        TerraceEntry.Probability = 1.0f;
+
         Def->TerrainOperations.Reset();
         Def->TerrainOperations.Add(PitEntry);
         Def->TerrainOperations.Add(ChimEntry);
         Def->TerrainOperations.Add(ColEntry);
+        Def->TerrainOperations.Add(TerraceEntry);
     }
 
     /** Fraction minimale d'échantillons devant tomber en grotte ouverte pour que l'équivalence
@@ -909,6 +937,89 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         TestTrue(TEXT("the bake produced columns, so the STEP 4d loop has data to run on ")
                  TEXT("(no params probe can cover this one -- see the comment above)"),
                  TotalColumns > 0);
+    }
+
+    //=========================================================================
+    // 3c. L'OVERRIDE D'OP PAR SALLE A-T-IL EU L'OCCASION DE COMPTER ?  (ÉTAPE C1)
+    //=========================================================================
+    // Le pool contient depuis C1 un op `Terrace` dont les valeurs (3.0 / 0.95 / 1.4) écrasent celles
+    // de la strate (6.0 / 0.6 / 0.5) sur les salles qui le tirent. Une pile qui ignorerait l'override
+    // rendrait donc une densité DIFFÉRENTE près de ces salles, et le contrôle 1 tomberait.
+    //
+    // ⚠️ MAIS SEULEMENT SI DE TELLES SALLES EXISTENT ET SI ON A ÉCHANTILLONNÉ PRÈS D'ELLES. C'est
+    // exactement le piège des pits, une quatrième fois : une équivalence verte prouverait alors que
+    // deux chemins s'accordent là où l'override ne s'applique pas. Il n'y a pas de sonde de params
+    // possible (le pool n'est pas dans la clé du cache), donc on interroge encore la STRUCTURE :
+    //   (1) combien de salles portent un op `Terrace` ?
+    //   (2) combien d'échantillons tombent dans le rayon d'influence d'une de ces salles ?
+    // Zéro à l'une ou l'autre ⇒ le contrôle 1 ne dit RIEN de C1, quelle que soit sa couleur.
+    //
+    // (2) est approximatif — il mesure en coordonnées NON warpées, alors que le voxel choisit sa
+    // salle en coordonnées warpées. C'est un compteur de COUVERTURE, pas un oracle : sur-estimer
+    // légèrement ne rend rien faux, ça rend seulement le seuil un peu généreux.
+    {
+        int32 StrateIdx = 0;
+        {
+            const int32 QZ = FMath::FloorToInt((float)((TopVoxelZ + BottomVoxelZ) / 2) / (float)CHUNK_SIZE);
+            StrateIdx = World.StrateManager->GetStrateIndex(
+                ((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+        }
+
+        const UVoxelStrateDefinition* Def = World.Definitions[FTestWorld::SlotTunnelNetwork].Get();
+
+        // UNE grande boîte couvrant tout le domaine échantillonné (chunks XY de -3 à +3), plutôt que
+        // 49 boîtes par chunk : les salles sont hachées par cellule, donc leurs positions ne
+        // dépendent pas du découpage — seule la décision de STOCKAGE change, et on ne lit ici que
+        // des centres et des ops.
+        const float Expansion = P.CaveWarpStrength + 2.0f;
+        const float BigMinX = -3.0f * CHUNK_SIZE - Expansion;
+        const float BigMinY = -3.0f * CHUNK_SIZE - Expansion;
+        const float BigMaxX =  4.0f * CHUNK_SIZE + Expansion;
+        const float BigMaxY =  4.0f * CHUNK_SIZE + Expansion;
+
+        FChunkSDFCache BigCache;
+        VoxelCaveMorphology::BuildChunkCache(
+            BigCache, BigMinX, BigMinY, BigMaxX, BigMaxY,
+            P, (uint32)World.Settings->Seed, StrateIdx, &Def->TerrainOperations);
+
+        TArray<const FCachedRoom*> TerraceRooms;
+        int32 NumRoomsWithOp = 0;
+        for (const FCachedRoom& R : BigCache.Rooms)
+        {
+            if (R.RoomOp == nullptr) { continue; }
+            ++NumRoomsWithOp;
+            if (R.RoomOp->Type == EVoxelTerrainOpType::Terrace) { TerraceRooms.Add(&R); }
+        }
+
+        int32 NumSamplesNearTerrace = 0;
+        for (int32 i = 0; i < NumTunnelSamples; ++i)
+        {
+            const FVector Pt = Points[i];
+            for (const FCachedRoom* R : TerraceRooms)
+            {
+                if ((float)FVector::DistSquared(Pt, R->Center) < R->CullRadiusSq)
+                {
+                    ++NumSamplesNearTerrace;
+                    break;
+                }
+            }
+        }
+
+        AddInfo(FString::Printf(
+            TEXT("Per-room override coverage (stage C1): %d of %d baked rooms carry a terrain op, ")
+            TEXT("%d of them a Terrace op whose params (3.0/0.95/1.4) overwrite the strate's ")
+            TEXT("(6.0/0.6/0.5); %d of %d samples fall inside one of those rooms' influence radius. ")
+            TEXT("The bit-identity in check 1 means C1 works ONLY insofar as those last two numbers ")
+            TEXT("are non-zero -- otherwise it proves that two paths agree where the override never ")
+            TEXT("applies, which is what stage B already proved."),
+            NumRoomsWithOp, BigCache.Rooms.Num(), TerraceRooms.Num(),
+            NumSamplesNearTerrace, NumTunnelSamples));
+
+        TestTrue(TEXT("the bake rolled at least one Terrace op onto a room (stage C1's premise)"),
+                 TerraceRooms.Num() > 0);
+        TestTrue(TEXT("at least one sample lands inside a Terrace-op room, so the per-room override ")
+                 TEXT("is actually exercised by the equivalence above"),
+                 NumSamplesNearTerrace > 0);
     }
 
     //=========================================================================

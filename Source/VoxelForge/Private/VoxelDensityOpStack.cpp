@@ -26,6 +26,7 @@
 #include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
 #include "VoxelNoise.h"               // VoxelNoise::FBM
 #include "VoxelStrateDefinition.h"    // TerrainOperations — le pool que BuildChunkCache tire par salle
+#include "VoxelTerrainOpDefinition.h" // ApplyTo — l'override d'op PAR SALLE (étape C1)
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
 #include "VoxelTypes.h"               // SmoothStep01, VOXEL_NOISE_SCALE
 
@@ -1817,6 +1818,13 @@ namespace
 
             /** La salle de SDF minimal pour le dernier voxel évalué. -1 = aucune. */
             int32 NearestRoom = -1;
+
+            /** ÉTAPE C1 — les params de la strate avec l'op de CETTE salle appliqué par-dessus.
+             *  Mémo par voxel : invalidé au début de chaque `Eval`, calculé au PREMIER modificateur
+             *  qui le demande. C'est ce qui reproduit le coût de l'original (une copie de struct par
+             *  voxel PRÈS D'UNE SURFACE, pas partout) sans que onze opérateurs la refassent chacun. */
+            FStrateGenerationParams LocalParams;
+            bool bLocalParamsValid = false;
         };
 
         static FState& State()
@@ -1831,6 +1839,55 @@ namespace
         /** L'index de la salle la plus proche pour le dernier voxel évalué. -1 = aucune.
          *  Lu par les arches, les dômes, le pincement et le biais de sol. */
         int32 GetNearestRoomIdx() const { return State().NearestRoom; }
+
+        /**
+         * ÉTAPE C1 — L'OVERRIDE D'OP PAR SALLE. Les params de la strate avec l'op de terrain tiré
+         * pour la salle la plus proche appliqué par-dessus. **ONZE des douze modificateurs de détail
+         * lisent ceci au lieu de leurs propres params.**
+         *
+         * ⚠️ POURQUOI ÇA VIT ICI ET PAS DANS CHAQUE MODIFICATEUR.
+         * `OPSTACK-DECOMPOSITION §2` disait que cette pièce n'a « pas de domicile propre » et
+         * proposait de donner à chaque modificateur un prédicat « seulement dans la salle N ». La
+         * difficulté venait d'une hypothèse : que chaque modificateur doive POSSÉDER ses params. Dès
+         * qu'UN opérateur possède l'état partagé et que les autres le LISENT, elle disparaît — et ce
+         * motif est déjà celui de `FOverhangShelfMod` ← `FSurfaceColumnSource` et de
+         * `FShaftLedgeMod` ← `FShaftFieldSource`. C'est la résolution des pits/cheminées une
+         * deuxième fois : ne pas inventer de mécanisme de portée, laisser une source publier.
+         *
+         * ⚠️ LA COPIE DE ~74 CHAMPS PAR VOXEL EST TRANSCRITE TELLE QUELLE. L'original écrit
+         * `FStrateGenerationParams LocalTerrainParams = Params;` dans le bloc par voxel. C'est un
+         * poste de perf réel, noté dans OPSTACK-PROGRESS ; le mémo ci-dessous garantit seulement
+         * qu'on ne la fait pas ONZE fois là où l'original la fait une.
+         *
+         * ⚠️ **LA RUGOSITÉ (4b) N'APPELLE PAS CECI**, et c'est la lecture du code, pas une
+         * simplification : dans l'original le shadow `const FStrateGenerationParams& Params =
+         * LocalTerrainParams;` est déclaré DANS le bloc `if (bNearCaveSurface)` qui commence APRÈS
+         * l'étape 4b. La rugosité lit les params de la strate. Douze modificateurs, onze lecteurs.
+         *
+         * One op owns the shared state and the rest read it — the same pattern the surface and shaft
+         * ports already use, and the reason §2's "no clean home" problem evaporates. The ~74-field
+         * per-voxel copy is the original's, kept. Roughness (4b) deliberately does NOT read this.
+         */
+        const FStrateGenerationParams& LocalParams() const
+        {
+            FState& S = State();
+            if (!S.bLocalParamsValid)
+            {
+                S.LocalParams = P;
+                if (S.NearestRoom >= 0 && S.Cache.Rooms.IsValidIndex(S.NearestRoom))
+                {
+                    const FCachedRoom& NR = S.Cache.Rooms[S.NearestRoom];
+                    if (NR.RoomOp)
+                    {
+                        // N'écrit que les champs propres au type de l'op ; tout le reste garde la
+                        // valeur de la strate. Exactement l'appel de l'original.
+                        NR.RoomOp->ApplyTo(S.LocalParams, NR.RoomOpWeight);
+                    }
+                }
+                S.bLocalParamsValid = true;
+            }
+            return S.LocalParams;
+        }
 
         /**
          * Une requête SDF supplémentaire dans le cache courant, pour les sondes de gradient des
@@ -1871,6 +1928,11 @@ namespace
             // consommateurs sont des objets séparés, et une valeur périmée qui traverse une frontière
             // d'opérateur est le genre de chose qu'on ne retrouve pas. On paie une écriture.
             S.NearestRoom = -1;
+            // ÉTAPE C1 — le mémo d'override est PAR VOXEL. L'invalider ici, avant tout early-out,
+            // est ce qui garantit qu'aucun modificateur ne lira les params de la salle du voxel
+            // précédent. (Le mémo n'est PAS recalculé ici : le faire coûterait une copie de struct
+            // sur chaque voxel de roc profond, ce que l'original ne paie pas.)
+            S.bLocalParamsValid = false;
 
             if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return; }   // Sdf reste FLT_MAX
 
@@ -2285,9 +2347,10 @@ namespace
 
             // `&& CaveSDF < FLT_MAX` est redondant sous le gate (qui le teste déjà) mais l'original
             // l'écrit, et une transcription littérale ne fait pas le tri.
-            if (!(P.TerraceStepHeight > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.TerraceStepHeight > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
-            const float StepH = P.TerraceStepHeight;
+            const float StepH = LP.TerraceStepHeight;
             const float DistFromSurface = FMath::Abs(CaveSDF);
             const float TerraceRange = StepH * 3.0f;
             if (!(DistFromSurface < TerraceRange)) { return; }
@@ -2305,21 +2368,21 @@ namespace
             // strates et les nervures plus bas. La rugosité (4b), elle, utilise EffectiveZ. C'est
             // délibéré dans l'original et ça se lit dans son commentaire d'en-tête du STEP 3.
             float NoisedZ = WorldZ;
-            if (P.TerraceNoiseDisplacement > 0.0f)
+            if (LP.TerraceNoiseDisplacement > 0.0f)
             {
                 const float DispNoise = HFractal3D(FVector(
                     WorldX * 0.04f + VoxelHash::SeedOffset(SeedU, 31.1f),
                     WorldY * 0.04f + VoxelHash::SeedOffset(SeedU, 37.3f),
                     WorldZ * 0.02f + VoxelHash::SeedOffset(SeedU, 41.7f)
                 ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
-                NoisedZ += DispNoise * P.TerraceNoiseDisplacement * StepH;
+                NoisedZ += DispNoise * LP.TerraceNoiseDisplacement * StepH;
             }
 
             const float K = NoisedZ / StepH;
             const float FloorK = FMath::FloorToFloat(K);
             const float Frac = K - FloorK;   // toujours [0, 1)
 
-            const float Edge = FMath::Lerp(0.45f, 0.02f, P.TerraceHardness);
+            const float Edge = FMath::Lerp(0.45f, 0.02f, LP.TerraceHardness);
             float StairValue;
             if (Frac < 0.5f - Edge)
             {
@@ -2348,6 +2411,7 @@ namespace
          *  `StepH/2` — troisième client du pliage numérique de `OPSTACK-DECOMPOSITION §0.2`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.TerraceStepHeight > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
@@ -2366,7 +2430,8 @@ namespace
     class FLayerLineMod final : public IVoxelDensityOp
     {
     public:
-        explicit FLayerLineMod(const FStrateGenerationParams& InP) : P(InP) {}
+        FLayerLineMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2375,13 +2440,15 @@ namespace
         {
             const float CaveSDF = InOut.Sdf;
             if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
-            if (!(P.LayerLineSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            if (Rooms == nullptr) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.LayerLineSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
             const float DistFromSurface = FMath::Abs(CaveSDF);
-            const float LineRange = P.LayerLineSpacing * 1.5f;
+            const float LineRange = LP.LayerLineSpacing * 1.5f;
             if (!(DistFromSurface < LineRange)) { return; }
 
-            const float LinePhase = WorldZ * (2.0f * PI) / P.LayerLineSpacing;
+            const float LinePhase = WorldZ * (2.0f * PI) / LP.LayerLineSpacing;
             float LineValue = FMath::Sin(LinePhase);
 
             LineValue = FMath::Max(LineValue, 0.0f);
@@ -2390,19 +2457,28 @@ namespace
             float Fade = 1.0f - (DistFromSurface / LineRange);
             Fade = Fade * Fade;
 
-            InOut.Density -= LineValue * P.LayerLineDepth * Fade;
+            InOut.Density -= LineValue * LP.LayerLineDepth * Fade;
         }
 
         /** Ne SOUSTRAIT que (`LineValue ≥ 0`, `Depth ≥ 0`) ⇒ `CarveOnly`, jamais `Both`. Un des
          *  rares modificateurs de détail qui garde une DIRECTION exploitable par le pliage. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // ⚠️ VERDICT DE BOÎTE ET OVERRIDE PAR SALLE : la borne se lit sur les params de la
+            // STRATE, pas sur ceux d'une salle — une boîte couvre plusieurs salles, donc aucune
+            // copie par voxel n'y a de sens. Une salle ne peut qu'ACTIVER un modificateur éteint au
+            // niveau strate, jamais l'inverse… sauf que `ApplyTo` écrit la valeur de l'op, y compris
+            // quand la strate valait 0. Donc quand une strate a un pool d'ops, ce verdict-ci peut
+            // être TROP OPTIMISTE. Aucun risque aujourd'hui : rien ne consomme `ClassifyBox` en
+            // production (cf. la file d'attente post-8/8), et il faudra le régler AVANT que
+            // `ClassifyTile` ne le consomme. Noté dans OPSTACK-PROGRESS.
             return (P.LayerLineSpacing > 0.0f && P.LayerLineDepth > 0.0f)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
     private:
         FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
     };
 
     //=========================================================================
@@ -2418,7 +2494,8 @@ namespace
     class FRibbingMod final : public IVoxelDensityOp
     {
     public:
-        explicit FRibbingMod(const FStrateGenerationParams& InP) : P(InP) {}
+        FRibbingMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2427,13 +2504,15 @@ namespace
         {
             const float CaveSDF = InOut.Sdf;
             if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
-            if (!(P.RibbingSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            if (Rooms == nullptr) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.RibbingSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
             const float DistFromSurface = FMath::Abs(CaveSDF);
-            const float RibRange = P.RibbingSpacing * 1.5f;
+            const float RibRange = LP.RibbingSpacing * 1.5f;
             if (!(DistFromSurface < RibRange)) { return; }
 
-            const float RibPhase = WorldZ * (2.0f * PI) / P.RibbingSpacing + PI * 0.5f;
+            const float RibPhase = WorldZ * (2.0f * PI) / LP.RibbingSpacing + PI * 0.5f;
             float RibValue = FMath::Sin(RibPhase);
 
             RibValue = FMath::Max(RibValue, 0.0f);
@@ -2442,18 +2521,20 @@ namespace
             float Fade = 1.0f - (DistFromSurface / RibRange);
             Fade = Fade * Fade;
 
-            InOut.Density += RibValue * P.RibbingDepth * Fade;
+            InOut.Density += RibValue * LP.RibbingDepth * Fade;
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.RibbingSpacing > 0.0f && P.RibbingDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
     private:
         FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
     };
 
     //=========================================================================
@@ -2468,8 +2549,8 @@ namespace
     class FCaveOverhangMod final : public IVoxelDensityOp
     {
     public:
-        FCaveOverhangMod(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+        FCaveOverhangMod(const FStrateGenerationParams& InP, int32 Seed, const FRoomGraphSource* InRooms)
+            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2478,10 +2559,12 @@ namespace
         {
             const float CaveSDF = InOut.Sdf;
             if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
-            if (!(P.OverhangStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            if (Rooms == nullptr) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.OverhangStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
             const float DistFromSurface = FMath::Abs(CaveSDF);
-            const float OverhangRange = P.OverhangDepth * 2.0f;
+            const float OverhangRange = LP.OverhangDepth * 2.0f;
             if (!(DistFromSurface < OverhangRange)) { return; }
 
             const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
@@ -2489,9 +2572,9 @@ namespace
 
             // Fréquence en Z à 0.15× celle de XY ⇒ les motifs s'étirent horizontalement.
             const float OverhangNoise = HFractal3D(FVector(
-                WorldX * P.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
-                WorldY * P.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
-                EffectiveZ * P.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
+                WorldX * LP.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
+                WorldY * LP.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
+                EffectiveZ * LP.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
             ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
 
             if (OverhangNoise > 0.0f)
@@ -2499,13 +2582,14 @@ namespace
                 float Fade = 1.0f - (DistFromSurface / OverhangRange);
                 Fade = Fade * Fade;
 
-                InOut.Density += OverhangNoise * P.OverhangDepth * P.OverhangStrength * Fade;
+                InOut.Density += OverhangNoise * LP.OverhangDepth * LP.OverhangStrength * Fade;
             }
         }
 
         /** Lobe positif seulement ⇒ n'AJOUTE que du solide ⇒ `FillOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
@@ -2513,6 +2597,7 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        const FRoomGraphSource* Rooms;   // NON possédant
     };
 
     //=========================================================================
@@ -2534,8 +2619,8 @@ namespace
     class FCaveCliffMod final : public IVoxelDensityOp
     {
     public:
-        FCaveCliffMod(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+        FCaveCliffMod(const FStrateGenerationParams& InP, int32 Seed, const FRoomGraphSource* InRooms)
+            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2544,7 +2629,9 @@ namespace
         {
             const float CaveSDF = InOut.Sdf;
             if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
-            if (!(P.CliffStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            if (Rooms == nullptr) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.CliffStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
             const float DistFromSurface = FMath::Abs(CaveSDF);
             const float CliffRange = 8.0f;   // constante en dur dans l'original
@@ -2559,7 +2646,7 @@ namespace
                 EffectiveZ * 0.15f + VoxelHash::SeedOffset(SeedU, 79.1f)   // 3× plus vite en Z
             )) * VOXEL_NOISE_SCALE;
 
-            const float CliffEffect = VertGrad * CaveSDF * P.CliffStrength;
+            const float CliffEffect = VertGrad * CaveSDF * LP.CliffStrength;
 
             if (FMath::Abs(VertGrad) > 0.3f)
             {
@@ -2572,12 +2659,14 @@ namespace
         /** `Both` : le signe suit celui de `VertGrad · CaveSDF`, donc les deux directions. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.CliffStrength > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        const FRoomGraphSource* Rooms;   // NON possédant
     };
 
     //=========================================================================
@@ -2592,8 +2681,8 @@ namespace
     class FScallopMod final : public IVoxelDensityOp
     {
     public:
-        FScallopMod(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+        FScallopMod(const FStrateGenerationParams& InP, int32 Seed, const FRoomGraphSource* InRooms)
+            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -2602,16 +2691,18 @@ namespace
         {
             const float CaveSDF = InOut.Sdf;
             if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
-            if (!(P.ScallopStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+            if (Rooms == nullptr) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.ScallopStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
 
             const float DistFromSurface = FMath::Abs(CaveSDF);
-            const float ScallopRange = P.ScallopStrength * 4.0f;
+            const float ScallopRange = LP.ScallopStrength * 4.0f;
             if (!(DistFromSurface < ScallopRange)) { return; }
 
             const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
                                    ? (WorldZ / P.VerticalScale) : WorldZ;
 
-            const float SF = P.ScallopFrequency;
+            const float SF = LP.ScallopFrequency;
             const float ScallopNoise = VoxelNoise::Cellular3D(FVector(
                 WorldX * SF + VoxelHash::SeedOffset(SeedU, 83.1f),
                 WorldY * SF + VoxelHash::SeedOffset(SeedU, 89.3f),
@@ -2623,19 +2714,21 @@ namespace
                 float Fade = 1.0f - (DistFromSurface / ScallopRange);
                 Fade = Fade * Fade;
 
-                InOut.Density -= ScallopNoise * P.ScallopStrength * Fade;
+                InOut.Density -= ScallopNoise * LP.ScallopStrength * Fade;
             }
         }
 
         /** Lobe positif seulement, SOUSTRAIT ⇒ `CarveOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.ScallopStrength > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        const FRoomGraphSource* Rooms;   // NON possédant
     };
 
     //=========================================================================
@@ -2664,7 +2757,8 @@ namespace
             if (Rooms == nullptr) { return; }
 
             const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
-            if (!(P.ArchDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.ArchDensity > 0.0f && CaveSDF < LP.SDFBlendRadius && CaveSDF < FLT_MAX
                   && NearestRoomIdx >= 0))
             {
                 return;
@@ -2686,7 +2780,7 @@ namespace
             {
                 const uint32 AH = VoxelHash::Mix(Room.Hash ^ (0xA4C400u + (uint32)i * 7369u));
 
-                if (VoxelHash::ToFloat01(AH) > P.ArchDensity) { continue; }
+                if (VoxelHash::ToFloat01(AH) > LP.ArchDensity) { continue; }
 
                 const uint32 AH2 = VoxelHash::Mix(AH ^ 0xA4C4u);
                 const float ArcCX = Room.Center.X + VoxelHash::ToFloatSigned(AH2) * Room.RadiusXY * 0.3f;
@@ -2707,7 +2801,7 @@ namespace
                 const FVector ArchB(ArcCX + CosA * HalfSpan, ArcCY + SinA * HalfSpan, ArcCZ);
 
                 const uint32 AH5 = VoxelHash::Mix(AH4 ^ 0xF00Du);
-                const float ArchRadius = FMath::Lerp(P.ArchMinRadius, P.ArchMaxRadius,
+                const float ArchRadius = FMath::Lerp(LP.ArchMinRadius, LP.ArchMaxRadius,
                                                      VoxelHash::ToFloat01(AH5));
 
                 const float ArchSDF = VoxelSDF::Capsule(VoxPos, ArchA, ArchB, ArchRadius);
@@ -2717,7 +2811,7 @@ namespace
                 {
                     float Fill = FMath::Clamp((ArchBlend - ArchSDF) / (ArchBlend * 2.0f), 0.0f, 1.0f);
                     Fill = SmoothStep01(Fill);
-                    InOut.Density += Fill * P.BaseDensity * 1.5f;
+                    InOut.Density += Fill * LP.BaseDensity * 1.5f;
                 }
             }
         }
@@ -2727,6 +2821,7 @@ namespace
          *  dette que `FRoomGraphSource::EffectOverBox`, et elle se paiera au même moment. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.ArchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -2817,7 +2912,8 @@ namespace
             if (Rooms == nullptr) { return; }
 
             const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
-            if (!(P.DomeDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.DomeDensity > 0.0f && CaveSDF < LP.SDFBlendRadius && CaveSDF < FLT_MAX
                   && NearestRoomIdx >= 0))
             {
                 return;
@@ -2833,7 +2929,7 @@ namespace
             {
                 const uint32 DH = VoxelHash::Mix(Room.Hash ^ (0xD0AE0u + (uint32)i * 8191u));
 
-                if (VoxelHash::ToFloat01(DH) > P.DomeDensity) { continue; }
+                if (VoxelHash::ToFloat01(DH) > LP.DomeDensity) { continue; }
 
                 const uint32 DH2 = VoxelHash::Mix(DH ^ 0xD0A0u);
                 const float DmX = Room.Center.X + VoxelHash::ToFloatSigned(DH2) * Room.RadiusXY * 0.4f;
@@ -2842,7 +2938,7 @@ namespace
 
                 const uint32 DH3 = VoxelHash::Mix(DH2 ^ 0x90DEu);
                 const float DmRadius = FMath::Min(
-                    FMath::Lerp(P.DomeMinRadius, P.DomeMaxRadius, VoxelHash::ToFloat01(DH3)),
+                    FMath::Lerp(LP.DomeMinRadius, LP.DomeMaxRadius, VoxelHash::ToFloat01(DH3)),
                     Room.RadiusXY * 0.85f
                 );
 
@@ -2850,7 +2946,7 @@ namespace
                 const float DmCenterZ = Room.Center.Z + Room.RadiusZ * 0.2f
                                       + VoxelHash::ToFloat01(DH4) * Room.RadiusZ * 0.3f;
 
-                const float DmHeight = DmRadius * P.DomeHeightRatio;
+                const float DmHeight = DmRadius * LP.DomeHeightRatio;
 
                 if (WorldZ > DmCenterZ + DmHeight + 3.0f || WorldZ < DmCenterZ - 3.0f) { continue; }
 
@@ -2871,7 +2967,7 @@ namespace
                 {
                     float Carve = FMath::Clamp((DmBlend - DomeSDF) / (DmBlend * 2.0f), 0.0f, 1.0f);
                     Carve = SmoothStep01(Carve);
-                    InOut.Density -= Carve * P.BaseDensity * 1.5f;
+                    InOut.Density -= Carve * LP.BaseDensity * 1.5f;
                 }
             }
         }
@@ -2879,6 +2975,7 @@ namespace
         /** Ne SOUSTRAIT que ⇒ `CarveOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.DomeDensity > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
@@ -2910,7 +3007,8 @@ namespace
             if (Rooms == nullptr) { return; }
 
             const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
-            if (!(P.PinchDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.PinchDensity > 0.0f && CaveSDF < LP.SDFBlendRadius && CaveSDF < FLT_MAX
                   && NearestRoomIdx >= 0))
             {
                 return;
@@ -2927,7 +3025,7 @@ namespace
             {
                 const uint32 PnH = VoxelHash::Mix(Room.Hash ^ (0xF1C400u + (uint32)i * 5417u));
 
-                if (VoxelHash::ToFloat01(PnH) > P.PinchDensity) { continue; }
+                if (VoxelHash::ToFloat01(PnH) > LP.PinchDensity) { continue; }
 
                 const uint32 PnH2 = VoxelHash::Mix(PnH ^ 0xF1C4u);
                 const float PnX = Room.Center.X + VoxelHash::ToFloatSigned(PnH2) * Room.RadiusXY * Spread;
@@ -2946,15 +3044,15 @@ namespace
                 const float DYPn = WorldY - PnY;
                 const float DZPn = WorldZ - PnZ;
 
-                const float MaxExtent = FMath::Max(P.PinchLength, P.PinchStrength) + 5.0f;
+                const float MaxExtent = FMath::Max(LP.PinchLength, LP.PinchStrength) + 5.0f;
                 if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > MaxExtent) { continue; }
 
                 const float Along  =  DXPn * CosPN + DYPn * SinPN;
                 const float Across = -DXPn * SinPN + DYPn * CosPN;
 
-                const float HalfLength   = P.PinchLength * 0.5f;
-                const float HalfNarrow   = P.PinchStrength;
-                const float HalfVertical = P.PinchStrength * 1.5f;
+                const float HalfLength   = LP.PinchLength * 0.5f;
+                const float HalfNarrow   = LP.PinchStrength;
+                const float HalfVertical = LP.PinchStrength * 1.5f;
 
                 const float NAlong   = Along   / HalfLength;
                 const float NAcross  = Across  / HalfNarrow;
@@ -2967,7 +3065,7 @@ namespace
                     Fill = SmoothStep01(Fill);
                     const float AxisDist = FMath::Sqrt(NAcross * NAcross + NUp * NUp);
                     const float SideFactor = FMath::Clamp(AxisDist * 2.0f, 0.0f, 1.0f);
-                    InOut.Density += Fill * SideFactor * P.BaseDensity * 1.5f;
+                    InOut.Density += Fill * SideFactor * LP.BaseDensity * 1.5f;
                 }
             }
         }
@@ -2975,6 +3073,7 @@ namespace
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.PinchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -3009,7 +3108,8 @@ namespace
             if (Rooms == nullptr) { return; }
 
             const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
-            if (!(P.FloorBias > 0.0f && NearestRoomIdx >= 0 && CaveSDF < 0.0f)) { return; }
+            const FStrateGenerationParams& LP = Rooms->LocalParams();   // C1 : params PAR SALLE
+            if (!(LP.FloorBias > 0.0f && NearestRoomIdx >= 0 && CaveSDF < 0.0f)) { return; }
 
             const FChunkSDFCache& Cache = Rooms->GetCache();
             if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }   // cf. FCaveArchMod
@@ -3021,13 +3121,14 @@ namespace
             if (NormZ < 0.0f)
             {
                 const float FloorFactor = NormZ * NormZ;   // 0 au centre, 1 au sol
-                InOut.Density += FloorFactor * P.FloorBias;
+                InOut.Density += FloorFactor * LP.FloorBias;
             }
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
+            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.FloorBias > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
         }
 
@@ -3284,14 +3385,15 @@ namespace VoxelDensityOps
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ ÉTAPES A + B (B1 À B5) — LES DOUZE MODIFICATEURS DE DÉTAIL SONT PORTÉS.
-        // **CE QUI RESTE, C'EST L'ÉTAPE C** : l'override d'op PAR SALLE. Tant qu'il manque, les
-        // onze modificateurs qui, dans l'original, lisent la copie de params de la salle la plus
-        // proche lisent ici les params de la STRATE. Les deux coïncident exactement tant qu'aucune
-        // salle ne porte un op de type détail (Terrace, LayerLines, Ribbing, Cliff, Scallop,
-        // Overhang, Arch, Dome, Pinch) — le test garde donc son pool à Pit/Cheminée/Colonne, dont
-        // les `ApplyTo` n'écrivent aucun champ de détail. **C'est CETTE condition, et rien d'autre,
-        // qui rend l'étape B vérifiable avant l'étape C.**
+        // ⚠️ ÉTAPES A + B + C1 — LA PILE EST COMPLÈTE POUR CET ARCHÉTYPE.
+        // Portés : échelle verticale, roc de base, warp, graphe de salles (+ pits + cheminées),
+        // carve, LES DOUZE MODIFICATEURS DE DÉTAIL (4b–4h), l'override d'op PAR SALLE, les vers,
+        // le post structurel.
+        //
+        // L'override (C1) n'ajoute AUCUN opérateur : il change ce que ONZE d'entre eux LISENT.
+        // `FRoomGraphSource::LocalParams()` publie les params de la strate avec l'op de la salle la
+        // plus proche appliqué ; les onze modificateurs concernés y lisent leurs champs au lieu des
+        // leurs. La rugosité (4b) NON — dans l'original elle précède la déclaration du shadow.
         //
         // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
         // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
@@ -3333,11 +3435,11 @@ namespace VoxelDensityOps
         //    a laissée (le biais de sol, en particulier, existe pour rattraper la rugosité).
         OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));            // 4b
         OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
-        OutStack.Add(MakeUnique<FLayerLineMod>(P));                      // 4c — lignes de strates
-        OutStack.Add(MakeUnique<FRibbingMod>(P));                        // 4c — nervures
-        OutStack.Add(MakeUnique<FCaveOverhangMod>(P, Seed));             // 4c — surplombs
-        OutStack.Add(MakeUnique<FCaveCliffMod>(P, Seed));                // 4c — falaise
-        OutStack.Add(MakeUnique<FScallopMod>(P, Seed));                  // 4c — festons
+        OutStack.Add(MakeUnique<FLayerLineMod>(P, RoomPtr));             // 4c — lignes de strates
+        OutStack.Add(MakeUnique<FRibbingMod>(P, RoomPtr));               // 4c — nervures
+        OutStack.Add(MakeUnique<FCaveOverhangMod>(P, Seed, RoomPtr));    // 4c — surplombs
+        OutStack.Add(MakeUnique<FCaveCliffMod>(P, Seed, RoomPtr));       // 4c — falaise
+        OutStack.Add(MakeUnique<FScallopMod>(P, Seed, RoomPtr));         // 4c — festons
         OutStack.Add(MakeUnique<FCaveArchMod>(P, RoomPtr));              // 4c — arches
         OutStack.Add(MakeUnique<FRoomColumnMod>(P, RoomPtr));            // 4d — colonnes (pré-cuites)
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
