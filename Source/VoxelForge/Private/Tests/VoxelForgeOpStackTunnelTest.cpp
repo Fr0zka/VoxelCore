@@ -1,9 +1,11 @@
 // VoxelForgeOpStackTunnelTest.cpp
-// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPES B1–B3 (huit modificateurs de détail, 4b–4c).
-// TunnelNetwork — STAGE A (the SDF spine) + STAGES B1-B3 (eight detail modifiers, 4b-4c).
+// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPE B COMPLÈTE (les douze modificateurs, 4b–4h).
+// TunnelNetwork — STAGE A (the SDF spine) + ALL OF STAGE B (the twelve detail modifiers, 4b-4h).
 //
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
-// `GetDensityWithParams` fait ~1080 lignes et treize modificateurs de détail. Tout porter avant de
+// `GetDensityWithParams` fait ~1080 lignes et douze modificateurs de détail (le chiffre « treize »
+// traînait dans les notes ; il y en a douze, et onze seulement lisent la copie de params par salle).
+// Tout porter avant de
 // pouvoir rien vérifier, ce serait écrire ~600 lignes non compilées par-dessus ~200 non vérifiées —
 // exactement le motif que `AUDIT §P3` documente et que ce refactor a évité six fois de suite.
 //
@@ -15,17 +17,22 @@
 // Même discipline que la passe « défauts puis tous les ops ON » du test de pile de hauteur, prise
 // dans l'autre sens.
 //
-// L'ÉTAPE B REMONTE CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté sort
-// de `DisableStageBModifiers` et entre dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
+// L'ÉTAPE B A REMONTÉ CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté sortait
+// de la liste des amplitudes éteintes pour entrer dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
 // qui prouve qu'il a réellement bougé quelque chose et (ii) le compte d'ops de la pile qui augmente.
 //   • B1 : rugosité de paroi, STEP 4b.
 //   • B2 : terrasses, lignes de strates, nervures — STEP 4c.
-//   • B3 (ce commit) : surplombs, falaise, festons, arches — STEP 4c.
+//   • B3 : surplombs, falaise, festons, arches — STEP 4c.
+//   • B4 (ce commit) : colonnes (4d), dômes (4g), pincement (4h), biais de sol. La liste des
+//     amplitudes éteintes est vide : **l'étape B est complète**.
 //
-// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les quatre modificateurs restants (colonnes,
-// dômes, pincement, biais de sol), rien sur l'override d'op par salle, et rien sur le saut de
-// tuile — `FRoomGraphSource::EffectOverBox` rend `Both`, donc aucun verdict n'est prouvable à ce
-// stade. Ce sont les étapes B4, B5 et C.
+// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur l'override d'op PAR SALLE — onze des douze
+// modificateurs lisent, dans l'original, une copie des params où l'op de la salle la plus proche a
+// été appliqué, et la pile lit les params de la strate. Les deux coïncident **uniquement** parce que
+// le pool du test ne contient que Pit / Chimney / Column, dont les `ApplyTo` n'écrivent aucun champ
+// de détail. Un op `Terrace` dans ce pool casserait l'équivalence : c'est exactement le test que C1
+// ajoutera, et c'est la seule preuve possible de l'override. Rien non plus sur le saut de tuile —
+// `FRoomGraphSource::EffectOverBox` rend `Both`.
 //
 // ⚠️ ÉCHANTILLONNAGE PAR GRAPPES, PAS UNIFORME. Le cache SDF se reconstruit quand la requête sort de
 // sa boîte de recherche ; 20 000 points uniformément aléatoires feraient ~20 000 `BuildChunkCache`
@@ -57,23 +64,21 @@ namespace
     constexpr int32 PointsPerChunk   = 250;
     constexpr int32 NumTunnelSamples = NumTunnelChunks * PointsPerChunk;
 
-    /**
-     * Met à zéro tout ce qui n'est PAS ENCORE porté, pour que l'original prenne le même chemin.
-     * Ces champs-là sont déjà à zéro par défaut ; on les écrit quand même, parce qu'un test qui
-     * dépend d'un défaut se casse le jour où le défaut change, et silencieusement.
-     *
-     * ⚠️ CETTE LISTE RÉTRÉCIT À CHAQUE GROUPE DE L'ÉTAPE B. Une ligne qui part d'ici doit arriver
-     * dans `EnableTunnelFeatures` ET dans `FeatureProbes` : la déplacer sans la sonder rendrait le
-     * groupe « activé » sans aucune preuve qu'il s'exécute. `SurfaceRoughness` (B1) est le premier
-     * à avoir fait le trajet — c'était le seul non nul par défaut (5.0).
-     */
-    void DisableStageBModifiers(FStrateGenerationParams& P)
-    {
-        P.ColumnDensity             = 0.0f;   // ⚠️ celui-ci se cuit dans SDFCache.Columns, pas un `if`
-        P.DomeDensity               = 0.0f;
-        P.PinchDensity              = 0.0f;
-        P.FloorBias                 = 0.0f;
-    }
+    //=========================================================================
+    // ⚠️ `DisableStageBModifiers` A DISPARU, ET SA DISPARITION EST LE RÉSULTAT DE L'ÉTAPE B
+    //=========================================================================
+    // Cette fonction mettait à zéro tout ce que le portage n'avait pas encore atteint, pour que
+    // l'original emprunte le même chemin que la pile. À chaque groupe (B1…B4) une ligne en sortait
+    // pour entrer dans `EnableTunnelFeatures` ET dans `FeatureProbes` ; à B4 il n'en restait plus.
+    // Sa liste vide EST la mesure de l'avancement — d'où le fait de le dire ici plutôt que de
+    // laisser une fonction vide qu'on continuerait d'appeler sans y penser.
+    //
+    // Une ligne y était de toute façon inopérante et mérite d'être notée : `ColumnDensity = 0`
+    // n'éteignait rien. La cuisson des colonnes lit `OpParams` (un struct NEUF où seul l'op de la
+    // salle a été appliqué), jamais le champ de la strate — même mécanisme que pour les pits. Ce qui
+    // tenait les colonnes éteintes à l'étape A, c'était l'ABSENCE d'op `Column` dans le pool, et le
+    // garde-fou qui ERREUR-ait si la cuisson en produisait quand même. B4 ajoute l'op au pool et
+    // retourne ce garde-fou : il EXIGE maintenant des colonnes.
 
     /**
      * ⚠️ DENSIFIÉ après le premier run vert. Aux défauts (`RoomSpacing = 80`, `RoomDensity = 0.35`)
@@ -93,7 +98,7 @@ namespace
      *
      * NOT here: PitDensity / ChimneyDensity. Setting them was a mistake that check 3b caught — the
      * bake reads a FRESH param struct with only the room's op applied, so those fields are never
-     * read. Pits exist only through a per-room terrain-op asset. See MakeShaftOpPool below.
+     * read. Pits exist only through a per-room terrain-op asset. See MakeRoomOpPool below.
      */
     void EnableTunnelFeatures(FStrateGenerationParams& P)
     {
@@ -137,27 +142,47 @@ namespace
         P.ArchDensity      = 0.9f;
         P.ArchMinRadius    = 3.0f;
         P.ArchMaxRadius    = 6.0f;
+
+        // ── ÉTAPE B4 : dômes · pincement · biais de sol (4g, 4h) ─────────────────────────────
+        // ⚠️ LES COLONNES (4d) NE SONT PAS ICI, et ce n'est pas un oubli : elles n'ont AUCUN
+        // paramètre de strate. Ni la cuisson ni la boucle par voxel ne lisent `ColumnDensity` ;
+        // elles n'existent que par un op `Column` dans le pool (voir `MakeRoomOpPool`) et leur
+        // couverture se prouve au contrôle 3b, pas par une sonde de params.
+        P.DomeDensity      = 0.9f;    // 2 tirages par salle ⇒ il en faut beaucoup pour couvrir
+        P.DomeMinRadius    = 8.0f;
+        P.DomeMaxRadius    = 15.0f;
+        P.DomeHeightRatio  = 0.8f;
+        P.PinchDensity     = 0.9f;    // idem, 3 tirages par salle
+        P.PinchStrength    = 5.0f;
+        P.PinchLength      = 12.0f;
+        P.FloorBias        = 0.8f;    // ne s'applique que dans l'air certain (CaveSDF < 0)
     }
 
     /**
-     * Le SEUL moyen d'obtenir des pits et des cheminées : donner à la strate un pool d'ops de
-     * terrain, que `BuildChunkCache` tire par salle. Deux entrées à `Probability = 0.5` ⇒ le pool
-     * est entièrement réclamé, donc **chaque salle reçoit un op** (moitié pits, moitié cheminées).
+     * Le SEUL moyen d'obtenir des pits, des cheminées et des colonnes : donner à la strate un pool
+     * d'ops de terrain, que `BuildChunkCache` tire par salle. Trois entrées à `Probability = 1.0` ⇒
+     * `TotalOpProb = 3`, `NormFactor = 1/3`, curseurs à 1/3, 2/3, 1 : **chaque salle reçoit un op**,
+     * un tiers de chaque sorte.
      *
-     * ⚠️ SÛR POUR L'ÉTAPE A, et ce n'est pas une évidence : l'override par salle du chemin d'origine
-     * applique l'op de la salle sur une COPIE des params, laquelle pilote les 13 modificateurs de
-     * détail — ceux que l'étape A n'a pas portés. Mais `ApplyTo` n'écrit, pour `Pit`, que les quatre
-     * champs de pit (idem `Chimney`). Aucun champ de détail n'est touché, donc aucun modificateur ne
-     * s'allume et l'équivalence de l'étape A tient. Un op `Terrace` ici la casserait — c'est
-     * exactement ce que l'étape B ajoutera, exprès.
+     * ⚠️⚠️ CE POOL DOIT RESTER Pit / Chimney / Column JUSQU'À L'ÉTAPE C1, ET LA RAISON EST SUBTILE.
+     * L'override par salle du chemin d'origine applique l'op de la salle sur une COPIE des params,
+     * et ONZE des douze modificateurs de détail lisent cette copie (la rugosité 4b, non : le shadow
+     * est déclaré après elle). L'étape B les a portés contre les params de la STRATE. Les deux ne
+     * coïncident que tant qu'aucune salle ne porte un op de type DÉTAIL — or `ApplyTo(Pit)` n'écrit
+     * que les quatre champs de pit, `ApplyTo(Chimney)` que les quatre de cheminée, `ApplyTo(Column)`
+     * que les trois de colonne. Aucun champ de détail touché ⇒ aucun modificateur ne diverge.
      *
-     * Safe at stage A because ApplyTo(Pit) writes only the four pit fields: no detail modifier wakes
-     * up. A Terrace op here WOULD break stage A — which is precisely what stage B will add.
+     * **Mettre un op `Terrace` ici casserait l'équivalence — et c'est exactement le test que C1
+     * ajoutera**, parce que c'est la seule preuve possible de l'override par salle.
+     *
+     * The pool must stay Pit/Chimney/Column until C1: eleven of the twelve modifiers read the
+     * per-room param copy in the original and the strate params here, and those agree only while no
+     * room carries a detail-type op. A Terrace entry is what C1 adds, deliberately.
      *
      * @param OutKeepAlive  les assets transitoires, à garder vivants pour la durée du test.
      */
-    void MakeShaftOpPool(UVoxelStrateDefinition* Def,
-                         TArray<TStrongObjectPtr<UVoxelTerrainOpDefinition>>& OutKeepAlive)
+    void MakeRoomOpPool(UVoxelStrateDefinition* Def,
+                        TArray<TStrongObjectPtr<UVoxelTerrainOpDefinition>>& OutKeepAlive)
     {
         UVoxelTerrainOpDefinition* PitOp = NewObject<UVoxelTerrainOpDefinition>(
             GetTransientPackage(), NAME_None, RF_Transient);
@@ -177,19 +202,38 @@ namespace
         ChimOp->ChimneyHeight    = 18.0f;
         OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(ChimOp));
 
+        // ⚠️ AJOUTÉ À L'ÉTAPE B4 : sans cette entrée, `SDFCache.Columns` reste VIDE et l'opérateur
+        // de colonnes ne s'exécute sur rien — ce que le contrôle 3b exigeait à l'étape A et qu'il
+        // exige désormais dans l'autre sens.
+        UVoxelTerrainOpDefinition* ColOp = NewObject<UVoxelTerrainOpDefinition>(
+            GetTransientPackage(), NAME_None, RF_Transient);
+        ColOp->Type            = EVoxelTerrainOpType::Column;
+        ColOp->ColumnDensity   = 0.9f;
+        ColOp->ColumnMinRadius = 2.0f;
+        ColOp->ColumnMaxRadius = 5.0f;
+        OutKeepAlive.Add(TStrongObjectPtr<UVoxelTerrainOpDefinition>(ColOp));
+
+        // `Probability = 1.0` sur les trois : la somme dépasse 1, donc la sélection est normalisée
+        // et chaque salle tire exactement un op parmi les trois, à parts égales.
         FStrateTerrainOpEntry PitEntry;
         PitEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(PitOp);
         PitEntry.Weight      = 1.0f;
-        PitEntry.Probability = 0.5f;
+        PitEntry.Probability = 1.0f;
 
         FStrateTerrainOpEntry ChimEntry;
         ChimEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(ChimOp);
         ChimEntry.Weight      = 1.0f;
-        ChimEntry.Probability = 0.5f;
+        ChimEntry.Probability = 1.0f;
+
+        FStrateTerrainOpEntry ColEntry;
+        ColEntry.Operation   = TSoftObjectPtr<UVoxelTerrainOpDefinition>(ColOp);
+        ColEntry.Weight      = 1.0f;
+        ColEntry.Probability = 1.0f;
 
         Def->TerrainOperations.Reset();
         Def->TerrainOperations.Add(PitEntry);
         Def->TerrainOperations.Add(ChimEntry);
+        Def->TerrainOperations.Add(ColEntry);
     }
 
     /** Fraction minimale d'échantillons devant tomber en grotte ouverte pour que l'équivalence
@@ -238,6 +282,15 @@ namespace
           [](FStrateGenerationParams& Q) { Q.ScallopStrength = 0.0f; } },
         { TEXT("B3 arches (STEP 4c)"),
           [](FStrateGenerationParams& Q) { Q.ArchDensity = 0.0f; } },
+        { TEXT("B4 domes (STEP 4g)"),
+          [](FStrateGenerationParams& Q) { Q.DomeDensity = 0.0f; } },
+        { TEXT("B4 pinch (STEP 4h)"),
+          [](FStrateGenerationParams& Q) { Q.PinchDensity = 0.0f; } },
+        { TEXT("B4 floor bias"),
+          [](FStrateGenerationParams& Q) { Q.FloorBias = 0.0f; } },
+        // ⚠️ PAS DE SONDE POUR LES COLONNES (STEP 4d), et ce n'est pas un oubli : elles n'ont aucun
+        // paramètre de strate qu'on puisse éteindre. Leur couverture se prouve au contrôle 3b, en
+        // demandant à la cuisson combien elle en a produit. Voir la note là-bas.
         // ⚠️ UNE SONDE PAR OPÉRATEUR, PAS UNE PAR GROUPE. Le groupe B2 en contient trois ; une seule
         // sonde « B2 » serait verte tant qu'UN des trois tire, et les deux autres pourraient être
         // faux sans que rien ne le dise. La granularité de la sonde est la granularité de la preuve.
@@ -295,7 +348,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     if (World.Definitions.IsValidIndex(FTestWorld::SlotTunnelNetwork)
         && World.Definitions[FTestWorld::SlotTunnelNetwork].IsValid())
     {
-        MakeShaftOpPool(World.Definitions[FTestWorld::SlotTunnelNetwork].Get(), OpAssets);
+        MakeRoomOpPool(World.Definitions[FTestWorld::SlotTunnelNetwork].Get(), OpAssets);
     }
     else
     {
@@ -322,18 +375,17 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    DisableStageBModifiers(P);
     EnableTunnelFeatures(P);
 
     FVoxelOpStack Stack;
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + **8 modificateurs (B1 · B2 · B3)** + worms + 3 structurels = 15.
-    // Les quatre modificateurs restants viendront s'insérer entre les arches et les vers, donc ce
+    // rock + roomgraph + carve + **les 12 modificateurs de détail** + worms + 3 structurels = 19.
+    // L'étape C n'ajoute AUCUN opérateur — elle change ce que onze d'entre eux LISENT — donc ce
     // nombre DOIT bouger à chaque groupe de l'étape B — c'est un compteur de progression, pas une
     // formalité : une pile qui ne grandit pas est une pile dont l'opérateur n'a pas été ajouté.
-    TestEqual(TEXT("the stage-A+B1..B3 tunnel stack is decomposed into 15 ops"), Stack.Num(), 15);
+    TestEqual(TEXT("the stage-A+B tunnel stack is decomposed into 19 ops"), Stack.Num(), 19);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -413,7 +465,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("is covered ONLY insofar as the bake-coverage and group-coverage lines below report ")
             TEXT("non-zero -- this message used to CLAIM coverage outright, and was wrong for a ")
             TEXT("whole run. NOT covered at all: whatever is still listed in ")
-            TEXT("DisableStageBModifiers, the per-room op override, and any tile verdict."),
+            TEXT("the per-room op override (stage C1), and any tile verdict."),
             NumTunnelSamples, NumTunnelChunks, NumInCave, NumInRock));
 
         AddInfo(FString::Printf(
@@ -745,15 +797,17 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         TestTrue(TEXT("the bake produced chimneys, so the chimney loop has data to run on"),
                  TotalChimneys > 0);
 
-        if (TotalColumns > 0)
-        {
-            AddError(FString::Printf(
-                TEXT("The bake produced %d columns, but stage A has NOT ported the column loop ")
-                TEXT("(STEP 4d). The equivalence above should have failed; if it did not, the ")
-                TEXT("sample points simply missed every column. Remove the column op from the pool ")
-                TEXT("until stage B."),
-                TotalColumns));
-        }
+        // ⚠️ CE GARDE-FOU S'EST RETOURNÉ À L'ÉTAPE B4, ET C'EST LE SEUL MOYEN DE COUVRIR LES
+        // COLONNES. Il ERREUR-ait si la cuisson produisait des colonnes (l'étape A n'avait pas porté
+        // `STEP 4d`) ; il EXIGE maintenant qu'elle en produise. Il n'y a pas d'alternative par
+        // paramètre : ni la cuisson ni la boucle par voxel ne lisent `FStrateGenerationParams::
+        // ColumnDensity`, donc aucune sonde de `FeatureProbes` ne peut éteindre les colonnes — et
+        // une pile bâtie sur un pool SANS op `Column` partagerait le cache `thread_local` (le pool
+        // n'est pas dans sa clé) et rendrait exactement la même densité, c'est-à-dire mentirait.
+        // Reste à demander à la cuisson ce qu'elle a cuit. Troisième application de la même leçon.
+        TestTrue(TEXT("the bake produced columns, so the STEP 4d loop has data to run on ")
+                 TEXT("(no params probe can cover this one -- see the comment above)"),
+                 TotalColumns > 0);
     }
 
     //=========================================================================

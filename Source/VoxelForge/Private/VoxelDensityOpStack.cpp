@@ -2736,6 +2736,307 @@ namespace
     };
 
     //=========================================================================
+    // RÔLE 3 — MODIFIER : COLONNES DE SALLE / ROOM COLUMNS  (TunnelNetwork, STEP 4d)
+    //=========================================================================
+    // ⚠️ CE N'EST PAS `FGridColumnMod` (FlatPlain / CrystalChamber). Celui-là pose des cylindres sur
+    // une GRILLE MONDE et se tire par cellule ; celui-ci PARCOURT une liste PRÉ-CUITE par
+    // `BuildChunkCache`, salle par salle. `OPSTACK-DECOMPOSITION §1` les sépare explicitement.
+    //
+    // ⚠️⚠️ IL N'A **AUCUN** PARAMÈTRE DE STRATE, ET C'EST LE PIÈGE DE CE GROUPE.
+    // Le code d'origine n'écrit aucun `if (Params.ColumnDensity > 0)` : il itère la liste cuite,
+    // point. `FStrateGenerationParams::ColumnDensity` n'est JAMAIS lu par la cuisson non plus (elle
+    // lit `OpParams`, un struct NEUF où seul l'op de la salle a été appliqué). Donc :
+    //   • mettre `ColumnDensity = 0` dans les params N'ÉTEINT PAS les colonnes ;
+    //   • la seule façon d'avoir des colonnes est un `UVoxelTerrainOpDefinition` de type `Column`
+    //     dans le pool de la strate ;
+    //   • et la seule façon de PROUVER qu'elles ont tiré est de regarder `SDFCache.Columns.Num()`.
+    // C'est exactement la leçon des pits, une troisième fois. Le test l'applique au contrôle 3b.
+    class FRoomColumnMod final : public IVoxelDensityOp
+    {
+    public:
+        FRoomColumnMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float, FVoxelOpSample& InOut) const override
+        {
+            if (!VF_NearCaveSurface(InOut.Sdf, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            for (const FCachedColumn& Col : Rooms->GetCache().Columns)
+            {
+                const float DX = WorldX - Col.CenterX;
+                const float DY = WorldY - Col.CenterY;
+                const float XYDistSq = DX * DX + DY * DY;
+                if (XYDistSq > Col.BoundXYRadiusSq) { continue; }
+
+                const float CylSDF = FMath::Sqrt(XYDistSq) - Col.Radius;
+
+                const float ColBlend = 3.0f;
+                if (CylSDF < ColBlend)
+                {
+                    float Fill = FMath::Clamp((ColBlend - CylSDF) / (ColBlend * 2.0f), 0.0f, 1.0f);
+                    Fill = SmoothStep01(Fill);
+                    InOut.Density += Fill * Col.BaseDensity * 1.5f;
+                }
+            }
+        }
+
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. On ne peut pas rendre `Identity` sans consulter le
+         *  cache pour la boîte interrogée — même dette que le graphe de salles. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return EVoxelOpEffect::FillOnly;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : DÔMES / CATHEDRAL CEILINGS  (TunnelNetwork, STEP 4g)
+    //=========================================================================
+    // Un demi-ellipsoïde creusé VERS LE HAUT depuis un point ancré au-dessus du centre de la salle.
+    // Relatif à la salle comme les arches, même porte `CaveSDF < SDFBlendRadius`.
+    class FDomeMod final : public IVoxelDensityOp
+    {
+    public:
+        FDomeMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
+            if (!(P.DomeDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+                  && NearestRoomIdx >= 0))
+            {
+                return;
+            }
+
+            const FChunkSDFCache& Cache = Rooms->GetCache();
+            if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }   // cf. FCaveArchMod
+            const FCachedRoom& Room = Cache.Rooms[NearestRoomIdx];
+
+            const int32 MaxDomes = 2;
+
+            for (int32 i = 0; i < MaxDomes; i++)
+            {
+                const uint32 DH = VoxelHash::Mix(Room.Hash ^ (0xD0AE0u + (uint32)i * 8191u));
+
+                if (VoxelHash::ToFloat01(DH) > P.DomeDensity) { continue; }
+
+                const uint32 DH2 = VoxelHash::Mix(DH ^ 0xD0A0u);
+                const float DmX = Room.Center.X + VoxelHash::ToFloatSigned(DH2) * Room.RadiusXY * 0.4f;
+                const float DmY = Room.Center.Y
+                                + VoxelHash::ToFloatSigned(VoxelHash::Mix(DH2)) * Room.RadiusXY * 0.4f;
+
+                const uint32 DH3 = VoxelHash::Mix(DH2 ^ 0x90DEu);
+                const float DmRadius = FMath::Min(
+                    FMath::Lerp(P.DomeMinRadius, P.DomeMaxRadius, VoxelHash::ToFloat01(DH3)),
+                    Room.RadiusXY * 0.85f
+                );
+
+                const uint32 DH4 = VoxelHash::Mix(DH3 ^ 0xCAFEu);
+                const float DmCenterZ = Room.Center.Z + Room.RadiusZ * 0.2f
+                                      + VoxelHash::ToFloat01(DH4) * Room.RadiusZ * 0.3f;
+
+                const float DmHeight = DmRadius * P.DomeHeightRatio;
+
+                if (WorldZ > DmCenterZ + DmHeight + 3.0f || WorldZ < DmCenterZ - 3.0f) { continue; }
+
+                const float DXDm = WorldX - DmX;
+                const float DYDm = WorldY - DmY;
+                const float DZDm = WorldZ - DmCenterZ;
+
+                if (DZDm < 0.0f) { continue; }   // ne creuse que vers le haut
+
+                const float NormX = DXDm / DmRadius;
+                const float NormY = DYDm / DmRadius;
+                const float NormZ = DZDm / DmHeight;
+                const float EllipDist = FMath::Sqrt(NormX * NormX + NormY * NormY + NormZ * NormZ) - 1.0f;
+                const float DomeSDF = EllipDist * FMath::Min(DmRadius, DmHeight);
+
+                const float DmBlend = 3.0f;
+                if (DomeSDF < DmBlend)
+                {
+                    float Carve = FMath::Clamp((DmBlend - DomeSDF) / (DmBlend * 2.0f), 0.0f, 1.0f);
+                    Carve = SmoothStep01(Carve);
+                    InOut.Density -= Carve * P.BaseDensity * 1.5f;
+                }
+            }
+        }
+
+        /** Ne SOUSTRAIT que ⇒ `CarveOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.DomeDensity > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : PINCEMENT / BOTTLENECK  (TunnelNetwork, STEP 4h)
+    //=========================================================================
+    // Resserre un passage PAR LES CÔTÉS. Placé sur le PÉRIMÈTRE de la salle (offset 0.85 · rayon) —
+    // là où les tunnels débouchent — et pas au centre, sinon il boucherait la salle elle-même.
+    // `SideFactor` (distance à l'axe, clampée) est ce qui laisse l'axe du passage libre : le
+    // remplissage est nul sur l'axe et maximal sur les bords de l'ellipsoïde.
+    class FPinchMod final : public IVoxelDensityOp
+    {
+    public:
+        FPinchMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
+            if (!(P.PinchDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+                  && NearestRoomIdx >= 0))
+            {
+                return;
+            }
+
+            const FChunkSDFCache& Cache = Rooms->GetCache();
+            if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }   // cf. FCaveArchMod
+            const FCachedRoom& Room = Cache.Rooms[NearestRoomIdx];
+
+            const float Spread = 0.85f;
+            const int32 MaxPinches = 3;
+
+            for (int32 i = 0; i < MaxPinches; i++)
+            {
+                const uint32 PnH = VoxelHash::Mix(Room.Hash ^ (0xF1C400u + (uint32)i * 5417u));
+
+                if (VoxelHash::ToFloat01(PnH) > P.PinchDensity) { continue; }
+
+                const uint32 PnH2 = VoxelHash::Mix(PnH ^ 0xF1C4u);
+                const float PnX = Room.Center.X + VoxelHash::ToFloatSigned(PnH2) * Room.RadiusXY * Spread;
+                const float PnY = Room.Center.Y
+                                + VoxelHash::ToFloatSigned(VoxelHash::Mix(PnH2)) * Room.RadiusXY * Spread;
+
+                const uint32 PnH3 = VoxelHash::Mix(PnH2 ^ 0x5432u);
+                const float PnZ = Room.Center.Z + VoxelHash::ToFloatSigned(PnH3) * Room.RadiusZ * 0.5f;
+
+                const uint32 PnH4 = VoxelHash::Mix(PnH3 ^ 0x9A3Bu);
+                const float PnAngle = VoxelHash::ToFloat01(PnH4) * PI;
+                const float CosPN = FMath::Cos(PnAngle);
+                const float SinPN = FMath::Sin(PnAngle);
+
+                const float DXPn = WorldX - PnX;
+                const float DYPn = WorldY - PnY;
+                const float DZPn = WorldZ - PnZ;
+
+                const float MaxExtent = FMath::Max(P.PinchLength, P.PinchStrength) + 5.0f;
+                if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > MaxExtent) { continue; }
+
+                const float Along  =  DXPn * CosPN + DYPn * SinPN;
+                const float Across = -DXPn * SinPN + DYPn * CosPN;
+
+                const float HalfLength   = P.PinchLength * 0.5f;
+                const float HalfNarrow   = P.PinchStrength;
+                const float HalfVertical = P.PinchStrength * 1.5f;
+
+                const float NAlong   = Along   / HalfLength;
+                const float NAcross  = Across  / HalfNarrow;
+                const float NUp      = DZPn    / HalfVertical;
+                const float EllipDist = NAlong * NAlong + NAcross * NAcross + NUp * NUp;
+
+                if (EllipDist < 1.0f)
+                {
+                    float Fill = 1.0f - EllipDist;
+                    Fill = SmoothStep01(Fill);
+                    const float AxisDist = FMath::Sqrt(NAcross * NAcross + NUp * NUp);
+                    const float SideFactor = FMath::Clamp(AxisDist * 2.0f, 0.0f, 1.0f);
+                    InOut.Density += Fill * SideFactor * P.BaseDensity * 1.5f;
+                }
+            }
+        }
+
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.PinchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : BIAIS DE SOL / FLOOR BIAS  (TunnelNetwork, fin de 4h)
+    //=========================================================================
+    // Rend de la densité dans la moitié BASSE de la salle pour contrer le relief que la rugosité
+    // laisse sur les sols — un sol praticable au lieu d'un sol bosselé. Ne s'applique QUE dans l'air
+    // certain (`CaveSDF < 0`) : dans la paroi, le clamp anti-remplissage de la rugosité tient déjà.
+    //
+    // ⚠️ DERNIER DE LA CHAÎNE, ET CE N'EST PAS INTERCHANGEABLE : il corrige ce que la rugosité (4b)
+    // a fait. Le déplacer avant elle le rendrait sans objet. C'est la raison pour laquelle l'ordre
+    // des opérateurs dans `BuildTunnelNetworkStack` est celui de l'original, ligne pour ligne.
+    class FFloorBiasMod final : public IVoxelDensityOp
+    {
+    public:
+        FFloorBiasMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
+            if (!(P.FloorBias > 0.0f && NearestRoomIdx >= 0 && CaveSDF < 0.0f)) { return; }
+
+            const FChunkSDFCache& Cache = Rooms->GetCache();
+            if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }   // cf. FCaveArchMod
+            const FCachedRoom& NR = Cache.Rooms[NearestRoomIdx];
+
+            // NormZ : -1 = sol de la salle, 0 = centre, +1 = plafond.
+            const float NormZ = (WorldZ - NR.Center.Z) / FMath::Max(NR.RadiusZ, 1.0f);
+
+            if (NormZ < 0.0f)
+            {
+                const float FloorFactor = NormZ * NormZ;   // 0 au centre, 1 au sol
+                InOut.Density += FloorFactor * P.FloorBias;
+            }
+        }
+
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.FloorBias > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
+    };
+
+    //=========================================================================
     // RÔLE 1 — SOURCE : VERS / WORM TUNNELS  (TunnelNetwork)
     //=========================================================================
     // Un carve par SEUIL sur du bruit 3D, masqué par la distance au réseau de salles. Il écrit la
@@ -2983,12 +3284,14 @@ namespace VoxelDensityOps
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ ÉTAPES A + B1 + B2 + B3 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
-        // Sont portés : l'échelle verticale, le roc de base, le warp, le graphe de salles (+ pits
-        // + cheminées), le carve, **la rugosité (4b), les terrasses, les lignes de strates, les
-        // nervures, les surplombs, la falaise, les festons, les arches**, les vers, le post
-        // structurel. **NE SONT PAS ENCORE PORTÉS** les quatre modificateurs restants (colonnes,
-        // dômes, pincement, biais de sol), ni l'override d'op PAR SALLE.
+        // ⚠️ ÉTAPES A + B (B1 À B5) — LES DOUZE MODIFICATEURS DE DÉTAIL SONT PORTÉS.
+        // **CE QUI RESTE, C'EST L'ÉTAPE C** : l'override d'op PAR SALLE. Tant qu'il manque, les
+        // onze modificateurs qui, dans l'original, lisent la copie de params de la salle la plus
+        // proche lisent ici les params de la STRATE. Les deux coïncident exactement tant qu'aucune
+        // salle ne porte un op de type détail (Terrace, LayerLines, Ribbing, Cliff, Scallop,
+        // Overhang, Arch, Dome, Pinch) — le test garde donc son pool à Pit/Cheminée/Colonne, dont
+        // les `ApplyTo` n'écrivent aucun champ de détail. **C'est CETTE condition, et rien d'autre,
+        // qui rend l'étape B vérifiable avant l'étape C.**
         //
         // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
         // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
@@ -3036,7 +3339,10 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FCaveCliffMod>(P, Seed));                // 4c — falaise
         OutStack.Add(MakeUnique<FScallopMod>(P, Seed));                  // 4c — festons
         OutStack.Add(MakeUnique<FCaveArchMod>(P, RoomPtr));              // 4c — arches
-        // [ÉTAPE B4 ira ici : colonnes, dômes, pincement, biais de sol]
+        OutStack.Add(MakeUnique<FRoomColumnMod>(P, RoomPtr));            // 4d — colonnes (pré-cuites)
+        OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
+        OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
+        OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
