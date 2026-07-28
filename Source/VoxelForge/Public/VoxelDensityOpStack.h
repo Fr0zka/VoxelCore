@@ -136,6 +136,50 @@ public:
     }
 
     /**
+     * LE MÊME PLIAGE, MAIS QUI DIT **QUI** A TUÉ CHAQUE HYPOTHÈSE. Diagnostic, réservé aux tests.
+     *
+     * ⚠️ IL DOIT RENDRE EXACTEMENT LE MÊME VERDICT QUE `ClassifyBox` — même boucle, même early-out,
+     * même ordre. Un diagnostic qui emprunte un chemin légèrement différent de celui qu'il explique
+     * est pire que pas de diagnostic : il envoie chercher le bug ailleurs. Si l'un des deux change,
+     * l'autre change avec lui.
+     *
+     * `OutSolidKiller` / `OutAirKiller` reçoivent l'INDEX du premier opérateur qui fait passer
+     * l'hypothèse correspondante de vraie à fausse, ou `INDEX_NONE` si elle a survécu. Le nom
+     * lisible s'obtient par `GetOpDebugName(index)`.
+     *
+     * Same fold, but it reports WHICH op killed each hypothesis. Must stay verdict-identical to
+     * ClassifyBox — a diagnostic that takes a slightly different path sends you hunting in the
+     * wrong place.
+     */
+    EVoxelTileClass ClassifyBoxAttributed(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                          int32& OutSolidKiller, int32& OutAirKiller) const
+    {
+        OutSolidKiller = INDEX_NONE;
+        OutAirKiller   = INDEX_NONE;
+
+        FVoxelBoxHypotheses H;
+        for (int32 i = 0; i < Ops.Num(); ++i)
+        {
+            const bool bSolidBefore = H.bCanBeAllSolid;
+            const bool bAirBefore   = H.bCanBeAllAir;
+
+            VF_FoldOp(H, *Ops[i], VoxelBox, Ctx);
+
+            if (bSolidBefore && !H.bCanBeAllSolid && OutSolidKiller == INDEX_NONE) { OutSolidKiller = i; }
+            if (bAirBefore   && !H.bCanBeAllAir   && OutAirKiller   == INDEX_NONE) { OutAirKiller   = i; }
+
+            if (H.IsDead()) { return EVoxelTileClass::Mixed; }
+        }
+        return H.Resolve();
+    }
+
+    /** Nom lisible d'un opérateur, pour les rapports de test. Voir `IVoxelDensityOp::DebugName`. */
+    const TCHAR* GetOpDebugName(int32 Index) const
+    {
+        return Ops.IsValidIndex(Index) ? Ops[Index]->DebugName() : TEXT("(none)");
+    }
+
+    /**
      * RÔLE 4 — ajoute les invariants de monde, dans l'ordre fixe, à la fin de la pile.
      * spine (0,0) → seal de frontière → carve de passage.
      *

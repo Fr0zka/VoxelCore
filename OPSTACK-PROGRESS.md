@@ -2583,3 +2583,99 @@ at the site rather than in a handoff.
 - Everything else should be **unchanged and green**. The §C2 fix changes generated terrain only
   inside transition bands on the `switch` path (where it was previously order-dependent, i.e. not
   well-defined), so an equivalence test that moves is a real signal, not expected noise.
+
+## 2026-07-28 — GREEN, and `0 proved of 40`. The blocker was the **worm**, not the room source.
+
+The build was green and every number in the previous entry held. One line did not:
+
+```
+Box verdicts over 40 TunnelNetwork tiles: 0 proved (0 AllSolid, 0 AllAir), 40 Mixed
+  -- brute-forced over 0 voxels, 0 violations.
+WARNING: No TunnelNetwork tile was proved ... this check verified nothing.
+```
+
+**The warning I wrote for exactly this case fired, and then it was not good enough.** It offered two
+candidate causes — "the tiles genuinely straddle cave" or "the source isn't reaching its `Identity`
+branch" — and **both were wrong**. The real cause was a third operator that neither candidate
+mentioned. That is the failure worth recording, more than the bug itself.
+
+### The cause, found by reading two default values
+
+`FWormFieldSource::EffectOverBox` answered `CarveOnly` unconditionally, with a *provably correct*
+amplitude bound of `WormStrength`. And in `VoxelStrateTypes.h`:
+
+```
+float BaseDensity  = 8.0f;
+float WormStrength = 10.0f;   // "Must exceed BaseDensity to create air." <- the field's own comment
+```
+
+So `SolidMargin = 8 − 10 = −2 < 0`, on **every tile of every strate with worms on**, before the fold
+ever reached anything the room source had proved. The worm's bound is not loose by accident — the
+defaults *require* it to exceed `BaseDensity`, or worms could never carve. A numerically correct
+bound that is structurally always fatal.
+
+### The fix was already written in the worm's own `Eval`, three lines up
+
+```cpp
+if (CaveSDF >= P.WormNetworkRange)   // vrai aussi quand il n'y a pas de réseau (FLT_MAX)
+{   NetworkMask = 0.0f;   }
+...
+if (NetworkMask <= 0.0f) { return; }
+```
+
+**The worm IS spatially bounded** — not by a bound of its own, but by the room source's, exactly like
+the twelve detail modifiers. Where `FRoomGraphSource` proves `Identity`, `Sdf` stays `FLT_MAX`
+(verified: `FVoxelOpSample::Sdf = FLT_MAX` is the initialiser), so `NetworkMask` is 0 at every voxel
+and `Eval` returns before touching `Density`. The worm is the *identity* there, not "a bounded
+carve". It simply never asked the question.
+
+So it now inherits the verdict — thirteen inheritors instead of twelve. Two details:
+
+- **Deliberately NOT `VF_NoCaveOverBox`.** That helper returns `true` when `Rooms == nullptr`, which
+  is right for the twelve modifiers (they only ever exist in a stack where the room source is the
+  sole SDF writer) and **wrong** for the worm, which a future assembly could place behind a different
+  SDF writer — `FLatticeCorridorSource` writes that channel too. No room source ⇒ we don't know ⇒
+  `CarveOnly`. Not knowing must cost CPU, never a hole.
+- `MaxCarveOverBox` now calls `EffectOverBox` rather than re-testing the condition, so the two cannot
+  drift. The room source's verdict memo makes the second call free.
+
+### The lesson, and the instrument that came out of it
+
+**A diagnostic that lists candidate causes without measuring them is still a guess** — it just looks
+like rigour. My warning named two causes and had a number for neither, so a green run with a real
+defect in it produced a message that sent the reader to the wrong two places.
+
+`FVoxelOpStack::ClassifyBoxAttributed` now exists: the same fold, verdict-identical to `ClassifyBox`
+(same loop, same early-out — a diagnostic that takes a different path than the thing it explains is
+worse than none), reporting the **index of the first operator that kills each hypothesis**.
+`IVoxelDensityOp::DebugName()` gives them readable names; it touches no cache key and no generation
+decision, so it cannot change the world. Check 4 prints:
+
+```
+AllSolid killed by: <op> x<count>, <op> x<count>, ...
+```
+
+Always printed, not only on failure — when tiles *are* proved, that line is what says why the rest
+are not. And the `0 proved` warning now says **"do not re-derive the cause, read the attribution
+line"**, because the next person's guess would be as good as mine was.
+
+### Ready to build. Likely compile-error spots
+
+1. `FWormFieldSource` gained a third ctor arg (defaulted) and a `Rooms` member; its single
+   construction site in `BuildTunnelNetworkStack` passes `RoomPtr`, which is already in scope there.
+2. `IVoxelDensityOp::DebugName()` is a new virtual with a default — six overrides added
+   (`ConstantFieldSource`, `RoomGraphSource`, `SdfConvertOp`, `OriginSpineOp`, `BoundarySealOp`,
+   `PassageCarveOp`, `WormFieldSource`). Everything else inherits `"(unnamed op)"` and reports by index.
+3. `ClassifyBoxAttributed` / `GetOpDebugName` are new inline methods on `FVoxelOpStack` (header).
+4. The test uses `TMap<FString,int32>::ValueSort` and `FindOrAdd` on a `const TCHAR*` key.
+
+### What to read, in order
+
+1. **`AllSolid killed by:`** — the new line. If it is empty ("AllSolid survived every tile") the
+   prize has landed. If it names `RoomGraphSource`, the tiles genuinely straddle cave and the sampler
+   is what to look at. If it names anything else, that operator's box answer is more pessimistic than
+   its `Eval`, and it is now named rather than guessed at.
+2. **`Box verdicts over 40`** — proved count is a measurement; the assertion is only that no proved
+   tile is *wrong*.
+3. Everything else should be unchanged. The worm change cannot alter density: `EffectOverBox` and
+   `MaxCarveOverBox` are box-verdict methods, and `Eval` is untouched.

@@ -144,6 +144,8 @@ namespace
             return FMath::Abs(Value);
         }
 
+        const TCHAR* DebugName() const override { return TEXT("ConstantFieldSource"); }
+
     private:
         float Value;
     };
@@ -1119,6 +1121,8 @@ namespace
             return EVoxelOpEffect::Identity;   // la source a répondu pour la paire
         }
 
+        const TCHAR* DebugName() const override { return TEXT("SdfConvertOp"); }
+
     private:
         float Blend, BaseDensity, Sign, MinDivisor;
     };
@@ -1158,6 +1162,8 @@ namespace
 
             return EVoxelOpEffect::CarveOnly;
         }
+
+        const TCHAR* DebugName() const override { return TEXT("OriginSpineOp"); }
 
     private:
         float TopZ, BotZ, Seal, Base, Radius;
@@ -1226,6 +1232,8 @@ namespace
             return EVoxelOpEffect::FillOnly;
         }
 
+        const TCHAR* DebugName() const override { return TEXT("BoundarySealOp"); }
+
     private:
         float TopZ, BotZ, Thickness, Base;
     };
@@ -1257,6 +1265,8 @@ namespace
             return Manager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
+
+        const TCHAR* DebugName() const override { return TEXT("PassageCarveOp"); }
 
     private:
         const UVoxelStrateManager* Manager;
@@ -2393,6 +2403,8 @@ namespace
             return B.Verdict;
         }
 
+        const TCHAR* DebugName() const override { return TEXT("RoomGraphSource"); }
+
     private:
         FStrateGenerationParams P;
         int32  Seed;
@@ -3505,8 +3517,12 @@ namespace
     class FWormFieldSource final : public IVoxelDensityOp
     {
     public:
-        FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+        /** @param InRooms  ⚠️ UNIQUEMENT pour `EffectOverBox` / `MaxCarveOverBox`. `Eval` lit le
+         *                  canal SDF de `InOut`, pas ce pointeur — le ver n'interroge jamais la
+         *                  source directement, il consomme ce qu'elle a écrit. Peut être nullptr. */
+        FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed,
+                         const FRoomGraphSource* InRooms = nullptr)
+            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
@@ -3572,10 +3588,57 @@ namespace
          * est solide de plus que la somme des carves restants » redevient prouvable — et c'est le
          * plus gros poste de perf du plan. Noté ici, au point exact où la borne manque.
          */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        /**
+         * ✅ **LE VER HÉRITE DU VERDICT DE LA SOURCE DE SALLES — ET C'EST CE QUI DÉBLOQUE TOUT.**
+         *
+         * La note ci-dessus (« aucune borne spatiale, donc il tue `AllSolid` sur CHAQUE tuile »)
+         * était vraie, et pourtant elle passait à côté de ce que son propre `Eval` fait trois
+         * lignes plus haut :
+         *
+         * ```
+         * if (CaveSDF >= P.WormNetworkRange)   // vrai aussi quand il n'y a pas de réseau (FLT_MAX)
+         * {   NetworkMask = 0.0f;   }
+         * ...
+         * if (NetworkMask <= 0.0f) { return; }
+         * ```
+         *
+         * **Le ver EST spatialement borné** — pas par une borne à lui, mais par celle de la source
+         * de salles, exactement comme les douze modificateurs de détail. Là où `FRoomGraphSource`
+         * prouve `Identity`, `Sdf` reste `FLT_MAX` sur toute la boîte, donc `NetworkMask` vaut 0
+         * partout, donc ce `return` est pris à chaque voxel. Le ver est l'identité, pas « un carve
+         * borné » : il ne s'exécute pas.
+         *
+         * ⚠️ POURQUOI CE CONTRÔLE COMPTAIT AUTANT. `BaseDensity = 8` et `WormStrength = 10` sont
+         * les DÉFAUTS, et le commentaire de `WormStrength` dit pourquoi (« must exceed BaseDensity
+         * to create air »). Donc `SolidMargin = 8 − 10 < 0` : tant que le ver rendait `CarveOnly`
+         * partout, il tuait `AllSolid` sur **toutes** les tuiles, et la réponse spatiale de la
+         * source de salles ne pouvait rien prouver derrière lui. Le premier build l'a montré —
+         * 0 tuile prouvée sur 40, la source ayant pourtant appris à répondre.
+         *
+         * ⚠️ ET POURQUOI ON N'UTILISE **PAS** `VF_NoCaveOverBox` ICI. Cet assistant rend `true`
+         * quand `Rooms == nullptr` — correct pour les douze modificateurs, qui n'existent que dans
+         * une pile où la source de salles est le seul écrivain du canal SDF. Le ver, lui, est un
+         * opérateur dont un futur assemblage pourrait le placer derrière un AUTRE écrivain de SDF
+         * (`FLatticeCorridorSource` en écrit un). Sans source de salles, on ne sait pas : on rend
+         * `CarveOnly`. Ne pas savoir doit coûter du CPU, jamais un trou.
+         *
+         * The worm IS spatially bounded — by the room source's bound, not one of its own, exactly
+         * like the twelve detail modifiers. Where the room source proves Identity, Sdf stays
+         * FLT_MAX, NetworkMask is 0 everywhere and Eval returns immediately. This mattered because
+         * BaseDensity=8 < WormStrength=10 BY DEFAULT, so an unconditional CarveOnly killed AllSolid
+         * on every tile. Deliberately not VF_NoCaveOverBox: its null-Rooms case answers "identity",
+         * which is wrong for an op that could sit behind a different SDF writer.
+         */
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
-            return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? EVoxelOpEffect::CarveOnly
-                                                                     : EVoxelOpEffect::Identity;
+            if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return EVoxelOpEffect::Identity; }
+
+            if (P.WormNetworkRange > 0.0f && Rooms != nullptr
+                && Rooms->EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity)
+            {
+                return EVoxelOpEffect::Identity;
+            }
+            return EVoxelOpEffect::CarveOnly;
         }
 
         /**
@@ -3588,8 +3651,12 @@ namespace
          * la seule sorte qui ait le droit d'être ici : sur-estimer coûte du CPU, sous-estimer fait
          * un trou.
          */
-        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
+            // Cohérent avec `EffectOverBox` PAR CONSTRUCTION plutôt que par relecture : deux
+            // conditions écrites deux fois finiraient par diverger. Le mémo de verdict de
+            // `FRoomGraphSource` rend ce second appel gratuit.
+            if (EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity) { return 0.0f; }
             return MaxCarveAmplitude();
         }
 
@@ -3599,15 +3666,19 @@ namespace
             return 0.0f;
         }
 
-        /** L'amplitude max de carve, en unités de densité. */
+        /** L'amplitude max de carve, en unités de densité. Borne BRUTE : elle ignore la portée du
+         *  réseau, c'est `MaxCarveOverBox` qui l'applique. */
         float MaxCarveAmplitude() const
         {
             return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? P.WormStrength : 0.0f;
         }
 
+        const TCHAR* DebugName() const override { return TEXT("WormFieldSource"); }
+
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        const FRoomGraphSource* Rooms;   // NON possédant — peut être nullptr (voir EffectOverBox)
     };
 
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
@@ -3819,7 +3890,11 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
         OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
         OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
-        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
+        // ⚠️ `RoomPtr` N'EST PAS DÉCORATIF ICI. Le ver hérite du verdict de boîte de la source de
+        // salles, faute de quoi il rend `CarveOnly` partout et tue `AllSolid` sur chaque tuile —
+        // avec les défauts (`BaseDensity = 8`, `WormStrength = 10`) la marge part négative, donc
+        // aucune tuile n'est prouvable, quoi que la source de salles ait réussi à prouver.
+        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed, RoomPtr));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);

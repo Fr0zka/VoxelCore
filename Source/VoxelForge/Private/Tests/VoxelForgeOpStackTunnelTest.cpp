@@ -1106,6 +1106,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         int32 NumProved = 0, NumMixed = 0, NumSolid = 0, NumAir = 0;
         int32 NumBruteSamples = 0, NumViolations = 0;
         float WorstViolation = 0.0f;
+        TMap<FString, int32> SolidKillerCounts;
 
         FRandomStream Rng(97531);
         for (int32 t = 0; t < 40; ++t)
@@ -1121,7 +1122,18 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
                 FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
 
-            const EVoxelTileClass Verdict = Stack.ClassifyBox(Box, Ctx);
+            // ATTRIBUTION — le même pliage, mais il dit QUI tue chaque hypothèse. Le premier build
+            // de l'`EffectOverBox` spatial est revenu vert avec 0 tuile prouvée, et le rapport ne
+            // savait nommer aucun coupable : les deux causes que la mise en garde proposait étaient
+            // toutes les deux fausses, la vraie étant un troisième opérateur. On ne redevine pas.
+            int32 SolidKiller = INDEX_NONE, AirKiller = INDEX_NONE;
+            const EVoxelTileClass Verdict = Stack.ClassifyBoxAttributed(Box, Ctx, SolidKiller, AirKiller);
+
+            if (SolidKiller != INDEX_NONE)
+            {
+                SolidKillerCounts.FindOrAdd(Stack.GetOpDebugName(SolidKiller))++;
+            }
+
             if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
 
             ++NumProved;
@@ -1158,13 +1170,37 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             TEXT("verdict leaves no geometry and no collision behind it."),
             NumProved, NumSolid, NumAir, NumMixed, NumBruteSamples, NumViolations));
 
+        // QUI TUE `AllSolid`, ET COMBIEN DE FOIS. Toujours imprimé, pas seulement en cas d'échec :
+        // c'est aussi la ligne qui dit, quand des tuiles SONT prouvées, ce qui bloque les autres.
+        {
+            SolidKillerCounts.ValueSort([](int32 A, int32 B) { return A > B; });
+            FString Breakdown;
+            for (const TPair<FString, int32>& Kv : SolidKillerCounts)
+            {
+                if (!Breakdown.IsEmpty()) { Breakdown += TEXT(", "); }
+                Breakdown += FString::Printf(TEXT("%s x%d"), *Kv.Key, Kv.Value);
+            }
+            if (Breakdown.IsEmpty()) { Breakdown = TEXT("nothing -- AllSolid survived every tile"); }
+
+            AddInfo(FString::Printf(
+                TEXT("AllSolid killed by: %s. This is the line that replaced a guess. The first ")
+                TEXT("build of the spatial EffectOverBox reported 0 proved of 40, and the warning ")
+                TEXT("offered two candidate causes -- BOTH WRONG. The real one was a third operator ")
+                TEXT("nobody was looking at: FWormFieldSource answered CarveOnly everywhere, and ")
+                TEXT("since BaseDensity=8 < WormStrength=10 BY DEFAULT, its provable amplitude bound ")
+                TEXT("alone drove SolidMargin negative on every tile in the world. Attribution is ")
+                TEXT("cheap; a second wrong guess is not."),
+                *Breakdown));
+        }
+
         if (NumProved == 0)
         {
-            AddWarning(TEXT("No TunnelNetwork tile was proved. That is not a failure, but it means ")
-                       TEXT("this check verified nothing: the brute force below has no verdict to ")
-                       TEXT("contradict. Either the sampled tiles all genuinely straddle cave, or ")
-                       TEXT("the spatial EffectOverBox is not reaching its Identity branch -- the ")
-                       TEXT("bake-coverage line of check 5b is the one that tells those apart."));
+            AddWarning(TEXT("No TunnelNetwork tile was proved, so the brute force below verified ")
+                       TEXT("nothing -- it has no verdict to contradict. Do NOT re-derive the cause: ")
+                       TEXT("read the 'AllSolid killed by' line above, which names the operator and ")
+                       TEXT("counts how often. If it names RoomGraphSource, the tiles genuinely ")
+                       TEXT("straddle cave (check the bake-coverage line of 5b); anything else is an ")
+                       TEXT("operator whose box answer is more pessimistic than its Eval."));
         }
 
         TestEqual(FString::Printf(
