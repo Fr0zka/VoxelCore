@@ -1,6 +1,6 @@
 // VoxelForgeOpStackTunnelTest.cpp
-// TunnelNetwork — ÉTAPES A + B + C1 : l'archétype ENTIER, override d'op par salle compris.
-// TunnelNetwork — STAGES A + B + C1: the WHOLE archetype, per-room op override included.
+// TunnelNetwork ET Underwater — étapes A + B + C : les deux archétypes, entiers.
+// TunnelNetwork AND Underwater — stages A + B + C: both archetypes, whole.
 //
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
 // `GetDensityWithParams` fait ~1080 lignes et douze modificateurs de détail (le chiffre « treize »
@@ -27,10 +27,15 @@
 //   • B5 : le GATE lui-même. Aucun opérateur ajouté — la décision (early-out répété par opérateur
 //     plutôt que conteneur de portée) est écrite dans `VF_NearCaveSurface`, et le contrôle 1d la
 //     paie : hors gate, la pile complète doit être BIT À BIT celle sans modificateurs.
-//   • C1 (ce commit) : l'override d'op PAR SALLE. Aucun opérateur ajouté non plus — onze des douze
+//   • C1 : l'override d'op PAR SALLE. Aucun opérateur ajouté non plus — onze des douze
 //     modificateurs lisent désormais `FRoomGraphSource::LocalParams()`. Le pool du test reçoit un op
 //     `Terrace` dont les valeurs écrasent celles de la strate : **une pile qui ignorerait l'override
 //     ne peut plus être bit-identique**, ce qu'aucun test de l'étape B ne pouvait exiger.
+//
+//   • C2 (ce commit) : `Underwater`. Aucun opérateur, aucun paramètre — le même rocher atteint
+//     depuis un second `case`. Le contrôle 5 l'échantillonne dans SON slot, ce qui exerce en prime
+//     un second index de strate (donc un second `StrateSeed` de cuisson et une seconde entrée de la
+//     mémo d'index) — ce que six chunks d'un seul slot ne peuvent pas faire.
 //
 // CE QUE CE TEST NE PROUVE TOUJOURS PAS : le saut de tuile — `FRoomGraphSource::EffectOverBox` rend
 // `Both` et le ver `CarveOnly` partout, donc zéro verdict prouvé, ce que le contrôle 4 ASSERTE.
@@ -379,6 +384,15 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         && World.Definitions[FTestWorld::SlotTunnelNetwork].IsValid())
     {
         MakeRoomOpPool(World.Definitions[FTestWorld::SlotTunnelNetwork].Get(), OpAssets);
+
+        // ÉTAPE C2 — le slot Underwater reçoit le MÊME pool, pour la même raison et au même
+        // moment. Sans lui, le contrôle 5 comparerait deux chemins sur une strate sans aucune
+        // primitive par salle : vert, et vide de sens.
+        if (World.Definitions.IsValidIndex(FTestWorld::SlotUnderwater)
+            && World.Definitions[FTestWorld::SlotUnderwater].IsValid())
+        {
+            MakeRoomOpPool(World.Definitions[FTestWorld::SlotUnderwater].Get(), OpAssets);
+        }
     }
     else
     {
@@ -1056,6 +1070,123 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             NumProved, NumMixed, NumProved));
 
         TestEqual(TEXT("stage A emits no unsound verdict (it emits none at all)"), NumProved, 0);
+    }
+
+    //=========================================================================
+    // 5. UNDERWATER — LE MÊME ROCHER, DEPUIS UN AUTRE SLOT  (ÉTAPE C2)
+    //=========================================================================
+    // `OPSTACK-DECOMPOSITION §8` affirme qu'il n'y a **aucune différence de densité** entre
+    // `Underwater` et `TunnelNetwork` : `GetDensityAt` les met dans le MÊME `case`, et
+    // `WaterLevelRelative` n'est lu que par `UVoxelStrateManager` (nappe d'eau, côté rendu), jamais
+    // par la densité. Les deux affirmations ont été RELUES dans le code avant d'écrire ce contrôle,
+    // pas supposées — c'est la leçon « vérifier la prémisse » et elle a déjà été payée quatre fois.
+    //
+    // Ce que ce contrôle ajoute par-dessus, et qui n'est PAS tautologique : le slot Underwater est
+    // une AUTRE strate, donc un autre `StrateIndex`, donc un autre `StrateSeed` dans la cuisson et
+    // une autre entrée de la mémo d'index de strate. Il exerce ce que six chunks du slot 0 ne
+    // peuvent pas : que la pile suive le bon jeu de salles quand deux strates du même archétype
+    // coexistent dans le même monde.
+    {
+        int32 UWTop = 0, UWBottom = 0;
+        if (!World.GetSlotVoxelZRange(FTestWorld::SlotUnderwater, UWTop, UWBottom))
+        {
+            AddError(TEXT("The fixture layout has no Underwater slot, so stage C2 is untested. ")
+                     TEXT("Check FTestWorld::Build's Archetypes[] against SlotUnderwater."));
+        }
+        else
+        {
+            const int32 UWMidChunkZ = ((UWTop + UWBottom) / 2) / CHUNK_SIZE;
+            FStrateGenerationParams UP =
+                World.StrateManager->GetGenerationParams(FIntVector(0, 0, UWMidChunkZ));
+            EnableTunnelFeatures(UP);
+
+            FVoxelOpStack UWStack;
+            VoxelDensityOps::BuildTunnelNetworkStack(UWStack, UP, World.Settings->Seed,
+                                                     Gen->OriginSpineRadius, World.StrateManager.Get());
+
+            FVoxelOpContext UWCtx;
+            UWCtx.Seed               = (uint32)World.Settings->Seed;
+            UWCtx.LayoutVersion      = World.StrateManager->GetLayoutVersion();
+            UWCtx.StrateTopWorldZ    = UP.StrateTopWorldZ;
+            UWCtx.StrateBottomWorldZ = UP.StrateBottomWorldZ;
+            UWStack.PrepareChunk(UWCtx);
+
+            TestEqual(TEXT("the Underwater stack is the tunnel stack: same 19 ops"), UWStack.Num(), 19);
+
+            const int32 UWChunks = 8, UWPerChunk = 250;
+            const int32 UWSamples = UWChunks * UWPerChunk;
+
+            TArray<FVector> UWPoints;
+            UWPoints.Reserve(UWSamples);
+            {
+                FRandomStream Rng(20260728);
+                const int32 CZ0 = UWBottom / CHUNK_SIZE;
+                const int32 CZ1 = FMath::Max(CZ0, (UWTop / CHUNK_SIZE) - 1);
+                for (int32 c = 0; c < UWChunks; ++c)
+                {
+                    const int32 CX = Rng.RandRange(-3, 3);
+                    const int32 CY = Rng.RandRange(-3, 3);
+                    const int32 CZ = Rng.RandRange(CZ0, CZ1);
+                    for (int32 i = 0; i < UWPerChunk; ++i)
+                    {
+                        UWPoints.Add(FVector(
+                            (float)(CX * CHUNK_SIZE + Rng.RandRange(0, CHUNK_SIZE - 1)),
+                            (float)(CY * CHUNK_SIZE + Rng.RandRange(0, CHUNK_SIZE - 1)),
+                            (float)FMath::Clamp(CZ * CHUNK_SIZE + Rng.RandRange(0, CHUNK_SIZE - 1),
+                                                UWBottom, UWTop)));
+                    }
+                }
+            }
+
+            const float UWInnerBot = UP.StrateBottomWorldZ + UP.BoundarySealThickness;
+            const float UWInnerTop = UP.StrateTopWorldZ    - UP.BoundarySealThickness;
+
+            int32 UWDiff = 0, UWInCave = 0;
+            float UWWorst = 0.0f;
+            for (int32 i = 0; i < UWSamples; ++i)
+            {
+                const float X = (float)UWPoints[i].X, Y = (float)UWPoints[i].Y, Z = (float)UWPoints[i].Z;
+                const float Old = Gen->GetDensityWithParams(X, Y, Z, UP);
+                const float New = UWStack.EvalMC(X, Y, Z);
+                if (Z > UWInnerBot && Z < UWInnerTop && Old >= 0.0f) { ++UWInCave; }
+                if (!BitEqual(Old, New))
+                {
+                    ++UWDiff;
+                    UWWorst = FMath::Max(UWWorst, FMath::Abs(Old - New));
+                }
+            }
+
+            if (UWDiff == 0)
+            {
+                AddInfo(FString::Printf(
+                    TEXT("Underwater (stage C2): bit-identical across %d samples in %d chunks of the ")
+                    TEXT("Underwater slot, %d of them in open cave (%.1f%%). This is a DIFFERENT ")
+                    TEXT("strate index from the TunnelNetwork slot, so it also exercises the ")
+                    TEXT("strate-index memo and the per-strate room seed -- which six chunks of one ")
+                    TEXT("slot cannot. No density difference between the two archetypes was found, ")
+                    TEXT("which is what OPSTACK-DECOMPOSITION 8 predicts."),
+                    UWSamples, UWChunks, UWInCave, 100.0f * (float)UWInCave / (float)UWSamples));
+            }
+            else
+            {
+                AddError(FString::Printf(
+                    TEXT("Underwater (stage C2): %d of %d samples differ (largest |delta| %.9g). ")
+                    TEXT("⚠️ READ THIS BEFORE FIXING CODE: if the TunnelNetwork equivalence above is ")
+                    TEXT("GREEN and only this one fails, the operators are fine and the finding is a ")
+                    TEXT("real DENSITY DIFFERENCE between Underwater and TunnelNetwork -- which ")
+                    TEXT("would contradict OPSTACK-DECOMPOSITION 8 and is worth more written down ")
+                    TEXT("than patched. The likeliest culprit is the strate index (the memo is keyed ")
+                    TEXT("on chunk-Z and layout version) rather than anything archetype-specific."),
+                    UWDiff, UWSamples, UWWorst));
+            }
+
+            if (UWInCave == 0)
+            {
+                AddWarning(TEXT("No Underwater sample landed in open cave, so this check compared ")
+                           TEXT("solid rock to solid rock and proves almost nothing about the ")
+                           TEXT("archetype. Same failure mode as the 1.1% run of stage A."));
+            }
+        }
     }
 
     return true;

@@ -628,6 +628,26 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     VoxelDensityOps::BuildFloatingIslandStack(CP_OpStack, CP_Float, Seed,
                                                               OriginSpineRadius, StrateManager);
                     break;
+
+                case ECaveGeneratorType::Underwater:
+                case ECaveGeneratorType::TunnelNetwork:
+                    // ⚠️ UN SEUL CAS POUR LES DEUX, exactement comme le `switch` de production
+                    // vingt lignes plus bas : `GetDensityAt` route déjà `Underwater` vers
+                    // `GetDensityWithParams`, et `WaterLevelRelative` n'est lu que par
+                    // `UVoxelStrateManager` (côté rendu / requête), JAMAIS par la densité — vérifié
+                    // par recherche, pas supposé. Underwater EST TunnelNetwork plus un drapeau d'eau.
+                    //
+                    // ⚠️ PAS DE GARDE DE STRATE DÉGÉNÉRÉE ICI, et c'est une différence RÉELLE avec
+                    // les cinq cas au-dessus : eux la portent parce que leur fonction d'archétype
+                    // court-circuite sur `return 1.0f` quand la hauteur est nulle. Lu ligne à ligne :
+                    // `GetDensityWithParams` n'a AUCUN early-out de ce genre. Ajouter la garde ici
+                    // ferait diverger la pile du `switch` sur les strates dégénérées, dans le sens
+                    // exact que la garde était censée empêcher ailleurs.
+                    OpCtx.StrateTopWorldZ    = CP_Tunnel.StrateTopWorldZ;
+                    OpCtx.StrateBottomWorldZ = CP_Tunnel.StrateBottomWorldZ;
+                    VoxelDensityOps::BuildTunnelNetworkStack(CP_OpStack, CP_Tunnel, Seed,
+                                                             OriginSpineRadius, StrateManager);
+                    break;
                 default:
                     // UsesOperatorStackForChunk ne rend true que pour les archétypes portés, donc
                     // on ne devrait jamais arriver ici. Si ça arrive, retomber sur le `switch`
