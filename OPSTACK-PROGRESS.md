@@ -2679,3 +2679,86 @@ line"**, because the next person's guess would be as good as mine was.
    tile is *wrong*.
 3. Everything else should be unchanged. The worm change cannot alter density: `EffectOverBox` and
    `MaxCarveOverBox` are box-verdict methods, and `Eval` is untouched.
+
+## 2026-07-28 — the worm fix WORKED. `AllSolid killed by: RoomGraphSource x40` — and that is not an answer.
+
+The attribution line did its job on its first run:
+
+```
+AllSolid killed by: RoomGraphSource x40
+```
+
+`WormFieldSource` is gone from that list, so the previous entry's fix landed exactly as reasoned. The
+blocker moved one operator upstream, to the room source itself.
+
+**And my own warning is now the thing to distrust.** It said: *"If it names RoomGraphSource, the tiles
+genuinely straddle cave."* That is a **hypothesis wearing the costume of a conclusion** — the same
+mistake as the previous warning, one level down. `RoomGraphSource` has FOUR primitive classes behind
+it (rooms, tunnels, pits, chimneys) whose bounds differ enormously in quality, and "the tiles straddle
+cave" is only one of the things a `Both` from it can mean. So: no third guess. Two changes, one of
+them proved, and an instrument for the rest.
+
+### Proved, not guessed: the columns test is gone
+
+The first version treated columns as **infinite cylinders in Z** (the cache gives them no vertical
+bound), so a box hundreds of voxels below the owning room answered `Both` because it shared an XY
+circle with a column. That was the loosest test in the function — and it was **redundant**, not
+conservative:
+
+```cpp
+void FRoomColumnMod::Eval(...) const
+{
+    if (!VF_NearCaveSurface(InOut.Sdf, P.SDFBlendRadius)) { return; }   // <- the only consumer
+```
+
+Columns are read by exactly one operator, and it gates on `Sdf` being near a cave surface. In a box
+no room, tunnel, pit or chimney reaches, `Sdf` stays `FLT_MAX` at every voxel, so **no column can
+execute regardless of where it sits in XY**. Removing the test tightens the verdict without touching
+its correctness. That is a proof, not a relaxation.
+
+### The instrument: which primitive class actually reaches the box
+
+`EffectOverBox` no longer early-outs on the first hit. It **counts all four classes**, because
+stopping at the first gives the right verdict and no information — which is precisely why
+`RoomGraphSource x40` told us nothing actionable. The cost is nil at the scale that matters: we have
+just run `BuildChunkCache`, which dwarfs a walk over ~100 structs, and the verdict is memoised so the
+walk happens once per box rather than thirteen times.
+
+`VoxelDensityOps::GetLastRoomBoxDiagnostic()` exposes it. **Deliberately a read-back of what the
+operator computed, not a re-derivation in the test** — the test has everything needed to replay the
+criterion, and replaying it would create a second definition that drifts from the real one and lies
+on the day it is believed. Same reason `VF_BuildOpStackForChunk` exists.
+
+The report now prints, per killed tile, how many rooms and tunnels of those in the cache actually
+reach the box. **The hypothesis it is built to kill or confirm:** a tunnel is culled per voxel by its
+**bounding sphere**, and for a long thin capsule that sphere is an enormous over-estimate, while a
+room's cull sphere is a fair fit for a roughly spherical room. If tunnels ≫ rooms, the box test is
+losing to capsule bounding spheres rather than to real cave, and the fix is a segment-vs-box distance
+— nothing to do with the sampler or with cave density.
+
+### What was deliberately NOT done, and why
+
+Tightening tunnels to a real capsule test is **not** free correctness: the per-voxel cull *is* the
+bounding sphere, so a capsule test would be tighter than the cull and would break the stated criterion
+("no primitive survives its cull"). Making it sound needs the stronger criterion — *no primitive can
+bring `Sdf` below `max(Blend, SDFBlendRadius·3, WormNetworkRange)`* — which in turn needs a bound on
+how far `SmoothMin` of N primitives can dip below `min`. That is real §0.2 design work, and doing it
+blind, in the same build, before knowing whether tunnels are even the problem, is the §C10 mistake
+verbatim. **Measure, then tighten what the numbers name.**
+
+### Ready to build. Likely compile-error spots
+
+1. `VoxelDensityOps::FRoomBoxDiagnostic` + `GetLastRoomBoxDiagnostic()` — new declaration in the
+   header, defined in the .cpp *after* the anonymous namespace closes (it reads
+   `FRoomGraphSource::BoxState()`, whose type lives in that namespace; legal, since the type does not
+   appear in the function's signature).
+2. `FBoxState` gained eight `int32` counters.
+3. The test accumulates into new locals and calls `VoxelDensityOps::GetLastRoomBoxDiagnostic()`.
+
+### What to read
+
+1. **`...and when RoomGraphSource is the killer`** — the new second line. `tunnels 40 / rooms 3` says
+   capsule bounding spheres; `rooms 40` says the tiles really are near rooms and the sampler is what
+   to look at; pits or chimneys leading would be a surprise worth stopping on.
+2. Whether removing the columns test alone moved `proved` off zero. If it did, that number is the
+   first real T1.d saving in the plugin.

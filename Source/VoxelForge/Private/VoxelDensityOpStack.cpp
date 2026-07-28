@@ -2162,6 +2162,12 @@ namespace
             uint32 KeyLayout = 0xFFFFFFFFu;
             bool   bValid = false;
             EVoxelOpEffect Verdict = EVoxelOpEffect::Both;
+
+            /** DIAGNOSTIC — combien de primitives de chaque classe atteignent la dernière boîte
+             *  interrogée, et combien le cache en contenait. Lu par les tests via
+             *  `VoxelDensityOps::GetLastRoomBoxDiagnostic`. N'entre dans aucune décision. */
+            int32 HitRooms = 0, HitTunnels = 0, HitPits = 0, HitChimneys = 0;
+            int32 NumRooms = 0, NumTunnels = 0, NumPits = 0, NumChimneys = 0;
         };
 
         static FBoxState& BoxState()
@@ -2338,60 +2344,69 @@ namespace
                 return (dx * dx + dy * dy) <= RSq;
             };
 
-            bool bReached = false;
+            //-----------------------------------------------------------------
+            // ⚠️ PAS D'EARLY-OUT : ON COMPTE PAR CLASSE, ET C'EST DÉLIBÉRÉ
+            //-----------------------------------------------------------------
+            // La version d'origine s'arrêtait à la première primitive atteinte. Elle donnait le bon
+            // verdict et AUCUNE information : quand `AllSolid killed by: RoomGraphSource x40` est
+            // tombé, il n'y avait aucun moyen de dire si le coupable était les salles, les tunnels
+            // ou les pits — donc aucun moyen de savoir quoi resserrer. Compter les cinq classes
+            // sépare les causes, et c'est la règle que ce projet a payée plusieurs fois : quand un
+            // zéro a plusieurs causes possibles, chacune a son propre nombre.
+            //
+            // Le coût est nul à l'échelle qui compte : on vient d'appeler `BuildChunkCache`, qui
+            // est de plusieurs ordres de grandeur au-dessus d'un parcours de ~100 structs, et le
+            // verdict est mémoïsé donc ce parcours arrive UNE fois par boîte, pas treize.
+            //
+            // No early-out on purpose: stopping at the first hit gives the right verdict and no
+            // information. When a zero has several possible causes, each gets its own number.
+            B.NumRooms    = B.Cache.Rooms.Num();
+            B.NumTunnels  = B.Cache.Tunnels.Num();
+            B.NumPits     = B.Cache.Pits.Num();
+            B.NumChimneys = B.Cache.Chimneys.Num();
+            B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
 
             for (const FCachedRoom& R : B.Cache.Rooms)
             {
-                if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { bReached = true; break; }
+                if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { ++B.HitRooms; }
             }
-            if (!bReached)
+            for (const FCachedTunnel& T : B.Cache.Tunnels)
             {
-                for (const FCachedTunnel& T : B.Cache.Tunnels)
-                {
-                    if (SphereHitsBox(T.BoundCenter, T.BoundRadiusSq, QMin, QMax)) { bReached = true; break; }
-                }
+                if (SphereHitsBox(T.BoundCenter, T.BoundRadiusSq, QMin, QMax)) { ++B.HitTunnels; }
             }
-            if (!bReached)
+            // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
+            // `Z >= TopZ - Depth - BlendK`.
+            for (const FCachedPit& Pit : B.Cache.Pits)
             {
-                // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
-                // `Z >= TopZ - Depth - BlendK`.
-                for (const FCachedPit& Pit : B.Cache.Pits)
-                {
-                    if (!(RMinZ < Pit.TopZ + Pit.BlendK))                 { continue; }
-                    if (!(RMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK))    { continue; }
-                    if (CircleHitsBoxXY(Pit.CenterX, Pit.CenterY, Pit.BoundXYRadiusSq))
-                    {
-                        bReached = true; break;
-                    }
-                }
+                if (!(RMinZ < Pit.TopZ + Pit.BlendK))              { continue; }
+                if (!(RMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK)) { continue; }
+                if (CircleHitsBoxXY(Pit.CenterX, Pit.CenterY, Pit.BoundXYRadiusSq)) { ++B.HitPits; }
             }
-            if (!bReached)
+            // Miroir exact : actif si `Z > BottomZ - BlendK` ET `Z <= BottomZ + Height + BlendK`.
+            for (const FCachedChimney& Ch : B.Cache.Chimneys)
             {
-                // Miroir exact : actif si `Z > BottomZ - BlendK` ET `Z <= BottomZ + Height + BlendK`.
-                for (const FCachedChimney& Ch : B.Cache.Chimneys)
-                {
-                    if (!(RMaxZ > Ch.BottomZ - Ch.BlendK))                  { continue; }
-                    if (!(RMinZ <= Ch.BottomZ + Ch.Height + Ch.BlendK))     { continue; }
-                    if (CircleHitsBoxXY(Ch.CenterX, Ch.CenterY, Ch.BoundXYRadiusSq))
-                    {
-                        bReached = true; break;
-                    }
-                }
+                if (!(RMaxZ > Ch.BottomZ - Ch.BlendK))              { continue; }
+                if (!(RMinZ <= Ch.BottomZ + Ch.Height + Ch.BlendK)) { continue; }
+                if (CircleHitsBoxXY(Ch.CenterX, Ch.CenterY, Ch.BoundXYRadiusSq)) { ++B.HitChimneys; }
             }
-            if (!bReached)
-            {
-                // Les colonnes ne sont pas lues par CETTE source (c'est `FRoomColumnMod`, STEP 4d,
-                // qui parcourt `GetCache()`), mais elles héritent de ce verdict. Elles n'ont aucune
-                // borne en Z dans le cache : on les traite donc comme des cylindres infinis, ce qui
-                // est le test le plus prudent qu'on puisse écrire à partir de ce qui est stocké.
-                for (const FCachedColumn& Col : B.Cache.Columns)
-                {
-                    if (CircleHitsBoxXY(Col.CenterX, Col.CenterY, Col.BoundXYRadiusSq))
-                    {
-                        bReached = true; break;
-                    }
-                }
-            }
+
+            //-----------------------------------------------------------------
+            // ✅ LES COLONNES NE SONT PLUS TESTÉES — ET C'EST PROUVÉ, PAS RELÂCHÉ
+            //-----------------------------------------------------------------
+            // La première version les traitait en cylindres INFINIS en Z (le cache ne leur donne
+            // aucune borne verticale), ce qui rendait `Both` pour une boîte située des centaines de
+            // voxels sous la salle propriétaire. Inutile : le seul consommateur des colonnes est
+            // `FRoomColumnMod`, dont l'`Eval` commence par
+            //     `if (!VF_NearCaveSurface(InOut.Sdf, P.SDFBlendRadius)) { return; }`
+            // Si aucune salle, aucun tunnel, aucun pit et aucune cheminée n'atteint la boîte, `Sdf`
+            // y reste `FLT_MAX`, le gate est faux à chaque voxel, et **aucune colonne ne peut
+            // s'exécuter** — quelle que soit sa position XY. Le test était donc REDONDANT, pas
+            // prudent. Le retirer resserre le verdict sans toucher à sa correction.
+            //
+            // Columns are not tested: their only consumer gates on Sdf being near a cave surface,
+            // which cannot happen in a box no room/tunnel/pit/chimney reaches. The test was
+            // redundant rather than conservative, and it was the loosest one here.
+            const bool bReached = (B.HitRooms + B.HitTunnels + B.HitPits + B.HitChimneys) > 0;
 
             B.Verdict = bReached ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
             B.KeyBox = VoxelBox;
@@ -3686,6 +3701,26 @@ namespace
     // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
     // ajoutée avec elle ne ferme rien → C2059.
     // END OF THE ANONYMOUS NAMESPACE — new operators go ABOVE this line.
+
+//=============================================================================
+// DIAGNOSTIC — voir la déclaration dans VoxelDensityOpStack.h
+//=============================================================================
+
+VoxelDensityOps::FRoomBoxDiagnostic VoxelDensityOps::GetLastRoomBoxDiagnostic()
+{
+    const FRoomGraphSource::FBoxState& B = FRoomGraphSource::BoxState();
+
+    FRoomBoxDiagnostic D;
+    D.HitRooms    = B.HitRooms;
+    D.HitTunnels  = B.HitTunnels;
+    D.HitPits     = B.HitPits;
+    D.HitChimneys = B.HitChimneys;
+    D.NumRooms    = B.NumRooms;
+    D.NumTunnels  = B.NumTunnels;
+    D.NumPits     = B.NumPits;
+    D.NumChimneys = B.NumChimneys;
+    return D;
+}
 
 //=============================================================================
 // FVoxelOpStack

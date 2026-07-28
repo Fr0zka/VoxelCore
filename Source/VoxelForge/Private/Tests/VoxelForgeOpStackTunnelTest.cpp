@@ -1107,6 +1107,9 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         int32 NumBruteSamples = 0, NumViolations = 0;
         float WorstViolation = 0.0f;
         TMap<FString, int32> SolidKillerCounts;
+        int32 NumRoomKilled = 0;
+        int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
+        int32 SumHitRooms = 0, SumNumRooms = 0, SumHitTunnels = 0, SumNumTunnels = 0;
 
         FRandomStream Rng(97531);
         for (int32 t = 0; t < 40; ++t)
@@ -1131,7 +1134,26 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
 
             if (SolidKiller != INDEX_NONE)
             {
-                SolidKillerCounts.FindOrAdd(Stack.GetOpDebugName(SolidKiller))++;
+                const FString KillerName = Stack.GetOpDebugName(SolidKiller);
+                SolidKillerCounts.FindOrAdd(KillerName)++;
+
+                // VENTILATION PAR CLASSE DE PRIMITIVE. Quand c'est la source de salles qui tue,
+                // « les tuiles traversent une grotte » n'est pas une réponse : les salles, les
+                // tunnels, les pits et les cheminées ont chacun leur borne, de finesse très
+                // différente (une sphère englobante de capsule est un très mauvais tunnel). On lit
+                // ce que l'opérateur a RÉELLEMENT calculé plutôt que de rejouer le critère ici.
+                if (KillerName == TEXT("RoomGraphSource"))
+                {
+                    const VoxelDensityOps::FRoomBoxDiagnostic D =
+                        VoxelDensityOps::GetLastRoomBoxDiagnostic();
+                    ++NumRoomKilled;
+                    if (D.HitRooms    > 0) { ++TilesHitByRooms; }
+                    if (D.HitTunnels  > 0) { ++TilesHitByTunnels; }
+                    if (D.HitPits     > 0) { ++TilesHitByPits; }
+                    if (D.HitChimneys > 0) { ++TilesHitByChimneys; }
+                    SumHitRooms   += D.HitRooms;   SumNumRooms   += D.NumRooms;
+                    SumHitTunnels += D.HitTunnels; SumNumTunnels += D.NumTunnels;
+                }
             }
 
             if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
@@ -1191,6 +1213,23 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 TEXT("alone drove SolidMargin negative on every tile in the world. Attribution is ")
                 TEXT("cheap; a second wrong guess is not."),
                 *Breakdown));
+
+            if (NumRoomKilled > 0)
+            {
+                AddInfo(FString::Printf(
+                    TEXT("...and when RoomGraphSource is the killer (%d tiles), WHICH primitive class ")
+                    TEXT("reaches the box: rooms %d, tunnels %d, pits %d, chimneys %d (tiles, not ")
+                    TEXT("primitives -- a tile can be hit by several). Averages per killed tile: ")
+                    TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. THIS is the line that ")
+                    TEXT("says what to tighten. A tunnel is culled per voxel by its BOUNDING SPHERE, ")
+                    TEXT("which for a long thin capsule is an enormous over-estimate; a room's cull ")
+                    TEXT("sphere is a fair fit. So tunnels >> rooms here would mean the box test is ")
+                    TEXT("losing to capsule bounding spheres, not to real cave -- and the fix would ")
+                    TEXT("be a segment-vs-box distance, not anything about the sampler."),
+                    NumRoomKilled, TilesHitByRooms, TilesHitByTunnels, TilesHitByPits, TilesHitByChimneys,
+                    (float)SumHitRooms   / (float)NumRoomKilled, (float)SumNumRooms   / (float)NumRoomKilled,
+                    (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled));
+            }
         }
 
         if (NumProved == 0)

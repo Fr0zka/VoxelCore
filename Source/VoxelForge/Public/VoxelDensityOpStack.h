@@ -331,6 +331,31 @@ namespace VoxelDensityOps
                                                 const UVoxelStrateManager* StrateManager);
 
     /**
+     * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE du dernier `FRoomGraphSource::EffectOverBox`
+     * évalué sur ce thread. **Tests uniquement. N'entre dans aucune décision de génération.**
+     *
+     * ⚠️ POURQUOI ÇA EXISTE PLUTÔT QUE D'ÊTRE REFAIT DANS LE TEST. Le test a déjà tout ce qu'il faut
+     * pour rejouer le critère — il appelle `BuildChunkCache` ailleurs. Le rejouer serait une
+     * DEUXIÈME définition du critère, qui dériverait de la vraie et mentirait exactement le jour où
+     * on la croirait. C'est la même raison qui a fait exister `VF_BuildOpStackForChunk`. On expose
+     * donc ce que l'opérateur a réellement calculé.
+     *
+     * `Hit*` = combien de primitives de cette classe atteignent la boîte (0 partout ⇒ `Identity`).
+     * `Num*` = combien le cache en contenait, ce qui distingue « aucune n'atteint » de « il n'y en
+     * avait aucune » — deux zéros de sens opposé.
+     *
+     * Reads back what the operator actually computed, rather than letting the test re-derive the
+     * criterion: a second copy would drift and would lie on the day it was believed.
+     */
+    struct FRoomBoxDiagnostic
+    {
+        int32 HitRooms = 0, HitTunnels = 0, HitPits = 0, HitChimneys = 0;
+        int32 NumRooms = 0, NumTunnels = 0, NumPits = 0, NumChimneys = 0;
+    };
+
+    VOXELFORGE_API FRoomBoxDiagnostic GetLastRoomBoxDiagnostic();
+
+    /**
      * FloatingIslands — 7 ops, et **la pile tourne à l'ENVERS** :
      *   ConstantVoid → IslandBlob → SdfRoughness → SdfFill → [structural post ×3]
      *
