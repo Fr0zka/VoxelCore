@@ -5,8 +5,7 @@
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
 // `GetDensityWithParams` fait ~1080 lignes et douze modificateurs de détail (le chiffre « treize »
 // traînait dans les notes ; il y en a douze, et onze seulement lisent la copie de params par salle).
-// Tout porter avant de
-// pouvoir rien vérifier, ce serait écrire ~600 lignes non compilées par-dessus ~200 non vérifiées —
+// Tout porter avant de pouvoir rien vérifier, ce serait écrire ~600 lignes non compilées par-dessus ~200 non vérifiées —
 // exactement le motif que `AUDIT §P3` documente et que ce refactor a évité six fois de suite.
 //
 // La sortie : **tous les modificateurs de détail sont pilotés par une amplitude**, et
@@ -17,14 +16,17 @@
 // Même discipline que la passe « défauts puis tous les ops ON » du test de pile de hauteur, prise
 // dans l'autre sens.
 //
-// L'ÉTAPE B A REMONTÉ CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté sortait
-// de la liste des amplitudes éteintes pour entrer dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
-// qui prouve qu'il a réellement bougé quelque chose et (ii) le compte d'ops de la pile qui augmente.
+// L'ÉTAPE B A REMONTÉ CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté
+// sortait de la liste des amplitudes éteintes pour entrer dans `EnableTunnelFeatures`, avec (i) une
+// sonde de couverture prouvant qu'il a réellement bougé quelque chose, et (ii) le compte d'ops qui monte.
 //   • B1 : rugosité de paroi, STEP 4b.
 //   • B2 : terrasses, lignes de strates, nervures — STEP 4c.
 //   • B3 : surplombs, falaise, festons, arches — STEP 4c.
-//   • B4 (ce commit) : colonnes (4d), dômes (4g), pincement (4h), biais de sol. La liste des
-//     amplitudes éteintes est vide : **l'étape B est complète**.
+//   • B4 : colonnes (4d), dômes (4g), pincement (4h), biais de sol. La liste des amplitudes
+//     éteintes est vide : les douze modificateurs sont portés.
+//   • B5 (ce commit) : le GATE lui-même. Aucun opérateur ajouté — la décision (early-out répété par
+//     opérateur plutôt que conteneur de portée) est écrite dans `VF_NearCaveSurface`, et le
+//     contrôle 1d la paie : hors gate, la pile complète doit être BIT À BIT celle sans modificateurs.
 //
 // CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur l'override d'op PAR SALLE — onze des douze
 // modificateurs lisent, dans l'original, une copie des params où l'op de la salle la plus proche a
@@ -609,6 +611,105 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 TEXT("what makes the three unused branches of the 4b switch mean anything -- the ")
                 TEXT("main equivalence only ever takes the FBM one."),
                 (int32)UE_ARRAY_COUNT(RoughVariants), RoughSweepPoints));
+        }
+    }
+
+    //=========================================================================
+    // 1d. LE GATE `bNearCaveSurface` — UN VOXEL HORS PORTÉE EST-IL VRAIMENT INTACT ?  (ÉTAPE B5)
+    //=========================================================================
+    // ⚠️ LA DÉCISION DE L'ÉTAPE B5, RAPPELÉE ICI PARCE QUE C'EST CE CONTRÔLE QUI LA PAIE.
+    // Dans l'original les douze modificateurs vivent dans UN SEUL `if (bNearCaveSurface)`. La pile
+    // est une LISTE PLATE, donc chaque opérateur re-teste le gate lui-même (`VF_NearCaveSurface`,
+    // VoxelDensityOpStack.cpp, où le raisonnement complet est écrit). Un opérateur conteneur aurait
+    // dû replier ses enfants à la place de `ClassifyBox` et les lui aurait cachés.
+    //
+    // Le risque que ce choix introduit est précis : **douze occasions d'oublier le gate au lieu
+    // d'une**. Un oubli ne se verrait pas forcément dans l'équivalence globale (le modificateur
+    // s'appliquerait aussi dans l'original si son propre range était large), d'où un contrôle dédié.
+    //
+    // MÉTHODE : on classe chaque échantillon par son SDF final (aucun opérateur en aval du graphe de
+    // salles n'écrit ce canal), puis on compare la pile COMPLÈTE à une pile dont les onze amplitudes
+    // pilotables sont à zéro. **Hors gate, les deux doivent être bit à bit identiques** ; dedans,
+    // elles doivent différer souvent — sinon le contrôle ne compare rien.
+    //
+    // ⚠️ CE QUE CE CONTRÔLE NE PEUT PAS COUVRIR : l'opérateur de COLONNES, qui n'a aucune amplitude
+    // à éteindre (cf. la note du contrôle 3b). Son gate à lui n'est couvert que par la bit-identité
+    // globale du contrôle 1 face à l'original — ce qui suffit, mais ne se voit pas ici.
+    {
+        FStrateGenerationParams PNoMods = P;
+        PNoMods.SurfaceRoughness   = 0.0f;
+        PNoMods.TerraceStepHeight  = 0.0f;
+        PNoMods.LayerLineSpacing   = 0.0f;
+        PNoMods.RibbingSpacing     = 0.0f;
+        PNoMods.OverhangStrength   = 0.0f;
+        PNoMods.CliffStrength      = 0.0f;
+        PNoMods.ScallopStrength    = 0.0f;
+        PNoMods.ArchDensity        = 0.0f;
+        PNoMods.DomeDensity        = 0.0f;
+        PNoMods.PinchDensity       = 0.0f;
+        PNoMods.FloorBias          = 0.0f;
+
+        FVoxelOpStack NoModStack;
+        VoxelDensityOps::BuildTunnelNetworkStack(NoModStack, PNoMods, World.Settings->Seed,
+                                                 Gen->OriginSpineRadius, World.StrateManager.Get());
+        NoModStack.PrepareChunk(Ctx);
+
+        TArray<float> NoModVals;
+        NoModVals.SetNumUninitialized(NumTunnelSamples);
+        TArray<uint8> bOutsideGate;
+        bOutsideGate.SetNumUninitialized(NumTunnelSamples);
+
+        const float DetailThreshold = P.SDFBlendRadius * 3.0f;
+
+        for (int32 i = 0; i < NumTunnelSamples; ++i)
+        {
+            const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
+            const FVoxelOpSample S = NoModStack.EvalSample(X, Y, Z);
+            NoModVals[i] = -S.Density;   // même négation MC que EvalMC
+            // Le gate, écrit exactement comme l'original et comme VF_NearCaveSurface.
+            bOutsideGate[i] = ((S.Sdf < DetailThreshold) && (S.Sdf < FLT_MAX)) ? 0 : 1;
+        }
+
+        int32 NumOutside = 0, NumLeaked = 0, NumInsideMoved = 0;
+        for (int32 i = 0; i < NumTunnelSamples; ++i)
+        {
+            if (bOutsideGate[i])
+            {
+                ++NumOutside;
+                if (!BitEqual(NoModVals[i], FullVals[i])) { ++NumLeaked; }
+            }
+            else if (!BitEqual(NoModVals[i], FullVals[i]))
+            {
+                ++NumInsideMoved;
+            }
+        }
+
+        TestEqual(TEXT("no detail modifier touches a voxel outside the bNearCaveSurface gate"),
+                  NumLeaked, 0);
+
+        AddInfo(FString::Printf(
+            TEXT("Gate check (stage B5): %d of %d samples (%.1f%%) sit OUTSIDE the gate ")
+            TEXT("(SDF >= SDFBlendRadius*3), and %d of them leaked. Inside the gate, %d samples ")
+            TEXT("move when the eleven amplitudes are zeroed -- that second number is what says ")
+            TEXT("the comparison is not vacuous: if it were 0, 'nothing leaked' would only mean ")
+            TEXT("'nothing happened anywhere'. The column operator (STEP 4d) is NOT covered here, ")
+            TEXT("having no amplitude to zero; its gate rides on check 1's bit-identity instead."),
+            NumOutside, NumTunnelSamples, 100.0f * (float)NumOutside / (float)NumTunnelSamples,
+            NumLeaked, NumInsideMoved));
+
+        if (NumOutside < NumTunnelSamples / 10)
+        {
+            AddWarning(FString::Printf(
+                TEXT("Only %d of %d samples are outside the gate, so this check barely asked its ")
+                TEXT("question. Deep rock is the common case in production -- a sampling set that ")
+                TEXT("almost never leaves the cave is not representative of what the gate skips."),
+                NumOutside, NumTunnelSamples));
+        }
+        if (NumInsideMoved == 0)
+        {
+            AddError(TEXT("Inside the gate, zeroing all eleven modifier amplitudes changed NOTHING. ")
+                     TEXT("The gate check above is therefore vacuous, and so, probably, is a large ")
+                     TEXT("part of check 1b. Suspect the params never reaching the operators."));
         }
     }
 
