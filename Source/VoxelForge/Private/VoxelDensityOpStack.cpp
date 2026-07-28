@@ -134,6 +134,16 @@ namespace
             return EVoxelOpEffect::Both;   // jamais atteint sauf Value == 0 : ClassifyBox répond avant
         }
 
+        /** ⚠️ LA MOITIÉ MANQUANTE DU PLIAGE NUMÉRIQUE (`OPSTACK-DECOMPOSITION §0.2`).
+         *  `MaxCarveOverBox` dit ce qu'un opérateur peut RETIRER ; ceci dit ce qu'il y avait à
+         *  retirer. Un champ constant est le seul opérateur du plugin qui connaisse cette marge
+         *  EXACTEMENT : la densité vaut `Value` partout, donc la marge est `|Value|`. Sans elle la
+         *  soustraction n'a pas de premier terme et tout carve borné tue quand même l'hypothèse. */
+        float ForcedMarginOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return FMath::Abs(Value);
+        }
+
     private:
         float Value;
     };
@@ -2305,7 +2315,17 @@ namespace
             return (P.SurfaceRoughness > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
         }
 
-        /** La borne d'amplitude, en unités de densité. Pas encore consommée par le pliage. */
+        /**
+         * ✅ Borne consommée par le pliage numérique. `RoughNoise` et `FineNoise` respectent tous
+         * deux le contrat `[-1, 1]` de fBM/Ridged/Cellular, mis à l'échelle par `VOXEL_NOISE_SCALE`,
+         * et `TotalRough = Rough·S + Fine·S·0.4` ⇒ `|TotalRough| ≤ 1.4 · S · SCALE`. Le fade est
+         * dans `[0,1]`. Le clamp anti-remplissage ne fait que RÉDUIRE côté fill ; on ne s'appuie pas
+         * dessus (il ne s'applique que dans l'air certain), donc la borne fill reste la même.
+         */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
+        float MaxFillOverBox (const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
+
+        /** La borne d'amplitude, en unités de densité. */
         float MaxAmplitude() const
         {
             return (P.SurfaceRoughness > 0.0f)
@@ -2476,6 +2496,17 @@ namespace
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
+        /** `LineValue = max(sin,0)³ ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ retrait ≤ `LayerLineDepth`.
+         *  ⚠️ Borne calculée sur les params de la STRATE : un op `LayerLines` par salle peut écrire
+         *  une profondeur PLUS GRANDE, ce qui rendrait cette borne fausse dans le sens dangereux.
+         *  C'est la même dette que la note d'`EffectOverBox` juste au-dessus, et elle doit être
+         *  réglée par le même correctif — AVANT que `ClassifyTile` ne consomme `ClassifyBox`. */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.LayerLineSpacing > 0.0f) ? FMath::Max(P.LayerLineDepth, 0.0f) : 0.0f;
+        }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
     private:
         FStrateGenerationParams P;
         const FRoomGraphSource* Rooms;   // NON possédant
@@ -2530,6 +2561,14 @@ namespace
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.RibbingSpacing > 0.0f && P.RibbingDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        /** `RibValue = max(sin,0)² ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ ajout ≤ `RibbingDepth`.
+         *  Même réserve « params de strate » que `FLayerLineMod::MaxCarveOverBox`. */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.RibbingSpacing > 0.0f) ? FMath::Max(P.RibbingDepth, 0.0f) : 0.0f;
         }
 
     private:
@@ -2592,6 +2631,15 @@ namespace
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        /** fBM ∈ [-1,1] × `VOXEL_NOISE_SCALE`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ ajout
+         *  ≤ `SCALE · Depth · Strength`. Même réserve « params de strate ». */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return VOXEL_NOISE_SCALE * FMath::Max(P.OverhangDepth, 0.0f)
+                                     * FMath::Max(P.OverhangStrength, 0.0f);
         }
 
     private:
@@ -2724,6 +2772,14 @@ namespace
             // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
             return (P.ScallopStrength > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
+
+        /** `Cellular3D ∈ [-1,1]`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ retrait ≤
+         *  `ScallopStrength`. Même réserve « params de strate ». */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return FMath::Max(P.ScallopStrength, 0.0f);
+        }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
 
     private:
         FStrateGenerationParams P;
@@ -3223,9 +3279,28 @@ namespace
                                                                      : EVoxelOpEffect::Identity;
         }
 
-        /** L'amplitude max de carve, en unités de densité. Pas encore consommée par le pliage —
-         *  posée ici pour que la borne de `§0.2` ait déjà un domicile quand les intervalles
-         *  arriveront. / The bound §0.2 needs, given a home before it has a consumer. */
+        /**
+         * ✅ **LA BORNE DE `§0.2`, MAINTENANT CONSOMMÉE.** Elle a passé plusieurs entrées de journal
+         * écrite mais inutilisée, faute d'un pliage capable de porter un nombre ; ce pliage existe.
+         *
+         * La preuve tient en une ligne : `t = 1 − WormValue/WormThreshold ∈ [0,1]` (le bloc ne
+         * s'exécute que sous le seuil) et `NetworkMask ∈ [0,1]` par construction, donc
+         * `t · WormStrength · NetworkMask ≤ WormStrength`. C'est une borne PROUVÉE, pas prudente —
+         * la seule sorte qui ait le droit d'être ici : sur-estimer coûte du CPU, sous-estimer fait
+         * un trou.
+         */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxCarveAmplitude();
+        }
+
+        /** Le ver ne REMPLIT jamais : `InOut.Density -= …` avec un terme positif. */
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return 0.0f;
+        }
+
+        /** L'amplitude max de carve, en unités de densité. */
         float MaxCarveAmplitude() const
         {
             return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? P.WormStrength : 0.0f;

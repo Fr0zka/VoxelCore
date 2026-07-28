@@ -317,6 +317,68 @@ public:
     virtual EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const = 0;
 
     /**
+     * ⚠️ LE PLIAGE QUI PORTE DES NOMBRES — `OPSTACK-DECOMPOSITION §0.2`, et le plus gros poste de
+     * perf du plan.
+     *
+     * La direction seule ne suffit pas pour les opérateurs FIELDÉS. Un carve à seuil de bruit (les
+     * vers de TunnelNetwork, la rugosité de paroi) n'a AUCUNE borne spatiale : il rend `CarveOnly`
+     * sur CHAQUE boîte de CHAQUE strate qui l'active, donc il tue l'hypothèse `AllSolid` partout et
+     * l'archétype ne saute pas une tuile. Aucun raffinement de `EffectOverBox` ne peut le récupérer,
+     * parce que la réponse « oui, je peux creuser ici » est VRAIE.
+     *
+     * **Mais son AMPLITUDE est bornée, et souvent triviale** : pour un ver, `t ∈ [0,1]` et
+     * `Mask ∈ [0,1]`, donc il ne peut déplacer la densité vers l'air que de `WormStrength` au plus.
+     * Si le roc est solide d'une marge SUPÉRIEURE à la somme de tous les carves restants, la boîte
+     * est prouvablement pleine — quel que soit le bruit.
+     *
+     * D'où deux nombres, en unités de DENSITÉ (convention interne, positif = solide) :
+     *   • `MaxCarveOverBox` — de combien AU PLUS cet opérateur peut baisser la densité sur la boîte,
+     *   • `MaxFillOverBox`  — de combien AU PLUS il peut la monter.
+     *
+     * **`FLT_MAX` = « je ne sais pas », et c'est le DÉFAUT.** Un opérateur qui ne redéfinit rien se
+     * comporte donc EXACTEMENT comme avant ce changement : le pliage retire `FLT_MAX` à la marge,
+     * elle passe sous zéro, l'hypothèse meurt. Les treize tests d'équivalence et
+     * `VoxelForge.OpStack.BoxVerdictFold` ne bougent pas d'un verdict.
+     *
+     * ⚠️ SENS DE L'ERREUR : SUR-estimer une amplitude coûte du CPU (une tuile maillée pour rien) ;
+     * SOUS-estimer produit un TROU. Comme partout ailleurs dans ce fichier, en cas de doute rendre
+     * `FLT_MAX`. Ce n'est pas une borne « raisonnable », c'est une borne PROUVÉE ou rien.
+     *
+     * The fold carries NUMBERS, not just directions. A fielded noise carve has no spatial bound but
+     * its AMPLITUDE is bounded, so "the rock is solid by more than the sum of every remaining carve"
+     * becomes provable. FLT_MAX means "unknown" and is the default, so every existing op is
+     * unchanged. Over-estimating costs CPU; under-estimating is a hole.
+     */
+    virtual float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
+    {
+        return FLT_MAX;
+    }
+
+    virtual float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
+    {
+        return FLT_MAX;
+    }
+
+    /**
+     * Pour un opérateur FORÇANT (celui dont `ClassifyBox` rend autre chose que `Mixed`) : de combien
+     * la densité est-elle garantie du bon côté de zéro, PARTOUT dans la boîte ?
+     *
+     * C'est l'autre moitié du pliage numérique. `MaxCarveOverBox` dit ce qu'on peut RETIRER ; ceci
+     * dit ce qu'il y avait à retirer. Sans les deux, la soustraction n'a pas de premier terme.
+     *
+     * Exemple, et c'est LE cas qui compte : `FConstantFieldSource` pose `Density = BaseDensity`
+     * partout. Sa marge est donc exactement `BaseDensity`. Un ver à `WormStrength = 0.6` sur un roc
+     * à `BaseDensity = 1.0` laisse 0.4 de marge ⇒ la boîte reste prouvablement pleine.
+     *
+     * **0 = « je ne sais pas », et c'est le DÉFAUT** : la marge tombe à zéro, le premier carve la
+     * fait passer sous zéro, l'hypothèse meurt — le comportement d'avant, à l'identique.
+     */
+    virtual float ForcedMarginOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
+    {
+        return 0.0f;
+    }
+
+    /**
      * OPÉRATEURS FORÇANTS. Certains opérateurs ne « déplacent » pas la densité d'entrée : ils
      * l'ÉCRASENT. La question « dans quelle direction peux-tu bouger ce champ ? » n'a alors pas de
      * sens ; la bonne question est « sais-tu prouver que toute cette boîte est d'un seul côté,
@@ -386,6 +448,20 @@ struct FVoxelBoxHypotheses
     bool bCanBeAllSolid = true;
     bool bCanBeAllAir   = true;
 
+    /**
+     * ⚠️ LES DEUX NOMBRES DU PLIAGE (`OPSTACK-DECOMPOSITION §0.2`).
+     * `SolidMargin` = de combien la densité est encore garantie AU-DESSUS de zéro partout dans la
+     * boîte, SOUS l'hypothèse « tout solide ». Un opérateur forçant la pose ; chaque carve en retire
+     * son amplitude maximale ; quand elle n'est plus strictement positive, l'hypothèse meurt.
+     * `AirMargin` est son miroir.
+     *
+     * **Elles valent 0 sur un état neuf, et c'est ce qui rend le changement rétro-compatible :**
+     * sans opérateur forçant qui déclare une marge, le premier carve fait `0 − FLT_MAX < 0` et tue
+     * l'hypothèse — le comportement exact d'avant le pliage numérique.
+     */
+    float SolidMargin = 0.0f;
+    float AirMargin   = 0.0f;
+
     bool IsDead() const { return !bCanBeAllSolid && !bCanBeAllAir; }
 
     /** Verdict final : exactement une hypothèse doit survivre. Égalité = prudence ⇒ Mixed. */
@@ -399,28 +475,60 @@ struct FVoxelBoxHypotheses
 /** Poser l'état depuis un verdict FORÇANT (source, ou seal dans sa bande) : l'opérateur écrase
  *  l'entrée, donc il écrase aussi tout ce que la pile avait conclu avant lui. Un verdict « tout
  *  air » affirme du même coup « pas tout solide », et réciproquement. */
-FORCEINLINE void VF_ForceHypotheses(FVoxelBoxHypotheses& H, EVoxelTileClass ForcedVerdict)
+/** @param Margin  de combien la densité est garantie du bon côté de zéro dans toute la boîte.
+ *                 0 (le défaut) = « je ne sais pas » ⇒ comportement d'avant le pliage numérique. */
+FORCEINLINE void VF_ForceHypotheses(FVoxelBoxHypotheses& H, EVoxelTileClass ForcedVerdict,
+                                    float Margin = 0.0f)
 {
     switch (ForcedVerdict)
     {
-    case EVoxelTileClass::AllSolid: H.bCanBeAllSolid = true;  H.bCanBeAllAir = false; break;
-    case EVoxelTileClass::AllAir:   H.bCanBeAllSolid = false; H.bCanBeAllAir = true;  break;
+    case EVoxelTileClass::AllSolid: H.bCanBeAllSolid = true;  H.bCanBeAllAir = false;
+                                    H.SolidMargin = Margin;   H.AirMargin = 0.0f;     break;
+    case EVoxelTileClass::AllAir:   H.bCanBeAllSolid = false; H.bCanBeAllAir = true;
+                                    H.SolidMargin = 0.0f;     H.AirMargin = Margin;   break;
     case EVoxelTileClass::Mixed:
-    default:                        H.bCanBeAllSolid = false; H.bCanBeAllAir = false; break;
+    default:                        H.bCanBeAllSolid = false; H.bCanBeAllAir = false;
+                                    H.SolidMargin = 0.0f;     H.AirMargin = 0.0f;     break;
     }
 }
 
-/** Plier l'effet DIRECTIONNEL d'un opérateur dans l'état. Monotone : ne fait que tuer. */
-FORCEINLINE void VF_FoldEffect(FVoxelBoxHypotheses& H, EVoxelOpEffect Effect)
+/**
+ * Plier l'effet d'un opérateur dans l'état. **Monotone : ne fait que tuer**, jamais ressusciter —
+ * c'est la propriété de sûreté, et le pliage numérique ne l'affaiblit pas : une marge ne peut que
+ * DESCENDRE, jamais remonter, en dehors d'un opérateur forçant.
+ *
+ * ⚠️ `MaxCarve` / `MaxFill` valent `FLT_MAX` par défaut = « amplitude inconnue ». La soustraction
+ * fait alors passer la marge très en dessous de zéro et l'hypothèse meurt, exactement comme la
+ * version purement directionnelle de ce pliage. Aucun opérateur existant ne change de verdict.
+ * (Arithmétique volontairement laissée en float sans garde : `0 − FLT_MAX` vaut `−FLT_MAX`,
+ * `−FLT_MAX − FLT_MAX` sature à `−inf`, et `−inf > 0` est faux. Pas de NaN possible, les deux
+ * termes étant de même signe.)
+ */
+FORCEINLINE void VF_FoldEffect(FVoxelBoxHypotheses& H, EVoxelOpEffect Effect,
+                               float MaxCarve = FLT_MAX, float MaxFill = FLT_MAX)
 {
     switch (Effect)
     {
-    case EVoxelOpEffect::Identity:                                          break;
-    case EVoxelOpEffect::CarveOnly: H.bCanBeAllSolid = false;               break;
-    case EVoxelOpEffect::FillOnly:  H.bCanBeAllAir   = false;               break;
+    case EVoxelOpEffect::Identity:
+        break;
+
+    case EVoxelOpEffect::CarveOnly:
+        H.SolidMargin -= MaxCarve;
+        if (!(H.SolidMargin > 0.0f)) { H.bCanBeAllSolid = false; }
+        break;
+
+    case EVoxelOpEffect::FillOnly:
+        H.AirMargin -= MaxFill;
+        if (!(H.AirMargin > 0.0f)) { H.bCanBeAllAir = false; }
+        break;
+
     case EVoxelOpEffect::Both:
-    default:                        H.bCanBeAllSolid = false;
-                                    H.bCanBeAllAir   = false;               break;
+    default:
+        H.SolidMargin -= MaxCarve;
+        if (!(H.SolidMargin > 0.0f)) { H.bCanBeAllSolid = false; }
+        H.AirMargin -= MaxFill;
+        if (!(H.AirMargin > 0.0f)) { H.bCanBeAllAir = false; }
+        break;
     }
 }
 
@@ -448,8 +556,9 @@ FORCEINLINE void VF_FoldOp(FVoxelBoxHypotheses& H, const IVoxelDensityOp& Op,
     const EVoxelTileClass Forced = Op.ClassifyBox(VoxelBox, Ctx);
     if (Forced != EVoxelTileClass::Mixed)
     {
-        VF_ForceHypotheses(H, Forced);
+        VF_ForceHypotheses(H, Forced, Op.ForcedMarginOverBox(VoxelBox, Ctx));
         return;
     }
-    VF_FoldEffect(H, Op.EffectOverBox(VoxelBox, Ctx));
+    VF_FoldEffect(H, Op.EffectOverBox(VoxelBox, Ctx),
+                  Op.MaxCarveOverBox(VoxelBox, Ctx), Op.MaxFillOverBox(VoxelBox, Ctx));
 }

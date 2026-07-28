@@ -323,6 +323,109 @@ bool FVoxelForgeOpFoldTest::RunTest(const FString& Parameters)
         }
     }
 
+    //=========================================================================
+    // LE PLIAGE NUMÉRIQUE — `OPSTACK-DECOMPOSITION §0.2`
+    //=========================================================================
+    // La direction seule ne récupère jamais un carve FIELDÉ : il peut creuser partout, donc il rend
+    // `CarveOnly` partout, et c'est VRAI. Ce que la direction ignore, c'est qu'il ne peut creuser que
+    // de `WormStrength` au plus. Le pliage porte donc deux nombres : une MARGE posée par l'opérateur
+    // forçant, et une AMPLITUDE retirée par chaque carve.
+    //
+    // ⚠️ LE PREMIER CONTRÔLE CI-DESSOUS EST LE PLUS IMPORTANT : il vérifie que la rétro-compatibilité
+    // est réelle. Les cinq blocs au-dessus n'ont pas changé d'une ligne et doivent rester verts —
+    // ils appellent les mêmes fonctions sans marge ni amplitude, donc avec les défauts
+    // (`Margin = 0`, `MaxCarve = FLT_MAX`), qui reproduisent le comportement purement directionnel.
+
+    // 1. Les défauts REPRODUISENT l'ancien pliage — c'est ce qui rend le changement sûr.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid);   // marge par défaut = 0
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly);        // amplitude par défaut = FLT_MAX
+        TestEqual(TEXT("with default margin and amplitude, a carve still kills AllSolid"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // 2. Une amplitude INCONNUE tue même une grosse marge. « Je ne sais pas » n'est pas « zéro ».
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 1000.0f);
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly);        // FLT_MAX
+        TestEqual(TEXT("an unbounded carve kills AllSolid however solid the rock is"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // 3. LE CAS QUI JUSTIFIE TOUT : roc à 1.0, ver à 0.6 ⇒ il reste 0.4 de marge, la boîte est
+    //    prouvablement pleine. C'est exactement `FConstantFieldSource` + `FWormFieldSource`.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 1.0f);    // BaseDensity
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly, 0.6f, 0.0f);   // WormStrength
+        TestEqual(TEXT("rock solid by more than the worm can carve stays provably AllSolid"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
+
+        // …et les carves S'ACCUMULENT : un second à 0.5 fait passer la marge sous zéro.
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly, 0.5f, 0.0f);
+        TestEqual(TEXT("carve amplitudes accumulate until the margin runs out"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // 4. ÉGALITÉ ⇒ ON PERD LA TUILE, délibérément. Une marge de 1.0 contre un carve de 1.0 peut
+    //    atteindre exactement zéro, et zéro est du côté AIR pour le mesher. Le test `> 0` est
+    //    STRICT, et il doit le rester : se tromper ici ferait un trou, pas une tuile en trop.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 1.0f);
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly, 1.0f, 0.0f);
+        TestEqual(TEXT("a carve exactly equal to the margin loses the tile (strict >, on purpose)"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
+    // 5. Le miroir côté AIR : une strate d'îles flottantes, surtout vide, avec un remplissage borné.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllAir, 1.0f);
+        VF_FoldEffect(H, EVoxelOpEffect::FillOnly, 0.0f, 0.35f);
+        TestEqual(TEXT("air deeper than the fill can reach stays provably AllAir"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::AllAir);
+    }
+
+    // 6. `Both` BORNÉ : la rugosité de paroi peut aller dans les deux sens, mais pas loin. Sur du
+    //    roc forcé, l'hypothèse AIR est déjà morte (le forçage l'a tuée) ; ce qui compte est que
+    //    l'hypothèse SOLIDE survive à un `Both` d'amplitude connue — impossible avant ce changement,
+    //    où `Both` tuait tout inconditionnellement.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 1.0f);
+        VF_FoldEffect(H, EVoxelOpEffect::Both, 0.3f, 0.3f);
+        TestEqual(TEXT("a bounded Both no longer kills a margin it cannot cross"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
+    }
+
+    // 7. LA PROPRIÉTÉ DE SÛRETÉ TIENT TOUJOURS : rien de borné ne ressuscite quoi que ce soit.
+    //    Le pliage numérique ne fait que retarder la mort d'une hypothèse, jamais l'annuler.
+    {
+        for (const EVoxelOpEffect E : { EVoxelOpEffect::Identity, EVoxelOpEffect::CarveOnly,
+                                        EVoxelOpEffect::FillOnly, EVoxelOpEffect::Both })
+        {
+            FVoxelBoxHypotheses H;
+            VF_ForceHypotheses(H, EVoxelTileClass::Mixed, 1000.0f);   // marge ignorée sur Mixed
+            VF_FoldEffect(H, E, 0.0f, 0.0f);                          // amplitudes NULLES
+            TestEqual(TEXT("a zero-amplitude op cannot resurrect an unprovable box either"),
+                      (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+        }
+    }
+
+    // 8. Une marge NULLE avec une amplitude NULLE : le carve ne retire rien, mais `0 > 0` est faux,
+    //    donc l'hypothèse meurt quand même. C'est voulu — une marge inconnue reste inconnue, et un
+    //    opérateur qui ne fait rien devrait rendre `Identity`, pas `CarveOnly` d'amplitude 0.
+    {
+        FVoxelBoxHypotheses H;
+        VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 0.0f);
+        VF_FoldEffect(H, EVoxelOpEffect::CarveOnly, 0.0f, 0.0f);
+        TestEqual(TEXT("zero margin dies even to a zero carve -- unknown is not zero"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+    }
+
     return true;
 }
 
