@@ -1,6 +1,6 @@
 // VoxelForgeOpStackTunnelTest.cpp
-// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPE B1 (rugosité de paroi, 4b).
-// TunnelNetwork — STAGE A (the SDF spine) + STAGE B1 (wall roughness, 4b).
+// TunnelNetwork — ÉTAPE A (squelette SDF) + ÉTAPES B1–B3 (huit modificateurs de détail, 4b–4c).
+// TunnelNetwork — STAGE A (the SDF spine) + STAGES B1-B3 (eight detail modifiers, 4b-4c).
 //
 // POURQUOI UN TEST D'UNE PILE INCOMPLÈTE
 // `GetDensityWithParams` fait ~1080 lignes et treize modificateurs de détail. Tout porter avant de
@@ -19,11 +19,13 @@
 // de `DisableStageBModifiers` et entre dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
 // qui prouve qu'il a réellement bougé quelque chose et (ii) le compte d'ops de la pile qui augmente.
 //   • B1 : rugosité de paroi, STEP 4b.
-//   • B2 (ce commit) : terrasses, lignes de strates, nervures — STEP 4c.
+//   • B2 : terrasses, lignes de strates, nervures — STEP 4c.
+//   • B3 (ce commit) : surplombs, falaise, festons, arches — STEP 4c.
 //
-// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les huit modificateurs restants (4c–4h), rien
-// sur l'override d'op par salle, et rien sur le saut de tuile — `FRoomGraphSource::EffectOverBox`
-// rend `Both`, donc aucun verdict n'est prouvable à ce stade. Ce sont les étapes B2–B5 et C.
+// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les quatre modificateurs restants (colonnes,
+// dômes, pincement, biais de sol), rien sur l'override d'op par salle, et rien sur le saut de
+// tuile — `FRoomGraphSource::EffectOverBox` rend `Both`, donc aucun verdict n'est prouvable à ce
+// stade. Ce sont les étapes B4, B5 et C.
 //
 // ⚠️ ÉCHANTILLONNAGE PAR GRAPPES, PAS UNIFORME. Le cache SDF se reconstruit quand la requête sort de
 // sa boîte de recherche ; 20 000 points uniformément aléatoires feraient ~20 000 `BuildChunkCache`
@@ -67,10 +69,6 @@ namespace
      */
     void DisableStageBModifiers(FStrateGenerationParams& P)
     {
-        P.OverhangStrength          = 0.0f;
-        P.CliffStrength             = 0.0f;
-        P.ScallopStrength           = 0.0f;
-        P.ArchDensity               = 0.0f;
         P.ColumnDensity             = 0.0f;   // ⚠️ celui-ci se cuit dans SDFCache.Columns, pas un `if`
         P.DomeDensity               = 0.0f;
         P.PinchDensity              = 0.0f;
@@ -124,6 +122,21 @@ namespace
         P.LayerLineDepth           = 0.35f;
         P.RibbingSpacing           = 4.0f;
         P.RibbingDepth             = 0.4f;
+
+        // ── ÉTAPE B3 : surplombs · falaise · festons · arches (4c) ───────────────────────────
+        P.OverhangStrength = 0.6f;
+        P.OverhangDepth    = 5.0f;
+        P.OverhangFrequency= 0.06f;
+        P.CliffStrength    = 0.5f;
+        P.ScallopStrength  = 0.8f;
+        P.ScallopFrequency = 0.1f;
+        // ⚠️ ArchDensity BEAUCOUP plus haut que le défaut (0.1) : chaque salle tire 3 arches et
+        // n'en garde que celles dont `hash01 <= ArchDensity`. À 0.1, ~0.3 arche par salle et une
+        // fenêtre d'influence de 2 voxels autour d'une capsule — la sonde de couverture rapporterait
+        // zéro sans que rien ne soit faux. La couverture d'un test n'est pas la valeur de prod.
+        P.ArchDensity      = 0.9f;
+        P.ArchMinRadius    = 3.0f;
+        P.ArchMaxRadius    = 6.0f;
     }
 
     /**
@@ -217,6 +230,14 @@ namespace
           [](FStrateGenerationParams& Q) { Q.LayerLineSpacing = 0.0f; } },
         { TEXT("B2 ribbing (STEP 4c)"),
           [](FStrateGenerationParams& Q) { Q.RibbingSpacing = 0.0f; } },
+        { TEXT("B3 cave overhangs (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.OverhangStrength = 0.0f; } },
+        { TEXT("B3 cliff sharpening (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.CliffStrength = 0.0f; } },
+        { TEXT("B3 scallop (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.ScallopStrength = 0.0f; } },
+        { TEXT("B3 arches (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.ArchDensity = 0.0f; } },
         // ⚠️ UNE SONDE PAR OPÉRATEUR, PAS UNE PAR GROUPE. Le groupe B2 en contient trois ; une seule
         // sonde « B2 » serait verte tant qu'UN des trois tire, et les deux autres pourraient être
         // faux sans que rien ne le dise. La granularité de la sonde est la granularité de la preuve.
@@ -308,12 +329,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + **rugosité + terrasses + lignes + nervures (B1, B2)** + worms
-    // + 3 structurels = 11.
-    // Les huit modificateurs restants viendront s'insérer entre les nervures et les vers, donc ce
+    // rock + roomgraph + carve + **8 modificateurs (B1 · B2 · B3)** + worms + 3 structurels = 15.
+    // Les quatre modificateurs restants viendront s'insérer entre les arches et les vers, donc ce
     // nombre DOIT bouger à chaque groupe de l'étape B — c'est un compteur de progression, pas une
     // formalité : une pile qui ne grandit pas est une pile dont l'opérateur n'a pas été ajouté.
-    TestEqual(TEXT("the stage-A+B1+B2 tunnel stack is decomposed into 11 ops"), Stack.Num(), 11);
+    TestEqual(TEXT("the stage-A+B1..B3 tunnel stack is decomposed into 15 ops"), Stack.Num(), 15);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -385,15 +405,15 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     if (NumDiff == 0)
     {
         AddInfo(FString::Printf(
-            TEXT("TunnelNetwork STAGE A+B1: bit-identical across %d samples in %d chunks (%d in ")
+            TEXT("TunnelNetwork STAGE A+B: bit-identical across %d samples in %d chunks (%d in ")
             TEXT("open cave, %d in rock, away from the seal bands). Exercised: vertical scale (1.35, ")
             TEXT("so effective Z differs from world Z everywhere), cave warp, the room/tunnel SDF via ")
-            TEXT("the SHARED BuildChunkCache, the carve with its floored divisor, wall roughness ")
-            TEXT("(4b, density-space variant), and the worm carve with its network mask. Pits, ")
-            TEXT("chimneys and roughness are covered only insofar as the bake-coverage and ")
-            TEXT("group-coverage lines below report non-zero -- this message used to CLAIM coverage ")
-            TEXT("outright, and was wrong for a whole run. NOT covered at all: the eleven remaining ")
-            TEXT("detail modifiers (4c-4h), the per-room op override, and any tile verdict."),
+            TEXT("the SHARED BuildChunkCache, the carve with its floored divisor, the ported detail ")
+            TEXT("modifiers of 4b-4c, and the worm carve with its network mask. Every one of those ")
+            TEXT("is covered ONLY insofar as the bake-coverage and group-coverage lines below report ")
+            TEXT("non-zero -- this message used to CLAIM coverage outright, and was wrong for a ")
+            TEXT("whole run. NOT covered at all: whatever is still listed in ")
+            TEXT("DisableStageBModifiers, the per-room op override, and any tile verdict."),
             NumTunnelSamples, NumTunnelChunks, NumInCave, NumInRock));
 
         AddInfo(FString::Printf(
@@ -406,7 +426,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     else
     {
         AddError(FString::Printf(
-            TEXT("TunnelNetwork STAGE A: %d of %d samples differ (largest |delta| %.9g at ")
+            TEXT("TunnelNetwork STAGE A+B: %d of %d samples differ (largest |delta| %.9g at ")
             TEXT("(%.0f, %.0f, %.0f)); %d cross the isosurface. Check, in order: the carve's ")
             TEXT("MinDivisor (TunnelNetwork floors Blend*2 at 1.0 and the other archetypes do NOT ")
             TEXT("-- getting this wrong only shows up when SDFBlendRadius*2 < 1), then EffectiveZ ")

@@ -2457,6 +2457,285 @@ namespace
     };
 
     //=========================================================================
+    // RÔLE 3 — MODIFIER : SURPLOMBS DE GROTTE / CAVE OVERHANGS  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // ⚠️ TROISIÈME OPÉRATEUR NOMMÉ « OVERHANG » DANS CE FICHIER, et ils n'ont rien en commun :
+    //   • `FOverhangShelfMod` (SurfaceWorld) emprunte la hauteur de terrain amont — géométrique ;
+    //   • celui-ci est un bruit fBM à FRÉQUENCE EN Z RÉDUITE (×0.15), dont on ne garde que le lobe
+    //     POSITIF : la roche ne s'étend que VERS la grotte, jamais en creux. D'où des étagères
+    //     éparses au lieu d'un déplacement uniforme.
+    // Même nom dans l'éditeur, deux idées différentes. `OPSTACK-DECOMPOSITION §1` les sépare déjà.
+    class FCaveOverhangMod final : public IVoxelDensityOp
+    {
+    public:
+        FCaveOverhangMod(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.OverhangStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float OverhangRange = P.OverhangDepth * 2.0f;
+            if (!(DistFromSurface < OverhangRange)) { return; }
+
+            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
+                                   ? (WorldZ / P.VerticalScale) : WorldZ;
+
+            // Fréquence en Z à 0.15× celle de XY ⇒ les motifs s'étirent horizontalement.
+            const float OverhangNoise = HFractal3D(FVector(
+                WorldX * P.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
+                WorldY * P.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
+                EffectiveZ * P.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
+            ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
+
+            if (OverhangNoise > 0.0f)
+            {
+                float Fade = 1.0f - (DistFromSurface / OverhangRange);
+                Fade = Fade * Fade;
+
+                InOut.Density += OverhangNoise * P.OverhangDepth * P.OverhangStrength * Fade;
+            }
+        }
+
+        /** Lobe positif seulement ⇒ n'AJOUTE que du solide ⇒ `FillOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)
+                 ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : AFFÛTAGE DE FALAISE / CLIFF SHARPENING  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // ⚠️ TRANSCRIT TEL QUEL BIEN QUE LE COMMENTAIRE DE L'ORIGINAL DÉCRIVE AUTRE CHOSE.
+    // Il annonce « échantillonner la densité en Z±1 et calculer le gradient vertical » ; le code, lui,
+    // n'échantillonne RIEN : il tire un Perlin dont la fréquence en Z est 3× celle de XY et l'appelle
+    // `VertGrad`. C'est un PROXY de gradient, pas un gradient — donc l'effet est décorrélé de la
+    // pente réelle de la paroi. Le multiplier par `CaveSDF` lui donne quand même le bon SIGNE de part
+    // et d'autre de la surface (plus solide côté roche, plus creusé côté air), ce qui suffit à
+    // produire des faces plus raides.
+    //
+    // Corriger l'écart changerait le monde ; le taire le laisserait se faire « corriger » un jour par
+    // quelqu'un qui lit le commentaire et pas le code. Noté ici ET dans OPSTACK-PROGRESS.
+    //
+    // Ported as written, not as commented: the original's comment promises a sampled vertical
+    // gradient, the code uses a Z-stretched Perlin as a proxy. Fixing it would change the world.
+    class FCaveCliffMod final : public IVoxelDensityOp
+    {
+    public:
+        FCaveCliffMod(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.CliffStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float CliffRange = 8.0f;   // constante en dur dans l'original
+            if (!(DistFromSurface < CliffRange)) { return; }
+
+            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
+                                   ? (WorldZ / P.VerticalScale) : WorldZ;
+
+            const float VertGrad = VoxelNoise::Perlin3D(FVector(
+                WorldX * 0.05f + VoxelHash::SeedOffset(SeedU, 71.3f),
+                WorldY * 0.05f + VoxelHash::SeedOffset(SeedU, 73.7f),
+                EffectiveZ * 0.15f + VoxelHash::SeedOffset(SeedU, 79.1f)   // 3× plus vite en Z
+            )) * VOXEL_NOISE_SCALE;
+
+            const float CliffEffect = VertGrad * CaveSDF * P.CliffStrength;
+
+            if (FMath::Abs(VertGrad) > 0.3f)
+            {
+                float Fade = 1.0f - (DistFromSurface / CliffRange);
+                Fade = Fade * Fade;
+                InOut.Density += CliffEffect * Fade * 3.0f;
+            }
+        }
+
+        /** `Both` : le signe suit celui de `VertGrad · CaveSDF`, donc les deux directions. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.CliffStrength > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : FESTONS / SCALLOP  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // Cuvettes concaves d'érosion hydraulique. Bruit cellulaire : la valeur est haute AU CENTRE
+    // d'une cellule (loin des points-features), donc on y creuse — d'où des rangées de coupelles
+    // lisses, la signature des grottes calcaires.
+    //
+    // Deuxième client de `VoxelNoise::Cellular3D` (le premier est la rugosité en mode Cellular) —
+    // c'est-à-dire la deuxième raison pour laquelle ce corps devait être PARTAGÉ et non recopié.
+    class FScallopMod final : public IVoxelDensityOp
+    {
+    public:
+        FScallopMod(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.ScallopStrength > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float ScallopRange = P.ScallopStrength * 4.0f;
+            if (!(DistFromSurface < ScallopRange)) { return; }
+
+            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
+                                   ? (WorldZ / P.VerticalScale) : WorldZ;
+
+            const float SF = P.ScallopFrequency;
+            const float ScallopNoise = VoxelNoise::Cellular3D(FVector(
+                WorldX * SF + VoxelHash::SeedOffset(SeedU, 83.1f),
+                WorldY * SF + VoxelHash::SeedOffset(SeedU, 89.3f),
+                EffectiveZ * SF + VoxelHash::SeedOffset(SeedU, 97.7f)
+            ));
+
+            if (ScallopNoise > 0.0f)
+            {
+                float Fade = 1.0f - (DistFromSurface / ScallopRange);
+                Fade = Fade * Fade;
+
+                InOut.Density -= ScallopNoise * P.ScallopStrength * Fade;
+            }
+        }
+
+        /** Lobe positif seulement, SOUSTRAIT ⇒ `CarveOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.ScallopStrength > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : ARCHES / PONTS DE ROCHE  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // ⚠️ PREMIER MODIFICATEUR RELATIF À LA SALLE. Il ne lit pas seulement `InOut.Sdf` : il lui faut
+    // LA SALLE — son hash (pour tirer les arches de façon déterministe), son centre et ses rayons.
+    // C'est l'unique consommateur de `NearestRoomIdx` avec les dômes, le pincement et le biais de
+    // sol, et c'est ce qui rend `FRoomGraphSource::GetNearestRoomIdx()` nécessaire.
+    //
+    // ⚠️ SA PORTE N'EST PAS LE GATE COMMUN : `CaveSDF < SDFBlendRadius` (dans la grotte ou tout
+    // près), pas `< SDFBlendRadius·3`. Une arche se pose dans le VIDE de la salle, pas dans sa paroi.
+    class FCaveArchMod final : public IVoxelDensityOp
+    {
+    public:
+        FCaveArchMod(const FStrateGenerationParams& InP, const FRoomGraphSource* InRooms)
+            : P(InP), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            const int32 NearestRoomIdx = Rooms->GetNearestRoomIdx();
+            if (!(P.ArchDensity > 0.0f && CaveSDF < P.SDFBlendRadius && CaveSDF < FLT_MAX
+                  && NearestRoomIdx >= 0))
+            {
+                return;
+            }
+
+            // ⚠️ `IsValidIndex` AJOUTÉ : l'original indexe directement après le seul test `>= 0`.
+            // L'index vient d'`EvaluateSDFCached` donc il est valide par construction — ce garde-fou
+            // ne peut donc JAMAIS changer la sortie, seulement empêcher un crash si l'invariant se
+            // cassait un jour. Même famille de décision que l'empreinte de params dans la clé de
+            // cache : on se trompe du côté du coût, jamais du côté du résultat.
+            const FChunkSDFCache& Cache = Rooms->GetCache();
+            if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }
+            const FCachedRoom& Room = Cache.Rooms[NearestRoomIdx];
+
+            const int32 MaxArches = 3;
+            const FVector VoxPos(WorldX, WorldY, WorldZ);
+
+            for (int32 i = 0; i < MaxArches; i++)
+            {
+                const uint32 AH = VoxelHash::Mix(Room.Hash ^ (0xA4C400u + (uint32)i * 7369u));
+
+                if (VoxelHash::ToFloat01(AH) > P.ArchDensity) { continue; }
+
+                const uint32 AH2 = VoxelHash::Mix(AH ^ 0xA4C4u);
+                const float ArcCX = Room.Center.X + VoxelHash::ToFloatSigned(AH2) * Room.RadiusXY * 0.3f;
+                const float ArcCY = Room.Center.Y
+                                  + VoxelHash::ToFloatSigned(VoxelHash::Mix(AH2)) * Room.RadiusXY * 0.3f;
+
+                const uint32 AH3 = VoxelHash::Mix(AH2 ^ 0xB41Du);
+                const float ArcCZ = Room.Center.Z + VoxelHash::ToFloatSigned(AH3) * Room.RadiusZ * 0.4f;
+
+                const uint32 AH4 = VoxelHash::Mix(AH3 ^ 0xCAFEu);
+                const float Angle    = VoxelHash::ToFloat01(AH4) * PI;
+                const float HalfSpan = Room.RadiusXY
+                                     * (0.5f + VoxelHash::ToFloat01(VoxelHash::Mix(AH4)) * 0.35f);
+
+                const float CosA = FMath::Cos(Angle);
+                const float SinA = FMath::Sin(Angle);
+                const FVector ArchA(ArcCX - CosA * HalfSpan, ArcCY - SinA * HalfSpan, ArcCZ);
+                const FVector ArchB(ArcCX + CosA * HalfSpan, ArcCY + SinA * HalfSpan, ArcCZ);
+
+                const uint32 AH5 = VoxelHash::Mix(AH4 ^ 0xF00Du);
+                const float ArchRadius = FMath::Lerp(P.ArchMinRadius, P.ArchMaxRadius,
+                                                     VoxelHash::ToFloat01(AH5));
+
+                const float ArchSDF = VoxelSDF::Capsule(VoxPos, ArchA, ArchB, ArchRadius);
+
+                const float ArchBlend = 2.0f;
+                if (ArchSDF < ArchBlend)
+                {
+                    float Fill = FMath::Clamp((ArchBlend - ArchSDF) / (ArchBlend * 2.0f), 0.0f, 1.0f);
+                    Fill = SmoothStep01(Fill);
+                    InOut.Density += Fill * P.BaseDensity * 1.5f;
+                }
+            }
+        }
+
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. Une vraie borne spatiale existe (les arches vivent
+         *  dans le rayon d'une salle) mais elle demande le cache pour la boîte interrogée — même
+         *  dette que `FRoomGraphSource::EffectOverBox`, et elle se paiera au même moment. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.ArchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        const FRoomGraphSource* Rooms;   // NON possédant
+    };
+
+    //=========================================================================
     // RÔLE 1 — SOURCE : VERS / WORM TUNNELS  (TunnelNetwork)
     //=========================================================================
     // Un carve par SEUIL sur du bruit 3D, masqué par la distance au réseau de salles. Il écrit la
@@ -2704,12 +2983,12 @@ namespace VoxelDensityOps
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ ÉTAPES A + B1 + B2 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
+        // ⚠️ ÉTAPES A + B1 + B2 + B3 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
         // Sont portés : l'échelle verticale, le roc de base, le warp, le graphe de salles (+ pits
         // + cheminées), le carve, **la rugosité (4b), les terrasses, les lignes de strates, les
-        // nervures**, les vers, le post structurel. **NE SONT PAS ENCORE PORTÉS** les huit
-        // modificateurs restants (surplombs, falaise, festons, arches, colonnes, dômes, pincement,
-        // biais de sol), ni l'override d'op PAR SALLE.
+        // nervures, les surplombs, la falaise, les festons, les arches**, les vers, le post
+        // structurel. **NE SONT PAS ENCORE PORTÉS** les quatre modificateurs restants (colonnes,
+        // dômes, pincement, biais de sol), ni l'override d'op PAR SALLE.
         //
         // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
         // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
@@ -2753,8 +3032,11 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
         OutStack.Add(MakeUnique<FLayerLineMod>(P));                      // 4c — lignes de strates
         OutStack.Add(MakeUnique<FRibbingMod>(P));                        // 4c — nervures
-        // [ÉTAPES B3–B4 iront ici : surplombs, falaise, festons, arches, colonnes, dômes,
-        //  pincement, biais de sol]
+        OutStack.Add(MakeUnique<FCaveOverhangMod>(P, Seed));             // 4c — surplombs
+        OutStack.Add(MakeUnique<FCaveCliffMod>(P, Seed));                // 4c — falaise
+        OutStack.Add(MakeUnique<FScallopMod>(P, Seed));                  // 4c — festons
+        OutStack.Add(MakeUnique<FCaveArchMod>(P, RoomPtr));              // 4c — arches
+        // [ÉTAPE B4 ira ici : colonnes, dômes, pincement, biais de sol]
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
