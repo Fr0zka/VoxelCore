@@ -2283,3 +2283,115 @@ Then, in the order agreed: settle `AUDIT §C2`'s suspected item (answerable by r
 `GetGenerationParams` and `FStrateGenerationParams::Lerp` — no build needed), the worm amplitude cap
 (`DECOMPOSITION §0.2`, its own commit, extends `BoxVerdictFold`), and then make `ClassifyTile` consume
 `ClassifyBox`. Perf stays parked until Jahni unparks it.
+
+---
+
+## 2026-07-28 — after 8 of 8: the fold carries numbers, and `ClassifyTile` finally consumes `ClassifyBox`
+
+Same unattended run, continued past the transition. Four more commits, still zero builds.
+
+```
+64d0e11  AUDIT §C2's suspected item settled — CONFIRMED, and it is the default config (docs only)
+353d504  the box fold carries NUMBERS — amplitude bounds alongside EVoxelOpEffect  (§0.2)
+239c037  the twelve detail modifiers inherit the room source's box verdict
+6a8390f  ClassifyTile consumes ClassifyBox for cave archetypes — the T1.d prize
+```
+
+**Test filter: `VoxelForge`. Now 14 tests** — the new one is
+`VoxelForge.OpStack.ClassifyTileSoundness`.
+
+### `AUDIT §C2` — the suspicion was right, and it needed no build to settle
+
+Four links, each read in the source rather than inferred: `Alpha` depends on chunk Z *inside* a
+slot; `Lerp` blends every room-placement field; `Gradient` + `TransitionBlendChunks = 2` are the
+**defaults**; and the strate index is per-slot, so the cache key cannot notice. A worker that builds
+`(X,Y,Z1)` then `(X,Y,Z2)` in one strate evaluates the second chunk against the first chunk's rooms.
+
+The part that matters more than the seam: **the result depends on which chunk that worker happened
+to build first** — a window-invariance break, and in multiplayer two peers can generate different
+geometry from the same seed. Not fixed here: the fix is a params CRC in the *original* path's SDF
+cache key, a live-generation change that wants a build in front of it.
+
+**Why nothing caught it:** the fixture sets `TransitionType = Hard` on every strate on purpose. The
+one configuration the tests never build is the default one.
+
+### The numeric fold, and the thing `§0.2` does not say out loud
+
+`§0.2` frames the worm as *the* blocker: a fielded carve has no spatial bound, so it answers
+`CarveOnly` on every box and kills `AllSolid` everywhere. True — and the amplitude fix is exactly as
+described (`t ∈ [0,1]`, `Mask ∈ [0,1]` ⇒ at most `WormStrength`). But porting it surfaced a second
+half that was missing:
+
+1. **The subtraction had no first term.** Nothing declared *how solid* the rock was. Hence
+   `ForcedMarginOverBox`, which `FConstantFieldSource` answers exactly (`|Value|`).
+2. **The twelve detail modifiers were the bigger drag, and not because of their amplitudes.** They
+   are all gated on the SDF the room source writes, so where the source proves no cave reaches the
+   box they are **Identity**, not "bounded" — yet each declared `Both`/`FillOnly`/`CarveOnly` and
+   killed the hypothesis just as hard. They already held the pointer since C1; they simply were not
+   asking. `VF_NoCaveOverBox` fixes twelve declarations in one place.
+
+Backwards compatibility is structural, not promised: `FLT_MAX` and `0` are the defaults, so an op
+that overrides nothing subtracts `FLT_MAX` from a margin of `0` and dies exactly as before.
+
+### `ClassifyTile` — the prize, and the only change on this run that could make a hole
+
+Where it used to `return Mixed` without a call for cave archetypes, it now builds the strate's stack
+and folds `ClassifyBox`. **SurfaceWorld and bedrock gaps keep their hand-written proofs** — an
+exact-lattice column test beats any box bound, so the stack has nothing to offer there.
+
+**The load-bearing decision:** `GetDensityAt`'s build switch was extracted into
+`VF_BuildOpStackForChunk` and both callers now use it. A second copy would be the worst bug
+available in this file — a tile skipped on the verdict of a stack that is not the one producing its
+density *is* a hole. A "keep these in sync" comment would not have been enough.
+
+Six guards, all failing to `Mixed`. The one that matters is **params bit-identical across every
+chunk coord the box touches**, and it exists *because of* the `§C2` finding two commits earlier: a
+tile straddling a blend band genuinely cannot be represented by one stack. The others: opt-in true on
+every chunk (not just the triggering one), one cave slot per tile, no mixed cave/surface/gap tile, a
+27-chunk-coord cap, and the disturbances folded by hand since `§10.2` leaves them outside the stack.
+
+**A safety property worth recording, because it was checked rather than assumed:** no box query in
+the whole operator library touches per-worker memo state — `EffectOverBox` and `ClassifyBox` are
+pure in every op. So the classifier building and folding its own stack cannot clobber the caches the
+density path depends on.
+
+**What it buys:** Maze, FlatPlain/CrystalChamber, VerticalShafts and FloatingIslands can prove tiles
+in production. TunnelNetwork and Underwater still prove nothing — their chain dies at
+`FRoomGraphSource`, which answers `Both`. Making it answer spatially means building the SDF cache for
+the queried box, which is *now worth it*: a skipped tile saves 30k+ density evaluations, and both
+the amplitude fold and the modifiers' Identity inheritance are already in place to receive it.
+**That is the single highest-value thing left.**
+
+### Fixture: a cross-test hazard that was hidden by an accident
+
+`FTestWorld::Build` gains `bUseOperatorStack` (default false), and every test world now gets a
+**process-unique `LayoutVersion`**. `PassagesVersion` is per-instance and starts at 0, so two
+`FTestWorld`s both reported `1` — and `GetDensityAt`'s per-chunk caches are keyed on
+`(ChunkCoord, LayoutVersion)`. One world could be served the previous world's params *and its
+`CP_UseOpStack` flag*. Invisible for as long as every world agreed the flag was false; the first
+world that ticks it removes the coincidence, in both directions.
+
+### The reviewer pass, done as the last step
+
+Re-read every ported operator against the original block, as a reviewer rather than the author.
+**No transcription error found.** What the pass did confirm, and what is worth knowing:
+
+- operator order in `BuildTunnelNetworkStack` matches the original **line for line** (roughness →
+  terrace → lines → ribs → overhang → cliff → scallop → arch → columns → domes → pinch → floor bias);
+- `EffectiveZ` is recomputed per operator instead of once — same expression, same operands, so
+  bit-identical;
+- the terrace's `SDFBlendRadius` comes from strate params in the port and from the *shadowed* copy in
+  the original, which are equal because no `ApplyTo` writes that field;
+- `LocalParams()` is materialised lazily by the first modifier that asks, which reproduces the
+  original's cost profile (one struct copy per voxel **inside the gate**, none in deep rock).
+
+### Next single action
+
+Unchanged: build, run the `VoxelForge` filter, read the coverage numbers before the colours. Then
+the two numbers new to this batch — `VoxelForge.OpStack.ClassifyTileSoundness`'s **count of tiles
+actually brute-forced** (zero would mean it proved nothing about the new wiring, and it errors on
+that), and the verdict counts compared against `VoxelForge.Determinism.ClassifyTileSoundness`, whose
+difference *is* the T1.d gain.
+
+After that: make `FRoomGraphSource::EffectOverBox` answer spatially. Everything else is now waiting
+on it, and the two commits above were built to receive it.
