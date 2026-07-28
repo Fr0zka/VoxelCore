@@ -2762,3 +2762,91 @@ verbatim. **Measure, then tighten what the numbers name.**
    to look at; pits or chimneys leading would be a surprise worth stopping on.
 2. Whether removing the columns test alone moved `proved` off zero. If it did, that number is the
    first real T1.d saving in the plugin.
+
+## 2026-07-28 — the breakdown refuted MY hypothesis, and found the sampler was the bug
+
+```
+rooms 40, tunnels 40, pits 14, chimneys 0
+Averages per killed tile: 4.9 of 7.2 rooms reach, 69.2 of 80.4 tunnels reach
+```
+
+I predicted "tunnels ≫ rooms ⇒ capsule bounding spheres". **Wrong, or rather insufficient:** tunnels
+*are* wildly over-counted (69 of 80), but **rooms hit all 40 tiles too**, so fixing tunnels alone
+would have moved the number by exactly zero. Fourth hypothesis this refactor has reversed on contact
+with a measurement. The instrument paid for itself on its first run.
+
+### The real finding: the tile sampler never left the (0,0) spine
+
+```cpp
+const int32 Extent = Step * Cells;                    // 1 * 8 = 8
+Rng.RandRange(-4, 4) * Extent                         // XY ∈ [-32, +32] voxels
+```
+
+Against the defaults:
+
+| | |
+|---|---|
+| `RoomSpacing` | **80** — ±32 does not cover half of one room cell |
+| `OriginRoomRadius` | **20**, guaranteed at (0,0); cull radius `max(20·1.5, 8) + 3·4` = **42** |
+| the (0,0) spine | descends exactly there |
+
+So all 40 tiles sat inside the origin room's cull sphere, in the most cave-riddled cubic
+metre of the entire world. `4.9 of 7.2 rooms reach` was not measuring the world's cave density — it
+was measuring the spine hub. **Every conclusion about "is deep rock provable" drawn from that sample
+was answering a different question.**
+
+Widened to ±320 voxels (4 × `RoomSpacing`), and the report now **prints its own sampling extent** plus
+how many tiles landed clear of the spine — because a sampler whose extent you cannot quote is one
+nobody is watching. The brute-force soundness assertion is untouched: this changes what the
+measurement *looks at*, never what it *demands*.
+
+### Why rooms can't be tightened and tunnels can — the arithmetic, before writing any code
+
+With `SDFBlendRadius K = 4`, `WormNetworkRange = 24`, mods gating at `3K = 12`, the strongest useful
+threshold is `T = max(Blend, 3K, WormNetworkRange) = 24`.
+
+`SmoothMin(A,B,K) = min(A,B) − H³K/6`, `H = max(K−|A−B|,0)/K`. Two consequences worth writing down:
+the penalty is **exactly zero** once `|A−B| ≥ K`, and the running minimum therefore **saturates at
+`K` below the true minimum** — so `Sdf ≥ min_i(SDF_i) − K` for **any** number of primitives. That is
+the bound that makes an "`Sdf ≥ T`" criterion possible at all.
+
+Now compare the two possible criteria per primitive:
+
+- **rooms** — cull rejects at `dist > Rmax + 3K` (= 57 worst case). The `Sdf ≥ T+K` criterion rejects
+  only at `dist ≥ Rmax + T + K` (= 73). Since `T + K = 28 > 3K = 12`, **the cull is strictly the
+  better test for rooms.** Nothing to gain; leave them alone.
+- **tunnels** — the cull is the capsule's **bounding sphere**, and with `MaxTunnelLength = 200` that
+  sphere has radius up to ~107 for a tube of radius 7. The `Sdf ≥ T+K` criterion uses the real
+  distance to the segment, so it rejects at `dist(box, segment) ≥ 7 + 28 = 35`. **Order of magnitude
+  tighter**, and sound because `TaperedCapsule` is a genuine distance function
+  (`Dist(P, ClosestOnSegment) − Lerp(Ra,Rb,T)`), verified rather than assumed.
+
+So the eventual fix is a **per-primitive disjunction** — a primitive cannot matter if it fails its
+cull *or* its own SDF stays ≥ `T + K` over the box — applied **only to tunnels**, where the SDF is
+exact. Mixing is sound: primitives failing the cull contribute nothing, the rest are all ≥ `T+K`, so
+the fold is ≥ `T`, and every consumer (converter at `Blend`, twelve mods at `3K`, worm at
+`WormNetworkRange`) is identity at `Sdf ≥ T`.
+
+### NOT done in this build, deliberately
+
+The tunnel disjunction changes what `Identity` *means* here — from "`Sdf` stays `FLT_MAX`" to
+"`Sdf ≥ T`" — and that is only sound if **every** consumer's threshold is ≤ `T`. Three premises still
+need reading rather than assuming: `VF_NearCaveSurface`'s exact constant, the `Blend` actually passed
+to `FSdfConvertOp` by `BuildTunnelNetworkStack`, and whether any modifier re-probes the SDF *outside*
+the box (`FCaveTerraceMod` samples Z±1) before its gate. Any one of those wrong is a hole with no
+collision behind it, and this session has already produced four confident chains that reversed on
+checking. **Fix the measurement first; it costs nothing and it is wrong today.**
+
+### The prediction, stated so the next run can refute it
+
+With the widened sampler: **rooms should stop hitting every tile** (cull spheres of mean radius ~42
+on an 80-lattice cover roughly 60 % of space, so ~40 % of tiles should be clear of all rooms), and
+**tunnels should now be the binding constraint on nearly all of them.** If instead tunnels stay at
+~100 % *and* rooms drop, the tunnel disjunction above is the whole remaining job. If rooms also stay
+at 100 %, my model of the room lattice is wrong and that is the thing to look at next — not the
+tunnels.
+
+### Ready to build. Compile-error spots
+
+`SpanCells` / `SpanVoxelsReported` / `NumTilesAwayFromSpine` are new locals hoisted **outside** the
+tile loop (the report line needs them); `P.OriginRoomRadius` and `P.RoomSpacing` are read in check 4.

@@ -1107,7 +1107,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         int32 NumBruteSamples = 0, NumViolations = 0;
         float WorstViolation = 0.0f;
         TMap<FString, int32> SolidKillerCounts;
-        int32 NumRoomKilled = 0;
+        int32 NumRoomKilled = 0, NumTilesAwayFromSpine = 0;
+        // ±320 voxels = 4 x RoomSpacing. Hors de la boucle : la ligne de rapport en a besoin, et
+        // une étendue d'échantillonnage qu'on ne peut pas citer est une étendue qu'on ne surveille pas.
+        const int32 SpanCells = 40;
+        const int32 SpanVoxelsReported = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
         int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
         int32 SumHitRooms = 0, SumNumRooms = 0, SumHitTunnels = 0, SumNumTunnels = 0;
 
@@ -1116,10 +1120,39 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         {
             const int32 Step = 1, Cells = 8;
             const int32 Extent = Step * Cells;
+
+            // ⚠️ L'ÉTENDUE XY ÉTAIT ±32 VOXELS, ET C'EST CE QUI RENDAIT CE BLOC INEXPLOITABLE.
+            // `RandRange(-4, 4) * 8` échantillonnait 40 tuiles dans un cube de ±32 voxels autour de
+            // (0,0) — c'est-à-dire l'endroit le PLUS creusé du monde entier, et de loin :
+            //   • `RoomSpacing = 80`, donc ±32 ne couvre même pas la moitié d'UNE cellule de salle ;
+            //   • `OriginRoomRadius = 20` garantit une grosse salle exactement à (0,0), de rayon de
+            //     cull `max(20·1.5, 8) + 3·4 = 42` — qui avale la quasi-totalité de la fenêtre ;
+            //   • la spine (0,0) descend précisément là.
+            // La mesure « 4.9 salles sur 7.2 atteignent la boîte » ne décrivait donc pas la densité
+            // de grottes du monde, elle décrivait le hub de la spine. Aucune conclusion sur la
+            // prouvabilité du roc profond ne pouvait sortir de cet échantillon.
+            //
+            // ⚠️ CE N'EST PAS « ÉLARGIR JUSQU'À CE QUE ÇA PASSE ». Le verdict de chaque tuile reste
+            // brute-forcé voxel par voxel juste en dessous : un échantillonneur plus large qui
+            // produirait un verdict FAUX échoue exactement comme avant. On corrige ce que la mesure
+            // REGARDE, pas ce qu'elle exige.
+            //
+            // The XY extent was ±32 voxels around (0,0) -- with RoomSpacing = 80 and a guaranteed
+            // OriginRoomRadius = 20 room at the origin, that samples the single most cave-dense spot
+            // in the world and says nothing about deep rock. Widening changes what the measurement
+            // LOOKS AT, not what it demands: every verdict is still brute-forced below.
             const FIntVector Origin(
-                Rng.RandRange(-4, 4) * Extent,
-                Rng.RandRange(-4, 4) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
                 FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
+
+            // Combien de tuiles échappent vraiment au hub de la spine : sans ce compte, un futur
+            // resserrement de l'étendue redeviendrait invisible.
+            if (FMath::Square((float)Origin.X) + FMath::Square((float)Origin.Y)
+                > FMath::Square(3.0f * P.OriginRoomRadius))
+            {
+                ++NumTilesAwayFromSpine;
+            }
             const int32 GridDim = Cells + 1;
             const FBox Box(
                 FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
@@ -1180,6 +1213,16 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 }
             }
         }
+
+        AddInfo(FString::Printf(
+            TEXT("Tile sampler: 40 tiles of 10 voxels, XY drawn from +/-%d voxels (= %.1f x ")
+            TEXT("RoomSpacing %.0f), Z across the strate; %d of 40 landed further than 3 x ")
+            TEXT("OriginRoomRadius from the (0,0) spine. THIS LINE EXISTS BECAUSE THE SAMPLER WAS ")
+            TEXT("THE BUG ONCE: it drew XY from +/-32 voxels, i.e. entirely inside the origin room's ")
+            TEXT("cull sphere, so every number below described the spine hub rather than the world. ")
+            TEXT("If the last count is low, nothing below says anything about deep rock."),
+            SpanVoxelsReported, (float)SpanVoxelsReported / FMath::Max(P.RoomSpacing, 1.0f),
+            P.RoomSpacing, NumTilesAwayFromSpine));
 
         AddInfo(FString::Printf(
             TEXT("Box verdicts over 40 TunnelNetwork tiles: %d proved (%d AllSolid, %d AllAir), ")
