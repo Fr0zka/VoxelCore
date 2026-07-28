@@ -70,6 +70,23 @@ namespace
     constexpr int32 PointsPerChunk   = 250;
     constexpr int32 NumTunnelSamples = NumTunnelChunks * PointsPerChunk;
 
+    /**
+     * L'empreinte de params que `GetDensityWithParams` exige depuis le correctif d'`AUDIT §C2`.
+     *
+     * ⚠️ CE N'EST PAS DU REMPLISSAGE D'ARGUMENT. Avant ce correctif, l'original clé son cache SDF
+     * sans les params, et le contrôle 3 plus bas explique en détail pourquoi il fallait alors
+     * comparer chaque pile à ELLE-MÊME plutôt qu'à l'original : l'oracle partageait le défaut
+     * testé. En passant la même empreinte que la production, l'oracle ne le partage plus.
+     *
+     * `LayoutVersion = 0` partout dans ce test : le monde de test ne rebâtit jamais son layout en
+     * cours de route, donc la version est constante — ce qui compte ici, c'est que l'empreinte
+     * DIFFÈRE entre deux jeux de params, et c'est exactement ce que la CRC donne.
+     */
+    FORCEINLINE uint32 VF_FP(const FStrateGenerationParams& InP)
+    {
+        return FCrc::MemCrc32(&InP, sizeof(InP));
+    }
+
     //=========================================================================
     // ⚠️ `DisableStageBModifiers` A DISPARU, ET SA DISPARITION EST LE RÉSULTAT DE L'ÉTAPE B
     //=========================================================================
@@ -503,7 +520,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     {
         const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
 
-        const float Old = Gen->GetDensityWithParams(X, Y, Z, P);
+        const float Old = Gen->GetDensityWithParams(X, Y, Z, P, VF_FP(P), 0);
         const float New = Stack.EvalMC(X, Y, Z);
         FullVals[i] = New;
 
@@ -650,7 +667,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             for (int32 i = 0; i < RoughSweepPoints; ++i)
             {
                 const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
-                if (!BitEqual(Gen->GetDensityWithParams(X, Y, Z, PV), VStack.EvalMC(X, Y, Z)))
+                if (!BitEqual(Gen->GetDensityWithParams(X, Y, Z, PV, VF_FP(PV), 0),
+                              VStack.EvalMC(X, Y, Z)))
                 {
                     ++VDiff;
                 }
@@ -819,22 +837,28 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // empreinte CRC des params. Ce bloc le vérifie en ALTERNANT A, B, A, B au même point, le motif
     // qui fait mentir une clé incomplète.
     //
-    // ⚠️⚠️ ON NE COMPARE **PAS** À L'ORIGINAL ICI, ET C'EST LE POINT LE PLUS IMPORTANT DE CE TEST.
-    // `GetDensityWithParams` clé son cache sur (boîte XY, strate, seed) — **sans les params**. En
-    // alternance il rendrait donc, pour B, les salles de A : l'original ÉCHOUERAIT ce contrôle. Le
-    // comparer à lui ici ne mesurerait pas mon opérateur, ça mesurerait son bug. On compare donc
-    // chaque pile à ELLE-MÊME évaluée seule — un oracle qui ne partage pas le défaut testé.
+    // ⚠️⚠️ HISTORIQUE, ET LE DÉNOUEMENT EST DANS LE PARAGRAPHE SUIVANT — À LIRE EN ENTIER.
+    // Ce bloc a été écrit quand `GetDensityWithParams` clé son cache sur (boîte XY, strate, seed),
+    // **sans les params** : en alternance il rendait, pour B, les salles de A, donc l'original
+    // ÉCHOUAIT ce contrôle. Le comparer à lui ici n'aurait pas mesuré l'opérateur, ça aurait mesuré
+    // son bug — d'où le choix de comparer chaque pile à ELLE-MÊME évaluée seule.
     //
-    // ⚠️ ET CE N'EST PEUT-ÊTRE PAS QU'UN ARTEFACT DE TEST — à vérifier, pas à croire. En production
-    // `GetGenerationParams` MÉLANGE les params entre strates voisines (transitions Gradient), donc
-    // deux chunks de Z différents dans la même strate peuvent avoir des params différents, avec la
-    // même boîte XY, le même index de strate et le même seed ⇒ aucune reconstruction. Si c'est
-    // exact, un worker qui descend une bande de transition sert les salles du chunk précédent.
-    // Noté dans `AUDIT §C2` comme SUSPECTÉ, avec le test qui le confirmerait — pas comme prouvé.
+    // ✅ **CE N'ÉTAIT PAS QU'UN ARTEFACT DE TEST, ET C'EST MAINTENANT CORRIGÉ** (2026-07-28). Le
+    // soupçon écrit ici s'est confirmé : `GetGenerationParams` blende les params À L'INTÉRIEUR
+    // d'une strate (`Alpha` = f(chunk Z) en `Gradient`, le défaut), donc deux chunks de Z différents
+    // partageaient boîte XY, index de strate et seed ⇒ aucune reconstruction ⇒ le deuxième chunk
+    // évalué contre les salles du premier. Et comme l'ordre des workers décide lequel est « le
+    // premier », **deux pairs divergeaient depuis la même seed**, ce que §2.6.1 interdit.
+    // `GetDensityWithParams` prend désormais une empreinte de params et une `LayoutVersion`
+    // OBLIGATOIRES (calculées une fois par chunk côté production, `VF_FP` ici).
     //
-    // We compare each stack to ITSELF evaluated alone, not to the original: the original keys its
-    // SDF cache without the params and would fail this check, so comparing against it would measure
-    // its bug rather than this operator.
+    // ⚠️ ON GARDE POURTANT L'ORACLE « CHAQUE PILE CONTRE ELLE-MÊME », et ce n'est pas de la
+    // paresse : il teste la clé de la PILE, qui est une clé distincte de celle de l'original. Les
+    // faire dépendre l'une de l'autre remettrait exactement le couplage qu'on vient de défaire.
+    //
+    // The suspicion recorded here was CONFIRMED and is now fixed: the params fingerprint and layout
+    // version are required arguments. The self-comparison oracle stays, because it tests the STACK's
+    // key, which is a different key from the original's.
     {
         FStrateGenerationParams P2 = P;
         P2.RoomSpacing = P.RoomSpacing * 0.6f;    // une autre disposition de salles
@@ -1059,10 +1083,30 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     }
 
     //=========================================================================
-    // 4. LE VERDICT DE BOÎTE — attendu NUL, et c'est le point
+    // 4. LE VERDICT DE BOÎTE — plus attendu nul, et CHAQUE VERDICT EST BRUTE-FORCÉ
     //=========================================================================
+    // ⚠️ CE BLOC A CHANGÉ DE NATURE LE 2026-07-28, ET IL FAUT SAVOIR POURQUOI.
+    // Il ASSERTAIT `NumProved == 0`. C'était juste tant que `FRoomGraphSource::EffectOverBox`
+    // rendait `Both` inconditionnellement : « zéro » était alors une description honnête de l'état
+    // du portage. Depuis que la source répond SPATIALEMENT, asserter zéro reviendrait à interdire
+    // le gain qu'on vient de construire — et pire, ça transformerait le test en gardien du bug.
+    //
+    // Ce qui le remplace n'est PAS « on enlève l'assertion » : c'est l'assertion qui compte
+    // vraiment, la SOUNDNESS. Un verdict faux ne se voit pas — pas de géométrie, **pas de
+    // collision** — jusqu'à ce qu'un joueur traverse le sol. Donc chaque tuile déclarée prouvée est
+    // ré-évaluée voxel par voxel, et le test échoue si UN seul échantillon contredit le verdict.
+    // Le nombre de tuiles prouvées, lui, est REPORTÉ, pas asserté : c'est une mesure, pas un
+    // contrat (la leçon « coverage is a number, not a boolean »).
+    //
+    // Was: assert zero proved. That was honest while the source answered Both unconditionally; it
+    // would now forbid the very gain this change makes. What replaces it is the assertion that
+    // actually matters — every proved tile is brute-forced voxel by voxel, because a false verdict
+    // means no geometry and NO COLLISION until a player falls through it.
     {
-        int32 NumProved = 0, NumMixed = 0;
+        int32 NumProved = 0, NumMixed = 0, NumSolid = 0, NumAir = 0;
+        int32 NumBruteSamples = 0, NumViolations = 0;
+        float WorstViolation = 0.0f;
+
         FRandomStream Rng(97531);
         for (int32 t = 0; t < 40; ++t)
         {
@@ -1077,21 +1121,56 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
                 FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
 
-            if (Stack.ClassifyBox(Box, Ctx) == EVoxelTileClass::Mixed) { ++NumMixed; }
-            else { ++NumProved; }
+            const EVoxelTileClass Verdict = Stack.ClassifyBox(Box, Ctx);
+            if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
+
+            ++NumProved;
+            const bool bClaimSolid = (Verdict == EVoxelTileClass::AllSolid);
+            if (bClaimSolid) { ++NumSolid; } else { ++NumAir; }
+
+            // BRUTE FORCE — la boîte entière, pas un échantillonnage. `EvalMC` rend la convention
+            // du mesher (négatif = solide), donc « tout solide » veut dire qu'aucun échantillon
+            // n'est du côté air. On teste le SIGNE, c'est-à-dire l'existence d'une traversée
+            // d'isosurface : c'est exactement la propriété sur laquelle le mesher est sauté.
+            for (float Z = (float)Box.Min.Z; Z <= (float)Box.Max.Z; Z += 1.0f)
+            for (float Y = (float)Box.Min.Y; Y <= (float)Box.Max.Y; Y += 1.0f)
+            for (float X = (float)Box.Min.X; X <= (float)Box.Max.X; X += 1.0f)
+            {
+                const float D = Stack.EvalMC(X, Y, Z);
+                ++NumBruteSamples;
+                const bool bViolates = bClaimSolid ? (D > 0.0f) : (D < 0.0f);
+                if (bViolates)
+                {
+                    ++NumViolations;
+                    WorstViolation = FMath::Max(WorstViolation, FMath::Abs(D));
+                }
+            }
         }
 
         AddInfo(FString::Printf(
-            TEXT("Box verdicts over 40 TunnelNetwork tiles: %d proved, %d Mixed. %d proved is the ")
-            TEXT("EXPECTED result at stage A and not a defect: the room source answers Both (its ")
-            TEXT("bounds live in the SDF cache, which it would have to build for the queried box), ")
-            TEXT("and the worm source answers CarveOnly EVERYWHERE because a fielded noise carve ")
-            TEXT("has no spatial bound at all. Recovering these needs the numeric amplitude cap in ")
-            TEXT("OPSTACK-DECOMPOSITION 0.2 -- the largest single perf item in the whole plan, and ")
-            TEXT("the reason this archetype currently skips zero tiles."),
-            NumProved, NumMixed, NumProved));
+            TEXT("Box verdicts over 40 TunnelNetwork tiles: %d proved (%d AllSolid, %d AllAir), ")
+            TEXT("%d Mixed -- brute-forced over %d voxels, %d violations. This number was 0 proved / ")
+            TEXT("40 Mixed until FRoomGraphSource::EffectOverBox learned to answer spatially, and it ")
+            TEXT("is the single largest perf item of the whole plan (OPSTACK-DECOMPOSITION 0.2): a ")
+            TEXT("proved tile skips GenerateMesh entirely, so it trades one BuildChunkCache against ")
+            TEXT("30000+ density evaluations. Read the PROVED count as a measurement, never as a ")
+            TEXT("contract -- what is asserted below is that none of them is WRONG, because a false ")
+            TEXT("verdict leaves no geometry and no collision behind it."),
+            NumProved, NumSolid, NumAir, NumMixed, NumBruteSamples, NumViolations));
 
-        TestEqual(TEXT("stage A emits no unsound verdict (it emits none at all)"), NumProved, 0);
+        if (NumProved == 0)
+        {
+            AddWarning(TEXT("No TunnelNetwork tile was proved. That is not a failure, but it means ")
+                       TEXT("this check verified nothing: the brute force below has no verdict to ")
+                       TEXT("contradict. Either the sampled tiles all genuinely straddle cave, or ")
+                       TEXT("the spatial EffectOverBox is not reaching its Identity branch -- the ")
+                       TEXT("bake-coverage line of check 5b is the one that tells those apart."));
+        }
+
+        TestEqual(FString::Printf(
+                      TEXT("every proved TunnelNetwork tile survives brute force (worst |density| ")
+                      TEXT("on the wrong side: %.9g)"), WorstViolation),
+                  NumViolations, 0);
     }
 
     //=========================================================================
@@ -1172,7 +1251,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             for (int32 i = 0; i < UWSamples; ++i)
             {
                 const float X = (float)UWPoints[i].X, Y = (float)UWPoints[i].Y, Z = (float)UWPoints[i].Z;
-                const float Old = Gen->GetDensityWithParams(X, Y, Z, UP);
+                const float Old = Gen->GetDensityWithParams(X, Y, Z, UP, VF_FP(UP), 0);
                 const float New = UWStack.EvalMC(X, Y, Z);
                 if (Z > UWInnerBot && Z < UWInnerTop && Old >= 0.0f) { ++UWInCave; }
                 if (!BitEqual(Old, New))

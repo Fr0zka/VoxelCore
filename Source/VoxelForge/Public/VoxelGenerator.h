@@ -118,9 +118,35 @@ public:
      * Densité pour une strate TunnelNetwork (rooms + tunnels + worm noise).
      * Utilisée en interne par GetDensityAt quand la strate est de ce type.
      * Exposée pour permettre des tests isolés avec des params custom.
+     *
+     * ⚠️ `ParamsFingerprint` ET `LayoutVersion` SONT OBLIGATOIRES, ET C'EST LE CORRECTIF
+     * D'`AUDIT §C2` (2026-07-28). Le cache SDF interne est clé sur (boîte XY, strate, seed) et
+     * PAS sur les params. Or `GetGenerationParams` BLENDE les params à l'intérieur d'une même
+     * strate — `Alpha` dépend du chunk Z en mode `Gradient` (le DÉFAUT, avec
+     * `TransitionBlendChunks = 2`) et du chunk XY en plus en mode `Interleaved`. Deux chunks de la
+     * même strate, même seed, donc même clé, mais des params DIFFÉRENTS : le worker évalue le
+     * deuxième chunk qu'il construit contre les salles du premier. Et comme *quel* chunk vient en
+     * premier dépend de l'ordre des workers, **deux pairs divergent depuis la même seed** — ce que
+     * `OPSTACK-PLAN §2.6.1` interdit explicitement.
+     *
+     * Pourquoi une empreinte PASSÉE plutôt qu'un `MemCrc32` calculé ici : ce serait ~300 octets de
+     * CRC PAR VOXEL sur le chemin le plus chaud du plugin. L'appelant la calcule UNE fois par
+     * chunk, là où le mémo de params vit déjà (`CP_*`), donc le coût par voxel est exactement deux
+     * comparaisons d'entiers. Pas de valeur par défaut : un appelant qui oublie doit ne pas
+     * compiler, pas hériter silencieusement du trou (la discipline de `FVoxelOpContext`).
+     *
+     * ⚠️ POUR LES TESTS : passez `FCrc::MemCrc32(&Params, sizeof(Params))`. Un oracle qui partage
+     * le défaut qu'il teste ne prouve rien — c'est précisément ce que la note de
+     * `VoxelForgeOpStackTunnelTest.cpp` (contrôle 3) décrivait comme le trou de l'original.
+     *
+     * The SDF cache key had neither the params nor anything that determines them, while the params
+     * are blended per chunk INSIDE a strate — so a worker could evaluate one chunk against another
+     * chunk's rooms, and which came first depends on worker order. Passing a once-per-chunk
+     * fingerprint keeps the fix off the per-voxel path. No default: forgetting it must not compile.
      */
     float GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
-                               const FStrateGenerationParams& Params) const;
+                               const FStrateGenerationParams& Params,
+                               uint32 ParamsFingerprint, uint32 LayoutVersion) const;
 
     /**
      * Densité pour une strate Slab (FlatPlain / CrystalChamber).

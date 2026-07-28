@@ -582,6 +582,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FIntVector              CP_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
         thread_local ECaveGeneratorType      CP_GenType = ECaveGeneratorType::TunnelNetwork;
         thread_local FStrateGenerationParams CP_Tunnel;
+        // AUDIT §C2 — empreinte de `CP_Tunnel`, rafraîchie avec lui. Elle voyage jusqu'à la clé du
+        // cache SDF de `GetDensityWithParams` pour qu'un chunk ne puisse plus être évalué contre
+        // les salles d'un chunk voisin aux params blendés différemment.
+        thread_local uint32                 CP_TunnelFP = 0xFFFFFFFFu;
         thread_local FSlabGenerationParams   CP_Slab;
         thread_local FMazeGenerationParams   CP_Maze;
         thread_local FSurfaceGenerationParams CP_Surface;
@@ -639,7 +643,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             case ECaveGeneratorType::FloatingIslands:
                 CP_Float   = StrateManager->GetFloatingIslandParamsForChunk(ChunkCoord);  break;
             default: // TunnelNetwork / Underwater
-                CP_Tunnel  = StrateManager->GetGenerationParams(ChunkCoord);              break;
+                CP_Tunnel  = StrateManager->GetGenerationParams(ChunkCoord);
+                // AUDIT §C2 — l'empreinte est calculée ICI, une fois par chunk, au seul endroit où
+                // les params changent. `FStrateGenerationParams` est du POD pur (aucun TArray /
+                // FString / pointeur), donc une CRC mémoire ne peut pas donner de FAUX POSITIF ; au
+                // pire un octet de padding donne un faux MANQUE, c'est-à-dire une reconstruction de
+                // cache. On se trompe du côté du CPU, jamais du côté d'une salle fausse.
+                CP_TunnelFP = FCrc::MemCrc32(&CP_Tunnel, sizeof(CP_Tunnel));
+                break;
             }
             CP_Dist = StrateManager->GetDisturbanceParamsForChunk(ChunkCoord);
 
@@ -754,7 +765,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         case ECaveGeneratorType::TunnelNetwork:
         default:
             // Underwater shares tunnel rock (water table is a render-side overlay).
-            Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel);         break;
+            Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
+                                          CP_TunnelFP, LayoutVersion);                break;
         }
 
         // Disturbance layer (the "wow" post-process) — cached params, MC convention.
@@ -764,8 +776,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     {
         // ── FALLBACK (no strate manager) ──
         // Use default TunnelNetwork params — produces generic caves.
-        FStrateGenerationParams FallbackParams;
-        Result = GetDensityWithParams(WorldX, WorldY, WorldZ, FallbackParams);
+        // `static` : ces params sont constants (construction par défaut), donc leur empreinte l'est
+        // aussi. La calculer une fois évite un CRC par voxel sur un chemin qui n'en a aucun besoin.
+        // `LayoutVersion = 0` : sans `StrateManager` il n'y a pas de layout, donc rien qui puisse
+        // périmer — et l'empreinte constante suffit à distinguer ce cache de tous les autres.
+        static const FStrateGenerationParams FallbackParams;
+        static const uint32 FallbackFP = FCrc::MemCrc32(&FallbackParams, sizeof(FallbackParams));
+        Result = GetDensityWithParams(WorldX, WorldY, WorldZ, FallbackParams, FallbackFP, 0);
     }
 
     //=========================================================================
@@ -813,7 +830,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 }
 
 float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
-                                             const FStrateGenerationParams& Params) const
+                                             const FStrateGenerationParams& Params,
+                                             uint32 ParamsFingerprint, uint32 LayoutVersion) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -930,6 +948,20 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     thread_local float CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
     thread_local int32 CachedStrate = INT32_MIN;
     thread_local uint32 CachedSeed = 0;
+    // ⚠️ AUDIT §C2 (corrigé le 2026-07-28). Les deux lignes qui manquaient à cette clé.
+    // La clé ci-dessus décrit la GÉOMÉTRIE de la fenêtre (boîte, strate, seed) et rien de ce qui
+    // détermine les PARAMS avec lesquels les salles ont été cuites. Comme `GetGenerationParams`
+    // blende à l'intérieur d'une strate (`Alpha` = f(chunk Z), et f(chunk XY) aussi en
+    // `Interleaved`), deux chunks voisins produisent la MÊME clé avec des params DIFFÉRENTS, et le
+    // deuxième se sert des salles du premier. Non déterministe entre pairs, parce que l'ordre des
+    // workers décide lequel est « le premier » — exactement ce que §2.6.1 interdit.
+    //
+    // Pourquoi ça ne casse PAS l'invariant de perf de §8.10 : la clé reste une BOÎTE, donc les
+    // sondes de gradient à `WorldX ± 1` ne font toujours pas tourner le cache. Ce qui le fait
+    // tourner en plus, c'est un changement RÉEL de params — une fois par chunk dans une bande de
+    // transition, ce qui est le nombre de reconstructions que ce cache aurait toujours dû faire.
+    thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
+    thread_local uint32 CachedLayout      = 0xFFFFFFFFu;
 
     // Index of the room with the smallest (most-inside) SDF for this voxel.
     // Written by EvaluateSDFCached, read by the terrain ops block to pick the
@@ -968,6 +1000,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // cached search box, or the strate/seed changed.
         const bool bNeedRebuild =
             StrateIdx != CachedStrate || (uint32)Seed != CachedSeed ||
+            ParamsFingerprint != CachedFingerprint || LayoutVersion != CachedLayout ||
             WarpedX < CachedSMinX || WarpedX > CachedSMaxX ||
             WarpedY < CachedSMinY || WarpedY > CachedSMaxY;
 
@@ -1011,6 +1044,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             CachedSMinY = SMinY; CachedSMaxY = SMaxY;
             CachedStrate = StrateIdx;
             CachedSeed = (uint32)Seed;
+            CachedFingerprint = ParamsFingerprint;
+            CachedLayout      = LayoutVersion;
         }
 
         // Evaluate SDF using cached rooms and tunnels (WARPED coordinates).

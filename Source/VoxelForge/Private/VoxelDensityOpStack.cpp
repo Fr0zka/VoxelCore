@@ -2124,25 +2124,273 @@ namespace
             InOut.Sdf = CaveSDF;
         }
 
-        /**
-         * ⚠️ `Both` POUR L'INSTANT, ET C'EST UNE DETTE ASSUMÉE, PAS UN OUBLI.
-         *
-         * Les bornes existent pourtant : `FCachedRoom` / `FCachedTunnel` portent déjà leurs
-         * `Bound*` (c'est ce dont `§2` dit qu'il rend le bedrock profond prouvable, « le plus gros
-         * poste de perf de tout le plan »). Ce qui manque, c'est que répondre honnêtement demande de
-         * consulter le cache — donc de le CONSTRUIRE pour la boîte interrogée, sur le thread qui
-         * interroge, ce qui n'est raisonnable qu'une fois `ClassifyBox` réellement branché dans
-         * `ClassifyTile` (il ne l'est toujours pas). Rendre `Both` coûte du CPU et ne peut pas faire
-         * de trou ; rendre le mauvais en ferait un.
-         *
-         * Conservative placeholder: the room/tunnel bounds needed for a real answer are already in
-         * the cache, but answering means building that cache for the queried box, which only pays
-         * once ClassifyTile actually consumes ClassifyBox. Both is always safe.
-         */
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        //---------------------------------------------------------------------
+        // L'ÉTAT PAR BOÎTE — SÉPARÉ DE `FState`, ET DÉLIBÉRÉMENT
+        //---------------------------------------------------------------------
+        // `EffectOverBox` construit un cache pour la boîte INTERROGÉE, qui n'est pas la boîte de
+        // recherche que `Eval` construit pour le voxel courant. Les faire partager `FState::Cache`
+        // serait *correct* — la discipline d'invariance de fenêtre de §8.4 garantit qu'un cache bâti
+        // sur une boîte PLUS LARGE donne le même SDF par voxel — mais ça rendrait `ClassifyTile`
+        // capable de perturber le cache chaud d'une génération en cours, et un jour quelqu'un
+        // paierait cette élégance très cher. Un deuxième cache par worker coûte une allocation
+        // amortie ; on la paie.
+        //
+        // Le VERDICT est mémoïsé, et ce n'est pas du confort : `VF_NoCaveOverBox` fait poser la
+        // question par les DOUZE modificateurs de détail pour la même boîte. Sans mémo, une tuile
+        // coûterait treize `BuildChunkCache` au lieu d'un.
+        //
+        // Second per-worker cache, on purpose: sharing FState::Cache would be sound but would let
+        // tile classification disturb a live generation's hot cache. The verdict is memoised because
+        // all twelve detail modifiers ask the same question about the same box.
+        struct FBoxState
         {
-            return (P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f) ? EVoxelOpEffect::Both
-                                                                  : EVoxelOpEffect::Identity;
+            FChunkSDFCache Cache;
+            FBox   KeyBox = FBox(ForceInit);
+            int32  KeyStrate = INT32_MIN;
+            uint32 KeySeed = 0;
+            uint32 KeyFingerprint = 0xFFFFFFFFu;
+            uint32 KeyLayout = 0xFFFFFFFFu;
+            bool   bValid = false;
+            EVoxelOpEffect Verdict = EVoxelOpEffect::Both;
+        };
+
+        static FBoxState& BoxState()
+        {
+            thread_local FBoxState S;
+            return S;
+        }
+
+        /**
+         * BORNE **PROUVABLE** DE `|Perlin3D|`, ET ELLE N'EST PAS 1.0.
+         *
+         * L'en-tête de `VoxelNoise::Perlin3D` annonce « ~[-1,1] (typiquement [-0.7,0.7]) ». Le `~`
+         * est un aveu : c'est une observation, pas un théorème, et un verdict de boîte fondé sur une
+         * observation est exactement le genre de trou que ce fichier passe son temps à éviter.
+         *
+         * Ce qui EST démontrable, en lisant `GradDot` : il rend `ru + rv` où `ru` et `rv` sont des
+         * composantes de l'offset fractionnaire, donc chacune dans `[-1, 1]` ⇒ `|GradDot| ≤ 2`. La
+         * valeur finale est une interpolation trilinéaire de huit `GradDot`, et une interpolation
+         * convexe ne sort jamais de l'enveloppe de ses entrées ⇒ `|Perlin3D| ≤ 2`. (La vraie borne
+         * de Perlin 3D est `√3/2 ≈ 0.87` ; on ne s'appuie pas dessus, elle dépend du jeu de
+         * gradients.) Se tromper ici coûte une boîte de recherche un peu plus large, jamais un
+         * verdict faux : plus large ⇒ SUR-ensemble de primitives ⇒ `Identity` plus rare.
+         *
+         * Provable bound rather than the header's observed one: GradDot returns ru+rv with both in
+         * [-1,1], and a trilinear lerp stays inside the hull of its inputs. Erring high costs CPU.
+         */
+        static constexpr float PerlinAbsBound = 2.0f;
+
+        /**
+         * ✅ LA RÉPONSE SPATIALE. La dette annoncée ici pendant tout le portage est payée.
+         *
+         * Ce que ça débloque, en un mot : `FSdfConvertOp` renvoie déjà `Identity` (« la source a
+         * répondu pour la paire ») et les douze modificateurs de détail héritent de ce verdict par
+         * `VF_NoCaveOverBox`. Le jour où cette fonction rend `Identity` pour une boîte, **quatorze
+         * opérateurs deviennent l'identité d'un coup** et la tuile est prouvable — c'est pour ça que
+         * le câblage a été posé à UN endroit et pas treize.
+         *
+         * LE CRITÈRE, ET POURQUOI IL NE PEUT ÊTRE FAUX QUE DANS UN SENS.
+         * `Eval` part de `MinSDF = FLT_MAX` et ne l'abaisse que via une primitive qui SURVIT à son
+         * cull par voxel (sphère 3D pour les salles et les tunnels, bornes Z + cercle XY pour les
+         * pits et les cheminées). Donc : si AUCUNE primitive du cache ne peut survivre à son cull en
+         * un point quelconque de la boîte, `Sdf` reste `FLT_MAX` sur TOUTE la boîte, la source est
+         * l'identité, et tout ce qui en dépend l'est aussi. On teste exactement ça — la même
+         * inégalité que le cull par voxel, élevée du point à la boîte. Une seule raison d'échouer.
+         *
+         * LES TROIS CHOSES QUI RENDENT LE TEST CONSERVATIF DU BON CÔTÉ :
+         *  1. le warp déplace la coordonnée de REQUÊTE, donc la boîte est dilatée de sa borne
+         *     prouvable avant d'être confrontée aux salles et aux tunnels ;
+         *  2. les pits et les cheminées sont interrogés en coordonnées RÉELLES (voir `Eval`), donc
+         *     ils sont confrontés à la boîte NON dilatée — la dilater serait juste plus prudent, ne
+         *     pas la dilater pour eux serait faux ;
+         *  3. la boîte de recherche du cache est PLUS LARGE que celle de `Eval`, ce qui donne un
+         *     SUR-ensemble de primitives : si rien n'atteint la boîte ici, rien ne l'atteint là-bas.
+         *
+         * The criterion is the per-voxel cull lifted from point to box: if no cached primitive can
+         * survive its own cull anywhere in the box, Sdf stays FLT_MAX across the whole box and the
+         * source — with the converter and all twelve modifiers behind it — is the identity.
+         */
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return EVoxelOpEffect::Identity; }
+
+            //-----------------------------------------------------------------
+            // 1. LA BOÎTE DOIT TENIR DANS UNE SEULE STRATE, PARAMS COMPRIS
+            //-----------------------------------------------------------------
+            // ⚠️ C'est la moitié « boîte » de la garde d'AUDIT §C2. `Eval` résout l'index de strate
+            // et le pool d'ops PAR CHUNK ; une boîte qui traverse une frontière verrait donc deux
+            // graphes de salles différents, et un cache unique n'en représenterait aucun. On ne
+            // devine pas lequel : on rend `Both`. Ça arrive au plus sur les tuiles de bord.
+            const int32 CZ0 = FMath::FloorToInt((float)VoxelBox.Min.Z / (float)CHUNK_SIZE);
+            const int32 CZ1 = FMath::FloorToInt((float)VoxelBox.Max.Z / (float)CHUNK_SIZE);
+            const int32 CX0 = FMath::FloorToInt((float)VoxelBox.Min.X / (float)CHUNK_SIZE);
+            const int32 CX1 = FMath::FloorToInt((float)VoxelBox.Max.X / (float)CHUNK_SIZE);
+            const int32 CY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / (float)CHUNK_SIZE);
+            const int32 CY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / (float)CHUNK_SIZE);
+
+            // Une boîte qui couvre des dizaines de chunks n'est de toute façon jamais prouvable ;
+            // la borne évite qu'un appelant futur transforme ce test en boucle coûteuse.
+            if ((int64)(CX1 - CX0 + 1) * (CY1 - CY0 + 1) * (CZ1 - CZ0 + 1) > 64)
+            {
+                return EVoxelOpEffect::Both;
+            }
+
+            int32 StrateIdx = 0;
+            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+            if (Manager)
+            {
+                StrateIdx = Manager->GetStrateIndex(((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+                for (int32 CZ = CZ0 + 1; CZ <= CZ1; ++CZ)
+                {
+                    if (Manager->GetStrateIndex(((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
+                    {
+                        return EVoxelOpEffect::Both;
+                    }
+                }
+
+                // ⚠️ LE POOL D'OPS FAIT PARTIE DE LA GÉOMÉTRIE, contrairement à ce qu'on croit en
+                // lisant `FCachedRoom` : `BuildChunkCache` s'en sert pour cuire les PITS et les
+                // CHEMINÉES (`OpParams` y lit `PitDensity`, `PitMinRadius`…). Passer `nullptr`
+                // « puisque la forme des salles n'en dépend pas » sous-bornerait le cache et
+                // pourrait rendre `Identity` au-dessus d'un pit réel. Un trou, exactement.
+                UVoxelStrateDefinition* Def0 = Manager->GetStrateForChunk(FIntVector(CX0, CY0, CZ0));
+                for (int32 CZ = CZ0; CZ <= CZ1; ++CZ)
+                for (int32 CY = CY0; CY <= CY1; ++CY)
+                for (int32 CX = CX0; CX <= CX1; ++CX)
+                {
+                    if (Manager->GetStrateForChunk(FIntVector(CX, CY, CZ)) != Def0)
+                    {
+                        return EVoxelOpEffect::Both;
+                    }
+                }
+                if (Def0) { TerrainOps = &Def0->TerrainOperations; }
+            }
+
+            //-----------------------------------------------------------------
+            // 2. LE MÉMO — clé complète (§C2 : jamais de clé sans params ni LayoutVersion)
+            //-----------------------------------------------------------------
+            // `Ctx.LayoutVersion` plutôt que le membre rempli par `PrepareChunk` : rien ne garantit
+            // qu'un appelant de `ClassifyBox` ait ouvert un chunk, et une version périmée dans une
+            // clé de cache est précisément la régression du 2026-07-27.
+            const uint32 LV = Ctx.LayoutVersion;
+
+            FBoxState& B = BoxState();
+            if (B.bValid && B.KeyBox == VoxelBox && B.KeyStrate == StrateIdx
+                && B.KeySeed == SeedU && B.KeyFingerprint == ParamsFingerprint && B.KeyLayout == LV)
+            {
+                return B.Verdict;
+            }
+
+            //-----------------------------------------------------------------
+            // 3. LE CACHE POUR LA BOÎTE INTERROGÉE
+            //-----------------------------------------------------------------
+            const float Warp = (P.CaveWarpStrength > 0.0f)
+                             ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * PerlinAbsBound
+                             : 0.0f;
+
+            // `+ 2` : la même marge de gradient que la boîte de recherche de `Eval`.
+            VoxelCaveMorphology::BuildChunkCache(
+                B.Cache,
+                (float)VoxelBox.Min.X - Warp - 2.0f, (float)VoxelBox.Min.Y - Warp - 2.0f,
+                (float)VoxelBox.Max.X + Warp + 2.0f, (float)VoxelBox.Max.Y + Warp + 2.0f,
+                P, SeedU, StrateIdx, TerrainOps);
+
+            //-----------------------------------------------------------------
+            // 4. LE CULL PAR VOXEL, ÉLEVÉ DU POINT À LA BOÎTE
+            //-----------------------------------------------------------------
+            // Espace de REQUÊTE des salles et des tunnels : XY dilaté du warp, Z passé par `EffZ`
+            // (monotone croissante tant que `VerticalScale > 0`, donc min et max se conservent)
+            // puis dilaté du warp lui aussi — `Eval` warpe bien les trois axes.
+            const FVector QMin((float)VoxelBox.Min.X - Warp,
+                               (float)VoxelBox.Min.Y - Warp,
+                               EffZ((float)VoxelBox.Min.Z) - Warp);
+            const FVector QMax((float)VoxelBox.Max.X + Warp,
+                               (float)VoxelBox.Max.Y + Warp,
+                               EffZ((float)VoxelBox.Max.Z) + Warp);
+
+            auto SphereHitsBox = [](const FVector& C, float RSq, const FVector& Mn, const FVector& Mx)
+            {
+                const float dx = FMath::Max3((float)(Mn.X - C.X), 0.0f, (float)(C.X - Mx.X));
+                const float dy = FMath::Max3((float)(Mn.Y - C.Y), 0.0f, (float)(C.Y - Mx.Y));
+                const float dz = FMath::Max3((float)(Mn.Z - C.Z), 0.0f, (float)(C.Z - Mx.Z));
+                return (dx * dx + dy * dy + dz * dz) <= RSq;
+            };
+
+            // Pits, cheminées et colonnes : coordonnées RÉELLES, donc boîte NON dilatée.
+            const float RMinX = (float)VoxelBox.Min.X, RMaxX = (float)VoxelBox.Max.X;
+            const float RMinY = (float)VoxelBox.Min.Y, RMaxY = (float)VoxelBox.Max.Y;
+            const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
+
+            auto CircleHitsBoxXY = [&](float CX, float CY, float RSq)
+            {
+                const float dx = FMath::Max3(RMinX - CX, 0.0f, CX - RMaxX);
+                const float dy = FMath::Max3(RMinY - CY, 0.0f, CY - RMaxY);
+                return (dx * dx + dy * dy) <= RSq;
+            };
+
+            bool bReached = false;
+
+            for (const FCachedRoom& R : B.Cache.Rooms)
+            {
+                if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { bReached = true; break; }
+            }
+            if (!bReached)
+            {
+                for (const FCachedTunnel& T : B.Cache.Tunnels)
+                {
+                    if (SphereHitsBox(T.BoundCenter, T.BoundRadiusSq, QMin, QMax)) { bReached = true; break; }
+                }
+            }
+            if (!bReached)
+            {
+                // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
+                // `Z >= TopZ - Depth - BlendK`.
+                for (const FCachedPit& Pit : B.Cache.Pits)
+                {
+                    if (!(RMinZ < Pit.TopZ + Pit.BlendK))                 { continue; }
+                    if (!(RMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK))    { continue; }
+                    if (CircleHitsBoxXY(Pit.CenterX, Pit.CenterY, Pit.BoundXYRadiusSq))
+                    {
+                        bReached = true; break;
+                    }
+                }
+            }
+            if (!bReached)
+            {
+                // Miroir exact : actif si `Z > BottomZ - BlendK` ET `Z <= BottomZ + Height + BlendK`.
+                for (const FCachedChimney& Ch : B.Cache.Chimneys)
+                {
+                    if (!(RMaxZ > Ch.BottomZ - Ch.BlendK))                  { continue; }
+                    if (!(RMinZ <= Ch.BottomZ + Ch.Height + Ch.BlendK))     { continue; }
+                    if (CircleHitsBoxXY(Ch.CenterX, Ch.CenterY, Ch.BoundXYRadiusSq))
+                    {
+                        bReached = true; break;
+                    }
+                }
+            }
+            if (!bReached)
+            {
+                // Les colonnes ne sont pas lues par CETTE source (c'est `FRoomColumnMod`, STEP 4d,
+                // qui parcourt `GetCache()`), mais elles héritent de ce verdict. Elles n'ont aucune
+                // borne en Z dans le cache : on les traite donc comme des cylindres infinis, ce qui
+                // est le test le plus prudent qu'on puisse écrire à partir de ce qui est stocké.
+                for (const FCachedColumn& Col : B.Cache.Columns)
+                {
+                    if (CircleHitsBoxXY(Col.CenterX, Col.CenterY, Col.BoundXYRadiusSq))
+                    {
+                        bReached = true; break;
+                    }
+                }
+            }
+
+            B.Verdict = bReached ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+            B.KeyBox = VoxelBox;
+            B.KeyStrate = StrateIdx;
+            B.KeySeed = SeedU;
+            B.KeyFingerprint = ParamsFingerprint;
+            B.KeyLayout = LV;
+            B.bValid = true;
+            return B.Verdict;
         }
 
     private:

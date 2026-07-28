@@ -2467,3 +2467,119 @@ building that cache for the queried box, and that is now clearly worth it — a 
 30 000+ density evaluations, `ClassifyTile` consumes `ClassifyBox` in production, the numeric
 amplitude fold is in place, and the twelve modifiers already inherit the source's verdict. Every
 piece is built to receive it and nothing else moves until it lands.
+
+## 2026-07-28 — the Underwater 0% is EXPLAINED, and `EffectOverBox` answers spatially. **UNBUILT.**
+
+Two things, in the order the handoff asked for them. The first cost one file read; the second is the
+piece everything has been waiting on since stage A.
+
+### 1. The one number — read, not inferred
+
+`Saved/Automation/Automation2026.07.28-14.30.37.csv`, the run Jahni had already made:
+
+```
+Underwater (C2) ..... bit-identical, 6000 samples in 24 chunks — 94 in open cave (1.6%)   was 0.0%
+Underwater diagnosis  strate index 7, voxel Z [-1440, -1313], seal-free interior (-1436, -1316);
+                      5600 of 6000 samples inside that interior;
+                      bake: 54 rooms, 28 pits, 17 chimneys, 25 columns over 6 search boxes
+```
+
+**The truncation WAS the cause.** All three counters of check 5b came back the way the "it's the Z
+range" hypothesis predicts: the bake is alive (54 rooms — never the problem), and the interior count
+is now 93 % where the whole point of the bug was that `Z / CHUNK_SIZE` truncating toward zero in
+negative Z shoved samples into the top seal band. `FloorDivChunk` moved them back. **Section closed.**
+
+One honest caveat, because the number deserves to be read rather than celebrated: **1.6 % is not
+16.7 %.** TunnelNetwork's cave coverage carries a 10 % floor; Underwater's guard trips only at
+**zero** (`if (UWInCave == 0)`), which is the exact shape the project's own lesson warns about — *a
+guard that only trips at zero notices absence, it does not measure coverage.* 94 samples genuinely
+exercise the carve, so the bit-identity now means something; it means about a tenth as much as
+TunnelNetwork's. Per the diagnosis line's own reading key (rooms > 0, interior high) the residual
+thinness is the **XY spread**. Not chased — the criterion for closing was non-zero, and it is a
+counter to tighten when someone is next in this file, not a bug.
+
+### 2. `FRoomGraphSource::EffectOverBox` answers spatially — the debt is paid
+
+The chain no longer dies at the room source. The criterion is the **per-voxel cull lifted from point
+to box**, which is the one formulation that can fail for exactly one reason:
+
+> `Eval` starts at `MinSDF = FLT_MAX` and only lowers it through a primitive that survives its own
+> cull. So if no cached primitive can survive its cull *anywhere in the box*, `Sdf` stays `FLT_MAX`
+> across the whole box — the source is the identity, and so is everything behind it.
+
+"Everything behind it" is not a figure of speech: `FSdfConvertOp` already returns `Identity` ("la
+source a répondu pour la paire") and the twelve detail modifiers already inherit through
+`VF_NoCaveOverBox`. **One function learned to answer and fourteen operators became provable.** That
+is what the C1 wiring was for, and it is the first time the "one place, not thirteen" bet has paid.
+
+What it does, in order: reject boxes spanning two strates or two op pools (`Both`); memoise the
+verdict (all twelve modifiers ask the *same* question about the *same* box — without the memo a tile
+would cost thirteen `BuildChunkCache` instead of one); build the cache for the queried box into a
+**second per-worker cache**, never `FState::Cache`, so classification cannot disturb a live
+generation; then test rooms and tunnels as spheres against the warp-dilated box, pits and chimneys
+against the **undilated** box (they are queried in real coordinates — dilating them would be merely
+cautious, *not* dilating them would be wrong), and columns as infinite cylinders.
+
+Three things chosen deliberately, all erring toward CPU:
+
+- **`|Perlin3D| <= 2`, not `<= 1`.** The header says "~[-1,1] (typically [-0.7,0.7])" — that `~` is an
+  observation, and a box verdict resting on an observation is the hole this file spends its life
+  avoiding. What is *provable* from reading `GradDot`: it returns `ru + rv` with both in `[-1,1]`, and
+  a trilinear lerp never leaves the hull of its inputs. So the warp dilation uses 2, roughly 3x the
+  real displacement. Costs a wider search box; cannot cost a verdict.
+- **The op pool is passed to `BuildChunkCache`, not `nullptr`.** Tempting to skip it "since room
+  geometry doesn't depend on it" — and false. The bake reads `OpParams` to place **pits and
+  chimneys**. Passing `nullptr` would under-bound the cache and could return `Identity` over a real
+  pit. That is precisely a hole, and it is the same trap as `ColumnDensity = 0` not disabling columns.
+- **The search box is wider than `Eval`'s**, which yields a *superset* of primitives — so "nothing
+  reaches the box here" implies "nothing reaches it there".
+
+### 3. `AUDIT §C2` fixed on the `switch` path — and the obvious fix was the wrong one
+
+`GetDensityWithParams` now takes **required** `ParamsFingerprint` + `LayoutVersion`. Details and the
+reasoning are in `AUDIT §C2`; the part worth repeating here is why the alternative that section used
+to recommend ("just add chunk Z to the key") is both insufficient and destructive: `Interleaved`
+makes `Alpha` depend on chunk **XY** as well, and chunk XY is deliberately *not* in the key — the box
+outlives the chunk so `WorldX ± 1` gradient probes don't thrash it (`§8.10`). Pinning XY to fix params
+would have traded a determinism bug for a perf regression. The CRC is taken **once per chunk** where
+the params memo already lives, so the per-voxel cost is two integer compares.
+
+The three test call sites now pass `VF_FP(P)`, so the oracle stops sharing the defect it tests.
+
+### 4. The other debt, `FLayerLineMod` / `LocalParams` — **dormant, and the premise was slightly off**
+
+The handoff said this had to be paid before `EffectOverBox` landed, because a per-room op can raise a
+modifier's amplitude above what the strate params claim. Checked before paying it, and the check
+reverses the conclusion — the fifth time this refactor that has happened:
+
+- when the source proves `Identity`, all twelve modifiers return `Identity` **soundly**: their
+  per-voxel gate is `bNearCaveSurface`, which is false everywhere in the box no matter what any room
+  op says. The room op cannot enable a gate that never opens.
+- when the source answers `Both`, it supplies **no** `MaxCarveOverBox`, so the default `FLT_MAX`
+  removes the whole margin and nothing is provable regardless of what the modifiers claim.
+
+So there is no reachable path today where an over-optimistic modifier bound changes a verdict. **The
+debt goes live the day `FRoomGraphSource` gains a `MaxCarveOverBox`** — bounding the converter's
+`2·BaseDensity` would make the modifiers' own numbers matter for the first time. That is now written
+at the site rather than in a handoff.
+
+### Ready to build. Likely compile-error spots, worst first
+
+1. `GetDensityWithParams` signature — 2 production call sites + 3 in `VoxelForgeOpStackTunnelTest.cpp`
+   are updated; **any other caller I missed will fail to compile, which is the intent.**
+2. `FCrc::MemCrc32` in `VoxelGenerator.cpp` and the test — reachable transitively in
+   `VoxelDensityOpStack.cpp` today, so it should resolve, but `#include "Misc/Crc.h"` is the fix.
+3. `FBoxState` / `BoxState()` / `PerlinAbsBound` are new members of `FRoomGraphSource`, inserted
+   INSIDE the class (not near the FACTORIES banner — the mistake this file warns about twice).
+4. `FBox::operator==` on `B.KeyBox == VoxelBox`.
+5. The rewritten check 4 uses `EVoxelTileClass::AllSolid` / `AllAir` and a triple `float` loop.
+
+### What to read in the results
+
+- **`Box verdicts over 40 TunnelNetwork tiles`** — this line no longer asserts `0 proved`. It asserts
+  that **no proved tile is wrong under brute force**, and reports the count. A non-zero proved count
+  is the T1.d prize arriving; a zero count now emits a *warning* saying the check verified nothing,
+  because a soundness check with no verdicts to contradict is vacuous.
+- Everything else should be **unchanged and green**. The §C2 fix changes generated terrain only
+  inside transition bands on the `switch` path (where it was previously order-dependent, i.e. not
+  well-defined), so an equivalence test that moves is a real signal, not expected noise.
