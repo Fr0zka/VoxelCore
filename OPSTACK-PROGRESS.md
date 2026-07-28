@@ -2935,3 +2935,95 @@ real T1.d saving in the plugin. If it is *also* zero, then the per-class line un
 rooms still saturate at 80 spacing (my model is wrong again, look there) or whether tunnels are
 finally alone (the segment-vs-box disjunction from the previous entry is then the whole remaining
 job, and its three unverified premises are listed there).
+
+## 2026-07-28 — ✅ **THE PRIZE LANDED.** 6 of 40 tiles proved, 7986 voxels brute-forced, 0 violations.
+
+```
+[production defaults] Box verdicts over 40 tiles: 6 proved (6 AllSolid, 0 AllAir), 34 Mixed
+                      -- brute-forced over 7986 voxels, 0 violations
+[dense fixture]       0 proved, 40 Mixed                      <- correct, and predicted
+```
+
+**This is the first real T1.d saving in the plugin.** 15 % of tiles skip `GenerateMesh` entirely —
+one `BuildChunkCache` traded against 30 000+ density evaluations each — and not one of those verdicts
+is asserted: all 7986 voxels were re-evaluated through the stack and every single one came back on
+the claimed side. The two-world split also did its job: the dense fixture reported 0, exactly as the
+arithmetic said it must, so the number above is a measurement of *production*, not of a test that was
+widened until it agreed.
+
+Five runs to get here, and the honest summary of them is that **every single one of my hypotheses was
+wrong and every single instrument was right**:
+
+| run | my hypothesis | what the instrument said |
+|---|---|---|
+| 1 | "the tiles straddle cave" / "Identity unreachable" | **the worm**, unbounded `CarveOnly`, `8 < 10` by default |
+| 2 | "tunnels ≫ rooms ⇒ bounding spheres" | rooms hit 40/40 too — fixing tunnels alone changes nothing |
+| 3 | "widen the sampler and rooms will drop" | they did not — `RoomSpacing` was **42**, not the 80 I computed with |
+| 4 | — | the fixture is *deliberately* saturated; `0 proved` is its correct answer |
+| 5 | "production defaults will prove tiles" | **6 of 40**, and now tunnels really are alone (32 vs 21) |
+
+### The tunnel disjunction — the deferred piece, now justified by its own number
+
+The breakdown finally isolated it: of the 34 unproved tiles, **32 were blocked by a tunnel and 21 by
+a room**, so ≥13 were blocked by tunnels *alone*. That is what made the deferred work worth doing, and
+it is why it was deferred until now rather than guessed at three runs ago.
+
+A primitive now fails to matter under a **disjunction**:
+
+> it misses its cull entirely **OR** its own SDF stays ≥ `T + K` over the whole box.
+
+Each branch wins on a different class, and the arithmetic says which:
+
+- **rooms** — cull rejects at `Rmax + 3K`, threshold only at `Rmax + T + K`. Cull is strictly tighter,
+  so rooms keep the cull alone. Not an omission; a calculation.
+- **tunnels** — the cull is the capsule's *bounding sphere*: radius ~107 for a 200-long tube of
+  radius 7. The threshold uses the true distance to the segment. Order of magnitude.
+
+**The bound is exact, not cautious.** `TaperedCapsule` was *read* (`Dist(P, ClosestOnSegment) −
+Lerp(Ra,Rb,t)`), so `SDF ≥ dist(P, segment) − max(Ra,Rb)`; and `dist(box, segment) ≥ dist(centre,
+segment) − half-diagonal` by triangle inequality. `VF_DistPointSegment` is written locally rather than
+taken from `FMath` — five lines, and "I think that function does that" is not good enough under a
+correctness bound.
+
+### ⚠️ `Identity` CHANGED MEANING, and that is the one real debt this creates
+
+It used to mean "`Sdf` stays `FLT_MAX`". It now means "`Sdf ≥ T`", with
+`T = max(3·SDFBlendRadius, WormNetworkRange)`. That is only sound because all three consumers of the
+SDF channel were **read one by one**, not assumed:
+
+| consumer | threshold | verified at |
+|---|---|---|
+| `FSdfConvertOp::Eval` | `Sdf >= Blend`, and `BuildTunnelNetworkStack` passes `MakeSdfCarve(P.SDFBlendRadius, …)` ⇒ **K** | call site |
+| the twelve modifiers | `VF_NearCaveSurface` ⇒ **3K** | its body |
+| `FWormFieldSource::Eval` | `CaveSDF >= WormNetworkRange` ⇒ **WormNetworkRange** | its body |
+
+Plus the one that could have bitten: `FCaveTerraceMod` re-probes the SDF at **Z±1, outside the box** —
+but its `VF_NearCaveSurface` gate is line 13 and the probes are lines 28–29. Gated first, so a gate
+that is false everywhere never emits a probe. Checked, not assumed.
+
+**Any new consumer of the `Sdf` channel must have a threshold ≤ `T` or be added to that `max`.** An
+operator reading `Sdf < 100` would see false `Identity` verdicts, i.e. tiles with no geometry **and no
+collision**. That warning is written at the site, in the function you land in when you add one.
+
+### Why `− K` is enough for any number of primitives
+
+`SmoothMin(A,B,K) = min(A,B) − H³K/6` with `H = max(K−|A−B|,0)/K`. The penalty is **exactly zero**
+once `|A−B| ≥ K`, so the running minimum saturates at `K` below the smallest term — it cannot descend
+further, because at that distance `H = 0` and subsequent folds return it unchanged. Hence
+`Sdf ≥ min_i(SDF_i) − K` for **any** N, not `− N·K/6`. Without that observation the slack would scale
+with the ~88 tunnels in the cache and the criterion would be worthless.
+
+### Ready to build. Compile-error spots
+
+1. `VF_DistPointSegment` — new helper in the anonymous namespace, next to `VF_NearCaveSurface`
+   (i.e. well above the end-of-namespace marker).
+2. `K` / `T` / `TunnelClear` / `QCenter` / `BoxHalfDiag` are new locals in `EffectOverBox`; the tunnel
+   loop variable is `Tn` **specifically so it does not shadow `T`**. Braces and parens verified balanced.
+3. `(QMax - QMin).Size()` returns a double under UE5's `FVector` — cast to float.
+
+### What to read
+
+`[production defaults] Box verdicts` — **6 is the number to beat.** The disjunction should raise it;
+≥13 tiles were tunnel-only blocked, so somewhere near 19 of 40 is the expectation. And
+`[dense fixture]` **must stay at 0** — if the dense world starts proving tiles, the disjunction is
+wrong somewhere and the brute force is the thing that will say so.

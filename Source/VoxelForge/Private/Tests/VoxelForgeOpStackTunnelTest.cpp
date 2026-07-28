@@ -1269,12 +1269,14 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                         TEXT("[%s] ...and when RoomGraphSource is the killer (%d tiles), WHICH primitive class ")
                         TEXT("reaches the box: rooms %d, tunnels %d, pits %d, chimneys %d (tiles, not ")
                         TEXT("primitives -- a tile can be hit by several). Averages per killed tile: ")
-                        TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. THIS is the line that ")
-                        TEXT("says what to tighten. A tunnel is culled per voxel by its BOUNDING SPHERE, ")
-                        TEXT("which for a long thin capsule is an enormous over-estimate; a room's cull ")
-                        TEXT("sphere is a fair fit. So tunnels >> rooms here would mean the box test is ")
-                        TEXT("losing to capsule bounding spheres, not to real cave -- and the fix would ")
-                        TEXT("be a segment-vs-box distance, not anything about the sampler."),
+                        TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. This line named ")
+                        TEXT("the tunnels (32 of 34 tiles vs 21 for rooms), and they have since been ")
+                        TEXT("given a second test: a tunnel now also passes if its own SDF stays >= ")
+                        TEXT("T+K over the box, which beats its bounding-sphere cull badly for a long ")
+                        TEXT("thin capsule. So a tunnel counted HERE is one genuinely close to the ")
+                        TEXT("box, not a bounding-sphere artefact. Rooms keep the cull test alone, ")
+                        TEXT("because for them the cull (Rmax+3K) is tighter than the threshold ")
+                        TEXT("(Rmax+T+K) -- that is arithmetic, not an omission."),
                         Label, NumRoomKilled, TilesHitByRooms, TilesHitByTunnels, TilesHitByPits, TilesHitByChimneys,
                         (float)SumHitRooms   / (float)NumRoomKilled, (float)SumNumRooms   / (float)NumRoomKilled,
                         (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled));

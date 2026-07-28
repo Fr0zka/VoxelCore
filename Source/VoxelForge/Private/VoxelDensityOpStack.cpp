@@ -79,6 +79,19 @@ namespace
     // STAGE B5 DECISION: repeated early-out in each op, NOT a scoping container — the stack is a flat
     // list that ClassifyBox folds op by op, and an op that only exists inside a container is not
     // composable. Cost stated honestly: twelve predictable compares instead of one branch.
+    /** Distance d'un point à un SEGMENT (pas à une droite). Écrite ici plutôt que prise dans
+     *  `FMath` : cinq lignes, aucune ambiguïté d'API, et elle sert une borne de correction — le
+     *  genre d'endroit où « je crois que cette fonction fait ça » n'est pas suffisant. */
+    FORCEINLINE float VF_DistPointSegment(const FVector& P, const FVector& A, const FVector& B)
+    {
+        const FVector AB = B - A;
+        const double LenSq = FVector::DotProduct(AB, AB);
+        const double T = (LenSq > UE_KINDA_SMALL_NUMBER)
+                       ? FMath::Clamp(FVector::DotProduct(P - A, AB) / LenSq, 0.0, 1.0)
+                       : 0.0;
+        return (float)FVector::Dist(P, A + AB * T);
+    }
+
     FORCEINLINE bool VF_NearCaveSurface(float Sdf, float SDFBlendRadius)
     {
         // Transcrit tel quel, ordre des comparaisons compris :
@@ -2205,13 +2218,22 @@ namespace
          * opérateurs deviennent l'identité d'un coup** et la tuile est prouvable — c'est pour ça que
          * le câblage a été posé à UN endroit et pas treize.
          *
-         * LE CRITÈRE, ET POURQUOI IL NE PEUT ÊTRE FAUX QUE DANS UN SENS.
-         * `Eval` part de `MinSDF = FLT_MAX` et ne l'abaisse que via une primitive qui SURVIT à son
-         * cull par voxel (sphère 3D pour les salles et les tunnels, bornes Z + cercle XY pour les
-         * pits et les cheminées). Donc : si AUCUNE primitive du cache ne peut survivre à son cull en
-         * un point quelconque de la boîte, `Sdf` reste `FLT_MAX` sur TOUTE la boîte, la source est
-         * l'identité, et tout ce qui en dépend l'est aussi. On teste exactement ça — la même
-         * inégalité que le cull par voxel, élevée du point à la boîte. Une seule raison d'échouer.
+         * LE CRITÈRE — **UNE PRIMITIVE NE COMPTE PAS SI ELLE RATE SON CULL *OU* SI SON SDF RESTE
+         * AU-DESSUS DU SEUIL `T`.** Une disjonction, pas une seule règle, et chaque branche gagne sur
+         * une classe différente. Le détail de `T` et sa condition de validité sont dans la note
+         * « LE SEUIL T » à l'intérieur de la fonction — la lire avant toute modification.
+         *
+         *  • branche CULL — `Eval` part de `MinSDF = FLT_MAX` et ne l'abaisse que via une primitive
+         *    qui SURVIT à son cull par voxel. Aucune survivante ⇒ `Sdf` reste `FLT_MAX`. C'est la
+         *    même inégalité que le cull, élevée du point à la boîte. **Meilleure pour les salles** :
+         *    leur cull (`Rmax + 3K`) est plus serré que le seuil (`Rmax + T + K`).
+         *  • branche SEUIL — une primitive peut survivre à son cull et rester malgré tout trop loin
+         *    pour qu'un consommateur s'allume. **Meilleure pour les tunnels**, dont le cull est la
+         *    sphère englobante d'une capsule : rayon ~107 pour un tube de rayon 7 long de 200.
+         *
+         * Mélanger les deux est sûr : les primitives de la branche cull ne contribuent RIEN, les
+         * autres sont toutes ≥ `T + K`, donc le pli vaut ≥ `T` (voir la saturation de `SmoothMin`),
+         * et les trois consommateurs sont éteints. Une seule raison d'échouer, dans les deux cas.
          *
          * LES TROIS CHOSES QUI RENDENT LE TEST CONSERVATIF DU BON CÔTÉ :
          *  1. le warp déplace la coordonnée de REQUÊTE, donc la boîte est dilatée de sa borne
@@ -2360,6 +2382,48 @@ namespace
             //
             // No early-out on purpose: stopping at the first hit gives the right verdict and no
             // information. When a zero has several possible causes, each gets its own number.
+            //-----------------------------------------------------------------
+            // ⚠️⚠️ LE SEUIL `T` — CE QUE `Identity` VEUT DIRE ICI, ET SA CONDITION DE VALIDITÉ
+            //-----------------------------------------------------------------
+            // Jusqu'ici `Identity` signifiait « `Sdf` reste `FLT_MAX` sur toute la boîte ». C'est
+            // vrai, mais c'est plus fort que nécessaire, et cette force coûtait la quasi-totalité du
+            // gain : aucun consommateur ne regarde `Sdf` au-delà d'un seuil.
+            //
+            // Les TROIS consommateurs du canal SDF de cette pile, RELUS un par un (pas supposés) :
+            //   • `FSdfConvertOp::Eval`   → `if (InOut.Sdf >= Blend) return;`  et
+            //     `BuildTunnelNetworkStack` l'instancie par `MakeSdfCarve(P.SDFBlendRadius, …)`
+            //     ⇒ seuil = `K`.
+            //   • les DOUZE modificateurs  → `VF_NearCaveSurface` ⇒ seuil = `3·K`.
+            //   • `FWormFieldSource::Eval` → `if (CaveSDF >= P.WormNetworkRange) NetworkMask = 0;`
+            //     puis `if (NetworkMask <= 0) return;` ⇒ seuil = `WormNetworkRange`.
+            // (`FCaveTerraceMod` re-sonde le SDF en Z±1, donc HORS de la boîte — mais son gate
+            //  `VF_NearCaveSurface` est testé AVANT la sonde, vérifié ligne par ligne. Un gate faux
+            //  partout ⇒ aucune sonde n'est jamais émise.)
+            //
+            // Donc `Sdf ≥ T` avec `T = max(K, 3K, WormNetworkRange)` suffit à éteindre les trois.
+            //
+            // ⚠️ **TOUT NOUVEAU CONSOMMATEUR DU CANAL `Sdf` DOIT AVOIR UN SEUIL ≤ T, OU ÊTRE AJOUTÉ
+            // À CE `Max`.** C'est la seule dette de couplage de cette fonction, et elle est réelle :
+            // un opérateur qui regarderait `Sdf < 100` verrait des verdicts `Identity` faux, donc
+            // des tuiles sans géométrie ET SANS COLLISION. Écrit ici parce que c'est ici qu'on
+            // atterrit en l'ajoutant.
+            //
+            // ⚠️ ET LA RAISON POUR LAQUELLE `− K` SUFFIT MALGRÉ N PRIMITIVES. `SmoothMin(A,B,K)`
+            // vaut `min(A,B) − H³K/6` avec `H = max(K − |A−B|, 0)/K`. Deux conséquences lues sur la
+            // formule : la pénalité est EXACTEMENT nulle dès que `|A−B| ≥ K`, et le minimum courant
+            // ne peut donc jamais descendre plus de `K` sous le plus petit des termes — arrivé là,
+            // `H = 0` et les plis suivants le laissent intact. D'où `Sdf ≥ min_i(SDF_i) − K` pour un
+            // nombre QUELCONQUE de primitives, et non `− N·K/6`. C'est ce qui rend ce critère
+            // utilisable au lieu d'être noyé sous le nombre de tunnels.
+            //
+            // Identity now means "Sdf >= T over the box", not "Sdf stays FLT_MAX" — no consumer
+            // looks past its own threshold, and the three that exist were read one by one. ANY NEW
+            // CONSUMER OF THE Sdf CHANNEL MUST HAVE A THRESHOLD <= T OR BE ADDED TO THIS MAX.
+            // The -K slack covers any number of primitives because SmoothMin's penalty is exactly
+            // zero once |A-B| >= K, so the running minimum saturates at K below the true minimum.
+            const float K = FMath::Max(P.SDFBlendRadius, 0.0f);
+            const float T = FMath::Max(3.0f * K, P.WormNetworkRange);
+
             B.NumRooms    = B.Cache.Rooms.Num();
             B.NumTunnels  = B.Cache.Tunnels.Num();
             B.NumPits     = B.Cache.Pits.Num();
@@ -2370,9 +2434,60 @@ namespace
             {
                 if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { ++B.HitRooms; }
             }
-            for (const FCachedTunnel& T : B.Cache.Tunnels)
+            //-----------------------------------------------------------------
+            // LES TUNNELS ONT DROIT À UN SECOND TEST, ET C'EST LÀ QUE SE TROUVE LE GAIN
+            //-----------------------------------------------------------------
+            // ⚠️ CECI CHANGE LE SENS D'`Identity` POUR CET OPÉRATEUR — lire la note « LE SEUIL T »
+            // ci-dessus avant de toucher quoi que ce soit ici.
+            //
+            // Le cull par voxel d'un tunnel est sa SPHÈRE ENGLOBANTE. Pour une capsule longue et
+            // fine c'est une sur-estimation énorme : avec `MaxTunnelLength = 200` et
+            // `TunnelMaxRadius = 7`, la sphère a un rayon jusqu'à ~107 pour un tube de rayon 7. La
+            // mesure le disait sans ambiguïté — 32 tuiles bloquées sur 34 par des tunnels, contre
+            // 21 par des salles.
+            //
+            // Donc : soit le tunnel rate son cull (il ne s'exécute pas), soit son PROPRE SDF reste
+            // ≥ `T + K` sur toute la boîte (il s'exécute mais ne peut pas descendre le champ assez
+            // bas pour qu'un consommateur s'allume). L'un ou l'autre suffit.
+            //
+            // La borne est exacte, pas prudente : `TaperedCapsule` rend
+            // `Dist(P, PlusProcheSurSegment) − Lerp(Ra, Rb, t)`, donc
+            // `SDF ≥ dist(P, segment) − max(Ra, Rb)` — RELU dans `VoxelCaveMorphology.h`, pas supposé.
+            // Et `dist(boîte, segment) ≥ dist(centre, segment) − demi-diagonale` par inégalité
+            // triangulaire : conservatif du bon côté, et trivialement vrai.
+            //
+            // A tunnel's per-voxel cull is its BOUNDING SPHERE — for a 200-long tube of radius 7
+            // that sphere has radius ~107. So a tunnel does not matter if it fails that cull OR if
+            // its own SDF stays >= T + K over the box. The bound is exact: TaperedCapsule is
+            // genuinely dist-to-segment minus an interpolated radius, and box-to-segment distance is
+            // bounded below by centre-to-segment minus the half-diagonal.
+            const float TunnelClear = T + K;
+            const FVector QCenter   = (QMin + QMax) * 0.5;
+            const float BoxHalfDiag = 0.5f * (float)(QMax - QMin).Size();
+
+            for (const FCachedTunnel& Tn : B.Cache.Tunnels)
             {
-                if (SphereHitsBox(T.BoundCenter, T.BoundRadiusSq, QMin, QMax)) { ++B.HitTunnels; }
+                if (!SphereHitsBox(Tn.BoundCenter, Tn.BoundRadiusSq, QMin, QMax)) { continue; }
+
+                float MaxR = FMath::Max(Tn.RadiusA, Tn.RadiusB);
+                float DistToAxis;
+                if (Tn.bHasMidpoint)
+                {
+                    // Deux segments : le SDF du tunnel est le `Min` des deux, donc sa borne
+                    // inférieure est le `Min` des deux bornes.
+                    MaxR = FMath::Max(MaxR, Tn.RadiusMid);
+                    DistToAxis = FMath::Min(
+                        VF_DistPointSegment(QCenter, Tn.EndpointA, Tn.Midpoint),
+                        VF_DistPointSegment(QCenter, Tn.Midpoint,  Tn.EndpointB));
+                }
+                else
+                {
+                    DistToAxis = VF_DistPointSegment(QCenter, Tn.EndpointA, Tn.EndpointB);
+                }
+
+                if (DistToAxis - BoxHalfDiag - MaxR >= TunnelClear) { continue; }
+
+                ++B.HitTunnels;
             }
             // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
             // `Z >= TopZ - Depth - BlendK`.
