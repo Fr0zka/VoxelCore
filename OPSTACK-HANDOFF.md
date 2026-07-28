@@ -110,6 +110,98 @@ by a test that compares it to the original. Only the ~60 lines of glue are trans
    `CarveOnly` whenever any shaft is within a `Spacing*1.6` halo instead of testing real connector
    capsules. Lost CPU, never a hole.
 
+## ⚠️ IF YOU ARE RUNNING UNATTENDED — read this section before starting
+
+Jahni may start this session and leave, then have you shut the PC down when you're done. If so:
+
+**You cannot build, and nobody will build for you during this run.** Rule #1 still holds absolutely.
+So everything you write stays unverified until he returns — which is exactly the `AUDIT §P3` pattern
+("unverified code on top of unverified code") this refactor has dodged seven times. You cannot avoid
+it while he is away. **What you CAN do is shape the work so a single build afterwards diagnoses it
+cheaply.** That is the whole job of this section.
+
+### The rules that replace "build after each step"
+
+1. **One commit per group below. Never bundle two.** Jahni reverts by group, and a failed build must
+   bisect to a group rather than to 700 lines. Name the group explicitly in the subject line.
+2. **Every commit leaves the tree coherent.** No half-written op, no dangling brace, no factory
+   declared without a definition. Assume the next thing that happens is a compile.
+3. **Transcribe literally. Do not improve anything.** With no test feedback, a "cleanup" is an
+   unfalsifiable guess. Keep the original's operation order, its constants, its `FVector`
+   round-trips, its odd `FMath::Max` floors. If something looks wrong, **write it down in the
+   progress log and port it as-is** — that is how `§C1` and the `MinDivisor` split were both found
+   without breaking anything.
+4. **Update the test in the same commit as the code it covers**, including its coverage counters. Do
+   not leave "I'll add the test after" — after is a build away.
+
+### The work queue, in order. Stop at the first hard stop.
+
+- **B1 — Surface roughness** (`STEP 4b`, ~130 lines). Density-space variant: a *different op* from
+  `FSdfRoughnessMod` (quadratic fade, anti-fill clamp, 4 noise types). See `DECOMPOSITION §1`.
+- **B2 — Terrace · LayerLines · Ribbing** (~150 lines). The three "sedimentary" remaps.
+- **B3 — Overhang · Cliff · Scallop · Arch** (~210 lines).
+- **B4 — Columns · Domes · Pinch · FloorBias** (~190 lines). Columns read `SDFCache.Columns`, so this
+  group needs a Column op in the test's room pool — and the stage-A guard that *errors* on
+  `TotalColumns > 0` must move to this commit, not before it.
+- **B5 — the gate itself.** All of B1–B4 live inside `if (bNearCaveSurface)`, i.e.
+  `Sdf < SDFBlendRadius·3 && Sdf < FLT_MAX`. Decide deliberately whether that is one scoping wrapper
+  or a repeated early-out in each op, write down which and why, and make the test prove a voxel
+  *outside* the gate is untouched.
+
+After each group, extend the test: turn that group's amplitudes ON in `EnableTunnelFeatures`, add a
+coverage counter proving the group actually fired (**not** just that its param is non-zero — see the
+pit/chimney lesson below), and move the op-count assertion.
+
+**⚠️ The one subtlety that lets B happen before C.** Inside `if (bNearCaveSurface)` the original
+*shadows* `Params` with `LocalTerrainParams` — a copy with the nearest room's terrain op applied — and
+**all 13 modifiers read the shadowed copy**. Porting them to read strate-level params is therefore
+equivalent *only while no room carries a detail-type op*. The test's room pool is Pit/Chimney only,
+and `ApplyTo(Pit)` writes just the four pit fields, so the two are identical today. **Keep it that
+way until stage C**: the moment a `Terrace` op enters the pool, the ported group must read the
+per-room value or the equivalence breaks — and that break is the correct signal, not a bug.
+(B4's Column op is safe: `STEP 4d` reads `SDFCache.Columns` from the bake, never the shadowed params.)
+
+### 🛑 HARD STOPS — do not cross these unattended
+
+- **Do NOT flip `TunnelNetwork` or `Underwater` on in `UsesOperatorStackForChunk`.** That points the
+  live world at an unverified path. It waits for a green build, always.
+- **Do NOT start stage C (the per-room op override).** It is the one piece with genuine design
+  freedom (`§2` offers two options and argues for (a)), and design without feedback is where an
+  unattended run does damage. **Instead, if you reach it: write the design up in
+  `OPSTACK-DECOMPOSITION §2` and stop.** A reviewed design is worth more than unreviewed code.
+- **Do NOT start the worm amplitude cap / numeric intervals.** It changes the fold contract that all
+  13 green tests depend on. It deserves a build cycle of its own.
+- **Do NOT build, do not launch the editor, do not push.** Unchanged, and not negotiable.
+
+### If you finish B1–B5 and still have time
+
+Prefer work that is **valuable without a build**, in this order:
+
+1. **Settle `AUDIT §C2`'s suspected item** — does `GetGenerationParams` actually vary within one
+   strate across a Gradient transition? That is answerable by *reading* `GetGenerationParams` and
+   `FStrateGenerationParams::Lerp`. Turn the suspicion into a yes or a no, with the evidence, and
+   correct the audit either way. **This is the highest-value build-free task available.**
+2. **Write the stage-C design** (above) without implementing it.
+3. **Re-read your own B1–B4 diffs against the original**, function by function, as a reviewer rather
+   than an author. On a run with no tests, a second reading is the only oracle you have.
+
+### The commit messages ARE the ledger
+
+**Jahni's words: "just commit with explicit name what changed, I'll revert if needed."** So there is
+no separate bookkeeping — the commit history is the record, and it has one job: let him revert a
+single group without touching the others.
+
+That makes the subject line load-bearing. Name the group and the scope, not the intent:
+
+```
+feat(opstack B2): port Terrace, LayerLines, Ribbing detail modifiers
+feat(opstack B4): port Columns, Domes, Pinch, FloorBias + column op in the test pool
+```
+
+Body: what was transcribed, anything that looked wrong and was ported as-is anyway, and what breaks
+first if the group is wrong. One group per commit — that rule exists *because* of the revert
+workflow, so it is the one thing not to bend.
+
 ## Hard rules that prevent real bugs
 
 - **Density sign:** negative = solid at the mesher. Inside the op stack the convention is INTERNAL
