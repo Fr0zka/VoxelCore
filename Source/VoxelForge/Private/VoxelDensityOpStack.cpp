@@ -1783,6 +1783,74 @@ namespace
             LayoutVersion = Ctx.LayoutVersion;
         }
 
+        //---------------------------------------------------------------------
+        // L'ÉTAT PAR WORKER, ET POURQUOI IL EST SORTI DE `Eval`
+        //---------------------------------------------------------------------
+        // Les modificateurs de détail de l'étape B ont besoin de ce que CETTE source a produit pour
+        // CE voxel : le cache SDF (les terrasses le ré-interrogent en Z±1, les colonnes le
+        // parcourent) et l'index de la salle la plus proche (arches, dômes, pincement, biais de sol).
+        // Dans l'original tout cela vit dans des `thread_local` d'une seule fonction de 1080 lignes ;
+        // ici la source les possède et les expose.
+        //
+        // ⚠️ `static` (donc PARTAGÉ ENTRE INSTANCES), pas un membre : c'est exactement ce que fait
+        // l'original, et le contrôle 3 du test en DÉPEND — deux piles construites côte à côte se
+        // partagent ce cache, et c'est l'empreinte de params dans la clé (pas une copie par pile) qui
+        // les empêche de se servir mutuellement leurs salles. En faire un membre ferait passer ce
+        // contrôle pour de mauvaises raisons.
+        //
+        // ⚠️ MÊME MOTIF QUE `FOverhangShelfMod` ← `FSurfaceColumnSource` et `FShaftLedgeMod` ←
+        // `FShaftFieldSource` : un opérateur possède l'état, les autres le lisent par pointeur non
+        // possédant remis à la construction. C'est un motif ÉTABLI dans ce fichier, pas une invention.
+        //
+        // Per-worker state, deliberately `static` (shared between instances) because that is what the
+        // original does and what the test's stale-cache check rests on. Detail ops read it through a
+        // non-owning pointer, the same way the surface and shaft ports already do.
+        struct FState
+        {
+            FChunkSDFCache Cache;
+            float  CachedSMinX = 1.0f, CachedSMaxX = -1.0f;   // invalide au départ (min > max)
+            float  CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
+            int32  CachedStrate = INT32_MIN;
+            uint32 CachedSeed = 0;
+            uint32 CachedFingerprint = 0xFFFFFFFFu;
+            uint32 CachedLayout = 0xFFFFFFFFu;
+
+            /** La salle de SDF minimal pour le dernier voxel évalué. -1 = aucune. */
+            int32 NearestRoom = -1;
+        };
+
+        static FState& State()
+        {
+            thread_local FState S;
+            return S;
+        }
+
+        /** Le cache que la source vient de bâtir/servir pour ce voxel. Lu par les colonnes (4d). */
+        const FChunkSDFCache& GetCache() const { return State().Cache; }
+
+        /** L'index de la salle la plus proche pour le dernier voxel évalué. -1 = aucune.
+         *  Lu par les arches, les dômes, le pincement et le biais de sol. */
+        int32 GetNearestRoomIdx() const { return State().NearestRoom; }
+
+        /**
+         * Une requête SDF supplémentaire dans le cache courant, pour les sondes de gradient des
+         * terrasses.
+         *
+         * ⚠️ TRANSCRIT TEL QUEL, Y COMPRIS CE QUI SEMBLE INCOHÉRENT : l'original sonde en
+         * `(WorldX, WorldY, WorldZ ± 1)` — coordonnées NON warpées et Z NON divisé par
+         * `VerticalScale` — alors que le champ qu'il sonde a été évalué en coordonnées WARPÉES et en
+         * Z effectif. La sonde ne voit donc pas exactement le champ dont elle mesure la pente, et
+         * elle ignore aussi les pits et les cheminées. C'est un écart réel de l'original ; le
+         * corriger changerait le monde, donc il est NOTÉ (OPSTACK-PROGRESS) et porté à l'identique.
+         *
+         * Transcribed as-is including what looks wrong: the probe uses unwarped X/Y and raw Z while
+         * the field it probes was evaluated warped, and it excludes pits/chimneys.
+         */
+        float ProbeSdfUnwarped(float X, float Y, float Z) const
+        {
+            return VoxelCaveMorphology::EvaluateSDFCached(X, Y, Z, State().Cache, P.SDFBlendRadius);
+        }
+
         /** Le Z « effectif » : `VerticalScale` étire le monde AVANT le bruit. Pure fonction de Z et
          *  d'un param — c'est pourquoi ce portage n'a PAS eu besoin d'un opérateur « frame »
          *  (voir la note de conception dans BuildTunnelNetworkStack). */
@@ -1794,6 +1862,16 @@ namespace
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
+            FState& S = State();
+
+            // ⚠️ REMIS À -1 INCONDITIONNELLEMENT, ce que l'original ne fait pas : chez lui
+            // `NearestRoomIdx` est un `thread_local` qui, quand `RoomDensity <= 0`, garde la valeur
+            // du voxel PRÉCÉDENT. Inobservable là-bas (sans salles, `CaveSDF` reste FLT_MAX, donc
+            // `bNearCaveSurface` est faux et aucun consommateur ne tourne) — mais ici les
+            // consommateurs sont des objets séparés, et une valeur périmée qui traverse une frontière
+            // d'opérateur est le genre de chose qu'on ne retrouve pas. On paie une écriture.
+            S.NearestRoom = -1;
+
             if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return; }   // Sdf reste FLT_MAX
 
             const float EffectiveZ = EffZ(WorldZ);
@@ -1833,11 +1911,9 @@ namespace
             // clé « égalité de chunk » se retournait à chaque cellule de bord et reconstruisait le
             // cache (coûteux) en boucle. Comme le cache couvre la boîte + MaxInfluence, toute requête
             // DANS la boîte est correcte. Ne pas « simplifier » en clé de chunk.
-            thread_local FChunkSDFCache SDFCache;
-            thread_local float  CachedSMinX = 1.0f, CachedSMaxX = -1.0f;   // invalide au départ
-            thread_local float  CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
-            thread_local int32  CachedStrate = INT32_MIN;
-            thread_local uint32 CachedSeed = 0;
+            // (Les champs de cache vivent maintenant dans `FState`, au-dessus, pour que les
+            // modificateurs de détail de l'étape B puissent les lire. Même durée de vie, même
+            // partage entre instances qu'avant : ce sont les mêmes `thread_local`, déménagés.)
             // ⚠️ AJOUTÉ PAR RAPPORT À L'ORIGINAL — la leçon du 2026-07-27 (régression d'overhang).
             // L'original ne clé QUE sur (boîte, strate, seed) : deux jeux de params différents dans
             // la MÊME strate au MÊME seed se servent mutuellement leur cache. En production
@@ -1846,8 +1922,6 @@ namespace
             // `FStrateGenerationParams` est du POD pur (aucun TArray/FString/pointeur), donc une CRC
             // mémoire ne peut pas donner un FAUX POSITIF ; au pire un padding donne un faux MANQUE,
             // c'est-à-dire un recalcul. On se trompe du côté du CPU, jamais du côté d'une salle fausse.
-            thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
-            thread_local uint32 CachedLayout = 0xFFFFFFFFu;
 
             // Index de strate — mémo (chunk-Z, version de layout), transcrit tel quel. La requête
             // vise le CENTRE de la bande, donc le résultat est une fonction pure de la clé.
@@ -1869,10 +1943,10 @@ namespace
             }
 
             const bool bNeedRebuild =
-                StrateIdx != CachedStrate || SeedU != CachedSeed ||
-                ParamsFingerprint != CachedFingerprint || LayoutVersion != CachedLayout ||
-                WarpedX < CachedSMinX || WarpedX > CachedSMaxX ||
-                WarpedY < CachedSMinY || WarpedY > CachedSMaxY;
+                StrateIdx != S.CachedStrate || SeedU != S.CachedSeed ||
+                ParamsFingerprint != S.CachedFingerprint || LayoutVersion != S.CachedLayout ||
+                WarpedX < S.CachedSMinX || WarpedX > S.CachedSMaxX ||
+                WarpedY < S.CachedSMinY || WarpedY > S.CachedSMaxY;
 
             if (bNeedRebuild)
             {
@@ -1899,19 +1973,18 @@ namespace
                 }
 
                 VoxelCaveMorphology::BuildChunkCache(
-                    SDFCache, SMinX, SMinY, SMaxX, SMaxY, P, SeedU, StrateIdx, TerrainOps);
+                    S.Cache, SMinX, SMinY, SMaxX, SMaxY, P, SeedU, StrateIdx, TerrainOps);
 
-                CachedSMinX = SMinX; CachedSMaxX = SMaxX;
-                CachedSMinY = SMinY; CachedSMaxY = SMaxY;
-                CachedStrate = StrateIdx;
-                CachedSeed = SeedU;
-                CachedFingerprint = ParamsFingerprint;
-                CachedLayout = LayoutVersion;
+                S.CachedSMinX = SMinX; S.CachedSMaxX = SMaxX;
+                S.CachedSMinY = SMinY; S.CachedSMaxY = SMaxY;
+                S.CachedStrate = StrateIdx;
+                S.CachedSeed = SeedU;
+                S.CachedFingerprint = ParamsFingerprint;
+                S.CachedLayout = LayoutVersion;
             }
 
-            int32 NearestRoom = -1;
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
-                WarpedX, WarpedY, WarpedZ, SDFCache, P.SDFBlendRadius, &NearestRoom);
+                WarpedX, WarpedY, WarpedZ, S.Cache, P.SDFBlendRadius, &S.NearestRoom);
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -1921,7 +1994,7 @@ namespace
             // mais à des coordonnées NON warpées. Sous un modèle de frames il aurait fallu les sortir
             // du frame tout en gardant le canal — exprimable, mais tordu. Dans un opérateur unique la
             // difficulté disparaît : le warp est une variable locale, pas un contexte hérité.
-            for (const FCachedPit& Pit : SDFCache.Pits)
+            for (const FCachedPit& Pit : S.Cache.Pits)
             {
                 const float DZ = WorldZ - Pit.TopZ;
                 if (DZ >= Pit.BlendK) { continue; }
@@ -1949,7 +2022,7 @@ namespace
                 CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
             }
 
-            for (const FCachedChimney& Chim : SDFCache.Chimneys)
+            for (const FCachedChimney& Chim : S.Cache.Chimneys)
             {
                 const float DZ = WorldZ - Chim.BottomZ;
                 if (-DZ >= Chim.BlendK) { continue; }
@@ -2180,6 +2253,207 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : TERRASSES / TERRACING  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // Un escalier lissé en Z : `Offset = staircase(Z) − Z` ajouté à la densité. Positif ⇒ marche
+    // solide sur laquelle marcher, négatif ⇒ vide sous la marche du dessus.
+    //
+    // ⚠️ LE SEUL MODIFICATEUR QUI RE-INTERROGE LE CHAMP SDF. Le facteur d'orientation vient de deux
+    // sondes en Z±1 : un SDF a un gradient ≈ unitaire, donc |dSDF/dZ| EST déjà la composante
+    // verticale normalisée — proche de 1 = sol/plafond, proche de 0 = paroi. Sans ce facteur, les
+    // terrasses posent des bourrelets horizontaux dans les puits verticaux.
+    //
+    // C'est pour cette re-interrogation que `FRoomGraphSource` expose `ProbeSdfUnwarped` (et donc
+    // que son cache est sorti de `Eval`) : le refaire ici voudrait dire un second cache SDF.
+    class FCaveTerraceMod final : public IVoxelDensityOp
+    {
+    public:
+        FCaveTerraceMod(const FStrateGenerationParams& InP, int32 Seed, const FRoomGraphSource* InRooms)
+            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (Rooms == nullptr) { return; }
+
+            // `&& CaveSDF < FLT_MAX` est redondant sous le gate (qui le teste déjà) mais l'original
+            // l'écrit, et une transcription littérale ne fait pas le tri.
+            if (!(P.TerraceStepHeight > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float StepH = P.TerraceStepHeight;
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float TerraceRange = StepH * 3.0f;
+            if (!(DistFromSurface < TerraceRange)) { return; }
+
+            // Deux évaluations SDF de plus par voxel, seulement près d'une surface. Approximation
+            // en Z seul : le gradient complet à 6 échantillons coûtait 3× pour le même signal.
+            const float SDF_Zp1 = Rooms->ProbeSdfUnwarped(WorldX, WorldY, WorldZ + 1.0f);
+            const float SDF_Zm1 = Rooms->ProbeSdfUnwarped(WorldX, WorldY, WorldZ - 1.0f);
+            const float GZ = (SDF_Zp1 - SDF_Zm1) * 0.5f;
+            const float SurfaceHorizontality = FMath::Clamp(FMath::Abs(GZ), 0.0f, 1.0f);
+            const float TerraceOrientFactor = FMath::Clamp((SurfaceHorizontality - 0.3f) / 0.4f, 0.0f, 1.0f);
+
+            // ⚠️ Z BRUT, PAS `EffectiveZ` : les terrasses sont géologiques, elles restent
+            // horizontales quelle que soit l'échelle verticale de la strate. Idem pour les lignes de
+            // strates et les nervures plus bas. La rugosité (4b), elle, utilise EffectiveZ. C'est
+            // délibéré dans l'original et ça se lit dans son commentaire d'en-tête du STEP 3.
+            float NoisedZ = WorldZ;
+            if (P.TerraceNoiseDisplacement > 0.0f)
+            {
+                const float DispNoise = HFractal3D(FVector(
+                    WorldX * 0.04f + VoxelHash::SeedOffset(SeedU, 31.1f),
+                    WorldY * 0.04f + VoxelHash::SeedOffset(SeedU, 37.3f),
+                    WorldZ * 0.02f + VoxelHash::SeedOffset(SeedU, 41.7f)
+                ), VoxelGenLOD::Eff(2)) * VOXEL_NOISE_SCALE;
+                NoisedZ += DispNoise * P.TerraceNoiseDisplacement * StepH;
+            }
+
+            const float K = NoisedZ / StepH;
+            const float FloorK = FMath::FloorToFloat(K);
+            const float Frac = K - FloorK;   // toujours [0, 1)
+
+            const float Edge = FMath::Lerp(0.45f, 0.02f, P.TerraceHardness);
+            float StairValue;
+            if (Frac < 0.5f - Edge)
+            {
+                StairValue = 0.0f;
+            }
+            else if (Frac > 0.5f + Edge)
+            {
+                StairValue = 1.0f;
+            }
+            else
+            {
+                const float T = (Frac - (0.5f - Edge)) / (2.0f * Edge);
+                StairValue = SmoothStep01(T);
+            }
+
+            const float TerracedZ = (FloorK + StairValue) * StepH;
+            const float Offset = TerracedZ - NoisedZ;   // ≈ [-StepH/2, +StepH/2]
+
+            float Fade = 1.0f - (DistFromSurface / TerraceRange);
+            Fade = Fade * Fade;
+
+            InOut.Density += Offset * Fade * TerraceOrientFactor;
+        }
+
+        /** `Both` : `Offset` change de signe d'une demi-marche à l'autre. Amplitude bornée par
+         *  `StepH/2` — troisième client du pliage numérique de `OPSTACK-DECOMPOSITION §0.2`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.TerraceStepHeight > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+        uint32 SeedU;
+        const FRoomGraphSource* Rooms;   // NON possédant : la pile possède la source
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : LIGNES DE STRATES / LAYER LINES  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // Rainures horizontales dans les parois — la strate sédimentaire vue en coupe. Une sinusoïde en
+    // Z, rectifiée puis CUBÉE : les bosses larges du sinus deviennent des pointes fines, donc des
+    // rainures étroites au lieu d'une ondulation.
+    class FLayerLineMod final : public IVoxelDensityOp
+    {
+    public:
+        explicit FLayerLineMod(const FStrateGenerationParams& InP) : P(InP) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.LayerLineSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float LineRange = P.LayerLineSpacing * 1.5f;
+            if (!(DistFromSurface < LineRange)) { return; }
+
+            const float LinePhase = WorldZ * (2.0f * PI) / P.LayerLineSpacing;
+            float LineValue = FMath::Sin(LinePhase);
+
+            LineValue = FMath::Max(LineValue, 0.0f);
+            LineValue = LineValue * LineValue * LineValue;   // affûtage cubique
+
+            float Fade = 1.0f - (DistFromSurface / LineRange);
+            Fade = Fade * Fade;
+
+            InOut.Density -= LineValue * P.LayerLineDepth * Fade;
+        }
+
+        /** Ne SOUSTRAIT que (`LineValue ≥ 0`, `Depth ≥ 0`) ⇒ `CarveOnly`, jamais `Both`. Un des
+         *  rares modificateurs de détail qui garde une DIRECTION exploitable par le pliage. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.LayerLineSpacing > 0.0f && P.LayerLineDepth > 0.0f)
+                 ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
+    };
+
+    //=========================================================================
+    // RÔLE 3 — MODIFIER : NERVURES / RIBBING  (TunnelNetwork, STEP 4c)
+    //=========================================================================
+    // La MÊME sinusoïde en Z que les lignes de strates, décalée d'un quart de période
+    // (`+ PI · 0.5`), rectifiée puis CARRÉE au lieu de cubée, et AJOUTÉE au lieu d'être soustraite :
+    // des bourrelets arrondis (tube de lave) au lieu de rainures fines.
+    //
+    // ⚠️ Deux opérateurs, pas un avec un signe : l'exposant diffère (3 contre 2), la phase diffère,
+    // et le paramètre d'espacement est indépendant. Les fusionner demanderait trois paramètres pour
+    // économiser dix lignes, et rendrait la correspondance avec l'original illisible.
+    class FRibbingMod final : public IVoxelDensityOp
+    {
+    public:
+        explicit FRibbingMod(const FStrateGenerationParams& InP) : P(InP) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float CaveSDF = InOut.Sdf;
+            if (!VF_NearCaveSurface(CaveSDF, P.SDFBlendRadius)) { return; }
+            if (!(P.RibbingSpacing > 0.0f && CaveSDF < FLT_MAX)) { return; }
+
+            const float DistFromSurface = FMath::Abs(CaveSDF);
+            const float RibRange = P.RibbingSpacing * 1.5f;
+            if (!(DistFromSurface < RibRange)) { return; }
+
+            const float RibPhase = WorldZ * (2.0f * PI) / P.RibbingSpacing + PI * 0.5f;
+            float RibValue = FMath::Sin(RibPhase);
+
+            RibValue = FMath::Max(RibValue, 0.0f);
+            RibValue = RibValue * RibValue;   // profil de bosse arrondi
+
+            float Fade = 1.0f - (DistFromSurface / RibRange);
+            Fade = Fade * Fade;
+
+            InOut.Density += RibValue * P.RibbingDepth * Fade;
+        }
+
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return (P.RibbingSpacing > 0.0f && P.RibbingDepth > 0.0f)
+                 ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+    private:
+        FStrateGenerationParams P;
     };
 
     //=========================================================================
@@ -2430,12 +2704,12 @@ namespace VoxelDensityOps
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
     {
-        // ⚠️ ÉTAPES A + B1 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
+        // ⚠️ ÉTAPES A + B1 + B2 — LA PILE EST ENCORE INCOMPLÈTE, ET DÉLIBÉRÉMENT.
         // Sont portés : l'échelle verticale, le roc de base, le warp, le graphe de salles (+ pits
-        // + cheminées), le carve, **la rugosité de paroi (4b)**, les vers, le post structurel.
-        // **NE SONT PAS ENCORE PORTÉS** les onze modificateurs restants de l'étape 4c-4h (terrasses,
-        // lignes de strates, nervures, surplombs, falaise, festons, arches, colonnes, dômes,
-        // pincement, biais de sol), ni l'override d'op PAR SALLE.
+        // + cheminées), le carve, **la rugosité (4b), les terrasses, les lignes de strates, les
+        // nervures**, les vers, le post structurel. **NE SONT PAS ENCORE PORTÉS** les huit
+        // modificateurs restants (surplombs, falaise, festons, arches, colonnes, dômes, pincement,
+        // biais de sol), ni l'override d'op PAR SALLE.
         //
         // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
         // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
@@ -2463,14 +2737,24 @@ namespace VoxelDensityOps
         // même chose vue de loin. Noté ici plutôt que laissé en TODO permanent.
         constexpr float CarveMinDivisor = 1.0f;   // TunnelNetwork plancher son diviseur, cf. FSdfConvertOp
 
+        // La source de salles est retenue par pointeur non possédant : les terrasses re-interrogent
+        // son cache SDF en Z±1. Même motif que `FShaftFieldSource` → `FShaftLedgeMod`.
+        TUniquePtr<FRoomGraphSource> RoomSource = MakeUnique<FRoomGraphSource>(P, Seed, StrateManager);
+        const FRoomGraphSource* RoomPtr = RoomSource.Get();
+
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
-        OutStack.Add(MakeUnique<FRoomGraphSource>(P, Seed, StrateManager));
+        OutStack.Add(MoveTemp(RoomSource));
         OutStack.Add(MakeSdfCarve(P.SDFBlendRadius, P.BaseDensity, CarveMinDivisor));
         // ── ÉTAPE B : les modificateurs de détail (4b–4h), chacun gated sur
         //    `Sdf < SDFBlendRadius·3` via VF_NearCaveSurface. Voir la note de l'étape B5 là-bas.
-        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));       // 4b
-        // [ÉTAPES B2–B4 iront ici : terrasses, lignes, nervures, surplombs, falaise, festons,
-        //  arches, colonnes, dômes, pincement, biais de sol]
+        //    L'ORDRE EST CELUI DE L'ORIGINAL et il compte : chacun lit la densité que le précédent
+        //    a laissée (le biais de sol, en particulier, existe pour rattraper la rugosité).
+        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));            // 4b
+        OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
+        OutStack.Add(MakeUnique<FLayerLineMod>(P));                      // 4c — lignes de strates
+        OutStack.Add(MakeUnique<FRibbingMod>(P));                        // 4c — nervures
+        // [ÉTAPES B3–B4 iront ici : surplombs, falaise, festons, arches, colonnes, dômes,
+        //  pincement, biais de sol]
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,

@@ -18,9 +18,10 @@
 // L'ÉTAPE B REMONTE CES AMPLITUDES UN GROUPE À LA FOIS, dans l'autre sens : chaque groupe porté sort
 // de `DisableStageBModifiers` et entre dans `EnableTunnelFeatures`, avec (i) une sonde de couverture
 // qui prouve qu'il a réellement bougé quelque chose et (ii) le compte d'ops de la pile qui augmente.
-//   • B1 (ce commit) : rugosité de paroi, STEP 4b.
+//   • B1 : rugosité de paroi, STEP 4b.
+//   • B2 (ce commit) : terrasses, lignes de strates, nervures — STEP 4c.
 //
-// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les onze modificateurs restants (4c–4h), rien
+// CE QUE CE TEST NE PROUVE PAS (et le dit) : rien sur les huit modificateurs restants (4c–4h), rien
 // sur l'override d'op par salle, et rien sur le saut de tuile — `FRoomGraphSource::EffectOverBox`
 // rend `Both`, donc aucun verdict n'est prouvable à ce stade. Ce sont les étapes B2–B5 et C.
 //
@@ -66,10 +67,6 @@ namespace
      */
     void DisableStageBModifiers(FStrateGenerationParams& P)
     {
-        P.TerraceStepHeight         = 0.0f;
-        P.TerraceNoiseDisplacement  = 0.0f;
-        P.LayerLineSpacing          = 0.0f;
-        P.RibbingSpacing            = 0.0f;
         P.OverhangStrength          = 0.0f;
         P.CliffStrength             = 0.0f;
         P.ScallopStrength           = 0.0f;
@@ -115,6 +112,18 @@ namespace
         P.RoughnessNoiseType  = EVoxelNoiseType::FBM;   // les 4 types sont balayés au contrôle 1c
         P.DomainWarpStrength  = 3.0f;                   // ≠ 0 ⇒ le chemin de warp de domaine est pris
         P.DomainWarpFrequency = 0.03f;
+
+        // ── ÉTAPE B2 : les trois remaniements « sédimentaires » (4c) ──────────────────────────
+        // Espacements CHOISIS PETITS devant la fenêtre d'échantillonnage : `LineRange` vaut
+        // `Spacing · 1.5`, donc un espacement de 30 ne laisserait presque aucun point dans la
+        // fenêtre et la sonde de couverture rapporterait un quasi-zéro pour la mauvaise raison.
+        P.TerraceStepHeight        = 6.0f;
+        P.TerraceHardness          = 0.6f;
+        P.TerraceNoiseDisplacement = 0.5f;   // ≠ 0 ⇒ le bruit de déplacement du palier est pris
+        P.LayerLineSpacing         = 5.0f;
+        P.LayerLineDepth           = 0.35f;
+        P.RibbingSpacing           = 4.0f;
+        P.RibbingDepth             = 0.4f;
     }
 
     /**
@@ -202,6 +211,15 @@ namespace
     {
         { TEXT("B1 surface roughness (STEP 4b)"),
           [](FStrateGenerationParams& Q) { Q.SurfaceRoughness = 0.0f; } },
+        { TEXT("B2 terracing (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.TerraceStepHeight = 0.0f; } },
+        { TEXT("B2 layer lines (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.LayerLineSpacing = 0.0f; } },
+        { TEXT("B2 ribbing (STEP 4c)"),
+          [](FStrateGenerationParams& Q) { Q.RibbingSpacing = 0.0f; } },
+        // ⚠️ UNE SONDE PAR OPÉRATEUR, PAS UNE PAR GROUPE. Le groupe B2 en contient trois ; une seule
+        // sonde « B2 » serait verte tant qu'UN des trois tire, et les deux autres pourraient être
+        // faux sans que rien ne le dise. La granularité de la sonde est la granularité de la preuve.
     };
 
     //=========================================================================
@@ -290,11 +308,12 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + **rugosité (B1)** + worms + 3 structurels = 8.
-    // Les onze modificateurs restants viendront s'insérer entre la rugosité et les vers, donc ce
+    // rock + roomgraph + carve + **rugosité + terrasses + lignes + nervures (B1, B2)** + worms
+    // + 3 structurels = 11.
+    // Les huit modificateurs restants viendront s'insérer entre les nervures et les vers, donc ce
     // nombre DOIT bouger à chaque groupe de l'étape B — c'est un compteur de progression, pas une
     // formalité : une pile qui ne grandit pas est une pile dont l'opérateur n'a pas été ajouté.
-    TestEqual(TEXT("the stage-A+B1 tunnel stack is decomposed into 8 ops"), Stack.Num(), 8);
+    TestEqual(TEXT("the stage-A+B1+B2 tunnel stack is decomposed into 11 ops"), Stack.Num(), 11);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;

@@ -266,11 +266,11 @@ namespace VoxelDensityOps
                                                 const UVoxelStrateManager* StrateManager);
 
     /**
-     * TunnelNetwork — **ÉTAPES A + B1, PILE ENCORE INCOMPLÈTE** :
+     * TunnelNetwork — **ÉTAPES A + B1 + B2, PILE ENCORE INCOMPLÈTE** :
      *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → CaveRoughness(4b)
-     *   → Worms → [structural ×3]
+     *   → Terrace → LayerLines → Ribbing → Worms → [structural ×3]
      *
-     * ⛔ NE PAS brancher cet archétype dans `UsesOperatorStackForChunk` avant l'étape C : les onze
+     * ⛔ NE PAS brancher cet archétype dans `UsesOperatorStackForChunk` avant l'étape C : les huit
      * modificateurs de détail restants (4c–4h) et l'override d'op par salle ne sont pas portés, donc
      * le monde y perdrait du détail. Le test compare avec ces amplitudes à zéro.
      *
