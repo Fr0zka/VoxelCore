@@ -112,13 +112,25 @@ by a test that compares it to the original. Only the ~60 lines of glue are trans
 
 ## ⚠️ IF YOU ARE RUNNING UNATTENDED — read this section before starting
 
-Jahni may start this session and leave, then have you shut the PC down when you're done. If so:
+Jahni may start this session and leave, then have you shut the PC down when you're done.
 
 **You cannot build, and nobody will build for you during this run.** Rule #1 still holds absolutely.
-So everything you write stays unverified until he returns — which is exactly the `AUDIT §P3` pattern
-("unverified code on top of unverified code") this refactor has dodged seven times. You cannot avoid
-it while he is away. **What you CAN do is shape the work so a single build afterwards diagnoses it
-cheaply.** That is the whole job of this section.
+Everything you write stays unverified until he returns.
+
+**That is his explicit, repeated decision, not an oversight — do not re-litigate it and do not
+quietly scale the work down.** Verbatim: *"I'm fine with unverified work, if committed, I can always
+manually go back and try — I want him to work towards the full op stack completeness."* So the goal
+of an unattended run is **to finish the transition**, not to stop somewhere safe. Take the queue
+below as far as it goes.
+
+Two things make that reasonable rather than reckless, and they are worth knowing:
+
+1. **Committing per group IS the safety net.** He reverts by sha. That is why the one-commit-per-group
+   rule is the one thing not to bend.
+2. **Reaching 8 of 8 does not change his world by itself.** `UsesOperatorStackForChunk` returns false
+   unless a strate has `bUseOperatorStack` ticked, so adding `TunnelNetwork` and `Underwater` to the
+   ported list is inert until *he* ticks a box. The flag flip is safe to include; pointing a live
+   world at it stays his call.
 
 ### The rules that replace "build after each step"
 
@@ -134,7 +146,7 @@ cheaply.** That is the whole job of this section.
 4. **Update the test in the same commit as the code it covers**, including its coverage counters. Do
    not leave "I'll add the test after" — after is a build away.
 
-### The work queue, in order. Stop at the first hard stop.
+### The work queue, in order. Run it to the end — **8 of 8 is the finish line.**
 
 - **B1 — Surface roughness** (`STEP 4b`, ~130 lines). Density-space variant: a *different op* from
   `FSdfRoughnessMod` (quadratic fade, anti-fill clamp, 4 noise types). See `DECOMPOSITION §1`.
@@ -152,38 +164,69 @@ After each group, extend the test: turn that group's amplitudes ON in `EnableTun
 coverage counter proving the group actually fired (**not** just that its param is non-zero — see the
 pit/chimney lesson below), and move the op-count assertion.
 
-**⚠️ The one subtlety that lets B happen before C.** Inside `if (bNearCaveSurface)` the original
-*shadows* `Params` with `LocalTerrainParams` — a copy with the nearest room's terrain op applied — and
-**all 13 modifiers read the shadowed copy**. Porting them to read strate-level params is therefore
-equivalent *only while no room carries a detail-type op*. The test's room pool is Pit/Chimney only,
-and `ApplyTo(Pit)` writes just the four pit fields, so the two are identical today. **Keep it that
-way until stage C**: the moment a `Terrace` op enters the pool, the ported group must read the
-per-room value or the equivalence breaks — and that break is the correct signal, not a bug.
-(B4's Column op is safe: `STEP 4d` reads `SDFCache.Columns` from the bake, never the shadowed params.)
+**⚠️ The subtlety that lets B precede C.** Inside `if (bNearCaveSurface)` the original *shadows*
+`Params` with `LocalTerrainParams` — a copy with the nearest room's terrain op applied — and **all 13
+modifiers read the shadowed copy**. Porting them against strate-level params is therefore equivalent
+*only while no room carries a detail-type op*. The test's pool is Pit/Chimney only and `ApplyTo(Pit)`
+writes just the four pit fields, so the two are identical today. **Keep the pool that way through
+B1–B5**; C1 is what makes a `Terrace` op in the pool legal. (B4's Column op is safe: `STEP 4d` reads
+`SDFCache.Columns` from the bake, never the shadowed params.)
 
-### 🛑 HARD STOPS — do not cross these unattended
+- **C1 — the per-room op override.** `§2` calls this the piece with "no clean home" and offers two
+  options. **Take option (a), and note that the mechanism is already established in this codebase —
+  do not invent a scoping predicate.** Three ops already read state owned by an upstream op via a
+  non-owning pointer handed over at build time: `FOverhangShelfMod` ← `FSurfaceColumnSource`,
+  `FShaftLedgeMod` ← `FShaftFieldSource`. Do the same here:
 
-- **Do NOT flip `TunnelNetwork` or `Underwater` on in `UsesOperatorStackForChunk`.** That points the
-  live world at an unverified path. It waits for a green build, always.
-- **Do NOT start stage C (the per-room op override).** It is the one piece with genuine design
-  freedom (`§2` offers two options and argues for (a)), and design without feedback is where an
-  unattended run does damage. **Instead, if you reach it: write the design up in
-  `OPSTACK-DECOMPOSITION §2` and stop.** A reviewed design is worth more than unreviewed code.
-- **Do NOT start the worm amplitude cap / numeric intervals.** It changes the fold contract that all
-  13 green tests depend on. It deserves a build cycle of its own.
-- **Do NOT build, do not launch the editor, do not push.** Unchanged, and not negotiable.
+  `FRoomGraphSource` gains `const FStrateGenerationParams& LocalParamsAt(x, y, z) const`, which
+  reproduces the original exactly — take the voxel's `NearestRoomIdx` (it already computes it), apply
+  that room's `RoomOp` onto a `thread_local` copy of the params, return it. Every detail op holds a
+  `const FRoomGraphSource*` and reads its fields from that copy instead of from its own.
 
-### If you finish B1–B5 and still have time
+  This is the pit/chimney resolution a second time: the difficulty in `§2` came from assuming each
+  modifier must own its params. Let one op own the shared state and the rest read it, and the problem
+  disappears. **Transcribe the per-voxel copy as-is** — yes, the original copies a ~74-field struct
+  per voxel inside the gate; note it in the log as a perf item and change nothing.
 
-Prefer work that is **valuable without a build**, in this order:
+  Acceptance: put a `Terrace` op in the test's room pool alongside Pit/Chimney and require
+  bit-identity. That is the check B could not make.
+- **C2 — `Underwater`.** Nearly free: `§8` establishes there is **no density difference at all** —
+  `GetDensityAt` routes it to `GetDensityWithParams` and `WaterLevelRelative` is consumed by the
+  render-side water system, not by density. So it is the TunnelNetwork stack, reached from a second
+  `case`. Add the wiring case and an equivalence test that samples the `Underwater` slot. If you find
+  a real density difference, **stop and write it down** — that would contradict `§8` and is worth
+  more as a finding than as code.
+- **C3 — 8 of 8.** Add `TunnelNetwork` and `Underwater` to `UsesOperatorStackForChunk`'s ported list.
+  Update `CODEMAP §3.2d` and its `UsesOperatorStackForChunk` row, tick `OPSTACK-PLAN` Phase 2, and
+  write the closing `OPSTACK-PROGRESS` entry: the archetype `switch` now has a complete operator-stack
+  twin, per-strate opt-in, every one equivalence-tested.
 
-1. **Settle `AUDIT §C2`'s suspected item** — does `GetGenerationParams` actually vary within one
-   strate across a Gradient transition? That is answerable by *reading* `GetGenerationParams` and
-   `FStrateGenerationParams::Lerp`. Turn the suspicion into a yes or a no, with the evidence, and
-   correct the audit either way. **This is the highest-value build-free task available.**
-2. **Write the stage-C design** (above) without implementing it.
-3. **Re-read your own B1–B4 diffs against the original**, function by function, as a reviewer rather
-   than an author. On a run with no tests, a second reading is the only oracle you have.
+### After 8 of 8 — keep going, in this order
+
+1. **Settle `AUDIT §C2`'s suspected item.** Does `GetGenerationParams` actually vary within one strate
+   across a Gradient transition? Answerable by *reading* `GetGenerationParams` and
+   `FStrateGenerationParams::Lerp` — no build. Turn the suspicion into a yes or a no with the
+   evidence, and correct the audit either way. Cheap, and it closes an open question honestly.
+2. **The worm amplitude cap (`DECOMPOSITION §0.2`).** The largest single perf item in the plan, and
+   the reason TunnelNetwork proves 0 of 40 tiles. It needs the fold to carry a **number**, not just a
+   direction: add a numeric carve/fill amplitude alongside `EVoxelOpEffect`, have
+   `FWormFieldSource::MaxCarveAmplitude()` (already written, already unused) feed it, and let
+   `AllSolid` survive when the rock is solid by more than the sum of every remaining carve.
+   **⚠️ This changes the fold contract that all 13 tests rest on — its own commit, nothing else in
+   it,** and `VoxelForge.OpStack.BoxVerdictFold` must be extended in the same commit.
+3. **Make `ClassifyTile` consume `ClassifyBox`.** Verified per archetype, still unconsumed in
+   production — this is where measured tile-skipping (Maze 23/60, slabs 36–40/60) becomes frames.
+   A false verdict is an invisible hole, so keep the brute-force check in every archetype's test.
+4. **Re-read your own diffs against the original**, group by group, as a reviewer rather than an
+   author. On a run with no builds, a second reading is the only oracle you have. Do this rather than
+   starting anything new when the queue runs out.
+
+### Still not yours to do, even unattended
+
+- **Do NOT build, do not launch the editor, do not push.** Unchanged, not negotiable.
+- **Do NOT tick `bUseOperatorStack` on any strate asset.** C3 makes the archetypes *available*;
+  pointing a live world at an unverified path stays Jahni's decision.
+- **Do NOT start Phase 3** (ops as data assets). It is a design conversation, not a transcription.
 
 ### The commit messages ARE the ledger
 
@@ -196,11 +239,17 @@ That makes the subject line load-bearing. Name the group and the scope, not the 
 ```
 feat(opstack B2): port Terrace, LayerLines, Ribbing detail modifiers
 feat(opstack B4): port Columns, Domes, Pinch, FloorBias + column op in the test pool
+feat(opstack C1): per-room op override — detail ops read LocalParamsAt from the room source
+feat(opstack C3): TunnelNetwork + Underwater in the ported list — 8 of 8
 ```
 
 Body: what was transcribed, anything that looked wrong and was ported as-is anyway, and what breaks
 first if the group is wrong. One group per commit — that rule exists *because* of the revert
 workflow, so it is the one thing not to bend.
+
+**Close the run with one `OPSTACK-PROGRESS` entry** listing every commit made, in order, with a
+one-line "what this touches" each, and the test filter to run (`VoxelForge`). Jahni's first action on
+return is a single build; that entry is what makes it efficient. Then shut down if he asked you to.
 
 ## Hard rules that prevent real bugs
 
