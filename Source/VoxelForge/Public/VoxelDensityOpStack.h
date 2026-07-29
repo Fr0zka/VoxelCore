@@ -351,6 +351,13 @@ namespace VoxelDensityOps
     {
         int32 HitRooms = 0, HitTunnels = 0, HitPits = 0, HitChimneys = 0;
         int32 NumRooms = 0, NumTunnels = 0, NumPits = 0, NumChimneys = 0;
+
+        /** Les mêmes comptes si la dilatation de warp valait ZÉRO, et de combien de voxels la boîte
+         *  est effectivement dilatée. `Hit* - Hit*NoWarp` = la part du blocage due à MA boîte plutôt
+         *  qu'à la géométrie. Cette mesure manquait, et son absence a coûté trois builds de
+         *  resserrement autour du mauvais terme. */
+        int32 HitRoomsNoWarp = 0, HitTunnelsNoWarp = 0;
+        float WarpDilation = 0.0f;
     };
 
     VOXELFORGE_API FRoomBoxDiagnostic GetLastRoomBoxDiagnostic();

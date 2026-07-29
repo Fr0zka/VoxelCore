@@ -1120,6 +1120,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             const int32 SpanVoxelsReported = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
             int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
             int32 SumHitRooms = 0, SumNumRooms = 0, SumHitTunnels = 0, SumNumTunnels = 0;
+            int32 SumHitRoomsNoWarp = 0, SumHitTunnelsNoWarp = 0;
+            float LastWarpDilation = 0.0f;
 
             FRandomStream Rng(97531);
             for (int32 t = 0; t < 40; ++t)
@@ -1192,6 +1194,9 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                         if (D.HitChimneys > 0) { ++TilesHitByChimneys; }
                         SumHitRooms   += D.HitRooms;   SumNumRooms   += D.NumRooms;
                         SumHitTunnels += D.HitTunnels; SumNumTunnels += D.NumTunnels;
+                        SumHitRoomsNoWarp   += D.HitRoomsNoWarp;
+                        SumHitTunnelsNoWarp += D.HitTunnelsNoWarp;
+                        LastWarpDilation     = D.WarpDilation;
                     }
                 }
 
@@ -1254,13 +1259,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 if (Breakdown.IsEmpty()) { Breakdown = TEXT("nothing -- AllSolid survived every tile"); }
 
                 AddInfo(FString::Printf(
-                    TEXT("[%s] AllSolid killed by: %s. This is the line that replaced a guess. The first ")
-                    TEXT("build of the spatial EffectOverBox reported 0 proved of 40, and the warning ")
-                    TEXT("offered two candidate causes -- BOTH WRONG. The real one was a third operator ")
-                    TEXT("nobody was looking at: FWormFieldSource answered CarveOnly everywhere, and ")
-                    TEXT("since BaseDensity=8 < WormStrength=10 BY DEFAULT, its provable amplitude bound ")
-                    TEXT("alone drove SolidMargin negative on every tile in the world. Attribution is ")
-                    TEXT("cheap; a second wrong guess is not."),
+                    TEXT("[%s] AllSolid killed by: %s. Names the first operator to kill the ")
+                    TEXT("hypothesis, counted per tile. (Why this line exists, and the wrong guesses ")
+                    TEXT("that preceded it, live in OPSTACK-PROGRESS and are deliberately NOT ")
+                    TEXT("repeated here: a diagnostic that carries narrative gets its live numbers ")
+                    TEXT("read as history and its history read as live numbers.)"),
                     Label, *Breakdown));
 
                 if (NumRoomKilled > 0)
@@ -1269,17 +1272,19 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                         TEXT("[%s] ...and when RoomGraphSource is the killer (%d tiles), WHICH primitive class ")
                         TEXT("reaches the box: rooms %d, tunnels %d, pits %d, chimneys %d (tiles, not ")
                         TEXT("primitives -- a tile can be hit by several). Averages per killed tile: ")
-                        TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. This line named ")
-                        TEXT("the tunnels (32 of 34 tiles vs 21 for rooms), and they have since been ")
-                        TEXT("given a second test: a tunnel now also passes if its own SDF stays >= ")
-                        TEXT("T+K over the box, which beats its bounding-sphere cull badly for a long ")
-                        TEXT("thin capsule. So a tunnel counted HERE is one genuinely close to the ")
-                        TEXT("box, not a bounding-sphere artefact. Rooms keep the cull test alone, ")
-                        TEXT("because for them the cull (Rmax+3K) is tighter than the threshold ")
-                        TEXT("(Rmax+T+K) -- that is arithmetic, not an omission."),
+                        TEXT("%.1f of %.1f rooms reach, %.1f of %.1f tunnels reach. ")
+                        TEXT("WARP SHARE: the query box is dilated by +/-%.1f voxels per axis for the ")
+                        TEXT("warped room/tunnel query; with that dilation set to ZERO the same tests ")
+                        TEXT("would keep only %.1f rooms and %.1f tunnels. The gap between those ")
+                        TEXT("pairs is blocking caused by MY BOX rather than by geometry -- the term ")
+                        TEXT("that went unmeasured while three rounds of tightening happened around ")
+                        TEXT("it. If the gap dominates, tighten the warp bound, not the primitives."),
                         Label, NumRoomKilled, TilesHitByRooms, TilesHitByTunnels, TilesHitByPits, TilesHitByChimneys,
                         (float)SumHitRooms   / (float)NumRoomKilled, (float)SumNumRooms   / (float)NumRoomKilled,
-                        (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled));
+                        (float)SumHitTunnels / (float)NumRoomKilled, (float)SumNumTunnels / (float)NumRoomKilled,
+                        LastWarpDilation,
+                        (float)SumHitRoomsNoWarp   / (float)NumRoomKilled,
+                        (float)SumHitTunnelsNoWarp / (float)NumRoomKilled));
                 }
             }
 

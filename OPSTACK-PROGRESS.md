@@ -3027,3 +3027,95 @@ with the ~88 tunnels in the cache and the criterion would be worthless.
 ≥13 tiles were tunnel-only blocked, so somewhere near 19 of 40 is the expectation. And
 `[dense fixture]` **must stay at 0** — if the dense world starts proving tiles, the disjunction is
 wrong somewhere and the brute force is the thing that will say so.
+
+## 2026-07-29 — Jahni: "are you in a loop?" **Yes.** The dominant term was a constant I set on day one and never measured.
+
+11 of 40 proved, 0 violations — real, but Jahni called it: *still wrong, re-read the original and how
+you're doing it.* He was right, and the re-read found it in one line.
+
+### The loop
+
+`PerlinAbsBound = 2.0`, chosen in the very first commit of the spatial `EffectOverBox` and never
+revisited. The warp dilation is `CaveWarpStrength · VOXEL_NOISE_SCALE · PerlinAbsBound`, and
+**`CaveWarpStrength = 8.0` by default** (the fixture does not override it):
+
+```
+dilation = 8 × 1.25 × 2.0 = 20 voxels, applied ±, on every axis
+tile     = 10 voxels  →  query box 50 voxels per side  →  125× the tile's volume
+BoxHalfDiag = 43.3
+```
+
+So the tunnel test I described as "an order of magnitude tighter" actually required
+`DistToAxis ≥ 28 + 43.3 + 7 = 78`, against a bounding-sphere cull that rejects at ~107. **27 %
+tighter, not 10×** — and the run reported exactly that: tunnels reaching went 78.0 → 58.5, a 25 %
+cut. The instrument told me the truth and I credited it to the tunnels.
+
+Four rounds of work — the worm, the columns, the sampler, the tunnel disjunction — every one of them
+tightening a term while **the term nobody measured stayed 125× too big**. Each round was individually
+correct and the loop was still real: *I kept instrumenting the thing I had just changed, and never
+instrumented the thing I had assumed.*
+
+### What re-reading the original actually showed
+
+`BuildChunkCache` is called — in `GetDensityWithParams`, in `FRoomGraphSource::Eval`, everywhere —
+with `Expansion = CaveWarpStrength + 2.0f`. That is the shipped, working, years-old code, and it is
+only correct if `|Perlin3D| · VOXEL_NOISE_SCALE ≤ CaveWarpStrength`, i.e. **`|Perlin3D| ≤ 0.8`**.
+
+**The whole plugin has always bet on 0.8. I chose 2.0 — 2.5× more conservative than the assumption
+the cache's own correctness already rests on — and then optimised around my own choice for three
+builds.** That is the answer to "are you in a loop", and it is not a subtle one.
+
+### The corrected bound, derived rather than guessed
+
+Read out of `GradDot`: `u` and `v` are always **two distinct** components of the corner offset —
+checked on all four hash branches, not assumed. Then per axis, splitting the eight corners by `i`:
+
+```
+Σ_c w_c·|dx_c| = (1−su)·fx + su·(1−fx)        su = Fade(fx)
+               ≤ 0.5     (max at fx = 0.5; 0.302 at fx = 0.25 and 0.75)
+|Perlin3D| ≤ Σ_c w_c(|a_c|+|b_c|) ≤ S_x + S_y + S_z ≤ 1.5
+```
+
+**1.5, provable, no case analysis on the hashes.** (The true max is lower still — only two of three
+axes appear per corner — and the classical `√3/2 ≈ 0.87` depends on the gradient set, so it is not
+leaned on.) Dilation drops 20 → 15 voxels. That is a 25 % cut in the dominant term, honestly
+obtained, and it is *not* the end of the story.
+
+### The instrument that should have existed from the first commit
+
+`EffectOverBox` now also computes every room/tunnel test **with the warp dilation set to zero**, and
+reports both. `HitRooms − HitRoomsNoWarp` is exactly the blocking caused by my own box rather than by
+geometry. The line reads:
+
+```
+WARP SHARE: the query box is dilated by ±N voxels per axis; with that dilation set to ZERO
+the same tests would keep only X rooms and Y tunnels.
+```
+
+If that gap dominates, the next move is the warp bound — **not** the primitives. That sentence is in
+the output so the next person (me, next run) cannot repeat this.
+
+### The other thing that was wrong: the diagnostics had become narrative
+
+The report was printing **hardcoded numbers from previous runs** next to live ones — "the first build
+reported 0 proved of 40", "32 of 34 tiles vs 21 for rooms" — while the live figures said 21 rooms of
+28 tiles. A reader cannot tell which is which, and I wrote every line of it. Diagnostics now report
+**this run only**; the history lives here, in the log, where it belongs.
+
+### Ready to build. Compile-error spots
+
+1. `PerlinAbsBound` 2.0 → 1.5 (one constant, big blast radius on the numbers, none on compilation).
+2. `FBoxState` gained `HitRoomsNoWarp` / `HitTunnelsNoWarp` / `WarpDilation`; mirrored on
+   `VoxelDensityOps::FRoomBoxDiagnostic` and copied in `GetLastRoomBoxDiagnostic`.
+3. `NWMin` / `NWMax` / `NoWarpHalfDiag` are new locals in `EffectOverBox`, declared before use
+   (verified mechanically, along with brace/paren balance).
+4. The per-class report line went from 10 to 13 format specifiers and 13 arguments — counted, and the
+   previous round's arg-list mismatch is exactly why it was counted.
+
+### What to read, and in this order
+
+1. **`WARP SHARE`** — the number that has been invisible all along. `rooms 1.1 → 0.4` would mean most
+   of the remaining block is my dilation and the warp bound is the whole job; `1.1 → 1.0` would mean
+   the geometry really is that dense and the dilation was never the point after the 1.5 fix.
+2. `[production defaults] Box verdicts` — **11 is the number to beat.**
+3. `[dense fixture]` must still be 0.

@@ -2181,6 +2181,11 @@ namespace
              *  `VoxelDensityOps::GetLastRoomBoxDiagnostic`. N'entre dans aucune décision. */
             int32 HitRooms = 0, HitTunnels = 0, HitPits = 0, HitChimneys = 0;
             int32 NumRooms = 0, NumTunnels = 0, NumPits = 0, NumChimneys = 0;
+            /** Les mêmes comptes avec une dilatation de warp NULLE, et de combien de voxels la
+             *  boîte est dilatée. C'est la mesure qui manquait pendant trois builds : sans elle,
+             *  « les tunnels bloquent » et « ma boîte est 125x trop grosse » sont indiscernables. */
+            int32 HitRoomsNoWarp = 0, HitTunnelsNoWarp = 0;
+            float WarpDilation = 0.0f;
         };
 
         static FBoxState& BoxState()
@@ -2204,10 +2209,43 @@ namespace
          * gradients.) Se tromper ici coûte une boîte de recherche un peu plus large, jamais un
          * verdict faux : plus large ⇒ SUR-ensemble de primitives ⇒ `Identity` plus rare.
          *
-         * Provable bound rather than the header's observed one: GradDot returns ru+rv with both in
-         * [-1,1], and a trilinear lerp stays inside the hull of its inputs. Erring high costs CPU.
+         * ⚠️⚠️ **CORRIGÉ DE 2.0 À 1.5 LE 2026-07-28, ET CETTE CONSTANTE ÉTAIT LE TERME DOMINANT DE
+         * TOUTE LA FONCTION PENDANT TROIS BUILDS.** À lire avant d'y retoucher.
+         *
+         * La dilatation vaut `CaveWarpStrength · VOXEL_NOISE_SCALE · CETTE BORNE`. Avec les défauts
+         * (`CaveWarpStrength = 8`, `SCALE = 1.25`) elle valait **20 voxels** — appliquée des deux
+         * côtés de chaque axe d'une tuile de **10 voxels**, soit une boîte de requête de 50 voxels,
+         * **125× le volume de la tuile**. Trois passes de resserrement (le ver, les colonnes,
+         * l'échantillonneur, la disjonction des tunnels) ont été faites AUTOUR de ce terme sans que
+         * personne ne le mesure. Le test des tunnels, annoncé « un ordre de grandeur plus serré », ne
+         * gagnait en pratique que 25 % — exactement parce que `BoxHalfDiag` était dominé par cette
+         * dilatation et non par la géométrie.
+         *
+         * ⚠️ ET LE RESTE DU PLUGIN N'A JAMAIS ÉTÉ AUSSI PRUDENT : `BuildChunkCache` est appelée avec
+         * `Expansion = CaveWarpStrength + 2` (ici comme dans `GetDensityWithParams`), ce qui suppose
+         * `|Perlin3D| · SCALE ≤ CaveWarpStrength`, donc `|Perlin3D| ≤ 0.8`. Le code qui tourne en
+         * production depuis toujours parie déjà là-dessus. Prendre 2.0 était 2,5× plus conservateur
+         * que l'hypothèse dont dépend déjà la correction du cache.
+         *
+         * LA BORNE 1.5, DÉMONTRÉE (et non observée) :
+         *   1. `GradDot` rend `±u ± v` où `u` et `v` sont deux composantes **distinctes** de l'offset
+         *      du coin — vérifié sur les quatre branches du `switch` de hash, pas supposé.
+         *   2. Pour l'axe x : les coins à `i=0` portent le poids `(1−su)` et l'offset `fx`, ceux à
+         *      `i=1` le poids `su` et l'offset `1−fx`. Donc `Σ_c w_c·|dx_c| = (1−su)·fx + su·(1−fx)`,
+         *      dont le maximum sur `[0,1]` vaut **0.5** (atteint en `fx = 0.5`, où `su = 0.5` ;
+         *      0.302 en 0.25 comme en 0.75).
+         *   3. `|Perlin| ≤ Σ_c w_c(|a_c| + |b_c|) ≤ S_x + S_y + S_z ≤ 3 × 0.5 = 1.5.`
+         * (Le vrai maximum est plus bas encore — seuls DEUX axes apparaissent par coin — mais 1.5
+         * est la borne qui se démontre sans analyse de cas sur les hash. `√3/2 ≈ 0.87`, la borne
+         * classique de Perlin 3D, dépend du jeu de gradients : on ne s'appuie pas dessus.)
+         *
+         * Was 2.0, and that constant was the dominant term of this whole function for three builds:
+         * it inflated a 10-voxel tile into a 50-voxel query box (125x the volume), which is why the
+         * "order of magnitude tighter" tunnel test only won 25%. The rest of the plugin has always
+         * assumed |Perlin3D| <= 0.8 (BuildChunkCache's Expansion = CaveWarpStrength + 2). 1.5 is
+         * PROVED above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
          */
-        static constexpr float PerlinAbsBound = 2.0f;
+        static constexpr float PerlinAbsBound = 1.5f;
 
         /**
          * ✅ LA RÉPONSE SPATIALE. La dette annoncée ici pendant tout le portage est payée.
@@ -2430,9 +2468,17 @@ namespace
             B.NumChimneys = B.Cache.Chimneys.Num();
             B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
 
+            // La MÊME boîte sans dilatation de warp — diagnostic seulement, voir plus bas.
+            const FVector NWMin((float)VoxelBox.Min.X, (float)VoxelBox.Min.Y, EffZ((float)VoxelBox.Min.Z));
+            const FVector NWMax((float)VoxelBox.Max.X, (float)VoxelBox.Max.Y, EffZ((float)VoxelBox.Max.Z));
+            const float NoWarpHalfDiag = 0.5f * (float)(NWMax - NWMin).Size();
+            B.HitRoomsNoWarp = B.HitTunnelsNoWarp = 0;
+            B.WarpDilation = Warp;
+
             for (const FCachedRoom& R : B.Cache.Rooms)
             {
                 if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { ++B.HitRooms; }
+                if (SphereHitsBox(R.Center, R.CullRadiusSq, NWMin, NWMax)) { ++B.HitRoomsNoWarp; }
             }
             //-----------------------------------------------------------------
             // LES TUNNELS ONT DROIT À UN SECOND TEST, ET C'EST LÀ QUE SE TROUVE LE GAIN
@@ -2488,6 +2534,13 @@ namespace
                 if (DistToAxis - BoxHalfDiag - MaxR >= TunnelClear) { continue; }
 
                 ++B.HitTunnels;
+
+                // DIAGNOSTIC — le MÊME test avec une dilatation de warp NULLE. Ne participe à aucun
+                // verdict ; il répond à la seule question que trois builds de resserrement n'ont
+                // jamais posée : « combien de ce blocage est de la géométrie, et combien est ma
+                // propre boîte dilatée ? ». `HitTunnels - HitTunnelsNoWarp` est exactement la part
+                // que le warp coûte.
+                if (DistToAxis - NoWarpHalfDiag - MaxR < TunnelClear) { ++B.HitTunnelsNoWarp; }
             }
             // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
             // `Z >= TopZ - Depth - BlendK`.
@@ -3834,6 +3887,9 @@ VoxelDensityOps::FRoomBoxDiagnostic VoxelDensityOps::GetLastRoomBoxDiagnostic()
     D.NumTunnels  = B.NumTunnels;
     D.NumPits     = B.NumPits;
     D.NumChimneys = B.NumChimneys;
+    D.HitRoomsNoWarp   = B.HitRoomsNoWarp;
+    D.HitTunnelsNoWarp = B.HitTunnelsNoWarp;
+    D.WarpDilation     = B.WarpDilation;
     return D;
 }
 
