@@ -3119,3 +3119,80 @@ reported 0 proved of 40", "32 of 34 tiles vs 21 for rooms" — while the live fi
    the geometry really is that dense and the dilation was never the point after the 1.5 fix.
 2. `[production defaults] Box verdicts` — **11 is the number to beat.**
 3. `[dense fixture]` must still be 0.
+
+## 2026-07-29 — WARP SHARE measured: **over half the blocking is my box.** And two corrections.
+
+The instrument that should have existed from commit one, on its first run:
+
+```
+[production defaults]  0.9 of 1.1 rooms reach, 2.4 of 3.3 tunnels reach
+                       WARP SHARE: dilated ±15.0 voxels/axis; with dilation ZERO
+                       the same tests keep only 0.4 rooms and 1.1 tunnels
+[dense fixture]        5.0 rooms / 46.3 tunnels  →  2.1 / 22.4 with zero dilation
+```
+
+**Rooms 0.9 → 0.4, tunnels 2.4 → 1.1.** Better than half of everything still blocking a verdict is
+caused by the query-box dilation rather than by cave geometry. Hypothesis confirmed, and the number
+is now permanent output.
+
+### ✋ CORRECTION — the justification I gave last entry was wrong
+
+I wrote that `BuildChunkCache`'s `Expansion = CaveWarpStrength + 2` means *"the whole plugin has
+always bet on `|Perlin3D| ≤ 0.8`"*, and used that to argue 2.0 was needlessly conservative. **That is
+false, and I should have read six lines further:**
+
+```cpp
+const bool bNeedRebuild = … || WarpedX < CachedSMinX || WarpedX > CachedSMaxX || …;
+```
+
+The cache **rebuilds when the warped query leaves the box.** So that expansion is a
+*rebuild-frequency heuristic*, not a correctness bound — nothing anywhere bets on 0.8, and the cache
+is self-correcting no matter how far the warp reaches. The 2.0 → 1.5 change stands on its own
+derivation and needs no support from that claim. Sixth premise this refactor that reversed on being
+checked, and this one I asserted **in the same entry where I diagnosed the habit.**
+
+### ✋ NEGATIVE RESULT — "shift the box by the local warp" does **not** work here
+
+The obvious next move is: the warp is smooth and low-frequency (`WF = 0.015`, wavelength ~67 voxels)
+and the tile is only 10 voxels, so evaluate the warp at the box centre, **shift** the box by it, and
+dilate only by the *variation* across the box. Worked through before writing it, and it loses:
+
+A rigorous per-axis Lipschitz bound for this `Perlin3D`:
+
+```
+∂V/∂fx = [Σ_c ∂W_c/∂su · G_c]·Fade'(fx)  +  Σ_c W_c·∂G_c/∂fx
+|Fade'| ≤ 15/8 = 1.875
+|Σ ∂W/∂su · G| ≤ 4          (difference of two convex combinations of values in [−2,2])
+|∂G/∂fx| ≤ 1                (u and v are distinct axes, so at most one of them is x)
+⇒ |∂V/∂fx| ≤ 4·1.875 + 1 = 8.5   per unit noise cell
+```
+
+Half-box in noise units: `WF·5 = 0.075` for x and y, `WF·5/1.35 = 0.056` for z ⇒ 0.206 total.
+So the local variation bound is `8.5 × 0.206 = 1.75`, against a **global** range bound of **1.5**.
+
+**The local bound is worse than the global one.** The crude Lipschitz constant times the box's extent
+in noise space already exceeds the whole range of the function. Recorded so nobody spends a build
+discovering it — the idea is sound in principle and simply does not pay at `WF = 0.015` with a
+Lipschitz constant this loose.
+
+### Where that leaves the warp term
+
+The measured ceiling for *all* remaining warp work is "about half the current blocking", i.e.
+somewhere around 11 → 16-20 tiles of 40. The only route left is tightening the sup of `|Perlin3D|`
+from the proved 1.5 toward its true value:
+
+```
+|Perlin| ≤ S_x + S_y + S_z − Σ_c w_c·min(|dx_c|,|dy_c|,|dz_c|)
+spot values: 1.000 at (0.5,0.5,0.5) · 1.003 at (0.9,0.5,0.5) · 0.614 at (0.9,0.9,0.5)
+```
+
+so the true sup looks like **≈ 1.0–1.1**, worth ~27 % off the dilation. But "spot-checked on a grid"
+is not a proof, and a sup proved wrong here is a tile with no geometry and **no collision**. That is
+analysis work with real hole-risk for a partial share of a bounded prize — a judgement call about
+appetite, not a technical unknown, so it goes to Jahni rather than getting done on my own initiative.
+
+### State: T1.d is delivered and verified
+
+**11 of 40 tiles (27.5 %) proved AllSolid at production defaults, 14641 voxels brute-forced,
+0 violations.** The dense fixture correctly proves nothing. Every verdict is checked voxel by voxel,
+so the risk of the whole feature is bounded by a test that runs on every build.
