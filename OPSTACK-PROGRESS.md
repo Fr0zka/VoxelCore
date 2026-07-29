@@ -3196,3 +3196,73 @@ appetite, not a technical unknown, so it goes to Jahni rather than getting done 
 **11 of 40 tiles (27.5 %) proved AllSolid at production defaults, 14641 voxels brute-forced,
 0 violations.** The dense fixture correctly proves nothing. Every verdict is checked voxel by voxel,
 so the risk of the whole feature is bounded by a test that runs on every build.
+
+## 2026-07-29 — T1.d banked at 11/40. VerticalShafts: the connector branch never tested a connector.
+
+Jahni's call: bank the tunnel result and take VerticalShafts rather than squeeze the Perlin sup.
+Right call — the shaft fix is a clearly-scoped defect with no hole-risk maths, on an archetype that
+was getting nothing.
+
+### The defect, and it is stated in its own comment
+
+`FShaftFieldSource::EffectOverBox` ends with a "connectors" branch that never looks at a connector:
+
+```cpp
+const FBox ConnBox = VoxelBox.ExpandBy(Spacing * 1.6f + Pad);
+for (cells in ConnBox)
+    if (RollShaft(cx, cy, Sh)) { return EVoxelOpEffect::CarveOnly; }   // prudent
+```
+
+It returns `CarveOnly` because a shaft **exists** somewhere in the neighbourhood. Against the
+defaults — `ShaftSpacing = 55`, `ShaftDensity = 0.6`, `Pad ≈ 11 + ExtraReach` — that expanded box
+spans roughly 4×4 cells and therefore ~10 shafts. **The condition is true essentially everywhere**,
+which is exactly the reported `0 proved of 60`. Conservative, never wrong, and completely sterile —
+the same shape as the worm's unconditional `CarveOnly`, one archetype over.
+
+### The fix: rebuild the connectors the way `GetCells` does, and test the real capsule
+
+Two things had to be right, and both were checked in the source rather than assumed:
+
+- **The enumeration is a superset.** `Eval` reads connectors from the 3×3 neighbourhood of *its
+  query's* cell. So any pair visible from a point in the box has both shafts inside the 3×3 of some
+  cell the box touches ⇒ both lie in `[box cells] ± 1`, which is precisely the range swept. Pairs
+  that no query ever sees may be produced — extra `CarveOnly`, never a hole.
+- **The pair order matches, so the hash matches.** `VoxelHash::Pair(A…, B…)` is fed in insertion
+  order, and `GetCells` inserts over `(dy, dx)` — row-major. The sweep here is `(cy, cx)`, the same
+  order, and row-major order restricted to a sub-grid preserves the relative order of any two cells.
+  So the same pair gets the same hash **without assuming `Pair()` is symmetric** — which was never
+  verified and now does not need to be.
+
+The capsule test splits the axes because a connector is a **horizontal** capsule at height `Zc`:
+Z is exact (`RMinZ > Zc + Reach || RMaxZ < Zc - Reach` ⇒ skip), XY uses point-to-segment from the box
+centre minus the XY half-diagonal. Far tighter than a 3-D half-diagonal, which is what the tunnel
+version had to settle for.
+
+### And the same sampler trap, caught this time before the build
+
+The shaft test drew tile XY from `RandRange(-6,6)*8` = **±48 voxels, against `ShaftSpacing = 55`** —
+less than one period of the pattern. Identical in kind to the ±32-vs-80 bug that cost the tunnel test
+three runs. Widened to ±440 (8 periods), and the report now prints its own extent in units of
+`ShaftSpacing`, so it cannot go unnoticed again.
+
+**The safety net was already there and is untouched:** this test brute-forces the full lattice of
+every proved tile against `EvalMC`, both hypotheses, and `AddError`s on the first violation. So the
+fix is checked by construction — if the superset argument or the hash-order argument is wrong, the
+existing assertion fails rather than a player falling through the floor.
+
+### Ready to build. Compile-error spots
+
+1. `VF_DistPointSegment2D` — new helper next to `VF_NearCaveSurface` in the anonymous namespace.
+2. Both new helpers now use `KINDA_SMALL_NUMBER`, matching the ~6 existing uses in the plugin; they
+   were briefly written with the `UE_`-prefixed spelling, which nothing else here uses.
+3. The shaft test hoists `SpanCells` / `SpanVoxels` **outside** the tile loop — the report needs
+   them, and `Extent` is loop-local. (That exact scoping slip happened in the tunnel test two rounds
+   ago; caught here before the build rather than after.)
+4. Format string is 6 specifiers / 6 arguments — counted.
+
+### What to read
+
+`Box verdicts over 60 VerticalShafts tiles` — **0 is the number to beat**, and `%d violations` must
+stay 0. If it is still 0 proved, the warning now says what to check *first*: `ExtraReach` inflates
+both remaining tests, so its value against `ShaftMaxRadius` is the thing to look at before touching
+either test — not a re-derivation from scratch.

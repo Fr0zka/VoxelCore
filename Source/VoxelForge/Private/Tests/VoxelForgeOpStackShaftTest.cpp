@@ -207,14 +207,24 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     {
         int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
         FRandomStream Rng(13579);
+        // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
+        // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
+        const int32 SpanCells  = 55;
+        const int32 SpanVoxels = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
 
         for (int32 t = 0; t < 60; ++t)
         {
             const int32 Step = 1, Cells = 8;
             const int32 Extent = Step * Cells;
+            // ⚠️ L'ÉTENDUE XY ÉTAIT ±48 VOXELS, POUR UN `ShaftSpacing` DE 55 : moins d'UNE cellule
+            // de puits. C'est le même piège que celui qui a coûté trois runs au test TunnelNetwork —
+            // un échantillonneur qui ne couvre pas une période du motif ne mesure pas le monde, il
+            // mesure un point du motif. ±440 = 8 périodes.
+            // The XY extent was ±48 voxels for a ShaftSpacing of 55 — less than one shaft cell, the
+            // same trap that cost the TunnelNetwork test three runs. ±440 covers 8 periods.
             const FIntVector Origin(
-                Rng.RandRange(-6, 6) * Extent,
-                Rng.RandRange(-6, 6) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
                 FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
 
             const int32 GridDim = Cells + 1;
@@ -259,10 +269,24 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("every box verdict the shaft stack emits survives brute force"), NumUnsound, 0);
 
         AddInfo(FString::Printf(
-            TEXT("Box verdicts over 60 VerticalShafts tiles: %d proved uniform, %d Mixed. Today's ")
-            TEXT("ClassifyTile proves ZERO of these -- every cave archetype falls through to \"pas ")
-            TEXT("prouvable en v1\"."),
-            NumProved, NumMixed));
+            TEXT("Box verdicts over 60 VerticalShafts tiles (XY sampled from +/-%d voxels = %.1f x ")
+            TEXT("ShaftSpacing %.0f): %d proved uniform, %d Mixed, brute-forced with %d violations. ")
+            TEXT("This was 0 proved for as long as the connector branch bailed on mere shaft ")
+            TEXT("EXISTENCE within Spacing*1.6 -- true almost everywhere at ShaftDensity 0.6, so it ")
+            TEXT("was conservative AND sterile. It now tests the real connector capsules. Read the ")
+            TEXT("proved count as a measurement; what is ASSERTED is that none of them is wrong, ")
+            TEXT("because a false verdict here leaves no geometry and no collision."),
+            SpanVoxels, (float)SpanVoxels / FMath::Max(P.ShaftSpacing, 1.0f), P.ShaftSpacing,
+            NumProved, NumMixed, NumUnsound));
+
+        if (NumProved == 0)
+        {
+            AddWarning(TEXT("No VerticalShafts tile was proved, so the brute force above verified ")
+                       TEXT("nothing. Before hypothesising: the shaft CIRCLE test and the connector ")
+                       TEXT("CAPSULE test are the only two things that can return CarveOnly here, ")
+                       TEXT("and ExtraReach inflates both -- check its value against ShaftMaxRadius ")
+                       TEXT("before touching either test."));
+        }
     }
 
     return true;

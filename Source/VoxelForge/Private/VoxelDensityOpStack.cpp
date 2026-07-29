@@ -86,10 +86,24 @@ namespace
     {
         const FVector AB = B - A;
         const double LenSq = FVector::DotProduct(AB, AB);
-        const double T = (LenSq > UE_KINDA_SMALL_NUMBER)
+        const double T = (LenSq > KINDA_SMALL_NUMBER)
                        ? FMath::Clamp(FVector::DotProduct(P - A, AB) / LenSq, 0.0, 1.0)
                        : 0.0;
         return (float)FVector::Dist(P, A + AB * T);
+    }
+
+    /** La même chose en 2D, pour les connecteurs de puits : ce sont des capsules HORIZONTALES, donc
+     *  Z se teste exactement et seul XY demande une distance point-segment. */
+    FORCEINLINE float VF_DistPointSegment2D(const FVector2D& P, const FVector2D& A, const FVector2D& B)
+    {
+        const FVector2D AB = B - A;
+        const double LenSq = (double)AB.X * AB.X + (double)AB.Y * AB.Y;
+        const double T = (LenSq > KINDA_SMALL_NUMBER)
+                       ? FMath::Clamp(((double)(P.X - A.X) * AB.X + (double)(P.Y - A.Y) * AB.Y) / LenSq, 0.0, 1.0)
+                       : 0.0;
+        const double DX = (double)P.X - ((double)A.X + AB.X * T);
+        const double DY = (double)P.Y - ((double)A.Y + AB.Y * T);
+        return (float)FMath::Sqrt(DX * DX + DY * DY);
     }
 
     FORCEINLINE bool VF_NearCaveSurface(float Sdf, float SDFBlendRadius)
@@ -1384,20 +1398,88 @@ namespace
                 if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::CarveOnly; }
             }
 
-            // ⚠️ Les connecteurs ne sont PAS testés ici, et c'est délibérément conservatif dans le
-            // mauvais sens si on n'y prend pas garde : un connecteur ne peut exister qu'entre deux
-            // puits d'un voisinage, donc si AUCUN puits n'atteint la boîte élargie de `Spacing*1.6`
-            // (la portée max d'une paire), aucun connecteur ne peut l'atteindre non plus.
-            const FBox ConnBox = VoxelBox.ExpandBy(Spacing * 1.6f + Pad);
-            const int32 KX0 = FMath::FloorToInt((float)ConnBox.Min.X / Spacing);
-            const int32 KX1 = FMath::FloorToInt((float)ConnBox.Max.X / Spacing);
-            const int32 KY0 = FMath::FloorToInt((float)ConnBox.Min.Y / Spacing);
-            const int32 KY1 = FMath::FloorToInt((float)ConnBox.Max.Y / Spacing);
-            for (int32 cy = KY0; cy <= KY1; ++cy)
-            for (int32 cx = KX0; cx <= KX1; ++cx)
+            //-----------------------------------------------------------------
+            // LES CONNECTEURS — LES VRAIES CAPSULES, PLUS « un puits existe dans le coin »
+            //-----------------------------------------------------------------
+            // ⚠️ CE BLOC RENDAIT `CarveOnly` DÈS QU'UN PUITS **EXISTAIT** dans la boîte élargie de
+            // `Spacing·1.6 + Pad`, sans jamais regarder un connecteur. Avec les défauts
+            // (`ShaftSpacing = 55`, `ShaftDensity = 0.6`) cette boîte élargie couvre ~4×4 cellules,
+            // donc une dizaine de puits : la condition était vraie PARTOUT et l'archétype prouvait
+            // 0 tuile sur 60. Conservatif, jamais faux — et totalement stérile.
+            //
+            // Ce qu'on fait à la place : reconstruire les connecteurs comme `GetCells` les
+            // construit, et tester la capsule réelle.
+            //
+            // ⚠️ POURQUOI L'ÉNUMÉRATION EST UN SUR-ENSEMBLE (donc sûre). `Eval` lit les connecteurs
+            // du voisinage 3×3 de la cellule DE SA REQUÊTE. Une paire visible depuis un point de la
+            // boîte a donc ses deux puits dans un même 3×3 centré sur une cellule que la boîte
+            // touche ⇒ les deux sont dans [cellules de la boîte] ± 1, qui est exactement la plage
+            // balayée ici. On peut produire des paires que personne ne voit jamais : c'est du
+            // `CarveOnly` en trop, pas un trou.
+            //
+            // ⚠️ ET POURQUOI L'ORDRE (A,B) EST LE MÊME QUE CELUI DE `GetCells`. Le hash de paire est
+            // pris sur (A puis B) dans l'ordre d'insertion, et `GetCells` insère en `(dy, dx)`,
+            // c'est-à-dire en balayage ligne par ligne. On balaie ici `(cy, cx)`, le même ordre — et
+            // un ordre ligne par ligne restreint à une sous-grille garde l'ordre relatif de deux
+            // cellules. Donc la même paire reçoit le même `VoxelHash::Pair`, sans supposer que
+            // celui-ci soit symétrique.
+            //
+            // Was: return CarveOnly as soon as any shaft EXISTED within Spacing*1.6 + Pad, which at
+            // ShaftSpacing 55 / ShaftDensity 0.6 is true everywhere -- 0 of 60 tiles proved. Now it
+            // rebuilds the connectors the way GetCells does and tests the real capsule. The pair
+            // enumeration is a superset (safe), and the row-major cell order reproduces GetCells'
+            // insertion order, so each pair gets the same hash without assuming Pair() is symmetric.
+            if (P.CrossConnectChance > 0.0f)
             {
-                FShaft Sh;
-                if (RollShaft(cx, cy, Sh)) { return EVoxelOpEffect::CarveOnly; }   // prudent
+                const int32 QX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
+                const int32 QX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
+                const int32 QY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
+                const int32 QY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
+
+                TArray<FShaft, TInlineAllocator<32>> Near;
+                for (int32 cy = QY0; cy <= QY1; ++cy)
+                for (int32 cx = QX0; cx <= QX1; ++cx)
+                {
+                    FShaft Sh;
+                    if (RollShaft(cx, cy, Sh)) { Near.Add(Sh); }
+                }
+
+                const float ConnReach = P.ConnectorRadius + ExtraReach;
+                const float BottomZ   = P.StrateBottomWorldZ + P.BoundarySealThickness;
+                const float TopZ      = P.StrateTopWorldZ    - P.BoundarySealThickness;
+
+                // Z est traité EXACTEMENT (le connecteur est une capsule horizontale à `Zc`), XY de
+                // façon conservative. Séparer les deux est bien plus serré qu'une demi-diagonale 3D.
+                const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
+                const FVector2D CtrXY(0.5f * (float)(VoxelBox.Min.X + VoxelBox.Max.X),
+                                      0.5f * (float)(VoxelBox.Min.Y + VoxelBox.Max.Y));
+                const float HalfDiagXY = 0.5f * FMath::Sqrt(
+                    FMath::Square((float)(VoxelBox.Max.X - VoxelBox.Min.X)) +
+                    FMath::Square((float)(VoxelBox.Max.Y - VoxelBox.Min.Y)));
+
+                for (int32 i = 0; i < Near.Num(); ++i)
+                for (int32 j = i + 1; j < Near.Num(); ++j)
+                {
+                    const FShaft& A = Near[i];
+                    const FShaft& B = Near[j];
+                    const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
+                    if (DSq > FMath::Square(Spacing * 1.6f)) { continue; }
+
+                    const uint32 PH = VoxelHash::Pair(
+                        FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
+                        FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), Salt ^ 0xC04Eu);
+                    if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance) { continue; }
+
+                    const float Zc = FMath::Lerp(BottomZ, TopZ,
+                                                 VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
+                    if (RMinZ > Zc + ConnReach || RMaxZ < Zc - ConnReach) { continue; }
+
+                    const float DistXY = VF_DistPointSegment2D(
+                        CtrXY, FVector2D(A.X, A.Y), FVector2D(B.X, B.Y));
+                    if (DistXY - HalfDiagXY >= ConnReach) { continue; }
+
+                    return EVoxelOpEffect::CarveOnly;
+                }
             }
 
             return EVoxelOpEffect::Identity;
