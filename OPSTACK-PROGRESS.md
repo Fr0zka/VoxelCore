@@ -4134,3 +4134,83 @@ or reword that first.
 
 **Neither approach solves VF-03's owner identity, boundary params conservatism, or the memo's
 unproven benefit.** Stated plainly by Sol rather than glossed.
+
+## 2026-08-17 (o) — Approach A + unambiguous bails + CP owner key LANDED on `experimental`
+
+Jahni explicitly authorised writes, commits, and a push to the real `experimental` tree. The three
+code changes below were landed there as separate commits. **Nothing in this entry was built,
+compiled, run in the editor, automation-tested, or measured.** All checks were static source/diff
+inspection plus `git diff --check`. The tree is ready for Jahni's build, not claimed green.
+
+### `8295f6e` — six-box surface-column LRU + cave-only opt-in diagnostic
+
+- Landed Approach A's six 81×81 direct-indexed boxes in
+  `FSurfaceColumnSource::GetColumn`. An acquisition miss recentres and clears one LRU victim; the
+  other five working sets stay warm. Exact `uint64 ColumnKey`, exact XY coverage, per-cell computed
+  flags, and fractional-XY direct computation are retained.
+- Deliberately kept the recommended six boxes despite the estimated **~0.79 MiB TLS per worker**
+  versus ~0.13 MiB for one box. There is no same-route measurement supporting an arbitrary smaller
+  count; silently choosing one would trade unknown miss behaviour for memory without evidence.
+- Applied the report's caveat before landing: `UVoxelStrateManager::Initialize` counts and lists
+  disabled **cave** slots only. `SurfaceWorld` is explicitly excluded because its exact-lattice
+  T1.d proof does not depend on `bUseOperatorStack`. The flag remains a real per-asset A/B switch;
+  no forced cutover from Approach B was taken.
+- Likely compile-error/watch spots for this commit: MSVC/UE function-local TLS for the large nested
+  `FColumnCache`; aggregate initialization of six `FColumnBox` values; range-for/member lookup in
+  the local `Acquire`; `FMemory::Memzero` on the selected `Computed` array; the new `UE_LOG` format
+  arguments and direct `Slot.Definition->GeneratorType` access.
+
+### `1e02c63` — the old `Cave Bail Not Op Stack` no longer means two things
+
+- Replaced the ambiguous counter with four named sites: `Sole Slot` means the complete sampled tile
+  Z range is proved inside the disabled slot; `Boundary Tile` means that range crosses its bounds;
+  `No Layout` means the failed chunk has no resolvable slot; `Recheck` means the later exhaustive
+  XYZ guard failed after the Z pass had already accepted the cave slot.
+- This is instrumentation only. The existing `UsesOperatorStackForChunk` predicate is still tested
+  at the same point, and every original `ClassifyTile` return point and return value is unchanged.
+  Slot bounds are queried only after that predicate has already failed, solely to choose a counter.
+- Likely compile-error/watch spots for this commit: declaration/definition spelling for all four UE
+  stats; the long stat display names; `FloorDivC` visibility inside the diagnostic branch; and the
+  `GetStrateChunkZBounds(ChunkZ, Top, Bottom)` argument order. A source diff confirms no terrain
+  predicate or `EVoxelTileClass` return changed, but only a build can validate the stat macros.
+
+### `f90c4e5` — VF-03's proved `CP_*` cache now has an owner identity
+
+- Each `UVoxelGenerator` receives a monotonic process-unique `DensityCacheOwnerId` from a relaxed
+  atomic at construction. `GetDensityAt` now keys its function-static `thread_local CP_*` state by
+  `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`. A world/generator change therefore refetches
+  params, generator type, disturbances, biome context, `CP_UseOpStack`, and the built op stack, and
+  invalidates `CP_BiomeCache` even when chunk/version values happen to match.
+- Hot-path cost is one additional `uint64` comparison per voxel; atomic work happens only once per
+  generator construction. A monotonic ID was chosen instead of a raw owner pointer so a later
+  UObject address reuse cannot resurrect stale TLS state.
+- Scope was deliberately restricted to the proved `CP_*` path. No claim was made and no key was
+  added to `OC_*`, `BM_*`, passage, biome, diff, or op-local caches. The test fixture's process-unique
+  layout-version bumps remain as conservative isolation for those unaudited caches, with its stale
+  CP-specific explanation corrected.
+- Likely compile-error/watch spots for this commit: UHT/generated-constructor compatibility with the
+  explicit `UVoxelGenerator()` declaration; MSVC/UE support for `<atomic>`, `std::atomic<uint64>`,
+  `fetch_add`, and `std::memory_order_relaxed`; and initialization/access of the new private,
+  non-UPROPERTY `DensityCacheOwnerId` from the `.cpp` constructor and const hot path.
+
+### Deliberately still open
+
+- Read the actual `.uasset` opt-in state in the editor and fly the same underground route. The new
+  `Sole Slot` versus `Boundary Tile` counters make that result interpretable; source cannot answer
+  asset state.
+- Measure the six-box memo on the same seed/route/settings/warm-up and record both miss rate per tile
+  and process memory at the real worker count. The verified structural improvement is **not** yet a
+  measured performance win.
+- Audit owner identity for the other TLS caches separately. This change does not promote VF-03's
+  unproved breadth into fact.
+- Boundary slot/params conservatism and every `ClassifyTile` safety guard remain unchanged.
+
+### Candidate worktree cleanup
+
+The dirty candidate diffs were preserved as named, recoverable stashes before cleanup:
+
+- `c5e067c3` (currently `stash@{1}`) — `archive VF approach A before worktree cleanup 2026-08-17`
+- `3be0b558` (currently `stash@{0}`) — `archive VF approach B before worktree cleanup 2026-08-17`
+
+`../VF-approach-A` and `../VF-approach-B` were then removed from Git's worktree list and their
+directories removed. Stashing was a cleanup-safety deviation only; it did not alter the landed code.
