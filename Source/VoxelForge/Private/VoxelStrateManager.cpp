@@ -2,6 +2,7 @@
 // Runtime strate layout generation and queries.
 
 #include "VoxelStrateManager.h"
+#include "CoreGlobals.h"  // GIsAutomationTesting — the opt-in diagnostic stays quiet under tests
 #include "VoxelSettings.h"
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
@@ -149,11 +150,23 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
         }
     }
 
+    // ⚠️ WARNING EN ÉDITEUR/JEU, JAMAIS EN TEST. Les tests `Determinism.*` construisent
+    // DÉLIBÉRÉMENT un monde non opt-in — c'est leur oracle de comparaison — et le framework
+    // d'automatisation compte un Warning comme un échec. Un diagnostic ne doit pas casser la suite
+    // qu'il est censé éclairer. Le message reste écrit UNE fois : seule la verbosité change.
+    // Warning in editor/game where it is actionable, never in tests: the Determinism.* tests build
+    // a non-opted-in world ON PURPOSE as their comparison oracle, and the automation framework
+    // treats a Warning as a failure. One message, two verbosities.
+    const bool bQuietDiagnostic = GIsAutomationTesting;
+
     if (NumOperatorStackDisabledCaves > 0)
     {
-        UE_LOG(LogTemp, Warning,
+        const FString Summary = FString::Printf(
             TEXT("[StrateManager] Operator-stack opt-in: %d/%d cave layout slots have Use Operator Stack disabled. These slots cannot use operator-stack ClassifyBox/T1.d; enable the asset setting on the listed definitions if that is intended."),
             NumOperatorStackDisabledCaves, NumCaveSlots);
+
+        if (bQuietDiagnostic) { UE_LOG(LogTemp, Log,     TEXT("%s"), *Summary); }
+        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Summary); }
     }
     else
     {
@@ -171,12 +184,15 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             continue;
         }
 
-        UE_LOG(LogTemp, Warning,
+        const FString Line = FString::Printf(
             TEXT("[StrateManager]   cave slot=%d name='%s' Z chunks=[%d to %d] bUseOperatorStack=false"),
             Slot.StrateIndex,
             *Slot.Definition->StrateName.ToString(),
             Slot.TopChunkZ,
             Slot.BottomChunkZ);
+
+        if (bQuietDiagnostic) { UE_LOG(LogTemp, Log,     TEXT("%s"), *Line); }
+        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Line); }
     }
 
     CachedSeed = WorldSeed;

@@ -4231,3 +4231,48 @@ so the pointer proves its own safety instead of relying on two conditions stayin
 Swept the file: the only other `Box.` uses (761–763) are inside the `if` and in scope. Not a logic
 error and not a caching change — a scope slip, invisible in review because the diff showed both
 halves separately. Still unbuilt beyond this compile fix.
+
+## 2026-08-16 (p) — the opt-in diagnostic was failing the test suite; and it answered T1.d
+
+### The six-box LRU worked
+
+Jahni: *"column memo miss is quite a fraction of what it used to be."* First qualitative
+confirmation that the LRU port was the right call — the single-box version wiped 6561 cells on every
+recenter. **Still owed a same-seed/same-route number before it counts as measured.**
+
+### The diagnostic broke the tests, for doing its job
+
+Sol's opt-in warning logs at `Warning`. UE's automation framework counts a `Warning` as a failure,
+and the `Determinism.*` tests **deliberately build a non-opted-in world** — that world is their
+comparison oracle, the baseline the `OpStack.*` numbers are measured against. So the diagnostic was
+failing the suite by correctly reporting an intentional configuration.
+
+Fixed: verbosity is now `Log` when `GIsAutomationTesting`, `Warning` otherwise. The message is
+written **once** and only the verbosity branches (`FString::Printf` then log `%s`) — four copies of a
+long format string across two sites would have been the "one definition, not two kept in sync"
+failure this project already has rules about. `CoreGlobals.h` added explicitly for
+`GIsAutomationTesting` rather than relying on transitivity, since there is no shared PCH.
+
+**Answer to "can I set the tests to use the op stack?" — no, and it must stay that way.** The
+`Determinism.*` fixture being non-opted-in is not an oversight; it is the oracle. `OpStack.*` runs the
+opted-in variant. Flipping the fixture would delete the comparison that gives every T1.d number its
+meaning.
+
+### ⚠️ AND THE DIAGNOSTIC ANSWERED T1.d — pending one check in the GAME log
+
+```
+7/7 cave layout slots have Use Operator Stack disabled
+  cave slot=0..3, 5..7   bUseOperatorStack=false
+```
+
+Slot 4 is absent, which is Sol's SurfaceWorld narrowing working as intended.
+
+Those slots are the **test fixture** (`name=''` ⇒ transient objects). **The line that matters is the
+same log from the real game.** If it also reports slots disabled, then the belief recorded on
+2026-08-16 (h) — *"the data assets in game have the switch on"* — is **wrong**, and T1.d has never
+been enabled in production at all. That single log line settles what a day of counter-reading could
+not, and it costs nothing to read.
+
+⇒ **Next action for Jahni: open the game (not the tests) and search the log for
+`Operator-stack opt-in`.** Whatever it says is the ground truth, and it supersedes both my earlier
+inference from `Cave Bail Not Op Stack` and the recorded belief about the assets.
