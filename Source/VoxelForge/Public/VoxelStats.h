@@ -14,7 +14,10 @@ DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Tiles Skipped All Air"), STAT_VoxelForge
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Tiles Meshed"), STAT_VoxelForgeTilesMeshed, STATGROUP_VoxelForge, VOXELFORGE_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Tiles Operator Stack Solid"), STAT_VoxelForgeTilesOpStackSolid, STATGROUP_VoxelForge, VOXELFORGE_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Tiles Operator Stack Air"), STAT_VoxelForgeTilesOpStackAir, STATGROUP_VoxelForge, VOXELFORGE_API);
-DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Not Op Stack"), STAT_VoxelForgeCaveBailNotOpStack, STATGROUP_VoxelForge, VOXELFORGE_API);
+DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Not Op Stack Sole Slot"), STAT_VoxelForgeCaveBailNotOpStackSoleSlot, STATGROUP_VoxelForge, VOXELFORGE_API);
+DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Not Op Stack Boundary Tile"), STAT_VoxelForgeCaveBailNotOpStackBoundaryTile, STATGROUP_VoxelForge, VOXELFORGE_API);
+DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Not Op Stack No Layout"), STAT_VoxelForgeCaveBailNotOpStackNoLayout, STATGROUP_VoxelForge, VOXELFORGE_API);
+DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Not Op Stack Recheck"), STAT_VoxelForgeCaveBailNotOpStackRecheck, STATGROUP_VoxelForge, VOXELFORGE_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Mixed Content"), STAT_VoxelForgeCaveBailMixedContent, STATGROUP_VoxelForge, VOXELFORGE_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Params"), STAT_VoxelForgeCaveBailParams, STATGROUP_VoxelForge, VOXELFORGE_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Cave Bail Stack Verdict"), STAT_VoxelForgeCaveBailStackVerdict, STATGROUP_VoxelForge, VOXELFORGE_API);

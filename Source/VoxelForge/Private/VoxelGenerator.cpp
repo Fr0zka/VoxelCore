@@ -2809,7 +2809,33 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 // même endroit, que `GetDensityAt`.
                 if (!StrateManager->UsesOperatorStackForChunk(CC))
                 {
-                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStack);
+                    // Attribution DIAGNOSTIQUE uniquement : l'ancien compteur mélangeait une
+                    // strate cave entièrement désactivée avec une tuile de frontière qui avait
+                    // rencontré un slot désactivé avant la garde « slot différent » ci-dessous.
+                    // On résout les bornes APRÈS l'échec du même prédicat ; elles ne changent ni
+                    // la condition, ni le point de retour, ni le verdict.
+                    // Diagnostic attribution only: the old counter mixed a wholly disabled cave
+                    // slot with a boundary tile that met a disabled slot before the different-slot
+                    // guard below. Resolve bounds only after the same predicate fails; classification
+                    // control flow and return value stay unchanged.
+                    int32 FailedTopCZ = 0, FailedBotCZ = 0;
+                    if (!StrateManager->GetStrateChunkZBounds(ChunkZ, FailedTopCZ, FailedBotCZ))
+                    {
+                        INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackNoLayout);
+                    }
+                    else
+                    {
+                        const int32 TileMinCZ = FloorDivC(MinZ, CHUNK_SIZE);
+                        const int32 TileMaxCZ = FloorDivC(MaxZ, CHUNK_SIZE);
+                        if (TileMinCZ >= FailedBotCZ && TileMaxCZ <= FailedTopCZ)
+                        {
+                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackSoleSlot);
+                        }
+                        else
+                        {
+                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackBoundaryTile);
+                        }
+                    }
                     return EVoxelTileClass::Mixed;
                 }
 
@@ -2929,7 +2955,12 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             // déclenché la tentative : un seul chunk hors pile invaliderait le verdict.
             if (!StrateManager->UsesOperatorStackForChunk(CC))
             {
-                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStack);
+                // Le passage Z précédent a déjà accepté l'unique slot cave. Avec le layout actuel
+                // (prédicat indépendant de X/Y), ce recheck est redondant ; un hit nomme donc
+                // précisément cette garde tardive au lieu d'être agrégé aux opt-ins désactivés.
+                // The prior Z pass already accepted the sole cave slot. With the current X/Y-
+                // independent predicate this recheck is redundant, so attribute it separately.
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackRecheck);
                 return EVoxelTileClass::Mixed;
             }
 
