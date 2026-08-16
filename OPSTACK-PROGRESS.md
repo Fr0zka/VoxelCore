@@ -4276,3 +4276,36 @@ not, and it costs nothing to read.
 ⇒ **Next action for Jahni: open the game (not the tests) and search the log for
 `Operator-stack opt-in`.** Whatever it says is the ground truth, and it supersedes both my earlier
 inference from `Cave Bail Not Op Stack` and the recorded belief about the assets.
+
+## 2026-08-16 (q) — suite green again, and the FIELD digest proves nothing moved
+
+14/14 pass, no `StrateManager` warnings in the output — the verbosity fix worked and the diagnostic
+no longer fails the suite it was meant to inform.
+
+### The result that matters: every number is IDENTICAL to the pre-change run
+
+```
+SHAPE digest 0xAC0294F1C6DD354C     FIELD digest 0xF62F3D355B1C0BDB     (both unchanged)
+ClassifyTile        Mixed 472 / AllSolid 70 / AllAir 58      (unchanged)
+OpStack ClassifyTile Mixed 541 / AllSolid 46 / AllAir 13     (unchanged)
+Shafts 30/60 · Maze 27/60 · Slab 45,43,32/60 · Islands 9 AllAir   (unchanged)
+Tunnel [production] 11 proved / 14641 voxels / 0 violations  (unchanged)
+all eight equivalences bit-identical · 0 violations everywhere
+```
+
+**The `FIELD` digest is the strongest evidence available here** — a bit-for-bit hash over 115,000
+samples of the whole field. It is unchanged, so the six-box LRU, the `DensityCacheOwnerId` key, the
+bail re-attribution and the scope fix **did not move a single voxel between them.** Four changes to
+caching, keying and diagnostics, and the world is byte-for-byte the same. That is precisely the
+contract each of them claimed, now tested rather than asserted.
+
+⇒ Caching changes are validated. **Their PERFORMANCE benefit is still unmeasured** — Jahni's
+"quite a fraction of what it used to be" on the column memo is a real observation but not a
+same-seed/same-route number.
+
+### The one thing still open, and it costs a log search
+
+**`Operator-stack opt-in` in the GAME's log.** The fixture reports 7/7 cave slots disabled, which is
+expected there. Whether the *real* world says the same is the ground truth for T1.d, and it
+supersedes both my inference from `Cave Bail Not Op Stack` and the belief recorded in (h). Nothing
+else should be built or reasoned about T1.d until that line is read.
