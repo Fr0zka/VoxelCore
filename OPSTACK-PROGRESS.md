@@ -3553,3 +3553,78 @@ absolute percentage.** The overhang and cliff mods call `GetColumn` again at the
 - `GetGenerationParams` is flagged as the safest of the six if any is ever wanted.
 
 Nothing here needs a decision from Jahni; it all needs the same next build.
+
+## 2026-08-16 (e) — ⛔ A REAL BUG: three box-verdict reaches used a bound this file had already refuted
+
+Found by auditing the invariant the handoff calls "the one that can delete collision", extended to
+the archetypes it does *not* cover. `CODEX-TASK-003`, written, executed by Codex, reviewed. **Not a
+perf change — a correctness change to a box verdict.**
+
+### The finding
+
+This file derives `|Perlin3D| ≤ 1.5` rigorously (the `GradDot` two-distinct-axes form and the
+per-axis weighted bound of 0.5), exposes it as `PerlinAbsBound`, uses it correctly for the tunnel
+warp dilation — and states outright that the noise header's "~[-1,1]" is an observation, not a
+theorem, and that a box verdict resting on one is a hole.
+
+**Three `ExtraReach` formulas in the same file assumed `sup|FBM| ≤ 1.0`**, each with the comment
+"FBM ∈ [-1,1]" — the exact claim disproved 1800 lines above. And `VoxelNoise::FBM` **normalises**
+(`return Total / MaxValue`, `VoxelNoise.h` ~272), so `sup|FBM| = sup|Perlin3D|` **exactly**: the
+octave sum neither amplifies nor attenuates it. The bound was simply wrong, by 1.5×.
+
+`Identity` from these sources means `Sdf ≥ ExtraReach` over the box; roughness then does
+`Sdf += FBM · VOXEL_NOISE_SCALE · Strength`, so soundness needs
+`ExtraReach − B·1.25·|Rough| ≥ (carve/fill threshold)`:
+
+| archetype | `ExtraReach` (defaults) | threshold | needs `B ≤` | at proved `B = 1.5` |
+|---|---|---|---|---|
+| **VerticalShafts** (`Rough 3.0`) | 6.75 | carve 2.0 | 1.27 | ⛔ **UNSOUND**, margin −0.875 |
+| **Maze** (`Rough 2.0`) | 5.5 | carve 2.0 | 1.40 | ⛔ **UNSOUND**, margin −0.25 |
+| **FloatingIslands** (`Rough 4.0`, `K 5.0`) | 16.0 | fill 5.0 + `K/6` | 2.03 | ✅ sound — **by parameter luck**, not construction |
+
+Break-even roughness for the two carve archetypes is `1.6`; they ship at **3.0** and **2.0**.
+
+### How alarmed to be — stated honestly, because overstating this would be its own failure
+
+**Nothing in the running game was ever affected**: no strate has `bUseOperatorStack` ticked. The
+brute-force tile scans report 0 violations, but they **sample**, and for shafts they were sampling a
+source that proved **zero** tiles until `e002bd4` — so that path had never been exercised at all.
+The empirical sup of this Perlin is ~1.0–1.1, *below* the 1.27 the shafts needed, which is why
+nothing surfaced. **The defect is that the verdict rested on an unproved bound** — precisely the
+standard this codebase already adopted and wrote down.
+
+⚠️ And note what made it findable: `e002bd4` (still unbuilt) is what first lets the shaft source
+return `Identity` at all. It converted a latent unsoundness into a reachable one.
+
+### The fix, and why it is safe
+
+`PerlinAbsBound` hoisted to file scope as `VF_PerlinAbsBound` (**one** definition, not a class-static
+plus three implicit `1.0`s — the same "one definition, not two kept in sync" rule that produced
+`VF_BuildOpStackForChunk`), and multiplied into all three reaches. The three lying comments now state
+the real justification.
+
+**It cannot change density by one bit.** `ExtraReach` is read *only* inside `EffectOverBox` — every
+other occurrence in the file is a comment or the `float ExtraReach;` member declaration. Verified
+mechanically after the edit: no `Eval` / `GetCells` / `GetCellsAt` line appears in the diff. The
+eight bit-for-bit equivalence tests are therefore unaffected by construction, not by hope.
+
+The direction is strictly conservative: larger reach ⇒ more `CarveOnly`, fewer `Identity` ⇒ *fewer*
+tiles proved. It can only cost CPU.
+
+New values at defaults: shafts **6.75 → 8.625** (+28 %), maze **5.5 → 6.75** (+23 %), islands
+**16.0 → 18.5** (+16 %).
+
+### ⚠️ What to expect in the build, so a correct result is not misread as a regression
+
+**The Maze and VerticalShafts box-verdict lines may prove FEWER tiles than before. That is the
+correct outcome and the price of a sound bound — do not "fix" it.** Record the before/after.
+`violations` must stay 0, as always. The eight equivalence tests must stay green; if any of them
+moves, the change touched density and the diff is wrong.
+
+### Process note — Codex refused the first run, correctly
+
+The first attempt stopped without editing: my spec wrote `VF_PerlinAbsBound` in its code snippet and
+`PerlinAbsBound` in its prose, and it asked which was intended rather than picking one. That is
+exactly the behaviour the spec template asks for ("if the code contradicts the spec, stop and say so
+rather than guessing"), and it is worth recording that it works — the cost was one clarification
+instead of a plausible-looking wrong rename.

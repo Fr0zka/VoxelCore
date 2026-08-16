@@ -35,6 +35,59 @@
 
 namespace
 {
+    /**
+     * BORNE **PROUVABLE** DE `|Perlin3D|`, ET ELLE N'EST PAS 1.0.
+     *
+     * L'en-tête de `VoxelNoise::Perlin3D` annonce « ~[-1,1] (typiquement [-0.7,0.7]) ». Le `~`
+     * est un aveu : c'est une observation, pas un théorème, et un verdict de boîte fondé sur une
+     * observation est exactement le genre de trou que ce fichier passe son temps à éviter.
+     *
+     * Ce qui EST démontrable, en lisant `GradDot` : il rend `ru + rv` où `ru` et `rv` sont des
+     * composantes de l'offset fractionnaire, donc chacune dans `[-1, 1]` ⇒ `|GradDot| ≤ 2`. La
+     * valeur finale est une interpolation trilinéaire de huit `GradDot`, et une interpolation
+     * convexe ne sort jamais de l'enveloppe de ses entrées ⇒ `|Perlin3D| ≤ 2`. (La vraie borne
+     * de Perlin 3D est `√3/2 ≈ 0.87` ; on ne s'appuie pas dessus, elle dépend du jeu de
+     * gradients.) Se tromper ici coûte une boîte de recherche un peu plus large, jamais un
+     * verdict faux : plus large ⇒ SUR-ensemble de primitives ⇒ `Identity` plus rare.
+     *
+     * ⚠️⚠️ **CORRIGÉ DE 2.0 À 1.5 LE 2026-07-28, ET CETTE CONSTANTE ÉTAIT LE TERME DOMINANT DE
+     * TOUTE LA FONCTION PENDANT TROIS BUILDS.** À lire avant d'y retoucher.
+     *
+     * La dilatation vaut `CaveWarpStrength · VOXEL_NOISE_SCALE · CETTE BORNE`. Avec les défauts
+     * (`CaveWarpStrength = 8`, `SCALE = 1.25`) elle valait **20 voxels** — appliquée des deux
+     * côtés de chaque axe d'une tuile de **10 voxels**, soit une boîte de requête de 50 voxels,
+     * **125× le volume de la tuile**. Trois passes de resserrement (le ver, les colonnes,
+     * l'échantillonneur, la disjonction des tunnels) ont été faites AUTOUR de ce terme sans que
+     * personne ne le mesure. Le test des tunnels, annoncé « un ordre de grandeur plus serré », ne
+     * gagnait en pratique que 25 % — exactement parce que `BoxHalfDiag` était dominé par cette
+     * dilatation et non par la géométrie.
+     *
+     * ⚠️ ET LE RESTE DU PLUGIN N'A JAMAIS ÉTÉ AUSSI PRUDENT : `BuildChunkCache` est appelée avec
+     * `Expansion = CaveWarpStrength + 2` (ici comme dans `GetDensityWithParams`), ce qui suppose
+     * `|Perlin3D| · SCALE ≤ CaveWarpStrength`, donc `|Perlin3D| ≤ 0.8`. Le code qui tourne en
+     * production depuis toujours parie déjà là-dessus. Prendre 2.0 était 2,5× plus conservateur
+     * que l'hypothèse dont dépend déjà la correction du cache.
+     *
+     * LA BORNE 1.5, DÉMONTRÉE (et non observée) :
+     *   1. `GradDot` rend `±u ± v` où `u` et `v` sont deux composantes **distinctes** de l'offset
+     *      du coin — vérifié sur les quatre branches du `switch` de hash, pas supposé.
+     *   2. Pour l'axe x : les coins à `i=0` portent le poids `(1−su)` et l'offset `fx`, ceux à
+     *      `i=1` le poids `su` et l'offset `1−fx`. Donc `Σ_c w_c·|dx_c| = (1−su)·fx + su·(1−fx)`,
+     *      dont le maximum sur `[0,1]` vaut **0.5** (atteint en `fx = 0.5`, où `su = 0.5` ;
+     *      0.302 en 0.25 comme en 0.75).
+     *   3. `|Perlin| ≤ Σ_c w_c(|a_c| + |b_c|) ≤ S_x + S_y + S_z ≤ 3 × 0.5 = 1.5.`
+     * (Le vrai maximum est plus bas encore — seuls DEUX axes apparaissent par coin — mais 1.5
+     * est la borne qui se démontre sans analyse de cas sur les hash. `√3/2 ≈ 0.87`, la borne
+     * classique de Perlin 3D, dépend du jeu de gradients : on ne s'appuie pas dessus.)
+     *
+     * Was 2.0, and that constant was the dominant term of this whole function for three builds:
+     * it inflated a 10-voxel tile into a 50-voxel query box (125x the volume), which is why the
+     * "order of magnitude tighter" tunnel test only won 25%. The rest of the plugin has always
+     * assumed |Perlin3D| <= 0.8 (BuildChunkCache's Expansion = CaveWarpStrength + 2). 1.5 is
+     * PROVED above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
+     */
+    static constexpr float VF_PerlinAbsBound = 1.5f;
+
     /** La même enveloppe que `FractalNoise3D` de VoxelGenerator.cpp (qui y est `static`, donc
      *  invisible ici). Le détour par `FVector` est délibéré — voir l'en-tête de ce fichier. */
     FORCEINLINE float HFractal3D(const FVector& Position, int32 Octaves = 4,
@@ -2283,59 +2336,6 @@ namespace
         }
 
         /**
-         * BORNE **PROUVABLE** DE `|Perlin3D|`, ET ELLE N'EST PAS 1.0.
-         *
-         * L'en-tête de `VoxelNoise::Perlin3D` annonce « ~[-1,1] (typiquement [-0.7,0.7]) ». Le `~`
-         * est un aveu : c'est une observation, pas un théorème, et un verdict de boîte fondé sur une
-         * observation est exactement le genre de trou que ce fichier passe son temps à éviter.
-         *
-         * Ce qui EST démontrable, en lisant `GradDot` : il rend `ru + rv` où `ru` et `rv` sont des
-         * composantes de l'offset fractionnaire, donc chacune dans `[-1, 1]` ⇒ `|GradDot| ≤ 2`. La
-         * valeur finale est une interpolation trilinéaire de huit `GradDot`, et une interpolation
-         * convexe ne sort jamais de l'enveloppe de ses entrées ⇒ `|Perlin3D| ≤ 2`. (La vraie borne
-         * de Perlin 3D est `√3/2 ≈ 0.87` ; on ne s'appuie pas dessus, elle dépend du jeu de
-         * gradients.) Se tromper ici coûte une boîte de recherche un peu plus large, jamais un
-         * verdict faux : plus large ⇒ SUR-ensemble de primitives ⇒ `Identity` plus rare.
-         *
-         * ⚠️⚠️ **CORRIGÉ DE 2.0 À 1.5 LE 2026-07-28, ET CETTE CONSTANTE ÉTAIT LE TERME DOMINANT DE
-         * TOUTE LA FONCTION PENDANT TROIS BUILDS.** À lire avant d'y retoucher.
-         *
-         * La dilatation vaut `CaveWarpStrength · VOXEL_NOISE_SCALE · CETTE BORNE`. Avec les défauts
-         * (`CaveWarpStrength = 8`, `SCALE = 1.25`) elle valait **20 voxels** — appliquée des deux
-         * côtés de chaque axe d'une tuile de **10 voxels**, soit une boîte de requête de 50 voxels,
-         * **125× le volume de la tuile**. Trois passes de resserrement (le ver, les colonnes,
-         * l'échantillonneur, la disjonction des tunnels) ont été faites AUTOUR de ce terme sans que
-         * personne ne le mesure. Le test des tunnels, annoncé « un ordre de grandeur plus serré », ne
-         * gagnait en pratique que 25 % — exactement parce que `BoxHalfDiag` était dominé par cette
-         * dilatation et non par la géométrie.
-         *
-         * ⚠️ ET LE RESTE DU PLUGIN N'A JAMAIS ÉTÉ AUSSI PRUDENT : `BuildChunkCache` est appelée avec
-         * `Expansion = CaveWarpStrength + 2` (ici comme dans `GetDensityWithParams`), ce qui suppose
-         * `|Perlin3D| · SCALE ≤ CaveWarpStrength`, donc `|Perlin3D| ≤ 0.8`. Le code qui tourne en
-         * production depuis toujours parie déjà là-dessus. Prendre 2.0 était 2,5× plus conservateur
-         * que l'hypothèse dont dépend déjà la correction du cache.
-         *
-         * LA BORNE 1.5, DÉMONTRÉE (et non observée) :
-         *   1. `GradDot` rend `±u ± v` où `u` et `v` sont deux composantes **distinctes** de l'offset
-         *      du coin — vérifié sur les quatre branches du `switch` de hash, pas supposé.
-         *   2. Pour l'axe x : les coins à `i=0` portent le poids `(1−su)` et l'offset `fx`, ceux à
-         *      `i=1` le poids `su` et l'offset `1−fx`. Donc `Σ_c w_c·|dx_c| = (1−su)·fx + su·(1−fx)`,
-         *      dont le maximum sur `[0,1]` vaut **0.5** (atteint en `fx = 0.5`, où `su = 0.5` ;
-         *      0.302 en 0.25 comme en 0.75).
-         *   3. `|Perlin| ≤ Σ_c w_c(|a_c| + |b_c|) ≤ S_x + S_y + S_z ≤ 3 × 0.5 = 1.5.`
-         * (Le vrai maximum est plus bas encore — seuls DEUX axes apparaissent par coin — mais 1.5
-         * est la borne qui se démontre sans analyse de cas sur les hash. `√3/2 ≈ 0.87`, la borne
-         * classique de Perlin 3D, dépend du jeu de gradients : on ne s'appuie pas dessus.)
-         *
-         * Was 2.0, and that constant was the dominant term of this whole function for three builds:
-         * it inflated a 10-voxel tile into a 50-voxel query box (125x the volume), which is why the
-         * "order of magnitude tighter" tunnel test only won 25%. The rest of the plugin has always
-         * assumed |Perlin3D| <= 0.8 (BuildChunkCache's Expansion = CaveWarpStrength + 2). 1.5 is
-         * PROVED above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
-         */
-        static constexpr float PerlinAbsBound = 1.5f;
-
-        /**
          * ✅ LA RÉPONSE SPATIALE. La dette annoncée ici pendant tout le portage est payée.
          *
          * Ce que ça débloque, en un mot : `FSdfConvertOp` renvoie déjà `Identity` (« la source a
@@ -2449,7 +2449,7 @@ namespace
             // 3. LE CACHE POUR LA BOÎTE INTERROGÉE
             //-----------------------------------------------------------------
             const float Warp = (P.CaveWarpStrength > 0.0f)
-                             ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * PerlinAbsBound
+                             ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
                              : 0.0f;
 
             // `+ 2` : la même marge de gradient que la boîte de recherche de `Eval`.
@@ -4101,9 +4101,11 @@ namespace VoxelDensityOps
         constexpr float CarveBlend = 2.0f;
 
         // Portée que la source doit déclarer pour la paire source+carve : la rugosité peut élargir
-        // le puits (FBM ∈ [-1,1] ⇒ ±Strength·VOXEL_NOISE_SCALE), puis le blend du carve. Sur-estimer
-        // coûte du CPU ; sous-estimer serait un trou.
-        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE + CarveBlend + 1.0f;
+        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
+        // prouvée `VF_PerlinAbsBound` ; la rugosité peut élargir le puits, puis vient le blend du
+        // carve. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
+        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
+                               * VF_PerlinAbsBound + CarveBlend + 1.0f;
 
         TUniquePtr<FShaftFieldSource> ShaftSource = MakeUnique<FShaftFieldSource>(P, Seed, ExtraReach);
         const FShaftFieldSource* ShaftPtr = ShaftSource.Get();
@@ -4210,9 +4212,12 @@ namespace VoxelDensityOps
         const float BlendK = FMath::Max(P.SDFBlendRadius, 0.01f);
 
         // Portée que la source doit déclarer pour la paire source+fill : la rugosité peut abaisser
-        // le SDF de `Rough·VOXEL_NOISE_SCALE` (FBM ∈ [-1,1]), le SmoothMin de `K/6` de plus, et le
-        // fill s'applique dès `Sdf < BlendK`. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
+        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
+        // prouvée `VF_PerlinAbsBound` ; le SDF peut être abaissé par la rugosité, puis par le
+        // SmoothMin de `K/6`, et le fill s'applique dès `Sdf < BlendK`. Sur-estimer coûte du CPU ;
+        // sous-estimer serait un trou.
         const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
+                               * VF_PerlinAbsBound
                                + BlendK * 2.0f + 1.0f;
 
         OutStack.Add(MakeConstantVoidSource(P.BaseDensity));
@@ -4242,9 +4247,11 @@ namespace VoxelDensityOps
         const float RoughApplyWithin = R + P.SurfaceRoughness + 2.0f;
 
         // Portée que la source doit déclarer pour la paire source+carve : le rayon du couloir peut
-        // être élargi par la rugosité (FBM ∈ [-1,1] ⇒ ±Strength·VOXEL_NOISE_SCALE) puis par le blend
-        // du carve. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
-        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE + CarveBlend + 1.0f;
+        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
+        // prouvée `VF_PerlinAbsBound` ; le rayon du couloir peut être élargi par la rugosité puis
+        // par le blend du carve. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
+        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
+                               * VF_PerlinAbsBound + CarveBlend + 1.0f;
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
         OutStack.Add(MakeLatticeCorridorSource(P, Seed, ExtraReach));
