@@ -306,7 +306,9 @@ driven by `EditorBrush*` props.
 - **SDF cache** (`GetDensityWithParams`): search-BOX validity, not chunk-key — gradient ±1
   sampling must not thrash the (expensive) rebuild.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
-  thread-locally per chunk; don't move the fetch/blend back to per-voxel.
+  thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
+  prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner
+  or layout key, and don't move the fetch/blend back to per-voxel.
 - **Biome cache** (`ResolveBiomeSampleAt`/`FChunkBiomeCache`, §8.14): validity is a world-XY BOX +
   ChunkZ + Seed, NOT a chunk key — same reason as the SDF cache. The cell classification is
   noise-heavy; a chunk-key would thrash it on gradient-normal / +X/+Y boundary samples. Keep

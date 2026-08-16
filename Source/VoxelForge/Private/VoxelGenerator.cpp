@@ -18,6 +18,8 @@
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 
+#include <atomic>
+
 //=============================================================================
 // L'ADAPTATEUR DE CHAMP DE BIOMES / THE BIOME FIELD ADAPTER
 //=============================================================================
@@ -445,6 +447,13 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
 // never fetched here — both callers already have them.
 namespace
 {
+    // Une identité monotone évite qu'un worker réutilise les CP_* d'un monde détruit même si
+    // l'allocateur UObject recycle plus tard la même adresse. Relaxed suffit : on ne publie aucune
+    // donnée, on alloue seulement une valeur distincte par instance.
+    // A monotonic identity prevents stale CP_* reuse even if UObject allocation later recycles an
+    // address. Relaxed ordering is sufficient: this allocates uniqueness, it publishes no data.
+    std::atomic<uint64> GNextDensityCacheOwnerId { 0 };
+
     struct FVoxelStackParamRefs
     {
         const FSlabGenerationParams*   Slab    = nullptr;
@@ -542,6 +551,11 @@ namespace
     }
 }
 
+UVoxelGenerator::UVoxelGenerator()
+    : DensityCacheOwnerId(GNextDensityCacheOwnerId.fetch_add(1, std::memory_order_relaxed) + 1)
+{
+}
+
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
     // Seul le seed est copié ici. Tout le reste (params de cave, transitions,
@@ -579,7 +593,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // The generator type, the (boundary-blended) param struct, and the disturbance
         // params are identical for the whole chunk, yet resolving them re-runs a strate
         // lookup + copies large structs (and a ~60-field Lerp for blended cave chunks).
-        // Cache them thread-locally, keyed by chunk coord — refetch only on chunk change.
+        // Cache them thread-locally, keyed by owner + chunk coord + layout version — refetch only
+        // when one of those integer identities changes.
+        thread_local uint64                  CP_OwnerId = 0;
         thread_local FIntVector              CP_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
         thread_local ECaveGeneratorType      CP_GenType = ECaveGeneratorType::TunnelNetwork;
         thread_local FStrateGenerationParams CP_Tunnel;
@@ -613,18 +629,23 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // "I tweaked the strate asset, regenerated, and one patch kept the old shape."
         thread_local uint32                   CP_Version = 0xFFFFFFFFu;
         // OPSTACK Phase 1 — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
-        // params (donc même clé chunk+version, aucune logique d'invalidation en plus). Vide tant que
+        // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide tant que
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
-        if (ChunkCoord != CP_Chunk || LayoutVersion != CP_Version)
+        const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
+        if (bOwnerChanged || ChunkCoord != CP_Chunk || LayoutVersion != CP_Version)
         {
             // La grille de biome est validée par une BOÎTE XY, qui ne dit rien du FBiomeContext
             // ayant servi à classer ses cellules : sur un changement de version elle est périmée
-            // même si la boîte couvre encore la requête.
-            if (LayoutVersion != CP_Version) { CP_BiomeCache.Invalidate(); }
+            // même si la boîte couvre encore la requête. Même invalidation quand le propriétaire
+            // change : deux mondes peuvent partager version et coordonnées, jamais leur contexte.
+            // The biome grid's XY box says nothing about its context. Owner changes invalidate it
+            // too: two worlds may share version and coordinates, never cached params/context.
+            if (bOwnerChanged || LayoutVersion != CP_Version) { CP_BiomeCache.Invalidate(); }
+            CP_OwnerId = DensityCacheOwnerId;
             CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);

@@ -68,6 +68,8 @@ class VOXELFORGE_API UVoxelGenerator : public UObject
     GENERATED_BODY()
 
 public:
+    UVoxelGenerator();
+
     //=========================================================================
     // SEED (source unique: Settings->Seed)
     //=========================================================================
@@ -321,6 +323,10 @@ public:
     EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const;
 
 private:
+    /** Identité process-unique du propriétaire des caches `CP_*` thread_local.
+     *  Process-unique owner identity for the `CP_*` thread-local cache key. */
+    uint64 DensityCacheOwnerId = 0;
+
     /** Pick the biome (index into Ctx.Biomes) for a Voronoi site, by its climate. */
     int32 ClassifyBiomeAtSite(float SiteX, float SiteY, const FBiomeContext& Ctx, uint32 SiteHash) const;
 

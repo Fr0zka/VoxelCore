@@ -251,18 +251,20 @@ redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
 > **Game-thread profiling (Perf):** `AVoxelWorld::Tick` and its sub-steps are wrapped in `TRACE_CPUPROFILER_EVENT_SCOPE` — `VoxelForge_Tick / UpdateChunks / BuildDesiredTiles / CullTiles / SubmitTiles / ProcessPending / ProcessUnload / UpdateDecorations / UpdateWater`. Capture a `Count/Incl/Excl` Insights timer export and read the `Excl` column to see which step owns the per-frame cost (the actor tick shows as `BP_VoxelWorld_C` if subclassed in BP). `VoxelForge_ClassifyTile` (T1.d) / `VoxelForge_GenerateMesh` + `VoxelForge_BuildStreams` are worker-side (off the frame): the RMC `FRealtimeMeshStreamSet` is now built on the gen worker (`BuildTileStreamSet`) and carried on `FChunkResult::Streams` (TSharedPtr), so `ApplyMeshToTile` is game-thread-cheap — just material/ceiling resolve + `CreateSectionGroup(MoveTemp)`. See ARCHITECTURE §8.10 "Worker-built StreamSet (T1.f)".
 
 ### 3.6 Density generator — `Public/VoxelGenerator.h` + `Private/VoxelGenerator.cpp`
-`UVoxelGenerator : UObject` — lightweight; holds `Seed`, and injected services
-`StrateManager` + `DiffLayer` (both nullable). This is **where terrain shape lives.**
+`UVoxelGenerator : UObject` — lightweight; holds `Seed`, a process-unique
+`DensityCacheOwnerId`, and injected services `StrateManager` + `DiffLayer` (both nullable).
+This is **where terrain shape lives.**
 
 | Symbol | .cpp line | Role |
 |--------|-----------|------|
+| `UVoxelGenerator` / `DensityCacheOwnerId` | — | Constructor allocates a process-unique integer identity (relaxed atomic, once per object). `GetDensityAt` includes it in the `CP_*` thread-local key, preventing a worker from serving another generator/world's params, biome context, `CP_UseOpStack`, or stack when `(ChunkCoord, LayoutVersion)` happens to match. Hot-path cost: one `uint64` compare per voxel. Scope is deliberately only the proved `CP_*` path. |
 | `FractalNoise3D` (static) | 25 | fBM (layered Perlin). |
 | `RidgedNoise3D` (static) | 55 | Ridged multifractal — craggy. |
 | `CellularNoise3D` (static) | 101 | Worley/cellular — grotto/scallop. |
 | `ApplyBoundarySeal` (static) | 170 | Solidifies strate top/bottom shells. |
 | `ApplyPassageCarving` (static) | 197 | Punches passages/elevator through the seal. |
 | `InitializeSettings` | 211 | Copies seed from settings. |
-| **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, dispatches, adds diff offset. |
+| **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, dispatches, adds diff offset. Its `CP_*` per-chunk state is keyed by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; every key component is an integer compare and a different generator/world cannot inherit the previous owner's cached params or op stack. |
 | **`GetDensityWithParams`** | 277 | TunnelNetwork pipeline (~1000 lines). See §4. ⚠️ Takes **required** `ParamsFingerprint` + `LayoutVersion` since the AUDIT §C2 fix (2026-07-28) — they go into the SDF cache key so a chunk can no longer be evaluated against a neighbour's rooms. Callers compute the CRC **once per chunk** (`CP_TunnelFP`), never per voxel. |
 | **`GetSlabDensity`** | 1306 | FlatPlain/CrystalChamber pipeline. See §4.2. |
 | `SampleSurfaceStructuralZ` | — | **F20:** the RAW SurfaceWorld heightfield (continents+mountains+detail), BEFORE any terrain op; returns terrain Z + relief M. Cliff re-samples it at an XY offset for a cheap analytic slope. |

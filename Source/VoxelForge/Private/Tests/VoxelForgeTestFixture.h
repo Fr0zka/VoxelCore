@@ -129,22 +129,20 @@ namespace VoxelForgeTest
             // elle n'était jusqu'ici masquée que par un accident.
             //
             // `PassagesVersion` est PAR INSTANCE et part de 0, donc deux `FTestWorld` successifs
-            // rendaient tous les deux **1**. Or les caches par chunk de `GetDensityAt` sont clés sur
-            // `(ChunkCoord, LayoutVersion)` : deux mondes différents, même version, même chunk ⇒ le
-            // second se voit servir les params — ET le drapeau `CP_UseOpStack` — du premier.
-            // Personne ne l'a vu parce que `bUseOperatorStack` valait false partout : les deux
-            // mondes étaient d'accord par défaut. Le premier monde qui coche la case fait tomber
-            // cette coïncidence, dans les DEUX sens (il contamine, et il est contaminé).
+            // rendaient tous les deux **1**. Historiquement, les caches `CP_*` de `GetDensityAt`
+            // n'avaient que `(ChunkCoord, LayoutVersion)` et le second monde pouvait hériter les
+            // params — ET `CP_UseOpStack` — du premier. `DensityCacheOwnerId` ferme maintenant CE
+            // chemin prouvé. Les bumps restent ici comme isolation conservatrice des autres caches
+            // TLS que cette correction n'a volontairement pas audités ni modifiés.
             //
             // Un compteur de processus donne à chaque monde une version distincte, donc tout cache
             // survivant d'un test à l'autre est forcément invalidé. `Initialize` est déterministe
             // (le pool est mélangé par le seed, les fixed strates sont épinglées), donc le rappeler
             // ne change pas le layout — seulement le compteur.
             //
-            // Each test world gets a process-unique LayoutVersion. Two worlds both reporting 1 made
-            // GetDensityAt's per-chunk caches serve the previous world's params — and its
-            // CP_UseOpStack flag — for the same chunk coord. Invisible while every world agreed that
-            // the flag was false.
+            // Each test world still gets a process-unique LayoutVersion. DensityCacheOwnerId now
+            // prevents the proved CP_* cross-world reuse directly; the version bumps remain as
+            // conservative isolation for other TLS caches not audited or changed by that fix.
             static int32 GWorldSerial = 0;
             const int32 Bumps = ++GWorldSerial;
             for (int32 b = 0; b < Bumps; ++b)
