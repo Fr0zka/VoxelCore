@@ -3330,3 +3330,48 @@ actually built.
    `Box verdicts over 60 VerticalShafts tiles`. 0 was the number for the project's whole life.
 3. **PERF** — the op path is measurably slower; suspects listed in the handoff. Measure first.
 4. The warp squeeze stays **parked** with its ceiling measured and a negative result recorded.
+
+## 2026-08-16 — reviewing CODEX-TASK-001 against the code reversed its acceptance bar
+
+Orchestrator pass over the spec before handing it to Codex, per the rule that a spec here must carry
+the invariant and not just the task. Reading `UVoxelGenerator::ClassifyTile` end to end found the
+spec's deliverable unmeasurable as written.
+
+### The defect
+
+The spec's baseline was *"with no strate opted in, `TilesSkippedAllSolid` underground stays 0"*.
+It cannot. `ClassifyTile` reaches a non-`Mixed` verdict by **two independent routes**:
+
+- **hand-written, predates all of this** — a chunk in a bedrock gap sets `bCanAir = false`
+  (VoxelGenerator.cpp ~2835); absent a passage or the origin spine the tile resolves **`AllSolid`**.
+  Plus the SurfaceWorld column scan. Both fire with **no strate ticked at all** — this is precisely
+  the "~84 % already rejected" note at the call site, which the spec quoted as a warning and then
+  contradicted in its own acceptance section;
+- **operator stack** — the `if (bAnyCave)` block, the only thing T1.d added.
+
+A single lumped counter mixes them, so the before/after Jahni is meant to read would have had a
+large non-zero "before" and a slightly larger "after". Unreadable — and the exact failure mode this
+project already has a lesson for: *when a zero has several possible causes, give each one its own
+number.*
+
+### The fix — site B
+
+Second site: the exit of the `bAnyCave` block (~3009), counters `TilesOpStackSolid` /
+`TilesOpStackAir`. The property that makes them the right instrument is stronger than the one they
+replace: the cave branch returns `Mixed` outright at `UsesOperatorStackForChunk` (~2809, and again
+per chunk of the box at ~2914), so **without an opted-in strate these are zero by construction, not
+by observation**. A non-zero reading cannot come from anywhere else.
+
+Also written into the spec: `TilesOpStackSolid ≤ TilesSkippedAllSolid` as a cross-check, the
+warning that a swapped solid/air pair reads as a plausible result while proving the wrong thing, and
+the note that `ClassifyTile` is `const` on the same workers as site A so the `INC_DWORD_STAT` rule
+covers both sites.
+
+`6bd5589`, pushed. **Nothing was built or run** — this is a documentation commit.
+
+### Unchanged and still open
+
+1. `CODEX-TASK-001` — now correct, ready to hand to Codex.
+2. `e002bd4` (VerticalShafts connector capsules) — written, **not yet built**. Read
+   `Box verdicts over 60 VerticalShafts tiles`; 0 is the number to beat, `violations` must stay 0.
+3. PERF on the op path; the warp squeeze stays parked.
