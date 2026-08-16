@@ -151,7 +151,11 @@ built and green.
   "~[-1,1]". Over-estimating costs CPU; under-estimating deletes collision.
 - `ProcessQueue` stays `EQueueMode::Mpsc`; `Epoch` carries through every async path; don't "optimize"
   the `ARCHITECTURE §8.10` invariants.
-- Commit per coherent unit with a real message. **Never push.** `main` is the known-good fallback.
+- Commit per coherent unit with a real message. **`experimental` is pushed and tracked
+  (`origin/experimental`, since 2026-07-29) — keep it in sync. NEVER push `main`**, which stays the
+  known-good fallback at the commit it has always been. ⚠️ A pushed commit here is **not** a
+  "verified green" marker: the branch carries unbuilt work by design, and only `OPSTACK-PROGRESS.md`
+  says what was actually built.
 - Update `CODEMAP §3`, `ARCHITECTURE §8`, tick `OPSTACK-PLAN`, append to `OPSTACK-PROGRESS.md`.
 - **When inserting a class into `VoxelDensityOpStack.cpp` / `VoxelHeightOpStack.cpp`, put it ABOVE
   the labelled end of the anonymous namespace.** Anchoring on the FACTORIES banner puts it outside,

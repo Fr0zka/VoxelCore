@@ -146,7 +146,9 @@ mid-edit, and nobody will be watching.** Everything below follows from that.
 CRASH-SAFE DISCIPLINE (non-negotiable when unattended)
 1. `git commit` after every coherent unit — a file, a test, a header. Small and often. You are on
    branch `experimental`; `main` is the known-good fallback, so committing costs nothing and a
-   half-finished commit is infinitely better than an uncommitted half-edit. Never push.
+   half-finished commit is infinitely better than an uncommitted half-edit. Pushing `experimental`
+   is fine and expected (it is tracked as `origin/experimental` since 2026-07-29); **never push
+   `main`.**
 2. Maintain `OPSTACK-PROGRESS.md` at the plugin root. APPEND (never rewrite) a dated entry per
    milestone: what you did, what you believe is true, what is UNVERIFIED (i.e. everything not yet
    built), and the single next action. Write the entry BEFORE starting the work it describes, so an
