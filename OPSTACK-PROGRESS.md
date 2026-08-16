@@ -4455,3 +4455,90 @@ four-way split of `Cave Bail Not Op Stack` showed `SoleSlot` and `BoundaryTile` 
 proved the assets were correctly ticked (Jahni said so twice; I doubted it twice) and pointed at
 `NoLayout`, a cause nobody had considered. *A counter that can fire for two reasons is not a
 measurement.*
+
+## 2026-08-17 (v) — mixed-content split + guarded category fold LANDED, awaiting Jahni's build
+
+**Nothing in this entry was built, compiled, run in the editor, automation-tested, or measured.**
+The only validation was static source/diff inspection and `git diff --check`. All rates below are
+instructions for the next flight, not claimed results.
+
+### The old 0.77 bucket is split before changing its guard
+
+`Cave Bail Mixed Content` had three call sites and four meanings. It is replaced by:
+
+- `Cave Mix Out Of Layout` — a tile contains one cave slot plus constant-air outside the layout;
+- `Cave Mix Gap` — one cave slot plus solid inter-strate bedrock;
+- `Cave Mix Surface World` — one cave slot plus a SurfaceWorld slot;
+- `Cave Bail Two Cave Slots` — a second cave slot was found; this remains an immediate `Mixed` bail.
+
+The first three are deliberately **presence counters**, incremented once per present category per
+tile before the later stack guards. They are not exclusive for an unusually tall tile, so they are
+not expected to sum to the old 0.77; each answers one unambiguous yes/no question. This placement is
+why the diagnostic survives the fold: a tile can increment `Cave Mix Out Of Layout` and later be
+proved `AllAir`. `Two Cave Slots` is still a bail counter because that condition was not relaxed.
+
+The split was applied first with the original `return Mixed` intact. Only after that
+behavior-preserving split was inspected was the return deliberately replaced by the fold below.
+
+### Decision: relax one-category, NOT one-cave-slot
+
+Folding is safe, but only in the narrow form suggested by the code:
+
+- Gap already contributes a proved `solid` hypothesis, out-of-layout a proved `air` hypothesis,
+  and SurfaceWorld classifies its exact mesher lattice through `ComputeSurfaceColumn`.
+- The one cave slot records the minimum/maximum **sampled cave Z**. `ClassifyBox` receives that cave
+  Z sub-box with the tile's full XY extent; asking it about the previous full tile box would model
+  gap/surface/out-of-layout with cave params and is not valid.
+- Opt-in, generator type, and bit-identical params are still checked for **every chunk intersecting
+  that cave sub-box in XYZ**. They were narrowed in Z only to exclude categories represented by
+  their own hypotheses; none was removed or weakened.
+- The stack verdict folds into the existing `bCanSolid` / `bCanAir`, then SurfaceWorld's exact
+  column scan still runs. `Tiles Operator Stack Solid/Air` now increments only for the final
+  non-`Mixed` tile verdict, after all categories have agreed.
+
+The independent **one-cave-slot requirement cannot be relaxed by this fold**. A second cave slot can
+carry a different archetype, opt-in, params, and stack; proving it would require building and
+guarding a second stack, not stretching the first. `Cave Bail Two Cave Slots` therefore still
+returns `Mixed`. Category folding is compatible with the generator-type and bit-identical-param
+guards precisely because those guards remain exhaustive over the sole cave sub-box.
+
+`Cave Bail Fold Conflict` was added for a proved cave verdict that contradicts an already proved
+category (for example cave=solid plus out-of-layout=air). That is distinct from `Cave Bail Stack
+Verdict` (the stack itself could not prove its box) and `Cave Bail Disturbance` (a post-stack feature
+killed the remaining hypothesis).
+
+### Exact next-build / next-flight readout
+
+Read these counters together on the same underground route:
+
+1. `Cave Mix Out Of Layout`, `Cave Mix Gap`, `Cave Mix Surface World`, and
+   `Cave Bail Two Cave Slots` — whichever is largest names the dominant old mixed-content cause.
+   The first three are presence counts and may overlap; `Cave Bail Mixed Content` should be absent.
+2. `Tiles Operator Stack Air` and `Tiles Operator Stack Solid` — either becoming non-zero proves a
+   cave stack participated in a **final** skip verdict. For the measured cave+open-air population,
+   the expected success signal is primarily `Tiles Operator Stack Air`.
+3. `Tiles Skipped All Air`, `Tiles Skipped All Solid`, `Tiles Meshed`, and `Tiles Classified` — the
+   accounting must still close: `Meshed + SkippedAllAir + SkippedAllSolid = Classified`. A fold win
+   raises a skipped counter and lowers `Tiles Meshed`; the pre-fold baseline was 1.15 meshed,
+   0.73 skipped-air, 1.88 classified.
+4. `Cave Bail Fold Conflict`, `Cave Bail Stack Verdict`, `Cave Bail Params`,
+   `Cave Bail Disturbance`, and `Cave Bail Two Cave Slots` — these explain mixed tiles that remain.
+   In particular, a high `Fold Conflict` means the dominant mix is genuinely heterogeneous rather
+   than blocked merely by the former one-category policy.
+
+After Jahni runs the suite, every brute-force `violations` count must remain zero and all eight
+operator-stack equivalences must remain bit-identical. Those are correctness requirements, not
+results from this unbuilt change.
+
+### Likely compile-error / review watch spots
+
+- declaration/definition/use spelling for the five new UE stats, especially
+  `STAT_VoxelForgeCaveBailFoldConflict` and `STAT_VoxelForgeCaveBailTwoCaveSlots`;
+- the `MAX_int32` / `MIN_int32` cave-extrema initializers and `FMath::Min/Max(int32)` assignments to
+  `CaveMinZ` / `CaveMaxZ`;
+- construction of `FBox CaveBox` from the cave-only integer Z extrema;
+- control flow after removing the cave branch's final return: SurfaceWorld columns must run before
+  the shared final verdict, and `bAnyCave` must imply initialized cave extrema (established in the
+  same `MemoCat == 2` iteration);
+- no protected layout accessor was introduced: the code still uses public
+  `GetStrateChunkZBounds`, never `FindSlotIndexForChunkZ`.

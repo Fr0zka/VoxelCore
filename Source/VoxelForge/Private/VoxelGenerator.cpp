@@ -2725,8 +2725,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         if (CX * CX + CY * CY <= Reach * Reach) bCanSolid = false;
     }
 
-    // ── Catégorisation par Z de treillis. v1 : gap bedrock = solide ; SurfaceWorld = test
-    //    colonne ; tout le reste (intérieurs de caves, hors layout) = Mixed immédiat. ──
+    // ── Catégorisation par Z du treillis : gap bedrock = solide ; hors layout = air constant ;
+    //    SurfaceWorld = test colonne ; un slot cave opt-in = verdict de pile sur sa sous-boîte. ──
     struct FSurfSlot
     {
         int32 BotChunkZ = INT32_MAX;   // identité du slot (borne basse de la strate, en chunks)
@@ -2753,13 +2753,19 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     int32 NumSlots = 0;
 
     // ── T1.d GÉNÉRIQUE : la pile d'opérateurs classe les archétypes de CAVE ──
-    // Ces trois-là suivent le slot de cave que la tuile touche. Le verdict de la pile porte sur la
-    // BOÎTE ENTIÈRE, pas sur un z, donc il ne peut être calculé qu'après la boucle — et il n'est
-    // valable que si la tuile ne touche QUE ce slot-là (voir la garde `bAnyNonCave`).
+    // Ces valeurs suivent l'UNIQUE slot de cave que la tuile touche. La pile classera seulement la
+    // sous-boîte Z de ses échantillons ; les catégories gap/surface/hors-layout plient séparément
+    // leurs hypothèses dans `bCanSolid` / `bCanAir`.
+    // These values track the ONE cave slot touched by the tile. The stack classifies only its
+    // sampled Z sub-box; gap/surface/out-of-layout fold their hypotheses separately.
     int32 CaveBotChunkZ = INT32_MAX;   // identité du slot de cave (borne basse, en chunks)
     int32 CaveRepChunkZ = 0;
-    bool  bAnyCave      = false;
-    bool  bAnyNonCave   = false;       // gap ou SurfaceWorld dans la même tuile ⇒ on abandonne
+    int32 CaveMinZ       = MAX_int32;
+    int32 CaveMaxZ       = MIN_int32;
+    bool  bAnyCave        = false;
+    bool  bAnyGap         = false;
+    bool  bAnySurface     = false;
+    bool  bAnyOutOfLayout = false;
 
     int32 MemoChunkZ  = INT32_MAX;
     int32 MemoCat     = -1;            // 0 = gap, 1 = surface, 2 = cave (pile), 3 = hors layout
@@ -2783,7 +2789,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             if (StrateManager->IsGapChunk(CC))
             {
                 MemoCat = 0;
-                bAnyNonCave = true;
+                bAnyGap = true;
             }
             //=================================================================
             // ⛔ HORS LAYOUT = AIR CONSTANT. C'ÉTAIT LE BLOCAGE DE T1.d.
@@ -2809,7 +2815,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             else if (!VF_ChunkZHasSlot(ChunkZ))
             {
                 MemoCat = 3;
-                bAnyNonCave = true;   // n'entre JAMAIS dans la branche de cave
+                bAnyOutOfLayout = true;
 
                 // Les disturbances sont appliquées APRÈS la densité d'archétype et peuvent AJOUTER
                 // de la roche (ponts, arêtes). Même prudence que les branches gap et cave : si
@@ -2861,7 +2867,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                     if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) bCanAir = false;
                 }
                 MemoCat = 1;
-                bAnyNonCave = true;
+                bAnySurface = true;
             }
             else
             {
@@ -2909,12 +2915,12 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 int32 CaveTopCZ = 0, CaveBotCZ = 0;
                 if (!StrateManager->GetStrateChunkZBounds(ChunkZ, CaveTopCZ, CaveBotCZ))
                 {
-                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveMixOutOfLayout);
                     return EVoxelTileClass::Mixed;   // hors layout
                 }
                 if (CaveBotChunkZ != INT32_MAX && CaveBotChunkZ != CaveBotCZ)
                 {
-                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailTwoCaveSlots);
                     return EVoxelTileClass::Mixed;
                 }
                 CaveBotChunkZ = CaveBotCZ;
@@ -2926,7 +2932,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
         if (MemoCat == 2)
         {
-            // Rien par z : la pile répond pour la boîte entière, après la boucle.
+            // La pile répond après la boucle, sur la sous-boîte Z contenant exactement les
+            // échantillons cave (XY reste la boîte complète du treillis).
+            CaveMinZ = FMath::Min(CaveMinZ, Zi);
+            CaveMaxZ = FMath::Max(CaveMaxZ, Zi);
         }
         else if (MemoCat == 0)
         {
@@ -2970,23 +2979,27 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     // DENSITÉ de cette tuile — même fabrique, mêmes params, même drapeau.
     if (bAnyCave)
     {
-        // Une tuile mi-cave mi-surface (ou mi-gap) n'est pas classable ainsi : la pile de cave ne
-        // répond que pour SA strate, et sa boîte couvrirait des z appartenant à une autre.
-        if (bAnyNonCave)
+        // Diagnostic de PRÉSENCE avant les gardes : le signal reste visible même si le pliage rend
+        // finalement AllSolid/AllAir. Ces compteurs ne sont pas exclusifs entre eux sur une tuile
+        // très haute ; chacun répond exactement à « cette catégorie était-elle aussi présente ? ».
+        // Presence diagnostics run before the guards, so a successful fold cannot hide the mix.
+        // They are not mutually exclusive for a very tall tile; each answers one exact question.
+        if (bAnyOutOfLayout || bAnyGap || bAnySurface)
         {
-            INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
-            return EVoxelTileClass::Mixed;
+            if (bAnyOutOfLayout) { INC_DWORD_STAT(STAT_VoxelForgeCaveMixOutOfLayout); }
+            if (bAnyGap)         { INC_DWORD_STAT(STAT_VoxelForgeCaveMixGap); }
+            if (bAnySurface)     { INC_DWORD_STAT(STAT_VoxelForgeCaveMixSurfaceWorld); }
         }
 
         const FIntVector RepCC(0, 0, CaveRepChunkZ);
         const ECaveGeneratorType CaveType = StrateManager->GetGeneratorTypeForChunk(RepCC);
 
         //---------------------------------------------------------------------
-        // ⚠️ LA GARDE QUI COMPTE : LES PARAMS DOIVENT ÊTRE LES MÊMES SUR TOUTE LA TUILE
+        // ⚠️ LA GARDE QUI COMPTE : LES PARAMS DOIVENT ÊTRE LES MÊMES SUR TOUTE LA SOUS-BOÎTE CAVE
         //---------------------------------------------------------------------
         // `GetGenerationParams` et ses homologues BLENDENT les params dans les bandes de transition :
         // `Alpha` dépend du chunk Z pour `Gradient`, et du chunk XY EN PLUS pour `Interleaved`. Deux
-        // chunks d'une même tuile peuvent donc porter des params différents — c'est le constat de
+        // chunks d'une même sous-boîte peuvent donc porter des params différents — c'est le constat de
         // `AUDIT §C2`, confirmé par lecture le 2026-07-28 — et UNE pile ne peut pas représenter DEUX
         // champs. On construit donc les params pour CHAQUE coordonnée de chunk que la boîte touche et
         // on exige qu'ils soient identiques bit à bit.
@@ -2995,7 +3008,12 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // `Mixed` de trop. On se trompe du côté du CPU, jamais du côté du trou.
         const int32 CX0 = FloorDivC(MinX, CHUNK_SIZE), CX1 = FloorDivC(MaxX, CHUNK_SIZE);
         const int32 CY0 = FloorDivC(MinY, CHUNK_SIZE), CY1 = FloorDivC(MaxY, CHUNK_SIZE);
-        const int32 CZ0 = FloorDivC(MinZ, CHUNK_SIZE), CZ1 = FloorDivC(MaxZ, CHUNK_SIZE);
+        // IMPORTANT : les gardes restent complètes, mais seulement sur les chunks où le mesher
+        // échantillonne réellement CETTE strate cave. Inclure gap/surface/hors-layout ici ferait
+        // échouer la garde d'archétype avant de pouvoir plier leurs hypothèses indépendantes.
+        // The guards stay exhaustive over the cave samples. Non-cave chunks are intentionally not
+        // represented by this stack; their hypotheses were folded separately in the Z pass.
+        const int32 CZ0 = FloorDivC(CaveMinZ, CHUNK_SIZE), CZ1 = FloorDivC(CaveMaxZ, CHUNK_SIZE);
 
         // Une tuile très étalée (Step élevé) toucherait trop de chunks pour que cette vérification
         // reste bon marché. Au-delà, `Mixed` — on renonce au gain, jamais à la sûreté.
@@ -3098,7 +3116,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             }
             default:
                 INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
-                return EVoxelTileClass::Mixed;   // SurfaceWorld ne peut pas arriver ici (bAnyNonCave)
+                return EVoxelTileClass::Mixed;   // SurfaceWorld ne peut pas être le type du slot cave
             }
 
             bFirst = false;
@@ -3134,9 +3152,9 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         }
         TileStack.PrepareChunk(OpCtx);
 
-        const FBox TileBox(FVector((float)MinX, (float)MinY, (float)MinZ),
-                           FVector((float)MaxX, (float)MaxY, (float)MaxZ));
-        const EVoxelTileClass StackVerdict = TileStack.ClassifyBox(TileBox, OpCtx);
+        const FBox CaveBox(FVector((float)MinX, (float)MinY, (float)CaveMinZ),
+                           FVector((float)MaxX, (float)MaxY, (float)CaveMaxZ));
+        const EVoxelTileClass StackVerdict = TileStack.ClassifyBox(CaveBox, OpCtx);
         if (StackVerdict == EVoxelTileClass::Mixed)
         {
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailStackVerdict);
@@ -3145,6 +3163,17 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
         if (StackVerdict == EVoxelTileClass::AllSolid) { bCanAir = false; }
         else                                           { bCanSolid = false; }
+
+        // Le verdict cave se plie avec gap=solide, hors-layout=air, seals surface=solide. Si les
+        // deux hypothèses sont mortes ici, les catégories se contredisent : ce n'est PAS un échec
+        // de borne de la pile ni une disturbance.
+        // Fold the cave verdict with gap=solid, out-of-layout=air, and solid surface seals. If both
+        // hypotheses die here, the categories conflict; this is not a stack-bound/disturbance bail.
+        if (!bCanSolid && !bCanAir)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailFoldConflict);
+            return EVoxelTileClass::Mixed;
+        }
 
         //---------------------------------------------------------------------
         // ⚠️ LES DISTURBANCES NE SONT PAS DANS LA PILE (`OPSTACK-DECOMPOSITION §10.2`) :
@@ -3156,20 +3185,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         if (D.ChasmDensity  > 0.0f) { bCanSolid = false; }
         if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) { bCanAir = false; }
 
-        if (bCanSolid == bCanAir)
+        if (!bCanSolid && !bCanAir)
         {
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailDisturbance);
             return EVoxelTileClass::Mixed;
         }
-        if (bCanSolid)
-        {
-            INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid);
-        }
-        else
-        {
-            INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir);
-        }
-        return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
     }
 
     // ── Balayage des colonnes XY sur le treillis exact du mesher (marge incluse). Une colonne
@@ -3228,6 +3248,15 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     // Ici exactement UNE hypothèse doit survivre (chaque point testé en tue une ; les tuiles
     // sans point intérieur ont tué AllAir via gap/seal). Égalité = prudence → Mixed.
     if (bCanSolid == bCanAir) return EVoxelTileClass::Mixed;
+    if (bAnyCave)
+    {
+        // Compte seulement les verdicts FINAUX qui sautent réellement une tuile. Une pile peut avoir
+        // prouvé sa sous-boîte cave puis perdre l'hypothèse sur une colonne SurfaceWorld adjacente.
+        // Count only final verdicts that actually skip a tile; a later surface column may still
+        // invalidate the hypothesis proved for the cave sub-box.
+        if (bCanSolid) { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid); }
+        else           { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir); }
+    }
     return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
 }
 

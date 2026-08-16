@@ -313,12 +313,12 @@ public:
      * (OriginVoxels, Step, CellsPerAxis) = les MÊMES arguments que GenerateMesh ; le verdict
      * porte sur le treillis exact que le mesher échantillonnerait (marge ±1 incluse).
      *
-     * v1 : ne prouve que les chunks GAP (bedrock) et les strates SurfaceWorld — colonnes
-     * terrain/plafond évaluées par le MÊME ComputeSurfaceColumn que le chemin densité (donc
-     * bit-identiques), bandes de seal solides, gardes spine/passages/disturbances/diff.
-     * Tout autre archétype (intérieur de caves) ⇒ Mixed. Worker-safe (lecture seule +
-     * caches thread_local partagés avec GetDensityAt — un verdict Mixed laisse les colonnes
-     * chaudes pour la génération qui suit).
+     * GAP (bedrock), hors-layout (air constant) et SurfaceWorld plient leurs hypothèses par Z ;
+     * SurfaceWorld évalue ses colonnes terrain/plafond avec le MÊME ComputeSurfaceColumn que le
+     * chemin densité. Un unique slot cave opt-in peut ajouter le verdict conservatif de sa pile,
+     * sous gardes d'archétype et de params bit-identiques. Spine/passages/disturbances/diff restent
+     * des gardes conservatrices. Worker-safe (lecture seule + caches thread_local partagés avec
+     * GetDensityAt — un verdict Mixed laisse les colonnes chaudes pour la génération qui suit).
      */
     EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const;
 
