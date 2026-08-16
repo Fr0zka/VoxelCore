@@ -4019,3 +4019,58 @@ control flow of `ClassifyTile` is untouched, which is the invariant that matters
 
 Good sign for `49a9959`, not proof — it was a race, and races hide. The stronger signal is the
 absence of any `generation pause timed out` log: the drain completes well inside its 5 s deadline.
+
+## 2026-08-16 (m) — ⚠️ T1.d's cause NAMED in one flight. And a retraction about the memo.
+
+### ⛔ RETRACTION: "the column-memo fix made it worse" was a bad read
+
+I compared 14.7% (one flight) against 23.3% (a different flight) and called the fix a regression.
+**Invalid.** Jahni: *"it was already like that when I first told you about it, it just is very
+random, being between 10 and I'd say at least 30% sometimes, not much the fix Codex just did."*
+
+**The miss rate is strongly location-dependent — roughly 10–30% depending on where you fly — and it
+was in that band BEFORE the direct-indexed-box port.** Comparing single-flight averages from
+different routes measures the route, not the change. The very error this project has a lesson for,
+committed against my own instrument.
+
+⇒ **The memo port is neither vindicated nor implicated.** A real before/after needs the *same seed
+and the same route*, which is exactly the discipline used for the box-verdict numbers and which I
+skipped here because a single average looked conclusive. **Do not re-litigate it from these
+screenshots.** Parked until it can be measured properly; not urgent.
+
+### 📌 Noted while diagnosing, worth keeping: the port is incomplete vs its reference
+
+`GSurfColCache` is **not one box — it is a 6-box LRU** (`NumBoxes = 6`, `Acquire()` picks/evicts by
+`LastUse`), each `Dim = 2·(CHUNK_SIZE+8)+1 = 81` square. My spec said "a direct-indexed box" and
+Codex faithfully implemented **one**. Consequence: on a single box, *any* recentre (leaving the XY
+footprint, or a `ColumnKey` change) wipes all 6561 cells, where the old hashed table lost exactly one
+entry per key mismatch. With several strates or regions interleaved on one worker, that is a
+plausible thrash source — **plausible, not measured.** If the memo is revisited, port the LRU too.
+
+### ✅ THE REAL RESULT — Part B named T1.d's blocker on its first flight
+
+Flying over the caves:
+
+```
+Tiles Classified        1.77      Tiles Meshed             1.77   ← nothing skipped at all
+Cave Bail Not Op Stack  1.42  ←   Cave Bail Stack Verdict  0.32
+Cave Bail Params        0.03      Cave Bail Mixed Content  (never fired)
+```
+
+**`CaveBailNotOpStack` accounts for ~80% of cave-branch attempts.** That counter fires on exactly one
+condition: `UVoxelStrateManager::UsesOperatorStackForChunk(CC)` returned **false** — either the
+initial check or the per-chunk sweep over every chunk the tile's box touches.
+
+⚠️ **So T1.d is blocked by CONFIGURATION, not by code.** All 8 archetypes are in the ported list, so a
+`false` means either `bUseOperatorStack` is not ticked on the strate being flown over, or a chunk in
+the box belongs to an adjacent strate that has not ticked it — the sweep requires **every** chunk in
+the box to agree, so one un-ticked neighbour kills boundary tiles.
+
+That `Cave Bail Stack Verdict = 0.32` is non-zero is the corroborating detail: for those tiles the
+flag *was* on for the whole box and the stack built fine — the verdict itself came back `Mixed`.
+So the machinery works; it is mostly not being reached.
+
+**Next step is Jahni's, and it is not a code change:** confirm which strate assets actually have
+`bUseOperatorStack` ticked. This is the second time today that a fact living in `.uasset` data
+drove hours of work in the wrong direction — see 2026-08-16 (h). **The counter did in one flight what
+six hours of reasoning could not: it named the cause instead of listing candidates.**
