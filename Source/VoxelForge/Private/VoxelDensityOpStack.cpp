@@ -740,6 +740,11 @@ namespace
             const bool bIntegerXY = WorldX == FMath::FloorToFloat(WorldX)
                                  && WorldY == FMath::FloorToFloat(WorldY);
             FColumn* MemoColumn = &DirectColumn;
+            // ⚠️ La boîte acquise doit survivre au `if` : le drapeau `Computed` n'est posé qu'APRÈS
+            // le calcul, plus bas, hors de cette portée. Non nul ⇔ chemin XY entier.
+            // The acquired box must outlive the `if`: the `Computed` flag is only set AFTER the
+            // column is computed, further down and outside this scope. Non-null <=> integer path.
+            FColumnBox* AcquiredBox = nullptr;
             int32 CI = 0;
             bool bNeedsCompute = true;
 
@@ -751,6 +756,7 @@ namespace
                 // Acquire vérifie la clé uint64 complète et les bornes exactes avant de dériver CI.
                 // Acquire checks the exact uint64 key and exact bounds before deriving CI.
                 FColumnBox& Box = Cache.Acquire(IX, IY, ColumnKey);
+                AcquiredBox = &Box;
 
                 CI = (IY - Box.BaseY) * FColumnBox::Dim + (IX - Box.BaseX);
                 MemoColumn = &Box.Cols[CI];
@@ -829,7 +835,7 @@ namespace
                     if (Slope > KINDA_SMALL_NUMBER) { C.DirX = GX / Slope; C.DirY = GY / Slope; }
                 }
 
-                if (bIntegerXY) { Box.Computed[CI] = true; }
+                if (AcquiredBox) { AcquiredBox->Computed[CI] = true; }
             }
             return *MemoColumn;
         }

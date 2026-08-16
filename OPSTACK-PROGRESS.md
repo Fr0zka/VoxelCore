@@ -4214,3 +4214,20 @@ The dirty candidate diffs were preserved as named, recoverable stashes before cl
 
 `../VF-approach-A` and `../VF-approach-B` were then removed from Git's worktree list and their
 directories removed. Stashing was a cleanup-safety deviation only; it did not alter the landed code.
+
+## 2026-08-16 (o) — build break in the six-box LRU: `Box` used after its scope closed
+
+`VoxelDensityOpStack.cpp(832): error C2065: 'Box' : identificateur non déclaré`
+
+Sol's single-box → six-box refactor changed the acquisition to
+`FColumnBox& Box = Cache.Acquire(...)` **inside** `if (bIntegerXY)`, but the `Computed` flag is only
+set *after* the column is computed, further down and **outside** that block. The old single-box
+version had `Box` at function scope, so the write-back compiled; the reference did not.
+
+Fixed by hoisting `FColumnBox* AcquiredBox = nullptr;` beside `MemoColumn` and writing back through
+it. The guard is now `if (AcquiredBox)` rather than `if (bIntegerXY)` — **non-null ⇔ integer path**,
+so the pointer proves its own safety instead of relying on two conditions staying in agreement.
+
+Swept the file: the only other `Box.` uses (761–763) are inside the `if` and in scope. Not a logic
+error and not a caching change — a scope slip, invisible in review because the diff showed both
+halves separately. Still unbuilt beyond this compile fix.
