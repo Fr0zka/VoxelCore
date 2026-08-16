@@ -4362,3 +4362,43 @@ sitting behind a routing mistake in the classifier's archetype lookup.
 out-of-layout chunks their own category in `ClassifyTile` rather than borrowing `TunnelNetwork`.
 If open air above the stack is provably uniform, those tiles become an `AllAir`/`AllSolid` verdict
 and T1.d finally fires on the majority of a surface flight.
+
+## 2026-08-16 (s) — T1.d BLOCKER FIXED: out-of-layout is constant AIR, not a cave archetype
+
+The contradictory comments are settled by reading `GetGenerationParams`:
+
+```cpp
+// If outside all strates, return negative density → guaranteed air.
+if (SlotIdx < 0) {
+    Empty.BaseDensity  = -1.0f;   Empty.WormStrength = 0.0f;   Empty.RoomDensity = 0.0f;
+```
+
+⇒ **`GetGeneratorTypeForChunk`'s comment ("the fallback density path will produce solid rock
+anyway") is FALSE.** Out-of-layout is a **constant air field** — no rooms, no worms, nothing to
+carve or fill it. `IsGapChunk`'s "open air, NOT a gap" was the correct one.
+
+### The fix
+
+`ClassifyTile` gains a fourth Z category (`MemoCat = 3`) for chunks with no layout slot:
+
+- sets `bAnyNonCave = true` ⇒ **never enters the cave branch**, which is where all 83 % were dying;
+- sets `bCanSolid = false` ⇒ the AllSolid hypothesis dies, **AllAir survives**;
+- bails to `Mixed` if a disturbance could *add* rock there (`BridgeDensity`/`RidgeDensity` > 0) —
+  chasms only carve, so they cannot threaten an air verdict.
+
+A tile entirely above the stack now resolves: no cave block, no column scan (`NumSlots == 0`),
+`bCanSolid = false`, `bCanAir = true` ⇒ **`AllAir`, skipped.** That is the majority of a surface
+flight, and it is a class of tile T1.d has never once been able to prove.
+
+### What to read after the build
+
+- **`Cave Bail Not Op Stack No Layout` should collapse to ~0** — those tiles no longer reach the
+  cave branch at all.
+- **`Tiles Skipped All Air` should rise sharply**, and `Tiles Meshed` should fall below
+  `Tiles Classified` for the first time in the game.
+- ⚠️ **`violations` must stay 0** in every test, and the eight equivalences must stay bit-identical:
+  this changes only the *classifier*, never a density value.
+
+Compile-risk spots: `FindSlotIndexForChunkZ` is public (`VoxelStrateManager.h:351`, verified);
+`FStrateDisturbanceParams` is already used later in the same function; the new `else if` sits before
+the surface `else`, so `Slots[MemoSlotIdx]` is never dereferenced for the new category.

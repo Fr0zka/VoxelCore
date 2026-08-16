@@ -2777,6 +2777,37 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 MemoCat = 0;
                 bAnyNonCave = true;
             }
+            //=================================================================
+            // ⛔ HORS LAYOUT = AIR CONSTANT. C'ÉTAIT LE BLOCAGE DE T1.d.
+            //=================================================================
+            // `GetGeneratorTypeForChunk` rend `TunnelNetwork` pour tout chunk hors de la pile de
+            // strates (« le chemin de repli produit de la roche de toute façon » — CE COMMENTAIRE
+            // EST FAUX) et `IsGapChunk` rend false au-dessus du sommet (« open air, NOT a gap »).
+            // Résultat : chaque tuile touchant l'air libre au-dessus du monde entrait dans la
+            // BRANCHE DE CAVE, n'y trouvait aucun slot, et abandonnait — mesuré en jeu à 83 % des
+            // tuiles classées (`Cave Bail Not Op Stack No Layout` = 1.58 / 1.90).
+            //
+            // La vérité est dans `GetGenerationParams` : hors layout il rend `BaseDensity = -1`,
+            // `RoomDensity = 0`, `WormStrength = 0` — un champ CONSTANT, donc de l'air, sans salle
+            // ni ver pour le percer. Une telle tuile est prouvable sans échantillonner.
+            //
+            // Out-of-layout is a CONSTANT AIR field, not a cave archetype. Every tile touching the
+            // open air above the world was being routed into the cave branch and bailing there.
+            else if (StrateManager->FindSlotIndexForChunkZ(ChunkZ) < 0)
+            {
+                MemoCat = 3;
+                bAnyNonCave = true;   // n'entre JAMAIS dans la branche de cave
+
+                // Les disturbances sont appliquées APRÈS la densité d'archétype et peuvent AJOUTER
+                // de la roche (ponts, arêtes). Même prudence que les branches gap et cave : si
+                // l'une peut agir ici, on ne prouve rien. Les chasms ne font que creuser ⇒ ils ne
+                // menacent pas un verdict d'air.
+                const FStrateDisturbanceParams DOut = StrateManager->GetDisturbanceParamsForChunk(CC);
+                if (DOut.BridgeDensity > 0.0f || DOut.RidgeDensity > 0.0f)
+                {
+                    return EVoxelTileClass::Mixed;
+                }
+            }
             else if (StrateManager->GetGeneratorTypeForChunk(CC) == ECaveGeneratorType::SurfaceWorld)
             {
                 // Retrouve (ou résout) le slot de strate — l'identité vient des bornes chunk-Z du layout.
@@ -2887,6 +2918,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         else if (MemoCat == 0)
         {
             bCanAir = false;   // bedrock du gap = solide (le carve des passages est déjà gardé)
+        }
+        else if (MemoCat == 3)
+        {
+            // Hors layout = air constant (BaseDensity = -1, aucune salle, aucun ver). L'hypothèse
+            // « tout solide » meurt ; « tout air » survit. Les passages et la spine ne font que
+            // creuser — ils sont déjà gardés plus haut et ne peuvent pas rendre ce z solide.
+            // Out of layout = constant air: AllSolid dies, AllAir survives.
+            bCanSolid = false;
         }
         else
         {
