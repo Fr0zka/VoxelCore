@@ -124,9 +124,13 @@ void VoxelCaveMorphology::BuildChunkCache(
     // MaxInfluence = how far a room body / tunnel TUBE reaches PERPENDICULAR to its
     // anchor — NOT its length. A room or tunnel whose anchor lies within MaxInfluence
     // of a box can touch a voxel inside that box.
+    // Envelope conservatif / conservative bound: Lerp accepts inverted endpoints,
+    // so max(Min, Max) covers either radius without changing the authored roll.
+    const float RoomRadiusEnvelope = FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius);
+    const float TunnelRadiusEnvelope = FMath::Max(Params.TunnelMinRadius, Params.TunnelMaxRadius);
     const float MaxInfluence = FMath::Max(
-        Params.MaxRoomRadius,
-        Params.TunnelWarpStrength + Params.TunnelMaxRadius
+        RoomRadiusEnvelope,
+        Params.TunnelWarpStrength + TunnelRadiusEnvelope
     ) + Params.SDFBlendRadius;
 
     const float MaxTunnelLen = FMath::Max(Params.MaxTunnelLength, 0.0f);
@@ -165,10 +169,10 @@ void VoxelCaveMorphology::BuildChunkCache(
     // Vertical range for room CENTER placement.
     //=========================================================================
     // Buffer = seal thickness + max room half-height.
-    // This guarantees the tallest possible room (MaxRoomRadius * RoomHeightRatio)
+    // This guarantees the tallest possible room (RoomRadiusEnvelope * RoomHeightRatio)
     // fits entirely within the seal boundary — no room gets its ceiling or floor
     // cut flat by the seal. Smaller rooms have proportionally more margin.
-    const float RoomZBuffer = Params.MaxRoomRadius * Params.RoomHeightRatio;
+    const float RoomZBuffer = RoomRadiusEnvelope * Params.RoomHeightRatio;
     const float StrateMinZ  = Params.StrateBottomWorldZ + Params.BoundarySealThickness + RoomZBuffer;
     const float StrateMaxZ  = Params.StrateTopWorldZ   - Params.BoundarySealThickness - RoomZBuffer;
     const float StrateRangeZ = StrateMaxZ - StrateMinZ;
@@ -868,9 +872,11 @@ float VoxelCaveMorphology::EvaluateSDF(
     const FStrateGenerationParams& Params,
     uint32 Seed, int32 StrateIndex)
 {
+    const float RoomRadiusEnvelope = FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius);
+    const float TunnelRadiusEnvelope = FMath::Max(Params.TunnelMinRadius, Params.TunnelMaxRadius);
     const float Margin = FMath::Max(
-        Params.MaxRoomRadius,
-        Params.TunnelWarpStrength + Params.TunnelMaxRadius
+        RoomRadiusEnvelope,
+        Params.TunnelWarpStrength + TunnelRadiusEnvelope
     ) + Params.SDFBlendRadius;
 
     FChunkSDFCache TempCache;

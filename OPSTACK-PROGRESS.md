@@ -3779,3 +3779,59 @@ shape of `AUDIT §C2`'s staleness class, but in prose instead of a cache key.
 **Rule added to the handoff: never state the flag's state from memory. Ask, or read it in the
 editor.** More generally: *a fact that lives outside the repo cannot be maintained inside the repo* —
 docs may record what it was **and when it was checked**, never assert it as current.
+
+## 2026-08-16 (i) — Sol-High audit: one real find (fixed), one overstated citation, eight leads
+
+Jahni asked for a second opinion: *"maybe put Codex on Sol High to do an evaluation of our code
+cleanliness and efficiency?"* Run read-only as `gpt-5.6-sol` / high, output at
+`AUDIT-2026-08-CODEX.md`. It touched nothing else, as instructed.
+
+**Prompting note that mattered:** the real failure mode for a fresh model here is confidently
+re-proposing decisions this project already made and documented. The prompt handed it the rejected
+list up front (splitting `GetDensityWithParams`, "simplifying" the `FVector` round-trip, collapsing
+the twelve-times gate, merging the passage enums, tightening "over-conservative" box bounds, the
+§8.10 invariants, the deliberate old/new duplication). **It re-proposed none of them.**
+
+### ✅ VF-05 is real, and it is the worst instance of the class I found twice today
+
+`VoxelCaveMorphology::BuildChunkCache` derives `MaxInfluence`, `RoomZBuffer` and `EvaluateSDF`'s
+`Margin` from `MaxRoomRadius` / `TunnelMaxRadius`, while the radii themselves are
+`Lerp(Min, Max, hash)` — which yields up to `max(Min, Max)`. Same defect as `CODEX-TASK-004`, and
+worse on three counts:
+
+1. it is **TunnelNetwork**, the largest archetype;
+2. `BuildChunkCache` is called by **both** density paths (`FRoomGraphSource` calls it rather than
+   transcribing it), so **this was never an operator-stack bug — it is in the shipped original
+   code and always has been**;
+3. its failure mode is a **window-invariance break** (`ARCHITECTURE §8.4`): whether a room exists
+   depends on which chunk you queried from. In multiplayer, two peers generate different geometry
+   from the same seed.
+
+Fixed in `CODEX-TASK-006`, verified against the code before specifying and after: four bound sites
+now use `RoomRadiusEnvelope` / `TunnelRadiusEnvelope`, the two duplicated copies of the formula still
+match, and **no `Lerp`, placement, hash or `bStore` line changed** — with correctly ordered params
+`max(Min,Max) == Max`, so it is bit-identical. **A no-op at correct values is the acceptance signal.**
+
+Notably, Sol independently derived the same *"do not reorder the `Lerp` endpoints, it changes
+deterministic assignment"* caveat I had written into task 004. Convergent reasoning on the danger,
+from a model that had not seen that task.
+
+### ⚠️ VF-03's corroboration does not exist — and that is the finding about the audit
+
+VF-03 claims *"the test fixture explicitly documents observed cross-world contamination."*
+It does not. `VoxelForgeTestFixture.h` documents that the `thread_local` caches exist and flags an
+unrelated `TSoftObjectPtr` risk. The underlying concern (caches keyed on chunk/seed/layout but not on
+*which generator owns them*) may still be valid — but it must be judged on its own merits.
+
+An audit whose job is to catch unchecked premises contained one. Every row is self-labelled "Verified
+by reading"; that label is the author's claim, not an independent check. A reviewer's header saying
+so now sits at the top of the file, listing exactly which rows I verified (VF-05 ✅, VF-02 ✅ premise,
+VF-03 ⚠️) and which are unverified leads (VF-01, VF-04, VF-06…VF-10).
+
+### VF-02 is worth a deliberate decision from Jahni, not a silent fix
+
+`VoxelWorld.cpp:327` reads *"Timeout after 3 seconds to avoid hanging the editor"*, and `EndPlay`
+proceeds when it expires while tasks still hold a raw `this`. **`CLAUDE.md` states the invariant more
+strongly than the code implements it** ("EndPlay blocks on `ActiveTaskCount → 0`" — it blocks *with a
+deadline*). That is a design trade someone made on purpose (never hang the editor) and it should be
+re-affirmed or changed deliberately, not patched by an agent while he is away.
