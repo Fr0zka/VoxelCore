@@ -11,6 +11,7 @@
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelContentManager.h"
 #include "VoxelDensityVolume.h"
+#include "VoxelStats.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
 // complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
@@ -1502,11 +1503,24 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     if (!bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
-        bTrivialEmpty = (Generator->ClassifyTile(OriginVoxels, Step, Cells) != EVoxelTileClass::Mixed);
+        INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
+        const EVoxelTileClass Verdict = Generator->ClassifyTile(OriginVoxels, Step, Cells);
+        if (Verdict == EVoxelTileClass::AllSolid)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllSolid);
+        }
+        else if (Verdict == EVoxelTileClass::AllAir)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllAir);
+        }
+        bTrivialEmpty = (Verdict != EVoxelTileClass::Mixed);
     }
 
     // F18 — feuille : deux heightfields sol/cap échantillonnés par colonne (pas de marching
     // cubes, pas de classifieur — la classe de surface est vraie par construction).
+    // `TilesMeshed` peut dépasser `TilesClassified` : les tuiles qui ratent cette porte sont
+    // maillées sans classification. / `TilesMeshed` may exceed `TilesClassified`: tiles that
+    // fail this gate are meshed without classification.
     FVoxelMeshData MeshData;
     if (!bTrivialEmpty)
     {
@@ -1517,6 +1531,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
                                    bWantCapture ? &Result.CaptureGrid : nullptr,
                                    BandVoxLo, BandVoxHi);
+        INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
     }
 
     // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air

@@ -3430,3 +3430,70 @@ nothing** — deliberately, so the instrument and the fix cannot land in the sam
 other unreadable. A negative result is specified as a real result.
 
 `CODEX-TASK-002-column-memo-thrash.md`. **Nothing was built or run.**
+
+## 2026-08-16 (c) — Codex delivered 001 + 002. Reviewed against the code. READY TO BUILD.
+
+First tandem round actually executed by me rather than handed over: Codex (`gpt-5.6-luna`, xhigh)
+ran both specs, I reviewed the diffs against the source rather than against its reports.
+
+### What landed
+
+`stat VoxelForge` — the plugin's **first stat group ever** (`grep INC_DWORD_STAT` used to return
+nothing). New `Public/VoxelStats.h` + `Private/VoxelStats.cpp`, eight `DWORD_COUNTER`s:
+
+| counter | site |
+|---|---|
+| `TilesClassified` / `TilesSkippedAllSolid` / `TilesSkippedAllAir` / `TilesMeshed` | `AVoxelWorld::GenerateTileResult` |
+| `TilesOpStackSolid` / `TilesOpStackAir` | `UVoxelGenerator::ClassifyTile`, the `bAnyCave` exit |
+| `ColumnMemoHit` / `ColumnMemoMiss` | `FSurfaceColumnSource::GetColumn` |
+
+### The review — what was checked, not what was reported
+
+- **Site A's verdict refactor is contract-identical.** `bTrivialEmpty = (Verdict != Mixed)` where
+  `Verdict` is the stored return. The gate's five clauses are untouched. That bool decides whether a
+  tile has **collision**, so this was checked character by character rather than read.
+- **Site B increments AFTER the `bCanSolid == bCanAir` bail-out**, and the pair follows `bCanSolid`
+  the same way the returned enum does — the swap that would compile, look plausible, and prove the
+  wrong thing did not happen.
+- **`GetColumn` is instrumented and NOT fixed**, which was the whole point of specifying 002 that
+  way. Table size, hash and the full key comparison are byte-identical; miss inside the `if`, hit in
+  the `else`, neither derived by subtracting from the other.
+- **Every `INC_DWORD_STAT` body is braced.** The macro expands to a braced block, so an unbraced
+  `if` would have left a stray `;` and broken the following `else`.
+
+### The macro arities were VERIFIED, not assumed
+
+This is the plugin's first use of the stats system, so there was no in-repo precedent to match and
+the usual "likely compile spot" would have been a guess. Read out of
+`UE_5.7/Engine/Source/Runtime/Core/Public/Stats/Stats.h` instead:
+
+- `DECLARE_STATS_GROUP(GroupDesc, GroupId, GroupCat)` — 3 args ✔
+- `DECLARE_DWORD_COUNTER_STAT_EXTERN(CounterName, StatId, GroupId, API)` — 4 args ✔
+- `DEFINE_STAT(Stat)` ✔ · `INC_DWORD_STAT(Stat)` ✔
+- `INC_DWORD_STAT` → **`FThreadStats::AddMessage`**, i.e. per-thread stat packets ⇒ **the
+  worker-thread invariant holds by mechanism**, not by hope. Both sites are on workers.
+- `Stats/Stats.h` includes `CoreGlobals.h` + `CoreTypes.h` itself ⇒ `VoxelStats.h` is self-
+  sufficient and IWYU-clean as a first include (it is, in `VoxelStats.cpp`).
+- `VOXELFORGE_API` needs no include — UBT defines it on the command line.
+- `VoxelForge.Build.cs` does not enumerate sources, so no build-script change is needed.
+
+### READY TO BUILD — and what to read afterwards
+
+Remaining compile risk is low and concentrated in `VoxelStats.h`/`.cpp` (identifier mismatch between
+the eight declarations and the eight definitions — checked by eye, they match).
+
+Three readings, and **the order matters**:
+
+1. **Baseline, nothing ticked, underground:** `TilesOpStackSolid` / `TilesOpStackAir` must be **0**.
+   They are zero by construction (the cave branch returns `Mixed` at `UsesOperatorStackForChunk`),
+   but observe it anyway or the next step proves nothing. `TilesSkippedAllSolid` **will** be non-zero
+   here — that is the pre-existing bedrock/surface skipping, not a bug.
+2. **Tick `bUseOperatorStack` on ONE `TunnelNetwork` strate, same route:** `TilesOpStackSolid` goes
+   **non-zero**. ← the production proof of T1.d, which has never existed.
+3. **A `SurfaceWorld` strate ticked:** report `ColumnMemoHit` **and** `ColumnMemoMiss`, both numbers.
+   Miss ≈ once per distinct column ⇒ my ~9× thrash derivation is **wrong**, the table is fine, and
+   the perf cost is the 19-virtual-calls suspect instead. Miss stuck at 20–30 % of lookups ⇒
+   confirmed, and the fix gets its own task with this run as its before.
+
+Also still unbuilt and riding along: `e002bd4` (VerticalShafts connector capsules) —
+`Box verdicts over 60 VerticalShafts tiles`, **0 is the number to beat**, `violations` must stay 0.

@@ -29,6 +29,7 @@
 #include "VoxelTerrainOpDefinition.h" // ApplyTo — l'override d'op PAR SALLE (étape C1)
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
 #include "VoxelTypes.h"               // SmoothStep01, VOXEL_NOISE_SCALE
+#include "VoxelStats.h"
 
 #include <atomic>                     // l'id d'instance non recyclé du mémo de colonne
 
@@ -641,6 +642,7 @@ namespace
             FSlot& S = Slots[Idx];
             if (S.Key != ColumnKey || S.X != WorldX || S.Y != WorldY)
             {
+                INC_DWORD_STAT(STAT_VoxelForgeColumnMemoMiss);
                 S.Key = ColumnKey;  S.X = WorldX;  S.Y = WorldY;
                 FColumn& C = S.C;
 
@@ -699,6 +701,10 @@ namespace
                     // plat — mais l'amplitude y vaut 0 de toute façon.
                     if (Slope > KINDA_SMALL_NUMBER) { C.DirX = GX / Slope; C.DirY = GY / Slope; }
                 }
+            }
+            else
+            {
+                INC_DWORD_STAT(STAT_VoxelForgeColumnMemoHit);
             }
             return S.C;
         }

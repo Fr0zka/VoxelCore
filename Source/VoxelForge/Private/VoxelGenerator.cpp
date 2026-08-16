@@ -16,6 +16,7 @@
 #include "VoxelDensityPrimitives.h"   // spine / seal / passage — shared with the operator stack
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
+#include "VoxelStats.h"
 
 //=============================================================================
 // L'ADAPTATEUR DE CHAMP DE BIOMES / THE BIOME FIELD ADAPTER
@@ -3007,6 +3008,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) { bCanAir = false; }
 
         if (bCanSolid == bCanAir) { return EVoxelTileClass::Mixed; }
+        if (bCanSolid)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid);
+        }
+        else
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir);
+        }
         return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
     }
 

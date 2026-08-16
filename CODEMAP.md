@@ -79,6 +79,7 @@ Paths relative to `Source/VoxelForge/`. `Public/` = headers, `Private/` = impl.
 | `../../VoxelForge.uplugin` | Plugin manifest. One Runtime module `VoxelForge`. Beta. |
 | `VoxelForge.Build.cs` | Deps: Core, CoreUObject, Engine, **GameplayTags**, **RealtimeMeshComponent**. |
 | `Public/VoxelForgeModule.h` / `Private/VoxelForgeModule.cpp` | `FVoxelForgeModule` boilerplate (Startup/Shutdown just log). |
+| `Public/VoxelStats.h` / `Private/VoxelStats.cpp` | `stat VoxelForge` DWORD counters for tile classification, skipping, meshing, and operator-stack verdicts. |
 
 ### 3.2 Foundational types — `Public/VoxelTypes.h` (no UClass, everyone includes it)
 | Symbol | Line | Notes |
