@@ -2807,17 +2807,23 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 // Condition 1 : la strate doit RÉELLEMENT être générée par la pile. Sinon on
                 // classerait un champ que le mesher ne produira pas. C'est le même drapeau, lu au
                 // même endroit, que `GetDensityAt`.
-                if (!StrateManager->UsesOperatorStackForChunk(CC)) { return EVoxelTileClass::Mixed; }
+                if (!StrateManager->UsesOperatorStackForChunk(CC))
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStack);
+                    return EVoxelTileClass::Mixed;
+                }
 
                 // Condition 2 : un seul slot de cave par tuile. Deux slots = deux jeux de params =
                 // deux piles, et une pile ne sait répondre que pour SA strate.
                 int32 CaveTopCZ = 0, CaveBotCZ = 0;
                 if (!StrateManager->GetStrateChunkZBounds(ChunkZ, CaveTopCZ, CaveBotCZ))
                 {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
                     return EVoxelTileClass::Mixed;   // hors layout
                 }
                 if (CaveBotChunkZ != INT32_MAX && CaveBotChunkZ != CaveBotCZ)
                 {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
                     return EVoxelTileClass::Mixed;
                 }
                 CaveBotChunkZ = CaveBotCZ;
@@ -2867,7 +2873,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     {
         // Une tuile mi-cave mi-surface (ou mi-gap) n'est pas classable ainsi : la pile de cave ne
         // répond que pour SA strate, et sa boîte couvrirait des z appartenant à une autre.
-        if (bAnyNonCave) { return EVoxelTileClass::Mixed; }
+        if (bAnyNonCave)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailMixedContent);
+            return EVoxelTileClass::Mixed;
+        }
 
         const FIntVector RepCC(0, 0, CaveRepChunkZ);
         const ECaveGeneratorType CaveType = StrateManager->GetGeneratorTypeForChunk(RepCC);
@@ -2891,7 +2901,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // Une tuile très étalée (Step élevé) toucherait trop de chunks pour que cette vérification
         // reste bon marché. Au-delà, `Mixed` — on renonce au gain, jamais à la sûreté.
         const int64 NumChunkCoords = (int64)(CX1 - CX0 + 1) * (int64)(CY1 - CY0 + 1) * (int64)(CZ1 - CZ0 + 1);
-        if (NumChunkCoords > 27) { return EVoxelTileClass::Mixed; }
+        if (NumChunkCoords > 27)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+            return EVoxelTileClass::Mixed;
+        }
 
         FSlabGenerationParams   TileSlab;
         FMazeGenerationParams   TileMaze;
@@ -2907,12 +2921,17 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             const FIntVector CC(cx, cy, cz);
             if (StrateManager->GetGeneratorTypeForChunk(CC) != CaveType)
             {
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
                 return EVoxelTileClass::Mixed;   // la boîte déborde sur un autre archétype
             }
 
             // Le drapeau doit tenir sur TOUS les chunks de la boîte, pas seulement sur celui qui a
             // déclenché la tentative : un seul chunk hors pile invaliderait le verdict.
-            if (!StrateManager->UsesOperatorStackForChunk(CC)) { return EVoxelTileClass::Mixed; }
+            if (!StrateManager->UsesOperatorStackForChunk(CC))
+            {
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStack);
+                return EVoxelTileClass::Mixed;
+            }
 
             switch (CaveType)
             {
@@ -2921,28 +2940,44 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             {
                 const FSlabGenerationParams Q = StrateManager->GetSlabParamsForChunk(CC);
                 if (bFirst) { TileSlab = Q; }
-                else if (FMemory::Memcmp(&Q, &TileSlab, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                else if (FMemory::Memcmp(&Q, &TileSlab, sizeof(Q)) != 0)
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+                    return EVoxelTileClass::Mixed;
+                }
                 break;
             }
             case ECaveGeneratorType::Maze:
             {
                 const FMazeGenerationParams Q = StrateManager->GetMazeParamsForChunk(CC);
                 if (bFirst) { TileMaze = Q; }
-                else if (FMemory::Memcmp(&Q, &TileMaze, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                else if (FMemory::Memcmp(&Q, &TileMaze, sizeof(Q)) != 0)
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+                    return EVoxelTileClass::Mixed;
+                }
                 break;
             }
             case ECaveGeneratorType::VerticalShafts:
             {
                 const FVerticalShaftParams Q = StrateManager->GetVerticalShaftParamsForChunk(CC);
                 if (bFirst) { TileVert = Q; }
-                else if (FMemory::Memcmp(&Q, &TileVert, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                else if (FMemory::Memcmp(&Q, &TileVert, sizeof(Q)) != 0)
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+                    return EVoxelTileClass::Mixed;
+                }
                 break;
             }
             case ECaveGeneratorType::FloatingIslands:
             {
                 const FFloatingIslandParams Q = StrateManager->GetFloatingIslandParamsForChunk(CC);
                 if (bFirst) { TileFloat = Q; }
-                else if (FMemory::Memcmp(&Q, &TileFloat, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                else if (FMemory::Memcmp(&Q, &TileFloat, sizeof(Q)) != 0)
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+                    return EVoxelTileClass::Mixed;
+                }
                 break;
             }
             case ECaveGeneratorType::Underwater:
@@ -2950,10 +2985,15 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             {
                 const FStrateGenerationParams Q = StrateManager->GetGenerationParams(CC);
                 if (bFirst) { TileTunnel = Q; }
-                else if (FMemory::Memcmp(&Q, &TileTunnel, sizeof(Q)) != 0) { return EVoxelTileClass::Mixed; }
+                else if (FMemory::Memcmp(&Q, &TileTunnel, sizeof(Q)) != 0)
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
+                    return EVoxelTileClass::Mixed;
+                }
                 break;
             }
             default:
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
                 return EVoxelTileClass::Mixed;   // SurfaceWorld ne peut pas arriver ici (bAnyNonCave)
             }
 
@@ -2985,6 +3025,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         {
             // Strate dégénérée ou archétype non porté : `GetDensityAt` retomberait sur le `switch`,
             // donc la pile ne décrit pas ce que le mesher verra. Aucun verdict.
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
             return EVoxelTileClass::Mixed;
         }
         TileStack.PrepareChunk(OpCtx);
@@ -2992,7 +3033,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         const FBox TileBox(FVector((float)MinX, (float)MinY, (float)MinZ),
                            FVector((float)MaxX, (float)MaxY, (float)MaxZ));
         const EVoxelTileClass StackVerdict = TileStack.ClassifyBox(TileBox, OpCtx);
-        if (StackVerdict == EVoxelTileClass::Mixed) { return EVoxelTileClass::Mixed; }
+        if (StackVerdict == EVoxelTileClass::Mixed)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailStackVerdict);
+            return EVoxelTileClass::Mixed;
+        }
 
         if (StackVerdict == EVoxelTileClass::AllSolid) { bCanAir = false; }
         else                                           { bCanSolid = false; }
@@ -3007,7 +3052,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         if (D.ChasmDensity  > 0.0f) { bCanSolid = false; }
         if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) { bCanAir = false; }
 
-        if (bCanSolid == bCanAir) { return EVoxelTileClass::Mixed; }
+        if (bCanSolid == bCanAir)
+        {
+            INC_DWORD_STAT(STAT_VoxelForgeCaveBailDisturbance);
+            return EVoxelTileClass::Mixed;
+        }
         if (bCanSolid)
         {
             INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid);

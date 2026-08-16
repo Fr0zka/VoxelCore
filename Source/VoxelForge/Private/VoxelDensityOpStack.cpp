@@ -661,43 +661,79 @@ namespace
         }
 
         /** La colonne complète, exactement les cinq sorties de `ComputeSurfaceColumn`.
-         *  Mémoïsée par (instance, X, Y) : la pile évalue tous les Z d'une colonne au même XY, donc
-         *  le taux de succès est ~1 et l'overhang lit la MÊME colonne que la source, par
+         *  Le mémo est une boîte à index direct, comme `FSurfaceColumnBox` : la pile évalue tous
+         *  les Z d'une colonne au même XY, donc l'overhang lit la MÊME colonne que la source, par
          *  construction plutôt que par convention. */
         struct FColumn { float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY; };
 
         const FColumn& GetColumn(float WorldX, float WorldY) const
         {
-            // ⚠️ POURQUOI UNE TABLE ET PAS UNE SEULE ENTRÉE. Un mémo à une entrée n'est correct que
-            // si l'appelant descend une colonne Z avant de changer de XY. Le mesher n'en promet
-            // RIEN — s'il itère X en premier dans une tranche Z, chaque voxel raterait et on
-            // relancerait toute la pile de hauteur par voxel, cliff compris (4 resamples
-            // structurels). Ce n'est pas « un peu plus lent », c'est un ordre de grandeur sur
-            // l'archétype le plus cher du plugin.
-            //
-            // Table à correspondance directe, clé COMPLÈTE comparée sur touche : une collision ne
-            // peut que coûter un recalcul, jamais rendre une mauvaise colonne.
-            //
-            // TAILLE : un chunk fait CHUNK_SIZE² colonnes (1024 à 32³). Les 256 entrées du premier
-            // jet ne tenaient donc même pas UN chunk — la table se piétinait elle-même à
-            // l'intérieur d'une seule tuile. 4096 entrées couvrent quatre chunks de front, pour
-            // ~150 Ko par worker : du même ordre qu'une boîte de `GSurfColCache` (~59 Ko × 6).
-            //
-            // A chunk is CHUNK_SIZE² columns (1024), so the first draft's 256 entries could not
-            // even hold one chunk and thrashed inside a single tile. 4096 covers four chunks.
-            struct FSlot { uint64 Key; float X, Y; FColumn C; };
-            thread_local FSlot Slots[4096] = {};
+            // Même schéma éprouvé que `GSurfColCache` : index direct dans une boîte XY, puis un
+            // drapeau `Computed` par cellule. Une tuile MC pleine résolution demande
+            // (CHUNK_SIZE + 3)² = 35×35 = 1225 colonnes (anneau de marge inclus) ; cette boîte
+            // de Dim×Dim, recentrée sur le premier échantillon, les garde toutes sans collision.
+            // Same proven scheme as `GSurfColCache`: direct XY indexing plus one `Computed` flag per
+            // cell. A full-resolution MC tile needs 35×35 = 1225 columns including its margin ring;
+            // the box is sized so one tile fits without eviction.
+            struct FColumnBox
+            {
+                enum : int32 { Halo = CHUNK_SIZE + 8, Dim = 2 * Halo + 1 };
+                int32 BaseX = 0, BaseY = 0;
+                uint64 Key = 0;             // strate + layout + seed + ParamsFingerprint
+                bool bValid = false;
+                FColumn Cols[Dim * Dim];
+                bool Computed[Dim * Dim];
+            };
+            thread_local FColumnBox Box = {};
+            thread_local FColumn DirectColumn = {};
 
-            const uint32 HX = *reinterpret_cast<const uint32*>(&WorldX);
-            const uint32 HY = *reinterpret_cast<const uint32*>(&WorldY);
-            const uint32 Idx = ((HX * 0x9E3779B9u) ^ (HY * 0x85EBCA6Bu)) >> 20;   // [0,4095]
+            // The production mesher and the exact-lattice classifier use integer XY. Fractional
+            // XY is still valid for the public density/equivalence probes: compute it directly so
+            // no integer cell can ever be returned for a different full (WorldX, WorldY) pair.
+            const bool bIntegerXY = WorldX == FMath::FloorToFloat(WorldX)
+                                 && WorldY == FMath::FloorToFloat(WorldY);
+            FColumn* MemoColumn = &DirectColumn;
+            int32 CI = 0;
+            bool bNeedsCompute = true;
 
-            FSlot& S = Slots[Idx];
-            if (S.Key != ColumnKey || S.X != WorldX || S.Y != WorldY)
+            if (bIntegerXY)
+            {
+                const int32 IX = (int32)WorldX;
+                const int32 IY = (int32)WorldY;
+
+                // Bounds are checked exactly before deriving CI; the index itself is the XY key.
+                // Les bornes sont vérifiées exactement avant CI : l'index EST la clé XY.
+                if (!Box.bValid || Box.Key != ColumnKey
+                    || IX < Box.BaseX || IX >= Box.BaseX + FColumnBox::Dim
+                    || IY < Box.BaseY || IY >= Box.BaseY + FColumnBox::Dim)
+                {
+                    Box.BaseX = IX - FColumnBox::Halo;
+                    Box.BaseY = IY - FColumnBox::Halo;
+                    Box.Key = ColumnKey;
+                    Box.bValid = true;
+                    FMemory::Memzero(Box.Computed, sizeof(Box.Computed));
+                }
+
+                CI = (IY - Box.BaseY) * FColumnBox::Dim + (IX - Box.BaseX);
+                MemoColumn = &Box.Cols[CI];
+                if (Box.Computed[CI])
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeColumnMemoHit);
+                    bNeedsCompute = false;
+                }
+                else
+                {
+                    INC_DWORD_STAT(STAT_VoxelForgeColumnMemoMiss);
+                }
+            }
+            else
             {
                 INC_DWORD_STAT(STAT_VoxelForgeColumnMemoMiss);
-                S.Key = ColumnKey;  S.X = WorldX;  S.Y = WorldY;
-                FColumn& C = S.C;
+            }
+
+            if (bNeedsCompute)
+            {
+                FColumn& C = *MemoColumn;
 
                 C.TerrainZ = TerrainStack.EvalHeight(WorldX, WorldY);
                 C.CeilSurf = CeilingStack.EvalHeight(WorldX, WorldY);
@@ -754,12 +790,10 @@ namespace
                     // plat — mais l'amplitude y vaut 0 de toute façon.
                     if (Slope > KINDA_SMALL_NUMBER) { C.DirX = GX / Slope; C.DirY = GY / Slope; }
                 }
+
+                if (bIntegerXY) { Box.Computed[CI] = true; }
             }
-            else
-            {
-                INC_DWORD_STAT(STAT_VoxelForgeColumnMemoHit);
-            }
-            return S.C;
+            return *MemoColumn;
         }
 
         /** Le champ structurel nu — l'overhang s'en sert pour emprunter la roche amont.

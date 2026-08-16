@@ -3959,3 +3959,63 @@ timeout that proceeds anyway is exactly what the bug already does. The three dan
 Edit a strate asset while the world is streaming. Expect a **brief stall, then the edit applies, and
 no crash.** If the `Error` log about a timed-out pause ever appears, the drain deadline (5 s) is too
 short for the in-flight queue and that is worth knowing rather than guessing.
+
+## 2026-08-16 (l) — BUILD RESULTS, and the column-memo fix they justified
+
+### The build: 14/14 green, 0 violations anywhere
+
+- **VerticalShafts box verdicts: 0 → 30 of 60**, 0 violations. **Zero was the number for this
+  project's entire life.** `e002bd4`'s connector capsules delivered — *after* `7dbdf51` widened that
+  archetype's reach by 28%, which pushed the other way.
+- **`[production defaults]` TunnelNetwork: 11 proved, 14641 voxels, 0 violations — byte-identical to
+  the pre-change run.** That line was set up as the isolated diagnostic for `cab8e8f`: nothing else
+  touched TunnelNetwork, and the fix is a guaranteed no-op iff room/tunnel `Min ≤ Max`. It did not
+  move ⇒ **Jahni's assets have correctly ordered ranges; that hole was never being hit.**
+- **All eight equivalence tests bit-identical** ⇒ the "bounds only, cannot reach density" claim on
+  `7dbdf51` / `eaa44bf` / `cab8e8f` is now **tested, not asserted**.
+- Maze 27/60, FlatPlain 45/60, CrystalChamber 43/60 (tuned 32/60), Islands 9 AllAir — all at the new
+  8.0× samplers, so not comparable to earlier runs by design.
+
+### ✅ The column-memo thrash: predicted 14.0%, measured 14.7%
+
+```
+Column Memo Hits   avg 102,300.84
+Column Memo Misses avg  17,683.60   → 14.74%
+```
+Predicted **14.0%** if thrashing, **1.4%** if not. Second confirmation from a different statistic:
+17,683 misses ÷ 2.13 tiles meshed ≈ **8,300 recomputes per tile** against a healthy ~1,225 = **6.8×**
+(derived 9.8×; the gap is expected since some tiles are cave and have no columns).
+
+**This is the first quantitative confirmation of a perf hypothesis in this project made *before* the
+measurement.** Fixed in `CODEX-TASK-008` Part A: the 4096-slot direct-mapped hashed table is replaced
+by a **direct-indexed box**, the scheme `GSurfColCache` has always used — no hash, no collisions,
+every column computed once. `ParamsFingerprint` is retained in the box key (its absence was the
+shipped bug that silently deleted the overhang; `GSurfColCache` itself omits it, and that part was
+deliberately **not** copied).
+
+⚠️ Open hypothesis, falsifiable next build: **`Tiles Meshed` averages only 2.13/frame, which is
+plausibly why LOD rings take so long to update.** If misses drop ~10× *and* LOD updates visibly
+speed up, the memo was the throughput ceiling. If misses drop and LODs stay slow, they are separate
+problems — and we will have cleanly separated them.
+
+### ⚠️ T1.d still does NOT fire in production — and now we will know why
+
+`Tiles Operator Stack Solid` / `Air` **never appeared** in `stat VoxelForge`. Every row that *did*
+appear has `Min 1.00`, not `0.00` — rows only render in frames where the counter fires — so site B is
+genuinely never reached. The `TilesSkippedAllSolid` of 1.18/frame (~45% of classified tiles) is the
+**pre-existing** bedrock/surface skipping, not the prize.
+
+The likely reason that sample missed it: 102,300 column-memo hits are `FSurfaceColumnSource`, i.e.
+**SurfaceWorld-dominated flight**. But the cave branch has 13 `return Mixed` paths and guessing which
+one fires is exactly the mistake this project keeps paying for. Part B adds six attribution counters
+— `CaveBailNotOpStack / MixedContent / Params / StackVerdict / Disturbance / NoStack` — one per bail
+category. **One underground flight now names the cause outright instead of offering candidates.**
+
+Verified in review: Part B's only edits are brace-expansions of one-line `if`s so a counter fits
+before the existing `return`. **Every condition and every returned value is byte-identical** — the
+control flow of `ClassifyTile` is untouched, which is the invariant that matters there.
+
+### No crashes while editing assets
+
+Good sign for `49a9959`, not proof — it was a race, and races hide. The stronger signal is the
+absence of any `generation pause timed out` log: the drain completes well inside its 5 s deadline.
