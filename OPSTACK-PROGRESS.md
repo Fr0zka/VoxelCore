@@ -3266,3 +3266,67 @@ existing assertion fails rather than a player falling through the floor.
 stay 0. If it is still 0 proved, the warning now says what to check *first*: `ExtraReach` inflates
 both remaining tests, so its value against `ShaftMaxRadius` is the thing to look at before touching
 either test — not a re-derivation from scratch.
+
+## 2026-07-29 — clean stopping point. Codex joins; the production-observability gap is named.
+
+### The finding that ends this session
+
+Jahni built a world, looked at it, and said: *"I don't know if it dropped any meshing? but it looks
+alright by the eye."*
+
+That sentence is the honest state of this entire refactor. **Everything proved so far was proved in
+an automation harness, on 40 sampled tiles.** In the running game, tile-skipping is **unobservable**:
+
+- `grep INC_DWORD_STAT Source/` → **nothing**. The plugin has zero stat counters.
+- *Skipped correctly* and *skipped nothing* render identically, so no visual check can separate them.
+- And `bUseOperatorStack` defaults **false** with no strate ticked, so unless Jahni ticked one, the
+  honest answer is "nothing new was dropped, by construction".
+
+This is the same failure this session spent six rounds learning to avoid — *coverage is a number, not
+a boolean* — applied to production instead of to a test. The tests got that discipline; the game
+never did.
+
+**Interim answer that needs no code:** the trace scopes `VoxelForge_ClassifyTile` and
+`VoxelForge_GenerateMesh` already exist at the site (`AVoxelWorld::GenerateTileResult`,
+VoxelWorld.cpp ~1501). In Unreal Insights, a skipped tile is a `ClassifyTile` with no `GenerateMesh`
+after it. ⚠️ But the comment there records that **~84 % of tiles were already being rejected** by the
+hand-written SurfaceWorld/bedrock paths long before the op stack existed, so surface skips drown the
+cave ones — the number only means something **underground in an opted-in `TunnelNetwork` strate**.
+
+### `CODEX-TASK-001-tile-skip-stats.md`
+
+Written and committed. A `stat VoxelForge` group with `TilesClassified / TilesSkippedAllSolid /
+TilesSkippedAllAir / TilesMeshed`. Solid and air are split deliberately: **cave archetypes prove
+`AllSolid`**, so that counter is the one that answers whether the op-stack work did anything real.
+
+Its deliverable is a before/after that is **the production proof of T1.d**, which does not exist
+today: no strate opted in ⇒ `TilesSkippedAllSolid` underground reads 0; tick `bUseOperatorStack` on
+one `TunnelNetwork` strate, fly the same route ⇒ non-zero.
+
+The spec carries the invariants rather than just the task, because that is the whole point of a spec
+here: `bTrivialEmpty` decides whether a tile has **collision**, the five-clause gate is load-bearing,
+and `GenerateTileResult` runs on **worker threads** — so a plain `static int32++` is a data race and
+`INC_DWORD_STAT` is not.
+
+### Working arrangement, from now on
+
+**Codex (Model Luna, xHigh) handles most of the coding; I orchestrate** — read the code, decide what
+to do, write precise specs, review what comes back **against the code rather than its description**,
+and own the docs and the measurements. Recorded in the handoff (`## How we work now`) and in memory.
+
+### Git
+
+`experimental` is now **pushed and tracked** (`origin/experimental`, Jahni's Gitea). `main` stays
+pinned at the known-good commit. The old flat "never push" rule was corrected in both places that
+stated it — with the caveat that matters: **a pushed commit is not a "verified green" marker**, since
+this branch carries unbuilt work by design. `OPSTACK-PROGRESS.md` remains the only record of what was
+actually built.
+
+### Still open, in priority order
+
+1. **`CODEX-TASK-001`** — the production observability gap. Priority, because every claim this
+   refactor makes is currently harness-only.
+2. **Build `e002bd4`** (VerticalShafts connector capsules) and read
+   `Box verdicts over 60 VerticalShafts tiles`. 0 was the number for the project's whole life.
+3. **PERF** — the op path is measurably slower; suspects listed in the handoff. Measure first.
+4. The warp squeeze stays **parked** with its ceiling measured and a negative result recorded.

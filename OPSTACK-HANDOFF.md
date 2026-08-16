@@ -1,10 +1,17 @@
-# Handoff — VoxelForge operator stack, 2026-07-29 (T1.d delivered and measured)
+# Handoff — VoxelForge operator stack, 2026-07-29 (T1.d measured in the harness, unproven in the game)
 
 > Paste the block below into a fresh session. Everything it refers to is on disk and in git.
 >
-> **State:** 8 of 8 archetypes ported and green. **Tile-skipping now actually works and is measured:
-> 11 of 40 tiles proved `AllSolid` at production defaults, 14641 voxels brute-forced, 0 violations.**
-> `AUDIT §C2` is fixed. One commit is written but **not yet built** — see "First action".
+> **State:** 8 of 8 archetypes ported and green. **Tile-skipping works and is measured — in the
+> automation harness:** 11 of 40 tiles proved `AllSolid` at production defaults, 14641 voxels
+> brute-forced, 0 violations. `AUDIT §C2` is fixed. `experimental` is pushed (`origin/experimental`).
+>
+> **Two things are open, and the second is the more interesting one:**
+> 1. commit `e002bd4` (VerticalShafts) is written and **not yet built**;
+> 2. **none of this is observable in the running game.** Jahni built a world, looked at it, and said
+>    *"I don't know if it dropped any meshing? but it looks alright by the eye."* He is right to be
+>    unsure — the plugin has **zero stat counters**, and *skipped correctly* renders identically to
+>    *skipped nothing*. `CODEX-TASK-001-tile-skip-stats.md` is the spec that closes this.
 
 ---
 
@@ -26,6 +33,24 @@ re-derive them.
    §C9's library half is the top open theoretical risk with 0 measured exposure.
 6. **`CODEMAP.md`** — navigation. Trust symbol names over line numbers.
 
+## How we work now — Codex writes, you orchestrate
+
+From 2026-07-29 this project runs **in tandem with Codex (Model Luna, xHigh)**. **Codex handles most
+of the coding; you orchestrate.** Concretely:
+
+- You read the code and decide *what* to do; you write **precise specs** Codex executes; you **review
+  what comes back against the real code, not against its description**; you own the docs
+  (`OPSTACK-PROGRESS.md`, `CODEMAP §3`, this file) and the measurements.
+- **Hand Codex the INVARIANT, not just the task.** This codebase's traps are invisible in a diff —
+  density sign, `Identity` meaning `Sdf ≥ T` (below), cache keys needing params + `LayoutVersion`,
+  inserting classes above the anonymous-namespace end marker. A spec that omits these gets code that
+  compiles and deletes collision.
+- `CODEX-TASK-*.md` at the plugin root are the specs. Each carries a **Why**, the **exact site**, the
+  **invariants**, an **acceptance** section, and **notes for the reviewer**. Write the next one the
+  same way.
+- Unchanged: **never build** (Jahni does), and a plausible patch is not a verified one until a
+  measurement says so.
+
 ## Where things stand
 
 All 8 archetypes have an operator-stack twin, per-strate opt-in, each equivalence-tested **bit for
@@ -37,7 +62,7 @@ Everything sits behind `UVoxelStrateDefinition::bUseOperatorStack`; the ported l
 that is my call and I still haven't made it. `GetDensityAt` and `ClassifyTile` build the stack
 through the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole, not a bug.
 
-### ✅ T1.d — the tile-skipping prize — is real, and it is measured
+### ✅ T1.d — the tile-skipping prize — is real and measured **in the harness** (not yet in the game)
 
 `FRoomGraphSource::EffectOverBox` answers **spatially**. The result, brute-forced voxel by voxel:
 
@@ -70,10 +95,30 @@ collision**. The warning is written at the site you land on when you add one.
 `|A−B| ≥ K`, so the running minimum saturates at `K` below the smallest term. Without that
 observation the slack would scale with the ~88 tunnels in a cache and the criterion would be dead.)
 
-## First action: build, then read ONE line
+## First actions — one build to read, one task to hand Codex
 
-**The last commit (`e002bd4`, VerticalShafts) is written and NOT built.** Everything before it is
-built and green.
+### (a) Hand Codex `CODEX-TASK-001-tile-skip-stats.md` — this is the priority
+
+Everything in this refactor has been proved in an automation harness on 40 sampled tiles, and
+**nothing has ever been observed in the running game.** The task adds a `stat VoxelForge` group with
+`TilesClassified / TilesSkippedAllSolid / TilesSkippedAllAir / TilesMeshed`.
+
+Its deliverable is a **before/after that constitutes the production proof of T1.d**: with no strate
+opted in, `TilesSkippedAllSolid` underground must read **0**; after ticking `bUseOperatorStack` on
+one `TunnelNetwork` strate and flying the same route, it must be **non-zero**. The spec carries the
+invariants — most importantly that `bTrivialEmpty` decides whether a tile has **collision**, and that
+`GenerateTileResult` runs on **worker threads** so a plain `static int32++` is a data race.
+
+Interim answer if Jahni wants it before that lands: **Unreal Insights already shows this.** The trace
+scopes `VoxelForge_ClassifyTile` and `VoxelForge_GenerateMesh` exist at the site; a skipped tile is a
+`ClassifyTile` with no `GenerateMesh` after it. ⚠️ But ~84 % of tiles were *already* being rejected by
+the hand-written SurfaceWorld/bedrock paths long before this work, so surface skips will drown the
+cave ones — you must be **underground in an opted-in `TunnelNetwork` strate** for the number to mean
+anything.
+
+### (b) Build `e002bd4` (VerticalShafts) and read ONE line
+
+Everything before it is built and green.
 
 > Build, run the `VoxelForge` filter, and read
 > **`Box verdicts over 60 VerticalShafts tiles`**.
