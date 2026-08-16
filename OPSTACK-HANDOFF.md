@@ -70,9 +70,26 @@ bit** against its original density function. The `switch` and the stack are two 
 interchangeable implementations.
 
 Everything sits behind `UVoxelStrateDefinition::bUseOperatorStack`; the ported list lives **only** in
-`UVoxelStrateManager::UsesOperatorStackForChunk` (all 8). **No strate asset has the box ticked** —
-that is my call and I still haven't made it. `GetDensityAt` and `ClassifyTile` build the stack
-through the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole, not a bug.
+`UVoxelStrateManager::UsesOperatorStackForChunk` (all 8). `GetDensityAt` and `ClassifyTile` build the
+stack through the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole.
+
+> ### ⚠️⚠️ CORRECTED 2026-08-16 — **THE FLAG IS ON IN THE GAME'S DATA ASSETS.**
+>
+> This section used to say *"No strate asset has the box ticked — that is my call and I still
+> haven't made it."* **That is false and was believed for a whole session.** Jahni: *"the data assets
+> in game have the switch on."*
+>
+> **Everything downstream of that premise flips:**
+> - The operator stack is **the production density path**, not a dormant twin. The measured perf
+>   regression is a regression players feel, not a lab result.
+> - Any unsoundness in an op's `EffectOverBox` is a **live** hole, not a latent one. Two were found
+>   and fixed on 2026-08-16 (`7dbdf51`, `eaa44bf`) and **both of those commit messages say "nothing
+>   in the running game was affected" — that sentence is WRONG, for this reason.** See
+>   `OPSTACK-PROGRESS.md` 2026-08-16 (h) for the corrected severity.
+> - The T1.d prize is already being collected in-game; `CODEX-TASK-001`'s counters measure how much.
+>
+> **Never state the flag's state from memory again — it lives in `.uasset` data, which is not
+> greppable from here. Ask, or read it in the editor.**
 
 ### ✅ T1.d — the tile-skipping prize — is real and measured **in the harness** (not yet in the game)
 

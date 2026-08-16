@@ -3743,3 +3743,39 @@ The proved counts **will move**; that is the point, not a regression. **`NumUnso
 must stay 0 in all three.** If one goes non-zero, the wider sampler has found a real hole the narrow
 one was hiding — in which case this task paid for itself on its first run, and the number must be
 reported rather than tuned away.
+
+## 2026-08-16 (h) — ⚠️ CORRECTION: the flag is ON in the game. Today's two fixes were LIVE, not latent.
+
+Jahni, on being told the op stack was "switched off": **"the data assets in game have the switch on."**
+
+The handoff said *"No strate asset has the box ticked — that is my call and I still haven't made it."*
+That sentence was stale, and I reasoned from it all session. **Every severity assessment written
+today under "nothing in the running game is affected" is wrong**, including two commit messages that
+say so in their body (`7dbdf51`, `eaa44bf`). Those are pushed and stay as written; this entry is the
+correction of record.
+
+### Corrected severity
+
+| fix | as filed today | actually |
+|---|---|---|
+| `7dbdf51` — `ExtraReach` used `sup\|FBM\| = 1.0`, proved bound 1.5 | "latent, nothing affected" | **live in the shipped game.** VerticalShafts needed `B ≤ 1.27`, Maze `B ≤ 1.40`. Whether a hole ever *manifested* rests on this Perlin's true sup (~1.0–1.1 empirically) — i.e. **it did not fail because the empirical sup happened to stay under the margin**, not because the code was right. |
+| `eaa44bf` — cell sweep padded by `MaxRadius`, envelope is `max(Min, Max)` | "no-op at defaults" | **still a no-op at correctly ordered values — but now worth CHECKING the real assets.** If any strate has `ColumnMinRadius > ColumnMaxRadius` or `ShaftMinRadius > ShaftMaxRadius`, that asset **was** producing tiles with no geometry and no collision. |
+
+⇒ **ACTION FOR JAHNI, before or with the next build:** open the strate assets and confirm
+`ColumnMinRadius ≤ ColumnMaxRadius` and `ShaftMinRadius ≤ ShaftMaxRadius`. If either is inverted,
+`eaa44bf` fixed a live hole and the before/after is visible. `IslandMinRadius/MaxRadius` was already
+guarded and is not at risk.
+
+Also re-prioritised by this: **the perf regression is a shipped regression**, not a lab curiosity.
+`CODEX-TASK-001` / `-002` stop being "prove the refactor worked" and become "diagnose a live
+slowdown". Same build, higher stakes.
+
+### The process failure worth keeping
+
+The flag's state lives in **`.uasset` binary data**, which cannot be grepped from here. So the docs
+carried a hand-written claim about it, nobody re-checked it, and it silently went stale — the exact
+shape of `AUDIT §C2`'s staleness class, but in prose instead of a cache key.
+
+**Rule added to the handoff: never state the flag's state from memory. Ask, or read it in the
+editor.** More generally: *a fact that lives outside the repo cannot be maintained inside the repo* —
+docs may record what it was **and when it was checked**, never assert it as current.
