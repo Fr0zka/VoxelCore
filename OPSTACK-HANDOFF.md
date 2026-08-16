@@ -95,19 +95,29 @@ collision**. The warning is written at the site you land on when you add one.
 `|A−B| ≥ K`, so the running minimum saturates at `K` below the smallest term. Without that
 observation the slack would scale with the ~88 tunnels in a cache and the criterion would be dead.)
 
-## First actions — one build to read, one task to hand Codex
+## First actions — one build to read, two tasks to hand Codex
 
-### (a) Hand Codex `CODEX-TASK-001-tile-skip-stats.md` — this is the priority
+### (a) Hand Codex `CODEX-TASK-001-tile-skip-stats.md`, then `-002-` — 001 first, they chain
 
 Everything in this refactor has been proved in an automation harness on 40 sampled tiles, and
-**nothing has ever been observed in the running game.** The task adds a `stat VoxelForge` group with
-`TilesClassified / TilesSkippedAllSolid / TilesSkippedAllAir / TilesMeshed`.
+**nothing has ever been observed in the running game.** Task 001 adds a `stat VoxelForge` group with
+`TilesClassified / TilesSkippedAllSolid / TilesSkippedAllAir / TilesMeshed`, **plus
+`TilesOpStackSolid / TilesOpStackAir` at a second site**. Task 002 adds `ColumnMemoHit / Miss` to the
+same group; it needs 001's header to exist, and both should land in one build.
 
-Its deliverable is a **before/after that constitutes the production proof of T1.d**: with no strate
-opted in, `TilesSkippedAllSolid` underground must read **0**; after ticking `bUseOperatorStack` on
-one `TunnelNetwork` strate and flying the same route, it must be **non-zero**. The spec carries the
-invariants — most importantly that `bTrivialEmpty` decides whether a tile has **collision**, and that
-`GenerateTileResult` runs on **worker threads** so a plain `static int32++` is a data race.
+Its deliverable is a **before/after that constitutes the production proof of T1.d**: after ticking
+`bUseOperatorStack` on one `TunnelNetwork` strate and flying the same route, **`TilesOpStackSolid`
+must go non-zero**. The spec carries the invariants — most importantly that `bTrivialEmpty` decides
+whether a tile has **collision**, and that `GenerateTileResult` runs on **worker threads** so a plain
+`static int32++` is a data race.
+
+⚠️ **Corrected 2026-08-16 — the earlier version of this bar was unmeasurable.** It said
+`TilesSkippedAllSolid` would read 0 underground with no strate opted in. It will not: `ClassifyTile`
+also proves `AllSolid` on its **hand-written** path (a bedrock-gap chunk sets `bCanAir = false`,
+`VoxelGenerator.cpp` ~2835), which fires with nothing ticked at all. That is the same "~84 %" caveat
+below, which the old bar quoted and then contradicted. The op-stack-only counters are zero **by
+construction** — the cave branch returns `Mixed` at `UsesOperatorStackForChunk` — so they are the
+ones that prove anything.
 
 Interim answer if Jahni wants it before that lands: **Unreal Insights already shows this.** The trace
 scopes `VoxelForge_ClassifyTile` and `VoxelForge_GenerateMesh` exist at the site; a skipped tile is a
@@ -135,12 +145,26 @@ Everything before it is built and green.
 
 ## Then, in order
 
-1. **PERF — still unparked, and now the biggest open item.** The op path is measurably slower. One
-   cause found and fixed (the column memo discarded itself every chunk). Remaining suspects in order:
-   the hashed column lookup vs `GSurfColCache`'s direct-indexed box, then per-voxel virtual dispatch.
-   Also measured and stated: the gate is tested twelve times per voxel instead of once (stage B5's
-   deliberate trade). **Measure before optimising** — that is the §C10 lesson, and this session
-   re-learned it the hard way.
+1. **PERF — the biggest open item, and now AIMED (2026-08-16). Read this before touching it.**
+   The op path is measurably slower; one cause was already found and fixed (the column memo
+   discarded itself every chunk). Three things were worked out since, all still **unmeasured**:
+
+   - **The A/B needs no new code.** `VoxelForge_ClassifyTile` and `VoxelForge_GenerateMesh` already
+     exist, and the world is deterministic, so two Insights traces — flag off, then on, same seed and
+     route — are a clean before/after.
+   - **But it is unreadable without task 001.** With the stack on, tiles get *skipped*, so
+     `GenerateMesh` runs fewer times; a total conflates "cheaper per tile" with "fewer tiles" and
+     those pull opposite ways. `TilesMeshed` is the denominator. **⇒ 001 is a PREREQUISITE here, not
+     a parallel item.** Order: 001 → traces → attribution → fix.
+   - **The suspects don't share an archetype**, so measure one ticked strate at a time.
+     *SurfaceWorld* = the hashed column memo. *TunnelNetwork* = **19 virtual calls per voxel**
+     (16 from `BuildTunnelNetworkStack` + 3 from `AppendStructuralPost`), plus the known 12× gate
+     re-test (stage B5's deliberate trade).
+
+   `CODEX-TASK-002` tests the SurfaceWorld suspect and **fixes nothing on purpose** — the derivation
+   says the direct-mapped 4096-slot table evicts ~25 % of columns *every Z plane* (the mesher
+   pre-samples **Z-outermost**), for a derived ~9× on column work. **Derived, not measured.**
+   **Measure before optimising** — the §C10 lesson, re-learned the hard way last session.
 2. **The warp squeeze — PARKED with its ceiling measured, my recommendation is leave it.** The
    `WARP SHARE` line says over half the remaining blocking is the query-box dilation, not geometry
    (production: rooms 0.9 → 0.4, tunnels 2.4 → 1.1 with the dilation zeroed). The only remaining
