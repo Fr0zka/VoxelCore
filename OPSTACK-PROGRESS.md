@@ -3835,3 +3835,67 @@ proceeds when it expires while tasks still hold a raw `this`. **`CLAUDE.md` stat
 strongly than the code implements it** ("EndPlay blocks on `ActiveTaskCount → 0`" — it blocks *with a
 deadline*). That is a design trade someone made on purpose (never hang the editor) and it should be
 re-affirmed or changed deliberately, not patched by an agent while he is away.
+
+## 2026-08-16 (j) — VF-01 CONFIRMED (crash class). And the deliberate decision to STOP writing code.
+
+Jahni: *"with those new finds, anything you feel you should act on right now?"* Two verifications,
+and then a judgement call that the answer is **no more code today**.
+
+### ⛔ VF-01 is real, and it is the most serious thing found today
+
+`UVoxelStrateManager::Initialize` does `StrateLayout.Empty()` **and** `Passages.Empty()` followed by
+`Passages.Add()` — it frees and reallocates both arrays. **There is no lock, no barrier and no worker
+drain anywhere in that file.** Meanwhile these are read *on mesher workers*:
+
+- `AnyPassageNearBox` (:460) — range-for over `Passages`
+- `EvaluateModifierSDF` — indexes `Passages[...]`
+- `FindSlotIndexForChunkZ` — iterates `StrateLayout`
+
+all reached from `GetDensityAt` / `ClassifyTile`. And `RegenerateAllChunks()` — which bumps the epoch
+— runs **after** `Initialize`, so previous-epoch workers are still live *during* the mutation. The
+epoch rejects a finished result; it cannot make a concurrent read of a freed allocation safe.
+
+**This exact class has already bitten this project once and been fixed once:** `DiffLayer.ChunkMods`
+is read on mesher workers and written on the game thread, and all access now holds `ModsLock` after a
+carve-vs-stream access violation. `StrateLayout` / `Passages` are the same shape with no such guard.
+
+Four `Initialize` call sites, and the dangerous one is **`OnObjectModifiedInEditor` (:309)** — it
+fires *automatically* when a strate asset is edited while the world is streaming. That is a routine
+action here, not an exotic one.
+
+⚠️ **If Jahni has seen unexplained editor crashes while tweaking strate assets, this is a prime
+suspect.** Worth asking before assuming it has never fired.
+
+### VF-10 confirmed real — but Sol missed the conclusion that matters
+
+The ~74-field `FStrateGenerationParams` copy per near-surface sample is real (74 fields counted).
+**But it is inherited from the original path** — `GetDensityWithParams` does the same copy — so both
+paths pay it equally and **it does not explain the op-stack perf regression.** The op stack actually
+*improved* it, memoising so eleven detail ops don't each repeat it, and the site's own comment
+already records it as a known perf item. A genuine future optimisation for both paths; not an answer
+to "why is the op path slower". Sol reported the cost correctly and drew no comparison.
+
+### ⛔ THE DECISION: stop adding code. This is the action, not an absence of one.
+
+Four code changes are stacked unbuilt, and **three of them have "nothing should move" as their
+acceptance signal**: `eaa44bf` and `cab8e8f` must be exact no-ops at correctly ordered params, and
+`7dbdf51` must move exactly two numbers in one known direction. That is a delicate attribution setup
+and it is only readable while it stays clean.
+
+Adding a fifth change — to **streaming lifecycle**, the most timing-sensitive code in the plugin —
+would make an unexpected build result unattributable. **The value of a clean, readable build now
+exceeds the value of one more fix.**
+
+VF-01's fix is also genuinely Jahni's call, not an agent's:
+
+- **Minimal option** — stop submissions, drain to `ActiveTaskCount == 0`, then `Initialize`, then bump
+  the epoch, then resume. Reuses the drain `EndPlay` already has. Cost: an editor hitch on every
+  asset edit, proportional to the in-flight tile queue.
+- **Sol's option** — an immutable generation snapshot (seed + layout + passages + resolved defs), one
+  atomic publish, each task holding a strong ref. Correct and hitch-free; a real refactor.
+- **Narrow option** — an `FRWLock` over just `StrateLayout`/`Passages`, exactly the `ModsLock`
+  precedent. Smallest diff, adds a per-voxel read lock on the hot path — which is precisely the kind
+  of cost this project insists on measuring before accepting.
+
+Trading a possible crash for a guaranteed hitch, or for hot-path lock traffic, is a product decision.
+It waits for him.
