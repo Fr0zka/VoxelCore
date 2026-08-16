@@ -3497,3 +3497,59 @@ Three readings, and **the order matters**:
 
 Also still unbuilt and riding along: `e002bd4` (VerticalShafts connector capsules) —
 `Box verdicts over 60 VerticalShafts tiles`, **0 is the number to beat**, `violations` must stay 0.
+
+## 2026-08-16 (d) — while Jahni was away: one bug closed on paper, one prediction sharpened
+
+No build, no measurement available, so this was a reading session. Three results.
+
+### 1. The last compile risk in `eb317d9` is mechanically gone
+
+The one spot I could not rule out by eye was an identifier mismatch between the eight declarations in
+`VoxelStats.h` and the eight `DEFINE_STAT`s in `VoxelStats.cpp`. Diffed the extracted symbol lists:
+**identical**, and all eight use sites resolve to declared names. That risk is retired, not estimated.
+
+### 2. ⛔ `AUDIT §C2` IS FULLY CLOSED — I was one step from spec'ing a fix for a solved bug
+
+The handoff, the audit and my own memory all listed the live-edit half (`OC_Chunk`, `BM_Chunk`,
+`FChunkBiomeCache`) as open. It is not, and has not been for a while. Every per-chunk cache carries
+the layout version — `CP_Version`, `OC_Version`, `BM_Version`, `TC_SeenVersion` — and
+`FChunkBiomeCache::Invalidate()` exists precisely because the validity box says nothing about the
+`FBiomeContext` its cells were classified against; all four `thread_local` instances call it on a
+version change. The only two other instances in the tree are **function-local**, built per task, so
+they cannot go stale.
+
+**Seventh time a confident premise reversed on reading.** The difference is that this one was checked
+*before* the work rather than after: it cost a doc edit instead of a Codex run and a build cycle.
+Recorded at `AUDIT-2026-07.md §C2` and struck from the handoff's open list.
+
+### 3. The column-memo prediction is now arithmetic, not a band
+
+`CODEX-TASK-002`'s acceptance said "20–30 % of lookups", which was a guess wearing a number. The
+inputs are all statically knowable, so they were read instead: `CHUNK_SIZE = 32`, `CellsPerAxis = 32`,
+`GridDim = 33`, pre-sample loops over `g ∈ [-1, GridDim]` ⇒ **1225 columns per tile over 35 Z
+planes** (the mesher's own "35³ floats" buffer comment confirms the dimension).
+
+1225 keys in 4096 slots = load factor **0.299**; expected single-occupancy slots `4096·np(1-p)^(n-1)`
+≈ 908, so **~317 columns (25.9 %) collide** and evict each other every plane. Op path ≈
+`1225 + 34×317` ≈ **12 000** column computations per tile against the box's **1225**: **≈ 9.8×**.
+
+⚠️ And the reading instruction changed with it: **compare the ratio of the two hypotheses, not an
+absolute percentage.** The overhang and cliff mods call `GetColumn` again at the same XY, which adds
+**hits only** — it drags the miss *rate* down without touching the verdict. The ~10× gap between
+"confirmed" and "wrong" is what survives that.
+
+### 4. `REVIEW_FINDINGS.md` reassessed — two items are now counter-productive, not merely optional
+
+- `GetDensityWithParams` and `BuildChunkCache` splits: **don't.** The operator stack is *replacing*
+  the first archetype by archetype, so the split gets deleted and churns the eight bit-for-bit
+  equivalence tests; and `FRoomGraphSource` deliberately **calls** `BuildChunkCache` rather than
+  transcribing it, so restructuring forks the thing kept unforked on purpose. Both also sit on the
+  `§8.10` invariants, where a "behaviour-preserving" change once silently deleted the overhang.
+- `EVoxelPassageType` vs `EVoxelPassageStyle`: **judged, leave them.** Not duplicates — one is the
+  global inter-strate bore shape, the other per-strate descent styling on `FStratePassageConfig`,
+  with different owners and value sets. Both are `UMETA`-tagged and therefore **serialised into
+  Jahni's authored strate assets**, so merging them rewrites saved content for cosmetic tidiness.
+  Recommend closing the item rather than acting on it.
+- `GetGenerationParams` is flagged as the safest of the six if any is ever wanted.
+
+Nothing here needs a decision from Jahni; it all needs the same next build.

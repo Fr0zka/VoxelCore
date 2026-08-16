@@ -87,21 +87,38 @@ around the existing `if (S.Key != ColumnKey || S.X != WorldX || S.Y != WorldY)`.
    `Column->GetColumn(...)` (~line 864). They are legitimate traffic and must be counted, not
    excluded — they are part of why a miss is expensive.
 
-## Acceptance
+## Acceptance — the prediction is now numeric (tightened 2026-08-16 from the real grid dimensions)
 
-Fly a route through a **SurfaceWorld** strate that has `bUseOperatorStack` ticked, `stat VoxelForge`
-on screen, and read the ratio.
+The hand-wavy "20–30 %" band this section used to carry has been replaced by an arithmetic
+prediction, because the inputs are all statically knowable and were read out of the source:
 
-- **`ColumnMemoMiss` ≈ one per distinct column per tile** (hit rate climbing toward ~97 % as Z
-  planes accumulate) ⇒ **the hypothesis is WRONG**, the table is fine, and the perf cost is
-  elsewhere. Record that and move to suspect 2 (per-voxel virtual dispatch). *A negative result here
-  is a real result and must be written down, not quietly dropped.*
-- **`ColumnMemoMiss` in the neighbourhood of 20–30 % of all lookups, and staying there** ⇒
-  **confirmed**: the table is evicting on collision every Z plane. The fix is then obvious and cheap
-  (direct-indexed box keyed like `GSurfColCache`, or a set-associative table), and gets its own
-  task with the before/after this run supplies.
+- `CHUNK_SIZE = 32`, `CellsPerAxis = 32`, `GridDim = 33`, and the pre-sample loops run
+  `g ∈ [-1, GridDim]` per axis ⇒ **35 × 35 = 1225 distinct columns per tile**, over **35 Z planes**
+  (the mesher's own buffer comment, "35³ floats", confirms the dimension).
+- 1225 keys in 4096 slots is a load factor of **0.299**. Expected slots holding exactly one key
+  `= 4096 · np(1-p)^(n-1) ≈ 908`, so **~317 columns (25.9 %) share a slot with another** and evict
+  each other on every plane.
+- ⇒ op path ≈ `1225 + 34 × 317` ≈ **12 000** column computations per tile.
+  Original path (`GSurfColCache`, direct-indexed, `Computed[CI]` persists) = **1225**.
+  **≈ 9.8×.**
 
-Report **both numbers**, not the ratio alone — a ratio cannot distinguish "few lookups" from "many".
+### How to read the result
+
+⚠️ **Compare the RATIO OF THE TWO HYPOTHESES, not an absolute percentage.** The overhang and cliff
+modifiers call `GetColumn` again at the same XY (~line 864); every extra consumer adds **hits** and
+no misses, so it inflates the denominator and drags the miss *rate* down without changing the
+verdict. What does not move is the ~10× gap between the two outcomes.
+
+| observation | verdict |
+|---|---|
+| misses ≈ **8–10×** the hit-path baseline (single-consumer: ~28 % of lookups) | **CONFIRMED** — the table evicts on collision every Z plane. The fix gets its own task, with this run as its "before". |
+| misses ≈ **1 per distinct column** (single-consumer: ~3 %, hit rate ≥ 97 %) | **hypothesis WRONG.** The table behaves like the box, the ~9.8× does not exist, and the perf cost is suspect 2 (19 virtual calls per voxel). |
+
+*A negative result here is a real result.* It retires the most-suspected cause and is worth the build
+either way; it must be written into `OPSTACK-PROGRESS.md`, not quietly dropped.
+
+Report **both raw numbers**, never the ratio alone — a ratio cannot distinguish "few lookups" from
+"many", and the absolute miss count is what the fix would be reducing.
 
 ## Notes for the reviewer (Claude)
 

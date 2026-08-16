@@ -92,6 +92,15 @@ Legend: ✅ verified against code · ◻️ checklist box.
   `ResetGridBuildState(FDecoGrid&)`. *(2026-07-04)*
 - [ ] **`EVoxelPassageType` vs `EVoxelPassageStyle`** — two overlapping passage-shape enums, both in
   active use (11 refs). Consider consolidating to one. *(judgment call, not dead)*
+  **JUDGED 2026-08-16 — LEAVE THEM. Recommendation: close this item rather than act on it.** They
+  read as duplicates from the index and are not: `EVoxelPassageType` (`VoxelStrateTypes.h` ~42) is
+  the **global inter-strate bore shape** the layout generator picks (`SlopedTunnel` / `VerticalShaft`
+  / helix…); `EVoxelPassageStyle` (~1741) is **per-strate descent styling** on
+  `FStratePassageConfig` (`Straight` / `Worm` / `Spiral` / `Cascading`). Different owners, different
+  value sets, different lifetimes. And both are `UMETA`-tagged, i.e. **serialised into Jahni's
+  authored strate assets** — merging them silently rewrites saved content. That is a content-risk
+  change bought for cosmetic tidiness, which is the wrong trade at any time and especially before
+  the content lock.
 
 ## Dead code
 - [x] **`UVoxelMarchingCubesMesher::GetDensity()`** — removed, along with `InterpolateEdge`,
@@ -106,10 +115,29 @@ Legend: ✅ verified against code · ◻️ checklist box.
   strate-aware vertical clamp; struck from the dead list.
 
 ## Over-complexity (behavior-preserving splits, optional)
-- [ ] `GetDensityWithParams` (~600-1000 L) → `ApplyCaveMorphology`/`ApplySurfaceRoughness`/`ApplyTerrainOps`/`ApplyPostProcess`
-- [ ] `BuildChunkCache` (~450 L) → `CollectRooms`/`BuildNeighborGraph`/`ResolveTunnels`/`BakeRoomFeatures`
-- [ ] `GenerateMesh` (~250 L) → `PrecalcDensityGrid`/`MarchCells`/`GenerateSkirts`
-- [ ] `GetGenerationParams` (~180 L) → extract `ApplyBoundaryTransition(...)`
+
+> ⛔ **REASSESSED 2026-08-16 — do not pick these up as filler work.** They were written before the
+> operator-stack refactor existed, and two of them are now actively counter-productive rather than
+> merely optional. Read the reason before ticking anything here.
+
+- [ ] ~~`GetDensityWithParams` (~600-1000 L)~~ → **DON'T.** ⛔ Two independent reasons. (1) The
+  operator stack is *replacing* this function archetype by archetype — splitting it produces code
+  that gets deleted, and churns the eight equivalence tests that compare the stack against it **bit
+  for bit**. (2) It is the hottest path in the plugin and carries the `ARCHITECTURE §8.10`
+  invariants (`thread_local` box-valid caches, two-pass MC loop, SSE noise). The one time a
+  "behaviour-preserving" change was made here it silently deleted the overhang and only 1 sample in
+  20 000 crossed the isosurface — *a perf change can be a correctness change*. Revisit only once the
+  `switch` path is retired for good.
+- [ ] ~~`BuildChunkCache` (~450 L)~~ → **DON'T, same reason.** `FRoomGraphSource` deliberately
+  **calls** `BuildChunkCache`/`EvaluateSDFCached` instead of transcribing them, precisely so there is
+  one definition. Restructuring it now forks the thing that was kept unforked on purpose.
+- [ ] `GenerateMesh` (~250 L) → `PrecalcDensityGrid`/`MarchCells`/`GenerateSkirts`.
+  ⚠️ Still genuinely optional, but the two-pass loop is an `§8.10` invariant — a split must not
+  merge the passes, and the Z-outermost pre-sample order is load-bearing for every column cache
+  downstream (see the column-memo work of 2026-08-16). Low value, non-zero risk.
+- [ ] `GetGenerationParams` (~180 L) → extract `ApplyBoundaryTransition(...)`. **The safest of the
+  six** — pure params math, no caches, and `AUDIT §C2` already forced a close reading of both
+  Gradient arms. If any of these is ever worth doing, it is this one.
 - [ ] `GeneratePassages` (~150 L) → `ComputePlacement`/`BuildControlChain`/`ComputeBounds`
 - [ ] `BuildCellSpawns` (~150 L) → `FindSurfaceCrossings`/`PlaceDecorationsAtCrossings`
 
