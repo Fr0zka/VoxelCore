@@ -1,17 +1,29 @@
-# Handoff — VoxelForge operator stack, 2026-07-29 (T1.d measured in the harness, unproven in the game)
+# Handoff — VoxelForge operator stack, updated 2026-08-16 (four things queued on ONE build)
 
 > Paste the block below into a fresh session. Everything it refers to is on disk and in git.
 >
-> **State:** 8 of 8 archetypes ported and green. **Tile-skipping works and is measured — in the
-> automation harness:** 11 of 40 tiles proved `AllSolid` at production defaults, 14641 voxels
-> brute-forced, 0 violations. `AUDIT §C2` is fixed. `experimental` is pushed (`origin/experimental`).
+> **State:** 8 of 8 archetypes ported and green. Tile-skipping is measured **in the automation
+> harness** (11 of 40 tiles proved `AllSolid` at production defaults, 14641 voxels brute-forced,
+> 0 violations) and **still unobserved in the running game**. `AUDIT §C2` is **fully closed** (both
+> halves — verified 2026-08-16, don't reopen). `experimental` is pushed.
 >
-> **Two things are open, and the second is the more interesting one:**
-> 1. commit `e002bd4` (VerticalShafts) is written and **not yet built**;
-> 2. **none of this is observable in the running game.** Jahni built a world, looked at it, and said
->    *"I don't know if it dropped any meshing? but it looks alright by the eye."* He is right to be
->    unsure — the plugin has **zero stat counters**, and *skipped correctly* renders identically to
->    *skipped nothing*. `CODEX-TASK-001-tile-skip-stats.md` is the spec that closes this.
+> ## ⛔ FOUR unbuilt things are stacked on `experimental`. Build once, read four numbers.
+>
+> | # | commit | what to read |
+> |---|---|---|
+> | 1 | `e002bd4` VerticalShafts connector capsules | `Box verdicts over 60 VerticalShafts tiles` — **0 has been the number for the project's whole life**; `violations` must stay 0 |
+> | 2 | `eb317d9` `stat VoxelForge`, 8 counters | baseline `TilesOpStackSolid` = 0 → tick one `TunnelNetwork` strate → **non-zero**. That is the production proof of T1.d, which has never existed |
+> | 3 | `7dbdf51` `ExtraReach` × `VF_PerlinAbsBound` | Maze/VerticalShafts may prove **FEWER** tiles. **That is correct, not a regression** |
+> | 4 | `eaa44bf` `Max3` radius envelope | **a NO-OP at shipped defaults is the correct result** — any moved number means the diff did more than intended |
+>
+> In all four: the eight equivalence tests must stay green, and `violations` must stay 0.
+>
+> **⚠️ 3 and 4 are CORRECTNESS fixes to box verdicts, found by auditing all 28 `EffectOverBox`
+> implementations.** Both were the same mistake: *a bound taken from the parameter that reads like
+> the maximum instead of the supremum of what `Eval` actually produces* — and both times a correct
+> instance of the same reasoning already existed elsewhere in the same file. See
+> `OPSTACK-PROGRESS.md` 2026-08-16 (e) and (f); the sound-and-checked ops are listed there so they
+> are not re-audited.
 
 ---
 
