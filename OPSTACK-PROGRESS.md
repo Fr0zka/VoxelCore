@@ -4417,3 +4417,41 @@ the test fixture, in the same shape.
 for precisely the no-slot case, and this same function already calls it three times for the same
 question. A small `VF_ChunkZHasSlot` lambda wraps it so the `else if` reads as the predicate it is.
 No accessor promoted, no new surface.
+
+## 2026-08-16 (u) — ✅✅ T1.d FIRES IN PRODUCTION. 39% of tiles skipped, measured in game.
+
+```
+                          BEFORE (a2c5e02^)      AFTER
+Tiles Classified                1.90             1.88
+Tiles Meshed                    1.90             1.15
+Tiles Skipped All Air         (absent)           0.73
+Cave Bail Not Op Stack NoLayout 1.58            (GONE)
+Cave Bail Mixed Content       (absent)           0.77
+```
+
+`1.15 + 0.73 = 1.88` — the accounting closes exactly.
+
+**39 % of classified tiles are now skipped, against 0 % this morning.** Each skipped tile avoids
+~43 000 density evaluations plus marching cubes. This is the first time in the project's history
+that tile-skipping has been observed in the running game rather than in an automation harness.
+
+`Cave Bail Not Op Stack No Layout` is gone: those tiles now either resolve `AllAir` or attribute to
+`Cave Bail Mixed Content` (0.77) — genuinely straddling open air and something else, a correct
+conservative `Mixed` rather than a misrouting.
+
+### What is NOT yet firing, stated plainly
+
+`Tiles Skipped All Solid`, `TilesOpStackSolid` and `TilesOpStackAir` are still absent. **The cave
+branch still produces no verdicts in game** — its attempts now land in `Cave Bail Mixed Content`
+(0.77) and `Cave Bail Stack Verdict` (0.32). So the win measured here is the **open-air** class,
+proved by the classifier's own Z categories; the operator stack's `ClassifyBox` has still never
+returned a verdict in production. That remains the open item, and the counters now name where to
+look: tiles straddling content boundaries, and boxes the stack legitimately cannot prove.
+
+### How this was found, worth keeping
+
+Every earlier attempt reasoned from a number that could mean four things. It broke open when Sol's
+four-way split of `Cave Bail Not Op Stack` showed `SoleSlot` and `BoundaryTile` at **zero** — which
+proved the assets were correctly ticked (Jahni said so twice; I doubted it twice) and pointed at
+`NoLayout`, a cause nobody had considered. *A counter that can fire for two reasons is not a
+measurement.*
