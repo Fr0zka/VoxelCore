@@ -129,6 +129,56 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             Slot.HeightInChunks);
     }
 
+    // Diagnostic de configuration, une seule fois par construction de layout. SurfaceWorld est
+    // volontairement exclu : son chemin T1.d exact-lattice ne dépend pas de ce drapeau.
+    // Configuration diagnostic once per layout build. SurfaceWorld is deliberately excluded:
+    // its exact-lattice T1.d path does not depend on this flag.
+    int32 NumCaveSlots = 0;
+    int32 NumOperatorStackDisabledCaves = 0;
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (!Slot.Definition || Slot.Definition->GeneratorType == ECaveGeneratorType::SurfaceWorld)
+        {
+            continue;
+        }
+
+        ++NumCaveSlots;
+        if (!Slot.Definition->bUseOperatorStack)
+        {
+            ++NumOperatorStackDisabledCaves;
+        }
+    }
+
+    if (NumOperatorStackDisabledCaves > 0)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[StrateManager] Operator-stack opt-in: %d/%d cave layout slots have Use Operator Stack disabled. These slots cannot use operator-stack ClassifyBox/T1.d; enable the asset setting on the listed definitions if that is intended."),
+            NumOperatorStackDisabledCaves, NumCaveSlots);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Log,
+            TEXT("[StrateManager] Operator-stack opt-in: all %d cave layout slots have Use Operator Stack enabled."),
+            NumCaveSlots);
+    }
+
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (!Slot.Definition
+            || Slot.Definition->GeneratorType == ECaveGeneratorType::SurfaceWorld
+            || Slot.Definition->bUseOperatorStack)
+        {
+            continue;
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("[StrateManager]   cave slot=%d name='%s' Z chunks=[%d to %d] bUseOperatorStack=false"),
+            Slot.StrateIndex,
+            *Slot.Definition->StrateName.ToString(),
+            Slot.TopChunkZ,
+            Slot.BottomChunkZ);
+    }
+
     CachedSeed = WorldSeed;
     bOpenSurfaceEntry = Settings->bOpenSurfaceEntry;
     OriginSpineRadius = Settings->OriginSpineRadius;

@@ -661,30 +661,77 @@ namespace
         }
 
         /** La colonne complète, exactement les cinq sorties de `ComputeSurfaceColumn`.
-         *  Le mémo est une boîte à index direct, comme `FSurfaceColumnBox` : la pile évalue tous
-         *  les Z d'une colonne au même XY, donc l'overhang lit la MÊME colonne que la source, par
-         *  construction plutôt que par convention. */
+         *  Le mémo est un LRU spatial de six boîtes à index direct, comme `GSurfColCache` : la
+         *  pile évalue tous les Z d'une colonne au même XY, donc l'overhang lit la MÊME colonne
+         *  que la source, par construction plutôt que par convention.
+         *
+         *  The memo is a six-box spatial LRU with direct XY indexing, matching `GSurfColCache`.
+         *  Six boxes retain interleaved strate regions at the cost of roughly 0.79 MiB of TLS for
+         *  the five-float column payload plus one computed flag per cell, before compiler padding. */
         struct FColumn { float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY; };
 
         const FColumn& GetColumn(float WorldX, float WorldY) const
         {
-            // Même schéma éprouvé que `GSurfColCache` : index direct dans une boîte XY, puis un
-            // drapeau `Computed` par cellule. Une tuile MC pleine résolution demande
-            // (CHUNK_SIZE + 3)² = 35×35 = 1225 colonnes (anneau de marge inclus) ; cette boîte
-            // de Dim×Dim, recentrée sur le premier échantillon, les garde toutes sans collision.
-            // Same proven scheme as `GSurfColCache`: direct XY indexing plus one `Computed` flag per
-            // cell. A full-resolution MC tile needs 35×35 = 1225 columns including its margin ring;
-            // the box is sized so one tile fits without eviction.
+            // Même schéma éprouvé que `GSurfColCache` : six boîtes à index direct dans XY, chacune
+            // avec un drapeau `Computed` par cellule et une clé uint64 exacte. Une tuile MC pleine
+            // résolution demande 35×35 = 1225 colonnes (anneau de marge inclus) ; une boîte de
+            // Dim×Dim, recentrée sur le premier échantillon, les garde toutes sans éviction.
+            // Same proven scheme as `GSurfColCache`: six direct-indexed XY boxes, each with one
+            // `Computed` flag per cell and an exact uint64 key. A full-resolution MC tile needs
+            // 35×35 = 1225 columns including its margin ring; one Dim×Dim box holds that tile.
             struct FColumnBox
             {
                 enum : int32 { Halo = CHUNK_SIZE + 8, Dim = 2 * Halo + 1 };
                 int32 BaseX = 0, BaseY = 0;
                 uint64 Key = 0;             // strate + layout + seed + ParamsFingerprint
+                uint32 LastUse = 0;         // LRU stamp
                 bool bValid = false;
                 FColumn Cols[Dim * Dim];
                 bool Computed[Dim * Dim];
             };
-            thread_local FColumnBox Box = {};
+
+            struct FColumnCache
+            {
+                enum : int32 { NumBoxes = 6 };
+                FColumnBox Boxes[NumBoxes];
+                uint32 Clock = 0;
+
+                // Hit exact : clé complète + couverture XY complète. En cas de miss, seul le
+                // victim LRU est recentré et invalidé ; les cinq autres boîtes restent chaudes.
+                // Exact hit: full key + full XY coverage. On a miss, only the LRU victim is
+                // recentered and invalidated; the other five boxes remain warm.
+                FColumnBox& Acquire(int32 IX, int32 IY, uint64 InColumnKey)
+                {
+                    ++Clock;
+                    for (FColumnBox& B : Boxes)
+                    {
+                        if (B.bValid && B.Key == InColumnKey
+                            && IX >= B.BaseX && IX < B.BaseX + FColumnBox::Dim
+                            && IY >= B.BaseY && IY < B.BaseY + FColumnBox::Dim)
+                        {
+                            B.LastUse = Clock;
+                            return B;
+                        }
+                    }
+
+                    // Miss d'acquisition : évincer/recentrer une seule boîte, jamais tout le cache.
+                    // Acquisition miss: evict/recenter one box only, never the whole cache.
+                    FColumnBox* Victim = &Boxes[0];
+                    for (FColumnBox& B : Boxes)
+                    {
+                        if (B.LastUse < Victim->LastUse) Victim = &B;
+                    }
+                    Victim->BaseX = IX - FColumnBox::Halo;
+                    Victim->BaseY = IY - FColumnBox::Halo;
+                    Victim->Key = InColumnKey;
+                    Victim->LastUse = Clock;
+                    Victim->bValid = true;
+                    FMemory::Memzero(Victim->Computed, sizeof(Victim->Computed));
+                    return *Victim;
+                }
+            };
+
+            thread_local FColumnCache Cache = {};
             thread_local FColumn DirectColumn = {};
 
             // The production mesher and the exact-lattice classifier use integer XY. Fractional
@@ -701,18 +748,9 @@ namespace
                 const int32 IX = (int32)WorldX;
                 const int32 IY = (int32)WorldY;
 
-                // Bounds are checked exactly before deriving CI; the index itself is the XY key.
-                // Les bornes sont vérifiées exactement avant CI : l'index EST la clé XY.
-                if (!Box.bValid || Box.Key != ColumnKey
-                    || IX < Box.BaseX || IX >= Box.BaseX + FColumnBox::Dim
-                    || IY < Box.BaseY || IY >= Box.BaseY + FColumnBox::Dim)
-                {
-                    Box.BaseX = IX - FColumnBox::Halo;
-                    Box.BaseY = IY - FColumnBox::Halo;
-                    Box.Key = ColumnKey;
-                    Box.bValid = true;
-                    FMemory::Memzero(Box.Computed, sizeof(Box.Computed));
-                }
+                // Acquire vérifie la clé uint64 complète et les bornes exactes avant de dériver CI.
+                // Acquire checks the exact uint64 key and exact bounds before deriving CI.
+                FColumnBox& Box = Cache.Acquire(IX, IY, ColumnKey);
 
                 CI = (IY - Box.BaseY) * FColumnBox::Dim + (IX - Box.BaseX);
                 MemoColumn = &Box.Cols[CI];
@@ -830,11 +868,13 @@ namespace
          * c'est-à-dire à chaque chunk. Résultat : une strate haute de 4 chunks recalculait ses
          * colonnes **4 fois**, resamples du cliff compris. Le chemin d'origine ne fait pas ça —
          * `GSurfColCache` est clé sur `(boîte XY, StrateKey, Seed, LayoutVersion)` **SANS ChunkZ**,
-         * délibérément, « shared down the whole vertical strate stack ».
+         * délibérément, « shared down the whole vertical strate stack ». Cette pile reprend la
+         * même identité de strate/layout/seed, en ajoutant l'empreinte obligatoire des params pour
+         * protéger ses sorties propres ; son mémo est maintenant un LRU spatial de six boîtes.
          *
-         * Donc la clé devient la même identité : ce qui rend deux colonnes interchangeables, c'est
-         * la STRATE et la version de layout, pas le chunk. Le mémo étant `thread_local`, il SURVIT
-         * à la reconstruction de la pile — seule la clé l'invalidait.
+         * Donc la clé garde l'identité partagée : ce qui rend deux colonnes interchangeables, c'est
+         * la STRATE, le seed, la version de layout et les params, pas le chunk. Le mémo étant
+         * `thread_local`, il SURVIT à la reconstruction de la pile — seule la clé l'invalidait.
          *
          * POURQUOI C'EST SÛR : les hauteurs sont XY-pures par construction (c'est tout l'objet de
          * `VoxelHeightOp.h`, où le type n'a pas de Z), et le champ de biomes est documenté
@@ -843,8 +883,9 @@ namespace
          *
          * The memo was keyed on InstanceId, which changes every chunk, so a 4-chunk strate recomputed
          * every column 4x. GSurfColCache deliberately omits ChunkZ and shares down the whole vertical
-         * stack; this now keys on the same identity. Safe because heights are XY-pure by type and the
-         * biome field is documented Z-independent.
+         * stack; this now shares the same strate/layout/seed identity and adds the required params
+         * fingerprint for its own outputs. The six-box LRU keeps independent XY regions alive. Safe
+         * because heights are XY-pure by type and the biome field is documented Z-independent.
          */
         void PrepareChunk(const FVoxelOpContext& Ctx) override
         {
@@ -881,14 +922,14 @@ namespace
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
-            // ⚠️ PAS de mémo par colonne ICI, délibérément. Le cache T1.a existe déjà UN NIVEAU
-            // AU-DESSUS (`GSurfColCache` dans `GetDensityAt`), clé sur (boîte XY, StrateKey, Seed).
-            // En rajouter un ici demanderait une seconde clé de cache à tenir juste — et une clé de
-            // cache fausse dans un op partagé sur toute la pile verticale est précisément le mode de
-            // défaillance qu'`AUDIT §6.3` décrit. Le branchement (étape 2b) réutilise le cache
-            // existant plutôt que d'en inventer un second.
-            // No per-column memo here on purpose: T1.a already exists one level up, and a second
-            // cache key is a second thing to get wrong.
+            // Le mémo par colonne vit ici, dans six boîtes thread_local partagées par les instances
+            // mais séparées par la clé, et lues par les Eval de cette source et FOverhangShelfMod.
+            // Il est séparé de `GSurfColCache` : la pile possède ses propres sorties et sa clé
+            // complète (strate + layout + seed + empreinte des params), donc réutiliser le cache
+            // du générateur serait incorrect.
+            // The per-column memo lives here in six thread-local boxes shared across instances but
+            // separated by the key, and read by this source's Eval calls and FOverhangShelfMod.
+            // It is separate from `GSurfColCache`: the stack owns its own outputs and full key.
             const FColumn& C = GetColumn(WorldX, WorldY);
 
             float Density = C.TerrainZ - WorldZ;
