@@ -280,14 +280,18 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         {
             int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
             FRandomStream Rng(24680 + SlotIndex);
+            // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
+            // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
+            const int32 SpanCells  = 60;
+            const int32 SpanVoxels = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
 
             for (int32 t = 0; t < NumSlabTiles; ++t)
             {
                 const int32 Step = 1, Cells = 8;
                 const int32 Extent = Step * Cells;
                 const FIntVector Origin(
-                    Rng.RandRange(-6, 6) * Extent,
-                    Rng.RandRange(-6, 6) * Extent,
+                    Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                    Rng.RandRange(-SpanCells, SpanCells) * Extent,
                     FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
 
                 const int32 GridDim = Cells + 1;   // le MÊME treillis que le mesher, marge ±1 comprise
@@ -335,10 +339,13 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
                       NumUnsound, 0);
 
             AddInfo(FString::Printf(
-                TEXT("%s box verdicts over %d tiles: %d proved uniform, %d Mixed. Today's ")
+                TEXT("%s box verdicts over %d tiles (XY sampled from +/- %d voxels = %.1f x ")
+                TEXT("ColumnSpacing %.0f): %d proved uniform, %d Mixed. Today's ")
                 TEXT("ClassifyTile proves ZERO of these. This number is the whole point of making ")
                 TEXT("the slab surfaces XY-pure (OPSTACK-DECOMPOSITION 3.1)."),
-                SlotName, NumSlabTiles, NumProved, NumMixed));
+                SlotName, NumSlabTiles, SpanVoxels,
+                (float)SpanVoxels / FMath::Max(SlabParams.ColumnSpacing, 1.0f), SlabParams.ColumnSpacing,
+                NumProved, NumMixed));
 
             if (NumProved == 0)
             {

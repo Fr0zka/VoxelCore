@@ -3697,3 +3697,49 @@ the same file** — `VF_PerlinAbsBound` for the first, `FIslandBlobSource` for t
 
 ⇒ When adding a bound, the question is not "what is the max parameter" but **"what is the supremum
 of the thing `Eval` can actually produce, and where in this file has that already been worked out?"**
+
+## 2026-08-16 (g) — the sampler bug was fixed twice and never as a CLASS. Three more instances.
+
+`CODEX-TASK-005`. Test-only; no non-test file changed.
+
+The handoff records: *"A sampler must cover at least one period of what it samples"* — found in the
+tunnel test (±32 vs `RoomSpacing 80`) and again in the shaft test (±48 vs `ShaftSpacing 55`). Both
+were widened to ±440 and taught to print their extent in periods. **The fix was applied where the
+bug was noticed, never to the class.** Three box-verdict tile scans still ran the original
+`RandRange(-6, 6) * Extent` with `Step 1, Cells 8` ⇒ **±48 voxels**:
+
+| test | half-extent | period (default — verified NOT overridden by the fixture) | coverage |
+|---|---|---|---|
+| Island | ±48 | `IslandSpacing` **95** | **0.51 periods** — worse than either bug already fixed |
+| Slab | ±48 | `ColumnSpacing` **60** | **0.80 periods** |
+| Maze | ±48 | `CellSize` **40** | 1.20 periods (marginal) |
+
+**Why this mattered *today* rather than in general:** the two commits immediately before it changed
+the very verdicts these tests guard — `7dbdf51` touches **islands** and maze, `eaa44bf` touches
+**slab columns**. The tests that would catch a mistake in those fixes were sampling half a lattice
+cell. Widening them before the build is what makes that build's green mean something.
+
+### The rule the two fixed tests already encoded, now written down
+
+`Extent = Step · Cells = 8`, so `SpanVoxels = SpanCells · 8`. For **8 periods** of half-extent:
+**`SpanCells` = the lattice spacing.** That is where the shaft test's `55` comes from — it equals
+`ShaftSpacing`, and it is not a coincidence. Applied: Island `95`, Slab `60`, Maze `40`, each giving
+exactly 8.0 periods, each printing the ratio **computed live from the params struct** so a future
+narrowing is visible instead of silent.
+
+### What was deliberately NOT done
+
+- **No assertion, tolerance, `AddError` or brute-force loop touched.** Every proved tile is still
+  verified voxel by voxel; a wider sampler producing a false verdict fails exactly as before. This
+  changes what the measurement *looks at*, never what it *demands*.
+- **No seed, `Step`, `Cells` or tile count changed** — a moved seed makes the before/after
+  incomparable, which is the only reason to do this now rather than later.
+- The ratio is never a hardcoded "8.0" in a format string. That would be a success message asserting
+  coverage while measuring nothing — a named failure mode here.
+
+### What to read after the build
+
+The proved counts **will move**; that is the point, not a regression. **`NumUnsound` / `violations`
+must stay 0 in all three.** If one goes non-zero, the wider sampler has found a real hole the narrow
+one was hiding — in which case this task paid for itself on its first run, and the number must be
+reported rather than tuned away.

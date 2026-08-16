@@ -235,14 +235,18 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
     {
         int32 NumProvedSolid = 0, NumProvedAir = 0, NumMixed = 0, NumUnsound = 0;
         FRandomStream Rng(24680);
+        // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
+        // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
+        const int32 SpanCells  = 95;
+        const int32 SpanVoxels = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
 
         for (int32 t = 0; t < 60; ++t)
         {
             const int32 Step = 1, Cells = 8;
             const int32 Extent = Step * Cells;
             const FIntVector Origin(
-                Rng.RandRange(-6, 6) * Extent,
-                Rng.RandRange(-6, 6) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
                 FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
 
             const int32 GridDim = Cells + 1;
@@ -289,10 +293,12 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("every box verdict the island stack emits survives brute force"), NumUnsound, 0);
 
         AddInfo(FString::Printf(
-            TEXT("Box verdicts over 60 FloatingIslands tiles: %d proved AllSolid, %d proved AllAir, ")
+            TEXT("Box verdicts over 60 FloatingIslands tiles (XY sampled from +/- %d voxels = %.1f x ")
+            TEXT("IslandSpacing %.0f): %d proved AllSolid, %d proved AllAir, ")
             TEXT("%d Mixed. Today's ClassifyTile proves ZERO of these. The AllAir count is the new ")
             TEXT("thing: no cave archetype has ever been able to prove 'all air', and a floating-")
             TEXT("island strate is mostly exactly that (OPSTACK-DECOMPOSITION 7)."),
+            SpanVoxels, (float)SpanVoxels / FMath::Max(P.IslandSpacing, 1.0f), P.IslandSpacing,
             NumProvedSolid, NumProvedAir, NumMixed));
 
         if (NumProvedAir == 0)

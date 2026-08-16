@@ -267,14 +267,18 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
     {
         int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
         FRandomStream Rng(24680);
+        // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
+        // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
+        const int32 SpanCells  = 40;
+        const int32 SpanVoxels = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
 
         for (int32 t = 0; t < 60; ++t)
         {
             const int32 Step = 1, Cells = 8;                  // petites tuiles : force brute tenable
             const int32 Extent = Step * Cells;
             const FIntVector Origin(
-                Rng.RandRange(-6, 6) * Extent,
-                Rng.RandRange(-6, 6) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
+                Rng.RandRange(-SpanCells, SpanCells) * Extent,
                 FMath::Clamp(Rng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
 
             const int32 GridDim = Cells + 1;   // le MÊME treillis que le mesher, marge ±1 comprise
@@ -319,9 +323,11 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                   NumUnsound, 0);
 
         AddInfo(FString::Printf(
-            TEXT("Box verdicts over 60 Maze tiles: %d proved uniform, %d Mixed. Today's ClassifyTile ")
+            TEXT("Box verdicts over 60 Maze tiles (XY sampled from +/- %d voxels = %.1f x ")
+            TEXT("CellSize %.0f): %d proved uniform, %d Mixed. Today's ClassifyTile ")
             TEXT("proves ZERO of these -- every cave archetype falls through to \"pas prouvable en ")
             TEXT("v1\". Any number above zero here is tile-skipping Maze has never had."),
+            SpanVoxels, (float)SpanVoxels / FMath::Max(MazeParams.CellSize, 1.0f), MazeParams.CellSize,
             NumProved, NumMixed));
 
         if (NumProved == 0)
