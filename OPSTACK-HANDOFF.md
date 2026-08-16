@@ -222,6 +222,14 @@ Everything before it is built and green.
 - **A bound in a box verdict must be PROVED, not observed.** `|Perlin3D| ≤ 1.5` is derived from
   `GradDot`'s two-distinct-axes form and the per-axis weighted bound of 0.5 — *not* from the header's
   "~[-1,1]". Over-estimating costs CPU; under-estimating deletes collision.
+  **⚠️ USE `VF_PerlinAbsBound` — it is file-scope in `VoxelDensityOpStack.cpp` and it is the ONLY
+  copy. Never write a bare `1.0` for a noise amplitude in a reach.** `VoxelNoise::FBM` **normalises**
+  (`return Total / MaxValue`), so `sup|FBM| = sup|Perlin3D|` **exactly** — the octave sum neither
+  amplifies nor attenuates it, and an `FBM`-driven reach needs the same 1.5. This rule was written
+  *before* three `ExtraReach` formulas were found violating it (2026-08-16, fixed in `7dbdf51`):
+  VerticalShafts and Maze were unsound at their shipped defaults, FloatingIslands sound only because
+  its `SDFBlendRadius` happens to be large. **A rule stated in a doc is not a rule enforced in code** —
+  when you add a reach, grep for `VF_PerlinAbsBound` and use it.
 - `ProcessQueue` stays `EQueueMode::Mpsc`; `Epoch` carries through every async path; don't "optimize"
   the `ARCHITECTURE §8.10` invariants.
 - Commit per coherent unit with a real message. **`experimental` is pushed and tracked
