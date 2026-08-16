@@ -3375,3 +3375,58 @@ covers both sites.
 2. `e002bd4` (VerticalShafts connector capsules) — written, **not yet built**. Read
    `Box verdicts over 60 VerticalShafts tiles`; 0 is the number to beat, `violations` must stay 0.
 3. PERF on the op path; the warp squeeze stays parked.
+
+## 2026-08-16 (b) — PERF: the suspects don't share an archetype, and the A/B needs no code
+
+Orchestration pass on the parked PERF item. Three findings, none of them measured yet — they are
+written here so the measurement that follows is aimed rather than exploratory.
+
+### 1. The perf A/B requires NO new code — but it requires task 001 to be readable
+
+`VoxelForge_ClassifyTile` and `VoxelForge_GenerateMesh` already exist at the call site. Since the
+world is deterministic, the same seed and the same flight path generate the same tiles, so **two
+Insights traces — `bUseOperatorStack` off, then on — are a clean A/B.** No instrument needed.
+
+**But the totals cannot be compared directly.** With the stack on, tiles are *skipped*, so
+`GenerateMesh` runs fewer times: a total-time comparison conflates "cheaper per tile" with "fewer
+tiles", and those two point in opposite directions. **`TilesMeshed` from `CODEX-TASK-001` is the
+denominator that separates them.**
+
+⇒ **001 is a PREREQUISITE for the perf work, not a parallel item.** The handoff listed them as
+independent (1 and 3); they are sequential. Order is now 001 → traces → attribution → fix.
+
+### 2. "The op path is slower" is one number over two unrelated cost structures
+
+Per archetype the suspects do not overlap, so a single figure cannot be acted on — the same lumping
+error as the tile-skip counter, one level up:
+
+- **SurfaceWorld** — the hashed column memo (below). Nothing to do with dispatch.
+- **TunnelNetwork** — **19 virtual calls per voxel**: 16 from `BuildTunnelNetworkStack` (rock, room
+  graph, carve, the twelve detail mods, the worm) plus 3 from `AppendStructuralPost` (spine, seal,
+  passage carve). None inlinable, against one monolithic `GetDensityWithParams` the compiler can
+  inline and vectorise. Plus the known 12× gate re-test (stage B5's deliberate trade).
+
+The measurement must therefore be taken **per archetype, one strate ticked at a time.**
+
+### 3. The column memo hypothesis — `CODEX-TASK-002` written to test it
+
+`FSurfaceColumnSource::GetColumn` uses a **direct-mapped 4096-entry hashed table**; `GSurfColCache`
+uses a **direct-indexed box** with a `Computed[]` flag and therefore has no collisions at all.
+
+The premise that makes the difference bite was checked rather than assumed: the mesher pre-samples
+with **Z OUTERMOST** (`VoxelMarchingCubesMesher.cpp` ~226), sweeping a full XY plane per Z level, so
+every column is revisited ~34 times per tile.
+
+The table's own comment sized it against this and concluded 4096 entries "covers four chunks". **The
+gap in that reasoning: a direct-mapped table evicts on collision, not on fullness.** ~1156 columns
+in 4096 slots is a load factor of 0.28, at which ~285 columns (~25 %) still share a slot with
+another. Those recompute the entire height stack — cliff's four structural resamples included — on
+*every* Z plane. ~1156 column computations on the original path vs ~10 000 on the op path: **~9×**,
+on the most expensive archetype in the plugin.
+
+**This is a derivation, not a measurement.** Six confident chains in this project have reversed on
+an unchecked premise, so `CODEX-TASK-002` adds `ColumnMemoHit` / `ColumnMemoMiss` and **fixes
+nothing** — deliberately, so the instrument and the fix cannot land in the same build and make each
+other unreadable. A negative result is specified as a real result.
+
+`CODEX-TASK-002-column-memo-thrash.md`. **Nothing was built or run.**
