@@ -4074,3 +4074,63 @@ So the machinery works; it is mostly not being reached.
 `bUseOperatorStack` ticked. This is the second time today that a fact living in `.uasset` data
 drove hours of work in the wrong direction — see 2026-08-16 (h). **The counter did in one flight what
 six hours of reasoning could not: it named the cause instead of listing candidates.**
+
+## 2026-08-16 (n) — Sol investigation: it refuted MY hypothesis and caught MY false accusation
+
+Sol High ran as investigator with authority to spawn Luna xHigh workers; two approaches implemented
+in isolated git worktrees (`../VF-approach-A`, `../VF-approach-B`). Main tree untouched at `4ba53f2`.
+Report: `INVESTIGATION-2026-08-SOL.md`.
+
+### ⛔ Two corrections to things I asserted, both found by reading
+
+**1. My "one un-ticked neighbouring strate kills boundary tiles" hypothesis is WRONG.**
+`UsesOperatorStackForChunk` depends **only on `ChunkCoord.Z`**. `ClassifyTile`'s earlier Z loop has
+already required the predicate for every cave Z it sampled and required all cave samples to be in one
+layout slot — within one slot the flag cannot vary with X or Y. **The later XYZ sweep is redundant,
+not over-strict.** Removing it would unlock nothing: boundary tiles still fail the independent
+one-slot / generator-type / bit-identical-params guards, which is correct and necessary.
+
+**2. I falsely accused the earlier audit of fabricating evidence.** I wrote in the reviewer header
+that VF-03's fixture citation did not exist. **It does** — `VoxelForgeTestFixture.h` ~134/146
+explicitly documents `CP_UseOpStack` contamination between worlds. I had read only the file's 30-line
+header comment and asserted a negative from a partial read. Header corrected.
+
+⇒ **VF-03's core claim is CONFIRMED, not plausible:** `GetDensityAt` keys its `thread_local CP_*`
+state by `(ChunkCoord, LayoutVersion)` with **no generator/world identity**, and every manager's
+version starts at the same value, so a second world on the same worker can inherit the first's
+params, `CP_UseOpStack` and stack. Its *breadth* (the `OC_*` / `BM_*` / passage / biome / diff
+caches) is still unproven and should be one owner-identity task, not assumed from the old row.
+
+### ⚠️ The bail counter I specced is AMBIGUOUS — my 80% reading was over-confident
+
+`Cave Bail Not Op Stack` is incremented by the **first** predicate check, which runs *before* the
+different-slot attribution. So a boundary tile that reaches an un-ticked adjacent cave slot is
+counted as `NotOpStack` even though mixed content would have rejected it anyway. **The measured
+1.42/1.77 therefore does NOT distinguish "the flown slot is un-ticked" from "a boundary tile met an
+un-ticked slot first."** Terrain correctness is unaffected; only the diagnosis is. The asset state
+still has to be read in the editor. *A counter that can fire for two reasons is the same defect this
+project fixed for `TilesSkippedAllSolid` — and I reintroduced it one layer down.*
+
+### The column memo, restated honestly
+
+The one-box port losing 6561 cells per recenter is **verified structurally**. That it *materially
+causes* the 10–30% in-game band is **unproven**, and the retracted different-route comparison cannot
+support it. Same seed, same route, or no claim.
+
+### Two approaches, both built, recommendation A
+
+| | **A — explicit opt-in + six-box LRU** | **B — code-enforced cutover + 4-way associative memo** |
+|---|---|---|
+| T1.d | init-time warnings naming every disabled slot; human fixes the asset. No silent behaviour change. | ignores the serialized flag; routes all 8 ported archetypes through the stack. |
+| memo | ports the reference 6-box spatial LRU (5 boxes stay warm on a miss) | 1024 sets × 4 ways, exact X/Y+key compare, no bulk clear |
+| cost | **~0.79 MiB TLS per worker** (vs ~0.13 now) | ~160 KiB TLS per worker |
+| risk | per-worker memory multiplication | **destroys the A/B lever** — the flag can no longer select paths in production |
+
+**Sol recommends A**, and I agree with its reason: the code does **not** justify weakening
+`ClassifyTile`, and the flag is the only same-route A/B lever we have — B would delete the very
+instrument needed to prove the refactor. Caveat to apply before adopting A: its warning currently
+enumerates SurfaceWorld slots too, whose exact-lattice T1.d path does not depend on the flag; narrow
+or reword that first.
+
+**Neither approach solves VF-03's owner identity, boundary params conservatism, or the memo's
+unproven benefit.** Stated plainly by Sol rather than glossed.
