@@ -25,6 +25,7 @@ class UMaterialParameterCollection;
 class UVolumeTexture;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class FScopedGenerationPause;
 namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
 /**
@@ -373,6 +374,8 @@ public:
     UVolumeTexture* GetDensityVolumeTexture(int32 Level = 0) const;
 
 private:
+    friend class FScopedGenerationPause;
+
     /** Get/create the shared MID wrapping a base terrain material (binds volume textures + shadow params).
      *  Returns Base unchanged-wrapped, or nullptr if Base is null. */
     UMaterialInstanceDynamic* GetOrCreateTerrainMID(UMaterialInterface* Base);
@@ -677,8 +680,18 @@ public:
     // Set to true during EndPlay — async tasks check this before accessing UObjects
     std::atomic<bool> bShuttingDown{false};
 
+    // Set during editor-driven generation mutations; distinct from teardown/shutdown semantics.
+    // Active pendant les mutations de génération lancées par l'éditeur, sans signifier la destruction.
+    std::atomic<bool> bGenerationPaused{false};
+
     // Number of async tasks currently running — EndPlay waits for this to reach 0
     std::atomic<int32> ActiveTaskCount{0};
+
+    FORCEINLINE bool ShouldAbortWork() const
+    {
+        return bShuttingDown.load(std::memory_order_relaxed)
+            || bGenerationPaused.load(std::memory_order_relaxed);
+    }
 
     // Player's level-0 tile coord (= chunk coord). The desired set is rebuilt when this changes.
     FIntVector CurrentCenterChunk = FIntVector::ZeroValue;

@@ -68,15 +68,21 @@ void UVoxelContentManager::NotifyShutdown()
 
     // Wait for in-flight march tasks to finish (they check the flag and bail). Timeout to avoid hangs.
     const double Deadline = FPlatformTime::Seconds() + 3.0;
-    while (GActiveDecoTasks.load(std::memory_order_relaxed) > 0)
-    {
-        if (FPlatformTime::Seconds() > Deadline) break;
-        FPlatformProcess::Yield();
-    }
+    WaitForDecorationTasks(Deadline);
 
     DrainDecoResults();
     ResetGridBuildState(NearGrid);
     ResetGridBuildState(FarGrid);
+}
+
+bool UVoxelContentManager::WaitForDecorationTasks(double Deadline)
+{
+    while (GActiveDecoTasks.load(std::memory_order_relaxed) > 0)
+    {
+        if (FPlatformTime::Seconds() > Deadline) return false;
+        FPlatformProcess::Yield();
+    }
+    return true;
 }
 
 void UVoxelContentManager::DrainDecoResults()

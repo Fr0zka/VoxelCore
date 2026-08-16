@@ -88,6 +88,45 @@ static void BuildTileStreamSet(RealtimeMesh::FRealtimeMeshStreamSet& Streams, co
     }
 }
 
+class FScopedGenerationPause
+{
+public:
+    explicit FScopedGenerationPause(AVoxelWorld* InWorld)
+        : World(InWorld)
+    {
+        if (!World) return;
+
+        World->bGenerationPaused.store(true, std::memory_order_release);
+
+        // The game thread owns this gate; workers only read Generator/Mesher and enqueue results.
+        // La barrière est prise sur le thread de jeu ; les workers ne font qu'énumérer et Enqueue.
+        const double Deadline = FPlatformTime::Seconds() + 5.0;
+        while (World->ActiveTaskCount.load(std::memory_order_relaxed) > 0)
+        {
+            if (FPlatformTime::Seconds() > Deadline) return;
+            FPlatformProcess::Yield();
+        }
+
+        if (World->ContentManager && !World->ContentManager->WaitForDecorationTasks(Deadline)) return;
+
+        bAcquired = true;
+    }
+
+    ~FScopedGenerationPause()
+    {
+        if (World)
+        {
+            World->bGenerationPaused.store(false, std::memory_order_release);
+        }
+    }
+
+    bool Acquired() const { return bAcquired; }
+
+private:
+    AVoxelWorld* World = nullptr;
+    bool bAcquired = false;
+};
+
 //=============================================================================
 // LIVE EDIT — regenerate all chunks when params change in the Details panel
 //=============================================================================
@@ -139,13 +178,22 @@ void AVoxelWorld::RegenerateAllChunks()
 
 void AVoxelWorld::RebuildStrates()
 {
-    if (StrateManager && Settings)
     {
-        // Re-applies layout + inter-strate gap + passage/spine settings from VoxelSettings.
-        StrateManager->Initialize(Settings, Settings->Seed);
+        FScopedGenerationPause Guard(this);
+        if (!Guard.Acquired())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] RebuildStrates: generation pause timed out; no mutation applied."));
+            return;
+        }
+
+        if (StrateManager && Settings)
+        {
+            // Re-applies layout + inter-strate gap + passage/spine settings from VoxelSettings.
+            StrateManager->Initialize(Settings, Settings->Seed);
+        }
+        if (AtmosphereManager) AtmosphereManager->Reset();
+        if (ContentManager)    ContentManager->ClearAll();
     }
-    if (AtmosphereManager) AtmosphereManager->Reset();
-    if (ContentManager)    ContentManager->ClearAll();
 
     // Reload all chunks against the rebuilt strate data.
     RegenerateAllChunks();
@@ -304,13 +352,22 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
 
     // Re-initialize the strate manager so it picks up the changed definition values,
     // then regenerate all chunks with the updated params.
-    if (StrateManager)
     {
-        StrateManager->Initialize(Settings, Settings->Seed);
-    }
-    if (Generator)
-    {
-        Generator->InitializeSettings(Settings);
+        FScopedGenerationPause Guard(this);
+        if (!Guard.Acquired())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] OnObjectModifiedInEditor: generation pause timed out; no mutation applied."));
+            return;
+        }
+
+        if (StrateManager)
+        {
+            StrateManager->Initialize(Settings, Settings->Seed);
+        }
+        if (Generator)
+        {
+            Generator->InitializeSettings(Settings);
+        }
     }
 
     RegenerateAllChunks();
@@ -635,7 +692,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
 // is refilled from the diff via MarkDirtyVoxelBox in RemeshDirtyChunks).
 void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
 {
-    if (!Generator || !Mesher || bShuttingDown.load(std::memory_order_relaxed)) return;
+    if (!Generator || !Mesher || ShouldAbortWork()) return;
 
     const FIntVector OriginVoxels = Tile.OriginVoxels();
     const int32 Cells = CHUNK_SIZE;   // level 0 is always full-res (level 0 < FullResClipLevels)
@@ -1464,14 +1521,14 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             ~FTaskGuard() { Counter.fetch_sub(1, std::memory_order_relaxed); }
         } Guard{ActiveTaskCount};
 
-        if (bShuttingDown.load(std::memory_order_relaxed)) return;
+        if (ShouldAbortWork()) return;
 
         FChunkResult Result;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                            BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                            bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY, Result);
 
-        if (!bShuttingDown.load(std::memory_order_relaxed))
+        if (!ShouldAbortWork())
         {
             ProcessQueue.Enqueue(MoveTemp(Result));   // move: don't copy the geometry payload
         }
@@ -2072,42 +2129,51 @@ void AVoxelWorld::ChangeSeed(int32 NewSeed)
     const int32 OldSeed = Settings->Seed;
     const int32 OldSeason = Settings->CurrentSeason;
 
-    // 1. Update seed in Settings (the authoritative source)
-    Settings->Seed = NewSeed;
-
-    // 2. Increment season counter
-    Settings->CurrentSeason++;
-
-    // 3. Push new seed to Generator
-    if (Generator)
     {
-        Generator->InitializeSettings(Settings);
-    }
+        FScopedGenerationPause Guard(this);
+        if (!Guard.Acquired())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] ChangeSeed: generation pause timed out; no mutation applied."));
+            return;
+        }
 
-    // 4. Rebuild strate layout with the new seed.
-    //    Strate assignments and passages all change.
-    if (StrateManager)
-    {
-        StrateManager->Initialize(Settings, NewSeed);
-    }
+        // 1. Update seed in Settings (the authoritative source)
+        Settings->Seed = NewSeed;
 
-    // 5. Clear all player modifications — carvings from the old world are meaningless
-    if (DiffLayer)
-    {
-        DiffLayer->Clear();
-    }
+        // 2. Increment season counter
+        Settings->CurrentSeason++;
 
-    // 5b. Update content placement seed so the new world scatters differently.
-    if (ContentManager)
-    {
-        ContentManager->SetSeed(NewSeed);
-        ContentManager->ClearAll();
-    }
+        // 3. Push new seed to Generator
+        if (Generator)
+        {
+            Generator->InitializeSettings(Settings);
+        }
 
-    // 5c. Reset atmosphere — strate layout changed, re-apply on next Tick.
-    if (AtmosphereManager)
-    {
-        AtmosphereManager->Reset();
+        // 4. Rebuild strate layout with the new seed.
+        //    Strate assignments and passages all change.
+        if (StrateManager)
+        {
+            StrateManager->Initialize(Settings, NewSeed);
+        }
+
+        // 5. Clear all player modifications — carvings from the old world are meaningless
+        if (DiffLayer)
+        {
+            DiffLayer->Clear();
+        }
+
+        // 5b. Update content placement seed so the new world scatters differently.
+        if (ContentManager)
+        {
+            ContentManager->SetSeed(NewSeed);
+            ContentManager->ClearAll();
+        }
+
+        // 5c. Reset atmosphere — strate layout changed, re-apply on next Tick.
+        if (AtmosphereManager)
+        {
+            AtmosphereManager->Reset();
+        }
     }
 
     // 6. Unload all existing chunks and let Tick reload them with new generation

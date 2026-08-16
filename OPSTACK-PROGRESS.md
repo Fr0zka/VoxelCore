@@ -3899,3 +3899,63 @@ VF-01's fix is also genuinely Jahni's call, not an agent's:
 
 Trading a possible crash for a guaranteed hitch, or for hot-path lock traffic, is a product decision.
 It waits for him.
+
+## 2026-08-16 (k) — VF-01 FIXED: the drain, chosen over the lock and the snapshot
+
+Jahni: *"well, you select it, I trust you and Sol."* `CODEX-TASK-007`.
+
+**First, a position I updated rather than defended.** An hour earlier I argued for adding no more
+code before the build, to keep the three "nothing should move" fixes attributable. That argument was
+about the **geometry** numbers — and a streaming-lifecycle change cannot reach an equivalence test or
+a box verdict, which are computed from params and hashes, not from *when* `Initialize` runs. The risk
+I cited did not apply to this particular change. A lifecycle bug shows up as a hang or a hitch, which
+is trivially attributable because nothing else in the stack touches lifecycle.
+
+### Why the drain, and not the other two
+
+| option | verdict |
+|---|---|
+| **`FRWLock` on the two arrays** (the `ModsLock` shape — smallest diff, exact in-repo precedent) | ⛔ **rejected on timing.** It puts a read lock on the **per-voxel hot path**: `EvaluateModifierSDF` and `FindSlotIndexForChunkZ` run ~43k times per tile. There is an open, unmeasured perf regression and two tasks queued to measure it — adding hot-path lock traffic now would **contaminate the exact measurement they exist to take.** Correct, worst possible timing. |
+| **Immutable generation snapshot** (Sol's proposal) | ⛔ **right long-term, too large to improvise.** It refactors `UVoxelStrateManager`'s whole API surface. That is a design conversation, not an agent's unprompted call. |
+| **Drain before mutating** | ✅ **chosen.** Zero hot-path cost. Reuses machinery already proven in `EndPlay`. Its only cost — a brief stall — lands exclusively on **human-initiated editor actions** (asset edit, rebuild, seed change) and never during play. |
+
+### What landed
+
+`FScopedGenerationPause` (RAII, in `VoxelWorld.cpp`) raises a new `bGenerationPaused` — **deliberately
+not `bShuttingDown`**, which means "tearing down" and would have misled the next reader — then drains
+**both** reader populations: `ActiveTaskCount` for chunk tasks and, via a new
+`UVoxelContentManager::WaitForDecorationTasks`, the decoration tasks counted by `GActiveDecoTasks`.
+Chunk tasks alone were never the whole reader set.
+
+⚠️ **The line that makes it a fix rather than a narrowing: on timeout it does NOT mutate.** It logs an
+`Error` naming the function and returns, leaving the world in its previous consistent state. A
+timeout that proceeds anyway is exactly what the bug already does. The three dangerous sites —
+`RebuildStrates`, `OnObjectModifiedInEditor`, `ChangeSeed` — are structured so `Initialize` is
+*unreachable* without the pause. `BeginPlay` (the fourth site) is untouched: no tasks exist yet.
+
+### Verified after the fact, not taken on report
+
+- Four files only; **no density or mesher file in the diff**, so generated terrain cannot move.
+- `ShouldAbortWork()` **replaced** three existing `bShuttingDown` checks — 3 replacements, 0 new
+  check points. `bShuttingDown`'s own semantics are unchanged.
+- `EndPlay` and `BeginPlay` untouched (VF-02's 3-second timeout is a separate deliberate decision and
+  stays Jahni's call).
+- The deadline passed to `WaitForDecorationTasks` is **absolute**, documented as such in the header —
+  and the refactor **removed** the duplicate spin loop from `NotifyShutdown` rather than adding a
+  second one.
+- Deadlock check, which the spec required Codex to perform and report: chunk and decoration tasks
+  read the generator and `Enqueue` to MPSC queues; **no worker path waits on the game thread**, so a
+  game-thread drain is bounded. Raising the pause also makes in-flight tasks bail early, so the drain
+  gets *faster*, not slower.
+
+### Compile-risk spots for the build
+
+1. `WaitForDecorationTasks(double)` declaration / definition / call-site agreement.
+2. `FScopedGenerationPause`'s forward declaration and `friend class` access in `VoxelWorld.h`.
+3. `ShouldAbortWork()` visibility from inside the `UE::Tasks::Launch` lambda.
+
+### What to check in the editor
+
+Edit a strate asset while the world is streaming. Expect a **brief stall, then the edit applies, and
+no crash.** If the `Error` log about a timed-out pause ever appears, the drain deadline (5 s) is too
+short for the in-flight queue and that is worth knowing rather than guessing.

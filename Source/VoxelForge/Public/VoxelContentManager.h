@@ -138,6 +138,10 @@ public:
      *  UObject teardown (worker tasks read the Generator). */
     void NotifyShutdown();
 
+    /** Wait until in-flight decoration march tasks drain before a generation mutation. Deadline is absolute.
+     *  Attend la fin des tâches de décoration avant une mutation de génération ; échéance absolue. */
+    bool WaitForDecorationTasks(double Deadline);
+
     //--- async-task plumbing (public so the worker lambda can reach them) -----
     /** One placement decided off-thread; spawned on the game thread from FDecoCellResult::Entries. */
     struct FDecoSpawn
