@@ -4309,3 +4309,56 @@ same-seed/same-route number.
 expected there. Whether the *real* world says the same is the ground truth for T1.d, and it
 supersedes both my inference from `Cave Bail Not Op Stack` and the belief recorded in (h). Nothing
 else should be built or reasoned about T1.d until that line is read.
+
+## 2026-08-16 (r) — ⛔ T1.d's BLOCKER FOUND: out-of-layout chunks are misrouted into the cave branch
+
+In-game `stat VoxelForge`, flying at full speed, with the split bail counters:
+
+```
+Tiles Classified  1.90        Tiles Meshed  1.90     ← nothing skipped
+Cave Bail Not Op Stack No Layout  1.58   (83% of classified)
+Cave Bail Stack Verdict           0.27
+Cave Bail Params                  0.05
+Cave Bail Not Op Stack SoleSlot / BoundaryTile / MixedContent  ← NEVER FIRED
+```
+
+**Jahni was right and I was wrong to doubt the assets.** `SoleSlot` never fires, so every strate he
+flies is genuinely opted in. `BoundaryTile` never fires either, so the neighbour theory is dead too.
+Sol's four-way split earned its keep on its first flight: the old lumped counter said "not op stack"
+and would have sent us at the assets again.
+
+### The mechanism, read out of the code
+
+Two functions disagree about what a chunk outside the strate stack *is*:
+
+```cpp
+// GetGeneratorTypeForChunk — outside all strates (above or below) →
+    return ECaveGeneratorType::TunnelNetwork;   // "the fallback density path produces solid rock anyway"
+
+// IsGapChunk — above the top strate or below the bottom →
+    return false;                               // "open air, NOT a gap"
+```
+
+So for any chunk **above the top strate** (`TopChunkZ = 0`, i.e. all of the open air above the
+world) `ClassifyTile` sees: not a gap, not SurfaceWorld ⇒ **cave archetype**. It enters the cave
+branch, calls `UsesOperatorStackForChunk`, `FindSlotIndexForChunkZ` returns −1, and it bails.
+
+**Every tile touching open air is being classified as a TunnelNetwork cave tile whose strate has the
+flag off.** That is 83 % of tiles on his route, and it is why `Tiles Classified == Tiles Meshed`.
+
+⚠️ **Note the two comments contradict each other** — one calls out-of-layout "solid rock via the
+fallback", the other calls above-stack "open air". **Do not guess which is true**; the correct verdict
+for those tiles depends on it, and guessing here writes a hole. Read `GetDensityAt`'s no-slot path
+before choosing.
+
+### Why this is the whole T1.d story
+
+The cave branch was never reached for the tiles that dominate a normal flight. T1.d has not been
+failing — it has been **unreachable**, and for a reason that has nothing to do with the operator
+stack, the box verdicts, or the asset flags. All of that machinery is correct and tested; it was
+sitting behind a routing mistake in the classifier's archetype lookup.
+
+**Next step (not taken — out of budget, and it needs the density question answered first):** make
+out-of-layout chunks their own category in `ClassifyTile` rather than borrowing `TunnelNetwork`.
+If open air above the stack is provably uniform, those tiles become an `AllAir`/`AllSolid` verdict
+and T1.d finally fires on the majority of a surface flight.
