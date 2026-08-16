@@ -178,9 +178,13 @@ Everything before it is built and green.
    libm can differ. Currently **0 samples within 1e-6 of the isosurface**, i.e. no measured risk. Run
    `CrossPlatformDigest` on Linux, compare the SHAPE digest, pin it. The real fix if ever needed is a
    deterministic in-house sin/cos.
-4. **`AUDIT §C2`'s remaining half** — `OC_Chunk`, `BM_Chunk`, `FChunkBiomeCache` are still keyed
-   without the layout version. That is the live-edit staleness class ("I tweaked the asset and one
-   patch kept the old shape"), not the determinism class, which is fixed.
+4. ~~**`AUDIT §C2`'s remaining half**~~ — **✅ CLOSED, verified 2026-08-16. Do not re-open, and do
+   not spec a fix for it — I nearly did.** `OC_Chunk`, `BM_Chunk` and `TC_BiomeCache` all carry a
+   layout-version guard (`OC_Version` / `BM_Version` / `TC_SeenVersion`), `FChunkBiomeCache` has an
+   explicit `Invalidate()` that all four `thread_local` instances call on a version change, and the
+   only other two instances in the tree are **function-local**, so they cannot go stale. Recorded in
+   `AUDIT-2026-07.md §C2`. The live-edit half was fixed at the same time as the determinism half;
+   only this list was stale.
 5. **Phase 3 — ops as data assets.** A design conversation, not a transcription. Don't start it
    unprompted. What makes it possible is already in place: ops depend on capabilities
    (`IVoxelBiomeField`), never on `UVoxelGenerator`.
