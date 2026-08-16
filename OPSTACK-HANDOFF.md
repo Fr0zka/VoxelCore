@@ -1,10 +1,10 @@
-# Handoff — VoxelForge operator stack, 2026-07-28 (Phase 2 complete and green)
+# Handoff — VoxelForge operator stack, 2026-07-29 (T1.d delivered and measured)
 
 > Paste the block below into a fresh session. Everything it refers to is on disk and in git.
 >
-> **State:** Phase 2 is **DONE — 8 of 8 archetypes ported, built, and green** (14 tests, two
-> consecutive green builds). `ClassifyTile` consumes `ClassifyBox`. **Everything in git is compiled
-> and tested.** One question to confirm in the first run, then one clear next task.
+> **State:** 8 of 8 archetypes ported and green. **Tile-skipping now actually works and is measured:
+> 11 of 40 tiles proved `AllSolid` at production defaults, 14641 voxels brute-forced, 0 violations.**
+> `AUDIT §C2` is fixed. One commit is written but **not yet built** — see "First action".
 
 ---
 
@@ -17,142 +17,128 @@ re-derive them.
 1. **`CLAUDE.md`** — project rules. **Rule #1 is absolute: never build, compile, or run the editor.**
    I build everything myself. When code is done, stop, say "ready to build", list the likely
    compile-error spots, and wait.
-2. **`OPSTACK-PROGRESS.md` — THE LAST ENTRY FIRST.** Append-only log; the resume point. The last
-   entry is the green build with every measured number in it.
+2. **`OPSTACK-PROGRESS.md` — THE LAST ENTRY FIRST.** Append-only log; the resume point.
 3. **`OPSTACK-PLAN.md`** — the plan. **§2.6.1 is the acceptance bar** and supersedes §2.6.
-4. **`OPSTACK-DECOMPOSITION.md`** — per-archetype breakdown. **§0.2** (the amplitude bound) is the
-   live one; §2 TunnelNetwork and §8 Underwater are now history, not instructions.
-5. **`AUDIT-2026-07.md`** — **§C2 has a CONFIRMED sub-item as of 2026-07-28, read it**; §C10 is
-   SOLVED, don't reopen; §C9's library half is the top open theoretical risk with 0 measured
-   exposure.
+4. **`OPSTACK-DECOMPOSITION.md`** — per-archetype breakdown. **§0.2** (the amplitude bound) is now
+   *implemented*, not pending; §2 TunnelNetwork and §8 Underwater are history, not instructions.
+5. **`AUDIT-2026-07.md`** — **§C2's SDF-cache half is FIXED (2026-07-28)**, its live-edit half
+   (`OC_Chunk` / `BM_Chunk` / `FChunkBiomeCache`) is still open; §C10 is SOLVED, don't reopen;
+   §C9's library half is the top open theoretical risk with 0 measured exposure.
 6. **`CODEMAP.md`** — navigation. Trust symbol names over line numbers.
 
-## Where things stand — the transition is COMPLETE and VERIFIED
+## Where things stand
 
 All 8 archetypes have an operator-stack twin, per-strate opt-in, each equivalence-tested **bit for
-bit** against its original density function. The `switch` and the stack are now two complete,
+bit** against its original density function. The `switch` and the stack are two complete,
 interchangeable implementations.
 
-| Archetype | State |
-|---|---|
-| `Maze` | ✅ ported, bit-identical, wired |
-| `FlatPlain` + `CrystalChamber` | ✅ **one op for both**, bit-identical, wired |
-| `SurfaceWorld` | ✅ ported incl. biome blending, bit-identical, wired |
-| `VerticalShafts` | ✅ ported, bit-identical, wired |
-| `FloatingIslands` | ✅ ported, bit-identical, wired — the stack that runs **backwards** |
-| `TunnelNetwork` | ✅ **19 ops**, bit-identical incl. all 12 detail modifiers + per-room override |
-| `Underwater` | ✅ same builder, second `case` — confirm its coverage number once, see below |
-
 Everything sits behind `UVoxelStrateDefinition::bUseOperatorStack`; the ported list lives **only** in
-`UVoxelStrateManager::UsesOperatorStackForChunk` (now all 8). **No strate asset has the box ticked**
-— that is my call and I haven't made it. But the flag is no longer a no-op anywhere: ticking it now
-really switches that strate onto the stack, for density *and* for tile classification.
+`UVoxelStrateManager::UsesOperatorStackForChunk` (all 8). **No strate asset has the box ticked** —
+that is my call and I still haven't made it. `GetDensityAt` and `ClassifyTile` build the stack
+through the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole, not a bug.
 
-`ClassifyTile` **consumes `ClassifyBox`** for cave archetypes (SurfaceWorld and bedrock gaps keep
-their hand-written exact-lattice proofs). `GetDensityAt` and `ClassifyTile` build the stack through
-the **same** factory, `VF_BuildOpStackForChunk` — a second copy would be a hole, not a bug.
+### ✅ T1.d — the tile-skipping prize — is real, and it is measured
 
-## The one number to confirm, and it takes one run
-
-The first green build reported this, and it is the one result worth understanding before trusting
-anything about `Underwater`:
+`FRoomGraphSource::EffectOverBox` answers **spatially**. The result, brute-forced voxel by voxel:
 
 ```
-Underwater (stage C2): bit-identical across 2000 samples — 0 of them in open cave (0.0%)
+[production defaults]  11 of 40 tiles proved AllSolid — 14641 voxels checked, 0 violations
+[dense fixture]         0 of 40                       — correct, and structurally inevitable
 ```
 
-**A green bit-identity over 2000 samples of solid rock is not evidence** — it is exactly what two
-agreeing voids look like. Same failure as stage A's 1.1 % run, in a different slot, caught by a
-counter written for it.
+One function's verdict is inherited by `FSdfConvertOp`, the twelve detail modifiers (via
+`VF_NoCaveOverBox`) **and** `FWormFieldSource` — fourteen operators from one place. That is what the
+C1 wiring was built for.
 
-A real bug surfaced while diagnosing it: the sampled chunk-Z range used `Z / CHUNK_SIZE`, and C++
-integer division **truncates toward zero**. TunnelNetwork is at the top of the layout in positive Z
-where truncation == floor, so it could not show there; Underwater is at the **bottom, in negative
-Z**, where it shifts the upper chunk bound a notch high and the `Clamp` piles samples into the top
-seal band. Fixed (`FloorDivChunk`), sampling widened 8 → 24 clusters, **and not trusted**: check 5b
-gives each of the three possible causes (the bake / the sampled Z range / the XY spread) its own
-number and prints how to read them.
+### ⚠️⚠️ THE ONE INVARIANT THAT CAN DELETE COLLISION — read before touching any op
 
-**That fix is built — the second build was green too. What I did not see is the number.** So:
+**`FRoomGraphSource::EffectOverBox` returning `Identity` now means `Sdf ≥ T`, NOT `Sdf == FLT_MAX`**,
+where `T = max(3·SDFBlendRadius, WormNetworkRange)`. That is sound only because all three consumers
+of the SDF channel were read one by one:
 
-> **First action: run the `VoxelForge` filter and read the `Underwater diagnosis` line, plus the
-> cave-coverage percentage on the line above it.**
+| consumer | threshold |
+|---|---|
+| `FSdfConvertOp::Eval` | `Sdf >= Blend`, and the tunnel stack passes `MakeSdfCarve(P.SDFBlendRadius, …)` ⇒ **K** |
+| the twelve modifiers | `VF_NearCaveSurface` ⇒ **3K** |
+| `FWormFieldSource::Eval` | `CaveSDF >= WormNetworkRange` ⇒ **WormNetworkRange** |
+
+**Any new consumer of `InOut.Sdf` must have a threshold ≤ `T`, or be added to that `max`.** An op
+reading `Sdf < 100` would see false `Identity` verdicts and produce tiles with no geometry **and no
+collision**. The warning is written at the site you land on when you add one.
+
+(The `−K` slack covers *any* number of primitives because `SmoothMin`'s penalty is exactly zero once
+`|A−B| ≥ K`, so the running minimum saturates at `K` below the smallest term. Without that
+observation the slack would scale with the ~88 tunnels in a cache and the criterion would be dead.)
+
+## First action: build, then read ONE line
+
+**The last commit (`e002bd4`, VerticalShafts) is written and NOT built.** Everything before it is
+built and green.
+
+> Build, run the `VoxelForge` filter, and read
+> **`Box verdicts over 60 VerticalShafts tiles`**.
 >
-> - **Non-zero cave coverage** ⇒ the truncation *was* the cause, `Underwater` is genuinely covered,
->   and this whole section is closed. Say so in `OPSTACK-PROGRESS.md` and move on to the next
->   section — do not go looking for a bug that no longer exists.
-> - **Still 0.0 %** ⇒ the diagnosis line names which of the three causes it is, and the fix follows
->   from that rather than from a guess.
+> **0 was the number for the whole project's life.** Its `EffectOverBox` used to return `CarveOnly`
+> because a shaft merely *existed* within a `Spacing*1.6` halo — true almost everywhere at
+> `ShaftSpacing 55 / ShaftDensity 0.6`. It now rebuilds the connectors the way `GetCells` does and
+> tests the real capsules, with **Z exact** and XY conservative.
 >
-> Either way it is one run, and the answer is printed. Do not infer it from the fact that the suite
-> is green: a bit-identity over solid rock is green for the wrong reason, which is the entire point
-> of that counter existing.
+> - **Non-zero, and `violations` still 0** ⇒ it worked; record it and move on.
+> - **Still 0** ⇒ the warning in that test names what to check **first**: `ExtraReach` inflates both
+>   remaining tests, so compare it against `ShaftMaxRadius` before touching either test. **Do not
+>   re-derive from scratch** — that is exactly what cost three rounds on TunnelNetwork.
 
-## Then the one task everything is waiting on
+## Then, in order
 
-**Make `FRoomGraphSource::EffectOverBox` answer spatially.**
-
-TunnelNetwork proves **0 of 40** tiles today, and the test asserts that. The chain dies at the room
-source, which returns `Both` with unknown amplitude before anything downstream is reached. Its room
-and tunnel bounds (`FCachedRoom::CullRadiusSq`, `FCachedTunnel::BoundRadiusSq`) are **already in the
-SDF cache**; what it costs is building that cache for the *queried box*, on the querying thread.
-
-That cost is now clearly worth paying, and every other piece is already built to receive it:
-
-- `ClassifyTile` consumes `ClassifyBox` in production, so a proved tile skips `GenerateMesh` —
-  30 000+ density evaluations saved against one `BuildChunkCache`;
-- the fold carries **numbers** (`MaxCarveOverBox` / `MaxFillOverBox` / `ForcedMarginOverBox`), so a
-  bounded worm no longer kills `AllSolid` on rock that is solid by more than it can carve;
-- the twelve detail modifiers already **inherit** the room source's verdict via `VF_NoCaveOverBox` —
-  the day the source says `Identity` for a box, all twelve follow, in one place rather than thirteen.
-
-**Keep the brute-force check.** `VoxelForge.OpStack.ClassifyTileSoundness` verifies verdicts against
-`GetDensityAt` on a world where every strate opted in. A false verdict is an invisible hole: no
-geometry, **no collision**, until a player falls through it.
-
-## ⚠️ Debts that must be paid BEFORE that lands, not after
-
-Both were introduced knowingly and are written at the exact site a reader would land on.
-
-1. **Box bounds read STRATE params, but a per-room op can raise them.** `EffectOverBox` and the new
-   amplitude bounds are computed from strate params, because a box spans many rooms. But `ApplyTo`
-   writes the op's value **even where the strate's was 0**, so a room op can enable a modifier the
-   strate had switched off, or give it a bigger amplitude. A box verdict on a strate with a
-   terrain-op pool can therefore be **too optimistic** — the dangerous direction. Harmless while the
-   room source answers `Both` (nothing is provable anyway); **not harmless the moment it doesn't.**
-   Noted at `FLayerLineMod::EffectOverBox` and `FRoomGraphSource::LocalParams()`.
-2. **`AUDIT §C2` is confirmed and unfixed on the `switch` path.** `GetGenerationParams` blends params
-   *within* a strate (`Alpha` depends on chunk Z for `Gradient`, and on chunk XY too for
-   `Interleaved`), and `Gradient` + `TransitionBlendChunks = 2` are the **defaults**. The original's
-   SDF cache key has neither params nor chunk Z, so a worker evaluates the second chunk it builds
-   against the first chunk's rooms — and *which* chunk came first depends on worker order, so two
-   peers can diverge from the same seed. The op stack does **not** inherit it (params CRC in the
-   key), and `ClassifyTile`'s new path guards against it explicitly (params must be bit-identical
-   across every chunk coord the box touches). The fix on the `switch` path is a params CRC in its
-   key — a live-generation change that wants a build in front of it.
-
-## After that, in order
-
-1. **PERF — unparked.** The op path is measurably slower. One cause found and fixed (the column memo
-   discarded itself every chunk). Remaining suspects in order: the hashed column lookup vs
-   `GSurfColCache`'s direct-indexed box, then per-voxel virtual dispatch. Also measured and stated:
-   the gate is now tested twelve times per voxel instead of once (stage B5's deliberate trade).
-   **Measure before optimising** — that is the §C10 lesson.
-2. **`VerticalShafts` proves 0 of 60 tiles.** Pessimistic, not wrong: `EffectOverBox` returns
-   `CarveOnly` whenever any shaft is within a `Spacing*1.6` halo instead of testing real connector
-   capsules. Lost CPU, never a hole.
+1. **PERF — still unparked, and now the biggest open item.** The op path is measurably slower. One
+   cause found and fixed (the column memo discarded itself every chunk). Remaining suspects in order:
+   the hashed column lookup vs `GSurfColCache`'s direct-indexed box, then per-voxel virtual dispatch.
+   Also measured and stated: the gate is tested twelve times per voxel instead of once (stage B5's
+   deliberate trade). **Measure before optimising** — that is the §C10 lesson, and this session
+   re-learned it the hard way.
+2. **The warp squeeze — PARKED with its ceiling measured, my recommendation is leave it.** The
+   `WARP SHARE` line says over half the remaining blocking is the query-box dilation, not geometry
+   (production: rooms 0.9 → 0.4, tunnels 2.4 → 1.1 with the dilation zeroed). The only remaining
+   route is proving `sup|Perlin3D|` down from the proved **1.5** toward its apparent ~1.0–1.1, worth
+   ~27 % of the dilation. Spot-checking a grid is **not** a proof and a wrong sup is a hole.
+   **A negative result is already recorded so nobody repeats it:** bounding the warp *locally*
+   (evaluate at the box centre, shift, dilate by the variation) is **worse** — a rigorous per-axis
+   Lipschitz bound is `4·1.875 + 1 = 8.5` per unit cell, and `8.5 × 0.206` (the half-box in noise
+   units) `= 1.75` exceeds the global range bound of 1.5.
 3. **`AUDIT §C9` library half** — `sinf`/`cosf` are not IEEE-754 specified, so MSVC's CRT and glibc's
    libm can differ. Currently **0 samples within 1e-6 of the isosurface**, i.e. no measured risk. Run
    `CrossPlatformDigest` on Linux, compare the SHAPE digest, pin it. The real fix if ever needed is a
    deterministic in-house sin/cos.
-4. **Phase 3 — ops as data assets.** A design conversation, not a transcription. Don't start it
+4. **`AUDIT §C2`'s remaining half** — `OC_Chunk`, `BM_Chunk`, `FChunkBiomeCache` are still keyed
+   without the layout version. That is the live-edit staleness class ("I tweaked the asset and one
+   patch kept the old shape"), not the determinism class, which is fixed.
+5. **Phase 3 — ops as data assets.** A design conversation, not a transcription. Don't start it
    unprompted. What makes it possible is already in place: ops depend on capabilities
    (`IVoxelBiomeField`), never on `UVoxelGenerator`.
+
+## Debts — status changed, read this before acting on the old text
+
+1. **"Box bounds read STRATE params but a per-room op can raise them" — DORMANT, not urgent.**
+   Checked rather than paid, and the check reversed the premise: when the source proves `Identity`
+   the twelve modifiers are `Identity` **soundly** (their `bNearCaveSurface` gate never opens, so no
+   room op can enable anything), and when it answers `Both` it supplies no `MaxCarveOverBox`, so the
+   default `FLT_MAX` kills every hypothesis regardless of what the modifiers claim. **It goes live
+   the day `FRoomGraphSource` gains a `MaxCarveOverBox`** — bounding the converter's `2·BaseDensity`
+   would make the modifiers' own numbers matter for the first time. Written at the site.
+2. **`AUDIT §C2` — FIXED on the `switch` path.** `GetDensityWithParams` now takes **required**
+   `ParamsFingerprint` + `LayoutVersion`. Required, not defaulted, so a caller that forgets fails to
+   compile. The CRC is taken **once per chunk** where the params memo already lives (`CP_TunnelFP`) —
+   a `MemCrc32` per voxel on the hottest path would have been a real regression. Note the audit's own
+   suggested alternative ("add chunk Z to the key") is both insufficient (`Interleaved` makes `Alpha`
+   depend on chunk **XY** too) and destructive (chunk XY is deliberately absent so `WorldX ± 1`
+   gradient probes don't thrash the box — `ARCHITECTURE §8.10`).
 
 ## Hard rules that prevent real bugs
 
 - **Density sign:** negative = solid at the mesher. Inside the op stack the convention is INTERNAL
   (**positive = solid**), negated once by the caller. The SDF channel uses standard SDF convention.
+- **`Identity` from the room source means `Sdf ≥ T`.** See the boxed invariant above. This is the
+  single most dangerous thing in the current code.
 - **Never run both density paths in one world.** **Comparing them is legitimate** — §C10 is closed
   since `FPSemantics = Precise`, and all eight equivalence tests compare bit for bit. They are
   **port-correctness oracles**, not fidelity checks: §2.6.1 requires *same seed ⇒ same world on every
@@ -160,49 +146,80 @@ Both were introduced knowingly and are written at the exact site a reader would 
 - **Every cache key includes `LayoutVersion` AND the params.** See §C2 and the overhang regression of
   2026-07-27, where omitting the params silently deleted the overhang and only 1 sample in 20 000
   crossed the isosurface.
+- **A bound in a box verdict must be PROVED, not observed.** `|Perlin3D| ≤ 1.5` is derived from
+  `GradDot`'s two-distinct-axes form and the per-axis weighted bound of 0.5 — *not* from the header's
+  "~[-1,1]". Over-estimating costs CPU; under-estimating deletes collision.
 - `ProcessQueue` stays `EQueueMode::Mpsc`; `Epoch` carries through every async path; don't "optimize"
   the `ARCHITECTURE §8.10` invariants.
 - Commit per coherent unit with a real message. **Never push.** `main` is the known-good fallback.
 - Update `CODEMAP §3`, `ARCHITECTURE §8`, tick `OPSTACK-PLAN`, append to `OPSTACK-PROGRESS.md`.
 - **When inserting a class into `VoxelDensityOpStack.cpp` / `VoxelHeightOpStack.cpp`, put it ABOVE
   the labelled end of the anonymous namespace.** Anchoring on the FACTORIES banner puts it outside,
-  and the brace added with it closes nothing. Made that mistake twice; both files say so at the
-  exact line.
+  and the brace added with it closes nothing. Made that mistake twice; both files say so.
+- **Match the codebase's spelling of engine macros.** `KINDA_SMALL_NUMBER`, not
+  `UE_KINDA_SMALL_NUMBER` — the plugin uses the unprefixed form everywhere.
 
 ## Method lessons this refactor actually paid for
 
 Ordered by how much they cost.
 
-- **Instrument before hypothesising.** §C10 cost six builds and five refuted hypotheses, then was
-  solved for free by a build setting changed for an unrelated reason. Park a question whose
-  consequences are measured and benign.
-- **Verify the premise before reasoning from it.** Five times now a confident chain rested on an
-  unchecked assumption and the check reversed it: C1's *documented* fix was wrong; "C9's risk is gone
-  after FPSemantics" was wrong; "C1 is closed, 0 sites left behind" was wrong (the sweep matched a
-  *spelling*); "PitDensity enables pits" was wrong; "there are 13 detail modifiers" was wrong (twelve,
-  and only eleven read the per-room copy). **A grep over a spelling is evidence about the spelling.**
+- **⭐ Instrument what you ASSUMED, not just what you changed.** This is the expensive one, learned
+  over four rounds in one session. The warp dilation — `CaveWarpStrength · VOXEL_NOISE_SCALE ·
+  PerlinAbsBound`, a constant chosen in the first commit — inflated a 10-voxel tile into a 50-voxel
+  query box, **125× the volume**. Four separate tightenings (the worm, the columns, the sampler, the
+  tunnel disjunction) were each individually correct and each landed *around* that untouched term.
+  The tunnel fix, predicted "an order of magnitude", delivered 25 % — **and the instrument said so,
+  and I credited the tunnels.** *When a fix under-delivers against its predicted size, suspect the
+  constant you never measured.*
+- **Instrument before hypothesising.** §C10 cost six builds and five refuted hypotheses. In this
+  session the attribution line (`AllSolid killed by: …`) was written after *two* wrong guesses and
+  immediately named a third operator nobody had looked at. **A diagnostic that lists candidate causes
+  without measuring them is still a guess wearing rigour** — my "either the tiles straddle cave or
+  the source isn't reaching Identity" warning offered two causes and both were wrong.
+- **Verify the premise before reasoning from it.** Six times now a confident chain rested on an
+  unchecked assumption and the check reversed it. Latest three: `RoomSpacing` was **42** (the fixture
+  overrides it) while I did three rounds of arithmetic with the header default of 80 — *the number
+  was printing in the report I kept quoting*; "the plugin bets on `|Perlin3D| ≤ 0.8`" was wrong (the
+  cache **rebuilds** when the warped query leaves the box, so that expansion is a perf heuristic);
+  and the per-room-op debt "must be paid first" was wrong (it is dormant). **Include the premises you
+  are confident enough about not to look up — especially a default, when a fixture exists whose whole
+  job is overriding defaults.**
+- **A sampler must cover at least one period of what it samples.** The tunnel test drew tile XY from
+  **±32 voxels** with `RoomSpacing 80` and a guaranteed origin room at (0,0) — it measured the spine
+  hub and called it the world. The shaft test had the identical bug (±48 against `ShaftSpacing 55`).
+  Both now print their own extent **in units of the pattern's period**.
+- **A test fixture tuned for coverage can be antagonistic to the thing you are measuring.**
+  `EnableTunnelFeatures` densifies (`RoomSpacing` 80→42, `RoomDensity` 0.35→0.85) so the equivalence
+  check isn't comparing solid rock to solid rock — and at that density the room cull radius *equals*
+  the lattice spacing, so **no box can ever be proved**. `0 proved` there is the correct answer. The
+  box verdict is therefore measured on **both** densities, and the dense run must stay at 0.
+- **Diagnostics report THIS run; history goes in the log.** The test output had accumulated hardcoded
+  numbers from previous runs beside live ones ("32 of 34 tiles" printed while the live figure was 21
+  of 28). Unreadable, and self-inflicted.
 - **Read the code, not the comment.** The cliff modifier's comment promises a sampled Z±1 gradient;
   the code samples nothing and uses a Z-stretched Perlin it *calls* `VertGrad`. Ported as written —
   and written down, so nobody "fixes" it from the comment.
 - **A perf change can be a correctness change.** The column-memo optimisation silently deleted the
   overhang; the tests caught it the same day. Invisible to inspection, and it produced plausible
   terrain.
-- **Coverage is a number, not a boolean.** Four related traps, each of which produced a green run
-  that proved almost nothing:
+- **Coverage is a number, not a boolean.** Four related traps, each producing a green run that proved
+  almost nothing:
   - *A test that prints nothing on success is indistinguishable from one that never ran.*
   - *A guard that only trips at zero notices absence, it does not measure coverage.* Use fractions.
   - *A success message that **asserts** coverage instead of reporting it reads as evidence while
     measuring nothing.*
   - *A check can be vacuous as well as a counter.* "Nothing leaked" is worthless unless something
-    happened — so the gate check also reports how many samples move when the modifiers are zeroed.
+    happened.
 - **Enabling a feature is not evidence it fired — ask the structure, not the output.** Setting
-  `PitDensity` did nothing (wrong struct). Diffing two stacks with/without the op pool would have
-  *lied* (the pool is not in the SDF cache key, so both share the `thread_local` cache). What worked:
-  call `BuildChunkCache` and look at `Pits.Num()`. **Prefer the check that can fail for exactly one
-  reason** — and when a zero has three possible causes, give each one its own number.
+  `PitDensity` did nothing (wrong struct). **Prefer the check that can fail for exactly one reason**
+  — and when a zero has several possible causes, give each one its own number.
 - **An oracle that shares the defect under test proves nothing.** The stale-cache check compares each
-  stack against *itself evaluated alone*, never against the original — which keys its SDF cache
-  without the params and would fail it.
+  stack against *itself evaluated alone*. (Since §C2 was fixed, the test call sites now pass a real
+  params fingerprint, so the original no longer shares the defect either.)
 - **One definition, not two kept in sync.** `VF_BuildOpStackForChunk` exists because a tile skipped on
-  the verdict of a stack that is not the one producing its density is a hole. A "keep these in sync"
-  comment would not have been enough.
+  the verdict of a stack that is not the one producing its density is a hole. The same reasoning is
+  why `GetLastRoomBoxDiagnostic` **reads back** what the operator computed instead of letting the
+  test re-derive the criterion, and why the two-density tile scan is one lambda called twice.
+- **Don't assert a number you want to improve.** Check 4 asserted `0 proved` — honest when written,
+  and it would have forbidden the entire T1.d gain. What it asserts now is that **no proved tile is
+  wrong** (brute force, every voxel); the proved count is *reported*.
