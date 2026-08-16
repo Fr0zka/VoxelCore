@@ -1706,11 +1706,17 @@ namespace
     // encore portés**. Inventer l'infrastructure de frame pour son unique utilisateur actuel, c'est
     // la concevoir contre un seul exemple — précisément ce que ce refactor a évité jusqu'ici en
     // n'abstrayant qu'à la deuxième occurrence (cf. `IVoxelBiomeField`, né d'un besoin réel).
-    // À reprendre quand TunnelNetwork arrivera avec le deuxième usage réel.
+    // ✅ RÉPONDU (2026-08-16) : TunnelNetwork EST porté, et le deuxième usage réel a dissous la
+    // question au lieu de la trancher. Voir `BuildTunnelNetworkStack` : `CaveWarp` n'enveloppe
+    // qu'UN opérateur (donc c'est une variable locale, pas un frame) et `VerticalScale` est une
+    // fonction pure d'un scalaire. **Zéro frame sur trois candidats.** Ne pas rouvrir : le warp
+    // reste local ICI pour la même raison qu'il est resté local là-bas.
     //
-    // The warp stays INSIDE the op against §7's FRAME suggestion: two of the three frame users are
-    // not ported yet, and designing the abstraction against a single example is what this refactor
-    // has deliberately avoided. Revisit when TunnelNetwork brings the second real use.
+    // The warp stays INSIDE the op against §7's FRAME suggestion. ✅ ANSWERED 2026-08-16: this said
+    // "revisit when TunnelNetwork brings the second real use" — TunnelNetwork is ported, and the
+    // second use dissolved the question rather than settling it. See BuildTunnelNetworkStack:
+    // CaveWarp wraps exactly ONE operator (a local variable, not a frame) and VerticalScale is a
+    // pure function of a scalar. ZERO frames out of three candidates. Do not reopen.
     class FIslandBlobSource final : public IVoxelDensityOp
     {
     public:
@@ -4140,15 +4146,19 @@ namespace VoxelDensityOps
         // plus proche appliqué ; les onze modificateurs concernés y lisent leurs champs au lieu des
         // leurs. La rugosité (4b) NON — dans l'original elle précède la déclaration du shadow.
         //
-        // C'est pour cela que `UsesOperatorStackForChunk` rend encore **false** pour TunnelNetwork :
-        // brancher une pile incomplète sur le monde en retirerait tout le détail. Le test compare
-        // avec ces amplitudes MISES À ZÉRO, donc l'étape A est entièrement vérifiable dès
-        // maintenant au lieu d'attendre ~600 lignes de plus — c'est la même discipline que la passe
-        // « défauts puis tous les ops ON » du test de la pile de hauteur.
+        // ⚠️ CE PARAGRAPHE ÉTAIT PÉRIMÉ ET DISAIT LE CONTRAIRE DU CODE (corrigé 2026-08-16).
+        // Il annonçait « étape A sur trois, les douze modificateurs et l'override par salle ne sont
+        // pas encore portés, c'est pour ça que `UsesOperatorStackForChunk` rend **false** pour
+        // TunnelNetwork ». Les trois étapes sont terminées : les douze modificateurs sont ajoutés
+        // douze lignes plus bas, l'override C1 est en place, et `UsesOperatorStackForChunk` rend
+        // **true** pour TunnelNetwork. Un commentaire qui contredit le code sous lui est
+        // exactement le piège « lire le code, pas le commentaire » à l'envers.
         //
-        // STAGE A OF THREE, deliberately incomplete: the 13 detail modifiers and the per-room op
-        // override are not ported yet, which is why the archetype is still off in
-        // UsesOperatorStackForChunk. The test zeroes those amplitudes so stage A is verifiable now.
+        // STALE PARAGRAPH REMOVED 2026-08-16. It claimed "stage A of three, the detail modifiers and
+        // the per-room override are not ported yet, which is why the archetype is still off in
+        // UsesOperatorStackForChunk". All three stages are done, the twelve modifiers are added a
+        // dozen lines below, and that function returns TRUE for TunnelNetwork. A comment that
+        // contradicts the code beneath it is the "read the code, not the comment" trap in reverse.
         //
         //---------------------------------------------------------------------
         // ⚠️ CE PORTAGE RETIRE L'IDÉE DE « FRAME OPS » (OPSTACK-DECOMPOSITION §1)
