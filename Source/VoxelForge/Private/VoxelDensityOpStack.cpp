@@ -1081,9 +1081,10 @@ namespace
         {
             if (ColDensity <= 0.0f || Spacing <= 0.0f) { return EVoxelOpEffect::Identity; }
 
-            // Marge : le centre d'une colonne vit dans sa cellule, son influence porte au plus
-            // MaxRadius + ColBlend. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
-            const float Reach = FMath::Max(MaxRadius, 0.0f) + ColBlend;
+            // Marge : l'enveloppe de `Lerp(MinRadius, MaxRadius, t)` est max(MinRadius, MaxRadius),
+            // pas `MaxRadius` seul si l'asset inverse les paramètres. The bound must cover both
+            // endpoints; using `MaxRadius` alone would leave a hole when the asset reverses them.
+            const float Reach = FMath::Max3(MinRadius, MaxRadius, 0.0f) + ColBlend;
 
             const int32 CX0 = FMath::FloorToInt(((float)VoxelBox.Min.X - Reach) / Spacing);
             const int32 CX1 = FMath::FloorToInt(((float)VoxelBox.Max.X + Reach) / Spacing);
@@ -1433,7 +1434,10 @@ namespace
             // La source répond pour la paire source+carve (SIMPLIFICATION DE PHASE 1) : `CarveOnly`
             // si une primitive atteint la boîte, `Identity` sinon. `ExtraReach` couvre la rugosité
             // et le blend en aval — le sous-estimer serait un TROU.
-            const float Pad = FMath::Max(P.ShaftMaxRadius, P.ConnectorRadius) + ExtraReach;
+            // L'enveloppe doit couvrir les deux bornes de `Lerp(ShaftMinRadius, ShaftMaxRadius, t)`,
+            // pas `ShaftMaxRadius` seul si l'asset inverse les paramètres. The bound must cover
+            // both radius endpoints before adding connector and downstream reach.
+            const float Pad = FMath::Max3(P.ShaftMinRadius, P.ShaftMaxRadius, P.ConnectorRadius) + ExtraReach;
             const FBox Padded = VoxelBox.ExpandBy(Pad);
 
             const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);

@@ -3628,3 +3628,72 @@ The first attempt stopped without editing: my spec wrote `VF_PerlinAbsBound` in 
 exactly the behaviour the spec template asks for ("if the code contradicts the spec, stop and say so
 rather than guessing"), and it is worth recording that it works — the cost was one clarification
 instead of a plausible-looking wrong rename.
+
+## 2026-08-16 (f) — the box-verdict audit, finished: 28 ops swept, a second class of bug found
+
+Having found the `ExtraReach` bug by auditing one archetype, I swept **all 28 `EffectOverBox`
+implementations** rather than stopping at the one that paid. Result: one more real defect, three
+false alarms worth recording so nobody re-chases them, and a clean bill for the rest.
+
+### ⛔ FOUND — `Min > Max` radius envelope (`CODEX-TASK-004`)
+
+Three ops roll a primitive radius as `FMath::Lerp(MinRadius, MaxRadius, hash01)`. `Lerp` with
+`t ∈ [0,1]` lands in `[min(A,B), max(A,B)]` — it does **not** require `A ≤ B`. Each op's
+`EffectOverBox` then sweeps a range of lattice cells padded by the largest radius a cell could hold;
+a pad below the true maximum means cells are **never examined**, so the op reports `Identity` for a
+box its own `Eval` will fill or carve.
+
+| op | pad | |
+|---|---|---|
+| `FGridColumnMod` ~1086 | `Max(MaxRadius, 0)` | ⛔ exposed |
+| `FShaftFieldSource` ~1436 | `Max(ShaftMaxRadius, ConnectorRadius)` | ⛔ exposed |
+| `FIslandBlobSource` ~1803 | `FMath::Max(IslandMinRadius, IslandMaxRadius)` | ✅ **already correct** |
+
+**The third is the whole argument.** Someone hit this exact concern writing the island source and
+guarded it; the other two shipped without. Fixed to `FMath::Max3(...)` — a spelling already used in
+this file (~2481) and in `VoxelCaveMorphology.cpp`.
+
+**Honest severity:** shipped defaults are correctly ordered (`2/5`, `2/7`, `5/11`), so nothing is
+broken out of the box, and **this fix is a no-op at defaults — that is its acceptance signal.** It
+needs a mis-ordered asset value, which nothing prevents: `ClampMin` is a per-property floor and
+Unreal cannot express "≤ that other property". `ColumnMinRadius` is also settable per-room via
+`UVoxelTerrainOpDefinition`. What makes five lines worth it is the failure *mode*: `Eval` still draws
+the fat column perfectly, so every meshed tile looks right and only the **skipped** ones are missing
+geometry and collision — invisible, and maddening to diagnose.
+
+⚠️ Recorded in the spec because it is the tempting wrong fix: **do not normalise the params.**
+Swapping the endpoints maps the same hash to a different radius, changing generated geometry and
+breaking the eight equivalence tests. Only the *bound* may become conservative; `Eval` stays
+byte-identical. Same rule as task 003.
+
+### ✅ CHECKED AND SOUND — do not re-audit these
+
+- **`FPassageCarveOp`** — its `Eval` reads `EvaluateModifierSDF` while its box guard asks
+  `AnyPassageNearBox`; the differing nouns look like a set mismatch and are not — **both iterate the
+  same `Passages` array**, "Modifier" is a legacy name. And the guard is the *same function* the
+  hand-written `ClassifyTile` uses, so there is one definition, not two.
+- **The passage bounding sphere** — `BoundRadius = maxDistFromCentre + Radius + 4.0f`, and that `+4`
+  **is** `PASSAGE_BLEND_RADIUS`, so "the bound already includes the blend" is true rather than
+  assumed. Its per-point radii are `RadiusAt(t) = Lerp(Mouth, Mid, Sin(t·π))` with `Sin ∈ [0,1]`, so
+  they never exceed `Passage.Radius = max(Mouth, Mid)` — the one place the `Min > Max` class *could*
+  have bitten a shipped default, and it does not.
+- **`FOriginSpineOp` / `FBoundarySealOp`** — Z-band plus XY-circle tests against named reaches; both
+  fail safe to `CarveOnly`/`FillOnly`.
+- **`FShaftLedgeMod`** — returns `FillOnly` unconditionally whenever ledges are configured, and its
+  `Identity` case is exactly the early-out its `Eval` takes. Conservative by construction.
+- **`FCaveArchMod` / `FDomeMod`** — they *also* roll `Lerp(Min, Max, hash)` radii, but their
+  `Identity` comes only from `VF_NoCaveOverBox` (cave-surface proximity) or the feature being off.
+  **No radius envelope in their verdict ⇒ not exposed.** Checked precisely because they matched the
+  pattern on a grep.
+- `FConstantFieldSource`, `FSlabVoidSource`, `FSurfaceColumnSource` — never return `Identity` at all.
+
+### The shape of both bugs, worth naming
+
+Task 003 and task 004 are the same mistake twice: **a box verdict's bound was derived from the
+parameter that reads like the maximum rather than from the actual supremum of what `Eval` produces.**
+Once it was `sup|FBM|` (assumed 1.0, proved 1.5); once it was `max radius` (assumed `MaxRadius`,
+actually `max(Min, Max)`). Both times a correct instance of the same reasoning existed **elsewhere in
+the same file** — `VF_PerlinAbsBound` for the first, `FIslandBlobSource` for the second.
+
+⇒ When adding a bound, the question is not "what is the max parameter" but **"what is the supremum
+of the thing `Eval` can actually produce, and where in this file has that already been worked out?"**
