@@ -4402,3 +4402,18 @@ flight, and it is a class of tile T1.d has never once been able to prove.
 Compile-risk spots: `FindSlotIndexForChunkZ` is public (`VoxelStrateManager.h:351`, verified);
 `FStrateDisturbanceParams` is already used later in the same function; the new `else if` sits before
 the surface `else`, so `Slots[MemoSlotIdx]` is never dereferenced for the new category.
+
+## 2026-08-16 (t) — build break: `FindSlotIndexForChunkZ` is protected, not public
+
+`VoxelGenerator.cpp(2796): C2248 — cannot access protected member`.
+
+I wrote "`FindSlotIndexForChunkZ` is public (`VoxelStrateManager.h:351`, verified)" in the previous
+entry. **It is `protected`.** The grep I called verification printed the declaration line and not the
+access specifier above it — I checked that the symbol existed and reported it as checked for
+something else. Exactly the "assert a negative from a partial read" mistake made earlier today with
+the test fixture, in the same shape.
+
+**Fixed without widening the API:** `GetStrateChunkZBounds` is `public:` (line 177), returns false
+for precisely the no-slot case, and this same function already calls it three times for the same
+question. A small `VF_ChunkZHasSlot` lambda wraps it so the `else if` reads as the predicate it is.
+No accessor promoted, no new surface.

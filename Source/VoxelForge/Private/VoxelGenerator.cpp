@@ -2762,8 +2762,16 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     bool  bAnyNonCave   = false;       // gap ou SurfaceWorld dans la même tuile ⇒ on abandonne
 
     int32 MemoChunkZ  = INT32_MAX;
-    int32 MemoCat     = -1;            // 0 = gap, 1 = surface, 2 = cave (pile d'opérateurs)
+    int32 MemoCat     = -1;            // 0 = gap, 1 = surface, 2 = cave (pile), 3 = hors layout
     int32 MemoSlotIdx = -1;
+
+    // « Ce chunk Z appartient-il à une strate ? » sous forme publique : `FindSlotIndexForChunkZ`
+    // est `protected`, `GetStrateChunkZBounds` rend false pour exactement le même cas.
+    auto VF_ChunkZHasSlot = [&](int32 Z) -> bool
+    {
+        int32 UnusedTopCZ = 0, UnusedBotCZ = 0;
+        return StrateManager->GetStrateChunkZBounds(Z, UnusedTopCZ, UnusedBotCZ);
+    };
     for (int32 g = -1; g <= GridDim; ++g)
     {
         const int32 Zi = OriginVoxels.Z + g * Step;
@@ -2793,7 +2801,12 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             //
             // Out-of-layout is a CONSTANT AIR field, not a cave archetype. Every tile touching the
             // open air above the world was being routed into the cave branch and bailing there.
-            else if (StrateManager->FindSlotIndexForChunkZ(ChunkZ) < 0)
+            // `GetStrateChunkZBounds` (PUBLIC) rend false exactement quand `FindSlotIndexForChunkZ`
+            // rend -1 — ce dernier est `protected`, et cette fonction l'utilise déjà deux fois pour
+            // la même question. Pas de nouvelle surface d'API pour un prédicat qui existe.
+            // GetStrateChunkZBounds is the public form of "has a layout slot"; the index accessor
+            // is protected and this function already uses the bounds call twice for the same test.
+            else if (!VF_ChunkZHasSlot(ChunkZ))
             {
                 MemoCat = 3;
                 bAnyNonCave = true;   // n'entre JAMAIS dans la branche de cave
