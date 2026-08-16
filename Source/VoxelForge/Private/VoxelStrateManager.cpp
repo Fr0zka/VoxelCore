@@ -165,7 +165,7 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             TEXT("[StrateManager] Operator-stack opt-in: %d/%d cave layout slots have Use Operator Stack disabled. These slots cannot use operator-stack ClassifyBox/T1.d; enable the asset setting on the listed definitions if that is intended."),
             NumOperatorStackDisabledCaves, NumCaveSlots);
 
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Log,     TEXT("%s"), *Summary); }
+        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Summary); }
         else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Summary); }
     }
     else
@@ -191,7 +191,7 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             Slot.TopChunkZ,
             Slot.BottomChunkZ);
 
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Log,     TEXT("%s"), *Line); }
+        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Line); }
         else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Line); }
     }
 
