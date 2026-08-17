@@ -4566,3 +4566,35 @@ same information, but the severity now carries meaning.
 ⇒ **General rule for this project's diagnostics:** if a line cannot distinguish a good run from a bad
 one, it must not be logged at a severity that implies something is wrong. The same defect as the
 lumped bail counter, one layer out: *a signal that always says the same thing measures nothing.*
+
+## 2026-08-16 (w) — CLOSED. The operator stack is declared done; direction changes to visible work.
+
+Jahni built `4d33321` + `91585ea` and reports the game looks fine. He asked for the handoff to be
+updated and the thread closed.
+
+**`OPSTACK-HANDOFF.md` fully rewritten in plain language.** The previous version had become a private
+dialect — his words: *"you've started using very unique terminology, i have NO idea what you've been
+doing."* That is a failure of the document, not of the reader. The new one leads with what the op
+stack was for, states plainly that Phase 3 was never built and is not being built, carries the honest
+three-week ledger, and includes a translation table for the jargon (`T1.d`, `box verdict`, `Mixed`,
+`violations`).
+
+### Final state
+
+- 8/8 archetypes live and bit-identical (115 000-sample field digest unchanged, eight equivalences).
+- 14/14 tests green through `871ca19`, `violations` 0 everywhere.
+- **39 % of tiles skipped in the running game**, from 0 % that morning.
+
+⚠️ **`4d33321` (boundary fold) and `91585ea` (warning demotion) are built but NOT re-verified** — the
+suite has not been re-run and the counters not re-read since. Recorded in the handoff with the exact
+two checks and the instruction to `git revert 4d33321` if either fails; the 39 % does not depend on
+it.
+
+### Direction, agreed
+
+**No Phase 3. No further refactoring.** The old `switch` stays as the oracle. Next work is whatever
+Jahni can see — `fable-idea.md`, F7 set-pieces, F9 audio. The handoff closes on the question that
+should have been asked in July: *what do you want the world to do that it doesn't?*
+
+This log stays append-only and stays the record of what was actually built. It ends here for the
+operator stack.
