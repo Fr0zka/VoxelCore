@@ -1107,7 +1107,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // seule ne dit rien de la production. Copier-coller le balayage aurait donné deux critères qui
     // divergent ; c'est un paramètre, pas un doublon.
     auto RunTileScan = [&](const FVoxelOpStack& S, const FStrateGenerationParams& TP,
-                           const FVoxelOpContext& TCtx, const TCHAR* Label)
+                           const FVoxelOpContext& TCtx, const TCHAR* Label,
+                           bool bZeroProvedIsExpected)
     {
             int32 NumProved = 0, NumMixed = 0, NumSolid = 0, NumAir = 0;
             int32 NumBruteSamples = 0, NumViolations = 0;
@@ -1290,7 +1291,17 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
 
             if (NumProved == 0)
             {
-                AddWarning(FString::Printf(
+                // ⚠️ UN AVERTISSEMENT QUI SE DÉCLENCHE À CHAQUE RUN ET VEUT DIRE « tout va bien »
+                // N'EST PAS UN AVERTISSEMENT — c'est du bruit qui apprend à ignorer les vrais.
+                // Sur la fixture dense, 0 prouvé est la SEULE réponse arithmétiquement possible
+                // (les sphères de cull couvrent ce monde 3,6x) : c'est une info. En production
+                // défauts, 0 prouvé serait une VRAIE régression (11 aujourd'hui) : ça reste un
+                // avertissement.
+                // A warning that fires every run and always means "this is fine" is noise that
+                // trains the reader to ignore warnings. Zero proved is the only possible answer on
+                // the dense fixture (info); on production defaults it would be a real regression
+                // from 11 (warning).
+                const FString ZeroMsg = FString::Printf(
                     TEXT("[%s] No tile was proved, so the brute force verified nothing -- it has no ")
                     TEXT("verdict to contradict. Do NOT re-derive the cause: read the two lines above, ")
                     TEXT("which name the operator and then the primitive class. ⚠️ On the DENSE ")
@@ -1299,7 +1310,10 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                     TEXT("occupancy, so cull spheres cover that world ~3.6x over and no box can be ")
                     TEXT("outside all of them. It is the 'production defaults' run that answers ")
                     TEXT("whether real worlds have skippable rock."),
-                    Label));
+                    Label);
+
+                if (bZeroProvedIsExpected) { AddInfo(ZeroMsg); }
+                else                       { AddWarning(ZeroMsg); }
             }
 
             TestEqual(FString::Printf(
@@ -1336,7 +1350,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // something, and that same densification makes tile-proving structurally impossible (room cull
     // radius ~= the lattice spacing, at 85% occupancy). Both are measured and both are brute-forced;
     // the dense one reporting ~0 is the correct answer, not a failure.
-    RunTileScan(Stack, P, Ctx, TEXT("dense fixture"));
+    RunTileScan(Stack, P, Ctx, TEXT("dense fixture"), /*bZeroProvedIsExpected*/ true);
 
     {
         FStrateGenerationParams SparseP = P;
@@ -1352,7 +1366,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
         // et c'est exactement ce que le contrôle 3 vérifie : l'empreinte de params est dans la clé,
         // donc l'une ne peut pas se servir les salles de l'autre. Le jour où ce contrôle tombe,
         // cette ligne-ci devient fausse en même temps — elles se surveillent mutuellement.
-        RunTileScan(SparseStack, SparseP, Ctx, TEXT("production defaults"));
+        RunTileScan(SparseStack, SparseP, Ctx, TEXT("production defaults"), /*bZeroProvedIsExpected*/ false);
     }
 
     //=========================================================================

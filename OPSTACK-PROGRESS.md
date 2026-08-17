@@ -4542,3 +4542,27 @@ results from this unbuilt change.
   same `MemoCat == 2` iteration);
 - no protected layout accessor was introduced: the code still uses public
   `GetStrateChunkZBounds`, never `FindSlotIndexForChunkZ`.
+
+## 2026-08-16 (v) — the permanent "warning" was noise, and it cost Jahni several sessions of worry
+
+Jahni: *"[this] have been in a 'warning' stage, is this fine ? is everything fine ?"*
+
+**Everything was fine.** The only `Warning:` in that whole run is the tunnel test's
+`[dense fixture] No tile was proved`, whose own text says *"On the DENSE FIXTURE this is the EXPECTED
+and correct result, not a defect."* The test reports Success; density is bit-identical; every
+coverage number is non-zero; `violations` is 0; and the `[production defaults]` run directly below
+reports **11 proved / 14641 voxels / 0 violations**.
+
+**But a warning that fires on every run and always means "this is fine" is not a warning — it is
+noise that trains the reader to ignore warnings.** It sat there for several sessions and made him
+uneasy about a green suite. That is a real cost, and it came from writing diagnostics for a reader
+who already had the context.
+
+Fixed: `RunTileScan` takes `bZeroProvedIsExpected`. On the **dense fixture** 0 proved is the only
+arithmetically possible answer (cull spheres cover that world ~3.6×) ⇒ `AddInfo`. On **production
+defaults** 0 proved would be a genuine regression from today's 11 ⇒ still `AddWarning`. Same message,
+same information, but the severity now carries meaning.
+
+⇒ **General rule for this project's diagnostics:** if a line cannot distinguish a good run from a bad
+one, it must not be logged at a severity that implies something is wrong. The same defect as the
+lumped bail counter, one layer out: *a signal that always says the same thing measures nothing.*
