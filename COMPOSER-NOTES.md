@@ -700,3 +700,62 @@ discovered ops, discovered strates, discovered parameter regions. It is the spin
   throwaway — the debug beacon **is** the real solution in programmer art. The placement logic is
   identical; only delivery changes later (light spilling from the passage, a draft, a shift in
   ambience). Build the ugly version; ship a reskin.
+
+---
+
+## 2026-08-17 — the MEASUREMENT PASS (and how "good" ever gets judged)
+
+### ⭐ The reframe that sets the budget: the composer runs ONCE PER SEASON, OFFLINE
+Everyone shares one seed per season ⇒ there is exactly **one world per season, ever** ⇒ the composer
+never runs on a player's machine and never runs at load. It runs once, on Jahni's box or a build
+machine. **The problem is not "fast enough for a loading screen", it is "runs overnight."** So it can:
+- generate a thousand candidate strates, measure them all, keep the best eight;
+- validate at any resolution it likes;
+- later run a model over the candidates at **zero runtime cost to anyone**;
+- ⭐ **let Jahni review the world before publishing the season.** The system does the work; he keeps a
+  veto. Costs nothing because it is all offline anyway.
+
+**What ships is small:** the season's seed + the chosen strates' parameter vectors. Clients generate
+terrain from those exactly as today. **No runtime composition anywhere.**
+
+### The pass itself: ONE coarse grid + ONE flood fill → one feature vector → three jobs
+Sample the candidate into a coarse voxel grid (a few boxes at hash-chosen XY within its Z band), flood
+fill the air once, derive everything from that grid. A 4–8× downsample preserves all of it.
+
+**Validation (is it garbage?):** air fraction · **largest connected component share** (low = swiss
+cheese: sealed pockets nobody reaches = generation paid for and never seen) · walkable surface (air
+above, solid below, survivable slope) · **feature scale** (median distance-transform of the air —
+catches "noise fog", structures smaller than a few voxels read as static not rock) · vertical
+clearance · **entrance→exit reachability** (the primordial law, as a number).
+
+**Danger (same grid, different questions):** fall exposure (walkable surface with a long drop beside
+it) · **openness** (mean distance to solid from walkable positions — sightlines and room to retreat,
+which is most of what makes a fight good or "blergh") · traversal mix (walk/climb/swim) · **tortuosity**
+(path length ÷ straight-line — maze-likeness).
+
+**Rarity:** nothing new — the vector of all the above, distance from the corpus centroid.
+
+⚠️ **Coarse sampling can LIE about connectivity.** A wall thinner than the sample spacing vanishes and
+two sealed spaces look joined ⇒ a strate could pass the primordial-law check while being impassable.
+The one metric where a false pass is dangerous. **Fix: coarse to FIND the route, then re-verify that
+one path at full resolution.** Cheap — only the corridor you found.
+
+**This is the same tool as F1** (`fable-idea.md`'s top-pick 2D world-preview): the measurement pass
+with a visualisation on top. Build the measurement, get the preview nearly free — and it's needed
+anyway for reviewing a season before publishing.
+
+### Judging "good" — Jahni is right to doubt, but the judge is the CORPUS, not a model
+Measurements catch **broken**, not **boring**. The gap is narrower than it looks because *good* never
+has to be defined — only **collected**:
+- **Rate at the STRATE level, not the world level.** Twenty candidates, thumbs up/down = twenty labels
+  in minutes; a hundred in an evening. Approved ones join the corpus and become blend parents.
+  **This loop works with ZERO machine learning.** A model only makes it faster, later.
+- **Player behaviour in a live season** — lingering, revisiting, rushing past. Free telemetry, but
+  careful: time spent can mean *fascinating* or *lost and furious*.
+- ⭐ **Where players choose to SNAPSHOT THEIR HOME.** An unambiguous "I love this place", no UI, no
+  prompt, ungameable. The strongest quality signal in the design, and it costs nothing.
+
+⚠️ **Known risk: convergence to a comfortable middle.** Promote only what you already liked, keep
+blending near the corpus, and the system slowly stops surprising you. Same failure mode as the
+build-vote pool, same counter: keep extrapolating past the corpus, and keep some unrated weird
+candidates in circulation.
