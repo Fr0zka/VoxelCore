@@ -318,6 +318,41 @@ public:
      * @param WorldPosition - Position in world space (Unreal units)
      * @return Strate index (0 = topmost), or -1 if outside all strates
      */
+    //=========================================================================
+    // ESPACE MONDE <-> ESPACE ACTEUR / WORLD <-> ACTOR SPACE
+    //=========================================================================
+    // Le champ de densite est defini en espace ACTEUR : (0,0) est l origine de CET acteur, pas
+    // celle du monde Unreal. Tout point venant d Unreal (position du pion, hit de trace, ancre de
+    // streaming) DOIT passer par ces helpers avant de toucher quoi que ce soit cote voxel.
+    //
+    // The density field is authored in ACTOR space: (0,0) is THIS actor s origin, not Unreal s
+    // world origin. Any point arriving from Unreal (pawn position, trace hit, streaming anchor)
+    // MUST go through these helpers before touching anything voxel-side.
+    //
+    // INVARIANT VERIFIABLE PAR GREP / GREP-CHECKABLE INVARIANT:
+    //   aucun `/ VOXEL_SIZE` applique a un parametre nomme `World*` hors de ces fonctions.
+    //   no `/ VOXEL_SIZE` applied to a parameter named `World*` outside these functions.
+    // C est la vraie garantie : le risque n est pas un site rate parmi ceux deja trouves, c est
+    // le SITE SUIVANT que personne ne verra. The risk is not a missed site among those already
+    // found - it is the NEXT one nobody notices.
+    //
+    // La racine est Static (voir BeginPlay) => la transform ne bouge pas en jeu, donc la relire a
+    // chaque appel est gratuit et ne demande aucune invalidation.
+    // The root is Static (see BeginPlay), so the transform cannot change during play: re-reading
+    // it per call is free and needs no invalidation.
+
+    /** World cm -> actor-local cm. */
+    UFUNCTION(BlueprintPure, Category = "Voxel World|Space")
+    FVector WorldToLocalCm(FVector WorldPos) const;
+
+    /** World cm -> actor-local VOXEL coords (what every density / diff-layer API expects). */
+    UFUNCTION(BlueprintPure, Category = "Voxel World|Space")
+    FVector WorldToLocalVoxel(FVector WorldPos) const;
+
+    /** Actor-local VOXEL coords -> world cm (placing actors, debug draws, UI markers). */
+    UFUNCTION(BlueprintPure, Category = "Voxel World|Space")
+    FVector LocalVoxelToWorld(FVector VoxelPos) const;
+
     UFUNCTION(BlueprintPure, Category = "Voxel World|Strate")
     int32 GetStrateAtPosition(FVector WorldPosition) const;
 

@@ -458,6 +458,29 @@ void AVoxelWorld::BeginPlay()
     }
 
     // Générateur + mesher (UObjects légers)
+    // TRANSLATION SEULEMENT / TRANSLATION ONLY.
+    // Tout le systeme raisonne en boites ALIGNEES SUR LES AXES DU MONDE : bornes de tuile, verdicts
+    // ClassifyBox, fenetre du clipmap, culling, distance de streaming. Une rotation ou une echelle
+    // non unitaire fait qu une tuile cesse d etre alignee sur les axes en espace monde, et TOUTE
+    // cette arithmetique devient fausse -- pas degradee : structurellement fausse.
+    // The whole system reasons in WORLD-AXIS-ALIGNED boxes: tile bounds, ClassifyBox verdicts, the
+    // clipmap window, culling, streaming distance. A rotation or non-unit scale means a tile is no
+    // longer axis-aligned in world space and none of that arithmetic survives - it does not degrade,
+    // it breaks structurally. Translating the actor IS supported (that is the point of the
+    // WorldToLocal* helpers); rotating or scaling it is not.
+    {
+        const FTransform ActorXf = GetActorTransform();
+        if (!ActorXf.GetRotation().Rotator().IsNearlyZero(0.01f) ||
+            !ActorXf.GetScale3D().Equals(FVector::OneVector, 0.001f))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelWorld] Actor has rotation %s / scale %s. VoxelForge supports TRANSLATION ONLY - ")
+                TEXT("tile bounds, ClassifyBox verdicts, the clipmap window and culling all assume ")
+                TEXT("world-axis-aligned boxes. Reset rotation to 0 and scale to 1."),
+                *ActorXf.GetRotation().Rotator().ToString(), *ActorXf.GetScale3D().ToString());
+        }
+    }
+
     Generator = NewObject<UVoxelGenerator>(this);
     Mesher    = NewObject<UVoxelMarchingCubesMesher>(this);
 
@@ -581,6 +604,29 @@ void AVoxelWorld::Tick(float DeltaTime)
         }
     }
 #endif
+}
+
+//=============================================================================
+// ESPACE MONDE <-> ESPACE ACTEUR / WORLD <-> ACTOR SPACE
+//=============================================================================
+// Le champ de densite est en espace ACTEUR. Ces trois fonctions sont la SEULE frontiere
+// autorisee entre les coordonnees Unreal et les coordonnees voxel (cf. VoxelWorld.h).
+// The density field is in ACTOR space. These three are the ONLY sanctioned boundary between
+// Unreal coordinates and voxel coordinates (see VoxelWorld.h).
+
+FVector AVoxelWorld::WorldToLocalCm(FVector WorldPos) const
+{
+    return GetActorTransform().InverseTransformPosition(WorldPos);
+}
+
+FVector AVoxelWorld::WorldToLocalVoxel(FVector WorldPos) const
+{
+    return GetActorTransform().InverseTransformPosition(WorldPos) / VOXEL_SIZE;
+}
+
+FVector AVoxelWorld::LocalVoxelToWorld(FVector VoxelPos) const
+{
+    return GetActorTransform().TransformPosition(VoxelPos * VOXEL_SIZE);
 }
 
 FVector AVoxelWorld::GetPlayerPosition() const
@@ -1100,7 +1146,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
     const int32 MaxTasks = GetMaxConcurrentTasks();
 
-    const FIntVector CenterChunk = WorldToChunkCoord(CenterPosition);  // player's level-0 tile
+    const FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
     CurrentCenterChunk = CenterChunk;
 
     // Streaming anchors (AI / remote players, §9.3): prune dead ones + detect chunk crossings so the
@@ -1116,7 +1162,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
             bAnchorsMoved = true;
             continue;
         }
-        const FIntVector AC = WorldToChunkCoord(A->GetActorLocation());
+        const FIntVector AC = WorldToChunkCoord(WorldToLocalCm(A->GetActorLocation()));
         if (AC != StreamingAnchors[i].LastChunk)
         {
             StreamingAnchors[i].LastChunk = AC;
@@ -1818,8 +1864,9 @@ int32 AVoxelWorld::GetStrateAtPosition(FVector WorldPosition) const
 {
     if (!StrateManager) return -1;
 
-    // GetStrateIndex expects Unreal world units — it converts internally.
-    return StrateManager->GetStrateIndex(WorldPosition.Z);
+    // GetStrateIndex veut des cm ACTEUR-LOCAUX (il convertit cm -> voxels lui-meme).
+    // GetStrateIndex wants actor-LOCAL cm (it does the cm -> voxel conversion itself).
+    return StrateManager->GetStrateIndex(WorldToLocalCm(WorldPosition).Z);
 }
 
 FVoxelBiomeQuery AVoxelWorld::GetBiomeAtWorldLocation(FVector WorldLocation) const
@@ -1878,7 +1925,7 @@ bool AVoxelWorld::GetVoxelSurfaceHeightAt(FVector WorldLocation, float& OutSurfa
 void AVoxelWorld::CarveAtPosition(FVector Position, float Radius, float Strength)
 {
     FVoxelModification Mod;
-    Mod.Center = Position / VOXEL_SIZE;    // world cm → voxel space
+    Mod.Center = WorldToLocalVoxel(Position);    // world cm → voxel space
     Mod.Radius = Radius;
     Mod.Strength = -FMath::Abs(Strength);  // force negative for carving
     ApplyModification(Mod);
@@ -1887,7 +1934,7 @@ void AVoxelWorld::CarveAtPosition(FVector Position, float Radius, float Strength
 void AVoxelWorld::FillAtPosition(FVector Position, float Radius, float Strength)
 {
     FVoxelModification Mod;
-    Mod.Center = Position / VOXEL_SIZE;
+    Mod.Center = WorldToLocalVoxel(Position);
     Mod.Radius = Radius;
     Mod.Strength = FMath::Abs(Strength);   // force positive for filling
     ApplyModification(Mod);
@@ -1932,7 +1979,7 @@ void AVoxelWorld::CarveBox(FVector Position, FVector ExtentVoxels, float Strengt
 {
     FVoxelModification Mod;
     Mod.Shape = EVoxelBrushShape::Box;
-    Mod.Center = Position / VOXEL_SIZE;
+    Mod.Center = WorldToLocalVoxel(Position);
     Mod.BoxExtent = ExtentVoxels;
     Mod.Radius = ExtentVoxels.GetMax();        // budget proxy
     Mod.Strength = -FMath::Abs(Strength);       // carve
@@ -1943,7 +1990,7 @@ void AVoxelWorld::FillBox(FVector Position, FVector ExtentVoxels, float Strength
 {
     FVoxelModification Mod;
     Mod.Shape = EVoxelBrushShape::Box;
-    Mod.Center = Position / VOXEL_SIZE;
+    Mod.Center = WorldToLocalVoxel(Position);
     Mod.BoxExtent = ExtentVoxels;
     Mod.Radius = ExtentVoxels.GetMax();
     Mod.Strength = FMath::Abs(Strength);        // fill
@@ -1954,8 +2001,8 @@ void AVoxelWorld::CarveCapsule(FVector WorldA, FVector WorldB, float RadiusVoxel
 {
     FVoxelModification Mod;
     Mod.Shape = EVoxelBrushShape::Capsule;
-    Mod.Center = WorldA / VOXEL_SIZE;
-    Mod.CapsuleEnd = WorldB / VOXEL_SIZE;
+    Mod.Center = WorldToLocalVoxel(WorldA);
+    Mod.CapsuleEnd = WorldToLocalVoxel(WorldB);
     Mod.Radius = RadiusVoxels;
     Mod.Strength = -FMath::Abs(Strength);
     ApplyModification(Mod);
@@ -1965,8 +2012,8 @@ void AVoxelWorld::FillCapsule(FVector WorldA, FVector WorldB, float RadiusVoxels
 {
     FVoxelModification Mod;
     Mod.Shape = EVoxelBrushShape::Capsule;
-    Mod.Center = WorldA / VOXEL_SIZE;
-    Mod.CapsuleEnd = WorldB / VOXEL_SIZE;
+    Mod.Center = WorldToLocalVoxel(WorldA);
+    Mod.CapsuleEnd = WorldToLocalVoxel(WorldB);
     Mod.Radius = RadiusVoxels;
     Mod.Strength = FMath::Abs(Strength);
     ApplyModification(Mod);

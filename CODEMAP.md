@@ -213,6 +213,19 @@ redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
 `ChunkLODs`, `ProcessQueue` (TQueue), `PendingChunkCoord` (TSet) (VoxelWorld.h:85-312).
 **Async state:** `bShuttingDown`, `ActiveTaskCount` (atomics), `GenerationEpoch`.
 
+**⭐ Espace ACTEUR / ACTOR SPACE (2026-08-17).** Le champ de densite est defini en espace **acteur** :
+`(0,0)` est l origine de l acteur `AVoxelWorld`, pas celle du monde Unreal. `WorldToLocalCm` /
+`WorldToLocalVoxel` / `LocalVoxelToWorld` sont la **SEULE frontiere autorisee** entre coordonnees
+Unreal et coordonnees voxel. **Invariant verifiable par grep : aucun `/ VOXEL_SIZE` applique a un
+parametre nomme `World*` hors de ces trois fonctions.** Avant cette date le plugin etait *a moitie*
+actor-relative (biome/deco/eau/volume/debug convertissaient ; le **centre de streaming**, les **ancres**,
+les **6 entrees carve/fill**, `GetStrateAtPosition` et `UVoxelAtmosphereManager::UpdateForPlayer` ne le
+faisaient pas) — ce qui ne marchait que tant que l acteur restait a l origine.
+⚠️ **TRANSLATION SEULEMENT** : tuiles, `ClassifyBox`, fenetre clipmap, culling et distance de streaming
+supposent tous des boites **alignees sur les axes du MONDE**. Une rotation ou une echelle non unitaire
+casse cette arithmetique *structurellement* — `BeginPlay` loggue une **Error** si on en met une.
+
+
 | Method | .cpp line | Role |
 |--------|-----------|------|
 | `AVoxelWorld()` ctor | 12 | Enables Tick. |
@@ -439,6 +452,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeOpStackShaftTest.cpp` | `VoxelForge.OpStack.VerticalShaftEquivalence` | The port that tests **reuse**, not fidelity: three of the five ops are Maze's, unchanged. Forces connectors + ledges on, because both are off or negligible at defaults and a resting param is an untested operator. **Fixed 2026-07-29:** its `EffectOverBox` used to return `CarveOnly` because a shaft merely *existed* within a `Spacing*1.6` halo — true almost everywhere at `ShaftSpacing 55 / ShaftDensity 0.6`, hence **0 of 60** tiles. It now rebuilds the connectors the way `GetCells` does (same row-major cell order ⇒ same `VoxelHash::Pair`, so symmetry of `Pair()` is not assumed; sweeping `[box cells] ± 1` is a superset of any 3×3's pairs) and tests the real capsule, with **Z exact** (horizontal capsule at `Zc`) and XY conservative. The sampler was also widened from ±48 voxels to ±440 — it was under one `ShaftSpacing`, the same trap as the tunnel test's ±32-vs-80. Every proved tile is brute-forced over its full lattice. |
 | `VoxelForgeOpStackIslandTest.cpp` | `VoxelForge.OpStack.FloatingIslandEquivalence` | The port that runs the stack **backwards** — void + fill vs rock + carve, same classes with the opposite sign. Counts interior-solid and open-void samples separately (on this archetype an aggregate "N solid" is dominated by the seal bands and says nothing about the islands). Counts `AllSolid` and `AllAir` verdicts **separately** too: `AllAir` is the one no cave archetype could ever prove, and it is the entire perf argument here. |
 | `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
+| `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 
 ## 4. The density pipeline (most-edited hot path)
 
@@ -510,6 +524,12 @@ Stage order (negative=solid throughout). Each stage's anchor:
   different layers — trust the MC convention at the mesher.
 - **Coordinate units:** density functions take **voxel coords** (not cm). World↔voxel
   conversions live in `VoxelTypes.h`. Mesher converts before calling the generator.
+- **Espace ACTEUR / actor space:** le champ de densite est en espace **acteur** — `(0,0)` = origine de
+  l acteur `AVoxelWorld`, pas du monde Unreal. Tout point venant d Unreal (pion, trace, ancre) passe par
+  `AVoxelWorld::WorldToLocalCm` / `WorldToLocalVoxel` / `LocalVoxelToWorld`. **Regle grep : aucun
+  `/ VOXEL_SIZE` sur un parametre `World*` hors de ces trois fonctions.** ⚠️ **Translation seulement** —
+  rotation/echelle cassent les boites alignees sur les axes (tuiles, `ClassifyBox`, clipmap, culling) ;
+  `BeginPlay` loggue une Error. The density field is in ACTOR space; translation only.
 - **Determinism:** all randomness is hash-of-(coord, seed, strateIndex) — no RNG state.
   Same seed ⇒ identical world. Player edits are the only non-deterministic overlay.
 - **Async safety:** background tasks must check `bShuttingDown` and only touch the

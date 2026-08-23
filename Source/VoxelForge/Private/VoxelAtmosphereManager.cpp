@@ -42,17 +42,27 @@ void UVoxelAtmosphereManager::UpdateForPlayer(const FVector& PlayerWorldPos)
     AActor* O = Owner.Get();
     if (!O) return;
 
-    const int32 Idx = StrateManager->GetStrateIndex(PlayerWorldPos.Z);
-    const UVoxelStrateDefinition* Def = StrateManager->GetStrateAt(PlayerWorldPos.Z);
+    // Le champ de densite est en espace ACTEUR : les requetes de strate et de biome veulent des
+    // coordonnees LOCALES. Le placement d acteurs, lui, veut du MONDE. Les deux cohabitent ici, ce
+    // qui est exactement pourquoi ce fichier supposait "acteur a l origine" avant le 2026-08-17.
+    // The density field is in ACTOR space: strate and biome queries want LOCAL coordinates, while
+    // actor placement wants WORLD. Both live in this function - which is exactly why it used to
+    // assume "actor at origin / identity".
+    const FTransform Xf = O->GetActorTransform();
+    const FVector LocalPos = Xf.InverseTransformPosition(PlayerWorldPos);
+
+    const int32 Idx = StrateManager->GetStrateIndex(LocalPos.Z);
+    const UVoxelStrateDefinition* Def = StrateManager->GetStrateAt(LocalPos.Z);
 
     // Player's dominant biome (XY field) — atmosphere can vary by biome within a strate.
-    // Convention matches GetStrateAt: world cm = voxel * VOXEL_SIZE (actor at origin/identity).
+    // Requete en espace ACTEUR (voir LocalPos ci-dessus) : cm locaux -> voxels.
+    // Queried in ACTOR space (see LocalPos above): local cm -> voxels.
     const UVoxelBiomeDefinition* Biome = nullptr;
     if (Generator && Def)
     {
-        const int32 ChunkZ = FMath::FloorToInt((PlayerWorldPos.Z / VOXEL_SIZE) / CHUNK_SIZE);
-        Biome = Generator->GetDominantBiomeAt(PlayerWorldPos.X / VOXEL_SIZE,
-                                              PlayerWorldPos.Y / VOXEL_SIZE, ChunkZ);
+        const int32 ChunkZ = FMath::FloorToInt((LocalPos.Z / VOXEL_SIZE) / CHUNK_SIZE);
+        Biome = Generator->GetDominantBiomeAt(LocalPos.X / VOXEL_SIZE,
+                                              LocalPos.Y / VOXEL_SIZE, ChunkZ);
     }
 
     // React on strate change (full apply) OR biome change within a strate (fog/sky only —
@@ -81,18 +91,18 @@ void UVoxelAtmosphereManager::UpdateForPlayer(const FVector& PlayerWorldPos)
     if (Def)
     {
         float TopZ, BottomZ;
-        if (StrateManager->GetStrateUnrealZRange(PlayerWorldPos.Z, TopZ, BottomZ))
+        if (StrateManager->GetStrateUnrealZRange(LocalPos.Z, TopZ, BottomZ))
         {
             if (CeilingActor)
             {
                 CeilingActor->SetActorLocationAndRotation(
-                    FVector(PlayerWorldPos.X, PlayerWorldPos.Y, TopZ + Def->CeilingLayerZOffset),
+                    Xf.TransformPosition(FVector(LocalPos.X, LocalPos.Y, TopZ + Def->CeilingLayerZOffset)),
                     Def->CeilingLayerRotation);
             }
             if (FloorActor)
             {
                 FloorActor->SetActorLocationAndRotation(
-                    FVector(PlayerWorldPos.X, PlayerWorldPos.Y, BottomZ + Def->FloorLayerZOffset),
+                    Xf.TransformPosition(FVector(LocalPos.X, LocalPos.Y, BottomZ + Def->FloorLayerZOffset)),
                     Def->FloorLayerRotation);
             }
         }

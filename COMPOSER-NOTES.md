@@ -759,3 +759,478 @@ has to be defined — only **collected**:
 blending near the corpus, and the system slowly stops surprising you. Same failure mode as the
 build-vote pool, same counter: keep extrapolating past the corpus, and keep some unrated weird
 candidates in circulation.
+
+---
+
+## 2026-08-17 — STACK ASSEMBLY: how the composer builds an op stack
+
+### What the three real builders actually look like (read from `VoxelDensityOpStack.cpp`)
+```
+TunnelNetwork (19)   rock source → room graph (SDF) → SdfCarve → 12 density modifiers → worm source → structural
+Maze (7)             rock source → lattice corridors (SDF) → SdfRoughness (SDF) → SdfCarve → structural
+FloatingIslands (7)  VOID source → island blobs (SDF) → SdfRoughness (SDF) → SdfFill → structural
+```
+
+### ⭐ 1. Most ordering is MECHANICAL, not aesthetic — derive it, don't author it
+Roughness sits on the **SDF** before conversion in Maze, and on **density** after conversion in
+TunnelNetwork — CODEMAP confirms they are literally two different ops for that reason. An op's legal
+position is fixed by **which channel it reads and which it writes**.
+⇒ **Every operator declares its channel reads/writes.** Dependencies then form a DAG and **any
+topological sort of that DAG is a legal stack.** No authored order, no judgement, and it generates
+orderings no human ever wrote down.
+
+### ⭐ 2. Root polarity is a one-bit identity lever
+FloatingIslands is the same op classes as Maze but rooted in a **void** source with a **fill** instead
+of a rock source with a carve — and you get islands instead of tunnels. One bit flips the entire
+character of a strate.
+
+### 3. `FFloorBiasMod` — delete the problem instead of documenting it
+FloorBias exists purely to undo what `FCaveRoughnessMod` did to floors. Both are density-space, so
+channel rules permit either order, but semantically one must follow the other.
+⇒ **An operator whose only purpose is to correct another operator is not a separate operator. FUSE
+them** into one op with two internal phases. Removes the invalid state rather than annotating it, and
+leaves the rest genuinely free to shuffle. *Fifteen ops that compose in any legal order beat eighteen
+with a footnote.* (Fusing with identical order and math leaves the world bit-identical.)
+
+### 4. One small declaration covers what's left
+Each op is **additive** (small displacement, commutes freely with peers ⇒ shuffle at will) or
+**transformative** (clamps, multiplies, gates ⇒ position matters, needs explicit placement).
+
+### 5. The structure roll
+`root polarity → shape source → conversion (follows from polarity) → draw k modifiers legal in the
+resulting channel space (k itself rolled) → structural post appended automatically.`
+With ~5 shape sources and ~15 modifiers choosing 4–8, that is **tens of thousands of structurally
+distinct stacks before a single parameter is touched** — which is what carries early variety while the
+corpus is small.
+
+### ⚠️ 6. THE BLOCKER — box verdicts are only correct *in the stack they ship in*
+CODEMAP, on the lattice corridor source: *"Its `EffectOverBox` answers for the source+carve **pair**
+(Phase 1 simplification) so it must be told the downstream `ExtraReach`."* The op interface says the
+same in its own comment: a source that writes only `Sdf` doesn't touch density itself, so it answers
+on behalf of the converter that follows it.
+
+That is fine when a human wrote the pair. It **breaks the moment the composer assembles a combination
+nobody verified**, and the failure is the silent one: a tile wrongly proved uniform ⇒ no geometry, no
+collision, no error, player falls through the floor.
+
+⇒ **Prerequisite before free composition is safe: every operator's `EffectOverBox` must be correct in
+ISOLATION**, not correct-given-its-neighbours. That means propagating an **SDF interval** through the
+box query instead of letting the source answer for the pair — which the interface comment already
+names as the Phase 3 version of the contract. Not huge, but load-bearing, and it must land first.
+
+### ✏️ Correction to yesterday's note
+The X-macro / struct diff said *"the only struct scalar missing from the macro is `Alpha`, which is the
+blend weight and correctly excluded."* **`Alpha` is not a field at all** — it is the `float Alpha`
+parameter of `FStrateGenerationParams::Lerp` (line 1033), which the regex caught by accident.
+**The macro and the struct are in PERFECT sync, zero exceptions.** Now guarded by a test — see below.
+
+---
+
+## 2026-08-17 — the X-macro guard (built, green)
+
+`Source/VoxelForge/Private/Tests/VoxelForgeStrateParamCoverageTest.cpp` →
+**`VoxelForge.Determinism.StrateParamBlendCoverage`**. Built clean first try (Jahni, 2026-08-17).
+Expands `VF_STRATE_PARAM_FIELDS` a **third** way (after LERP and SNAP) into a name list and diffs it
+against `FStrateGenerationParams`' UObject reflection. No fixture, no world — a shape test.
+`GExemptFieldNames` is **empty**: every reflected field is covered, and an exemption must be written
+down as a decision. Matters more under the composer, which invents parameter sets through that same
+`Lerp` — a missing field would be **constant across every invented strate** with nothing to notice it
+by. CODEMAP §3.12 row added.
+
+---
+
+## 2026-08-17 — ⚠️ THE PRIMORDIAL LAW HAS A REAL HOLE (verified in code)
+
+### What passages do today
+`UVoxelStrateManager::GeneratePassages` places every inter-strate passage as:
+`FRandomStream Rng(CachedSeed ^ 0x50A55A6E)` → **random angle** around the (0,0) spine → **random
+distance** in the config range → **random reach** into each strate. Endpoints are `(PX, PY, TopZ)`
+and `(PX, PY, BottomZ)`. Carving is a structural-post invariant (`VF_ApplyPassageCarving`), so the
+tube itself IS air by construction.
+
+### ⚠️ The hole
+**Nothing consults the destination strate's actual cave layout.** The tube is air, but whether its
+lower mouth *joins the lower strate's connected space* is pure luck. **A player can descend a passage
+and arrive in a sealed bubble** — legal geometry, air all the way, and nowhere to go. The primordial
+law is currently a hope, not a guarantee. It gets worse under invented strates, where nobody has
+eyeballed the layout.
+
+Also: that `FRandomStream` walks **sequentially across all strates**, so changing an early strate's
+connection count shifts **every later passage**. Same order-dependence as the strate pool
+⇒ use `hash(seed, strateIndex, connIndex)` instead.
+
+### ⭐ Fix 1 — don't let the passage hope; make the strate OFFER a landing site
+Add to the field-source contract something like **`SuggestOpenPoint(WorldX, WorldY) → optional Z`**.
+Every source already knows where its own air is:
+| source | open point |
+|---|---|
+| `FRoomGraphSource` | nearest room centre (rooms are hash-placed ⇒ cheap to find) |
+| `MakeSlabVoidSource` | anywhere in the void band |
+| `FIslandBlobSource` | just above an island top |
+| `FSurfaceColumnSource` | just above `TerrainZ` |
+| `MakeLatticeCorridorSource` | the nearest lattice node |
+
+Passage placement becomes: pick XY → **ask the lower strate's source for an open Z near it** → aim
+there. Deterministic, cheap, and it keeps working for **invented** strates because any new source must
+answer. Nice inversion: the strate offers the landing site instead of the passage gambling.
+
+### Fix 2 — verification as the net (reuses the measurement pass)
+The measurement pass already flood-fills the air. So: **does the upper mouth's air component reach the
+lower mouth's?** If not, re-roll the passage (`hash(..., attempt)`). Coarse to find, full resolution to
+confirm the one corridor — as established for the connectivity metric.
+
+### Fix 3 — FINDABILITY, and most of it is data, not code
+✅ **`ELandmarkAnchor::PassageMouth` already exists** — landmarks can anchor at passage mouths, and
+`FStrateLandmark` already carries a **Light-Orb block**. A glowing landmark at every passage mouth is
+authorable **today, with no code at all.**
+
+But *findable* means being drawn there from a distance, not marked once you arrive. Three layers,
+cheapest first:
+- **Light.** A glow down a tunnel is the strongest pull in a cave. Already supported.
+- **Sound.** An emitter with a long attenuation radius at the mouth. Works **around corners**, which
+  light does not — in a cave you hear the draft before you see the hole. (Ties to F9 audio.)
+- ⭐ **Make the mouth a PLACE, not a hole.** Fix 1 already lands the passage *in a room*; make that
+  room distinctive — bigger, lit, decorated. Places are memorable, cracks in walls are not. This is
+  the one that actually makes it findable on the second visit, which is what quests need.
+- *Parked (strongest, most invasive):* bias the cave network to converge toward the mouth, so simply
+  following tunnels tends to lead there.
+
+---
+
+## 2026-08-17 — RULING + BUILD ORDER
+
+**Jahni's ruling:** guaranteeing an open landing place is **needed**. And the passage mouth should be
+**a real landmark — a special place**, so it *shows* and is *less dismissed*. Not merely a lit marker.
+Also: *"not all to be implemented in a row."*
+
+### The sequencing principle
+⭐ **Every tier must be worth doing on its own, before the next one exists.** Nothing gets built purely
+as machinery for a later tier. (This is the direct antidote to the 2026-07/08 refactor, where three
+weeks of correct work produced a world unchanged by a single voxel.)
+
+### Tier 0 — safety nets, true regardless of the composer
+- ✅ **X-macro guard test** — DONE, built green 2026-08-17.
+- **Order-independent placement:** replace the sequential `FRandomStream` in `Initialize` and
+  `GeneratePassages` with `hash(seed, slotIndex[, connIndex, attempt])`. *Standalone value:* Jahni can
+  reorder or tidy the strate pool asset **without changing every world**. Small, isolated.
+
+### Tier 1 — the primordial law (a BUG FIX, not composer work)
+- **`SuggestOpenPoint(X, Y) → optional Z`** on field sources; aim passages at it.
+- **Passage mouth becomes a room + a distinctive landmark** (per the ruling).
+*Standalone value:* fixes a **live hole in the shipping game** — today a player can descend into a
+sealed pocket. Worth doing **even if the composer never happens**, and it makes the current world
+better immediately.
+
+### Tier 2 — the measurement pass
+Coarse sample + one flood fill + the feature vector (air fraction, largest component, walkable surface,
+feature scale, clearance, reachability, fall exposure, openness, traversal mix, tortuosity).
+*Standalone value:* it **is** F1, `fable-idea.md`'s top-pick world-preview tool — Jahni can finally see
+what parameters do instead of tuning blind. It also verifies Tier 1 (does the mouth actually connect?).
+
+### Tier 3 — op-system prerequisites for free composition
+- **Channel read/write declarations** on every op ⇒ ordering derives from a DAG.
+- **Fuse corrective ops** (`FFloorBiasMod` into `FCaveRoughnessMod`) — an op that only repairs another
+  op is not an op.
+- ⚠️ **`EffectOverBox` correct in ISOLATION** (SDF interval propagation instead of "the source answers
+  for the pair"). **This is the gate on free composition** — without it, a novel stack can wrongly
+  prove a tile uniform ⇒ no geometry, no collision, no error.
+*Standalone value:* the fuse and the isolation fix are both correctness improvements to the code that
+ships today.
+
+### Tier 4 — the composer proper
+Structure roll (root polarity → shape source → k modifiers) · parameter roll (blend the corpus via
+`Lerp`) · reject-and-resample driven by Tier 2 · the **offline season pipeline** with Jahni's review
+and veto.
+
+### Tier 5 — the long game
+**Promotion** (good strates rejoin the corpus) · theme/tag draws for materials, creatures, audio ·
+eventually the model. All of it optional, all of it compounding.
+
+---
+
+## 2026-08-17 — WORLD SHAPE + TRAVERSAL (the two holes Codex found, now closed)
+
+Codex read `COMPOSER-NOTES.md` cold, in isolation, and correctly identified the project, the goal
+(the **corrected** one — the system invents strates, Jahni supplies vocabulary), and the intended
+feel. It found all three marked reversals and no unmarked one. Two of its five "could not determine"
+items were real holes; Jahni closed them:
+
+### Decided
+- ⭐ **The world has NO BOTTOM.** Endless descent.
+- **Boss strates are INTERMEDIARY** — roughly every 5 strates. Bosses punctuate, they do not terminate.
+- **Return trip, two ways:** walk back up through the tunnels (that is content, not a chore), **or**
+  once a strate has been visited it opens a passage onward, so transport (elevator/other) can carry you
+  down, **choosing which strate to travel to**.
+- **Unlock is LOCAL (per player) for now.** Base scope = a **local server** fed by **Jahni's database**
+  for community information. **Global/world-level unlock is a possible future** — gated on strates
+  being large enough that finding the next passage is not "a 10 minute endeavour of searching".
+
+### Consequences
+- ⚠️ **No bottom breaks "generate the whole world offline at season start."** Fix: pre-generate a
+  **deep buffer** (~30 strates) offline; extend in another offline batch if players approach its end.
+  A season probably never exhausts it, and the **review/veto step survives intact**.
+- ⚠️ **Danger needs a ceiling.** `danger = f(depth)` with no bottom grows forever ⇒ everything eventually
+  unsurvivable. It must plateau or approach an asymptote. Open question that shapes the whole curve:
+  **does strate 40 differ from strate 30 in danger, or only in what KIND of place it is?**
+- **"Every 5th slot is a boss" needs a PERIODIC fixed-slot rule.** `Settings->FixedStrates` is a
+  `TMap<int32, …>` of absolute indices today — the composer needs `slot % N` as well.
+- The boss is therefore a **GATE**, which is where the transport network naturally hangs (the route past
+  strate 10 opens when the boss at 10 falls). Gives the descent a rhythm: five strates, then a wall.
+- **"Select which strate to travel to" is a menu — and that menu is the WORLD MANIFEST** (names, danger,
+  discovered state). Third time the manifest has paid for itself.
+- ⭐ **The global-vs-local call is MEASURABLE, not a guess.** The measurement pass already computes
+  entrance→exit path length and tortuosity; a live season gives the real number by telemetry. Decide it
+  from data later. (Same principle as everything else here: measure, don't declare.)
+
+### ⚠️ Architecture consequence — the community layer must be OPTIONAL AT RUNTIME
+Local server + external database means a DB outage, a network hiccup or maintenance must **degrade**,
+never break. The world is generated from the seed and needs no DB at all. So: **procedural names are
+the fallback** when community names cannot be fetched (the deterministic name always exists by
+construction), shared builds simply do not appear, votes queue locally and sync later. Cheap now,
+genuinely painful to retrofit once a hundred call sites assume the fetch succeeded.
+
+### ⚠️ Clarification — elevator unlocks DIE WITH THE WIPE
+The wipe is world-only and "everything else survives", **but the unlock network is world-scoped**: it
+references this season's strates, and next season strate 7 is a different place. Carrying it forward
+would also skip the new season's frontier, which is the point of wiping. **Named here before a player
+discovers it the hard way.**
+
+---
+
+## 2026-08-17 — DEPTH ECONOMY + material placement (and the manifest is confirmed a NEED)
+
+### Decided
+- **Gear stats have a CEILING (~depth 30).** Past it, loot has the *same* stats but better natural
+  **rolls** (Trove-style stat-quality %) ⇒ **less material to level up**. Depth buys **less grind and
+  unique access, never bigger numbers.**
+- **Past the ceiling, going deeper is about pride, challenge, and seeing new things.** Confirmed
+  intent, not an accident.
+- **Trading will exist** — lightly at first, better once the surface becomes a social hub.
+- ⭐ **Depth-locked materials are tagged by TIER, not by strate** — e.g. a `post difficulty content`
+  tag — **so placement stays random.**
+- ✅ **The world manifest is confirmed a NEED**, not a proposal.
+
+### Why the tier tag is better than a fixed depth (Jahni's call, and it is the stronger one)
+A fixed depth is **solved once and stays solved forever**. A random placement inside a difficulty tier
+must be **found again every wipe**, and in a one-seed shared world the answer spreads. *"Where is X this
+season?"* becomes a renewable community question — exactly what the shared-knowledge design wants, at
+zero extra cost.
+
+### Consequences
+- **Guarantee what recipes depend on; leave the rest to chance.** One flag on the material: *essential*
+  ⇒ the composer must place it somewhere in the generated buffer; *optional* ⇒ the dice decide, and a
+  season lacking it gets an identity ("the one with no X"). Essential-but-absent is a dead end nobody
+  can fix.
+- ⭐ **MANIFEST ≠ PLAYER KNOWLEDGE.** The manifest holds ground truth (the composer placed it, and
+  quests/validation/fast-travel need it). **Discovery state is a separate overlay**, per player. Easy
+  now; awkward to unpick if the client is handed the whole manifest up front.
+- ⚠️ **You cannot hide the manifest anyway** — the client generates terrain from the seed, so players
+  hold the generator and can enumerate it offline. Not a leak to prevent; a fact to design around, as
+  Minecraft does with seed maps. And it barely matters here: community knowledge spreading **is** the
+  intent, datamining is only a faster route to it, and **the wipe is what makes it not matter** — a map
+  of season 4 is worthless in season 5.
+- ⚠️ **The danger growth rate past the gear ceiling IS the endgame difficulty curve.** Below 30 gear and
+  danger climb together; above it gear is capped and danger is not, so skill/strategy/consumables are
+  the only levers left. That single number decides where the wall sits. Everything else is content;
+  that is tuning.
+- **Reward converges while danger does not** — a roll-quality % asymptotes at 100. Deliberate: the deep
+  game is sustained by scarcity and pride, not progression.
+- **Trading is a community-layer feature** ⇒ it must degrade gracefully when the database is
+  unreachable, like shared builds and community names.
+
+---
+
+## 2026-08-17 — THE WORLD MANIFEST: design
+
+### ⭐ It is TWO things, not one
+**Tier A — the SPINE. Finite, tiny, actually stored.** Strate slots + passages. ~30 strates plus a few
+passages each ⇒ ~100 entries, kilobytes. **This already exists** as `StrateLayout` + the passage list,
+computed once in `UVoxelStrateManager::Initialize`. It is the world's skeleton.
+
+**Tier B — the FIELD. Infinite in XY, therefore NEVER stored.** Landmarks, rooms, material deposits,
+build sites. The world does not end sideways, so this cannot be a table — it is a **function**: give it
+a region, it enumerates what is there. Deterministic, hash-based, **zero bytes**.
+
+⇒ That split is what makes "must not be expensive" true rather than aspirational.
+
+### ⭐ The trick: THE ID ENCODES THE POSITION
+The hard requirement is resolving an ID **back** to a place (a saved quest target, a fast-travel
+destination, a wiki citation) — normally a lookup table, which is exactly what we cannot have.
+Landmarks are placed on a **hash lattice**, so build the ID from **lattice cell + type + slot index
+within the cell**. Then **ID → position is ARITHMETIC**: no table, no database, no storage. A quest
+stores `strate 4, cell (−128, 73), type Lake, index 2` and resolves it instantly, forever, on any
+machine, offline.
+
+**Names fall out of the same thing:** `hash(id, seed)` → word pool. Every entry in an infinite world
+has a stable, globally identical name that nobody stored and nobody generated in advance — including
+entries no player will ever visit. (This is the substrate that makes quests and wikis possible; see the
+two-layer naming note, community names override on top.)
+
+### What earns an entry
+**One test: can a system need to ask "where is it?" or "what is it called?"** If yes, it is an entry.
+✅ strates · passage mouths · landmarks · notable rooms · material deposits · build sites · boss arenas ·
+the (0,0) spine. ❌ individual rocks · every tunnel segment · terrain that merely emerged from noise.
+
+**Underneath that — ADDRESSABLE vs NOTABLE.** Everything hash-placed is *addressable* for free (it has
+an ID by construction). **Notability is a filter on top, and it is exactly what the measurement pass
+produces**: biggest chamber in a region, the one with a lake, the one at a passage mouth. "Notable
+rooms" needs no new placement logic, only a threshold.
+
+### Discovery sits ON TOP, never inside
+A player's discovered set is a set of **IDs** — small integers, cheap to store, cheap to sync. Community
+discovery is the union. **The manifest never changes; only who has seen what.** (Confirms MANIFEST ≠
+PLAYER KNOWLEDGE from the depth-economy note.)
+
+### ⚠️ Two cautions
+- **The hash functions become part of the FROZEN SEASON CONTRACT.** Change how a lattice cell hashes and
+  every quest target in that season moves. Fine — worlds are frozen within a season — but these
+  functions are **not implementation details to tidy mid-season**.
+- **Tier B is cheap, not FREE.** Enumerating rooms in a region needs that region's room-placement pass.
+  Fine for a beacon or nearby markers; a full-continent map view would hurt. ⇒ **LOD the query**: coarse
+  regions return only high-notability entries — which is what a zoomed-out map wants anyway.
+
+---
+
+## 2026-08-17 — NEAR-INFINITE STRATES: three consequences
+
+Jahni: some strates (surface-like especially) are **near-infinite in XY** — storage is impossible.
+Confirms the Tier A / Tier B split. But it also quietly weakens three things already decided:
+
+### ⭐ 1. The (0,0) SPINE is what makes an infinite world navigable — state it as a law
+In a bounded cave you eventually stumble onto the way down. In an infinite surface strate you never
+will — the exit is a point in an endless plane. But `GeneratePassages` already places passages at a
+random **angle + distance from the origin**, within a configured range, so **passages cluster near the
+spine by construction.**
+⇒ **The descent is anchored to the spine; infinity is OPTIONAL content.** A lost player walks back to
+the spine and finds the way down. Everything outward is exploration you choose.
+⚠️ This is currently an **accident of how the code happens to work**, not a stated invariant. It should
+be written down as a law alongside the entrance/exit one.
+
+### 2. The measurement pass must sample WHERE PLAYERS GO
+An infinite strate cannot be measured, only sampled — and a box a million units out measures a place
+nobody will ever stand in. ⇒ **validate the neighbourhood of the spine and the passage mouths**, the
+load-bearing part. A strate may be beautiful at the origin and mush ten km out; that is genuinely fine.
+Also: report measurements as **distributions (median + spread), not single values** — regions really
+will differ, especially once biomes vary the surface. A mean pretending to describe infinity is a lie.
+
+### ⚠️ 3. CORRECTION — essential materials need a DENSITY, not a location
+Earlier note said the composer must place an essential material "somewhere in the buffer". **In an
+infinite strate "somewhere" is unfindable** — it could be a thousand km out. The guarantee must be a
+**placement density within the reachable band**: near enough to the spine, common enough to actually
+meet. Otherwise a season ships a recipe nobody can complete and it reads as a bug, not as scarcity.
+Conveniently this is measurable: *expected number of deposits within N of the spine* is a number the
+composer can check.
+
+---
+
+## 2026-08-17 — the CITY is a plain UE level (no seam problem after all)
+
+**Correction to my "authored city meets generated surface" worry:** the hand-authored city is a
+**normal Unreal level**, not voxel terrain. VoxelForge sits **under the hole in the city**, or
+possibly **instantiated in a whole separate level** to be free of the city's constraints.
+⇒ **There is no authored/generated seam.** They are not the same kind of thing.
+
+### Open / to confirm
+- ❓ **Is the voxel world therefore entirely SUBTERRANEAN?** If the real outdoors is the city level,
+  then `SurfaceWorld` is not a surface — it is a cathedral-sized underground space that *reads* as
+  outdoors (consistent with the existing design where surface/sky strates are enclosed, lit from
+  within by skylight + gem-star ceiling, never by a sun). **Asked, not assumed.**
+- ⚠️ **Separate level vs sublevel is a real tradeoff, worth settling before both exist.** A distinct map
+  gives the voxel world its own world settings, lighting, kill-Z and streaming, free of the city's —
+  genuinely valuable. **The cost is that the descent becomes a LOAD rather than a walk.** For a game
+  whose core verb is descending, a seamless transition through the hole would feel far better, and UE
+  can do it with both as sublevels of one world — but then the voxel world inherits the city's world
+  settings, which is exactly the constraint being escaped. *"Free of constraints"* and *"you can walk
+  down into it"* are in tension.
+- **Infinite vs bounded world is UNDECIDED.** Jahni: *"I might not make infinite world also, but for now
+  I might, so I prefer saying it."*
+  ⇒ **Keep designing for INFINITE**: it degrades gracefully to bounded, while a bounded-assuming design
+  (stored manifest, complete map, exhaustive validation) breaks the moment the world is not.
+  ⇒ But note bounded is a **lever, not merely a limit** — it would buy complete measurement instead of
+  sampling, a real map, and much easier findability. A live option to pull deliberately one day.
+
+---
+
+## 2026-08-17 — BOUNDED world, SUBTERRANEAN confirmed, and the descent shaft
+
+### Decided
+- ⭐ **The world is BOUNDED.** Still gigantic maps, but finite.
+- ✅ **The voxel world is entirely SUBTERRANEAN** — everything is under the surface; some strates only
+  *mimic* being surface-like. (The real outdoors is the city's UE level.)
+- **Transition:** likely a **master level** holding shared elements (lighting etc.), switching when the
+  player enters the hole, with a transition playing. **The elevator can be as long as needed** — but
+  Jahni intends to place the **first strate well below** so travel time covers generation naturally.
+
+### What BOUNDED buys
+- ⭐ **The primordial law becomes PROVABLE, not sampled.** The composer can flood-fill an *entire*
+  strate at coarse resolution, so entrance→exit reachability is a **proof**, not a probability. Same
+  for largest-connected-component and walkable surface — true statistics, not estimates from boxes.
+  For the one law Jahni called primordial, that is the difference between a check and a guarantee.
+- **Budget note:** 8 km × 8 km at 4 m sampling ≈ 200 M cells (too many); at 16 m ≈ 3 M (nothing).
+  Resolution scales with map size. Aliasing caveat still applies — **coarse to find the route, full
+  resolution to confirm the one corridor.**
+- **"Explored" becomes a real number** — a finite volume means *"the community has explored 34 % of
+  season 5"*. A genuine collective progress bar for a shared world, free once bounded.
+
+### ⚠️ NEW REQUIREMENT — an XY world-edge seal, which does not exist
+Verified: `VF_ApplyBoundarySeal(float& Density, float WorldZ, float StrateTopZ, float StrateBottomZ,
+float Thickness, float BaseDensity)` is **purely VERTICAL** — it seals each strate's ceiling and floor
+so nothing punches through except passages. There is **no horizontal equivalent**, because until now
+the world had no sides. A bounded world does.
+⇒ Build it as a **fourth structural invariant** alongside spine → seal → passage: a **forcing** op,
+appended automatically, not author-omittable. Two reasons that shape is right: an invented strate
+cannot forget it, and because forcing ops prove `AllSolid` in their band, **the world's outer shell
+becomes free to skip** in tile classification.
+
+### The transition, and ⭐ the descent shaft as the game's front door
+- **Distance gives a FIXED time budget, not an adaptive one** — fall speed × depth is the same
+  wall-clock on every machine, so a slow disk still lands in ungenerated space. **An elevator can
+  stall for a ready signal; a free fall cannot.** If it's a drop, size it for the worst machine.
+- ⭐ **Whatever sits between the hole and the first strate is the highest-traffic space in the game** —
+  every player, every session, forever. It is currently an *accident* (just the gap streaming needed).
+  It should be authored deliberately, because it is already doing several jobs:
+  - **sets the tone** for everything below (a featureless drop reads as a loading screen; a worked
+    shaft with old machinery and lights going into the dark reads as "people have been here");
+  - **it is the elevator lobby** ⇒ the natural home of the manifest-driven **strate-select menu**, as a
+    real place rather than a floating panel;
+  - ⭐ **it is where depth becomes legible** — wall markings, and **the community's depth record for the
+    season marked on the shaft**, passed on the way down. The season's collective arc made physical, in
+    the one place everybody looks;
+  - later: shops, NPCs, surface-side infrastructure.
+- Costs nothing architecturally (city-level authored geometry, or the top of the spine) but turns a
+  technical necessity into the game's threshold.
+
+---
+
+## 2026-08-17 — ACTOR-SPACE sweep (built, working)
+
+**Why:** the city's hole is not at world (0,0), so the `AVoxelWorld` actor must be placed under it.
+Jahni: *"we'll have it to be fully actor relative, just in case."*
+
+**What was actually true before:** the plugin was **half** actor-relative. Correct already —
+`GetBiomeAtWorldLocation`, `GetVoxelSurfaceHeightAt`, `UpdateDecorations`, `UpdateLandmarks`,
+`UpdateWater`, `UVoxelDensityVolume::Update`, the passage debug draw, the clipmap material. **Not**
+correct — the streaming centre, the streaming anchors, all six carve/fill entry points,
+`GetStrateAtPosition`, and `UVoxelAtmosphereManager::UpdateForPlayer` (whose own comment *documented*
+the assumption: *"actor at origin/identity"*). It only ever worked because the actor sat at the origin.
+
+⚠️ **The trap avoided:** the content managers already convert internally, so converting `PlayerLastPos`
+at the source would have **double-converted four call sites**. The fix had to be per-boundary, not at
+the top. Found only by reading each consumer — the estimate before that read was wrong in both
+directions.
+
+**Landed:**
+- `AVoxelWorld::WorldToLocalCm` / `WorldToLocalVoxel` / `LocalVoxelToWorld` (BlueprintPure) — declared
+  as **the only sanctioned boundary** between Unreal coordinates and voxel coordinates.
+- ⭐ **A grep-checkable invariant, which is the real deliverable:** *no `/ VOXEL_SIZE` applied to a
+  parameter named `World*` outside those three functions.* The risk was never a missed site among the
+  ones we found — it is the **next** one nobody notices.
+- 11 call sites converted (counted before and after; every old pattern now zero).
+- ⚠️ **Translation-only guard in `BeginPlay`** — tiles, `ClassifyBox`, the clipmap window, culling and
+  streaming distance all assume **world-axis-aligned** boxes. A rotation or non-unit scale breaks that
+  *structurally*, not gracefully. Logs an Error naming the offending rotation/scale.
+- CODEMAP §3.5 and §6 document the convention.
+
+**Nice property:** with the actor at the origin every conversion is identity, so this is a **no-op**
+until the actor moves. Verify by building, confirming nothing changed, *then* moving the actor.
+Jahni built it: **"seems to work fine."**
