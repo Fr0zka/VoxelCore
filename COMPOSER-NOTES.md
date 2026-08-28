@@ -3,6 +3,21 @@
 > Started 2026-08-17. Small on purpose: what we decided, what's still open, what must not be
 > forgotten. Not a design doc — that comes later, if it earns it.
 
+
+## ⚠️ VOCABULARY — read this first
+
+Jahni pinned these terms on 2026-08-17 because my notes used "world" for two different things.
+
+| term | what it means |
+|---|---|
+| **THE SURFACE / THE CITY** | The hand-authored **plain Unreal level** (not voxel terrain). Sky island or unclimbable mountain, so resources cannot come from up here. **Communal, identical for everyone, and it NEVER resets.** It *progresses across seasons*: camp → village → town → city → advanced city. |
+| **THE DEPTHS** | Everything **VoxelForge** generates: subterranean, bounded, stacked strates below the city hole. Some strates only *mimic* being outdoors. **THIS is what is regenerated every season.** |
+| **A SEASON** | One generation of **the depths** (~6–12 months), plus the settlement tier it earns. The wipe replaces the depths and leaves the city standing. |
+
+⚠️ **Earlier sections of this file say "the world" when they mean THE DEPTHS.** Wherever a note talks
+about wiping, regenerating, seeds, strates, the manifest or the composer, read **the depths**. The city
+is never any of those things — it is authored, permanent, and outside VoxelForge entirely.
+
 ## The idea, in one line
 
 **Jahni authors the vocabulary; the system writes the sentences.** He makes data assets (ops, biomes,
@@ -1233,4 +1248,234 @@ directions.
 
 **Nice property:** with the actor at the origin every conversion is identity, so this is a **no-op**
 until the actor moves. Verify by building, confirming nothing changed, *then* moving the actor.
-Jahni built it: **"seems to work fine."**
+Jahni built it: **"seems to work fine."** Then moved the actor off the origin and confirmed again —
+**that is the real test**, since the identity case proves only that nothing broke.
+
+---
+
+## 2026-08-17 — NAMING (Jahni: "pretty clever")
+
+**Failure mode to avoid: slot-filling.** *"The Crystal Cavern of Whispers."* Players learn the template
+in ten minutes; after that every name is noise, and worse, names stop **distinguishing** places — if
+everything is `[Adj] [Noun] of [Noun]` you cannot remember which was which, which defeats the point.
+
+### 1. ⭐ Derive names from the MEASUREMENTS, not from a bag
+The feature vector already exists per notable entry (volume, openness, verticality, water, feature
+scale). Let the name generator read it: a vast open chamber draws vast-open words, a flooded one draws
+water words, a tight vertical shaft draws shaft words. The name then **fits the place** — a player who
+hears "the Sink" and later finds a huge drain-like chamber gets a small satisfying click.
+*(Fifth use of the measurement pass.)*
+
+### 2. Several competing GRAMMARS, not one template
+Real maps are layers of naming logics from different eras and languages, and that mess is what makes
+them feel real. Pick a grammar by hash, from ~5:
+| grammar | examples | implies |
+|---|---|---|
+| **Compound** | Blackreach, Stonefall, Grimwater | short, two morphemes, germanic-ish |
+| **Descriptive definite** | The Long Dark, The Hollow, The Sink | plain, spoken |
+| **Possessive** | Varen's Fall, The Mason's Mistake | somebody was here, and it went badly |
+| **Functional** | Shaft Nine, The Lower Cut | industry, records, someone was organised |
+| **Opaque** | invented phonology (consistent syllable inventory) | a language, not keyboard mash |
+**Five grammars reads as history. One grammar reads as a generator.**
+
+### 3. Name SCARCITY — most things get no name at all
+If every room is named, names mean nothing. Only **notable** entries get one (the threshold already
+defined by addressable-vs-notable); everything else stays addressable but anonymous. Scarcity is what
+makes a named place feel like a place, and it is free — a threshold, not a feature.
+
+### 4. Names must survive contact with a WIKI
+Players will **type these into search boxes and say them aloud**. So: short, pronounceable on sight, no
+apostrophes or unusual glyphs. **A name nobody can spell cannot become community knowledge** — which is
+the whole reason names exist in a shared world.
+
+### ⛔ Parked by Jahni
+Varying the **naming language by depth** (deeper = older, stranger tongue). Liked in principle but
+parked "for now" — it is still a gradient, and gradients are what he rejected.
+
+---
+
+## 2026-08-17 — DEATH: the possessed corpse
+
+**Jahni's original intent:** dying in the depths (most often) leaves your corpse **possessed** — you must
+**fight it** to get your loot back. His worry: with distance growing **horizontally as well as
+vertically**, how much frustration does that create? Floated a **bounty hunter NPC you pay to retrieve
+your stuff**.
+
+### ⚠️ The trap that would break it: gear on the corpse = a DEATH SPIRAL
+If the corpse holds your **gear**, you return *without* your equipment to fight a copy of yourself
+*wearing* it. Every attempt is weaker than the last, and a bad night ends with your best gear
+permanently orbiting a corpse you can no longer beat. Souls games dodge this by taking only currency,
+never equipment.
+⇒ **Fix: the corpse holds your CARGO; you keep your GEAR.** The fight becomes you against an equal —
+exactly the intended challenge, winnable with better play. **Self-balancing with zero tuning:** a
+strong player's corpse is a strong enemy, a weak one's is weak, at every depth, forever.
+
+### The frustration is the TRAVEL, not the fight
+Nobody resents a hard fight; they resent twenty minutes of walking to reach it. **Fix travel, leave the
+fight alone.**
+- ✅ **The vertical half is already solved** — the elevator/unlock network. Unlocked stop at 12, died at
+  13 ⇒ you travel one strate, not thirteen. An unplanned payoff, and an argument for unlock stops being
+  **generous**.
+- ✅ **CONFIRMED by Jahni 2026-08-17.** ⭐ **The horizontal half: LET THE CORPSE WALK** — it wanders
+  around **landmarks near the passage**, not arbitrarily. It is possessed — why would it stay put? Move it
+  toward the nearest **passage mouth or landmark**. It comes partway to meet you, which collapses the
+  distance problem and is *better fiction* than a static body. Falls out of it:
+  - the death location is reported as a **NAMED PLACE**, not coordinates — "last seen near the Sink"
+    (**sixth** use of the manifest);
+  - the retrieval point is somewhere you were heading anyway;
+  - and it is genuinely unnerving — your own corpse, wearing your face, hunting you.
+
+### The bounty hunter: price it in TIME, not only gold
+A pure money sink either trivialises the corpse run or goes unused. But if he retrieves your cargo and
+delivers it **later** (next session / a real-world delay), then **the corpse run is the fast path and
+the hunter is the "I don't have another hour tonight" path.** Both stay meaningful, it self-balances
+across players with different free time, and it gives the city's NPCs a real job.
+
+### Open forks
+- **Dying while fighting your corpse** — one corpse that absorbs the previous, or do they stack?
+- **Can another player kill your corpse and take the cargo?** A genuine fork: real interaction and real
+  griefing in the same mechanic.
+
+---
+
+## 2026-08-17 — DEATH, resolved: the mirror match + the retrieval guild
+
+### Decided
+- **Only YOU can claim your loot.** No PvP looting — keeps the death mechanic out of tension with the
+  otherwise cooperative design.
+- ⭐ **The corpse COPIES your weapons; you keep yours too.** Better than my cargo/gear split: it keeps a
+  true mirror fight without ever disarming you, so the death spiral cannot happen.
+- **Possible later:** dead players spawn into **multiple instances of the depths**, so your corpse
+  becomes an encounter in other players' worlds; killing it earns **gold from a retrieving guild** (not
+  your loot).
+
+### Why the mirror is strong — and the one thing to make deliberate
+It tests **your own build's weakness** (glass cannon ⇒ you fight a glass cannon that hits as hard as you
+do — a "know thyself" fight), and it **self-balances at every gear tier and depth, forever, with zero
+tuning**.
+⚠️ But a *perfect* mirror is a **coin flip**, and you often arrive having already spent consumables
+getting there. ⇒ **Give the player a small, honest edge, on purpose:** *you* have potions and
+consumables and the corpse does not; *you* can retreat, heal and come back, and it cannot. Enough to
+make the fight winnable through **preparation** rather than luck — which is exactly the gear-and-
+strategy test intended. Do not leave this accidental.
+
+### ⚠️ HARD RULE — copied weapons must NOT be lootable
+If the corpse spawns a copy of your legendary sword and **drops** it, you have built an **item
+duplicator**, and it will be found within a week. **Copied gear vanishes with the corpse; only the cargo
+drops.** Cheap to get right now, brutal to unwind after a season of duplicated items is in circulation.
+
+### ⭐ The guild unifies two systems into one
+The bounty-hunter NPC and the player-paid retrieval are the **same mechanism with two front ends**:
+| path | who | speed | certainty |
+|---|---|---|---|
+| **Player** | someone finds your corpse in their instance and kills it | fast | uncertain |
+| **NPC** | nobody came, so the guild sends a professional | slow (next session / real delay) | guaranteed |
+
+Either way **the cargo returns to you** (mail, or a retrieval office in the city) and **the killer is
+paid by the guild, not out of your pocket.** Nobody loses anything, the guild becomes a real institution
+with a reason to exist, and it is **one system to build, not two.**
+
+⭐ **Your corpse becomes content for other people.** In a game about a shared world, your worst night
+turns into someone else's encounter — a wandering possessed adventurer in the deep dark, wearing better
+gear than theirs, worth killing. **The first mechanic here where failure ADDS to the world instead of
+only costing you.**
+
+---
+
+## 2026-08-17 — SESSION SHAPE, PARTY PLAY, and the OPENING (big lore reveal)
+
+### Decided
+- **Run length: still unknown.** But ⭐ **a corpse run is a DETOUR, not an evening — 10 minutes at
+  worst.** That is now a hard constraint that propagates (see below).
+- **The descent is done TOGETHER.** Today: a local server on one player's machine or a dedicated one.
+  Later: **instances sent per group — different groups never meet in the depths.**
+- **Creatures: nothing decided yet.** Flagged as needed.
+- **Corpse location NPC** (guild, or near the passage): tells you where your corpse was last seen for a
+  very small fee. ⇒ **Refinement: charge for PRECISION, not existence.** Free = *"last seen near the
+  Sink, strate 12"*; paid = exact position / live tracking. Reasons: the decision becomes real (coin vs
+  hunt) instead of a fee-gated UI step; **it can never trap a broke player** (death → lost cargo → can't
+  afford the info → can't recover is a spiral that hits hardest after a bad run); and *"last seen"* is
+  honest fiction, since the corpse genuinely wanders. Diegetic too — you talk to someone instead of
+  reading a death screen. (**Seventh** use of the manifest's names.)
+
+### ⭐ THE OPENING — and it solves a structural problem
+Cinematic: **civilization emerged FROM the depths.** The first, **artificial, hand-made strate** holds
+**crystals with humans inside**. We are un-crystallized, discover a **base camp**, and are told we could
+be adventurers who brave the depths. Then down to **"strate 2" — the first GENERATED strate.**
+
+- ⭐ **This justifies the authored/generated seam IN FICTION.** We had accepted "strate 1 is hand-made,
+  the rest are composed" as a production fact players must not notice. But the hand-made strate is
+  **hand-made in-world too** — artificial because someone built it; the generated ones below are the
+  *natural* deep world. A player who senses strate 1 feels different is **correctly reading the
+  fiction**, not spotting the seam. Rare, and worth protecting.
+- ⭐ **Descending is a RETURN, not a conquest.** You are going back to where you came from — a far better
+  motive than loot, and it gives the depths an implied history for free. Also seeds mystery: who
+  crystallized them, and why?
+
+### Consequences
+- ⭐ **PLACE the corpse, don't walk it.** If it pathfinds toward a landmark, retrieval time depends on
+  where you happened to die — and dying 40 minutes out breaks the 10-minute cap. So **on death, place it
+  at a landmark near the nearest passage / elevator stop**, and let it wander only *within* that
+  neighbourhood for atmosphere. Turns the cap from a hope into a **guarantee** — the same
+  build-it-in-rather-than-measure-it pattern as the primordial law.
+- ⚠️ **CONTRADICTION resolved by Jahni — and my proposed fix was BACKWARDS.** I assumed the settlement
+  resets and the arc lives inside a season. **No: the settlement PERSISTS and progresses ACROSS
+  seasons.** See the dedicated section below.
+- **Instancing makes the city the ENTIRE social surface.** If groups never meet below, then trade, the
+  guild, shared builds and simply seeing another person all happen up top. Strong argument for a
+  generous city and for the descent-shaft lobby. The depths are shared as **knowledge, not presence** —
+  which is consistent: wiki, names and discoveries all still work.
+- **Strate size and elevator density are now downstream of the 10-minute cap.** If a stop anchors
+  retrieval, a strate must be crossable in roughly that order, or dying far from a stop breaks it.
+- **Party play changes danger tuning fundamentally** — a boss balanced for one is a joke for four.
+  Unresolved: does danger scale with party size, or are strates tuned for a nominal group?
+
+---
+
+## 2026-08-17 — ⭐ THE CORE LOOP, CLOSED (the settlement is communal and permanent)
+
+### Decided
+- **The surface is limited by construction** — a **sky island**, or a mountain so tall no one can
+  descend it. So resources **must** come from below.
+- **The settlement is COMMUNAL** — the same for everyone, global. **It does NOT reset at the wipe.**
+- **A SEASON is the unit that advances it:** camp → village → town → city → advanced city → …
+  **driven by everyone.**
+- **Players gather resources and donate** (to the mayor or similar); a **global count** rises until the
+  next tier is reached.
+
+### ⭐ The loop is now closed and coherent
+**Limited surface → must descend → depths give resources → resources build the settlement → the
+settlement enables deeper descent.** Every system discussed today hangs off this. The sky island does
+quiet work: it explains why there is no trade with anywhere else, why the depths are the only economy,
+and why descending is the civilization's project rather than a hobby.
+
+### ⭐ The wipe gains meaning beyond freshness
+The **world** is impermanent; the **civilization** persists. *"We lost our maps, but we built a town."*
+Season 8 arrives in a place season 3 made.
+**Survives the wipe:** the settlement and its tier · account progression · titles · personal blueprint
+library · housing instances.
+**Dies with the wipe:** the world · the shared build pool · the elevator unlock network.
+
+### ⚠️ Three requirements this creates
+1. **The tier threshold MUST scale with active population.** A fixed number stalls forever with a small
+   playerbase and is blown through in a week with a large one — either way the promise ("a season
+   advances the settlement") breaks. ⇒ **Target one tier per season**, and retune the threshold at the
+   season boundary from observed participation. **That moment already exists** — it is the offline
+   review where Jahni inspects and vetoes the next world. **One process, two uses.** A quiet season then
+   adjusts rather than permanently stalling the city.
+2. ⚠️ **The tier must grant ACCESS and CONVENIENCE, never POWER.** Services, NPCs, workshops, bank, fast
+   travel, aesthetics — **not** better starting gear or stat boosts. Otherwise season-8 players start
+   stronger than season-1 players, early strates trivialize, and the difficulty curve erodes every
+   season until the top half of the world is decoration. **This is the SAME rule already chosen for
+   depth** (depth buys access and less grind, never bigger numbers) — one consistent economic principle,
+   applied twice. Good sign.
+3. ⭐ **Make the city a LEDGER, for late joiners.** Someone arriving in season 8 built none of it —
+   alienating, or the best first impression in the game, depending on whether the city **records who
+   built it**: plaques on the aqueduct, names in the great hall, a monument per tier listing that
+   season's contributors. New players then walk through evidence that people made this place, and
+   veterans get something permanent — pairing exactly with the titles that already survive wipes.
+
+### Smaller consequence
+**Cargo now has two destinations** — your own progression, or the city. A real recurring choice with a
+communal dimension; it gives otherwise-worthless materials a use; and it makes the corpse run hit
+harder. *That ore wasn't just yours — it was the aqueduct.*
