@@ -1479,3 +1479,83 @@ library · housing instances.
 **Cargo now has two destinations** — your own progression, or the city. A real recurring choice with a
 communal dimension; it gives otherwise-worthless materials a use; and it makes the corpse run hit
 harder. *That ore wasn't just yours — it was the aqueduct.*
+
+---
+
+## 2026-08-17 — THE VERBS: digging and combat
+
+### Digging — a REVEAL-AND-SHAPE verb, not a movement verb
+⛔ **Correction: I over-designed this.** I pitched digging as traversal (the Deep Rock model). Jahni:
+it is for **digging walls that hide something behind**, **uncovering half-buried ruins**, **tiny
+shortcuts within the same strate**, and **terraforming for builds**.
+- ⏸️ **Noise attracting monsters: parked** ("not for now"). Recorded because it is still the cheapest way
+  to price digging in *safety* rather than in resources, if it is ever wanted.
+- Useful fact from the code, unchanged: `VF_ApplyOriginSpine` deliberately leaves the boundary **seals
+  intact** *"so the player must still dig through to descend"* — descending by digging is intentional
+  but effortful; passages and elevators stay the fast path.
+
+### Combat — MMORPG-like
+Ranged/melee × magic/physical · stuns, roots, mutes · AoE and **targeted** AoE · DoTs. **Party of 6.**
+**First person must remain possible.** **No friendly fire** — an AoE in a tunnel is simply strong, and
+that is accepted.
+
+### ⭐ This puts HARD SPATIAL REQUIREMENTS on the composer — and they are measurable
+Arena sizes, translated into the composer's own units (**1 chunk = 32 voxels × 25 cm = 8 m**):
+| space | size | chunks |
+|---|---|---|
+| **boss arena** (6 players + adds + movement) | ~25–30 m across | **3–4** |
+| **ordinary fight space** | ~15–20 m | **~2** |
+| **third-person camera clearance** | ~6–8 m of headroom | **~1** |
+*Starting estimates, not gospel.* Arenas are **small relative to strates** (1–256 chunks tall), so
+guaranteeing a supply of them is a **placement** problem, not a size problem.
+
+⇒ A fightable space needs: minimum floor area · slope below a threshold · minimum clearance · clear
+sightlines. **All of these the measurement pass already computes or trivially can** ⇒ a strate can be
+**validated** to contain N fightable spaces, exactly as it is validated to have an entrance and an exit.
+**"Fights don't feel blergh" becomes a GENERATION GUARANTEE rather than a tuning hope.**
+
+**What caves add that a flat MMO arena cannot: VERTICALITY.** MMO fights are overwhelmingly flat; a
+fight across ledges and drops is genuinely different — and it is already in the danger metrics as fall
+exposure. The composer can deliberately produce arenas that are **spacious but vertical**, which is what
+makes cave combat *better* than field combat instead of a worse version of it.
+
+### ⭐ First person + ground telegraphs conflict — so TELEGRAPH THE SOURCE, NOT THE FLOOR
+A circle painted on the ground only works if you can see the ground, which is exactly what first person
+removes (you cannot see a telegraph under your feet, or behind you). If instead the **enemy visibly
+winds up** (glow, raised arm, rising particles), the threat is read off the creature and you move away
+from it. Works identically in FP and TP, **works when the floor is lumpy voxel rock where decals project
+badly anyway**, and reading an animation is more skilful and more legible than reading a decal.
+⚠️ **Supporting both perspectives means the constraints are the UNION:** full third-person camera
+clearance **and** source-readable telegraphs.
+
+### ⛔ CORRECTION — six players do NOT break streaming; the architecture already solved it
+I raised this as a 6x streaming cost. **Wrong, and Jahni was right:** the host cares only about
+**collision**; mesh and everything visual is **per client**, since every client generates the same world
+(ARCHITECTURE §9.3/§9.4). Verified in code: `RegisterStreamingAnchor` defaults to `XYRadiusChunks=1,
+ZBelow=1, ZAbove=0` = a 3x3x2 box = **18 level-0 tiles per remote player** (~90 for five), against a
+player clipmap of hundreds-to-thousands across LODs at `ViewDistanceXY=16`. A rounding error, not a
+multiplier. `CollisionOnly` skips **rendering** (`MeshComp->SetVisibility(false)`: no draw, no VSM, no
+culling); it still runs density + marching cubes + the collision cook, because collision needs geometry
+-- but at 18 tiles each that is small.
+
+**Two things that DO scale with six players:**
+- ⚠️ **Carve-driven re-meshing, which is BURSTY, not steady-state.** Six players digging in six places =
+  six streams of dirty-tile work: the host re-cooks collision for each, every client re-meshes what it
+  can see. This is the multiplier that actually tracks party size, and it arrives in spikes. Digging is
+  now a *reveal* verb (walls hiding things, ruins to uncover), so a party will do a lot of it at once.
+- ⚠️ **Client-side meshing makes determinism a HARD RUNTIME REQUIREMENT, not a nice property.** If two
+  clients generate even slightly different geometry they disagree about where the walls are -- and the
+  host collision is authoritative, so one player hits an invisible wall where another sees a passage.
+  ⇒ `VoxelForge.Determinism.CrossPlatformDigest` currently **reports rather than asserts** (informational
+  until someone pins the values). **This architecture promotes it to must-be-green.** Windows client +
+  Linux host, or two clients on different CPUs, producing different floats is now a visible gameplay
+  bug.
+
+### Other consequences
+- ⚠️ **The corpse mirror breaks for SUPPORT builds.** A healer's corpse heals itself and the fight is
+  unwinnable for reasons unrelated to skill. ⇒ the corpse should be a **combat-shaped** version of you —
+  your weapons and damage, minus the abilities that make the fight impossible — not a literal copy.
+- **No friendly fire** removes a whole class of party friction (important with pick-up groups). Its
+  consequence: the cost of a cramped fight becomes **visual clutter**, not damage. Six players' effects
+  in an 8 m tunnel is unreadable noise and nobody can find the telegraph in it. The arena requirement
+  survives — for a different reason than "nowhere to dodge".
