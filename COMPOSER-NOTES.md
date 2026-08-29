@@ -343,7 +343,7 @@ the parameter named "max".
 It proves anything below `TerrainZ` solid and skips meshing. Any future 3D generation inside mountains
 needs a guard, or the caves vanish with no error.
 
-### ⚠️ 6.4 The primordial law has a real hole TODAY
+### 🔨 6.4 The primordial law hole — HALF FIXED (4 of 8 archetypes), built + green
 
 `UVoxelStrateManager::GeneratePassages` places every inter-strate passage as independently salted
 hashes of `(seed, upper-strate index, connection index)` → random angle around the (0,0) spine →
@@ -561,3 +561,51 @@ acceptance conditions. Both now met:
 
 ⚠️ **Read the PROVED counts as measurements, never as contracts.** What is asserted is that none of
 them is *wrong* — a false verdict leaves no geometry and no collision behind it.
+
+---
+
+## 11. Tier 1 status — passages aim at real open space (PARTIAL, built + green)
+
+**Landed 2026-08-17.** `VF_SuggestOpenPointZ` (in `VoxelCaveMorphology`) is a **pure free function** of
+(archetype, params, seed, XY) — it touches no operator stack, no `UVoxelStrateManager`, no cache. That
+matters: `GeneratePassages` runs inside `Initialize`, when the layout is half-built and `LayoutVersion`
+is mid-flight, so constructing anything holding a manager pointer there is a re-entrancy trap.
+
+`GeneratePassages` now asks the **destination** strate for an open Z near the chosen XY and aims the
+lower mouth there, clamped strictly inside the interior (never into a seal band). Where the archetype
+cannot answer, **today's random reach is preserved unchanged**.
+
+### ⚠️ Coverage is PARTIAL and the number is the point
+Measured by `VoxelForge.Determinism.PassageLandsInOpenSpace`:
+
+> *7 inter-strate passages, 3 checked, 48/48 ring samples air, 4 query-false (4 unique archetypes;
+> 4 unsupported, 0 supported-but-no-point).*
+
+✅ **Answering:** TunnelNetwork · Underwater · FlatPlain · CrystalChamber.
+❌ **Not answering:** Maze · VerticalShafts · SurfaceWorld (and by extension FloatingIslands).
+
+⇒ **The primordial law is guaranteed for four archetypes of eight.** The improvement over this morning
+is not that the hole is closed — it is that the gap is now **measured instead of invisible**. Follow-on
+work: Maze can answer from its lattice nodes, VerticalShafts from its shafts, SurfaceWorld from just
+above `TerrainZ`, FloatingIslands from just above a blob top.
+
+### Two seed contracts, do not mix them
+- **TunnelNetwork / Underwater** → `VoxelCaveMorphology::MakeStrateSeed` (the strate's own room seed).
+- **Slab archetypes** → the generator **world** seed, which is what `GetSlabDensity` uses.
+
+Seeding the query from the passage salt hash — which my spec originally asked for — would inspect a
+cave graph that **does not exist** and return confident answers about imaginary rooms. Codex caught it.
+
+### The test is a proxy, and says so
+The first version sampled `GetDensityAt` at the mouth and asserted air — **vacuous**, because
+`VF_ApplyPassageCarving` is a structural-post invariant, so the tube is air *at its own mouth by
+construction*. It passed whether the aiming worked or not. Replaced with a **16-point lateral ring** at
+`MouthRadius + 2 × PassageBlend` (~14 voxels at defaults), requiring ≥ 8/16 air. A mouth in a real room
+has open space around it; a mouth in bedrock has only the tube it dug itself.
+⚠️ **It is a proxy for connectivity, not a proof.** The proof is a flood fill — Tier 2.
+
+### ⚠️ A forked placement envelope, guarded by that test
+`VF_FindNearestHashRoomZ` re-derives the room vertical placement envelope that `BuildChunkCache` also
+computes. Calling the per-chunk cache builder from `Initialize` is impractical, so this is a deliberate
+second copy. **Both sites now carry a PLACEMENT CONTRACT comment naming the other**, and the ring test
+is the only thing standing between a placement change and silent bedrock passages.

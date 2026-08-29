@@ -33,8 +33,10 @@
 
 // Forward declarations
 struct FStrateGenerationParams;
+struct FSlabGenerationParams;
 struct FStrateTerrainOpEntry;
 class UVoxelTerrainOpDefinition;
+enum class ECaveGeneratorType : uint8;
 
 //=============================================================================
 // SDF PRIMITIVES
@@ -468,6 +470,15 @@ struct FChunkSDFCache
 
 namespace VoxelCaveMorphology
 {
+    // The room graph's seed is the world seed salted by the strate index. Keep this formula
+    // shared by BuildChunkCache and landing-site queries so a query cannot inspect another
+    // strate's room layout. / La seed du graphe des salles est la seed monde salée par l'index
+    // de strate. La formule est partagée entre BuildChunkCache et les requêtes d'atterrissage.
+    FORCEINLINE uint32 MakeStrateSeed(uint32 WorldSeed, int32 StrateIndex)
+    {
+        return VoxelHash::Mix(WorldSeed ^ (uint32)(StrateIndex * 7919 + 104729));
+    }
+
     // PHASE 1: Build the SDF cache for a rectangular region.
     // Collects all rooms, computes nearest-neighbor backbone, decides tunnel
     // connections, and pre-computes all tunnel geometry (radii, offsets, midpoints).
@@ -523,3 +534,30 @@ namespace VoxelCaveMorphology
         uint32 Seed, int32 StrateIndex
     );
 }
+
+/**
+ * Suggest a deterministic open-space Z for an inter-strate passage mouth.
+ *
+ * This is deliberately a pure source query: it does not touch a generator, an operator stack,
+ * a strate manager, a cache, or mutable state. For TunnelNetwork/Underwater, Seed must be the
+ * strate-specific room seed returned by VoxelCaveMorphology::MakeStrateSeed; for slab archetypes,
+ * Seed is the generator world seed used by GetSlabDensity.
+ *
+ * Propose un Z d'espace ouvert déterministe pour la bouche d'un passage inter-strates. Cette
+ * requête ne touche ni générateur, ni pile d'opérateurs, ni StrateManager, ni cache, ni état
+ * mutable. Pour TunnelNetwork/Underwater, Seed est la seed de salles de la strate; pour les
+ * archétypes slab, c'est la seed monde utilisée par GetSlabDensity.
+ *
+ * @return true when the archetype can provide a confident point; false when it cannot.
+ */
+VOXELFORGE_API bool VF_SuggestOpenPointZ(
+    ECaveGeneratorType Archetype,
+    const FStrateGenerationParams& CaveParams,
+    const FSlabGenerationParams& SlabParams,
+    int32 Seed,
+    float StrateTopZ,
+    float StrateBottomZ,
+    float WorldX,
+    float WorldY,
+    float& OutZ
+);

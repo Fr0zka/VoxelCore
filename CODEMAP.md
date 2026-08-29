@@ -318,6 +318,12 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
   | `EvaluateSDFCached` | 757 | **Phase 2** (per voxel): SmoothMin over cached rooms/tunnels; returns nearest room idx for terrain-op lookup. **Signature changed (perf pass 2): `RoomShapeVariety` param REMOVED** — the shape roll + capsule trig are pre-baked into `FCachedRoom` (`ShapeType/ShapeA/ShapeB/ShapeR`) by `BuildChunkCache`, bit-identical. |
   | `EvaluateSDF` | 738 | Convenience wrapper (builds temp cache) for one-off queries. |
 
+`MakeStrateSeed` (h:~477) is the shared pure world-seed/strate-index salt used by both
+`BuildChunkCache` and destination landing queries. `VF_SuggestOpenPointZ` (h:~550, implemented in
+`VoxelCaveMorphology.cpp`) is the pure landing-site query: nearest hash room centre for
+TunnelNetwork/Underwater, slab void midpoint for FlatPlain/CrystalChamber, and `false` for the other
+archetypes. It never touches a generator, operator stack, manager, cache, or mutable state.
+
   Performance note (h:209-220): caching rooms/tunnels once per chunk instead of per
   voxel is the single biggest CPU win.
 
@@ -354,7 +360,7 @@ Maps depth→strate at runtime; owns passages.
 | Method | .cpp line | Role |
 |--------|-----------|------|
 | `Initialize` | 10 | Builds the stacked layout from settings+seed (fixed slots + pool sorted by soft-asset path, then unchanged Fisher-Yates shuffle), logs every **cave** slot whose operator-stack opt-in is disabled, then `GeneratePassages`. SurfaceWorld is deliberately excluded from that diagnostic because its exact-lattice T1.d path does not depend on the flag. |
-| `GeneratePassages` | 146 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. |
+| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. After XY placement, the destination's pure `VF_SuggestOpenPointZ` targets the lower mouth and the result is clamped outside the destination seal bands; unsupported answers warn and preserve the old random reach. |
 | `EvaluateModifierSDF` | 357 | SDF of passages at a point (for carving). Per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`. §8.10. |
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
 | `FindSlotIndexForChunkZ` | 427 | Z → layout index. |
@@ -454,6 +460,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
+| `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |
 
 ## 4. The density pipeline (most-edited hot path)
 

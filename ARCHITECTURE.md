@@ -290,6 +290,16 @@ is a simple straight tube. Placement, reach, and shape draws for inter-strate pa
 connection count cannot shift any later passage. Global passage settings were removed from
 `VoxelSettings`.
 
+After a passage's XY is selected, `GeneratePassages` asks the **destination** strate for a lower-mouth
+height through the pure free function `VF_SuggestOpenPointZ` (`VoxelCaveMorphology`). TunnelNetwork and
+Underwater use the nearest hash-placed room centre, with `MakeStrateSeed(world-seed, strate-index)`
+matching the room graph's existing identity; FlatPlain and CrystalChamber recompute their slab void
+band and reject column-overlap points. Maze, SurfaceWorld, VerticalShafts, and FloatingIslands remain
+explicitly unanswerable for this tier: they keep the historical random reach and emit a warning. This
+query is source-level only — it does not construct an operator stack, touch a cache, or call back into
+`UVoxelStrateManager` while `Initialize` is building the layout. The resulting lower endpoint is
+clamped to the destination's seal-free interior.
+
 ### 8.9 Carving — brush shapes + editor controls
 `FVoxelModification` has `EVoxelBrushShape {Sphere,Box,Capsule}` + `BoxExtent`/`CapsuleEnd`/
 `Falloff` + `GetWorldBounds`. `UVoxelDiffLayer::GetDensityOffset` switches per shape; chunk

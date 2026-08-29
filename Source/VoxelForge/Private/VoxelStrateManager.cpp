@@ -266,6 +266,19 @@ void UVoxelStrateManager::GeneratePassages()
     constexpr uint32 PassageSaltPhase      = 0xA1100009u;
     constexpr uint32 PassageSaltBendFreq   = 0xA110000Au;
 
+    int32 TotalPassages = 0;
+    int32 NumAimedAtOpenPoint = 0;
+    TSet<FString> NoQueryArchetypes;
+
+    const auto ArchetypeName = [](ECaveGeneratorType Archetype)
+    {
+        if (const UEnum* ArchetypeEnum = StaticEnum<ECaveGeneratorType>())
+        {
+            return ArchetypeEnum->GetNameStringByValue(static_cast<int64>(Archetype));
+        }
+        return FString::Printf(TEXT("Value_%d"), static_cast<int32>(Archetype));
+    };
+
     //=========================================================================
     // INTER-STRATE PASSAGES: tunnels connecting consecutive strates.
     // Each passage is randomly assigned one of 5 types, which determines
@@ -317,13 +330,92 @@ void UVoxelStrateManager::GeneratePassages()
             const float PX = FMath::Cos(Angle) * Distance;
             const float PY = FMath::Sin(Angle) * Distance;
 
+            ++TotalPassages;
+
+            // Ask the destination archetype for a source-level open Z at this XY. This is pure
+            // and safe during Initialize: it does not construct an operator stack or call back
+            // into the manager. Cave room graphs use the same strate seed as BuildChunkCache;
+            // slab fields use the world seed consumed by GetSlabDensity.
+            float SuggestedLowerZ = 0.0f;
+            bool bAimedAtOpenPoint = false;
+            const UVoxelStrateDefinition* LowerDef = Lower.Definition;
+            if (LowerDef)
+            {
+                const bool bUsesRoomSeed =
+                    LowerDef->GeneratorType == ECaveGeneratorType::TunnelNetwork
+                    || LowerDef->GeneratorType == ECaveGeneratorType::Underwater;
+                const int32 LowerQuerySeed = bUsesRoomSeed
+                    ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
+                        static_cast<uint32>(CachedSeed), Lower.StrateIndex))
+                    : CachedSeed;
+
+                bAimedAtOpenPoint = VF_SuggestOpenPointZ(
+                    LowerDef->GeneratorType,
+                    LowerDef->GenerationParams,
+                    LowerDef->SlabParams,
+                    LowerQuerySeed,
+                    LowerTopZ,
+                    (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
+                    PX,
+                    PY,
+                    SuggestedLowerZ);
+
+                if (bAimedAtOpenPoint)
+                {
+                    ++NumAimedAtOpenPoint;
+                }
+                else
+                {
+                    NoQueryArchetypes.Add(ArchetypeName(LowerDef->GeneratorType));
+                }
+            }
+
             // LENGTH: reach into each strate, capped to the interior.
             const float UpperReach = FMath::Min(
                 PassageRandomRange(Cfg.ReachMin, Cfg.ReachMax, PassageSaltUpperReach), UpperMax);
             const float LowerReach = FMath::Min(
                 PassageRandomRange(Cfg.ReachMin, Cfg.ReachMax, PassageSaltLowerReach), LowerMax);
             const float TopZ = UpperBottomZ + UpperReach;
-            const float BottomZ = LowerTopZ - LowerReach;
+            float BottomZ = LowerTopZ - LowerReach;
+
+            if (bAimedAtOpenPoint)
+            {
+                float LowerSealThickness = 0.0f;
+                switch (LowerDef->GeneratorType)
+                {
+                case ECaveGeneratorType::TunnelNetwork:
+                case ECaveGeneratorType::Underwater:
+                    LowerSealThickness = LowerDef->GenerationParams.BoundarySealThickness;
+                    break;
+
+                case ECaveGeneratorType::FlatPlain:
+                case ECaveGeneratorType::CrystalChamber:
+                    LowerSealThickness = LowerDef->SlabParams.BoundarySealThickness;
+                    break;
+
+                default:
+                    break;
+                }
+
+                const float LowerBottomZ = (float)(Lower.BottomChunkZ) * CHUNK_SIZE;
+                const float InnerBottomZ = LowerBottomZ + LowerSealThickness;
+                const float InnerTopZ = LowerTopZ - LowerSealThickness;
+                if (FMath::IsFinite(SuggestedLowerZ)
+                    && FMath::IsFinite(InnerBottomZ)
+                    && FMath::IsFinite(InnerTopZ)
+                    && InnerBottomZ < InnerTopZ)
+                {
+                    // VF_SuggestOpenPointZ already guarantees a strict interior answer. Keep a
+                    // tiny margin in the final clamp so a future source query cannot land on a
+                    // seal boundary through rounding.
+                    const float StrictMargin = FMath::Min(
+                        KINDA_SMALL_NUMBER, (InnerTopZ - InnerBottomZ) * 0.25f);
+                    BottomZ = FMath::Clamp(
+                        SuggestedLowerZ,
+                        InnerBottomZ + StrictMargin,
+                        InnerTopZ - StrictMargin);
+                }
+            }
 
             const int32 Segments = FMath::Clamp(Cfg.Segments, 1, 48);
             Passage.ControlPoints.Reset();
@@ -421,6 +513,25 @@ void UVoxelStrateManager::GeneratePassages()
             Passages.Add(Passage);
         }
     }
+
+    TArray<FString> SortedNoQueryArchetypes;
+    for (const FString& Archetype : NoQueryArchetypes)
+    {
+        SortedNoQueryArchetypes.Add(Archetype);
+    }
+    SortedNoQueryArchetypes.Sort();
+    FString NoQueryList = TEXT("none");
+    if (SortedNoQueryArchetypes.Num() > 0)
+    {
+        NoQueryList = FString::Join(SortedNoQueryArchetypes, TEXT(", "));
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[StrateManager] Passage landing sites: %d/%d aimed at generator-confirmed open space, %d fell back to random reach (archetypes with no query: %s)."),
+        NumAimedAtOpenPoint,
+        TotalPassages,
+        TotalPassages - NumAimedAtOpenPoint,
+        *NoQueryList);
 
     //=========================================================================
     // SURFACE ENTRY SHAFT — the one auto-opened (0,0) connection.

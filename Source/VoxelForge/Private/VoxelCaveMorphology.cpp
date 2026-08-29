@@ -30,6 +30,7 @@
 #include "VoxelCaveMorphology.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
 #include "VoxelStrateTypes.h"
+#include "VoxelNoise.h"           // Pure FBM used by the slab landing query
 #include "VoxelTerrainOpDefinition.h"
 
 //=============================================================================
@@ -87,6 +88,313 @@ static void BakeRoomFeature(
     }
 }
 
+namespace
+{
+    // Find the nearest hash room's vertical centre without constructing a cache. The search is
+    // deliberately bounded: an empty neighbourhood is an honest "no answer", not a guessed Z.
+    // Cherche le centre vertical de la salle hachée la plus proche sans construire de cache. La
+    // recherche est bornée : un voisinage vide signifie "pas de réponse", jamais un Z inventé.
+    bool VF_FindNearestHashRoomZ(
+        const FStrateGenerationParams& Params,
+        int32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float& OutZ)
+    {
+        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        const float CellSize = Params.RoomSpacing;
+        const float RadiusEnvelope = FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius);
+        if (!FMath::IsFinite(CellSize) || !FMath::IsFinite(Params.RoomDensity)
+            || !FMath::IsFinite(Params.MinRoomRadius) || !FMath::IsFinite(Params.MaxRoomRadius)
+            || !FMath::IsFinite(Params.RoomHeightRatio)
+            || !FMath::IsFinite(Params.BoundarySealThickness)
+            || !FMath::IsFinite(Params.MaxTunnelLength)
+            || CellSize <= 0.0f || Params.RoomDensity <= 0.0f
+            || Params.MaxTunnelLength <= 0.0f
+            || RadiusEnvelope <= 0.0f || Params.RoomHeightRatio <= 0.0f
+            || Params.BoundarySealThickness < 0.0f)
+        {
+            return false;
+        }
+
+        // PLACEMENT CONTRACT: this envelope MUST remain identical to the room-center placement
+        // code in VoxelCaveMorphology::BuildChunkCache below. The pure query deliberately does
+        // not call that per-chunk cache builder during Initialize, so this is intentionally a
+        // second copy.
+        // VoxelForge.Determinism.PassageLandsInOpenSpace is the fixed ring test that catches drift.
+        // The extra room-height buffer keeps the generated room body away from both seal bands.
+        const float RoomZBuffer = RadiusEnvelope * Params.RoomHeightRatio;
+        const float StrateMinZ = StrateBottomZ + Params.BoundarySealThickness + RoomZBuffer;
+        const float StrateMaxZ = StrateTopZ - Params.BoundarySealThickness - RoomZBuffer;
+        const float StrateRangeZ = StrateMaxZ - StrateMinZ;
+        if (!FMath::IsFinite(StrateRangeZ) || StrateRangeZ <= 0.0f)
+        {
+            return false;
+        }
+
+        // A passage is placed within the configured reach from the spine. Start the search a little
+        // farther than that reach, then expand deterministic rings until the nearest candidate is
+        // proven; cap pathological asset values so Initialize cannot become an unbounded grid scan.
+        const float SearchDistance = FMath::Max(CellSize * 2.0f,
+            FMath::Max(Params.MaxTunnelLength, 0.0f));
+        const float SearchCells = SearchDistance / CellSize;
+        const int32 InitialSearchRadius = FMath::Min(
+            32,
+            FMath::Max(2, FMath::CeilToInt(SearchCells) + 1));
+        constexpr int32 MaxSearchRadius = 32;
+
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / CellSize);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / CellSize);
+
+        float BestDistSq = FLT_MAX;
+        float BestZ = 0.0f;
+        int32 BestCellX = 0;
+        int32 BestCellY = 0;
+        bool bFound = false;
+
+        auto ConsiderCell = [&](int32 CellX, int32 CellY)
+        {
+            // Keep this roll byte-for-byte aligned with BuildChunkCache's room placement.
+            const uint32 CellHash = VoxelHash::Cell(CellX, CellY, (uint32)Seed);
+            if (VoxelHash::ToFloat01(CellHash) >= Params.RoomDensity) return;
+
+            const float JitterX = VoxelHash::ToFloat01(VoxelHash::Mix(CellHash ^ 0x12345678u));
+            const float JitterY = VoxelHash::ToFloat01(VoxelHash::Mix(CellHash ^ 0x9ABCDEF0u));
+            const float JitterZ = VoxelHash::ToFloat01(VoxelHash::Mix(CellHash ^ 0x55AA55AAu));
+
+            const float RoomX = (CellX + 0.15f + JitterX * 0.7f) * CellSize;
+            const float RoomY = (CellY + 0.15f + JitterY * 0.7f) * CellSize;
+            const float RoomZ = StrateMinZ + JitterZ * FMath::Max(StrateRangeZ, 1.0f);
+            const float DX = RoomX - WorldX;
+            const float DY = RoomY - WorldY;
+            const float DistSq = DX * DX + DY * DY;
+
+            const bool bCloser = DistSq < BestDistSq;
+            const bool bTie = DistSq == BestDistSq
+                && (CellX < BestCellX || (CellX == BestCellX && CellY < BestCellY));
+            if (!bCloser && !bTie) return;
+
+            BestDistSq = DistSq;
+            BestZ = RoomZ;
+            BestCellX = CellX;
+            BestCellY = CellY;
+            bFound = true;
+        };
+
+        auto ScanRing = [&](int32 Radius)
+        {
+            for (int32 CellY = BaseCellY - Radius; CellY <= BaseCellY + Radius; ++CellY)
+            {
+                for (int32 CellX = BaseCellX - Radius; CellX <= BaseCellX + Radius; ++CellX)
+                {
+                    if (FMath::Max(FMath::Abs(CellX - BaseCellX), FMath::Abs(CellY - BaseCellY)) != Radius)
+                    {
+                        continue;
+                    }
+                    ConsiderCell(CellX, CellY);
+                }
+            }
+        };
+
+        // The nearest possible room centre in any cell outside this square is at least this far
+        // from the query point (the placement jitter is bounded to [0.15, 0.85] cell).
+        auto IsNearestProven = [&](int32 Radius)
+        {
+            if (!bFound) return false;
+            const float OutsideDistance = ((float)Radius + 0.15f) * CellSize;
+            return BestDistSq < OutsideDistance * OutsideDistance;
+        };
+
+        for (int32 CellY = BaseCellY - InitialSearchRadius;
+             CellY <= BaseCellY + InitialSearchRadius;
+             ++CellY)
+        {
+            for (int32 CellX = BaseCellX - InitialSearchRadius;
+                 CellX <= BaseCellX + InitialSearchRadius;
+                 ++CellX)
+            {
+                ConsiderCell(CellX, CellY);
+            }
+        }
+
+        bool bNearestProven = IsNearestProven(InitialSearchRadius);
+        for (int32 Radius = InitialSearchRadius + 1;
+             Radius <= MaxSearchRadius && !bNearestProven;
+             ++Radius)
+        {
+            ScanRing(Radius);
+            bNearestProven = IsNearestProven(Radius);
+        }
+
+        if (!bFound || !bNearestProven) return false;
+
+        // The placement envelope above normally makes this automatic. Keep the explicit check so
+        // malformed but finite parameters never turn a boundary value into an open-point claim.
+        const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
+        const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
+        if (!FMath::IsFinite(BestZ) || BestZ <= InnerBottom || BestZ >= InnerTop)
+        {
+            return false;
+        }
+
+        OutZ = BestZ;
+        return true;
+    }
+
+    // The slab source is an XY height band. Evaluate the same two pure height fields as
+    // GetSlabDensity, then choose their midpoint after intersecting the seal-free interior.
+    // La source slab est une bande de hauteurs XY : on recalcule les deux champs purs comme
+    // GetSlabDensity, puis on prend leur milieu après intersection avec l'intérieur sans seal.
+    bool VF_SuggestSlabOpenPointZ(
+        const FSlabGenerationParams& Params,
+        int32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float& OutZ)
+    {
+        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        if (!FMath::IsFinite(Params.FloorRelativeHeight)
+            || !FMath::IsFinite(Params.CeilingRelativeHeight)
+            || !FMath::IsFinite(Params.FloorRoughness)
+            || !FMath::IsFinite(Params.FloorRoughnessFrequency)
+            || !FMath::IsFinite(Params.CeilingRoughness)
+            || !FMath::IsFinite(Params.CeilingRoughnessFrequency)
+            || !FMath::IsFinite(Params.ColumnDensity)
+            || !FMath::IsFinite(Params.ColumnMinRadius)
+            || !FMath::IsFinite(Params.ColumnMaxRadius)
+            || !FMath::IsFinite(Params.ColumnSpacing)
+            || !FMath::IsFinite(Params.BoundarySealThickness)
+            || !FMath::IsFinite(Params.BaseDensity)
+            || Params.BoundarySealThickness < 0.0f)
+        {
+            return false;
+        }
+
+        const float StrateHeight = StrateTopZ - StrateBottomZ;
+        const uint32 SeedU = (uint32)Seed;
+
+        const float FloorZ = StrateBottomZ + StrateHeight * Params.FloorRelativeHeight;
+        float FloorNoise = 0.0f;
+        if (Params.FloorRoughness > 0.0f)
+        {
+            const float FF = Params.FloorRoughnessFrequency;
+            FloorNoise = VoxelNoise::FBM(
+                WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
+                WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
+                0.0f, 3
+            ) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
+        }
+        const float FloorSurface = FloorZ + FloorNoise;
+
+        const float CeilZ = StrateBottomZ + StrateHeight * Params.CeilingRelativeHeight;
+        float CeilNoise = 0.0f;
+        if (Params.CeilingRoughness > 0.0f)
+        {
+            const float CF = Params.CeilingRoughnessFrequency;
+            const float RawNoise = VoxelNoise::FBM(
+                WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
+                WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
+                3000.0f, 3
+            ) * VOXEL_NOISE_SCALE;
+            CeilNoise = FMath::Abs(RawNoise) * Params.CeilingRoughness;
+        }
+        const float CeilSurface = FMath::Max(CeilZ - CeilNoise, FloorSurface + 2.0f);
+
+        // VF_ApplyBoundarySeal's bands are [Top-Thickness, Top) and
+        // (Bottom, Bottom+Thickness]. The midpoint below stays strictly inside both limits.
+        const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
+        const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
+        const float OpenBottom = FMath::Max(FloorSurface, InnerBottom);
+        const float OpenTop = FMath::Min(CeilSurface, InnerTop);
+        if (!FMath::IsFinite(OpenBottom) || !FMath::IsFinite(OpenTop) || OpenTop <= OpenBottom)
+        {
+            return false;
+        }
+
+        // Slab columns are infinite-height. If one reaches this XY, no Z in the slab void is a
+        // confident pre-passage landing point, so report "unanswerable" instead of guessing.
+        if (Params.ColumnDensity > 0.0f && Params.ColumnSpacing > 0.0f)
+        {
+            const float Spacing = Params.ColumnSpacing;
+            const int32 ColumnCellX = FMath::FloorToInt(WorldX / Spacing);
+            const int32 ColumnCellY = FMath::FloorToInt(WorldY / Spacing);
+
+            for (int32 DY = -1; DY <= 1; ++DY)
+            {
+                for (int32 DX = -1; DX <= 1; ++DX)
+                {
+                    const int32 CellX = ColumnCellX + DX;
+                    const int32 CellY = ColumnCellY + DY;
+                    const uint32 H = VoxelHash::Cell(CellX, CellY, SeedU ^ 0xC01C01u);
+                    if (VoxelHash::ToFloat01(H) > Params.ColumnDensity) continue;
+
+                    const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
+                    const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
+                    const float ColumnX = (CellX + 0.15f + JX * 0.7f) * Spacing;
+                    const float ColumnY = (CellY + 0.15f + JY * 0.7f) * Spacing;
+                    const float Radius = FMath::Lerp(Params.ColumnMinRadius, Params.ColumnMaxRadius,
+                        VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+                    const float ColumnDX = WorldX - ColumnX;
+                    const float ColumnDY = WorldY - ColumnY;
+                    if (FMath::Sqrt(ColumnDX * ColumnDX + ColumnDY * ColumnDY) - Radius < 2.0f)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        OutZ = (OpenBottom + OpenTop) * 0.5f;
+        return FMath::IsFinite(OutZ);
+    }
+}
+
+bool VF_SuggestOpenPointZ(
+    ECaveGeneratorType Archetype,
+    const FStrateGenerationParams& CaveParams,
+    const FSlabGenerationParams& SlabParams,
+    int32 Seed,
+    float StrateTopZ,
+    float StrateBottomZ,
+    float WorldX,
+    float WorldY,
+    float& OutZ)
+{
+    switch (Archetype)
+    {
+    case ECaveGeneratorType::TunnelNetwork:
+    case ECaveGeneratorType::Underwater:
+        return VF_FindNearestHashRoomZ(CaveParams, Seed, StrateTopZ, StrateBottomZ,
+                                       WorldX, WorldY, OutZ);
+
+    case ECaveGeneratorType::FlatPlain:
+    case ECaveGeneratorType::CrystalChamber:
+        return VF_SuggestSlabOpenPointZ(SlabParams, Seed, StrateTopZ, StrateBottomZ,
+                                        WorldX, WorldY, OutZ);
+
+    default:
+        // No confident source-level answer for Maze, SurfaceWorld, shafts, or islands yet.
+        // Pas de réponse source sûre pour Maze, SurfaceWorld, shafts ou islands pour le moment.
+        return false;
+    }
+}
+
 //=============================================================================
 // PHASE 1: BUILD CHUNK CACHE
 //=============================================================================
@@ -113,7 +421,7 @@ void VoxelCaveMorphology::BuildChunkCache(
     OutCache.Columns.Reset();
 
     // Combine world seed with strate index so each strate gets unique caves
-    const uint32 StrateSeed = VoxelHash::Mix(Seed ^ (uint32)(StrateIndex * 7919 + 104729));
+    const uint32 StrateSeed = VoxelCaveMorphology::MakeStrateSeed(Seed, StrateIndex);
 
     const float CellSize = Params.RoomSpacing;
     if (CellSize <= 0.0f) return;
@@ -167,6 +475,11 @@ void VoxelCaveMorphology::BuildChunkCache(
 
     //=========================================================================
     // Vertical range for room CENTER placement.
+    // PLACEMENT CONTRACT: this formula MUST remain identical to
+    // VF_FindNearestHashRoomZ above. The pure landing query deliberately does not call this
+    // per-chunk cache builder during Initialize, so the fixed
+    // VoxelForge.Determinism.PassageLandsInOpenSpace ring test is the guard that catches drift
+    // between the two sites.
     //=========================================================================
     // Buffer = seal thickness + max room half-height.
     // This guarantees the tallest possible room (RoomRadiusEnvelope * RoomHeightRatio)
