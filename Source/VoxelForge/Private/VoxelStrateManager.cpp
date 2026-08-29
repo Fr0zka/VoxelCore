@@ -45,16 +45,28 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
     // Fixed strates are excluded from the shuffle — they always use their
     // assigned definition regardless of seed.
 
-    TArray<UVoxelStrateDefinition*> ShuffledPool;
+    using FLoadedPoolEntry = TPair<FString, UVoxelStrateDefinition*>;
+    TArray<FLoadedPoolEntry> ShuffledPool;
     for (const TSoftObjectPtr<UVoxelStrateDefinition>& SoftPtr : Settings->StratePool)
     {
         // Load the asset (synchronous for now — could be async later)
         UVoxelStrateDefinition* Def = SoftPtr.LoadSynchronous();
         if (Def)
         {
-            ShuffledPool.Add(Def);
+            ShuffledPool.Emplace(SoftPtr.ToString(), Def);
         }
     }
+
+    // Sort by the soft asset path before shuffling. Pointer addresses depend on load order and
+    // would make the layout machine-dependent. The pool is a set for layout purposes: editor
+    // reordering must not change the input sequence seen by Fisher-Yates.
+    // Trier par chemin de soft asset avant le shuffle. Les adresses de pointeurs dépendent de
+    // l'ordre de chargement et rendraient le layout dépendant de la machine. Le pool est un set
+    // pour le layout : réordonner l'asset dans l'éditeur ne doit pas changer l'entrée de Fisher-Yates.
+    ShuffledPool.Sort([](const FLoadedPoolEntry& A, const FLoadedPoolEntry& B)
+    {
+        return FCString::Strcmp(*A.Key, *B.Key) < 0;
+    });
 
     // Seed-based shuffle using Fisher-Yates
     // FRandomStream gives us deterministic random numbers from a seed
@@ -102,7 +114,7 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
         else if (ShuffledPool.Num() > 0)
         {
             // Cycle through the pool (wraps around if more strates than pool entries)
-            Slot.Definition = ShuffledPool[PoolCursor % ShuffledPool.Num()];
+            Slot.Definition = ShuffledPool[PoolCursor % ShuffledPool.Num()].Value;
             PoolCursor++;
         }
         else
@@ -238,8 +250,21 @@ void UVoxelStrateManager::GeneratePassages()
 
     if (StrateLayout.Num() < 1) return;
 
-    // Deterministic RNG from world seed
-    FRandomStream Rng(CachedSeed ^ 0x50A55A6E);  // XOR with "PASSAGE" hash
+    // Deterministic per-value hashes from the world seed. Every draw is keyed by its boundary
+    // strate index, connection index, and a unique salt, so one passage cannot shift another.
+    // Hachages déterministes par valeur depuis le seed du monde. Chaque tirage est indexé par la
+    // strate de frontière, la connexion et un sel unique : un passage ne peut plus décaler l'autre.
+    const uint32 PassageSeed = static_cast<uint32>(CachedSeed) ^ 0x50A55A6Eu;  // "PASSAGE"
+    constexpr uint32 PassageSaltAngle      = 0xA1100001u;
+    constexpr uint32 PassageSaltDistance   = 0xA1100002u;
+    constexpr uint32 PassageSaltUpperReach = 0xA1100003u;
+    constexpr uint32 PassageSaltLowerReach = 0xA1100004u;
+    constexpr uint32 PassageSaltWormFreq   = 0xA1100005u;
+    constexpr uint32 PassageSaltNoiseX     = 0xA1100006u;
+    constexpr uint32 PassageSaltNoiseY     = 0xA1100007u;
+    constexpr uint32 PassageSaltNoiseZ     = 0xA1100008u;
+    constexpr uint32 PassageSaltPhase      = 0xA1100009u;
+    constexpr uint32 PassageSaltBendFreq   = 0xA110000Au;
 
     //=========================================================================
     // INTER-STRATE PASSAGES: tunnels connecting consecutive strates.
@@ -269,19 +294,34 @@ void UVoxelStrateManager::GeneratePassages()
         const int32 Conns = FMath::Max(0, Cfg.Connections);
         for (int32 c = 0; c < Conns; c++)
         {
+            const auto PassageRandom01 = [PassageSeed, i, c](uint32 Salt)
+            {
+                return VoxelHash::ToFloat01(VoxelHash::Cell(i, c, PassageSeed ^ Salt));
+            };
+            const auto PassageRandomRange = [&PassageRandom01](float Min, float Max, uint32 Salt)
+            {
+                return FMath::Lerp(Min, Max, PassageRandom01(Salt));
+            };
+
             FVoxelPassage Passage;
             Passage.UpperStrateIndex = i;
             Passage.LowerStrateIndex = i + 1;
+            // PassageType has no random draw in the current implementation; preserve its existing
+            // default while PassageConfig::Style controls the generated control-point shape.
+            // PassageType n'a pas de tirage aléatoire ici ; conserver son défaut, tandis que
+            // PassageConfig::Style contrôle la forme des points de contrôle générés.
 
             // PLACEMENT: random angle, distance from the (0,0) spine within config range.
-            const float Angle = Rng.FRandRange(0.0f, 2.0f * PI);
-            const float Distance = Rng.FRandRange(DistLo, DistHi);
+            const float Angle = PassageRandom01(PassageSaltAngle) * (2.0f * PI);
+            const float Distance = PassageRandomRange(DistLo, DistHi, PassageSaltDistance);
             const float PX = FMath::Cos(Angle) * Distance;
             const float PY = FMath::Sin(Angle) * Distance;
 
             // LENGTH: reach into each strate, capped to the interior.
-            const float UpperReach = FMath::Min(Rng.FRandRange(Cfg.ReachMin, Cfg.ReachMax), UpperMax);
-            const float LowerReach = FMath::Min(Rng.FRandRange(Cfg.ReachMin, Cfg.ReachMax), LowerMax);
+            const float UpperReach = FMath::Min(
+                PassageRandomRange(Cfg.ReachMin, Cfg.ReachMax, PassageSaltUpperReach), UpperMax);
+            const float LowerReach = FMath::Min(
+                PassageRandomRange(Cfg.ReachMin, Cfg.ReachMax, PassageSaltLowerReach), LowerMax);
             const float TopZ = UpperBottomZ + UpperReach;
             const float BottomZ = LowerTopZ - LowerReach;
 
@@ -295,13 +335,13 @@ void UVoxelStrateManager::GeneratePassages()
             auto RadiusAt = [&](float t) { return FMath::Lerp(Cfg.MouthRadius, Cfg.MidRadius, FMath::Sin(t * PI)); };
 
             // Per-passage shape seeds.
-            const float WormFreq = Rng.FRandRange(0.8f, 1.8f);   // (vertical wobble only)
-            const float NSeedX = Rng.FRandRange(0.0f, 500.0f);
-            const float NSeedY = Rng.FRandRange(0.0f, 500.0f);
-            const float NSeedZ = Rng.FRandRange(0.0f, 500.0f);
-            const float PhaseA = Rng.FRandRange(0.0f, 2.0f * PI);
+            const float WormFreq = PassageRandomRange(0.8f, 1.8f, PassageSaltWormFreq);   // (vertical wobble only)
+            const float NSeedX = PassageRandomRange(0.0f, 500.0f, PassageSaltNoiseX);
+            const float NSeedY = PassageRandomRange(0.0f, 500.0f, PassageSaltNoiseY);
+            const float NSeedZ = PassageRandomRange(0.0f, 500.0f, PassageSaltNoiseZ);
+            const float PhaseA = PassageRandom01(PassageSaltPhase) * (2.0f * PI);
             // Base fBM frequency for the worm's wander (octaves add finer detail on top).
-            const float BendFreq = Rng.FRandRange(1.5f, 2.5f);
+            const float BendFreq = PassageRandomRange(1.5f, 2.5f, PassageSaltBendFreq);
 
             for (int32 s = 0; s <= Segments; s++)
             {

@@ -285,7 +285,10 @@ with a flat-top envelope → organic squirm (NOT a 1D zigzag, NOT a same-freq 2-
 whose bounds reach this chunk (rebuilt on chunk change / `PassagesVersion` bump) — chunks with no
 passage near return `FLT_MAX` immediately — then **bounding-sphere-culls** each shortlisted passage
 (`FVoxelPassage::BoundCenter/BoundRadiusSq`). Both are perf-critical (§8.10). The (0,0) surface entry
-is a simple straight tube. Global passage settings were removed from `VoxelSettings`.
+is a simple straight tube. Placement, reach, and shape draws for inter-strate passages are keyed by
+`(seed, upper-strate index, connection index, per-value salt)` through `VoxelHash`, so one passage's
+connection count cannot shift any later passage. Global passage settings were removed from
+`VoxelSettings`.
 
 ### 8.9 Carving — brush shapes + editor controls
 `FVoxelModification` has `EVoxelBrushShape {Sphere,Box,Capsule}` + `BoxExtent`/`CapsuleEnd`/

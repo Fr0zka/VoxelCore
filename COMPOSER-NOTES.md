@@ -345,11 +345,12 @@ needs a guard, or the caves vanish with no error.
 
 ### ⚠️ 6.4 The primordial law has a real hole TODAY
 
-`UVoxelStrateManager::GeneratePassages` places every inter-strate passage as: `FRandomStream(CachedSeed
-^ 0x50A55A6E)` → random angle around the (0,0) spine → random distance in the config range → random
-reach into each strate. **Nothing consults the destination strate's cave layout.** Carving is a
-structural-post invariant so the tube *is* air — but whether its lower mouth joins the lower strate's
-connected space is pure luck. **A player can descend a passage and arrive in a sealed pocket.**
+`UVoxelStrateManager::GeneratePassages` places every inter-strate passage as independently salted
+hashes of `(seed, upper-strate index, connection index)` → random angle around the (0,0) spine →
+random distance in the config range → random reach into each strate. **Nothing consults the
+destination strate's cave layout.** Carving is a structural-post invariant so the tube *is* air — but
+whether its lower mouth joins the lower strate's connected space is pure luck. **A player can descend
+a passage and arrive in a sealed pocket.**
 
 **Fix — make the strate OFFER a landing site, don't let the passage gamble.** Add to the field-source
 contract something like `SuggestOpenPoint(WorldX, WorldY) -> optional Z`. Every source already knows
@@ -372,16 +373,18 @@ you see the hole); and ⭐ **make the mouth a PLACE, not a hole** — the `Sugge
 lands the passage in a room, so make that room distinctive. Cracks in walls are forgettable; rooms are
 landmarks, and that is what makes it findable on the *second* visit, which quests need.
 
-### ⚠️ 6.6 The layout depends on the pool's CONTENTS *and its ORDER*
+### ✅ 6.6 The layout depends on the pool's CONTENTS, not its ORDER (BUILT + TESTS GREEN)
 
-`Initialize` Fisher-Yates shuffles `Settings->StratePool` with `FRandomStream(WorldSeed)`, then cycles it
-(`PoolCursor % Num`) when `TotalStrates` exceeds the pool. So **reordering the pool asset in the editor
-changes every world**, and a pool smaller than the strate count repeats entries in a fixed order.
+Before Tier 0, `Initialize` Fisher-Yates shuffled `Settings->StratePool` in editor order with
+`FRandomStream(WorldSeed)`, then cycled it (`PoolCursor % Num`) when `TotalStrates` exceeded the pool.
+So **reordering the pool asset in the editor changed every world**, and a pool smaller than the strate
+count repeated entries in a fixed order.
 
-⇒ Use `hash(seed, slotIndex[, attempt])` instead, over a pool sorted by a stable key. The pool becomes a
-**set** rather than a sequence: tidying the asset stops changing worlds, and each slot's roll becomes
-independent of its neighbours'. Adding or removing a strate type still changes worlds — unavoidable, and
-the reason content lands at wipes.
+⇒ **Tier 0 is now implemented:** load the pool, sort it by the stable soft-asset path, then keep the
+existing Fisher-Yates shuffle and cycling algorithm. The pool is a **set** rather than an editor-ordered
+sequence: tidying the asset stops changing worlds. Adding or removing a strate type still changes
+worlds — unavoidable, and the reason content lands at wipes. A per-slot hash would be a different
+sampling algorithm and is intentionally deferred.
 
 ### ⚠️ 6.7 A bounded world needs an XY EDGE SEAL, which does not exist
 
@@ -455,7 +458,7 @@ refactor, where three weeks of correct work produced a world unchanged by a sing
 ### Tier 0 — safety nets, true regardless of the composer
 - ✅ **X-macro guard test** — DONE, green.
 - ✅ **Actor-space sweep** — DONE, confirmed off-origin.
-- **Order-independent placement** (§6.6). *Standalone value:* the strate pool asset can be reordered or
+- ✅ **Order-independent placement** (§6.6) — DONE. Built clean, `VoxelForge.Determinism.LayoutOrderIndependence` green. *Standalone value:* the strate pool asset can be reordered or
   tidied without changing every world. Small and isolated.
 
 ### Tier 1 — the primordial law (a BUG FIX, not composer work)
@@ -525,3 +528,36 @@ Game-design questions live in **[GDD.md](GDD.md) §16**. These are the ones that
 5. **Whether op discovery** (promoting good sub-stacks into named reusable units) is ever worth it.
    Parked: the existing parameter space is already vastly larger than a hundred seasons could explore.
    **The scarce resource is judgment, not vocabulary.**
+
+---
+
+## 10. Verification log
+
+**2026-08-17 — full suite run headless, first time this session.** Built `VoxelMEditor Win64
+Development` clean (no errors, no warnings), then:
+
+```
+UnrealEditor-Cmd.exe VoxelM.uproject -ExecCmds="Automation RunTests VoxelForge;Quit"
+                     -unattended -nopause -nosplash -NullRHI -ReportExportPath=...
+```
+
+**Result: 16 succeeded, 0 failed, 0 not run, 0 succeeded-with-warnings.** 25.7 s.
+
+Tests: BoxVerdictFold · ClassifyTileSoundness (×2) · CrossPlatformDigest · DensityPurity ·
+DiffLayerContention · FloatingIslandEquivalence · LargeSeedSurvives · **LayoutOrderIndependence** ·
+LiveEditInvalidation · MazeEquivalence · SlabEquivalence · **StrateParamBlendCoverage** ·
+SurfaceHeightEquivalence · TunnelNetworkSpineEquivalence · VerticalShaftEquivalence.
+
+**⭐ This closes the pending-verification thread opened by `OPSTACK-HANDOFF.md`.** That file flagged
+commits `4d33321` (Sol's boundary fold) and `91585ea` as *built but NOT re-verified*, with two
+acceptance conditions. Both now met:
+- **`violations` = 0** everywhere. Measured: TunnelNetwork at production defaults **12 of 40 tiles
+  proved AllSolid, 15 972 voxels brute-forced, 0 violations**; VerticalShafts **32 of 60 proved, 0
+  violations**; dense fixture 0 proved / 40 Mixed, 0 violations.
+- **All equivalence tests green** — Maze, Slab, TunnelNetworkSpine, VerticalShaft, FloatingIsland,
+  SurfaceHeight.
+
+⇒ **No revert of `4d33321` is needed.** The 39 % tile-skip win stands, verified rather than assumed.
+
+⚠️ **Read the PROVED counts as measurements, never as contracts.** What is asserted is that none of
+them is *wrong* — a false verdict leaves no geometry and no collision behind it.
