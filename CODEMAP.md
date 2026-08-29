@@ -319,10 +319,14 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
   | `EvaluateSDF` | 738 | Convenience wrapper (builds temp cache) for one-off queries. |
 
 `MakeStrateSeed` (h:~477) is the shared pure world-seed/strate-index salt used by both
-`BuildChunkCache` and destination landing queries. `VF_SuggestOpenPointZ` (h:~550, implemented in
-`VoxelCaveMorphology.cpp`) is the pure landing-site query: nearest hash room centre for
-TunnelNetwork/Underwater, slab void midpoint for FlatPlain/CrystalChamber, and `false` for the other
-archetypes. It never touches a generator, operator stack, manager, cache, or mutable state.
+`BuildChunkCache` and the TunnelNetwork/Underwater destination landing queries.
+`VF_SuggestLandingPoint` (h:~550, implemented in `VoxelCaveMorphology.cpp`) is the pure landing-site
+query: nearest hash-room height at the requested XY for TunnelNetwork/Underwater, slab void midpoint
+for FlatPlain/CrystalChamber, and bounded lateral searches for a horizontal lattice corridor (one
+Maze cell), lower-seal/ledge-safe shaft (one ShaftSpacing), or validated blob top (one IslandSpacing).
+It returns `false` when those feature-bearing conditions cannot be proven inside the supplied budget;
+SurfaceWorld remains refused because its production height can depend on manager-owned biome/per-column
+context. It never touches a generator, operator stack, manager, cache, or mutable state.
 
   Performance note (h:209-220): caching rooms/tunnels once per chunk instead of per
   voxel is the single biggest CPU win.
@@ -360,7 +364,7 @@ Maps depth→strate at runtime; owns passages.
 | Method | .cpp line | Role |
 |--------|-----------|------|
 | `Initialize` | 10 | Builds the stacked layout from settings+seed (fixed slots + pool sorted by soft-asset path, then unchanged Fisher-Yates shuffle), logs every **cave** slot whose operator-stack opt-in is disabled, then `GeneratePassages`. SurfaceWorld is deliberately excluded from that diagnostic because its exact-lattice T1.d path does not depend on the flag. |
-| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. After XY placement, the destination's pure `VF_SuggestOpenPointZ` targets the lower mouth and the result is clamped outside the destination seal bands; unsupported answers warn and preserve the old random reach. |
+| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. After XY placement, the destination's pure `VF_SuggestLandingPoint` may move the lower mouth within an archetype-specific lattice budget, then the result is clamped outside the destination seal bands and interpolated through the control points; unsupported/no-footing answers warn and preserve the old random reach. |
 | `EvaluateModifierSDF` | 357 | SDF of passages at a point (for carving). Per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`. §8.10. |
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
 | `FindSlotIndexForChunkZ` | 427 | Z → layout index. |

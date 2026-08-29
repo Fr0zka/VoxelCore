@@ -279,6 +279,50 @@ void UVoxelStrateManager::GeneratePassages()
         return FString::Printf(TEXT("Value_%d"), static_cast<int32>(Archetype));
     };
 
+    const auto MaxLateralSnapFor = [](const UVoxelStrateDefinition& Definition) -> float
+    {
+        switch (Definition.GeneratorType)
+        {
+        case ECaveGeneratorType::Maze:
+            // One maze lattice cell is the largest deliberate correction. It keeps a shortcut
+            // within the same local maze neighborhood and protects its configured spine-distance
+            // distribution from silently becoming a long-range teleport.
+            return FMath::Max(Definition.MazeParams.CellSize, 1.0f);
+
+        case ECaveGeneratorType::VerticalShafts:
+            // One shaft grid spacing is the natural nearest-site budget. A sparser layout may
+            // legitimately decline instead of pulling the passage away from the spine.
+            return FMath::Max(Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
+
+        case ECaveGeneratorType::FloatingIslands:
+            // One island grid spacing protects the intentional radial placement while still
+            // allowing a passage to reach a neighboring blob rather than an arbitrary far island.
+            return FMath::Max(Definition.FloatingIslandParams.IslandSpacing, 1.0f);
+
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            // Une salle est une CIBLE ÉPARSE en XY, exactement comme un couloir de labyrinthe : le
+            // budget doit donc être réel. Zéro ici était un bug — la requête trouvait la salle la
+            // plus proche puis atterrissait à côté d'elle dans 92,8 % des cas (balayage d'un million
+            // de seeds). Un espacement de salles est le voisinage local naturel.
+            //
+            // A room is an XY-SPARSE target, exactly like a maze corridor, so the budget must be
+            // real. Zero here was the bug: the query found the nearest room and then landed beside
+            // it 92.8% of the time (million-seed sweep). One room spacing is the natural local
+            // neighbourhood, and it protects the configured spine-distance distribution.
+            return FMath::Max(Definition.GenerationParams.RoomSpacing, 1.0f);
+
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+        default:
+            // Les slabs sont une bande de vide CONTINUE en XY : le XY demandé est déjà à
+            // l'intérieur, donc aucun déplacement latéral n'est nécessaire. Zéro est correct ici.
+            // A slab's void band is XY-CONTINUOUS, so the requested XY is already inside it and no
+            // lateral movement is needed. Zero is correct here, unlike for rooms.
+            return 0.0f;
+        }
+    };
+
     //=========================================================================
     // INTER-STRATE PASSAGES: tunnels connecting consecutive strates.
     // Each passage is randomly assigned one of 5 types, which determines
@@ -332,11 +376,11 @@ void UVoxelStrateManager::GeneratePassages()
 
             ++TotalPassages;
 
-            // Ask the destination archetype for a source-level open Z at this XY. This is pure
-            // and safe during Initialize: it does not construct an operator stack or call back
-            // into the manager. Cave room graphs use the same strate seed as BuildChunkCache;
-            // slab fields use the world seed consumed by GetSlabDensity.
-            float SuggestedLowerZ = 0.0f;
+            // Ask the destination archetype for a source-level landing point. This is pure and
+            // safe during Initialize: it does not construct an operator stack or call back into
+            // the manager. Cave room graphs use the strate seed from MakeStrateSeed; slab, maze,
+            // shaft, and island fields use the world seed consumed by their source.
+            FVector SuggestedLowerPoint = FVector::ZeroVector;
             bool bAimedAtOpenPoint = false;
             const UVoxelStrateDefinition* LowerDef = Lower.Definition;
             if (LowerDef)
@@ -349,16 +393,21 @@ void UVoxelStrateManager::GeneratePassages()
                         static_cast<uint32>(CachedSeed), Lower.StrateIndex))
                     : CachedSeed;
 
-                bAimedAtOpenPoint = VF_SuggestOpenPointZ(
+                const float MaxLateralSnap = MaxLateralSnapFor(*LowerDef);
+                bAimedAtOpenPoint = VF_SuggestLandingPoint(
                     LowerDef->GeneratorType,
                     LowerDef->GenerationParams,
                     LowerDef->SlabParams,
+                    LowerDef->MazeParams,
+                    LowerDef->VerticalShaftParams,
+                    LowerDef->FloatingIslandParams,
                     LowerQuerySeed,
                     LowerTopZ,
                     (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
                     PX,
                     PY,
-                    SuggestedLowerZ);
+                    MaxLateralSnap,
+                    SuggestedLowerPoint);
 
                 if (bAimedAtOpenPoint)
                 {
@@ -377,6 +426,9 @@ void UVoxelStrateManager::GeneratePassages()
                 PassageRandomRange(Cfg.ReachMin, Cfg.ReachMax, PassageSaltLowerReach), LowerMax);
             const float TopZ = UpperBottomZ + UpperReach;
             float BottomZ = LowerTopZ - LowerReach;
+            float LowerX = PX;
+            float LowerY = PY;
+            Passage.RequestedLowerPoint = FVector(PX, PY, BottomZ);
 
             if (bAimedAtOpenPoint)
             {
@@ -393,6 +445,18 @@ void UVoxelStrateManager::GeneratePassages()
                     LowerSealThickness = LowerDef->SlabParams.BoundarySealThickness;
                     break;
 
+                case ECaveGeneratorType::Maze:
+                    LowerSealThickness = LowerDef->MazeParams.BoundarySealThickness;
+                    break;
+
+                case ECaveGeneratorType::VerticalShafts:
+                    LowerSealThickness = LowerDef->VerticalShaftParams.BoundarySealThickness;
+                    break;
+
+                case ECaveGeneratorType::FloatingIslands:
+                    LowerSealThickness = LowerDef->FloatingIslandParams.BoundarySealThickness;
+                    break;
+
                 default:
                     break;
                 }
@@ -400,18 +464,22 @@ void UVoxelStrateManager::GeneratePassages()
                 const float LowerBottomZ = (float)(Lower.BottomChunkZ) * CHUNK_SIZE;
                 const float InnerBottomZ = LowerBottomZ + LowerSealThickness;
                 const float InnerTopZ = LowerTopZ - LowerSealThickness;
-                if (FMath::IsFinite(SuggestedLowerZ)
+                if (FMath::IsFinite(SuggestedLowerPoint.X)
+                    && FMath::IsFinite(SuggestedLowerPoint.Y)
+                    && FMath::IsFinite(SuggestedLowerPoint.Z)
                     && FMath::IsFinite(InnerBottomZ)
                     && FMath::IsFinite(InnerTopZ)
                     && InnerBottomZ < InnerTopZ)
                 {
-                    // VF_SuggestOpenPointZ already guarantees a strict interior answer. Keep a
+                    // VF_SuggestLandingPoint already guarantees a strict interior answer. Keep a
                     // tiny margin in the final clamp so a future source query cannot land on a
                     // seal boundary through rounding.
+                    LowerX = SuggestedLowerPoint.X;
+                    LowerY = SuggestedLowerPoint.Y;
                     const float StrictMargin = FMath::Min(
                         KINDA_SMALL_NUMBER, (InnerTopZ - InnerBottomZ) * 0.25f);
                     BottomZ = FMath::Clamp(
-                        SuggestedLowerZ,
+                        SuggestedLowerPoint.Z,
                         InnerBottomZ + StrictMargin,
                         InnerTopZ - StrictMargin);
                 }
@@ -445,7 +513,9 @@ void UVoxelStrateManager::GeneratePassages()
                 switch (Cfg.Style)
                 {
                 case EVoxelPassageStyle::Straight:
-                    break;  // pure vertical
+                    // No authored lateral offset. A snapped lower mouth can still make this
+                    // segment slanted, so the endpoint interpolation below remains intentional.
+                    break;
 
                 case EVoxelPassageStyle::Spiral:
                 {
@@ -488,15 +558,39 @@ void UVoxelStrateManager::GeneratePassages()
                     Z += NZ * VOXEL_NOISE_SCALE * Cfg.VerticalWobble * Env;
                 }
 
-                Passage.ControlPoints.Add(FVector(PX + OX, PY + OY, Z));
+                const float BaseX = FMath::Lerp(PX, LowerX, T);
+                const float BaseY = FMath::Lerp(PY, LowerY, T);
+                FVector ControlPoint(BaseX + OX, BaseY + OY, Z);
+                // The style envelope is mathematically zero at a mouth, but evaluating sin(PI)
+                // leaves a tiny float residue. Pin both endpoints so the full query result is the
+                // actual lower mouth, including a lateral snap, and never merely an approximation.
+                if (s == 0)
+                {
+                    ControlPoint = FVector(PX, PY, TopZ);
+                }
+                else if (s == Segments)
+                {
+                    ControlPoint = FVector(LowerX, LowerY, BottomZ);
+                }
+                Passage.ControlPoints.Add(ControlPoint);
                 Passage.ControlRadii.Add(RadiusAt(T));
             }
 
             Passage.UpperPoint = Passage.ControlPoints[0];
             Passage.LowerPoint = Passage.ControlPoints.Last();
-            Passage.Radius = FMath::Max(Cfg.MouthRadius, Cfg.MidRadius);  // fallback / bounds
+            Passage.Radius = 0.0f;
+            for (const float ControlRadius : Passage.ControlRadii)
+            {
+                Passage.Radius = FMath::Max(Passage.Radius, ControlRadius);
+            }
+            // Fallback / bounds if an invalid authored width produced no positive profile.
+            Passage.Radius = FMath::Max(Passage.Radius, FMath::Max(Cfg.MouthRadius, Cfg.MidRadius));
 
-            // Bounding sphere over all control points (+ widest radius + blend) for culling.
+            // Bounding sphere over all control points (+ widest radius + blend) for culling. This
+            // remains conservative when the lower mouth snaps laterally: every slanted segment is
+            // between two control points, and a segment lies inside the sphere containing both
+            // endpoints. Under-sizing this sphere would make EvaluateModifierSDF cull a real
+            // passage and leave a sealed pocket.
             {
                 FVector Center = FVector::ZeroVector;
                 for (const FVector& CP : Passage.ControlPoints) Center += CP;

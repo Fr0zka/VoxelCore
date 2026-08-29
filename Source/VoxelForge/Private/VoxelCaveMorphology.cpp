@@ -91,20 +91,23 @@ static void BakeRoomFeature(
 namespace
 {
     // Find the nearest hash room's vertical centre without constructing a cache. The search is
-    // deliberately bounded: an empty neighbourhood is an honest "no answer", not a guessed Z.
+    // deliberately bounded: an empty neighbourhood is an honest "no answer", not a guessed point.
+    // Rooms are dense enough that the requested XY remains the landing XY; only Z is selected.
     // Cherche le centre vertical de la salle hachée la plus proche sans construire de cache. La
-    // recherche est bornée : un voisinage vide signifie "pas de réponse", jamais un Z inventé.
-    bool VF_FindNearestHashRoomZ(
+    // recherche est bornée : un voisinage vide signifie "pas de réponse", jamais un point inventé.
+    bool VF_FindNearestHashRoomLandingPoint(
         const FStrateGenerationParams& Params,
         int32 Seed,
         float StrateTopZ,
         float StrateBottomZ,
         float WorldX,
         float WorldY,
-        float& OutZ)
+        float MaxLateralSnap,
+        FVector& OutPoint)
     {
         if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
             || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
@@ -156,6 +159,8 @@ namespace
 
         float BestDistSq = FLT_MAX;
         float BestZ = 0.0f;
+        float BestRoomX = 0.0f;
+        float BestRoomY = 0.0f;
         int32 BestCellX = 0;
         int32 BestCellY = 0;
         bool bFound = false;
@@ -184,6 +189,8 @@ namespace
 
             BestDistSq = DistSq;
             BestZ = RoomZ;
+            BestRoomX = RoomX;
+            BestRoomY = RoomY;
             BestCellX = CellX;
             BestCellY = CellY;
             bFound = true;
@@ -245,25 +252,55 @@ namespace
             return false;
         }
 
-        OutZ = BestZ;
-        return true;
+        // ⭐ Renvoyer le CENTRE de la salle, pas le XY demandé.
+        //
+        // La version précédente renvoyait FVector(WorldX, WorldY, BestZ) : le Z de la salle la plus
+        // proche, au XY de l'APPELANT. Un balayage d'un million de seeds a montré que ce point tombe
+        // HORS de la salle sélectionnée 92,8 % du temps — la requête trouvait une salle puis visait
+        // à côté. Le centre est intérieur PAR CONSTRUCTION, et c'est aussi le point qui garde la
+        // plus grande marge face au warp de production (qui déplace le champ d'environ 1,5 voxel :
+        // décisif au bord d'une salle, négligeable en son centre).
+        //
+        // Return the ROOM CENTRE, not the requested XY. The previous version returned the nearest
+        // room's Z at the CALLER's XY; a million-seed sweep put that point OUTSIDE the selected room
+        // 92.8% of the time — it found a room and then aimed beside it. The centre is inside by
+        // construction and holds the largest margin against the production cave warp (~1.5 voxels of
+        // displacement: decisive at a room's edge, negligible at its centre).
+        //
+        // ⚠️ Le budget est borné volontairement. Les passages sont placés à une distance délibérée
+        // de la spine (0,0) pour qu'un joueur perdu puisse les retrouver ; un snap non borné
+        // dissoudrait cette propriété en silence. Hors budget ⇒ on décline, et l'appelant garde son
+        // ancienne portée aléatoire.
+        // The budget is bounded on purpose: passages sit at a deliberate distance from the (0,0)
+        // spine so a lost player can find them, and an unbounded snap would dissolve that silently.
+        // Over budget => decline, and the caller keeps its old random reach.
+        if (BestDistSq > MaxLateralSnap * MaxLateralSnap)
+        {
+            return false;
+        }
+
+        OutPoint = FVector(BestRoomX, BestRoomY, BestZ);
+        return OutPoint.ContainsNaN() == false && FMath::IsFinite(OutPoint.X)
+            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
     }
 
     // The slab source is an XY height band. Evaluate the same two pure height fields as
     // GetSlabDensity, then choose their midpoint after intersecting the seal-free interior.
     // La source slab est une bande de hauteurs XY : on recalcule les deux champs purs comme
     // GetSlabDensity, puis on prend leur milieu après intersection avec l'intérieur sans seal.
-    bool VF_SuggestSlabOpenPointZ(
+    bool VF_SuggestSlabLandingPoint(
         const FSlabGenerationParams& Params,
         int32 Seed,
         float StrateTopZ,
         float StrateBottomZ,
         float WorldX,
         float WorldY,
-        float& OutZ)
+        float MaxLateralSnap,
+        FVector& OutPoint)
     {
         if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
             || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
@@ -360,37 +397,751 @@ namespace
             }
         }
 
-        OutZ = (OpenBottom + OpenTop) * 0.5f;
-        return FMath::IsFinite(OutZ);
+        // Slab void is a height band at every usable XY. Keep the requested XY exactly as before;
+        // its caller supplies zero lateral snap so this dense source cannot wander from the spine.
+        OutPoint = FVector(WorldX, WorldY, (OpenBottom + OpenTop) * 0.5f);
+        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
+            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+    }
+
+    // Maze corridors are thin 3D lattice edges. Only a horizontal edge is a useful landing
+    // source: a vertical edge can prove air, but cannot prove a place to stand. The edge set and
+    // the Z levels below are the same hash contract as GetMazeDensity, with no cache involved.
+    bool VF_SuggestMazeLandingPoint(
+        const FMazeGenerationParams& Params,
+        int32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float MaxLateralSnap,
+        FVector& OutPoint)
+    {
+        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        if (!FMath::IsFinite(Params.CellSize)
+            || !FMath::IsFinite(Params.CorridorRadius)
+            || !FMath::IsFinite(Params.BranchProbability)
+            || !FMath::IsFinite(Params.Verticality)
+            || !FMath::IsFinite(Params.SurfaceRoughness)
+            || !FMath::IsFinite(Params.BoundarySealThickness)
+            || !FMath::IsFinite(Params.BaseDensity)
+            || Params.CellSize <= 0.0f
+            || Params.CorridorRadius <= 0.0f
+            || Params.BranchProbability <= 0.0f || Params.BranchProbability > 1.0f
+            || Params.Verticality < 0.0f || Params.Verticality > 1.0f
+            || Params.SurfaceRoughness < 0.0f
+            || Params.BoundarySealThickness < 0.0f
+            || Params.BaseDensity <= 0.0f)
+        {
+            return false;
+        }
+
+        const float CellSize = FMath::Max(Params.CellSize, 1.0f);
+        const float Radius = FMath::Max(Params.CorridorRadius, 0.5f);
+        const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE;
+
+        // A strict interior of the tube is needed. At the MC zero surface the source's smooth
+        // carve is only half applied, so stopping at the nominal radius would be an air guess.
+        const float SafeRadius = Radius - RoughnessBound - 0.25f;
+        if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
+        {
+            return false;
+        }
+
+        const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
+        const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
+        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
+            || InnerBottom >= InnerTop)
+        {
+            return false;
+        }
+
+        // A node centre must leave the corridor radius above the lower interior boundary. The
+        // explicit checks in the loop keep ceil/floor edge cases strict after float rounding.
+        const int32 MinNodeZ = FMath::CeilToInt(
+            (InnerBottom + Radius) / CellSize - 0.5f);
+        const int32 MaxNodeZ = FMath::FloorToInt(
+            InnerTop / CellSize - 0.5f);
+        constexpr int32 MaxNodeLevels = 256;
+        if (MaxNodeZ < MinNodeZ || MaxNodeZ - MinNodeZ >= MaxNodeLevels)
+        {
+            return false;
+        }
+
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / CellSize);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / CellSize);
+        const uint32 SeedU = (uint32)Seed ^ 0x4D617A65u;  // 'Maze'
+        const float MaxSnapSq = MaxLateralSnap * MaxLateralSnap;
+
+        float BestDistSq = FLT_MAX;
+        float BestX = 0.0f;
+        float BestY = 0.0f;
+        float BestZ = 0.0f;
+        int32 BestCellX = INT32_MAX;
+        int32 BestCellY = INT32_MAX;
+        int32 BestNodeZ = INT32_MAX;
+        int32 BestAxis = INT32_MAX;
+        bool bFound = false;
+
+        auto ConsiderEdge = [&](int32 CellX, int32 CellY, int32 CellZ,
+                                uint32 AxisSalt, float Threshold, int32 Axis)
+        {
+            // This is the exact lower-node + axis hash used by GetMazeDensity::EdgeOpen.
+            uint32 H = VoxelHash::Cell(CellX, CellY, SeedU ^ AxisSalt);
+            H ^= VoxelHash::Mix((uint32)(CellZ * 73856093) ^ AxisSalt);
+            if (VoxelHash::ToFloat01(VoxelHash::Mix(H)) >= Threshold) return;
+
+            const float NodeX = (CellX + 0.5f) * CellSize;
+            const float NodeY = (CellY + 0.5f) * CellSize;
+            const float NodeZWorld = (CellZ + 0.5f) * CellSize;
+            if (NodeZWorld - Radius <= InnerBottom || NodeZWorld >= InnerTop)
+            {
+                return;
+            }
+
+            float ClosestX = NodeX;
+            float ClosestY = NodeY;
+            if (Axis == 0)
+            {
+                ClosestX = FMath::Clamp(WorldX, NodeX, NodeX + CellSize);
+            }
+            else
+            {
+                ClosestY = FMath::Clamp(WorldY, NodeY, NodeY + CellSize);
+            }
+
+            const float DX = WorldX - ClosestX;
+            const float DY = WorldY - ClosestY;
+            const float DistSq = DX * DX + DY * DY;
+            const bool bCloser = DistSq < BestDistSq;
+            const bool bTie = DistSq == BestDistSq
+                && (CellZ < BestNodeZ
+                    || (CellZ == BestNodeZ
+                        && (CellX < BestCellX
+                            || (CellX == BestCellX
+                                && (CellY < BestCellY
+                                    || (CellY == BestCellY && Axis < BestAxis))))));
+            if (!bCloser && !bTie) return;
+
+            BestDistSq = DistSq;
+            BestX = ClosestX;
+            BestY = ClosestY;
+            BestZ = NodeZWorld;
+            BestCellX = CellX;
+            BestCellY = CellY;
+            BestNodeZ = CellZ;
+            BestAxis = Axis;
+            bFound = true;
+        };
+
+        // A candidate edge can be one cell beyond the requested point when the point is near a
+        // cell boundary. The two-cell guard band covers the segment endpoint and the one-cell
+        // lateral budget without turning this into an unbounded lattice scan.
+        const int32 SearchRadius = FMath::CeilToInt(MaxLateralSnap / CellSize) + 2;
+        for (int32 CellZ = MinNodeZ; CellZ <= MaxNodeZ; ++CellZ)
+        {
+            for (int32 CellY = BaseCellY - SearchRadius; CellY <= BaseCellY + SearchRadius; ++CellY)
+            {
+                for (int32 CellX = BaseCellX - SearchRadius; CellX <= BaseCellX + SearchRadius; ++CellX)
+                {
+                    ConsiderEdge(CellX, CellY, CellZ, 0xA1u,
+                                  Params.BranchProbability, 0);
+                    ConsiderEdge(CellX, CellY, CellZ, 0xB2u,
+                                  Params.BranchProbability, 1);
+                }
+            }
+        }
+
+        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestX)
+            || !FMath::IsFinite(BestY) || !FMath::IsFinite(BestZ))
+        {
+            return false;
+        }
+
+        OutPoint = FVector(BestX, BestY, BestZ);
+        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
+            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+    }
+
+    // VerticalShafts has a guaranteed floor only when its lower boundary seal exists. Select a
+    // point above that seal and outside every ledge band; an infinite shaft by itself is not a
+    // standing point. The 3x3 roll is deliberately the same local source neighbourhood as the
+    // production density function.
+    bool VF_SuggestVerticalShaftLandingPoint(
+        const FVerticalShaftParams& Params,
+        int32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float MaxLateralSnap,
+        FVector& OutPoint)
+    {
+        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        if (!FMath::IsFinite(Params.ShaftSpacing)
+            || !FMath::IsFinite(Params.ShaftDensity)
+            || !FMath::IsFinite(Params.ShaftMinRadius)
+            || !FMath::IsFinite(Params.ShaftMaxRadius)
+            || !FMath::IsFinite(Params.CrossConnectChance)
+            || !FMath::IsFinite(Params.ConnectorRadius)
+            || !FMath::IsFinite(Params.LedgeSpacing)
+            || !FMath::IsFinite(Params.LedgeDepth)
+            || !FMath::IsFinite(Params.SurfaceRoughness)
+            || !FMath::IsFinite(Params.BoundarySealThickness)
+            || !FMath::IsFinite(Params.BaseDensity)
+            || Params.ShaftSpacing <= 0.0f
+            || Params.ShaftDensity <= 0.0f || Params.ShaftDensity > 1.0f
+            || Params.ShaftMinRadius <= 0.0f
+            || Params.ShaftMaxRadius < Params.ShaftMinRadius
+            || Params.CrossConnectChance < 0.0f || Params.CrossConnectChance > 1.0f
+            || Params.ConnectorRadius <= 0.0f
+            || Params.LedgeSpacing < 0.0f || Params.LedgeDepth < 0.0f
+            || Params.SurfaceRoughness < 0.0f
+            || Params.BoundarySealThickness <= 0.0f
+            || Params.BaseDensity <= 0.0f)
+        {
+            return false;
+        }
+
+        const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
+        const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
+        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
+            || InnerBottom >= InnerTop)
+        {
+            return false;
+        }
+
+        const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE;
+        const float ShaftInteriorMargin = RoughnessBound + 0.25f;
+        const float FloorClearance = FMath::Max(1.0f, RoughnessBound + 1.0f);
+
+        // Pick the first interval above the bottom seal that is not occupied by a periodic ledge.
+        // Leaving a full roughness-sized margin makes the result a source-level air claim rather
+        // than a point on the smoothed ledge edge.
+        float LandingFromBottom = FMath::Max(
+            Params.BoundarySealThickness, Params.LedgeDepth) + FloorClearance;
+        if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
+        {
+            const float SafeBand = Params.LedgeDepth + FloorClearance;
+            if (SafeBand * 2.0f >= Params.LedgeSpacing)
+            {
+                return false;
+            }
+
+            const float Period = FMath::FloorToFloat(LandingFromBottom / Params.LedgeSpacing);
+            const float PeriodStart = Period * Params.LedgeSpacing;
+            const float InPeriod = LandingFromBottom - PeriodStart;
+            if (InPeriod < SafeBand)
+            {
+                LandingFromBottom = PeriodStart + SafeBand;
+            }
+            else if (InPeriod > Params.LedgeSpacing - SafeBand)
+            {
+                LandingFromBottom = (Period + 1.0f) * Params.LedgeSpacing + SafeBand;
+            }
+        }
+
+        const float LandingZ = StrateBottomZ + LandingFromBottom;
+        if (!FMath::IsFinite(LandingZ)
+            || LandingZ <= InnerBottom || LandingZ >= InnerTop)
+        {
+            return false;
+        }
+
+        const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / Spacing);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / Spacing);
+        const uint32 SeedU = (uint32)Seed ^ 0x53686674u;  // 'Shft'
+
+        const float MaxSnapSq = MaxLateralSnap * MaxLateralSnap;
+        const int32 SearchRadius = FMath::CeilToInt(
+            (MaxLateralSnap + FMath::Max(Params.ShaftMaxRadius, 1.0f)) / Spacing) + 2;
+
+        float BestDistSq = FLT_MAX;
+        float BestX = 0.0f;
+        float BestY = 0.0f;
+        bool bFound = false;
+        int32 BestCellX = INT32_MAX;
+        int32 BestCellY = INT32_MAX;
+        for (int32 DY = -SearchRadius; DY <= SearchRadius; ++DY)
+        {
+            for (int32 DX = -SearchRadius; DX <= SearchRadius; ++DX)
+            {
+                const int32 CellX = BaseCellX + DX;
+                const int32 CellY = BaseCellY + DY;
+                const uint32 H = VoxelHash::Cell(CellX, CellY, SeedU);
+                if (VoxelHash::ToFloat01(H) > Params.ShaftDensity) continue;
+
+                const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
+                const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
+                const float ShaftX = (CellX + 0.15f + JX * 0.7f) * Spacing;
+                const float ShaftY = (CellY + 0.15f + JY * 0.7f) * Spacing;
+                const float Radius = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
+                    VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+                const float SafeRadius = Radius - ShaftInteriorMargin;
+                if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
+                {
+                    continue;
+                }
+
+                const float DXWorld = WorldX - ShaftX;
+                const float DYWorld = WorldY - ShaftY;
+                const float Distance = FMath::Sqrt(DXWorld * DXWorld + DYWorld * DYWorld);
+                const float SnapDistance = FMath::Max(Distance - SafeRadius, 0.0f);
+                const float DistSq = SnapDistance * SnapDistance;
+                const bool bCloser = DistSq < BestDistSq;
+                const bool bTie = DistSq == BestDistSq
+                    && (CellX < BestCellX || (CellX == BestCellX && CellY < BestCellY));
+                if (!bCloser && !bTie)
+                {
+                    continue;
+                }
+
+                if (Distance <= SafeRadius || Distance <= KINDA_SMALL_NUMBER)
+                {
+                    BestX = WorldX;
+                    BestY = WorldY;
+                }
+                else
+                {
+                    const float Scale = SafeRadius / Distance;
+                    BestX = ShaftX + DXWorld * Scale;
+                    BestY = ShaftY + DYWorld * Scale;
+                }
+                BestDistSq = DistSq;
+                BestCellX = CellX;
+                BestCellY = CellY;
+                bFound = true;
+            }
+        }
+
+        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestX)
+            || !FMath::IsFinite(BestY))
+        {
+            return false;
+        }
+
+        OutPoint = FVector(BestX, BestY, LandingZ);
+        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
+            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+    }
+
+    struct FVFIslandSite
+    {
+        int32 CellX, CellY;
+        float X, Y, Rxy, TopHalf, TopZ, BotZ, TaperEnd;
+    };
+
+    // Evaluate only the island source, in the same internal-density convention as
+    // GetFloatingIslandDensity (positive = solid, negative = void). This is intentionally a
+    // local pure evaluator: it lets the query bracket the actual blob top instead of treating a
+    // nominal island centre as footing. Full-octave noise is used because this query has no LOD
+    // state by design and GeneratePassages runs before a tile's LOD is selected.
+    float VF_EvaluateIslandInteriorDensity(
+        const FFloatingIslandParams& Params,
+        uint32 Seed,
+        const FVFIslandSite* Islands,
+        int32 NumIslands,
+        float WorldX,
+        float WorldY,
+        float WorldZ)
+    {
+        const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
+        const FVector WarpXPosition(
+            WorldX * 0.04f + VoxelHash::SeedOffset(Seed, 0.0007f),
+            WorldY * 0.04f,
+            WorldZ * 0.012f);
+        const FVector WarpYPosition(
+            WorldX * 0.04f + 31.0f,
+            WorldY * 0.04f + 7.0f,
+            WorldZ * 0.012f);
+        const float WX = WorldX + VoxelNoise::FBM(
+            (float)WarpXPosition.X, (float)WarpXPosition.Y, (float)WarpXPosition.Z, 3)
+            * VOXEL_NOISE_SCALE * WarpAmp;
+        const float WY = WorldY + VoxelNoise::FBM(
+            (float)WarpYPosition.X, (float)WarpYPosition.Y, (float)WarpYPosition.Z, 3)
+            * VOXEL_NOISE_SCALE * WarpAmp;
+
+        const float BlendK = FMath::Max(Params.SDFBlendRadius, 0.01f);
+        const float Spacing = FMath::Max(Params.IslandSpacing, 1.0f);
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / Spacing);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / Spacing);
+        float IslandSDF = FLT_MAX;
+        for (int32 IslandIndex = 0; IslandIndex < NumIslands; ++IslandIndex)
+        {
+            const FVFIslandSite& Island = Islands[IslandIndex];
+            // Production GetFloatingIslandDensity evaluates exactly this 3x3 cell neighbourhood
+            // for the queried XY. The outer search may collect more candidates so a lateral snap
+            // can be found, but those distant blobs must not influence the returned footing.
+            if (FMath::Abs(Island.CellX - BaseCellX) > 1
+                || FMath::Abs(Island.CellY - BaseCellY) > 1)
+            {
+                continue;
+            }
+            const float DX = WX - Island.X;
+            const float DY = WY - Island.Y;
+            const float DistXY = FMath::Sqrt(DX * DX + DY * DY);
+            const float Height = FMath::Clamp(
+                (WorldZ - Island.BotZ) / FMath::Max(Island.TopZ - Island.BotZ, 1.0f),
+                0.0f, 1.0f);
+            const float Taper = SmoothStep01(FMath::Clamp(
+                Height / Island.TaperEnd, 0.0f, 1.0f));
+            const float Envelope = Island.Rxy * Taper;
+
+            float TopSurface = Island.TopZ;
+            if (Params.TopFlatten < 1.0f)
+            {
+                const float Edge = FMath::Clamp(
+                    DistXY / FMath::Max(Island.Rxy, 1.0f), 0.0f, 1.0f);
+                TopSurface = Island.TopZ
+                    - (1.0f - Params.TopFlatten) * Island.TopHalf * 2.0f * Edge * Edge;
+            }
+
+            const float SDF = FMath::Max(DistXY - Envelope, WorldZ - TopSurface);
+            IslandSDF = VoxelSDF::SmoothMin(IslandSDF, SDF, BlendK);
+        }
+
+        if (Params.SurfaceRoughness > 0.0f
+            && IslandSDF < Params.SurfaceRoughness + BlendK + 2.0f)
+        {
+            const FVector RoughnessPosition(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f);
+            IslandSDF += VoxelNoise::FBM(
+                (float)RoughnessPosition.X, (float)RoughnessPosition.Y,
+                (float)RoughnessPosition.Z, 4)
+                * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
+        }
+
+        float Density = -Params.BaseDensity;
+        if (IslandSDF < BlendK)
+        {
+            float Fill = FMath::Clamp(
+                (BlendK - IslandSDF) / (BlendK * 2.0f), 0.0f, 1.0f);
+            Fill = SmoothStep01(Fill);
+            Density += Fill * Params.BaseDensity * 2.0f;
+        }
+        return Density;
+    }
+
+    bool VF_SuggestFloatingIslandLandingPoint(
+        const FFloatingIslandParams& Params,
+        int32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float MaxLateralSnap,
+        FVector& OutPoint)
+    {
+        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        if (!FMath::IsFinite(Params.IslandSpacing)
+            || !FMath::IsFinite(Params.IslandDensity)
+            || !FMath::IsFinite(Params.IslandMinRadius)
+            || !FMath::IsFinite(Params.IslandMaxRadius)
+            || !FMath::IsFinite(Params.ThicknessRatio)
+            || !FMath::IsFinite(Params.VerticalJitter)
+            || !FMath::IsFinite(Params.TopFlatten)
+            || !FMath::IsFinite(Params.SurfaceRoughness)
+            || !FMath::IsFinite(Params.SDFBlendRadius)
+            || !FMath::IsFinite(Params.BoundarySealThickness)
+            || !FMath::IsFinite(Params.BaseDensity)
+            || Params.IslandSpacing <= 0.0f
+            || Params.IslandDensity <= 0.0f || Params.IslandDensity > 1.0f
+            || Params.IslandMinRadius <= 0.0f
+            || Params.IslandMaxRadius < Params.IslandMinRadius
+            || Params.ThicknessRatio < 0.0f
+            || Params.VerticalJitter < 0.0f
+            || Params.SurfaceRoughness < 0.0f
+            || Params.BoundarySealThickness < 0.0f
+            || Params.BaseDensity <= 0.0f)
+        {
+            return false;
+        }
+
+        const float H = StrateTopZ - StrateBottomZ;
+        const float Spacing = FMath::Max(Params.IslandSpacing, 1.0f);
+        const uint32 SeedU = (uint32)Seed ^ 0x49736C64u;  // 'Isld'
+        const float MidZ = (StrateTopZ + StrateBottomZ) * 0.5f;
+
+        const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
+        const float WarpBound = WarpAmp * VOXEL_NOISE_SCALE;
+        const float MaxIslandRadius = FMath::Max(Params.IslandMaxRadius, 1.0f);
+        const float SearchReach = MaxLateralSnap + MaxIslandRadius + WarpBound + 2.0f;
+        const int32 SearchRadius = FMath::CeilToInt(SearchReach / Spacing) + 2;
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / Spacing);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / Spacing);
+
+        TArray<FVFIslandSite, TInlineAllocator<64>> Islands;
+        Islands.Reserve((2 * SearchRadius + 1) * (2 * SearchRadius + 1));
+        float MinBotZ = FLT_MAX;
+        float MaxTopZ = -FLT_MAX;
+        for (int32 DY = -SearchRadius; DY <= SearchRadius; ++DY)
+        {
+            for (int32 DX = -SearchRadius; DX <= SearchRadius; ++DX)
+            {
+                const int32 CellX = BaseCellX + DX;
+                const int32 CellY = BaseCellY + DY;
+                const uint32 Hh = VoxelHash::Cell(CellX, CellY, SeedU);
+                if (VoxelHash::ToFloat01(Hh) > Params.IslandDensity) continue;
+
+                FVFIslandSite& Island = Islands.AddDefaulted_GetRef();
+                Island.CellX = CellX;
+                Island.CellY = CellY;
+                const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
+                const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
+                Island.X = (CellX + 0.15f + JX * 0.7f) * Spacing;
+                Island.Y = (CellY + 0.15f + JY * 0.7f) * Spacing;
+                Island.Rxy = FMath::Lerp(Params.IslandMinRadius, Params.IslandMaxRadius,
+                    VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x5A5Au)));
+                Island.TopHalf = Island.Rxy * 0.20f;
+                const float UnderDepth = Island.Rxy * FMath::Max(Params.ThicknessRatio, 0.25f);
+                const float SpreadZ = FMath::Max(
+                    H * 0.5f - FMath::Max(Island.TopHalf, UnderDepth)
+                    - Params.BoundarySealThickness, 0.0f) * Params.VerticalJitter;
+                const float CenterZ = MidZ
+                    + VoxelHash::ToFloatSigned(VoxelHash::Mix(Hh ^ 0xB17Du)) * SpreadZ;
+                Island.TopZ = CenterZ + Island.TopHalf;
+                Island.BotZ = CenterZ - UnderDepth;
+                Island.TaperEnd = FMath::Lerp(0.45f, 0.7f,
+                    VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x7A1Eu)));
+
+                MinBotZ = FMath::Min(MinBotZ, Island.BotZ);
+                MaxTopZ = FMath::Max(MaxTopZ, Island.TopZ);
+            }
+        }
+
+        if (Islands.Num() == 0 || !FMath::IsFinite(MinBotZ) || !FMath::IsFinite(MaxTopZ))
+        {
+            return false;
+        }
+
+        const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE;
+        const float BlendK = FMath::Max(Params.SDFBlendRadius, 0.01f);
+        const float SearchPad = RoughnessBound + BlendK + 3.0f;
+        const float SearchTop = MaxTopZ + SearchPad;
+        const float SearchBottom = MinBotZ - SearchPad;
+        constexpr float ScanStep = 0.5f;
+        constexpr int32 MaxVerticalSamples = 2048;
+        if (!FMath::IsFinite(SearchTop) || !FMath::IsFinite(SearchBottom)
+            || SearchTop <= SearchBottom
+            || (SearchTop - SearchBottom) / ScanStep > (float)MaxVerticalSamples)
+        {
+            return false;
+        }
+
+        const float MaxSnapSq = MaxLateralSnap * MaxLateralSnap;
+        float BestDistSq = FLT_MAX;
+        FVector BestPoint = FVector::ZeroVector;
+        int32 BestIslandIndex = INDEX_NONE;
+
+        auto FindLandingZ = [&](float CandidateX, float CandidateY, float& OutLandingZ) -> bool
+        {
+            float UpperZ = SearchTop;
+            float UpperDensity = VF_EvaluateIslandInteriorDensity(
+                Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, UpperZ);
+            if (!FMath::IsFinite(UpperDensity) || UpperDensity > 0.0f)
+            {
+                return false;
+            }
+
+            for (int32 Sample = 0; Sample < MaxVerticalSamples && UpperZ > SearchBottom; ++Sample)
+            {
+                const float LowerZ = FMath::Max(SearchBottom, UpperZ - ScanStep);
+                const float LowerDensity = VF_EvaluateIslandInteriorDensity(
+                    Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, LowerZ);
+                if (!FMath::IsFinite(LowerDensity)) return false;
+
+                // Descending from guaranteed air, the first solid bracket is the highest actual
+                // blob top at this XY. That is the footing surface; no island-centre guess is
+                // involved.
+                if (UpperDensity <= 0.0f && LowerDensity > 0.0f)
+                {
+                    float SolidZ = LowerZ;
+                    float AirZ = UpperZ;
+                    for (int32 Iteration = 0; Iteration < 12; ++Iteration)
+                    {
+                        const float Mid = (SolidZ + AirZ) * 0.5f;
+                        const float MidDensity = VF_EvaluateIslandInteriorDensity(
+                            Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, Mid);
+                        if (!FMath::IsFinite(MidDensity)) return false;
+                        if (MidDensity > 0.0f) SolidZ = Mid;
+                        else                   AirZ = Mid;
+                    }
+
+                    const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
+                    const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
+                    const float LandingZ = AirZ + 0.5f;
+                    if (!FMath::IsFinite(LandingZ)
+                        || LandingZ <= InnerBottom || LandingZ >= InnerTop
+                        || VF_EvaluateIslandInteriorDensity(
+                            Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, LandingZ) > 0.0f
+                        || VF_EvaluateIslandInteriorDensity(
+                            Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, SolidZ) <= 0.0f
+                        || VF_EvaluateIslandInteriorDensity(
+                            Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, LandingZ - 1.0f) <= 0.0f)
+                    {
+                        return false;
+                    }
+
+                    OutLandingZ = LandingZ;
+                    return FMath::IsFinite(OutLandingZ);
+                }
+
+                UpperZ = LowerZ;
+                UpperDensity = LowerDensity;
+            }
+
+            return false;
+        };
+
+        for (int32 IslandIndex = 0; IslandIndex < Islands.Num(); ++IslandIndex)
+        {
+            const FVFIslandSite& Island = Islands[IslandIndex];
+            // Reserve a conservative interior disk. WarpBound protects the source's lobed frame;
+            // the one-voxel margin keeps a returned top away from the nominal radial edge. If no
+            // such disk is within MaxLateralSnap, declining is preferable to an arbitrary jump.
+            const float SafeRadius = Island.Rxy - WarpBound - 1.0f;
+            if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f) continue;
+
+            const float DX = WorldX - Island.X;
+            const float DY = WorldY - Island.Y;
+            const float Distance = FMath::Sqrt(DX * DX + DY * DY);
+            const float SnapDistance = FMath::Max(Distance - SafeRadius, 0.0f);
+            const float DistSq = SnapDistance * SnapDistance;
+            if (DistSq > MaxSnapSq) continue;
+
+            float CandidateX = WorldX;
+            float CandidateY = WorldY;
+            if (Distance > SafeRadius && Distance > KINDA_SMALL_NUMBER)
+            {
+                const float Scale = SafeRadius / Distance;
+                CandidateX = Island.X + DX * Scale;
+                CandidateY = Island.Y + DY * Scale;
+            }
+
+            float CandidateZ = 0.0f;
+            if (!FindLandingZ(CandidateX, CandidateY, CandidateZ)) continue;
+
+            const bool bCloser = DistSq < BestDistSq;
+            const bool bTie = DistSq == BestDistSq && IslandIndex < BestIslandIndex;
+            if (!bCloser && !bTie) continue;
+
+            BestDistSq = DistSq;
+            BestPoint = FVector(CandidateX, CandidateY, CandidateZ);
+            BestIslandIndex = IslandIndex;
+        }
+
+        if (BestIslandIndex == INDEX_NONE || BestDistSq > MaxSnapSq || BestPoint.ContainsNaN())
+        {
+            return false;
+        }
+
+        OutPoint = BestPoint;
+        return FMath::IsFinite(OutPoint.X) && FMath::IsFinite(OutPoint.Y)
+            && FMath::IsFinite(OutPoint.Z);
     }
 }
 
-bool VF_SuggestOpenPointZ(
+bool VF_SuggestLandingPoint(
     ECaveGeneratorType Archetype,
     const FStrateGenerationParams& CaveParams,
     const FSlabGenerationParams& SlabParams,
     int32 Seed,
     float StrateTopZ,
     float StrateBottomZ,
-    float WorldX,
-    float WorldY,
-    float& OutZ)
+    float DesiredX,
+    float DesiredY,
+    float MaxLateralSnap,
+    FVector& OutPoint)
 {
     switch (Archetype)
     {
     case ECaveGeneratorType::TunnelNetwork:
     case ECaveGeneratorType::Underwater:
-        return VF_FindNearestHashRoomZ(CaveParams, Seed, StrateTopZ, StrateBottomZ,
-                                       WorldX, WorldY, OutZ);
+        return VF_FindNearestHashRoomLandingPoint(CaveParams, Seed, StrateTopZ, StrateBottomZ,
+                                                  DesiredX, DesiredY, MaxLateralSnap, OutPoint);
 
     case ECaveGeneratorType::FlatPlain:
     case ECaveGeneratorType::CrystalChamber:
-        return VF_SuggestSlabOpenPointZ(SlabParams, Seed, StrateTopZ, StrateBottomZ,
-                                        WorldX, WorldY, OutZ);
+        return VF_SuggestSlabLandingPoint(SlabParams, Seed, StrateTopZ, StrateBottomZ,
+                                           DesiredX, DesiredY, MaxLateralSnap, OutPoint);
 
     default:
-        // No confident source-level answer for Maze, SurfaceWorld, shafts, or islands yet.
-        // Pas de réponse source sûre pour Maze, SurfaceWorld, shafts ou islands pour le moment.
+        // This overload intentionally covers only archetypes whose placement parameters are
+        // already present in the two legacy structs. The complete overload below carries the
+        // lattice/grid/blob parameters and answers those sources without guessing.
+        return false;
+    }
+}
+
+bool VF_SuggestLandingPoint(
+    ECaveGeneratorType Archetype,
+    const FStrateGenerationParams& CaveParams,
+    const FSlabGenerationParams& SlabParams,
+    const FMazeGenerationParams& MazeParams,
+    const FVerticalShaftParams& VerticalShaftParams,
+    const FFloatingIslandParams& FloatingIslandParams,
+    int32 Seed,
+    float StrateTopZ,
+    float StrateBottomZ,
+    float DesiredX,
+    float DesiredY,
+    float MaxLateralSnap,
+    FVector& OutPoint)
+{
+    switch (Archetype)
+    {
+    case ECaveGeneratorType::TunnelNetwork:
+    case ECaveGeneratorType::Underwater:
+        return VF_FindNearestHashRoomLandingPoint(CaveParams, Seed, StrateTopZ, StrateBottomZ,
+                                                  DesiredX, DesiredY, MaxLateralSnap, OutPoint);
+
+    case ECaveGeneratorType::FlatPlain:
+    case ECaveGeneratorType::CrystalChamber:
+        return VF_SuggestSlabLandingPoint(SlabParams, Seed, StrateTopZ, StrateBottomZ,
+                                           DesiredX, DesiredY, MaxLateralSnap, OutPoint);
+
+    case ECaveGeneratorType::Maze:
+        return VF_SuggestMazeLandingPoint(MazeParams, Seed, StrateTopZ, StrateBottomZ,
+                                          DesiredX, DesiredY, MaxLateralSnap, OutPoint);
+
+    case ECaveGeneratorType::VerticalShafts:
+        return VF_SuggestVerticalShaftLandingPoint(VerticalShaftParams, Seed,
+                                                   StrateTopZ, StrateBottomZ,
+                                                   DesiredX, DesiredY, MaxLateralSnap, OutPoint);
+
+    case ECaveGeneratorType::FloatingIslands:
+        return VF_SuggestFloatingIslandLandingPoint(FloatingIslandParams, Seed,
+                                                    StrateTopZ, StrateBottomZ,
+                                                    DesiredX, DesiredY, MaxLateralSnap, OutPoint);
+
+    case ECaveGeneratorType::SurfaceWorld:
+        // The structural heightfield is analytically seed-based, but production SurfaceWorld
+        // resolves biome-selected surface params and per-column overhang state through the
+        // manager/cache path. This pure API has no biome context and must not query it.
+        return false;
+
+    default:
         return false;
     }
 }
@@ -476,7 +1227,7 @@ void VoxelCaveMorphology::BuildChunkCache(
     //=========================================================================
     // Vertical range for room CENTER placement.
     // PLACEMENT CONTRACT: this formula MUST remain identical to
-    // VF_FindNearestHashRoomZ above. The pure landing query deliberately does not call this
+    // VF_FindNearestHashRoomLandingPoint above. The pure landing query deliberately does not call this
     // per-chunk cache builder during Initialize, so the fixed
     // VoxelForge.Determinism.PassageLandsInOpenSpace ring test is the guard that catches drift
     // between the two sites.

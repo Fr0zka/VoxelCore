@@ -290,13 +290,19 @@ is a simple straight tube. Placement, reach, and shape draws for inter-strate pa
 connection count cannot shift any later passage. Global passage settings were removed from
 `VoxelSettings`.
 
-After a passage's XY is selected, `GeneratePassages` asks the **destination** strate for a lower-mouth
-height through the pure free function `VF_SuggestOpenPointZ` (`VoxelCaveMorphology`). TunnelNetwork and
-Underwater use the nearest hash-placed room centre, with `MakeStrateSeed(world-seed, strate-index)`
-matching the room graph's existing identity; FlatPlain and CrystalChamber recompute their slab void
-band and reject column-overlap points. Maze, SurfaceWorld, VerticalShafts, and FloatingIslands remain
-explicitly unanswerable for this tier: they keep the historical random reach and emit a warning. This
-query is source-level only — it does not construct an operator stack, touch a cache, or call back into
+After a passage's XY is selected, `GeneratePassages` asks the **destination** strate for a full lower-mouth
+landing point through the pure free function `VF_SuggestLandingPoint` (`VoxelCaveMorphology`).
+TunnelNetwork and Underwater keep the nearest hash-room vertical placement at the requested XY, with
+`MakeStrateSeed(world-seed, strate-index)` matching the room graph's existing identity; FlatPlain and
+CrystalChamber recompute their slab void band and reject column-overlap points. Maze snaps to the
+nearest roughness-safe horizontal lattice corridor within one cell, VerticalShafts to a roughness-safe
+shaft within one shaft spacing, and FloatingIslands to a validated blob top within one island spacing.
+Those three return false when no footing exists inside that explicit lateral budget. GeneratePassages
+interpolates the snapped XY through the control-point chain and recomputes its conservative bound;
+SurfaceWorld remains deliberately unanswerable because production terrain can be selected through
+manager-owned biome/per-column context.
+Declined answers (unsupported or no-footing) keep the historical random reach and emit a warning. This query is source-level
+only — it does not construct an operator stack, touch a cache, or call back into
 `UVoxelStrateManager` while `Initialize` is building the layout. The resulting lower endpoint is
 clamped to the destination's seal-free interior.
 

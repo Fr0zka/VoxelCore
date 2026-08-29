@@ -48,6 +48,11 @@ struct FVoxelPassage
     FVector UpperPoint = FVector::ZeroVector;  // Entry in upper strate
     FVector LowerPoint = FVector::ZeroVector;  // Exit in lower strate
 
+    // The deterministic lower-mouth request before destination landing-site adjustment. Kept for
+    // diagnostics/tests so the bounded lateral snap can be measured against the original spine-
+    // relative placement; not used by the SDF evaluator.
+    FVector RequestedLowerPoint = FVector::ZeroVector;
+
     // Passage dimensions — how wide the carved tunnel is (in voxels).
     // Varies by type: VerticalShaft ~7-8, SpiralDescent ~4, CrackCrevice ~2-3, others ~5.
     float Radius = 5.0f;

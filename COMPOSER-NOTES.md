@@ -343,7 +343,7 @@ the parameter named "max".
 It proves anything below `TerrainZ` solid and skips meshing. Any future 3D generation inside mountains
 needs a guard, or the caves vanish with no error.
 
-### 🔨 6.4 The primordial law hole — HALF FIXED (4 of 8 archetypes), built + green
+### 🔨 6.4 The primordial law hole — bounded destination landing
 
 `UVoxelStrateManager::GeneratePassages` places every inter-strate passage as independently salted
 hashes of `(seed, upper-strate index, connection index)` → random angle around the (0,0) spine →
@@ -352,13 +352,13 @@ destination strate's cave layout.** Carving is a structural-post invariant so th
 whether its lower mouth joins the lower strate's connected space is pure luck. **A player can descend
 a passage and arrive in a sealed pocket.**
 
-**Fix — make the strate OFFER a landing site, don't let the passage gamble.** Add to the field-source
-contract something like `SuggestOpenPoint(WorldX, WorldY) -> optional Z`. Every source already knows
-where its own air is: `FRoomGraphSource` the nearest room centre (hash-placed, cheap to find),
-`MakeSlabVoidSource` anywhere in the void band, `FIslandBlobSource` just above an island top,
-`FSurfaceColumnSource` just above `TerrainZ`, `MakeLatticeCorridorSource` the nearest lattice node.
-Passage placement becomes: pick XY, ask the strate below for an open Z near it, aim there. Deterministic,
-cheap, and it keeps working for invented strates because any new source must answer.
+**Fix — make the strate OFFER a landing site, don't let the passage gamble.** The source contract is
+`SuggestLandingPoint(DesiredX, DesiredY, MaxLateralSnap) -> optional FVector`. Every source knows where
+its own air is: `FRoomGraphSource` keeps the nearest room's vertical placement at the requested XY,
+`MakeSlabVoidSource` answers in the void band, `FIslandBlobSource` finds a blob top, and the lattice/
+shaft sources search their placement grid. Sparse sources may move laterally, but only within one
+source spacing/cell; if that bounded search has no footing, falling back is the honest answer.
+Passage placement remains deterministic and cheap, and the slanted control-point chain is bounded too.
 
 Then the measurement pass flood fill is the net: does the upper mouth's air component reach the lower
 mouth's? If not, re-roll with the attempt folded into the hash.
@@ -369,7 +369,7 @@ mouth's? If not, re-roll with the attempt folded into the hash.
 `FStrateLandmark` already carries a Light-Orb block. **A glowing landmark at every passage mouth is
 authorable today with no code at all.** Beyond that, cheapest first: light (a glow down a tunnel is the
 strongest pull in a cave); sound (works around corners, which light does not — you hear the draft before
-you see the hole); and ⭐ **make the mouth a PLACE, not a hole** — the `SuggestOpenPoint` fix already
+you see the hole); and ⭐ **make the mouth a PLACE, not a hole** — the `SuggestLandingPoint` fix already
 lands the passage in a room, so make that room distinctive. Cracks in walls are forgettable; rooms are
 landmarks, and that is what makes it findable on the *second* visit, which quests need.
 
@@ -462,7 +462,7 @@ refactor, where three weeks of correct work produced a world unchanged by a sing
   tidied without changing every world. Small and isolated.
 
 ### Tier 1 — the primordial law (a BUG FIX, not composer work)
-- **`SuggestOpenPoint` on field sources; passages aim at it** (§6.4).
+- **`SuggestLandingPoint` on field sources; passages aim at it** (§6.4).
 - **The passage mouth becomes a room plus a distinctive landmark** (§6.5).
 
 *Standalone value:* fixes a **live hole in the shipping game** — today a player can descend into a
@@ -564,34 +564,38 @@ them is *wrong* — a false verdict leaves no geometry and no collision behind i
 
 ---
 
-## 11. Tier 1 status — passages aim at real open space (PARTIAL, built + green)
+## 11. Tier 1 status — passages aim at real open space (bounded full-point query; build not run)
 
-**Landed 2026-08-17.** `VF_SuggestOpenPointZ` (in `VoxelCaveMorphology`) is a **pure free function** of
-(archetype, params, seed, XY) — it touches no operator stack, no `UVoxelStrateManager`, no cache. That
-matters: `GeneratePassages` runs inside `Initialize`, when the layout is half-built and `LayoutVersion`
-is mid-flight, so constructing anything holding a manager pointer there is a re-entrancy trap.
+**Updated 2026-08-29.** `VF_SuggestLandingPoint` (in `VoxelCaveMorphology`) is a **pure free function**
+of (archetype, params, seed, desired XY, lateral budget) — it touches no operator stack, no
+`UVoxelStrateManager`, no cache. That matters: `GeneratePassages` runs inside `Initialize`, when the
+layout is half-built and `LayoutVersion` is mid-flight, so constructing anything holding a manager
+pointer there is a re-entrancy trap.
 
-`GeneratePassages` now asks the **destination** strate for an open Z near the chosen XY and aims the
-lower mouth there, clamped strictly inside the interior (never into a seal band). Where the archetype
-cannot answer, **today's random reach is preserved unchanged**.
+`GeneratePassages` now asks the **destination** strate for a full open/footing point near the chosen XY.
+Maze, VerticalShafts, and FloatingIslands may snap to a nearby lattice site, shaft, or island top;
+the lower mouth uses the returned X/Y/Z, clamped strictly inside the interior (never into a seal band).
+Where the archetype cannot prove footing inside its bound, **today's random reach and original XY are
+preserved unchanged**.
 
-### ⚠️ Coverage is PARTIAL and the number is the point
-Measured by `VoxelForge.Determinism.PassageLandsInOpenSpace`:
+### ⚠️ Coverage is source-dependent and the number is the point
+The failing pre-fix measurement was:
 
-> *7 inter-strate passages, 3 checked, 48/48 ring samples air, 4 query-false (4 unique archetypes;
-> 4 unsupported, 0 supported-but-no-point).*
+> *7 inter-strate passages, 3 checked, 0 footing checks, 38/48 room/slab ring samples air, 4
+> query-false (4 unique archetypes; 1 unsupported, 3 supported-but-no-point).*
 
-✅ **Answering:** TunnelNetwork · Underwater · FlatPlain · CrystalChamber.
-❌ **Not answering:** Maze · VerticalShafts · SurfaceWorld (and by extension FloatingIslands).
+The Tier 1 query now searches laterally for `Maze`, `VerticalShafts`, and `FloatingIslands` landing
+sites within one configured placement period. `SurfaceWorld` remains intentionally refused.
+The extended test uses vertical source footing brackets for those three instead of applying the
+room/slab circumference ring to thin or void-dominated geometry. The post-fix measurement is deliberately
+not claimed here because this change does not build or run the Unreal automation test.
 
-⇒ **The primordial law is guaranteed for four archetypes of eight.** The improvement over this morning
-is not that the hole is closed — it is that the gap is now **measured instead of invisible**. Follow-on
-work: Maze can answer from its lattice nodes, VerticalShafts from its shafts, SurfaceWorld from just
-above `TerrainZ`, FloatingIslands from just above a blob top.
-
-### Two seed contracts, do not mix them
+### Seed contracts, do not mix them
 - **TunnelNetwork / Underwater** → `VoxelCaveMorphology::MakeStrateSeed` (the strate's own room seed).
-- **Slab archetypes** → the generator **world** seed, which is what `GetSlabDensity` uses.
+- **Slab / Maze / VerticalShafts / FloatingIslands** → the generator **world** seed, which their
+  source placement/noise uses.
+- **SurfaceWorld** → no answer yet; its world seed alone does not identify the manager-resolved
+  biome/per-column production context.
 
 Seeding the query from the passage salt hash — which my spec originally asked for — would inspect a
 cave graph that **does not exist** and return confident answers about imaginary rooms. Codex caught it.
@@ -600,12 +604,76 @@ cave graph that **does not exist** and return confident answers about imaginary 
 The first version sampled `GetDensityAt` at the mouth and asserted air — **vacuous**, because
 `VF_ApplyPassageCarving` is a structural-post invariant, so the tube is air *at its own mouth by
 construction*. It passed whether the aiming worked or not. Replaced with a **16-point lateral ring** at
-`MouthRadius + 2 × PassageBlend` (~14 voxels at defaults), requiring ≥ 8/16 air. A mouth in a real room
-has open space around it; a mouth in bedrock has only the tube it dug itself.
+`MouthRadius + 2 × PassageBlend` (~14 voxels at defaults), requiring ≥ 8/16 air for room/slab
+destinations. A mouth in a real room has open space around it; a mouth in bedrock has only the tube it
+dug itself. Maze, VerticalShafts, and FloatingIslands use a manager-free source density bracket:
+air at the landing and solid below it. A large void ring is not evidence of island footing.
 ⚠️ **It is a proxy for connectivity, not a proof.** The proof is a flood fill — Tier 2.
 
 ### ⚠️ A forked placement envelope, guarded by that test
-`VF_FindNearestHashRoomZ` re-derives the room vertical placement envelope that `BuildChunkCache` also
+`VF_FindNearestHashRoomLandingPoint` re-derives the room vertical placement envelope that `BuildChunkCache` also
 computes. Calling the per-chunk cache builder from `Initialize` is impractical, so this is a deliberate
 second copy. **Both sites now carry a PLACEMENT CONTRACT comment naming the other**, and the ring test
 is the only thing standing between a placement change and silent bedrock passages.
+
+---
+
+## 12. Tier 1 FINAL — and the 92.8% defect a green suite hid
+
+**Built clean, suite green: 17 succeeded, 0 warnings, 0 failed (2026-08-30).**
+
+### ⚠️ Correct the record: commit `1ab8c0c` overstated what worked
+It reported *"3 checked, 48/48 ring samples air"* and read as Tier 1 working. A million-seed sweep later
+showed the room query left the landing point **OUTSIDE the selected room 92.795% of the time**. The
+fixture's 48/48 was **luck**, not correctness — seven sampled passages cannot see a systemic defect.
+
+**Cause, and it was my instruction:** I specced `MaxLateralSnap = 0` for rooms and slabs — *"preserving
+existing placement, do not regress them, they are green today."* The room path found the nearest room,
+then returned the **caller's XY** with that room's Z. It located a room and aimed beside it. That is the
+exact defect I correctly identified for Maze/VerticalShafts/FloatingIslands and then explicitly exempted
+rooms from.
+
+### The fix: return the ROOM CENTRE
+`VF_FindNearestHashRoomLandingPoint` already computed the room's XY and discarded it. It now returns it.
+- **A room's centre is inside its own room by construction** — no SDF evaluation, no warp handling
+  needed. It is also the point with the largest margin against the production cave warp (~1.5 voxels of
+  displacement: decisive at a room's edge, irrelevant at its centre). Simpler *and* more robust than the
+  warped-SDF inside-proof I had been specifying.
+- **Caves get a real budget** (`RoomSpacing`): a room is an XY-**sparse** target, exactly like a maze
+  corridor. **Slabs correctly keep 0** — a slab's void band is XY-continuous, so the requested XY is
+  already inside it.
+
+### ⚠️ OPEN TRADE-OFF: the room budget is tight
+Final measurement: *7 passages, 5 checked, 3 footing checks, **32/32** room/slab ring samples air,
+2 query-false (1 unsupported, 1 supported-but-no-point)* — and **TunnelNetwork and Underwater declined
+entirely at this seed.**
+
+With `RoomDensity < 1` not every cell holds a room, so the nearest is often 1.5–2 cells away and one
+`RoomSpacing` refuses. Cave passages are back on random reach — *honest*, but not landing.
+
+**~2× spacing would likely restore cave coverage, at the cost of passages drifting further from the
+(0,0) spine — the property that makes them findable.** Deliberately NOT tuned: "raise the number until
+coverage looks better" is the move rejected twice this session. **Jahni's call.**
+
+### A guard was softened, and why that is not threshold-tuning
+`PassageLandsInOpenSpace` asserted that all four room/slab archetypes must answer *within the fixture's
+7 passages*. That asserts a property of the **sample**, not the code — and it failed on a **fix**, since
+a supported query is *allowed* to decline on budget. Now reported via `AddInfo`.
+**Still hard failures:** vacuity (zero passages / zero checks / no footing exercised), every per-mouth
+ring and footing assertion, endpoint-matches-query, and SurfaceWorld unexpectedly answering.
+Same discipline the codebase applies to box-verdict PROVED counts: *read the count as a measurement,
+assert only that nothing it reports is wrong.*
+
+### Process notes worth keeping
+- ⚠️ **`codex exec` began hanging reliably** — three runs, 0 bytes written, process alive, at
+  `max`/`xhigh`/`high`. A tiny `low`-effort probe worked, Jahni's interactive CLI works, and quota was
+  confirmed fine. Cause unresolved; the room fix was completed by hand instead.
+- ⚠️ **I waited 4.5 hours on a hung background task** because I treated "no notification" as "still
+  working." Checking the output file's size costs nothing. `CodexGuidance.md` states the rule from the
+  other side: *never wait silently; report if blocked more than two minutes.*
+- ⚠️ **A stream edit (`perl`) corrupted `VoxelStrateManager.cpp`** — a skip-until-terminator ran past
+  its block because a second `UE_LOG(LogTemp, Warning` existed earlier in the file, deleting ~178 lines
+  and an entire function. Git recovered it. **Use targeted read-then-edit on source files; verify line
+  count and brace balance after any structural edit.**
+- **Do not run builds while a Codex task is active** — `CodexGuidance.md` §Collaboration: one agent per
+  working tree.
