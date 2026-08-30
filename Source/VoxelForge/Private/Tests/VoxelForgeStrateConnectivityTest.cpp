@@ -3,6 +3,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
 
 #include "VoxelForgeTestFixture.h"
@@ -11,6 +12,11 @@
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FVoxelForgeStrateConnectivityTest,
     "VoxelForge.Generation.StrateConnectivity",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeStrateConnectivityRefinementTest,
+    "VoxelForge.Generation.StrateConnectivityRefinement",
     EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
 
 namespace
@@ -99,7 +105,8 @@ namespace
         switch (Result)
         {
         case EVoxelConnectivityResult::Connected:      return TEXT("CONNECTED");
-        case EVoxelConnectivityResult::NotConnected:   return TEXT("NOT_CONNECTED");
+        case EVoxelConnectivityResult::NotConnectedAtThisResolution:
+            return TEXT("NOT_CONNECTED_AT_THIS_RESOLUTION");
         case EVoxelConnectivityResult::StartCellSolid: return TEXT("START_CELL_SOLID");
         case EVoxelConnectivityResult::GoalCellSolid:  return TEXT("GOAL_CELL_SOLID");
         case EVoxelConnectivityResult::OutOfWindow:    return TEXT("OUT_OF_WINDOW");
@@ -234,6 +241,40 @@ namespace
                 / static_cast<double>(OutSampleCount))
             : 0.0f;
     }
+
+    struct FRefinementSweepRow
+    {
+        int32 SampleStep = 0;
+        int32 RadiusInVoxels = 0;
+        FVoxelStrateMetrics Metrics;
+        FConnectivityProbe Probe;
+    };
+
+    bool FindChainMouths(
+        const TArray<FVoxelPassage>& Passages,
+        int32 StrateIndex,
+        FVector& OutArrivalPoint,
+        FVector& OutDeparturePoint)
+    {
+        int32 ArrivalCount = 0;
+        int32 DepartureCount = 0;
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (Passage.LowerStrateIndex == StrateIndex
+                && Passage.UpperStrateIndex + 1 == StrateIndex)
+            {
+                OutArrivalPoint = Passage.LowerPoint;
+                ++ArrivalCount;
+            }
+            if (Passage.UpperStrateIndex == StrateIndex
+                && Passage.LowerStrateIndex == StrateIndex + 1)
+            {
+                OutDeparturePoint = Passage.UpperPoint;
+                ++DepartureCount;
+            }
+        }
+        return ArrivalCount == 1 && DepartureCount == 1;
+    }
 }
 
 bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
@@ -348,6 +389,25 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     }
     World.DiffLayer->Clear();
 
+    // The refinement test deliberately approaches MaxCells at step 1. Keep a separate,
+    // cheap over-cap control here so a future allocation/refusal regression cannot hide behind
+    // the connectivity API's endpoint result.
+    FVoxelStrateMeasureSettings TooLargeSettings = Settings;
+    TooLargeSettings.SampleStep = 1;
+    TooLargeSettings.RadiusInVoxels = 256;
+    const FVoxelStrateMetrics TooLargeMetrics = VF_MeasureStrate(
+        *World.Generator, *World.StrateManager, 0, TooLargeSettings);
+    if (TooLargeMetrics.bValid
+        || !TooLargeMetrics.RefusalReason.Contains(TEXT("MaxCells")))
+    {
+        AddError(FString::Printf(
+            TEXT("HARD FAILURE: the over-cap grid was not refused by MaxCells (valid=%s, "
+                 "reason='%s')."),
+            TooLargeMetrics.bValid ? TEXT("true") : TEXT("false"),
+            *TooLargeMetrics.RefusalReason));
+        bAllChecksPassed = false;
+    }
+
     TArray<FArchetypeReport> ArchetypeReports;
     const TArray<FStrateSlot>& Layout = World.StrateManager->GetLayout();
     ArchetypeReports.Reserve(Layout.Num());
@@ -448,6 +508,9 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         GapAirFraction,
         GapAirSamples,
         GapSamples);
+    Summary += FString::Printf(
+        TEXT("MaxCells refusal control: over-cap measurement refused with reason '%s'.\n"),
+        *TooLargeMetrics.RefusalReason);
     Summary += TEXT("Archetypes (old one-chunk vs derived window; derived InteriorMarginVoxels<0 => 2x BoundarySealThickness, clamped):\n");
     Summary += TEXT("  name | old margin | old Z span [min,max) | old Air | old Largest | old LargestCells | old >=1% | old Walkable | old FeatureScale vox | old Clearance vox | old Components | old Samples | old Solid | derived margin | derived Z span [min,max) | derived Air | derived Largest | derived LargestCells | derived >=1% | derived Walkable | derived FeatureScale vox | derived Clearance vox | derived Components | derived Samples | derived Solid\n");
     for (const FArchetypeReport& Report : ArchetypeReports)
@@ -496,7 +559,7 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
 
     int32 NumAnchorProbes = 0;
     int32 NumAnchorConnected = 0;
-    int32 NumAnchorNotConnected = 0;
+    int32 NumAnchorNotConnectedAtThisResolution = 0;
     int32 NumAnchorStartCellSolid = 0;
     int32 NumAnchorGoalCellSolid = 0;
     int32 NumAnchorOutOfWindow = 0;
@@ -552,7 +615,9 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             switch (Probe.Result)
             {
             case EVoxelConnectivityResult::Connected:      ++NumAnchorConnected; break;
-            case EVoxelConnectivityResult::NotConnected:   ++NumAnchorNotConnected; break;
+            case EVoxelConnectivityResult::NotConnectedAtThisResolution:
+                ++NumAnchorNotConnectedAtThisResolution;
+                break;
             case EVoxelConnectivityResult::StartCellSolid: ++NumAnchorStartCellSolid; break;
             case EVoxelConnectivityResult::GoalCellSolid:  ++NumAnchorGoalCellSolid; break;
             case EVoxelConnectivityResult::OutOfWindow:    ++NumAnchorOutOfWindow; break;
@@ -836,11 +901,11 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         NumArrivalDepartureRoutesChecked);
     Summary += FString::Printf(
         TEXT("Correct largest-component endpoint probes (%d, including the surface-entry auxiliary): "
-             "connected=%d, not-connected=%d, start-cell-solid=%d, goal-cell-solid=%d, "
+             "connected=%d, not-connected-at-resolution=%d, start-cell-solid=%d, goal-cell-solid=%d, "
              "out-of-window=%d, coarse-lied=%d, snapped endpoint events=%d.\n"),
         NumAnchorProbes,
         NumAnchorConnected,
-        NumAnchorNotConnected,
+        NumAnchorNotConnectedAtThisResolution,
         NumAnchorStartCellSolid,
         NumAnchorGoalCellSolid,
         NumAnchorOutOfWindow,
@@ -921,6 +986,178 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             Metrics.LargestComponentPoint.Y,
             Metrics.LargestComponentPoint.Z);
     }
+    AddInfo(Summary);
+
+    return bAllChecksPassed;
+}
+
+bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+
+    FTestWorld World;
+    World.Build(/*InSeed=*/1337, /*InGapChunks=*/2);
+    if (!World.IsValid())
+    {
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    const TArray<FStrateSlot>& Layout = World.StrateManager->GetLayout();
+    const int32 VerticalShaftsIndex = FTestWorld::SlotVerticalShafts;
+    if (!Layout.IsValidIndex(VerticalShaftsIndex)
+        || Layout[VerticalShaftsIndex].Definition == nullptr
+        || Layout[VerticalShaftsIndex].Definition->GeneratorType
+            != ECaveGeneratorType::VerticalShafts)
+    {
+        AddError(TEXT("HARD FAILURE: the pinned VerticalShafts fixture slot is missing or changed."));
+        return false;
+    }
+
+    FVector ArrivalPoint = FVector::ZeroVector;
+    FVector DeparturePoint = FVector::ZeroVector;
+    if (!FindChainMouths(
+            World.StrateManager->GetPassages(),
+            VerticalShaftsIndex,
+            ArrivalPoint,
+            DeparturePoint))
+    {
+        AddError(TEXT("HARD FAILURE: VerticalShafts does not have exactly one arrival and one "
+                      "departure mouth between consecutive strates."));
+        return false;
+    }
+
+    FVoxelStrateMeasureSettings BaseSettings;
+    BaseSettings.CenterXY = FVector2D::ZeroVector;
+    BaseSettings.MaxCells = 8000000;
+    BaseSettings.HeadroomCells = 2;
+    BaseSettings.InteriorMarginVoxels = -1;
+
+    struct FRefinementCase
+    {
+        int32 SampleStep;
+        int32 RadiusInVoxels;
+    };
+    static constexpr FRefinementCase Cases[] = {
+        {4, 256},
+        {4, 192},
+        {2, 192},
+        {4, 128},
+        {1, 128},
+    };
+
+    bool bAllChecksPassed = true;
+    TArray<FRefinementSweepRow> Rows;
+    Rows.Reserve(UE_ARRAY_COUNT(Cases));
+
+    const double SweepStartSeconds = FPlatformTime::Seconds();
+    for (const FRefinementCase& TestCase : Cases)
+    {
+        FRefinementSweepRow& Row = Rows.AddDefaulted_GetRef();
+        Row.SampleStep = TestCase.SampleStep;
+        Row.RadiusInVoxels = TestCase.RadiusInVoxels;
+
+        FVoxelStrateMeasureSettings RowSettings = BaseSettings;
+        RowSettings.SampleStep = TestCase.SampleStep;
+        RowSettings.RadiusInVoxels = TestCase.RadiusInVoxels;
+
+        Row.Metrics = VF_MeasureStrate(
+            *World.Generator,
+            *World.StrateManager,
+            VerticalShaftsIndex,
+            RowSettings);
+
+        Row.Probe.bChecked = true;
+        Row.Probe.Result = VF_AreConnected(
+            *World.Generator,
+            *World.StrateManager,
+            VerticalShaftsIndex,
+            ArrivalPoint,
+            DeparturePoint,
+            RowSettings,
+            Row.Probe.bStartSnapped,
+            Row.Probe.bGoalSnapped);
+
+        if (!Row.Metrics.bValid
+            || Row.Metrics.NumSampled <= 0
+            || Row.Metrics.NumSampled > BaseSettings.MaxCells
+            || Row.Metrics.NumAir <= 0
+            || Row.Metrics.NumSolid <= 0)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts refinement row step=%d radius=%d did not "
+                     "produce a bounded non-vacuous measurement (valid=%s, reason='%s', "
+                     "cells=%lld, air=%lld, solid=%lld)."),
+                Row.SampleStep,
+                Row.RadiusInVoxels,
+                Row.Metrics.bValid ? TEXT("true") : TEXT("false"),
+                *Row.Metrics.RefusalReason,
+                Row.Metrics.NumSampled,
+                Row.Metrics.NumAir,
+                Row.Metrics.NumSolid));
+            bAllChecksPassed = false;
+        }
+
+        if (Row.Probe.Result == EVoxelConnectivityResult::OutOfWindow
+            || Row.Probe.Result == EVoxelConnectivityResult::StartCellSolid
+            || Row.Probe.Result == EVoxelConnectivityResult::GoalCellSolid)
+        {
+            const FString ProbeText = ConnectivityProbeText(Row.Probe);
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts refinement row step=%d radius=%d could "
+                     "not query both in-window air mouths: %s."),
+                Row.SampleStep,
+                Row.RadiusInVoxels,
+                *ProbeText));
+            bAllChecksPassed = false;
+        }
+
+        if (Row.Probe.bStartSnapped || Row.Probe.bGoalSnapped)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts refinement row step=%d radius=%d snapped "
+                     "an endpoint; the controlled comparison is not a mouth-to-mouth query."),
+                Row.SampleStep,
+                Row.RadiusInVoxels));
+            bAllChecksPassed = false;
+        }
+
+    }
+    const double SweepSeconds = FPlatformTime::Seconds() - SweepStartSeconds;
+
+    FString Summary = TEXT(
+        "VerticalShafts arrival->departure refinement (seed 1337; source mouth pair; "
+        "derived interior window):\n");
+    Summary += TEXT(
+        "  SampleStep | RadiusInVoxels | verdict | components | largest share | cells | margin | "
+        "Z window | endpoint snaps\n");
+    for (const FRefinementSweepRow& Row : Rows)
+    {
+        const FString VerdictText = ConnectivityProbeText(Row.Probe);
+        FString SnapText = TEXT("none");
+        if (Row.Probe.bStartSnapped || Row.Probe.bGoalSnapped)
+        {
+            SnapText = ConnectivityProbeText(Row.Probe);
+        }
+        Summary += FString::Printf(
+            TEXT("  %d | %d | %s | %d | %.9g | %lld | %d | [%d,%d) | %s\n"),
+            Row.SampleStep,
+            Row.RadiusInVoxels,
+            *VerdictText,
+            Row.Metrics.NumAirComponents,
+            Row.Metrics.LargestComponentShare,
+            Row.Metrics.NumSampled,
+            Row.Metrics.ResolvedMarginVoxels,
+            Row.Metrics.SampledMinZ,
+            Row.Metrics.SampledMaxZ,
+            *SnapText);
+    }
+    Summary += TEXT(
+        "Controlled comparisons hold radius constant: (step 4, radius 192) vs (step 2, "
+        "radius 192), and (step 4, radius 128) vs (step 1, radius 128).\n");
+    Summary += FString::Printf(
+        TEXT("VerticalShafts refinement sweep wall-clock: %.3f seconds.\n"),
+        SweepSeconds);
     AddInfo(Summary);
 
     return bAllChecksPassed;

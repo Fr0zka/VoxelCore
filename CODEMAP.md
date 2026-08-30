@@ -312,13 +312,15 @@ representative point, cell count, and count of components holding at least 1% of
 `VF_AreConnected` recovers a deterministic BFS parent path from the same kind of grid and checks
 only that route at full voxel resolution before returning `Connected`. It returns an explicit
 `EVoxelConnectivityResult`; a solid endpoint cell is repaired by snapping to the nearest air cell
-among its 26 neighbours when possible, and reports the snap through its out flags. No UObject state,
-cache, actor, world, or PIE is required.
+among its 26 neighbours when possible, and reports the snap through its out flags. A missing coarse
+route returns `NotConnectedAtThisResolution`: that is evidence only at the grid's resolution,
+because a corridor thinner than `SampleStep` is invisible. No UObject state, cache, actor, world,
+or PIE is required.
 | Symbol | Role |
 |--------|------|
 | `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin, and results identify the resolved margin/Z window and deterministic component representatives. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; refuses invalid bounds or a grid over `MaxCells`. |
-| `VF_AreConnected` | Coarse 6-connected BFS plus one full-resolution recheck of its recovered route, with explicit endpoint-solid, out-of-window, coarse-lie, and connectivity outcomes. |
+| `VF_AreConnected` | Coarse 6-connected BFS plus one full-resolution recheck of its recovered route, with explicit endpoint-solid, out-of-window, `CoarseLied`, `NotConnectedAtThisResolution`, and connected outcomes. |
 
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`
 Header is rich with inline docs. Two namespaces + a per-chunk cache system.

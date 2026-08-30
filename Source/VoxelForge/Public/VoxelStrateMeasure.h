@@ -11,7 +11,7 @@ class UVoxelStrateManager;
 enum class EVoxelConnectivityResult : uint8
 {
     Connected,
-    NotConnected,
+    NotConnectedAtThisResolution, // Evidence only at this grid's resolution; corridors thinner than SampleStep are invisible.
     StartCellSolid,
     GoalCellSolid,
     OutOfWindow,
@@ -74,7 +74,9 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
  * If an endpoint's own coarse cell is solid, the query searches the 26 neighbouring cells and
  * uses the nearest air cell when one exists. The snap flags report those repairs. Solid-cell
  * results are returned only when no adjacent air cell exists. A coarse route that fails its
- * full-resolution re-check returns CoarseLied.
+ * full-resolution re-check returns CoarseLied; a missing coarse route returns
+ * NotConnectedAtThisResolution because a corridor thinner than SampleStep is invisible to the
+ * grid. A bare "not connected" result is evidence only at the grid's own resolution.
  */
 VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     const UVoxelGenerator& Generator,

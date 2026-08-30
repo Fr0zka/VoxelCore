@@ -882,7 +882,7 @@ EVoxelConnectivityResult VF_AreConnected(
     TArray<int32> Path;
     if (!VoxelStrateMeasurePrivate::FindCoarsePath(Grid, Start, Goal, Path))
     {
-        return EVoxelConnectivityResult::NotConnected;
+        return EVoxelConnectivityResult::NotConnectedAtThisResolution;
     }
 
     // The coarse route is evidence, not a pass. Re-check this one BFS route at one-voxel spacing
