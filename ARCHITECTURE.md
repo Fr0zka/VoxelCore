@@ -45,11 +45,24 @@ what the world IS, and both paths compute it.
   column at XY (0,0) in every strate's **interior** (seals untouched). Radius =
   `UVoxelGenerator::OriginSpineRadius` ← `VoxelSettings::OriginSpineRadius`. Called before
   every `ApplyBoundarySeal`.
+- `VerticalShafts` treats that structural column as a **connector endpoint**, not as a second
+  density primitive: while rebuilding its memoised 3×3 shaft neighbourhood, an origin-adjacent
+  query adds `(0,0,OriginSpineRadius)` to the local shaft set for pair generation only. The
+  existing `VoxelHash::Pair` gate and `Spacing*1.6` neighbour cutoff remain in force, so the link
+  is a pure function of the shaft cell and seed and is independent of evaluation order. Spine
+  links use a radius above the proven `sup|FBM|=1.5` roughness envelope (`max(ConnectorRadius,
+  SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 + 1)`); the ordinary connector radius and ordinary shaft
+  roughness are unchanged. `BuildVerticalShaftStack` receives the same runtime spine radius and
+  mirrors this source rule; `VF_ApplyOriginSpine` remains the sole owner of the column itself.
 - Descent is **player-dug** through the thin seals at (0,0). The single auto-opened
   connection is the **surface entry shaft** at (0,0) through the top of strate 0
   (`GeneratePassages`, `bOpenSurfaceEntry`).
 - **Hybrid extras:** auto-carved *shortcut* passages per boundary, placed away from (0,0).
   Now fully **per-strate** — see §8.8 (the upper strate's `PassageConfig` drives count/style/shape).
+
+This connector is local topology, not a promise that independently placed shortcut mouths are
+globally connected. The acceptance measurement for `VerticalShafts` remains the actual
+arrival→departure flood-fill at the passage endpoints.
 
 ### 8.3 Disturbance layer (the "wow" post-process)
 `FStrateDisturbanceParams` (on the definition, all archetypes). `ApplyDisturbances`
@@ -324,6 +337,10 @@ driven by `EditorBrush*` props.
   no loads AND no LOD mismatches outstanding.
 - **SDF cache** (`GetDensityWithParams`): search-BOX validity, not chunk-key — gradient ±1
   sampling must not thrash the (expensive) rebuild.
+- **VerticalShafts field cache**: shaft rolls and pair decisions, including the structural-spine
+  connector endpoint, are rebuilt only when the thread-local centre cell or a geometry-affecting
+  parameter changes. They must not be re-hashed in the per-voxel loop; the operator-stack source
+  follows the same cache contract.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
   thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
   prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner

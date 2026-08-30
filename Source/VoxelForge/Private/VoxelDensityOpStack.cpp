@@ -1465,15 +1465,16 @@ namespace
     class FShaftFieldSource final : public IVoxelDensityOp
     {
     public:
-        FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InExtraReach)
+        FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InExtraReach,
+                          float InSpineRadius)
             : P(InP), Salt((uint32)Seed ^ 0x53686674u)   // 'Shft' — identique à GetVerticalShaftDensity
-            , ExtraReach(InExtraReach) {}
+            , ExtraReach(InExtraReach), SpineRadius(InSpineRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
-        struct FShaft { float X, Y, R; };
-        struct FConn  { FVector A, B; };
+        struct FShaft { float X, Y, R; bool bOriginSpine; };
+        struct FConn  { FVector A, B; float Radius; };
 
         // ⚠️ DÉCLARÉE ICI, avant toute fonction qui la renvoie. Un type imbriqué doit exister au
         // moment où le COMPILATEUR lit la SIGNATURE — les corps de méthodes sont différés, pas les
@@ -1483,8 +1484,8 @@ namespace
         // compiler reads the SIGNATURE — bodies are deferred, return types are not.
         struct FCells
         {
-            TArray<FShaft, TInlineAllocator<9>> Shafts;
-            TArray<FConn,  TInlineAllocator<8>> Conns;
+            TArray<FShaft, TInlineAllocator<10>> Shafts;
+            TArray<FConn,  TInlineAllocator<16>> Conns;
         };
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -1494,6 +1495,7 @@ namespace
             float CaveSDF = FLT_MAX;
             for (const FShaft& Sh : C.Shafts)
             {
+                if (Sh.bOriginSpine) continue;  // VF_ApplyOriginSpine owns the structural column.
                 const float DX = WorldX - Sh.X;
                 const float DY = WorldY - Sh.Y;
                 CaveSDF = FMath::Min(CaveSDF, FMath::Sqrt(DX * DX + DY * DY) - Sh.R);
@@ -1501,7 +1503,7 @@ namespace
             const FVector Pos(WorldX, WorldY, WorldZ);
             for (const FConn& Cn : C.Conns)
             {
-                CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, Cn.A, Cn.B, P.ConnectorRadius));
+                CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, Cn.A, Cn.B, Cn.Radius));
             }
             InOut.Sdf = CaveSDF;
         }
@@ -1518,7 +1520,8 @@ namespace
             // L'enveloppe doit couvrir les deux bornes de `Lerp(ShaftMinRadius, ShaftMaxRadius, t)`,
             // pas `ShaftMaxRadius` seul si l'asset inverse les paramètres. The bound must cover
             // both radius endpoints before adding connector and downstream reach.
-            const float Pad = FMath::Max3(P.ShaftMinRadius, P.ShaftMaxRadius, P.ConnectorRadius) + ExtraReach;
+            const float Pad = FMath::Max3(P.ShaftMinRadius, P.ShaftMaxRadius,
+                                          SpineConnectorRadius()) + ExtraReach;
             const FBox Padded = VoxelBox.ExpandBy(Pad);
 
             const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
@@ -1588,7 +1591,16 @@ namespace
                     if (RollShaft(cx, cy, Sh)) { Near.Add(Sh); }
                 }
 
-                const float ConnReach = P.ConnectorRadius + ExtraReach;
+                // Match GetCells' rule conservatively: any query cell in the central 3x3 may see
+                // a spine connector. This is a superset for a box, so it can only make the tile
+                // less likely to be classified AllSolid.
+                if (SpineRadius > 0.0f
+                    && QX0 <= 1 && QX1 >= -1
+                    && QY0 <= 1 && QY1 >= -1)
+                {
+                    Near.Add({0.0f, 0.0f, SpineRadius, true});
+                }
+
                 const float BottomZ   = P.StrateBottomWorldZ + P.BoundarySealThickness;
                 const float TopZ      = P.StrateTopWorldZ    - P.BoundarySealThickness;
 
@@ -1612,7 +1624,15 @@ namespace
                     const uint32 PH = VoxelHash::Pair(
                         FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
                         FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), Salt ^ 0xC04Eu);
-                    if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance) { continue; }
+                    const bool bSpineConnector = A.bOriginSpine || B.bOriginSpine;
+                    if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance)
+                    {
+                        continue;
+                    }
+
+                    const float ConnRadius = bSpineConnector
+                        ? SpineConnectorRadius() : P.ConnectorRadius;
+                    const float ConnReach = ConnRadius + ExtraReach;
 
                     const float Zc = FMath::Lerp(BottomZ, TopZ,
                                                  VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
@@ -1644,7 +1664,18 @@ namespace
             Out.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
             Out.R = FMath::Lerp(P.ShaftMinRadius, P.ShaftMaxRadius,
                                 VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            Out.bOriginSpine = false;
             return true;
+        }
+
+        /** Spine links use a radius above the repository's proven sup|FBM|=1.5 roughness
+         * envelope, so the roughness pass cannot pinch their centreline shut. */
+        float SpineConnectorRadius() const
+        {
+            constexpr float RoughnessAbsBound = 1.5f;
+            const float RoughnessReach = FMath::Max(P.SurfaceRoughness, 0.0f)
+                                       * VOXEL_NOISE_SCALE * RoughnessAbsBound;
+            return FMath::Max(P.ConnectorRadius, RoughnessReach + 1.0f);
         }
 
         /** Le voisinage 3×3 + ses connecteurs, mémoïsés par worker. Clé = cellule + tous les params
@@ -1660,18 +1691,21 @@ namespace
             thread_local int32   VS_CX = INT32_MAX, VS_CY = INT32_MAX;
             thread_local uint32  VS_Salt = 0xFFFFFFFFu;
             thread_local float   VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f,
-                                 VS_MaxR = -1.0f, VS_Cross = -1.0f,
+                                 VS_MaxR = -1.0f, VS_Cross = -1.0f, VS_ConnR = -1.0f,
+                                 VS_Rough = -1.0f, VS_SpineR = -1.0f,
                                  VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX, VS_Seal = -1.0f;
 
             if (CX != VS_CX || CY != VS_CY || Salt != VS_Salt || Spacing != VS_Spacing ||
                 P.ShaftDensity != VS_Dens || P.ShaftMinRadius != VS_MinR || P.ShaftMaxRadius != VS_MaxR ||
-                P.CrossConnectChance != VS_Cross ||
+                P.CrossConnectChance != VS_Cross || P.ConnectorRadius != VS_ConnR ||
+                P.SurfaceRoughness != VS_Rough || SpineRadius != VS_SpineR ||
                 P.StrateBottomWorldZ != VS_BotZ || P.StrateTopWorldZ != VS_TopZ ||
                 P.BoundarySealThickness != VS_Seal)
             {
                 VS_CX = CX;  VS_CY = CY;  VS_Salt = Salt;  VS_Spacing = Spacing;
                 VS_Dens = P.ShaftDensity;  VS_MinR = P.ShaftMinRadius;  VS_MaxR = P.ShaftMaxRadius;
-                VS_Cross = P.CrossConnectChance;
+                VS_Cross = P.CrossConnectChance;  VS_ConnR = P.ConnectorRadius;
+                VS_Rough = P.SurfaceRoughness;    VS_SpineR = SpineRadius;
                 VS_BotZ = P.StrateBottomWorldZ;  VS_TopZ = P.StrateTopWorldZ;
                 VS_Seal = P.BoundarySealThickness;
                 Cache.Shafts.Reset();
@@ -1682,6 +1716,12 @@ namespace
                 {
                     FShaft Sh;
                     if (RollShaft(CX + dx, CY + dy, Sh)) { Cache.Shafts.Add(Sh); }
+                }
+
+                const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
+                if (bOriginNearby && SpineRadius > 0.0f)
+                {
+                    Cache.Shafts.Add({0.0f, 0.0f, SpineRadius, true});
                 }
 
                 if (P.CrossConnectChance > 0.0f && Cache.Shafts.Num() >= 2)
@@ -1699,10 +1739,16 @@ namespace
                         const uint32 PH = VoxelHash::Pair(
                             FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
                             FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), Salt ^ 0xC04Eu);
-                        if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance) { continue; }
+                        const bool bSpineConnector = A.bOriginSpine || B.bOriginSpine;
+                        if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance)
+                        {
+                            continue;
+                        }
 
                         const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-                        Cache.Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc) });
+                        const float ConnectorR = bSpineConnector
+                            ? SpineConnectorRadius() : P.ConnectorRadius;
+                        Cache.Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR });
                     }
                 }
             }
@@ -1712,6 +1758,7 @@ namespace
         FVerticalShaftParams P;
         uint32 Salt;
         float  ExtraReach;
+        float  SpineRadius;
     };
 
     //=========================================================================
@@ -1748,6 +1795,7 @@ namespace
             float BestSq = FLT_MAX;
             for (const FShaftFieldSource::FShaft& Sh : C.Shafts)
             {
+                if (Sh.bOriginSpine) continue;  // ledges belong to real shafts, not the post.
                 const float D2 = FMath::Square(WorldX - Sh.X) + FMath::Square(WorldY - Sh.Y);
                 if (D2 < BestSq) { BestSq = D2; Near = &Sh; }
             }
@@ -4198,7 +4246,8 @@ namespace VoxelDensityOps
         const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
                                * VF_PerlinAbsBound + CarveBlend + 1.0f;
 
-        TUniquePtr<FShaftFieldSource> ShaftSource = MakeUnique<FShaftFieldSource>(P, Seed, ExtraReach);
+        TUniquePtr<FShaftFieldSource> ShaftSource =
+            MakeUnique<FShaftFieldSource>(P, Seed, ExtraReach, SpineRadius);
         const FShaftFieldSource* ShaftPtr = ShaftSource.Get();
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));

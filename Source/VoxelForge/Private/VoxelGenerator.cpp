@@ -3701,23 +3701,26 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     // Shafts + cross-connectors of the 3×3 neighbourhood are pure functions of (cell, seed,
     // params) yet were re-hashed PER VOXEL (9 cell rolls + a pair hash per shaft pair). Bake
     // them once per centre cell (thread_local); per-voxel work = the cylinder/capsule SDFs.
-    struct FLocalShaft { float X, Y, R; };
-    struct FLocalConn  { FVector A, B; };
-    thread_local TArray<FLocalShaft, TInlineAllocator<9>> Shafts;
-    thread_local TArray<FLocalConn, TInlineAllocator<8>>  Conns;
+    struct FLocalShaft { float X, Y, R; bool bOriginSpine; };
+    struct FLocalConn  { FVector A, B; float Radius; };
+    thread_local TArray<FLocalShaft, TInlineAllocator<10>> Shafts;
+    thread_local TArray<FLocalConn, TInlineAllocator<16>> Conns;
     thread_local int32  VS_CX = INT32_MAX, VS_CY = INT32_MAX;
     thread_local uint32 VS_Seed = 0xFFFFFFFFu;
     thread_local float  VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f, VS_MaxR = -1.0f,
-                        VS_Cross = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX;
+                        VS_Cross = -1.0f, VS_ConnR = -1.0f, VS_Rough = -1.0f,
+                        VS_SpineR = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX;
 
     if (CX != VS_CX || CY != VS_CY || S != VS_Seed || Spacing != VS_Spacing ||
         Params.ShaftDensity != VS_Dens || Params.ShaftMinRadius != VS_MinR || Params.ShaftMaxRadius != VS_MaxR ||
-        Params.CrossConnectChance != VS_Cross ||
+        Params.CrossConnectChance != VS_Cross || Params.ConnectorRadius != VS_ConnR ||
+        Params.SurfaceRoughness != VS_Rough || OriginSpineRadius != VS_SpineR ||
         Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ)
     {
         VS_CX = CX;  VS_CY = CY;  VS_Seed = S;  VS_Spacing = Spacing;
         VS_Dens = Params.ShaftDensity;  VS_MinR = Params.ShaftMinRadius;  VS_MaxR = Params.ShaftMaxRadius;
-        VS_Cross = Params.CrossConnectChance;
+        VS_Cross = Params.CrossConnectChance;  VS_ConnR = Params.ConnectorRadius;
+        VS_Rough = Params.SurfaceRoughness;    VS_SpineR = OriginSpineRadius;
         VS_BotZ = Params.StrateBottomWorldZ;  VS_TopZ = Params.StrateTopWorldZ;
         Shafts.Reset();
         Conns.Reset();
@@ -3737,7 +3740,17 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
             Sh.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
             Sh.R = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
                                VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            Sh.bOriginSpine = false;
             Shafts.Add(Sh);
+        }
+
+        // The structural (0,0) spine is not re-carved here. It participates only as a
+        // connector endpoint. The local 3x3 set is origin-adjacent when its centre cell is in
+        // the central 3x3; the structural post remains the sole owner of the vertical column.
+        const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
+        if (bOriginNearby && OriginSpineRadius > 0.0f)
+        {
+            Shafts.Add({0.0f, 0.0f, OriginSpineRadius, true});
         }
 
         // Horizontal connectors between nearby shaft pairs (hash-gated).
@@ -3750,6 +3763,7 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
             {
                 const FLocalShaft& A = Shafts[i];
                 const FLocalShaft& B = Shafts[j];
+                const bool bSpineConnector = A.bOriginSpine || B.bOriginSpine;
                 const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
                 if (DSq > FMath::Square(Spacing * 1.6f)) continue;  // only neighbours
 
@@ -3760,7 +3774,13 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
                 if (VoxelHash::ToFloat01(PH) >= Params.CrossConnectChance) continue;
 
                 const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-                Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc) });
+                const float ConnectorR = bSpineConnector
+                    ? FMath::Max(
+                        Params.ConnectorRadius,
+                        FMath::Max(Params.SurfaceRoughness, 0.0f)
+                            * VOXEL_NOISE_SCALE * 1.5f + 1.0f)
+                    : Params.ConnectorRadius;
+                Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR });
             }
         }
     }
@@ -3770,13 +3790,14 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     // Vertical shafts as infinite cylinders (boundary seal handles the ends).
     for (const FLocalShaft& Sh : Shafts)
     {
+        if (Sh.bOriginSpine) continue;  // VF_ApplyOriginSpine owns the structural column.
         const float DX = WorldX - Sh.X;
         const float DY = WorldY - Sh.Y;
         CaveSDF = FMath::Min(CaveSDF, FMath::Sqrt(DX * DX + DY * DY) - Sh.R);
     }
     for (const FLocalConn& C : Conns)
     {
-        CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, C.A, C.B, Params.ConnectorRadius));
+        CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, C.A, C.B, C.Radius));
     }
 
     // Wall roughness.
@@ -3807,6 +3828,7 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
             const FLocalShaft* Near = nullptr; float BestSq = FLT_MAX;
             for (const FLocalShaft& Sh : Shafts)
             {
+                if (Sh.bOriginSpine) continue;  // ledges belong to real shafts, not the post.
                 const float D2 = FMath::Square(WorldX - Sh.X) + FMath::Square(WorldY - Sh.Y);
                 if (D2 < BestSq) { BestSq = D2; Near = &Sh; }
             }

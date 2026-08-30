@@ -1714,7 +1714,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         SweepSeconds);
 
     Summary += TEXT(
-        "Part A — margin artifact check (SampleStep 2, RadiusInVoxels 192; explicit margins):\n");
+        "Resolution control — margin artifact check (SampleStep 2, RadiusInVoxels 192; explicit margins):\n");
     Summary += TEXT(
         "  margin | verdict | components | largest share | sampled cells | Z window | endpoint snaps\n");
     for (const FRefinementSweepRow& Row : MarginRows)
@@ -1737,7 +1737,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             *SnapText);
     }
     Summary += FString::Printf(
-        TEXT("Part A verdict: %s. Margin sweep wall-clock: %.3f seconds.\n"),
+        TEXT("Resolution-control verdict: %s. Margin sweep wall-clock: %.3f seconds.\n"),
         bMarginArtifact
             ? TEXT("ARTIFACT — at least one margin-0/2/4 query is CONNECTED; the default margin excluded the connection")
             : TEXT("FINDING SURVIVES — no margin-0/2/4 query is CONNECTED; the full window is exonerated"),
@@ -1828,10 +1828,10 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         NumMouthToSpineQueries,
         NumMouthToSpineCoarseLied);
     Summary += TEXT(
-        "Interpretation: the spine is relevant and usually a backbone, but it is not a universal "
-        "connector. The VerticalShafts result supports a placement-first choice for this defect "
-        "because most fixture mouths reach the spine; it does not support treating the spine as "
-        "a guarantee for every archetype.\n");
+        "Interpretation: the structural spine remains a continuous column. After the "
+        "VerticalShafts connector change, the seed-1337 spine is the largest component, but the "
+        "distant shaft networks at the measured passage mouths are not thereby guaranteed to join; "
+        "the 16-seed arrival->departure sweep below is the acceptance measurement.\n");
     Summary += TEXT(
         "Ordering-dependency hazard: making passage i's departure mouth depend on passage i-1's "
         "arrival mouth would make layout generation a sequence. That conflicts with "
@@ -1839,7 +1839,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         "coupled implementation would be expected to break that test. No such dependency was "
         "implemented here.\n");
 
-    if (!bMarginArtifact && bMarginSweepUsable)
+    if (bMarginSweepUsable)
     {
         const FVoxelConnectivityDiagnostics Diagnostics = VF_DiagnoseConnectivity(
             *World.Generator,
@@ -1868,7 +1868,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         const float CoarseStraightLineCells = MouthStraightLine
             / static_cast<float>(DiagnosticSettings.SampleStep);
 
-        Summary += TEXT("Part B — VerticalShafts diagnosis (seed 1337; margin 0; step 2; radius 192):\n");
+        Summary += TEXT("Part C — VerticalShafts post-fix measurement (seed 1337; margin 0; step 2; radius 192):\n");
         Summary += FString::Printf(
             TEXT("  arrival LowerPoint: (%.3f, %.3f, %.3f); departure UpperPoint: "
                  "(%.3f, %.3f, %.3f); XY separation %.3f voxels; Z delta %.3f voxels.\n"),
@@ -1903,6 +1903,20 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             ConnectivityResultName(Diagnostics.Result),
             Diagnostics.bStartSnapped ? TEXT("yes") : TEXT("no"),
             Diagnostics.bGoalSnapped ? TEXT("yes") : TEXT("no"));
+
+        if (MarginRows.Num() > 0
+            && SpineReports.IsValidIndex(VerticalShaftsIndex))
+        {
+            const FVoxelStrateMetrics& VerticalMetrics = MarginRows[0].Metrics;
+            const FSpineDiagnosisReport& VerticalSpine = SpineReports[VerticalShaftsIndex];
+            Summary += FString::Printf(
+                TEXT("  Part C VerticalShafts topology: components=%d; largest share=%.9g; "
+                     "spine component share=%.9g; spine-is-largest=%s.\n"),
+                VerticalMetrics.NumAirComponents,
+                VerticalMetrics.LargestComponentShare,
+                VerticalSpine.SpineComponent.GoalComponentShare,
+                VerticalSpine.SpineComponent.bGoalComponentIsLargest ? TEXT("YES") : TEXT("NO"));
+        }
 
         static constexpr int32 SeedCases[] = {
             1337, 1, 2, 3, 4, 5, 6, 7,
@@ -2039,6 +2053,12 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             SeedArrivalToDepartureSnapEvents,
             SeedSweepSeconds);
         Summary += FString::Printf(
+            TEXT("  ACCEPTANCE arrival->departure: %s (%d/%d seeds pass).\n"),
+            SeedPasses == UE_ARRAY_COUNT(SeedCases) && SeedFailures == 0
+                ? TEXT("PASS") : TEXT("FAIL"),
+            SeedPasses,
+            UE_ARRAY_COUNT(SeedCases));
+        Summary += FString::Printf(
             TEXT("  spine column sweep: full-window run=%d/%d, one-open-run=%d/%d, "
                  "component-largest=%d/%d, no open component=%d; component share range "
                  "[%.9g, %.9g].\n"),
@@ -2110,11 +2130,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     }
     else
     {
-        Summary += FString::Printf(
-            TEXT("Part B diagnosis and multi-seed sweep: SKIPPED because Part A %s.\n"),
-            bMarginArtifact
-                ? TEXT("found the connection in the previously excluded band")
-                : TEXT("did not produce a usable four-row measurement/query set"));
+        Summary += TEXT(
+            "Part C post-fix measurement and multi-seed sweep: SKIPPED because the margin "
+            "measurement set was not usable.\n");
     }
 
     AddInfo(Summary);
