@@ -19,6 +19,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     "VoxelForge.Generation.StrateConnectivityRefinement",
     EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeVerticalShaftSeamTest,
+    "VoxelForge.Generation.VerticalShaftSeamFreedom",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
 namespace
 {
     struct FArchetypeReport
@@ -448,6 +453,7 @@ namespace
         FVoxelConnectivityDiagnostics SpineComponent;
         FVoxelConnectivityDiagnostics ArrivalToSpineFacts;
         FVoxelConnectivityDiagnostics DepartureToSpineFacts;
+        FVoxelStrateMetrics Topology;
     };
 
     bool FindDiagnosticMouths(
@@ -611,6 +617,142 @@ namespace
         }
         return true;
     }
+}
+
+bool CheckVerticalShaftSeams(
+    VoxelForgeTest::FTestWorld& World,
+    int32& OutChecked,
+    int32& OutMismatches,
+    FString& OutFirstMismatch)
+{
+    OutChecked = 0;
+    OutMismatches = 0;
+    OutFirstMismatch.Reset();
+
+    int32 TopVoxelZ = 0;
+    int32 BottomVoxelZ = 0;
+    if (!World.GetSlotVoxelZRange(
+            VoxelForgeTest::FTestWorld::SlotVerticalShafts, TopVoxelZ, BottomVoxelZ))
+    {
+        return false;
+    }
+
+    const FVerticalShaftParams P = World.StrateManager->GetVerticalShaftParamsForChunk(
+        FIntVector(0, 0, (TopVoxelZ + BottomVoxelZ) / (2 * CHUNK_SIZE)));
+    const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
+    const float Z = static_cast<float>((TopVoxelZ + BottomVoxelZ) / 2);
+    const UVoxelGenerator* Generator = World.Generator.Get();
+
+    // A point is sampled immediately on both sides of many shaft-cell boundaries. For each point,
+    // two calls in distinct chunk contexts warm the per-chunk state in opposite orders before the
+    // same point is evaluated again. A different parent window would then show up as a bit change.
+    for (int32 CellY = -3; CellY <= 3; ++CellY)
+    {
+        for (int32 CellX = -5; CellX <= 5; ++CellX)
+        {
+            const float CellBoundaryX = static_cast<float>(CellX + 1) * Spacing;
+            const float Y = (static_cast<float>(CellY) + 0.37f) * Spacing;
+            for (const float X : { CellBoundaryX - 0.25f, CellBoundaryX + 0.25f })
+            {
+                const FVector Probe(X, Y, Z);
+                const int32 ProbeChunkX = FMath::FloorToInt(X / static_cast<float>(CHUNK_SIZE));
+                const int32 ProbeChunkY = FMath::FloorToInt(Y / static_cast<float>(CHUNK_SIZE));
+                const FVector ContextA(
+                    static_cast<float>(ProbeChunkX * CHUNK_SIZE + 1),
+                    static_cast<float>(ProbeChunkY * CHUNK_SIZE + 1), Z);
+                const FVector ContextB(
+                    static_cast<float>((ProbeChunkX + 1) * CHUNK_SIZE + 1),
+                    static_cast<float>((ProbeChunkY - 1) * CHUNK_SIZE + 1), Z);
+
+                const float Reference = Generator->GetDensityAt(Probe.X, Probe.Y, Probe.Z);
+                if (((CellX + CellY) & 1) == 0)
+                {
+                    Generator->GetDensityAt(ContextA.X, ContextA.Y, ContextA.Z);
+                    Generator->GetDensityAt(ContextB.X, ContextB.Y, ContextB.Z);
+                }
+                else
+                {
+                    Generator->GetDensityAt(ContextB.X, ContextB.Y, ContextB.Z);
+                    Generator->GetDensityAt(ContextA.X, ContextA.Y, ContextA.Z);
+                }
+                const float Got = Generator->GetDensityAt(Probe.X, Probe.Y, Probe.Z);
+
+                ++OutChecked;
+                if (!SameFloatBits(Reference, Got))
+                {
+                    if (OutMismatches == 0)
+                    {
+                        OutFirstMismatch = FString::Printf(
+                            TEXT("at (%.3f, %.3f, %.3f): reference %.9g [0x%08X] vs after "
+                                 "neighbouring chunk contexts %.9g [0x%08X]"),
+                            Probe.X,
+                            Probe.Y,
+                            Probe.Z,
+                            Reference,
+                            *reinterpret_cast<const uint32*>(&Reference),
+                            Got,
+                            *reinterpret_cast<const uint32*>(&Got));
+                    }
+                    ++OutMismatches;
+                }
+            }
+        }
+    }
+    return OutChecked > 0;
+}
+
+bool FVoxelForgeVerticalShaftSeamTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+
+    bool bAllChecksPassed = true;
+    FString Summary = TEXT("VerticalShafts seam-freedom check (cell-boundary probes with two "
+                          "neighbouring chunk-context orders):\n");
+    for (const bool bUseOperatorStack : { false, true })
+    {
+        FTestWorld World;
+        World.Build(/*InSeed=*/1337, /*InGapChunks=*/2, bUseOperatorStack);
+        if (!World.IsValid())
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: could not build the %s seam-test fixture."),
+                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")));
+            bAllChecksPassed = false;
+            continue;
+        }
+
+        int32 Checked = 0;
+        int32 Mismatches = 0;
+        FString FirstMismatch;
+        if (!CheckVerticalShaftSeams(World, Checked, Mismatches, FirstMismatch))
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: the %s seam test sampled no VerticalShafts positions."),
+                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")));
+            bAllChecksPassed = false;
+            continue;
+        }
+
+        Summary += FString::Printf(
+            TEXT("  %s path: %d same-position re-evaluations, %d bit mismatches%s%s.\n"),
+            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
+            Checked,
+            Mismatches,
+            Mismatches > 0 ? TEXT("; first ") : TEXT(""),
+            Mismatches > 0 ? *FirstMismatch : TEXT(""));
+        if (Mismatches != 0)
+        {
+            AddError(FString::Printf(
+                TEXT("SEAM: %s VerticalShafts density changed after different chunk-context "
+                     "orders: %s"),
+                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
+                *FirstMismatch));
+            bAllChecksPassed = false;
+        }
+    }
+
+    AddInfo(Summary);
+    return bAllChecksPassed;
 }
 
 bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
@@ -1936,6 +2078,11 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         int32 SeedSpineNoOpenCell = 0;
         float SeedSpineShareMin = FLT_MAX;
         float SeedSpineShareMax = -FLT_MAX;
+        int32 SeedTopologyInvalid = 0;
+        int32 SeedTopologyComponentsMin = INT32_MAX;
+        int32 SeedTopologyComponentsMax = 0;
+        float SeedTopologyLargestShareMin = FLT_MAX;
+        float SeedTopologyLargestShareMax = -FLT_MAX;
         TArray<FSpineDiagnosisReport> SeedReports;
         SeedReports.Reserve(UE_ARRAY_COUNT(SeedCases));
         const double SeedSweepStartSeconds = FPlatformTime::Seconds();
@@ -1971,6 +2118,51 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
                 continue;
             }
             SeedReport.Seed = Seed;
+
+            const FVoxelStrateMetrics& Topology = SeedReport.Topology = VF_MeasureStrate(
+                *SeedWorld.Generator,
+                *SeedWorld.StrateManager,
+                VerticalShaftsIndex,
+                DiagnosticSettings);
+            const bool bTopologyUsable =
+                Topology.bValid
+                && Topology.NumSampled > 0
+                && Topology.NumAir > 0
+                && Topology.NumSolid > 0
+                && Topology.NumAirComponents > 0
+                && Topology.LargestComponentCells > 0
+                && Topology.LargestComponentCells <= Topology.NumAir
+                && FMath::IsFinite(Topology.LargestComponentShare)
+                && Topology.LargestComponentShare >= 0.0f
+                && Topology.LargestComponentShare <= 1.0f;
+            if (!bTopologyUsable)
+            {
+                ++SeedTopologyInvalid;
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: seed %d VerticalShafts topology measurement is not "
+                         "usable (valid=%s, sampled=%lld, air=%lld, solid=%lld, components=%d, "
+                         "largest share=%.9g, reason='%s')."),
+                    Seed,
+                    Topology.bValid ? TEXT("true") : TEXT("false"),
+                    Topology.NumSampled,
+                    Topology.NumAir,
+                    Topology.NumSolid,
+                    Topology.NumAirComponents,
+                    Topology.LargestComponentShare,
+                    *Topology.RefusalReason));
+                bAllChecksPassed = false;
+            }
+            else
+            {
+                SeedTopologyComponentsMin = FMath::Min(
+                    SeedTopologyComponentsMin, Topology.NumAirComponents);
+                SeedTopologyComponentsMax = FMath::Max(
+                    SeedTopologyComponentsMax, Topology.NumAirComponents);
+                SeedTopologyLargestShareMin = FMath::Min(
+                    SeedTopologyLargestShareMin, Topology.LargestComponentShare);
+                SeedTopologyLargestShareMax = FMath::Max(
+                    SeedTopologyLargestShareMax, Topology.LargestComponentShare);
+            }
 
             if (!SeedReport.bHasChainArrival || !SeedReport.bHasDeparture
                 || !SeedReport.ArrivalToDeparture.bChecked)
@@ -2030,7 +2222,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             }
 
             const EVoxelConnectivityResult SeedResult = SeedReport.ArrivalToDeparture.Result;
-            if (SeedResult == EVoxelConnectivityResult::Connected
+            if (bTopologyUsable
+                && SeedResult == EVoxelConnectivityResult::Connected
                 && !SeedReport.ArrivalToDeparture.bStartSnapped
                 && !SeedReport.ArrivalToDeparture.bGoalSnapped)
             {
@@ -2072,6 +2265,15 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             SeedSpineShareMin == FLT_MAX ? 0.0f : SeedSpineShareMin,
             SeedSpineShareMax == -FLT_MAX ? 0.0f : SeedSpineShareMax);
         Summary += FString::Printf(
+            TEXT("  seed topology: components range [%d, %d], largest-component share range "
+                 "[%.9g, %.9g], invalid measurements=%d; spine-component share is reported "
+                 "per seed below.\n"),
+            SeedTopologyComponentsMin == INT32_MAX ? 0 : SeedTopologyComponentsMin,
+            SeedTopologyComponentsMax,
+            SeedTopologyLargestShareMin == FLT_MAX ? 0.0f : SeedTopologyLargestShareMin,
+            SeedTopologyLargestShareMax == -FLT_MAX ? 0.0f : SeedTopologyLargestShareMax,
+            SeedTopologyInvalid);
+        Summary += FString::Printf(
             TEXT("  seed result breakdown — arrival->spine: CONNECTED=%d, "
                  "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
                  "OUT_OF_WINDOW=%d, COARSE_LIED=%d; departure->spine: CONNECTED=%d, "
@@ -2103,8 +2305,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             SeedArrivalToSpineSnapEvents,
             SeedDepartureToSpineSnapEvents,
             SeedArrivalToDepartureSnapEvents);
-        Summary += TEXT("  seed | spine air | full run | one open run | spine share | spine largest | "
-                       "arrival->spine | departure->spine | arrival->departure\n");
+        Summary += TEXT("  seed | components | largest share | spine air | spine share | spine largest | "
+                       "full run | one open run | arrival->spine | departure->spine | "
+                       "arrival->departure\n");
         for (int32 SeedIndex = 0; SeedIndex < SeedReports.Num(); ++SeedIndex)
         {
             const FSpineDiagnosisReport& SeedReport = SeedReports[SeedIndex];
@@ -2115,14 +2318,22 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             const FString SpineLargest = SeedReport.SpineComponent.GoalComponentCells > 0
                 ? (SeedReport.SpineComponent.bGoalComponentIsLargest ? TEXT("YES") : TEXT("NO"))
                 : TEXT("N/A");
+            const FString Components = SeedReport.Topology.bValid
+                ? FString::Printf(TEXT("%d"), SeedReport.Topology.NumAirComponents)
+                : TEXT("N/A");
+            const FString LargestShare = SeedReport.Topology.bValid
+                ? FString::Printf(TEXT("%.9g"), SeedReport.Topology.LargestComponentShare)
+                : TEXT("N/A");
             Summary += FString::Printf(
-                TEXT("  %d | %.9g | %s | %s | %s | %s | %s | %s | %s\n"),
+                TEXT("  %d | %s | %s | %.9g | %s | %s | %s | %s | %s | %s | %s\n"),
                 SeedReport.Seed,
+                *Components,
+                *LargestShare,
                 SeedReport.Spine.AirFraction,
-                SeedReport.Spine.bFullWindowRun ? TEXT("YES") : TEXT("NO"),
-                SeedReport.Spine.bAirSamplesFormOneRun ? TEXT("YES") : TEXT("NO"),
                 *SpineShare,
                 *SpineLargest,
+                SeedReport.Spine.bFullWindowRun ? TEXT("YES") : TEXT("NO"),
+                SeedReport.Spine.bAirSamplesFormOneRun ? TEXT("YES") : TEXT("NO"),
                 *ConnectivityProbeText(SeedReport.ArrivalToSpine),
                 *ConnectivityProbeText(SeedReport.DepartureToSpine),
                 *ConnectivityProbeText(SeedReport.ArrivalToDeparture));

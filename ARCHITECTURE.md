@@ -46,23 +46,27 @@ what the world IS, and both paths compute it.
   `UVoxelGenerator::OriginSpineRadius` ← `VoxelSettings::OriginSpineRadius`. Called before
   every `ApplyBoundarySeal`.
 - `VerticalShafts` treats that structural column as a **connector endpoint**, not as a second
-  density primitive: while rebuilding its memoised 3×3 shaft neighbourhood, an origin-adjacent
-  query adds `(0,0,OriginSpineRadius)` to the local shaft set for pair generation only. The
-  existing `VoxelHash::Pair` gate and `Spacing*1.6` neighbour cutoff remain in force, so the link
-  is a pure function of the shaft cell and seed and is independent of evaluation order. Spine
-  links use a radius above the proven `sup|FBM|=1.5` roughness envelope (`max(ConnectorRadius,
-  SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 + 1)`); the ordinary connector radius and ordinary shaft
-  roughness are unchanged. `BuildVerticalShaftStack` receives the same runtime spine radius and
-  mirrors this source rule; `VF_ApplyOriginSpine` remains the sole owner of the column itself.
+  density primitive. A thread-local rebuild collects a 7×7 cell window once, emits tree links only
+  for the inner 3×3 cells, and resolves each parent from its complete 5×5 candidate window. Each
+  shaft chooses the nearest shaft whose jittered distance to (0,0) is strictly smaller; ties use
+  the lowest cell index. A local minimum links directly to the spine. The wider collection is
+  therefore fully contained for every emitted shaft and the parent is independent of chunk or
+  evaluation-cell boundaries. The existing probabilistic `VoxelHash::Pair` links and
+  `Spacing*1.6` cutoff remain as texture and loops; they are additive, not the connectivity law.
+  Tree links use a radius strictly above the proven `sup|FBM|=1.5` roughness envelope
+  (`max(ConnectorRadius, SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 + 1)`).
+  `BuildVerticalShaftStack` mirrors the same tree, random links, windows, hashes, and radius;
+  `VF_ApplyOriginSpine` remains the sole owner of the vertical column itself.
 - Descent is **player-dug** through the thin seals at (0,0). The single auto-opened
   connection is the **surface entry shaft** at (0,0) through the top of strate 0
   (`GeneratePassages`, `bOpenSurfaceEntry`).
 - **Hybrid extras:** auto-carved *shortcut* passages per boundary, placed away from (0,0).
   Now fully **per-strate** — see §8.8 (the upper strate's `PassageConfig` drives count/style/shape).
 
-This connector is local topology, not a promise that independently placed shortcut mouths are
-globally connected. The acceptance measurement for `VerticalShafts` remains the actual
-arrival→departure flood-fill at the passage endpoints.
+The tree is a construction guarantee for the shaft field: every seeded shaft has one inward
+edge, and every chain strictly decreases distance to the origin until it reaches a local minimum
+that links to the spine. It does not alter passage placement. The acceptance measurement remains
+the actual arrival→departure flood-fill at the independently placed passage endpoints.
 
 ### 8.3 Disturbance layer (the "wow" post-process)
 `FStrateDisturbanceParams` (on the definition, all archetypes). `ApplyDisturbances`
@@ -337,10 +341,13 @@ driven by `EditorBrush*` props.
   no loads AND no LOD mismatches outstanding.
 - **SDF cache** (`GetDensityWithParams`): search-BOX validity, not chunk-key — gradient ±1
   sampling must not thrash the (expensive) rebuild.
-- **VerticalShafts field cache**: shaft rolls and pair decisions, including the structural-spine
-  connector endpoint, are rebuilt only when the thread-local centre cell or a geometry-affecting
-  parameter changes. They must not be re-hashed in the per-voxel loop; the operator-stack source
-  follows the same cache contract.
+- **VerticalShafts field cache**: shaft rolls and connector decisions, including the structural
+  tree and structural-spine connector endpoint, are rebuilt only when the thread-local centre cell
+  or a geometry-affecting parameter changes. Each rebuild rolls 49 cells (7×7); it stores/emits
+  only the inner 3×3 shafts and their capsules for the per-voxel loop. The complete 5×5 parent
+  windows are contained by that 7×7 collection, so no parent decision depends on the evaluation
+  cell. No cell or pair hash may move into the per-voxel loop; the operator-stack source follows
+  the same cache contract.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
   thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
   prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner

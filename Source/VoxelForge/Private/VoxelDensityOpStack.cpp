@@ -1444,13 +1444,14 @@ namespace
     //=========================================================================
     // RÔLE 1 — SOURCE : PUITS VERTICAUX / VERTICAL SHAFTS
     //=========================================================================
-    // Cylindres infinis sur une grille XY jitterée + connecteurs horizontaux entre paires proches,
-    // ouverts par un hash de paire symétrique. Écrit le canal SDF uniquement.
+    // Cylindres infinis sur une grille XY jitterée + un arbre de drainage déterministe, complété
+    // par des connecteurs horizontaux entre paires proches ouverts par un hash de paire. Écrit le
+    // canal SDF uniquement.
     //
     // ⚠️ ÉCART ASSUMÉ AVEC `OPSTACK-DECOMPOSITION §6`, qui suggérait DEUX sources (colonnes XY-pures
     // + connecteurs) pour que la moitié cylindrique reçoive le traitement du cache de colonne et un
     // `ClassifyBox` exact en XY. Gardé en UN opérateur, et voici pourquoi :
-    //   • les connecteurs se dérivent de la MÊME liste 3×3 que les puits (il faut les paires), donc
+    //   • les connecteurs se dérivent de la MÊME liste inner 3×3 que les puits (il faut les paires), donc
     //     séparer imposerait soit de rouler les cellules deux fois, soit un cache partagé entre
     //     deux ops — c'est-à-dire la complexité qu'on voulait éviter ;
     //   • le `FShaftLedgeMod` en aval a de toute façon besoin de la liste des puits, donc il faut
@@ -1459,9 +1460,10 @@ namespace
     // gardé : un `EffectOverBox` conservatif qui teste cercles ET capsules, ce que la version
     // séparée aurait dû faire aussi. À revoir si le profil montre que ça compte.
     //
-    // Kept as ONE op against §6's suggestion: the connectors derive from the same 3×3 roll as the
-    // shafts, and the downstream ledge mod needs the shaft list anyway. What is forfeited is an
-    // exact XY box verdict on the cylinder half alone.
+    // Kept as ONE op against §6's suggestion: the per-voxel connectors derive from the same inner
+    // 3×3 roll as the shafts, while a rebuild-only 7×7 collection resolves each 5×5 tree window;
+    // the downstream ledge mod needs the inner shaft list anyway. What is forfeited is an exact XY
+    // box verdict on the cylinder half alone.
     class FShaftFieldSource final : public IVoxelDensityOp
     {
     public:
@@ -1473,7 +1475,7 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
-        struct FShaft { float X, Y, R; bool bOriginSpine; };
+        struct FShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
         struct FConn  { FVector A, B; float Radius; };
 
         // ⚠️ DÉCLARÉE ICI, avant toute fonction qui la renvoie. Un type imbriqué doit exister au
@@ -1485,7 +1487,7 @@ namespace
         struct FCells
         {
             TArray<FShaft, TInlineAllocator<10>> Shafts;
-            TArray<FConn,  TInlineAllocator<16>> Conns;
+            TArray<FConn,  TInlineAllocator<24>> Conns;
         };
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -1546,6 +1548,105 @@ namespace
             }
 
             //-----------------------------------------------------------------
+            // THE STRUCTURAL TREE — enumerate every inner cell that the box can query, then
+            // collect its complete 5×5 parent window. This is the EffectOverBox mirror of GetCells:
+            // it may over-enumerate, but it must never miss a cached tree capsule.
+            //-----------------------------------------------------------------
+            constexpr int32 CandidateRadius = 2;
+            constexpr uint32 TreeSalt = 0x7A11u;
+            const int32 EmitX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
+            const int32 EmitX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
+            const int32 EmitY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
+            const int32 EmitY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
+
+            TArray<FShaft, TInlineAllocator<64>> TreeCandidates;
+            TArray<FShaft, TInlineAllocator<32>> TreeEmit;
+            for (int32 cy = EmitY0 - CandidateRadius; cy <= EmitY1 + CandidateRadius; ++cy)
+            for (int32 cx = EmitX0 - CandidateRadius; cx <= EmitX1 + CandidateRadius; ++cx)
+            {
+                FShaft Sh;
+                if (!RollShaft(cx, cy, Sh)) { continue; }
+                TreeCandidates.Add(Sh);
+                if (cx >= EmitX0 && cx <= EmitX1 && cy >= EmitY0 && cy <= EmitY1)
+                {
+                    TreeEmit.Add(Sh);
+                }
+            }
+
+            const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
+            const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
+            const float TreeRadius = SpineConnectorRadius();
+            const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
+            const FVector2D CtrXY(0.5f * (float)(VoxelBox.Min.X + VoxelBox.Max.X),
+                                  0.5f * (float)(VoxelBox.Min.Y + VoxelBox.Max.Y));
+            const float HalfDiagXY = 0.5f * FMath::Sqrt(
+                FMath::Square((float)(VoxelBox.Max.X - VoxelBox.Min.X)) +
+                FMath::Square((float)(VoxelBox.Max.Y - VoxelBox.Min.Y)));
+            auto ConnectorMayReachBox = [&](const FConn& Conn)
+            {
+                const float ConnReach = Conn.Radius + ExtraReach;
+                const float Zc = Conn.A.Z;
+                if (RMinZ > Zc + ConnReach || RMaxZ < Zc - ConnReach) { return false; }
+                const float DistXY = VF_DistPointSegment2D(
+                    CtrXY, FVector2D(Conn.A.X, Conn.A.Y), FVector2D(Conn.B.X, Conn.B.Y));
+                return DistXY - HalfDiagXY < ConnReach;
+            };
+
+            for (const FShaft& Child : TreeEmit)
+            {
+                const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
+                const FShaft* Parent = nullptr;
+                float BestDistanceSq = FLT_MAX;
+                for (const FShaft& Candidate : TreeCandidates)
+                {
+                    if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
+                    {
+                        continue;
+                    }
+                    if (FMath::Abs(Candidate.CellX - Child.CellX) > CandidateRadius
+                        || FMath::Abs(Candidate.CellY - Child.CellY) > CandidateRadius)
+                    {
+                        continue;
+                    }
+
+                    const float CandidateOriginSq = FMath::Square(Candidate.X)
+                                                   + FMath::Square(Candidate.Y);
+                    if (!(CandidateOriginSq < ChildOriginSq))
+                    {
+                        continue;
+                    }
+
+                    const float DistanceSq = FMath::Square(Child.X - Candidate.X)
+                                           + FMath::Square(Child.Y - Candidate.Y);
+                    const bool bLowerCell = Parent == nullptr
+                        || Candidate.CellY < Parent->CellY
+                        || (Candidate.CellY == Parent->CellY
+                            && Candidate.CellX < Parent->CellX);
+                    if (DistanceSq < BestDistanceSq
+                        || (DistanceSq == BestDistanceSq && bLowerCell))
+                    {
+                        BestDistanceSq = DistanceSq;
+                        Parent = &Candidate;
+                    }
+                }
+
+                const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
+                const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
+                const uint32 LinkHash = VoxelHash::Pair(
+                    Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
+                const float Zc = FMath::Lerp(
+                    P.StrateBottomWorldZ + P.BoundarySealThickness,
+                    P.StrateTopWorldZ - P.BoundarySealThickness,
+                    VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+                const FVector ParentPoint = Parent != nullptr
+                    ? FVector(Parent->X, Parent->Y, Zc)
+                    : FVector(0.0f, 0.0f, Zc);
+                const FConn TreeConn{
+                    FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius };
+                if (ConnectorMayReachBox(TreeConn)) { return EVoxelOpEffect::CarveOnly; }
+            }
+
+            //-----------------------------------------------------------------
             // LES CONNECTEURS — LES VRAIES CAPSULES, PLUS « un puits existe dans le coin »
             //-----------------------------------------------------------------
             // ⚠️ CE BLOC RENDAIT `CarveOnly` DÈS QU'UN PUITS **EXISTAIT** dans la boîte élargie de
@@ -1558,11 +1659,11 @@ namespace
             // construit, et tester la capsule réelle.
             //
             // ⚠️ POURQUOI L'ÉNUMÉRATION EST UN SUR-ENSEMBLE (donc sûre). `Eval` lit les connecteurs
-            // du voisinage 3×3 de la cellule DE SA REQUÊTE. Une paire visible depuis un point de la
-            // boîte a donc ses deux puits dans un même 3×3 centré sur une cellule que la boîte
-            // touche ⇒ les deux sont dans [cellules de la boîte] ± 1, qui est exactement la plage
-            // balayée ici. On peut produire des paires que personne ne voit jamais : c'est du
-            // `CarveOnly` en trop, pas un trou.
+            // du voisinage inner 3×3 de la cellule DE SA REQUÊTE. Une paire random visible depuis
+            // un point de la boîte a donc ses deux puits dans [cellules de la boîte] ± 1, qui est
+            // exactement la plage balayée ici. Les connecteurs de l'arbre sont testés séparément
+            // au-dessus avec leur collecte 7×7/émission inner 3×3. On peut produire des paires que
+            // personne ne voit jamais : c'est du `CarveOnly` en trop, pas un trou.
             //
             // ⚠️ ET POURQUOI L'ORDRE (A,B) EST LE MÊME QUE CELUI DE `GetCells`. Le hash de paire est
             // pris sur (A puis B) dans l'ordre d'insertion, et `GetCells` insère en `(dy, dx)`,
@@ -1573,15 +1674,15 @@ namespace
             //
             // Was: return CarveOnly as soon as any shaft EXISTED within Spacing*1.6 + Pad, which at
             // ShaftSpacing 55 / ShaftDensity 0.6 is true everywhere -- 0 of 60 tiles proved. Now it
-            // rebuilds the connectors the way GetCells does and tests the real capsule. The pair
+            // rebuilds the random links the way GetCells does and tests the real capsule. The pair
             // enumeration is a superset (safe), and the row-major cell order reproduces GetCells'
             // insertion order, so each pair gets the same hash without assuming Pair() is symmetric.
             if (P.CrossConnectChance > 0.0f)
             {
-                const int32 QX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
-                const int32 QX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
-                const int32 QY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
-                const int32 QY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
+                const int32 QX0 = EmitX0;
+                const int32 QX1 = EmitX1;
+                const int32 QY0 = EmitY0;
+                const int32 QY1 = EmitY1;
 
                 TArray<FShaft, TInlineAllocator<32>> Near;
                 for (int32 cy = QY0; cy <= QY1; ++cy)
@@ -1598,21 +1699,11 @@ namespace
                     && QX0 <= 1 && QX1 >= -1
                     && QY0 <= 1 && QY1 >= -1)
                 {
-                    Near.Add({0.0f, 0.0f, SpineRadius, true});
+                    Near.Add({0.0f, 0.0f, SpineRadius, 0, 0, true});
                 }
-
-                const float BottomZ   = P.StrateBottomWorldZ + P.BoundarySealThickness;
-                const float TopZ      = P.StrateTopWorldZ    - P.BoundarySealThickness;
 
                 // Z est traité EXACTEMENT (le connecteur est une capsule horizontale à `Zc`), XY de
                 // façon conservative. Séparer les deux est bien plus serré qu'une demi-diagonale 3D.
-                const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
-                const FVector2D CtrXY(0.5f * (float)(VoxelBox.Min.X + VoxelBox.Max.X),
-                                      0.5f * (float)(VoxelBox.Min.Y + VoxelBox.Max.Y));
-                const float HalfDiagXY = 0.5f * FMath::Sqrt(
-                    FMath::Square((float)(VoxelBox.Max.X - VoxelBox.Min.X)) +
-                    FMath::Square((float)(VoxelBox.Max.Y - VoxelBox.Min.Y)));
-
                 for (int32 i = 0; i < Near.Num(); ++i)
                 for (int32 j = i + 1; j < Near.Num(); ++j)
                 {
@@ -1632,17 +1723,11 @@ namespace
 
                     const float ConnRadius = bSpineConnector
                         ? SpineConnectorRadius() : P.ConnectorRadius;
-                    const float ConnReach = ConnRadius + ExtraReach;
-
                     const float Zc = FMath::Lerp(BottomZ, TopZ,
                                                  VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-                    if (RMinZ > Zc + ConnReach || RMaxZ < Zc - ConnReach) { continue; }
-
-                    const float DistXY = VF_DistPointSegment2D(
-                        CtrXY, FVector2D(A.X, A.Y), FVector2D(B.X, B.Y));
-                    if (DistXY - HalfDiagXY >= ConnReach) { continue; }
-
-                    return EVoxelOpEffect::CarveOnly;
+                    const FConn RandomConn{
+                        FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnRadius };
+                    if (ConnectorMayReachBox(RandomConn)) { return EVoxelOpEffect::CarveOnly; }
                 }
             }
 
@@ -1664,6 +1749,8 @@ namespace
             Out.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
             Out.R = FMath::Lerp(P.ShaftMinRadius, P.ShaftMaxRadius,
                                 VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            Out.CellX = nx;
+            Out.CellY = ny;
             Out.bOriginSpine = false;
             return true;
         }
@@ -1678,7 +1765,8 @@ namespace
             return FMath::Max(P.ConnectorRadius, RoughnessReach + 1.0f);
         }
 
-        /** Le voisinage 3×3 + ses connecteurs, mémoïsés par worker. Clé = cellule + tous les params
+        /** Le voisinage inner 3×3 + ses connecteurs, mémoïsés par worker. Le rebuild collecte un
+         *  7×7 temporaire pour résoudre les fenêtres parent 5×5. Clé = cellule + tous les params
          *  qui influent (comme l'original) : stable à travers les reconstructions de pile, ce qui
          *  est la leçon retenue du mémo de colonne de SurfaceWorld. */
         const FCells& GetCells(float WorldX, float WorldY) const
@@ -1711,23 +1799,101 @@ namespace
                 Cache.Shafts.Reset();
                 Cache.Conns.Reset();
 
-                for (int32 dy = -1; dy <= 1; dy++)
-                for (int32 dx = -1; dx <= 1; dx++)
+                constexpr int32 CollectRadius = 3;   // 7×7: inner 3×3 + one 5×5 candidate halo
+                constexpr int32 EmitRadius = 1;      // 3×3: the only cells allowed to emit tree links
+                constexpr int32 CandidateRadius = 2; // 5×5 parent window around an emitting shaft
+                constexpr uint32 TreeSalt = 0x7A11u;
+
+                TArray<FShaft, TInlineAllocator<49>> CollectedShafts;
+                // Rebuild-only wide collection. `Cache.Shafts` remains the inner 3×3 working set
+                // used by Eval and the ledge modifier, so the 7×7 cost is not paid per voxel.
+                for (int32 dy = -CollectRadius; dy <= CollectRadius; dy++)
+                for (int32 dx = -CollectRadius; dx <= CollectRadius; dx++)
                 {
                     FShaft Sh;
-                    if (RollShaft(CX + dx, CY + dy, Sh)) { Cache.Shafts.Add(Sh); }
+                    if (!RollShaft(CX + dx, CY + dy, Sh)) { continue; }
+                    CollectedShafts.Add(Sh);
+                    if (FMath::Abs(dx) <= EmitRadius && FMath::Abs(dy) <= EmitRadius)
+                    {
+                        Cache.Shafts.Add(Sh);
+                    }
                 }
 
                 const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
                 if (bOriginNearby && SpineRadius > 0.0f)
                 {
-                    Cache.Shafts.Add({0.0f, 0.0f, SpineRadius, true});
+                    Cache.Shafts.Add({0.0f, 0.0f, SpineRadius, 0, 0, true});
                 }
 
+                const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
+                const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
+                const float TreeRadius = SpineConnectorRadius();
+
+                auto EmitTreeConnector = [&](const FShaft& Child, const FShaft* Parent)
+                {
+                    const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
+                    const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
+                    const uint32 LinkHash = VoxelHash::Pair(
+                        Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
+                    const float Zc = FMath::Lerp(
+                        BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+                    const FVector ParentPoint = Parent != nullptr
+                        ? FVector(Parent->X, Parent->Y, Zc)
+                        : FVector(0.0f, 0.0f, Zc);
+                    Cache.Conns.Add({ FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius });
+                };
+
+                // Structural drainage tree. Every real shaft emitted by this cache chooses the
+                // nearest strictly more-central shaft in its complete 5×5 window; a local minimum
+                // drains to the spine. The explicit row-major cell tie-break is independent of
+                // array iteration order, and the synthetic spine is not a candidate shaft.
+                for (const FShaft& Child : Cache.Shafts)
+                {
+                    if (Child.bOriginSpine) continue;
+
+                    const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
+                    const FShaft* Parent = nullptr;
+                    float BestDistanceSq = FLT_MAX;
+                    for (const FShaft& Candidate : CollectedShafts)
+                    {
+                        if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
+                        {
+                            continue;
+                        }
+                        if (FMath::Abs(Candidate.CellX - Child.CellX) > CandidateRadius
+                            || FMath::Abs(Candidate.CellY - Child.CellY) > CandidateRadius)
+                        {
+                            continue;
+                        }
+
+                        const float CandidateOriginSq = FMath::Square(Candidate.X)
+                                                       + FMath::Square(Candidate.Y);
+                        if (!(CandidateOriginSq < ChildOriginSq))
+                        {
+                            continue;
+                        }
+
+                        const float DistanceSq = FMath::Square(Child.X - Candidate.X)
+                                               + FMath::Square(Child.Y - Candidate.Y);
+                        const bool bLowerCell = Parent == nullptr
+                            || Candidate.CellY < Parent->CellY
+                            || (Candidate.CellY == Parent->CellY
+                                && Candidate.CellX < Parent->CellX);
+                        if (DistanceSq < BestDistanceSq
+                            || (DistanceSq == BestDistanceSq && bLowerCell))
+                        {
+                            BestDistanceSq = DistanceSq;
+                            Parent = &Candidate;
+                        }
+                    }
+
+                    EmitTreeConnector(Child, Parent);
+                }
+
+                // Existing random links remain the texture/loop layer and stay on the inner 3×3
+                // set. Only the deterministic parent lookup uses the 7×7 collection.
                 if (P.CrossConnectChance > 0.0f && Cache.Shafts.Num() >= 2)
                 {
-                    const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
-                    const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
                     for (int32 i = 0; i < Cache.Shafts.Num(); i++)
                     for (int32 j = i + 1; j < Cache.Shafts.Num(); j++)
                     {

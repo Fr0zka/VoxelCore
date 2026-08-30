@@ -3679,9 +3679,9 @@ void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float World
 //=============================================================================
 // VERTICAL-SHAFT GENERATOR  (ECaveGeneratorType::VerticalShafts)
 //=============================================================================
-// Solid rock carved by hash-placed full-height vertical shafts (cylinders) with
-// occasional horizontal connector tunnels between neighbouring shafts and partial
-// ledges inside them. Emphasises climbing and falling.
+// Solid rock carved by hash-placed full-height vertical shafts (cylinders), a deterministic
+// drainage tree of horizontal connector tunnels rooted at the origin spine, additive random
+// connector loops, and partial ledges inside them. Emphasises climbing and falling.
 
 float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float WorldZ,
                                                const FVerticalShaftParams& Params) const
@@ -3698,36 +3698,50 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     const int32 CX = FMath::FloorToInt(WorldX / Spacing);
     const int32 CY = FMath::FloorToInt(WorldY / Spacing);
 
-    // Shafts + cross-connectors of the 3×3 neighbourhood are pure functions of (cell, seed,
-    // params) yet were re-hashed PER VOXEL (9 cell rolls + a pair hash per shaft pair). Bake
-    // them once per centre cell (thread_local); per-voxel work = the cylinder/capsule SDFs.
-    struct FLocalShaft { float X, Y, R; bool bOriginSpine; };
+    // The shaft topology is pure, but it is deliberately split into two windows:
+    //   * COLLECT 7×7 cells once during this thread-local cache rebuild. This is the source data
+    //     needed to resolve every 5×5 parent window for the emitted cells below.
+    //   * EMIT/EVALUATE only the INNER 3×3 cells. A shaft in that inner window has its whole
+    //     5×5 candidate window inside the collected 7×7, so two neighbouring evaluation cells
+    //     compute the same parent for the same shaft. The 7×7 work is therefore rebuild-only;
+    //     the per-voxel loop still sees at most the inner 3×3 shafts plus their cached capsules.
+    struct FLocalShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
     struct FLocalConn  { FVector A, B; float Radius; };
     thread_local TArray<FLocalShaft, TInlineAllocator<10>> Shafts;
-    thread_local TArray<FLocalConn, TInlineAllocator<16>> Conns;
+    thread_local TArray<FLocalConn, TInlineAllocator<24>> Conns;
     thread_local int32  VS_CX = INT32_MAX, VS_CY = INT32_MAX;
     thread_local uint32 VS_Seed = 0xFFFFFFFFu;
     thread_local float  VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f, VS_MaxR = -1.0f,
                         VS_Cross = -1.0f, VS_ConnR = -1.0f, VS_Rough = -1.0f,
-                        VS_SpineR = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX;
+                        VS_SpineR = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX,
+                        VS_Seal = -1.0f;
 
     if (CX != VS_CX || CY != VS_CY || S != VS_Seed || Spacing != VS_Spacing ||
         Params.ShaftDensity != VS_Dens || Params.ShaftMinRadius != VS_MinR || Params.ShaftMaxRadius != VS_MaxR ||
         Params.CrossConnectChance != VS_Cross || Params.ConnectorRadius != VS_ConnR ||
         Params.SurfaceRoughness != VS_Rough || OriginSpineRadius != VS_SpineR ||
-        Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ)
+        Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ ||
+        Params.BoundarySealThickness != VS_Seal)
     {
         VS_CX = CX;  VS_CY = CY;  VS_Seed = S;  VS_Spacing = Spacing;
         VS_Dens = Params.ShaftDensity;  VS_MinR = Params.ShaftMinRadius;  VS_MaxR = Params.ShaftMaxRadius;
         VS_Cross = Params.CrossConnectChance;  VS_ConnR = Params.ConnectorRadius;
         VS_Rough = Params.SurfaceRoughness;    VS_SpineR = OriginSpineRadius;
         VS_BotZ = Params.StrateBottomWorldZ;  VS_TopZ = Params.StrateTopWorldZ;
+        VS_Seal = Params.BoundarySealThickness;
         Shafts.Reset();
         Conns.Reset();
 
-        // Collect shafts in the 3x3 neighbourhood (XY).
-        for (int32 dy = -1; dy <= 1; dy++)
-        for (int32 dx = -1; dx <= 1; dx++)
+        constexpr int32 CollectRadius = 3;   // 7×7: inner 3×3 + one 5×5 candidate halo
+        constexpr int32 EmitRadius = 1;      // 3×3: the only cells allowed to emit tree links
+        constexpr int32 CandidateRadius = 2; // 5×5 parent window around an emitting shaft
+        constexpr uint32 TreeSalt = 0x7A11u;
+
+        TArray<FLocalShaft, TInlineAllocator<49>> CollectedShafts;
+        // Collect the wider deterministic neighbourhood once. Only the inner cells are retained
+        // in `Shafts`, because that is the per-voxel working set and the seam-free emission set.
+        for (int32 dy = -CollectRadius; dy <= CollectRadius; dy++)
+        for (int32 dx = -CollectRadius; dx <= CollectRadius; dx++)
         {
             const int32 nx = CX + dx, ny = CY + dy;
             const uint32 Hh = VoxelHash::Cell(nx, ny, S);
@@ -3740,8 +3754,14 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
             Sh.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
             Sh.R = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
                                VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
+            Sh.CellX = nx;
+            Sh.CellY = ny;
             Sh.bOriginSpine = false;
-            Shafts.Add(Sh);
+            CollectedShafts.Add(Sh);
+            if (FMath::Abs(dx) <= EmitRadius && FMath::Abs(dy) <= EmitRadius)
+            {
+                Shafts.Add(Sh);
+            }
         }
 
         // The structural (0,0) spine is not re-carved here. It participates only as a
@@ -3750,14 +3770,81 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
         const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
         if (bOriginNearby && OriginSpineRadius > 0.0f)
         {
-            Shafts.Add({0.0f, 0.0f, OriginSpineRadius, true});
+            Shafts.Add({0.0f, 0.0f, OriginSpineRadius, 0, 0, true});
         }
 
-        // Horizontal connectors between nearby shaft pairs (hash-gated).
+        const float BottomZ = Params.StrateBottomWorldZ + Params.BoundarySealThickness;
+        const float TopZ    = Params.StrateTopWorldZ    - Params.BoundarySealThickness;
+        const float RoughnessReach = FMath::Max(Params.SurfaceRoughness, 0.0f)
+                                    * VOXEL_NOISE_SCALE * 1.5f;
+        // A tree link must remain open at the centreline after the SDF roughness pass. The +1
+        // margin makes the radius strictly greater than the proven roughness supremum.
+        const float TreeConnectorRadius = FMath::Max(Params.ConnectorRadius, RoughnessReach + 1.0f);
+
+        auto EmitTreeConnector = [&](const FLocalShaft& Child, const FLocalShaft* Parent)
+        {
+            const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
+            const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
+            const uint32 LinkHash = VoxelHash::Pair(
+                Child.CellX, Child.CellY, ParentCellX, ParentCellY, S ^ TreeSalt);
+            const float Zc = FMath::Lerp(BottomZ, TopZ,
+                                         VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+            const FVector ParentPoint = Parent != nullptr
+                ? FVector(Parent->X, Parent->Y, Zc)
+                : FVector(0.0f, 0.0f, Zc);
+            Conns.Add({ FVector(Child.X, Child.Y, Zc), ParentPoint, TreeConnectorRadius });
+        };
+
+        // Structural drainage tree: every real shaft in the inner 3×3 selects one strictly
+        // more-central shaft from its complete 5×5 window. A local minimum has no such parent and
+        // drains directly to the (0,0) spine. The explicit cell-coordinate tie-break makes this
+        // independent of array/iteration order; the synthetic spine is not a candidate shaft.
+        for (const FLocalShaft& Child : Shafts)
+        {
+            if (Child.bOriginSpine) continue;
+
+            const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
+            const FLocalShaft* Parent = nullptr;
+            float BestDistanceSq = FLT_MAX;
+            for (const FLocalShaft& Candidate : CollectedShafts)
+            {
+                if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
+                {
+                    continue;
+                }
+                if (FMath::Abs(Candidate.CellX - Child.CellX) > CandidateRadius
+                    || FMath::Abs(Candidate.CellY - Child.CellY) > CandidateRadius)
+                {
+                    continue;
+                }
+
+                const float CandidateOriginSq = FMath::Square(Candidate.X)
+                                               + FMath::Square(Candidate.Y);
+                if (!(CandidateOriginSq < ChildOriginSq))
+                {
+                    continue;
+                }
+
+                const float DistanceSq = FMath::Square(Child.X - Candidate.X)
+                                       + FMath::Square(Child.Y - Candidate.Y);
+                const bool bLowerCell = Parent == nullptr
+                    || Candidate.CellY < Parent->CellY
+                    || (Candidate.CellY == Parent->CellY && Candidate.CellX < Parent->CellX);
+                if (DistanceSq < BestDistanceSq
+                    || (DistanceSq == BestDistanceSq && bLowerCell))
+                {
+                    BestDistanceSq = DistanceSq;
+                    Parent = &Candidate;
+                }
+            }
+
+            EmitTreeConnector(Child, Parent);
+        }
+
+        // Existing probabilistic links remain as texture and loops. They intentionally stay on
+        // the cached inner 3×3 working set; only the structural parent lookup needs the 7×7 halo.
         if (Params.CrossConnectChance > 0.0f && Shafts.Num() >= 2)
         {
-            const float BottomZ = Params.StrateBottomWorldZ + Params.BoundarySealThickness;
-            const float TopZ    = Params.StrateTopWorldZ    - Params.BoundarySealThickness;
             for (int32 i = 0; i < Shafts.Num(); i++)
             for (int32 j = i + 1; j < Shafts.Num(); j++)
             {
@@ -3777,8 +3864,7 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
                 const float ConnectorR = bSpineConnector
                     ? FMath::Max(
                         Params.ConnectorRadius,
-                        FMath::Max(Params.SurfaceRoughness, 0.0f)
-                            * VOXEL_NOISE_SCALE * 1.5f + 1.0f)
+                        RoughnessReach + 1.0f)
                     : Params.ConnectorRadius;
                 Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR });
             }
