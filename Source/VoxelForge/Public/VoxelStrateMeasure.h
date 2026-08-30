@@ -7,6 +7,17 @@
 class UVoxelGenerator;
 class UVoxelStrateManager;
 
+/** Explicit outcome of a coarse connectivity query plus its full-resolution route re-check. */
+enum class EVoxelConnectivityResult : uint8
+{
+    Connected,
+    NotConnected,
+    StartCellSolid,
+    GoalCellSolid,
+    OutOfWindow,
+    CoarseLied
+};
+
 /** Settings for the deterministic coarse grid used by the strate measurement pass. */
 struct VOXELFORGE_API FVoxelStrateMeasureSettings
 {
@@ -31,6 +42,9 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     float AirFraction           = 0.f;
     int32 NumAirComponents      = 0;
     float LargestComponentShare = 0.f;
+    FVector LargestComponentPoint = FVector::ZeroVector; // Actor-space voxel coords; valid iff NumAir > 0.
+    int64 LargestComponentCells = 0;
+    int32 NumComponentsAtLeast1Pct = 0;
     float WalkableFraction      = 0.f;
     float MedianFeatureScale   = 0.f;
     int32 MedianVerticalClearance = 0;
@@ -57,14 +71,17 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
 /**
  * Test coarse connectivity and then re-check the one recovered coarse route at full resolution.
  *
- * bOutCoarseLied is true only when the coarse route existed but a full-resolution sample on that
- * route was solid (or non-finite), in which case this function always returns false.
+ * If an endpoint's own coarse cell is solid, the query searches the 26 neighbouring cells and
+ * uses the nearest air cell when one exists. The snap flags report those repairs. Solid-cell
+ * results are returned only when no adjacent air cell exists. A coarse route that fails its
+ * full-resolution re-check returns CoarseLied.
  */
-VOXELFORGE_API bool VF_AreConnected(
+VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     const UVoxelGenerator& Generator,
     const UVoxelStrateManager& Manager,
     int32 StrateIndex,
     const FVector& AVoxel,
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
-    bool& bOutCoarseLied);
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped);

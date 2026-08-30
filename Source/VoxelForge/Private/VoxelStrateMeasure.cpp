@@ -298,7 +298,10 @@ namespace VoxelStrateMeasurePrivate
         const FSampleGrid& Grid,
         TArray<int32>& OutComponents,
         int32& OutNumComponents,
-        int32& OutLargestComponentCells)
+        int64 NumAir,
+        int64& OutLargestComponentCells,
+        int32& OutLargestComponentLowestCell,
+        int32& OutNumComponentsAtLeast1Pct)
     {
         OutComponents.SetNumUninitialized(Grid.CellCount);
         for (int32 Index = 0; Index < Grid.CellCount; ++Index)
@@ -310,6 +313,8 @@ namespace VoxelStrateMeasurePrivate
         Queue.SetNumUninitialized(Grid.CellCount);
         OutNumComponents = 0;
         OutLargestComponentCells = 0;
+        OutLargestComponentLowestCell = INDEX_NONE;
+        OutNumComponentsAtLeast1Pct = 0;
 
         for (int32 Start = 0; Start < Grid.CellCount; ++Start)
         {
@@ -353,7 +358,20 @@ namespace VoxelStrateMeasurePrivate
                 if (Z > 0)             Visit(Grid.Index(X, Y, Z - 1));
             }
 
-            OutLargestComponentCells = FMath::Max(OutLargestComponentCells, ComponentCells);
+            const int64 ComponentCells64 = static_cast<int64>(ComponentCells);
+            if (NumAir > 0 && ComponentCells64 * 100 >= NumAir)
+            {
+                ++OutNumComponentsAtLeast1Pct;
+            }
+
+            if (ComponentCells64 > OutLargestComponentCells
+                || (ComponentCells64 == OutLargestComponentCells
+                    && (OutLargestComponentLowestCell == INDEX_NONE
+                        || Start < OutLargestComponentLowestCell)))
+            {
+                OutLargestComponentCells = ComponentCells64;
+                OutLargestComponentLowestCell = Start;
+            }
         }
     }
 
@@ -429,8 +447,6 @@ namespace VoxelStrateMeasurePrivate
     {
         TArray<int32> Components;
         int32 NumComponents = 0;
-        int32 LargestComponentCells = 0;
-        FloodFillAir(Grid, Components, NumComponents, LargestComponentCells);
 
         int64 NumAir = 0;
         for (const uint8 bAir : Grid.Air)
@@ -438,16 +454,38 @@ namespace VoxelStrateMeasurePrivate
             NumAir += bAir != 0u ? 1 : 0;
         }
 
+        int64 LargestComponentCells = 0;
+        int32 LargestComponentLowestCell = INDEX_NONE;
+        int32 NumComponentsAtLeast1Pct = 0;
+        FloodFillAir(
+            Grid,
+            Components,
+            NumComponents,
+            NumAir,
+            LargestComponentCells,
+            LargestComponentLowestCell,
+            NumComponentsAtLeast1Pct);
+
         InOutMetrics.NumSampled = Grid.CellCount;
         InOutMetrics.NumAir = NumAir;
         InOutMetrics.NumSolid = static_cast<int64>(Grid.CellCount) - NumAir;
         InOutMetrics.AirFraction = static_cast<float>(
             static_cast<double>(NumAir) / static_cast<double>(Grid.CellCount));
         InOutMetrics.NumAirComponents = NumComponents;
+        InOutMetrics.LargestComponentCells = LargestComponentCells;
+        InOutMetrics.NumComponentsAtLeast1Pct = NumComponentsAtLeast1Pct;
         InOutMetrics.LargestComponentShare = NumAir > 0
             ? static_cast<float>(static_cast<double>(LargestComponentCells)
                 / static_cast<double>(NumAir))
             : 0.0f;
+        if (NumAir > 0 && LargestComponentLowestCell != INDEX_NONE)
+        {
+            int32 LargestX = 0;
+            int32 LargestY = 0;
+            int32 LargestZ = 0;
+            DecodeIndex(Grid, LargestComponentLowestCell, LargestX, LargestY, LargestZ);
+            InOutMetrics.LargestComponentPoint = Grid.CellCenter(LargestX, LargestY, LargestZ);
+        }
 
         TArray<int32> ClearanceValues;
         ClearanceValues.Reserve(static_cast<int32>(NumAir));
@@ -535,6 +573,93 @@ namespace VoxelStrateMeasurePrivate
         const int32 Z = FMath::Clamp(FMath::FloorToInt((Point.Z - Grid.MinZ) / Step), 0, Grid.NumZ - 1);
         OutCell = Grid.Index(X, Y, Z);
         return true;
+    }
+
+    enum class EEndpointCellResult : uint8
+    {
+        OutOfWindow,
+        Air,
+        Solid
+    };
+
+    EEndpointCellResult ResolveEndpointCell(
+        const FSampleGrid& Grid,
+        const FVector& Point,
+        int32& OutCell,
+        bool& bOutSnapped)
+    {
+        bOutSnapped = false;
+        int32 OriginalCell = -1;
+        if (!FindCellForPoint(Grid, Point, OriginalCell))
+        {
+            return EEndpointCellResult::OutOfWindow;
+        }
+        if (Grid.Air[OriginalCell] != 0u)
+        {
+            OutCell = OriginalCell;
+            return EEndpointCellResult::Air;
+        }
+
+        int32 OriginalX = 0;
+        int32 OriginalY = 0;
+        int32 OriginalZ = 0;
+        DecodeIndex(Grid, OriginalCell, OriginalX, OriginalY, OriginalZ);
+
+        int32 BestCell = INDEX_NONE;
+        float BestDistanceSquared = FLT_MAX;
+        const int32 MaxX = Grid.NumX - 1;
+        const int32 MaxY = Grid.NumY - 1;
+        const int32 MaxZ = Grid.NumZ - 1;
+        const int32 MinX = OriginalX > 0 ? OriginalX - 1 : 0;
+        const int32 MinY = OriginalY > 0 ? OriginalY - 1 : 0;
+        const int32 MinZ = OriginalZ > 0 ? OriginalZ - 1 : 0;
+        const int32 CandidateMaxX = OriginalX < MaxX ? OriginalX + 1 : MaxX;
+        const int32 CandidateMaxY = OriginalY < MaxY ? OriginalY + 1 : MaxY;
+        const int32 CandidateMaxZ = OriginalZ < MaxZ ? OriginalZ + 1 : MaxZ;
+        for (int32 Z = MinZ;
+             Z <= CandidateMaxZ;
+             ++Z)
+        {
+            for (int32 Y = MinY;
+                 Y <= CandidateMaxY;
+                 ++Y)
+            {
+                for (int32 X = MinX;
+                     X <= CandidateMaxX;
+                     ++X)
+                {
+                    if (X == OriginalX && Y == OriginalY && Z == OriginalZ)
+                    {
+                        continue;
+                    }
+
+                    const int32 Candidate = Grid.Index(X, Y, Z);
+                    if (Grid.Air[Candidate] == 0u)
+                    {
+                        continue;
+                    }
+
+                    const float DistanceSquared = FVector::DistSquared(
+                        Point, Grid.CellCenter(X, Y, Z));
+                    if (DistanceSquared < BestDistanceSquared
+                        || (DistanceSquared == BestDistanceSquared
+                            && (BestCell == INDEX_NONE || Candidate < BestCell)))
+                    {
+                        BestDistanceSquared = DistanceSquared;
+                        BestCell = Candidate;
+                    }
+                }
+            }
+        }
+
+        if (BestCell == INDEX_NONE)
+        {
+            return EEndpointCellResult::Solid;
+        }
+
+        OutCell = BestCell;
+        bOutSnapped = true;
+        return EEndpointCellResult::Air;
     }
 
     bool FullResolutionAirOnSegment(
@@ -706,20 +831,22 @@ FVoxelStrateMetrics VF_MeasureStrate(
     return Result;
 }
 
-bool VF_AreConnected(
+EVoxelConnectivityResult VF_AreConnected(
     const UVoxelGenerator& Generator,
     const UVoxelStrateManager& Manager,
     int32 StrateIndex,
     const FVector& AVoxel,
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
-    bool& bOutCoarseLied)
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped)
 {
-    bOutCoarseLied = false;
+    bOutStartSnapped = false;
+    bOutGoalSnapped = false;
     if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y) || !FMath::IsFinite(AVoxel.Z)
         || !FMath::IsFinite(BVoxel.X) || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
     {
-        return false;
+        return EVoxelConnectivityResult::OutOfWindow;
     }
 
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
@@ -727,21 +854,35 @@ bool VF_AreConnected(
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
     {
-        return false;
+        return EVoxelConnectivityResult::OutOfWindow;
     }
 
     int32 Start = -1;
     int32 Goal = -1;
-    if (!VoxelStrateMeasurePrivate::FindCellForPoint(Grid, AVoxel, Start)
-        || !VoxelStrateMeasurePrivate::FindCellForPoint(Grid, BVoxel, Goal))
+    const VoxelStrateMeasurePrivate::EEndpointCellResult StartCell =
+        VoxelStrateMeasurePrivate::ResolveEndpointCell(
+            Grid, AVoxel, Start, bOutStartSnapped);
+    const VoxelStrateMeasurePrivate::EEndpointCellResult GoalCell =
+        VoxelStrateMeasurePrivate::ResolveEndpointCell(
+            Grid, BVoxel, Goal, bOutGoalSnapped);
+    if (StartCell == VoxelStrateMeasurePrivate::EEndpointCellResult::OutOfWindow
+        || GoalCell == VoxelStrateMeasurePrivate::EEndpointCellResult::OutOfWindow)
     {
-        return false;
+        return EVoxelConnectivityResult::OutOfWindow;
+    }
+    if (StartCell == VoxelStrateMeasurePrivate::EEndpointCellResult::Solid)
+    {
+        return EVoxelConnectivityResult::StartCellSolid;
+    }
+    if (GoalCell == VoxelStrateMeasurePrivate::EEndpointCellResult::Solid)
+    {
+        return EVoxelConnectivityResult::GoalCellSolid;
     }
 
     TArray<int32> Path;
     if (!VoxelStrateMeasurePrivate::FindCoarsePath(Grid, Start, Goal, Path))
     {
-        return false;
+        return EVoxelConnectivityResult::NotConnected;
     }
 
     // The coarse route is evidence, not a pass. Re-check this one BFS route at one-voxel spacing
@@ -749,8 +890,7 @@ bool VF_AreConnected(
     if (!VoxelStrateMeasurePrivate::FullResolutionPathIsAir(
             Generator, Grid, AVoxel, BVoxel, Path))
     {
-        bOutCoarseLied = true;
-        return false;
+        return EVoxelConnectivityResult::CoarseLied;
     }
-    return true;
+    return EVoxelConnectivityResult::Connected;
 }

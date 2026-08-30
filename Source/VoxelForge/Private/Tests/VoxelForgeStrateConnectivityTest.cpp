@@ -25,16 +25,27 @@ namespace
         FVoxelStrateMetrics DerivedWindowRepeat;
     };
 
-    struct FPassageReport
+    struct FConnectivityProbe
+    {
+        bool bChecked = false;
+        EVoxelConnectivityResult Result = EVoxelConnectivityResult::OutOfWindow;
+        bool bStartSnapped = false;
+        bool bGoalSnapped = false;
+    };
+
+    struct FStrateConnectivityReport
     {
         int32 Index = INDEX_NONE;
         FString Name;
-        int32 UpperStrateIndex = INDEX_NONE;
-        int32 LowerStrateIndex = INDEX_NONE;
-        FVector UpperPoint = FVector::ZeroVector;
-        FVector LowerPoint = FVector::ZeroVector;
-        FString UpperResult;
-        FString LowerResult;
+        int32 ArrivalPassageIndex = INDEX_NONE;
+        int32 DeparturePassageIndex = INDEX_NONE;
+        FVector ArrivalPoint = FVector::ZeroVector;
+        FVector DeparturePoint = FVector::ZeroVector;
+        bool bHasArrival = false;
+        bool bHasDeparture = false;
+        FConnectivityProbe ArrivalToDeparture;
+        FConnectivityProbe ArrivalToLargest;
+        FConnectivityProbe DepartureToLargest;
     };
 
     FString ArchetypeName(const FStrateSlot& Slot)
@@ -55,6 +66,13 @@ namespace
         return FMemory::Memcmp(&A, &B, sizeof(float)) == 0;
     }
 
+    bool SameVectorBits(const FVector& A, const FVector& B)
+    {
+        return SameFloatBits(A.X, B.X)
+            && SameFloatBits(A.Y, B.Y)
+            && SameFloatBits(A.Z, B.Z);
+    }
+
     bool MetricsAreBitIdentical(const FVoxelStrateMetrics& A, const FVoxelStrateMetrics& B)
     {
         return A.bValid == B.bValid
@@ -65,6 +83,9 @@ namespace
             && SameFloatBits(A.AirFraction, B.AirFraction)
             && A.NumAirComponents == B.NumAirComponents
             && SameFloatBits(A.LargestComponentShare, B.LargestComponentShare)
+            && SameVectorBits(A.LargestComponentPoint, B.LargestComponentPoint)
+            && A.LargestComponentCells == B.LargestComponentCells
+            && A.NumComponentsAtLeast1Pct == B.NumComponentsAtLeast1Pct
             && SameFloatBits(A.WalkableFraction, B.WalkableFraction)
             && SameFloatBits(A.MedianFeatureScale, B.MedianFeatureScale)
             && A.MedianVerticalClearance == B.MedianVerticalClearance
@@ -73,34 +94,45 @@ namespace
             && A.SampledMaxZ == B.SampledMaxZ;
     }
 
-    bool IsInsideMeasuredWindow(
-        const FVoxelStrateMetrics& Metrics,
-        const FVoxelStrateMeasureSettings& Settings,
-        const FVector& Point)
+    const TCHAR* ConnectivityResultName(EVoxelConnectivityResult Result)
     {
-        const float MinX = Settings.CenterXY.X - static_cast<float>(Settings.RadiusInVoxels);
-        const float MaxX = Settings.CenterXY.X + static_cast<float>(Settings.RadiusInVoxels);
-        const float MinY = Settings.CenterXY.Y - static_cast<float>(Settings.RadiusInVoxels);
-        const float MaxY = Settings.CenterXY.Y + static_cast<float>(Settings.RadiusInVoxels);
-        return Point.X >= MinX && Point.X < MaxX
-            && Point.Y >= MinY && Point.Y < MaxY
-            && Point.Z >= static_cast<float>(Metrics.SampledMinZ)
-            && Point.Z < static_cast<float>(Metrics.SampledMaxZ);
+        switch (Result)
+        {
+        case EVoxelConnectivityResult::Connected:      return TEXT("CONNECTED");
+        case EVoxelConnectivityResult::NotConnected:   return TEXT("NOT_CONNECTED");
+        case EVoxelConnectivityResult::StartCellSolid: return TEXT("START_CELL_SOLID");
+        case EVoxelConnectivityResult::GoalCellSolid:  return TEXT("GOAL_CELL_SOLID");
+        case EVoxelConnectivityResult::OutOfWindow:    return TEXT("OUT_OF_WINDOW");
+        case EVoxelConnectivityResult::CoarseLied:     return TEXT("COARSE_LIED");
+        default:                                       return TEXT("UNKNOWN");
+        }
     }
 
-    FVector LargestComponentAnchor(
-        const FStrateSlot& Slot,
-        const FVector2D& CenterXY,
-        int32 SampleStep)
+    FString ConnectivityProbeText(const FConnectivityProbe& Probe)
     {
-        // The fixture's origin spine is the deterministic hub/void anchor. The measurement API
-        // intentionally returns metrics rather than a component coordinate, so this report probes
-        // the known spine point that represents the largest reachable component in this fixture.
-        // Keep the established anchor one full chunk above the strate floor. The derived window
-        // includes it, while the first derived sample cell may still be floor rock for slab fields.
-        const float AnchorZ = (static_cast<float>(Slot.BottomChunkZ) + 1.0f) * CHUNK_SIZE
-            + 0.5f * static_cast<float>(SampleStep);
-        return FVector(CenterXY.X + 2.0f, CenterXY.Y + 2.0f, AnchorZ);
+        if (!Probe.bChecked)
+        {
+            return TEXT("NOT_CHECKED");
+        }
+
+        FString Text = ConnectivityResultName(Probe.Result);
+        if (Probe.bStartSnapped || Probe.bGoalSnapped)
+        {
+            Text += TEXT(" [");
+            bool bNeedSeparator = false;
+            if (Probe.bStartSnapped)
+            {
+                Text += TEXT("start snapped");
+                bNeedSeparator = true;
+            }
+            if (Probe.bGoalSnapped)
+            {
+                if (bNeedSeparator) Text += TEXT(", ");
+                Text += TEXT("goal snapped");
+            }
+            Text += TEXT("]");
+        }
+        return Text;
     }
 
     bool FullResolutionDirectSegmentHasSolid(
@@ -239,8 +271,8 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
      * 2. Vacuity: a main measurement with no samples, no air, or no solid measures nothing.
      * 3. Range sanity: fractions/components must describe an actual air field.
      * 4. Determinism: identical inputs must produce bit-identical metrics.
-     * 5. Coarse-lie guard: a coarse route must never be reported connected after a full-resolution
-     *    solid sample; the controlled 3-voxel wall below must make bOutCoarseLied fire.
+     * 5. Coarse-lie guard: a coarse route must never be reported CONNECTED after a
+     *    full-resolution solid sample; the controlled 3-voxel wall below must return COARSE_LIED.
      */
 
     int32 GapTopChunkZ = 0;
@@ -349,6 +381,15 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             || !FMath::IsFinite(Metrics.WalkableFraction)
             || Metrics.WalkableFraction < 0.0f || Metrics.WalkableFraction > 1.0f
             || (Metrics.NumAir > 0 && Metrics.NumAirComponents == 0)
+            || Metrics.LargestComponentCells < 0
+            || Metrics.LargestComponentCells > Metrics.NumAir
+            || Metrics.NumComponentsAtLeast1Pct < 0
+            || Metrics.NumComponentsAtLeast1Pct > Metrics.NumAirComponents
+            || (Metrics.NumAir > 0 && Metrics.LargestComponentCells == 0)
+            || (Metrics.NumAir > 0
+                && (!FMath::IsFinite(Metrics.LargestComponentPoint.X)
+                    || !FMath::IsFinite(Metrics.LargestComponentPoint.Y)
+                    || !FMath::IsFinite(Metrics.LargestComponentPoint.Z)))
             || (Metrics.LargestComponentShare == 0.0f && Metrics.AirFraction > 0.05f)
             || Metrics.ResolvedMarginVoxels < 1
             || Metrics.SampledMinZ >= Metrics.SampledMaxZ)
@@ -408,20 +449,22 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         GapAirSamples,
         GapSamples);
     Summary += TEXT("Archetypes (old one-chunk vs derived window; derived InteriorMarginVoxels<0 => 2x BoundarySealThickness, clamped):\n");
-    Summary += TEXT("  name | old margin | old Z span [min,max) | old Air | old Largest | old Walkable | old FeatureScale vox | old Clearance vox | old Components | old Samples | old Solid | derived margin | derived Z span [min,max) | derived Air | derived Largest | derived Walkable | derived FeatureScale vox | derived Clearance vox | derived Components | derived Samples | derived Solid\n");
+    Summary += TEXT("  name | old margin | old Z span [min,max) | old Air | old Largest | old LargestCells | old >=1% | old Walkable | old FeatureScale vox | old Clearance vox | old Components | old Samples | old Solid | derived margin | derived Z span [min,max) | derived Air | derived Largest | derived LargestCells | derived >=1% | derived Walkable | derived FeatureScale vox | derived Clearance vox | derived Components | derived Samples | derived Solid\n");
     for (const FArchetypeReport& Report : ArchetypeReports)
     {
         const FVoxelStrateMetrics& Old = Report.OldWindow;
         const FVoxelStrateMetrics& Derived = Report.DerivedWindow;
         Summary += FString::Printf(
-            TEXT("  %s | %d | [%d,%d) | %.9g | %.9g | %.9g | %.9g | %d | %d | %lld | %lld | "
-                 "%d | [%d,%d) | %.9g | %.9g | %.9g | %.9g | %d | %d | %lld | %lld\n"),
+            TEXT("  %s | %d | [%d,%d) | %.9g | %.9g | %lld | %d | %.9g | %.9g | %d | %d | %lld | %lld | "
+                 "%d | [%d,%d) | %.9g | %.9g | %lld | %d | %.9g | %.9g | %d | %d | %lld | %lld\n"),
             *Report.Name,
             Old.ResolvedMarginVoxels,
             Old.SampledMinZ,
             Old.SampledMaxZ,
             Old.AirFraction,
             Old.LargestComponentShare,
+            Old.LargestComponentCells,
+            Old.NumComponentsAtLeast1Pct,
             Old.WalkableFraction,
             Old.MedianFeatureScale,
             Old.MedianVerticalClearance,
@@ -433,6 +476,8 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             Derived.SampledMaxZ,
             Derived.AirFraction,
             Derived.LargestComponentShare,
+            Derived.LargestComponentCells,
+            Derived.NumComponentsAtLeast1Pct,
             Derived.WalkableFraction,
             Derived.MedianFeatureScale,
             Derived.MedianVerticalClearance,
@@ -443,6 +488,81 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
 
     int32 NumRoutesChecked = 0;
     int32 NumRoutesRefuted = 0;
+    int32 NumGuardRoutesChecked = 0;
+    int32 NumGuardRoutesRefuted = 0;
+    int32 NumSnappedEndpointEvents = 0;
+    int32 NumArrivalDepartureRoutesChecked = 0;
+    int32 NumArrivalDepartureSnappedEndpointEvents = 0;
+
+    int32 NumAnchorProbes = 0;
+    int32 NumAnchorConnected = 0;
+    int32 NumAnchorNotConnected = 0;
+    int32 NumAnchorStartCellSolid = 0;
+    int32 NumAnchorGoalCellSolid = 0;
+    int32 NumAnchorOutOfWindow = 0;
+    int32 NumAnchorCoarseLied = 0;
+    int32 NumAnchorSnappedEndpointEvents = 0;
+
+    auto ProbeRoute = [&](int32 StrateIndex,
+                          const FVector& Start,
+                          const FVector& Goal,
+                          bool bCountInGuard,
+                          bool bCountAsAnchorProbe,
+                          bool bCountAsArrivalDeparture) -> FConnectivityProbe
+    {
+        FConnectivityProbe Probe;
+        Probe.bChecked = true;
+        Probe.Result = VF_AreConnected(
+            *World.Generator,
+            *World.StrateManager,
+            StrateIndex,
+            Start,
+            Goal,
+            DerivedWindowSettings,
+            Probe.bStartSnapped,
+            Probe.bGoalSnapped);
+
+        ++NumRoutesChecked;
+        if (Probe.Result == EVoxelConnectivityResult::CoarseLied)
+        {
+            ++NumRoutesRefuted;
+        }
+        if (bCountInGuard)
+        {
+            ++NumGuardRoutesChecked;
+            if (Probe.Result == EVoxelConnectivityResult::CoarseLied)
+            {
+                ++NumGuardRoutesRefuted;
+            }
+        }
+
+        const int32 SnappedHere = (Probe.bStartSnapped ? 1 : 0)
+            + (Probe.bGoalSnapped ? 1 : 0);
+        NumSnappedEndpointEvents += SnappedHere;
+        if (bCountAsArrivalDeparture)
+        {
+            ++NumArrivalDepartureRoutesChecked;
+            NumArrivalDepartureSnappedEndpointEvents += SnappedHere;
+        }
+
+        if (bCountAsAnchorProbe)
+        {
+            ++NumAnchorProbes;
+            NumAnchorSnappedEndpointEvents += SnappedHere;
+            switch (Probe.Result)
+            {
+            case EVoxelConnectivityResult::Connected:      ++NumAnchorConnected; break;
+            case EVoxelConnectivityResult::NotConnected:   ++NumAnchorNotConnected; break;
+            case EVoxelConnectivityResult::StartCellSolid: ++NumAnchorStartCellSolid; break;
+            case EVoxelConnectivityResult::GoalCellSolid:  ++NumAnchorGoalCellSolid; break;
+            case EVoxelConnectivityResult::OutOfWindow:    ++NumAnchorOutOfWindow; break;
+            case EVoxelConnectivityResult::CoarseLied:     ++NumAnchorCoarseLied; break;
+            default: break;
+            }
+        }
+        return Probe;
+    };
+
     for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
     {
         const FStrateSlot& Slot = Layout[StrateIndex];
@@ -455,22 +575,15 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         const FVector B(Settings.CenterXY.X + 2.0f, Settings.CenterXY.Y + 2.0f,
                         static_cast<float>(Window.SampledMaxZ)
                             - 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep));
-        bool bCoarseLied = false;
-        const bool bConnected = VF_AreConnected(
-            *World.Generator,
-            *World.StrateManager,
-            StrateIndex,
-            A,
-            B,
-            DerivedWindowSettings,
-            bCoarseLied);
-        ++NumRoutesChecked;
-        if (bCoarseLied) ++NumRoutesRefuted;
-        if (bConnected && FullResolutionDirectSegmentHasSolid(*World.Generator, A, B))
+        const FConnectivityProbe Probe = ProbeRoute(
+            StrateIndex, A, B, /*bCountInGuard=*/true, /*bCountAsAnchorProbe=*/false,
+            /*bCountAsArrivalDeparture=*/false);
+        if (Probe.Result == EVoxelConnectivityResult::Connected
+            && FullResolutionDirectSegmentHasSolid(*World.Generator, A, B))
         {
             AddError(FString::Printf(
-                TEXT("HARD FAILURE: VF_AreConnected returned true for %s while its full-resolution "
-                     "direct walk contained a solid sample."),
+                TEXT("HARD FAILURE: VF_AreConnected returned CONNECTED for %s while its "
+                     "full-resolution direct walk contained a solid sample."),
                 *ArchetypeName(Slot)));
             bAllChecksPassed = false;
         }
@@ -498,102 +611,315 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         bAllChecksPassed = false;
     }
 
-    bool bWallCoarseLied = false;
-    const bool bWallConnected = VF_AreConnected(
-        *World.Generator,
-        *World.StrateManager,
-        0,
-        WallA,
-        WallB,
-        DerivedWindowSettings,
-        bWallCoarseLied);
-    ++NumRoutesChecked;
-    if (bWallCoarseLied) ++NumRoutesRefuted;
-    if (bWallConnected)
+    const FConnectivityProbe WallProbe = ProbeRoute(
+        0, WallA, WallB, /*bCountInGuard=*/true, /*bCountAsAnchorProbe=*/false,
+        /*bCountAsArrivalDeparture=*/false);
+    if (WallProbe.Result != EVoxelConnectivityResult::CoarseLied)
     {
-        AddError(TEXT("HARD FAILURE: VF_AreConnected reported true across a full-resolution solid 3-voxel wall."));
-        bAllChecksPassed = false;
-    }
-    if (!bWallCoarseLied)
-    {
-        AddError(TEXT("HARD FAILURE: the controlled coarse-connectivity lie did not set bOutCoarseLied."));
+        AddError(FString::Printf(
+            TEXT("HARD FAILURE: the controlled coarse-connectivity lie returned %s instead of "
+                 "COARSE_LIED."),
+            ConnectivityResultName(WallProbe.Result)));
         bAllChecksPassed = false;
     }
     World.DiffLayer->Clear();
 
-    TArray<FPassageReport> PassageReports;
     const TArray<FVoxelPassage>& Passages = World.StrateManager->GetPassages();
-    PassageReports.Reserve(Passages.Num());
+    TArray<int32> ArrivalPassageByStrate;
+    TArray<int32> DeparturePassageByStrate;
+    ArrivalPassageByStrate.Init(INDEX_NONE, Layout.Num());
+    DeparturePassageByStrate.Init(INDEX_NONE, Layout.Num());
+    int32 SurfaceEntryPassageIndex = INDEX_NONE;
+
     for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
-        FPassageReport& Report = PassageReports.AddDefaulted_GetRef();
-        Report.Index = PassageIndex;
-        Report.Name = FString::Printf(TEXT("%03d"), PassageIndex);
-        Report.UpperStrateIndex = Passage.UpperStrateIndex;
-        Report.LowerStrateIndex = Passage.LowerStrateIndex;
-        Report.UpperPoint = Passage.UpperPoint;
-        Report.LowerPoint = Passage.LowerPoint;
-
-        auto CheckEndpoint = [&](int32 EndpointStrateIndex, const FVector& Endpoint) -> FString
+        if (Passage.UpperStrateIndex == Passage.LowerStrateIndex)
         {
-            if (!Layout.IsValidIndex(EndpointStrateIndex)) return TEXT("invalid-strate");
-            const FVoxelStrateMetrics& EndpointMetrics =
-                DerivedMetricsByIndex[EndpointStrateIndex];
-            if (!EndpointMetrics.bValid) return TEXT("invalid-window");
-            if (!IsInsideMeasuredWindow(EndpointMetrics, DerivedWindowSettings, Endpoint))
+            if (SurfaceEntryPassageIndex == INDEX_NONE)
             {
-                return TEXT("out-of-window");
+                SurfaceEntryPassageIndex = PassageIndex;
             }
+            continue;
+        }
 
-            const FStrateSlot& Slot = Layout[EndpointStrateIndex];
-            const FVector Anchor = LargestComponentAnchor(
-                Slot,
-                DerivedWindowSettings.CenterXY,
-                DerivedWindowSettings.SampleStep);
-            bool bCoarseLied = false;
-            const bool bConnected = VF_AreConnected(
-                *World.Generator,
-                *World.StrateManager,
-                EndpointStrateIndex,
-                Endpoint,
-                Anchor,
-                DerivedWindowSettings,
-                bCoarseLied);
-            ++NumRoutesChecked;
-            if (bCoarseLied) ++NumRoutesRefuted;
-            return bConnected ? TEXT("CONNECTED_TO_LARGEST") : TEXT("NOT_CONNECTED");
-        };
+        if (Passage.LowerStrateIndex != Passage.UpperStrateIndex + 1)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: passage %d is not between consecutive strates (%d -> %d)."),
+                PassageIndex,
+                Passage.UpperStrateIndex,
+                Passage.LowerStrateIndex));
+            bAllChecksPassed = false;
+            continue;
+        }
 
-        Report.UpperResult = CheckEndpoint(Passage.UpperStrateIndex, Passage.UpperPoint);
-        Report.LowerResult = CheckEndpoint(Passage.LowerStrateIndex, Passage.LowerPoint);
+        if (!Layout.IsValidIndex(Passage.UpperStrateIndex)
+            || !Layout.IsValidIndex(Passage.LowerStrateIndex))
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: passage %d references a strate outside the layout (%d -> %d)."),
+                PassageIndex,
+                Passage.UpperStrateIndex,
+                Passage.LowerStrateIndex));
+            bAllChecksPassed = false;
+            continue;
+        }
+
+        if (ArrivalPassageByStrate[Passage.LowerStrateIndex] != INDEX_NONE)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: strate %d has more than one arrival passage."),
+                Passage.LowerStrateIndex));
+            bAllChecksPassed = false;
+        }
+        else
+        {
+            ArrivalPassageByStrate[Passage.LowerStrateIndex] = PassageIndex;
+        }
+
+        if (DeparturePassageByStrate[Passage.UpperStrateIndex] != INDEX_NONE)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: strate %d has more than one departure passage."),
+                Passage.UpperStrateIndex));
+            bAllChecksPassed = false;
+        }
+        else
+        {
+            DeparturePassageByStrate[Passage.UpperStrateIndex] = PassageIndex;
+        }
     }
 
-    PassageReports.Sort([](const FPassageReport& A, const FPassageReport& B)
+    for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
     {
-        return A.Index < B.Index;
-    });
+        if (StrateIndex > 0 && ArrivalPassageByStrate[StrateIndex] == INDEX_NONE)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: non-topmost strate %d has no arrival passage."),
+                StrateIndex));
+            bAllChecksPassed = false;
+        }
+        if (StrateIndex + 1 < Layout.Num()
+            && DeparturePassageByStrate[StrateIndex] == INDEX_NONE)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: non-bottom-most strate %d has no departure passage."),
+                StrateIndex));
+            bAllChecksPassed = false;
+        }
+    }
+
+    TArray<FStrateConnectivityReport> StrateReports;
+    StrateReports.SetNum(Layout.Num());
+    for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
+    {
+        FStrateConnectivityReport& Report = StrateReports[StrateIndex];
+        Report.Index = StrateIndex;
+        Report.Name = ArchetypeName(Layout[StrateIndex]);
+
+        if (ArrivalPassageByStrate[StrateIndex] != INDEX_NONE)
+        {
+            Report.bHasArrival = true;
+            Report.ArrivalPassageIndex = ArrivalPassageByStrate[StrateIndex];
+            Report.ArrivalPoint = Passages[Report.ArrivalPassageIndex].LowerPoint;
+        }
+        if (DeparturePassageByStrate[StrateIndex] != INDEX_NONE)
+        {
+            Report.bHasDeparture = true;
+            Report.DeparturePassageIndex = DeparturePassageByStrate[StrateIndex];
+            Report.DeparturePoint = Passages[Report.DeparturePassageIndex].UpperPoint;
+        }
+    }
+
+    // The actual largest-component comparison uses the representative point returned by the
+    // measurement API. The surface-entry lower mouth remains an auxiliary guard probe so this
+    // task continues to re-report the established 15 endpoint comparison probes; it is not the
+    // topmost strate's chain arrival.
+    for (FStrateConnectivityReport& Report : StrateReports)
+    {
+        const FVoxelStrateMetrics& Metrics = DerivedMetricsByIndex[Report.Index];
+        if (!Metrics.bValid) continue;
+
+        if (Report.bHasArrival)
+        {
+            Report.ArrivalToLargest = ProbeRoute(
+                Report.Index,
+                Report.ArrivalPoint,
+                Metrics.LargestComponentPoint,
+                /*bCountInGuard=*/true,
+                /*bCountAsAnchorProbe=*/true,
+                /*bCountAsArrivalDeparture=*/false);
+        }
+        if (Report.bHasDeparture)
+        {
+            Report.DepartureToLargest = ProbeRoute(
+                Report.Index,
+                Report.DeparturePoint,
+                Metrics.LargestComponentPoint,
+                /*bCountInGuard=*/true,
+                /*bCountAsAnchorProbe=*/true,
+                /*bCountAsArrivalDeparture=*/false);
+        }
+    }
+
+    if (SurfaceEntryPassageIndex != INDEX_NONE && Layout.IsValidIndex(0)
+        && DerivedMetricsByIndex[0].bValid)
+    {
+        const FVoxelPassage& SurfaceEntry = Passages[SurfaceEntryPassageIndex];
+        ProbeRoute(
+            0,
+            SurfaceEntry.LowerPoint,
+            DerivedMetricsByIndex[0].LargestComponentPoint,
+            /*bCountInGuard=*/true,
+            /*bCountAsAnchorProbe=*/true,
+            /*bCountAsArrivalDeparture=*/false);
+    }
+    else
+    {
+        AddError(TEXT("HARD FAILURE: the surface-entry auxiliary endpoint probe is missing."));
+        bAllChecksPassed = false;
+    }
+
+    int32 NumArrivalDeparturePasses = 0;
+    TArray<FString> FailedStrates;
+    for (FStrateConnectivityReport& Report : StrateReports)
+    {
+        if (!Report.bHasArrival || !Report.bHasDeparture)
+        {
+            continue;
+        }
+
+        Report.ArrivalToDeparture = ProbeRoute(
+            Report.Index,
+            Report.ArrivalPoint,
+            Report.DeparturePoint,
+            /*bCountInGuard=*/false,
+            /*bCountAsAnchorProbe=*/false,
+            /*bCountAsArrivalDeparture=*/true);
+        if (Report.ArrivalToDeparture.Result == EVoxelConnectivityResult::Connected)
+        {
+            ++NumArrivalDeparturePasses;
+        }
+        else
+        {
+            const FString ResultText = ConnectivityProbeText(Report.ArrivalToDeparture);
+            FailedStrates.Add(FString::Printf(
+                TEXT("%d:%s (%s)"),
+                Report.Index,
+                *Report.Name,
+                *ResultText));
+        }
+    }
+
+    FString FailedStrateText = TEXT("none");
+    if (FailedStrates.Num() > 0)
+    {
+        FailedStrateText = FString::Join(FailedStrates, TEXT(", "));
+    }
+
     Summary += FString::Printf(
-        TEXT("Connectivity guard (derived window): %d routes checked, %d coarse routes refuted at full resolution.\n"),
+        TEXT("Coarse-lie guard (8 interior routes + wall control + 15 endpoint->largest probes): "
+             "%d routes checked, %d coarse routes refuted at full resolution.\n"),
+        NumGuardRoutesChecked,
+        NumGuardRoutesRefuted);
+    Summary += FString::Printf(
+        TEXT("All connectivity probes (including arrival->departure law queries): %d routes "
+             "checked, %d coarse routes refuted at full resolution.\n"),
         NumRoutesChecked,
         NumRoutesRefuted);
-    Summary += TEXT("Passages (derived window; each endpoint -> its strate's largest-component spine anchor, sorted):\n");
-    for (const FPassageReport& Report : PassageReports)
+    Summary += FString::Printf(
+        TEXT("Endpoint snap repair: %d snapped endpoint events across all probes; %d in "
+             "%d arrival->departure probes.\n"),
+        NumSnappedEndpointEvents,
+        NumArrivalDepartureSnappedEndpointEvents,
+        NumArrivalDepartureRoutesChecked);
+    Summary += FString::Printf(
+        TEXT("Correct largest-component endpoint probes (%d, including the surface-entry auxiliary): "
+             "connected=%d, not-connected=%d, start-cell-solid=%d, goal-cell-solid=%d, "
+             "out-of-window=%d, coarse-lied=%d, snapped endpoint events=%d.\n"),
+        NumAnchorProbes,
+        NumAnchorConnected,
+        NumAnchorNotConnected,
+        NumAnchorStartCellSolid,
+        NumAnchorGoalCellSolid,
+        NumAnchorOutOfWindow,
+        NumAnchorCoarseLied,
+        NumAnchorSnappedEndpointEvents);
+    Summary += TEXT("Previous \"5 of 15 disconnected\" verdict: ARTIFACT as a claim about sealed "
+                   "pockets; it used a guessed anchor and asked the wrong (largest-component) law.\n");
+    Summary += FString::Printf(
+        TEXT("arrival->departure: %d of %d applicable strates pass; failures: %s.\n"),
+        NumArrivalDeparturePasses,
+        NumArrivalDepartureRoutesChecked,
+        *FailedStrateText);
+
+    Summary += TEXT("Strates (chain order; derived window; largest point is the deterministic "
+                   "lowest-cell representative):\n");
+    Summary += TEXT("  Strate | arrival->departure | arrival->largest | departure->largest | components | largest share | largest cells | >=1% | largest point\n");
+    for (const FStrateConnectivityReport& Report : StrateReports)
     {
+        const FVoxelStrateMetrics& Metrics = DerivedMetricsByIndex[Report.Index];
+        FString ArrivalToDeparture;
+        if (Report.bHasArrival && Report.bHasDeparture)
+        {
+            ArrivalToDeparture = ConnectivityProbeText(Report.ArrivalToDeparture);
+        }
+        else if (!Report.bHasArrival && Report.Index == 0)
+        {
+            ArrivalToDeparture = TEXT("N/A (topmost; no arrival)");
+        }
+        else if (!Report.bHasDeparture && Report.Index + 1 == StrateReports.Num())
+        {
+            ArrivalToDeparture = TEXT("N/A (bottom-most; no departure)");
+        }
+        else
+        {
+            ArrivalToDeparture = TEXT("MISSING_CHAIN_MOUTH");
+        }
+
+        FString ArrivalToLargest;
+        if (Report.bHasArrival)
+        {
+            ArrivalToLargest = ConnectivityProbeText(Report.ArrivalToLargest);
+        }
+        else if (Report.Index == 0)
+        {
+            ArrivalToLargest = TEXT("N/A (topmost; no arrival)");
+        }
+        else
+        {
+            ArrivalToLargest = TEXT("MISSING_ARRIVAL");
+        }
+
+        FString DepartureToLargest;
+        if (Report.bHasDeparture)
+        {
+            DepartureToLargest = ConnectivityProbeText(Report.DepartureToLargest);
+        }
+        else if (Report.Index + 1 == StrateReports.Num())
+        {
+            DepartureToLargest = TEXT("N/A (bottom-most; no departure)");
+        }
+        else
+        {
+            DepartureToLargest = TEXT("MISSING_DEPARTURE");
+        }
+
         Summary += FString::Printf(
-            TEXT("  passage %s: UpperPoint strate=%d (%.3f,%.3f,%.3f) => %s; "
-                 "LowerPoint strate=%d (%.3f,%.3f,%.3f) => %s\n"),
+            TEXT("  %d %s | %s | %s | %s | %d | %.9g | %lld | %d | (%.3f,%.3f,%.3f)\n"),
+            Report.Index,
             *Report.Name,
-            Report.UpperStrateIndex,
-            Report.UpperPoint.X,
-            Report.UpperPoint.Y,
-            Report.UpperPoint.Z,
-            *Report.UpperResult,
-            Report.LowerStrateIndex,
-            Report.LowerPoint.X,
-            Report.LowerPoint.Y,
-            Report.LowerPoint.Z,
-            *Report.LowerResult);
+            *ArrivalToDeparture,
+            *ArrivalToLargest,
+            *DepartureToLargest,
+            Metrics.NumAirComponents,
+            Metrics.LargestComponentShare,
+            Metrics.LargestComponentCells,
+            Metrics.NumComponentsAtLeast1Pct,
+            Metrics.LargestComponentPoint.X,
+            Metrics.LargestComponentPoint.Y,
+            Metrics.LargestComponentPoint.Z);
     }
     AddInfo(Summary);
 
