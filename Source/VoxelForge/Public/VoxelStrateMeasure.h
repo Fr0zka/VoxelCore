@@ -26,7 +26,7 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     FVector2D CenterXY       = FVector2D::ZeroVector; // Actor-space voxel coordinates.
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     HeadroomCells  = 2;    // Air cells above a floor cell required for walkable.
-    int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped).
+    int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped); explicit 0 includes the seal.
 };
 
 /** Metrics derived from one coarse grid and its single air flood fill. */
@@ -53,6 +53,33 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     int32 ResolvedMarginVoxels = 0;
     int32 SampledMinZ = 0;
     int32 SampledMaxZ = 0;
+};
+
+/**
+ * Component facts for one coarse mouth-to-mouth query.
+ *
+ * The component shares are fractions of the sampled air cells. The two component distances are
+ * exact spatial Euclidean distances in coarse-cell coordinates to the nearest cell of the other
+ * mouth's component. Solid cells do not participate in that proximity calculation because it
+ * measures geometric separation between air components, not an alternate route. A distance of
+ * zero means both mouths resolve to the same component. Negative distances mean that the
+ * requested grid or endpoint could not be analyzed.
+ */
+struct VOXELFORGE_API FVoxelConnectivityDiagnostics
+{
+    bool bValid = false;
+    EVoxelConnectivityResult Result = EVoxelConnectivityResult::OutOfWindow;
+    bool bStartSnapped = false;
+    bool bGoalSnapped = false;
+
+    int64 NumAirCells = 0;
+    int64 StartComponentCells = 0;
+    int64 GoalComponentCells = 0;
+    float StartComponentShare = 0.0f;
+    float GoalComponentShare = 0.0f;
+
+    float StartToGoalComponentDistanceCells = -1.0f;
+    float GoalToStartComponentDistanceCells = -1.0f;
 };
 
 /**
@@ -87,3 +114,17 @@ VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     const FVoxelStrateMeasureSettings& Settings,
     bool& bOutStartSnapped,
     bool& bOutGoalSnapped);
+
+/**
+ * Return the component sizes and spatial separation facts for the same query performed by
+ * VF_AreConnected. The returned Result uses the same full-resolution route re-check. bValid means
+ * the sample grid was built and both endpoint coordinates were in its bounds; component fields
+ * remain zero/negative when an endpoint has no air cell to analyze.
+ */
+VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings);

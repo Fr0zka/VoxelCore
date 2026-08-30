@@ -164,14 +164,14 @@ namespace VoxelStrateMeasurePrivate
             }
             else if (DoubleSealThickness <= static_cast<float>(INT32_MIN))
             {
-                RequestedMargin = 1;
+                RequestedMargin = 0;
             }
             else
             {
                 RequestedMargin = FMath::CeilToInt(DoubleSealThickness);
             }
         }
-        const int32 ResolvedMargin = FMath::Clamp(RequestedMargin, 1, MaxMargin);
+        const int32 ResolvedMargin = FMath::Clamp(RequestedMargin, 0, MaxMargin);
 
         const int64 InteriorMinZ = StrateBottomZ + static_cast<int64>(ResolvedMargin);
         const int64 InteriorMaxZ = StrateTopZ - static_cast<int64>(ResolvedMargin);
@@ -803,6 +803,94 @@ namespace VoxelStrateMeasurePrivate
         }
         return true;
     }
+
+    EVoxelConnectivityResult EvaluateConnectivityOnGrid(
+        const UVoxelGenerator& Generator,
+        const FSampleGrid& Grid,
+        const FVector& AVoxel,
+        const FVector& BVoxel,
+        int32& OutStart,
+        int32& OutGoal,
+        bool& bOutStartSnapped,
+        bool& bOutGoalSnapped)
+    {
+        OutStart = -1;
+        OutGoal = -1;
+        bOutStartSnapped = false;
+        bOutGoalSnapped = false;
+
+        const EEndpointCellResult StartCell = ResolveEndpointCell(
+            Grid, AVoxel, OutStart, bOutStartSnapped);
+        const EEndpointCellResult GoalCell = ResolveEndpointCell(
+            Grid, BVoxel, OutGoal, bOutGoalSnapped);
+        if (StartCell == EEndpointCellResult::OutOfWindow
+            || GoalCell == EEndpointCellResult::OutOfWindow)
+        {
+            return EVoxelConnectivityResult::OutOfWindow;
+        }
+        if (StartCell == EEndpointCellResult::Solid)
+        {
+            return EVoxelConnectivityResult::StartCellSolid;
+        }
+        if (GoalCell == EEndpointCellResult::Solid)
+        {
+            return EVoxelConnectivityResult::GoalCellSolid;
+        }
+
+        TArray<int32> Path;
+        if (!FindCoarsePath(Grid, OutStart, OutGoal, Path))
+        {
+            return EVoxelConnectivityResult::NotConnectedAtThisResolution;
+        }
+
+        // The coarse route is evidence, not a pass. Re-check this one BFS route at one-voxel
+        // spacing in the original voxel field. A single solid sample is the dangerous coarse
+        // false positive.
+        if (!FullResolutionPathIsAir(Generator, Grid, AVoxel, BVoxel, Path))
+        {
+            return EVoxelConnectivityResult::CoarseLied;
+        }
+        return EVoxelConnectivityResult::Connected;
+    }
+
+    float DistanceToComponent(
+        const FSampleGrid& Grid,
+        int32 StartCell,
+        int32 TargetComponent,
+        const TArray<int32>& Components)
+    {
+        if (Components[StartCell] == TargetComponent)
+        {
+            return 0.0f;
+        }
+
+        int32 StartX = 0;
+        int32 StartY = 0;
+        int32 StartZ = 0;
+        DecodeIndex(Grid, StartCell, StartX, StartY, StartZ);
+        int64 BestDistanceSquared = MAX_int64;
+        for (int32 Index = 0; Index < Grid.CellCount; ++Index)
+        {
+            if (Components[Index] != TargetComponent)
+            {
+                continue;
+            }
+
+            int32 X = 0;
+            int32 Y = 0;
+            int32 Z = 0;
+            DecodeIndex(Grid, Index, X, Y, Z);
+            const int64 DX = static_cast<int64>(X) - static_cast<int64>(StartX);
+            const int64 DY = static_cast<int64>(Y) - static_cast<int64>(StartY);
+            const int64 DZ = static_cast<int64>(Z) - static_cast<int64>(StartZ);
+            const int64 DistanceSquared = DX * DX + DY * DY + DZ * DZ;
+            BestDistanceSquared = FMath::Min(BestDistanceSquared, DistanceSquared);
+        }
+
+        return BestDistanceSquared == MAX_int64
+            ? -1.0f
+            : FMath::Sqrt(static_cast<float>(BestDistanceSquared));
+    }
 }
 
 FVoxelStrateMetrics VF_MeasureStrate(
@@ -859,38 +947,109 @@ EVoxelConnectivityResult VF_AreConnected(
 
     int32 Start = -1;
     int32 Goal = -1;
-    const VoxelStrateMeasurePrivate::EEndpointCellResult StartCell =
-        VoxelStrateMeasurePrivate::ResolveEndpointCell(
-            Grid, AVoxel, Start, bOutStartSnapped);
-    const VoxelStrateMeasurePrivate::EEndpointCellResult GoalCell =
-        VoxelStrateMeasurePrivate::ResolveEndpointCell(
-            Grid, BVoxel, Goal, bOutGoalSnapped);
-    if (StartCell == VoxelStrateMeasurePrivate::EEndpointCellResult::OutOfWindow
-        || GoalCell == VoxelStrateMeasurePrivate::EEndpointCellResult::OutOfWindow)
+    return VoxelStrateMeasurePrivate::EvaluateConnectivityOnGrid(
+        Generator,
+        Grid,
+        AVoxel,
+        BVoxel,
+        Start,
+        Goal,
+        bOutStartSnapped,
+        bOutGoalSnapped);
+}
+
+FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings)
+{
+    FVoxelConnectivityDiagnostics Result;
+    if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y) || !FMath::IsFinite(AVoxel.Z)
+        || !FMath::IsFinite(BVoxel.X) || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
     {
-        return EVoxelConnectivityResult::OutOfWindow;
-    }
-    if (StartCell == VoxelStrateMeasurePrivate::EEndpointCellResult::Solid)
-    {
-        return EVoxelConnectivityResult::StartCellSolid;
-    }
-    if (GoalCell == VoxelStrateMeasurePrivate::EEndpointCellResult::Solid)
-    {
-        return EVoxelConnectivityResult::GoalCellSolid;
+        return Result;
     }
 
-    TArray<int32> Path;
-    if (!VoxelStrateMeasurePrivate::FindCoarsePath(Grid, Start, Goal, Path))
+    VoxelStrateMeasurePrivate::FSampleGrid Grid;
+    FString RefusalReason;
+    if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
+            Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
     {
-        return EVoxelConnectivityResult::NotConnectedAtThisResolution;
+        return Result;
     }
 
-    // The coarse route is evidence, not a pass. Re-check this one BFS route at one-voxel spacing
-    // in the original voxel field. A single solid sample is the dangerous coarse false positive.
-    if (!VoxelStrateMeasurePrivate::FullResolutionPathIsAir(
-            Generator, Grid, AVoxel, BVoxel, Path))
+    int32 Start = -1;
+    int32 Goal = -1;
+    Result.Result = VoxelStrateMeasurePrivate::EvaluateConnectivityOnGrid(
+        Generator,
+        Grid,
+        AVoxel,
+        BVoxel,
+        Start,
+        Goal,
+        Result.bStartSnapped,
+        Result.bGoalSnapped);
+    Result.bValid = Result.Result != EVoxelConnectivityResult::OutOfWindow
+        || (Start >= 0 && Goal >= 0);
+    if (Start < 0 || Goal < 0)
     {
-        return EVoxelConnectivityResult::CoarseLied;
+        return Result;
     }
-    return EVoxelConnectivityResult::Connected;
+
+    TArray<int32> Components;
+    int32 NumComponents = 0;
+    int64 LargestComponentCells = 0;
+    int32 LargestComponentLowestCell = INDEX_NONE;
+    int32 NumComponentsAtLeast1Pct = 0;
+    int64 NumAir = 0;
+    for (const uint8 bAir : Grid.Air)
+    {
+        NumAir += bAir != 0u ? 1 : 0;
+    }
+    FloodFillAir(
+        Grid,
+        Components,
+        NumComponents,
+        NumAir,
+        LargestComponentCells,
+        LargestComponentLowestCell,
+        NumComponentsAtLeast1Pct);
+
+    const int32 StartComponent = Components[Start];
+    const int32 GoalComponent = Components[Goal];
+    if (StartComponent < 0 || GoalComponent < 0)
+    {
+        return Result;
+    }
+
+    TArray<int32> ComponentCells;
+    ComponentCells.Init(0, NumComponents);
+    for (const int32 Component : Components)
+    {
+        if (Component >= 0)
+        {
+            ++ComponentCells[Component];
+        }
+    }
+
+    Result.NumAirCells = NumAir;
+    Result.StartComponentCells = ComponentCells[StartComponent];
+    Result.GoalComponentCells = ComponentCells[GoalComponent];
+    if (NumAir > 0)
+    {
+        Result.StartComponentShare = static_cast<float>(
+            static_cast<double>(Result.StartComponentCells) / static_cast<double>(NumAir));
+        Result.GoalComponentShare = static_cast<float>(
+            static_cast<double>(Result.GoalComponentCells) / static_cast<double>(NumAir));
+    }
+    Result.StartToGoalComponentDistanceCells =
+        VoxelStrateMeasurePrivate::DistanceToComponent(
+            Grid, Start, GoalComponent, Components);
+    Result.GoalToStartComponentDistanceCells =
+        VoxelStrateMeasurePrivate::DistanceToComponent(
+            Grid, Goal, StartComponent, Components);
+    return Result;
 }

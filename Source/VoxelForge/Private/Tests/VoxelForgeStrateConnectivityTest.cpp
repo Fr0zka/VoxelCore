@@ -246,6 +246,7 @@ namespace
     {
         int32 SampleStep = 0;
         int32 RadiusInVoxels = 0;
+        int32 RequestedMarginVoxels = -1;
         FVoxelStrateMetrics Metrics;
         FConnectivityProbe Probe;
     };
@@ -1037,6 +1038,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     {
         int32 SampleStep;
         int32 RadiusInVoxels;
+        int32 InteriorMarginVoxels = -1;
     };
     static constexpr FRefinementCase Cases[] = {
         {4, 256},
@@ -1056,10 +1058,12 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         FRefinementSweepRow& Row = Rows.AddDefaulted_GetRef();
         Row.SampleStep = TestCase.SampleStep;
         Row.RadiusInVoxels = TestCase.RadiusInVoxels;
+        Row.RequestedMarginVoxels = TestCase.InteriorMarginVoxels;
 
         FVoxelStrateMeasureSettings RowSettings = BaseSettings;
         RowSettings.SampleStep = TestCase.SampleStep;
         RowSettings.RadiusInVoxels = TestCase.RadiusInVoxels;
+        RowSettings.InteriorMarginVoxels = TestCase.InteriorMarginVoxels;
 
         Row.Metrics = VF_MeasureStrate(
             *World.Generator,
@@ -1125,6 +1129,106 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     }
     const double SweepSeconds = FPlatformTime::Seconds() - SweepStartSeconds;
 
+    static constexpr int32 MarginCases[] = {0, 2, 4, 8};
+    TArray<FRefinementSweepRow> MarginRows;
+    MarginRows.Reserve(UE_ARRAY_COUNT(MarginCases));
+
+    const double MarginSweepStartSeconds = FPlatformTime::Seconds();
+    for (const int32 RequestedMargin : MarginCases)
+    {
+        FRefinementSweepRow& Row = MarginRows.AddDefaulted_GetRef();
+        Row.SampleStep = 2;
+        Row.RadiusInVoxels = 192;
+        Row.RequestedMarginVoxels = RequestedMargin;
+
+        FVoxelStrateMeasureSettings RowSettings = BaseSettings;
+        RowSettings.SampleStep = Row.SampleStep;
+        RowSettings.RadiusInVoxels = Row.RadiusInVoxels;
+        RowSettings.InteriorMarginVoxels = RequestedMargin;
+
+        Row.Metrics = VF_MeasureStrate(
+            *World.Generator,
+            *World.StrateManager,
+            VerticalShaftsIndex,
+            RowSettings);
+
+        Row.Probe.bChecked = true;
+        Row.Probe.Result = VF_AreConnected(
+            *World.Generator,
+            *World.StrateManager,
+            VerticalShaftsIndex,
+            ArrivalPoint,
+            DeparturePoint,
+            RowSettings,
+            Row.Probe.bStartSnapped,
+            Row.Probe.bGoalSnapped);
+
+        if (!Row.Metrics.bValid
+            || Row.Metrics.NumSampled <= 0
+            || Row.Metrics.NumSampled > BaseSettings.MaxCells
+            || Row.Metrics.NumAir <= 0
+            || Row.Metrics.NumSolid <= 0)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts margin row margin=%d did not produce a "
+                     "bounded non-vacuous measurement (valid=%s, reason='%s', cells=%lld, "
+                     "air=%lld, solid=%lld)."),
+                RequestedMargin,
+                Row.Metrics.bValid ? TEXT("true") : TEXT("false"),
+                *Row.Metrics.RefusalReason,
+                Row.Metrics.NumSampled,
+                Row.Metrics.NumAir,
+                Row.Metrics.NumSolid));
+            bAllChecksPassed = false;
+        }
+
+        if (Row.Metrics.ResolvedMarginVoxels != RequestedMargin)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts margin row requested margin=%d but the "
+                     "measurement resolved margin=%d."),
+                RequestedMargin,
+                Row.Metrics.ResolvedMarginVoxels));
+            bAllChecksPassed = false;
+        }
+
+        if (Row.Probe.Result == EVoxelConnectivityResult::OutOfWindow
+            || Row.Probe.Result == EVoxelConnectivityResult::StartCellSolid
+            || Row.Probe.Result == EVoxelConnectivityResult::GoalCellSolid)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts margin row margin=%d could not query both "
+                     "in-window air mouths: %s."),
+                RequestedMargin,
+                *ConnectivityProbeText(Row.Probe)));
+            bAllChecksPassed = false;
+        }
+
+        if (Row.Probe.bStartSnapped || Row.Probe.bGoalSnapped)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: VerticalShafts margin row margin=%d snapped an endpoint; "
+                     "the controlled comparison is not a mouth-to-mouth query."),
+                RequestedMargin));
+            bAllChecksPassed = false;
+        }
+    }
+    const double MarginSweepSeconds = FPlatformTime::Seconds() - MarginSweepStartSeconds;
+
+    bool bMarginArtifact = false;
+    bool bMarginSweepUsable = MarginRows.Num() == UE_ARRAY_COUNT(MarginCases);
+    for (const FRefinementSweepRow& Row : MarginRows)
+    {
+        bMarginArtifact |= Row.Probe.Result == EVoxelConnectivityResult::Connected;
+        bMarginSweepUsable &= Row.Metrics.bValid
+            && Row.Metrics.ResolvedMarginVoxels == Row.RequestedMarginVoxels
+            && Row.Probe.Result != EVoxelConnectivityResult::OutOfWindow
+            && Row.Probe.Result != EVoxelConnectivityResult::StartCellSolid
+            && Row.Probe.Result != EVoxelConnectivityResult::GoalCellSolid
+            && !Row.Probe.bStartSnapped
+            && !Row.Probe.bGoalSnapped;
+    }
+
     FString Summary = TEXT(
         "VerticalShafts arrival->departure refinement (seed 1337; source mouth pair; "
         "derived interior window):\n");
@@ -1158,6 +1262,199 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     Summary += FString::Printf(
         TEXT("VerticalShafts refinement sweep wall-clock: %.3f seconds.\n"),
         SweepSeconds);
+
+    Summary += TEXT(
+        "Part A — margin artifact check (SampleStep 2, RadiusInVoxels 192; explicit margins):\n");
+    Summary += TEXT(
+        "  margin | verdict | components | largest share | sampled cells | Z window | endpoint snaps\n");
+    for (const FRefinementSweepRow& Row : MarginRows)
+    {
+        const FString VerdictText = ConnectivityProbeText(Row.Probe);
+        FString SnapText = TEXT("none");
+        if (Row.Probe.bStartSnapped || Row.Probe.bGoalSnapped)
+        {
+            SnapText = ConnectivityProbeText(Row.Probe);
+        }
+        Summary += FString::Printf(
+            TEXT("  %d | %s | %d | %.9g | %lld | [%d,%d) | %s\n"),
+            Row.RequestedMarginVoxels,
+            *VerdictText,
+            Row.Metrics.NumAirComponents,
+            Row.Metrics.LargestComponentShare,
+            Row.Metrics.NumSampled,
+            Row.Metrics.SampledMinZ,
+            Row.Metrics.SampledMaxZ,
+            *SnapText);
+    }
+    Summary += FString::Printf(
+        TEXT("Part A verdict: %s. Margin sweep wall-clock: %.3f seconds.\n"),
+        bMarginArtifact
+            ? TEXT("ARTIFACT — at least one margin-0/2/4 query is CONNECTED; the default margin excluded the connection")
+            : TEXT("FINDING SURVIVES — no margin-0/2/4 query is CONNECTED; the full window is exonerated"),
+        MarginSweepSeconds);
+
+    if (!bMarginArtifact && bMarginSweepUsable)
+    {
+        FVoxelStrateMeasureSettings DiagnosticSettings = BaseSettings;
+        DiagnosticSettings.SampleStep = 2;
+        DiagnosticSettings.RadiusInVoxels = 192;
+        DiagnosticSettings.InteriorMarginVoxels = 0;
+
+        const FVoxelConnectivityDiagnostics Diagnostics = VF_DiagnoseConnectivity(
+            *World.Generator,
+            *World.StrateManager,
+            VerticalShaftsIndex,
+            ArrivalPoint,
+            DeparturePoint,
+            DiagnosticSettings);
+        if (!Diagnostics.bValid
+            || Diagnostics.NumAirCells <= 0
+            || Diagnostics.StartComponentCells <= 0
+            || Diagnostics.GoalComponentCells <= 0
+            || Diagnostics.StartToGoalComponentDistanceCells < 0
+            || Diagnostics.GoalToStartComponentDistanceCells < 0)
+        {
+            AddError(TEXT("HARD FAILURE: the surviving VerticalShafts finding could not produce "
+                          "component and separation diagnostics."));
+            bAllChecksPassed = false;
+        }
+
+        const float MouthXYSeparation = FMath::Sqrt(
+            FMath::Square(ArrivalPoint.X - DeparturePoint.X)
+            + FMath::Square(ArrivalPoint.Y - DeparturePoint.Y));
+        const float MouthZDelta = DeparturePoint.Z - ArrivalPoint.Z;
+        const float MouthStraightLine = FVector::Dist(ArrivalPoint, DeparturePoint);
+        const float CoarseStraightLineCells = MouthStraightLine
+            / static_cast<float>(DiagnosticSettings.SampleStep);
+
+        Summary += TEXT("Part B — VerticalShafts diagnosis (seed 1337; margin 0; step 2; radius 192):\n");
+        Summary += FString::Printf(
+            TEXT("  arrival LowerPoint: (%.3f, %.3f, %.3f); departure UpperPoint: "
+                 "(%.3f, %.3f, %.3f); XY separation %.3f voxels; Z delta %.3f voxels.\n"),
+            ArrivalPoint.X,
+            ArrivalPoint.Y,
+            ArrivalPoint.Z,
+            DeparturePoint.X,
+            DeparturePoint.Y,
+            DeparturePoint.Z,
+            MouthXYSeparation,
+            MouthZDelta);
+        Summary += FString::Printf(
+            TEXT("  mouth components: air=%lld; arrival=%lld (share %.9g); departure=%lld "
+                 "(share %.9g).\n"),
+            Diagnostics.NumAirCells,
+            Diagnostics.StartComponentCells,
+            Diagnostics.StartComponentShare,
+            Diagnostics.GoalComponentCells,
+            Diagnostics.GoalComponentShare);
+        Summary += FString::Printf(
+            TEXT("  coarse-grid separation: straight-line %.3f cells (%.3f voxels); "
+                 "arrival to nearest departure-component cell %.3f cells (%.3f voxels); "
+                 "departure to nearest arrival-component cell %.3f cells (%.3f voxels).\n"),
+            CoarseStraightLineCells,
+            MouthStraightLine,
+            Diagnostics.StartToGoalComponentDistanceCells,
+            Diagnostics.StartToGoalComponentDistanceCells * static_cast<float>(DiagnosticSettings.SampleStep),
+            Diagnostics.GoalToStartComponentDistanceCells,
+            Diagnostics.GoalToStartComponentDistanceCells * static_cast<float>(DiagnosticSettings.SampleStep));
+        Summary += FString::Printf(
+            TEXT("  diagnostic route verdict: %s; endpoint snaps: start=%s, goal=%s.\n"),
+            ConnectivityResultName(Diagnostics.Result),
+            Diagnostics.bStartSnapped ? TEXT("yes") : TEXT("no"),
+            Diagnostics.bGoalSnapped ? TEXT("yes") : TEXT("no"));
+
+        static constexpr int32 SeedCases[] = {
+            1337, 1, 2, 3, 4, 5, 6, 7,
+            8, 9, 10, 11, 12, 13, 14, 15,
+        };
+        int32 SeedPasses = 0;
+        int32 SeedFailures = 0;
+        int32 SeedSnapEvents = 0;
+        int32 SeedResultCounts[6] = {};
+        const double SeedSweepStartSeconds = FPlatformTime::Seconds();
+        for (const int32 Seed : SeedCases)
+        {
+            FTestWorld SeedWorld;
+            SeedWorld.Build(Seed, /*InGapChunks=*/2);
+            if (!SeedWorld.IsValid())
+            {
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: seed %d could not build the VerticalShafts fixture."),
+                    Seed));
+                ++SeedFailures;
+                continue;
+            }
+
+            FVector SeedArrivalPoint = FVector::ZeroVector;
+            FVector SeedDeparturePoint = FVector::ZeroVector;
+            if (!FindChainMouths(
+                    SeedWorld.StrateManager->GetPassages(),
+                    VerticalShaftsIndex,
+                    SeedArrivalPoint,
+                    SeedDeparturePoint))
+            {
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: seed %d did not produce exactly one VerticalShafts "
+                         "arrival and departure mouth."),
+                    Seed));
+                ++SeedFailures;
+                continue;
+            }
+
+            bool bStartSnapped = false;
+            bool bGoalSnapped = false;
+            const EVoxelConnectivityResult SeedResult = VF_AreConnected(
+                *SeedWorld.Generator,
+                *SeedWorld.StrateManager,
+                VerticalShaftsIndex,
+                SeedArrivalPoint,
+                SeedDeparturePoint,
+                DiagnosticSettings,
+                bStartSnapped,
+                bGoalSnapped);
+            ++SeedResultCounts[static_cast<int32>(SeedResult)];
+            const int32 SnapEvents = (bStartSnapped ? 1 : 0) + (bGoalSnapped ? 1 : 0);
+            SeedSnapEvents += SnapEvents;
+            if (SeedResult == EVoxelConnectivityResult::Connected
+                && !bStartSnapped
+                && !bGoalSnapped)
+            {
+                ++SeedPasses;
+            }
+            else
+            {
+                ++SeedFailures;
+            }
+        }
+        const double SeedSweepSeconds = FPlatformTime::Seconds() - SeedSweepStartSeconds;
+
+        Summary += FString::Printf(
+            TEXT("  multi-seed arrival->departure sweep (%d seeds; margin 0, step 2, radius 192): "
+                 "%d pass, %d fail, %d snapped endpoint events; wall-clock %.3f seconds.\n"),
+            UE_ARRAY_COUNT(SeedCases),
+            SeedPasses,
+            SeedFailures,
+            SeedSnapEvents,
+            SeedSweepSeconds);
+        Summary += FString::Printf(
+            TEXT("  seed result breakdown: CONNECTED=%d, NOT_CONNECTED_AT_THIS_RESOLUTION=%d, "
+                 "START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, OUT_OF_WINDOW=%d, COARSE_LIED=%d.\n"),
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
+            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)]);
+    }
+    else
+    {
+        Summary += FString::Printf(
+            TEXT("Part B diagnosis and multi-seed sweep: SKIPPED because Part A %s.\n"),
+            bMarginArtifact
+                ? TEXT("found the connection in the previously excluded band")
+                : TEXT("did not produce a usable four-row measurement/query set"));
+    }
+
     AddInfo(Summary);
 
     return bAllChecksPassed;
