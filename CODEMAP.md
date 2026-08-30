@@ -303,15 +303,17 @@ This is **where terrain shape lives.**
 > XY-field noise (heightfield/ceiling/relief/moisture) deliberately stays un-biased. §8.10.
 
 ### 3.6b Strate measurement — `Public/VoxelStrateMeasure.h` + `Private/VoxelStrateMeasure.cpp`
-Headless, read-only Tier 2 measurement pass. `VF_MeasureStrate` samples one strate's strict
-interior into a bounded coarse grid, performs one deterministic 6-connected air flood fill, and
-derives fractions, components, walkability, feature scale, and clearance from that grid.
+Headless, read-only Tier 2 measurement pass. `VF_MeasureStrate` samples one strate between a
+boundary-seal-derived (or explicitly overridden) interior margin into a bounded coarse grid,
+performs one deterministic 6-connected air flood fill, and derives fractions, components,
+walkability, feature scale, and clearance from that grid. Metrics report the resolved margin and
+the inclusive/exclusive voxel Z window used.
 `VF_AreConnected` recovers a deterministic BFS parent path from the same kind of grid and checks
 only that route at full voxel resolution before returning true; a coarse false positive sets
 `bOutCoarseLied`. No UObject state, cache, actor, world, or PIE is required.
 | Symbol | Role |
 |--------|------|
-| `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements. |
+| `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin, and results identify the resolved margin/Z window. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; refuses invalid bounds or a grid over `MaxCells`. |
 | `VF_AreConnected` | Coarse 6-connected BFS plus one full-resolution recheck of its recovered route. |
 

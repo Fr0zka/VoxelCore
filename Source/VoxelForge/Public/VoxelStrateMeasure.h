@@ -15,6 +15,7 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     FVector2D CenterXY       = FVector2D::ZeroVector; // Actor-space voxel coordinates.
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     HeadroomCells  = 2;    // Air cells above a floor cell required for walkable.
+    int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped).
 };
 
 /** Metrics derived from one coarse grid and its single air flood fill. */
@@ -33,13 +34,19 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     float WalkableFraction      = 0.f;
     float MedianFeatureScale   = 0.f;
     int32 MedianVerticalClearance = 0;
+
+    // The exact vertical window used by the measurement: [SampledMinZ, SampledMaxZ).
+    int32 ResolvedMarginVoxels = 0;
+    int32 SampledMinZ = 0;
+    int32 SampledMaxZ = 0;
 };
 
 /**
  * Measure one strate in actor-space voxel coordinates.
  *
- * The pass samples only the interior chunks of the requested strate, flood-fills its air once,
- * and derives all returned metrics from that same grid. It never mutates either input object.
+ * The pass samples the requested strate between a resolved margin inside its top and bottom
+ * boundaries, flood-fills its air once, and derives all returned metrics from that same grid.
+ * It never mutates either input object.
  */
 VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
     const UVoxelGenerator& Generator,

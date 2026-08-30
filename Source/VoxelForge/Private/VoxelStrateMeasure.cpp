@@ -26,6 +26,10 @@ namespace VoxelStrateMeasurePrivate
         float ExtentY = 0.0f;
         float ExtentZ = 0.0f;
 
+        int32 ResolvedMarginVoxels = 0;
+        int32 SampledMinZ = 0;
+        int32 SampledMaxZ = 0;
+
         // 1 = air, 0 = solid. The polarity is deliberately explicit at the sampling site below.
         TArray<uint8> Air;
 
@@ -114,14 +118,74 @@ namespace VoxelStrateMeasurePrivate
             return Refuse(OutReason, TEXT("The requested strate has no positive vertical extent."));
         }
 
-        // Exclude the complete top and bottom chunks. Those outer chunks contain the seal bands;
-        // the measurement is about the strate interior, not the boundary bedrock.
-        const int64 InteriorMinZ = (static_cast<int64>(Slot.BottomChunkZ) + 1) * CHUNK_SIZE;
-        const int64 InteriorMaxZ = static_cast<int64>(Slot.TopChunkZ) * CHUNK_SIZE;
+        const int64 StrateBottomZ = static_cast<int64>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        const int64 StrateTopZ = (static_cast<int64>(Slot.TopChunkZ) + 1) * CHUNK_SIZE;
+        const int64 StrateHeight = StrateTopZ - StrateBottomZ;
+        if (StrateHeight <= 0)
+        {
+            return Refuse(OutReason, TEXT("The requested strate has no positive voxel height."));
+        }
+
+        // Resolve the margin from the same blended parameter query used by generation. The
+        // representative chunk is deliberately in the middle of this slot and uses the sample
+        // centre's XY chunk, so a future non-Hard transition resolves through the manager exactly
+        // as generation does at that representative location.
+        const int32 MidChunkZ = Slot.BottomChunkZ
+            + (Slot.TopChunkZ - Slot.BottomChunkZ) / 2;
+        const FIntVector RepresentativeChunk(
+            FMath::FloorToInt(Settings.CenterXY.X / static_cast<float>(CHUNK_SIZE)),
+            FMath::FloorToInt(Settings.CenterXY.Y / static_cast<float>(CHUNK_SIZE)),
+            MidChunkZ);
+        const FStrateGenerationParams RepresentativeParams =
+            Manager.GetGenerationParams(RepresentativeChunk);
+
+        const int64 MaxMargin64 = FMath::Max<int64>(1, StrateHeight / 4);
+        const int32 MaxMargin = static_cast<int32>(
+            FMath::Min<int64>(MaxMargin64, static_cast<int64>(INT32_MAX)));
+        int32 RequestedMargin = Settings.InteriorMarginVoxels;
+        if (RequestedMargin < 0)
+        {
+            const float DoubleSealThickness = 2.0f * RepresentativeParams.BoundarySealThickness;
+            if (FMath::IsNaN(RepresentativeParams.BoundarySealThickness))
+            {
+                return Refuse(OutReason, TEXT("BoundarySealThickness is NaN; the interior margin cannot be derived."));
+            }
+
+            // Avoid converting an infinite value to int. A positive overflow is still an
+            // intentionally absurd seal request and therefore resolves to the safe maximum;
+            // negative infinity resolves to the minimum.
+            if (!FMath::IsFinite(DoubleSealThickness))
+            {
+                RequestedMargin = DoubleSealThickness > 0.0f ? MaxMargin : 1;
+            }
+            else if (DoubleSealThickness >= static_cast<float>(INT32_MAX))
+            {
+                RequestedMargin = MaxMargin;
+            }
+            else if (DoubleSealThickness <= static_cast<float>(INT32_MIN))
+            {
+                RequestedMargin = 1;
+            }
+            else
+            {
+                RequestedMargin = FMath::CeilToInt(DoubleSealThickness);
+            }
+        }
+        const int32 ResolvedMargin = FMath::Clamp(RequestedMargin, 1, MaxMargin);
+
+        const int64 InteriorMinZ = StrateBottomZ + static_cast<int64>(ResolvedMargin);
+        const int64 InteriorMaxZ = StrateTopZ - static_cast<int64>(ResolvedMargin);
         const int64 InteriorHeight = InteriorMaxZ - InteriorMinZ;
         if (InteriorHeight <= 0)
         {
-            return Refuse(OutReason, TEXT("The strate is too short after excluding its top and bottom chunks."));
+            return Refuse(OutReason, TEXT("The strate has no measurable height after applying its interior margin."));
+        }
+        if (InteriorMinZ < static_cast<int64>(INT32_MIN)
+            || InteriorMinZ > static_cast<int64>(INT32_MAX)
+            || InteriorMaxZ < static_cast<int64>(INT32_MIN)
+            || InteriorMaxZ > static_cast<int64>(INT32_MAX))
+        {
+            return Refuse(OutReason, TEXT("The sampled Z window is outside the metrics struct's int32 range."));
         }
 
         const int64 XYExtent = static_cast<int64>(Settings.RadiusInVoxels) * 2;
@@ -188,6 +252,9 @@ namespace VoxelStrateMeasurePrivate
         OutGrid.ExtentX = MaxX - MinX;
         OutGrid.ExtentY = MaxY - MinY;
         OutGrid.ExtentZ = MaxZ - MinZ;
+        OutGrid.ResolvedMarginVoxels = ResolvedMargin;
+        OutGrid.SampledMinZ = static_cast<int32>(InteriorMinZ);
+        OutGrid.SampledMaxZ = static_cast<int32>(InteriorMaxZ);
         OutGrid.Air.SetNumUninitialized(OutGrid.CellCount);
 
         bool bSawNonFiniteDensity = false;
@@ -627,6 +694,9 @@ FVoxelStrateMetrics VF_MeasureStrate(
         return Result;
     }
 
+    Result.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
+    Result.SampledMinZ = Grid.SampledMinZ;
+    Result.SampledMaxZ = Grid.SampledMaxZ;
     VoxelStrateMeasurePrivate::BuildMetricsFromGrid(Grid, Settings, Result);
     Result.bValid = Result.NumSampled > 0;
     if (!Result.bValid)

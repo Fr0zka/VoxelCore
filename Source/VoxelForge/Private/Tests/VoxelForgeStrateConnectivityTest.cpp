@@ -19,14 +19,20 @@ namespace
     {
         FString Name;
         int32 Index = INDEX_NONE;
-        FVoxelStrateMetrics First;
-        FVoxelStrateMetrics Second;
+        FVoxelStrateMetrics OldWindow;
+        FVoxelStrateMetrics OldWindowRepeat;
+        FVoxelStrateMetrics DerivedWindow;
+        FVoxelStrateMetrics DerivedWindowRepeat;
     };
 
     struct FPassageReport
     {
         int32 Index = INDEX_NONE;
         FString Name;
+        int32 UpperStrateIndex = INDEX_NONE;
+        int32 LowerStrateIndex = INDEX_NONE;
+        FVector UpperPoint = FVector::ZeroVector;
+        FVector LowerPoint = FVector::ZeroVector;
         FString UpperResult;
         FString LowerResult;
     };
@@ -61,22 +67,39 @@ namespace
             && SameFloatBits(A.LargestComponentShare, B.LargestComponentShare)
             && SameFloatBits(A.WalkableFraction, B.WalkableFraction)
             && SameFloatBits(A.MedianFeatureScale, B.MedianFeatureScale)
-            && A.MedianVerticalClearance == B.MedianVerticalClearance;
+            && A.MedianVerticalClearance == B.MedianVerticalClearance
+            && A.ResolvedMarginVoxels == B.ResolvedMarginVoxels
+            && A.SampledMinZ == B.SampledMinZ
+            && A.SampledMaxZ == B.SampledMaxZ;
     }
 
-    bool IsStrictInteriorPoint(const FStrateSlot& Slot, const FVector& Point)
+    bool IsInsideMeasuredWindow(
+        const FVoxelStrateMetrics& Metrics,
+        const FVoxelStrateMeasureSettings& Settings,
+        const FVector& Point)
     {
-        const float MinZ = (static_cast<float>(Slot.BottomChunkZ) + 1.0f) * CHUNK_SIZE;
-        const float MaxZ = static_cast<float>(Slot.TopChunkZ) * CHUNK_SIZE;
-        return Point.Z >= MinZ && Point.Z < MaxZ;
+        const float MinX = Settings.CenterXY.X - static_cast<float>(Settings.RadiusInVoxels);
+        const float MaxX = Settings.CenterXY.X + static_cast<float>(Settings.RadiusInVoxels);
+        const float MinY = Settings.CenterXY.Y - static_cast<float>(Settings.RadiusInVoxels);
+        const float MaxY = Settings.CenterXY.Y + static_cast<float>(Settings.RadiusInVoxels);
+        return Point.X >= MinX && Point.X < MaxX
+            && Point.Y >= MinY && Point.Y < MaxY
+            && Point.Z >= static_cast<float>(Metrics.SampledMinZ)
+            && Point.Z < static_cast<float>(Metrics.SampledMaxZ);
     }
 
-    FVector LargestComponentAnchor(const FStrateSlot& Slot, const FVector2D& CenterXY)
+    FVector LargestComponentAnchor(
+        const FStrateSlot& Slot,
+        const FVector2D& CenterXY,
+        int32 SampleStep)
     {
         // The fixture's origin spine is the deterministic hub/void anchor. The measurement API
         // intentionally returns metrics rather than a component coordinate, so this report probes
         // the known spine point that represents the largest reachable component in this fixture.
-        const float AnchorZ = (static_cast<float>(Slot.BottomChunkZ) + 1.0f) * CHUNK_SIZE + 2.0f;
+        // Keep the established anchor one full chunk above the strate floor. The derived window
+        // includes it, while the first derived sample cell may still be floor rock for slab fields.
+        const float AnchorZ = (static_cast<float>(Slot.BottomChunkZ) + 1.0f) * CHUNK_SIZE
+            + 0.5f * static_cast<float>(SampleStep);
         return FVector(CenterXY.X + 2.0f, CenterXY.Y + 2.0f, AnchorZ);
     }
 
@@ -200,6 +223,11 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     Settings.MaxCells = 8000000;
     Settings.HeadroomCells = 2;
 
+    FVoxelStrateMeasureSettings OldWindowSettings = Settings;
+    OldWindowSettings.InteriorMarginVoxels = CHUNK_SIZE;
+    FVoxelStrateMeasureSettings DerivedWindowSettings = Settings;
+    DerivedWindowSettings.InteriorMarginVoxels = -1;
+
     bool bAllChecksPassed = true;
     FString Summary = TEXT("VoxelForge strate measurement summary (seed 1337, step 4, radius 256):\n");
 
@@ -258,8 +286,8 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     // deliberately separate from the gap probe above: this catches a sign inversion in the new
     // measurement pass even though the generator-level gap probe uses the correct MC predicate.
     const FStrateSlot& SolidControlSlot = World.StrateManager->GetLayout()[0];
-    const int32 SolidControlMinZ = (SolidControlSlot.BottomChunkZ + 1) * CHUNK_SIZE;
-    const int32 SolidControlMaxZ = SolidControlSlot.TopChunkZ * CHUNK_SIZE;
+    const int32 SolidControlMinZ = SolidControlSlot.BottomChunkZ * CHUNK_SIZE;
+    const int32 SolidControlMaxZ = (SolidControlSlot.TopChunkZ + 1) * CHUNK_SIZE;
     FVoxelModification SolidControl;
     SolidControl.Shape = EVoxelBrushShape::Box;
     SolidControl.Center = FVector(
@@ -275,7 +303,7 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     SolidControl.Strength = 100.0f;
     const TArray<FIntVector> SolidControlChunks = World.DiffLayer->ApplyModification(SolidControl);
     const FVoxelStrateMetrics SolidControlMetrics = VF_MeasureStrate(
-        *World.Generator, *World.StrateManager, 0, Settings);
+        *World.Generator, *World.StrateManager, 0, DerivedWindowSettings);
     if (SolidControlChunks.Num() == 0 || !SolidControlMetrics.bValid
         || SolidControlMetrics.AirFraction > 0.05f)
     {
@@ -291,22 +319,16 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     TArray<FArchetypeReport> ArchetypeReports;
     const TArray<FStrateSlot>& Layout = World.StrateManager->GetLayout();
     ArchetypeReports.Reserve(Layout.Num());
-    for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
-    {
-        FArchetypeReport& Report = ArchetypeReports.AddDefaulted_GetRef();
-        Report.Index = StrateIndex;
-        Report.Name = ArchetypeName(Layout[StrateIndex]);
-        Report.First = VF_MeasureStrate(
-            *World.Generator, *World.StrateManager, StrateIndex, Settings);
-        Report.Second = VF_MeasureStrate(
-            *World.Generator, *World.StrateManager, StrateIndex, Settings);
+    TArray<FVoxelStrateMetrics> DerivedMetricsByIndex;
+    DerivedMetricsByIndex.SetNum(Layout.Num());
 
-        const FVoxelStrateMetrics& Metrics = Report.First;
+    auto ValidateMeasurement = [&](const FString& Label, const FVoxelStrateMetrics& Metrics)
+    {
         if (!Metrics.bValid)
         {
             AddError(FString::Printf(
                 TEXT("HARD FAILURE: %s measurement refused: %s."),
-                *Report.Name,
+                *Label,
                 *Metrics.RefusalReason));
             bAllChecksPassed = false;
         }
@@ -314,7 +336,7 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         {
             AddError(FString::Printf(
                 TEXT("HARD FAILURE: vacuous %s measurement — sampled=%lld, air=%lld, solid=%lld."),
-                *Report.Name,
+                *Label,
                 Metrics.NumSampled,
                 Metrics.NumAir,
                 Metrics.NumSolid));
@@ -327,19 +349,49 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             || !FMath::IsFinite(Metrics.WalkableFraction)
             || Metrics.WalkableFraction < 0.0f || Metrics.WalkableFraction > 1.0f
             || (Metrics.NumAir > 0 && Metrics.NumAirComponents == 0)
-            || (Metrics.LargestComponentShare == 0.0f && Metrics.AirFraction > 0.05f))
+            || (Metrics.LargestComponentShare == 0.0f && Metrics.AirFraction > 0.05f)
+            || Metrics.ResolvedMarginVoxels < 1
+            || Metrics.SampledMinZ >= Metrics.SampledMaxZ)
         {
             AddError(FString::Printf(
-                TEXT("HARD FAILURE: range/component sanity failed for %s."), *Report.Name));
+                TEXT("HARD FAILURE: range/component/window sanity failed for %s."), *Label));
             bAllChecksPassed = false;
         }
-        if (!MetricsAreBitIdentical(Report.First, Report.Second))
+    };
+
+    for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
+    {
+        FArchetypeReport& Report = ArchetypeReports.AddDefaulted_GetRef();
+        Report.Index = StrateIndex;
+        Report.Name = ArchetypeName(Layout[StrateIndex]);
+        Report.OldWindow = VF_MeasureStrate(
+            *World.Generator, *World.StrateManager, StrateIndex, OldWindowSettings);
+        Report.OldWindowRepeat = VF_MeasureStrate(
+            *World.Generator, *World.StrateManager, StrateIndex, OldWindowSettings);
+        Report.DerivedWindow = VF_MeasureStrate(
+            *World.Generator, *World.StrateManager, StrateIndex, DerivedWindowSettings);
+        Report.DerivedWindowRepeat = VF_MeasureStrate(
+            *World.Generator, *World.StrateManager, StrateIndex, DerivedWindowSettings);
+
+        ValidateMeasurement(
+            FString::Printf(TEXT("%s old-window"), *Report.Name), Report.OldWindow);
+        ValidateMeasurement(
+            FString::Printf(TEXT("%s derived-window"), *Report.Name), Report.DerivedWindow);
+        if (!MetricsAreBitIdentical(Report.OldWindow, Report.OldWindowRepeat))
         {
             AddError(FString::Printf(
-                TEXT("HARD FAILURE: %s measurement was not bit-identical on the second call."),
+                TEXT("HARD FAILURE: %s old-window measurement was not bit-identical on the second call."),
                 *Report.Name));
             bAllChecksPassed = false;
         }
+        if (!MetricsAreBitIdentical(Report.DerivedWindow, Report.DerivedWindowRepeat))
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: %s derived-window measurement was not bit-identical on the second call."),
+                *Report.Name));
+            bAllChecksPassed = false;
+        }
+        DerivedMetricsByIndex[StrateIndex] = Report.DerivedWindow;
     }
 
     ArchetypeReports.Sort([](const FArchetypeReport& A, const FArchetypeReport& B)
@@ -355,22 +407,38 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         GapAirFraction,
         GapAirSamples,
         GapSamples);
-    Summary += TEXT("Archetypes (sorted):\n");
+    Summary += TEXT("Archetypes (old one-chunk vs derived window; derived InteriorMarginVoxels<0 => 2x BoundarySealThickness, clamped):\n");
+    Summary += TEXT("  name | old margin | old Z span [min,max) | old Air | old Largest | old Walkable | old FeatureScale vox | old Clearance vox | old Components | old Samples | old Solid | derived margin | derived Z span [min,max) | derived Air | derived Largest | derived Walkable | derived FeatureScale vox | derived Clearance vox | derived Components | derived Samples | derived Solid\n");
     for (const FArchetypeReport& Report : ArchetypeReports)
     {
-        const FVoxelStrateMetrics& Metrics = Report.First;
+        const FVoxelStrateMetrics& Old = Report.OldWindow;
+        const FVoxelStrateMetrics& Derived = Report.DerivedWindow;
         Summary += FString::Printf(
-            TEXT("  %s: Air=%.9g, Largest=%.9g, Walkable=%.9g, FeatureScale=%.9g vox, "
-                 "Clearance=%d vox, Components=%d, Samples=%lld, Solid=%lld\n"),
+            TEXT("  %s | %d | [%d,%d) | %.9g | %.9g | %.9g | %.9g | %d | %d | %lld | %lld | "
+                 "%d | [%d,%d) | %.9g | %.9g | %.9g | %.9g | %d | %d | %lld | %lld\n"),
             *Report.Name,
-            Metrics.AirFraction,
-            Metrics.LargestComponentShare,
-            Metrics.WalkableFraction,
-            Metrics.MedianFeatureScale,
-            Metrics.MedianVerticalClearance,
-            Metrics.NumAirComponents,
-            Metrics.NumSampled,
-            Metrics.NumSolid);
+            Old.ResolvedMarginVoxels,
+            Old.SampledMinZ,
+            Old.SampledMaxZ,
+            Old.AirFraction,
+            Old.LargestComponentShare,
+            Old.WalkableFraction,
+            Old.MedianFeatureScale,
+            Old.MedianVerticalClearance,
+            Old.NumAirComponents,
+            Old.NumSampled,
+            Old.NumSolid,
+            Derived.ResolvedMarginVoxels,
+            Derived.SampledMinZ,
+            Derived.SampledMaxZ,
+            Derived.AirFraction,
+            Derived.LargestComponentShare,
+            Derived.WalkableFraction,
+            Derived.MedianFeatureScale,
+            Derived.MedianVerticalClearance,
+            Derived.NumAirComponents,
+            Derived.NumSampled,
+            Derived.NumSolid);
     }
 
     int32 NumRoutesChecked = 0;
@@ -378,17 +446,24 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
     {
         const FStrateSlot& Slot = Layout[StrateIndex];
-        const int32 InteriorMinZ = (Slot.BottomChunkZ + 1) * CHUNK_SIZE;
-        const int32 InteriorMaxZ = Slot.TopChunkZ * CHUNK_SIZE;
-        if (InteriorMinZ >= InteriorMaxZ) continue;
+        const FVoxelStrateMetrics& Window = DerivedMetricsByIndex[StrateIndex];
+        if (!Window.bValid || Window.SampledMinZ >= Window.SampledMaxZ) continue;
 
         const FVector A(Settings.CenterXY.X + 2.0f, Settings.CenterXY.Y + 2.0f,
-                        static_cast<float>(InteriorMinZ + 2));
+                        static_cast<float>(Window.SampledMinZ)
+                            + 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep));
         const FVector B(Settings.CenterXY.X + 2.0f, Settings.CenterXY.Y + 2.0f,
-                        static_cast<float>(InteriorMaxZ - 2));
+                        static_cast<float>(Window.SampledMaxZ)
+                            - 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep));
         bool bCoarseLied = false;
         const bool bConnected = VF_AreConnected(
-            *World.Generator, *World.StrateManager, StrateIndex, A, B, Settings, bCoarseLied);
+            *World.Generator,
+            *World.StrateManager,
+            StrateIndex,
+            A,
+            B,
+            DerivedWindowSettings,
+            bCoarseLied);
         ++NumRoutesChecked;
         if (bCoarseLied) ++NumRoutesRefuted;
         if (bConnected && FullResolutionDirectSegmentHasSolid(*World.Generator, A, B))
@@ -403,9 +478,9 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
 
     // Controlled negative route: at SampleStep 4, the two coarse centres at X=-2 and X=+2
     // remain air while the three full-resolution voxels at X=-1,0,+1 are filled solid.
-    const FStrateSlot& WallSlot = Layout[0];
-    const int32 WallInteriorMinZ = (WallSlot.BottomChunkZ + 1) * CHUNK_SIZE;
-    const float WallZ = static_cast<float>(WallInteriorMinZ + 2);
+    const FVoxelStrateMetrics& WallWindow = DerivedMetricsByIndex[0];
+    const float WallZ = static_cast<float>(WallWindow.SampledMinZ)
+        + 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep);
     const FVector WallA(Settings.CenterXY.X - 2.0f, Settings.CenterXY.Y + 2.0f, WallZ);
     const FVector WallB(Settings.CenterXY.X + 2.0f, Settings.CenterXY.Y + 2.0f, WallZ);
 
@@ -430,7 +505,7 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         0,
         WallA,
         WallB,
-        Settings,
+        DerivedWindowSettings,
         bWallCoarseLied);
     ++NumRoutesChecked;
     if (bWallCoarseLied) ++NumRoutesRefuted;
@@ -455,14 +530,27 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         FPassageReport& Report = PassageReports.AddDefaulted_GetRef();
         Report.Index = PassageIndex;
         Report.Name = FString::Printf(TEXT("%03d"), PassageIndex);
+        Report.UpperStrateIndex = Passage.UpperStrateIndex;
+        Report.LowerStrateIndex = Passage.LowerStrateIndex;
+        Report.UpperPoint = Passage.UpperPoint;
+        Report.LowerPoint = Passage.LowerPoint;
 
         auto CheckEndpoint = [&](int32 EndpointStrateIndex, const FVector& Endpoint) -> FString
         {
             if (!Layout.IsValidIndex(EndpointStrateIndex)) return TEXT("invalid-strate");
-            const FStrateSlot& Slot = Layout[EndpointStrateIndex];
-            if (!IsStrictInteriorPoint(Slot, Endpoint)) return TEXT("out-of-band");
+            const FVoxelStrateMetrics& EndpointMetrics =
+                DerivedMetricsByIndex[EndpointStrateIndex];
+            if (!EndpointMetrics.bValid) return TEXT("invalid-window");
+            if (!IsInsideMeasuredWindow(EndpointMetrics, DerivedWindowSettings, Endpoint))
+            {
+                return TEXT("out-of-window");
+            }
 
-            const FVector Anchor = LargestComponentAnchor(Slot, Settings.CenterXY);
+            const FStrateSlot& Slot = Layout[EndpointStrateIndex];
+            const FVector Anchor = LargestComponentAnchor(
+                Slot,
+                DerivedWindowSettings.CenterXY,
+                DerivedWindowSettings.SampleStep);
             bool bCoarseLied = false;
             const bool bConnected = VF_AreConnected(
                 *World.Generator,
@@ -470,11 +558,11 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
                 EndpointStrateIndex,
                 Endpoint,
                 Anchor,
-                Settings,
+                DerivedWindowSettings,
                 bCoarseLied);
             ++NumRoutesChecked;
             if (bCoarseLied) ++NumRoutesRefuted;
-            return bConnected ? TEXT("connected") : TEXT("not-connected");
+            return bConnected ? TEXT("CONNECTED_TO_LARGEST") : TEXT("NOT_CONNECTED");
         };
 
         Report.UpperResult = CheckEndpoint(Passage.UpperStrateIndex, Passage.UpperPoint);
@@ -486,16 +574,25 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         return A.Index < B.Index;
     });
     Summary += FString::Printf(
-        TEXT("Connectivity guard: %d routes checked, %d coarse routes refuted at full resolution.\n"),
+        TEXT("Connectivity guard (derived window): %d routes checked, %d coarse routes refuted at full resolution.\n"),
         NumRoutesChecked,
         NumRoutesRefuted);
-    Summary += TEXT("Passages (endpoint -> largest-component spine anchor, sorted):\n");
+    Summary += TEXT("Passages (derived window; each endpoint -> its strate's largest-component spine anchor, sorted):\n");
     for (const FPassageReport& Report : PassageReports)
     {
         Summary += FString::Printf(
-            TEXT("  passage %s: upper=%s, lower=%s\n"),
+            TEXT("  passage %s: UpperPoint strate=%d (%.3f,%.3f,%.3f) => %s; "
+                 "LowerPoint strate=%d (%.3f,%.3f,%.3f) => %s\n"),
             *Report.Name,
+            Report.UpperStrateIndex,
+            Report.UpperPoint.X,
+            Report.UpperPoint.Y,
+            Report.UpperPoint.Z,
             *Report.UpperResult,
+            Report.LowerStrateIndex,
+            Report.LowerPoint.X,
+            Report.LowerPoint.Y,
+            Report.LowerPoint.Z,
             *Report.LowerResult);
     }
     AddInfo(Summary);
