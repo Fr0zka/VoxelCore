@@ -75,8 +75,12 @@ struct VOXELFORGE_API FVoxelConnectivityDiagnostics
     int64 NumAirCells = 0;
     int64 StartComponentCells = 0;
     int64 GoalComponentCells = 0;
+    int64 LargestComponentCells = 0;
     float StartComponentShare = 0.0f;
     float GoalComponentShare = 0.0f;
+    float LargestComponentShare = 0.0f;
+    bool bStartComponentIsLargest = false;
+    bool bGoalComponentIsLargest = false;
 
     float StartToGoalComponentDistanceCells = -1.0f;
     float GoalToStartComponentDistanceCells = -1.0f;
@@ -116,10 +120,27 @@ VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     bool& bOutGoalSnapped);
 
 /**
+ * The same connectivity query with component facts returned from the same sampled grid. This
+ * overload exists for diagnostics that need both the required route verdict and the component
+ * containing one endpoint without sampling the strate a second time.
+ */
+VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    FVoxelConnectivityDiagnostics& OutDiagnostics);
+
+/**
  * Return the component sizes and spatial separation facts for the same query performed by
  * VF_AreConnected. The returned Result uses the same full-resolution route re-check. bValid means
  * the sample grid was built and both endpoint coordinates were in its bounds; component fields
- * remain zero/negative when an endpoint has no air cell to analyze.
+ * remain zero/negative when an endpoint has no air cell to analyze. Largest-component membership
+ * treats equal-sized components as tied for largest.
  */
 VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
     const UVoxelGenerator& Generator,

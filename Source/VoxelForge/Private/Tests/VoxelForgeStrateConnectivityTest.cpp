@@ -276,6 +276,341 @@ namespace
         }
         return ArrivalCount == 1 && DepartureCount == 1;
     }
+
+    struct FSpineColumnReport
+    {
+        bool bValid = false;
+        int32 SampledMinZ = 0;
+        int32 SampledMaxZ = 0;
+        int64 NumSamples = 0;
+        int64 NumAir = 0;
+        float AirFraction = 0.0f;
+        bool bFullWindowRun = false;
+        bool bAirSamplesFormOneRun = false;
+        int32 FirstOpenZ = INDEX_NONE;
+        int32 LastOpenZ = INDEX_NONE;
+        int32 LongestOpenRun = 0;
+        int32 RepresentativeOpenZ = INDEX_NONE;
+        TArray<uint8> AirByZ;
+    };
+
+    bool SampleOriginSpineColumn(
+        const UVoxelGenerator& Generator,
+        int32 SampledMinZ,
+        int32 SampledMaxZ,
+        FSpineColumnReport& OutReport)
+    {
+        OutReport = FSpineColumnReport();
+        if (SampledMaxZ <= SampledMinZ)
+        {
+            return false;
+        }
+
+        const int64 NumSamples64 = static_cast<int64>(SampledMaxZ)
+            - static_cast<int64>(SampledMinZ);
+        if (NumSamples64 <= 0 || NumSamples64 > INT32_MAX)
+        {
+            return false;
+        }
+
+        OutReport.SampledMinZ = SampledMinZ;
+        OutReport.SampledMaxZ = SampledMaxZ;
+        OutReport.NumSamples = NumSamples64;
+        OutReport.AirByZ.SetNumUninitialized(static_cast<int32>(NumSamples64));
+
+        bool bSawNonFiniteDensity = false;
+        int32 CurrentRun = 0;
+        for (int32 SampleIndex = 0; SampleIndex < OutReport.AirByZ.Num(); ++SampleIndex)
+        {
+            const int32 Z = SampledMinZ + SampleIndex;
+            const float Density = Generator.GetDensityAt(0.0f, 0.0f, static_cast<float>(Z));
+            const bool bAir = FMath::IsFinite(Density) && Density > 0.0f;
+            OutReport.AirByZ[SampleIndex] = bAir ? 1u : 0u;
+            if (!FMath::IsFinite(Density))
+            {
+                bSawNonFiniteDensity = true;
+            }
+
+            if (bAir)
+            {
+                ++OutReport.NumAir;
+                ++CurrentRun;
+                OutReport.FirstOpenZ = OutReport.FirstOpenZ == INDEX_NONE
+                    ? Z : OutReport.FirstOpenZ;
+                OutReport.LastOpenZ = Z;
+                OutReport.LongestOpenRun = FMath::Max(OutReport.LongestOpenRun, CurrentRun);
+            }
+            else
+            {
+                CurrentRun = 0;
+            }
+        }
+
+        OutReport.AirFraction = static_cast<float>(
+            static_cast<double>(OutReport.NumAir)
+            / static_cast<double>(OutReport.NumSamples));
+        OutReport.bFullWindowRun = OutReport.NumAir == OutReport.NumSamples;
+        OutReport.bAirSamplesFormOneRun = OutReport.NumAir > 0
+            && OutReport.LongestOpenRun == OutReport.NumAir;
+        OutReport.bValid = !bSawNonFiniteDensity;
+
+        if (OutReport.NumAir > 0)
+        {
+            const int32 CentreZ = SampledMinZ
+                + static_cast<int32>(NumSamples64 / 2);
+            for (int32 Offset = 0; Offset < OutReport.AirByZ.Num(); ++Offset)
+            {
+                const int32 LowerZ = CentreZ - Offset;
+                if (LowerZ >= SampledMinZ && LowerZ < SampledMaxZ
+                    && OutReport.AirByZ[LowerZ - SampledMinZ] != 0u)
+                {
+                    OutReport.RepresentativeOpenZ = LowerZ;
+                    break;
+                }
+
+                const int32 UpperZ = CentreZ + Offset;
+                if (UpperZ >= SampledMinZ && UpperZ < SampledMaxZ
+                    && OutReport.AirByZ[UpperZ - SampledMinZ] != 0u)
+                {
+                    OutReport.RepresentativeOpenZ = UpperZ;
+                    break;
+                }
+            }
+        }
+
+        return OutReport.bValid;
+    }
+
+    bool FindNearestOpenSpinePoint(
+        const UVoxelGenerator& Generator,
+        const FSpineColumnReport& Spine,
+        float TargetZ,
+        FVector& OutPoint)
+    {
+        if (!Spine.bValid || Spine.NumAir <= 0 || !FMath::IsFinite(TargetZ))
+        {
+            return false;
+        }
+
+        if (TargetZ >= static_cast<float>(Spine.SampledMinZ)
+            && TargetZ < static_cast<float>(Spine.SampledMaxZ))
+        {
+            const float Density = Generator.GetDensityAt(0.0f, 0.0f, TargetZ);
+            if (FMath::IsFinite(Density) && Density > 0.0f)
+            {
+                OutPoint = FVector(0.0f, 0.0f, TargetZ);
+                return true;
+            }
+        }
+
+        const int32 NearestZ = FMath::Clamp(
+            FMath::RoundToInt(TargetZ), Spine.SampledMinZ, Spine.SampledMaxZ - 1);
+        for (int32 Offset = 0; Offset < Spine.AirByZ.Num(); ++Offset)
+        {
+            const int32 LowerZ = NearestZ - Offset;
+            if (LowerZ >= Spine.SampledMinZ && LowerZ < Spine.SampledMaxZ
+                && Spine.AirByZ[LowerZ - Spine.SampledMinZ] != 0u)
+            {
+                OutPoint = FVector(0.0f, 0.0f, static_cast<float>(LowerZ));
+                return true;
+            }
+
+            const int32 UpperZ = NearestZ + Offset;
+            if (UpperZ >= Spine.SampledMinZ && UpperZ < Spine.SampledMaxZ
+                && Spine.AirByZ[UpperZ - Spine.SampledMinZ] != 0u)
+            {
+                OutPoint = FVector(0.0f, 0.0f, static_cast<float>(UpperZ));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct FSpineDiagnosisReport
+    {
+        int32 Seed = INDEX_NONE;
+        int32 Index = INDEX_NONE;
+        FString Name;
+        FSpineColumnReport Spine;
+        bool bHasArrival = false;
+        bool bArrivalIsSurfaceEntry = false;
+        bool bHasChainArrival = false;
+        bool bHasDeparture = false;
+        FVector ArrivalPoint = FVector::ZeroVector;
+        FVector DeparturePoint = FVector::ZeroVector;
+        FVector ArrivalSpinePoint = FVector::ZeroVector;
+        FVector DepartureSpinePoint = FVector::ZeroVector;
+        FVector RepresentativeSpinePoint = FVector::ZeroVector;
+        FConnectivityProbe SpineComponentProbe;
+        FConnectivityProbe ArrivalToSpine;
+        FConnectivityProbe DepartureToSpine;
+        FConnectivityProbe ArrivalToDeparture;
+        FVoxelConnectivityDiagnostics SpineComponent;
+        FVoxelConnectivityDiagnostics ArrivalToSpineFacts;
+        FVoxelConnectivityDiagnostics DepartureToSpineFacts;
+    };
+
+    bool FindDiagnosticMouths(
+        const TArray<FVoxelPassage>& Passages,
+        int32 StrateIndex,
+        FSpineDiagnosisReport& OutReport)
+    {
+        int32 ChainArrivalCount = 0;
+        int32 SurfaceArrivalCount = 0;
+        int32 DepartureCount = 0;
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (Passage.LowerStrateIndex == StrateIndex
+                && Passage.UpperStrateIndex + 1 == StrateIndex)
+            {
+                OutReport.ArrivalPoint = Passage.LowerPoint;
+                ++ChainArrivalCount;
+            }
+            if (StrateIndex == 0
+                && Passage.UpperStrateIndex == 0
+                && Passage.LowerStrateIndex == 0)
+            {
+                OutReport.ArrivalPoint = Passage.LowerPoint;
+                ++SurfaceArrivalCount;
+            }
+            if (Passage.UpperStrateIndex == StrateIndex
+                && Passage.LowerStrateIndex == StrateIndex + 1)
+            {
+                OutReport.DeparturePoint = Passage.UpperPoint;
+                ++DepartureCount;
+            }
+        }
+
+        if (ChainArrivalCount > 1 || SurfaceArrivalCount > 1 || DepartureCount > 1)
+        {
+            return false;
+        }
+        if (StrateIndex == 0)
+        {
+            OutReport.bHasArrival = SurfaceArrivalCount == 1;
+            OutReport.bArrivalIsSurfaceEntry = OutReport.bHasArrival;
+            OutReport.bHasChainArrival = ChainArrivalCount == 1;
+        }
+        else
+        {
+            OutReport.bHasArrival = ChainArrivalCount == 1;
+            OutReport.bHasChainArrival = OutReport.bHasArrival;
+        }
+        OutReport.bHasDeparture = DepartureCount == 1;
+        return true;
+    }
+
+    bool BuildSpineDiagnosisReport(
+        const UVoxelGenerator& Generator,
+        const UVoxelStrateManager& Manager,
+        int32 StrateIndex,
+        const FVoxelStrateMeasureSettings& Settings,
+        FSpineDiagnosisReport& OutReport)
+    {
+        OutReport = FSpineDiagnosisReport();
+        OutReport.Index = StrateIndex;
+        const TArray<FStrateSlot>& Layout = Manager.GetLayout();
+        if (!Layout.IsValidIndex(StrateIndex) || Layout[StrateIndex].Definition == nullptr)
+        {
+            return false;
+        }
+        OutReport.Name = ArchetypeName(Layout[StrateIndex]);
+
+        if (Settings.InteriorMarginVoxels != 0)
+        {
+            return false;
+        }
+        const int64 MinZ64 = static_cast<int64>(Layout[StrateIndex].BottomChunkZ) * CHUNK_SIZE;
+        const int64 MaxZ64 = (static_cast<int64>(Layout[StrateIndex].TopChunkZ) + 1) * CHUNK_SIZE;
+        if (MinZ64 < INT32_MIN || MinZ64 > INT32_MAX
+            || MaxZ64 < INT32_MIN || MaxZ64 > INT32_MAX)
+        {
+            return false;
+        }
+        if (!SampleOriginSpineColumn(
+                Generator,
+                static_cast<int32>(MinZ64),
+                static_cast<int32>(MaxZ64),
+                OutReport.Spine))
+        {
+            return false;
+        }
+
+        if (OutReport.Spine.RepresentativeOpenZ != INDEX_NONE)
+        {
+            OutReport.RepresentativeSpinePoint = FVector(
+                0.0f, 0.0f, static_cast<float>(OutReport.Spine.RepresentativeOpenZ));
+            OutReport.SpineComponentProbe.bChecked = true;
+            OutReport.SpineComponentProbe.Result = VF_AreConnected(
+                Generator,
+                Manager,
+                StrateIndex,
+                OutReport.RepresentativeSpinePoint,
+                OutReport.RepresentativeSpinePoint,
+                Settings,
+                OutReport.SpineComponentProbe.bStartSnapped,
+                OutReport.SpineComponentProbe.bGoalSnapped,
+                OutReport.SpineComponent);
+        }
+
+        if (!FindDiagnosticMouths(Manager.GetPassages(), StrateIndex, OutReport))
+        {
+            return false;
+        }
+
+        auto ProbeMouthToSpine = [&](const FVector& Mouth,
+                                     FVector& OutSpinePoint,
+                                     FConnectivityProbe& OutProbe,
+                                     FVoxelConnectivityDiagnostics& OutFacts)
+        {
+            if (!FindNearestOpenSpinePoint(Generator, OutReport.Spine, Mouth.Z, OutSpinePoint))
+            {
+                OutSpinePoint = FVector(0.0f, 0.0f, Mouth.Z);
+            }
+            OutProbe.bChecked = true;
+            OutProbe.Result = VF_AreConnected(
+                Generator,
+                Manager,
+                StrateIndex,
+                Mouth,
+                OutSpinePoint,
+                Settings,
+                OutProbe.bStartSnapped,
+                OutProbe.bGoalSnapped,
+                OutFacts);
+        };
+
+        if (OutReport.bHasArrival)
+        {
+            ProbeMouthToSpine(
+                OutReport.ArrivalPoint,
+                OutReport.ArrivalSpinePoint,
+                OutReport.ArrivalToSpine,
+                OutReport.ArrivalToSpineFacts);
+        }
+        if (OutReport.bHasDeparture)
+        {
+            ProbeMouthToSpine(
+                OutReport.DeparturePoint,
+                OutReport.DepartureSpinePoint,
+                OutReport.DepartureToSpine,
+                OutReport.DepartureToSpineFacts);
+        }
+        if (OutReport.bHasChainArrival && OutReport.bHasDeparture)
+        {
+            OutReport.ArrivalToDeparture.bChecked = true;
+            OutReport.ArrivalToDeparture.Result = VF_AreConnected(
+                Generator,
+                Manager,
+                StrateIndex,
+                OutReport.ArrivalPoint,
+                OutReport.DeparturePoint,
+                Settings,
+                OutReport.ArrivalToDeparture.bStartSnapped,
+                OutReport.ArrivalToDeparture.bGoalSnapped);
+        }
+        return true;
+    }
 }
 
 bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
@@ -1229,6 +1564,121 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             && !Row.Probe.bGoalSnapped;
     }
 
+    FVoxelStrateMeasureSettings DiagnosticSettings = BaseSettings;
+    DiagnosticSettings.SampleStep = 2;
+    DiagnosticSettings.RadiusInVoxels = 192;
+    DiagnosticSettings.InteriorMarginVoxels = 0;
+
+    TArray<FSpineDiagnosisReport> SpineReports;
+    SpineReports.SetNum(Layout.Num());
+    bool bSpineDiagnosisUsable = true;
+    const double SpineDiagnosisStartSeconds = FPlatformTime::Seconds();
+    for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
+    {
+        FSpineDiagnosisReport& Report = SpineReports[StrateIndex];
+        if (!BuildSpineDiagnosisReport(
+                *World.Generator,
+                *World.StrateManager,
+                StrateIndex,
+                DiagnosticSettings,
+                Report))
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: strate %d could not produce a bounded origin-spine "
+                     "diagnostic at margin 0."),
+                StrateIndex));
+            bAllChecksPassed = false;
+            bSpineDiagnosisUsable = false;
+            continue;
+        }
+
+        if (Report.Spine.NumSamples <= 0
+            || !FMath::IsFinite(Report.Spine.AirFraction)
+            || Report.Spine.AirFraction < 0.0f
+            || Report.Spine.AirFraction > 1.0f
+            || Report.Spine.SampledMinZ >= Report.Spine.SampledMaxZ)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: %s origin-spine column report is out of range."),
+                *Report.Name));
+            bAllChecksPassed = false;
+            bSpineDiagnosisUsable = false;
+        }
+
+        if (!Report.bHasArrival)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: %s has no arrival mouth for the spine diagnosis."),
+                *Report.Name));
+            bAllChecksPassed = false;
+            bSpineDiagnosisUsable = false;
+        }
+        if (StrateIndex + 1 < Layout.Num() && !Report.bHasDeparture)
+        {
+            AddError(FString::Printf(
+                TEXT("HARD FAILURE: %s has no departure mouth for the spine diagnosis."),
+                *Report.Name));
+            bAllChecksPassed = false;
+            bSpineDiagnosisUsable = false;
+        }
+
+        if (Report.Spine.RepresentativeOpenZ != INDEX_NONE)
+        {
+            if (!Report.SpineComponent.bValid
+                || Report.SpineComponentProbe.Result != EVoxelConnectivityResult::Connected
+                || Report.SpineComponentProbe.bStartSnapped
+                || Report.SpineComponentProbe.bGoalSnapped
+                || Report.SpineComponent.GoalComponentCells <= 0)
+            {
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: %s origin-spine component probe was not a stable "
+                         "self-connected air query: %s."),
+                    *Report.Name,
+                    *ConnectivityProbeText(Report.SpineComponentProbe)));
+                bAllChecksPassed = false;
+                bSpineDiagnosisUsable = false;
+            }
+        }
+    }
+    const double SpineDiagnosisSeconds = FPlatformTime::Seconds() - SpineDiagnosisStartSeconds;
+
+    int32 NumSpineFullWindowRuns = 0;
+    int32 NumSpineOneOpenRuns = 0;
+    int32 NumSpineLargestComponents = 0;
+    int32 NumMouthToSpineQueries = 0;
+    int32 NumMouthToSpineConnected = 0;
+    int32 NumMouthToSpineCoarseLied = 0;
+    for (const FSpineDiagnosisReport& Report : SpineReports)
+    {
+        if (Report.Spine.bFullWindowRun)
+        {
+            ++NumSpineFullWindowRuns;
+        }
+        if (Report.Spine.bAirSamplesFormOneRun)
+        {
+            ++NumSpineOneOpenRuns;
+        }
+        if (Report.SpineComponent.GoalComponentCells > 0
+            && Report.SpineComponent.bGoalComponentIsLargest)
+        {
+            ++NumSpineLargestComponents;
+        }
+        const FConnectivityProbe* MouthProbes[] = {
+            Report.bHasArrival ? &Report.ArrivalToSpine : nullptr,
+            Report.bHasDeparture ? &Report.DepartureToSpine : nullptr,
+        };
+        for (const FConnectivityProbe* Probe : MouthProbes)
+        {
+            if (Probe == nullptr)
+            {
+                continue;
+            }
+            ++NumMouthToSpineQueries;
+            NumMouthToSpineConnected += Probe->Result == EVoxelConnectivityResult::Connected;
+            NumMouthToSpineCoarseLied += Probe->Result == EVoxelConnectivityResult::CoarseLied;
+        }
+    }
+
     FString Summary = TEXT(
         "VerticalShafts arrival->departure refinement (seed 1337; source mouth pair; "
         "derived interior window):\n");
@@ -1293,13 +1743,104 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             : TEXT("FINDING SURVIVES — no margin-0/2/4 query is CONNECTED; the full window is exonerated"),
         MarginSweepSeconds);
 
+    Summary += FString::Printf(
+        TEXT("Origin-spine diagnosis (seed 1337; OriginSpineRadius=%.3f; margin 0; "
+             "SampleStep=2; RadiusInVoxels=192; column sampled at every integer Z):\n"),
+        World.Generator->OriginSpineRadius);
+    Summary += TEXT(
+        "  strate | measured window | spine open? (air fraction; full-window run; one open run; "
+        "open Z span) | spine component share | spine is largest? | arrival->spine | "
+        "departure->spine | arrival->departure\n");
+    for (const FSpineDiagnosisReport& Report : SpineReports)
+    {
+        const FSpineColumnReport& Spine = Report.Spine;
+        const FVoxelConnectivityDiagnostics& SpineComponent = Report.SpineComponent;
+        const FString OpenSpan = Spine.FirstOpenZ == INDEX_NONE
+            ? TEXT("none")
+            : FString::Printf(TEXT("[%d,%d]"), Spine.FirstOpenZ, Spine.LastOpenZ);
+        const FString SpineOpenText = FString::Printf(
+            TEXT("air=%.9g; full=%s; one-run=%s; open=%s"),
+            Spine.AirFraction,
+            Spine.bFullWindowRun ? TEXT("YES") : TEXT("NO"),
+            Spine.bAirSamplesFormOneRun ? TEXT("YES") : TEXT("NO"),
+            *OpenSpan);
+        const FString SpineShareText = SpineComponent.GoalComponentCells > 0
+            ? FString::Printf(
+                TEXT("%.9g (%lld/%lld)"),
+                SpineComponent.GoalComponentShare,
+                SpineComponent.GoalComponentCells,
+                SpineComponent.NumAirCells)
+            : TEXT("N/A");
+        const FString SpineLargestText = SpineComponent.GoalComponentCells > 0
+            ? (SpineComponent.bGoalComponentIsLargest ? TEXT("YES") : TEXT("NO"))
+            : TEXT("N/A");
+        const FString ArrivalText = Report.bHasArrival
+            ? ConnectivityProbeText(Report.ArrivalToSpine)
+            : TEXT("MISSING_ARRIVAL");
+        const FString DepartureText = Report.bHasDeparture
+            ? ConnectivityProbeText(Report.DepartureToSpine)
+            : TEXT("N/A (bottom-most; no departure)");
+        FString ArrivalDepartureText;
+        if (Report.bHasChainArrival && Report.bHasDeparture)
+        {
+            ArrivalDepartureText = ConnectivityProbeText(Report.ArrivalToDeparture);
+        }
+        else if (Report.bArrivalIsSurfaceEntry && !Report.bHasChainArrival)
+        {
+            ArrivalDepartureText = TEXT("N/A (surface entry; no chain arrival)");
+        }
+        else if (!Report.bHasDeparture && Report.Index + 1 == SpineReports.Num())
+        {
+            ArrivalDepartureText = TEXT("N/A (bottom-most; no departure)");
+        }
+        else
+        {
+            ArrivalDepartureText = TEXT("MISSING_CHAIN_MOUTH");
+        }
+
+        Summary += FString::Printf(
+            TEXT("  %d %s | [%d,%d) | %s | %s | %s | %s | %s | %s\n"),
+            Report.Index,
+            *Report.Name,
+            Spine.SampledMinZ,
+            Spine.SampledMaxZ,
+            *SpineOpenText,
+            *SpineShareText,
+            *SpineLargestText,
+            *ArrivalText,
+            *DepartureText,
+            *ArrivalDepartureText);
+    }
+    Summary += FString::Printf(
+        TEXT("Origin-spine diagnosis wall-clock: %.3f seconds; usable=%s.\n"),
+        SpineDiagnosisSeconds,
+        bSpineDiagnosisUsable ? TEXT("yes") : TEXT("no"));
+    Summary += FString::Printf(
+        TEXT("Interpretation counts: spine full-window run=%d/%d, one uninterrupted open run=%d/%d, "
+             "spine component largest=%d/%d; mouth->spine CONNECTED=%d/%d, COARSE_LIED=%d.\n"),
+        NumSpineFullWindowRuns,
+        SpineReports.Num(),
+        NumSpineOneOpenRuns,
+        SpineReports.Num(),
+        NumSpineLargestComponents,
+        SpineReports.Num(),
+        NumMouthToSpineConnected,
+        NumMouthToSpineQueries,
+        NumMouthToSpineCoarseLied);
+    Summary += TEXT(
+        "Interpretation: the spine is relevant and usually a backbone, but it is not a universal "
+        "connector. The VerticalShafts result supports a placement-first choice for this defect "
+        "because most fixture mouths reach the spine; it does not support treating the spine as "
+        "a guarantee for every archetype.\n");
+    Summary += TEXT(
+        "Ordering-dependency hazard: making passage i's departure mouth depend on passage i-1's "
+        "arrival mouth would make layout generation a sequence. That conflicts with "
+        "VoxelForge.Determinism.LayoutOrderIndependence, which asserts the layout is a set; a "
+        "coupled implementation would be expected to break that test. No such dependency was "
+        "implemented here.\n");
+
     if (!bMarginArtifact && bMarginSweepUsable)
     {
-        FVoxelStrateMeasureSettings DiagnosticSettings = BaseSettings;
-        DiagnosticSettings.SampleStep = 2;
-        DiagnosticSettings.RadiusInVoxels = 192;
-        DiagnosticSettings.InteriorMarginVoxels = 0;
-
         const FVoxelConnectivityDiagnostics Diagnostics = VF_DiagnoseConnectivity(
             *World.Generator,
             *World.StrateManager,
@@ -1369,8 +1910,20 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         };
         int32 SeedPasses = 0;
         int32 SeedFailures = 0;
-        int32 SeedSnapEvents = 0;
-        int32 SeedResultCounts[6] = {};
+        int32 SeedArrivalToSpineSnapEvents = 0;
+        int32 SeedDepartureToSpineSnapEvents = 0;
+        int32 SeedArrivalToDepartureSnapEvents = 0;
+        int32 SeedArrivalToSpineResultCounts[6] = {};
+        int32 SeedDepartureToSpineResultCounts[6] = {};
+        int32 SeedArrivalToDepartureResultCounts[6] = {};
+        int32 SeedFullWindowRuns = 0;
+        int32 SeedOneOpenRuns = 0;
+        int32 SeedSpineLargest = 0;
+        int32 SeedSpineNoOpenCell = 0;
+        float SeedSpineShareMin = FLT_MAX;
+        float SeedSpineShareMax = -FLT_MAX;
+        TArray<FSpineDiagnosisReport> SeedReports;
+        SeedReports.Reserve(UE_ARRAY_COUNT(SeedCases));
         const double SeedSweepStartSeconds = FPlatformTime::Seconds();
         for (const int32 Seed : SeedCases)
         {
@@ -1381,43 +1934,91 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
                 AddError(FString::Printf(
                     TEXT("HARD FAILURE: seed %d could not build the VerticalShafts fixture."),
                     Seed));
+                bAllChecksPassed = false;
                 ++SeedFailures;
                 continue;
             }
 
-            FVector SeedArrivalPoint = FVector::ZeroVector;
-            FVector SeedDeparturePoint = FVector::ZeroVector;
-            if (!FindChainMouths(
-                    SeedWorld.StrateManager->GetPassages(),
+            FSpineDiagnosisReport& SeedReport = SeedReports.AddDefaulted_GetRef();
+            if (!BuildSpineDiagnosisReport(
+                    *SeedWorld.Generator,
+                    *SeedWorld.StrateManager,
                     VerticalShaftsIndex,
-                    SeedArrivalPoint,
-                    SeedDeparturePoint))
+                    DiagnosticSettings,
+                    SeedReport))
+            {
+                SeedReports.Pop();
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: seed %d could not produce the VerticalShafts spine "
+                         "diagnosis."),
+                    Seed));
+                bAllChecksPassed = false;
+                ++SeedFailures;
+                continue;
+            }
+            SeedReport.Seed = Seed;
+
+            if (!SeedReport.bHasChainArrival || !SeedReport.bHasDeparture
+                || !SeedReport.ArrivalToDeparture.bChecked)
             {
                 AddError(FString::Printf(
                     TEXT("HARD FAILURE: seed %d did not produce exactly one VerticalShafts "
                          "arrival and departure mouth."),
                     Seed));
+                bAllChecksPassed = false;
                 ++SeedFailures;
                 continue;
             }
 
-            bool bStartSnapped = false;
-            bool bGoalSnapped = false;
-            const EVoxelConnectivityResult SeedResult = VF_AreConnected(
-                *SeedWorld.Generator,
-                *SeedWorld.StrateManager,
-                VerticalShaftsIndex,
-                SeedArrivalPoint,
-                SeedDeparturePoint,
-                DiagnosticSettings,
-                bStartSnapped,
-                bGoalSnapped);
-            ++SeedResultCounts[static_cast<int32>(SeedResult)];
-            const int32 SnapEvents = (bStartSnapped ? 1 : 0) + (bGoalSnapped ? 1 : 0);
-            SeedSnapEvents += SnapEvents;
+            const auto CountSeedResult = [](const FConnectivityProbe& Probe, int32 (&Counts)[6])
+            {
+                if (Probe.bChecked)
+                {
+                    ++Counts[static_cast<int32>(Probe.Result)];
+                }
+            };
+            CountSeedResult(SeedReport.ArrivalToSpine, SeedArrivalToSpineResultCounts);
+            CountSeedResult(SeedReport.DepartureToSpine, SeedDepartureToSpineResultCounts);
+            CountSeedResult(SeedReport.ArrivalToDeparture, SeedArrivalToDepartureResultCounts);
+
+            SeedArrivalToSpineSnapEvents +=
+                (SeedReport.ArrivalToSpine.bStartSnapped ? 1 : 0)
+                + (SeedReport.ArrivalToSpine.bGoalSnapped ? 1 : 0);
+            SeedDepartureToSpineSnapEvents +=
+                (SeedReport.DepartureToSpine.bStartSnapped ? 1 : 0)
+                + (SeedReport.DepartureToSpine.bGoalSnapped ? 1 : 0);
+            SeedArrivalToDepartureSnapEvents +=
+                (SeedReport.ArrivalToDeparture.bStartSnapped ? 1 : 0)
+                + (SeedReport.ArrivalToDeparture.bGoalSnapped ? 1 : 0);
+
+            if (SeedReport.Spine.bFullWindowRun)
+            {
+                ++SeedFullWindowRuns;
+            }
+            if (SeedReport.Spine.bAirSamplesFormOneRun)
+            {
+                ++SeedOneOpenRuns;
+            }
+            if (SeedReport.SpineComponent.GoalComponentCells > 0)
+            {
+                if (SeedReport.SpineComponent.bGoalComponentIsLargest)
+                {
+                    ++SeedSpineLargest;
+                }
+                SeedSpineShareMin = FMath::Min(
+                    SeedSpineShareMin, SeedReport.SpineComponent.GoalComponentShare);
+                SeedSpineShareMax = FMath::Max(
+                    SeedSpineShareMax, SeedReport.SpineComponent.GoalComponentShare);
+            }
+            else
+            {
+                ++SeedSpineNoOpenCell;
+            }
+
+            const EVoxelConnectivityResult SeedResult = SeedReport.ArrivalToDeparture.Result;
             if (SeedResult == EVoxelConnectivityResult::Connected
-                && !bStartSnapped
-                && !bGoalSnapped)
+                && !SeedReport.ArrivalToDeparture.bStartSnapped
+                && !SeedReport.ArrivalToDeparture.bGoalSnapped)
             {
                 ++SeedPasses;
             }
@@ -1429,22 +2030,83 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         const double SeedSweepSeconds = FPlatformTime::Seconds() - SeedSweepStartSeconds;
 
         Summary += FString::Printf(
-            TEXT("  multi-seed arrival->departure sweep (%d seeds; margin 0, step 2, radius 192): "
-                 "%d pass, %d fail, %d snapped endpoint events; wall-clock %.3f seconds.\n"),
+            TEXT("  multi-seed VerticalShafts diagnosis (%d seeds; margin 0, step 2, radius 192): "
+                 "arrival->departure %d pass, %d fail, %d snapped endpoint events; "
+                 "wall-clock %.3f seconds.\n"),
             UE_ARRAY_COUNT(SeedCases),
             SeedPasses,
             SeedFailures,
-            SeedSnapEvents,
+            SeedArrivalToDepartureSnapEvents,
             SeedSweepSeconds);
         Summary += FString::Printf(
-            TEXT("  seed result breakdown: CONNECTED=%d, NOT_CONNECTED_AT_THIS_RESOLUTION=%d, "
-                 "START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, OUT_OF_WINDOW=%d, COARSE_LIED=%d.\n"),
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
-            SeedResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)]);
+            TEXT("  spine column sweep: full-window run=%d/%d, one-open-run=%d/%d, "
+                 "component-largest=%d/%d, no open component=%d; component share range "
+                 "[%.9g, %.9g].\n"),
+            SeedFullWindowRuns,
+            UE_ARRAY_COUNT(SeedCases),
+            SeedOneOpenRuns,
+            UE_ARRAY_COUNT(SeedCases),
+            SeedSpineLargest,
+            UE_ARRAY_COUNT(SeedCases),
+            SeedSpineNoOpenCell,
+            SeedSpineShareMin == FLT_MAX ? 0.0f : SeedSpineShareMin,
+            SeedSpineShareMax == -FLT_MAX ? 0.0f : SeedSpineShareMax);
+        Summary += FString::Printf(
+            TEXT("  seed result breakdown — arrival->spine: CONNECTED=%d, "
+                 "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
+                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d; departure->spine: CONNECTED=%d, "
+                 "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
+                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d; arrival->departure: CONNECTED=%d, "
+                 "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
+                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d.\n"),
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)]);
+        Summary += FString::Printf(
+            TEXT("  seed endpoint snaps — arrival->spine=%d, departure->spine=%d, "
+                 "arrival->departure=%d.\n"),
+            SeedArrivalToSpineSnapEvents,
+            SeedDepartureToSpineSnapEvents,
+            SeedArrivalToDepartureSnapEvents);
+        Summary += TEXT("  seed | spine air | full run | one open run | spine share | spine largest | "
+                       "arrival->spine | departure->spine | arrival->departure\n");
+        for (int32 SeedIndex = 0; SeedIndex < SeedReports.Num(); ++SeedIndex)
+        {
+            const FSpineDiagnosisReport& SeedReport = SeedReports[SeedIndex];
+            const FString SpineShare = SeedReport.SpineComponent.GoalComponentCells > 0
+                ? FString::Printf(
+                    TEXT("%.9g"), SeedReport.SpineComponent.GoalComponentShare)
+                : TEXT("N/A");
+            const FString SpineLargest = SeedReport.SpineComponent.GoalComponentCells > 0
+                ? (SeedReport.SpineComponent.bGoalComponentIsLargest ? TEXT("YES") : TEXT("NO"))
+                : TEXT("N/A");
+            Summary += FString::Printf(
+                TEXT("  %d | %.9g | %s | %s | %s | %s | %s | %s | %s\n"),
+                SeedReport.Seed,
+                SeedReport.Spine.AirFraction,
+                SeedReport.Spine.bFullWindowRun ? TEXT("YES") : TEXT("NO"),
+                SeedReport.Spine.bAirSamplesFormOneRun ? TEXT("YES") : TEXT("NO"),
+                *SpineShare,
+                *SpineLargest,
+                *ConnectivityProbeText(SeedReport.ArrivalToSpine),
+                *ConnectivityProbeText(SeedReport.DepartureToSpine),
+                *ConnectivityProbeText(SeedReport.ArrivalToDeparture));
+        }
     }
     else
     {

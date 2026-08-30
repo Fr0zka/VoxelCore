@@ -891,6 +891,148 @@ namespace VoxelStrateMeasurePrivate
             ? -1.0f
             : FMath::Sqrt(static_cast<float>(BestDistanceSquared));
     }
+
+    void PopulateConnectivityDiagnostics(
+        const FSampleGrid& Grid,
+        int32 Start,
+        int32 Goal,
+        EVoxelConnectivityResult ConnectivityResult,
+        bool bStartSnapped,
+        bool bGoalSnapped,
+        FVoxelConnectivityDiagnostics& OutDiagnostics)
+    {
+        OutDiagnostics = FVoxelConnectivityDiagnostics();
+        OutDiagnostics.Result = ConnectivityResult;
+        OutDiagnostics.bStartSnapped = bStartSnapped;
+        OutDiagnostics.bGoalSnapped = bGoalSnapped;
+        OutDiagnostics.bValid = ConnectivityResult != EVoxelConnectivityResult::OutOfWindow
+            || (Start >= 0 && Goal >= 0);
+        if (Start < 0 || Goal < 0)
+        {
+            return;
+        }
+
+        TArray<int32> Components;
+        int32 NumComponents = 0;
+        int64 LargestComponentCells = 0;
+        int32 LargestComponentLowestCell = INDEX_NONE;
+        int32 NumComponentsAtLeast1Pct = 0;
+        int64 NumAir = 0;
+        for (const uint8 bAir : Grid.Air)
+        {
+            NumAir += bAir != 0u ? 1 : 0;
+        }
+        FloodFillAir(
+            Grid,
+            Components,
+            NumComponents,
+            NumAir,
+            LargestComponentCells,
+            LargestComponentLowestCell,
+            NumComponentsAtLeast1Pct);
+
+        const int32 StartComponent = Components[Start];
+        const int32 GoalComponent = Components[Goal];
+        if (StartComponent < 0 || GoalComponent < 0)
+        {
+            return;
+        }
+
+        TArray<int32> ComponentCells;
+        ComponentCells.Init(0, NumComponents);
+        for (const int32 Component : Components)
+        {
+            if (Component >= 0)
+            {
+                ++ComponentCells[Component];
+            }
+        }
+
+        OutDiagnostics.NumAirCells = NumAir;
+        OutDiagnostics.StartComponentCells = ComponentCells[StartComponent];
+        OutDiagnostics.GoalComponentCells = ComponentCells[GoalComponent];
+        OutDiagnostics.LargestComponentCells = LargestComponentCells;
+        if (NumAir > 0)
+        {
+            OutDiagnostics.StartComponentShare = static_cast<float>(
+                static_cast<double>(OutDiagnostics.StartComponentCells)
+                / static_cast<double>(NumAir));
+            OutDiagnostics.GoalComponentShare = static_cast<float>(
+                static_cast<double>(OutDiagnostics.GoalComponentCells)
+                / static_cast<double>(NumAir));
+            OutDiagnostics.LargestComponentShare = static_cast<float>(
+                static_cast<double>(LargestComponentCells)
+                / static_cast<double>(NumAir));
+        }
+        OutDiagnostics.bStartComponentIsLargest =
+            OutDiagnostics.StartComponentCells == LargestComponentCells;
+        OutDiagnostics.bGoalComponentIsLargest =
+            OutDiagnostics.GoalComponentCells == LargestComponentCells;
+        OutDiagnostics.StartToGoalComponentDistanceCells = DistanceToComponent(
+            Grid, Start, GoalComponent, Components);
+        OutDiagnostics.GoalToStartComponentDistanceCells = DistanceToComponent(
+            Grid, Goal, StartComponent, Components);
+    }
+
+    EVoxelConnectivityResult QueryConnectivity(
+        const UVoxelGenerator& Generator,
+        const UVoxelStrateManager& Manager,
+        int32 StrateIndex,
+        const FVector& AVoxel,
+        const FVector& BVoxel,
+        const FVoxelStrateMeasureSettings& Settings,
+        bool& bOutStartSnapped,
+        bool& bOutGoalSnapped,
+        FVoxelConnectivityDiagnostics* OutDiagnostics)
+    {
+        bOutStartSnapped = false;
+        bOutGoalSnapped = false;
+        if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y)
+            || !FMath::IsFinite(AVoxel.Z) || !FMath::IsFinite(BVoxel.X)
+            || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
+        {
+            if (OutDiagnostics != nullptr)
+            {
+                *OutDiagnostics = FVoxelConnectivityDiagnostics();
+            }
+            return EVoxelConnectivityResult::OutOfWindow;
+        }
+
+        FSampleGrid Grid;
+        FString RefusalReason;
+        if (!BuildSampleGrid(Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
+        {
+            if (OutDiagnostics != nullptr)
+            {
+                *OutDiagnostics = FVoxelConnectivityDiagnostics();
+            }
+            return EVoxelConnectivityResult::OutOfWindow;
+        }
+
+        int32 Start = -1;
+        int32 Goal = -1;
+        const EVoxelConnectivityResult Result = EvaluateConnectivityOnGrid(
+            Generator,
+            Grid,
+            AVoxel,
+            BVoxel,
+            Start,
+            Goal,
+            bOutStartSnapped,
+            bOutGoalSnapped);
+        if (OutDiagnostics != nullptr)
+        {
+            PopulateConnectivityDiagnostics(
+                Grid,
+                Start,
+                Goal,
+                Result,
+                bOutStartSnapped,
+                bOutGoalSnapped,
+                *OutDiagnostics);
+        }
+        return Result;
+    }
 }
 
 FVoxelStrateMetrics VF_MeasureStrate(
@@ -929,33 +1071,39 @@ EVoxelConnectivityResult VF_AreConnected(
     bool& bOutStartSnapped,
     bool& bOutGoalSnapped)
 {
-    bOutStartSnapped = false;
-    bOutGoalSnapped = false;
-    if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y) || !FMath::IsFinite(AVoxel.Z)
-        || !FMath::IsFinite(BVoxel.X) || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
-    {
-        return EVoxelConnectivityResult::OutOfWindow;
-    }
-
-    VoxelStrateMeasurePrivate::FSampleGrid Grid;
-    FString RefusalReason;
-    if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
-            Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
-    {
-        return EVoxelConnectivityResult::OutOfWindow;
-    }
-
-    int32 Start = -1;
-    int32 Goal = -1;
-    return VoxelStrateMeasurePrivate::EvaluateConnectivityOnGrid(
+    return VoxelStrateMeasurePrivate::QueryConnectivity(
         Generator,
-        Grid,
+        Manager,
+        StrateIndex,
         AVoxel,
         BVoxel,
-        Start,
-        Goal,
+        Settings,
         bOutStartSnapped,
-        bOutGoalSnapped);
+        bOutGoalSnapped,
+        nullptr);
+}
+
+EVoxelConnectivityResult VF_AreConnected(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    FVoxelConnectivityDiagnostics& OutDiagnostics)
+{
+    return VoxelStrateMeasurePrivate::QueryConnectivity(
+        Generator,
+        Manager,
+        StrateIndex,
+        AVoxel,
+        BVoxel,
+        Settings,
+        bOutStartSnapped,
+        bOutGoalSnapped,
+        &OutDiagnostics);
 }
 
 FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
@@ -967,89 +1115,15 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
     const FVoxelStrateMeasureSettings& Settings)
 {
     FVoxelConnectivityDiagnostics Result;
-    if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y) || !FMath::IsFinite(AVoxel.Z)
-        || !FMath::IsFinite(BVoxel.X) || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
-    {
-        return Result;
-    }
-
-    VoxelStrateMeasurePrivate::FSampleGrid Grid;
-    FString RefusalReason;
-    if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
-            Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
-    {
-        return Result;
-    }
-
-    int32 Start = -1;
-    int32 Goal = -1;
-    Result.Result = VoxelStrateMeasurePrivate::EvaluateConnectivityOnGrid(
+    VoxelStrateMeasurePrivate::QueryConnectivity(
         Generator,
-        Grid,
+        Manager,
+        StrateIndex,
         AVoxel,
         BVoxel,
-        Start,
-        Goal,
+        Settings,
         Result.bStartSnapped,
-        Result.bGoalSnapped);
-    Result.bValid = Result.Result != EVoxelConnectivityResult::OutOfWindow
-        || (Start >= 0 && Goal >= 0);
-    if (Start < 0 || Goal < 0)
-    {
-        return Result;
-    }
-
-    TArray<int32> Components;
-    int32 NumComponents = 0;
-    int64 LargestComponentCells = 0;
-    int32 LargestComponentLowestCell = INDEX_NONE;
-    int32 NumComponentsAtLeast1Pct = 0;
-    int64 NumAir = 0;
-    for (const uint8 bAir : Grid.Air)
-    {
-        NumAir += bAir != 0u ? 1 : 0;
-    }
-    FloodFillAir(
-        Grid,
-        Components,
-        NumComponents,
-        NumAir,
-        LargestComponentCells,
-        LargestComponentLowestCell,
-        NumComponentsAtLeast1Pct);
-
-    const int32 StartComponent = Components[Start];
-    const int32 GoalComponent = Components[Goal];
-    if (StartComponent < 0 || GoalComponent < 0)
-    {
-        return Result;
-    }
-
-    TArray<int32> ComponentCells;
-    ComponentCells.Init(0, NumComponents);
-    for (const int32 Component : Components)
-    {
-        if (Component >= 0)
-        {
-            ++ComponentCells[Component];
-        }
-    }
-
-    Result.NumAirCells = NumAir;
-    Result.StartComponentCells = ComponentCells[StartComponent];
-    Result.GoalComponentCells = ComponentCells[GoalComponent];
-    if (NumAir > 0)
-    {
-        Result.StartComponentShare = static_cast<float>(
-            static_cast<double>(Result.StartComponentCells) / static_cast<double>(NumAir));
-        Result.GoalComponentShare = static_cast<float>(
-            static_cast<double>(Result.GoalComponentCells) / static_cast<double>(NumAir));
-    }
-    Result.StartToGoalComponentDistanceCells =
-        VoxelStrateMeasurePrivate::DistanceToComponent(
-            Grid, Start, GoalComponent, Components);
-    Result.GoalToStartComponentDistanceCells =
-        VoxelStrateMeasurePrivate::DistanceToComponent(
-            Grid, Goal, StartComponent, Components);
+        Result.bGoalSnapped,
+        &Result);
     return Result;
 }
