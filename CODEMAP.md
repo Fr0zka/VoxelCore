@@ -311,17 +311,22 @@ walkability, feature scale, and clearance from that grid. Metrics report the res
 the inclusive/exclusive voxel Z window used, plus the largest component's deterministic lowest-cell
 representative point, cell count, and count of components holding at least 1% of the air.
 `VF_AreConnected` recovers a deterministic BFS parent path from the same kind of grid and checks
-only that route at full voxel resolution before returning `Connected`. It returns an explicit
-`EVoxelConnectivityResult`; a solid endpoint cell is repaired by snapping to the nearest air cell
-among its 26 neighbours when possible, and reports the snap through its out flags. A missing coarse
-route returns `NotConnectedAtThisResolution`: that is evidence only at the grid's resolution,
-because a corridor thinner than `SampleStep` is invisible. No UObject state, cache, actor, world,
-or PIE is required.
+candidate routes at full voxel resolution before returning `Connected`. When a candidate is
+refuted, its specific coarse cell edge is added to a deterministic array blocklist and BFS is
+retried up to `MaxRouteRetries` (default 16). It returns an explicit `EVoxelConnectivityResult`;
+a solid endpoint cell is repaired by snapping to the nearest air cell among its 26 neighbours
+when possible, and reports the snap through its out flags. A missing coarse route after edge
+exclusions returns `NotConnectedAtThisResolution`: that is evidence only at the grid's
+resolution, because a corridor thinner than `SampleStep` is invisible. Exhausting the retry
+budget (or finding a refutation in an endpoint segment with no coarse edge to exclude) returns
+`CoarseLiedBudgetExhausted`, which is unknown rather than disconnected. Every `Connected` result
+has a full-resolution air-verified route, and the query reports the alternate route retry count.
+No UObject state, cache, actor, world, or PIE is required.
 | Symbol | Role |
 |--------|------|
 | `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin (including zero to sample the seal), and results identify the resolved margin/Z window and deterministic component representatives. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; refuses invalid bounds or a grid over `MaxCells`. |
-| `VF_AreConnected` | Coarse 6-connected BFS plus one full-resolution recheck of its recovered route, with explicit endpoint-solid, out-of-window, `CoarseLied`, `NotConnectedAtThisResolution`, and connected outcomes; the diagnostics overload returns endpoint component facts from that same grid. |
+| `VF_AreConnected` | Coarse 6-connected BFS plus deterministic blocked-edge retries, with a full-resolution air recheck for every candidate route and explicit endpoint-solid, out-of-window, `NotConnectedAtThisResolution`, `CoarseLiedBudgetExhausted` (unknown), and connected outcomes; diagnostics include endpoint component facts and the retry count from that same grid. |
 | `VF_DiagnoseConnectivity` | The same query plus each mouth's air-component size/share and exact geometric distance to the nearest cell of the other component; proximity is measured in coarse-cell coordinates and does not claim a route through solid. |
 
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`

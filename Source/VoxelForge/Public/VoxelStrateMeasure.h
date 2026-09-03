@@ -15,7 +15,7 @@ enum class EVoxelConnectivityResult : uint8
     StartCellSolid,
     GoalCellSolid,
     OutOfWindow,
-    CoarseLied
+    CoarseLiedBudgetExhausted // Unknown: retries are exhausted, or the refutation has no coarse edge to exclude.
 };
 
 /** Settings for the deterministic coarse grid used by the strate measurement pass. */
@@ -25,6 +25,7 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     int32     RadiusInVoxels = 256;  // Half-extent in X and Y around CenterXY.
     FVector2D CenterXY       = FVector2D::ZeroVector; // Actor-space voxel coordinates.
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
+    int32     MaxRouteRetries = 16; // Alternate coarse routes to full-resolution-check after the first route.
     int32     HeadroomCells  = 2;    // Air cells above a floor cell required for walkable.
     int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped); explicit 0 includes the seal.
 };
@@ -71,6 +72,7 @@ struct VOXELFORGE_API FVoxelConnectivityDiagnostics
     EVoxelConnectivityResult Result = EVoxelConnectivityResult::OutOfWindow;
     bool bStartSnapped = false;
     bool bGoalSnapped = false;
+    int32 NumRouteRetries = 0; // Alternate routes full-resolution-checked after the first route.
 
     int64 NumAirCells = 0;
     int64 StartComponentCells = 0;
@@ -100,14 +102,17 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
     const FVoxelStrateMeasureSettings& Settings);
 
 /**
- * Test coarse connectivity and then re-check the one recovered coarse route at full resolution.
+ * Test coarse connectivity and re-check recovered coarse routes at full resolution.
  *
  * If an endpoint's own coarse cell is solid, the query searches the 26 neighbouring cells and
  * uses the nearest air cell when one exists. The snap flags report those repairs. Solid-cell
- * results are returned only when no adjacent air cell exists. A coarse route that fails its
- * full-resolution re-check returns CoarseLied; a missing coarse route returns
- * NotConnectedAtThisResolution because a corridor thinner than SampleStep is invisible to the
- * grid. A bare "not connected" result is evidence only at the grid's own resolution.
+ * results are returned only when no adjacent air cell exists. When a route fails its
+ * full-resolution re-check, the failed coarse edge is excluded from a deterministic local
+ * blocklist and BFS is retried up to MaxRouteRetries. A missing route after exclusions returns
+ * NotConnectedAtThisResolution. If the retry budget is exhausted while routes are still being
+ * refuted, the result is CoarseLiedBudgetExhausted: unknown, not disconnected. The same unknown
+ * result is used when a refutation is in an endpoint-to-cell segment with no coarse edge to
+ * exclude. Every Connected result has a fully re-walked air route.
  */
 VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     const UVoxelGenerator& Generator,
@@ -118,6 +123,18 @@ VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
     const FVoxelStrateMeasureSettings& Settings,
     bool& bOutStartSnapped,
     bool& bOutGoalSnapped);
+
+/** The same query as the simple overload, with the number of alternate routes actually tried. */
+VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    int32& OutNumRouteRetries);
 
 /**
  * The same connectivity query with component facts returned from the same sampled grid. This
@@ -137,8 +154,9 @@ VOXELFORGE_API EVoxelConnectivityResult VF_AreConnected(
 
 /**
  * Return the component sizes and spatial separation facts for the same query performed by
- * VF_AreConnected. The returned Result uses the same full-resolution route re-check. bValid means
- * the sample grid was built and both endpoint coordinates were in its bounds; component fields
+ * VF_AreConnected. The returned Result uses the same retrying full-resolution route re-check,
+ * and NumRouteRetries reports the number of alternate routes actually checked. bValid means the
+ * sample grid was built and both endpoint coordinates were in its bounds; component fields
  * remain zero/negative when an endpoint has no air cell to analyze. Largest-component membership
  * treats equal-sized components as tied for largest.
  */

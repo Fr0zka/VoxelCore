@@ -42,6 +42,7 @@ namespace
         EVoxelConnectivityResult Result = EVoxelConnectivityResult::OutOfWindow;
         bool bStartSnapped = false;
         bool bGoalSnapped = false;
+        int32 NumRouteRetries = 0;
     };
 
     struct FStrateConnectivityReport
@@ -115,9 +116,38 @@ namespace
         case EVoxelConnectivityResult::StartCellSolid: return TEXT("START_CELL_SOLID");
         case EVoxelConnectivityResult::GoalCellSolid:  return TEXT("GOAL_CELL_SOLID");
         case EVoxelConnectivityResult::OutOfWindow:    return TEXT("OUT_OF_WINDOW");
-        case EVoxelConnectivityResult::CoarseLied:     return TEXT("COARSE_LIED");
+        case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:
+            return TEXT("COARSE_LIED_BUDGET_EXHAUSTED");
         default:                                       return TEXT("UNKNOWN");
         }
+    }
+
+    constexpr int32 ConnectivityResultCount =
+        static_cast<int32>(EVoxelConnectivityResult::CoarseLiedBudgetExhausted) + 1;
+
+    int32 NumRefutedRoutes(const FConnectivityProbe& Probe)
+    {
+        switch (Probe.Result)
+        {
+        case EVoxelConnectivityResult::Connected:
+        case EVoxelConnectivityResult::NotConnectedAtThisResolution:
+            return Probe.NumRouteRetries;
+        case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:
+            return Probe.NumRouteRetries + 1;
+        default:
+            return 0;
+        }
+    }
+
+    bool ConnectivityProbesAreBitIdentical(
+        const FConnectivityProbe& A,
+        const FConnectivityProbe& B)
+    {
+        return A.bChecked == B.bChecked
+            && A.Result == B.Result
+            && A.bStartSnapped == B.bStartSnapped
+            && A.bGoalSnapped == B.bGoalSnapped
+            && A.NumRouteRetries == B.NumRouteRetries;
     }
 
     FString ConnectivityProbeText(const FConnectivityProbe& Probe)
@@ -127,7 +157,10 @@ namespace
             return TEXT("NOT_CHECKED");
         }
 
-        FString Text = ConnectivityResultName(Probe.Result);
+        FString Text = FString::Printf(
+            TEXT("%s [retries=%d]"),
+            ConnectivityResultName(Probe.Result),
+            Probe.NumRouteRetries);
         if (Probe.bStartSnapped || Probe.bGoalSnapped)
         {
             Text += TEXT(" [");
@@ -557,6 +590,8 @@ namespace
                 OutReport.SpineComponentProbe.bStartSnapped,
                 OutReport.SpineComponentProbe.bGoalSnapped,
                 OutReport.SpineComponent);
+            OutReport.SpineComponentProbe.NumRouteRetries =
+                OutReport.SpineComponent.NumRouteRetries;
         }
 
         if (!FindDiagnosticMouths(Manager.GetPassages(), StrateIndex, OutReport))
@@ -584,6 +619,7 @@ namespace
                 OutProbe.bStartSnapped,
                 OutProbe.bGoalSnapped,
                 OutFacts);
+            OutProbe.NumRouteRetries = OutFacts.NumRouteRetries;
         };
 
         if (OutReport.bHasArrival)
@@ -613,7 +649,8 @@ namespace
                 OutReport.DeparturePoint,
                 Settings,
                 OutReport.ArrivalToDeparture.bStartSnapped,
-                OutReport.ArrivalToDeparture.bGoalSnapped);
+                OutReport.ArrivalToDeparture.bGoalSnapped,
+                OutReport.ArrivalToDeparture.NumRouteRetries);
         }
         return true;
     }
@@ -791,7 +828,8 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
      * 3. Range sanity: fractions/components must describe an actual air field.
      * 4. Determinism: identical inputs must produce bit-identical metrics.
      * 5. Coarse-lie guard: a coarse route must never be reported CONNECTED after a
-     *    full-resolution solid sample; the controlled 3-voxel wall below must return COARSE_LIED.
+     *    full-resolution solid sample; the controlled 3-voxel wall below must never return
+     *    CONNECTED, and the bounded retry outcome must remain explicitly unknown.
      */
 
     int32 GapTopChunkZ = 0;
@@ -1029,6 +1067,9 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
 
     int32 NumRoutesChecked = 0;
     int32 NumRoutesRefuted = 0;
+    int32 NumRouteRetriesUsed = 0;
+    int32 MaxRouteRetriesUsed = 0;
+    int32 NumBudgetExhausted = 0;
     int32 NumGuardRoutesChecked = 0;
     int32 NumGuardRoutesRefuted = 0;
     int32 NumSnappedEndpointEvents = 0;
@@ -1041,7 +1082,7 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     int32 NumAnchorStartCellSolid = 0;
     int32 NumAnchorGoalCellSolid = 0;
     int32 NumAnchorOutOfWindow = 0;
-    int32 NumAnchorCoarseLied = 0;
+    int32 NumAnchorBudgetExhausted = 0;
     int32 NumAnchorSnappedEndpointEvents = 0;
 
     auto ProbeRoute = [&](int32 StrateIndex,
@@ -1061,20 +1102,19 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             Goal,
             DerivedWindowSettings,
             Probe.bStartSnapped,
-            Probe.bGoalSnapped);
+            Probe.bGoalSnapped,
+            Probe.NumRouteRetries);
 
         ++NumRoutesChecked;
-        if (Probe.Result == EVoxelConnectivityResult::CoarseLied)
-        {
-            ++NumRoutesRefuted;
-        }
+        NumRoutesRefuted += NumRefutedRoutes(Probe);
+        NumRouteRetriesUsed += Probe.NumRouteRetries;
+        MaxRouteRetriesUsed = FMath::Max(MaxRouteRetriesUsed, Probe.NumRouteRetries);
+        NumBudgetExhausted +=
+            Probe.Result == EVoxelConnectivityResult::CoarseLiedBudgetExhausted ? 1 : 0;
         if (bCountInGuard)
         {
             ++NumGuardRoutesChecked;
-            if (Probe.Result == EVoxelConnectivityResult::CoarseLied)
-            {
-                ++NumGuardRoutesRefuted;
-            }
+            NumGuardRoutesRefuted += NumRefutedRoutes(Probe);
         }
 
         const int32 SnappedHere = (Probe.bStartSnapped ? 1 : 0)
@@ -1099,7 +1139,9 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
             case EVoxelConnectivityResult::StartCellSolid: ++NumAnchorStartCellSolid; break;
             case EVoxelConnectivityResult::GoalCellSolid:  ++NumAnchorGoalCellSolid; break;
             case EVoxelConnectivityResult::OutOfWindow:    ++NumAnchorOutOfWindow; break;
-            case EVoxelConnectivityResult::CoarseLied:     ++NumAnchorCoarseLied; break;
+            case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:
+                ++NumAnchorBudgetExhausted;
+                break;
             default: break;
             }
         }
@@ -1157,12 +1199,35 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     const FConnectivityProbe WallProbe = ProbeRoute(
         0, WallA, WallB, /*bCountInGuard=*/true, /*bCountAsAnchorProbe=*/false,
         /*bCountAsArrivalDeparture=*/false);
-    if (WallProbe.Result != EVoxelConnectivityResult::CoarseLied)
+    if (WallProbe.Result != EVoxelConnectivityResult::CoarseLiedBudgetExhausted
+        || WallProbe.NumRouteRetries != DerivedWindowSettings.MaxRouteRetries)
     {
         AddError(FString::Printf(
-            TEXT("HARD FAILURE: the controlled coarse-connectivity lie returned %s instead of "
-                 "COARSE_LIED."),
-            ConnectivityResultName(WallProbe.Result)));
+            TEXT("HARD FAILURE: the controlled solid wall returned %s after %d retries; "
+                 "expected COARSE_LIED_BUDGET_EXHAUSTED after the MaxRouteRetries=%d cap."),
+            ConnectivityResultName(WallProbe.Result),
+            WallProbe.NumRouteRetries,
+            DerivedWindowSettings.MaxRouteRetries));
+        bAllChecksPassed = false;
+    }
+
+    FConnectivityProbe WallProbeRepeat;
+    WallProbeRepeat.bChecked = true;
+    WallProbeRepeat.Result = VF_AreConnected(
+        *World.Generator,
+        *World.StrateManager,
+        0,
+        WallA,
+        WallB,
+        DerivedWindowSettings,
+        WallProbeRepeat.bStartSnapped,
+        WallProbeRepeat.bGoalSnapped,
+        WallProbeRepeat.NumRouteRetries);
+    if (!ConnectivityProbesAreBitIdentical(WallProbe, WallProbeRepeat))
+    {
+        AddError(TEXT(
+            "HARD FAILURE: the blocked-edge retry order was not deterministic; repeating the "
+            "same wall query changed its verdict, snaps, or retry count."));
         bAllChecksPassed = false;
     }
     World.DiffLayer->Clear();
@@ -1372,6 +1437,14 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         NumRoutesChecked,
         NumRoutesRefuted);
     Summary += FString::Printf(
+        TEXT("Retry budget: MaxRouteRetries=%d; %d alternate routes checked across %d queries "
+             "(maximum %d retries in one query); budget exhausted on %d queries.\n"),
+        DerivedWindowSettings.MaxRouteRetries,
+        NumRouteRetriesUsed,
+        NumRoutesChecked,
+        MaxRouteRetriesUsed,
+        NumBudgetExhausted);
+    Summary += FString::Printf(
         TEXT("Endpoint snap repair: %d snapped endpoint events across all probes; %d in "
              "%d arrival->departure probes.\n"),
         NumSnappedEndpointEvents,
@@ -1380,14 +1453,14 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
     Summary += FString::Printf(
         TEXT("Correct largest-component endpoint probes (%d, including the surface-entry auxiliary): "
              "connected=%d, not-connected-at-resolution=%d, start-cell-solid=%d, goal-cell-solid=%d, "
-             "out-of-window=%d, coarse-lied=%d, snapped endpoint events=%d.\n"),
+             "out-of-window=%d, coarse-lied-budget-exhausted=%d, snapped endpoint events=%d.\n"),
         NumAnchorProbes,
         NumAnchorConnected,
         NumAnchorNotConnectedAtThisResolution,
         NumAnchorStartCellSolid,
         NumAnchorGoalCellSolid,
         NumAnchorOutOfWindow,
-        NumAnchorCoarseLied,
+        NumAnchorBudgetExhausted,
         NumAnchorSnappedEndpointEvents);
     Summary += TEXT("Previous \"5 of 15 disconnected\" verdict: ARTIFACT as a claim about sealed "
                    "pockets; it used a guessed anchor and asked the wrong (largest-component) law.\n");
@@ -1557,7 +1630,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             DeparturePoint,
             RowSettings,
             Row.Probe.bStartSnapped,
-            Row.Probe.bGoalSnapped);
+            Row.Probe.bGoalSnapped,
+            Row.Probe.NumRouteRetries);
 
         if (!Row.Metrics.bValid
             || Row.Metrics.NumSampled <= 0
@@ -1638,7 +1712,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             DeparturePoint,
             RowSettings,
             Row.Probe.bStartSnapped,
-            Row.Probe.bGoalSnapped);
+            Row.Probe.bGoalSnapped,
+            Row.Probe.NumRouteRetries);
 
         if (!Row.Metrics.bValid
             || Row.Metrics.NumSampled <= 0
@@ -1789,7 +1864,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     int32 NumSpineLargestComponents = 0;
     int32 NumMouthToSpineQueries = 0;
     int32 NumMouthToSpineConnected = 0;
-    int32 NumMouthToSpineCoarseLied = 0;
+    int32 NumMouthToSpineBudgetExhausted = 0;
+    int32 NumMouthToSpineRetriesUsed = 0;
+    int32 MaxMouthToSpineRetries = 0;
     for (const FSpineDiagnosisReport& Report : SpineReports)
     {
         if (Report.Spine.bFullWindowRun)
@@ -1817,7 +1894,11 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             }
             ++NumMouthToSpineQueries;
             NumMouthToSpineConnected += Probe->Result == EVoxelConnectivityResult::Connected;
-            NumMouthToSpineCoarseLied += Probe->Result == EVoxelConnectivityResult::CoarseLied;
+            NumMouthToSpineBudgetExhausted +=
+                Probe->Result == EVoxelConnectivityResult::CoarseLiedBudgetExhausted;
+            NumMouthToSpineRetriesUsed += Probe->NumRouteRetries;
+            MaxMouthToSpineRetries = FMath::Max(
+                MaxMouthToSpineRetries, Probe->NumRouteRetries);
         }
     }
 
@@ -1959,7 +2040,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         bSpineDiagnosisUsable ? TEXT("yes") : TEXT("no"));
     Summary += FString::Printf(
         TEXT("Interpretation counts: spine full-window run=%d/%d, one uninterrupted open run=%d/%d, "
-             "spine component largest=%d/%d; mouth->spine CONNECTED=%d/%d, COARSE_LIED=%d.\n"),
+             "spine component largest=%d/%d; mouth->spine CONNECTED=%d/%d, "
+             "COARSE_LIED_BUDGET_EXHAUSTED=%d, retries=%d (max %d).\n"),
         NumSpineFullWindowRuns,
         SpineReports.Num(),
         NumSpineOneOpenRuns,
@@ -1968,7 +2050,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         SpineReports.Num(),
         NumMouthToSpineConnected,
         NumMouthToSpineQueries,
-        NumMouthToSpineCoarseLied);
+        NumMouthToSpineBudgetExhausted,
+        NumMouthToSpineRetriesUsed,
+        MaxMouthToSpineRetries);
     Summary += TEXT(
         "Interpretation: the structural spine remains a continuous column. After the "
         "VerticalShafts connector change, the seed-1337 spine is the largest component, but the "
@@ -2041,8 +2125,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             Diagnostics.GoalToStartComponentDistanceCells,
             Diagnostics.GoalToStartComponentDistanceCells * static_cast<float>(DiagnosticSettings.SampleStep));
         Summary += FString::Printf(
-            TEXT("  diagnostic route verdict: %s; endpoint snaps: start=%s, goal=%s.\n"),
+            TEXT("  diagnostic route verdict: %s; retries=%d; endpoint snaps: start=%s, goal=%s.\n"),
             ConnectivityResultName(Diagnostics.Result),
+            Diagnostics.NumRouteRetries,
             Diagnostics.bStartSnapped ? TEXT("yes") : TEXT("no"),
             Diagnostics.bGoalSnapped ? TEXT("yes") : TEXT("no"));
 
@@ -2069,9 +2154,18 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         int32 SeedArrivalToSpineSnapEvents = 0;
         int32 SeedDepartureToSpineSnapEvents = 0;
         int32 SeedArrivalToDepartureSnapEvents = 0;
-        int32 SeedArrivalToSpineResultCounts[6] = {};
-        int32 SeedDepartureToSpineResultCounts[6] = {};
-        int32 SeedArrivalToDepartureResultCounts[6] = {};
+        int32 SeedArrivalToSpineResultCounts[ConnectivityResultCount] = {};
+        int32 SeedDepartureToSpineResultCounts[ConnectivityResultCount] = {};
+        int32 SeedArrivalToDepartureResultCounts[ConnectivityResultCount] = {};
+        int32 SeedArrivalToSpineRetries = 0;
+        int32 SeedDepartureToSpineRetries = 0;
+        int32 SeedArrivalToDepartureRetries = 0;
+        int32 SeedArrivalToSpineMaxRetries = 0;
+        int32 SeedDepartureToSpineMaxRetries = 0;
+        int32 SeedArrivalToDepartureMaxRetries = 0;
+        int32 SeedArrivalToSpineBudgetExhausted = 0;
+        int32 SeedDepartureToSpineBudgetExhausted = 0;
+        int32 SeedArrivalToDepartureBudgetExhausted = 0;
         int32 SeedFullWindowRuns = 0;
         int32 SeedOneOpenRuns = 0;
         int32 SeedSpineLargest = 0;
@@ -2176,7 +2270,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
                 continue;
             }
 
-            const auto CountSeedResult = [](const FConnectivityProbe& Probe, int32 (&Counts)[6])
+            const auto CountSeedResult = [](
+                const FConnectivityProbe& Probe,
+                int32 (&Counts)[ConnectivityResultCount])
             {
                 if (Probe.bChecked)
                 {
@@ -2186,6 +2282,29 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             CountSeedResult(SeedReport.ArrivalToSpine, SeedArrivalToSpineResultCounts);
             CountSeedResult(SeedReport.DepartureToSpine, SeedDepartureToSpineResultCounts);
             CountSeedResult(SeedReport.ArrivalToDeparture, SeedArrivalToDepartureResultCounts);
+
+            SeedArrivalToSpineRetries += SeedReport.ArrivalToSpine.NumRouteRetries;
+            SeedDepartureToSpineRetries += SeedReport.DepartureToSpine.NumRouteRetries;
+            SeedArrivalToDepartureRetries +=
+                SeedReport.ArrivalToDeparture.NumRouteRetries;
+            SeedArrivalToSpineMaxRetries = FMath::Max(
+                SeedArrivalToSpineMaxRetries,
+                SeedReport.ArrivalToSpine.NumRouteRetries);
+            SeedDepartureToSpineMaxRetries = FMath::Max(
+                SeedDepartureToSpineMaxRetries,
+                SeedReport.DepartureToSpine.NumRouteRetries);
+            SeedArrivalToDepartureMaxRetries = FMath::Max(
+                SeedArrivalToDepartureMaxRetries,
+                SeedReport.ArrivalToDeparture.NumRouteRetries);
+            SeedArrivalToSpineBudgetExhausted +=
+                SeedReport.ArrivalToSpine.Result
+                    == EVoxelConnectivityResult::CoarseLiedBudgetExhausted;
+            SeedDepartureToSpineBudgetExhausted +=
+                SeedReport.DepartureToSpine.Result
+                    == EVoxelConnectivityResult::CoarseLiedBudgetExhausted;
+            SeedArrivalToDepartureBudgetExhausted +=
+                SeedReport.ArrivalToDeparture.Result
+                    == EVoxelConnectivityResult::CoarseLiedBudgetExhausted;
 
             SeedArrivalToSpineSnapEvents +=
                 (SeedReport.ArrivalToSpine.bStartSnapped ? 1 : 0)
@@ -2246,6 +2365,20 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             SeedArrivalToDepartureSnapEvents,
             SeedSweepSeconds);
         Summary += FString::Printf(
+            TEXT("  seed retries used (total/max/budget-exhausted): arrival->spine=%d/%d/%d; "
+                 "departure->spine=%d/%d/%d; arrival->departure=%d/%d/%d; "
+                 "MaxRouteRetries=%d.\n"),
+            SeedArrivalToSpineRetries,
+            SeedArrivalToSpineMaxRetries,
+            SeedArrivalToSpineBudgetExhausted,
+            SeedDepartureToSpineRetries,
+            SeedDepartureToSpineMaxRetries,
+            SeedDepartureToSpineBudgetExhausted,
+            SeedArrivalToDepartureRetries,
+            SeedArrivalToDepartureMaxRetries,
+            SeedArrivalToDepartureBudgetExhausted,
+            DiagnosticSettings.MaxRouteRetries);
+        Summary += FString::Printf(
             TEXT("  ACCEPTANCE arrival->departure: %s (%d/%d seeds pass).\n"),
             SeedPasses == UE_ARRAY_COUNT(SeedCases) && SeedFailures == 0
                 ? TEXT("PASS") : TEXT("FAIL"),
@@ -2276,29 +2409,29 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         Summary += FString::Printf(
             TEXT("  seed result breakdown — arrival->spine: CONNECTED=%d, "
                  "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
-                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d; departure->spine: CONNECTED=%d, "
+                 "OUT_OF_WINDOW=%d, COARSE_LIED_BUDGET_EXHAUSTED=%d; departure->spine: CONNECTED=%d, "
                  "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
-                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d; arrival->departure: CONNECTED=%d, "
+                 "OUT_OF_WINDOW=%d, COARSE_LIED_BUDGET_EXHAUSTED=%d; arrival->departure: CONNECTED=%d, "
                  "NOT_CONNECTED_AT_THIS_RESOLUTION=%d, START_CELL_SOLID=%d, GOAL_CELL_SOLID=%d, "
-                 "OUT_OF_WINDOW=%d, COARSE_LIED=%d.\n"),
+                 "OUT_OF_WINDOW=%d, COARSE_LIED_BUDGET_EXHAUSTED=%d.\n"),
             SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
             SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
             SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
             SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
             SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
-            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)],
+            SeedArrivalToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLiedBudgetExhausted)],
             SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
             SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
             SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
             SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
             SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
-            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)],
+            SeedDepartureToSpineResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLiedBudgetExhausted)],
             SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::Connected)],
             SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::NotConnectedAtThisResolution)],
             SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::StartCellSolid)],
             SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::GoalCellSolid)],
             SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::OutOfWindow)],
-            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLied)]);
+            SeedArrivalToDepartureResultCounts[static_cast<int32>(EVoxelConnectivityResult::CoarseLiedBudgetExhausted)]);
         Summary += FString::Printf(
             TEXT("  seed endpoint snaps — arrival->spine=%d, departure->spine=%d, "
                  "arrival->departure=%d.\n"),

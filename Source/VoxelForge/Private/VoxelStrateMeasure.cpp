@@ -662,6 +662,41 @@ namespace VoxelStrateMeasurePrivate
         return EEndpointCellResult::Air;
     }
 
+    struct FCoarseEdge
+    {
+        int32 First = INDEX_NONE;
+        int32 Second = INDEX_NONE;
+
+        bool IsValid() const
+        {
+            return First >= 0 && Second >= 0 && First != Second;
+        }
+    };
+
+    FCoarseEdge MakeCoarseEdge(int32 A, int32 B)
+    {
+        FCoarseEdge Edge;
+        Edge.First = FMath::Min(A, B);
+        Edge.Second = FMath::Max(A, B);
+        return Edge;
+    }
+
+    bool IsCoarseEdgeBlocked(
+        const TArray<FCoarseEdge>& BlockedEdges,
+        int32 A,
+        int32 B)
+    {
+        const FCoarseEdge Candidate = MakeCoarseEdge(A, B);
+        for (const FCoarseEdge& Blocked : BlockedEdges)
+        {
+            if (Blocked.First == Candidate.First && Blocked.Second == Candidate.Second)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool FullResolutionAirOnSegment(
         const UVoxelGenerator& Generator,
         const FVector& Start,
@@ -689,8 +724,11 @@ namespace VoxelStrateMeasurePrivate
         const FSampleGrid& Grid,
         const FVector& A,
         const FVector& B,
-        const TArray<int32>& Path)
+        const TArray<int32>& Path,
+        FCoarseEdge& OutFailedEdge)
     {
+        OutFailedEdge = FCoarseEdge();
+
         int32 StartX = 0;
         int32 StartY = 0;
         int32 StartZ = 0;
@@ -702,6 +740,9 @@ namespace VoxelStrateMeasurePrivate
 
         if (!FullResolutionAirOnSegment(Generator, A, Grid.CellCenter(StartX, StartY, StartZ)))
         {
+            // The endpoint-to-cell-center segment has no coarse cell pair to exclude. It is
+            // common to every route from this endpoint, so report unknown rather than claiming
+            // that the pair is disconnected at this resolution.
             return false;
         }
 
@@ -720,17 +761,25 @@ namespace VoxelStrateMeasurePrivate
                     Grid.CellCenter(PreviousX, PreviousY, PreviousZ),
                     Grid.CellCenter(CurrentX, CurrentY, CurrentZ)))
             {
+                OutFailedEdge = MakeCoarseEdge(Path[PathIndex - 1], Path[PathIndex]);
                 return false;
             }
         }
 
-        return FullResolutionAirOnSegment(Generator, Grid.CellCenter(EndX, EndY, EndZ), B);
+        if (!FullResolutionAirOnSegment(Generator, Grid.CellCenter(EndX, EndY, EndZ), B))
+        {
+            // As above, the final endpoint segment is shared by every route that reaches the
+            // goal cell and therefore has no precise coarse edge to exclude.
+            return false;
+        }
+        return true;
     }
 
     bool FindCoarsePath(
         const FSampleGrid& Grid,
         int32 Start,
         int32 Goal,
+        const TArray<FCoarseEdge>& BlockedEdges,
         TArray<int32>& OutPath)
     {
         if (Grid.Air[Start] == 0u || Grid.Air[Goal] == 0u)
@@ -762,7 +811,9 @@ namespace VoxelStrateMeasurePrivate
 
             auto Visit = [&](int32 Neighbor)
             {
-                if (Grid.Air[Neighbor] != 0u && Parent[Neighbor] == -2)
+                if (Grid.Air[Neighbor] != 0u
+                    && Parent[Neighbor] == -2
+                    && !IsCoarseEdgeBlocked(BlockedEdges, Current, Neighbor))
                 {
                     Parent[Neighbor] = Current;
                     Queue[Tail++] = Neighbor;
@@ -812,12 +863,15 @@ namespace VoxelStrateMeasurePrivate
         int32& OutStart,
         int32& OutGoal,
         bool& bOutStartSnapped,
-        bool& bOutGoalSnapped)
+        bool& bOutGoalSnapped,
+        int32& OutNumRouteRetries,
+        int32 MaxRouteRetries)
     {
         OutStart = -1;
         OutGoal = -1;
         bOutStartSnapped = false;
         bOutGoalSnapped = false;
+        OutNumRouteRetries = 0;
 
         const EEndpointCellResult StartCell = ResolveEndpointCell(
             Grid, AVoxel, OutStart, bOutStartSnapped);
@@ -837,20 +891,40 @@ namespace VoxelStrateMeasurePrivate
             return EVoxelConnectivityResult::GoalCellSolid;
         }
 
+        TArray<FCoarseEdge> BlockedEdges;
         TArray<int32> Path;
-        if (!FindCoarsePath(Grid, OutStart, OutGoal, Path))
+        for (;;)
         {
-            return EVoxelConnectivityResult::NotConnectedAtThisResolution;
-        }
+            if (!FindCoarsePath(Grid, OutStart, OutGoal, BlockedEdges, Path))
+            {
+                // This is a negative verdict only after all edges excluded by earlier
+                // full-resolution failures leave no coarse route at this resolution.
+                return EVoxelConnectivityResult::NotConnectedAtThisResolution;
+            }
 
-        // The coarse route is evidence, not a pass. Re-check this one BFS route at one-voxel
-        // spacing in the original voxel field. A single solid sample is the dangerous coarse
-        // false positive.
-        if (!FullResolutionPathIsAir(Generator, Grid, AVoxel, BVoxel, Path))
-        {
-            return EVoxelConnectivityResult::CoarseLied;
+            // The coarse route is evidence, not a pass. Re-check every candidate at one-voxel
+            // spacing in the original voxel field. A single solid sample refutes only this
+            // route, so exclude its precise coarse edge and search again.
+            FCoarseEdge FailedEdge;
+            if (FullResolutionPathIsAir(Generator, Grid, AVoxel, BVoxel, Path, FailedEdge))
+            {
+                return EVoxelConnectivityResult::Connected;
+            }
+
+            if (OutNumRouteRetries >= MaxRouteRetries || !FailedEdge.IsValid())
+            {
+                // A route can be refuted without a retryable pair when the failure is in an
+                // endpoint-to-cell segment (or when the explicit retry budget is spent). Both
+                // cases are unknown, never evidence of disconnection.
+                return EVoxelConnectivityResult::CoarseLiedBudgetExhausted;
+            }
+
+            check(FailedEdge.First != FailedEdge.Second);
+            check(!IsCoarseEdgeBlocked(
+                BlockedEdges, FailedEdge.First, FailedEdge.Second));
+            BlockedEdges.Add(FailedEdge);
+            ++OutNumRouteRetries;
         }
-        return EVoxelConnectivityResult::Connected;
     }
 
     float DistanceToComponent(
@@ -899,12 +973,14 @@ namespace VoxelStrateMeasurePrivate
         EVoxelConnectivityResult ConnectivityResult,
         bool bStartSnapped,
         bool bGoalSnapped,
+        int32 NumRouteRetries,
         FVoxelConnectivityDiagnostics& OutDiagnostics)
     {
         OutDiagnostics = FVoxelConnectivityDiagnostics();
         OutDiagnostics.Result = ConnectivityResult;
         OutDiagnostics.bStartSnapped = bStartSnapped;
         OutDiagnostics.bGoalSnapped = bGoalSnapped;
+        OutDiagnostics.NumRouteRetries = NumRouteRetries;
         OutDiagnostics.bValid = ConnectivityResult != EVoxelConnectivityResult::OutOfWindow
             || (Start >= 0 && Goal >= 0);
         if (Start < 0 || Goal < 0)
@@ -983,13 +1059,23 @@ namespace VoxelStrateMeasurePrivate
         const FVoxelStrateMeasureSettings& Settings,
         bool& bOutStartSnapped,
         bool& bOutGoalSnapped,
+        int32& OutNumRouteRetries,
         FVoxelConnectivityDiagnostics* OutDiagnostics)
     {
         bOutStartSnapped = false;
         bOutGoalSnapped = false;
+        OutNumRouteRetries = 0;
         if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y)
             || !FMath::IsFinite(AVoxel.Z) || !FMath::IsFinite(BVoxel.X)
             || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
+        {
+            if (OutDiagnostics != nullptr)
+            {
+                *OutDiagnostics = FVoxelConnectivityDiagnostics();
+            }
+            return EVoxelConnectivityResult::OutOfWindow;
+        }
+        if (Settings.MaxRouteRetries < 0)
         {
             if (OutDiagnostics != nullptr)
             {
@@ -1019,7 +1105,9 @@ namespace VoxelStrateMeasurePrivate
             Start,
             Goal,
             bOutStartSnapped,
-            bOutGoalSnapped);
+            bOutGoalSnapped,
+            OutNumRouteRetries,
+            Settings.MaxRouteRetries);
         if (OutDiagnostics != nullptr)
         {
             PopulateConnectivityDiagnostics(
@@ -1029,6 +1117,7 @@ namespace VoxelStrateMeasurePrivate
                 Result,
                 bOutStartSnapped,
                 bOutGoalSnapped,
+                OutNumRouteRetries,
                 *OutDiagnostics);
         }
         return Result;
@@ -1071,6 +1160,7 @@ EVoxelConnectivityResult VF_AreConnected(
     bool& bOutStartSnapped,
     bool& bOutGoalSnapped)
 {
+    int32 NumRouteRetries = 0;
     return VoxelStrateMeasurePrivate::QueryConnectivity(
         Generator,
         Manager,
@@ -1080,6 +1170,31 @@ EVoxelConnectivityResult VF_AreConnected(
         Settings,
         bOutStartSnapped,
         bOutGoalSnapped,
+        NumRouteRetries,
+        nullptr);
+}
+
+EVoxelConnectivityResult VF_AreConnected(
+    const UVoxelGenerator& Generator,
+    const UVoxelStrateManager& Manager,
+    int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    int32& OutNumRouteRetries)
+{
+    return VoxelStrateMeasurePrivate::QueryConnectivity(
+        Generator,
+        Manager,
+        StrateIndex,
+        AVoxel,
+        BVoxel,
+        Settings,
+        bOutStartSnapped,
+        bOutGoalSnapped,
+        OutNumRouteRetries,
         nullptr);
 }
 
@@ -1094,6 +1209,7 @@ EVoxelConnectivityResult VF_AreConnected(
     bool& bOutGoalSnapped,
     FVoxelConnectivityDiagnostics& OutDiagnostics)
 {
+    int32 NumRouteRetries = 0;
     return VoxelStrateMeasurePrivate::QueryConnectivity(
         Generator,
         Manager,
@@ -1103,6 +1219,7 @@ EVoxelConnectivityResult VF_AreConnected(
         Settings,
         bOutStartSnapped,
         bOutGoalSnapped,
+        NumRouteRetries,
         &OutDiagnostics);
 }
 
@@ -1115,6 +1232,7 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
     const FVoxelStrateMeasureSettings& Settings)
 {
     FVoxelConnectivityDiagnostics Result;
+    int32 NumRouteRetries = 0;
     VoxelStrateMeasurePrivate::QueryConnectivity(
         Generator,
         Manager,
@@ -1124,6 +1242,7 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
         Settings,
         Result.bStartSnapped,
         Result.bGoalSnapped,
+        NumRouteRetries,
         &Result);
     return Result;
 }
