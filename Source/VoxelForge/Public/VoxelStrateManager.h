@@ -48,6 +48,11 @@ struct FVoxelPassage
     FVector UpperPoint = FVector::ZeroVector;  // Entry in upper strate
     FVector LowerPoint = FVector::ZeroVector;  // Exit in lower strate
 
+    // The deterministic upper-mouth request before source landing-site adjustment. Kept for
+    // diagnostics/tests so the bounded lateral snap can be measured against the original spine-
+    // relative placement; not used by the SDF evaluator.
+    FVector RequestedUpperPoint = FVector::ZeroVector;
+
     // The deterministic lower-mouth request before destination landing-site adjustment. Kept for
     // diagnostics/tests so the bounded lateral snap can be measured against the original spine-
     // relative placement; not used by the SDF evaluator.
