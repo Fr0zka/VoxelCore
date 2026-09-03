@@ -462,15 +462,27 @@ refactor, where three weeks of correct work produced a world unchanged by a sing
   tidied without changing every world. Small and isolated.
 
 ### Tier 1 — the primordial law (a BUG FIX, not composer work)
-- **`SuggestLandingPoint` on field sources; passages aim at it** (§6.4).
-- **The passage mouth becomes a room plus a distinctive landmark** (§6.5).
+- ✅ **`SuggestLandingPoint` on field sources; passages aim at it** (§6.4) — DONE, **both mouths**.
+  ⚠️ It shipped HALF BUILT for weeks: only the LOWER mouth was ever aimed. See §14.3 — the ring proxy
+  could not see it, and only the Tier 2 connectivity measurement could.
+- ⬜ **The passage mouth becomes a room plus a distinctive landmark** (§6.5) — not started.
+- ⬜ **`SurfaceWorld` still refuses the query** — it needs manager-resolved biome context, which
+  cannot be answered from a pure free function. Open.
 
-*Standalone value:* fixes a **live hole in the shipping game** — today a player can descend into a
-sealed pocket. Worth doing even if the composer never happens.
+*Standalone value:* fixes a **live hole in the shipping game** — a player could descend into a
+sealed pocket. Worth doing even if the composer never happens. **It was real**: see §14.
 
-### Tier 2 — the measurement pass (§3.4)
-*Standalone value:* it **is** F1, `fable-idea.md`'s top-pick world-preview tool. Jahni can finally see
-what parameters do instead of tuning blind. It also verifies Tier 1.
+### Tier 2 — the measurement pass (§3.4) — ✅ BUILT (2026-09-03), see §13
+`VoxelStrateMeasure.h/.cpp` + `VoxelForge.Generation.StrateConnectivity` / `...Refinement`.
+*Standalone value:* it **is** F1, `fable-idea.md`'s top-pick world-preview tool — the measurement
+half. The visualisation on top is not built yet.
+
+**It paid for itself immediately**: it found the `VerticalShafts` primordial-law violation (§14),
+which no amount of playing was likely to surface, and it caught three of its own artifacts before
+they became "findings" (§13).
+
+⬜ Remaining: the *preview* (F1's visualisation), and the danger/rarity metric families from §3.4
+(fall exposure, openness, traversal mix, tortuosity, corpus-centroid distance).
 
 ### Tier 3 — op-system prerequisites for free composition
 - **Channel read/write declarations** on every op, so ordering derives from a DAG (§3.2).
@@ -677,3 +689,147 @@ assert only that nothing it reports is wrong.*
   count and brace balance after any structural edit.**
 - **Do not run builds while a Codex task is active** — `CodexGuidance.md` §Collaboration: one agent per
   working tree.
+
+---
+
+## 13. Tier 2 BUILT — and what measuring the world actually found (2026-09-03)
+
+**The measurement pass exists, is falsifiable, and earned itself on the first run by finding a live
+gameplay bug that six months of playing might not have surfaced.**
+
+`VoxelStrateMeasure.h/.cpp` — read-only, deterministic, headless. One coarse grid, one 6-connected
+air flood fill, every metric derived from that same grid: air fraction, component count, largest
+component share, walkable fraction, median feature scale, median vertical clearance, and connectivity
+between two points. `VoxelForge.Generation.StrateConnectivity` (fast) and
+`...StrateConnectivityRefinement` (the slow sweeps).
+
+### ⭐ The single most important habit this produced
+**Every reported number states the volume it was measured in.** `ResolvedMarginVoxels`, `SampledMinZ`,
+`SampledMaxZ` are on the metrics struct and printed. This exists because the first version did not
+have it, and the consequence is below.
+
+### ⚠️ Three artifacts that looked exactly like findings
+
+Each of these was, briefly, believed. Each was wrong. The pattern is identical every time: **a number
+produced by a method nobody had questioned.**
+
+1. **"FlatPlain is a 99.95% empty void."** The interior window excluded a whole chunk (32 voxels) at
+   each strate boundary to avoid a 4-voxel seal band — 8x too much. On 4-chunk strates that discarded
+   *half of every strate, floor included*. Walkable fraction was reading 0.00044; with the window
+   derived from the seal that actually exists (`2 x BoundarySealThickness`), it is 0.0578. **132x.**
+   *My spec's error.*
+
+2. **"5 of 15 passage endpoints are disconnected."** The test's `LargestComponentAnchor()` did not find
+   the largest component — it returned a hardcoded guess near the (0,0) spine. And the question itself
+   was wrong: *"connected to the largest component"* is not the primordial law. A strate can be 57
+   disconnected shafts and be perfectly good, provided the shaft you arrive in is the shaft you leave
+   from. Corrected: **13 of 15 connected**, and the real question is `arrival → departure`.
+   *My spec's error, twice over.*
+
+3. **"7 of 16 seeds fail the law."** `VF_AreConnected` took the shortest coarse BFS route, re-walked it
+   at full resolution, and on hitting a wall returned false and gave up — never looking for another
+   way round. Of those failures, only 2 were `NOT_CONNECTED`; **7 were `COARSE_LIED`**, i.e. one
+   candidate route was blocked. A blocked route is not a disconnected pair. *My verifier's error.*
+
+⇒ **Rule: when a measurement reports something alarming, suspect the measurement first.** It was the
+method three times out of three. The cost of checking is minutes; the cost of not checking was nearly
+a rewrite of generation that was not broken.
+
+### The guard is two-directional now, and the directions are NOT symmetric
+- **False POSITIVE** (coarse says joined, reality is walled) → *dangerous*: no geometry, no collision,
+  a player falls through the floor. `FullResolutionPathIsAir` re-walks the recovered route at
+  one-voxel spacing. It fires: **2 of 21 routes** on the first run were coarse false positives.
+- **False NEGATIVE** (a corridor thinner than `SampleStep` vanishes) → *merely wrong*, but wrong in the
+  direction that sends you "fixing" healthy code. Named explicitly as
+  `NotConnectedAtThisResolution` so a bare negative can never be read as proof.
+
+⇒ **`CoarseLiedBudgetExhausted` means UNKNOWN and must never be folded into "disconnected".**
+
+### Settling a finding: refinement with the confound held fixed
+`VerticalShafts` was declared a real bug only after step 4→2→1 (7.34M cells), radius 256→192→128, and
+margin 8→4→2→0 (margin 0 includes the seal, which can only *add* solid, so it cannot invent a route) —
+with **step and radius varied independently** so neither could explain the result. Then 16 seeds,
+because a single fixture cannot distinguish one unlucky world from a broken archetype. See
+[[tests-must-be-falsifiable]]; a 7-sample fixture already hid a defect that fired 92.8% of the time.
+
+---
+
+## 14. The VerticalShafts bug, end to end
+
+**Symptom:** descend into a `VerticalShafts` strate and you cannot reach its exit. 15 of 16 seeds.
+
+**It was three bugs wearing one coat.**
+
+### 14.1 The spine was not the backbone there
+The (0,0) spine (`OriginSpineRadius` 14) holds 97–100% of the air and is the largest component in
+**7 of 8** archetypes. In `VerticalShafts` it punched through as an isolated column holding **9.6%**,
+never the largest. Fixed: the spine now participates as a *connector endpoint* — **not** as a carving
+shaft; `VF_ApplyOriginSpine` remains sole owner — and is excluded from ledge placement.
+Necessary, **not sufficient**: it only joins its own 3x3 neighbourhood, and mouths land 60–200 voxels out.
+
+### 14.2 ⭐ The shaft graph sat below its percolation threshold
+The tell was a *plateau*: the largest component sat at **~0.22 in every variant** — roughness 0,
+connector radius 8, baseline. Roughness changed the component *count* (it manufactures noise pockets)
+but never the giant component's share.
+
+`ShaftDensity` 0.6 sites, `CrossConnectChance` 0.35 bonds, and a `1.6`-cell pair cutoff that silently
+drops many neighbour pairs once jitter spreads shafts 1.7 (orthogonal) to 2.4 (diagonal) cells apart.
+
+⛔ **Do NOT fix this by raising those three numbers.** Percolation is a **phase transition**: tuning
+toward it buys a world connected at one seed and shattered at the next — which *is* the 1-in-16
+behaviour. A phase transition is not a knob.
+
+✅ **Fixed structurally:** a **drainage tree**. Every shaft emits a deterministic connector to the
+nearest shaft *strictly closer to the origin*, so chains drain inward and terminate at the spine. The
+probabilistic connectors stay as texture and loops — the tree guarantees you can get out, the noise
+keeps it from reading as a diagram.
+
+  - seed 1337: **30 components / .220 largest → 17 / .975**
+  - 16 seeds: spine is the largest component **16/16** (was 8/16)
+
+⚠️ **Seam hazard, and the reason for the 7x7 window.** A shaft's parent computed from a 3x3 window
+would differ between chunks, so the connector would exist in one and not the other — invisible in the
+metrics, very visible in game. **Collect over 7x7, emit only for the inner 3x3**, whose 5x5 candidate
+windows are then fully contained. Guarded by `VoxelForge.Generation.VerticalShaftSeamFreedom`
+(154 probes, 0 mismatches). The 49 hash rolls happen on **cache rebuild, never per voxel**
+(1.634 us rebuild, 0.100 us hot call).
+
+⚠️ Connector radius must exceed the **proven roughness supremum**
+(`SurfaceRoughness x VOXEL_NOISE_SCALE x 1.5` = 5.625 at defaults; `sup|FBM|` is **1.5, not 1.0** —
+see [[voxelforge-noise-bounds]]). A guaranteed connector that noise can close is not a guarantee.
+
+### 14.3 ⭐ Tier 1 was only ever HALF BUILT
+`VF_SuggestLandingPoint` was called **once per passage, for the LOWER mouth only**. The upper mouth
+fell out of the control-point chain with no landing query at all. **Tier 1 fixed where a player
+ARRIVES and never touched where they DEPART** — and the measurement said so exactly:
+`departure → spine` was **0 connected across all 16 seeds**.
+
+**The ring proxy could never have caught this.** It checks each mouth for open space individually, and
+an unaimed mouth still has open space around it *because the passage tube carved some*. Only a
+connectivity measurement could see it. This is the strongest argument in the whole project for Tier 2
+existing at all.
+
+✅ Fixed: each mouth queries **its own** strate independently — which is precisely what keeps the
+layout a **set, not a sequence**. Passage `i` never reads passage `i-1`, so
+`LayoutOrderIndependence` stays green. ⛔ The "obvious" fix (chain the mouths) would break it.
+
+  - `departure → spine`: **0 → 9** of 16 · `arrival → departure`: **4 → 7** of 16
+
+**Status: not yet 16/16.** The remaining gap is mostly `COARSE_LIED`, i.e. §13's verifier defect, not
+the world. Fix the measurement before touching generation again.
+
+---
+
+## 15. Working notes that cost something
+
+- ✅ **The `codex exec` hang was stdin.** It prints `Reading additional input from stdin...` and blocks
+  forever on an inherited pipe. **Always `< /dev/null`.** Cost 4.5 h once. Read the banner's
+  `reasoning effort:` line back after every launch — Jahni asks for `max`.
+- **A killed agent leaves unvalidated edits.** A session teardown killed Codex mid-task; the edits were
+  complete and correct but had never been built. **Build and run them yourself rather than assume** —
+  a clean-looking diff is not a passing test.
+- **Codex has found six real errors in my specs across nine tasks.** Asking for disagreement in every
+  spec is the highest-value line in them. Three of today's corrections came from it, not me.
+- **Acceptance must be the measured property, never "the code was written."** Twice a task returned
+  "built, and it does not meet the criterion — here is the number." Both times that honesty pointed
+  straight at the real cause.
