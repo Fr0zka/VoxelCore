@@ -2471,6 +2471,228 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
                 *ConnectivityProbeText(SeedReport.DepartureToSpine),
                 *ConnectivityProbeText(SeedReport.ArrivalToDeparture));
         }
+
+        // PART 0: resolve the two remaining step-2 negatives without changing generation.  The
+        // 12M cap is deliberately high enough for the 320x320x112 step-1/radius-160 fallback,
+        // but low enough that the requested 384x384x112 step-1/radius-192 attempt is explicitly
+        // reported as a MaxCells refusal rather than silently changing the measurement budget.
+        struct FSeedResolutionRow
+        {
+            int32 SampleStep = 0;
+            int32 RadiusInVoxels = 0;
+            bool bMaxCellsRefused = false;
+            FVoxelStrateMetrics Metrics;
+            FVoxelConnectivityDiagnostics Diagnostics;
+        };
+
+        static constexpr int32 ResolutionSeeds[] = {6, 14};
+        static constexpr FRefinementCase ResolutionCases[] = {
+            {2, 192},
+            {1, 192},
+            {2, 128},
+            {1, 128},
+        };
+        constexpr int32 ResolutionMaxCells = 12000000;
+
+        Summary += TEXT(
+            "PART 0 — residual VerticalShafts seed refinement (seeds 6 and 14; margin derived; "
+            "MaxCells=12000000):\n");
+        Summary += TEXT(
+            "  seed | SampleStep | RadiusInVoxels | verdict | components | largest share | retries | "
+            "arrival mouth (x,y,z; component share) | departure mouth (x,y,z; component share)\n");
+
+        for (const int32 Seed : ResolutionSeeds)
+        {
+            FTestWorld ResolutionWorld;
+            ResolutionWorld.Build(Seed, /*InGapChunks=*/2);
+            if (!ResolutionWorld.IsValid())
+            {
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: Part 0 seed %d could not build the VerticalShafts fixture."),
+                    Seed));
+                bAllChecksPassed = false;
+                continue;
+            }
+
+            FVector ResolutionArrivalPoint = FVector::ZeroVector;
+            FVector ResolutionDeparturePoint = FVector::ZeroVector;
+            if (!FindChainMouths(
+                    ResolutionWorld.StrateManager->GetPassages(),
+                    VerticalShaftsIndex,
+                    ResolutionArrivalPoint,
+                    ResolutionDeparturePoint))
+            {
+                AddError(FString::Printf(
+                    TEXT("HARD FAILURE: Part 0 seed %d does not have exactly one arrival and "
+                         "departure mouth."),
+                    Seed));
+                bAllChecksPassed = false;
+                continue;
+            }
+
+            TArray<FSeedResolutionRow> ResolutionRows;
+            ResolutionRows.Reserve(UE_ARRAY_COUNT(ResolutionCases) + 1);
+            for (const FRefinementCase& TestCase : ResolutionCases)
+            {
+                FSeedResolutionRow& Row = ResolutionRows.AddDefaulted_GetRef();
+                Row.SampleStep = TestCase.SampleStep;
+                Row.RadiusInVoxels = TestCase.RadiusInVoxels;
+
+                FVoxelStrateMeasureSettings RowSettings = DiagnosticSettings;
+                RowSettings.SampleStep = TestCase.SampleStep;
+                RowSettings.RadiusInVoxels = TestCase.RadiusInVoxels;
+                RowSettings.MaxCells = ResolutionMaxCells;
+                RowSettings.InteriorMarginVoxels = -1;
+
+                Row.Metrics = VF_MeasureStrate(
+                    *ResolutionWorld.Generator,
+                    *ResolutionWorld.StrateManager,
+                    VerticalShaftsIndex,
+                    RowSettings);
+                const bool bMaxCellsRefusal = !Row.Metrics.bValid
+                    && Row.Metrics.RefusalReason.Contains(TEXT("MaxCells"));
+                Row.bMaxCellsRefused = bMaxCellsRefusal;
+
+                Row.Diagnostics = VF_DiagnoseConnectivity(
+                    *ResolutionWorld.Generator,
+                    *ResolutionWorld.StrateManager,
+                    VerticalShaftsIndex,
+                    ResolutionArrivalPoint,
+                    ResolutionDeparturePoint,
+                    RowSettings);
+
+                const bool bExpectedFallbackRefusal = TestCase.SampleStep == 1
+                    && TestCase.RadiusInVoxels == 192;
+                if (!Row.Metrics.bValid
+                    && !(bExpectedFallbackRefusal && bMaxCellsRefusal))
+                {
+                    AddError(FString::Printf(
+                        TEXT("HARD FAILURE: Part 0 seed %d row step=%d radius=%d was not a "
+                             "bounded measurement (metrics valid=%s reason='%s')."),
+                        Seed,
+                        Row.SampleStep,
+                        Row.RadiusInVoxels,
+                        Row.Metrics.bValid ? TEXT("true") : TEXT("false"),
+                        *Row.Metrics.RefusalReason));
+                    bAllChecksPassed = false;
+                }
+                if (Row.Metrics.bValid
+                    && !Row.Diagnostics.bValid
+                    && Row.Diagnostics.Result != EVoxelConnectivityResult::OutOfWindow)
+                {
+                    AddError(FString::Printf(
+                        TEXT("HARD FAILURE: Part 0 seed %d row step=%d radius=%d produced an "
+                             "invalid connectivity diagnostic with result %s."),
+                        Seed,
+                        Row.SampleStep,
+                        Row.RadiusInVoxels,
+                        ConnectivityResultName(Row.Diagnostics.Result)));
+                    bAllChecksPassed = false;
+                }
+            }
+
+            // If the requested fine grid is over the cap, perform the specified radius-control
+            // substitution. This row is the one used to decide whether step refinement changes
+            // the verdict; the refused 192 row remains in the report as evidence of the cap.
+            if (ResolutionRows.IsValidIndex(1) && ResolutionRows[1].bMaxCellsRefused)
+            {
+                FSeedResolutionRow& FallbackRow = ResolutionRows.AddDefaulted_GetRef();
+                FallbackRow.SampleStep = 1;
+                FallbackRow.RadiusInVoxels = 160;
+
+                FVoxelStrateMeasureSettings FallbackSettings = DiagnosticSettings;
+                FallbackSettings.SampleStep = 1;
+                FallbackSettings.RadiusInVoxels = 160;
+                FallbackSettings.MaxCells = ResolutionMaxCells;
+                FallbackSettings.InteriorMarginVoxels = -1;
+
+                FallbackRow.Metrics = VF_MeasureStrate(
+                    *ResolutionWorld.Generator,
+                    *ResolutionWorld.StrateManager,
+                    VerticalShaftsIndex,
+                    FallbackSettings);
+                FallbackRow.Diagnostics = VF_DiagnoseConnectivity(
+                    *ResolutionWorld.Generator,
+                    *ResolutionWorld.StrateManager,
+                    VerticalShaftsIndex,
+                    ResolutionArrivalPoint,
+                    ResolutionDeparturePoint,
+                    FallbackSettings);
+                if (!FallbackRow.Metrics.bValid)
+                {
+                    AddError(FString::Printf(
+                        TEXT("HARD FAILURE: Part 0 seed %d step=1 radius=160 fallback was not "
+                             "a bounded measurement (metrics valid=%s reason='%s')."),
+                        Seed,
+                        FallbackRow.Metrics.bValid ? TEXT("true") : TEXT("false"),
+                        *FallbackRow.Metrics.RefusalReason));
+                    bAllChecksPassed = false;
+                }
+                if (FallbackRow.Metrics.bValid
+                    && !FallbackRow.Diagnostics.bValid
+                    && FallbackRow.Diagnostics.Result != EVoxelConnectivityResult::OutOfWindow)
+                {
+                    AddError(FString::Printf(
+                        TEXT("HARD FAILURE: Part 0 seed %d step=1 radius=160 produced an "
+                             "invalid connectivity diagnostic with result %s."),
+                        Seed,
+                        ConnectivityResultName(FallbackRow.Diagnostics.Result)));
+                    bAllChecksPassed = false;
+                }
+            }
+
+            for (const FSeedResolutionRow& Row : ResolutionRows)
+            {
+                const bool bUsable = Row.Metrics.bValid && Row.Diagnostics.bValid;
+                const bool bOutOfWindow = Row.Diagnostics.Result == EVoxelConnectivityResult::OutOfWindow;
+                const FString Verdict = Row.bMaxCellsRefused
+                    ? TEXT("EXCEEDS_MAXCELLS")
+                    : (Row.Metrics.bValid && bOutOfWindow)
+                        ? TEXT("OUT_OF_WINDOW")
+                        : bUsable
+                            ? ConnectivityResultName(Row.Diagnostics.Result)
+                            : TEXT("UNUSABLE");
+                const FString Components = Row.Metrics.bValid
+                    ? FString::Printf(TEXT("%d"), Row.Metrics.NumAirComponents)
+                    : TEXT("N/A");
+                const FString LargestShare = Row.Metrics.bValid
+                    ? FString::Printf(TEXT("%.9g"), Row.Metrics.LargestComponentShare)
+                    : TEXT("N/A");
+                const FString Retries = Row.Diagnostics.bValid || (Row.Metrics.bValid && bOutOfWindow)
+                    ? FString::Printf(TEXT("%d"), Row.Diagnostics.NumRouteRetries)
+                    : TEXT("N/A");
+                const FString ArrivalShare = bUsable
+                    ? FString::Printf(TEXT("%.9g"), Row.Diagnostics.StartComponentShare)
+                    : TEXT("N/A");
+                const FString DepartureShare = bUsable
+                    ? FString::Printf(TEXT("%.9g"), Row.Diagnostics.GoalComponentShare)
+                    : TEXT("N/A");
+                Summary += FString::Printf(
+                    TEXT("  %d | %d | %d | %s | %s | %s | %s | (%.3f, %.3f, %.3f; %s) | "
+                         "(%.3f, %.3f, %.3f; %s)%s\n"),
+                    Seed,
+                    Row.SampleStep,
+                    Row.RadiusInVoxels,
+                    *Verdict,
+                    *Components,
+                    *LargestShare,
+                    *Retries,
+                    ResolutionArrivalPoint.X,
+                    ResolutionArrivalPoint.Y,
+                    ResolutionArrivalPoint.Z,
+                    *ArrivalShare,
+                    ResolutionDeparturePoint.X,
+                    ResolutionDeparturePoint.Y,
+                    ResolutionDeparturePoint.Z,
+                    *DepartureShare,
+                    Row.bMaxCellsRefused
+                        ? TEXT(" [requested row refused; use step=1/radius=160 below]")
+                        : TEXT(""));
+            }
+        }
+        Summary += TEXT(
+            "  Part 0 interpretation: step=1/radius=192 is attempted first; when it exceeds the "
+            "12M measurement cap, step=1/radius=160 is the prescribed radius control.\n");
     }
     else
     {

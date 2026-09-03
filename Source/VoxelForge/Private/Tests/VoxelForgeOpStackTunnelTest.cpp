@@ -464,11 +464,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildTunnelNetworkStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + roomgraph + carve + **les 12 modificateurs de détail** + worms + 3 structurels = 19.
+    // rock + roomgraph + carve + **les 12 modificateurs de détail** + worms + 4 structurels = 20.
     // L'étape C n'ajoute AUCUN opérateur — elle change ce que onze d'entre eux LISENT — donc ce
     // nombre DOIT bouger à chaque groupe de l'étape B — c'est un compteur de progression, pas une
     // formalité : une pile qui ne grandit pas est une pile dont l'opérateur n'a pas été ajouté.
-    TestEqual(TEXT("the stage-A+B tunnel stack is decomposed into 19 ops"), Stack.Num(), 19);
+    TestEqual(TEXT("the stage-A+B tunnel stack is decomposed into 20 ops"), Stack.Num(), 20);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;
@@ -1408,7 +1408,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             UWCtx.StrateBottomWorldZ = UP.StrateBottomWorldZ;
             UWStack.PrepareChunk(UWCtx);
 
-            TestEqual(TEXT("the Underwater stack is the tunnel stack: same 19 ops"), UWStack.Num(), 19);
+            TestEqual(TEXT("the Underwater stack is the tunnel stack: same 20 ops"), UWStack.Num(), 20);
 
             // 8 → 24 chunks, comme le balayage principal. Le premier run vert a rapporté **0 de 2000
             // échantillons en grotte ouverte** là où le slot TunnelNetwork en avait 16,7 % : trop peu de

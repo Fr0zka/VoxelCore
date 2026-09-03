@@ -315,10 +315,10 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
         VoxelDensityOps::BuildSurfaceStack(Stack, P, World.Settings->Seed,
                                            Gen->OriginSpineRadius, World.StrateManager.Get());
 
-        // 1 source + 1 overhang + 3 structurels. L'op overhang est présent mais inerte ici
+        // 1 source + 1 overhang + 4 structurels. L'op overhang est présent mais inerte ici
         // (amp 0 ⇒ sortie immédiate) — la décomposition ne change pas selon les params.
-        TestEqual(TEXT("the surface density stack is source + overhang + 3 structural"),
-                  Stack.Num(), 5);
+        TestEqual(TEXT("the surface density stack is source + overhang + 4 structural"),
+                  Stack.Num(), 6);
 
         FVoxelOpContext Ctx;
         Ctx.Seed               = (uint32)World.Settings->Seed;

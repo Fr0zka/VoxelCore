@@ -103,8 +103,8 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildFloatingIslandStack(Stack, P, World.Settings->Seed,
                                               Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // void + blobs + roughness + fill + 3 structurels.
-    TestEqual(TEXT("the island stack is decomposed into 7 ops"), Stack.Num(), 7);
+    // void + blobs + roughness + fill + 4 structurels.
+    TestEqual(TEXT("the island stack is decomposed into 8 ops"), Stack.Num(), 8);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;

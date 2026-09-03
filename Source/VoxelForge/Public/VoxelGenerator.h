@@ -58,7 +58,7 @@ namespace VoxelGenLOD
  * UVoxelGenerator
  *
  * Objet UObject léger — ne stocke pas de données lourdes.
- * Tient juste un pointeur sur les settings (pour le seed) et les services
+ * Tient les paramètres globaux copiés depuis les settings (seed, spine, bord XY) et les services
  * dont il a besoin (StrateManager pour les params par chunk, DiffLayer pour
  * les carves du joueur).
  */
@@ -73,14 +73,21 @@ public:
     //=========================================================================
     // SEED (source unique: Settings->Seed)
     //=========================================================================
-    // On copie juste le seed au démarrage pour éviter un déréférencement
-    // par voxel. Tout le reste vient des params de strate.
+    // Les paramètres globaux sont copiés au démarrage pour éviter un déréférencement par voxel.
+    // Les formes créatives viennent ensuite des params de strate.
     int32 Seed = 0;
 
     // Radius (voxels) of the guaranteed open vertical landing column carved at world
     // XY (0,0) in every strate — the (0,0) descent spine. Copied from VoxelSettings.
     // 0 disables the spine carve.
     float OriginSpineRadius = 14.0f;
+
+    // Radius (voxels) of the bounded world in actor-space XY, measured from (0,0).
+    // 0 keeps the legacy unbounded behavior and is a true no-op for the edge seal.
+    float WorldRadiusVoxels = 8192.0f;
+
+    // Width (voxels) of the smooth solid ramp at the XY world edge.
+    float EdgeSealThickness = 64.0f;
 
     //=========================================================================
     // SERVICES (injectés par AVoxelWorld::BeginPlay)

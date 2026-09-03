@@ -79,6 +79,8 @@ namespace VoxelForgeTest
                 NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
             Settings->Seed = InSeed;
             Settings->InterStrateGapChunks = InGapChunks;
+            // WorldRadiusVoxels/EdgeSealThickness intentionally inherit the UVoxelSettings defaults;
+            // WorldEdgeSeal overrides them explicitly when it needs a small test world or radius 0.
 
             // Une strate par archétype. PINNED via FixedStrates, pas via le pool : Initialize()
             // mélange le pool avec le seed, ce qui rendrait la correspondance archétype → Z

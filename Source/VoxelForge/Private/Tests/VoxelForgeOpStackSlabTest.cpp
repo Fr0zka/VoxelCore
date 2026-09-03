@@ -103,9 +103,9 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         VoxelDensityOps::BuildSlabStack(Stack, SlabParams, World.Settings->Seed,
                                         Gen->OriginSpineRadius, World.StrateManager.Get());
 
-        // La décomposition doit rester une DÉCOMPOSITION : vide + colonnes + 3 structurels.
-        TestEqual(*FString::Printf(TEXT("%s decomposes into void + columns + 3 structural"), SlotName),
-                  Stack.Num(), 5);
+        // La décomposition doit rester une DÉCOMPOSITION : vide + colonnes + 4 structurels.
+        TestEqual(*FString::Printf(TEXT("%s decomposes into void + columns + 4 structural"), SlotName),
+                  Stack.Num(), 6);
 
         FVoxelOpContext Ctx;
         Ctx.Seed               = (uint32)World.Settings->Seed;

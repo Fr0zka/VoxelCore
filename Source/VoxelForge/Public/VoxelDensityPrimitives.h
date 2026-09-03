@@ -1,27 +1,26 @@
 // VoxelDensityPrimitives.h
-// Les trois post-traitements STRUCTURELS partagés par chaque archétype.
-// The three STRUCTURAL post-processes every archetype shares.
+// Les quatre post-traitements STRUCTURELS partagés par chaque archétype.
+// The four STRUCTURAL post-processes every archetype shares.
 //
 // POURQUOI CE FICHIER EXISTE / WHY THIS FILE EXISTS
-// Ces trois fonctions étaient `static` dans VoxelGenerator.cpp et appelées à l'identique par les six
-// fonctions de densité. La pile d'opérateurs a besoin des MÊMES, donc elles montent ici : UNE copie,
-// partagée par le générateur et par les opérateurs. Dupliquer serait garantir qu'elles divergent —
-// et ce sont des INVARIANTS de monde (la descente doit rester possible, les seals doivent tenir, les
-// passages doivent percer), pas des choix créatifs.
+// Les trois primitives verticales étaient `static` dans VoxelGenerator.cpp et appelées à l'identique
+// par les six fonctions de densité. La pile d'opérateurs a besoin des MÊMES, donc elles montent ici :
+// UNE copie partagée. Le scellement XY est ajouté dans ce même fichier pour que les deux chemins
+// partagent aussi la nouvelle invariance — les invariants de monde ne sont pas des choix créatifs.
 //
-// They were `static` in VoxelGenerator.cpp and called identically by all six density functions. The
-// operator stack needs the same ones, so they move here: ONE copy, shared. Duplicating would
-// guarantee divergence, and these are world INVARIANTS, not creative choices.
+// The three vertical primitives were `static` in VoxelGenerator.cpp and called identically by all six
+// density functions. The operator stack needs the same ones, so they move here: ONE shared copy. The
+// XY seal is added beside them so both paths share the new invariant too.
 //
 // ⚠️ CONVENTION DE SIGNE — la source n°1 de confusion du plugin.
-// Ces trois fonctions travaillent en convention INTERNE : **positif = SOLIDE, négatif = AIR**.
+// Ces primitives travaillent en convention INTERNE : **positif = SOLIDE, négatif = AIR**.
 // C'est la convention dans laquelle chaque fonction d'archétype est écrite ; la négation vers la
 // convention marching-cubes (négatif = solide) se fait UNE FOIS, sur le `return`.
 // SIGN CONVENTION: these work in INTERNAL convention — **positive = SOLID**. The negate to MC
 // convention happens ONCE, at the caller's return.
 //
-// Aucun changement de comportement en les déplaçant : corps identiques, FORCEINLINE au lieu de
-// static, mêmes appelants. / No behavioural change: identical bodies, FORCEINLINE instead of static.
+// Les trois corps déplacés restent identiques; le quatrième est la nouvelle frontière globale.
+// The three moved bodies remain identical; the fourth is the new global boundary.
 
 #pragma once
 
@@ -117,14 +116,148 @@ FORCEINLINE void VF_ApplyOriginSpine(float& Density, float WorldX, float WorldY,
 }
 
 //=============================================================================
-// PORTÉES / REACHES — les rayons dont ClassifyTile et EffectOverBox ont besoin
+// XY EDGE SEAL / SCELLEMENT DE LA LIMITE XY
 //=============================================================================
-// Les constantes de blend ci-dessus (3.0 pour la spine, 4.0 pour les passages) sont dupliquées à la
-// main dans ClassifyTile aujourd'hui. Les nommer ici pour qu'un futur test de bornes ne puisse pas
-// les désynchroniser. / The blend constants above are hand-duplicated inside ClassifyTile today.
-// Naming them here so a future bounds test cannot let the two drift apart.
+// The bounded-world rim is a radial solid ramp in actor-space XY. This helper uses the same
+// internal convention as VF_ApplyBoundarySeal (positive = solid); the MC-facing wrapper below
+// negates it so the output convention remains negative = solid.
+//
+// Radius == 0 is deliberately checked before any arithmetic: it is a true legacy no-op, not a
+// nearly-invisible setting-dependent perturbation. The common interior case also returns from a
+// squared-distance test and pays no sqrt.
+FORCEINLINE void VF_ApplyXYEdgeSeal(float& Density, float WorldX, float WorldY,
+    float WorldRadiusVoxels, float Thickness, float BaseDensity)
+{
+    if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f) || !(BaseDensity > 0.0f)) return;
+    if (!FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+        || !FMath::IsFinite(WorldRadiusVoxels) || !FMath::IsFinite(Thickness)
+        || !FMath::IsFinite(BaseDensity)) return;
+
+    const float InnerRadius = WorldRadiusVoxels - Thickness;
+    const float InnerRadiusSq = InnerRadius * InnerRadius;
+    const float DistSq = WorldX * WorldX + WorldY * WorldY;
+    const float RadiusSq = WorldRadiusVoxels * WorldRadiusVoxels;
+
+    // The overwhelmingly common case: well inside the bounded world.
+    if (InnerRadius > 0.0f && DistSq <= InnerRadiusSq) return;
+
+    // Keep the outer-boundary comparison in squared space too. This makes the exact force branch
+    // and the ClassifyBox proof use the same predicate: at or beyond R the result is BaseDensity,
+    // with no sqrt-rounding ambiguity in the forced-solid margin.
+    if (DistSq >= RadiusSq)
+    {
+        Density = FMath::Max(Density, BaseDensity);
+        return;
+    }
+
+    const float DistXY = FMath::Sqrt(DistSq);
+    // 0 at the inner edge, 1 at the world radius; smoothstep removes a cylindrical cliff.
+    const float SealFactor = SmoothStep01(FMath::Clamp(
+        (DistXY - InnerRadius) / Thickness, 0.0f, 1.0f));
+
+    // At/beyond WorldRadiusVoxels the branch above already forced exactly BaseDensity.
+    Density = FMath::Max(Density, SealFactor * BaseDensity);
+}
+
+/** MC-facing form used after post-processes that already operate in the output convention. */
+FORCEINLINE void VF_ApplyXYEdgeSealMC(float& Density, float WorldX, float WorldY,
+    float WorldRadiusVoxels, float Thickness, float BaseDensity)
+{
+    if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f)) return;
+
+    float InternalDensity = -Density;
+    VF_ApplyXYEdgeSeal(InternalDensity, WorldX, WorldY,
+                       WorldRadiusVoxels, Thickness, BaseDensity);
+    Density = -InternalDensity;
+}
+
+//=============================================================================
+// XY EDGE PROOF / PREUVE DE BOITE
+//=============================================================================
+// The closest point of an AABB to the XY origin gives the minimum radius over the whole box.
+// The helpers below are shared by ClassifyBox, ClassifyTile's global shell early-out, and the
+// soundness test. They intentionally require one voxel of radial margin in the ramp: at the
+// mathematical inner edge the helper is a true no-op, so claiming AllSolid there would be false.
 namespace VoxelDensityReach
 {
-    constexpr float SpineBlend   = 3.0f;
-    constexpr float PassageBlend = 4.0f;
+    constexpr float SpineBlend        = 3.0f;
+    constexpr float PassageBlend      = 4.0f;
+    constexpr float EdgeProofMargin   = 1.0f;
 }
+
+FORCEINLINE bool VF_IsValidXYEdgeSealProofInput(const FBox& VoxelBox,
+    float WorldRadiusVoxels, float Thickness, float BaseDensity)
+{
+    return VoxelBox.IsValid
+        && FMath::IsFinite(VoxelBox.Min.X) && FMath::IsFinite(VoxelBox.Min.Y)
+        && FMath::IsFinite(VoxelBox.Max.X) && FMath::IsFinite(VoxelBox.Max.Y)
+        && FMath::IsFinite(WorldRadiusVoxels) && FMath::IsFinite(Thickness)
+        && FMath::IsFinite(BaseDensity)
+        && WorldRadiusVoxels > 0.0f && Thickness > 0.0f && BaseDensity > 0.0f;
+}
+
+FORCEINLINE float VF_XYEdgeClosestRadiusSq(const FBox& VoxelBox)
+{
+    const float ClosestX = (VoxelBox.Min.X > 0.0f) ? VoxelBox.Min.X
+                         : (VoxelBox.Max.X < 0.0f) ? VoxelBox.Max.X : 0.0f;
+    const float ClosestY = (VoxelBox.Min.Y > 0.0f) ? VoxelBox.Min.Y
+                         : (VoxelBox.Max.Y < 0.0f) ? VoxelBox.Max.Y : 0.0f;
+    return ClosestX * ClosestX + ClosestY * ClosestY;
+}
+
+FORCEINLINE float VF_XYEdgeFarthestRadiusSq(const FBox& VoxelBox)
+{
+    const float FarthestX = FMath::Max(FMath::Abs(VoxelBox.Min.X), FMath::Abs(VoxelBox.Max.X));
+    const float FarthestY = FMath::Max(FMath::Abs(VoxelBox.Min.Y), FMath::Abs(VoxelBox.Max.Y));
+    return FarthestX * FarthestX + FarthestY * FarthestY;
+}
+
+/**
+ * Return the actual positive lower-bound margin imposed by the edge seal over a box, or 0 when
+ * the box is not provably forced. The ramp bound is intentionally reduced by 2× after the
+ * one-voxel proof margin, so float evaluation error can only make this estimate too small.
+ */
+FORCEINLINE float VF_XYEdgeSealForcedMarginOverBox(const FBox& VoxelBox,
+    float WorldRadiusVoxels, float Thickness, float BaseDensity)
+{
+    if (!VF_IsValidXYEdgeSealProofInput(VoxelBox, WorldRadiusVoxels, Thickness, BaseDensity)) return 0.0f;
+
+    const float ClosestRadiusSq = VF_XYEdgeClosestRadiusSq(VoxelBox);
+    const float RadiusSq = WorldRadiusVoxels * WorldRadiusVoxels;
+    if (ClosestRadiusSq >= RadiusSq)
+    {
+        // The per-voxel helper takes the >= WorldRadiusVoxels branch and forces BaseDensity.
+        return BaseDensity;
+    }
+
+    const float InnerRadius = WorldRadiusVoxels - Thickness;
+    const float ProofRadius = InnerRadius + VoxelDensityReach::EdgeProofMargin;
+    if (!(Thickness > VoxelDensityReach::EdgeProofMargin)
+        || !(ClosestRadiusSq >= ProofRadius * ProofRadius)) return 0.0f;
+
+    const float GuaranteedFactor = SmoothStep01(
+        FMath::Clamp(VoxelDensityReach::EdgeProofMargin / Thickness, 0.0f, 1.0f));
+    return BaseDensity * GuaranteedFactor * 0.5f;
+}
+
+FORCEINLINE bool VF_XYEdgeSealBoxIsForcedSolid(const FBox& VoxelBox,
+    float WorldRadiusVoxels, float Thickness, float BaseDensity)
+{
+    return VF_XYEdgeSealForcedMarginOverBox(
+        VoxelBox, WorldRadiusVoxels, Thickness, BaseDensity) > 0.0f;
+}
+
+FORCEINLINE bool VF_XYEdgeSealBoxTouchesBand(const FBox& VoxelBox,
+    float WorldRadiusVoxels, float Thickness)
+{
+    if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f)
+        || !FMath::IsFinite(WorldRadiusVoxels) || !FMath::IsFinite(Thickness)) return false;
+
+    const float InnerRadius = WorldRadiusVoxels - Thickness;
+    return VF_XYEdgeFarthestRadiusSq(VoxelBox) > InnerRadius * InnerRadius;
+}
+
+//=============================================================================
+// PORTÉES / REACHES — les rayons dont ClassifyTile et EffectOverBox ont besoin
+//=============================================================================
+// The constants are named above so a future bounds test cannot let them drift from the hot path.

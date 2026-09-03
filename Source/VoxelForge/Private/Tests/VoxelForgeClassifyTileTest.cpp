@@ -151,10 +151,9 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
 
     AddInfo(FString::Printf(
         TEXT("ClassifyTile verdicts over %d scanned tiles: Mixed %d, AllSolid %d, AllAir %d ")
-        TEXT("(brute-forcing %d of them). NOTE: cave archetypes always return Mixed today — see ")
-        TEXT("VoxelGenerator.cpp \"archétype cave [...] pas prouvable en v1\". A low non-Mixed count ")
-        TEXT("is expected and is exactly the tile-skipping prize OPSTACK-PLAN wants EffectOverBox ")
-        TEXT("to unlock."),
+        TEXT("(brute-forcing %d of them). Cave archetypes now use the opt-in operator-stack ")
+        TEXT("ClassifyBox fold; the global XY edge proof also skips proven outer-shell tiles. A low ")
+        TEXT("non-Mixed count is expected: every uncertain case remains Mixed for safety."),
         NumTilesScanned, NumMixed, NumAllSolid, NumAllAir, ToVerify.Num()));
 
     if (ToVerify.Num() == 0)

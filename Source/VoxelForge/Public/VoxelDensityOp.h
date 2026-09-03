@@ -31,7 +31,7 @@
 //   2. COMBINER          — comment deux champs fusionnent (min/max/smooth/mask). C'EST le rôle qui
 //                          achète la composition ; sans lui il n'y a pas de refactor.
 //   3. DETAIL MODIFIER   — l'ancien système, rétrogradé à un rôle sur quatre. Inchangé.
-//   4. STRUCTURAL POST   — spine (0,0) → seal → passages → diff layer. Des INVARIANTS de monde,
+//   4. STRUCTURAL POST   — spine (0,0) → seal vertical → passages → seal XY → diff layer. Des INVARIANTS de monde,
 //                          pas des choix créatifs : toujours ajoutés, dans cet ordre, jamais
 //                          omissibles par l'auteur.
 //
@@ -60,27 +60,23 @@
 // LE GROS LOT PERF : les strates de grotte ne sautent AUCUNE tuile aujourd'hui
 // THE PERF PRIZE: cave strates skip ZERO tiles today
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// ClassifyTile ne sait prouver que les gaps de bedrock et SurfaceWorld ; tout le reste tombe sur
-// `return EVoxelTileClass::Mixed; // archétype cave […] pas prouvable en v1`. TunnelNetwork, Maze,
-// VerticalShafts, FloatingIslands, FlatPlain, CrystalChamber et Underwater ne captent donc RIEN du
-// gain T1.d (84 % des générations vides, −44 % de CPU worker). Écrire un prouveur sur mesure par
-// archétype a toujours été trop cher — EffectOverBox EST le mécanisme générique qui le rend gratuit :
-// une source à graphe de salles qui rend Identity quand aucune borne de salle ni de tunnel n'atteint
-// la boîte rend le bedrock profond sautable pour la première fois.
+// ClassifyTile conserve ses preuves exactes pour les gaps de bedrock et SurfaceWorld ; les
+// archétypes de cave opt-in passent maintenant par le même pliage `ClassifyBox`. Le post XY fournit
+// en plus la première preuve globale de coque : une tuile entièrement dans la bande forcée peut être
+// sautée sans connaître l'archétype ou le Z.
 //
 // **Traiter cela comme un livrable explicite de chaque portage, pas comme un effet de bord.**
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // ÉTAT / STATUS
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// Phase 1. Le premier archétype (Maze) EST porté, dans VoxelDensityOpStack.{h,cpp} — mais
-// **GetDensityAt et ClassifyTile ne sont PAS touchés** : le `switch` reste le seul chemin qui
-// alimente le jeu. La pile est validée par un test qui la compare à GetMazeDensity point par point.
-// Le branchement dans GetDensityAt attend un build vert.
+// Les huit archétypes ont maintenant une pile derrière l'opt-in `bUseOperatorStack`, et ClassifyTile
+// utilise cette pile pour les slots de cave opt-in. Le chemin legacy reste disponible pour les
+// strates non opt-in; les tests d'équivalence servent de garde de portage.
 //
-// Phase 1. Maze IS ported (VoxelDensityOpStack.{h,cpp}) but **GetDensityAt and ClassifyTile are NOT
-// touched** — the switch is still the only path feeding the game. The stack is validated by a test
-// that compares it to GetMazeDensity point by point. Wiring it in waits for a green build.
+// All eight archetypes now have an operator-stack path behind `bUseOperatorStack`, and ClassifyTile
+// uses that stack for opt-in cave slots. The legacy switch remains available for opt-out strates;
+// equivalence tests are port-correctness guards.
 //
 // NOTE sur les UENUM : ces types sont volontairement du C++ nu (pas d'UHT, pas de .generated.h).
 // Ils deviendront UENUM/USTRUCT en Phase 3, quand les opérateurs deviendront des data assets et
@@ -99,7 +95,7 @@ struct FBiomeContext;
 //=============================================================================
 // Le rôle n'est pas décoratif : le compilateur de pile s'en sert pour ORDONNER. Les
 // StructuralPost sont toujours ajoutés en dernier, dans l'ordre fixe spine → seal → passage →
-// diff, quoi que l'auteur ait assemblé. Un auteur ne peut pas les omettre : la descente doit
+// seal XY → diff, quoi que l'auteur ait assemblé. Un auteur ne peut pas les omettre : la descente doit
 // rester possible, les seals doivent tenir, les passages doivent percer, les éditions du joueur
 // gagnent toujours.
 enum class EVoxelOpRole : uint8
@@ -209,6 +205,12 @@ struct FVoxelOpContext
     // Compteur de génération du layout (UVoxelStrateManager::GetLayoutVersion()).
     // DOIT faire partie de toute clé de cache. Voir AUDIT C2.
     uint32 LayoutVersion = 0;
+
+    // Global XY world-edge invariant. These are copied from UVoxelSettings by the generator and
+    // travel with the chunk context so the automatically appended edge op cannot be omitted by a
+    // builder. Radius 0 is the legacy unbounded/no-op mode.
+    float WorldRadiusVoxels = 8192.0f;
+    float EdgeSealThickness = 64.0f;
 
     // Bornes Z de la strate en coords VOXEL (pas cm).
     float StrateTopWorldZ = 0.0f;
@@ -386,8 +388,8 @@ public:
      *
      * Deux familles répondent autre chose que Mixed :
      *   • les SOURCES (rôle 1) — elles posent le champ, donc elles le savent par construction ;
-     *   • les op STRUCTURELS forçants — typiquement ApplyBoundarySeal, qui à l'intérieur de sa
-     *     bande fait `Max(Density, SealFactor·BaseDensity)` avec SealFactor > 0 : le résultat est
+     *   • les op STRUCTURELS forçants — ApplyBoundarySeal et ApplyXYEdgeSeal — qui, dans leur bande
+     *     prouvée, font `Max(Density, SealFactor·BaseDensity)` avec SealFactor > 0 : le résultat est
      *     solide garanti quoi qu'il y ait eu avant. C'est exactement ce que ClassifyTile encode
      *     aujourd'hui avec « bande de seal ⇒ bCanAir = false » — et un simple FillOnly ne suffirait
      *     PAS à le reproduire (voir VF_FoldOp plus bas).
@@ -397,8 +399,8 @@ public:
      * échantillonnant ses colonnes sur le treillis exact, exactement comme aujourd'hui.
      *
      * FORCING OPS. Some ops do not *move* the input density, they *overwrite* it. Default Mixed =
-     * "I don't know", always safe. The boundary seal is the non-source example, and it is the
-     * reason this method exists at all rather than being folded into EffectOverBox.
+     * "I don't know", always safe. The vertical and XY edge seals are the non-source examples, and
+     * they are the reason this method exists at all rather than being folded into EffectOverBox.
      */
     virtual EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
@@ -451,6 +453,8 @@ public:
 //   ApplyOriginSpine           → CarveOnly   (tue AllSolid) ≡ le test cercle/boîte XY
 //   ApplyBoundarySeal          → ClassifyBox = AllSolid DANS sa bande (opérateur forçant),
 //                                FillOnly ailleurs         ≡ « bande de seal ⇒ bCanAir=false »
+//   ApplyXYEdgeSeal             → ClassifyBox = AllSolid DANS sa bande radiale (forçant) ; il gagne
+//                                après les passages, donc la coque extérieure reste fermée.
 //   disturbances chasms        → CarveOnly   ≡ « ChasmDensity > 0 ⇒ bCanSolid=false »
 //   disturbances ponts/arêtes  → FillOnly    ≡ « Bridge/RidgeDensity > 0 ⇒ bCanAir=false »
 //   diff layer                 → Both si des mods touchent la boîte, sinon Identity

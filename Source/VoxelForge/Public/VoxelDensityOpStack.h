@@ -6,15 +6,16 @@
 // `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
 // UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
 // strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés :
-// **Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands (6 sur 8)**.
+// **Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork,
+// Underwater (8 sur 8)**.
 // Toute autre strate passe encore par le `switch`, inchangé.
-// `ClassifyTile` n'est PAS branché : il utilise toujours ses gardes écrites à la main, pas
-// `ClassifyBox`. C'est la Phase 2.
+// `ClassifyTile` est branché pour les archétypes de cave opt-in : il construit la même pile et
+// plie `ClassifyBox`; les gaps et SurfaceWorld gardent leurs preuves exactes dédiées.
 //
 // THIS FEEDS THE GAME, BUT ONLY BEHIND AN OPT-IN. GetDensityAt builds the stack per chunk and
 // evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate ticked
-// bUseOperatorStack AND its archetype ported — 6 of 8). ClassifyTile is NOT wired: it still uses its
-// hand-written guards rather than ClassifyBox. That is Phase 2.
+// bUseOperatorStack AND its archetype is ported — all 8). ClassifyTile uses the same stack for cave
+// archetypes; gaps and SurfaceWorld retain their exact hand-written proofs.
 //
 // ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde.
 // ⚠️ EN REVANCHE, LES COMPARER EST DEVENU LÉGITIME — cette ligne disait l'inverse et elle est
@@ -43,7 +44,7 @@ class UVoxelStrateManager;
  * FVoxelOpStack — une liste ordonnée d'opérateurs + le pliage de verdict de boîte.
  *
  * PROPRIÉTÉ (rôle 4) : les opérateurs STRUCTURELS sont ajoutés par `AppendStructuralPost` et
- * l'ordre spine → seal → passage est garanti par cette fonction, pas par l'auteur. Un auteur ne
+ * l'ordre spine → seal → passage → seal XY est garanti par cette fonction, pas par l'auteur. Un auteur ne
  * peut pas les omettre ni les réordonner — ce sont des invariants de monde (la descente doit rester
  * possible, les seals doivent tenir, les passages doivent percer).
  *
@@ -122,7 +123,7 @@ public:
     /**
      * Le pliage générique qui remplacera les gardes écrites à la main dans ClassifyTile.
      * Voir `VF_FoldOp` (VoxelDensityOp.h) pour la sémantique — en particulier pourquoi un
-     * opérateur FORÇANT (le seal dans sa bande) écrase ce que la pile avait conclu avant lui.
+     * opérateur FORÇANT (les seals dans leurs bandes) écrase ce que la pile avait conclu avant lui.
      */
     EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
@@ -130,7 +131,8 @@ public:
         for (const TUniquePtr<IVoxelDensityOp>& Op : Ops)
         {
             VF_FoldOp(H, *Op, VoxelBox, Ctx);
-            if (H.IsDead()) { return EVoxelTileClass::Mixed; }   // early-out : plus rien à prouver
+            // Do not early-out on a dead hypothesis: a later forcing structural post may
+            // deliberately overwrite it (the XY edge seal is appended after passage carving).
         }
         return H.Resolve();
     }
@@ -138,8 +140,8 @@ public:
     /**
      * LE MÊME PLIAGE, MAIS QUI DIT **QUI** A TUÉ CHAQUE HYPOTHÈSE. Diagnostic, réservé aux tests.
      *
-     * ⚠️ IL DOIT RENDRE EXACTEMENT LE MÊME VERDICT QUE `ClassifyBox` — même boucle, même early-out,
-     * même ordre. Un diagnostic qui emprunte un chemin légèrement différent de celui qu'il explique
+     * ⚠️ IL DOIT RENDRE EXACTEMENT LE MÊME VERDICT QUE `ClassifyBox` — même boucle, même ordre,
+     * y compris le fait de laisser un post forçant ultérieur ressusciter une hypothèse morte. Un diagnostic qui emprunte un chemin légèrement différent de celui qu'il explique
      * est pire que pas de diagnostic : il envoie chercher le bug ailleurs. Si l'un des deux change,
      * l'autre change avec lui.
      *
@@ -148,8 +150,8 @@ public:
      * lisible s'obtient par `GetOpDebugName(index)`.
      *
      * Same fold, but it reports WHICH op killed each hypothesis. Must stay verdict-identical to
-     * ClassifyBox — a diagnostic that takes a slightly different path sends you hunting in the
-     * wrong place.
+     * ClassifyBox, including later forcing posts that may overwrite a dead hypothesis — a
+     * diagnostic that takes a slightly different path sends you hunting in the wrong place.
      */
     EVoxelTileClass ClassifyBoxAttributed(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                                           int32& OutSolidKiller, int32& OutAirKiller) const
@@ -168,7 +170,6 @@ public:
             if (bSolidBefore && !H.bCanBeAllSolid && OutSolidKiller == INDEX_NONE) { OutSolidKiller = i; }
             if (bAirBefore   && !H.bCanBeAllAir   && OutAirKiller   == INDEX_NONE) { OutAirKiller   = i; }
 
-            if (H.IsDead()) { return EVoxelTileClass::Mixed; }
         }
         return H.Resolve();
     }
@@ -181,7 +182,7 @@ public:
 
     /**
      * RÔLE 4 — ajoute les invariants de monde, dans l'ordre fixe, à la fin de la pile.
-     * spine (0,0) → seal de frontière → carve de passage.
+     * spine (0,0) → seal de frontière → carve de passage → seal de limite XY.
      *
      * ⚠️ La couche de diff (édits joueur) n'est PAS ici : elle vit dans `GetDensityAt`, APRÈS la
      * négation MC, avec les disturbances. Elle rejoindra la pile quand les disturbances seront
@@ -192,6 +193,8 @@ public:
      * It joins the stack when disturbances are ported. Harmless while the stack feeds nothing.
      *
      * @param StrateManager  peut être nullptr → pas de carve de passage (comme le fallback actuel).
+     *                        Le seal XY reste toujours présent ; son rayon/thickness viennent de Ctx
+     *                        au moment de PrepareChunk (0 = monde non borné).
      */
     VOXELFORGE_API void AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
                                              float SealThickness, float BaseDensity, float SpineRadius,
@@ -286,7 +289,7 @@ namespace VoxelDensityOps
 
     /**
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
-     *   SlabVoidSource → GridColumnMod → [structural post ×3]
+     *   SlabVoidSource → GridColumnMod → [structural post ×4]
      *
      * C'est le premier vrai gain du refactor (OPSTACK-PLAN §4) : deux des huit archétypes
      * disparaissent dans un opérateur, et leur différence redevient ce qu'elle était déjà dans
@@ -297,8 +300,8 @@ namespace VoxelDensityOps
                                        const UVoxelStrateManager* StrateManager);
 
     /**
-     * VerticalShafts — 8 ops, et **TROIS viennent de Maze sans une ligne de changement** :
-     *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge → [structural post ×3]
+     * VerticalShafts — 9 ops, et **TROIS viennent de Maze sans une ligne de changement** :
+     *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge → [structural post ×4]
      *
      * C'est la démonstration que `§2.5` promettait : dans le `switch`, Maze et VerticalShafts sont
      * deux fonctions de ~100 lignes sans rien de commun à l'œil ; en opérateurs, ce sont les mêmes
@@ -310,10 +313,10 @@ namespace VoxelDensityOps
                                                 const UVoxelStrateManager* StrateManager);
 
     /**
-     * TunnelNetwork — **COMPLET, 19 ops** :
+     * TunnelNetwork — **COMPLET, 20 ops** :
      *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → CaveRoughness(4b)
      *   → Terrace → LayerLines → Ribbing → Overhang → Cliff → Scallop → Arch → RoomColumn(4d)
-     *   → Dome(4g) → Pinch(4h) → FloorBias → Worms → [structural ×3]
+     *   → Dome(4g) → Pinch(4h) → FloorBias → Worms → [structural ×4]
      *
      * L'override d'op PAR SALLE (étape C1) n'ajoute aucun opérateur : `FRoomGraphSource` publie
      * `LocalParams()` — les params de la strate avec l'op de la salle la plus proche appliqué — et
@@ -363,8 +366,8 @@ namespace VoxelDensityOps
     VOXELFORGE_API FRoomBoxDiagnostic GetLastRoomBoxDiagnostic();
 
     /**
-     * FloatingIslands — 7 ops, et **la pile tourne à l'ENVERS** :
-     *   ConstantVoid → IslandBlob → SdfRoughness → SdfFill → [structural post ×3]
+     * FloatingIslands — 8 ops, et **la pile tourne à l'ENVERS** :
+     *   ConstantVoid → IslandBlob → SdfRoughness → SdfFill → [structural post ×4]
      *
      * Les quatre archétypes portés jusqu'ici partent de ROC et CREUSENT ; celui-ci part du VIDE et
      * REMPLIT. Aucune des deux extrémités n'a demandé d'opérateur neuf — `FConstantFieldSource` et

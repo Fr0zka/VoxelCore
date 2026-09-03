@@ -13,7 +13,7 @@
 #include "VoxelDiffLayer.h"
 #include "VoxelBiomeDefinition.h"
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
-#include "VoxelDensityPrimitives.h"   // spine / seal / passage — shared with the operator stack
+#include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
@@ -231,13 +231,13 @@ static float CellularNoise3D(const FVector& Position)
 //=============================================================================
 
 // Les CORPS de ces trois helpers ont déménagé dans Public/VoxelDensityPrimitives.h : la pile
-// d'opérateurs (VoxelDensityOpStack) a besoin exactement des mêmes, et deux copies de trois
-// INVARIANTS de monde (descente possible, seals qui tiennent, passages qui percent) finiraient par
+// d'opérateurs (VoxelDensityOpStack) a besoin exactement des mêmes, et deux copies des INVARIANTS
+// de monde (descente possible, seals qui tiennent, passages qui percent, bord fermé) finiraient par
 // diverger. Ces trois lignes gardent les noms locaux pour que les ~20 sites d'appel ci-dessous ne
 // bougent pas d'un caractère — le déplacement ne change AUCUN comportement.
 //
-// The BODIES moved to Public/VoxelDensityPrimitives.h; the operator stack needs the same three, and
-// two copies of three world invariants would eventually drift. These forwarders keep the local names
+// The BODIES moved to Public/VoxelDensityPrimitives.h; the operator stack needs the same primitives,
+// and duplicate world invariants would eventually drift. These forwarders keep the local names
 // so not one of the ~20 call sites below changes. No behavioural change.
 //
 // Convention INTERNE ici : positif = SOLIDE. La négation vers MC se fait sur le `return`.
@@ -558,10 +558,12 @@ UVoxelGenerator::UVoxelGenerator()
 
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
-    // Seul le seed est copié ici. Tout le reste (params de cave, transitions,
-    // blendings) vient des strate definitions via le StrateManager.
+    // Les paramètres globaux sont copiés ici une seule fois : le chemin voxel ne doit pas
+    // déréférencer l'asset de settings.
     Seed = Settings ? Settings->Seed : 0;
     OriginSpineRadius = Settings ? Settings->OriginSpineRadius : 14.0f;
+    WorldRadiusVoxels = Settings ? Settings->WorldRadiusVoxels : 0.0f;
+    EdgeSealThickness = Settings ? Settings->EdgeSealThickness : 64.0f;
 }
 
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
@@ -580,10 +582,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     {
         // SOLID BEDROCK gap between two strates. The auto-carved passages still tunnel
         // through it, but the (0,0) descent stays solid here so the player digs the gap
-        // to reach the next layer. No caves, no spine, no seal — just rock + passages.
+        // to reach the next layer. No caves, no spine, no vertical seal — just rock + passages;
+        // the global XY edge seal is applied below for bounded worlds.
         float Density = 8.0f;  // bedrock solidity (positive = solid)
         const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
         ApplyPassageCarving(Density, ModSDF, 8.0f, 0.0f);
+        VF_ApplyXYEdgeSeal(Density, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
         Result = -Density;
     }
     else if (StrateManager)
@@ -687,6 +691,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 OpCtx.ChunkCoord    = ChunkCoord;
                 OpCtx.Seed          = (uint32)Seed;
                 OpCtx.LayoutVersion = LayoutVersion;
+                OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
+                OpCtx.EdgeSealThickness = EdgeSealThickness;
 
                 // ⚠️ LE MAPPING VIT DANS `VF_BuildOpStackForChunk` (haut de ce fichier) ET NULLE
                 // PART AILLEURS — `ClassifyTile` appelle la MÊME fabrique. Un verdict de tuile issu
@@ -807,6 +813,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         Result = GetDensityWithParams(WorldX, WorldY, WorldZ, FallbackParams, FallbackFP, 0);
     }
 
+    // The edge is the final generated structural invariant. Passage carving is ordered before it
+    // in every archetype/stack, and this MC-facing pass also covers out-of-layout air plus any
+    // disturbance that might otherwise carve back into the shell. Player edits remain separate
+    // below and are deliberately still the user override path.
+    VF_ApplyXYEdgeSealMC(Result, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
+
     //=========================================================================
     // PLAYER MODIFICATIONS (diff layer)
     //=========================================================================
@@ -873,7 +885,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //   4h. Pinch/Bottleneck: ellipsoidal passage narrowing for chokepoints
     //   5.  Worm tunnels: additional organic connectivity
     //   6.  Boundary seal: solid rock at strate top/bottom
-    //   7.  Modifiers: passages between strates (punch through seals)
+    //   7.  Modifiers: passages between strates (punch through vertical seals)
+    //   8.  XY edge seal: global bounded-world shell wins over passages at the rim
     //
     // Convention: positive density = solid, negative = air (internally).
     // At the end, we negate for the MC table (negative = solid there).
@@ -1945,6 +1958,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
     }
 
+    // Fourth structural post: the XY edge wins over a passage near the rim.
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
+
     // Convention MC: négatif = solide, positif = air.
     // La logique interne utilise positif = solide (plus lisible), donc on négate.
     return -Density;
@@ -2146,7 +2163,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     }
 
     //=========================================================================
-    // STEP 5: BOUNDARY SEAL + STEP 6: PASSAGES
+    // STEP 5: BOUNDARY SEAL + STEP 6: PASSAGES + STEP 7: XY EDGE SEAL
     //=========================================================================
     // Même logique que TunnelNetwork — factorisée dans les helpers ci-dessus.
     ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
@@ -2162,6 +2179,9 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
         const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
         ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
     }
+
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
 
     // Convention MC: négatif = solide.
     return -Density;
@@ -2275,6 +2295,9 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
         const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
         ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
     }
+
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
 
     return -Density;
 }
@@ -2536,6 +2559,9 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
         ApplyPassageCarving(Density, ModSDF, S.BaseDensity, S.BoundarySealThickness);
     }
 
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, S.BaseDensity);
+
     return -Density;
 }
 
@@ -2681,8 +2707,6 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
 
 EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
 {
-    if (!StrateManager) return EVoxelTileClass::Mixed;
-
     // Mêmes clamps que GenerateMesh — le verdict doit couvrir le treillis réellement échantillonné.
     Step = FMath::Max(1, Step);
     const int32 CPA     = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
@@ -2707,6 +2731,20 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         const FIntVector MaxChunk(FloorDivC(MaxX, CHUNK_SIZE), FloorDivC(MaxY, CHUNK_SIZE), FloorDivC(MaxZ, CHUNK_SIZE));
         if (DiffLayer->HasAnyModInChunkRange(MinChunk, MaxChunk)) return EVoxelTileClass::Mixed;
     }
+
+    // The bounded shell is global: it also covers gaps and out-of-layout air, so prove it before
+    // consulting the strate layout. The final MC edge pass uses a positive base, hence 1.0 is a
+    // deliberately conservative proof input here; the stack op performs the same proof with the
+    // archetype base for its own sub-box.
+    const FBox TileVoxelBox(FVector((float)MinX, (float)MinY, (float)MinZ),
+                            FVector((float)MaxX, (float)MaxY, (float)MaxZ));
+    if (VF_XYEdgeSealBoxIsForcedSolid(TileVoxelBox, WorldRadiusVoxels,
+                                      EdgeSealThickness, 1.0f))
+    {
+        return EVoxelTileClass::AllSolid;
+    }
+
+    if (!StrateManager) return EVoxelTileClass::Mixed;
 
     bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
     bool bCanAir   = true;   // "tout le treillis est air" encore prouvable
@@ -3140,6 +3178,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         OpCtx.Seed          = (uint32)Seed;
         OpCtx.LayoutVersion = TC_LayoutVersion;
         OpCtx.Step          = Step;
+        OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
+        OpCtx.EdgeSealThickness = EdgeSealThickness;
 
         FVoxelOpStack TileStack;
         if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
@@ -3940,6 +3980,9 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
         ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
     }
 
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
+
     return -Density;
 }
 
@@ -4096,6 +4139,9 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
         const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
         ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
     }
+
+    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
 
     return -Density;
 }

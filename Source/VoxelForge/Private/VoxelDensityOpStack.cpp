@@ -2,7 +2,7 @@
 // Les opérateurs concrets de la Phase 1 : la décomposition de Maze + le post-traitement structurel.
 // The concrete Phase 1 operators: the Maze decomposition + the structural post-process.
 //
-// ⚠️ AUCUN de ces opérateurs n'alimente le jeu. Voir l'en-tête de VoxelDensityOpStack.h.
+// Ces opérateurs alimentent le jeu derrière l'opt-in décrit dans l'en-tête de VoxelDensityOpStack.h.
 //
 // FIDÉLITÉ / FIDELITY
 // Chaque corps ci-dessous est une transcription LITTÉRALE du bloc correspondant de
@@ -20,7 +20,7 @@
 
 #include "VoxelDensityOpStack.h"
 
-#include "VoxelDensityPrimitives.h"   // VF_ApplyOriginSpine / Seal / PassageCarving
+#include "VoxelDensityPrimitives.h"   // VF_ApplyOriginSpine / seals / PassageCarving
 #include "VoxelCaveMorphology.h"      // VoxelSDF::Capsule, VoxelHash
 #include "VoxelGenerator.h"           // VoxelGenLOD::Eff
 #include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
@@ -1404,6 +1404,65 @@ namespace
 
     private:
         float TopZ, BotZ, Thickness, Base;
+    };
+
+    //=========================================================================
+    // RÔLE 4 — STRUCTUREL : SCELLEMENT DE LA LIMITE XY (opérateur FORÇANT)
+    //=========================================================================
+    class FXYEdgeSealOp final : public IVoxelDensityOp
+    {
+    public:
+        explicit FXYEdgeSealOp(float InBase)
+            : Base(InBase) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+
+        void PrepareChunk(const FVoxelOpContext& Ctx) override
+        {
+            // The settings are global, but PrepareChunk is the stack's one per-chunk hand-off.
+            // Keeping the prepared copy makes Eval hot and keeps the op independent of the asset.
+            WorldRadius = Ctx.WorldRadiusVoxels;
+            Thickness    = Ctx.EdgeSealThickness;
+        }
+
+        void Eval(float X, float Y, float, FVoxelOpSample& InOut) const override
+        {
+            VF_ApplyXYEdgeSeal(InOut.Density, X, Y, WorldRadius, Thickness, Base);
+        }
+
+        /**
+         * The seal is forcing, not merely FillOnly: once every point in the box is at least one
+         * voxel into the ramp (or beyond the radius), the result is positive-solid regardless of
+         * all preceding source/carve operators.
+         */
+        EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return VF_XYEdgeSealBoxIsForcedSolid(
+                VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness, Base)
+                ? EVoxelTileClass::AllSolid : EVoxelTileClass::Mixed;
+        }
+
+        float ForcedMarginOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return VF_XYEdgeSealForcedMarginOverBox(
+                VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness, Base);
+        }
+
+        // In the inner world it is Identity; a box that reaches the radial band can only gain rock.
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return VF_XYEdgeSealBoxTouchesBand(
+                VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness)
+                ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        bool IsXYPure() const override { return true; }
+        const TCHAR* DebugName() const override { return TEXT("XYEdgeSealOp"); }
+
+    private:
+        float Base = 8.0f;
+        mutable float WorldRadius = 8192.0f;
+        mutable float Thickness = 64.0f;
     };
 
     //=========================================================================
@@ -4294,12 +4353,15 @@ void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBott
                                          float SealThickness, float BaseDensity, float SpineRadius,
                                          const UVoxelStrateManager* StrateManager)
 {
-    // ORDRE NON NÉGOCIABLE, et c'est l'ordre que les six fonctions de densité utilisent déjà :
-    // la spine creuse l'intérieur (et ne touche JAMAIS les bandes de seal), le seal re-solidifie
-    // ses bandes, les passages percent tout — seal compris —, le joueur gagne en dernier.
+    // ORDRE NON NÉGOCIABLE : la spine creuse l'intérieur (et ne touche JAMAIS les bandes de seal),
+    // le seal vertical re-solidifie ses bandes, les passages percent les seals, puis la limite XY
+    // gagne sur tout ce qui précède. Ainsi, même un passage placé dans la rampe ou au-delà du rayon
+    // ne peut pas ouvrir la coque extérieure. Les éditions joueur restent le dernier post de
+    // GetDensityAt, hors de cette pile, comme avant.
     Add(MakeUnique<FOriginSpineOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity, SpineRadius));
     Add(MakeUnique<FBoundarySealOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity));
     Add(MakeUnique<FPassageCarveOp>(StrateManager, BaseDensity, SealThickness));
+    Add(MakeUnique<FXYEdgeSealOp>(BaseDensity));
 }
 
 //=============================================================================

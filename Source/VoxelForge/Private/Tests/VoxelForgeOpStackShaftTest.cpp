@@ -91,8 +91,8 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     VoxelDensityOps::BuildVerticalShaftStack(Stack, P, World.Settings->Seed,
                                              Gen->OriginSpineRadius, World.StrateManager.Get());
 
-    // rock + shafts + roughness + carve + ledges + 3 structurels.
-    TestEqual(TEXT("the shaft stack is decomposed into 8 ops"), Stack.Num(), 8);
+    // rock + shafts + roughness + carve + ledges + 4 structurels.
+    TestEqual(TEXT("the shaft stack is decomposed into 9 ops"), Stack.Num(), 9);
 
     FVoxelOpContext Ctx;
     Ctx.Seed               = (uint32)World.Settings->Seed;

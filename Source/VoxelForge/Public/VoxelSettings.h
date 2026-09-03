@@ -179,6 +179,28 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0", ClampMax = "3"))
 	int32 LODOctaveDrop = 0;
 
+	//==========================================================================
+	// WORLD BOUNDS (bounded gigantic world in actor-space XY)
+	//==========================================================================
+	// Radius (voxels) of the bounded world in XY, measured from actor-space (0,0).
+	// 0 = unbounded (legacy behaviour, no edge seal).
+	//
+	// ⚠️ DEFAULTS TO 0 ON PURPOSE, and it is not the value the GDD wants.
+	// Existing DA_Settings / BP_VoxelSettings assets predate this property, so they do NOT serialize
+	// it — they silently inherit whatever C++ default is written here. A non-zero default would
+	// therefore wall in every existing world the next time the editor opens, with nothing in the
+	// asset to show why. The GDD calls for "bounded, but gigantic": ~8192 voxels (2.05 km) is the
+	// intended production value. SET IT IN THE ASSET, deliberately, once.
+	//
+	// FR : 0 par défaut EXPRÈS — les assets existants n'ont pas cette propriété et héritent
+	// silencieusement de la valeur C++. La valeur de production visée (~8192) se règle dans l'asset.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|World Bounds", meta = (ClampMin = "0.0"))
+	float WorldRadiusVoxels = 0.0f;
+
+	// Solid ramp thickness at the radial world edge, in voxels.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|World Bounds", meta = (ClampMin = "0.0"))
+	float EdgeSealThickness = 64.0f;
+
 	//=========================================================================
 	// CONTENT — distance-based decoration grid (no LOD pop)
 	//=========================================================================

@@ -27,7 +27,10 @@ by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispat
 | Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
 
 All density fns share the convention: internal **positive=solid**, apply origin spine →
-boundary seal → inter-strate passages, then `return -Density` (MC: negative=solid).
+vertical boundary seal → inter-strate passages → XY edge seal, then `return -Density` (MC:
+negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
+the global rim cannot be reopened by a post-process; the diff layer remains the explicit player
+override.
 StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/FloatingIslandParamsForChunk`
 (macro `VF_ARCHETYPE_PARAMS_GETTER`) — no cross-boundary blend (Hard transitions between archetypes).
 On top of the archetype, an optional **biome** layer (§8.14) modulates terrain & content WITHIN a
@@ -68,10 +71,37 @@ edge, and every chain strictly decreases distance to the origin until it reaches
 that links to the spine. It does not alter passage placement. The acceptance measurement remains
 the actual arrival→departure flood-fill at the independently placed passage endpoints.
 
+### 8.2a XY edge seal (bounded-world invariant)
+`UVoxelSettings::WorldRadiusVoxels` and `EdgeSealThickness` define the bounded world in actor-space
+XY around `(0,0)`. The default radius is 8192 voxels (~2.05 km at 25 cm/voxel) and the default
+solid ramp is 64 voxels. A radius of **0 is a true no-op**: the hot path returns before doing any
+arithmetic, so the legacy unbounded field is unchanged. From `R - Thickness` to `R`,
+`VF_ApplyXYEdgeSeal` raises the internal positive-solid density with the same `SmoothStep01` ramp
+idiom as the vertical seal; at and beyond `R` it forces positive `BaseDensity`. The generator
+negates once for marching cubes, so the externally visible sealed density is negative (solid).
+
+This is the fourth structural post and is appended automatically by
+`FVoxelOpStack::AppendStructuralPost`, after the spine, vertical seal, and passage carve. Passage
+carving deliberately remains before the edge seal: passages may pierce a vertical strate seal, but
+a passage whose mouth or body reaches the XY rim is overwritten by the edge force and cannot open a
+hole through the world boundary. The legacy density functions apply the same post in the same
+order. `GetDensityAt` reapplies the MC-facing form after disturbances as a backstop for out-of-layout
+air and any disturbance carve; player diff edits still run last by design and remain authoritative.
+
+`FXYEdgeSealOp` is `IsXYPure() == true`, uses only a squared radial early-out in the common interior
+case, and returns `AllSolid` from `ClassifyBox` only when the closest point of the whole box is at
+least one voxel into the ramp (or beyond `R`). Its `ForcedMarginOverBox` reports the actual positive
+lower bound, conservatively reduced after the one-voxel proof margin; it never treats the
+mathematical inner edge as solid. The same proof is used by the global `ClassifyTile` shell guard,
+so tiles wholly in the proven outer band can skip T1.d generation/collision work. A box touching the
+band but not meeting that proof remains `Mixed`.
+
 ### 8.3 Disturbance layer (the "wow" post-process)
 `FStrateDisturbanceParams` (on the definition, all archetypes). `ApplyDisturbances`
 (VoxelGenerator.cpp static, **MC convention**) runs in `GetDensityAt` after dispatch:
-chasms (carve air), bridges (solid spans), ridges (solid blades). Stays inside seal bands.
+chasms (carve air), bridges (solid spans), ridges (solid blades). The XY edge seal is reapplied after
+this layer, so disturbances cannot reopen the outer shell; the layer otherwise stays inside the
+vertical seal bands.
 Provided per chunk by `StrateManager::GetDisturbanceParamsForChunk`.
 
 ### 8.4 Cross-chunk determinism (the seam-prevention invariant)
@@ -352,6 +382,11 @@ driven by `EditorBrush*` props.
   thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
   prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner
   or layout key, and don't move the fetch/blend back to per-voxel.
+- **XY edge seal hot path** (§8.2a): `WorldRadiusVoxels == 0` returns immediately; otherwise the
+  common interior case is a squared-distance test with no square root. The forcing op receives the
+  two global settings through `FVoxelOpContext` once per chunk, while `ClassifyBox`/`ClassifyTile`
+  share the radial proof. This adds no cache, state, RNG, or clipmap stream, and does not touch the
+  density grid's two-pass MC loop or any existing `thread_local` cache.
 - **Biome cache** (`ResolveBiomeSampleAt`/`FChunkBiomeCache`, §8.14): validity is a world-XY BOX +
   ChunkZ + Seed, NOT a chunk key — same reason as the SDF cache. The cell classification is
   noise-heavy; a chunk-key would thrash it on gradient-normal / +X/+Y boundary samples. Keep
@@ -542,6 +577,9 @@ driven by `EditorBrush*` props.
   **Conservative guards** (anything that can carve/fill): player mods (`HasAnyModInChunkRange`) ⇒
   Mixed; passages (`AnyPassageNearBox`, bounding spheres + carve blend pad) and the (0,0) spine
   (circle/box XY) kill AllSolid; disturbance chasms kill AllSolid, bridges/ridges kill AllAir.
+  The global XY edge proof runs first and returns AllSolid for a box entirely in the forced band;
+  the same force is the final generated post after disturbances, so a near-rim passage cannot
+  invalidate that verdict. Every other uncertain case remains Mixed.
   A false `Mixed` only costs CPU; the code must NEVER emit a false AllSolid/AllAir (that's a hole).
   Capture tiles (`bWantCapture`, density-volume shadow window) always generate — the volume wants the
   grid even for uniform cells. A sparse ~5×5 column pre-pass exits Mixed fast on surface-crossing

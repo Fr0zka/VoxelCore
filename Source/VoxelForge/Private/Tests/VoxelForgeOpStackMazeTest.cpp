@@ -140,8 +140,8 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
 
     // La décomposition doit être une DÉCOMPOSITION. Un `FMazeOp` monolithique passerait tous les
     // tests numériques ci-dessous et aurait pourtant raté l'objet entier du refactor (§2.5).
-    TestEqual(TEXT("the Maze stack is decomposed, not wrapped (rock + corridors + roughness + carve + 3 structural)"),
-              Stack.Num(), 7);
+    TestEqual(TEXT("the Maze stack is decomposed, not wrapped (rock + corridors + roughness + carve + 4 structural)"),
+              Stack.Num(), 8);
 
     FVoxelOpContext Ctx;
     Ctx.Seed                = (uint32)World.Settings->Seed;
