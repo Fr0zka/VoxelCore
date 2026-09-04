@@ -196,6 +196,49 @@ small commandlet walking the struct by reflection. Clamp coverage is partial. A 
 tunables at all (`StrateTopWorldZ` / `StrateBottomWorldZ` are runtime Z bounds) and need an explicit
 exclusion list. Bools cannot be blended — roll them by probability or inherit from the dominant parent.
 
+### ✅ Tier 4a status — parameter roll built (2026-09-04)
+
+`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp` now implement the corpus and
+the deterministic roll. `Private/Tests/VoxelForgeComposerParameterRollTest.cpp` is the offline
+measurement harness. The roll uses `FStrateGenerationParams::Lerp`, chooses 2–3 weighted parents
+inside one archetype group, applies jitter of **±15% of each field's measured corpus range
+(`max-min`)**, then applies reflected `ClampMin`/`ClampMax` metadata. It does not use clamps as
+distribution ranges, does not touch generation, and leaves `WorldRadiusVoxels` at its default 0.
+
+The loader walks the settings asset's fixed-strate and pool references, de-duplicates by asset path,
+and accepts only `TunnelNetwork` / `Underwater`: those are the only archetypes whose authored vector
+is `GenerationParams`. The current `DA_Settings` asset contains **one unique resolved reference**,
+`DA_Strate3`, and it is `TunnelNetwork`; the other authored archetype assets are not in that
+settings corpus. Consequently every measured field has zero spread, all 64 rolls repeat the same
+known-good vector (parent weights still roll deterministically), and this run did not exercise
+non-zero jitter. That is a corpus-size finding, not a rate optimization.
+
+The reflection/use audit found **36 excluded fields**: the 34 terrain-op transport fields
+`TerraceStepHeight`, `TerraceHardness`, `TerraceNoiseDisplacement`, `LayerLineSpacing`,
+`LayerLineDepth`, `OverhangStrength`, `OverhangDepth`, `OverhangFrequency`, `RibbingSpacing`,
+`RibbingDepth`, `CliffStrength`, `ScallopStrength`, `ScallopFrequency`, `ArchDensity`,
+`ArchMinRadius`, `ArchMaxRadius`, `ColumnDensity`, `ColumnMinRadius`, `ColumnMaxRadius`,
+`PitDensity`, `PitMinRadius`, `PitMaxRadius`, `PitDepth`, `ChimneyDensity`, `ChimneyMinRadius`,
+`ChimneyMaxRadius`, `ChimneyHeight`, `DomeDensity`, `DomeMinRadius`, `DomeMaxRadius`,
+`DomeHeightRatio`, `PinchDensity`, `PinchStrength`, `PinchLength` — populated per room by
+`UVoxelTerrainOpDefinition` — plus the manager-owned runtime bounds `StrateTopWorldZ` and
+`StrateBottomWorldZ`. The test prints the complete field-by-field table, including excluded fields,
+reflection status, and clamp metadata.
+
+The bool policy is explicit: `bTunnelsFlowTowardOrigin` is inherited from the dominant parent.
+`OriginRoomMaxConnections` and `RoughnessNoiseType` retain `Lerp`'s existing SNAP behavior and
+are not jittered. In this editor build clamp metadata was available while the table was built; it
+is **not promised in a cooked runtime**, so the commandlet/cook-time bake remains owed.
+
+The first 64-candidate run (step 4, radius 256, max 8,000,000 cells, fixture seed 1337) produced
+64/64 non-vacuous candidates, 64/64 largest-component share ≥ 0.50, and 64/64 exact unsnapped
+arrival→departure law passes. Every row was `air=0.520272`, `largest share=0.999996`,
+`walkable=0.057995`, `feature scale=20.000000`, `Connected`; total runtime was **542.220 s**.
+The §6.2 check saw **2,560 Mixed, 0 AllSolid, 0 AllAir, 0 brute-force voxels, 0 violations**:
+this is explicitly **vacuous**, not evidence that rolled bounds are sound, because the current cave
+box path emitted no uniform verdict. The test leaves §6.2 open and reports that fact rather than
+turning it into a workaround.
+
 ### 3.4 The measurement pass — one grid, one flood fill, three jobs
 
 Sample a candidate strate into a coarse voxel grid, flood-fill the air **once**, derive everything from
@@ -533,8 +576,11 @@ an open semantic decision; the Part 0 analysis above concludes that FloorBias is
 roughness and should stay late in the stack.
 
 ### Tier 4 — the composer proper
-Structure roll (§3.2) · parameter roll (§3.3) · reject-and-resample driven by Tier 2 (§3.5) · the
-**offline season pipeline** with Jahni's review and veto (§3.1).
+- ✅ **Parameter roll (§3.3, Tier 4a)** — corpus spread + deterministic blend/jitter implementation
+  and the 64-candidate measurement pass are built; the first run exposed a one-vector settings corpus
+  and a vacuous cave box-verdict scan, both recorded above.
+- ⬜ Structure roll (§3.2) · reject-and-resample driven by Tier 2 (§3.5) · the **offline season
+  pipeline** with Jahni's review and veto (§3.1).
 
 ### Tier 5 — the long game
 **Promotion** (good strates rejoin the corpus) · theme and tag draws for materials, creatures and audio ·
