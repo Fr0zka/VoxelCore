@@ -320,6 +320,35 @@ VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailedForArchetype(
 /** Pure structure roll: no retained RNG state and no corpus/runtime dependency. */
 VOXELFORGE_API FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index);
 
+/**
+ * Provenance for a parameter block that does not read the authored corpus.
+ *
+ * NaiveUniform is the §3.3 control: every scalar is rolled independently inside the same
+ * finite code-declared envelope used by the constraint arm. ConstraintSampled draws the
+ * independent geometry quantities and derives the coupled quantities from generator equations.
+ * Neither mode reads a strate asset or a corpus entry.
+ */
+enum class EVoxelStrateCorpusFreeSamplingMode : uint8
+{
+    NaiveUniform,
+    ConstraintSampled,
+};
+
+/** Roll one native parameter family without consulting FVoxelStrateCorpus. */
+VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsCorpusFree(
+    ECaveGeneratorType Archetype,
+    int32 Seed,
+    int32 Index,
+    EVoxelStrateCorpusFreeSamplingMode Mode,
+    float StrateHeightInVoxels);
+
+/** Validate the hard geometry relations used by ConstraintSampled and the corpus audit. */
+VOXELFORGE_API bool VF_ValidateStrateCorpusFreeConstraints(
+    ECaveGeneratorType Archetype,
+    const FVoxelStrateArchetypeParams& Params,
+    float StrateHeightInVoxels,
+    FString& OutViolation);
+
 #if WITH_EDITOR
 /**
  * Roll one candidate for the editor walk-through path. Parameter rolls call

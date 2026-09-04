@@ -470,6 +470,131 @@ and **0 violations** (1,901 Mixed, 266 AllSolid, 393 AllAir). The parameter-roll
 proved **1,204 boxes**, checked **1,602,524 voxels**, and found **0 violations** (1,356 Mixed, 608
 AllSolid, 596 AllAir). A violation would reopen §6.2; this run did not.
 
+### Corpus-free measurement (2026-09-04)
+
+The proposed alternative to copying correlations from examples was measured directly. The structure
+recipe is shared by all three arms, so only parameter provenance changes:
+
+* **Corpus blend (today):** the existing exact-archetype weighted parent blend, ±15% spread jitter,
+  and final metadata clamps.
+* **Naive uniform:** every live scalar is independently uniform in the same finite corpus-free
+  envelope. No authored vector, default vector, blend, or corpus spread is read.
+* **Constraint-sampled:** independent geometry quantities are drawn; dependent quantities are
+  calculated from the relations below, then the same envelope is applied as a final safety net.
+
+There is an important wording issue in Part A: most fields have only `ClampMin` and no finite
+`ClampMax` (`VoxelStrateTypes.h` has 135 minimums and 52 maximums across 216 UPROPERTYs), while
+the native tunnel fields have no reflected metadata. “Uniform within clamps” is therefore undefined
+for much of the parameter space. For this measurement, `VF_GetCorpusFreeRange` declares finite
+H-relative operational envelopes for those fields; it does not use a corpus value or a default value
+as a range. The exact envelope is in `VoxelStrateComposer.cpp:1087-1278`, and both corpus-free arms
+use it so the comparison is fair. This makes the naive result conditional on an explicit finite
+support, which is a spec caveat rather than a hidden tuning target.
+
+#### Declared relations
+
+These are sufficient conservative relations for the experiment, derived from the existing generator
+equations. They are not claimed to be invariants of every existing authored asset; the audit below
+checks that question rather than assuming it.
+
+| relation | declaration used by `ConstraintSampled` | code that supplies the geometry/math |
+|---|---|---|
+| Room placement, overlap, and isolation | Let `S=RoomSpacing`, `D=RoomDensity`, and `R=MaxRoomRadius`. Draw target area coverage `C = πR²D/S²` in `0.08..0.18`; derive `R = S*sqrt(C/(πD))`; require `C∈[0.02,0.35]` and `R≤S/2`. The coverage interval is an explicit experiment support for the room occupancy equation, not a generator hard limit. | `VoxelCaveMorphology.cpp:1305-1326` rolls room existence, jitter, and radius; `VoxelCaveMorphology.cpp:1319-1320` gives the `[0.15,0.85]` cell jitter. Implemented/validated at `VoxelStrateComposer.cpp:1522-1540` and `:3094-3104`. |
+| Tunnel reach | Neighboring-room horizontal jitter can be `1.7S` in each axis, hence `1.7S√2`; vertical center separation can be `2*R*RoomHeightRatio`. Derive `MaxTunnelLength` as at least the Euclidean sum of those bounds. This matches the generator’s distance gate. | `VoxelCaveMorphology.cpp:1388` and `:1502` reject out-of-reach links; implemented/validated at `VoxelStrateComposer.cpp:1557-1564` and `:3114-3121`. |
+| Room vertical fit | `BoundarySealThickness + max(MaxRoomRadius,OriginRoomRadius)*RoomHeightRatio < H/2`, because room centers are restricted to the seal-free interval and the room Z radius is `Radius*RoomHeightRatio`. | `VoxelCaveMorphology.cpp:137-140` and `:248-250` establish the room/seal buffer; validated at `VoxelStrateComposer.cpp:3106-3112`. |
+| Slab floor/ceiling | Worst floor is `H*FloorRelativeHeight + 1.25*FloorRoughness`; worst ceiling is `H*CeilingRelativeHeight - 1.25*CeilingRoughness`. Derive both relative heights from seal + clearance and require a two-voxel void. | `VoxelCaveMorphology.cpp:329-362` and `VoxelGenerator.cpp:2175-2212`; implemented/validated at `VoxelStrateComposer.cpp:1602-1626` and `:3143-3185`. |
+| Maze corridor | Derive `CorridorRadius = CellSize*(0.12..0.24)` so it leaves lattice wall; cap roughness below `CorridorRadius+2` so the centerline remains carveable. | `VoxelCaveMorphology.cpp:428-458` bounds the lattice; `VoxelGenerator.cpp:2412-2432` applies roughness and subtracts `2*BaseDensity`; implemented/validated at `VoxelStrateComposer.cpp:1629-1642` and `:3188-3216`. |
+| Surface ground/cap and height features | The structural height is bounded by `ElevationRange*(1+MountainStrength)+2*1.25*SurfaceRoughness`. Add conservative budgets for cliff displacement (`CliffStrength*CliffSharpness` times that spread), terrace step, layer depth, and beach width. Derive `BaseGroundRelative` above the bottom seal and `CeilingRelative` below the top seal with cap roughness, undulation, ridge, overhang height, and two-voxel headroom. Cliff is sampled as a scalar and reduced only when this derived height budget cannot contain it. | `VoxelGenerator.cpp:2470-2517` is the structural height equation; `:2537-2557` is the cliff remap; `:2607-2654` is the cap; `:2670-2686` caps overhang height. Implemented/validated at `VoxelStrateComposer.cpp:1645-1724` and `:3219-3269`. |
+| Vertical shafts and ledges | Require `ShaftMaxRadius≤ShaftSpacing/2`; require `ShaftMinRadius > 1.5*1.25*SurfaceRoughness + 0.25`; derive `ConnectorRadius > 1.5*1.25*SurfaceRoughness + 1`; derive ledge spacing greater than `2*(LedgeDepth + floor-clearance)`. | `VoxelCaveMorphology.cpp:628-654` moves landings out of roughness/ledge bands; `VoxelGenerator.cpp:3944-3954` derives tree roughness reach and `:4209-4214` applies ledges; implemented/validated at `VoxelStrateComposer.cpp:1730-1755` and `:3272-3310`. |
+| Floating islands | Require `IslandMaxRadius≤IslandSpacing/2`; derive island radius and thickness so `BoundarySealThickness + max(0.2R,ThicknessRatio*R) < H/2`; require the minimum radius to exceed roughness plus SDF blend. | `VoxelCaveMorphology.cpp:852-935` computes island radius, underside, warp, and blend pad; `VoxelGenerator.cpp:4268-4344` starts with void and fills the island; implemented/validated at `VoxelStrateComposer.cpp:1757-1780` and `:3313-3355`. |
+| Density sign/carve strength | Every solid-starting family samples `BaseDensity>0`; tunnel worm strength is derived above base density, and the maze/shaft/island paths use the existing ±`2*BaseDensity` carve/fill convention. | `VoxelGenerator.cpp:1059`, `:2085`, `:2359-2432`, `:3944-3954`, `:4200`, and `:4272`; the relation checks are in `VoxelStrateComposer.cpp:3029-3355`. |
+
+Bools and enums are categorical, not arithmetic constraints. `bTunnelsFlowTowardOrigin` is a fair
+50/50 draw; `OriginRoomMaxConnections` is an integer draw in the declared `0..12` support; and
+`RoughnessNoiseType` is a uniform draw over all four enum values. Reflected boolean fields in the
+sibling families are also fair 50/50. There are currently no non-tunnel reflected enums. The
+category stream is separate from the scalar stream so neither arm’s scalar coupling changes the
+categorical policy. The sampler is deterministic in `(archetype, seed, index, mode, H)`, uses no
+retained RNG state, and clamps only after dependent equations (`VoxelStrateComposer.cpp:1782-1841`).
+
+#### The actual three-way result
+
+The requested **256×3** run was started and stopped after roughly six minutes without reaching an
+aggregate report. A 64×3 attempt (including a repeat after law traversal was made conditional on
+passing the fragmentation gate) also exceeded roughly 27 minutes without an aggregate report. Those
+partial runs are not data. The completed equal-arm run therefore used **16 candidates per arm**;
+all three arms ran the same 16 structure recipes, step-4 measurement over radius 256, `MaxCells=
+8,000,000`, and one fixed arrival/departure pair. Criterion precedence is **vacuous → fragmented
+(`LargestComponentShare < 0.50`) → law failed**. Law is intentionally skipped for fragmented
+candidates because the earlier criterion already decides the candidate; `law skipped` is reported
+separately. The completed test took **22.995 s** internally (**22.980 s** in roll/measurement).
+
+| approach | survival | vacuous | fragmented | law failed | air range | walkable range | feature scale range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| corpus blend (today) | 13/16 (81.2%) | 0 | 1 | 2 | 0.003291..0.999878 | 0.000000..0.318692 | 4..332 |
+| naive uniform | 7/16 (43.8%) | 3 | 3 | 3 | 0.003471..1.000000 | 0.000000..0.163436 | 0..152 |
+| constraint-sampled | 7/16 (43.8%) | 3 | 5 | 1 | 0.002636..1.000000 | 0.000000..0.220178 | 0..52 |
+
+The intermediate gates were corpus `16 non-vacuous / 15 largest-enough / 13 law passes`, naive
+`13 / 10 / 7`, and constrained `13 / 8 / 7`. Observed law failures were 2, 3, and 1
+respectively; the other candidates that did not reach the law were the reported fragmented cases.
+No roll, build, measurement, stack-count, channel-order, or context failure occurred.
+
+The constrained survivors are valid but not as good as the corpus survivors in this run:
+
+| approach | survivor count | air range (mean) | walkable range (mean) | feature scale range (mean) |
+|---|---:|---:|---:|---:|
+| corpus blend (today) | 13 | 0.022004..0.999878 (0.801809) | 0.000000..0.318692 (0.066071) | 4..332 (92.307693) |
+| naive uniform | 7 | 0.542744..0.996999 (0.856300) | 0.000068..0.044617 (0.012566) | 12..152 (64.571426) |
+| constraint-sampled | 7 | 0.801857..0.976726 (0.886178) | 0.000237..0.047382 (0.012851) | 16..52 (31.428572) |
+
+The constraint arm tied naive survival at 7/16, traded three naive law failures for five
+fragmentation failures, and produced a higher mean air fraction but dramatically lower walkable and
+feature-scale ranges than the corpus survivors. With only seven survivors in each corpus-free arm,
+this is evidence of a quality gap, not a claim about a stable population distribution; it is already
+enough to reject “technically valid means equivalent.”
+
+#### Box-law and authored-corpus audit
+
+Every arm performed 40 box probes per candidate. Non-`Mixed` verdicts were brute-forced over the
+same unit lattice: **0 violations** in all arms.
+
+| approach | Mixed | AllSolid | AllAir | proved | voxels checked | violations |
+|---|---:|---:|---:|---:|---:|---:|
+| corpus blend (today) | 444 | 69 | 127 | 196 | 260,876 | 0 |
+| naive uniform | 330 | 168 | 142 | 310 | 412,610 | 0 |
+| constraint-sampled | 378 | 90 | 172 | 262 | 348,722 | 0 |
+| **total** | **1,152** | **327** | **441** | **768** | **673,486** | **0** |
+
+The constraint sampler produced **0 declared-parameter violations** and stopped-on-violation count
+0. `WorldRadiusVoxels` remained **0**. The shared structure recipe had 0 determinism failures;
+each arm had 0 parameter-roll determinism failures, 0 invalid stack counts, 0 channel-order
+failures, and 0 context violations.
+
+The same declared relations were audited against all 12 current corpus vectors. **3/12 violate**
+the conservative experiment relations:
+
+* `DA_Strate3` (`TunnelNetwork`, H=128): room area coverage `2.68447`, above the declared `0.35`
+  upper support.
+* `Default_SurfaceWorld` (`SurfaceWorld`, H=128): conservative ground lower bound `-15.35`,
+  below the bottom seal `4`.
+* `Default_VerticalShafts` (`VerticalShafts`, H=128): minimum shaft radius `5`, below the roughness
+  margin `5.875`.
+
+These are findings about the proposed sufficient relations, not proof that those authored worlds
+are visibly broken: two are deliberately worst-case bounds and the first is an occupancy heuristic.
+The corpus is living outside the new constraint envelope in three places, so the envelope cannot be
+silently promoted to a universal validator without either weakening it or changing those assets.
+
+#### Verdict
+
+The corpus is still load-bearing for quality. Keep the corpus-blend arm in production and use the
+constraint sampler as a corpus-free exploratory/bootstrap arm whose passing candidates can enter
+Tier 5 promotion. Do not replace the production arm with naive uniform rolling. The data does not
+justify dropping the handmade vectors today; it supports keeping them while promotion gradually
+dilutes their share. A future larger sample is warranted after optimizing the fixed law/box pass,
+but it should be treated as confirmation, not as permission to tune these observed counts.
+
 ### 3.4 The measurement pass — one grid, one flood fill, three jobs
 
 Sample a candidate strate into a coarse voxel grid, flood-fill the air **once**, derive everything from
