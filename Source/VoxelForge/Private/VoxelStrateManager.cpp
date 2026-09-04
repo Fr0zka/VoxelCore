@@ -9,6 +9,36 @@
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 
+#if WITH_EDITOR
+#include "VoxelStrateComposer.h"
+
+struct FVoxelStrateComposerSlotOverride
+{
+    int32 CandidateSeed = 0;
+    ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FVoxelStrateArchetypeParams Params;
+    bool bUseRecipe = false;
+    FVoxelOpStackRecipe Recipe;
+};
+
+static void VF_SetComposerRuntimeBounds(
+    FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ)
+{
+    Params.TunnelNetworkParams.StrateTopWorldZ = TopWorldZ;
+    Params.TunnelNetworkParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.SlabParams.StrateTopWorldZ = TopWorldZ;
+    Params.SlabParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.MazeParams.StrateTopWorldZ = TopWorldZ;
+    Params.MazeParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.SurfaceParams.StrateTopWorldZ = TopWorldZ;
+    Params.SurfaceParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.VerticalShaftParams.StrateTopWorldZ = TopWorldZ;
+    Params.VerticalShaftParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.FloatingIslandParams.StrateTopWorldZ = TopWorldZ;
+    Params.FloatingIslandParams.StrateBottomWorldZ = BottomWorldZ;
+}
+#endif
+
 // Fractal Brownian Motion (layered Perlin) along a 1D parameter, ~[-1,1].
 // Independent octaves at increasing frequency / decreasing amplitude give an organic,
 // non-repeating wander — the key to a worm that SQUIRMS instead of zig-zagging (1D) or
@@ -35,6 +65,11 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
     }
 
     StrateLayout.Empty();
+#if WITH_EDITOR
+    // A full layout rebuild discards any temporary walk-through candidate. The world calls this
+    // under FScopedGenerationPause, so no worker can observe the map while it is being cleared.
+    ComposerOverrides.Reset();
+#endif
 
     const int32 TotalStrates = Settings->TotalStrates;
 
@@ -239,6 +274,125 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
     // Generate passages between consecutive strates
     GeneratePassages();
 }
+
+#if WITH_EDITOR
+const FVoxelStrateComposerSlotOverride* UVoxelStrateManager::FindComposerOverride(
+    int32 StrateIndex) const
+{
+    const TSharedPtr<FVoxelStrateComposerSlotOverride>* Found = ComposerOverrides.Find(StrateIndex);
+    return Found != nullptr ? Found->Get() : nullptr;
+}
+
+bool UVoxelStrateManager::SetComposerOverrideForStrate(
+    int32 StrateIndex, int32 CandidateSeed, ECaveGeneratorType Archetype,
+    const FVoxelStrateArchetypeParams& Params, bool bUseRecipe,
+    const FVoxelOpStackRecipe* Recipe, FString& OutError)
+{
+    OutError.Reset();
+
+    const FStrateSlot* TargetSlot = nullptr;
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.StrateIndex == StrateIndex)
+        {
+            TargetSlot = &Slot;
+            break;
+        }
+    }
+    if (TargetSlot == nullptr || TargetSlot->Definition == nullptr)
+    {
+        OutError = FString::Printf(TEXT("Strate index %d is not present in the live layout."), StrateIndex);
+        return false;
+    }
+
+    switch (Archetype)
+    {
+    case ECaveGeneratorType::TunnelNetwork:
+    case ECaveGeneratorType::FlatPlain:
+    case ECaveGeneratorType::CrystalChamber:
+    case ECaveGeneratorType::Maze:
+    case ECaveGeneratorType::SurfaceWorld:
+    case ECaveGeneratorType::VerticalShafts:
+    case ECaveGeneratorType::FloatingIslands:
+    case ECaveGeneratorType::Underwater:
+        break;
+    default:
+        OutError = TEXT("The composer returned an unsupported strate archetype.");
+        return false;
+    }
+
+    if (bUseRecipe && Recipe == nullptr)
+    {
+        OutError = TEXT("A structure candidate did not provide a recipe.");
+        return false;
+    }
+
+    TSharedPtr<FVoxelStrateComposerSlotOverride> Override =
+        MakeShared<FVoxelStrateComposerSlotOverride>();
+    Override->CandidateSeed = CandidateSeed;
+    Override->Archetype = Archetype;
+    Override->Params = Params;
+    VF_SetComposerRuntimeBounds(
+        Override->Params,
+        (float)(TargetSlot->TopChunkZ + 1) * CHUNK_SIZE,
+        (float)TargetSlot->BottomChunkZ * CHUNK_SIZE);
+    Override->bUseRecipe = bUseRecipe;
+    if (Recipe != nullptr)
+    {
+        Override->Recipe = *Recipe;
+    }
+
+    // Only one slot is overridden at a time. Keeping this map small also makes the worker-side
+    // copy-on-chunk-refetch cheap. Passage geometry is deliberately not regenerated: the layout
+    // and its passages are unchanged, and this is the same manager state used by the offline
+    // candidate measurement harness.
+    ComposerOverrides.Reset();
+    ComposerOverrides.Add(StrateIndex, MoveTemp(Override));
+
+    // This is both the passage-shortlist invalidation counter and the cache key used by the
+    // generator's per-chunk params/stack memos. The world has already paused all readers.
+    ++PassagesVersion;
+    return true;
+}
+
+bool UVoxelStrateManager::GetComposerOverrideForChunk(
+    const FIntVector& ChunkCoord, int32& OutCandidateSeed,
+    ECaveGeneratorType& OutArchetype, FVoxelStrateArchetypeParams& OutParams,
+    bool& bOutUseRecipe, FVoxelOpStackRecipe& OutRecipe) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0)
+    {
+        return false;
+    }
+
+    const FVoxelStrateComposerSlotOverride* Override =
+        FindComposerOverride(StrateLayout[SlotIdx].StrateIndex);
+    if (Override == nullptr)
+    {
+        return false;
+    }
+
+    OutCandidateSeed = Override->CandidateSeed;
+    OutArchetype = Override->Archetype;
+    OutParams = Override->Params;
+    bOutUseRecipe = Override->bUseRecipe;
+    OutRecipe = Override->Recipe;
+    return true;
+}
+
+bool UVoxelStrateManager::HasComposerRecipeOverride() const
+{
+    for (const TPair<int32, TSharedPtr<FVoxelStrateComposerSlotOverride>>& Pair : ComposerOverrides)
+    {
+        if (Pair.Value.IsValid() && Pair.Value->bUseRecipe)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 //=============================================================================
 // PASSAGE GENERATION
@@ -935,6 +1089,14 @@ ECaveGeneratorType UVoxelStrateManager::GetGeneratorTypeForChunk(const FIntVecto
         return ECaveGeneratorType::TunnelNetwork;
     }
 
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override =
+        FindComposerOverride(StrateLayout[SlotIdx].StrateIndex))
+    {
+        return Override->Archetype;
+    }
+#endif
+
     return StrateLayout[SlotIdx].Definition->GeneratorType;
 }
 
@@ -942,6 +1104,15 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
 {
     const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
     if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) { return false; }
+
+#if WITH_EDITOR
+    if (FindComposerOverride(StrateLayout[SlotIdx].StrateIndex) != nullptr)
+    {
+        // Temporary composer candidates are measured through the stack path. Do not inherit an
+        // unrelated asset flag from the slot being replaced.
+        return true;
+    }
+#endif
 
     const UVoxelStrateDefinition* Def = StrateLayout[SlotIdx].Definition;
     if (!Def->bUseOperatorStack) { return false; }
@@ -1018,8 +1189,23 @@ FSlabGenerationParams UVoxelStrateManager::GetSlabParamsForChunk(const FIntVecto
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
 
-    // Copy the designer-authored slab params from the strate definition.
-    FSlabGenerationParams Result = Slot.Definition->SlabParams;
+    // Copy the designer-authored slab params from the strate definition, unless an editor
+    // composer candidate owns this slot.
+    FSlabGenerationParams Result;
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override =
+        FindComposerOverride(Slot.StrateIndex))
+    {
+        Result = (Override->Archetype == ECaveGeneratorType::FlatPlain
+                  || Override->Archetype == ECaveGeneratorType::CrystalChamber)
+            ? Override->Params.SlabParams
+            : Slot.Definition->SlabParams;
+    }
+    else
+#endif
+    {
+        Result = Slot.Definition->SlabParams;
+    }
 
     // Fill in the runtime Z bounds (voxel coordinates, same convention as
     // FStrateGenerationParams::StrateTopWorldZ / StrateBottomWorldZ).
@@ -1034,32 +1220,111 @@ FSlabGenerationParams UVoxelStrateManager::GetSlabParamsForChunk(const FIntVecto
 // PER-ARCHETYPE PARAM GETTERS
 //=============================================================================
 // Each mirrors GetSlabParamsForChunk: copy designer params, fill runtime Z bounds.
-// No cross-boundary blending — archetypes meet at Hard boundaries. A macro keeps
-// the boilerplate (slot lookup + fallback + Z bounds) in one place.
+// No cross-boundary blending — archetypes meet at Hard boundaries.
 
-#define VF_ARCHETYPE_PARAMS_GETTER(FnName, StructType, DefMember)                       \
-StructType UVoxelStrateManager::FnName(const FIntVector& ChunkCoord) const              \
-{                                                                                      \
-    int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);                              \
-    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition)                              \
-    {                                                                                  \
-        StructType Empty;                                                              \
-        Empty.BaseDensity = -1.0f;                                                     \
-        return Empty;                                                                  \
-    }                                                                                  \
-    const FStrateSlot& Slot = StrateLayout[SlotIdx];                                   \
-    StructType Result = Slot.Definition->DefMember;                                    \
-    Result.StrateTopWorldZ    = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;              \
-    Result.StrateBottomWorldZ = (float)(Slot.BottomChunkZ)  * CHUNK_SIZE;              \
-    return Result;                                                                     \
+FMazeGenerationParams UVoxelStrateManager::GetMazeParamsForChunk(const FIntVector& ChunkCoord) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition)
+    {
+        FMazeGenerationParams Empty;
+        Empty.BaseDensity = -1.0f;
+        return Empty;
+    }
+
+    const FStrateSlot& Slot = StrateLayout[SlotIdx];
+    FMazeGenerationParams Result = Slot.Definition->MazeParams;
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
+    {
+        if (Override->Archetype == ECaveGeneratorType::Maze)
+        {
+            Result = Override->Params.MazeParams;
+        }
+    }
+#endif
+    Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+    Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+    return Result;
 }
 
-VF_ARCHETYPE_PARAMS_GETTER(GetMazeParamsForChunk,           FMazeGenerationParams,    MazeParams)
-VF_ARCHETYPE_PARAMS_GETTER(GetSurfaceParamsForChunk,        FSurfaceGenerationParams, SurfaceParams)
-VF_ARCHETYPE_PARAMS_GETTER(GetVerticalShaftParamsForChunk,  FVerticalShaftParams,     VerticalShaftParams)
-VF_ARCHETYPE_PARAMS_GETTER(GetFloatingIslandParamsForChunk, FFloatingIslandParams,    FloatingIslandParams)
+FSurfaceGenerationParams UVoxelStrateManager::GetSurfaceParamsForChunk(const FIntVector& ChunkCoord) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition)
+    {
+        FSurfaceGenerationParams Empty;
+        Empty.BaseDensity = -1.0f;
+        return Empty;
+    }
 
-#undef VF_ARCHETYPE_PARAMS_GETTER
+    const FStrateSlot& Slot = StrateLayout[SlotIdx];
+    FSurfaceGenerationParams Result = Slot.Definition->SurfaceParams;
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
+    {
+        if (Override->Archetype == ECaveGeneratorType::SurfaceWorld)
+        {
+            Result = Override->Params.SurfaceParams;
+        }
+    }
+#endif
+    Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+    Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+    return Result;
+}
+
+FVerticalShaftParams UVoxelStrateManager::GetVerticalShaftParamsForChunk(const FIntVector& ChunkCoord) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition)
+    {
+        FVerticalShaftParams Empty;
+        Empty.BaseDensity = -1.0f;
+        return Empty;
+    }
+
+    const FStrateSlot& Slot = StrateLayout[SlotIdx];
+    FVerticalShaftParams Result = Slot.Definition->VerticalShaftParams;
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
+    {
+        if (Override->Archetype == ECaveGeneratorType::VerticalShafts)
+        {
+            Result = Override->Params.VerticalShaftParams;
+        }
+    }
+#endif
+    Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+    Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+    return Result;
+}
+
+FFloatingIslandParams UVoxelStrateManager::GetFloatingIslandParamsForChunk(const FIntVector& ChunkCoord) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition)
+    {
+        FFloatingIslandParams Empty;
+        Empty.BaseDensity = -1.0f;
+        return Empty;
+    }
+
+    const FStrateSlot& Slot = StrateLayout[SlotIdx];
+    FFloatingIslandParams Result = Slot.Definition->FloatingIslandParams;
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
+    {
+        if (Override->Archetype == ECaveGeneratorType::FloatingIslands)
+        {
+            Result = Override->Params.FloatingIslandParams;
+        }
+    }
+#endif
+    Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+    Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+    return Result;
+}
 
 FBiomeContext UVoxelStrateManager::GetBiomeContextForChunk(const FIntVector& ChunkCoord) const
 {
@@ -1156,6 +1421,20 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     }
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
+
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override =
+        FindComposerOverride(Slot.StrateIndex))
+    {
+        FStrateGenerationParams Result = Override->Params.TunnelNetworkParams;
+        Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+        Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+        // A candidate is a hard replacement of this slot. Do not blend its rolled vector with an
+        // authored neighbour at a boundary; this is also how the offline fixture measures it.
+        return Result;
+    }
+#endif
+
     FStrateGenerationParams BaseParams = BuildParamsFromDefinition(Slot.Definition);
 
     //=========================================================================

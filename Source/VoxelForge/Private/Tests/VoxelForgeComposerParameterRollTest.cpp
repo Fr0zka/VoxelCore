@@ -816,8 +816,18 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     const double RollAndMeasureStartSeconds = FPlatformTime::Seconds();
     for (int32 CandidateIndex = 0; CandidateIndex < NumCandidates; ++CandidateIndex)
     {
+#if WITH_EDITOR
+        // The PIE hand-off and this test deliberately cross the same seam. The wrapper only
+        // packages the exact parameter-roll call below; it must not grow a second RNG path.
+        const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
+            Corpus, AuthoredSettings->Seed, CandidateIndex, false);
+        const FVoxelStrateRollInfo& Roll = Candidate.ParameterRoll;
+        TestTrue(FString::Printf(TEXT("candidate %d hand-off roll is valid"), CandidateIndex),
+                 Candidate.bValid && Roll.bValid);
+#else
         const FVoxelStrateRollInfo Roll = VF_RollStrateParamsDetailed(
             Corpus, AuthoredSettings->Seed, CandidateIndex);
+#endif
         TestTrue(FString::Printf(TEXT("candidate %d roll is valid"), CandidateIndex), Roll.bValid);
 
         TotalBootstrapJitterFields += Roll.BootstrapJitterFieldCount;

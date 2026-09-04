@@ -15,6 +15,7 @@
 
 class UVoxelSettings;
 class UVoxelStrateDefinition;
+class UVoxelStrateManager;
 
 /** The one-bit identity choice at the root of a rolled structure. */
 UENUM(BlueprintType)
@@ -211,6 +212,32 @@ struct VOXELFORGE_API FVoxelStrateRollInfo
     TArray<FString> BootstrapJitterFieldNames;
 };
 
+#if WITH_EDITOR
+/**
+ * One candidate materialised by the same deterministic calls used by the offline composer tests.
+ * This is an editor-only hand-off object: it is never a reflected asset and never part of the
+ * shipping generation contract.
+ */
+struct VOXELFORGE_API FVoxelStrateComposerCandidate
+{
+    bool bValid = false;
+    FString FailureReason;
+
+    int32 Seed = 0;
+    int32 Index = 0;
+    bool bStructureRoll = false;
+
+    ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FVoxelStrateArchetypeParams ArchetypeParams;
+    FVoxelOpStackRecipe Recipe;
+
+    // Kept so automation/editor callers can audit the exact six independent structure blocks
+    // without re-rolling them through a second implementation.
+    FVoxelStrateRollInfo ParameterRoll;
+    TArray<FVoxelStrateRollInfo> StructureBlockRolls;
+};
+#endif
+
 /**
  * Known-good strate vectors plus their measured field spread.
  *
@@ -292,6 +319,32 @@ VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailedForArchetype(
 
 /** Pure structure roll: no retained RNG state and no corpus/runtime dependency. */
 VOXELFORGE_API FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index);
+
+#if WITH_EDITOR
+/**
+ * Roll one candidate for the editor walk-through path. Parameter rolls call
+ * VF_RollStrateParamsDetailed; structure rolls call VF_RollStrateStructure and the exact six
+ * VF_RollStrateParamsDetailedForArchetype block rolls used by the structure test.
+ */
+VOXELFORGE_API FVoxelStrateComposerCandidate VF_RollStrateCandidate(
+    const FVoxelStrateCorpus& Corpus, int32 Seed, int32 Index, bool bRollStructure);
+
+/**
+ * Build a parameter-roll candidate through the same archetype-to-stack mapping used by production
+ * GetDensityAt/ClassifyTile. This is editor-only so the offline composer remains absent from a
+ * shipping build; the result is used only for the post-apply density sanity check.
+ */
+VOXELFORGE_API bool VF_BuildNativeStrateStackForCandidate(
+    ECaveGeneratorType Archetype,
+    const FVoxelStrateArchetypeParams& Params,
+    int32 Seed,
+    float SpineRadius,
+    float WorldRadiusVoxels,
+    float EdgeSealThickness,
+    const UVoxelStrateManager* StrateManager,
+    FVoxelOpStack& OutStack,
+    FVoxelOpContext& OutContext);
+#endif
 
 /** Stable compact representation and equality/hash helpers for manifests and reports. */
 VOXELFORGE_API FString VF_FormatStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe);

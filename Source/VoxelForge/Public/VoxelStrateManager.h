@@ -24,6 +24,12 @@
 
 class UVoxelSettings;
 
+#if WITH_EDITOR
+struct FVoxelStrateArchetypeParams;
+struct FVoxelOpStackRecipe;
+struct FVoxelStrateComposerSlotOverride;
+#endif
+
 /**
  * FVoxelPassage — A navigable connection between two strates.
  *
@@ -142,6 +148,27 @@ public:
      * @param WorldSeed - Seed for randomizing non-fixed strates
      */
     void Initialize(UVoxelSettings* Settings, int32 WorldSeed);
+
+#if WITH_EDITOR
+    /**
+     * Install an editor-only candidate over one already-built slot. The slot's definition,
+     * dimensions, content, and passages remain intact; only the density archetype/parameters
+     * (or the materialised recipe) are replaced. The caller must hold the world's generation pause.
+     */
+    bool SetComposerOverrideForStrate(
+        int32 StrateIndex, int32 CandidateSeed, ECaveGeneratorType Archetype,
+        const FVoxelStrateArchetypeParams& Params, bool bUseRecipe,
+        const FVoxelOpStackRecipe* Recipe, FString& OutError);
+
+    /** Read the immutable editor override for a chunk into worker-local storage. */
+    bool GetComposerOverrideForChunk(
+        const FIntVector& ChunkCoord, int32& OutCandidateSeed,
+        ECaveGeneratorType& OutArchetype, FVoxelStrateArchetypeParams& OutParams,
+        bool& bOutUseRecipe, FVoxelOpStackRecipe& OutRecipe) const;
+
+    /** Custom recipes cannot be safely classified by the native ClassifyBox proof yet. */
+    bool HasComposerRecipeOverride() const;
+#endif
 
     //=========================================================================
     // QUERIES
@@ -326,9 +353,9 @@ protected:
     // Passages connecting consecutive strates
     TArray<FVoxelPassage> Passages;
 
-    // Bumped every time Passages is rebuilt (GeneratePassages). EvaluateModifierSDF keeps a
-    // thread_local per-chunk shortlist of nearby passages and uses this to invalidate it when
-    // the passage set changes — so stale indices are never read after a rebuild.
+    // Bumped every time Passages is rebuilt (GeneratePassages), and for an editor composer
+    // override. EvaluateModifierSDF and all generator thread_local memos use this to invalidate
+    // cached passage/strate data after either kind of live change.
     uint32 PassagesVersion = 0;
 
     // How many chunks at strate boundaries are blended (transition zone)
@@ -359,6 +386,11 @@ protected:
     // Find which slot a chunk Z coordinate falls into.
     // Returns INDEX into StrateLayout, or -1 if not found.
     int32 FindSlotIndexForChunkZ(int32 ChunkZ) const;
+
+#if WITH_EDITOR
+    const FVoxelStrateComposerSlotOverride* FindComposerOverride(int32 StrateIndex) const;
+    TMap<int32, TSharedPtr<FVoxelStrateComposerSlotOverride>> ComposerOverrides;
+#endif
 
     // Build FStrateGenerationParams from a strate definition:
     // copies base GenerationParams, then applies all referenced terrain op assets.

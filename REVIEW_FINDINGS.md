@@ -90,7 +90,10 @@ Legend: ✅ verified against code · ◻️ checklist box.
   like Box/Capsule already did (one diff-layer + remesh dispatch). *(2026-07-04)*
 - [x] **`VoxelContentManager.cpp`** — duplicated drain/reset loops → `DrainDecoResults()` +
   `ResetGridBuildState(FDecoGrid&)`. *(2026-07-04)*
-- [ ] **`EVoxelPassageType` vs `EVoxelPassageStyle`** — two overlapping passage-shape enums, both in
+- [x] **`EVoxelPassageType` vs `EVoxelPassageStyle`** — ✅ **CLOSED 2026-09-04 as WONTFIX**, enacting
+  the 2026-08-16 judgement below, which recommended closure and was then left open by oversight. No
+  code change; the two enums stay.
+  Two overlapping passage-shape enums, both in
   active use (11 refs). Consider consolidating to one. *(judgment call, not dead)*
   **JUDGED 2026-08-16 — LEAVE THEM. Recommendation: close this item rather than act on it.** They
   read as duplicates from the index and are not: `EVoxelPassageType` (`VoxelStrateTypes.h` ~42) is

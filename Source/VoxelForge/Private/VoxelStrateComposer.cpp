@@ -2270,6 +2270,131 @@ FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index)
     return Recipe;
 }
 
+#if WITH_EDITOR
+namespace
+{
+    struct FComposerStructureBlockSpec
+    {
+        EVoxelStrateParamBlock Block;
+        ECaveGeneratorType Archetype;
+        uint32 SeedSalt;
+    };
+
+    // Keep these salts in the composer implementation so the editor action and the offline
+    // structure test cannot silently acquire different block streams.
+    static const FComposerStructureBlockSpec GComposerStructureBlocks[] =
+    {
+        { EVoxelStrateParamBlock::TunnelNetwork,  ECaveGeneratorType::TunnelNetwork,  0x1001u },
+        { EVoxelStrateParamBlock::Slab,            ECaveGeneratorType::FlatPlain,       0x1003u },
+        { EVoxelStrateParamBlock::Maze,            ECaveGeneratorType::Maze,            0x1005u },
+        { EVoxelStrateParamBlock::Surface,         ECaveGeneratorType::SurfaceWorld,    0x1007u },
+        { EVoxelStrateParamBlock::VerticalShaft,   ECaveGeneratorType::VerticalShafts,  0x1009u },
+        { EVoxelStrateParamBlock::FloatingIsland,  ECaveGeneratorType::FloatingIslands, 0x100Bu },
+    };
+
+    void VF_CopyComposerBlock(FVoxelStrateArchetypeParams& OutParams,
+                              const FVoxelStrateRollInfo& Roll,
+                              ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            OutParams.TunnelNetworkParams = Roll.ArchetypeParams.TunnelNetworkParams;
+            break;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            OutParams.SlabParams = Roll.ArchetypeParams.SlabParams;
+            break;
+        case ECaveGeneratorType::Maze:
+            OutParams.MazeParams = Roll.ArchetypeParams.MazeParams;
+            break;
+        case ECaveGeneratorType::SurfaceWorld:
+            OutParams.SurfaceParams = Roll.ArchetypeParams.SurfaceParams;
+            break;
+        case ECaveGeneratorType::VerticalShafts:
+            OutParams.VerticalShaftParams = Roll.ArchetypeParams.VerticalShaftParams;
+            break;
+        case ECaveGeneratorType::FloatingIslands:
+            OutParams.FloatingIslandParams = Roll.ArchetypeParams.FloatingIslandParams;
+            break;
+        default:
+            break;
+        }
+    }
+
+    ECaveGeneratorType VF_ComposerArchetypeForRecipe(const FVoxelOpStackRecipe& Recipe)
+    {
+        switch (Recipe.StructuralParamBlock)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return ECaveGeneratorType::TunnelNetwork;
+        case EVoxelStrateParamBlock::Slab:           return ECaveGeneratorType::FlatPlain;
+        case EVoxelStrateParamBlock::Maze:           return ECaveGeneratorType::Maze;
+        case EVoxelStrateParamBlock::Surface:        return ECaveGeneratorType::SurfaceWorld;
+        case EVoxelStrateParamBlock::VerticalShaft:  return ECaveGeneratorType::VerticalShafts;
+        case EVoxelStrateParamBlock::FloatingIsland: return ECaveGeneratorType::FloatingIslands;
+        default:                                     return ECaveGeneratorType::TunnelNetwork;
+        }
+    }
+}
+
+FVoxelStrateComposerCandidate VF_RollStrateCandidate(
+    const FVoxelStrateCorpus& Corpus, int32 Seed, int32 Index, bool bRollStructure)
+{
+    FVoxelStrateComposerCandidate Candidate;
+    Candidate.Seed = Seed;
+    Candidate.Index = Index;
+    Candidate.bStructureRoll = bRollStructure;
+
+    if (!bRollStructure)
+    {
+        // This is the exact Tier 4a call used by the parameter-roll measurement test.
+        Candidate.ParameterRoll = VF_RollStrateParamsDetailed(Corpus, Seed, Index);
+        if (!Candidate.ParameterRoll.bValid)
+        {
+            Candidate.FailureReason = Candidate.ParameterRoll.FailureReason;
+            return Candidate;
+        }
+
+        Candidate.Archetype = Candidate.ParameterRoll.Archetype;
+        Candidate.ArchetypeParams = Candidate.ParameterRoll.ArchetypeParams;
+        Candidate.bValid = true;
+        return Candidate;
+    }
+
+    // This is the exact Tier 4b structure call plus the six independent native-family rolls used
+    // to materialise every structure candidate in the offline test.
+    Candidate.Recipe = VF_RollStrateStructure(Seed, Index);
+    Candidate.Archetype = VF_ComposerArchetypeForRecipe(Candidate.Recipe);
+    Candidate.StructureBlockRolls.Reserve(UE_ARRAY_COUNT(GComposerStructureBlocks));
+
+    bool bAllBlocksValid = true;
+    for (const FComposerStructureBlockSpec& Spec : GComposerStructureBlocks)
+    {
+        const FVoxelStrateRollInfo Roll = VF_RollStrateParamsDetailedForArchetype(
+            Corpus, Spec.Archetype, Seed ^ static_cast<int32>(Spec.SeedSalt), Index);
+        Candidate.StructureBlockRolls.Add(Roll);
+        if (!Roll.bValid)
+        {
+            bAllBlocksValid = false;
+            if (Candidate.FailureReason.IsEmpty())
+            {
+                Candidate.FailureReason = FString::Printf(
+                    TEXT("parameter block %d (%s) failed: %s"),
+                    static_cast<int32>(Spec.Block),
+                    VF_GetStrateArchetypeName(Spec.Archetype),
+                    *Roll.FailureReason);
+            }
+            continue;
+        }
+        VF_CopyComposerBlock(Candidate.ArchetypeParams, Roll, Spec.Archetype);
+    }
+
+    Candidate.bValid = bAllBlocksValid;
+    return Candidate;
+}
+#endif
+
 FString VF_FormatStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe)
 {
     FString Modifiers;

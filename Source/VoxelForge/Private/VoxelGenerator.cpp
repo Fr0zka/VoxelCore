@@ -18,6 +18,10 @@
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 
+#if WITH_EDITOR
+#include "VoxelStrateComposer.h"
+#endif
+
 #include <atomic>
 
 //=============================================================================
@@ -589,6 +593,63 @@ namespace
     }
 }
 
+#if WITH_EDITOR
+bool VF_BuildNativeStrateStackForCandidate(
+    ECaveGeneratorType Archetype,
+    const FVoxelStrateArchetypeParams& Params,
+    int32 InSeed,
+    float SpineRadius,
+    float InWorldRadiusVoxels,
+    float InEdgeSealThickness,
+    const UVoxelStrateManager* StrateManager,
+    FVoxelOpStack& OutStack,
+    FVoxelOpContext& OutContext)
+{
+    FVoxelStackParamRefs Refs;
+    switch (Archetype)
+    {
+    case ECaveGeneratorType::FlatPlain:
+    case ECaveGeneratorType::CrystalChamber:
+        Refs.Slab = &Params.SlabParams;
+        break;
+    case ECaveGeneratorType::Maze:
+        Refs.Maze = &Params.MazeParams;
+        break;
+    case ECaveGeneratorType::SurfaceWorld:
+        // The live surface path can additionally carry biome-specific parameter arrays and a
+        // generator-owned biome field. The editor sanity check deliberately handles the exact
+        // no-biome/native case only; the caller reports a biome target as unavailable rather than
+        // comparing unlike fields.
+        Refs.Surface = &Params.SurfaceParams;
+        break;
+    case ECaveGeneratorType::VerticalShafts:
+        Refs.Vert = &Params.VerticalShaftParams;
+        break;
+    case ECaveGeneratorType::FloatingIslands:
+        Refs.Float = &Params.FloatingIslandParams;
+        break;
+    case ECaveGeneratorType::Underwater:
+    case ECaveGeneratorType::TunnelNetwork:
+        Refs.Tunnel = &Params.TunnelNetworkParams;
+        break;
+    default:
+        return false;
+    }
+
+    OutContext = FVoxelOpContext();
+    OutContext.Seed = static_cast<uint32>(InSeed);
+    OutContext.LayoutVersion = StrateManager != nullptr ? StrateManager->GetLayoutVersion() : 0;
+    OutContext.WorldRadiusVoxels = InWorldRadiusVoxels;
+    OutContext.EdgeSealThickness = InEdgeSealThickness;
+    if (!VF_BuildOpStackForChunk(Archetype, Refs, InSeed, SpineRadius, StrateManager,
+                                 OutStack, OutContext))
+    {
+        return false;
+    }
+    return true;
+}
+#endif
+
 UVoxelGenerator::UVoxelGenerator()
     : DensityCacheOwnerId(GNextDensityCacheOwnerId.fetch_add(1, std::memory_order_relaxed) + 1)
 {
@@ -675,6 +736,15 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
+#if WITH_EDITOR
+        // Editor-only composer override. The candidate recipe is copied into this worker-local
+        // cache on the same versioned refetch as the native params; no worker reads mutable editor
+        // state while the world is applying a new candidate.
+        thread_local bool                       CP_UseComposerRecipe = false;
+        thread_local int32                      CP_ComposerSeed = 0;
+        thread_local FVoxelStrateArchetypeParams CP_ComposerParams;
+        thread_local FVoxelOpStackRecipe        CP_ComposerRecipe;
+#endif
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
         const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
@@ -691,6 +761,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
+#if WITH_EDITOR
+            CP_UseComposerRecipe = false;
+            ECaveGeneratorType ComposerArchetype = ECaveGeneratorType::TunnelNetwork;
+            bool bComposerUseRecipe = false;
+            if (StrateManager->GetComposerOverrideForChunk(
+                ChunkCoord, CP_ComposerSeed, ComposerArchetype, CP_ComposerParams,
+                bComposerUseRecipe, CP_ComposerRecipe))
+            {
+                CP_GenType = ComposerArchetype;
+                CP_UseComposerRecipe = bComposerUseRecipe;
+            }
+#endif
             switch (CP_GenType)
             {
             case ECaveGeneratorType::FlatPlain:
@@ -725,6 +807,35 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (CP_UseOpStack)
             {
                 CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
+#if WITH_EDITOR
+                if (CP_UseComposerRecipe)
+                {
+                    FVoxelOpContext ComposerContext;
+                    if (VF_BuildStackFromRecipe(
+                        CP_ComposerRecipe, CP_ComposerParams, Seed,
+                        OriginSpineRadius, StrateManager, CP_OpStack, ComposerContext, nullptr))
+                    {
+                        ComposerContext.ChunkCoord = ChunkCoord;
+                        ComposerContext.Step = 1;
+                        ComposerContext.LayoutVersion = LayoutVersion;
+                        // The recipe builder supplies the candidate's vertical seal to the
+                        // structural post. The XY edge seal is global and uses live settings.
+                        ComposerContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                        ComposerContext.EdgeSealThickness = EdgeSealThickness;
+                        CP_OpStack.PrepareChunk(ComposerContext);
+                    }
+                    else
+                    {
+                        // The editor action validates before installing the override. Keep this
+                        // fallback safe if a future recipe changes underneath PIE: the native
+                        // candidate params remain available instead of yielding an uninitialised
+                        // stack or a hole.
+                        CP_UseOpStack = false;
+                    }
+                }
+                else
+#endif
+                {
                 FVoxelOpContext OpCtx;
                 OpCtx.ChunkCoord    = ChunkCoord;
                 OpCtx.Seed          = (uint32)Seed;
@@ -773,6 +884,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 // which is the point: the first op that hoists real per-chunk work must find the
                 // call already here.
                 if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
+                }
             }
         }
 
@@ -2783,6 +2895,16 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     }
 
     if (!StrateManager) return EVoxelTileClass::Mixed;
+
+#if WITH_EDITOR
+    // A custom recipe is deliberately not fed to the native ClassifyBox proof yet. Returning
+    // Mixed keeps the live walk-through hole-safe: GenerateMesh samples the exact recipe stack,
+    // while no optimistic AllAir/AllSolid result can skip a candidate tile.
+    if (StrateManager->HasComposerRecipeOverride())
+    {
+        return EVoxelTileClass::Mixed;
+    }
+#endif
 
     bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
     bool bCanAir   = true;   // "tout le treillis est air" encore prouvable

@@ -118,6 +118,15 @@ Provided per chunk by `StrateManager::GetDisturbanceParamsForChunk`.
 **If you add a connectivity rule with longer edges, the COLLECT region must still cover the
 max edge reach, and decisions must not depend on the stored window.**
 
+The editor composer walk-through preserves this invariant by avoiding a layout rebuild. AVoxelWorld::ApplyComposerCandidate
+pauses and drains active generation, installs one temporary override on an existing slot, increments
+the manager's layout/passages version, and then reuses RegenerateAllChunks to bump GenerationEpoch.
+The slot's Z range and passages therefore remain stable; worker tasks copy the immutable override during
+their versioned refetch. A parameter candidate uses the production native stack mapping, while a
+structure candidate uses VF_BuildStackFromRecipe; custom recipes conservatively return Mixed from
+ClassifyTile so no unproven box bound can skip their mesh. The bridge and its editable properties are
+WITH_EDITOR/WITH_EDITORONLY_DATA only and do not exist in a shipping build.
+
 ### 8.5 Content scatter & water — `VoxelContentManager.h/.cpp` (NEW)
 `UVoxelContentManager` (owned by `AVoxelWorld`, game-thread). TWO INDEPENDENT subsystems:
 
@@ -658,6 +667,14 @@ driven by `EditorBrush*` props.
 ### 8.11 Live tuning & debug (`AVoxelWorld`, CallInEditor / PIE)
 - `RebuildStrates` — re-reads ALL of `VoxelSettings` and rebuilds layout/gap/passages/spine +
   regenerates. Use after changing those (plain `RegenerateAllChunks` keeps the old layout/passages).
+- ApplyComposerCandidate — editor-only PIE walk-through for one offline candidate. Set
+  ComposerSeed, ComposerCandidateIndex, ComposerTargetStrateIndex (0 = topmost), and
+  bComposerRollStructure in Live Edit|Composer, then click Apply Composer Candidate. It uses the
+  shared composer roll, overlays density on the existing slot, pauses/drains workers, bumps the
+  manager version, and reuses RegenerateAllChunks for the epoch/re-stream. It does not rebuild
+  passages or change the authoritative Settings->Seed; RebuildStrates removes the overlay. The
+  action logs recipe, archetype, air/largest-component/walkable/feature metrics, and an eight-point
+  bit-level density verdict. The button itself still requires owner verification in PIE.
 - `ValidateDeterminism` (F2) — one-click §8.4 regression test: samples chunk-boundary points under
   two different thread_local cache alignments (left-chunk warm vs right-chunk warm) + a repeat
   pass; every delta must be EXACTLY 0. Run it after any hot-path refactor that claims

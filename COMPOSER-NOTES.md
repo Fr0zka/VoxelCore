@@ -84,7 +84,10 @@ a model over the candidates at zero runtime cost. **And Jahni reviews and vetoes
 publishes** — the system does the work, he keeps the veto.
 
 **What ships is small:** the season's seed plus the chosen strates' parameter vectors. Clients generate
-terrain from those, deterministically, exactly as today. **No runtime composition anywhere.**
+terrain from those, deterministically, exactly as today. **No composition is shipped or run in the
+normal game path.** The editor-only PIE inspection button described below is a deliberate debugging
+exception: it overlays one already-built slot so the owner can walk a measured candidate; it is not
+cooked, does not compose a season, and is cleared by RebuildStrates.
 
 ### 3.2 Structure: how a stack gets assembled
 
@@ -193,6 +196,26 @@ rerolls every recipe and rebuilt stack, checks `WorldRadiusVoxels == 0`, and fee
 through the offline Tier 2 sampler; no runtime generation path calls this API. The final focused
 test took **76.466 s**. The complete `VoxelForge` namespace then passed **24/24 tests (0 failed,
 0 not run)** in **339.797 s**.
+
+### 3.2a Editor walk-through hand-off (not a runtime composer)
+
+AVoxelWorld::ApplyComposerCandidate is the one editor-only bridge from this offline API to a live
+PIE world. It calls VF_RollStrateCandidate(Corpus, ComposerSeed, ComposerCandidateIndex,
+bComposerRollStructure). That wrapper delegates to the exact parameter/recipe calls exercised by
+the offline composer tests, then installs the result
+as a temporary density override on ComposerTargetStrateIndex. The layout slot's authored definition,
+height, content, and generated passages are intentionally unchanged; this avoids calling
+GeneratePassages while Initialize is half-built. The action pauses/drains generation, bumps the
+manager layout version, and reuses RegenerateAllChunks so GenerationEpoch invalidates stale mesh
+results and the normal streamer rebuilds the world.
+
+The Details-panel properties are ComposerSeed, ComposerCandidateIndex, ComposerTargetStrateIndex,
+and bComposerRollStructure, under Live Edit|Composer. The button is Apply Composer Candidate; it
+is usable only during PIE. RebuildStrates clears the temporary override. A post-apply eight-point
+density check compares the live generator with the same prepared candidate stack bit-for-bit when
+no diff edits, disturbance post, or surface-biome context makes the standalone oracle incomplete.
+The log line carries the recipe/archetype and the coarse metrics so it can be matched to a
+contact-sheet row. This hand-off is editor-only and is not part of the shipped composer contract.
 
 ### 3.3 Parameters: the range problem
 

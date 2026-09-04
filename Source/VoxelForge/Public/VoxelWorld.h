@@ -452,6 +452,30 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Live Edit")
     bool bLiveEditStrates = false;
 
+#if WITH_EDITORONLY_DATA
+    /** Seed passed to the deterministic offline composer roll. This does not change Settings->Seed. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Live Edit|Composer")
+    int32 ComposerSeed = 0;
+
+    /** Candidate row passed to VF_RollStrateCandidate (the offline tests use the same index). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Live Edit|Composer", meta = (ClampMin = "0"))
+    int32 ComposerCandidateIndex = 0;
+
+    /** Existing layout slot to replace; 0 is the topmost strate. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Live Edit|Composer", meta = (ClampMin = "0"))
+    int32 ComposerTargetStrateIndex = 0;
+
+    /** False rolls one native parameter vector; true rolls the structure recipe and its six blocks. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Live Edit|Composer")
+    bool bComposerRollStructure = false;
+#endif
+
+#if WITH_EDITOR
+    /** Roll and apply the selected offline composer candidate to one live PIE slot. */
+    UFUNCTION(CallInEditor, Category = "Live Edit|Composer")
+    void ApplyComposerCandidate();
+#endif
+
     /** Click to force-regenerate all chunks right now (useful during PIE). */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Live Edit")
     void RegenerateAllChunks();

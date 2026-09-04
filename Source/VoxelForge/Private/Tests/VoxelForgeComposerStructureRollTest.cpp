@@ -367,8 +367,17 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     const double RollAndMeasureStartSeconds = FPlatformTime::Seconds();
     for (int32 CandidateIndex = 0; CandidateIndex < NumCandidates; ++CandidateIndex)
     {
+#if WITH_EDITOR
+        // Keep the editor hand-off and the structure test on the same recipe/block roll seam.
+        const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
+            Corpus, AuthoredSettings->Seed, CandidateIndex, true);
+        TestTrue(FString::Printf(TEXT("candidate %d hand-off roll is valid"), CandidateIndex),
+                 Candidate.bValid);
+        const FVoxelOpStackRecipe Recipe = Candidate.Recipe;
+#else
         const FVoxelOpStackRecipe Recipe = VF_RollStrateStructure(
             AuthoredSettings->Seed, CandidateIndex);
+#endif
         const FVoxelOpStackRecipe RepeatRecipe = VF_RollStrateStructure(
             AuthoredSettings->Seed, CandidateIndex);
         TestTrue(FString::Printf(TEXT("candidate %d recipe reroll is identical"), CandidateIndex),
@@ -404,11 +413,24 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         FVoxelStrateArchetypeParams CandidateParams;
         bool bParameterRollsValid = true;
         double CandidateDistanceSquared = 0.0;
-        for (const FBlockSpec& Spec : GBlockSpecs)
+        for (int32 BlockIndex = 0; BlockIndex < UE_ARRAY_COUNT(GBlockSpecs); ++BlockIndex)
         {
+#if WITH_EDITOR
+            const FBlockSpec& Spec = GBlockSpecs[BlockIndex];
+            if (!Candidate.StructureBlockRolls.IsValidIndex(BlockIndex))
+            {
+                bParameterRollsValid = false;
+                AddError(FString::Printf(TEXT("candidate %d missing parameter block %d"),
+                                         CandidateIndex, static_cast<int32>(Spec.Block)));
+                continue;
+            }
+            const FVoxelStrateRollInfo& BlockRoll = Candidate.StructureBlockRolls[BlockIndex];
+#else
+            const FBlockSpec& Spec = GBlockSpecs[BlockIndex];
             const FVoxelStrateRollInfo BlockRoll = VF_RollStrateParamsDetailedForArchetype(
                 Corpus, Spec.Archetype,
                 AuthoredSettings->Seed ^ static_cast<int32>(Spec.SeedSalt), CandidateIndex);
+#endif
             if (!BlockRoll.bValid)
             {
                 bParameterRollsValid = false;

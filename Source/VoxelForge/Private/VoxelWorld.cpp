@@ -33,6 +33,11 @@
 #include "Misc/Paths.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
+#if WITH_EDITOR
+#include "VoxelStrateComposer.h"
+#include "VoxelStrateMeasure.h"
+#endif
+
 AVoxelWorld::AVoxelWorld()
 {
     PrimaryActorTick.bCanEverTick = true;
@@ -126,6 +131,228 @@ private:
     AVoxelWorld* World = nullptr;
     bool bAcquired = false;
 };
+
+#if WITH_EDITOR
+namespace
+{
+    void VF_SetComposerRuntimeBounds(FVoxelStrateArchetypeParams& Params,
+                                     float TopWorldZ, float BottomWorldZ)
+    {
+        Params.TunnelNetworkParams.StrateTopWorldZ = TopWorldZ;
+        Params.TunnelNetworkParams.StrateBottomWorldZ = BottomWorldZ;
+        Params.SlabParams.StrateTopWorldZ = TopWorldZ;
+        Params.SlabParams.StrateBottomWorldZ = BottomWorldZ;
+        Params.MazeParams.StrateTopWorldZ = TopWorldZ;
+        Params.MazeParams.StrateBottomWorldZ = BottomWorldZ;
+        Params.SurfaceParams.StrateTopWorldZ = TopWorldZ;
+        Params.SurfaceParams.StrateBottomWorldZ = BottomWorldZ;
+        Params.VerticalShaftParams.StrateTopWorldZ = TopWorldZ;
+        Params.VerticalShaftParams.StrateBottomWorldZ = BottomWorldZ;
+        Params.FloatingIslandParams.StrateTopWorldZ = TopWorldZ;
+        Params.FloatingIslandParams.StrateBottomWorldZ = BottomWorldZ;
+    }
+
+    float VF_ComposerBoundarySeal(const FVoxelStrateArchetypeParams& Params,
+                                  ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return Params.SlabParams.BoundarySealThickness;
+        case ECaveGeneratorType::Maze:
+            return Params.MazeParams.BoundarySealThickness;
+        case ECaveGeneratorType::SurfaceWorld:
+            return Params.SurfaceParams.BoundarySealThickness;
+        case ECaveGeneratorType::VerticalShafts:
+            return Params.VerticalShaftParams.BoundarySealThickness;
+        case ECaveGeneratorType::FloatingIslands:
+            return Params.FloatingIslandParams.BoundarySealThickness;
+        case ECaveGeneratorType::Underwater:
+        case ECaveGeneratorType::TunnelNetwork:
+        default:
+            return Params.TunnelNetworkParams.BoundarySealThickness;
+        }
+    }
+
+    class FComposerStackDensitySampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        explicit FComposerStackDensitySampler(const FVoxelOpStack& InStack)
+            : Stack(InStack) {}
+
+        float SampleDensity(float WorldX, float WorldY, float WorldZ) const override
+        {
+            return Stack.EvalMC(WorldX, WorldY, WorldZ);
+        }
+
+    private:
+        const FVoxelOpStack& Stack;
+    };
+
+    bool VF_BuildComposerReferenceStack(
+        const FVoxelStrateComposerCandidate& Candidate,
+        const UVoxelGenerator& Generator,
+        const UVoxelStrateManager& StrateManager,
+        int32 TargetTopChunkZ,
+        int32 TargetBottomChunkZ,
+        FVoxelOpStack& OutStack,
+        FVoxelOpContext& OutContext,
+        FString& OutError)
+    {
+        const float TopWorldZ = (float)(TargetTopChunkZ + 1) * CHUNK_SIZE;
+        const float BottomWorldZ = (float)TargetBottomChunkZ * CHUNK_SIZE;
+        FVoxelStrateArchetypeParams Params = Candidate.ArchetypeParams;
+        VF_SetComposerRuntimeBounds(Params, TopWorldZ, BottomWorldZ);
+
+        bool bBuilt = false;
+        if (Candidate.bStructureRoll)
+        {
+            bBuilt = VF_BuildStackFromRecipe(
+                Candidate.Recipe, Params, Generator.Seed, Generator.OriginSpineRadius,
+                &StrateManager, OutStack, OutContext, &OutError);
+        }
+        else
+        {
+            bBuilt = VF_BuildNativeStrateStackForCandidate(
+                Candidate.Archetype, Params, Generator.Seed, Generator.OriginSpineRadius,
+                Generator.WorldRadiusVoxels, Generator.EdgeSealThickness, &StrateManager,
+                OutStack, OutContext);
+            if (!bBuilt && OutError.IsEmpty())
+            {
+                OutError = TEXT("The production native candidate stack could not be materialised.");
+            }
+        }
+        if (!bBuilt)
+        {
+            return false;
+        }
+
+        // The recipe builder deliberately defaults the world-edge context to 0 for offline
+        // measurements. A live candidate must use the actual world's edge law, while its
+        // vertical bounds and structural seal remain candidate-owned.
+        const int32 MidChunkZ = TargetBottomChunkZ
+            + (TargetTopChunkZ - TargetBottomChunkZ) / 2;
+        OutContext.ChunkCoord = FIntVector(0, 0, MidChunkZ);
+        OutContext.Step = 1;
+        OutContext.LayoutVersion = StrateManager.GetLayoutVersion();
+        OutContext.WorldRadiusVoxels = Generator.WorldRadiusVoxels;
+        OutContext.EdgeSealThickness = Generator.EdgeSealThickness;
+        OutStack.PrepareChunk(OutContext);
+        return true;
+    }
+
+    bool VF_ComposerReferenceIsComparable(
+        const AVoxelWorld& World,
+        const FStrateSlot& TargetSlot,
+        ECaveGeneratorType Archetype,
+        const FIntVector& RepresentativeChunk,
+        FString& OutReason)
+    {
+        OutReason.Reset();
+        if (World.DiffLayer && World.DiffLayer->HasAnyMods())
+        {
+            OutReason = TEXT("diff-layer-modifications-present");
+            return false;
+        }
+
+        const FStrateDisturbanceParams Disturbances =
+            World.StrateManager->GetDisturbanceParamsForChunk(RepresentativeChunk);
+        if (Disturbances.ChasmDensity > 0.0f
+            || Disturbances.BridgeDensity > 0.0f
+            || Disturbances.RidgeDensity > 0.0f)
+        {
+            OutReason = TEXT("live-disturbance-post-present");
+            return false;
+        }
+
+        // The production SurfaceWorld stack may include a generator-owned biome field and
+        // per-biome params. The standalone candidate stack intentionally does not invent that
+        // context; fall back to the live metric and mark the density check as unavailable.
+        if (Archetype == ECaveGeneratorType::SurfaceWorld
+            && TargetSlot.Definition != nullptr
+            && TargetSlot.Definition->Biomes.Num() > 0)
+        {
+            OutReason = TEXT("surface-biome-context-present");
+            return false;
+        }
+        return true;
+    }
+
+    FVoxelStrateMeasureSettings VF_ComposerMeasureSettings()
+    {
+        FVoxelStrateMeasureSettings Settings;
+        Settings.SampleStep = 4;
+        Settings.RadiusInVoxels = 256;
+        Settings.CenterXY = FVector2D::ZeroVector;
+        Settings.MaxCells = 8000000;
+        Settings.MaxRouteRetries = 16;
+        Settings.HeadroomCells = 2;
+        Settings.InteriorMarginVoxels = -1;
+        return Settings;
+    }
+
+    bool VF_ComposerDensitySanityCheck(
+        const UVoxelGenerator& Generator,
+        const FVoxelOpStack& ReferenceStack,
+        int32 TargetTopChunkZ,
+        int32 TargetBottomChunkZ,
+        float& OutMaxDelta,
+        int32& OutMismatches,
+        int32& OutSamples)
+    {
+        // Keep all probes inside one representative chunk column where possible. This exercises
+        // both the live thread-local refetch and the prepared reference stack without making the
+        // check depend on a particular room being present at a hand-picked coordinate.
+        static const FIntVector Offsets[] =
+        {
+            FIntVector(1, 1, -15),
+            FIntVector(7, 13, -7),
+            FIntVector(17, 3, 1),
+            FIntVector(29, 27, 9),
+            FIntVector(3, 23, 17),
+            FIntVector(19, 19, 25),
+            FIntVector(11, 29, 31),
+            FIntVector(27, 5, -23),
+        };
+
+        const int32 MidChunkZ = TargetBottomChunkZ
+            + (TargetTopChunkZ - TargetBottomChunkZ) / 2;
+        const int32 BottomWorldZ = TargetBottomChunkZ * CHUNK_SIZE;
+        const int32 TopWorldZExclusive = (TargetTopChunkZ + 1) * CHUNK_SIZE;
+        const int32 MidWorldZ = MidChunkZ * CHUNK_SIZE + CHUNK_SIZE / 2;
+
+        OutMaxDelta = 0.0f;
+        OutMismatches = 0;
+        OutSamples = 0;
+        for (const FIntVector& Offset : Offsets)
+        {
+            const float X = (float)Offset.X;
+            const float Y = (float)Offset.Y;
+            const float Z = (float)FMath::Clamp(
+                MidWorldZ + Offset.Z, BottomWorldZ + 1, TopWorldZExclusive - 1);
+            const float Live = Generator.GetDensityAt(X, Y, Z);
+            const float Reference = ReferenceStack.EvalMC(X, Y, Z);
+
+            uint32 LiveBits = 0;
+            uint32 ReferenceBits = 0;
+            FMemory::Memcpy(&LiveBits, &Live, sizeof(LiveBits));
+            FMemory::Memcpy(&ReferenceBits, &Reference, sizeof(ReferenceBits));
+            const bool bBitEqual = LiveBits == ReferenceBits;
+            if (!bBitEqual)
+            {
+                ++OutMismatches;
+            }
+
+            const float Delta = (FMath::IsFinite(Live) && FMath::IsFinite(Reference))
+                ? FMath::Abs(Live - Reference) : FLT_MAX;
+            OutMaxDelta = FMath::Max(OutMaxDelta, Delta);
+            ++OutSamples;
+        }
+        return OutMismatches == 0;
+    }
+}
+#endif
 
 //=============================================================================
 // LIVE EDIT — regenerate all chunks when params change in the Details panel
@@ -270,6 +497,210 @@ void AVoxelWorld::ValidateDeterminism()
 }
 
 #if WITH_EDITOR
+void AVoxelWorld::ApplyComposerCandidate()
+{
+    UWorld* World = GetWorld();
+    if (World == nullptr || !World->IsPlayInEditor())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: run this button from a PIE world."));
+        return;
+    }
+    if (bShuttingDown.load(std::memory_order_acquire)
+        || bGenerationPaused.load(std::memory_order_acquire))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: generation is already stopping or paused."));
+        return;
+    }
+    if (!Settings || !Generator || !StrateManager)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: BeginPlay has not initialized Settings, Generator, and StrateManager."));
+        return;
+    }
+
+    const TArray<FStrateSlot>& Layout = StrateManager->GetLayout();
+    const FStrateSlot* TargetSlot = nullptr;
+    for (const FStrateSlot& Slot : Layout)
+    {
+        if (Slot.StrateIndex == ComposerTargetStrateIndex)
+        {
+            TargetSlot = &Slot;
+            break;
+        }
+    }
+    if (TargetSlot == nullptr || TargetSlot->Definition == nullptr)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: ComposerTargetStrateIndex=%d is not a live layout slot (layout has %d slots)."),
+            ComposerTargetStrateIndex, Layout.Num());
+        return;
+    }
+
+    FVoxelStrateCorpus Corpus;
+    FString CorpusReport;
+    if (!Corpus.LoadFromAssetRegistry(CorpusReport))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: composer corpus is unavailable: %s"),
+            *CorpusReport);
+        return;
+    }
+
+    const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
+        Corpus, ComposerSeed, ComposerCandidateIndex, bComposerRollStructure);
+    if (!Candidate.bValid)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: seed=%d index=%d roll failed: %s"),
+            ComposerSeed, ComposerCandidateIndex, *Candidate.FailureReason);
+        return;
+    }
+
+    const int32 TargetTopChunkZ = TargetSlot->TopChunkZ;
+    const int32 TargetBottomChunkZ = TargetSlot->BottomChunkZ;
+    const float TargetTopWorldZ = (float)(TargetTopChunkZ + 1) * CHUNK_SIZE;
+    const float TargetBottomWorldZ = (float)TargetBottomChunkZ * CHUNK_SIZE;
+    const FIntVector RepresentativeChunk(
+        0, 0, TargetBottomChunkZ + (TargetTopChunkZ - TargetBottomChunkZ) / 2);
+
+    // Materialise before mutating the live manager. A bad recipe or unsupported native family
+    // therefore leaves the running world untouched.
+    FVoxelStrateArchetypeParams PreflightParams = Candidate.ArchetypeParams;
+    VF_SetComposerRuntimeBounds(PreflightParams, TargetTopWorldZ, TargetBottomWorldZ);
+    FVoxelOpStack PreflightStack;
+    FVoxelOpContext PreflightContext;
+    FString PreflightError;
+    bool bPreflightBuilt = false;
+    if (Candidate.bStructureRoll)
+    {
+        bPreflightBuilt = VF_BuildStackFromRecipe(
+            Candidate.Recipe, PreflightParams, Generator->Seed, Generator->OriginSpineRadius,
+            StrateManager, PreflightStack, PreflightContext, &PreflightError);
+    }
+    else
+    {
+        bPreflightBuilt = VF_BuildNativeStrateStackForCandidate(
+            Candidate.Archetype, PreflightParams, Generator->Seed, Generator->OriginSpineRadius,
+            Generator->WorldRadiusVoxels, Generator->EdgeSealThickness, StrateManager,
+            PreflightStack, PreflightContext);
+        if (!bPreflightBuilt)
+        {
+            PreflightError = TEXT("The production native candidate stack could not be materialised.");
+        }
+    }
+    if (!bPreflightBuilt)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelWorld] ApplyComposerCandidate: seed=%d index=%d was not applied: %s"),
+            ComposerSeed, ComposerCandidateIndex, *PreflightError);
+        return;
+    }
+
+    FString ApplyError;
+    {
+        // The manager override is a density-only replacement. It does not call Initialize or
+        // GeneratePassages while the layout is half-built: the existing slot Z span, content
+        // definition, and passage geometry remain stable. The pause drains current workers before
+        // the map is changed, and the subsequent RegenerateAllChunks supplies the epoch bump.
+        FScopedGenerationPause Guard(this);
+        if (!Guard.Acquired())
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelWorld] ApplyComposerCandidate: generation pause timed out; no mutation applied."));
+            return;
+        }
+
+        if (!StrateManager->SetComposerOverrideForStrate(
+            ComposerTargetStrateIndex, Candidate.Seed, Candidate.Archetype,
+            Candidate.ArchetypeParams, Candidate.bStructureRoll,
+            Candidate.bStructureRoll ? &Candidate.Recipe : nullptr, ApplyError))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelWorld] ApplyComposerCandidate: seed=%d index=%d was not applied: %s"),
+                ComposerSeed, ComposerCandidateIndex, *ApplyError);
+            return;
+        }
+
+        // These are the same game-thread-owned side systems reset by RebuildStrates. The full
+        // chunk reset below also resets the density volume and preserves DiffLayer edits.
+        if (AtmosphereManager) { AtmosphereManager->Reset(); }
+        if (ContentManager)    { ContentManager->ClearAll(); }
+    }
+
+    // Reuse the established seed/live-edit invalidation path: GenerationEpoch increments here,
+    // stale ProcessQueue results are dropped, and the normal Tick submits a fresh stream around
+    // the player. No async worker can observe the half-applied manager state.
+    RegenerateAllChunks();
+
+    FVoxelOpStack ReferenceStack;
+    FVoxelOpContext ReferenceContext;
+    FString ReferenceError;
+    const bool bReferenceBuilt = VF_BuildComposerReferenceStack(
+        Candidate, *Generator, *StrateManager, TargetTopChunkZ, TargetBottomChunkZ,
+        ReferenceStack, ReferenceContext, ReferenceError);
+
+    FString ComparableReason;
+    const bool bReferenceComparable = bReferenceBuilt
+        && VF_ComposerReferenceIsComparable(
+            *this, *TargetSlot, Candidate.Archetype, RepresentativeChunk, ComparableReason);
+
+    const FVoxelStrateMeasureSettings MeasureSettings = VF_ComposerMeasureSettings();
+    FVoxelStrateMetrics Metrics;
+    FString MetricSource;
+    if (bReferenceComparable)
+    {
+        FComposerStackDensitySampler Sampler(ReferenceStack);
+        Metrics = VF_MeasureStrateWithSampler(
+            Sampler, (int32)TargetBottomWorldZ, (int32)TargetTopWorldZ,
+            VF_ComposerBoundarySeal(PreflightParams, Candidate.Archetype), MeasureSettings);
+        MetricSource = TEXT("candidate-stack");
+    }
+    else
+    {
+        // A live diff, disturbance post, or surface biome context makes a standalone stack an
+        // unlike oracle. Keep the owner's metric useful by measuring the actual applied generator;
+        // the log records why the bit-level oracle was skipped.
+        Metrics = VF_MeasureStrate(
+            *Generator, *StrateManager, ComposerTargetStrateIndex, MeasureSettings);
+        MetricSource = TEXT("live-generator");
+    }
+
+    float MaxDensityDelta = 0.0f;
+    int32 DensityMismatches = 0;
+    int32 DensitySamples = 0;
+    bool bDensityMatch = false;
+    if (bReferenceComparable)
+    {
+        bDensityMatch = VF_ComposerDensitySanityCheck(
+            *Generator, ReferenceStack, TargetTopChunkZ, TargetBottomChunkZ,
+            MaxDensityDelta, DensityMismatches, DensitySamples);
+    }
+
+    const FString RecipeText = Candidate.bStructureRoll
+        ? VF_FormatStrateStructureRecipe(Candidate.Recipe)
+        : TEXT("parameter-roll");
+    const FString DeterminismText = !bReferenceBuilt
+        ? FString::Printf(TEXT("UNAVAILABLE(%s)"), *ReferenceError)
+        : !bReferenceComparable
+            ? FString::Printf(TEXT("SKIPPED(%s)"), *ComparableReason)
+            : FString::Printf(TEXT("%s/%d"), bDensityMatch ? TEXT("PASS") : TEXT("FAIL"),
+                              DensitySamples);
+    const float AirFraction = Metrics.bValid ? Metrics.AirFraction : -1.0f;
+    const float LargestShare = Metrics.bValid ? Metrics.LargestComponentShare : -1.0f;
+    const float WalkableFraction = Metrics.bValid ? Metrics.WalkableFraction : -1.0f;
+    const float FeatureScale = Metrics.bValid ? Metrics.MedianFeatureScale : -1.0f;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[VoxelWorld] ComposerCandidate applied seed=%d index=%d target=%d recipe=%s archetype=%s metrics=%s air=%.6f largest=%.6f walkable=%.6f feature=%.3f components=%d determinism=%s max_delta=%.9g mismatches=%d epoch=%u"),
+        Candidate.Seed, Candidate.Index, ComposerTargetStrateIndex, *RecipeText,
+        VF_GetStrateArchetypeName(Candidate.Archetype), *MetricSource,
+        AirFraction, LargestShare, WalkableFraction, FeatureScale,
+        Metrics.bValid ? Metrics.NumAirComponents : -1,
+        *DeterminismText, MaxDensityDelta, DensityMismatches, GenerationEpoch);
+}
+
 void AVoxelWorld::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);

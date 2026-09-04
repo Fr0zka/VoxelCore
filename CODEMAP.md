@@ -413,13 +413,14 @@ Maps depth→strate at runtime; owns passages.
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
 | `FindSlotIndexForChunkZ` | 427 | Z → layout index. |
 | `GetStrateAt` / `GetStrateIndex` | 443 / 455 | World-Z queries. |
-| `GetLayoutVersion` | h:161 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize`). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so editor rebuilds never serve stale data. |
+| `GetLayoutVersion` | h:161 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize` and by the editor composer override). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so live changes never serve stale data. |
 | `GetStrateForChunk` | 466 | Chunk → definition. |
 | `GetGeneratorTypeForChunk` | 476 | Chunk → generator type. |
 | `UsesOperatorStackForChunk` | 559 | Chunk → should `GetDensityAt` take the operator stack? `bUseOperatorStack` on the definition **AND** archetype in the ported list — **now all 8 of 8** (Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork, Underwater). **That list is written down here and nowhere else.** With every archetype ported the flag is now the *only* thing that decides the path, so ticking the box is no longer a no-op anywhere — it is a real switch onto the operator stack for that strate. |
 | `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
 | `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
 | `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
+| `SetComposerOverrideForStrate` / `GetComposerOverrideForChunk` | editor-only | Temporary density-only candidate overlay for one existing slot. Copies immutable params/recipe into the worker refetch path, leaves layout/content/passages intact, and bumps `PassagesVersion` to invalidate generator memos. |
 | `BuildParamsFromDefinition` (static) | 1399 | Returns the definition's base `GenerationParams` only. Terrain-op assets are passed separately to `BuildChunkCache`, which applies one selected op per room and pre-bakes Column/Pit/Chimney features. |
 
 **`Public/VoxelTerrainOpDefinition.h` + `.cpp`** — `UVoxelTerrainOpDefinition : UPrimaryDataAsset`
@@ -462,7 +463,8 @@ selection → `FStrateGenerationParams::Lerp` or reflected native-family blend �
 field range jitter (or the season-zero ±25% own-magnitude bootstrap for near-zero ranges) →
 editor-reflection clamps → ordered-pair repair. Bool
 `bTunnelsFlowTowardOrigin` inherits from the dominant parent; integer/enum SNAP fields are not
-jittered. This API is not called by runtime generation. The settings audit found **one unique path**,
+jittered. Normal runtime generation never calls this API; the editor-only AVoxelWorld bridge does so
+only from its PIE button. The settings audit found **one unique path**,
 `/Game/VoxelForge/DA_Strate3`, which explains the old one-vector corpus; the project assets were
 never in that pool.
 
@@ -474,6 +476,13 @@ resource declarations, rolls 4–8 unique modifiers, and validates the recipe be
 it. `RequiredResources` / `ProvidedResources` close the room-state hole that channel masks alone
 could not express. `VoxelForgeComposerStructureRollTest` rolls 64 candidates, measures them through
 the offline sampler, and brute-forces every uniform box verdict from the novel stack itself.
+
+Public/VoxelWorld.h + Private/VoxelWorld.cpp — ApplyComposerCandidate exposes the four
+Live Edit|Composer properties and the CallInEditor button. It preflights the candidate, pauses
+generation before installing the manager override, and calls the existing epoch-aware full reset.
+The post-apply check compares eight densities against the shared native/recipe stack where the live
+world has no extra diff, disturbance, or biome context. It reports SKIPPED rather than comparing
+unlike fields.
 
 **`Public/VoxelStratePreview.h` + `Private/VoxelStratePreview.cpp`** — editor/automation-only PNG
 renderer and self-contained contact sheet. It consumes `FVoxelStrateSampleGrid` from the measurement
