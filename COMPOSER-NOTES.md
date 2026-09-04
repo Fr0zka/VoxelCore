@@ -253,6 +253,50 @@ small commandlet walking the struct by reflection. Clamp coverage is partial. A 
 tunables at all (`StrateTopWorldZ` / `StrateBottomWorldZ` are runtime Z bounds) and need an explicit
 exclusion list. Bools cannot be blended — roll them by probability or inherit from the dominant parent.
 
+### ✅ Tier 5 status — promotion is built and measured (2026-09-05)
+
+Promotion is now a real corpus input, not a claim about a future approval UI. A surviving editor
+candidate becomes a `FVoxelStratePromotableRecord`: complete native parameter vector (all six family
+blocks), recipe, archetype tag, measured metric summary, season/seed/candidate identity, input corpus
+hash, and the three gate results. `VF_SaveStratePromotedRecords` writes a sorted, pretty JSON store
+(`schema_version=2`) beside one JSON season manifest per run. `FVoxelStrateCorpus` loads those records
+alongside project assets and C++ defaults, tags each member `project`, `default`, or `promoted`, and
+prints the provenance counts in the membership report. The stored metric is evidence for review only:
+the world-specific verifier rebuilds the recipe and remeasures it on every load, and a failed fresh
+non-vacuous, largest-component, or primordial arrival→departure gate cannot enter the corpus.
+
+The provisional policy is deliberately explicit. It accepts only records that pass all three gates,
+requires a normalized measured-metric distance of **at least 0.20** from every usable existing member
+and already accepted record, and caps a season at **6** promotions. Distance is Euclidean over
+`(air fraction, largest-component share, walkable fraction, median feature scale / 256 voxels,
+median vertical clearance / 64 voxels)`. The 0.20 threshold is a review-sized novelty floor: it is
+roughly a 20-point move in one bounded fraction, or a smaller combined move across dimensions, while
+the physical normalizers make feature/clearance changes comparable. It is provisional, not the
+owner's definition of good. One authored asset was measured as a valid but all-air window in this
+fixture (`DA_Strate2`), so it is retained as measured-but-vacuous and uses conservative exact-parameter
+identity fallback rather than a false metric distance; the other **11/12** base members participate
+in the measured novelty space.
+
+The five-season simulation used 24 structure candidates per season, the fixed sample window
+(`step=8`, `radius=256`, `WorldRadiusVoxels=0`), and the same fresh verifier on every reload:
+
+| Season | Input corpus hash | Corpus after | project/default/promoted | survivors / 24 | survival | measured spread | promoted | rejected near-dup / hash / cap |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `9dbcea85` | 15 | 4 / 8 / 3 | 5 | 20.8% | 0.869214 | 3 | 2 / 0 / 0 |
+| 2 | `8b624d80` | 20 | 4 / 8 / 8 | 13 | 54.2% | 0.849043 | 5 | 8 / 0 / 0 |
+| 3 | `cfbd74ec` | 20 | 4 / 8 / 8 | 13 | 54.2% | 0.849043 | 0 | 13 / 0 / 0 |
+| 4 | `cfbd74ec` | 21 | 4 / 8 / 9 | 11 | 45.8% | 0.916302 | 1 | 10 / 0 / 0 |
+| 5 | `c108a276` | 21 | 4 / 8 / 9 | 12 | 50.0% | 0.916302 | 0 | 12 / 0 / 0 |
+
+The curve does **not** show a monotonic survival improvement: `20.8%, 54.2%, 54.2%, 45.8%,
+50.0%`. Measured spread also dips and plateaus, but ends wider: **0.869214 → 0.916302
+(+0.047089)**. This five-season run therefore found no collapse toward a mean, but it is not evidence
+that collapse cannot happen at a different seed or policy. The current recommendation is to keep the
+novelty floor and add a small, explicitly reviewable outlier quota in a later policy revision—promote
+some distant survivors even when their quality score is merely acceptable—rather than tune this run
+to look smoother. The owner still needs the preview before defining “good”; promotion is the dilution
+mechanism, not that missing judgment.
+
 ### ✅ Tier 4a status — parameter roll built (2026-09-04)
 
 `Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp` now implement the corpus and
@@ -654,6 +698,13 @@ cap, or the writer can be called for an explicitly selected list. Fine filenames
 card's text include the sample step and exact resolved XY/Z window, so they cannot be mistaken for the
 coarse render. A refused fine render is shown as a refusal with its reason rather than silently omitted.
 
+The fine ROI is now centred on each survivor's deterministic `LargestComponentPoint` from the coarse
+air flood fill and is labelled **“largest open space”** on the page. It is not the middle of the
+strate and not the world origin. In the final 42-survivor run, the origin-centred baseline had **6/42**
+uniform fine plan projections (and 6/42 complete two-view cards); the largest-open-space pass had
+**3/42** in both counts. The reduction is real but not total: a largest open space can itself be
+larger than a radius-64 ROI, so a uniform card is not proof that the strate is empty.
+
 The vertical image is an XZ section through the sampled cell nearest the strate-window centre Y. The
 plan image scans every sampled Z layer, keeps layers containing both air and solid, and chooses the
 one with the largest number of XY solid/air boundary transitions; ties prefer more mixed cells, more
@@ -667,11 +718,11 @@ orange walkable cells, a turquoise scalar contour, and a one-chunk footer scale 
 resampling. It also carries the required caveat: a 2D apparent join is not a 3D connectivity proof;
 the separate arrival→departure verdict is the connectivity check.
 
-The focused run measured **0.456 s** for the coarse render, **70.271 s** for the 42 fine scalar samples,
-and **0.573 s** for their filled/contour rendering. Peak fine `Air` + `Density` capture allocation was
-**9,338,880 bytes** and the peak single RGBA raster was **75,776 bytes**. The full StructureRoll test
-completed in **184.659 s**, with 64 coarse filled pairs, 64 coarse contour pairs, 42 fine filled pairs,
-42 fine contour pairs, and 0 refusals.
+The final run measured **0.300 s** for the coarse render, **133.272 s** for the origin-plus-centred
+fine scalar samples, and **1.113 s** for their filled/contour rendering. Peak fine `Air` + `Density`
+capture allocation was **9,338,880 bytes** and the peak single RGBA raster was **75,776 bytes**. The
+full StructureRoll test completed in **243.649 s**, with 64 coarse filled pairs, 64 coarse contour
+pairs, 42 fine filled pairs, 42 fine contour pairs, and 0 refusals.
 
 ### 3.5 Validation in three layers, and how "good" is ever judged
 
@@ -696,7 +747,10 @@ But *good* never has to be defined, only **collected**:
 ⚠️ **Known risk: convergence to a comfortable middle.** Promote only what you already liked, keep
 blending near the corpus, and the system slowly stops surprising you. Same failure mode as the
 build-vote pool, same counter: keep extrapolating past the corpus, and keep some unrated weird
-candidates in circulation.
+candidates in circulation. The first five-season promotion measurement did **not** collapse: mean
+normalized spread ended 0.047089 wider than it started, but survival was not monotonic. That is one
+seed and one provisional policy, not a dispensation from the risk; the next policy should reserve a
+reviewable outlier quota instead of assuming survivor promotion preserves surprise.
 
 ---
 
@@ -981,13 +1035,21 @@ roughness and should stay late in the stack.
 - ✅ **Structure roll (§3.2, Tier 4b)** — serialisable recipes, root polarity, declaration-derived
   resource-safe modifier legality, mandatory posts, 64-candidate measurement, and direct box-verdict
   brute force are built; the bootstrap follow-up is 42/64 survival with 0 invalid recipes and 0
-  violations, plus 64 rendered preview pairs and an index.html contact sheet.
+  violations, plus 64 rendered preview pairs and an index.html contact sheet. The fine survivor ROI
+  is centred on `LargestComponentPoint` and labelled largest open space; the final before/after
+  blank-plan count is 6/42 → 3/42.
 - ⬜ Reject-and-resample driven by Tier 2 (§3.5) · the **offline season pipeline** with Jahni's review
   and veto (§3.1).
 
 ### Tier 5 — the long game
-**Promotion** (good strates rejoin the corpus) · theme and tag draws for materials, creatures and audio ·
-eventually the model. All optional, all compounding.
+- ✅ **Promotion** (good strates rejoin the corpus) — JSON promotable records and season manifests,
+  project/default/promoted provenance, fresh-load re-verification of the three gates, measured
+  near-duplicate rejection, per-season cap, and a deterministic five-season simulation. The run ended
+  at 21 corpus members (4 project, 8 default, 9 promoted); spread widened overall but survival was
+  non-monotonic. The owner still needs to define “good” from the preview; promotion does not invent
+  that judgment.
+- ⬜ Theme and tag draws for materials, creatures, and audio · eventually the model. All optional,
+  all compounding.
 
 ---
 
@@ -1025,7 +1087,10 @@ Game-design questions live in **[GDD.md](GDD.md) §16**. These are the ones that
 3. **How theme coherence is drawn** — operators, materials, decorations, creatures and audio pulled as a
    compatible set. Jahni expects his first big job to be creating themes and tagging content with
    multiple fitting tags.
-4. **Where the corpus lives** and how promotion is recorded between seasons.
+4. ✅ **Where the corpus lives** and how promotion is recorded between seasons: the cumulative store is
+   `Saved/ComposerPromotion/seed_0_step_8_radius_256/promoted_strates.json` in the simulation, with
+   `season_01_manifest.json` … `season_05_manifest.json` alongside it; the default runtime/editor
+   location is `Saved/VoxelForge/StrateCorpus/promoted_strates.json`.
 5. **Whether op discovery** (promoting good sub-stacks into named reusable units) is ever worth it.
    Parked: the existing parameter space is already vastly larger than a hundred seasons could explore.
    **The scarce resource is judgment, not vocabulary.**
@@ -1068,6 +1133,17 @@ acceptance conditions. Both now met:
 
 ⚠️ **Read the PROVED counts as measurements, never as contracts.** What is asserted is that none of
 them is *wrong* — a false verdict leaves no geometry and no collision behind it.
+
+---
+
+**2026-09-05 — Tier 5 + fine-ROI validation.** The specified UE 5.7 `VoxelMEditor Win64
+Development` build succeeded. The full headless `VoxelForge` namespace reported **27 succeeded,
+0 failed, 0 not run, 0 succeeded-with-warnings** in **613.277 s**. The focused promotion test was
+green in **63.556 s** and the focused StructureRoll test was green in **243.649 s**. Promotion ended
+with 9 cumulative records, fresh-load stale-metric replacement, `WorldRadiusVoxels=0`, and the table
+in §3.3. The StructureRoll preview measured fine blank plan/card counts **6/42 → 3/42** and rendered
+42 fine filled pairs plus 42 contour pairs with 0 refusals. No existing generation/equivalence test
+failed.
 
 ---
 

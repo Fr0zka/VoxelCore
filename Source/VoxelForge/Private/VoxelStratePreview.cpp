@@ -177,6 +177,28 @@ namespace
         return bAnyWalkable ? GWalkableColor : bAnyAir ? GAirColor : GSolidColor;
     }
 
+    bool VF_HasContentVariation(const TArray<FColor>& Pixels,
+                                int32 Width,
+                                int32 ContentHeight)
+    {
+        if (Width <= 0 || ContentHeight <= 0 || Pixels.Num() < Width * ContentHeight)
+        {
+            return false;
+        }
+        const FColor First = Pixels[0];
+        for (int32 Y = 0; Y < ContentHeight; ++Y)
+        {
+            for (int32 X = 0; X < Width; ++X)
+            {
+                if (Pixels[Y * Width + X] != First)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     FPlanSliceChoice VF_ChoosePlanSlice(const FVoxelStrateSampleGrid& Grid,
                                         int32 HeadroomCells)
     {
@@ -864,6 +886,8 @@ bool VF_WriteStratePreviewFineCandidate(
                                    CandidateIndex);
         return false;
     }
+    InOutCandidate.bFineVerticalContentVaries = VF_HasContentVariation(
+        Pixels, Width, Height - GPreviewScaleBarFooterPixels);
 
     const bool bHasContour = FineGrid.HasScalarDensity();
     if (bHasContour)
@@ -896,6 +920,8 @@ bool VF_WriteStratePreviewFineCandidate(
                                    CandidateIndex);
         return false;
     }
+    InOutCandidate.bFinePlanContentVaries = VF_HasContentVariation(
+        Pixels, Width, Height - GPreviewScaleBarFooterPixels);
     if (bHasContour)
     {
         int32 ContourWidth = 0;
@@ -914,6 +940,8 @@ bool VF_WriteStratePreviewFineCandidate(
 
     InOutCandidate.bFineRendered = true;
     InOutCandidate.bFineContourRendered = bHasContour;
+    InOutCandidate.bFineBlank = !InOutCandidate.bFineVerticalContentVaries
+        && !InOutCandidate.bFinePlanContentVaries;
     InOutCandidate.FinePlanSliceCellZ = Plan.CellZ;
     InOutCandidate.FinePlanSliceWorldZ = VF_CellWorldCoordinate(
         FineGrid.MinZ, FineGrid.MaxZ, FineGrid.SampleStep, Plan.CellZ);
@@ -1021,8 +1049,10 @@ bool VF_WriteStratePreviewIndex(
         "<span><i class=\"swatch\" style=\"background:#dae1e7\"></i>air</span>"
         "<span><i class=\"swatch\" style=\"background:#f5a636\"></i>walkable cell</span>"
         "<span><i class=\"swatch\" style=\"background:#4de2be\"></i>density=0 contour</span></div>\n"
-        "<p class=\"note\"><strong>Fine ROI:</strong> the separate step-1 pass is requested only "
-        "for selected candidates (this run selects coarse survivors). Its exact window is printed "
+        "<p class=\"note\"><strong>Fine ROI — largest open space:</strong> the separate step-1 pass "
+        "is requested only for selected candidates (this run selects coarse survivors). Its XY "
+        "window is centred on the deterministic <code>LargestComponentPoint</code> from the coarse "
+        "air flood fill, not on the strate midpoint or the world origin. Its exact window is printed "
         "on the card. If its cell cap is exceeded, no fine allocation is made and the refusal is "
         "shown on that card.</p>\n"
         "<p class=\"note\">Ordering: survivors first, then each group by descending distance from "
@@ -1115,7 +1145,7 @@ bool VF_WriteStratePreviewIndex(
             Html += FString::Printf(TEXT("<div class=\"no-image\">No coarse image: %s</div>\n"),
                                     *VF_HtmlEscape(Candidate.RenderFailureReason));
         }
-        Html += TEXT("</div>\n<div class=\"fine-section\"><h3>FINE ROI — filled cells and density=0 contour</h3>\n");
+        Html += TEXT("</div>\n<div class=\"fine-section\"><h3>FINE ROI — largest open space; filled cells and density=0 contour</h3>\n");
         if (!Candidate.bFineRequested)
         {
             Html += TEXT("<p class=\"not-requested\">Fine ROI not requested for this candidate; it did not pass the coarse survivor screen.</p>\n");
@@ -1132,7 +1162,7 @@ bool VF_WriteStratePreviewIndex(
         {
             const FString FineWindowDescription = Candidate.FineWindow.Describe();
             Html += FString::Printf(
-                TEXT("<p class=\"window\">Exact fine ROI window: %s; slice Y=%d voxels.</p>\n"
+                TEXT("<p class=\"window\">Largest-open-space fine ROI; exact window: %s; slice Y=%d voxels.</p>\n"
                      "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XZ filled cells\"><figcaption>"
                      "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
                 *VF_HtmlEscape(FineWindowDescription), Candidate.FineVerticalSliceWorldY,
@@ -1154,7 +1184,7 @@ bool VF_WriteStratePreviewIndex(
             }
 
             Html += FString::Printf(
-                TEXT("<p class=\"window\">Exact fine ROI window: %s; selected Z=%d voxels.</p>\n"
+                TEXT("<p class=\"window\">Largest-open-space fine ROI; exact window: %s; selected Z=%d voxels.</p>\n"
                      "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XY filled cells\"><figcaption>"
                      "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
                 *VF_HtmlEscape(FineWindowDescription), Candidate.FinePlanSliceWorldZ,

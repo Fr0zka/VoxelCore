@@ -620,30 +620,26 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         VF_GetProjectAssetPaths(UVoxelStrateDefinition::StaticClass());
     const TArray<FString> ProjectTerrainOpAssets =
         VF_GetProjectAssetPaths(UVoxelTerrainOpDefinition::StaticClass());
-    int32 NumProjectCorpusEntries = 0;
-    int32 NumDefaultCorpusEntries = 0;
+    const int32 NumProjectCorpusEntries = Corpus.NumForProvenance(
+        EVoxelStrateCorpusProvenance::Project);
+    const int32 NumDefaultCorpusEntries = Corpus.NumForProvenance(
+        EVoxelStrateCorpusProvenance::Default);
+    const int32 NumPromotedCorpusEntries = Corpus.NumForProvenance(
+        EVoxelStrateCorpusProvenance::Promoted);
     FString CorpusMembership = TEXT("CORPUS MEMBERSHIP\n");
     for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())
     {
-        if (VF_IsComposerDefault(Entry))
-        {
-            ++NumDefaultCorpusEntries;
-        }
-        else
-        {
-            ++NumProjectCorpusEntries;
-        }
         CorpusMembership += FString::Printf(TEXT("%s | %s | %s\n"),
-                                             VF_IsComposerDefault(Entry) ? TEXT("default") : TEXT("project"),
+                                             VF_GetStrateCorpusProvenanceName(Entry.Provenance),
                                              VF_GetStrateArchetypeName(Entry.Archetype),
                                              *Entry.SourcePath);
     }
     AddInfo(FString::Printf(
         TEXT("Corpus membership: %d project strate assets discovered, %d project vectors loaded, "
-             "%d defaults, %d total members. Terrain-op Asset Registry count (not rolled in this "
+             "%d defaults, %d promoted, %d total members. Terrain-op Asset Registry count (not rolled in this "
              "task; live fields use header defaults instead): %d."),
-        ProjectStrateAssets.Num(), NumProjectCorpusEntries, NumDefaultCorpusEntries, Corpus.Num(),
-        ProjectTerrainOpAssets.Num()));
+        ProjectStrateAssets.Num(), NumProjectCorpusEntries, NumDefaultCorpusEntries,
+        NumPromotedCorpusEntries, Corpus.Num(), ProjectTerrainOpAssets.Num()));
     AddInfo(CorpusMembership);
     for (const ECaveGeneratorType Archetype : {
         ECaveGeneratorType::TunnelNetwork,
@@ -712,11 +708,11 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     FString SpreadTable = TEXT(
         "CORPUS SPREAD (population stddev; spread jitter = ±15% of max-min; near-zero spread "
         "uses ±25% of field magnitude with a one-unit floor; clamps are safety only)\n"
-        "archetype | struct | field | kind | excluded | reflected | authored | op-defaults | samples | min | max | mean | stddev | clamp\n");
+        "archetype | struct | field | kind | excluded | reflected | authored | promoted | op-defaults | samples | min | max | mean | stddev | clamp\n");
     for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
     {
         SpreadTable += FString::Printf(
-            TEXT("%s | %s | %s | %s | %s | %s | %d | %d | %d | %s | %s | %s | %s | %s\n"),
+            TEXT("%s | %s | %s | %s | %s | %s | %d | %d | %d | %d | %s | %s | %s | %s | %s\n"),
             VF_GetStrateArchetypeName(Spread.Archetype),
             *Spread.ParamStructName,
             *Spread.FieldName,
@@ -724,6 +720,7 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
             Spread.bExcluded ? TEXT("yes") : TEXT("no"),
             Spread.bReflected ? TEXT("yes") : TEXT("no"),
             Spread.AuthoredSampleCount,
+            Spread.PromotedSampleCount,
             Spread.DefaultSeedCount,
             Spread.SampleCount,
             *VF_FormatSpreadValue(Spread.Min),

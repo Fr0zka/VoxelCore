@@ -344,6 +344,10 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     int32 NumFineRendered = 0;
     int32 NumFineContourRendered = 0;
     int32 NumFineRefused = 0;
+    int32 NumFinePlanBlankBeforeCentering = 0;
+    int32 NumFinePlanBlankAfterCentering = 0;
+    int32 NumFineCardBlankBeforeCentering = 0;
+    int32 NumFineCardBlankAfterCentering = 0;
     int64 TotalFineCells = 0;
     int64 PeakFineCaptureBytes = 0;
     int64 PeakFineRasterBytes = 0;
@@ -625,11 +629,50 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         if (bCandidateSurvivor)
         {
             ++NumFineRequested;
+
+            // Render the old origin-centred pass into the same filenames first. The temporary
+            // record gives an exact before count from the renderer's content-variation check; the
+            // corrected capture below overwrites those files. The two grids are sequential, so
+            // peak retained memory remains one fine capture.
+            FVoxelStrateSampleGrid OriginFineGrid;
+            const double OriginFineMeasureStartSeconds = FPlatformTime::Seconds();
+            const FVoxelStrateMetrics OriginFineMetrics = VF_MeasureStrateWithSampler(
+                Sampler, BottomVoxelZ, TopVoxelZ + 1,
+                Context.EdgeSealThickness, FineMeasureSettings, &OriginFineGrid);
+            FineMeasureSeconds += FPlatformTime::Seconds() - OriginFineMeasureStartSeconds;
+            FVoxelStratePreviewCandidate OriginFinePreview;
+            FString OriginFinePreviewError;
+            const double OriginFineRenderStartSeconds = FPlatformTime::Seconds();
+            const bool bOriginFineWritten = VF_WriteStratePreviewFineCandidate(
+                PreviewDirectory, CandidateIndex, OriginFineGrid,
+                FineMeasureSettings.HeadroomCells,
+                OriginFineMetrics.bValid ? FString() : OriginFineMetrics.RefusalReason,
+                OriginFinePreview, OriginFinePreviewError);
+            FineRenderSeconds += FPlatformTime::Seconds() - OriginFineRenderStartSeconds;
+            TestTrue(FString::Printf(TEXT("candidate %d origin baseline fine render records"),
+                                     CandidateIndex),
+                     bOriginFineWritten);
+            if (OriginFinePreview.bFineRendered && !OriginFinePreview.bFinePlanContentVaries)
+            {
+                ++NumFinePlanBlankBeforeCentering;
+            }
+            if (OriginFinePreview.bFineRendered && OriginFinePreview.bFineBlank)
+            {
+                ++NumFineCardBlankBeforeCentering;
+            }
+
+            FVoxelStrateMeasureSettings CenteredFineMeasureSettings = FineMeasureSettings;
+            if (Metrics.bValid && FMath::IsFinite(Metrics.LargestComponentPoint.X)
+                && FMath::IsFinite(Metrics.LargestComponentPoint.Y))
+            {
+                CenteredFineMeasureSettings.CenterXY = FVector2D(
+                    Metrics.LargestComponentPoint.X, Metrics.LargestComponentPoint.Y);
+            }
             FVoxelStrateSampleGrid FineGrid;
             const double FineMeasureStartSeconds = FPlatformTime::Seconds();
             const FVoxelStrateMetrics FineMetrics = VF_MeasureStrateWithSampler(
                 Sampler, BottomVoxelZ, TopVoxelZ + 1,
-                Context.EdgeSealThickness, FineMeasureSettings, &FineGrid);
+                Context.EdgeSealThickness, CenteredFineMeasureSettings, &FineGrid);
             FineMeasureSeconds += FPlatformTime::Seconds() - FineMeasureStartSeconds;
 
             const FString FineFailureReason = FineMetrics.bValid
@@ -645,6 +688,14 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
             TestTrue(FString::Printf(TEXT("candidate %d fine preview records without a second renderer sample"),
                                      CandidateIndex),
                      bFineWritten);
+            if (PreviewCandidate.bFineRendered && !PreviewCandidate.bFinePlanContentVaries)
+            {
+                ++NumFinePlanBlankAfterCentering;
+            }
+            if (PreviewCandidate.bFineRendered && PreviewCandidate.bFineBlank)
+            {
+                ++NumFineCardBlankAfterCentering;
+            }
             TestTrue(FString::Printf(TEXT("candidate %d fine capture keeps scalar density"),
                                      CandidateIndex),
                      !FineMetrics.bValid || FineGrid.HasScalarDensity());
@@ -768,11 +819,15 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         FirstBoxViolation.IsEmpty() ? TEXT("No violations.") : *FirstBoxViolation));
     AddInfo(FString::Printf(
         TEXT("Preview cost: coarse step=%d 64-card pass render %.3fs; fine ROI requested=%d "
-             "(survivors=%d), rendered=%d, contour pairs=%d, refused=%d; fine sample %.3fs + "
+             "(survivors=%d), rendered=%d, contour pairs=%d, refused=%d; "
+             "blank plan origin=%d, blank plan largest-open-space=%d; blank card origin=%d, "
+             "blank card largest-open-space=%d; fine sample %.3fs + "
              "render %.3fs; fine cells sampled=%lld; peak fine Air+Density capture=%lld bytes; "
              "peak single RGBA raster=%lld bytes; ROI step=%d radius=%d MaxCells=%d."),
         MeasureSettings.SampleStep, CoarsePreviewSeconds,
         NumFineRequested, NumSurvivors, NumFineRendered, NumFineContourRendered, NumFineRefused,
+        NumFinePlanBlankBeforeCentering, NumFinePlanBlankAfterCentering,
+        NumFineCardBlankBeforeCentering, NumFineCardBlankAfterCentering,
         FineMeasureSeconds, FineRenderSeconds, TotalFineCells,
         PeakFineCaptureBytes, PeakFineRasterBytes,
         FinePreviewSettings.SampleStep, FinePreviewSettings.RadiusInVoxels,
@@ -815,7 +870,8 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
                  "vertical=%dx%d, plan=%dx%d, "
                  "plan Z chosen from each candidate's measured layer with the highest solid/air "
                  "boundary count (first candidate Z=%d); index=%s; first-candidate window=%s; "
-                 "fine previews are linked on survivor cards; image cap=512 px including 20 px "
+                 "fine previews are linked on survivor cards and centred on each largest open "
+                 "space point (never the strate midpoint); image cap=512 px including 20 px "
                  "scale footer."),
             PreviewCandidates.Num(),
             NumRenderedPairs,
@@ -840,6 +896,15 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
               NumFineRequested, NumSurvivors);
     TestEqual(TEXT("fine preview outcomes account for every requested survivor"),
               NumFineRendered + NumFineRefused, NumFineRequested);
+    AddInfo(FString::Printf(TEXT(
+        "Fine blank baseline: plan projection %d/%d origin-centred versus %d/%d centred on "
+        "LargestComponentPoint; complete two-projection cards %d/%d versus %d/%d. A blank "
+        "projection/card means its filled-cell pixels were uniform (scale footer excluded), "
+        "not that the measurement was refused."),
+        NumFinePlanBlankBeforeCentering, NumFineRequested,
+        NumFinePlanBlankAfterCentering, NumFineRequested,
+        NumFineCardBlankBeforeCentering, NumFineRequested,
+        NumFineCardBlankAfterCentering, NumFineRequested));
     TestEqual(TEXT("every rendered fine preview has a scalar contour pair"),
               NumFineContourRendered, NumFineRendered);
     TestTrue(TEXT("structure roller emits 64 distinct structural recipes"),

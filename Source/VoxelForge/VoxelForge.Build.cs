@@ -79,6 +79,7 @@ public class VoxelForge : ModuleRules
 		// Private dependencies - only used in our .cpp files, not exposed in headers
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			"Json",           // Diffable Tier 5 promoted-record and season-manifest stores
 			"ImageWrapper",  // PNG encode for the biome-map preview bake (BakeBiomePreview)
 			"RHI",           // Texture3D create + RHIUpdateTexture3D for the density volume (mini-sun shadows)
 			"RenderCore",    // ENQUEUE_RENDER_COMMAND for the volume upload

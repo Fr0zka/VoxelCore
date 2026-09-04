@@ -445,7 +445,7 @@ One asset = one biome: identity + `DebugColor`, climate placement box (`ReliefMi
 atmosphere override, `WaterMaterial`, `MaterialPaletteIndex` (F6 — baked to vertex colour, §8.15)), `GameplayTags`. Referenced from
 `UVoxelStrateDefinition::Biomes[]`. Generator-agnostic (surface biomes now, cave biomes later). §8.14.
 
-**`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp`** (Tier 4a/4b) — offline
+**`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp`** (Tier 4a/4b + Tier 5) — offline
 `FVoxelStrateCorpus`, `VF_RollStrateParams`, and `VF_RollStrateStructure`. `LoadFromAssetRegistry` enumerates every project
 `UVoxelStrateDefinition` through the Asset Registry, excludes `Saved/Autosaves` and `Saved/Cooked`
 copies, and adds one `VoxelStrateTypes.h` default vector for each of the eight exact archetypes.
@@ -477,6 +477,18 @@ it. `RequiredResources` / `ProvidedResources` close the room-state hole that cha
 could not express. `VoxelForgeComposerStructureRollTest` rolls 64 candidates, measures them through
 the offline sampler, and brute-forces every uniform box verdict from the novel stack itself.
 
+Tier 5 adds `FVoxelStratePromotableRecord`, `FVoxelStratePromotionPolicy`, and
+`FVoxelStratePromotionBatchResult`. `VF_SaveStratePromotedRecords` writes a sorted schema-2 JSON
+corpus store containing the complete six-family parameter vector, recipe, archetype, gate evidence,
+metrics, season/seed, and input corpus hash; `VF_SaveStrateSeasonManifest` writes one diffable JSON
+summary beside it. `FVoxelStrateCorpus::LoadPromotedRecords` re-verifies every record through the
+world-specific `IVoxelStratePromotionVerifier` before admission, remeasures project/default members
+when that verifier supplies the optional audit, and tags membership `project` / `default` /
+`promoted`. `VF_SelectStratePromotions` uses normalized measured-metric distance (threshold 0.20),
+the existing corpus contents hash, deterministic RecordId ordering, and a six-record season cap.
+The promotion test simulates five seasons and deliberately corrupts one stored metric to prove the
+loader replaces it with a fresh measurement.
+
 `EVoxelStrateCorpusFreeSamplingMode`, `VF_RollStrateParamsCorpusFree`, and
 `VF_ValidateStrateCorpusFreeConstraints` are the offline corpus-free control/experiment. They never
 read a corpus entry or strate asset: `NaiveUniform` rolls every live scalar independently inside a
@@ -506,7 +518,8 @@ pass, emits deterministic centre-Y XZ and data-selected XY slices via `IImageWra
 and scalar density=0 contour views side by side without blurring the sampled raster. Each image is capped at
 512 pixels (including its scale footer). `FVoxelStrateFinePreviewSettings` is a separate caller-selected
 fine pass: the composer selects only survivors at step 1, radius 64 (a 128×128 XY ROI), and `MaxCells=2,000,000`;
-the writer labels every image with its exact ROI and step and records cap refusals in the page. The 64-card
+the caller centres it on each coarse survivor's `LargestComponentPoint` and the writer labels it
+“largest open space” with its exact ROI and step; cap refusals are recorded in the page. The 64-card
 sheet remains sorted by survivor status then descending corpus-centroid distance, repeats exact measurement
 windows, marks rejection reasons, explains the 2D-connectivity limitation, and has no runtime generation hook.
 
@@ -575,7 +588,8 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 | `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. Bootstrap follow-up: **1,422 applications / 168 distinct fields**; **38/64 survival**, feature scale **0→376**, walkable **0.000000→0.286766** (no broadening beyond the prior run); **1,356 Mixed + 608 AllSolid + 596 AllAir = 1,204 proved boxes**, **1,602,524 lattice voxels checked, 0 violations**, 146.250 s total in the final full-namespace run. |
 | ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
-| `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Focused run: **42/64 survival (65.6%)**, **64 distinct recipes**, **6,848 bootstrap applications / 107 distinct fields**, **659 proved boxes / 877,129 voxels / 0 violations**, **64 coarse filled + 64 coarse contour pairs**, **42 fine ROI filled + 42 fine contour pairs**, **184.659 s**, **0 refusals**. |
+| `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. Final run: **9 promoted**, corpus **4/8/9**, survival **20.8/54.2/54.2/45.8/50.0%**, spread **0.869214→0.916302**, **63.556 s**, 0 failures. |
+| `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Final run: **42/64 survival (65.6%)**, **64 distinct recipes**, **0 invalid recipes**, **64 coarse filled + 64 coarse contour pairs**, **42 fine filled + 42 fine contour pairs**, blank plan/card **6/42→3/42**, **243.649 s**, **0 refusals**. |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm run uses **16 candidates per arm** (256×3 and 64×3 were stopped before aggregate output for runtime), step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **13/16, 7/16, 7/16** survival; survivor walkable means **0.066071, 0.012566, 0.012851** and feature-scale means **92.307693, 64.571426, 31.428572**. Box checks: **196/260,876**, **310/412,610**, **262/348,722** proved/voxels, **0 violations** in every arm. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |

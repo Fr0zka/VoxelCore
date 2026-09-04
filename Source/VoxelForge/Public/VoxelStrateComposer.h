@@ -10,6 +10,7 @@
 #include "CoreMinimal.h"
 #include "VoxelStrateTypes.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelStrateMeasure.h"
 
 #include "VoxelStrateComposer.generated.h"
 
@@ -142,6 +143,7 @@ struct VOXELFORGE_API FVoxelStrateFieldSpread
     // Actual authored corpus samples and synthetic per-operation default samples are kept
     // separate in the report. SampleCount is their effective total used for the statistics.
     int32 AuthoredSampleCount = 0;
+    int32 PromotedSampleCount = 0;
     int32 DefaultSeedCount = 0;
     int32 SampleCount = 0;
     double Min = 0.0;
@@ -156,6 +158,54 @@ struct VOXELFORGE_API FVoxelStrateFieldSpread
     double ClampMin = 0.0;
     double ClampMax = 0.0;
 };
+
+/** Where a member of the offline corpus came from. */
+enum class EVoxelStrateCorpusProvenance : uint8
+{
+    Project,
+    Default,
+    Promoted,
+};
+
+/** The finite, diffable metric summary stored with a promoted strate. */
+struct VOXELFORGE_API FVoxelStrateMeasuredMetrics
+{
+    bool bValid = false;
+
+    int64 NumSampled = 0;
+    int64 NumAir = 0;
+    int64 NumSolid = 0;
+    float AirFraction = 0.0f;
+    int32 NumAirComponents = 0;
+    float LargestComponentShare = 0.0f;
+    FVector LargestComponentPoint = FVector::ZeroVector;
+    int64 LargestComponentCells = 0;
+    int32 NumComponentsAtLeast1Pct = 0;
+    float WalkableFraction = 0.0f;
+    float MedianFeatureScale = 0.0f;
+    int32 MedianVerticalClearance = 0;
+
+    int32 ResolvedMarginVoxels = 0;
+    int32 SampledMinZ = 0;
+    int32 SampledMaxZ = 0;
+    int32 SampledNumX = 0;
+    int32 SampledNumY = 0;
+    int32 SampledNumZ = 0;
+    float SampledMinX = 0.0f;
+    float SampledMaxX = 0.0f;
+    float SampledMinY = 0.0f;
+    float SampledMaxY = 0.0f;
+
+    // This is the component-size audit trail, not a retained density grid. It is bounded by the
+    // number of discovered air components and is useful when reviewing a promoted record.
+    TArray<int64> AirComponentCells;
+
+    bool IsUsable() const;
+};
+
+/** Copy the measured facts that are safe and useful to persist; no sampler or grid is retained. */
+VOXELFORGE_API FVoxelStrateMeasuredMetrics VF_SummarizeStrateMetrics(
+    const FVoxelStrateMetrics& Metrics);
 
 /** Native parameter storage for every currently supported strate archetype. */
 struct VOXELFORGE_API FVoxelStrateArchetypeParams
@@ -187,6 +237,129 @@ struct VOXELFORGE_API FVoxelStrateCorpusEntry
     // use 1.0. The field remains explicit so a future offline corpus can assign weights without
     // changing the roll algorithm.
     float Weight = 1.0f;
+
+    EVoxelStrateCorpusProvenance Provenance = EVoxelStrateCorpusProvenance::Project;
+
+    // Promoted entries retain their recipe and re-measured facts so the next policy decision can
+    // compare measured geometry, not only parameter-space distance. Project/default entries leave
+    // these fields unset unless an offline simulation explicitly measures them.
+    bool bHasRecipe = false;
+    FVoxelOpStackRecipe Recipe;
+    bool bHasMeasuredMetrics = false;
+    FVoxelStrateMeasuredMetrics MeasuredMetrics;
+
+    FString PromotionRecordId;
+    int32 PromotionSeason = INDEX_NONE;
+    int32 PromotionSeed = 0;
+    int32 PromotionCandidateIndex = INDEX_NONE;
+    uint32 PromotionInputCorpusHash = 0;
+};
+
+/** A candidate record that is eligible to be considered for corpus promotion. */
+struct VOXELFORGE_API FVoxelStratePromotableRecord
+{
+    FString RecordId;
+    int32 Season = 0;
+    int32 Seed = 0;
+    int32 CandidateIndex = INDEX_NONE;
+    uint32 InputCorpusHash = 0;
+
+    ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FVoxelStrateArchetypeParams Params;
+    FVoxelOpStackRecipe Recipe;
+    FVoxelStrateMeasuredMetrics MeasuredMetrics;
+
+    // These are recorded evidence for review. The loader deliberately ignores the stored metric
+    // and gate values and asks its verifier to rebuild/re-measure the recipe instead.
+    bool bPassedNonVacuous = false;
+    bool bPassedLargestComponent = false;
+    bool bPassedPrimordialLaw = false;
+};
+
+/** Fresh validation output used by the safe promoted-record loader. */
+struct VOXELFORGE_API FVoxelStratePromotionVerification
+{
+    bool bPassedNonVacuous = false;
+    bool bPassedLargestComponent = false;
+    bool bPassedPrimordialLaw = false;
+    FVoxelStrateMeasuredMetrics MeasuredMetrics;
+    FString FailureReason;
+
+    bool PassedAllGates() const
+    {
+        return bPassedNonVacuous && bPassedLargestComponent && bPassedPrimordialLaw
+            && MeasuredMetrics.IsUsable();
+    }
+};
+
+/**
+ * World-specific re-measurement seam for promoted records.
+ *
+ * A corpus store cannot know the active fixture, mouths, or validation window. Its caller must
+ * provide this verifier; a null verifier means promoted records are skipped rather than trusted.
+ */
+class VOXELFORGE_API IVoxelStratePromotionVerifier
+{
+public:
+    virtual ~IVoxelStratePromotionVerifier() = default;
+    virtual bool Verify(const FVoxelStratePromotableRecord& Record,
+                        FVoxelStratePromotionVerification& OutVerification) const = 0;
+
+    // Optional companion audit for project/default members. A policy pass can then compare a
+    // candidate against the measured corpus rather than falling back to parameter identity. A
+    // world-specific verifier may return false when that fixture cannot measure the member.
+    virtual bool MeasureCorpusEntry(const FVoxelStrateCorpusEntry& Entry,
+                                    FVoxelStrateMeasuredMetrics& OutMetrics) const
+    {
+        (void)Entry;
+        (void)OutMetrics;
+        return false;
+    }
+};
+
+/** Explicit, provisional Tier 5 policy. The owner can change these after seeing the preview. */
+struct VOXELFORGE_API FVoxelStratePromotionPolicy
+{
+    // Five normalized measured dimensions are compared with Euclidean distance. 0.20 is large
+    // enough to reject close copies while still admitting genuinely different geometry; it is a
+    // provisional review threshold, not a claim that this is the owner's final definition of good.
+    double MinimumNormalizedMeasuredMetricDistance = 0.20;
+    int32 MaxPromotionsPerSeason = 6;
+
+    // Physical normalization for the two unbounded-in-principle metric dimensions. Air fraction,
+    // largest share, and walkable fraction already live in [0,1].
+    float FeatureScaleNormalizationVoxels = 256.0f;
+    float ClearanceNormalizationVoxels = 64.0f;
+};
+
+/** Counters and accepted records from one deterministic policy pass. */
+struct VOXELFORGE_API FVoxelStratePromotionBatchResult
+{
+    bool bPolicyValid = false;
+    TArray<FVoxelStratePromotableRecord> Promoted;
+    int32 NumCandidates = 0;
+    int32 NumValidationRejected = 0;
+    int32 NumCorpusHashRejected = 0;
+    int32 NumNearDuplicateRejected = 0;
+    int32 NumCapRejected = 0;
+    double MinimumAcceptedDistance = 0.0;
+};
+
+/** One line of the diffable season manifest written beside the cumulative record store. */
+struct VOXELFORGE_API FVoxelStrateSeasonManifest
+{
+    int32 Season = 0;
+    int32 Seed = 0;
+    uint32 InputCorpusHash = 0;
+    int32 CandidateCount = 0;
+    int32 SurvivorCount = 0;
+    int32 PromotedCount = 0;
+    int32 CorpusSize = 0;
+    int32 ProjectCount = 0;
+    int32 DefaultCount = 0;
+    int32 PromotedCorpusCount = 0;
+    float SurvivalRate = 0.0f;
+    double MeasuredSpread = 0.0;
 };
 
 /** Result of one deterministic roll, including provenance for the offline report. */
@@ -243,15 +416,20 @@ struct VOXELFORGE_API FVoxelStrateComposerCandidate
  *
  * `LoadFromAssetRegistry` enumerates every project UVoxelStrateDefinition through the Asset
  * Registry, explicitly excluding Saved/Autosaves and Saved/Cooked copies. It also adds one
- * known-good default vector for every archetype/family in VoxelStrateTypes.h. Parents are selected
- * only inside the exact archetype group; no cross-archetype blend is attempted.
+ * known-good default vector for every archetype/family in VoxelStrateTypes.h, then optionally
+ * loads the cumulative promoted-record JSON store. Promoted records enter only after the caller's
+ * world-specific verifier rebuilds and remeasures them; with no verifier they are skipped safely.
+ * Parents are selected only inside the exact archetype group; no cross-archetype blend is attempted.
  */
 class VOXELFORGE_API FVoxelStrateCorpus
 {
 public:
     void Reset();
 
-    bool LoadFromAssetRegistry(FString& OutReport);
+    bool LoadFromAssetRegistry(
+        FString& OutReport,
+        const FString& PromotedStorePath = FString(),
+        const IVoxelStratePromotionVerifier* PromotionVerifier = nullptr);
 
     /**
      * Compatibility alias retained for callers compiled against the first Tier 4a pass. The
@@ -268,6 +446,15 @@ public:
                   ECaveGeneratorType Archetype, const FVoxelStrateArchetypeParams& Params,
                   float Weight = 1.0f);
 
+    /** Load cumulative promoted records, re-verifying every record before it enters Entries. */
+    bool LoadPromotedRecords(const FString& StorePath,
+                             const IVoxelStratePromotionVerifier* PromotionVerifier,
+                             FString& OutReport);
+
+    /** Attach an offline measurement to an existing member without changing corpus identity. */
+    bool SetMeasuredMetrics(const FString& SourcePath,
+                            const FVoxelStrateMeasuredMetrics& Metrics);
+
     bool IsValid() const { return bSchemaValid && Entries.Num() > 0; }
     bool IsSchemaValid() const { return bSchemaValid; }
     const FString& GetSchemaError() const { return SchemaError; }
@@ -278,6 +465,7 @@ public:
     const TArray<FString>& GetSkippedDefinitions() const { return SkippedDefinitions; }
 
     int32 NumForArchetype(ECaveGeneratorType Archetype) const;
+    int32 NumForProvenance(EVoxelStrateCorpusProvenance Provenance) const;
 
     const FVoxelStrateFieldSpread* FindSpread(
         ECaveGeneratorType Archetype, const FString& FieldName) const;
@@ -296,6 +484,18 @@ public:
     bool AreClampMetadataAvailableAtRuntime() const { return false; }
 
 private:
+    bool AddEntryInternal(const FString& SourcePath, const FString& SourceName,
+                          ECaveGeneratorType Archetype,
+                          const FVoxelStrateArchetypeParams& Params,
+                          float Weight, EVoxelStrateCorpusProvenance Provenance,
+                          const FVoxelOpStackRecipe* Recipe,
+                          const FVoxelStrateMeasuredMetrics* Metrics,
+                          const FString& PromotionRecordId,
+                          int32 PromotionSeason,
+                          int32 PromotionSeed,
+                          int32 PromotionCandidateIndex,
+                          uint32 PromotionInputCorpusHash,
+                          bool bRebuild);
     void RebuildSpreads();
 
     TArray<FVoxelStrateCorpusEntry> Entries;
@@ -308,6 +508,8 @@ private:
 
 /** Human-readable name used by the offline report. */
 VOXELFORGE_API const TCHAR* VF_GetStrateArchetypeName(ECaveGeneratorType Archetype);
+VOXELFORGE_API const TCHAR* VF_GetStrateCorpusProvenanceName(
+    EVoxelStrateCorpusProvenance Provenance);
 
 /** Full provenance result. Pure with respect to the corpus: no global or retained RNG state. */
 VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailed(
@@ -349,6 +551,30 @@ VOXELFORGE_API bool VF_ValidateStrateCorpusFreeConstraints(
     float StrateHeightInVoxels,
     FString& OutViolation);
 
+/** Normalized Euclidean distance in the five policy metric dimensions. */
+VOXELFORGE_API double VF_NormalizedMeasuredMetricDistance(
+    const FVoxelStrateMeasuredMetrics& A,
+    const FVoxelStrateMeasuredMetrics& B,
+    const FVoxelStratePromotionPolicy& Policy);
+
+/** Select deterministic, validated, varied records for one season. */
+VOXELFORGE_API FVoxelStratePromotionBatchResult VF_SelectStratePromotions(
+    const FVoxelStrateCorpus& Corpus,
+    const TArray<FVoxelStratePromotableRecord>& Candidates,
+    const FVoxelStratePromotionPolicy& Policy);
+
+/** Write/readable cumulative JSON store; records are sorted by RecordId before writing. */
+VOXELFORGE_API bool VF_SaveStratePromotedRecords(
+    const FString& StorePath,
+    const TArray<FVoxelStratePromotableRecord>& Records,
+    FString& OutReport);
+
+/** Write the matching season summary beside the promoted-record store. */
+VOXELFORGE_API bool VF_SaveStrateSeasonManifest(
+    const FString& ManifestPath,
+    const FVoxelStrateSeasonManifest& Manifest,
+    FString& OutReport);
+
 #if WITH_EDITOR
 /**
  * Roll one candidate for the editor walk-through path. Parameter rolls call
@@ -373,6 +599,16 @@ VOXELFORGE_API bool VF_BuildNativeStrateStackForCandidate(
     const UVoxelStrateManager* StrateManager,
     FVoxelOpStack& OutStack,
     FVoxelOpContext& OutContext);
+
+/** Build the persisted record from the exact editor candidate and its just-measured gate facts. */
+VOXELFORGE_API FVoxelStratePromotableRecord VF_MakeStratePromotableRecord(
+    const FVoxelStrateComposerCandidate& Candidate,
+    const FVoxelStrateMetrics& Metrics,
+    int32 Season,
+    uint32 InputCorpusHash,
+    bool bPassedNonVacuous,
+    bool bPassedLargestComponent,
+    bool bPassedPrimordialLaw);
 #endif
 
 /** Stable compact representation and equality/hash helpers for manifests and reports. */

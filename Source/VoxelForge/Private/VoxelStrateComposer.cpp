@@ -4,8 +4,15 @@
 
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Math/RandomStream.h"
 #include "Modules/ModuleManager.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 #include "UObject/EnumProperty.h"
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealType.h"
@@ -2254,6 +2261,806 @@ namespace
     }
 }
 
+bool FVoxelStrateMeasuredMetrics::IsUsable() const
+{
+    return bValid
+        && NumSampled > 0
+        && NumAir > 0
+        && NumSolid > 0
+        && NumSampled == NumAir + NumSolid
+        && NumAirComponents > 0
+        && LargestComponentCells > 0
+        && AirComponentCells.Num() == NumAirComponents
+        && FMath::IsFinite(AirFraction)
+        && FMath::IsFinite(LargestComponentShare)
+        && FMath::IsFinite(WalkableFraction)
+        && FMath::IsFinite(MedianFeatureScale)
+        && FMath::IsFinite(LargestComponentPoint.X)
+        && FMath::IsFinite(LargestComponentPoint.Y)
+        && FMath::IsFinite(LargestComponentPoint.Z);
+}
+
+FVoxelStrateMeasuredMetrics VF_SummarizeStrateMetrics(
+    const FVoxelStrateMetrics& Metrics)
+{
+    FVoxelStrateMeasuredMetrics Result;
+    Result.bValid = Metrics.bValid;
+    Result.NumSampled = Metrics.NumSampled;
+    Result.NumAir = Metrics.NumAir;
+    Result.NumSolid = Metrics.NumSolid;
+    Result.AirFraction = Metrics.AirFraction;
+    Result.NumAirComponents = Metrics.NumAirComponents;
+    Result.LargestComponentShare = Metrics.LargestComponentShare;
+    Result.LargestComponentPoint = Metrics.LargestComponentPoint;
+    Result.LargestComponentCells = Metrics.LargestComponentCells;
+    Result.NumComponentsAtLeast1Pct = Metrics.NumComponentsAtLeast1Pct;
+    Result.WalkableFraction = Metrics.WalkableFraction;
+    Result.MedianFeatureScale = Metrics.MedianFeatureScale;
+    Result.MedianVerticalClearance = Metrics.MedianVerticalClearance;
+    Result.ResolvedMarginVoxels = Metrics.ResolvedMarginVoxels;
+    Result.SampledMinZ = Metrics.SampledMinZ;
+    Result.SampledMaxZ = Metrics.SampledMaxZ;
+    Result.SampledNumX = Metrics.SampledNumX;
+    Result.SampledNumY = Metrics.SampledNumY;
+    Result.SampledNumZ = Metrics.SampledNumZ;
+    Result.SampledMinX = Metrics.SampledMinX;
+    Result.SampledMaxX = Metrics.SampledMaxX;
+    Result.SampledMinY = Metrics.SampledMinY;
+    Result.SampledMaxY = Metrics.SampledMaxY;
+    Result.AirComponentCells = Metrics.AirComponentCells;
+    return Result;
+}
+
+namespace
+{
+    constexpr int32 GPromotionStoreSchemaVersion = 2;
+
+    bool VF_GetJsonValue(const TSharedPtr<FJsonObject>& Object,
+                         const TCHAR* FieldName,
+                         EJson ExpectedType,
+                         TSharedPtr<FJsonValue>& OutValue)
+    {
+        OutValue.Reset();
+        if (!Object.IsValid())
+        {
+            return false;
+        }
+
+        const TSharedPtr<FJsonValue>* Found = Object->Values.Find(FieldName);
+        if (Found == nullptr || !Found->IsValid() || (*Found)->Type != ExpectedType)
+        {
+            return false;
+        }
+        OutValue = *Found;
+        return true;
+    }
+
+    bool VF_ReadJsonNumber(const TSharedPtr<FJsonObject>& Object,
+                           const TCHAR* FieldName, double& OutValue)
+    {
+        TSharedPtr<FJsonValue> Value;
+        if (!VF_GetJsonValue(Object, FieldName, EJson::Number, Value))
+        {
+            return false;
+        }
+        OutValue = Value->AsNumber();
+        return FMath::IsFinite(OutValue);
+    }
+
+    bool VF_ReadJsonNumber(const TSharedPtr<FJsonObject>& Object,
+                           const FString& FieldName, double& OutValue)
+    {
+        return VF_ReadJsonNumber(Object, *FieldName, OutValue);
+    }
+
+    bool VF_ReadJsonInt64(const TSharedPtr<FJsonObject>& Object,
+                          const TCHAR* FieldName, int64& OutValue)
+    {
+        double Number = 0.0;
+        if (!VF_ReadJsonNumber(Object, FieldName, Number)
+            || Number < -9223372036854775807.0
+            || Number > 9223372036854775807.0)
+        {
+            return false;
+        }
+        const int64 Integral = static_cast<int64>(Number);
+        if (static_cast<double>(Integral) != Number)
+        {
+            return false;
+        }
+        OutValue = Integral;
+        return true;
+    }
+
+    bool VF_ReadJsonInt32(const TSharedPtr<FJsonObject>& Object,
+                          const TCHAR* FieldName, int32& OutValue)
+    {
+        int64 Value = 0;
+        if (!VF_ReadJsonInt64(Object, FieldName, Value)
+            || Value < static_cast<int64>(TNumericLimits<int32>::Lowest())
+            || Value > static_cast<int64>(TNumericLimits<int32>::Max()))
+        {
+            return false;
+        }
+        OutValue = static_cast<int32>(Value);
+        return true;
+    }
+
+    bool VF_ReadJsonFloat(const TSharedPtr<FJsonObject>& Object,
+                          const TCHAR* FieldName, float& OutValue)
+    {
+        double Value = 0.0;
+        if (!VF_ReadJsonNumber(Object, FieldName, Value)
+            || Value < -static_cast<double>(TNumericLimits<float>::Max())
+            || Value > static_cast<double>(TNumericLimits<float>::Max()))
+        {
+            return false;
+        }
+        OutValue = static_cast<float>(Value);
+        return FMath::IsFinite(OutValue);
+    }
+
+    bool VF_ReadJsonBool(const TSharedPtr<FJsonObject>& Object,
+                         const TCHAR* FieldName, bool& OutValue)
+    {
+        TSharedPtr<FJsonValue> Value;
+        if (!VF_GetJsonValue(Object, FieldName, EJson::Boolean, Value))
+        {
+            return false;
+        }
+        OutValue = Value->AsBool();
+        return true;
+    }
+
+    bool VF_ReadJsonString(const TSharedPtr<FJsonObject>& Object,
+                           const TCHAR* FieldName, FString& OutValue)
+    {
+        TSharedPtr<FJsonValue> Value;
+        if (!VF_GetJsonValue(Object, FieldName, EJson::String, Value))
+        {
+            return false;
+        }
+        OutValue = Value->AsString();
+        return true;
+    }
+
+    bool VF_ReadJsonObject(const TSharedPtr<FJsonObject>& Object,
+                           const TCHAR* FieldName,
+                           TSharedPtr<FJsonObject>& OutValue)
+    {
+        TSharedPtr<FJsonValue> Value;
+        if (!VF_GetJsonValue(Object, FieldName, EJson::Object, Value))
+        {
+            return false;
+        }
+        OutValue = Value->AsObject();
+        return OutValue.IsValid();
+    }
+
+    bool VF_ReadJsonArray(const TSharedPtr<FJsonObject>& Object,
+                          const TCHAR* FieldName,
+                          const TArray<TSharedPtr<FJsonValue>>*& OutValue)
+    {
+        TSharedPtr<FJsonValue> Value;
+        if (!VF_GetJsonValue(Object, FieldName, EJson::Array, Value))
+        {
+            return false;
+        }
+        OutValue = &Value->AsArray();
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializeRecipeEntry(const FVoxelOpRecipeEntry& Entry)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetNumberField(TEXT("op_class"), static_cast<int32>(Entry.OpClass));
+        Object->SetNumberField(TEXT("param_block"), static_cast<int32>(Entry.ParamBlock));
+        return Object;
+    }
+
+    bool VF_DeserializeRecipeEntry(const TSharedPtr<FJsonObject>& Object,
+                                   FVoxelOpRecipeEntry& OutEntry)
+    {
+        int32 OpClass = 0;
+        int32 ParamBlock = 0;
+        if (!VF_ReadJsonInt32(Object, TEXT("op_class"), OpClass)
+            || !VF_ReadJsonInt32(Object, TEXT("param_block"), ParamBlock)
+            || OpClass < static_cast<int32>(EVoxelStrateOpClass::ConstantRockSource)
+            || OpClass > static_cast<int32>(EVoxelStrateOpClass::DensityNoiseFillMod)
+            || ParamBlock < static_cast<int32>(EVoxelStrateParamBlock::None)
+            || ParamBlock > static_cast<int32>(EVoxelStrateParamBlock::FloatingIsland))
+        {
+            return false;
+        }
+        OutEntry.OpClass = static_cast<EVoxelStrateOpClass>(OpClass);
+        OutEntry.ParamBlock = static_cast<EVoxelStrateParamBlock>(ParamBlock);
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializeRecipe(const FVoxelOpStackRecipe& Recipe)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetNumberField(TEXT("root_polarity"), static_cast<int32>(Recipe.RootPolarity));
+        Object->SetObjectField(TEXT("root"), VF_SerializeRecipeEntry(Recipe.Root));
+        Object->SetObjectField(TEXT("shape_source"), VF_SerializeRecipeEntry(Recipe.ShapeSource));
+        Object->SetObjectField(TEXT("conversion"), VF_SerializeRecipeEntry(Recipe.Conversion));
+        Object->SetNumberField(TEXT("structural_param_block"),
+                               static_cast<int32>(Recipe.StructuralParamBlock));
+
+        TArray<TSharedPtr<FJsonValue>> Modifiers;
+        Modifiers.Reserve(Recipe.Modifiers.Num());
+        for (const FVoxelOpRecipeEntry& Modifier : Recipe.Modifiers)
+        {
+            Modifiers.Add(MakeShared<FJsonValueObject>(VF_SerializeRecipeEntry(Modifier)));
+        }
+        Object->SetArrayField(TEXT("modifiers"), MoveTemp(Modifiers));
+        return Object;
+    }
+
+    bool VF_DeserializeRecipe(const TSharedPtr<FJsonObject>& Object,
+                              FVoxelOpStackRecipe& OutRecipe)
+    {
+        int32 RootPolarity = 0;
+        int32 StructuralParamBlock = 0;
+        TSharedPtr<FJsonObject> Root;
+        TSharedPtr<FJsonObject> ShapeSource;
+        TSharedPtr<FJsonObject> Conversion;
+        const TArray<TSharedPtr<FJsonValue>>* Modifiers = nullptr;
+        if (!VF_ReadJsonInt32(Object, TEXT("root_polarity"), RootPolarity)
+            || !VF_ReadJsonObject(Object, TEXT("root"), Root)
+            || !VF_ReadJsonObject(Object, TEXT("shape_source"), ShapeSource)
+            || !VF_ReadJsonObject(Object, TEXT("conversion"), Conversion)
+            || !VF_ReadJsonInt32(Object, TEXT("structural_param_block"), StructuralParamBlock)
+            || !VF_ReadJsonArray(Object, TEXT("modifiers"), Modifiers)
+            || RootPolarity < static_cast<int32>(EVoxelStrateRootPolarity::RockCarve)
+            || RootPolarity > static_cast<int32>(EVoxelStrateRootPolarity::VoidFill)
+            || StructuralParamBlock < static_cast<int32>(EVoxelStrateParamBlock::None)
+            || StructuralParamBlock > static_cast<int32>(EVoxelStrateParamBlock::FloatingIsland)
+            || Modifiers->Num() < 4 || Modifiers->Num() > 8
+            || !VF_DeserializeRecipeEntry(Root, OutRecipe.Root)
+            || !VF_DeserializeRecipeEntry(ShapeSource, OutRecipe.ShapeSource)
+            || !VF_DeserializeRecipeEntry(Conversion, OutRecipe.Conversion))
+        {
+            return false;
+        }
+
+        OutRecipe.RootPolarity = static_cast<EVoxelStrateRootPolarity>(RootPolarity);
+        OutRecipe.StructuralParamBlock = static_cast<EVoxelStrateParamBlock>(StructuralParamBlock);
+        OutRecipe.Modifiers.Reset();
+        OutRecipe.Modifiers.Reserve(Modifiers->Num());
+        for (const TSharedPtr<FJsonValue>& Value : *Modifiers)
+        {
+            if (!Value.IsValid() || Value->Type != EJson::Object)
+            {
+                return false;
+            }
+            FVoxelOpRecipeEntry& Entry = OutRecipe.Modifiers.AddDefaulted_GetRef();
+            if (!VF_DeserializeRecipeEntry(Value->AsObject(), Entry))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializeArchetypeParams(
+        ECaveGeneratorType Archetype,
+        const FVoxelStrateArchetypeParams& Params)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        const void* Memory = VF_GetParamMemory(Params, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Memory == nullptr || Struct == nullptr)
+        {
+            return Object;
+        }
+
+        if (VF_IsTunnelArchetype(Archetype))
+        {
+#define VF_JSON_WRITE_TUNNEL_LERPF(Name) \
+            do { \
+                const FString FieldName(TEXT(#Name)); \
+                if (!VF_IsExcludedForArchetype(Archetype, FieldName)) { \
+                    double Value = 0.0; \
+                    if (VF_ReadNamedField(Memory, Archetype, FieldName, Value)) \
+                    { Object->SetNumberField(FieldName, Value); } \
+                } \
+            } while (false);
+#define VF_JSON_WRITE_TUNNEL_SNAPF(Name) VF_JSON_WRITE_TUNNEL_LERPF(Name)
+            VF_STRATE_PARAM_FIELDS(VF_JSON_WRITE_TUNNEL_LERPF, VF_JSON_WRITE_TUNNEL_SNAPF)
+#undef VF_JSON_WRITE_TUNNEL_LERPF
+#undef VF_JSON_WRITE_TUNNEL_SNAPF
+            return Object;
+        }
+
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        TArray<FString> Names;
+        for (const TPair<FString, FProperty*>& Pair : Properties)
+        {
+            Names.Add(Pair.Key);
+        }
+        Names.Sort([](const FString& A, const FString& B) { return A < B; });
+        for (const FString& FieldName : Names)
+        {
+            if (VF_IsRuntimeField(FieldName) || VF_IsExcludedForArchetype(Archetype, FieldName))
+            {
+                continue;
+            }
+            FProperty* const* PropertyPtr = Properties.Find(FieldName);
+            if (PropertyPtr == nullptr || *PropertyPtr == nullptr
+                || !VF_IsScalarProperty(*PropertyPtr))
+            {
+                continue;
+            }
+            double Value = 0.0;
+            if (VF_ReadPropertyValue(*PropertyPtr, Memory, Value))
+            {
+                Object->SetNumberField(FieldName, Value);
+            }
+        }
+        return Object;
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializeAllArchetypeParams(
+        const FVoxelStrateArchetypeParams& Params)
+    {
+        // A recipe may read more than the active archetype's family (for example a tunnel
+        // modifier can be selected while the shape source belongs to another family). Persist
+        // the complete native parameter vector so re-verification measures the same recipe.
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetObjectField(TEXT("tunnel_network"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::TunnelNetwork, Params));
+        Object->SetObjectField(TEXT("slab"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::FlatPlain, Params));
+        Object->SetObjectField(TEXT("maze"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::Maze, Params));
+        Object->SetObjectField(TEXT("surface"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::SurfaceWorld, Params));
+        Object->SetObjectField(TEXT("vertical_shaft"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::VerticalShafts, Params));
+        Object->SetObjectField(TEXT("floating_island"),
+                               VF_SerializeArchetypeParams(
+                                   ECaveGeneratorType::FloatingIslands, Params));
+        return Object;
+    }
+
+    void VF_ResetParamFamily(FVoxelStrateArchetypeParams& Params,
+                             ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            Params.TunnelNetworkParams = FStrateGenerationParams();
+            break;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            Params.SlabParams = FSlabGenerationParams();
+            break;
+        case ECaveGeneratorType::Maze:
+            Params.MazeParams = FMazeGenerationParams();
+            break;
+        case ECaveGeneratorType::SurfaceWorld:
+            Params.SurfaceParams = FSurfaceGenerationParams();
+            break;
+        case ECaveGeneratorType::VerticalShafts:
+            Params.VerticalShaftParams = FVerticalShaftParams();
+            break;
+        case ECaveGeneratorType::FloatingIslands:
+            Params.FloatingIslandParams = FFloatingIslandParams();
+            break;
+        default:
+            break;
+        }
+    }
+
+    bool VF_DeserializeArchetypeParams(
+        ECaveGeneratorType Archetype,
+        const TSharedPtr<FJsonObject>& Object,
+        FVoxelStrateArchetypeParams& OutParams)
+    {
+        if (!Object.IsValid() || !VF_IsSupportedArchetype(Archetype))
+        {
+            return false;
+        }
+
+        // Reset only the family being read. The promoted record stores all families, and each
+        // successive call must preserve the values already decoded for the other families.
+        VF_ResetParamFamily(OutParams, Archetype);
+        void* Memory = VF_GetParamMemory(OutParams, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Memory == nullptr || Struct == nullptr)
+        {
+            return false;
+        }
+
+        bool bValid = true;
+        if (VF_IsTunnelArchetype(Archetype))
+        {
+#define VF_JSON_READ_TUNNEL_LERPF(Name) \
+            do { \
+                const FString FieldName(TEXT(#Name)); \
+                if (!VF_IsExcludedForArchetype(Archetype, FieldName)) { \
+                    double Value = 0.0; \
+                    const bool bFieldValid = VF_ReadJsonNumber(Object, FieldName, Value) \
+                        && VF_WriteNamedField(Memory, Archetype, FieldName, Value); \
+                    bValid = bFieldValid && bValid; \
+                } \
+            } while (false);
+#define VF_JSON_READ_TUNNEL_SNAPF(Name) VF_JSON_READ_TUNNEL_LERPF(Name)
+            VF_STRATE_PARAM_FIELDS(VF_JSON_READ_TUNNEL_LERPF, VF_JSON_READ_TUNNEL_SNAPF)
+#undef VF_JSON_READ_TUNNEL_LERPF
+#undef VF_JSON_READ_TUNNEL_SNAPF
+        }
+        else
+        {
+            TMap<FString, FProperty*> Properties;
+            VF_CollectProperties(Struct, Properties);
+            for (const TPair<FString, FProperty*>& Pair : Properties)
+            {
+                const FString& FieldName = Pair.Key;
+                if (VF_IsRuntimeField(FieldName) || VF_IsExcludedForArchetype(Archetype, FieldName)
+                    || Pair.Value == nullptr || !VF_IsScalarProperty(Pair.Value))
+                {
+                    continue;
+                }
+                double Value = 0.0;
+                const bool bFieldValid = VF_ReadJsonNumber(Object, FieldName, Value)
+                    && VF_WritePropertyValue(Pair.Value, Memory, Value);
+                bValid = bFieldValid && bValid;
+            }
+        }
+
+        VF_ResetExcludedFields(OutParams, Archetype);
+        return bValid;
+    }
+
+    bool VF_DeserializeAllArchetypeParams(
+        const TSharedPtr<FJsonObject>& Object,
+        FVoxelStrateArchetypeParams& OutParams)
+    {
+        if (!Object.IsValid())
+        {
+            return false;
+        }
+
+        TSharedPtr<FJsonObject> Tunnel;
+        TSharedPtr<FJsonObject> Slab;
+        TSharedPtr<FJsonObject> Maze;
+        TSharedPtr<FJsonObject> Surface;
+        TSharedPtr<FJsonObject> Vertical;
+        TSharedPtr<FJsonObject> Floating;
+        if (!VF_ReadJsonObject(Object, TEXT("tunnel_network"), Tunnel)
+            || !VF_ReadJsonObject(Object, TEXT("slab"), Slab)
+            || !VF_ReadJsonObject(Object, TEXT("maze"), Maze)
+            || !VF_ReadJsonObject(Object, TEXT("surface"), Surface)
+            || !VF_ReadJsonObject(Object, TEXT("vertical_shaft"), Vertical)
+            || !VF_ReadJsonObject(Object, TEXT("floating_island"), Floating))
+        {
+            return false;
+        }
+
+        OutParams = FVoxelStrateArchetypeParams();
+        bool bValid = true;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::TunnelNetwork, Tunnel, OutParams) && bValid;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::FlatPlain, Slab, OutParams) && bValid;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::Maze, Maze, OutParams) && bValid;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::SurfaceWorld, Surface, OutParams) && bValid;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::VerticalShafts, Vertical, OutParams) && bValid;
+        bValid = VF_DeserializeArchetypeParams(
+            ECaveGeneratorType::FloatingIslands, Floating, OutParams) && bValid;
+        return bValid;
+    }
+
+    void VF_SetJsonMetricNumbers(const TSharedPtr<FJsonObject>& Object,
+                                 const FVoxelStrateMeasuredMetrics& Metrics)
+    {
+        Object->SetBoolField(TEXT("valid"), Metrics.bValid);
+        Object->SetNumberField(TEXT("num_sampled"), static_cast<double>(Metrics.NumSampled));
+        Object->SetNumberField(TEXT("num_air"), static_cast<double>(Metrics.NumAir));
+        Object->SetNumberField(TEXT("num_solid"), static_cast<double>(Metrics.NumSolid));
+        Object->SetNumberField(TEXT("air_fraction"), Metrics.AirFraction);
+        Object->SetNumberField(TEXT("num_air_components"), Metrics.NumAirComponents);
+        Object->SetNumberField(TEXT("largest_component_share"), Metrics.LargestComponentShare);
+        Object->SetNumberField(TEXT("largest_component_cells"),
+                               static_cast<double>(Metrics.LargestComponentCells));
+        Object->SetNumberField(TEXT("num_components_at_least_1_pct"),
+                               Metrics.NumComponentsAtLeast1Pct);
+        Object->SetNumberField(TEXT("walkable_fraction"), Metrics.WalkableFraction);
+        Object->SetNumberField(TEXT("median_feature_scale"), Metrics.MedianFeatureScale);
+        Object->SetNumberField(TEXT("median_vertical_clearance"), Metrics.MedianVerticalClearance);
+        Object->SetNumberField(TEXT("resolved_margin_voxels"), Metrics.ResolvedMarginVoxels);
+        Object->SetNumberField(TEXT("sampled_min_z"), Metrics.SampledMinZ);
+        Object->SetNumberField(TEXT("sampled_max_z"), Metrics.SampledMaxZ);
+        Object->SetNumberField(TEXT("sampled_num_x"), Metrics.SampledNumX);
+        Object->SetNumberField(TEXT("sampled_num_y"), Metrics.SampledNumY);
+        Object->SetNumberField(TEXT("sampled_num_z"), Metrics.SampledNumZ);
+        Object->SetNumberField(TEXT("sampled_min_x"), Metrics.SampledMinX);
+        Object->SetNumberField(TEXT("sampled_max_x"), Metrics.SampledMaxX);
+        Object->SetNumberField(TEXT("sampled_min_y"), Metrics.SampledMinY);
+        Object->SetNumberField(TEXT("sampled_max_y"), Metrics.SampledMaxY);
+
+        TSharedPtr<FJsonObject> Point = MakeShared<FJsonObject>();
+        Point->SetNumberField(TEXT("x"), Metrics.LargestComponentPoint.X);
+        Point->SetNumberField(TEXT("y"), Metrics.LargestComponentPoint.Y);
+        Point->SetNumberField(TEXT("z"), Metrics.LargestComponentPoint.Z);
+        Object->SetObjectField(TEXT("largest_component_point"), Point);
+
+        TArray<TSharedPtr<FJsonValue>> Components;
+        Components.Reserve(Metrics.AirComponentCells.Num());
+        for (const int64 Cells : Metrics.AirComponentCells)
+        {
+            Components.Add(MakeShared<FJsonValueNumber>(static_cast<double>(Cells)));
+        }
+        Object->SetArrayField(TEXT("air_component_cells"), MoveTemp(Components));
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializeMetrics(const FVoxelStrateMeasuredMetrics& Metrics)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        VF_SetJsonMetricNumbers(Object, Metrics);
+        return Object;
+    }
+
+    bool VF_DeserializeMetrics(const TSharedPtr<FJsonObject>& Object,
+                               FVoxelStrateMeasuredMetrics& OutMetrics)
+    {
+        if (!Object.IsValid())
+        {
+            return false;
+        }
+
+        bool bValid = true;
+        bValid = VF_ReadJsonBool(Object, TEXT("valid"), OutMetrics.bValid) && bValid;
+        bValid = VF_ReadJsonInt64(Object, TEXT("num_sampled"), OutMetrics.NumSampled) && bValid;
+        bValid = VF_ReadJsonInt64(Object, TEXT("num_air"), OutMetrics.NumAir) && bValid;
+        bValid = VF_ReadJsonInt64(Object, TEXT("num_solid"), OutMetrics.NumSolid) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("air_fraction"), OutMetrics.AirFraction) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("num_air_components"), OutMetrics.NumAirComponents) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("largest_component_share"),
+                                  OutMetrics.LargestComponentShare) && bValid;
+        bValid = VF_ReadJsonInt64(Object, TEXT("largest_component_cells"),
+                                  OutMetrics.LargestComponentCells) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("num_components_at_least_1_pct"),
+                                  OutMetrics.NumComponentsAtLeast1Pct) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("walkable_fraction"), OutMetrics.WalkableFraction) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("median_feature_scale"),
+                                  OutMetrics.MedianFeatureScale) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("median_vertical_clearance"),
+                                  OutMetrics.MedianVerticalClearance) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("resolved_margin_voxels"),
+                                  OutMetrics.ResolvedMarginVoxels) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("sampled_min_z"), OutMetrics.SampledMinZ) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("sampled_max_z"), OutMetrics.SampledMaxZ) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("sampled_num_x"), OutMetrics.SampledNumX) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("sampled_num_y"), OutMetrics.SampledNumY) && bValid;
+        bValid = VF_ReadJsonInt32(Object, TEXT("sampled_num_z"), OutMetrics.SampledNumZ) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("sampled_min_x"), OutMetrics.SampledMinX) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("sampled_max_x"), OutMetrics.SampledMaxX) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("sampled_min_y"), OutMetrics.SampledMinY) && bValid;
+        bValid = VF_ReadJsonFloat(Object, TEXT("sampled_max_y"), OutMetrics.SampledMaxY) && bValid;
+
+        TSharedPtr<FJsonObject> Point;
+        bValid = VF_ReadJsonObject(Object, TEXT("largest_component_point"), Point) && bValid;
+        if (Point.IsValid())
+        {
+            bValid = VF_ReadJsonNumber(Point, TEXT("x"), OutMetrics.LargestComponentPoint.X) && bValid;
+            bValid = VF_ReadJsonNumber(Point, TEXT("y"), OutMetrics.LargestComponentPoint.Y) && bValid;
+            bValid = VF_ReadJsonNumber(Point, TEXT("z"), OutMetrics.LargestComponentPoint.Z) && bValid;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Components = nullptr;
+        bValid = VF_ReadJsonArray(Object, TEXT("air_component_cells"), Components) && bValid;
+        OutMetrics.AirComponentCells.Reset();
+        if (Components != nullptr)
+        {
+            OutMetrics.AirComponentCells.Reserve(Components->Num());
+            for (const TSharedPtr<FJsonValue>& Value : *Components)
+            {
+                if (!Value.IsValid() || Value->Type != EJson::Number
+                    || !FMath::IsFinite(Value->AsNumber()))
+                {
+                    bValid = false;
+                    continue;
+                }
+                const double Number = Value->AsNumber();
+                const int64 Cells = static_cast<int64>(Number);
+                if (Number < 0.0 || static_cast<double>(Cells) != Number)
+                {
+                    bValid = false;
+                    continue;
+                }
+                OutMetrics.AirComponentCells.Add(Cells);
+            }
+        }
+        return bValid;
+    }
+
+    TSharedPtr<FJsonObject> VF_SerializePromotableRecord(
+        const FVoxelStratePromotableRecord& Record)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetStringField(TEXT("record_id"), Record.RecordId);
+        Object->SetNumberField(TEXT("season"), Record.Season);
+        Object->SetNumberField(TEXT("seed"), Record.Seed);
+        Object->SetNumberField(TEXT("candidate_index"), Record.CandidateIndex);
+        Object->SetNumberField(TEXT("input_corpus_hash"),
+                               static_cast<double>(Record.InputCorpusHash));
+        Object->SetStringField(TEXT("archetype"), VF_GetStrateArchetypeName(Record.Archetype));
+        Object->SetObjectField(TEXT("parameters"),
+                               VF_SerializeAllArchetypeParams(Record.Params));
+        Object->SetObjectField(TEXT("recipe"), VF_SerializeRecipe(Record.Recipe));
+        Object->SetObjectField(TEXT("measured_metrics"), VF_SerializeMetrics(Record.MeasuredMetrics));
+        Object->SetBoolField(TEXT("passed_non_vacuous"), Record.bPassedNonVacuous);
+        Object->SetBoolField(TEXT("passed_largest_component"), Record.bPassedLargestComponent);
+        Object->SetBoolField(TEXT("passed_primordial_law"), Record.bPassedPrimordialLaw);
+        return Object;
+    }
+
+    bool VF_DeserializePromotableRecord(
+        const TSharedPtr<FJsonObject>& Object,
+        FVoxelStratePromotableRecord& OutRecord)
+    {
+        if (!Object.IsValid()
+            || !VF_ReadJsonString(Object, TEXT("record_id"), OutRecord.RecordId)
+            || OutRecord.RecordId.IsEmpty()
+            || !VF_ReadJsonInt32(Object, TEXT("season"), OutRecord.Season)
+            || !VF_ReadJsonInt32(Object, TEXT("seed"), OutRecord.Seed)
+            || !VF_ReadJsonInt32(Object, TEXT("candidate_index"), OutRecord.CandidateIndex))
+        {
+            return false;
+        }
+
+        int64 CorpusHash = 0;
+        FString ArchetypeName;
+        TSharedPtr<FJsonObject> Params;
+        TSharedPtr<FJsonObject> Recipe;
+        TSharedPtr<FJsonObject> Metrics;
+        if (!VF_ReadJsonInt64(Object, TEXT("input_corpus_hash"), CorpusHash)
+            || CorpusHash <= 0 || CorpusHash > static_cast<int64>(TNumericLimits<uint32>::Max())
+            || !VF_ReadJsonString(Object, TEXT("archetype"), ArchetypeName)
+            || !VF_ReadJsonObject(Object, TEXT("parameters"), Params)
+            || !VF_ReadJsonObject(Object, TEXT("recipe"), Recipe)
+            || !VF_ReadJsonObject(Object, TEXT("measured_metrics"), Metrics)
+            || !VF_ReadJsonBool(Object, TEXT("passed_non_vacuous"), OutRecord.bPassedNonVacuous)
+            || !VF_ReadJsonBool(Object, TEXT("passed_largest_component"), OutRecord.bPassedLargestComponent)
+            || !VF_ReadJsonBool(Object, TEXT("passed_primordial_law"), OutRecord.bPassedPrimordialLaw))
+        {
+            return false;
+        }
+
+        bool bArchetypeFound = false;
+        for (const ECaveGeneratorType Archetype : GAllArchetypes)
+        {
+            if (ArchetypeName == VF_GetStrateArchetypeName(Archetype))
+            {
+                OutRecord.Archetype = Archetype;
+                bArchetypeFound = true;
+                break;
+            }
+        }
+        if (!bArchetypeFound
+            || !VF_DeserializeAllArchetypeParams(Params, OutRecord.Params)
+            || !VF_DeserializeRecipe(Recipe, OutRecord.Recipe)
+            || !VF_DeserializeMetrics(Metrics, OutRecord.MeasuredMetrics))
+        {
+            return false;
+        }
+        OutRecord.InputCorpusHash = static_cast<uint32>(CorpusHash);
+        return true;
+    }
+
+    bool VF_MeasuredMetricsExactlyEqual(const FVoxelStrateMeasuredMetrics& A,
+                                        const FVoxelStrateMeasuredMetrics& B)
+    {
+        return A.bValid == B.bValid
+            && A.NumSampled == B.NumSampled
+            && A.NumAir == B.NumAir
+            && A.NumSolid == B.NumSolid
+            && A.AirFraction == B.AirFraction
+            && A.NumAirComponents == B.NumAirComponents
+            && A.LargestComponentShare == B.LargestComponentShare
+            && A.LargestComponentPoint == B.LargestComponentPoint
+            && A.LargestComponentCells == B.LargestComponentCells
+            && A.NumComponentsAtLeast1Pct == B.NumComponentsAtLeast1Pct
+            && A.WalkableFraction == B.WalkableFraction
+            && A.MedianFeatureScale == B.MedianFeatureScale
+            && A.MedianVerticalClearance == B.MedianVerticalClearance
+            && A.ResolvedMarginVoxels == B.ResolvedMarginVoxels
+            && A.SampledMinZ == B.SampledMinZ
+            && A.SampledMaxZ == B.SampledMaxZ
+            && A.SampledNumX == B.SampledNumX
+            && A.SampledNumY == B.SampledNumY
+            && A.SampledNumZ == B.SampledNumZ
+            && A.SampledMinX == B.SampledMinX
+            && A.SampledMaxX == B.SampledMaxX
+            && A.SampledMinY == B.SampledMinY
+            && A.SampledMaxY == B.SampledMaxY
+            && A.AirComponentCells == B.AirComponentCells;
+    }
+
+    bool VF_SaveJsonObject(const FString& FilePath,
+                           const TSharedPtr<FJsonObject>& Object,
+                           FString& OutError)
+    {
+        const FString Directory = FPaths::GetPath(FilePath);
+        if (!Directory.IsEmpty() && !IFileManager::Get().MakeDirectory(*Directory, true))
+        {
+            OutError = FString::Printf(TEXT("could not create JSON directory %s"), *Directory);
+            return false;
+        }
+
+        FString JsonText;
+        TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonText);
+        if (!FJsonSerializer::Serialize(Object.ToSharedRef(), Writer) || !Writer->Close())
+        {
+            OutError = FString::Printf(TEXT("could not serialise JSON for %s"), *FilePath);
+            return false;
+        }
+        if (!FFileHelper::SaveStringToFile(JsonText, *FilePath))
+        {
+            OutError = FString::Printf(TEXT("could not write JSON file %s"), *FilePath);
+            return false;
+        }
+        return true;
+    }
+
+    bool VF_LoadJsonObject(const FString& FilePath,
+                           TSharedPtr<FJsonObject>& OutObject,
+                           FString& OutError)
+    {
+        FString JsonText;
+        if (!FFileHelper::LoadFileToString(JsonText, *FilePath))
+        {
+            OutError = FString::Printf(TEXT("could not read JSON file %s"), *FilePath);
+            return false;
+        }
+
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+        if (!FJsonSerializer::Deserialize(Reader, OutObject) || !OutObject.IsValid())
+        {
+            OutError = FString::Printf(TEXT("invalid JSON in %s"), *FilePath);
+            return false;
+        }
+        return true;
+    }
+
+    FString VF_PromotionSortKey(const FVoxelStratePromotableRecord& Record)
+    {
+        if (!Record.RecordId.IsEmpty())
+        {
+            return Record.RecordId;
+        }
+        return FString::Printf(TEXT("season_%08d_seed_%08d_candidate_%08d_archetype_%d_recipe_%08x"),
+                               Record.Season, Record.Seed, Record.CandidateIndex,
+                               static_cast<int32>(static_cast<uint8>(Record.Archetype)),
+                               VF_HashStrateStructureRecipe(Record.Recipe));
+    }
+
+    bool VF_MetricsAreFinite(const FVoxelStrateMeasuredMetrics& Metrics)
+    {
+        return FMath::IsFinite(Metrics.AirFraction)
+            && FMath::IsFinite(Metrics.LargestComponentShare)
+            && FMath::IsFinite(Metrics.WalkableFraction)
+            && FMath::IsFinite(Metrics.MedianFeatureScale)
+            && FMath::IsFinite(Metrics.LargestComponentPoint.X)
+            && FMath::IsFinite(Metrics.LargestComponentPoint.Y)
+            && FMath::IsFinite(Metrics.LargestComponentPoint.Z);
+    }
+}
+
 const TArray<FVoxelStrateFieldExclusion>& FVoxelStrateCorpus::GetNonTunableFields()
 {
     static const TArray<FVoxelStrateFieldExclusion> Exclusions = []
@@ -2412,7 +3219,32 @@ void FVoxelStrateCorpus::RebuildSpreads()
 
     for (int32 FieldIndex = 0; FieldIndex < FieldSpreads.Num(); ++FieldIndex)
     {
-        FieldSpreads[FieldIndex].AuthoredSampleCount = Values[FieldIndex].Num();
+        int32 AuthoredSampleCount = 0;
+        int32 PromotedSampleCount = 0;
+        for (const FVoxelStrateCorpusEntry& Entry : Entries)
+        {
+            if (Entry.Archetype != FieldSpreads[FieldIndex].Archetype)
+            {
+                continue;
+            }
+            double Value = 0.0;
+            const void* Memory = VF_GetParamMemory(Entry.ArchetypeParams, Entry.Archetype);
+            if (Memory != nullptr
+                && VF_ReadNamedField(Memory, Entry.Archetype, FieldSpreads[FieldIndex].FieldName, Value)
+                && FMath::IsFinite(Value))
+            {
+                if (Entry.Provenance == EVoxelStrateCorpusProvenance::Promoted)
+                {
+                    ++PromotedSampleCount;
+                }
+                else
+                {
+                    ++AuthoredSampleCount;
+                }
+            }
+        }
+        FieldSpreads[FieldIndex].AuthoredSampleCount = AuthoredSampleCount;
+        FieldSpreads[FieldIndex].PromotedSampleCount = PromotedSampleCount;
     }
     VF_AddTerrainOperationDefaultSamples(Values, FieldSpreads);
 
@@ -2420,7 +3252,8 @@ void FVoxelStrateCorpus::RebuildSpreads()
     {
         FVoxelStrateFieldSpread& Spread = FieldSpreads[FieldIndex];
         const TArray<double>& Samples = Values[FieldIndex];
-        Spread.DefaultSeedCount = Samples.Num() - Spread.AuthoredSampleCount;
+        Spread.DefaultSeedCount = Samples.Num() - Spread.AuthoredSampleCount
+            - Spread.PromotedSampleCount;
         Spread.SampleCount = Samples.Num();
         if (Samples.Num() == 0)
         {
@@ -2467,6 +3300,24 @@ bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& Sour
                                   ECaveGeneratorType Archetype,
                                   const FVoxelStrateArchetypeParams& Params, float Weight)
 {
+    return AddEntryInternal(SourcePath, SourceName, Archetype, Params, Weight,
+                            EVoxelStrateCorpusProvenance::Project,
+                            nullptr, nullptr, FString(), INDEX_NONE, 0, INDEX_NONE, 0, true);
+}
+
+bool FVoxelStrateCorpus::AddEntryInternal(
+    const FString& SourcePath, const FString& SourceName,
+    ECaveGeneratorType Archetype, const FVoxelStrateArchetypeParams& Params,
+    float Weight, EVoxelStrateCorpusProvenance Provenance,
+    const FVoxelOpStackRecipe* Recipe,
+    const FVoxelStrateMeasuredMetrics* Metrics,
+    const FString& PromotionRecordId,
+    int32 PromotionSeason,
+    int32 PromotionSeed,
+    int32 PromotionCandidateIndex,
+    uint32 PromotionInputCorpusHash,
+    bool bRebuild)
+{
     if (!VF_IsSupportedArchetype(Archetype))
     {
         SkippedDefinitions.Add(FString::Printf(
@@ -2489,6 +3340,22 @@ bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& Sour
     Entry.ArchetypeParams = Params;
     Entry.Params = Params.TunnelNetworkParams;
     Entry.Weight = Weight;
+    Entry.Provenance = Provenance;
+    Entry.bHasRecipe = Recipe != nullptr;
+    if (Recipe != nullptr)
+    {
+        Entry.Recipe = *Recipe;
+    }
+    Entry.bHasMeasuredMetrics = Metrics != nullptr;
+    if (Metrics != nullptr)
+    {
+        Entry.MeasuredMetrics = *Metrics;
+    }
+    Entry.PromotionRecordId = PromotionRecordId;
+    Entry.PromotionSeason = PromotionSeason;
+    Entry.PromotionSeed = PromotionSeed;
+    Entry.PromotionCandidateIndex = PromotionCandidateIndex;
+    Entry.PromotionInputCorpusHash = PromotionInputCorpusHash;
 
     Entries.Sort([](const FVoxelStrateCorpusEntry& A, const FVoxelStrateCorpusEntry& B)
     {
@@ -2499,7 +3366,10 @@ bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& Sour
         }
         return A.SourceName < B.SourceName;
     });
-    RebuildSpreads();
+    if (bRebuild)
+    {
+        RebuildSpreads();
+    }
     return true;
 }
 
@@ -2570,7 +3440,9 @@ bool FVoxelStrateCorpus::LoadFromDefinitions(
         const FString DefaultPath = FString::Printf(
             TEXT("/VoxelForge/ComposerDefaults/%s"), *ArchetypeName);
         const FString DefaultName = FString::Printf(TEXT("Default_%s"), *ArchetypeName);
-        if (AddEntry(DefaultPath, DefaultName, Archetype, Defaults, 1.0f))
+        if (AddEntryInternal(DefaultPath, DefaultName, Archetype, Defaults, 1.0f,
+                             EVoxelStrateCorpusProvenance::Default,
+                             nullptr, nullptr, FString(), INDEX_NONE, 0, INDEX_NONE, 0, true))
         {
             ++NumDefaultEntries;
         }
@@ -2612,7 +3484,10 @@ static bool VF_IsIgnoredSavedCopy(const FString& PackagePath)
         || PackagePath.Contains(TEXT("/Saved/Cooked"), ESearchCase::IgnoreCase);
 }
 
-bool FVoxelStrateCorpus::LoadFromAssetRegistry(FString& OutReport)
+bool FVoxelStrateCorpus::LoadFromAssetRegistry(
+    FString& OutReport,
+    const FString& PromotedStorePath,
+    const IVoxelStratePromotionVerifier* PromotionVerifier)
 {
     FAssetRegistryModule& AssetRegistryModule =
         FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -2663,13 +3538,60 @@ bool FVoxelStrateCorpus::LoadFromAssetRegistry(FString& OutReport)
 
     FString DefinitionReport;
     const bool bLoaded = LoadFromDefinitions(Definitions, DefinitionReport);
+    int32 NumBaseMetricsMeasured = 0;
+    int32 NumBaseMetricsUnusable = 0;
+    int32 NumBaseMetricsUnavailable = 0;
+    if (PromotionVerifier != nullptr)
+    {
+        for (FVoxelStrateCorpusEntry& Entry : Entries)
+        {
+            if (Entry.Provenance == EVoxelStrateCorpusProvenance::Promoted)
+            {
+                continue;
+            }
+
+            FVoxelStrateMeasuredMetrics Metrics;
+            if (PromotionVerifier->MeasureCorpusEntry(Entry, Metrics)
+                && Metrics.bValid)
+            {
+                Entry.MeasuredMetrics = Metrics;
+                Entry.bHasMeasuredMetrics = true;
+                ++NumBaseMetricsMeasured;
+                if (!Metrics.IsUsable())
+                {
+                    ++NumBaseMetricsUnusable;
+                }
+            }
+            else
+            {
+                Entry.bHasMeasuredMetrics = false;
+                ++NumBaseMetricsUnavailable;
+            }
+        }
+    }
     OutReport = FString::Printf(
         TEXT("Asset Registry strate scan: %d records; %d project candidates; %d Saved/Autosaves "
              "or Saved/Cooked copies ignored; %d outside project; %d duplicate records; %d unresolved. "
-             "%s"),
+             "%s Base metric audit: %d measured (%d usable, %d vacuous), %d unavailable."),
         AssetData.Num(), SeenObjectPaths.Num(), NumIgnoredSaved, NumOutsideProject,
-        NumDuplicateRecords, NumUnresolved, *DefinitionReport);
-    return bLoaded && NumUnresolved == 0;
+        NumDuplicateRecords, NumUnresolved, *DefinitionReport,
+        NumBaseMetricsMeasured, NumBaseMetricsMeasured - NumBaseMetricsUnusable,
+        NumBaseMetricsUnusable, NumBaseMetricsUnavailable);
+
+    const FString ResolvedPromotedStorePath = PromotedStorePath.IsEmpty()
+        ? FPaths::ProjectSavedDir() / TEXT("VoxelForge") / TEXT("StrateCorpus")
+            / TEXT("promoted_strates.json")
+        : PromotedStorePath;
+    FString PromotedReport;
+    const bool bPromotedLoaded = LoadPromotedRecords(
+        ResolvedPromotedStorePath, PromotionVerifier, PromotedReport);
+    OutReport += FString::Printf(
+        TEXT(" Promotion store: %s Membership provenance: project=%d default=%d promoted=%d."),
+        *PromotedReport,
+        NumForProvenance(EVoxelStrateCorpusProvenance::Project),
+        NumForProvenance(EVoxelStrateCorpusProvenance::Default),
+        NumForProvenance(EVoxelStrateCorpusProvenance::Promoted));
+    return bLoaded && NumUnresolved == 0 && bPromotedLoaded;
 }
 
 bool FVoxelStrateCorpus::LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport)
@@ -2727,6 +3649,19 @@ int32 FVoxelStrateCorpus::NumForArchetype(ECaveGeneratorType Archetype) const
     for (const FVoxelStrateCorpusEntry& Entry : Entries)
     {
         if (Entry.Archetype == Archetype)
+        {
+            ++Count;
+        }
+    }
+    return Count;
+}
+
+int32 FVoxelStrateCorpus::NumForProvenance(EVoxelStrateCorpusProvenance Provenance) const
+{
+    int32 Count = 0;
+    for (const FVoxelStrateCorpusEntry& Entry : Entries)
+    {
+        if (Entry.Provenance == Provenance)
         {
             ++Count;
         }
@@ -2796,6 +3731,19 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
         const uint8 Archetype = static_cast<uint8>(Entry.Archetype);
         HashBytes(&Archetype, sizeof(Archetype));
         HashBytes(&Entry.Weight, sizeof(Entry.Weight));
+        const bool bPromotedEntry = Entry.Provenance == EVoxelStrateCorpusProvenance::Promoted;
+
+        // Preserve the Tier 4 hash byte-for-byte for the existing project/default corpus. A
+        // promoted member is a new input, however, and its recipe must participate in the hash so
+        // a season can be reproduced from exactly the same cumulative corpus contents.
+        if (bPromotedEntry)
+        {
+            const uint8 PromotedMarker = 1;
+            HashBytes(&PromotedMarker, sizeof(PromotedMarker));
+            const uint32 RecipeHash = Entry.bHasRecipe
+                ? VF_HashStrateStructureRecipe(Entry.Recipe) : 0U;
+            HashBytes(&RecipeHash, sizeof(RecipeHash));
+        }
 
         const void* Memory = VF_GetParamMemory(Entry.ArchetypeParams, Entry.Archetype);
         UStruct* Struct = VF_GetParamStruct(Entry.Archetype);
@@ -2807,9 +3755,11 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
         if (VF_IsTunnelArchetype(Entry.Archetype))
         {
 #define VF_HASH_FSTRATE_FIELD(Name) \
-            HashString(TEXT(#Name)); \
-            HashBytes(&Entry.ArchetypeParams.TunnelNetworkParams.Name, \
-                      sizeof(Entry.ArchetypeParams.TunnelNetworkParams.Name));
+            if (!bPromotedEntry || !VF_IsRuntimeField(TEXT(#Name))) { \
+                HashString(TEXT(#Name)); \
+                HashBytes(&Entry.ArchetypeParams.TunnelNetworkParams.Name, \
+                          sizeof(Entry.ArchetypeParams.TunnelNetworkParams.Name)); \
+            }
             VF_STRATE_PARAM_FIELDS(VF_HASH_FSTRATE_FIELD, VF_HASH_FSTRATE_FIELD)
 #undef VF_HASH_FSTRATE_FIELD
         }
@@ -2834,10 +3784,76 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
             for (const TCHAR* RuntimeField : RuntimeFields)
             {
                 double Value = 0.0;
-                if (VF_ReadNamedField(Memory, Entry.Archetype, RuntimeField, Value))
+                if (!bPromotedEntry
+                    && VF_ReadNamedField(Memory, Entry.Archetype, RuntimeField, Value))
                 {
                     HashString(RuntimeField);
                     HashBytes(&Value, sizeof(Value));
+                }
+            }
+        }
+
+        if (bPromotedEntry)
+        {
+            // Promoted recipes carry all six native families. Include the complete vector in the
+            // cumulative corpus identity, while omitting runtime Z bounds so a saved record and
+            // its reloaded form hash identically.
+            const ECaveGeneratorType Families[] =
+            {
+                ECaveGeneratorType::TunnelNetwork,
+                ECaveGeneratorType::FlatPlain,
+                ECaveGeneratorType::Maze,
+                ECaveGeneratorType::SurfaceWorld,
+                ECaveGeneratorType::VerticalShafts,
+                ECaveGeneratorType::FloatingIslands,
+            };
+            for (const ECaveGeneratorType Family : Families)
+            {
+                const uint8 FamilyCode = static_cast<uint8>(Family);
+                HashBytes(&FamilyCode, sizeof(FamilyCode));
+                const void* FamilyMemory = VF_GetParamMemory(Entry.ArchetypeParams, Family);
+                UStruct* FamilyStruct = VF_GetParamStruct(Family);
+                if (FamilyMemory == nullptr || FamilyStruct == nullptr)
+                {
+                    continue;
+                }
+
+                if (VF_IsTunnelArchetype(Family))
+                {
+#define VF_HASH_PROMOTED_TUNNEL_FIELD(Name) \
+                    if (!VF_IsRuntimeField(TEXT(#Name))) { \
+                        HashString(TEXT(#Name)); \
+                        HashBytes(&Entry.ArchetypeParams.TunnelNetworkParams.Name, \
+                                  sizeof(Entry.ArchetypeParams.TunnelNetworkParams.Name)); \
+                    }
+                    VF_STRATE_PARAM_FIELDS(VF_HASH_PROMOTED_TUNNEL_FIELD, VF_HASH_PROMOTED_TUNNEL_FIELD)
+#undef VF_HASH_PROMOTED_TUNNEL_FIELD
+                }
+                else
+                {
+                    TMap<FString, FProperty*> FamilyProperties;
+                    VF_CollectProperties(FamilyStruct, FamilyProperties);
+                    TArray<FString> FamilyNames;
+                    for (const TPair<FString, FProperty*>& Pair : FamilyProperties)
+                    {
+                        FamilyNames.Add(Pair.Key);
+                    }
+                    FamilyNames.Sort([](const FString& A, const FString& B)
+                    {
+                        return A < B;
+                    });
+                    for (const FString& FieldName : FamilyNames)
+                    {
+                        const FProperty* const* PropertyPtr = FamilyProperties.Find(FieldName);
+                        if (PropertyPtr == nullptr || *PropertyPtr == nullptr
+                            || !VF_IsScalarProperty(*PropertyPtr))
+                        {
+                            continue;
+                        }
+                        HashString(FieldName);
+                        const void* ValuePtr = (*PropertyPtr)->ContainerPtrToValuePtr<void>(FamilyMemory);
+                        HashBytes(ValuePtr, (*PropertyPtr)->GetSize());
+                    }
                 }
             }
         }
@@ -2859,6 +3875,17 @@ const TCHAR* VF_GetStrateArchetypeName(ECaveGeneratorType Archetype)
     case ECaveGeneratorType::Underwater:      return TEXT("Underwater");
     }
     return TEXT("Unknown");
+}
+
+const TCHAR* VF_GetStrateCorpusProvenanceName(EVoxelStrateCorpusProvenance Provenance)
+{
+    switch (Provenance)
+    {
+    case EVoxelStrateCorpusProvenance::Project:  return TEXT("project");
+    case EVoxelStrateCorpusProvenance::Default:  return TEXT("default");
+    case EVoxelStrateCorpusProvenance::Promoted: return TEXT("promoted");
+    }
+    return TEXT("unknown");
 }
 
 bool VF_AreStrateParamsBitIdentical(const FStrateGenerationParams& A,
@@ -2963,6 +3990,375 @@ double VF_DistanceFromStrateCorpusCentroid(
         }
     }
     return FMath::Sqrt(FMath::Max(0.0, DistanceSquared));
+}
+
+double VF_NormalizedMeasuredMetricDistance(
+    const FVoxelStrateMeasuredMetrics& A,
+    const FVoxelStrateMeasuredMetrics& B,
+    const FVoxelStratePromotionPolicy& Policy)
+{
+    if (!A.IsUsable() || !B.IsUsable()
+        || !FMath::IsFinite(Policy.FeatureScaleNormalizationVoxels)
+        || !FMath::IsFinite(Policy.ClearanceNormalizationVoxels)
+        || Policy.FeatureScaleNormalizationVoxels <= 0.0f
+        || Policy.ClearanceNormalizationVoxels <= 0.0f)
+    {
+        return TNumericLimits<double>::Max();
+    }
+
+    const double FeatureDelta = static_cast<double>(A.MedianFeatureScale - B.MedianFeatureScale)
+        / static_cast<double>(Policy.FeatureScaleNormalizationVoxels);
+    const double ClearanceDelta = static_cast<double>(A.MedianVerticalClearance
+                                                       - B.MedianVerticalClearance)
+        / static_cast<double>(Policy.ClearanceNormalizationVoxels);
+    const double AirDelta = static_cast<double>(A.AirFraction - B.AirFraction);
+    const double LargestDelta = static_cast<double>(A.LargestComponentShare
+                                                    - B.LargestComponentShare);
+    const double WalkableDelta = static_cast<double>(A.WalkableFraction - B.WalkableFraction);
+    const double DistanceSquared = AirDelta * AirDelta
+        + LargestDelta * LargestDelta
+        + WalkableDelta * WalkableDelta
+        + FeatureDelta * FeatureDelta
+        + ClearanceDelta * ClearanceDelta;
+    return FMath::Sqrt(FMath::Max(0.0, DistanceSquared));
+}
+
+FVoxelStratePromotionBatchResult VF_SelectStratePromotions(
+    const FVoxelStrateCorpus& Corpus,
+    const TArray<FVoxelStratePromotableRecord>& Candidates,
+    const FVoxelStratePromotionPolicy& Policy)
+{
+    FVoxelStratePromotionBatchResult Result;
+    Result.NumCandidates = Candidates.Num();
+    Result.MinimumAcceptedDistance = 0.0;
+
+    if (!FMath::IsFinite(Policy.MinimumNormalizedMeasuredMetricDistance)
+        || Policy.MinimumNormalizedMeasuredMetricDistance <= 0.0
+        || Policy.MaxPromotionsPerSeason < 0
+        || !FMath::IsFinite(Policy.FeatureScaleNormalizationVoxels)
+        || !FMath::IsFinite(Policy.ClearanceNormalizationVoxels)
+        || Policy.FeatureScaleNormalizationVoxels <= 0.0f
+        || Policy.ClearanceNormalizationVoxels <= 0.0f)
+    {
+        return Result;
+    }
+    Result.bPolicyValid = true;
+
+    const uint32 ExpectedCorpusHash = Corpus.GetContentsHash();
+    TArray<FVoxelStratePromotableRecord> Ordered = Candidates;
+    Ordered.Sort([](const FVoxelStratePromotableRecord& A,
+                   const FVoxelStratePromotableRecord& B)
+    {
+        const FString AKey = VF_PromotionSortKey(A);
+        const FString BKey = VF_PromotionSortKey(B);
+        if (AKey != BKey)
+        {
+            return AKey < BKey;
+        }
+        if (A.InputCorpusHash != B.InputCorpusHash)
+        {
+            return A.InputCorpusHash < B.InputCorpusHash;
+        }
+        return A.CandidateIndex < B.CandidateIndex;
+    });
+
+    double MinimumDistance = TNumericLimits<double>::Max();
+    for (const FVoxelStratePromotableRecord& Candidate : Ordered)
+    {
+        if (Candidate.InputCorpusHash != ExpectedCorpusHash)
+        {
+            ++Result.NumCorpusHashRejected;
+            continue;
+        }
+        if (!Candidate.bPassedNonVacuous
+            || !Candidate.bPassedLargestComponent
+            || !Candidate.bPassedPrimordialLaw
+            || !Candidate.MeasuredMetrics.IsUsable()
+            || !VF_MetricsAreFinite(Candidate.MeasuredMetrics)
+            || !VF_IsSupportedArchetype(Candidate.Archetype)
+            || Candidate.RecordId.IsEmpty())
+        {
+            ++Result.NumValidationRejected;
+            continue;
+        }
+
+        bool bNearDuplicate = false;
+        for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())
+        {
+            if (Entry.bHasMeasuredMetrics && Entry.MeasuredMetrics.IsUsable())
+            {
+                const double Distance = VF_NormalizedMeasuredMetricDistance(
+                    Candidate.MeasuredMetrics, Entry.MeasuredMetrics, Policy);
+                if (Distance < Policy.MinimumNormalizedMeasuredMetricDistance)
+                {
+                    bNearDuplicate = true;
+                    break;
+                }
+            }
+            else if (Entry.Archetype == Candidate.Archetype
+                     && VF_AreStrateArchetypeParamsBitIdentical(
+                         Entry.ArchetypeParams, Candidate.Params, Candidate.Archetype))
+            {
+                bNearDuplicate = true;
+                break;
+            }
+        }
+        if (!bNearDuplicate)
+        {
+            for (const FVoxelStratePromotableRecord& Accepted : Result.Promoted)
+            {
+                const double Distance = VF_NormalizedMeasuredMetricDistance(
+                    Candidate.MeasuredMetrics, Accepted.MeasuredMetrics, Policy);
+                if (Distance < Policy.MinimumNormalizedMeasuredMetricDistance
+                    || (Candidate.Archetype == Accepted.Archetype
+                        && VF_AreStrateArchetypeParamsBitIdentical(
+                            Candidate.Params, Accepted.Params, Candidate.Archetype)))
+                {
+                    bNearDuplicate = true;
+                    break;
+                }
+                MinimumDistance = FMath::Min(MinimumDistance, Distance);
+            }
+        }
+        if (bNearDuplicate)
+        {
+            ++Result.NumNearDuplicateRejected;
+            continue;
+        }
+        if (Result.Promoted.Num() >= Policy.MaxPromotionsPerSeason)
+        {
+            ++Result.NumCapRejected;
+            continue;
+        }
+
+        Result.Promoted.Add(Candidate);
+        // A first accepted record has no pairwise distance. Keep the public value at zero until
+        // the batch contains a meaningful comparison.
+        if (MinimumDistance < TNumericLimits<double>::Max())
+        {
+            Result.MinimumAcceptedDistance = MinimumDistance;
+        }
+    }
+    return Result;
+}
+
+bool VF_SaveStratePromotedRecords(
+    const FString& StorePath,
+    const TArray<FVoxelStratePromotableRecord>& Records,
+    FString& OutReport)
+{
+    if (StorePath.IsEmpty())
+    {
+        OutReport = TEXT("promotion store path is empty");
+        return false;
+    }
+
+    TArray<FVoxelStratePromotableRecord> SortedRecords = Records;
+    SortedRecords.Sort([](const FVoxelStratePromotableRecord& A,
+                          const FVoxelStratePromotableRecord& B)
+    {
+        return VF_PromotionSortKey(A) < VF_PromotionSortKey(B);
+    });
+
+    TSet<FString> RecordIds;
+    TArray<TSharedPtr<FJsonValue>> JsonRecords;
+    JsonRecords.Reserve(SortedRecords.Num());
+    for (const FVoxelStratePromotableRecord& Record : SortedRecords)
+    {
+        if (Record.RecordId.IsEmpty() || RecordIds.Contains(Record.RecordId))
+        {
+            OutReport = FString::Printf(
+                TEXT("promotion store contains an empty or duplicate record id (%s)"),
+                *Record.RecordId);
+            return false;
+        }
+        RecordIds.Add(Record.RecordId);
+        JsonRecords.Add(MakeShared<FJsonValueObject>(VF_SerializePromotableRecord(Record)));
+    }
+
+    TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("format"), TEXT("VoxelForgePromotedStrates"));
+    Root->SetNumberField(TEXT("schema_version"), GPromotionStoreSchemaVersion);
+    Root->SetNumberField(TEXT("record_count"), SortedRecords.Num());
+    Root->SetArrayField(TEXT("records"), MoveTemp(JsonRecords));
+
+    FString Error;
+    if (!VF_SaveJsonObject(StorePath, Root, Error))
+    {
+        OutReport = Error;
+        return false;
+    }
+    OutReport = FString::Printf(TEXT("saved %d promoted records to %s"),
+                                SortedRecords.Num(), *StorePath);
+    return true;
+}
+
+bool VF_SaveStrateSeasonManifest(
+    const FString& ManifestPath,
+    const FVoxelStrateSeasonManifest& Manifest,
+    FString& OutReport)
+{
+    if (ManifestPath.IsEmpty())
+    {
+        OutReport = TEXT("season manifest path is empty");
+        return false;
+    }
+
+    TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("format"), TEXT("VoxelForgeSeasonManifest"));
+    Root->SetNumberField(TEXT("schema_version"), GPromotionStoreSchemaVersion);
+    Root->SetNumberField(TEXT("season"), Manifest.Season);
+    Root->SetNumberField(TEXT("seed"), Manifest.Seed);
+    Root->SetNumberField(TEXT("input_corpus_hash"),
+                         static_cast<double>(Manifest.InputCorpusHash));
+    Root->SetNumberField(TEXT("candidate_count"), Manifest.CandidateCount);
+    Root->SetNumberField(TEXT("survivor_count"), Manifest.SurvivorCount);
+    Root->SetNumberField(TEXT("promoted_count"), Manifest.PromotedCount);
+    Root->SetNumberField(TEXT("corpus_size"), Manifest.CorpusSize);
+    Root->SetNumberField(TEXT("project_count"), Manifest.ProjectCount);
+    Root->SetNumberField(TEXT("default_count"), Manifest.DefaultCount);
+    Root->SetNumberField(TEXT("promoted_corpus_count"), Manifest.PromotedCorpusCount);
+    Root->SetNumberField(TEXT("survival_rate"), Manifest.SurvivalRate);
+    Root->SetNumberField(TEXT("measured_spread"), Manifest.MeasuredSpread);
+
+    FString Error;
+    if (!VF_SaveJsonObject(ManifestPath, Root, Error))
+    {
+        OutReport = Error;
+        return false;
+    }
+    OutReport = FString::Printf(TEXT("saved season %d manifest to %s"),
+                                Manifest.Season, *ManifestPath);
+    return true;
+}
+
+bool FVoxelStrateCorpus::LoadPromotedRecords(
+    const FString& StorePath,
+    const IVoxelStratePromotionVerifier* PromotionVerifier,
+    FString& OutReport)
+{
+    if (StorePath.IsEmpty())
+    {
+        OutReport = TEXT("no promotion store path supplied; 0 promoted members loaded");
+        return false;
+    }
+    if (!IFileManager::Get().FileExists(*StorePath))
+    {
+        OutReport = FString::Printf(TEXT("%s is absent; 0 promoted members loaded"), *StorePath);
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> Root;
+    FString JsonError;
+    if (!VF_LoadJsonObject(StorePath, Root, JsonError))
+    {
+        OutReport = JsonError;
+        return false;
+    }
+
+    int32 SchemaVersion = 0;
+    int32 StoredRecordCount = 0;
+    const TArray<TSharedPtr<FJsonValue>>* JsonRecords = nullptr;
+    if (!VF_ReadJsonInt32(Root, TEXT("schema_version"), SchemaVersion)
+        || SchemaVersion != GPromotionStoreSchemaVersion
+        || !VF_ReadJsonInt32(Root, TEXT("record_count"), StoredRecordCount)
+        || !VF_ReadJsonArray(Root, TEXT("records"), JsonRecords))
+    {
+        OutReport = FString::Printf(TEXT("%s has unsupported or malformed promotion-store schema"),
+                                    *StorePath);
+        return false;
+    }
+    if (StoredRecordCount != JsonRecords->Num())
+    {
+        OutReport = FString::Printf(
+            TEXT("%s has record_count=%d but contains %d records"),
+            *StorePath, StoredRecordCount, JsonRecords->Num());
+        return false;
+    }
+
+    if (PromotionVerifier == nullptr)
+    {
+        // A stored metric is evidence for a human, never an admission ticket. Without a
+        // world-specific verifier there is no safe way to establish the primordial law, so this
+        // compatibility call intentionally leaves the base corpus unchanged.
+        OutReport = FString::Printf(
+            TEXT("%s contains %d records; verifier was null, so all promoted records were skipped"),
+            *StorePath, JsonRecords->Num());
+        return true;
+    }
+
+    int32 NumLoaded = 0;
+    int32 NumMalformed = 0;
+    int32 NumRejected = 0;
+    int32 NumMetricReplaced = 0;
+    TSet<FString> SeenRecordIds;
+    for (const TSharedPtr<FJsonValue>& JsonValue : *JsonRecords)
+    {
+        if (!JsonValue.IsValid() || JsonValue->Type != EJson::Object)
+        {
+            ++NumMalformed;
+            continue;
+        }
+
+        FVoxelStratePromotableRecord Record;
+        if (!VF_DeserializePromotableRecord(JsonValue->AsObject(), Record)
+            || SeenRecordIds.Contains(Record.RecordId))
+        {
+            ++NumMalformed;
+            continue;
+        }
+        SeenRecordIds.Add(Record.RecordId);
+
+        FVoxelStratePromotionVerification Verification;
+        if (!PromotionVerifier->Verify(Record, Verification)
+            || !Verification.PassedAllGates())
+        {
+            ++NumRejected;
+            continue;
+        }
+
+        if (!VF_MeasuredMetricsExactlyEqual(Record.MeasuredMetrics,
+                                            Verification.MeasuredMetrics))
+        {
+            ++NumMetricReplaced;
+        }
+        const FString SourcePath = FString::Printf(
+            TEXT("/VoxelForge/Promoted/%s"), *Record.RecordId);
+        if (!AddEntryInternal(SourcePath, Record.RecordId, Record.Archetype, Record.Params, 1.0f,
+                              EVoxelStrateCorpusProvenance::Promoted,
+                              &Record.Recipe, &Verification.MeasuredMetrics,
+                              Record.RecordId, Record.Season, Record.Seed,
+                              Record.CandidateIndex, Record.InputCorpusHash, false))
+        {
+            ++NumRejected;
+            continue;
+        }
+        ++NumLoaded;
+    }
+
+    RebuildSpreads();
+    OutReport = FString::Printf(
+        TEXT("%s: %d records re-verified; %d promoted members loaded; %d rejected by fresh gates; "
+             "%d malformed/duplicate; stored metrics replaced for %d records"),
+        *StorePath, NumLoaded + NumRejected, NumLoaded, NumRejected, NumMalformed,
+        NumMetricReplaced);
+    return true;
+}
+
+bool FVoxelStrateCorpus::SetMeasuredMetrics(
+    const FString& SourcePath,
+    const FVoxelStrateMeasuredMetrics& Metrics)
+{
+    for (FVoxelStrateCorpusEntry& Entry : Entries)
+    {
+        if (Entry.SourcePath == SourcePath)
+        {
+            Entry.MeasuredMetrics = Metrics;
+            Entry.bHasMeasuredMetrics = Metrics.bValid;
+            return true;
+        }
+    }
+    return false;
 }
 
 FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpus,
@@ -3557,6 +4953,34 @@ FVoxelStrateComposerCandidate VF_RollStrateCandidate(
 
     Candidate.bValid = bAllBlocksValid;
     return Candidate;
+}
+
+FVoxelStratePromotableRecord VF_MakeStratePromotableRecord(
+    const FVoxelStrateComposerCandidate& Candidate,
+    const FVoxelStrateMetrics& Metrics,
+    int32 Season,
+    uint32 InputCorpusHash,
+    bool bPassedNonVacuous,
+    bool bPassedLargestComponent,
+    bool bPassedPrimordialLaw)
+{
+    FVoxelStratePromotableRecord Record;
+    Record.Season = Season;
+    Record.Seed = Candidate.Seed;
+    Record.CandidateIndex = Candidate.Index;
+    Record.InputCorpusHash = InputCorpusHash;
+    Record.Archetype = Candidate.Archetype;
+    Record.Params = Candidate.ArchetypeParams;
+    Record.Recipe = Candidate.Recipe;
+    Record.MeasuredMetrics = VF_SummarizeStrateMetrics(Metrics);
+    Record.bPassedNonVacuous = bPassedNonVacuous;
+    Record.bPassedLargestComponent = bPassedLargestComponent;
+    Record.bPassedPrimordialLaw = bPassedPrimordialLaw;
+    Record.RecordId = FString::Printf(
+        TEXT("season_%04d_seed_%d_candidate_%04d_corpus_%08x_recipe_%08x"),
+        Season, Candidate.Seed, Candidate.Index, InputCorpusHash,
+        VF_HashStrateStructureRecipe(Candidate.Recipe));
+    return Record;
 }
 #endif
 
