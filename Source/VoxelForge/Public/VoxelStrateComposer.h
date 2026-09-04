@@ -28,9 +28,11 @@ struct VOXELFORGE_API FVoxelStrateFieldExclusion
     FString Reason;
 };
 
-/** Measured statistics for one field across the currently loaded corpus. */
+/** Measured statistics for one field in one archetype's corpus group. */
 struct VOXELFORGE_API FVoxelStrateFieldSpread
 {
+    ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FString ParamStructName;
     FString FieldName;
     EVoxelStrateFieldKind Kind = EVoxelStrateFieldKind::Continuous;
     bool bExcluded = false;
@@ -50,12 +52,30 @@ struct VOXELFORGE_API FVoxelStrateFieldSpread
     double ClampMax = 0.0;
 };
 
+/** Native parameter storage for every currently supported strate archetype. */
+struct VOXELFORGE_API FVoxelStrateArchetypeParams
+{
+    FStrateGenerationParams TunnelNetworkParams;
+    FSlabGenerationParams SlabParams;
+    FMazeGenerationParams MazeParams;
+    FSurfaceGenerationParams SurfaceParams;
+    FVerticalShaftParams VerticalShaftParams;
+    FFloatingIslandParams FloatingIslandParams;
+};
+
 /** One known-good authored vector and the archetype that gives it meaning. */
 struct VOXELFORGE_API FVoxelStrateCorpusEntry
 {
     FString SourcePath;
     FString SourceName;
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+
+    // Native storage is selected by Archetype. Keeping every family here makes the corpus
+    // type-safe without changing any runtime generation parameter struct.
+    FVoxelStrateArchetypeParams ArchetypeParams;
+
+    // Compatibility view for callers of the original Tier 4a API. It is meaningful for
+    // TunnelNetwork/Underwater entries and is the same value as ArchetypeParams.TunnelNetworkParams.
     FStrateGenerationParams Params;
 
     // The current asset format has no corpus weight field. Loaded hand-authored entries therefore
@@ -71,6 +91,10 @@ struct VOXELFORGE_API FVoxelStrateRollInfo
     FString FailureReason;
 
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FVoxelStrateArchetypeParams ArchetypeParams;
+
+    // Compatibility view for the original tunnel-only API. For a non-tunnel roll, the native
+    // result is in ArchetypeParams and this member is not the active candidate vector.
     FStrateGenerationParams Params;
 
     TArray<int32> ParentEntryIndices;
@@ -81,23 +105,31 @@ struct VOXELFORGE_API FVoxelStrateRollInfo
 /**
  * Known-good strate vectors plus their measured field spread.
  *
- * `LoadFromSettings` walks both the pool and fixed-strate references, resolves each definition,
- * de-duplicates it by asset path, and admits only TunnelNetwork/Underwater definitions because
- * those are the two archetypes whose authored vector is `GenerationParams`. Other archetypes have
- * different parameter structs; treating their default `GenerationParams` as authored data would
- * manufacture a false corpus.
+ * `LoadFromAssetRegistry` enumerates every project UVoxelStrateDefinition through the Asset
+ * Registry, explicitly excluding Saved/Autosaves and Saved/Cooked copies. It also adds one
+ * known-good default vector for every archetype/family in VoxelStrateTypes.h. Parents are selected
+ * only inside the exact archetype group; no cross-archetype blend is attempted.
  */
 class VOXELFORGE_API FVoxelStrateCorpus
 {
 public:
     void Reset();
 
+    bool LoadFromAssetRegistry(FString& OutReport);
+
+    /**
+     * Compatibility alias retained for callers compiled against the first Tier 4a pass. The
+     * settings argument is audited only for diagnostics; it is not a corpus input.
+     */
     bool LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport);
     bool LoadFromDefinitions(const TArray<UVoxelStrateDefinition*>& Definitions, FString& OutReport);
 
     /** Add an already-resolved vector, primarily for offline tools and focused tests. */
     bool AddEntry(const FString& SourcePath, const FString& SourceName,
                   ECaveGeneratorType Archetype, const FStrateGenerationParams& Params,
+                  float Weight = 1.0f);
+    bool AddEntry(const FString& SourcePath, const FString& SourceName,
+                  ECaveGeneratorType Archetype, const FVoxelStrateArchetypeParams& Params,
                   float Weight = 1.0f);
 
     bool IsValid() const { return bSchemaValid && Entries.Num() > 0; }
@@ -109,6 +141,10 @@ public:
     const TArray<FVoxelStrateFieldSpread>& GetFieldSpreads() const { return FieldSpreads; }
     const TArray<FString>& GetSkippedDefinitions() const { return SkippedDefinitions; }
 
+    int32 NumForArchetype(ECaveGeneratorType Archetype) const;
+
+    const FVoxelStrateFieldSpread* FindSpread(
+        ECaveGeneratorType Archetype, const FString& FieldName) const;
     const FVoxelStrateFieldSpread* FindSpread(const FString& FieldName) const;
 
     /** Stable hash of source paths, archetypes, weights, and every listed scalar field. */
@@ -149,3 +185,8 @@ VOXELFORGE_API FStrateGenerationParams VF_RollStrateParams(
 VOXELFORGE_API bool VF_AreStrateParamsBitIdentical(
     const FStrateGenerationParams& A, const FStrateGenerationParams& B);
 
+/** Bitwise comparison of the native vector for one archetype family. */
+VOXELFORGE_API bool VF_AreStrateArchetypeParamsBitIdentical(
+    const FVoxelStrateArchetypeParams& A,
+    const FVoxelStrateArchetypeParams& B,
+    ECaveGeneratorType Archetype);

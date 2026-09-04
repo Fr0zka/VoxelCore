@@ -200,18 +200,66 @@ exclusion list. Bools cannot be blended — roll them by probability or inherit 
 
 `Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp` now implement the corpus and
 the deterministic roll. `Private/Tests/VoxelForgeComposerParameterRollTest.cpp` is the offline
-measurement harness. The roll uses `FStrateGenerationParams::Lerp`, chooses 2–3 weighted parents
-inside one archetype group, applies jitter of **±15% of each field's measured corpus range
-(`max-min`)**, then applies reflected `ClampMin`/`ClampMax` metadata. It does not use clamps as
-distribution ranges, does not touch generation, and leaves `WorldRadiusVoxels` at its default 0.
+measurement harness. The roll uses the native family blend (`FStrateGenerationParams::Lerp` for
+the tunnel family), chooses 2–3 weighted parents **inside one exact archetype group**, applies
+jitter of **±15% of each field's measured corpus range (`max-min`)**, then applies reflected
+`ClampMin`/`ClampMax` metadata. It does not use clamps as distribution ranges, does not touch
+generation, and leaves `WorldRadiusVoxels` at its default 0. The sibling native parameter structs
+are carried in the same corpus entry, so a `SurfaceWorld` vector is never blended with a
+`TunnelNetwork` vector merely because both happen to be stored in a strate asset.
 
-The loader walks the settings asset's fixed-strate and pool references, de-duplicates by asset path,
-and accepts only `TunnelNetwork` / `Underwater`: those are the only archetypes whose authored vector
-is `GenerationParams`. The current `DA_Settings` asset contains **one unique resolved reference**,
-`DA_Strate3`, and it is `TunnelNetwork`; the other authored archetype assets are not in that
-settings corpus. Consequently every measured field has zero spread, all 64 rolls repeat the same
-known-good vector (parent weights still roll deterministically), and this run did not exercise
-non-zero jitter. That is a corpus-size finding, not a rate optimization.
+The original one-vector result was caused by the old loader following `DA_Settings`' fixed-strate
+and pool references. An audit of those references finds **one unique path**,
+`/Game/VoxelForge/DA_Strate3.DA_Strate3`, whose archetype is `TunnelNetwork`; that is why the
+previous corpus only loaded one asset. The current loader instead asks the Asset Registry for every
+project `UVoxelStrateDefinition`, sorts and de-duplicates the results, accepts `/Game` packages,
+and ignores `Saved/Autosaves` and `Saved/Cooked` copies. The scan found **4 project assets**, with
+no saved-copy, outside-project, duplicate, or unresolved records:
+
+| Asset | Archetype |
+|---|---|
+| `DA_Strate1` | `SurfaceWorld` |
+| `DA_Strate2` | `FloatingIslands` |
+| `DA_Strate3` | `TunnelNetwork` |
+| `DA_Strate4` | `TunnelNetwork` |
+
+The hand-authored C++ defaults in `VoxelStrateTypes.h` are also corpus members: one for each of the
+8 supported archetypes (`TunnelNetwork`, `FlatPlain`, `CrystalChamber`, `Maze`, `SurfaceWorld`,
+`VerticalShafts`, `FloatingIslands`, `Underwater`). The fed corpus is therefore **12 members** in
+**8 exact-archetype groups**. Group membership is `TunnelNetwork=3`, `FlatPlain=1`,
+`CrystalChamber=1`, `Maze=1`, `SurfaceWorld=2`, `VerticalShafts=1`, `FloatingIslands=2`, and
+`Underwater=1`.
+
+The complete 253-descriptor spread table is emitted by the automation test, including sample count,
+min/max/mean/standard deviation, excluded/reflected status, and clamp metadata. The 230 zero-range
+rows are intentionally omitted below; these are the **23 rows with real spread** (float formatting
+is the test's measured output):
+
+| Archetype | Field | N | Min | Max | Mean | StdDev |
+|---|---|---:|---:|---:|---:|---:|
+| TunnelNetwork | MinRoomRadius | 3 | 10 | 25 | 15 | 7.07106781 |
+| TunnelNetwork | MaxRoomRadius | 3 | 30 | 125 | 61.6666667 | 44.7834295 |
+| TunnelNetwork | OriginRoomRadius | 3 | 20 | 120 | 53.3333333 | 47.1404521 |
+| TunnelNetwork | TunnelMinRadius | 3 | 3 | 9 | 5 | 2.82842712 |
+| TunnelNetwork | TunnelMaxRadius | 3 | 7 | 15 | 9.66666667 | 3.77123617 |
+| SurfaceWorld | BaseGroundRelative | 2 | 0.200000003 | 0.300000012 | 0.250000007 | 0.0500000045 |
+| SurfaceWorld | ElevationRange | 2 | 60 | 200 | 130 | 70 |
+| SurfaceWorld | ContinentFrequency | 2 | 0.00100000005 | 0.00600000005 | 0.00350000005 | 0.0025 |
+| SurfaceWorld | MountainStrength | 2 | 0.5 | 1 | 0.75 | 0.25 |
+| SurfaceWorld | MountainFrequency | 2 | 0.00200000009 | 0.0120000001 | 0.0070000001 | 0.005 |
+| SurfaceWorld | SurfaceRoughness | 2 | 2 | 3 | 2.5 | 0.5 |
+| SurfaceWorld | ReliefStrength | 2 | 0 | 0.699999988 | 0.349999994 | 0.349999994 |
+| SurfaceWorld | ReliefContrast | 2 | 1.60000002 | 2 | 1.80000001 | 0.199999988 |
+| SurfaceWorld | TerraceHeight | 2 | 12 | 20 | 16 | 4 |
+| SurfaceWorld | BeachWidth | 2 | 8 | 200 | 104 | 96 |
+| FloatingIslands | IslandSpacing | 2 | 95 | 1000 | 547.5 | 452.5 |
+| FloatingIslands | IslandDensity | 2 | 0.100000001 | 0.5 | 0.300000001 | 0.199999999 |
+| FloatingIslands | IslandMinRadius | 2 | 18 | 50 | 34 | 16 |
+| FloatingIslands | IslandMaxRadius | 2 | 42 | 500 | 271 | 229 |
+| FloatingIslands | ThicknessRatio | 2 | 0.100000001 | 0.699999988 | 0.399999995 | 0.299999993 |
+| FloatingIslands | VerticalJitter | 2 | 0.200000003 | 0.600000024 | 0.400000013 | 0.20000001 |
+| FloatingIslands | TopFlatten | 2 | 0.600000024 | 0.800000012 | 0.700000018 | 0.099999994 |
+| FloatingIslands | SurfaceRoughness | 2 | 0 | 4 | 2 | 2 |
 
 The reflection/use audit found **36 excluded fields**: the 34 terrain-op transport fields
 `TerraceStepHeight`, `TerraceHardness`, `TerraceNoiseDisplacement`, `LayerLineSpacing`,
@@ -222,22 +270,45 @@ The reflection/use audit found **36 excluded fields**: the 34 terrain-op transpo
 `ChimneyMaxRadius`, `ChimneyHeight`, `DomeDensity`, `DomeMinRadius`, `DomeMaxRadius`,
 `DomeHeightRatio`, `PinchDensity`, `PinchStrength`, `PinchLength` — populated per room by
 `UVoxelTerrainOpDefinition` — plus the manager-owned runtime bounds `StrateTopWorldZ` and
-`StrateBottomWorldZ`. The test prints the complete field-by-field table, including excluded fields,
+`StrateBottomWorldZ`. The tunnel transport fields are measured directly from the native
+`FStrateGenerationParams` X-macro even though they are not reflected `UPROPERTY`s; their values are
+reported but deliberately not jittered. Same-named fields in sibling structs are not automatically
+excluded: the exclusion applies to the tunnel transport slots whose generation source is the
+terrain-op pool. The test prints the complete field-by-field table, including excluded fields,
 reflection status, and clamp metadata.
+
+The terrain-field source is now traced in code. `VoxelStrateManager.cpp` loads the active strate's
+`TerrainOperations` soft-object pool, and `VoxelGenerator.cpp` passes that pool to
+`VoxelCaveMorphology::BuildChunkCache`. For each nearest room, `FVoxelTerrainOpDefinition::ApplyTo`
+overlays the selected operation onto a local copy (`FStrateGenerationParams LocalTerrainParams =
+Params`) before the room operator runs. Thus the 34 values are transported through the strate
+params, but their authored cave-detail values come from `UVoxelTerrainOpDefinition` assets selected
+by the active strate's terrain-operation pool. Rolling those slots in the strate composer is not a
+useful way to roll cave detail: selected room operations overwrite them. It is not a literal
+absolute no-op, because the local base copy is still used where no operation overwrites a slot.
+The correct future design is a **second corpus** over terrain-op assets plus the active pool's
+membership/weights; this task does not build it. The project currently has **1**
+`UVoxelTerrainOpDefinition` asset (the Asset Registry count used by the test).
 
 The bool policy is explicit: `bTunnelsFlowTowardOrigin` is inherited from the dominant parent.
 `OriginRoomMaxConnections` and `RoughnessNoiseType` retain `Lerp`'s existing SNAP behavior and
 are not jittered. In this editor build clamp metadata was available while the table was built; it
 is **not promised in a cooked runtime**, so the commandlet/cook-time bake remains owed.
 
-The first 64-candidate run (step 4, radius 256, max 8,000,000 cells, fixture seed 1337) produced
-64/64 non-vacuous candidates, 64/64 largest-component share ≥ 0.50, and 64/64 exact unsnapped
-arrival→departure law passes. Every row was `air=0.520272`, `largest share=0.999996`,
-`walkable=0.057995`, `feature scale=20.000000`, `Connected`; total runtime was **542.220 s**.
-The §6.2 check saw **2,560 Mixed, 0 AllSolid, 0 AllAir, 0 brute-force voxels, 0 violations**:
-this is explicitly **vacuous**, not evidence that rolled bounds are sound, because the current cave
-box path emitted no uniform verdict. The test leaves §6.2 open and reports that fact rather than
-turning it into a workaround.
+The fed 64-candidate run (step 4 sweep, radius 256, max 8,000,000 cells, fixture seed 1337)
+produced **59/64 survivors (92.2%)**. There were 60 non-vacuous candidates, 60 with largest
+component share ≥ 0.50, 63 exact unsnapped arrival→departure law passes, and no roll failures.
+The complete 64-row table is emitted by `VoxelForge.Composer.ParameterRoll`; each row reports
+archetype, weighted parents, air fraction, largest share, walkable fraction, feature scale, and
+arrival→departure verdict. The final full-suite run took **112.574 s** total (**0.015 s** corpus
+load, **112.556 s** roll/measurement).
+
+The §6.2 check is no longer vacuous: **1,224 boxes proved**, **1,629,144 voxels checked**,
+**0 violations**. Its verdict mix was 1,336 Mixed, 549 AllSolid, and 675 AllAir; the law check
+reported no violating candidate. The box law used unit step and brute-forced every voxel of each
+uniform box, while the candidate sweep retained step 4. The test asserts zero violations and keeps
+the law open to future changed candidates rather than treating this clean run as a license to tune
+the survival rate.
 
 ### 3.4 The measurement pass — one grid, one flood fill, three jobs
 

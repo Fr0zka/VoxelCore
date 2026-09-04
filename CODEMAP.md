@@ -438,16 +438,21 @@ One asset = one biome: identity + `DebugColor`, climate placement box (`ReliefMi
 atmosphere override, `WaterMaterial`, `MaterialPaletteIndex` (F6 — baked to vertex colour, §8.15)), `GameplayTags`. Referenced from
 `UVoxelStrateDefinition::Biomes[]`. Generator-agnostic (surface biomes now, cave biomes later). §8.14.
 
-**`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp`** (NEW, Tier 4a) — offline
-`FVoxelStrateCorpus` and `VF_RollStrateParams`. Walks the settings asset's fixed/pool definition
-references, admits only `TunnelNetwork` / `Underwater` vectors (the archetypes that author
-`GenerationParams`), measures every X-macro field's min/max/mean/population stddev, and exposes the
-explicit non-tunable list. Rolls are pure in `(corpus contents, seed, index)`: weighted 2–3-parent
-same-archetype selection → `FStrateGenerationParams::Lerp` → ±15% of measured field range jitter →
-editor-reflection clamps → ordered-pair repair. Bool `bTunnelsFlowTowardOrigin` inherits from the
-dominant parent; integer/enum SNAP fields are not jittered. This API is not called by runtime
-generation. The first project corpus run found one eligible `DA_Strate3` vector, so all measured
-spreads were zero; that limitation is recorded by the Tier 4a test/report rather than hidden.
+**`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp`** (Tier 4a) — offline
+`FVoxelStrateCorpus` and `VF_RollStrateParams`. `LoadFromAssetRegistry` enumerates every project
+`UVoxelStrateDefinition` through the Asset Registry, excludes `Saved/Autosaves` and `Saved/Cooked`
+copies, and adds one `VoxelStrateTypes.h` default vector for each of the eight exact archetypes.
+The corpus is grouped by exact `ECaveGeneratorType`: the 2026-09-04 run loaded **4 project
+vectors + 8 defaults = 12 members** in **8 groups**. Sibling families use their native structs
+(`FSlabGenerationParams`, `FMazeGenerationParams`, `FSurfaceGenerationParams`,
+`FVerticalShaftParams`, `FFloatingIslandParams`); no cross-archetype blend is attempted.
+Spreads are measured per group, including the plain-native tunnel transport fields for reporting.
+Rolls are pure in `(corpus contents, seed, index)`: weighted 2–3-parent same-archetype selection →
+`FStrateGenerationParams::Lerp` or reflected native-family blend → ±15% of measured field range
+jitter → editor-reflection clamps → ordered-pair repair. Bool `bTunnelsFlowTowardOrigin` inherits
+from the dominant parent; integer/enum SNAP fields are not jittered. This API is not called by
+runtime generation. The settings audit found **one unique path**, `/Game/VoxelForge/DA_Strate3`,
+which explains the old one-vector corpus; the project assets were never in that pool.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
 `UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
@@ -512,7 +517,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeOpStackIslandTest.cpp` | `VoxelForge.OpStack.FloatingIslandEquivalence` | The port that runs the stack **backwards** — void + fill vs rock + carve, same classes with the opposite sign. Counts interior-solid and open-void samples separately (on this archetype an aggregate "N solid" is dominated by the seal bands and says nothing about the islands). Counts `AllSolid` and `AllAir` verdicts **separately** too: `AllAir` is the one no cave archetype could ever prove, and it is the entire perf argument here. |
 | `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
-| `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Loads the hand-authored settings corpus, prints the complete per-field spread/exclusion/clamp table, asserts deterministic bit-identical rolls, measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law, and brute-forces every rolled production box verdict. The first run found one eligible vector (all spreads zero), 64/64 survival, and a deliberately reported vacuous §6.2 scan: 2,560 Mixed, 0 proved, 0 violations. |
+| `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. The final full-suite run: **59/64 survival (92.2%)**, **1,336 Mixed + 549 AllSolid + 675 AllAir = 1,224 proved boxes**, **1,629,144 lattice voxels checked, 0 violations**, 112.574 s total. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |
 | `VoxelForgeStrateConnectivityTest.cpp` | `VoxelForge.Generation.StrateConnectivity` / `VoxelForge.Generation.StrateConnectivityRefinement` / `VoxelForge.Generation.VerticalShaftSeamFreedom` | Bounded strate metrics with density-polarity and solid-gap controls, deterministic route rechecks, and refinement sweeps. The refinement test fits the measurement AABB to each arrival/departure mouth pair, reports exact before/after seed-6 cell counts, reruns every negative with doubled margin, measures tree orphan candidates/path reachability and roughness-bubble proxies, asserts axis landings, checks source/mirror physical paths, and requires 16/16 effective arrival→departure results across the 16 VerticalShafts seeds. Margin-binding negatives are reported as measurement limits, never as gap findings. The seam test re-evaluates cell-boundary positions after warming distinct neighbouring chunk contexts in both legacy and operator-stack paths. |

@@ -2,21 +2,142 @@
 
 #include "VoxelStrateComposer.h"
 
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Math/RandomStream.h"
-#include "Misc/Crc.h"
+#include "Modules/ModuleManager.h"
+#include "UObject/EnumProperty.h"
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectGlobals.h"
 
 #include "VoxelSettings.h"
 #include "VoxelStrateDefinition.h"
 
-#include <cmath>
 #include <type_traits>
 #include <utility>
 
 namespace
 {
     constexpr float GJitterFraction = 0.15f;
+
+    static const ECaveGeneratorType GAllArchetypes[] =
+    {
+        ECaveGeneratorType::TunnelNetwork,
+        ECaveGeneratorType::FlatPlain,
+        ECaveGeneratorType::CrystalChamber,
+        ECaveGeneratorType::Maze,
+        ECaveGeneratorType::SurfaceWorld,
+        ECaveGeneratorType::VerticalShafts,
+        ECaveGeneratorType::FloatingIslands,
+        ECaveGeneratorType::Underwater,
+    };
+
+    bool VF_IsTunnelArchetype(ECaveGeneratorType Archetype)
+    {
+        return Archetype == ECaveGeneratorType::TunnelNetwork
+            || Archetype == ECaveGeneratorType::Underwater;
+    }
+
+    bool VF_IsSupportedArchetype(ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+        case ECaveGeneratorType::Maze:
+        case ECaveGeneratorType::SurfaceWorld:
+        case ECaveGeneratorType::VerticalShafts:
+        case ECaveGeneratorType::FloatingIslands:
+        case ECaveGeneratorType::Underwater:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    UStruct* VF_GetParamStruct(ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return FStrateGenerationParams::StaticStruct();
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return FSlabGenerationParams::StaticStruct();
+        case ECaveGeneratorType::Maze:
+            return FMazeGenerationParams::StaticStruct();
+        case ECaveGeneratorType::SurfaceWorld:
+            return FSurfaceGenerationParams::StaticStruct();
+        case ECaveGeneratorType::VerticalShafts:
+            return FVerticalShaftParams::StaticStruct();
+        case ECaveGeneratorType::FloatingIslands:
+            return FFloatingIslandParams::StaticStruct();
+        default:
+            return nullptr;
+        }
+    }
+
+    void* VF_GetParamMemory(FVoxelStrateArchetypeParams& Params,
+                            ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return &Params.TunnelNetworkParams;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return &Params.SlabParams;
+        case ECaveGeneratorType::Maze:
+            return &Params.MazeParams;
+        case ECaveGeneratorType::SurfaceWorld:
+            return &Params.SurfaceParams;
+        case ECaveGeneratorType::VerticalShafts:
+            return &Params.VerticalShaftParams;
+        case ECaveGeneratorType::FloatingIslands:
+            return &Params.FloatingIslandParams;
+        default:
+            return nullptr;
+        }
+    }
+
+    const void* VF_GetParamMemory(const FVoxelStrateArchetypeParams& Params,
+                                  ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return &Params.TunnelNetworkParams;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return &Params.SlabParams;
+        case ECaveGeneratorType::Maze:
+            return &Params.MazeParams;
+        case ECaveGeneratorType::SurfaceWorld:
+            return &Params.SurfaceParams;
+        case ECaveGeneratorType::VerticalShafts:
+            return &Params.VerticalShaftParams;
+        case ECaveGeneratorType::FloatingIslands:
+            return &Params.FloatingIslandParams;
+        default:
+            return nullptr;
+        }
+    }
+
+    FString VF_SpreadKey(ECaveGeneratorType Archetype, const FString& FieldName)
+    {
+        return FString::Printf(TEXT("%d:%s"), static_cast<int32>(static_cast<uint8>(Archetype)),
+                               *FieldName);
+    }
+
+    FString VF_SpreadKey(ECaveGeneratorType Archetype, const TCHAR* FieldName)
+    {
+        return VF_SpreadKey(Archetype, FString(FieldName));
+    }
 
     template <typename T>
     EVoxelStrateFieldKind VF_FieldKindFor()
@@ -51,6 +172,23 @@ namespace
         return nullptr;
     }
 
+    bool VF_IsRuntimeField(const FString& FieldName)
+    {
+        return FieldName == TEXT("StrateTopWorldZ")
+            || FieldName == TEXT("StrateBottomWorldZ");
+    }
+
+    bool VF_IsExcludedForArchetype(ECaveGeneratorType Archetype, const FString& FieldName)
+    {
+        // These names are transport slots only for FStrateGenerationParams. Sibling families
+        // have real authored fields with some of the same names (e.g. Surface::TerraceHardness).
+        if (VF_IsTunnelArchetype(Archetype))
+        {
+            return VF_FindExclusion(FieldName) != nullptr;
+        }
+        return VF_IsRuntimeField(FieldName);
+    }
+
     void VF_AddExclusion(TArray<FVoxelStrateFieldExclusion>& Out,
                          const TCHAR* FieldName, const TCHAR* Reason)
     {
@@ -59,10 +197,14 @@ namespace
         Entry.Reason = Reason;
     }
 
-    void VF_CollectGenerationProperties(TMap<FString, FProperty*>& OutProperties)
+    void VF_CollectProperties(UStruct* Struct, TMap<FString, FProperty*>& OutProperties)
     {
         OutProperties.Reset();
-        UStruct* Struct = FStrateGenerationParams::StaticStruct();
+        if (Struct == nullptr)
+        {
+            return;
+        }
+
         for (TFieldIterator<FProperty> It(Struct, EFieldIteratorFlags::IncludeSuper); It; ++It)
         {
             FProperty* Property = *It;
@@ -71,6 +213,337 @@ namespace
                 OutProperties.Add(Property->GetName(), Property);
             }
         }
+    }
+
+    EVoxelStrateFieldKind VF_PropertyKind(const FProperty* Property)
+    {
+        if (Property == nullptr)
+        {
+            return EVoxelStrateFieldKind::Continuous;
+        }
+        if (CastField<FBoolProperty>(Property) != nullptr)
+        {
+            return EVoxelStrateFieldKind::Boolean;
+        }
+        if (CastField<FEnumProperty>(Property) != nullptr)
+        {
+            return EVoxelStrateFieldKind::Enum;
+        }
+        if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property))
+        {
+            if (NumericProperty->IsEnum())
+            {
+                return EVoxelStrateFieldKind::Enum;
+            }
+            if (NumericProperty->IsInteger())
+            {
+                return EVoxelStrateFieldKind::Integer;
+            }
+        }
+        return EVoxelStrateFieldKind::Continuous;
+    }
+
+    bool VF_IsScalarProperty(const FProperty* Property)
+    {
+        return CastField<FBoolProperty>(Property) != nullptr
+            || CastField<FNumericProperty>(Property) != nullptr
+            || CastField<FEnumProperty>(Property) != nullptr;
+    }
+
+    bool VF_ReadPropertyValue(const FProperty* Property, const void* Memory, double& OutValue)
+    {
+        if (Property == nullptr || Memory == nullptr || !VF_IsScalarProperty(Property))
+        {
+            return false;
+        }
+
+        const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Memory);
+        if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+        {
+            OutValue = BoolProperty->GetPropertyValue(ValuePtr) ? 1.0 : 0.0;
+            return true;
+        }
+
+        const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property);
+        const FNumericProperty* UnderlyingProperty = NumericProperty;
+        if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+        {
+            UnderlyingProperty = EnumProperty->GetUnderlyingProperty();
+        }
+        if (UnderlyingProperty == nullptr)
+        {
+            return false;
+        }
+
+        if (UnderlyingProperty->IsFloatingPoint())
+        {
+            OutValue = UnderlyingProperty->GetFloatingPointPropertyValue(ValuePtr);
+        }
+        else
+        {
+            // Current integer/enum fields are non-negative; the signed accessor gives the
+            // expected value for the byte-backed enum properties used by the strate structs.
+            OutValue = static_cast<double>(UnderlyingProperty->GetSignedIntPropertyValue(ValuePtr));
+        }
+        return FMath::IsFinite(OutValue);
+    }
+
+    bool VF_WritePropertyValue(const FProperty* Property, void* Memory, double Value)
+    {
+        if (Property == nullptr || Memory == nullptr || !VF_IsScalarProperty(Property)
+            || !FMath::IsFinite(Value))
+        {
+            return false;
+        }
+
+        void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Memory);
+        if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+        {
+            BoolProperty->SetPropertyValue(ValuePtr, Value >= 0.5);
+            return true;
+        }
+
+        const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property);
+        const FNumericProperty* UnderlyingProperty = NumericProperty;
+        if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+        {
+            UnderlyingProperty = EnumProperty->GetUnderlyingProperty();
+        }
+        if (UnderlyingProperty == nullptr)
+        {
+            return false;
+        }
+
+        if (UnderlyingProperty->IsFloatingPoint())
+        {
+            UnderlyingProperty->SetFloatingPointPropertyValue(ValuePtr, Value);
+        }
+        else
+        {
+            UnderlyingProperty->SetIntPropertyValue(ValuePtr, static_cast<int64>(FMath::RoundToInt(Value)));
+        }
+        return true;
+    }
+
+    template <typename T>
+    double VF_NativeValueAsDouble(T Value)
+    {
+        if constexpr (std::is_enum<T>::value)
+        {
+            using UnderlyingType = typename std::underlying_type<T>::type;
+            return static_cast<double>(static_cast<UnderlyingType>(Value));
+        }
+        else
+        {
+            return static_cast<double>(Value);
+        }
+    }
+
+    template <typename T, typename std::enable_if<!std::is_enum<T>::value, int>::type = 0>
+    void VF_AssignNativeValue(T& Target, double Value)
+    {
+        Target = static_cast<T>(Value);
+    }
+
+    template <typename T, typename std::enable_if<std::is_enum<T>::value, int>::type = 0>
+    void VF_AssignNativeValue(T& Target, double Value)
+    {
+        using UnderlyingType = typename std::underlying_type<T>::type;
+        Target = static_cast<T>(static_cast<UnderlyingType>(FMath::RoundToInt(Value)));
+    }
+
+    bool VF_ReadFStrateField(const FStrateGenerationParams& Params,
+                             const FString& FieldName, double& OutValue)
+    {
+#define VF_READ_FSTRATE_FIELD(Name) \
+        if (FieldName == TEXT(#Name)) { OutValue = VF_NativeValueAsDouble(Params.Name); return true; }
+        VF_STRATE_PARAM_FIELDS(VF_READ_FSTRATE_FIELD, VF_READ_FSTRATE_FIELD)
+#undef VF_READ_FSTRATE_FIELD
+        return false;
+    }
+
+    bool VF_WriteFStrateField(FStrateGenerationParams& Params,
+                              const FString& FieldName, double Value)
+    {
+#define VF_WRITE_FSTRATE_FIELD(Name) \
+        if (FieldName == TEXT(#Name)) { VF_AssignNativeValue(Params.Name, Value); return true; }
+        VF_STRATE_PARAM_FIELDS(VF_WRITE_FSTRATE_FIELD, VF_WRITE_FSTRATE_FIELD)
+#undef VF_WRITE_FSTRATE_FIELD
+        return false;
+    }
+
+    bool VF_ReadRuntimeField(const void* Memory, ECaveGeneratorType Archetype,
+                             const FString& FieldName, double& OutValue)
+    {
+        if (Memory == nullptr || !VF_IsRuntimeField(FieldName))
+        {
+            return false;
+        }
+
+        if (FieldName == TEXT("StrateTopWorldZ"))
+        {
+            switch (Archetype)
+            {
+            case ECaveGeneratorType::TunnelNetwork:
+            case ECaveGeneratorType::Underwater:
+                OutValue = static_cast<const FStrateGenerationParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            case ECaveGeneratorType::FlatPlain:
+            case ECaveGeneratorType::CrystalChamber:
+                OutValue = static_cast<const FSlabGenerationParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            case ECaveGeneratorType::Maze:
+                OutValue = static_cast<const FMazeGenerationParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            case ECaveGeneratorType::SurfaceWorld:
+                OutValue = static_cast<const FSurfaceGenerationParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            case ECaveGeneratorType::VerticalShafts:
+                OutValue = static_cast<const FVerticalShaftParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            case ECaveGeneratorType::FloatingIslands:
+                OutValue = static_cast<const FFloatingIslandParams*>(Memory)->StrateTopWorldZ;
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            OutValue = static_cast<const FStrateGenerationParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            OutValue = static_cast<const FSlabGenerationParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        case ECaveGeneratorType::Maze:
+            OutValue = static_cast<const FMazeGenerationParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        case ECaveGeneratorType::SurfaceWorld:
+            OutValue = static_cast<const FSurfaceGenerationParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        case ECaveGeneratorType::VerticalShafts:
+            OutValue = static_cast<const FVerticalShaftParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        case ECaveGeneratorType::FloatingIslands:
+            OutValue = static_cast<const FFloatingIslandParams*>(Memory)->StrateBottomWorldZ;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool VF_WriteRuntimeField(void* Memory, ECaveGeneratorType Archetype,
+                              const FString& FieldName, double Value)
+    {
+        if (Memory == nullptr || !VF_IsRuntimeField(FieldName))
+        {
+            return false;
+        }
+
+        if (FieldName == TEXT("StrateTopWorldZ"))
+        {
+            switch (Archetype)
+            {
+            case ECaveGeneratorType::TunnelNetwork:
+            case ECaveGeneratorType::Underwater:
+                static_cast<FStrateGenerationParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            case ECaveGeneratorType::FlatPlain:
+            case ECaveGeneratorType::CrystalChamber:
+                static_cast<FSlabGenerationParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            case ECaveGeneratorType::Maze:
+                static_cast<FMazeGenerationParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            case ECaveGeneratorType::SurfaceWorld:
+                static_cast<FSurfaceGenerationParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            case ECaveGeneratorType::VerticalShafts:
+                static_cast<FVerticalShaftParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            case ECaveGeneratorType::FloatingIslands:
+                static_cast<FFloatingIslandParams*>(Memory)->StrateTopWorldZ = static_cast<float>(Value);
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            static_cast<FStrateGenerationParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            static_cast<FSlabGenerationParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        case ECaveGeneratorType::Maze:
+            static_cast<FMazeGenerationParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        case ECaveGeneratorType::SurfaceWorld:
+            static_cast<FSurfaceGenerationParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        case ECaveGeneratorType::VerticalShafts:
+            static_cast<FVerticalShaftParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        case ECaveGeneratorType::FloatingIslands:
+            static_cast<FFloatingIslandParams*>(Memory)->StrateBottomWorldZ = static_cast<float>(Value);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool VF_ReadNamedField(const void* Memory, ECaveGeneratorType Archetype,
+                           const FString& FieldName, double& OutValue)
+    {
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Struct == nullptr || Memory == nullptr)
+        {
+            return false;
+        }
+
+        if (VF_IsTunnelArchetype(Archetype)
+            && VF_ReadFStrateField(*static_cast<const FStrateGenerationParams*>(Memory),
+                                   FieldName, OutValue))
+        {
+            return true;
+        }
+
+        if (const FProperty* Property = FindFProperty<FProperty>(Struct, FName(*FieldName)))
+        {
+            return VF_ReadPropertyValue(Property, Memory, OutValue);
+        }
+        return VF_ReadRuntimeField(Memory, Archetype, FieldName, OutValue);
+    }
+
+    bool VF_WriteNamedField(void* Memory, ECaveGeneratorType Archetype,
+                            const FString& FieldName, double Value)
+    {
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Struct == nullptr || Memory == nullptr)
+        {
+            return false;
+        }
+
+        if (VF_IsTunnelArchetype(Archetype)
+            && VF_WriteFStrateField(*static_cast<FStrateGenerationParams*>(Memory),
+                                    FieldName, Value))
+        {
+            return true;
+        }
+
+        if (FProperty* Property = FindFProperty<FProperty>(Struct, FName(*FieldName)))
+        {
+            return VF_WritePropertyValue(Property, Memory, Value);
+        }
+        return VF_WriteRuntimeField(Memory, Archetype, FieldName, Value);
     }
 
     void VF_AddPropertyMetadata(FVoxelStrateFieldSpread& Spread, const FProperty* Property)
@@ -112,39 +585,31 @@ namespace
 
     void VF_AddSpreadDescriptor(TArray<FVoxelStrateFieldSpread>& OutSpreads,
                                 TMap<FString, int32>& OutIndices,
+                                ECaveGeneratorType Archetype,
+                                const FString& ParamStructName,
                                 const TMap<FString, FProperty*>& Properties,
-                                const TCHAR* Name, EVoxelStrateFieldKind Kind)
+                                const FString& Name, EVoxelStrateFieldKind Kind)
     {
         FVoxelStrateFieldSpread& Spread = OutSpreads.AddDefaulted_GetRef();
+        Spread.Archetype = Archetype;
+        Spread.ParamStructName = ParamStructName;
         Spread.FieldName = Name;
         Spread.Kind = Kind;
-        Spread.bExcluded = VF_FindExclusion(Spread.FieldName) != nullptr;
+        Spread.bExcluded = VF_IsExcludedForArchetype(Archetype, Name);
 
-        if (const FProperty* const* Property = Properties.Find(Spread.FieldName))
+        if (const FProperty* const* Property = Properties.Find(Name))
         {
             Spread.bReflected = (*Property != nullptr);
             VF_AddPropertyMetadata(Spread, *Property);
         }
 
-        OutIndices.Add(Spread.FieldName, OutSpreads.Num() - 1);
-    }
-
-    void VF_AccumulateValue(const TCHAR* Name, double Value,
-                            const TMap<FString, int32>& Indices,
-                            TArray<TArray<double>>& Values)
-    {
-        const int32* Index = Indices.Find(FString(Name));
-        if (Index != nullptr && Values.IsValidIndex(*Index) && FMath::IsFinite(Value))
-        {
-            Values[*Index].Add(Value);
-        }
+        OutIndices.Add(VF_SpreadKey(Archetype, Name), OutSpreads.Num() - 1);
     }
 
     void VF_ResetNonTunableFields(FStrateGenerationParams& Params)
     {
-        // These fields are deliberately not inherited from a parent, jittered, or clamped. The
-        // first group is terrain-op transport populated per room by UVoxelTerrainOpDefinition;
-        // the last two are manager-owned runtime Z bounds.
+        // These are terrain-op transport values (written per room by UVoxelTerrainOpDefinition)
+        // plus manager-owned runtime Z bounds. They are not rolled in this composer pass.
         Params.TerraceStepHeight = 0.0f;
         Params.TerraceHardness = 0.0f;
         Params.TerraceNoiseDisplacement = 0.0f;
@@ -183,60 +648,283 @@ namespace
         Params.StrateBottomWorldZ = 0.0f;
     }
 
-    void VF_JitterFloat(float& Value, const FVoxelStrateFieldSpread* Spread, FRandomStream& Rng)
+    void VF_ResetRuntimeFields(FVoxelStrateArchetypeParams& Params,
+                               ECaveGeneratorType Archetype)
     {
-        if (Spread == nullptr || Spread->bExcluded || Spread->Kind != EVoxelStrateFieldKind::Continuous)
+        void* Memory = VF_GetParamMemory(Params, Archetype);
+        VF_WriteRuntimeField(Memory, Archetype, TEXT("StrateTopWorldZ"), 0.0);
+        VF_WriteRuntimeField(Memory, Archetype, TEXT("StrateBottomWorldZ"), 0.0);
+    }
+
+    void VF_ResetExcludedFields(FVoxelStrateArchetypeParams& Params,
+                                ECaveGeneratorType Archetype)
+    {
+        if (VF_IsTunnelArchetype(Archetype))
+        {
+            VF_ResetNonTunableFields(Params.TunnelNetworkParams);
+        }
+        else
+        {
+            VF_ResetRuntimeFields(Params, Archetype);
+        }
+    }
+
+    void VF_AppendSchemaError(FString& SchemaError, const FString& Message)
+    {
+        SchemaError += Message;
+        SchemaError += TEXT(" ");
+    }
+
+    void VF_ValidateFieldDescriptor(const TArray<FVoxelStrateFieldSpread>& Spreads,
+                                    ECaveGeneratorType Archetype,
+                                    const FString& FieldName,
+                                    bool& bSchemaValid, FString& SchemaError)
+    {
+        const FVoxelStrateFieldSpread* Spread = nullptr;
+        for (const FVoxelStrateFieldSpread& Candidate : Spreads)
+        {
+            if (Candidate.Archetype == Archetype && Candidate.FieldName == FieldName)
+            {
+                Spread = &Candidate;
+                break;
+            }
+        }
+        if (Spread != nullptr && !Spread->bReflected && !Spread->bExcluded)
+        {
+            bSchemaValid = false;
+            VF_AppendSchemaError(SchemaError,
+                FString::Printf(TEXT("Field '%s.%s' is neither reflected nor explicitly excluded."),
+                                *Spread->ParamStructName, *FieldName));
+        }
+    }
+
+    void VF_ValidateStructProperties(const TMap<FString, FProperty*>& Properties,
+                                     const TSet<FString>& ExpectedNames,
+                                     const FString& ParamStructName,
+                                     bool& bSchemaValid, FString& SchemaError)
+    {
+        for (const TPair<FString, FProperty*>& Pair : Properties)
+        {
+            if (!ExpectedNames.Contains(Pair.Key))
+            {
+                bSchemaValid = false;
+                VF_AppendSchemaError(SchemaError,
+                    FString::Printf(TEXT("Reflected %s field '%s' is absent from the composer field list."),
+                                    *ParamStructName, *Pair.Key));
+            }
+            if (!VF_IsScalarProperty(Pair.Value))
+            {
+                bSchemaValid = false;
+                VF_AppendSchemaError(SchemaError,
+                    FString::Printf(TEXT("Reflected %s field '%s' is not scalar and cannot be rolled."),
+                                    *ParamStructName, *Pair.Key));
+            }
+        }
+    }
+
+    void VF_BlendParamStruct(FVoxelStrateArchetypeParams& Destination,
+                             const FVoxelStrateArchetypeParams& Source,
+                             ECaveGeneratorType Archetype, float Alpha)
+    {
+        void* DestinationMemory = VF_GetParamMemory(Destination, Archetype);
+        const void* SourceMemory = VF_GetParamMemory(Source, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (DestinationMemory == nullptr || SourceMemory == nullptr || Struct == nullptr)
         {
             return;
         }
 
-        const float CorpusRange = (float)FMath::Max(0.0, Spread->Max - Spread->Min);
-        if (CorpusRange > 0.0f)
+        if (VF_IsTunnelArchetype(Archetype))
         {
-            Value += (Rng.FRand() * 2.0f - 1.0f) * GJitterFraction * CorpusRange;
+            Destination.TunnelNetworkParams = FStrateGenerationParams::Lerp(
+                Destination.TunnelNetworkParams, Source.TunnelNetworkParams, Alpha);
+            return;
+        }
+
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        for (const TPair<FString, FProperty*>& Pair : Properties)
+        {
+            if (!VF_IsScalarProperty(Pair.Value))
+            {
+                continue;
+            }
+
+            double A = 0.0;
+            double B = 0.0;
+            if (!VF_ReadPropertyValue(Pair.Value, DestinationMemory, A)
+                || !VF_ReadPropertyValue(Pair.Value, SourceMemory, B))
+            {
+                continue;
+            }
+
+            const EVoxelStrateFieldKind Kind = VF_PropertyKind(Pair.Value);
+            const double Value = Kind == EVoxelStrateFieldKind::Continuous
+                ? static_cast<double>(FMath::Lerp(static_cast<float>(A), static_cast<float>(B), Alpha))
+                : (Alpha < 0.5f ? A : B);
+            VF_WritePropertyValue(Pair.Value, DestinationMemory, Value);
         }
     }
 
-    void VF_ClampFloat(float& Value, const FVoxelStrateFieldSpread* Spread)
+    void VF_CopyDominantBooleans(FVoxelStrateArchetypeParams& Destination,
+                                 const FVoxelStrateArchetypeParams& Dominant,
+                                 ECaveGeneratorType Archetype)
     {
-        if (Spread == nullptr || Spread->bExcluded)
+        void* DestinationMemory = VF_GetParamMemory(Destination, Archetype);
+        const void* DominantMemory = VF_GetParamMemory(Dominant, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (DestinationMemory == nullptr || DominantMemory == nullptr || Struct == nullptr)
         {
             return;
         }
-        if (Spread->bHasClampMin)
+
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        for (const TPair<FString, FProperty*>& Pair : Properties)
         {
-            Value = FMath::Max(Value, (float)Spread->ClampMin);
-        }
-        if (Spread->bHasClampMax)
-        {
-            Value = FMath::Min(Value, (float)Spread->ClampMax);
+            if (VF_PropertyKind(Pair.Value) != EVoxelStrateFieldKind::Boolean)
+            {
+                continue;
+            }
+            double Value = 0.0;
+            if (VF_ReadPropertyValue(Pair.Value, DominantMemory, Value))
+            {
+                VF_WritePropertyValue(Pair.Value, DestinationMemory, Value);
+            }
         }
     }
 
-    void VF_ClampInt(int32& Value, const FVoxelStrateFieldSpread* Spread)
+    void VF_JitterNativeParams(FVoxelStrateArchetypeParams& Params,
+                               ECaveGeneratorType Archetype,
+                               const FVoxelStrateCorpus& Corpus,
+                               FRandomStream& Rng)
     {
-        if (Spread == nullptr || Spread->bExcluded)
+        void* Memory = VF_GetParamMemory(Params, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Memory == nullptr || Struct == nullptr)
         {
             return;
         }
-        if (Spread->bHasClampMin)
+
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        for (const TPair<FString, FProperty*>& Pair : Properties)
         {
-            Value = FMath::Max(Value, FMath::CeilToInt((float)Spread->ClampMin));
-        }
-        if (Spread->bHasClampMax)
-        {
-            Value = FMath::Min(Value, FMath::FloorToInt((float)Spread->ClampMax));
+            if (VF_PropertyKind(Pair.Value) != EVoxelStrateFieldKind::Continuous)
+            {
+                continue;
+            }
+
+            const FVoxelStrateFieldSpread* Spread = Corpus.FindSpread(Archetype, Pair.Key);
+            if (Spread == nullptr || Spread->bExcluded)
+            {
+                continue;
+            }
+
+            const double CorpusRange = FMath::Max(0.0, Spread->Max - Spread->Min);
+            if (!(CorpusRange > 0.0))
+            {
+                continue;
+            }
+
+            double Value = 0.0;
+            if (VF_ReadPropertyValue(Pair.Value, Memory, Value))
+            {
+                Value += static_cast<double>((Rng.FRand() * 2.0f - 1.0f) * GJitterFraction)
+                    * CorpusRange;
+                VF_WritePropertyValue(Pair.Value, Memory, Value);
+            }
         }
     }
 
-    void VF_RepairOrderedPair(float& MinValue, float& MaxValue)
+    void VF_ClampNativeParams(FVoxelStrateArchetypeParams& Params,
+                              ECaveGeneratorType Archetype,
+                              const FVoxelStrateCorpus& Corpus)
     {
-        // Convex blending preserves these relations, but independent jitter is allowed to cross
-        // one. Repairing the pair after the jitter keeps the relation without inventing a new
-        // range or touching generation code.
-        if (MinValue > MaxValue)
+        void* Memory = VF_GetParamMemory(Params, Archetype);
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Memory == nullptr || Struct == nullptr)
         {
-            Swap(MinValue, MaxValue);
+            return;
+        }
+
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        for (const TPair<FString, FProperty*>& Pair : Properties)
+        {
+            const EVoxelStrateFieldKind Kind = VF_PropertyKind(Pair.Value);
+            if (Kind == EVoxelStrateFieldKind::Boolean)
+            {
+                continue;
+            }
+
+            const FVoxelStrateFieldSpread* Spread = Corpus.FindSpread(Archetype, Pair.Key);
+            if (Spread == nullptr || Spread->bExcluded)
+            {
+                continue;
+            }
+
+            double Value = 0.0;
+            if (!VF_ReadPropertyValue(Pair.Value, Memory, Value))
+            {
+                continue;
+            }
+            if (Spread->bHasClampMin)
+            {
+                Value = FMath::Max(Value, Spread->ClampMin);
+            }
+            if (Spread->bHasClampMax)
+            {
+                Value = FMath::Min(Value, Spread->ClampMax);
+            }
+            VF_WritePropertyValue(Pair.Value, Memory, Value);
+        }
+    }
+
+    void VF_RepairOrderedPair(FVoxelStrateArchetypeParams& Params,
+                              ECaveGeneratorType Archetype,
+                              const TCHAR* MinField, const TCHAR* MaxField)
+    {
+        void* Memory = VF_GetParamMemory(Params, Archetype);
+        double MinValue = 0.0;
+        double MaxValue = 0.0;
+        if (VF_ReadNamedField(Memory, Archetype, MinField, MinValue)
+            && VF_ReadNamedField(Memory, Archetype, MaxField, MaxValue)
+            && MinValue > MaxValue)
+        {
+            VF_WriteNamedField(Memory, Archetype, MinField, MaxValue);
+            VF_WriteNamedField(Memory, Archetype, MaxField, MinValue);
+        }
+    }
+
+    void VF_RepairNativeOrderedPairs(FVoxelStrateArchetypeParams& Params,
+                                     ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            VF_RepairOrderedPair(Params, Archetype, TEXT("MinRoomRadius"), TEXT("MaxRoomRadius"));
+            VF_RepairOrderedPair(Params, Archetype, TEXT("RoomFloorCutMin"), TEXT("RoomFloorCutMax"));
+            VF_RepairOrderedPair(Params, Archetype, TEXT("TunnelMinRadius"), TEXT("TunnelMaxRadius"));
+            break;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            VF_RepairOrderedPair(Params, Archetype, TEXT("FloorRelativeHeight"), TEXT("CeilingRelativeHeight"));
+            VF_RepairOrderedPair(Params, Archetype, TEXT("ColumnMinRadius"), TEXT("ColumnMaxRadius"));
+            break;
+        case ECaveGeneratorType::SurfaceWorld:
+            VF_RepairOrderedPair(Params, Archetype, TEXT("BaseGroundRelative"), TEXT("CeilingRelative"));
+            break;
+        case ECaveGeneratorType::VerticalShafts:
+            VF_RepairOrderedPair(Params, Archetype, TEXT("ShaftMinRadius"), TEXT("ShaftMaxRadius"));
+            break;
+        case ECaveGeneratorType::FloatingIslands:
+            VF_RepairOrderedPair(Params, Archetype, TEXT("IslandMinRadius"), TEXT("IslandMaxRadius"));
+            break;
+        case ECaveGeneratorType::Maze:
+        default:
+            break;
         }
     }
 
@@ -253,8 +941,8 @@ namespace
     uint32 VF_RollSeed(uint32 CorpusHash, int32 Seed, int32 Index)
     {
         uint32 Value = CorpusHash ^ 0x9e3779b9U;
-        Value = VF_Avalanche(Value ^ (uint32)Seed);
-        Value = VF_Avalanche(Value ^ ((uint32)Index + 0x85ebca6bU));
+        Value = VF_Avalanche(Value ^ static_cast<uint32>(Seed));
+        Value = VF_Avalanche(Value ^ (static_cast<uint32>(Index) + 0x85ebca6bU));
         return Value;
     }
 
@@ -343,7 +1031,7 @@ namespace
             return Result;
         }
 
-        FRandomStream Rng((int32)VF_RollSeed(Corpus.GetContentsHash(), Seed, Index));
+        FRandomStream Rng(static_cast<int32>(VF_RollSeed(Corpus.GetContentsHash(), Seed, Index)));
 
         float TotalGroupWeight = 0.0f;
         for (const FParentGroup& Group : Groups)
@@ -387,8 +1075,8 @@ namespace
         for (int32 ParentSlot = 0; ParentSlot < ParentCount; ++ParentSlot)
         {
             // Once a group is exhausted, replacement is intentional. It keeps the requested
-            // 2–3-parent algorithm defined for a one-entry corpus and makes that limitation
-            // visible in the provenance list rather than silently inventing a second vector.
+            // 2–3-parent algorithm defined for a one-entry group and exposes that limitation in
+            // provenance instead of silently inventing a second vector.
             const TArray<int32>& Candidates = Available.Num() > 0 ? Available : Group.EntryIndices;
             const int32 ParentIndex = VF_WeightedPick(Candidates, Entries, Rng);
             if (ParentIndex == INDEX_NONE)
@@ -425,63 +1113,31 @@ namespace
             }
         }
 
-        FStrateGenerationParams Params = Entries[Result.ParentEntryIndices[0]].Params;
+        Result.Archetype = Group.Archetype;
+        Result.ArchetypeParams = Entries[Result.ParentEntryIndices[0]].ArchetypeParams;
         float AccumulatedWeight = Result.ParentWeights[0];
         for (int32 ParentSlot = 1; ParentSlot < Result.ParentEntryIndices.Num(); ++ParentSlot)
         {
             const float ThisWeight = Result.ParentWeights[ParentSlot];
             const float Alpha = ThisWeight / (AccumulatedWeight + ThisWeight);
-            Params = FStrateGenerationParams::Lerp(
-                Params, Entries[Result.ParentEntryIndices[ParentSlot]].Params, Alpha);
+            VF_BlendParamStruct(Result.ArchetypeParams,
+                                Entries[Result.ParentEntryIndices[ParentSlot]].ArchetypeParams,
+                                Result.Archetype, Alpha);
             AccumulatedWeight += ThisWeight;
         }
 
-        // Discrete values are not jittered. Lerp already snaps int/enum fields at 0.5; bools use
-        // the explicit dominant-parent policy because a boolean has no meaningful linear blend.
         const int32 DominantParent = Result.ParentEntryIndices[Result.DominantParentPosition];
-        Params.bTunnelsFlowTowardOrigin = Entries[DominantParent].Params.bTunnelsFlowTowardOrigin;
+        VF_CopyDominantBooleans(Result.ArchetypeParams,
+                                Entries[DominantParent].ArchetypeParams,
+                                Result.Archetype);
+        VF_JitterNativeParams(Result.ArchetypeParams, Result.Archetype, Corpus, Rng);
+        VF_ClampNativeParams(Result.ArchetypeParams, Result.Archetype, Corpus);
+        VF_RepairNativeOrderedPairs(Result.ArchetypeParams, Result.Archetype);
+        VF_ResetExcludedFields(Result.ArchetypeParams, Result.Archetype);
 
-#define VF_COMPOSER_JITTER_LERPF(Name) \
-        VF_JitterFloat(Params.Name, Corpus.FindSpread(TEXT(#Name)), Rng);
-#define VF_COMPOSER_JITTER_SNAP(Name)
-        VF_STRATE_PARAM_FIELDS(VF_COMPOSER_JITTER_LERPF, VF_COMPOSER_JITTER_SNAP)
-#undef VF_COMPOSER_JITTER_LERPF
-#undef VF_COMPOSER_JITTER_SNAP
-
-        // Clamp metadata is consulted only after blend+jitter. It is a hard editor-build safety
-        // net, not a distribution range.
-#define VF_COMPOSER_CLAMP_LERPF(Name) \
-        VF_ClampFloat(Params.Name, Corpus.FindSpread(TEXT(#Name)));
-#define VF_COMPOSER_CLAMP_INT(Name) \
-        VF_ClampInt(Params.Name, Corpus.FindSpread(TEXT(#Name)));
-#define VF_COMPOSER_CLAMP_SNAP_OriginRoomMaxConnections() \
-        VF_ClampInt(Params.OriginRoomMaxConnections, Corpus.FindSpread(TEXT("OriginRoomMaxConnections")));
-#define VF_COMPOSER_CLAMP_SNAP_bTunnelsFlowTowardOrigin()
-#define VF_COMPOSER_CLAMP_SNAP_RoughnessNoiseType()
-#define VF_COMPOSER_CLAMP_SNAP(Name) VF_COMPOSER_CLAMP_SNAP_##Name()
-        /* The SNAP expansion is dispatched field-by-field because the list contains one int,
-         * one bool, and one enum. */
-        VF_STRATE_PARAM_FIELDS(VF_COMPOSER_CLAMP_LERPF, VF_COMPOSER_CLAMP_SNAP)
-#undef VF_COMPOSER_CLAMP_LERPF
-#undef VF_COMPOSER_CLAMP_INT
-#undef VF_COMPOSER_CLAMP_SNAP
-#undef VF_COMPOSER_CLAMP_SNAP_OriginRoomMaxConnections
-#undef VF_COMPOSER_CLAMP_SNAP_bTunnelsFlowTowardOrigin
-#undef VF_COMPOSER_CLAMP_SNAP_RoughnessNoiseType
-
-        VF_RepairOrderedPair(Params.MinRoomRadius, Params.MaxRoomRadius);
-        VF_RepairOrderedPair(Params.RoomFloorCutMin, Params.RoomFloorCutMax);
-        VF_RepairOrderedPair(Params.TunnelMinRadius, Params.TunnelMaxRadius);
-        VF_RepairOrderedPair(Params.ArchMinRadius, Params.ArchMaxRadius);
-        VF_RepairOrderedPair(Params.ColumnMinRadius, Params.ColumnMaxRadius);
-        VF_RepairOrderedPair(Params.PitMinRadius, Params.PitMaxRadius);
-        VF_RepairOrderedPair(Params.ChimneyMinRadius, Params.ChimneyMaxRadius);
-        VF_RepairOrderedPair(Params.DomeMinRadius, Params.DomeMaxRadius);
-
-        VF_ResetNonTunableFields(Params);
-
-        Result.Params = Params;
-        Result.Archetype = Group.Archetype;
+        // Preserve the original compact API's compatibility view. Detailed callers use the
+        // correctly typed active family in ArchetypeParams.
+        Result.Params = Result.ArchetypeParams.TunnelNetworkParams;
         Result.bValid = true;
         return Result;
     }
@@ -494,7 +1150,9 @@ const TArray<FVoxelStrateFieldExclusion>& FVoxelStrateCorpus::GetNonTunableField
         TArray<FVoxelStrateFieldExclusion> Result;
 
         const TCHAR* TerrainOpReason = TEXT(
-            "Internal terrain-op transport: populated per room by UVoxelTerrainOpDefinition, not an authored GenerationParams tunable.");
+            "Transport slot only: generation overlays it per room from a UVoxelTerrainOpDefinition "
+            "selected through the active strate's TerrainOperations pool; it is not the authored "
+            "strate-generation source.");
         VF_AddExclusion(Result, TEXT("TerraceStepHeight"), TerrainOpReason);
         VF_AddExclusion(Result, TEXT("TerraceHardness"), TerrainOpReason);
         VF_AddExclusion(Result, TEXT("TerraceNoiseDisplacement"), TerrainOpReason);
@@ -555,54 +1213,85 @@ void FVoxelStrateCorpus::RebuildSpreads()
     SchemaError.Reset();
     bSchemaValid = true;
 
-    TMap<FString, FProperty*> Properties;
-    VF_CollectGenerationProperties(Properties);
-
-    TArray<FString> ExpectedNames;
-    TSet<FString> ExpectedNameSet;
     TMap<FString, int32> Indices;
+    for (const ECaveGeneratorType Archetype : GAllArchetypes)
+    {
+        UStruct* Struct = VF_GetParamStruct(Archetype);
+        if (Struct == nullptr)
+        {
+            bSchemaValid = false;
+            VF_AppendSchemaError(SchemaError,
+                FString::Printf(TEXT("No parameter struct is registered for archetype %s."),
+                                VF_GetStrateArchetypeName(Archetype)));
+            continue;
+        }
 
+        const FString ParamStructName = Struct->GetName();
+        TMap<FString, FProperty*> Properties;
+        VF_CollectProperties(Struct, Properties);
+        TSet<FString> ExpectedNames;
+
+        if (VF_IsTunnelArchetype(Archetype))
+        {
 #define VF_COMPOSER_ADD_LERPF(Name) \
-    ExpectedNames.Add(TEXT(#Name)); \
-    ExpectedNameSet.Add(TEXT(#Name)); \
-    VF_AddSpreadDescriptor(FieldSpreads, Indices, Properties, TEXT(#Name), EVoxelStrateFieldKind::Continuous);
+            ExpectedNames.Add(TEXT(#Name)); \
+            VF_AddSpreadDescriptor(FieldSpreads, Indices, Archetype, ParamStructName, Properties, \
+                                   TEXT(#Name), EVoxelStrateFieldKind::Continuous);
 #define VF_COMPOSER_ADD_SNAP(Name) \
-    ExpectedNames.Add(TEXT(#Name)); \
-    ExpectedNameSet.Add(TEXT(#Name)); \
-    VF_AddSpreadDescriptor(FieldSpreads, Indices, Properties, TEXT(#Name), \
-        VF_FieldKindFor<decltype(std::declval<FStrateGenerationParams>().Name)>());
-    VF_STRATE_PARAM_FIELDS(VF_COMPOSER_ADD_LERPF, VF_COMPOSER_ADD_SNAP)
+            ExpectedNames.Add(TEXT(#Name)); \
+            VF_AddSpreadDescriptor(FieldSpreads, Indices, Archetype, ParamStructName, Properties, \
+                                   TEXT(#Name), VF_FieldKindFor<decltype(std::declval<FStrateGenerationParams>().Name)>());
+            VF_STRATE_PARAM_FIELDS(VF_COMPOSER_ADD_LERPF, VF_COMPOSER_ADD_SNAP)
 #undef VF_COMPOSER_ADD_LERPF
 #undef VF_COMPOSER_ADD_SNAP
+        }
+        else
+        {
+            for (const TPair<FString, FProperty*>& Pair : Properties)
+            {
+                if (VF_IsScalarProperty(Pair.Value))
+                {
+                    ExpectedNames.Add(Pair.Key);
+                    VF_AddSpreadDescriptor(FieldSpreads, Indices, Archetype, ParamStructName,
+                                           Properties, Pair.Key, VF_PropertyKind(Pair.Value));
+                }
+            }
+        }
 
-    for (const TPair<FString, FProperty*>& Pair : Properties)
-    {
-        if (!ExpectedNameSet.Contains(Pair.Key))
+        // Sibling structs keep runtime bounds as ordinary C++ fields, just as
+        // FStrateGenerationParams does. Include them in the report and mark them excluded even
+        // though reflection cannot see them.
+        if (!VF_IsTunnelArchetype(Archetype))
         {
-            bSchemaValid = false;
-            SchemaError += FString::Printf(
-                TEXT("Reflected FStrateGenerationParams field '%s' is absent from VF_STRATE_PARAM_FIELDS. "),
-                *Pair.Key);
+            ExpectedNames.Add(TEXT("StrateTopWorldZ"));
+            ExpectedNames.Add(TEXT("StrateBottomWorldZ"));
+            VF_AddSpreadDescriptor(FieldSpreads, Indices, Archetype, ParamStructName, Properties,
+                                   TEXT("StrateTopWorldZ"), EVoxelStrateFieldKind::Continuous);
+            VF_AddSpreadDescriptor(FieldSpreads, Indices, Archetype, ParamStructName, Properties,
+                                   TEXT("StrateBottomWorldZ"), EVoxelStrateFieldKind::Continuous);
         }
-    }
-    for (const FVoxelStrateFieldExclusion& Exclusion : GetNonTunableFields())
-    {
-        if (!ExpectedNameSet.Contains(Exclusion.FieldName))
+
+        VF_ValidateStructProperties(Properties, ExpectedNames, ParamStructName,
+                                     bSchemaValid, SchemaError);
+
+        if (VF_IsTunnelArchetype(Archetype))
         {
-            bSchemaValid = false;
-            SchemaError += FString::Printf(
-                TEXT("Explicit exclusion '%s' is absent from VF_STRATE_PARAM_FIELDS. "),
-                *Exclusion.FieldName);
+            for (const FVoxelStrateFieldExclusion& Exclusion : GetNonTunableFields())
+            {
+                if (!ExpectedNames.Contains(Exclusion.FieldName))
+                {
+                    bSchemaValid = false;
+                    VF_AppendSchemaError(SchemaError,
+                        FString::Printf(TEXT("Explicit exclusion '%s' is absent from %s."),
+                                        *Exclusion.FieldName, *ParamStructName));
+                }
+            }
         }
-    }
-    for (const FString& ExpectedName : ExpectedNames)
-    {
-        const FVoxelStrateFieldSpread* Spread = FindSpread(ExpectedName);
-        if (Spread != nullptr && !Spread->bReflected && !Spread->bExcluded)
+
+        for (const FString& ExpectedName : ExpectedNames)
         {
-            bSchemaValid = false;
-            SchemaError += FString::Printf(
-                TEXT("Field '%s' is neither reflected nor explicitly excluded. "), *ExpectedName);
+            VF_ValidateFieldDescriptor(FieldSpreads, Archetype, ExpectedName,
+                                       bSchemaValid, SchemaError);
         }
     }
 
@@ -610,13 +1299,27 @@ void FVoxelStrateCorpus::RebuildSpreads()
     Values.SetNum(FieldSpreads.Num());
     for (const FVoxelStrateCorpusEntry& Entry : Entries)
     {
-#define VF_COMPOSER_ACCUM_LERPF(Name) \
-        VF_AccumulateValue(TEXT(#Name), static_cast<double>(Entry.Params.Name), Indices, Values);
-#define VF_COMPOSER_ACCUM_SNAP(Name) \
-        VF_AccumulateValue(TEXT(#Name), static_cast<double>(Entry.Params.Name), Indices, Values);
-        VF_STRATE_PARAM_FIELDS(VF_COMPOSER_ACCUM_LERPF, VF_COMPOSER_ACCUM_SNAP)
-#undef VF_COMPOSER_ACCUM_LERPF
-#undef VF_COMPOSER_ACCUM_SNAP
+        const void* Memory = VF_GetParamMemory(Entry.ArchetypeParams, Entry.Archetype);
+        if (Memory == nullptr)
+        {
+            continue;
+        }
+
+        for (int32 FieldIndex = 0; FieldIndex < FieldSpreads.Num(); ++FieldIndex)
+        {
+            const FVoxelStrateFieldSpread& Spread = FieldSpreads[FieldIndex];
+            if (Spread.Archetype != Entry.Archetype)
+            {
+                continue;
+            }
+
+            double Value = 0.0;
+            if (VF_ReadNamedField(Memory, Entry.Archetype, Spread.FieldName, Value)
+                && FMath::IsFinite(Value))
+            {
+                Values[FieldIndex].Add(Value);
+            }
+        }
     }
 
     for (int32 FieldIndex = 0; FieldIndex < FieldSpreads.Num(); ++FieldIndex)
@@ -638,7 +1341,7 @@ void FVoxelStrateCorpus::RebuildSpreads()
             Spread.Max = FMath::Max(Spread.Max, Sample);
             Sum += Sample;
         }
-        Spread.Mean = Sum / (double)Samples.Num();
+        Spread.Mean = Sum / static_cast<double>(Samples.Num());
 
         double Variance = 0.0;
         for (const double Sample : Samples)
@@ -646,7 +1349,7 @@ void FVoxelStrateCorpus::RebuildSpreads()
             const double Delta = Sample - Spread.Mean;
             Variance += Delta * Delta;
         }
-        Spread.StdDev = FMath::Sqrt(FMath::Max(0.0, Variance / (double)Samples.Num()));
+        Spread.StdDev = FMath::Sqrt(FMath::Max(0.0, Variance / static_cast<double>(Samples.Num())));
     }
 
 #if WITH_EDITOR
@@ -660,12 +1363,20 @@ bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& Sour
                                   ECaveGeneratorType Archetype,
                                   const FStrateGenerationParams& Params, float Weight)
 {
-    if (Archetype != ECaveGeneratorType::TunnelNetwork
-        && Archetype != ECaveGeneratorType::Underwater)
+    FVoxelStrateArchetypeParams ArchetypeParams;
+    ArchetypeParams.TunnelNetworkParams = Params;
+    return AddEntry(SourcePath, SourceName, Archetype, ArchetypeParams, Weight);
+}
+
+bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& SourceName,
+                                  ECaveGeneratorType Archetype,
+                                  const FVoxelStrateArchetypeParams& Params, float Weight)
+{
+    if (!VF_IsSupportedArchetype(Archetype))
     {
         SkippedDefinitions.Add(FString::Printf(
-            TEXT("%s skipped: archetype %s does not author FStrateGenerationParams."),
-            *SourcePath, VF_GetStrateArchetypeName(Archetype)));
+            TEXT("%s skipped: unknown archetype value %d."),
+            *SourcePath, static_cast<int32>(static_cast<uint8>(Archetype))));
         return false;
     }
     if (!FMath::IsFinite(Weight) || Weight <= 0.0f)
@@ -680,15 +1391,16 @@ bool FVoxelStrateCorpus::AddEntry(const FString& SourcePath, const FString& Sour
     Entry.SourcePath = SourcePath;
     Entry.SourceName = SourceName.IsEmpty() ? SourcePath : SourceName;
     Entry.Archetype = Archetype;
-    Entry.Params = Params;
+    Entry.ArchetypeParams = Params;
+    Entry.Params = Params.TunnelNetworkParams;
     Entry.Weight = Weight;
 
     Entries.Sort([](const FVoxelStrateCorpusEntry& A, const FVoxelStrateCorpusEntry& B)
     {
         if (A.SourcePath != B.SourcePath) { return A.SourcePath < B.SourcePath; }
-        if ((uint8)A.Archetype != (uint8)B.Archetype)
+        if (static_cast<uint8>(A.Archetype) != static_cast<uint8>(B.Archetype))
         {
-            return (uint8)A.Archetype < (uint8)B.Archetype;
+            return static_cast<uint8>(A.Archetype) < static_cast<uint8>(B.Archetype);
         }
         return A.SourceName < B.SourceName;
     });
@@ -715,6 +1427,7 @@ bool FVoxelStrateCorpus::LoadFromDefinitions(
     });
 
     TSet<FString> SeenPaths;
+    int32 NumDefinitionEntries = 0;
     for (UVoxelStrateDefinition* Definition : SortedDefinitions)
     {
         const FString SourcePath = Definition->GetPathName();
@@ -728,35 +1441,57 @@ bool FVoxelStrateCorpus::LoadFromDefinitions(
             ? Definition->GetName()
             : Definition->StrateName.ToString();
 
-        if (Definition->GeneratorType != ECaveGeneratorType::TunnelNetwork
-            && Definition->GeneratorType != ECaveGeneratorType::Underwater)
+        if (!VF_IsSupportedArchetype(Definition->GeneratorType))
         {
             SkippedDefinitions.Add(FString::Printf(
-                TEXT("%s (%s) skipped: %s uses a different authored parameter struct; its ")
-                TEXT("GenerationParams default is not corpus data."),
+                TEXT("%s (%s) skipped: unknown GeneratorType value %d."),
                 *SourcePath, *SourceName,
-                VF_GetStrateArchetypeName(Definition->GeneratorType)));
+                static_cast<int32>(static_cast<uint8>(Definition->GeneratorType))));
             continue;
         }
 
-        FVoxelStrateCorpusEntry& Entry = Entries.AddDefaulted_GetRef();
-        Entry.SourcePath = SourcePath;
-        Entry.SourceName = SourceName;
-        Entry.Archetype = Definition->GeneratorType;
-        Entry.Params = Definition->GenerationParams;
-        Entry.Weight = 1.0f; // There is no authoring weight on UVoxelStrateDefinition.
+        FVoxelStrateArchetypeParams Params;
+        Params.TunnelNetworkParams = Definition->GenerationParams;
+        Params.SlabParams = Definition->SlabParams;
+        Params.MazeParams = Definition->MazeParams;
+        Params.SurfaceParams = Definition->SurfaceParams;
+        Params.VerticalShaftParams = Definition->VerticalShaftParams;
+        Params.FloatingIslandParams = Definition->FloatingIslandParams;
+
+        if (AddEntry(SourcePath, SourceName, Definition->GeneratorType, Params, 1.0f))
+        {
+            ++NumDefinitionEntries;
+        }
     }
 
-    Entries.Sort([](const FVoxelStrateCorpusEntry& A, const FVoxelStrateCorpusEntry& B)
+    // C++ member initializers in VoxelStrateTypes.h are hand-tuned, known-good starting points.
+    // Add one member for every exact archetype so an empty group still has a valid parent and so
+    // the defaults are measured alongside project assets.
+    FVoxelStrateArchetypeParams Defaults;
+    int32 NumDefaultEntries = 0;
+    for (const ECaveGeneratorType Archetype : GAllArchetypes)
     {
-        if (A.SourcePath != B.SourcePath) { return A.SourcePath < B.SourcePath; }
-        return (uint8)A.Archetype < (uint8)B.Archetype;
-    });
-    RebuildSpreads();
+        const FString ArchetypeName = VF_GetStrateArchetypeName(Archetype);
+        const FString DefaultPath = FString::Printf(
+            TEXT("/VoxelForge/ComposerDefaults/%s"), *ArchetypeName);
+        const FString DefaultName = FString::Printf(TEXT("Default_%s"), *ArchetypeName);
+        if (AddEntry(DefaultPath, DefaultName, Archetype, Defaults, 1.0f))
+        {
+            ++NumDefaultEntries;
+        }
+    }
 
+    RebuildSpreads();
+    TSet<uint8> ArchetypeSet;
+    for (const FVoxelStrateCorpusEntry& Entry : Entries)
+    {
+        ArchetypeSet.Add(static_cast<uint8>(Entry.Archetype));
+    }
     OutReport = FString::Printf(
-        TEXT("Corpus definitions: %d resolved usable entries, %d skipped, %d fields measured. "),
-        Entries.Num(), SkippedDefinitions.Num(), FieldSpreads.Num());
+        TEXT("Corpus definitions: %d resolved project vectors + %d archetype defaults = %d corpus "
+             "members; %d exact-archetype groups; %d field descriptors measured. "),
+        NumDefinitionEntries, NumDefaultEntries, Entries.Num(), ArchetypeSet.Num(),
+        FieldSpreads.Num());
     for (const FString& Skipped : SkippedDefinitions)
     {
         OutReport += Skipped;
@@ -770,44 +1505,62 @@ bool FVoxelStrateCorpus::LoadFromDefinitions(
     return IsValid();
 }
 
-bool FVoxelStrateCorpus::LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport)
+static bool VF_IsProjectPackagePath(const FString& PackagePath)
 {
-    Reset();
-    if (Settings == nullptr)
-    {
-        OutReport = TEXT("Cannot load strate corpus: settings is null.");
-        return false;
-    }
+    return PackagePath == TEXT("/Game")
+        || PackagePath.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase);
+}
 
-    TArray<TSoftObjectPtr<UVoxelStrateDefinition>> References;
-    for (const TPair<int32, TSoftObjectPtr<UVoxelStrateDefinition>>& Pair : Settings->FixedStrates)
+static bool VF_IsIgnoredSavedCopy(const FString& PackagePath)
+{
+    return PackagePath.Contains(TEXT("/Saved/Autosaves"), ESearchCase::IgnoreCase)
+        || PackagePath.Contains(TEXT("/Saved/Cooked"), ESearchCase::IgnoreCase);
+}
+
+bool FVoxelStrateCorpus::LoadFromAssetRegistry(FString& OutReport)
+{
+    FAssetRegistryModule& AssetRegistryModule =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+    TArray<FAssetData> AssetData;
+    AssetRegistryModule.Get().GetAssetsByClass(
+        UVoxelStrateDefinition::StaticClass()->GetClassPathName(), AssetData, true);
+    AssetData.Sort([](const FAssetData& A, const FAssetData& B)
     {
-        References.Add(Pair.Value);
-    }
-    References.Append(Settings->StratePool);
-    References.Sort([](const TSoftObjectPtr<UVoxelStrateDefinition>& A,
-                       const TSoftObjectPtr<UVoxelStrateDefinition>& B)
-    {
-        return A.ToSoftObjectPath().ToString() < B.ToSoftObjectPath().ToString();
+        return A.GetObjectPathString() < B.GetObjectPathString();
     });
 
     TArray<UVoxelStrateDefinition*> Definitions;
-    TSet<FString> SeenPaths;
-    FString ResolutionNotes;
-    for (const TSoftObjectPtr<UVoxelStrateDefinition>& Reference : References)
+    TSet<FString> SeenObjectPaths;
+    int32 NumIgnoredSaved = 0;
+    int32 NumOutsideProject = 0;
+    int32 NumDuplicateRecords = 0;
+    int32 NumUnresolved = 0;
+    for (const FAssetData& Asset : AssetData)
     {
-        const FString Path = Reference.ToSoftObjectPath().ToString();
-        if (Path.IsEmpty() || SeenPaths.Contains(Path))
+        const FString PackagePath = Asset.PackageName.ToString();
+        const FString ObjectPath = Asset.GetObjectPathString();
+        if (!VF_IsProjectPackagePath(PackagePath))
         {
+            ++NumOutsideProject;
             continue;
         }
-        SeenPaths.Add(Path);
+        if (VF_IsIgnoredSavedCopy(PackagePath) || VF_IsIgnoredSavedCopy(ObjectPath))
+        {
+            ++NumIgnoredSaved;
+            continue;
+        }
+        if (SeenObjectPaths.Contains(ObjectPath))
+        {
+            ++NumDuplicateRecords;
+            continue;
+        }
+        SeenObjectPaths.Add(ObjectPath);
 
-        TSoftObjectPtr<UVoxelStrateDefinition> LoadReference = Reference;
-        UVoxelStrateDefinition* Definition = LoadReference.LoadSynchronous();
+        UVoxelStrateDefinition* Definition = Cast<UVoxelStrateDefinition>(Asset.GetAsset());
         if (Definition == nullptr)
         {
-            ResolutionNotes += FString::Printf(TEXT("%s could not be resolved. "), *Path);
+            ++NumUnresolved;
             continue;
         }
         Definitions.Add(Definition);
@@ -816,13 +1569,97 @@ bool FVoxelStrateCorpus::LoadFromSettings(const UVoxelSettings* Settings, FStrin
     FString DefinitionReport;
     const bool bLoaded = LoadFromDefinitions(Definitions, DefinitionReport);
     OutReport = FString::Printf(
-        TEXT("Settings references: %d unique soft paths, %d resolved. %s%s"),
-        SeenPaths.Num(), Definitions.Num(), *ResolutionNotes, *DefinitionReport);
+        TEXT("Asset Registry strate scan: %d records; %d project candidates; %d Saved/Autosaves "
+             "or Saved/Cooked copies ignored; %d outside project; %d duplicate records; %d unresolved. "
+             "%s"),
+        AssetData.Num(), SeenObjectPaths.Num(), NumIgnoredSaved, NumOutsideProject,
+        NumDuplicateRecords, NumUnresolved, *DefinitionReport);
+    return bLoaded && NumUnresolved == 0;
+}
+
+bool FVoxelStrateCorpus::LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport)
+{
+    // Compatibility/audit entry point. It intentionally does not load any soft reference: the
+    // Asset Registry is the corpus source, while the settings pool is reported as the reason the
+    // first Tier 4a run saw only one vector.
+    TArray<FString> SettingsPaths;
+    if (Settings != nullptr)
+    {
+        TSet<FString> UniquePaths;
+        for (const TPair<int32, TSoftObjectPtr<UVoxelStrateDefinition>>& Pair : Settings->FixedStrates)
+        {
+            const FString Path = Pair.Value.ToSoftObjectPath().ToString();
+            if (!Path.IsEmpty())
+            {
+                UniquePaths.Add(Path);
+            }
+        }
+        for (const TSoftObjectPtr<UVoxelStrateDefinition>& Reference : Settings->StratePool)
+        {
+            const FString Path = Reference.ToSoftObjectPath().ToString();
+            if (!Path.IsEmpty())
+            {
+                UniquePaths.Add(Path);
+            }
+        }
+        for (const FString& Path : UniquePaths)
+        {
+            SettingsPaths.Add(Path);
+        }
+        SettingsPaths.Sort();
+    }
+
+    FString RegistryReport;
+    const bool bLoaded = LoadFromAssetRegistry(RegistryReport);
+    OutReport = FString::Printf(
+        TEXT("Settings audit: %d unique fixed/pool soft paths"), SettingsPaths.Num());
+    for (const FString& Path : SettingsPaths)
+    {
+        OutReport += FString::Printf(TEXT(" [%s]"), *Path);
+    }
+    if (Settings == nullptr)
+    {
+        OutReport += TEXT(" [settings object was null]");
+    }
+    OutReport += TEXT("; settings references are diagnostic only. ");
+    OutReport += RegistryReport;
     return bLoaded;
+}
+
+int32 FVoxelStrateCorpus::NumForArchetype(ECaveGeneratorType Archetype) const
+{
+    int32 Count = 0;
+    for (const FVoxelStrateCorpusEntry& Entry : Entries)
+    {
+        if (Entry.Archetype == Archetype)
+        {
+            ++Count;
+        }
+    }
+    return Count;
+}
+
+const FVoxelStrateFieldSpread* FVoxelStrateCorpus::FindSpread(
+    ECaveGeneratorType Archetype, const FString& FieldName) const
+{
+    for (const FVoxelStrateFieldSpread& Spread : FieldSpreads)
+    {
+        if (Spread.Archetype == Archetype && Spread.FieldName == FieldName)
+        {
+            return &Spread;
+        }
+    }
+    return nullptr;
 }
 
 const FVoxelStrateFieldSpread* FVoxelStrateCorpus::FindSpread(const FString& FieldName) const
 {
+    // Compatibility lookup: the original API had one tunnel-family namespace. Prefer
+    // TunnelNetwork, then fall back to the first matching family for old diagnostics.
+    if (const FVoxelStrateFieldSpread* Spread = FindSpread(ECaveGeneratorType::TunnelNetwork, FieldName))
+    {
+        return Spread;
+    }
     for (const FVoxelStrateFieldSpread& Spread : FieldSpreads)
     {
         if (Spread.FieldName == FieldName)
@@ -842,7 +1679,7 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
         const uint8* Bytes = static_cast<const uint8*>(Data);
         for (SIZE_T ByteIndex = 0; ByteIndex < Size; ++ByteIndex)
         {
-            Hash ^= (uint32)Bytes[ByteIndex];
+            Hash ^= static_cast<uint32>(Bytes[ByteIndex]);
             Hash *= 16777619U;
         }
     };
@@ -850,7 +1687,7 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
     {
         for (int32 CharIndex = 0; CharIndex < String.Len(); ++CharIndex)
         {
-            const uint32 Code = (uint32)String[CharIndex];
+            const uint32 Code = static_cast<uint32>(String[CharIndex]);
             HashBytes(&Code, sizeof(Code));
         }
         const uint32 Terminator = 0U;
@@ -861,17 +1698,54 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
     {
         HashString(Entry.SourcePath);
         HashString(Entry.SourceName);
-        const uint8 Archetype = (uint8)Entry.Archetype;
+        const uint8 Archetype = static_cast<uint8>(Entry.Archetype);
         HashBytes(&Archetype, sizeof(Archetype));
         HashBytes(&Entry.Weight, sizeof(Entry.Weight));
 
-#define VF_COMPOSER_HASH_LERPF(Name) \
-        HashBytes(&Entry.Params.Name, sizeof(Entry.Params.Name));
-#define VF_COMPOSER_HASH_SNAP(Name) \
-        HashBytes(&Entry.Params.Name, sizeof(Entry.Params.Name));
-        VF_STRATE_PARAM_FIELDS(VF_COMPOSER_HASH_LERPF, VF_COMPOSER_HASH_SNAP)
-#undef VF_COMPOSER_HASH_LERPF
-#undef VF_COMPOSER_HASH_SNAP
+        const void* Memory = VF_GetParamMemory(Entry.ArchetypeParams, Entry.Archetype);
+        UStruct* Struct = VF_GetParamStruct(Entry.Archetype);
+        if (Memory == nullptr || Struct == nullptr)
+        {
+            continue;
+        }
+
+        if (VF_IsTunnelArchetype(Entry.Archetype))
+        {
+#define VF_HASH_FSTRATE_FIELD(Name) \
+            HashString(TEXT(#Name)); \
+            HashBytes(&Entry.ArchetypeParams.TunnelNetworkParams.Name, \
+                      sizeof(Entry.ArchetypeParams.TunnelNetworkParams.Name));
+            VF_STRATE_PARAM_FIELDS(VF_HASH_FSTRATE_FIELD, VF_HASH_FSTRATE_FIELD)
+#undef VF_HASH_FSTRATE_FIELD
+        }
+        else
+        {
+            TMap<FString, FProperty*> Properties;
+            VF_CollectProperties(Struct, Properties);
+            for (const TPair<FString, FProperty*>& Pair : Properties)
+            {
+                HashString(Pair.Key);
+                if (VF_IsScalarProperty(Pair.Value))
+                {
+                    const void* ValuePtr = Pair.Value->ContainerPtrToValuePtr<void>(Memory);
+                    HashBytes(ValuePtr, Pair.Value->GetSize());
+                }
+            }
+
+            static const TCHAR* RuntimeFields[] =
+            {
+                TEXT("StrateTopWorldZ"), TEXT("StrateBottomWorldZ")
+            };
+            for (const TCHAR* RuntimeField : RuntimeFields)
+            {
+                double Value = 0.0;
+                if (VF_ReadNamedField(Memory, Entry.Archetype, RuntimeField, Value))
+                {
+                    HashString(RuntimeField);
+                    HashBytes(&Value, sizeof(Value));
+                }
+            }
+        }
     }
     return Hash;
 }
@@ -905,6 +1779,56 @@ bool VF_AreStrateParamsBitIdentical(const FStrateGenerationParams& A,
     return true;
 }
 
+bool VF_AreStrateArchetypeParamsBitIdentical(
+    const FVoxelStrateArchetypeParams& A,
+    const FVoxelStrateArchetypeParams& B,
+    ECaveGeneratorType Archetype)
+{
+    if (VF_IsTunnelArchetype(Archetype))
+    {
+        return VF_AreStrateParamsBitIdentical(A.TunnelNetworkParams, B.TunnelNetworkParams);
+    }
+
+    const void* AMemory = VF_GetParamMemory(A, Archetype);
+    const void* BMemory = VF_GetParamMemory(B, Archetype);
+    UStruct* Struct = VF_GetParamStruct(Archetype);
+    if (AMemory == nullptr || BMemory == nullptr || Struct == nullptr)
+    {
+        return false;
+    }
+
+    TMap<FString, FProperty*> Properties;
+    VF_CollectProperties(Struct, Properties);
+    for (const TPair<FString, FProperty*>& Pair : Properties)
+    {
+        const FProperty* Property = Pair.Value;
+        const void* AValue = Property->ContainerPtrToValuePtr<void>(AMemory);
+        const void* BValue = Property->ContainerPtrToValuePtr<void>(BMemory);
+        if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+        {
+            if (BoolProperty->GetPropertyValue(AValue) != BoolProperty->GetPropertyValue(BValue))
+            {
+                return false;
+            }
+        }
+        else if (FMemory::Memcmp(AValue, BValue, Property->GetSize()) != 0)
+        {
+            return false;
+        }
+    }
+
+    double ATop = 0.0;
+    double BTop = 0.0;
+    double ABottom = 0.0;
+    double BBottom = 0.0;
+    return VF_ReadRuntimeField(AMemory, Archetype, TEXT("StrateTopWorldZ"), ATop)
+        && VF_ReadRuntimeField(BMemory, Archetype, TEXT("StrateTopWorldZ"), BTop)
+        && VF_ReadRuntimeField(AMemory, Archetype, TEXT("StrateBottomWorldZ"), ABottom)
+        && VF_ReadRuntimeField(BMemory, Archetype, TEXT("StrateBottomWorldZ"), BBottom)
+        && FMemory::Memcmp(&ATop, &BTop, sizeof(ATop)) == 0
+        && FMemory::Memcmp(&ABottom, &BBottom, sizeof(ABottom)) == 0;
+}
+
 FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpus,
                                                  int32 Seed, int32 Index)
 {
@@ -915,7 +1839,8 @@ FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpu
     {
         const FVoxelStrateRollInfo Repeat = VF_RollInternal(Corpus, Seed, Index);
         checkf(Repeat.bValid && Repeat.Archetype == Result.Archetype
-                   && VF_AreStrateParamsBitIdentical(Repeat.Params, Result.Params)
+                   && VF_AreStrateArchetypeParamsBitIdentical(
+                       Repeat.ArchetypeParams, Result.ArchetypeParams, Result.Archetype)
                    && Repeat.ParentEntryIndices == Result.ParentEntryIndices
                    && Repeat.ParentWeights == Result.ParentWeights,
                TEXT("VF_RollStrateParams lost determinism for the same corpus/seed/index."));

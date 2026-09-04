@@ -4,10 +4,15 @@
 
 #include "Misc/AutomationTest.h"
 #include "HAL/PlatformTime.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Modules/ModuleManager.h"
 
 #include "VoxelForgeTestFixture.h"
+#include "VoxelSettings.h"
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
+#include "VoxelTerrainOpDefinition.h"
 
 namespace
 {
@@ -51,6 +56,124 @@ namespace
         }
         return FString::Printf(TEXT("(-inf,%s]"),
                                 *VF_FormatSpreadValue(Spread.ClampMax));
+    }
+
+    bool VF_IsProjectPackagePath(const FString& PackagePath)
+    {
+        return PackagePath == TEXT("/Game")
+            || PackagePath.StartsWith(TEXT("/Game/"), ESearchCase::IgnoreCase);
+    }
+
+    bool VF_IsIgnoredSavedCopy(const FString& PackagePath)
+    {
+        return PackagePath.Contains(TEXT("/Saved/Autosaves"), ESearchCase::IgnoreCase)
+            || PackagePath.Contains(TEXT("/Saved/Cooked"), ESearchCase::IgnoreCase);
+    }
+
+    TArray<FString> VF_GetProjectAssetPaths(UClass* AssetClass)
+    {
+        TArray<FString> Paths;
+        if (AssetClass == nullptr)
+        {
+            return Paths;
+        }
+
+        FAssetRegistryModule& AssetRegistryModule =
+            FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FAssetData> Assets;
+        AssetRegistryModule.Get().GetAssetsByClass(AssetClass->GetClassPathName(), Assets, true);
+
+        TSet<FString> SeenPaths;
+        for (const FAssetData& Asset : Assets)
+        {
+            const FString PackagePath = Asset.PackageName.ToString();
+            const FString ObjectPath = Asset.GetObjectPathString();
+            if (!VF_IsProjectPackagePath(PackagePath)
+                || VF_IsIgnoredSavedCopy(PackagePath)
+                || VF_IsIgnoredSavedCopy(ObjectPath)
+                || SeenPaths.Contains(ObjectPath))
+            {
+                continue;
+            }
+            SeenPaths.Add(ObjectPath);
+            Paths.Add(ObjectPath);
+        }
+        Paths.Sort();
+        return Paths;
+    }
+
+    FString VF_FormatSettingsAudit(const UVoxelSettings* Settings)
+    {
+        TArray<FString> Paths;
+        if (Settings != nullptr)
+        {
+            TSet<FString> UniquePaths;
+            for (const TPair<int32, TSoftObjectPtr<UVoxelStrateDefinition>>& Pair : Settings->FixedStrates)
+            {
+                const FString Path = Pair.Value.ToSoftObjectPath().ToString();
+                if (!Path.IsEmpty())
+                {
+                    UniquePaths.Add(Path);
+                }
+            }
+            for (const TSoftObjectPtr<UVoxelStrateDefinition>& Reference : Settings->StratePool)
+            {
+                const FString Path = Reference.ToSoftObjectPath().ToString();
+                if (!Path.IsEmpty())
+                {
+                    UniquePaths.Add(Path);
+                }
+            }
+            for (const FString& Path : UniquePaths)
+            {
+                Paths.Add(Path);
+            }
+            Paths.Sort();
+        }
+
+        FString Result = FString::Printf(TEXT("Settings corpus audit: %d unique fixed/pool paths"),
+                                          Paths.Num());
+        for (const FString& Path : Paths)
+        {
+            Result += FString::Printf(TEXT(" [%s]"), *Path);
+        }
+        Result += TEXT("; these settings references are not the corpus source.");
+        return Result;
+    }
+
+    bool VF_RollRuntimeZIsZero(const FVoxelStrateRollInfo& Roll)
+    {
+        switch (Roll.Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return Roll.ArchetypeParams.TunnelNetworkParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.TunnelNetworkParams.StrateBottomWorldZ == 0.0f;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return Roll.ArchetypeParams.SlabParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.SlabParams.StrateBottomWorldZ == 0.0f;
+        case ECaveGeneratorType::Maze:
+            return Roll.ArchetypeParams.MazeParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.MazeParams.StrateBottomWorldZ == 0.0f;
+        case ECaveGeneratorType::SurfaceWorld:
+            return Roll.ArchetypeParams.SurfaceParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.SurfaceParams.StrateBottomWorldZ == 0.0f;
+        case ECaveGeneratorType::VerticalShafts:
+            return Roll.ArchetypeParams.VerticalShaftParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.VerticalShaftParams.StrateBottomWorldZ == 0.0f;
+        case ECaveGeneratorType::FloatingIslands:
+            return Roll.ArchetypeParams.FloatingIslandParams.StrateTopWorldZ == 0.0f
+                && Roll.ArchetypeParams.FloatingIslandParams.StrateBottomWorldZ == 0.0f;
+        default:
+            return false;
+        }
+    }
+
+    bool VF_IsComposerDefault(const FVoxelStrateCorpusEntry& Entry)
+    {
+        return Entry.SourcePath.StartsWith(TEXT("/VoxelForge/ComposerDefaults/"),
+                                           ESearchCase::IgnoreCase);
     }
 
     FString VF_FormatParents(const FVoxelStrateCorpus& Corpus,
@@ -233,21 +356,81 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     FVoxelStrateCorpus Corpus;
     FString CorpusReport;
     const double CorpusStartSeconds = FPlatformTime::Seconds();
-    const bool bCorpusLoaded = Corpus.LoadFromSettings(AuthoredSettings, CorpusReport);
+    const bool bCorpusLoaded = Corpus.LoadFromAssetRegistry(CorpusReport);
     const double CorpusSeconds = FPlatformTime::Seconds() - CorpusStartSeconds;
     AddInfo(FString::Printf(TEXT("%s Load time %.3fs; contents hash 0x%08x; clamp metadata at "
                                  "build=%s, promised at cooked runtime=%s."),
                             *CorpusReport, CorpusSeconds, Corpus.GetContentsHash(),
                             Corpus.AreClampMetadataAvailableAtBuild() ? TEXT("yes") : TEXT("no"),
                             Corpus.AreClampMetadataAvailableAtRuntime() ? TEXT("yes") : TEXT("no")));
+    AddInfo(VF_FormatSettingsAudit(AuthoredSettings));
+
+    const TArray<FString> ProjectStrateAssets =
+        VF_GetProjectAssetPaths(UVoxelStrateDefinition::StaticClass());
+    const TArray<FString> ProjectTerrainOpAssets =
+        VF_GetProjectAssetPaths(UVoxelTerrainOpDefinition::StaticClass());
+    int32 NumProjectCorpusEntries = 0;
+    int32 NumDefaultCorpusEntries = 0;
+    FString CorpusMembership = TEXT("CORPUS MEMBERSHIP\n");
+    for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())
+    {
+        if (VF_IsComposerDefault(Entry))
+        {
+            ++NumDefaultCorpusEntries;
+        }
+        else
+        {
+            ++NumProjectCorpusEntries;
+        }
+        CorpusMembership += FString::Printf(TEXT("%s | %s | %s\n"),
+                                             VF_IsComposerDefault(Entry) ? TEXT("default") : TEXT("project"),
+                                             VF_GetStrateArchetypeName(Entry.Archetype),
+                                             *Entry.SourcePath);
+    }
+    AddInfo(FString::Printf(
+        TEXT("Corpus membership: %d project strate assets discovered, %d project vectors loaded, "
+             "%d defaults, %d total members. Terrain-op Asset Registry count (not rolled in this "
+             "task): %d."),
+        ProjectStrateAssets.Num(), NumProjectCorpusEntries, NumDefaultCorpusEntries, Corpus.Num(),
+        ProjectTerrainOpAssets.Num()));
+    AddInfo(CorpusMembership);
+    for (const ECaveGeneratorType Archetype : {
+        ECaveGeneratorType::TunnelNetwork,
+        ECaveGeneratorType::FlatPlain,
+        ECaveGeneratorType::CrystalChamber,
+        ECaveGeneratorType::Maze,
+        ECaveGeneratorType::SurfaceWorld,
+        ECaveGeneratorType::VerticalShafts,
+        ECaveGeneratorType::FloatingIslands,
+        ECaveGeneratorType::Underwater})
+    {
+        int32 NumDefaultsForArchetype = 0;
+        for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())
+        {
+            if (Entry.Archetype == Archetype && VF_IsComposerDefault(Entry))
+            {
+                ++NumDefaultsForArchetype;
+            }
+        }
+        TestEqual(FString::Printf(TEXT("one hand-tuned default for %s"),
+                                  VF_GetStrateArchetypeName(Archetype)),
+                  NumDefaultsForArchetype, 1);
+        TestTrue(FString::Printf(TEXT("%s has a same-archetype corpus group"),
+                                 VF_GetStrateArchetypeName(Archetype)),
+                 Corpus.NumForArchetype(Archetype) > 0);
+    }
+    TestEqual(TEXT("all project strate assets plus eight defaults are corpus members"),
+              Corpus.Num(), ProjectStrateAssets.Num() + 8);
 
     FString SpreadTable = TEXT(
         "CORPUS SPREAD (population stddev; jitter range = ±15% of max-min; clamps are safety only)\n"
-        "field | kind | excluded | reflected | samples | min | max | mean | stddev | clamp\n");
+        "archetype | struct | field | kind | excluded | reflected | samples | min | max | mean | stddev | clamp\n");
     for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
     {
         SpreadTable += FString::Printf(
-            TEXT("%s | %s | %s | %s | %d | %s | %s | %s | %s | %s\n"),
+            TEXT("%s | %s | %s | %s | %s | %s | %d | %s | %s | %s | %s | %s\n"),
+            VF_GetStrateArchetypeName(Spread.Archetype),
+            *Spread.ParamStructName,
             *Spread.FieldName,
             VF_FieldKindName(Spread.Kind),
             Spread.bExcluded ? TEXT("yes") : TEXT("no"),
@@ -270,9 +453,10 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     AddInfo(ExclusionTable);
     AddInfo(TEXT(
         "Bool policy: bTunnelsFlowTowardOrigin is inherited from the dominant weighted parent; "
-        "int/enum SNAP fields use FStrateGenerationParams::Lerp and are not jittered. Parent "
-        "selection is weight-1.0 (equal) because UVoxelStrateDefinition has no corpus-weight field; "
-        "parents are selected only within one archetype group."));
+        "int/enum SNAP fields use the native family blend and are not jittered. Parent selection "
+        "is weight-1.0 (equal) because UVoxelStrateDefinition has no corpus-weight field; parents "
+        "are selected only within one exact archetype group. FStrateGenerationParams terrain-op "
+        "transport fields remain excluded; the sibling families' authored fields are rolled."));
 
     TestTrue(TEXT("the reflected parameter schema is covered or explicitly excluded"),
              Corpus.IsSchemaValid());
@@ -281,7 +465,7 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     {
         AddError(FString::Printf(
             TEXT("Cannot run the 64-candidate measurement: %s"),
-            Corpus.IsSchemaValid() ? TEXT("the settings asset exposed no TunnelNetwork/Underwater GenerationParams")
+            Corpus.IsSchemaValid() ? TEXT("the Asset Registry exposed no usable strate vectors")
                                    : *Corpus.GetSchemaError()));
         return false;
     }
@@ -326,6 +510,7 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     int64 TotalBoxCheckedVoxels = 0;
     int32 TotalBoxViolations = 0;
     TArray<int32> BoxViolationCandidates;
+    FString FirstBoxViolation;
 
     const double RollAndMeasureStartSeconds = FPlatformTime::Seconds();
     for (int32 CandidateIndex = 0; CandidateIndex < NumCandidates; ++CandidateIndex)
@@ -349,23 +534,47 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
             continue;
         }
 
+        bool bParentsMatchArchetype = true;
+        for (const int32 ParentIndex : Roll.ParentEntryIndices)
+        {
+            if (!Corpus.GetEntries().IsValidIndex(ParentIndex)
+                || Corpus.GetEntries()[ParentIndex].Archetype != Roll.Archetype)
+            {
+                bParentsMatchArchetype = false;
+                break;
+            }
+        }
+        TestTrue(FString::Printf(TEXT("candidate %d parents stay within %s"),
+                                 CandidateIndex, VF_GetStrateArchetypeName(Roll.Archetype)),
+                 bParentsMatchArchetype);
+
+        const FVoxelStrateRollInfo RepeatRoll = VF_RollStrateParamsDetailed(
+            Corpus, AuthoredSettings->Seed, CandidateIndex);
+        TestTrue(FString::Printf(TEXT("candidate %d is bit-identical on deterministic reroll"),
+                                 CandidateIndex),
+                 RepeatRoll.bValid && RepeatRoll.Archetype == Roll.Archetype
+                     && VF_AreStrateArchetypeParamsBitIdentical(
+                         RepeatRoll.ArchetypeParams, Roll.ArchetypeParams, Roll.Archetype)
+                     && RepeatRoll.ParentEntryIndices == Roll.ParentEntryIndices
+                     && RepeatRoll.ParentWeights == Roll.ParentWeights);
+
         // Put the invented vector into a transient fixture definition. This is an offline test
         // world only; the runtime manager/generation code and authored assets are untouched.
         UVoxelStrateDefinition* CandidateDefinition =
             World.Definitions[CandidateStrateIndex].Get();
         CandidateDefinition->GeneratorType = Roll.Archetype;
-        CandidateDefinition->GenerationParams = Roll.Params;
+        CandidateDefinition->GenerationParams = Roll.ArchetypeParams.TunnelNetworkParams;
+        CandidateDefinition->SlabParams = Roll.ArchetypeParams.SlabParams;
+        CandidateDefinition->MazeParams = Roll.ArchetypeParams.MazeParams;
+        CandidateDefinition->SurfaceParams = Roll.ArchetypeParams.SurfaceParams;
+        CandidateDefinition->VerticalShaftParams = Roll.ArchetypeParams.VerticalShaftParams;
+        CandidateDefinition->FloatingIslandParams = Roll.ArchetypeParams.FloatingIslandParams;
         CandidateDefinition->bUseOperatorStack = true;
         CandidateDefinition->TransitionType = EVoxelStrateTransition::Hard;
         World.Reinitialize();
 
-        const FStrateGenerationParams RuntimeParams = World.StrateManager->GetGenerationParams(
-            FIntVector(0, 0,
-                World.StrateManager->GetLayout()[CandidateStrateIndex].BottomChunkZ
-                + (World.StrateManager->GetLayout()[CandidateStrateIndex].TopChunkZ
-                   - World.StrateManager->GetLayout()[CandidateStrateIndex].BottomChunkZ) / 2));
         TestTrue(FString::Printf(TEXT("candidate %d keeps runtime Z out of the rolled vector"), CandidateIndex),
-                 Roll.Params.StrateTopWorldZ == 0.0f && Roll.Params.StrateBottomWorldZ == 0.0f);
+                 VF_RollRuntimeZIsZero(Roll));
 
         const FVoxelStrateMetrics Metrics = VF_MeasureStrate(
             *World.Generator, *World.StrateManager, CandidateStrateIndex, MeasureSettings);
@@ -438,6 +647,10 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         if (BoxReport.Violations > 0)
         {
             BoxViolationCandidates.Add(CandidateIndex);
+            if (FirstBoxViolation.IsEmpty())
+            {
+                FirstBoxViolation = BoxReport.FirstViolation;
+            }
         }
 
         CandidateTable += FString::Printf(
@@ -481,8 +694,8 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         AddError(FString::Printf(
             TEXT("ROLLED BOX-VERDICT VIOLATION: %d candidate(s) produced a false AllSolid/AllAir "
                  "claim; first candidate index %d. This closes the test red because §6.2 bounds "
-                 "were not sound for the rolled parameter space."),
-            BoxViolationCandidates.Num(), BoxViolationCandidates[0]));
+                 "were not sound for the rolled parameter space. First violation: %s"),
+            BoxViolationCandidates.Num(), BoxViolationCandidates[0], *FirstBoxViolation));
     }
     if (TotalBoxProved == 0)
     {
@@ -504,4 +717,3 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS
-
