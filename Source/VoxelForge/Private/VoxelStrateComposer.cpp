@@ -13,6 +13,7 @@
 
 #include "VoxelSettings.h"
 #include "VoxelStrateDefinition.h"
+#include "VoxelTerrainOpDefinition.h"
 #include "VoxelDensityOpStack.h"
 
 #include <type_traits>
@@ -547,6 +548,88 @@ namespace
         return VF_WriteRuntimeField(Memory, Archetype, FieldName, Value);
     }
 
+    const TCHAR* VF_GetTerrainOperationFieldPrefix(EVoxelTerrainOpType Type)
+    {
+        switch (Type)
+        {
+        case EVoxelTerrainOpType::Terrace:    return TEXT("Terrace");
+        case EVoxelTerrainOpType::LayerLines: return TEXT("LayerLine");
+        case EVoxelTerrainOpType::Ribbing:    return TEXT("Ribbing");
+        case EVoxelTerrainOpType::Cliff:      return TEXT("Cliff");
+        case EVoxelTerrainOpType::Scallop:    return TEXT("Scallop");
+        case EVoxelTerrainOpType::Overhang:   return TEXT("Overhang");
+        case EVoxelTerrainOpType::Arch:       return TEXT("Arch");
+        case EVoxelTerrainOpType::Column:     return TEXT("Column");
+        case EVoxelTerrainOpType::Pit:        return TEXT("Pit");
+        case EVoxelTerrainOpType::Chimney:    return TEXT("Chimney");
+        case EVoxelTerrainOpType::Dome:       return TEXT("Dome");
+        case EVoxelTerrainOpType::Pinch:      return TEXT("Pinch");
+        default:                              return TEXT("");
+        }
+    }
+
+    void VF_AddTerrainOperationDefaultSamples(
+        TArray<TArray<double>>& Values,
+        const TArray<FVoxelStrateFieldSpread>& Spreads)
+    {
+        if (Values.Num() != Spreads.Num())
+        {
+            return;
+        }
+
+        UVoxelTerrainOpDefinition* Operation = NewObject<UVoxelTerrainOpDefinition>(
+            GetTransientPackage(), NAME_None, RF_Transient);
+        if (Operation == nullptr)
+        {
+            return;
+        }
+
+        static const EVoxelTerrainOpType OperationTypes[] =
+        {
+            EVoxelTerrainOpType::Terrace,
+            EVoxelTerrainOpType::LayerLines,
+            EVoxelTerrainOpType::Ribbing,
+            EVoxelTerrainOpType::Cliff,
+            EVoxelTerrainOpType::Scallop,
+            EVoxelTerrainOpType::Overhang,
+            EVoxelTerrainOpType::Arch,
+            EVoxelTerrainOpType::Column,
+            EVoxelTerrainOpType::Pit,
+            EVoxelTerrainOpType::Chimney,
+            EVoxelTerrainOpType::Dome,
+            EVoxelTerrainOpType::Pinch,
+        };
+
+        for (const EVoxelTerrainOpType Type : OperationTypes)
+        {
+            const TCHAR* Prefix = VF_GetTerrainOperationFieldPrefix(Type);
+            Operation->Type = Type;
+            FStrateGenerationParams Defaults;
+            Operation->ApplyTo(Defaults);
+
+            // Seed only the fields owned by this operation. The values come from the actual
+            // UVoxelTerrainOpDefinition UPROPERTY initializers through ApplyTo; no second asset
+            // corpus and no duplicated default constants are introduced here.
+            for (int32 FieldIndex = 0; FieldIndex < Spreads.Num(); ++FieldIndex)
+            {
+                const FVoxelStrateFieldSpread& Spread = Spreads[FieldIndex];
+                if (!VF_IsTunnelArchetype(Spread.Archetype)
+                    || Spread.bExcluded
+                    || !Spread.FieldName.StartsWith(Prefix))
+                {
+                    continue;
+                }
+
+                double Value = 0.0;
+                if (VF_ReadNamedField(&Defaults, Spread.Archetype, Spread.FieldName, Value)
+                    && FMath::IsFinite(Value))
+                {
+                    Values[FieldIndex].Add(Value);
+                }
+            }
+        }
+    }
+
     void VF_AddPropertyMetadata(FVoxelStrateFieldSpread& Spread, const FProperty* Property)
     {
 #if WITH_EDITOR
@@ -607,26 +690,11 @@ namespace
         OutIndices.Add(VF_SpreadKey(Archetype, Name), OutSpreads.Num() - 1);
     }
 
-    void VF_ResetNonTunableFields(FStrateGenerationParams& Params)
+    void VF_ResetDeadTerrainTransportFields(FStrateGenerationParams& Params)
     {
-        // These are terrain-op transport values (written per room by UVoxelTerrainOpDefinition)
-        // plus manager-owned runtime Z bounds. They are not rolled in this composer pass.
-        Params.TerraceStepHeight = 0.0f;
-        Params.TerraceHardness = 0.0f;
-        Params.TerraceNoiseDisplacement = 0.0f;
-        Params.LayerLineSpacing = 0.0f;
-        Params.LayerLineDepth = 0.0f;
-        Params.OverhangStrength = 0.0f;
-        Params.OverhangDepth = 0.0f;
-        Params.OverhangFrequency = 0.0f;
-        Params.RibbingSpacing = 0.0f;
-        Params.RibbingDepth = 0.0f;
-        Params.CliffStrength = 0.0f;
-        Params.ScallopStrength = 0.0f;
-        Params.ScallopFrequency = 0.0f;
-        Params.ArchDensity = 0.0f;
-        Params.ArchMinRadius = 0.0f;
-        Params.ArchMaxRadius = 0.0f;
+        // Empirical liveness proved these direct FStrate slots are dead: the runtime bakes these
+        // three operation families from UVoxelTerrainOpDefinition values into room caches before
+        // sampling. Keep them at their neutral values until terrain-op structs are rolled too.
         Params.ColumnDensity = 0.0f;
         Params.ColumnMinRadius = 0.0f;
         Params.ColumnMaxRadius = 0.0f;
@@ -638,13 +706,6 @@ namespace
         Params.ChimneyMinRadius = 0.0f;
         Params.ChimneyMaxRadius = 0.0f;
         Params.ChimneyHeight = 0.0f;
-        Params.DomeDensity = 0.0f;
-        Params.DomeMinRadius = 0.0f;
-        Params.DomeMaxRadius = 0.0f;
-        Params.DomeHeightRatio = 0.0f;
-        Params.PinchDensity = 0.0f;
-        Params.PinchStrength = 0.0f;
-        Params.PinchLength = 0.0f;
         Params.StrateTopWorldZ = 0.0f;
         Params.StrateBottomWorldZ = 0.0f;
     }
@@ -662,7 +723,7 @@ namespace
     {
         if (VF_IsTunnelArchetype(Archetype))
         {
-            VF_ResetNonTunableFields(Params.TunnelNetworkParams);
+            VF_ResetDeadTerrainTransportFields(Params.TunnelNetworkParams);
         }
         else
         {
@@ -690,7 +751,12 @@ namespace
                 break;
             }
         }
-        if (Spread != nullptr && !Spread->bReflected && !Spread->bExcluded)
+        double NativeValue = 0.0;
+        FStrateGenerationParams NativeDefaults;
+        const bool bNativeFStrateField = VF_IsTunnelArchetype(Archetype)
+            && VF_ReadFStrateField(NativeDefaults, FieldName, NativeValue);
+        if (Spread != nullptr && !Spread->bReflected && !Spread->bExcluded
+            && !bNativeFStrateField)
         {
             bSchemaValid = false;
             VF_AppendSchemaError(SchemaError,
@@ -805,6 +871,38 @@ namespace
         if (Memory == nullptr || Struct == nullptr)
         {
             return;
+        }
+
+        // FStrateGenerationParams deliberately keeps the terrain-detail transport fields as
+        // native, non-UPROPERTY members. Handle those fields through the same measured spread
+        // policy as reflected fields; otherwise removing an exclusion would only change the
+        // report while the candidate value stayed at its blended parent value.
+        if (VF_IsTunnelArchetype(Archetype))
+        {
+            for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
+            {
+                if (Spread.Archetype != Archetype
+                    || Spread.bReflected
+                    || Spread.bExcluded
+                    || Spread.Kind != EVoxelStrateFieldKind::Continuous)
+                {
+                    continue;
+                }
+
+                const double CorpusRange = FMath::Max(0.0, Spread.Max - Spread.Min);
+                if (!(CorpusRange > 0.0))
+                {
+                    continue;
+                }
+
+                double Value = 0.0;
+                if (VF_ReadNamedField(Memory, Archetype, Spread.FieldName, Value))
+                {
+                    Value += static_cast<double>((Rng.FRand() * 2.0f - 1.0f) * GJitterFraction)
+                        * CorpusRange;
+                    VF_WriteNamedField(Memory, Archetype, Spread.FieldName, Value);
+                }
+            }
         }
 
         TMap<FString, FProperty*> Properties;
@@ -1327,44 +1425,21 @@ const TArray<FVoxelStrateFieldExclusion>& FVoxelStrateCorpus::GetNonTunableField
     {
         TArray<FVoxelStrateFieldExclusion> Result;
 
-        const TCHAR* TerrainOpReason = TEXT(
-            "Transport slot only: generation overlays it per room from a UVoxelTerrainOpDefinition "
-            "selected through the active strate's TerrainOperations pool; it is not the authored "
-            "strate-generation source.");
-        VF_AddExclusion(Result, TEXT("TerraceStepHeight"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("TerraceHardness"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("TerraceNoiseDisplacement"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("LayerLineSpacing"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("LayerLineDepth"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("OverhangStrength"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("OverhangDepth"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("OverhangFrequency"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("RibbingSpacing"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("RibbingDepth"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("CliffStrength"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ScallopStrength"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ScallopFrequency"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ArchDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ArchMinRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ArchMaxRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ColumnDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ColumnMinRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ColumnMaxRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PitDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PitMinRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PitMaxRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PitDepth"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ChimneyDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ChimneyMinRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ChimneyMaxRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("ChimneyHeight"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("DomeDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("DomeMinRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("DomeMaxRadius"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("DomeHeightRatio"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PinchDensity"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PinchStrength"), TerrainOpReason);
-        VF_AddExclusion(Result, TEXT("PinchLength"), TerrainOpReason);
+        const TCHAR* DeadTerrainOpReason = TEXT(
+            "Empirically dead when only this FStrateGenerationParams slot changes: the runtime "
+            "bakes Column/Pit/Chimney geometry from UVoxelTerrainOpDefinition values into the "
+            "room cache, so this direct strata slot does not feed GetDensityAt.");
+        VF_AddExclusion(Result, TEXT("ColumnDensity"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ColumnMinRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ColumnMaxRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("PitDensity"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("PitMinRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("PitMaxRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("PitDepth"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ChimneyDensity"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ChimneyMinRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ChimneyMaxRadius"), DeadTerrainOpReason);
+        VF_AddExclusion(Result, TEXT("ChimneyHeight"), DeadTerrainOpReason);
 
         VF_AddExclusion(Result, TEXT("StrateTopWorldZ"), TEXT(
             "Runtime Z bound supplied by UVoxelStrateManager for the active layout slot; not a tunable."));
@@ -1502,8 +1577,15 @@ void FVoxelStrateCorpus::RebuildSpreads()
 
     for (int32 FieldIndex = 0; FieldIndex < FieldSpreads.Num(); ++FieldIndex)
     {
+        FieldSpreads[FieldIndex].AuthoredSampleCount = Values[FieldIndex].Num();
+    }
+    VF_AddTerrainOperationDefaultSamples(Values, FieldSpreads);
+
+    for (int32 FieldIndex = 0; FieldIndex < FieldSpreads.Num(); ++FieldIndex)
+    {
         FVoxelStrateFieldSpread& Spread = FieldSpreads[FieldIndex];
         const TArray<double>& Samples = Values[FieldIndex];
+        Spread.DefaultSeedCount = Samples.Num() - Spread.AuthoredSampleCount;
         Spread.SampleCount = Samples.Num();
         if (Samples.Num() == 0)
         {

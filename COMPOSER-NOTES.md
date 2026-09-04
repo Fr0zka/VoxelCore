@@ -264,10 +264,11 @@ The hand-authored C++ defaults in `VoxelStrateTypes.h` are also corpus members: 
 `CrystalChamber=1`, `Maze=1`, `SurfaceWorld=2`, `VerticalShafts=1`, `FloatingIslands=2`, and
 `Underwater=1`.
 
-The complete 253-descriptor spread table is emitted by the automation test, including sample count,
-min/max/mean/standard deviation, excluded/reflected status, and clamp metadata. The 230 zero-range
-rows are intentionally omitted below; these are the **23 rows with real spread** (float formatting
-is the test's measured output):
+The complete 253-descriptor spread table is emitted by the automation test, including authored and
+synthetic operation-default sample counts, min/max/mean/standard deviation, excluded/reflected
+status, and clamp metadata. The current run has **212 zero-range rows** and **41 rows with real
+spread**. The shape-spread rows below are retained from the prior report; the newly measured
+terrain-detail spread is listed explicitly after the liveness experiment.
 
 | Archetype | Field | N | Min | Max | Mean | StdDev |
 |---|---|---:|---:|---:|---:|---:|
@@ -295,54 +296,133 @@ is the test's measured output):
 | FloatingIslands | TopFlatten | 2 | 0.600000024 | 0.800000012 | 0.700000018 | 0.099999994 |
 | FloatingIslands | SurfaceRoughness | 2 | 0 | 4 | 2 | 2 |
 
-The reflection/use audit found **36 excluded fields**: the 34 terrain-op transport fields
-`TerraceStepHeight`, `TerraceHardness`, `TerraceNoiseDisplacement`, `LayerLineSpacing`,
-`LayerLineDepth`, `OverhangStrength`, `OverhangDepth`, `OverhangFrequency`, `RibbingSpacing`,
-`RibbingDepth`, `CliffStrength`, `ScallopStrength`, `ScallopFrequency`, `ArchDensity`,
-`ArchMinRadius`, `ArchMaxRadius`, `ColumnDensity`, `ColumnMinRadius`, `ColumnMaxRadius`,
-`PitDensity`, `PitMinRadius`, `PitMaxRadius`, `PitDepth`, `ChimneyDensity`, `ChimneyMinRadius`,
-`ChimneyMaxRadius`, `ChimneyHeight`, `DomeDensity`, `DomeMinRadius`, `DomeMaxRadius`,
-`DomeHeightRatio`, `PinchDensity`, `PinchStrength`, `PinchLength` — populated per room by
-`UVoxelTerrainOpDefinition` — plus the manager-owned runtime bounds `StrateTopWorldZ` and
-`StrateBottomWorldZ`. The tunnel transport fields are measured directly from the native
-`FStrateGenerationParams` X-macro even though they are not reflected `UPROPERTY`s; their values are
-reported but deliberately not jittered. Same-named fields in sibling structs are not automatically
-excluded: the exclusion applies to the tunnel transport slots whose generation source is the
-terrain-op pool. The test prints the complete field-by-field table, including excluded fields,
-reflection status, and clamp metadata.
+The 34 terrain-detail fields now have the following effective spread. `N` is shown as
+`authored+op-defaults=effective`; the TunnelNetwork group has 3 authored vectors and Underwater
+has 1. The default seed is present only for the 23 live fields, one matching operation type per
+field. The values are the test's population statistics (the operation shape defaults happen to be
+identical to the FStrate defaults, so only activation fields have non-zero spread here).
 
-The terrain-field source is now traced in code. `VoxelStrateManager.cpp` loads the active strate's
-`TerrainOperations` soft-object pool, and `VoxelGenerator.cpp` passes that pool to
-`VoxelCaveMorphology::BuildChunkCache`. For each nearest room, `FVoxelTerrainOpDefinition::ApplyTo`
-overlays the selected operation onto a local copy (`FStrateGenerationParams LocalTerrainParams =
-Params`) before the room operator runs. Thus the 34 values are transported through the strate
-params, but their authored cave-detail values come from `UVoxelTerrainOpDefinition` assets selected
-by the active strate's terrain-operation pool. Rolling those slots in the strate composer is not a
-useful way to roll cave detail: selected room operations overwrite them. It is not a literal
-absolute no-op, because the local base copy is still used where no operation overwrites a slot.
-The correct future design is a **second corpus** over terrain-op assets plus the active pool's
-membership/weights; this task does not build it. The project currently has **1**
-`UVoxelTerrainOpDefinition` asset (the Asset Registry count used by the test).
+| Field | Tunnel N | Tunnel min..max | Tunnel mean | Tunnel SD | Underwater N | Underwater min..max | Underwater mean | Underwater SD | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| TerraceStepHeight | 3+1=4 | 0..5 | 1.25 | 2.16506351 | 1+1=2 | 0..5 | 2.5 | 2.5 | LIVE |
+| TerraceHardness | 3+1=4 | 0.5..0.5 | 0.5 | 0 | 1+1=2 | 0.5..0.5 | 0.5 | 0 | LIVE |
+| TerraceNoiseDisplacement | 3+1=4 | 0.5..0.5 | 0.5 | 0 | 1+1=2 | 0.5..0.5 | 0.5 | 0 | LIVE |
+| LayerLineSpacing | 3+1=4 | 0..4 | 1 | 1.73205081 | 1+1=2 | 0..4 | 2 | 2 | LIVE |
+| LayerLineDepth | 3+1=4 | 0.300000012..0.300000012 | 0.300000012 | 0 | 1+1=2 | 0.300000012..0.300000012 | 0.300000012 | 0 | LIVE |
+| OverhangStrength | 3+1=4 | 0..0.5 | 0.125 | 0.216506351 | 1+1=2 | 0..0.5 | 0.25 | 0.25 | LIVE |
+| OverhangDepth | 3+1=4 | 5..5 | 5 | 0 | 1+1=2 | 5..5 | 5 | 0 | LIVE |
+| OverhangFrequency | 3+1=4 | 0.0599999987..0.0599999987 | 0.0599999987 | 0 | 1+1=2 | 0.0599999987..0.0599999987 | 0.0599999987 | 0 | LIVE |
+| RibbingSpacing | 3+1=4 | 0..3 | 0.75 | 1.29903811 | 1+1=2 | 0..3 | 1.5 | 1.5 | LIVE |
+| RibbingDepth | 3+1=4 | 0.400000006..0.400000006 | 0.400000006 | 0 | 1+1=2 | 0.400000006..0.400000006 | 0.400000006 | 0 | LIVE |
+| CliffStrength | 3+1=4 | 0..0.5 | 0.125 | 0.216506351 | 1+1=2 | 0..0.5 | 0.25 | 0.25 | LIVE |
+| ScallopStrength | 3+1=4 | 0..0.5 | 0.125 | 0.216506351 | 1+1=2 | 0..0.5 | 0.25 | 0.25 | LIVE |
+| ScallopFrequency | 3+1=4 | 0.100000001..0.100000001 | 0.100000001 | 0 | 1+1=2 | 0.100000001..0.100000001 | 0.100000001 | 0 | LIVE |
+| ArchDensity | 3+1=4 | 0..0.100000001 | 0.0250000004 | 0.0433012708 | 1+1=2 | 0..0.100000001 | 0.0500000007 | 0.0500000007 | LIVE |
+| ArchMinRadius | 3+1=4 | 3..3 | 3 | 0 | 1+1=2 | 3..3 | 3 | 0 | LIVE |
+| ArchMaxRadius | 3+1=4 | 6..6 | 6 | 0 | 1+1=2 | 6..6 | 6 | 0 | LIVE |
+| ColumnDensity | 3+0=3 | 0..0 | 0 | 0 | 1+0=1 | 0..0 | 0 | 0 | DEAD |
+| ColumnMinRadius | 3+0=3 | 2..2 | 2 | 0 | 1+0=1 | 2..2 | 2 | 0 | DEAD |
+| ColumnMaxRadius | 3+0=3 | 5..5 | 5 | 0 | 1+0=1 | 5..5 | 5 | 0 | DEAD |
+| PitDensity | 3+0=3 | 0..0 | 0 | 0 | 1+0=1 | 0..0 | 0 | 0 | DEAD |
+| PitMinRadius | 3+0=3 | 4..4 | 4 | 0 | 1+0=1 | 4..4 | 4 | 0 | DEAD |
+| PitMaxRadius | 3+0=3 | 10..10 | 10 | 0 | 1+0=1 | 10..10 | 10 | 0 | DEAD |
+| PitDepth | 3+0=3 | 25..25 | 25 | 0 | 1+0=1 | 25..25 | 25 | 0 | DEAD |
+| ChimneyDensity | 3+0=3 | 0..0 | 0 | 0 | 1+0=1 | 0..0 | 0 | 0 | DEAD |
+| ChimneyMinRadius | 3+0=3 | 2..2 | 2 | 0 | 1+0=1 | 2..2 | 2 | 0 | DEAD |
+| ChimneyMaxRadius | 3+0=3 | 5..5 | 5 | 0 | 1+0=1 | 5..5 | 5 | 0 | DEAD |
+| ChimneyHeight | 3+0=3 | 20..20 | 20 | 0 | 1+0=1 | 20..20 | 20 | 0 | DEAD |
+| DomeDensity | 3+1=4 | 0..0.150000006 | 0.0375000015 | 0.0649519079 | 1+1=2 | 0..0.150000006 | 0.075000003 | 0.075000003 | LIVE |
+| DomeMinRadius | 3+1=4 | 8..8 | 8 | 0 | 1+1=2 | 8..8 | 8 | 0 | LIVE |
+| DomeMaxRadius | 3+1=4 | 15..15 | 15 | 0 | 1+1=2 | 15..15 | 15 | 0 | LIVE |
+| DomeHeightRatio | 3+1=4 | 0.800000012..0.800000012 | 0.800000012 | 0 | 1+1=2 | 0.800000012..0.800000012 | 0.800000012 | 0 | LIVE |
+| PinchDensity | 3+1=4 | 0..0.150000006 | 0.0375000015 | 0.0649519079 | 1+1=2 | 0..0.150000006 | 0.075000003 | 0.075000003 | LIVE |
+| PinchStrength | 3+1=4 | 5..5 | 5 | 0 | 1+1=2 | 5..5 | 5 | 0 | LIVE |
+| PinchLength | 3+1=4 | 12..12 | 12 | 0 | 1+1=2 | 12..12 | 12 | 0 | LIVE |
+
+The first pass excluded all **34** terrain-detail fields. That was an unmeasured structural claim,
+so `VoxelForge.Composer.TerrainDetailLiveness` now tests it directly. For both the legacy and
+operator-stack `GetDensityAt` paths, it uses a fixed **4,096-point** lattice (16×16×16, 4-voxel
+spacing, the TunnelNetwork fixture), clears the terrain-operation pool, records a baseline, then
+changes only one operation group to substantial values. The two paths produced bit-identical
+results. The aggregate verdict is **9 live groups / 23 live fields** and **3 dead groups / 11 dead
+fields**:
+
+| Operation group | Changed samples / 4,096 | Sign changes | Sum abs delta | Max abs delta | Verdict |
+|---|---:|---:|---:|---:|---|
+| Terrace | 1,314 | 40 | 2,177.12156 | 5.09695816 | LIVE |
+| LayerLines | 532 | 8 | 163.082606 | 0.64941144 | LIVE |
+| Overhang | 569 | 12 | 598.018486 | 4.41974068 | LIVE |
+| Ribbing | 933 | 6 | 213.929947 | 1.49233627 | LIVE |
+| Cliff | 391 | 3 | 372.185603 | 2.80882835 | LIVE |
+| Scallop | 38 | 0 | 5.78068841 | 1.01755953 | LIVE |
+| Arch | 418 | 190 | 7,327.12817 | 36.0000019 | LIVE |
+| Column | 0 | 0 | 0 | 0 | DEAD |
+| Pit | 0 | 0 | 0 | 0 | DEAD |
+| Chimney | 0 | 0 | 0 | 0 | DEAD |
+| Dome | 227 | 44 | 3,262.50304 | 24.0000019 | LIVE |
+| Pinch | 226 | 22 | 1,217.39489 | 16.3533421 | LIVE |
+
+The result is identical for both paths, so each row above represents two measured rows. The
+baseline mean was `-3.86253725` for every group. Variant means were, respectively, `-3.8647801`,
+`-3.82272216`, `-4.00853786`, `-3.91476624`, `-3.86411419`, `-3.86112595`, `-5.6513869`,
+`-3.86253725`, `-3.86253725`, `-3.86253725`, `-3.06602772`, and `-4.1597528` in the table's
+order. The live fields are therefore removed from the exclusion list and are now eligible for the
+roll. Only the 11 direct Column/Pit/Chimney transport fields plus the two runtime Z bounds remain
+excluded.
+
+The dead-field call chain is concrete. `UVoxelStrateManager::BuildParamsFromDefinition`
+(`Private/VoxelStrateManager.cpp:1399-1404`) returns only `Definition->GenerationParams`; it does
+not merge terrain-op assets. `VoxelGenerator::GetDensityAt` (`Private/VoxelGenerator.cpp:1099-1109`)
+gets the active definition's `TerrainOperations` pool and passes it to
+`VoxelCaveMorphology::BuildChunkCache`. The cache applies the selected
+`UVoxelTerrainOpDefinition` at `Private/VoxelCaveMorphology.cpp:1741`, then consumes
+`PitDensity`/shape at `:1744-1764`, `ChimneyDensity`/shape at `:1767-1787`, and
+`ColumnDensity`/shape at `:1790-1803`. Sampling uses the resulting `SDFCache.Pits` and
+`SDFCache.Chimneys` at `Private/VoxelGenerator.cpp:1147-1206` and `SDFCache.Columns` at
+`:1730-1752`; it does not read the direct strata Column/Pit/Chimney slots. The project contains
+exactly **1** `UVoxelTerrainOpDefinition` asset, `Content/VoxelForge/Blocks/NewDataAsset.uasset`,
+so a second asset corpus would have one member and no useful spread.
+
+The composer now seeds each of the 23 live fields with **one matching per-operation default** from
+the `UVoxelTerrainOpDefinition` header (applied through `ApplyTo`, with no duplicated constants),
+then adds any authored strate values. The current TunnelNetwork group has 3 authored samples + 1
+operation-default sample; Underwater has 1 + 1. The dead fields receive no synthetic seed and stay
+excluded. The complete test table exposes `authored`, `op-defaults`, and effective `samples`.
+
+Recommendation for the dead trio: do **not** build an asset corpus for the one current asset. The
+right future composer abstraction is direct terrain-op parameter structs/configurations, seeded by
+the per-operation defaults and any authored op values, with the rolled op payload carried alongside
+`FVoxelStrateRollInfo` and injected into the transient candidate's terrain-op pool. That requires a
+small candidate/materialisation API and a populated-pool liveness/box test; simply jittering the
+current direct FStrate slots would remain a silent no-op. This task rolls every field that the
+existing direct strata path can actually move and leaves the dead trio neutral until that API exists.
 
 The bool policy is explicit: `bTunnelsFlowTowardOrigin` is inherited from the dominant parent.
 `OriginRoomMaxConnections` and `RoughnessNoiseType` retain `Lerp`'s existing SNAP behavior and
 are not jittered. In this editor build clamp metadata was available while the table was built; it
 is **not promised in a cooked runtime**, so the commandlet/cook-time bake remains owed.
 
-The fed 64-candidate run (step 4 sweep, radius 256, max 8,000,000 cells, fixture seed 1337)
-produced **59/64 survivors (92.2%)**. There were 60 non-vacuous candidates, 60 with largest
-component share ≥ 0.50, 63 exact unsnapped arrival→departure law passes, and no roll failures.
-The complete 64-row table is emitted by `VoxelForge.Composer.ParameterRoll`; each row reports
-archetype, weighted parents, air fraction, largest share, walkable fraction, feature scale, and
-arrival→departure verdict. The current run took **114.845 s** total (**0.014 s** corpus load,
-**114.827 s** roll/measurement).
+The controlled 64-candidate run (step 4 sweep, radius 256, max 8,000,000 cells, fixture seed 1337)
+kept the existing corpus hash/RNG stream while enabling the live detail fields. It produced
+**59/64 survivors (92.2%)**: 60 non-vacuous candidates, 60 with largest component share ≥ 0.50,
+63 exact unsnapped arrival→departure law passes, and no roll failures. The complete 64-row table
+is emitted by `VoxelForge.Composer.ParameterRoll`; each row reports archetype, weighted parents,
+air fraction, largest share, walkable fraction, feature scale, and arrival→departure verdict.
+Feature scale was **0→376** (the prior `190ff38` run was **4→376**), while walkable fraction was
+**0.000000→0.388506** (prior **0.000→0.389**). Thus detail variation widened the feature-scale
+range only at the low end by four voxels; it did not increase the upper scale or the walkable
+spread. The 17 TunnelNetwork/Underwater candidates all carried at least one non-zero live detail
+activation, and each of Terrace/LayerLines/Overhang/Ribbing/Cliff/Scallop/Arch/Dome/Pinch appeared
+non-zero in all 17. The measurement is therefore not broadly sensitive to these detail fields in
+this 64-candidate corpus, which is an empirical result, not a reason to remove the live knobs. The
+controlled run took **113.317 s** total (**0.015 s** corpus load, **113.300 s** roll/measurement).
 
-The §6.2 check is no longer vacuous: **1,224 boxes proved**, **1,629,144 voxels checked**,
-**0 violations**. Its verdict mix was 1,336 Mixed, 549 AllSolid, and 675 AllAir; the law check
-reported no violating candidate. The box law used unit step and brute-forced every voxel of each
-uniform box, while the candidate sweep retained step 4. The test asserts zero violations and keeps
-the law open to future changed candidates rather than treating this clean run as a license to tune
-the survival rate.
+The §6.2 check remains non-vacuous: **1,228 boxes proved**, **1,634,468 voxels checked**, and
+**0 violations**. Its verdict mix was 1,332 Mixed, 553 AllSolid, and 675 AllAir; no candidate
+violated the box law. The box law used unit step and brute-forced every voxel of each uniform box,
+while the candidate sweep retained step 4. The test asserts zero violations and keeps the law open
+to future changed candidates rather than treating this clean run as a license to tune the survival
+rate.
 
 ### 3.4 The measurement pass — one grid, one flood fill, three jobs
 

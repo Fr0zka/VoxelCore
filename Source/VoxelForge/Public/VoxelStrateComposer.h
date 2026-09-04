@@ -120,7 +120,7 @@ enum class EVoxelStrateFieldKind : uint8
     Enum,
 };
 
-/** A field deliberately kept out of the parameter roll. */
+/** A field deliberately kept out of the parameter roll after the measured liveness audit. */
 struct VOXELFORGE_API FVoxelStrateFieldExclusion
 {
     FString FieldName;
@@ -137,6 +137,10 @@ struct VOXELFORGE_API FVoxelStrateFieldSpread
     bool bExcluded = false;
     bool bReflected = false;
 
+    // Actual authored corpus samples and synthetic per-operation default samples are kept
+    // separate in the report. SampleCount is their effective total used for the statistics.
+    int32 AuthoredSampleCount = 0;
+    int32 DefaultSeedCount = 0;
     int32 SampleCount = 0;
     double Min = 0.0;
     double Max = 0.0;
@@ -246,10 +250,10 @@ public:
         ECaveGeneratorType Archetype, const FString& FieldName) const;
     const FVoxelStrateFieldSpread* FindSpread(const FString& FieldName) const;
 
-    /** Stable hash of source paths, archetypes, weights, and every listed scalar field. */
+    /** Stable hash of source paths, archetypes, weights, and every listed scalar corpus field. */
     uint32 GetContentsHash() const;
 
-    /** Explicit exclusion list discovered from the struct reflection/use audit. */
+    /** Explicit exclusion list retained after the fixed-lattice terrain-detail liveness audit. */
     static const TArray<FVoxelStrateFieldExclusion>& GetNonTunableFields();
 
     /** True in an editor build where UPROPERTY metadata was available while spreads were built. */

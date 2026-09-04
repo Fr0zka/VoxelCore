@@ -330,6 +330,251 @@ namespace
         }
         return Report;
     }
+
+    enum class ETerrainDetailProbeGroup : uint8
+    {
+        Terrace,
+        LayerLines,
+        Overhang,
+        Ribbing,
+        Cliff,
+        Scallop,
+        Arch,
+        Column,
+        Pit,
+        Chimney,
+        Dome,
+        Pinch,
+    };
+
+    struct FTerrainDetailProbeSpec
+    {
+        ETerrainDetailProbeGroup Group;
+        const TCHAR* Name;
+        bool bExpectedLive;
+    };
+
+    static const FTerrainDetailProbeSpec GTerrainDetailProbeSpecs[] =
+    {
+        { ETerrainDetailProbeGroup::Terrace,   TEXT("Terrace"),   true  },
+        { ETerrainDetailProbeGroup::LayerLines,TEXT("LayerLines"),true  },
+        { ETerrainDetailProbeGroup::Overhang,  TEXT("Overhang"),  true  },
+        { ETerrainDetailProbeGroup::Ribbing,   TEXT("Ribbing"),   true  },
+        { ETerrainDetailProbeGroup::Cliff,     TEXT("Cliff"),     true  },
+        { ETerrainDetailProbeGroup::Scallop,   TEXT("Scallop"),   true  },
+        { ETerrainDetailProbeGroup::Arch,      TEXT("Arch"),      true  },
+        { ETerrainDetailProbeGroup::Column,    TEXT("Column"),    false },
+        { ETerrainDetailProbeGroup::Pit,       TEXT("Pit"),       false },
+        { ETerrainDetailProbeGroup::Chimney,   TEXT("Chimney"),   false },
+        { ETerrainDetailProbeGroup::Dome,      TEXT("Dome"),      true  },
+        { ETerrainDetailProbeGroup::Pinch,     TEXT("Pinch"),     true  },
+    };
+
+    void VF_ClearTerrainDetailFields(FStrateGenerationParams& Params)
+    {
+        Params.TerraceStepHeight = 0.0f;
+        Params.TerraceHardness = 0.0f;
+        Params.TerraceNoiseDisplacement = 0.0f;
+        Params.LayerLineSpacing = 0.0f;
+        Params.LayerLineDepth = 0.0f;
+        Params.OverhangStrength = 0.0f;
+        Params.OverhangDepth = 0.0f;
+        Params.OverhangFrequency = 0.0f;
+        Params.RibbingSpacing = 0.0f;
+        Params.RibbingDepth = 0.0f;
+        Params.CliffStrength = 0.0f;
+        Params.ScallopStrength = 0.0f;
+        Params.ScallopFrequency = 0.0f;
+        Params.ArchDensity = 0.0f;
+        Params.ArchMinRadius = 0.0f;
+        Params.ArchMaxRadius = 0.0f;
+        Params.ColumnDensity = 0.0f;
+        Params.ColumnMinRadius = 0.0f;
+        Params.ColumnMaxRadius = 0.0f;
+        Params.PitDensity = 0.0f;
+        Params.PitMinRadius = 0.0f;
+        Params.PitMaxRadius = 0.0f;
+        Params.PitDepth = 0.0f;
+        Params.ChimneyDensity = 0.0f;
+        Params.ChimneyMinRadius = 0.0f;
+        Params.ChimneyMaxRadius = 0.0f;
+        Params.ChimneyHeight = 0.0f;
+        Params.DomeDensity = 0.0f;
+        Params.DomeMinRadius = 0.0f;
+        Params.DomeMaxRadius = 0.0f;
+        Params.DomeHeightRatio = 0.0f;
+        Params.PinchDensity = 0.0f;
+        Params.PinchStrength = 0.0f;
+        Params.PinchLength = 0.0f;
+    }
+
+    void VF_SetTerrainDetailProbe(FStrateGenerationParams& Params,
+                                   ETerrainDetailProbeGroup Group)
+    {
+        switch (Group)
+        {
+        case ETerrainDetailProbeGroup::Terrace:
+            Params.TerraceStepHeight = 12.0f;
+            Params.TerraceHardness = 0.9f;
+            Params.TerraceNoiseDisplacement = 1.0f;
+            break;
+        case ETerrainDetailProbeGroup::LayerLines:
+            Params.LayerLineSpacing = 12.0f;
+            Params.LayerLineDepth = 1.0f;
+            break;
+        case ETerrainDetailProbeGroup::Overhang:
+            Params.OverhangStrength = 1.0f;
+            Params.OverhangDepth = 12.0f;
+            Params.OverhangFrequency = 0.03f;
+            break;
+        case ETerrainDetailProbeGroup::Ribbing:
+            Params.RibbingSpacing = 10.0f;
+            Params.RibbingDepth = 1.5f;
+            break;
+        case ETerrainDetailProbeGroup::Cliff:
+            Params.CliffStrength = 1.0f;
+            break;
+        case ETerrainDetailProbeGroup::Scallop:
+            Params.ScallopStrength = 2.0f;
+            Params.ScallopFrequency = 0.04f;
+            break;
+        case ETerrainDetailProbeGroup::Arch:
+            Params.ArchDensity = 1.0f;
+            Params.ArchMinRadius = 8.0f;
+            Params.ArchMaxRadius = 14.0f;
+            break;
+        case ETerrainDetailProbeGroup::Column:
+            Params.ColumnDensity = 1.0f;
+            Params.ColumnMinRadius = 8.0f;
+            Params.ColumnMaxRadius = 14.0f;
+            break;
+        case ETerrainDetailProbeGroup::Pit:
+            Params.PitDensity = 1.0f;
+            Params.PitMinRadius = 8.0f;
+            Params.PitMaxRadius = 14.0f;
+            Params.PitDepth = 64.0f;
+            break;
+        case ETerrainDetailProbeGroup::Chimney:
+            Params.ChimneyDensity = 1.0f;
+            Params.ChimneyMinRadius = 8.0f;
+            Params.ChimneyMaxRadius = 14.0f;
+            Params.ChimneyHeight = 64.0f;
+            break;
+        case ETerrainDetailProbeGroup::Dome:
+            Params.DomeDensity = 1.0f;
+            Params.DomeMinRadius = 14.0f;
+            Params.DomeMaxRadius = 24.0f;
+            Params.DomeHeightRatio = 1.25f;
+            break;
+        case ETerrainDetailProbeGroup::Pinch:
+            Params.PinchDensity = 1.0f;
+            Params.PinchStrength = 12.0f;
+            Params.PinchLength = 32.0f;
+            break;
+        }
+    }
+
+    void VF_BuildTerrainDetailLattice(const VoxelForgeTest::FTestWorld& World,
+                                      TArray<FVector>& OutPoints)
+    {
+        int32 TopVoxelZ = 0;
+        int32 BottomVoxelZ = 0;
+        OutPoints.Reset();
+        if (!World.GetSlotVoxelZRange(VoxelForgeTest::FTestWorld::SlotTunnelNetwork,
+                                      TopVoxelZ, BottomVoxelZ))
+        {
+            return;
+        }
+
+        constexpr int32 Side = 16;
+        constexpr int32 Step = 4;
+        const int32 CentreZ = (TopVoxelZ + BottomVoxelZ) / 2;
+        OutPoints.Reserve(Side * Side * Side);
+        for (int32 IZ = 0; IZ < Side; ++IZ)
+        for (int32 IY = 0; IY < Side; ++IY)
+        for (int32 IX = 0; IX < Side; ++IX)
+        {
+            OutPoints.Add(FVector(
+                (float)(-32 + IX * Step),
+                (float)(-32 + IY * Step),
+                (float)(CentreZ - 32 + IZ * Step)));
+        }
+    }
+
+    struct FTerrainDetailDensitySummary
+    {
+        uint32 Digest = 2166136261u;
+        double Mean = 0.0;
+        double Min = 0.0;
+        double Max = 0.0;
+    };
+
+    FTerrainDetailDensitySummary VF_SampleTerrainDetailLattice(
+        const VoxelForgeTest::FTestWorld& World,
+        const TArray<FVector>& Points,
+        TArray<float>& OutDensities)
+    {
+        FTerrainDetailDensitySummary Summary;
+        OutDensities.Reset(Points.Num());
+        if (Points.Num() == 0 || !World.Generator.IsValid())
+        {
+            return Summary;
+        }
+
+        Summary.Min = FLT_MAX;
+        Summary.Max = -FLT_MAX;
+        double Sum = 0.0;
+        for (const FVector& Point : Points)
+        {
+            const float Density = World.Generator->GetDensityAt(Point.X, Point.Y, Point.Z);
+            OutDensities.Add(Density);
+            uint32 Bits = 0;
+            FMemory::Memcpy(&Bits, &Density, sizeof(Bits));
+            Summary.Digest ^= Bits;
+            Summary.Digest *= 16777619u;
+            Summary.Min = FMath::Min(Summary.Min, (double)Density);
+            Summary.Max = FMath::Max(Summary.Max, (double)Density);
+            Sum += Density;
+        }
+        Summary.Mean = Sum / (double)Points.Num();
+        return Summary;
+    }
+
+    struct FTerrainDetailDensityDelta
+    {
+        int32 Changed = 0;
+        int32 SignChanged = 0;
+        double SumAbs = 0.0;
+        double MaxAbs = 0.0;
+    };
+
+    FTerrainDetailDensityDelta VF_CompareTerrainDetailSamples(
+        const TArray<float>& Baseline,
+        const TArray<float>& Variant)
+    {
+        FTerrainDetailDensityDelta Delta;
+        if (Baseline.Num() != Variant.Num())
+        {
+            return Delta;
+        }
+        for (int32 Index = 0; Index < Baseline.Num(); ++Index)
+        {
+            const float A = Baseline[Index];
+            const float B = Variant[Index];
+            if (!VoxelForgeTest::BitEqual(A, B))
+            {
+                ++Delta.Changed;
+            }
+            if ((A < 0.0f) != (B < 0.0f))
+            {
+                ++Delta.SignChanged;
+            }
+            const double AbsDelta = FMath::Abs((double)B - (double)A);
+            Delta.SumAbs += AbsDelta;
+            Delta.MaxAbs = FMath::Max(Delta.MaxAbs, AbsDelta);
+        }
+        return Delta;
+    }
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -390,7 +635,7 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     AddInfo(FString::Printf(
         TEXT("Corpus membership: %d project strate assets discovered, %d project vectors loaded, "
              "%d defaults, %d total members. Terrain-op Asset Registry count (not rolled in this "
-             "task): %d."),
+             "task; live fields use header defaults instead): %d."),
         ProjectStrateAssets.Num(), NumProjectCorpusEntries, NumDefaultCorpusEntries, Corpus.Num(),
         ProjectTerrainOpAssets.Num()));
     AddInfo(CorpusMembership);
@@ -422,19 +667,57 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("all project strate assets plus eight defaults are corpus members"),
               Corpus.Num(), ProjectStrateAssets.Num() + 8);
 
+    static const TCHAR* LiveTerrainDetailFields[] =
+    {
+        TEXT("TerraceStepHeight"), TEXT("TerraceHardness"), TEXT("TerraceNoiseDisplacement"),
+        TEXT("LayerLineSpacing"), TEXT("LayerLineDepth"),
+        TEXT("OverhangStrength"), TEXT("OverhangDepth"), TEXT("OverhangFrequency"),
+        TEXT("RibbingSpacing"), TEXT("RibbingDepth"), TEXT("CliffStrength"),
+        TEXT("ScallopStrength"), TEXT("ScallopFrequency"), TEXT("ArchDensity"),
+        TEXT("ArchMinRadius"), TEXT("ArchMaxRadius"),
+        TEXT("DomeDensity"), TEXT("DomeMinRadius"), TEXT("DomeMaxRadius"),
+        TEXT("DomeHeightRatio"), TEXT("PinchDensity"), TEXT("PinchStrength"),
+        TEXT("PinchLength"),
+    };
+    static const TCHAR* DeadTerrainDetailFields[] =
+    {
+        TEXT("ColumnDensity"), TEXT("ColumnMinRadius"), TEXT("ColumnMaxRadius"),
+        TEXT("PitDensity"), TEXT("PitMinRadius"), TEXT("PitMaxRadius"), TEXT("PitDepth"),
+        TEXT("ChimneyDensity"), TEXT("ChimneyMinRadius"), TEXT("ChimneyMaxRadius"),
+        TEXT("ChimneyHeight"),
+    };
+    for (const TCHAR* FieldName : LiveTerrainDetailFields)
+    {
+        const FVoxelStrateFieldSpread* Spread = Corpus.FindSpread(
+            ECaveGeneratorType::TunnelNetwork, FString(FieldName));
+        TestTrue(FString::Printf(TEXT("live terrain field %s is no longer excluded"), FieldName),
+                 Spread != nullptr && !Spread->bExcluded);
+    }
+    for (const TCHAR* FieldName : DeadTerrainDetailFields)
+    {
+        const FVoxelStrateFieldSpread* Spread = Corpus.FindSpread(
+            ECaveGeneratorType::TunnelNetwork, FString(FieldName));
+        TestTrue(FString::Printf(TEXT("dead terrain field %s remains excluded"), FieldName),
+                 Spread != nullptr && Spread->bExcluded);
+    }
+    TestEqual(TEXT("exactly eleven direct terrain transport fields remain excluded"),
+              static_cast<int32>(UE_ARRAY_COUNT(DeadTerrainDetailFields)), 11);
+
     FString SpreadTable = TEXT(
         "CORPUS SPREAD (population stddev; jitter range = ±15% of max-min; clamps are safety only)\n"
-        "archetype | struct | field | kind | excluded | reflected | samples | min | max | mean | stddev | clamp\n");
+        "archetype | struct | field | kind | excluded | reflected | authored | op-defaults | samples | min | max | mean | stddev | clamp\n");
     for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
     {
         SpreadTable += FString::Printf(
-            TEXT("%s | %s | %s | %s | %s | %s | %d | %s | %s | %s | %s | %s\n"),
+            TEXT("%s | %s | %s | %s | %s | %s | %d | %d | %d | %s | %s | %s | %s | %s\n"),
             VF_GetStrateArchetypeName(Spread.Archetype),
             *Spread.ParamStructName,
             *Spread.FieldName,
             VF_FieldKindName(Spread.Kind),
             Spread.bExcluded ? TEXT("yes") : TEXT("no"),
             Spread.bReflected ? TEXT("yes") : TEXT("no"),
+            Spread.AuthoredSampleCount,
+            Spread.DefaultSeedCount,
             Spread.SampleCount,
             *VF_FormatSpreadValue(Spread.Min),
             *VF_FormatSpreadValue(Spread.Max),
@@ -455,8 +738,10 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         "Bool policy: bTunnelsFlowTowardOrigin is inherited from the dominant weighted parent; "
         "int/enum SNAP fields use the native family blend and are not jittered. Parent selection "
         "is weight-1.0 (equal) because UVoxelStrateDefinition has no corpus-weight field; parents "
-        "are selected only within one exact archetype group. FStrateGenerationParams terrain-op "
-        "transport fields remain excluded; the sibling families' authored fields are rolled."));
+        "are selected only within one exact archetype group. The 23 empirically live terrain-detail "
+        "fields are rolled, with one per-operation header-default sample added to their spread; "
+        "only the 11 empirically dead Column/Pit/Chimney transport fields remain excluded. The "
+        "sibling families' authored fields are rolled."));
 
     TestTrue(TEXT("the reflected parameter schema is covered or explicitly excluded"),
              Corpus.IsSchemaValid());
@@ -509,6 +794,9 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     int32 TotalBoxProved = 0;
     int64 TotalBoxCheckedVoxels = 0;
     int32 TotalBoxViolations = 0;
+    int32 NumTunnelLikeCandidates = 0;
+    int32 NumCandidatesWithLiveDetail = 0;
+    int32 LiveActivationVariationCounts[9] = {};
     TArray<int32> BoxViolationCandidates;
     FString FirstBoxViolation;
 
@@ -532,6 +820,41 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
             CandidateTable += FString::Printf(TEXT("%d | invalid | %s | invalid | invalid | invalid | invalid | %s\n"),
                                                CandidateIndex, *ParentText, *Roll.FailureReason);
             continue;
+        }
+
+        if (Roll.Archetype == ECaveGeneratorType::TunnelNetwork
+            || Roll.Archetype == ECaveGeneratorType::Underwater)
+        {
+            const FStrateGenerationParams& DetailParams =
+                Roll.ArchetypeParams.TunnelNetworkParams;
+            const float LiveActivationValues[] =
+            {
+                DetailParams.TerraceStepHeight,
+                DetailParams.LayerLineSpacing,
+                DetailParams.OverhangStrength,
+                DetailParams.RibbingSpacing,
+                DetailParams.CliffStrength,
+                DetailParams.ScallopStrength,
+                DetailParams.ArchDensity,
+                DetailParams.DomeDensity,
+                DetailParams.PinchDensity,
+            };
+            ++NumTunnelLikeCandidates;
+            bool bHasLiveDetail = false;
+            for (int32 DetailIndex = 0;
+                 DetailIndex < static_cast<int32>(UE_ARRAY_COUNT(LiveActivationValues));
+                 ++DetailIndex)
+            {
+                if (LiveActivationValues[DetailIndex] != 0.0f)
+                {
+                    bHasLiveDetail = true;
+                    ++LiveActivationVariationCounts[DetailIndex];
+                }
+            }
+            if (bHasLiveDetail)
+            {
+                ++NumCandidatesWithLiveDetail;
+            }
         }
 
         bool bParentsMatchArchetype = true;
@@ -683,6 +1006,31 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         NumRollFailures, RollAndMeasureSeconds));
 
     AddInfo(FString::Printf(
+        TEXT("Live detail activation coverage: %d/%d TunnelNetwork/Underwater candidates had at "
+             "least one non-zero live activation; Terrace/Layer/Overhang/Ribbing/Cliff/Scallop/"
+             "Arch/Dome/Pinch non-zero candidate counts = %d/%d/%d/%d/%d/%d/%d/%d/%d."),
+        NumCandidatesWithLiveDetail, NumTunnelLikeCandidates,
+        LiveActivationVariationCounts[0], LiveActivationVariationCounts[1],
+        LiveActivationVariationCounts[2], LiveActivationVariationCounts[3],
+        LiveActivationVariationCounts[4], LiveActivationVariationCounts[5],
+        LiveActivationVariationCounts[6], LiveActivationVariationCounts[7],
+        LiveActivationVariationCounts[8]));
+    TestTrue(TEXT("at least one TunnelNetwork/Underwater candidate carries live detail variation"),
+             NumCandidatesWithLiveDetail > 0);
+    static const TCHAR* LiveActivationNames[] =
+    {
+        TEXT("Terrace"), TEXT("LayerLines"), TEXT("Overhang"), TEXT("Ribbing"), TEXT("Cliff"),
+        TEXT("Scallop"), TEXT("Arch"), TEXT("Dome"), TEXT("Pinch"),
+    };
+    for (int32 DetailIndex = 0;
+         DetailIndex < static_cast<int32>(UE_ARRAY_COUNT(LiveActivationNames)); ++DetailIndex)
+    {
+        TestTrue(FString::Printf(TEXT("live %s activation appears in a rolled candidate"),
+                                 LiveActivationNames[DetailIndex]),
+                 LiveActivationVariationCounts[DetailIndex] > 0);
+    }
+
+    AddInfo(FString::Printf(
         TEXT("Rolled §6.2 box verdict check: mixed=%d, AllSolid=%d, AllAir=%d, proved=%d, "
              "brute-force lattice samples=%lld, violations=%d; violating candidates=%s. "
              "A zero-proved run is reported as vacuous rather than silently treated as sound."),
@@ -714,6 +1062,139 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
                                  "roll/measurement %.3fs)."),
                             TestSeconds, CorpusSeconds, RollAndMeasureSeconds));
     return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeTerrainDetailLivenessTest,
+    "VoxelForge.Composer.TerrainDetailLiveness",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FVoxelForgeTerrainDetailLivenessTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+    (void)Parameters;
+
+    constexpr int32 ExpectedLatticeSamples = 16 * 16 * 16;
+    FString Table = TEXT(
+        "TERRAIN DETAIL LIVENESS (same 4096-point lattice; only one group changed per row)\n"
+        "path | group | samples | baseline digest | variant digest | baseline mean | variant mean | "
+        "changed | sign changes | sum abs delta | max abs delta | verdict\n");
+    int32 TotalRows = 0;
+    int32 FailedRows = 0;
+
+    for (const bool bUseOperatorStack : { false, true })
+    {
+        FTestWorld World;
+        World.Build(1337, 2, bUseOperatorStack);
+        if (!World.IsValid())
+        {
+            AddError(World.WhyInvalid());
+            return false;
+        }
+
+        UVoxelStrateDefinition* Definition =
+            World.Definitions[FTestWorld::SlotTunnelNetwork].Get();
+        if (Definition == nullptr)
+        {
+            AddError(TEXT("The fixture has no TunnelNetwork definition for the liveness experiment."));
+            return false;
+        }
+        Definition->TerrainOperations.Reset();
+        TestEqual(
+            FString::Printf(TEXT("%s fixture has no terrain-op asset pool"),
+                            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")),
+            Definition->TerrainOperations.Num(), 0);
+
+        TArray<FVector> Points;
+        VF_BuildTerrainDetailLattice(World, Points);
+        TestEqual(
+            FString::Printf(TEXT("%s experiment uses the fixed lattice"),
+                            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")),
+            Points.Num(), ExpectedLatticeSamples);
+
+        FStrateGenerationParams BaselineParams = Definition->GenerationParams;
+        VF_ClearTerrainDetailFields(BaselineParams);
+        TArray<float> FirstBaseline;
+        bool bHaveFirstBaseline = false;
+
+        for (const FTerrainDetailProbeSpec& Spec : GTerrainDetailProbeSpecs)
+        {
+            Definition->GenerationParams = BaselineParams;
+            World.Reinitialize();
+
+            TArray<float> BaselineSamples;
+            const FTerrainDetailDensitySummary BaselineSummary =
+                VF_SampleTerrainDetailLattice(World, Points, BaselineSamples);
+            if (!bHaveFirstBaseline)
+            {
+                FirstBaseline = BaselineSamples;
+                bHaveFirstBaseline = true;
+            }
+            else
+            {
+                bool bSameBaseline = FirstBaseline.Num() == BaselineSamples.Num();
+                for (int32 SampleIndex = 0; bSameBaseline && SampleIndex < FirstBaseline.Num(); ++SampleIndex)
+                {
+                    bSameBaseline = BitEqual(FirstBaseline[SampleIndex], BaselineSamples[SampleIndex]);
+                }
+                TestTrue(
+                    FString::Printf(TEXT("%s baseline is stable before %s probe"),
+                                    bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
+                                    Spec.Name),
+                    bSameBaseline);
+            }
+
+            FStrateGenerationParams VariantParams = BaselineParams;
+            VF_SetTerrainDetailProbe(VariantParams, Spec.Group);
+            Definition->GenerationParams = VariantParams;
+            World.Reinitialize();
+
+            TArray<float> VariantSamples;
+            const FTerrainDetailDensitySummary VariantSummary =
+                VF_SampleTerrainDetailLattice(World, Points, VariantSamples);
+            const FTerrainDetailDensityDelta Delta =
+                VF_CompareTerrainDetailSamples(BaselineSamples, VariantSamples);
+
+            const bool bObservedLive = Delta.Changed > 0;
+            const bool bVerdictMatches = bObservedLive == Spec.bExpectedLive;
+            ++TotalRows;
+            if (!bVerdictMatches)
+            {
+                ++FailedRows;
+            }
+            TestTrue(
+                FString::Printf(TEXT("%s %s field group has the measured liveness verdict"),
+                                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
+                                Spec.Name),
+                bVerdictMatches);
+
+            Table += FString::Printf(
+                TEXT("%s | %s | %d | 0x%08x | 0x%08x | %.9g | %.9g | %d | %d | %.9g | %.9g | %s\n"),
+                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
+                Spec.Name,
+                Points.Num(),
+                BaselineSummary.Digest,
+                VariantSummary.Digest,
+                BaselineSummary.Mean,
+                VariantSummary.Mean,
+                Delta.Changed,
+                Delta.SignChanged,
+                Delta.SumAbs,
+                Delta.MaxAbs,
+                bObservedLive ? TEXT("LIVE") : TEXT("DEAD"));
+        }
+    }
+
+    AddInfo(Table);
+    AddInfo(FString::Printf(
+        TEXT("Terrain detail liveness: %d group/path rows measured, %d mismatches; LIVE groups "
+             "must have at least one bit-changed density and DEAD groups must have none. No "
+             "terrain-operation assets were present in the fixture pool."),
+        TotalRows, FailedRows));
+    TestEqual(TEXT("all terrain detail liveness rows matched their measured verdict"), FailedRows, 0);
+    TestEqual(TEXT("both density paths measured every terrain detail group"), TotalRows,
+              static_cast<int32>(2 * UE_ARRAY_COUNT(GTerrainDetailProbeSpecs)));
+    return FailedRows == 0;
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS

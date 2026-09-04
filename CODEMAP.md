@@ -378,7 +378,7 @@ context. It never touches a generator, operator stack, manager, cache, or mutabl
 | `EVoxelNoiseType` | 99 | FBM/Ridged/Mixed/Cellular. |
 | `ECaveGeneratorType` | 146 | TunnelNetwork / FlatPlain / CrystalChamber. |
 | `EVoxelStrateTransition` | 183 | Gradient / Hard / Interleaved boundary blends. |
-| **`FStrateGenerationParams`** | ~350 | The giant TunnelNetwork param bag (rock, worms, rooms, tunnels, warp, roughness, all terrain-op transport fields, boundary seal). `Lerp()` static blends two sets at boundaries — it expands the **`VF_STRATE_PARAM_FIELDS` X-macro** (defined just above the struct): **adding a field to the struct? add it to that list** or blends silently reset it to default. |
+| **`FStrateGenerationParams`** | ~350 | The giant TunnelNetwork param bag (rock, worms, rooms, tunnels, warp, roughness, live terrain-detail fields, dead terrain-op transport slots, boundary seal). `Lerp()` static blends two sets at boundaries — it expands the **`VF_STRATE_PARAM_FIELDS` X-macro** (defined just above the struct): **adding a field to the struct? add it to that list** or blends silently reset it to default. |
 | `FStrateTerrainOpEntry` | 965 | Soft-ptr to a terrain op + Weight + Probability. |
 | **`FSlabGenerationParams`** | 1019 | Floor/ceiling heights, roughness, columns, seal — for slab generators. |
 | **`FPlacementProfile`** | ~1747 | **Shared placement vocabulary** for every scatter primitive (`FStrateDecoration`, `FStrateLandmark`, coming `FStrateSetPiece`): spawn (ActorClass/InstancedMesh), Filter gates (surface/slope/overhang/water/RequiredBiome + **F7 awareness `Conditions[]`** — `FTerrainCondition` relief/moisture/biome-border predicates, AND-ed, evaluated by `Generator::EvaluateTerrainConditions`), Transform (align/offsets/RotationOffset+RandomRotation/scale), Render (cull/shadow). Each primitive embeds it as `Profile` + keeps only its own DISTRIBUTION fields. Per-primitive defaults set in each struct's ctor (deco: scale 0.8-1.2 + RandomRotation.Yaw=360; landmark: Ceiling + no align). |
@@ -414,7 +414,7 @@ Maps depth→strate at runtime; owns passages.
 | `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
 | `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
 | `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
-| `BuildParamsFromDefinition` (static) | 771 | Base params + merge all referenced terrain op assets. The one place ops fold into params. |
+| `BuildParamsFromDefinition` (static) | 1399 | Returns the definition's base `GenerationParams` only. Terrain-op assets are passed separately to `BuildChunkCache`, which applies one selected op per room and pre-bakes Column/Pit/Chimney features. |
 
 **`Public/VoxelTerrainOpDefinition.h` + `.cpp`** — `UVoxelTerrainOpDefinition : UPrimaryDataAsset`
 (h:67). One asset = one terrain op. `EVoxelTerrainOpType` (h:36): Terrace, LayerLines,
@@ -446,13 +446,18 @@ The corpus is grouped by exact `ECaveGeneratorType`: the 2026-09-04 run loaded *
 vectors + 8 defaults = 12 members** in **8 groups**. Sibling families use their native structs
 (`FSlabGenerationParams`, `FMazeGenerationParams`, `FSurfaceGenerationParams`,
 `FVerticalShaftParams`, `FFloatingIslandParams`); no cross-archetype blend is attempted.
-Spreads are measured per group, including the plain-native tunnel transport fields for reporting.
-Rolls are pure in `(corpus contents, seed, index)`: weighted 2–3-parent same-archetype selection →
-`FStrateGenerationParams::Lerp` or reflected native-family blend → ±15% of measured field range
-jitter → editor-reflection clamps → ordered-pair repair. Bool `bTunnelsFlowTowardOrigin` inherits
-from the dominant parent; integer/enum SNAP fields are not jittered. This API is not called by
-runtime generation. The settings audit found **one unique path**, `/Game/VoxelForge/DA_Strate3`,
-which explains the old one-vector corpus; the project assets were never in that pool.
+Spreads are measured per group, including the plain-native tunnel fields. The fixed-lattice audit
+found **23 live terrain-detail fields** (Terrace, LayerLines, Overhang, Ribbing, Cliff, Scallop,
+Arch, Dome, Pinch) and **11 dead direct transport fields** (Column, Pit, Chimney); only the latter
+remain excluded. Live fields receive one matching `UVoxelTerrainOpDefinition` header-default sample
+in addition to authored strate values, so an all-default strate corpus still has useful activation
+spread. Rolls are pure in `(corpus contents, seed, index)`: weighted 2–3-parent same-archetype
+selection → `FStrateGenerationParams::Lerp` or reflected native-family blend → ±15% of measured
+field range jitter → editor-reflection clamps → ordered-pair repair. Bool
+`bTunnelsFlowTowardOrigin` inherits from the dominant parent; integer/enum SNAP fields are not
+jittered. This API is not called by runtime generation. The settings audit found **one unique path**,
+`/Game/VoxelForge/DA_Strate3`, which explains the old one-vector corpus; the project assets were
+never in that pool.
 
 `FVoxelOpStackRecipe` is the serialisable Tier 4b manifest: root polarity, root/source/conversion
 class IDs, an ordered modifier ID list, and one native parameter-family ID per entry. Posts are not
@@ -526,7 +531,8 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeOpStackIslandTest.cpp` | `VoxelForge.OpStack.FloatingIslandEquivalence` | The port that runs the stack **backwards** — void + fill vs rock + carve, same classes with the opposite sign. Counts interior-solid and open-void samples separately (on this archetype an aggregate "N solid" is dominated by the seal bands and says nothing about the islands). Counts `AllSolid` and `AllAir` verdicts **separately** too: `AllAir` is the one no cave archetype could ever prove, and it is the entire perf argument here. |
 | `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 7-op Maze stack vs `GetMazeDensity` over 20k points (aiming for bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers and brute force on every box verdict the stack emits. Reports how many tiles the stack can prove uniform — today's `ClassifyTile` proves **zero** for any cave archetype. |
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
-| `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. Current run: **59/64 survival (92.2%)**, **1,336 Mixed + 549 AllSolid + 675 AllAir = 1,224 proved boxes**, **1,629,144 lattice voxels checked, 0 violations**, 114.845 s total. |
+| `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. Current detail-enabled run: **59/64 survival (92.2%)**, **1,332 Mixed + 553 AllSolid + 675 AllAir = 1,228 proved boxes**, **1,634,468 lattice voxels checked, 0 violations**, 113.317 s total. Feature scale **0→376**; walkable **0.000000→0.388506**; all 17 TunnelNetwork/Underwater candidates carried live detail activation. |
+| ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Focused run: **46/64 survival (71.9%)**, **64 distinct recipes**, **RoomGraph 15 / Lattice 19 / Shaft 8 / Island 14 / Noise 8**, **k=4:11 / 5:13 / 6:11 / 7:10 / 8:19**, **489 proved boxes / 650,859 voxels / 0 violations**. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |
