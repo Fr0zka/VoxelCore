@@ -160,6 +160,40 @@ corpus is small.
 **⇒ Rule: vary STRUCTURE aggressively, vary PARAMETERS conservatively.** Shift the ratio as the corpus
 grows.
 
+**Tier 4b implementation (2026-09-04):** `FVoxelOpStackRecipe` is the shipped-manifest shape: it
+stores the one-bit `RootPolarity`, root/source/conversion `EVoxelStrateOpClass` IDs, an ordered list
+of modifier IDs, and an `EVoxelStrateParamBlock` on every entry. The four structural posts are
+deliberately not a field in the recipe. `VF_BuildStackFromRecipe` appends spine, vertical seal,
+passage carving, and XY edge seal in that fixed order, so an invented strate cannot omit primordial
+law. The conversion ID is checked against polarity rather than rolled independently.
+
+The roller's modifier catalogue is a deterministic array of declared ops, not a compatibility list.
+It asks each op for its channel reads/writes, additive contract, required resources, and provided
+resources, then draws 4–8 unique entries from the legal remainder. The channel declarations exposed
+a real missing dependency: `FCaveTerraceMod` and the other room-relative cave modifiers use the
+`FRoomGraphSource` room cache through a non-owning pointer, even though their channel masks only said
+`Density`. `FShaftLedgeMod` similarly consumes shaft state, and `FOverhangShelfMod` consumes the
+surface-column state. `RequiredResources` / `ProvidedResources` now declare and validate those
+dependencies (RoomGeometry, ShaftGeometry, SurfaceColumn); the roller cannot place such an op before
+its provider. `FCaveRoughnessMod` and `FWormFieldSource` were checked and do not require room state:
+they read only their declared channels and parameters.
+
+The parameter decision is deliberately visible: structure and parameter rolls are separate. Each
+candidate rolls the six native family blocks independently from the exact-archetype corpus using the
+Tier 4a conservative blend/jitter procedure. An op consumes the block named on its recipe entry;
+structural posts consume the shape source's family block. There is no unsafe 73-field cross-family
+blend. The current `SurfaceWorld` block is still rolled and carried even when a structure has no
+surface-column op, so the recipe remains a complete family-parameter record.
+
+The focused 64-candidate run produced 64 distinct recipes, 0 invalid recipes, and 0 box-verdict
+violations. It checked 650,859 voxels across 489 proved boxes. Survival was 46/64 (71.9%) under the
+same non-vacuous, largest-share ≥ 0.50, exact `Connected` criteria as Tier 4a; that lower rate is an
+expected consequence of aggressive structural exploration, not a tuning target. The test also
+rerolls every recipe and rebuilt stack, checks `WorldRadiusVoxels == 0`, and feeds the novel stack
+through the offline Tier 2 sampler; no runtime generation path calls this API. The final focused
+test took **76.466 s**. The complete `VoxelForge` namespace then passed **24/24 tests (0 failed,
+0 not run)** in **339.797 s**.
+
 ### 3.3 Parameters: the range problem
 
 **Verified facts, not remembered:** `FStrateGenerationParams` has **73 scalar fields** (+1 bool) — not
@@ -300,8 +334,8 @@ produced **59/64 survivors (92.2%)**. There were 60 non-vacuous candidates, 60 w
 component share ≥ 0.50, 63 exact unsnapped arrival→departure law passes, and no roll failures.
 The complete 64-row table is emitted by `VoxelForge.Composer.ParameterRoll`; each row reports
 archetype, weighted parents, air fraction, largest share, walkable fraction, feature scale, and
-arrival→departure verdict. The final full-suite run took **112.574 s** total (**0.015 s** corpus
-load, **112.556 s** roll/measurement).
+arrival→departure verdict. The current run took **114.845 s** total (**0.014 s** corpus load,
+**114.827 s** roll/measurement).
 
 The §6.2 check is no longer vacuous: **1,224 boxes proved**, **1,629,144 voxels checked**,
 **0 violations**. Its verdict mix was 1,336 Mixed, 549 AllSolid, and 675 AllAir; the law check
@@ -650,8 +684,11 @@ roughness and should stay late in the stack.
 - ✅ **Parameter roll (§3.3, Tier 4a)** — corpus spread + deterministic blend/jitter implementation
   and the 64-candidate measurement pass are built; the first run exposed a one-vector settings corpus
   and a vacuous cave box-verdict scan, both recorded above.
-- ⬜ Structure roll (§3.2) · reject-and-resample driven by Tier 2 (§3.5) · the **offline season
-  pipeline** with Jahni's review and veto (§3.1).
+- ✅ **Structure roll (§3.2, Tier 4b)** — serialisable recipes, root polarity, declaration-derived
+  resource-safe modifier legality, mandatory posts, 64-candidate measurement, and direct box-verdict
+  brute force are built; focused result is 46/64 survival with 0 invalid recipes and 0 violations.
+- ⬜ Reject-and-resample driven by Tier 2 (§3.5) · the **offline season pipeline** with Jahni's review
+  and veto (§3.1).
 
 ### Tier 5 — the long game
 **Promotion** (good strates rejoin the corpus) · theme and tag draws for materials, creatures and audio ·

@@ -7,6 +7,14 @@
 class UVoxelGenerator;
 class UVoxelStrateManager;
 
+/** Read-only density source used by the offline Tier 2 pass for a materialised custom stack. */
+class VOXELFORGE_API IVoxelStrateDensitySampler
+{
+public:
+    virtual ~IVoxelStrateDensitySampler() = default;
+    virtual float SampleDensity(float WorldX, float WorldY, float WorldZ) const = 0;
+};
+
 /** Explicit outcome of a coarse connectivity query plus its full-resolution route re-check. */
 enum class EVoxelConnectivityResult : uint8
 {
@@ -122,6 +130,14 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
     int32 StrateIndex,
     const FVoxelStrateMeasureSettings& Settings);
 
+/** The same Tier 2 pass over an explicit voxel Z window and a custom read-only sampler. */
+VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrateWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVoxelStrateMeasureSettings& Settings);
+
 /**
  * Test coarse connectivity and re-check recovered coarse routes at full resolution.
  *
@@ -185,6 +201,29 @@ VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
     const UVoxelGenerator& Generator,
     const UVoxelStrateManager& Manager,
     int32 StrateIndex,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings);
+
+/** Connectivity variant for the explicit custom-stack measurement window. */
+VOXELFORGE_API EVoxelConnectivityResult VF_AreConnectedWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    FVoxelConnectivityDiagnostics* OutDiagnostics = nullptr);
+
+/** Full diagnostics variant for a custom stack. */
+VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
     const FVector& AVoxel,
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings);

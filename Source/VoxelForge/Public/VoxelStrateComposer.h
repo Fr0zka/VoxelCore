@@ -8,9 +8,108 @@
 
 #include "CoreMinimal.h"
 #include "VoxelStrateTypes.h"
+#include "VoxelDensityOpStack.h"
+
+#include "VoxelStrateComposer.generated.h"
 
 class UVoxelSettings;
 class UVoxelStrateDefinition;
+
+/** The one-bit identity choice at the root of a rolled structure. */
+UENUM(BlueprintType)
+enum class EVoxelStrateRootPolarity : uint8
+{
+    RockCarve = 0,
+    VoidFill = 1,
+};
+
+/** Native parameter family an op reads when a recipe is materialised. */
+UENUM(BlueprintType)
+enum class EVoxelStrateParamBlock : uint8
+{
+    None = 0,
+    TunnelNetwork = 1,
+    Slab = 2,
+    Maze = 3,
+    Surface = 4,
+    VerticalShaft = 5,
+    FloatingIsland = 6,
+};
+
+/** Stable manifest id for every op the offline structure roller may place. */
+UENUM(BlueprintType)
+enum class EVoxelStrateOpClass : uint8
+{
+    ConstantRockSource = 0,
+    ConstantVoidSource = 1,
+    RoomGraphSource = 2,
+    LatticeCorridorSource = 3,
+    ShaftFieldSource = 4,
+    IslandBlobSource = 5,
+    NoiseRibbonSource = 6,
+    SdfRoughnessMod = 7,
+    SdfCarve = 8,
+    SdfFill = 9,
+    GridColumnMod = 10,
+    CaveRoughnessMod = 11,
+    CaveTerraceMod = 12,
+    LayerLineMod = 13,
+    RibbingMod = 14,
+    CaveOverhangMod = 15,
+    CaveCliffMod = 16,
+    ScallopMod = 17,
+    CaveArchMod = 18,
+    RoomColumnMod = 19,
+    DomeMod = 20,
+    PinchMod = 21,
+    FloorBiasMod = 22,
+    WormFieldSource = 23,
+    ShaftLedgeMod = 24,
+    DensityNoiseCarveMod = 25,
+    DensityNoiseFillMod = 26,
+};
+
+/** One creative op in the serialisable structure manifest. */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FVoxelOpRecipeEntry
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    EVoxelStrateOpClass OpClass = EVoxelStrateOpClass::ConstantRockSource;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    EVoxelStrateParamBlock ParamBlock = EVoxelStrateParamBlock::None;
+};
+
+/**
+ * Serialisable creative structure. Structural posts are intentionally absent: the recipe builder
+ * appends spine, vertical seal, passage carve, and XY edge seal in that fixed order every time.
+ */
+USTRUCT(BlueprintType)
+struct VOXELFORGE_API FVoxelOpStackRecipe
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    EVoxelStrateRootPolarity RootPolarity = EVoxelStrateRootPolarity::RockCarve;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    FVoxelOpRecipeEntry Root;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    FVoxelOpRecipeEntry ShapeSource;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    FVoxelOpRecipeEntry Conversion;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    TArray<FVoxelOpRecipeEntry> Modifiers;
+
+    // Which native block supplies the mandatory structural post parameters.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recipe")
+    EVoxelStrateParamBlock StructuralParamBlock = EVoxelStrateParamBlock::None;
+};
 
 /** The kind of value represented by one entry of VF_STRATE_PARAM_FIELDS. */
 enum class EVoxelStrateFieldKind : uint8
@@ -176,6 +275,19 @@ VOXELFORGE_API const TCHAR* VF_GetStrateArchetypeName(ECaveGeneratorType Archety
 /** Full provenance result. Pure with respect to the corpus: no global or retained RNG state. */
 VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailed(
     const FVoxelStrateCorpus& Corpus, int32 Seed, int32 Index);
+
+/** Roll one exact native family, used to feed the independent blocks of a novel recipe. */
+VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailedForArchetype(
+    const FVoxelStrateCorpus& Corpus, ECaveGeneratorType Archetype, int32 Seed, int32 Index);
+
+/** Pure structure roll: no retained RNG state and no corpus/runtime dependency. */
+VOXELFORGE_API FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index);
+
+/** Stable compact representation and equality/hash helpers for manifests and reports. */
+VOXELFORGE_API FString VF_FormatStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe);
+VOXELFORGE_API uint32 VF_HashStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe);
+VOXELFORGE_API bool VF_AreStrateStructureRecipesIdentical(
+    const FVoxelOpStackRecipe& A, const FVoxelOpStackRecipe& B);
 
 /** The compact API requested by the composer design. */
 VOXELFORGE_API FStrateGenerationParams VF_RollStrateParams(

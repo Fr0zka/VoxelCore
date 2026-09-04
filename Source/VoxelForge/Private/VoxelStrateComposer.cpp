@@ -13,6 +13,7 @@
 
 #include "VoxelSettings.h"
 #include "VoxelStrateDefinition.h"
+#include "VoxelDensityOpStack.h"
 
 #include <type_traits>
 #include <utility>
@@ -992,7 +993,8 @@ namespace
     }
 
     FVoxelStrateRollInfo VF_RollInternal(const FVoxelStrateCorpus& Corpus,
-                                         int32 Seed, int32 Index)
+                                         int32 Seed, int32 Index,
+                                         const ECaveGeneratorType* ForcedArchetype = nullptr)
     {
         FVoxelStrateRollInfo Result;
         if (!Corpus.IsValid())
@@ -1043,7 +1045,24 @@ namespace
         }
 
         int32 GroupIndex = 0;
-        if (TotalGroupWeight > 0.0f)
+        if (ForcedArchetype != nullptr)
+        {
+            GroupIndex = INDEX_NONE;
+            for (int32 CandidateGroup = 0; CandidateGroup < Groups.Num(); ++CandidateGroup)
+            {
+                if (Groups[CandidateGroup].Archetype == *ForcedArchetype)
+                {
+                    GroupIndex = CandidateGroup;
+                    break;
+                }
+            }
+            if (GroupIndex == INDEX_NONE)
+            {
+                Result.FailureReason = TEXT("The requested archetype has no corpus group.");
+                return Result;
+            }
+        }
+        else if (TotalGroupWeight > 0.0f)
         {
             float Cursor = Rng.FRand() * TotalGroupWeight;
             for (int32 CandidateGroup = 0; CandidateGroup < Groups.Num(); ++CandidateGroup)
@@ -1140,6 +1159,165 @@ namespace
         Result.Params = Result.ArchetypeParams.TunnelNetworkParams;
         Result.bValid = true;
         return Result;
+    }
+
+    struct FStructureModifierCandidate
+    {
+        EVoxelStrateOpClass OpClass;
+        EVoxelStrateParamBlock ParamBlock;
+    };
+
+    static const EVoxelStrateOpClass GStructureShapeSources[] =
+    {
+        EVoxelStrateOpClass::RoomGraphSource,
+        EVoxelStrateOpClass::LatticeCorridorSource,
+        EVoxelStrateOpClass::ShaftFieldSource,
+        EVoxelStrateOpClass::IslandBlobSource,
+        EVoxelStrateOpClass::NoiseRibbonSource,
+    };
+
+    // Fixed order is intentional. This is a source-controlled catalogue, not a hash-container
+    // iteration; changing it is a manifest-versioned design change rather than an accidental RNG
+    // change.
+    static const FStructureModifierCandidate GStructureModifiers[] =
+    {
+        { EVoxelStrateOpClass::SdfRoughnessMod,       EVoxelStrateParamBlock::None },
+        { EVoxelStrateOpClass::SdfCarve,              EVoxelStrateParamBlock::None },
+        { EVoxelStrateOpClass::SdfFill,               EVoxelStrateParamBlock::None },
+        { EVoxelStrateOpClass::CaveRoughnessMod,     EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::WormFieldSource,      EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::GridColumnMod,        EVoxelStrateParamBlock::Slab },
+        { EVoxelStrateOpClass::DensityNoiseCarveMod, EVoxelStrateParamBlock::None },
+        { EVoxelStrateOpClass::DensityNoiseFillMod,  EVoxelStrateParamBlock::None },
+        { EVoxelStrateOpClass::CaveTerraceMod,       EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::LayerLineMod,         EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::RibbingMod,           EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::CaveOverhangMod,      EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::CaveCliffMod,         EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::ScallopMod,           EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::CaveArchMod,          EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::RoomColumnMod,        EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::DomeMod,              EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::PinchMod,             EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::FloorBiasMod,         EVoxelStrateParamBlock::TunnelNetwork },
+        { EVoxelStrateOpClass::ShaftLedgeMod,        EVoxelStrateParamBlock::VerticalShaft },
+    };
+
+    uint32 VF_StructureRollSeed(int32 Seed, int32 Index)
+    {
+        uint32 Value = VF_Avalanche(static_cast<uint32>(Seed) ^ 0xD1CEB00Bu);
+        Value = VF_Avalanche(Value ^ (static_cast<uint32>(Index) + 0x7F4A7C15u));
+        return Value;
+    }
+
+    bool VF_IsContractLegalAfter(EVoxelOpChannelMask AvailableChannels,
+                                 EVoxelOpResourceMask AvailableResources,
+                                 const FVoxelStrateOpContract& Contract)
+    {
+        if ((Contract.Reads & static_cast<EVoxelOpChannelMask>(~AvailableChannels)) != 0
+            || (Contract.RequiredResources
+                & static_cast<EVoxelOpResourceMask>(~AvailableResources)) != 0)
+        {
+            return false;
+        }
+        if (Contract.bAdditive
+            && (Contract.Writes == VoxelOpChannels::None
+                || (Contract.Writes & static_cast<EVoxelOpChannelMask>(~Contract.Reads)) != 0))
+        {
+            return false;
+        }
+        for (const EVoxelOpChannelMask Channel :
+             { VoxelOpChannels::Density, VoxelOpChannels::Sdf })
+        {
+            if ((Contract.Writes & Channel) == 0 || (Contract.Reads & Channel) != 0)
+            {
+                continue;
+            }
+            // All channels are already published by root + shape. A write-only candidate would
+            // therefore be a replacement clobber and is excluded before it can enter a recipe.
+            return false;
+        }
+        return true;
+    }
+
+    FVoxelOpRecipeEntry VF_MakeRecipeEntry(EVoxelStrateOpClass OpClass,
+                                            EVoxelStrateParamBlock ParamBlock)
+    {
+        FVoxelOpRecipeEntry Entry;
+        Entry.OpClass = OpClass;
+        Entry.ParamBlock = ParamBlock;
+        return Entry;
+    }
+
+    FVoxelOpStackRecipe VF_RollStructureInternal(int32 Seed, int32 Index)
+    {
+        FVoxelOpStackRecipe Recipe;
+        FRandomStream Rng(static_cast<int32>(VF_StructureRollSeed(Seed, Index)));
+
+        Recipe.RootPolarity = Rng.RandRange(0, 1) == 0
+            ? EVoxelStrateRootPolarity::RockCarve
+            : EVoxelStrateRootPolarity::VoidFill;
+
+        const EVoxelStrateOpClass ShapeClass = GStructureShapeSources[
+            Rng.RandRange(0, UE_ARRAY_COUNT(GStructureShapeSources) - 1)];
+        const EVoxelStrateParamBlock ShapeBlock =
+            ShapeClass == EVoxelStrateOpClass::RoomGraphSource
+                ? EVoxelStrateParamBlock::TunnelNetwork
+                : ShapeClass == EVoxelStrateOpClass::ShaftFieldSource
+                    ? EVoxelStrateParamBlock::VerticalShaft
+                    : ShapeClass == EVoxelStrateOpClass::IslandBlobSource
+                        ? EVoxelStrateParamBlock::FloatingIsland
+                        : EVoxelStrateParamBlock::Maze;
+
+        Recipe.Root = VF_MakeRecipeEntry(
+            Recipe.RootPolarity == EVoxelStrateRootPolarity::VoidFill
+                ? EVoxelStrateOpClass::ConstantVoidSource
+                : EVoxelStrateOpClass::ConstantRockSource,
+            ShapeBlock);
+        Recipe.ShapeSource = VF_MakeRecipeEntry(ShapeClass, ShapeBlock);
+        Recipe.Conversion = VF_MakeRecipeEntry(
+            Recipe.RootPolarity == EVoxelStrateRootPolarity::VoidFill
+                ? EVoxelStrateOpClass::SdfFill
+                : EVoxelStrateOpClass::SdfCarve,
+            ShapeBlock);
+        Recipe.StructuralParamBlock = ShapeBlock;
+
+        FVoxelStrateOpContract ShapeContract;
+        const bool bShapeDeclared = VoxelDensityOps::GetStrateOpContract(ShapeClass, ShapeContract);
+        checkf(bShapeDeclared, TEXT("Structure catalogue contains an undeclared shape source."));
+
+        const EVoxelOpChannelMask AvailableChannels = VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        const EVoxelOpResourceMask AvailableResources = ShapeContract.ProvidedResources;
+
+        TArray<FStructureModifierCandidate> Legal;
+        for (const FStructureModifierCandidate& Candidate : GStructureModifiers)
+        {
+            FVoxelStrateOpContract Contract;
+            if (!VoxelDensityOps::GetStrateOpContract(Candidate.OpClass, Contract))
+            {
+                checkf(false, TEXT("Structure catalogue contains an undeclared modifier."));
+                continue;
+            }
+            if (VF_IsContractLegalAfter(AvailableChannels, AvailableResources, Contract))
+            {
+                Legal.Add(Candidate);
+            }
+        }
+
+        const int32 K = Rng.RandRange(4, 8);
+        checkf(Legal.Num() >= K,
+               TEXT("Structure roller has fewer legal modifiers than its rolled k."));
+        for (int32 ModifierIndex = 0; ModifierIndex < K && Legal.Num() > 0; ++ModifierIndex)
+        {
+            const int32 Pick = Rng.RandRange(0, Legal.Num() - 1);
+            const FStructureModifierCandidate Candidate = Legal[Pick];
+            Recipe.Modifiers.Add(VF_MakeRecipeEntry(
+                Candidate.OpClass,
+                Candidate.ParamBlock == EVoxelStrateParamBlock::None
+                    ? ShapeBlock : Candidate.ParamBlock));
+            Legal.RemoveAt(Pick, 1, EAllowShrinking::No);
+        }
+        return Recipe;
     }
 }
 
@@ -1849,8 +2027,164 @@ FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpu
     return Result;
 }
 
+FVoxelStrateRollInfo VF_RollStrateParamsDetailedForArchetype(
+    const FVoxelStrateCorpus& Corpus, ECaveGeneratorType Archetype, int32 Seed, int32 Index)
+{
+    const FVoxelStrateRollInfo Result = VF_RollInternal(Corpus, Seed, Index, &Archetype);
+
+#if DO_CHECK
+    if (Result.bValid)
+    {
+        const FVoxelStrateRollInfo Repeat = VF_RollInternal(Corpus, Seed, Index, &Archetype);
+        checkf(Repeat.bValid && Repeat.Archetype == Result.Archetype
+                   && VF_AreStrateArchetypeParamsBitIdentical(
+                       Repeat.ArchetypeParams, Result.ArchetypeParams, Result.Archetype)
+                   && Repeat.ParentEntryIndices == Result.ParentEntryIndices
+                   && Repeat.ParentWeights == Result.ParentWeights,
+               TEXT("VF_RollStrateParamsDetailedForArchetype lost determinism."));
+    }
+#endif
+    return Result;
+}
+
 FStrateGenerationParams VF_RollStrateParams(const FVoxelStrateCorpus& Corpus,
                                              int32 Seed, int32 Index)
 {
     return VF_RollStrateParamsDetailed(Corpus, Seed, Index).Params;
+}
+
+namespace
+{
+    const TCHAR* VF_RecipeOpCode(EVoxelStrateOpClass OpClass)
+    {
+        switch (OpClass)
+        {
+        case EVoxelStrateOpClass::ConstantRockSource: return TEXT("rk");
+        case EVoxelStrateOpClass::ConstantVoidSource: return TEXT("vd");
+        case EVoxelStrateOpClass::RoomGraphSource: return TEXT("rg");
+        case EVoxelStrateOpClass::LatticeCorridorSource: return TEXT("lt");
+        case EVoxelStrateOpClass::ShaftFieldSource: return TEXT("sh");
+        case EVoxelStrateOpClass::IslandBlobSource: return TEXT("is");
+        case EVoxelStrateOpClass::NoiseRibbonSource: return TEXT("nr");
+        case EVoxelStrateOpClass::SdfRoughnessMod: return TEXT("sr");
+        case EVoxelStrateOpClass::SdfCarve: return TEXT("cv");
+        case EVoxelStrateOpClass::SdfFill: return TEXT("fl");
+        case EVoxelStrateOpClass::GridColumnMod: return TEXT("gc");
+        case EVoxelStrateOpClass::CaveRoughnessMod: return TEXT("cr");
+        case EVoxelStrateOpClass::CaveTerraceMod: return TEXT("tr");
+        case EVoxelStrateOpClass::LayerLineMod: return TEXT("ll");
+        case EVoxelStrateOpClass::RibbingMod: return TEXT("rb");
+        case EVoxelStrateOpClass::CaveOverhangMod: return TEXT("co");
+        case EVoxelStrateOpClass::CaveCliffMod: return TEXT("cc");
+        case EVoxelStrateOpClass::ScallopMod: return TEXT("sc");
+        case EVoxelStrateOpClass::CaveArchMod: return TEXT("ar");
+        case EVoxelStrateOpClass::RoomColumnMod: return TEXT("rc");
+        case EVoxelStrateOpClass::DomeMod: return TEXT("dm");
+        case EVoxelStrateOpClass::PinchMod: return TEXT("pn");
+        case EVoxelStrateOpClass::FloorBiasMod: return TEXT("fb");
+        case EVoxelStrateOpClass::WormFieldSource: return TEXT("wm");
+        case EVoxelStrateOpClass::ShaftLedgeMod: return TEXT("sl");
+        case EVoxelStrateOpClass::DensityNoiseCarveMod: return TEXT("nc");
+        case EVoxelStrateOpClass::DensityNoiseFillMod: return TEXT("nf");
+        default: return TEXT("??");
+        }
+    }
+
+    const TCHAR* VF_RecipeBlockCode(EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return TEXT("T");
+        case EVoxelStrateParamBlock::Slab: return TEXT("B");
+        case EVoxelStrateParamBlock::Maze: return TEXT("M");
+        case EVoxelStrateParamBlock::Surface: return TEXT("S");
+        case EVoxelStrateParamBlock::VerticalShaft: return TEXT("V");
+        case EVoxelStrateParamBlock::FloatingIsland: return TEXT("I");
+        default: return TEXT("-");
+        }
+    }
+
+    FString VF_FormatRecipeEntry(const FVoxelOpRecipeEntry& Entry)
+    {
+        return FString::Printf(TEXT("%s/%s"), VF_RecipeOpCode(Entry.OpClass),
+                               VF_RecipeBlockCode(Entry.ParamBlock));
+    }
+}
+
+FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index)
+{
+    const FVoxelOpStackRecipe Recipe = VF_RollStructureInternal(Seed, Index);
+
+#if DO_CHECK
+    const FVoxelOpStackRecipe Repeat = VF_RollStructureInternal(Seed, Index);
+    checkf(VF_AreStrateStructureRecipesIdentical(Recipe, Repeat),
+           TEXT("VF_RollStrateStructure lost determinism for the same seed/index."));
+#endif
+    return Recipe;
+}
+
+FString VF_FormatStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe)
+{
+    FString Modifiers;
+    for (int32 Index = 0; Index < Recipe.Modifiers.Num(); ++Index)
+    {
+        if (Index > 0) { Modifiers += TEXT(","); }
+        Modifiers += VF_FormatRecipeEntry(Recipe.Modifiers[Index]);
+    }
+    return FString::Printf(TEXT("%s|r=%s|s=%s|x=%s|m=[%s]|posts=%s"),
+                           Recipe.RootPolarity == EVoxelStrateRootPolarity::VoidFill ? TEXT("VF") : TEXT("RC"),
+                           *VF_FormatRecipeEntry(Recipe.Root),
+                           *VF_FormatRecipeEntry(Recipe.ShapeSource),
+                           *VF_FormatRecipeEntry(Recipe.Conversion),
+                           *Modifiers,
+                           VF_RecipeBlockCode(Recipe.StructuralParamBlock));
+}
+
+uint32 VF_HashStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe)
+{
+    uint32 Hash = 2166136261u;
+    auto AddByte = [&Hash](uint8 Value)
+    {
+        Hash ^= static_cast<uint32>(Value);
+        Hash *= 16777619u;
+    };
+    auto AddEntry = [&AddByte](const FVoxelOpRecipeEntry& Entry)
+    {
+        AddByte(static_cast<uint8>(Entry.OpClass));
+        AddByte(static_cast<uint8>(Entry.ParamBlock));
+    };
+
+    AddByte(static_cast<uint8>(Recipe.RootPolarity));
+    AddEntry(Recipe.Root);
+    AddEntry(Recipe.ShapeSource);
+    AddEntry(Recipe.Conversion);
+    AddByte(static_cast<uint8>(Recipe.Modifiers.Num()));
+    for (const FVoxelOpRecipeEntry& Entry : Recipe.Modifiers) { AddEntry(Entry); }
+    AddByte(static_cast<uint8>(Recipe.StructuralParamBlock));
+    return Hash;
+}
+
+bool VF_AreStrateStructureRecipesIdentical(const FVoxelOpStackRecipe& A,
+                                           const FVoxelOpStackRecipe& B)
+{
+    if (A.RootPolarity != B.RootPolarity
+        || A.Root.OpClass != B.Root.OpClass || A.Root.ParamBlock != B.Root.ParamBlock
+        || A.ShapeSource.OpClass != B.ShapeSource.OpClass
+        || A.ShapeSource.ParamBlock != B.ShapeSource.ParamBlock
+        || A.Conversion.OpClass != B.Conversion.OpClass
+        || A.Conversion.ParamBlock != B.Conversion.ParamBlock
+        || A.StructuralParamBlock != B.StructuralParamBlock
+        || A.Modifiers.Num() != B.Modifiers.Num())
+    {
+        return false;
+    }
+    for (int32 Index = 0; Index < A.Modifiers.Num(); ++Index)
+    {
+        if (A.Modifiers[Index].OpClass != B.Modifiers[Index].OpClass
+            || A.Modifiers[Index].ParamBlock != B.Modifiers[Index].ParamBlock)
+        {
+            return false;
+        }
+    }
+    return true;
 }

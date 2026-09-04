@@ -19,6 +19,7 @@
 // decomposition is right" into a proof.
 
 #include "VoxelDensityOpStack.h"
+#include "VoxelStrateComposer.h"
 
 #include "VoxelDensityPrimitives.h"   // VF_ApplyOriginSpine / seals / PassageCarving
 #include "VoxelCaveMorphology.h"      // VoxelSDF::Capsule, VoxelHash
@@ -294,6 +295,130 @@ namespace
 
     private:
         float Value;
+    };
+
+    //=======================================================================
+    // TIER 4b — GENERIC ROLLED SOURCE/MODIFIER PRIMITIVES
+    //=======================================================================
+    // These two small primitives keep the non-room channel space large enough for the promised
+    // k=4..8 draw.  They are deliberately bounded: their box contracts are amplitude proofs, not
+    // guesses.  They do not carry any room/shaft/surface pointer, so the resource graph correctly
+    // treats them as legal after every SDF shape source.
+    class FNoiseRibbonSource final : public IVoxelDensityOp
+    {
+    public:
+        FNoiseRibbonSource(const FMazeGenerationParams& InP, int32 InSeed)
+            : CellSize(FMath::Max(InP.CellSize, 8.0f))
+            , CorridorRadius(FMath::Max(InP.CorridorRadius, 0.5f))
+            , SeedU(static_cast<uint32>(InSeed) ^ 0x5249626Eu) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            const float Frequency = 1.0f / CellSize;
+            const FVector NoisePos(
+                WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 3.17f),
+                WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 7.31f),
+                WorldZ * Frequency + VoxelHash::SeedOffset(SeedU, 11.47f));
+            const float Ribbon = FMath::Clamp(
+                FMath::Abs(VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                                           VoxelGenLOD::Eff(3), 2.0f, 0.5f))
+                    * VOXEL_NOISE_SCALE,
+                0.0f, 2.0f);
+            InOut.Sdf = Ribbon * CellSize - CorridorRadius;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return EVoxelOpEffect::Identity;
+        }
+
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox&,
+                                 const FVoxelOpContext&) const override
+        {
+            if (!FMath::IsFinite(CellSize) || !FMath::IsFinite(CorridorRadius)
+                || CellSize <= 0.0f || CorridorRadius < 0.0f)
+            {
+                InOut.SetUnknown();
+                return;
+            }
+            // Eval clamps the FBM envelope to [0,2].  This interval is exact enough for safety
+            // and independent of the queried box, so it never claims a false empty region.
+            InOut.Set(-CorridorRadius, 2.0f * CellSize - CorridorRadius);
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("NoiseRibbonSource"); }
+
+    private:
+        float CellSize;
+        float CorridorRadius;
+        uint32 SeedU;
+    };
+
+    class FDensityNoiseMod final : public IVoxelDensityOp
+    {
+    public:
+        FDensityNoiseMod(float InStrength, float InFrequency, int32 InOctaves,
+                         int32 InSeed, bool bInFill)
+            : Strength(FMath::Max(InStrength, 0.0f))
+            , Frequency(FMath::Max(InFrequency, 0.0001f))
+            , Octaves(FMath::Clamp(InOctaves, 1, 8))
+            , SeedU(static_cast<uint32>(InSeed) ^ (bInFill ? 0x46696C6Cu : 0x43617276u))
+            , bFill(bInFill) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
+        {
+            if (!(Strength > 0.0f)) { return; }
+            const FVector NoisePos(
+                WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 13.2f),
+                WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 17.8f),
+                WorldZ * Frequency + VoxelHash::SeedOffset(SeedU, 23.4f));
+            const float Noise01 = FMath::Clamp(
+                VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                                VoxelGenLOD::Eff(Octaves), 2.0f, 0.5f) * 0.5f + 0.5f,
+                0.0f, 1.0f);
+            const float Delta = Strength * Noise01;
+            InOut.Density += bFill ? Delta : -Delta;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            if (!(Strength > 0.0f)) { return EVoxelOpEffect::Identity; }
+            return bFill ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::CarveOnly;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return bFill ? 0.0f : Strength;
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return bFill ? Strength : 0.0f;
+        }
+
+        const TCHAR* DebugName() const override
+        {
+            return bFill ? TEXT("DensityNoiseFillMod") : TEXT("DensityNoiseCarveMod");
+        }
+
+    private:
+        float Strength;
+        float Frequency;
+        int32 Octaves;
+        uint32 SeedU;
+        bool bFill;
     };
 
     //=========================================================================
@@ -950,6 +1075,7 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask ProvidedResources() const override { return VoxelOpResources::SurfaceColumn; }
         bool IsAdditive() const override { return false; }
         bool IsXYPure() const override { return false; }   // voir le bloc ci-dessus
 
@@ -1081,6 +1207,7 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::SurfaceColumn; }
         bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
         bool IsXYPure() const override { return false; }   // franchement non : voir `Frac`
@@ -1771,6 +1898,7 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        EVoxelOpResourceMask ProvidedResources() const override { return VoxelOpResources::ShaftGeometry; }
         bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -2194,6 +2322,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::ShaftGeometry; }
         bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -2577,6 +2706,7 @@ namespace
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        EVoxelOpResourceMask ProvidedResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return false; }
 
         void PrepareChunk(const FVoxelOpContext& Ctx) override
@@ -3606,6 +3736,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -3715,6 +3846,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -3803,6 +3935,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -3886,6 +4019,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -3986,6 +4120,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4060,6 +4195,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4151,6 +4287,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4267,6 +4404,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4330,6 +4468,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4437,6 +4576,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4556,6 +4696,7 @@ namespace
             return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
         }
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
@@ -4794,6 +4935,23 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
         return Result.IsEmpty() ? TEXT("none") : Result;
     };
 
+    auto DescribeResourceMask = [](EVoxelOpResourceMask Mask) -> FString
+    {
+        FString Result;
+        if ((Mask & VoxelOpResources::RoomGeometry) != 0) { Result += TEXT("RoomGeometry"); }
+        if ((Mask & VoxelOpResources::ShaftGeometry) != 0)
+        {
+            if (!Result.IsEmpty()) { Result += TEXT(", "); }
+            Result += TEXT("ShaftGeometry");
+        }
+        if ((Mask & VoxelOpResources::SurfaceColumn) != 0)
+        {
+            if (!Result.IsEmpty()) { Result += TEXT(", "); }
+            Result += TEXT("SurfaceColumn");
+        }
+        return Result.IsEmpty() ? TEXT("none") : Result;
+    };
+
     auto Fail = [&](int32 Index, const FOpEntry* Entry, const TCHAR* Rule) -> bool
     {
         if (OutError != nullptr)
@@ -4803,8 +4961,10 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
             const EVoxelOpChannelMask Reads = Entry != nullptr ? Entry->Reads : VoxelOpChannels::None;
             const EVoxelOpChannelMask Writes = Entry != nullptr ? Entry->Writes : VoxelOpChannels::None;
             *OutError = FString::Printf(
-                TEXT("op %d (%s) violates channel DAG: %s; reads=[%s], writes=[%s]"),
-                Index, Name, Rule, *DescribeMask(Reads), *DescribeMask(Writes));
+                TEXT("op %d (%s) violates stack DAG: %s; reads=[%s], writes=[%s], requires=[%s], provides=[%s]"),
+                Index, Name, Rule, *DescribeMask(Reads), *DescribeMask(Writes),
+                *DescribeResourceMask(Entry != nullptr ? Entry->RequiredResources : VoxelOpResources::None),
+                *DescribeResourceMask(Entry != nullptr ? Entry->ProvidedResources : VoxelOpResources::None));
         }
         return false;
     };
@@ -4812,6 +4972,7 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
     // The two array slots are deliberately explicit: FVoxelOpSample has exactly two fields, and
     // adding a third field requires extending EVoxelOpChannel and this validator together.
     int32 LastWriter[2] = { INDEX_NONE, INDEX_NONE };
+    EVoxelOpResourceMask AvailableResources = VoxelOpResources::None;
 
     auto ChannelIndex = [](EVoxelOpChannelMask Channel) -> int32
     {
@@ -4822,6 +4983,21 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
     {
         const FOpEntry& Entry = Ops[Index];
         if (Entry.Op.Get() == nullptr) { return Fail(Index, &Entry, TEXT("null operator")); }
+
+        if ((Entry.RequiredResources & VoxelOpResources::All) != Entry.RequiredResources)
+        {
+            return Fail(Index, &Entry, TEXT("requires an unknown op resource"));
+        }
+        if ((Entry.ProvidedResources & VoxelOpResources::All) != Entry.ProvidedResources)
+        {
+            return Fail(Index, &Entry, TEXT("provides an unknown op resource"));
+        }
+        if ((Entry.RequiredResources
+             & static_cast<EVoxelOpResourceMask>(~AvailableResources)) != 0)
+        {
+            return Fail(Index, &Entry,
+                        TEXT("requires op state before an earlier provider published it"));
+        }
 
         if ((Entry.Reads & VoxelOpChannels::All) != Entry.Reads)
         {
@@ -4883,6 +5059,8 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
                 LastWriter[ChannelIndex(Channel)] = Index;
             }
         }
+
+        AvailableResources |= Entry.ProvidedResources;
     }
 
     return true;
@@ -4909,6 +5087,117 @@ void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBott
 
 namespace VoxelDensityOps
 {
+    bool GetStrateOpContract(EVoxelStrateOpClass OpClass, FVoxelStrateOpContract& OutContract)
+    {
+        const FStrateGenerationParams TunnelParams;
+        const FSlabGenerationParams SlabParams;
+        const FMazeGenerationParams MazeParams;
+        const FSurfaceGenerationParams SurfaceParams;
+        const FVerticalShaftParams ShaftParams;
+        const FFloatingIslandParams IslandParams;
+
+        TUniquePtr<IVoxelDensityOp> Probe;
+        switch (OpClass)
+        {
+        case EVoxelStrateOpClass::ConstantRockSource:
+            Probe = MakeConstantRockSource(TunnelParams.BaseDensity);
+            break;
+        case EVoxelStrateOpClass::ConstantVoidSource:
+            Probe = MakeConstantVoidSource(IslandParams.BaseDensity);
+            break;
+        case EVoxelStrateOpClass::RoomGraphSource:
+            Probe = MakeUnique<FRoomGraphSource>(TunnelParams, 0, nullptr);
+            break;
+        case EVoxelStrateOpClass::LatticeCorridorSource:
+            Probe = MakeUnique<FLatticeCorridorSource>(MazeParams, 0);
+            break;
+        case EVoxelStrateOpClass::ShaftFieldSource:
+            Probe = MakeUnique<FShaftFieldSource>(ShaftParams, 0, 14.0f);
+            break;
+        case EVoxelStrateOpClass::IslandBlobSource:
+            Probe = MakeUnique<FIslandBlobSource>(IslandParams, 0);
+            break;
+        case EVoxelStrateOpClass::NoiseRibbonSource:
+            Probe = MakeUnique<FNoiseRibbonSource>(MazeParams, 0);
+            break;
+        case EVoxelStrateOpClass::SdfRoughnessMod:
+            Probe = MakeSdfRoughnessMod(MazeParams.SurfaceRoughness, 0.12f, 3, 8.0f);
+            break;
+        case EVoxelStrateOpClass::SdfCarve:
+            Probe = MakeSdfCarve(2.0f, TunnelParams.BaseDensity);
+            break;
+        case EVoxelStrateOpClass::SdfFill:
+            Probe = MakeSdfFill(2.0f, IslandParams.BaseDensity);
+            break;
+        case EVoxelStrateOpClass::GridColumnMod:
+            Probe = MakeUnique<FGridColumnMod>(SlabParams, 0);
+            break;
+        case EVoxelStrateOpClass::CaveRoughnessMod:
+            Probe = MakeUnique<FCaveRoughnessMod>(TunnelParams, 0);
+            break;
+        case EVoxelStrateOpClass::CaveTerraceMod:
+            Probe = MakeUnique<FCaveTerraceMod>(TunnelParams, 0, nullptr);
+            break;
+        case EVoxelStrateOpClass::LayerLineMod:
+            Probe = MakeUnique<FLayerLineMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::RibbingMod:
+            Probe = MakeUnique<FRibbingMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::CaveOverhangMod:
+            Probe = MakeUnique<FCaveOverhangMod>(TunnelParams, 0, nullptr);
+            break;
+        case EVoxelStrateOpClass::CaveCliffMod:
+            Probe = MakeUnique<FCaveCliffMod>(TunnelParams, 0, nullptr);
+            break;
+        case EVoxelStrateOpClass::ScallopMod:
+            Probe = MakeUnique<FScallopMod>(TunnelParams, 0, nullptr);
+            break;
+        case EVoxelStrateOpClass::CaveArchMod:
+            Probe = MakeUnique<FCaveArchMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::RoomColumnMod:
+            Probe = MakeUnique<FRoomColumnMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::DomeMod:
+            Probe = MakeUnique<FDomeMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::PinchMod:
+            Probe = MakeUnique<FPinchMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::FloorBiasMod:
+            Probe = MakeUnique<FFloorBiasMod>(TunnelParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::WormFieldSource:
+            Probe = MakeUnique<FWormFieldSource>(TunnelParams, 0);
+            break;
+        case EVoxelStrateOpClass::ShaftLedgeMod:
+            Probe = MakeUnique<FShaftLedgeMod>(ShaftParams, nullptr);
+            break;
+        case EVoxelStrateOpClass::DensityNoiseCarveMod:
+            Probe = MakeUnique<FDensityNoiseMod>(1.0f, 0.02f, 3, 0, false);
+            break;
+        case EVoxelStrateOpClass::DensityNoiseFillMod:
+            Probe = MakeUnique<FDensityNoiseMod>(1.0f, 0.02f, 3, 0, true);
+            break;
+        default:
+            return false;
+        }
+
+        if (!Probe)
+        {
+            return false;
+        }
+
+        OutContract.Role = Probe->GetRole();
+        OutContract.Reads = Probe->ChannelReads();
+        OutContract.Writes = Probe->ChannelWrites();
+        OutContract.bAdditive = Probe->IsAdditive();
+        OutContract.RequiredResources = Probe->RequiredResources();
+        OutContract.ProvidedResources = Probe->ProvidedResources();
+        return true;
+    }
+
     TUniquePtr<IVoxelDensityOp> MakeConstantRockSource(float BaseDensity)
     {
         return MakeUnique<FConstantFieldSource>(BaseDensity);
@@ -5148,4 +5437,550 @@ namespace VoxelDensityOps
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
     }
+}
+
+namespace VoxelStrateRecipePrivate
+{
+    const FStrateGenerationParams* Tunnel(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.TunnelNetworkParams;
+    }
+
+    const FSlabGenerationParams* Slab(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.SlabParams;
+    }
+
+    const FMazeGenerationParams* Maze(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.MazeParams;
+    }
+
+    const FSurfaceGenerationParams* Surface(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.SurfaceParams;
+    }
+
+    const FVerticalShaftParams* Shaft(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.VerticalShaftParams;
+    }
+
+    const FFloatingIslandParams* Island(const FVoxelStrateArchetypeParams& Params)
+    {
+        return &Params.FloatingIslandParams;
+    }
+
+    float BaseDensity(const FVoxelStrateArchetypeParams& Params, EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Tunnel(Params)->BaseDensity;
+        case EVoxelStrateParamBlock::Slab:          return Slab(Params)->BaseDensity;
+        case EVoxelStrateParamBlock::Maze:          return Maze(Params)->BaseDensity;
+        case EVoxelStrateParamBlock::Surface:       return Surface(Params)->BaseDensity;
+        case EVoxelStrateParamBlock::VerticalShaft: return Shaft(Params)->BaseDensity;
+        case EVoxelStrateParamBlock::FloatingIsland: return Island(Params)->BaseDensity;
+        default:                                    return 8.0f;
+        }
+    }
+
+    float BoundarySeal(const FVoxelStrateArchetypeParams& Params, EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Tunnel(Params)->BoundarySealThickness;
+        case EVoxelStrateParamBlock::Slab:          return Slab(Params)->BoundarySealThickness;
+        case EVoxelStrateParamBlock::Maze:          return Maze(Params)->BoundarySealThickness;
+        case EVoxelStrateParamBlock::Surface:       return Surface(Params)->BoundarySealThickness;
+        case EVoxelStrateParamBlock::VerticalShaft: return Shaft(Params)->BoundarySealThickness;
+        case EVoxelStrateParamBlock::FloatingIsland: return Island(Params)->BoundarySealThickness;
+        default:                                    return 4.0f;
+        }
+    }
+
+    float Top(const FVoxelStrateArchetypeParams& Params, EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Tunnel(Params)->StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Slab:          return Slab(Params)->StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Maze:          return Maze(Params)->StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Surface:       return Surface(Params)->StrateTopWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft: return Shaft(Params)->StrateTopWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Island(Params)->StrateTopWorldZ;
+        default:                                    return 0.0f;
+        }
+    }
+
+    float Bottom(const FVoxelStrateArchetypeParams& Params, EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Tunnel(Params)->StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Slab:          return Slab(Params)->StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Maze:          return Maze(Params)->StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Surface:       return Surface(Params)->StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft: return Shaft(Params)->StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Island(Params)->StrateBottomWorldZ;
+        default:                                    return 0.0f;
+        }
+    }
+
+    EVoxelStrateParamBlock ShapeBlock(EVoxelStrateOpClass OpClass)
+    {
+        switch (OpClass)
+        {
+        case EVoxelStrateOpClass::RoomGraphSource:     return EVoxelStrateParamBlock::TunnelNetwork;
+        case EVoxelStrateOpClass::LatticeCorridorSource:
+        case EVoxelStrateOpClass::NoiseRibbonSource:   return EVoxelStrateParamBlock::Maze;
+        case EVoxelStrateOpClass::ShaftFieldSource:    return EVoxelStrateParamBlock::VerticalShaft;
+        case EVoxelStrateOpClass::IslandBlobSource:    return EVoxelStrateParamBlock::FloatingIsland;
+        default:                                       return EVoxelStrateParamBlock::None;
+        }
+    }
+
+    EVoxelStrateParamBlock FixedParamBlock(EVoxelStrateOpClass OpClass)
+    {
+        switch (OpClass)
+        {
+        case EVoxelStrateOpClass::GridColumnMod:
+            return EVoxelStrateParamBlock::Slab;
+        case EVoxelStrateOpClass::CaveRoughnessMod:
+        case EVoxelStrateOpClass::CaveTerraceMod:
+        case EVoxelStrateOpClass::LayerLineMod:
+        case EVoxelStrateOpClass::RibbingMod:
+        case EVoxelStrateOpClass::CaveOverhangMod:
+        case EVoxelStrateOpClass::CaveCliffMod:
+        case EVoxelStrateOpClass::ScallopMod:
+        case EVoxelStrateOpClass::CaveArchMod:
+        case EVoxelStrateOpClass::RoomColumnMod:
+        case EVoxelStrateOpClass::DomeMod:
+        case EVoxelStrateOpClass::PinchMod:
+        case EVoxelStrateOpClass::FloorBiasMod:
+        case EVoxelStrateOpClass::WormFieldSource:
+            return EVoxelStrateParamBlock::TunnelNetwork;
+        case EVoxelStrateOpClass::ShaftLedgeMod:
+            return EVoxelStrateParamBlock::VerticalShaft;
+        default:
+            return EVoxelStrateParamBlock::None;
+        }
+    }
+
+    float SdfBlend(const FVoxelStrateArchetypeParams& Params, EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork:
+            return Params.TunnelNetworkParams.SDFBlendRadius;
+        case EVoxelStrateParamBlock::Maze:
+            return 2.0f;
+        case EVoxelStrateParamBlock::VerticalShaft:
+            return 2.0f;
+        case EVoxelStrateParamBlock::FloatingIsland:
+            return FMath::Max(Params.FloatingIslandParams.SDFBlendRadius, 0.01f);
+        default:
+            return 2.0f;
+        }
+    }
+
+    float SdfRoughnessStrength(const FVoxelStrateArchetypeParams& Params,
+                               EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Params.TunnelNetworkParams.SurfaceRoughness;
+        case EVoxelStrateParamBlock::Maze:          return Params.MazeParams.SurfaceRoughness;
+        case EVoxelStrateParamBlock::VerticalShaft: return Params.VerticalShaftParams.SurfaceRoughness;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.SurfaceRoughness;
+        default:                                    return 2.0f;
+        }
+    }
+
+    float SdfRoughnessFrequency(const FVoxelStrateArchetypeParams& Params,
+                                EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return Params.TunnelNetworkParams.RoughnessFrequency;
+        case EVoxelStrateParamBlock::Maze:          return 0.12f;
+        case EVoxelStrateParamBlock::VerticalShaft: return 0.1f;
+        case EVoxelStrateParamBlock::FloatingIsland: return 0.08f;
+        default:                                    return 0.1f;
+        }
+    }
+
+    int32 SdfRoughnessOctaves(EVoxelStrateParamBlock Block)
+    {
+        return Block == EVoxelStrateParamBlock::FloatingIsland ? 4 : 3;
+    }
+
+    float SdfRoughnessWindow(const FVoxelStrateArchetypeParams& Params,
+                             EVoxelStrateParamBlock Block)
+    {
+        const float Strength = SdfRoughnessStrength(Params, Block);
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork:
+            return Params.TunnelNetworkParams.SDFBlendRadius * 3.0f + Strength + 2.0f;
+        case EVoxelStrateParamBlock::Maze:
+            return FMath::Max(Params.MazeParams.CorridorRadius, 0.5f) + Strength + 2.0f;
+        case EVoxelStrateParamBlock::VerticalShaft:
+            return Strength + 4.0f;
+        case EVoxelStrateParamBlock::FloatingIsland:
+            return Strength + SdfBlend(Params, Block) + 2.0f;
+        default:
+            return Strength + 4.0f;
+        }
+    }
+
+    float GenericStrength(const FVoxelStrateArchetypeParams& Params,
+                           EVoxelStrateParamBlock Block)
+    {
+        return FMath::Max(0.25f, 0.35f * FMath::Abs(BaseDensity(Params, Block)));
+    }
+
+    float GenericFrequency(const FVoxelStrateArchetypeParams& Params,
+                           EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Maze:
+            return 1.0f / FMath::Max(Params.MazeParams.CellSize, 8.0f);
+        case EVoxelStrateParamBlock::VerticalShaft:
+            return 0.01f;
+        case EVoxelStrateParamBlock::FloatingIsland:
+            return 0.02f;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+            return FMath::Max(Params.TunnelNetworkParams.RoughnessFrequency, 0.001f);
+        default:
+            return 0.02f;
+        }
+    }
+
+    bool IsShapeSource(EVoxelStrateOpClass OpClass)
+    {
+        switch (OpClass)
+        {
+        case EVoxelStrateOpClass::RoomGraphSource:
+        case EVoxelStrateOpClass::LatticeCorridorSource:
+        case EVoxelStrateOpClass::ShaftFieldSource:
+        case EVoxelStrateOpClass::IslandBlobSource:
+        case EVoxelStrateOpClass::NoiseRibbonSource:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool ValidateRecipeContracts(const FVoxelOpStackRecipe& Recipe, FString& OutError)
+    {
+        TArray<EVoxelStrateOpClass> Classes;
+        Classes.Reserve(3 + Recipe.Modifiers.Num());
+        Classes.Add(Recipe.Root.OpClass);
+        Classes.Add(Recipe.ShapeSource.OpClass);
+        Classes.Add(Recipe.Conversion.OpClass);
+        for (const FVoxelOpRecipeEntry& Entry : Recipe.Modifiers)
+        {
+            Classes.Add(Entry.OpClass);
+        }
+
+        auto ValidateParamBlock = [&](const FVoxelOpRecipeEntry& Entry, int32 EntryIndex)
+        {
+            if (Entry.ParamBlock == EVoxelStrateParamBlock::None)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d has no parameter block"), EntryIndex);
+                return false;
+            }
+            const EVoxelStrateParamBlock Fixed = FixedParamBlock(Entry.OpClass);
+            if (Fixed != EVoxelStrateParamBlock::None && Entry.ParamBlock != Fixed)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d uses the wrong parameter block"), EntryIndex);
+                return false;
+            }
+            return true;
+        };
+        if (!ValidateParamBlock(Recipe.Root, 0)
+            || !ValidateParamBlock(Recipe.ShapeSource, 1)
+            || !ValidateParamBlock(Recipe.Conversion, 2))
+        {
+            return false;
+        }
+        for (int32 ModifierIndex = 0; ModifierIndex < Recipe.Modifiers.Num(); ++ModifierIndex)
+        {
+            if (!ValidateParamBlock(Recipe.Modifiers[ModifierIndex], 3 + ModifierIndex))
+            {
+                return false;
+            }
+        }
+
+        int32 LastWriter[2] = { INDEX_NONE, INDEX_NONE };
+        EVoxelOpResourceMask AvailableResources = VoxelOpResources::None;
+        const EVoxelOpChannelMask Channels[] = { VoxelOpChannels::Density, VoxelOpChannels::Sdf };
+        auto ChannelIndex = [](EVoxelOpChannelMask Channel) { return Channel == VoxelOpChannels::Density ? 0 : 1; };
+
+        for (int32 Index = 0; Index < Classes.Num(); ++Index)
+        {
+            FVoxelStrateOpContract Contract;
+            if (!VoxelDensityOps::GetStrateOpContract(Classes[Index], Contract))
+            {
+                OutError = FString::Printf(TEXT("recipe op %d has no declaration"), Index);
+                return false;
+            }
+            if ((Contract.Reads & VoxelOpChannels::All) != Contract.Reads
+                || (Contract.Writes & VoxelOpChannels::All) != Contract.Writes
+                || (Contract.RequiredResources & VoxelOpResources::All) != Contract.RequiredResources
+                || (Contract.ProvidedResources & VoxelOpResources::All) != Contract.ProvidedResources)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d has an unknown declaration bit"), Index);
+                return false;
+            }
+            if ((Contract.RequiredResources
+                 & static_cast<EVoxelOpResourceMask>(~AvailableResources)) != 0)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d requires unavailable state"), Index);
+                return false;
+            }
+            if (Contract.bAdditive && Contract.Writes == VoxelOpChannels::None)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d is additive but writes no channel"), Index);
+                return false;
+            }
+            if (Contract.bAdditive
+                && (Contract.Writes & static_cast<EVoxelOpChannelMask>(~Contract.Reads)) != 0)
+            {
+                OutError = FString::Printf(TEXT("recipe op %d is additive without reading its writes"), Index);
+                return false;
+            }
+            for (const EVoxelOpChannelMask Channel : Channels)
+            {
+                if ((Contract.Reads & Channel) == 0) { continue; }
+                const int32 CI = ChannelIndex(Channel);
+                const bool bRootIdentity = Contract.Role == EVoxelOpRole::FieldSource
+                    && (Contract.Writes & Channel) != 0 && LastWriter[CI] == INDEX_NONE;
+                if (LastWriter[CI] == INDEX_NONE && !bRootIdentity)
+                {
+                    OutError = FString::Printf(TEXT("recipe op %d reads an unpublished channel"), Index);
+                    return false;
+                }
+            }
+            for (const EVoxelOpChannelMask Channel : Channels)
+            {
+                if ((Contract.Writes & Channel) == 0 || (Contract.Reads & Channel) != 0) { continue; }
+                if (LastWriter[ChannelIndex(Channel)] != INDEX_NONE)
+                {
+                    OutError = FString::Printf(TEXT("recipe op %d clobbers a channel"), Index);
+                    return false;
+                }
+            }
+            for (const EVoxelOpChannelMask Channel : Channels)
+            {
+                if ((Contract.Writes & Channel) != 0)
+                {
+                    LastWriter[ChannelIndex(Channel)] = Index;
+                }
+            }
+            AvailableResources |= Contract.ProvidedResources;
+        }
+        return true;
+    }
+
+    TUniquePtr<IVoxelDensityOp> BuildRecipeOp(const FVoxelOpRecipeEntry& Entry,
+                                              const FVoxelStrateArchetypeParams& Params,
+                                              int32 Seed,
+                                              float SpineRadius,
+                                              const UVoxelStrateManager* StrateManager,
+                                              const FRoomGraphSource*& OutRoom,
+                                              const FShaftFieldSource*& OutShaft)
+    {
+        const EVoxelStrateParamBlock Block = Entry.ParamBlock;
+        switch (Entry.OpClass)
+        {
+        case EVoxelStrateOpClass::ConstantRockSource:
+            return VoxelDensityOps::MakeConstantRockSource(BaseDensity(Params, Block));
+        case EVoxelStrateOpClass::ConstantVoidSource:
+            return VoxelDensityOps::MakeConstantVoidSource(BaseDensity(Params, Block));
+        case EVoxelStrateOpClass::RoomGraphSource:
+        {
+            TUniquePtr<FRoomGraphSource> Op = MakeUnique<FRoomGraphSource>(*Tunnel(Params), Seed, StrateManager);
+            OutRoom = Op.Get();
+            return Op;
+        }
+        case EVoxelStrateOpClass::LatticeCorridorSource:
+            return MakeUnique<FLatticeCorridorSource>(*Maze(Params), Seed);
+        case EVoxelStrateOpClass::ShaftFieldSource:
+        {
+            TUniquePtr<FShaftFieldSource> Op = MakeUnique<FShaftFieldSource>(*Shaft(Params), Seed, SpineRadius);
+            OutShaft = Op.Get();
+            return Op;
+        }
+        case EVoxelStrateOpClass::IslandBlobSource:
+            return MakeUnique<FIslandBlobSource>(*Island(Params), Seed);
+        case EVoxelStrateOpClass::NoiseRibbonSource:
+            return MakeUnique<FNoiseRibbonSource>(*Maze(Params), Seed);
+        case EVoxelStrateOpClass::SdfRoughnessMod:
+            return VoxelDensityOps::MakeSdfRoughnessMod(
+                SdfRoughnessStrength(Params, Block),
+                SdfRoughnessFrequency(Params, Block),
+                SdfRoughnessOctaves(Block),
+                SdfRoughnessWindow(Params, Block));
+        case EVoxelStrateOpClass::SdfCarve:
+            return VoxelDensityOps::MakeSdfCarve(SdfBlend(Params, Block), BaseDensity(Params, Block));
+        case EVoxelStrateOpClass::SdfFill:
+            return VoxelDensityOps::MakeSdfFill(SdfBlend(Params, Block), BaseDensity(Params, Block));
+        case EVoxelStrateOpClass::GridColumnMod:
+            return MakeUnique<FGridColumnMod>(*Slab(Params), Seed);
+        case EVoxelStrateOpClass::CaveRoughnessMod:
+            return MakeUnique<FCaveRoughnessMod>(*Tunnel(Params), Seed);
+        case EVoxelStrateOpClass::CaveTerraceMod:
+            return MakeUnique<FCaveTerraceMod>(*Tunnel(Params), Seed, OutRoom);
+        case EVoxelStrateOpClass::LayerLineMod:
+            return MakeUnique<FLayerLineMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::RibbingMod:
+            return MakeUnique<FRibbingMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::CaveOverhangMod:
+            return MakeUnique<FCaveOverhangMod>(*Tunnel(Params), Seed, OutRoom);
+        case EVoxelStrateOpClass::CaveCliffMod:
+            return MakeUnique<FCaveCliffMod>(*Tunnel(Params), Seed, OutRoom);
+        case EVoxelStrateOpClass::ScallopMod:
+            return MakeUnique<FScallopMod>(*Tunnel(Params), Seed, OutRoom);
+        case EVoxelStrateOpClass::CaveArchMod:
+            return MakeUnique<FCaveArchMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::RoomColumnMod:
+            return MakeUnique<FRoomColumnMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::DomeMod:
+            return MakeUnique<FDomeMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::PinchMod:
+            return MakeUnique<FPinchMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::FloorBiasMod:
+            return MakeUnique<FFloorBiasMod>(*Tunnel(Params), OutRoom);
+        case EVoxelStrateOpClass::WormFieldSource:
+            return MakeUnique<FWormFieldSource>(*Tunnel(Params), Seed);
+        case EVoxelStrateOpClass::ShaftLedgeMod:
+            return MakeUnique<FShaftLedgeMod>(*Shaft(Params), OutShaft);
+        case EVoxelStrateOpClass::DensityNoiseCarveMod:
+            return MakeUnique<FDensityNoiseMod>(GenericStrength(Params, Block),
+                                                GenericFrequency(Params, Block), 3, Seed, false);
+        case EVoxelStrateOpClass::DensityNoiseFillMod:
+            return MakeUnique<FDensityNoiseMod>(GenericStrength(Params, Block),
+                                                GenericFrequency(Params, Block), 3, Seed, true);
+        default:
+            return nullptr;
+        }
+    }
+}
+
+bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
+                             const FVoxelStrateArchetypeParams& Params,
+                             int32 Seed, float SpineRadius,
+                             const UVoxelStrateManager* StrateManager,
+                             FVoxelOpStack& OutStack,
+                             FVoxelOpContext& OutContext,
+                             FString* OutError)
+{
+    auto Fail = [&](const FString& Reason) -> bool
+    {
+        if (OutError != nullptr) { *OutError = Reason; }
+        return false;
+    };
+    if (OutError != nullptr) { OutError->Reset(); }
+
+    if (Recipe.Modifiers.Num() < 4 || Recipe.Modifiers.Num() > 8)
+    {
+        return Fail(TEXT("A structure recipe must draw between 4 and 8 modifiers."));
+    }
+    const EVoxelStrateOpClass ExpectedRoot = Recipe.RootPolarity == EVoxelStrateRootPolarity::VoidFill
+        ? EVoxelStrateOpClass::ConstantVoidSource : EVoxelStrateOpClass::ConstantRockSource;
+    const EVoxelStrateOpClass ExpectedConversion = Recipe.RootPolarity == EVoxelStrateRootPolarity::VoidFill
+        ? EVoxelStrateOpClass::SdfFill : EVoxelStrateOpClass::SdfCarve;
+    if (Recipe.Root.OpClass != ExpectedRoot || Recipe.Conversion.OpClass != ExpectedConversion)
+    {
+        return Fail(TEXT("Recipe polarity does not match its root/conversion ids."));
+    }
+    if (!VoxelStrateRecipePrivate::IsShapeSource(Recipe.ShapeSource.OpClass))
+    {
+        return Fail(TEXT("Recipe shape source is not a rollable SDF source."));
+    }
+    const EVoxelStrateParamBlock ShapeBlock =
+        VoxelStrateRecipePrivate::ShapeBlock(Recipe.ShapeSource.OpClass);
+    if (ShapeBlock == EVoxelStrateParamBlock::None
+        || Recipe.StructuralParamBlock != ShapeBlock
+        || Recipe.Root.ParamBlock == EVoxelStrateParamBlock::None
+        || Recipe.ShapeSource.ParamBlock != ShapeBlock
+        || Recipe.Conversion.ParamBlock != ShapeBlock)
+    {
+        return Fail(TEXT("Recipe parameter blocks do not match its shape source."));
+    }
+
+    FString ContractError;
+    if (!VoxelStrateRecipePrivate::ValidateRecipeContracts(Recipe, ContractError))
+    {
+        return Fail(ContractError);
+    }
+
+    FVoxelOpStack Candidate;
+    const FRoomGraphSource* RoomPtr = nullptr;
+    const FShaftFieldSource* ShaftPtr = nullptr;
+
+    FVoxelOpRecipeEntry Root = Recipe.Root;
+    TUniquePtr<IVoxelDensityOp> RootOp =
+        VoxelStrateRecipePrivate::BuildRecipeOp(Root, Params, Seed, SpineRadius, StrateManager, RoomPtr, ShaftPtr);
+    if (!RootOp) { return Fail(TEXT("Recipe root could not be materialised.")); }
+    Candidate.Add(MoveTemp(RootOp));
+
+    TUniquePtr<IVoxelDensityOp> ShapeOp =
+        VoxelStrateRecipePrivate::BuildRecipeOp(Recipe.ShapeSource, Params, Seed, SpineRadius,
+                                                StrateManager, RoomPtr, ShaftPtr);
+    if (!ShapeOp) { return Fail(TEXT("Recipe shape source could not be materialised.")); }
+    Candidate.Add(MoveTemp(ShapeOp));
+
+    TUniquePtr<IVoxelDensityOp> ConversionOp =
+        VoxelStrateRecipePrivate::BuildRecipeOp(Recipe.Conversion, Params, Seed, SpineRadius,
+                                                StrateManager, RoomPtr, ShaftPtr);
+    if (!ConversionOp) { return Fail(TEXT("Recipe conversion could not be materialised.")); }
+    Candidate.Add(MoveTemp(ConversionOp));
+
+    for (const FVoxelOpRecipeEntry& Entry : Recipe.Modifiers)
+    {
+        TUniquePtr<IVoxelDensityOp> Modifier =
+            VoxelStrateRecipePrivate::BuildRecipeOp(Entry, Params, Seed, SpineRadius,
+                                                    StrateManager, RoomPtr, ShaftPtr);
+        if (!Modifier)
+        {
+            return Fail(TEXT("Recipe modifier could not be materialised."));
+        }
+        Candidate.Add(MoveTemp(Modifier));
+    }
+
+    const float Top = VoxelStrateRecipePrivate::Top(Params, Recipe.StructuralParamBlock);
+    const float Bottom = VoxelStrateRecipePrivate::Bottom(Params, Recipe.StructuralParamBlock);
+    const float Seal = VoxelStrateRecipePrivate::BoundarySeal(Params, Recipe.StructuralParamBlock);
+    const float Base = VoxelStrateRecipePrivate::BaseDensity(Params, Recipe.StructuralParamBlock);
+    if (!FMath::IsFinite(Top) || !FMath::IsFinite(Bottom) || Top <= Bottom
+        || !FMath::IsFinite(Seal) || !FMath::IsFinite(Base))
+    {
+        return Fail(TEXT("Recipe structural parameters do not define a finite positive strate."));
+    }
+
+    OutContext = FVoxelOpContext();
+    OutContext.Seed = Seed;
+    OutContext.LayoutVersion = StrateManager != nullptr ? StrateManager->GetLayoutVersion() : 0;
+    OutContext.WorldRadiusVoxels = 0.0f;
+    OutContext.EdgeSealThickness = Seal;
+    OutContext.StrateTopWorldZ = Top;
+    OutContext.StrateBottomWorldZ = Bottom;
+
+    // This is the only place a recipe can acquire world-law operators. There is no recipe field
+    // for posts, so a serialised manifest cannot forget them or reorder them.
+    Candidate.AppendStructuralPost(Top, Bottom, Seal, Base, SpineRadius, StrateManager);
+
+    FString ValidationError;
+    if (!Candidate.ValidateChannelOrder(&ValidationError))
+    {
+        return Fail(FString::Printf(TEXT("Materialised recipe failed ValidateChannelOrder: %s"),
+                                    *ValidationError));
+    }
+
+    OutStack = MoveTemp(Candidate);
+    return true;
 }

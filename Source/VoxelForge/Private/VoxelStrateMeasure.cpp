@@ -75,23 +75,28 @@ namespace VoxelStrateMeasurePrivate
     }
 
     bool BuildSampleGrid(
-        const UVoxelGenerator& Generator,
-        const UVoxelStrateManager& Manager,
+        const UVoxelGenerator* Generator,
+        const UVoxelStrateManager* Manager,
+        const IVoxelStrateDensitySampler* Sampler,
         int32 StrateIndex,
+        int32 ExplicitBottomWorldZ,
+        int32 ExplicitTopWorldZ,
+        float ExplicitBoundarySealThickness,
+        bool bUseExplicitBounds,
         const FVoxelStrateMeasureSettings& Settings,
         FSampleGrid& OutGrid,
         FString& OutReason)
     {
-        const TArray<FStrateSlot>& Layout = Manager.GetLayout();
-        if (!Layout.IsValidIndex(StrateIndex))
+        if (bUseExplicitBounds)
         {
-            return Refuse(OutReason, TEXT("StrateIndex is outside the manager layout."));
+            if (Sampler == nullptr)
+            {
+                return Refuse(OutReason, TEXT("An explicit measurement window requires a density sampler."));
+            }
         }
-
-        const FStrateSlot& Slot = Layout[StrateIndex];
-        if (Slot.Definition == nullptr)
+        else if (Generator == nullptr || Manager == nullptr)
         {
-            return Refuse(OutReason, TEXT("The requested strate has no definition."));
+            return Refuse(OutReason, TEXT("A generator and manager are required for a layout measurement."));
         }
         if (Settings.SampleStep <= 0)
         {
@@ -136,13 +141,37 @@ namespace VoxelStrateMeasurePrivate
                 return Refuse(OutReason, TEXT("CoverMarginVoxels must be finite and non-negative."));
             }
         }
-        if (Slot.TopChunkZ <= Slot.BottomChunkZ)
+        int64 StrateBottomZ = 0;
+        int64 StrateTopZ = 0;
+        if (bUseExplicitBounds)
         {
-            return Refuse(OutReason, TEXT("The requested strate has no positive vertical extent."));
+            StrateBottomZ = static_cast<int64>(ExplicitBottomWorldZ);
+            StrateTopZ = static_cast<int64>(ExplicitTopWorldZ);
+            if (StrateTopZ <= StrateBottomZ)
+            {
+                return Refuse(OutReason, TEXT("The explicit strate has no positive vertical extent."));
+            }
         }
+        else
+        {
+            const TArray<FStrateSlot>& Layout = Manager->GetLayout();
+            if (!Layout.IsValidIndex(StrateIndex))
+            {
+                return Refuse(OutReason, TEXT("StrateIndex is outside the manager layout."));
+            }
 
-        const int64 StrateBottomZ = static_cast<int64>(Slot.BottomChunkZ) * CHUNK_SIZE;
-        const int64 StrateTopZ = (static_cast<int64>(Slot.TopChunkZ) + 1) * CHUNK_SIZE;
+            const FStrateSlot& Slot = Layout[StrateIndex];
+            if (Slot.Definition == nullptr)
+            {
+                return Refuse(OutReason, TEXT("The requested strate has no definition."));
+            }
+            if (Slot.TopChunkZ <= Slot.BottomChunkZ)
+            {
+                return Refuse(OutReason, TEXT("The requested strate has no positive vertical extent."));
+            }
+            StrateBottomZ = static_cast<int64>(Slot.BottomChunkZ) * CHUNK_SIZE;
+            StrateTopZ = (static_cast<int64>(Slot.TopChunkZ) + 1) * CHUNK_SIZE;
+        }
         const int64 StrateHeight = StrateTopZ - StrateBottomZ;
         if (StrateHeight <= 0)
         {
@@ -192,14 +221,23 @@ namespace VoxelStrateMeasurePrivate
             return Refuse(OutReason, TEXT("The requested XY window is not a finite positive voxel box."));
         }
 
-        const int32 MidChunkZ = Slot.BottomChunkZ
-            + (Slot.TopChunkZ - Slot.BottomChunkZ) / 2;
-        const FIntVector RepresentativeChunk(
-            FMath::FloorToInt(WindowCenter.X / static_cast<float>(CHUNK_SIZE)),
-            FMath::FloorToInt(WindowCenter.Y / static_cast<float>(CHUNK_SIZE)),
-            MidChunkZ);
-        const FStrateGenerationParams RepresentativeParams =
-            Manager.GetGenerationParams(RepresentativeChunk);
+        FStrateGenerationParams RepresentativeParams;
+        if (bUseExplicitBounds)
+        {
+            RepresentativeParams.BoundarySealThickness = ExplicitBoundarySealThickness;
+        }
+        else
+        {
+            const TArray<FStrateSlot>& Layout = Manager->GetLayout();
+            const FStrateSlot& Slot = Layout[StrateIndex];
+            const int32 MidChunkZ = Slot.BottomChunkZ
+                + (Slot.TopChunkZ - Slot.BottomChunkZ) / 2;
+            const FIntVector RepresentativeChunk(
+                FMath::FloorToInt(WindowCenter.X / static_cast<float>(CHUNK_SIZE)),
+                FMath::FloorToInt(WindowCenter.Y / static_cast<float>(CHUNK_SIZE)),
+                MidChunkZ);
+            RepresentativeParams = Manager->GetGenerationParams(RepresentativeChunk);
+        }
 
         const int64 MaxMargin64 = FMath::Max<int64>(1, StrateHeight / 4);
         const int32 MaxMargin = static_cast<int32>(
@@ -328,7 +366,9 @@ namespace VoxelStrateMeasurePrivate
                 for (int32 X = 0; X < OutGrid.NumX; ++X)
                 {
                     const FVector Sample = OutGrid.CellCenter(X, Y, Z);
-                    const float Density = Generator.GetDensityAt(Sample.X, Sample.Y, Sample.Z);
+                    const float Density = Sampler != nullptr
+                        ? Sampler->SampleDensity(Sample.X, Sample.Y, Sample.Z)
+                        : Generator->GetDensityAt(Sample.X, Sample.Y, Sample.Z);
                     if (!FMath::IsFinite(Density))
                     {
                         bSawNonFiniteDensity = true;
@@ -772,7 +812,8 @@ namespace VoxelStrateMeasurePrivate
     }
 
     bool FullResolutionAirOnSegment(
-        const UVoxelGenerator& Generator,
+        const UVoxelGenerator* Generator,
+        const IVoxelStrateDensitySampler* Sampler,
         const FVector& Start,
         const FVector& End)
     {
@@ -784,7 +825,9 @@ namespace VoxelStrateMeasurePrivate
         {
             const float Alpha = static_cast<float>(Step) / static_cast<float>(NumSteps);
             const FVector Sample = Start + Delta * Alpha;
-            const float Density = Generator.GetDensityAt(Sample.X, Sample.Y, Sample.Z);
+            const float Density = Sampler != nullptr
+                ? Sampler->SampleDensity(Sample.X, Sample.Y, Sample.Z)
+                : Generator->GetDensityAt(Sample.X, Sample.Y, Sample.Z);
             if (!FMath::IsFinite(Density) || !(Density > 0.0f))
             {
                 return false;
@@ -794,7 +837,8 @@ namespace VoxelStrateMeasurePrivate
     }
 
     bool FullResolutionPathIsAir(
-        const UVoxelGenerator& Generator,
+        const UVoxelGenerator* Generator,
+        const IVoxelStrateDensitySampler* Sampler,
         const FSampleGrid& Grid,
         const FVector& A,
         const FVector& B,
@@ -812,7 +856,7 @@ namespace VoxelStrateMeasurePrivate
         int32 EndZ = 0;
         DecodeIndex(Grid, Path.Last(), EndX, EndY, EndZ);
 
-        if (!FullResolutionAirOnSegment(Generator, A, Grid.CellCenter(StartX, StartY, StartZ)))
+        if (!FullResolutionAirOnSegment(Generator, Sampler, A, Grid.CellCenter(StartX, StartY, StartZ)))
         {
             // The endpoint-to-cell-center segment has no coarse cell pair to exclude. It is
             // common to every route from this endpoint, so report unknown rather than claiming
@@ -831,7 +875,7 @@ namespace VoxelStrateMeasurePrivate
             int32 CurrentZ = 0;
             DecodeIndex(Grid, Path[PathIndex], CurrentX, CurrentY, CurrentZ);
             if (!FullResolutionAirOnSegment(
-                    Generator,
+                    Generator, Sampler,
                     Grid.CellCenter(PreviousX, PreviousY, PreviousZ),
                     Grid.CellCenter(CurrentX, CurrentY, CurrentZ)))
             {
@@ -840,7 +884,7 @@ namespace VoxelStrateMeasurePrivate
             }
         }
 
-        if (!FullResolutionAirOnSegment(Generator, Grid.CellCenter(EndX, EndY, EndZ), B))
+        if (!FullResolutionAirOnSegment(Generator, Sampler, Grid.CellCenter(EndX, EndY, EndZ), B))
         {
             // As above, the final endpoint segment is shared by every route that reaches the
             // goal cell and therefore has no precise coarse edge to exclude.
@@ -930,7 +974,8 @@ namespace VoxelStrateMeasurePrivate
     }
 
     EVoxelConnectivityResult EvaluateConnectivityOnGrid(
-        const UVoxelGenerator& Generator,
+        const UVoxelGenerator* Generator,
+        const IVoxelStrateDensitySampler* Sampler,
         const FSampleGrid& Grid,
         const FVector& AVoxel,
         const FVector& BVoxel,
@@ -980,7 +1025,7 @@ namespace VoxelStrateMeasurePrivate
             // spacing in the original voxel field. A single solid sample refutes only this
             // route, so exclude its precise coarse edge and search again.
             FCoarseEdge FailedEdge;
-            if (FullResolutionPathIsAir(Generator, Grid, AVoxel, BVoxel, Path, FailedEdge))
+            if (FullResolutionPathIsAir(Generator, Sampler, Grid, AVoxel, BVoxel, Path, FailedEdge))
             {
                 return EVoxelConnectivityResult::Connected;
             }
@@ -1126,9 +1171,14 @@ namespace VoxelStrateMeasurePrivate
     }
 
     EVoxelConnectivityResult QueryConnectivity(
-        const UVoxelGenerator& Generator,
-        const UVoxelStrateManager& Manager,
+        const UVoxelGenerator* Generator,
+        const UVoxelStrateManager* Manager,
+        const IVoxelStrateDensitySampler* Sampler,
         int32 StrateIndex,
+        int32 ExplicitBottomWorldZ,
+        int32 ExplicitTopWorldZ,
+        float ExplicitBoundarySealThickness,
+        bool bUseExplicitBounds,
         const FVector& AVoxel,
         const FVector& BVoxel,
         const FVoxelStrateMeasureSettings& Settings,
@@ -1161,7 +1211,10 @@ namespace VoxelStrateMeasurePrivate
 
         FSampleGrid Grid;
         FString RefusalReason;
-        if (!BuildSampleGrid(Generator, Manager, StrateIndex, Settings, Grid, RefusalReason))
+        if (!BuildSampleGrid(Generator, Manager, Sampler, StrateIndex,
+                             ExplicitBottomWorldZ, ExplicitTopWorldZ,
+                             ExplicitBoundarySealThickness, bUseExplicitBounds,
+                             Settings, Grid, RefusalReason))
         {
             if (OutDiagnostics != nullptr)
             {
@@ -1174,6 +1227,7 @@ namespace VoxelStrateMeasurePrivate
         int32 Goal = -1;
         const EVoxelConnectivityResult Result = EvaluateConnectivityOnGrid(
             Generator,
+            Sampler,
             Grid,
             AVoxel,
             BVoxel,
@@ -1208,7 +1262,43 @@ FVoxelStrateMetrics VF_MeasureStrate(
     FVoxelStrateMetrics Result;
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
-            Generator, Manager, StrateIndex, Settings, Grid, Result.RefusalReason))
+            &Generator, &Manager, nullptr, StrateIndex, 0, 0, 0.0f, false,
+            Settings, Grid, Result.RefusalReason))
+    {
+        return Result;
+    }
+
+    Result.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
+    Result.SampledMinZ = Grid.SampledMinZ;
+    Result.SampledMaxZ = Grid.SampledMaxZ;
+    Result.SampledNumX = Grid.NumX;
+    Result.SampledNumY = Grid.NumY;
+    Result.SampledNumZ = Grid.NumZ;
+    Result.SampledMinX = Grid.MinX;
+    Result.SampledMaxX = Grid.MaxX;
+    Result.SampledMinY = Grid.MinY;
+    Result.SampledMaxY = Grid.MaxY;
+    VoxelStrateMeasurePrivate::BuildMetricsFromGrid(Grid, Settings, Result);
+    Result.bValid = Result.NumSampled > 0;
+    if (!Result.bValid)
+    {
+        Result.RefusalReason = TEXT("The measurement grid was empty.");
+    }
+    return Result;
+}
+
+FVoxelStrateMetrics VF_MeasureStrateWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVoxelStrateMeasureSettings& Settings)
+{
+    FVoxelStrateMetrics Result;
+    VoxelStrateMeasurePrivate::FSampleGrid Grid;
+    if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
+            nullptr, nullptr, &Sampler, INDEX_NONE, StrateBottomWorldZ, StrateTopWorldZ,
+            BoundarySealThickness, true, Settings, Grid, Result.RefusalReason))
     {
         return Result;
     }
@@ -1244,9 +1334,11 @@ EVoxelConnectivityResult VF_AreConnected(
 {
     int32 NumRouteRetries = 0;
     return VoxelStrateMeasurePrivate::QueryConnectivity(
-        Generator,
-        Manager,
+        &Generator,
+        &Manager,
+        nullptr,
         StrateIndex,
+        0, 0, 0.0f, false,
         AVoxel,
         BVoxel,
         Settings,
@@ -1268,9 +1360,11 @@ EVoxelConnectivityResult VF_AreConnected(
     int32& OutNumRouteRetries)
 {
     return VoxelStrateMeasurePrivate::QueryConnectivity(
-        Generator,
-        Manager,
+        &Generator,
+        &Manager,
+        nullptr,
         StrateIndex,
+        0, 0, 0.0f, false,
         AVoxel,
         BVoxel,
         Settings,
@@ -1293,9 +1387,11 @@ EVoxelConnectivityResult VF_AreConnected(
 {
     int32 NumRouteRetries = 0;
     return VoxelStrateMeasurePrivate::QueryConnectivity(
-        Generator,
-        Manager,
+        &Generator,
+        &Manager,
+        nullptr,
         StrateIndex,
+        0, 0, 0.0f, false,
         AVoxel,
         BVoxel,
         Settings,
@@ -1316,9 +1412,11 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
     FVoxelConnectivityDiagnostics Result;
     int32 NumRouteRetries = 0;
     VoxelStrateMeasurePrivate::QueryConnectivity(
-        Generator,
-        Manager,
+        &Generator,
+        &Manager,
+        nullptr,
         StrateIndex,
+        0, 0, 0.0f, false,
         AVoxel,
         BVoxel,
         Settings,
@@ -1326,5 +1424,41 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivity(
         Result.bGoalSnapped,
         NumRouteRetries,
         &Result);
+    return Result;
+}
+
+EVoxelConnectivityResult VF_AreConnectedWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    FVoxelConnectivityDiagnostics* OutDiagnostics)
+{
+    int32 NumRouteRetries = 0;
+    return VoxelStrateMeasurePrivate::QueryConnectivity(
+        nullptr, nullptr, &Sampler, INDEX_NONE,
+        StrateBottomWorldZ, StrateTopWorldZ, BoundarySealThickness, true,
+        AVoxel, BVoxel, Settings, bOutStartSnapped, bOutGoalSnapped,
+        NumRouteRetries, OutDiagnostics);
+}
+
+FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings)
+{
+    FVoxelConnectivityDiagnostics Result;
+    VF_AreConnectedWithSampler(Sampler, StrateBottomWorldZ, StrateTopWorldZ,
+                                BoundarySealThickness, AVoxel, BVoxel, Settings,
+                                Result.bStartSnapped, Result.bGoalSnapped, &Result);
     return Result;
 }

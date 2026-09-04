@@ -39,6 +39,20 @@
 #include "VoxelHeightOp.h"      // IVoxelBiomeField — BuildSurfaceStack takes ownership of one
 
 class UVoxelStrateManager;
+struct FVoxelOpStackRecipe;
+struct FVoxelStrateArchetypeParams;
+enum class EVoxelStrateOpClass : uint8;
+
+/** The declarations the offline structure roller reads before it ever materialises an op. */
+struct VOXELFORGE_API FVoxelStrateOpContract
+{
+    EVoxelOpRole Role = EVoxelOpRole::DetailModifier;
+    EVoxelOpChannelMask Reads = VoxelOpChannels::None;
+    EVoxelOpChannelMask Writes = VoxelOpChannels::None;
+    bool bAdditive = false;
+    EVoxelOpResourceMask RequiredResources = VoxelOpResources::None;
+    EVoxelOpResourceMask ProvidedResources = VoxelOpResources::None;
+};
 
 /**
  * FVoxelOpStack — une liste ordonnée d'opérateurs + le pliage de verdict de boîte.
@@ -68,6 +82,8 @@ private:
         EVoxelOpChannelMask Reads = VoxelOpChannels::None;
         EVoxelOpChannelMask Writes = VoxelOpChannels::None;
         bool bAdditive = false;
+        EVoxelOpResourceMask RequiredResources = VoxelOpResources::None;
+        EVoxelOpResourceMask ProvidedResources = VoxelOpResources::None;
     };
 
 public:
@@ -102,6 +118,8 @@ public:
             Entry.Reads     = Entry.Op->ChannelReads();
             Entry.Writes    = Entry.Op->ChannelWrites();
             Entry.bAdditive = Entry.Op->IsAdditive();
+            Entry.RequiredResources = Entry.Op->RequiredResources();
+            Entry.ProvidedResources = Entry.Op->ProvidedResources();
         }
         Ops.Add(MoveTemp(Entry));
     }
@@ -258,6 +276,10 @@ private:
 
 namespace VoxelDensityOps
 {
+    /** Query the concrete op declaration used by the offline recipe roller. */
+    VOXELFORGE_API bool GetStrateOpContract(EVoxelStrateOpClass OpClass,
+                                            FVoxelStrateOpContract& OutContract);
+
     /** Rôle 1 — `Density = BaseDensity` partout. `ClassifyBox` → AllSolid, exact et gratuit.
      *  Racine de TunnelNetwork, Maze, VerticalShafts et des gaps de bedrock. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeConstantRockSource(float BaseDensity);
@@ -439,3 +461,12 @@ namespace VoxelDensityOps
                                        int32 Seed, float SpineRadius,
                                        const UVoxelStrateManager* StrateManager);
 }
+
+/** Materialise an offline recipe. Structural posts are appended internally and cannot be omitted. */
+VOXELFORGE_API bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
+                                            const FVoxelStrateArchetypeParams& Params,
+                                            int32 Seed, float SpineRadius,
+                                            const UVoxelStrateManager* StrateManager,
+                                            FVoxelOpStack& OutStack,
+                                            FVoxelOpContext& OutContext,
+                                            FString* OutError = nullptr);

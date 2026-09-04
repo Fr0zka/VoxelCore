@@ -155,6 +155,33 @@ namespace VoxelOpChannels
 }
 
 //=============================================================================
+// OPERATOR RESOURCES / RESSOURCES D'OPERATEUR
+//=============================================================================
+// Sample-channel declarations describe the FVoxelOpSample only.  Some operators also consume
+// stateful geometry published by an earlier source (the room graph, shaft field, or surface
+// column).  Keep that dependency explicit as a second, tiny graph so the composer cannot place a
+// room modifier on a stack that has no room source merely because its Density/Sdf masks happen to
+// fit.
+enum class EVoxelOpResource : uint8
+{
+    None          = 0,
+    RoomGeometry  = 1 << 0,
+    ShaftGeometry = 1 << 1,
+    SurfaceColumn = 1 << 2,
+};
+
+using EVoxelOpResourceMask = uint8;
+
+namespace VoxelOpResources
+{
+    static constexpr EVoxelOpResourceMask None          = 0;
+    static constexpr EVoxelOpResourceMask RoomGeometry  = static_cast<EVoxelOpResourceMask>(EVoxelOpResource::RoomGeometry);
+    static constexpr EVoxelOpResourceMask ShaftGeometry = static_cast<EVoxelOpResourceMask>(EVoxelOpResource::ShaftGeometry);
+    static constexpr EVoxelOpResourceMask SurfaceColumn = static_cast<EVoxelOpResourceMask>(EVoxelOpResource::SurfaceColumn);
+    static constexpr EVoxelOpResourceMask All = RoomGeometry | ShaftGeometry | SurfaceColumn;
+}
+
+//=============================================================================
 // COMPOSITION / COMBINERS
 //=============================================================================
 // Vocabulaire délibérément petit, et il réutilise ce qui existe déjà
@@ -381,6 +408,22 @@ public:
      */
     virtual EVoxelOpChannelMask ChannelReads() const = 0;
     virtual EVoxelOpChannelMask ChannelWrites() const = 0;
+
+    /**
+     * Non-sample state required by this op.  A declaration is satisfied only by a provider that
+     * appeared earlier in the stack.  Defaults are deliberately empty so existing independent
+     * operators and external test doubles remain source-compatible.
+     */
+    virtual EVoxelOpResourceMask RequiredResources() const
+    {
+        return VoxelOpResources::None;
+    }
+
+    /** State published for later consumers, e.g. FRoomGraphSource's room geometry cache. */
+    virtual EVoxelOpResourceMask ProvidedResources() const
+    {
+        return VoxelOpResources::None;
+    }
 
     /**
      * True when this op contributes a delta to its written channels without replacing, clamping,
