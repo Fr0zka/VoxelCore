@@ -87,6 +87,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 namespace
 {
     constexpr int32 NumMazeSamples = 20000;
+    constexpr int32 NumMazeBoxTests = 256;
 
     /** Les params Maze de la strate Maze de la fixture, bornes Z de runtime comprises. */
     bool ResolveMazeParams(const VoxelForgeTest::FTestWorld& World, FMazeGenerationParams& Out,
@@ -265,14 +266,14 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
     // VerticalShafts, FloatingIslands, FlatPlain, CrystalChamber et Underwater ne captent RIEN du
     // gain T1.d. Tout nombre > 0 ici est du saut de tuile que Maze n'a jamais eu.
     {
-        int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
+        int32 NumProved = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
         FRandomStream Rng(24680);
         // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
         // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
         const int32 SpanCells  = 40;
         const int32 SpanVoxels = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
 
-        for (int32 t = 0; t < 60; ++t)
+        for (int32 t = 0; t < NumMazeBoxTests; ++t)
         {
             const int32 Step = 1, Cells = 8;                  // petites tuiles : force brute tenable
             const int32 Extent = Step * Cells;
@@ -299,6 +300,7 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                 const float Y = (float)(Origin.Y + gy * Step);
                 const float Z = (float)(Origin.Z + gz * Step);
                 const float D = Stack.EvalMC(X, Y, Z);
+                ++NumBruteSamples;
                 if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f))
                 {
                     if (NumUnsound == 0)
@@ -307,8 +309,8 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                             TEXT("HOLE: the op stack claimed %s for the box at (%d,%d,%d) but ")
                             TEXT("EvalMC(%.0f, %.0f, %.0f) = %.6g is on the %s side. One of the ops' ")
                             TEXT("EffectOverBox/ClassifyBox is not conservative. Suspects, in order: ")
-                            TEXT("the lattice source's ExtraReach (does it cover the roughness ")
-                            TEXT("amplitude AND the carve blend?), then the seal's forcing verdict."),
+                            TEXT("the source interval, the SDF roughness interval, the converter's ")
+                            TEXT("threshold fold, then the seal's forcing verdict."),
                             bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
                             Origin.X, Origin.Y, Origin.Z, X, Y, Z, D,
                             (D >= 0.0f) ? TEXT("AIR") : TEXT("SOLID")));
@@ -323,12 +325,12 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                   NumUnsound, 0);
 
         AddInfo(FString::Printf(
-            TEXT("Box verdicts over 60 Maze tiles (XY sampled from +/- %d voxels = %.1f x ")
-            TEXT("CellSize %.0f): %d proved uniform, %d Mixed. Today's ClassifyTile ")
+            TEXT("Box verdicts over %d Maze tiles (XY sampled from +/- %d voxels = %.1f x ")
+            TEXT("CellSize %.0f): %d proved uniform, %d Mixed, %d voxels checked, %d violations. Today's ClassifyTile ")
             TEXT("proves ZERO of these -- every cave archetype falls through to \"pas prouvable en ")
             TEXT("v1\". Any number above zero here is tile-skipping Maze has never had."),
-            SpanVoxels, (float)SpanVoxels / FMath::Max(MazeParams.CellSize, 1.0f), MazeParams.CellSize,
-            NumProved, NumMixed));
+            NumMazeBoxTests, SpanVoxels, (float)SpanVoxels / FMath::Max(MazeParams.CellSize, 1.0f), MazeParams.CellSize,
+            NumProved, NumMixed, NumBruteSamples, NumUnsound));
 
         if (NumProved == 0)
         {
@@ -336,6 +338,86 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                        TEXT("classifier for Maze. Not a correctness problem, but the perf case for ")
                        TEXT("the port rests on this number."));
         }
+    }
+
+    //==========================================================================
+    // ISOLATION — a source with a converter it was never authored with
+    //==========================================================================
+    // Maze's hand-written stack uses ConstantRock -> Lattice -> SdfRoughness -> SdfCarve.
+    // This stack deliberately uses a VOID root and SdfFill instead.  The only way it may
+    // claim AllAir is for the propagated lattice/roughness interval to prove that the fill
+    // converter is inactive over the whole box.  A source that still answered for its old
+    // carve neighbour would not be a valid implementation of this test.
+    {
+        FMazeGenerationParams NovelParams = MazeParams;
+        NovelParams.BranchProbability = 0.12f;
+        NovelParams.Verticality = 0.08f;
+        NovelParams.CorridorRadius = 1.0f;
+
+        FVoxelOpStack NovelStack;
+        NovelStack.Add(VoxelDensityOps::MakeConstantVoidSource(NovelParams.BaseDensity));
+        NovelStack.Add(VoxelDensityOps::MakeLatticeCorridorSource(NovelParams, World.Settings->Seed));
+        NovelStack.Add(VoxelDensityOps::MakeSdfRoughnessMod(
+            0.35f, 0.12f, 3, NovelParams.CorridorRadius + 2.0f));
+        NovelStack.Add(VoxelDensityOps::MakeSdfFill(1.25f, NovelParams.BaseDensity));
+        NovelStack.PrepareChunk(Ctx);
+
+        FString ChannelError;
+        TestTrue(TEXT("the unverified source/converter stack has a valid channel order"),
+                 NovelStack.ValidateChannelOrder(&ChannelError));
+        if (!ChannelError.IsEmpty()) { AddError(ChannelError); }
+
+        constexpr int32 NumNovelBoxTests = 256;
+        const int32 NovelSpanCells = 160;
+        const int32 NovelSpanVoxels = NovelSpanCells * 8;
+        int32 NumNovelSolid = 0, NumNovelAir = 0, NumNovelMixed = 0;
+        int32 NumNovelVoxels = 0, NumNovelViolations = 0;
+        FRandomStream NovelRng(86420);
+
+        for (int32 t = 0; t < NumNovelBoxTests; ++t)
+        {
+            const int32 Step = 1, Cells = 8;
+            const int32 Extent = Step * Cells;
+            const FIntVector Origin(
+                NovelRng.RandRange(-NovelSpanCells, NovelSpanCells) * Extent,
+                NovelRng.RandRange(-NovelSpanCells, NovelSpanCells) * Extent,
+                FMath::Clamp(NovelRng.RandRange(BottomVoxelZ / Extent, TopVoxelZ / Extent), -4096, 4096) * Extent);
+            const int32 GridDim = Cells + 1;
+            const FBox Box(
+                FVector(Origin.X - Step, Origin.Y - Step, Origin.Z - Step),
+                FVector(Origin.X + GridDim * Step, Origin.Y + GridDim * Step, Origin.Z + GridDim * Step));
+
+            const EVoxelTileClass Verdict = NovelStack.ClassifyBox(Box, Ctx);
+            if (Verdict == EVoxelTileClass::Mixed)
+            {
+                ++NumNovelMixed;
+                continue;
+            }
+
+            const bool bClaimsSolid = (Verdict == EVoxelTileClass::AllSolid);
+            if (bClaimsSolid) { ++NumNovelSolid; } else { ++NumNovelAir; }
+
+            // No sampled subset: every lattice point in every proved box is checked.
+            for (int32 gz = -1; gz <= GridDim; ++gz)
+            for (int32 gy = -1; gy <= GridDim; ++gy)
+            for (int32 gx = -1; gx <= GridDim; ++gx)
+            {
+                const float X = (float)(Origin.X + gx * Step);
+                const float Y = (float)(Origin.Y + gy * Step);
+                const float Z = (float)(Origin.Z + gz * Step);
+                const float D = NovelStack.EvalMC(X, Y, Z);
+                ++NumNovelVoxels;
+                if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f)) { ++NumNovelViolations; }
+            }
+        }
+
+        TestEqual(TEXT("the unverified source/converter stack has zero box-verdict violations"),
+                  NumNovelViolations, 0);
+        AddInfo(FString::Printf(
+            TEXT("Novel lattice+roughness+FILL stack: %d boxes proved (%d AllSolid, %d AllAir), " )
+            TEXT("%d Mixed; %d voxels checked, %d violations; XY sampled from +/- %d voxels."),
+            NumNovelSolid + NumNovelAir, NumNovelSolid, NumNovelAir, NumNovelMixed,
+            NumNovelVoxels, NumNovelViolations, NovelSpanVoxels));
     }
 
     return true;

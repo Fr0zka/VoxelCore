@@ -383,6 +383,11 @@ driven by `EditorBrush*` props.
   the stack entry. `ValidateChannelOrder` is assembly/diagnostic-only; no declaration virtual may
   enter `Eval`'s per-voxel loop. If `FVoxelOpSample` gains a field, add its channel bit and update
   every operator declaration and the validator together.
+- **Isolated box proofs** (`FVoxelBoxHypotheses` + `FVoxelBoxSdfInterval`): the box fold carries
+  the SDF interval produced so far. An SDF-only source publishes only its own interval; a later
+  converter or detail op applies its own state-aware response. Unknown or invalid bounds force the
+  fold toward `Mixed`: a missed skip costs CPU, while a false uniform verdict removes geometry and
+  collision. Every new SDF writer must implement `PropagateSdfOverBox`; the default is unknown.
 - **VerticalShafts field cache**: shaft rolls and connector decisions, including the structural
   tree and structural-spine connector endpoint, are rebuilt only when the thread-local centre cell
   or a geometry-affecting parameter changes. Each rebuild rolls a wider direct-indexed geometric

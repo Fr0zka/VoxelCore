@@ -118,19 +118,32 @@ succeeded, 0 failed, 0 not run**.
 **void** source with a **fill** instead of a rock source with a carve — and you get islands instead of
 tunnels.
 
-**Corrective ops must be FUSED, not ordered.** `FFloorBiasMod` exists only to undo what
-`FCaveRoughnessMod` did to floors. Both are density-space, so channel rules permit either order.
-**An operator whose only purpose is to correct another operator is not a separate operator** — fuse them
-into one op with two internal phases. That removes the invalid state instead of annotating it. Fifteen
-ops that compose in any legal order beat eighteen with a footnote. (Fusing with identical order and
-math leaves the field bit-identical.)
+⛔ **"Corrective ops must be FUSED" — WITHDRAWN 2026-09-04. The premise was false.**
 
-**Current implementation finding:** the fuse is not landed. Ten operators intervene between 4b and
-4h — `FCaveTerraceMod`, `FLayerLineMod`, `FRibbingMod`, `FCaveOverhangMod`, `FCaveCliffMod`,
-`FScallopMod`, `FCaveArchMod`, `FRoomColumnMod`, `FDomeMod`, and `FPinchMod` — and every one reads
-and writes `Density`. Moving the floor phase next to roughness would therefore reorder the live
-density updates; the required bit-identical gate cannot be assumed. The current 20-op stack remains
-in its original order until a fusion that preserves that order and math is available.
+This section used to assert: *"`FFloorBiasMod` exists only to undo what `FCaveRoughnessMod` did to
+floors... fuse them into one op with two internal phases."* **It does not, and they must not be fused.**
+
+Read the math rather than the names. `FCaveRoughnessMod` adds its own displacement:
+`D += TotalRough`. Eleven ops later, `FFloorBiasMod` computes an **independent** term
+`B = NormZ² × FloorBias` from `Sdf`, room geometry and `WorldZ`, and adds it: `D += B`.
+**It never reads or subtracts `TotalRough`.** It is not a correction to roughness at all — it acts on
+the accumulated density and belongs late in the stack, exactly where it is.
+
+⇒ **No fuse. No `corrects` dependency either** — there is nothing being corrected. The general
+principle ("an operator whose only purpose is to correct another is not a separate operator") stands
+as a rule for ops that genuinely are corrective; this simply was not an instance of it.
+
+**Two lessons, both cheap here and expensive elsewhere:**
+- The claim came from reading a *name* and a *comment*. Ten Density-writing ops sit between the two
+  (`FCaveTerraceMod`, `FLayerLineMod`, `FRibbingMod`, `FCaveOverhangMod`, `FCaveCliffMod`,
+  `FScallopMod`, `FCaveArchMod`, `FRoomColumnMod`, `FDomeMod`, `FPinchMod`) — a fact one grep would
+  have shown before the design paragraph was written.
+- The old parenthetical *"fusing with identical order and math leaves the field bit-identical"* was
+  also wrong: reordering across ten accumulating ops cannot be bit-identical, because IEEE-754
+  addition is not commutative. ⚠️ But do not let that argument decide anything on its own —
+  **bit-identity across builds was never required** (see §8: peer determinism is *same build, all
+  machines*). Had the fuse been semantically right, a slightly changed field would have been an
+  acceptable price. It was the *semantics* that killed it, not the bits.
 
 **One declaration covers the rest:** an op is **additive** (small displacement, commutes freely — shuffle
 at will) or **transformative** (clamps, multiplies, gates — position matters, needs explicit placement).
@@ -335,21 +348,24 @@ still a gradient, and gradients are what Jahni rejected.
 
 All verified against the source on 2026-08-17 unless marked otherwise.
 
-### ⚠️ 6.1 THE BLOCKER — box verdicts are only correct in the stack they ship in
+### ✅ 6.1 THE BLOCKER — `EffectOverBox` correct in isolation (resolved 2026-09-04)
 
-CODEMAP, on the lattice corridor source: *"Its `EffectOverBox` answers for the source+carve **pair**
-(Phase 1 simplification) so it must be told the downstream `ExtraReach`."* The op interface says the
-same in its own comment: a source writing only `Sdf` does not touch density itself, so it answers on
-behalf of the converter that follows it.
+The source+converter coupling is removed. `FVoxelBoxHypotheses` now carries an
+`FVoxelBoxSdfInterval`; each SDF writer publishes only the interval for its own field, and each
+converter/detail operator folds that interval through its own formula. `FVoxelOpStack::VF_FoldOp`
+propagates the interval in stack order, so an operator cannot borrow a neighbour's reach or verdict.
 
-Fine when a human wrote the pair. **It breaks the moment the composer assembles a combination nobody
-verified**, and the failure is the silent one: a tile wrongly proved uniform means no geometry, no
-collision, no error, and a player falls through the floor.
+The interval is deliberately a proof, not a likelihood: invalid, non-finite, or unimplemented
+bounds become unknown and therefore cost a skip rather than manufacture `AllSolid`/`AllAir`.
+Bounds use the supremum of `Eval` over the authored parameter range, including `sup|FBM| = 1.5`,
+the `max(Min, Max)` radius envelope, warp·√2 where two axes are independent, and the SmoothMin
+slack. The existing fold carries the interval; no parallel box-query path was needed.
 
-⇒ **Prerequisite before free composition is safe: every operator's `EffectOverBox` must be correct in
-ISOLATION**, not correct-given-its-neighbours. That means propagating an **SDF interval** through the
-box query instead of letting the source answer for the pair — which the interface comment already names
-as the Phase 3 version of the contract. Not huge, but load-bearing, and it must land first.
+The isolation deliverable is an unverified combination: `ConstantVoid → LatticeCorridorSource →
+SdfRoughness → SdfFill`, which no shipping builder emits. Across 256 boxes it proved 250 `AllAir`
+and 6 `Mixed`; **332,750 voxels checked, 0 violations**. The shipping archetype scans likewise
+reported zero violations. This resolves §6.1 for the current operators, with one ongoing interface
+rule: every future SDF writer must implement interval propagation or accept `Mixed` by default.
 
 ### ⚠️ 6.2 Box-verdict bounds are proved against HAND-SET params
 
@@ -509,10 +525,12 @@ they became "findings" (§13).
   2026-09-04).
 - ⏸ **Fuse corrective ops** (`FFloorBiasMod` into `FCaveRoughnessMod`) — blocked by the ten
   intervening `Density` readers/writers under the bit-identity requirement; see §3.2.
-- ⚠️ **`EffectOverBox` correct in ISOLATION** (§6.1) — the gate on everything after.
+- ✅ **`EffectOverBox` correct in ISOLATION** (§6.1; built and brute-force verified 2026-09-04).
 - **The XY edge seal** (§6.7).
 
-*Standalone value:* the fuse and the isolation fix are both correctness improvements to shipping code.
+*Standalone value:* the isolation fix is a correctness improvement to shipping code. The fuse remains
+an open semantic decision; the Part 0 analysis above concludes that FloorBias is not a correction of
+roughness and should stay late in the stack.
 
 ### Tier 4 — the composer proper
 Structure roll (§3.2) · parameter roll (§3.3) · reject-and-resample driven by Tier 2 (§3.5) · the

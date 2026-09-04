@@ -252,7 +252,7 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     // 3. LE VERDICT DE BOÎTE
     //=========================================================================
     {
-        int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
+        int32 NumProved = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
         FRandomStream Rng(13579);
         // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
         // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
@@ -292,6 +292,7 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
                 const float Y = (float)(Origin.Y + gy * Step);
                 const float Z = (float)(Origin.Z + gz * Step);
                 const float D = Stack.EvalMC(X, Y, Z);
+                ++NumBruteSamples;
                 if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f))
                 {
                     if (NumUnsound == 0)
@@ -299,8 +300,8 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
                         AddError(FString::Printf(
                             TEXT("HOLE: the shaft stack claimed %s for the box at (%d,%d,%d) but ")
                             TEXT("EvalMC(%.0f, %.0f, %.0f) = %.6g is on the %s side. Suspects, in ")
-                            TEXT("order: the shaft source's ExtraReach (does it cover the roughness ")
-                            TEXT("amplitude AND the carve blend?), then the connector sweep (a ")
+                            TEXT("order: the shaft source's SDF interval (does it cover all shaft ")
+                            TEXT("and connector geometry?), then the connector sweep (a ")
                             TEXT("connector can reach Spacing*1.6 beyond its cell), then the ledge ")
                             TEXT("op's FillOnly."),
                             bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
@@ -317,22 +318,22 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
 
         AddInfo(FString::Printf(
             TEXT("Box verdicts over 60 VerticalShafts tiles (XY sampled from +/-%d voxels = %.1f x ")
-            TEXT("ShaftSpacing %.0f): %d proved uniform, %d Mixed, brute-forced with %d violations. ")
+            TEXT("ShaftSpacing %.0f): %d proved uniform, %d Mixed, %d voxels checked, %d violations. ")
             TEXT("This was 0 proved for as long as the connector branch bailed on mere shaft ")
             TEXT("EXISTENCE within Spacing*1.6 -- true almost everywhere at ShaftDensity 0.6, so it ")
             TEXT("was conservative AND sterile. It now tests the real connector capsules. Read the ")
             TEXT("proved count as a measurement; what is ASSERTED is that none of them is wrong, ")
             TEXT("because a false verdict here leaves no geometry and no collision."),
             SpanVoxels, (float)SpanVoxels / FMath::Max(P.ShaftSpacing, 1.0f), P.ShaftSpacing,
-            NumProved, NumMixed, NumUnsound));
+            NumProved, NumMixed, NumBruteSamples, NumUnsound));
 
         if (NumProved == 0)
         {
             AddWarning(TEXT("No VerticalShafts tile was proved, so the brute force above verified ")
                        TEXT("nothing. Before hypothesising: the shaft CIRCLE test and the connector ")
                        TEXT("CAPSULE test are the only two things that can return CarveOnly here, ")
-                       TEXT("and ExtraReach inflates both -- check its value against ShaftMaxRadius ")
-                       TEXT("before touching either test."));
+                       TEXT("and the interval must cover both the shaft and connector capsules before ")
+                       TEXT("either test is relaxed."));
         }
     }
 

@@ -278,7 +278,7 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
         // 3. LE VERDICT DE BOÎTE — ce que §3.1 a acheté
         //=====================================================================
         {
-            int32 NumProved = 0, NumMixed = 0, NumUnsound = 0;
+            int32 NumProved = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
             FRandomStream Rng(24680 + SlotIndex);
             // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
             // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
@@ -312,6 +312,7 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
                     const float Y = (float)(Origin.Y + gy * Step);
                     const float Z = (float)(Origin.Z + gz * Step);
                     const float D = Stack.EvalMC(X, Y, Z);
+                    ++NumBruteSamples;
                     if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f))
                     {
                         if (NumUnsound == 0)
@@ -320,7 +321,7 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
                                 TEXT("HOLE: %s claimed %s for the box at (%d,%d,%d) but ")
                                 TEXT("EvalMC(%.0f, %.0f, %.0f) = %.6g is on the %s side. One of the ")
                                 TEXT("ops is not conservative. Suspects, in order: the slab source's ")
-                                TEXT("noise amplitude bounds (does FBM really honour [-1,1]?), the ")
+                                TEXT("noise amplitude bounds (the proved FBM supremum is 1.5, not 1.0), the ")
                                 TEXT("ceiling clamp raising CeilSurface above CeilZ, then the column ")
                                 TEXT("mod's reach (MaxRadius + blend)."),
                                 SlotName, bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
@@ -340,12 +341,12 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
 
             AddInfo(FString::Printf(
                 TEXT("%s box verdicts over %d tiles (XY sampled from +/- %d voxels = %.1f x ")
-                TEXT("ColumnSpacing %.0f): %d proved uniform, %d Mixed. Today's ")
+                TEXT("ColumnSpacing %.0f): %d proved uniform, %d Mixed, %d voxels checked, %d violations. Today's ")
                 TEXT("ClassifyTile proves ZERO of these. This number is the whole point of making ")
                 TEXT("the slab surfaces XY-pure (OPSTACK-DECOMPOSITION 3.1)."),
                 SlotName, NumSlabTiles, SpanVoxels,
                 (float)SpanVoxels / FMath::Max(SlabParams.ColumnSpacing, 1.0f), SlabParams.ColumnSpacing,
-                NumProved, NumMixed));
+                NumProved, NumMixed, NumBruteSamples, NumUnsound));
 
             if (NumProved == 0)
             {

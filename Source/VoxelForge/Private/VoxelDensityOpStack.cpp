@@ -169,6 +169,32 @@ namespace
         return (Sdf < DetailThreshold) && (Sdf < FLT_MAX);
     }
 
+    /** Lower bound for the distance between two axis-aligned boxes. The segment's AABB contains
+     * the segment, so this is a conservative lower bound for point-to-segment distance. */
+    FORCEINLINE float VF_DistanceBetweenBoxes(const FVector& AMin, const FVector& AMax,
+                                               const FVector& BMin, const FVector& BMax)
+    {
+        const float DX = FMath::Max3((float)(AMin.X - BMax.X), (float)(BMin.X - AMax.X), 0.0f);
+        const float DY = FMath::Max3((float)(AMin.Y - BMax.Y), (float)(BMin.Y - AMax.Y), 0.0f);
+        const float DZ = FMath::Max3((float)(AMin.Z - BMax.Z), (float)(BMin.Z - AMax.Z), 0.0f);
+        return FMath::Sqrt(DX * DX + DY * DY + DZ * DZ);
+    }
+
+    FORCEINLINE float VF_DistanceBoxToPointXY(const FBox& Box, float X, float Y)
+    {
+        const float DX = FMath::Max3((float)(Box.Min.X - X), 0.0f, (float)(X - Box.Max.X));
+        const float DY = FMath::Max3((float)(Box.Min.Y - Y), 0.0f, (float)(Y - Box.Max.Y));
+        return FMath::Sqrt(DX * DX + DY * DY);
+    }
+
+    FORCEINLINE float VF_SaturatingAdd(float A, float B)
+    {
+        if (!FMath::IsFinite(A) || !FMath::IsFinite(B)) { return FLT_MAX; }
+        if (B > 0.0f && A > FLT_MAX - B) { return FLT_MAX; }
+        if (B < 0.0f && A < -FLT_MAX - B) { return -FLT_MAX; }
+        return A + B;
+    }
+
     // Structural tree capsules must meet shaft axes without landing inside a ledge band. This is
     // the same pure helper as the generator path: one deterministic safe interval is shared by the
     // whole strate, so a link cannot be blocked when it crosses an unrelated shaft's ledge.
@@ -284,13 +310,12 @@ namespace
     class FLatticeCorridorSource final : public IVoxelDensityOp
     {
     public:
-        FLatticeCorridorSource(const FMazeGenerationParams& P, int32 Seed, float InExtraReach)
+        FLatticeCorridorSource(const FMazeGenerationParams& P, int32 Seed)
             : CellSize(FMath::Max(P.CellSize, 1.0f))
             , CorridorRadius(FMath::Max(P.CorridorRadius, 0.5f))
             , BranchProbability(P.BranchProbability)
             , Verticality(P.Verticality)
             , Salt((uint32)Seed ^ 0x4D617A65u)   // 'Maze' — identique à GetMazeDensity
-            , ExtraReach(InExtraReach)
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -318,43 +343,58 @@ namespace
             InOut.Sdf = FMath::Min(InOut.Sdf, Sdf);
         }
 
-        // Répond pour la paire source + conversion (SIMPLIFICATION DE PHASE 1, cf. VoxelDensityOp.h).
-        // Conservatif par construction : on sur-approxime la boîte de chaque capsule, donc on peut
-        // dire CarveOnly à tort (coût CPU) mais jamais Identity à tort (ce serait un trou).
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        // This source writes SDF only. The following converter decides whether that SDF carves;
+        // the source itself has no density effect in isolation.
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            const float Reach = CorridorRadius + ExtraReach;
-            const FVector Min = VoxelBox.Min - FVector(Reach);
-            const FVector Max = VoxelBox.Max + FVector(Reach);
+            return EVoxelOpEffect::Identity;
+        }
 
-            // Nœuds dont une arête peut atteindre la boîte élargie. Les arêtes partent du nœud
-            // INFÉRIEUR vers +1, d'où le -1 sur la borne basse.
-            const int32 LoX = FMath::FloorToInt(Min.X / CellSize) - 1;
-            const int32 LoY = FMath::FloorToInt(Min.Y / CellSize) - 1;
-            const int32 LoZ = FMath::FloorToInt(Min.Z / CellSize) - 1;
-            const int32 HiX = FMath::FloorToInt(Max.X / CellSize);
-            const int32 HiY = FMath::FloorToInt(Max.Y / CellSize);
-            const int32 HiZ = FMath::FloorToInt(Max.Z / CellSize);
+        /** Exact cell coverage plus a geometric lower bound for every open edge. The upper bound
+         * is FLT_MAX because a far point can retain an arbitrarily positive capsule distance. */
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                 const FVoxelOpContext&) const override
+        {
+            const int32 CX0 = FMath::FloorToInt((float)VoxelBox.Min.X / CellSize);
+            const int32 CY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / CellSize);
+            const int32 CZ0 = FMath::FloorToInt((float)VoxelBox.Min.Z / CellSize);
+            const int32 CX1 = FMath::FloorToInt((float)VoxelBox.Max.X / CellSize);
+            const int32 CY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / CellSize);
+            const int32 CZ1 = FMath::FloorToInt((float)VoxelBox.Max.Z / CellSize);
 
-            // Garde-fou : une boîte énorme face à une petite CellSize ferait exploser la boucle.
-            // Au-delà, on renonce à prouver quoi que ce soit — CarveOnly est toujours SÛR.
-            constexpr int64 MaxNodesScanned = 32 * 32 * 32;
-            const int64 NodeCount = (int64)(HiX - LoX + 1) * (HiY - LoY + 1) * (HiZ - LoZ + 1);
-            if (NodeCount <= 0 || NodeCount > MaxNodesScanned) { return EVoxelOpEffect::CarveOnly; }
-
-            for (int32 nz = LoZ; nz <= HiZ; ++nz)
-            for (int32 ny = LoY; ny <= HiY; ++ny)
-            for (int32 nx = LoX; nx <= HiX; ++nx)
+            constexpr int64 MaxCellsScanned = 64 * 64 * 64;
+            const int64 CellCount = (int64)(CX1 - CX0 + 1) * (CY1 - CY0 + 1) * (CZ1 - CZ0 + 1);
+            if (CellCount <= 0 || CellCount > MaxCellsScanned)
             {
-                const FVector A = NodeCenter(nx, ny, nz);
-                if (EdgeOpen(nx, ny, nz, 0xA1u, BranchProbability) && SegmentHitsBox(A, NodeCenter(nx + 1, ny, nz), Min, Max)) return EVoxelOpEffect::CarveOnly;
-                if (EdgeOpen(nx, ny, nz, 0xB2u, BranchProbability) && SegmentHitsBox(A, NodeCenter(nx, ny + 1, nz), Min, Max)) return EVoxelOpEffect::CarveOnly;
-                if (EdgeOpen(nx, ny, nz, 0xC3u, Verticality)       && SegmentHitsBox(A, NodeCenter(nx, ny, nz + 1), Min, Max)) return EVoxelOpEffect::CarveOnly;
+                InOut.SetUnknown();
+                return;
             }
 
-            // Aucun couloir n'atteint cette boîte ⇒ la pile ne peut rien y creuser.
-            // C'est le premier saut de tuile que Maze ait jamais eu.
-            return EVoxelOpEffect::Identity;
+            float Lower = FLT_MAX;
+            bool bAnyEdge = false;
+            for (int32 cz = CZ0; cz <= CZ1; ++cz)
+            for (int32 cy = CY0; cy <= CY1; ++cy)
+            for (int32 cx = CX0; cx <= CX1; ++cx)
+            {
+                const TArray<FEdge, TInlineAllocator<24>>& Edges =
+                    GetCellEdges(FIntVector(cx, cy, cz));
+                for (const FEdge& E : Edges)
+                {
+                    bAnyEdge = true;
+                    const FVector SegmentMin(
+                        FMath::Min(E.A.X, E.B.X), FMath::Min(E.A.Y, E.B.Y), FMath::Min(E.A.Z, E.B.Z));
+                    const FVector SegmentMax(
+                        FMath::Max(E.A.X, E.B.X), FMath::Max(E.A.Y, E.B.Y), FMath::Max(E.A.Z, E.B.Z));
+                    Lower = FMath::Min(Lower,
+                        VF_DistanceBetweenBoxes(VoxelBox.Min, VoxelBox.Max,
+                                                 SegmentMin, SegmentMax) - CorridorRadius);
+                }
+            }
+
+            FVoxelBoxSdfInterval Own;
+            if (!bAnyEdge) { Own.Set(FLT_MAX, FLT_MAX); }
+            else            { Own.Set(Lower, FLT_MAX); }
+            InOut.MinWith(Own);
         }
 
     private:
@@ -427,7 +467,6 @@ namespace
 
         float  CellSize, CorridorRadius, BranchProbability, Verticality;
         uint32 Salt;
-        float  ExtraReach;
     };
 
     //=========================================================================
@@ -461,12 +500,11 @@ namespace
             FloorZ = P.StrateBottomWorldZ + StrateHeight * P.FloorRelativeHeight;
             CeilZ  = P.StrateBottomWorldZ + StrateHeight * P.CeilingRelativeHeight;
 
-            // Amplitudes MAXIMALES des deux bruits. Le contrat de `VoxelNoise::FBM` est [-1,1]
-            // (noté à sa définition), donc ces bornes sont des garanties, pas des estimations —
-            // c'est exactement ce qui autorise un verdict de boîte SÛR.
-            // FBM's contract is [-1,1], so these bounds are guarantees, not estimates.
-            FloorAmp = VOXEL_NOISE_SCALE * FMath::Max(FloorRoughness, 0.0f);
-            CeilAmp  = VOXEL_NOISE_SCALE * FMath::Max(CeilRoughness,  0.0f);
+            // FBM's proved supremum is 1.5, not the parameter's nominal [-1,1] label. Bounds must
+            // cover every authored value, so never normalise the roughness parameter to repair a
+            // bound: multiply the actual maximum noise envelope instead.
+            FloorAmp = VOXEL_NOISE_SCALE * VF_PerlinAbsBound * FMath::Abs(FloorRoughness);
+            CeilAmp  = VOXEL_NOISE_SCALE * VF_PerlinAbsBound * FMath::Abs(CeilRoughness);
         }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -1142,11 +1180,46 @@ namespace
                        * VOXEL_NOISE_SCALE * Strength;
         }
 
-        // Ne touche pas la densité par lui-même ; la source amont a déjà compté son amplitude dans
-        // sa portée (`ExtraReach`). Cf. SIMPLIFICATION DE PHASE 1 dans VoxelDensityOp.h.
+        // This modifier does not touch density itself. Its interval update is the only box-query
+        // responsibility; the downstream converter consumes the resulting interval.
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             return EVoxelOpEffect::Identity;
+        }
+
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                 const FVoxelOpContext&) const override
+        {
+            if (!InOut.IsKnown()) { return; }
+            if (!FMath::IsFinite(Strength) || !FMath::IsFinite(Frequency)
+                || !FMath::IsFinite(ApplyWithin) || BaseOctaves <= 0)
+            {
+                InOut.SetUnknown();
+                return;
+            }
+            if (Strength <= 0.0f) { return; }
+
+            // The noise input is float after the deliberate FVector round-trip in Eval. If an
+            // authored frequency/box product overflows, Eval can publish a non-finite SDF and no
+            // finite interval is a proof. Unknown costs the skip and protects the geometry.
+            const float MaxAbsCoord = FMath::Max3(
+                FMath::Max(FMath::Abs((float)VoxelBox.Min.X), FMath::Abs((float)VoxelBox.Max.X)),
+                FMath::Max(FMath::Abs((float)VoxelBox.Min.Y), FMath::Abs((float)VoxelBox.Max.Y)),
+                FMath::Max(FMath::Abs((float)VoxelBox.Min.Z), FMath::Abs((float)VoxelBox.Max.Z)));
+            if (!FMath::IsFinite(MaxAbsCoord) || !FMath::IsFinite(MaxAbsCoord * FMath::Abs(Frequency)))
+            {
+                InOut.SetUnknown();
+                return;
+            }
+
+            // The gate is `Sdf < ApplyWithin`. If the whole input interval is outside it, the
+            // modifier is exactly the identity. Otherwise add the proven FBM envelope to both
+            // sides; conditional untouched points are still covered by [Min, Max] + envelope.
+            if (InOut.Min >= ApplyWithin) { return; }
+
+            const float Amplitude = FMath::Abs(Strength) * VOXEL_NOISE_SCALE * VF_PerlinAbsBound;
+            InOut.Min = VF_SaturatingAdd(InOut.Min, -Amplitude);
+            InOut.Max = VF_SaturatingAdd(InOut.Max,  Amplitude);
         }
 
     private:
@@ -1349,12 +1422,100 @@ namespace
 
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return EVoxelOpEffect::Identity;   // la source a répondu pour la paire
+            const float Coefficient = Sign * BaseDensity * 2.0f;
+            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
+                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return EVoxelOpEffect::Both;
+            }
+            if (Coefficient < 0.0f) { return EVoxelOpEffect::CarveOnly; }
+            if (Coefficient > 0.0f) { return EVoxelOpEffect::FillOnly; }
+            return EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            const EVoxelOpEffect Intrinsic = EffectOverBox(VoxelBox, Ctx);
+            if (Intrinsic == EVoxelOpEffect::Both || Intrinsic == EVoxelOpEffect::Identity)
+            {
+                return Intrinsic;
+            }
+            return H.Sdf.IsKnown() && H.Sdf.Min >= Blend
+                 ? EVoxelOpEffect::Identity : Intrinsic;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            const float Coefficient = Sign * BaseDensity * 2.0f;
+            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
+                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return FLT_MAX;
+            }
+            return Coefficient < 0.0f ? FMath::Abs(Coefficient) : 0.0f;
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            const float Coefficient = Sign * BaseDensity * 2.0f;
+            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
+                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return FLT_MAX;
+            }
+            return Coefficient > 0.0f ? FMath::Abs(Coefficient) : 0.0f;
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            const float Coefficient = Sign * BaseDensity * 2.0f;
+            if (!FMath::IsFinite(Coefficient)) { return FLT_MAX; }
+            if (!FMath::IsFinite(Blend) || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return FLT_MAX;
+            }
+            if (Coefficient >= 0.0f) { return 0.0f; }
+            return IsInactive(H) ? 0.0f : FMath::Abs(Coefficient) * MaxFactor(H);
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            const float Coefficient = Sign * BaseDensity * 2.0f;
+            if (!FMath::IsFinite(Coefficient)) { return FLT_MAX; }
+            if (!FMath::IsFinite(Blend) || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return FLT_MAX;
+            }
+            if (Coefficient <= 0.0f) { return 0.0f; }
+            return IsInactive(H) ? 0.0f : FMath::Abs(Coefficient) * MaxFactor(H);
         }
 
         const TCHAR* DebugName() const override { return TEXT("SdfConvertOp"); }
 
     private:
+        bool IsInactive(const FVoxelBoxHypotheses& H) const
+        {
+            return !H.Sdf.IsKnown() ? false : H.Sdf.Min >= Blend;
+        }
+
+        float MaxFactor(const FVoxelBoxHypotheses& H) const
+        {
+            if (!H.Sdf.IsKnown() || !FMath::IsFinite(Blend)
+                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            {
+                return 1.0f;
+            }
+
+            const float Denom = FMath::Max(Blend * 2.0f, MinDivisor);
+            if (!(Denom > 0.0f) || !FMath::IsFinite(Denom)) { return 1.0f; }
+
+            const float T = FMath::Clamp((Blend - H.Sdf.Min) / Denom, 0.0f, 1.0f);
+            return SmoothStep01(T);
+        }
+
         float Blend, BaseDensity, Sign, MinDivisor;
     };
 
@@ -1590,9 +1751,10 @@ namespace
     //     deux ops — c'est-à-dire la complexité qu'on voulait éviter ;
     //   • le `FShaftLedgeMod` en aval a de toute façon besoin de la liste des puits, donc il faut
     //     l'exposer depuis une source ; l'exposer depuis deux serait pire.
-    // Ce qui est perdu : le verdict de boîte exact sur la seule moitié cylindrique. Ce qui est
-    // gardé : un `EffectOverBox` conservatif qui teste cercles ET capsules, ce que la version
-    // séparée aurait dû faire aussi. À revoir si le profil montre que ça compte.
+    // Ce qui est perdu : le verdict de boîte exact sur la seule moitié cylindrique. Le compromis
+    // actuel est une propagation d'intervalle qui couvre cercles ET capsules, tandis que le
+    // `EffectOverBox` intrinsèque reste Identity : le convertisseur ou consommateur aval décide
+    // séparément de son propre effet.
     //
     // Kept as ONE op against §6's suggestion: the per-voxel connectors derive from the same inner
     // 3×3 roll as the shafts, while a rebuild-only 9×9 collection resolves each 5×5 tree window
@@ -1602,10 +1764,9 @@ namespace
     class FShaftFieldSource final : public IVoxelDensityOp
     {
     public:
-        FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InExtraReach,
-                          float InSpineRadius)
+        FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InSpineRadius)
             : P(InP), Salt((uint32)Seed ^ 0x53686674u)   // 'Shft' — identique à GetVerticalShaftDensity
-            , ExtraReach(InExtraReach), SpineRadius(InSpineRadius) {}
+            , SpineRadius(InSpineRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
@@ -1652,283 +1813,77 @@ namespace
          *  poser d'étagère que sur sa moitié +X/+Y. Même motif que colonne → overhang. */
         const FCells& GetCellsAt(float WorldX, float WorldY) const { return GetCells(WorldX, WorldY); }
 
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // La source répond pour la paire source+carve (SIMPLIFICATION DE PHASE 1) : `CarveOnly`
-            // si une primitive atteint la boîte, `Identity` sinon. `ExtraReach` couvre la rugosité
-            // et le blend en aval — le sous-estimer serait un TROU.
-            // L'enveloppe doit couvrir les deux bornes de `Lerp(ShaftMinRadius, ShaftMaxRadius, t)`,
-            // pas `ShaftMaxRadius` seul si l'asset inverse les paramètres. The bound must cover
-            // both radius endpoints before adding connector and downstream reach.
-            const float Pad = FMath::Max3(P.ShaftMinRadius, P.ShaftMaxRadius,
-                                          SpineConnectorRadius()) + ExtraReach;
-            const FBox Padded = VoxelBox.ExpandBy(Pad);
+            // This source writes SDF only. A converter or other SDF consumer must inspect the
+            // propagated interval; the source has no density effect in isolation.
+            return EVoxelOpEffect::Identity;
+        }
+
+        /**
+         * Propagate the source's own SDF interval. Eval selects the inner 3x3 cell neighbourhood,
+         * so enumerating every cell touched by the box and asking GetCells at that cell centre is an
+         * exact superset. Shaft axes are infinite in Z; connector capsules use their segment AABB
+         * as a conservative distance lower bound.
+         */
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                 const FVoxelOpContext&) const override
+        {
+            if (!FMath::IsFinite((float)VoxelBox.Min.X) || !FMath::IsFinite((float)VoxelBox.Min.Y)
+                || !FMath::IsFinite((float)VoxelBox.Min.Z)
+                || !FMath::IsFinite((float)VoxelBox.Max.X) || !FMath::IsFinite((float)VoxelBox.Max.Y)
+                || !FMath::IsFinite((float)VoxelBox.Max.Z)
+                || VoxelBox.Min.X > VoxelBox.Max.X || VoxelBox.Min.Y > VoxelBox.Max.Y
+                || VoxelBox.Min.Z > VoxelBox.Max.Z
+                || !FMath::IsFinite(P.ShaftSpacing) || P.ShaftSpacing <= 0.0f)
+            {
+                InOut.SetUnknown();
+                return;
+            }
 
             const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
-            const int32 CX0 = FMath::FloorToInt((float)Padded.Min.X / Spacing);
-            const int32 CX1 = FMath::FloorToInt((float)Padded.Max.X / Spacing);
-            const int32 CY0 = FMath::FloorToInt((float)Padded.Min.Y / Spacing);
-            const int32 CY1 = FMath::FloorToInt((float)Padded.Max.Y / Spacing);
+            const int32 CX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing);
+            const int32 CY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing);
+            const int32 CX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing);
+            const int32 CY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing);
+            constexpr int64 MaxCellsScanned = 64 * 64;
+            const int64 CellCount = ((int64)CX1 - CX0 + 1) * ((int64)CY1 - CY0 + 1);
+            if (CellCount <= 0 || CellCount > MaxCellsScanned)
+            {
+                InOut.SetUnknown();
+                return;
+            }
 
+            float Lower = FLT_MAX;
+            bool bAnyPrimitive = false;
             for (int32 cy = CY0; cy <= CY1; ++cy)
             for (int32 cx = CX0; cx <= CX1; ++cx)
             {
-                FShaft Sh;
-                if (!RollShaft(cx, cy, Sh)) { continue; }
-                // Cercle (rayon + marge) contre le rectangle XY : un cylindre est infini en Z, donc
-                // la question est purement XY.
-                const float R  = Sh.R + ExtraReach;
-                const float QX = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.X - Sh.X,
-                                                             Sh.X - (float)VoxelBox.Max.X));
-                const float QY = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.Y - Sh.Y,
-                                                             Sh.Y - (float)VoxelBox.Max.Y));
-                if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::CarveOnly; }
-            }
-
-            //-----------------------------------------------------------------
-            // THE STRUCTURAL TREE — enumerate every inner cell that the box can query, then
-            // collect its complete 5×5 parent window. This is the EffectOverBox mirror of GetCells:
-            // it may over-enumerate, but it must never miss a cached tree capsule.
-            //-----------------------------------------------------------------
-            constexpr int32 CandidateRadius = 2;
-            constexpr int32 FallbackRadius = 3;
-            constexpr uint32 TreeSalt = 0x7A11u;
-            const float TreeRadius = SpineConnectorRadius();
-            const int32 ConnectorCellPad = FMath::Max(
-                1, FMath::CeilToInt(TreeRadius / Spacing));
-            const int32 TreeEmitRadius = FallbackRadius + ConnectorCellPad;
-            const int32 QueryX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
-            const int32 QueryX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
-            const int32 QueryY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
-            const int32 QueryY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
-            const int32 TreeEmitX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing)
-                - TreeEmitRadius;
-            const int32 TreeEmitX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing)
-                + TreeEmitRadius;
-            const int32 TreeEmitY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing)
-                - TreeEmitRadius;
-            const int32 TreeEmitY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing)
-                + TreeEmitRadius;
-
-            TArray<FShaft, TInlineAllocator<225>> TreeCandidates;
-            TArray<FShaft, TInlineAllocator<81>> TreeEmit;
-            for (int32 cy = TreeEmitY0 - FallbackRadius;
-                 cy <= TreeEmitY1 + FallbackRadius; ++cy)
-            for (int32 cx = TreeEmitX0 - FallbackRadius;
-                 cx <= TreeEmitX1 + FallbackRadius; ++cx)
-            {
-                FShaft Sh;
-                if (!RollShaft(cx, cy, Sh)) { continue; }
-                TreeCandidates.Add(Sh);
-                if (cx >= TreeEmitX0 && cx <= TreeEmitX1
-                    && cy >= TreeEmitY0 && cy <= TreeEmitY1)
+                const FCells& C = GetCells((cx + 0.5f) * Spacing, (cy + 0.5f) * Spacing);
+                for (const FShaft& Sh : C.Shafts)
                 {
-                    TreeEmit.Add(Sh);
+                    if (Sh.bOriginSpine) { continue; }
+                    bAnyPrimitive = true;
+                    Lower = FMath::Min(Lower,
+                        VF_DistanceBoxToPointXY(VoxelBox, Sh.X, Sh.Y) - FMath::Abs(Sh.R));
+                }
+                for (const FConn& Conn : C.Conns)
+                {
+                    bAnyPrimitive = true;
+                    const FVector ConnMin(
+                        FMath::Min(Conn.A.X, Conn.B.X), FMath::Min(Conn.A.Y, Conn.B.Y),
+                        FMath::Min(Conn.A.Z, Conn.B.Z));
+                    const FVector ConnMax(
+                        FMath::Max(Conn.A.X, Conn.B.X), FMath::Max(Conn.A.Y, Conn.B.Y),
+                        FMath::Max(Conn.A.Z, Conn.B.Z));
+                    Lower = FMath::Min(Lower,
+                        VF_DistanceBetweenBoxes(VoxelBox.Min, VoxelBox.Max, ConnMin, ConnMax)
+                        - FMath::Abs(Conn.Radius));
                 }
             }
 
-            const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
-            const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
-            const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
-            const FVector2D CtrXY(0.5f * (float)(VoxelBox.Min.X + VoxelBox.Max.X),
-                                  0.5f * (float)(VoxelBox.Min.Y + VoxelBox.Max.Y));
-            const float HalfDiagXY = 0.5f * FMath::Sqrt(
-                FMath::Square((float)(VoxelBox.Max.X - VoxelBox.Min.X)) +
-                FMath::Square((float)(VoxelBox.Max.Y - VoxelBox.Min.Y)));
-            auto ConnectorMayReachBox = [&](const FConn& Conn)
-            {
-                const float ConnReach = Conn.Radius + ExtraReach;
-                const float Zc = Conn.A.Z;
-                if (RMinZ > Zc + ConnReach || RMaxZ < Zc - ConnReach) { return false; }
-                const float DistXY = VF_DistPointSegment2D(
-                    CtrXY, FVector2D(Conn.A.X, Conn.A.Y), FVector2D(Conn.B.X, Conn.B.Y));
-                return DistXY - HalfDiagXY < ConnReach;
-            };
-
-            for (const FShaft& Child : TreeEmit)
-            {
-                const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
-                const FShaft* Parent = nullptr;
-                float BestDistanceSq = FLT_MAX;
-                for (const FShaft& Candidate : TreeCandidates)
-                {
-                    if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
-                    {
-                        continue;
-                    }
-                    if (FMath::Abs(Candidate.CellX - Child.CellX) > CandidateRadius
-                        || FMath::Abs(Candidate.CellY - Child.CellY) > CandidateRadius)
-                    {
-                        continue;
-                    }
-
-                    const float CandidateOriginSq = FMath::Square(Candidate.X)
-                                                   + FMath::Square(Candidate.Y);
-                    if (!(CandidateOriginSq < ChildOriginSq))
-                    {
-                        continue;
-                    }
-
-                    const float DistanceSq = FMath::Square(Child.X - Candidate.X)
-                                           + FMath::Square(Child.Y - Candidate.Y);
-                    const bool bLowerCell = Parent == nullptr
-                        || Candidate.CellY < Parent->CellY
-                        || (Candidate.CellY == Parent->CellY
-                            && Candidate.CellX < Parent->CellX);
-                    if (DistanceSq < BestDistanceSq
-                        || (DistanceSq == BestDistanceSq && bLowerCell))
-                    {
-                        BestDistanceSq = DistanceSq;
-                        Parent = &Candidate;
-                    }
-                }
-
-                if (Parent == nullptr
-                    && !(FMath::Abs(Child.CellX) <= CandidateRadius
-                        && FMath::Abs(Child.CellY) <= CandidateRadius))
-                {
-                    // Keep EffectOverBox's parent resolver identical to GetCells. A local
-                    // minimum chooses the nearest lower-origin shaft in the collected halo; the
-                    // monotone origin-distance key proves that the resulting tree reaches the
-                    // spine and cannot cycle. If the finite halo is empty, the direct spine is the
-                    // conservative final fallback.
-                    for (const FShaft& Candidate : TreeCandidates)
-                    {
-                        if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
-                        {
-                            continue;
-                        }
-                        if (FMath::Abs(Candidate.CellX - Child.CellX) > FallbackRadius
-                            || FMath::Abs(Candidate.CellY - Child.CellY) > FallbackRadius)
-                        {
-                            continue;
-                        }
-
-                        const float CandidateOriginSq = FMath::Square(Candidate.X)
-                                                       + FMath::Square(Candidate.Y);
-                        if (!(CandidateOriginSq < ChildOriginSq))
-                        {
-                            continue;
-                        }
-
-                        const float DistanceSq = FMath::Square(Child.X - Candidate.X)
-                                               + FMath::Square(Child.Y - Candidate.Y);
-                        const bool bLowerCell = Parent == nullptr
-                            || Candidate.CellY < Parent->CellY
-                            || (Candidate.CellY == Parent->CellY
-                                && Candidate.CellX < Parent->CellX);
-                        if (DistanceSq < BestDistanceSq
-                            || (DistanceSq == BestDistanceSq && bLowerCell))
-                        {
-                            BestDistanceSq = DistanceSq;
-                            Parent = &Candidate;
-                        }
-                    }
-                }
-
-                const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
-                const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
-                const uint32 LinkHash = VoxelHash::Pair(
-                    Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
-                const float Zc = VF_SelectVerticalTreeConnectorZ(
-                    P,
-                    P.StrateBottomWorldZ + P.BoundarySealThickness,
-                    P.StrateTopWorldZ - P.BoundarySealThickness,
-                    LinkHash);
-                const FVector ParentPoint = Parent != nullptr
-                    ? FVector(Parent->X, Parent->Y, Zc)
-                    : FVector(0.0f, 0.0f, Zc);
-                const FConn TreeConn{
-                    FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius };
-                if (ConnectorMayReachBox(TreeConn)) { return EVoxelOpEffect::CarveOnly; }
-            }
-
-            //-----------------------------------------------------------------
-            // LES CONNECTEURS — LES VRAIES CAPSULES, PLUS « un puits existe dans le coin »
-            //-----------------------------------------------------------------
-            // ⚠️ CE BLOC RENDAIT `CarveOnly` DÈS QU'UN PUITS **EXISTAIT** dans la boîte élargie de
-            // `Spacing·1.6 + Pad`, sans jamais regarder un connecteur. Avec les défauts
-            // (`ShaftSpacing = 55`, `ShaftDensity = 0.6`) cette boîte élargie couvre ~4×4 cellules,
-            // donc une dizaine de puits : la condition était vraie PARTOUT et l'archétype prouvait
-            // 0 tuile sur 60. Conservatif, jamais faux — et totalement stérile.
-            //
-            // Ce qu'on fait à la place : reconstruire les connecteurs comme `GetCells` les
-            // construit, et tester la capsule réelle.
-            //
-            // ⚠️ POURQUOI L'ÉNUMÉRATION EST UN SUR-ENSEMBLE (donc sûre). `Eval` lit les connecteurs
-            // du voisinage inner 3×3 de la cellule DE SA REQUÊTE. Une paire random visible depuis
-            // un point de la boîte a donc ses deux puits dans [cellules de la boîte] ± 1, qui est
-            // exactement la plage balayée ici. Les connecteurs de l'arbre sont testés séparément
-            // au-dessus avec leur collecte élargie/émission du halo géométrique. On peut produire des paires que
-            // personne ne voit jamais : c'est du `CarveOnly` en trop, pas un trou.
-            //
-            // ⚠️ ET POURQUOI L'ORDRE (A,B) EST LE MÊME QUE CELUI DE `GetCells`. Le hash de paire est
-            // pris sur (A puis B) dans l'ordre d'insertion, et `GetCells` insère en `(dy, dx)`,
-            // c'est-à-dire en balayage ligne par ligne. On balaie ici `(cy, cx)`, le même ordre — et
-            // un ordre ligne par ligne restreint à une sous-grille garde l'ordre relatif de deux
-            // cellules. Donc la même paire reçoit le même `VoxelHash::Pair`, sans supposer que
-            // celui-ci soit symétrique.
-            //
-            // Was: return CarveOnly as soon as any shaft EXISTED within Spacing*1.6 + Pad, which at
-            // ShaftSpacing 55 / ShaftDensity 0.6 is true everywhere -- 0 of 60 tiles proved. Now it
-            // rebuilds the random links the way GetCells does and tests the real capsule. The pair
-            // enumeration is a superset (safe), and the row-major cell order reproduces GetCells'
-            // insertion order, so each pair gets the same hash without assuming Pair() is symmetric.
-            if (P.CrossConnectChance > 0.0f)
-            {
-                const int32 QX0 = QueryX0;
-                const int32 QX1 = QueryX1;
-                const int32 QY0 = QueryY0;
-                const int32 QY1 = QueryY1;
-
-                TArray<FShaft, TInlineAllocator<32>> Near;
-                for (int32 cy = QY0; cy <= QY1; ++cy)
-                for (int32 cx = QX0; cx <= QX1; ++cx)
-                {
-                    FShaft Sh;
-                    if (RollShaft(cx, cy, Sh)) { Near.Add(Sh); }
-                }
-
-                // Match GetCells' rule conservatively: any query cell in the central 3x3 may see
-                // a spine connector. This is a superset for a box, so it can only make the tile
-                // less likely to be classified AllSolid.
-                if (SpineRadius > 0.0f
-                    && QX0 <= 1 && QX1 >= -1
-                    && QY0 <= 1 && QY1 >= -1)
-                {
-                    Near.Add({0.0f, 0.0f, SpineRadius, 0, 0, true});
-                }
-
-                // Z est traité EXACTEMENT (le connecteur est une capsule horizontale à `Zc`), XY de
-                // façon conservative. Séparer les deux est bien plus serré qu'une demi-diagonale 3D.
-                for (int32 i = 0; i < Near.Num(); ++i)
-                for (int32 j = i + 1; j < Near.Num(); ++j)
-                {
-                    const FShaft& A = Near[i];
-                    const FShaft& B = Near[j];
-                    const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
-                    if (DSq > FMath::Square(Spacing * 1.6f)) { continue; }
-
-                    const uint32 PH = VoxelHash::Pair(
-                        FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
-                        FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), Salt ^ 0xC04Eu);
-                    const bool bSpineConnector = A.bOriginSpine || B.bOriginSpine;
-                    if (VoxelHash::ToFloat01(PH) >= P.CrossConnectChance)
-                    {
-                        continue;
-                    }
-
-                    const float ConnRadius = bSpineConnector
-                        ? SpineConnectorRadius() : P.ConnectorRadius;
-                    const float Zc = FMath::Lerp(BottomZ, TopZ,
-                                                 VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-                    const FConn RandomConn{
-                        FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnRadius };
-                    if (ConnectorMayReachBox(RandomConn)) { return EVoxelOpEffect::CarveOnly; }
-                }
-            }
-
-            return EVoxelOpEffect::Identity;
+            if (bAnyPrimitive) { InOut.Set(Lower, FLT_MAX); }
+            else               { InOut.Set(FLT_MAX, FLT_MAX); }
         }
 
     private:
@@ -2218,7 +2173,6 @@ namespace
 
         FVerticalShaftParams P;
         uint32 Salt;
-        float  ExtraReach;
         float  SpineRadius;
     };
 
@@ -2279,8 +2233,19 @@ namespace
         // N'ajoute que du solide ⇒ tue AllAir, jamais AllSolid.
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return (P.LedgeSpacing > 0.0f && P.LedgeDepth > 0.0f)
+            return (Field != nullptr && P.LedgeSpacing > 0.0f && P.LedgeDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            if (Field == nullptr || P.LedgeSpacing <= 0.0f || P.LedgeDepth <= 0.0f)
+            {
+                return EVoxelOpEffect::Identity;
+            }
+            return H.Sdf.IsKnown() && H.Sdf.Min >= 0.0f
+                 ? EVoxelOpEffect::Identity : EVoxelOpEffect::FillOnly;
         }
 
     private:
@@ -2319,9 +2284,9 @@ namespace
     class FIslandBlobSource final : public IVoxelDensityOp
     {
     public:
-        FIslandBlobSource(const FFloatingIslandParams& InP, int32 Seed, float InExtraReach)
+        FIslandBlobSource(const FFloatingIslandParams& InP, int32 Seed)
             : P(InP), Salt((uint32)Seed ^ 0x49736C64u)   // 'Isld' — identique à GetFloatingIslandDensity
-            , ExtraReach(InExtraReach) {}
+        {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
@@ -2384,61 +2349,111 @@ namespace
         }
 
         /**
-         * `FillOnly` si une île peut atteindre la boîte, `Identity` sinon — et sur une strate d'îles
-         * `Identity` est le cas COURANT, ce qui est tout l'intérêt : combiné à l'`AllAir` de la
-         * source constante, c'est la première fois qu'un archétype de grotte peut prouver « tout air »
-         * (`OPSTACK-DECOMPOSITION §7`).
+     * Cette source écrit uniquement le canal SDF : son `EffectOverBox` intrinsèque est donc
+     * `Identity`. Le convertisseur de remplissage consomme ensuite l'intervalle publié ; sur une
+     * strate d'îles, l'absence d'île prouvée est le cas COURANT et, combinée à l'`AllAir` de la
+     * source constante, permet enfin de prouver « tout air » (`OPSTACK-DECOMPOSITION §7`).
          *
          * BORNE, et pourquoi elle est sûre dans les deux directions :
          *   • en XY, `Sdf ≥ DistXY − Rxy` (l'enveloppe ne dépasse jamais `Rxy`), et le warp déplace
-         *     le POINT de `WarpAmp · VOXEL_NOISE_SCALE · √2` au plus (FBM ∈ [−1,1] sur DEUX axes
-         *     indépendants — voir la note √2 dans le corps) ;
+         *     le POINT de `WarpAmp · VOXEL_NOISE_SCALE · √2` au plus (la borne prouvée de chaque
+         *     FBM est 1.5 sur DEUX axes indépendants — voir la note √2 dans le corps) ;
          *   • en Z, `Sdf ≥ WorldZ − TopSurf ≥ WorldZ − TopZ`, donc au-dessus du sommet + marge il
          *     n'y a plus rien à faire. **En dessous, il n'y a PAS de borne** : sous une île, le SDF
          *     vaut ≈ `DistXY` à toute profondeur, donc un mince fil de matière descend le long de
          *     l'axe. C'est le comportement de l'original ; le confondre avec « rien en dessous »
          *     serait un TROU, et c'est pourquoi seule la borne HAUTE est testée.
-         *   • `ExtraReach` couvre l'aval (rugosité, blend du fill, creux du SmoothMin ≤ K/6).
+         *   • cette source ne couvre pas l'aval : elle publie seulement son propre intervalle SDF.
+         *     La rugosité, le blend du fill et le creux du SmoothMin sont bornés par leurs propres
+         *     opérateurs dans le pliage, chacun avec son contrat isolé.
          */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // ⚠️ √2, PAS 1×. Le warp déplace X et Y par DEUX échantillons de bruit INDÉPENDANTS,
-            // chacun borné par `WarpAmp · VOXEL_NOISE_SCALE`. Le déplacement du POINT est donc la
-            // diagonale, `WarpMax·√2`, et non `WarpMax`. Une marge à 1× serait fausse de 41 % dans
-            // le pire cas — c'est-à-dire un trou dans le coin exact où les deux bruits saturent
-            // ensemble. Rare, et c'est précisément ce qui rendrait le bug injoignable en test.
-            // TWO independent noise samples ⇒ the point displacement is the diagonal, not one axis.
-            constexpr float Sqrt2 = 1.4142136f;
-            const float WarpMax = (P.IslandMinRadius + P.IslandMaxRadius) * 0.5f * 0.35f
-                                  * VOXEL_NOISE_SCALE * Sqrt2;
-            const float Pad = ExtraReach + FMath::Abs(WarpMax);
-            const float MaxR = FMath::Max(P.IslandMinRadius, P.IslandMaxRadius);
+            // This source writes SDF only. Island filling is the converter's responsibility.
+            return EVoxelOpEffect::Identity;
+        }
+
+        /**
+         * Propagate a source-only lower bound. The exact 3x3 neighbourhood used by Eval is
+         * enumerated for every XY cell touched by the box. The warp, authored radius endpoints,
+         * top envelope, and the bounded SmoothMin dip are all included in the bound.
+         */
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                 const FVoxelOpContext&) const override
+        {
+            if (!FMath::IsFinite((float)VoxelBox.Min.X) || !FMath::IsFinite((float)VoxelBox.Min.Y)
+                || !FMath::IsFinite((float)VoxelBox.Min.Z)
+                || !FMath::IsFinite((float)VoxelBox.Max.X) || !FMath::IsFinite((float)VoxelBox.Max.Y)
+                || !FMath::IsFinite((float)VoxelBox.Max.Z)
+                || VoxelBox.Min.X > VoxelBox.Max.X || VoxelBox.Min.Y > VoxelBox.Max.Y
+                || VoxelBox.Min.Z > VoxelBox.Max.Z
+                || !FMath::IsFinite(P.IslandSpacing) || !FMath::IsFinite(P.IslandDensity)
+                || !FMath::IsFinite(P.IslandMinRadius) || !FMath::IsFinite(P.IslandMaxRadius)
+                || !FMath::IsFinite(P.ThicknessRatio) || !FMath::IsFinite(P.VerticalJitter)
+                || !FMath::IsFinite(P.TopFlatten) || !FMath::IsFinite(P.SDFBlendRadius)
+                || P.IslandDensity < 0.0f)
+            {
+                InOut.SetUnknown();
+                return;
+            }
+
+            if (P.IslandDensity <= 0.0f)
+            {
+                InOut.Set(FLT_MAX, FLT_MAX);
+                return;
+            }
 
             const float Spacing = FMath::Max(P.IslandSpacing, 1.0f);
-            const FBox Padded = VoxelBox.ExpandBy(MaxR + Pad);
-            const int32 CX0 = FMath::FloorToInt((float)Padded.Min.X / Spacing);
-            const int32 CX1 = FMath::FloorToInt((float)Padded.Max.X / Spacing);
-            const int32 CY0 = FMath::FloorToInt((float)Padded.Min.Y / Spacing);
-            const int32 CY1 = FMath::FloorToInt((float)Padded.Max.Y / Spacing);
+            const int32 CX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing);
+            const int32 CY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing);
+            const int32 CX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing);
+            const int32 CY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing);
+            constexpr int64 MaxCellsScanned = 64 * 64;
+            const int64 CellCount = ((int64)CX1 - CX0 + 1) * ((int64)CY1 - CY0 + 1);
+            if (CellCount <= 0 || CellCount > MaxCellsScanned)
+            {
+                InOut.SetUnknown();
+                return;
+            }
 
+            constexpr float Sqrt2 = 1.4142136f;
+            const float WarpAmp = (P.IslandMinRadius + P.IslandMaxRadius) * 0.5f * 0.35f;
+            const float WarpDiag = FMath::Abs(WarpAmp) * VOXEL_NOISE_SCALE * VF_PerlinAbsBound * Sqrt2;
+            const float RadiusUpper = FMath::Max3(P.IslandMinRadius, P.IslandMaxRadius, 0.0f);
+            // For the authored TopFlatten range [0,1], TopSurf never exceeds TopZ. Keeping the
+            // positive general-range term makes the proof remain safe if a data asset is widened.
+            const float TopSurfExtra = FMath::Max(P.TopFlatten - 1.0f, 0.0f)
+                                      * RadiusUpper * 0.20f * 2.0f;
+
+            float Lower = FLT_MAX;
+            bool bAnyIsland = false;
+            const float BlendK = FMath::Max(P.SDFBlendRadius, 0.01f);
             for (int32 cy = CY0; cy <= CY1; ++cy)
             for (int32 cx = CX0; cx <= CX1; ++cx)
             {
-                FIsland Isl;
-                if (!RollIsland(cx, cy, Isl)) { continue; }
-
-                // Entièrement au-dessus du sommet de l'île (+ marge) ⇒ hors d'atteinte.
-                if ((float)VoxelBox.Min.Z > Isl.TopZ + Pad) { continue; }
-
-                const float R  = Isl.Rxy + Pad;
-                const float QX = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.X - Isl.X,
-                                                             Isl.X - (float)VoxelBox.Max.X));
-                const float QY = FMath::Max(0.0f, FMath::Max((float)VoxelBox.Min.Y - Isl.Y,
-                                                             Isl.Y - (float)VoxelBox.Max.Y));
-                if (QX * QX + QY * QY < R * R) { return EVoxelOpEffect::FillOnly; }
+                const FCells& C = GetCells((cx + 0.5f) * Spacing, (cy + 0.5f) * Spacing);
+                for (const FIsland& Isl : C.Islands)
+                {
+                    bAnyIsland = true;
+                    const float RadialLower = VF_DistanceBoxToPointXY(VoxelBox, Isl.X, Isl.Y)
+                                            - WarpDiag
+                                            - FMath::Max(Isl.Rxy, 0.0f);
+                    const float TopLower = (float)VoxelBox.Min.Z - Isl.TopZ - TopSurfExtra;
+                    const float IslandLower = FMath::Max(RadialLower, TopLower);
+                    Lower = FMath::Min(Lower, IslandLower);
+                }
             }
 
-            return EVoxelOpEffect::Identity;
+            if (!bAnyIsland)
+            {
+                InOut.Set(FLT_MAX, FLT_MAX);
+                return;
+            }
+
+            // SmoothMin can dip below the smallest raw term, but its total deficit is bounded by
+            // one blend radius: once the running minimum is a blend radius below another term,
+            // the next penalty is zero. This is a lower bound for any number of islands.
+            InOut.Set(VF_SaturatingAdd(Lower, -BlendK), FLT_MAX);
         }
 
     private:
@@ -2528,7 +2543,6 @@ namespace
 
         FFloatingIslandParams P;
         uint32 Salt;
-        float  ExtraReach;
     };
 
     //=========================================================================
@@ -2914,9 +2928,9 @@ namespace
         // paierait cette élégance très cher. Un deuxième cache par worker coûte une allocation
         // amortie ; on la paie.
         //
-        // Le VERDICT est mémoïsé, et ce n'est pas du confort : `VF_NoCaveOverBox` fait poser la
-        // question par les DOUZE modificateurs de détail pour la même boîte. Sans mémo, une tuile
-        // coûterait treize `BuildChunkCache` au lieu d'un.
+        // Le cache et l'intervalle sont mémoïsés, et ce n'est pas du confort : les DOUZE
+        // modificateurs de détail consultent le même intervalle pour la même boîte. Sans mémo,
+        // une tuile coûterait treize `BuildChunkCache` au lieu d'un.
         //
         // Second per-worker cache, on purpose: sharing FState::Cache would be sound but would let
         // tile classification disturb a live generation's hot cache. The verdict is memoised because
@@ -2931,6 +2945,7 @@ namespace
             uint32 KeyLayout = 0xFFFFFFFFu;
             bool   bValid = false;
             EVoxelOpEffect Verdict = EVoxelOpEffect::Both;
+            FVoxelBoxSdfInterval SdfInterval;
 
             /** DIAGNOSTIC — combien de primitives de chaque classe atteignent la dernière boîte
              *  interrogée, et combien le cache en contenait. Lu par les tests via
@@ -2953,11 +2968,10 @@ namespace
         /**
          * ✅ LA RÉPONSE SPATIALE. La dette annoncée ici pendant tout le portage est payée.
          *
-         * Ce que ça débloque, en un mot : `FSdfConvertOp` renvoie déjà `Identity` (« la source a
-         * répondu pour la paire ») et les douze modificateurs de détail héritent de ce verdict par
-         * `VF_NoCaveOverBox`. Le jour où cette fonction rend `Identity` pour une boîte, **quatorze
-         * opérateurs deviennent l'identité d'un coup** et la tuile est prouvable — c'est pour ça que
-         * le câblage a été posé à UN endroit et pas treize.
+         * Ce que ça débloque, en un mot : la source publie un intervalle SDF et `FSdfConvertOp`
+         * ainsi que les douze modificateurs de détail décident séparément, à partir de cet
+         * intervalle, s'ils sont identités. Une boîte éloignée peut donc éteindre toute la chaîne,
+         * mais aucune source ne répond au nom d'un convertisseur ou d'un modificateur.
          *
          * LE CRITÈRE — **UNE PRIMITIVE NE COMPTE PAS SI ELLE RATE SON CULL *OU* SI SON SDF RESTE
          * AU-DESSUS DU SEUIL `T`.** Une disjonction, pas une seule règle, et chaque branche gagne sur
@@ -2985,308 +2999,333 @@ namespace
          *  3. la boîte de recherche du cache est PLUS LARGE que celle de `Eval`, ce qui donne un
          *     SUR-ensemble de primitives : si rien n'atteint la boîte ici, rien ne l'atteint là-bas.
          *
-         * The criterion is the per-voxel cull lifted from point to box: if no cached primitive can
-         * survive its own cull anywhere in the box, Sdf stays FLT_MAX across the whole box and the
-         * source — with the converter and all twelve modifiers behind it — is the identity.
+         * The criterion is the per-voxel cull lifted from point to box. The source publishes only
+         * its own SDF interval; the converter and the twelve modifiers consume that interval in
+         * their own state-aware folds.
          */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return EVoxelOpEffect::Identity; }
+            // This source writes SDF only. It must never answer for a converter or modifier that
+            // happens to follow it; the interval is the source's complete box-query contract.
+            return EVoxelOpEffect::Identity;
+        }
 
-            //-----------------------------------------------------------------
-            // 1. LA BOÎTE DOIT TENIR DANS UNE SEULE STRATE, PARAMS COMPRIS
-            //-----------------------------------------------------------------
-            // ⚠️ C'est la moitié « boîte » de la garde d'AUDIT §C2. `Eval` résout l'index de strate
-            // et le pool d'ops PAR CHUNK ; une boîte qui traverse une frontière verrait donc deux
-            // graphes de salles différents, et un cache unique n'en représenterait aucun. On ne
-            // devine pas lequel : on rend `Both`. Ça arrive au plus sur les tuiles de bord.
-            const int32 CZ0 = FMath::FloorToInt((float)VoxelBox.Min.Z / (float)CHUNK_SIZE);
-            const int32 CZ1 = FMath::FloorToInt((float)VoxelBox.Max.Z / (float)CHUNK_SIZE);
-            const int32 CX0 = FMath::FloorToInt((float)VoxelBox.Min.X / (float)CHUNK_SIZE);
-            const int32 CX1 = FMath::FloorToInt((float)VoxelBox.Max.X / (float)CHUNK_SIZE);
-            const int32 CY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / (float)CHUNK_SIZE);
-            const int32 CY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / (float)CHUNK_SIZE);
+        /**
+         * Publish a conservative interval for this source alone.
+         *
+         * The cache is the same morphology implementation used by Eval, but the box proof never
+         * samples a downstream density op. Rooms and tunnel segments are bounded by the exact
+         * geometric support that Eval's culls admit; pits and chimneys are bounded in their real
+         * (unwarped) coordinates. The final SmoothMin can lower the running minimum by at most K.
+         *
+         * Soundness is the priority: a failed validation, an overlarge scan, or a non-finite
+         * intermediate returns Unknown. That can lose a tile skip; it cannot turn a tile into a
+         * false AllSolid/AllAir result.
+         */
+        void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                 const FVoxelOpContext& Ctx) const override
+        {
+            FBoxState& B = BoxState();
 
-            // Une boîte qui couvre des dizaines de chunks n'est de toute façon jamais prouvable ;
-            // la borne évite qu'un appelant futur transforme ce test en boucle coûteuse.
-            if ((int64)(CX1 - CX0 + 1) * (CY1 - CY0 + 1) * (CZ1 - CZ0 + 1) > 64)
+            auto Unknown = [&]()
             {
-                return EVoxelOpEffect::Both;
+                B.bValid = false;
+                B.SdfInterval.SetUnknown();
+                InOut.SetUnknown();
+            };
+            auto Finite = [](float V) { return FMath::IsFinite(V); };
+
+            const float BoxMinX = (float)VoxelBox.Min.X;
+            const float BoxMinY = (float)VoxelBox.Min.Y;
+            const float BoxMinZ = (float)VoxelBox.Min.Z;
+            const float BoxMaxX = (float)VoxelBox.Max.X;
+            const float BoxMaxY = (float)VoxelBox.Max.Y;
+            const float BoxMaxZ = (float)VoxelBox.Max.Z;
+            if (!Finite(BoxMinX) || !Finite(BoxMinY) || !Finite(BoxMinZ)
+                || !Finite(BoxMaxX) || !Finite(BoxMaxY) || !Finite(BoxMaxZ)
+                || BoxMinX > BoxMaxX || BoxMinY > BoxMaxY || BoxMinZ > BoxMaxZ)
+            {
+                Unknown();
+                return;
+            }
+
+            // These are the fields that influence the source geometry or its cache window. If an
+            // authored asset leaves the proven range, the safe answer is Unknown, never a guessed
+            // "reasonable" radius. Non-positive room density/spacing is an exact Eval no-op.
+            const float RelevantParams[] = {
+                P.RoomDensity, P.RoomSpacing, P.MinRoomRadius, P.MaxRoomRadius, P.RoomHeightRatio,
+                P.RoomFloorCutMin, P.RoomFloorCutMax, P.FloorReliefStrength, P.FloorReliefFrequency,
+                P.RoomShapeVariety, P.OriginRoomRadius, P.TunnelMinRadius, P.TunnelMaxRadius,
+                P.TunnelDensity, P.MaxTunnelLength, P.TunnelWarpStrength, P.TunnelHorizontalBias,
+                P.TunnelEndpointZOffset, P.SDFBlendRadius, P.CaveWarpStrength, P.CaveWarpFrequency,
+                P.VerticalScale
+            };
+            for (const float V : RelevantParams)
+            {
+                if (!Finite(V))
+                {
+                    Unknown();
+                    return;
+                }
+            }
+
+            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f))
+            {
+                B.bValid = false;
+                B.NumRooms = B.NumTunnels = B.NumPits = B.NumChimneys = 0;
+                B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
+                B.HitRoomsNoWarp = B.HitTunnelsNoWarp = 0;
+                B.WarpDilation = 0.0f;
+                B.SdfInterval.Set(FLT_MAX, FLT_MAX);
+                InOut = B.SdfInterval;
+                return;
+            }
+
+            if (P.MinRoomRadius < 0.0f || P.MaxRoomRadius < 0.0f || P.RoomHeightRatio < 0.0f
+                || P.OriginRoomRadius < 0.0f || P.TunnelMinRadius < 0.0f || P.TunnelMaxRadius < 0.0f
+                || P.SDFBlendRadius < 0.0f)
+            {
+                Unknown();
+                return;
+            }
+
+            const int32 CX0 = FMath::FloorToInt(BoxMinX / (float)CHUNK_SIZE);
+            const int32 CY0 = FMath::FloorToInt(BoxMinY / (float)CHUNK_SIZE);
+            const int32 CZ0 = FMath::FloorToInt(BoxMinZ / (float)CHUNK_SIZE);
+            const int32 CX1 = FMath::FloorToInt(BoxMaxX / (float)CHUNK_SIZE);
+            const int32 CY1 = FMath::FloorToInt(BoxMaxY / (float)CHUNK_SIZE);
+            const int32 CZ1 = FMath::FloorToInt(BoxMaxZ / (float)CHUNK_SIZE);
+
+            const int64 SpanX = (int64)CX1 - (int64)CX0 + 1;
+            const int64 SpanY = (int64)CY1 - (int64)CY0 + 1;
+            const int64 SpanZ = (int64)CZ1 - (int64)CZ0 + 1;
+            if (SpanX <= 0 || SpanY <= 0 || SpanZ <= 0 || SpanX * SpanY * SpanZ > 64)
+            {
+                Unknown();
+                return;
             }
 
             int32 StrateIdx = 0;
             const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
             if (Manager)
             {
-                StrateIdx = Manager->GetStrateIndex(((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+                StrateIdx = Manager->GetStrateIndex(
+                    ((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
                 for (int32 CZ = CZ0 + 1; CZ <= CZ1; ++CZ)
                 {
-                    if (Manager->GetStrateIndex(((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
+                    if (Manager->GetStrateIndex(
+                            ((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
                     {
-                        return EVoxelOpEffect::Both;
+                        Unknown();
+                        return;
                     }
                 }
 
-                // ⚠️ LE POOL D'OPS FAIT PARTIE DE LA GÉOMÉTRIE, contrairement à ce qu'on croit en
-                // lisant `FCachedRoom` : `BuildChunkCache` s'en sert pour cuire les PITS et les
-                // CHEMINÉES (`OpParams` y lit `PitDensity`, `PitMinRadius`…). Passer `nullptr`
-                // « puisque la forme des salles n'en dépend pas » sous-bornerait le cache et
-                // pourrait rendre `Identity` au-dessus d'un pit réel. Un trou, exactement.
-                UVoxelStrateDefinition* Def0 = Manager->GetStrateForChunk(FIntVector(CX0, CY0, CZ0));
+                // The room-op pool is part of the SDF: BuildChunkCache bakes pits, chimneys, and
+                // columns from it. Every chunk touched by this query must therefore resolve to the
+                // same definition before one cache can represent the box.
+                UVoxelStrateDefinition* Def0 =
+                    Manager->GetStrateForChunk(FIntVector(CX0, CY0, CZ0));
                 for (int32 CZ = CZ0; CZ <= CZ1; ++CZ)
                 for (int32 CY = CY0; CY <= CY1; ++CY)
                 for (int32 CX = CX0; CX <= CX1; ++CX)
                 {
                     if (Manager->GetStrateForChunk(FIntVector(CX, CY, CZ)) != Def0)
                     {
-                        return EVoxelOpEffect::Both;
+                        Unknown();
+                        return;
                     }
                 }
                 if (Def0) { TerrainOps = &Def0->TerrainOperations; }
             }
 
-            //-----------------------------------------------------------------
-            // 2. LE MÉMO — clé complète (§C2 : jamais de clé sans params ni LayoutVersion)
-            //-----------------------------------------------------------------
-            // `Ctx.LayoutVersion` plutôt que le membre rempli par `PrepareChunk` : rien ne garantit
-            // qu'un appelant de `ClassifyBox` ait ouvert un chunk, et une version périmée dans une
-            // clé de cache est précisément la régression du 2026-07-27.
             const uint32 LV = Ctx.LayoutVersion;
-
-            FBoxState& B = BoxState();
             if (B.bValid && B.KeyBox == VoxelBox && B.KeyStrate == StrateIdx
                 && B.KeySeed == SeedU && B.KeyFingerprint == ParamsFingerprint && B.KeyLayout == LV)
             {
-                return B.Verdict;
+                InOut = B.SdfInterval;
+                return;
             }
 
-            //-----------------------------------------------------------------
-            // 3. LE CACHE POUR LA BOÎTE INTERROGÉE
-            //-----------------------------------------------------------------
             const float Warp = (P.CaveWarpStrength > 0.0f)
                              ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
                              : 0.0f;
+            if (!Finite(Warp))
+            {
+                Unknown();
+                return;
+            }
 
-            // `+ 2` : la même marge de gradient que la boîte de recherche de `Eval`.
+            // The search window is a superset of every warped point in the box, with the same
+            // two-voxel gradient margin used by Eval's cache path.
             VoxelCaveMorphology::BuildChunkCache(
                 B.Cache,
-                (float)VoxelBox.Min.X - Warp - 2.0f, (float)VoxelBox.Min.Y - Warp - 2.0f,
-                (float)VoxelBox.Max.X + Warp + 2.0f, (float)VoxelBox.Max.Y + Warp + 2.0f,
+                BoxMinX - Warp - 2.0f, BoxMinY - Warp - 2.0f,
+                BoxMaxX + Warp + 2.0f, BoxMaxY + Warp + 2.0f,
                 P, SeedU, StrateIdx, TerrainOps);
 
-            //-----------------------------------------------------------------
-            // 4. LE CULL PAR VOXEL, ÉLEVÉ DU POINT À LA BOÎTE
-            //-----------------------------------------------------------------
-            // Espace de REQUÊTE des salles et des tunnels : XY dilaté du warp, Z passé par `EffZ`
-            // (monotone croissante tant que `VerticalScale > 0`, donc min et max se conservent)
-            // puis dilaté du warp lui aussi — `Eval` warpe bien les trois axes.
-            const FVector QMin((float)VoxelBox.Min.X - Warp,
-                               (float)VoxelBox.Min.Y - Warp,
-                               EffZ((float)VoxelBox.Min.Z) - Warp);
-            const FVector QMax((float)VoxelBox.Max.X + Warp,
-                               (float)VoxelBox.Max.Y + Warp,
-                               EffZ((float)VoxelBox.Max.Z) + Warp);
-
-            auto SphereHitsBox = [](const FVector& C, float RSq, const FVector& Mn, const FVector& Mx)
+            const float EffectiveMinZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
+                                      ? BoxMinZ / P.VerticalScale : BoxMinZ;
+            const float EffectiveMaxZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
+                                      ? BoxMaxZ / P.VerticalScale : BoxMaxZ;
+            const FVector QMin(BoxMinX - Warp, BoxMinY - Warp, EffectiveMinZ - Warp);
+            const FVector QMax(BoxMaxX + Warp, BoxMaxY + Warp, EffectiveMaxZ + Warp);
+            const FVector RMin(BoxMinX, BoxMinY, BoxMinZ);
+            const FVector RMax(BoxMaxX, BoxMaxY, BoxMaxZ);
+            if (!Finite((float)QMin.X) || !Finite((float)QMin.Y) || !Finite((float)QMin.Z)
+                || !Finite((float)QMax.X) || !Finite((float)QMax.Y) || !Finite((float)QMax.Z))
             {
-                const float dx = FMath::Max3((float)(Mn.X - C.X), 0.0f, (float)(C.X - Mx.X));
-                const float dy = FMath::Max3((float)(Mn.Y - C.Y), 0.0f, (float)(C.Y - Mx.Y));
-                const float dz = FMath::Max3((float)(Mn.Z - C.Z), 0.0f, (float)(C.Z - Mx.Z));
-                return (dx * dx + dy * dy + dz * dz) <= RSq;
+                Unknown();
+                return;
+            }
+
+            const float K = P.SDFBlendRadius;
+            const float WormThreshold = FMath::IsFinite(P.WormNetworkRange)
+                                       ? FMath::Max(3.0f * K, P.WormNetworkRange) : FLT_MAX;
+            const float ThresholdWithBlend = VF_SaturatingAdd(WormThreshold, K);
+            float Lower = FLT_MAX;
+            bool bAnyPrimitive = false;
+            bool bInvalidBound = false;
+
+            auto Consider = [&](float Candidate)
+            {
+                if (!Finite(Candidate))
+                {
+                    bInvalidBound = true;
+                    return;
+                }
+                bAnyPrimitive = true;
+                Lower = FMath::Min(Lower, Candidate);
+            };
+            auto CountThreshold = [&](float Candidate, int32& Count)
+            {
+                if (Finite(Candidate) && Candidate < ThresholdWithBlend) { ++Count; }
             };
 
-            // Pits, cheminées et colonnes : coordonnées RÉELLES, donc boîte NON dilatée.
-            const float RMinX = (float)VoxelBox.Min.X, RMaxX = (float)VoxelBox.Max.X;
-            const float RMinY = (float)VoxelBox.Min.Y, RMaxY = (float)VoxelBox.Max.Y;
-            const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
-
-            auto CircleHitsBoxXY = [&](float CX, float CY, float RSq)
-            {
-                const float dx = FMath::Max3(RMinX - CX, 0.0f, CX - RMaxX);
-                const float dy = FMath::Max3(RMinY - CY, 0.0f, CY - RMaxY);
-                return (dx * dx + dy * dy) <= RSq;
-            };
-
-            //-----------------------------------------------------------------
-            // ⚠️ PAS D'EARLY-OUT : ON COMPTE PAR CLASSE, ET C'EST DÉLIBÉRÉ
-            //-----------------------------------------------------------------
-            // La version d'origine s'arrêtait à la première primitive atteinte. Elle donnait le bon
-            // verdict et AUCUNE information : quand `AllSolid killed by: RoomGraphSource x40` est
-            // tombé, il n'y avait aucun moyen de dire si le coupable était les salles, les tunnels
-            // ou les pits — donc aucun moyen de savoir quoi resserrer. Compter les cinq classes
-            // sépare les causes, et c'est la règle que ce projet a payée plusieurs fois : quand un
-            // zéro a plusieurs causes possibles, chacune a son propre nombre.
-            //
-            // Le coût est nul à l'échelle qui compte : on vient d'appeler `BuildChunkCache`, qui
-            // est de plusieurs ordres de grandeur au-dessus d'un parcours de ~100 structs, et le
-            // verdict est mémoïsé donc ce parcours arrive UNE fois par boîte, pas treize.
-            //
-            // No early-out on purpose: stopping at the first hit gives the right verdict and no
-            // information. When a zero has several possible causes, each gets its own number.
-            //-----------------------------------------------------------------
-            // ⚠️⚠️ LE SEUIL `T` — CE QUE `Identity` VEUT DIRE ICI, ET SA CONDITION DE VALIDITÉ
-            //-----------------------------------------------------------------
-            // Jusqu'ici `Identity` signifiait « `Sdf` reste `FLT_MAX` sur toute la boîte ». C'est
-            // vrai, mais c'est plus fort que nécessaire, et cette force coûtait la quasi-totalité du
-            // gain : aucun consommateur ne regarde `Sdf` au-delà d'un seuil.
-            //
-            // Les TROIS consommateurs du canal SDF de cette pile, RELUS un par un (pas supposés) :
-            //   • `FSdfConvertOp::Eval`   → `if (InOut.Sdf >= Blend) return;`  et
-            //     `BuildTunnelNetworkStack` l'instancie par `MakeSdfCarve(P.SDFBlendRadius, …)`
-            //     ⇒ seuil = `K`.
-            //   • les DOUZE modificateurs  → `VF_NearCaveSurface` ⇒ seuil = `3·K`.
-            //   • `FWormFieldSource::Eval` → `if (CaveSDF >= P.WormNetworkRange) NetworkMask = 0;`
-            //     puis `if (NetworkMask <= 0) return;` ⇒ seuil = `WormNetworkRange`.
-            // (`FCaveTerraceMod` re-sonde le SDF en Z±1, donc HORS de la boîte — mais son gate
-            //  `VF_NearCaveSurface` est testé AVANT la sonde, vérifié ligne par ligne. Un gate faux
-            //  partout ⇒ aucune sonde n'est jamais émise.)
-            //
-            // Donc `Sdf ≥ T` avec `T = max(K, 3K, WormNetworkRange)` suffit à éteindre les trois.
-            //
-            // ⚠️ **TOUT NOUVEAU CONSOMMATEUR DU CANAL `Sdf` DOIT AVOIR UN SEUIL ≤ T, OU ÊTRE AJOUTÉ
-            // À CE `Max`.** C'est la seule dette de couplage de cette fonction, et elle est réelle :
-            // un opérateur qui regarderait `Sdf < 100` verrait des verdicts `Identity` faux, donc
-            // des tuiles sans géométrie ET SANS COLLISION. Écrit ici parce que c'est ici qu'on
-            // atterrit en l'ajoutant.
-            //
-            // ⚠️ ET LA RAISON POUR LAQUELLE `− K` SUFFIT MALGRÉ N PRIMITIVES. `SmoothMin(A,B,K)`
-            // vaut `min(A,B) − H³K/6` avec `H = max(K − |A−B|, 0)/K`. Deux conséquences lues sur la
-            // formule : la pénalité est EXACTEMENT nulle dès que `|A−B| ≥ K`, et le minimum courant
-            // ne peut donc jamais descendre plus de `K` sous le plus petit des termes — arrivé là,
-            // `H = 0` et les plis suivants le laissent intact. D'où `Sdf ≥ min_i(SDF_i) − K` pour un
-            // nombre QUELCONQUE de primitives, et non `− N·K/6`. C'est ce qui rend ce critère
-            // utilisable au lieu d'être noyé sous le nombre de tunnels.
-            //
-            // Identity now means "Sdf >= T over the box", not "Sdf stays FLT_MAX" — no consumer
-            // looks past its own threshold, and the three that exist were read one by one. ANY NEW
-            // CONSUMER OF THE Sdf CHANNEL MUST HAVE A THRESHOLD <= T OR BE ADDED TO THIS MAX.
-            // The -K slack covers any number of primitives because SmoothMin's penalty is exactly
-            // zero once |A-B| >= K, so the running minimum saturates at K below the true minimum.
-            const float K = FMath::Max(P.SDFBlendRadius, 0.0f);
-            const float T = FMath::Max(3.0f * K, P.WormNetworkRange);
-
-            B.NumRooms    = B.Cache.Rooms.Num();
-            B.NumTunnels  = B.Cache.Tunnels.Num();
-            B.NumPits     = B.Cache.Pits.Num();
+            B.NumRooms = B.Cache.Rooms.Num();
+            B.NumTunnels = B.Cache.Tunnels.Num();
+            B.NumPits = B.Cache.Pits.Num();
             B.NumChimneys = B.Cache.Chimneys.Num();
             B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
-
-            // La MÊME boîte sans dilatation de warp — diagnostic seulement, voir plus bas.
-            const FVector NWMin((float)VoxelBox.Min.X, (float)VoxelBox.Min.Y, EffZ((float)VoxelBox.Min.Z));
-            const FVector NWMax((float)VoxelBox.Max.X, (float)VoxelBox.Max.Y, EffZ((float)VoxelBox.Max.Z));
-            const float NoWarpHalfDiag = 0.5f * (float)(NWMax - NWMin).Size();
             B.HitRoomsNoWarp = B.HitTunnelsNoWarp = 0;
             B.WarpDilation = Warp;
 
-            for (const FCachedRoom& R : B.Cache.Rooms)
-            {
-                if (SphereHitsBox(R.Center, R.CullRadiusSq, QMin, QMax)) { ++B.HitRooms; }
-                if (SphereHitsBox(R.Center, R.CullRadiusSq, NWMin, NWMax)) { ++B.HitRoomsNoWarp; }
-            }
-            //-----------------------------------------------------------------
-            // LES TUNNELS ONT DROIT À UN SECOND TEST, ET C'EST LÀ QUE SE TROUVE LE GAIN
-            //-----------------------------------------------------------------
-            // ⚠️ CECI CHANGE LE SENS D'`Identity` POUR CET OPÉRATEUR — lire la note « LE SEUIL T »
-            // ci-dessus avant de toucher quoi que ce soit ici.
-            //
-            // Le cull par voxel d'un tunnel est sa SPHÈRE ENGLOBANTE. Pour une capsule longue et
-            // fine c'est une sur-estimation énorme : avec `MaxTunnelLength = 200` et
-            // `TunnelMaxRadius = 7`, la sphère a un rayon jusqu'à ~107 pour un tube de rayon 7. La
-            // mesure le disait sans ambiguïté — 32 tuiles bloquées sur 34 par des tunnels, contre
-            // 21 par des salles.
-            //
-            // Donc : soit le tunnel rate son cull (il ne s'exécute pas), soit son PROPRE SDF reste
-            // ≥ `T + K` sur toute la boîte (il s'exécute mais ne peut pas descendre le champ assez
-            // bas pour qu'un consommateur s'allume). L'un ou l'autre suffit.
-            //
-            // La borne est exacte, pas prudente : `TaperedCapsule` rend
-            // `Dist(P, PlusProcheSurSegment) − Lerp(Ra, Rb, t)`, donc
-            // `SDF ≥ dist(P, segment) − max(Ra, Rb)` — RELU dans `VoxelCaveMorphology.h`, pas supposé.
-            // Et `dist(boîte, segment) ≥ dist(centre, segment) − demi-diagonale` par inégalité
-            // triangulaire : conservatif du bon côté, et trivialement vrai.
-            //
-            // A tunnel's per-voxel cull is its BOUNDING SPHERE — for a 200-long tube of radius 7
-            // that sphere has radius ~107. So a tunnel does not matter if it fails that cull OR if
-            // its own SDF stays >= T + K over the box. The bound is exact: TaperedCapsule is
-            // genuinely dist-to-segment minus an interpolated radius, and box-to-segment distance is
-            // bounded below by centre-to-segment minus the half-diagonal.
-            const float TunnelClear = T + K;
-            const FVector QCenter   = (QMin + QMax) * 0.5;
-            const float BoxHalfDiag = 0.5f * (float)(QMax - QMin).Size();
+            const FVector NoWarpMin(BoxMinX, BoxMinY, EffectiveMinZ);
+            const FVector NoWarpMax(BoxMaxX, BoxMaxY, EffectiveMaxZ);
 
-            for (const FCachedTunnel& Tn : B.Cache.Tunnels)
+            for (const FCachedRoom& Room : B.Cache.Rooms)
             {
-                if (!SphereHitsBox(Tn.BoundCenter, Tn.BoundRadiusSq, QMin, QMax)) { continue; }
-
-                float MaxR = FMath::Max(Tn.RadiusA, Tn.RadiusB);
-                float DistToAxis;
-                if (Tn.bHasMidpoint)
+                const float CullRadiusSq = Room.CullRadiusSq;
+                if (!Finite((float)Room.Center.X) || !Finite((float)Room.Center.Y)
+                    || !Finite((float)Room.Center.Z) || !Finite(CullRadiusSq)
+                    || CullRadiusSq < 0.0f)
                 {
-                    // Deux segments : le SDF du tunnel est le `Min` des deux, donc sa borne
-                    // inférieure est le `Min` des deux bornes.
-                    MaxR = FMath::Max(MaxR, Tn.RadiusMid);
-                    DistToAxis = FMath::Min(
-                        VF_DistPointSegment(QCenter, Tn.EndpointA, Tn.Midpoint),
-                        VF_DistPointSegment(QCenter, Tn.Midpoint,  Tn.EndpointB));
-                }
-                else
-                {
-                    DistToAxis = VF_DistPointSegment(QCenter, Tn.EndpointA, Tn.EndpointB);
+                    bInvalidBound = true;
+                    continue;
                 }
 
-                if (DistToAxis - BoxHalfDiag - MaxR >= TunnelClear) { continue; }
-
-                ++B.HitTunnels;
-
-                // DIAGNOSTIC — le MÊME test avec une dilatation de warp NULLE. Ne participe à aucun
-                // verdict ; il répond à la seule question que trois builds de resserrement n'ont
-                // jamais posée : « combien de ce blocage est de la géométrie, et combien est ma
-                // propre boîte dilatée ? ». `HitTunnels - HitTunnelsNoWarp` est exactement la part
-                // que le warp coûte.
-                if (DistToAxis - NoWarpHalfDiag - MaxR < TunnelClear) { ++B.HitTunnelsNoWarp; }
+                const float RoomRadius = FMath::Sqrt(CullRadiusSq);
+                const float RoomLower = VF_DistanceBetweenBoxes(
+                    QMin, QMax, Room.Center, Room.Center) - RoomRadius;
+                const float RoomLowerNoWarp = VF_DistanceBetweenBoxes(
+                    NoWarpMin, NoWarpMax, Room.Center, Room.Center) - RoomRadius;
+                Consider(RoomLower);
+                CountThreshold(RoomLower, B.HitRooms);
+                CountThreshold(RoomLowerNoWarp, B.HitRoomsNoWarp);
             }
-            // Miroir exact des deux `continue` de `Eval` : actif si `Z < TopZ + BlendK` ET
-            // `Z >= TopZ - Depth - BlendK`.
+
+            for (const FCachedTunnel& Tunnel : B.Cache.Tunnels)
+            {
+                const float MaxRadius = FMath::Max3(
+                    FMath::Abs(Tunnel.RadiusA), FMath::Abs(Tunnel.RadiusB),
+                    Tunnel.bHasMidpoint ? FMath::Abs(Tunnel.RadiusMid) : 0.0f);
+                const FVector SegmentAMin(
+                    FMath::Min(Tunnel.EndpointA.X, Tunnel.bHasMidpoint ? Tunnel.Midpoint.X : Tunnel.EndpointB.X),
+                    FMath::Min(Tunnel.EndpointA.Y, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Y : Tunnel.EndpointB.Y),
+                    FMath::Min(Tunnel.EndpointA.Z, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Z : Tunnel.EndpointB.Z));
+                const FVector SegmentAMax(
+                    FMath::Max(Tunnel.EndpointA.X, Tunnel.bHasMidpoint ? Tunnel.Midpoint.X : Tunnel.EndpointB.X),
+                    FMath::Max(Tunnel.EndpointA.Y, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Y : Tunnel.EndpointB.Y),
+                    FMath::Max(Tunnel.EndpointA.Z, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Z : Tunnel.EndpointB.Z));
+
+                float TunnelLower = VF_DistanceBetweenBoxes(
+                    QMin, QMax, SegmentAMin, SegmentAMax) - MaxRadius;
+                if (Tunnel.bHasMidpoint)
+                {
+                    const FVector SegmentBMin(
+                        FMath::Min(Tunnel.Midpoint.X, Tunnel.EndpointB.X),
+                        FMath::Min(Tunnel.Midpoint.Y, Tunnel.EndpointB.Y),
+                        FMath::Min(Tunnel.Midpoint.Z, Tunnel.EndpointB.Z));
+                    const FVector SegmentBMax(
+                        FMath::Max(Tunnel.Midpoint.X, Tunnel.EndpointB.X),
+                        FMath::Max(Tunnel.Midpoint.Y, Tunnel.EndpointB.Y),
+                        FMath::Max(Tunnel.Midpoint.Z, Tunnel.EndpointB.Z));
+                    TunnelLower = FMath::Min(
+                        TunnelLower,
+                        VF_DistanceBetweenBoxes(QMin, QMax, SegmentBMin, SegmentBMax) - MaxRadius);
+                }
+
+                const float TunnelLowerNoWarp = VF_DistanceBetweenBoxes(
+                    NoWarpMin, NoWarpMax, SegmentAMin, SegmentAMax) - MaxRadius;
+                Consider(TunnelLower);
+                CountThreshold(TunnelLower, B.HitTunnels);
+                CountThreshold(TunnelLowerNoWarp, B.HitTunnelsNoWarp);
+            }
+
             for (const FCachedPit& Pit : B.Cache.Pits)
             {
-                if (!(RMinZ < Pit.TopZ + Pit.BlendK))              { continue; }
-                if (!(RMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK)) { continue; }
-                if (CircleHitsBoxXY(Pit.CenterX, Pit.CenterY, Pit.BoundXYRadiusSq)) { ++B.HitPits; }
+                if (!(BoxMinZ < Pit.TopZ + Pit.BlendK)
+                    || !(BoxMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK))
+                {
+                    continue;
+                }
+                const float MaxRadius = FMath::Abs(Pit.Radius) + FMath::Abs(Pit.FlareExtra);
+                const float PitLower = VF_DistanceBoxToPointXY(
+                    FBox(RMin, RMax), Pit.CenterX, Pit.CenterY) - MaxRadius;
+                Consider(PitLower);
+                CountThreshold(PitLower, B.HitPits);
             }
-            // Miroir exact : actif si `Z > BottomZ - BlendK` ET `Z <= BottomZ + Height + BlendK`.
-            for (const FCachedChimney& Ch : B.Cache.Chimneys)
+
+            for (const FCachedChimney& Chimney : B.Cache.Chimneys)
             {
-                if (!(RMaxZ > Ch.BottomZ - Ch.BlendK))              { continue; }
-                if (!(RMinZ <= Ch.BottomZ + Ch.Height + Ch.BlendK)) { continue; }
-                if (CircleHitsBoxXY(Ch.CenterX, Ch.CenterY, Ch.BoundXYRadiusSq)) { ++B.HitChimneys; }
+                if (!(BoxMaxZ > Chimney.BottomZ - Chimney.BlendK)
+                    || !(BoxMinZ <= Chimney.BottomZ + Chimney.Height + Chimney.BlendK))
+                {
+                    continue;
+                }
+                const float MaxRadius = FMath::Abs(Chimney.Radius) + FMath::Abs(Chimney.FlareExtra);
+                const float ChimneyLower = VF_DistanceBoxToPointXY(
+                    FBox(RMin, RMax), Chimney.CenterX, Chimney.CenterY) - MaxRadius;
+                Consider(ChimneyLower);
+                CountThreshold(ChimneyLower, B.HitChimneys);
             }
 
-            //-----------------------------------------------------------------
-            // ✅ LES COLONNES NE SONT PLUS TESTÉES — ET C'EST PROUVÉ, PAS RELÂCHÉ
-            //-----------------------------------------------------------------
-            // La première version les traitait en cylindres INFINIS en Z (le cache ne leur donne
-            // aucune borne verticale), ce qui rendait `Both` pour une boîte située des centaines de
-            // voxels sous la salle propriétaire. Inutile : le seul consommateur des colonnes est
-            // `FRoomColumnMod`, dont l'`Eval` commence par
-            //     `if (!VF_NearCaveSurface(InOut.Sdf, P.SDFBlendRadius)) { return; }`
-            // Si aucune salle, aucun tunnel, aucun pit et aucune cheminée n'atteint la boîte, `Sdf`
-            // y reste `FLT_MAX`, le gate est faux à chaque voxel, et **aucune colonne ne peut
-            // s'exécuter** — quelle que soit sa position XY. Le test était donc REDONDANT, pas
-            // prudent. Le retirer resserre le verdict sans toucher à sa correction.
-            //
-            // Columns are not tested: their only consumer gates on Sdf being near a cave surface,
-            // which cannot happen in a box no room/tunnel/pit/chimney reaches. The test was
-            // redundant rather than conservative, and it was the loosest one here.
-            const bool bReached = (B.HitRooms + B.HitTunnels + B.HitPits + B.HitChimneys) > 0;
+            if (bInvalidBound)
+            {
+                Unknown();
+                return;
+            }
 
-            B.Verdict = bReached ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+            FVoxelBoxSdfInterval Own;
+            if (!bAnyPrimitive)
+            {
+                Own.Set(FLT_MAX, FLT_MAX);
+            }
+            else
+            {
+                Own.Set(VF_SaturatingAdd(Lower, -K), FLT_MAX);
+            }
+
+            B.SdfInterval = Own;
+            B.Verdict = Own.IsKnown() && Own.Min >= WormThreshold
+                       ? EVoxelOpEffect::Identity : EVoxelOpEffect::Both;
             B.KeyBox = VoxelBox;
             B.KeyStrate = StrateIdx;
             B.KeySeed = SeedU;
             B.KeyFingerprint = ParamsFingerprint;
             B.KeyLayout = LV;
             B.bValid = true;
-            return B.Verdict;
+            InOut = Own;
         }
 
         const TCHAR* DebugName() const override { return TEXT("RoomGraphSource"); }
@@ -3301,37 +3340,35 @@ namespace
     };
 
     //=========================================================================
-    // LA CLÉ QUI REND LE PLIAGE NUMÉRIQUE PAYANT : hériter du verdict de la source
+    // LE GATE DE BOÎTE DES MODIFICATEURS DE CAVE
     //=========================================================================
-    // ⚠️ SANS CECI, LES BORNES D'AMPLITUDE NE SERVENT À RIEN SUR CET ARCHÉTYPE, et c'est le point
-    // que `OPSTACK-DECOMPOSITION §0.2` ne dit pas explicitement.
-    //
-    // Les douze modificateurs de détail sont TOUS gated sur `bNearCaveSurface`, c'est-à-dire sur
-    // `Sdf < SDFBlendRadius·3`. Or `Sdf` ne devient fini que si le graphe de salles a écrit quelque
-    // chose. **Là où la source prouve qu'aucune salle ni tunnel n'atteint la boîte, `Sdf` reste
-    // `FLT_MAX` sur toute la boîte, donc les douze sont l'IDENTITÉ** — et pas seulement « bornés ».
-    //
-    // Chacun le sait déjà par voxel (son premier `if`) mais le déclarait `Both`/`FillOnly` par boîte,
-    // ce qui tuait l'hypothèse `AllSolid` du roc profond aussi sûrement qu'un opérateur réellement
-    // actif. Douze déclarations trop prudentes, une seule cause : ils ne consultaient pas la source
-    // dont ils dépendent, alors qu'ils en tiennent déjà le pointeur (étape C1).
-    //
-    // ⚠️ AUJOURD'HUI CE SHORT-CIRCUIT NE TIRE PRESQUE JAMAIS : `FRoomGraphSource::EffectOverBox`
-    // rend `Identity` uniquement quand `RoomDensity <= 0`. Il devient l'interrupteur du bedrock
-    // profond le jour où la source répond SPATIALEMENT (ses bornes de salles et de tunnels sont déjà
-    // dans le cache — il faut le construire pour la boîte interrogée, ce qui ne se paie qu'une fois
-    // `ClassifyTile` branché sur `ClassifyBox`). Le câblage est posé maintenant pour que ce jour-là
-    // il n'y ait qu'UN endroit à changer, pas treize.
-    //
-    // Without this, the amplitude bounds buy nothing here: all twelve modifiers are gated on the SDF
-    // the room source writes, so where the source proves no cave reaches the box they are IDENTITY,
-    // not merely bounded. They already hold the pointer; they simply were not asking.
-    FORCEINLINE bool VF_NoCaveOverBox(const FRoomGraphSource* Rooms, const FBox& VoxelBox,
-                                      const FVoxelOpContext& Ctx)
+    // The source publishes an SDF interval; detail modifiers consume that interval here. This is
+    // deliberately a state test, never a call to the source's EffectOverBox: the latter is the
+    // source-only answer and must remain valid when the composer chooses a different consumer.
+    FORCEINLINE bool VF_CaveBoxIsFar(const FVoxelBoxHypotheses& H, float SDFBlendRadius)
     {
-        // Pas de source ⇒ `Sdf` reste FLT_MAX ⇒ le gate est faux partout ⇒ identité. Conservatif
-        // dans le bon sens : on ne rend `Identity` que quand la source elle-même le rend.
-        return Rooms == nullptr || Rooms->EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity;
+        const float Threshold = SDFBlendRadius * 3.0f;
+        return FMath::IsFinite(Threshold) && H.Sdf.IsKnown() && H.Sdf.Min >= Threshold;
+    }
+
+    FORCEINLINE EVoxelOpEffect VF_CaveDetailEffect(const FRoomGraphSource* Rooms,
+                                                   const FVoxelBoxHypotheses& H,
+                                                   float SDFBlendRadius,
+                                                   EVoxelOpEffect Intrinsic)
+    {
+        // A detail op with no room source has the same no-op guard as Eval. An unknown interval is
+        // not a reason to claim Identity: uncertainty costs a skip, while a false skip is a hole.
+        return (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius))
+             ? EVoxelOpEffect::Identity : Intrinsic;
+    }
+
+    FORCEINLINE float VF_CaveDetailMax(const FRoomGraphSource* Rooms,
+                                       const FVoxelBoxHypotheses& H,
+                                       float SDFBlendRadius)
+    {
+        // Per-room overrides can activate or enlarge a modifier even when the strate-level
+        // parameter is zero. Near/unknown therefore returns the safe default amplitude.
+        return (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius)) ? 0.0f : FLT_MAX;
     }
 
     //=========================================================================
@@ -3364,12 +3401,8 @@ namespace
     class FCaveRoughnessMod final : public IVoxelDensityOp
     {
     public:
-        /** @param InRoomsForBox  ⚠️ UNIQUEMENT pour `EffectOverBox`. Cet opérateur lit délibérément
-         *  les params de la STRATE et NON `LocalParams()` (voir la note d'en-tête) ; le pointeur ne
-         *  sert qu'à hériter du verdict de boîte de la source. Ne pas s'en servir dans `Eval`. */
-        FCaveRoughnessMod(const FStrateGenerationParams& InP, int32 Seed,
-                          const FRoomGraphSource* InRoomsForBox)
-            : P(InP), SeedU((uint32)Seed), RoomsForBox(InRoomsForBox) {}
+        FCaveRoughnessMod(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
         EVoxelOpChannelMask ChannelReads() const override
@@ -3496,37 +3529,56 @@ namespace
          * `Both` : la rugosité peut pousser dans les deux sens (le clamp ne s'applique que dans
          * l'air certain). Conservatif et donc correct, mais coûteux — comme les vers, c'est un
          * opérateur dont l'AMPLITUDE est bornée alors que sa DIRECTION ne l'est pas :
-         *   |TotalRough| ≤ 1.4 · SurfaceRoughness · VOXEL_NOISE_SCALE,  fade ∈ [0,1].
+         *   |TotalRough| ≤ 2.1 · SurfaceRoughness · VOXEL_NOISE_SCALE,  fade ∈ [0,1].
          * Deuxième client pour le pliage numérique de `OPSTACK-DECOMPOSITION §0.2`, noté au point
          * exact où la borne manque (le premier est `FWormFieldSource::MaxCarveAmplitude`).
          */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            if (VF_NoCaveOverBox(RoomsForBox, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.SurfaceRoughness > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            const EVoxelOpEffect Intrinsic = EffectOverBox(VoxelBox, Ctx);
+            if (Intrinsic == EVoxelOpEffect::Identity) { return Intrinsic; }
+            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? EVoxelOpEffect::Identity : Intrinsic;
         }
 
         /**
          * ✅ Borne consommée par le pliage numérique. `RoughNoise` et `FineNoise` respectent tous
-         * deux le contrat `[-1, 1]` de fBM/Ridged/Cellular, mis à l'échelle par `VOXEL_NOISE_SCALE`,
-         * et `TotalRough = Rough·S + Fine·S·0.4` ⇒ `|TotalRough| ≤ 1.4 · S · SCALE`. Le fade est
+         * deux sont couverts par la borne prouvée `VF_PerlinAbsBound = 1.5`, mis à l'échelle par
+         * `VOXEL_NOISE_SCALE`, et `TotalRough = Rough·S + Fine·S·0.4` ⇒
+         * `|TotalRough| ≤ 2.1 · S · SCALE`. Le fade est
          * dans `[0,1]`. Le clamp anti-remplissage ne fait que RÉDUIRE côté fill ; on ne s'appuie pas
          * dessus (il ne s'applique que dans l'air certain), donc la borne fill reste la même.
          */
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
         float MaxFillOverBox (const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
 
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? 0.0f : MaxCarveOverBox(VoxelBox, Ctx);
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? 0.0f : MaxFillOverBox(VoxelBox, Ctx);
+        }
+
         /** La borne d'amplitude, en unités de densité. */
         float MaxAmplitude() const
         {
             return (P.SurfaceRoughness > 0.0f)
-                 ? (1.4f * P.SurfaceRoughness * VOXEL_NOISE_SCALE) : 0.0f;
+                 ? (2.1f * P.SurfaceRoughness * VOXEL_NOISE_SCALE) : 0.0f;
         }
 
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
-        const FRoomGraphSource* RoomsForBox;   // NON possédant, et NON lu par Eval
     };
 
     //=========================================================================
@@ -3627,11 +3679,16 @@ namespace
 
         /** `Both` : `Offset` change de signe d'une demi-marche à l'autre. Amplitude bornée par
          *  `StepH/2` — troisième client du pliage numérique de `OPSTACK-DECOMPOSITION §0.2`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.TerraceStepHeight > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::Both);
         }
 
     private:
@@ -3687,19 +3744,17 @@ namespace
 
         /** Ne SOUSTRAIT que (`LineValue ≥ 0`, `Depth ≥ 0`) ⇒ `CarveOnly`, jamais `Both`. Un des
          *  rares modificateurs de détail qui garde une DIRECTION exploitable par le pliage. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // ⚠️ VERDICT DE BOÎTE ET OVERRIDE PAR SALLE : la borne se lit sur les params de la
-            // STRATE, pas sur ceux d'une salle — une boîte couvre plusieurs salles, donc aucune
-            // copie par voxel n'y a de sens. Une salle ne peut qu'ACTIVER un modificateur éteint au
-            // niveau strate, jamais l'inverse… sauf que `ApplyTo` écrit la valeur de l'op, y compris
-            // quand la strate valait 0. Donc quand une strate a un pool d'ops, ce verdict-ci peut
-            // être TROP OPTIMISTE. Aucun risque aujourd'hui : rien ne consomme `ClassifyBox` en
-            // production (cf. la file d'attente post-8/8), et il faudra le régler AVANT que
-            // `ClassifyTile` ne le consomme. Noté dans OPSTACK-PROGRESS.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.LayerLineSpacing > 0.0f && P.LayerLineDepth > 0.0f)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::CarveOnly);
         }
 
         /** `LineValue = max(sin,0)³ ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ retrait ≤ `LayerLineDepth`.
@@ -3712,6 +3767,14 @@ namespace
             return (P.LayerLineSpacing > 0.0f) ? FMath::Max(P.LayerLineDepth, 0.0f) : 0.0f;
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+        }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses&) const override { return 0.0f; }
 
     private:
         FStrateGenerationParams P;
@@ -3768,12 +3831,17 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.RibbingSpacing > 0.0f && P.RibbingDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
         /** `RibValue = max(sin,0)² ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ ajout ≤ `RibbingDepth`.
@@ -3782,6 +3850,14 @@ namespace
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             return (P.RibbingSpacing > 0.0f) ? FMath::Max(P.RibbingDepth, 0.0f) : 0.0f;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses&) const override { return 0.0f; }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
         }
 
     private:
@@ -3845,12 +3921,17 @@ namespace
         }
 
         /** Lobe positif seulement ⇒ n'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
         /** fBM ∈ [-1,1] × `VOXEL_NOISE_SCALE`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ ajout
@@ -3858,8 +3939,17 @@ namespace
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return VOXEL_NOISE_SCALE * FMath::Max(P.OverhangDepth, 0.0f)
-                                     * FMath::Max(P.OverhangStrength, 0.0f);
+            return VOXEL_NOISE_SCALE * VF_PerlinAbsBound
+                 * FMath::Max(P.OverhangDepth, 0.0f)
+                 * FMath::Max(P.OverhangStrength, 0.0f);
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses&) const override { return 0.0f; }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
         }
 
     private:
@@ -3931,11 +4021,16 @@ namespace
         }
 
         /** `Both` : le signe suit celui de `VertGrad · CaveSDF`, donc les deux directions. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.CliffStrength > 0.0f) ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::Both);
         }
 
     private:
@@ -4000,20 +4095,33 @@ namespace
         }
 
         /** Lobe positif seulement, SOUSTRAIT ⇒ `CarveOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.ScallopStrength > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::CarveOnly);
         }
 
         /** `Cellular3D ∈ [-1,1]`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ retrait ≤
          *  `ScallopStrength`. Même réserve « params de strate ». */
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return FMath::Max(P.ScallopStrength, 0.0f);
+            return VF_PerlinAbsBound * FMath::Max(P.ScallopStrength, 0.0f);
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+        }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses&) const override { return 0.0f; }
 
     private:
         FStrateGenerationParams P;
@@ -4112,14 +4220,18 @@ namespace
             }
         }
 
-        /** N'AJOUTE que du solide ⇒ `FillOnly`. Une vraie borne spatiale existe (les arches vivent
-         *  dans le rayon d'une salle) mais elle demande le cache pour la boîte interrogée — même
-         *  dette que `FRoomGraphSource::EffectOverBox`, et elle se paiera au même moment. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        /** N'AJOUTE que du solide ⇒ `FillOnly`. La décision spatiale est indépendante : elle
+         *  consomme l'intervalle SDF publié par la source, comme les autres détails de salle. */
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.ArchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
     private:
@@ -4184,10 +4296,16 @@ namespace
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. On ne peut pas rendre `Identity` sans consulter le
          *  cache pour la boîte interrogée — même dette que le graphe de salles. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return EVoxelOpEffect::FillOnly;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
     private:
@@ -4283,11 +4401,16 @@ namespace
         }
 
         /** Ne SOUSTRAIT que ⇒ `CarveOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.DomeDensity > 0.0f) ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::CarveOnly);
         }
 
     private:
@@ -4388,11 +4511,16 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.PinchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
     private:
@@ -4407,9 +4535,11 @@ namespace
     // laisse sur les sols — un sol praticable au lieu d'un sol bosselé. Ne s'applique QUE dans l'air
     // certain (`CaveSDF < 0`) : dans la paroi, le clamp anti-remplissage de la rugosité tient déjà.
     //
-    // ⚠️ DERNIER DE LA CHAÎNE, ET CE N'EST PAS INTERCHANGEABLE : il corrige ce que la rugosité (4b)
-    // a fait. Le déplacer avant elle le rendrait sans objet. C'est la raison pour laquelle l'ordre
-    // des opérateurs dans `BuildTunnelNetworkStack` est celui de l'original, ligne pour ligne.
+    // ⚠️ DERNIER DE LA CHAÎNE, ET CE N'EST PAS INTERCHANGEABLE : il ajoute un biais indépendant à
+    // la densité déjà accumulée par les étapes précédentes. Il ne lit ni ne soustrait la variation
+    // de rugosité (4b). Le déplacer avant les autres étapes changerait donc leur entrée et leur
+    // sortie, ce qui est la raison pour laquelle l'ordre de `BuildTunnelNetworkStack` reste celui
+    // de l'original, ligne pour ligne.
     //
     // TIER 3b AUDIT (2026-09-04): this op is intentionally still separate. Ten operators lie
     // between 4b and this phase (4c through 4h), and every one reads+writes Density. Moving this
@@ -4454,11 +4584,16 @@ namespace
         }
 
         /** N'AJOUTE que du solide ⇒ `FillOnly`. */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Borne au niveau STRATE — voir la note d'`FLayerLineMod::EffectOverBox`.
-            if (VF_NoCaveOverBox(Rooms, VoxelBox, Ctx)) { return EVoxelOpEffect::Identity; }
             return (P.FloorBias > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
+                                        EVoxelOpEffect::FillOnly);
         }
 
     private:
@@ -4479,12 +4614,8 @@ namespace
     class FWormFieldSource final : public IVoxelDensityOp
     {
     public:
-        /** @param InRooms  ⚠️ UNIQUEMENT pour `EffectOverBox` / `MaxCarveOverBox`. `Eval` lit le
-         *                  canal SDF de `InOut`, pas ce pointeur — le ver n'interroge jamais la
-         *                  source directement, il consomme ce qu'elle a écrit. Peut être nullptr. */
-        FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed,
-                         const FRoomGraphSource* InRooms = nullptr)
-            : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
+        FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed)
+            : P(InP), SeedU((uint32)Seed) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override
@@ -4545,68 +4676,30 @@ namespace
         }
 
         /**
-         * ⚠️ `CarveOnly` PARTOUT quand les vers sont actifs — et c'est exactement le problème que
-         * `OPSTACK-DECOMPOSITION §0.2` isole : un carve fieldé n'a AUCUNE borne spatiale, donc il tue
-         * l'hypothèse `AllSolid` sur CHAQUE tuile de CHAQUE strate à vers. La direction seule ne peut
-         * pas le récupérer.
-         *
-         * **Mais l'amplitude, elle, est bornée et triviale** : `t ∈ [0,1]`, `NetworkMask ∈ [0,1]`,
-         * donc ce ver ne peut déplacer la densité vers l'air que de `WormStrength` au plus. Dès que
-         * le pliage saura porter un INTERVALLE numérique et pas seulement une direction, « le rocher
-         * est solide de plus que la somme des carves restants » redevient prouvable — et c'est le
-         * plus gros poste de perf du plan. Noté ici, au point exact où la borne manque.
+         * The worm is a density consumer, not an SDF source. Its intrinsic response is `CarveOnly`.
+         * The state-aware fold may prove it inactive only when the interval already published by a
+         * preceding SDF writer proves `Sdf >= WormNetworkRange` throughout the box. An unknown or
+         * unrelated interval leaves the carve active, which is conservative for free composition.
+         * Its magnitude is independently bounded by `WormStrength` because both `t` and
+         * `NetworkMask` are in [0, 1].
          */
-        /**
-         * ✅ **LE VER HÉRITE DU VERDICT DE LA SOURCE DE SALLES — ET C'EST CE QUI DÉBLOQUE TOUT.**
-         *
-         * La note ci-dessus (« aucune borne spatiale, donc il tue `AllSolid` sur CHAQUE tuile »)
-         * était vraie, et pourtant elle passait à côté de ce que son propre `Eval` fait trois
-         * lignes plus haut :
-         *
-         * ```
-         * if (CaveSDF >= P.WormNetworkRange)   // vrai aussi quand il n'y a pas de réseau (FLT_MAX)
-         * {   NetworkMask = 0.0f;   }
-         * ...
-         * if (NetworkMask <= 0.0f) { return; }
-         * ```
-         *
-         * **Le ver EST spatialement borné** — pas par une borne à lui, mais par celle de la source
-         * de salles, exactement comme les douze modificateurs de détail. Là où `FRoomGraphSource`
-         * prouve `Identity`, `Sdf` reste `FLT_MAX` sur toute la boîte, donc `NetworkMask` vaut 0
-         * partout, donc ce `return` est pris à chaque voxel. Le ver est l'identité, pas « un carve
-         * borné » : il ne s'exécute pas.
-         *
-         * ⚠️ POURQUOI CE CONTRÔLE COMPTAIT AUTANT. `BaseDensity = 8` et `WormStrength = 10` sont
-         * les DÉFAUTS, et le commentaire de `WormStrength` dit pourquoi (« must exceed BaseDensity
-         * to create air »). Donc `SolidMargin = 8 − 10 < 0` : tant que le ver rendait `CarveOnly`
-         * partout, il tuait `AllSolid` sur **toutes** les tuiles, et la réponse spatiale de la
-         * source de salles ne pouvait rien prouver derrière lui. Le premier build l'a montré —
-         * 0 tuile prouvée sur 40, la source ayant pourtant appris à répondre.
-         *
-         * ⚠️ ET POURQUOI ON N'UTILISE **PAS** `VF_NoCaveOverBox` ICI. Cet assistant rend `true`
-         * quand `Rooms == nullptr` — correct pour les douze modificateurs, qui n'existent que dans
-         * une pile où la source de salles est le seul écrivain du canal SDF. Le ver, lui, est un
-         * opérateur dont un futur assemblage pourrait le placer derrière un AUTRE écrivain de SDF
-         * (`FLatticeCorridorSource` en écrit un). Sans source de salles, on ne sait pas : on rend
-         * `CarveOnly`. Ne pas savoir doit coûter du CPU, jamais un trou.
-         *
-         * The worm IS spatially bounded — by the room source's bound, not one of its own, exactly
-         * like the twelve detail modifiers. Where the room source proves Identity, Sdf stays
-         * FLT_MAX, NetworkMask is 0 everywhere and Eval returns immediately. This mattered because
-         * BaseDensity=8 < WormStrength=10 BY DEFAULT, so an unconditional CarveOnly killed AllSolid
-         * on every tile. Deliberately not VF_NoCaveOverBox: its null-Rooms case answers "identity",
-         * which is wrong for an op that could sit behind a different SDF writer.
-         */
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return EVoxelOpEffect::Identity; }
+            return EVoxelOpEffect::CarveOnly;
+        }
 
-            if (P.WormNetworkRange > 0.0f && Rooms != nullptr
-                && Rooms->EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity)
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                     const FVoxelBoxHypotheses& H) const override
+        {
+            const EVoxelOpEffect Intrinsic = EffectOverBox(VoxelBox, Ctx);
+            if (Intrinsic == EVoxelOpEffect::Identity) { return Intrinsic; }
+            if (P.WormNetworkRange > 0.0f && H.Sdf.IsKnown()
+                && H.Sdf.Min >= P.WormNetworkRange)
             {
                 return EVoxelOpEffect::Identity;
             }
-            return EVoxelOpEffect::CarveOnly;
+            return Intrinsic;
         }
 
         /**
@@ -4619,13 +4712,17 @@ namespace
          * la seule sorte qui ait le droit d'être ici : sur-estimer coûte du CPU, sous-estimer fait
          * un trou.
          */
-        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            // Cohérent avec `EffectOverBox` PAR CONSTRUCTION plutôt que par relecture : deux
-            // conditions écrites deux fois finiraient par diverger. Le mémo de verdict de
-            // `FRoomGraphSource` rend ce second appel gratuit.
-            if (EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity) { return 0.0f; }
             return MaxCarveAmplitude();
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return (P.WormNetworkRange > 0.0f && H.Sdf.IsKnown()
+                    && H.Sdf.Min >= P.WormNetworkRange)
+                 ? 0.0f : MaxCarveOverBox(VoxelBox, Ctx);
         }
 
         /** Le ver ne REMPLIT jamais : `InOut.Density -= …` avec un terme positif. */
@@ -4646,7 +4743,6 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
-        const FRoomGraphSource* Rooms;   // NON possédant — peut être nullptr (voir EffectOverBox)
     };
 
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
@@ -4825,9 +4921,9 @@ namespace VoxelDensityOps
         return MakeUnique<FConstantFieldSource>(-BaseDensity);
     }
 
-    TUniquePtr<IVoxelDensityOp> MakeLatticeCorridorSource(const FMazeGenerationParams& P, int32 Seed, float ExtraReach)
+    TUniquePtr<IVoxelDensityOp> MakeLatticeCorridorSource(const FMazeGenerationParams& P, int32 Seed)
     {
-        return MakeUnique<FLatticeCorridorSource>(P, Seed, ExtraReach);
+        return MakeUnique<FLatticeCorridorSource>(P, Seed);
     }
 
     TUniquePtr<IVoxelDensityOp> MakeSdfRoughnessMod(float Strength, float Frequency,
@@ -4910,15 +5006,8 @@ namespace VoxelDensityOps
         // same three ops with a different source.
         constexpr float CarveBlend = 2.0f;
 
-        // Portée que la source doit déclarer pour la paire source+carve : la rugosité peut élargir
-        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
-        // prouvée `VF_PerlinAbsBound` ; la rugosité peut élargir le puits, puis vient le blend du
-        // carve. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
-        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
-                               * VF_PerlinAbsBound + CarveBlend + 1.0f;
-
         TUniquePtr<FShaftFieldSource> ShaftSource =
-            MakeUnique<FShaftFieldSource>(P, Seed, ExtraReach, SpineRadius);
+            MakeUnique<FShaftFieldSource>(P, Seed, SpineRadius);
         const FShaftFieldSource* ShaftPtr = ShaftSource.Get();
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
@@ -4988,8 +5077,8 @@ namespace VoxelDensityOps
         // ── ÉTAPE B : les modificateurs de détail (4b–4h), chacun gated sur
         //    `Sdf < SDFBlendRadius·3` via VF_NearCaveSurface. Voir la note de l'étape B5 là-bas.
         //    L'ORDRE EST CELUI DE L'ORIGINAL et il compte : chacun lit la densité que le précédent
-        //    a laissée (le biais de sol, en particulier, existe pour rattraper la rugosité).
-        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed, RoomPtr));   // 4b
+        //    a laissée (le biais de sol est un ajout indépendant appliqué à cette accumulation).
+        OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));            // 4b
         OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
         OutStack.Add(MakeUnique<FLayerLineMod>(P, RoomPtr));             // 4c — lignes de strates
         OutStack.Add(MakeUnique<FRibbingMod>(P, RoomPtr));               // 4c — nervures
@@ -5001,11 +5090,10 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
         OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
         OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
-        // ⚠️ `RoomPtr` N'EST PAS DÉCORATIF ICI. Le ver hérite du verdict de boîte de la source de
-        // salles, faute de quoi il rend `CarveOnly` partout et tue `AllSolid` sur chaque tuile —
-        // avec les défauts (`BaseDensity = 8`, `WormStrength = 10`) la marge part négative, donc
-        // aucune tuile n'est prouvable, quoi que la source de salles ait réussi à prouver.
-        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed, RoomPtr));
+        // The worm consumes the SDF interval carried by the fold; it has no pointer to, and no
+        // dependency on, this particular room source. That keeps the same operator safe behind a
+        // different SDF writer assembled by the composer.
+        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                       P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
@@ -5026,17 +5114,8 @@ namespace VoxelDensityOps
         // from void and fills — and neither end needed a new operator, only the opposite sign.
         const float BlendK = FMath::Max(P.SDFBlendRadius, 0.01f);
 
-        // Portée que la source doit déclarer pour la paire source+fill : la rugosité peut abaisser
-        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
-        // prouvée `VF_PerlinAbsBound` ; le SDF peut être abaissé par la rugosité, puis par le
-        // SmoothMin de `K/6`, et le fill s'applique dès `Sdf < BlendK`. Sur-estimer coûte du CPU ;
-        // sous-estimer serait un trou.
-        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
-                               * VF_PerlinAbsBound
-                               + BlendK * 2.0f + 1.0f;
-
         OutStack.Add(MakeConstantVoidSource(P.BaseDensity));
-        OutStack.Add(MakeUnique<FIslandBlobSource>(P, Seed, ExtraReach));
+        OutStack.Add(MakeUnique<FIslandBlobSource>(P, Seed));
         // Fréquence 0.08 et 4 octaves — les constantes de `GetFloatingIslandDensity`. Quatrième
         // archétype à réutiliser cet opérateur (Maze 0.12/3, VerticalShafts 0.1/3).
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.08f, 4,
@@ -5061,15 +5140,8 @@ namespace VoxelDensityOps
         // l'original. Reproduite à l'identique pour que l'égalité binaire tienne.
         const float RoughApplyWithin = R + P.SurfaceRoughness + 2.0f;
 
-        // Portée que la source doit déclarer pour la paire source+carve : le rayon du couloir peut
-        // `FBM` est normalisé (`Total / MaxValue`), donc sup|FBM| = sup|Perlin3D| = la borne
-        // prouvée `VF_PerlinAbsBound` ; le rayon du couloir peut être élargi par la rugosité puis
-        // par le blend du carve. Sur-estimer coûte du CPU ; sous-estimer serait un trou.
-        const float ExtraReach = FMath::Abs(P.SurfaceRoughness) * VOXEL_NOISE_SCALE
-                               * VF_PerlinAbsBound + CarveBlend + 1.0f;
-
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
-        OutStack.Add(MakeLatticeCorridorSource(P, Seed, ExtraReach));
+        OutStack.Add(MakeLatticeCorridorSource(P, Seed));
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, RoughFrequency, RoughOctaves, RoughApplyWithin));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
 

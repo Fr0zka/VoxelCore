@@ -233,7 +233,7 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
     // 3. LE VERDICT DE BOÎTE — et la première preuve « AllAir » du plugin
     //=========================================================================
     {
-        int32 NumProvedSolid = 0, NumProvedAir = 0, NumMixed = 0, NumUnsound = 0;
+        int32 NumProvedSolid = 0, NumProvedAir = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
         FRandomStream Rng(24680);
         // Hors de la boucle : la ligne de rapport en a besoin. Une étendue d'échantillonnage qu'on
         // ne peut pas citer dans le rapport est une étendue que personne ne surveille.
@@ -268,6 +268,7 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
                 const float Y = (float)(Origin.Y + gy * Step);
                 const float Z = (float)(Origin.Z + gz * Step);
                 const float D = Stack.EvalMC(X, Y, Z);
+                ++NumBruteSamples;
                 if (bClaimsSolid ? (D >= 0.0f) : (D < 0.0f))
                 {
                     if (NumUnsound == 0)
@@ -275,7 +276,7 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
                         AddError(FString::Printf(
                             TEXT("HOLE: the island stack claimed %s for the box at (%d,%d,%d) but ")
                             TEXT("EvalMC(%.0f, %.0f, %.0f) = %.6g is on the %s side. Suspects, in ")
-                            TEXT("order: the blob source's Pad (does it cover the WARP amplitude ")
+                            TEXT("order: the blob source's propagated SDF interval (does it cover the WARP amplitude ")
                             TEXT("AND the roughness AND the fill blend AND the SmoothMin dip?), ")
                             TEXT("then the Z bound -- note there is NO lower bound, a thin thread ")
                             TEXT("of matter hangs below each island down the axis, so only the ")
@@ -295,11 +296,11 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
         AddInfo(FString::Printf(
             TEXT("Box verdicts over 60 FloatingIslands tiles (XY sampled from +/- %d voxels = %.1f x ")
             TEXT("IslandSpacing %.0f): %d proved AllSolid, %d proved AllAir, ")
-            TEXT("%d Mixed. Today's ClassifyTile proves ZERO of these. The AllAir count is the new ")
+            TEXT("%d Mixed, %d voxels checked, %d violations. Today's ClassifyTile proves ZERO of these. The AllAir count is the new ")
             TEXT("thing: no cave archetype has ever been able to prove 'all air', and a floating-")
             TEXT("island strate is mostly exactly that (OPSTACK-DECOMPOSITION 7)."),
             SpanVoxels, (float)SpanVoxels / FMath::Max(P.IslandSpacing, 1.0f), P.IslandSpacing,
-            NumProvedSolid, NumProvedAir, NumMixed));
+            NumProvedSolid, NumProvedAir, NumMixed, NumBruteSamples, NumUnsound));
 
         if (NumProvedAir == 0)
         {

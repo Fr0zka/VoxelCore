@@ -39,22 +39,35 @@
 // the descent structure intact no matter what an author assembles.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// LA CLÉ DE VOÛTE : EffectOverBox — direction, pas intervalle / THE KEYSTONE: direction, not intervals
+// LA CLÉ DE VOÛTE : EffectOverBox + intervalle SDF / THE KEYSTONE: EffectOverBox + SDF interval
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// La version « complète » d'une borne rendrait un intervalle numérique. NE PAS COMMENCER LÀ.
-// Presque tout opérateur existant est UNIDIRECTIONNEL : il ne fait que creuser, ou que remplir.
-// Cela suffit à reproduire GÉNÉRIQUEMENT chaque garde écrite à la main dans ClassifyTile :
+// Un verdict de boîte doit être une preuve. Rendre `Both` coûte du CPU ; rendre `Identity` ou une
+// direction fausse supprime de la géométrie et peut laisser un joueur tomber au travers du monde.
+// En cas de doute, `Mixed`.
+//
+// Un opérateur qui écrit seulement le canal SDF ne peut pas honnêtement répondre pour le convertisseur
+// qui viendra peut-être après lui : il doit propager un intervalle SDF, et le convertisseur doit plier
+// cet intervalle avec sa propre formule. Chaque opérateur répond ainsi pour lui-même, et la composition
+// reste sûre même pour une combinaison que personne n'a écrite à la main auparavant.
+//
+// A box verdict is a proof. `Both` costs CPU; a false `Identity` or direction removes geometry and can
+// let a player fall through the world. When in doubt, return `Mixed`.
+// An SDF-only writer reports an SDF interval; a later converter folds that interval through its own
+// response. Each operator answers for itself, so an unverified composition remains sound.
+//
+// La première version de cette interface n'avait qu'une direction numérique. Presque tout opérateur
+// existant est UNIDIRECTIONNEL : il ne fait que creuser, ou que remplir. Cela suffit à reproduire
+// GÉNÉRIQUEMENT chaque garde écrite à la main dans ClassifyTile :
 //
 //     « passages ⇒ bCanSolid = false »        EST     CarveOnly
 //     « ponts/arêtes ⇒ bCanAir = false »      EST     FillOnly
 //     « aucun passage près de cette boîte »   EST     Identity
 //
-// Donc la Phase 1 n'a besoin d'AUCUNE borne numérique et obtient déjà toute la propriété de
-// sûreté. Les intervalles sont un resserrement ultérieur pour le coût de génération, pas un
-// prérequis de correction. C'est ce qui rend le premier pas petit.
+// La direction reste le repli conservateur par défaut pour les opérateurs qui ne connaissent pas
+// d'intervalle ; elle ne permet jamais à un écrivain SDF d'usurper la réponse d'un voisin.
 //
-// Phase 1 needs NO numeric bounds and already gets the whole safety property. Intervals are a
-// later tightening for gen cost, not a correctness prerequisite.
+// Direction remains the conservative fallback for operators without an interval implementation;
+// it never lets an SDF writer impersonate a downstream neighbour.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // LE GROS LOT PERF : les strates de grotte ne sautent AUCUNE tuile aujourd'hui
@@ -283,6 +296,64 @@ struct FVoxelOpSample
     float Sdf = FLT_MAX;
 };
 
+/**
+ * Intervalle conservateur du canal SDF sur une boîte.
+ *
+ * `Min` et `Max` sont les bornes SUPRÊMES de toutes les valeurs que l'opérateur peut produire dans
+ * la boîte. `[FLT_MAX, FLT_MAX]` est l'identité exacte : aucune surface connue. Un intervalle inconnu
+ * est volontairement large ; il force le fold à rester `Mixed` plutôt que de risquer un faux tile
+ * uniforme. Les setters refusent toute borne non finie ou inversée : un opérateur qui ne peut pas
+ * prouver son intervalle perd le skip, jamais la géométrie.
+ *
+ * Conservative SDF interval over a box. `Min`/`Max` bound every value the operator can produce.
+ * `[FLT_MAX, FLT_MAX]` is the exact "no surface" identity. Unknown is deliberately wide: it costs
+ * a skip, never a hole. Invalid bounds become unknown instead of being guessed.
+ */
+struct FVoxelBoxSdfInterval
+{
+    bool  bKnown = true;
+    float Min = FLT_MAX;
+    float Max = FLT_MAX;
+
+    bool IsKnown() const { return bKnown; }
+
+    void SetUnknown()
+    {
+        bKnown = false;
+        Min = -FLT_MAX;
+        Max = FLT_MAX;
+    }
+
+    void Set(float InMin, float InMax)
+    {
+        if (!FMath::IsFinite(InMin) || !FMath::IsFinite(InMax) || InMin > InMax)
+        {
+            SetUnknown();
+            return;
+        }
+        bKnown = true;
+        Min = InMin;
+        Max = InMax;
+    }
+
+    /** Output of `min(Input, Other)` when both intervals are known. */
+    void MinWith(const FVoxelBoxSdfInterval& Other)
+    {
+        if (!bKnown || !Other.bKnown)
+        {
+            SetUnknown();
+            return;
+        }
+        Min = FMath::Min(Min, Other.Min);
+        Max = FMath::Min(Max, Other.Max);
+    }
+};
+
+// Forward declaration: the interval-aware EffectOverBox overloads consume the hypotheses that
+// have already been folded, while the hypotheses themselves are declared immediately below the
+// interface.
+struct FVoxelBoxHypotheses;
+
 //=============================================================================
 // L'INTERFACE / THE INTERFACE
 //=============================================================================
@@ -344,8 +415,9 @@ public:
     virtual void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const = 0;
 
     /**
-     * CONSERVATIF. Phase 1 : direction seule. Phase 3 : surcharge avec intervalle numérique.
-     * Rendre Both est toujours sûr ; rendre le mauvais est un trou.
+     * CONSERVATIF. The two-argument method is the intrinsic fallback. The state-aware overload
+     * below is what the stack calls: it sees the SDF interval already produced by earlier ops.
+     * Returning Both is always safe; returning the wrong direction is a hole.
      *
      * Le contrat est « conservatif », pas « forme close » : un opérateur A LE DROIT
      * D'ÉCHANTILLONNER pour répondre. C'est exactement ce que fait ClassifyTile aujourd'hui pour
@@ -354,19 +426,19 @@ public:
      *
      * The contract is "conservative", not "closed-form": an op MAY sample to answer.
      *
-     * ⚠️ SIMPLIFICATION DE PHASE 1, à connaître : une source qui n'écrit QUE le canal SDF ne touche
-     * pas la densité par elle-même — c'est l'opérateur de conversion (`FSdfCarve`/`FSdfFill`) qui le
-     * fait. Répondre honnêtement demanderait de propager un INTERVALLE de SDF à travers la requête
-     * de boîte, exactement comme `Eval` propage une valeur de SDF. En attendant, **la source répond
-     * pour la paire** (elle rend `CarveOnly`/`FillOnly` quand une primitive atteint la boîte,
-     * `Identity` sinon) et la conversion rend `Identity`. Conservatif et correct ; à remplacer par
-     * une requête de boîte à deux canaux quand les intervalles numériques arriveront (Phase 3).
-     *
-     * PHASE 1 SIMPLIFICATION: an SDF-only source answers for itself AND its conversion op; the
-     * conversion returns Identity. Answering honestly needs an SDF INTERVAL threaded through the box
-     * query, mirroring how Eval threads an SDF value. Conservative and correct meanwhile.
+     * An SDF-only source MUST NOT answer for a converter that happens to follow it. It reports its
+     * own interval through `PropagateSdfOverBox`; the converter's state-aware overload then folds
+     * the interval through its own formula. This is the isolation rule that makes free composition
+     * safe.
      */
     virtual EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const = 0;
+
+    /** State-aware effect. The default preserves old custom operators' conservative direction. */
+    virtual EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                         const FVoxelBoxHypotheses&) const
+    {
+        return EffectOverBox(VoxelBox, Ctx);
+    }
 
     /**
      * ⚠️ LE PLIAGE QUI PORTE DES NOMBRES — `OPSTACK-DECOMPOSITION §0.2`, et le plus gros poste de
@@ -406,9 +478,36 @@ public:
         return FLT_MAX;
     }
 
+    /** State-aware amplitude. The default is the old, conservative amplitude. */
+    virtual float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                  const FVoxelBoxHypotheses&) const
+    {
+        return MaxCarveOverBox(VoxelBox, Ctx);
+    }
+
     virtual float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
         return FLT_MAX;
+    }
+
+    /** State-aware amplitude. The default is the old, conservative amplitude. */
+    virtual float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                 const FVoxelBoxHypotheses&) const
+    {
+        return MaxFillOverBox(VoxelBox, Ctx);
+    }
+
+    /**
+     * Propagate this operator's own SDF result through a box query. Only call this for an operator
+     * whose cached channel declaration writes `Sdf`. The default is unknown by construction: a new
+     * SDF writer cannot accidentally make a false uniform verdict merely because it forgot this
+     * method. Implementations that assign SDF replace the interval; min/accumulating writers use
+     * `FVoxelBoxSdfInterval::MinWith`.
+     */
+    virtual void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
+                                     const FVoxelOpContext&) const
+    {
+        InOut.SetUnknown();
     }
 
     /**
@@ -537,6 +636,9 @@ struct FVoxelBoxHypotheses
     float SolidMargin = 0.0f;
     float AirMargin   = 0.0f;
 
+    /** SDF interval after all SDF writers folded so far. It starts at the exact no-surface identity. */
+    FVoxelBoxSdfInterval Sdf;
+
     bool IsDead() const { return !bCanBeAllSolid && !bCanBeAllAir; }
 
     /** Verdict final : exactement une hypothèse doit survivre. Égalité = prudence ⇒ Mixed. */
@@ -626,14 +728,29 @@ FORCEINLINE void VF_FoldEffect(FVoxelBoxHypotheses& H, EVoxelOpEffect Effect,
  * pure FillOnly would have thrown away, while still letting a passage take it back.
  */
 FORCEINLINE void VF_FoldOp(FVoxelBoxHypotheses& H, const IVoxelDensityOp& Op,
-                           const FBox& VoxelBox, const FVoxelOpContext& Ctx)
+                           const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                           bool bWritesSdf)
 {
+    // Soundness bias: an unknown SDF interval is allowed to kill a skip, never to manufacture a
+    // uniform tile. The interval is propagated only after this op's own effect has been folded, so
+    // the next op sees exactly the SDF version that Eval would expose at this point in the stack.
     const EVoxelTileClass Forced = Op.ClassifyBox(VoxelBox, Ctx);
     if (Forced != EVoxelTileClass::Mixed)
     {
         VF_ForceHypotheses(H, Forced, Op.ForcedMarginOverBox(VoxelBox, Ctx));
+        if (bWritesSdf) { Op.PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx); }
         return;
     }
-    VF_FoldEffect(H, Op.EffectOverBox(VoxelBox, Ctx),
-                  Op.MaxCarveOverBox(VoxelBox, Ctx), Op.MaxFillOverBox(VoxelBox, Ctx));
+    VF_FoldEffect(H, Op.EffectOverBox(VoxelBox, Ctx, H),
+                  Op.MaxCarveOverBox(VoxelBox, Ctx, H),
+                  Op.MaxFillOverBox(VoxelBox, Ctx, H));
+    if (bWritesSdf) { Op.PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx); }
+}
+
+/** Backward-compatible helper for unit tests and callers with no cached declaration metadata. */
+FORCEINLINE void VF_FoldOp(FVoxelBoxHypotheses& H, const IVoxelDensityOp& Op,
+                           const FBox& VoxelBox, const FVoxelOpContext& Ctx)
+{
+    VF_FoldOp(H, Op, VoxelBox, Ctx,
+              (Op.ChannelWrites() & VoxelOpChannels::Sdf) != 0);
 }

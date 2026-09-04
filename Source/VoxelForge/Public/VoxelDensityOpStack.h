@@ -154,7 +154,8 @@ public:
         FVoxelBoxHypotheses H;
         for (const FOpEntry& Entry : Ops)
         {
-            VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx);
+            VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx,
+                      (Entry.Writes & VoxelOpChannels::Sdf) != 0);
             // Do not early-out on a dead hypothesis: a later forcing structural post may
             // deliberately overwrite it (the XY edge seal is appended after passage carving).
         }
@@ -189,7 +190,8 @@ public:
             const bool bSolidBefore = H.bCanBeAllSolid;
             const bool bAirBefore   = H.bCanBeAllAir;
 
-            VF_FoldOp(H, *Ops[i].Op, VoxelBox, Ctx);
+            VF_FoldOp(H, *Ops[i].Op, VoxelBox, Ctx,
+                      (Ops[i].Writes & VoxelOpChannels::Sdf) != 0);
 
             if (bSolidBefore && !H.bCanBeAllSolid && OutSolidKiller == INDEX_NONE) { OutSolidKiller = i; }
             if (bAirBefore   && !H.bCanBeAllAir   && OutAirKiller   == INDEX_NONE) { OutAirKiller   = i; }
@@ -270,14 +272,11 @@ namespace VoxelDensityOps
      *  Écrit le canal SDF uniquement. Identité d'arête = hash(nœud inférieur, axe), donc deux
      *  chunks adjacents NE PEUVENT PAS être en désaccord : pas de cache de chunk, pas de région
      *  COLLECT, zéro risque de couture (AUDIT §6.4 — le motif à préférer). */
-    /*  `ExtraReach` = tout ce qui peut eLARGIR la portée du couloir en aval (amplitude de rugosité
-     *  rayon de blend du carve). La source répond pour la paire source+conversion dans
-     *  `EffectOverBox` (voir la note « SIMPLIFICATION DE PHASE 1 » dans VoxelDensityOp.h), donc elle
-     *  doit connaître cette marge, sinon sa réponse `Identity` serait un MENSONGE — c'est-à-dire un
-     *  trou. / The source answers for the source+conversion pair, so it must know the downstream
-     *  margin: an Identity that is wrong is a hole. */
+    /** The source answers only for its own SDF field. Its box query publishes an SDF interval;
+     *  each later converter or modifier consumes that interval through the generic fold. It does
+     *  not know, and must not answer for, any downstream operator. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeLatticeCorridorSource(const FMazeGenerationParams& P,
-                                                                         int32 Seed, float ExtraReach);
+                                                                         int32 Seed);
 
     /** Rôle 3 — rugosité de paroi appliquée au canal SDF (variante Maze/Shafts/Islands).
      *  `Frequency` est codée en dur au site d'appel aujourd'hui (0.12 pour Maze) ; l'exposer est
@@ -302,7 +301,8 @@ namespace VoxelDensityOps
     /** Rôle 1 — la dalle : surface de sol + surface de plafond → champ de vide. **XY-PUR** depuis
      *  OPSTACK-DECOMPOSITION §3.1 (le terme en Z des deux bruits est parti), ce qui lui donne un
      *  `ClassifyBox` EXACT sans échantillonnage : les deux surfaces vivent dans des bandes en Z
-     *  bornées par le contrat [-1,1] de FBM. Sert FlatPlain **et** CrystalChamber. */
+     *  bornées par le supremum prouvé de FBM (1.5, not the nominal parameter label). Sert
+     *  FlatPlain **et** CrystalChamber. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSlabVoidSource(const FSlabGenerationParams& P, int32 Seed);
 
     /** Rôle 3 — cylindres de hauteur infinie sur une grille monde. N'ajoute que du solide ⇒
@@ -380,8 +380,9 @@ namespace VoxelDensityOps
                                                 const UVoxelStrateManager* StrateManager);
 
     /**
-     * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE du dernier `FRoomGraphSource::EffectOverBox`
-     * évalué sur ce thread. **Tests uniquement. N'entre dans aucune décision de génération.**
+     * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE de la dernière propagation d'intervalle
+     * de `FRoomGraphSource` évaluée sur ce thread. **Tests uniquement. N'entre dans aucune décision
+     * de génération.**
      *
      * ⚠️ POURQUOI ÇA EXISTE PLUTÔT QUE D'ÊTRE REFAIT DANS LE TEST. Le test a déjà tout ce qu'il faut
      * pour rejouer le critère — il appelle `BuildChunkCache` ailleurs. Le rejouer serait une

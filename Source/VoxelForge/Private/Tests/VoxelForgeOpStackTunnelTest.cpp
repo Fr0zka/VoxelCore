@@ -1086,8 +1086,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // 4. LE VERDICT DE BOÎTE — plus attendu nul, et CHAQUE VERDICT EST BRUTE-FORCÉ
     //=========================================================================
     // ⚠️ CE BLOC A CHANGÉ DE NATURE LE 2026-07-28, ET IL FAUT SAVOIR POURQUOI.
-    // Il ASSERTAIT `NumProved == 0`. C'était juste tant que `FRoomGraphSource::EffectOverBox`
-    // rendait `Both` inconditionnellement : « zéro » était alors une description honnête de l'état
+    // Il ASSERTAIT `NumProved == 0`. C'était juste tant que la source de salles répondait
+    // `Both` inconditionnellement : « zéro » était alors une description honnête de l'état
     // du portage. Depuis que la source répond SPATIALEMENT, asserter zéro reviendrait à interdire
     // le gain qu'on vient de construire — et pire, ça transformerait le test en gardien du bug.
     //
@@ -1239,7 +1239,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             AddInfo(FString::Printf(
                 TEXT("[%s] Box verdicts over 40 TunnelNetwork tiles: %d proved (%d AllSolid, %d AllAir), ")
                 TEXT("%d Mixed -- brute-forced over %d voxels, %d violations. This number was 0 proved / ")
-                TEXT("40 Mixed until FRoomGraphSource::EffectOverBox learned to answer spatially, and it ")
+                TEXT("40 Mixed until the SDF source interval and state-aware fold learned to answer spatially, and it ")
                 TEXT("is the single largest perf item of the whole plan (OPSTACK-DECOMPOSITION 0.2): a ")
                 TEXT("proved tile skips GenerateMesh entirely, so it trades one BuildChunkCache against ")
                 TEXT("30000+ density evaluations. Read the PROVED count as a measurement, never as a ")
@@ -1407,6 +1407,11 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             UWCtx.StrateTopWorldZ    = UP.StrateTopWorldZ;
             UWCtx.StrateBottomWorldZ = UP.StrateBottomWorldZ;
             UWStack.PrepareChunk(UWCtx);
+
+            // Underwater shares the tunnel builder, but it is a separate production archetype. Keep
+            // its box proof in the report so a future change cannot silently make only this slot
+            // unsound or sterile.
+            RunTileScan(UWStack, UP, UWCtx, TEXT("Underwater"), /*bZeroProvedIsExpected*/ false);
 
             TestEqual(TEXT("the Underwater stack is the tunnel stack: same 20 ops"), UWStack.Num(), 20);
 
