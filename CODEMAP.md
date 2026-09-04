@@ -309,7 +309,7 @@ This is **where terrain shape lives.**
 
 ### 3.6b Strate measurement — `Public/VoxelStrateMeasure.h` + `Private/VoxelStrateMeasure.cpp`
 Headless, read-only Tier 2 measurement pass. `VF_MeasureStrate` samples one strate between a
-boundary-seal-derived (or explicitly overridden, including explicit zero) interior margin into a bounded coarse grid.
+boundary-seal-derived (or explicitly overridden, including explicit zero) interior margin into a bounded grid.
 When both `CoverPointA` and `CoverPointB` are set, the XY window is their AABB expanded by
 `CoverMarginVoxels`; otherwise it is the legacy square centered on `CenterXY` with
 `RadiusInVoxels`.
@@ -319,8 +319,11 @@ the inclusive/exclusive voxel Z window used, the exact sampled dimensions/bounds
 component's deterministic lowest-cell representative point, cell count, and count of components
 holding at least 1% of the air. The flood fill also retains component cell counts in discovery order,
 so diagnostics can classify small non-largest components without a second source sample.
-Callers may optionally receive that exact polarity grid as `FVoxelStrateSampleGrid`; the editor-only
-composer preview consumes this hand-off rather than sampling the world again.
+Callers may optionally receive that exact polarity grid and scalar values as `FVoxelStrateSampleGrid`; the
+editor-only composer preview consumes this hand-off rather than sampling the world again. The filled view uses
+the captured `Air` polarity, while the paired density=0 contour uses the captured scalar field directly (no blur
+of the coarse raster). Capture refuses a grid over `MaxCells` before allocating it; ordinary metric callers do
+not retain either buffer.
 `VF_AreConnected` recovers a deterministic BFS parent path from the same kind of grid and checks
 candidate routes at full voxel resolution before returning `Connected`. When a candidate is
 refuted, its specific coarse cell edge is added to a deterministic array blocklist and BFS is
@@ -336,7 +339,7 @@ No UObject state, cache, actor, world, or PIE is required.
 | Symbol | Role |
 |--------|------|
 | `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin (including zero to sample the seal) or fit the XY window to two points with a margin, and results identify the resolved window/dimensions/Z range and deterministic component representatives/sizes. |
-| `FVoxelStrateSampleGrid` | Optional one-pass `density > 0` air/solid capture exported by the measurement functions; bounded by `MaxCells`, consumed by editor/automation previews, never retained on ordinary metrics calls. |
+| `FVoxelStrateSampleGrid` | Optional one-pass `density > 0` `Air` polarity plus exact scalar `Density` capture exported by measurement functions; bounded by `MaxCells`, consumed by editor/automation previews, never retained on ordinary metrics calls. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; resolves either the legacy centered square or the two-point fitted AABB, and refuses invalid bounds or a grid over `MaxCells`. |
 | `VF_AreConnected` | Coarse 6-connected BFS plus deterministic blocked-edge retries, with a full-resolution air recheck for every candidate route and explicit endpoint-solid, out-of-window, `NotConnectedAtThisResolution`, `CoarseLiedBudgetExhausted` (unknown), and connected outcomes; diagnostics include endpoint component facts and the retry count from that same grid. |
 | `VF_DiagnoseConnectivity` | The same query plus each mouth's air-component size/share and exact geometric distance to the nearest cell of the other component; proximity is measured in coarse-cell coordinates and does not claim a route through solid. |
@@ -474,10 +477,13 @@ the offline sampler, and brute-forces every uniform box verdict from the novel s
 
 **`Public/VoxelStratePreview.h` + `Private/VoxelStratePreview.cpp`** — editor/automation-only PNG
 renderer and self-contained contact sheet. It consumes `FVoxelStrateSampleGrid` from the measurement
-pass, emits deterministic centre-Y XZ and data-selected XY slices via `IImageWrapper`, caps each
-image at 512 pixels (including its scale footer), and sorts the 64-card sheet by survivor status then
-descending corpus-centroid distance. The page repeats each candidate's exact measurement window,
-marks rejection reasons, explains the 2D-connectivity limitation, and has no runtime generation hook.
+pass, emits deterministic centre-Y XZ and data-selected XY slices via `IImageWrapper`, and shows filled-cell
+and scalar density=0 contour views side by side without blurring the sampled raster. Each image is capped at
+512 pixels (including its scale footer). `FVoxelStrateFinePreviewSettings` is a separate caller-selected
+fine pass: the composer selects only survivors at step 1, radius 64 (a 128×128 XY ROI), and `MaxCells=2,000,000`;
+the writer labels every image with its exact ROI and step and records cap refusals in the page. The 64-card
+sheet remains sorted by survivor status then descending corpus-centroid distance, repeats exact measurement
+windows, marks rejection reasons, explains the 2D-connectivity limitation, and has no runtime generation hook.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
 `UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
@@ -544,7 +550,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 | `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. Bootstrap follow-up: **1,422 applications / 168 distinct fields**; **38/64 survival**, feature scale **0→376**, walkable **0.000000→0.286766** (no broadening beyond the prior run); **1,356 Mixed + 608 AllSolid + 596 AllAir = 1,204 proved boxes**, **1,602,524 lattice voxels checked, 0 violations**, 146.250 s total in the final full-namespace run. |
 | ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
-| `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic XZ/XY preview, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Focused run: **42/64 survival (65.6%)**, **64 distinct recipes**, **6,848 bootstrap applications / 107 distinct fields**, **659 proved boxes / 877,129 voxels / 0 violations**, **64 rendered pairs + index.html**. |
+| `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Focused run: **42/64 survival (65.6%)**, **64 distinct recipes**, **6,848 bootstrap applications / 107 distinct fields**, **659 proved boxes / 877,129 voxels / 0 violations**, **64 coarse filled + 64 coarse contour pairs**, **42 fine ROI filled + 42 fine contour pairs**, **184.659 s**, **0 refusals**. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |
 | `VoxelForgeStrateConnectivityTest.cpp` | `VoxelForge.Generation.StrateConnectivity` / `VoxelForge.Generation.StrateConnectivityRefinement` / `VoxelForge.Generation.VerticalShaftSeamFreedom` | Bounded strate metrics with density-polarity and solid-gap controls, deterministic route rechecks, and refinement sweeps. The refinement test fits the measurement AABB to each arrival/departure mouth pair, reports exact before/after seed-6 cell counts, reruns every negative with doubled margin, measures tree orphan candidates/path reachability and roughness-bubble proxies, asserts axis landings, checks source/mirror physical paths, and requires 16/16 effective arrival→departure results across the 16 VerticalShafts seeds. Margin-binding negatives are reported as measurement limits, never as gap findings. The seam test re-evaluates cell-boundary positions after warming distinct neighbouring chunk contexts in both legacy and operator-stack paths. |

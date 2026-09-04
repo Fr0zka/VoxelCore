@@ -21,6 +21,9 @@ namespace
     constexpr int32 BoxChecksPerCandidate = 40;
     constexpr int32 BoxStep = 1;
     constexpr int32 BoxCells = 8;
+    constexpr int32 FinePreviewSampleStep = 1;
+    constexpr int32 FinePreviewRadiusVoxels = 64;
+    constexpr int32 FinePreviewMaxCells = 2000000;
 
     const TCHAR* VF_ConnectivityName(EVoxelConnectivityResult Result)
     {
@@ -308,6 +311,14 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     MeasureSettings.HeadroomCells = 2;
     MeasureSettings.InteriorMarginVoxels = -1;
 
+    FVoxelStrateFinePreviewSettings FinePreviewSettings;
+    FinePreviewSettings.SampleStep = FinePreviewSampleStep;
+    FinePreviewSettings.RadiusInVoxels = FinePreviewRadiusVoxels;
+    FinePreviewSettings.MaxCells = FinePreviewMaxCells;
+    TestTrue(TEXT("fine preview defaults are a bounded valid ROI"), FinePreviewSettings.IsValid());
+    const FVoxelStrateMeasureSettings FineMeasureSettings =
+        FinePreviewSettings.MakeMeasureSettings(MeasureSettings);
+
     FString CandidateTable = TEXT(
         "candidate | recipe (compact) | air | largest share | walkable | feature scale | arrival->departure\n");
     int32 NumSurvivors = 0;
@@ -329,10 +340,22 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     PreviewCandidates.Reserve(NumCandidates);
     FVoxelStratePreviewWindow PreviewWindow;
     bool bPreviewWindowSet = false;
+    int32 NumFineRequested = 0;
+    int32 NumFineRendered = 0;
+    int32 NumFineContourRendered = 0;
+    int32 NumFineRefused = 0;
+    int64 TotalFineCells = 0;
+    int64 PeakFineCaptureBytes = 0;
+    int64 PeakFineRasterBytes = 0;
+    double FineMeasureSeconds = 0.0;
+    double FineRenderSeconds = 0.0;
+    double CoarsePreviewSeconds = 0.0;
+    bool bFineCapRefusalChecked = false;
     const FString PreviewRunId = FString::Printf(
-        TEXT("structure_seed_%d_corpus_%08x_step_%d_radius_%d"),
+        TEXT("structure_seed_%d_corpus_%08x_step_%d_radius_%d_fine_step_%d_fine_radius_%d"),
         AuthoredSettings->Seed, Corpus.GetContentsHash(),
-        MeasureSettings.SampleStep, MeasureSettings.RadiusInVoxels);
+        MeasureSettings.SampleStep, MeasureSettings.RadiusInVoxels,
+        FinePreviewSettings.SampleStep, FinePreviewSettings.RadiusInVoxels);
     const FString PreviewDirectory = FPaths::ProjectSavedDir()
         / TEXT("ComposerPreview") / PreviewRunId;
     TArray<int32> ShapeCounts;
@@ -440,6 +463,23 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
 
         Stack.PrepareChunk(Context);
         FStackDensitySampler Sampler(Stack);
+
+        if (!bFineCapRefusalChecked)
+        {
+            FVoxelStrateMeasureSettings RefusalSettings = FineMeasureSettings;
+            RefusalSettings.MaxCells = 1;
+            FVoxelStrateSampleGrid RefusedFineGrid;
+            const FVoxelStrateMetrics RefusedFineMetrics = VF_MeasureStrateWithSampler(
+                Sampler, BottomVoxelZ, TopVoxelZ + 1,
+                Context.EdgeSealThickness, RefusalSettings, &RefusedFineGrid);
+            TestTrue(TEXT("fine preview refuses an over-cap ROI before allocation"),
+                     !RefusedFineMetrics.bValid
+                         && RefusedFineGrid.Air.Num() == 0
+                         && RefusedFineGrid.Density.Num() == 0
+                         && RefusedFineMetrics.RefusalReason.Contains(TEXT("MaxCells")));
+            bFineCapRefusalChecked = true;
+        }
+
         FVoxelStrateSampleGrid SampleGrid;
         const FVoxelStrateMetrics Metrics = VF_MeasureStrateWithSampler(
             Sampler, BottomVoxelZ, TopVoxelZ + 1,
@@ -527,10 +567,11 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         }
         TestTrue(FString::Printf(TEXT("candidate %d preview captures its measurement grid"),
                                  CandidateIndex),
-                 !Metrics.bValid || SampleGrid.IsValid());
+                 !Metrics.bValid || SampleGrid.HasScalarDensity());
 
         FVoxelStratePreviewCandidate PreviewCandidate;
         FString PreviewError;
+        const double CoarsePreviewStartSeconds = FPlatformTime::Seconds();
         const bool bPreviewWritten = VF_WriteStratePreviewCandidate(
             PreviewDirectory,
             CandidateIndex,
@@ -544,16 +585,82 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
             RejectionReason,
             PreviewCandidate,
             PreviewError);
+        CoarsePreviewSeconds += FPlatformTime::Seconds() - CoarsePreviewStartSeconds;
         TestTrue(FString::Printf(TEXT("candidate %d preview rasterises without a second sample"),
                                  CandidateIndex),
                  bPreviewWritten);
         TestTrue(FString::Printf(TEXT("candidate %d has images when its measurement is valid"),
                                  CandidateIndex),
-                 !Metrics.bValid || PreviewCandidate.bRendered);
+                 !Metrics.bValid
+                     || (PreviewCandidate.bRendered && PreviewCandidate.bContourRendered));
         if (!bPreviewWritten)
         {
             AddError(FString::Printf(TEXT("candidate %d preview failed: %s"),
                                      CandidateIndex, *PreviewError));
+        }
+
+        const bool bCandidateSurvivor = bNonVacuous && bLargestEnough && bLawPass;
+        if (bCandidateSurvivor)
+        {
+            ++NumFineRequested;
+            FVoxelStrateSampleGrid FineGrid;
+            const double FineMeasureStartSeconds = FPlatformTime::Seconds();
+            const FVoxelStrateMetrics FineMetrics = VF_MeasureStrateWithSampler(
+                Sampler, BottomVoxelZ, TopVoxelZ + 1,
+                Context.EdgeSealThickness, FineMeasureSettings, &FineGrid);
+            FineMeasureSeconds += FPlatformTime::Seconds() - FineMeasureStartSeconds;
+
+            const FString FineFailureReason = FineMetrics.bValid
+                ? FString() : FineMetrics.RefusalReason;
+            const double FineRenderStartSeconds = FPlatformTime::Seconds();
+            FString FinePreviewError;
+            const bool bFineWritten = VF_WriteStratePreviewFineCandidate(
+                PreviewDirectory, CandidateIndex, FineGrid,
+                FineMeasureSettings.HeadroomCells, FineFailureReason,
+                PreviewCandidate, FinePreviewError);
+            FineRenderSeconds += FPlatformTime::Seconds() - FineRenderStartSeconds;
+
+            TestTrue(FString::Printf(TEXT("candidate %d fine preview records without a second renderer sample"),
+                                     CandidateIndex),
+                     bFineWritten);
+            TestTrue(FString::Printf(TEXT("candidate %d fine capture keeps scalar density"),
+                                     CandidateIndex),
+                     !FineMetrics.bValid || FineGrid.HasScalarDensity());
+            if (FineMetrics.bValid)
+            {
+                TotalFineCells += FineGrid.CellCount;
+                PeakFineCaptureBytes = FMath::Max(
+                    PeakFineCaptureBytes,
+                    static_cast<int64>(FineGrid.Air.GetAllocatedSize())
+                        + static_cast<int64>(FineGrid.Density.GetAllocatedSize()));
+            }
+            if (!FineMetrics.bValid)
+            {
+                ++NumFineRefused;
+            }
+            if (PreviewCandidate.bFineRendered)
+            {
+                ++NumFineRendered;
+                PeakFineRasterBytes = FMath::Max(
+                    PeakFineRasterBytes,
+                    static_cast<int64>(PreviewCandidate.FineVerticalImageWidth)
+                        * static_cast<int64>(PreviewCandidate.FineVerticalImageHeight)
+                        * static_cast<int64>(sizeof(FColor)));
+                PeakFineRasterBytes = FMath::Max(
+                    PeakFineRasterBytes,
+                    static_cast<int64>(PreviewCandidate.FinePlanImageWidth)
+                        * static_cast<int64>(PreviewCandidate.FinePlanImageHeight)
+                        * static_cast<int64>(sizeof(FColor)));
+            }
+            if (PreviewCandidate.bFineContourRendered)
+            {
+                ++NumFineContourRendered;
+            }
+            if (!bFineWritten)
+            {
+                AddError(FString::Printf(TEXT("candidate %d fine preview failed: %s"),
+                                         CandidateIndex, *FinePreviewError));
+            }
         }
         PreviewCandidates.Add(MoveTemp(PreviewCandidate));
 
@@ -637,6 +744,17 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         TotalBoxMixed, TotalBoxAllSolid, TotalBoxAllAir, TotalBoxProved,
         TotalBoxCheckedVoxels, TotalBoxViolations,
         FirstBoxViolation.IsEmpty() ? TEXT("No violations.") : *FirstBoxViolation));
+    AddInfo(FString::Printf(
+        TEXT("Preview cost: coarse step=%d 64-card pass render %.3fs; fine ROI requested=%d "
+             "(survivors=%d), rendered=%d, contour pairs=%d, refused=%d; fine sample %.3fs + "
+             "render %.3fs; fine cells sampled=%lld; peak fine Air+Density capture=%lld bytes; "
+             "peak single RGBA raster=%lld bytes; ROI step=%d radius=%d MaxCells=%d."),
+        MeasureSettings.SampleStep, CoarsePreviewSeconds,
+        NumFineRequested, NumSurvivors, NumFineRendered, NumFineContourRendered, NumFineRefused,
+        FineMeasureSeconds, FineRenderSeconds, TotalFineCells,
+        PeakFineCaptureBytes, PeakFineRasterBytes,
+        FinePreviewSettings.SampleStep, FinePreviewSettings.RadiusInVoxels,
+        FinePreviewSettings.MaxCells));
     FString PreviewIndexPath;
     FString PreviewError;
     const bool bPreviewIndexWritten = bPreviewWindowSet
@@ -658,20 +776,28 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     {
         const FVoxelStratePreviewCandidate& FirstPreview = PreviewCandidates[0];
         int32 NumRenderedPairs = 0;
+        int32 NumRenderedContourPairs = 0;
         for (const FVoxelStratePreviewCandidate& Candidate : PreviewCandidates)
         {
             if (Candidate.bRendered)
             {
                 ++NumRenderedPairs;
             }
+            if (Candidate.bContourRendered)
+            {
+                ++NumRenderedContourPairs;
+            }
         }
         AddInfo(FString::Printf(
-            TEXT("Composer preview: %d candidates, %d rendered pairs, vertical=%dx%d, plan=%dx%d, "
+            TEXT("Composer preview: %d candidates, %d filled pairs + %d contour pairs, "
+                 "vertical=%dx%d, plan=%dx%d, "
                  "plan Z chosen from each candidate's measured layer with the highest solid/air "
                  "boundary count (first candidate Z=%d); index=%s; first-candidate window=%s; "
-                 "image cap=512 px including 20 px scale footer."),
+                 "fine previews are linked on survivor cards; image cap=512 px including 20 px "
+                 "scale footer."),
             PreviewCandidates.Num(),
             NumRenderedPairs,
+            NumRenderedContourPairs,
             FirstPreview.VerticalImageWidth, FirstPreview.VerticalImageHeight,
             FirstPreview.PlanImageWidth, FirstPreview.PlanImageHeight,
             FirstPreview.PlanSliceWorldZ,
@@ -686,6 +812,14 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("exactly 64 structure candidates were requested"), NumCandidates, 64);
     TestEqual(TEXT("invalid recipes emitted by the roller/build path"), NumInvalidRecipes, 0);
     TestEqual(TEXT("custom-stack box verdict violations"), TotalBoxViolations, 0);
+    TestTrue(TEXT("fine cap refusal was checked before any fine allocation"),
+             bFineCapRefusalChecked);
+    TestEqual(TEXT("fine previews are requested only for coarse survivors"),
+              NumFineRequested, NumSurvivors);
+    TestEqual(TEXT("fine preview outcomes account for every requested survivor"),
+              NumFineRendered + NumFineRefused, NumFineRequested);
+    TestEqual(TEXT("every rendered fine preview has a scalar contour pair"),
+              NumFineContourRendered, NumFineRendered);
     TestTrue(TEXT("structure roller emits 64 distinct structural recipes"),
              DistinctRecipes.Num() == NumCandidates);
 

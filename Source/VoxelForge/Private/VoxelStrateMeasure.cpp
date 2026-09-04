@@ -32,6 +32,8 @@ namespace VoxelStrateMeasurePrivate
 
         // 1 = air, 0 = solid. The polarity is deliberately explicit at the sampling site below.
         TArray<uint8> Air;
+        // Optional exact scalar samples retained only for an explicit preview capture.
+        TArray<float> Density;
 
         FORCEINLINE int32 Index(int32 X, int32 Y, int32 Z) const
         {
@@ -84,6 +86,7 @@ namespace VoxelStrateMeasurePrivate
         float ExplicitBoundarySealThickness,
         bool bUseExplicitBounds,
         const FVoxelStrateMeasureSettings& Settings,
+        bool bCaptureDensity,
         FSampleGrid& OutGrid,
         FString& OutReason)
     {
@@ -356,6 +359,10 @@ namespace VoxelStrateMeasurePrivate
         OutGrid.SampledMinZ = static_cast<int32>(InteriorMinZ);
         OutGrid.SampledMaxZ = static_cast<int32>(InteriorMaxZ);
         OutGrid.Air.SetNumUninitialized(OutGrid.CellCount);
+        if (bCaptureDensity)
+        {
+            OutGrid.Density.SetNumUninitialized(OutGrid.CellCount);
+        }
 
         bool bSawNonFiniteDensity = false;
         int32 CellIndex = 0;
@@ -375,6 +382,10 @@ namespace VoxelStrateMeasurePrivate
                     }
 
                     // MC convention in this codebase: negative is solid, positive is air.
+                    if (bCaptureDensity)
+                    {
+                        OutGrid.Density[CellIndex] = Density;
+                    }
                     OutGrid.Air[CellIndex++] = Density > 0.0f ? 1u : 0u;
                 }
             }
@@ -408,6 +419,7 @@ namespace VoxelStrateMeasurePrivate
         // Move, rather than copy, the already-built polarity grid. The caller owns this buffer
         // only when it explicitly requested a capture.
         Destination.Air = MoveTemp(Source.Air);
+        Destination.Density = MoveTemp(Source.Density);
     }
 
     void DecodeIndex(const FSampleGrid& Grid, int32 Index, int32& OutX, int32& OutY, int32& OutZ)
@@ -1237,7 +1249,7 @@ namespace VoxelStrateMeasurePrivate
         if (!BuildSampleGrid(Generator, Manager, Sampler, StrateIndex,
                              ExplicitBottomWorldZ, ExplicitTopWorldZ,
                              ExplicitBoundarySealThickness, bUseExplicitBounds,
-                             Settings, Grid, RefusalReason))
+                             Settings, false, Grid, RefusalReason))
         {
             if (OutDiagnostics != nullptr)
             {
@@ -1291,7 +1303,7 @@ FVoxelStrateMetrics VF_MeasureStrate(
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             &Generator, &Manager, nullptr, StrateIndex, 0, 0, 0.0f, false,
-            Settings, Grid, Result.RefusalReason))
+            Settings, OutSampleGrid != nullptr, Grid, Result.RefusalReason))
     {
         return Result;
     }
@@ -1335,7 +1347,8 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             nullptr, nullptr, &Sampler, INDEX_NONE, StrateBottomWorldZ, StrateTopWorldZ,
-            BoundarySealThickness, true, Settings, Grid, Result.RefusalReason))
+            BoundarySealThickness, true, Settings, OutSampleGrid != nullptr,
+            Grid, Result.RefusalReason))
     {
         return Result;
     }

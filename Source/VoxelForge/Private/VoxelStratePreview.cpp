@@ -53,6 +53,8 @@ namespace
     const FColor GSolidColor(18, 23, 30, 255);
     const FColor GAirColor(218, 225, 231, 255);
     const FColor GWalkableColor(245, 166, 54, 255);
+    const FColor GContourBackground(12, 19, 25, 255);
+    const FColor GContourLineColor(77, 226, 190, 255);
     const FColor GScaleBarColor(245, 245, 245, 255);
     const FColor GScaleBarBackground(9, 12, 17, 255);
 
@@ -375,6 +377,262 @@ namespace
         return OutWidth > 0 && OutHeight > 0;
     }
 
+    struct FContourPoint
+    {
+        float X = 0.0f;
+        float Y = 0.0f;
+    };
+
+    FContourPoint VF_InterpolateContourPoint(const FContourPoint& A,
+                                             const FContourPoint& B,
+                                             float ValueA,
+                                             float ValueB)
+    {
+        const float Denominator = ValueA - ValueB;
+        const float Alpha = FMath::IsNearlyZero(Denominator)
+            ? 0.5f
+            : FMath::Clamp(ValueA / Denominator, 0.0f, 1.0f);
+        return {
+            FMath::Lerp(A.X, B.X, Alpha),
+            FMath::Lerp(A.Y, B.Y, Alpha)
+        };
+    }
+
+    void VF_DrawContourLine(TArray<FColor>& Pixels, int32 Width, int32 Height,
+                            const FContourPoint& A, const FContourPoint& B)
+    {
+        // The caller passes the content height so the scale-bar footer is never painted over.
+        // The pixel buffer is intentionally taller than this region.
+        if (Width <= 0 || Height <= 0 || Pixels.Num() < Width * Height)
+        {
+            return;
+        }
+
+        int32 X0 = FMath::Clamp(FMath::RoundToInt(A.X), 0, Width - 1);
+        int32 Y0 = FMath::Clamp(FMath::RoundToInt(A.Y), 0, Height - 1);
+        const int32 X1 = FMath::Clamp(FMath::RoundToInt(B.X), 0, Width - 1);
+        const int32 Y1 = FMath::Clamp(FMath::RoundToInt(B.Y), 0, Height - 1);
+        const int32 DeltaX = FMath::Abs(X1 - X0);
+        const int32 StepX = X0 < X1 ? 1 : -1;
+        const int32 DeltaY = -FMath::Abs(Y1 - Y0);
+        const int32 StepY = Y0 < Y1 ? 1 : -1;
+        int32 Error = DeltaX + DeltaY;
+
+        for (;;)
+        {
+            Pixels[Y0 * Width + X0] = GContourLineColor;
+            if (X0 == X1 && Y0 == Y1)
+            {
+                break;
+            }
+            const int32 DoubleError = 2 * Error;
+            if (DoubleError >= DeltaY)
+            {
+                Error += DeltaY;
+                X0 += StepX;
+            }
+            if (DoubleError <= DeltaX)
+            {
+                Error += DeltaX;
+                Y0 += StepY;
+            }
+        }
+    }
+
+    void VF_DrawContourQuad(TArray<FColor>& Pixels, int32 Width, int32 Height,
+                            const FContourPoint& A, const FContourPoint& B,
+                            const FContourPoint& C, const FContourPoint& D,
+                            float ValueA, float ValueB, float ValueC, float ValueD)
+    {
+        if (!FMath::IsFinite(ValueA) || !FMath::IsFinite(ValueB)
+            || !FMath::IsFinite(ValueC) || !FMath::IsFinite(ValueD))
+        {
+            return;
+        }
+
+        // A/B/C/D wind around one scalar quad. The bit mask is deliberately based on the same
+        // strict sign rule as Air: density > 0 is air, density <= 0 is solid.
+        const int32 Mask = (ValueA > 0.0f ? 1 : 0)
+            | (ValueB > 0.0f ? 2 : 0)
+            | (ValueC > 0.0f ? 4 : 0)
+            | (ValueD > 0.0f ? 8 : 0);
+        if (Mask == 0 || Mask == 15)
+        {
+            return;
+        }
+
+        const FContourPoint Edge0 = VF_InterpolateContourPoint(A, B, ValueA, ValueB);
+        const FContourPoint Edge1 = VF_InterpolateContourPoint(B, C, ValueB, ValueC);
+        const FContourPoint Edge2 = VF_InterpolateContourPoint(C, D, ValueC, ValueD);
+        const FContourPoint Edge3 = VF_InterpolateContourPoint(D, A, ValueD, ValueA);
+        const float CentreValue = 0.25f * (ValueA + ValueB + ValueC + ValueD);
+
+        auto Draw = [&](const FContourPoint& First, const FContourPoint& Second)
+        {
+            VF_DrawContourLine(Pixels, Width, Height, First, Second);
+        };
+
+        switch (Mask)
+        {
+        case 1:  Draw(Edge3, Edge0); break;
+        case 2:  Draw(Edge0, Edge1); break;
+        case 3:  Draw(Edge3, Edge1); break;
+        case 4:  Draw(Edge1, Edge2); break;
+        case 5:
+            // The diagonal case is decided from the scalar centre, not from the binary image.
+            // This makes the saddle deterministic while keeping the isoline tied to the field.
+            if (CentreValue > 0.0f)
+            {
+                Draw(Edge0, Edge1);
+                Draw(Edge2, Edge3);
+            }
+            else
+            {
+                Draw(Edge3, Edge0);
+                Draw(Edge1, Edge2);
+            }
+            break;
+        case 6:  Draw(Edge0, Edge2); break;
+        case 7:  Draw(Edge2, Edge3); break;
+        case 8:  Draw(Edge2, Edge3); break;
+        case 9:  Draw(Edge0, Edge2); break;
+        case 10:
+            if (CentreValue > 0.0f)
+            {
+                Draw(Edge3, Edge0);
+                Draw(Edge1, Edge2);
+            }
+            else
+            {
+                Draw(Edge0, Edge1);
+                Draw(Edge2, Edge3);
+            }
+            break;
+        case 11: Draw(Edge1, Edge2); break;
+        case 12: Draw(Edge1, Edge3); break;
+        case 13: Draw(Edge0, Edge1); break;
+        case 14: Draw(Edge0, Edge3); break;
+        default: break;
+        }
+    }
+
+    FContourPoint VF_MapVerticalContourPoint(int32 X, int32 Z,
+                                              int32 SourceWidth, int32 SourceHeight,
+                                              int32 OutputWidth, int32 ContentHeight)
+    {
+        return {
+            SourceWidth > 1
+                ? static_cast<float>(X) * static_cast<float>(OutputWidth - 1)
+                    / static_cast<float>(SourceWidth - 1)
+                : 0.0f,
+            SourceHeight > 1
+                ? static_cast<float>(SourceHeight - 1 - Z)
+                    * static_cast<float>(ContentHeight - 1)
+                    / static_cast<float>(SourceHeight - 1)
+                : 0.0f
+        };
+    }
+
+    FContourPoint VF_MapPlanContourPoint(int32 X, int32 Y,
+                                          int32 SourceWidth, int32 SourceHeight,
+                                          int32 OutputWidth, int32 ContentHeight)
+    {
+        return {
+            SourceWidth > 1
+                ? static_cast<float>(X) * static_cast<float>(OutputWidth - 1)
+                    / static_cast<float>(SourceWidth - 1)
+                : 0.0f,
+            SourceHeight > 1
+                ? static_cast<float>(Y) * static_cast<float>(ContentHeight - 1)
+                    / static_cast<float>(SourceHeight - 1)
+                : 0.0f
+        };
+    }
+
+    bool VF_RenderVerticalContour(const FVoxelStrateSampleGrid& Grid, int32 FixedY,
+                                  TArray<FColor>& OutPixels,
+                                  int32& OutWidth, int32& OutHeight)
+    {
+        if (!Grid.HasScalarDensity())
+        {
+            return false;
+        }
+
+        const int32 MaxContentDimension = GMaxPreviewImageDimension
+            - GPreviewScaleBarFooterPixels;
+        OutWidth = FMath::Min(Grid.NumX, MaxContentDimension);
+        const int32 ContentHeight = FMath::Min(Grid.NumZ, MaxContentDimension);
+        OutHeight = ContentHeight + GPreviewScaleBarFooterPixels;
+        OutPixels.Init(GContourBackground, OutWidth * OutHeight);
+        if (Grid.NumX > 1 && Grid.NumZ > 1)
+        {
+            for (int32 Z = 0; Z + 1 < Grid.NumZ; ++Z)
+            {
+                for (int32 X = 0; X + 1 < Grid.NumX; ++X)
+                {
+                    const FContourPoint A = VF_MapVerticalContourPoint(
+                        X, Z, Grid.NumX, Grid.NumZ, OutWidth, ContentHeight);
+                    const FContourPoint B = VF_MapVerticalContourPoint(
+                        X + 1, Z, Grid.NumX, Grid.NumZ, OutWidth, ContentHeight);
+                    const FContourPoint C = VF_MapVerticalContourPoint(
+                        X + 1, Z + 1, Grid.NumX, Grid.NumZ, OutWidth, ContentHeight);
+                    const FContourPoint D = VF_MapVerticalContourPoint(
+                        X, Z + 1, Grid.NumX, Grid.NumZ, OutWidth, ContentHeight);
+                    VF_DrawContourQuad(
+                        OutPixels, OutWidth, ContentHeight, A, B, C, D,
+                        Grid.Density[Grid.Index(X, FixedY, Z)],
+                        Grid.Density[Grid.Index(X + 1, FixedY, Z)],
+                        Grid.Density[Grid.Index(X + 1, FixedY, Z + 1)],
+                        Grid.Density[Grid.Index(X, FixedY, Z + 1)]);
+                }
+            }
+        }
+        VF_DrawScaleBar(OutPixels, OutWidth, ContentHeight, Grid.NumX, Grid.SampleStep);
+        return OutWidth > 0 && OutHeight > 0;
+    }
+
+    bool VF_RenderPlanContour(const FVoxelStrateSampleGrid& Grid, int32 FixedZ,
+                              TArray<FColor>& OutPixels,
+                              int32& OutWidth, int32& OutHeight)
+    {
+        if (!Grid.HasScalarDensity())
+        {
+            return false;
+        }
+
+        const int32 MaxContentDimension = GMaxPreviewImageDimension
+            - GPreviewScaleBarFooterPixels;
+        OutWidth = FMath::Min(Grid.NumX, MaxContentDimension);
+        const int32 ContentHeight = FMath::Min(Grid.NumY, MaxContentDimension);
+        OutHeight = ContentHeight + GPreviewScaleBarFooterPixels;
+        OutPixels.Init(GContourBackground, OutWidth * OutHeight);
+        if (Grid.NumX > 1 && Grid.NumY > 1)
+        {
+            for (int32 Y = 0; Y + 1 < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X + 1 < Grid.NumX; ++X)
+                {
+                    const FContourPoint A = VF_MapPlanContourPoint(
+                        X, Y, Grid.NumX, Grid.NumY, OutWidth, ContentHeight);
+                    const FContourPoint B = VF_MapPlanContourPoint(
+                        X + 1, Y, Grid.NumX, Grid.NumY, OutWidth, ContentHeight);
+                    const FContourPoint C = VF_MapPlanContourPoint(
+                        X + 1, Y + 1, Grid.NumX, Grid.NumY, OutWidth, ContentHeight);
+                    const FContourPoint D = VF_MapPlanContourPoint(
+                        X, Y + 1, Grid.NumX, Grid.NumY, OutWidth, ContentHeight);
+                    VF_DrawContourQuad(
+                        OutPixels, OutWidth, ContentHeight, A, B, C, D,
+                        Grid.Density[Grid.Index(X, Y, FixedZ)],
+                        Grid.Density[Grid.Index(X + 1, Y, FixedZ)],
+                        Grid.Density[Grid.Index(X + 1, Y + 1, FixedZ)],
+                        Grid.Density[Grid.Index(X, Y + 1, FixedZ)]);
+                }
+            }
+        }
+        VF_DrawScaleBar(OutPixels, OutWidth, ContentHeight, Grid.NumX, Grid.SampleStep);
+        return OutWidth > 0 && OutHeight > 0;
+    }
+
     bool VF_WritePng(const FString& Path, const TArray<FColor>& Pixels,
                      int32 Width, int32 Height, FString& OutError)
     {
@@ -461,6 +719,41 @@ bool VF_WriteStratePreviewCandidate(
         return false;
     }
 
+    if (!IFileManager::Get().MakeDirectory(*OutputDirectory, true))
+    {
+        OutError = FString::Printf(TEXT("failed to create preview directory %s"),
+                                   *OutputDirectory);
+        return false;
+    }
+
+    const FString Stem = FString::Printf(TEXT("candidate_%03d"), CandidateIndex);
+    OutCandidate.VerticalImageFile = Stem + TEXT("_vertical.png");
+    OutCandidate.VerticalContourImageFile = Stem + TEXT("_vertical_contour.png");
+    OutCandidate.PlanImageFile = Stem + TEXT("_plan.png");
+    OutCandidate.PlanContourImageFile = Stem + TEXT("_plan_contour.png");
+    const FString VerticalPath = OutputDirectory / OutCandidate.VerticalImageFile;
+    if (!VF_WritePng(VerticalPath, VerticalPixels, VerticalWidth, VerticalHeight, OutError))
+    {
+        return false;
+    }
+
+    const bool bHasContour = Grid.HasScalarDensity();
+    if (bHasContour)
+    {
+        int32 ContourWidth = 0;
+        int32 ContourHeight = 0;
+        if (!VF_RenderVerticalContour(Grid, FixedY, VerticalPixels,
+                                      ContourWidth, ContourHeight)
+            || ContourWidth != VerticalWidth || ContourHeight != VerticalHeight
+            || !VF_WritePng(OutputDirectory / OutCandidate.VerticalContourImageFile,
+                            VerticalPixels, ContourWidth, ContourHeight, OutError))
+        {
+            OutError = FString::Printf(TEXT("failed to write vertical density contour for candidate %d"),
+                                       CandidateIndex);
+            return false;
+        }
+    }
+
     TArray<FColor> PlanPixels;
     int32 PlanWidth = 0;
     int32 PlanHeight = 0;
@@ -471,25 +764,34 @@ bool VF_WriteStratePreviewCandidate(
         return false;
     }
 
-    if (!IFileManager::Get().MakeDirectory(*OutputDirectory, true))
+    const FString PlanPath = OutputDirectory / OutCandidate.PlanImageFile;
+    if (!VF_WritePng(PlanPath, PlanPixels, PlanWidth, PlanHeight, OutError))
     {
-        OutError = FString::Printf(TEXT("failed to create preview directory %s"),
-                                   *OutputDirectory);
         return false;
     }
-
-    const FString Stem = FString::Printf(TEXT("candidate_%03d"), CandidateIndex);
-    OutCandidate.VerticalImageFile = Stem + TEXT("_vertical.png");
-    OutCandidate.PlanImageFile = Stem + TEXT("_plan.png");
-    const FString VerticalPath = OutputDirectory / OutCandidate.VerticalImageFile;
-    const FString PlanPath = OutputDirectory / OutCandidate.PlanImageFile;
-    if (!VF_WritePng(VerticalPath, VerticalPixels, VerticalWidth, VerticalHeight, OutError)
-        || !VF_WritePng(PlanPath, PlanPixels, PlanWidth, PlanHeight, OutError))
+    if (bHasContour)
     {
-        return false;
+        int32 ContourWidth = 0;
+        int32 ContourHeight = 0;
+        if (!VF_RenderPlanContour(Grid, Plan.CellZ, PlanPixels,
+                                  ContourWidth, ContourHeight)
+            || ContourWidth != PlanWidth || ContourHeight != PlanHeight
+            || !VF_WritePng(OutputDirectory / OutCandidate.PlanContourImageFile,
+                            PlanPixels, ContourWidth, ContourHeight, OutError))
+        {
+            OutError = FString::Printf(TEXT("failed to write plan density contour for candidate %d"),
+                                       CandidateIndex);
+            return false;
+        }
     }
 
     OutCandidate.bRendered = true;
+    OutCandidate.bContourRendered = bHasContour;
+    if (!bHasContour)
+    {
+        OutCandidate.RenderFailureReason = TEXT(
+            "no scalar density capture was supplied; filled cells were rendered, but no density=0 contour is available");
+    }
     OutCandidate.VerticalSliceCellY = FixedY;
     OutCandidate.VerticalSliceWorldY = VF_CellWorldCoordinate(
         Grid.MinY, Grid.MaxY, Grid.SampleStep, FixedY);
@@ -502,6 +804,126 @@ bool VF_WriteStratePreviewCandidate(
     OutCandidate.PlanImageHeight = PlanHeight;
     OutCandidate.PlanSliceBoundaryTransitions = Plan.BoundaryTransitions;
     OutCandidate.PlanSliceMixedCells = Plan.MixedCells;
+    return true;
+}
+
+bool VF_WriteStratePreviewFineCandidate(
+    const FString& OutputDirectory,
+    int32 CandidateIndex,
+    const FVoxelStrateSampleGrid& FineGrid,
+    int32 HeadroomCells,
+    const FString& FineFailureReason,
+    FVoxelStratePreviewCandidate& InOutCandidate,
+    FString& OutError)
+{
+    InOutCandidate.bFineRequested = true;
+    InOutCandidate.FineRenderFailureReason = FineFailureReason;
+    if (!FineGrid.IsValid())
+    {
+        if (InOutCandidate.FineRenderFailureReason.IsEmpty())
+        {
+            InOutCandidate.FineRenderFailureReason = TEXT("fine ROI measurement was refused");
+        }
+        return true;
+    }
+    InOutCandidate.FineWindow = VF_GetStratePreviewWindow(FineGrid);
+    if (HeadroomCells < 0)
+    {
+        OutError = TEXT("preview HeadroomCells cannot be negative");
+        return false;
+    }
+
+    const FPlanSliceChoice Plan = VF_ChoosePlanSlice(FineGrid, HeadroomCells);
+    const float CentreY = 0.5f * (FineGrid.MinY + FineGrid.MaxY);
+    const float Step = static_cast<float>(FineGrid.SampleStep);
+    const int32 FixedY = FMath::Clamp(
+        FMath::FloorToInt((CentreY - FineGrid.MinY) / Step), 0, FineGrid.NumY - 1);
+
+    if (!IFileManager::Get().MakeDirectory(*OutputDirectory, true))
+    {
+        OutError = FString::Printf(TEXT("failed to create preview directory %s"),
+                                   *OutputDirectory);
+        return false;
+    }
+
+    const FString Stem = FString::Printf(TEXT("candidate_%03d_fine_step_%d"),
+                                          CandidateIndex, FineGrid.SampleStep);
+    InOutCandidate.FineVerticalImageFile = Stem + TEXT("_vertical_filled.png");
+    InOutCandidate.FineVerticalContourImageFile = Stem + TEXT("_vertical_contour.png");
+    InOutCandidate.FinePlanImageFile = Stem + TEXT("_plan_filled.png");
+    InOutCandidate.FinePlanContourImageFile = Stem + TEXT("_plan_contour.png");
+
+    TArray<FColor> Pixels;
+    int32 Width = 0;
+    int32 Height = 0;
+    if (!VF_RenderVertical(FineGrid, HeadroomCells, FixedY, Pixels, Width, Height)
+        || !VF_WritePng(OutputDirectory / InOutCandidate.FineVerticalImageFile,
+                        Pixels, Width, Height, OutError))
+    {
+        OutError = FString::Printf(TEXT("failed to write fine vertical filled view for candidate %d"),
+                                   CandidateIndex);
+        return false;
+    }
+
+    const bool bHasContour = FineGrid.HasScalarDensity();
+    if (bHasContour)
+    {
+        int32 ContourWidth = 0;
+        int32 ContourHeight = 0;
+        if (!VF_RenderVerticalContour(FineGrid, FixedY, Pixels,
+                                       ContourWidth, ContourHeight)
+            || ContourWidth != Width || ContourHeight != Height
+            || !VF_WritePng(OutputDirectory / InOutCandidate.FineVerticalContourImageFile,
+                            Pixels, ContourWidth, ContourHeight, OutError))
+        {
+            OutError = FString::Printf(TEXT("failed to write fine vertical density contour for candidate %d"),
+                                       CandidateIndex);
+            return false;
+        }
+    }
+
+    InOutCandidate.FineVerticalSliceCellY = FixedY;
+    InOutCandidate.FineVerticalSliceWorldY = VF_CellWorldCoordinate(
+        FineGrid.MinY, FineGrid.MaxY, FineGrid.SampleStep, FixedY);
+    InOutCandidate.FineVerticalImageWidth = Width;
+    InOutCandidate.FineVerticalImageHeight = Height;
+
+    if (!VF_RenderPlan(FineGrid, HeadroomCells, Plan.CellZ, Pixels, Width, Height)
+        || !VF_WritePng(OutputDirectory / InOutCandidate.FinePlanImageFile,
+                        Pixels, Width, Height, OutError))
+    {
+        OutError = FString::Printf(TEXT("failed to write fine plan filled view for candidate %d"),
+                                   CandidateIndex);
+        return false;
+    }
+    if (bHasContour)
+    {
+        int32 ContourWidth = 0;
+        int32 ContourHeight = 0;
+        if (!VF_RenderPlanContour(FineGrid, Plan.CellZ, Pixels,
+                                  ContourWidth, ContourHeight)
+            || ContourWidth != Width || ContourHeight != Height
+            || !VF_WritePng(OutputDirectory / InOutCandidate.FinePlanContourImageFile,
+                            Pixels, ContourWidth, ContourHeight, OutError))
+        {
+            OutError = FString::Printf(TEXT("failed to write fine plan density contour for candidate %d"),
+                                       CandidateIndex);
+            return false;
+        }
+    }
+
+    InOutCandidate.bFineRendered = true;
+    InOutCandidate.bFineContourRendered = bHasContour;
+    InOutCandidate.FinePlanSliceCellZ = Plan.CellZ;
+    InOutCandidate.FinePlanSliceWorldZ = VF_CellWorldCoordinate(
+        FineGrid.MinZ, FineGrid.MaxZ, FineGrid.SampleStep, Plan.CellZ);
+    InOutCandidate.FinePlanImageWidth = Width;
+    InOutCandidate.FinePlanImageHeight = Height;
+    if (!bHasContour && InOutCandidate.FineRenderFailureReason.IsEmpty())
+    {
+        InOutCandidate.FineRenderFailureReason = TEXT(
+            "no scalar density capture was supplied; filled cells were rendered, but no density=0 contour is available");
+    }
     return true;
 }
 
@@ -572,12 +994,17 @@ bool VF_WriteStratePreviewIndex(
         ".candidate.rejected{border-color:#8b3b42;background:#21171a}.candidate h2{margin:0 0 6px;font-size:18px}\n"
         ".badge{border-radius:999px;padding:2px 7px;font-size:11px;font-weight:700;letter-spacing:.04em}.survivor{background:#1f6f43;color:#d7ffe5}.rejected-badge{background:#9b3440;color:#fff0f1}\n"
         ".reason{color:#ffb4b8;margin:6px 0}.recipe{color:#c9d1d9;overflow-wrap:anywhere;margin-bottom:8px}.recipe code{font:12px ui-monospace,SFMono-Regular,monospace}\n"
-        ".window{font-size:11px;color:#8b949e;margin:5px 0 10px}.images{display:grid;grid-template-columns:1fr 1fr;gap:8px}.images figure{margin:0}.images img{display:block;width:100%;height:auto;background:#090c11;image-rendering:pixelated;border:1px solid #30363d}.images figcaption{font-size:11px;color:#aab4c0;margin-top:3px}\n"
+        ".window{font-size:11px;color:#8b949e;margin:5px 0 10px}.view-section{margin:12px 0}.view-section h3{font-size:12px;letter-spacing:.03em;color:#e6edf3;margin:10px 0 3px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:8px}.pair figure{margin:0}.pair img{display:block;width:100%;height:auto;background:#090c11;image-rendering:pixelated;border:1px solid #30363d}.pair figcaption{font-size:11px;color:#aab4c0;margin-top:3px}.fine-section{border-top:1px solid #6e4e1f;margin-top:14px;padding-top:4px}.fine-section h3{color:#ffd580}.not-requested{color:#8b949e;font-size:12px;margin:8px 0}.contour-note{color:#8cebd1}\n"
         ".no-image{min-height:40px;border:1px dashed #8b3b42;color:#ffb4b8;padding:12px;font-size:12px}\n"
         "table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}th,td{padding:3px 4px;border-bottom:1px solid #30363d;text-align:left}th{color:#aab4c0;font-weight:500}td{text-align:right;font-variant-numeric:tabular-nums}.verdict{font-weight:650}\n"
         ".footer{color:#8b949e;font-size:11px;margin-top:18px}\n"
         "</style></head><body>\n");
     Html += FString::Printf(TEXT("<h1>%s</h1>\n"), *VF_HtmlEscape(RunTitle));
+    Html += FString::Printf(
+        TEXT("<p class=\"note\"><strong>How to read coarse images:</strong> At sample step %d, "
+             "hard edges can come from sampling, not necessarily hard world walls. A "
+             "lattice-sourced strate is genuinely rectilinear at step 1; that is expected for a maze.</p>\n"),
+        Window.SampleStep);
     Html += FString::Printf(
         TEXT("<p class=\"note\">%s "
              "Density polarity is explicit: density &gt; 0 is air. One chunk = 32 voxels = 8 m "
@@ -592,7 +1019,12 @@ bool VF_WriteStratePreviewIndex(
         "connectivity check, not something the pictures prove.</p>\n"
         "<div class=\"legend\"><span><i class=\"swatch\" style=\"background:#12171e\"></i>solid</span>"
         "<span><i class=\"swatch\" style=\"background:#dae1e7\"></i>air</span>"
-        "<span><i class=\"swatch\" style=\"background:#f5a636\"></i>walkable cell</span></div>\n"
+        "<span><i class=\"swatch\" style=\"background:#f5a636\"></i>walkable cell</span>"
+        "<span><i class=\"swatch\" style=\"background:#4de2be\"></i>density=0 contour</span></div>\n"
+        "<p class=\"note\"><strong>Fine ROI:</strong> the separate step-1 pass is requested only "
+        "for selected candidates (this run selects coarse survivors). Its exact window is printed "
+        "on the card. If its cell cap is exceeded, no fine allocation is made and the refusal is "
+        "shown on that card.</p>\n"
         "<p class=\"note\">Ordering: survivors first, then each group by descending distance from "
         "the corpus centroid so the strangest candidates appear early. The preview raster cap is "
         "512 px per image dimension including a 20 px scale-bar footer; if a source grid is larger, "
@@ -622,23 +1054,126 @@ bool VF_WriteStratePreviewIndex(
         }
         Html += FString::Printf(TEXT("<p class=\"window\">Numbers and slice choices use: %s</p>\n"),
                                 *VF_HtmlEscape(MetricWindow));
-        Html += TEXT("<div class=\"images\">\n");
+        Html += TEXT("<div class=\"view-section\"><h3>COARSE XZ — filled cells and density=0 contour</h3>\n");
         if (Candidate.bRendered)
         {
             Html += FString::Printf(
-                TEXT("<figure><img src=\"%s\" alt=\"candidate %d vertical XZ slice\"><figcaption>"
-                     "Vertical XZ @ centre Y=%d voxels</figcaption></figure>\n"
-                     "<figure><img src=\"%s\" alt=\"candidate %d plan XY slice\"><figcaption>"
-                     "Plan XY @ selected Z=%d voxels; %d solid/air boundary transitions</figcaption></figure>\n"),
+                TEXT("<p class=\"window\">Exact coarse window: %s; slice Y=%d voxels.</p>\n"
+                     "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d coarse XZ filled cells\"><figcaption>"
+                     "COARSE · filled cells · step=%d</figcaption></figure>\n"),
+                *VF_HtmlEscape(MetricWindow), Candidate.VerticalSliceWorldY,
                 *VF_HtmlEscape(Candidate.VerticalImageFile), Candidate.CandidateIndex,
-                Candidate.VerticalSliceWorldY,
-                *VF_HtmlEscape(Candidate.PlanImageFile), Candidate.CandidateIndex,
-                Candidate.PlanSliceWorldZ, Candidate.PlanSliceBoundaryTransitions);
+                Candidate.Window.SampleStep);
+            if (Candidate.bContourRendered)
+            {
+                Html += FString::Printf(
+                    TEXT("<figure><img src=\"%s\" alt=\"candidate %d coarse XZ density zero contour\"><figcaption>"
+                         "COARSE · density=0 contour · scalar field · step=%d</figcaption></figure></div>\n"),
+                    *VF_HtmlEscape(Candidate.VerticalContourImageFile), Candidate.CandidateIndex,
+                    Candidate.Window.SampleStep);
+            }
+            else
+            {
+                Html += FString::Printf(
+                    TEXT("<div class=\"no-image\"><span class=\"contour-note\">No coarse contour:</span> %s</div></div>\n"),
+                    *VF_HtmlEscape(Candidate.RenderFailureReason));
+            }
         }
         else
         {
-            Html += FString::Printf(TEXT("<div class=\"no-image\">No image: %s</div>\n"),
+            Html += FString::Printf(TEXT("<div class=\"no-image\">No coarse image: %s</div>\n"),
                                     *VF_HtmlEscape(Candidate.RenderFailureReason));
+        }
+        Html += TEXT("</div>\n<div class=\"view-section\"><h3>COARSE XY — filled cells and density=0 contour</h3>\n");
+        if (Candidate.bRendered)
+        {
+            Html += FString::Printf(
+                TEXT("<p class=\"window\">Exact coarse window: %s; selected Z=%d voxels; %d solid/air boundary transitions.</p>\n"
+                     "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d coarse XY filled cells\"><figcaption>"
+                     "COARSE · filled cells · step=%d</figcaption></figure>\n"),
+                *VF_HtmlEscape(MetricWindow), Candidate.PlanSliceWorldZ,
+                Candidate.PlanSliceBoundaryTransitions,
+                *VF_HtmlEscape(Candidate.PlanImageFile), Candidate.CandidateIndex,
+                Candidate.Window.SampleStep);
+            if (Candidate.bContourRendered)
+            {
+                Html += FString::Printf(
+                    TEXT("<figure><img src=\"%s\" alt=\"candidate %d coarse XY density zero contour\"><figcaption>"
+                         "COARSE · density=0 contour · scalar field · step=%d</figcaption></figure></div>\n"),
+                    *VF_HtmlEscape(Candidate.PlanContourImageFile), Candidate.CandidateIndex,
+                    Candidate.Window.SampleStep);
+            }
+            else
+            {
+                Html += FString::Printf(
+                    TEXT("<div class=\"no-image\"><span class=\"contour-note\">No coarse contour:</span> %s</div></div>\n"),
+                    *VF_HtmlEscape(Candidate.RenderFailureReason));
+            }
+        }
+        else
+        {
+            Html += FString::Printf(TEXT("<div class=\"no-image\">No coarse image: %s</div>\n"),
+                                    *VF_HtmlEscape(Candidate.RenderFailureReason));
+        }
+        Html += TEXT("</div>\n<div class=\"fine-section\"><h3>FINE ROI — filled cells and density=0 contour</h3>\n");
+        if (!Candidate.bFineRequested)
+        {
+            Html += TEXT("<p class=\"not-requested\">Fine ROI not requested for this candidate; it did not pass the coarse survivor screen.</p>\n");
+        }
+        else if (!Candidate.bFineRendered)
+        {
+            const FString FineFailureText = Candidate.FineRenderFailureReason.IsEmpty()
+                ? TEXT("unspecified fine preview refusal") : Candidate.FineRenderFailureReason;
+            Html += FString::Printf(
+                TEXT("<div class=\"no-image\">Fine ROI requested but refused/not rendered: %s</div>\n"),
+                *VF_HtmlEscape(FineFailureText));
+        }
+        else
+        {
+            const FString FineWindowDescription = Candidate.FineWindow.Describe();
+            Html += FString::Printf(
+                TEXT("<p class=\"window\">Exact fine ROI window: %s; slice Y=%d voxels.</p>\n"
+                     "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XZ filled cells\"><figcaption>"
+                     "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
+                *VF_HtmlEscape(FineWindowDescription), Candidate.FineVerticalSliceWorldY,
+                *VF_HtmlEscape(Candidate.FineVerticalImageFile), Candidate.CandidateIndex,
+                Candidate.FineWindow.SampleStep);
+            if (Candidate.bFineContourRendered)
+            {
+                Html += FString::Printf(
+                    TEXT("<figure><img src=\"%s\" alt=\"candidate %d fine XZ density zero contour\"><figcaption>"
+                         "FINE ROI · density=0 contour · scalar field · step=%d</figcaption></figure></div>\n"),
+                    *VF_HtmlEscape(Candidate.FineVerticalContourImageFile), Candidate.CandidateIndex,
+                    Candidate.FineWindow.SampleStep);
+            }
+            else
+            {
+                Html += FString::Printf(
+                    TEXT("<div class=\"no-image\"><span class=\"contour-note\">No fine contour:</span> %s</div></div>\n"),
+                    *VF_HtmlEscape(Candidate.FineRenderFailureReason));
+            }
+
+            Html += FString::Printf(
+                TEXT("<p class=\"window\">Exact fine ROI window: %s; selected Z=%d voxels.</p>\n"
+                     "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XY filled cells\"><figcaption>"
+                     "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
+                *VF_HtmlEscape(FineWindowDescription), Candidate.FinePlanSliceWorldZ,
+                *VF_HtmlEscape(Candidate.FinePlanImageFile), Candidate.CandidateIndex,
+                Candidate.FineWindow.SampleStep);
+            if (Candidate.bFineContourRendered)
+            {
+                Html += FString::Printf(
+                    TEXT("<figure><img src=\"%s\" alt=\"candidate %d fine XY density zero contour\"><figcaption>"
+                         "FINE ROI · density=0 contour · scalar field · step=%d</figcaption></figure></div>\n"),
+                    *VF_HtmlEscape(Candidate.FinePlanContourImageFile), Candidate.CandidateIndex,
+                    Candidate.FineWindow.SampleStep);
+            }
+            else
+            {
+                Html += FString::Printf(
+                    TEXT("<div class=\"no-image\"><span class=\"contour-note\">No fine contour:</span> %s</div></div>\n"),
+                    *VF_HtmlEscape(Candidate.FineRenderFailureReason));
+            }
         }
         Html += TEXT("</div>\n<table><caption class=\"window\">Grid measurements use the window above; "
                     "centroid distance is roll-space</caption>\n");
@@ -699,6 +1234,25 @@ bool VF_WriteStratePreviewCandidate(
     (void)bRejected;
     (void)RejectionReason;
     OutCandidate = FVoxelStratePreviewCandidate();
+    OutError = TEXT("strate preview rendering is editor-only");
+    return false;
+}
+
+bool VF_WriteStratePreviewFineCandidate(
+    const FString& OutputDirectory,
+    int32 CandidateIndex,
+    const FVoxelStrateSampleGrid& FineGrid,
+    int32 HeadroomCells,
+    const FString& FineFailureReason,
+    FVoxelStratePreviewCandidate& InOutCandidate,
+    FString& OutError)
+{
+    (void)OutputDirectory;
+    (void)CandidateIndex;
+    (void)FineGrid;
+    (void)HeadroomCells;
+    (void)FineFailureReason;
+    (void)InOutCandidate;
     OutError = TEXT("strate preview rendering is editor-only");
     return false;
 }

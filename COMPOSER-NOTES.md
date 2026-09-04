@@ -484,32 +484,46 @@ review a season before publishing.
 
 ### ✅ F1 measurement + preview built (2026-09-04)
 
-`FVoxelStrateSampleGrid` is an opt-in export of the exact `Air` polarity grid already sampled by
-`VF_MeasureStrate` / `VF_MeasureStrateWithSampler`. The editor/automation renderer consumes that
-buffer and never calls a density sampler, so each candidate's images and numbers come from one
-window and one sample pass. `VoxelForge.Composer.StructureRoll` now writes two PNGs per candidate
-and one self-contained `index.html` to:
+`FVoxelStrateSampleGrid` is an opt-in export of both the exact `Air` polarity and the scalar `Density`
+values already sampled by `VF_MeasureStrate` / `VF_MeasureStrateWithSampler`. The editor/automation
+renderer consumes that buffer and never calls a density sampler, so each candidate's metrics and images
+come from one window and one sample pass. The filled-cell view is paired with a marching-squares-style
+`density = 0` contour from the scalar field. The contour is not an anti-aliased or blurred coarse image:
+it is a legibility aid alongside the honest sampled-cell evidence.
 
-`Saved/ComposerPreview/structure_seed_0_corpus_9dbcea85_step_4_radius_256/`
+The step-4 measurement and 64-card contact sheet are unchanged in scope. Each card now shows the coarse
+filled and contour XZ/XY pairs. `VoxelForge.Composer.StructureRoll` writes them, plus an optional fine
+pass, to:
 
-The sheet contains all **64 candidates / 128 PNGs**, survivors first and then descending normalized
-distance from the corpus centroid so outliers are near the top. Every card repeats its exact resolved
-interior margin, sample step, XY bounds, and inclusive/exclusive Z span before listing air, largest
-component share, walkable fraction, feature scale, clearance, and arrival→departure. Rejected cards
-are visibly marked and name `vacuous`, `fragmented`, and/or `law failed`.
+`Saved/ComposerPreview/structure_seed_0_corpus_9dbcea85_step_4_radius_256_fine_step_1_fine_radius_64/`
+
+The fine pass is explicit and bounded: the current composer selects the 42 coarse survivors, samples
+step 1 in a radius-64 (128×128 XY) ROI, and refuses before allocation when `MaxCells=2,000,000` would be
+exceeded. The default is radius 64 because it stays around the observed 1.8M-cell budget while exposing
+voxel-scale detail; radius 128 is already roughly 7.1–7.5M cells and radius 256 exceeds the 8M coarse
+cap. The public settings let another editor/automation caller choose step, radius, centre, margin, and
+cap, or the writer can be called for an explicitly selected list. Fine filenames, captions, and each
+card's text include the sample step and exact resolved XY/Z window, so they cannot be mistaken for the
+coarse render. A refused fine render is shown as a refusal with its reason rather than silently omitted.
 
 The vertical image is an XZ section through the sampled cell nearest the strate-window centre Y. The
 plan image scans every sampled Z layer, keeps layers containing both air and solid, and chooses the
 one with the largest number of XY solid/air boundary transitions; ties prefer more mixed cells, more
 walkable cells, then the layer nearest the vertical centre. If no mixed layer exists it chooses the
 most solid fallback layer, so a slab does not silently produce a blank mid-height sheet. The focused
-run's first candidate was **128×48** for vertical and **128×148** for plan; dimensions vary with the
-resolved Z window. Both images use dark solid, light air, orange walkable cells, and a one-chunk
-footer scale bar. The page states **one chunk = 32 voxels = 8 m**, the density sign (`> 0` is air),
-the exact measurement window, the 512-pixel-per-dimension cap (including a 20-pixel footer), and
-that larger source grids aggregate already-sampled cells rather than resampling. It also carries the
-required caveat: a 2D apparent join is not a 3D connectivity proof; the separate arrival→departure
-verdict is the connectivity check.
+run's first candidate was **128×48** for coarse vertical, **128×130** for fine vertical, and **128×148**
+for both plan images; dimensions vary with the resolved Z window. Both views use dark solid, light air,
+orange walkable cells, a turquoise scalar contour, and a one-chunk footer scale bar. The page states
+**one chunk = 32 voxels = 8 m**, the density sign (`> 0` is air), every exact window, the 512-pixel cap
+(including a 20-pixel footer), and that larger source grids aggregate already-sampled cells rather than
+resampling. It also carries the required caveat: a 2D apparent join is not a 3D connectivity proof;
+the separate arrival→departure verdict is the connectivity check.
+
+The focused run measured **0.456 s** for the coarse render, **70.271 s** for the 42 fine scalar samples,
+and **0.573 s** for their filled/contour rendering. Peak fine `Air` + `Density` capture allocation was
+**9,338,880 bytes** and the peak single RGBA raster was **75,776 bytes**. The full StructureRoll test
+completed in **184.659 s**, with 64 coarse filled pairs, 64 coarse contour pairs, 42 fine filled pairs,
+42 fine contour pairs, and 0 refusals.
 
 ### 3.5 Validation in three layers, and how "good" is ever judged
 

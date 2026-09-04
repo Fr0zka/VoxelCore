@@ -33,6 +33,39 @@ struct VOXELFORGE_API FVoxelStratePreviewWindow
     FString Describe() const;
 };
 
+/** Parameters for the optional selected-candidate fine pass. */
+struct VOXELFORGE_API FVoxelStrateFinePreviewSettings
+{
+    // The default is deliberately one voxel: the pass exists to expose detail that step 4 cannot.
+    int32 SampleStep = 1;
+    // radius=64 gives a 128x128 XY ROI and stays below the default two-million-cell cap for the
+    // four-chunk fixture while retaining the same origin-centred frame as the coarse sweep.
+    int32 RadiusInVoxels = 64;
+    int32 MaxCells = 2000000;
+    FVector2D CenterXY = FVector2D::ZeroVector;
+    int32 InteriorMarginVoxels = -1;
+
+    bool IsValid() const
+    {
+        return SampleStep > 0 && RadiusInVoxels > 0 && MaxCells > 0
+            && FMath::IsFinite(CenterXY.X) && FMath::IsFinite(CenterXY.Y);
+    }
+
+    FVoxelStrateMeasureSettings MakeMeasureSettings(
+        const FVoxelStrateMeasureSettings& BaseSettings) const
+    {
+        FVoxelStrateMeasureSettings Settings = BaseSettings;
+        Settings.SampleStep = SampleStep;
+        Settings.RadiusInVoxels = RadiusInVoxels;
+        Settings.CenterXY = CenterXY;
+        Settings.CoverPointA.Reset();
+        Settings.CoverPointB.Reset();
+        Settings.MaxCells = MaxCells;
+        Settings.InteriorMarginVoxels = InteriorMarginVoxels;
+        return Settings;
+    }
+};
+
 /** One lightweight row/card record; sampled cells are rendered immediately and are not retained. */
 struct VOXELFORGE_API FVoxelStratePreviewCandidate
 {
@@ -43,11 +76,26 @@ struct VOXELFORGE_API FVoxelStratePreviewCandidate
     FString RejectionReason;
     FString RenderFailureReason;
     FString VerticalImageFile;
+    FString VerticalContourImageFile;
     FString PlanImageFile;
+    FString PlanContourImageFile;
+
+    // Fine files are intentionally separate from the coarse names, even when the ROI happens to
+    // have the same raster dimensions. The exact fine window is repeated on the card.
+    FString FineRenderFailureReason;
+    FString FineVerticalImageFile;
+    FString FineVerticalContourImageFile;
+    FString FinePlanImageFile;
+    FString FinePlanContourImageFile;
+    FVoxelStratePreviewWindow FineWindow;
 
     bool bRejected = false;
     bool bMetricsValid = false;
     bool bRendered = false;
+    bool bContourRendered = false;
+    bool bFineRequested = false;
+    bool bFineRendered = false;
+    bool bFineContourRendered = false;
 
     float AirFraction = 0.0f;
     float LargestComponentShare = 0.0f;
@@ -66,6 +114,15 @@ struct VOXELFORGE_API FVoxelStratePreviewCandidate
     int32 PlanImageHeight = 0;
     int32 PlanSliceBoundaryTransitions = 0;
     int32 PlanSliceMixedCells = 0;
+
+    int32 FineVerticalSliceCellY = INDEX_NONE;
+    int32 FineVerticalSliceWorldY = 0;
+    int32 FineVerticalImageWidth = 0;
+    int32 FineVerticalImageHeight = 0;
+    int32 FinePlanSliceCellZ = INDEX_NONE;
+    int32 FinePlanSliceWorldZ = 0;
+    int32 FinePlanImageWidth = 0;
+    int32 FinePlanImageHeight = 0;
 };
 
 /** Copy the exact measurement-window metadata needed by the index page. */
@@ -91,6 +148,23 @@ VOXELFORGE_API bool VF_WriteStratePreviewCandidate(
     bool bRejected,
     const FString& RejectionReason,
     FVoxelStratePreviewCandidate& OutCandidate,
+    FString& OutError);
+
+/**
+ * Attach a separately measured fine ROI to an existing candidate record.
+ *
+ * The caller chooses which candidates receive this call. An invalid grid is recorded as a
+ * refused/not-rendered fine preview and returns true, so a MaxCells refusal remains visible in
+ * the contact sheet without being mistaken for a PNG failure. The renderer consumes the exact
+ * captured Air and Density arrays and never calls a sampler.
+ */
+VOXELFORGE_API bool VF_WriteStratePreviewFineCandidate(
+    const FString& OutputDirectory,
+    int32 CandidateIndex,
+    const FVoxelStrateSampleGrid& FineGrid,
+    int32 HeadroomCells,
+    const FString& FineFailureReason,
+    FVoxelStratePreviewCandidate& InOutCandidate,
     FString& OutError);
 
 /** Write one self-contained, offline contact sheet for all candidate records. */

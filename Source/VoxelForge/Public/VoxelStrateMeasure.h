@@ -45,10 +45,12 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
 };
 
 /**
- * Optional capture of the exact coarse grid used by one measurement.
+ * Optional capture of the exact grid used by one measurement.
  *
  * Air is deliberately stored as a polarity bit: 1 means density > 0 (air), 0 means solid.
- * The capture is opt-in so ordinary metrics callers do not retain an 8-million-cell buffer.
+ * Density retains the scalar sample that produced that bit, so an editor preview can draw a
+ * density=0 contour without inventing geometry by blurring the binary view. Both arrays are
+ * opt-in so ordinary metrics callers do not retain a multi-million-cell buffer.
  * It is an editor/automation hand-off for tools such as the composer preview, not a runtime
  * generation cache.
  */
@@ -75,6 +77,10 @@ struct VOXELFORGE_API FVoxelStrateSampleGrid
     // 1 = air (density > 0), 0 = solid (density <= 0), matching the measurement polarity.
     TArray<uint8> Air;
 
+    // Exact scalar density at the same cell centre as Air. Present on measurement captures;
+    // empty on legacy/binary-only callers. This is never used by generation.
+    TArray<float> Density;
+
     FORCEINLINE int32 Index(int32 X, int32 Y, int32 Z) const
     {
         return static_cast<int32>(
@@ -90,6 +96,11 @@ struct VOXELFORGE_API FVoxelStrateSampleGrid
                 == static_cast<int64>(NumX) * static_cast<int64>(NumY)
                     * static_cast<int64>(NumZ)
             && Air.Num() == CellCount;
+    }
+
+    bool HasScalarDensity() const
+    {
+        return IsValid() && Density.Num() == CellCount;
     }
 };
 
