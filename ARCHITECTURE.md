@@ -378,6 +378,11 @@ driven by `EditorBrush*` props.
   no loads AND no LOD mismatches outstanding.
 - **SDF cache** (`GetDensityWithParams`): search-BOX validity, not chunk-key — gradient ±1
   sampling must not thrash the (expensive) rebuild.
+- **Operator channel metadata** (`FVoxelOpStack`): `ChannelReads`, `ChannelWrites`, and
+  `IsAdditive` are called only when an operator is added to a stack and their values are cached in
+  the stack entry. `ValidateChannelOrder` is assembly/diagnostic-only; no declaration virtual may
+  enter `Eval`'s per-voxel loop. If `FVoxelOpSample` gains a field, add its channel bit and update
+  every operator declaration and the validator together.
 - **VerticalShafts field cache**: shaft rolls and connector decisions, including the structural
   tree and structural-spine connector endpoint, are rebuilt only when the thread-local centre cell
   or a geometry-affecting parameter changes. Each rebuild rolls a wider direct-indexed geometric

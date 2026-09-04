@@ -114,6 +114,34 @@ enum class EVoxelOpRole : uint8
 };
 
 //=============================================================================
+// CANAUX DE L'ÉCHANTILLON / SAMPLE CHANNELS
+//=============================================================================
+// `FVoxelOpSample` is deliberately a small, explicit state record. Keep its channel set here,
+// next to the interface that declares which fields an operator consumes and publishes. The enum
+// values are bits so a declaration can name more than one channel without introducing another
+// per-voxel object or a dynamic container.
+//
+// `Density` is the internal positive=solid field; `Sdf` is the standard negative=inside field.
+// If a future field is added to `FVoxelOpSample`, it must also be added here and to every operator
+// declaration before the composer can treat that field as part of the dependency graph.
+enum class EVoxelOpChannel : uint8
+{
+    None    = 0,
+    Density = 1 << 0,
+    Sdf     = 1 << 1,
+};
+
+using EVoxelOpChannelMask = uint8;
+
+namespace VoxelOpChannels
+{
+    static constexpr EVoxelOpChannelMask None    = 0;
+    static constexpr EVoxelOpChannelMask Density = static_cast<EVoxelOpChannelMask>(EVoxelOpChannel::Density);
+    static constexpr EVoxelOpChannelMask Sdf     = static_cast<EVoxelOpChannelMask>(EVoxelOpChannel::Sdf);
+    static constexpr EVoxelOpChannelMask All     = Density | Sdf;
+}
+
+//=============================================================================
 // COMPOSITION / COMBINERS
 //=============================================================================
 // Vocabulaire délibérément petit, et il réutilise ce qui existe déjà
@@ -269,6 +297,28 @@ public:
     virtual ~IVoxelDensityOp() = default;
 
     virtual EVoxelOpRole GetRole() const = 0;
+
+    /**
+     * Channel contract for the composer. A read is a field inspected from `InOut` before this op
+     * publishes its result; a write is a field whose value may differ when the op returns. A
+     * read/write declaration therefore means "transform the current version". `+=` and `-=` are
+     * both reads and writes; an assignment that ignores the old field is a write-only producer /
+     * replacement. Context, coordinates, caches and referenced objects are not sample channels.
+     *
+     * These are graph metadata, not voxel work: the stack snapshots them while it is assembled and
+     * the validator reads the snapshot. They must never be called from `Eval`.
+     */
+    virtual EVoxelOpChannelMask ChannelReads() const = 0;
+    virtual EVoxelOpChannelMask ChannelWrites() const = 0;
+
+    /**
+     * True when this op contributes a delta to its written channels without replacing, clamping,
+     * selecting, or otherwise depending on the previous value of those written channels. Such an
+     * op may be shuffled with another compatible additive delta; a false result means its position
+     * is explicit. A gate on a channel the op itself writes is transformative even if its final
+     * arithmetic contains `+=`.
+     */
+    virtual bool IsAdditive() const = 0;
 
     /**
      * Hisser ici TOUT le travail constant sur le chunk : listes de salles, grilles de biome,

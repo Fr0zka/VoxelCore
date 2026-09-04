@@ -88,12 +88,16 @@ terrain from those, deterministically, exactly as today. **No runtime compositio
 
 ### 3.2 Structure: how a stack gets assembled
 
-The three real builders, for reference:
+The current shipping builders, for reference (structural posts included; TunnelNetwork's builder is
+also the Underwater builder):
 
 ```
-TunnelNetwork (19)   rock source -> room graph (SDF) -> SdfCarve -> 12 density modifiers -> worm source -> structural
-Maze (7)             rock source -> lattice corridors (SDF) -> SdfRoughness (SDF) -> SdfCarve -> structural
-FloatingIslands (7)  VOID source -> island blobs (SDF) -> SdfRoughness (SDF) -> SdfFill -> structural
+TunnelNetwork / Underwater (20)  rock source -> room graph (SDF) -> SdfCarve -> 12 density modifiers -> worm source -> structural
+FlatPlain / CrystalChamber (6)   slab-void source -> grid columns -> structural
+Maze (8)                          rock source -> lattice corridors (SDF) -> SdfRoughness (SDF) -> SdfCarve -> structural
+SurfaceWorld (6)                  surface column -> overhang -> structural
+VerticalShafts (9)                rock source -> shaft field (SDF) -> SdfRoughness (SDF) -> SdfCarve -> ledges -> structural
+FloatingIslands (8)                VOID source -> island blobs (SDF) -> SdfRoughness (SDF) -> SdfFill -> structural
 ```
 
 **⭐ Most ordering is MECHANICAL — derive it, do not author it.** Roughness sits on the *SDF* before
@@ -102,6 +106,13 @@ different ops for exactly that reason. An op's legal position is fixed by **whic
 which it writes**.
 ⇒ **Every operator declares its channel reads/writes.** Dependencies form a DAG and **any topological
 sort of that DAG is a legal stack** — no authored order, and it produces orderings nobody wrote down.
+
+**Built status — 2026-09-04:** `EVoxelOpChannel` now names the two fields actually carried by
+`FVoxelOpSample` (`Density` and `Sdf`); all 29 concrete density operators declare reads, writes, and
+additive/transformative behavior. `FVoxelOpStack::Add` snapshots that metadata, and
+`ValidateChannelOrder` checks the resulting channel DAG without entering the voxel loop.
+`VoxelForge.OpStack.ChannelDAG` builds all eight shipping stacks and validates them: **22 tests
+succeeded, 0 failed, 0 not run**.
 
 **⭐ Root polarity is a one-bit identity lever.** FloatingIslands is Maze's op classes rooted in a
 **void** source with a **fill** instead of a rock source with a carve — and you get islands instead of
@@ -114,8 +125,17 @@ into one op with two internal phases. That removes the invalid state instead of 
 ops that compose in any legal order beat eighteen with a footnote. (Fusing with identical order and
 math leaves the field bit-identical.)
 
+**Current implementation finding:** the fuse is not landed. Ten operators intervene between 4b and
+4h — `FCaveTerraceMod`, `FLayerLineMod`, `FRibbingMod`, `FCaveOverhangMod`, `FCaveCliffMod`,
+`FScallopMod`, `FCaveArchMod`, `FRoomColumnMod`, `FDomeMod`, and `FPinchMod` — and every one reads
+and writes `Density`. Moving the floor phase next to roughness would therefore reorder the live
+density updates; the required bit-identical gate cannot be assumed. The current 20-op stack remains
+in its original order until a fusion that preserves that order and math is available.
+
 **One declaration covers the rest:** an op is **additive** (small displacement, commutes freely — shuffle
 at will) or **transformative** (clamps, multiplies, gates — position matters, needs explicit placement).
+“Commutes” here is algebraic: IEEE-754 float accumulation is not generally bitwise commutative, so a
+shuffle still needs the equivalence gate.
 
 **The structure roll:**
 `root polarity -> shape source -> conversion (follows from polarity) -> draw k modifiers legal in the
@@ -485,8 +505,10 @@ they became "findings" (§13).
 (fall exposure, openness, traversal mix, tortuosity, corpus-centroid distance).
 
 ### Tier 3 — op-system prerequisites for free composition
-- **Channel read/write declarations** on every op, so ordering derives from a DAG (§3.2).
-- **Fuse corrective ops** (`FFloorBiasMod` into `FCaveRoughnessMod`).
+- ✅ **Channel read/write declarations** on every op, plus the stack DAG validator (§3.2; built
+  2026-09-04).
+- ⏸ **Fuse corrective ops** (`FFloorBiasMod` into `FCaveRoughnessMod`) — blocked by the ten
+  intervening `Density` readers/writers under the bit-identity requirement; see §3.2.
 - ⚠️ **`EffectOverBox` correct in ISOLATION** (§6.1) — the gate on everything after.
 - **The XY edge seal** (§6.7).
 
@@ -559,6 +581,12 @@ Tests: BoxVerdictFold · ClassifyTileSoundness (×2) · CrossPlatformDigest · D
 DiffLayerContention · FloatingIslandEquivalence · LargeSeedSurvives · **LayoutOrderIndependence** ·
 LiveEditInvalidation · MazeEquivalence · SlabEquivalence · **StrateParamBlendCoverage** ·
 SurfaceHeightEquivalence · TunnelNetworkSpineEquivalence · VerticalShaftEquivalence.
+
+**2026-09-04 — Tier 3b validation run.** The specified UE 5.7 `VoxelMEditor Win64 Development`
+build succeeded (14 actions). The full headless suite reported **22 succeeded, 0 failed, 0 not run,
+0 succeeded-with-warnings**, including `VoxelForge.OpStack.ChannelDAG`; the existing equivalence,
+determinism, box-verdict, and connectivity checks stayed green. The 4b→4h fuse was deliberately
+not applied after the intervening-channel audit above.
 
 **⭐ This closes the pending-verification thread opened by `OPSTACK-HANDOFF.md`.** That file flagged
 commits `4d33321` (Sol's boundary fold) and `91585ea` as *built but NOT re-verified*, with two

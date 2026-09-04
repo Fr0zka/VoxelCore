@@ -226,6 +226,9 @@ namespace
         explicit FConstantFieldSource(float InValue) : Value(InValue) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
         bool IsXYPure() const override { return true; }   // constant ⇒ trivialement sans Z
 
@@ -291,6 +294,9 @@ namespace
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Sdf; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -464,6 +470,9 @@ namespace
         }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         // ⚠️⚠️ CORRIGÉ 2026-07-27 : c'était `true`, ET C'ÉTAIT FAUX.
@@ -901,6 +910,9 @@ namespace
         const FSurfaceGenerationParams& GetParams() const { return P; }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         bool IsXYPure() const override { return false; }   // voir le bloc ci-dessus
 
         /**
@@ -1029,6 +1041,9 @@ namespace
             : P(InP), SeedU((uint32)Seed), Column(InColumn) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
         bool IsXYPure() const override { return false; }   // franchement non : voir `Frac`
 
@@ -1097,6 +1112,9 @@ namespace
             , BaseOctaves(InBaseOctaves), ApplyWithin(InApplyWithin) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Sdf; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; } // gate depends on the SDF it writes
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -1163,6 +1181,9 @@ namespace
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
         bool IsXYPure() const override { return true; }   // cylindres de hauteur infinie
 
@@ -1303,6 +1324,12 @@ namespace
             : Blend(InBlend), BaseDensity(InBaseDensity), Sign(InSign), MinDivisor(InMinDivisor) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::Combiner; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float, float, float, FVoxelOpSample& InOut) const override
@@ -1341,6 +1368,9 @@ namespace
             : TopZ(InTopZ), BotZ(InBotZ), Seal(InSeal), Base(InBase), Radius(InRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float X, float Y, float Z, FVoxelOpSample& InOut) const override
@@ -1383,6 +1413,9 @@ namespace
             : TopZ(InTopZ), BotZ(InBotZ), Thickness(InThickness), Base(InBase) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float, float, float Z, FVoxelOpSample& InOut) const override
@@ -1452,6 +1485,9 @@ namespace
             : Base(InBase) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
 
         void PrepareChunk(const FVoxelOpContext& Ctx) override
         {
@@ -1511,6 +1547,9 @@ namespace
             : Manager(InManager), Base(InBase), Seal(InSeal) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float X, float Y, float Z, FVoxelOpSample& InOut) const override
@@ -1569,6 +1608,9 @@ namespace
             , ExtraReach(InExtraReach), SpineRadius(InSpineRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         struct FShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
@@ -2193,6 +2235,12 @@ namespace
             : P(InP), Field(InField) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -2276,6 +2324,9 @@ namespace
             , ExtraReach(InExtraReach) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         struct FIsland { float X, Y, Rxy, TopHalf, TopZ, BotZ, TaperEnd; };
@@ -2510,6 +2561,9 @@ namespace
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Sdf; }
+        bool IsAdditive() const override { return false; }
 
         void PrepareChunk(const FVoxelOpContext& Ctx) override
         {
@@ -3318,6 +3372,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), RoomsForBox(InRoomsForBox) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3489,6 +3549,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3587,6 +3653,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3663,6 +3735,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3727,6 +3805,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3807,6 +3891,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3870,6 +3960,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -3942,6 +4038,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -4048,6 +4150,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float, FVoxelOpSample& InOut) const override
@@ -4099,6 +4207,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -4195,6 +4309,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -4290,6 +4410,10 @@ namespace
     // ⚠️ DERNIER DE LA CHAÎNE, ET CE N'EST PAS INTERCHANGEABLE : il corrige ce que la rugosité (4b)
     // a fait. Le déplacer avant elle le rendrait sans objet. C'est la raison pour laquelle l'ordre
     // des opérateurs dans `BuildTunnelNetworkStack` est celui de l'original, ligne pour ligne.
+    //
+    // TIER 3b AUDIT (2026-09-04): this op is intentionally still separate. Ten operators lie
+    // between 4b and this phase (4c through 4h), and every one reads+writes Density. Moving this
+    // phase next to 4b would reorder those density updates, so a bit-identical fuse is not legal.
     class FFloorBiasMod final : public IVoxelDensityOp
     {
     public:
@@ -4297,6 +4421,12 @@ namespace
             : P(InP), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
@@ -4357,6 +4487,12 @@ namespace
             : P(InP), SeedU((uint32)Seed), Rooms(InRooms) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
+        EVoxelOpChannelMask ChannelReads() const override
+        {
+            return VoxelOpChannels::Density | VoxelOpChannels::Sdf;
+        }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -4545,6 +4681,116 @@ VoxelDensityOps::FRoomBoxDiagnostic VoxelDensityOps::GetLastRoomBoxDiagnostic()
 //=============================================================================
 // FVoxelOpStack
 //=============================================================================
+
+bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
+{
+    if (OutError != nullptr) { OutError->Reset(); }
+
+    auto DescribeMask = [](EVoxelOpChannelMask Mask) -> FString
+    {
+        FString Result;
+        if ((Mask & VoxelOpChannels::Density) != 0) { Result += TEXT("Density"); }
+        if ((Mask & VoxelOpChannels::Sdf) != 0)
+        {
+            if (!Result.IsEmpty()) { Result += TEXT(", "); }
+            Result += TEXT("Sdf");
+        }
+        return Result.IsEmpty() ? TEXT("none") : Result;
+    };
+
+    auto Fail = [&](int32 Index, const FOpEntry* Entry, const TCHAR* Rule) -> bool
+    {
+        if (OutError != nullptr)
+        {
+            const TCHAR* Name = (Entry != nullptr && Entry->Op.Get() != nullptr)
+                              ? Entry->Op->DebugName() : TEXT("(null op)");
+            const EVoxelOpChannelMask Reads = Entry != nullptr ? Entry->Reads : VoxelOpChannels::None;
+            const EVoxelOpChannelMask Writes = Entry != nullptr ? Entry->Writes : VoxelOpChannels::None;
+            *OutError = FString::Printf(
+                TEXT("op %d (%s) violates channel DAG: %s; reads=[%s], writes=[%s]"),
+                Index, Name, Rule, *DescribeMask(Reads), *DescribeMask(Writes));
+        }
+        return false;
+    };
+
+    // The two array slots are deliberately explicit: FVoxelOpSample has exactly two fields, and
+    // adding a third field requires extending EVoxelOpChannel and this validator together.
+    int32 LastWriter[2] = { INDEX_NONE, INDEX_NONE };
+
+    auto ChannelIndex = [](EVoxelOpChannelMask Channel) -> int32
+    {
+        return Channel == VoxelOpChannels::Density ? 0 : 1;
+    };
+
+    for (int32 Index = 0; Index < Ops.Num(); ++Index)
+    {
+        const FOpEntry& Entry = Ops[Index];
+        if (Entry.Op.Get() == nullptr) { return Fail(Index, &Entry, TEXT("null operator")); }
+
+        if ((Entry.Reads & VoxelOpChannels::All) != Entry.Reads)
+        {
+            return Fail(Index, &Entry, TEXT("reads an unknown sample channel"));
+        }
+        if ((Entry.Writes & VoxelOpChannels::All) != Entry.Writes)
+        {
+            return Fail(Index, &Entry, TEXT("writes an unknown sample channel"));
+        }
+
+        if (Entry.bAdditive && Entry.Writes == VoxelOpChannels::None)
+        {
+            return Fail(Index, &Entry, TEXT("an additive operator must publish a channel"));
+        }
+        if (Entry.bAdditive
+            && (Entry.Writes & static_cast<EVoxelOpChannelMask>(~Entry.Reads)) != 0)
+        {
+            return Fail(Index, &Entry,
+                        TEXT("an additive operator must read every channel it writes"));
+        }
+
+        const EVoxelOpChannelMask Channels[] = {
+            VoxelOpChannels::Density, VoxelOpChannels::Sdf
+        };
+        for (const EVoxelOpChannelMask Channel : Channels)
+        {
+            if ((Entry.Reads & Channel) == 0) { continue; }
+
+            const int32 Writer = LastWriter[ChannelIndex(Channel)];
+            const bool bRootIdentityFold = Entry.Op->GetRole() == EVoxelOpRole::FieldSource
+                                         && (Entry.Writes & Channel) != 0
+                                         && Writer == INDEX_NONE;
+            if (Writer == INDEX_NONE && !bRootIdentityFold)
+            {
+                return Fail(Index, &Entry,
+                            TEXT("reads a channel before a producer has published it"));
+            }
+        }
+
+        for (const EVoxelOpChannelMask Channel : Channels)
+        {
+            if ((Entry.Writes & Channel) == 0 || (Entry.Reads & Channel) != 0) { continue; }
+
+            // A write-only op is an assignment/replacement. It may establish the first version,
+            // but it may not erase a previously produced channel without declaring a read of it.
+            if (LastWriter[ChannelIndex(Channel)] != INDEX_NONE)
+            {
+                return Fail(Index, &Entry,
+                            TEXT("a write-only replacement would clobber an existing channel"));
+            }
+        }
+
+        for (const EVoxelOpChannelMask Channel : Channels)
+        {
+            if ((Entry.Writes & Channel) != 0)
+            {
+                // Every read above has either consumed this writer's predecessor or the explicit
+                // root identity. Updating the version here makes all later consumer edges forward.
+                LastWriter[ChannelIndex(Channel)] = Index;
+            }
+        }
+    }
+
+    return true;
+}
 
 void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
                                          float SealThickness, float BaseDensity, float SpineRadius,

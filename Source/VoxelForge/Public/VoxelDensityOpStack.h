@@ -59,6 +59,17 @@ class UVoxelStrateManager;
  */
 class FVoxelOpStack
 {
+private:
+    /** Metadata is snapshotted when an op enters the stack so no declaration virtual is ever
+     *  dispatched from `EvalSample`'s per-voxel loop. */
+    struct FOpEntry
+    {
+        TUniquePtr<IVoxelDensityOp> Op;
+        EVoxelOpChannelMask Reads = VoxelOpChannels::None;
+        EVoxelOpChannelMask Writes = VoxelOpChannels::None;
+        bool bAdditive = false;
+    };
+
 public:
     // DÉPLAÇABLE, PAS COPIABLE — et c'est la bonne sémantique, pas un contournement de compilateur :
     // une pile POSSÈDE ses opérateurs de façon unique. La copier voudrait dire cloner des opérateurs
@@ -66,13 +77,13 @@ public:
     //
     // ⚠️ NOTE COMPILATEUR : ne PAS remettre `VOXELFORGE_API` sur la classe. Sous MSVC, dllexport sur
     // une classe force l'instanciation de TOUS ses membres implicites, y compris l'opérateur
-    // d'affectation par copie — impossible à générer pour un `TArray<TUniquePtr<...>>`, d'où
+    // d'affectation par copie — impossible à générer pour un `TArray<FOpEntry>`, d'où
     // l'erreur C2280 « fonction supprimée ». L'export va sur la seule méthode hors-ligne.
     //
     // MOVE-ONLY, and that is the correct semantics rather than a compiler workaround: a stack
     // uniquely OWNS its operators. Do NOT put VOXELFORGE_API back on the class — under MSVC,
     // dllexport forces instantiation of every implicit member including copy-assignment, which
-    // cannot be generated for a TArray<TUniquePtr<...>> (error C2280). Export the out-of-line
+    // cannot be generated for a TArray<FOpEntry> (error C2280). Export the out-of-line
     // method instead.
     FVoxelOpStack() = default;
     FVoxelOpStack(FVoxelOpStack&&) = default;
@@ -80,7 +91,20 @@ public:
     FVoxelOpStack(const FVoxelOpStack&) = delete;
     FVoxelOpStack& operator=(const FVoxelOpStack&) = delete;
 
-    void Add(TUniquePtr<IVoxelDensityOp> Op) { Ops.Add(MoveTemp(Op)); }
+    void Add(TUniquePtr<IVoxelDensityOp> Op)
+    {
+        FOpEntry Entry;
+        Entry.Op = MoveTemp(Op);
+        if (Entry.Op.Get() != nullptr)
+        {
+            // Assembly-time metadata only. ValidateChannelOrder reuses this snapshot, and Eval
+            // never asks an operator for its declaration.
+            Entry.Reads     = Entry.Op->ChannelReads();
+            Entry.Writes    = Entry.Op->ChannelWrites();
+            Entry.bAdditive = Entry.Op->IsAdditive();
+        }
+        Ops.Add(MoveTemp(Entry));
+    }
 
     int32 Num() const { return Ops.Num(); }
 
@@ -89,7 +113,7 @@ public:
      *  mensonge utile qui finirait par masquer une course. */
     void PrepareChunk(const FVoxelOpContext& Ctx)
     {
-        for (const TUniquePtr<IVoxelDensityOp>& Op : Ops) { Op->PrepareChunk(Ctx); }
+        for (const FOpEntry& Entry : Ops) { Entry.Op->PrepareChunk(Ctx); }
     }
 
     /**
@@ -110,7 +134,7 @@ public:
     FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
     {
         FVoxelOpSample S;
-        for (const TUniquePtr<IVoxelDensityOp>& Op : Ops) { Op->Eval(WorldX, WorldY, WorldZ, S); }
+        for (const FOpEntry& Entry : Ops) { Entry.Op->Eval(WorldX, WorldY, WorldZ, S); }
         return S;
     }
 
@@ -128,9 +152,9 @@ public:
     EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
         FVoxelBoxHypotheses H;
-        for (const TUniquePtr<IVoxelDensityOp>& Op : Ops)
+        for (const FOpEntry& Entry : Ops)
         {
-            VF_FoldOp(H, *Op, VoxelBox, Ctx);
+            VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx);
             // Do not early-out on a dead hypothesis: a later forcing structural post may
             // deliberately overwrite it (the XY edge seal is appended after passage carving).
         }
@@ -165,7 +189,7 @@ public:
             const bool bSolidBefore = H.bCanBeAllSolid;
             const bool bAirBefore   = H.bCanBeAllAir;
 
-            VF_FoldOp(H, *Ops[i], VoxelBox, Ctx);
+            VF_FoldOp(H, *Ops[i].Op, VoxelBox, Ctx);
 
             if (bSolidBefore && !H.bCanBeAllSolid && OutSolidKiller == INDEX_NONE) { OutSolidKiller = i; }
             if (bAirBefore   && !H.bCanBeAllAir   && OutAirKiller   == INDEX_NONE) { OutAirKiller   = i; }
@@ -177,8 +201,30 @@ public:
     /** Nom lisible d'un opérateur, pour les rapports de test. Voir `IVoxelDensityOp::DebugName`. */
     const TCHAR* GetOpDebugName(int32 Index) const
     {
-        return Ops.IsValidIndex(Index) ? Ops[Index]->DebugName() : TEXT("(none)");
+        return Ops.IsValidIndex(Index) ? Ops[Index].Op->DebugName() : TEXT("(none)");
     }
+
+    /**
+     * Validate the stack's channel dependency DAG without evaluating a voxel.
+     *
+     * Rule: each channel has a current version. A channel is unavailable until an earlier op
+     * writes it. The one deliberate exception is a root `FieldSource` that reads and writes the
+     * same channel as an identity fold (for example `min(FLT_MAX, Sdf)`); it may consume that
+     * channel's `FVoxelOpSample` initial identity while publishing the first real version. An op
+     * may read only the version visible on entry; a read/write op consumes that version and
+     * publishes the next one. A write-only op is a replacement/producer, so it is legal only as
+     * the first producer of that channel; allowing a second write-only producer would silently
+     * clobber the earlier field. An additive op must read every channel it writes, because an
+     * additive delta cannot introduce or replace a channel. All producer-to-consumer edges
+     * therefore point forward in the list, and the list is a legal topological ordering of the
+     * channel DAG. A later read deliberately sees the writer's post-op version; a consumer that
+     * needs a pre-write value must be placed before that writer. The declarations do not invent
+     * dependencies from names, roles, or Eval side effects.
+     *
+     * This is assembly/diagnostic work only. It must not be called from Eval or any voxel loop.
+     * Returns false and optionally describes the first violation.
+     */
+    VOXELFORGE_API bool ValidateChannelOrder(FString* OutError = nullptr) const;
 
     /**
      * RÔLE 4 — ajoute les invariants de monde, dans l'ordre fixe, à la fin de la pile.
@@ -201,7 +247,7 @@ public:
                                              const UVoxelStrateManager* StrateManager);
 
 private:
-    TArray<TUniquePtr<IVoxelDensityOp>> Ops;
+    TArray<FOpEntry> Ops;
 };
 
 //=============================================================================
