@@ -49,27 +49,33 @@ what the world IS, and both paths compute it.
   `UVoxelGenerator::OriginSpineRadius` ← `VoxelSettings::OriginSpineRadius`. Called before
   every `ApplyBoundarySeal`.
 - `VerticalShafts` treats that structural column as a **connector endpoint**, not as a second
-  density primitive. A thread-local rebuild collects a 7×7 cell window once, emits tree links only
-  for the inner 3×3 cells, and resolves each parent from its complete 5×5 candidate window. Each
+  density primitive. A thread-local rebuild collects a direct-indexed geometric halo once (with
+  the stock settings: 9×9 tree-emission cells and a 15×15 roll), emits tree links only for the
+  inner 3×3 cells, and resolves each parent from its complete ±2-cell candidate window. Each
   shaft chooses the nearest shaft whose jittered distance to (0,0) is strictly smaller; ties use
-  the lowest cell index. A local minimum links directly to the spine. The wider collection is
-  therefore fully contained for every emitted shaft and the parent is independent of chunk or
-  evaluation-cell boundaries. The existing probabilistic `VoxelHash::Pair` links and
+  the lowest cell index. If that window has no parent, the deterministic ±3 lower-origin neighbour
+  fallback fires; a window touching the origin uses the spine directly, with a final direct-spine
+  fallback for an unusually empty finite halo. The wider collection is therefore fully contained
+  for every emitted shaft and the parent is independent of chunk or evaluation-cell boundaries.
+  Every parent edge strictly decreases origin distance or terminates at the spine, which proves
+  that no shaft is orphaned or cyclic. The existing probabilistic `VoxelHash::Pair` links and
   `Spacing*1.6` cutoff remain as texture and loops; they are additive, not the connectivity law.
   Tree links use a radius strictly above the proven `sup|FBM|=1.5` roughness envelope
-  (`max(ConnectorRadius, SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 + 1)`).
-  `BuildVerticalShaftStack` mirrors the same tree, random links, windows, hashes, and radius;
-  `VF_ApplyOriginSpine` remains the sole owner of the vertical column itself.
+  (`max(ConnectorRadius, SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 + 1)`) and choose a shared
+  ledge-free Z interval. `BuildVerticalShaftStack` mirrors the same tree, random links, windows,
+  hashes, radius, and connector-Z rule; `VF_ApplyOriginSpine` remains the sole owner of the
+  vertical column itself.
 - Descent is **player-dug** through the thin seals at (0,0). The single auto-opened
   connection is the **surface entry shaft** at (0,0) through the top of strate 0
   (`GeneratePassages`, `bOpenSurfaceEntry`).
 - **Hybrid extras:** auto-carved *shortcut* passages per boundary, placed away from (0,0).
   Now fully **per-strate** — see §8.8 (the upper strate's `PassageConfig` drives count/style/shape).
 
-The tree is a construction guarantee for the shaft field: every seeded shaft has one inward
-edge, and every chain strictly decreases distance to the origin until it reaches a local minimum
-that links to the spine. It does not alter passage placement. The acceptance measurement remains
-the actual arrival→departure flood-fill at the independently placed passage endpoints.
+The tree is a construction guarantee for the shaft field: every seeded shaft has one inward edge,
+and every chain strictly decreases distance to the origin until it reaches a local minimum that
+links to the spine. The fallback resolver preserves that proof, so no shaft is an orphan or part
+of a cycle. It does not alter passage placement. The acceptance measurement remains the actual
+arrival→departure flood-fill at the independently placed passage endpoints.
 
 ### 8.2a XY edge seal (bounded-world invariant)
 `UVoxelSettings::WorldRadiusVoxels` and `EdgeSealThickness` define the bounded world in actor-space
@@ -342,8 +348,9 @@ landing point through the pure free function `VF_SuggestLandingPoint` (`VoxelCav
 TunnelNetwork and Underwater keep the nearest hash-room vertical placement at the requested XY, with
 `MakeStrateSeed(world-seed, strate-index)` matching the room graph's existing identity; FlatPlain and
 CrystalChamber recompute their slab void band and reject column-overlap points. Maze snaps to the
-nearest roughness-safe horizontal lattice corridor within one cell, VerticalShafts to a roughness-safe
-shaft within one shaft spacing, and FloatingIslands to a validated blob top within one island spacing.
+nearest roughness-safe horizontal lattice corridor within one cell, VerticalShafts to the exact
+axis of a roughness-safe shaft on the drainage tree within one shaft spacing, and FloatingIslands
+to a validated blob top within one island spacing.
 Those three return false when no footing exists inside that explicit lateral budget. GeneratePassages
 interpolates the snapped XY through the control-point chain and recomputes its conservative bound;
 SurfaceWorld remains deliberately unanswerable because production terrain can be selected through
@@ -373,11 +380,13 @@ driven by `EditorBrush*` props.
   sampling must not thrash the (expensive) rebuild.
 - **VerticalShafts field cache**: shaft rolls and connector decisions, including the structural
   tree and structural-spine connector endpoint, are rebuilt only when the thread-local centre cell
-  or a geometry-affecting parameter changes. Each rebuild rolls 49 cells (7×7); it stores/emits
-  only the inner 3×3 shafts and their capsules for the per-voxel loop. The complete 5×5 parent
-  windows are contained by that 7×7 collection, so no parent decision depends on the evaluation
-  cell. No cell or pair hash may move into the per-voxel loop; the operator-stack source follows
-  the same cache contract.
+  or a geometry-affecting parameter changes. Each rebuild rolls a wider direct-indexed geometric
+  halo (stock settings: 9×9 tree-emission cells / 15×15 total roll); it stores/emits only the
+  inner 3×3 shafts and their capsules for the per-voxel loop, while spatial culling selects cached
+  connectors. The complete ±2 parent and ±3 fallback windows plus connector reach are contained
+  by that halo, so no parent decision depends on the evaluation cell. No cell or pair hash, widened
+  neighbourhood scan, or tree construction may move into the per-voxel loop; the operator-stack
+  source follows the same cache contract.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
   thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
   prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner

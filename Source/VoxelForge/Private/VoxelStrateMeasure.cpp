@@ -97,7 +97,14 @@ namespace VoxelStrateMeasurePrivate
         {
             return Refuse(OutReason, TEXT("SampleStep must be greater than zero."));
         }
-        if (Settings.RadiusInVoxels <= 0)
+        const bool bHasCoverPointA = Settings.CoverPointA.IsSet();
+        const bool bHasCoverPointB = Settings.CoverPointB.IsSet();
+        if (bHasCoverPointA != bHasCoverPointB)
+        {
+            return Refuse(OutReason, TEXT("CoverPointA and CoverPointB must be set together."));
+        }
+        const bool bUseFittedWindow = bHasCoverPointA && bHasCoverPointB;
+        if (!bUseFittedWindow && Settings.RadiusInVoxels <= 0)
         {
             return Refuse(OutReason, TEXT("RadiusInVoxels must be greater than zero."));
         }
@@ -109,9 +116,25 @@ namespace VoxelStrateMeasurePrivate
         {
             return Refuse(OutReason, TEXT("HeadroomCells cannot be negative."));
         }
-        if (!FMath::IsFinite(Settings.CenterXY.X) || !FMath::IsFinite(Settings.CenterXY.Y))
+        if (!bUseFittedWindow
+            && (!FMath::IsFinite(Settings.CenterXY.X) || !FMath::IsFinite(Settings.CenterXY.Y)))
         {
             return Refuse(OutReason, TEXT("CenterXY must contain finite voxel coordinates."));
+        }
+        if (bUseFittedWindow)
+        {
+            const FVector2D& PointA = Settings.CoverPointA.GetValue();
+            const FVector2D& PointB = Settings.CoverPointB.GetValue();
+            if (!FMath::IsFinite(PointA.X) || !FMath::IsFinite(PointA.Y)
+                || !FMath::IsFinite(PointB.X) || !FMath::IsFinite(PointB.Y))
+            {
+                return Refuse(OutReason, TEXT("Cover points must contain finite voxel coordinates."));
+            }
+            if (!FMath::IsFinite(Settings.CoverMarginVoxels)
+                || Settings.CoverMarginVoxels < 0.0f)
+            {
+                return Refuse(OutReason, TEXT("CoverMarginVoxels must be finite and non-negative."));
+            }
         }
         if (Slot.TopChunkZ <= Slot.BottomChunkZ)
         {
@@ -128,13 +151,52 @@ namespace VoxelStrateMeasurePrivate
 
         // Resolve the margin from the same blended parameter query used by generation. The
         // representative chunk is deliberately in the middle of this slot and uses the sample
-        // centre's XY chunk, so a future non-Hard transition resolves through the manager exactly
-        // as generation does at that representative location.
+        // window centre's XY chunk, so a future non-Hard transition resolves through the manager
+        // exactly as generation does at that representative location.
+        FVector2D WindowCenter = Settings.CenterXY;
+        double MinX64 = 0.0;
+        double MaxX64 = 0.0;
+        double MinY64 = 0.0;
+        double MaxY64 = 0.0;
+        if (bUseFittedWindow)
+        {
+            const FVector2D& PointA = Settings.CoverPointA.GetValue();
+            const FVector2D& PointB = Settings.CoverPointB.GetValue();
+            const double Margin = static_cast<double>(Settings.CoverMarginVoxels);
+            MinX64 = FMath::Min(static_cast<double>(PointA.X), static_cast<double>(PointB.X)) - Margin;
+            MaxX64 = FMath::Max(static_cast<double>(PointA.X), static_cast<double>(PointB.X)) + Margin;
+            MinY64 = FMath::Min(static_cast<double>(PointA.Y), static_cast<double>(PointB.Y)) - Margin;
+            MaxY64 = FMath::Max(static_cast<double>(PointA.Y), static_cast<double>(PointB.Y)) + Margin;
+            WindowCenter = FVector2D(
+                static_cast<float>(0.5 * (MinX64 + MaxX64)),
+                static_cast<float>(0.5 * (MinY64 + MaxY64)));
+        }
+        else
+        {
+            MinX64 = static_cast<double>(Settings.CenterXY.X)
+                - static_cast<double>(Settings.RadiusInVoxels);
+            MaxX64 = static_cast<double>(Settings.CenterXY.X)
+                + static_cast<double>(Settings.RadiusInVoxels);
+            MinY64 = static_cast<double>(Settings.CenterXY.Y)
+                - static_cast<double>(Settings.RadiusInVoxels);
+            MaxY64 = static_cast<double>(Settings.CenterXY.Y)
+                + static_cast<double>(Settings.RadiusInVoxels);
+        }
+        const double XYExtentX = MaxX64 - MinX64;
+        const double XYExtentY = MaxY64 - MinY64;
+        if (!FMath::IsFinite(MinX64) || !FMath::IsFinite(MaxX64)
+            || !FMath::IsFinite(MinY64) || !FMath::IsFinite(MaxY64)
+            || !FMath::IsFinite(XYExtentX) || !FMath::IsFinite(XYExtentY)
+            || XYExtentX < 1.0 || XYExtentY < 1.0)
+        {
+            return Refuse(OutReason, TEXT("The requested XY window is not a finite positive voxel box."));
+        }
+
         const int32 MidChunkZ = Slot.BottomChunkZ
             + (Slot.TopChunkZ - Slot.BottomChunkZ) / 2;
         const FIntVector RepresentativeChunk(
-            FMath::FloorToInt(Settings.CenterXY.X / static_cast<float>(CHUNK_SIZE)),
-            FMath::FloorToInt(Settings.CenterXY.Y / static_cast<float>(CHUNK_SIZE)),
+            FMath::FloorToInt(WindowCenter.X / static_cast<float>(CHUNK_SIZE)),
+            FMath::FloorToInt(WindowCenter.Y / static_cast<float>(CHUNK_SIZE)),
             MidChunkZ);
         const FStrateGenerationParams RepresentativeParams =
             Manager.GetGenerationParams(RepresentativeChunk);
@@ -188,10 +250,18 @@ namespace VoxelStrateMeasurePrivate
             return Refuse(OutReason, TEXT("The sampled Z window is outside the metrics struct's int32 range."));
         }
 
-        const int64 XYExtent = static_cast<int64>(Settings.RadiusInVoxels) * 2;
         const int64 Step = static_cast<int64>(Settings.SampleStep);
-        const int64 NumX64 = CeilDivPositive(XYExtent, Step);
-        const int64 NumY64 = NumX64;
+        const double NumXReal = XYExtentX / static_cast<double>(Step);
+        const double NumYReal = XYExtentY / static_cast<double>(Step);
+        if (!FMath::IsFinite(NumXReal) || !FMath::IsFinite(NumYReal)
+            || NumXReal <= 0.0 || NumYReal <= 0.0
+            || NumXReal > static_cast<double>(INT32_MAX)
+            || NumYReal > static_cast<double>(INT32_MAX))
+        {
+            return Refuse(OutReason, TEXT("A sample-grid dimension exceeds the supported array size."));
+        }
+        const int64 NumX64 = FMath::CeilToInt64(NumXReal);
+        const int64 NumY64 = FMath::CeilToInt64(NumYReal);
         const int64 NumZ64 = CeilDivPositive(InteriorHeight, Step);
         const int64 MaxCells = static_cast<int64>(Settings.MaxCells);
 
@@ -216,14 +286,6 @@ namespace VoxelStrateMeasurePrivate
             return Refuse(OutReason, TEXT("The requested sample grid exceeds the bounded cell count."));
         }
 
-        const double MinX64 = static_cast<double>(Settings.CenterXY.X)
-            - static_cast<double>(Settings.RadiusInVoxels);
-        const double MaxX64 = static_cast<double>(Settings.CenterXY.X)
-            + static_cast<double>(Settings.RadiusInVoxels);
-        const double MinY64 = static_cast<double>(Settings.CenterXY.Y)
-            - static_cast<double>(Settings.RadiusInVoxels);
-        const double MaxY64 = static_cast<double>(Settings.CenterXY.Y)
-            + static_cast<double>(Settings.RadiusInVoxels);
         const float MinX = static_cast<float>(MinX64);
         const float MaxX = static_cast<float>(MaxX64);
         const float MinY = static_cast<float>(MinY64);
@@ -301,7 +363,8 @@ namespace VoxelStrateMeasurePrivate
         int64 NumAir,
         int64& OutLargestComponentCells,
         int32& OutLargestComponentLowestCell,
-        int32& OutNumComponentsAtLeast1Pct)
+        int32& OutNumComponentsAtLeast1Pct,
+        TArray<int64>* OutComponentCells)
     {
         OutComponents.SetNumUninitialized(Grid.CellCount);
         for (int32 Index = 0; Index < Grid.CellCount; ++Index)
@@ -315,6 +378,10 @@ namespace VoxelStrateMeasurePrivate
         OutLargestComponentCells = 0;
         OutLargestComponentLowestCell = INDEX_NONE;
         OutNumComponentsAtLeast1Pct = 0;
+        if (OutComponentCells != nullptr)
+        {
+            OutComponentCells->Reset();
+        }
 
         for (int32 Start = 0; Start < Grid.CellCount; ++Start)
         {
@@ -359,6 +426,10 @@ namespace VoxelStrateMeasurePrivate
             }
 
             const int64 ComponentCells64 = static_cast<int64>(ComponentCells);
+            if (OutComponentCells != nullptr)
+            {
+                OutComponentCells->Add(ComponentCells64);
+            }
             if (NumAir > 0 && ComponentCells64 * 100 >= NumAir)
             {
                 ++OutNumComponentsAtLeast1Pct;
@@ -457,6 +528,7 @@ namespace VoxelStrateMeasurePrivate
         int64 LargestComponentCells = 0;
         int32 LargestComponentLowestCell = INDEX_NONE;
         int32 NumComponentsAtLeast1Pct = 0;
+        TArray<int64> ComponentCells;
         FloodFillAir(
             Grid,
             Components,
@@ -464,7 +536,8 @@ namespace VoxelStrateMeasurePrivate
             NumAir,
             LargestComponentCells,
             LargestComponentLowestCell,
-            NumComponentsAtLeast1Pct);
+            NumComponentsAtLeast1Pct,
+            &ComponentCells);
 
         InOutMetrics.NumSampled = Grid.CellCount;
         InOutMetrics.NumAir = NumAir;
@@ -472,6 +545,7 @@ namespace VoxelStrateMeasurePrivate
         InOutMetrics.AirFraction = static_cast<float>(
             static_cast<double>(NumAir) / static_cast<double>(Grid.CellCount));
         InOutMetrics.NumAirComponents = NumComponents;
+        InOutMetrics.AirComponentCells = MoveTemp(ComponentCells);
         InOutMetrics.LargestComponentCells = LargestComponentCells;
         InOutMetrics.NumComponentsAtLeast1Pct = NumComponentsAtLeast1Pct;
         InOutMetrics.LargestComponentShare = NumAir > 0
@@ -1005,7 +1079,8 @@ namespace VoxelStrateMeasurePrivate
             NumAir,
             LargestComponentCells,
             LargestComponentLowestCell,
-            NumComponentsAtLeast1Pct);
+            NumComponentsAtLeast1Pct,
+            nullptr);
 
         const int32 StartComponent = Components[Start];
         const int32 GoalComponent = Components[Goal];
@@ -1141,6 +1216,13 @@ FVoxelStrateMetrics VF_MeasureStrate(
     Result.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
     Result.SampledMinZ = Grid.SampledMinZ;
     Result.SampledMaxZ = Grid.SampledMaxZ;
+    Result.SampledNumX = Grid.NumX;
+    Result.SampledNumY = Grid.NumY;
+    Result.SampledNumZ = Grid.NumZ;
+    Result.SampledMinX = Grid.MinX;
+    Result.SampledMaxX = Grid.MaxX;
+    Result.SampledMinY = Grid.MinY;
+    Result.SampledMaxY = Grid.MaxY;
     VoxelStrateMeasurePrivate::BuildMetricsFromGrid(Grid, Settings, Result);
     Result.bValid = Result.NumSampled > 0;
     if (!Result.bValid)

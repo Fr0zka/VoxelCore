@@ -672,8 +672,8 @@ namespace
             (MaxLateralSnap + FMath::Max(Params.ShaftMaxRadius, 1.0f)) / Spacing) + 2;
 
         float BestDistSq = FLT_MAX;
-        float BestX = 0.0f;
-        float BestY = 0.0f;
+        float BestAxisX = 0.0f;
+        float BestAxisY = 0.0f;
         bool bFound = false;
         int32 BestCellX = INT32_MAX;
         int32 BestCellY = INT32_MAX;
@@ -711,17 +711,12 @@ namespace
                     continue;
                 }
 
-                if (Distance <= SafeRadius || Distance <= KINDA_SMALL_NUMBER)
-                {
-                    BestX = WorldX;
-                    BestY = WorldY;
-                }
-                else
-                {
-                    const float Scale = SafeRadius / Distance;
-                    BestX = ShaftX + DXWorld * Scale;
-                    BestY = ShaftY + DYWorld * Scale;
-                }
+                // A VerticalShafts landing must identify the topology, not merely an open point
+                // inside its radius. The safe-radius distance still chooses the nearest confident
+                // site under the existing snap budget, but the returned XY is the selected shaft's
+                // exact axis so it is on the deterministic drainage tree by construction.
+                BestAxisX = ShaftX;
+                BestAxisY = ShaftY;
                 BestDistSq = DistSq;
                 BestCellX = CellX;
                 BestCellY = CellY;
@@ -729,13 +724,13 @@ namespace
             }
         }
 
-        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestX)
-            || !FMath::IsFinite(BestY))
+        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestAxisX)
+            || !FMath::IsFinite(BestAxisY))
         {
             return false;
         }
 
-        OutPoint = FVector(BestX, BestY, LandingZ);
+        OutPoint = FVector(BestAxisX, BestAxisY, LandingZ);
         return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
             && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
     }

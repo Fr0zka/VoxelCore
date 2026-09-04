@@ -24,6 +24,12 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     int32     SampleStep     = 4;    // Voxels between samples.
     int32     RadiusInVoxels = 256;  // Half-extent in X and Y around CenterXY.
     FVector2D CenterXY       = FVector2D::ZeroVector; // Actor-space voxel coordinates.
+    // When both points are set, replace the square centered on CenterXY with the XY AABB of the
+    // two points expanded by CoverMarginVoxels. This keeps a mouth-to-mouth measurement sized by
+    // the mouths' separation instead of by their distance from the world origin.
+    TOptional<FVector2D> CoverPointA;
+    TOptional<FVector2D> CoverPointB;
+    float CoverMarginVoxels = 48.0f;
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     MaxRouteRetries = 16; // Alternate coarse routes to full-resolution-check after the first route.
     int32     HeadroomCells  = 2;    // Air cells above a floor cell required for walkable.
@@ -54,6 +60,21 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     int32 ResolvedMarginVoxels = 0;
     int32 SampledMinZ = 0;
     int32 SampledMaxZ = 0;
+
+    // The exact sampled XY box and dimensions. For a fitted window these are the AABB-derived
+    // dimensions; for the legacy window they describe CenterXY +/- RadiusInVoxels.
+    int32 SampledNumX = 0;
+    int32 SampledNumY = 0;
+    int32 SampledNumZ = 0;
+    float SampledMinX = 0.0f;
+    float SampledMaxX = 0.0f;
+    float SampledMinY = 0.0f;
+    float SampledMaxY = 0.0f;
+
+    // Air-component sizes in deterministic flood-fill discovery order. Keeping these facts from
+    // the one required flood fill lets diagnostics classify small non-largest components without
+    // sampling the source a second time.
+    TArray<int64> AirComponentCells;
 };
 
 /**

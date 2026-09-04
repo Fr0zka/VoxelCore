@@ -169,6 +169,42 @@ namespace
         return (Sdf < DetailThreshold) && (Sdf < FLT_MAX);
     }
 
+    // Structural tree capsules must meet shaft axes without landing inside a ledge band. This is
+    // the same pure helper as the generator path: one deterministic safe interval is shared by the
+    // whole strate, so a link cannot be blocked when it crosses an unrelated shaft's ledge.
+    FORCEINLINE float VF_SelectVerticalTreeConnectorZ(
+        const FVerticalShaftParams& Params,
+        float BottomZ,
+        float TopZ,
+        uint32 LinkHash)
+    {
+        if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
+        {
+            const float Period = Params.LedgeSpacing;
+            const float RelativeBottom = BottomZ - Params.StrateBottomWorldZ;
+            const float RelativeTop = TopZ - Params.StrateBottomWorldZ;
+            const int32 FirstPeriod = FMath::FloorToInt(RelativeBottom / Period);
+            const float Random01 = VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash));
+
+            for (int32 PeriodOffset = 0; PeriodOffset <= 1; ++PeriodOffset)
+            {
+                const float PeriodStart = static_cast<float>(FirstPeriod + PeriodOffset) * Period;
+                const float SafeStart = FMath::Max(
+                    RelativeBottom, PeriodStart + Params.LedgeDepth + 0.01f);
+                const float SafeEnd = FMath::Min(
+                    RelativeTop, PeriodStart + Period - Params.LedgeDepth - 0.01f);
+                if (SafeEnd > SafeStart)
+                {
+                    return Params.StrateBottomWorldZ
+                        + FMath::Lerp(SafeStart, SafeEnd, Random01);
+                }
+            }
+        }
+
+        return FMath::Lerp(BottomZ, TopZ,
+                           VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+    }
+
     //=========================================================================
     // RÔLE 1 — SOURCE : CHAMP CONSTANT / CONSTANT FIELD  (roc ET vide)
     //=========================================================================
@@ -1520,7 +1556,8 @@ namespace
     // séparée aurait dû faire aussi. À revoir si le profil montre que ça compte.
     //
     // Kept as ONE op against §6's suggestion: the per-voxel connectors derive from the same inner
-    // 3×3 roll as the shafts, while a rebuild-only 7×7 collection resolves each 5×5 tree window;
+    // 3×3 roll as the shafts, while a rebuild-only 9×9 collection resolves each 5×5 tree window
+    // and fixed ±3 fallback;
     // the downstream ledge mod needs the inner shaft list anyway. What is forfeited is an exact XY
     // box verdict on the cylinder half alone.
     class FShaftFieldSource final : public IVoxelDensityOp
@@ -1546,7 +1583,7 @@ namespace
         struct FCells
         {
             TArray<FShaft, TInlineAllocator<10>> Shafts;
-            TArray<FConn,  TInlineAllocator<24>> Conns;
+            TArray<FConn,  TInlineAllocator<32>> Conns;
         };
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
@@ -1612,21 +1649,37 @@ namespace
             // it may over-enumerate, but it must never miss a cached tree capsule.
             //-----------------------------------------------------------------
             constexpr int32 CandidateRadius = 2;
+            constexpr int32 FallbackRadius = 3;
             constexpr uint32 TreeSalt = 0x7A11u;
-            const int32 EmitX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
-            const int32 EmitX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
-            const int32 EmitY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
-            const int32 EmitY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
+            const float TreeRadius = SpineConnectorRadius();
+            const int32 ConnectorCellPad = FMath::Max(
+                1, FMath::CeilToInt(TreeRadius / Spacing));
+            const int32 TreeEmitRadius = FallbackRadius + ConnectorCellPad;
+            const int32 QueryX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing) - 1;
+            const int32 QueryX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing) + 1;
+            const int32 QueryY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing) - 1;
+            const int32 QueryY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing) + 1;
+            const int32 TreeEmitX0 = FMath::FloorToInt((float)VoxelBox.Min.X / Spacing)
+                - TreeEmitRadius;
+            const int32 TreeEmitX1 = FMath::FloorToInt((float)VoxelBox.Max.X / Spacing)
+                + TreeEmitRadius;
+            const int32 TreeEmitY0 = FMath::FloorToInt((float)VoxelBox.Min.Y / Spacing)
+                - TreeEmitRadius;
+            const int32 TreeEmitY1 = FMath::FloorToInt((float)VoxelBox.Max.Y / Spacing)
+                + TreeEmitRadius;
 
-            TArray<FShaft, TInlineAllocator<64>> TreeCandidates;
-            TArray<FShaft, TInlineAllocator<32>> TreeEmit;
-            for (int32 cy = EmitY0 - CandidateRadius; cy <= EmitY1 + CandidateRadius; ++cy)
-            for (int32 cx = EmitX0 - CandidateRadius; cx <= EmitX1 + CandidateRadius; ++cx)
+            TArray<FShaft, TInlineAllocator<225>> TreeCandidates;
+            TArray<FShaft, TInlineAllocator<81>> TreeEmit;
+            for (int32 cy = TreeEmitY0 - FallbackRadius;
+                 cy <= TreeEmitY1 + FallbackRadius; ++cy)
+            for (int32 cx = TreeEmitX0 - FallbackRadius;
+                 cx <= TreeEmitX1 + FallbackRadius; ++cx)
             {
                 FShaft Sh;
                 if (!RollShaft(cx, cy, Sh)) { continue; }
                 TreeCandidates.Add(Sh);
-                if (cx >= EmitX0 && cx <= EmitX1 && cy >= EmitY0 && cy <= EmitY1)
+                if (cx >= TreeEmitX0 && cx <= TreeEmitX1
+                    && cy >= TreeEmitY0 && cy <= TreeEmitY1)
                 {
                     TreeEmit.Add(Sh);
                 }
@@ -1634,7 +1687,6 @@ namespace
 
             const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
             const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
-            const float TreeRadius = SpineConnectorRadius();
             const float RMinZ = (float)VoxelBox.Min.Z, RMaxZ = (float)VoxelBox.Max.Z;
             const FVector2D CtrXY(0.5f * (float)(VoxelBox.Min.X + VoxelBox.Max.X),
                                   0.5f * (float)(VoxelBox.Min.Y + VoxelBox.Max.Y));
@@ -1689,14 +1741,58 @@ namespace
                     }
                 }
 
+                if (Parent == nullptr
+                    && !(FMath::Abs(Child.CellX) <= CandidateRadius
+                        && FMath::Abs(Child.CellY) <= CandidateRadius))
+                {
+                    // Keep EffectOverBox's parent resolver identical to GetCells. A local
+                    // minimum chooses the nearest lower-origin shaft in the collected halo; the
+                    // monotone origin-distance key proves that the resulting tree reaches the
+                    // spine and cannot cycle. If the finite halo is empty, the direct spine is the
+                    // conservative final fallback.
+                    for (const FShaft& Candidate : TreeCandidates)
+                    {
+                        if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
+                        {
+                            continue;
+                        }
+                        if (FMath::Abs(Candidate.CellX - Child.CellX) > FallbackRadius
+                            || FMath::Abs(Candidate.CellY - Child.CellY) > FallbackRadius)
+                        {
+                            continue;
+                        }
+
+                        const float CandidateOriginSq = FMath::Square(Candidate.X)
+                                                       + FMath::Square(Candidate.Y);
+                        if (!(CandidateOriginSq < ChildOriginSq))
+                        {
+                            continue;
+                        }
+
+                        const float DistanceSq = FMath::Square(Child.X - Candidate.X)
+                                               + FMath::Square(Child.Y - Candidate.Y);
+                        const bool bLowerCell = Parent == nullptr
+                            || Candidate.CellY < Parent->CellY
+                            || (Candidate.CellY == Parent->CellY
+                                && Candidate.CellX < Parent->CellX);
+                        if (DistanceSq < BestDistanceSq
+                            || (DistanceSq == BestDistanceSq && bLowerCell))
+                        {
+                            BestDistanceSq = DistanceSq;
+                            Parent = &Candidate;
+                        }
+                    }
+                }
+
                 const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
                 const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
                 const uint32 LinkHash = VoxelHash::Pair(
                     Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
-                const float Zc = FMath::Lerp(
+                const float Zc = VF_SelectVerticalTreeConnectorZ(
+                    P,
                     P.StrateBottomWorldZ + P.BoundarySealThickness,
                     P.StrateTopWorldZ - P.BoundarySealThickness,
-                    VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+                    LinkHash);
                 const FVector ParentPoint = Parent != nullptr
                     ? FVector(Parent->X, Parent->Y, Zc)
                     : FVector(0.0f, 0.0f, Zc);
@@ -1721,7 +1817,7 @@ namespace
             // du voisinage inner 3×3 de la cellule DE SA REQUÊTE. Une paire random visible depuis
             // un point de la boîte a donc ses deux puits dans [cellules de la boîte] ± 1, qui est
             // exactement la plage balayée ici. Les connecteurs de l'arbre sont testés séparément
-            // au-dessus avec leur collecte 7×7/émission inner 3×3. On peut produire des paires que
+            // au-dessus avec leur collecte élargie/émission du halo géométrique. On peut produire des paires que
             // personne ne voit jamais : c'est du `CarveOnly` en trop, pas un trou.
             //
             // ⚠️ ET POURQUOI L'ORDRE (A,B) EST LE MÊME QUE CELUI DE `GetCells`. Le hash de paire est
@@ -1738,10 +1834,10 @@ namespace
             // insertion order, so each pair gets the same hash without assuming Pair() is symmetric.
             if (P.CrossConnectChance > 0.0f)
             {
-                const int32 QX0 = EmitX0;
-                const int32 QX1 = EmitX1;
-                const int32 QY0 = EmitY0;
-                const int32 QY1 = EmitY1;
+                const int32 QX0 = QueryX0;
+                const int32 QX1 = QueryX1;
+                const int32 QY0 = QueryY0;
+                const int32 QY1 = QueryY1;
 
                 TArray<FShaft, TInlineAllocator<32>> Near;
                 for (int32 cy = QY0; cy <= QY1; ++cy)
@@ -1825,7 +1921,7 @@ namespace
         }
 
         /** Le voisinage inner 3×3 + ses connecteurs, mémoïsés par worker. Le rebuild collecte un
-         *  7×7 temporaire pour résoudre les fenêtres parent 5×5. Clé = cellule + tous les params
+         *  halo 9×9 émetteur / 15×15 total pour résoudre les fenêtres parent 5×5 et le fallback fixe ±3. Clé = cellule + tous les params
          *  qui influent (comme l'original) : stable à travers les reconstructions de pile, ce qui
          *  est la leçon retenue du mémo de colonne de SurfaceWorld. */
         const FCells& GetCells(float WorldX, float WorldY) const
@@ -1858,25 +1954,59 @@ namespace
                 Cache.Shafts.Reset();
                 Cache.Conns.Reset();
 
-                constexpr int32 CollectRadius = 3;   // 7×7: inner 3×3 + one 5×5 candidate halo
-                constexpr int32 EmitRadius = 1;      // 3×3: the only cells allowed to emit tree links
+                constexpr int32 EmitRadius = 1;      // 3×3: shaft cylinders and random links
                 constexpr int32 CandidateRadius = 2; // 5×5 parent window around an emitting shaft
+                constexpr int32 FallbackRadius = 3;  // fixed fallback window around an emitting shaft
                 constexpr uint32 TreeSalt = 0x7A11u;
 
-                TArray<FShaft, TInlineAllocator<49>> CollectedShafts;
+                const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
+                const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
+                const float TreeRadius = SpineConnectorRadius();
+                // A tree capsule can affect a cell even when neither endpoint is in that cell.
+                // Keep a rebuild-only child halo for that geometric reach, then add the
+                // parent-search halo. With the defaults this is 4 + 3 cells = 15×15 rolls.
+                const int32 ConnectorCellPad = FMath::Max(
+                    1, FMath::CeilToInt(TreeRadius / Spacing));
+                const int32 TreeEmitRadius = FallbackRadius + ConnectorCellPad;
+                const int32 CollectRadius = TreeEmitRadius + FallbackRadius;
+
+                const int32 CollectSide = CollectRadius * 2 + 1;
+                TArray<FShaft, TInlineAllocator<225>> ShaftGrid;
+                TArray<uint8, TInlineAllocator<225>> ShaftPresent;
+                TArray<FShaft, TInlineAllocator<81>> TreeEmitShafts;
+                ShaftGrid.SetNum(CollectSide * CollectSide);
+                ShaftPresent.Init(0, CollectSide * CollectSide);
                 // Rebuild-only wide collection. `Cache.Shafts` remains the inner 3×3 working set
-                // used by Eval and the ledge modifier, so the 7×7 cost is not paid per voxel.
+                // used by Eval and the ledge modifier; the wider tree work is not paid per voxel.
                 for (int32 dy = -CollectRadius; dy <= CollectRadius; dy++)
                 for (int32 dx = -CollectRadius; dx <= CollectRadius; dx++)
                 {
                     FShaft Sh;
                     if (!RollShaft(CX + dx, CY + dy, Sh)) { continue; }
-                    CollectedShafts.Add(Sh);
+                    const int32 GridIndex = (dy + CollectRadius) * CollectSide + (dx + CollectRadius);
+                    ShaftGrid[GridIndex] = Sh;
+                    ShaftPresent[GridIndex] = 1;
                     if (FMath::Abs(dx) <= EmitRadius && FMath::Abs(dy) <= EmitRadius)
                     {
                         Cache.Shafts.Add(Sh);
                     }
+                    if (FMath::Abs(dx) <= TreeEmitRadius && FMath::Abs(dy) <= TreeEmitRadius)
+                    {
+                        TreeEmitShafts.Add(Sh);
+                    }
                 }
+
+                auto FindCollectedShaft = [&](int32 CellX, int32 CellY) -> const FShaft*
+                {
+                    const int32 dx = CellX - CX;
+                    const int32 dy = CellY - CY;
+                    if (FMath::Abs(dx) > CollectRadius || FMath::Abs(dy) > CollectRadius)
+                    {
+                        return nullptr;
+                    }
+                    const int32 GridIndex = (dy + CollectRadius) * CollectSide + (dx + CollectRadius);
+                    return ShaftPresent[GridIndex] ? &ShaftGrid[GridIndex] : nullptr;
+                };
 
                 const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
                 if (bOriginNearby && SpineRadius > 0.0f)
@@ -1884,9 +2014,20 @@ namespace
                     Cache.Shafts.Add({0.0f, 0.0f, SpineRadius, 0, 0, true});
                 }
 
-                const float BottomZ = P.StrateBottomWorldZ + P.BoundarySealThickness;
-                const float TopZ    = P.StrateTopWorldZ    - P.BoundarySealThickness;
-                const float TreeRadius = SpineConnectorRadius();
+                const float CellMinX = static_cast<float>(CX) * Spacing;
+                const float CellMaxX = static_cast<float>(CX + 1) * Spacing;
+                const float CellMinY = static_cast<float>(CY) * Spacing;
+                const float CellMaxY = static_cast<float>(CY + 1) * Spacing;
+                auto ConnectorMayReachCell = [&](const FConn& Conn)
+                {
+                    const float MinX = FMath::Min(Conn.A.X, Conn.B.X) - Conn.Radius;
+                    const float MaxX = FMath::Max(Conn.A.X, Conn.B.X) + Conn.Radius;
+                    const float MinY = FMath::Min(Conn.A.Y, Conn.B.Y) - Conn.Radius;
+                    const float MaxY = FMath::Max(Conn.A.Y, Conn.B.Y) + Conn.Radius;
+                    const float GapX = FMath::Max3(CellMinX - MaxX, MinX - CellMaxX, 0.0f);
+                    const float GapY = FMath::Max3(CellMinY - MaxY, MinY - CellMaxY, 0.0f);
+                    return GapX == 0.0f && GapY == 0.0f;
+                };
 
                 auto EmitTreeConnector = [&](const FShaft& Child, const FShaft* Parent)
                 {
@@ -1894,55 +2035,103 @@ namespace
                     const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
                     const uint32 LinkHash = VoxelHash::Pair(
                         Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
-                    const float Zc = FMath::Lerp(
-                        BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
+                    const float Zc = VF_SelectVerticalTreeConnectorZ(
+                        P, BottomZ, TopZ, LinkHash);
                     const FVector ParentPoint = Parent != nullptr
                         ? FVector(Parent->X, Parent->Y, Zc)
                         : FVector(0.0f, 0.0f, Zc);
-                    Cache.Conns.Add({ FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius });
+                    const FConn Conn{
+                        FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius };
+                    if (ConnectorMayReachCell(Conn))
+                    {
+                        Cache.Conns.Add(Conn);
+                    }
                 };
 
-                // Structural drainage tree. Every real shaft emitted by this cache chooses the
-                // nearest strictly more-central shaft in its complete 5×5 window; a local minimum
-                // drains to the spine. The explicit row-major cell tie-break is independent of
-                // array iteration order, and the synthetic spine is not a candidate shaft.
-                for (const FShaft& Child : Cache.Shafts)
+                // Structural drainage tree. Every real shaft in the rebuild-only child window
+                // first chooses the nearest strictly more-central shaft in its complete 5×5
+                // window. A local minimum falls back to the nearest lower-origin shaft in the
+                // deterministic halo; a window touching the origin uses the spine directly, with
+                // a final direct-spine fallback for an unusually empty finite halo. Every parent
+                // edge therefore either strictly decreases origin distance or terminates at the
+                // spine: no cycles and no orphans. Spatial culling makes the same edge visible
+                // throughout its capsule, independent of which cache cell evaluates it.
+                for (const FShaft& Child : TreeEmitShafts)
                 {
                     if (Child.bOriginSpine) continue;
 
                     const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
                     const FShaft* Parent = nullptr;
                     float BestDistanceSq = FLT_MAX;
-                    for (const FShaft& Candidate : CollectedShafts)
+                    for (int32 dy = -CandidateRadius; dy <= CandidateRadius; ++dy)
+                    for (int32 dx = -CandidateRadius; dx <= CandidateRadius; ++dx)
                     {
-                        if (Candidate.CellX == Child.CellX && Candidate.CellY == Child.CellY)
-                        {
-                            continue;
-                        }
-                        if (FMath::Abs(Candidate.CellX - Child.CellX) > CandidateRadius
-                            || FMath::Abs(Candidate.CellY - Child.CellY) > CandidateRadius)
+                        const FShaft* Candidate = FindCollectedShaft(
+                            Child.CellX + dx, Child.CellY + dy);
+                        if (Candidate == nullptr
+                            || (Candidate->CellX == Child.CellX && Candidate->CellY == Child.CellY))
                         {
                             continue;
                         }
 
-                        const float CandidateOriginSq = FMath::Square(Candidate.X)
-                                                       + FMath::Square(Candidate.Y);
+                        const float CandidateOriginSq = FMath::Square(Candidate->X)
+                                                       + FMath::Square(Candidate->Y);
                         if (!(CandidateOriginSq < ChildOriginSq))
                         {
                             continue;
                         }
 
-                        const float DistanceSq = FMath::Square(Child.X - Candidate.X)
-                                               + FMath::Square(Child.Y - Candidate.Y);
+                        const float DistanceSq = FMath::Square(Child.X - Candidate->X)
+                                               + FMath::Square(Child.Y - Candidate->Y);
                         const bool bLowerCell = Parent == nullptr
-                            || Candidate.CellY < Parent->CellY
-                            || (Candidate.CellY == Parent->CellY
-                                && Candidate.CellX < Parent->CellX);
+                            || Candidate->CellY < Parent->CellY
+                            || (Candidate->CellY == Parent->CellY
+                                && Candidate->CellX < Parent->CellX);
                         if (DistanceSq < BestDistanceSq
                             || (DistanceSq == BestDistanceSq && bLowerCell))
                         {
                             BestDistanceSq = DistanceSq;
-                            Parent = &Candidate;
+                            Parent = Candidate;
+                        }
+                    }
+
+                    if (Parent == nullptr
+                        && !(FMath::Abs(Child.CellX) <= CandidateRadius
+                            && FMath::Abs(Child.CellY) <= CandidateRadius))
+                    {
+                        // Specified neighbour-shaft fallback. The lower-origin restriction is the
+                        // proof that this fallback cannot create a cycle.
+                        for (int32 dy = -FallbackRadius; dy <= FallbackRadius; ++dy)
+                        for (int32 dx = -FallbackRadius; dx <= FallbackRadius; ++dx)
+                        {
+                            const FShaft* Candidate = FindCollectedShaft(
+                                Child.CellX + dx, Child.CellY + dy);
+                            if (Candidate == nullptr
+                                || (Candidate->CellX == Child.CellX
+                                    && Candidate->CellY == Child.CellY))
+                            {
+                                continue;
+                            }
+
+                            const float CandidateOriginSq = FMath::Square(Candidate->X)
+                                                           + FMath::Square(Candidate->Y);
+                            if (!(CandidateOriginSq < ChildOriginSq))
+                            {
+                                continue;
+                            }
+
+                            const float DistanceSq = FMath::Square(Child.X - Candidate->X)
+                                                   + FMath::Square(Child.Y - Candidate->Y);
+                            const bool bLowerCell = Parent == nullptr
+                                || Candidate->CellY < Parent->CellY
+                                || (Candidate->CellY == Parent->CellY
+                                    && Candidate->CellX < Parent->CellX);
+                            if (DistanceSq < BestDistanceSq
+                                || (DistanceSq == BestDistanceSq && bLowerCell))
+                            {
+                                BestDistanceSq = DistanceSq;
+                                Parent = Candidate;
+                            }
                         }
                     }
 
@@ -1950,7 +2139,7 @@ namespace
                 }
 
                 // Existing random links remain the texture/loop layer and stay on the inner 3×3
-                // set. Only the deterministic parent lookup uses the 7×7 collection.
+                // set. Only the deterministic tree build uses the wider 9×9/15×15 collection.
                 if (P.CrossConnectChance > 0.0f && Cache.Shafts.Num() >= 2)
                 {
                     for (int32 i = 0; i < Cache.Shafts.Num(); i++)
@@ -1973,7 +2162,12 @@ namespace
                         const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
                         const float ConnectorR = bSpineConnector
                             ? SpineConnectorRadius() : P.ConnectorRadius;
-                        Cache.Conns.Add({ FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR });
+                        const FConn Conn{
+                            FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR };
+                        if (ConnectorMayReachCell(Conn))
+                        {
+                            Cache.Conns.Add(Conn);
+                        }
                     }
                 }
             }
@@ -2024,7 +2218,10 @@ namespace
                 const float D2 = FMath::Square(WorldX - Sh.X) + FMath::Square(WorldY - Sh.Y);
                 if (D2 < BestSq) { BestSq = D2; Near = &Sh; }
             }
-            if (Near && (WorldX - Near->X) + (WorldY - Near->Y) > 0.0f)
+            // The shaft axis is the structural tree's terminal point. Keep the mathematical
+            // half-plane boundary open: tiny cancellation error must not turn an exact axis
+            // landing into a solid ledge cap and sever the parent capsule.
+            if (Near && (WorldX - Near->X) + (WorldY - Near->Y) > 1.0e-3f)
             {
                 const float Shelf = 1.0f - SmoothStep01(BandT / P.LedgeDepth);
                 InOut.Density = FMath::Max(InOut.Density, Shelf * P.BaseDensity);

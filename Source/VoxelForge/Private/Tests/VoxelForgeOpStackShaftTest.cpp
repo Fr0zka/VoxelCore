@@ -174,8 +174,8 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     //=========================================================================
     // 2. INVARIANCE DE FENÊTRE
     //=========================================================================
-    // La source garde un cache inner 3×3 `thread_local`; chaque rebuild collecte 7×7 pour les
-    // fenêtres d'arbre 5×5. La clé est le jeu de params : c'est exactement le genre d'endroit où
+    // La source garde un cache inner 3×3 `thread_local`; chaque rebuild collecte un halo 9×9/15×15
+    // pour les fenêtres d'arbre 5×5 et le fallback ±3. La clé est le jeu de params : c'est exactement le genre d'endroit où
     // une clé incomplète produit une couture (AUDIT §C2).
     {
         std::atomic<int32> Impure{ 0 };
@@ -208,9 +208,9 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     //==========================================================================
     {
         // Force one distinct centre cell per call, then hold one cell constant. This measures the
-        // widened collection where it belongs (cache rebuild), separately from the hot per-voxel
-        // path. The implementation deliberately performs 49 cell rolls for the former and zero
-        // cell rolls for the latter; only the cached inner 3×3/capsule SDFs remain hot.
+    // widened collection where it belongs (cache rebuild), separately from the hot per-voxel
+    // path. The implementation deliberately performs 225 cell rolls for the former and zero
+    // cell rolls for the latter; only the cached inner 3×3/capsule SDFs remain hot.
         constexpr int32 NumRebuildSamples = 256;
         constexpr int32 NumHotSamples = 20000;
         const float PerfSpacing = FMath::Max(P.ShaftSpacing, 1.0f);
@@ -239,7 +239,7 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
 
         AddInfo(FString::Printf(
             TEXT("VerticalShafts cache perf: %d forced rebuilds at %.3f us/call and %d hot calls "
-                 "at %.3f us/call (7x7=49 cell rolls only on rebuild; inner 3x3/capsule SDF "
+                 "at %.3f us/call (15x15=225 cell rolls only on rebuild; inner 3x3/capsule SDF "
                  "only on hot calls; sink=%.9g)."),
             NumRebuildSamples,
             RebuildSeconds * 1.0e6 / static_cast<double>(NumRebuildSamples),

@@ -553,6 +553,8 @@ namespace VoxelCaveMorphology
  *
  * Propose un point d'atterrissage déterministe complet pour la bouche d'un passage inter-strates.
  * Cette requête reste pure et le déplacement latéral est strictement borné par MaxLateralSnap.
+ * Pour VerticalShafts, la réponse XY est exactement l'axe d'un puits sélectionné; elle n'est pas
+ * un point ouvert arbitraire à l'intérieur de son disque.
  *
  * @return true when the archetype can provide a confident point; false when it cannot.
  */
@@ -573,7 +575,8 @@ VOXELFORGE_API bool VF_SuggestLandingPoint(
  * Complete source-query overload for archetypes whose placement parameters are not part of
  * FStrateGenerationParams/FSlabGenerationParams. The extra structs are read-only inputs only;
  * the function remains pure and SurfaceWorld still returns false for the reason above. The
- * returned point is either at the requested XY or within MaxLateralSnap of it.
+ * returned point is either at the requested XY or within MaxLateralSnap of it. VerticalShafts
+ * returns the selected shaft axis so the answer belongs to the connected shaft tree.
  */
 VOXELFORGE_API bool VF_SuggestLandingPoint(
     ECaveGeneratorType Archetype,
