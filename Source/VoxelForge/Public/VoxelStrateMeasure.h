@@ -44,6 +44,55 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped); explicit 0 includes the seal.
 };
 
+/**
+ * Optional capture of the exact coarse grid used by one measurement.
+ *
+ * Air is deliberately stored as a polarity bit: 1 means density > 0 (air), 0 means solid.
+ * The capture is opt-in so ordinary metrics callers do not retain an 8-million-cell buffer.
+ * It is an editor/automation hand-off for tools such as the composer preview, not a runtime
+ * generation cache.
+ */
+struct VOXELFORGE_API FVoxelStrateSampleGrid
+{
+    bool bValid = false;
+    int32 NumX = 0;
+    int32 NumY = 0;
+    int32 NumZ = 0;
+    int32 SampleStep = 1;
+    int32 CellCount = 0;
+
+    float MinX = 0.0f;
+    float MinY = 0.0f;
+    float MinZ = 0.0f;
+    float MaxX = 0.0f;
+    float MaxY = 0.0f;
+    float MaxZ = 0.0f;
+
+    int32 ResolvedMarginVoxels = 0;
+    int32 SampledMinZ = 0;
+    int32 SampledMaxZ = 0;
+
+    // 1 = air (density > 0), 0 = solid (density <= 0), matching the measurement polarity.
+    TArray<uint8> Air;
+
+    FORCEINLINE int32 Index(int32 X, int32 Y, int32 Z) const
+    {
+        return static_cast<int32>(
+            static_cast<int64>(X)
+            + static_cast<int64>(NumX) * (static_cast<int64>(Y)
+                + static_cast<int64>(NumY) * static_cast<int64>(Z)));
+    }
+
+    bool IsValid() const
+    {
+        return bValid && NumX > 0 && NumY > 0 && NumZ > 0
+            && static_cast<int64>(CellCount)
+                == static_cast<int64>(NumX) * static_cast<int64>(NumY)
+                    * static_cast<int64>(NumZ)
+            && Air.Num() == CellCount;
+    }
+};
+
 /** Metrics derived from one coarse grid and its single air flood fill. */
 struct VOXELFORGE_API FVoxelStrateMetrics
 {
@@ -128,7 +177,8 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrate(
     const UVoxelGenerator& Generator,
     const UVoxelStrateManager& Manager,
     int32 StrateIndex,
-    const FVoxelStrateMeasureSettings& Settings);
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelStrateSampleGrid* OutSampleGrid = nullptr);
 
 /** The same Tier 2 pass over an explicit voxel Z window and a custom read-only sampler. */
 VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrateWithSampler(
@@ -136,7 +186,8 @@ VOXELFORGE_API FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     int32 StrateBottomWorldZ,
     int32 StrateTopWorldZ,
     float BoundarySealThickness,
-    const FVoxelStrateMeasureSettings& Settings);
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelStrateSampleGrid* OutSampleGrid = nullptr);
 
 /**
  * Test coarse connectivity and re-check recovered coarse routes at full resolution.

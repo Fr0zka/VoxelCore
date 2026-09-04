@@ -11,6 +11,8 @@
 #include "VoxelSettings.h"
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
+#include "VoxelStratePreview.h"
+#include "Misc/Paths.h"
 
 namespace
 {
@@ -321,6 +323,18 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     int64 TotalBoxCheckedVoxels = 0;
     int32 TotalBoxViolations = 0;
     FString FirstBoxViolation;
+    int32 TotalBootstrapJitterFields = 0;
+    TSet<FString> BootstrapJitterFieldNames;
+    TArray<FVoxelStratePreviewCandidate> PreviewCandidates;
+    PreviewCandidates.Reserve(NumCandidates);
+    FVoxelStratePreviewWindow PreviewWindow;
+    bool bPreviewWindowSet = false;
+    const FString PreviewRunId = FString::Printf(
+        TEXT("structure_seed_%d_corpus_%08x_step_%d_radius_%d"),
+        AuthoredSettings->Seed, Corpus.GetContentsHash(),
+        MeasureSettings.SampleStep, MeasureSettings.RadiusInVoxels);
+    const FString PreviewDirectory = FPaths::ProjectSavedDir()
+        / TEXT("ComposerPreview") / PreviewRunId;
     TArray<int32> ShapeCounts;
     ShapeCounts.Init(0, 5);
     int32 KCounts[9] = { 0 };
@@ -366,6 +380,7 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
 
         FVoxelStrateArchetypeParams CandidateParams;
         bool bParameterRollsValid = true;
+        double CandidateDistanceSquared = 0.0;
         for (const FBlockSpec& Spec : GBlockSpecs)
         {
             const FVoxelStrateRollInfo BlockRoll = VF_RollStrateParamsDetailedForArchetype(
@@ -380,6 +395,14 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
                                          *BlockRoll.FailureReason));
                 continue;
             }
+            TotalBootstrapJitterFields += BlockRoll.BootstrapJitterFieldCount;
+            for (const FString& FieldName : BlockRoll.BootstrapJitterFieldNames)
+            {
+                BootstrapJitterFieldNames.Add(FieldName);
+            }
+            const double BlockDistance = VF_DistanceFromStrateCorpusCentroid(
+                Corpus, BlockRoll.ArchetypeParams, Spec.Archetype);
+            CandidateDistanceSquared += BlockDistance * BlockDistance;
             VF_CopyRollBlock(CandidateParams, BlockRoll, Spec.Archetype);
         }
         VF_SetAllRuntimeBounds(CandidateParams, TopWorldZ, BottomWorldZ);
@@ -417,9 +440,10 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
 
         Stack.PrepareChunk(Context);
         FStackDensitySampler Sampler(Stack);
+        FVoxelStrateSampleGrid SampleGrid;
         const FVoxelStrateMetrics Metrics = VF_MeasureStrateWithSampler(
             Sampler, BottomVoxelZ, TopVoxelZ + 1,
-            Context.EdgeSealThickness, MeasureSettings);
+            Context.EdgeSealThickness, MeasureSettings, &SampleGrid);
 
         FVoxelConnectivityDiagnostics Law;
         if (ArrivalCount == 1 && DepartureCount == 1)
@@ -455,6 +479,27 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
             FeatureText = FString::Printf(TEXT("%.6f"), Metrics.MedianFeatureScale);
         }
 
+        FString RejectionReason;
+        if (!bNonVacuous)
+        {
+            RejectionReason = TEXT("vacuous");
+        }
+        else
+        {
+            if (!bLargestEnough)
+            {
+                RejectionReason = TEXT("fragmented");
+            }
+            if (!bLawPass)
+            {
+                if (!RejectionReason.IsEmpty())
+                {
+                    RejectionReason += TEXT("; ");
+                }
+                RejectionReason += TEXT("law failed");
+            }
+        }
+
         const FBoxVerdictReport BoxReport = VF_CheckStackBoxVerdicts(
             Stack, Context, CandidateIndex, BottomVoxelZ, TopVoxelZ);
         TotalBoxMixed += BoxReport.Mixed;
@@ -467,6 +512,50 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         {
             FirstBoxViolation = BoxReport.FirstViolation;
         }
+
+        const double CandidateDistance = FMath::Sqrt(
+            FMath::Max(0.0, CandidateDistanceSquared));
+        const FVoxelStratePreviewWindow CandidateWindow =
+            VF_GetStratePreviewWindow(SampleGrid);
+        if (CandidateWindow.IsValid())
+        {
+            if (!bPreviewWindowSet)
+            {
+                PreviewWindow = CandidateWindow;
+                bPreviewWindowSet = true;
+            }
+        }
+        TestTrue(FString::Printf(TEXT("candidate %d preview captures its measurement grid"),
+                                 CandidateIndex),
+                 !Metrics.bValid || SampleGrid.IsValid());
+
+        FVoxelStratePreviewCandidate PreviewCandidate;
+        FString PreviewError;
+        const bool bPreviewWritten = VF_WriteStratePreviewCandidate(
+            PreviewDirectory,
+            CandidateIndex,
+            VF_FormatStrateStructureRecipe(Recipe),
+            SampleGrid,
+            Metrics,
+            MeasureSettings.HeadroomCells,
+            CandidateDistance,
+            LawText,
+            !(bNonVacuous && bLargestEnough && bLawPass),
+            RejectionReason,
+            PreviewCandidate,
+            PreviewError);
+        TestTrue(FString::Printf(TEXT("candidate %d preview rasterises without a second sample"),
+                                 CandidateIndex),
+                 bPreviewWritten);
+        TestTrue(FString::Printf(TEXT("candidate %d has images when its measurement is valid"),
+                                 CandidateIndex),
+                 !Metrics.bValid || PreviewCandidate.bRendered);
+        if (!bPreviewWritten)
+        {
+            AddError(FString::Printf(TEXT("candidate %d preview failed: %s"),
+                                     CandidateIndex, *PreviewError));
+        }
+        PreviewCandidates.Add(MoveTemp(PreviewCandidate));
 
         // Same recipe + same block vectors + same seed must yield the same world values. This is
         // checked on a fixed point array for every candidate, including cache-backed sources.
@@ -548,6 +637,51 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
         TotalBoxMixed, TotalBoxAllSolid, TotalBoxAllAir, TotalBoxProved,
         TotalBoxCheckedVoxels, TotalBoxViolations,
         FirstBoxViolation.IsEmpty() ? TEXT("No violations.") : *FirstBoxViolation));
+    FString PreviewIndexPath;
+    FString PreviewError;
+    const bool bPreviewIndexWritten = bPreviewWindowSet
+        && PreviewCandidates.Num() == NumCandidates
+        && VF_WriteStratePreviewIndex(
+            PreviewDirectory,
+            FString::Printf(TEXT("VoxelForge composer structure preview — seed %d"),
+                             AuthoredSettings->Seed),
+            PreviewWindow,
+            PreviewCandidates,
+            PreviewIndexPath,
+            PreviewError);
+    TestTrue(TEXT("64-candidate composer preview index is written"), bPreviewIndexWritten);
+    if (!bPreviewIndexWritten)
+    {
+        AddError(FString::Printf(TEXT("composer preview index failed: %s"), *PreviewError));
+    }
+    if (bPreviewWindowSet && PreviewCandidates.Num() > 0)
+    {
+        const FVoxelStratePreviewCandidate& FirstPreview = PreviewCandidates[0];
+        int32 NumRenderedPairs = 0;
+        for (const FVoxelStratePreviewCandidate& Candidate : PreviewCandidates)
+        {
+            if (Candidate.bRendered)
+            {
+                ++NumRenderedPairs;
+            }
+        }
+        AddInfo(FString::Printf(
+            TEXT("Composer preview: %d candidates, %d rendered pairs, vertical=%dx%d, plan=%dx%d, "
+                 "plan Z chosen from each candidate's measured layer with the highest solid/air "
+                 "boundary count (first candidate Z=%d); index=%s; first-candidate window=%s; "
+                 "image cap=512 px including 20 px scale footer."),
+            PreviewCandidates.Num(),
+            NumRenderedPairs,
+            FirstPreview.VerticalImageWidth, FirstPreview.VerticalImageHeight,
+            FirstPreview.PlanImageWidth, FirstPreview.PlanImageHeight,
+            FirstPreview.PlanSliceWorldZ,
+            *PreviewIndexPath,
+            *PreviewWindow.Describe()));
+    }
+    AddInfo(FString::Printf(
+        TEXT("Bootstrap jitter: %d field applications across the six structure blocks; %d "
+             "distinct archetype fields took the bootstrap path."),
+        TotalBootstrapJitterFields, BootstrapJitterFieldNames.Num()));
 
     TestEqual(TEXT("exactly 64 structure candidates were requested"), NumCandidates, 64);
     TestEqual(TEXT("invalid recipes emitted by the roller/build path"), NumInvalidRecipes, 0);

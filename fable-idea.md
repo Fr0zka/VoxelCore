@@ -91,7 +91,14 @@ tiles.) In a tall multi-strate world most chunks in the desired set are full bed
 
 ### A. Tooling first — force multipliers for everything after
 
-**F1 — 2D world-preview editor tool.** ★ my top pick. An editor utility that samples `f_XY` (terrain height, relief M, water mask — later the biome map) over an N×N window into a `UTexture2D`, with the Surface|Macro knobs live. Tuning ReliefStrength/biome layout becomes seconds instead of regen-and-fly. Directly addresses the standing "hard to dial blind" pain (Worm passages, today's Stage 0 knobs). Extend with a top-view passage-path overlay (the data exists in `bDebugDrawPassages`).
+**F1 — 2D world-preview editor tool. ✅ BUILT 2026-09-04 (measurement + preview).** ★ my top pick. The
+editor/automation pass captures the exact coarse measurement grid, writes deterministic PNG XZ and
+XY slices plus a self-contained 64-candidate contact sheet, and labels walkable cells, scale, metric
+windows, rejection reasons, and the 2D-connectivity caveat. Output is under
+`Saved/ComposerPreview/<runid>/`; no runtime generation path is involved. The original idea remains:
+sample `f_XY` (terrain height, relief M, water mask — later the biome map) over an N×N window with
+the Surface|Macro knobs live, then extend with a top-view passage-path overlay (the data exists in
+`bDebugDrawPassages`).
 
 **F2 — Determinism validator button.** ✅ DONE 2026-07-04 (`AVoxelWorld::ValidateDeterminism`,
 Live Edit category). CallInEditor: sample a band of densities from two different chunk-window alignments, diff, report max delta. Turns the scariest invariant (§8.4 — window invariance) into a one-click regression test *before* biome code starts landing.

@@ -387,6 +387,29 @@ namespace VoxelStrateMeasurePrivate
         return true;
     }
 
+    void ExportSampleGrid(FSampleGrid& Source, FVoxelStrateSampleGrid& Destination)
+    {
+        Destination = FVoxelStrateSampleGrid();
+        Destination.bValid = true;
+        Destination.NumX = Source.NumX;
+        Destination.NumY = Source.NumY;
+        Destination.NumZ = Source.NumZ;
+        Destination.SampleStep = Source.SampleStep;
+        Destination.CellCount = Source.CellCount;
+        Destination.MinX = Source.MinX;
+        Destination.MinY = Source.MinY;
+        Destination.MinZ = Source.MinZ;
+        Destination.MaxX = Source.MaxX;
+        Destination.MaxY = Source.MaxY;
+        Destination.MaxZ = Source.MaxZ;
+        Destination.ResolvedMarginVoxels = Source.ResolvedMarginVoxels;
+        Destination.SampledMinZ = Source.SampledMinZ;
+        Destination.SampledMaxZ = Source.SampledMaxZ;
+        // Move, rather than copy, the already-built polarity grid. The caller owns this buffer
+        // only when it explicitly requested a capture.
+        Destination.Air = MoveTemp(Source.Air);
+    }
+
     void DecodeIndex(const FSampleGrid& Grid, int32 Index, int32& OutX, int32& OutY, int32& OutZ)
     {
         const int32 Plane = Grid.NumX * Grid.NumY;
@@ -1257,9 +1280,14 @@ FVoxelStrateMetrics VF_MeasureStrate(
     const UVoxelGenerator& Generator,
     const UVoxelStrateManager& Manager,
     int32 StrateIndex,
-    const FVoxelStrateMeasureSettings& Settings)
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelStrateSampleGrid* OutSampleGrid)
 {
     FVoxelStrateMetrics Result;
+    if (OutSampleGrid != nullptr)
+    {
+        *OutSampleGrid = FVoxelStrateSampleGrid();
+    }
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             &Generator, &Manager, nullptr, StrateIndex, 0, 0, 0.0f, false,
@@ -1284,6 +1312,10 @@ FVoxelStrateMetrics VF_MeasureStrate(
     {
         Result.RefusalReason = TEXT("The measurement grid was empty.");
     }
+    if (OutSampleGrid != nullptr && Result.bValid)
+    {
+        VoxelStrateMeasurePrivate::ExportSampleGrid(Grid, *OutSampleGrid);
+    }
     return Result;
 }
 
@@ -1292,9 +1324,14 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     int32 StrateBottomWorldZ,
     int32 StrateTopWorldZ,
     float BoundarySealThickness,
-    const FVoxelStrateMeasureSettings& Settings)
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelStrateSampleGrid* OutSampleGrid)
 {
     FVoxelStrateMetrics Result;
+    if (OutSampleGrid != nullptr)
+    {
+        *OutSampleGrid = FVoxelStrateSampleGrid();
+    }
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             nullptr, nullptr, &Sampler, INDEX_NONE, StrateBottomWorldZ, StrateTopWorldZ,
@@ -1318,6 +1355,10 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     if (!Result.bValid)
     {
         Result.RefusalReason = TEXT("The measurement grid was empty.");
+    }
+    if (OutSampleGrid != nullptr && Result.bValid)
+    {
+        VoxelStrateMeasurePrivate::ExportSampleGrid(Grid, *OutSampleGrid);
     }
     return Result;
 }

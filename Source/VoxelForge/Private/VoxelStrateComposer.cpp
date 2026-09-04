@@ -22,6 +22,9 @@
 namespace
 {
     constexpr float GJitterFraction = 0.15f;
+    constexpr float GBootstrapJitterFraction = 0.25f;
+    constexpr double GNearZeroSpread = 1.0e-6;
+    constexpr double GBootstrapMagnitudeFloor = 1.0;
 
     static const ECaveGeneratorType GAllArchetypes[] =
     {
@@ -861,10 +864,41 @@ namespace
         }
     }
 
+    void VF_JitterMeasuredField(double& Value,
+                                const FVoxelStrateFieldSpread& Spread,
+                                ECaveGeneratorType Archetype,
+                                FRandomStream& Rng,
+                                int32& OutBootstrapFieldCount,
+                                TArray<FString>& OutBootstrapFieldNames)
+    {
+        const double CorpusRange = FMath::Max(0.0, Spread.Max - Spread.Min);
+        const bool bUseBootstrap = CorpusRange <= GNearZeroSpread;
+
+        // Spread-derived jitter is the real rule. This bootstrap is only for a starved corpus:
+        // when season zero has supplied no useful measured range, use a fraction of this field's
+        // own magnitude, with a one-native-unit floor near zero. Promotion (Tier 5) should retire
+        // this fallback as the corpus grows.
+        const double JitterScale = bUseBootstrap
+            ? FMath::Max(FMath::Abs(Value), GBootstrapMagnitudeFloor)
+            : CorpusRange;
+        const float JitterFraction = bUseBootstrap
+            ? GBootstrapJitterFraction : GJitterFraction;
+        Value += static_cast<double>((Rng.FRand() * 2.0f - 1.0f) * JitterFraction)
+            * JitterScale;
+
+        if (bUseBootstrap)
+        {
+            ++OutBootstrapFieldCount;
+            OutBootstrapFieldNames.AddUnique(VF_SpreadKey(Archetype, Spread.FieldName));
+        }
+    }
+
     void VF_JitterNativeParams(FVoxelStrateArchetypeParams& Params,
                                ECaveGeneratorType Archetype,
                                const FVoxelStrateCorpus& Corpus,
-                               FRandomStream& Rng)
+                               FRandomStream& Rng,
+                               int32& OutBootstrapFieldCount,
+                               TArray<FString>& OutBootstrapFieldNames)
     {
         void* Memory = VF_GetParamMemory(Params, Archetype);
         UStruct* Struct = VF_GetParamStruct(Archetype);
@@ -889,17 +923,11 @@ namespace
                     continue;
                 }
 
-                const double CorpusRange = FMath::Max(0.0, Spread.Max - Spread.Min);
-                if (!(CorpusRange > 0.0))
-                {
-                    continue;
-                }
-
                 double Value = 0.0;
                 if (VF_ReadNamedField(Memory, Archetype, Spread.FieldName, Value))
                 {
-                    Value += static_cast<double>((Rng.FRand() * 2.0f - 1.0f) * GJitterFraction)
-                        * CorpusRange;
+                    VF_JitterMeasuredField(Value, Spread, Archetype, Rng,
+                                           OutBootstrapFieldCount, OutBootstrapFieldNames);
                     VF_WriteNamedField(Memory, Archetype, Spread.FieldName, Value);
                 }
             }
@@ -920,17 +948,11 @@ namespace
                 continue;
             }
 
-            const double CorpusRange = FMath::Max(0.0, Spread->Max - Spread->Min);
-            if (!(CorpusRange > 0.0))
-            {
-                continue;
-            }
-
             double Value = 0.0;
             if (VF_ReadPropertyValue(Pair.Value, Memory, Value))
             {
-                Value += static_cast<double>((Rng.FRand() * 2.0f - 1.0f) * GJitterFraction)
-                    * CorpusRange;
+                VF_JitterMeasuredField(Value, *Spread, Archetype, Rng,
+                                       OutBootstrapFieldCount, OutBootstrapFieldNames);
                 VF_WritePropertyValue(Pair.Value, Memory, Value);
             }
         }
@@ -1247,7 +1269,9 @@ namespace
         VF_CopyDominantBooleans(Result.ArchetypeParams,
                                 Entries[DominantParent].ArchetypeParams,
                                 Result.Archetype);
-        VF_JitterNativeParams(Result.ArchetypeParams, Result.Archetype, Corpus, Rng);
+        VF_JitterNativeParams(Result.ArchetypeParams, Result.Archetype, Corpus, Rng,
+                              Result.BootstrapJitterFieldCount,
+                              Result.BootstrapJitterFieldNames);
         VF_ClampNativeParams(Result.ArchetypeParams, Result.Archetype, Corpus);
         VF_RepairNativeOrderedPairs(Result.ArchetypeParams, Result.Archetype);
         VF_ResetExcludedFields(Result.ArchetypeParams, Result.Archetype);
@@ -2087,6 +2111,47 @@ bool VF_AreStrateArchetypeParamsBitIdentical(
         && VF_ReadRuntimeField(BMemory, Archetype, TEXT("StrateBottomWorldZ"), BBottom)
         && FMemory::Memcmp(&ATop, &BTop, sizeof(ATop)) == 0
         && FMemory::Memcmp(&ABottom, &BBottom, sizeof(ABottom)) == 0;
+}
+
+double VF_DistanceFromStrateCorpusCentroid(
+    const FVoxelStrateCorpus& Corpus,
+    const FVoxelStrateArchetypeParams& Params,
+    ECaveGeneratorType Archetype)
+{
+    const void* Memory = VF_GetParamMemory(Params, Archetype);
+    if (Memory == nullptr)
+    {
+        return 0.0;
+    }
+
+    double DistanceSquared = 0.0;
+    for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
+    {
+        if (Spread.Archetype != Archetype || Spread.bExcluded
+            || Spread.Kind == EVoxelStrateFieldKind::Boolean
+            || Spread.Kind == EVoxelStrateFieldKind::Enum)
+        {
+            continue;
+        }
+
+        double Value = 0.0;
+        if (!VF_ReadNamedField(Memory, Archetype, Spread.FieldName, Value))
+        {
+            continue;
+        }
+
+        const double CorpusRange = FMath::Max(0.0, Spread.Max - Spread.Min);
+        const double Scale = CorpusRange > GNearZeroSpread
+            ? CorpusRange
+            : FMath::Max(FMath::Abs(Spread.Mean) * GBootstrapJitterFraction,
+                         GBootstrapMagnitudeFloor);
+        if (FMath::IsFinite(Value) && FMath::IsFinite(Spread.Mean) && Scale > 0.0)
+        {
+            const double Normalized = (Value - Spread.Mean) / Scale;
+            DistanceSquared += Normalized * Normalized;
+        }
+    }
+    return FMath::Sqrt(FMath::Max(0.0, DistanceSquared));
 }
 
 FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpus,

@@ -424,6 +424,29 @@ while the candidate sweep retained step 4. The test asserts zero violations and 
 to future changed candidates rather than treating this clean run as a license to tune the survival
 rate.
 
+### Season-zero bootstrap follow-up (2026-09-04)
+
+The homogeneous-field trap is now handled explicitly. A field whose measured corpus range is at
+or below `1e-6` takes a **bootstrap** jitter of ±25% of its own magnitude, with a one-native-unit
+floor for values near zero; fields with useful spread still take the real ±15% of `max-min` rule.
+The safety clamps remain a final guard and never become roll ranges. `FVoxelStrateRollInfo` reports
+both the number of bootstrap applications and the distinct `archetype:field` names. The comment in
+the implementation makes the lifecycle explicit: this is a bootstrap for a starved season-zero
+corpus, and Tier 5 promotion should retire it as the corpus grows.
+
+The follow-up 64-roll measurement applied the bootstrap **1,422 times across 168 distinct fields**.
+It did **not** broaden the measured distributions beyond the previous run: feature scale stayed
+**0→376 voxels** and walkable fraction was **0.000000→0.286766**, below the previous **0.388506**
+maximum. The bootstrap is therefore active, but these two measurements are insensitive to the
+changed fields in this sample; this is more useful than pretending the new knob created visible
+world variety. The run had **38/64 survivors**, 60 non-vacuous candidates, 55 meeting the largest
+component threshold, and 42 exact law passes; those counts are observations, not tuning targets.
+
+The wider structure-roll jitter remained sound: **659 boxes proved**, **877,129 voxels checked**,
+and **0 violations** (1,901 Mixed, 266 AllSolid, 393 AllAir). The parameter-roll box check likewise
+proved **1,204 boxes**, checked **1,602,524 voxels**, and found **0 violations** (1,356 Mixed, 608
+AllSolid, 596 AllAir). A violation would reopen §6.2; this run did not.
+
 ### 3.4 The measurement pass — one grid, one flood fill, three jobs
 
 Sample a candidate strate into a coarse voxel grid, flood-fill the air **once**, derive everything from
@@ -456,8 +479,37 @@ one path at full resolution** — cheap, because only one corridor is verified.
 describes a place nobody will stand in. Report **distributions (median + spread), not single values**.
 
 **This is also F1.** `fable-idea.md`'s top-pick 2D world-preview tool is this pass with a visualisation
-on top. Build the measurement, get the preview nearly free — and it is needed anyway to review a season
-before publishing.
+on top. The measurement hand-off and deterministic preview are now built; they are needed anyway to
+review a season before publishing.
+
+### ✅ F1 measurement + preview built (2026-09-04)
+
+`FVoxelStrateSampleGrid` is an opt-in export of the exact `Air` polarity grid already sampled by
+`VF_MeasureStrate` / `VF_MeasureStrateWithSampler`. The editor/automation renderer consumes that
+buffer and never calls a density sampler, so each candidate's images and numbers come from one
+window and one sample pass. `VoxelForge.Composer.StructureRoll` now writes two PNGs per candidate
+and one self-contained `index.html` to:
+
+`Saved/ComposerPreview/structure_seed_0_corpus_9dbcea85_step_4_radius_256/`
+
+The sheet contains all **64 candidates / 128 PNGs**, survivors first and then descending normalized
+distance from the corpus centroid so outliers are near the top. Every card repeats its exact resolved
+interior margin, sample step, XY bounds, and inclusive/exclusive Z span before listing air, largest
+component share, walkable fraction, feature scale, clearance, and arrival→departure. Rejected cards
+are visibly marked and name `vacuous`, `fragmented`, and/or `law failed`.
+
+The vertical image is an XZ section through the sampled cell nearest the strate-window centre Y. The
+plan image scans every sampled Z layer, keeps layers containing both air and solid, and chooses the
+one with the largest number of XY solid/air boundary transitions; ties prefer more mixed cells, more
+walkable cells, then the layer nearest the vertical centre. If no mixed layer exists it chooses the
+most solid fallback layer, so a slab does not silently produce a blank mid-height sheet. The focused
+run's first candidate was **128×48** for vertical and **128×148** for plan; dimensions vary with the
+resolved Z window. Both images use dark solid, light air, orange walkable cells, and a one-chunk
+footer scale bar. The page states **one chunk = 32 voxels = 8 m**, the density sign (`> 0` is air),
+the exact measurement window, the 512-pixel-per-dimension cap (including a 20-pixel footer), and
+that larger source grids aggregate already-sampled cells rather than resampling. It also carries the
+required caveat: a 2D apparent join is not a 3D connectivity proof; the separate arrival→departure
+verdict is the connectivity check.
 
 ### 3.5 Validation in three layers, and how "good" is ever judged
 
@@ -739,14 +791,14 @@ sealed pocket. Worth doing even if the composer never happens. **It was real**: 
 ### Tier 2 — the measurement pass (§3.4) — ✅ BUILT (2026-09-03), see §13
 `VoxelStrateMeasure.h/.cpp` + `VoxelForge.Generation.StrateConnectivity` / `...Refinement`.
 *Standalone value:* it **is** F1, `fable-idea.md`'s top-pick world-preview tool — the measurement
-half. The visualisation on top is not built yet.
+half plus the deterministic editor/automation visualisation described in §3.4.
 
 **It paid for itself immediately**: it found the `VerticalShafts` primordial-law violation (§14),
 which no amount of playing was likely to surface, and it caught three of its own artifacts before
 they became "findings" (§13).
 
-⬜ Remaining: the *preview* (F1's visualisation), and the danger/rarity metric families from §3.4
-(fall exposure, openness, traversal mix, tortuosity, corpus-centroid distance).
+⬜ Remaining: the danger/rarity metric families from §3.4 (fall exposure, openness, traversal mix,
+tortuosity, corpus-centroid distance).
 
 ### Tier 3 — op-system prerequisites for free composition
 - ✅ **Channel read/write declarations** on every op, plus the stack DAG validator (§3.2; built
@@ -762,11 +814,12 @@ roughness and should stay late in the stack.
 
 ### Tier 4 — the composer proper
 - ✅ **Parameter roll (§3.3, Tier 4a)** — corpus spread + deterministic blend/jitter implementation
-  and the 64-candidate measurement pass are built; the first run exposed a one-vector settings corpus
-  and a vacuous cave box-verdict scan, both recorded above.
+  and the 64-candidate measurement pass are built; the bootstrap follow-up is 38/64 survival with
+  0 box-verdict violations (the first-run corpus/vacuity findings remain recorded above).
 - ✅ **Structure roll (§3.2, Tier 4b)** — serialisable recipes, root polarity, declaration-derived
   resource-safe modifier legality, mandatory posts, 64-candidate measurement, and direct box-verdict
-  brute force are built; focused result is 46/64 survival with 0 invalid recipes and 0 violations.
+  brute force are built; the bootstrap follow-up is 42/64 survival with 0 invalid recipes and 0
+  violations, plus 64 rendered preview pairs and an index.html contact sheet.
 - ⬜ Reject-and-resample driven by Tier 2 (§3.5) · the **offline season pipeline** with Jahni's review
   and veto (§3.1).
 

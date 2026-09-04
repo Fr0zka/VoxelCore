@@ -2,7 +2,8 @@
 //
 // This is deliberately not part of the runtime generation path.  The composer is a build-box
 // tool/test API: it loads authored vectors, measures their spread, and makes deterministic
-// candidates by blending those vectors before applying a small spread-relative jitter.
+// candidates by blending those vectors before applying spread-relative (or season-zero bootstrap)
+// jitter.
 
 #pragma once
 
@@ -203,6 +204,11 @@ struct VOXELFORGE_API FVoxelStrateRollInfo
     TArray<int32> ParentEntryIndices;
     TArray<float> ParentWeights;
     int32 DominantParentPosition = INDEX_NONE;
+
+    // Provenance for the starved-corpus fallback. Names are keyed as "archetype:field" so a
+    // report can distinguish field descriptors from the number of times they were applied.
+    int32 BootstrapJitterFieldCount = 0;
+    TArray<FString> BootstrapJitterFieldNames;
 };
 
 /**
@@ -305,4 +311,16 @@ VOXELFORGE_API bool VF_AreStrateParamsBitIdentical(
 VOXELFORGE_API bool VF_AreStrateArchetypeParamsBitIdentical(
     const FVoxelStrateArchetypeParams& A,
     const FVoxelStrateArchetypeParams& B,
+    ECaveGeneratorType Archetype);
+
+/**
+ * Normalised distance from the measured centroid of one exact-archetype corpus group.
+ *
+ * This is an offline ordering aid for the preview only. Continuous/integer fields are measured
+ * in their corpus units; zero-spread fields use a conservative scale floor so the value remains
+ * finite without turning clamps into roll ranges. It never participates in generation.
+ */
+VOXELFORGE_API double VF_DistanceFromStrateCorpusCentroid(
+    const FVoxelStrateCorpus& Corpus,
+    const FVoxelStrateArchetypeParams& Params,
     ECaveGeneratorType Archetype);

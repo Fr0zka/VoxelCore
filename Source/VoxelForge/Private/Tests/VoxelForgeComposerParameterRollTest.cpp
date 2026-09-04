@@ -19,6 +19,12 @@ namespace
     constexpr int32 NumCandidates = 64;
     constexpr float LargestComponentSurvivalThreshold = 0.50f;
     constexpr int32 BoxChecksPerCandidate = 40;
+    // Baseline reported by the pre-bootstrap 64-candidate run. Kept as a comparison point in the
+    // automation output; it is not a pass/fail threshold.
+    constexpr float PreviousFeatureScaleMin = 0.0f;
+    constexpr float PreviousFeatureScaleMax = 376.0f;
+    constexpr float PreviousWalkableMin = 0.0f;
+    constexpr float PreviousWalkableMax = 0.388506f;
 
     const TCHAR* VF_FieldKindName(EVoxelStrateFieldKind Kind)
     {
@@ -704,7 +710,8 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
               static_cast<int32>(UE_ARRAY_COUNT(DeadTerrainDetailFields)), 11);
 
     FString SpreadTable = TEXT(
-        "CORPUS SPREAD (population stddev; jitter range = ±15% of max-min; clamps are safety only)\n"
+        "CORPUS SPREAD (population stddev; spread jitter = ±15% of max-min; near-zero spread "
+        "uses ±25% of field magnitude with a one-unit floor; clamps are safety only)\n"
         "archetype | struct | field | kind | excluded | reflected | authored | op-defaults | samples | min | max | mean | stddev | clamp\n");
     for (const FVoxelStrateFieldSpread& Spread : Corpus.GetFieldSpreads())
     {
@@ -799,6 +806,12 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     int32 LiveActivationVariationCounts[9] = {};
     TArray<int32> BoxViolationCandidates;
     FString FirstBoxViolation;
+    int32 TotalBootstrapJitterFields = 0;
+    TSet<FString> BootstrapJitterFieldNames;
+    float FeatureScaleMin = FLT_MAX;
+    float FeatureScaleMax = -FLT_MAX;
+    float WalkableMin = FLT_MAX;
+    float WalkableMax = -FLT_MAX;
 
     const double RollAndMeasureStartSeconds = FPlatformTime::Seconds();
     for (int32 CandidateIndex = 0; CandidateIndex < NumCandidates; ++CandidateIndex)
@@ -806,6 +819,12 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         const FVoxelStrateRollInfo Roll = VF_RollStrateParamsDetailed(
             Corpus, AuthoredSettings->Seed, CandidateIndex);
         TestTrue(FString::Printf(TEXT("candidate %d roll is valid"), CandidateIndex), Roll.bValid);
+
+        TotalBootstrapJitterFields += Roll.BootstrapJitterFieldCount;
+        for (const FString& FieldName : Roll.BootstrapJitterFieldNames)
+        {
+            BootstrapJitterFieldNames.Add(FieldName);
+        }
 
         FString ParentText = VF_FormatParents(Corpus, Roll);
         FString AirText = TEXT("invalid");
@@ -879,7 +898,9 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
                      && VF_AreStrateArchetypeParamsBitIdentical(
                          RepeatRoll.ArchetypeParams, Roll.ArchetypeParams, Roll.Archetype)
                      && RepeatRoll.ParentEntryIndices == Roll.ParentEntryIndices
-                     && RepeatRoll.ParentWeights == Roll.ParentWeights);
+                     && RepeatRoll.ParentWeights == Roll.ParentWeights
+                     && RepeatRoll.BootstrapJitterFieldCount == Roll.BootstrapJitterFieldCount
+                     && RepeatRoll.BootstrapJitterFieldNames == Roll.BootstrapJitterFieldNames);
 
         // Put the invented vector into a transient fixture definition. This is an offline test
         // world only; the runtime manager/generation code and authored assets are untouched.
@@ -957,6 +978,10 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
             LargestText = FString::Printf(TEXT("%.6f"), Metrics.LargestComponentShare);
             WalkableText = FString::Printf(TEXT("%.6f"), Metrics.WalkableFraction);
             FeatureText = FString::Printf(TEXT("%.6f"), Metrics.MedianFeatureScale);
+            FeatureScaleMin = FMath::Min(FeatureScaleMin, Metrics.MedianFeatureScale);
+            FeatureScaleMax = FMath::Max(FeatureScaleMax, Metrics.MedianFeatureScale);
+            WalkableMin = FMath::Min(WalkableMin, Metrics.WalkableFraction);
+            WalkableMax = FMath::Max(WalkableMax, Metrics.WalkableFraction);
         }
 
         const FBoxVerdictReport BoxReport = VF_CheckRolledBoxVerdicts(
@@ -996,6 +1021,31 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     const double RollAndMeasureSeconds = FPlatformTime::Seconds() - RollAndMeasureStartSeconds;
 
     AddInfo(CandidateTable);
+    const bool bHaveFeatureDistribution = FeatureScaleMin != FLT_MAX;
+    const bool bHaveWalkableDistribution = WalkableMin != FLT_MAX;
+    const bool bFeatureBroadened = bHaveFeatureDistribution
+        && (FeatureScaleMin < PreviousFeatureScaleMin
+            || FeatureScaleMax > PreviousFeatureScaleMax);
+    const bool bWalkableBroadened = bHaveWalkableDistribution
+        && (WalkableMin < PreviousWalkableMin
+            || WalkableMax > PreviousWalkableMax);
+    AddInfo(FString::Printf(
+        TEXT("Bootstrap jitter: %d field applications across 64 rolls; %d distinct "
+             "archetype fields took the bootstrap path. Spread-derived jitter remains ±15%%; "
+             "bootstrap is ±25%% of own magnitude with a one-unit near-zero floor."),
+        TotalBootstrapJitterFields, BootstrapJitterFieldNames.Num()));
+    AddInfo(FString::Printf(
+        TEXT("Measured distribution after bootstrap: feature scale %.6f..%.6f voxels "
+             "(previous %.6f..%.6f; broadened=%s); walkable %.6f..%.6f "
+             "(previous %.6f..%.6f; broadened=%s)."),
+        FeatureScaleMin, FeatureScaleMax,
+        PreviousFeatureScaleMin, PreviousFeatureScaleMax,
+        bFeatureBroadened ? TEXT("yes") : TEXT("no"),
+        WalkableMin, WalkableMax,
+        PreviousWalkableMin, PreviousWalkableMax,
+        bWalkableBroadened ? TEXT("yes") : TEXT("no")));
+    TestTrue(TEXT("zero-spread bootstrap path is exercised by the 64-roll corpus"),
+             TotalBootstrapJitterFields > 0 && BootstrapJitterFieldNames.Num() > 0);
     AddInfo(FString::Printf(
         TEXT("Survival: %d/%d (%.1f%%). Criteria: non-vacuous (valid, sampled, air>0, solid>0), "
              "largest component share >= %.2f, and exact unsnapped arrival->departure law "
