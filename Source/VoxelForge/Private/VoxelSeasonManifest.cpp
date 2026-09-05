@@ -886,6 +886,19 @@ namespace VoxelSeasonManifestPrivate
                        Metrics.LargestWalkableSurfaceShare);
         SetMetricFloat(Object, TEXT("median_feature_scale"), Metrics.MedianFeatureScale);
         Object->SetNumberField(TEXT("median_vertical_clearance"), Metrics.MedianVerticalClearance);
+        Object->SetBoolField(TEXT("player_fit_resolved"), Metrics.bPlayerFitResolved);
+        Object->SetStringField(TEXT("player_fit_refusal_reason"), Metrics.PlayerFitRefusalReason);
+        Object->SetNumberField(TEXT("num_player_fit_cells"),
+                               static_cast<double>(Metrics.NumPlayerFitCells));
+        SetMetricFloat(Object, TEXT("player_fit_fraction"), Metrics.PlayerFitFraction);
+        Object->SetNumberField(TEXT("num_traversable_components"),
+                               Metrics.NumTraversableComponents);
+        Object->SetNumberField(TEXT("largest_traversable_component_cells"),
+                               static_cast<double>(Metrics.LargestTraversableComponentCells));
+        SetMetricFloat(Object, TEXT("traversable_component_share"),
+                       Metrics.TraversableComponentShare);
+        SetMetricFloat(Object, TEXT("minimum_player_clearance_voxels"),
+                       Metrics.MinimumPlayerClearanceVoxels);
         Object->SetNumberField(TEXT("resolved_margin_voxels"), Metrics.ResolvedMarginVoxels);
         Object->SetNumberField(TEXT("sampled_min_z"), Metrics.SampledMinZ);
         Object->SetNumberField(TEXT("sampled_max_z"), Metrics.SampledMaxZ);
@@ -940,6 +953,25 @@ namespace VoxelSeasonManifestPrivate
         }
         bValid = ReadMetricFloat(Object, TEXT("median_feature_scale"), OutMetrics.MedianFeatureScale) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("median_vertical_clearance"), OutMetrics.MedianVerticalClearance) && bValid;
+        if (Object->HasField(TEXT("player_fit_resolved")))
+        {
+            bValid = ReadJsonBool(Object, TEXT("player_fit_resolved"),
+                                  OutMetrics.bPlayerFitResolved) && bValid;
+            bValid = ReadJsonString(Object, TEXT("player_fit_refusal_reason"),
+                                    OutMetrics.PlayerFitRefusalReason) && bValid;
+            bValid = ReadJsonInt64(Object, TEXT("num_player_fit_cells"),
+                                   OutMetrics.NumPlayerFitCells) && bValid;
+            bValid = ReadMetricFloat(Object, TEXT("player_fit_fraction"),
+                                     OutMetrics.PlayerFitFraction) && bValid;
+            bValid = ReadJsonInt32(Object, TEXT("num_traversable_components"),
+                                   OutMetrics.NumTraversableComponents) && bValid;
+            bValid = ReadJsonInt64(Object, TEXT("largest_traversable_component_cells"),
+                                   OutMetrics.LargestTraversableComponentCells) && bValid;
+            bValid = ReadMetricFloat(Object, TEXT("traversable_component_share"),
+                                     OutMetrics.TraversableComponentShare) && bValid;
+            bValid = ReadMetricFloat(Object, TEXT("minimum_player_clearance_voxels"),
+                                     OutMetrics.MinimumPlayerClearanceVoxels) && bValid;
+        }
         bValid = ReadJsonInt32(Object, TEXT("resolved_margin_voxels"), OutMetrics.ResolvedMarginVoxels) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("sampled_min_z"), OutMetrics.SampledMinZ) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("sampled_max_z"), OutMetrics.SampledMaxZ) && bValid;
@@ -997,6 +1029,8 @@ namespace VoxelSeasonManifestPrivate
         case EVoxelConnectivityResult::NotConnectedAtThisResolution: return TEXT("NotConnectedAtThisResolution");
         case EVoxelConnectivityResult::StartCellSolid: return TEXT("StartCellSolid");
         case EVoxelConnectivityResult::GoalCellSolid: return TEXT("GoalCellSolid");
+        case EVoxelConnectivityResult::StartCellNotPlayerFit: return TEXT("StartCellNotPlayerFit");
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit: return TEXT("GoalCellNotPlayerFit");
         case EVoxelConnectivityResult::OutOfWindow: return TEXT("OutOfWindow");
         case EVoxelConnectivityResult::CoarseLiedBudgetExhausted: return TEXT("CoarseLiedBudgetExhausted");
         }
@@ -1010,6 +1044,8 @@ namespace VoxelSeasonManifestPrivate
             EVoxelConnectivityResult::NotConnectedAtThisResolution,
             EVoxelConnectivityResult::StartCellSolid,
             EVoxelConnectivityResult::GoalCellSolid,
+            EVoxelConnectivityResult::StartCellNotPlayerFit,
+            EVoxelConnectivityResult::GoalCellNotPlayerFit,
             EVoxelConnectivityResult::OutOfWindow,
             EVoxelConnectivityResult::CoarseLiedBudgetExhausted,
         };
@@ -1917,7 +1953,11 @@ namespace VoxelSeasonCompositionPrivate
             && FMath::IsFinite(Settings.CenterXY.X)
             && FMath::IsFinite(Settings.CenterXY.Y)
             && FMath::IsFinite(Settings.CoverMarginVoxels)
-            && Settings.CoverMarginVoxels >= 0.0f;
+            && Settings.CoverMarginVoxels >= 0.0f
+            && FMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
+            && Settings.PlayerCapsuleRadiusVoxels > 0.0f
+            && FMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
+            && Settings.PlayerCapsuleHalfHeightVoxels > 0.0f;
     }
 
     bool IsBossSlot(int32 DepthIndex, int32 TotalStrates, int32 Interval)
@@ -2193,20 +2233,54 @@ namespace VoxelSeasonCompositionPrivate
             return false;
         }
 
-        const FVoxelConnectivityDiagnostics Law = VF_DiagnoseConnectivityWithSampler(
-            Sampler, Strate.BottomWorldZ, Strate.TopWorldZ, Seal,
-            FVector(0.0f, 0.0f, InteriorBottom + 0.5f),
-            FVector(0.0f, 0.0f, InteriorTop - 0.5f), Settings.MeasureSettings);
-        OutEvaluation.PrimordialLawResult = Law.Result;
-        OutEvaluation.bPassedPrimordialLaw = Law.bValid
-            && Law.Result == EVoxelConnectivityResult::Connected
-            && !Law.bStartSnapped && !Law.bGoalSnapped;
+        FVoxelStrateMeasureSettings PlayerFitSettings = Settings.PlayerFitMeasureSettings;
+        // The season primordial law has always used the (0,0) spine as its arrival and departure
+        // line. Keep the fine ROI centred on that same physical route; centring it on the coarse
+        // largest-air representative can exclude the law endpoints and turn a valid route into
+        // an arbitrary OutOfWindow result. The player-fit pass still has its independent fine
+        // resolution and bounded radius.
+        PlayerFitSettings.CenterXY = FVector2D::ZeroVector;
+        PlayerFitSettings.CoverPointA.Reset();
+        PlayerFitSettings.CoverPointB.Reset();
+        FVoxelStrateMetrics PlayerFitMetrics;
+        const FVoxelConnectivityDiagnostics PlayerFitLaw =
+            VF_DiagnosePlayerFitConnectivityWithSampler(
+                Sampler, Strate.BottomWorldZ, Strate.TopWorldZ, Seal,
+                FVector(0.0f, 0.0f, InteriorBottom + 0.5f),
+                FVector(0.0f, 0.0f, InteriorTop - 0.5f),
+                PlayerFitSettings, &PlayerFitMetrics);
+        // The legacy fields remain the bounded coarse measurement. The player fields come from
+        // the separate one-voxel ROI that also backed the restricted route query.
+        RawMetrics.bPlayerFitResolved = PlayerFitMetrics.bPlayerFitResolved;
+        RawMetrics.PlayerFitRefusalReason = PlayerFitMetrics.PlayerFitRefusalReason;
+        RawMetrics.NumPlayerFitCells = PlayerFitMetrics.NumPlayerFitCells;
+        RawMetrics.PlayerFitFraction = PlayerFitMetrics.PlayerFitFraction;
+        RawMetrics.NumTraversableComponents = PlayerFitMetrics.NumTraversableComponents;
+        RawMetrics.LargestTraversableComponentCells =
+            PlayerFitMetrics.LargestTraversableComponentCells;
+        RawMetrics.TraversableComponentShare = PlayerFitMetrics.TraversableComponentShare;
+        RawMetrics.MinimumPlayerClearanceVoxels =
+            PlayerFitMetrics.MinimumPlayerClearanceVoxels;
+        if (OutRawMetrics != nullptr)
+        {
+            *OutRawMetrics = RawMetrics;
+        }
+
+        OutEvaluation.PrimordialLawResult = PlayerFitLaw.Result;
+        const bool bPlayerFitExists = PlayerFitMetrics.bValid
+            && PlayerFitMetrics.bPlayerFitResolved
+            && PlayerFitMetrics.NumPlayerFitCells > 0
+            && PlayerFitMetrics.NumTraversableComponents > 0
+            && PlayerFitMetrics.TraversableComponentShare > 0.0f;
+        OutEvaluation.bPassedPrimordialLaw = bPlayerFitExists
+            && PlayerFitLaw.bValid
+            && PlayerFitLaw.Result == EVoxelConnectivityResult::Connected;
         if (!OutEvaluation.bPassedPrimordialLaw)
         {
             OutEvaluation.FailureReason = FString::Printf(
-                TEXT("primordial law failed: %s%s"),
-                RejectionReasonForLaw(Law.Result),
-                (Law.bStartSnapped || Law.bGoalSnapped) ? TEXT(" (endpoint snapped)") : TEXT(""));
+                TEXT("player-fit primordial law failed: %s%s"),
+                RejectionReasonForLaw(PlayerFitLaw.Result),
+                bPlayerFitExists ? TEXT("") : TEXT(" (no player-fitting floor volume)"));
             return false;
         }
 
@@ -2432,6 +2506,10 @@ FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed,
     if (!IsValidMeasureSettings(Settings.MeasureSettings))
     {
         return Fail(TEXT("MeasureSettings are invalid for a bounded offline pass."));
+    }
+    if (!IsValidMeasureSettings(Settings.PlayerFitMeasureSettings))
+    {
+        return Fail(TEXT("PlayerFitMeasureSettings are invalid for a bounded offline pass."));
     }
 
     TMap<int32, FVoxelSeasonFixedStrate> FixedStrates;

@@ -716,6 +716,15 @@ bool VF_WriteStratePreviewCandidate(
     OutCandidate.LargestWalkableSurfaceShare = Metrics.LargestWalkableSurfaceShare;
     OutCandidate.MedianFeatureScale = Metrics.MedianFeatureScale;
     OutCandidate.MedianVerticalClearance = Metrics.MedianVerticalClearance;
+    OutCandidate.bPlayerFitResolved = Metrics.bPlayerFitResolved;
+    OutCandidate.PlayerFitRefusalReason = Metrics.PlayerFitRefusalReason;
+    OutCandidate.NumPlayerFitCells = Metrics.NumPlayerFitCells;
+    OutCandidate.PlayerFitFraction = Metrics.PlayerFitFraction;
+    OutCandidate.NumTraversableComponents = Metrics.NumTraversableComponents;
+    OutCandidate.LargestTraversableComponentCells =
+        Metrics.LargestTraversableComponentCells;
+    OutCandidate.TraversableComponentShare = Metrics.TraversableComponentShare;
+    OutCandidate.MinimumPlayerClearanceVoxels = Metrics.MinimumPlayerClearanceVoxels;
     OutCandidate.DistanceFromCorpusCentroid = FMath::IsFinite(DistanceFromCorpusCentroid)
         ? DistanceFromCorpusCentroid : 0.0;
 
@@ -1085,10 +1094,11 @@ bool VF_WriteStratePreviewIndex(
             "walkable cell / sampled XY footprint</em>. Largest connected surface is the largest "
             "four-neighbour component of those projected columns / all walkable columns. It is "
             "not a 3D traversal proof; the arrival → departure route check is separate.</p>\n"
-            "<p class=\"note\"><strong>Part A measurement settings:</strong> step=4 voxels, "
-            "HeadroomCells=2, XY radius=256 voxels, MaxCells=8,000,000. Each summary row lists "
-            "the exact target, derived interior margin, Z range, XY range, and grid for every "
-            "hard-gate survivor; each card repeats its selected window.</p>\n"
+            "<p class=\"note\"><strong>Part A measurement settings:</strong> legacy fields use "
+            "step=4 voxels, HeadroomCells=2, XY radius=256 voxels, MaxCells=8,000,000. The "
+            "player-fit gate uses a separate step-1 fine ROI and refuses to answer at any coarser "
+            "step. Each summary row lists the exact target, derived interior margin, Z range, XY "
+            "range, and grid for every hard-gate survivor; each card repeats its selected window.</p>\n"
             "<p class=\"note\"><strong>Reality check:</strong> real caves mix long, narrow passages "
             "with rooms, branches, multiple levels, and occasional vertical shafts; there is no "
             "universal target floor-to-volume ratio. The quantitative table below is therefore a "
@@ -1103,20 +1113,23 @@ bool VF_WriteStratePreviewIndex(
             "<table class=\"summary\"><caption>Part A — survivor distributions; every value uses the exact window printed in its row</caption>\n"
             "<tr><th>archetype</th><th>eligible single-region rolls / hard-gate survivors</th><th>walkable fraction<br>(median; min–max)</th>"
             "<th>floor area fraction<br>(median; min–max)</th><th>median clearance over walkable cells<br>(median; min–max voxels)</th>"
-            "<th>largest connected surface<br>(median; min–max)</th><th>window</th></tr>\n");
+            "<th>largest connected surface<br>(median; min–max)</th><th>player-fit fraction<br>(selected fine ROI)</th>"
+            "<th>traversable component share<br>(selected fine ROI)</th><th>window</th></tr>\n");
         for (const FVoxelStratePreviewArchetypeSummary& Summary : *ArchetypeSummaries)
         {
             const FString SummaryWindow = !Summary.WindowSummary.IsEmpty()
                 ? Summary.WindowSummary
                 : Summary.Window.IsValid() ? Summary.Window.Describe() : TEXT("unavailable");
             Html += FString::Printf(
-                TEXT("<tr><th>%s</th><td>%d / %d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"summary-window\">%s</td></tr>\n"),
+                TEXT("<tr><th>%s</th><td>%d / %d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"summary-window\">%s</td></tr>\n"),
                 *VF_HtmlEscape(Summary.ArchetypeName), Summary.EvaluatedCandidates,
                 Summary.HardGateSurvivors,
                 *VF_HtmlEscape(Summary.WalkableFractionSummary),
                 *VF_HtmlEscape(Summary.WalkableFloorAreaSummary),
                 *VF_HtmlEscape(Summary.MedianVerticalClearanceSummary),
                 *VF_HtmlEscape(Summary.LargestWalkableSurfaceSummary),
+                *VF_HtmlEscape(Summary.PlayerFitFractionSummary),
+                *VF_HtmlEscape(Summary.TraversableComponentShareSummary),
                 *VF_HtmlEscape(SummaryWindow));
         }
         Html += TEXT("</table>\n");
@@ -1142,10 +1155,11 @@ bool VF_WriteStratePreviewIndex(
         "<span><i class=\"swatch\" style=\"background:#dae1e7\"></i>air</span>"
         "<span><i class=\"swatch\" style=\"background:#f5a636\"></i>walkable cell</span>"
         "<span><i class=\"swatch\" style=\"background:#4de2be\"></i>density=0 contour</span></div>\n"
-        "<p class=\"note\"><strong>Fine ROI — largest open space:</strong> the separate step-1 pass "
-        "is requested only for selected candidates (this run selects coarse survivors). Its XY "
-        "window is centred on the deterministic <code>LargestComponentPoint</code> from the coarse "
-        "air flood fill, not on the strate midpoint or the world origin. Its exact window is printed "
+        "<p class=\"note\"><strong>Fine ROI — player-fit audit:</strong> the separate step-1 pass "
+        "is used by the player-fit gate for every candidate that reaches the legacy screen, and "
+        "is rendered for the selected candidate. The caller supplies its bounded XY window; the "
+        "showcase fits that window to the deterministic arrival/departure mouth pair so the gate "
+        "cannot pass or fail because its endpoints were cropped out. Its exact window is printed "
         "on the card. If its cell cap is exceeded, no fine allocation is made and the refusal is "
         "shown on that card.</p>\n"
         "<p class=\"note\">Ordering: survivors first, then each group by descending distance from "
@@ -1271,7 +1285,7 @@ bool VF_WriteStratePreviewIndex(
             Html += FString::Printf(TEXT("<div class=\"no-image\">No coarse image: %s</div>\n"),
                                     *VF_HtmlEscape(Candidate.RenderFailureReason));
         }
-        Html += TEXT("</div>\n<div class=\"fine-section\"><h3>FINE ROI — largest open space; filled cells and density=0 contour</h3>\n");
+        Html += TEXT("</div>\n<div class=\"fine-section\"><h3>FINE ROI — player-fit audit; filled cells and density=0 contour</h3>\n");
         if (!Candidate.bFineRequested)
         {
             Html += TEXT("<p class=\"not-requested\">Fine ROI not requested for this candidate; it did not pass the coarse survivor screen.</p>\n");
@@ -1294,7 +1308,7 @@ bool VF_WriteStratePreviewIndex(
         {
             const FString FineWindowDescription = Candidate.FineWindow.Describe();
             Html += FString::Printf(
-                TEXT("<p class=\"window\">Largest-open-space fine ROI; exact window: %s; slice Y=%d voxels.</p>\n"
+                TEXT("<p class=\"window\">Player-fit fine ROI; exact window: %s; slice Y=%d voxels.</p>\n"
                      "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XZ filled cells\"><figcaption>"
                      "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
                 *VF_HtmlEscape(FineWindowDescription), Candidate.FineVerticalSliceWorldY,
@@ -1316,7 +1330,7 @@ bool VF_WriteStratePreviewIndex(
             }
 
             Html += FString::Printf(
-                TEXT("<p class=\"window\">Largest-open-space fine ROI; exact window: %s; selected Z=%d voxels.</p>\n"
+                TEXT("<p class=\"window\">Player-fit fine ROI; exact window: %s; selected Z=%d voxels.</p>\n"
                      "<div class=\"pair\"><figure><img src=\"%s\" alt=\"candidate %d fine XY filled cells\"><figcaption>"
                      "FINE ROI · filled cells · step=%d</figcaption></figure>\n"),
                 *VF_HtmlEscape(FineWindowDescription), Candidate.FinePlanSliceWorldZ,
@@ -1349,6 +1363,12 @@ bool VF_WriteStratePreviewIndex(
                  "<tr><th>walkable surface components</th><td>%s</td></tr>\n"
                  "<tr><th>feature scale (voxels)</th><td>%s</td></tr>\n"
                  "<tr><th>vertical clearance (voxels)</th><td>%s</td></tr>\n"
+                 "<tr><th>player-fit resolved</th><td>%s</td></tr>\n"
+                 "<tr><th>player-fit fraction (fine ROI)</th><td>%s</td></tr>\n"
+                 "<tr><th>player-fitting floor cells</th><td>%s</td></tr>\n"
+                 "<tr><th>traversable component share (fine ROI)</th><td>%s</td></tr>\n"
+                 "<tr><th>traversable components</th><td>%s</td></tr>\n"
+                 "<tr><th>minimum player clearance (voxels)</th><td>%s</td></tr>\n"
                  "<tr><th>arrival → departure</th><td class=\"verdict\">%s</td></tr>\n"
                  "<tr><th>distance from corpus centroid (roll-space)</th><td>%.6f</td></tr>\n</table>\n</section>\n"),
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.AirFraction),
@@ -1360,6 +1380,12 @@ bool VF_WriteStratePreviewIndex(
             *VF_FormatIntegerMetric(Candidate.bMetricsValid, Candidate.NumWalkableSurfaceComponents),
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.MedianFeatureScale),
             *VF_FormatIntegerMetric(Candidate.bMetricsValid, Candidate.MedianVerticalClearance),
+            Candidate.bPlayerFitResolved ? TEXT("yes") : TEXT("no"),
+            *VF_FormatMetric(Candidate.bPlayerFitResolved, Candidate.PlayerFitFraction),
+            *VF_FormatInteger64Metric(Candidate.bPlayerFitResolved, Candidate.NumPlayerFitCells),
+            *VF_FormatMetric(Candidate.bPlayerFitResolved, Candidate.TraversableComponentShare),
+            *VF_FormatIntegerMetric(Candidate.bPlayerFitResolved, Candidate.NumTraversableComponents),
+            *VF_FormatMetric(Candidate.bPlayerFitResolved, Candidate.MinimumPlayerClearanceVoxels),
             *VF_HtmlEscape(Candidate.ArrivalDepartureVerdict),
             Candidate.DistanceFromCorpusCentroid);
     }

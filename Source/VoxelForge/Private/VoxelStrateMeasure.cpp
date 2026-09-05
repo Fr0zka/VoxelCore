@@ -441,7 +441,8 @@ namespace VoxelStrateMeasurePrivate
         int64& OutLargestComponentCells,
         int32& OutLargestComponentLowestCell,
         int32& OutNumComponentsAtLeast1Pct,
-        TArray<int64>* OutComponentCells)
+        TArray<int64>* OutComponentCells,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
         OutComponents.SetNumUninitialized(Grid.CellCount);
         for (int32 Index = 0; Index < Grid.CellCount; ++Index)
@@ -462,7 +463,9 @@ namespace VoxelStrateMeasurePrivate
 
         for (int32 Start = 0; Start < Grid.CellCount; ++Start)
         {
-            if (Grid.Air[Start] == 0u || OutComponents[Start] >= 0)
+            if (Grid.Air[Start] == 0u
+                || (EligibilityMask != nullptr && (*EligibilityMask)[Start] == 0u)
+                || OutComponents[Start] >= 0)
             {
                 continue;
             }
@@ -486,7 +489,9 @@ namespace VoxelStrateMeasurePrivate
 
                 auto Visit = [&](int32 Neighbor)
                 {
-                    if (Grid.Air[Neighbor] != 0u && OutComponents[Neighbor] < 0)
+                    if (Grid.Air[Neighbor] != 0u
+                        && (EligibilityMask == nullptr || (*EligibilityMask)[Neighbor] != 0u)
+                        && OutComponents[Neighbor] < 0)
                     {
                         OutComponents[Neighbor] = ComponentId;
                         Queue[Tail++] = Neighbor;
@@ -576,6 +581,343 @@ namespace VoxelStrateMeasurePrivate
         }
     }
 
+    struct FPlayerCapsuleStencilRow
+    {
+        int32 RelativeZ = 0;
+        TArray<FIntPoint> HorizontalOffsets;
+    };
+
+    bool IsPointInsideCapsule(
+        float RelativeZ,
+        int32 OffsetX,
+        int32 OffsetY,
+        float Radius,
+        float HalfHeight)
+    {
+        // The capsule is upright and its centre is HalfHeight above the top face of the solid
+        // floor cell. This is a direct capsule test in the fine voxel lattice; it deliberately
+        // does not infer occupancy from Manhattan distance.
+        const float AxisHalfLength = FMath::Max(0.0f, HalfHeight - Radius);
+        const float DistanceToAxis = FMath::Max(
+            FMath::Abs(RelativeZ) - AxisHalfLength, 0.0f);
+        const float DistanceSquared = static_cast<float>(OffsetX * OffsetX + OffsetY * OffsetY)
+            + DistanceToAxis * DistanceToAxis;
+        return DistanceSquared <= Radius * Radius + KINDA_SMALL_NUMBER;
+    }
+
+    bool BuildPlayerCapsuleStencil(
+        const FVoxelStrateMeasureSettings& Settings,
+        TArray<FPlayerCapsuleStencilRow>& OutRows,
+        FString& OutReason)
+    {
+        OutRows.Reset();
+        if (!FMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
+            || Settings.PlayerCapsuleRadiusVoxels <= 0.0f
+            || !FMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
+            || Settings.PlayerCapsuleHalfHeightVoxels <= 0.0f)
+        {
+            return Refuse(OutReason,
+                          TEXT("Player capsule radius and half-height must be finite and greater than zero."));
+        }
+
+        const double HeightCellsReal = FMath::CeilToDouble(
+            2.0 * static_cast<double>(Settings.PlayerCapsuleHalfHeightVoxels));
+        // This is a stencil-size guard, not a gameplay threshold. It prevents a malformed
+        // caller-supplied capsule from allocating an unbounded per-anchor loop.
+        constexpr double MaxStencilHeightCells = 4096.0;
+        if (!FMath::IsFinite(HeightCellsReal) || HeightCellsReal <= 0.0
+            || HeightCellsReal > MaxStencilHeightCells)
+        {
+            return Refuse(OutReason,
+                          TEXT("The player capsule height exceeds the bounded fit stencil."));
+        }
+
+        const double MaxHorizontalOffsetReal = FMath::CeilToDouble(
+            static_cast<double>(Settings.PlayerCapsuleRadiusVoxels));
+        constexpr double MaxStencilHorizontalRadiusCells = 4096.0;
+        if (!FMath::IsFinite(MaxHorizontalOffsetReal)
+            || MaxHorizontalOffsetReal < 0.0
+            || MaxHorizontalOffsetReal > MaxStencilHorizontalRadiusCells)
+        {
+            return Refuse(OutReason,
+                          TEXT("The player capsule radius exceeds the bounded fit stencil."));
+        }
+        const int32 HeightCells = static_cast<int32>(HeightCellsReal);
+        const int32 MaxHorizontalOffset = static_cast<int32>(MaxHorizontalOffsetReal);
+        // This bounds both the retained stencil and the per-anchor occupancy work. It is
+        // deliberately far above the confirmed capsule's handful of offsets, but prevents a
+        // malformed caller from turning a valid-looking finite radius into an enormous array.
+        constexpr int64 MaxStencilOffsets = 1ll << 20;
+        int64 NumStencilOffsets = 0;
+
+        OutRows.Reserve(HeightCells);
+        for (int32 RelativeZ = 0; RelativeZ < HeightCells; ++RelativeZ)
+        {
+            FPlayerCapsuleStencilRow& Row = OutRows.AddDefaulted_GetRef();
+            Row.RelativeZ = RelativeZ;
+            const float CapsuleRelativeZ = static_cast<float>(RelativeZ) + 0.5f
+                - Settings.PlayerCapsuleHalfHeightVoxels;
+            for (int32 OffsetY = -MaxHorizontalOffset;
+                 OffsetY <= MaxHorizontalOffset;
+                 ++OffsetY)
+            {
+                for (int32 OffsetX = -MaxHorizontalOffset;
+                     OffsetX <= MaxHorizontalOffset;
+                     ++OffsetX)
+                {
+                    if (IsPointInsideCapsule(
+                            CapsuleRelativeZ, OffsetX, OffsetY,
+                            Settings.PlayerCapsuleRadiusVoxels,
+                            Settings.PlayerCapsuleHalfHeightVoxels))
+                    {
+                        if (NumStencilOffsets >= MaxStencilOffsets)
+                        {
+                            return Refuse(
+                                OutReason,
+                                TEXT("The player capsule occupancy stencil exceeds its bounded work limit."));
+                        }
+                        Row.HorizontalOffsets.Add(FIntPoint(OffsetX, OffsetY));
+                        ++NumStencilOffsets;
+                    }
+                }
+            }
+
+            // The full-height floor rule still requires one clear voxel in rows whose voxel
+            // centre lies outside the rounded cap (normally the top partial voxel of a 7.04
+            // voxel player). This is what makes 176 cm a full-height requirement rather than a
+            // 7-centre-point approximation.
+            if (Row.HorizontalOffsets.IsEmpty())
+            {
+                Row.HorizontalOffsets.Add(FIntPoint::ZeroValue);
+            }
+        }
+        return true;
+    }
+
+    bool BuildPlayerFitMask(
+        const FSampleGrid& Grid,
+        const FVoxelStrateMeasureSettings& Settings,
+        TArray<uint8>& OutPlayerFit,
+        int64& OutNumPlayerFitCells,
+        FString& OutReason)
+    {
+        OutPlayerFit.Reset();
+        OutNumPlayerFitCells = 0;
+        if (Grid.SampleStep != 1)
+        {
+            return Refuse(
+                OutReason,
+                *FString::Printf(
+                    TEXT("Player-fit metrics refused: SampleStep=%d; exact capsule fit requires SampleStep=1."),
+                    Grid.SampleStep));
+        }
+
+        TArray<FPlayerCapsuleStencilRow> StencilRows;
+        if (!BuildPlayerCapsuleStencil(Settings, StencilRows, OutReason))
+        {
+            return false;
+        }
+
+        OutPlayerFit.Init(0u, Grid.CellCount);
+        for (int32 Z = 1; Z < Grid.NumZ; ++Z)
+        {
+            for (int32 Y = 0; Y < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X < Grid.NumX; ++X)
+                {
+                    const int32 Current = Grid.Index(X, Y, Z);
+                    if (Grid.Air[Current] == 0u
+                        || Grid.Air[Grid.Index(X, Y, Z - 1)] != 0u)
+                    {
+                        continue;
+                    }
+
+                    bool bFits = true;
+                    for (const FPlayerCapsuleStencilRow& Row : StencilRows)
+                    {
+                        const int32 TargetZ = Z + Row.RelativeZ;
+                        if (TargetZ < 0 || TargetZ >= Grid.NumZ)
+                        {
+                            bFits = false;
+                            break;
+                        }
+                        for (const FIntPoint& Offset : Row.HorizontalOffsets)
+                        {
+                            const int32 TargetX = X + Offset.X;
+                            const int32 TargetY = Y + Offset.Y;
+                            if (TargetX < 0 || TargetX >= Grid.NumX
+                                || TargetY < 0 || TargetY >= Grid.NumY
+                                || Grid.Air[Grid.Index(TargetX, TargetY, TargetZ)] == 0u)
+                            {
+                                bFits = false;
+                                break;
+                            }
+                        }
+                        if (!bFits)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (bFits)
+                    {
+                        OutPlayerFit[Current] = 1u;
+                        ++OutNumPlayerFitCells;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    float MinimumPlayerClearanceChebyshev(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFit)
+    {
+        if (PlayerFit.Num() != Grid.CellCount)
+        {
+            return 0.0f;
+        }
+
+        const int32 PlaneCells = Grid.NumX * Grid.NumY;
+        constexpr int32 Infinity = INT32_MAX / 4;
+        TArray<int32> Distances;
+        Distances.SetNumUninitialized(PlaneCells);
+        int32 MinimumDistance = Infinity;
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        {
+            for (int32 Y = 0; Y < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X < Grid.NumX; ++X)
+                {
+                    const int32 PlaneIndex = X + Grid.NumX * Y;
+                    Distances[PlaneIndex] = Grid.Air[Grid.Index(X, Y, Z)] == 0u
+                        ? 0 : Infinity;
+                }
+            }
+
+            auto Relax = [&](int32 Current, int32 Neighbor)
+            {
+                if (Distances[Neighbor] < Infinity)
+                {
+                    Distances[Current] = FMath::Min(
+                        Distances[Current], Distances[Neighbor] + 1);
+                }
+            };
+
+            // Two raster passes with the complete 8-neighbour stencil give a true 2D
+            // Chebyshev distance to solid in this horizontal slice. It is used only for the
+            // reported minimum; capsule occupancy above is the direct stencil check.
+            for (int32 Y = 0; Y < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X < Grid.NumX; ++X)
+                {
+                    const int32 Current = X + Grid.NumX * Y;
+                    if (Grid.Air[Grid.Index(X, Y, Z)] == 0u) continue;
+                    if (X > 0) Relax(Current, Current - 1);
+                    if (Y > 0)
+                    {
+                        Relax(Current, Current - Grid.NumX);
+                        if (X > 0) Relax(Current, Current - Grid.NumX - 1);
+                        if (X + 1 < Grid.NumX) Relax(Current, Current - Grid.NumX + 1);
+                    }
+                }
+            }
+            for (int32 Y = Grid.NumY - 1; Y >= 0; --Y)
+            {
+                for (int32 X = Grid.NumX - 1; X >= 0; --X)
+                {
+                    const int32 Current = X + Grid.NumX * Y;
+                    if (Grid.Air[Grid.Index(X, Y, Z)] == 0u) continue;
+                    if (X + 1 < Grid.NumX) Relax(Current, Current + 1);
+                    if (Y + 1 < Grid.NumY)
+                    {
+                        Relax(Current, Current + Grid.NumX);
+                        if (X > 0) Relax(Current, Current + Grid.NumX - 1);
+                        if (X + 1 < Grid.NumX) Relax(Current, Current + Grid.NumX + 1);
+                    }
+                }
+            }
+
+            for (int32 Y = 0; Y < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X < Grid.NumX; ++X)
+                {
+                    const int32 Cell = Grid.Index(X, Y, Z);
+                    if (PlayerFit[Cell] != 0u)
+                    {
+                        MinimumDistance = FMath::Min(
+                            MinimumDistance, Distances[X + Grid.NumX * Y]);
+                    }
+                }
+            }
+        }
+
+        return MinimumDistance == Infinity
+            ? 0.0f : static_cast<float>(MinimumDistance);
+    }
+
+    void BuildPlayerFitMetrics(
+        const FSampleGrid& Grid,
+        const FVoxelStrateMeasureSettings& Settings,
+        FVoxelStrateMetrics& InOutMetrics,
+        TArray<uint8>* OutPlayerFitMask = nullptr)
+    {
+        InOutMetrics.bPlayerFitResolved = false;
+        InOutMetrics.PlayerFitRefusalReason.Reset();
+        InOutMetrics.NumPlayerFitCells = 0;
+        InOutMetrics.PlayerFitFraction = 0.0f;
+        InOutMetrics.NumTraversableComponents = 0;
+        InOutMetrics.LargestTraversableComponentCells = 0;
+        InOutMetrics.TraversableComponentShare = 0.0f;
+        InOutMetrics.MinimumPlayerClearanceVoxels = 0.0f;
+
+        TArray<uint8> PlayerFit;
+        if (!BuildPlayerFitMask(
+                Grid, Settings, PlayerFit, InOutMetrics.NumPlayerFitCells,
+                InOutMetrics.PlayerFitRefusalReason))
+        {
+            if (OutPlayerFitMask != nullptr)
+            {
+                OutPlayerFitMask->Reset();
+            }
+            return;
+        }
+        InOutMetrics.bPlayerFitResolved = true;
+        InOutMetrics.PlayerFitFraction = InOutMetrics.NumAir > 0
+            ? static_cast<float>(static_cast<double>(InOutMetrics.NumPlayerFitCells)
+                / static_cast<double>(InOutMetrics.NumAir))
+            : 0.0f;
+
+        TArray<int32> Components;
+        int32 NumComponents = 0;
+        int64 LargestComponentCells = 0;
+        int32 LargestComponentLowestCell = INDEX_NONE;
+        int32 NumComponentsAtLeast1Pct = 0;
+        FloodFillAir(
+            Grid,
+            Components,
+            NumComponents,
+            InOutMetrics.NumPlayerFitCells,
+            LargestComponentCells,
+            LargestComponentLowestCell,
+            NumComponentsAtLeast1Pct,
+            nullptr,
+            &PlayerFit);
+        InOutMetrics.NumTraversableComponents = NumComponents;
+        InOutMetrics.LargestTraversableComponentCells = LargestComponentCells;
+        InOutMetrics.TraversableComponentShare = InOutMetrics.NumPlayerFitCells > 0
+            ? static_cast<float>(static_cast<double>(LargestComponentCells)
+                / static_cast<double>(InOutMetrics.NumPlayerFitCells))
+            : 0.0f;
+        InOutMetrics.MinimumPlayerClearanceVoxels = MinimumPlayerClearanceChebyshev(
+            Grid, PlayerFit);
+        if (OutPlayerFitMask != nullptr)
+        {
+            *OutPlayerFitMask = MoveTemp(PlayerFit);
+        }
+    }
+
     float MedianFloat(TArray<float>& Values)
     {
         if (Values.Num() == 0) return 0.0f;
@@ -591,7 +933,8 @@ namespace VoxelStrateMeasurePrivate
     void BuildMetricsFromGrid(
         const FSampleGrid& Grid,
         const FVoxelStrateMeasureSettings& Settings,
-        FVoxelStrateMetrics& InOutMetrics)
+        FVoxelStrateMetrics& InOutMetrics,
+        TArray<uint8>* OutPlayerFitMask = nullptr)
     {
         TArray<int32> Components;
         int32 NumComponents = 0;
@@ -775,6 +1118,11 @@ namespace VoxelStrateMeasurePrivate
             }
             InOutMetrics.MedianFeatureScale = MedianFloat(FeatureScales);
         }
+
+        // This is intentionally a separate fine-resolution pass. The legacy metrics above may
+        // be useful at SampleStep=4/8, but they cannot answer whether the confirmed player capsule
+        // fits. A coarse grid therefore receives an explicit refusal instead of an estimate.
+        BuildPlayerFitMetrics(Grid, Settings, InOutMetrics, OutPlayerFitMask);
     }
 
     bool FindCellForPoint(const FSampleGrid& Grid, const FVector& Point, int32& OutCell)
@@ -793,14 +1141,16 @@ namespace VoxelStrateMeasurePrivate
     {
         OutOfWindow,
         Air,
-        Solid
+        Solid,
+        NotPlayerFit
     };
 
     EEndpointCellResult ResolveEndpointCell(
         const FSampleGrid& Grid,
         const FVector& Point,
         int32& OutCell,
-        bool& bOutSnapped)
+        bool& bOutSnapped,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
         bOutSnapped = false;
         int32 OriginalCell = -1;
@@ -808,7 +1158,12 @@ namespace VoxelStrateMeasurePrivate
         {
             return EEndpointCellResult::OutOfWindow;
         }
-        if (Grid.Air[OriginalCell] != 0u)
+        const auto IsEligible = [&, EligibilityMask](int32 Cell)
+        {
+            return Grid.Air[Cell] != 0u
+                && (EligibilityMask == nullptr || (*EligibilityMask)[Cell] != 0u);
+        };
+        if (IsEligible(OriginalCell))
         {
             OutCell = OriginalCell;
             return EEndpointCellResult::Air;
@@ -848,7 +1203,7 @@ namespace VoxelStrateMeasurePrivate
                     }
 
                     const int32 Candidate = Grid.Index(X, Y, Z);
-                    if (Grid.Air[Candidate] == 0u)
+                    if (!IsEligible(Candidate))
                     {
                         continue;
                     }
@@ -868,7 +1223,43 @@ namespace VoxelStrateMeasurePrivate
 
         if (BestCell == INDEX_NONE)
         {
-            return EEndpointCellResult::Solid;
+            if (EligibilityMask != nullptr)
+            {
+                // Passage mouth points are authored on the centreline of a carved connector, not
+                // necessarily on the floor-anchor lattice used by PlayerFit. Resolve them to the
+                // nearest player-fitting floor cell over the bounded fine grid, rather than
+                // declaring an in-air mouth unreachable just because its floor is several cells
+                // below. The endpoint is reported as snapped, and the route re-check below still
+                // validates the endpoint-to-anchor segment against density.
+                for (int32 Candidate = 0; Candidate < Grid.CellCount; ++Candidate)
+                {
+                    if ((*EligibilityMask)[Candidate] == 0u)
+                    {
+                        continue;
+                    }
+
+                    int32 CandidateX = 0;
+                    int32 CandidateY = 0;
+                    int32 CandidateZ = 0;
+                    DecodeIndex(Grid, Candidate, CandidateX, CandidateY, CandidateZ);
+                    const float DistanceSquared = FVector::DistSquared(
+                        Point, Grid.CellCenter(CandidateX, CandidateY, CandidateZ));
+                    if (DistanceSquared < BestDistanceSquared
+                        || (DistanceSquared == BestDistanceSquared
+                            && (BestCell == INDEX_NONE || Candidate < BestCell)))
+                    {
+                        BestDistanceSquared = DistanceSquared;
+                        BestCell = Candidate;
+                    }
+                }
+            }
+        }
+
+        if (BestCell == INDEX_NONE)
+        {
+            return EligibilityMask != nullptr
+                ? EEndpointCellResult::NotPlayerFit
+                : EEndpointCellResult::Solid;
         }
 
         OutCell = BestCell;
@@ -943,9 +1334,48 @@ namespace VoxelStrateMeasurePrivate
         const FVector& A,
         const FVector& B,
         const TArray<int32>& Path,
-        FCoarseEdge& OutFailedEdge)
+        FCoarseEdge& OutFailedEdge,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
         OutFailedEdge = FCoarseEdge();
+
+        if (EligibilityMask != nullptr)
+        {
+            // A player-fit route is deliberately a graph over floor anchors, not a second air
+            // route with a coarse-cell illusion. The mask was built at SampleStep=1 and every
+            // edge below is between adjacent player-fitting cells.
+            for (int32 PathIndex = 0; PathIndex < Path.Num(); ++PathIndex)
+            {
+                if (!EligibilityMask->IsValidIndex(Path[PathIndex])
+                    || (*EligibilityMask)[Path[PathIndex]] == 0u)
+                {
+                    if (PathIndex > 0)
+                    {
+                        OutFailedEdge = MakeCoarseEdge(
+                            Path[PathIndex - 1], Path[PathIndex]);
+                    }
+                    return false;
+                }
+            }
+            int32 StartX = 0;
+            int32 StartY = 0;
+            int32 StartZ = 0;
+            DecodeIndex(Grid, Path[0], StartX, StartY, StartZ);
+            int32 EndX = 0;
+            int32 EndY = 0;
+            int32 EndZ = 0;
+            DecodeIndex(Grid, Path.Last(), EndX, EndY, EndZ);
+            if (!FullResolutionAirOnSegment(
+                    Generator, Sampler, A, Grid.CellCenter(StartX, StartY, StartZ))
+                || !FullResolutionAirOnSegment(
+                    Generator, Sampler, Grid.CellCenter(EndX, EndY, EndZ), B))
+            {
+                // Endpoint approaches have no graph edge to exclude. The player-fit route is
+                // therefore unknown if either mouth-to-anchor segment contains solid density.
+                return false;
+            }
+            return true;
+        }
 
         int32 StartX = 0;
         int32 StartY = 0;
@@ -998,9 +1428,15 @@ namespace VoxelStrateMeasurePrivate
         int32 Start,
         int32 Goal,
         const TArray<FCoarseEdge>& BlockedEdges,
-        TArray<int32>& OutPath)
+        TArray<int32>& OutPath,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
-        if (Grid.Air[Start] == 0u || Grid.Air[Goal] == 0u)
+        const auto IsEligible = [&, EligibilityMask](int32 Cell)
+        {
+            return Grid.Air[Cell] != 0u
+                && (EligibilityMask == nullptr || (*EligibilityMask)[Cell] != 0u);
+        };
+        if (!IsEligible(Start) || !IsEligible(Goal))
         {
             return false;
         }
@@ -1029,7 +1465,7 @@ namespace VoxelStrateMeasurePrivate
 
             auto Visit = [&](int32 Neighbor)
             {
-                if (Grid.Air[Neighbor] != 0u
+                if (IsEligible(Neighbor)
                     && Parent[Neighbor] == -2
                     && !IsCoarseEdgeBlocked(BlockedEdges, Current, Neighbor))
                 {
@@ -1084,7 +1520,8 @@ namespace VoxelStrateMeasurePrivate
         bool& bOutStartSnapped,
         bool& bOutGoalSnapped,
         int32& OutNumRouteRetries,
-        int32 MaxRouteRetries)
+        int32 MaxRouteRetries,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
         OutStart = -1;
         OutGoal = -1;
@@ -1093,9 +1530,9 @@ namespace VoxelStrateMeasurePrivate
         OutNumRouteRetries = 0;
 
         const EEndpointCellResult StartCell = ResolveEndpointCell(
-            Grid, AVoxel, OutStart, bOutStartSnapped);
+            Grid, AVoxel, OutStart, bOutStartSnapped, EligibilityMask);
         const EEndpointCellResult GoalCell = ResolveEndpointCell(
-            Grid, BVoxel, OutGoal, bOutGoalSnapped);
+            Grid, BVoxel, OutGoal, bOutGoalSnapped, EligibilityMask);
         if (StartCell == EEndpointCellResult::OutOfWindow
             || GoalCell == EEndpointCellResult::OutOfWindow)
         {
@@ -1105,16 +1542,25 @@ namespace VoxelStrateMeasurePrivate
         {
             return EVoxelConnectivityResult::StartCellSolid;
         }
+        if (StartCell == EEndpointCellResult::NotPlayerFit)
+        {
+            return EVoxelConnectivityResult::StartCellNotPlayerFit;
+        }
         if (GoalCell == EEndpointCellResult::Solid)
         {
             return EVoxelConnectivityResult::GoalCellSolid;
+        }
+        if (GoalCell == EEndpointCellResult::NotPlayerFit)
+        {
+            return EVoxelConnectivityResult::GoalCellNotPlayerFit;
         }
 
         TArray<FCoarseEdge> BlockedEdges;
         TArray<int32> Path;
         for (;;)
         {
-            if (!FindCoarsePath(Grid, OutStart, OutGoal, BlockedEdges, Path))
+            if (!FindCoarsePath(
+                    Grid, OutStart, OutGoal, BlockedEdges, Path, EligibilityMask))
             {
                 // This is a negative verdict only after all edges excluded by earlier
                 // full-resolution failures leave no coarse route at this resolution.
@@ -1125,7 +1571,9 @@ namespace VoxelStrateMeasurePrivate
             // spacing in the original voxel field. A single solid sample refutes only this
             // route, so exclude its precise coarse edge and search again.
             FCoarseEdge FailedEdge;
-            if (FullResolutionPathIsAir(Generator, Sampler, Grid, AVoxel, BVoxel, Path, FailedEdge))
+            if (FullResolutionPathIsAir(
+                    Generator, Sampler, Grid, AVoxel, BVoxel, Path, FailedEdge,
+                    EligibilityMask))
             {
                 return EVoxelConnectivityResult::Connected;
             }
@@ -1193,10 +1641,13 @@ namespace VoxelStrateMeasurePrivate
         bool bStartSnapped,
         bool bGoalSnapped,
         int32 NumRouteRetries,
-        FVoxelConnectivityDiagnostics& OutDiagnostics)
+        FVoxelConnectivityDiagnostics& OutDiagnostics,
+        const TArray<uint8>* EligibilityMask = nullptr)
     {
         OutDiagnostics = FVoxelConnectivityDiagnostics();
         OutDiagnostics.Result = ConnectivityResult;
+        OutDiagnostics.bPlayerFitRestricted = EligibilityMask != nullptr;
+        OutDiagnostics.bPlayerFitResolved = EligibilityMask != nullptr;
         OutDiagnostics.bStartSnapped = bStartSnapped;
         OutDiagnostics.bGoalSnapped = bGoalSnapped;
         OutDiagnostics.NumRouteRetries = NumRouteRetries;
@@ -1213,9 +1664,11 @@ namespace VoxelStrateMeasurePrivate
         int32 LargestComponentLowestCell = INDEX_NONE;
         int32 NumComponentsAtLeast1Pct = 0;
         int64 NumAir = 0;
-        for (const uint8 bAir : Grid.Air)
+        for (int32 Index = 0; Index < Grid.CellCount; ++Index)
         {
-            NumAir += bAir != 0u ? 1 : 0;
+            NumAir += Grid.Air[Index] != 0u
+                && (EligibilityMask == nullptr || (*EligibilityMask)[Index] != 0u)
+                ? 1 : 0;
         }
         FloodFillAir(
             Grid,
@@ -1225,7 +1678,8 @@ namespace VoxelStrateMeasurePrivate
             LargestComponentCells,
             LargestComponentLowestCell,
             NumComponentsAtLeast1Pct,
-            nullptr);
+            nullptr,
+            EligibilityMask);
 
         const int32 StartComponent = Components[Start];
         const int32 GoalComponent = Components[Goal];
@@ -1285,11 +1739,30 @@ namespace VoxelStrateMeasurePrivate
         bool& bOutStartSnapped,
         bool& bOutGoalSnapped,
         int32& OutNumRouteRetries,
-        FVoxelConnectivityDiagnostics* OutDiagnostics)
+        FVoxelConnectivityDiagnostics* OutDiagnostics,
+        bool bPlayerFitRestricted = false,
+        FVoxelStrateMetrics* OutPlayerMetrics = nullptr)
     {
         bOutStartSnapped = false;
         bOutGoalSnapped = false;
         OutNumRouteRetries = 0;
+        if (OutPlayerMetrics != nullptr)
+        {
+            *OutPlayerMetrics = FVoxelStrateMetrics();
+        }
+        auto RefusePlayerFit = [&](const FString& Reason)
+        {
+            if (OutDiagnostics != nullptr)
+            {
+                *OutDiagnostics = FVoxelConnectivityDiagnostics();
+                OutDiagnostics->bPlayerFitRestricted = bPlayerFitRestricted;
+                OutDiagnostics->RefusalReason = Reason;
+            }
+            if (OutPlayerMetrics != nullptr)
+            {
+                OutPlayerMetrics->PlayerFitRefusalReason = Reason;
+            }
+        };
         if (!FMath::IsFinite(AVoxel.X) || !FMath::IsFinite(AVoxel.Y)
             || !FMath::IsFinite(AVoxel.Z) || !FMath::IsFinite(BVoxel.X)
             || !FMath::IsFinite(BVoxel.Y) || !FMath::IsFinite(BVoxel.Z))
@@ -1297,6 +1770,7 @@ namespace VoxelStrateMeasurePrivate
             if (OutDiagnostics != nullptr)
             {
                 *OutDiagnostics = FVoxelConnectivityDiagnostics();
+                OutDiagnostics->bPlayerFitRestricted = bPlayerFitRestricted;
             }
             return EVoxelConnectivityResult::OutOfWindow;
         }
@@ -1305,7 +1779,16 @@ namespace VoxelStrateMeasurePrivate
             if (OutDiagnostics != nullptr)
             {
                 *OutDiagnostics = FVoxelConnectivityDiagnostics();
+                OutDiagnostics->bPlayerFitRestricted = bPlayerFitRestricted;
             }
+            return EVoxelConnectivityResult::OutOfWindow;
+        }
+
+        if (bPlayerFitRestricted && Settings.SampleStep != 1)
+        {
+            RefusePlayerFit(FString::Printf(
+                TEXT("Player-fit connectivity refused: SampleStep=%d; exact capsule fit requires SampleStep=1."),
+                Settings.SampleStep));
             return EVoxelConnectivityResult::OutOfWindow;
         }
 
@@ -1319,8 +1802,56 @@ namespace VoxelStrateMeasurePrivate
             if (OutDiagnostics != nullptr)
             {
                 *OutDiagnostics = FVoxelConnectivityDiagnostics();
+                OutDiagnostics->bPlayerFitRestricted = bPlayerFitRestricted;
+                OutDiagnostics->RefusalReason = RefusalReason;
+            }
+            if (OutPlayerMetrics != nullptr)
+            {
+                OutPlayerMetrics->PlayerFitRefusalReason = RefusalReason;
             }
             return EVoxelConnectivityResult::OutOfWindow;
+        }
+
+        TArray<uint8> PlayerFitMask;
+        FVoxelStrateMetrics PlayerMetrics;
+        if (bPlayerFitRestricted)
+        {
+            // A player-fit query needs only the fine-grid air count plus the direct capsule
+            // stencil. Do not pay for the legacy all-air flood fill, walkable-column scan, or
+            // Manhattan feature transform here: those values belong to the separate legacy
+            // measurement pass, and recomputing them for every fine candidate made the gate
+            // needlessly expensive without changing its answer.
+            PlayerMetrics.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
+            PlayerMetrics.SampledMinZ = Grid.SampledMinZ;
+            PlayerMetrics.SampledMaxZ = Grid.SampledMaxZ;
+            PlayerMetrics.SampledNumX = Grid.NumX;
+            PlayerMetrics.SampledNumY = Grid.NumY;
+            PlayerMetrics.SampledNumZ = Grid.NumZ;
+            PlayerMetrics.SampledMinX = Grid.MinX;
+            PlayerMetrics.SampledMaxX = Grid.MaxX;
+            PlayerMetrics.SampledMinY = Grid.MinY;
+            PlayerMetrics.SampledMaxY = Grid.MaxY;
+            PlayerMetrics.NumSampled = Grid.CellCount;
+            for (const uint8 bAir : Grid.Air)
+            {
+                PlayerMetrics.NumAir += bAir != 0u ? 1 : 0;
+            }
+            PlayerMetrics.NumSolid = static_cast<int64>(Grid.CellCount) - PlayerMetrics.NumAir;
+            PlayerMetrics.AirFraction = PlayerMetrics.NumSampled > 0
+                ? static_cast<float>(static_cast<double>(PlayerMetrics.NumAir)
+                    / static_cast<double>(PlayerMetrics.NumSampled))
+                : 0.0f;
+            BuildPlayerFitMetrics(Grid, Settings, PlayerMetrics, &PlayerFitMask);
+            PlayerMetrics.bValid = PlayerMetrics.NumSampled > 0;
+            if (OutPlayerMetrics != nullptr)
+            {
+                *OutPlayerMetrics = PlayerMetrics;
+            }
+            if (!PlayerMetrics.bPlayerFitResolved)
+            {
+                RefusePlayerFit(PlayerMetrics.PlayerFitRefusalReason);
+                return EVoxelConnectivityResult::OutOfWindow;
+            }
         }
 
         int32 Start = -1;
@@ -1336,7 +1867,8 @@ namespace VoxelStrateMeasurePrivate
             bOutStartSnapped,
             bOutGoalSnapped,
             OutNumRouteRetries,
-            Settings.MaxRouteRetries);
+            Settings.MaxRouteRetries,
+            bPlayerFitRestricted ? &PlayerFitMask : nullptr);
         if (OutDiagnostics != nullptr)
         {
             PopulateConnectivityDiagnostics(
@@ -1347,7 +1879,16 @@ namespace VoxelStrateMeasurePrivate
                 bOutStartSnapped,
                 bOutGoalSnapped,
                 OutNumRouteRetries,
-                *OutDiagnostics);
+                *OutDiagnostics,
+                bPlayerFitRestricted ? &PlayerFitMask : nullptr);
+            if (bPlayerFitRestricted &&
+                (Result == EVoxelConnectivityResult::StartCellNotPlayerFit
+                 || Result == EVoxelConnectivityResult::GoalCellNotPlayerFit))
+            {
+                OutDiagnostics->RefusalReason = Result == EVoxelConnectivityResult::StartCellNotPlayerFit
+                    ? TEXT("arrival endpoint is not a player-fitting floor cell")
+                    : TEXT("departure endpoint is not a player-fitting floor cell");
+            }
         }
         return Result;
     }
@@ -1579,6 +2120,46 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
     VF_AreConnectedWithSampler(Sampler, StrateBottomWorldZ, StrateTopWorldZ,
                                 BoundarySealThickness, AVoxel, BVoxel, Settings,
                                 Result.bStartSnapped, Result.bGoalSnapped, &Result);
+    return Result;
+}
+
+EVoxelConnectivityResult VF_ArePlayerFitConnectedWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    bool& bOutStartSnapped,
+    bool& bOutGoalSnapped,
+    FVoxelConnectivityDiagnostics* OutDiagnostics)
+{
+    int32 NumRouteRetries = 0;
+    return VoxelStrateMeasurePrivate::QueryConnectivity(
+        nullptr, nullptr, &Sampler, INDEX_NONE,
+        StrateBottomWorldZ, StrateTopWorldZ, BoundarySealThickness, true,
+        AVoxel, BVoxel, Settings, bOutStartSnapped, bOutGoalSnapped,
+        NumRouteRetries, OutDiagnostics, true, nullptr);
+}
+
+FVoxelConnectivityDiagnostics VF_DiagnosePlayerFitConnectivityWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelStrateMetrics* OutPlayerMetrics)
+{
+    FVoxelConnectivityDiagnostics Result;
+    int32 NumRouteRetries = 0;
+    VoxelStrateMeasurePrivate::QueryConnectivity(
+        nullptr, nullptr, &Sampler, INDEX_NONE,
+        StrateBottomWorldZ, StrateTopWorldZ, BoundarySealThickness, true,
+        AVoxel, BVoxel, Settings, Result.bStartSnapped, Result.bGoalSnapped,
+        NumRouteRetries, &Result, true, OutPlayerMetrics);
     return Result;
 }
 

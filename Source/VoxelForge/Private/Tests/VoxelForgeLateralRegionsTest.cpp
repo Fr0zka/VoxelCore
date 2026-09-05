@@ -48,6 +48,10 @@ namespace
             return TEXT("StartCellSolid");
         case EVoxelConnectivityResult::GoalCellSolid:
             return TEXT("GoalCellSolid");
+        case EVoxelConnectivityResult::StartCellNotPlayerFit:
+            return TEXT("StartCellNotPlayerFit");
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit:
+            return TEXT("GoalCellNotPlayerFit");
         case EVoxelConnectivityResult::OutOfWindow:
             return TEXT("OutOfWindow");
         case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:

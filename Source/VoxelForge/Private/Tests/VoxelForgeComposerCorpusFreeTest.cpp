@@ -34,6 +34,8 @@ namespace
         case EVoxelConnectivityResult::GoalCellSolid:               return TEXT("GoalCellSolid");
         case EVoxelConnectivityResult::OutOfWindow:                 return TEXT("OutOfWindow");
         case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:   return TEXT("CoarseLiedBudget");
+        case EVoxelConnectivityResult::StartCellNotPlayerFit:       return TEXT("StartCellNotPlayerFit");
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit:        return TEXT("GoalCellNotPlayerFit");
         }
         return TEXT("Unknown");
     }
@@ -272,7 +274,7 @@ namespace
         int32 InvalidStackCount = 0;
         int32 ChannelOrderFailures = 0;
         int32 ContextViolations = 0;
-        int32 LawResults[6] = { 0, 0, 0, 0, 0, 0 };
+        int32 LawResults[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         FQualityStats AllQuality;
         FQualityStats SurvivorQuality;
         FBoxVerdictReport Box;
@@ -303,6 +305,8 @@ namespace
         case EVoxelConnectivityResult::GoalCellSolid:               return 3;
         case EVoxelConnectivityResult::OutOfWindow:                 return 4;
         case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:   return 5;
+        case EVoxelConnectivityResult::StartCellNotPlayerFit:       return 6;
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit:        return 7;
         }
         return 5;
     }
@@ -723,7 +727,8 @@ bool FVoxelForgeComposerCorpusFreeTest::RunTest(const FString& Parameters)
                  "law skipped=%d, "
                  "roll failures=%d, build failures=%d, unmeasured=%d, deterministic roll failures=%d; "
                  "stack-count failures=%d, channel-order failures=%d, context violations=%d; "
-                 "law results Connected=%d NotConnected=%d StartSolid=%d GoalSolid=%d OutOfWindow=%d Budget=%d; "
+                 "law results Connected=%d NotConnected=%d StartSolid=%d GoalSolid=%d OutOfWindow=%d Budget=%d "
+                 "StartNotPlayerFit=%d GoalNotPlayerFit=%d; "
                  "quality all %s; survivor quality %s; first failure=%s."),
             Arm->Name, Arm->NonVacuous, LargestComponentSurvivalThreshold, Arm->LargestEnough,
             Arm->LawPasses, Arm->LawFailedObserved, Arm->LawSkipped,
@@ -732,6 +737,7 @@ bool FVoxelForgeComposerCorpusFreeTest::RunTest(const FString& Parameters)
             Arm->InvalidStackCount, Arm->ChannelOrderFailures, Arm->ContextViolations,
             Arm->LawResults[0], Arm->LawResults[1], Arm->LawResults[2],
             Arm->LawResults[3], Arm->LawResults[4], Arm->LawResults[5],
+            Arm->LawResults[6], Arm->LawResults[7],
             *Arm->AllQuality.SummaryText(), *Arm->SurvivorQuality.SummaryText(),
             Arm->FirstFailure.IsEmpty() ? TEXT("none") : *Arm->FirstFailure));
         AddInfo(FString::Printf(

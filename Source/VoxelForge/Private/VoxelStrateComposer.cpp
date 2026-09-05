@@ -2285,6 +2285,14 @@ FVoxelStrateMeasuredMetrics VF_SummarizeStrateMetrics(
     Result.LargestWalkableSurfaceShare = Metrics.LargestWalkableSurfaceShare;
     Result.MedianFeatureScale = Metrics.MedianFeatureScale;
     Result.MedianVerticalClearance = Metrics.MedianVerticalClearance;
+    Result.bPlayerFitResolved = Metrics.bPlayerFitResolved;
+    Result.PlayerFitRefusalReason = Metrics.PlayerFitRefusalReason;
+    Result.NumPlayerFitCells = Metrics.NumPlayerFitCells;
+    Result.PlayerFitFraction = Metrics.PlayerFitFraction;
+    Result.NumTraversableComponents = Metrics.NumTraversableComponents;
+    Result.LargestTraversableComponentCells = Metrics.LargestTraversableComponentCells;
+    Result.TraversableComponentShare = Metrics.TraversableComponentShare;
+    Result.MinimumPlayerClearanceVoxels = Metrics.MinimumPlayerClearanceVoxels;
     Result.ResolvedMarginVoxels = Metrics.ResolvedMarginVoxels;
     Result.SampledMinZ = Metrics.SampledMinZ;
     Result.SampledMaxZ = Metrics.SampledMaxZ;
@@ -2778,6 +2786,19 @@ namespace
                                Metrics.LargestWalkableSurfaceShare);
         Object->SetNumberField(TEXT("median_feature_scale"), Metrics.MedianFeatureScale);
         Object->SetNumberField(TEXT("median_vertical_clearance"), Metrics.MedianVerticalClearance);
+        Object->SetBoolField(TEXT("player_fit_resolved"), Metrics.bPlayerFitResolved);
+        Object->SetStringField(TEXT("player_fit_refusal_reason"), Metrics.PlayerFitRefusalReason);
+        Object->SetNumberField(TEXT("num_player_fit_cells"),
+                               static_cast<double>(Metrics.NumPlayerFitCells));
+        Object->SetNumberField(TEXT("player_fit_fraction"), Metrics.PlayerFitFraction);
+        Object->SetNumberField(TEXT("num_traversable_components"),
+                               Metrics.NumTraversableComponents);
+        Object->SetNumberField(TEXT("largest_traversable_component_cells"),
+                               static_cast<double>(Metrics.LargestTraversableComponentCells));
+        Object->SetNumberField(TEXT("traversable_component_share"),
+                               Metrics.TraversableComponentShare);
+        Object->SetNumberField(TEXT("minimum_player_clearance_voxels"),
+                               Metrics.MinimumPlayerClearanceVoxels);
         Object->SetNumberField(TEXT("resolved_margin_voxels"), Metrics.ResolvedMarginVoxels);
         Object->SetNumberField(TEXT("sampled_min_z"), Metrics.SampledMinZ);
         Object->SetNumberField(TEXT("sampled_max_z"), Metrics.SampledMaxZ);
@@ -2852,6 +2873,25 @@ namespace
                                   OutMetrics.MedianFeatureScale) && bValid;
         bValid = VF_ReadJsonInt32(Object, TEXT("median_vertical_clearance"),
                                   OutMetrics.MedianVerticalClearance) && bValid;
+        if (Object->HasField(TEXT("player_fit_resolved")))
+        {
+            bValid = VF_ReadJsonBool(Object, TEXT("player_fit_resolved"),
+                                     OutMetrics.bPlayerFitResolved) && bValid;
+            bValid = VF_ReadJsonString(Object, TEXT("player_fit_refusal_reason"),
+                                       OutMetrics.PlayerFitRefusalReason) && bValid;
+            bValid = VF_ReadJsonInt64(Object, TEXT("num_player_fit_cells"),
+                                      OutMetrics.NumPlayerFitCells) && bValid;
+            bValid = VF_ReadJsonFloat(Object, TEXT("player_fit_fraction"),
+                                      OutMetrics.PlayerFitFraction) && bValid;
+            bValid = VF_ReadJsonInt32(Object, TEXT("num_traversable_components"),
+                                      OutMetrics.NumTraversableComponents) && bValid;
+            bValid = VF_ReadJsonInt64(Object, TEXT("largest_traversable_component_cells"),
+                                      OutMetrics.LargestTraversableComponentCells) && bValid;
+            bValid = VF_ReadJsonFloat(Object, TEXT("traversable_component_share"),
+                                      OutMetrics.TraversableComponentShare) && bValid;
+            bValid = VF_ReadJsonFloat(Object, TEXT("minimum_player_clearance_voxels"),
+                                      OutMetrics.MinimumPlayerClearanceVoxels) && bValid;
+        }
         bValid = VF_ReadJsonInt32(Object, TEXT("resolved_margin_voxels"),
                                   OutMetrics.ResolvedMarginVoxels) && bValid;
         bValid = VF_ReadJsonInt32(Object, TEXT("sampled_min_z"), OutMetrics.SampledMinZ) && bValid;
@@ -2995,6 +3035,14 @@ namespace
             && A.LargestWalkableSurfaceShare == B.LargestWalkableSurfaceShare
             && A.MedianFeatureScale == B.MedianFeatureScale
             && A.MedianVerticalClearance == B.MedianVerticalClearance
+            && A.bPlayerFitResolved == B.bPlayerFitResolved
+            && A.PlayerFitRefusalReason == B.PlayerFitRefusalReason
+            && A.NumPlayerFitCells == B.NumPlayerFitCells
+            && A.PlayerFitFraction == B.PlayerFitFraction
+            && A.NumTraversableComponents == B.NumTraversableComponents
+            && A.LargestTraversableComponentCells == B.LargestTraversableComponentCells
+            && A.TraversableComponentShare == B.TraversableComponentShare
+            && A.MinimumPlayerClearanceVoxels == B.MinimumPlayerClearanceVoxels
             && A.ResolvedMarginVoxels == B.ResolvedMarginVoxels
             && A.SampledMinZ == B.SampledMinZ
             && A.SampledMaxZ == B.SampledMaxZ
@@ -3075,6 +3123,10 @@ namespace
             && FMath::IsFinite(Metrics.WalkableFloorAreaFraction)
             && FMath::IsFinite(Metrics.LargestWalkableSurfaceShare)
             && FMath::IsFinite(Metrics.MedianFeatureScale)
+            && (!Metrics.bPlayerFitResolved
+                || (FMath::IsFinite(Metrics.PlayerFitFraction)
+                    && FMath::IsFinite(Metrics.TraversableComponentShare)
+                    && FMath::IsFinite(Metrics.MinimumPlayerClearanceVoxels)))
             && FMath::IsFinite(Metrics.LargestComponentPoint.X)
             && FMath::IsFinite(Metrics.LargestComponentPoint.Y)
             && FMath::IsFinite(Metrics.LargestComponentPoint.Z);

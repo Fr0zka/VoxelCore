@@ -124,6 +124,14 @@ struct VOXELFORGE_API FVoxelStratePreviewCandidate
     float LargestWalkableSurfaceShare = 0.0f;
     float MedianFeatureScale = 0.0f;
     int32 MedianVerticalClearance = 0;
+    bool bPlayerFitResolved = false;
+    FString PlayerFitRefusalReason;
+    int64 NumPlayerFitCells = 0;
+    float PlayerFitFraction = 0.0f;
+    int32 NumTraversableComponents = 0;
+    int64 LargestTraversableComponentCells = 0;
+    float TraversableComponentShare = 0.0f;
+    float MinimumPlayerClearanceVoxels = 0.0f;
     double DistanceFromCorpusCentroid = 0.0;
 
     int32 VerticalSliceCellY = INDEX_NONE;
@@ -160,6 +168,8 @@ struct VOXELFORGE_API FVoxelStratePreviewArchetypeSummary
     FString WalkableFloorAreaSummary;
     FString MedianVerticalClearanceSummary;
     FString LargestWalkableSurfaceSummary;
+    FString PlayerFitFractionSummary;
+    FString TraversableComponentShareSummary;
 };
 
 /** Copy the exact measurement-window metadata needed by the index page. */

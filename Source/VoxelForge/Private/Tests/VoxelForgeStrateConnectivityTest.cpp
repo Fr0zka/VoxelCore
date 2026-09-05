@@ -102,6 +102,15 @@ namespace
             && SameFloatBits(A.WalkableFraction, B.WalkableFraction)
             && SameFloatBits(A.MedianFeatureScale, B.MedianFeatureScale)
             && A.MedianVerticalClearance == B.MedianVerticalClearance
+            && A.bPlayerFitResolved == B.bPlayerFitResolved
+            && A.PlayerFitRefusalReason == B.PlayerFitRefusalReason
+            && A.NumPlayerFitCells == B.NumPlayerFitCells
+            && SameFloatBits(A.PlayerFitFraction, B.PlayerFitFraction)
+            && A.NumTraversableComponents == B.NumTraversableComponents
+            && A.LargestTraversableComponentCells == B.LargestTraversableComponentCells
+            && SameFloatBits(A.TraversableComponentShare, B.TraversableComponentShare)
+            && SameFloatBits(A.MinimumPlayerClearanceVoxels,
+                             B.MinimumPlayerClearanceVoxels)
             && A.ResolvedMarginVoxels == B.ResolvedMarginVoxels
             && A.SampledMinZ == B.SampledMinZ
             && A.SampledMaxZ == B.SampledMaxZ
@@ -124,6 +133,10 @@ namespace
             return TEXT("NOT_CONNECTED_AT_THIS_RESOLUTION");
         case EVoxelConnectivityResult::StartCellSolid: return TEXT("START_CELL_SOLID");
         case EVoxelConnectivityResult::GoalCellSolid:  return TEXT("GOAL_CELL_SOLID");
+        case EVoxelConnectivityResult::StartCellNotPlayerFit:
+            return TEXT("START_CELL_NOT_PLAYER_FIT");
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit:
+            return TEXT("GOAL_CELL_NOT_PLAYER_FIT");
         case EVoxelConnectivityResult::OutOfWindow:    return TEXT("OUT_OF_WINDOW");
         case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:
             return TEXT("COARSE_LIED_BUDGET_EXHAUSTED");
@@ -132,7 +145,7 @@ namespace
     }
 
     constexpr int32 ConnectivityResultCount =
-        static_cast<int32>(EVoxelConnectivityResult::CoarseLiedBudgetExhausted) + 1;
+        static_cast<int32>(EVoxelConnectivityResult::GoalCellNotPlayerFit) + 1;
 
     int32 NumRefutedRoutes(const FConnectivityProbe& Probe)
     {

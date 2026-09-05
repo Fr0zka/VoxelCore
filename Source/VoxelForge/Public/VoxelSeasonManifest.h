@@ -93,6 +93,9 @@ struct VOXELFORGE_API FVoxelSeasonCompositionSettings
     // Coarse measurement is deliberately bounded. Tests may reduce the window; production may
     // spend the overnight budget on a finer pass after the selector has been judged.
     FVoxelStrateMeasureSettings MeasureSettings;
+    // Player-fit is a separate, explicitly fine pass. SampleStep values other than one are
+    // refused by the metric, never interpreted as an approximate capsule answer.
+    FVoxelStrateMeasureSettings PlayerFitMeasureSettings;
     FVoxelSeasonSelectionPolicy SelectionPolicy;
 
     // Explicit composed fixed slots take precedence. When empty, the composer adapts the
@@ -119,6 +122,13 @@ struct VOXELFORGE_API FVoxelSeasonCompositionSettings
         MeasureSettings.MaxRouteRetries = 16;
         MeasureSettings.HeadroomCells = 2;
         MeasureSettings.InteriorMarginVoxels = -1;
+
+        PlayerFitMeasureSettings.SampleStep = 1;
+        PlayerFitMeasureSettings.RadiusInVoxels = 64;
+        PlayerFitMeasureSettings.MaxCells = 2000000;
+        PlayerFitMeasureSettings.MaxRouteRetries = 16;
+        PlayerFitMeasureSettings.HeadroomCells = 2;
+        PlayerFitMeasureSettings.InteriorMarginVoxels = -1;
     }
 };
 

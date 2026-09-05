@@ -200,6 +200,15 @@ struct VOXELFORGE_API FVoxelStrateMeasuredMetrics
     float MedianFeatureScale = 0.0f;
     int32 MedianVerticalClearance = 0;
 
+    bool bPlayerFitResolved = false;
+    FString PlayerFitRefusalReason;
+    int64 NumPlayerFitCells = 0;
+    float PlayerFitFraction = 0.0f;
+    int32 NumTraversableComponents = 0;
+    int64 LargestTraversableComponentCells = 0;
+    float TraversableComponentShare = 0.0f;
+    float MinimumPlayerClearanceVoxels = 0.0f;
+
     int32 ResolvedMarginVoxels = 0;
     int32 SampledMinZ = 0;
     int32 SampledMaxZ = 0;
