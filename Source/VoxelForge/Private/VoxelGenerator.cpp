@@ -741,9 +741,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // cache on the same versioned refetch as the native params; no worker reads mutable editor
         // state while the world is applying a new candidate.
         thread_local bool                       CP_UseComposerRecipe = false;
+        thread_local bool                       CP_UseComposerRegions = false;
         thread_local int32                      CP_ComposerSeed = 0;
         thread_local FVoxelStrateArchetypeParams CP_ComposerParams;
         thread_local FVoxelOpStackRecipe        CP_ComposerRecipe;
+        thread_local FVoxelStrateRegionManifest CP_ComposerRegions;
 #endif
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
@@ -763,9 +765,20 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
 #if WITH_EDITOR
             CP_UseComposerRecipe = false;
+            CP_UseComposerRegions = false;
             ECaveGeneratorType ComposerArchetype = ECaveGeneratorType::TunnelNetwork;
             bool bComposerUseRecipe = false;
-            if (StrateManager->GetComposerOverrideForChunk(
+            if (StrateManager->GetComposerRegionOverrideForChunk(
+                ChunkCoord, CP_ComposerRegions))
+            {
+                CP_UseComposerRegions = true;
+                CP_ComposerSeed = CP_ComposerRegions.Seed;
+                if (CP_ComposerRegions.Regions.Num() > 0)
+                {
+                    CP_GenType = CP_ComposerRegions.Regions[0].Archetype;
+                }
+            }
+            else if (StrateManager->GetComposerOverrideForChunk(
                 ChunkCoord, CP_ComposerSeed, ComposerArchetype, CP_ComposerParams,
                 bComposerUseRecipe, CP_ComposerRecipe))
             {
@@ -804,11 +817,37 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
             // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
             CP_UseOpStack = StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+#if WITH_EDITOR
+            // A composer override is already an explicit, validated stack description.  It must
+            // be evaluated even when the authored definition had the normal operator-stack opt-in
+            // disabled; otherwise a multi-region candidate would be installed in the manager but
+            // silently fall back to the old one-archetype switch.
+            CP_UseOpStack = CP_UseOpStack || CP_UseComposerRegions || CP_UseComposerRecipe;
+#endif
             if (CP_UseOpStack)
             {
                 CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
 #if WITH_EDITOR
-                if (CP_UseComposerRecipe)
+                if (CP_UseComposerRegions)
+                {
+                    FVoxelOpContext RegionContext;
+                    if (VF_BuildStrateRegionStack(
+                        CP_ComposerRegions, OriginSpineRadius, StrateManager,
+                        CP_OpStack, RegionContext, nullptr))
+                    {
+                        RegionContext.ChunkCoord = ChunkCoord;
+                        RegionContext.Step = 1;
+                        RegionContext.LayoutVersion = LayoutVersion;
+                        RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                        RegionContext.EdgeSealThickness = EdgeSealThickness;
+                        CP_OpStack.PrepareChunk(RegionContext);
+                    }
+                    else
+                    {
+                        CP_UseOpStack = false;
+                    }
+                }
+                else if (CP_UseComposerRecipe)
                 {
                     FVoxelOpContext ComposerContext;
                     if (VF_BuildStackFromRecipe(
@@ -2897,6 +2936,94 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     if (!StrateManager) return EVoxelTileClass::Mixed;
 
 #if WITH_EDITOR
+    // A multi-region composer override is already a complete parent stack: it owns the lateral
+    // blend and the four global structural posts.  Classify it as one field only when the complete
+    // mesher box stays inside that one strate; otherwise the Z-category pass below deliberately
+    // returns Mixed.  Disturbances and the diff layer remain outside the stack, so either one also
+    // vetoes a skip.
+    FVoxelStrateRegionManifest ComposerRegions;
+    const FIntVector RegionProbeChunk(
+        FloorDivC(MinX, CHUNK_SIZE), FloorDivC(MinY, CHUNK_SIZE), FloorDivC(MinZ, CHUNK_SIZE));
+    if (StrateManager->GetComposerRegionOverrideForChunk(RegionProbeChunk, ComposerRegions))
+    {
+        int32 RegionTopChunkZ = 0;
+        int32 RegionBottomChunkZ = 0;
+        const int32 RegionMinChunkZ = FloorDivC(MinZ, CHUNK_SIZE);
+        const int32 RegionMaxChunkZ = FloorDivC(MaxZ, CHUNK_SIZE);
+        if (!StrateManager->GetStrateChunkZBounds(RegionProbeChunk.Z,
+                                                  RegionTopChunkZ, RegionBottomChunkZ)
+            || RegionMinChunkZ < RegionBottomChunkZ
+            || RegionMaxChunkZ > RegionTopChunkZ)
+        {
+            return EVoxelTileClass::Mixed;
+        }
+
+        // A representative chunk is not enough for a proof: the mesher box can cross an XY
+        // chunk edge, and disturbances are chunk-local.  Require every touched chunk to remain
+        // in the same slot and to have no active disturbance before delegating the proof to the
+        // complete lateral stack.  Any uncertainty is Mixed; a false uniform answer here can
+        // skip a real seam or carve.
+        const int32 RegionMinChunkX = FloorDivC(MinX, CHUNK_SIZE);
+        const int32 RegionMaxChunkX = FloorDivC(MaxX, CHUNK_SIZE);
+        const int32 RegionMinChunkY = FloorDivC(MinY, CHUNK_SIZE);
+        const int32 RegionMaxChunkY = FloorDivC(MaxY, CHUNK_SIZE);
+        for (int32 CZ = RegionMinChunkZ; CZ <= RegionMaxChunkZ; ++CZ)
+        {
+            int32 TouchedTopChunkZ = 0;
+            int32 TouchedBottomChunkZ = 0;
+            if (!StrateManager->GetStrateChunkZBounds(
+                    CZ, TouchedTopChunkZ, TouchedBottomChunkZ)
+                || TouchedTopChunkZ != RegionTopChunkZ
+                || TouchedBottomChunkZ != RegionBottomChunkZ)
+            {
+                return EVoxelTileClass::Mixed;
+            }
+            for (int32 CY = RegionMinChunkY; CY <= RegionMaxChunkY; ++CY)
+            {
+                for (int32 CX = RegionMinChunkX; CX <= RegionMaxChunkX; ++CX)
+                {
+                    const FIntVector TouchedChunk(CX, CY, CZ);
+                    FVoxelStrateRegionManifest TouchedRegions;
+                    if (!StrateManager->GetComposerRegionOverrideForChunk(
+                            TouchedChunk, TouchedRegions)
+                        || TouchedRegions.StrateIndex != ComposerRegions.StrateIndex
+                        || TouchedRegions.Seed != ComposerRegions.Seed
+                        || TouchedRegions.RegionCount != ComposerRegions.RegionCount
+                        || TouchedRegions.PartitionSeed != ComposerRegions.PartitionSeed
+                        || TouchedRegions.LatticeCellSize != ComposerRegions.LatticeCellSize
+                        || TouchedRegions.BlendWidth != ComposerRegions.BlendWidth)
+                    {
+                        return EVoxelTileClass::Mixed;
+                    }
+
+                    const FStrateDisturbanceParams Disturbances =
+                        StrateManager->GetDisturbanceParamsForChunk(TouchedChunk);
+                    if (Disturbances.ChasmDensity > 0.0f
+                        || Disturbances.BridgeDensity > 0.0f
+                        || Disturbances.RidgeDensity > 0.0f)
+                    {
+                        return EVoxelTileClass::Mixed;
+                    }
+                }
+            }
+        }
+
+        FVoxelOpStack RegionStack;
+        FVoxelOpContext RegionContext;
+        if (!VF_BuildStrateRegionStack(ComposerRegions, OriginSpineRadius,
+                                        StrateManager, RegionStack, RegionContext, nullptr))
+        {
+            return EVoxelTileClass::Mixed;
+        }
+        RegionContext.ChunkCoord = RegionProbeChunk;
+        RegionContext.Step = Step;
+        RegionContext.LayoutVersion = StrateManager->GetLayoutVersion();
+        RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
+        RegionContext.EdgeSealThickness = EdgeSealThickness;
+        RegionStack.PrepareChunk(RegionContext);
+        return RegionStack.ClassifyBox(TileVoxelBox, RegionContext);
+    }
+
     // A custom recipe is deliberately not fed to the native ClassifyBox proof yet. Returning
     // Mixed keeps the live walk-through hole-safe: GenerateMesh samples the exact recipe stack,
     // while no optimistic AllAir/AllSolid result can skip a candidate tile.

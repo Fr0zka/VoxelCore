@@ -228,6 +228,142 @@ struct VOXELFORGE_API FVoxelStrateArchetypeParams
     FFloatingIslandParams FloatingIslandParams;
 };
 
+/**
+ * One lateral region in a strate.
+ *
+ * This is deliberately a plain manifest record rather than a label on the strate.  The recipe
+ * and the native vector belong to the region, and the runtime combines the resulting density
+ * fields.  Structural posts are not region-owned.
+ */
+struct VOXELFORGE_API FVoxelStrateRegion
+{
+    int32 RegionIndex = 0;
+    int32 Seed = 0;
+    ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
+    FVoxelStrateArchetypeParams ArchetypeParams;
+    bool bUsesRecipe = false;
+    FVoxelOpStackRecipe Recipe;
+};
+
+/**
+ * Offline-composed lateral region manifest for one strate.
+ *
+ * `StrateIndex` is part of the partition identity.  A candidate can be moved to another live
+ * slot, so the editor hand-off must call VF_RekeyStrateRegionManifest before installing it.
+ * `PartitionSeed` is retained in the manifest so the runtime never has to recreate an RNG stream.
+ */
+struct VOXELFORGE_API FVoxelStrateRegionManifest
+{
+    bool bValid = false;
+    FString FailureReason;
+
+    int32 Seed = 0;
+    int32 StrateIndex = 0;
+    int32 RegionCount = 1;
+    uint32 PartitionSeed = 0;
+
+    // A 32-voxel chunk sees a tiny portion of this lattice.  The values are manifest data, not
+    // hidden runtime tuning knobs; changing them changes the authored world and its hash.
+    float LatticeCellSize = 256.0f;
+    float BlendWidth = 24.0f;
+
+    // One global structural post configuration.  Region recipes may use different native blocks,
+    // but no region is allowed to choose the spine/seal/passage/edge-seal values independently.
+    bool bHasGlobalStructuralParams = false;
+    EVoxelStrateParamBlock StructuralParamBlock = EVoxelStrateParamBlock::None;
+    float StrateTopWorldZ = 0.0f;
+    float StrateBottomWorldZ = 0.0f;
+    float BoundarySealThickness = 0.0f;
+    float BaseDensity = 8.0f;
+
+    TArray<FVoxelStrateRegion> Regions;
+
+    bool IsSingleRegion() const { return RegionCount == 1 && Regions.Num() == 1; }
+
+    bool IsValid() const
+    {
+        return bValid && RegionCount >= 1 && RegionCount <= 3
+            && Regions.Num() == RegionCount
+            && FMath::IsFinite(LatticeCellSize) && LatticeCellSize > 0.0f
+            && FMath::IsFinite(BlendWidth) && BlendWidth >= 0.0f;
+    }
+};
+
+/** Result of the positional Voronoi query used by the lateral density combiner. */
+struct VOXELFORGE_API FVoxelStrateRegionQuery
+{
+    int32 PrimaryRegion = 0;
+    int32 NeighborRegion = INDEX_NONE;
+    float NeighborWeight = 0.0f;
+    float NearestDifferentRegionGap = FLT_MAX;
+    // False means the bounded lattice neighborhood could not prove that its different-region
+    // candidate is the nearest one. Density evaluation may still use a zero blend weight, but a
+    // ClassifyBox proof must refuse to call that an infinite boundary distance.
+    bool bNearestDifferentRegionKnown = false;
+    bool bInBlendBand = false;
+};
+
+/** Conservative XY proof used before a tile may be skipped. */
+struct VOXELFORGE_API FVoxelStrateRegionBoxProof
+{
+    bool bProvablySingleRegion = false;
+    bool bTouchesRegionBoundary = true;
+    bool bTouchesBlendBand = true;
+};
+
+/** One hash-lattice site retained by the per-chunk partition cache. */
+struct VOXELFORGE_API FVoxelStrateRegionSite
+{
+    int32 CellX = 0;
+    int32 CellY = 0;
+    int32 Region = 0;
+    float WorldX = 0.0f;
+    float WorldY = 0.0f;
+};
+
+/**
+ * Worker-local cache for the lateral partition.
+ *
+ * Hash/site discovery and the integer XY grid are prepared once for a chunk.  The voxel path
+ * then does an O(1) lookup for the ordinary integer density samples; only fractional gradient
+ * probes use the small prepared site list.  No seed lattice is searched or allocated per voxel.
+ */
+struct VOXELFORGE_API FVoxelStrateRegionPartitionCache
+{
+    void PrepareForChunk(const FVoxelStrateRegionManifest& Manifest,
+                         const FIntVector& ChunkCoord);
+    FVoxelStrateRegionQuery Query(float WorldX, float WorldY) const;
+
+private:
+    int32 RegionCount = 1;
+    uint32 PartitionSeed = 0;
+    float LatticeCellSize = 256.0f;
+    float BlendWidth = 24.0f;
+    int32 BaseX = 0;
+    int32 BaseY = 0;
+    int32 Dim = 0;
+    TArray<FVoxelStrateRegionSite> Sites;
+    TArray<FVoxelStrateRegionQuery> IntegerSamples;
+};
+
+/** Set every native family’s runtime Z bounds to the same strate interval. */
+VOXELFORGE_API void VF_SetStrateArchetypeRuntimeBounds(
+    FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ);
+
+/** Stable identity helpers for the deterministic lateral partition. */
+VOXELFORGE_API int32 VF_RollStrateRegionCount(int32 Seed, int32 StrateIndex);
+VOXELFORGE_API uint32 VF_GetStrateRegionPartitionSeed(int32 Seed, int32 StrateIndex);
+VOXELFORGE_API void VF_RekeyStrateRegionManifest(
+    FVoxelStrateRegionManifest& Manifest, int32 Seed, int32 StrateIndex);
+
+/** Pure positional query; no retained state and no ordering-dependent RNG. */
+VOXELFORGE_API FVoxelStrateRegionQuery VF_QueryStrateRegion(
+    const FVoxelStrateRegionManifest& Manifest, float WorldX, float WorldY);
+
+/** Conservative proof for an XY projection of a voxel box. */
+VOXELFORGE_API FVoxelStrateRegionBoxProof VF_AnalyzeStrateRegionBox(
+    const FVoxelStrateRegionManifest& Manifest, const FBox& VoxelBox);
+
 /** One known-good authored vector and the archetype that gives it meaning. */
 struct VOXELFORGE_API FVoxelStrateCorpusEntry
 {
@@ -413,6 +549,7 @@ struct VOXELFORGE_API FVoxelStrateComposerCandidate
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
     FVoxelStrateArchetypeParams ArchetypeParams;
     FVoxelOpStackRecipe Recipe;
+    FVoxelStrateRegionManifest Regions;
 
     // Kept so automation/editor callers can audit the exact six independent structure blocks
     // without re-rolling them through a second implementation.
@@ -531,6 +668,30 @@ VOXELFORGE_API FVoxelStrateRollInfo VF_RollStrateParamsDetailedForArchetype(
 
 /** Pure structure roll: no retained RNG state and no corpus/runtime dependency. */
 VOXELFORGE_API FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index);
+
+/** Roll one-to-three independent region recipes/vectors plus their deterministic partition. */
+VOXELFORGE_API FVoxelStrateRegionManifest VF_RollStrateRegionManifest(
+    const FVoxelStrateCorpus& Corpus, int32 Seed, int32 StrateIndex, bool bRollStructure);
+
+/**
+ * ⛔ THE LATERAL-REGION GATE. Returns false, and must keep returning false until the seam law holds.
+ *
+ * Lateral regions (archetypes mixing inside one strate — "tunnel network leading to a big chamber")
+ * are BUILT and MEASURED but NOT SHIPPABLE. Measured 2026-09-05: `arrival -> departure` across a
+ * region seam passes **9 of 16 seeds**, against 11/16 for same-region controls in the same harness.
+ *
+ * Density blending alone does not guarantee a player can cross a seam. A strate that mixes archetypes
+ * and strands you at the boundary is strictly worse than one that does not mix — so this stays off.
+ *
+ * ⚠️ DO NOT flip this to true to "enable the feature". The fix is an explicit corridor/landing
+ * contract across seams (a design decision, deliberately not made unilaterally), after which the
+ * measured rate must be 16/16. `VoxelForge.Composer.LateralRegions` asserts that this gate is shut
+ * whenever the rate is imperfect, so flipping it without fixing the law turns the suite red.
+ *
+ * Safe today regardless: single-region output is bit-identical to legacy, and cross-boundary box
+ * verdicts returned 0 violations over 199,800 brute-forced samples (all correctly `Mixed`).
+ */
+VOXELFORGE_API bool VF_LateralRegionsAreShippable();
 
 /**
  * Provenance for a parameter block that does not read the authored corpus.

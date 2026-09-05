@@ -19,6 +19,8 @@ struct FVoxelStrateComposerSlotOverride
     FVoxelStrateArchetypeParams Params;
     bool bUseRecipe = false;
     FVoxelOpStackRecipe Recipe;
+    bool bUseRegions = false;
+    FVoxelStrateRegionManifest Regions;
 };
 
 static void VF_SetComposerRuntimeBounds(
@@ -286,7 +288,8 @@ const FVoxelStrateComposerSlotOverride* UVoxelStrateManager::FindComposerOverrid
 bool UVoxelStrateManager::SetComposerOverrideForStrate(
     int32 StrateIndex, int32 CandidateSeed, ECaveGeneratorType Archetype,
     const FVoxelStrateArchetypeParams& Params, bool bUseRecipe,
-    const FVoxelOpStackRecipe* Recipe, FString& OutError)
+    const FVoxelOpStackRecipe* Recipe, FString& OutError,
+    const FVoxelStrateRegionManifest* InRegions)
 {
     OutError.Reset();
 
@@ -342,6 +345,32 @@ bool UVoxelStrateManager::SetComposerOverrideForStrate(
         Override->Recipe = *Recipe;
     }
 
+    if (InRegions != nullptr && InRegions->RegionCount > 1)
+    {
+        if (!InRegions->IsValid())
+        {
+            OutError = InRegions->FailureReason.IsEmpty()
+                ? TEXT("The composer returned an invalid lateral region manifest.")
+                : InRegions->FailureReason;
+            return false;
+        }
+        Override->bUseRegions = true;
+        Override->Regions = *InRegions;
+        VF_RekeyStrateRegionManifest(Override->Regions, CandidateSeed, StrateIndex);
+        Override->Regions.StrateTopWorldZ = (float)(TargetSlot->TopChunkZ + 1) * CHUNK_SIZE;
+        Override->Regions.StrateBottomWorldZ = (float)TargetSlot->BottomChunkZ * CHUNK_SIZE;
+        VF_SetStrateArchetypeRuntimeBounds(Override->Params,
+                                           Override->Regions.StrateTopWorldZ,
+                                           Override->Regions.StrateBottomWorldZ);
+        for (FVoxelStrateRegion& Region : Override->Regions.Regions)
+        {
+            VF_SetStrateArchetypeRuntimeBounds(Region.ArchetypeParams,
+                                               Override->Regions.StrateTopWorldZ,
+                                               Override->Regions.StrateBottomWorldZ);
+        }
+        Override->Regions.bHasGlobalStructuralParams = true;
+    }
+
     // Only one slot is overridden at a time. Keeping this map small also makes the worker-side
     // copy-on-chunk-refetch cheap. Passage geometry is deliberately not regenerated: the layout
     // and its passages are unchanged, and this is the same manager state used by the offline
@@ -378,6 +407,25 @@ bool UVoxelStrateManager::GetComposerOverrideForChunk(
     OutParams = Override->Params;
     bOutUseRecipe = Override->bUseRecipe;
     OutRecipe = Override->Recipe;
+    return true;
+}
+
+bool UVoxelStrateManager::GetComposerRegionOverrideForChunk(
+    const FIntVector& ChunkCoord, FVoxelStrateRegionManifest& OutRegions) const
+{
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0)
+    {
+        return false;
+    }
+
+    const FVoxelStrateComposerSlotOverride* Override =
+        FindComposerOverride(StrateLayout[SlotIdx].StrateIndex);
+    if (Override == nullptr || !Override->bUseRegions)
+    {
+        return false;
+    }
+    OutRegions = Override->Regions;
     return true;
 }
 

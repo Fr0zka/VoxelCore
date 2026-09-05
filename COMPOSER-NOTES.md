@@ -169,7 +169,8 @@ which it writes**.
 sort of that DAG is a legal stack** — no authored order, and it produces orderings nobody wrote down.
 
 **Built status — 2026-09-04:** `EVoxelOpChannel` now names the two fields actually carried by
-`FVoxelOpSample` (`Density` and `Sdf`); all 29 concrete density operators declare reads, writes, and
+`FVoxelOpSample` (`Density` and `Sdf`); all 30 concrete density operators (including the lateral
+parent combiner) declare reads, writes, and
 additive/transformative behavior. `FVoxelOpStack::Add` snapshots that metadata, and
 `ValidateChannelOrder` checks the resulting channel DAG without entering the voxel loop.
 `VoxelForge.OpStack.ChannelDAG` builds all eight shipping stacks and validates them: **22 tests
@@ -254,6 +255,63 @@ rerolls every recipe and rebuilt stack, checks `WorldRadiusVoxels == 0`, and fee
 through the offline Tier 2 sampler; no runtime generation path calls this API. The final focused
 test took **76.466 s**. The complete `VoxelForge` namespace then passed **24/24 tests (0 failed,
 0 not run)** in **339.797 s**.
+
+### 3.2b Lateral regions — implemented, primordial-law gate failed (2026-09-05)
+
+The owner's “tunnel network leading to a big chamber and drops into shafts” question changes the
+unit of composition: an archetype is a **region inside a strate**, not the strate's label. Tier 4d
+therefore adds `FVoxelStrateRegionManifest`. The composer rolls 1–3 region records by a salted
+`VoxelHash::Cell` identity. Every region carries its own native parameter vector and, for structure
+rolls, its own recipe. The partition is a jittered 256-voxel XY lattice with nearest-site,
+nearest-different-site Voronoi assignment. Its identity is pure `(XY, seed, absolute strate index)`;
+rekeying is explicit when a candidate moves from an attempt index into a live slot.
+
+The lateral junction mirrors the vertical transition shape but blends the result at the right
+level. In a region core, one stack evaluates. Within the 24-voxel boundary band, the nearest
+different region's stack evaluates too and the two **internal densities** are crossfaded with the
+same linear curve used by the vertical transition (split symmetrically at the bisector). Native
+parameters are never blended: `ShaftSpacing` and a slab's floor/ceiling controls do not share a
+meaning. Region cores omit structural posts; the parent appends the global spine, vertical seal,
+passage carve, and XY edge seal once, in the existing order, after the lateral result. `Density`
+keeps the stack convention positive=solid and is negated only at the MC-facing boundary.
+
+The runtime hand-off remains an explicit manifest copy, not a new runtime composer. A worker
+prepares a small lattice-site halo and `(CHUNK_SIZE+3)^2` integer query grid per chunk; normal
+integer voxel samples use O(1) cached region lookup, and fractional gradient probes reuse the
+prepared site set. `ValidateChannelOrder` still runs for every region core and the parent, and
+`WorldRadiusVoxels` remains zero during offline materialisation.
+
+The box proof is intentionally conservative. A box is allowed to use one child only when the
+centre's bounded-neighborhood nearest-site gap is known and, minus twice the XY half-diagonal, is
+**strictly greater** than the blend width. If the local lattice window cannot certify that nearest
+different-region site, the proof is refused. Every other box evaluates every region's `ClassifyBox`;
+any `Mixed`, disagreement, boundary, or unproved band remains `Mixed`. The dedicated audit exercised 40 boxes, including 20 boxes that
+actually touched more than one region, brute-forced **199,800** integer samples, and found **0
+false-uniform violations**. All 20 cross-boundary verdicts were `Mixed`; no cross-boundary uniform
+claim was accepted.
+
+The performance audit at width 24 measured **10,517/65,536 = 16.0477%** band voxels over the
+Z-independent XY field. With chunk preparation excluded and the partition cache hot, the latest
+focused run was **338.11 ns/voxel** in an interior and **663.12 ns/voxel** in a band (**1.961×**).
+That is the expected cost of evaluating a second stack, and it is an explicit §8.10 budget item;
+if this
+feature proceeds, a narrower band or a cheaper density junction needs an owner-approved design
+decision rather than an unreported performance regression.
+
+The primordial law is the blocker. The test deliberately collected **16 actual opposite-region
+arrival/departure mouth pairs**, without adding a corridor, changing a threshold, or filtering for
+success. The lateral parent connected **9/16 (56.25%)**. The same exact region-zero recipe/vector
+and structural settings in a one-region control connected **11/16**, so the underlying structure
+roll is itself not universally connected; that control does not excuse the lateral failure. The
+same 16 seam cases were **valid 16/16, non-vacuous 16/16, and largest-component share ≥ 0.50
+16/16**; including the unsnapped seam law, full hard-gate survival is therefore **9/16**. The
+result is not ready for promotion. A future fix must be a design decision such as a guaranteed
+cross-seam corridor/landing contract, not a hidden pass threshold or seed selection.
+
+The rendered review artifact is
+`Saved/ComposerPreview/LateralRegions_seed_12001/index.html` (vertical/plan images and contour
+variants). It is intentionally retained even though the law test is red, so a measured seam can be
+looked at rather than trusted.
 
 ### 3.2a Editor walk-through hand-off (not a runtime composer)
 
@@ -1228,6 +1286,21 @@ rebuilding every selected stack compared **393,216 density samples bit-identical
 same seed twice emitted byte-identical JSON. The selected-only descent review was written beside the
 manifest. The run also kept all existing equivalence, determinism, box-verdict, and connectivity
 tests green.
+
+**2026-09-05 — Tier 4d lateral-region audit.** The specified build succeeded after adding the
+per-chunk partition cache, density combiner, conservative box fold, season round-trip fields, and
+the editor preview hand-off. The dedicated test intentionally remains red on the primordial-law
+gate: it collected **16 opposite-region mouth pairs** and connected **9/16 (56.25%)**; the same
+region-zero controls connected **11/16**. This is evidence, not a tuned threshold. The box audit
+covered **40** boxes (**20 cross-boundary**), brute-forced **199,800** integer samples, and found
+**0** false-uniform violations; all cross-boundary verdicts were `Mixed`. At blend width **24**,
+**10,517/65,536 = 16.0477%** of sampled XY voxels were in a band; cached interior timing was
+**338.11 ns/voxel**, band timing **663.12 ns/voxel**, or **1.961×**. The multi-region preview was
+written to `Saved/ComposerPreview/LateralRegions_seed_12001/index.html`. On those same 16 seam
+cases, survival before the law gate was **valid 16/16, non-vacuous 16/16, largest-component share
+≥ 0.50 16/16**, and full hard-gate survival was **9/16**. No corridor, threshold change, or
+successful-seed filter was introduced; lateral regions are not ready for promotion until the seam
+law has a design-level fix.
 
 ---
 

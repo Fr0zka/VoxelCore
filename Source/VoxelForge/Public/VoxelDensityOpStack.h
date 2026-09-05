@@ -41,6 +41,7 @@
 class UVoxelStrateManager;
 struct FVoxelOpStackRecipe;
 struct FVoxelStrateArchetypeParams;
+struct FVoxelStrateRegionManifest;
 enum class EVoxelStrateOpClass : uint8;
 
 /** The declarations the offline structure roller reads before it ever materialises an op. */
@@ -353,7 +354,8 @@ namespace VoxelDensityOps
                                           const UVoxelStrateManager* StrateManager,
                                           const TArray<FSurfaceGenerationParams>& PerBiomeParams =
                                               TArray<FSurfaceGenerationParams>(),
-                                          TUniquePtr<IVoxelBiomeField> BiomeField = nullptr);
+                                          TUniquePtr<IVoxelBiomeField> BiomeField = nullptr,
+                                          bool bAppendStructuralPosts = true);
 
     /**
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
@@ -365,7 +367,8 @@ namespace VoxelDensityOps
      */
     VOXELFORGE_API void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
                                        int32 Seed, float SpineRadius,
-                                       const UVoxelStrateManager* StrateManager);
+                                       const UVoxelStrateManager* StrateManager,
+                                       bool bAppendStructuralPosts = true);
 
     /**
      * VerticalShafts — 9 ops, et **TROIS viennent de Maze sans une ligne de changement** :
@@ -378,7 +381,8 @@ namespace VoxelDensityOps
      */
     VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
                                                 int32 Seed, float SpineRadius,
-                                                const UVoxelStrateManager* StrateManager);
+                                                const UVoxelStrateManager* StrateManager,
+                                                bool bAppendStructuralPosts = true);
 
     /**
      * TunnelNetwork — **COMPLET, 20 ops** :
@@ -399,7 +403,8 @@ namespace VoxelDensityOps
     VOXELFORGE_API void BuildTunnelNetworkStack(FVoxelOpStack& OutStack,
                                                 const FStrateGenerationParams& P,
                                                 int32 Seed, float SpineRadius,
-                                                const UVoxelStrateManager* StrateManager);
+                                                const UVoxelStrateManager* StrateManager,
+                                                bool bAppendStructuralPosts = true);
 
     /**
      * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE de la dernière propagation d'intervalle
@@ -448,7 +453,8 @@ namespace VoxelDensityOps
      */
     VOXELFORGE_API void BuildFloatingIslandStack(FVoxelOpStack& OutStack, const FFloatingIslandParams& P,
                                                  int32 Seed, float SpineRadius,
-                                                 const UVoxelStrateManager* StrateManager);
+                                                 const UVoxelStrateManager* StrateManager,
+                                                 bool bAppendStructuralPosts = true);
 
     /**
      * La pile Maze complète, décomposée — PAS un `FMazeOp` monolithique :
@@ -459,14 +465,26 @@ namespace VoxelDensityOps
      */
     VOXELFORGE_API void BuildMazeStack(FVoxelOpStack& OutStack, const FMazeGenerationParams& P,
                                        int32 Seed, float SpineRadius,
-                                       const UVoxelStrateManager* StrateManager);
+                                       const UVoxelStrateManager* StrateManager,
+                                       bool bAppendStructuralPosts = true);
 }
 
-/** Materialise an offline recipe. Structural posts are appended internally and cannot be omitted. */
+/** Materialise an offline recipe. Structural posts are appended by default; lateral region cores
+ * deliberately pass false so the parent stack can append the global posts exactly once. */
 VOXELFORGE_API bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
                                             const FVoxelStrateArchetypeParams& Params,
                                             int32 Seed, float SpineRadius,
                                             const UVoxelStrateManager* StrateManager,
                                             FVoxelOpStack& OutStack,
                                             FVoxelOpContext& OutContext,
-                                            FString* OutError = nullptr);
+                                            FString* OutError = nullptr,
+                                            bool bAppendStructuralPosts = true);
+
+/** Build the region combiner stack. Creative cores are independent; structural posts are global. */
+VOXELFORGE_API bool VF_BuildStrateRegionStack(
+    const FVoxelStrateRegionManifest& Manifest,
+    float SpineRadius,
+    const UVoxelStrateManager* StrateManager,
+    FVoxelOpStack& OutStack,
+    FVoxelOpContext& OutContext,
+    FString* OutError = nullptr);

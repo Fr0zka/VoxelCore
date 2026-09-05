@@ -194,6 +194,7 @@ namespace
         const FVoxelStrateComposerCandidate& Candidate,
         const UVoxelGenerator& Generator,
         const UVoxelStrateManager& StrateManager,
+        int32 TargetStrateIndex,
         int32 TargetTopChunkZ,
         int32 TargetBottomChunkZ,
         FVoxelOpStack& OutStack,
@@ -206,7 +207,24 @@ namespace
         VF_SetComposerRuntimeBounds(Params, TopWorldZ, BottomWorldZ);
 
         bool bBuilt = false;
-        if (Candidate.bStructureRoll)
+        if (Candidate.Regions.RegionCount > 1)
+        {
+            FVoxelStrateRegionManifest RegionManifest = Candidate.Regions;
+            VF_RekeyStrateRegionManifest(RegionManifest, Candidate.Seed,
+                                          TargetStrateIndex);
+            RegionManifest.StrateTopWorldZ = TopWorldZ;
+            RegionManifest.StrateBottomWorldZ = BottomWorldZ;
+            RegionManifest.bHasGlobalStructuralParams = true;
+            for (FVoxelStrateRegion& Region : RegionManifest.Regions)
+            {
+                VF_SetStrateArchetypeRuntimeBounds(Region.ArchetypeParams,
+                                                   TopWorldZ, BottomWorldZ);
+            }
+            bBuilt = VF_BuildStrateRegionStack(
+                RegionManifest, Generator.OriginSpineRadius, &StrateManager,
+                OutStack, OutContext, &OutError);
+        }
+        else if (Candidate.bStructureRoll)
         {
             bBuilt = VF_BuildStackFromRecipe(
                 Candidate.Recipe, Params, Generator.Seed, Generator.OriginSpineRadius,
@@ -573,7 +591,25 @@ void AVoxelWorld::ApplyComposerCandidate()
     FVoxelOpContext PreflightContext;
     FString PreflightError;
     bool bPreflightBuilt = false;
-    if (Candidate.bStructureRoll)
+    FVoxelStrateRegionManifest PreflightRegions;
+    if (Candidate.Regions.RegionCount > 1)
+    {
+        PreflightRegions = Candidate.Regions;
+        VF_RekeyStrateRegionManifest(PreflightRegions, Candidate.Seed,
+                                      ComposerTargetStrateIndex);
+        PreflightRegions.StrateTopWorldZ = TargetTopWorldZ;
+        PreflightRegions.StrateBottomWorldZ = TargetBottomWorldZ;
+        PreflightRegions.bHasGlobalStructuralParams = true;
+        for (FVoxelStrateRegion& Region : PreflightRegions.Regions)
+        {
+            VF_SetStrateArchetypeRuntimeBounds(Region.ArchetypeParams,
+                                               TargetTopWorldZ, TargetBottomWorldZ);
+        }
+        bPreflightBuilt = VF_BuildStrateRegionStack(
+            PreflightRegions, Generator->OriginSpineRadius, StrateManager,
+            PreflightStack, PreflightContext, &PreflightError);
+    }
+    else if (Candidate.bStructureRoll)
     {
         bPreflightBuilt = VF_BuildStackFromRecipe(
             Candidate.Recipe, PreflightParams, Generator->Seed, Generator->OriginSpineRadius,
@@ -615,7 +651,8 @@ void AVoxelWorld::ApplyComposerCandidate()
         if (!StrateManager->SetComposerOverrideForStrate(
             ComposerTargetStrateIndex, Candidate.Seed, Candidate.Archetype,
             Candidate.ArchetypeParams, Candidate.bStructureRoll,
-            Candidate.bStructureRoll ? &Candidate.Recipe : nullptr, ApplyError))
+            Candidate.bStructureRoll ? &Candidate.Recipe : nullptr, ApplyError,
+            Candidate.Regions.RegionCount > 1 ? &Candidate.Regions : nullptr))
         {
             UE_LOG(LogTemp, Error,
                 TEXT("[VoxelWorld] ApplyComposerCandidate: seed=%d index=%d was not applied: %s"),
@@ -638,7 +675,8 @@ void AVoxelWorld::ApplyComposerCandidate()
     FVoxelOpContext ReferenceContext;
     FString ReferenceError;
     const bool bReferenceBuilt = VF_BuildComposerReferenceStack(
-        Candidate, *Generator, *StrateManager, TargetTopChunkZ, TargetBottomChunkZ,
+        Candidate, *Generator, *StrateManager, ComposerTargetStrateIndex,
+        TargetTopChunkZ, TargetBottomChunkZ,
         ReferenceStack, ReferenceContext, ReferenceError);
 
     FString ComparableReason;

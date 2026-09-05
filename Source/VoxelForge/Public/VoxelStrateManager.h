@@ -27,6 +27,7 @@ class UVoxelSettings;
 #if WITH_EDITOR
 struct FVoxelStrateArchetypeParams;
 struct FVoxelOpStackRecipe;
+struct FVoxelStrateRegionManifest;
 struct FVoxelStrateComposerSlotOverride;
 #endif
 
@@ -158,13 +159,18 @@ public:
     bool SetComposerOverrideForStrate(
         int32 StrateIndex, int32 CandidateSeed, ECaveGeneratorType Archetype,
         const FVoxelStrateArchetypeParams& Params, bool bUseRecipe,
-        const FVoxelOpStackRecipe* Recipe, FString& OutError);
+        const FVoxelOpStackRecipe* Recipe, FString& OutError,
+        const FVoxelStrateRegionManifest* Regions = nullptr);
 
     /** Read the immutable editor override for a chunk into worker-local storage. */
     bool GetComposerOverrideForChunk(
         const FIntVector& ChunkCoord, int32& OutCandidateSeed,
         ECaveGeneratorType& OutArchetype, FVoxelStrateArchetypeParams& OutParams,
         bool& bOutUseRecipe, FVoxelOpStackRecipe& OutRecipe) const;
+
+    /** Read the immutable editor region override into worker-local storage. */
+    bool GetComposerRegionOverrideForChunk(
+        const FIntVector& ChunkCoord, FVoxelStrateRegionManifest& OutRegions) const;
 
     /** Custom recipes cannot be safely classified by the native ClassifyBox proof yet. */
     bool HasComposerRecipeOverride() const;

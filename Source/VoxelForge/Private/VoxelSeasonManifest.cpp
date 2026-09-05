@@ -1092,6 +1092,152 @@ namespace VoxelSeasonManifestPrivate
         Root->SetStringField(TEXT("policy_note"), Manifest.PolicyNote);
     }
 
+    TSharedPtr<FJsonObject> SerializeRegionManifest(
+        const FVoxelStrateRegionManifest& Regions)
+    {
+        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetBoolField(TEXT("valid"), Regions.bValid);
+        Object->SetStringField(TEXT("failure_reason"), Regions.FailureReason);
+        Object->SetNumberField(TEXT("seed"), Regions.Seed);
+        Object->SetNumberField(TEXT("strate_index"), Regions.StrateIndex);
+        Object->SetNumberField(TEXT("region_count"), Regions.RegionCount);
+        Object->SetNumberField(TEXT("partition_seed"),
+                               static_cast<double>(Regions.PartitionSeed));
+        SetMetricFloat(Object, TEXT("lattice_cell_size"), Regions.LatticeCellSize);
+        SetMetricFloat(Object, TEXT("blend_width"), Regions.BlendWidth);
+        Object->SetBoolField(TEXT("has_global_structural_params"),
+                             Regions.bHasGlobalStructuralParams);
+        Object->SetNumberField(TEXT("structural_param_block"),
+                               static_cast<int32>(Regions.StructuralParamBlock));
+        SetMetricFloat(Object, TEXT("strate_top_world_z"), Regions.StrateTopWorldZ);
+        SetMetricFloat(Object, TEXT("strate_bottom_world_z"), Regions.StrateBottomWorldZ);
+        SetMetricFloat(Object, TEXT("boundary_seal_thickness"),
+                       Regions.BoundarySealThickness);
+        SetMetricFloat(Object, TEXT("base_density"), Regions.BaseDensity);
+
+        TArray<TSharedPtr<FJsonValue>> RegionValues;
+        for (const FVoxelStrateRegion& Region : Regions.Regions)
+        {
+            TSharedPtr<FJsonObject> RegionObject = MakeShared<FJsonObject>();
+            RegionObject->SetNumberField(TEXT("region_index"), Region.RegionIndex);
+            RegionObject->SetNumberField(TEXT("seed"), Region.Seed);
+            RegionObject->SetStringField(TEXT("archetype"), ArchetypeName(Region.Archetype));
+            RegionObject->SetNumberField(TEXT("archetype_id"),
+                                         static_cast<int32>(Region.Archetype));
+            RegionObject->SetBoolField(TEXT("uses_recipe"), Region.bUsesRecipe);
+            RegionObject->SetObjectField(TEXT("recipe"), SerializeRecipe(Region.Recipe));
+            RegionObject->SetObjectField(TEXT("parameters"),
+                                         SerializeAllParams(Region.ArchetypeParams));
+            RegionValues.Add(MakeShared<FJsonValueObject>(MoveTemp(RegionObject)));
+        }
+        Object->SetArrayField(TEXT("regions"), MoveTemp(RegionValues));
+        return Object;
+    }
+
+    bool ReadJsonUInt32(const TSharedPtr<FJsonObject>& Object,
+                        const TCHAR* Name, uint32& OutValue)
+    {
+        double Number = 0.0;
+        if (!ReadJsonNumber(Object, Name, Number)
+            || !FMath::IsFinite(Number)
+            || Number < 0.0 || Number > 4294967295.0
+            || FMath::FloorToDouble(Number) != Number)
+        {
+            return false;
+        }
+        OutValue = static_cast<uint32>(Number);
+        return true;
+    }
+
+    bool DeserializeRegionManifest(const TSharedPtr<FJsonObject>& Object,
+                                   FVoxelStrateRegionManifest& OutRegions)
+    {
+        if (!Object.IsValid()) return false;
+        OutRegions = FVoxelStrateRegionManifest();
+        bool JsonValid = false;
+        int32 StructuralBlock = 0;
+        bool bFieldsValid = ReadJsonBool(Object, TEXT("valid"), JsonValid)
+            && ReadJsonString(Object, TEXT("failure_reason"), OutRegions.FailureReason)
+            && ReadJsonInt32(Object, TEXT("seed"), OutRegions.Seed)
+            && ReadJsonInt32(Object, TEXT("strate_index"), OutRegions.StrateIndex)
+            && ReadJsonInt32(Object, TEXT("region_count"), OutRegions.RegionCount)
+            && ReadJsonUInt32(Object, TEXT("partition_seed"), OutRegions.PartitionSeed)
+            && ReadMetricFloat(Object, TEXT("lattice_cell_size"), OutRegions.LatticeCellSize)
+            && ReadMetricFloat(Object, TEXT("blend_width"), OutRegions.BlendWidth)
+            && ReadJsonBool(Object, TEXT("has_global_structural_params"),
+                            OutRegions.bHasGlobalStructuralParams)
+            && ReadJsonInt32(Object, TEXT("structural_param_block"), StructuralBlock)
+            && ReadMetricFloat(Object, TEXT("strate_top_world_z"), OutRegions.StrateTopWorldZ)
+            && ReadMetricFloat(Object, TEXT("strate_bottom_world_z"),
+                               OutRegions.StrateBottomWorldZ)
+            && ReadMetricFloat(Object, TEXT("boundary_seal_thickness"),
+                               OutRegions.BoundarySealThickness)
+            && ReadMetricFloat(Object, TEXT("base_density"), OutRegions.BaseDensity);
+        if (StructuralBlock < static_cast<int32>(EVoxelStrateParamBlock::None)
+            || StructuralBlock > static_cast<int32>(EVoxelStrateParamBlock::FloatingIsland))
+        {
+            bFieldsValid = false;
+        }
+        OutRegions.StructuralParamBlock = static_cast<EVoxelStrateParamBlock>(StructuralBlock);
+
+        const TArray<TSharedPtr<FJsonValue>>* RegionValues = nullptr;
+        bFieldsValid = ReadJsonArray(Object, TEXT("regions"), RegionValues) && bFieldsValid;
+        if (RegionValues == nullptr
+            || OutRegions.RegionCount < 1 || OutRegions.RegionCount > 3
+            || RegionValues->Num() != OutRegions.RegionCount)
+        {
+            bFieldsValid = false;
+        }
+
+        OutRegions.Regions.Reset();
+        if (RegionValues != nullptr)
+        {
+            OutRegions.Regions.Reserve(RegionValues->Num());
+            for (int32 Index = 0; Index < RegionValues->Num(); ++Index)
+            {
+                const TSharedPtr<FJsonValue>& Value = (*RegionValues)[Index];
+                if (!Value.IsValid() || Value->Type != EJson::Object)
+                {
+                    bFieldsValid = false;
+                    continue;
+                }
+                const TSharedPtr<FJsonObject> RegionObject = Value->AsObject();
+                FVoxelStrateRegion& Region = OutRegions.Regions.AddDefaulted_GetRef();
+                FString ArchetypeText;
+                int32 ArchetypeId = -1;
+                TSharedPtr<FJsonObject> Recipe, Params;
+                bFieldsValid = ReadJsonInt32(RegionObject, TEXT("region_index"),
+                                             Region.RegionIndex) && bFieldsValid;
+                bFieldsValid = ReadJsonInt32(RegionObject, TEXT("seed"), Region.Seed)
+                    && bFieldsValid;
+                bFieldsValid = ReadJsonString(RegionObject, TEXT("archetype"), ArchetypeText)
+                    && bFieldsValid;
+                bFieldsValid = ReadJsonInt32(RegionObject, TEXT("archetype_id"), ArchetypeId)
+                    && bFieldsValid;
+                bFieldsValid = ReadJsonBool(RegionObject, TEXT("uses_recipe"),
+                                            Region.bUsesRecipe) && bFieldsValid;
+                bFieldsValid = ReadJsonObject(RegionObject, TEXT("recipe"), Recipe)
+                    && bFieldsValid;
+                bFieldsValid = ReadJsonObject(RegionObject, TEXT("parameters"), Params)
+                    && bFieldsValid;
+                bFieldsValid = ParseArchetype(ArchetypeText, Region.Archetype)
+                    && bFieldsValid;
+                bFieldsValid = Region.RegionIndex == Index && bFieldsValid;
+                bFieldsValid = ArchetypeId == static_cast<int32>(Region.Archetype)
+                    && bFieldsValid;
+                if (Region.bUsesRecipe)
+                {
+                    bFieldsValid = DeserializeRecipe(Recipe, Region.Recipe) && bFieldsValid;
+                }
+                bFieldsValid = DeserializeAllParams(Params, Region.ArchetypeParams)
+                    && bFieldsValid;
+            }
+        }
+
+        OutRegions.bValid = JsonValid;
+        return bFieldsValid && OutRegions.IsValid();
+    }
+
     TSharedPtr<FJsonObject> SerializeStrate(const FVoxelSeasonStrate& Strate)
     {
         TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
@@ -1104,8 +1250,16 @@ namespace VoxelSeasonManifestPrivate
         Object->SetStringField(TEXT("archetype"), ArchetypeName(Strate.Archetype));
         Object->SetNumberField(TEXT("archetype_id"), static_cast<int32>(Strate.Archetype));
         Object->SetBoolField(TEXT("uses_recipe"), Strate.bUsesRecipe);
+        Object->SetBoolField(TEXT("uses_regions"), Strate.bUsesRegions);
         Object->SetObjectField(TEXT("recipe"), SerializeRecipe(Strate.Recipe));
         Object->SetObjectField(TEXT("parameters"), SerializeAllParams(Strate.Params));
+        // Keep old/single-region artifacts compact and on the exact legacy rebuild path.  A
+        // multi-region strate carries the complete parent manifest because that is its runtime
+        // identity; an invalid default Regions object must not make fixed legacy entries unloadable.
+        if (Strate.bUsesRegions)
+        {
+            Object->SetObjectField(TEXT("regions"), SerializeRegionManifest(Strate.Regions));
+        }
         Object->SetObjectField(TEXT("measured_metrics"), SerializeMetrics(Strate.Metrics));
         Object->SetNumberField(TEXT("distance_from_corpus_centroid"), Strate.DistanceFromCorpusCentroid);
         Object->SetStringField(TEXT("selection_reason"), Strate.SelectionReason);
@@ -1151,10 +1305,34 @@ namespace VoxelSeasonManifestPrivate
         OutStrate.DistanceFromCorpusCentroid = Distance;
         OutStrate.SelectionReason = Reason;
         OutStrate.SourceDefinitionPath = SourcePath;
-        TSharedPtr<FJsonObject> Recipe, Params, Metrics;
+        TSharedPtr<FJsonObject> Recipe, Params, Metrics, RegionsObject;
         bValid = ReadJsonObject(Object, TEXT("recipe"), Recipe) && bValid;
         bValid = ReadJsonObject(Object, TEXT("parameters"), Params) && bValid;
         bValid = ReadJsonObject(Object, TEXT("measured_metrics"), Metrics) && bValid;
+        const TSharedPtr<FJsonValue>* RegionsValue = Object->Values.Find(TEXT("regions"));
+        if (RegionsValue != nullptr)
+        {
+            bValid = ReadJsonObject(Object, TEXT("regions"), RegionsObject) && bValid;
+            if (RegionsObject.IsValid())
+            {
+                bValid = DeserializeRegionManifest(RegionsObject, OutStrate.Regions)
+                    && bValid;
+            }
+        }
+        const TSharedPtr<FJsonValue>* UsesRegionsValue =
+            Object->Values.Find(TEXT("uses_regions"));
+        if (UsesRegionsValue != nullptr)
+        {
+            bValid = ReadJsonBool(Object, TEXT("uses_regions"), OutStrate.bUsesRegions)
+                && bValid;
+        }
+        else
+        {
+            // Schema-1 manifests predating lateral regions simply take the old path.  A region
+            // object is optional for backward compatibility, and never implicitly changes that
+            // path without the explicit opt-in bit.
+            OutStrate.bUsesRegions = false;
+        }
         bValid = ParseArchetype(ArchetypeText, OutStrate.Archetype) && bValid;
         bValid = ArchetypeId == static_cast<int32>(OutStrate.Archetype) && bValid;
         bValid = ParseConnectivityName(LawText, OutStrate.PrimordialLawResult) && bValid;
@@ -1164,6 +1342,11 @@ namespace VoxelSeasonManifestPrivate
         }
         bValid = DeserializeAllParams(Params, OutStrate.Params) && bValid;
         bValid = DeserializeMetrics(Metrics, OutStrate.Metrics) && bValid;
+        if (OutStrate.bUsesRegions
+            && (!OutStrate.Regions.IsValid() || OutStrate.Regions.RegionCount <= 1))
+        {
+            bValid = false;
+        }
         return bValid;
     }
 
@@ -1461,8 +1644,27 @@ bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
     for (int32 Index = 0; Index < OutManifest.Strates.Num(); ++Index)
     {
         const FVoxelSeasonStrate& Strate = OutManifest.Strates[Index];
+        const float StoredTop = static_cast<float>(Strate.TopWorldZ);
+        const float StoredBottom = static_cast<float>(Strate.BottomWorldZ);
         if (Strate.DepthIndex != Index || !Strate.bPassedPrimordialLaw
             || Strate.PrimordialLawResult != EVoxelConnectivityResult::Connected)
+        {
+            bFieldsValid = false;
+            break;
+        }
+        if (Strate.bUsesRegions
+            && (!Strate.Regions.IsValid()
+                || Strate.Regions.RegionCount <= 1
+                || Strate.Regions.Seed != Strate.Seed
+                || Strate.Regions.StrateIndex != Strate.DepthIndex
+                || Strate.Regions.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+                    Strate.Seed, Strate.DepthIndex)
+                || !Strate.Regions.bHasGlobalStructuralParams
+                || FMemory::Memcmp(&Strate.Regions.StrateTopWorldZ,
+                                   &StoredTop, sizeof(float)) != 0
+                || FMemory::Memcmp(&Strate.Regions.StrateBottomWorldZ,
+                                   &StoredBottom, sizeof(float)) != 0)
+        )
         {
             bFieldsValid = false;
             break;
@@ -1487,6 +1689,9 @@ namespace VoxelSeasonCompositionPrivate
     float ActiveBottom(const FVoxelStrateArchetypeParams& Params, ECaveGeneratorType Archetype);
     float ActiveSeal(const FVoxelStrateArchetypeParams& Params, ECaveGeneratorType Archetype);
     void SetRuntimeBounds(FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ);
+    void SetRegionRuntimeBounds(FVoxelStrateRegionManifest& Regions,
+                                int32 Seed, int32 StrateIndex,
+                                float TopWorldZ, float BottomWorldZ);
     const TCHAR* RejectionReasonForLaw(EVoxelConnectivityResult Result);
 
     // These caps are policy/allocator guards, not gameplay limits. They keep a malformed build-box
@@ -1690,9 +1895,17 @@ namespace VoxelSeasonCompositionPrivate
         OutStrate.Archetype = Candidate.Archetype;
         OutStrate.Recipe = Candidate.Recipe;
         OutStrate.Params = Candidate.ArchetypeParams;
+        OutStrate.Regions = Candidate.Regions;
         OutStrate.bUsesRecipe = true;
+        OutStrate.bUsesRegions = Candidate.Regions.RegionCount > 1;
         SetRuntimeBounds(OutStrate.Params, static_cast<float>(TopWorldZ),
                          static_cast<float>(BottomWorldZ));
+        if (OutStrate.Regions.IsValid())
+        {
+            SetRegionRuntimeBounds(OutStrate.Regions, Candidate.Seed, CandidateIndex,
+                                   static_cast<float>(TopWorldZ),
+                                   static_cast<float>(BottomWorldZ));
+        }
     }
 #endif
 
@@ -1712,11 +1925,19 @@ namespace VoxelSeasonCompositionPrivate
         OutStrate.Archetype = Fixed.Archetype;
         OutStrate.Recipe = Fixed.Recipe;
         OutStrate.Params = Fixed.Params;
+        OutStrate.Regions = Fixed.Regions;
         OutStrate.SourceDefinitionPath = Fixed.SourceDefinitionPath;
         OutStrate.bFixed = true;
         OutStrate.bUsesRecipe = Fixed.bUsesRecipe;
+        OutStrate.bUsesRegions = Fixed.bUsesRegions && Fixed.Regions.IsValid();
         SetRuntimeBounds(OutStrate.Params, static_cast<float>(TopWorldZ),
                          static_cast<float>(BottomWorldZ));
+        if (OutStrate.bUsesRegions)
+        {
+            SetRegionRuntimeBounds(OutStrate.Regions, Fixed.Seed, DepthIndex,
+                                   static_cast<float>(TopWorldZ),
+                                   static_cast<float>(BottomWorldZ));
+        }
     }
 
     bool EvaluateStrate(const FVoxelSeasonStrate& Strate,
@@ -1739,7 +1960,13 @@ namespace VoxelSeasonCompositionPrivate
         FVoxelOpContext Context;
         FString BuildError;
         bool bBuilt = false;
-        if (Strate.bUsesRecipe)
+        if (Strate.bUsesRegions)
+        {
+            bBuilt = VF_BuildStrateRegionStack(
+                Strate.Regions, Settings.OriginSpineRadius, nullptr,
+                Stack, Context, &BuildError);
+        }
+        else if (Strate.bUsesRecipe)
         {
             bBuilt = VF_BuildStackFromRecipe(Strate.Recipe, Strate.Params, Strate.Seed,
                                               Settings.OriginSpineRadius, nullptr, Stack,
@@ -1958,6 +2185,21 @@ namespace VoxelSeasonCompositionPrivate
         Params.VerticalShaftParams.StrateBottomWorldZ = BottomWorldZ;
         Params.FloatingIslandParams.StrateTopWorldZ = TopWorldZ;
         Params.FloatingIslandParams.StrateBottomWorldZ = BottomWorldZ;
+    }
+
+    void SetRegionRuntimeBounds(FVoxelStrateRegionManifest& Regions,
+                                int32 Seed, int32 StrateIndex,
+                                float TopWorldZ, float BottomWorldZ)
+    {
+        VF_RekeyStrateRegionManifest(Regions, Seed, StrateIndex);
+        Regions.StrateTopWorldZ = TopWorldZ;
+        Regions.StrateBottomWorldZ = BottomWorldZ;
+        Regions.bHasGlobalStructuralParams = true;
+        for (FVoxelStrateRegion& Region : Regions.Regions)
+        {
+            VF_SetStrateArchetypeRuntimeBounds(Region.ArchetypeParams,
+                                               TopWorldZ, BottomWorldZ);
+        }
     }
 
     bool SameFloatBits(float A, float B)
@@ -2353,6 +2595,15 @@ FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed,
                                     Settings.StrateHeightInChunks, TopWorldZ,
                                     BottomWorldZ, Strate);
                 Strate.DepthIndex = DepthIndex;
+                if (Strate.bUsesRegions)
+                {
+                    // Candidate probes use the attempt index only to make their provisional
+                    // measurements independent.  The persisted world is keyed by its absolute
+                    // strate slot, so rekey before the final placement gate and measurement.
+                    SetRegionRuntimeBounds(Strate.Regions, Strate.Seed, DepthIndex,
+                                           static_cast<float>(TopWorldZ),
+                                           static_cast<float>(BottomWorldZ));
+                }
                 FSeasonEvaluation Evaluation;
                 if (!EvaluateStrate(Strate, Settings, Evaluation))
                 {
@@ -2592,6 +2843,21 @@ bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
 
     const float StoredTop = static_cast<float>(Strate.TopWorldZ);
     const float StoredBottom = static_cast<float>(Strate.BottomWorldZ);
+    if (Strate.bUsesRegions)
+    {
+        if (!Strate.Regions.IsValid()
+            || Strate.Regions.RegionCount <= 1
+            || Strate.Regions.Seed != Strate.Seed
+            || Strate.Regions.StrateIndex != Strate.DepthIndex
+            || Strate.Regions.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+                Strate.Seed, Strate.DepthIndex)
+            || !Strate.Regions.bHasGlobalStructuralParams
+            || !SameFloatBits(Strate.Regions.StrateTopWorldZ, StoredTop)
+            || !SameFloatBits(Strate.Regions.StrateBottomWorldZ, StoredBottom))
+        {
+            return Fail(TEXT("Manifest lateral region description is invalid or not keyed to its slot."));
+        }
+    }
     if (!SameFloatBits(ActiveTop(Strate.Params, Strate.Archetype), StoredTop)
         || !SameFloatBits(ActiveBottom(Strate.Params, Strate.Archetype), StoredBottom))
     {
@@ -2599,7 +2865,12 @@ bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
     }
 
     bool bBuilt = false;
-    if (Strate.bUsesRecipe)
+    if (Strate.bUsesRegions)
+    {
+        bBuilt = VF_BuildStrateRegionStack(Strate.Regions, SpineRadius, StrateManager,
+                                            OutStack, OutContext, OutError);
+    }
+    else if (Strate.bUsesRecipe)
     {
         bBuilt = VF_BuildStackFromRecipe(Strate.Recipe, Strate.Params, Strate.Seed,
                                           SpineRadius, StrateManager, OutStack, OutContext,

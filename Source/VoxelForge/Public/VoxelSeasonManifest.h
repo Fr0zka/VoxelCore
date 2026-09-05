@@ -65,7 +65,9 @@ struct VOXELFORGE_API FVoxelSeasonFixedStrate
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
     FVoxelStrateArchetypeParams Params;
     FVoxelOpStackRecipe Recipe;
+    FVoxelStrateRegionManifest Regions;
     bool bUsesRecipe = true;
+    bool bUsesRegions = false;
     FString SourceDefinitionPath;
 };
 
@@ -162,6 +164,9 @@ struct VOXELFORGE_API FVoxelSeasonStrate
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
     FVoxelOpStackRecipe Recipe;
     FVoxelStrateArchetypeParams Params;
+    // When true this is the complete lateral parent description. Params/Archetype remain the
+    // compatibility identity of region zero; runtime rebuilds use Regions and never blend params.
+    FVoxelStrateRegionManifest Regions;
     FVoxelStrateMeasuredMetrics Metrics;
 
     double DistanceFromCorpusCentroid = 0.0;
@@ -173,6 +178,7 @@ struct VOXELFORGE_API FVoxelSeasonStrate
     bool bBossSlot = false;
     bool bFixed = false;
     bool bUsesRecipe = true;
+    bool bUsesRegions = false;
 
     bool bPassedNonVacuous = false;
     bool bPassedLargestComponent = false;
@@ -224,8 +230,20 @@ struct VOXELFORGE_API FVoxelSeasonManifest
 
     bool IsUsable() const
     {
-        return bValid && Error.IsEmpty() && WorldRadiusVoxels == 0.0f
-            && Strates.Num() == SelectedCount && SelectedCount > 0;
+        if (!bValid || !Error.IsEmpty() || WorldRadiusVoxels != 0.0f
+            || Strates.Num() != SelectedCount || SelectedCount <= 0)
+        {
+            return false;
+        }
+        for (const FVoxelSeasonStrate& Strate : Strates)
+        {
+            if (Strate.bUsesRegions
+                && (!Strate.Regions.IsValid() || Strate.Regions.RegionCount <= 1))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -266,4 +284,3 @@ VOXELFORGE_API bool VF_RebuildVoxelSeasonStrate(
     FVoxelOpStack& OutStack,
     FVoxelOpContext& OutContext,
     FString* OutError = nullptr);
-

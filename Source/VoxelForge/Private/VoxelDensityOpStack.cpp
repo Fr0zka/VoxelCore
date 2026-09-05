@@ -4886,6 +4886,129 @@ namespace
         uint32 SeedU;
     };
 
+    //=============================================================================
+    // RÔLE 2 — COMBINER : RÉGIONS LATÉRALES
+    //=============================================================================
+    // The creative stacks stay independent.  This op owns only their density-level junction;
+    // the parent FVoxelOpStack appends the global structural posts after it.  In particular, no
+    // recipe can make the spine, vertical seal, passage carve, or XY edge seal region-local.
+    class FLateralRegionBlendOp final : public IVoxelDensityOp
+    {
+    public:
+        FLateralRegionBlendOp(const FVoxelStrateRegionManifest& InManifest,
+                              TArray<FVoxelOpStack>&& InStacks)
+            : RegionStacks(MoveTemp(InStacks))
+        {
+            // Keep only partition metadata here.  The native vectors/recipes have already been
+            // consumed by the stacks and must not be duplicated in the voxel operator.
+            PartitionManifest.bValid = true;
+            PartitionManifest.Seed = InManifest.Seed;
+            PartitionManifest.StrateIndex = InManifest.StrateIndex;
+            PartitionManifest.RegionCount = InManifest.RegionCount;
+            PartitionManifest.PartitionSeed = InManifest.PartitionSeed;
+            PartitionManifest.LatticeCellSize = InManifest.LatticeCellSize;
+            PartitionManifest.BlendWidth = InManifest.BlendWidth;
+            PartitionManifest.Regions.SetNum(InManifest.RegionCount);
+        }
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::Combiner; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        bool IsAdditive() const override { return false; }
+
+        void PrepareChunk(const FVoxelOpContext& Ctx) override
+        {
+            PartitionCache.PrepareForChunk(PartitionManifest, Ctx.ChunkCoord);
+            bPrepared = true;
+            for (FVoxelOpStack& Stack : RegionStacks)
+            {
+                Stack.PrepareChunk(Ctx);
+            }
+        }
+
+        void Eval(float WorldX, float WorldY, float WorldZ,
+                  FVoxelOpSample& InOut) const override
+        {
+            if (RegionStacks.Num() == 0) { return; }
+
+            const FVoxelStrateRegionQuery Query = bPrepared
+                ? PartitionCache.Query(WorldX, WorldY)
+                : VF_QueryStrateRegion(PartitionManifest, WorldX, WorldY);
+            const int32 Primary = FMath::Clamp(Query.PrimaryRegion, 0, RegionStacks.Num() - 1);
+            const float PrimaryDensity = RegionStacks[Primary].EvalInternal(
+                WorldX, WorldY, WorldZ);
+            float Density = PrimaryDensity;
+
+            if (Query.NeighborWeight > 0.0f && Query.NeighborRegion != INDEX_NONE
+                && RegionStacks.IsValidIndex(Query.NeighborRegion)
+                && Query.NeighborRegion != Primary)
+            {
+                const float NeighborDensity = RegionStacks[Query.NeighborRegion].EvalInternal(
+                    WorldX, WorldY, WorldZ);
+                Density = FMath::Lerp(PrimaryDensity, NeighborDensity, Query.NeighborWeight);
+            }
+            InOut.Density = Density;
+        }
+
+        /**
+         * A box wholly outside the band can use its one creative stack.  A box that may touch a
+         * bisector or the band asks every region stack.  If any is Mixed, the parent is Mixed. If
+         * all possible stacks agree, their convex density blend has the same sign everywhere, so
+         * the blend band is proved uniform too.  This is deliberately stricter than sampling a
+         * center point and is the protection against a cross-region false uniform tile.
+         */
+        EVoxelTileClass ClassifyBox(const FBox& VoxelBox,
+                                    const FVoxelOpContext& Ctx) const override
+        {
+            if (RegionStacks.Num() == 0) { return EVoxelTileClass::Mixed; }
+
+            const FVoxelStrateRegionBoxProof Proof =
+                VF_AnalyzeStrateRegionBox(PartitionManifest, VoxelBox);
+            if (Proof.bProvablySingleRegion)
+            {
+                const FVoxelStrateRegionQuery Query = VF_QueryStrateRegion(
+                    PartitionManifest,
+                    ((float)VoxelBox.Min.X + (float)VoxelBox.Max.X) * 0.5f,
+                    ((float)VoxelBox.Min.Y + (float)VoxelBox.Max.Y) * 0.5f);
+                const int32 Primary = FMath::Clamp(
+                    Query.PrimaryRegion, 0, RegionStacks.Num() - 1);
+                return RegionStacks[Primary].ClassifyBox(VoxelBox, Ctx);
+            }
+
+            EVoxelTileClass CommonVerdict = EVoxelTileClass::Mixed;
+            for (const FVoxelOpStack& Stack : RegionStacks)
+            {
+                const EVoxelTileClass Verdict = Stack.ClassifyBox(VoxelBox, Ctx);
+                if (Verdict == EVoxelTileClass::Mixed)
+                {
+                    return EVoxelTileClass::Mixed;
+                }
+                if (CommonVerdict == EVoxelTileClass::Mixed)
+                {
+                    CommonVerdict = Verdict;
+                }
+                else if (CommonVerdict != Verdict)
+                {
+                    return EVoxelTileClass::Mixed;
+                }
+            }
+            return CommonVerdict;
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return EVoxelOpEffect::Both;
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("LateralRegionBlendOp"); }
+
+    private:
+        FVoxelStrateRegionManifest PartitionManifest;
+        TArray<FVoxelOpStack> RegionStacks;
+        mutable FVoxelStrateRegionPartitionCache PartitionCache;
+        mutable bool bPrepared = false;
+    };
+
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
     // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
     // (« FVoxelOpStack », « FABRIQUES ») insère la classe HORS du namespace anonyme, et l'accolade
@@ -5249,7 +5372,8 @@ namespace VoxelDensityOps
     void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,
                            int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
                            const TArray<FSurfaceGenerationParams>& PerBiomeParams,
-                           TUniquePtr<IVoxelBiomeField> BiomeField)
+                           TUniquePtr<IVoxelBiomeField> BiomeField,
+                           bool bAppendStructuralPosts)
     {
         // ARCHÉTYPE COMPLET depuis l'étape 2c : vide + overhang + mélange de biomes.
         // `PerBiomeParams` vide ⇒ chemin sans biomes, strictement inchangé.
@@ -5262,12 +5386,17 @@ namespace VoxelDensityOps
         // motif que cliff → structural : un modificateur qui a besoin de ce que la source a produit.
         OutStack.Add(MakeUnique<FOverhangShelfMod>(P, Seed, ColumnPtr));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 
     void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
-                        int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                        int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                        bool bAppendStructuralPosts)
     {
         // DEUX archétypes entrent ici, aucun branchement ne les distingue — parce que
         // `GetSlabDensity` n'en fait aucun non plus. FlatPlain et CrystalChamber ne diffèrent que
@@ -5276,12 +5405,17 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSlabVoidSource(P, Seed));
         OutStack.Add(MakeGridColumnMod(P, Seed));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 
     void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
-                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                                 bool bAppendStructuralPosts)
     {
         // ⚠️ LA PREUVE QUE L'ABSTRACTION EST RÉELLE, et elle vaut d'être dite : TROIS des cinq
         // opérateurs ci-dessous sont ceux de Maze, **repris sans une ligne de changement** —
@@ -5308,12 +5442,17 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
         OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
-                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                                 int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                                 bool bAppendStructuralPosts)
     {
         // ⚠️ ÉTAPES A + B + C1 — LA PILE EST COMPLÈTE POUR CET ARCHÉTYPE.
         // Portés : échelle verticale, roc de base, warp, graphe de salles (+ pits + cheminées),
@@ -5384,12 +5523,17 @@ namespace VoxelDensityOps
         // different SDF writer assembled by the composer.
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 
     void BuildFloatingIslandStack(FVoxelOpStack& OutStack, const FFloatingIslandParams& P,
-                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                                  bool bAppendStructuralPosts)
     {
         // ⚠️ LA PILE QUI S'INVERSE, et c'est la mesure que ce portage-ci ajoute : les quatre autres
         // archétypes partent de ROC et CREUSENT ; celui-ci part du VIDE et REMPLIT. Aucune des deux
@@ -5411,12 +5555,17 @@ namespace VoxelDensityOps
                                          P.SurfaceRoughness + BlendK + 2.0f));
         OutStack.Add(MakeSdfFill(BlendK, P.BaseDensity));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 
     void BuildMazeStack(FVoxelOpStack& OutStack, const FMazeGenerationParams& P,
-                        int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager)
+                        int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
+                        bool bAppendStructuralPosts)
     {
         // Les constantes viennent telles quelles de GetMazeDensity — elles y étaient codées en dur.
         constexpr float CarveBlend      = 2.0f;
@@ -5434,8 +5583,12 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, RoughFrequency, RoughOctaves, RoughApplyWithin));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
 
-        OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                                      P.BoundarySealThickness, P.BaseDensity, SpineRadius, StrateManager);
+        if (bAppendStructuralPosts)
+        {
+            OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                                          P.BoundarySealThickness, P.BaseDensity,
+                                          SpineRadius, StrateManager);
+        }
     }
 }
 
@@ -5876,7 +6029,8 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
                              const UVoxelStrateManager* StrateManager,
                              FVoxelOpStack& OutStack,
                              FVoxelOpContext& OutContext,
-                             FString* OutError)
+                             FString* OutError,
+                             bool bAppendStructuralPosts)
 {
     auto Fail = [&](const FString& Reason) -> bool
     {
@@ -5971,8 +6125,13 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
     OutContext.StrateBottomWorldZ = Bottom;
 
     // This is the only place a recipe can acquire world-law operators. There is no recipe field
-    // for posts, so a serialised manifest cannot forget them or reorder them.
-    Candidate.AppendStructuralPost(Top, Bottom, Seal, Base, SpineRadius, StrateManager);
+    // for posts, so a serialised manifest cannot forget them or reorder them. Lateral callers
+    // materialise this same creative recipe with posts disabled, then append the global post set
+    // to the parent stack below.
+    if (bAppendStructuralPosts)
+    {
+        Candidate.AppendStructuralPost(Top, Bottom, Seal, Base, SpineRadius, StrateManager);
+    }
 
     FString ValidationError;
     if (!Candidate.ValidateChannelOrder(&ValidationError))
@@ -5982,5 +6141,311 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
     }
 
     OutStack = MoveTemp(Candidate);
+    return true;
+}
+
+namespace
+{
+    static EVoxelStrateParamBlock VF_RegionParamBlock(ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber: return EVoxelStrateParamBlock::Slab;
+        case ECaveGeneratorType::Maze:            return EVoxelStrateParamBlock::Maze;
+        case ECaveGeneratorType::SurfaceWorld:   return EVoxelStrateParamBlock::Surface;
+        case ECaveGeneratorType::VerticalShafts: return EVoxelStrateParamBlock::VerticalShaft;
+        case ECaveGeneratorType::FloatingIslands:return EVoxelStrateParamBlock::FloatingIsland;
+        case ECaveGeneratorType::Underwater:
+        case ECaveGeneratorType::TunnelNetwork:
+        default:                                  return EVoxelStrateParamBlock::TunnelNetwork;
+        }
+    }
+
+    static float VF_RegionTop(const FVoxelStrateArchetypeParams& Params,
+                              EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.StrateTopWorldZ;
+        }
+    }
+
+    static float VF_RegionBottom(const FVoxelStrateArchetypeParams& Params,
+                                 EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.StrateBottomWorldZ;
+        }
+    }
+
+    static float VF_RegionSeal(const FVoxelStrateArchetypeParams& Params,
+                               EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.BoundarySealThickness;
+        }
+    }
+
+    static float VF_RegionBase(const FVoxelStrateArchetypeParams& Params,
+                               EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.BaseDensity;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.BaseDensity;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.BaseDensity;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.BaseDensity;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.BaseDensity;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.BaseDensity;
+        }
+    }
+
+    static bool VF_BuildNativeRegionCore(
+        const FVoxelStrateRegion& Region,
+        const FVoxelStrateArchetypeParams& Params,
+        float SpineRadius,
+        const UVoxelStrateManager* StrateManager,
+        bool bAppendStructuralPosts,
+        FVoxelOpStack& OutStack,
+        FVoxelOpContext& OutContext)
+    {
+        switch (Region.Archetype)
+        {
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            if (Params.SlabParams.StrateTopWorldZ - Params.SlabParams.StrateBottomWorldZ <= 0.0f)
+            {
+                return false;
+            }
+            OutContext.StrateTopWorldZ = Params.SlabParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.SlabParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildSlabStack(OutStack, Params.SlabParams, Region.Seed,
+                                            SpineRadius, StrateManager, bAppendStructuralPosts);
+            return true;
+        case ECaveGeneratorType::Maze:
+            if (Params.MazeParams.StrateTopWorldZ - Params.MazeParams.StrateBottomWorldZ <= 0.0f)
+            {
+                return false;
+            }
+            OutContext.StrateTopWorldZ = Params.MazeParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.MazeParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildMazeStack(OutStack, Params.MazeParams, Region.Seed,
+                                            SpineRadius, StrateManager, bAppendStructuralPosts);
+            return true;
+        case ECaveGeneratorType::SurfaceWorld:
+            if (Params.SurfaceParams.StrateTopWorldZ - Params.SurfaceParams.StrateBottomWorldZ <= 0.0f)
+            {
+                return false;
+            }
+            OutContext.StrateTopWorldZ = Params.SurfaceParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.SurfaceParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildSurfaceStack(
+                OutStack, Params.SurfaceParams, Region.Seed, SpineRadius, StrateManager,
+                TArray<FSurfaceGenerationParams>(), nullptr, bAppendStructuralPosts);
+            return true;
+        case ECaveGeneratorType::VerticalShafts:
+            if (Params.VerticalShaftParams.StrateTopWorldZ
+                - Params.VerticalShaftParams.StrateBottomWorldZ <= 0.0f)
+            {
+                return false;
+            }
+            OutContext.StrateTopWorldZ = Params.VerticalShaftParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.VerticalShaftParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildVerticalShaftStack(
+                OutStack, Params.VerticalShaftParams, Region.Seed,
+                SpineRadius, StrateManager, bAppendStructuralPosts);
+            return true;
+        case ECaveGeneratorType::FloatingIslands:
+            if (Params.FloatingIslandParams.StrateTopWorldZ
+                - Params.FloatingIslandParams.StrateBottomWorldZ <= 0.0f)
+            {
+                return false;
+            }
+            OutContext.StrateTopWorldZ = Params.FloatingIslandParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.FloatingIslandParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildFloatingIslandStack(
+                OutStack, Params.FloatingIslandParams, Region.Seed,
+                SpineRadius, StrateManager, bAppendStructuralPosts);
+            return true;
+        case ECaveGeneratorType::Underwater:
+        case ECaveGeneratorType::TunnelNetwork:
+            OutContext.StrateTopWorldZ = Params.TunnelNetworkParams.StrateTopWorldZ;
+            OutContext.StrateBottomWorldZ = Params.TunnelNetworkParams.StrateBottomWorldZ;
+            VoxelDensityOps::BuildTunnelNetworkStack(
+                OutStack, Params.TunnelNetworkParams, Region.Seed,
+                SpineRadius, StrateManager, bAppendStructuralPosts);
+            return true;
+        default:
+            return false;
+        }
+    }
+}
+
+bool VF_BuildStrateRegionStack(
+    const FVoxelStrateRegionManifest& Manifest,
+    float SpineRadius,
+    const UVoxelStrateManager* StrateManager,
+    FVoxelOpStack& OutStack,
+    FVoxelOpContext& OutContext,
+    FString* OutError)
+{
+    auto Fail = [&](const FString& Reason) -> bool
+    {
+        if (OutError != nullptr) { *OutError = Reason; }
+        return false;
+    };
+    if (OutError != nullptr) { OutError->Reset(); }
+    if (!Manifest.IsValid())
+    {
+        return Fail(Manifest.FailureReason.IsEmpty()
+            ? TEXT("lateral region manifest is invalid") : Manifest.FailureReason);
+    }
+    if (Manifest.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+            Manifest.Seed, Manifest.StrateIndex))
+    {
+        return Fail(TEXT("lateral region partition seed is stale for its seed/strate index"));
+    }
+
+    EVoxelStrateParamBlock GlobalBlock = Manifest.StructuralParamBlock;
+    if (GlobalBlock == EVoxelStrateParamBlock::None)
+    {
+        GlobalBlock = Manifest.Regions[0].bUsesRecipe
+            ? Manifest.Regions[0].Recipe.StructuralParamBlock
+            : VF_RegionParamBlock(Manifest.Regions[0].Archetype);
+    }
+
+    FVoxelStrateArchetypeParams FirstParams = Manifest.Regions[0].ArchetypeParams;
+    float Top = Manifest.bHasGlobalStructuralParams
+        ? Manifest.StrateTopWorldZ : VF_RegionTop(FirstParams, GlobalBlock);
+    float Bottom = Manifest.bHasGlobalStructuralParams
+        ? Manifest.StrateBottomWorldZ : VF_RegionBottom(FirstParams, GlobalBlock);
+    float Seal = Manifest.bHasGlobalStructuralParams
+        ? Manifest.BoundarySealThickness : VF_RegionSeal(FirstParams, GlobalBlock);
+    float Base = Manifest.bHasGlobalStructuralParams
+        ? Manifest.BaseDensity : VF_RegionBase(FirstParams, GlobalBlock);
+    if (!FMath::IsFinite(Top) || !FMath::IsFinite(Bottom) || !(Top > Bottom)
+        || !FMath::IsFinite(Seal) || Seal < 0.0f
+        || !FMath::IsFinite(Base) || !(Base > 0.0f))
+    {
+        return Fail(TEXT("lateral region structural parameters are not a finite positive strate"));
+    }
+
+    auto MakeRegionParams = [&](const FVoxelStrateRegion& Region)
+    {
+        FVoxelStrateArchetypeParams Params = Region.ArchetypeParams;
+        VF_SetStrateArchetypeRuntimeBounds(Params, Top, Bottom);
+        return Params;
+    };
+
+    // The one-region form remains a normal stack.  It is useful to callers that consume a region
+    // manifest, while production keeps its old branch entirely untouched for the hard identity
+    // gate.
+    if (Manifest.RegionCount == 1)
+    {
+        const FVoxelStrateRegion& Region = Manifest.Regions[0];
+        const FVoxelStrateArchetypeParams Params = MakeRegionParams(Region);
+        bool bBuilt = false;
+        if (Region.bUsesRecipe)
+        {
+            bBuilt = VF_BuildStackFromRecipe(Region.Recipe, Params, Region.Seed,
+                                              SpineRadius, StrateManager, OutStack,
+                                              OutContext, OutError, true);
+        }
+        else
+        {
+            OutContext = FVoxelOpContext();
+            OutContext.Seed = static_cast<uint32>(Region.Seed);
+            OutContext.LayoutVersion = StrateManager != nullptr
+                ? StrateManager->GetLayoutVersion() : 0;
+            bBuilt = VF_BuildNativeRegionCore(Region, Params, SpineRadius, StrateManager,
+                                              true, OutStack, OutContext);
+            if (!bBuilt && OutError != nullptr)
+            {
+                *OutError = TEXT("single lateral region native stack could not be materialised");
+            }
+        }
+        if (!bBuilt) { return false; }
+        OutContext.WorldRadiusVoxels = 0.0f;
+        OutContext.EdgeSealThickness = Seal;
+        return true;
+    }
+
+    TArray<FVoxelOpStack> RegionStacks;
+    RegionStacks.Reserve(Manifest.RegionCount);
+    for (const FVoxelStrateRegion& Region : Manifest.Regions)
+    {
+        const FVoxelStrateArchetypeParams Params = MakeRegionParams(Region);
+        FVoxelOpStack Core;
+        FVoxelOpContext CoreContext;
+        bool bBuilt = false;
+        if (Region.bUsesRecipe)
+        {
+            bBuilt = VF_BuildStackFromRecipe(Region.Recipe, Params, Region.Seed,
+                                              SpineRadius, StrateManager, Core,
+                                              CoreContext, OutError, false);
+        }
+        else
+        {
+            CoreContext = FVoxelOpContext();
+            CoreContext.Seed = static_cast<uint32>(Region.Seed);
+            CoreContext.LayoutVersion = StrateManager != nullptr
+                ? StrateManager->GetLayoutVersion() : 0;
+            bBuilt = VF_BuildNativeRegionCore(Region, Params, SpineRadius, StrateManager,
+                                              false, Core, CoreContext);
+            if (!bBuilt && OutError != nullptr)
+            {
+                *OutError = FString::Printf(TEXT("region %d native stack could not be materialised"),
+                                             Region.RegionIndex);
+            }
+        }
+        if (!bBuilt)
+        {
+            return false;
+        }
+        RegionStacks.Add(MoveTemp(Core));
+    }
+
+    FVoxelOpStack Parent;
+    Parent.Add(MakeUnique<FLateralRegionBlendOp>(Manifest, MoveTemp(RegionStacks)));
+    Parent.AppendStructuralPost(Top, Bottom, Seal, Base, SpineRadius, StrateManager);
+
+    FString ValidationError;
+    if (!Parent.ValidateChannelOrder(&ValidationError))
+    {
+        return Fail(FString::Printf(TEXT("lateral region parent failed ValidateChannelOrder: %s"),
+                                    *ValidationError));
+    }
+
+    OutContext = FVoxelOpContext();
+    OutContext.Seed = static_cast<uint32>(Manifest.Seed);
+    OutContext.LayoutVersion = StrateManager != nullptr
+        ? StrateManager->GetLayoutVersion() : 0;
+    OutContext.WorldRadiusVoxels = 0.0f;
+    OutContext.EdgeSealThickness = Seal;
+    OutContext.StrateTopWorldZ = Top;
+    OutContext.StrateBottomWorldZ = Bottom;
+    OutStack = MoveTemp(Parent);
     return true;
 }

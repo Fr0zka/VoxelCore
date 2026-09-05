@@ -22,6 +22,7 @@
 #include "VoxelStrateDefinition.h"
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelCaveMorphology.h"
 #include "VoxelTypes.h"
 
 #include <type_traits>
@@ -4361,6 +4362,358 @@ bool FVoxelStrateCorpus::SetMeasuredMetrics(
     return false;
 }
 
+void VF_SetStrateArchetypeRuntimeBounds(
+    FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ)
+{
+    Params.TunnelNetworkParams.StrateTopWorldZ = TopWorldZ;
+    Params.TunnelNetworkParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.SlabParams.StrateTopWorldZ = TopWorldZ;
+    Params.SlabParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.MazeParams.StrateTopWorldZ = TopWorldZ;
+    Params.MazeParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.SurfaceParams.StrateTopWorldZ = TopWorldZ;
+    Params.SurfaceParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.VerticalShaftParams.StrateTopWorldZ = TopWorldZ;
+    Params.VerticalShaftParams.StrateBottomWorldZ = BottomWorldZ;
+    Params.FloatingIslandParams.StrateTopWorldZ = TopWorldZ;
+    Params.FloatingIslandParams.StrateBottomWorldZ = BottomWorldZ;
+}
+
+namespace VoxelStrateRegionPrivate
+{
+    constexpr uint32 PartitionSalt = 0x5245474Eu;       // "REGN"
+    constexpr uint32 PositionSaltX = 0x584F4646u;        // "XOFF"
+    constexpr uint32 PositionSaltY = 0x594F4646u;        // "YOFF"
+    constexpr uint32 RegionSalt = 0x52494458u;           // "RIDX"
+
+    static int32 CellAt(float World, float CellSize)
+    {
+        return FMath::FloorToInt(World / CellSize);
+    }
+
+    static FVoxelStrateRegionSite MakeSite(int32 CellX, int32 CellY,
+                                           int32 InRegionCount, uint32 InPartitionSeed,
+                                           float CellSize)
+    {
+        FVoxelStrateRegionSite Site;
+        Site.CellX = CellX;
+        Site.CellY = CellY;
+
+        const uint32 H = VoxelHash::Cell(CellX, CellY, InPartitionSeed ^ PartitionSalt);
+        const float JitterX = VoxelHash::ToFloatSigned(
+            VoxelHash::Mix(H ^ PositionSaltX)) * 0.35f;
+        const float JitterY = VoxelHash::ToFloatSigned(
+            VoxelHash::Mix(H ^ PositionSaltY)) * 0.35f;
+        Site.WorldX = (static_cast<float>(CellX) + 0.5f + JitterX) * CellSize;
+        Site.WorldY = (static_cast<float>(CellY) + 0.5f + JitterY) * CellSize;
+
+        const uint32 RegionHash = VoxelHash::Cell(
+            CellX, CellY, InPartitionSeed ^ RegionSalt);
+        Site.Region = InRegionCount > 1
+            ? static_cast<int32>(RegionHash % static_cast<uint32>(InRegionCount)) : 0;
+        return Site;
+    }
+
+    static void GatherSites(float WorldX, float WorldY, int32 InRegionCount,
+                            uint32 InPartitionSeed, float CellSize,
+                            TArray<FVoxelStrateRegionSite>& OutSites)
+    {
+        OutSites.Reset();
+        if (!(CellSize > 0.0f) || !FMath::IsFinite(CellSize))
+        {
+            return;
+        }
+
+        const int32 CenterX = CellAt(WorldX, CellSize);
+        const int32 CenterY = CellAt(WorldY, CellSize);
+        OutSites.Reserve(25);
+        for (int32 DY = -2; DY <= 2; ++DY)
+        {
+            for (int32 DX = -2; DX <= 2; ++DX)
+            {
+                OutSites.Add(MakeSite(CenterX + DX, CenterY + DY,
+                                      InRegionCount, InPartitionSeed, CellSize));
+            }
+        }
+    }
+
+    static bool IsEarlierSite(const FVoxelStrateRegionSite& A,
+                              const FVoxelStrateRegionSite& B)
+    {
+        if (A.CellX != B.CellX) { return A.CellX < B.CellX; }
+        return A.CellY < B.CellY;
+    }
+
+    static FVoxelStrateRegionQuery QuerySites(
+        const TArray<FVoxelStrateRegionSite>& Sites, int32 InRegionCount,
+        float BlendWidth, float CellSize, float WorldX, float WorldY)
+    {
+        FVoxelStrateRegionQuery Result;
+        if (InRegionCount <= 1 || Sites.Num() == 0)
+        {
+            return Result;
+        }
+        Result.NearestDifferentRegionGap = 0.0f;
+        const int32 CenterCellX = CellAt(WorldX, CellSize);
+        const int32 CenterCellY = CellAt(WorldY, CellSize);
+
+        int32 PrimaryIndex = INDEX_NONE;
+        int32 NeighborIndex = INDEX_NONE;
+        float PrimaryDistanceSq = FLT_MAX;
+        float NeighborDistanceSq = FLT_MAX;
+        for (int32 Index = 0; Index < Sites.Num(); ++Index)
+        {
+            const FVoxelStrateRegionSite& Site = Sites[Index];
+            if (FMath::Abs(Site.CellX - CenterCellX) > 2
+                || FMath::Abs(Site.CellY - CenterCellY) > 2)
+            {
+                continue;
+            }
+            const float DX = WorldX - Site.WorldX;
+            const float DY = WorldY - Site.WorldY;
+            const float DistanceSq = DX * DX + DY * DY;
+            if (PrimaryIndex == INDEX_NONE
+                || DistanceSq < PrimaryDistanceSq
+                || (DistanceSq == PrimaryDistanceSq
+                    && IsEarlierSite(Site, Sites[PrimaryIndex])))
+            {
+                PrimaryIndex = Index;
+                PrimaryDistanceSq = DistanceSq;
+            }
+        }
+
+        const int32 PrimaryRegion = Sites[PrimaryIndex].Region;
+        for (int32 Index = 0; Index < Sites.Num(); ++Index)
+        {
+            if (FMath::Abs(Sites[Index].CellX - CenterCellX) > 2
+                || FMath::Abs(Sites[Index].CellY - CenterCellY) > 2)
+            {
+                continue;
+            }
+            if (Sites[Index].Region == PrimaryRegion) { continue; }
+            const float DX = WorldX - Sites[Index].WorldX;
+            const float DY = WorldY - Sites[Index].WorldY;
+            const float DistanceSq = DX * DX + DY * DY;
+            if (NeighborIndex == INDEX_NONE
+                || DistanceSq < NeighborDistanceSq
+                || (DistanceSq == NeighborDistanceSq
+                    && IsEarlierSite(Sites[Index], Sites[NeighborIndex])))
+            {
+                NeighborIndex = Index;
+                NeighborDistanceSq = DistanceSq;
+            }
+        }
+
+        Result.PrimaryRegion = PrimaryRegion;
+        if (NeighborIndex == INDEX_NONE)
+        {
+            return Result;
+        }
+
+        const float NeighborDistance = FMath::Sqrt(FMath::Max(NeighborDistanceSq, 0.0f));
+        const float Gap = FMath::Max(
+            NeighborDistance
+                - FMath::Sqrt(FMath::Max(PrimaryDistanceSq, 0.0f)), 0.0f);
+        Result.NeighborRegion = Sites[NeighborIndex].Region;
+        Result.NearestDifferentRegionGap = Gap;
+
+        // A site outside the ±2-cell window is at least 2.15 cell lengths from a point in the
+        // center cell (site jitter is bounded to ±0.35 around the cell midpoint).  A candidate
+        // within 2.0 cell lengths is therefore known to beat every omitted site.  Otherwise the
+        // density path can conservatively use the candidate/zero weight, but box proof must not
+        // treat the local window as an infinite search.
+        Result.bNearestDifferentRegionKnown = FMath::IsFinite(CellSize)
+            && CellSize > 0.0f
+            && NeighborDistance <= 2.0f * CellSize;
+
+        if (!(BlendWidth > 0.0f))
+        {
+            return Result;
+        }
+
+        // The vertical transition is linear from 0 at the outer edge to 1 at the boundary.  A
+        // Voronoi boundary is shared by two regions, so the same curve is split symmetrically:
+        // each side contributes 0.5 at the bisector and 0 outside the band.
+        const float Curve = FMath::Clamp(1.0f - Gap / BlendWidth, 0.0f, 1.0f);
+        Result.NeighborWeight = 0.5f * Curve;
+        Result.bInBlendBand = Result.NeighborWeight > 0.0f;
+        return Result;
+    }
+
+    static FVoxelStrateRegionQuery QueryWithGather(
+        float WorldX, float WorldY, int32 InRegionCount, uint32 InPartitionSeed,
+        float CellSize, float BlendWidth)
+    {
+        TArray<FVoxelStrateRegionSite> Sites;
+        GatherSites(WorldX, WorldY, InRegionCount, InPartitionSeed, CellSize, Sites);
+        return QuerySites(Sites, InRegionCount, BlendWidth, CellSize, WorldX, WorldY);
+    }
+}
+
+int32 VF_RollStrateRegionCount(int32 Seed, int32 StrateIndex)
+{
+    return 1 + static_cast<int32>(VoxelHash::Cell(
+        StrateIndex, StrateIndex ^ 0x6D, static_cast<uint32>(Seed) ^ 0x524F4C4Cu) % 3u);
+}
+
+uint32 VF_GetStrateRegionPartitionSeed(int32 Seed, int32 StrateIndex)
+{
+    return VoxelHash::Cell(StrateIndex, StrateIndex ^ 0x6D,
+                           static_cast<uint32>(Seed) ^ 0x52454750u);
+}
+
+void VF_RekeyStrateRegionManifest(
+    FVoxelStrateRegionManifest& Manifest, int32 InSeed, int32 InStrateIndex)
+{
+    Manifest.Seed = InSeed;
+    Manifest.StrateIndex = InStrateIndex;
+    Manifest.PartitionSeed = VF_GetStrateRegionPartitionSeed(InSeed, InStrateIndex);
+}
+
+FVoxelStrateRegionQuery VF_QueryStrateRegion(
+    const FVoxelStrateRegionManifest& Manifest, float WorldX, float WorldY)
+{
+    // The retained seed is an offline artifact, not an alternate identity. Reject a stale or
+    // hand-edited partition key instead of silently evaluating a different world for the same
+    // (seed, strate-index) pair.
+    if (!Manifest.IsValid()
+        || Manifest.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+            Manifest.Seed, Manifest.StrateIndex))
+    {
+        return FVoxelStrateRegionQuery();
+    }
+    return VoxelStrateRegionPrivate::QueryWithGather(
+        WorldX, WorldY, Manifest.RegionCount, Manifest.PartitionSeed,
+        Manifest.LatticeCellSize, Manifest.BlendWidth);
+}
+
+void FVoxelStrateRegionPartitionCache::PrepareForChunk(
+    const FVoxelStrateRegionManifest& Manifest, const FIntVector& ChunkCoord)
+{
+    RegionCount = Manifest.RegionCount;
+    PartitionSeed = Manifest.PartitionSeed;
+    LatticeCellSize = Manifest.LatticeCellSize;
+    BlendWidth = Manifest.BlendWidth;
+    BaseX = ChunkCoord.X * CHUNK_SIZE - 1;
+    BaseY = ChunkCoord.Y * CHUNK_SIZE - 1;
+    Dim = CHUNK_SIZE + 3;
+    Sites.Reset();
+    IntegerSamples.Reset();
+
+    if (!Manifest.IsValid()
+        || Manifest.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+            Manifest.Seed, Manifest.StrateIndex))
+    {
+        RegionCount = 1;
+        Dim = 0;
+        return;
+    }
+
+    const int32 MinCellX = VoxelStrateRegionPrivate::CellAt(
+        static_cast<float>(BaseX), LatticeCellSize) - 2;
+    const int32 MaxCellX = VoxelStrateRegionPrivate::CellAt(
+        static_cast<float>(BaseX + Dim - 1), LatticeCellSize) + 2;
+    const int32 MinCellY = VoxelStrateRegionPrivate::CellAt(
+        static_cast<float>(BaseY), LatticeCellSize) - 2;
+    const int32 MaxCellY = VoxelStrateRegionPrivate::CellAt(
+        static_cast<float>(BaseY + Dim - 1), LatticeCellSize) + 2;
+    Sites.Reserve((MaxCellX - MinCellX + 1) * (MaxCellY - MinCellY + 1));
+    for (int32 CY = MinCellY; CY <= MaxCellY; ++CY)
+    {
+        for (int32 CX = MinCellX; CX <= MaxCellX; ++CX)
+        {
+            Sites.Add(VoxelStrateRegionPrivate::MakeSite(
+                CX, CY, RegionCount, PartitionSeed, LatticeCellSize));
+        }
+    }
+
+    IntegerSamples.SetNum(Dim * Dim);
+    for (int32 Y = 0; Y < Dim; ++Y)
+    {
+        for (int32 X = 0; X < Dim; ++X)
+        {
+            IntegerSamples[Y * Dim + X] = VoxelStrateRegionPrivate::QuerySites(
+                Sites, RegionCount, BlendWidth, LatticeCellSize,
+                static_cast<float>(BaseX + X), static_cast<float>(BaseY + Y));
+        }
+    }
+}
+
+FVoxelStrateRegionQuery FVoxelStrateRegionPartitionCache::Query(
+    float WorldX, float WorldY) const
+{
+    if (Dim > 0
+        && WorldX == FMath::FloorToFloat(WorldX)
+        && WorldY == FMath::FloorToFloat(WorldY))
+    {
+        const int32 IX = FMath::FloorToInt(WorldX);
+        const int32 IY = FMath::FloorToInt(WorldY);
+        const int32 LocalX = IX - BaseX;
+        const int32 LocalY = IY - BaseY;
+        if (LocalX >= 0 && LocalX < Dim && LocalY >= 0 && LocalY < Dim)
+        {
+            return IntegerSamples[LocalY * Dim + LocalX];
+        }
+    }
+
+    // The production stack is prepared for the current chunk before its first sample.  Reuse the
+    // prepared local site set for the rare fractional probe as well; rebuilding a lattice window
+    // here would turn a cache miss into a per-voxel allocation/hash walk.  The prepared set has a
+    // one-voxel halo, which covers the mesher's gradient probes.  The pure public query remains the
+    // fallback for an intentionally out-of-window diagnostic call.
+    const float PreparedMaxX = static_cast<float>(BaseX + Dim - 1);
+    const float PreparedMaxY = static_cast<float>(BaseY + Dim - 1);
+    if (Sites.Num() > 0 && Dim > 0
+        && WorldX >= static_cast<float>(BaseX) && WorldX <= PreparedMaxX
+        && WorldY >= static_cast<float>(BaseY) && WorldY <= PreparedMaxY)
+    {
+        return VoxelStrateRegionPrivate::QuerySites(
+            Sites, RegionCount, BlendWidth, LatticeCellSize, WorldX, WorldY);
+    }
+    return VoxelStrateRegionPrivate::QueryWithGather(
+        WorldX, WorldY, RegionCount, PartitionSeed,
+        LatticeCellSize, BlendWidth);
+}
+
+FVoxelStrateRegionBoxProof VF_AnalyzeStrateRegionBox(
+    const FVoxelStrateRegionManifest& Manifest, const FBox& VoxelBox)
+{
+    FVoxelStrateRegionBoxProof Proof;
+    if (!Manifest.IsValid()
+        || Manifest.PartitionSeed != VF_GetStrateRegionPartitionSeed(
+            Manifest.Seed, Manifest.StrateIndex))
+    {
+        return Proof;
+    }
+    if (Manifest.RegionCount <= 1)
+    {
+        Proof.bProvablySingleRegion = true;
+        Proof.bTouchesRegionBoundary = false;
+        Proof.bTouchesBlendBand = false;
+        return Proof;
+    }
+
+    const float HalfX = FMath::Max((float)(VoxelBox.Max.X - VoxelBox.Min.X) * 0.5f, 0.0f);
+    const float HalfY = FMath::Max((float)(VoxelBox.Max.Y - VoxelBox.Min.Y) * 0.5f, 0.0f);
+    const float Radius = FMath::Sqrt(HalfX * HalfX + HalfY * HalfY);
+    const float CenterX = ((float)VoxelBox.Min.X + (float)VoxelBox.Max.X) * 0.5f;
+    const float CenterY = ((float)VoxelBox.Min.Y + (float)VoxelBox.Max.Y) * 0.5f;
+    const FVoxelStrateRegionQuery Center = VF_QueryStrateRegion(Manifest, CenterX, CenterY);
+    if (!Center.bNearestDifferentRegionKnown)
+    {
+        return Proof;
+    }
+    const float GapLowerBound = Center.NearestDifferentRegionGap - 2.0f * Radius;
+
+    // The difference of two Euclidean distances is 2-Lipschitz.  Strict inequalities are
+    // intentional: an equality may put a sample exactly on a bisector or at the blend cutoff,
+    // and that is not a proof a mesher is allowed to skip.
+    Proof.bTouchesRegionBoundary = !(GapLowerBound > 0.0f);
+    Proof.bTouchesBlendBand = !(GapLowerBound > Manifest.BlendWidth);
+    Proof.bProvablySingleRegion = GapLowerBound > Manifest.BlendWidth;
+    return Proof;
+}
+
 FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpus,
                                                  int32 Seed, int32 Index)
 {
@@ -4831,6 +5184,246 @@ FVoxelOpStackRecipe VF_RollStrateStructure(int32 Seed, int32 Index)
     return Recipe;
 }
 
+namespace VoxelStrateRegionPrivate
+{
+    static ECaveGeneratorType ArchetypeForRecipe(const FVoxelOpStackRecipe& Recipe)
+    {
+        switch (Recipe.StructuralParamBlock)
+        {
+        case EVoxelStrateParamBlock::TunnelNetwork: return ECaveGeneratorType::TunnelNetwork;
+        case EVoxelStrateParamBlock::Slab:           return ECaveGeneratorType::FlatPlain;
+        case EVoxelStrateParamBlock::Maze:           return ECaveGeneratorType::Maze;
+        case EVoxelStrateParamBlock::Surface:        return ECaveGeneratorType::SurfaceWorld;
+        case EVoxelStrateParamBlock::VerticalShaft:  return ECaveGeneratorType::VerticalShafts;
+        case EVoxelStrateParamBlock::FloatingIsland: return ECaveGeneratorType::FloatingIslands;
+        default:                                     return ECaveGeneratorType::TunnelNetwork;
+        }
+    }
+
+    static EVoxelStrateParamBlock ParamBlockForArchetype(ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber: return EVoxelStrateParamBlock::Slab;
+        case ECaveGeneratorType::Maze:            return EVoxelStrateParamBlock::Maze;
+        case ECaveGeneratorType::SurfaceWorld:   return EVoxelStrateParamBlock::Surface;
+        case ECaveGeneratorType::VerticalShafts: return EVoxelStrateParamBlock::VerticalShaft;
+        case ECaveGeneratorType::FloatingIslands:return EVoxelStrateParamBlock::FloatingIsland;
+        case ECaveGeneratorType::Underwater:
+        case ECaveGeneratorType::TunnelNetwork:
+        default:                                  return EVoxelStrateParamBlock::TunnelNetwork;
+        }
+    }
+
+    static void CopyParamBlock(FVoxelStrateArchetypeParams& OutParams,
+                               const FVoxelStrateRollInfo& Roll,
+                               ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            OutParams.TunnelNetworkParams = Roll.ArchetypeParams.TunnelNetworkParams;
+            break;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            OutParams.SlabParams = Roll.ArchetypeParams.SlabParams;
+            break;
+        case ECaveGeneratorType::Maze:
+            OutParams.MazeParams = Roll.ArchetypeParams.MazeParams;
+            break;
+        case ECaveGeneratorType::SurfaceWorld:
+            OutParams.SurfaceParams = Roll.ArchetypeParams.SurfaceParams;
+            break;
+        case ECaveGeneratorType::VerticalShafts:
+            OutParams.VerticalShaftParams = Roll.ArchetypeParams.VerticalShaftParams;
+            break;
+        case ECaveGeneratorType::FloatingIslands:
+            OutParams.FloatingIslandParams = Roll.ArchetypeParams.FloatingIslandParams;
+            break;
+        default:
+            break;
+        }
+    }
+
+    static float BoundarySeal(const FVoxelStrateArchetypeParams& Params,
+                              EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.BoundarySealThickness;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.BoundarySealThickness;
+        }
+    }
+
+    static float BaseDensity(const FVoxelStrateArchetypeParams& Params,
+                             EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.BaseDensity;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.BaseDensity;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.BaseDensity;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.BaseDensity;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.BaseDensity;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.BaseDensity;
+        }
+    }
+
+    static float Top(const FVoxelStrateArchetypeParams& Params,
+                     EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.StrateTopWorldZ;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.StrateTopWorldZ;
+        }
+    }
+
+    static float Bottom(const FVoxelStrateArchetypeParams& Params,
+                        EVoxelStrateParamBlock Block)
+    {
+        switch (Block)
+        {
+        case EVoxelStrateParamBlock::Slab:           return Params.SlabParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Maze:           return Params.MazeParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::Surface:        return Params.SurfaceParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::VerticalShaft:  return Params.VerticalShaftParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::FloatingIsland: return Params.FloatingIslandParams.StrateBottomWorldZ;
+        case EVoxelStrateParamBlock::TunnelNetwork:
+        default:                                     return Params.TunnelNetworkParams.StrateBottomWorldZ;
+        }
+    }
+}
+
+bool VF_LateralRegionsAreShippable()
+{
+    // ⛔ FALSE ON PURPOSE. See the declaration in VoxelStrateComposer.h for the full reasoning.
+    //
+    // FR : volontairement désactivé — la loi primordiale ne tient pas encore au travers d'une
+    // couture entre régions (9/16 graines mesurées le 2026-09-05).
+    //
+    // Measured: arrival -> departure across a region seam passes 9/16 seeds. A strate that mixes
+    // archetypes but strands the player at the boundary is worse than one that does not mix.
+    // Flipping this without an explicit cross-seam corridor contract turns the suite red by design.
+    return false;
+}
+
+FVoxelStrateRegionManifest VF_RollStrateRegionManifest(
+    const FVoxelStrateCorpus& Corpus, int32 Seed, int32 StrateIndex, bool bRollStructure)
+{
+    FVoxelStrateRegionManifest Manifest;
+    Manifest.RegionCount = VF_RollStrateRegionCount(Seed, StrateIndex);
+    VF_RekeyStrateRegionManifest(Manifest, Seed, StrateIndex);
+    Manifest.Regions.Reserve(Manifest.RegionCount);
+    Manifest.bValid = true;
+
+    static const ECaveGeneratorType StructureBlocks[] =
+    {
+        ECaveGeneratorType::TunnelNetwork,
+        ECaveGeneratorType::FlatPlain,
+        ECaveGeneratorType::Maze,
+        ECaveGeneratorType::SurfaceWorld,
+        ECaveGeneratorType::VerticalShafts,
+        ECaveGeneratorType::FloatingIslands,
+    };
+    static const EVoxelStrateParamBlock BlockIds[] =
+    {
+        EVoxelStrateParamBlock::TunnelNetwork,
+        EVoxelStrateParamBlock::Slab,
+        EVoxelStrateParamBlock::Maze,
+        EVoxelStrateParamBlock::Surface,
+        EVoxelStrateParamBlock::VerticalShaft,
+        EVoxelStrateParamBlock::FloatingIsland,
+    };
+    static const uint32 BlockSalts[] = { 0x1001u, 0x1003u, 0x1005u,
+                                        0x1007u, 0x1009u, 0x100Bu };
+
+    for (int32 RegionIndex = 0; RegionIndex < Manifest.RegionCount; ++RegionIndex)
+    {
+        FVoxelStrateRegion& Region = Manifest.Regions.AddDefaulted_GetRef();
+        Region.RegionIndex = RegionIndex;
+        Region.Seed = RegionIndex == 0
+            ? Seed
+            : static_cast<int32>(VoxelHash::Cell(
+                StrateIndex, RegionIndex, static_cast<uint32>(Seed) ^ 0x52454753u));
+        Region.bUsesRecipe = bRollStructure;
+
+        if (!bRollStructure)
+        {
+            const FVoxelStrateRollInfo Roll = VF_RollStrateParamsDetailed(
+                Corpus, Region.Seed, StrateIndex);
+            if (!Roll.bValid)
+            {
+                Manifest.bValid = false;
+                if (Manifest.FailureReason.IsEmpty())
+                {
+                    Manifest.FailureReason = Roll.FailureReason;
+                }
+                continue;
+            }
+            Region.Archetype = Roll.Archetype;
+            Region.ArchetypeParams = Roll.ArchetypeParams;
+        }
+        else
+        {
+            Region.Recipe = VF_RollStrateStructure(Region.Seed, StrateIndex);
+            Region.Archetype = VoxelStrateRegionPrivate::ArchetypeForRecipe(Region.Recipe);
+            for (int32 BlockIndex = 0; BlockIndex < UE_ARRAY_COUNT(StructureBlocks); ++BlockIndex)
+            {
+                const FVoxelStrateRollInfo Roll = VF_RollStrateParamsDetailedForArchetype(
+                    Corpus, StructureBlocks[BlockIndex],
+                    Region.Seed ^ static_cast<int32>(BlockSalts[BlockIndex]), StrateIndex);
+                if (!Roll.bValid)
+                {
+                    Manifest.bValid = false;
+                    if (Manifest.FailureReason.IsEmpty())
+                    {
+                        Manifest.FailureReason = Roll.FailureReason;
+                    }
+                    continue;
+                }
+                VoxelStrateRegionPrivate::CopyParamBlock(
+                    Region.ArchetypeParams, Roll, StructureBlocks[BlockIndex]);
+            }
+        }
+    }
+
+    if (Manifest.Regions.Num() == Manifest.RegionCount && Manifest.RegionCount > 0)
+    {
+        const FVoxelStrateRegion& First = Manifest.Regions[0];
+        Manifest.StructuralParamBlock = bRollStructure
+            ? First.Recipe.StructuralParamBlock
+            : VoxelStrateRegionPrivate::ParamBlockForArchetype(First.Archetype);
+        Manifest.StrateTopWorldZ = VoxelStrateRegionPrivate::Top(
+            First.ArchetypeParams, Manifest.StructuralParamBlock);
+        Manifest.StrateBottomWorldZ = VoxelStrateRegionPrivate::Bottom(
+            First.ArchetypeParams, Manifest.StructuralParamBlock);
+        Manifest.BoundarySealThickness = VoxelStrateRegionPrivate::BoundarySeal(
+            First.ArchetypeParams, Manifest.StructuralParamBlock);
+        Manifest.BaseDensity = VoxelStrateRegionPrivate::BaseDensity(
+            First.ArchetypeParams, Manifest.StructuralParamBlock);
+        Manifest.bHasGlobalStructuralParams = FMath::IsFinite(Manifest.StrateTopWorldZ)
+            && FMath::IsFinite(Manifest.StrateBottomWorldZ)
+            && Manifest.StrateTopWorldZ > Manifest.StrateBottomWorldZ
+            && FMath::IsFinite(Manifest.BoundarySealThickness)
+            && FMath::IsFinite(Manifest.BaseDensity);
+    }
+    return Manifest;
+}
+
 #if WITH_EDITOR
 namespace
 {
@@ -4919,6 +5512,13 @@ FVoxelStrateComposerCandidate VF_RollStrateCandidate(
 
         Candidate.Archetype = Candidate.ParameterRoll.Archetype;
         Candidate.ArchetypeParams = Candidate.ParameterRoll.ArchetypeParams;
+        Candidate.Regions = VF_RollStrateRegionManifest(Corpus, Seed, Index, false);
+        if (!Candidate.Regions.IsValid())
+        {
+            Candidate.FailureReason = Candidate.Regions.FailureReason.IsEmpty()
+                ? TEXT("lateral region roll failed") : Candidate.Regions.FailureReason;
+            return Candidate;
+        }
         Candidate.bValid = true;
         return Candidate;
     }
@@ -4951,7 +5551,13 @@ FVoxelStrateComposerCandidate VF_RollStrateCandidate(
         VF_CopyComposerBlock(Candidate.ArchetypeParams, Roll, Spec.Archetype);
     }
 
-    Candidate.bValid = bAllBlocksValid;
+    Candidate.Regions = VF_RollStrateRegionManifest(Corpus, Seed, Index, true);
+    if (!Candidate.Regions.IsValid() && Candidate.FailureReason.IsEmpty())
+    {
+        Candidate.FailureReason = Candidate.Regions.FailureReason.IsEmpty()
+            ? TEXT("lateral region roll failed") : Candidate.Regions.FailureReason;
+    }
+    Candidate.bValid = bAllBlocksValid && Candidate.Regions.IsValid();
     return Candidate;
 }
 

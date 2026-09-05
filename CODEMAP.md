@@ -173,6 +173,22 @@ bit. They are port-correctness oracles, not fidelity checks: the acceptance bar 
 | `VoxelDensityOps::BuildFloatingIslandStack` | — | 8 ops, and **the stack runs backwards**: void source + fill instead of rock source + carve, using the *same* classes with the opposite sign. Only the blob source is new. Reuse by **inversion** — a stronger result than reuse by identity, since it says the abstract axis (the density sign) is the right one. |
 | `VoxelDensityOps::BuildMazeStack` | — | The 8-op Maze stack (4 structural posts included). If this ever becomes one op, the refactor failed its own test (§2.5). Callers must skip it on a **degenerate strate** (top−bottom ≤ 0): `GetMazeDensity` early-outs to air there and the stack has no such early-out by design — `GetDensityAt` falls back to the `switch`. |
 
+#### Lateral region parent (Tier 4d)
+
+`VF_RollStrateRegionManifest` rolls a deterministic count of 1–3 regions and gives each region its
+own native parameter vector and, for structure candidates, its own recipe. `VF_QueryStrateRegion`
+assigns XY through jittered `VoxelHash::Cell` sites on a 256-voxel lattice; the pure query is keyed
+by `(WorldXY, Seed, StrateIndex)` and the worker-side `FVoxelStrateRegionPartitionCache` prepares
+the site window and integer query grid once per chunk. `FLateralRegionBlendOp` evaluates the primary
+region core and, inside a 24-voxel band, the nearest different-region core, then lerps **density**
+(not native parameters). The four structural posts are appended once to the parent after the
+blend. Count==1 uses the ordinary one-stack path and is covered by native and recipe bit-identity
+oracles. `ClassifyBox` proves a single-region/non-band box only from a conservative Lipschitz gap
+bound; otherwise it folds every region and returns `Mixed` on any disagreement or unknown. The
+runtime/editor override reads the immutable manifest per chunk; it never searches lattice seeds per
+voxel. The dedicated `VoxelForge.Composer.LateralRegions` test reports cross-boundary brute-force
+box samples, interior-vs-band timing, 16 opposite-region passage-mouth trials, and a saved preview.
+
 ### 3.2e Height-space operators — `Public/VoxelHeightOp.h` + `Private/VoxelHeightOpStack.cpp`
 ⚠️ **Feeds nothing yet** — built and exercised only by `VoxelForge.OpStack.SurfaceHeightEquivalence`.
 **A SECOND op family, and it exists for a reason worth knowing:** SurfaceWorld's terrain ops (cliff /

@@ -32,12 +32,53 @@ negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated aft
 the global rim cannot be reopened by a post-process; the diff layer remains the explicit player
 override.
 StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/FloatingIslandParamsForChunk`
-(macro `VF_ARCHETYPE_PARAMS_GETTER`) — no cross-boundary blend (Hard transitions between archetypes).
+(macro `VF_ARCHETYPE_PARAMS_GETTER`) — the ordinary authored path has no cross-boundary blend
+(Hard transitions between strates). The offline composer’s lateral manifest is the explicit
+within-strate exception described in §8.1a; it blends evaluated density fields, not these params.
 On top of the archetype, an optional **biome** layer (§8.14) modulates terrain & content WITHIN a
 strate via a window-invariant XY field — currently wired into SurfaceWorld.
 
-⚠️ **The `switch` above is no longer the only density path.** 6 of the 8 archetypes (all but
-TunnelNetwork and Underwater) also exist as **operator stacks**, selected per strate by
+### 8.1a Lateral regions (Tier 4d)
+
+An archetype is now allowed to be a **spatial region inside one strate**, rather than a label that
+describes the whole strate. The offline composer rolls one to three region records. Each record
+owns its own native parameter vector and, for structure candidates, its own recipe; region zero is
+also retained as the compatibility identity. A one-region record takes the existing stack path.
+
+The partition is a pure function of `(world XY, world seed, absolute strate index)`. A 256-voxel
+hash lattice places jittered sites (`VoxelHash::Cell`), each site receives a deterministic region
+id, and the nearest-site assignment is Voronoi-like. Near a bisector, the nearest different-region
+site supplies the neighbour; its weight is the same linear boundary curve used by the vertical
+transition, split symmetrically so both sides meet at 0.5. The parent lerps the two **evaluated
+internal densities**, never their parameter vectors: a shaft spacing and a slab parameter are not
+commensurable. Internal density is positive solid; the parent is negated once at the MC boundary.
+
+Region cores are built without structural posts. `FLateralRegionBlendOp` resolves the creative
+field, then one parent appends the global spine, vertical seal, passage carve, and XY edge seal in
+the existing fixed order. No region can disable or duplicate those posts. The manifest is an
+offline artifact and the editor hand-off copies it into a worker-local per-chunk cache: the chunk
+prepares a small lattice-site window plus an integer XY query grid, so ordinary voxel evaluation is
+an O(1) lookup rather than a seed search or allocation. Fractional gradient probes reuse the same
+prepared site window.
+
+The lateral `ClassifyBox` proof is deliberately one-sided. It uses a certified nearest-different
+site from the bounded local lattice window plus a 2-Lipschitz bound over the box's XY radius; only
+a strict lower bound greater than the blend width proves that one region and no blend band can touch
+the box. If the bounded query cannot certify that neighbor, proof is refused. Every other box asks
+every region stack; any `Mixed`, disagreement, or unknown result remains `Mixed`. Convex density blending means
+that equal all-air/all-solid signs are safe, but no cross-region uniformity is inferred from a
+single sample. The same key is checked when a season manifest is loaded, and `WorldRadiusVoxels`
+remains zero during offline materialisation.
+
+This mechanism is implemented and instrumented, but not ready to promote: the seam-specific
+16-seed passage-mouth audit currently reports **9/16** connected opposite-region pairs, while the
+exact region-zero controls report **11/16**. The same cases are **16/16 valid, non-vacuous, and
+above the 0.50 largest-component survival threshold** before the law gate. No corridor or
+threshold tuning was added. The failed primordial-law gate is therefore retained as a design
+blocker; see `COMPOSER-NOTES.md §3.2b` and the validation log in §10.
+
+⚠️ **The `switch` above is no longer the only density path.** All 8 archetypes also exist as
+**operator stacks**, selected per strate by
 `bUseOperatorStack` and evaluated instead of the `switch`; each is bit-identical to the function in
 its row. The design lives in `OPSTACK-PLAN.md` / `OPSTACK-DECOMPOSITION.md`, the symbol index in
 `CODEMAP §3.2d` — not repeated here. What matters for *this* document: the archetype table describes
@@ -392,6 +433,13 @@ driven by `EditorBrush*` props.
   the stack entry. `ValidateChannelOrder` is assembly/diagnostic-only; no declaration virtual may
   enter `Eval`'s per-voxel loop. If `FVoxelOpSample` gains a field, add its channel bit and update
   every operator declaration and the validator together.
+- **Lateral region lookup/blend** (§8.1a): `FVoxelStrateRegionPartitionCache::PrepareForChunk`
+  builds the bounded jittered-site window and a `(CHUNK_SIZE+3)^2` integer query grid once per
+  chunk. Integer voxel samples read that grid; fractional gradient probes use the prepared site
+  window. `FLateralRegionBlendOp` evaluates one creative stack in a region interior and a second
+  only when the cached gap enters the blend band. The parent appends the four global structural
+  posts once. Do not move `VoxelHash` site gathering, `TArray` construction, or region-stack
+  discovery into `Eval`; the measured band overhead is an explicit Tier 4d budget item.
 - **Isolated box proofs** (`FVoxelBoxHypotheses` + `FVoxelBoxSdfInterval`): the box fold carries
   the SDF interval produced so far. An SDF-only source publishes only its own interval; a later
   converter or detail op applies its own state-aware response. Unknown or invalid bounds force the
