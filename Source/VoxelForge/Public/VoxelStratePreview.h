@@ -71,6 +71,13 @@ struct VOXELFORGE_API FVoxelStrateFinePreviewSettings
 struct VOXELFORGE_API FVoxelStratePreviewCandidate
 {
     int32 CandidateIndex = INDEX_NONE;
+    // Showcase cards carry their archetype and the exact editor hand-off values. Ordinary
+    // contact-sheet callers may leave these unset and retain the legacy candidate heading.
+    FString ArchetypeName;
+    bool bShowcaseCard = false;
+    int32 ComposerSeed = INDEX_NONE;
+    int32 ComposerTargetStrateIndex = INDEX_NONE;
+    bool bComposerRollStructure = false;
     // Season pages deliberately opt into descent order. The ordinary candidate contact sheet
     // keeps its survivor/outlier ordering; a season review must read top-to-bottom like play.
     bool bSeasonOrder = false;
@@ -110,6 +117,11 @@ struct VOXELFORGE_API FVoxelStratePreviewCandidate
     float AirFraction = 0.0f;
     float LargestComponentShare = 0.0f;
     float WalkableFraction = 0.0f;
+    int64 WalkableFloorColumns = 0;
+    float WalkableFloorAreaFraction = 0.0f;
+    int32 NumWalkableSurfaceComponents = 0;
+    int64 LargestWalkableSurfaceColumns = 0;
+    float LargestWalkableSurfaceShare = 0.0f;
     float MedianFeatureScale = 0.0f;
     int32 MedianVerticalClearance = 0;
     double DistanceFromCorpusCentroid = 0.0;
@@ -133,6 +145,21 @@ struct VOXELFORGE_API FVoxelStratePreviewCandidate
     int32 FinePlanSliceWorldZ = 0;
     int32 FinePlanImageWidth = 0;
     int32 FinePlanImageHeight = 0;
+};
+
+/** Aggregate Part A row for a stable archetype-level review table. */
+struct VOXELFORGE_API FVoxelStratePreviewArchetypeSummary
+{
+    FString ArchetypeName;
+    int32 EvaluatedCandidates = 0;
+    int32 HardGateSurvivors = 0;
+    FVoxelStratePreviewWindow Window;
+    FString WindowSummary;
+
+    FString WalkableFractionSummary;
+    FString WalkableFloorAreaSummary;
+    FString MedianVerticalClearanceSummary;
+    FString LargestWalkableSurfaceSummary;
 };
 
 /** Copy the exact measurement-window metadata needed by the index page. */
@@ -184,4 +211,5 @@ VOXELFORGE_API bool VF_WriteStratePreviewIndex(
     const FVoxelStratePreviewWindow& Window,
     const TArray<FVoxelStratePreviewCandidate>& Candidates,
     FString& OutIndexPath,
-    FString& OutError);
+    FString& OutError,
+    const TArray<FVoxelStratePreviewArchetypeSummary>* ArchetypeSummaries = nullptr);

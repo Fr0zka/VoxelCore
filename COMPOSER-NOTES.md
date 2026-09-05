@@ -840,6 +840,75 @@ capture allocation was **9,338,880 bytes** and the peak single RGBA raster was *
 full StructureRoll test completed in **243.649 s**, with 64 coarse filled pairs, 64 coarse contour
 pairs, 42 fine filled pairs, 42 fine contour pairs, and 0 refusals.
 
+### ✅ Morning archetype showcase + walkable floor-area audit (2026-09-05)
+
+The owner-facing review artifact is Saved/VoxelForge/Showcase/index.html. It is generated only by
+the editor automation test VoxelForge.Composer.Showcase; opening it is offline and has no runtime
+generation hook. It contains one alphabetized card for each native archetype, with the exact four PIE
+hand-off values, recipe, coarse step-4 filled/contour XZ+XY views, and a separate step-1 filled/contour
+ROI centred on that card's coarse LargestComponentPoint. The fine ROI is bounded at radius 64 and
+MaxCells=2,000,000; a refusal or blank ROI is written as text rather than represented by an empty
+image. All eight cards in the final run rendered both fine views; refusals **0**, blank cards **0**.
+
+The Part A table adds three measurements to the original volumetric walkability ratio:
+
+* WalkableFloorAreaFraction = distinct sampled XY columns containing at least one walkable cell /
+  the sampled XY footprint. It is an area/footprint proxy, not a continuous world-area integral.
+* MedianVerticalClearance is the lower median of the sampled air run above walkable cells, reported
+  in voxels. Both the walkability predicate and this median use the stated sample step.
+* LargestWalkableSurfaceShare is the largest 4-neighbour connected component of the projected
+  walkable columns / all walkable columns. It is a 2D surface-continuity indicator, not a proof that
+  floors at different Z values connect in 3D; the separate exact unsnapped arrival→departure route
+  check remains the traversal gate.
+
+The showcase selection exhausts seeds **0** and **7331**, candidate indices **0–63**, and excludes
+multi-region rolls while VF_LateralRegionsAreShippable() is false. The hard gates are non-vacuous,
+largest air component share ≥ **0.50**, and exact unsnapped arrival→departure connectivity. Among
+those survivors the deterministic score is floor_area + 0.25*clamp(clearance/64,0,1) +
+0.10*largest_surface; floor area is primary, clearance and projected continuity are tie-breakers.
+The fixture and PIE hand-off use the project generator seed **0**, bComposerRollStructure=false,
+and leave the existing slot layout, passage endpoints, placement, and WorldRadiusVoxels=0 intact.
+
+Selected-card measurements (each card prints its own exact derived-margin Z window; common XY window
+is [-256,256) × [-256,256) voxels, step **4**, HeadroomCells=2, MaxCells=8,000,000):
+
+| Archetype | walkable fraction | floor area fraction | median clearance | largest surface share |
+|-----------|------------------:|--------------------:|-----------------:|----------------------:|
+| CrystalChamber | 0.059105 | 0.999878 | 68 | 1.000000 |
+| FlatPlain | 0.056107 | 0.999878 | 72 | 1.000000 |
+| FloatingIslands | 0.018869 | 0.400146 | 36 | 0.678005 |
+| Maze | 0.286020 | 0.290466 | 8 | 0.990544 |
+| SurfaceWorld | 0.064233 | 0.937378 | 64 | 0.993619 |
+| TunnelNetwork | 0.155047 | 0.208374 | 20 | 0.463972 |
+| Underwater | 0.228995 | 0.206055 | 12 | 0.331161 |
+| VerticalShafts | 0.108252 | 0.113770 | 12 | 0.144850 |
+
+The result is mixed, and that is the finding. CrystalChamber, FlatPlain, and SurfaceWorld retain
+roughly **0.94–1.00** walkable XY footprint while their volumetric walkable ratios are only
+**0.056–0.064**: the original ratio was primarily measuring corridor occupancy and was the wrong
+quality target for broad slab/chamber floors. Maze is genuinely corridor-rich: its ratio and floor
+area are both about **0.29**, and **0.991** of its projected walkable surface is in the largest
+component. Conversely, TunnelNetwork, Underwater, and VerticalShafts have only **0.114–0.208** floor
+area and **0.145–0.464** largest-surface share; FloatingIslands is intermediate (**0.400** area,
+**0.678** largest share). Those are real fragmentation/ledge findings, not just a strict-volume
+artifact. All selected cards pass the separate mouth-to-mouth route check, so “walkable area” still
+does not mean every walkable patch is on the traversable route.
+
+The web sanity check did not produce a defensible universal “good” floor-to-volume threshold. The
+official NPS descriptions instead support a heterogeneous target: solution caves grow along connected
+fractures and streams, passages branch and join, and caves can contain multiple levels, narrow
+walking passages, rooms, and vertical pits. NPS's Lehman Cave dimensions give a useful scale example
+(the Talus Room is reported as 90 ft wide × 376 ft long, with 21,511 sq ft of floor area and 113 ft
+floor-to-ceiling), not a universal ratio. The official Deep Rock Galactic cave-design note likewise
+describes rooms connected by narrow winding tunnels, while the Team Cherry map-design interview
+emphasizes interconnected spaces and backtracking. References: NPS Solution Caves
+(https://www.nps.gov/subjects/caves/solution-caves.htm), NPS Mammoth Cave morphology
+(https://home.nps.gov/maca/learn/nature/how-mammoth-cave-formed.htm), NPS Lehman Cave dimensions
+(https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm), Deep Rock Galactic procedural
+cave design
+(https://store.steampowered.com/news/posts/?appgroupname=Deep+Rock+Galactic&appids=548430&enddate=1729500950&feed=steam_community_announcements),
+and Team Cherry map design (https://www.pcgamer.com/how-to-design-a-great-metroidvania-map/).
+
 ### 3.5 Validation in three layers, and how "good" is ever judged
 
 1. **Construct by design** so the law cannot break — build the connections FIRST and generate around

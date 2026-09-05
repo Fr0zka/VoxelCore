@@ -192,6 +192,11 @@ struct VOXELFORGE_API FVoxelStrateMeasuredMetrics
     int64 LargestComponentCells = 0;
     int32 NumComponentsAtLeast1Pct = 0;
     float WalkableFraction = 0.0f;
+    int64 WalkableFloorColumns = 0;
+    float WalkableFloorAreaFraction = 0.0f;
+    int32 NumWalkableSurfaceComponents = 0;
+    int64 LargestWalkableSurfaceColumns = 0;
+    float LargestWalkableSurfaceShare = 0.0f;
     float MedianFeatureScale = 0.0f;
     int32 MedianVerticalClearance = 0;
 

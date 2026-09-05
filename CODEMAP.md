@@ -330,7 +330,9 @@ When both `CoverPointA` and `CoverPointB` are set, the XY window is their AABB e
 `CoverMarginVoxels`; otherwise it is the legacy square centered on `CenterXY` with
 `RadiusInVoxels`.
 It performs one deterministic 6-connected air flood fill, and derives fractions, components,
-walkability, feature scale, and clearance from that grid. Metrics report the resolved margin and
+walkability, feature scale, and clearance from that grid. It then performs one bounded 4-neighbour
+flood fill over the projected XY columns that contain a walkable surface; this is a floor-continuity
+indicator, not another source-density sample or a 3D route proof. Metrics report the resolved margin and
 the inclusive/exclusive voxel Z window used, the exact sampled dimensions/bounds, and the largest
 component's deterministic lowest-cell representative point, cell count, and count of components
 holding at least 1% of the air. The flood fill also retains component cell counts in discovery order,
@@ -354,7 +356,7 @@ has a full-resolution air-verified route, and the query reports the alternate ro
 No UObject state, cache, actor, world, or PIE is required.
 | Symbol | Role |
 |--------|------|
-| `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin (including zero to sample the seal) or fit the XY window to two points with a margin, and results identify the resolved window/dimensions/Z range and deterministic component representatives/sizes. |
+| `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin (including zero to sample the seal) or fit the XY window to two points with a margin, and results identify the resolved window/dimensions/Z range, deterministic air-component facts, walkable floor-area columns/fraction, projected surface components/share, and median clearance. |
 | `FVoxelStrateSampleGrid` | Optional one-pass `density > 0` `Air` polarity plus exact scalar `Density` capture exported by measurement functions; bounded by `MaxCells`, consumed by editor/automation previews, never retained on ordinary metrics calls. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; resolves either the legacy centered square or the two-point fitted AABB, and refuses invalid bounds or a grid over `MaxCells`. |
 | `VF_AreConnected` | Coarse 6-connected BFS plus deterministic blocked-edge retries, with a full-resolution air recheck for every candidate route and explicit endpoint-solid, out-of-window, `NotConnectedAtThisResolution`, `CoarseLiedBudgetExhausted` (unknown), and connected outcomes; diagnostics include endpoint component facts and the retry count from that same grid. |
@@ -535,9 +537,11 @@ and scalar density=0 contour views side by side without blurring the sampled ras
 512 pixels (including its scale footer). `FVoxelStrateFinePreviewSettings` is a separate caller-selected
 fine pass: the composer selects only survivors at step 1, radius 64 (a 128×128 XY ROI), and `MaxCells=2,000,000`;
 the caller centres it on each coarse survivor's `LargestComponentPoint` and the writer labels it
-“largest open space” with its exact ROI and step; cap refusals are recorded in the page. The 64-card
-sheet remains sorted by survivor status then descending corpus-centroid distance, repeats exact measurement
-windows, marks rejection reasons, explains the 2D-connectivity limitation, and has no runtime generation hook.
+“largest open space” with its exact ROI and step; cap refusals and blank fine ROIs are recorded explicitly
+instead of showing empty evidence. The ordinary 64-card sheet remains sorted by survivor status then
+descending corpus-centroid distance. The `VoxelForge.Composer.Showcase` test additionally writes an
+alphabetized one-card-per-archetype PIE hand-off page with the Part A survivor distributions, exact seed /
+candidate / target-slot values, and no runtime generation hook.
 
 **`Public/VoxelSeasonManifest.h` + `Private/VoxelSeasonManifest.cpp`** — Tier 4c's offline season
 artifact. `VF_ComposeSeason` generates a bounded configurable candidate batch, applies the Tier 2
@@ -621,6 +625,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
 | `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. Final run: **9 promoted**, corpus **4/8/9**, survival **20.8/54.2/54.2/45.8/50.0%**, spread **0.869214→0.916302**, **63.556 s**, 0 failures. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Final run: **42/64 survival (65.6%)**, **64 distinct recipes**, **0 invalid recipes**, **64 coarse filled + 64 coarse contour pairs**, **42 fine filled + 42 fine contour pairs**, blank plan/card **6/42→3/42**, **243.649 s**, **0 refusals**. |
+| `VoxelForgeComposerShowcaseTest.cpp` | `VoxelForge.Composer.Showcase` | Exhausts the bounded parameter-roll set (seeds **0, 7331**, indices **0–63**), excludes multi-region rolls while the lateral gate is off, and measures every missing-family candidate in all six interior target slots at step 4 / radius 256 / `MaxCells=8,000,000`. Hard gates are non-vacuous, largest air share ≥ **0.50**, and exact unsnapped arrival→departure connectivity; selection score is floor-area fraction + clearance tie-break + projected-surface tie-break. It asserts roll/manifest determinism, density sign, zero `WorldRadiusVoxels`, bit-identical metric reruns, and writes one alphabetized card per archetype to `Saved/VoxelForge/Showcase/index.html`, with step-1 radius-64 filled/contour plan + vertical ROI images centred on `LargestComponentPoint`. |
 | `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Composes a six-slot offline season from 24 structure candidates; asserts **19 hard-gate survivors**, **6 selected**, deterministic byte-identical JSON, absolute descent order, all selected primordial-law facts, and a selected-only review page with metrics/reasons/boss markers. Loads the JSON, rebuilds every selected stack, and compares **393,216** bounded density samples bit-for-bit. Rejection audit: **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**. |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm run uses **16 candidates per arm** (256×3 and 64×3 were stopped before aggregate output for runtime), step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **13/16, 7/16, 7/16** survival; survivor walkable means **0.066071, 0.012566, 0.012851** and feature-scale means **92.307693, 64.571426, 31.428572**. Box checks: **196/260,876**, **310/412,610**, **262/348,722** proved/voxels, **0 violations** in every arm. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |

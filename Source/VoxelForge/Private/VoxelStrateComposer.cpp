@@ -2275,6 +2275,8 @@ bool FVoxelStrateMeasuredMetrics::IsUsable() const
         && FMath::IsFinite(AirFraction)
         && FMath::IsFinite(LargestComponentShare)
         && FMath::IsFinite(WalkableFraction)
+        && FMath::IsFinite(WalkableFloorAreaFraction)
+        && FMath::IsFinite(LargestWalkableSurfaceShare)
         && FMath::IsFinite(MedianFeatureScale)
         && FMath::IsFinite(LargestComponentPoint.X)
         && FMath::IsFinite(LargestComponentPoint.Y)
@@ -2296,6 +2298,11 @@ FVoxelStrateMeasuredMetrics VF_SummarizeStrateMetrics(
     Result.LargestComponentCells = Metrics.LargestComponentCells;
     Result.NumComponentsAtLeast1Pct = Metrics.NumComponentsAtLeast1Pct;
     Result.WalkableFraction = Metrics.WalkableFraction;
+    Result.WalkableFloorColumns = Metrics.WalkableFloorColumns;
+    Result.WalkableFloorAreaFraction = Metrics.WalkableFloorAreaFraction;
+    Result.NumWalkableSurfaceComponents = Metrics.NumWalkableSurfaceComponents;
+    Result.LargestWalkableSurfaceColumns = Metrics.LargestWalkableSurfaceColumns;
+    Result.LargestWalkableSurfaceShare = Metrics.LargestWalkableSurfaceShare;
     Result.MedianFeatureScale = Metrics.MedianFeatureScale;
     Result.MedianVerticalClearance = Metrics.MedianVerticalClearance;
     Result.ResolvedMarginVoxels = Metrics.ResolvedMarginVoxels;
@@ -2779,6 +2786,16 @@ namespace
         Object->SetNumberField(TEXT("num_components_at_least_1_pct"),
                                Metrics.NumComponentsAtLeast1Pct);
         Object->SetNumberField(TEXT("walkable_fraction"), Metrics.WalkableFraction);
+        Object->SetNumberField(TEXT("walkable_floor_columns"),
+                               static_cast<double>(Metrics.WalkableFloorColumns));
+        Object->SetNumberField(TEXT("walkable_floor_area_fraction"),
+                               Metrics.WalkableFloorAreaFraction);
+        Object->SetNumberField(TEXT("num_walkable_surface_components"),
+                               Metrics.NumWalkableSurfaceComponents);
+        Object->SetNumberField(TEXT("largest_walkable_surface_columns"),
+                               static_cast<double>(Metrics.LargestWalkableSurfaceColumns));
+        Object->SetNumberField(TEXT("largest_walkable_surface_share"),
+                               Metrics.LargestWalkableSurfaceShare);
         Object->SetNumberField(TEXT("median_feature_scale"), Metrics.MedianFeatureScale);
         Object->SetNumberField(TEXT("median_vertical_clearance"), Metrics.MedianVerticalClearance);
         Object->SetNumberField(TEXT("resolved_margin_voxels"), Metrics.ResolvedMarginVoxels);
@@ -2836,6 +2853,21 @@ namespace
         bValid = VF_ReadJsonInt32(Object, TEXT("num_components_at_least_1_pct"),
                                   OutMetrics.NumComponentsAtLeast1Pct) && bValid;
         bValid = VF_ReadJsonFloat(Object, TEXT("walkable_fraction"), OutMetrics.WalkableFraction) && bValid;
+        // These fields were added after the first promotion-store schema. Keep old records
+        // readable: their absence means the new diagnostic is unknown, not zero evidence.
+        if (Object->HasField(TEXT("walkable_floor_columns")))
+        {
+            bValid = VF_ReadJsonInt64(Object, TEXT("walkable_floor_columns"),
+                                      OutMetrics.WalkableFloorColumns) && bValid;
+            bValid = VF_ReadJsonFloat(Object, TEXT("walkable_floor_area_fraction"),
+                                      OutMetrics.WalkableFloorAreaFraction) && bValid;
+            bValid = VF_ReadJsonInt32(Object, TEXT("num_walkable_surface_components"),
+                                      OutMetrics.NumWalkableSurfaceComponents) && bValid;
+            bValid = VF_ReadJsonInt64(Object, TEXT("largest_walkable_surface_columns"),
+                                      OutMetrics.LargestWalkableSurfaceColumns) && bValid;
+            bValid = VF_ReadJsonFloat(Object, TEXT("largest_walkable_surface_share"),
+                                      OutMetrics.LargestWalkableSurfaceShare) && bValid;
+        }
         bValid = VF_ReadJsonFloat(Object, TEXT("median_feature_scale"),
                                   OutMetrics.MedianFeatureScale) && bValid;
         bValid = VF_ReadJsonInt32(Object, TEXT("median_vertical_clearance"),
@@ -2976,6 +3008,11 @@ namespace
             && A.LargestComponentCells == B.LargestComponentCells
             && A.NumComponentsAtLeast1Pct == B.NumComponentsAtLeast1Pct
             && A.WalkableFraction == B.WalkableFraction
+            && A.WalkableFloorColumns == B.WalkableFloorColumns
+            && A.WalkableFloorAreaFraction == B.WalkableFloorAreaFraction
+            && A.NumWalkableSurfaceComponents == B.NumWalkableSurfaceComponents
+            && A.LargestWalkableSurfaceColumns == B.LargestWalkableSurfaceColumns
+            && A.LargestWalkableSurfaceShare == B.LargestWalkableSurfaceShare
             && A.MedianFeatureScale == B.MedianFeatureScale
             && A.MedianVerticalClearance == B.MedianVerticalClearance
             && A.ResolvedMarginVoxels == B.ResolvedMarginVoxels
@@ -3055,6 +3092,8 @@ namespace
         return FMath::IsFinite(Metrics.AirFraction)
             && FMath::IsFinite(Metrics.LargestComponentShare)
             && FMath::IsFinite(Metrics.WalkableFraction)
+            && FMath::IsFinite(Metrics.WalkableFloorAreaFraction)
+            && FMath::IsFinite(Metrics.LargestWalkableSurfaceShare)
             && FMath::IsFinite(Metrics.MedianFeatureScale)
             && FMath::IsFinite(Metrics.LargestComponentPoint.X)
             && FMath::IsFinite(Metrics.LargestComponentPoint.Y)

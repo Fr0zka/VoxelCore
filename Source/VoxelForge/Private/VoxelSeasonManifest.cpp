@@ -873,6 +873,16 @@ namespace VoxelSeasonManifestPrivate
         Object->SetNumberField(TEXT("num_components_at_least_1_pct"),
                                Metrics.NumComponentsAtLeast1Pct);
         SetMetricFloat(Object, TEXT("walkable_fraction"), Metrics.WalkableFraction);
+        Object->SetNumberField(TEXT("walkable_floor_columns"),
+                               static_cast<double>(Metrics.WalkableFloorColumns));
+        SetMetricFloat(Object, TEXT("walkable_floor_area_fraction"),
+                       Metrics.WalkableFloorAreaFraction);
+        Object->SetNumberField(TEXT("num_walkable_surface_components"),
+                               Metrics.NumWalkableSurfaceComponents);
+        Object->SetNumberField(TEXT("largest_walkable_surface_columns"),
+                               static_cast<double>(Metrics.LargestWalkableSurfaceColumns));
+        SetMetricFloat(Object, TEXT("largest_walkable_surface_share"),
+                       Metrics.LargestWalkableSurfaceShare);
         SetMetricFloat(Object, TEXT("median_feature_scale"), Metrics.MedianFeatureScale);
         Object->SetNumberField(TEXT("median_vertical_clearance"), Metrics.MedianVerticalClearance);
         Object->SetNumberField(TEXT("resolved_margin_voxels"), Metrics.ResolvedMarginVoxels);
@@ -914,6 +924,19 @@ namespace VoxelSeasonManifestPrivate
         bValid = ReadJsonInt64(Object, TEXT("largest_component_cells"), OutMetrics.LargestComponentCells) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("num_components_at_least_1_pct"), OutMetrics.NumComponentsAtLeast1Pct) && bValid;
         bValid = ReadMetricFloat(Object, TEXT("walkable_fraction"), OutMetrics.WalkableFraction) && bValid;
+        if (Object->HasField(TEXT("walkable_floor_columns")))
+        {
+            bValid = ReadJsonInt64(Object, TEXT("walkable_floor_columns"),
+                                   OutMetrics.WalkableFloorColumns) && bValid;
+            bValid = ReadMetricFloat(Object, TEXT("walkable_floor_area_fraction"),
+                                     OutMetrics.WalkableFloorAreaFraction) && bValid;
+            bValid = ReadJsonInt32(Object, TEXT("num_walkable_surface_components"),
+                                   OutMetrics.NumWalkableSurfaceComponents) && bValid;
+            bValid = ReadJsonInt64(Object, TEXT("largest_walkable_surface_columns"),
+                                   OutMetrics.LargestWalkableSurfaceColumns) && bValid;
+            bValid = ReadMetricFloat(Object, TEXT("largest_walkable_surface_share"),
+                                     OutMetrics.LargestWalkableSurfaceShare) && bValid;
+        }
         bValid = ReadMetricFloat(Object, TEXT("median_feature_scale"), OutMetrics.MedianFeatureScale) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("median_vertical_clearance"), OutMetrics.MedianVerticalClearance) && bValid;
         bValid = ReadJsonInt32(Object, TEXT("resolved_margin_voxels"), OutMetrics.ResolvedMarginVoxels) && bValid;

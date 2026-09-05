@@ -639,6 +639,10 @@ namespace VoxelStrateMeasurePrivate
         TArray<int32> ClearanceValues;
         ClearanceValues.Reserve(static_cast<int32>(NumAir));
         int64 NumWalkable = 0;
+        const int64 XYColumnCount64 = static_cast<int64>(Grid.NumX)
+            * static_cast<int64>(Grid.NumY);
+        TArray<uint8> WalkableColumns;
+        WalkableColumns.Init(0u, static_cast<int32>(XYColumnCount64));
 
         for (int32 Z = 0; Z < Grid.NumZ; ++Z)
         {
@@ -667,6 +671,7 @@ namespace VoxelStrateMeasurePrivate
                     if (!bHasHeadroom) continue;
 
                     ++NumWalkable;
+                    WalkableColumns[X + Grid.NumX * Y] = 1u;
                     int32 ClearanceCells = 0;
                     while (static_cast<int64>(Z) + ClearanceCells < Grid.NumZ
                         && Grid.Air[Grid.Index(X, Y, Z + ClearanceCells)] != 0u)
@@ -684,6 +689,64 @@ namespace VoxelStrateMeasurePrivate
         InOutMetrics.WalkableFraction = NumAir > 0
             ? static_cast<float>(static_cast<double>(NumWalkable)
                 / static_cast<double>(NumAir))
+            : 0.0f;
+        for (const uint8 bWalkable : WalkableColumns)
+        {
+            InOutMetrics.WalkableFloorColumns += bWalkable != 0u ? 1 : 0;
+        }
+        InOutMetrics.WalkableFloorAreaFraction = XYColumnCount64 > 0
+            ? static_cast<float>(static_cast<double>(InOutMetrics.WalkableFloorColumns)
+                / static_cast<double>(XYColumnCount64))
+            : 0.0f;
+
+        // The area graph is intentionally projected to XY: each column contributes one floor
+        // footprint even when several sampled Z cells in it meet the walkability predicate.
+        // Keep the flood fill deterministic and bounded by the already bounded XY grid.
+        TArray<uint8> VisitedWalkableColumns;
+        VisitedWalkableColumns.Init(0u, static_cast<int32>(XYColumnCount64));
+        TArray<int32> SurfaceQueue;
+        SurfaceQueue.Reserve(static_cast<int32>(XYColumnCount64));
+        for (int32 Column = 0; Column < WalkableColumns.Num(); ++Column)
+        {
+            if (WalkableColumns[Column] == 0u || VisitedWalkableColumns[Column] != 0u)
+            {
+                continue;
+            }
+
+            ++InOutMetrics.NumWalkableSurfaceComponents;
+            VisitedWalkableColumns[Column] = 1u;
+            SurfaceQueue.Reset();
+            SurfaceQueue.Add(Column);
+            int64 ComponentColumns = 0;
+            for (int32 QueueIndex = 0; QueueIndex < SurfaceQueue.Num(); ++QueueIndex)
+            {
+                const int32 CurrentColumn = SurfaceQueue[QueueIndex];
+                ++ComponentColumns;
+                const int32 CurrentX = CurrentColumn % Grid.NumX;
+                const int32 CurrentY = CurrentColumn / Grid.NumX;
+                const int32 NeighbourColumns[4] = {
+                    CurrentX > 0 ? CurrentColumn - 1 : INDEX_NONE,
+                    CurrentX + 1 < Grid.NumX ? CurrentColumn + 1 : INDEX_NONE,
+                    CurrentY > 0 ? CurrentColumn - Grid.NumX : INDEX_NONE,
+                    CurrentY + 1 < Grid.NumY ? CurrentColumn + Grid.NumX : INDEX_NONE
+                };
+                for (const int32 Neighbour : NeighbourColumns)
+                {
+                    if (Neighbour != INDEX_NONE
+                        && WalkableColumns[Neighbour] != 0u
+                        && VisitedWalkableColumns[Neighbour] == 0u)
+                    {
+                        VisitedWalkableColumns[Neighbour] = 1u;
+                        SurfaceQueue.Add(Neighbour);
+                    }
+                }
+            }
+            InOutMetrics.LargestWalkableSurfaceColumns = FMath::Max(
+                InOutMetrics.LargestWalkableSurfaceColumns, ComponentColumns);
+        }
+        InOutMetrics.LargestWalkableSurfaceShare = InOutMetrics.WalkableFloorColumns > 0
+            ? static_cast<float>(static_cast<double>(InOutMetrics.LargestWalkableSurfaceColumns)
+                / static_cast<double>(InOutMetrics.WalkableFloorColumns))
             : 0.0f;
 
         if (ClearanceValues.Num() > 0)

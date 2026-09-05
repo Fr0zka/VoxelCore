@@ -121,6 +121,17 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     int64 LargestComponentCells = 0;
     int32 NumComponentsAtLeast1Pct = 0;
     float WalkableFraction      = 0.f;
+    // Distinct sampled XY columns that contain at least one walkable cell, divided by the
+    // sampled XY footprint. This is a floor-area proxy, not a volume ratio: a large chamber
+    // can have a small WalkableFraction while retaining a substantial walkable floor.
+    int64 WalkableFloorColumns = 0;
+    float WalkableFloorAreaFraction = 0.f;
+    // Four-neighbour connected components of the projected walkable columns. This deliberately
+    // remains a 2D surface indicator; it does not prove that floors at different Z values are
+    // traversable in 3D. The separate arrival/departure route check is the traversal gate.
+    int32 NumWalkableSurfaceComponents = 0;
+    int64 LargestWalkableSurfaceColumns = 0;
+    float LargestWalkableSurfaceShare = 0.f;
     float MedianFeatureScale   = 0.f;
     int32 MedianVerticalClearance = 0;
 

@@ -89,6 +89,11 @@ namespace
         return bValid ? FString::Printf(TEXT("%d"), Value) : TEXT("invalid");
     }
 
+    FString VF_FormatInteger64Metric(bool bValid, int64 Value)
+    {
+        return bValid ? FString::Printf(TEXT("%lld"), static_cast<long long>(Value)) : TEXT("invalid");
+    }
+
     bool VF_IsWalkableCell(const FVoxelStrateSampleGrid& Grid,
                            int32 X, int32 Y, int32 Z, int32 HeadroomCells)
     {
@@ -704,6 +709,11 @@ bool VF_WriteStratePreviewCandidate(
     OutCandidate.AirFraction = Metrics.AirFraction;
     OutCandidate.LargestComponentShare = Metrics.LargestComponentShare;
     OutCandidate.WalkableFraction = Metrics.WalkableFraction;
+    OutCandidate.WalkableFloorColumns = Metrics.WalkableFloorColumns;
+    OutCandidate.WalkableFloorAreaFraction = Metrics.WalkableFloorAreaFraction;
+    OutCandidate.NumWalkableSurfaceComponents = Metrics.NumWalkableSurfaceComponents;
+    OutCandidate.LargestWalkableSurfaceColumns = Metrics.LargestWalkableSurfaceColumns;
+    OutCandidate.LargestWalkableSurfaceShare = Metrics.LargestWalkableSurfaceShare;
     OutCandidate.MedianFeatureScale = Metrics.MedianFeatureScale;
     OutCandidate.MedianVerticalClearance = Metrics.MedianVerticalClearance;
     OutCandidate.DistanceFromCorpusCentroid = FMath::IsFinite(DistanceFromCorpusCentroid)
@@ -961,7 +971,8 @@ bool VF_WriteStratePreviewIndex(
     const FVoxelStratePreviewWindow& Window,
     const TArray<FVoxelStratePreviewCandidate>& Candidates,
     FString& OutIndexPath,
-    FString& OutError)
+    FString& OutError,
+    const TArray<FVoxelStratePreviewArchetypeSummary>* ArchetypeSummaries)
 {
     if (!Window.IsValid())
     {
@@ -979,6 +990,15 @@ bool VF_WriteStratePreviewIndex(
     SortedCandidates.Sort([](const FVoxelStratePreviewCandidate& A,
                              const FVoxelStratePreviewCandidate& B)
     {
+        if (A.bShowcaseCard != B.bShowcaseCard)
+        {
+            return A.bShowcaseCard;
+        }
+        if (A.bShowcaseCard && B.bShowcaseCard
+            && A.ArchetypeName != B.ArchetypeName)
+        {
+            return A.ArchetypeName < B.ArchetypeName;
+        }
         if (A.bSeasonOrder != B.bSeasonOrder)
         {
             return A.bSeasonOrder;
@@ -1036,10 +1056,71 @@ bool VF_WriteStratePreviewIndex(
         ".reason{color:#ffb4b8;margin:6px 0}.recipe{color:#c9d1d9;overflow-wrap:anywhere;margin-bottom:8px}.recipe code{font:12px ui-monospace,SFMono-Regular,monospace}\n"
         ".window{font-size:11px;color:#8b949e;margin:5px 0 10px}.view-section{margin:12px 0}.view-section h3{font-size:12px;letter-spacing:.03em;color:#e6edf3;margin:10px 0 3px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:8px}.pair figure{margin:0}.pair img{display:block;width:100%;height:auto;background:#090c11;image-rendering:pixelated;border:1px solid #30363d}.pair figcaption{font-size:11px;color:#aab4c0;margin-top:3px}.fine-section{border-top:1px solid #6e4e1f;margin-top:14px;padding-top:4px}.fine-section h3{color:#ffd580}.not-requested{color:#8b949e;font-size:12px;margin:8px 0}.contour-note{color:#8cebd1}\n"
         ".no-image{min-height:40px;border:1px dashed #8b3b42;color:#ffb4b8;padding:12px;font-size:12px}\n"
+        ".pie-banner{border:2px solid #f5a636;background:#2b2112;color:#ffe5b0;border-radius:8px;padding:14px;margin:16px 0;font-size:15px}\n"
+        ".pie-card{border:2px solid #f5a636;background:#2b2112;color:#ffe5b0;border-radius:6px;padding:10px;margin:8px 0 12px;font-size:13px;line-height:1.6}\n"
+        ".pie-card code{font:13px ui-monospace,SFMono-Regular,monospace;color:#fff1ce}\n"
+        ".sources a{color:#8cebd1}.summary{display:block;overflow-x:auto;white-space:nowrap}.summary th,.summary td{vertical-align:top}.summary-window{white-space:normal;min-width:260px}\n"
         "table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}th,td{padding:3px 4px;border-bottom:1px solid #30363d;text-align:left}th{color:#aab4c0;font-weight:500}td{text-align:right;font-variant-numeric:tabular-nums}.verdict{font-weight:650}\n"
         ".footer{color:#8b949e;font-size:11px;margin-top:18px}\n"
         "</style></head><body>\n");
     Html += FString::Printf(TEXT("<h1>%s</h1>\n"), *VF_HtmlEscape(RunTitle));
+    const bool bShowcase = ArchetypeSummaries != nullptr && !ArchetypeSummaries->IsEmpty();
+    if (bShowcase)
+    {
+        Html += TEXT(
+            "<div class=\"pie-banner\"><strong>PIE WALK-THROUGH — exact values per card</strong> "
+            "Set the four displayed properties on the VoxelWorld actor, enter PIE, then click "
+            "<strong>Apply Composer Candidate</strong>. The candidate seed/index are the same "
+            "offline inputs used to produce these images. This page never changes runtime "
+            "generation by itself.</div>\n"
+            "<p class=\"note\"><strong>Showcase scope:</strong> all cards use the native "
+            "single-region path with <code>bComposerRollStructure=false</code>; lateral regions "
+            "are deliberately gated off. The target slot is reported explicitly on each card. "
+            "The candidate archetype is the density replacement, while the live slot layout, "
+            "height, passages, placement, and world seed remain unchanged.</p>\n"
+            "<h2>Part A — what the numbers mean</h2>\n"
+            "<p class=\"note\">Walkable fraction is <em>walkable sampled air cells / all sampled air "
+            "cells</em>; it is a volumetric occupancy ratio and is expected to understate a large "
+            "room. Walkable floor area is <em>distinct XY columns containing at least one "
+            "walkable cell / sampled XY footprint</em>. Largest connected surface is the largest "
+            "four-neighbour component of those projected columns / all walkable columns. It is "
+            "not a 3D traversal proof; the arrival → departure route check is separate.</p>\n"
+            "<p class=\"note\"><strong>Part A measurement settings:</strong> step=4 voxels, "
+            "HeadroomCells=2, XY radius=256 voxels, MaxCells=8,000,000. Each summary row lists "
+            "the exact target, derived interior margin, Z range, XY range, and grid for every "
+            "hard-gate survivor; each card repeats its selected window.</p>\n"
+            "<p class=\"note\"><strong>Reality check:</strong> real caves mix long, narrow passages "
+            "with rooms, branches, multiple levels, and occasional vertical shafts; there is no "
+            "universal target floor-to-volume ratio. The quantitative table below is therefore a "
+            "diagnostic comparison across this corpus, not a tuned magic number.</p>\n");
+        Html += TEXT(
+            "<p class=\"note sources\"><strong>References used:</strong> "
+            "<a href=\"https://www.nps.gov/subjects/caves/solution-caves.htm\">NPS Solution Caves</a>; "
+            "<a href=\"https://home.nps.gov/maca/learn/nature/how-mammoth-cave-formed.htm\">NPS Mammoth Cave morphology</a>; "
+            "<a href=\"https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm\">NPS Lehman Caves dimensions</a>; "
+            "<a href=\"https://store.steampowered.com/news/posts/?appgroupname=Deep+Rock+Galactic&amp;appids=548430&amp;enddate=1729500950&amp;feed=steam_community_announcements\">Deep Rock Galactic procedural cave design</a>; "
+            "<a href=\"https://www.pcgamer.com/how-to-design-a-great-metroidvania-map/\">Team Cherry map-design interview</a>.</p>\n"
+            "<table class=\"summary\"><caption>Part A — survivor distributions; every value uses the exact window printed in its row</caption>\n"
+            "<tr><th>archetype</th><th>eligible single-region rolls / hard-gate survivors</th><th>walkable fraction<br>(median; min–max)</th>"
+            "<th>floor area fraction<br>(median; min–max)</th><th>median clearance over walkable cells<br>(median; min–max voxels)</th>"
+            "<th>largest connected surface<br>(median; min–max)</th><th>window</th></tr>\n");
+        for (const FVoxelStratePreviewArchetypeSummary& Summary : *ArchetypeSummaries)
+        {
+            const FString SummaryWindow = !Summary.WindowSummary.IsEmpty()
+                ? Summary.WindowSummary
+                : Summary.Window.IsValid() ? Summary.Window.Describe() : TEXT("unavailable");
+            Html += FString::Printf(
+                TEXT("<tr><th>%s</th><td>%d / %d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"summary-window\">%s</td></tr>\n"),
+                *VF_HtmlEscape(Summary.ArchetypeName), Summary.EvaluatedCandidates,
+                Summary.HardGateSurvivors,
+                *VF_HtmlEscape(Summary.WalkableFractionSummary),
+                *VF_HtmlEscape(Summary.WalkableFloorAreaSummary),
+                *VF_HtmlEscape(Summary.MedianVerticalClearanceSummary),
+                *VF_HtmlEscape(Summary.LargestWalkableSurfaceSummary),
+                *VF_HtmlEscape(SummaryWindow));
+        }
+        Html += TEXT("</table>\n");
+    }
     Html += FString::Printf(
         TEXT("<p class=\"note\"><strong>How to read coarse images:</strong> At sample step %d, "
              "hard edges can come from sampling, not necessarily hard world walls. A "
@@ -1085,20 +1166,41 @@ bool VF_WriteStratePreviewIndex(
             ? Candidate.Window.Describe() : WindowDescription;
         const int32 DisplayIndex = Candidate.bSeasonOrder && Candidate.DepthIndex != INDEX_NONE
             ? Candidate.DepthIndex : Candidate.CandidateIndex;
+        const FString CardTitle = Candidate.bShowcaseCard && !Candidate.ArchetypeName.IsEmpty()
+            ? FString::Printf(TEXT("%s · candidate %d"), *Candidate.ArchetypeName, Candidate.CandidateIndex)
+            : FString::Printf(TEXT("#%d"), DisplayIndex);
         Html += FString::Printf(
-            TEXT("<section class=\"%s\"><h2>#%d <span class=\"badge %s\">%s</span></h2>\n"),
-            *CardClass, DisplayIndex, *StatusClass, *Status);
-        Html += FString::Printf(TEXT("<div class=\"recipe\"><code>%s</code></div>\n"),
-                                *VF_HtmlEscape(Candidate.RecipeString));
-        if (Candidate.bSeasonOrder)
+            TEXT("<section class=\"%s\"><h2>%s <span class=\"badge %s\">%s</span></h2>\n"),
+            *CardClass, *VF_HtmlEscape(CardTitle), *StatusClass, *Status);
+        if (Candidate.bShowcaseCard)
         {
             Html += FString::Printf(
+                TEXT("<div class=\"pie-card\"><strong>PIE — type exactly, then click Apply Composer Candidate</strong>"
+                     "<br><code>ComposerSeed = %d</code>"
+                     "<br><code>ComposerCandidateIndex = %d</code>"
+                     "<br><code>ComposerTargetStrateIndex = %d</code>"
+                     "<br><code>bComposerRollStructure = %s</code></div>\n"),
+                Candidate.ComposerSeed, Candidate.CandidateIndex,
+                Candidate.ComposerTargetStrateIndex,
+                Candidate.bComposerRollStructure ? TEXT("true") : TEXT("false"));
+        }
+        Html += FString::Printf(TEXT("<div class=\"recipe\"><code>%s</code></div>\n"),
+                                *VF_HtmlEscape(Candidate.RecipeString));
+        if (Candidate.bSeasonOrder || Candidate.bShowcaseCard)
+        {
+            const FString SelectionExtra = Candidate.bSeasonOrder
+                ? FString::Printf(TEXT("<br><strong>Boss slot:</strong> %s"),
+                                  Candidate.bBossSlot ? TEXT("yes") : TEXT("no"))
+                : FString();
+            Html += FString::Printf(
                 TEXT("<p class=\"reason\" style=\"color:#d7e3f4\"><strong>Why selected:</strong> %s"
-                     "<br><strong>Boss slot:</strong> %s</p>\n"),
+                     "%s</p>\n"),
                 *VF_HtmlEscape(Candidate.SelectionReason.IsEmpty()
-                    ? TEXT("selected by the provisional season policy")
+                    ? (Candidate.bShowcaseCard
+                        ? TEXT("selected from the hard-gate survivor set by floor area, then vertical clearance")
+                        : TEXT("selected by the provisional season policy"))
                     : Candidate.SelectionReason),
-                Candidate.bBossSlot ? TEXT("yes") : TEXT("no"));
+                *SelectionExtra);
         }
         if (Candidate.bRejected)
         {
@@ -1182,6 +1284,12 @@ bool VF_WriteStratePreviewIndex(
                 TEXT("<div class=\"no-image\">Fine ROI requested but refused/not rendered: %s</div>\n"),
                 *VF_HtmlEscape(FineFailureText));
         }
+        else if (Candidate.bFineBlank)
+        {
+            Html += TEXT("<div class=\"no-image\"><strong>Fine ROI is blank at both selected slices.</strong> "
+                        "That is reported as a content finding; empty images are intentionally not "
+                        "shown as evidence of a visible room.</div>\n");
+        }
         else
         {
             const FString FineWindowDescription = Candidate.FineWindow.Describe();
@@ -1235,6 +1343,10 @@ bool VF_WriteStratePreviewIndex(
             TEXT("<tr><th>air fraction</th><td>%s</td></tr>\n"
                  "<tr><th>largest component share</th><td>%s</td></tr>\n"
                  "<tr><th>walkable fraction</th><td>%s</td></tr>\n"
+                 "<tr><th>walkable floor area fraction</th><td>%s</td></tr>\n"
+                 "<tr><th>walkable floor columns</th><td>%s</td></tr>\n"
+                 "<tr><th>largest connected surface share</th><td>%s</td></tr>\n"
+                 "<tr><th>walkable surface components</th><td>%s</td></tr>\n"
                  "<tr><th>feature scale (voxels)</th><td>%s</td></tr>\n"
                  "<tr><th>vertical clearance (voxels)</th><td>%s</td></tr>\n"
                  "<tr><th>arrival → departure</th><td class=\"verdict\">%s</td></tr>\n"
@@ -1242,6 +1354,10 @@ bool VF_WriteStratePreviewIndex(
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.AirFraction),
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.LargestComponentShare),
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.WalkableFraction),
+            *VF_FormatMetric(Candidate.bMetricsValid, Candidate.WalkableFloorAreaFraction),
+            *VF_FormatInteger64Metric(Candidate.bMetricsValid, Candidate.WalkableFloorColumns),
+            *VF_FormatMetric(Candidate.bMetricsValid, Candidate.LargestWalkableSurfaceShare),
+            *VF_FormatIntegerMetric(Candidate.bMetricsValid, Candidate.NumWalkableSurfaceComponents),
             *VF_FormatMetric(Candidate.bMetricsValid, Candidate.MedianFeatureScale),
             *VF_FormatIntegerMetric(Candidate.bMetricsValid, Candidate.MedianVerticalClearance),
             *VF_HtmlEscape(Candidate.ArrivalDepartureVerdict),
@@ -1317,12 +1433,14 @@ bool VF_WriteStratePreviewIndex(
     const FVoxelStratePreviewWindow& Window,
     const TArray<FVoxelStratePreviewCandidate>& Candidates,
     FString& OutIndexPath,
-    FString& OutError)
+    FString& OutError,
+    const TArray<FVoxelStratePreviewArchetypeSummary>* ArchetypeSummaries)
 {
     (void)OutputDirectory;
     (void)RunTitle;
     (void)Window;
     (void)Candidates;
+    (void)ArchetypeSummaries;
     OutIndexPath.Reset();
     OutError = TEXT("strate preview rendering is editor-only");
     return false;
