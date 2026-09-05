@@ -104,7 +104,7 @@ namespace
     // retourne ce garde-fou : il EXIGE maintenant des colonnes.
 
     /**
-     * ⚠️ DENSIFIÉ après le premier run vert. Aux défauts (`RoomSpacing = 80`, `RoomDensity = 0.35`)
+     * ⚠️ DENSIFIÉ après le premier run vert. Aux anciens défauts (`RoomSpacing = 80`, `RoomDensity = 0.35`)
      * le premier passage a rendu **65 échantillons en grotte sur 6000, soit 1,1 %** : bit-identique,
      * oui, mais en comparant surtout du roc plein à du roc plein, là où le carve et les vers ne
      * s'exécutent même pas. Le compteur avait été écrit exactement pour dire ça, et il l'a dit ;
@@ -125,14 +125,14 @@ namespace
      */
     void EnableTunnelFeatures(FStrateGenerationParams& P)
     {
-        P.RoomSpacing     = 42.0f;   // 80 → 42 : des salles à portée de chaque chunk échantillonné
-        P.RoomDensity     = 0.85f;   // 0.35 → 0.85
+        P.RoomSpacing     = 42.0f;   // current production scale → 42: rooms reach sampled chunks
+        P.RoomDensity     = 0.85f;   // production .35 → .85
         P.VerticalScale   = 1.35f;   // ≠ 1 ⇒ le Z « effectif » diverge du Z monde partout
 
         // ── ÉTAPE B1 : rugosité de paroi (4b) ────────────────────────────────────────────────
         // Écrits EXPLICITEMENT, pas laissés au défaut : un test qui dépend d'un défaut se casse en
-        // silence le jour où le défaut change. `SurfaceRoughness` était le seul de ces champs non nul
-        // par défaut (5.0), et l'étape A le remettait à zéro — c'est ce zéro qui disparaît ici.
+        // silence le jour où le défaut change. The production default is now 2.0, but this fixture
+        // deliberately uses 5.0 so the full roughness branch is exercised.
         P.SurfaceRoughness    = 5.0f;
         P.RoughnessFrequency  = 0.1f;
         P.RoughnessNoiseType  = EVoxelNoiseType::FBM;   // les 4 types sont balayés au contrôle 1c
@@ -450,7 +450,9 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     }
 
     const int32 MidChunkZ = ((TopVoxelZ + BottomVoxelZ) / 2) / CHUNK_SIZE;
-    FStrateGenerationParams P = World.StrateManager->GetGenerationParams(FIntVector(0, 0, MidChunkZ));
+    const FStrateGenerationParams ProductionP =
+        World.StrateManager->GetGenerationParams(FIntVector(0, 0, MidChunkZ));
+    FStrateGenerationParams P = ProductionP;
 
     if (P.StrateTopWorldZ - P.StrateBottomWorldZ <= 0.0f)
     {
@@ -1115,8 +1117,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
             float WorstViolation = 0.0f;
             TMap<FString, int32> SolidKillerCounts;
             int32 NumRoomKilled = 0, NumTilesAwayFromSpine = 0;
-            // ±320 voxels = 4 x RoomSpacing. Hors de la boucle : la ligne de rapport en a besoin, et
-            // une étendue d'échantillonnage qu'on ne peut pas citer est une étendue qu'on ne surveille pas.
+            // Fixed ±320-voxel probe envelope. The report computes its ratio to the active
+            // RoomSpacing; keeping the envelope fixed makes before/after tile counts comparable.
             const int32 SpanCells = 40;
             const int32 SpanVoxelsReported = SpanCells * 8;   // Extent = Step * Cells = 1 * 8
             int32 TilesHitByRooms = 0, TilesHitByTunnels = 0, TilesHitByPits = 0, TilesHitByChimneys = 0;
@@ -1133,9 +1135,9 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 // ⚠️ L'ÉTENDUE XY ÉTAIT ±32 VOXELS, ET C'EST CE QUI RENDAIT CE BLOC INEXPLOITABLE.
                 // `RandRange(-4, 4) * 8` échantillonnait 40 tuiles dans un cube de ±32 voxels autour de
                 // (0,0) — c'est-à-dire l'endroit le PLUS creusé du monde entier, et de loin :
-                //   • `RoomSpacing = 80`, donc ±32 ne couvre même pas la moitié d'UNE cellule de salle ;
-                //   • `OriginRoomRadius = 20` garantit une grosse salle exactement à (0,0), de rayon de
-                //     cull `max(20·1.5, 8) + 3·4 = 42` — qui avale la quasi-totalité de la fenêtre ;
+                //   • the old `RoomSpacing = 80` meant ±32 did not cover half of ONE room cell ;
+                //   • the old `OriginRoomRadius = 20` guaranteed a large room at (0,0), whose cull
+                //     radius `max(20·1.5, 8) + 3·4 = 42` swallowed almost the whole window ;
                 //   • la spine (0,0) descend précisément là.
                 // La mesure « 4.9 salles sur 7.2 atteignent la boîte » ne décrivait donc pas la densité
                 // de grottes du monde, elle décrivait le hub de la spine. Aucune conclusion sur la
@@ -1146,9 +1148,8 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 // produirait un verdict FAUX échoue exactement comme avant. On corrige ce que la mesure
                 // REGARDE, pas ce qu'elle exige.
                 //
-                // The XY extent was ±32 voxels around (0,0) -- with RoomSpacing = 80 and a guaranteed
-                // OriginRoomRadius = 20 room at the origin, that samples the single most cave-dense spot
-                // in the world and says nothing about deep rock. Widening changes what the measurement
+                // The old XY extent was ±32 voxels around (0,0) -- inside the guaranteed origin room.
+                // Widening changes what the measurement
                 // LOOKS AT, not what it demands: every verdict is still brute-forced below.
                 const FIntVector Origin(
                     Rng.RandRange(-SpanCells, SpanCells) * Extent,
@@ -1300,7 +1301,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
                 // A warning that fires every run and always means "this is fine" is noise that
                 // trains the reader to ignore warnings. Zero proved is the only possible answer on
                 // the dense fixture (info); on production defaults it would be a real regression
-                // from 11 (warning).
+                // from the previous measured count (warning).
                 const FString ZeroMsg = FString::Printf(
                     TEXT("[%s] No tile was proved, so the brute force verified nothing -- it has no ")
                     TEXT("verdict to contradict. Do NOT re-derive the cause: read the two lines above, ")
@@ -1326,15 +1327,14 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     // LES DEUX MONDES, ET POURQUOI IL EN FAUT DEUX
     //-------------------------------------------------------------------------
     // ⚠️ LA FIXTURE REND CE VERDICT STRUCTURELLEMENT IMPOSSIBLE, ET CE N'EST PAS UN DÉFAUT DE LA
-    // FIXTURE. `EnableTunnelFeatures` densifie délibérément (`RoomSpacing` 80 → 42,
-    // `RoomDensity` 0.35 → 0.85) parce qu'aux défauts le premier run n'avait que 1,1 % des
+    // FIXTURE. `EnableTunnelFeatures` densifie délibérément (production spacing → 42,
+    // `RoomDensity` 0.35 → 0.85) because the first run had only 1.1% of samples in open cave,
     // échantillons en grotte — l'équivalence comparait du roc plein à du roc plein. Cette
     // densification est ce qui rend le contrôle 1 SIGNIFIANT.
     //
     // Mais elle est exactement ANTAGONISTE de la prouvabilité, et l'arithmétique le dit sans
     // ambiguïté : le rayon de cull d'une salle vaut `max(R·1.5, R·HeightRatio) + 3·SDFBlendRadius`,
-    // soit `1.5R + 12` ⇒ entre 27 et 57 pour `R ∈ [10, 30]`, moyenne ≈ 42 — c'est-à-dire
-    // **exactement le pas du réseau**, à 85 % d'occupation. Des sphères de cull de rayon égal au pas
+    // soit `1.5R + 12`; at the dense fixture's 85% occupancy those cull spheres overlap the lattice
     // du réseau recouvrent l'espace ~3,6 fois. **Aucune boîte de ce monde ne peut être hors de
     // toutes les sphères de cull.** Le « 6.3 salles sur 8.3 atteignent la boîte » mesuré est
     // exactement ça, et élargir l'échantillonneur n'y a rien changé (39 tuiles sur 40 étaient déjà
@@ -1353,9 +1353,7 @@ bool FVoxelForgeOpStackTunnelTest::RunTest(const FString& Parameters)
     RunTileScan(Stack, P, Ctx, TEXT("dense fixture"), /*bZeroProvedIsExpected*/ true);
 
     {
-        FStrateGenerationParams SparseP = P;
-        SparseP.RoomSpacing = 80.0f;   // le défaut d'`UVoxelStrateDefinition`
-        SparseP.RoomDensity = 0.35f;   // idem — voir `EnableTunnelFeatures`
+        FStrateGenerationParams SparseP = ProductionP;
 
         FVoxelOpStack SparseStack;
         VoxelDensityOps::BuildTunnelNetworkStack(SparseStack, SparseP, World.Settings->Seed,

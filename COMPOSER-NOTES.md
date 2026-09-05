@@ -381,6 +381,44 @@ small commandlet walking the struct by reflection. Clamp coverage is partial. A 
 tunables at all (`StrateTopWorldZ` / `StrateBottomWorldZ` are runtime Z bounds) and need an explicit
 exclusion list. Bools cannot be blended — roll them by probability or inherit from the dominant parent.
 
+#### Human-scale audit and the killed tunnel-only hypothesis (2026-09-05)
+
+The generation defaults are now derived from the body reference rather than chosen as voxel counts:
+**1 voxel = 0.25 m**, the player capsule is **1.36 voxels / 0.34 m radius** and **7.04 voxels /
+1.76 m tall**, and the default strate is **8 chunks / 256 voxels / 64 m**. The complete generated
+`name | voxels | METRES | body/level meaning` table is emitted by `VoxelForge.Composer.Showcase` and
+covers each archetype plus the shared passage/disturbance and optional transport fields.
+
+The requested maze test was run first on the same seed/index and a mouth-fitted step-1 ROI. The
+radius is the tunnel radius; the bore is twice the radius:
+
+| Corridor radius | Bore | Player-fit fraction | Traversable share | Minimum clearance | Arrival→departure |
+|----------------:|-----:|--------------------:|------------------:|------------------:|-------------------|
+| 4 vox / 1.00 m | 2.00 m | 0.009007 | 0.078358 | 1 voxel / 0.25 m | NotConnected |
+| 6 vox / 1.50 m | 3.00 m | 0.014545 | 0.165932 | 1 voxel / 0.25 m | NotConnected |
+| 8 vox / 2.00 m | 4.00 m | 0.012156 | 0.126354 | 1 voxel / 0.25 m | NotConnected |
+| 10 vox / 2.50 m | 5.00 m | 0.009814 | 0.105611 | 1 voxel / 0.25 m | NotConnected |
+| 12 vox / 3.00 m | 6.00 m | 0.008697 | 0.185039 | 1 voxel / 0.25 m | NotConnected |
+
+The hypothesis is **killed as a single root cause**. There is no sharp or monotonic fit rise, and
+the law stays disconnected at every bore. The unchanged one-voxel minimum also shows that the
+failure is not explained by the nominal tunnel diameter alone: the generated field, route mouths,
+floor/cap interaction, and/or resolution still need separate diagnosis.
+
+The new defaults use separate derivations: rooms are 8-20 m diameters with a 24 m origin hub and
+32 m cells; round passages are 3-4 m bores; Maze is a 16 m cell with a 4 m bore; slabs reserve a
+22.4 m floor-to-ceiling span; shaft diameters are 4-7 m with 3 m connectors; islands are 12-24 m
+diameters on 28 m cells; ordinary passages are 3-4 m bores and reach 8-24 m. `RoomSpacing` keeps
+the largest room 6 m radially clear of the next cell, `CorridorRadius` is 8/32 = 0.25 of Maze half-cell,
+and `StrateHeightInChunks` grows from 4 to 8 because 17 m tall rooms, 20 m terrain relief,
+vertical shafts, and a high cap do not share a comfortable 32 m envelope. No global multiplier was
+used. The roughness reach is `1.875 × roughness` voxels: the new default ratios are
+**0.625** (minimum tunnel), **0.469** (Maze), **0.469/0.625** (shaft/connector), **0.234** island
+radius (**0.484** including blend), **0.625/0.938** slab column for floor/ceiling, and **0.047**
+against SurfaceWorld's 80-voxel relief scale.
+
+The architecture sanity check uses [Epic's Unreal level-blockout guidance](https://dev.epicgames.com/documentation/en-us/unreal-engine/designer-01-project-setup-and-level-blockout-in-unreal-engine) (player-sized reference, 2-3 m halls and 3-4 m heights as starting guidance), the [2010 ADA Standards](https://www.ada.gov/law-and-regs/design-standards/2010-stds/) (915 mm clear walking width and larger passing/turning spaces), and [NPS Lehman Cave dimensions](https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm) (real chambers ranging from passages to 20 m-plus vertical volumes). These are sanity anchors, not claims that one universal ratio makes a good cave.
+
 ### ✅ Tier 5 status — promotion is built and measured (2026-09-05)
 
 Promotion is now a real corpus input, not a claim about a future approval UI. A surviving editor
@@ -817,9 +855,9 @@ pass, to:
 
 `Saved/ComposerPreview/structure_seed_0_corpus_9dbcea85_step_4_radius_256_fine_step_1_fine_radius_64/`
 
-The fine pass is explicit and bounded: the current composer selects the 42 coarse survivors, samples
-step 1 in a radius-64 (128×128 XY) ROI, and refuses before allocation when `MaxCells=2,000,000` would be
-exceeded. The default is radius 64 because it stays around the observed 1.8M-cell budget while exposing
+The fine pass is explicit and bounded: the historical composer selected the 42 coarse survivors, sampled
+step 1 in a radius-64 (128×128 XY) ROI, and refused before allocation when `MaxCells=2,000,000` would be
+exceeded. The default is radius 64 because it stays around the observed multi-million-cell budget while exposing
 voxel-scale detail; radius 128 is already roughly 7.1–7.5M cells and radius 256 exceeds the 8M coarse
 cap. The public settings let another editor/automation caller choose step, radius, centre, margin, and
 cap, or the writer can be called for an explicitly selected list. Fine filenames, captions, and each
@@ -859,8 +897,10 @@ the editor automation test VoxelForge.Composer.Showcase; opening it is offline a
 generation hook. It contains one alphabetized card for each native archetype, with the exact four PIE
 hand-off values, recipe, coarse step-4 filled/contour XZ+XY views, and a separate step-1 filled/contour
 ROI centred on that card's coarse LargestComponentPoint. The fine ROI is bounded at radius 64 and
-MaxCells=2,000,000; a refusal or blank ROI is written as text rather than represented by an empty
-image. All eight cards in the final run rendered both fine views; refusals **0**, blank cards **0**.
+MaxCells=4,000,000; a refusal or blank ROI is written as text rather than represented by an empty
+image. The earlier bounded four-chunk run rendered all eight fine views; the final production-height
+run is recorded below because its larger window produced **7** fine renders, **1** refusal, and **1**
+blank diagnostic card.
 
 The Part A table adds three measurements to the original volumetric walkability ratio:
 
@@ -881,7 +921,9 @@ those survivors the deterministic score is floor_area + 0.25*clamp(clearance/64,
 The fixture and PIE hand-off use the project generator seed **0**, bComposerRollStructure=false,
 and leave the existing slot layout, passage endpoints, placement, and WorldRadiusVoxels=0 intact.
 
-Selected-card measurements (each card prints its own exact derived-margin Z window; common XY window
+The following is the **pre-scale baseline** captured before the 2026-09-05 human-scale defaults
+(the post-scale diagnostic table is below). Each card prints its own exact derived-margin Z window;
+common XY window
 is [-256,256) × [-256,256) voxels, step **4**, HeadroomCells=2, MaxCells=8,000,000):
 
 | Archetype | walkable fraction | floor area fraction | median clearance | largest surface share |
@@ -920,6 +962,126 @@ emphasizes interconnected spaces and backtracking. References: NPS Solution Cave
 cave design
 (https://store.steampowered.com/news/posts/?appgroupname=Deep+Rock+Galactic&appids=548430&enddate=1729500950&feed=steam_community_announcements),
 and Team Cherry map design (https://www.pcgamer.com/how-to-design-a-great-metroidvania-map/).
+
+#### Final post-scale measurement (2026-09-05)
+
+The new defaults are applied in `VoxelStrateTypes.h`; the production definition, season defaults, and
+the owner-facing showcase use `StrateHeightInChunks=8` (64 m). The bounded test fixture remains at
+four chunks so the broad regression suite stays finite; this is a test-budget distinction, not a
+second production default. The final focused run is
+`Saved/AutomationReports/WorldScaleShowcaseProductionFinal/index.json`, with 256 roll evaluations,
+82 eligible single-region evaluations, 174 lateral-region evaluations skipped while that gate is off,
+and a **0/8** complete hard-gate survivor set. It still wrote fresh diagnostic cards: 7 fine renders,
+1 refusal, and 1 blank card.
+
+The before/after values below are deliberately labelled as candidate measurements, not paired
+experiments: the before rows are the selected pre-scale candidates from the baseline report, while
+the after rows are the best measured post-scale candidates from the production-height search. Floor
+area is the coarse 128 m × 128 m projected-footprint proxy (16,384 m² maximum); the ratio is the
+candidate's reported roughness-to-feature ratio. A zero or unresolved player law is a result, not a
+substituted value.
+
+| Archetype | Before: fit / traversable / law | Before: floor m² / median clearance m / roughness ratio | After: fit / traversable / law | After: floor m² / median clearance m / roughness ratio |
+|---|---|---|---|---|
+| CrystalChamber | 0.011745 / 0.810378 / NotConnectedAtThisResolution | 16,382 / 17 / 1.813 floor, 1.796 ceiling | 0.002699 / 0.017288 / NotConnectedAtThisResolution | 16,384 / 35 / 0.847 |
+| FlatPlain | 0.003938 / 0.053571 / NotConnectedAtThisResolution | 16,382 / 18 / 1.840 floor, 2.308 ceiling | 0.000000 / 0.000000 / unresolved | 16,343 / 43 / 1.092 |
+| FloatingIslands | 0.000000 / 0.000000 / StartCellNotPlayerFit | 6,556 / 9 / 0.025 | 0.000000 / 0.000000 / StartCellNotPlayerFit | 4,577 / 29 / 0.283 |
+| Maze | 0.010523 / 0.136646 / NotConnectedAtThisResolution | 4,759 / 2 / 0.938 | 0.016851 / 0.058757 / NotConnectedAtThisResolution | 6,115 / 3 / 0.423 |
+| SurfaceWorld | 0.001027 / 0.029412 / NotConnectedAtThisResolution | 15,359 / 16 / 0.032 | 0.000627 / 0.008415 / NotConnectedAtThisResolution | 16,384 / 42 / 0.038 |
+| TunnelNetwork | 0.004439 / 0.145833 / NotConnectedAtThisResolution | 3,414 / 5 / 1.436 | 0.001197 / 0.612245 / NotConnectedAtThisResolution | 6,153 / 9 / 0.383 |
+| Underwater | 0.005251 / 0.160000 / NotConnectedAtThisResolution | 3,376 / 3 / 2.212 | 0.000000 / 0.000000 / OutOfWindow | 21 / 17 / 0.683 |
+| VerticalShafts | 0.007458 / 0.233577 / NotConnectedAtThisResolution | 1,864 / 3 / 0.731 shaft, 1.302 connector | 0.009883 / 0.083045 / NotConnectedAtThisResolution | 2,718 / 4 / 0.622 |
+
+The interpreted outcome is mixed. Nominal dimensions and median clearances grew where they should,
+and TunnelNetwork's best measured candidate's traversable share rose substantially, but the global law
+did not become connected and broad rooms can still have very low player-fit fractions. Maze improved
+only modestly and remains disconnected. This is consistent with the radius sweep being a killed
+single-cause hypothesis: width alone did not cure the route/mouth/resolution failures.
+
+The direct default roughness arithmetic is stable and independent of which rolled candidate won:
+
+| Archetype / feature | Arithmetic | Ratio |
+|---|---|---:|
+| TunnelNetwork, Underwater tunnel | reach `= 2 × 1.25 × 1.5 = 3.75 vox`; `3.75 / 6` minimum radius | 0.625 |
+| Maze corridor | `3.75 / 8` | 0.469 |
+| FlatPlain, CrystalChamber floor / ceiling columns | `7.50 / 12` and `11.25 / 12` using mean 12-voxel column radius | 0.625 / 0.938 |
+| VerticalShafts shaft / connector | `3.75 / 8` and `3.75 / 6` | 0.469 / 0.625 |
+| FloatingIslands | `5.625 / 24`; including 6-voxel SDF blend, `(5.625+6)/24` | 0.234 / 0.484 |
+| SurfaceWorld relief | `3.75 / 80` terrain-relief scale | 0.047 |
+
+The default derivations are not a global multiplier:
+
+* Body and target anchors: `1 voxel = 0.25 m`; the capsule is `1.36 vox` radius and `7.04 vox`
+  tall. A 2.5 m no-duck corridor is 10 voxels; the 3-4 m fight target is 12-16 voxels. An 8-15 m
+  room is 32-60 voxels across, and a 20 m cathedral anchor is 80 voxels across. Epic's official
+  Unreal blockout guidance uses a player-sized reference and gives roughly 2-3 m halls and 3-4 m
+  heights as starting guidance; the [2010 ADA Standards](https://www.ada.gov/law-and-regs/design-standards/2010-stds/)
+  provide a 915 mm accessible clear-width lower bound, not a combat-space target.
+* TunnelNetwork/Underwater: room radii `16..40 vox = 4..10 m`, so diameters are 8-20 m; the
+  origin radius `48 vox = 12 m` gives a 24 m, three-chunk hub. `RoomSpacing=128 vox = 32 m` leaves
+  `64-40=24 vox = 6 m` radial margin around the largest room. `TunnelMin/MaxRadius=6..8` gives
+  3-4 m bores. `RoomHeightRatio=0.85` makes the largest room's vertical diameter
+  `2×40×0.85×0.25=17 m`; `H=8×32=256 vox=64 m` leaves enough vertical budget for seals,
+  passages, and a high room. `MaxTunnelLength=360 vox=90 m` exceeds the worst jittered neighbour
+  distance with margin.
+* FlatPlain/CrystalChamber: floor `0.25×256=64 vox=16 m`, ceiling `0.60×256=153.6 vox=38.4 m`,
+  leaving `22.4 m` before roughness. Columns are `8..16 vox` radii (4-8 m diameters) on 96-voxel
+  (24 m) cells. The two names intentionally retain the same slab generator and parameter block.
+* Maze: `CellSize=64 vox=16 m`; `CorridorRadius=8 vox=2 m`, hence a 4 m bore; the corridor radius
+  is `8/32=0.25` of the half-cell, leaving a 6 m centre-to-wall radial margin before other geometry.
+* SurfaceWorld: `ElevationRange=80 vox=20 m`, base ground `0.25×256=16 m`, warp `48 vox=12 m`,
+  sky cap `0.95×256=243.2 vox=60.8 m`; terrace/layer/beach/overhang values are separately
+  2 m / 2 m / 3 m / 4 m reach + 6 m height optional features.
+* VerticalShafts: spacing `80 vox=20 m`, shaft radii `8..14 vox` (4-7 m diameters), connector
+  radius `6 vox` (3 m bore), ledge spacing `32 vox=8 m`, ledge depth `4 vox=1 m`.
+* FloatingIslands: spacing `112 vox=28 m`, radii `24..48 vox` (12-24 m diameters); the largest
+  leaves `56-48=8 vox=2 m` centre-to-edge radial margin. Thickness is independent:
+  `48×0.60=28.8 vox=7.2 m` below the centre and `48×0.20=9.6 vox=2.4 m` above it.
+* Shared passages and disturbances: mouth/mid radii `8/6 vox` (4/3 m bores), reach `32..96 vox`
+  (8-24 m), spine distance `64..192 vox` (16-48 m), wander/spiral `24 vox=6 m`, cascade ledge
+  `8 vox=2 m`; chasm spacing/radius `192/24 vox` (48 m / 6 m), bridge spacing/radius `128/8`
+  (32 m / 2 m), and ridge spacing/height/thickness `128/32/8` (32 m / 8 m / 2 m). Optional
+  transport fields are also audited: arch radius `6..12` (1.5-3 m), column `4..8` (1-2 m), pit
+  `8..16` plus depth `32` (2-4 m plus 8 m), chimney `4..8` plus height `32` (1-2 m plus 8 m),
+  dome `16..32` (4-8 m), pinch length `24` (6 m), overhang depth `8` (2 m), and the inactive
+  layer/rib depths `0.3/0.4` (7.5/10 cm). The exact generated row-by-row audit includes nominal
+  periods for every frequency field.
+
+The 64 m height is deliberate rather than accidental: the GDD boss-space anchor is approximately
+3-4 chunks (24-32 m), so the extra vertical envelope is needed to combine that room scale with
+seals and vertical traversal. The NPS [Lehman Cave dimensions](https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm)
+also support heterogeneous natural volumes rather than one fixed room ratio.
+
+#### Equivalence, box safety, and cost after the default move
+
+The full report `Saved/AutomationReports/WorldScaleFullFinal3/index.json` recorded 28 successes,
+2 warning-only tests, 0 failures, and 0 not-run tests in 1,704.010 s. The warnings are known scope
+findings: lateral regions remain gated at 9/16 cross-region law, and TunnelNetwork op-stack
+sampling has only 240/6,000 samples outside its gate. Neither is a box-soundness violation.
+
+All legacy/stack equivalence tests remained bit-identical to their shared reference paths, including
+Maze, both slab archetypes, SurfaceWorld, TunnelNetwork stage A+B, VerticalShafts, and FloatingIslands.
+`WorldRadiusVoxels` remained 0, lateral regions stayed gated, density sign remained correct, and every
+box brute-force audit reported **0 violations**. Current representative box counts are: ParameterRoll
+1,149 proved / 1,529,319 lattice voxels; StructureRoll 715 / 951,665; corpus-free arms 185 / 246,235,
+260 / 346,060, and 299 / 397,969; TunnelNetwork production op-stack 7/40 proved (7 AllSolid),
+Underwater 34/40, Maze 127/256 plus 250/256 novel lattice boxes, FlatPlain 27/60, CrystalChamber
+39/60, tuned CrystalChamber 29/60, VerticalShafts 31/60, and FloatingIslands 15/60 AllAir.
+Every listed count has zero brute-force violations.
+
+The pristine pre-scale player-fit showcase did not execute the op-stack classification suite, so a
+pure old-default tile-count delta does not exist. The nearest instrumented pre-final checkpoint had
+the operator-stack 600-tile scan at **521 Mixed / 23 AllSolid / 56 AllAir**; the final world-scale
+scan is **518 / 71 / 11**. Uniform proofs therefore did not collapse (79 → 82), although the
+AllAir/AllSolid mix moved. The final non-stack scan is **522 / 22 / 56**. This is a real measured
+classification result, but it must not be misrepresented as a pristine causal A/B run. The
+production-height showcase itself cost about **1,709.7 s** and produced 7 fine renders, one refusal,
+and one blank diagnostic card; its artifact is `Saved/VoxelForge/Showcase/index.html`.
+
+The corrected owner-facing artifact is therefore at `Saved/VoxelForge/Showcase/index.html` (fresh
+report: `Saved/AutomationReports/WorldScaleShowcaseProductionFinal/index.json`). It contains the new
+metre audit and the rejected-but-useful diagnostic cards; the zero hard-gate survivor set is
+intentionally visible rather than hidden by a fallback candidate.
 
 ### 3.5 Validation in three layers, and how "good" is ever judged
 
@@ -1092,8 +1254,10 @@ a passage and arrive in a sealed pocket.**
 `SuggestLandingPoint(DesiredX, DesiredY, MaxLateralSnap) -> optional FVector`. Every source knows where
 its own air is: `FRoomGraphSource` keeps the nearest room's vertical placement at the requested XY,
 `MakeSlabVoidSource` answers in the void band, `FIslandBlobSource` finds a blob top, and the lattice/
-shaft sources search their placement grid. Sparse sources may move laterally, but only within one
-source spacing/cell; if that bounded search has no footing, falling back is the honest answer.
+shaft sources search their placement grid. Sparse sources may move laterally, but only within a
+bounded local source neighbourhood (one cell for Maze, two shaft spacings at the default
+VerticalShafts density, one spacing for islands); if that search has no footing, falling back is the
+honest answer.
 Passage placement remains deterministic and cheap, and the slanted control-point chain is bounded too.
 
 Then the measurement pass flood fill is the net: does the upper mouth's air component reach the lower

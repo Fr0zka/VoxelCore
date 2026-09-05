@@ -627,9 +627,11 @@ void UVoxelStrateManager::GeneratePassages()
             return FMath::Max(Definition.MazeParams.CellSize, 1.0f);
 
         case ECaveGeneratorType::VerticalShafts:
-            // One shaft grid spacing is the natural nearest-site budget. A sparser layout may
-            // legitimately decline instead of pulling the passage away from the spine.
-            return FMath::Max(Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
+            // A density of 0.6 does not guarantee an occupied cell in the immediate grid
+            // neighbourhood. Allow the nearest occupied shaft to be two grid cells away while
+            // remaining a bounded local query; the landing query still returns that shaft's
+            // exact axis, so this cannot create a non-topological mouth.
+            return FMath::Max(2.0f * Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
 
         case ECaveGeneratorType::FloatingIslands:
             // One island grid spacing protects the intentional radial placement while still

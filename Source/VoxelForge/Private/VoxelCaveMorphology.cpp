@@ -634,6 +634,13 @@ namespace
         // than a point on the smoothed ledge edge.
         float LandingFromBottom = FMath::Max(
             Params.BoundarySealThickness, Params.LedgeDepth) + FloorClearance;
+        // The measurement API derives its default interior margin as two seal thicknesses.
+        // Keep a source-level landing strictly inside that same measured window; otherwise a
+        // lower-roughness default can produce a perfectly valid shaft landing just below the
+        // diagnostic grid's lower edge and turn a real mouth query into OUT_OF_WINDOW.
+        LandingFromBottom = FMath::Max(
+            LandingFromBottom,
+            2.0f * Params.BoundarySealThickness + 0.01f);
         if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
         {
             const float SafeBand = Params.LedgeDepth + FloorClearance;

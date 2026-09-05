@@ -57,7 +57,7 @@ struct VOXELFORGE_API FVoxelSeasonSelectionPolicy
 struct VOXELFORGE_API FVoxelSeasonFixedStrate
 {
     int32 Seed = 0;
-    int32 HeightInChunks = 4;
+    int32 HeightInChunks = 8;
     ECaveGeneratorType Archetype = ECaveGeneratorType::TunnelNetwork;
     FVoxelStrateArchetypeParams Params;
     FVoxelOpStackRecipe Recipe;
@@ -85,7 +85,7 @@ struct VOXELFORGE_API FVoxelSeasonCompositionSettings
 
     // Generated candidates use one stable height. Fixed authored slots may provide their own
     // height. World layout bounds are written into every selected parameter family below.
-    int32 StrateHeightInChunks = 4;
+    int32 StrateHeightInChunks = 8;
     int32 InterStrateGapChunks = 0;
     float OriginSpineRadius = 14.0f;
     float WorldRadiusVoxels = 0.0f;
@@ -125,7 +125,9 @@ struct VOXELFORGE_API FVoxelSeasonCompositionSettings
 
         PlayerFitMeasureSettings.SampleStep = 1;
         PlayerFitMeasureSettings.RadiusInVoxels = 64;
-        PlayerFitMeasureSettings.MaxCells = 2000000;
+        // A fitted mouth-to-mouth XY window across an 8-chunk (256-voxel) strate can approach
+        // four million cells. Keep the cap finite and below the old multi-gigabyte retry cost.
+        PlayerFitMeasureSettings.MaxCells = 4000000;
         PlayerFitMeasureSettings.MaxRouteRetries = 16;
         PlayerFitMeasureSettings.HeadroomCells = 2;
         PlayerFitMeasureSettings.InteriorMarginVoxels = -1;

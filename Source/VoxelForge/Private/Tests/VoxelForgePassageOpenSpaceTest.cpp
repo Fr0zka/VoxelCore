@@ -52,7 +52,10 @@ namespace
         case ECaveGeneratorType::Maze:
             return FMath::Max(Definition.MazeParams.CellSize, 1.0f);
         case ECaveGeneratorType::VerticalShafts:
-            return FMath::Max(Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
+            // A 0.6 shaft density does not guarantee an occupied immediate cell. The production
+            // query therefore permits a bounded two-cell local search and still returns the
+            // selected site's exact axis.
+            return FMath::Max(2.0f * Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
         case ECaveGeneratorType::FloatingIslands:
             return FMath::Max(Definition.FloatingIslandParams.IslandSpacing, 1.0f);
         default:

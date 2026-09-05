@@ -73,7 +73,8 @@ namespace VoxelForgeTest
          * dangerous — and `VoxelForge.Determinism.LargeSeedSurvives` deliberately passes big ones
          * (up to 2e9) to prove it stays that way.
          */
-        void Build(int32 InSeed = 1337, int32 InGapChunks = 2, bool bUseOperatorStack = false)
+        void Build(int32 InSeed = 1337, int32 InGapChunks = 2, bool bUseOperatorStack = false,
+                   int32 InStrateHeightInChunks = 4)
         {
             Settings = TStrongObjectPtr<UVoxelSettings>(
                 NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
@@ -105,7 +106,11 @@ namespace VoxelForgeTest
                 UVoxelStrateDefinition* Def = NewObject<UVoxelStrateDefinition>(
                     GetTransientPackage(), NAME_None, RF_Transient);
                 Def->GeneratorType = Archetypes[i];
-                Def->StrateHeightInChunks = 4;
+                // Keep the shared density fixture at the historical 4-chunk test volume unless
+                // a caller explicitly asks for the production/default 8-chunk envelope. The
+                // refinement and roll tests use the smaller synthetic volume as a bounded memory
+                // control; the owner-facing showcase opts into 8 chunks below.
+                Def->StrateHeightInChunks = FMath::Max(1, InStrateHeightInChunks);
                 // L'OPT-IN de la pile d'opérateurs. Faux par défaut : les treize tests existants
                 // doivent continuer à exercer le `switch`, qui reste le comportement de référence.
                 // Seul le test de solidité de ClassifyTie côté pile le passe à vrai.

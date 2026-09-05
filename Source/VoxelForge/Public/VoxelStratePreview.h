@@ -38,11 +38,11 @@ struct VOXELFORGE_API FVoxelStrateFinePreviewSettings
 {
     // The default is deliberately one voxel: the pass exists to expose detail that step 4 cannot.
     int32 SampleStep = 1;
-    // radius=64 gives a 128x128 XY ROI and stays below the default two-million-cell cap for the
-    // four-chunk fixture. The caller may re-centre it on the deterministic largest open space
+    // radius=64 gives a 128x128 XY ROI and stays below the default four-million-cell cap for the
+    // eight-chunk fixture. The caller may re-centre it on the deterministic largest open space
     // point found by the coarse air flood fill; it is not inherently the strate midpoint.
     int32 RadiusInVoxels = 64;
-    int32 MaxCells = 2000000;
+    int32 MaxCells = 4000000;
     FVector2D CenterXY = FVector2D::ZeroVector;
     int32 InteriorMarginVoxels = -1;
 

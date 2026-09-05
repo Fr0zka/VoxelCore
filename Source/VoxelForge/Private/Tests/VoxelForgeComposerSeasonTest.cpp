@@ -49,7 +49,7 @@ bool FVoxelForgeComposerSeasonTest::RunTest(const FString& Parameters)
     Settings.Corpus = &Corpus;
     Settings.CandidateCount = 24;
     Settings.SelectedStrateCount = 6;
-    Settings.StrateHeightInChunks = 4;
+    Settings.StrateHeightInChunks = 8;
     Settings.InterStrateGapChunks = 0;
     Settings.OriginSpineRadius = 14.0f;
     Settings.WorldRadiusVoxels = 0.0f;

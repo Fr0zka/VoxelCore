@@ -656,12 +656,12 @@ bool FVoxelForgeComposerCorpusFreeTest::RunTest(const FString& Parameters)
     const double MeasurementSeconds = FPlatformTime::Seconds() - MeasurementStartSeconds;
 
     // Audit the same declared relations against the 12 current authored corpus vectors. Project
-    // assets carry their own height; the eight C++ defaults use the fixture's 4-chunk height.
+    // assets carry their own height; the eight C++ defaults use the fixture's 8-chunk height.
     int32 AuthoredConstraintViolations = 0;
     FString AuthoredViolationList;
     for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())
     {
-        float EntryHeight = 4.0f * (float)CHUNK_SIZE;
+        float EntryHeight = 8.0f * (float)CHUNK_SIZE;
         if (!Entry.SourcePath.Contains(TEXT("/VoxelForge/ComposerDefaults/")))
         {
             UVoxelStrateDefinition* Definition = LoadObject<UVoxelStrateDefinition>(

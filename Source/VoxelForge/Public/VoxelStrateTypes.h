@@ -446,10 +446,10 @@ struct VOXELFORGE_API FStrateGenerationParams
     // the cave system instead of spraying disconnected noise pockets through the whole
     // strate (the far-field "confetti"). 0 = unlimited (legacy unmasked behaviour).
     //   16  → tight braiding right along rooms/tunnels
-    //   24  → braids + short noodle shortcuts (good default)
-    //   48+ → loose, wandering side-passages
+    //   64  → 16 m braids + side passages (human-scale default)
+    //   96+ → loose, wandering side-passages
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worm Tunnels", meta = (ClampMin = "0.0"))
-    float WormNetworkRange = 24.0f;
+    float WormNetworkRange = 64.0f;
 
     // ===== CAVE MORPHOLOGY (room-and-corridor) =====
     //
@@ -465,12 +465,12 @@ struct VOXELFORGE_API FStrateGenerationParams
 
     // Distance between room grid cells (in voxels).
     // This controls room SPACING, not size. Larger = rooms further apart.
-    //   40  → dense room network, rooms nearly touching
-    //   80  → moderate density, corridors between rooms (good default)
-    //   120 → sparse rooms, long corridors
+    //   64  → dense room network
+    //   128 → 32 m cell spacing (human-scale default)
+    //   160 → sparse rooms, long corridors
     //   200+→ isolated chambers with long tunnel treks
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms")
-    float RoomSpacing = 80.0f;
+    float RoomSpacing = 128.0f;
 
     // Probability of a room existing in each grid cell (0-1).
     // Not every cell gets a room — this controls how many are filled.
@@ -483,28 +483,29 @@ struct VOXELFORGE_API FStrateGenerationParams
 
     // Smallest possible room radius (in voxels).
     // Small rooms feel like alcoves or nooks.
-    //   5-8  → small alcoves
-    //   10-15→ natural small chambers (good default)
-    //   20+  → even "small" rooms are spacious
+    //   8-12 → alcoves and small rooms
+    //   16   → 8 m diameter room (human-scale minimum)
+    //   24+  → spacious small rooms
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms")
-    float MinRoomRadius = 10.0f;
+    float MinRoomRadius = 16.0f;
 
     // Largest possible room radius (in voxels).
     // Large rooms are cathedral chambers.
-    //   15-20→ moderate rooms
-    //   25-35→ large caverns (good default)
-    //   50+  → massive cathedral spaces
+    //   24-32→ moderate rooms
+    //   40   → 20 m diameter chamber (large-room default)
+    //   80+  → massive cathedral spaces
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms")
-    float MaxRoomRadius = 30.0f;
+    float MaxRoomRadius = 40.0f;
 
     // How vertically squished rooms are.
     // 1.0 = perfect sphere (tall as wide).
     // Lower = flatter, more horizontal chambers.
     //   0.2-0.3 → very flat caverns (strate-like, wide and low)
-    //   0.4-0.5 → natural cave chambers (good default)
+    //   0.4-0.5 → natural cave chambers
+    //   0.85    → tall rooms (17 m diameter-height envelope at radius 40)
     //   0.7-1.0 → tall, cathedral-like rooms
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms", meta = (ClampMin = "0.1", ClampMax = "1.0"))
-    float RoomHeightRatio = 0.4f;
+    float RoomHeightRatio = 0.85f;
 
     // Per-room floor flatness range. Each room hash-rolls a value in [Min, Max].
     //   FloorCutZ = RoomCenter.Z - RoomRadiusZ * roll
@@ -521,11 +522,11 @@ struct VOXELFORGE_API FStrateGenerationParams
     // with navigable flat floors.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms",
         meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float RoomFloorCutMin = 1.0f;
+    float RoomFloorCutMin = 0.70f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms",
         meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float RoomFloorCutMax = 1.0f;
+    float RoomFloorCutMax = 0.90f;
 
     // Large-scale floor undulation — how many voxels the floor plane rises and falls.
     // This is NOT surface roughness (which adds rock texture). This shifts the entire
@@ -535,13 +536,14 @@ struct VOXELFORGE_API FStrateGenerationParams
     //
     // Only meaningful when RoomFloorCutMin < 1.0 (flat floor mode active).
     //
-    //   0     → perfectly flat floor (default — use surface roughness for texture)
+    //   0     → perfectly flat floor
+    //   4     → 1 m variation (human-scale default; subtle beside a room)
     //   2-4   → subtle floor variation, barely perceptible gradient
     //   5-10  → clear hills and basins — interesting to walk across
     //   15+   → dramatic terrain — slopes and drops within the room
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms",
         meta = (ClampMin = "0.0", EditCondition = "RoomFloorCutMin < 1.0"))
-    float FloorReliefStrength = 0.0f;
+    float FloorReliefStrength = 4.0f;
 
     // How wide the floor hills are. Lower = broader, gentler undulations.
     //   0.005 → very broad (one hill spans the whole room)
@@ -567,10 +569,11 @@ struct VOXELFORGE_API FStrateGenerationParams
     // making it the natural hub of the strate's cave network.
     //   0   → disabled (no guaranteed origin room)
     //   15  → moderate hub room
-    //   20  → large central chamber (good default)
-    //   30+ → massive starting cavern
+    //   32  → large central chamber
+    //   48  → 24 m hub (three-chunk boss-space default)
+    //   64+ → massive starting cavern
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms")
-    float OriginRoomRadius = 20.0f;
+    float OriginRoomRadius = 48.0f;
 
     // Maximum number of backbone tunnels that can force-connect to the origin room.
     // Without a limit, every room in the search area that picks origin as its nearest
@@ -588,18 +591,18 @@ struct VOXELFORGE_API FStrateGenerationParams
     // ===== TUNNELS (connecting corridors between rooms) =====
 
     // Smallest tunnel radius (in voxels). Creates tight squeeze corridors.
-    //   2-3 → claustrophobic crawlspaces
-    //   3-4 → tight but passable (good default)
-    //   5+  → even "narrow" tunnels are comfortable
+    //   4-5 → marginal passage
+    //   6   → 3 m bore (minimum comfortable round passage)
+    //   8   → 4 m bore (human-scale wide passage)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
-    float TunnelMinRadius = 3.0f;
+    float TunnelMinRadius = 6.0f;
 
     // Largest tunnel radius (in voxels). Creates wide passages.
-    //   5-6 → comfortable walking tunnels
-    //   7-8 → wide passages (good default)
+    //   6   → 3 m bore (comfortable walking tunnel)
+    //   8   → 4 m bore (fight-space passage)
     //   10+ → practically small rooms
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
-    float TunnelMaxRadius = 7.0f;
+    float TunnelMaxRadius = 8.0f;
 
     // Probability that two nearby rooms are connected by a tunnel (0-1).
     //   0.2 → sparse connections, mostly dead-end rooms
@@ -610,10 +613,11 @@ struct VOXELFORGE_API FStrateGenerationParams
 
     // Maximum tunnel length (in voxels). Rooms further apart won't connect.
     //   100 → only close neighbors
-    //   200 → moderate reach (good default)
+    //   200 → moderate reach
+    //   360 → 90 m, reaches the worst jittered neighbour at 32 m cell spacing
     //   400+→ long-range connections possible
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
-    float MaxTunnelLength = 200.0f;
+    float MaxTunnelLength = 360.0f;
 
     // How much tunnel paths curve (in voxels of sideways displacement).
     // Without this, tunnels are straight lines between rooms.
@@ -622,10 +626,10 @@ struct VOXELFORGE_API FStrateGenerationParams
     // Capped at 25% of tunnel length to prevent kinky short tunnels.
     //   0   → perfectly straight tunnels (artificial look)
     //   8-12→ gentle natural curves
-    //   15  → clearly winding passages (good default)
+    //   24  → 6 m lateral bend (human-scale default)
     //   25+ → very curvy, meandering corridors
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
-    float TunnelWarpStrength = 15.0f;
+    float TunnelWarpStrength = 24.0f;
 
     // Preference for horizontal connections over vertical (0-1).
     // Real caves are mostly horizontal — vertical connections are rarer.
@@ -652,17 +656,17 @@ struct VOXELFORGE_API FStrateGenerationParams
     // Combined with terrain ops (cliffs, terraces), this creates multi-level rooms
     // where one tunnel exits at the upper ledge and another at the lower floor.
     //   0.0 → all tunnels connect at room center height
-    //   0.5 → endpoints range from -50% to +50% of room height (good default)
+    //   0.25 → endpoints use a restrained quarter-height offset (default)
     //   1.0 → full range — tunnels can enter near floor or ceiling
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float TunnelEndpointZOffset = 0.5f;
+    float TunnelEndpointZOffset = 0.25f;
 
     // ===== SDF BLEND (junction smoothness) =====
 
     // Smooth union blend radius. Controls how rounded the junctions
     // are where rooms meet tunnels (or rooms meet rooms).
     //   1-2 → sharp, angular junctions
-    //   3-5 → natural rounded junctions (good default)
+    //   4   → 1 m rounded junction (default)
     //   8+  → very blobby, organic blending
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Blend")
     float SDFBlendRadius = 4.0f;
@@ -685,10 +689,10 @@ struct VOXELFORGE_API FStrateGenerationParams
     // This controls the overall organic distortion of the cave skeleton.
     //   0   → disabled — pristine geometric rooms and straight tunnels
     //   4-6 → subtle natural variation (rooms slightly irregular)
-    //   8-12→ clearly organic caves, tunnels visibly curve (good default)
+    //   16  → 4 m skeleton distortion (human-scale default)
     //   16+ → heavily distorted, surreal cave shapes
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Cave Warp")
-    float CaveWarpStrength = 8.0f;
+    float CaveWarpStrength = 16.0f;
 
     // Frequency of the warp noise. Lower = broader, smoother bends.
     // This controls the SCALE of the distortion.
@@ -708,10 +712,11 @@ struct VOXELFORGE_API FStrateGenerationParams
     // How strong the roughness is (in voxels of displacement).
     //   0   → perfectly smooth SDF shapes
     //   2-3 → subtle rocky texture
-    //   4-6 → natural rocky cave surfaces (good default)
+    //   2   → 0.5 m wall texture (human-scale default; bounded reach 0.94 m)
+    //   4-6 → stronger natural rocky cave surfaces
     //   8+  → very rough, jagged rock
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Roughness")
-    float SurfaceRoughness = 5.0f;
+    float SurfaceRoughness = 2.0f;
 
     // Frequency of the roughness noise. Higher = finer details.
     //   0.05  → large rocky features (boulders, ledges)
@@ -758,13 +763,14 @@ struct VOXELFORGE_API FStrateGenerationParams
     // Only applied below room center Z (fades to 0 at center, strongest at floor).
     // Does NOT affect the open space above room center or walls/ceiling.
     //
-    //   0   → disabled — full roughness on all surfaces (default)
+    //   0   → disabled — full roughness on all surfaces
     //   2-3 → subtle flattening, floor still has character
+    //   4     → 1 m of floor bias (human-scale default)
     //   4-6 → noticeably flatter floor while keeping wall/ceiling rough
     //   8+  → near-flat floor (good for navigable caves)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Roughness",
         meta = (ClampMin = "0.0"))
-    float FloorBias = 0.0f;
+    float FloorBias = 4.0f;
 
     // ===== TERRAIN OPERATIONS =====
     //
@@ -837,8 +843,9 @@ struct VOXELFORGE_API FStrateGenerationParams
     float OverhangStrength = 0.0f;
 
     // How far overhangs protrude from walls (in voxels of density added).
-    //   2-3 → small, 5-8 → natural, 10+ → dramatic
-    float OverhangDepth = 5.0f;
+    //   8   → 2 m optional shelf (human-scale default)
+    //   16+ → dramatic
+    float OverhangDepth = 8.0f;
 
     // Frequency of the overhang noise. Z freq is auto 5x lower for horizontal features.
     //   0.03 → large rare, 0.06 → moderate, 0.1+ → many small
@@ -919,8 +926,9 @@ struct VOXELFORGE_API FStrateGenerationParams
     //   0.06 → moderate (good for cathedral strates)
     //   0.1  → frequent bridges
     float ArchDensity = 0.0f;
-    float ArchMinRadius = 3.0f;
-    float ArchMaxRadius = 6.0f;
+    // Radius of an optional bridge tube: 1.5-3 m at the human-scale defaults.
+    float ArchMinRadius = 6.0f;
+    float ArchMaxRadius = 12.0f;
 
     // ===== COLUMNS / PILLARS =====
     //
@@ -939,8 +947,8 @@ struct VOXELFORGE_API FStrateGenerationParams
     //   0.15 → moderate (good for cathedral strates)
     //   0.3  → dense forest of pillars
     float ColumnDensity = 0.0f;
-    float ColumnMinRadius = 2.0f;
-    float ColumnMaxRadius = 5.0f;
+    float ColumnMinRadius = 4.0f;
+    float ColumnMaxRadius = 8.0f;
 
     // ===== PITS / VERTICAL SHAFTS =====
     //
@@ -960,24 +968,25 @@ struct VOXELFORGE_API FStrateGenerationParams
     //   0.08 → moderate (good for deep strates with vertical gameplay)
     //   0.15 → frequent pits (chaotic, maze-like)
     float PitDensity = 0.0f;
-    float PitMinRadius = 4.0f;
-    float PitMaxRadius = 10.0f;
-    float PitDepth = 25.0f;
+    float PitMinRadius = 8.0f;
+    float PitMaxRadius = 16.0f;
+    float PitDepth = 32.0f;
 
     // ----- Chimney / Shaft (upward voids — inverse of pits) -----
 
     // Chimneys: narrow vertical tubes piercing upward from cave ceilings.
     float ChimneyDensity = 0.0f;
-    float ChimneyMinRadius = 2.0f;
-    float ChimneyMaxRadius = 5.0f;
-    float ChimneyHeight = 20.0f;
+    float ChimneyMinRadius = 4.0f;
+    float ChimneyMaxRadius = 8.0f;
+    float ChimneyHeight = 32.0f;
 
     // ----- Dome (hemispherical chamber ceilings) -----
 
-    // Domes: hemispherical chamber ceilings for cathedral-like feel.
+    // Domes: hemispherical chamber ceilings for cathedral-like feel. The default 16-32 voxel
+    // radius is a 4-8 m optional ceiling feature; the surrounding room remains the main volume.
     float DomeDensity = 0.0f;
-    float DomeMinRadius = 8.0f;
-    float DomeMaxRadius = 15.0f;
+    float DomeMinRadius = 16.0f;
+    float DomeMaxRadius = 32.0f;
     float DomeHeightRatio = 0.8f;
 
     // ----- Pinch / Bottleneck (passage narrowing) -----
@@ -985,7 +994,7 @@ struct VOXELFORGE_API FStrateGenerationParams
     // Pinch: passage narrowing for bottlenecks/chokepoints.
     float PinchDensity = 0.0f;
     float PinchStrength = 5.0f;
-    float PinchLength = 12.0f;
+    float PinchLength = 24.0f;
 
     // ----- Strate boundary sealing -----
 
@@ -1129,7 +1138,7 @@ struct VOXELFORGE_API FSlabGenerationParams
     // 0.0 = at the very bottom of the strate, 1.0 = at the very top.
     // Keep this well below CeilingRelativeHeight or you get no open space.
     //   0.1-0.2 → floor is near the bottom (lots of headroom)
-    //   0.25    → floor at 25% height (good default)
+    //   0.25    → floor at 16 m in a 64 m strate (human-scale default)
     //   0.4+    → very low ceiling; claustrophobic plains
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Shape",
         meta = (ClampMin = "0.0", ClampMax = "0.95"))
@@ -1138,12 +1147,12 @@ struct VOXELFORGE_API FSlabGenerationParams
     // Where the ceiling surface sits, relative to this strate's height.
     // Must be above FloorRelativeHeight. The difference determines how tall
     // the open void is.
-    //   0.6  → moderate ceiling height (tight plains)
-    //   0.8  → tall open space (good default for FlatPlain)
+    //   0.6  → ceiling at 38.4 m in a 64 m strate (22.4 m open span)
+    //   0.8  → tall open space
     //   0.9+ → nearly the full strate height is open (cavernous plains)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Shape",
         meta = (ClampMin = "0.05", ClampMax = "1.0"))
-    float CeilingRelativeHeight = 0.80f;
+    float CeilingRelativeHeight = 0.60f;
 
     // ===== FLOOR ROUGHNESS =====
     // Perlin-based displacement of the floor surface up/down.
@@ -1152,7 +1161,8 @@ struct VOXELFORGE_API FSlabGenerationParams
 
     // How many voxels the floor surface can shift up or down.
     //   0   → perfectly flat floor (artificial, but dramatic)
-    //   3-5 → subtle rolling ground (good for FlatPlain)
+    //   4   → 1 m rolling ground displacement (human-scale default)
+    //   3-5 → subtle rolling ground
     //   8+  → significant hills, deep valleys
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Floor")
     float FloorRoughness = 4.0f;
@@ -1172,8 +1182,8 @@ struct VOXELFORGE_API FSlabGenerationParams
 
     // How far ceiling formations hang down into the void (in voxels).
     //   0     → flat ceiling (no formations)
-    //   4-6   → subtle bumps (FlatPlain default)
-    //   10-15 → significant formations (CrystalChamber default)
+    //   6     → 1.5 m downward formations (FlatPlain/Crystal default)
+    //   10-15 → significant formations
     //   20+   → dramatic columns reaching toward the floor
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Ceiling")
     float CeilingRoughness = 6.0f;
@@ -1205,22 +1215,22 @@ struct VOXELFORGE_API FSlabGenerationParams
 
     // Smallest column radius (in voxels).
     //   1-2 → slender needle-like pillars
-    //   3-4 → narrow columns (good default)
+    //   8   → 2 m radius / 4 m diameter (human-scale minimum)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Columns")
-    float ColumnMinRadius = 2.0f;
+    float ColumnMinRadius = 8.0f;
 
     // Largest column radius (in voxels).
-    //   6-8   → natural stone pillars (good default)
-    //   12-15 → massive trunks
+    //   8-16  → 2-4 m optional pillars
+    //   24+   → massive trunks
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Columns")
-    float ColumnMaxRadius = 7.0f;
+    float ColumnMaxRadius = 16.0f;
 
     // Hash grid cell size (higher = columns further apart).
     //   30 → dense grid, many candidate slots (most empty due to ColumnDensity)
-    //   60 → moderate spacing (good default)
+    //   96 → 24 m spacing (human-scale default)
     //   100+ → only occasional columns
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slab|Columns")
-    float ColumnSpacing = 60.0f;
+    float ColumnSpacing = 96.0f;
 
     // ===== BOUNDARY & DENSITY =====
 
@@ -1265,14 +1275,14 @@ struct VOXELFORGE_API FMazeGenerationParams
     GENERATED_BODY()
 
     // Lattice cell size in voxels. Smaller = tighter, more claustrophobic maze.
-    //   25-35 → very tight warren · 40 → classic maze (default) · 60+ → roomy
+    //   32    → compact maze cell · 64 → 16 m fight-space cell (default) · 96+ → roomy
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "8.0"))
-    float CellSize = 40.0f;
+    float CellSize = 64.0f;
 
     // Corridor tube radius in voxels. Keep well below CellSize/2 to leave walls.
-    //   3 → crawlspace · 4 → walkable (default) · 6 → wide halls
+    //   4-5 → marginal passage · 8 → 2 m radius / 4 m bore (default) · 10+ → broad hall
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "1.0"))
-    float CorridorRadius = 4.0f;
+    float CorridorRadius = 8.0f;
 
     // Probability that a horizontal edge between adjacent cells is open (0-1).
     // Lower = more dead ends and a more maze-like feel; higher = more open/connected.
@@ -1321,12 +1331,12 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     // Mean ground height as a fraction of the strate height (0 = bottom, 1 = top).
     // The terrain heightfield varies around this baseline by ElevationRange.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape", meta = (ClampMin = "0.05", ClampMax = "0.9"))
-    float BaseGroundRelative = 0.30f;
+    float BaseGroundRelative = 0.25f;
 
     // Total vertical amplitude of the terrain heightfield in voxels (peak-to-trough-ish).
-    //   20 → gentle plains · 60 → hills + valleys (default) · 120+ → tall mountains
+    //   20 → gentle plains · 80 → 20 m hills + valleys (default) · 120+ → tall mountains
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape", meta = (ClampMin = "0.0"))
-    float ElevationRange = 60.0f;
+    float ElevationRange = 80.0f;
 
     // Low-frequency "continent" noise — broad landmasses and basins.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape")
@@ -1345,9 +1355,10 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape")
     float DetailFrequency = 0.04f;
 
-    // Small-scale surface roughness in voxels (rocks, bumps).
+    // Small-scale surface roughness in voxels (rocks, bumps). The default 2 voxels is 0.5 m;
+    // its proved 0.94 m noise reach remains small beside the 20 m terrain relief.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Shape", meta = (ClampMin = "0.0"))
-    float SurfaceRoughness = 3.0f;
+    float SurfaceRoughness = 2.0f;
 
     // ----- Macro relief & landforms -----
 
@@ -1355,7 +1366,7 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     // sampling continents/mountains. Bends straight coastlines and ridgelines into winding,
     // organic landforms. 0 = no warp (axis-aligned blobby noise, the old look).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0"))
-    float HeightWarpStrength = 35.0f;
+    float HeightWarpStrength = 48.0f;
 
     // Frequency of the domain-warp noise. Lower = broader, sweeping bends.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro")
@@ -1382,9 +1393,10 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float TerraceStrength = 0.0f;
 
-    // Height of each terrace step in voxels (when TerraceStrength > 0).
+    // Height of each terrace step in voxels (when TerraceStrength > 0). The 8-voxel default is
+    // a 2 m optional landform step; TerraceStrength remains off by default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Macro", meta = (ClampMin = "1.0"))
-    float TerraceHeight = 12.0f;
+    float TerraceHeight = 8.0f;
 
     // Terrace edge sharpness (0-1). 0 = soft rounded steps; 1 = crisp flat mesas with near-
     // vertical risers. Only matters when TerraceStrength > 0. (F20 — the plateau tops flatten
@@ -1405,9 +1417,9 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
     float LayerLineDepth = 0.0f;
 
-    // Vertical spacing between layer lines in voxels (band period).
+    // Vertical spacing between layer lines in voxels (band period). The 8-voxel default is 2 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "1.0"))
-    float LayerLineSpacing = 4.0f;
+    float LayerLineSpacing = 8.0f;
 
     // Cliff STEEPENING (0-1 master): where the surface is already STEEP (slope > threshold),
     // push the height away from the local mean so gentle slopes become sheer walls / canyon
@@ -1448,13 +1460,13 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     // at which the terrain gradient is measured (so a spot over the void can "see" the cliff). Bigger =
     // deeper overhangs reaching further out (and a bit more cost). ~8-20.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
-    float OverhangReach = 12.0f;
+    float OverhangReach = 16.0f;
 
     // Vertical HEIGHT (voxels) of the overhang zone above the local ground — where the shelf sits above
     // the ground/void directly under it, AND the band ClassifyTile treats as ambiguous (so it never holes
     // a trivially-skipped tile). Larger = taller/higher shelves but more woken air tiles near cliffs.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Ops", meta = (ClampMin = "0.0"))
-    float OverhangHeight = 20.0f;
+    float OverhangHeight = 24.0f;
 
     // Horizontal frequency of the shelf-shape noise (breaks the reach up so shelves are ragged, not a
     // uniform lip). Lower = broader, smoother shelves.
@@ -1480,9 +1492,9 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Water", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float WaterLevelRelative = 0.27f;
 
-    // Width (voxels) of the flattened beach/shore band around the water line.
+    // Width (voxels) of the flattened beach/shore band around the water line. The default is 3 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Water", meta = (ClampMin = "0.0"))
-    float BeachWidth = 8.0f;
+    float BeachWidth = 12.0f;
 
     // ----- Sky cap & boundary -----
 
@@ -1491,7 +1503,7 @@ struct VOXELFORGE_API FSurfaceGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.3", ClampMax = "1.0"))
     float CeilingRelative = 0.95f;
 
-    // Downward bumpiness of the sky-cap ceiling (voxels). 0 = flat ceiling.
+    // Downward bumpiness of the sky-cap ceiling (voxels). 0 = flat ceiling; 6 = 1.5 m detail.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Sky", meta = (ClampMin = "0.0"))
     float CeilingRoughness = 6.0f;
 
@@ -1564,39 +1576,41 @@ struct VOXELFORGE_API FVerticalShaftParams
     GENERATED_BODY()
 
     // Hash-grid cell size for shaft XY placement (voxels). Larger = shafts further apart.
+    // 80 voxels = 20 m, leaving room for a 4-7 m diameter shaft and a fight lane.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "10.0"))
-    float ShaftSpacing = 55.0f;
+    float ShaftSpacing = 80.0f;
 
     // Probability a grid cell contains a shaft (0-1).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float ShaftDensity = 0.6f;
 
-    // Shaft radius range (voxels).
+    // Shaft radius range (voxels): 4-7 m diameter at the human-scale default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "1.0"))
-    float ShaftMinRadius = 5.0f;
+    float ShaftMinRadius = 8.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "1.0"))
-    float ShaftMaxRadius = 11.0f;
+    float ShaftMaxRadius = 14.0f;
 
     // Chance an adjacent pair of shafts is joined by a horizontal connector tunnel (0-1).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float CrossConnectChance = 0.35f;
 
-    // Radius of horizontal connector tunnels (voxels).
+    // Radius of horizontal connector tunnels (voxels): 1.5 m radius / 3 m bore by default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "1.0"))
-    float ConnectorRadius = 4.0f;
+    float ConnectorRadius = 6.0f;
 
-    // Vertical spacing of ledges inside shafts (voxels). 0 = no ledges (sheer drops).
+    // Vertical spacing of ledges inside shafts (voxels). 32 = 8 m landing interval;
+    // 0 = no ledges (sheer drops).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0"))
-    float LedgeSpacing = 24.0f;
+    float LedgeSpacing = 32.0f;
 
-    // How far ledges intrude into the shaft (voxels of solid added).
+    // How far ledges intrude into the shaft (voxels of solid added). 4 = 1 m by default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0"))
-    float LedgeDepth = 3.0f;
+    float LedgeDepth = 4.0f;
 
     // Small-scale wall roughness (voxels).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0"))
-    float SurfaceRoughness = 3.0f;
+    float SurfaceRoughness = 2.0f;
 
     // Solid shell thickness at strate top/bottom (voxels).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shafts", meta = (ClampMin = "0.0"))
@@ -1626,25 +1640,26 @@ struct VOXELFORGE_API FFloatingIslandParams
 {
     GENERATED_BODY()
 
-    // Hash-grid cell size for island placement (voxels). Larger = islands further apart.
+    // Hash-grid cell size for island placement (voxels). 112 = 28 m, while the largest default
+    // island is 24 m across, leaving a 2 m centre-to-edge gap.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "20.0"))
-    float IslandSpacing = 95.0f;
+    float IslandSpacing = 112.0f;
 
     // Probability a grid cell contains an island (0-1).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float IslandDensity = 0.5f;
 
-    // Island horizontal radius range (voxels).
+    // Island horizontal radius range (voxels): 12-24 m landmass diameters by default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "2.0"))
-    float IslandMinRadius = 18.0f;
+    float IslandMinRadius = 24.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "2.0"))
-    float IslandMaxRadius = 42.0f;
+    float IslandMaxRadius = 48.0f;
 
     // Island vertical thickness as a fraction of its horizontal radius.
-    //   0.4 → thin plates · 0.7 → chunky (default) · 1.0 → near-spherical
+    //   0.4 → thin plates · 0.6 → substantial landmass (default) · 1.0 → near-spherical
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.1", ClampMax = "1.5"))
-    float ThicknessRatio = 0.7f;
+    float ThicknessRatio = 0.6f;
 
     // How much islands scatter vertically within the void (0 = all mid-height, 1 = full spread).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -1656,11 +1671,11 @@ struct VOXELFORGE_API FFloatingIslandParams
 
     // Surface roughness on island shells (voxels) — craggy undersides, bumpy tops.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.0"))
-    float SurfaceRoughness = 4.0f;
+    float SurfaceRoughness = 3.0f;
 
-    // SmoothMin blend radius for merging overlapping islands (voxels).
+    // SmoothMin blend radius for merging overlapping islands (voxels): 1.5 m by default.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.0"))
-    float SDFBlendRadius = 5.0f;
+    float SDFBlendRadius = 6.0f;
 
     // Solid shell thickness at strate top/bottom (voxels).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Islands", meta = (ClampMin = "0.0"))
@@ -1696,27 +1711,30 @@ struct VOXELFORGE_API FStrateDisturbanceParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Chasms", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float ChasmDensity = 0.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Chasms", meta = (ClampMin = "20.0"))
-    float ChasmSpacing = 170.0f;
+    // 192 voxels = 48 m between optional chasm sites.
+    float ChasmSpacing = 192.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Chasms", meta = (ClampMin = "1.0"))
-    float ChasmRadius = 14.0f;
+    float ChasmRadius = 24.0f;
 
     // --- BRIDGES: horizontal solid spans across open space ---
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Bridges", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float BridgeDensity = 0.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Bridges", meta = (ClampMin = "20.0"))
-    float BridgeSpacing = 120.0f;
+    // 128 voxels = 32 m between optional bridge sites.
+    float BridgeSpacing = 128.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Bridges", meta = (ClampMin = "1.0"))
-    float BridgeRadius = 5.0f;
+    float BridgeRadius = 8.0f;
 
     // --- RIDGES: thin solid blades rising from the floor ---
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Ridges", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float RidgeDensity = 0.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Ridges", meta = (ClampMin = "20.0"))
-    float RidgeSpacing = 110.0f;
+    // 128 voxels = 32 m between optional ridge sites.
+    float RidgeSpacing = 128.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Ridges", meta = (ClampMin = "0.0"))
-    float RidgeHeight = 30.0f;
+    float RidgeHeight = 32.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance|Ridges", meta = (ClampMin = "1.0"))
-    float RidgeThickness = 6.0f;
+    float RidgeThickness = 8.0f;
 
     // Rock solidity used to scale carve/fill strength. Match the strate's BaseDensity.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Disturbance")
@@ -1768,33 +1786,36 @@ struct VOXELFORGE_API FStratePassageConfig
 
     // ----- WIDTH (tapers along the length) -----
     // Radius at the two mouths (entry/exit) and at the middle. Equal = uniform tube;
+    // The defaults are 2 m radius / 4 m bore at mouths and 1.5 m radius / 3 m bore in the middle.
     // Mouth > Mid = chambers at the ends with a squeeze between; Mid > Mouth = a bulge.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MouthRadius = 6.0f;
+    float MouthRadius = 8.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MidRadius = 4.0f;
+    float MidRadius = 6.0f;
 
     // ----- LENGTH -----
-    // How far the tunnel reaches INTO each strate (voxels). Auto-capped to the interior.
+    // How far the tunnel reaches INTO each strate (voxels). Auto-capped to the interior;
+    // the defaults span 8-24 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Length", meta = (ClampMin = "8.0"))
-    float ReachMin = 40.0f;
+    float ReachMin = 32.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Length", meta = (ClampMin = "8.0"))
-    float ReachMax = 90.0f;
+    float ReachMax = 96.0f;
 
     // ----- PLACEMENT -----
-    // Horizontal distance range from the (0,0) spine (voxels) where tunnels may appear.
+    // Horizontal distance range from the (0,0) spine (voxels) where tunnels may appear;
+    // the defaults are 16-48 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Placement", meta = (ClampMin = "0.0"))
-    float DistanceMin = 60.0f;
+    float DistanceMin = 64.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Placement", meta = (ClampMin = "0.0"))
-    float DistanceMax = 200.0f;
+    float DistanceMax = 192.0f;
 
     // ----- SHAPE detail -----
-    // Worm: max sideways excursion from the axis (voxels). 0 = straight even in Worm style.
+    // Worm: max sideways excursion from the axis (voxels). 24 = 6 m; 0 = straight even in Worm style.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Shape", meta = (ClampMin = "0.0"))
-    float Wander = 15.0f;
+    float Wander = 24.0f;
 
     // Path resolution (control points). Higher = smoother curves; lower = more faceted /
     // cheaper. The worm makes several bends, so keep this reasonably high for smoothness.
@@ -1805,19 +1826,21 @@ struct VOXELFORGE_API FStratePassageConfig
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Shape", meta = (ClampMin = "0.0"))
     float VerticalWobble = 0.0f;
 
-    // Spiral style: helix radius (voxels) and number of full turns over the descent.
+    // Spiral style: helix radius (voxels) and number of full turns over the descent. The default
+    // radius is 6 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Spiral", meta = (ClampMin = "1.0"))
-    float SpiralRadius = 16.0f;
+    float SpiralRadius = 24.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Spiral", meta = (ClampMin = "0.25"))
     float SpiralTurns = 2.0f;
 
-    // Cascading style: number of ledge+drop steps, and how far each ledge runs (voxels).
+    // Cascading style: number of ledge+drop steps, and how far each ledge runs (voxels). The
+    // default ledge run is 2 m.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Cascade", meta = (ClampMin = "1", ClampMax = "16"))
     int32 CascadeSteps = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Cascade", meta = (ClampMin = "0.0"))
-    float CascadeLedge = 14.0f;
+    float CascadeLedge = 8.0f;
 };
 
 //=============================================================================

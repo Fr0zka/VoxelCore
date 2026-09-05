@@ -2107,7 +2107,9 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
 
     FVoxelStrateMeasureSettings BaseSettings;
     BaseSettings.CenterXY = FVector2D::ZeroVector;
-    BaseSettings.MaxCells = 8000000;
+    // The centered control stays bounded after the 4 m vertical-volume fixture is retained;
+    // 12 M also leaves room for the scale-aware 320-voxel control below.
+    BaseSettings.MaxCells = 12000000;
     BaseSettings.HeadroomCells = 2;
     BaseSettings.InteriorMarginVoxels = -1;
 
@@ -2121,8 +2123,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         {4, 256},
         {4, 192},
         {2, 192},
-        {4, 128},
-        {1, 128},
+        {4, 160},
+        {1, 160},
     };
 
     bool bAllChecksPassed = true;
@@ -2458,7 +2460,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     }
     Summary += TEXT(
         "Controlled comparisons hold radius constant: (step 4, radius 192) vs (step 2, "
-        "radius 192), and (step 4, radius 128) vs (step 1, radius 128).\n");
+        "radius 192), and (step 4, radius 160) vs (step 1, radius 160).\n");
     Summary += FString::Printf(
         TEXT("VerticalShafts refinement sweep wall-clock: %.3f seconds.\n"),
         SweepSeconds);
@@ -3236,10 +3238,17 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     // PART A/B — the production acceptance window follows the actual two mouths. The older
     // centered-window diagnostics above remain useful for the origin-spine invariant; they are
     // deliberately not reused here because a mouth-fitted box is not expected to contain (0,0).
-    constexpr int32 FittedMaxCells = 20000000;
+    // The tree's prescribed neighbour fallback reaches three shaft-grid cells. A mouth window
+    // must therefore cover three spacings beyond the endpoints before it can be called a fitted
+    // diagnostic box. This grows with the body-scale shaft spacing rather than preserving the
+    // old 48-voxel window by habit.
+    const FVerticalShaftParams& FittedShaftParams =
+        Layout[VerticalShaftsIndex].Definition->VerticalShaftParams;
+    const float FittedMargin = FMath::Max(
+        48.0f, 3.0f * FMath::Max(FittedShaftParams.ShaftSpacing, 1.0f));
+    const float DoubledFittedMargin = 2.0f * FittedMargin;
+    constexpr int32 FittedMaxCells = 120000000;
     constexpr int32 BeforeChangeMaxCells = 12000000;
-    constexpr float FittedMargin = 48.0f;
-    constexpr float DoubledFittedMargin = 96.0f;
 
     auto MakeFittedSettings = [&](int32 SampleStep,
                                   const FVector& A,
@@ -3297,8 +3306,8 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     };
 
     Summary += TEXT(
-        "PART A — fitted VerticalShafts mouth window (AABB of the two XY mouths + 48 voxels; "
-        "step 1/2; fitted MaxCells=20000000):\n");
+        "PART A — fitted VerticalShafts mouth window (AABB of the two XY mouths + three shaft "
+        "spacings; step 1/2; doubled-margin control; fitted MaxCells=120000000):\n");
     Summary += TEXT(
         "  seed | step | default margin verdict | fitted dimensions/cells | doubled-margin check | "
         "interpretation | arrival component share | departure component share\n");
@@ -3341,12 +3350,21 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         {
             AddError(FString::Printf(
                 TEXT("HARD FAILURE: fitted-window seed %d has a VerticalShafts mouth not on a "
-                     "shaft axis (arrival axis=%s, departure axis=%s)."),
+                     "shaft axis (arrival axis=%s, departure axis=%s; arrival=(%.3f,%.3f,%.3f); "
+                     "departure=(%.3f,%.3f,%.3f); spacing=%.3f; density=%.3f)."),
                 Seed,
                 IsVerticalShaftAxis(ShaftParams, Seed, ResolutionArrivalPoint)
                     ? TEXT("yes") : TEXT("no"),
                 IsVerticalShaftAxis(ShaftParams, Seed, ResolutionDeparturePoint)
-                    ? TEXT("yes") : TEXT("no")));
+                    ? TEXT("yes") : TEXT("no"),
+                ResolutionArrivalPoint.X,
+                ResolutionArrivalPoint.Y,
+                ResolutionArrivalPoint.Z,
+                ResolutionDeparturePoint.X,
+                ResolutionDeparturePoint.Y,
+                ResolutionDeparturePoint.Z,
+                ShaftParams.ShaftSpacing,
+                ShaftParams.ShaftDensity));
             bPartAFittedChecksPassed = false;
         }
 
@@ -3491,13 +3509,13 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
     }
 
     Summary += TEXT(
-        "PART B — fitted 16-seed audit (step 2, margin 48): strict-local-minimum shafts are the "
+        "PART B — fitted 16-seed audit (step 2, margin=three shaft spacings): strict-local-minimum shafts are the "
         "pre-fix orphan candidates; post-fix parent paths are checked with the same fixed ±2/±3 "
         "resolver over a padded [-20,20] cell audit domain. Small-component threshold is one "
         "mean-radius shaft volume.\n");
     Summary += TEXT(
         "  seed | fitted verdict | cells | components | small non-largest/total | strict minima/shafts "
-        "| neighbour fallback | path orphans | axis mouths | doubled margin 96 verdict/cells | "
+        "| neighbour fallback | path orphans | axis mouths | doubled fitted-margin verdict/cells | "
         "tree path XY bounds\n");
 
     static constexpr int32 FittedSeedCases[] = {
@@ -3859,7 +3877,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         SmallComponentThresholdMin == INT32_MAX ? 0 : SmallComponentThresholdMin,
         SmallComponentThresholdMax);
     Summary += FString::Printf(
-        TEXT("  fitted acceptance arrival->departure: %s (%d/%d effective pass; direct margin48="
+        TEXT("  fitted acceptance arrival->departure: %s (%d/%d effective pass; direct fitted margin="
              "%d/%d, %d fail; binding negatives=%d, trusted negatives=%d, measurement limits=%d); "
              "sweep wall-clock=%.3f seconds.\n"),
         SweepPasses == UE_ARRAY_COUNT(FittedSeedCases) && SweepFailures == 0

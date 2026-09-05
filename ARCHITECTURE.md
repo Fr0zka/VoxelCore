@@ -11,6 +11,50 @@
 A large A-to-Z expansion. The world is a stack of strates the player descends through;
 each strate can be a fundamentally different *archetype*, connected at (0,0).
 
+### 8.0 Human-scale generation contract (2026-09-05)
+
+All authored lengths are voxel-space values, converted at the boundary by `0.25 m/voxel`. The body
+reference is a **0.34 m radius, 1.76 m tall** capsule (`1.36 × 7.04` voxels). The default strate
+height is now **8 chunks = 256 voxels = 64 m**, which is intentionally larger than the 3-4 chunk
+boss-arena anchor so an archetype can reserve seals, vertical play, and a high ceiling together.
+
+The default size families are deliberately independent:
+
+| Feature | Default metre derivation | Coupling kept sound |
+|---------|--------------------------|---------------------|
+| Room network | radius 4-10 m (8-20 m diameters), origin radius 12 m (24 m hub), cell spacing 32 m | `MaxRoomRadius 40 < RoomSpacing/2 64`; a 6 m radial margin remains around the largest room |
+| Round passages | 1.5-2 m radius (3-4 m bores); maze corridor radius 2 m (4 m bore) | a 1.76 m body fits vertically with headroom; Maze `8 < CellSize/2 32` |
+| Slab | floor at 16 m, ceiling at 38.4 m, 22.4 m open span | floor/ceiling noise and 4-8 m column diameters remain inside the open span |
+| SurfaceWorld | 20 m terrain relief, 12 m warp, 60.8 m sky cap | terrain features are bounded below the 64 m strate envelope |
+| VerticalShafts | 4-7 m shaft diameters, 3 m connector bore, 8 m ledge interval | shaft spacing is 20 m; connector/ledge values are derived from the roughness envelope |
+| FloatingIslands | 12-24 m island diameters, 28 m cell spacing | the largest island leaves a 2 m centre-to-edge gap; thickness is separately derived |
+| Inter-strate passages | 3-4 m mouth bore, 3 m mid bore, 8-24 m reach, 16-48 m offset | width, reach, and wander are separate body/placement decisions |
+
+For wall detail, `VOXEL_NOISE_SCALE=1.25` and the proven `sup|fBM|=1.5` give a roughness reach of
+`1.875 × SurfaceRoughness` voxels. The default ratios are **0.625** against the minimum tunnel
+radius, **0.469** against the Maze corridor radius, **0.469/0.625** against shaft/connector radii,
+**0.234** against the minimum island radius (**0.484** including its 6-voxel blend), and
+**0.625/0.938** against slab column radius for floor/ceiling roughness. SurfaceWorld is a
+heightfield, so its **0.047** ratio is against its 80-voxel relief scale, not a fictitious radial
+feature. FlatPlain and CrystalChamber intentionally share `GetSlabDensity` and the same slab
+parameter block; they cannot acquire separate scale geometry without a generator change.
+
+This scale contract is informed by [Epic's Unreal level-blockout guidance](https://dev.epicgames.com/documentation/en-us/unreal-engine/designer-01-project-setup-and-level-blockout-in-unreal-engine), which recommends a player-sized reference and gives 2-3 m hall / 3-4 m height starting guidance. The
+[2010 ADA Standards](https://www.ada.gov/law-and-regs/design-standards/2010-stds/) are a lower-bound
+accessibility reference (915 mm clear walking width and larger passing/turning spaces), while
+[NPS Lehman Cave dimensions](https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm) support
+keeping natural chambers heterogeneous and allowing 20 m-plus cathedral volumes.
+
+Validation is deliberately split by cost: bounded regression fixtures remain 4 chunks, while the
+production definition, season defaults, and owner-facing showcase use 8 chunks. The final focused
+showcase (`WorldScaleShowcaseProductionFinal`) exhausted 256 rolls, measured 82 eligible single-region
+rolls, skipped 174 multi-region rolls while lateral regions remain gated, and found **0/8** complete
+hard-gate survivor set at fine step 1. It still produced diagnostic cards (7 fine renders, 1 refusal,
+1 blank). The full `VoxelForge` run (`WorldScaleFullFinal3`) recorded **28 successes, 2 warning-only,
+0 failures, 0 not-run**; all box-verdict violation counts were **0**, `WorldRadiusVoxels` stayed **0**,
+and operator-stack equivalence paths remained bit-identical. The two authored-corpus relation findings
+(2/12) are conservative experiment-envelope findings, not box-verdict violations.
+
 ### 8.1 Archetypes (`ECaveGeneratorType`, VoxelStrateTypes.h)
 Each archetype has its own param `USTRUCT` (on `UVoxelStrateDefinition`, EditCondition-gated
 by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispatched by the
@@ -421,7 +465,8 @@ TunnelNetwork and Underwater keep the nearest hash-room vertical placement at th
 `MakeStrateSeed(world-seed, strate-index)` matching the room graph's existing identity; FlatPlain and
 CrystalChamber recompute their slab void band and reject column-overlap points. Maze snaps to the
 nearest roughness-safe horizontal lattice corridor within one cell, VerticalShafts to the exact
-axis of a roughness-safe shaft on the drainage tree within one shaft spacing, and FloatingIslands
+axis of a roughness-safe shaft on the drainage tree within two shaft spacings at the default site
+density, and FloatingIslands
 to a validated blob top within one island spacing.
 Those three return false when no footing exists inside that explicit lateral budget. GeneratePassages
 interpolates the snapped XY through the control-point chain and recomputes its conservative bound;

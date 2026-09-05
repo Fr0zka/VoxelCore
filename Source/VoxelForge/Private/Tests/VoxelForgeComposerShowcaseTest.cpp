@@ -27,7 +27,7 @@ namespace
     constexpr float ClearanceNormalizationVoxels = 64.0f;
     constexpr int32 FinePreviewSampleStep = 1;
     constexpr int32 FinePreviewRadiusVoxels = 64;
-    constexpr int32 FinePreviewMaxCells = 2000000;
+    constexpr int32 FinePreviewMaxCells = 4000000;
 
     const ECaveGeneratorType GShowcaseArchetypes[] = {
         ECaveGeneratorType::CrystalChamber,
@@ -125,20 +125,45 @@ namespace
         int32 EvaluatedCandidates = 0;
         TArray<FShowcaseSample> Survivors;
         TOptional<FShowcaseSample> Best;
+        // Best coarse-measured candidate, retained even when a hard gate rejects it. This keeps
+        // the scale audit useful when the player-fit law correctly finds no survivor.
+        TOptional<FShowcaseSample> BestMeasured;
+        int32 MeasuredCandidates = 0;
         FString LastFailure;
     };
+
+    bool VF_IsBetterShowcaseSample(const FShowcaseSample& Sample,
+                                   const TOptional<FShowcaseSample>& Current)
+    {
+        return !Current.IsSet()
+            || Sample.SelectionScore > Current->SelectionScore
+            || (Sample.SelectionScore == Current->SelectionScore
+                && (Sample.Candidate.Seed < Current->Candidate.Seed
+                    || (Sample.Candidate.Seed == Current->Candidate.Seed
+                        && Sample.Candidate.Index < Current->Candidate.Index)));
+    }
 
     void VF_AddMetricSample(FShowcaseStats& Stats, const FShowcaseSample& Sample)
     {
         Stats.Survivors.Add(Sample);
-        if (!Stats.Best.IsSet()
-            || Sample.SelectionScore > Stats.Best->SelectionScore
-            || (Sample.SelectionScore == Stats.Best->SelectionScore
-                && (Sample.Candidate.Seed < Stats.Best->Candidate.Seed
-                    || (Sample.Candidate.Seed == Stats.Best->Candidate.Seed
-                        && Sample.Candidate.Index < Stats.Best->Candidate.Index))))
+        if (VF_IsBetterShowcaseSample(Sample, Stats.Best))
         {
             Stats.Best = Sample;
+        }
+    }
+
+    void VF_AddMeasuredSample(FShowcaseStats& Stats, const FShowcaseSample& Sample)
+    {
+        // NumSampled is the direct evidence that the coarse grid was built. Keep this diagnostic
+        // path independent of the legacy gate's bool return and of any future metric-validity
+        // policy changes: a rejected candidate can still be the most useful scale evidence.
+        if (Sample.Candidate.bValid && Sample.Metrics.NumSampled > 0)
+        {
+            ++Stats.MeasuredCandidates;
+            if (VF_IsBetterShowcaseSample(Sample, Stats.BestMeasured))
+            {
+                Stats.BestMeasured = Sample;
+            }
         }
     }
 
@@ -569,6 +594,396 @@ namespace
         return Report;
     }
 
+    FString VF_FormatWorldScaleAudit()
+    {
+        constexpr float VoxelMetres = 0.25f;
+        constexpr float StrateHeightVoxels = 8.0f * static_cast<float>(CHUNK_SIZE);
+        FString Report = TEXT(
+            "WORLD SCALE AUDIT (all distances are authored in voxels; METRES = voxels * 0.25; "
+            "player radius=1.36 vox/0.34 m, height=7.04 vox/1.76 m; frequency rows show nominal "
+            "period=1/frequency)\n"
+            "archetype | name | voxels | METRES | body/level meaning\n");
+        auto Add = [&Report](const TCHAR* Archetype, const TCHAR* Name,
+                             float Voxels, const TCHAR* Meaning)
+        {
+            Report += FString::Printf(
+                TEXT("%s | %s | %.2f | %.2f | %s\n"), Archetype, Name,
+                Voxels, Voxels * 0.25f, Meaning);
+        };
+        auto AddRange = [&Report](const TCHAR* Archetype, const TCHAR* Name,
+                                  float MinVoxels, float MaxVoxels,
+                                  const TCHAR* Meaning)
+        {
+            Report += FString::Printf(
+                TEXT("%s | %s | %.2f..%.2f | %.2f..%.2f | %s\n"), Archetype, Name,
+                MinVoxels, MaxVoxels, MinVoxels * 0.25f, MaxVoxels * 0.25f, Meaning);
+        };
+        const TCHAR* TunnelNames[] = { TEXT("TunnelNetwork"), TEXT("Underwater") };
+        for (const TCHAR* Archetype : TunnelNames)
+        {
+            Add(Archetype, TEXT("StrateHeight"), StrateHeightVoxels,
+                TEXT("8 chunks: a 64 m vertical envelope for tall rooms and passages"));
+            Add(Archetype, TEXT("BoundarySealThickness"), 4.0f,
+                TEXT("1 m solid geological boundary; not player space"));
+            Add(Archetype, TEXT("WormNetworkRange"), 64.0f,
+                TEXT("16 m side-passage reach around the room/tunnel skeleton"));
+            Add(Archetype, TEXT("WormFrequency (nominal period)"), 1.0f / 0.015f,
+                TEXT("16.7 m noise period: about two chunks for broad bends"));
+            Add(Archetype, TEXT("RoomSpacing"), 128.0f,
+                TEXT("32 m room-cell spacing; leaves a 6 m radial margin around a 20 m room"));
+            AddRange(Archetype, TEXT("RoomRadius"), 16.0f, 40.0f,
+                     TEXT("8 m minimum room to 20 m large chamber diameter"));
+            Add(Archetype, TEXT("OriginRoomRadius"), 48.0f,
+                TEXT("24 m hub diameter: a three-chunk boss-space anchor"));
+            AddRange(Archetype, TEXT("TunnelRadius"), 6.0f, 8.0f,
+                     TEXT("3-4 m bores: body height plus generous headroom and fight width"));
+            Add(Archetype, TEXT("MaxTunnelLength"), 360.0f,
+                TEXT("90 m: reaches the worst 32 m cell-jitter neighbour with margin"));
+            Add(Archetype, TEXT("TunnelWarpStrength"), 24.0f,
+                TEXT("6 m lateral bend, visibly organic but smaller than the 90 m reach"));
+            Add(Archetype, TEXT("SDFBlendRadius"), 4.0f,
+                TEXT("1 m junction rounding, below the 1.5 m minimum tunnel radius"));
+            Add(Archetype, TEXT("CaveWarpStrength"), 16.0f,
+                TEXT("4 m skeleton distortion"));
+            Add(Archetype, TEXT("SurfaceRoughness"), 2.0f,
+                TEXT("0.5 m wall texture; bounded reach is 0.94 m"));
+            Add(Archetype, TEXT("FloorReliefStrength"), 4.0f,
+                TEXT("1 m floor undulation, small relative to a 3 m bore"));
+            Add(Archetype, TEXT("FloorReliefFrequency (nominal period)"), 1.0f / 0.015f,
+                TEXT("16.7 m floor-undulation period: broad enough to walk as a slope"));
+            Add(Archetype, TEXT("RoughnessFrequency (nominal period)"), 1.0f / 0.1f,
+                TEXT("2.5 m wall-detail period: a few body lengths, not voxel-grain tunnel"));
+            Add(Archetype, TEXT("CaveWarpFrequency (nominal period)"), 1.0f / 0.015f,
+                TEXT("16.7 m skeleton-warp period: broad landform-scale bend"));
+            Add(Archetype, TEXT("DomainWarpFrequency (nominal period)"), 1.0f / 0.03f,
+                TEXT("8.3 m optional roughness-warp period"));
+            Add(Archetype, TEXT("CliffSampleDist (transport)"), 2.0f,
+                TEXT("0.5 m optional local slope sample distance"));
+            Add(Archetype, TEXT("FloorBias"), 4.0f,
+                TEXT("1 m floor stabilisation applied below room centre"));
+            Add(Archetype, TEXT("DomainWarpStrength"), 0.0f,
+                TEXT("0 m optional roughness-coordinate warp; disabled by default"));
+            Add(Archetype, TEXT("OverhangFrequency (nominal period)"), 1.0f / 0.06f,
+                TEXT("4.2 m optional shelf-shape period"));
+            Add(Archetype, TEXT("ScallopFrequency (nominal period)"), 1.0f / 0.1f,
+                TEXT("2.5 m optional erosion-bowl period"));
+            Add(Archetype, TEXT("TerraceStepHeight (transport)"), 0.0f,
+                TEXT("0 m optional step; disabled by default"));
+            Add(Archetype, TEXT("LayerLineSpacing (transport)"), 0.0f,
+                TEXT("0 m optional geological band period; disabled by default"));
+            Add(Archetype, TEXT("LayerLineDepth (transport)"), 0.3f,
+                TEXT("0.075 m optional groove depth; inactive while spacing is zero"));
+            Add(Archetype, TEXT("RibbingSpacing (transport)"), 0.0f,
+                TEXT("0 m optional rib period; disabled by default"));
+            Add(Archetype, TEXT("RibbingDepth (transport)"), 0.4f,
+                TEXT("0.1 m optional rib protrusion; inactive while spacing is zero"));
+            Add(Archetype, TEXT("OverhangDepth (transport)"), 8.0f,
+                TEXT("2 m optional shelf; terrain-op transport is reset when disabled"));
+            AddRange(Archetype, TEXT("ArchRadius (transport)"), 6.0f, 12.0f,
+                     TEXT("1.5-3 m optional arch feature"));
+            AddRange(Archetype, TEXT("ColumnRadius (transport)"), 4.0f, 8.0f,
+                     TEXT("1-2 m optional pillar radius"));
+            AddRange(Archetype, TEXT("PitRadius (transport)"), 8.0f, 16.0f,
+                     TEXT("2-4 m optional vertical opening radius"));
+            Add(Archetype, TEXT("PitDepth (transport)"), 32.0f,
+                TEXT("8 m optional vertical drop"));
+            AddRange(Archetype, TEXT("ChimneyRadius (transport)"), 4.0f, 8.0f,
+                     TEXT("1-2 m optional upward shaft radius"));
+            Add(Archetype, TEXT("ChimneyHeight (transport)"), 32.0f,
+                TEXT("8 m optional upward shaft height"));
+            AddRange(Archetype, TEXT("DomeRadius (transport)"), 16.0f, 32.0f,
+                     TEXT("4-8 m optional ceiling dome radius"));
+            Add(Archetype, TEXT("PinchLength (transport)"), 24.0f,
+                TEXT("6 m optional bottleneck length; default operation is disabled"));
+        }
+
+        for (const TCHAR* Archetype : { TEXT("FlatPlain"), TEXT("CrystalChamber") })
+        {
+            Add(Archetype, TEXT("StrateHeight"), StrateHeightVoxels,
+                TEXT("8 chunks / 64 m: open vertical chamber envelope"));
+            Add(Archetype, TEXT("Floor height"), StrateHeightVoxels * 0.25f,
+                TEXT("16 m above the strate bottom"));
+            Add(Archetype, TEXT("Ceiling height"), StrateHeightVoxels * 0.60f,
+                TEXT("38.4 m above the bottom; 22.4 m clear span before roughness"));
+            Add(Archetype, TEXT("FloorRoughness"), 4.0f,
+                TEXT("1 m rolling floor displacement"));
+            Add(Archetype, TEXT("CeilingRoughness"), 6.0f,
+                TEXT("1.5 m downward formation reach"));
+            Add(Archetype, TEXT("FloorRoughnessFrequency (nominal period)"), 1.0f / 0.04f,
+                TEXT("6.25 m floor-detail period: broad rolling ground"));
+            Add(Archetype, TEXT("CeilingRoughnessFrequency (nominal period)"), 1.0f / 0.04f,
+                TEXT("6.25 m ceiling-formation period"));
+            AddRange(Archetype, TEXT("ColumnRadius"), 8.0f, 16.0f,
+                     TEXT("4-8 m pillar diameters; large enough to read without erasing a fight lane"));
+            Add(Archetype, TEXT("ColumnSpacing"), 96.0f,
+                TEXT("24 m pillar-cell spacing"));
+            Add(Archetype, TEXT("BoundarySealThickness"), 4.0f,
+                TEXT("1 m solid boundary"));
+        }
+
+        Add(TEXT("Common layout"), TEXT("OriginSpineRadius"), 14.0f,
+            TEXT("3.5 m radius / 7 m diameter central descent spine"));
+        Add(TEXT("Common layout"), TEXT("InterStrateGap"), 0.0f,
+            TEXT("0 m bedrock gap by default; configured as whole 8 m chunks"));
+        Add(TEXT("Common layout"), TEXT("WorldRadiusVoxels"), 0.0f,
+            TEXT("0 m lateral bound: radial regions remain gated off"));
+
+        Add(TEXT("Maze"), TEXT("StrateHeight"), StrateHeightVoxels,
+            TEXT("8 chunks / 64 m: supports several 16 m maze levels"));
+        Add(TEXT("Maze"), TEXT("CellSize"), 64.0f,
+            TEXT("16 m lattice cells, matching ordinary fight-space scale"));
+        Add(TEXT("Maze"), TEXT("CorridorRadius"), 8.0f,
+            TEXT("2 m radius / 4 m circular bore: upper fight-space target"));
+        Add(TEXT("Maze"), TEXT("SurfaceRoughness"), 2.0f,
+            TEXT("0.5 m texture; bounded reach is 0.94 m, below the 2 m radius"));
+        Add(TEXT("Maze"), TEXT("BoundarySealThickness"), 4.0f,
+            TEXT("1 m solid boundary"));
+
+        Add(TEXT("SurfaceWorld"), TEXT("StrateHeight"), StrateHeightVoxels,
+            TEXT("8 chunks / 64 m: high sky-cap envelope"));
+        Add(TEXT("SurfaceWorld"), TEXT("ElevationRange"), 80.0f,
+            TEXT("20 m terrain relief: human-scale hills, not a miniature room"));
+        Add(TEXT("SurfaceWorld"), TEXT("Base ground height"), StrateHeightVoxels * 0.25f,
+            TEXT("16 m mean ground elevation above the strate bottom"));
+        Add(TEXT("SurfaceWorld"), TEXT("HeightWarpStrength"), 48.0f,
+            TEXT("12 m horizontal landform distortion"));
+        Add(TEXT("SurfaceWorld"), TEXT("SurfaceRoughness"), 2.0f,
+            TEXT("0.5 m ground detail; bounded reach is 0.94 m"));
+        Add(TEXT("SurfaceWorld"), TEXT("ContinentFrequency (nominal period)"), 1.0f / 0.006f,
+            TEXT("41.7 m broad landmass period"));
+        Add(TEXT("SurfaceWorld"), TEXT("MountainFrequency (nominal period)"), 1.0f / 0.012f,
+            TEXT("20.8 m ridge period"));
+        Add(TEXT("SurfaceWorld"), TEXT("DetailFrequency (nominal period)"), 1.0f / 0.04f,
+            TEXT("6.25 m fine terrain period"));
+        Add(TEXT("SurfaceWorld"), TEXT("TerraceHeight"), 8.0f,
+            TEXT("2 m optional step; operation remains disabled by strength 0"));
+        Add(TEXT("SurfaceWorld"), TEXT("LayerLineSpacing"), 8.0f,
+            TEXT("2 m optional geological band spacing"));
+        Add(TEXT("SurfaceWorld"), TEXT("LayerLineDepth"), 0.0f,
+            TEXT("0 m default band displacement: optional operation disabled"));
+        Add(TEXT("SurfaceWorld"), TEXT("CliffSampleDist"), 2.0f,
+            TEXT("0.5 m slope sample scale for optional cliff operation"));
+        Add(TEXT("SurfaceWorld"), TEXT("OverhangReach"), 16.0f,
+            TEXT("4 m optional shelf reach"));
+        Add(TEXT("SurfaceWorld"), TEXT("OverhangHeight"), 24.0f,
+            TEXT("6 m optional shelf zone"));
+        Add(TEXT("SurfaceWorld"), TEXT("BeachWidth"), 12.0f,
+            TEXT("3 m shore band"));
+        Add(TEXT("SurfaceWorld"), TEXT("Sky cap height"), StrateHeightVoxels * 0.95f,
+            TEXT("60.8 m above the strate bottom; leaves a high open sky"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingRoughness"), 6.0f,
+            TEXT("1.5 m optional downward cap detail"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingUndulation"), 0.0f,
+            TEXT("0 m broad cap swell; disabled by default"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingRidgeStrength"), 0.0f,
+            TEXT("0 m hanging ridge height; disabled by default"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingWarpStrength"), 0.0f,
+            TEXT("0 m cap-coordinate warp; disabled by default"));
+        Add(TEXT("SurfaceWorld"), TEXT("BoundarySealThickness"), 4.0f,
+            TEXT("1 m solid boundary"));
+
+        Add(TEXT("SurfaceWorld"), TEXT("HeightWarpFrequency (nominal period)"), 1.0f / 0.008f,
+            TEXT("31.25 m landform-warp period"));
+        Add(TEXT("SurfaceWorld"), TEXT("ReliefFrequency (nominal period)"), 1.0f / 0.0015f,
+            TEXT("166.7 m macro-region period"));
+        Add(TEXT("SurfaceWorld"), TEXT("OverhangFrequency (nominal period)"), 1.0f / 0.02f,
+            TEXT("12.5 m optional shelf-shape period"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingRoughnessFrequency (nominal period)"), 1.0f / 0.04f,
+            TEXT("6.25 m optional cap-detail period"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingUndulationFrequency (nominal period)"), 1.0f / 0.004f,
+            TEXT("62.5 m optional cap-swell period"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingRidgeFrequency (nominal period)"), 1.0f / 0.02f,
+            TEXT("12.5 m optional hanging-ridge period"));
+        Add(TEXT("SurfaceWorld"), TEXT("CeilingWarpFrequency (nominal period)"), 1.0f / 0.01f,
+            TEXT("25 m optional cap-warp period"));
+
+        Add(TEXT("VerticalShafts"), TEXT("StrateHeight"), StrateHeightVoxels,
+            TEXT("8 chunks / 64 m: a full vertical traversal envelope"));
+        Add(TEXT("VerticalShafts"), TEXT("ShaftSpacing"), 80.0f,
+            TEXT("20 m shaft-cell spacing"));
+        AddRange(TEXT("VerticalShafts"), TEXT("ShaftRadius"), 8.0f, 14.0f,
+                 TEXT("4-7 m shaft diameters"));
+        Add(TEXT("VerticalShafts"), TEXT("ConnectorRadius"), 6.0f,
+            TEXT("1.5 m radius / 3 m horizontal connector bore"));
+        Add(TEXT("VerticalShafts"), TEXT("LedgeSpacing"), 32.0f,
+            TEXT("8 m vertical landing interval"));
+        Add(TEXT("VerticalShafts"), TEXT("LedgeDepth"), 4.0f,
+            TEXT("1 m landing intrusion"));
+        Add(TEXT("VerticalShafts"), TEXT("SurfaceRoughness"), 2.0f,
+            TEXT("0.5 m wall texture; bounded reach is 0.94 m"));
+        Add(TEXT("VerticalShafts"), TEXT("BoundarySealThickness"), 4.0f,
+            TEXT("1 m solid boundary"));
+
+        Add(TEXT("FloatingIslands"), TEXT("StrateHeight"), StrateHeightVoxels,
+            TEXT("8 chunks / 64 m: vertical sky volume"));
+        Add(TEXT("FloatingIslands"), TEXT("IslandSpacing"), 112.0f,
+            TEXT("28 m island-cell spacing; max 24 m diameter leaves a 2 m centre-to-edge gap"));
+        AddRange(TEXT("FloatingIslands"), TEXT("IslandRadius"), 24.0f, 48.0f,
+                 TEXT("12-24 m landmass diameters: room to cathedral scale"));
+        Add(TEXT("FloatingIslands"), TEXT("Underside half-depth"), 48.0f * 0.60f,
+            TEXT("7.2 m below the centre for the largest island; top half is 2.4 m"));
+        Add(TEXT("FloatingIslands"), TEXT("SurfaceRoughness"), 3.0f,
+            TEXT("0.75 m island texture; bounded reach is 1.41 m"));
+        Add(TEXT("FloatingIslands"), TEXT("SDFBlendRadius"), 6.0f,
+            TEXT("1.5 m island edge blend"));
+        Add(TEXT("FloatingIslands"), TEXT("BoundarySealThickness"), 4.0f,
+            TEXT("1 m solid boundary"));
+
+        Add(TEXT("Common passage"), TEXT("MouthRadius"), 8.0f,
+            TEXT("2 m radius / 4 m bore at each strate mouth"));
+        Add(TEXT("Common passage"), TEXT("MidRadius"), 6.0f,
+            TEXT("1.5 m radius / 3 m minimum bore between mouths"));
+        AddRange(TEXT("Common passage"), TEXT("Reach"), 32.0f, 96.0f,
+                 TEXT("8-24 m reach into each strate"));
+        AddRange(TEXT("Common passage"), TEXT("Distance from spine"), 64.0f, 192.0f,
+                 TEXT("16-48 m placement range"));
+        Add(TEXT("Common passage"), TEXT("Wander"), 24.0f,
+            TEXT("6 m sideways meander"));
+        Add(TEXT("Common passage"), TEXT("VerticalWobble"), 0.0f,
+            TEXT("0 m vertical wobble by default; descent remains controlled"));
+        Add(TEXT("Common passage"), TEXT("SpiralRadius"), 24.0f,
+            TEXT("6 m corkscrew radius"));
+        Add(TEXT("Common passage"), TEXT("CascadeLedge"), 8.0f,
+            TEXT("2 m ledge run per cascade step"));
+
+        Add(TEXT("Common disturbance"), TEXT("ChasmSpacing"), 192.0f,
+            TEXT("48 m chasm-cell spacing"));
+        Add(TEXT("Common disturbance"), TEXT("ChasmRadius"), 24.0f,
+            TEXT("6 m radius / 12 m opening when enabled"));
+        Add(TEXT("Common disturbance"), TEXT("BridgeSpacing"), 128.0f,
+            TEXT("32 m bridge-cell spacing"));
+        Add(TEXT("Common disturbance"), TEXT("BridgeRadius"), 8.0f,
+            TEXT("2 m radius / 4 m bridge width"));
+        Add(TEXT("Common disturbance"), TEXT("RidgeSpacing"), 128.0f,
+            TEXT("32 m ridge-cell spacing"));
+        Add(TEXT("Common disturbance"), TEXT("RidgeHeight"), 32.0f,
+            TEXT("8 m optional blade height"));
+        Add(TEXT("Common disturbance"), TEXT("RidgeThickness"), 8.0f,
+            TEXT("2 m optional blade half-width"));
+        Add(TEXT("Common disturbance"), TEXT("BoundarySealThickness"), 4.0f,
+            TEXT("1 m solid boundary shared with the active archetype"));
+
+        Report += FString::Printf(
+            TEXT("Audit anchors: 1 voxel=%.2f m; 1 chunk=8.00 m; 2.5 m walk corridor=10 vox; "
+                 "3-4 m fight corridor=12-16 vox; 8-15 m room=32-60 vox; 20 m cathedral=80 vox.\n"),
+            VoxelMetres);
+        return Report;
+    }
+
+    FString VF_FormatDefaultRoughnessRatios()
+    {
+        const float TunnelReach = VF_RoughnessReach(2.0f);
+        const float SlabFloorReach = VF_RoughnessReach(4.0f);
+        const float SlabCeilingReach = VF_RoughnessReach(6.0f);
+        const float MazeReach = VF_RoughnessReach(2.0f);
+        const float ShaftReach = VF_RoughnessReach(2.0f);
+        const float IslandReach = VF_RoughnessReach(3.0f);
+        return FString::Printf(
+            TEXT("Default roughness-to-feature ratios (reach = roughness * 1.25 * 1.5; "
+                 "all values are dimensionless): TunnelNetwork=%.3f reach/%.1f-voxel "
+                 "minimum tunnel radius (room mean %.3f); Underwater=same; FlatPlain="
+                 "%.3f floor reach/mean column radius and %.3f ceiling reach/mean column radius; "
+                 "CrystalChamber=same slab engine; Maze=%.3f reach/%.1f-voxel corridor radius; "
+                 "SurfaceWorld=%.3f reach/80-voxel terrain relief; VerticalShafts=%.3f shaft-min "
+                 "and %.3f connector; FloatingIslands=%.3f reach/min island radius "
+                 "(%.3f including 6-voxel blend).\n"),
+             TunnelReach / 6.0f, 6.0f, TunnelReach / 28.0f,
+             SlabFloorReach / 12.0f, SlabCeilingReach / 12.0f,
+             MazeReach / 8.0f, 8.0f, TunnelReach / 80.0f,
+            ShaftReach / 8.0f, ShaftReach / 6.0f,
+            IslandReach / 24.0f, (IslandReach + 6.0f) / 24.0f);
+    }
+
+    float VF_ShowcaseRoughnessFeatureRatio(
+        const FVoxelStrateComposerCandidate& Candidate)
+    {
+        switch (Candidate.Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return VF_RoughnessReach(
+                Candidate.ArchetypeParams.TunnelNetworkParams.SurfaceRoughness)
+                / FMath::Max(
+                    Candidate.ArchetypeParams.TunnelNetworkParams.TunnelMinRadius,
+                    KINDA_SMALL_NUMBER);
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+        {
+            const FSlabGenerationParams& P = Candidate.ArchetypeParams.SlabParams;
+            const float ColumnRadius = 0.5f * (P.ColumnMinRadius + P.ColumnMaxRadius);
+            return FMath::Max(
+                VF_RoughnessReach(P.FloorRoughness),
+                VF_RoughnessReach(P.CeilingRoughness))
+                / FMath::Max(ColumnRadius, KINDA_SMALL_NUMBER);
+        }
+        case ECaveGeneratorType::Maze:
+            return VF_RoughnessReach(Candidate.ArchetypeParams.MazeParams.SurfaceRoughness)
+                / FMath::Max(Candidate.ArchetypeParams.MazeParams.CorridorRadius,
+                             KINDA_SMALL_NUMBER);
+        case ECaveGeneratorType::SurfaceWorld:
+            return VF_RoughnessReach(Candidate.ArchetypeParams.SurfaceParams.SurfaceRoughness)
+                / FMath::Max(Candidate.ArchetypeParams.SurfaceParams.ElevationRange,
+                             KINDA_SMALL_NUMBER);
+        case ECaveGeneratorType::VerticalShafts:
+            return VF_RoughnessReach(
+                Candidate.ArchetypeParams.VerticalShaftParams.SurfaceRoughness)
+                / FMath::Max(
+                    Candidate.ArchetypeParams.VerticalShaftParams.ShaftMinRadius,
+                    KINDA_SMALL_NUMBER);
+        case ECaveGeneratorType::FloatingIslands:
+        {
+            const FFloatingIslandParams& P = Candidate.ArchetypeParams.FloatingIslandParams;
+            return (VF_RoughnessReach(P.SurfaceRoughness) + P.SDFBlendRadius)
+                / FMath::Max(P.IslandMinRadius, KINDA_SMALL_NUMBER);
+        }
+        default:
+            return 0.0f;
+        }
+    }
+
+    FString VF_FormatPlayerFitSummary(
+        const TArray<FShowcaseSample>& Samples,
+        const TCHAR* Label)
+    {
+        FString Report = FString::Printf(
+            TEXT("%s (walkable floor area is the coarse 128 m x 128 m footprint proxy)\n"
+                 "archetype | PlayerFitFraction | TraversableComponentShare | "
+                 "player-fit arrival->departure | walkable floor area m2 | "
+                 "median vertical clearance m | roughness-to-feature ratio\n"), Label);
+        for (const ECaveGeneratorType Archetype : GShowcaseArchetypes)
+        {
+            const FShowcaseSample* Found = Samples.FindByPredicate(
+                [Archetype](const FShowcaseSample& Sample)
+                {
+                    return Sample.Candidate.Archetype == Archetype;
+                });
+            if (Found == nullptr)
+            {
+                Report += FString::Printf(
+                    TEXT("%s | no measured sample | no measured sample | no measured sample | "
+                         "n/a | n/a | n/a\n"),
+                    VF_GetStrateArchetypeName(Archetype));
+                continue;
+            }
+            const FVoxelStrateMetrics& M = Found->FineMetrics;
+            const FString Law = M.bPlayerFitResolved
+                ? VF_ShowcaseConnectivityName(Found->PlayerFitLaw.Result)
+                : TEXT("unresolved");
+            const float FloorAreaM2 = Found->Metrics.WalkableFloorAreaFraction
+                * 128.0f * 128.0f;
+            Report += FString::Printf(
+                TEXT("%s | %.6f | %.6f | %s | %.1f (%.6f footprint) | %.2f | %.3f\n"),
+                VF_GetStrateArchetypeName(Archetype),
+                M.bPlayerFitResolved ? M.PlayerFitFraction : 0.0f,
+                M.bPlayerFitResolved ? M.TraversableComponentShare : 0.0f,
+                *Law, FloorAreaM2,
+                Found->Metrics.WalkableFloorAreaFraction,
+                Found->Metrics.MedianVerticalClearance * 0.25f,
+                VF_ShowcaseRoughnessFeatureRatio(Found->Candidate));
+        }
+        return Report;
+    }
+
     bool VF_RunMazeRoughnessExperiment(
         const VoxelForgeTest::FTestWorld& World,
         const FShowcaseSample& MazeSample,
@@ -633,6 +1048,80 @@ namespace
             ZeroMetrics.MinimumPlayerClearanceVoxels,
             VF_ShowcaseConnectivityName(MazeSample.PlayerFitLaw.Result),
             VF_ShowcaseConnectivityName(ZeroLaw.Result), MazeSample.TargetStrateIndex);
+        return true;
+    }
+
+    bool VF_RunMazeCorridorRadiusSweep(
+        const VoxelForgeTest::FTestWorld& World,
+        const FShowcaseSample& MazeSample,
+        const FVoxelStrateMeasureSettings& BaseSettings,
+        const FVoxelStrateFinePreviewSettings& FinePreviewSettings,
+        FString& OutReport)
+    {
+        if (MazeSample.Candidate.Archetype != ECaveGeneratorType::Maze)
+        {
+            OutReport = TEXT("Part A Maze corridor-radius sweep unavailable: previous Maze roll was not found.");
+            return false;
+        }
+
+        FVector ArrivalPoint = FVector::ZeroVector;
+        FVector DeparturePoint = FVector::ZeroVector;
+        if (!VF_GetShowcaseMouthPair(
+                World, MazeSample.TargetStrateIndex, ArrivalPoint, DeparturePoint))
+        {
+            OutReport = TEXT("Part A Maze corridor-radius sweep unavailable: mouth pair was not found.");
+            return false;
+        }
+
+        int32 TopVoxelZ = 0;
+        int32 BottomVoxelZ = 0;
+        if (!World.GetSlotVoxelZRange(MazeSample.TargetStrateIndex, TopVoxelZ, BottomVoxelZ))
+        {
+            OutReport = TEXT("Part A Maze corridor-radius sweep unavailable: Z range was not found.");
+            return false;
+        }
+
+        const FVoxelStrateMeasureSettings FineSettings = VF_MakeFinePlayerFitSettings(
+            BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint);
+        const float RadiusSweep[] = { 4.0f, 6.0f, 8.0f, 10.0f, 12.0f };
+        OutReport = TEXT(
+            "Part A Maze corridor-radius sweep (same seed/index, fitted step-1 ROI; "
+            "radius voxels -> bore metres):\n");
+        for (const float CorridorRadius : RadiusSweep)
+        {
+            FVoxelStrateComposerCandidate Candidate = MazeSample.Candidate;
+            Candidate.ArchetypeParams.MazeParams.CorridorRadius = CorridorRadius;
+
+            FVoxelOpStack Stack;
+            FVoxelOpContext Context;
+            FString BuildError;
+            if (!VF_BuildShowcaseStack(
+                    World, Candidate, TopVoxelZ, BottomVoxelZ, Stack, Context, BuildError))
+            {
+                OutReport += FString::Printf(
+                    TEXT("  radius=%.0f bore=%.2f m: build failed (%s)\n"),
+                    CorridorRadius, CorridorRadius * 2.0f * VOXEL_SIZE / 100.0f, *BuildError);
+                continue;
+            }
+
+            Stack.PrepareChunk(Context);
+            FShowcaseStackSampler Sampler(Stack);
+            FVoxelStrateMetrics Metrics;
+            const FVoxelConnectivityDiagnostics Law =
+                VF_DiagnosePlayerFitConnectivityWithSampler(
+                    Sampler, BottomVoxelZ, TopVoxelZ + 1, Context.EdgeSealThickness,
+                    ArrivalPoint, DeparturePoint, FineSettings, &Metrics);
+            OutReport += FString::Printf(
+                TEXT("  radius=%.0f (%.2f m) bore=%.2f m: fit=%.6f traversable=%.6f "
+                     "fit_cells=%lld min_clearance=%.2f voxels (%.2f m) law=%s\n"),
+                CorridorRadius, CorridorRadius * VOXEL_SIZE / 100.0f,
+                CorridorRadius * 2.0f * VOXEL_SIZE / 100.0f,
+                Metrics.PlayerFitFraction, Metrics.TraversableComponentShare,
+                static_cast<long long>(Metrics.NumPlayerFitCells),
+                Metrics.MinimumPlayerClearanceVoxels,
+                Metrics.MinimumPlayerClearanceVoxels * VOXEL_SIZE / 100.0f,
+                VF_ShowcaseConnectivityName(Law.Result));
+        }
         return true;
     }
 
@@ -1073,7 +1562,9 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     }
 
     FTestWorld World;
-    World.Build(BaseComposerSeed, 2, true);
+    // The shared fixture defaults to a bounded 4-chunk volume for fast density tests. The
+    // owner-facing scale audit must exercise the production/default 8-chunk envelope.
+    World.Build(BaseComposerSeed, 2, true, 8);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -1188,6 +1679,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
             {
                 Stats[ArchetypeIndex].LastFailure = MoveTemp(FailureReason);
             }
+            VF_AddMeasuredSample(Stats[ArchetypeIndex], Sample);
 
         }
     }
@@ -1248,6 +1740,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                     {
                         Stats[ArchetypeIndex].LastFailure = MoveTemp(FailureReason);
                     }
+                    VF_AddMeasuredSample(Stats[ArchetypeIndex], Sample);
                 }
 
             }
@@ -1270,12 +1763,75 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
          ++ArchetypeIndex)
     {
         AddInfo(FString::Printf(
-            TEXT("Showcase search detail %s: eligible=%d hard_gate_survivors=%d last_failure=%s"),
+            TEXT("Showcase search detail %s: eligible=%d measured=%d hard_gate_survivors=%d last_failure=%s"),
             VF_GetStrateArchetypeName(GShowcaseArchetypes[ArchetypeIndex]),
             Stats[ArchetypeIndex].EvaluatedCandidates,
+            Stats[ArchetypeIndex].MeasuredCandidates,
             Stats[ArchetypeIndex].Survivors.Num(),
-            Stats[ArchetypeIndex].LastFailure.IsEmpty()
+             Stats[ArchetypeIndex].LastFailure.IsEmpty()
                 ? TEXT("none") : *Stats[ArchetypeIndex].LastFailure));
+    }
+    TArray<FShowcaseSample> FreshSurvivorSamples;
+    for (const FShowcaseStats& ArchetypeStats : Stats)
+    {
+        if (ArchetypeStats.Best.IsSet())
+        {
+            FreshSurvivorSamples.Add(ArchetypeStats.Best.GetValue());
+        }
+    }
+    AddInfo(VF_FormatPlayerFitSummary(
+        FreshSurvivorSamples, TEXT("AFTER defaults: fresh hard-gate survivors")));
+
+    TArray<FShowcaseSample> FreshDiagnosticSamples;
+    FreshDiagnosticSamples.Reserve(UE_ARRAY_COUNT(GShowcaseArchetypes));
+    for (const FShowcaseStats& ArchetypeStats : Stats)
+    {
+        if (!ArchetypeStats.BestMeasured.IsSet())
+        {
+            continue;
+        }
+        const FShowcaseSample Measured = ArchetypeStats.BestMeasured.GetValue();
+        const FVoxelStrateComposerCandidate DiagnosticCandidate = Measured.Candidate;
+        FShowcaseSample Diagnostic;
+        FString DiagnosticFailure;
+        // Re-run the selected coarse measurement with the player-fit pass enabled even when a
+        // legacy gate fails. This is diagnostic only: it never enters Survivors or changes card
+        // selection, but it gives every archetype an honest before/after scale row.
+        VF_EvaluateShowcaseCandidate(
+            World, DiagnosticCandidate, Measured.TargetStrateIndex, MeasureSettings,
+            Diagnostic, &DiagnosticFailure, true);
+        if (Diagnostic.Candidate.bValid && Diagnostic.Metrics.NumSampled > 0)
+        {
+            FreshDiagnosticSamples.Add(MoveTemp(Diagnostic));
+        }
+    }
+    AddInfo(VF_FormatPlayerFitSummary(
+        FreshDiagnosticSamples,
+        TEXT("AFTER defaults: best measured candidate per archetype (diagnostic; hard gates separate)")));
+
+    TArray<FShowcaseSample> PreviewSelections;
+    PreviewSelections.Reserve(UE_ARRAY_COUNT(GShowcaseArchetypes));
+    bool bHaveAllPreviewSelections = true;
+    for (int32 ArchetypeIndex = 0;
+         ArchetypeIndex < UE_ARRAY_COUNT(GShowcaseArchetypes);
+         ++ArchetypeIndex)
+    {
+        if (Stats[ArchetypeIndex].Best.IsSet())
+        {
+            PreviewSelections.Add(Stats[ArchetypeIndex].Best.GetValue());
+            continue;
+        }
+        const FShowcaseSample* Diagnostic = FreshDiagnosticSamples.FindByPredicate(
+            [Archetype = GShowcaseArchetypes[ArchetypeIndex]](const FShowcaseSample& Sample)
+            {
+                return Sample.Candidate.Archetype == Archetype;
+            });
+        if (Diagnostic == nullptr)
+        {
+            bHaveAllPreviewSelections = false;
+            break;
+        }
+        PreviewSelections.Add(*Diagnostic);
     }
 
     struct FPreviousShowcaseSelection
@@ -1358,6 +1914,10 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     AddInfo(FString::Printf(
         TEXT("Previous eight showcase candidates rejected by the new player-fit gate: %d/8."),
         NumPreviousShowcaseRejected));
+    AddInfo(VF_FormatPlayerFitSummary(
+        PreviousSamples, TEXT("AFTER defaults: historical candidate re-measurement")));
+    AddInfo(VF_FormatWorldScaleAudit());
+    AddInfo(VF_FormatDefaultRoughnessRatios());
     AddInfo(VF_FormatRoughnessRadiusReport(PreviousSamples));
     FString MazeRoughnessReport;
     if (const FShowcaseSample* MazeSample = PreviousSamples.FindByPredicate(
@@ -1368,6 +1928,10 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     {
         VF_RunMazeRoughnessExperiment(
             World, *MazeSample, MeasureSettings, FinePreviewSettings, MazeRoughnessReport);
+        FString MazeRadiusReport;
+        VF_RunMazeCorridorRadiusSweep(
+            World, *MazeSample, MeasureSettings, FinePreviewSettings, MazeRadiusReport);
+        AddInfo(MazeRadiusReport);
     }
     else
     {
@@ -1392,8 +1956,13 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     }
     if (!bHaveAllArchetypes)
     {
-        AddInfo(TEXT("Showcase cards are not written because the new hard gate found no complete "
-                      "eight-archetype survivor set; the diagnostic report above is the result."));
+        AddInfo(TEXT("No complete eight-archetype hard-gate survivor set was found; the fresh "
+                      "preview cards below are rejected diagnostic candidates for scale review."));
+    }
+    if (!bHaveAllPreviewSelections)
+    {
+        AddInfo(TEXT("Fresh diagnostic previews are incomplete because at least one archetype had "
+                      "no measurable candidate."));
         return true;
     }
 
@@ -1429,8 +1998,9 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
          ArchetypeIndex < UE_ARRAY_COUNT(GShowcaseArchetypes);
          ++ArchetypeIndex)
     {
-        const FShowcaseSample& Selected = Stats[ArchetypeIndex].Best.GetValue();
+        const FShowcaseSample& Selected = PreviewSelections[ArchetypeIndex];
         const FVoxelStrateComposerCandidate& Candidate = Selected.Candidate;
+        const bool bDiagnosticCard = !bHaveAllArchetypes;
 
         // The output filename namespace is local to this page. Keep it distinct even if a future
         // search selects equal candidate indices from two different composer seeds; the PIE fields
@@ -1484,7 +2054,11 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
             ShowcaseDirectory, RenderIndex,
             VF_FormatNativeParameterRecipe(Candidate),
             SampleGrid, Metrics, MeasureSettings.HeadroomCells,
-            Selected.SelectionScore, Selected.LawText, false, TEXT(""),
+            Selected.SelectionScore, Selected.LawText, bDiagnosticCard,
+            bDiagnosticCard
+                ? TEXT("Diagnostic only: no complete hard-gate survivor set; this card is retained "
+                       "to inspect the generated scale and exact player-fit law.")
+                : TEXT(""),
             PreviewCandidate, PreviewError);
         TestTrue(FString::Printf(TEXT("selected %s coarse preview writes"),
                                  VF_GetStrateArchetypeName(Candidate.Archetype)),
@@ -1516,6 +2090,11 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
         const FVoxelStrateMetrics FineMetrics = VF_MeasureStrateWithSampler(
             Sampler, Selected.BottomVoxelZ, Selected.TopVoxelZ + 1, Context.EdgeSealThickness,
             FineMeasureSettings, &FineGrid);
+        FVoxelStrateMetrics FinePlayerMetrics;
+        VF_DiagnosePlayerFitConnectivityWithSampler(
+            Sampler, Selected.BottomVoxelZ, Selected.TopVoxelZ + 1,
+            Context.EdgeSealThickness, FineArrivalPoint, FineDeparturePoint,
+            FineMeasureSettings, &FinePlayerMetrics);
         const auto IsInsideFineXY = [&FineGrid](const FVector& Point)
         {
             return Point.X >= FineGrid.MinX && Point.X < FineGrid.MaxX
@@ -1531,7 +2110,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                  !FineMetrics.bValid || FineGrid.CellCount <= FinePreviewMaxCells);
         TestTrue(FString::Printf(TEXT("selected %s fine player-fit metrics rerun identically"),
                                  VF_GetStrateArchetypeName(Candidate.Archetype)),
-                 VF_ShowcaseMetricsEqual(Selected.FineMetrics, FineMetrics));
+                 VF_ShowcaseMetricsEqual(Selected.FineMetrics, FinePlayerMetrics));
         const bool bFineWritten = VF_WriteStratePreviewFineCandidate(
             ShowcaseDirectory, RenderIndex, FineGrid,
             FineMeasureSettings.HeadroomCells,
@@ -1546,17 +2125,17 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                                      VF_GetStrateArchetypeName(Candidate.Archetype), *PreviewError));
             return false;
         }
-        PreviewCandidate.bPlayerFitResolved = FineMetrics.bPlayerFitResolved;
-        PreviewCandidate.PlayerFitRefusalReason = FineMetrics.PlayerFitRefusalReason;
-        PreviewCandidate.NumPlayerFitCells = FineMetrics.NumPlayerFitCells;
-        PreviewCandidate.PlayerFitFraction = FineMetrics.PlayerFitFraction;
-        PreviewCandidate.NumTraversableComponents = FineMetrics.NumTraversableComponents;
+        PreviewCandidate.bPlayerFitResolved = FinePlayerMetrics.bPlayerFitResolved;
+        PreviewCandidate.PlayerFitRefusalReason = FinePlayerMetrics.PlayerFitRefusalReason;
+        PreviewCandidate.NumPlayerFitCells = FinePlayerMetrics.NumPlayerFitCells;
+        PreviewCandidate.PlayerFitFraction = FinePlayerMetrics.PlayerFitFraction;
+        PreviewCandidate.NumTraversableComponents = FinePlayerMetrics.NumTraversableComponents;
         PreviewCandidate.LargestTraversableComponentCells =
-            FineMetrics.LargestTraversableComponentCells;
-        PreviewCandidate.TraversableComponentShare = FineMetrics.TraversableComponentShare;
+            FinePlayerMetrics.LargestTraversableComponentCells;
+        PreviewCandidate.TraversableComponentShare = FinePlayerMetrics.TraversableComponentShare;
         PreviewCandidate.MinimumPlayerClearanceVoxels =
-            FineMetrics.MinimumPlayerClearanceVoxels;
-        if (FineMetrics.bValid)
+            FinePlayerMetrics.MinimumPlayerClearanceVoxels;
+        if (FinePlayerMetrics.bValid)
         {
             TestTrue(FString::Printf(TEXT("selected %s fine preview has filled and contour views"),
                                      VF_GetStrateArchetypeName(Candidate.Archetype)),
@@ -1581,17 +2160,28 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
         PreviewCandidate.ComposerSeed = Candidate.Seed;
         PreviewCandidate.ComposerTargetStrateIndex = Selected.TargetStrateIndex;
         PreviewCandidate.bComposerRollStructure = false;
-        PreviewCandidate.SelectionReason = FString::Printf(
-            TEXT("Hard gates passed: non-vacuous, largest air component >= %.2f, and "
-                 "player-fit arrival → departure connectivity (fine step=1; "
-                 "fit cells=%lld). Selected by legacy score "
-                 "floor_area + 0.25*clamp(clearance/%d,0,1) + 0.10*largest_surface = %.6f; "
-                 "floor area is the primary walking signal. Applied to existing target slot %d."),
-            LargestComponentSurvivalThreshold,
-            static_cast<long long>(FineMetrics.NumPlayerFitCells),
-            static_cast<int32>(ClearanceNormalizationVoxels),
-            Selected.SelectionScore,
-            Selected.TargetStrateIndex);
+        PreviewCandidate.SelectionReason = bDiagnosticCard
+            ? FString::Printf(
+                TEXT("Diagnostic only: the complete hard-gate set was not found. Legacy law=%s; "
+                     "player-fit law=%s; selected by the same score "
+                     "floor_area + 0.25*clamp(clearance/%d,0,1) + 0.10*largest_surface = %.6f; "
+                     "applied to existing target slot %d."),
+                VF_ShowcaseConnectivityName(Selected.LegacyLaw.Result),
+                VF_ShowcaseConnectivityName(Selected.PlayerFitLaw.Result),
+                static_cast<int32>(ClearanceNormalizationVoxels),
+                Selected.SelectionScore,
+                Selected.TargetStrateIndex)
+            : FString::Printf(
+                TEXT("Hard gates passed: non-vacuous, largest air component >= %.2f, and "
+                     "player-fit arrival → departure connectivity (fine step=1; "
+                     "fit cells=%lld). Selected by legacy score "
+                     "floor_area + 0.25*clamp(clearance/%d,0,1) + 0.10*largest_surface = %.6f; "
+                     "floor area is the primary walking signal. Applied to existing target slot %d."),
+                LargestComponentSurvivalThreshold,
+                static_cast<long long>(FineMetrics.NumPlayerFitCells),
+                static_cast<int32>(ClearanceNormalizationVoxels),
+                Selected.SelectionScore,
+                Selected.TargetStrateIndex);
         PreviewCandidates.Add(MoveTemp(PreviewCandidate));
 
         TestTrue(FString::Printf(TEXT("selected %s retains a valid exact coarse window"),
@@ -1603,7 +2193,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
          ArchetypeIndex < UE_ARRAY_COUNT(GShowcaseArchetypes);
          ++ArchetypeIndex)
     {
-        const FShowcaseSample& Selected = Stats[ArchetypeIndex].Best.GetValue();
+        const FShowcaseSample& Selected = PreviewSelections[ArchetypeIndex];
         Summaries[ArchetypeIndex].Window = PreviewCandidates[ArchetypeIndex].Window;
         Summaries[ArchetypeIndex].WindowSummary = VF_FormatShowcaseSummaryWindow(
             Stats[ArchetypeIndex]);

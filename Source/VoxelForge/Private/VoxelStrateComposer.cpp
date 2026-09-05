@@ -1119,34 +1119,34 @@ namespace
             if (FieldName == TEXT("WormThreshold")) return Set(0.01f, 0.50f);
             if (FieldName == TEXT("WormStrength")) return Set(1.0f, 64.0f);
             if (FieldName == TEXT("WormNetworkRange")) return Set(0.0f, H * 1.5f);
-            if (FieldName == TEXT("RoomSpacing")) return Set(16.0f, H * 2.5f);
+            if (FieldName == TEXT("RoomSpacing")) return Set(64.0f, FMath::Max(96.0f, H * 0.75f));
             if (FieldName == TEXT("RoomDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("MinRoomRadius")) return Set(1.0f, HHalf);
-            if (FieldName == TEXT("MaxRoomRadius")) return Set(1.0f, H);
+            if (FieldName == TEXT("MinRoomRadius")) return Set(16.0f, FMath::Max(32.0f, HHalf));
+            if (FieldName == TEXT("MaxRoomRadius")) return Set(16.0f, FMath::Max(48.0f, H * 0.75f));
             if (FieldName == TEXT("RoomHeightRatio")) return Set(0.10f, 1.0f);
             if (FieldName == TEXT("RoomShapeVariety")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("RoomFloorCutMin")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("RoomFloorCutMax")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("FloorReliefStrength")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("FloorReliefFrequency")) return Set(0.001f, 0.10f);
-            if (FieldName == TEXT("OriginRoomRadius")) return Set(0.0f, H * 0.75f);
-            if (FieldName == TEXT("TunnelMinRadius")) return Set(1.0f, HQuarter);
-            if (FieldName == TEXT("TunnelMaxRadius")) return Set(1.0f, HHalf);
+            if (FieldName == TEXT("OriginRoomRadius")) return Set(24.0f, FMath::Max(64.0f, H * 0.75f));
+            if (FieldName == TEXT("TunnelMinRadius")) return Set(6.0f, FMath::Max(8.0f, HQuarter));
+            if (FieldName == TEXT("TunnelMaxRadius")) return Set(8.0f, FMath::Max(16.0f, H * 0.25f));
             if (FieldName == TEXT("TunnelDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("MaxTunnelLength")) return Set(1.0f, H * 4.0f);
+            if (FieldName == TEXT("MaxTunnelLength")) return Set(64.0f, H * 4.0f);
             if (FieldName == TEXT("TunnelWarpStrength")) return Set(0.0f, H);
             if (FieldName == TEXT("TunnelHorizontalBias")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("TunnelEndpointZOffset")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("SDFBlendRadius")) return Set(0.0f, H * 0.15f);
+            if (FieldName == TEXT("SDFBlendRadius")) return Set(2.0f, FMath::Max(4.0f, H * 0.15f));
             if (FieldName == TEXT("WaterLevelRelative")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("CaveWarpStrength")) return Set(0.0f, HHalf);
             if (FieldName == TEXT("CaveWarpFrequency")) return Set(0.001f, 0.10f);
-            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.5f, FMath::Max(4.0f, H * 0.04f));
             if (FieldName == TEXT("RoughnessFrequency")) return Set(0.001f, 0.20f);
             if (FieldName == TEXT("BoundarySealThickness")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("DomainWarpStrength")) return Set(0.0f, HHalf);
             if (FieldName == TEXT("DomainWarpFrequency")) return Set(0.001f, 0.20f);
-            if (FieldName == TEXT("FloorBias")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("FloorBias")) return Set(0.0f, FMath::Max(4.0f, H * 0.10f));
             if (FieldName == TEXT("TerraceStepHeight")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("TerraceHardness")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("TerraceNoiseDisplacement")) return Set(0.0f, 1.0f);
@@ -1161,22 +1161,22 @@ namespace
             if (FieldName == TEXT("ScallopStrength")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("ScallopFrequency")) return Set(0.001f, 0.20f);
             if (FieldName == TEXT("ArchDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ArchMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("ArchMaxRadius")) return Set(1.0f, H * 0.20f);
+            if (FieldName == TEXT("ArchMinRadius")) return Set(6.0f, FMath::Max(12.0f, H * 0.20f));
+            if (FieldName == TEXT("ArchMaxRadius")) return Set(12.0f, FMath::Max(24.0f, H * 0.30f));
             if (FieldName == TEXT("ColumnDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ColumnMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("ColumnMaxRadius")) return Set(1.0f, H * 0.40f);
+            if (FieldName == TEXT("ColumnMinRadius")) return Set(4.0f, FMath::Max(8.0f, H * 0.20f));
+            if (FieldName == TEXT("ColumnMaxRadius")) return Set(8.0f, FMath::Max(16.0f, H * 0.40f));
             if (FieldName == TEXT("PitDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("PitMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("PitMaxRadius")) return Set(1.0f, H * 0.40f);
+            if (FieldName == TEXT("PitMinRadius")) return Set(8.0f, FMath::Max(16.0f, H * 0.20f));
+            if (FieldName == TEXT("PitMaxRadius")) return Set(16.0f, FMath::Max(32.0f, H * 0.40f));
             if (FieldName == TEXT("PitDepth")) return Set(0.0f, HHalf);
             if (FieldName == TEXT("ChimneyDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ChimneyMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("ChimneyMaxRadius")) return Set(1.0f, H * 0.40f);
+            if (FieldName == TEXT("ChimneyMinRadius")) return Set(4.0f, FMath::Max(8.0f, H * 0.20f));
+            if (FieldName == TEXT("ChimneyMaxRadius")) return Set(8.0f, FMath::Max(16.0f, H * 0.40f));
             if (FieldName == TEXT("ChimneyHeight")) return Set(0.0f, HHalf);
             if (FieldName == TEXT("DomeDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("DomeMinRadius")) return Set(1.0f, H * 0.30f);
-            if (FieldName == TEXT("DomeMaxRadius")) return Set(1.0f, H * 0.50f);
+            if (FieldName == TEXT("DomeMinRadius")) return Set(16.0f, FMath::Max(32.0f, H * 0.30f));
+            if (FieldName == TEXT("DomeMaxRadius")) return Set(32.0f, FMath::Max(48.0f, H * 0.50f));
             if (FieldName == TEXT("DomeHeightRatio")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("PinchDensity")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("PinchStrength")) return Set(0.0f, H);
@@ -1190,58 +1190,58 @@ namespace
         case ECaveGeneratorType::CrystalChamber:
             if (FieldName == TEXT("FloorRelativeHeight")) return Set(0.0f, 0.95f);
             if (FieldName == TEXT("CeilingRelativeHeight")) return Set(0.05f, 1.0f);
-            if (FieldName == TEXT("FloorRoughness")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("FloorRoughness")) return Set(0.5f, FMath::Max(4.0f, H * 0.04f));
             if (FieldName == TEXT("FloorRoughnessFrequency")) return Set(0.001f, 0.15f);
-            if (FieldName == TEXT("CeilingRoughness")) return Set(0.0f, HHalf);
+            if (FieldName == TEXT("CeilingRoughness")) return Set(1.0f, FMath::Max(16.0f, H * 0.12f));
             if (FieldName == TEXT("CeilingRoughnessFrequency")) return Set(0.001f, 0.15f);
             if (FieldName == TEXT("ColumnDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ColumnMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("ColumnMaxRadius")) return Set(1.0f, H * 0.40f);
-            if (FieldName == TEXT("ColumnSpacing")) return Set(10.0f, H * 1.5f);
+            if (FieldName == TEXT("ColumnMinRadius")) return Set(8.0f, FMath::Max(12.0f, H * 0.20f));
+            if (FieldName == TEXT("ColumnMaxRadius")) return Set(16.0f, FMath::Max(24.0f, H * 0.40f));
+            if (FieldName == TEXT("ColumnSpacing")) return Set(64.0f, FMath::Max(96.0f, H * 0.75f));
             if (FieldName == TEXT("BoundarySealThickness")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("BaseDensity")) return Set(1.0f, 32.0f);
             return false;
 
         case ECaveGeneratorType::Maze:
-            if (FieldName == TEXT("CellSize")) return Set(8.0f, H * 2.0f);
-            if (FieldName == TEXT("CorridorRadius")) return Set(1.0f, HQuarter);
+            if (FieldName == TEXT("CellSize")) return Set(48.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
+            if (FieldName == TEXT("CorridorRadius")) return Set(6.0f, 8.0f);
             if (FieldName == TEXT("BranchProbability")) return Set(0.05f, 1.0f);
             if (FieldName == TEXT("Verticality")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.5f, FMath::Max(3.0f, H * 0.02f));
             if (FieldName == TEXT("BoundarySealThickness")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("BaseDensity")) return Set(1.0f, 32.0f);
             return false;
 
         case ECaveGeneratorType::SurfaceWorld:
             if (FieldName == TEXT("BaseGroundRelative")) return Set(0.05f, 0.90f);
-            if (FieldName == TEXT("ElevationRange")) return Set(0.0f, H * 2.0f);
+            if (FieldName == TEXT("ElevationRange")) return Set(24.0f, FMath::Max(80.0f, H * 0.50f));
             if (FieldName == TEXT("ContinentFrequency")) return Set(0.0005f, 0.10f);
             if (FieldName == TEXT("MountainStrength")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("MountainFrequency")) return Set(0.0005f, 0.10f);
             if (FieldName == TEXT("DetailFrequency")) return Set(0.0005f, 0.20f);
-            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.0f, HQuarter);
-            if (FieldName == TEXT("HeightWarpStrength")) return Set(0.0f, H);
+            if (FieldName == TEXT("SurfaceRoughness")) return Set(1.0f, FMath::Max(3.0f, H * 0.02f));
+            if (FieldName == TEXT("HeightWarpStrength")) return Set(0.0f, FMath::Max(48.0f, H * 0.25f));
             if (FieldName == TEXT("HeightWarpFrequency")) return Set(0.0005f, 0.10f);
             if (FieldName == TEXT("ReliefFrequency")) return Set(0.0002f, 0.02f);
             if (FieldName == TEXT("ReliefStrength")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("ReliefContrast")) return Set(0.25f, 4.0f);
             if (FieldName == TEXT("TerraceStrength")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("TerraceHeight")) return Set(1.0f, HHalf);
+            if (FieldName == TEXT("TerraceHeight")) return Set(2.0f, FMath::Max(8.0f, H * 0.08f));
             if (FieldName == TEXT("TerraceHardness")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("LayerLineDepth")) return Set(0.0f, HQuarter);
-            if (FieldName == TEXT("LayerLineSpacing")) return Set(1.0f, H);
+            if (FieldName == TEXT("LayerLineSpacing")) return Set(2.0f, FMath::Max(8.0f, H * 0.25f));
             if (FieldName == TEXT("CliffStrength")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("CliffSlopeThreshold")) return Set(0.05f, 2.0f);
             if (FieldName == TEXT("CliffSharpness")) return Set(0.0f, 4.0f);
             if (FieldName == TEXT("CliffSampleDist")) return Set(0.5f, HQuarter);
             if (FieldName == TEXT("OverhangStrength")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("OverhangReach")) return Set(0.0f, HHalf);
-            if (FieldName == TEXT("OverhangHeight")) return Set(0.0f, HHalf);
+            if (FieldName == TEXT("OverhangReach")) return Set(4.0f, FMath::Max(16.0f, H * 0.15f));
+            if (FieldName == TEXT("OverhangHeight")) return Set(4.0f, FMath::Max(24.0f, H * 0.25f));
             if (FieldName == TEXT("OverhangFrequency")) return Set(0.0005f, 0.20f);
             if (FieldName == TEXT("OverhangZScale")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("OverhangSlopeThreshold")) return Set(0.05f, 2.0f);
             if (FieldName == TEXT("WaterLevelRelative")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("BeachWidth")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("BeachWidth")) return Set(4.0f, FMath::Max(12.0f, H * 0.10f));
             if (FieldName == TEXT("CeilingRelative")) return Set(0.30f, 1.0f);
             if (FieldName == TEXT("CeilingRoughness")) return Set(0.0f, HHalf);
             if (FieldName == TEXT("CeilingRoughnessFrequency")) return Set(0.0005f, 0.20f);
@@ -1256,29 +1256,29 @@ namespace
             return false;
 
         case ECaveGeneratorType::VerticalShafts:
-            if (FieldName == TEXT("ShaftSpacing")) return Set(10.0f, H * 2.0f);
+            if (FieldName == TEXT("ShaftSpacing")) return Set(64.0f, FMath::Max(80.0f, FMath::Min(112.0f, H * 0.75f)));
             if (FieldName == TEXT("ShaftDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ShaftMinRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("ShaftMaxRadius")) return Set(1.0f, H * 0.40f);
+            if (FieldName == TEXT("ShaftMinRadius")) return Set(8.0f, 16.0f);
+            if (FieldName == TEXT("ShaftMaxRadius")) return Set(12.0f, 24.0f);
             if (FieldName == TEXT("CrossConnectChance")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("ConnectorRadius")) return Set(1.0f, H * 0.20f);
-            if (FieldName == TEXT("LedgeSpacing")) return Set(0.0f, H);
-            if (FieldName == TEXT("LedgeDepth")) return Set(0.0f, HQuarter);
-            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("ConnectorRadius")) return Set(6.0f, 12.0f);
+            if (FieldName == TEXT("LedgeSpacing")) return Set(8.0f, FMath::Max(32.0f, H * 0.25f));
+            if (FieldName == TEXT("LedgeDepth")) return Set(2.0f, FMath::Max(4.0f, H * 0.08f));
+            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.5f, FMath::Max(3.0f, H * 0.02f));
             if (FieldName == TEXT("BoundarySealThickness")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("BaseDensity")) return Set(1.0f, 32.0f);
             return false;
 
         case ECaveGeneratorType::FloatingIslands:
-            if (FieldName == TEXT("IslandSpacing")) return Set(20.0f, H * 3.0f);
+            if (FieldName == TEXT("IslandSpacing")) return Set(96.0f, FMath::Max(112.0f, FMath::Min(160.0f, H * 0.75f)));
             if (FieldName == TEXT("IslandDensity")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("IslandMinRadius")) return Set(2.0f, H * 0.30f);
-            if (FieldName == TEXT("IslandMaxRadius")) return Set(2.0f, H * 0.75f);
+            if (FieldName == TEXT("IslandMinRadius")) return Set(24.0f, FMath::Max(32.0f, H * 0.30f));
+            if (FieldName == TEXT("IslandMaxRadius")) return Set(48.0f, FMath::Max(64.0f, H * 0.50f));
             if (FieldName == TEXT("ThicknessRatio")) return Set(0.10f, 1.5f);
             if (FieldName == TEXT("VerticalJitter")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("TopFlatten")) return Set(0.0f, 1.0f);
-            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.0f, HQuarter);
-            if (FieldName == TEXT("SDFBlendRadius")) return Set(0.0f, HQuarter);
+            if (FieldName == TEXT("SurfaceRoughness")) return Set(0.5f, FMath::Max(3.0f, H * 0.02f));
+            if (FieldName == TEXT("SDFBlendRadius")) return Set(2.0f, FMath::Max(6.0f, H * 0.10f));
             if (FieldName == TEXT("BoundarySealThickness")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("BaseDensity")) return Set(1.0f, 32.0f);
             return false;
@@ -1533,35 +1533,47 @@ namespace
                                   float StrateHeightInVoxels)
     {
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
-        const float SpacingMin = FMath::Min(48.0f, H * 0.35f);
-        const float SpacingMax = FMath::Max(SpacingMin + 8.0f, FMath::Min(160.0f, H * 0.94f));
+        // Human-scale derivation: an 8 m room is the smallest room-like volume (radius 16),
+        // a 20 m chamber is the large-room target (radius 40), and a 24 m hub is the three-
+        // chunk boss-space target. Keep the room-cell margin independent of those radii.
+        const float SpacingMin = FMath::Max(96.0f, H * 0.35f);
+        const float SpacingMax = FMath::Max(SpacingMin + 32.0f, FMath::Min(160.0f, H * 0.94f));
         const float Coverage = VF_CorpusFreeU(Rng, 0.08f, 0.18f);
 
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
         P.RoomSpacing = VF_CorpusFreeU(Rng, SpacingMin, SpacingMax);
-        P.RoomDensity = VF_CorpusFreeU(Rng, 0.25f, 0.75f);
+        P.RoomDensity = VF_CorpusFreeU(Rng, 0.20f, 0.45f);
         const float RadiusRatio = FMath::Sqrt(
             Coverage / (PI * FMath::Max(P.RoomDensity, 0.001f)));
-        P.MaxRoomRadius = P.RoomSpacing * RadiusRatio;
-        P.MinRoomRadius = P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.35f, 0.75f);
-        P.RoomHeightRatio = VF_CorpusFreeU(Rng, 0.25f, 0.85f);
-        P.OriginRoomRadius = P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.60f, 0.95f);
+        P.MaxRoomRadius = FMath::Min(
+            FMath::Max(40.0f, P.RoomSpacing * RadiusRatio),
+            FMath::Min(P.RoomSpacing * 0.45f, H * 0.30f));
+        P.MinRoomRadius = FMath::Max(
+            16.0f, P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.45f, 0.70f));
+        P.MinRoomRadius = FMath::Min(P.MinRoomRadius, P.MaxRoomRadius);
+        P.RoomHeightRatio = VF_CorpusFreeU(Rng, 0.70f, 0.95f);
+        const float MaxRoomVerticalRadius = FMath::Max(
+            8.0f, H * 0.50f - P.BoundarySealThickness - 1.0f);
+        P.OriginRoomRadius = FMath::Min(
+            P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.90f, 1.15f),
+            MaxRoomVerticalRadius / FMath::Max(P.RoomHeightRatio, 0.1f));
+        P.OriginRoomRadius = FMath::Max(P.OriginRoomRadius, P.MinRoomRadius);
 
-        P.RoomFloorCutMin = VF_CorpusFreeU(Rng, 0.35f, 0.85f);
+        P.RoomFloorCutMin = VF_CorpusFreeU(Rng, 0.55f, 0.75f);
         P.RoomFloorCutMax = P.RoomFloorCutMin + VF_CorpusFreeU(
-            Rng, 0.0f, 1.0f - P.RoomFloorCutMin);
+            Rng, 0.0f, FMath::Min(0.25f, 1.0f - P.RoomFloorCutMin));
         P.FloorReliefStrength = VF_CorpusFreeU(
             Rng, 0.0f,
             FMath::Min(12.0f, P.MaxRoomRadius * P.RoomHeightRatio * 0.25f));
 
-        const float TunnelMinCap = FMath::Max(1.5f, P.MinRoomRadius * 0.45f);
+        const float TunnelMinCap = FMath::Max(6.0f, FMath::Min(8.0f, P.MinRoomRadius * 0.45f));
         P.TunnelMinRadius = FMath::Max(
-            1.5f, P.MinRoomRadius * VF_CorpusFreeU(Rng, 0.25f, 0.45f));
+            6.0f, P.MinRoomRadius * VF_CorpusFreeU(Rng, 0.25f, 0.40f));
         P.TunnelMinRadius = FMath::Min(P.TunnelMinRadius, TunnelMinCap);
         P.TunnelMaxRadius = FMath::Max(
             P.TunnelMinRadius,
-            P.MinRoomRadius * VF_CorpusFreeU(Rng, 0.55f, 0.90f));
+            FMath::Min(8.0f, P.MinRoomRadius * VF_CorpusFreeU(Rng, 0.50f, 0.75f)));
 
         // Adjacent cells can differ in both X and Y. The placement jitter is [0.15, 0.85]
         // cell, so the worst local diagonal separation is 1.7 * S * sqrt(2), not the
@@ -1570,17 +1582,17 @@ namespace
         const float VerticalReach = 2.0f * P.MaxRoomRadius * P.RoomHeightRatio;
         const float NeighborReach = FMath::Sqrt(
             HorizontalReach * HorizontalReach + VerticalReach * VerticalReach);
-        P.MaxTunnelLength = NeighborReach * VF_CorpusFreeU(Rng, 1.0f, 1.40f);
-        P.TunnelWarpStrength = P.MaxTunnelLength * VF_CorpusFreeU(Rng, 0.02f, 0.12f);
-        P.WormStrength = P.BaseDensity * VF_CorpusFreeU(Rng, 1.10f, 1.80f);
-        P.WormNetworkRange = P.RoomSpacing * VF_CorpusFreeU(Rng, 0.20f, 0.60f);
-        P.CaveWarpStrength = P.RoomSpacing * VF_CorpusFreeU(Rng, 0.02f, 0.12f);
+        P.MaxTunnelLength = NeighborReach * VF_CorpusFreeU(Rng, 1.05f, 1.30f);
+        P.TunnelWarpStrength = P.MaxTunnelLength * VF_CorpusFreeU(Rng, 0.03f, 0.08f);
+        P.WormStrength = P.BaseDensity * VF_CorpusFreeU(Rng, 1.35f, 1.80f);
+        P.WormNetworkRange = P.RoomSpacing * VF_CorpusFreeU(Rng, 0.25f, 0.50f);
+        P.CaveWarpStrength = P.RoomSpacing * VF_CorpusFreeU(Rng, 0.03f, 0.10f);
 
         P.SDFBlendRadius = VF_CorpusFreeU(
-            Rng, 0.5f, FMath::Max(0.5f, FMath::Min(4.0f, P.TunnelMinRadius * 0.35f)));
+            Rng, 2.0f, FMath::Max(2.0f, FMath::Min(4.0f, P.TunnelMinRadius * 0.50f)));
         const float RoughnessMax = FMath::Max(
             0.0f, (P.TunnelMinRadius - P.SDFBlendRadius - 0.25f) / VOXEL_NOISE_SCALE);
-        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.0f, RoughnessMax * 0.70f);
+        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.5f, RoughnessMax * 0.60f);
         P.FloorBias = VF_CorpusFreeU(
             Rng, 0.0f, P.MaxRoomRadius * P.RoomHeightRatio * 0.25f);
 
@@ -1597,7 +1609,12 @@ namespace
         P.ArchMaxRadius = FMath::Max(
             P.ArchMinRadius,
             P.MinRoomRadius * VF_CorpusFreeU(Rng, 0.20f, 0.45f));
-        P.DomeMaxRadius = P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.30f, 0.60f);
+        // The public envelope has a 32-voxel minimum dome radius. Apply that envelope before
+        // deriving the height ratio; otherwise a small sampled dome would be clamped larger
+        // after this equation and could violate the room-height relation.
+        P.DomeMaxRadius = FMath::Min(
+            P.MaxRoomRadius,
+            FMath::Max(32.0f, P.MaxRoomRadius * VF_CorpusFreeU(Rng, 0.30f, 0.60f)));
         P.DomeMinRadius = P.DomeMaxRadius * VF_CorpusFreeU(Rng, 0.35f, 0.75f);
         P.DomeHeightRatio = FMath::Min(
             1.0f,
@@ -1615,23 +1632,27 @@ namespace
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
-        P.FloorRoughness = VF_CorpusFreeU(Rng, 0.0f, H * 0.04f);
-        P.CeilingRoughness = VF_CorpusFreeU(Rng, 0.0f, H * 0.08f);
+        // A slab is an open fight/chamber volume, not a one-voxel shell. At the new
+        // eight-chunk default this leaves roughly 20-50 m between the two surfaces after
+        // reserving the 2.5-4 m feature envelopes below.
+        P.FloorRoughness = VF_CorpusFreeU(Rng, 1.0f, FMath::Max(4.0f, H * 0.04f));
+        P.CeilingRoughness = VF_CorpusFreeU(Rng, 2.0f, FMath::Max(8.0f, H * 0.06f));
 
         const float FloorNoise = VOXEL_NOISE_SCALE * P.FloorRoughness;
         const float CeilingNoise = VOXEL_NOISE_SCALE * P.CeilingRoughness;
-        const float FloorClearance = VF_CorpusFreeU(Rng, H * 0.08f, H * 0.16f);
-        const float CeilingClearance = VF_CorpusFreeU(Rng, H * 0.08f, H * 0.16f);
+        const float FloorClearance = VF_CorpusFreeU(Rng, H * 0.08f, H * 0.12f);
+        const float CeilingClearance = VF_CorpusFreeU(Rng, H * 0.08f, H * 0.12f);
         P.FloorRelativeHeight = (P.BoundarySealThickness + FloorNoise + FloorClearance) / H;
         P.CeilingRelativeHeight = 1.0f
             - (P.BoundarySealThickness + CeilingNoise + CeilingClearance) / H;
 
         P.ColumnSpacing = VF_CorpusFreeU(
-            Rng, FMath::Max(24.0f, H * 0.30f), FMath::Max(32.0f, H * 0.75f));
-        P.ColumnMinRadius = VF_CorpusFreeU(Rng, 1.0f, P.ColumnSpacing * 0.08f);
+            Rng, FMath::Max(96.0f, H * 0.375f),
+            FMath::Max(128.0f, FMath::Min(160.0f, H * 0.75f)));
+        P.ColumnMinRadius = VF_CorpusFreeU(Rng, 8.0f, 12.0f);
         P.ColumnMaxRadius = FMath::Max(
             P.ColumnMinRadius,
-            FMath::Min(P.ColumnSpacing * 0.40f, H * 0.38f));
+            FMath::Min(P.ColumnSpacing * 0.40f, P.ColumnMinRadius + 8.0f));
         return true;
     }
 
@@ -1640,12 +1661,16 @@ namespace
                                 float StrateHeightInVoxels)
     {
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
+        // Body-derived lattice: the fight corridor is 3-4 m wide (radius 6-8 voxels),
+        // while the lattice cell is 12-16 m (48-64 voxels). Thus a corridor radius is
+        // about one eighth of a cell, far below CellSize/2, leaving a real rock wall.
         P.CellSize = VF_CorpusFreeU(
-            Rng, FMath::Max(24.0f, H * 0.25f), FMath::Min(96.0f, H * 0.75f));
-        P.CorridorRadius = P.CellSize * VF_CorpusFreeU(Rng, 0.12f, 0.24f);
+            Rng, 48.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
+        P.CorridorRadius = VF_CorpusFreeU(
+            Rng, 6.0f, FMath::Min(8.0f, P.CellSize * 0.20f));
         const float RoughnessCap = FMath::Max(
             0.0f, (P.CorridorRadius + 2.0f) / (VOXEL_NOISE_SCALE * 1.25f));
-        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.0f, RoughnessCap * 0.70f);
+        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.5f, RoughnessCap * 0.60f);
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
         return true;
@@ -1658,9 +1683,11 @@ namespace
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
-        P.ElevationRange = VF_CorpusFreeU(Rng, H * 0.06f, H * 0.16f);
+        // Outdoor relief uses 6-20 m as its authored human-scale band; the absolute
+        // height is still tied to H so the sky cap has room above the terrain.
+        P.ElevationRange = VF_CorpusFreeU(Rng, H * 0.10f, H * 0.25f);
         P.MountainStrength = VF_CorpusFreeU(Rng, 0.20f, 0.80f);
-        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.0f, H * 0.02f);
+        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 1.0f, FMath::Max(3.0f, H * 0.02f));
 
         const float GroundLowerDeviation = P.ElevationRange * 0.50f
             + P.SurfaceRoughness * VOXEL_NOISE_SCALE;
@@ -1743,18 +1770,21 @@ namespace
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
+        // A shaft is a 4-7 m diameter vertical room; connectors are 3-6 m bores.
+        // The 20-28 m site spacing leaves a substantial rock web between shafts.
         P.ShaftSpacing = VF_CorpusFreeU(
-            Rng, FMath::Max(32.0f, H * 0.30f),
-            FMath::Max(32.0f, FMath::Min(112.0f, H * 0.90f)));
-        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.0f, H * 0.04f);
+            Rng, 80.0f, FMath::Max(96.0f, FMath::Min(112.0f, H * 0.90f)));
+        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 1.0f, FMath::Max(3.0f, H * 0.02f));
         const float RoughnessReach = P.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f;
-        P.ShaftMinRadius = RoughnessReach + 0.5f + VF_CorpusFreeU(Rng, 1.0f, 4.0f);
+        P.ShaftMinRadius = FMath::Max(
+            8.0f, RoughnessReach + 0.5f + VF_CorpusFreeU(Rng, 1.0f, 3.0f));
         P.ShaftMaxRadius = FMath::Max(
-            P.ShaftMinRadius + 0.5f,
-            FMath::Min(P.ShaftSpacing * 0.40f, P.ShaftMinRadius + 16.0f));
-        P.ConnectorRadius = RoughnessReach + 1.0f + VF_CorpusFreeU(Rng, 0.0f, 3.0f);
+            P.ShaftMinRadius + 4.0f,
+            FMath::Min(P.ShaftSpacing * 0.40f, P.ShaftMinRadius + 8.0f));
+        P.ConnectorRadius = FMath::Max(
+            6.0f, RoughnessReach + 1.0f + VF_CorpusFreeU(Rng, 0.0f, 2.0f));
         P.LedgeDepth = VF_CorpusFreeU(
-            Rng, 0.5f, FMath::Max(0.5f, FMath::Min(4.0f, P.ShaftSpacing * 0.08f)));
+            Rng, 2.0f, FMath::Max(4.0f, FMath::Min(6.0f, P.ShaftSpacing * 0.08f)));
         const float FloorClearance = FMath::Max(
             1.0f, P.SurfaceRoughness * VOXEL_NOISE_SCALE + 1.0f);
         P.LedgeSpacing = 2.0f * (P.LedgeDepth + FloorClearance)
@@ -1770,21 +1800,23 @@ namespace
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
+        // Island radii are deliberately larger than the roughness envelope: 12-24 m
+        // diameters read as land masses, while 28-40 m site spacing prevents mush.
         P.IslandSpacing = VF_CorpusFreeU(
-            Rng, FMath::Max(40.0f, H * 0.30f),
-            FMath::Max(40.0f, FMath::Min(120.0f, H * 0.75f)));
-        P.ThicknessRatio = VF_CorpusFreeU(Rng, 0.30f, 0.90f);
+            Rng, 112.0f, FMath::Max(112.0f, FMath::Min(160.0f, H * 0.75f)));
+        P.ThicknessRatio = VF_CorpusFreeU(Rng, 0.45f, 0.75f);
         const float MaxByHeight = (H * 0.50f - P.BoundarySealThickness)
             / FMath::Max(P.ThicknessRatio, 0.25f);
         const float MaxRadius = FMath::Max(
-            2.0f, FMath::Min(P.IslandSpacing * 0.45f, MaxByHeight * 0.85f));
+            48.0f, FMath::Min(P.IslandSpacing * 0.45f, MaxByHeight * 0.85f));
         P.IslandMaxRadius = MaxRadius;
-        P.IslandMinRadius = P.IslandMaxRadius * VF_CorpusFreeU(Rng, 0.45f, 0.80f);
+        P.IslandMinRadius = FMath::Max(
+            24.0f, P.IslandMaxRadius * VF_CorpusFreeU(Rng, 0.50f, 0.80f));
         P.SDFBlendRadius = VF_CorpusFreeU(
-            Rng, 0.5f, FMath::Min(6.0f, P.IslandMinRadius * 0.20f));
+            Rng, 2.0f, FMath::Min(6.0f, P.IslandMinRadius * 0.20f));
         const float RoughnessMax = FMath::Max(
             0.0f, (P.IslandMinRadius - P.SDFBlendRadius) / VOXEL_NOISE_SCALE);
-        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.0f, RoughnessMax * 0.70f);
+        P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.5f, RoughnessMax * 0.60f);
         return true;
     }
 
@@ -1860,8 +1892,39 @@ namespace
         }
         if (bValid && bConstraintSampled)
         {
-            bValid = VF_ApplyCorpusFreeConstraints(Archetype, Params, ScalarRng,
-                                                   StrateHeightInVoxels);
+            // Dependent constraints are authored in terms of the final vector, while the
+            // reflected envelope clamp below can move an independently sampled field (for
+            // example SurfaceWorld elevation) after that derivation. Treat the fully clamped
+            // vector as the candidate and deterministically resample until the declared
+            // relations hold; never return a vector whose coupling was only true pre-clamp.
+            constexpr int32 MaxConstraintAttempts = 64;
+            FString ConstraintViolation;
+            bool bConstraintValid = false;
+            for (int32 Attempt = 0; Attempt < MaxConstraintAttempts; ++Attempt)
+            {
+                bConstraintValid = VF_ApplyCorpusFreeConstraints(
+                    Archetype, Params, ScalarRng, StrateHeightInVoxels);
+                if (!bConstraintValid)
+                {
+                    break;
+                }
+                VF_ClampCorpusFreeFields(Params, Archetype, StrateHeightInVoxels);
+                VF_ResetExcludedFields(Params, Archetype);
+                if (VF_ValidateStrateCorpusFreeConstraints(
+                        Archetype, Params, StrateHeightInVoxels, ConstraintViolation))
+                {
+                    break;
+                }
+                bConstraintValid = false;
+            }
+            if (!bConstraintValid)
+            {
+                Result.FailureReason = ConstraintViolation.IsEmpty()
+                    ? TEXT("Constraint sampler could not produce a clamped legal vector.")
+                    : FString::Printf(TEXT("Constraint sampler exhausted legal retries: %s"),
+                                      *ConstraintViolation);
+                return Result;
+            }
         }
         if (!bValid)
         {
@@ -1869,10 +1932,12 @@ namespace
             return Result;
         }
 
-        // Last safety net only: all dependent values above are derived before this envelope
-        // clamp, and no corpus/default value is consulted.
-        VF_ClampCorpusFreeFields(Params, Archetype, StrateHeightInVoxels);
-        VF_ResetExcludedFields(Params, Archetype);
+        if (!bConstraintSampled)
+        {
+            // Last safety net for the independent arm; no corpus/default value is consulted.
+            VF_ClampCorpusFreeFields(Params, Archetype, StrateHeightInVoxels);
+            VF_ResetExcludedFields(Params, Archetype);
+        }
         Result.ArchetypeParams = Params;
         Result.Params = Params.TunnelNetworkParams;
         Result.bValid = true;

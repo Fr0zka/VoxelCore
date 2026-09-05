@@ -66,11 +66,11 @@ public:
 
     // How many chunks tall this strate is.
     // Each strate can have a different height!
-    // Big open caverns = 6-8 chunks, tight tunnels = 3, vertical shaft = 12+
-    // Surface/sky worlds want a high sky-cap ceiling, so they go much taller.
-    // 1 chunk = 32 voxels x 25cm = 8 m, so 256 chunks ~= 2 km of vertical strate.
+    // Human-scale defaults use 8 chunks = 64 m. This gives a 20 m+ vertical budget for
+    // cathedral rooms, tall shafts, and the surface sky cap without changing the lateral gate.
+    // 1 chunk = 32 voxels x 25cm = 8 m, so the maximum 256 chunks is ~= 2 km of vertical strate.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Dimensions", meta = (ClampMin = "1", ClampMax = "256"))
-    int32 StrateHeightInChunks = 4;
+    int32 StrateHeightInChunks = 8;
 
     //=========================================================================
     // BOUNDARY TRANSITION
