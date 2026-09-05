@@ -164,9 +164,31 @@ pauses and drains active generation, installs one temporary override on an exist
 the manager's layout/passages version, and then reuses RegenerateAllChunks to bump GenerationEpoch.
 The slot's Z range and passages therefore remain stable; worker tasks copy the immutable override during
 their versioned refetch. A parameter candidate uses the production native stack mapping, while a
-structure candidate uses VF_BuildStackFromRecipe; custom recipes conservatively return Mixed from
-ClassifyTile so no unproven box bound can skip their mesh. The bridge and its editable properties are
+structure candidate uses `VF_BuildStackFromRecipe`. Custom recipes now classify with that exact
+materialised stack; slot/gap crossings, diffs, and disturbances still fail closed to `Mixed`, and
+accepted uniform verdicts are brute-force checked by `VoxelForge.Composer.Season`. The bridge and its editable properties are
 WITH_EDITOR/WITH_EDITORONLY_DATA only and do not exist in a shipping build.
+
+### 8.4a Cooked seasons — composition stays offline, evaluation ships
+
+`UVoxelSeasonAsset` is a `UPrimaryDataAsset` imported from the diffable schema-2
+`season_manifest.json`. The asset embeds the reviewed JSON, independently copies its seed, season,
+spine/radius and SHA-1 content hash, and retains cook references to authored fixed definitions.
+Runtime parses and verifies both hash copies before accepting the season. An assigned invalid season
+fails closed; it never falls back to an unrelated authored pool.
+
+When `UVoxelSettings::Season` is assigned, `UVoxelStrateManager::Initialize` keeps its existing
+half-built-layout/`GeneratePassages` ordering but feeds it the manifest's exact ordered slots, bounds,
+archetypes, vectors, per-strate seeds and recipes. `UVoxelGenerator` copies an immutable recipe/vector
+on the existing `(owner, chunk, layout version)` refetch and materialises `FVoxelOpStack` locally.
+No rolling, corpus load, measurement, selection, promotion, or review code is compiled for Shipping.
+When Season is unset, the authored fixed/pool shuffle path is unchanged.
+
+Schema 2 is deliberately density-focused. A fixed slot may retain an authored definition path as its
+content/visual/passage bag; a generated slot has deterministic empty/default wider content. Because
+passage configuration is not stored, generated slots set `Connections=0` instead of inventing the
+UObject default passage that was never measured; the origin spine remains. Lateral-region manifests
+are rejected while `VF_LateralRegionsAreShippable()` remains false (measured cross-seam law 9/16).
 
 ### 8.5 Content scatter & water — `VoxelContentManager.h/.cpp` (NEW)
 `UVoxelContentManager` (owned by `AVoxelWorld`, game-thread). TWO INDEPENDENT subsystems:
@@ -836,7 +858,7 @@ generic biome field), not just SurfaceWorld. Empty `Biomes[]` ⇒ all-zero colou
 
 ## 9. Multiplayer model (listen-server first, dedicated-friendly)
 
-> **Status: DESIGN ONLY — nothing is networked in-tree yet** (no `Replicated`/`HasAuthority`/RPCs; a
+> **Status: transport is DESIGN ONLY — nothing is networked in-tree yet** (no `Replicated`/`HasAuthority`/RPCs; a
 > single `GetPlayerPosition()` center; a local diff layer). This section locks in the invariants so the
 > streaming / AI / carve systems are built network-aware from the start instead of retrofitted. Target
 > **now = listen server** (the host is a player AND the authority); **dedicated server = future / out of
@@ -845,11 +867,11 @@ generic biome field), not just SurfaceWorld. Empty `Biomes[]` ⇒ all-zero colou
 ### 9.1 The core invariant — determinism means you NEVER replicate geometry
 The world is a pure function of **(seed, strate layout)** (§8.4). So terrain is reconstructed identically
 on every peer from a tiny amount of shared state — it is **never streamed as geometry over the wire**:
-- Replicate the **effective seed + strate layout** ONCE (at join). Every client's `UVoxelGenerator` +
-  `UVoxelStrateManager` then generate byte-identical terrain locally. (Today the seed lives on the data
-  asset / `UVoxelSettings::Seed`; MP must propagate the *host's* effective seed to joiners so their
-  generators match — a mismatch = divergent worlds. The strate layout is deterministic from seed, so it
-  syncs implicitly once the seed does.)
+- Replicate the **effective seed + strate layout identity** ONCE (at join). For a cooked season the
+  layout is the reviewed manifest, not a pool shuffle: peers must load the same season asset and compare
+  `AVoxelWorld::GetCurrentSeasonContentHash()` before accepting play. For the legacy path the layout remains
+  deterministic from the effective seed. Every peer then generates terrain locally; geometry never crosses
+  the wire. The transport/RPC that performs this join handshake remains out of tree.
 - The **diff layer is the ONLY non-deterministic terrain state** (§3.9, [[voxelforge-difflayer-threading]])
   → it is the only thing that must sync. Since carving is a minor feature, this traffic is small.
 

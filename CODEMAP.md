@@ -222,7 +222,7 @@ redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
 | World bounds | `WorldRadiusVoxels=8192` and `EdgeSealThickness=64` (actor-space XY radial shell; radius 0 = true legacy no-op) |
 | Lighting | `bEnableDensityVolume` + DensityVolume* tunables (§3.11 density clipmap / mini-sun shadows) |
 | Rendering | `VoxelMaterial` (61) |
-| Strates | `Seed` (69), `CurrentSeason=1` (73), `StratePool` (78), `FixedStrates` map (83), `TotalStrates=10` (87) |
+| Strates | Optional cooked `Season`; effective seed/spine/radius/season accessors read it when assigned. Otherwise `Seed`, `CurrentSeason=1`, `StratePool`, `FixedStrates`, and `TotalStrates=10` retain the authored path. |
 | Carving budget | `MaxModifications=0` (97), `MaxBrushRadius=15` (102), `MaxTotalVolume=0` (107). 0 = unlimited. |
 
 ### 3.5 World orchestrator — `Public/VoxelWorld.h` + `Private/VoxelWorld.cpp`
@@ -278,8 +278,8 @@ casse cette arithmetique *structurellement* — `BeginPlay` loggue une **Error**
 | `CarveAtPosition` / `FillAtPosition` | 691 / 709 | Build `FVoxelModification` → `ApplyModification`. |
 | `ApplyModification` | ~1581 | Single funnel for all brushes: DiffLayer → **sync-remesh the brush-centre level-0 tile** (`SyncRemeshTile`, instant hole; skipped if that tile is mid-gen — would race a stale in-flight result) → `RemeshDirtyChunks(..., excludeCenter)` for the neighbours → `RemoveDecorationsInSphere`. |
 | `ClearAllModifications` | 726 | Clears diff layer, regenerates. |
-| `ChangeSeed` | 740 | **Season reset**: new seed everywhere, clear diffs, bump season, reload. |
-| `GetCurrentSeed` / `GetCurrentSeason` | 784 / 789 | Accessors. |
+| `ChangeSeed` | 740 | **Legacy season reset**: new seed everywhere, clear diffs, bump season, reload. Rejected while a cooked season owns the seed. |
+| `GetCurrentSeed` / `GetCurrentSeason` / `GetCurrentSeasonContentHash` | — | Effective cooked-or-legacy identity; the hash is the join-time stale-season comparison value. |
 | `RemeshDirtyChunks` | 798 | Queue loaded level-0 dirty tiles onto `DirtyRemeshQueue` (async re-mesh, no pop) + `MarkDirtyVoxelBox` the volume. Optional `ExcludeTile` = the sync'd centre. Drained FIRST in the submit loop at **BackgroundHigh** (ahead of streaming/band) so a dig never waits behind streaming; in-flight tiles stay QUEUED (not dropped) so a stale pre-carve result is corrected once it lands — fixes "hole shows up a beat late / not until I move". |
 
 > **Game-thread profiling (Perf):** `AVoxelWorld::Tick` and its sub-steps are wrapped in `TRACE_CPUPROFILER_EVENT_SCOPE` — `VoxelForge_Tick / UpdateChunks / BuildDesiredTiles / CullTiles / SubmitTiles / ProcessPending / ProcessUnload / UpdateDecorations / UpdateWater`. Capture a `Count/Incl/Excl` Insights timer export and read the `Excl` column to see which step owns the per-frame cost (the actor tick shows as `BP_VoxelWorld_C` if subclassed in BP). `VoxelForge_ClassifyTile` (T1.d) / `VoxelForge_GenerateMesh` + `VoxelForge_BuildStreams` are worker-side (off the frame): the RMC `FRealtimeMeshStreamSet` is now built on the gen worker (`BuildTileStreamSet`) and carried on `FChunkResult::Streams` (TSharedPtr), so `ApplyMeshToTile` is game-thread-cheap — just material/ceiling resolve + `CreateSectionGroup(MoveTemp)`. See ARCHITECTURE §8.10 "Worker-built StreamSet (T1.f)".
@@ -297,14 +297,14 @@ This is **where terrain shape lives.**
 | `CellularNoise3D` (static) | 101 | Worley/cellular — grotto/scallop. |
 | `ApplyBoundarySeal` (static) | 170 | Solidifies strate top/bottom shells. |
 | `ApplyPassageCarving` (static) | 197 | Punches passages/elevator through the seal. |
-| `InitializeSettings` | 211 | Copies seed, spine radius, and global XY world-bound settings from `UVoxelSettings`; radius 0 preserves the legacy unbounded field. |
-| **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, dispatches, adds diff offset. Its `CP_*` per-chunk state is keyed by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; every key component is an integer compare and a different generator/world cannot inherit the previous owner's cached params or op stack. |
+| `InitializeSettings` | 211 | Copies the effective seed, spine radius, and global XY world-bound settings from `UVoxelSettings` (the season owns all three when assigned); radius 0 preserves the unbounded field. |
+| **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, materialises a cooked-season recipe on the existing per-chunk refetch when present, dispatches, then adds disturbances/diff. Its `CP_*` state is keyed by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; workers copy immutable recipe/vector data and never read editor composer state. |
 | **`GetDensityWithParams`** | 277 | TunnelNetwork pipeline (~1000 lines). See §4. ⚠️ Takes **required** `ParamsFingerprint` + `LayoutVersion` since the AUDIT §C2 fix (2026-07-28) — they go into the SDF cache key so a chunk can no longer be evaluated against a neighbour's rooms. Callers compute the CRC **once per chunk** (`CP_TunnelFP`), never per voxel. |
 | **`GetSlabDensity`** | 1306 | FlatPlain/CrystalChamber pipeline. See §4.2. |
 | `SampleSurfaceStructuralZ` | — | **F20:** the RAW SurfaceWorld heightfield (continents+mountains+detail), BEFORE any terrain op; returns terrain Z + relief M. Cliff re-samples it at an XY offset for a cheap analytic slope. |
 | `ComputeSurfaceTerrainZ` / `GetSurfaceDensity` | — | SurfaceWorld heightfield → terrain Z, then density; biome **output-blend** lerps dominant/neighbour heights (`ParamsD`/`ParamsN`/weight). **F20 surface ops** (`FSurfaceGenerationParams`, biome-selected + slope/relief-conditioned, all default off): Cliff (slope-gated STEEPENING — push height from local mean where steep ⇒ sheer walls; 4 structural resamples only when on), Terrace (relief-gated + `TerraceHardness`), LayerLines (sedimentary shelves) — pure per-column height REMAPS applied here so the single height oracle stays consistent (MC/sheets/ClassifyTile/deco/BP bridge). **Phase 2 OVERHANG** (volumetric — real jutting shelves): in `SurfaceDensityFromColumn`, for AIR voxels in a window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height (tiny low ⇒ air over the void, full high ⇒ borrows the far cliff rock) and unioned in ⇒ a shelf attached to the cliff, tapering out over the void with air beneath (the sketch). Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill `(DirX,DirY)` resolved once in `ComputeSurfaceColumn` (gradient sampled at the REACH scale so a spot over the void can see the cliff), cached on `FSurfaceColumn`. Genuine 3D (per-voxel structural re-eval, gated to steep overhang columns). Off ⇒ byte-identical. §8.14. |
 | `VF_BuildOpStackForChunk` (file-static) | — | **The archetype → stack mapping, written down once.** `GetDensityAt` and `ClassifyTile` both call it; params are passed in, never fetched here. A second copy would be the worst bug available in this file — a tile skipped on the verdict of a stack that is not the one producing its density is a hole. Returns false (⇒ caller falls back to the `switch`) for an unported archetype, missing params, or a **degenerate strate**, since five archetype functions early-out to air there and the stack deliberately has no such early-out. `Refs.Surface == nullptr` makes it refuse SurfaceWorld, which is how `ClassifyTile` keeps its own exact-lattice proof. |
-| `ClassifyTile` | — | **T1.d trivial-tile reject** (worker, called by `LoadTile` before `GenerateMesh`): first applies the shared radial XY edge proof (global outer-shell tiles → AllSolid, including gaps/out-of-layout), then proves a tile AllSolid/AllAir on the mesher's exact lattice (gap chunks + SurfaceWorld columns via the SHARED `GSurfColCache`; seal bands; **cave archetypes via `FVoxelOpStack::ClassifyBox` when the strate opted in** — see §3.2d for the six guards, all failing to `Mixed`; guards: diff mods, passages, spine, disturbances, **F20 overhang** — a column point in `(TerrainZ, TerrainZ+OverhangMargin]` (margin = max `OverhangHeight`) is unprovable ⇒ Mixed, UPWARD only since the shelf union only ADDS rock above ground, so an overhang shelf never holes a trivially-skipped tile) → skip gen. Mixed = generate normally. Its diagnostic-only not-op-stack bail attribution distinguishes a tile wholly inside the disabled slot, a boundary tile, and an unresolved layout; the classifier's conditions/returns are unchanged. §8.10. |
+| `ClassifyTile` | — | **T1.d trivial-tile reject.** Cooked/editor recipes now build the exact recipe stack and call its proved `ClassifyBox`; a tile crossing a slot/gap, any diff, or any disturbance returns `Mixed`. This replaces the old global `HasComposerRecipeOverride()` force-to-Mixed. Native cave/surface/gap proofs and all §8.10 caches remain unchanged. |
 | `SampleRelief` / `SampleMoisture` | — | Climate fields (pure XY, [0,1]). Relief = shared source of truth for the relief map M. §8.14. |
 | `SampleBiomeAt` | — | Warped-Voronoi + climate biome query (dominant + neighbour + weight). Reference used by the preview bake + `GetDominantBiomeAt`. §8.14. |
 | `ResolveBiomeSampleAt` / `RebuildBiomeGrid` | — | Hot-path biome resolve (FBiomeSample) via a box-validated per-chunk cell-grid cache. Bit-identical to `SampleBiomeAt`. §8.14, §8.10. |
@@ -425,7 +425,7 @@ Maps depth→strate at runtime; owns passages.
 - `FStrateSlot` (h:84): definition + chunk-Z range + index.
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| `Initialize` | 10 | Builds the stacked layout from settings+seed (fixed slots + pool sorted by soft-asset path, then unchanged Fisher-Yates shuffle), logs every **cave** slot whose operator-stack opt-in is disabled, then `GeneratePassages`. SurfaceWorld is deliberately excluded from that diagnostic because its exact-lattice T1.d path does not depend on the flag. |
+| `Initialize` | 10 | Keeps the existing sequencing through `GeneratePassages`, but selects one slot source: a validated cooked season (exact ordered bounds/vector/recipe) or the unchanged authored fixed+sorted/shuffled pool. Assigned-invalid seasons fail closed. Authored source definitions are duplicated as content bags; generated slots use deterministic C++ defaults and zero auto-passages because schema 2 does not store passage configuration. |
 | `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. After XY placement, the destination's pure `VF_SuggestLandingPoint` may move the lower mouth within an archetype-specific lattice budget, then the result is clamped outside the destination seal bands and interpolated through the control points; unsupported/no-footing answers warn and preserve the old random reach. |
 | `EvaluateModifierSDF` | 357 | SDF of passages at a point (for carving). Per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`. §8.10. |
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
@@ -435,6 +435,7 @@ Maps depth→strate at runtime; owns passages.
 | `GetStrateForChunk` | 466 | Chunk → definition. |
 | `GetGeneratorTypeForChunk` | 476 | Chunk → generator type. |
 | `UsesOperatorStackForChunk` | 559 | Chunk → should `GetDensityAt` take the operator stack? `bUseOperatorStack` on the definition **AND** archetype in the ported list — **now all 8 of 8** (Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork, Underwater). **That list is written down here and nowhere else.** With every archetype ported the flag is now the *only* thing that decides the path, so ticking the box is no longer a no-op anywhere — it is a real switch onto the operator stack for that strate. |
+| `GetRecipeForChunk` | — | Runtime immutable recipe/vector/strate-seed copy for cooked seasons; editor slot overrides use the same worker hand-off. |
 | `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
 | `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
 | `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
@@ -491,7 +492,8 @@ class IDs, an ordered modifier ID list, and one native parameter-family ID per e
 represented in the manifest; `VF_BuildStackFromRecipe` appends spine, vertical seal, passage carve,
 and XY edge seal in the fixed order. The roller derives modifier legality from the op channel and
 resource declarations, rolls 4–8 unique modifiers, and validates the recipe before materialising
-it. `RequiredResources` / `ProvidedResources` close the room-state hole that channel masks alone
+it. **Rolling is editor-only; `VF_BuildStackFromRecipe` is runtime evaluation and is used by cooked
+seasons.** `RequiredResources` / `ProvidedResources` close the room-state hole that channel masks alone
 could not express. `VoxelForgeComposerStructureRollTest` rolls 64 candidates, measures them through
 the offline sampler, and brute-forces every uniform box verdict from the novel stack itself.
 
@@ -543,20 +545,28 @@ descending corpus-centroid distance. The `VoxelForge.Composer.Showcase` test add
 alphabetized one-card-per-archetype PIE hand-off page with the Part A survivor distributions, exact seed /
 candidate / target-slot values, and no runtime generation hook.
 
-**`Public/VoxelSeasonManifest.h` + `Private/VoxelSeasonManifest.cpp`** — Tier 4c's offline season
-artifact. `VF_ComposeSeason` generates a bounded configurable candidate batch, applies the Tier 2
+**`Public/VoxelSeasonManifest.h` + `Private/VoxelSeasonManifest.cpp`** — Tier 4c's offline composer
+and runtime-readable schema-2 artifact. `VF_ComposeSeason` generates a bounded configurable candidate batch, applies the Tier 2
 non-vacuous / largest-component / primordial-law gates, then selects an ordered Tier A spine with the
 explicit provisional grounded/outlier, adjacency, variety, and five-slot boss policy. The JSON stores
 the complete six-family parameter vector (float values carry both a readable number and exact IEEE-754
 bits), seed/index/archetype/recipe, bounds, measured metrics, gate facts, candidate audit, and rejection
-counts. `VF_LoadVoxelSeasonManifest` plus `VF_RebuildVoxelSeasonStrate` are the round-trip seam; generated
+counts. A canonical SHA-1 `content_hash` covers the complete payload. `VF_DeserializeVoxelSeasonManifest`
+verifies it in memory; `VF_LoadVoxelSeasonManifest` plus `VF_RebuildVoxelSeasonStrate` are the round-trip seam; generated
 recipe entries rebuild through the mandatory-post builder, while authored `FixedStrates` retain their
 absolute slot and native vector. The selected-only descent review reuses `VoxelStratePreview`, and all
-composition/review work is editor/build-box code; normal runtime generation is untouched. The focused
+composition/review work is editor/build-box code; parsing and recipe materialisation are runtime. Lateral
+region manifests remain rejected because their cross-seam law is only 9/16. The focused
 season test currently reports **24 generated / 19 hard-gate survivors / 6 selected / 18 unselected or
 rejected**, with **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**, and **393,216**
 round-trip density samples bit-identical. The specified UE 5.7 editor build succeeded and the full
-`VoxelForge` namespace passed **28/28 tests** after this seam was added.
+`VoxelForge` namespace passed **28/28 tests** after the original seam was added; current results must be
+re-recorded after the owner build.
+
+**`Public/VoxelSeasonAsset.h` + `Private/VoxelSeasonAsset.cpp`** — `UVoxelSeasonAsset :
+UPrimaryDataAsset`, the cookable carrier. Its editor button imports the reviewable JSON, stores the exact
+text plus independently copied metadata/hash, and retains soft references to any authored definitions.
+`UVoxelSettings::Season` is the only activation switch.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
 `UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
@@ -626,7 +636,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. Final run: **9 promoted**, corpus **4/8/9**, survival **20.8/54.2/54.2/45.8/50.0%**, spread **0.869214→0.916302**, **63.556 s**, 0 failures. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Final run: **42/64 survival (65.6%)**, **64 distinct recipes**, **0 invalid recipes**, **64 coarse filled + 64 coarse contour pairs**, **42 fine filled + 42 fine contour pairs**, blank plan/card **6/42→3/42**, **243.649 s**, **0 refusals**. |
 | `VoxelForgeComposerShowcaseTest.cpp` | `VoxelForge.Composer.Showcase` | Exhausts the bounded parameter-roll set (seeds **0, 7331**, indices **0–63**), excludes multi-region rolls while the lateral gate is off, and measures every missing-family candidate in all six interior target slots at step 4 / radius 256 / `MaxCells=8,000,000`. Hard gates are non-vacuous, largest air share ≥ **0.50**, and exact unsnapped arrival→departure connectivity; selection score is floor-area fraction + clearance tie-break + projected-surface tie-break. It asserts roll/manifest determinism, density sign, zero `WorldRadiusVoxels`, bit-identical metric reruns, and writes one alphabetized card per archetype to `Saved/VoxelForge/Showcase/index.html`, with step-1 radius-64 filled/contour plan + vertical ROI images centred on `LargestComponentPoint`. |
-| `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Composes a six-slot offline season from 24 structure candidates; asserts **19 hard-gate survivors**, **6 selected**, deterministic byte-identical JSON, absolute descent order, all selected primordial-law facts, and a selected-only review page with metrics/reasons/boss markers. Loads the JSON, rebuilds every selected stack, and compares **393,216** bounded density samples bit-for-bit. Rejection audit: **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**. |
+| `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Existing compose/review/393,216-sample round trip plus schema hash tamper rejection, two independent runtime manager/generator instances, season-authoritative seed/spine/radius, unset-season regression, and brute-force verification of every sampled non-Mixed recipe tile verdict (up to 64). |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm run uses **16 candidates per arm** (256×3 and 64×3 were stopped before aggregate output for runtime), step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **13/16, 7/16, 7/16** survival; survivor walkable means **0.066071, 0.012566, 0.012851** and feature-scale means **92.307693, 64.571426, 31.428572**. Box checks: **196/260,876**, **310/412,610**, **262/348,722** proved/voxels, **0 violations** in every arm. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |
@@ -683,6 +693,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | Tweak room/tunnel shapes | `VoxelCaveMorphology.cpp` `BuildChunkCache` :47 / `EvaluateSDFCached` :757. |
 | Worm tunnel behavior | `GetDensityWithParams` Step 5, VoxelGenerator.cpp:1241. |
 | Strate stacking / which strate where | `UVoxelStrateManager::Initialize` :10. |
+| Publish/use an offline season | Create `UVoxelSeasonAsset`, set `SourceManifestJson`, press `ImportSeasonManifestJson`, then assign it to `UVoxelSettings::Season`. |
 | Boundary blend between strates | `GetGenerationParams` :515 + `FStrateGenerationParams::Lerp` (expands `VF_STRATE_PARAM_FIELDS`, StrateTypes.h — new fields go in that list). |
 | Passages between strates | `GeneratePassages` :146 + `EvaluateModifierSDF` :371 + `ApplyPassageCarving` (Generator.cpp:197). |
 | Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:691/709 → `UVoxelDiffLayer::ApplyModification` :63. |

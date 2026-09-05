@@ -356,7 +356,9 @@ VOXELFORGE_API void VF_SetStrateArchetypeRuntimeBounds(
     FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ);
 
 /** Stable identity helpers for the deterministic lateral partition. */
+#if WITH_EDITOR
 VOXELFORGE_API int32 VF_RollStrateRegionCount(int32 Seed, int32 StrateIndex);
+#endif
 VOXELFORGE_API uint32 VF_GetStrateRegionPartitionSeed(int32 Seed, int32 StrateIndex);
 VOXELFORGE_API void VF_RekeyStrateRegionManifest(
     FVoxelStrateRegionManifest& Manifest, int32 Seed, int32 StrateIndex);

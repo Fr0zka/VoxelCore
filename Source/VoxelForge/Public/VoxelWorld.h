@@ -308,6 +308,10 @@ public:
     UFUNCTION(BlueprintPure, Category = "Voxel World|Season")
     int32 GetCurrentSeason() const;
 
+    /** Reviewed manifest digest to replicate/compare at join; empty on the legacy authored path. */
+    UFUNCTION(BlueprintPure, Category = "Voxel World|Season")
+    FString GetCurrentSeasonContentHash() const;
+
     //=========================================================================
     // STRATE QUERIES (gameplay integration)
     //=========================================================================

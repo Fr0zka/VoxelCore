@@ -481,6 +481,7 @@ VOXELFORGE_API bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
                                             bool bAppendStructuralPosts = true);
 
 /** Build the region combiner stack. Creative cores are independent; structural posts are global. */
+#if WITH_EDITOR
 VOXELFORGE_API bool VF_BuildStrateRegionStack(
     const FVoxelStrateRegionManifest& Manifest,
     float SpineRadius,
@@ -488,3 +489,4 @@ VOXELFORGE_API bool VF_BuildStrateRegionStack(
     FVoxelOpStack& OutStack,
     FVoxelOpContext& OutContext,
     FString* OutError = nullptr);
+#endif

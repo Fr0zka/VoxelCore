@@ -13,6 +13,7 @@
 
 // IWYU : pointeur seulement (VoxelMaterial). / Pointer-only use.
 class UMaterialInterface;
+class UVoxelSeasonAsset;
 
 UCLASS(BlueprintType)
 class UVoxelSettings : public UPrimaryDataAsset
@@ -20,6 +21,12 @@ class UVoxelSettings : public UPrimaryDataAsset
 	GENERATED_BODY()
 
 public:
+
+    /** Season seed/radius replace the mutable authored values only when Season is assigned. */
+    int32 GetEffectiveWorldSeed() const;
+    float GetEffectiveOriginSpineRadius() const;
+    float GetEffectiveWorldRadiusVoxels() const;
+    int32 GetEffectiveSeasonNumber() const;
 
 	//=========================================================================
 	// STREAMING (distance de vue)
@@ -349,6 +356,11 @@ public:
 	// Seed du monde. Pilote toute la génération procédurale.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Strates")
 	int32 Seed = 0;
+
+	// Optional reviewed/cooked season. When set, its manifest owns layout, seed, bounds and
+	// density recipes; the authored StratePool/FixedStrates path remains untouched when unset.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Voxel|Strates")
+	TSoftObjectPtr<UVoxelSeasonAsset> Season;
 
 	// Numéro de saison (incrementé par ChangeSeed). Purement informatif côté gameplay.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Strates")

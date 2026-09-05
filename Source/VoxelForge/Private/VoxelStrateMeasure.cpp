@@ -2,6 +2,8 @@
 
 #include "VoxelStrateMeasure.h"
 
+#if WITH_EDITOR
+
 #include "VoxelGenerator.h"
 #include "VoxelStrateManager.h"
 #include "VoxelTypes.h"
@@ -1579,3 +1581,5 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
                                 Result.bStartSnapped, Result.bGoalSnapped, &Result);
     return Result;
 }
+
+#endif // WITH_EDITOR — measurement never ships

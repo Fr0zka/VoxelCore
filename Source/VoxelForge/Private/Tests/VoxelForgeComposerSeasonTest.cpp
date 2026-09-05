@@ -5,10 +5,18 @@
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "UObject/Package.h"        // GetTransientPackage() — this file does not use the shared
+                                   // fixture, which is where the other tests pick it up implicitly.
+#include "UObject/StrongObjectPtr.h"
 
 #include "VoxelDensityOpStack.h"
+#include "VoxelGenerator.h"
+#include "VoxelSeasonAsset.h"
 #include "VoxelSeasonManifest.h"
+#include "VoxelSettings.h"
 #include "VoxelStrateComposer.h"
+#include "VoxelStrateDefinition.h"
+#include "VoxelStrateManager.h"
 
 namespace
 {
@@ -121,6 +129,11 @@ bool FVoxelForgeComposerSeasonTest::RunTest(const FString& Parameters)
     }
     TestEqual(TEXT("loaded manifest has the same number of selected strates"),
               LoadedManifest.Strates.Num(), Manifest.Strates.Num());
+    TestEqual(TEXT("loaded manifest content hash matches the composed payload"),
+              LoadedManifest.ContentHash, Manifest.ContentHash);
+    TestEqual(TEXT("manifest recomputes the hash it was composed from"),
+              VF_ComputeVoxelSeasonManifestContentHash(LoadedManifest),
+              LoadedManifest.ContentHash);
 
     int64 ComparedDensitySamples = 0;
     bool bAllDensityBitsIdentical = true;
@@ -202,6 +215,190 @@ bool FVoxelForgeComposerSeasonTest::RunTest(const FString& Parameters)
                             ComparedDensitySamples));
     TestTrue(TEXT("manifest round-trip density field is bit-identical"),
              bAllDensityBitsIdentical);
+
+    // Runtime seam: embed the reviewed JSON in a cookable primary asset, then let two independent
+    // managers/generators materialise the complete selected layout. The authored settings seed and
+    // radius are deliberately different so the test proves the season is authoritative.
+    TStrongObjectPtr<UVoxelSeasonAsset> SeasonAsset(
+        NewObject<UVoxelSeasonAsset>(GetTransientPackage(), NAME_None, RF_Transient));
+    FString AssetReport;
+    TestTrue(TEXT("cookable season asset accepts the reviewed manifest"),
+             SeasonAsset->SetManifestJson(Manifest.SerializedJson, AssetReport));
+
+    TStrongObjectPtr<UVoxelSettings> RuntimeSettings(
+        NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
+    RuntimeSettings->Seed = Manifest.Seed + 17;
+    RuntimeSettings->OriginSpineRadius = Manifest.OriginSpineRadius + 31.0f;
+    RuntimeSettings->WorldRadiusVoxels = 4096.0f;
+    RuntimeSettings->Season = TSoftObjectPtr<UVoxelSeasonAsset>(SeasonAsset.Get());
+
+    TStrongObjectPtr<UVoxelStrateManager> ManagerA(
+        NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
+    TStrongObjectPtr<UVoxelStrateManager> ManagerB(
+        NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
+    TestTrue(TEXT("first independent season manager initializes"),
+             ManagerA->Initialize(RuntimeSettings.Get(), RuntimeSettings->GetEffectiveWorldSeed()));
+    TestTrue(TEXT("second independent season manager initializes"),
+             ManagerB->Initialize(RuntimeSettings.Get(), RuntimeSettings->GetEffectiveWorldSeed()));
+    TestEqual(TEXT("season overrides the authored settings seed"),
+              RuntimeSettings->GetEffectiveWorldSeed(), Manifest.Seed);
+    TestEqual(TEXT("season keeps WorldRadiusVoxels zero"),
+              RuntimeSettings->GetEffectiveWorldRadiusVoxels(), 0.0f);
+    TestEqual(TEXT("season owns the origin spine radius used by recipe stacks"),
+              RuntimeSettings->GetEffectiveOriginSpineRadius(), Manifest.OriginSpineRadius);
+    TestEqual(TEXT("first manager loads every season slot"),
+              ManagerA->GetNumStrates(), Manifest.Strates.Num());
+    TestEqual(TEXT("second manager loads every season slot"),
+              ManagerB->GetNumStrates(), Manifest.Strates.Num());
+    TestEqual(TEXT("first manager exposes the reviewed content hash"),
+              ManagerA->GetSeasonContentHash(), Manifest.ContentHash);
+    TestEqual(TEXT("second manager exposes the reviewed content hash"),
+              ManagerB->GetSeasonContentHash(), Manifest.ContentHash);
+
+    TStrongObjectPtr<UVoxelGenerator> GeneratorA(
+        NewObject<UVoxelGenerator>(GetTransientPackage(), NAME_None, RF_Transient));
+    TStrongObjectPtr<UVoxelGenerator> GeneratorB(
+        NewObject<UVoxelGenerator>(GetTransientPackage(), NAME_None, RF_Transient));
+    GeneratorA->InitializeSettings(RuntimeSettings.Get());
+    GeneratorB->InitializeSettings(RuntimeSettings.Get());
+    GeneratorA->SetStrateManager(ManagerA.Get());
+    GeneratorB->SetStrateManager(ManagerB.Get());
+
+    int64 ManagerDensitySamples = 0;
+    bool bManagersBitIdentical = true;
+    for (const FVoxelSeasonStrate& Strate : Manifest.Strates)
+    {
+        for (int32 Z = Strate.BottomWorldZ;
+             Z < Strate.TopWorldZ && bManagersBitIdentical; Z += 2)
+        {
+            for (int32 Y = -32; Y < 32 && bManagersBitIdentical; Y += 2)
+            {
+                for (int32 X = -32; X < 32; X += 2)
+                {
+                    const float A = GeneratorA->GetDensityAt((float)X, (float)Y, (float)Z);
+                    const float B = GeneratorB->GetDensityAt((float)X, (float)Y, (float)Z);
+                    ++ManagerDensitySamples;
+                    if (!SameDensityBits(A, B))
+                    {
+                        bManagersBitIdentical = false;
+                        AddError(FString::Printf(
+                            TEXT("independent season managers diverged at (%d,%d,%d): 0x%08x vs 0x%08x"),
+                            X, Y, Z, *reinterpret_cast<const uint32*>(&A),
+                            *reinterpret_cast<const uint32*>(&B)));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    AddInfo(FString::Printf(
+        TEXT("two independent runtime season managers compared %lld bit-identical density samples"),
+        ManagerDensitySamples));
+    TestTrue(TEXT("two independent runtime season managers produce a bit-identical field"),
+             bManagersBitIdentical);
+
+    // The former HasComposerRecipeOverride force made every one of these tiles Mixed (zero proved
+    // tiles). The new path asks the exact recipe stack and brute-forces every verdict it accepts.
+    int32 NumClassified = 0;
+    int32 NumMixed = 0;
+    int32 NumAllSolid = 0;
+    int32 NumAllAir = 0;
+    int32 NumVerdictsBruteForced = 0;
+    int32 NumFalseVerdicts = 0;
+    constexpr int32 TileCells = 16;
+    for (const FVoxelSeasonStrate& Strate : Manifest.Strates)
+    {
+        for (int32 ZBand = 1; ZBand <= 3; ++ZBand)
+        {
+            const int32 Z = Strate.BottomWorldZ
+                + (Strate.TopWorldZ - Strate.BottomWorldZ) * ZBand / 4;
+            for (int32 Y = -128; Y <= 128; Y += 32)
+            {
+                for (int32 X = -128; X <= 128; X += 32)
+                {
+                    const FIntVector Origin(X, Y, Z);
+                    const EVoxelTileClass Verdict = GeneratorA->ClassifyTile(
+                        Origin, 1, TileCells);
+                    ++NumClassified;
+                    if (Verdict == EVoxelTileClass::Mixed) { ++NumMixed; continue; }
+                    if (Verdict == EVoxelTileClass::AllSolid) ++NumAllSolid;
+                    else ++NumAllAir;
+
+                    if (NumVerdictsBruteForced >= 64) continue;
+                    ++NumVerdictsBruteForced;
+                    const bool bSolid = Verdict == EVoxelTileClass::AllSolid;
+                    bool bBad = false;
+                    for (int32 GZ = -1; GZ <= TileCells + 1 && !bBad; ++GZ)
+                    for (int32 GY = -1; GY <= TileCells + 1 && !bBad; ++GY)
+                    for (int32 GX = -1; GX <= TileCells + 1; ++GX)
+                    {
+                        const float D = GeneratorA->GetDensityAt(
+                            (float)(X + GX), (float)(Y + GY), (float)(Z + GZ));
+                        if (bSolid ? D >= 0.0f : D < 0.0f)
+                        {
+                            bBad = true;
+                            ++NumFalseVerdicts;
+                            AddError(FString::Printf(
+                                TEXT("composed recipe false %s tile at (%d,%d,%d), sample (%d,%d,%d)=%.9g"),
+                                bSolid ? TEXT("AllSolid") : TEXT("AllAir"), X, Y, Z,
+                                X + GX, Y + GY, Z + GZ, D));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    AddInfo(FString::Printf(
+        TEXT("composed recipe tile classification: before force=%d Mixed/0 proved; after=%d Mixed, %d AllSolid, %d AllAir; %d accepted verdicts brute-forced, %d violations"),
+        NumClassified, NumMixed, NumAllSolid, NumAllAir,
+        NumVerdictsBruteForced, NumFalseVerdicts));
+    TestTrue(TEXT("composed recipe classification proves at least one uniform tile"),
+             NumAllSolid + NumAllAir > 0);
+    TestEqual(TEXT("composed recipe classification has no false uniform verdict"),
+              NumFalseVerdicts, 0);
+
+    FString TamperedJson = Manifest.SerializedJson;
+    const FString OriginalSeedField = FString::Printf(TEXT("\"seed\": %d"), Manifest.Seed);
+    const FString TamperedSeedField = FString::Printf(TEXT("\"seed\": %d"), Manifest.Seed + 1);
+    TamperedJson = TamperedJson.Replace(*OriginalSeedField, *TamperedSeedField,
+                                        ESearchCase::CaseSensitive);
+    FVoxelSeasonManifest TamperedManifest;
+    FString TamperReport;
+    TestFalse(TEXT("stale/edited season JSON is rejected by its content hash"),
+              VF_DeserializeVoxelSeasonManifest(
+                  TamperedJson, TamperedManifest, TamperReport));
+    TestTrue(TEXT("stale season failure names the content hash"),
+             TamperReport.Contains(TEXT("content hash")));
+
+    // Explicit unset regression gate: no season means the authored pointer, seed and radius still
+    // flow through the original pool/fixed path.
+    TStrongObjectPtr<UVoxelSettings> LegacySettings(
+        NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
+    TStrongObjectPtr<UVoxelStrateDefinition> LegacyDefinition(
+        NewObject<UVoxelStrateDefinition>(GetTransientPackage(), NAME_None, RF_Transient));
+    LegacySettings->Seed = 77123;
+    LegacySettings->OriginSpineRadius = 23.0f;
+    LegacySettings->WorldRadiusVoxels = 987.0f;
+    LegacySettings->TotalStrates = 1;
+    LegacyDefinition->StrateHeightInChunks = 7;
+    LegacySettings->StratePool.Add(
+        TSoftObjectPtr<UVoxelStrateDefinition>(LegacyDefinition.Get()));
+    TStrongObjectPtr<UVoxelStrateManager> LegacyManager(
+        NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
+    TestTrue(TEXT("legacy manager still initializes with Season unset"),
+             LegacyManager->Initialize(LegacySettings.Get(), LegacySettings->Seed));
+    TestTrue(TEXT("season unset remains the authored-pool path"),
+             LegacySettings->Season.IsNull()
+             && LegacyManager->GetNumStrates() == 1
+             && LegacyManager->GetLayout()[0].Definition == LegacyDefinition.Get()
+             && LegacyManager->GetLayout()[0].HeightInChunks == 7
+             && LegacyManager->GetWorldSeed() == LegacySettings->Seed
+             && LegacySettings->GetEffectiveWorldSeed() == LegacySettings->Seed
+             && LegacySettings->GetEffectiveOriginSpineRadius()
+                == LegacySettings->OriginSpineRadius
+             && LegacySettings->GetEffectiveWorldRadiusVoxels()
+                == LegacySettings->WorldRadiusVoxels);
     return true;
 }
 

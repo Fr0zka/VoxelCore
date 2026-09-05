@@ -7,6 +7,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/SecureHash.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -1428,56 +1429,85 @@ const TCHAR* VF_GetVoxelSeasonSelectionReasonName(EVoxelSeasonSelectionReason Re
     return TEXT("unknown");
 }
 
-FString VF_SerializeVoxelSeasonManifest(const FVoxelSeasonManifest& Manifest)
+namespace
 {
-    using namespace VoxelSeasonManifestPrivate;
-    TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
-    SetCommonManifestFields(Root, Manifest);
-
-    TArray<TSharedPtr<FJsonValue>> Strates;
-    for (const FVoxelSeasonStrate& Strate : Manifest.Strates)
+    FString SerializeVoxelSeasonManifestInternal(
+        const FVoxelSeasonManifest& Manifest, bool bIncludeContentHash)
     {
-        Strates.Add(MakeShared<FJsonValueObject>(SerializeStrate(Strate)));
-    }
-    Root->SetArrayField(TEXT("strates"), MoveTemp(Strates));
+        using namespace VoxelSeasonManifestPrivate;
+        TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+        SetCommonManifestFields(Root, Manifest);
 
-    TArray<TSharedPtr<FJsonValue>> Rejections;
-    for (const FVoxelSeasonRejectionCount& Rejection : Manifest.RejectionCounts)
-    {
-        TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
-        Object->SetStringField(TEXT("reason"), Rejection.Reason);
-        Object->SetNumberField(TEXT("count"), Rejection.Count);
-        Rejections.Add(MakeShared<FJsonValueObject>(Object));
-    }
-    Root->SetArrayField(TEXT("rejection_counts"), MoveTemp(Rejections));
+        TArray<TSharedPtr<FJsonValue>> Strates;
+        for (const FVoxelSeasonStrate& Strate : Manifest.Strates)
+        {
+            Strates.Add(MakeShared<FJsonValueObject>(SerializeStrate(Strate)));
+        }
+        Root->SetArrayField(TEXT("strates"), MoveTemp(Strates));
 
-    if (!Manifest.CandidateAudit.IsEmpty())
-    {
-        TArray<TSharedPtr<FJsonValue>> Audit;
-        for (const FVoxelSeasonCandidateAudit& Row : Manifest.CandidateAudit)
+        TArray<TSharedPtr<FJsonValue>> Rejections;
+        for (const FVoxelSeasonRejectionCount& Rejection : Manifest.RejectionCounts)
         {
             TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
-            Object->SetNumberField(TEXT("candidate_index"), Row.CandidateIndex);
-            Object->SetNumberField(TEXT("seed"), Row.Seed);
-            Object->SetStringField(TEXT("archetype"), ArchetypeName(Row.Archetype));
-            Object->SetNumberField(TEXT("recipe_hash"), static_cast<double>(Row.RecipeHash));
-            Object->SetNumberField(TEXT("distance_from_corpus_centroid"), Row.DistanceFromCorpusCentroid);
-            Object->SetBoolField(TEXT("passed_hard_gates"), Row.bPassedHardGates);
-            Object->SetBoolField(TEXT("selected"), Row.bSelected);
-            Object->SetStringField(TEXT("rejection_reason"), Row.RejectionReason);
-            Audit.Add(MakeShared<FJsonValueObject>(Object));
+            Object->SetStringField(TEXT("reason"), Rejection.Reason);
+            Object->SetNumberField(TEXT("count"), Rejection.Count);
+            Rejections.Add(MakeShared<FJsonValueObject>(Object));
         }
-        Root->SetArrayField(TEXT("candidate_audit"), MoveTemp(Audit));
-    }
+        Root->SetArrayField(TEXT("rejection_counts"), MoveTemp(Rejections));
 
-    FString JsonText;
-    TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
-        TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonText);
-    if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer) || !Writer->Close())
-    {
-        return FString();
+        if (!Manifest.CandidateAudit.IsEmpty())
+        {
+            TArray<TSharedPtr<FJsonValue>> Audit;
+            for (const FVoxelSeasonCandidateAudit& Row : Manifest.CandidateAudit)
+            {
+                TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+                Object->SetNumberField(TEXT("candidate_index"), Row.CandidateIndex);
+                Object->SetNumberField(TEXT("seed"), Row.Seed);
+                Object->SetStringField(TEXT("archetype"), ArchetypeName(Row.Archetype));
+                Object->SetNumberField(TEXT("recipe_hash"), static_cast<double>(Row.RecipeHash));
+                Object->SetNumberField(TEXT("distance_from_corpus_centroid"), Row.DistanceFromCorpusCentroid);
+                Object->SetBoolField(TEXT("passed_hard_gates"), Row.bPassedHardGates);
+                Object->SetBoolField(TEXT("selected"), Row.bSelected);
+                Object->SetStringField(TEXT("rejection_reason"), Row.RejectionReason);
+                Audit.Add(MakeShared<FJsonValueObject>(Object));
+            }
+            Root->SetArrayField(TEXT("candidate_audit"), MoveTemp(Audit));
+        }
+
+        if (bIncludeContentHash)
+        {
+            const FString Payload = SerializeVoxelSeasonManifestInternal(Manifest, false);
+            if (Payload.IsEmpty()) return FString();
+            FTCHARToUTF8 Utf8(*Payload);
+            uint8 Digest[FSHA1::DigestSize];
+            FSHA1::HashBuffer(Utf8.Get(), Utf8.Length(), Digest);
+            Root->SetStringField(TEXT("content_hash"), BytesToHex(Digest, FSHA1::DigestSize));
+        }
+
+        FString JsonText;
+        TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonText);
+        if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer) || !Writer->Close())
+        {
+            return FString();
+        }
+        return JsonText;
     }
-    return JsonText;
+}
+
+FString VF_ComputeVoxelSeasonManifestContentHash(const FVoxelSeasonManifest& Manifest)
+{
+    const FString Payload = SerializeVoxelSeasonManifestInternal(Manifest, false);
+    if (Payload.IsEmpty()) return FString();
+    FTCHARToUTF8 Utf8(*Payload);
+    uint8 Digest[FSHA1::DigestSize];
+    FSHA1::HashBuffer(Utf8.Get(), Utf8.Length(), Digest);
+    return BytesToHex(Digest, FSHA1::DigestSize);
+}
+
+FString VF_SerializeVoxelSeasonManifest(const FVoxelSeasonManifest& Manifest)
+{
+    return SerializeVoxelSeasonManifestInternal(Manifest, true);
 }
 
 bool VF_SaveVoxelSeasonManifest(const FString& ManifestPath,
@@ -1511,24 +1541,25 @@ bool VF_SaveVoxelSeasonManifest(const FString& ManifestPath,
     return true;
 }
 
-bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
-                                FVoxelSeasonManifest& OutManifest,
-                                FString& OutReport)
+bool VF_DeserializeVoxelSeasonManifest(const FString& ManifestJson,
+                                       FVoxelSeasonManifest& OutManifest,
+                                       FString& OutReport)
 {
     using namespace VoxelSeasonManifestPrivate;
     OutManifest = FVoxelSeasonManifest();
     OutReport.Reset();
-    if (ManifestPath.IsEmpty())
+    if (ManifestJson.IsEmpty())
     {
-        OutReport = TEXT("season manifest path is empty");
+        OutReport = TEXT("season manifest JSON is empty");
         OutManifest.Error = OutReport;
         return false;
     }
 
     TSharedPtr<FJsonObject> Root;
-    FString OriginalJson;
-    if (!LoadJson(ManifestPath, Root, OutReport, &OriginalJson))
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ManifestJson);
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
     {
+        OutReport = TEXT("season manifest JSON is malformed");
         OutManifest.Error = OutReport;
         return false;
     }
@@ -1556,6 +1587,8 @@ bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
     bool bFieldsValid = true;
     OutManifest.bValid = bValid;
     OutManifest.SchemaVersion = SchemaVersion;
+    bFieldsValid = ReadJsonString(Root, TEXT("content_hash"), OutManifest.ContentHash)
+        && bFieldsValid;
     bFieldsValid = ReadJsonInt32(Root, TEXT("season"), OutManifest.Season) && bFieldsValid;
     bFieldsValid = ReadJsonInt32(Root, TEXT("seed"), OutManifest.Seed) && bFieldsValid;
     double CorpusHash = 0.0;
@@ -1669,7 +1702,7 @@ bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
         const FVoxelSeasonStrate& Strate = OutManifest.Strates[Index];
         const float StoredTop = static_cast<float>(Strate.TopWorldZ);
         const float StoredBottom = static_cast<float>(Strate.BottomWorldZ);
-        if (Strate.DepthIndex != Index || !Strate.bPassedPrimordialLaw
+        if (Strate.DepthIndex != Index || Strate.bUsesRegions || !Strate.bPassedPrimordialLaw
             || Strate.PrimordialLawResult != EVoxelConnectivityResult::Connected)
         {
             bFieldsValid = false;
@@ -1695,17 +1728,99 @@ bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
     }
     if (!bFieldsValid)
     {
-        OutReport = FString::Printf(TEXT("season manifest %s contains invalid fields"), *ManifestPath);
+        OutReport = TEXT("season manifest contains invalid fields");
         OutManifest.Error = OutReport;
         OutManifest.bValid = false;
         return false;
     }
-    OutManifest.ManifestPath = ManifestPath;
-    OutManifest.SerializedJson = MoveTemp(OriginalJson);
-    OutReport = FString::Printf(TEXT("loaded season manifest from %s"), *ManifestPath);
+    const FString ComputedHash = VF_ComputeVoxelSeasonManifestContentHash(OutManifest);
+    if (ComputedHash.IsEmpty()
+        || !ComputedHash.Equals(OutManifest.ContentHash, ESearchCase::IgnoreCase))
+    {
+        OutReport = FString::Printf(
+            TEXT("season manifest content hash mismatch (stored %s, computed %s)"),
+            *OutManifest.ContentHash, *ComputedHash);
+        OutManifest.Error = OutReport;
+        OutManifest.bValid = false;
+        return false;
+    }
+    OutManifest.SerializedJson = ManifestJson;
+    OutReport = FString::Printf(TEXT("loaded season manifest hash %s"), *OutManifest.ContentHash);
     return OutManifest.IsUsable();
 }
 
+bool VF_LoadVoxelSeasonManifest(const FString& ManifestPath,
+                                FVoxelSeasonManifest& OutManifest,
+                                FString& OutReport)
+{
+    FString JsonText;
+    if (ManifestPath.IsEmpty())
+    {
+        OutReport = TEXT("season manifest path is empty");
+        OutManifest = FVoxelSeasonManifest();
+        OutManifest.Error = OutReport;
+        return false;
+    }
+    if (!FFileHelper::LoadFileToString(JsonText, *ManifestPath))
+    {
+        OutReport = FString::Printf(TEXT("could not read season manifest %s"), *ManifestPath);
+        OutManifest = FVoxelSeasonManifest();
+        OutManifest.Error = OutReport;
+        return false;
+    }
+    if (!VF_DeserializeVoxelSeasonManifest(JsonText, OutManifest, OutReport))
+    {
+        OutReport = FString::Printf(TEXT("season manifest %s: %s"), *ManifestPath, *OutReport);
+        OutManifest.Error = OutReport;
+        return false;
+    }
+    OutManifest.ManifestPath = ManifestPath;
+    OutReport = FString::Printf(TEXT("loaded season manifest from %s (hash %s)"),
+                                *ManifestPath, *OutManifest.ContentHash);
+    return true;
+}
+
+namespace VoxelSeasonRuntimePrivate
+{
+    float ActiveTop(const FVoxelStrateArchetypeParams& Params, ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:      return Params.TunnelNetworkParams.StrateTopWorldZ;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:  return Params.SlabParams.StrateTopWorldZ;
+        case ECaveGeneratorType::Maze:            return Params.MazeParams.StrateTopWorldZ;
+        case ECaveGeneratorType::SurfaceWorld:    return Params.SurfaceParams.StrateTopWorldZ;
+        case ECaveGeneratorType::VerticalShafts:  return Params.VerticalShaftParams.StrateTopWorldZ;
+        case ECaveGeneratorType::FloatingIslands: return Params.FloatingIslandParams.StrateTopWorldZ;
+        }
+        return 0.0f;
+    }
+
+    float ActiveBottom(const FVoxelStrateArchetypeParams& Params, ECaveGeneratorType Archetype)
+    {
+        switch (Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:      return Params.TunnelNetworkParams.StrateBottomWorldZ;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:  return Params.SlabParams.StrateBottomWorldZ;
+        case ECaveGeneratorType::Maze:            return Params.MazeParams.StrateBottomWorldZ;
+        case ECaveGeneratorType::SurfaceWorld:    return Params.SurfaceParams.StrateBottomWorldZ;
+        case ECaveGeneratorType::VerticalShafts:  return Params.VerticalShaftParams.StrateBottomWorldZ;
+        case ECaveGeneratorType::FloatingIslands: return Params.FloatingIslandParams.StrateBottomWorldZ;
+        }
+        return 0.0f;
+    }
+
+    bool SameFloatBits(float A, float B)
+    {
+        return FMemory::Memcmp(&A, &B, sizeof(float)) == 0;
+    }
+}
+
+#if WITH_EDITOR
 namespace VoxelSeasonCompositionPrivate
 {
     float ActiveTop(const FVoxelStrateArchetypeParams& Params, ECaveGeneratorType Archetype);
@@ -1920,7 +2035,10 @@ namespace VoxelSeasonCompositionPrivate
         OutStrate.Params = Candidate.ArchetypeParams;
         OutStrate.Regions = Candidate.Regions;
         OutStrate.bUsesRecipe = true;
-        OutStrate.bUsesRegions = Candidate.Regions.RegionCount > 1;
+        // Lateral composition remains a laboratory feature until its cross-seam law is perfect.
+        // The season artifact must therefore stay on the proved single-stack runtime contract.
+        OutStrate.bUsesRegions = VF_LateralRegionsAreShippable()
+            && Candidate.Regions.RegionCount > 1;
         SetRuntimeBounds(OutStrate.Params, static_cast<float>(TopWorldZ),
                          static_cast<float>(BottomWorldZ));
         if (OutStrate.Regions.IsValid())
@@ -2235,6 +2353,7 @@ namespace VoxelSeasonCompositionPrivate
         return VoxelSeasonManifestPrivate::ConnectivityName(Result);
     }
 }
+#endif // WITH_EDITOR — composition, measurement and review helpers never ship
 
 namespace VoxelSeasonCompositionPrivate
 {
@@ -2791,6 +2910,11 @@ FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed,
 
     Manifest.bValid = true;
     Manifest.Error.Reset();
+    Manifest.ContentHash = VF_ComputeVoxelSeasonManifestContentHash(Manifest);
+    if (Manifest.ContentHash.IsEmpty())
+    {
+        return Fail(TEXT("could not hash composed season manifest"));
+    }
     Manifest.SerializedJson = VF_SerializeVoxelSeasonManifest(Manifest);
     if (Manifest.SerializedJson.IsEmpty())
     {
@@ -2807,20 +2931,9 @@ FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed,
     return Manifest;
 }
 
-#else
-
-FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed,
-                                      const FVoxelSeasonCompositionSettings& Settings)
-{
-    (void)SeasonSeed;
-    (void)Settings;
-    FVoxelSeasonManifest Manifest;
-    Manifest.Error = TEXT("season composition is editor/build-box only");
-    return Manifest;
-}
-
 #endif
 
+#if WITH_EDITOR
 FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed, const UVoxelSettings* WorldSettings)
 {
     FVoxelSeasonCompositionSettings Settings;
@@ -2835,6 +2948,7 @@ FVoxelSeasonManifest VF_ComposeSeason(int32 SeasonSeed, const UVoxelSettings* Wo
     }
     return VF_ComposeSeason(SeasonSeed, Settings);
 }
+#endif
 
 bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
                                float SpineRadius,
@@ -2843,7 +2957,7 @@ bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
                                FVoxelOpContext& OutContext,
                                FString* OutError)
 {
-    using namespace VoxelSeasonCompositionPrivate;
+    using namespace VoxelSeasonRuntimePrivate;
     auto Fail = [&](const FString& Reason) -> bool
     {
         if (OutError != nullptr)
@@ -2890,8 +3004,12 @@ bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
     bool bBuilt = false;
     if (Strate.bUsesRegions)
     {
+#if WITH_EDITOR
         bBuilt = VF_BuildStrateRegionStack(Strate.Regions, SpineRadius, StrateManager,
                                             OutStack, OutContext, OutError);
+#else
+        return Fail(TEXT("Lateral region manifests are not shippable."));
+#endif
     }
     else if (Strate.bUsesRecipe)
     {
@@ -2902,7 +3020,8 @@ bool VF_BuildSeasonStrateStack(const FVoxelSeasonStrate& Strate,
     else
     {
 #if WITH_EDITOR
-        const float Seal = ActiveSeal(Strate.Params, Strate.Archetype);
+        const float Seal = VoxelSeasonCompositionPrivate::ActiveSeal(
+            Strate.Params, Strate.Archetype);
         bBuilt = VF_BuildNativeStrateStackForCandidate(
             Strate.Archetype, Strate.Params, Strate.Seed, SpineRadius,
             0.0f, Seal, StrateManager, OutStack, OutContext);
@@ -2940,6 +3059,7 @@ bool VF_RebuildVoxelSeasonStrate(const FVoxelSeasonStrate& Strate,
                                      OutStack, OutContext, OutError);
 }
 
+#if WITH_EDITOR
 namespace VoxelSeasonCompositionPrivate
 {
     bool WriteReviewPage(const FVoxelSeasonManifest& Manifest,
@@ -3021,3 +3141,4 @@ namespace VoxelSeasonCompositionPrivate
         return true;
     }
 }
+#endif // WITH_EDITOR — review rendering never ships

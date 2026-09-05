@@ -4886,6 +4886,7 @@ namespace
         uint32 SeedU;
     };
 
+#if WITH_EDITOR
     //=============================================================================
     // RÔLE 2 — COMBINER : RÉGIONS LATÉRALES
     //=============================================================================
@@ -5008,6 +5009,7 @@ namespace
         mutable FVoxelStrateRegionPartitionCache PartitionCache;
         mutable bool bPrepared = false;
     };
+#endif
 
 }   // ⚠️ FIN DU NAMESPACE ANONYME — TOUT NOUVEL OPÉRATEUR SE MET AU-DESSUS DE CETTE LIGNE.
     // Même piège que dans VoxelHeightOpStack.cpp : s'ancrer sur une bannière située plus bas
@@ -6144,6 +6146,7 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
     return true;
 }
 
+#if WITH_EDITOR
 namespace
 {
     static EVoxelStrateParamBlock VF_RegionParamBlock(ECaveGeneratorType Archetype)
@@ -6449,3 +6452,4 @@ bool VF_BuildStrateRegionStack(
     OutStack = MoveTemp(Parent);
     return true;
 }
+#endif // WITH_EDITOR — lateral regions remain behind the failed shippability gate

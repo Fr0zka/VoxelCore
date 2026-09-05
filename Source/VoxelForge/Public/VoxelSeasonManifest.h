@@ -1,8 +1,4 @@
-// Offline Tier 4c season composition and the diffable Tier A manifest.
-//
-// This header deliberately describes an editor/build-box artifact. The normal runtime path still
-// receives its existing settings and builds density exactly as before; no runtime code consumes a
-// season manifest as a hidden generation fallback.
+// Offline Tier 4c composition plus the runtime-readable, diffable Tier A manifest.
 
 #pragma once
 
@@ -195,7 +191,7 @@ struct VOXELFORGE_API FVoxelSeasonStrate
  */
 struct VOXELFORGE_API FVoxelSeasonManifest
 {
-    static constexpr int32 CurrentSchemaVersion = 1;
+    static constexpr int32 CurrentSchemaVersion = 2;
 
     bool bValid = false;
     int32 SchemaVersion = CurrentSchemaVersion;
@@ -204,6 +200,9 @@ struct VOXELFORGE_API FVoxelSeasonManifest
     int32 Season = 0;
     int32 Seed = 0;
     uint32 InputCorpusHash = 0;
+    // SHA-1 of the canonical manifest JSON with this field omitted.  This detects stale cooked
+    // season assets without requiring the editor-only input corpus on a player's machine.
+    FString ContentHash;
     int32 CandidateCount = 0;
     int32 SurvivorCount = 0;
     int32 SelectedCount = 0;
@@ -230,15 +229,17 @@ struct VOXELFORGE_API FVoxelSeasonManifest
 
     bool IsUsable() const
     {
-        if (!bValid || !Error.IsEmpty() || WorldRadiusVoxels != 0.0f
+        if (!bValid || !Error.IsEmpty() || ContentHash.Len() != 40 || WorldRadiusVoxels != 0.0f
             || Strates.Num() != SelectedCount || SelectedCount <= 0)
         {
             return false;
         }
         for (const FVoxelSeasonStrate& Strate : Strates)
         {
-            if (Strate.bUsesRegions
-                && (!Strate.Regions.IsValid() || Strate.Regions.RegionCount <= 1))
+            // Region composition is intentionally not a shippable season format yet.  Keeping
+            // this rejection in the portable manifest contract prevents an editor experiment
+            // from becoming packaged terrain merely because its density evaluator exists.
+            if (Strate.bUsesRegions)
             {
                 return false;
             }
@@ -252,15 +253,23 @@ VOXELFORGE_API const TCHAR* VF_GetVoxelSeasonSelectionReasonName(
     EVoxelSeasonSelectionReason Reason);
 
 /** Compose, validate, select, serialize, and (by default) write one season. Editor/build-box only. */
+#if WITH_EDITOR
 VOXELFORGE_API FVoxelSeasonManifest VF_ComposeSeason(
     int32 SeasonSeed, const FVoxelSeasonCompositionSettings& Settings);
 
 /** Convenience overload that adapts the existing runtime settings asset. */
 VOXELFORGE_API FVoxelSeasonManifest VF_ComposeSeason(
     int32 SeasonSeed, const UVoxelSettings* WorldSettings);
+#endif
 
 /** Serialize/read the complete Tier A manifest as stable pretty JSON. */
 VOXELFORGE_API FString VF_SerializeVoxelSeasonManifest(
+    const FVoxelSeasonManifest& Manifest);
+/** Parse an in-memory/cooked JSON manifest and verify its embedded content hash. */
+VOXELFORGE_API bool VF_DeserializeVoxelSeasonManifest(
+    const FString& ManifestJson, FVoxelSeasonManifest& OutManifest, FString& OutReport);
+/** Stable SHA-1 over the canonical manifest payload (the content_hash field itself is omitted). */
+VOXELFORGE_API FString VF_ComputeVoxelSeasonManifestContentHash(
     const FVoxelSeasonManifest& Manifest);
 VOXELFORGE_API bool VF_SaveVoxelSeasonManifest(
     const FString& ManifestPath, const FVoxelSeasonManifest& Manifest, FString& OutReport);

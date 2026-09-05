@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <utility>
 
+#if WITH_EDITOR
 namespace
 {
     constexpr float GJitterFraction = 0.15f;
@@ -2262,27 +2263,6 @@ namespace
     }
 }
 
-bool FVoxelStrateMeasuredMetrics::IsUsable() const
-{
-    return bValid
-        && NumSampled > 0
-        && NumAir > 0
-        && NumSolid > 0
-        && NumSampled == NumAir + NumSolid
-        && NumAirComponents > 0
-        && LargestComponentCells > 0
-        && AirComponentCells.Num() == NumAirComponents
-        && FMath::IsFinite(AirFraction)
-        && FMath::IsFinite(LargestComponentShare)
-        && FMath::IsFinite(WalkableFraction)
-        && FMath::IsFinite(WalkableFloorAreaFraction)
-        && FMath::IsFinite(LargestWalkableSurfaceShare)
-        && FMath::IsFinite(MedianFeatureScale)
-        && FMath::IsFinite(LargestComponentPoint.X)
-        && FMath::IsFinite(LargestComponentPoint.Y)
-        && FMath::IsFinite(LargestComponentPoint.Z);
-}
-
 FVoxelStrateMeasuredMetrics VF_SummarizeStrateMetrics(
     const FVoxelStrateMetrics& Metrics)
 {
@@ -3901,22 +3881,6 @@ uint32 FVoxelStrateCorpus::GetContentsHash() const
     return Hash;
 }
 
-const TCHAR* VF_GetStrateArchetypeName(ECaveGeneratorType Archetype)
-{
-    switch (Archetype)
-    {
-    case ECaveGeneratorType::TunnelNetwork:  return TEXT("TunnelNetwork");
-    case ECaveGeneratorType::FlatPlain:      return TEXT("FlatPlain");
-    case ECaveGeneratorType::CrystalChamber: return TEXT("CrystalChamber");
-    case ECaveGeneratorType::Maze:            return TEXT("Maze");
-    case ECaveGeneratorType::SurfaceWorld:    return TEXT("SurfaceWorld");
-    case ECaveGeneratorType::VerticalShafts:  return TEXT("VerticalShafts");
-    case ECaveGeneratorType::FloatingIslands: return TEXT("FloatingIslands");
-    case ECaveGeneratorType::Underwater:      return TEXT("Underwater");
-    }
-    return TEXT("Unknown");
-}
-
 const TCHAR* VF_GetStrateCorpusProvenanceName(EVoxelStrateCorpusProvenance Provenance)
 {
     switch (Provenance)
@@ -4400,6 +4364,7 @@ bool FVoxelStrateCorpus::SetMeasuredMetrics(
     }
     return false;
 }
+#endif // WITH_EDITOR — corpus loading, promotion and parameter/structure roll implementation
 
 void VF_SetStrateArchetypeRuntimeBounds(
     FVoxelStrateArchetypeParams& Params, float TopWorldZ, float BottomWorldZ)
@@ -4589,11 +4554,13 @@ namespace VoxelStrateRegionPrivate
     }
 }
 
+#if WITH_EDITOR
 int32 VF_RollStrateRegionCount(int32 Seed, int32 StrateIndex)
 {
     return 1 + static_cast<int32>(VoxelHash::Cell(
         StrateIndex, StrateIndex ^ 0x6D, static_cast<uint32>(Seed) ^ 0x524F4C4Cu) % 3u);
 }
+#endif
 
 uint32 VF_GetStrateRegionPartitionSeed(int32 Seed, int32 StrateIndex)
 {
@@ -4753,6 +4720,7 @@ FVoxelStrateRegionBoxProof VF_AnalyzeStrateRegionBox(
     return Proof;
 }
 
+#if WITH_EDITOR
 FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpus,
                                                  int32 Seed, int32 Index)
 {
@@ -5694,3 +5662,4 @@ bool VF_AreStrateStructureRecipesIdentical(const FVoxelOpStackRecipe& A,
     }
     return true;
 }
+#endif // WITH_EDITOR — no roller/corpus entry point is compiled into Shipping

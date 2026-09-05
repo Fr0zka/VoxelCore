@@ -83,7 +83,8 @@ thousand candidate strates, measure them all, keep the best, validate at any res
 a model over the candidates at zero runtime cost. **And Jahni reviews and vetoes the season before it
 publishes** — the system does the work, he keeps the veto.
 
-**What ships is small:** the season's seed plus the chosen strates' parameter vectors. Clients generate
+**What ships is small:** the season's seed plus the chosen strates' parameter vectors and structure
+recipes. Clients generate
 terrain from those, deterministically, exactly as today. **No composition is shipped or run in the
 normal game path.** The editor-only PIE inspection button described below is a deliberate debugging
 exception: it overlays one already-built slot so the owner can walk a measured candidate; it is not
@@ -98,20 +99,31 @@ recipe, complete native parameter-family vector, archetype, bounds, measured met
 Floating-point fields carry both a readable value and their exact IEEE-754 bit pattern, so a loader can
 rebuild the same stack and the season test can assert bit-identical density rather than assume it.
 
+Publishing is explicit: keep the JSON as the reviewed/diffable source, create a
+`UVoxelSeasonAsset`, point `SourceManifestJson` at it, press `ImportSeasonManifestJson`, and assign the
+asset to `UVoxelSettings::Season`. The primary data asset is what cooks. Schema 2 embeds a canonical
+SHA-1 `content_hash`; runtime recomputes it and also compares the asset's separately imported metadata,
+so a stale or edited season fails closed instead of silently falling back to the authored pool.
+
 The selected-only review page is a descent-ordered `VoxelStratePreview` contact sheet. Each card shows
 the depth, recipe, metrics, grounded/outlier/fixed selection reason, and boss-slot marker. Selection is
 deliberately provisional: the current readable policy reserves 75% grounded and 25% outlier slots,
 penalises near-identical neighbours, rewards new archetypes/recipes, and respects fixed absolute slots.
 Jahni's preview and veto remain the decision that turns this artifact into a published season. The
-composer and review writer are editor/build-box code only; no normal runtime generation path calls
-them, and `WorldRadiusVoxels` remains 0.
+composer, corpus, measurement, selection, promotion, and review writer are editor/build-box code only.
+Runtime contains only manifest parsing/verification and recipe evaluation, and `WorldRadiusVoxels`
+remains 0. Generated schema-2 slots have no passage/content/visual record: they therefore use
+deterministic empty/default wider content and zero auto-passages (the origin spine remains). Fixed slots
+may retain an authored definition path as that wider-content bag. Lateral regions remain unshippable at
+the measured 9/16 cross-seam law result.
 
 An abbreviated manifest shape is:
 
 ```json
 {
   "format": "VoxelForgeSeasonManifest",
-  "schema_version": 1,
+  "schema_version": 2,
+  "content_hash": "0123456789abcdef0123456789abcdef01234567",
   "season": 0,
   "seed": 9320,
   "candidate_count": 24,

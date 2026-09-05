@@ -4,10 +4,12 @@
 #include "VoxelStrateManager.h"
 #include "CoreGlobals.h"  // GIsAutomationTesting — the opt-in diagnostic stays quiet under tests
 #include "VoxelSettings.h"
+#include "VoxelSeasonAsset.h"
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
+#include "UObject/UObjectGlobals.h"
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -58,22 +60,46 @@ static float PassageFBM(float X, float Seed)
     return (MaxV > 0.0f) ? (Total / MaxV) : 0.0f;
 }
 
-void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
+bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 {
     if (!Settings)
     {
         UE_LOG(LogTemp, Error, TEXT("[StrateManager] No settings provided!"));
-        return;
+        return false;
+    }
+
+    FVoxelSeasonManifest SeasonManifest;
+    bool bUseSeason = false;
+    if (!Settings->Season.IsNull())
+    {
+        UVoxelSeasonAsset* SeasonAsset = Settings->Season.LoadSynchronous();
+        FString SeasonReport;
+        if (SeasonAsset == nullptr
+            || !SeasonAsset->LoadManifest(SeasonManifest, SeasonReport))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[StrateManager] Season asset is assigned but unusable: %s"),
+                SeasonAsset ? *SeasonReport : *Settings->Season.ToString());
+            return false; // Fail closed: falling back to the authored pool would diverge peers.
+        }
+        bUseSeason = true;
+        WorldSeed = SeasonManifest.Seed;
     }
 
     StrateLayout.Empty();
+    SeasonStrates.Empty();
+    ActiveSeasonContentHash.Reset();
 #if WITH_EDITOR
     // A full layout rebuild discards any temporary walk-through candidate. The world calls this
     // under FScopedGenerationPause, so no worker can observe the map while it is being cleared.
     ComposerOverrides.Reset();
 #endif
 
-    const int32 TotalStrates = Settings->TotalStrates;
+    const int32 TotalStrates = bUseSeason
+        ? SeasonManifest.Strates.Num() : Settings->TotalStrates;
+    const int32 LayoutGapChunks = bUseSeason
+        ? SeasonManifest.InterStrateGapChunks
+        : FMath::Max(0, Settings->InterStrateGapChunks);
 
     //=========================================================================
     // STEP 1: Build shuffled pool (seed-based randomization)
@@ -84,13 +110,16 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     using FLoadedPoolEntry = TPair<FString, UVoxelStrateDefinition*>;
     TArray<FLoadedPoolEntry> ShuffledPool;
-    for (const TSoftObjectPtr<UVoxelStrateDefinition>& SoftPtr : Settings->StratePool)
+    if (!bUseSeason)
     {
-        // Load the asset (synchronous for now — could be async later)
-        UVoxelStrateDefinition* Def = SoftPtr.LoadSynchronous();
-        if (Def)
+        for (const TSoftObjectPtr<UVoxelStrateDefinition>& SoftPtr : Settings->StratePool)
         {
-            ShuffledPool.Emplace(SoftPtr.ToString(), Def);
+            // Load the asset (synchronous for now — could be async later)
+            UVoxelStrateDefinition* Def = SoftPtr.LoadSynchronous();
+            if (Def)
+            {
+                ShuffledPool.Emplace(SoftPtr.ToString(), Def);
+            }
         }
     }
 
@@ -125,12 +154,15 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     // Pre-load fixed strate definitions
     TMap<int32, UVoxelStrateDefinition*> LoadedFixed;
-    for (auto& Pair : Settings->FixedStrates)
+    if (!bUseSeason)
     {
-        UVoxelStrateDefinition* Def = Pair.Value.LoadSynchronous();
-        if (Def)
+        for (auto& Pair : Settings->FixedStrates)
         {
-            LoadedFixed.Add(Pair.Key, Def);
+            UVoxelStrateDefinition* Def = Pair.Value.LoadSynchronous();
+            if (Def)
+            {
+                LoadedFixed.Add(Pair.Key, Def);
+            }
         }
     }
 
@@ -142,32 +174,97 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
         FStrateSlot Slot;
         Slot.StrateIndex = i;
 
-        // Pick definition: fixed or from pool
-        UVoxelStrateDefinition** FixedDef = LoadedFixed.Find(i);
-        if (FixedDef && *FixedDef)
+        if (bUseSeason)
         {
-            Slot.Definition = *FixedDef;
-        }
-        else if (ShuffledPool.Num() > 0)
-        {
-            // Cycle through the pool (wraps around if more strates than pool entries)
-            Slot.Definition = ShuffledPool[PoolCursor % ShuffledPool.Num()].Value;
-            PoolCursor++;
+            const FVoxelSeasonStrate& SeasonStrate = SeasonManifest.Strates[i];
+            if (!SeasonStrate.SourceDefinitionPath.IsEmpty())
+            {
+                TSoftObjectPtr<UVoxelStrateDefinition> SourceDefinition(
+                    FSoftObjectPath(SeasonStrate.SourceDefinitionPath));
+                UVoxelStrateDefinition* LoadedDefinition = SourceDefinition.LoadSynchronous();
+                if (LoadedDefinition == nullptr)
+                {
+                    UE_LOG(LogTemp, Error,
+                        TEXT("[StrateManager] Season slot %d could not load authored definition '%s'."),
+                        i, *SeasonStrate.SourceDefinitionPath);
+                    StrateLayout.Empty();
+                    SeasonStrates.Empty();
+                    return false;
+                }
+                // Keep the authored content/passage/visual bag without mutating the cooked asset,
+                // then make the manifest's density identity authoritative below.
+                Slot.Definition = DuplicateObject<UVoxelStrateDefinition>(LoadedDefinition, this);
+            }
+            else
+            {
+                // The current density manifest has no wider content record. Keep all consumers
+                // supplied with a stable definition object, but do not guess an authored theme.
+                Slot.Definition = NewObject<UVoxelStrateDefinition>(this, NAME_None, RF_Transient);
+                Slot.Definition->StrateName = FText::FromString(
+                    FString::Printf(TEXT("Season %d Strate %d"), SeasonManifest.Season, i));
+                Slot.Definition->TransitionType = EVoxelStrateTransition::Hard;
+                // Passage configuration is not part of schema v2. Inventing the UObject default
+                // here would add an unreviewed tunnel to every generated boundary and make the
+                // runtime field differ from the field that passed composition. The origin spine
+                // remains the guaranteed connection until a later schema explicitly stores these.
+                Slot.Definition->PassageConfig.Connections = 0;
+            }
+
+            Slot.Definition->GeneratorType = SeasonStrate.Archetype;
+            Slot.Definition->bUseOperatorStack = SeasonStrate.bUsesRecipe;
+            Slot.Definition->StrateHeightInChunks = SeasonStrate.HeightInChunks;
+            Slot.Definition->GenerationParams = SeasonStrate.Params.TunnelNetworkParams;
+            Slot.Definition->SlabParams = SeasonStrate.Params.SlabParams;
+            Slot.Definition->MazeParams = SeasonStrate.Params.MazeParams;
+            Slot.Definition->SurfaceParams = SeasonStrate.Params.SurfaceParams;
+            Slot.Definition->VerticalShaftParams = SeasonStrate.Params.VerticalShaftParams;
+            Slot.Definition->FloatingIslandParams = SeasonStrate.Params.FloatingIslandParams;
+
+            Slot.HeightInChunks = SeasonStrate.HeightInChunks;
+            Slot.TopChunkZ = SeasonStrate.TopWorldZ / CHUNK_SIZE - 1;
+            Slot.BottomChunkZ = SeasonStrate.BottomWorldZ / CHUNK_SIZE;
+            if (SeasonStrate.TopWorldZ % CHUNK_SIZE != 0
+                || SeasonStrate.BottomWorldZ % CHUNK_SIZE != 0
+                || Slot.TopChunkZ != CurrentTopZ
+                || Slot.BottomChunkZ != CurrentTopZ - (Slot.HeightInChunks - 1))
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("[StrateManager] Season slot %d bounds do not describe the declared stacked layout."), i);
+                StrateLayout.Empty();
+                SeasonStrates.Empty();
+                return false;
+            }
+            SeasonStrates.Add(SeasonStrate);
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("[StrateManager] No strate definitions available for slot %d!"), i);
-            continue;
-        }
+            // Pick definition: fixed or from pool
+            UVoxelStrateDefinition** FixedDef = LoadedFixed.Find(i);
+            if (FixedDef && *FixedDef)
+            {
+                Slot.Definition = *FixedDef;
+            }
+            else if (ShuffledPool.Num() > 0)
+            {
+                // Cycle through the pool (wraps around if more strates than pool entries)
+                Slot.Definition = ShuffledPool[PoolCursor % ShuffledPool.Num()].Value;
+                PoolCursor++;
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[StrateManager] No strate definitions available for slot %d!"), i);
+                continue;
+            }
 
-        // Compute Z range from definition's height
-        Slot.HeightInChunks = Slot.Definition->StrateHeightInChunks;
-        Slot.TopChunkZ = CurrentTopZ;
-        Slot.BottomChunkZ = CurrentTopZ - (Slot.HeightInChunks - 1);
+            // Compute Z range from definition's height
+            Slot.HeightInChunks = Slot.Definition->StrateHeightInChunks;
+            Slot.TopChunkZ = CurrentTopZ;
+            Slot.BottomChunkZ = CurrentTopZ - (Slot.HeightInChunks - 1);
+        }
 
         // Move the cursor down for the next strate, leaving a solid-bedrock gap of
         // InterStrateGapChunks chunks between this strate and the next.
-        CurrentTopZ = Slot.BottomChunkZ - 1 - FMath::Max(0, Settings->InterStrateGapChunks);
+        CurrentTopZ = Slot.BottomChunkZ - 1 - LayoutGapChunks;
 
         StrateLayout.Add(Slot);
 
@@ -187,13 +284,17 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
     int32 NumOperatorStackDisabledCaves = 0;
     for (const FStrateSlot& Slot : StrateLayout)
     {
-        if (!Slot.Definition || Slot.Definition->GeneratorType == ECaveGeneratorType::SurfaceWorld)
+        const ECaveGeneratorType SlotArchetype = bUseSeason
+            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
+        if (!Slot.Definition || SlotArchetype == ECaveGeneratorType::SurfaceWorld)
         {
             continue;
         }
 
         ++NumCaveSlots;
-        if (!Slot.Definition->bUseOperatorStack)
+        const bool bUsesStack = bUseSeason
+            ? SeasonStrates[Slot.StrateIndex].bUsesRecipe : Slot.Definition->bUseOperatorStack;
+        if (!bUsesStack)
         {
             ++NumOperatorStackDisabledCaves;
         }
@@ -226,9 +327,13 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     for (const FStrateSlot& Slot : StrateLayout)
     {
+        const bool bSeasonStack = bUseSeason
+            && SeasonStrates[Slot.StrateIndex].bUsesRecipe;
+        const ECaveGeneratorType SlotArchetype = bUseSeason
+            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
         if (!Slot.Definition
-            || Slot.Definition->GeneratorType == ECaveGeneratorType::SurfaceWorld
-            || Slot.Definition->bUseOperatorStack)
+            || SlotArchetype == ECaveGeneratorType::SurfaceWorld
+            || (bUseSeason ? bSeasonStack : Slot.Definition->bUseOperatorStack))
         {
             continue;
         }
@@ -246,8 +351,13 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     CachedSeed = WorldSeed;
     bOpenSurfaceEntry = Settings->bOpenSurfaceEntry;
-    OriginSpineRadius = Settings->OriginSpineRadius;
-    InterStrateGapChunks = FMath::Max(0, Settings->InterStrateGapChunks);
+    OriginSpineRadius = bUseSeason
+        ? SeasonManifest.OriginSpineRadius : Settings->OriginSpineRadius;
+    InterStrateGapChunks = LayoutGapChunks;
+    if (bUseSeason)
+    {
+        ActiveSeasonContentHash = SeasonManifest.ContentHash;
+    }
     // Passage shape/count is per-strate now (UVoxelStrateDefinition::PassageConfig).
 
     //=========================================================================
@@ -260,6 +370,7 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
     for (const FStrateSlot& Slot : StrateLayout)
     {
         if (!Slot.Definition) continue;
+        if (bUseSeason && SeasonStrates[Slot.StrateIndex].bUsesRecipe) continue;
 
         for (const FStrateTerrainOpEntry& Entry : Slot.Definition->TerrainOperations)
         {
@@ -275,6 +386,7 @@ void UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     // Generate passages between consecutive strates
     GeneratePassages();
+    return bUseSeason ? IsUsingSeason() : true;
 }
 
 #if WITH_EDITOR
@@ -429,18 +541,40 @@ bool UVoxelStrateManager::GetComposerRegionOverrideForChunk(
     return true;
 }
 
-bool UVoxelStrateManager::HasComposerRecipeOverride() const
+#endif
+
+bool UVoxelStrateManager::GetRecipeForChunk(
+    const FIntVector& ChunkCoord, int32& OutRecipeSeed,
+    ECaveGeneratorType& OutArchetype, FVoxelStrateArchetypeParams& OutParams,
+    FVoxelOpStackRecipe& OutRecipe) const
 {
-    for (const TPair<int32, TSharedPtr<FVoxelStrateComposerSlotOverride>>& Pair : ComposerOverrides)
+    const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
+    if (SlotIdx < 0) return false;
+
+#if WITH_EDITOR
+    if (const FVoxelStrateComposerSlotOverride* Override =
+            FindComposerOverride(StrateLayout[SlotIdx].StrateIndex))
     {
-        if (Pair.Value.IsValid() && Pair.Value->bUseRecipe)
-        {
-            return true;
-        }
+        if (!Override->bUseRecipe || Override->bUseRegions) return false;
+        OutRecipeSeed = Override->CandidateSeed;
+        OutArchetype = Override->Archetype;
+        OutParams = Override->Params;
+        OutRecipe = Override->Recipe;
+        return true;
+    }
+#endif
+    if (SeasonStrates.IsValidIndex(SlotIdx))
+    {
+        const FVoxelSeasonStrate& Strate = SeasonStrates[SlotIdx];
+        if (!Strate.bUsesRecipe || Strate.bUsesRegions) return false;
+        OutRecipeSeed = Strate.Seed;
+        OutArchetype = Strate.Archetype;
+        OutParams = Strate.Params;
+        OutRecipe = Strate.Recipe;
+        return true;
     }
     return false;
 }
-#endif
 
 //=============================================================================
 // PASSAGE GENERATION
@@ -619,10 +753,12 @@ void UVoxelStrateManager::GeneratePassages()
                 const bool bUsesRoomSeed =
                     UpperDef->GeneratorType == ECaveGeneratorType::TunnelNetwork
                     || UpperDef->GeneratorType == ECaveGeneratorType::Underwater;
-                const int32 UpperQuerySeed = bUsesRoomSeed
-                    ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
-                        static_cast<uint32>(CachedSeed), Upper.StrateIndex))
-                    : CachedSeed;
+                const int32 UpperQuerySeed = SeasonStrates.IsValidIndex(i)
+                    ? SeasonStrates[i].Seed
+                    : (bUsesRoomSeed
+                        ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
+                            static_cast<uint32>(CachedSeed), Upper.StrateIndex))
+                        : CachedSeed);
 
                 bAimedUpperAtOpenPoint = VF_SuggestLandingPoint(
                     UpperDef->GeneratorType,
@@ -657,10 +793,12 @@ void UVoxelStrateManager::GeneratePassages()
                 const bool bUsesRoomSeed =
                     LowerDef->GeneratorType == ECaveGeneratorType::TunnelNetwork
                     || LowerDef->GeneratorType == ECaveGeneratorType::Underwater;
-                const int32 LowerQuerySeed = bUsesRoomSeed
-                    ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
-                        static_cast<uint32>(CachedSeed), Lower.StrateIndex))
-                    : CachedSeed;
+                const int32 LowerQuerySeed = SeasonStrates.IsValidIndex(i + 1)
+                    ? SeasonStrates[i + 1].Seed
+                    : (bUsesRoomSeed
+                        ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
+                            static_cast<uint32>(CachedSeed), Lower.StrateIndex))
+                        : CachedSeed);
 
                 const float MaxLateralSnap = MaxLateralSnapFor(*LowerDef);
                 bAimedLowerAtOpenPoint = VF_SuggestLandingPoint(
@@ -1145,6 +1283,11 @@ ECaveGeneratorType UVoxelStrateManager::GetGeneratorTypeForChunk(const FIntVecto
     }
 #endif
 
+    if (SeasonStrates.IsValidIndex(SlotIdx))
+    {
+        return SeasonStrates[SlotIdx].Archetype;
+    }
+
     return StrateLayout[SlotIdx].Definition->GeneratorType;
 }
 
@@ -1152,6 +1295,13 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
 {
     const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
     if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) { return false; }
+
+    if (SeasonStrates.IsValidIndex(SlotIdx))
+    {
+        // A recipe is an explicit stack opt-in. Native fixed entries retain the authored/switch
+        // route while still reading their season parameter vector.
+        return SeasonStrates[SlotIdx].bUsesRecipe;
+    }
 
 #if WITH_EDITOR
     if (FindComposerOverride(StrateLayout[SlotIdx].StrateIndex) != nullptr)
@@ -1240,8 +1390,12 @@ FSlabGenerationParams UVoxelStrateManager::GetSlabParamsForChunk(const FIntVecto
     // Copy the designer-authored slab params from the strate definition, unless an editor
     // composer candidate owns this slot.
     FSlabGenerationParams Result;
+    if (SeasonStrates.IsValidIndex(SlotIdx))
+    {
+        Result = SeasonStrates[SlotIdx].Params.SlabParams;
+    }
 #if WITH_EDITOR
-    if (const FVoxelStrateComposerSlotOverride* Override =
+    else if (const FVoxelStrateComposerSlotOverride* Override =
         FindComposerOverride(Slot.StrateIndex))
     {
         Result = (Override->Archetype == ECaveGeneratorType::FlatPlain
@@ -1281,7 +1435,8 @@ FMazeGenerationParams UVoxelStrateManager::GetMazeParamsForChunk(const FIntVecto
     }
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
-    FMazeGenerationParams Result = Slot.Definition->MazeParams;
+    FMazeGenerationParams Result = SeasonStrates.IsValidIndex(SlotIdx)
+        ? SeasonStrates[SlotIdx].Params.MazeParams : Slot.Definition->MazeParams;
 #if WITH_EDITOR
     if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
     {
@@ -1307,7 +1462,8 @@ FSurfaceGenerationParams UVoxelStrateManager::GetSurfaceParamsForChunk(const FIn
     }
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
-    FSurfaceGenerationParams Result = Slot.Definition->SurfaceParams;
+    FSurfaceGenerationParams Result = SeasonStrates.IsValidIndex(SlotIdx)
+        ? SeasonStrates[SlotIdx].Params.SurfaceParams : Slot.Definition->SurfaceParams;
 #if WITH_EDITOR
     if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
     {
@@ -1333,7 +1489,8 @@ FVerticalShaftParams UVoxelStrateManager::GetVerticalShaftParamsForChunk(const F
     }
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
-    FVerticalShaftParams Result = Slot.Definition->VerticalShaftParams;
+    FVerticalShaftParams Result = SeasonStrates.IsValidIndex(SlotIdx)
+        ? SeasonStrates[SlotIdx].Params.VerticalShaftParams : Slot.Definition->VerticalShaftParams;
 #if WITH_EDITOR
     if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
     {
@@ -1359,7 +1516,8 @@ FFloatingIslandParams UVoxelStrateManager::GetFloatingIslandParamsForChunk(const
     }
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
-    FFloatingIslandParams Result = Slot.Definition->FloatingIslandParams;
+    FFloatingIslandParams Result = SeasonStrates.IsValidIndex(SlotIdx)
+        ? SeasonStrates[SlotIdx].Params.FloatingIslandParams : Slot.Definition->FloatingIslandParams;
 #if WITH_EDITOR
     if (const FVoxelStrateComposerSlotOverride* Override = FindComposerOverride(Slot.StrateIndex))
     {
@@ -1440,11 +1598,20 @@ float UVoxelStrateManager::GetWaterLevelWorldZForChunk(const FIntVector& ChunkCo
 
     // Pull the relative level from whichever archetype owns water.
     float Rel = 0.0f;
-    switch (Def->GeneratorType)
+    const ECaveGeneratorType Archetype = SeasonStrates.IsValidIndex(SlotIdx)
+        ? SeasonStrates[SlotIdx].Archetype : Def->GeneratorType;
+    switch (Archetype)
     {
-    case ECaveGeneratorType::SurfaceWorld: Rel = Def->SurfaceParams.WaterLevelRelative;   break;
-    case ECaveGeneratorType::Underwater:   Rel = Def->GenerationParams.WaterLevelRelative; break;
-    default:                               Rel = Def->GenerationParams.WaterLevelRelative; break;
+    case ECaveGeneratorType::SurfaceWorld:
+        Rel = SeasonStrates.IsValidIndex(SlotIdx)
+            ? SeasonStrates[SlotIdx].Params.SurfaceParams.WaterLevelRelative
+            : Def->SurfaceParams.WaterLevelRelative;
+        break;
+    default:
+        Rel = SeasonStrates.IsValidIndex(SlotIdx)
+            ? SeasonStrates[SlotIdx].Params.TunnelNetworkParams.WaterLevelRelative
+            : Def->GenerationParams.WaterLevelRelative;
+        break;
     }
     if (Rel <= 0.0f) return -FLT_MAX;
 
@@ -1482,6 +1649,16 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         return Result;
     }
 #endif
+
+    if (SeasonStrates.IsValidIndex(SlotIdx))
+    {
+        FStrateGenerationParams Result = SeasonStrates[SlotIdx].Params.TunnelNetworkParams;
+        Result.StrateTopWorldZ = (float)(Slot.TopChunkZ + 1) * CHUNK_SIZE;
+        Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
+        // Season vectors are already final, measured slot records. Vertical structural posts own
+        // their boundary; blending them with another selected recipe would describe neither one.
+        return Result;
+    }
 
     FStrateGenerationParams BaseParams = BuildParamsFromDefinition(Slot.Definition);
 

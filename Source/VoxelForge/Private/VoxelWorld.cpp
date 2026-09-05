@@ -423,6 +423,7 @@ void AVoxelWorld::RegenerateAllChunks()
 
 void AVoxelWorld::RebuildStrates()
 {
+    bool bLayoutRebuilt = true;
     {
         FScopedGenerationPause Guard(this);
         if (!Guard.Acquired())
@@ -434,10 +435,18 @@ void AVoxelWorld::RebuildStrates()
         if (StrateManager && Settings)
         {
             // Re-applies layout + inter-strate gap + passage/spine settings from VoxelSettings.
-            StrateManager->Initialize(Settings, Settings->Seed);
+            bLayoutRebuilt = StrateManager->Initialize(
+                Settings, Settings->GetEffectiveWorldSeed());
         }
         if (AtmosphereManager) AtmosphereManager->Reset();
         if (ContentManager)    ContentManager->ClearAll();
+    }
+
+    if (!bLayoutRebuilt)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelWorld] RebuildStrates refused an invalid season; loaded tiles were not regenerated."));
+        return;
     }
 
     // Reload all chunks against the rebuilt strate data.
@@ -831,7 +840,7 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
 
         if (StrateManager)
         {
-            StrateManager->Initialize(Settings, Settings->Seed);
+            StrateManager->Initialize(Settings, Settings->GetEffectiveWorldSeed());
         }
         if (Generator)
         {
@@ -959,11 +968,19 @@ void AVoxelWorld::BeginPlay()
     Mesher->SkirtCells      = Settings->SkirtCells;
     Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
 
-    // Système de strates — piloté par le pool et les fixed entries dans Settings.
-    if (Settings->StratePool.Num() > 0)
+    // Système de strates — a cooked season takes precedence; otherwise the authored pool path is
+    // exactly the legacy one.
+    if (!Settings->Season.IsNull() || Settings->StratePool.Num() > 0)
     {
         StrateManager = NewObject<UVoxelStrateManager>(this);
-        StrateManager->Initialize(Settings, Settings->Seed);
+        if (!StrateManager->Initialize(Settings, Settings->GetEffectiveWorldSeed()))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelWorld] World generation disabled because its assigned season is invalid or incomplete."));
+            bShuttingDown.store(true, std::memory_order_release);
+            SetActorTickEnabled(false);
+            return;
+        }
         Generator->SetStrateManager(StrateManager);
         UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Strate system initialized with %d strates"),
             StrateManager->GetNumStrates());
@@ -977,7 +994,8 @@ void AVoxelWorld::BeginPlay()
 
     // Content manager — distance-based decoration grid (no LOD pop) + level-0 water planes.
     ContentManager = NewObject<UVoxelContentManager>(this);
-    ContentManager->Initialize(this, StrateManager, Generator, Settings, Settings->Seed);
+    ContentManager->Initialize(
+        this, StrateManager, Generator, Settings, Settings->GetEffectiveWorldSeed());
 
     // Atmosphere manager — per-strate fog + ambient + persistent ceiling/floor layers.
     if (bManageAtmosphere && StrateManager)
@@ -2641,6 +2659,12 @@ void AVoxelWorld::ChangeSeed(int32 NewSeed)
         UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] ChangeSeed failed — no Settings assigned"));
         return;
     }
+    if (!Settings->Season.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelWorld] ChangeSeed rejected: a cooked Season owns the seed. Assign another season asset instead."));
+        return;
+    }
 
     const int32 OldSeed = Settings->Seed;
     const int32 OldSeason = Settings->CurrentSeason;
@@ -2702,12 +2726,17 @@ void AVoxelWorld::ChangeSeed(int32 NewSeed)
 
 int32 AVoxelWorld::GetCurrentSeed() const
 {
-    return Settings ? Settings->Seed : 0;
+    return Settings ? Settings->GetEffectiveWorldSeed() : 0;
 }
 
 int32 AVoxelWorld::GetCurrentSeason() const
 {
-    return Settings ? Settings->CurrentSeason : 0;
+    return Settings ? Settings->GetEffectiveSeasonNumber() : 0;
+}
+
+FString AVoxelWorld::GetCurrentSeasonContentHash() const
+{
+    return StrateManager ? StrateManager->GetSeasonContentHash() : FString();
 }
 
 //=============================================================================

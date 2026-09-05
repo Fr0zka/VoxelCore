@@ -20,13 +20,12 @@
 #include "CoreMinimal.h"
 #include "VoxelStrateTypes.h"
 #include "VoxelStrateDefinition.h"
+#include "VoxelSeasonManifest.h"
 #include "VoxelStrateManager.generated.h"
 
 class UVoxelSettings;
 
 #if WITH_EDITOR
-struct FVoxelStrateArchetypeParams;
-struct FVoxelOpStackRecipe;
 struct FVoxelStrateRegionManifest;
 struct FVoxelStrateComposerSlotOverride;
 #endif
@@ -148,7 +147,21 @@ public:
      * @param Settings - VoxelSettings with pool/fixed strate config
      * @param WorldSeed - Seed for randomizing non-fixed strates
      */
-    void Initialize(UVoxelSettings* Settings, int32 WorldSeed);
+    /** Returns false without a usable layout; an assigned invalid/stale season never falls back. */
+    bool Initialize(UVoxelSettings* Settings, int32 WorldSeed);
+
+    /**
+     * Copy the immutable recipe payload for this chunk. In packaged builds this comes only from
+     * the cooked season; editor candidate overrides use the same read-only worker hand-off.
+     */
+    bool GetRecipeForChunk(
+        const FIntVector& ChunkCoord, int32& OutRecipeSeed,
+        ECaveGeneratorType& OutArchetype, FVoxelStrateArchetypeParams& OutParams,
+        FVoxelOpStackRecipe& OutRecipe) const;
+
+    bool IsUsingSeason() const { return !ActiveSeasonContentHash.IsEmpty(); }
+    const FString& GetSeasonContentHash() const { return ActiveSeasonContentHash; }
+    int32 GetWorldSeed() const { return CachedSeed; }
 
 #if WITH_EDITOR
     /**
@@ -172,8 +185,6 @@ public:
     bool GetComposerRegionOverrideForChunk(
         const FIntVector& ChunkCoord, FVoxelStrateRegionManifest& OutRegions) const;
 
-    /** Custom recipes cannot be safely classified by the native ClassifyBox proof yet. */
-    bool HasComposerRecipeOverride() const;
 #endif
 
     //=========================================================================
@@ -355,6 +366,11 @@ protected:
     // The stacked strate layout (index 0 = topmost strate)
     UPROPERTY()
     TArray<FStrateSlot> StrateLayout;
+
+    // Parallel to StrateLayout only while a cooked season is active. Plain immutable data is
+    // copied into worker-local caches on the existing layout-versioned refetch path.
+    TArray<FVoxelSeasonStrate> SeasonStrates;
+    FString ActiveSeasonContentHash;
 
     // Passages connecting consecutive strates
     TArray<FVoxelPassage> Passages;
