@@ -523,6 +523,21 @@ the caller centres it on each coarse survivor's `LargestComponentPoint` and the 
 sheet remains sorted by survivor status then descending corpus-centroid distance, repeats exact measurement
 windows, marks rejection reasons, explains the 2D-connectivity limitation, and has no runtime generation hook.
 
+**`Public/VoxelSeasonManifest.h` + `Private/VoxelSeasonManifest.cpp`** — Tier 4c's offline season
+artifact. `VF_ComposeSeason` generates a bounded configurable candidate batch, applies the Tier 2
+non-vacuous / largest-component / primordial-law gates, then selects an ordered Tier A spine with the
+explicit provisional grounded/outlier, adjacency, variety, and five-slot boss policy. The JSON stores
+the complete six-family parameter vector (float values carry both a readable number and exact IEEE-754
+bits), seed/index/archetype/recipe, bounds, measured metrics, gate facts, candidate audit, and rejection
+counts. `VF_LoadVoxelSeasonManifest` plus `VF_RebuildVoxelSeasonStrate` are the round-trip seam; generated
+recipe entries rebuild through the mandatory-post builder, while authored `FixedStrates` retain their
+absolute slot and native vector. The selected-only descent review reuses `VoxelStratePreview`, and all
+composition/review work is editor/build-box code; normal runtime generation is untouched. The focused
+season test currently reports **24 generated / 19 hard-gate survivors / 6 selected / 18 unselected or
+rejected**, with **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**, and **393,216**
+round-trip density samples bit-identical. The specified UE 5.7 editor build succeeded and the full
+`VoxelForge` namespace passed **28/28 tests** after this seam was added.
+
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
 `UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
 **negative Strength = carve, positive = fill**) grouped by chunk in `TMap ChunkMods`.
@@ -590,6 +605,7 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
 | `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. Final run: **9 promoted**, corpus **4/8/9**, survival **20.8/54.2/54.2/45.8/50.0%**, spread **0.869214→0.916302**, **63.556 s**, 0 failures. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 42 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. Final run: **42/64 survival (65.6%)**, **64 distinct recipes**, **0 invalid recipes**, **64 coarse filled + 64 coarse contour pairs**, **42 fine filled + 42 fine contour pairs**, blank plan/card **6/42→3/42**, **243.649 s**, **0 refusals**. |
+| `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Composes a six-slot offline season from 24 structure candidates; asserts **19 hard-gate survivors**, **6 selected**, deterministic byte-identical JSON, absolute descent order, all selected primordial-law facts, and a selected-only review page with metrics/reasons/boss markers. Loads the JSON, rebuilds every selected stack, and compares **393,216** bounded density samples bit-for-bit. Rejection audit: **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**. |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm run uses **16 candidates per arm** (256×3 and 64×3 were stopped before aggregate output for runtime), step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **13/16, 7/16, 7/16** survival; survivor walkable means **0.066071, 0.012566, 0.012851** and feature-scale means **92.307693, 64.571426, 31.428572**. Box checks: **196/260,876**, **310/412,610**, **262/348,722** proved/voxels, **0 violations** in every arm. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
 | `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check every generated inter-strate passage whose destination query answers: a 16-point ring outside the mouth's carve/blend band has at least half its samples in destination air, and the endpoint matches the pure open-point result within the mouth's float envelope. This is a connectivity proxy, not a flood-fill proof. Reports checked passages and false/unanswerable archetypes; fails if it inspects zero passages. |

@@ -18,6 +18,16 @@ class UVoxelSettings;
 class UVoxelStrateDefinition;
 class UVoxelStrateManager;
 
+#if WITH_EDITOR
+// The complete definitions live in VoxelSeasonManifest.h. Keeping this forward declaration here
+// makes the Tier 4c entry point discoverable from the composer header without creating a circular
+// include (the manifest header includes this one for the existing vector/recipe types).
+struct FVoxelSeasonManifest;
+struct FVoxelSeasonCompositionSettings;
+VOXELFORGE_API FVoxelSeasonManifest VF_ComposeSeason(
+    int32 SeasonSeed, const FVoxelSeasonCompositionSettings& Settings);
+#endif
+
 /** The one-bit identity choice at the root of a rolled structure. */
 UENUM(BlueprintType)
 enum class EVoxelStrateRootPolarity : uint8

@@ -89,6 +89,64 @@ normal game path.** The editor-only PIE inspection button described below is a d
 exception: it overlays one already-built slot so the owner can walk a measured candidate; it is not
 cooked, does not compose a season, and is cleared by RebuildStrates.
 
+**Tier 4c is now the build-box seam:** `VF_ComposeSeason(SeasonSeed, Settings)` generates a bounded
+candidate batch, measures every candidate, rejects vacuous/fragmented/primordial-law failures, and
+writes the selected Tier A spine as diffable `season_manifest.json`. The default test budget is 24
+candidates at measurement step 8 and a six-slot output; production can raise the candidate count for
+the overnight budget without changing the runtime contract. The manifest stores each selected seed,
+recipe, complete native parameter-family vector, archetype, bounds, measured metrics, and gate facts.
+Floating-point fields carry both a readable value and their exact IEEE-754 bit pattern, so a loader can
+rebuild the same stack and the season test can assert bit-identical density rather than assume it.
+
+The selected-only review page is a descent-ordered `VoxelStratePreview` contact sheet. Each card shows
+the depth, recipe, metrics, grounded/outlier/fixed selection reason, and boss-slot marker. Selection is
+deliberately provisional: the current readable policy reserves 75% grounded and 25% outlier slots,
+penalises near-identical neighbours, rewards new archetypes/recipes, and respects fixed absolute slots.
+Jahni's preview and veto remain the decision that turns this artifact into a published season. The
+composer and review writer are editor/build-box code only; no normal runtime generation path calls
+them, and `WorldRadiusVoxels` remains 0.
+
+An abbreviated manifest shape is:
+
+```json
+{
+  "format": "VoxelForgeSeasonManifest",
+  "schema_version": 1,
+  "season": 0,
+  "seed": 9320,
+  "candidate_count": 24,
+  "survivor_count": 19,
+  "selected_count": 6,
+  "strates": [
+    {
+      "depth_index": 0,
+      "seed": 123,
+      "archetype": "Maze",
+      "uses_recipe": true,
+      "recipe": {
+        "root_polarity": 0,
+        "root": { "op_class": 0, "param_block": 3 },
+        "shape_source": { "op_class": 3, "param_block": 3 },
+        "conversion": { "op_class": 8, "param_block": 3 },
+        "structural_param_block": 3,
+        "modifiers": []
+      },
+      "parameters": { "maze": { "LatticeSpacing": { "value": 18.0, "bits": "0x41900000" } } },
+      "measured_metrics": {
+        "air_fraction": { "kind": "float", "value": 0.5, "bits": "0x3F000000" },
+        "largest_component_share": { "kind": "float", "value": 0.9, "bits": "0x3F666666" }
+      },
+      "selection_reason": "grounded; provisional 75/25 policy",
+      "boss_slot": false
+    }
+  ]
+}
+```
+
+The real file is complete; the sample is intentionally abbreviated. `FVoxelSeasonFixedStrate` also
+allows a build invocation to provide a full recipe/vector for an absolute slot, while entries adapted
+from today's authored `FixedStrates` retain their native vector and source asset path.
+
 ### 3.2 Structure: how a stack gets assembled
 
 The current shipping builders, for reference (structural posts included; TunnelNetwork's builder is
@@ -759,8 +817,15 @@ reviewable outlier quota instead of assuming survivor promotion preserves surpri
 ### ⭐ It is TWO things, not one
 
 **Tier A — the SPINE. Finite, tiny, actually stored.** Strate slots and passages. ~30 strates plus a few
-passages each is roughly 100 entries — kilobytes. **This already exists** as `StrateLayout` plus the
-passage list, computed once in `UVoxelStrateManager::Initialize`.
+passages each is roughly 100 entries — kilobytes. The runtime manager already computes `StrateLayout`
+and its passage list once in `UVoxelStrateManager::Initialize`; Tier 4c now adds the first reviewable
+serialized Tier A artifact, `season_manifest.json`, containing the selected ordered strate spine and
+the data required to reproduce each selected density field exactly.
+
+The current Tier 4c manifest deliberately serializes the chosen strates, not the manager's generated
+inter-strate passage geometry or the full material/creature/content placement payload. The season test
+therefore proves each stored strate's density round trip; passage serialization and the wider content
+manifest remain a follow-up before this file can be called the complete world manifest described here.
 
 **Tier B — the FIELD. Effectively unbounded in XY, therefore NEVER stored.** Landmarks, rooms, material
 deposits, build sites. It is a **function**: give it a region, it enumerates what is there.
@@ -1038,8 +1103,16 @@ roughness and should stay late in the stack.
   violations, plus 64 rendered preview pairs and an index.html contact sheet. The fine survivor ROI
   is centred on `LargestComponentPoint` and labelled largest open space; the final before/after
   blank-plan count is 6/42 → 3/42.
-- ⬜ Reject-and-resample driven by Tier 2 (§3.5) · the **offline season pipeline** with Jahni's review
-  and veto (§3.1).
+- ✅ **Season pipeline (§3.1, §3.5, §4, Tier 4c)** — `VF_ComposeSeason` generates and measures a
+  bounded candidate batch, rejects vacuous/fragmented/primordial-law failures, and writes a Tier A
+  JSON spine plus a selected-only descent review page using `VoxelStratePreview`. The explicit policy
+  is provisional: default 75% grounded / 25% outlier, adjacent-similarity penalty, archetype/recipe
+  variety bonuses, and fixed absolute slots with boss markers every five non-terminal slots. The
+  focused artifact run was **24 generated / 19 hard-gate survivors / 6 selected / 18 rejected or
+  unselected**: 4 vacuous, 1 primordial-law budget failure, and 13 policy-not-selected. The loader
+  rebuild test compared **393,216 density samples bit-identically**, and the same seed emitted
+  byte-identical JSON. This closes the offline artifact and veto seam; full passage/content manifest
+  serialization is still open as noted in §4.
 
 ### Tier 5 — the long game
 - ✅ **Promotion** (good strates rejoin the corpus) — JSON promotable records and season manifests,
@@ -1144,6 +1217,17 @@ with 9 cumulative records, fresh-load stale-metric replacement, `WorldRadiusVoxe
 in §3.3. The StructureRoll preview measured fine blank plan/card counts **6/42 → 3/42** and rendered
 42 fine filled pairs plus 42 contour pairs with 0 refusals. No existing generation/equivalence test
 failed.
+
+**2026-09-05 — Tier 4c season validation.** The specified UE 5.7 `VoxelMEditor Win64 Development`
+build succeeded after adding the season manifest and review seam. The focused
+`VoxelForge.Composer.Season` test passed, then the full headless `VoxelForge` namespace reported
+**28 succeeded, 0 failed, 0 not run, 0 succeeded-with-warnings**. The season artifact used 24
+generated candidates, 19 hard-gate survivors, and selected 6; it recorded 4 vacuous rejections, 1
+primordial-law budget rejection, and 13 provisional-policy non-selections. Reloading the JSON and
+rebuilding every selected stack compared **393,216 density samples bit-identically**; composing the
+same seed twice emitted byte-identical JSON. The selected-only descent review was written beside the
+manifest. The run also kept all existing equivalence, determinism, box-verdict, and connectivity
+tests green.
 
 ---
 

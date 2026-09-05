@@ -71,6 +71,12 @@ struct VOXELFORGE_API FVoxelStrateFinePreviewSettings
 struct VOXELFORGE_API FVoxelStratePreviewCandidate
 {
     int32 CandidateIndex = INDEX_NONE;
+    // Season pages deliberately opt into descent order. The ordinary candidate contact sheet
+    // keeps its survivor/outlier ordering; a season review must read top-to-bottom like play.
+    bool bSeasonOrder = false;
+    int32 DepthIndex = INDEX_NONE;
+    FString SelectionReason;
+    bool bBossSlot = false;
     FVoxelStratePreviewWindow Window;
     FString RecipeString;
     FString ArrivalDepartureVerdict;

@@ -979,6 +979,18 @@ bool VF_WriteStratePreviewIndex(
     SortedCandidates.Sort([](const FVoxelStratePreviewCandidate& A,
                              const FVoxelStratePreviewCandidate& B)
     {
+        if (A.bSeasonOrder != B.bSeasonOrder)
+        {
+            return A.bSeasonOrder;
+        }
+        if (A.bSeasonOrder && B.bSeasonOrder)
+        {
+            if (A.DepthIndex != B.DepthIndex)
+            {
+                return A.DepthIndex < B.DepthIndex;
+            }
+            return A.CandidateIndex < B.CandidateIndex;
+        }
         if (A.bRejected != B.bRejected)
         {
             return !A.bRejected;
@@ -1071,11 +1083,23 @@ bool VF_WriteStratePreviewIndex(
         const FString CardClass = Candidate.bRejected ? TEXT("candidate rejected") : TEXT("candidate");
         const FString MetricWindow = Candidate.Window.IsValid()
             ? Candidate.Window.Describe() : WindowDescription;
+        const int32 DisplayIndex = Candidate.bSeasonOrder && Candidate.DepthIndex != INDEX_NONE
+            ? Candidate.DepthIndex : Candidate.CandidateIndex;
         Html += FString::Printf(
             TEXT("<section class=\"%s\"><h2>#%d <span class=\"badge %s\">%s</span></h2>\n"),
-            *CardClass, Candidate.CandidateIndex, *StatusClass, *Status);
+            *CardClass, DisplayIndex, *StatusClass, *Status);
         Html += FString::Printf(TEXT("<div class=\"recipe\"><code>%s</code></div>\n"),
                                 *VF_HtmlEscape(Candidate.RecipeString));
+        if (Candidate.bSeasonOrder)
+        {
+            Html += FString::Printf(
+                TEXT("<p class=\"reason\" style=\"color:#d7e3f4\"><strong>Why selected:</strong> %s"
+                     "<br><strong>Boss slot:</strong> %s</p>\n"),
+                *VF_HtmlEscape(Candidate.SelectionReason.IsEmpty()
+                    ? TEXT("selected by the provisional season policy")
+                    : Candidate.SelectionReason),
+                Candidate.bBossSlot ? TEXT("yes") : TEXT("no"));
+        }
         if (Candidate.bRejected)
         {
             Html += FString::Printf(TEXT("<p class=\"reason\"><strong>Why rejected:</strong> %s</p>\n"),
