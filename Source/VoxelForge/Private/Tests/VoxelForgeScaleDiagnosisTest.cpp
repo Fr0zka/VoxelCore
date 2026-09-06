@@ -13,6 +13,7 @@
 #include "VoxelForgeTestFixture.h"
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
+#include "VoxelForgePlayerFitWindow.h"
 #include "VoxelTypes.h"
 
 namespace
@@ -703,17 +704,99 @@ namespace
         }
     }
 
+    int32 VF_MaxCenteredRadiusForCap(
+        int32 TopVoxelZ,
+        int32 BottomVoxelZ,
+        float BoundarySealThickness,
+        const FVoxelStrateMeasureSettings& Settings)
+    {
+        const int64 StrateHeight = static_cast<int64>(TopVoxelZ) + 1
+            - static_cast<int64>(BottomVoxelZ);
+        const int64 MaxMargin64 = FMath::Max<int64>(1, StrateHeight / 4);
+        const int32 MaxMargin = static_cast<int32>(FMath::Min<int64>(
+            MaxMargin64, static_cast<int64>(INT32_MAX)));
+        int32 RequestedMargin = Settings.InteriorMarginVoxels;
+        if (RequestedMargin < 0)
+        {
+            RequestedMargin = FMath::CeilToInt(2.0f * BoundarySealThickness);
+        }
+        const int32 ResolvedMargin = FMath::Clamp(RequestedMargin, 0, MaxMargin);
+        const int64 InteriorHeight = StrateHeight - 2 * static_cast<int64>(ResolvedMargin);
+        if (InteriorHeight <= 0 || Settings.SampleStep <= 0 || Settings.MaxCells <= 0)
+        {
+            return 0;
+        }
+
+        const int64 NumZ = (InteriorHeight + Settings.SampleStep - 1)
+            / static_cast<int64>(Settings.SampleStep);
+        const int64 MaxAxisCells = FMath::Min<int64>(
+            static_cast<int64>(INT32_MAX),
+            static_cast<int64>(FMath::Sqrt(
+                static_cast<double>(Settings.MaxCells / FMath::Max<int64>(NumZ, 1)))));
+        int32 Radius = static_cast<int32>(FMath::Max<int64>(
+            1, (MaxAxisCells * static_cast<int64>(Settings.SampleStep)) / 2));
+        auto CellCountForRadius = [Settings, NumZ](int32 CandidateRadius) -> int64
+        {
+            const int64 NumXY = (2 * static_cast<int64>(CandidateRadius)
+                                 + Settings.SampleStep - 1)
+                / static_cast<int64>(Settings.SampleStep);
+            if (NumXY <= 0 || NumXY > INT64_MAX / NumXY
+                || NumXY * NumXY > INT64_MAX / FMath::Max<int64>(NumZ, 1))
+            {
+                return INT64_MAX;
+            }
+            return NumXY * NumXY * NumZ;
+        };
+        while (Radius > 1 && CellCountForRadius(Radius) > Settings.MaxCells)
+        {
+            --Radius;
+        }
+        while (Radius < INT32_MAX
+            && CellCountForRadius(Radius + 1) <= Settings.MaxCells)
+        {
+            ++Radius;
+        }
+        return Radius;
+    }
+
     void VF_ReportPlayerFitRow(
         FAutomationTestBase& Test,
         const TCHAR* Label,
+        const FString& WindowLabel,
+        int32 SampleStep,
         const FVoxelStrateMetrics& Metrics,
         const FVoxelConnectivityDiagnostics& Diagnostics)
     {
+        if (!Metrics.bValid || !Metrics.bPlayerFitResolved)
+        {
+            const FString& Refusal = !Metrics.RefusalReason.IsEmpty()
+                ? Metrics.RefusalReason : Metrics.PlayerFitRefusalReason;
+            Test.AddInfo(FString::Printf(
+                TEXT("PLAYER_FIT step=%d window=%s %s: REFUSED reason=%s"),
+                SampleStep,
+                *WindowLabel,
+                Label,
+                Refusal.IsEmpty() ? TEXT("player-fit metrics unresolved") : *Refusal));
+            return;
+        }
         Test.AddInfo(FString::Printf(
-            TEXT("PLAYER_FIT step=1 fitted-window %s: fit_cells=%lld components=%d "
+            TEXT("PLAYER_FIT step=%d window=%s bounds=X[%.1f,%.1f) Y[%.1f,%.1f) "
+                 "Z[%d,%d) grid=%dx%dx%d sampled=%lld %s: fit_cells=%lld components=%d "
                  "largest_component_cells=%lld arrival_component_cells=%lld "
                  "departure_component_cells=%lld mouth_component_gap_voxels=%.3f "
                  "fit_fraction=%.9f traversable_share=%.9f law=%s"),
+            SampleStep,
+            *WindowLabel,
+            Metrics.SampledMinX,
+            Metrics.SampledMaxX,
+            Metrics.SampledMinY,
+            Metrics.SampledMaxY,
+            Metrics.SampledMinZ,
+            Metrics.SampledMaxZ,
+            Metrics.SampledNumX,
+            Metrics.SampledNumY,
+            Metrics.SampledNumZ,
+            static_cast<long long>(Metrics.NumSampled),
             Label,
             static_cast<long long>(Metrics.NumPlayerFitCells),
             Metrics.NumTraversableComponents,
@@ -1016,7 +1099,115 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         ControlSettings.PlayerWalkableFloorAngleDegrees,
         ControlSettings.HeadroomCells));
 
-    // H3 — the eight fixed showcase identities, measured at step 1 on a mouth-fitted window.
+    // PART A — direct route-window experiment on the requested Maze identity. The first row is
+    // intentionally the old mouth-only box; the second turns on the topology-aware origin
+    // coverage; the third uses the largest centered origin window that the same MaxCells cap can
+    // hold while retaining enough resolution to contain both mouths.
+    {
+        const int32 PartAMazeSlot = FTestWorld::SlotMaze;
+        VF_SetCandidateOnSlot(World, MazeCandidate, PartAMazeSlot);
+        FVector ArrivalPoint = FVector::ZeroVector;
+        FVector DeparturePoint = FVector::ZeroVector;
+        int32 ArrivalCount = 0;
+        int32 DepartureCount = 0;
+        for (const FVoxelPassage& Passage : World.StrateManager->GetPassages())
+        {
+            if (Passage.LowerStrateIndex == PartAMazeSlot
+                && Passage.UpperStrateIndex + 1 == PartAMazeSlot)
+            {
+                ArrivalPoint = Passage.LowerPoint;
+                ++ArrivalCount;
+            }
+            if (Passage.UpperStrateIndex == PartAMazeSlot
+                && Passage.LowerStrateIndex == PartAMazeSlot + 1)
+            {
+                DeparturePoint = Passage.UpperPoint;
+                ++DepartureCount;
+            }
+        }
+
+        TestEqual(TEXT("PART A Maze has one arrival mouth"), ArrivalCount, 1);
+        TestEqual(TEXT("PART A Maze has one departure mouth"), DepartureCount, 1);
+        int32 MazeTopVoxelZ = 0;
+        int32 MazeBottomVoxelZ = 0;
+        TestTrue(TEXT("PART A Maze has a vertical measurement range"),
+                 World.GetSlotVoxelZRange(PartAMazeSlot, MazeTopVoxelZ, MazeBottomVoxelZ));
+        if (ArrivalCount == 1 && DepartureCount == 1
+            && World.GetSlotVoxelZRange(PartAMazeSlot, MazeTopVoxelZ, MazeBottomVoxelZ))
+        {
+            FVoxelStrateMeasureSettings PartABase = CharacterFitSettings;
+            PartABase.SampleStep = 1;
+            PartABase.RadiusInVoxels = 64;
+            PartABase.MaxCells = FineDiagnosisMaxCells;
+            PartABase.MaxRouteRetries = 16;
+            PartABase.HeadroomCells = 2;
+            PartABase.InteriorMarginVoxels = -1;
+
+            FGeneratorSampler GeneratorSampler(*World.Generator);
+            auto RunPartAWindow =
+                [&](const FString& WindowLabel, const FVoxelStrateMeasureSettings& Settings)
+            {
+                FVoxelStrateMetrics Metrics;
+                const FVoxelConnectivityDiagnostics Diagnostics =
+                    VF_DiagnosePlayerFitConnectivityWithSampler(
+                        GeneratorSampler, MazeBottomVoxelZ, MazeTopVoxelZ + 1,
+                        VF_BoundarySealForCandidate(MazeCandidate),
+                        ArrivalPoint, DeparturePoint, Settings, &Metrics);
+                VF_ReportPlayerFitRow(
+                    *this, TEXT("Maze seed=0 index=50 slot=4"), WindowLabel,
+                    Settings.SampleStep, Metrics, Diagnostics);
+                return TTuple<FVoxelStrateMetrics, FVoxelConnectivityDiagnostics>(
+                    MoveTemp(Metrics), Diagnostics);
+            };
+
+            FVoxelStrateMeasureSettings CurrentSettings = PartABase;
+            VoxelForgePlayerFitWindow::ConfigureMouthWindow(
+                CurrentSettings, ArrivalPoint, DeparturePoint, ECaveGeneratorType::Maze);
+            CurrentSettings.bIncludeOriginInCoverWindow = false;
+            const auto CurrentResult = RunPartAWindow(
+                TEXT("current mouth-AABB + margin"), CurrentSettings);
+
+            FVoxelStrateMeasureSettings OriginSettings = PartABase;
+            VoxelForgePlayerFitWindow::ConfigureMouthWindow(
+                OriginSettings, ArrivalPoint, DeparturePoint, ECaveGeneratorType::Maze);
+            const auto OriginResult = RunPartAWindow(
+                TEXT("origin-inclusive mouth-AABB + margin"), OriginSettings);
+
+            FVoxelStrateMeasureSettings WholeSettings = PartABase;
+            WholeSettings.MaxCells = FineDiagnosisMaxCells * 8;
+            WholeSettings.CenterXY = FVector2D::ZeroVector;
+            WholeSettings.CoverPointA.Reset();
+            WholeSettings.CoverPointB.Reset();
+            WholeSettings.bIncludeOriginInCoverWindow = false;
+            const float MouthMargin = FMath::CeilToFloat(
+                WholeSettings.PlayerCapsuleRadiusVoxels) + 2.0f;
+            const int32 MouthReach = FMath::CeilToInt(FMath::Max(
+                FMath::Max(FMath::Abs(ArrivalPoint.X), FMath::Abs(DeparturePoint.X)),
+                FMath::Max(FMath::Abs(ArrivalPoint.Y), FMath::Abs(DeparturePoint.Y)))
+                + MouthMargin);
+            WholeSettings.SampleStep = 1;
+            WholeSettings.RadiusInVoxels = VF_MaxCenteredRadiusForCap(
+                MazeTopVoxelZ, MazeBottomVoxelZ,
+                VF_BoundarySealForCandidate(MazeCandidate), WholeSettings);
+            const FString WholeWindowLabel = FString::Printf(
+                TEXT("whole-strate centered origin cap window (radius=%d; mouth_reach=%d; "
+                     "MaxCells=%d)"),
+                WholeSettings.RadiusInVoxels, MouthReach, WholeSettings.MaxCells);
+            const auto WholeResult = RunPartAWindow(WholeWindowLabel, WholeSettings);
+
+            AddInfo(FString::Printf(
+                TEXT("PART_A verdict: current=%s; origin-inclusive=%s; whole-strate-cap=%s; "
+                     "origin flip=%s"),
+                VF_DiagnosisConnectivityName(CurrentResult.Get<1>().Result),
+                VF_DiagnosisConnectivityName(OriginResult.Get<1>().Result),
+                VF_DiagnosisConnectivityName(WholeResult.Get<1>().Result),
+                OriginResult.Get<1>().Result == EVoxelConnectivityResult::Connected
+                    ? TEXT("CONFIRMED") : TEXT("NOT_CONFIRMED")));
+        }
+    }
+
+    // H3 — the eight fixed showcase identities, measured at step 1 on the topology-aware fitted
+    // window. Origin-rooted families include (0,0) before the MaxCells refusal check.
     // The Maze identity is intentionally the requested seed 0 / index 50 / fourth one-based slot.
     struct FShowcaseSelection
     {
@@ -1065,6 +1256,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
     int32 NumH3Connected = 0;
     int32 NumH3DegenerateConnected = 0;
     int32 NumH3Measured = 0;
+    int32 NumH3Refused = 0;
 
     for (const FShowcaseSelection& Selection : Selections)
     {
@@ -1109,13 +1301,8 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         FVoxelStrateMeasureSettings Settings = CharacterFitSettings;
         Settings.SampleStep = 1;
         Settings.RadiusInVoxels = 64;
-        Settings.CenterXY = FVector2D(
-            0.5f * (ArrivalPoint.X + DeparturePoint.X),
-            0.5f * (ArrivalPoint.Y + DeparturePoint.Y));
-        Settings.CoverPointA = FVector2D(ArrivalPoint.X, ArrivalPoint.Y);
-        Settings.CoverPointB = FVector2D(DeparturePoint.X, DeparturePoint.Y);
-        Settings.CoverMarginVoxels = FMath::CeilToFloat(
-            Settings.PlayerCapsuleRadiusVoxels) + 2.0f;
+        VoxelForgePlayerFitWindow::ConfigureMouthWindow(
+            Settings, ArrivalPoint, DeparturePoint, Selection.Archetype);
         Settings.MaxCells = FineDiagnosisMaxCells;
         Settings.MaxRouteRetries = 16;
         Settings.HeadroomCells = 2;
@@ -1136,7 +1323,22 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
                 GeneratorSampler, BottomVoxelZ, TopVoxelZ + 1,
                 VF_BoundarySealForCandidate(Candidate), ArrivalPoint, DeparturePoint,
                 Settings, &Metrics);
-        VF_ReportPlayerFitRow(*this, Selection.Label, Metrics, Diagnostics);
+        VF_ReportPlayerFitRow(
+            *this, Selection.Label,
+            VoxelForgePlayerFitWindow::RouteWindowName(Selection.Archetype),
+            Settings.SampleStep, Metrics, Diagnostics);
+        if (!Metrics.bValid || !Metrics.bPlayerFitResolved)
+        {
+            ++NumH3Refused;
+            const FString& Refusal = !Metrics.RefusalReason.IsEmpty()
+                ? Metrics.RefusalReason : Metrics.PlayerFitRefusalReason;
+            AddInfo(FString::Printf(
+                TEXT("H3 %s law=REFUSED; window=%s; reason=%s"),
+                Selection.Label,
+                VoxelForgePlayerFitWindow::RouteWindowName(Selection.Archetype),
+                Refusal.IsEmpty() ? TEXT("player-fit metrics unresolved") : *Refusal));
+            continue;
+        }
         ++NumH3Measured;
         if (Diagnostics.Result == EVoxelConnectivityResult::Connected)
         {
@@ -1182,11 +1384,12 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
     AddInfo(FString::Printf(
         TEXT("LAW_TALLY restricted step1: before_connected=1/8 "
              "before_connected_through_4_cells=1; after_connected=%d/%d "
-             "after_connected_through_4_cells=%d measured=%d/8"),
+             "after_connected_through_4_cells=%d measured=%d/8 refused=%d/8"),
         NumH3Connected,
-        UE_ARRAY_COUNT(Selections),
+        NumH3Measured,
         NumH3DegenerateConnected,
-        NumH3Measured));
+        NumH3Measured,
+        NumH3Refused));
 
     return true;
 }

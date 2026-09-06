@@ -364,7 +364,9 @@ Headless, read-only Tier 2 measurement pass. `VF_MeasureStrate` samples one stra
 boundary-seal-derived (or explicitly overridden, including explicit zero) interior margin into a bounded grid.
 When both `CoverPointA` and `CoverPointB` are set, the XY window is their AABB expanded by
 `CoverMarginVoxels`; otherwise it is the legacy square centered on `CenterXY` with
-`RadiusInVoxels`.
+`RadiusInVoxels`. Origin-rooted callers set `bIncludeOriginInCoverWindow` to expand that fitted
+AABB to include `(0,0)` before the `MaxCells` check; an over-cap route window is refused rather
+than cropped back to a mouth-only box.
 It performs one deterministic 6-connected air flood fill, and derives fractions, components,
 walkability, feature scale, and clearance from that grid. It then performs one bounded 4-neighbour
 flood fill over the projected XY columns that contain a walkable surface; this is a floor-continuity

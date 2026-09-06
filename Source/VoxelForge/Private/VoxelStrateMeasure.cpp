@@ -202,6 +202,17 @@ namespace VoxelStrateMeasurePrivate
             MaxX64 = FMath::Max(static_cast<double>(PointA.X), static_cast<double>(PointB.X)) + Margin;
             MinY64 = FMath::Min(static_cast<double>(PointA.Y), static_cast<double>(PointB.Y)) - Margin;
             MaxY64 = FMath::Max(static_cast<double>(PointA.Y), static_cast<double>(PointB.Y)) + Margin;
+            if (Settings.bIncludeOriginInCoverWindow)
+            {
+                // The fitted box is a route-coverage contract, not merely an endpoint box. An
+                // origin-rooted graph may have its only mouth-to-mouth path through this spine.
+                // Expand the requested bounds before the MaxCells check below; never crop the
+                // route after discovering that the full box is too large.
+                MinX64 = FMath::Min(MinX64, 0.0);
+                MaxX64 = FMath::Max(MaxX64, 0.0);
+                MinY64 = FMath::Min(MinY64, 0.0);
+                MaxY64 = FMath::Max(MaxY64, 0.0);
+            }
             WindowCenter = FVector2D(
                 static_cast<float>(0.5 * (MinX64 + MaxX64)),
                 static_cast<float>(0.5 * (MinY64 + MaxY64)));
@@ -2169,6 +2180,7 @@ namespace VoxelStrateMeasurePrivate
             }
             if (OutPlayerMetrics != nullptr)
             {
+                OutPlayerMetrics->RefusalReason = Reason;
                 OutPlayerMetrics->PlayerFitRefusalReason = Reason;
             }
         };
@@ -2216,6 +2228,7 @@ namespace VoxelStrateMeasurePrivate
             }
             if (OutPlayerMetrics != nullptr)
             {
+                OutPlayerMetrics->RefusalReason = RefusalReason;
                 OutPlayerMetrics->PlayerFitRefusalReason = RefusalReason;
             }
             return EVoxelConnectivityResult::OutOfWindow;

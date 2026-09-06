@@ -1946,3 +1946,75 @@ the world. Fix the measurement before touching generation again.
 - **Acceptance must be the measured property, never "the code was written."** Twice a task returned
   "built, and it does not meet the criterion — here is the number." Both times that honesty pointed
   straight at the real cause.
+
+---
+
+## 16. Player-fit route-window audit — the origin is not the missing flip (2026-09-06)
+
+This pass tested the proposed sixth measurement artifact directly on the fixed Maze identity:
+composer seed `0`, candidate index `50`, fourth one-based fixture slot (`SlotMaze == 3`). The
+player-fit stencil remained `SampleStep=1`; every row below names its exact XY/Z window and cell
+budget. `NotConnectedAtThisResolution` is a result of that stated grid, not a claim that the
+infinite Maze graph is disconnected.
+
+### 16.1 Part A — three Maze windows
+
+| window | exact window / grid | MaxCells | fit cells | components | largest | arrival / departure | gap (voxels) | law |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| current mouth-AABB + margin | `X[-84.1,168.7) Y[39.5,53.3) Z[-1175,-937)`, `253×14×238`, `842,996` cells, step 1 | 4,000,000 | 1,352 | 50 | 237 | 128 / 1 | 254.492 | `NotConnectedAtThisResolution` |
+| origin-inclusive mouth-AABB + margin | `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` cells, step 1 | 4,000,000 | 9,598 | 309 | 845 | 120 / 3 | 274.811 | `NotConnectedAtThisResolution` |
+| whole-strate centered origin cap window | `X[-183,183) Y[-183,183) Z[-1175,-937)`, `366×366×238`, `31,881,528` cells, step 1 | 32,000,000 | 115,578 | 2,903 | 11,418 | 172 / 4 | 274.811 | `NotConnectedAtThisResolution` |
+
+The origin-inclusive box did **not** flip to `Connected`, and the larger centered window did not
+either. The hypothesis is therefore **not confirmed** for this candidate. The whole-strate probe
+used an explicit 32M cap so it could remain a real step-1 player-fit measurement; the production
+fine-law cap remains 4M. A step-2 player-fit probe is not equivalent here: the player-fit API
+intentionally refuses every `SampleStep != 1` because the capsule stencil cannot be resolved at
+that resolution.
+
+### 16.2 Part B — route-aware window policy
+
+The measurement now has an explicit `bIncludeOriginInCoverWindow` flag. It expands the fitted mouth
+AABB to include `(0,0)` **before** the `MaxCells` check. If that route window is over the cap, the
+measurement refuses with `The requested sample grid exceeds MaxCells; measurement refused.` It does
+not shrink back to a mouth-only box.
+
+The policy used by the eight-row law is:
+
+- origin-inclusive mouth-AABB: `Maze`, `VerticalShafts`, `TunnelNetwork`, and `Underwater`;
+- mouth-AABB plus capsule margin: `CrystalChamber`, `FlatPlain`, `SurfaceWorld`, and
+  `FloatingIslands`.
+
+The first group is origin-rooted by its actual topology: Maze parent chains, VerticalShafts
+drainage-tree chains, and the origin-flowing room graph shared by TunnelNetwork/Underwater. The
+global structural spine exists for every stack, but it is not treated as the promised route for
+the four local/independent families.
+
+### 16.3 Part C — corrected eight-row law
+
+These are the fixed seed-0 identities in the scale diagnosis. All valid rows are step 1. The
+window column is part of the result, not an omitted implementation detail.
+
+| archetype | player-fit window (`X/Y/Z`, grid, cells) | fit cells | components | largest | arrival / departure | gap (voxels) | law |
+|---|---|---:|---:|---:|---:|---:|---|
+| CrystalChamber | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-537,-295)`, `27×68×242`, `444,312` | 992 | 102 | 165 | 40 / 6 | 50.070 | `NotConnectedAtThisResolution` |
+| FlatPlain | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-534,-298)`, `27×68×236`, `433,296` | 2,346 | 9 | 2,337 | 1 / 2,337 | 138.105 | `NotConnectedAtThisResolution` |
+| FloatingIslands | mouth-AABB + margin; `X[-143.5,-135.5) Y[121.8,129.8) Z[-537,-295)`, `8×8×242`, `15,488` | 0 | 0 | 0 | 0 / 0 | -1.000 | `StartCellNotPlayerFit` |
+| Maze | origin-inclusive mouth-AABB + margin; `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` | 9,598 | 309 | 845 | 120 / 3 | 274.811 | `NotConnectedAtThisResolution` |
+| SurfaceWorld | mouth-AABB + margin; `X[-133.7,-76.1) Y[-68.8,47.5) Z[-1495,-1257)`, `58×117×238`, `1,615,068` | 1,720 | 248 | 801 | 1 / 3 | 101.454 | `NotConnectedAtThisResolution` |
+| TunnelNetwork | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-536,-296)`, `179×68×240`, `2,921,280` | 3,684 | 213 | 1,176 | 108 / 82 | 83.361 | `NotConnectedAtThisResolution` |
+| Underwater | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-535,-297)`, `179×68×238`, `2,896,936` | 1,669 | 79 | 618 | 109 / 109 | 0.000 | `CoarseLiedBudgetExhausted` (**unknown**, not a pass) |
+| VerticalShafts | origin-inclusive mouth-AABB + margin; **refused before allocation** because the required grid exceeds `MaxCells=4,000,000` | — | — | — | — | — | `REFUSED(MaxCells)` |
+
+The valid-row tally is **0/7 Connected**, with **1/8 refused** and one `CoarseLiedBudgetExhausted`
+unknown. The old one-cell/one-pocket success is not present in this corrected table.
+
+### 16.4 Plain verdict
+
+The remaining failure is not the cropped measurement window. Maze remains disconnected in player-fit
+volume even when the origin is covered and when the full 32M-cell step-1 centered window is measured.
+The proven spanning-tree graph and the player-fit volume are different claims: the graph has a route,
+but the generated player-fitting corridor/mouth volume does not currently provide a continuous route
+from these two passage mouths. The smallest next generation task is therefore at the mouths or their
+player-fit join to the corridor network (with the possibility of a fine-floor/stencil break along
+the route), not another window, size, density, or topology tuning pass.

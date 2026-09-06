@@ -13,6 +13,7 @@
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
 #include "VoxelStratePreview.h"
+#include "VoxelForgePlayerFitWindow.h"
 #include "VoxelTypes.h"
 
 namespace
@@ -113,6 +114,7 @@ namespace
         FVoxelStrateMetrics FineMetrics;
         FVoxelConnectivityDiagnostics LegacyLaw;
         FVoxelConnectivityDiagnostics PlayerFitLaw;
+        FString FineWindowSummary;
         double SelectionScore = -1.0;
         FString LawText;
         int32 TargetStrateIndex = INDEX_NONE;
@@ -247,22 +249,15 @@ namespace
         const FVoxelStrateMeasureSettings& BaseSettings,
         const FVoxelStrateFinePreviewSettings& FinePreviewSettings,
         const FVector& ArrivalPoint,
-        const FVector& DeparturePoint)
+        const FVector& DeparturePoint,
+        ECaveGeneratorType Archetype)
     {
         FVoxelStrateMeasureSettings Settings =
             FinePreviewSettings.MakeMeasureSettings(BaseSettings);
-        // The old fine preview was centred on the coarse largest-component representative. That
-        // is useful for a picture, but it can put both mouths outside the ROI and turn a real
-        // player-fit route into a meaningless OutOfWindow result. Fit the fine ROI to the two
-        // existing mouth XY points instead; the small explicit margin leaves room for the
-        // capsule's horizontal stencil at either endpoint without changing placement.
-        Settings.CenterXY = FVector2D(
-            0.5f * (ArrivalPoint.X + DeparturePoint.X),
-            0.5f * (ArrivalPoint.Y + DeparturePoint.Y));
-        Settings.CoverPointA = FVector2D(ArrivalPoint.X, ArrivalPoint.Y);
-        Settings.CoverPointB = FVector2D(DeparturePoint.X, DeparturePoint.Y);
-        Settings.CoverMarginVoxels = FMath::CeilToFloat(
-            Settings.PlayerCapsuleRadiusVoxels) + 2.0f;
+        // The fine preview follows the measured route contract. Local topologies use the two
+        // mouths plus a capsule margin; origin-rooted topologies also cover the (0,0) spine.
+        VoxelForgePlayerFitWindow::ConfigureMouthWindow(
+            Settings, ArrivalPoint, DeparturePoint, Archetype);
         return Settings;
     }
 
@@ -366,7 +361,8 @@ namespace
         FinePreviewSettings.MaxCells = FinePreviewMaxCells;
         FVoxelStrateMeasureSettings FineMeasureSettings =
             VF_MakeFinePlayerFitSettings(
-                MeasureSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint);
+                MeasureSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint,
+                Candidate.Archetype);
         FVoxelStrateMetrics FineMetrics;
         const FVoxelConnectivityDiagnostics PlayerFitLaw =
             VF_DiagnosePlayerFitConnectivityWithSampler(
@@ -374,6 +370,8 @@ namespace
                 ArrivalPoint, DeparturePoint, FineMeasureSettings, &FineMetrics);
         OutSample.FineMetrics = FineMetrics;
         OutSample.PlayerFitLaw = PlayerFitLaw;
+        OutSample.FineWindowSummary = VoxelForgePlayerFitWindow::DescribeResolvedWindow(
+            FineMetrics, FineMeasureSettings.SampleStep, Candidate.Archetype);
         OutSample.LawText = FString::Printf(
             TEXT("legacy=%s%s; player_fit=%s%s"),
             VF_ShowcaseConnectivityName(Law.Result),
@@ -948,7 +946,8 @@ namespace
         FString Report = FString::Printf(
             TEXT("%s (player-fit fields are fitted SampleStep=1; walkable floor area and "
                  "median vertical clearance are coarse SampleStep=4 proxies)\n"
-                 "archetype | player_fit_fraction_step1 | traversable_share_step1 | "
+                 "archetype | player_fit_window | player_fit_fraction_step1 | "
+                 "traversable_share_step1 | "
                  "fit_cells_step1 | components_step1 | largest_component_cells_step1 | "
                  "arrival_component_cells_step1 | departure_component_cells_step1 | "
                  "mouth_component_gap_voxels_step1 | restricted_law_step1 | "
@@ -965,6 +964,7 @@ namespace
             {
                 Report += FString::Printf(
                     TEXT("%s | no measured sample | no measured sample | no measured sample | "
+                         "no measured sample | "
                          "no measured sample | no measured sample | no measured sample | "
                          "no measured sample | no measured sample | no measured sample | "
                          "n/a | n/a | n/a\n"),
@@ -979,9 +979,10 @@ namespace
             const float FloorAreaM2 = Found->Metrics.WalkableFloorAreaFraction
                 * 128.0f * 128.0f;
             Report += FString::Printf(
-                TEXT("%s | %.6f | %.6f | %lld | %d | %lld | %lld | %lld | %.3f | %s | "
+                TEXT("%s | %s | %.6f | %.6f | %lld | %d | %lld | %lld | %lld | %.3f | %s | "
                      "%.1f (%.6f footprint) | %.2f | %.3f\n"),
                 VF_GetStrateArchetypeName(Archetype),
+                *Found->FineWindowSummary,
                 M.bPlayerFitResolved ? M.PlayerFitFraction : 0.0f,
                 M.bPlayerFitResolved ? M.TraversableComponentShare : 0.0f,
                 static_cast<long long>(M.NumPlayerFitCells),
@@ -1042,7 +1043,8 @@ namespace
         Stack.PrepareChunk(Context);
         FShowcaseStackSampler Sampler(Stack);
         const FVoxelStrateMeasureSettings FineSettings = VF_MakeFinePlayerFitSettings(
-            BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint);
+            BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint,
+            MazeSample.Candidate.Archetype);
         FVoxelStrateMetrics ZeroMetrics;
         const FVoxelConnectivityDiagnostics ZeroLaw =
             VF_DiagnosePlayerFitConnectivityWithSampler(
@@ -1096,7 +1098,8 @@ namespace
         }
 
         const FVoxelStrateMeasureSettings FineSettings = VF_MakeFinePlayerFitSettings(
-            BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint);
+            BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint,
+            MazeSample.Candidate.Archetype);
         const float RadiusSweep[] = { 6.0f, 8.0f, 10.0f, 12.0f, 12.5f };
         OutReport = TEXT(
             "Part A Maze corridor-radius sweep (same seed/index, fitted step-1 ROI; "
@@ -1889,12 +1892,13 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
         }
         const FString FineSummary = Sample.FineMetrics.bPlayerFitResolved
             ? FString::Printf(
-                TEXT("fit_step1=%.6f traversable_step1=%.6f fit_cells_step1=%lld "
+                TEXT("window=%s; fit_step1=%.6f traversable_step1=%.6f fit_cells_step1=%lld "
                      "components_step1=%d largest_component_cells_step1=%lld "
                      "arrival_component_cells_step1=%lld departure_component_cells_step1=%lld "
                      "mouth_component_gap_step1=%.3f min_player_clearance_step1=%.2f "
                      "restricted_law_step1=%s; coarse_step4_walkable=%.6f "
                      "coarse_step4_clearance=%d voxels"),
+                *Sample.FineWindowSummary,
                 Sample.FineMetrics.PlayerFitFraction,
                 Sample.FineMetrics.TraversableComponentShare,
                 static_cast<long long>(Sample.FineMetrics.NumPlayerFitCells),
@@ -1908,8 +1912,9 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                 Sample.Metrics.WalkableFraction,
                 Sample.Metrics.MedianVerticalClearance)
             : FString::Printf(
-                TEXT("fit_step1=UNRESOLVED reason=%s; coarse_step4_walkable=%.6f "
+                TEXT("window=%s; fit_step1=UNRESOLVED reason=%s; coarse_step4_walkable=%.6f "
                      "coarse_step4_clearance=%d voxels"),
+                *Sample.FineWindowSummary,
                 Sample.FineMetrics.PlayerFitRefusalReason.IsEmpty()
                     ? TEXT("not measured") : *Sample.FineMetrics.PlayerFitRefusalReason,
                 Sample.Metrics.WalkableFraction,
@@ -2114,7 +2119,8 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                      World, Selected.TargetStrateIndex, FineArrivalPoint, FineDeparturePoint));
         const FVoxelStrateMeasureSettings FineMeasureSettings =
             VF_MakeFinePlayerFitSettings(
-                MeasureSettings, FinePreviewSettings, FineArrivalPoint, FineDeparturePoint);
+                MeasureSettings, FinePreviewSettings, FineArrivalPoint, FineDeparturePoint,
+                Candidate.Archetype);
         FVoxelStrateSampleGrid FineGrid;
         const FVoxelStrateMetrics FineMetrics = VF_MeasureStrateWithSampler(
             Sampler, Selected.BottomVoxelZ, Selected.TopVoxelZ + 1, Context.EdgeSealThickness,
@@ -2224,8 +2230,10 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     {
         const FShowcaseSample& Selected = PreviewSelections[ArchetypeIndex];
         Summaries[ArchetypeIndex].Window = PreviewCandidates[ArchetypeIndex].Window;
-        Summaries[ArchetypeIndex].WindowSummary = VF_FormatShowcaseSummaryWindow(
-            Stats[ArchetypeIndex]);
+        Summaries[ArchetypeIndex].WindowSummary = FString::Printf(
+            TEXT("coarse_window=%s; player_fit_window=%s"),
+            *VF_FormatShowcaseSummaryWindow(Stats[ArchetypeIndex]),
+            *Selected.FineWindowSummary);
         Summaries[ArchetypeIndex].PlayerFitFractionSummary = FString::Printf(
             TEXT("%.6f (step=1)"), Selected.FineMetrics.PlayerFitFraction);
         Summaries[ArchetypeIndex].TraversableComponentShareSummary = FString::Printf(
@@ -2239,7 +2247,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
                  "components_step1=%d, largest_component_cells_step1=%lld, "
                  "arrival_component_cells_step1=%lld, departure_component_cells_step1=%lld, "
                  "mouth_component_gap_voxels_step1=%.3f, player_clearance_step1=%.2f voxels, "
-                 "restricted_law_step1=%s, window=%s"),
+                 "restricted_law_step1=%s, coarse_window=%s, player_fit_window=%s"),
             VF_GetStrateArchetypeName(GShowcaseArchetypes[ArchetypeIndex]),
             Stats[ArchetypeIndex].Survivors.Num(),
             Selected.Candidate.Seed, Selected.Candidate.Index,
@@ -2258,7 +2266,8 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
             Selected.PlayerFitLaw.StartToGoalComponentDistanceCells,
             Selected.FineMetrics.MinimumPlayerClearanceVoxels,
             VF_ShowcaseConnectivityName(Selected.PlayerFitLaw.Result),
-            *PreviewCandidates[ArchetypeIndex].Window.Describe()));
+            *PreviewCandidates[ArchetypeIndex].Window.Describe(),
+            *Selected.FineWindowSummary));
     }
 
     FString IndexPath;

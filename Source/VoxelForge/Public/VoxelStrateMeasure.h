@@ -68,6 +68,11 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     TOptional<FVector2D> CoverPointA;
     TOptional<FVector2D> CoverPointB;
     float CoverMarginVoxels = 48.0f;
+    // Origin-rooted topologies can route from one mouth to the other through the (0,0) spine.
+    // When true, include (0,0) in the fitted AABB before applying MaxCells. A caller must keep
+    // this enabled for that topology; an over-cap route window is then refused honestly instead
+    // of being cropped back to a mouth-only box.
+    bool bIncludeOriginInCoverWindow = false;
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     MaxRouteRetries = 16; // Alternate coarse routes to full-resolution-check after the first route.
     int32     HeadroomCells  = 2;    // Legacy walkable-column metric only.
