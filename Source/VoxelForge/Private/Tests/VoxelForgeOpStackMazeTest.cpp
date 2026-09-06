@@ -4,7 +4,7 @@
 //
 // CE QUE LA PHASE 1 DEVAIT PROUVER / WHAT PHASE 1 HAD TO PROVE
 // Le déclencheur d'arrêt de `OPSTACK-PLAN §4` : **« est-ce que la séparation source / modifier tombe
-// naturellement du code existant ? »** Réponse mesurée : oui. Maze se décompose en sept opérateurs
+// naturellement du code existant ? »** Réponse mesurée : oui. Maze se décompose en huit opérateurs
 // sans contorsion, le SDF est reproduit BIT POUR BIT, et aucun échantillon ne change de côté de
 // l'isosurface.
 //
@@ -29,7 +29,8 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // ⚠️ LE PLANCHER ULP (HISTORIQUE) — lire ceci avant de « corriger » un écart résiduel
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// La pile reproduit `GetMazeDensity` à ~1-2 ULP près sur ~2 % des échantillons (ceux qui tombent
+// (HISTORIQUE, avant `FPSemantics = Precise`) la pile reproduisait `GetMazeDensity` à ~1-2 ULP près
+// sur ~2 % des échantillons (ceux qui tombent
 // dans la coquille de blend du SDF, où `Blend - Sdf` annule catastrophiquement et amplifie le
 // dernier arrondi). **Zéro échantillon ne traverse l'isosurface**, donc pas un triangle ne bouge.
 //
@@ -73,9 +74,11 @@
 #include "Misc/AutomationTest.h"
 #include "Async/ParallelFor.h"
 #include "HAL/PlatformMisc.h"
+#include "HAL/PlatformTime.h"
 
 #include "VoxelForgeTestFixture.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelCaveMorphology.h"
 
 #include <atomic>
 
@@ -88,6 +91,236 @@ namespace
 {
     constexpr int32 NumMazeSamples = 20000;
     constexpr int32 NumMazeBoxTests = 256;
+
+    struct FMazeGraphAudit
+    {
+        int32 NumNodes = 0;
+        int32 NumEdges = 0;
+        int32 NumDisconnected = 0;
+        TArray<uint64> EdgeKeys;
+        TArray<int32> RunLengths;
+        int64 DegreeCounts[8] = {};
+    };
+
+    int32 MazeGraphIndex(int32 X, int32 Y, int32 Z, int32 Radius)
+    {
+        const int32 Dim = Radius * 2 + 1;
+        return (X + Radius) + Dim * ((Y + Radius) + Dim * (Z + Radius));
+    }
+
+    uint64 MazeGraphEdgeKey(int32 A, int32 B)
+    {
+        const uint32 Lo = static_cast<uint32>(FMath::Min(A, B));
+        const uint32 Hi = static_cast<uint32>(FMath::Max(A, B));
+        return (static_cast<uint64>(Lo) << 32) | static_cast<uint64>(Hi);
+    }
+
+    void MazeGraphAddEdge(TArray<TArray<int32>>& Adjacency, TSet<uint64>& Seen,
+                          int32 A, int32 B)
+    {
+        if (A == B) { return; }
+        const uint64 Key = MazeGraphEdgeKey(A, B);
+        if (!Seen.Contains(Key))
+        {
+            Seen.Add(Key);
+            Adjacency[A].Add(B);
+            Adjacency[B].Add(A);
+        }
+    }
+
+    FMazeGraphAudit AuditMazeGraph(const FMazeGenerationParams& Params, int32 Seed,
+                                   int32 Radius, int32 MetricRadius)
+    {
+        FMazeGraphAudit Out;
+        const int32 Dim = Radius * 2 + 1;
+        Out.NumNodes = Dim * Dim * Dim;
+        TArray<TArray<int32>> Adjacency;
+        Adjacency.SetNum(Out.NumNodes);
+        TSet<uint64> Seen;
+        const uint32 Salt = static_cast<uint32>(Seed) ^ 0x4D617A65u;
+
+        // One parent per node. In this centered finite audit the parent of every sampled node is
+        // also sampled because it lowers Manhattan distance to the origin.
+        for (int32 Z = -Radius; Z <= Radius; ++Z)
+        for (int32 Y = -Radius; Y <= Radius; ++Y)
+        for (int32 X = -Radius; X <= Radius; ++X)
+        {
+            FIntVector Parent;
+            if (VoxelMazeTopology::TryGetParent(X, Y, Z, Salt, Parent))
+            {
+                MazeGraphAddEdge(Adjacency, Seen,
+                    MazeGraphIndex(X, Y, Z, Radius),
+                    MazeGraphIndex(Parent.X, Parent.Y, Parent.Z, Radius));
+            }
+        }
+
+        // Add only the optional non-tree edges. The tree count is therefore observable directly,
+        // and the same routine can audit the authored loop knobs without treating them as a
+        // connectivity requirement.
+        for (int32 Z = -Radius; Z <= Radius; ++Z)
+        for (int32 Y = -Radius; Y <= Radius; ++Y)
+        for (int32 X = -Radius; X <= Radius; ++X)
+        {
+            const int32 A = MazeGraphIndex(X, Y, Z, Radius);
+            if (X < Radius && VoxelMazeTopology::IsLoopEdgeOpen(
+                    X, Y, Z, VoxelMazeTopology::EAxis::X, Salt,
+                    Params.BranchProbability, Params.Verticality))
+            {
+                MazeGraphAddEdge(Adjacency, Seen, A,
+                    MazeGraphIndex(X + 1, Y, Z, Radius));
+            }
+            if (Y < Radius && VoxelMazeTopology::IsLoopEdgeOpen(
+                    X, Y, Z, VoxelMazeTopology::EAxis::Y, Salt,
+                    Params.BranchProbability, Params.Verticality))
+            {
+                MazeGraphAddEdge(Adjacency, Seen, A,
+                    MazeGraphIndex(X, Y + 1, Z, Radius));
+            }
+            if (Z < Radius && VoxelMazeTopology::IsLoopEdgeOpen(
+                    X, Y, Z, VoxelMazeTopology::EAxis::Z, Salt,
+                    Params.BranchProbability, Params.Verticality))
+            {
+                MazeGraphAddEdge(Adjacency, Seen, A,
+                    MazeGraphIndex(X, Y, Z + 1, Radius));
+            }
+        }
+
+        Out.NumEdges = Seen.Num();
+        Out.EdgeKeys.Reserve(Seen.Num());
+        for (const uint64 Key : Seen) { Out.EdgeKeys.Add(Key); }
+        Out.EdgeKeys.Sort();
+
+        TArray<uint8> Visited;
+        Visited.Init(0, Out.NumNodes);
+        TArray<int32> Pending;
+        Pending.Add(MazeGraphIndex(0, 0, 0, Radius));
+        Visited[Pending[0]] = 1;
+        while (Pending.Num() > 0)
+        {
+            const int32 Current = Pending.Pop(EAllowShrinking::No);
+            for (const int32 Next : Adjacency[Current])
+            {
+                if (!Visited[Next])
+                {
+                    Visited[Next] = 1;
+                    Pending.Add(Next);
+                }
+            }
+        }
+        for (const uint8 WasVisited : Visited)
+        {
+            if (!WasVisited) { ++Out.NumDisconnected; }
+        }
+
+        // Report degree only for an interior window so the finite audit boundary cannot invent
+        // dead ends. Degree 1 is the dead-end count; degree 6 would be the regular cubic grid.
+        for (int32 Z = -MetricRadius; Z <= MetricRadius; ++Z)
+        for (int32 Y = -MetricRadius; Y <= MetricRadius; ++Y)
+        for (int32 X = -MetricRadius; X <= MetricRadius; ++X)
+        {
+            const int32 Degree = Adjacency[ MazeGraphIndex(X, Y, Z, Radius) ].Num();
+            ++Out.DegreeCounts[FMath::Min(Degree, 7)];
+        }
+
+        // A run is a maximal sequence of degree-2 edges between junctions/dead ends. The graph
+        // is sampled with a larger halo than the reported degree window; truncation only affects
+        // the outermost runs, never the connectivity assertion.
+        TSet<uint64> UsedRunEdges;
+        for (int32 Start = 0; Start < Adjacency.Num(); ++Start)
+        {
+            if (Adjacency[Start].Num() == 2) { continue; }
+            for (const int32 First : Adjacency[Start])
+            {
+                const uint64 FirstKey = MazeGraphEdgeKey(Start, First);
+                if (UsedRunEdges.Contains(FirstKey)) { continue; }
+
+                int32 Length = 1;
+                UsedRunEdges.Add(FirstKey);
+                int32 Previous = Start;
+                int32 Current = First;
+                while (Adjacency[Current].Num() == 2)
+                {
+                    const int32 Next = Adjacency[Current][0] == Previous
+                        ? Adjacency[Current][1] : Adjacency[Current][0];
+                    const uint64 EdgeKey = MazeGraphEdgeKey(Current, Next);
+                    if (UsedRunEdges.Contains(EdgeKey)) { break; }
+                    UsedRunEdges.Add(EdgeKey);
+                    ++Length;
+                    Previous = Current;
+                    Current = Next;
+                }
+                Out.RunLengths.Add(Length);
+            }
+        }
+        // A completely degree-2 cycle is not expected for this tree-plus-loops graph, but keep
+        // the distribution total honest if a future loop policy creates one.
+        for (int32 Start = 0; Start < Adjacency.Num(); ++Start)
+        for (const int32 First : Adjacency[Start])
+        {
+            const uint64 FirstKey = MazeGraphEdgeKey(Start, First);
+            if (UsedRunEdges.Contains(FirstKey)) { continue; }
+            int32 Length = 1;
+            UsedRunEdges.Add(FirstKey);
+            int32 Previous = Start;
+            int32 Current = First;
+            while (true)
+            {
+                int32 Next = INDEX_NONE;
+                for (const int32 Candidate : Adjacency[Current])
+                {
+                    if (Candidate != Previous) { Next = Candidate; break; }
+                }
+                if (Next == INDEX_NONE) { break; }
+                const uint64 EdgeKey = MazeGraphEdgeKey(Current, Next);
+                if (UsedRunEdges.Contains(EdgeKey)) { break; }
+                UsedRunEdges.Add(EdgeKey);
+                ++Length;
+                Previous = Current;
+                Current = Next;
+            }
+            Out.RunLengths.Add(Length);
+        }
+        return Out;
+    }
+
+    FString DescribeMazeDistribution(const TArray<int64>& DegreeCounts,
+                                     const TArray<int32>& RunLengths)
+    {
+        int64 TotalDegree = 0;
+        int64 DegreeSum = 0;
+        for (int32 Degree = 0; Degree < DegreeCounts.Num(); ++Degree)
+        {
+            TotalDegree += DegreeCounts[Degree];
+            DegreeSum += Degree * DegreeCounts[Degree];
+        }
+
+        TArray<int32> SortedRuns = RunLengths;
+        SortedRuns.Sort();
+        const int32 Median = SortedRuns.Num() > 0 ? SortedRuns[SortedRuns.Num() / 2] : 0;
+        const int32 P90 = SortedRuns.Num() > 0
+            ? SortedRuns[FMath::Min(SortedRuns.Num() - 1,
+                                    FMath::FloorToInt(SortedRuns.Num() * 0.90f))]
+            : 0;
+        int32 MaxRun = 0;
+        for (const int32 Run : SortedRuns) { MaxRun = FMath::Max(MaxRun, Run); }
+
+        FString DegreeText;
+        for (int32 Degree = 0; Degree < DegreeCounts.Num(); ++Degree)
+        {
+            if (Degree > 0) { DegreeText += TEXT(", "); }
+            DegreeText += FString::Printf(TEXT("d%d=%lld"), Degree,
+                                          static_cast<long long>(DegreeCounts[Degree]));
+        }
+        return FString::Printf(
+            TEXT("degrees{%s}, mean=%.3f, dead_end_fraction=%.3f; runs n=%d min=%d "
+                 "median=%d p90=%d max=%d"),
+            *DegreeText,
+            TotalDegree > 0 ? static_cast<double>(DegreeSum) / static_cast<double>(TotalDegree) : 0.0,
+            TotalDegree > 0 ? static_cast<double>(DegreeCounts.IsValidIndex(1) ? DegreeCounts[1] : 0)
+                                / static_cast<double>(TotalDegree) : 0.0,
+            SortedRuns.Num(), SortedRuns.Num() > 0 ? SortedRuns[0] : 0,
+            Median, P90, MaxRun);
+    }
 
     /** Les params Maze de la strate Maze de la fixture, bornes Z de runtime comprises. */
     bool ResolveMazeParams(const VoxelForgeTest::FTestWorld& World, FMazeGenerationParams& Out,
@@ -131,6 +364,94 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
             TEXT("GetMazeDensity down its early-out. The op stack has no such early-out by design."),
             MazeParams.StrateTopWorldZ, MazeParams.StrateBottomWorldZ));
         return false;
+    }
+
+    //==========================================================================
+    // TOPOLOGY — construction proof, determinism, and maze morphology
+    //==========================================================================
+    {
+        constexpr int32 NumTopologySeeds = 64;
+        constexpr int32 GraphRadius = 10;
+        constexpr int32 MetricRadius = 7;
+
+        FMazeGenerationParams TreeParams = MazeParams;
+        TreeParams.BranchProbability = 0.0f;
+        TreeParams.Verticality = 0.0f;
+
+        int32 TreeEdgeCountViolations = 0;
+        int32 TreeDisconnected = 0;
+        int32 MazeDisconnected = 0;
+        int32 DeterminismFailures = 0;
+        int64 OptionalEdges = 0;
+        TArray<int64> DegreeCounts;
+        DegreeCounts.Init(0, 8);
+        TArray<int32> RunLengths;
+
+        for (int32 Seed = 0; Seed < NumTopologySeeds; ++Seed)
+        {
+            const FMazeGraphAudit Tree = AuditMazeGraph(
+                TreeParams, Seed, GraphRadius, MetricRadius);
+            const FMazeGraphAudit Maze = AuditMazeGraph(
+                MazeParams, Seed, GraphRadius, MetricRadius);
+            const FMazeGraphAudit Repeat = AuditMazeGraph(
+                MazeParams, Seed, GraphRadius, MetricRadius);
+
+            if (Tree.NumEdges != Tree.NumNodes - 1) { ++TreeEdgeCountViolations; }
+            TreeDisconnected += Tree.NumDisconnected;
+            MazeDisconnected += Maze.NumDisconnected;
+            OptionalEdges += static_cast<int64>(Maze.NumEdges - (Maze.NumNodes - 1));
+            if (Maze.EdgeKeys != Repeat.EdgeKeys) { ++DeterminismFailures; }
+            for (int32 Degree = 0; Degree < DegreeCounts.Num(); ++Degree)
+            {
+                DegreeCounts[Degree] += Maze.DegreeCounts[Degree];
+            }
+            RunLengths.Append(Maze.RunLengths);
+        }
+
+        TestEqual(TEXT("origin-directed parent graph has exactly N-1 edges with loops disabled"),
+                  TreeEdgeCountViolations, 0);
+        TestEqual(TEXT("origin-directed parent graph has zero disconnected cells"),
+                  TreeDisconnected, 0);
+        TestEqual(TEXT("Maze corridor graph has zero disconnected cells across 64 seeds"),
+                  MazeDisconnected, 0);
+        TestEqual(TEXT("Maze topology is deterministic for repeated same-seed builds"),
+                  DeterminismFailures, 0);
+
+        int64 TotalDegree = 0;
+        int64 DegreeSum = 0;
+        for (int32 Degree = 0; Degree < DegreeCounts.Num(); ++Degree)
+        {
+            TotalDegree += DegreeCounts[Degree];
+            DegreeSum += static_cast<int64>(Degree) * DegreeCounts[Degree];
+        }
+        TestTrue(TEXT("Maze topology has actual degree-1 dead ends"),
+                 DegreeCounts.IsValidIndex(1) && DegreeCounts[1] > 0);
+        TestTrue(TEXT("Maze topology has varied corridor run lengths"),
+                 RunLengths.Num() > 0 && RunLengths[0] >= 1
+                     && [&RunLengths]()
+                     {
+                         int32 MinRun = MAX_int32, MaxRun = 0;
+                         for (const int32 Run : RunLengths)
+                         {
+                             MinRun = FMath::Min(MinRun, Run);
+                             MaxRun = FMath::Max(MaxRun, Run);
+                         }
+                         return MinRun < MaxRun;
+                     }());
+        TestTrue(TEXT("Maze mean junction degree stays below a cubic grid's degree 6"),
+                 TotalDegree > 0
+                     && static_cast<double>(DegreeSum) / static_cast<double>(TotalDegree) < 6.0);
+
+        AddInfo(FString::Printf(
+            TEXT("Maze topology: %d seeds, centered graph radius %d (%d nodes); tree edges "
+                 "N-1 violations=%d, tree disconnected=%d, Maze disconnected=%d, optional "
+                 "loop edges=%lld; %s; cubic-grid control: degree6=100.000%%, degree1=0.000%%, "
+                 "mean=6.000 (no dead ends)."),
+            NumTopologySeeds, GraphRadius,
+            (GraphRadius * 2 + 1) * (GraphRadius * 2 + 1) * (GraphRadius * 2 + 1),
+            TreeEdgeCountViolations, TreeDisconnected, MazeDisconnected,
+            static_cast<long long>(OptionalEdges),
+            *DescribeMazeDistribution(DegreeCounts, RunLengths)));
     }
 
     const UVoxelGenerator* Gen = World.Generator.Get();
@@ -259,12 +580,54 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
                   Impure.load(), 0);
     }
 
+    //==========================================================================
+    // CACHE COST — topology decisions belong to the rebuild, not the voxel loop
+    //==========================================================================
+    {
+        constexpr int32 NumRebuildSamples = 256;
+        constexpr int32 NumHotSamples = 20000;
+        const float PerfCellSize = FMath::Max(MazeParams.CellSize, 1.0f);
+        const float PerfZ = 0.5f * (MazeParams.StrateBottomWorldZ + MazeParams.StrateTopWorldZ);
+        volatile float Sink = 0.0f;
+
+        float LastX = 0.0f;
+        float LastY = 0.0f;
+        const double RebuildStart = FPlatformTime::Seconds();
+        for (int32 i = 0; i < NumRebuildSamples; ++i)
+        {
+            const int32 CellX = (i % 16) - 8;
+            const int32 CellY = (i / 16) - 8;
+            LastX = (static_cast<float>(CellX) + 0.37f) * PerfCellSize;
+            LastY = (static_cast<float>(CellY) + 0.61f) * PerfCellSize;
+            Sink += Stack.EvalMC(LastX, LastY, PerfZ);
+        }
+        const double RebuildSeconds = FPlatformTime::Seconds() - RebuildStart;
+
+        const double HotStart = FPlatformTime::Seconds();
+        for (int32 i = 0; i < NumHotSamples; ++i)
+        {
+            Sink += Stack.EvalMC(LastX, LastY, PerfZ);
+        }
+        const double HotSeconds = FPlatformTime::Seconds() - HotStart;
+
+        AddInfo(FString::Printf(
+            TEXT("Maze cache perf: %d forced cell rebuilds at %.3f us/call and %d hot calls "
+                 "at %.3f us/call (8 child nodes + capped loop rolls only on rebuild; capsule "
+                 "SDFs only on hot calls; sink=%.9g)."),
+            NumRebuildSamples,
+            RebuildSeconds * 1.0e6 / static_cast<double>(NumRebuildSamples),
+            NumHotSamples,
+            HotSeconds * 1.0e6 / static_cast<double>(NumHotSamples),
+            static_cast<float>(Sink)));
+    }
+
     //=========================================================================
-    // LE VERDICT DE BOÎTE — le vrai prix perf : Maze n'a JAMAIS su sauter une tuile.
+    // LE VERDICT DE BOÎTE — le prix perf de l'intervalle SDF conservatif.
     //=========================================================================
     // ClassifyTile renvoie Mixed pour tout archétype de grotte, donc TunnelNetwork, Maze,
     // VerticalShafts, FloatingIslands, FlatPlain, CrystalChamber et Underwater ne captent RIEN du
-    // gain T1.d. Tout nombre > 0 ici est du saut de tuile que Maze n'a jamais eu.
+    // gain T1.d. Tout nombre > 0 ici est le saut de tuile propre à la pile, pas une décision du
+    // classifieur historique.
     {
         int32 NumProved = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
         FRandomStream Rng(24680);

@@ -248,6 +248,141 @@ namespace VoxelHash
 }
 
 //=============================================================================
+// MAZE TOPOLOGY — ORIGIN-DIRECTED SPANNING TREE
+//=============================================================================
+// A Maze node never waits for a probabilistic edge to connect it to the network. Every node
+// except the origin chooses exactly one parent among the coordinate axes that point toward the
+// origin. The chosen parent lowers |X|+|Y|+|Z| by one, so following parents terminates at (0,0,0)
+// and the undirected parent edges are a spanning tree of the infinite lattice.
+//
+// The optional loop rolls below are deliberately capped and are never used for the parent edge.
+// They add alternate routes and visual irregularity, but deleting every loop still leaves the
+// complete tree. This is the locality contract: the parent is a function of the child node and
+// seed only; an emitted voxel cell needs the eight child nodes in its one-cell {-1,0} halo.
+namespace VoxelMazeTopology
+{
+    enum class EAxis : uint8
+    {
+        X = 0,
+        Y = 1,
+        Z = 2,
+    };
+
+    // These are authoring knobs for optional loops, not connectivity probabilities. The scales
+    // keep old authored BranchProbability/Verticality values useful without allowing a lattice
+    // full of redundant parallel edges to turn the tree back into a grid.
+    constexpr float HorizontalLoopScale = 0.18f;
+    constexpr float VerticalLoopScale   = 0.10f;
+
+    FORCEINLINE uint32 NodeHash(int32 X, int32 Y, int32 Z, uint32 Salt, uint32 DomainSalt)
+    {
+        uint32 H = VoxelHash::Cell(X, Y, Salt ^ DomainSalt);
+        H ^= VoxelHash::Mix(static_cast<uint32>(Z) * 73856093u ^ DomainSalt);
+        return VoxelHash::Mix(H);
+    }
+
+    FORCEINLINE uint32 AxisSalt(EAxis Axis)
+    {
+        switch (Axis)
+        {
+        case EAxis::X: return 0xA1u;
+        case EAxis::Y: return 0xB2u;
+        case EAxis::Z: return 0xC3u;
+        default:       return 0xA1u;
+        }
+    }
+
+    FORCEINLINE bool TryGetParent(int32 X, int32 Y, int32 Z, uint32 Salt,
+                                  FIntVector& OutParent)
+    {
+        if (X == 0 && Y == 0 && Z == 0)
+        {
+            return false;
+        }
+
+        EAxis Available[3];
+        int32 Steps[3];
+        int32 NumAvailable = 0;
+        if (X != 0)
+        {
+            Available[NumAvailable] = EAxis::X;
+            Steps[NumAvailable++] = X > 0 ? -1 : 1;
+        }
+        if (Y != 0)
+        {
+            Available[NumAvailable] = EAxis::Y;
+            Steps[NumAvailable++] = Y > 0 ? -1 : 1;
+        }
+        if (Z != 0)
+        {
+            Available[NumAvailable] = EAxis::Z;
+            Steps[NumAvailable++] = Z > 0 ? -1 : 1;
+        }
+
+        const uint32 H = NodeHash(X, Y, Z, Salt, 0xD4E1A5E1u);
+        const int32 ParentIndex = static_cast<int32>(H % static_cast<uint32>(NumAvailable));
+        const EAxis ParentAxis = Available[ParentIndex];
+        const int32 ParentStep = Steps[ParentIndex];
+        OutParent = FIntVector(X, Y, Z);
+        switch (ParentAxis)
+        {
+        case EAxis::X: OutParent.X += ParentStep; break;
+        case EAxis::Y: OutParent.Y += ParentStep; break;
+        case EAxis::Z: OutParent.Z += ParentStep; break;
+        default: break;
+        }
+        return true;
+    }
+
+    FORCEINLINE FIntVector AxisNeighbour(int32 X, int32 Y, int32 Z, EAxis Axis)
+    {
+        switch (Axis)
+        {
+        case EAxis::X: return FIntVector(X + 1, Y, Z);
+        case EAxis::Y: return FIntVector(X, Y + 1, Z);
+        case EAxis::Z: return FIntVector(X, Y, Z + 1);
+        default:       return FIntVector(X, Y, Z);
+        }
+    }
+
+    FORCEINLINE bool IsTreeEdge(int32 X, int32 Y, int32 Z, EAxis Axis, uint32 Salt)
+    {
+        const FIntVector A(X, Y, Z);
+        const FIntVector B = AxisNeighbour(X, Y, Z, Axis);
+        FIntVector Parent;
+        return (TryGetParent(A.X, A.Y, A.Z, Salt, Parent) && Parent == B)
+            || (TryGetParent(B.X, B.Y, B.Z, Salt, Parent) && Parent == A);
+    }
+
+    FORCEINLINE float LoopProbability(EAxis Axis, float BranchProbability, float Verticality)
+    {
+        return Axis == EAxis::Z
+            ? FMath::Clamp(Verticality, 0.0f, 1.0f) * VerticalLoopScale
+            : FMath::Clamp(BranchProbability, 0.0f, 1.0f) * HorizontalLoopScale;
+    }
+
+    FORCEINLINE bool IsLoopEdgeOpen(int32 X, int32 Y, int32 Z, EAxis Axis, uint32 Salt,
+                                    float BranchProbability, float Verticality)
+    {
+        if (IsTreeEdge(X, Y, Z, Axis, Salt))
+        {
+            return false;
+        }
+
+        const float Probability = LoopProbability(Axis, BranchProbability, Verticality);
+        return Probability > 0.0f
+            && VoxelHash::ToFloat01(NodeHash(X, Y, Z, Salt, AxisSalt(Axis))) < Probability;
+    }
+
+    FORCEINLINE bool IsOpenEdge(int32 X, int32 Y, int32 Z, EAxis Axis, uint32 Salt,
+                                float BranchProbability, float Verticality)
+    {
+        return IsTreeEdge(X, Y, Z, Axis, Salt)
+            || IsLoopEdgeOpen(X, Y, Z, Axis, Salt, BranchProbability, Verticality);
+    }
+}
+
+//=============================================================================
 // BRUIT CELLULAIRE / CELLULAR (WORLEY) NOISE — 3D
 //=============================================================================
 // ⚠️ POURQUOI CE CORPS VIT ICI ET NON DANS VoxelNoise.h.

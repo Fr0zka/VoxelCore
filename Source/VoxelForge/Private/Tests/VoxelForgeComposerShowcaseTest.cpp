@@ -732,10 +732,10 @@ namespace
             TEXT("8 chunks / 64 m: supports several 16 m maze levels"));
         Add(TEXT("Maze"), TEXT("CellSize"), 64.0f,
             TEXT("16 m lattice cells, matching ordinary fight-space scale"));
-        Add(TEXT("Maze"), TEXT("CorridorRadius"), 8.0f,
-            TEXT("2 m radius / 4 m circular bore: upper fight-space target"));
+        Add(TEXT("Maze"), TEXT("CorridorRadius"), 12.5f,
+            TEXT("3.125 m radius / 6.25 m nominal bore; 3 m usable floor survives worst roughness"));
         Add(TEXT("Maze"), TEXT("SurfaceRoughness"), 2.0f,
-            TEXT("0.5 m texture; bounded reach is 0.94 m, below the 2 m radius"));
+            TEXT("0.5 m texture; proven bounded reach is 0.94 m, below the 3.125 m radius"));
         Add(TEXT("Maze"), TEXT("BoundarySealThickness"), 4.0f,
             TEXT("1 m solid boundary"));
 
@@ -889,7 +889,7 @@ namespace
                  "(%.3f including 6-voxel blend).\n"),
              TunnelReach / 6.0f, 6.0f, TunnelReach / 28.0f,
              SlabFloorReach / 12.0f, SlabCeilingReach / 12.0f,
-             MazeReach / 8.0f, 8.0f, TunnelReach / 80.0f,
+             MazeReach / 12.5f, 12.5f, TunnelReach / 80.0f,
             ShaftReach / 8.0f, ShaftReach / 6.0f,
             IslandReach / 24.0f, (IslandReach + 6.0f) / 24.0f);
     }
@@ -1097,7 +1097,7 @@ namespace
 
         const FVoxelStrateMeasureSettings FineSettings = VF_MakeFinePlayerFitSettings(
             BaseSettings, FinePreviewSettings, ArrivalPoint, DeparturePoint);
-        const float RadiusSweep[] = { 4.0f, 6.0f, 8.0f, 10.0f, 12.0f };
+        const float RadiusSweep[] = { 6.0f, 8.0f, 10.0f, 12.0f, 12.5f };
         OutReport = TEXT(
             "Part A Maze corridor-radius sweep (same seed/index, fitted step-1 ROI; "
             "radius voxels -> bore metres):\n");

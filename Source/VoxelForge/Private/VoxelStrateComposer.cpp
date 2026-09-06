@@ -1203,8 +1203,8 @@ namespace
             return false;
 
         case ECaveGeneratorType::Maze:
-            if (FieldName == TEXT("CellSize")) return Set(48.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
-            if (FieldName == TEXT("CorridorRadius")) return Set(6.0f, 8.0f);
+            if (FieldName == TEXT("CellSize")) return Set(64.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
+            if (FieldName == TEXT("CorridorRadius")) return Set(10.0f, 12.5f);
             if (FieldName == TEXT("BranchProbability")) return Set(0.05f, 1.0f);
             if (FieldName == TEXT("Verticality")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("SurfaceRoughness")) return Set(0.5f, FMath::Max(3.0f, H * 0.02f));
@@ -1661,15 +1661,18 @@ namespace
                                 float StrateHeightInVoxels)
     {
         const float H = FMath::Max(StrateHeightInVoxels, static_cast<float>(CHUNK_SIZE));
-        // Body-derived lattice: the fight corridor is 3-4 m wide (radius 6-8 voxels),
-        // while the lattice cell is 12-16 m (48-64 voxels). Thus a corridor radius is
-        // about one eighth of a cell, far below CellSize/2, leaving a real rock wall.
+        // Body-derived lattice: a 3 m usable floor needs a 4.286 m clear diameter. At 25 cm per
+        // voxel that is 17.143 voxels, radius 8.571. The proven 3.75-voxel roughness envelope is
+        // added to the authored radius, then rounded up to 12.5: the worst-case usable floor is
+        // still 0.7 * (2 * (12.5 - 3.75) * 0.25) = 3.0625 m. CellSize stays 64-96 voxels, so
+        // radius remains well below CellSize/2 and a real rock wall survives.
         P.CellSize = VF_CorpusFreeU(
-            Rng, 48.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
+            Rng, 64.0f, FMath::Max(64.0f, FMath::Min(96.0f, H * 0.75f)));
         P.CorridorRadius = VF_CorpusFreeU(
-            Rng, 6.0f, FMath::Min(8.0f, P.CellSize * 0.20f));
+            Rng, 10.0f, FMath::Min(12.5f, P.CellSize * 0.20f));
         const float RoughnessCap = FMath::Max(
-            0.0f, (P.CorridorRadius + 2.0f) / (VOXEL_NOISE_SCALE * 1.25f));
+            0.0f, (P.CorridorRadius - 2.0f)
+                / (VOXEL_NOISE_SCALE * 1.5f));
         P.SurfaceRoughness = VF_CorpusFreeU(Rng, 0.5f, RoughnessCap * 0.60f);
         P.BoundarySealThickness = VF_CorpusFreeU(
             Rng, FMath::Min(3.0f, H * 0.02f), FMath::Min(8.0f, H * 0.08f));
@@ -5070,11 +5073,11 @@ bool VF_ValidateStrateCorpusFreeConstraints(
             return Fail(TEXT("CorridorRadius must leave lattice walls"),
                         P.CorridorRadius, P.CellSize * 0.25f);
         }
-        if (P.SurfaceRoughness * VOXEL_NOISE_SCALE
+        if (P.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f
             >= P.CorridorRadius + 2.0f)
         {
             return Fail(TEXT("maze roughness must not erase the corridor centreline"),
-                        P.SurfaceRoughness * VOXEL_NOISE_SCALE,
+                        P.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f,
                         P.CorridorRadius + 2.0f);
         }
         if (P.BoundarySealThickness < 0.0f

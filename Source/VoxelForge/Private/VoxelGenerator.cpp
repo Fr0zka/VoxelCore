@@ -2387,11 +2387,11 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
 //=============================================================================
 // MAZE GENERATOR  (ECaveGeneratorType::Maze)
 //=============================================================================
-// Solid rock carved by a deterministic 3D lattice of corridors. Each lattice node
-// sits at a cell center; an edge to its +X/+Y/+Z neighbour is "open" when a hash of
-// (lower node, axis) passes BranchProbability (Verticality for Z edges). The corridor
-// is a thin capsule. Edge identity is the lower node + axis, so two adjacent chunks
-// always agree — no cache needed, evaluated over the few nearby nodes per voxel.
+// Solid rock carved by a deterministic 3D lattice of corridors. Each non-origin lattice node
+// chooses one parent toward (0,0,0), which is a spanning tree by construction. A small, capped
+// hash-gated loop set adds alternate routes without being needed for connectivity. The local
+// source evaluates the eight child nodes in the current cell's {-1,0} halo, so chunk seams cannot
+// change an edge decision.
 
 float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
                                       const FMazeGenerationParams& Params) const
@@ -2409,10 +2409,9 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
     const int32 CY = FMath::FloorToInt(WorldY / CS);
     const int32 CZ = FMath::FloorToInt(WorldZ / CS);
 
-    // The open-edge set reachable from this voxel's cell is a pure function of (cell, seed,
-    // probabilities) yet was re-hashed PER VOXEL (8 nodes × 3 edges = 24 hash rolls). Bake the
-    // open edges' capsule endpoints once per cell (thread_local); the per-voxel work is just
-    // the capsule SDFs. Rebuilds only on a cell crossing / param change — bit-identical.
+    // The edge set reachable from this voxel's cell is a pure function of (cell, seed, params).
+    // Bake the parent and optional loop capsule endpoints once per cell (thread_local); the
+    // per-voxel work is just the capsule SDFs. Rebuilds only on a cell crossing / param change.
     struct FMazeEdge { FVector A, B; };
     thread_local TArray<FMazeEdge, TInlineAllocator<24>> MZ_Edges;
     thread_local FIntVector MZ_Cell(INT32_MAX, INT32_MAX, INT32_MAX);
@@ -2431,15 +2430,8 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
         {
             return FVector((X + 0.5f) * CS, (Y + 0.5f) * CS, (Z + 0.5f) * CS);
         };
-        // Deterministic hash of a 3D lattice edge, keyed on its lower node + axis salt.
-        auto EdgeOpen = [S](int32 X, int32 Y, int32 Z, uint32 AxisSalt, float Threshold) -> bool
-        {
-            uint32 H = VoxelHash::Cell(X, Y, S ^ AxisSalt);
-            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
-            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
-        };
-
-        // Nodes in {-1,0} per axis cover every edge that can reach this voxel's cell.
+        // Canonical lower-node edges in {-1,0} per axis cover every corridor that can reach this
+        // voxel's cell. IsOpenEdge checks both endpoints, including a +1 node's parent choice.
         for (int32 dz = -1; dz <= 0; dz++)
         for (int32 dy = -1; dy <= 0; dy++)
         for (int32 dx = -1; dx <= 0; dx++)
@@ -2447,12 +2439,24 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
             const int32 nx = CX + dx, ny = CY + dy, nz = CZ + dz;
             const FVector A = NodeCenter(nx, ny, nz);
 
-            if (EdgeOpen(nx, ny, nz, 0xA1u, Params.BranchProbability))
+            if (VoxelMazeTopology::IsOpenEdge(
+                    nx, ny, nz, VoxelMazeTopology::EAxis::X,
+                    S, Params.BranchProbability, Params.Verticality))
+            {
                 MZ_Edges.Add({ A, NodeCenter(nx + 1, ny, nz) });
-            if (EdgeOpen(nx, ny, nz, 0xB2u, Params.BranchProbability))
+            }
+            if (VoxelMazeTopology::IsOpenEdge(
+                    nx, ny, nz, VoxelMazeTopology::EAxis::Y,
+                    S, Params.BranchProbability, Params.Verticality))
+            {
                 MZ_Edges.Add({ A, NodeCenter(nx, ny + 1, nz) });
-            if (EdgeOpen(nx, ny, nz, 0xC3u, Params.Verticality))
+            }
+            if (VoxelMazeTopology::IsOpenEdge(
+                    nx, ny, nz, VoxelMazeTopology::EAxis::Z,
+                    S, Params.BranchProbability, Params.Verticality))
+            {
                 MZ_Edges.Add({ A, NodeCenter(nx, ny, nz + 1) });
+            }
         }
     }
 

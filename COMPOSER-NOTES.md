@@ -392,6 +392,9 @@ covers each archetype plus the shared passage/disturbance and optional transport
 The requested maze test was run first on the same seed/index and a mouth-fitted step-1 ROI. The
 radius is the tunnel radius; the bore is twice the radius:
 
+This is the **pre-spanning-tree radius sweep**. It remains useful as historical evidence about
+mouth/fine-resolution behaviour, but it is not a connectivity result for the new topology.
+
 | Corridor radius | Bore | Player-fit fraction | Traversable share | Minimum clearance | Arrival→departure |
 |----------------:|-----:|--------------------:|------------------:|------------------:|-------------------|
 | 4 vox / 1.00 m | 2.00 m | 0.009007 | 0.078358 | 1 voxel / 0.25 m | NotConnected |
@@ -406,16 +409,20 @@ failure is not explained by the nominal tunnel diameter alone: the generated fie
 floor/cap interaction, and/or resolution still need separate diagnosis.
 
 The new defaults use separate derivations: rooms are 8-20 m diameters with a 24 m origin hub and
-32 m cells; round passages are 3-4 m bores; Maze is a 16 m cell with a 4 m bore; slabs reserve a
-22.4 m floor-to-ceiling span; shaft diameters are 4-7 m with 3 m connectors; islands are 12-24 m
-diameters on 28 m cells; ordinary passages are 3-4 m bores and reach 8-24 m. `RoomSpacing` keeps
-the largest room 6 m radially clear of the next cell, `CorridorRadius` is 8/32 = 0.25 of Maze half-cell,
-and `StrateHeightInChunks` grows from 4 to 8 because 17 m tall rooms, 20 m terrain relief,
-vertical shafts, and a high cap do not share a comfortable 32 m envelope. No global multiplier was
-used. The roughness reach is `1.875 × roughness` voxels: the new default ratios are
-**0.625** (minimum tunnel), **0.469** (Maze), **0.469/0.625** (shaft/connector), **0.234** island
-radius (**0.484** including blend), **0.625/0.938** slab column for floor/ceiling, and **0.047**
-against SurfaceWorld's 80-voxel relief scale.
+32 m cells; round passages are 3-4 m bores; Maze is a 16 m cell with a 6.25 m nominal bore;
+slabs reserve a 22.4 m floor-to-ceiling span; shaft diameters are 4-7 m with 3 m connectors;
+islands are 12-24 m diameters on 28 m cells; ordinary passages are 3-4 m bores and reach 8-24 m.
+`RoomSpacing` keeps the largest room 6 m radially clear of the next cell. For Maze, the target is
+3 m of usable two-abreast floor: `3 / 0.7 = 4.286 m` clear diameter, or an 8.571-voxel clear
+radius; adding the proven 3.75-voxel roughness reach gives 12.321 voxels, rounded to
+`CorridorRadius=12.5`. Thus the worst-case usable floor is
+`0.7 × 2 × (12.5−3.75) × 0.25 = 3.0625 m`, and the roughness ratio is `3.75/12.5 = 0.300`.
+The 64-voxel cell leaves `64−2×(12.5+3.75)=31.5` voxels (7.875 m) of worst-case wall
+between neighbouring bores. `StrateHeightInChunks` grows from 4 to 8 because 17 m tall rooms,
+20 m terrain relief, and a high cap do not share a comfortable 32 m envelope. No global multiplier
+was used. The other default ratios remain **0.625** (minimum tunnel), **0.469/0.625**
+(shaft/connector), **0.234** island radius (**0.484** including blend), **0.625/0.938** slab
+column for floor/ceiling, and **0.047** against SurfaceWorld's 80-voxel relief scale.
 
 The architecture sanity check uses [Epic's Unreal level-blockout guidance](https://dev.epicgames.com/documentation/en-us/unreal-engine/designer-01-project-setup-and-level-blockout-in-unreal-engine) (player-sized reference, 2-3 m halls and 3-4 m heights as starting guidance), the [2010 ADA Standards](https://www.ada.gov/law-and-regs/design-standards/2010-stds/) (915 mm clear walking width and larger passing/turning spaces), and [NPS Lehman Cave dimensions](https://www.nps.gov/grba/learn/nature/lehman-caves-dimensions.htm) (real chambers ranging from passages to 20 m-plus vertical volumes). These are sanity anchors, not claims that one universal ratio makes a good cave.
 
@@ -713,7 +720,7 @@ checks that question rather than assuming it.
 | Tunnel reach | Neighboring-room horizontal jitter can be `1.7S` in each axis, hence `1.7S√2`; vertical center separation can be `2*R*RoomHeightRatio`. Derive `MaxTunnelLength` as at least the Euclidean sum of those bounds. This matches the generator’s distance gate. | `VoxelCaveMorphology.cpp:1388` and `:1502` reject out-of-reach links; implemented/validated at `VoxelStrateComposer.cpp:1557-1564` and `:3114-3121`. |
 | Room vertical fit | `BoundarySealThickness + max(MaxRoomRadius,OriginRoomRadius)*RoomHeightRatio < H/2`, because room centers are restricted to the seal-free interval and the room Z radius is `Radius*RoomHeightRatio`. | `VoxelCaveMorphology.cpp:137-140` and `:248-250` establish the room/seal buffer; validated at `VoxelStrateComposer.cpp:3106-3112`. |
 | Slab floor/ceiling | Worst floor is `H*FloorRelativeHeight + 1.25*FloorRoughness`; worst ceiling is `H*CeilingRelativeHeight - 1.25*CeilingRoughness`. Derive both relative heights from seal + clearance and require a two-voxel void. | `VoxelCaveMorphology.cpp:329-362` and `VoxelGenerator.cpp:2175-2212`; implemented/validated at `VoxelStrateComposer.cpp:1602-1626` and `:3143-3185`. |
-| Maze corridor | Derive `CorridorRadius = CellSize*(0.12..0.24)` so it leaves lattice wall; cap roughness below `CorridorRadius+2` so the centerline remains carveable. | `VoxelCaveMorphology.cpp:428-458` bounds the lattice; `VoxelGenerator.cpp:2412-2432` applies roughness and subtracts `2*BaseDensity`; implemented/validated at `VoxelStrateComposer.cpp:1629-1642` and `:3188-3216`. |
+| Maze corridor | For a 25 cm voxel, derive `3/0.7 = 4.286 m` clear diameter for two-abreast floor, hence an 8.571-voxel clear radius. Add the proven `SurfaceRoughness*VOXEL_NOISE_SCALE*1.5 = 3.75` voxels and round to `CorridorRadius=12.5`; require `CellSize=64` so the worst-case bore gap remains `64−2*(12.5+3.75)=31.5` voxels. | `VoxelCaveMorphology.cpp` bounds the lattice and applies the roughness-safe landing; `VoxelGenerator.cpp` applies roughness and subtracts `2*BaseDensity`; implemented/validated at `VoxelStrateComposer.cpp:1629-1642` and `:3188-3216`. |
 | Surface ground/cap and height features | The structural height is bounded by `ElevationRange*(1+MountainStrength)+2*1.25*SurfaceRoughness`. Add conservative budgets for cliff displacement (`CliffStrength*CliffSharpness` times that spread), terrace step, layer depth, and beach width. Derive `BaseGroundRelative` above the bottom seal and `CeilingRelative` below the top seal with cap roughness, undulation, ridge, overhang height, and two-voxel headroom. Cliff is sampled as a scalar and reduced only when this derived height budget cannot contain it. | `VoxelGenerator.cpp:2470-2517` is the structural height equation; `:2537-2557` is the cliff remap; `:2607-2654` is the cap; `:2670-2686` caps overhang height. Implemented/validated at `VoxelStrateComposer.cpp:1645-1724` and `:3219-3269`. |
 | Vertical shafts and ledges | Require `ShaftMaxRadius≤ShaftSpacing/2`; require `ShaftMinRadius > 1.5*1.25*SurfaceRoughness + 0.25`; derive `ConnectorRadius > 1.5*1.25*SurfaceRoughness + 1`; derive ledge spacing greater than `2*(LedgeDepth + floor-clearance)`. | `VoxelCaveMorphology.cpp:628-654` moves landings out of roughness/ledge bands; `VoxelGenerator.cpp:3944-3954` derives tree roughness reach and `:4209-4214` applies ledges; implemented/validated at `VoxelStrateComposer.cpp:1730-1755` and `:3272-3310`. |
 | Floating islands | Require `IslandMaxRadius≤IslandSpacing/2`; derive island radius and thickness so `BoundarySealThickness + max(0.2R,ThicknessRatio*R) < H/2`; require the minimum radius to exceed roughness plus SDF blend. | `VoxelCaveMorphology.cpp:852-935` computes island radius, underside, warp, and blend pad; `VoxelGenerator.cpp:4268-4344` starts with void and fills the island; implemented/validated at `VoxelStrateComposer.cpp:1757-1780` and `:3313-3355`. |
@@ -963,7 +970,7 @@ cave design
 (https://store.steampowered.com/news/posts/?appgroupname=Deep+Rock+Galactic&appids=548430&enddate=1729500950&feed=steam_community_announcements),
 and Team Cherry map design (https://www.pcgamer.com/how-to-design-a-great-metroidvania-map/).
 
-#### Final post-scale measurement (2026-09-05)
+#### Historical post-scale measurement before the Maze spanning-tree correction (2026-09-05)
 
 The new defaults are applied in `VoxelStrateTypes.h`; the production definition, season defaults, and
 the owner-facing showcase use `StrateHeightInChunks=8` (64 m). The bounded test fixture remains at
@@ -1027,8 +1034,10 @@ The default derivations are not a global multiplier:
 * FlatPlain/CrystalChamber: floor `0.25×256=64 vox=16 m`, ceiling `0.60×256=153.6 vox=38.4 m`,
   leaving `22.4 m` before roughness. Columns are `8..16 vox` radii (4-8 m diameters) on 96-voxel
   (24 m) cells. The two names intentionally retain the same slab generator and parameter block.
-* Maze: `CellSize=64 vox=16 m`; `CorridorRadius=8 vox=2 m`, hence a 4 m bore; the corridor radius
-  is `8/32=0.25` of the half-cell, leaving a 6 m centre-to-wall radial margin before other geometry.
+* Maze: `CellSize=64 vox=16 m`; `CorridorRadius=12.5 vox=3.125 m`, hence a 6.25 m nominal bore.
+  The 3.75-voxel proven roughness reach leaves an 8.75-voxel effective radius and
+  `0.7×(2×8.75×0.25)=3.0625 m` of usable floor; the worst-case neighbouring-bore wall is
+  `64−2×16.25=31.5 vox=7.875 m`.
 * SurfaceWorld: `ElevationRange=80 vox=20 m`, base ground `0.25×256=16 m`, warp `48 vox=12 m`,
   sky cap `0.95×256=243.2 vox=60.8 m`; terrace/layer/beach/overhang values are separately
   2 m / 2 m / 3 m / 4 m reach + 6 m height optional features.
@@ -1668,6 +1677,75 @@ axis), while the landing query proves the actual ledge-side capsule pose. The re
 passed; the full `VoxelForge` namespace finished with **29 successes, 2 known warnings, 0 failures,
 0 not-run** in 2,388.35 s. The warnings remain the gated lateral-region 9/16 law and the known
 TunnelNetwork op-stack outside-gate sample count; box violations stayed zero.
+
+### 12.2 2026-09-06 Maze spanning-tree correction
+
+The Maze lattice no longer uses independent per-edge hash gating. Each non-origin cell chooses one
+parent from the non-zero coordinate axes and steps one unit toward the origin. The parent reduces
+`|x|+|y|+|z|` by exactly one, so the undirected parent edges form one infinite rooted tree: no cycle
+can exist, and following parents reaches `(0,0,0)` from every cell. A canonical lower node plus
+axis edge is emitted when either endpoint selects the other. Optional loop edges use capped hash
+rolls (`0.18 × BranchProbability` horizontally and `0.10 × Verticality` vertically); they add
+visual choice without carrying the connectivity guarantee.
+
+This is locally computable. The evaluator's exact window is the eight lower nodes in
+`{-1,0}³` (a 2×2×2 node window); the adjacent `+1` endpoint is one of the two endpoints of each
+canonical edge, so its parent decision is still inside that same bounded window. The source and
+op-stack cache use the identical predicate. No wide collect was needed, and no parent decision
+depends on the stored window or chunk origin. `WorldRadiusVoxels` remains `0`; lateral regions
+remain gated off.
+
+The focused topology audit sampled **64 seeds** over a centred radius-10 graph (**9,261 cells per
+seed**). With loops disabled, every graph had exactly `N−1` parent edges and **0 edge-count or
+disconnected-cell violations**. With default loop settings, disconnected cells were also **0**.
+The default sample added **103,297** optional loop edges in total. Repeating the same seed produced
+bit-identical edge keys across **20,000** checks.
+
+The output is measurably unlike the old cubic grid. Across **216,000 interior cells** and all
+64 seeds, the degree distribution was `d0=0, d1=34,371 (15.9%), d2=79,046, d3=68,545,
+d4=27,965, d5=5,531, d6=542`, with mean degree **2.504**. Maximal degree-2 corridor runs were
+`n=464,360`, minimum **1**, median **1**, p90 **3**, maximum **18**. The cubic-grid control was
+`d6=100%`, `d1=0%`, mean **6.000**. The tree therefore supplies real dead ends, varied runs,
+and non-uniform junctions even before the optional loops are considered.
+
+The seam test `VoxelForge.Generation.MazeSeamFreedom` passed **42/42 boundary probes** with
+**0 legacy mismatches and 0 operator mismatches**. It explicitly records the 2×2×2 local window
+and “no wide collect” contract.
+
+The player-fit law is still not connected, and was not tuned toward. The pre-tree baseline at the
+same style of fine measurement was **5,759 fit cells / 82 components / largest 1,217 / arrival 30 /
+departure 1,217 / gap 121.598 voxels**, `NotConnectedAtThisResolution`. The new spanning-tree
+showcase candidate (seed `0`, candidate `57`) measured **2,453 / 72 / 473 / arrival 100 /
+departure 415 / gap 149.730 voxels**, also `NotConnectedAtThisResolution`; its coarse lattice
+verdict was `Connected`. This separates the proven corridor-graph law from the remaining physical
+player-fit problem: the gap is at the passage mouths/fine floor-resolution interaction (and must
+not be “fixed” by raising edge probability), not evidence that the lattice graph is probabilistically
+fragmented. The other archetypes retain their own independent fit findings.
+
+The 3 m two-abreast radius derivation is explicit: `3/0.7 = 4.286 m` clear diameter, or an
+8.571-voxel clear radius at 0.25 m/voxel. Add the proven roughness reach
+`2×1.25×1.5 = 3.75 voxels`, giving 12.321 voxels; round up to `CorridorRadius=12.5`.
+The effective floor diameter is `2×(12.5−3.75)×0.25 = 4.375 m`, so usable floor is
+`0.7×4.375 = 3.0625 m`. With `CellSize=64`, worst-case neighbouring-bore wall is
+`64−2×(12.5+3.75)=31.5 voxels = 7.875 m`.
+
+Box audits stayed sound after adding guaranteed air: the existing Maze box audit proved **104
+uniform boxes**, classified **152 Mixed**, sampled **138,424 voxels**, and found **0 violations**;
+the novel fill audit covered **240 boxes** (`0 AllSolid`, `240 AllAir`) plus **16 Mixed** cases,
+**319,440 voxels**, and **0 violations**. The focused audit measured **1.436 μs** per forced cache
+rebuild and **0.150 μs/call** for 20,000 hot evaluations; the final namespace run measured
+**1.130 μs** and **0.145 μs/call**, respectively, on the validation machine. Parent/loop work stays
+in the thread-local rebuild.
+
+The regenerated owner-facing artifact is
+`E:/Projet Unreal/VoxelM/Saved/VoxelForge/Showcase/index.html`; the selected Maze card is
+`candidate_1003_plan.png` (with matching `candidate_1003_vertical.png` and fine ROI variants).
+The post-fix showcase rendered **6 fine views**, refused **2**, and produced **0 blank** cards.
+
+The final full namespace verification is `Saved/AutomationReports/VoxelForgeFullMazeTreeFinal3/index.json`:
+**32 tests, 30 clean successes, 2 warning-bearing successes, 0 failures, 0 not-run** in **2,523.978 s**.
+The two warnings are the pre-existing gated lateral-region result and the known TunnelNetwork
+outside-gate sample count; neither is a Maze or box-soundness failure.
 
 ### ⚠️ Correct the record: commit `1ab8c0c` overstated what worked
 It reported *"3 checked, 48/48 ring samples air"* and read as Tier 1 working. A million-seed sweep later

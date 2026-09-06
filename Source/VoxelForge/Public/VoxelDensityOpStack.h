@@ -292,9 +292,10 @@ namespace VoxelDensityOps
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeConstantVoidSource(float BaseDensity);
 
     /** Rôle 1 — les couloirs de Maze : capsules sur les arêtes ouvertes d'un treillis 3D.
-     *  Écrit le canal SDF uniquement. Identité d'arête = hash(nœud inférieur, axe), donc deux
-     *  chunks adjacents NE PEUVENT PAS être en désaccord : pas de cache de chunk, pas de région
-     *  COLLECT, zéro risque de couture (AUDIT §6.4 — le motif à préférer). */
+     *  Écrit le canal SDF uniquement. Chaque nœud hors origine choisit un parent vers l'origine;
+     *  les arêtes canoniques (nœud inférieur + axe) testent localement les deux parents. La source
+     *  met en cache les décisions de la fenêtre {-1,0}³ par cellule; les chunks adjacents voient
+     *  donc exactement le même graphe, sans collect global ni couture. */
     /** The source answers only for its own SDF field. Its box query publishes an SDF interval;
      *  each later converter or modifier consumes that interval through the generic fold. It does
      *  not know, and must not answer for, any downstream operator. */

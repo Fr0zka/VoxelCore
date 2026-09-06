@@ -165,8 +165,9 @@ public:
                          const FSlabGenerationParams& Params) const;
 
     /**
-     * Densité pour une strate Maze — couloirs étroits sur un treillis 3D déterministe.
-     * Pas de cache: évalué par voxel sur les quelques cellules voisines.
+      * Densité pour une strate Maze — couloirs sur un treillis 3D déterministe, avec les décisions
+      * parent/boucle reconstruites par cellule dans un cache thread-local; le hot path ne parcourt
+      * que les capsules déjà émises.
      */
     float GetMazeDensity(float WorldX, float WorldY, float WorldZ,
                          const FMazeGenerationParams& Params) const;

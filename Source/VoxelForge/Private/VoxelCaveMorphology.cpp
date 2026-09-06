@@ -706,14 +706,6 @@ namespace
                 (Y + 0.5f) * CellSize,
                 (Z + 0.5f) * CellSize);
         };
-        auto EdgeOpen = [SeedU](int32 X, int32 Y, int32 Z,
-                                uint32 AxisSalt, float Threshold)
-        {
-            uint32 H = VoxelHash::Cell(X, Y, SeedU ^ AxisSalt);
-            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
-            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
-        };
-
         const float Radius = FMath::Max(Params.CorridorRadius, 0.5f);
         float MazeSDF = FLT_MAX;
         for (int32 DZ = -1; DZ <= 0; ++DZ)
@@ -726,21 +718,27 @@ namespace
                     const int32 Y = CellY + DY;
                     const int32 Z = CellZ + DZ;
                     const FVector A = NodeCenter(X, Y, Z);
-                    if (EdgeOpen(X, Y, Z, 0xA1u, Params.BranchProbability))
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            X, Y, Z, VoxelMazeTopology::EAxis::X,
+                            SeedU, Params.BranchProbability, Params.Verticality))
                     {
                         MazeSDF = FMath::Min(
                             MazeSDF,
                             VoxelSDF::Capsule(
                                 Position, A, NodeCenter(X + 1, Y, Z), Radius));
                     }
-                    if (EdgeOpen(X, Y, Z, 0xB2u, Params.BranchProbability))
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            X, Y, Z, VoxelMazeTopology::EAxis::Y,
+                            SeedU, Params.BranchProbability, Params.Verticality))
                     {
                         MazeSDF = FMath::Min(
                             MazeSDF,
                             VoxelSDF::Capsule(
                                 Position, A, NodeCenter(X, Y + 1, Z), Radius));
                     }
-                    if (EdgeOpen(X, Y, Z, 0xC3u, Params.Verticality))
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            X, Y, Z, VoxelMazeTopology::EAxis::Z,
+                            SeedU, Params.BranchProbability, Params.Verticality))
                     {
                         MazeSDF = FMath::Min(
                             MazeSDF,
@@ -1229,9 +1227,9 @@ namespace
             OutPoint);
     }
 
-    // Maze corridors are thin 3D lattice edges. Only a horizontal edge is a useful landing
-    // source: a vertical edge can prove air, but cannot prove a place to stand. The edge set and
-    // the Z levels below are the same hash contract as GetMazeDensity, with no cache involved.
+    // Maze corridors are lattice edges. Only a horizontal edge is a useful landing source: a
+    // vertical edge can prove air, but cannot prove a place to stand. The edge set and Z levels
+    // below use the same origin-directed tree + loop contract as GetMazeDensity, with no cache.
     bool VF_SuggestMazeLandingPoint(
         const FMazeGenerationParams& Params,
         int32 Seed,
@@ -1259,7 +1257,7 @@ namespace
             || !FMath::IsFinite(Params.BaseDensity)
             || Params.CellSize <= 0.0f
             || Params.CorridorRadius <= 0.0f
-            || Params.BranchProbability <= 0.0f || Params.BranchProbability > 1.0f
+            || Params.BranchProbability < 0.0f || Params.BranchProbability > 1.0f
             || Params.Verticality < 0.0f || Params.Verticality > 1.0f
             || Params.SurfaceRoughness < 0.0f
             || Params.BoundarySealThickness < 0.0f
@@ -1270,7 +1268,10 @@ namespace
 
         const float CellSize = FMath::Max(Params.CellSize, 1.0f);
         const float Radius = FMath::Max(Params.CorridorRadius, 0.5f);
-        const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE;
+        // VoxelNoise::FBM has the proven absolute bound 1.5. This is the displacement that a
+        // corridor radius must survive; using the nominal [-1,1] label here would certify a
+        // landing inside a wall at the extremum.
+        const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f;
 
         // A strict interior of the tube is needed. At the MC zero surface the source's smooth
         // carve is only half applied, so stopping at the nominal radius would be an air guess.
@@ -1315,13 +1316,16 @@ namespace
         int32 BestAxis = INT32_MAX;
         bool bFound = false;
 
-        auto ConsiderEdge = [&](int32 CellX, int32 CellY, int32 CellZ,
-                                uint32 AxisSalt, float Threshold, int32 Axis)
+        auto ConsiderEdge = [&](int32 CellX, int32 CellY, int32 CellZ, int32 Axis)
         {
-            // This is the exact lower-node + axis hash used by GetMazeDensity::EdgeOpen.
-            uint32 H = VoxelHash::Cell(CellX, CellY, SeedU ^ AxisSalt);
-            H ^= VoxelHash::Mix((uint32)(CellZ * 73856093) ^ AxisSalt);
-            if (VoxelHash::ToFloat01(VoxelHash::Mix(H)) >= Threshold) return;
+            const VoxelMazeTopology::EAxis EdgeAxis =
+                static_cast<VoxelMazeTopology::EAxis>(Axis);
+            if (!VoxelMazeTopology::IsOpenEdge(
+                    CellX, CellY, CellZ, EdgeAxis, SeedU,
+                    Params.BranchProbability, Params.Verticality))
+            {
+                return;
+            }
 
             const float NodeX = (CellX + 0.5f) * CellSize;
             const float NodeY = (CellY + 0.5f) * CellSize;
@@ -1376,10 +1380,8 @@ namespace
             {
                 for (int32 CellX = BaseCellX - SearchRadius; CellX <= BaseCellX + SearchRadius; ++CellX)
                 {
-                    ConsiderEdge(CellX, CellY, CellZ, 0xA1u,
-                                  Params.BranchProbability, 0);
-                    ConsiderEdge(CellX, CellY, CellZ, 0xB2u,
-                                  Params.BranchProbability, 1);
+                    ConsiderEdge(CellX, CellY, CellZ, 0);
+                    ConsiderEdge(CellX, CellY, CellZ, 1);
                 }
             }
         }

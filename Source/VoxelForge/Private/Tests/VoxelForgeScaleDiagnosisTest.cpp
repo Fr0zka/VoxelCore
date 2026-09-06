@@ -19,11 +19,11 @@ namespace
 {
     constexpr int32 DiagnosisSeed = 0;
     constexpr int32 MazeCandidateIndex = 50;
-    constexpr int32 TunnelCandidateIndex = 61;
-    // These are the current seed-0 showcase identities from the bounded roll set.  The previous
-    // report's VerticalShafts identity was seed 0 / index 34; index 15 belongs to another family
-    // in the current corpus and would silently leave the shaft probe on fixture defaults.
-    constexpr int32 ShaftCandidateIndex = 34;
+    // These are single-region seed-0 identities after the Maze default/range change updates the
+    // corpus content hash. Keep the probes on real candidates rather than silently testing fixture
+    // defaults when a historical index moves to another family.
+    constexpr int32 TunnelCandidateIndex = 4;
+    constexpr int32 ShaftCandidateIndex = 6;
     constexpr int32 RadialSampleMaxVoxels = 48;
     constexpr int32 FineDiagnosisMaxCells = 4000000;
 
@@ -207,14 +207,6 @@ namespace
                      World.Generator->WorldRadiusVoxels, World.Generator->EdgeSealThickness,
                      World.StrateManager->GetLayoutVersion());
 
-        auto EdgeOpen = [Salt](int32 X, int32 Y, int32 Z,
-                               uint32 AxisSalt, float Threshold)
-        {
-            uint32 H = VoxelHash::Cell(X, Y, Salt ^ AxisSalt);
-            H ^= VoxelHash::Mix(static_cast<uint32>(Z * 73856093) ^ AxisSalt);
-            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
-        };
-
         auto FinalDensity = [&World](const FVector& Point)
         {
             return World.Generator->GetDensityAt(Point.X, Point.Y, Point.Z);
@@ -243,16 +235,23 @@ namespace
                             (NodeZ + 0.5f) * CellSize);
                         const float DistanceSq = A.X * A.X + A.Y * A.Y;
 
-                        struct FAxisSpec { uint32 Salt; float Threshold; FVector Delta; const TCHAR* Name; };
+                        struct FAxisSpec
+                        {
+                            VoxelMazeTopology::EAxis Axis;
+                            FVector Delta;
+                            const TCHAR* Name;
+                        };
                         const FAxisSpec Axes[] = {
-                            { 0xA1u, Params.BranchProbability,
+                            { VoxelMazeTopology::EAxis::X,
                               FVector(CellSize, 0.0f, 0.0f), TEXT("X") },
-                            { 0xB2u, Params.BranchProbability,
+                            { VoxelMazeTopology::EAxis::Y,
                               FVector(0.0f, CellSize, 0.0f), TEXT("Y") },
                         };
                         for (const FAxisSpec& Axis : Axes)
                         {
-                            if (!EdgeOpen(NodeX, NodeY, NodeZ, Axis.Salt, Axis.Threshold))
+                            if (!VoxelMazeTopology::IsOpenEdge(
+                                    NodeX, NodeY, NodeZ, Axis.Axis, Salt,
+                                    Params.BranchProbability, Params.Verticality))
                             {
                                 continue;
                             }
@@ -1028,14 +1027,14 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         const TCHAR* Label;
     };
     const FShowcaseSelection Selections[] = {
-        { ECaveGeneratorType::CrystalChamber, 0,   36, FTestWorld::SlotFlatPlain, TEXT("CrystalChamber") },
-        { ECaveGeneratorType::FlatPlain,       0,   11, FTestWorld::SlotFlatPlain, TEXT("FlatPlain") },
-        { ECaveGeneratorType::FloatingIslands, 0,   15, FTestWorld::SlotFlatPlain, TEXT("FloatingIslands") },
+        { ECaveGeneratorType::CrystalChamber, 0,   28, FTestWorld::SlotFlatPlain, TEXT("CrystalChamber") },
+        { ECaveGeneratorType::FlatPlain,       0,   37, FTestWorld::SlotFlatPlain, TEXT("FlatPlain") },
+        { ECaveGeneratorType::FloatingIslands, 0,    9, FTestWorld::SlotFlatPlain, TEXT("FloatingIslands") },
         { ECaveGeneratorType::Maze,            0,   50, FTestWorld::SlotMaze,      TEXT("Maze") },
-        { ECaveGeneratorType::SurfaceWorld,    0,   10, FTestWorld::SlotSurfaceWorld, TEXT("SurfaceWorld") },
-        { ECaveGeneratorType::TunnelNetwork,   0,   61, FTestWorld::SlotFlatPlain, TEXT("TunnelNetwork") },
-        { ECaveGeneratorType::Underwater,      0,   63, FTestWorld::SlotFlatPlain, TEXT("Underwater") },
-        { ECaveGeneratorType::VerticalShafts,  0,   34, FTestWorld::SlotFlatPlain, TEXT("VerticalShafts") },
+        { ECaveGeneratorType::SurfaceWorld,    0,   27, FTestWorld::SlotSurfaceWorld, TEXT("SurfaceWorld") },
+        { ECaveGeneratorType::TunnelNetwork,   0,    4, FTestWorld::SlotFlatPlain, TEXT("TunnelNetwork") },
+        { ECaveGeneratorType::Underwater,      0,   16, FTestWorld::SlotFlatPlain, TEXT("Underwater") },
+        { ECaveGeneratorType::VerticalShafts,  0,    6, FTestWorld::SlotFlatPlain, TEXT("VerticalShafts") },
     };
 
     // Baseline rows from the pre-fix fitted-window report. The supplied VerticalShafts row is

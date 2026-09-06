@@ -11,7 +11,7 @@
 A large A-to-Z expansion. The world is a stack of strates the player descends through;
 each strate can be a fundamentally different *archetype*, connected at (0,0).
 
-### 8.0 Human-scale generation contract (2026-09-05)
+### 8.0 Human-scale generation contract (2026-09-06)
 
 All authored lengths are voxel-space values, converted at the boundary by `0.25 m/voxel`. The body
 reference is a **0.34 m radius, 1.76 m tall** capsule (`1.36 × 7.04` voxels). The default strate
@@ -23,7 +23,7 @@ The default size families are deliberately independent:
 | Feature | Default metre derivation | Coupling kept sound |
 |---------|--------------------------|---------------------|
 | Room network | radius 4-10 m (8-20 m diameters), origin radius 12 m (24 m hub), cell spacing 32 m | `MaxRoomRadius 40 < RoomSpacing/2 64`; a 6 m radial margin remains around the largest room |
-| Round passages | 1.5-2 m radius (3-4 m bores); maze corridor radius 2 m (4 m bore) | a 1.76 m body fits vertically with headroom; Maze `8 < CellSize/2 32` |
+| Round passages | 1.5-2 m radius (3-4 m bores); maze corridor radius 3.125 m (6.25 m nominal bore) | `0.7 × 2 × (12.5−3.75) × 0.25 = 3.0625 m` usable floor after worst roughness; Maze `12.5 < CellSize/2 32` |
 | Slab | floor at 16 m, ceiling at 38.4 m, 22.4 m open span | floor/ceiling noise and 4-8 m column diameters remain inside the open span |
 | SurfaceWorld | 20 m terrain relief, 12 m warp, 60.8 m sky cap | terrain features are bounded below the 64 m strate envelope |
 | VerticalShafts | 4-7 m shaft diameters, 3 m connector bore, 8 m ledge interval | shaft spacing is 20 m; connector/ledge values are derived from the roughness envelope |
@@ -32,7 +32,7 @@ The default size families are deliberately independent:
 
 For wall detail, `VOXEL_NOISE_SCALE=1.25` and the proven `sup|fBM|=1.5` give a roughness reach of
 `1.875 × SurfaceRoughness` voxels. The default ratios are **0.625** against the minimum tunnel
-radius, **0.469** against the Maze corridor radius, **0.469/0.625** against shaft/connector radii,
+radius, **0.300** against the Maze corridor radius, **0.469/0.625** against shaft/connector radii,
 **0.234** against the minimum island radius (**0.484** including its 6-voxel blend), and
 **0.625/0.938** against slab column radius for floor/ceiling roughness. SurfaceWorld is a
 heightfield, so its **0.047** ratio is against its 80-voxel relief scale, not a fictitious radial
@@ -46,14 +46,15 @@ accessibility reference (915 mm clear walking width and larger passing/turning s
 keeping natural chambers heterogeneous and allowing 20 m-plus cathedral volumes.
 
 Validation is deliberately split by cost: bounded regression fixtures remain 4 chunks, while the
-production definition, season defaults, and owner-facing showcase use 8 chunks. The final focused
-showcase (`WorldScaleShowcaseProductionFinal`) exhausted 256 rolls, measured 82 eligible single-region
-rolls, skipped 174 multi-region rolls while lateral regions remain gated, and found **0/8** complete
-hard-gate survivor set at fine step 1. It still produced diagnostic cards (7 fine renders, 1 refusal,
-1 blank). The full `VoxelForge` run (`WorldScaleFullFinal3`) recorded **28 successes, 2 warning-only,
-0 failures, 0 not-run**; all box-verdict violation counts were **0**, `WorldRadiusVoxels` stayed **0**,
-and operator-stack equivalence paths remained bit-identical. The two authored-corpus relation findings
-(2/12) are conservative experiment-envelope findings, not box-verdict violations.
+production definition, season defaults, and owner-facing showcase use 8 chunks. The historical
+pre-tree production-height sweep exhausted 256 rolls and found **0/8** complete hard-gate survivors;
+its 7 fine renders, 1 refusal, and 1 blank are retained as the scale baseline. The final
+`VoxelForge` run (`VoxelForgeFullMazeTreeFinal3`) recorded **30 clean successes, 2 warning-bearing,
+0 failures, 0 not-run** in **2,523.978 s**; its regenerated showcase produced **6 fine renders, 2
+refusals, and 0 blanks**. All box-verdict violation counts were **0**, `WorldRadiusVoxels` stayed
+**0**, lateral regions stayed gated, and operator-stack equivalence paths remained bit-identical.
+The two authored-corpus relation findings (2/12) are conservative experiment-envelope findings,
+not box-verdict violations.
 
 ### 8.1 Archetypes (`ECaveGeneratorType`, VoxelStrateTypes.h)
 Each archetype has its own param `USTRUCT` (on `UVoxelStrateDefinition`, EditCondition-gated
@@ -64,7 +65,7 @@ by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispat
 |-----------|---------------|------------|------|
 | TunnelNetwork | `FStrateGenerationParams` | `GetDensityWithParams` | rooms+tunnels (original) |
 | FlatPlain / CrystalChamber | `FSlabGenerationParams` | `GetSlabDensity` | floor/ceiling void (original) |
-| Maze | `FMazeGenerationParams` | `GetMazeDensity` | tight corridors on a 3D lattice (per-voxel, no cache; edge = lower node + axis hash) |
+| Maze | `FMazeGenerationParams` | `GetMazeDensity` | origin-directed spanning-tree corridors on a 3D lattice, with capped loop edges and a thread-local per-cell capsule cache |
 | SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, **F20 heightfield terrain ops** (`Surface|Ops` — all default off ⇒ byte-identical): **Cliff** (slope-gated steepening — where the analytic structural slope > `CliffSlopeThreshold`, push the height away from the local mean by `CliffSharpness` ⇒ gentle slopes become sheer walls/canyon faces that hug real steep ground, gentle areas untouched; 4 structural resamples only when enabled), **Terrace** (relief-gated plateau quantize + `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed) — pure per-column height remaps in the single oracle `ComputeSurfaceTerrainZ` (`SampleSurfaceStructuralZ` = pre-op raw height, re-sampled at an XY offset for Cliff's slope), biome-selected + border-blended for free via each biome's `SurfaceParams` + the height output-lerp; plus **phase-2 Overhang** (the first VOLUMETRIC op — real jutting shelves like a cliff lip): in `SurfaceDensityFromColumn`, for AIR voxels in the window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height and unioned in. Low in the window the shift is ~0 (borrows nearby low rock ⇒ stays air over the void); high up it reaches the far cliff (solid) ⇒ a shelf attached to the cliff, tapering out over the void with air underneath. Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill dir `(DirX,DirY)` are resolved once in `ComputeSurfaceColumn` — the gradient sampled at the REACH scale (`OverhangReach`) so a point out over the void can "see" the cliff to know which way is uphill — and cached on `FSurfaceColumn`. It's genuine 3D (per-voxel structural re-eval), so it's gated hard to steep overhang columns; the union only ADDS rock (never removes), capped at `TerrainZ+OverhangHeight`, so `ClassifyTile` forces Mixed only in `(TerrainZ, TerrainZ+OverhangMargin]` (upward-only; margin = max `OverhangHeight`) — a shelf never holes a trivially-skipped tile, and only the thin cliff-edge band of air tiles is woken (NOT far-field like phase-3 spikes/holes). Overhang undersides classify as ground rock by the F17 rule (down-facing but below `TerrainZ`). Known v1 limit: applies at all LODs (Step-agnostic) — may alias far; gate to fine tiles later. Beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap vs ground is a PER-TRIANGLE surface class (F17), not a per-tile verdict**: the mesher classifies each unique vertex on the **worker** — only down-facing verts (`N.Z<-0.1`) pay a memoized `GetSurfaceHeightAt` column query; nearer `CeilSurf` ⇒ sky-cap, nearer `TerrainZ` ⇒ terrain overhang stays ground (a future SurfaceWorld cave roof — down-facing but below `TerrainZ` — also lands ground by the same rule; non-surface strates always ground). Triangles take the majority class of their 3 verts and are packed as **two contiguous index runs** (ground then cap, `FVoxelMeshData::NumCeilingTriangles`; skirts inherit their source triangle's run) → RMC **polygroups 0/1** → one **section per non-empty group** (`ApplyMeshToTile`, material slot = group index): slot 0 = strate `OverrideMaterial`/default (min-corner chunk), slot 1 = `CeilingMaterial` resolved at the tile's **TOP chunk** (mid as gap fallback, then min; fallback: ground material) — a coarse tile is 2^level chunks tall, so its min corner can sit in a lower strate/gap while the cap belongs to the strate above (this was the "far cap = ground material" residue), so the shadowless overhead rock is tinted separately instead of reading flat/bright. Shadow is **per section** via `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired): ground casts at level≤1, the cap section never casts, so the rock ceiling never shadows the terrain below it. History: v1 was a game-thread centre height-oracle (misclassified coarse far tiles → terrain material on the cap underside); v2 a whole-tile worker normal VOTE — which painted **mixed coarse tiles** (one far tile spanning terrain AND cap) entirely with the winner's material, and put sky material under terrain overhangs. The per-triangle class fixes both and is the identity channel caves/F8 will reuse. |
 | VerticalShafts | `FVerticalShaftParams` | `GetVerticalShaftDensity` | full-height shafts + horizontal connectors + partial ledges |
 | FloatingIslands | `FFloatingIslandParams` | `GetFloatingIslandDensity` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
@@ -202,6 +203,23 @@ Provided per chunk by `StrateManager::GetDisturbanceParamsForChunk`.
 (`+MaxInfluence`) kept for per-voxel eval. This makes the room/tunnel graph window-invariant.
 **If you add a connectivity rule with longer edges, the COLLECT region must still cover the
 max edge reach, and decisions must not depend on the stored window.**
+
+#### Maze topology — local spanning tree, optional loops
+
+Maze uses a different, strictly local connectivity contract. A non-origin lattice node `(x,y,z)`
+hash-selects one parent from the axes whose coordinate is non-zero, taking one step toward
+`(0,0,0)`. The parent step reduces `|x|+|y|+|z|` by one, so the infinite undirected parent graph
+has one root, no cycles, and every cell is reachable by construction. A canonical lower-node plus
+axis edge is open when either endpoint selects the other as parent. Horizontal and vertical loop
+edges are optional visual detail, capped at `0.18 * BranchProbability` and `0.10 * Verticality`;
+they are never needed for the connectivity proof.
+
+The evaluation window is exactly the lower nodes in `{-1,0}³`, an 8-node / 2×2×2 local halo. The
+edge predicate checks the adjacent `+1` endpoint's parent locally, so it does not need a wider
+collect region and cannot disagree at a chunk boundary. Both `GetMazeDensity` and
+`MakeLatticeCorridorSource` rebuild those decisions in their thread-local per-cell cache; the
+voxel loop evaluates only cached capsule SDFs. This is deliberately independent of
+`WorldRadiusVoxels` (which remains `0`) and the still-gated lateral-region system.
 
 The editor composer walk-through preserves this invariant by avoiding a layout rebuild. AVoxelWorld::ApplyComposerCandidate
 pauses and drains active generation, installs one temporary override on an existing slot, increments
@@ -521,6 +539,12 @@ driven by `EditorBrush*` props.
   by that halo, so no parent decision depends on the evaluation cell. No cell or pair hash, widened
   neighbourhood scan, or tree construction may move into the per-voxel loop; the operator-stack
   source follows the same cache contract.
+- **Maze field cache**: parent/loop decisions are rebuilt only when the thread-local cell, seed, or
+  loop parameters change. The rebuild evaluates the 24 canonical lower-node/axis edges in the
+  local `{-1,0}³` window and emits at most 24 capsules; the per-voxel loop performs no hash,
+  parent, loop, or neighbourhood work. The focused audit measured **1.436 μs** per forced rebuild
+  and **0.150 μs** per hot call in the focused audit; the final namespace run measured **1.130 μs**
+  rebuild and **0.145 μs** hot on the same machine.
 - **Per-chunk param cache** in `GetDensityAt`: GenType + param struct + disturbance cached
   thread-locally by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; the process-unique owner ID
   prevents cross-world reuse while adding only one `uint64` compare per voxel. Don't remove the owner

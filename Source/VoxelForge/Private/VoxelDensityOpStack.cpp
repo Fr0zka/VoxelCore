@@ -424,14 +424,16 @@ namespace
     //=========================================================================
     // RÔLE 1 — SOURCE : COULOIRS SUR TREILLIS 3D / 3D LATTICE CORRIDORS
     //=========================================================================
-    // Chaque nœud du treillis est au centre d'une cellule ; l'arête vers son voisin +X/+Y/+Z est
-    // « ouverte » quand un hash de (nœud inférieur, axe) passe BranchProbability (Verticality pour
-    // Z). Le couloir est une capsule fine.
+    // Chaque nœud du treillis est au centre d'une cellule. Il choisit exactement un parent parmi
+    // les axes qui le rapprochent de l'origine ; l'arête parent abaisse donc |X|+|Y|+|Z| de un.
+    // Le résultat est un arbre couvrant de tout le treillis infini. Quelques arêtes supplémentaires
+    // sont hashées comme des boucles, avec des probabilités plafonnées qui ne participent jamais à
+    // la connectivité. Le couloir est une capsule.
     //
-    // ⚠️ LA propriété qui fait de Maze le bon premier portage : l'identité d'une arête est
-    // (nœud INFÉRIEUR, axe). Deux chunks adjacents calculent donc littéralement le même hash pour
-    // l'arête qu'ils partagent — ils NE PEUVENT PAS être en désaccord. Pas de cache de chunk, pas
-    // de région COLLECT, pas de discipline d'invariance de fenêtre à maintenir (AUDIT §6.4).
+    // La règle est locale et seam-safe : les huit nœuds-enfants du halo {-1,0}³ suffisent à émettre
+    // toutes les arêtes qui peuvent toucher la cellule évaluée. Chaque décision est une fonction
+    // pure du nœud, de l'axe et de la seed ; il n'y a ni collect global ni dépendance à la fenêtre
+    // de chunk.
     class FLatticeCorridorSource final : public IVoxelDensityOp
     {
     public:
@@ -530,13 +532,6 @@ namespace
             return FVector((X + 0.5f) * CellSize, (Y + 0.5f) * CellSize, (Z + 0.5f) * CellSize);
         }
 
-        bool EdgeOpen(int32 X, int32 Y, int32 Z, uint32 AxisSalt, float Threshold) const
-        {
-            uint32 H = VoxelHash::Cell(X, Y, Salt ^ AxisSalt);
-            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
-            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
-        }
-
         // Sur-approximation volontaire : boîte englobante du segment contre la boîte élargie.
         // Un test capsule/AABB exact serait plus serré ; il coûterait plus cher pour un gain nul
         // ici, car la réponse ne sert qu'à un rejet grossier par tuile.
@@ -548,9 +543,10 @@ namespace
         }
 
         /**
-         * Le cache par CELLULE, repris tel quel de GetMazeDensity. Il est `thread_local` et non
+         * Le cache par CELLULE, partagé avec le même contrat que GetMazeDensity. Il est `thread_local` et non
          * membre parce que la pile est PARTAGÉE entre workers en lecture — un membre mutable serait
-         * une course. C'est aussi exactement ce que fait le code d'aujourd'hui.
+         * une course. La reconstruction seule inspecte le petit voisinage ; Eval ne refait aucune
+         * décision de parent ou de boucle.
          *
          * ⚠️ PHASE 3 : quand les opérateurs deviendront des assets partagés, il faudra un objet
          * d'état PAR WORKER plutôt que ce `thread_local` (qui est global à la fonction, donc partagé
@@ -571,7 +567,9 @@ namespace
                 MZ_Branch = BranchProbability;  MZ_Vert = Verticality;
                 MZ_Edges.Reset();
 
-                // Nodes in {-1,0} per axis cover every edge that can reach this voxel's cell.
+                // Canonical lower-node edges in {-1,0} per axis cover every corridor that can
+                // reach this voxel's cell. IsOpenEdge checks both endpoints, including a +1
+                // node's parent choice, without needing a wider cache window.
                 for (int32 dz = -1; dz <= 0; dz++)
                 for (int32 dy = -1; dy <= 0; dy++)
                 for (int32 dx = -1; dx <= 0; dx++)
@@ -579,12 +577,24 @@ namespace
                     const int32 nx = Cell.X + dx, ny = Cell.Y + dy, nz = Cell.Z + dz;
                     const FVector A = NodeCenter(nx, ny, nz);
 
-                    if (EdgeOpen(nx, ny, nz, 0xA1u, BranchProbability))
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            nx, ny, nz, VoxelMazeTopology::EAxis::X,
+                            Salt, BranchProbability, Verticality))
+                    {
                         MZ_Edges.Add({ A, NodeCenter(nx + 1, ny, nz) });
-                    if (EdgeOpen(nx, ny, nz, 0xB2u, BranchProbability))
+                    }
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            nx, ny, nz, VoxelMazeTopology::EAxis::Y,
+                            Salt, BranchProbability, Verticality))
+                    {
                         MZ_Edges.Add({ A, NodeCenter(nx, ny + 1, nz) });
-                    if (EdgeOpen(nx, ny, nz, 0xC3u, Verticality))
+                    }
+                    if (VoxelMazeTopology::IsOpenEdge(
+                            nx, ny, nz, VoxelMazeTopology::EAxis::Z,
+                            Salt, BranchProbability, Verticality))
+                    {
                         MZ_Edges.Add({ A, NodeCenter(nx, ny, nz + 1) });
+                    }
                 }
             }
             return MZ_Edges;
@@ -1293,14 +1303,15 @@ namespace
             // en float. Passer directement des floats saute cet aller-retour, et sous /fp:fast
             // les deux chemins ne s'arrondissent pas au même endroit : ~1 ULP d'écart sur le SDF,
             // qui ressort en 1 ULP sur la densité finale. Reproduire le détour, c'est reproduire
-            // l'arrondi. HYPOTHÈSE NON ENCORE VÉRIFIÉE : elle prédit que MazeEquivalence passe de
-            // 454 écarts à 0. Si le prochain run montre encore des écarts, c'est que la divergence
-            // vient d'ailleurs (candidat suivant : contraction FMA entre unités de compilation).
+            // l'arrondi. VERIFIE par MazeEquivalence : le détour conserve l'identité binaire avec
+            // GetMazeDensity (0 écart sur 20,000 échantillons). Si cela change, le candidat suivant
+            // est une contraction FMA entre unités de compilation.
             //
-            // THE FVector ROUND-TRIP IS DELIBERATE — do not "simplify" it. The original goes
-            // float -> double (FVector is double in UE5) -> float; going straight through floats
-            // skips a rounding step, and under /fp:fast the two paths round in different places.
-            // Reproducing the detour reproduces the rounding.
+            // THE FVector ROUND-TRIP IS DELIBERATE — do not "simplify" it. MazeEquivalence
+            // verifies the resulting path against GetMazeDensity (0 differences / 20,000 samples).
+            // The original goes float -> double (FVector is double in UE5) -> float; going straight
+            // through floats skips a rounding step, and under /fp:fast the two paths round in
+            // different places. Reproducing the detour reproduces the rounding.
             const FVector NoisePos(WorldX * Frequency, WorldY * Frequency, WorldZ * Frequency);
             InOut.Sdf += VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
                                          VoxelGenLOD::Eff(BaseOctaves), 2.0f, 0.5f)

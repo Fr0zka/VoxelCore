@@ -1263,11 +1263,11 @@ struct VOXELFORGE_API FSlabGenerationParams
 /**
  * FMazeGenerationParams — tight, branching corridors on a deterministic 3D lattice.
  *
- * Each lattice node sits at a cell center. An edge to a +X / +Y / +Z neighbour exists
- * when a symmetric pair-hash passes BranchProbability (Z edges additionally gated by
- * Verticality). Corridors are thin capsules carved through solid rock. Because edges
- * are decided by a pure symmetric hash of the two cells, the maze is identical in every
- * chunk with no caching needed — evaluated per-voxel over the few nearby cells.
+ * Each lattice node sits at a cell center and chooses one parent among the axes that point toward
+ * the origin. That parent edge is always present, so the lattice is a spanning tree: following
+ * parents strictly lowers |X|+|Y|+|Z| and ends at (0,0,0). A capped hash roll adds optional
+ * horizontal/vertical loops for alternate routes; loops are visual detail, never the connectivity
+ * proof. The evaluator needs only the current cell's one-cell {-1,0} child-node halo.
  */
 USTRUCT(BlueprintType)
 struct VOXELFORGE_API FMazeGenerationParams
@@ -1279,19 +1279,19 @@ struct VOXELFORGE_API FMazeGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "8.0"))
     float CellSize = 64.0f;
 
-    // Corridor tube radius in voxels. Keep well below CellSize/2 to leave walls.
-    //   4-5 → marginal passage · 8 → 2 m radius / 4 m bore (default) · 10+ → broad hall
+    // Corridor tube radius in voxels. Keep below CellSize/2 to leave a real lattice wall.
+    //   8.6 → 3 m nominal usable floor at 25 cm/voxel; 12.5 → the same after the
+    //   proven 3.75-voxel roughness envelope (default, 6.25 m nominal bore).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "1.0"))
-    float CorridorRadius = 8.0f;
+    float CorridorRadius = 12.5f;
 
-    // Probability that a horizontal edge between adjacent cells is open (0-1).
-    // Lower = more dead ends and a more maze-like feel; higher = more open/connected.
-    //   0.45 → sparse, lots of dead ends · 0.7 → connected maze (default) · 0.9 → very open
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+    // Legacy authoring knob for optional horizontal loop edges (0-1). Parent edges are always
+    // present, so this no longer controls connectivity. The runtime caps it at 0.18 * this value.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float BranchProbability = 0.7f;
 
-    // Probability that a vertical (Z) edge between stacked cells is open (0-1).
-    // 0 = single-level maze; higher = multi-storey with vertical shafts between levels.
+    // Legacy authoring knob for optional vertical loop edges (0-1). The spanning tree still reaches
+    // every Z level; the runtime caps this loop chance at 0.10 * Verticality.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float Verticality = 0.3f;
 

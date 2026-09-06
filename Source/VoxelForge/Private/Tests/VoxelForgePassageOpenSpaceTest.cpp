@@ -72,10 +72,12 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     using namespace VoxelForgeTest;
 
     FTestWorld World;
-    // Seed 11791 deliberately puts the passage mouths over a Maze corridor, a VerticalShafts
+    // Seed 12345 deliberately puts the passage mouths over a Maze corridor, a VerticalShafts
     // shaft, and a FloatingIslands blob. SurfaceWorld remains a deliberate query refusal because
-    // its production height can be biome/context-selected by the manager.
-    World.Build(/*InSeed=*/11791);
+    // its production height can be biome/context-selected by the manager. This fixture seed was
+    // repinned after the Maze topology/radius change; it is coverage selection, not generation
+    // tuning.
+    World.Build(/*InSeed=*/12345);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -344,7 +346,7 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                         SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z, P);
                     const float FloorProbeZ = SuggestedPoint.Z
                         - FMath::Max(P.CorridorRadius, 0.5f)
-                        - P.SurfaceRoughness * VOXEL_NOISE_SCALE - 3.0f;
+                        - P.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f - 3.0f;
                     FootingDensity = SourceOnlyGenerator->GetMazeDensity(
                         SuggestedPoint.X, SuggestedPoint.Y, FloorProbeZ, P);
                     break;
