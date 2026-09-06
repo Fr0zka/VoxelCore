@@ -603,8 +603,8 @@ void UVoxelStrateManager::GeneratePassages()
     constexpr uint32 PassageSaltBendFreq   = 0xA110000Au;
 
     int32 TotalPassages = 0;
-    int32 NumAimedAtUpperOpenPoint = 0;
-    int32 NumAimedAtLowerOpenPoint = 0;
+    int32 NumAimedAtUpperPlayerFit = 0;
+    int32 NumAimedAtLowerPlayerFit = 0;
     TSet<FString> NoQueryArchetypes;
 
     const auto ArchetypeName = [](ECaveGeneratorType Archetype)
@@ -629,8 +629,9 @@ void UVoxelStrateManager::GeneratePassages()
         case ECaveGeneratorType::VerticalShafts:
             // A density of 0.6 does not guarantee an occupied cell in the immediate grid
             // neighbourhood. Allow the nearest occupied shaft to be two grid cells away while
-            // remaining a bounded local query; the landing query still returns that shaft's
-            // exact axis, so this cannot create a non-topological mouth.
+            // remaining a bounded local query; the landing query still returns a pose inside
+            // that shaft's deterministic feature core, so this cannot create a non-topological
+            // mouth.
             return FMath::Max(2.0f * Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
 
         case ECaveGeneratorType::FloatingIslands:
@@ -749,20 +750,18 @@ void UVoxelStrateManager::GeneratePassages()
             // their source. The two queries are deliberately independent: a passage never reads
             // another passage's endpoint or any live layout state.
             FVector SuggestedUpperPoint = FVector::ZeroVector;
-            bool bAimedUpperAtOpenPoint = false;
+            bool bAimedUpperAtPlayerFitPoint = false;
             if (UpperDef)
             {
                 const bool bUsesRoomSeed =
                     UpperDef->GeneratorType == ECaveGeneratorType::TunnelNetwork
                     || UpperDef->GeneratorType == ECaveGeneratorType::Underwater;
-                const int32 UpperQuerySeed = SeasonStrates.IsValidIndex(i)
-                    ? SeasonStrates[i].Seed
-                    : (bUsesRoomSeed
-                        ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
-                            static_cast<uint32>(CachedSeed), Upper.StrateIndex))
-                        : CachedSeed);
+                const int32 UpperQuerySeed = bUsesRoomSeed
+                    ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
+                        static_cast<uint32>(CachedSeed), Upper.StrateIndex))
+                    : CachedSeed;
 
-                bAimedUpperAtOpenPoint = VF_SuggestLandingPoint(
+                bAimedUpperAtPlayerFitPoint = VF_SuggestLandingPoint(
                     UpperDef->GeneratorType,
                     UpperDef->GenerationParams,
                     UpperDef->SlabParams,
@@ -777,9 +776,9 @@ void UVoxelStrateManager::GeneratePassages()
                     MaxLateralSnapFor(*UpperDef),
                     SuggestedUpperPoint);
 
-                if (bAimedUpperAtOpenPoint)
+                if (bAimedUpperAtPlayerFitPoint)
                 {
-                    ++NumAimedAtUpperOpenPoint;
+                    ++NumAimedAtUpperPlayerFit;
                 }
                 else
                 {
@@ -788,22 +787,20 @@ void UVoxelStrateManager::GeneratePassages()
             }
 
             FVector SuggestedLowerPoint = FVector::ZeroVector;
-            bool bAimedLowerAtOpenPoint = false;
+            bool bAimedLowerAtPlayerFitPoint = false;
             const UVoxelStrateDefinition* LowerDef = Lower.Definition;
             if (LowerDef)
             {
                 const bool bUsesRoomSeed =
                     LowerDef->GeneratorType == ECaveGeneratorType::TunnelNetwork
                     || LowerDef->GeneratorType == ECaveGeneratorType::Underwater;
-                const int32 LowerQuerySeed = SeasonStrates.IsValidIndex(i + 1)
-                    ? SeasonStrates[i + 1].Seed
-                    : (bUsesRoomSeed
-                        ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
-                            static_cast<uint32>(CachedSeed), Lower.StrateIndex))
-                        : CachedSeed);
+                const int32 LowerQuerySeed = bUsesRoomSeed
+                    ? static_cast<int32>(VoxelCaveMorphology::MakeStrateSeed(
+                        static_cast<uint32>(CachedSeed), Lower.StrateIndex))
+                    : CachedSeed;
 
                 const float MaxLateralSnap = MaxLateralSnapFor(*LowerDef);
-                bAimedLowerAtOpenPoint = VF_SuggestLandingPoint(
+                bAimedLowerAtPlayerFitPoint = VF_SuggestLandingPoint(
                     LowerDef->GeneratorType,
                     LowerDef->GenerationParams,
                     LowerDef->SlabParams,
@@ -818,9 +815,9 @@ void UVoxelStrateManager::GeneratePassages()
                     MaxLateralSnap,
                     SuggestedLowerPoint);
 
-                if (bAimedLowerAtOpenPoint)
+                if (bAimedLowerAtPlayerFitPoint)
                 {
-                    ++NumAimedAtLowerOpenPoint;
+                    ++NumAimedAtLowerPlayerFit;
                 }
                 else
                 {
@@ -842,7 +839,7 @@ void UVoxelStrateManager::GeneratePassages()
             Passage.RequestedUpperPoint = FVector(PX, PY, TopZ);
             Passage.RequestedLowerPoint = FVector(PX, PY, BottomZ);
 
-            if (bAimedUpperAtOpenPoint)
+            if (bAimedUpperAtPlayerFitPoint)
             {
                 const float UpperSealThickness = BoundarySealThicknessFor(*UpperDef);
                 const float InnerBottomZ = UpperBottomZ + UpperSealThickness;
@@ -868,7 +865,7 @@ void UVoxelStrateManager::GeneratePassages()
                 }
             }
 
-            if (bAimedLowerAtOpenPoint)
+            if (bAimedLowerAtPlayerFitPoint)
             {
                 const float LowerSealThickness = BoundarySealThicknessFor(*LowerDef);
                 const float LowerBottomZ = (float)(Lower.BottomChunkZ) * CHUNK_SIZE;
@@ -1031,12 +1028,12 @@ void UVoxelStrateManager::GeneratePassages()
     }
 
     UE_LOG(LogTemp, Log,
-        TEXT("[StrateManager] Passage landing sites: upper %d/%d and lower %d/%d aimed at generator-confirmed open space, %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
-        NumAimedAtUpperOpenPoint,
+        TEXT("[StrateManager] Passage landing sites: upper %d/%d and lower %d/%d aimed at player-fit source space, %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
+        NumAimedAtUpperPlayerFit,
         TotalPassages,
-        NumAimedAtLowerOpenPoint,
+        NumAimedAtLowerPlayerFit,
         TotalPassages,
-        (TotalPassages * 2) - NumAimedAtUpperOpenPoint - NumAimedAtLowerOpenPoint,
+        (TotalPassages * 2) - NumAimedAtUpperPlayerFit - NumAimedAtLowerPlayerFit,
         TotalPassages * 2,
         *NoQueryList);
 

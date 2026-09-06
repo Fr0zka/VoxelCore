@@ -539,22 +539,27 @@ namespace VoxelCaveMorphology
 }
 
 /**
- * Suggest a deterministic full landing point for an inter-strate passage mouth.
+ * Suggest a deterministic player-fit landing point for an inter-strate passage mouth.
  *
  * This is deliberately a pure source query: it does not touch a generator, an operator stack,
  * a strate manager, a cache, or mutable state. DesiredX/DesiredY is the passage's deliberate
  * placement around the (0,0) spine. Sparse sources may move laterally, but never farther than
- * MaxLateralSnap; false means no confident landing site exists inside that bound.
+ * MaxLateralSnap; false means no confident player-fit pose exists inside that bound. A successful
+ * point has a locally supported floor within player step height, a walkable support patch, and a
+ * clear capsule volume. The local source stencil deliberately does not claim flood-fill
+ * connectivity or a measured component size; it selects a topology-backed feature core instead.
  * For TunnelNetwork/Underwater, Seed must be the strate-specific room seed returned by
  * VoxelCaveMorphology::MakeStrateSeed; for slab, maze, shaft, and island archetypes, Seed is the
  * generator world seed consumed by their source. SurfaceWorld deliberately has no answer here:
  * its production height can be selected by manager-owned biome context and per-chunk state,
  * which this re-entrant query cannot inspect.
  *
- * Propose un point d'atterrissage déterministe complet pour la bouche d'un passage inter-strates.
- * Cette requête reste pure et le déplacement latéral est strictement borné par MaxLateralSnap.
- * Pour VerticalShafts, la réponse XY est exactement l'axe d'un puits sélectionné; elle n'est pas
- * un point ouvert arbitraire à l'intérieur de son disque.
+ * Propose un point d'atterrissage déterministe où la capsule du joueur tient réellement pour la
+ * bouche d'un passage inter-strates. Cette requête reste pure et le déplacement latéral est
+ * strictement borné par MaxLateralSnap; elle ne prétend pas prouver une composante connectée.
+ * Pour VerticalShafts, la réponse s'appuie sur l'axe d'un puits sélectionné et peut se déplacer
+ * vers une banquette déterministe (+X/+Y) pour obtenir un support; ce n'est pas un point ouvert
+ * arbitraire à l'intérieur de son disque.
  *
  * @return true when the archetype can provide a confident point; false when it cannot.
  */
@@ -572,11 +577,13 @@ VOXELFORGE_API bool VF_SuggestLandingPoint(
 );
 
 /**
- * Complete source-query overload for archetypes whose placement parameters are not part of
+ * Complete player-fit source-query overload for archetypes whose placement parameters are not part of
  * FStrateGenerationParams/FSlabGenerationParams. The extra structs are read-only inputs only;
  * the function remains pure and SurfaceWorld still returns false for the reason above. The
- * returned point is either at the requested XY or within MaxLateralSnap of it. VerticalShafts
- * returns the selected shaft axis so the answer belongs to the connected shaft tree.
+ * returned point is either at the requested XY or within MaxLateralSnap of it, and is accepted
+ * only after the local player capsule/support stencil passes. VerticalShafts uses a selected
+ * shaft's deterministic feature core and ledge-side pose; the axis identifies the topology but
+ * is not itself claimed to be a standable point.
  */
 VOXELFORGE_API bool VF_SuggestLandingPoint(
     ECaveGeneratorType Archetype,

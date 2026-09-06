@@ -1549,19 +1549,27 @@ law has a design-level fix.
 
 ---
 
-## 11. Tier 1 status — passages aim at real open space (bounded full-point query; build not run)
+## 11. Tier 1 status — passages aim at player-fit source space (pure local stencil)
 
-**Updated 2026-08-29.** `VF_SuggestLandingPoint` (in `VoxelCaveMorphology`) is a **pure free function**
+**Updated 2026-09-06.** `VF_SuggestLandingPoint` (in `VoxelCaveMorphology`) is a **pure free function**
 of (archetype, params, seed, desired XY, lateral budget) — it touches no operator stack, no
 `UVoxelStrateManager`, no cache. That matters: `GeneratePassages` runs inside `Initialize`, when the
 layout is half-built and `LayoutVersion` is mid-flight, so constructing anything holding a manager
 pointer there is a re-entrancy trap.
 
-`GeneratePassages` now asks the **destination** strate for a full open/footing point near the chosen XY.
-Maze, VerticalShafts, and FloatingIslands may snap to a nearby lattice site, shaft, or island top;
-the lower mouth uses the returned X/Y/Z, clamped strictly inside the interior (never into a seal band).
-Where the archetype cannot prove footing inside its bound, **today's random reach and original XY are
-preserved unchanged**.
+`GeneratePassages` now asks **each mouth's own strate**, independently, for a player-fit pose near
+the chosen XY. The pure query reconstructs the exact default capsule stencil used by
+`VoxelStrateMeasure`: support coverage within max step height, a walkable support patch, and a clear
+capsule volume, with positive density meaning air and non-positive density meaning solid. It samples
+only a stateless source evaluator — no manager pointer, live layout, operator stack, cache, or
+measurement flood fill enters the query.
+
+The candidate is deliberately a feature core rather than arbitrary air: a room floor core,
+requested XY in a slab, a horizontal Maze edge, a VerticalShafts shaft core with a deterministic
+ledge-side offset above its lower seal, or a FloatingIslands top surface. The local stencil proves a legal pose, not that the pose belongs to a
+large connected component; that question remains in the measurement pass. When no legal local pose
+exists inside the bounded source neighbourhood, **the random reach and original XY are preserved
+unchanged**.
 
 ### ⚠️ Coverage is source-dependent and the number is the point
 The failing pre-fix measurement was:
@@ -1569,11 +1577,15 @@ The failing pre-fix measurement was:
 > *7 inter-strate passages, 3 checked, 0 footing checks, 38/48 room/slab ring samples air, 4
 > query-false (4 unique archetypes; 1 unsupported, 3 supported-but-no-point).*
 
-The Tier 1 query now searches laterally for `Maze`, `VerticalShafts`, and `FloatingIslands` landing
-sites within one configured placement period. `SurfaceWorld` remains intentionally refused.
+The Tier 1 query now searches laterally for `Maze`, `VerticalShafts`, and `FloatingIslands` feature
+cores within one configured placement period, and for cave rooms within one `RoomSpacing`.
+`SurfaceWorld` remains intentionally refused.
 The extended test uses vertical source footing brackets for those three instead of applying the
-room/slab circumference ring to thin or void-dominated geometry. The post-fix measurement is deliberately
-not claimed here because this change does not build or run the Unreal automation test.
+room/slab circumference ring to thin or void-dominated geometry. The post-fix measurement is not
+claimed as a connectivity proof: the focused fixture now reports 7 passages, 3 upper and 3 lower
+player-fit queries answered, 8/14 mouths falling back, 0/0 room/slab ring samples air, and all 3
+answered thin-source footing checks valid. The eight-card step-1 measurement is recorded in §12.1;
+it is the source of truth for the remaining component gaps.
 
 ### Seed contracts, do not mix them
 - **TunnelNetwork / Underwater** → `VoxelCaveMorphology::MakeStrateSeed` (the strate's own room seed).
@@ -1593,7 +1605,9 @@ construction*. It passed whether the aiming worked or not. Replaced with a **16-
 destinations. A mouth in a real room has open space around it; a mouth in bedrock has only the tube it
 dug itself. Maze, VerticalShafts, and FloatingIslands use a manager-free source density bracket:
 air at the landing and solid below it. A large void ring is not evidence of island footing.
-⚠️ **It is a proxy for connectivity, not a proof.** The proof is a flood fill — Tier 2.
+⚠️ **It is a proxy for connectivity, not a proof.** The pure query itself is even narrower: it can
+prove a local capsule pose but cannot prove a large component without reading generated layout
+state. The proof is a flood fill — Tier 2.
 
 ### ⚠️ A forked placement envelope, guarded by that test
 `VF_FindNearestHashRoomLandingPoint` re-derives the room vertical placement envelope that `BuildChunkCache` also
@@ -1603,9 +1617,57 @@ is the only thing standing between a placement change and silent bedrock passage
 
 ---
 
-## 12. Tier 1 FINAL — and the 92.8% defect a green suite hid
+## 12. Tier 1 checkpoint — and the 92.8% defect a green suite hid
 
-**Built clean, suite green: 17 succeeded, 0 warnings, 0 failed (2026-08-30).**
+**Historical checkpoint: built clean, suite green: 17 succeeded, 0 warnings, 0 failed
+(2026-08-30).** The room-centre correction below remains useful history, but it did not prove a
+player-sized landing or a large connected component.
+
+### 12.1 2026-09-06 player-fit landing pass
+
+The next correction keeps the pure/re-entrant boundary intact and replaces the query's open-air
+claim with a local player-pose claim. Both the upper and lower mouths query their own source
+independently. The query mirrors the measurement stencil (capsule volume, support patch, step
+height, and walkable normal) against a stateless archetype source evaluator. It does not run a
+flood fill, so it cannot honestly promise that the two mouths share a large fit component.
+
+The final eight-archetype before/after table below records the measured arrival/departure component
+sizes and voxel gaps. A remaining gap is a generation-connectivity finding, not a reason to widen
+the landing budget.
+
+| Archetype | Before: fit / components / largest / arrival / departure / gap / law | After: fit / components / largest / arrival / departure / gap / law |
+|---|---|---|
+| CrystalChamber | 655 / 197 / 24 / 1 / 1 / 47.529 / NotConnectedAtThisResolution | 1,360 / 62 / 717 / 270 / 717 / 19.131 / NotConnectedAtThisResolution |
+| FlatPlain | 1,116 / 45 / 259 / 1 / 1 / 48.104 / NotConnectedAtThisResolution | 2,136 / 2 / 2,135 / 2,135 / 2,135 / 0.000 / Connected |
+| FloatingIslands | 4 / 2 / 3 / 1 / 1 / 0.000 / Connected | 0 / 0 / 0 / 0 / 0 / -1.000 / StartCellNotPlayerFit |
+| Maze | 2,801 / 309 / 176 / 43 / 81 / 206.630 / NotConnectedAtThisResolution | 5,759 / 82 / 1,217 / 30 / 1,217 / 121.598 / NotConnectedAtThisResolution |
+| SurfaceWorld | 713 / 520 / 6 / 1 / 1 / 110.648 / NotConnectedAtThisResolution | 355 / 223 / 9 / 3 / 1 / 96.073 / NotConnectedAtThisResolution |
+| TunnelNetwork | 2,748 / 467 / 1,292 / 2 / 1 / 164.405 / NotConnectedAtThisResolution | 100 / 1 / 100 / 100 / 100 / 0.000 / CoarseLiedBudgetExhausted |
+| Underwater | 337 / 86 / 35 / 3 / 11 / 142.499 / NotConnectedAtThisResolution | 342 / 13 / 194 / 95 / 194 / 115.265 / NotConnectedAtThisResolution |
+| VerticalShafts | 1,156 / 112 / 96 / 3 / 36 / 94.000 / NotConnectedAtThisResolution | 4,669 / 36 / 619 / 14 / 81 / 104.890 / NotConnectedAtThisResolution |
+
+The restricted law tally is **1/8 connected before and 1/8 after**; no after result is a connected
+component of four cells or fewer. The FloatingIslands `StartCellNotPlayerFit` result is the live
+world after the mouth carve: the pure source query found a top pose, but the structural passage
+carve removes the support at that exact endpoint. That is a generation/carve integration issue,
+not evidence that the query should accept open air. TunnelNetwork's single 100-cell component is
+the coarse retry budget being exhausted, not a connected-law pass.
+
+The query-answer fixture still intentionally refuses `SurfaceWorld`. In this seed, the sparse room
+and slab sources can also decline when no room/core passes the local stencil inside their lateral
+budget; that preserves the original placement rather than inventing a point. The pure query has
+no component-size oracle, so its honest large-space substitute is a guaranteed feature core:
+room centre, slab floor at requested XY, horizontal Maze edge, shaft ledge-side pose, or island
+top interior. A generation-side connection/room-mouth guarantee is the smallest alternative if
+the measured law must become connected.
+
+The old VerticalShafts refinement assertion that every mouth sit on the exact shaft axis was too
+strong for this task: an infinite open cylinder has no support surface at its axis. It is now an
+executable **feature-core** invariant (with the drainage-tree path still audited from the resolved
+axis), while the landing query proves the actual ledge-side capsule pose. The required UE 5.7 build
+passed; the full `VoxelForge` namespace finished with **29 successes, 2 known warnings, 0 failures,
+0 not-run** in 2,388.35 s. The warnings remain the gated lateral-region 9/16 law and the known
+TunnelNetwork op-stack outside-gate sample count; box violations stayed zero.
 
 ### ⚠️ Correct the record: commit `1ab8c0c` overstated what worked
 It reported *"3 checked, 48/48 ring samples air"* and read as Tier 1 working. A million-seed sweep later

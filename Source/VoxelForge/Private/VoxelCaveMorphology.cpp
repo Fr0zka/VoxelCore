@@ -28,6 +28,8 @@
 //     this chunk are kept for the per-voxel loop, so hot-path cost stays low.
 
 #include "VoxelCaveMorphology.h"
+#include "VoxelDensityPrimitives.h"
+#include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
 #include "VoxelStrateTypes.h"
 #include "VoxelNoise.h"           // Pure FBM used by the slab landing query
@@ -90,9 +92,776 @@ static void BakeRoomFeature(
 
 namespace
 {
-    // Find the nearest hash room's vertical centre without constructing a cache. The search is
+    // Runtime landing queries use the same pinned capsule dimensions and support rules as the
+    // player-fit measurement, but they cannot call the editor-only flood fill.  Keep this local
+    // evaluator deliberately source-only: the callback is pure density math supplied by the
+    // archetype query, never a generator, manager, cache, or layout lookup.
+    struct FVFPlayerCapsuleStencilRow
+    {
+        int32 RelativeZ = 0;
+        TArray<FIntPoint> HorizontalOffsets;
+    };
+
+    bool VF_IsPointInsidePlayerCapsule(
+        float RelativeZ,
+        int32 OffsetX,
+        int32 OffsetY,
+        float Radius,
+        float HalfHeight)
+    {
+        const float AxisHalfLength = FMath::Max(0.0f, HalfHeight - Radius);
+        const float DistanceToAxis = FMath::Max(
+            FMath::Abs(RelativeZ) - AxisHalfLength, 0.0f);
+        const float DistanceSquared = static_cast<float>(OffsetX * OffsetX + OffsetY * OffsetY)
+            + DistanceToAxis * DistanceToAxis;
+        return DistanceSquared <= Radius * Radius + KINDA_SMALL_NUMBER;
+    }
+
+    bool VF_BuildPlayerFitStencil(
+        const FVoxelStrateMeasureSettings& Settings,
+        TArray<FVFPlayerCapsuleStencilRow>& OutRows,
+        TArray<FIntPoint>& OutSupportOffsets,
+        int32& OutCentreSupportIndex,
+        int32& OutRequiredSupportCount)
+    {
+        OutRows.Reset();
+        OutSupportOffsets.Reset();
+        OutCentreSupportIndex = INDEX_NONE;
+        OutRequiredSupportCount = 0;
+
+        if (!FMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
+            || Settings.PlayerCapsuleRadiusVoxels <= 0.0f
+            || !FMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
+            || Settings.PlayerCapsuleHalfHeightVoxels <= 0.0f
+            || !FMath::IsFinite(Settings.PlayerMaxStepHeightMeters)
+            || Settings.PlayerMaxStepHeightMeters < 0.0f
+            || !FMath::IsFinite(Settings.PlayerWalkableFloorAngleDegrees)
+            || Settings.PlayerWalkableFloorAngleDegrees < 0.0f
+            || Settings.PlayerWalkableFloorAngleDegrees > 90.0f
+            || !FMath::IsFinite(Settings.PlayerSupportPatchMinCoverageFraction)
+            || Settings.PlayerSupportPatchMinCoverageFraction <= 0.0f
+            || Settings.PlayerSupportPatchMinCoverageFraction > 1.0f)
+        {
+            return false;
+        }
+
+        const int32 HeightCells = FMath::CeilToInt(
+            2.0f * Settings.PlayerCapsuleHalfHeightVoxels);
+        const int32 MaxHorizontalOffset = FMath::CeilToInt(
+            Settings.PlayerCapsuleRadiusVoxels);
+        if (HeightCells <= 0 || HeightCells > 4096
+            || MaxHorizontalOffset < 0 || MaxHorizontalOffset > 4096)
+        {
+            return false;
+        }
+
+        int64 NumStencilOffsets = 0;
+        for (int32 RelativeZ = 0; RelativeZ < HeightCells; ++RelativeZ)
+        {
+            FVFPlayerCapsuleStencilRow& Row = OutRows.AddDefaulted_GetRef();
+            Row.RelativeZ = RelativeZ;
+            const float CapsuleRelativeZ = static_cast<float>(RelativeZ) + 0.5f
+                - Settings.PlayerCapsuleHalfHeightVoxels;
+            for (int32 OffsetY = -MaxHorizontalOffset;
+                 OffsetY <= MaxHorizontalOffset;
+                 ++OffsetY)
+            {
+                for (int32 OffsetX = -MaxHorizontalOffset;
+                     OffsetX <= MaxHorizontalOffset;
+                     ++OffsetX)
+                {
+                    if (!VF_IsPointInsidePlayerCapsule(
+                            CapsuleRelativeZ, OffsetX, OffsetY,
+                            Settings.PlayerCapsuleRadiusVoxels,
+                            Settings.PlayerCapsuleHalfHeightVoxels))
+                    {
+                        continue;
+                    }
+                    if (NumStencilOffsets >= (1ll << 20))
+                    {
+                        return false;
+                    }
+                    Row.HorizontalOffsets.Add(FIntPoint(OffsetX, OffsetY));
+                    ++NumStencilOffsets;
+                }
+            }
+
+            // Preserve the top partial row exactly as the measurement does.  A row with no
+            // rounded-cap offsets still needs a centre sample for full-height clearance.
+            if (Row.HorizontalOffsets.IsEmpty())
+            {
+                Row.HorizontalOffsets.Add(FIntPoint::ZeroValue);
+            }
+        }
+
+        const int32 MaxSupportOffset = FMath::CeilToInt(
+            Settings.PlayerCapsuleRadiusVoxels);
+        for (int32 OffsetY = -MaxSupportOffset;
+             OffsetY <= MaxSupportOffset;
+             ++OffsetY)
+        {
+            for (int32 OffsetX = -MaxSupportOffset;
+                 OffsetX <= MaxSupportOffset;
+                 ++OffsetX)
+            {
+                if (static_cast<float>(OffsetX * OffsetX + OffsetY * OffsetY)
+                    > FMath::Square(Settings.PlayerCapsuleRadiusVoxels)
+                        + KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+                if (OffsetX == 0 && OffsetY == 0)
+                {
+                    OutCentreSupportIndex = OutSupportOffsets.Num();
+                }
+                OutSupportOffsets.Add(FIntPoint(OffsetX, OffsetY));
+            }
+        }
+
+        if (OutRows.IsEmpty() || OutSupportOffsets.IsEmpty()
+            || OutCentreSupportIndex == INDEX_NONE)
+        {
+            return false;
+        }
+        OutRequiredSupportCount = FMath::Clamp(
+            FMath::CeilToInt(
+                Settings.PlayerSupportPatchMinCoverageFraction
+                    * static_cast<float>(OutSupportOffsets.Num())),
+            1,
+            OutSupportOffsets.Num());
+        return true;
+    }
+
+    using FVFPlayerDensitySampler = TFunctionRef<float(float, float, float)>;
+
+    bool VF_GetPlayerFitInteriorBounds(
+        const FVoxelStrateMeasureSettings& Settings,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float BoundarySealThickness,
+        float& OutInnerTop,
+        float& OutInnerBottom)
+    {
+        if (!FMath::IsFinite(StrateTopZ)
+            || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(BoundarySealThickness)
+            || BoundarySealThickness < 0.0f
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        int32 InteriorMarginVoxels = Settings.InteriorMarginVoxels;
+        if (InteriorMarginVoxels < 0)
+        {
+            const double DerivedMargin = 2.0
+                * static_cast<double>(BoundarySealThickness);
+            if (!FMath::IsFinite(DerivedMargin)
+                || DerivedMargin > static_cast<double>(INT32_MAX))
+            {
+                return false;
+            }
+            InteriorMarginVoxels = FMath::CeilToInt(static_cast<float>(DerivedMargin));
+        }
+        if (InteriorMarginVoxels < 0 || InteriorMarginVoxels > 4096)
+        {
+            return false;
+        }
+
+        OutInnerBottom = StrateBottomZ + static_cast<float>(InteriorMarginVoxels);
+        OutInnerTop = StrateTopZ - static_cast<float>(InteriorMarginVoxels);
+        return FMath::IsFinite(OutInnerTop)
+            && FMath::IsFinite(OutInnerBottom)
+            && OutInnerTop > OutInnerBottom;
+    }
+
+    bool VF_ValidatePlayerFitPose(
+        const FVoxelStrateMeasureSettings& Settings,
+        const FVector& CandidateFeetPoint,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float BoundarySealThickness,
+        FVFPlayerDensitySampler SampleDensity,
+        FVector& OutPoint)
+    {
+        OutPoint = FVector::ZeroVector;
+        if (!FMath::IsFinite(CandidateFeetPoint.X)
+            || !FMath::IsFinite(CandidateFeetPoint.Y)
+            || !FMath::IsFinite(CandidateFeetPoint.Z)
+            || !FMath::IsFinite(StrateTopZ)
+            || !FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(BoundarySealThickness)
+            || BoundarySealThickness < 0.0f
+            || StrateTopZ <= StrateBottomZ)
+        {
+            return false;
+        }
+
+        TArray<FVFPlayerCapsuleStencilRow> StencilRows;
+        TArray<FIntPoint> SupportOffsets;
+        int32 CentreSupportIndex = INDEX_NONE;
+        int32 RequiredSupportCount = 0;
+        if (!VF_BuildPlayerFitStencil(
+                Settings, StencilRows, SupportOffsets,
+                CentreSupportIndex, RequiredSupportCount))
+        {
+            return false;
+        }
+
+        const double MaxStepHeightVoxelsReal =
+            static_cast<double>(Settings.PlayerMaxStepHeightMeters)
+            / static_cast<double>(FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        if (!FMath::IsFinite(MaxStepHeightVoxelsReal)
+            || MaxStepHeightVoxelsReal < 0.0
+            || MaxStepHeightVoxelsReal > 4096.0)
+        {
+            return false;
+        }
+        const int32 MaxDownwardSearchCells = FMath::CeilToInt(
+            static_cast<float>(MaxStepHeightVoxelsReal));
+        const float MaxStepHeightVoxels = static_cast<float>(MaxStepHeightVoxelsReal);
+        const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+            Settings.PlayerWalkableFloorAngleDegrees));
+
+        TArray<float> SupportHeights;
+        SupportHeights.SetNumUninitialized(SupportOffsets.Num());
+        TArray<uint8> bSupported;
+        bSupported.Init(0u, SupportOffsets.Num());
+        int32 NumSupported = 0;
+        for (int32 SupportIndex = 0; SupportIndex < SupportOffsets.Num(); ++SupportIndex)
+        {
+            const FIntPoint& Offset = SupportOffsets[SupportIndex];
+            for (int32 DownwardCell = 0;
+                 DownwardCell <= MaxDownwardSearchCells;
+                 ++DownwardCell)
+            {
+                const float UpperZ = CandidateFeetPoint.Z
+                    - static_cast<float>(DownwardCell);
+                const float LowerZ = UpperZ - 1.0f;
+                const float LowerDensity = SampleDensity(
+                    CandidateFeetPoint.X + static_cast<float>(Offset.X),
+                    CandidateFeetPoint.Y + static_cast<float>(Offset.Y),
+                    LowerZ);
+                const float UpperDensity = SampleDensity(
+                    CandidateFeetPoint.X + static_cast<float>(Offset.X),
+                    CandidateFeetPoint.Y + static_cast<float>(Offset.Y),
+                    UpperZ);
+                if (!FMath::IsFinite(LowerDensity)
+                    || !FMath::IsFinite(UpperDensity)
+                    || !(LowerDensity <= 0.0f)
+                    || !(UpperDensity > 0.0f))
+                {
+                    continue;
+                }
+
+                const float Denominator = UpperDensity - LowerDensity;
+                if (!FMath::IsFinite(Denominator) || Denominator <= 0.0f)
+                {
+                    continue;
+                }
+                const float Fraction = FMath::Clamp(
+                    -LowerDensity / Denominator, 0.0f, 1.0f);
+                const float SurfaceHeight = LowerZ + Fraction;
+                const float CandidateBottom = CandidateFeetPoint.Z - 0.5f;
+                if (!FMath::IsFinite(SurfaceHeight)
+                    || SurfaceHeight > CandidateBottom + KINDA_SMALL_NUMBER
+                    || SurfaceHeight < CandidateBottom - MaxStepHeightVoxels
+                        - KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+
+                bSupported[SupportIndex] = 1u;
+                SupportHeights[SupportIndex] = SurfaceHeight;
+                ++NumSupported;
+                break;
+            }
+        }
+
+        if (NumSupported < RequiredSupportCount
+            || bSupported[CentreSupportIndex] == 0u)
+        {
+            return false;
+        }
+
+        float SupportHeight = -FLT_MAX;
+        int32 SupportCount = 0;
+        for (int32 Index = 0; Index < SupportOffsets.Num(); ++Index)
+        {
+            if (bSupported[Index] == 0u) continue;
+            ++SupportCount;
+            SupportHeight = FMath::Max(SupportHeight, SupportHeights[Index]);
+        }
+        if (SupportCount < RequiredSupportCount || !FMath::IsFinite(SupportHeight))
+        {
+            return false;
+        }
+
+        float MaximumGradient = 0.0f;
+        for (int32 First = 0; First < SupportOffsets.Num(); ++First)
+        {
+            if (bSupported[First] == 0u) continue;
+            for (int32 Second = First + 1; Second < SupportOffsets.Num(); ++Second)
+            {
+                if (bSupported[Second] == 0u) continue;
+                const float DX = static_cast<float>(
+                    SupportOffsets[Second].X - SupportOffsets[First].X);
+                const float DY = static_cast<float>(
+                    SupportOffsets[Second].Y - SupportOffsets[First].Y);
+                const float HorizontalDistance = FMath::Sqrt(DX * DX + DY * DY);
+                if (HorizontalDistance <= KINDA_SMALL_NUMBER) continue;
+                MaximumGradient = FMath::Max(
+                    MaximumGradient,
+                    FMath::Abs(SupportHeights[Second] - SupportHeights[First])
+                        / HorizontalDistance);
+            }
+        }
+        const float SupportNormalZ = 1.0f / FMath::Sqrt(
+            1.0f + MaximumGradient * MaximumGradient);
+        if (!FMath::IsFinite(SupportNormalZ)
+            || SupportNormalZ + KINDA_SMALL_NUMBER < MinimumWalkableNormalZ)
+        {
+            return false;
+        }
+
+        // Re-evaluate every occupied stencil sample at the chosen support, so an overhang cannot
+        // masquerade as a floor. The returned point is the free centre immediately above that
+        // resolved support, which is the stable standing/footing point used by passage mouths.
+        for (const FVFPlayerCapsuleStencilRow& Row : StencilRows)
+        {
+            const float SampleZ = SupportHeight
+                + static_cast<float>(Row.RelativeZ) + 0.5f;
+            for (const FIntPoint& Offset : Row.HorizontalOffsets)
+            {
+                const float Density = SampleDensity(
+                    CandidateFeetPoint.X + static_cast<float>(Offset.X),
+                    CandidateFeetPoint.Y + static_cast<float>(Offset.Y),
+                    SampleZ);
+                if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                {
+                    return false;
+                }
+            }
+        }
+
+        float InnerTop = 0.0f;
+        float InnerBottom = 0.0f;
+        if (!VF_GetPlayerFitInteriorBounds(
+                Settings, StrateTopZ, StrateBottomZ, BoundarySealThickness,
+                InnerTop, InnerBottom))
+        {
+            return false;
+        }
+        const float OutputZ = SupportHeight + 0.5f;
+        const float OccupiedTop = SupportHeight
+            + 2.0f * Settings.PlayerCapsuleHalfHeightVoxels;
+        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
+            || !FMath::IsFinite(OutputZ) || !FMath::IsFinite(OccupiedTop)
+            || OutputZ <= InnerBottom
+            || OccupiedTop >= InnerTop)
+        {
+            return false;
+        }
+
+        OutPoint = FVector(CandidateFeetPoint.X, CandidateFeetPoint.Y, OutputZ);
+        return !OutPoint.ContainsNaN()
+            && FMath::IsFinite(OutPoint.X)
+            && FMath::IsFinite(OutPoint.Y)
+            && FMath::IsFinite(OutPoint.Z);
+    }
+
+    struct FVFRoomLandingSite
+    {
+        FVector Center = FVector::ZeroVector;
+        float RadiusXY = 0.0f;
+        float RadiusZ = 0.0f;
+        uint32 Hash = 0;
+        bool bOrigin = false;
+    };
+
+    float VF_RoomFloorZ(
+        const FVFRoomLandingSite& Site,
+        const FStrateGenerationParams& Params)
+    {
+        if (Params.RoomFloorCutMin >= 1.0f && Params.RoomFloorCutMax >= 1.0f)
+        {
+            return Site.Center.Z - Site.RadiusZ;
+        }
+        const float Roll = VoxelHash::ToFloat01(VoxelHash::Mix(Site.Hash ^ 0xF100F2u));
+        const float FloorCut = FMath::Lerp(
+            FMath::Min(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
+            FMath::Max(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
+            Roll);
+        return Site.Center.Z - Site.RadiusZ * FloorCut;
+    }
+
+    float VF_EvaluateRoomLandingDensity(
+        const FVFRoomLandingSite& Site,
+        const FStrateGenerationParams& Params,
+        uint32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float WorldX,
+        float WorldY,
+        float WorldZ)
+    {
+        float EffectiveZ = WorldZ;
+        if (Params.VerticalScale > 0.0f && Params.VerticalScale != 1.0f)
+        {
+            EffectiveZ = WorldZ / Params.VerticalScale;
+        }
+
+        FVector Position(WorldX, WorldY, EffectiveZ);
+        if (Params.CaveWarpStrength > 0.0f)
+        {
+            const float Frequency = Params.CaveWarpFrequency;
+            const float Strength = Params.CaveWarpStrength;
+            Position.X += VoxelNoise::Perlin3D(
+                WorldX * Frequency + VoxelHash::SeedOffset(Seed, 0.37f),
+                WorldY * Frequency + 1.3f,
+                EffectiveZ * Frequency + 5.7f)
+                * VOXEL_NOISE_SCALE * Strength;
+            Position.Y += VoxelNoise::Perlin3D(
+                WorldX * Frequency + 7.1f,
+                WorldY * Frequency + VoxelHash::SeedOffset(Seed, 0.59f),
+                EffectiveZ * Frequency + 2.3f)
+                * VOXEL_NOISE_SCALE * Strength;
+            Position.Z += VoxelNoise::Perlin3D(
+                WorldX * Frequency + 11.3f,
+                WorldY * Frequency + 9.7f,
+                EffectiveZ * Frequency + VoxelHash::SeedOffset(Seed, 0.41f))
+                * VOXEL_NOISE_SCALE * Strength;
+        }
+
+        const uint32 ShapeHash = VoxelHash::Mix(Site.Hash ^ 0xDEADBEEFu);
+        const float ShapeRoll = Site.bOrigin ? 0.0f : VoxelHash::ToFloat01(ShapeHash);
+        const float BoxThreshold = 1.0f - Params.RoomShapeVariety * 0.5f;
+        const float CapsuleThreshold = 1.0f - Params.RoomShapeVariety * 0.2f;
+        float RoomSDF = 0.0f;
+        if (ShapeRoll >= BoxThreshold && ShapeRoll < CapsuleThreshold)
+        {
+            RoomSDF = VoxelSDF::RoundedBox(
+                Position,
+                Site.Center,
+                FVector(Site.RadiusXY * 0.8f, Site.RadiusXY * 0.8f, Site.RadiusZ * 0.8f),
+                Site.RadiusXY * 0.25f);
+        }
+        else if (ShapeRoll >= CapsuleThreshold)
+        {
+            const float DirectionAngle = VoxelHash::ToFloat01(
+                VoxelHash::Mix(Site.Hash ^ 0xCAFEBABEu)) * 2.0f * PI;
+            const float StretchDistance = Site.RadiusXY * 0.7f;
+            const FVector Direction(FMath::Cos(DirectionAngle), FMath::Sin(DirectionAngle), 0.0f);
+            RoomSDF = VoxelSDF::Capsule(
+                Position,
+                Site.Center + Direction * StretchDistance,
+                Site.Center - Direction * StretchDistance,
+                FMath::Min(Site.RadiusXY * 0.6f, Site.RadiusZ));
+        }
+        else
+        {
+            RoomSDF = VoxelSDF::Ellipsoid(
+                Position, Site.Center,
+                FVector(Site.RadiusXY, Site.RadiusXY, Site.RadiusZ));
+        }
+
+        const float FloorCut = FMath::Lerp(
+            FMath::Min(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
+            FMath::Max(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
+            VoxelHash::ToFloat01(VoxelHash::Mix(Site.Hash ^ 0xF100F2u)));
+        if (FloorCut < 1.0f)
+        {
+            float FloorZ = Site.Center.Z - Site.RadiusZ * FloorCut;
+            if (Params.FloorReliefStrength > 0.0f)
+            {
+                const float Frequency = Params.FloorReliefFrequency;
+                const float FloorSeed = static_cast<float>(
+                    VoxelHash::Mix(Site.Hash ^ 0xF100F1u)) * 0.00001f;
+                float Noise = FMath::PerlinNoise2D(FVector2D(
+                    Position.X * Frequency + FloorSeed,
+                    Position.Y * Frequency + FloorSeed * 1.7f)) * 0.65f;
+                Noise += FMath::PerlinNoise2D(FVector2D(
+                    Position.X * Frequency * 2.3f + FloorSeed * 3.1f,
+                    Position.Y * Frequency * 2.3f + FloorSeed * 5.3f)) * 0.35f;
+                FloorZ += Noise * VOXEL_NOISE_SCALE * Params.FloorReliefStrength;
+            }
+            RoomSDF = VoxelSDF::SmoothMax(
+                RoomSDF, FloorZ - Position.Z, Params.SDFBlendRadius * 0.35f);
+        }
+
+        float InternalDensity = RoomSDF < 0.0f ? -1.0f : 1.0f;
+        VF_ApplyBoundarySeal(
+            InternalDensity, WorldZ, StrateTopZ, StrateBottomZ,
+            Params.BoundarySealThickness, 1.0f);
+        // Query-facing density uses the same MC polarity as the measurement: positive is air.
+        return -InternalDensity;
+    }
+
+    float VF_EvaluateSlabLandingDensity(
+        const FSlabGenerationParams& Params,
+        uint32 Seed,
+        float WorldX,
+        float WorldY,
+        float WorldZ)
+    {
+        const float StrateHeight = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
+        if (!(StrateHeight > 0.0f)) return -1.0f;
+
+        const uint32 SeedU = Seed;
+        const float FloorZ = Params.StrateBottomWorldZ
+            + StrateHeight * Params.FloorRelativeHeight;
+        float FloorNoise = 0.0f;
+        if (Params.FloorRoughness > 0.0f)
+        {
+            FloorNoise = VoxelNoise::FBM(
+                WorldX * Params.FloorRoughnessFrequency
+                    + VoxelHash::SeedOffset(SeedU, 7.3f),
+                WorldY * Params.FloorRoughnessFrequency
+                    + VoxelHash::SeedOffset(SeedU, 11.1f),
+                0.0f, 3) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
+        }
+        const float FloorSurface = FloorZ + FloorNoise;
+
+        const float CeilZ = Params.StrateBottomWorldZ
+            + StrateHeight * Params.CeilingRelativeHeight;
+        float CeilNoise = 0.0f;
+        if (Params.CeilingRoughness > 0.0f)
+        {
+            const float RawNoise = VoxelNoise::FBM(
+                WorldX * Params.CeilingRoughnessFrequency
+                    + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
+                WorldY * Params.CeilingRoughnessFrequency
+                    + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
+                3000.0f, 3) * VOXEL_NOISE_SCALE;
+            CeilNoise = FMath::Abs(RawNoise) * Params.CeilingRoughness;
+        }
+        const float CeilSurface = FMath::Max(
+            CeilZ - CeilNoise, FloorSurface + 2.0f);
+        float InternalDensity = -FMath::Min(
+            WorldZ - FloorSurface, CeilSurface - WorldZ);
+
+        if (Params.ColumnDensity > 0.0f && Params.ColumnSpacing > 0.0f)
+        {
+            float ColumnSDF = FLT_MAX;
+            const float Spacing = Params.ColumnSpacing;
+            const int32 CellX = FMath::FloorToInt(WorldX / Spacing);
+            const int32 CellY = FMath::FloorToInt(WorldY / Spacing);
+            for (int32 DY = -1; DY <= 1; ++DY)
+            {
+                for (int32 DX = -1; DX <= 1; ++DX)
+                {
+                    const int32 ColumnX = CellX + DX;
+                    const int32 ColumnY = CellY + DY;
+                    const uint32 H = VoxelHash::Cell(
+                        ColumnX, ColumnY, SeedU ^ 0xC01C01u);
+                    if (VoxelHash::ToFloat01(H) > Params.ColumnDensity) continue;
+                    const float JX = VoxelHash::ToFloat01(
+                        VoxelHash::Mix(H ^ 0x12345678u));
+                    const float JY = VoxelHash::ToFloat01(
+                        VoxelHash::Mix(H ^ 0x9ABCDEF0u));
+                    const float CentreX = (ColumnX + 0.15f + JX * 0.7f) * Spacing;
+                    const float CentreY = (ColumnY + 0.15f + JY * 0.7f) * Spacing;
+                    const float Radius = FMath::Lerp(
+                        Params.ColumnMinRadius, Params.ColumnMaxRadius,
+                        VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+                    ColumnSDF = FMath::Min(
+                        ColumnSDF,
+                        FMath::Sqrt(FMath::Square(WorldX - CentreX)
+                            + FMath::Square(WorldY - CentreY)) - Radius);
+                }
+            }
+            if (ColumnSDF < 2.0f && ColumnSDF < FLT_MAX)
+            {
+                float Fill = FMath::Clamp(
+                    (2.0f - ColumnSDF) / 4.0f, 0.0f, 1.0f);
+                InternalDensity += SmoothStep01(Fill)
+                    * Params.BaseDensity * 1.5f;
+            }
+        }
+
+        VF_ApplyBoundarySeal(
+            InternalDensity, WorldZ, Params.StrateTopWorldZ,
+            Params.StrateBottomWorldZ, Params.BoundarySealThickness,
+            Params.BaseDensity);
+        return -InternalDensity;
+    }
+
+    float VF_EvaluateMazeLandingDensity(
+        const FMazeGenerationParams& Params,
+        uint32 Seed,
+        float WorldX,
+        float WorldY,
+        float WorldZ)
+    {
+        const float CellSize = FMath::Max(Params.CellSize, 1.0f);
+        const FVector Position(WorldX, WorldY, WorldZ);
+        const uint32 SeedU = Seed ^ 0x4D617A65u;
+        const int32 CellX = FMath::FloorToInt(WorldX / CellSize);
+        const int32 CellY = FMath::FloorToInt(WorldY / CellSize);
+        const int32 CellZ = FMath::FloorToInt(WorldZ / CellSize);
+        auto NodeCenter = [CellSize](int32 X, int32 Y, int32 Z)
+        {
+            return FVector(
+                (X + 0.5f) * CellSize,
+                (Y + 0.5f) * CellSize,
+                (Z + 0.5f) * CellSize);
+        };
+        auto EdgeOpen = [SeedU](int32 X, int32 Y, int32 Z,
+                                uint32 AxisSalt, float Threshold)
+        {
+            uint32 H = VoxelHash::Cell(X, Y, SeedU ^ AxisSalt);
+            H ^= VoxelHash::Mix((uint32)(Z * 73856093) ^ AxisSalt);
+            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
+        };
+
+        const float Radius = FMath::Max(Params.CorridorRadius, 0.5f);
+        float MazeSDF = FLT_MAX;
+        for (int32 DZ = -1; DZ <= 0; ++DZ)
+        {
+            for (int32 DY = -1; DY <= 0; ++DY)
+            {
+                for (int32 DX = -1; DX <= 0; ++DX)
+                {
+                    const int32 X = CellX + DX;
+                    const int32 Y = CellY + DY;
+                    const int32 Z = CellZ + DZ;
+                    const FVector A = NodeCenter(X, Y, Z);
+                    if (EdgeOpen(X, Y, Z, 0xA1u, Params.BranchProbability))
+                    {
+                        MazeSDF = FMath::Min(
+                            MazeSDF,
+                            VoxelSDF::Capsule(
+                                Position, A, NodeCenter(X + 1, Y, Z), Radius));
+                    }
+                    if (EdgeOpen(X, Y, Z, 0xB2u, Params.BranchProbability))
+                    {
+                        MazeSDF = FMath::Min(
+                            MazeSDF,
+                            VoxelSDF::Capsule(
+                                Position, A, NodeCenter(X, Y + 1, Z), Radius));
+                    }
+                    if (EdgeOpen(X, Y, Z, 0xC3u, Params.Verticality))
+                    {
+                        MazeSDF = FMath::Min(
+                            MazeSDF,
+                            VoxelSDF::Capsule(
+                                Position, A, NodeCenter(X, Y, Z + 1), Radius));
+                    }
+                }
+            }
+        }
+
+        if (Params.SurfaceRoughness > 0.0f
+            && MazeSDF < Radius + Params.SurfaceRoughness + 2.0f)
+        {
+            MazeSDF += VoxelNoise::FBM(
+                WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f, 3)
+                * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
+        }
+
+        float InternalDensity = Params.BaseDensity;
+        if (MazeSDF < 2.0f)
+        {
+            float Carve = FMath::Clamp(
+                (2.0f - MazeSDF) / 4.0f, 0.0f, 1.0f);
+            InternalDensity -= SmoothStep01(Carve)
+                * Params.BaseDensity * 2.0f;
+        }
+        VF_ApplyBoundarySeal(
+            InternalDensity, WorldZ, Params.StrateTopWorldZ,
+            Params.StrateBottomWorldZ, Params.BoundarySealThickness,
+            Params.BaseDensity);
+        return -InternalDensity;
+    }
+
+    float VF_EvaluateShaftLandingDensity(
+        const FVerticalShaftParams& Params,
+        uint32 Seed,
+        float WorldX,
+        float WorldY,
+        float WorldZ)
+    {
+        const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
+        const int32 BaseCellX = FMath::FloorToInt(WorldX / Spacing);
+        const int32 BaseCellY = FMath::FloorToInt(WorldY / Spacing);
+        const uint32 SeedU = Seed ^ 0x53686674u;
+        float CaveSDF = FLT_MAX;
+        FVector NearestCentre = FVector::ZeroVector;
+        float NearestDistanceSq = FLT_MAX;
+        float NearestRadius = 0.0f;
+        for (int32 DY = -1; DY <= 1; ++DY)
+        {
+            for (int32 DX = -1; DX <= 1; ++DX)
+            {
+                const int32 CellX = BaseCellX + DX;
+                const int32 CellY = BaseCellY + DY;
+                const uint32 H = VoxelHash::Cell(CellX, CellY, SeedU);
+                if (VoxelHash::ToFloat01(H) > Params.ShaftDensity) continue;
+                const float JX = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(H ^ 0x12345678u));
+                const float JY = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(H ^ 0x9ABCDEF0u));
+                const float CentreX = (CellX + 0.15f + JX * 0.7f) * Spacing;
+                const float CentreY = (CellY + 0.15f + JY * 0.7f) * Spacing;
+                const float Radius = FMath::Lerp(
+                    Params.ShaftMinRadius, Params.ShaftMaxRadius,
+                    VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
+                const float DistanceSq = FMath::Square(WorldX - CentreX)
+                    + FMath::Square(WorldY - CentreY);
+                if (DistanceSq < NearestDistanceSq)
+                {
+                    NearestDistanceSq = DistanceSq;
+                    NearestCentre = FVector(CentreX, CentreY, 0.0f);
+                    NearestRadius = Radius;
+                }
+                CaveSDF = FMath::Min(
+                    CaveSDF,
+                    FMath::Sqrt(DistanceSq) - Radius);
+            }
+        }
+
+        float InternalDensity = Params.BaseDensity;
+        if (Params.SurfaceRoughness > 0.0f
+            && CaveSDF < Params.SurfaceRoughness + 4.0f)
+        {
+            CaveSDF += VoxelNoise::FBM(
+                WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f, 3)
+                * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
+        }
+        if (CaveSDF < 2.0f)
+        {
+            float Carve = FMath::Clamp(
+                (2.0f - CaveSDF) / 4.0f, 0.0f, 1.0f);
+            InternalDensity -= SmoothStep01(Carve)
+                * Params.BaseDensity * 2.0f;
+        }
+
+        if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f
+            && CaveSDF < 0.0f && NearestDistanceSq < FLT_MAX)
+        {
+            const float Phase = FMath::Frac(
+                (WorldZ - Params.StrateBottomWorldZ) / Params.LedgeSpacing);
+            const float BandT = FMath::Min(Phase, 1.0f - Phase)
+                * Params.LedgeSpacing;
+            if (BandT < Params.LedgeDepth
+                && (WorldX - NearestCentre.X) + (WorldY - NearestCentre.Y) > 1.0e-3f)
+            {
+                const float Shelf = 1.0f - SmoothStep01(
+                    BandT / Params.LedgeDepth);
+                InternalDensity = FMath::Max(
+                    InternalDensity, Shelf * Params.BaseDensity);
+            }
+        }
+        VF_ApplyBoundarySeal(
+            InternalDensity, WorldZ, Params.StrateTopWorldZ,
+            Params.StrateBottomWorldZ, Params.BoundarySealThickness,
+            Params.BaseDensity);
+        return -InternalDensity;
+    }
+
+    // Find the nearest hash room's feature core without constructing a cache. The search is
     // deliberately bounded: an empty neighbourhood is an honest "no answer", not a guessed point.
-    // Rooms are dense enough that the requested XY remains the landing XY; only Z is selected.
+    // The returned XY is the selected room centre; only a room core is a trustworthy sparse target.
     // Cherche le centre vertical de la salle hachée la plus proche sans construire de cache. La
     // recherche est bornée : un voisinage vide signifie "pas de réponse", jamais un point inventé.
     bool VF_FindNearestHashRoomLandingPoint(
@@ -161,6 +930,9 @@ namespace
         float BestZ = 0.0f;
         float BestRoomX = 0.0f;
         float BestRoomY = 0.0f;
+        float BestRadiusXY = 0.0f;
+        float BestRadiusZ = 0.0f;
+        uint32 BestHash = 0u;
         int32 BestCellX = 0;
         int32 BestCellY = 0;
         bool bFound = false;
@@ -191,6 +963,15 @@ namespace
             BestZ = RoomZ;
             BestRoomX = RoomX;
             BestRoomY = RoomY;
+            BestRadiusXY = RadiusEnvelope;
+            const float SizeFactor = VoxelHash::ToFloat01(
+                VoxelHash::Mix(CellHash ^ 0xFEDCBA98u));
+            BestRadiusXY = FMath::Lerp(
+                FMath::Min(Params.MinRoomRadius, Params.MaxRoomRadius),
+                FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius),
+                SizeFactor);
+            BestRadiusZ = BestRadiusXY * Params.RoomHeightRatio;
+            BestHash = CellHash;
             BestCellX = CellX;
             BestCellY = CellY;
             bFound = true;
@@ -279,9 +1060,33 @@ namespace
             return false;
         }
 
-        OutPoint = FVector(BestRoomX, BestRoomY, BestZ);
-        return OutPoint.ContainsNaN() == false && FMath::IsFinite(OutPoint.X)
-            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+        const FVFRoomLandingSite Site{
+            FVector(BestRoomX, BestRoomY, BestZ),
+            BestRadiusXY,
+            BestRadiusZ,
+            BestHash,
+            false };
+        const float FloorZ = VF_RoomFloorZ(Site, Params);
+        FVoxelStrateMeasureSettings FitSettings;
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const FVector CandidateFeet(
+            Site.Center.X, Site.Center.Y, FloorZ + MaxStepHeightVoxels + 0.5f);
+        const auto SampleRoom = [&](float X, float Y, float Z)
+        {
+            return VF_EvaluateRoomLandingDensity(
+                Site, Params, static_cast<uint32>(Seed),
+                StrateTopZ, StrateBottomZ, X, Y, Z);
+        };
+        return VF_ValidatePlayerFitPose(
+            FitSettings,
+            CandidateFeet,
+            StrateTopZ,
+            StrateBottomZ,
+            Params.BoundarySealThickness,
+            SampleRoom,
+            OutPoint);
     }
 
     // The slab source is an XY height band. Evaluate the same two pure height fields as
@@ -397,11 +1202,31 @@ namespace
             }
         }
 
-        // Slab void is a height band at every usable XY. Keep the requested XY exactly as before;
-        // its caller supplies zero lateral snap so this dense source cannot wander from the spine.
-        OutPoint = FVector(WorldX, WorldY, (OpenBottom + OpenTop) * 0.5f);
-        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
-            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+        // The old query returned the centre of the void band.  That is open air, but it is not a
+        // player pose: the body must stand on the floor.  Re-run the pure slab source through the
+        // same support/capsule stencil used by the measurement and return the resolved feet row.
+        FSlabGenerationParams SourceParams = Params;
+        SourceParams.StrateTopWorldZ = StrateTopZ;
+        SourceParams.StrateBottomWorldZ = StrateBottomZ;
+        FVoxelStrateMeasureSettings FitSettings;
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const FVector CandidateFeet(
+            WorldX, WorldY, OpenBottom + MaxStepHeightVoxels + 0.5f);
+        const auto SampleSlab = [&](float X, float Y, float Z)
+        {
+            return VF_EvaluateSlabLandingDensity(
+                SourceParams, static_cast<uint32>(Seed), X, Y, Z);
+        };
+        return VF_ValidatePlayerFitPose(
+            FitSettings,
+            CandidateFeet,
+            StrateTopZ,
+            StrateBottomZ,
+            SourceParams.BoundarySealThickness,
+            SampleSlab,
+            OutPoint);
     }
 
     // Maze corridors are thin 3D lattice edges. Only a horizontal edge is a useful landing
@@ -565,9 +1390,61 @@ namespace
             return false;
         }
 
-        OutPoint = FVector(BestX, BestY, BestZ);
-        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
-            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+        FMazeGenerationParams SourceParams = Params;
+        SourceParams.StrateTopWorldZ = StrateTopZ;
+        SourceParams.StrateBottomWorldZ = StrateBottomZ;
+        FVoxelStrateMeasureSettings FitSettings;
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const auto SampleMaze = [&](float X, float Y, float Z)
+        {
+            return VF_EvaluateMazeLandingDensity(
+                SourceParams, static_cast<uint32>(Seed), X, Y, Z);
+        };
+
+        // The nearest point on a lattice edge can be its spherical node cap, where the support
+        // patch is narrower than the same edge's middle. Try a few deterministic points along
+        // the selected horizontal edge, then a small vertical anchor band. Every trial remains
+        // inside the original lateral budget and is checked by the exact player stencil.
+        const float NodeX = (BestCellX + 0.5f) * CellSize;
+        const float NodeY = (BestCellY + 0.5f) * CellSize;
+        constexpr int32 EdgeSamples = 9;
+        const int32 VerticalOffsets[] = { 0, 1, -1, 2, -2, 3, -3, 4, 5, 6 };
+        for (int32 EdgeSample = 0; EdgeSample < EdgeSamples; ++EdgeSample)
+        {
+            const float T = static_cast<float>(EdgeSample) / (EdgeSamples - 1);
+            const float CandidateX = BestAxis == 0 ? NodeX + T * CellSize : NodeX;
+            const float CandidateY = BestAxis == 1 ? NodeY + T * CellSize : NodeY;
+            const float LateralDX = CandidateX - WorldX;
+            const float LateralDY = CandidateY - WorldY;
+            if (LateralDX * LateralDX + LateralDY * LateralDY > MaxSnapSq)
+            {
+                continue;
+            }
+
+            for (const int32 VerticalOffset : VerticalOffsets)
+            {
+                const FVector CandidateFeet(
+                    CandidateX,
+                    CandidateY,
+                    BestZ - Radius + RoughnessBound
+                        + MaxStepHeightVoxels + 0.5f
+                        + static_cast<float>(VerticalOffset));
+                if (VF_ValidatePlayerFitPose(
+                        FitSettings,
+                        CandidateFeet,
+                        StrateTopZ,
+                        StrateBottomZ,
+                        SourceParams.BoundarySealThickness,
+                        SampleMaze,
+                        OutPoint))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // VerticalShafts has a guaranteed floor only when its lower boundary seal exists. Select a
@@ -617,58 +1494,8 @@ namespace
             return false;
         }
 
-        const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
-        const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
-        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
-            || InnerBottom >= InnerTop)
-        {
-            return false;
-        }
-
         const float RoughnessBound = Params.SurfaceRoughness * VOXEL_NOISE_SCALE;
         const float ShaftInteriorMargin = RoughnessBound + 0.25f;
-        const float FloorClearance = FMath::Max(1.0f, RoughnessBound + 1.0f);
-
-        // Pick the first interval above the bottom seal that is not occupied by a periodic ledge.
-        // Leaving a full roughness-sized margin makes the result a source-level air claim rather
-        // than a point on the smoothed ledge edge.
-        float LandingFromBottom = FMath::Max(
-            Params.BoundarySealThickness, Params.LedgeDepth) + FloorClearance;
-        // The measurement API derives its default interior margin as two seal thicknesses.
-        // Keep a source-level landing strictly inside that same measured window; otherwise a
-        // lower-roughness default can produce a perfectly valid shaft landing just below the
-        // diagnostic grid's lower edge and turn a real mouth query into OUT_OF_WINDOW.
-        LandingFromBottom = FMath::Max(
-            LandingFromBottom,
-            2.0f * Params.BoundarySealThickness + 0.01f);
-        if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
-        {
-            const float SafeBand = Params.LedgeDepth + FloorClearance;
-            if (SafeBand * 2.0f >= Params.LedgeSpacing)
-            {
-                return false;
-            }
-
-            const float Period = FMath::FloorToFloat(LandingFromBottom / Params.LedgeSpacing);
-            const float PeriodStart = Period * Params.LedgeSpacing;
-            const float InPeriod = LandingFromBottom - PeriodStart;
-            if (InPeriod < SafeBand)
-            {
-                LandingFromBottom = PeriodStart + SafeBand;
-            }
-            else if (InPeriod > Params.LedgeSpacing - SafeBand)
-            {
-                LandingFromBottom = (Period + 1.0f) * Params.LedgeSpacing + SafeBand;
-            }
-        }
-
-        const float LandingZ = StrateBottomZ + LandingFromBottom;
-        if (!FMath::IsFinite(LandingZ)
-            || LandingZ <= InnerBottom || LandingZ >= InnerTop)
-        {
-            return false;
-        }
-
         const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
         const int32 BaseCellX = FMath::FloorToInt(WorldX / Spacing);
         const int32 BaseCellY = FMath::FloorToInt(WorldY / Spacing);
@@ -681,6 +1508,7 @@ namespace
         float BestDistSq = FLT_MAX;
         float BestAxisX = 0.0f;
         float BestAxisY = 0.0f;
+        float BestSafeRadius = 0.0f;
         bool bFound = false;
         int32 BestCellX = INT32_MAX;
         int32 BestCellY = INT32_MAX;
@@ -720,10 +1548,13 @@ namespace
 
                 // A VerticalShafts landing must identify the topology, not merely an open point
                 // inside its radius. The safe-radius distance still chooses the nearest confident
-                // site under the existing snap budget, but the returned XY is the selected shaft's
-                // exact axis so it is on the deterministic drainage tree by construction.
+                // site under the existing snap budget. The candidate offsets below stay inside
+                // this same feature core while allowing the generated ledge to provide a real
+                // walkable support patch; the exact shaft axis is an open cylinder and has no
+                // support surface by itself.
                 BestAxisX = ShaftX;
                 BestAxisY = ShaftY;
+                BestSafeRadius = SafeRadius;
                 BestDistSq = DistSq;
                 BestCellX = CellX;
                 BestCellY = CellY;
@@ -737,9 +1568,91 @@ namespace
             return false;
         }
 
-        OutPoint = FVector(BestAxisX, BestAxisY, LandingZ);
-        return !OutPoint.ContainsNaN() && FMath::IsFinite(OutPoint.X)
-            && FMath::IsFinite(OutPoint.Y) && FMath::IsFinite(OutPoint.Z);
+        FVerticalShaftParams SourceParams = Params;
+        SourceParams.StrateTopWorldZ = StrateTopZ;
+        SourceParams.StrateBottomWorldZ = StrateBottomZ;
+
+        FVoxelStrateMeasureSettings FitSettings;
+        float InnerTop = 0.0f;
+        float InnerBottom = 0.0f;
+        if (!VF_GetPlayerFitInteriorBounds(
+                FitSettings, StrateTopZ, StrateBottomZ,
+                Params.BoundarySealThickness, InnerTop, InnerBottom))
+        {
+            return false;
+        }
+        const auto SampleShaft = [&](float X, float Y, float Z)
+        {
+            return VF_EvaluateShaftLandingDensity(
+                SourceParams, static_cast<uint32>(Seed), X, Y, Z);
+        };
+
+        // The query's default interior margin is the same 2x-seal margin used by the exact
+        // player-fit measurement. This prevents a lower boundary seal from being reported as a
+        // standing floor that the measured window intentionally excludes.
+        const float FirstCandidateZ = InnerBottom + 0.5f;
+        const float LastCandidateZ = InnerTop
+            - 2.0f * FitSettings.PlayerCapsuleHalfHeightVoxels - 0.5f;
+        if (!FMath::IsFinite(FirstCandidateZ) || !FMath::IsFinite(LastCandidateZ)
+            || LastCandidateZ < FirstCandidateZ)
+        {
+            return false;
+        }
+
+        const int32 NumCandidateSteps = FMath::Min(
+            4096,
+            FMath::Max(0, FMath::CeilToInt(LastCandidateZ - FirstCandidateZ)));
+
+        const FVector2D CandidateOffsets[] = {
+            FVector2D(0.0f, 0.0f),
+            FVector2D(0.20f, 0.20f),
+            FVector2D(0.35f, 0.35f),
+            FVector2D(0.50f, 0.15f),
+            FVector2D(0.15f, 0.50f),
+            FVector2D(0.55f, 0.35f),
+            FVector2D(0.35f, 0.55f),
+        };
+        for (const FVector2D& NormalizedOffset : CandidateOffsets)
+        {
+            const float CandidateX = BestAxisX
+                + NormalizedOffset.X * BestSafeRadius;
+            const float CandidateY = BestAxisY
+                + NormalizedOffset.Y * BestSafeRadius;
+            const float OffsetSq = FMath::Square(CandidateX - BestAxisX)
+                + FMath::Square(CandidateY - BestAxisY);
+            const float LateralDX = CandidateX - WorldX;
+            const float LateralDY = CandidateY - WorldY;
+            const float LateralDistanceSq = FMath::Square(LateralDX)
+                + FMath::Square(LateralDY);
+            if (!FMath::IsFinite(CandidateX) || !FMath::IsFinite(CandidateY)
+                || !FMath::IsFinite(LateralDistanceSq)
+                || OffsetSq > FMath::Square(BestSafeRadius)
+                || LateralDistanceSq > MaxSnapSq + KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            for (int32 CandidateStep = 0;
+                 CandidateStep <= NumCandidateSteps;
+                 ++CandidateStep)
+            {
+                const FVector CandidateFeet(
+                    CandidateX, CandidateY,
+                    FirstCandidateZ + static_cast<float>(CandidateStep));
+                if (VF_ValidatePlayerFitPose(
+                        FitSettings,
+                        CandidateFeet,
+                        StrateTopZ,
+                        StrateBottomZ,
+                        Params.BoundarySealThickness,
+                        SampleShaft,
+                        OutPoint))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     struct FVFIslandSite
@@ -955,6 +1868,7 @@ namespace
         float BestDistSq = FLT_MAX;
         FVector BestPoint = FVector::ZeroVector;
         int32 BestIslandIndex = INDEX_NONE;
+        FVoxelStrateMeasureSettings FitSettings;
 
         auto FindLandingZ = [&](float CandidateX, float CandidateY, float& OutLandingZ) -> bool
         {
@@ -1016,6 +1930,28 @@ namespace
             return false;
         };
 
+        const auto SampleIsland = [&](float X, float Y, float Z)
+        {
+            // Island density uses the opposite convention internally (positive = solid).
+            return -VF_EvaluateIslandInteriorDensity(
+                Params, SeedU, Islands.GetData(), Islands.Num(), X, Y, Z);
+        };
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const FIntPoint CoreOffsets[] = {
+            FIntPoint(0, 0),
+            FIntPoint(1, 0), FIntPoint(-1, 0),
+            FIntPoint(0, 1), FIntPoint(0, -1),
+            FIntPoint(2, 0), FIntPoint(-2, 0),
+            FIntPoint(0, 2), FIntPoint(0, -2),
+            FIntPoint(1, 1), FIntPoint(1, -1),
+            FIntPoint(-1, 1), FIntPoint(-1, -1),
+            FIntPoint(3, 0), FIntPoint(-3, 0),
+            FIntPoint(0, 3), FIntPoint(0, -3)
+        };
+        const float FeetOffsets[] = { 0.0f, -1.0f, 1.0f, -2.0f, 2.0f, 3.0f };
+
         for (int32 IslandIndex = 0; IslandIndex < Islands.Num(); ++IslandIndex)
         {
             const FVFIslandSite& Island = Islands[IslandIndex];
@@ -1034,23 +1970,77 @@ namespace
 
             float CandidateX = WorldX;
             float CandidateY = WorldY;
-            if (Distance > SafeRadius && Distance > KINDA_SMALL_NUMBER)
+            // Prefer the feature core whenever it fits the lateral budget. A point near the
+            // nominal blob rim can be open air yet fail the support patch; the deterministic
+            // centre is the island's large, stable landing feature.
+            if (Distance <= MaxLateralSnap)
+            {
+                CandidateX = Island.X;
+                CandidateY = Island.Y;
+            }
+            else if (Distance > SafeRadius && Distance > KINDA_SMALL_NUMBER)
             {
                 const float Scale = SafeRadius / Distance;
                 CandidateX = Island.X + DX * Scale;
                 CandidateY = Island.Y + DY * Scale;
             }
 
-            float CandidateZ = 0.0f;
-            if (!FindLandingZ(CandidateX, CandidateY, CandidateZ)) continue;
+            const float CandidateDX = CandidateX - WorldX;
+            const float CandidateDY = CandidateY - WorldY;
+            const float CandidateDistSq =
+                CandidateDX * CandidateDX + CandidateDY * CandidateDY;
+            if (CandidateDistSq > MaxSnapSq)
+            {
+                continue;
+            }
 
-            const bool bCloser = DistSq < BestDistSq;
-            const bool bTie = DistSq == BestDistSq && IslandIndex < BestIslandIndex;
-            if (!bCloser && !bTie) continue;
+            // A top surface is only a landing site if the complete player stencil can occupy the
+            // air above it and the support patch is walkable.  The core offsets are a bounded,
+            // deterministic local search for a broad patch; they are not a component query.
+            for (const FIntPoint& CoreOffset : CoreOffsets)
+            {
+                const float TrialX = CandidateX + static_cast<float>(CoreOffset.X);
+                const float TrialY = CandidateY + static_cast<float>(CoreOffset.Y);
+                const float TrialDX = TrialX - Island.X;
+                const float TrialDY = TrialY - Island.Y;
+                if (TrialDX * TrialDX + TrialDY * TrialDY
+                        > FMath::Square(SafeRadius) + KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+                const float LateralDX = TrialX - WorldX;
+                const float LateralDY = TrialY - WorldY;
+                const float TrialDistSq = LateralDX * LateralDX + LateralDY * LateralDY;
+                if (TrialDistSq > MaxSnapSq) continue;
 
-            BestDistSq = DistSq;
-            BestPoint = FVector(CandidateX, CandidateY, CandidateZ);
-            BestIslandIndex = IslandIndex;
+                float CandidateZ = 0.0f;
+                if (!FindLandingZ(TrialX, TrialY, CandidateZ)) continue;
+                for (const float FeetOffset : FeetOffsets)
+                {
+                    FVector FitPoint = FVector::ZeroVector;
+                    if (!VF_ValidatePlayerFitPose(
+                            FitSettings,
+                            FVector(TrialX, TrialY,
+                                CandidateZ + FeetOffset + MaxStepHeightVoxels),
+                            StrateTopZ,
+                            StrateBottomZ,
+                            Params.BoundarySealThickness,
+                            SampleIsland,
+                            FitPoint))
+                    {
+                        continue;
+                    }
+
+                    const bool bCloser = TrialDistSq < BestDistSq;
+                    const bool bTie = TrialDistSq == BestDistSq
+                        && IslandIndex < BestIslandIndex;
+                    if (!bCloser && !bTie) continue;
+
+                    BestDistSq = TrialDistSq;
+                    BestPoint = FitPoint;
+                    BestIslandIndex = IslandIndex;
+                }
+            }
         }
 
         if (BestIslandIndex == INDEX_NONE || BestDistSq > MaxSnapSq || BestPoint.ContainsNaN())

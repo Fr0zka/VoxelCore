@@ -9,6 +9,7 @@
 #include "VoxelForgeTestFixture.h"
 #include "VoxelCaveMorphology.h"
 #include "VoxelStrateMeasure.h"
+#include "VoxelTypes.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FVoxelForgeStrateConnectivityTest,
@@ -327,6 +328,7 @@ namespace
     {
         float X = 0.0f;
         float Y = 0.0f;
+        float Radius = 0.0f;
         int32 CellX = 0;
         int32 CellY = 0;
     };
@@ -350,6 +352,10 @@ namespace
             + VoxelHash::ToFloat01(VoxelHash::Mix(Hash ^ 0x12345678u)) * 0.7f) * Spacing;
         OutShaft.Y = (CellY + 0.15f
             + VoxelHash::ToFloat01(VoxelHash::Mix(Hash ^ 0x9ABCDEF0u)) * 0.7f) * Spacing;
+        OutShaft.Radius = FMath::Lerp(
+            Params.ShaftMinRadius,
+            Params.ShaftMaxRadius,
+            VoxelHash::ToFloat01(VoxelHash::Mix(Hash ^ 0xBEEFu)));
         OutShaft.CellX = CellX;
         OutShaft.CellY = CellY;
         return true;
@@ -788,14 +794,27 @@ namespace
         return Out;
     }
 
-    bool IsVerticalShaftAxis(
+    bool FindVerticalShaftFeatureCore(
         const FVerticalShaftParams& Params,
         int32 Seed,
-        const FVector& Point)
+        const FVector& Point,
+        FVector& OutAxisPoint)
     {
         const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
+        const float InteriorMargin = FMath::Max(Params.SurfaceRoughness, 0.0f)
+            * VOXEL_NOISE_SCALE + 0.25f;
+        if (!FMath::IsFinite(InteriorMargin) || InteriorMargin < 0.0f)
+        {
+            return false;
+        }
+
         const int32 BaseCellX = FMath::FloorToInt(Point.X / Spacing);
         const int32 BaseCellY = FMath::FloorToInt(Point.Y / Spacing);
+        float BestDistanceSq = FLT_MAX;
+        int32 BestCellX = INT32_MAX;
+        int32 BestCellY = INT32_MAX;
+        FAuditShaft BestShaft;
+        bool bFound = false;
         for (int32 DY = -1; DY <= 1; ++DY)
         {
             for (int32 DX = -1; DX <= 1; ++DX)
@@ -806,14 +825,50 @@ namespace
                 {
                     continue;
                 }
-                if (FMath::IsNearlyEqual(Point.X, Shaft.X, 0.001f)
-                    && FMath::IsNearlyEqual(Point.Y, Shaft.Y, 0.001f))
+                const float SafeRadius = Shaft.Radius - InteriorMargin;
+                if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
                 {
-                    return true;
+                    continue;
+                }
+
+                const float DistanceSq = FMath::Square(Point.X - Shaft.X)
+                    + FMath::Square(Point.Y - Shaft.Y);
+                if (DistanceSq > FMath::Square(SafeRadius) + 1.0e-4f)
+                {
+                    continue;
+                }
+
+                const bool bCloser = DistanceSq < BestDistanceSq;
+                const bool bTie = DistanceSq == BestDistanceSq
+                    && (Shaft.CellX < BestCellX
+                        || (Shaft.CellX == BestCellX && Shaft.CellY < BestCellY));
+                if (bCloser || bTie)
+                {
+                    BestDistanceSq = DistanceSq;
+                    BestCellX = Shaft.CellX;
+                    BestCellY = Shaft.CellY;
+                    BestShaft = Shaft;
+                    bFound = true;
                 }
             }
         }
-        return false;
+
+        if (!bFound)
+        {
+            return false;
+        }
+
+        OutAxisPoint = FVector(BestShaft.X, BestShaft.Y, Point.Z);
+        return true;
+    }
+
+    bool IsVerticalShaftFeatureCore(
+        const FVerticalShaftParams& Params,
+        int32 Seed,
+        const FVector& Point)
+    {
+        FVector AxisPoint = FVector::ZeroVector;
+        return FindVerticalShaftFeatureCore(Params, Seed, Point, AxisPoint);
     }
 
     bool FindChainMouths(
@@ -3344,18 +3399,20 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
 
         const FVerticalShaftParams& ShaftParams =
             Layout[VerticalShaftsIndex].Definition->VerticalShaftParams;
-        if (!IsVerticalShaftAxis(
-                ShaftParams, Seed, ResolutionArrivalPoint)
-            || !IsVerticalShaftAxis(ShaftParams, Seed, ResolutionDeparturePoint))
+        const bool bArrivalFeatureCore = IsVerticalShaftFeatureCore(
+            ShaftParams, Seed, ResolutionArrivalPoint);
+        const bool bDepartureFeatureCore = IsVerticalShaftFeatureCore(
+            ShaftParams, Seed, ResolutionDeparturePoint);
+        if (!bArrivalFeatureCore || !bDepartureFeatureCore)
         {
             AddError(FString::Printf(
-                TEXT("HARD FAILURE: fitted-window seed %d has a VerticalShafts mouth not on a "
-                     "shaft axis (arrival axis=%s, departure axis=%s; arrival=(%.3f,%.3f,%.3f); "
+                TEXT("HARD FAILURE: fitted-window seed %d has a VerticalShafts mouth outside "
+                     "the shaft feature core (arrival core=%s, departure core=%s; arrival=(%.3f,%.3f,%.3f); "
                      "departure=(%.3f,%.3f,%.3f); spacing=%.3f; density=%.3f)."),
                 Seed,
-                IsVerticalShaftAxis(ShaftParams, Seed, ResolutionArrivalPoint)
+                bArrivalFeatureCore
                     ? TEXT("yes") : TEXT("no"),
-                IsVerticalShaftAxis(ShaftParams, Seed, ResolutionDeparturePoint)
+                bDepartureFeatureCore
                     ? TEXT("yes") : TEXT("no"),
                 ResolutionArrivalPoint.X,
                 ResolutionArrivalPoint.Y,
@@ -3515,7 +3572,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         "mean-radius shaft volume.\n");
     Summary += TEXT(
         "  seed | fitted verdict | cells | components | small non-largest/total | strict minima/shafts "
-        "| neighbour fallback | path orphans | axis mouths | doubled fitted-margin verdict/cells | "
+        "| neighbour fallback | path orphans | shaft feature-core mouths | doubled fitted-margin verdict/cells | "
         "tree path XY bounds\n");
 
     static constexpr int32 FittedSeedCases[] = {
@@ -3577,8 +3634,12 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         const FVerticalShaftParams RuntimeShaftParams =
             SeedWorld.StrateManager->GetVerticalShaftParamsForChunk(
                 FIntVector(0, 0, ShaftMidChunkZ));
-        const bool bAxisMouths = IsVerticalShaftAxis(ShaftParams, Seed, SeedArrivalPoint)
-            && IsVerticalShaftAxis(ShaftParams, Seed, SeedDeparturePoint);
+        FVector ArrivalShaftAxis = SeedArrivalPoint;
+        FVector DepartureShaftAxis = SeedDeparturePoint;
+        const bool bShaftFeatureMouths = FindVerticalShaftFeatureCore(
+            ShaftParams, Seed, SeedArrivalPoint, ArrivalShaftAxis)
+            && FindVerticalShaftFeatureCore(
+                ShaftParams, Seed, SeedDeparturePoint, DepartureShaftAxis);
         const FVoxelStrateMeasureSettings FittedSettings = MakeFittedSettings(
             2,
             SeedArrivalPoint,
@@ -3649,7 +3710,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             && Diagnostics.Result == EVoxelConnectivityResult::Connected
             && !Diagnostics.bStartSnapped
             && !Diagnostics.bGoalSnapped
-            && bAxisMouths;
+            && bShaftFeatureMouths;
         bool bCountsAsPass = bCountsAsDirectPass;
         FString DoubledSweepText = TEXT("not-run");
         FString TreePathText = TEXT("not-needed");
@@ -3682,14 +3743,14 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             FVector2D PathMax = FVector2D::ZeroVector;
             int32 PathHops = 0;
             const bool bArrivalPath = AuditVerticalShaftPathBounds(
-                ShaftParams, Seed, SeedArrivalPoint, PathMin, PathMax, PathHops);
+                ShaftParams, Seed, ArrivalShaftAxis, PathMin, PathMax, PathHops);
             FVector2D DeparturePathMin = FVector2D::ZeroVector;
             FVector2D DeparturePathMax = FVector2D::ZeroVector;
             int32 DeparturePathHops = 0;
             const bool bDeparturePath = AuditVerticalShaftPathBounds(
                 ShaftParams,
                 Seed,
-                SeedDeparturePoint,
+                DepartureShaftAxis,
                 DeparturePathMin,
                 DeparturePathMax,
                 DeparturePathHops);
@@ -3778,7 +3839,7 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
             Audit.NumShafts,
             Audit.NumNeighbourFallbacks,
             Audit.NumUnreachable,
-            bAxisMouths ? TEXT("YES") : TEXT("NO"),
+            bShaftFeatureMouths ? TEXT("YES") : TEXT("NO"),
                 *DoubledSweepText,
                 *TreePathText);
 
@@ -3786,10 +3847,10 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
         {
             const FVerticalShaftPhysicalAudit ArrivalPhysical =
                 AuditVerticalShaftPathDensity(
-                    *SeedWorld.Generator, RuntimeShaftParams, Seed, SeedArrivalPoint);
+                    *SeedWorld.Generator, RuntimeShaftParams, Seed, ArrivalShaftAxis);
             const FVerticalShaftPhysicalAudit DeparturePhysical =
                 AuditVerticalShaftPathDensity(
-                    *SeedWorld.Generator, RuntimeShaftParams, Seed, SeedDeparturePoint);
+                    *SeedWorld.Generator, RuntimeShaftParams, Seed, DepartureShaftAxis);
             const FVerticalShaftPhysicalAudit& FirstBadPhysical =
                 ArrivalPhysical.NumNonAirSamples > 0 ? ArrivalPhysical : DeparturePhysical;
             Summary += FString::Printf(
@@ -3827,15 +3888,15 @@ bool FVoxelForgeStrateConnectivityRefinementTest::RunTest(const FString& Paramet
                 FirstBadPhysical.FirstBadFraction);
         }
 
-        if (Audit.NumUnreachable != 0 || !Audit.bOrderIndependent || !bAxisMouths)
+        if (Audit.NumUnreachable != 0 || !Audit.bOrderIndependent || !bShaftFeatureMouths)
         {
             AddError(FString::Printf(
                 TEXT("HARD FAILURE: fitted audit seed %d violated the shaft-tree/landing "
-                     "invariant (unreachable=%d, order-independent=%s, axis-mouths=%s)."),
+                     "invariant (unreachable=%d, order-independent=%s, feature-core-mouths=%s)."),
                 Seed,
                 Audit.NumUnreachable,
                 Audit.bOrderIndependent ? TEXT("yes") : TEXT("no"),
-                bAxisMouths ? TEXT("yes") : TEXT("no")));
+                bShaftFeatureMouths ? TEXT("yes") : TEXT("no")));
             bAllChecksPassed = false;
         }
     }

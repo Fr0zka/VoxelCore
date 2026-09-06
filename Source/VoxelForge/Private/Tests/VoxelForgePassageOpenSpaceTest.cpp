@@ -54,10 +54,13 @@ namespace
         case ECaveGeneratorType::VerticalShafts:
             // A 0.6 shaft density does not guarantee an occupied immediate cell. The production
             // query therefore permits a bounded two-cell local search and still returns the
-            // selected site's exact axis.
+            // selected site's deterministic feature core/ledge-side pose.
             return FMath::Max(2.0f * Definition.VerticalShaftParams.ShaftSpacing, 1.0f);
         case ECaveGeneratorType::FloatingIslands:
             return FMath::Max(Definition.FloatingIslandParams.IslandSpacing, 1.0f);
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return FMath::Max(Definition.GenerationParams.RoomSpacing, 1.0f);
         default:
             return 0.0f;
         }
@@ -85,6 +88,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
 
     int32 NumInterStratePassages = 0;
     int32 NumChecked = 0;
+    int32 NumUpperChecked = 0;
+    int32 NumUpperQueryFalse = 0;
     int32 NumQueryFalse = 0;
     int32 NumUnsupported = 0;
     int32 NumSupportedWithoutPoint = 0;
@@ -142,6 +147,74 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                 TEXT("Passage source strate %d has no definition."),
                 Source.StrateIndex));
             continue;
+        }
+
+        // The upper mouth has its own source query too. This is deliberately evaluated from the
+        // upper strate's definition, seed, bounds, and requested XY; it must never inherit the
+        // lower mouth's answer or become an implicit passage chain.
+        const float SourceTopZ = (float)(Source.TopChunkZ + 1) * CHUNK_SIZE;
+        const float SourceBottomZ = (float)Source.BottomChunkZ * CHUNK_SIZE;
+        const int32 SourceQuerySeed = OpenPointSeedFor(
+            *SourceDefinition, Source, WorldSeed);
+        const float SourceMaxLateralSnap = MaxLateralSnapFor(*SourceDefinition);
+        FVector SuggestedUpperPoint = FVector::ZeroVector;
+        const bool bCanAnswerUpper = VF_SuggestLandingPoint(
+            SourceDefinition->GeneratorType,
+            SourceDefinition->GenerationParams,
+            SourceDefinition->SlabParams,
+            SourceDefinition->MazeParams,
+            SourceDefinition->VerticalShaftParams,
+            SourceDefinition->FloatingIslandParams,
+            SourceQuerySeed,
+            SourceTopZ,
+            SourceBottomZ,
+            Passage.RequestedUpperPoint.X,
+            Passage.RequestedUpperPoint.Y,
+            SourceMaxLateralSnap,
+            SuggestedUpperPoint);
+        if (!bCanAnswerUpper)
+        {
+            ++NumUpperQueryFalse;
+            FalseArchetypes.Add(static_cast<uint8>(SourceDefinition->GeneratorType));
+        }
+        else
+        {
+            ++NumUpperChecked;
+            const float UpperSnapDX = Passage.UpperPoint.X
+                - Passage.RequestedUpperPoint.X;
+            const float UpperSnapDY = Passage.UpperPoint.Y
+                - Passage.RequestedUpperPoint.Y;
+            const float UpperSnapDistance = FMath::Sqrt(
+                UpperSnapDX * UpperSnapDX + UpperSnapDY * UpperSnapDY);
+            if (!FMath::IsNearlyEqual(Passage.UpperPoint.X, SuggestedUpperPoint.X, 0.01f)
+                || !FMath::IsNearlyEqual(Passage.UpperPoint.Y, SuggestedUpperPoint.Y, 0.01f)
+                || !FMath::IsNearlyEqual(Passage.UpperPoint.Z, SuggestedUpperPoint.Z, 0.01f))
+            {
+                bAllAnswerableEndpointsMatchQuery = false;
+                AddError(FString::Printf(
+                    TEXT("Passage from strate %d (%s) missed its upper player-fit landing point: endpoint (%.9g, %.9g, %.9g), query (%.9g, %.9g, %.9g)."),
+                    Source.StrateIndex,
+                    *ArchetypeName(SourceDefinition->GeneratorType),
+                    Passage.UpperPoint.X,
+                    Passage.UpperPoint.Y,
+                    Passage.UpperPoint.Z,
+                    SuggestedUpperPoint.X,
+                    SuggestedUpperPoint.Y,
+                    SuggestedUpperPoint.Z));
+            }
+            if (!FMath::IsFinite(UpperSnapDistance)
+                || UpperSnapDistance > SourceMaxLateralSnap + 0.01f)
+            {
+                bAllAnswerableEndpointsMatchQuery = false;
+                AddError(FString::Printf(
+                    TEXT("Passage from strate %d (%s) exceeded its upper lateral snap bound: %.6f > %.6f from requested (%.3f, %.3f)."),
+                    Source.StrateIndex,
+                    *ArchetypeName(SourceDefinition->GeneratorType),
+                    UpperSnapDistance,
+                    SourceMaxLateralSnap,
+                    Passage.RequestedUpperPoint.X,
+                    Passage.RequestedUpperPoint.Y));
+            }
         }
 
         const FStratePassageConfig& PassageConfig = SourceDefinition->PassageConfig;
@@ -377,8 +450,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     }
 
     AddInfo(FString::Printf(
-        TEXT("Passage open-space check: %d inter-strate passages, %d checked, %d footing checks, %d/%d room/slab ring samples air, %d query-false (%d unique archetypes; %d unsupported, %d supported-but-no-point)."),
+        TEXT("Passage player-fit check: %d inter-strate passages, upper %d checked (%d false), lower %d checked (%d footing checks), %d/%d room/slab ring samples air, lower %d query-false (%d unique archetypes; %d unsupported, %d supported-but-no-point)."),
         NumInterStratePassages,
+        NumUpperChecked,
+        NumUpperQueryFalse,
         NumChecked,
         NumFootingChecked,
         NumRingAirSamples,
@@ -397,6 +472,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     if (NumChecked == 0)
     {
         AddError(TEXT("VACUOUS: zero answerable passage mouths were checked; the passage invariant was not exercised."));
+    }
+    if (NumUpperChecked == 0)
+    {
+        AddError(TEXT("VACUOUS: zero answerable upper passage mouths were checked; independent upper-mouth aiming was not exercised."));
     }
     if (NumFootingChecked == 0)
     {
@@ -461,6 +540,7 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
 
     return NumInterStratePassages > 0
         && NumChecked > 0
+        && NumUpperChecked > 0
         && NumFootingChecked > 0
         && bAllNewFootingArchetypesAnswered
         // (fixture coverage of the room/slab archetypes is reported, not asserted — see above)
