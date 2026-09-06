@@ -41,6 +41,48 @@ struct FStrateTerrainOpEntry;
 class UVoxelTerrainOpDefinition;
 enum class ECaveGeneratorType : uint8;
 
+/**
+ * The geometry contract for one end of an inter-strate passage.
+ *
+ * All values are actor-space voxels.  `StandingPoint` is the player-fit anchor: its floor is
+ * `FloorZ = StandingPoint.Z - 0.5`.  The chamber is deliberately separate from the tube endpoint
+ * so a sloped/vertical tube never presents the player with a hole as its first standing position.
+ *
+ * A source query answer selects the landing's XY/Z anchor.  Because that pure query does not
+ * flood-fill the live network, every inter-strate end also gets a deterministic root connector
+ * (`bHasNetworkConnector`).  Its flat floor ramps to the same common interior root level for that
+ * strate, so both mouths enter one walkable hub even when their authored floors are at opposite
+ * sides of the strate.  The hub is an annular walkable network around (0,0), not the pre-existing
+ * vertical air shaft.  `RootSpineRadius` keeps both the hub air and support slab outside that shaft,
+ * so the spine remains open.  If the direct run would be steeper than 44 degrees, the connector
+ * uses a deterministic level dog-leg before its final ramp; the bend is geometry, not a per-voxel
+ * search.
+ */
+struct VOXELFORGE_API FVoxelPassageLanding
+{
+    FVector StandingPoint = FVector::ZeroVector;
+    FVector DoorPoint = FVector::ZeroVector;
+    FVector DoorDirection = FVector(1.0f, 0.0f, 0.0f);
+
+    FVector ConnectorStart = FVector::ZeroVector;
+    FVector ConnectorControl = FVector::ZeroVector;
+    FVector ConnectorEnd = FVector::ZeroVector;
+
+    float FloorZ = 0.0f;
+    float CeilingZ = 0.0f;
+    float HalfWidth = 0.0f;
+    float FloorThickness = 3.0f;
+    float ConnectorRadius = 0.0f;
+    float ConnectorCeilingZ = 0.0f;
+    float RootFloorZ = 0.0f;
+    float RootCeilingZ = 0.0f;
+    float RootSpineRadius = 0.0f;
+
+    bool bSourcePlayerFit = false;
+    bool bHasNetworkConnector = false;
+    bool bHasConnectorBend = false;
+};
+
 //=============================================================================
 // SDF PRIMITIVES
 //=============================================================================
@@ -152,6 +194,29 @@ namespace VoxelSDF
         return -SmoothMin(-A, -B, K);
     }
 }
+
+/** Build the deterministic, body-sized room geometry at one standing anchor. */
+VOXELFORGE_API FVoxelPassageLanding VF_BuildPassageLanding(
+    const FVector& StandingPoint,
+    float MouthRadius,
+    const FVector& DoorDirection,
+    float StrateTopZ,
+    float StrateBottomZ,
+    float BoundarySealThickness,
+    bool bSourcePlayerFit,
+    bool bHasNetworkConnector,
+    const FVector& NetworkPoint,
+    float RootSpineRadius = 0.0f);
+
+/** Signed distance of the room + optional root connector. Negative means passage air. */
+VOXELFORGE_API float VF_EvaluatePassageLandingSDF(
+    const FVector& Position,
+    const FVoxelPassageLanding& Landing);
+
+/** True when a point belongs to the guaranteed solid floor slab of the landing/connector. */
+VOXELFORGE_API bool VF_IsPassageLandingFloor(
+    const FVector& Position,
+    const FVoxelPassageLanding& Landing);
 
 //=============================================================================
 // HASH FUNCTIONS

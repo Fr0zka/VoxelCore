@@ -87,6 +87,28 @@ FORCEINLINE void VF_ApplyPassageCarving(float& Density, float ModSDF,
     Density = FMath::Min(Density, FMath::Lerp(Density, AirTarget, CarveFactor));
 }
 
+// Landing air is also reasserted after the MC-space disturbance post.  Unlike the legacy tube
+// carve above, this threshold is independent of the incoming density: applying it a second time
+// is therefore bit-stable.  The structural passage op and the post-disturbance backstop can share
+// the same operation without turning an otherwise unchanged live-vs-direct op-stack comparison
+// into a second, deeper smooth carve.  The tube intentionally retains its old current-density
+// interpolation because that is part of the legacy structural path's contract.
+FORCEINLINE void VF_ApplyPassageLandingCarving(float& Density, float LandingSDF,
+    float BaseDensity, float SealThickness)
+{
+    constexpr float PASSAGE_BLEND_RADIUS = 4.0f;
+    if (LandingSDF >= PASSAGE_BLEND_RADIUS) return;
+
+    float CarveFactor = FMath::Clamp(
+        (PASSAGE_BLEND_RADIUS - LandingSDF) / (PASSAGE_BLEND_RADIUS * 2.0f),
+        0.0f, 1.0f);
+    CarveFactor = SmoothStep01(CarveFactor);
+
+    const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
+    const float LandingThreshold = FMath::Lerp(BaseDensity, AirTarget, CarveFactor);
+    Density = FMath::Min(Density, LandingThreshold);
+}
+
 //=============================================================================
 // SPINE DE DESCENTE (0,0) / (0,0) DESCENT SPINE
 //=============================================================================

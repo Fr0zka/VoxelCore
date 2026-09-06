@@ -21,6 +21,7 @@
 #include "VoxelStrateTypes.h"
 #include "VoxelStrateDefinition.h"
 #include "VoxelSeasonManifest.h"
+#include "VoxelCaveMorphology.h"
 #include "VoxelStrateManager.generated.h"
 
 class UVoxelSettings;
@@ -83,6 +84,11 @@ struct FVoxelPassage
     // wider chambers at the mouths, a squeeze in the middle, etc. If shorter than
     // ControlPoints, the uniform Radius is used as a fallback.
     TArray<float> ControlRadii;
+
+    // Body-sized, flat-floored chambers at both tube ends. UpperPoint/LowerPoint remain the
+    // standing anchors returned by the source query; the tube enters each room at DoorPoint.
+    FVoxelPassageLanding UpperLanding;
+    FVoxelPassageLanding LowerLanding;
 
     // Bounding sphere enclosing the whole passage (+ radius + blend), in voxel coords.
     // Computed once in GeneratePassages; lets EvaluateModifierSDF reject far voxels with
@@ -348,12 +354,31 @@ public:
      */
     float EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const;
 
+    /** Apply the passage tube/landing carve and the guaranteed landing floor in internal density. */
+    void ApplyPassageModifier(float& Density, float WorldX, float WorldY, float WorldZ,
+                              float BaseDensity, float SealThickness) const;
+
+    /** Reapply the landing-only air carve in internal density (used after visual disturbances). */
+    void ApplyPassageLandingAir(float& Density, float WorldX, float WorldY, float WorldZ,
+                                float BaseDensity, float SealThickness) const;
+
+    /** Re-assert landing air after MC-space disturbances, still before the final XY seal. */
+    void ApplyPassageLandingAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                  float BaseDensity, float SealThickness) const;
+
+    /** Re-assert a landing floor after the landing air pass, still before the final XY seal. */
+    void ApplyPassageLandingFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                    float BaseDensity) const;
+
     /**
      * True si la sphère englobante d'un passage (élargie du rayon de blend de carve) touche la
      * boîte VOXEL [MinVoxel, MaxVoxel]. Test conservatif O(Passages) — utilisé par ClassifyTile
      * (rejet des tuiles trivialement pleines) une fois PAR TUILE, jamais par voxel.
      */
     bool AnyPassageNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
+
+    /** Conservative box guard for the floor fill; unlike a tube it can affect the all-air proof. */
+    bool AnyPassageLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
 
     /** Get all generated passages (for debug display). */
     const TArray<FVoxelPassage>& GetPassages() const { return Passages; }

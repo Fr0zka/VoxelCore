@@ -2056,6 +2056,520 @@ namespace
     }
 }
 
+namespace
+{
+    constexpr float VF_LandingCarveSafetyMargin = 4.0f;
+
+    struct FVoxelPassageLandingConnectorProjection
+    {
+        FVector2D Closest = FVector2D::ZeroVector;
+        float DistanceAlong = 0.0f;
+        float TotalLength = 0.0f;
+        float SegmentLength = 0.0f;
+        float SegmentParameter = 0.0f;
+        int32 SegmentIndex = 0;
+    };
+
+    FVoxelPassageLandingConnectorProjection VF_ProjectPassageLandingConnector(
+        const FVector& Position,
+        const FVoxelPassageLanding& Landing)
+    {
+        const FVector2D A(Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
+        const FVector2D Control(Landing.ConnectorControl.X, Landing.ConnectorControl.Y);
+        const FVector2D B(Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
+        const FVector2D P(Position.X, Position.Y);
+        const bool bBend = Landing.bHasConnectorBend;
+        const FVector2D FirstEnd = bBend ? Control : B;
+        const FVector2D FirstVector = FirstEnd - A;
+        const FVector2D SecondVector = B - Control;
+        const float FirstLength = FirstVector.Size();
+        const float SecondLength = bBend ? SecondVector.Size() : 0.0f;
+
+        FVoxelPassageLandingConnectorProjection Result;
+        Result.TotalLength = FirstLength + SecondLength;
+        Result.Closest = A;
+        Result.SegmentLength = FirstLength;
+        if (Result.TotalLength <= KINDA_SMALL_NUMBER)
+        {
+            return Result;
+        }
+
+        float BestDistanceSquared = FLT_MAX;
+        const auto ProjectSegment = [&](const FVector2D& SegmentStart,
+                                        const FVector2D& SegmentEnd,
+                                        float SegmentOffset,
+                                        int32 SegmentIndex)
+        {
+            const FVector2D Segment = SegmentEnd - SegmentStart;
+            const float LengthSquared = Segment.SizeSquared();
+            const float Parameter = LengthSquared > KINDA_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(P - SegmentStart, Segment)
+                               / LengthSquared, 0.0f, 1.0f)
+                : 0.0f;
+            const FVector2D Candidate = SegmentStart + Segment * Parameter;
+            const float DistanceSquared = (P - Candidate).SizeSquared();
+            if (DistanceSquared < BestDistanceSquared
+                || (DistanceSquared == BestDistanceSquared
+                    && SegmentIndex < Result.SegmentIndex))
+            {
+                BestDistanceSquared = DistanceSquared;
+                Result.Closest = Candidate;
+                Result.DistanceAlong = SegmentOffset
+                    + FMath::Sqrt(FMath::Max(LengthSquared, 0.0f)) * Parameter;
+                Result.SegmentLength = FMath::Sqrt(FMath::Max(LengthSquared, 0.0f));
+                Result.SegmentParameter = Parameter;
+                Result.SegmentIndex = SegmentIndex;
+            }
+        };
+
+        ProjectSegment(A, FirstEnd, 0.0f, 0);
+        if (bBend)
+        {
+            ProjectSegment(Control, B, FirstLength, 1);
+        }
+        return Result;
+    }
+
+    float VF_PassageLandingConnectorFloorParameter(
+        const FVoxelPassageLandingConnectorProjection& Projection,
+        const FVoxelPassageLanding& Landing)
+    {
+        if (Projection.TotalLength <= KINDA_SMALL_NUMBER)
+        {
+            return 0.0f;
+        }
+
+        if (Landing.bHasConnectorBend)
+        {
+            // The first leg is deliberately level with the room. The second leg carries the
+            // complete rise and ends with a short level overlap inside the root annulus.
+            if (Projection.SegmentIndex == 0)
+            {
+                return 0.0f;
+            }
+            const float RootFlatLength = Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f;
+            const float RampLength = FMath::Max(
+                Projection.SegmentLength - RootFlatLength, KINDA_SMALL_NUMBER);
+            return FMath::Clamp(
+                Projection.SegmentParameter * Projection.SegmentLength / RampLength,
+                0.0f, 1.0f);
+        }
+
+        // The direct zero-rise case remains a single segment. Keep the old end aprons for
+        // descriptors produced by older cooked data, even though new passages use the bend when
+        // a non-zero rise needs a guaranteed slope.
+        const float SourceFlatLength = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
+        const float RootFlatLength = Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f;
+        const float SourceDistance = FMath::Clamp(
+            SourceFlatLength, 0.0f, Projection.TotalLength * 0.49f);
+        const float RootDistance = FMath::Clamp(
+            Projection.TotalLength - RootFlatLength,
+            Projection.TotalLength * 0.51f, Projection.TotalLength);
+        if (RootDistance <= SourceDistance + KINDA_SMALL_NUMBER)
+        {
+            return FMath::Clamp(
+                Projection.DistanceAlong / Projection.TotalLength, 0.0f, 1.0f);
+        }
+        return FMath::Clamp(
+            (Projection.DistanceAlong - SourceDistance)
+                / (RootDistance - SourceDistance), 0.0f, 1.0f);
+    }
+}
+
+FVoxelPassageLanding VF_BuildPassageLanding(
+    const FVector& InStandingPoint,
+    float MouthRadius,
+    const FVector& InDoorDirection,
+    float StrateTopZ,
+    float StrateBottomZ,
+    float BoundarySealThickness,
+    bool bSourcePlayerFit,
+    bool bHasNetworkConnector,
+    const FVector& NetworkPoint,
+    float RootSpineRadius)
+{
+    FVoxelPassageLanding Landing;
+
+    // Body-derived dimensions at the authored 25 cm voxel scale:
+    //   player diameter = 2 * 34 cm = 0.68 m = 2.72 voxels;
+    //   a 3 m turn floor is 3 / 0.25 = 12 voxels across;
+    //   capsule height = 2 * 88 cm = 1.76 m = 7.04 voxels;
+    //   1 m of headroom adds 4 voxels, so the minimum room height rounds to 12 voxels (3 m).
+    // The tube radius adds two voxels of clearance around the doorway.  The support writer keeps
+    // one voxel inside the room wall, so HalfWidth=max(7, MouthRadius+2) gives a guaranteed
+    // 12-voxel = 3 m flat support floor, while the authored chamber is 14 voxels = 3.5 m wide.
+    const float SafeMouthRadius = FMath::Max(FMath::Abs(MouthRadius), 1.0f);
+    const float DesiredHalfWidth = FMath::Max(7.0f, SafeMouthRadius + 2.0f);
+    const float BodyHeightWithHeadroom = FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f;
+    const float DesiredHeight = FMath::Max(
+        FMath::Max(12.0f, BodyHeightWithHeadroom),
+        2.0f * SafeMouthRadius + 2.0f);
+    const float SafeSeal = FMath::Max(BoundarySealThickness, 0.0f);
+
+    FVector Direction(InDoorDirection.X, InDoorDirection.Y, 0.0f);
+    if (!Direction.Normalize())
+    {
+        Direction = FVector(1.0f, 0.0f, 0.0f);
+    }
+
+    Landing.StandingPoint = InStandingPoint;
+    Landing.FloorZ = InStandingPoint.Z - 0.5f;
+    Landing.HalfWidth = DesiredHalfWidth;
+    Landing.CeilingZ = Landing.FloorZ + DesiredHeight;
+    Landing.FloorThickness = 3.0f;
+    Landing.DoorDirection = Direction;
+    Landing.RootSpineRadius = FMath::Max(RootSpineRadius, 0.0f);
+    Landing.bSourcePlayerFit = bSourcePlayerFit;
+    Landing.bHasNetworkConnector = false;
+    Landing.RootFloorZ = Landing.FloorZ;
+    Landing.RootCeilingZ = Landing.CeilingZ;
+
+    // Keep the complete room and its floor strictly inside the vertical seal. Normal authored
+    // strates have far more room than this bound; the clamp is a fail-safe for a source pose near
+    // a seal and never moves a normal interior pose.
+    const float InnerBottom = StrateBottomZ + SafeSeal;
+    const float InnerTop = StrateTopZ - SafeSeal;
+    if (FMath::IsFinite(InnerBottom) && FMath::IsFinite(InnerTop)
+        && InnerTop > InnerBottom)
+    {
+        // Passage carving is intentionally ordered after the vertical seal and fades over its
+        // four-voxel blend radius. Keep both the underside of the support slab and the top of the
+        // room beyond that radius from the seal, so the landing cannot use the passage exception
+        // to open a strate boundary.
+        const float MinFloor = InnerBottom + Landing.FloorThickness
+            + VF_LandingCarveSafetyMargin;
+        const float MaxFloor = InnerTop - DesiredHeight - VF_LandingCarveSafetyMargin;
+        if (MaxFloor >= MinFloor)
+        {
+            Landing.FloorZ = FMath::Clamp(Landing.FloorZ, MinFloor, MaxFloor);
+            Landing.StandingPoint.Z = Landing.FloorZ + 0.5f;
+            Landing.CeilingZ = Landing.FloorZ + DesiredHeight;
+        }
+        else
+        {
+            // A degenerate strate cannot satisfy the full body/headroom contract. Fail closed
+            // instead of emitting a partial chamber whose blend would approach a seal.
+            Landing.HalfWidth = 0.0f;
+            Landing.CeilingZ = Landing.FloorZ;
+            Landing.bSourcePlayerFit = false;
+            return Landing;
+        }
+    }
+
+    // The tube centreline is tangent to the floor: the tube bottom is exactly FloorZ.  The door
+    // sits one voxel inside the room so the room/tube smooth union cannot leave a lip.
+    Landing.DoorPoint = Landing.StandingPoint
+        + Direction * FMath::Max(0.0f, Landing.HalfWidth - 1.0f);
+    Landing.DoorPoint.Z = Landing.FloorZ + SafeMouthRadius;
+
+    if (bHasNetworkConnector
+        && FMath::IsFinite(NetworkPoint.X)
+        && FMath::IsFinite(NetworkPoint.Y)
+        && FMath::IsFinite(NetworkPoint.Z))
+    {
+        // The connector is a swept rectangular ramp.  Its source end keeps the authored landing
+        // floor; its root end is the common, deterministic interior floor supplied by the
+        // manager.  This is what joins two mouths in one strate when their source floors sit at
+        // opposite sides of the strate.  The manager chooses the common level inside the same
+        // seal-safe interval as this builder, so no source query or passage order can affect it.
+        // Five voxels = 1.25 m half-width / 2.5 m clear width.  This is the smallest whole-voxel
+        // annular root corridor that leaves a 1.36-voxel player capsule a two-voxel fit margin on
+        // the support lattice, while the landing itself remains the 3 m turn floor.  Its separate
+        // 12-voxel (3 m) clear height gives the 1.76 m capsule more than 1 m of headroom while the
+        // player walks out to the network root.  The floor rise is linear along the horizontal
+        // run; if the direct run is too short, a level dog-leg makes the final ramp satisfy the
+        // same 44 degree walkable limit by construction.
+        Landing.ConnectorRadius = 5.0f;
+        const float ConnectorHeight = FMath::Max(
+            12.0f, FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f);
+        Landing.ConnectorCeilingZ = Landing.FloorZ + ConnectorHeight;
+        Landing.RootFloorZ = NetworkPoint.Z;
+        Landing.RootCeilingZ = Landing.RootFloorZ + ConnectorHeight;
+
+        // Clamp the supplied common level again at the geometry boundary.  This is deliberately
+        // a clamp, not a per-passage repair: all callers derive NetworkPoint.Z from the strate's
+        // bounds, and malformed tiny strates remain sealed rather than producing a root breach.
+        if (FMath::IsFinite(InnerBottom) && FMath::IsFinite(InnerTop)
+            && InnerTop > InnerBottom)
+        {
+            const float RootMinFloor = InnerBottom + Landing.FloorThickness
+                + VF_LandingCarveSafetyMargin;
+            const float RootMaxFloor = InnerTop - ConnectorHeight
+                - VF_LandingCarveSafetyMargin;
+            if (RootMaxFloor >= RootMinFloor)
+            {
+                Landing.RootFloorZ = FMath::Clamp(
+                    Landing.RootFloorZ, RootMinFloor, RootMaxFloor);
+                Landing.RootCeilingZ = Landing.RootFloorZ + ConnectorHeight;
+            }
+            else
+            {
+                // There is no seal-safe interval for a full landing connector in a malformed
+                // tiny strate. Fail closed: a partial ramp that reaches a boundary is worse than
+                // an explicit unanswered landing, and normal authored strates never enter this
+                // branch.
+                return Landing;
+            }
+        }
+        else
+        {
+            return Landing;
+        }
+
+        const float ConnectorZ = (Landing.FloorZ + Landing.ConnectorCeilingZ) * 0.5f;
+        const float RootConnectorZ = (Landing.RootFloorZ + Landing.RootCeilingZ) * 0.5f;
+        FVector2D RootEntryDirection(
+            Landing.StandingPoint.X - NetworkPoint.X,
+            Landing.StandingPoint.Y - NetworkPoint.Y);
+        if (!RootEntryDirection.Normalize())
+        {
+            RootEntryDirection = FVector2D(Direction.X, Direction.Y);
+            if (!RootEntryDirection.Normalize())
+            {
+                RootEntryDirection = FVector2D(1.0f, 0.0f);
+            }
+        }
+
+        // The structural spine is a vertical air column, so its centre is not a standing
+        // endpoint. End the ramp in the middle of the support annulus instead: with the 1.36-voxel
+        // capsule radius, a centre at RootSpineRadius+2.25 sits at least one capsule radius outside
+        // the spine and at least one capsule radius inside the 4.5-voxel support edge. Every
+        // passage therefore enters the same continuous, floor-backed annular hub, while the spine
+        // itself remains open and unsealed.
+        const float RootEntryRadius = Landing.RootSpineRadius + 2.25f;
+        const FVector2D RootEntryXY(
+            NetworkPoint.X + RootEntryDirection.X * RootEntryRadius,
+            NetworkPoint.Y + RootEntryDirection.Y * RootEntryRadius);
+        Landing.ConnectorStart = FVector(
+            Landing.StandingPoint.X, Landing.StandingPoint.Y, ConnectorZ);
+        Landing.ConnectorEnd = FVector(RootEntryXY.X, RootEntryXY.Y, RootConnectorZ);
+
+        // A direct source-to-root ramp is usually gentle, but its length is not a contract: a
+        // legal source pose can be close to the spine while its floor is near a strate face. Add a
+        // deterministic level dog-leg whenever the direct run cannot meet the 44-degree law.
+        // The final leg is the only rising part, and its extra horizontal run includes the root
+        // annulus overlap. This makes the slope a construction guarantee for every seed, rather
+        // than a property observed in today's showcase seeds. WorldRadiusVoxels is deliberately
+        // zero, so the bounded world rim cannot be approached by this lateral safety run.
+        constexpr float WalkableSlope = 0.9656888f; // tan(44 degrees)
+        constexpr float RootFlatLength = 2.25f;
+        const FVector2D SourceXY(Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
+        const FVector2D RootXY(Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
+        const FVector2D Direct = RootXY - SourceXY;
+        const float DirectLength = Direct.Size();
+        const float FloorRise = FMath::Abs(Landing.RootFloorZ - Landing.FloorZ);
+        const float RequiredRampLength = FloorRise / WalkableSlope;
+        const float SourceFlatLength = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
+        if (FloorRise > KINDA_SMALL_NUMBER
+            && (DirectLength <= KINDA_SMALL_NUMBER
+                || DirectLength < RequiredRampLength + RootFlatLength + SourceFlatLength))
+        {
+            FVector2D Along = Direct;
+            if (!Along.Normalize())
+            {
+                Along = FVector2D(Direction.X, Direction.Y);
+                if (!Along.Normalize())
+                {
+                    Along = FVector2D(1.0f, 0.0f);
+                }
+            }
+            const FVector2D Perpendicular(-Along.Y, Along.X);
+            const float DogLegLength = RequiredRampLength + RootFlatLength + 1.0f;
+            const FVector2D ControlXY = RootXY + Perpendicular * DogLegLength;
+            Landing.ConnectorControl = FVector(ControlXY.X, ControlXY.Y, ConnectorZ);
+            Landing.bHasConnectorBend = true;
+        }
+        else if (FloorRise > KINDA_SMALL_NUMBER)
+        {
+            // Keep the same straight geometry when it already satisfies the bound. The explicit
+            // false flag is part of the descriptor so the evaluator and order-independence test
+            // cannot infer a different topology from an uninitialised control point.
+            Landing.ConnectorControl = FVector::ZeroVector;
+            Landing.bHasConnectorBend = false;
+        }
+        else
+        {
+            Landing.ConnectorControl = FVector(
+                (Landing.ConnectorStart.X + Landing.ConnectorEnd.X) * 0.5f,
+                (Landing.ConnectorStart.Y + Landing.ConnectorEnd.Y) * 0.5f,
+                ConnectorZ);
+            Landing.bHasConnectorBend = false;
+        }
+        Landing.bHasNetworkConnector = true;
+    }
+
+    return Landing;
+}
+
+float VF_EvaluatePassageLandingSDF(
+    const FVector& Position,
+    const FVoxelPassageLanding& Landing)
+{
+    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+        || !FMath::IsFinite(Position.Z)
+        || !FMath::IsFinite(Landing.StandingPoint.X)
+        || !FMath::IsFinite(Landing.StandingPoint.Y)
+        || !FMath::IsFinite(Landing.FloorZ)
+        || !FMath::IsFinite(Landing.CeilingZ)
+        || !FMath::IsFinite(Landing.HalfWidth)
+        || Landing.HalfWidth <= 0.0f
+        || Landing.CeilingZ <= Landing.FloorZ)
+    {
+        return FLT_MAX;
+    }
+
+    const FVector RoomCenter(
+        Landing.StandingPoint.X,
+        Landing.StandingPoint.Y,
+        (Landing.FloorZ + Landing.CeilingZ) * 0.5f);
+    constexpr float RoomRounding = 1.5f;
+    const FVector RoomHalfExtent(
+        FMath::Max(Landing.HalfWidth - RoomRounding, 0.25f),
+        FMath::Max(Landing.HalfWidth - RoomRounding, 0.25f),
+        FMath::Max((Landing.CeilingZ - Landing.FloorZ) * 0.5f - RoomRounding, 0.25f));
+
+    // max(Room, FloorZ-Z) is the important distinction from a bore: below FloorZ is solid,
+    // while every horizontal section above it has the same flat floor plane.
+    float LandingSDF = FMath::Max(
+        VoxelSDF::RoundedBox(Position, RoomCenter, RoomHalfExtent, RoomRounding),
+        Landing.FloorZ - Position.Z);
+
+    if (Landing.bHasNetworkConnector && Landing.ConnectorRadius > 0.0f
+        && FMath::IsFinite(Landing.ConnectorCeilingZ)
+        && Landing.ConnectorCeilingZ > Landing.FloorZ
+        && FMath::IsFinite(Landing.RootFloorZ)
+        && FMath::IsFinite(Landing.RootCeilingZ)
+        && Landing.RootCeilingZ > Landing.RootFloorZ)
+    {
+        const FVoxelPassageLandingConnectorProjection Projection =
+            VF_ProjectPassageLandingConnector(Position, Landing);
+        const float FloorT = VF_PassageLandingConnectorFloorParameter(Projection, Landing);
+        const float HorizontalSDF = (FVector2D(Position.X, Position.Y)
+                                     - Projection.Closest).Size()
+            - Landing.ConnectorRadius;
+        const float ConnectorFloorZ = FMath::Lerp(
+            Landing.FloorZ, Landing.RootFloorZ, FloorT);
+        const float ConnectorCeilingZ = FMath::Lerp(
+            Landing.ConnectorCeilingZ, Landing.RootCeilingZ, FloorT);
+        const float VerticalSDF = FMath::Max(
+            ConnectorFloorZ - Position.Z,
+            Position.Z - ConnectorCeilingZ);
+        // A swept box with a flat source leg and a measured-slope final ramp, not a round bore:
+        // the floor normal is deterministic and bounded, while the fixed twelve-voxel clear height
+        // follows the route. The source and root ends are exactly the two flat landing floors.
+        const float ConnectorSDF = FMath::Max(HorizontalSDF, VerticalSDF);
+        LandingSDF = VoxelSDF::SmoothMin(LandingSDF, ConnectorSDF, 3.0f);
+
+        if (Landing.RootSpineRadius >= 0.0f)
+        {
+            // A shared hub turns the guaranteed root join into a walkable network. With the normal
+            // origin spine it is an annulus outside that shaft; with a disabled spine it safely
+            // degenerates to a disk, so the landing contract still has a guaranteed root volume.
+            const float HubRadius = Landing.RootSpineRadius + Landing.ConnectorRadius;
+            const float RadialDistance = FMath::Sqrt(
+                FMath::Square(Position.X) + FMath::Square(Position.Y));
+            const float HubHorizontalSDF = FMath::Max(
+                Landing.RootSpineRadius - RadialDistance,
+                RadialDistance - HubRadius);
+            const float HubVerticalSDF = FMath::Max(
+                Landing.RootFloorZ - Position.Z,
+                Position.Z - Landing.RootCeilingZ);
+            const float HubSDF = FMath::Max(HubHorizontalSDF, HubVerticalSDF);
+            LandingSDF = VoxelSDF::SmoothMin(LandingSDF, HubSDF, 3.0f);
+        }
+    }
+
+    return LandingSDF;
+}
+
+bool VF_IsPassageLandingFloor(
+    const FVector& Position,
+    const FVoxelPassageLanding& Landing)
+{
+    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+        || !FMath::IsFinite(Position.Z) || !FMath::IsFinite(Landing.FloorZ)
+        || !FMath::IsFinite(Landing.FloorThickness)
+        || Landing.FloorThickness <= 0.0f || Landing.HalfWidth <= 0.0f)
+    {
+        return false;
+    }
+
+    const auto IsInFloorBand = [](float Z, float FloorZ, float Thickness)
+    {
+        // The analytic ramp and the sampled density use the same float interpolation, but a
+        // caller can arrive at the mathematically identical plane through a different fused
+        // multiply/add sequence. Include one machine epsilon on the upper side so the support
+        // backstop cannot disappear at an exact floor sample.
+        return Z <= FloorZ + KINDA_SMALL_NUMBER && Z > FloorZ - Thickness;
+    };
+    const bool bInsideRootSpine = Landing.RootSpineRadius > 0.0f
+        && FMath::Square(Position.X) + FMath::Square(Position.Y)
+            <= FMath::Square(Landing.RootSpineRadius);
+
+    // The room floor is a true horizontal landing: it is the only floor that owns the full
+    // three-metre turning patch.  The central root spine is left open.
+    if (IsInFloorBand(Position.Z, Landing.FloorZ, Landing.FloorThickness)
+        && !bInsideRootSpine)
+    {
+        const float FloorHalfWidth = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
+        if (FMath::Abs(Position.X - Landing.StandingPoint.X) <= FloorHalfWidth
+            && FMath::Abs(Position.Y - Landing.StandingPoint.Y) <= FloorHalfWidth)
+        {
+            return true;
+        }
+    }
+
+    if (Landing.bHasNetworkConnector && Landing.ConnectorRadius > 0.0f
+        && FMath::IsFinite(Landing.RootFloorZ)
+        && FMath::IsFinite(Landing.RootCeilingZ)
+        && Landing.RootCeilingZ > Landing.RootFloorZ)
+    {
+        const FVoxelPassageLandingConnectorProjection Projection =
+            VF_ProjectPassageLandingConnector(Position, Landing);
+        const FVector2D& Closest = Projection.Closest;
+        const float FloorT = VF_PassageLandingConnectorFloorParameter(Projection, Landing);
+        const float ConnectorFloorZ = FMath::Lerp(
+            Landing.FloorZ, Landing.RootFloorZ, FloorT);
+        if (!bInsideRootSpine
+            && IsInFloorBand(Position.Z, ConnectorFloorZ, Landing.FloorThickness))
+        {
+            // Keep connector support inset by half a voxel from its clear width.  The landing
+            // chamber—not this narrow transit leg—owns the 3 m turn floor; this inset preserves
+            // a solid walking strip without capping a neighbouring shaft at its edge.
+            const float FloorRadius = FMath::Max(
+                Landing.ConnectorRadius - 0.5f,
+                FVoxelPlayerCapsuleConstants::RadiusVoxels);
+            if ((FVector2D(Position.X, Position.Y) - Closest).SizeSquared()
+                    <= FMath::Square(FloorRadius))
+            {
+                return true;
+            }
+        }
+
+        if (IsInFloorBand(Position.Z, Landing.RootFloorZ, Landing.FloorThickness))
+        {
+            // The common root hub is a walkable annulus, not a cap over the vertical spine.  Its
+            // 4.5-voxel support inset leaves the same 0.5-voxel air clearance at the outer wall as
+            // the connector and never writes inside the spine radius.
+            const float RadialDistanceSquared = FMath::Square(Position.X)
+                + FMath::Square(Position.Y);
+            const float HubInnerRadius = Landing.RootSpineRadius;
+            const float HubOuterSupportRadius = Landing.RootSpineRadius
+                + FMath::Max(Landing.ConnectorRadius - 0.5f,
+                             FVoxelPlayerCapsuleConstants::RadiusVoxels);
+            const bool bOutsideSpine = Landing.RootSpineRadius <= 0.0f
+                || RadialDistanceSquared > FMath::Square(HubInnerRadius);
+            if (bOutsideSpine
+                && RadialDistanceSquared <= FMath::Square(HubOuterSupportRadius))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 bool VF_SuggestLandingPoint(
     ECaveGeneratorType Archetype,
     const FStrateGenerationParams& CaveParams,

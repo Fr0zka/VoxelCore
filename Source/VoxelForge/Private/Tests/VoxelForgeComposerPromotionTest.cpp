@@ -421,13 +421,18 @@ bool FVoxelForgeComposerPromotionTest::RunTest(const FString& Parameters)
         if (Passage.LowerStrateIndex == CandidateStrateIndex
             && Passage.UpperStrateIndex + 1 == CandidateStrateIndex)
         {
-            ArrivalPoint = Passage.LowerPoint;
+            // The promotion simulation intentionally remains the legacy coarse air-law probe
+            // (SampleStep=8), not the Tier-1 fine player-fit law. A floor standing anchor can lie
+            // in the solid half of a coarse cell after the landing adds its support slab; the
+            // deterministic door anchor is the actual air position where the tube meets that
+            // landing and keeps the strict no-snap assertion meaningful.
+            ArrivalPoint = Passage.LowerLanding.DoorPoint;
             ++ArrivalCount;
         }
         if (Passage.UpperStrateIndex == CandidateStrateIndex
             && Passage.LowerStrateIndex == CandidateStrateIndex + 1)
         {
-            DeparturePoint = Passage.UpperPoint;
+            DeparturePoint = Passage.UpperLanding.DoorPoint;
             ++DepartureCount;
         }
     }

@@ -1854,8 +1854,7 @@ namespace
         void Eval(float X, float Y, float Z, FVoxelOpSample& InOut) const override
         {
             if (!Manager) { return; }
-            const float ModSDF = Manager->EvaluateModifierSDF(X, Y, Z);
-            VF_ApplyPassageCarving(InOut.Density, ModSDF, Base, Seal);
+            Manager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
         }
 
         // ≡ la garde `AnyPassageNearBox` écrite à la main dans ClassifyTile — déjà écrite, ici
@@ -1863,6 +1862,12 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
             if (!Manager) { return EVoxelOpEffect::Identity; }
+            if (Manager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
+            {
+                // The room carves air, while its support slab force-writes solid. Both
+                // hypotheses must therefore be killed for a box touching that slab.
+                return EVoxelOpEffect::Both;
+            }
             return Manager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
@@ -5207,10 +5212,10 @@ void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBott
                                          const UVoxelStrateManager* StrateManager)
 {
     // ORDRE NON NÉGOCIABLE : la spine creuse l'intérieur (et ne touche JAMAIS les bandes de seal),
-    // le seal vertical re-solidifie ses bandes, les passages percent les seals, puis la limite XY
-    // gagne sur tout ce qui précède. Ainsi, même un passage placé dans la rampe ou au-delà du rayon
-    // ne peut pas ouvrir la coque extérieure. Les éditions joueur restent le dernier post de
-    // GetDensityAt, hors de cette pile, comme avant.
+    // le seal vertical re-solidifie ses bandes, les passages (tube + landing + support) percent
+    // les seals, puis la limite XY gagne sur tout ce qui précède. Ainsi, même un passage placé
+    // dans la rampe ou au-delà du rayon ne peut pas ouvrir la coque extérieure. Les éditions joueur
+    // restent le dernier post de GetDensityAt, hors de cette pile, comme avant.
     Add(MakeUnique<FOriginSpineOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity, SpineRadius));
     Add(MakeUnique<FBoundarySealOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity));
     Add(MakeUnique<FPassageCarveOp>(StrateManager, BaseDensity, SealThickness));

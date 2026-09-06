@@ -137,7 +137,7 @@ reference path for opt-out strates. See [OPSTACK-PLAN.md](OPSTACK-PLAN.md) for t
 
 | Symbol | Notes |
 |--------|-------|
-| `EVoxelOpRole` | The four roles: `FieldSource` (what the field IS) · `Combiner` (how fields merge) · `DetailModifier` (today's `UVoxelTerrainOpDefinition`) · `StructuralPost` (spine→vertical seal→passage→XY edge seal→diff, appended automatically, never author-omittable). |
+| `EVoxelOpRole` | The four roles: `FieldSource` (what the field IS) · `Combiner` (how fields merge) · `DetailModifier` (today's `UVoxelTerrainOpDefinition`) · `StructuralPost` (spine→vertical seal→passage tube/landing floor→XY edge seal→diff, appended automatically, never author-omittable). |
 | `EVoxelOpChannel` / `EVoxelOpChannelMask` | The explicit `FVoxelOpSample` channel set: `Density` and `Sdf` (plus `None`/`All` masks). Every density op declares the channels it reads and writes. |
 | `EVoxelOpCombine` | `Replace`/`Union`(min)/`Subtract`(max)/`SmoothUnion`/`SmoothSubtract`/`Add`/`Mask`. Sign reminder: negative = solid, so "add solid" is `min`. |
 | `EVoxelOpEffect` | `Identity`/`CarveOnly`/`FillOnly`/`Both`. Conservative: `Both` is always safe, the wrong one is a hole. |
@@ -149,7 +149,8 @@ reference path for opt-out strates. See [OPSTACK-PLAN.md](OPSTACK-PLAN.md) for t
 
 ### 3.2c Structural primitives — `Public/VoxelDensityPrimitives.h`
 `VF_ApplyOriginSpine` · `VF_ApplyBoundarySeal` · `VF_ApplyPassageCarving` · `VF_ApplyXYEdgeSeal` —
-the four world invariants every archetype appends, **moved here 2026-07-27** so the generator and
+the four world invariants every archetype appends, with landing/floor geometry joined by the
+manager passage post, **moved here 2026-07-27** so the generator and
 the operator stack share ONE copy. The XY helper is a radial smooth ramp in actor-space and is a
 true no-op when `WorldRadiusVoxels == 0`; `VF_XYEdgeSealForcedMarginOverBox` is the shared sound
 proof for `ClassifyBox` and T1.d's global shell skip. `VoxelGenerator.cpp` keeps same-named
@@ -181,7 +182,7 @@ bit. They are port-correctness oracles, not fidelity checks: the acceptance bar 
 |--------|------|-------|
 | `FVoxelOpStack` | — | Ordered move-only list of `TUniquePtr` entries. `Add` snapshots channel metadata; `PrepareChunk` / `EvalInternal` / `EvalMC` / `ClassifyBox` (the fold lets a later forcing post overwrite a dead hypothesis). |
 | `FVoxelOpStack::ValidateChannelOrder` | — | Assembly/diagnostic-only channel/resource DAG validator. It requires prior producers, rejects write-only clobbers and invalid additive declarations, and requires room/shaft/surface state providers before consumers. It permits the one root SDF identity fold used by Maze. `VoxelForge.OpStack.ChannelDAG` validates all 8 shipping stacks. |
-| `FVoxelOpStack::AppendStructuralPost` | 4 | Appends spine → vertical seal → passage → XY edge seal **in that fixed order**. An author cannot omit or reorder them. The diff layer is NOT here yet — it still lives in `GetDensityAt` after the MC negate, with disturbances. |
+| `FVoxelOpStack::AppendStructuralPost` | 4 | Appends spine → vertical seal → passage tube/landing floor → XY edge seal **in that fixed order**. An author cannot omit or reorder them. The diff layer is NOT here yet — it still lives in `GetDensityAt` after the MC negate, with disturbances. |
 | `VoxelDensityOps::MakeConstantRockSource` | 1 | `Density = BaseDensity`. `ClassifyBox` → **AllSolid**, exact and free. Shared by TunnelNetwork, Maze, VerticalShafts and bedrock gaps. Class is `FConstantFieldSource` (one class, two factories). |
 | `VoxelDensityOps::MakeConstantVoidSource` | 1 | The **same class, negated**: `Density = -BaseDensity`, and `ClassifyBox` → **AllAir** — the first source in the plugin that can prove it. FloatingIslands' root; that verdict is what makes a mostly-empty island strate skippable. |
 | `VoxelDensityOps::MakeLatticeCorridorSource` | 1 | Maze corridors, SDF channel. Each canonical lower-node/axis edge is open when it is a parent edge in the origin-directed tree or passes a capped loop roll; both endpoints are hashed locally, so adjacent chunks cannot disagree. The source reports its own conservative SDF interval; a later converter supplies its own carve/fill response, so the source is independent of the chosen consumer. |
@@ -422,14 +423,24 @@ Header is rich with inline docs. Two namespaces + a per-chunk cache system.
 landing-site query: it evaluates the local archetype source through the same capsule/support
 contract as the measurement pass — support within step height, walkable slope, and full capsule
 clearance. Room queries use a room-floor core, slabs keep their requested XY, and the sparse
- sources use bounded feature cores: a horizontal lattice corridor (one Maze cell), a selected
- VerticalShafts tree shaft plus deterministic ledge-side offsets (up to two local shaft spacings at the 0.6
-site density), or a validated blob top (one IslandSpacing). It is intentionally not a flood fill:
-the pure query can prove a local pose, not a large component. The
+sources use bounded feature cores: a horizontal lattice corridor (one Maze cell), a selected
+VerticalShafts tree shaft plus deterministic ledge-side offsets (up to two local shaft spacings at
+the 0.6 site density), or a validated blob top (one IslandSpacing). It is intentionally not a
+flood fill: the pure query can prove a local pose, not a large component. The
 VerticalShafts result is therefore on the drainage tree, not merely in an open roughness disk.
 It returns `false` when those feature-bearing conditions cannot be proven inside the supplied budget;
 SurfaceWorld remains refused because its production height can depend on manager-owned biome/per-column
 context. It never touches a generator, operator stack, manager, cache, or mutable state.
+
+`FVoxelPassageLanding`, `VF_BuildPassageLanding`, `VF_EvaluatePassageLandingSDF`, and
+`VF_IsPassageLandingFloor` (h:~56/~189, implemented near `.cpp:2059`) turn each inter-strate mouth
+into a deterministic rounded room plus a hard support slab. The room is sized from the player
+capsule (minimum 12 voxels / 3 m flat floor, 12 voxels / 3 m clear height, and at least 14 voxels /
+3.5 m authored width); every end also gets a flat-floor connector to the guaranteed `(0,0)` root
+network because the pure source query is local rather than a component proof. The manager's shared
+thread-local passage shortlist serves tube, room, connector, and floor evaluation; no landing
+search occurs per voxel. `GeneratePassages` stores the full descriptors and the order-independence
+test compares them bit-for-bit.
 
   Performance note (h:209-220): caching rooms/tunnels once per chunk instead of per
   voxel is the single biggest CPU win.
@@ -462,14 +473,18 @@ groups by generator type.
 
 **`Public/VoxelStrateManager.h` + `.cpp`** — `UVoxelStrateManager : UObject` (h:108).
 Maps depth→strate at runtime; owns passages.
-- `FVoxelPassage` (h:39): endpoints, radius, type, control points.
+- `FVoxelPassage` (h:39): standing endpoints, radius, type, control points, and upper/lower landing descriptors (room, floor, door, and root connector).
 - `FStrateSlot` (h:84): definition + chunk-Z range + index.
 | Method | .cpp line | Role |
 |--------|-----------|------|
 | `Initialize` | 10 | Keeps the existing sequencing through `GeneratePassages`, but selects one slot source: a validated cooked season (exact ordered bounds/vector/recipe) or the unchanged authored fixed+sorted/shuffled pool. Assigned-invalid seasons fail closed. Authored source definitions are duplicated as content bags; generated slots use deterministic C++ defaults and zero auto-passages because schema 2 does not store passage configuration. |
-| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. Each mouth independently queries its own strate's pure player-fit `VF_SuggestLandingPoint` with its contract seed (cave room salt, otherwise world seed), may move within its archetype-specific budget, then is clamped outside the destination seal bands and interpolated through the control points; unsupported/no-fit answers preserve the old random reach. |
-| `EvaluateModifierSDF` | 357 | SDF of passages at a point (for carving). Per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`. §8.10. |
+| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. Each mouth independently queries its own strate's pure player-fit `VF_SuggestLandingPoint` with its contract seed (cave room salt, otherwise world seed), may move within its archetype-specific budget, then receives a body-sized room/floor and a connector to the common per-strate origin-root annular hub. Unsupported/no-fit answers preserve the old random reach; a deterministic level dog-leg is inserted when the final ramp needs it to stay ≤44°. All descriptors and bounds are generated without reading another passage. |
+| `EvaluateModifierSDF` | 357 | SDF of passage tubes plus landing rooms/connectors at a point. A per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`; the same cache serves floor membership. §8.10. |
+| `ApplyPassageModifier` | 1319 | Shared legacy/op-stack passage post: carves tube and landing/connector air through the idempotent landing primitive, then restores the landing/connector support slab in internal positive-solid density. |
+| `VF_ApplyPassageLandingCarving` | — | Idempotent density-independent landing-air threshold shared by the structural pass and the post-disturbance MC backstop; keeps legacy and operator-stack results bit-identical. |
+| `ApplyPassageLandingFloorMC` | 1347 | Reasserts the same support slab after MC-space disturbances and before the final XY edge seal. |
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
+| `AnyPassageLandingFloorNearBox` | — | Conservative room/connector-floor AABB guard. It kills the `AllAir` hypothesis wherever a proved landing floor can occur; the op-stack returns `Both` for the same box. |
 | `FindSlotIndexForChunkZ` | 427 | Z → layout index. |
 | `GetStrateAt` / `GetStrateIndex` | 443 / 455 | World-Z queries. |
 | `GetLayoutVersion` | h:161 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize` and by the editor composer override). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so live changes never serve stale data. |
@@ -597,7 +612,8 @@ verifies it in memory; `VF_LoadVoxelSeasonManifest` plus `VF_RebuildVoxelSeasonS
 recipe entries rebuild through the mandatory-post builder, while authored `FixedStrates` retain their
 absolute slot and native vector. The selected-only descent review reuses `VoxelStratePreview`, and all
 composition/review work is editor/build-box code; parsing and recipe materialisation are runtime. Lateral
-region manifests remain rejected because their cross-seam law is only 9/16. The focused
+region manifests remain rejected because their post-landing cross-seam law is only **4/16** (the
+pre-landing snapshot was 9/16). The focused
 season test currently reports **24 generated / 19 hard-gate survivors / 6 selected / 18 unselected or
 rejected**, with **4 vacuous**, **1 primordial-law budget**, **13 policy-not-selected**, and **393,216**
 round-trip density samples bit-identical. The specified UE 5.7 editor build succeeded and the final
@@ -605,6 +621,11 @@ round-trip density samples bit-identical. The specified UE 5.7 editor build succ
 warning-bearing, 0 failed, 0 not run** in **2,523.978 s**. The regenerated showcase produced **6 fine
 renders, 2 refusals, and 0 blanks**; all box-verdict violations remained zero. The later focused
 production-height showcase history is recorded separately below.
+
+The current landing validation is recorded in `VoxelForgeLandingFinal5`: **30 clean successes, 2
+warning-bearing successes, 0 failures, 0 not-run** across 32 tests in **3,607.746 s**. The strict
+promotion assertions passed and no assertion was weakened. The landing-specific geometry test,
+both connectivity tests, all box verdicts, seals, determinism, and op-stack equivalence tests passed.
 
 **`Public/VoxelSeasonAsset.h` + `Private/VoxelSeasonAsset.cpp`** — `UVoxelSeasonAsset :
 UPrimaryDataAsset`, the cookable carrier. Its editor button imports the reviewable JSON, stores the exact
@@ -676,13 +697,13 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 | `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. World-scale run: **1,422 applications / 168 distinct fields**; **36/64 survival**, 60 non-vacuous, 58 largest-component, 40 exact-law passes; **1,411 Mixed + 731 AllSolid + 418 AllAir = 1,149 proved boxes**, **1,529,319 lattice voxels checked, 0 violations**, 148.387 s. |
 | ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
-| `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. World-scale run: **16 promoted**, corpus **4/8/16**, survival **45.8/66.7/75.0/66.7/58.3%**, spread **0.677151→0.867010**, **92.390 s**, 0 failures. |
+| `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. The final landing validation passed the strict existing gates; no assertion was weakened. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 33 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. World-scale run: **33/64 survival (51.6%)**, **64 distinct recipes**, **0 invalid recipes**, **715 proved custom boxes / 951,665 lattice voxels / 0 violations**, blank plan/card **4/33→5/33**, **174.854 s**, **0 refusals**. |
-| `VoxelForgeComposerShowcaseTest.cpp` | `VoxelForge.Composer.Showcase` | Exhausts the bounded parameter-roll set (seeds **0, 7331**, indices **0–63**), excludes multi-region rolls while the lateral gate is off, and measures every missing-family candidate in all six interior target slots at step 4 / radius 256 / `MaxCells=8,000,000`. Hard gates are non-vacuous, largest air share ≥ **0.50**, and exact unsnapped arrival→departure connectivity; selection score is floor-area fraction + clearance tie-break + projected-surface tie-break. It asserts roll/manifest determinism, density sign, zero `WorldRadiusVoxels`, bit-identical metric reruns, and writes one alphabetized card per archetype to `Saved/VoxelForge/Showcase/index.html`, with step-1 radius-64 filled/contour plan + vertical ROI images centred on `LargestComponentPoint`. The final production-height run uses **H=8 chunks / 64 m**, emits the full voxel→metre audit, and produced **7 fine renders, 1 refusal, 1 blank**; its hard-gate survivor set was **0/8**. |
+| `VoxelForgeComposerShowcaseTest.cpp` | `VoxelForge.Composer.Showcase` | Exhausts the bounded parameter-roll set (seeds **0, 7331**, indices **0–63**), excludes multi-region rolls while the lateral gate is off, and measures every missing-family candidate in all six interior target slots at step 4 / radius 256 / `MaxCells=8,000,000`. Hard gates are non-vacuous, largest air share ≥ **0.50**, and exact unsnapped arrival→departure connectivity; selection score is floor-area fraction + clearance tie-break + projected-surface tie-break. It asserts roll/manifest determinism, density sign, zero `WorldRadiusVoxels`, bit-identical metric reruns, and writes one alphabetized card per archetype to `Saved/VoxelForge/Showcase/index.html`, with step-1 radius-64 filled/contour plan + vertical ROI images centred on `LargestComponentPoint`. The final landing regeneration evaluated **256** rolls (**82** eligible single-region, **174** skipped multi-region), produced **7 fine renders, 1 refusal, 0 blanks**, and retained a diagnostic hard-gate survivor set of **0/8**. |
 | `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Existing compose/review/393,216-sample round trip plus schema hash tamper rejection, two independent runtime manager/generator instances, season-authoritative seed/spine/radius, unset-season regression, and brute-force verification of every sampled non-Mixed recipe tile verdict (up to 64). |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm world-scale run uses **16 candidates per arm**, step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **10/16, 9/16, 8/16** survival; survivor feature-scale ranges are **8..268**, **8..60**, **8..92** voxels. Box checks: **185/246,235**, **260/346,060**, **299/397,969** proved/voxels, **0 violations** in every arm; constraint parameter and box-stop violations were also 0. |
-| `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, radius, type, control geometry, and bounds bit-for-bit. |
-| `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check both generated mouths against independent source queries. Answered mouths must match the pure player-fit point within the float envelope; the lower mouth also keeps the 16-point ring and source-footing assertions outside the carve/blend band. This is a local-fit/open-space proxy, not a flood-fill proof. Reports answered/refused mouths and archetypes; fails if either side is vacuous. |
+| `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, landing descriptors, control geometry, and bounds bit-for-bit. |
+| `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check both generated mouths against independent source queries, then audits all 14 inter-strate landing ends: body-derived room dimensions, final-density flat-floor slope, explicit root-network join, seal containment, hot-call/rebuild timing, and targeted `ClassifyTile` box soundness. Reports source-fit/refused mouths and per-archetype landing slopes; fails on any floor, join, seal, or box violation. |
 | `VoxelForgeStrateConnectivityTest.cpp` | `VoxelForge.Generation.StrateConnectivity` / `VoxelForge.Generation.StrateConnectivityRefinement` / `VoxelForge.Generation.VerticalShaftSeamFreedom` | Bounded strate metrics with density-polarity and solid-gap controls, deterministic route rechecks, and refinement sweeps. The refinement test uses the bounded 4-chunk density fixture, fits each measurement AABB to the arrival/departure mouth pair plus three shaft spacings (the prescribed local tree fallback), and caps the fitted control at 120,000,000 cells. It reports exact before/after seed-6 cell counts, reruns every negative with the fitted margin doubled, measures tree orphan candidates/path reachability and roughness-bubble proxies, asserts mouths remain inside the deterministic shaft feature core (the exact axis is an unsupported open cylinder), checks source/mirror physical paths, and requires 16/16 effective arrival→departure results across the 16 VerticalShafts seeds. Margin-binding negatives are reported as measurement limits, never as gap findings. The shaft seam test re-evaluates cell-boundary positions after warming distinct neighbouring chunk contexts. |
 | `VoxelForgeMazeSeamTest.cpp` | `VoxelForge.Generation.MazeSeamFreedom` | Re-evaluates **42** cell-boundary probes after warming six different neighbouring chunk contexts in both legacy and operator-stack paths. Latest result: **0 legacy mismatches, 0 operator mismatches**. The Maze source's 2×2×2 lower-node window is deliberately local; no wide collect is involved. |
 | `VoxelForgeWorldEdgeSealTest.cpp` | `VoxelForge.Generation.WorldEdgeSeal` | Positive samples outside the radius across every fixture strate, bit-identical interior negative control against radius 0, monotonic smooth-ramp check, radius-0 no-op, radial `ClassifyBox`/T1.d proofs brute-forced for every reported voxel, and synthetic plus generated near-rim passage coverage. Emits one aggregate summary with proved-box and voxel counts. |
@@ -711,7 +732,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | 4h — Pinch | 1142 | Passage bottlenecks. |
 | 5 — Worm tunnels | 1241 | abs(noise1)+abs(noise2), masked by distance-to-network (`WormNetworkRange`: braids hugging rooms/tunnels, no far-field speckle; 0 = legacy unmasked). |
 | 6 — Boundary seal | 1274 | Solid top/bottom shells (`ApplyBoundarySeal`). |
-| 7 — Inter-strate passages | 1281 | Carve passages/elevator (`ApplyPassageCarving`). |
+| 7 — Inter-strate passages + landings | `GetDensityWithParams`: 2217; `GetSlabDensity`: 2434+ | Carve passage tubes and deterministic room/connectors, restore their support floors, then leave the final XY seal to the outer MC post (`ApplyPassageModifier` / `ApplyPassageLandingFloorMC`). |
 
 ### 4.2 `GetSlabDensity` (FlatPlain / CrystalChamber) — VoxelGenerator.cpp:1306
 | Step | Line | What |
@@ -720,7 +741,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | 2 — Ceiling surface | 1343 | Formations hang downward (`abs(noise)`). |
 | 3 — Void→base density | 1379 | Solid outside [floor,ceiling]. |
 | 4 — Columns | 1399 | World-space hash grid, full-height. |
-| 5+6 — Seal + passages | 1461 | Same seal/passage carving as TunnelNetwork. |
+| 5+6 — Seal + passages | 1461 | Same seal, passage-tube, landing-room, connector, and support-floor path as TunnelNetwork. |
 
 ---
 
@@ -739,7 +760,7 @@ Stage order (negative=solid throughout). Each stage's anchor:
 | Strate stacking / which strate where | `UVoxelStrateManager::Initialize` :10. |
 | Publish/use an offline season | Create `UVoxelSeasonAsset`, set `SourceManifestJson`, press `ImportSeasonManifestJson`, then assign it to `UVoxelSettings::Season`. |
 | Boundary blend between strates | `GetGenerationParams` :515 + `FStrateGenerationParams::Lerp` (expands `VF_STRATE_PARAM_FIELDS`, StrateTypes.h — new fields go in that list). |
-| Passages between strates | `GeneratePassages` :146 + `EvaluateModifierSDF` :371 + `ApplyPassageCarving` (Generator.cpp:197). |
+| Passages / landing geometry between strates | `GeneratePassages` :146 + `EvaluateModifierSDF` :371 + `ApplyPassageModifier` / `ApplyPassageLandingFloorMC` (StrateManager.cpp) + `ClassifyTile` floor guard (Generator.cpp). |
 | Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:691/709 → `UVoxelDiffLayer::ApplyModification` :63. |
 | Mesh smoothness / normals | Grid-gradient in `GenerateMesh` (`GradAt` lambda), `IsoLevel` (h). |
 | New slab/flat-world generator | `GetSlabDensity` Generator.cpp:1306 + `FSlabGenerationParams` (StrateTypes.h:1019). |

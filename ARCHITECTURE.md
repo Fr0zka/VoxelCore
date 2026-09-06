@@ -48,13 +48,17 @@ keeping natural chambers heterogeneous and allowing 20 m-plus cathedral volumes.
 Validation is deliberately split by cost: bounded regression fixtures remain 4 chunks, while the
 production definition, season defaults, and owner-facing showcase use 8 chunks. The historical
 pre-tree production-height sweep exhausted 256 rolls and found **0/8** complete hard-gate survivors;
-its 7 fine renders, 1 refusal, and 1 blank are retained as the scale baseline. The final
+its 7 fine renders, 1 refusal, and 1 blank are retained as the scale baseline. The historical final
 `VoxelForge` run (`VoxelForgeFullMazeTreeFinal3`) recorded **30 clean successes, 2 warning-bearing,
 0 failures, 0 not-run** in **2,523.978 s**; its regenerated showcase produced **6 fine renders, 2
 refusals, and 0 blanks**. All box-verdict violation counts were **0**, `WorldRadiusVoxels` stayed
 **0**, lateral regions stayed gated, and operator-stack equivalence paths remained bit-identical.
-The two authored-corpus relation findings (2/12) are conservative experiment-envelope findings,
-not box-verdict violations.
+The 2026-09-06 landing validation (`VoxelForgeLandingFinal5`) recorded **30 clean successes, 2
+warning-bearing successes, 0 failures, 0 not-run** across 32 tests in **3,607.746 s**. The strict
+`Composer.Promotion` assertions remain intact and passed; no assertion was weakened. The landing,
+connectivity, seal, box-soundness, determinism, and equivalence tests passed. The two warnings are
+the known gated lateral-region result and the known TunnelNetwork outside-gate sample count; they
+are not landing or box-verdict violations.
 
 ### 8.1 Archetypes (`ECaveGeneratorType`, VoxelStrateTypes.h)
 Each archetype has its own param `USTRUCT` (on `UVoxelStrateDefinition`, EditCondition-gated
@@ -72,7 +76,7 @@ by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispat
 | Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
 
 All density fns share the convention: internal **positive=solid**, apply origin spine →
-vertical boundary seal → inter-strate passages → XY edge seal, then `return -Density` (MC:
+vertical boundary seal → inter-strate passage tube + landing/floor → XY edge seal, then `return -Density` (MC:
 negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
 the global rim cannot be reopened by a post-process; the diff layer remains the explicit player
 override.
@@ -99,7 +103,7 @@ internal densities**, never their parameter vectors: a shaft spacing and a slab 
 commensurable. Internal density is positive solid; the parent is negated once at the MC boundary.
 
 Region cores are built without structural posts. `FLateralRegionBlendOp` resolves the creative
-field, then one parent appends the global spine, vertical seal, passage carve, and XY edge seal in
+field, then one parent appends the global spine, vertical seal, passage carve/landing floor, and XY edge seal in
 the existing fixed order. No region can disable or duplicate those posts. The manifest is an
 offline artifact and the editor hand-off copies it into a worker-local per-chunk cache: the chunk
 prepares a small lattice-site window plus an integer XY query grid, so ordinary voxel evaluation is
@@ -115,12 +119,13 @@ that equal all-air/all-solid signs are safe, but no cross-region uniformity is i
 single sample. The same key is checked when a season manifest is loaded, and `WorldRadiusVoxels`
 remains zero during offline materialisation.
 
-This mechanism is implemented and instrumented, but not ready to promote: the seam-specific
-16-seed passage-mouth audit currently reports **9/16** connected opposite-region pairs, while the
-exact region-zero controls report **11/16**. The same cases are **16/16 valid, non-vacuous, and
-above the 0.50 largest-component survival threshold** before the law gate. No corridor or
-threshold tuning was added. The failed primordial-law gate is therefore retained as a design
-blocker; see `COMPOSER-NOTES.md §3.2b` and the validation log in §10.
+This mechanism is implemented and instrumented, but not ready to promote: the pre-landing
+16-seed passage-mouth audit reported **9/16** connected opposite-region pairs. After the landing
+pass, the current audit reports **4/16**, while the exact region-zero controls also report **4/16**.
+The same cases are **16/16 valid, non-vacuous, and above the 0.50 largest-component survival
+threshold** before the law gate. No corridor or threshold tuning was added. The failed primordial-law
+gate is therefore retained as a design blocker; see `COMPOSER-NOTES.md §3.2b` and the validation log
+in §10.
 
 ⚠️ **The `switch` above is no longer the only density path.** All 8 archetypes also exist as
 **operator stacks**, selected per strate by
@@ -173,12 +178,14 @@ idiom as the vertical seal; at and beyond `R` it forces positive `BaseDensity`. 
 negates once for marching cubes, so the externally visible sealed density is negative (solid).
 
 This is the fourth structural post and is appended automatically by
-`FVoxelOpStack::AppendStructuralPost`, after the spine, vertical seal, and passage carve. Passage
-carving deliberately remains before the edge seal: passages may pierce a vertical strate seal, but
-a passage whose mouth or body reaches the XY rim is overwritten by the edge force and cannot open a
-hole through the world boundary. The legacy density functions apply the same post in the same
-order. `GetDensityAt` reapplies the MC-facing form after disturbances as a backstop for out-of-layout
-air and any disturbance carve; player diff edits still run last by design and remain authoritative.
+`FVoxelOpStack::AppendStructuralPost`, after the spine, vertical seal, and passage tube + landing
+floor. Passage carving deliberately remains before the edge seal: the tube is the intentional
+vertical-boundary crossing, while each landing/connector is clamped inside the strate's vertical
+seal. A passage whose mouth, landing, or body reaches the XY rim is overwritten by the edge force
+and cannot open a hole through the world boundary. The legacy density functions apply the same post
+in the same order. `GetDensityAt` reapplies the MC-facing landing air/floor after disturbances as an
+idempotent support backstop, before the final XY seal; player diff edits still run last by design
+and remain authoritative.
 
 `FXYEdgeSealOp` is `IsXYPure() == true`, uses only a squared radial early-out in the common interior
 case, and returns `AllSolid` from `ClassifyBox` only when the closest point of the whole box is at
@@ -471,14 +478,16 @@ with a flat-top envelope → organic squirm (NOT a 1D zigzag, NOT a same-freq 2-
 `EvaluateModifierSDF` (per voxel) first builds a `thread_local` **per-chunk shortlist** of passages
 whose bounds reach this chunk (rebuilt on chunk change / `PassagesVersion` bump) — chunks with no
 passage near return `FLT_MAX` immediately — then **bounding-sphere-culls** each shortlisted passage
-(`FVoxelPassage::BoundCenter/BoundRadiusSq`). Both are perf-critical (§8.10). The (0,0) surface entry
-is a simple straight tube. Placement, reach, and shape draws for inter-strate passages are keyed by
-`(seed, upper-strate index, connection index, per-value salt)` through `VoxelHash`, so one passage's
-connection count cannot shift any later passage. Global passage settings were removed from
-`VoxelSettings`.
+(`FVoxelPassage::BoundCenter/BoundRadiusSq`). The same shortlist serves the tube, landing SDF, and
+landing-floor membership; no source query, flood fill, or topology search is in the voxel loop. Both
+are perf-critical (§8.10). The (0,0) surface entry is a simple straight tube. Placement, reach, and
+shape draws for inter-strate passages are keyed by `(seed, upper-strate index, connection index,
+per-value salt)` through `VoxelHash`, so one passage's connection count cannot shift any later
+passage. Global passage settings were removed from `VoxelSettings`.
 
-After a passage's XY is selected, `GeneratePassages` asks the **destination** strate for a full lower-mouth
-landing point through the pure free function `VF_SuggestLandingPoint` (`VoxelCaveMorphology`).
+After each passage's XY is selected, `GeneratePassages` asks **both** participating strates for a
+player-fit source point through the pure free function `VF_SuggestLandingPoint`
+(`VoxelCaveMorphology`).
 TunnelNetwork and Underwater keep the nearest hash-room vertical placement at the requested XY, with
 `MakeStrateSeed(world-seed, strate-index)` matching the room graph's existing identity; FlatPlain and
 CrystalChamber recompute their slab void band and reject column-overlap points. Maze snaps to the
@@ -487,13 +496,49 @@ axis of a roughness-safe shaft on the drainage tree within two shaft spacings at
 density, and FloatingIslands
 to a validated blob top within one island spacing.
 Those three return false when no footing exists inside that explicit lateral budget. GeneratePassages
-interpolates the snapped XY through the control-point chain and recomputes its conservative bound;
+interpolates each accepted XY through the control-point chain and recomputes its conservative bound;
 SurfaceWorld remains deliberately unanswerable because production terrain can be selected through
-manager-owned biome/per-column context.
-Declined answers (unsupported or no-footing) keep the historical random reach and emit a warning. This query is source-level
-only — it does not construct an operator stack, touch a cache, or call back into
-`UVoxelStrateManager` while `Initialize` is building the layout. The resulting lower endpoint is
-clamped to the destination's seal-free interior.
+manager-owned biome/per-column context. Declined answers (unsupported or no-footing) keep the
+historical random reach and are reported diagnostically.
+
+The source query proves only a local pose; it does not flood-fill the live network. Therefore every
+inter-strate end also receives an explicit `FVoxelPassageLanding`: a rounded chamber with a hard
+flat floor and a deterministic connector to the strate's guaranteed origin-root network at `(0,0)`.
+This is the join guarantee, including for a source-fit answer — it is not a probability claim about
+a nearby room. The connector is a swept flat-floor corridor with a 5-voxel (1.25 m) radius / 2.5 m
+clear width and a 12-voxel (3 m) clear height. Its 4.5-voxel support inset is enough for the
+1.36-voxel player radius and avoids capping unrelated shaft air; support stops at the configured
+origin-spine radius, so the existing vertical root column remains open. At the root, every connector
+joins an annular hub outside the spine, with a common per-strate floor derived from the sealed
+interior bounds. If the direct floor run would exceed 44°, the deterministic builder inserts a
+level dog-leg before the final ramp. The hub and the connector floor are therefore a real walkable
+network, not a point anchor or nearest-component guess, and no per-passage ordering is involved.
+
+The chamber dimensions come directly from the capsule: player diameter `2×0.34/0.25 = 2.72`
+voxels; required floor width `3/0.25 = 12` voxels; capsule height `2×0.88/0.25 = 7.04` voxels;
+one metre of headroom adds 4 voxels. `HalfWidth=max(7, MouthRadius+2)` leaves
+`2×(HalfWidth−1) >= 12` voxels of flat support after the one-voxel wall inset; the authored room
+is therefore at least 14 voxels (3.5 m) wide. Height is
+`max(12, 7.04+4, 2×MouthRadius+2)`; the stock 8-voxel mouth is an 18-voxel (4.5 m) room.
+`FloorZ=StandingPoint.Z−0.5`, floor thickness is 3 voxels (0.75 m), and the tube centreline
+meets the room at `FloorZ+MouthRadius`, so its lower tangent is the floor and there is no step lip.
+The final-density floor audit samples the flat plane and checks its normal against the explicit ≤44°
+landing contract; it also checks the analytic connector ramps against the same limit. The movement
+CDO currently reports 44.8°, so the landing audit is intentionally the stricter criterion.
+
+The landing is part of the structural post, in the fixed order
+`origin spine → vertical seal → passage tube + landing/floor → XY edge seal`. The floor is applied
+after the passage carve and after MC-space disturbances as a support backstop, still before the
+final XY edge seal. Room/floor Z is clamped inside the vertical seal; the XY edge seal is last and
+wins over every landing or tube near the rim. Thus no landing can breach a strate boundary or the
+world edge. The op-stack `FPassageCarveOp` calls the same manager operation as the legacy path,
+including the floor, and `ClassifyTile` kills both uniform hypotheses around the bidirectional
+landing floor (`Both` in the stack), so an air proof cannot delete support.
+
+The query remains pure — it does not construct an operator stack, touch a cache, or call back into
+`UVoxelStrateManager` while `Initialize` builds the layout. Landing descriptors, connector choice,
+door direction, and bounds are all produced once from the passage seed salts; passages never read
+another passage's result. `LayoutOrderIndependence` compares the complete descriptors bit-for-bit.
 
 ### 8.9 Carving — brush shapes + editor controls
 `FVoxelModification` has `EVoxelBrushShape {Sphere,Box,Capsule}` + `BoxExtent`/`CapsuleEnd`/
@@ -565,7 +610,9 @@ driven by `EditorBrush*` props.
   (incremented in `GeneratePassages`). Most chunks have NO passage near → instant `FLT_MAX` return
   instead of walking the whole `Passages` array per voxel. Conservative superset (chunk bounding
   sphere vs passage bound) ⇒ bit-identical carve. Store indices + version, never pointers (the array
-  is rebuilt on `RebuildStrates`).
+  is rebuilt on `RebuildStrates`). Landing rooms, connector SDFs, and floor membership reuse this
+  exact cache. The final landing audit measured **0.665 μs** per forced rebuild and **0.646 μs**
+  per hot call on the validation machine; source-fit queries run only during `GeneratePassages`.
 - **Gen tasks run at `UE::Tasks::ETaskPriority::BackgroundNormal`** (`LoadTile`): worker gen yields
   to foreground game/render tasks. Without it, raising `MaxConcurrentTasks` past the spare-core count
   saturates the scheduler and starves the frame (the "concurrency > ~12 = stutter" symptom). Keep gen

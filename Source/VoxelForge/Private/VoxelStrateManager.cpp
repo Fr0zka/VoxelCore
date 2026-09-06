@@ -7,6 +7,7 @@
 #include "VoxelSeasonAsset.h"
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
+#include "VoxelDensityPrimitives.h"  // Shared passage carve polarity/strength
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 #include "UObject/UObjectGlobals.h"
@@ -58,6 +59,65 @@ static float PassageFBM(float X, float Seed)
         Freq *= 2.0f;
     }
     return (MaxV > 0.0f) ? (Total / MaxV) : 0.0f;
+}
+
+namespace
+{
+    /**
+     * One shared passage cache for the tube SDF and landing-floor fill.
+     *
+     * The source query and all landing dimensions are resolved by GeneratePassages.  This cache
+     * only narrows the immutable passage array once per (manager, version, chunk); neither the
+     * player-fit stencil nor a topology search can leak into the voxel loop.
+     */
+    struct FPassageEvaluationCache
+    {
+        const UVoxelStrateManager* Owner = nullptr;
+        FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+        uint32 Version = 0xFFFFFFFFu;
+        TArray<int32> Nearby;
+    };
+
+    FPassageEvaluationCache& VF_GetPassageEvaluationCache()
+    {
+        thread_local FPassageEvaluationCache Cache;
+        return Cache;
+    }
+
+    const TArray<int32>& VF_GetNearbyPassages(
+        const UVoxelStrateManager* Manager,
+        const FIntVector& ChunkCoord)
+    {
+        FPassageEvaluationCache& Cache = VF_GetPassageEvaluationCache();
+        const uint32 Version = Manager ? Manager->GetLayoutVersion() : 0u;
+        if (Cache.Owner == Manager && Cache.Chunk == ChunkCoord && Cache.Version == Version)
+        {
+            return Cache.Nearby;
+        }
+
+        Cache.Owner = Manager;
+        Cache.Chunk = ChunkCoord;
+        Cache.Version = Version;
+        Cache.Nearby.Reset();
+        if (!Manager) return Cache.Nearby;
+
+        const FVector ChunkCenter(
+            (ChunkCoord.X + 0.5f) * (float)CHUNK_SIZE,
+            (ChunkCoord.Y + 0.5f) * (float)CHUNK_SIZE,
+            (ChunkCoord.Z + 0.5f) * (float)CHUNK_SIZE);
+        const float ChunkRadius = (float)CHUNK_SIZE * 0.8660254f + 3.0f;
+        const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+        for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
+        {
+            const FVoxelPassage& Passage = Passages[PassageIndex];
+            const float Reach = Passage.BoundRadius + ChunkRadius;
+            if (FVector::DistSquared(ChunkCenter, Passage.BoundCenter) <= Reach * Reach)
+            {
+                Cache.Nearby.Add(PassageIndex);
+            }
+        }
+        return Cache.Nearby;
+    }
 }
 
 bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
@@ -601,10 +661,14 @@ void UVoxelStrateManager::GeneratePassages()
     constexpr uint32 PassageSaltNoiseZ     = 0xA1100008u;
     constexpr uint32 PassageSaltPhase      = 0xA1100009u;
     constexpr uint32 PassageSaltBendFreq   = 0xA110000Au;
+    constexpr uint32 PassageSaltUpperDoor  = 0xA110000Bu;
+    constexpr uint32 PassageSaltLowerDoor  = 0xA110000Cu;
 
     int32 TotalPassages = 0;
     int32 NumAimedAtUpperPlayerFit = 0;
     int32 NumAimedAtLowerPlayerFit = 0;
+    int32 NumUpperRootConnectors = 0;
+    int32 NumLowerRootConnectors = 0;
     TSet<FString> NoQueryArchetypes;
 
     const auto ArchetypeName = [](ECaveGeneratorType Archetype)
@@ -678,6 +742,9 @@ void UVoxelStrateManager::GeneratePassages()
         case ECaveGeneratorType::Maze:
             return Definition.MazeParams.BoundarySealThickness;
 
+        case ECaveGeneratorType::SurfaceWorld:
+            return Definition.SurfaceParams.BoundarySealThickness;
+
         case ECaveGeneratorType::VerticalShafts:
             return Definition.VerticalShaftParams.BoundarySealThickness;
 
@@ -687,6 +754,30 @@ void UVoxelStrateManager::GeneratePassages()
         default:
             return 0.0f;
         }
+    };
+
+    const auto CommonRootFloorFor = [](float StrateTopZ, float StrateBottomZ,
+                                       float BoundarySealThickness) -> float
+    {
+        // The two mouth queries may legitimately return floors near opposite strate faces.  A
+        // shared root level is therefore derived from the strate bounds, never from passage
+        // iteration order. Leave the floor slab and the full 12-voxel connector clearance beyond
+        // the four-voxel passage blend away from both seals; the landing builder repeats this
+        // clamp as its final safety boundary.
+        const float Seal = FMath::Max(BoundarySealThickness, 0.0f);
+        const float InnerBottom = StrateBottomZ + Seal;
+        const float InnerTop = StrateTopZ - Seal;
+        const float ConnectorHeight = FMath::Max(
+            12.0f, FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f);
+        constexpr float PassageBlendSafety = 4.0f;
+        const float MinimumFloor = InnerBottom + 3.0f + PassageBlendSafety;
+        const float MaximumFloor = InnerTop - ConnectorHeight - PassageBlendSafety;
+        if (FMath::IsFinite(MinimumFloor) && FMath::IsFinite(MaximumFloor)
+            && MaximumFloor >= MinimumFloor)
+        {
+            return 0.5f * (MinimumFloor + MaximumFloor);
+        }
+        return 0.5f * (InnerBottom + InnerTop);
     };
 
     //=========================================================================
@@ -983,8 +1074,79 @@ void UVoxelStrateManager::GeneratePassages()
                 Passage.ControlRadii.Add(RadiusAt(T));
             }
 
-            Passage.UpperPoint = Passage.ControlPoints[0];
-            Passage.LowerPoint = Passage.ControlPoints.Last();
+            // The old control-point endpoints were also the player's standing points. That made
+            // a sloped/vertical tube open directly under the capsule. Keep the queried points as
+            // explicit standing anchors, and move only the tube's first/last point to a doorway
+            // tangent to the landing floor. The endpoint-to-anchor distinction is the geometry
+            // that turns a mouth into a place.
+            auto DoorDirectionFrom = [](const FVector& Delta, float Angle) -> FVector
+            {
+                FVector Direction(Delta.X, Delta.Y, 0.0f);
+                if (!Direction.Normalize())
+                {
+                    Direction = FVector(FMath::Cos(Angle), FMath::Sin(Angle), 0.0f);
+                    if (!Direction.Normalize())
+                    {
+                        Direction = FVector(1.0f, 0.0f, 0.0f);
+                    }
+                }
+                return Direction;
+            };
+
+            const FVector UpperDoorDirection = DoorDirectionFrom(
+                Passage.ControlPoints.Num() > 1
+                    ? Passage.ControlPoints[1] - Passage.ControlPoints[0]
+                    : FVector::ZeroVector,
+                PassageRandom01(PassageSaltUpperDoor) * 2.0f * PI);
+            const FVector LowerDoorDirection = DoorDirectionFrom(
+                Passage.ControlPoints.Num() > 1
+                    ? Passage.ControlPoints[Passage.ControlPoints.Num() - 2]
+                        - Passage.ControlPoints.Last()
+                    : FVector::ZeroVector,
+                PassageRandom01(PassageSaltLowerDoor) * 2.0f * PI);
+
+            // A source-fit answer proves only a local pose; none of the pure queries performs a
+            // flood fill over the live strate. Every mouth therefore receives the same explicit
+            // flat-floor connector to the deterministic root, including answered mouths. This
+            // is what makes the join guaranteed rather than merely probable.
+            Passage.UpperLanding = VF_BuildPassageLanding(
+                FVector(UpperX, UpperY, TopZ),
+                Cfg.MouthRadius,
+                UpperDoorDirection,
+                UpperTopZ,
+                UpperBottomZ,
+                UpperDef ? BoundarySealThicknessFor(*UpperDef) : 0.0f,
+                bAimedUpperAtPlayerFitPoint,
+                /*bHasNetworkConnector=*/true,
+                FVector(0.0f, 0.0f,
+                    CommonRootFloorFor(
+                        UpperTopZ, UpperBottomZ,
+                        UpperDef ? BoundarySealThicknessFor(*UpperDef) : 0.0f)),
+                OriginSpineRadius);
+            Passage.LowerLanding = VF_BuildPassageLanding(
+                FVector(LowerX, LowerY, BottomZ),
+                Cfg.MouthRadius,
+                LowerDoorDirection,
+                LowerTopZ,
+                (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
+                LowerDef ? BoundarySealThicknessFor(*LowerDef) : 0.0f,
+                bAimedLowerAtPlayerFitPoint,
+                /*bHasNetworkConnector=*/true,
+                FVector(0.0f, 0.0f,
+                    CommonRootFloorFor(
+                        LowerTopZ, (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
+                        LowerDef ? BoundarySealThicknessFor(*LowerDef) : 0.0f)),
+                OriginSpineRadius);
+            Passage.UpperPoint = Passage.UpperLanding.StandingPoint;
+            Passage.LowerPoint = Passage.LowerLanding.StandingPoint;
+            if (Passage.UpperLanding.bHasNetworkConnector) ++NumUpperRootConnectors;
+            if (Passage.LowerLanding.bHasNetworkConnector) ++NumLowerRootConnectors;
+
+            if (Passage.ControlPoints.Num() > 0)
+            {
+                Passage.ControlPoints[0] = Passage.UpperLanding.DoorPoint;
+                Passage.ControlPoints.Last() = Passage.LowerLanding.DoorPoint;
+            }
             Passage.Radius = 0.0f;
             for (const float ControlRadius : Passage.ControlRadii)
             {
@@ -992,20 +1154,76 @@ void UVoxelStrateManager::GeneratePassages()
             }
             // Fallback / bounds if an invalid authored width produced no positive profile.
             Passage.Radius = FMath::Max(Passage.Radius, FMath::Max(Cfg.MouthRadius, Cfg.MidRadius));
+            Passage.Radius = FMath::Max(Passage.Radius,
+                FMath::Max(Passage.UpperLanding.ConnectorRadius,
+                           Passage.LowerLanding.ConnectorRadius));
 
-            // Bounding sphere over all control points (+ widest radius + blend) for culling. This
-            // remains conservative when either mouth snaps laterally: every slanted segment is
-            // between two control points, and a segment lies inside the sphere containing both
-            // endpoints. Under-sizing this sphere would make EvaluateModifierSDF cull a real
-            // passage and leave a sealed pocket.
+            // Bounding sphere over the tube, both rooms, both floor slabs, and both optional root
+            // connectors (+ widest radius + blend) for culling. Under-sizing this sphere would
+            // cull a real landing and leave a sealed pocket, so the room's full box diagonal is
+            // included rather than treating the standing anchor as a point.
             {
-                FVector Center = FVector::ZeroVector;
-                for (const FVector& CP : Passage.ControlPoints) Center += CP;
-                Center /= (float)Passage.ControlPoints.Num();
-                float MaxDistSq = 0.0f;
+                FVector BoundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
+                FVector BoundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                auto IncludePoint = [&BoundsMin, &BoundsMax](const FVector& Point, float Pad)
+                {
+                    BoundsMin.X = FMath::Min(BoundsMin.X, Point.X - Pad);
+                    BoundsMin.Y = FMath::Min(BoundsMin.Y, Point.Y - Pad);
+                    BoundsMin.Z = FMath::Min(BoundsMin.Z, Point.Z - Pad);
+                    BoundsMax.X = FMath::Max(BoundsMax.X, Point.X + Pad);
+                    BoundsMax.Y = FMath::Max(BoundsMax.Y, Point.Y + Pad);
+                    BoundsMax.Z = FMath::Max(BoundsMax.Z, Point.Z + Pad);
+                };
                 for (const FVector& CP : Passage.ControlPoints)
-                    MaxDistSq = FMath::Max(MaxDistSq, (float)FVector::DistSquared(Center, CP));
-                const float R = FMath::Sqrt(MaxDistSq) + Passage.Radius + 4.0f;
+                {
+                    IncludePoint(CP, Passage.Radius + 4.0f);
+                }
+                const auto IncludeLanding = [&IncludePoint](const FVoxelPassageLanding& Landing)
+                {
+                    const float Height = FMath::Max(Landing.CeilingZ - Landing.FloorZ, 0.0f);
+                    const FVector RoomCenter(
+                        Landing.StandingPoint.X,
+                        Landing.StandingPoint.Y,
+                        (Landing.FloorZ + Landing.CeilingZ) * 0.5f);
+                    const float RoomRadius = FMath::Sqrt(
+                        2.0f * FMath::Square(Landing.HalfWidth)
+                        + 0.25f * FMath::Square(Height))
+                        + Landing.FloorThickness + 4.0f;
+                    IncludePoint(RoomCenter, RoomRadius);
+                    if (Landing.bHasNetworkConnector)
+                    {
+                        const float HubRadius = Landing.RootSpineRadius
+                            + Landing.ConnectorRadius;
+                        const float HubHalfHeight = 0.5f * FMath::Max(
+                            Landing.RootCeilingZ - Landing.RootFloorZ, 0.0f);
+                        IncludePoint(FVector(0.0f, 0.0f,
+                                             (Landing.RootFloorZ + Landing.RootCeilingZ) * 0.5f),
+                                     FMath::Sqrt(FMath::Square(HubRadius)
+                                         + FMath::Square(HubHalfHeight))
+                                         + Landing.FloorThickness + 4.0f);
+                        const float ConnectorHalfHeight = FMath::Max(
+                            0.5f * FMath::Max(
+                                Landing.ConnectorCeilingZ - Landing.FloorZ, 0.0f),
+                            Landing.ConnectorRadius);
+                        IncludePoint(Landing.ConnectorStart,
+                            ConnectorHalfHeight + 4.0f);
+                        if (Landing.bHasConnectorBend)
+                        {
+                            IncludePoint(Landing.ConnectorControl,
+                                ConnectorHalfHeight + 4.0f);
+                        }
+                        IncludePoint(Landing.ConnectorEnd,
+                            ConnectorHalfHeight + 4.0f);
+                    }
+                };
+                IncludeLanding(Passage.UpperLanding);
+                IncludeLanding(Passage.LowerLanding);
+
+                const FVector Center = (BoundsMin + BoundsMax) * 0.5f;
+                float MaxDistSq = 0.0f;
+                MaxDistSq = FMath::Max(MaxDistSq, (float)FVector::DistSquared(Center, BoundsMin));
+                MaxDistSq = FMath::Max(MaxDistSq, (float)FVector::DistSquared(Center, BoundsMax));
+                const float R = FMath::Sqrt(MaxDistSq);
                 Passage.BoundCenter = Center;
                 Passage.BoundRadius = R;
                 Passage.BoundRadiusSq = R * R;
@@ -1028,11 +1246,13 @@ void UVoxelStrateManager::GeneratePassages()
     }
 
     UE_LOG(LogTemp, Log,
-        TEXT("[StrateManager] Passage landing sites: upper %d/%d and lower %d/%d aimed at player-fit source space, %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
+        TEXT("[StrateManager] Passage landings: upper %d/%d and lower %d/%d source-fit; root floor connectors %d/%d; %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
         NumAimedAtUpperPlayerFit,
         TotalPassages,
         NumAimedAtLowerPlayerFit,
         TotalPassages,
+        NumUpperRootConnectors,
+        NumLowerRootConnectors,
         (TotalPassages * 2) - NumAimedAtUpperPlayerFit - NumAimedAtLowerPlayerFit,
         TotalPassages * 2,
         *NoQueryList);
@@ -1080,52 +1300,16 @@ void UVoxelStrateManager::GeneratePassages()
 
 float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const
 {
-    //=========================================================================
-    // PER-CHUNK PASSAGE SHORTLIST
-    //=========================================================================
-    // This runs PER VOXEL (35³ per tile). The vast majority of chunks are nowhere near a
-    // descent passage, yet every voxel still walked the WHOLE Passages array just to reject
-    // each one on a squared-distance test (Passages.Num() × 35³ rejects per tile, all wasted).
-    // Cache, per chunk, the shortlist of passages whose bounds actually reach this chunk —
-    // usually EMPTY → instant FLT_MAX return (no carve). Indices (not pointers) + a version
-    // stamp keep it safe across a GeneratePassages rebuild. Output is bit-identical: the
-    // shortlist is a conservative superset (chunk bounding sphere vs each passage bound).
-    thread_local FIntVector    SL_Chunk(INT32_MAX, INT32_MAX, INT32_MAX);
-    thread_local uint32        SL_Version = 0xFFFFFFFFu;
-    thread_local TArray<int32> SL_Nearby;
-
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
 
-    if (ChunkCoord != SL_Chunk || SL_Version != PassagesVersion)
-    {
-        SL_Chunk   = ChunkCoord;
-        SL_Version = PassagesVersion;
-        SL_Nearby.Reset();
+    // The shortlist is rebuilt once for a (manager, version, chunk) and is shared by the tube,
+    // landing, and floor paths. No source-fit stencil or topology search is allowed below it.
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
 
-        // Chunk bounding sphere (centre + half-diagonal), padded by the blend radius. A passage
-        // is kept iff its bounding sphere overlaps the chunk's — i.e. some voxel here could be
-        // inside its per-voxel reject radius. √3/2 · CHUNK_SIZE ≈ 0.866 · size.
-        const FVector CCenter(
-            (ChunkCoord.X + 0.5f) * (float)CHUNK_SIZE,
-            (ChunkCoord.Y + 0.5f) * (float)CHUNK_SIZE,
-            (ChunkCoord.Z + 0.5f) * (float)CHUNK_SIZE);
-        const float ChunkR = (float)CHUNK_SIZE * 0.8660254f + 3.0f;  // +BlendK
-
-        for (int32 i = 0; i < Passages.Num(); ++i)
-        {
-            const FVoxelPassage& P = Passages[i];
-            const float Reach = P.BoundRadius + ChunkR;
-            if (FVector::DistSquared(CCenter, P.BoundCenter) <= Reach * Reach)
-            {
-                SL_Nearby.Add(i);
-            }
-        }
-    }
-
-    if (SL_Nearby.Num() == 0) return FLT_MAX;   // no passage near this chunk → no carve
+    if (Nearby.Num() == 0) return FLT_MAX;   // no passage near this chunk → no carve
 
     float MinSDF = FLT_MAX;
     const float BlendK = 3.0f;  // Smooth blend for passage junctions
@@ -1136,7 +1320,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     // entry is a simple straight tube. A bounding-sphere reject skips far passages.
     //=========================================================================
     const FVector Pos(WorldX, WorldY, WorldZ);
-    for (int32 PIdx : SL_Nearby)
+    for (int32 PIdx : Nearby)
     {
         const FVoxelPassage& P = Passages[PIdx];
         // BOUNDING-SPHERE REJECT: skip passages this voxel can't possibly be inside.
@@ -1168,9 +1352,123 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
             const float PassageSDF = VoxelSDF::Capsule(Pos, P.UpperPoint, P.LowerPoint, P.Radius);
             MinSDF = VoxelSDF::SmoothMin(MinSDF, PassageSDF, BlendK);
         }
+
+        // A landing is a real room with a hard flat-floor half-space, not a sphere around the
+        // tube endpoint. The optional connector is the same fixed SDF geometry selected during
+        // GeneratePassages; it never performs a source query here.
+        const float UpperLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.UpperLanding);
+        const float LowerLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.LowerLanding);
+        MinSDF = VoxelSDF::SmoothMin(MinSDF, UpperLandingSDF, BlendK);
+        MinSDF = VoxelSDF::SmoothMin(MinSDF, LowerLandingSDF, BlendK);
     }
 
     return MinSDF;
+}
+
+void UVoxelStrateManager::ApplyPassageModifier(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
+    VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
+    ApplyPassageLandingAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVector Position(WorldX, WorldY, WorldZ);
+    for (const int32 PassageIndex : Nearby)
+    {
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding))
+        {
+            // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
+            // support slab. It is deliberately applied after the air carve so a tube can never
+            // tunnel through the floor and leave the player over a void.
+            Density = FMath::Max(Density, BaseDensity);
+            break;
+        }
+    }
+}
+
+void UVoxelStrateManager::ApplyPassageLandingAir(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    if (Nearby.Num() == 0) return;
+
+    const FVector Position(WorldX, WorldY, WorldZ);
+    float MinLandingSDF = FLT_MAX;
+    for (const int32 PassageIndex : Nearby)
+    {
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq)
+        {
+            continue;
+        }
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            const float LandingSDF = VF_EvaluatePassageLandingSDF(Position, *Landing);
+            if (LandingSDF < MinLandingSDF)
+            {
+                MinLandingSDF = LandingSDF;
+            }
+        }
+    }
+
+    if (MinLandingSDF == FLT_MAX) return;
+
+    // Keep the same smooth interior blend used by the passage op. This landing-specific writer is
+    // idempotent because the MC-facing post may run after the structural op already saw the same
+    // voxel. The landing's support floor is restored by the floor writer after this MC-facing pass.
+    VF_ApplyPassageLandingCarving(Density, MinLandingSDF, BaseDensity, SealThickness);
+}
+
+void UVoxelStrateManager::ApplyPassageLandingAirMC(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    // ApplyDisturbances is deliberately an MC-space post-process and can add a bridge or ridge
+    // on top of the structural passage. Reassert only landing air here; the support slab is
+    // restored by ApplyPassageLandingFloorMC immediately afterwards. This stays on the same
+    // thread-local passage shortlist as the hot voxel path and performs no source/topology work.
+    float InternalDensity = -Density;
+    ApplyPassageLandingAir(
+        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+    Density = -InternalDensity;
+}
+
+void UVoxelStrateManager::ApplyPassageLandingFloorMC(
+    float& Density, float WorldX, float WorldY, float WorldZ, float BaseDensity) const
+{
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVector Position(WorldX, WorldY, WorldZ);
+    for (const int32 PassageIndex : Nearby)
+    {
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding))
+        {
+            // Result is in MC convention here (negative = solid). This reassertion is the
+            // structural floor backstop after the optional MC-space disturbance layer.
+            Density = FMath::Min(Density, -BaseDensity);
+            break;
+        }
+    }
 }
 
 bool UVoxelStrateManager::AnyPassageNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const
@@ -1189,6 +1487,99 @@ bool UVoxelStrateManager::AnyPassageNearBox(const FVector& MinVoxel, const FVect
         if (FVector::DistSquared(C, P.BoundCenter) <= Reach * Reach)
         {
             return true;
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
+    const FVector& MinVoxel, const FVector& MaxVoxel) const
+{
+    // A conservative AABB test is enough for the floor's only solid write. False positives cost
+    // a tile; a false negative could classify an air tile uniformly and remove the player's floor.
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (Landing->HalfWidth <= 0.0f || Landing->FloorThickness <= 0.0f)
+            {
+                continue;
+            }
+            const float Pad = 1.0f;
+            const float FloorMinX = Landing->StandingPoint.X - Landing->HalfWidth - Pad;
+            const float FloorMaxX = Landing->StandingPoint.X + Landing->HalfWidth + Pad;
+            const float FloorMinY = Landing->StandingPoint.Y - Landing->HalfWidth - Pad;
+            const float FloorMaxY = Landing->StandingPoint.Y + Landing->HalfWidth + Pad;
+            const float FloorMinZ = Landing->FloorZ - Landing->FloorThickness - Pad;
+            const float FloorMaxZ = Landing->FloorZ + Pad;
+            if (FloorMaxX >= MinVoxel.X && FloorMinX <= MaxVoxel.X
+                && FloorMaxY >= MinVoxel.Y && FloorMinY <= MaxVoxel.Y
+                && FloorMaxZ >= MinVoxel.Z && FloorMinZ <= MaxVoxel.Z)
+            {
+                return true;
+            }
+
+            // The fallback connector carries the same support slab away from the room.  Its
+            // segment is not covered by the room AABB above; omitting it would let a tile that
+            // contains only the connector floor prove AllAir and erase the guaranteed join.
+            if (Landing->bHasNetworkConnector && Landing->ConnectorRadius > 0.0f
+                && FMath::IsFinite(Landing->ConnectorStart.X)
+                && FMath::IsFinite(Landing->ConnectorStart.Y)
+                && FMath::IsFinite(Landing->ConnectorStart.Z)
+                && FMath::IsFinite(Landing->ConnectorEnd.X)
+                && FMath::IsFinite(Landing->ConnectorEnd.Y)
+                && FMath::IsFinite(Landing->ConnectorEnd.Z))
+            {
+                const float ConnectorPad = Landing->ConnectorRadius + Pad;
+                float ConnectorMinX = FMath::Min(
+                    Landing->ConnectorStart.X, Landing->ConnectorEnd.X) - ConnectorPad;
+                float ConnectorMaxX = FMath::Max(
+                    Landing->ConnectorStart.X, Landing->ConnectorEnd.X) + ConnectorPad;
+                float ConnectorMinY = FMath::Min(
+                    Landing->ConnectorStart.Y, Landing->ConnectorEnd.Y) - ConnectorPad;
+                float ConnectorMaxY = FMath::Max(
+                    Landing->ConnectorStart.Y, Landing->ConnectorEnd.Y) + ConnectorPad;
+                if (Landing->bHasConnectorBend)
+                {
+                    ConnectorMinX = FMath::Min(
+                        ConnectorMinX, Landing->ConnectorControl.X - ConnectorPad);
+                    ConnectorMaxX = FMath::Max(
+                        ConnectorMaxX, Landing->ConnectorControl.X + ConnectorPad);
+                    ConnectorMinY = FMath::Min(
+                        ConnectorMinY, Landing->ConnectorControl.Y - ConnectorPad);
+                    ConnectorMaxY = FMath::Max(
+                        ConnectorMaxY, Landing->ConnectorControl.Y + ConnectorPad);
+                }
+                const float ConnectorMinZ = FMath::Min(
+                    Landing->FloorZ, Landing->RootFloorZ)
+                    - Landing->FloorThickness - Pad;
+                const float ConnectorMaxZ = FMath::Max(
+                    Landing->FloorZ, Landing->RootFloorZ) + Pad;
+                if (ConnectorMaxX >= MinVoxel.X && ConnectorMinX <= MaxVoxel.X
+                    && ConnectorMaxY >= MinVoxel.Y && ConnectorMinY <= MaxVoxel.Y
+                    && ConnectorMaxZ >= MinVoxel.Z && ConnectorMinZ <= MaxVoxel.Z)
+                {
+                    return true;
+                }
+
+                if (Landing->RootSpineRadius >= 0.0f)
+                {
+                    const float HubPad = Landing->RootSpineRadius
+                        + Landing->ConnectorRadius + Pad;
+                    const float HubMinZ = Landing->RootFloorZ
+                        - Landing->FloorThickness - Pad;
+                    const float HubMaxZ = Landing->RootFloorZ + Pad;
+                    if (HubPad >= 0.0f
+                        && HubPad >= MinVoxel.X && -HubPad <= MaxVoxel.X
+                        && HubPad >= MinVoxel.Y && -HubPad <= MaxVoxel.Y
+                        && HubMaxZ >= MinVoxel.Z && HubMinZ <= MaxVoxel.Z)
+                    {
+                        return true;
+                    }
+                }
+            }
         }
     }
     return false;

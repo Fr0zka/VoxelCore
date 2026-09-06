@@ -115,7 +115,8 @@ Runtime contains only manifest parsing/verification and recipe evaluation, and `
 remains 0. Generated schema-2 slots have no passage/content/visual record: they therefore use
 deterministic empty/default wider content and zero auto-passages (the origin spine remains). Fixed slots
 may retain an authored definition path as that wider-content bag. Lateral regions remain unshippable at
-the measured 9/16 cross-seam law result.
+the measured **4/16** cross-seam law result after the landing pass (the 9/16 figure below is the
+pre-landing snapshot).
 
 An abbreviated manifest shape is:
 
@@ -268,7 +269,7 @@ through the offline Tier 2 sampler; no runtime generation path calls this API. T
 test took **76.466 s**. The complete `VoxelForge` namespace then passed **24/24 tests (0 failed,
 0 not run)** in **339.797 s**.
 
-### 3.2b Lateral regions — implemented, primordial-law gate failed (2026-09-05)
+### 3.2b Lateral regions — implemented, primordial-law gate failed (2026-09-06 post-landing audit)
 
 The owner's “tunnel network leading to a big chamber and drops into shafts” question changes the
 unit of composition: an archetype is a **region inside a strate**, not the strate's label. Tier 4d
@@ -284,7 +285,7 @@ different region's stack evaluates too and the two **internal densities** are cr
 same linear curve used by the vertical transition (split symmetrically at the bisector). Native
 parameters are never blended: `ShaftSpacing` and a slab's floor/ceiling controls do not share a
 meaning. Region cores omit structural posts; the parent appends the global spine, vertical seal,
-passage carve, and XY edge seal once, in the existing order, after the lateral result. `Density`
+passage tube + landing/floor, and XY edge seal once, in the existing order, after the lateral result. `Density`
 keeps the stack convention positive=solid and is negated only at the MC-facing boundary.
 
 The runtime hand-off remains an explicit manifest copy, not a new runtime composer. A worker
@@ -310,14 +311,13 @@ if this
 feature proceeds, a narrower band or a cheaper density junction needs an owner-approved design
 decision rather than an unreported performance regression.
 
-The primordial law is the blocker. The test deliberately collected **16 actual opposite-region
-arrival/departure mouth pairs**, without adding a corridor, changing a threshold, or filtering for
-success. The lateral parent connected **9/16 (56.25%)**. The same exact region-zero recipe/vector
-and structural settings in a one-region control connected **11/16**, so the underlying structure
-roll is itself not universally connected; that control does not excuse the lateral failure. The
-same 16 seam cases were **valid 16/16, non-vacuous 16/16, and largest-component share ≥ 0.50
-16/16**; including the unsnapped seam law, full hard-gate survival is therefore **9/16**. The
-result is not ready for promotion. A future fix must be a design decision such as a guaranteed
+The primordial law is the blocker. The pre-landing audit connected **9/16 (56.25%)**. After the
+landing geometry pass, the current same-fixture audit still collected **16 actual opposite-region
+arrival/departure mouth pairs** and connected **4/16**; the one-region controls also connected
+**4/16**. The same 16 seam cases remain **valid 16/16, non-vacuous 16/16, and largest-component
+share ≥ 0.50 16/16**; including the unsnapped seam law, current full hard-gate survival is therefore
+**4/16**. The landing itself is geometry-green, but it does not rescue the native region network.
+The result is not ready for promotion. A future fix must be a design decision such as a guaranteed
 cross-seam corridor/landing contract, not a hidden pass threshold or seed selection.
 
 The rendered review artifact is
@@ -1272,15 +1272,49 @@ Passage placement remains deterministic and cheap, and the slanted control-point
 Then the measurement pass flood fill is the net: does the upper mouth's air component reach the lower
 mouth's? If not, re-roll with the attempt folded into the hash.
 
-### 6.5 Findability is mostly DATA, not code
+### ✅ 6.5 The passage mouth becomes a LANDING; the landmark remains DATA — BUILT
 
 `ELandmarkAnchor::PassageMouth` already exists — landmarks can anchor at passage mouths — and
 `FStrateLandmark` already carries a Light-Orb block. **A glowing landmark at every passage mouth is
-authorable today with no code at all.** Beyond that, cheapest first: light (a glow down a tunnel is the
-strongest pull in a cave); sound (works around corners, which light does not — you hear the draft before
-you see the hole); and ⭐ **make the mouth a PLACE, not a hole** — the `SuggestLandingPoint` fix already
-lands the passage in a room, so make that room distinctive. Cracks in walls are forgettable; rooms are
-landmarks, and that is what makes it findable on the *second* visit, which quests need.
+authorable today with no code at all.** The geometry half is now built: every end of every inter-strate
+passage is a deterministic `FVoxelPassageLanding` — a rounded room, a hard flat support floor, a
+doorway tangent to the tube, and a floor-backed connector to the guaranteed `(0,0)` root network.
+The content half is deliberately not built here; landmark meshes, lights, sound, and placement
+policy belong to the content system. The landing supplies the stable, walkable, deterministic
+`PassageMouth` anchor that content placement needs, without inventing landmark geometry here.
+
+The dimensions derive from the capsule and the existing two-abreast corridor rule: player diameter
+`2×0.34/0.25 = 2.72` voxels; floor width `3/0.25 = 12` voxels; capsule height
+`2×0.88/0.25 = 7.04` voxels; and 1 m headroom adds 4 voxels. The room uses
+`HalfWidth=max(7, MouthRadius+2)`, so its one-voxel-inset support floor is at least 12 voxels /
+3 m wide while the authored room is at least 14 voxels / 3.5 m wide. Its height is
+`max(12, 7.04+4, 2×MouthRadius+2)`; with the stock 8-voxel mouth, that is 18 voxels / 4.5 m.
+The floor is at `StandingPoint.Z−0.5`, three voxels / 0.75 m thick, and the tube centreline meets
+the room at `FloorZ+MouthRadius`, so the lower tube tangent is the floor rather than a hole with a
+step. The connector is 5 voxels / 1.25 m radius (2.5 m clear width), 12 voxels / 3 m clear height,
+with a 4.5-voxel support inset; the room, not the transit leg, owns the turn floor. At the root it
+joins a common per-strate annular hub outside the origin spine. A direct ramp is used when it can
+stay ≤44°; otherwise the deterministic connector inserts a level dog-leg before its final ramp.
+The final-density audit checks every floor normal against the explicit ≤44° walkable-slope limit
+(the movement CDO currently reports 44.8°, so this landing contract is conservative).
+
+The join is guaranteed rather than likely because a source query is only a local capsule proof — it
+does not flood-fill the live graph. `GeneratePassages` therefore adds the same deterministic
+connector for answered and refused source queries, ending at the common annular hub around `(0,0)`.
+The hub is the explicit walkable root network; it is outside the vertical spine, so the spine stays
+open while every connector has a floor and a common interior level. It is generated from the
+passage seed and is included in the conservative passage bounds. Its structural
+post order is `origin spine → vertical seal → passage tube + landing/floor → XY edge seal`; the
+landing is clamped inside the vertical seal, the floor backstop runs before the final XY edge seal,
+and the edge seal wins at the world rim. `ClassifyTile` and the op-stack both treat a landing floor
+as bidirectional geometry, so a proved `AllAir` box cannot erase the support.
+
+The stable room/floor/door/connector anchor is exactly the hook the landmark content system needs:
+it is walkable, known, deterministic, and available through the passage-mouth anchor without
+inventing a second placement search. Beyond that, cheapest first: light (a glow down a tunnel is
+the strongest pull in a cave) and sound (works around corners, which light does not — you hear the
+draft before you see the hole). Rooms are what make the mouth findable on the *second* visit, which
+quests need.
 
 ### ✅ 6.6 The layout depends on the pool's CONTENTS, not its ORDER (BUILT + TESTS GREEN)
 
@@ -1374,7 +1408,9 @@ refactor, where three weeks of correct work produced a world unchanged by a sing
 - ✅ **`SuggestLandingPoint` on field sources; passages aim at it** (§6.4) — DONE, **both mouths**.
   ⚠️ It shipped HALF BUILT for weeks: only the LOWER mouth was ever aimed. See §14.3 — the ring proxy
   could not see it, and only the Tier 2 connectivity measurement could.
-- ⬜ **The passage mouth becomes a room plus a distinctive landmark** (§6.5) — not started.
+- ✅ **The passage mouth becomes a room plus a distinctive landmark hook** (§6.5) — BUILT for the
+  geometry: both ends get deterministic walkable landings, floors, and root-network connectors.
+  Landmark content itself remains intentionally with the content system.
 - ⬜ **`SurfaceWorld` still refuses the query** — it needs manager-resolved biome context, which
   cannot be answered from a pure free function. Open.
 
@@ -1558,7 +1594,7 @@ law has a design-level fix.
 
 ---
 
-## 11. Tier 1 status — passages aim at player-fit source space (pure local stencil)
+## 11. Tier 1 status — passages aim at player-fit source space (pure local stencil; foundation for §6.5)
 
 **Updated 2026-09-06.** `VF_SuggestLandingPoint` (in `VoxelCaveMorphology`) is a **pure free function**
 of (archetype, params, seed, desired XY, lateral budget) — it touches no operator stack, no
@@ -1579,6 +1615,11 @@ ledge-side offset above its lower seal, or a FloatingIslands top surface. The lo
 large connected component; that question remains in the measurement pass. When no legal local pose
 exists inside the bounded source neighbourhood, **the random reach and original XY are preserved
 unchanged**.
+
+This section is the source-selection contract, not the finished mouth geometry. §6.5 now wraps every
+accepted or refused result in a structural landing: the source result chooses a deterministic anchor
+when available, while the manager supplies the room, flat floor, doorway, and guaranteed root-network
+connector that make the anchor a place to stand. The source query remains pure and manager-free.
 
 ### ⚠️ Coverage is source-dependent and the number is the point
 The failing pre-fix measurement was:
@@ -1632,7 +1673,7 @@ is the only thing standing between a placement change and silent bedrock passage
 (2026-08-30).** The room-centre correction below remains useful history, but it did not prove a
 player-sized landing or a large connected component.
 
-### 12.1 2026-09-06 player-fit landing pass
+### 12.1 2026-09-06 player-fit source-query pass (historical, before landing geometry)
 
 The next correction keeps the pure/re-entrant boundary intact and replaces the query's open-air
 claim with a local player-pose claim. Both the upper and lower mouths query their own source
@@ -1678,7 +1719,7 @@ passed; the full `VoxelForge` namespace finished with **29 successes, 2 known wa
 0 not-run** in 2,388.35 s. The warnings remain the gated lateral-region 9/16 law and the known
 TunnelNetwork op-stack outside-gate sample count; box violations stayed zero.
 
-### 12.2 2026-09-06 Maze spanning-tree correction
+### 12.2 2026-09-06 Maze spanning-tree correction (historical, before landing geometry)
 
 The Maze lattice no longer uses independent per-edge hash gating. Each non-origin cell chooses one
 parent from the non-zero coordinate axes and steps one unit toward the origin. The parent reduces
@@ -1738,14 +1779,102 @@ rebuild and **0.150 μs/call** for 20,000 hot evaluations; the final namespace r
 in the thread-local rebuild.
 
 The regenerated owner-facing artifact is
-`E:/Projet Unreal/VoxelM/Saved/VoxelForge/Showcase/index.html`; the selected Maze card is
+`E:/Projet Unreal/VoxelM/Saved/VoxelForge/Showcase/index.html`; the current Maze card is
 `candidate_1003_plan.png` (with matching `candidate_1003_vertical.png` and fine ROI variants).
-The post-fix showcase rendered **6 fine views**, refused **2**, and produced **0 blank** cards.
+The landing pass rendered **8 fine views**, refused **0**, and produced **0 blank** cards. The
+showcase's diagnostic player-fit gate still found **0/8 hard-gate survivors**; the cards are kept
+as walkable geometry previews rather than pretending that unresolved inter-landing law is solved.
 
 The final full namespace verification is `Saved/AutomationReports/VoxelForgeFullMazeTreeFinal3/index.json`:
 **32 tests, 30 clean successes, 2 warning-bearing successes, 0 failures, 0 not-run** in **2,523.978 s**.
 The two warnings are the pre-existing gated lateral-region result and the known TunnelNetwork
 outside-gate sample count; neither is a Maze or box-soundness failure.
+
+### 12.3 2026-09-06 §6.5 landing geometry pass
+
+The mouth is now a place rather than the end of a bore. `GeneratePassages` builds both ends of all
+seven inter-strate passages as `FVoxelPassageLanding` descriptors. Each descriptor contains a
+rounded room, a three-voxel support slab, a tube doorway at the floor tangent, and an explicit
+flat-floor connector to the deterministic `(0,0)` origin-root network. The source query still does
+the local archetype selection; the connector is present for both answered and refused queries
+because a local capsule proof is not a component proof.
+
+The body arithmetic is: diameter `2×0.34/0.25 = 2.72` voxels; minimum turn floor `3/0.25 = 12`
+voxels; capsule height `2×0.88/0.25 = 7.04` voxels; and one metre of headroom `=4` voxels.
+`HalfWidth=max(7,MouthRadius+2)` leaves a one-voxel-inset flat support floor at least 12 voxels /
+3 m across and an authored room at least 14 voxels / 3.5 m across. Height is
+`max(12,7.04+4,2×MouthRadius+2)`; stock mouth radius 8 therefore produces an 18-voxel / 4.5 m
+room. The tube centreline enters at `FloorZ+MouthRadius`, so its lower tangent is the room floor.
+The connector is 5 voxels / 1.25 m radius (2.5 m clear width), 12 voxels / 3 m clear height, and
+a 4.5-voxel support inset. It joins the common per-strate annular hub outside the origin spine;
+the direct ramp is used only when it stays ≤44°, otherwise a deterministic level dog-leg precedes
+the final ramp. All 14 landing floors passed the final-density slope bracket; worst measured room
+gradient was `0.058998`, below the explicit 44° limit `tan(44°)=0.965689`, and the worst
+analytic connector gradient was `0.522406` (walkable limit `0.965689`). The per-end values were recorded by
+`VoxelForge.Determinism.PassageLandsInOpenSpace` without per-sample logging.
+
+The focused landing audit reported **14/14** floor/slope passes, **14/14** explicit root-network
+connectors, **0** seal violations, and **0** geometry/floor failures. The targeted tile audit saw
+**14** floor boxes, **0** uniform proofs (`AllSolid=0`, `AllAir=0`), and **0** brute-force verdict
+violations. The connector itself is a guaranteed walkable branch to the structural root; the
+separate player-fit law below correctly remains an empirical test of the native network between
+the two landing branches, especially when their floor heights differ.
+The same audit measured the passage shortlist at **0.665 μs** per forced rebuild and **0.646 μs**
+per hot call on the validation machine; source queries and landing construction remain outside the
+voxel loop.
+
+The support strip stops at the configured origin-spine radius; this preserves the existing vertical
+air column rather than capping it with a landing floor. The connector still reaches the spine
+boundary, and the full-resolution direct-walk assertion remains enabled.
+
+Final player-fit component sizes from the fitted-window audit were:
+
+The table below is the fixed H3 fitted-window identity used by `ScaleDiagnosis`. Separately, the
+specific 31.9M-cell whole-strate Maze comparison cited by §6.5 changed from the supplied
+**172-cell arrival / 4-cell departure** pocket to **1,235 / 2,938** after the landing. That is a
+substantial improvement at both mouths, but it still has a **71.896-voxel** gap and remains
+`NotConnectedAtThisResolution`.
+
+| Archetype | Before: fit / components / largest / arrival / departure / gap / law | After: fit / components / largest / arrival / departure / gap / law |
+|---|---|---|
+| CrystalChamber | 655 / 197 / 24 / 1 / 1 / 47.529 / NotConnectedAtThisResolution | 1,575 / 90 / 286 / 286 / 274 / 155.042 / NotConnectedAtThisResolution |
+| FlatPlain | 1,116 / 45 / 259 / 1 / 1 / 48.104 / NotConnectedAtThisResolution | 2,817 / 11 / 2,130 / 268 / 273 / 155.042 / NotConnectedAtThisResolution |
+| FloatingIslands | 4 / 2 / 3 / 1 / 1 / 0.000 / Connected | 72 / 1 / 72 / 72 / 72 / 0.000 / Connected |
+| Maze | 2,801 / 309 / 176 / 43 / 81 / 206.630 / NotConnectedAtThisResolution | 12,384 / 340 / 3,210 / 3,210 / 3,210 / 0.000 / Connected |
+| SurfaceWorld | 713 / 520 / 6 / 1 / 1 / 110.648 / NotConnectedAtThisResolution | 2,256 / 297 / 286 / 286 / 268 / 164.250 / NotConnectedAtThisResolution |
+| TunnelNetwork | 2,748 / 467 / 1,292 / 2 / 1 / 164.405 / NotConnectedAtThisResolution | 6,683 / 227 / 3,841 / 3,841 / 269 / 155.042 / NotConnectedAtThisResolution |
+| Underwater | 337 / 86 / 35 / 3 / 11 / 142.499 / NotConnectedAtThisResolution | 5,780 / 117 / 3,838 / 3,838 / 267 / 155.042 / NotConnectedAtThisResolution |
+| VerticalShafts | 1,156 / 112 / 96 / 3 / 36 / 94.000 / NotConnectedAtThisResolution | refused: fitted origin-inclusive grid exceeded `MaxCells` |
+
+Thus the restricted player-fit tally is **1/8 before** and **2/7 after** of the measured archetypes,
+with **0** after connections through four cells and **1/8 refused** (VerticalShafts). Maze's
+origin-inclusive fitted window is connected, but its independent whole-strate 31,881,528-cell
+step-1 window is not: **119,479 fit cells / 2,948 components / largest 11,418 / arrival 1,235 /
+departure 2,938 / gap 71.896**, so this is not a cropped-window victory. The hard independent
+VerticalShafts air-network refinement is a different, larger check and passed **16/16** fitted
+arrival→departure seeds. The remaining player-fit misses are therefore between substantial
+landing components and are not being hidden by a relaxed assertion or tuned toward a component
+count.
+
+The final UE 5.7 validation was the requested editor build (4 actions, succeeded; 11.59 s), followed by
+`VoxelForgeLandingFinal5`: **32 tests, 30 clean successes, 2 warning-bearing successes, 0 failures,
+0 not-run** in **3,607.746 s**. `Composer.Promotion` passed with its strict existing gates; no
+assertion was weakened. The two warning-bearing tests are the gated lateral-region audit (**4/16**)
+and the known TunnelNetwork op-stack outside-gate sample count; landing, connectivity, seal,
+The namespace's showcase child evaluated **256** rolls (**82** eligible single-region, **174**
+multi-region skipped while the lateral gate is off) and regenerated
+`E:/Projet Unreal/VoxelM/Saved/VoxelForge/Showcase/index.html` with **7 fine renders, 1 refusal,
+0 blanks**.
+
+The landing audit's per-end final-density floor gradients (lower / upper where present) were:
+TunnelNetwork **0.044387**; FlatPlain **0.001678 / 0.058998**; CrystalChamber
+**0.001434 / 0.006241**; Maze **0.004608 / 0.020844**; SurfaceWorld **0.012390 / 0.012970**;
+VerticalShafts **0.000061 / 0.018677**; FloatingIslands **0.005249 / 0.028687**; Underwater
+**0.000061 / 0.000061**. All 14 passed against the explicit 44° walkable gradient limit
+**0.965689** (`tan(44°)`).
+The corresponding analytic connector gradients were **0.183831, 0.149547, 0.522406, 0.285965,
+0.037782, 0.113750, 0.069551, 0.215350, 0.189820, 0.201735, 0.132101, 0.157017, 0.011850,
+0.028576** (14/14; worst **0.522406**, limit **0.965689**).
 
 ### ⚠️ Correct the record: commit `1ab8c0c` overstated what worked
 It reported *"3 checked, 48/48 ring samples air"* and read as Tier 1 working. A million-seed sweep later
@@ -1961,16 +2090,17 @@ infinite Maze graph is disconnected.
 
 | window | exact window / grid | MaxCells | fit cells | components | largest | arrival / departure | gap (voxels) | law |
 |---|---|---:|---:|---:|---:|---:|---:|---|
-| current mouth-AABB + margin | `X[-84.1,168.7) Y[39.5,53.3) Z[-1175,-937)`, `253×14×238`, `842,996` cells, step 1 | 4,000,000 | 1,352 | 50 | 237 | 128 / 1 | 254.492 | `NotConnectedAtThisResolution` |
-| origin-inclusive mouth-AABB + margin | `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` cells, step 1 | 4,000,000 | 9,598 | 309 | 845 | 120 / 3 | 274.811 | `NotConnectedAtThisResolution` |
-| whole-strate centered origin cap window | `X[-183,183) Y[-183,183) Z[-1175,-937)`, `366×366×238`, `31,881,528` cells, step 1 | 32,000,000 | 115,578 | 2,903 | 11,418 | 172 / 4 | 274.811 | `NotConnectedAtThisResolution` |
+| current mouth-AABB + margin | `X[-84.1,168.7) Y[39.5,53.3) Z[-1175,-937)`, `253×14×238`, `842,996` cells, step 1 | 4,000,000 | 2,041 | 58 | 510 | 510 / 294 | 254.370 | `NotConnectedAtThisResolution` |
+| origin-inclusive mouth-AABB + margin | `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` cells, step 1 | 4,000,000 | 12,384 | 340 | 3,210 | 3,210 / 3,210 | 0.000 | `Connected` |
+| whole-strate centered origin cap window | `X[-183,183) Y[-183,183) Z[-1175,-937)`, `366×366×238`, `31,881,528` cells, step 1 | 32,000,000 | 119,479 | 2,948 | 11,418 | 1,235 / 2,938 | 71.896 | `NotConnectedAtThisResolution` |
 
-The origin-inclusive box did **not** flip to `Connected`, and the larger centered window did not
-either. The hypothesis is therefore **not confirmed** for this candidate. The whole-strate probe
-used an explicit 32M cap so it could remain a real step-1 player-fit measurement; the production
-fine-law cap remains 4M. A step-2 player-fit probe is not equivalent here: the player-fit API
-intentionally refuses every `SampleStep != 1` because the capsule stencil cannot be resolved at
-that resolution.
+The origin-inclusive box **did** flip this candidate to `Connected`, but the larger centered
+whole-strate window did not. The result is therefore a useful local join diagnosis, not a claim that
+the native Maze strate is connected end-to-end: the 31.9M-cell measurement is the controlling
+whole-strate result. The whole-strate probe used an explicit 32M cap so it could remain a real
+step-1 player-fit measurement; the production fine-law cap remains 4M. A step-2 player-fit probe
+is not equivalent here: the player-fit API intentionally refuses every `SampleStep != 1` because
+the capsule stencil cannot be resolved at that resolution.
 
 ### 16.2 Part B — route-aware window policy
 
@@ -1985,10 +2115,10 @@ The policy used by the eight-row law is:
 - mouth-AABB plus capsule margin: `CrystalChamber`, `FlatPlain`, `SurfaceWorld`, and
   `FloatingIslands`.
 
-The first group is origin-rooted by its actual topology: Maze parent chains, VerticalShafts
+The first group is origin-rooted by its actual native topology: Maze parent chains, VerticalShafts
 drainage-tree chains, and the origin-flowing room graph shared by TunnelNetwork/Underwater. The
-global structural spine exists for every stack, but it is not treated as the promised route for
-the four local/independent families.
+landing pass also supplies an explicit structural root hub for every archetype, but this diagnostic
+keeps that hub separate from the native player-fit law so it cannot hide a broken archetype network.
 
 ### 16.3 Part C — corrected eight-row law
 
@@ -1997,24 +2127,23 @@ window column is part of the result, not an omitted implementation detail.
 
 | archetype | player-fit window (`X/Y/Z`, grid, cells) | fit cells | components | largest | arrival / departure | gap (voxels) | law |
 |---|---|---:|---:|---:|---:|---:|---|
-| CrystalChamber | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-537,-295)`, `27×68×242`, `444,312` | 992 | 102 | 165 | 40 / 6 | 50.070 | `NotConnectedAtThisResolution` |
-| FlatPlain | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-534,-298)`, `27×68×236`, `433,296` | 2,346 | 9 | 2,337 | 1 / 2,337 | 138.105 | `NotConnectedAtThisResolution` |
-| FloatingIslands | mouth-AABB + margin; `X[-143.5,-135.5) Y[121.8,129.8) Z[-537,-295)`, `8×8×242`, `15,488` | 0 | 0 | 0 | 0 / 0 | -1.000 | `StartCellNotPlayerFit` |
-| Maze | origin-inclusive mouth-AABB + margin; `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` | 9,598 | 309 | 845 | 120 / 3 | 274.811 | `NotConnectedAtThisResolution` |
-| SurfaceWorld | mouth-AABB + margin; `X[-133.7,-76.1) Y[-68.8,47.5) Z[-1495,-1257)`, `58×117×238`, `1,615,068` | 1,720 | 248 | 801 | 1 / 3 | 101.454 | `NotConnectedAtThisResolution` |
-| TunnelNetwork | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-536,-296)`, `179×68×240`, `2,921,280` | 3,684 | 213 | 1,176 | 108 / 82 | 83.361 | `NotConnectedAtThisResolution` |
-| Underwater | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-535,-297)`, `179×68×238`, `2,896,936` | 1,669 | 79 | 618 | 109 / 109 | 0.000 | `CoarseLiedBudgetExhausted` (**unknown**, not a pass) |
+| CrystalChamber | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-537,-295)`, `27×68×242`, `444,312` | 1,575 | 90 | 286 | 286 / 274 | 155.042 | `NotConnectedAtThisResolution` |
+| FlatPlain | mouth-AABB + margin; `X[-178.9,-152.8) Y[-38.2,29.1) Z[-534,-298)`, `27×68×236`, `433,296` | 2,817 | 11 | 2,130 | 268 / 273 | 155.042 | `NotConnectedAtThisResolution` |
+| FloatingIslands | mouth-AABB + margin; `X[-143.5,-135.5) Y[121.8,129.8) Z[-537,-295)`, `8×8×242`, `15,488` | 72 | 1 | 72 | 72 / 72 | 0.000 | `Connected` |
+| Maze | origin-inclusive mouth-AABB + margin; `X[-84.1,168.7) Y[0.0,53.3) Z[-1175,-937)`, `253×54×238`, `3,251,556` | 12,384 | 340 | 3,210 | 3,210 / 3,210 | 0.000 | `Connected` |
+| SurfaceWorld | mouth-AABB + margin; `X[-133.7,-76.1) Y[-68.8,47.5) Z[-1495,-1257)`, `58×117×238`, `1,615,068` | 2,256 | 297 | 286 | 286 / 268 | 164.250 | `NotConnectedAtThisResolution` |
+| TunnelNetwork | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-536,-296)`, `179×68×240`, `2,921,280` | 6,683 | 227 | 3,841 | 3,841 / 269 | 155.042 | `NotConnectedAtThisResolution` |
+| Underwater | origin-inclusive mouth-AABB + margin; `X[-178.9,0.0) Y[-38.2,29.1) Z[-535,-297)`, `179×68×238`, `2,896,936` | 5,780 | 117 | 3,838 | 3,838 / 267 | 155.042 | `NotConnectedAtThisResolution` |
 | VerticalShafts | origin-inclusive mouth-AABB + margin; **refused before allocation** because the required grid exceeds `MaxCells=4,000,000` | — | — | — | — | — | `REFUSED(MaxCells)` |
 
-The valid-row tally is **0/7 Connected**, with **1/8 refused** and one `CoarseLiedBudgetExhausted`
-unknown. The old one-cell/one-pocket success is not present in this corrected table.
+The valid-row tally is **2/7 Connected**, with **1/8 refused** and **0** unknown results. Neither
+connected row is a ≤4-cell pocket: `after_connected_through_4_cells=0`.
 
 ### 16.4 Plain verdict
 
-The remaining failure is not the cropped measurement window. Maze remains disconnected in player-fit
-volume even when the origin is covered and when the full 32M-cell step-1 centered window is measured.
-The proven spanning-tree graph and the player-fit volume are different claims: the graph has a route,
-but the generated player-fitting corridor/mouth volume does not currently provide a continuous route
-from these two passage mouths. The smallest next generation task is therefore at the mouths or their
-player-fit join to the corridor network (with the possibility of a fine-floor/stencil break along
-the route), not another window, size, density, or topology tuning pass.
+The remaining failure is not solved by treating a local origin-inclusive window as the whole strate:
+that Maze window is connected, while the full 32M-cell step-1 centered window remains disconnected.
+The proven spanning-tree graph and the player-fit volume are different claims. The landing branches
+are substantial and explicit-root-connected, but the native player-fitting route between them still
+fails at whole-strate scale. That is a genuine between-landings/archetype-network finding, not a
+measurement crop, a tiny landing pocket, or a weakened assertion.

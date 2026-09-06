@@ -4,6 +4,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
 
 #include "VoxelCaveMorphology.h"
@@ -65,6 +66,29 @@ namespace
             return 0.0f;
         }
     }
+
+    float BoundarySealFor(const UVoxelStrateDefinition& Definition)
+    {
+        switch (Definition.GeneratorType)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return Definition.GenerationParams.BoundarySealThickness;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return Definition.SlabParams.BoundarySealThickness;
+        case ECaveGeneratorType::Maze:
+            return Definition.MazeParams.BoundarySealThickness;
+        case ECaveGeneratorType::SurfaceWorld:
+            return Definition.SurfaceParams.BoundarySealThickness;
+        case ECaveGeneratorType::VerticalShafts:
+            return Definition.VerticalShaftParams.BoundarySealThickness;
+        case ECaveGeneratorType::FloatingIslands:
+            return Definition.FloatingIslandParams.BoundarySealThickness;
+        default:
+            return 0.0f;
+        }
+    }
 }
 
 bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
@@ -103,6 +127,27 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     bool bAllAnswerableMouthRingsHaveAir = true;
     bool bAllAnswerableFootingsAreValid = true;
     bool bAllAnswerableEndpointsMatchQuery = true;
+
+    int32 NumLandingEnds = 0;
+    int32 NumLandingFloorsPassed = 0;
+    int32 NumLandingFloorFailures = 0;
+    int32 NumLandingNetworkJoins = 0;
+    int32 NumLandingSealFailures = 0;
+    int32 NumLandingFloorBoxes = 0;
+    int32 NumLandingBoxProofs = 0;
+    int32 NumLandingBoxAllSolid = 0;
+    int32 NumLandingBoxAllAir = 0;
+    int32 NumLandingBoxViolations = 0;
+    int32 NumLandingSourceFit = 0;
+    int32 NumLandingConnectorSlopesPassed = 0;
+    int32 NumLandingConnectorSlopeFailures = 0;
+    float WorstLandingFloorGradient = 0.0f;
+    float WorstLandingConnectorGradient = 0.0f;
+    FString FirstLandingFailure;
+    FString LandingSlopeReport;
+    constexpr float LandingWalkableAngleDegrees = 44.0f;
+    const float LandingWalkableSlope = FMath::Tan(
+        FMath::DegreesToRadians(LandingWalkableAngleDegrees));
 
     for (const FVoxelPassage& Passage : Passages)
     {
@@ -279,8 +324,9 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         ++NumChecked;
         AnsweredArchetypes.Add(static_cast<uint8>(Definition->GeneratorType));
 
-        // Control-point endpoints are pinned to the complete query result, including any lateral
-        // snap. A mismatch here means GeneratePassages used stale XY or stale Z downstream.
+        // Standing endpoints remain pinned to the complete query result, including any lateral
+        // snap. The tube endpoint is now the landing door, so this intentionally compares the
+        // public standing anchor rather than the first/last control point.
         if (!FMath::IsNearlyEqual(Passage.LowerPoint.X, SuggestedPoint.X, 0.01f)
             || !FMath::IsNearlyEqual(Passage.LowerPoint.Y, SuggestedPoint.Y, 0.01f)
             || !FMath::IsNearlyEqual(Passage.LowerPoint.Z, SuggestedPoint.Z, 0.01f))
@@ -451,6 +497,337 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         }
     }
 
+    //==========================================================================
+    // LANDING GEOMETRY — the mouth is now measured as a room, not as a tube.
+    //==========================================================================
+    // Use the final production density, including the legacy structural post and any
+    // disturbance backstop. Five points on every floor give a small numerical walkability
+    // stencil; the floor writer itself is a plane, but the test must inspect the resulting field.
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (Passage.UpperStrateIndex == Passage.LowerStrateIndex) continue;
+
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        const int32 StrateIndices[] = {
+            Passage.UpperStrateIndex, Passage.LowerStrateIndex };
+        for (int32 EndIndex = 0; EndIndex < 2; ++EndIndex)
+        {
+            ++NumLandingEnds;
+            const FVoxelPassageLanding& Landing = *Landings[EndIndex];
+            const int32 StrateIndex = StrateIndices[EndIndex];
+            const UVoxelStrateDefinition* Definition = Layout.IsValidIndex(StrateIndex)
+                ? Layout[StrateIndex].Definition : nullptr;
+
+            auto RecordFailure = [&](const FString& Message)
+            {
+                if (FirstLandingFailure.IsEmpty()) FirstLandingFailure = Message;
+            };
+
+            if (Definition == nullptr
+                || Landing.HalfWidth <= 0.0f
+                || Landing.CeilingZ <= Landing.FloorZ
+                || !FMath::IsFinite(Landing.FloorZ)
+                || !FMath::IsFinite(Landing.CeilingZ)
+                || !FMath::IsFinite(Landing.HalfWidth))
+            {
+                ++NumLandingFloorFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("invalid landing descriptor at passage strate end %d/%d"),
+                    Passage.UpperStrateIndex, Passage.LowerStrateIndex));
+                continue;
+            }
+
+            const float StrateTopZ = (float)(Layout[StrateIndex].TopChunkZ + 1) * CHUNK_SIZE;
+            const float StrateBottomZ = (float)Layout[StrateIndex].BottomChunkZ * CHUNK_SIZE;
+            const float Seal = BoundarySealFor(*Definition);
+            if (!(Landing.FloorZ > StrateBottomZ + Seal)
+                || !(Landing.CeilingZ < StrateTopZ - Seal))
+            {
+                ++NumLandingSealFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("landing at strate %d reaches its seal (floor %.3f, ceiling %.3f, interior %.3f..%.3f)"),
+                    StrateIndex, Landing.FloorZ, Landing.CeilingZ,
+                    StrateBottomZ + Seal, StrateTopZ - Seal));
+            }
+
+            if ((Landing.StandingPoint - (EndIndex == 0
+                    ? Passage.UpperPoint : Passage.LowerPoint)).SizeSquared() > 0.0001f)
+            {
+                ++NumLandingFloorFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("landing standing anchor does not match passage %s point at strate %d"),
+                    EndIndex == 0 ? TEXT("upper") : TEXT("lower"), StrateIndex));
+            }
+
+            const bool bWidthAndHeadroom = Landing.HalfWidth * 2.0f >= 12.0f - 0.01f
+                && Landing.CeilingZ - Landing.FloorZ >= 12.0f - 0.01f;
+            const bool bDoorTangent = FMath::IsNearlyEqual(
+                Landing.DoorPoint.Z - Landing.FloorZ,
+                Passage.Radius >= 0.0f ? FMath::Max(
+                    Passage.ControlRadii.Num() > 0
+                        ? Passage.ControlRadii[0] : Passage.Radius,
+                    1.0f) : 1.0f,
+                0.01f);
+            if (!bWidthAndHeadroom || !bDoorTangent)
+            {
+                ++NumLandingFloorFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("landing at strate %d failed body/door arithmetic (width %.3f, height %.3f, door rise %.3f)"),
+                    StrateIndex, Landing.HalfWidth * 2.0f,
+                    Landing.CeilingZ - Landing.FloorZ,
+                    Landing.DoorPoint.Z - Landing.FloorZ));
+            }
+
+            const FVector FloorSamples[] = {
+                Landing.StandingPoint,
+                Landing.StandingPoint + FVector(2.0f, 0.0f, 0.0f),
+                Landing.StandingPoint + FVector(-2.0f, 0.0f, 0.0f),
+                Landing.StandingPoint + FVector(0.0f, 2.0f, 0.0f),
+                Landing.StandingPoint + FVector(0.0f, -2.0f, 0.0f) };
+            float SurfaceHeights[UE_ARRAY_COUNT(FloorSamples)] = {};
+            bool bFloorPassed = true;
+            float LandingGradient = -1.0f;
+            for (int32 SampleIndex = 0; SampleIndex < UE_ARRAY_COUNT(FloorSamples); ++SampleIndex)
+            {
+                const FVector& Sample = FloorSamples[SampleIndex];
+                const float Below = World.Generator->GetDensityAt(
+                    Sample.X, Sample.Y, Landing.FloorZ - 1.0f);
+                const float Above = World.Generator->GetDensityAt(
+                    Sample.X, Sample.Y, Landing.FloorZ + 1.0f);
+                const float Denominator = Above - Below;
+                if (!FMath::IsFinite(Below) || !FMath::IsFinite(Above)
+                    || !(Below < 0.0f) || !(Above >= 0.0f)
+                    || !(Denominator > 0.0f))
+                {
+                    bFloorPassed = false;
+                    continue;
+                }
+                SurfaceHeights[SampleIndex] = Landing.FloorZ - 1.0f
+                    + FMath::Clamp(-Below / Denominator, 0.0f, 1.0f) * 2.0f;
+            }
+
+            if (bFloorPassed)
+            {
+                float MaxGradient = 0.0f;
+                for (int32 SampleIndex = 1; SampleIndex < UE_ARRAY_COUNT(FloorSamples); ++SampleIndex)
+                {
+                    MaxGradient = FMath::Max(MaxGradient,
+                        FMath::Abs(SurfaceHeights[SampleIndex] - SurfaceHeights[0]) / 2.0f);
+                }
+                LandingGradient = MaxGradient;
+                WorstLandingFloorGradient = FMath::Max(WorstLandingFloorGradient, MaxGradient);
+                const float NormalZ = 1.0f / FMath::Sqrt(1.0f + MaxGradient * MaxGradient);
+                bFloorPassed = NormalZ + KINDA_SMALL_NUMBER >= FMath::Cos(
+                    FMath::DegreesToRadians(LandingWalkableAngleDegrees));
+            }
+
+            float ConnectorGradient = -1.0f;
+            bool bConnectorSlopePassed = false;
+            if (Landing.bHasNetworkConnector
+                && FMath::IsFinite(Landing.ConnectorStart.X)
+                && FMath::IsFinite(Landing.ConnectorStart.Y)
+                && FMath::IsFinite(Landing.ConnectorEnd.X)
+                && FMath::IsFinite(Landing.ConnectorEnd.Y)
+                && (!Landing.bHasConnectorBend
+                    || (FMath::IsFinite(Landing.ConnectorControl.X)
+                        && FMath::IsFinite(Landing.ConnectorControl.Y)))
+                && FMath::IsFinite(Landing.RootFloorZ)
+                && FMath::IsFinite(Landing.FloorZ))
+            {
+                const FVector2D ConnectorStart(
+                    Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
+                const FVector2D ConnectorEnd(
+                    Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
+                const float DirectLength = (ConnectorEnd - ConnectorStart).Size();
+                if (Landing.bHasConnectorBend)
+                {
+                    const FVector2D ConnectorControl(
+                        Landing.ConnectorControl.X, Landing.ConnectorControl.Y);
+                    const float FinalLegLength = (ConnectorEnd - ConnectorControl).Size();
+                    const float RampLength = FMath::Max(
+                        FinalLegLength - (Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f),
+                        KINDA_SMALL_NUMBER);
+                    ConnectorGradient = FMath::Abs(
+                        Landing.RootFloorZ - Landing.FloorZ) / RampLength;
+                }
+                else
+                {
+                    const float RampLength = FMath::Max(
+                        DirectLength - FMath::Max(Landing.HalfWidth - 1.0f, 0.0f)
+                            - (Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f),
+                        KINDA_SMALL_NUMBER);
+                    ConnectorGradient = FMath::Abs(
+                        Landing.RootFloorZ - Landing.FloorZ) / RampLength;
+                }
+                bConnectorSlopePassed = FMath::IsFinite(ConnectorGradient)
+                    && ConnectorGradient <= LandingWalkableSlope + KINDA_SMALL_NUMBER;
+            }
+
+            if (bConnectorSlopePassed)
+            {
+                ++NumLandingConnectorSlopesPassed;
+                WorstLandingConnectorGradient = FMath::Max(
+                    WorstLandingConnectorGradient, ConnectorGradient);
+            }
+            else
+            {
+                ++NumLandingConnectorSlopeFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("landing at strate %d has connector slope %.6f above the %.6f walkable limit"),
+                    StrateIndex, ConnectorGradient, LandingWalkableSlope));
+            }
+
+            const bool bLandingSlopePassed = bFloorPassed && bConnectorSlopePassed;
+            if (bLandingSlopePassed)
+            {
+                ++NumLandingFloorsPassed;
+            }
+            else
+            {
+                ++NumLandingFloorFailures;
+                RecordFailure(FString::Printf(
+                    TEXT("landing at strate %d failed its final-density flat-floor slope bracket"),
+                    StrateIndex));
+            }
+
+            if (Landing.bSourcePlayerFit)
+            {
+                ++NumLandingSourceFit;
+            }
+            if (Landing.bHasNetworkConnector)
+            {
+                ++NumLandingNetworkJoins;
+            }
+            else
+            {
+                RecordFailure(FString::Printf(
+                    TEXT("landing at strate %d has neither a source fit nor a deterministic network connector"),
+                    StrateIndex));
+            }
+
+            // Exercise the same box shortcut that can otherwise erase a support slab. A uniform
+            // verdict is allowed only if every exact ClassifyTile lattice sample agrees with the
+            // final density; a floor-bearing landing should normally force Mixed via the
+            // bidirectional passage effect. This is one aggregate audit, not per-sample logging.
+            const FIntVector LandingBoxOrigin(
+                FMath::FloorToInt(Landing.StandingPoint.X) - 4,
+                FMath::FloorToInt(Landing.StandingPoint.Y) - 4,
+                FMath::FloorToInt(Landing.FloorZ) - 3);
+            constexpr int32 LandingBoxCells = 8;
+            constexpr int32 LandingBoxStep = 1;
+            const EVoxelTileClass LandingBoxVerdict = World.Generator->ClassifyTile(
+                LandingBoxOrigin, LandingBoxStep, LandingBoxCells);
+            ++NumLandingFloorBoxes;
+            if (LandingBoxVerdict != EVoxelTileClass::Mixed)
+            {
+                ++NumLandingBoxProofs;
+                if (LandingBoxVerdict == EVoxelTileClass::AllSolid) ++NumLandingBoxAllSolid;
+                if (LandingBoxVerdict == EVoxelTileClass::AllAir) ++NumLandingBoxAllAir;
+
+                bool bBoxAgrees = true;
+                const bool bClaimsSolid = LandingBoxVerdict == EVoxelTileClass::AllSolid;
+                for (int32 GZ = -1; GZ <= LandingBoxCells + 1 && bBoxAgrees; ++GZ)
+                {
+                    for (int32 GY = -1; GY <= LandingBoxCells + 1 && bBoxAgrees; ++GY)
+                    {
+                        for (int32 GX = -1; GX <= LandingBoxCells + 1; ++GX)
+                        {
+                            const float Density = World.Generator->GetDensityAt(
+                                (float)(LandingBoxOrigin.X + GX * LandingBoxStep),
+                                (float)(LandingBoxOrigin.Y + GY * LandingBoxStep),
+                                (float)(LandingBoxOrigin.Z + GZ * LandingBoxStep));
+                            const bool bMatches = bClaimsSolid
+                                ? Density < 0.0f : Density >= 0.0f;
+                            if (!FMath::IsFinite(Density) || !bMatches)
+                            {
+                                bBoxAgrees = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!bBoxAgrees)
+                {
+                    ++NumLandingBoxViolations;
+                    if (NumLandingBoxViolations == 1)
+                    {
+                        AddError(FString::Printf(
+                            TEXT("Landing box verdict %d was not sound at (%d,%d,%d): the uniform %s verdict disagreed with final density."),
+                            NumLandingBoxProofs,
+                            LandingBoxOrigin.X,
+                            LandingBoxOrigin.Y,
+                            LandingBoxOrigin.Z,
+                            bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir")));
+                    }
+                }
+            }
+
+            const FString LandingArchetype = ArchetypeName(Definition->GeneratorType);
+            LandingSlopeReport += FString::Printf(
+                TEXT("%s[%d:%s]=floor:%s(%.6f),connector:%s(%.6f)%s "),
+                *LandingArchetype,
+                StrateIndex,
+                EndIndex == 0 ? TEXT("upper") : TEXT("lower"),
+                bFloorPassed ? TEXT("PASS") : TEXT("FAIL"),
+                LandingGradient,
+                bConnectorSlopePassed ? TEXT("PASS") : TEXT("FAIL"),
+                ConnectorGradient,
+                Landing.bHasConnectorBend ? TEXT("[bend]") : TEXT(""));
+        }
+    }
+
+    // The passage modifier is called once per density sample, but shortlist construction is
+    // keyed by (manager, layout version, chunk) in thread_local storage. Measure the hot hit and
+    // the deliberately alternating two-chunk rebuild separately so the report exposes the cache
+    // contract without adding a log line for any individual sample.
+    const FVoxelPassage* TimingPassage = nullptr;
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (Passage.UpperStrateIndex != Passage.LowerStrateIndex)
+        {
+            TimingPassage = &Passage;
+            break;
+        }
+    }
+    if (TimingPassage != nullptr)
+    {
+        const FVector TimingPoint = TimingPassage->UpperLanding.StandingPoint
+            + FVector(0.0f, 0.0f, 2.0f);
+        constexpr int32 HotCalls = 8192;
+        constexpr int32 RebuildCalls = 96;
+        volatile float TimingSink = 0.0f;
+        double StartSeconds = FPlatformTime::Seconds();
+        for (int32 Call = 0; Call < HotCalls; ++Call)
+        {
+            float Density = 8.0f;
+            World.StrateManager->ApplyPassageModifier(
+                Density, TimingPoint.X, TimingPoint.Y, TimingPoint.Z, 8.0f, 0.0f);
+            TimingSink += Density;
+        }
+        const double HotSeconds = FPlatformTime::Seconds() - StartSeconds;
+
+        StartSeconds = FPlatformTime::Seconds();
+        for (int32 Call = 0; Call < RebuildCalls; ++Call)
+        {
+            const FVector Point = TimingPoint
+                + ((Call & 1) != 0 ? FVector((float)CHUNK_SIZE, 0.0f, 0.0f)
+                                   : FVector::ZeroVector);
+            float Density = 8.0f;
+            World.StrateManager->ApplyPassageModifier(
+                Density, Point.X, Point.Y, Point.Z, 8.0f, 0.0f);
+            TimingSink += Density;
+        }
+        const double RebuildSeconds = FPlatformTime::Seconds() - StartSeconds;
+        AddInfo(FString::Printf(
+            TEXT("Passage TLS cache timing: rebuild %.3f us/call over %d alternating chunks; hot %.3f us/call over %d same-chunk calls (sink %.3f)."),
+            RebuildSeconds * 1000000.0 / (double)RebuildCalls,
+            RebuildCalls,
+            HotSeconds * 1000000.0 / (double)HotCalls,
+            HotCalls,
+            (float)TimingSink));
+    }
+
     AddInfo(FString::Printf(
         TEXT("Passage player-fit check: %d inter-strate passages, upper %d checked (%d false), lower %d checked (%d footing checks), %d/%d room/slab ring samples air, lower %d query-false (%d unique archetypes; %d unsupported, %d supported-but-no-point)."),
         NumInterStratePassages,
@@ -464,6 +841,36 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         FalseArchetypes.Num(),
         NumUnsupported,
         NumSupportedWithoutPoint));
+    AddInfo(FString::Printf(
+        TEXT("Landing geometry: %d/%d ends passed the final-density floor test (worst room gradient %.6f), connector slopes %d/%d (worst %.6f; walkable limit %.6f), source-fit anchors %d/%d, explicit root-network joins %d/%d, seal violations %d, geometry/floor failures %d."),
+        NumLandingFloorsPassed,
+        NumLandingEnds,
+        WorstLandingFloorGradient,
+        NumLandingConnectorSlopesPassed,
+        NumLandingEnds,
+        WorstLandingConnectorGradient,
+        LandingWalkableSlope,
+        NumLandingSourceFit,
+        NumLandingEnds,
+        NumLandingNetworkJoins,
+        NumLandingEnds,
+        NumLandingSealFailures,
+        NumLandingFloorFailures));
+    if (!LandingSlopeReport.IsEmpty())
+    {
+        AddInfo(FString::Printf(TEXT("Landing slope tests per end: %s"), *LandingSlopeReport));
+    }
+    AddInfo(FString::Printf(
+        TEXT("Landing floor box verdicts: %d boxes probed, %d uniform proofs (AllSolid %d, AllAir %d), %d violations."),
+        NumLandingFloorBoxes,
+        NumLandingBoxProofs,
+        NumLandingBoxAllSolid,
+        NumLandingBoxAllAir,
+        NumLandingBoxViolations));
+    if (!FirstLandingFailure.IsEmpty())
+    {
+        AddError(FString::Printf(TEXT("First landing geometry failure: %s"), *FirstLandingFailure));
+    }
 
     // A test that inspected nothing is not evidence of the invariant. Fail loudly in both cases.
     // Un test qui n'a rien inspecté ne prouve pas l'invariant : échouer explicitement dans les deux cas.
@@ -541,6 +948,14 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     }
 
     return NumInterStratePassages > 0
+        && NumLandingEnds == NumInterStratePassages * 2
+        && NumLandingFloorsPassed == NumLandingEnds
+        && NumLandingConnectorSlopesPassed == NumLandingEnds
+        && NumLandingConnectorSlopeFailures == 0
+        && NumLandingNetworkJoins == NumLandingEnds
+        && NumLandingSealFailures == 0
+        && NumLandingFloorFailures == 0
+        && NumLandingBoxViolations == 0
         && NumChecked > 0
         && NumUpperChecked > 0
         && NumFootingChecked > 0

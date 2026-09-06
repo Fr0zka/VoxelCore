@@ -176,7 +176,8 @@ public:
             VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx,
                       (Entry.Writes & VoxelOpChannels::Sdf) != 0);
             // Do not early-out on a dead hypothesis: a later forcing structural post may
-            // deliberately overwrite it (the XY edge seal is appended after passage carving).
+            // deliberately overwrite it (the XY edge seal is appended after passage tube/landing
+            // carving and support).
         }
         return H.Resolve();
     }

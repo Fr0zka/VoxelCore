@@ -289,12 +289,6 @@ static FORCEINLINE void ApplyBoundarySeal(float& Density, float WorldZ,
     VF_ApplyBoundarySeal(Density, WorldZ, StrateTopZ, StrateBottomZ, Thickness, BaseDensity);
 }
 
-static FORCEINLINE void ApplyPassageCarving(float& Density, float ModSDF,
-    float BaseDensity, float SealThickness)
-{
-    VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
-}
-
 static FORCEINLINE void ApplyOriginSpine(float& Density, float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
@@ -681,11 +675,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     {
         // SOLID BEDROCK gap between two strates. The auto-carved passages still tunnel
         // through it, but the (0,0) descent stays solid here so the player digs the gap
-        // to reach the next layer. No caves, no spine, no vertical seal — just rock + passages;
+        // to reach the next layer. No caves, no spine, no vertical seal — just rock + passage
+        // tube/landing;
         // the global XY edge seal is applied below for bounded worlds.
         float Density = 8.0f;  // bedrock solidity (positive = solid)
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, 8.0f, 0.0f);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ, 8.0f, 0.0f);
         VF_ApplyXYEdgeSeal(Density, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
         Result = -Density;
     }
@@ -996,6 +991,81 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 
         // Disturbance layer (the "wow" post-process) — cached params, MC convention.
         ApplyDisturbances(Result, WorldX, WorldY, WorldZ, CP_Dist, (uint32)Seed);
+
+        // A disturbance is allowed to add visual detail, but it must not refill the landing's
+        // measured air volume or turn its support slab back into a hole. Reassert the landing
+        // air first, then the structural floor, in MC space before the final XY seal. The two
+        // calls use the same landing geometry already evaluated by the legacy and op-stack post.
+        float LandingBaseDensity = CP_Dist.BaseDensity;
+#if WITH_EDITOR
+        // A composer parent can deliberately use a different structural base than the authored
+        // definition. The landing floor was already applied by PassageCarveOp with that parent
+        // base; use the same value for this post-disturbance MC backstop or live-vs-direct stack
+        // evaluation would differ exactly on floor voxels.
+        if (CP_UseComposerRegions && CP_ComposerRegions.bHasGlobalStructuralParams)
+        {
+            LandingBaseDensity = CP_ComposerRegions.BaseDensity;
+        }
+        else
+#endif
+        if (CP_UseCustomRecipe)
+        {
+            switch (CP_CustomRecipe.StructuralParamBlock)
+            {
+            case EVoxelStrateParamBlock::TunnelNetwork:
+                LandingBaseDensity = CP_CustomParams.TunnelNetworkParams.BaseDensity;
+                break;
+            case EVoxelStrateParamBlock::Slab:
+                LandingBaseDensity = CP_CustomParams.SlabParams.BaseDensity;
+                break;
+            case EVoxelStrateParamBlock::Maze:
+                LandingBaseDensity = CP_CustomParams.MazeParams.BaseDensity;
+                break;
+            case EVoxelStrateParamBlock::Surface:
+                LandingBaseDensity = CP_CustomParams.SurfaceParams.BaseDensity;
+                break;
+            case EVoxelStrateParamBlock::VerticalShaft:
+                LandingBaseDensity = CP_CustomParams.VerticalShaftParams.BaseDensity;
+                break;
+            case EVoxelStrateParamBlock::FloatingIsland:
+                LandingBaseDensity = CP_CustomParams.FloatingIslandParams.BaseDensity;
+                break;
+            default:
+                break;
+            }
+        }
+        else
+        {
+            switch (CP_GenType)
+            {
+            case ECaveGeneratorType::FlatPlain:
+            case ECaveGeneratorType::CrystalChamber:
+                LandingBaseDensity = CP_Slab.BaseDensity;
+                break;
+            case ECaveGeneratorType::Maze:
+                LandingBaseDensity = CP_Maze.BaseDensity;
+                break;
+            case ECaveGeneratorType::SurfaceWorld:
+                LandingBaseDensity = CP_Surface.BaseDensity;
+                break;
+            case ECaveGeneratorType::VerticalShafts:
+                LandingBaseDensity = CP_Vert.BaseDensity;
+                break;
+            case ECaveGeneratorType::FloatingIslands:
+                LandingBaseDensity = CP_Float.BaseDensity;
+                break;
+            case ECaveGeneratorType::TunnelNetwork:
+            case ECaveGeneratorType::Underwater:
+            default:
+                LandingBaseDensity = CP_Tunnel.BaseDensity;
+                break;
+            }
+        }
+        StrateManager->ApplyPassageLandingAirMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
+            CP_Dist.BoundarySealThickness);
+        StrateManager->ApplyPassageLandingFloorMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
     }
     else
     {
@@ -2151,8 +2221,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //=========================================================================
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            Params.BaseDensity, Params.BoundarySealThickness);
     }
 
     // Fourth structural post: the XY edge wins over a passage near the rim.
@@ -2373,8 +2444,9 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
 
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            Params.BaseDensity, Params.BoundarySealThickness);
     }
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
@@ -2493,8 +2565,9 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
 
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            Params.BaseDensity, Params.BoundarySealThickness);
     }
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
@@ -2756,8 +2829,9 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
 
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, S.BaseDensity, S.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            S.BaseDensity, S.BoundarySealThickness);
     }
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
@@ -3138,6 +3212,16 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     if (StrateManager->AnyPassageNearBox(FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
     {
         bCanSolid = false;
+    }
+    // A landing is bidirectional geometry: its chamber kills the AllSolid hypothesis, while its
+    // guaranteed support slab kills AllAir.  Without this second guard a tile covering only the
+    // floor could be classified uniformly air and the mesher would skip the solid support that
+    // keeps the player from falling through it.  The operator-stack path returns Both for the
+    // same box, so the hand-written legacy fold must carry the identical hypothesis kill here.
+    if (StrateManager->AnyPassageLandingFloorNearBox(
+            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
+    {
+        bCanAir = false;
     }
     if (OriginSpineRadius > 0.0f)
     {
@@ -4468,8 +4552,9 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
 
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            Params.BaseDensity, Params.BoundarySealThickness);
     }
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
@@ -4628,8 +4713,9 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
 
     if (StrateManager)
     {
-        const float ModSDF = StrateManager->EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-        ApplyPassageCarving(Density, ModSDF, Params.BaseDensity, Params.BoundarySealThickness);
+        StrateManager->ApplyPassageModifier(
+            Density, WorldX, WorldY, WorldZ,
+            Params.BaseDensity, Params.BoundarySealThickness);
     }
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,

@@ -136,6 +136,28 @@ namespace
             && VoxelForgeTest::BitEqual(A.Z, B.Z);
     }
 
+    bool SameLanding(const FVoxelPassageLanding& A, const FVoxelPassageLanding& B)
+    {
+        return SameVectorBits(A.StandingPoint, B.StandingPoint)
+            && SameVectorBits(A.DoorPoint, B.DoorPoint)
+            && SameVectorBits(A.DoorDirection, B.DoorDirection)
+            && SameVectorBits(A.ConnectorStart, B.ConnectorStart)
+            && SameVectorBits(A.ConnectorControl, B.ConnectorControl)
+            && SameVectorBits(A.ConnectorEnd, B.ConnectorEnd)
+            && VoxelForgeTest::BitEqual(A.FloorZ, B.FloorZ)
+            && VoxelForgeTest::BitEqual(A.CeilingZ, B.CeilingZ)
+            && VoxelForgeTest::BitEqual(A.HalfWidth, B.HalfWidth)
+            && VoxelForgeTest::BitEqual(A.FloorThickness, B.FloorThickness)
+            && VoxelForgeTest::BitEqual(A.ConnectorRadius, B.ConnectorRadius)
+            && VoxelForgeTest::BitEqual(A.ConnectorCeilingZ, B.ConnectorCeilingZ)
+            && VoxelForgeTest::BitEqual(A.RootFloorZ, B.RootFloorZ)
+            && VoxelForgeTest::BitEqual(A.RootCeilingZ, B.RootCeilingZ)
+            && VoxelForgeTest::BitEqual(A.RootSpineRadius, B.RootSpineRadius)
+            && A.bSourcePlayerFit == B.bSourcePlayerFit
+            && A.bHasNetworkConnector == B.bHasNetworkConnector
+            && A.bHasConnectorBend == B.bHasConnectorBend;
+    }
+
     bool SamePassage(const FVoxelPassage& A, const FVoxelPassage& B, FString& OutMismatch,
                      int32 PassageIndex)
     {
@@ -152,6 +174,14 @@ namespace
         {
             OutMismatch = FString::Printf(
                 TEXT("passage %d endpoints differ"), PassageIndex);
+            return false;
+        }
+
+        if (!SameLanding(A.UpperLanding, B.UpperLanding)
+            || !SameLanding(A.LowerLanding, B.LowerLanding))
+        {
+            OutMismatch = FString::Printf(
+                TEXT("passage %d landing descriptors differ"), PassageIndex);
             return false;
         }
 
