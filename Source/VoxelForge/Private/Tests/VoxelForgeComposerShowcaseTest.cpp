@@ -946,10 +946,14 @@ namespace
         const TCHAR* Label)
     {
         FString Report = FString::Printf(
-            TEXT("%s (walkable floor area is the coarse 128 m x 128 m footprint proxy)\n"
-                 "archetype | PlayerFitFraction | TraversableComponentShare | "
-                 "player-fit arrival->departure | walkable floor area m2 | "
-                 "median vertical clearance m | roughness-to-feature ratio\n"), Label);
+            TEXT("%s (player-fit fields are fitted SampleStep=1; walkable floor area and "
+                 "median vertical clearance are coarse SampleStep=4 proxies)\n"
+                 "archetype | player_fit_fraction_step1 | traversable_share_step1 | "
+                 "fit_cells_step1 | components_step1 | largest_component_cells_step1 | "
+                 "arrival_component_cells_step1 | departure_component_cells_step1 | "
+                 "mouth_component_gap_voxels_step1 | restricted_law_step1 | "
+                 "coarse_walkable_floor_area_m2 | coarse_median_vertical_clearance_m | "
+                 "roughness-to-feature ratio\n"), Label);
         for (const ECaveGeneratorType Archetype : GShowcaseArchetypes)
         {
             const FShowcaseSample* Found = Samples.FindByPredicate(
@@ -961,21 +965,31 @@ namespace
             {
                 Report += FString::Printf(
                     TEXT("%s | no measured sample | no measured sample | no measured sample | "
+                         "no measured sample | no measured sample | no measured sample | "
+                         "no measured sample | no measured sample | no measured sample | "
                          "n/a | n/a | n/a\n"),
                     VF_GetStrateArchetypeName(Archetype));
                 continue;
             }
             const FVoxelStrateMetrics& M = Found->FineMetrics;
+            const FVoxelConnectivityDiagnostics& D = Found->PlayerFitLaw;
             const FString Law = M.bPlayerFitResolved
                 ? VF_ShowcaseConnectivityName(Found->PlayerFitLaw.Result)
                 : TEXT("unresolved");
             const float FloorAreaM2 = Found->Metrics.WalkableFloorAreaFraction
                 * 128.0f * 128.0f;
             Report += FString::Printf(
-                TEXT("%s | %.6f | %.6f | %s | %.1f (%.6f footprint) | %.2f | %.3f\n"),
+                TEXT("%s | %.6f | %.6f | %lld | %d | %lld | %lld | %lld | %.3f | %s | "
+                     "%.1f (%.6f footprint) | %.2f | %.3f\n"),
                 VF_GetStrateArchetypeName(Archetype),
                 M.bPlayerFitResolved ? M.PlayerFitFraction : 0.0f,
                 M.bPlayerFitResolved ? M.TraversableComponentShare : 0.0f,
+                static_cast<long long>(M.NumPlayerFitCells),
+                M.NumTraversableComponents,
+                static_cast<long long>(M.LargestTraversableComponentCells),
+                static_cast<long long>(D.StartComponentCells),
+                static_cast<long long>(D.GoalComponentCells),
+                D.StartToGoalComponentDistanceCells,
                 *Law, FloorAreaM2,
                 Found->Metrics.WalkableFloorAreaFraction,
                 Found->Metrics.MedianVerticalClearance * 0.25f,
@@ -1875,20 +1889,35 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
         }
         const FString FineSummary = Sample.FineMetrics.bPlayerFitResolved
             ? FString::Printf(
-                TEXT("fit=%.6f traversable=%.6f fit_cells=%lld min_player_clearance=%.2f "
-                     "restricted_law=%s"),
+                TEXT("fit_step1=%.6f traversable_step1=%.6f fit_cells_step1=%lld "
+                     "components_step1=%d largest_component_cells_step1=%lld "
+                     "arrival_component_cells_step1=%lld departure_component_cells_step1=%lld "
+                     "mouth_component_gap_step1=%.3f min_player_clearance_step1=%.2f "
+                     "restricted_law_step1=%s; coarse_step4_walkable=%.6f "
+                     "coarse_step4_clearance=%d voxels"),
                 Sample.FineMetrics.PlayerFitFraction,
                 Sample.FineMetrics.TraversableComponentShare,
                 static_cast<long long>(Sample.FineMetrics.NumPlayerFitCells),
+                Sample.FineMetrics.NumTraversableComponents,
+                static_cast<long long>(Sample.FineMetrics.LargestTraversableComponentCells),
+                static_cast<long long>(Sample.PlayerFitLaw.StartComponentCells),
+                static_cast<long long>(Sample.PlayerFitLaw.GoalComponentCells),
+                Sample.PlayerFitLaw.StartToGoalComponentDistanceCells,
                 Sample.FineMetrics.MinimumPlayerClearanceVoxels,
-                VF_ShowcaseConnectivityName(Sample.PlayerFitLaw.Result))
+                VF_ShowcaseConnectivityName(Sample.PlayerFitLaw.Result),
+                Sample.Metrics.WalkableFraction,
+                Sample.Metrics.MedianVerticalClearance)
             : FString::Printf(
-                TEXT("fit=UNRESOLVED reason=%s"),
+                TEXT("fit_step1=UNRESOLVED reason=%s; coarse_step4_walkable=%.6f "
+                     "coarse_step4_clearance=%d voxels"),
                 Sample.FineMetrics.PlayerFitRefusalReason.IsEmpty()
-                    ? TEXT("not measured") : *Sample.FineMetrics.PlayerFitRefusalReason);
+                    ? TEXT("not measured") : *Sample.FineMetrics.PlayerFitRefusalReason,
+                Sample.Metrics.WalkableFraction,
+                Sample.Metrics.MedianVerticalClearance);
         AddInfo(FString::Printf(
-            TEXT("previous showcase %s seed=%d index=%d: %s; old_walkable=%.6f "
-                 "old_floor_area=%.6f old_largest_surface=%.6f old_law=%s; %s%s"),
+            TEXT("previous showcase %s seed=%d index=%d: %s; coarse_step4_walkable=%.6f "
+                 "coarse_step4_floor_area=%.6f coarse_step4_largest_surface=%.6f "
+                 "coarse_step4_law=%s; %s%s"),
             VF_GetStrateArchetypeName(Previous.Archetype), Previous.Seed,
             Previous.CandidateIndex,
             bPassedNewGate ? TEXT("ACCEPTED by player-fit gate") : TEXT("REJECTED by player-fit gate"),
@@ -2203,10 +2232,14 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
             TEXT("%.6f (step=1)"), Selected.FineMetrics.TraversableComponentShare);
         AddInfo(FString::Printf(
             TEXT("%s: hard-gate survivors=%d, selected seed=%d index=%d, "
-                 "old_walkable=%.6f, old_floor_area=%.6f, old_clearance=%d voxels, "
-                 "old_largest_surface=%.6f, old_law=%s, player_fit_fraction=%.6f, "
-                 "traversable_component_share=%.6f, player_fit_cells=%lld, "
-                 "player_clearance=%.2f voxels, restricted_law=%s, window=%s"),
+                 "coarse_step4_walkable=%.6f, coarse_step4_floor_area=%.6f, "
+                 "coarse_step4_clearance=%d voxels, coarse_step4_largest_surface=%.6f, "
+                 "coarse_step4_law=%s, player_fit_fraction_step1=%.6f, "
+                 "traversable_component_share_step1=%.6f, player_fit_cells_step1=%lld, "
+                 "components_step1=%d, largest_component_cells_step1=%lld, "
+                 "arrival_component_cells_step1=%lld, departure_component_cells_step1=%lld, "
+                 "mouth_component_gap_voxels_step1=%.3f, player_clearance_step1=%.2f voxels, "
+                 "restricted_law_step1=%s, window=%s"),
             VF_GetStrateArchetypeName(GShowcaseArchetypes[ArchetypeIndex]),
             Stats[ArchetypeIndex].Survivors.Num(),
             Selected.Candidate.Seed, Selected.Candidate.Index,
@@ -2218,6 +2251,11 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
             Selected.FineMetrics.PlayerFitFraction,
             Selected.FineMetrics.TraversableComponentShare,
             static_cast<long long>(Selected.FineMetrics.NumPlayerFitCells),
+            Selected.FineMetrics.NumTraversableComponents,
+            static_cast<long long>(Selected.FineMetrics.LargestTraversableComponentCells),
+            static_cast<long long>(Selected.PlayerFitLaw.StartComponentCells),
+            static_cast<long long>(Selected.PlayerFitLaw.GoalComponentCells),
+            Selected.PlayerFitLaw.StartToGoalComponentDistanceCells,
             Selected.FineMetrics.MinimumPlayerClearanceVoxels,
             VF_ShowcaseConnectivityName(Selected.PlayerFitLaw.Result),
             *PreviewCandidates[ArchetypeIndex].Window.Describe()));

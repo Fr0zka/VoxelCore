@@ -1,0 +1,895 @@
+// Measurement-only scale diagnosis for the player-fit showcase.
+
+#if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
+
+#include "Misc/AutomationTest.h"
+
+#include "VoxelCaveMorphology.h"
+#include "VoxelDensityOpStack.h"
+#include "VoxelForgeTestFixture.h"
+#include "VoxelStrateComposer.h"
+#include "VoxelStrateMeasure.h"
+#include "VoxelTypes.h"
+
+namespace
+{
+    constexpr int32 DiagnosisSeed = 0;
+    constexpr int32 MazeCandidateIndex = 50;
+    constexpr int32 TunnelCandidateIndex = 61;
+    // These are the current seed-0 showcase identities from the bounded roll set.  The previous
+    // report's VerticalShafts identity was seed 0 / index 34; index 15 belongs to another family
+    // in the current corpus and would silently leave the shaft probe on fixture defaults.
+    constexpr int32 ShaftCandidateIndex = 34;
+    constexpr int32 RadialSampleMaxVoxels = 48;
+    constexpr int32 FineDiagnosisMaxCells = 4000000;
+
+    const TCHAR* VF_DiagnosisConnectivityName(EVoxelConnectivityResult Result)
+    {
+        switch (Result)
+        {
+        case EVoxelConnectivityResult::Connected:                   return TEXT("Connected");
+        case EVoxelConnectivityResult::NotConnectedAtThisResolution: return TEXT("NotConnectedAtThisResolution");
+        case EVoxelConnectivityResult::StartCellSolid:              return TEXT("StartCellSolid");
+        case EVoxelConnectivityResult::GoalCellSolid:               return TEXT("GoalCellSolid");
+        case EVoxelConnectivityResult::StartCellNotPlayerFit:       return TEXT("StartCellNotPlayerFit");
+        case EVoxelConnectivityResult::GoalCellNotPlayerFit:        return TEXT("GoalCellNotPlayerFit");
+        case EVoxelConnectivityResult::OutOfWindow:                 return TEXT("OutOfWindow");
+        case EVoxelConnectivityResult::CoarseLiedBudgetExhausted:   return TEXT("CoarseLiedBudgetExhausted");
+        }
+        return TEXT("Unknown");
+    }
+
+    struct FDensityCrossing
+    {
+        bool bFound = false;
+        float AxisDensity = 0.0f;
+        float CrossingRadiusVoxels = -1.0f;
+        int32 FirstSolidStep = -1;
+        float FirstSolidDensity = 0.0f;
+    };
+
+    FDensityCrossing VF_SampleRadialRay(
+        const FVector& AxisPoint,
+        const FVector& UnitNormal,
+        TFunctionRef<float(const FVector&)> SampleDensity,
+        int32 MaxDistanceVoxels = RadialSampleMaxVoxels)
+    {
+        FDensityCrossing Result;
+        float PreviousDensity = SampleDensity(AxisPoint);
+        Result.AxisDensity = PreviousDensity;
+        for (int32 Distance = 1; Distance <= MaxDistanceVoxels; ++Distance)
+        {
+            const float CurrentDensity = SampleDensity(
+                AxisPoint + UnitNormal * static_cast<float>(Distance));
+            // MC convention in this codebase: density >= 0 is air and density < 0 is solid.
+            if (PreviousDensity >= 0.0f && CurrentDensity < 0.0f)
+            {
+                const float Denominator = PreviousDensity - CurrentDensity;
+                const float Fraction = FMath::IsNearlyZero(Denominator)
+                    ? 0.0f : FMath::Clamp(PreviousDensity / Denominator, 0.0f, 1.0f);
+                Result.bFound = true;
+                Result.CrossingRadiusVoxels = static_cast<float>(Distance - 1) + Fraction;
+                Result.FirstSolidStep = Distance;
+                Result.FirstSolidDensity = CurrentDensity;
+                return Result;
+            }
+            PreviousDensity = CurrentDensity;
+        }
+        return Result;
+    }
+
+    struct FRadialSection
+    {
+        FVector AxisPoint = FVector::ZeroVector;
+        FVector UnitNormal = FVector::ZeroVector;
+        FDensityCrossing Positive;
+        FDensityCrossing Negative;
+        bool bValid = false;
+    };
+
+    FRadialSection VF_SampleSection(
+        const FVector& AxisPoint,
+        const FVector& UnitNormal,
+        TFunctionRef<float(const FVector&)> SampleDensity)
+    {
+        FRadialSection Result;
+        Result.AxisPoint = AxisPoint;
+        Result.UnitNormal = UnitNormal.GetSafeNormal();
+        if (Result.UnitNormal.IsNearlyZero())
+        {
+            return Result;
+        }
+        Result.Positive = VF_SampleRadialRay(AxisPoint, Result.UnitNormal, SampleDensity);
+        Result.Negative = VF_SampleRadialRay(AxisPoint, -Result.UnitNormal, SampleDensity);
+        Result.bValid = Result.Positive.bFound && Result.Negative.bFound;
+        return Result;
+    }
+
+    float VF_SectionScore(const FRadialSection& Section)
+    {
+        return Section.bValid
+            ? FMath::Min(Section.Positive.CrossingRadiusVoxels,
+                         Section.Negative.CrossingRadiusVoxels)
+            : -1.0f;
+    }
+
+    FVector VF_PerpendicularTo(const FVector& Tangent)
+    {
+        const FVector Basis = FMath::Abs(Tangent.Z) < 0.9f
+            ? FVector::UpVector : FVector::RightVector;
+        return FVector::CrossProduct(Tangent, Basis).GetSafeNormal();
+    }
+
+    void VF_SetCandidateOnSlot(
+        VoxelForgeTest::FTestWorld& World,
+        const FVoxelStrateComposerCandidate& Candidate,
+        int32 SlotIndex)
+    {
+        UVoxelStrateDefinition* Definition = World.Definitions.IsValidIndex(SlotIndex)
+            ? World.Definitions[SlotIndex].Get() : nullptr;
+        if (Definition == nullptr)
+        {
+            return;
+        }
+        Definition->GeneratorType = Candidate.Archetype;
+        Definition->GenerationParams = Candidate.ArchetypeParams.TunnelNetworkParams;
+        Definition->SlabParams = Candidate.ArchetypeParams.SlabParams;
+        Definition->MazeParams = Candidate.ArchetypeParams.MazeParams;
+        Definition->SurfaceParams = Candidate.ArchetypeParams.SurfaceParams;
+        Definition->VerticalShaftParams = Candidate.ArchetypeParams.VerticalShaftParams;
+        Definition->FloatingIslandParams = Candidate.ArchetypeParams.FloatingIslandParams;
+        Definition->bUseOperatorStack = true;
+        Definition->TransitionType = EVoxelStrateTransition::Hard;
+        World.Reinitialize();
+    }
+
+    int32 VF_MidChunkZ(const VoxelForgeTest::FTestWorld& World, int32 SlotIndex)
+    {
+        int32 TopVoxelZ = 0;
+        int32 BottomVoxelZ = 0;
+        if (!World.GetSlotVoxelZRange(SlotIndex, TopVoxelZ, BottomVoxelZ))
+        {
+            return 0;
+        }
+        return FMath::FloorToInt(
+            0.5f * static_cast<float>(TopVoxelZ + 1 + BottomVoxelZ)
+            / static_cast<float>(CHUNK_SIZE));
+    }
+
+    struct FCoreStackProbe
+    {
+        FVoxelOpStack Stack;
+
+        void Prepare(int32 ChunkZ, float TopZ, float BottomZ,
+                     float WorldRadiusVoxels, float EdgeSealThickness,
+                     uint32 LayoutVersion)
+        {
+            FVoxelOpContext Context;
+            Context.ChunkCoord = FIntVector(0, 0, ChunkZ);
+            Context.Step = 1;
+            Context.LayoutVersion = LayoutVersion;
+            Context.WorldRadiusVoxels = WorldRadiusVoxels;
+            Context.EdgeSealThickness = EdgeSealThickness;
+            Context.StrateTopWorldZ = TopZ;
+            Context.StrateBottomWorldZ = BottomZ;
+            Stack.PrepareChunk(Context);
+        }
+
+        float Sample(const FVector& Point) const
+        {
+            return Stack.EvalMC(Point.X, Point.Y, Point.Z);
+        }
+    };
+
+    bool VF_FindMazeAxis(
+        const VoxelForgeTest::FTestWorld& World,
+        const FMazeGenerationParams& Params,
+        int32 SlotIndex,
+        FRadialSection& OutFinalSection,
+        FRadialSection& OutCoreSection,
+        FString& OutDescription)
+    {
+        const float CellSize = FMath::Max(Params.CellSize, 1.0f);
+        const uint32 Salt = static_cast<uint32>(World.Generator->Seed) ^ 0x4D617A65u;
+        const int32 MidChunkZ = VF_MidChunkZ(World, SlotIndex);
+        const int32 BaseCellZ = FMath::FloorToInt(
+            (0.5f * (Params.StrateTopWorldZ + Params.StrateBottomWorldZ)) / CellSize);
+
+        FCoreStackProbe Core;
+        VoxelDensityOps::BuildMazeStack(
+            Core.Stack, Params, World.Generator->Seed, World.Generator->OriginSpineRadius,
+            World.StrateManager.Get(), false);
+        Core.Prepare(MidChunkZ, Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+                     World.Generator->WorldRadiusVoxels, World.Generator->EdgeSealThickness,
+                     World.StrateManager->GetLayoutVersion());
+
+        auto EdgeOpen = [Salt](int32 X, int32 Y, int32 Z,
+                               uint32 AxisSalt, float Threshold)
+        {
+            uint32 H = VoxelHash::Cell(X, Y, Salt ^ AxisSalt);
+            H ^= VoxelHash::Mix(static_cast<uint32>(Z * 73856093) ^ AxisSalt);
+            return VoxelHash::ToFloat01(VoxelHash::Mix(H)) < Threshold;
+        };
+
+        auto FinalDensity = [&World](const FVector& Point)
+        {
+            return World.Generator->GetDensityAt(Point.X, Point.Y, Point.Z);
+        };
+        auto CoreDensity = [&Core](const FVector& Point)
+        {
+            return Core.Sample(Point);
+        };
+
+        float BestDistanceSq = FLT_MAX;
+        for (int32 Ring = 1; Ring <= 12; ++Ring)
+        {
+            for (int32 NodeY = -Ring; NodeY <= Ring; ++NodeY)
+            {
+                for (int32 NodeX = -Ring; NodeX <= Ring; ++NodeX)
+                {
+                    if (FMath::Max(FMath::Abs(NodeX), FMath::Abs(NodeY)) != Ring)
+                    {
+                        continue;
+                    }
+                    for (int32 NodeZ = BaseCellZ - 1; NodeZ <= BaseCellZ + 1; ++NodeZ)
+                    {
+                        const FVector A(
+                            (NodeX + 0.5f) * CellSize,
+                            (NodeY + 0.5f) * CellSize,
+                            (NodeZ + 0.5f) * CellSize);
+                        const float DistanceSq = A.X * A.X + A.Y * A.Y;
+
+                        struct FAxisSpec { uint32 Salt; float Threshold; FVector Delta; const TCHAR* Name; };
+                        const FAxisSpec Axes[] = {
+                            { 0xA1u, Params.BranchProbability,
+                              FVector(CellSize, 0.0f, 0.0f), TEXT("X") },
+                            { 0xB2u, Params.BranchProbability,
+                              FVector(0.0f, CellSize, 0.0f), TEXT("Y") },
+                        };
+                        for (const FAxisSpec& Axis : Axes)
+                        {
+                            if (!EdgeOpen(NodeX, NodeY, NodeZ, Axis.Salt, Axis.Threshold))
+                            {
+                                continue;
+                            }
+                            const FVector B = A + Axis.Delta;
+                            const FVector AxisPoint = 0.5f * (A + B);
+                            if (AxisPoint.Z <= Params.StrateBottomWorldZ + Params.BoundarySealThickness + 8.0f
+                                || AxisPoint.Z >= Params.StrateTopWorldZ - Params.BoundarySealThickness - 8.0f
+                                || DistanceSq < FMath::Square(World.Generator->OriginSpineRadius + 24.0f))
+                            {
+                                continue;
+                            }
+
+                            const FVector Normal = VF_PerpendicularTo((B - A).GetSafeNormal());
+                            const FRadialSection FinalSection = VF_SampleSection(
+                                AxisPoint, Normal, FinalDensity);
+                            const FRadialSection CoreSection = VF_SampleSection(
+                                AxisPoint, Normal, CoreDensity);
+                            if (!FinalSection.bValid || !CoreSection.bValid
+                                || FinalSection.Positive.AxisDensity <= 0.0f)
+                            {
+                                continue;
+                            }
+
+                            if (DistanceSq >= BestDistanceSq)
+                            {
+                                continue;
+                            }
+                            BestDistanceSq = DistanceSq;
+                            OutFinalSection = FinalSection;
+                            OutCoreSection = CoreSection;
+                            OutDescription = FString::Printf(
+                                TEXT("Maze edge axis=%s node=(%d,%d,%d) endpointA=(%.2f,%.2f,%.2f) "
+                                     "endpointB=(%.2f,%.2f,%.2f)"),
+                                Axis.Name, NodeX, NodeY, NodeZ,
+                                A.X, A.Y, A.Z, B.X, B.Y, B.Z);
+                        }
+                    }
+                }
+            }
+            if (OutFinalSection.bValid)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct FTunnelAxisCandidate
+    {
+        bool bValid = false;
+        float Score = -1.0f;
+        float NominalRadius = 0.0f;
+        FString Description;
+        FRadialSection FinalSection;
+        FRadialSection CoreSection;
+    };
+
+    void VF_ConsiderTunnelSegment(
+        const VoxelForgeTest::FTestWorld& World,
+        const FStrateGenerationParams& Params,
+        const FCoreStackProbe& Core,
+        const FVector& A,
+        const FVector& B,
+        float RadiusA,
+        float RadiusB,
+        const FString& SegmentName,
+        FTunnelAxisCandidate& InOutBest)
+    {
+        const FVector Tangent = (B - A).GetSafeNormal();
+        const float Length = FVector::Dist(A, B);
+        if (Tangent.IsNearlyZero() || Length < 24.0f)
+        {
+            return;
+        }
+
+        const FVector Normal = VF_PerpendicularTo(Tangent);
+        const FVector Binormal = FVector::CrossProduct(Tangent, Normal).GetSafeNormal();
+        const float NominalRadius = FMath::Lerp(RadiusA, RadiusB, 0.5f);
+        const int32 SearchExtent = 16;
+        const int32 SearchStep = 4;
+        const int32 MaxDistance = FMath::Clamp(
+            FMath::CeilToInt(NominalRadius + FMath::Max(Params.SurfaceRoughness, 0.0f) + 20.0f),
+            24, RadialSampleMaxVoxels);
+
+        auto FinalDensity = [&World](const FVector& Point)
+        {
+            return World.Generator->GetDensityAt(Point.X, Point.Y, Point.Z);
+        };
+        auto CoreDensity = [&Core](const FVector& Point)
+        {
+            return Core.Sample(Point);
+        };
+
+        for (int32 OffsetB = -SearchExtent; OffsetB <= SearchExtent; OffsetB += SearchStep)
+        {
+            for (int32 OffsetN = -SearchExtent; OffsetN <= SearchExtent; OffsetN += SearchStep)
+            {
+                const FVector AxisPoint = 0.5f * (A + B)
+                    + Binormal * static_cast<float>(OffsetB)
+                    + Normal * static_cast<float>(OffsetN);
+                if (AxisPoint.Z <= Params.StrateBottomWorldZ + Params.BoundarySealThickness + 8.0f
+                    || AxisPoint.Z >= Params.StrateTopWorldZ - Params.BoundarySealThickness - 8.0f
+                    || FVector2D(AxisPoint.X, AxisPoint.Y).SizeSquared()
+                        < FMath::Square(World.Generator->OriginSpineRadius + 24.0f))
+                {
+                    continue;
+                }
+
+                const FRadialSection FinalSection = VF_SampleSection(
+                    AxisPoint, Normal, FinalDensity);
+                if (!FinalSection.bValid)
+                {
+                    continue;
+                }
+                const FRadialSection CoreSection = VF_SampleSection(
+                    AxisPoint, Normal, CoreDensity);
+                if (!CoreSection.bValid)
+                {
+                    continue;
+                }
+
+                const float Score = VF_SectionScore(FinalSection);
+                if (Score <= InOutBest.Score)
+                {
+                    continue;
+                }
+                InOutBest.bValid = true;
+                InOutBest.Score = Score;
+                InOutBest.NominalRadius = NominalRadius;
+                InOutBest.Description = FString::Printf(
+                    TEXT("%s segment A=(%.2f,%.2f,%.2f) B=(%.2f,%.2f,%.2f) "
+                         "axisOffset=(%.2f,%.2f,%.2f)"),
+                    *SegmentName, A.X, A.Y, A.Z, B.X, B.Y, B.Z,
+                    AxisPoint.X - 0.5f * (A.X + B.X),
+                    AxisPoint.Y - 0.5f * (A.Y + B.Y),
+                    AxisPoint.Z - 0.5f * (A.Z + B.Z));
+                InOutBest.FinalSection = FinalSection;
+                InOutBest.CoreSection = CoreSection;
+            }
+        }
+    }
+
+    bool VF_FindTunnelAxis(
+        const VoxelForgeTest::FTestWorld& World,
+        const FStrateGenerationParams& Params,
+        int32 SlotIndex,
+        FTunnelAxisCandidate& OutBest)
+    {
+        const int32 MidChunkZ = VF_MidChunkZ(World, SlotIndex);
+        FCoreStackProbe Core;
+        VoxelDensityOps::BuildTunnelNetworkStack(
+            Core.Stack, Params, World.Generator->Seed, World.Generator->OriginSpineRadius,
+            World.StrateManager.Get(), false);
+        Core.Prepare(MidChunkZ, Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+                     World.Generator->WorldRadiusVoxels, World.Generator->EdgeSealThickness,
+                     World.StrateManager->GetLayoutVersion());
+
+        FChunkSDFCache Cache;
+        const float SearchExtent = FMath::Max(
+            512.0f, FMath::Max(Params.RoomSpacing * 4.0f, Params.MaxTunnelLength * 2.0f));
+        VoxelCaveMorphology::BuildChunkCache(
+            Cache, -SearchExtent, -SearchExtent, SearchExtent, SearchExtent,
+            Params, static_cast<uint32>(World.Generator->Seed), SlotIndex, nullptr);
+
+        for (int32 TunnelIndex = 0; TunnelIndex < Cache.Tunnels.Num(); ++TunnelIndex)
+        {
+            const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIndex];
+            if (Tunnel.bHasMidpoint)
+            {
+                VF_ConsiderTunnelSegment(
+                    World, Params, Core, Tunnel.EndpointA, Tunnel.Midpoint,
+                    Tunnel.RadiusA, Tunnel.RadiusMid,
+                    FString::Printf(TEXT("tunnel[%d].A-mid"), TunnelIndex), OutBest);
+                VF_ConsiderTunnelSegment(
+                    World, Params, Core, Tunnel.Midpoint, Tunnel.EndpointB,
+                    Tunnel.RadiusMid, Tunnel.RadiusB,
+                    FString::Printf(TEXT("tunnel[%d].mid-B"), TunnelIndex), OutBest);
+            }
+            else
+            {
+                VF_ConsiderTunnelSegment(
+                    World, Params, Core, Tunnel.EndpointA, Tunnel.EndpointB,
+                    Tunnel.RadiusA, Tunnel.RadiusB,
+                    FString::Printf(TEXT("tunnel[%d]"), TunnelIndex), OutBest);
+            }
+        }
+        return OutBest.bValid;
+    }
+
+    bool VF_FindShaftAxis(
+        const VoxelForgeTest::FTestWorld& World,
+        const FVerticalShaftParams& Params,
+        int32 SlotIndex,
+        FRadialSection& OutFinalSection,
+        FRadialSection& OutCoreSection,
+        float& OutNominalRadius,
+        FString& OutDescription)
+    {
+        const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
+        const uint32 Salt = static_cast<uint32>(World.Generator->Seed) ^ 0x53686674u;
+        const int32 MidChunkZ = VF_MidChunkZ(World, SlotIndex);
+        FCoreStackProbe Core;
+        VoxelDensityOps::BuildVerticalShaftStack(
+            Core.Stack, Params, World.Generator->Seed, World.Generator->OriginSpineRadius,
+            World.StrateManager.Get(), false);
+        Core.Prepare(MidChunkZ, Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+                     World.Generator->WorldRadiusVoxels, World.Generator->EdgeSealThickness,
+                     World.StrateManager->GetLayoutVersion());
+
+        auto FinalDensity = [&World](const FVector& Point)
+        {
+            return World.Generator->GetDensityAt(Point.X, Point.Y, Point.Z);
+        };
+        auto CoreDensity = [&Core](const FVector& Point)
+        {
+            return Core.Sample(Point);
+        };
+
+        const float InnerBottom = Params.StrateBottomWorldZ + Params.BoundarySealThickness + 4.0f;
+        const float InnerTop = Params.StrateTopWorldZ - Params.BoundarySealThickness - 4.0f;
+        const float Period = FMath::Max(Params.LedgeSpacing, 32.0f);
+        for (int32 Ring = 1; Ring <= 32; ++Ring)
+        {
+            for (int32 CellY = -Ring; CellY <= Ring; ++CellY)
+            {
+                for (int32 CellX = -Ring; CellX <= Ring; ++CellX)
+                {
+                    if (FMath::Max(FMath::Abs(CellX), FMath::Abs(CellY)) != Ring)
+                    {
+                        continue;
+                    }
+                    const uint32 CellHash = VoxelHash::Cell(CellX, CellY, Salt);
+                    if (VoxelHash::ToFloat01(CellHash) > Params.ShaftDensity)
+                    {
+                        continue;
+                    }
+                    const float JitterX = VoxelHash::ToFloat01(
+                        VoxelHash::Mix(CellHash ^ 0x12345678u));
+                    const float JitterY = VoxelHash::ToFloat01(
+                        VoxelHash::Mix(CellHash ^ 0x9ABCDEF0u));
+                    const float ShaftX = (CellX + 0.15f + JitterX * 0.7f) * Spacing;
+                    const float ShaftY = (CellY + 0.15f + JitterY * 0.7f) * Spacing;
+                    const float Radius = FMath::Lerp(
+                        Params.ShaftMinRadius, Params.ShaftMaxRadius,
+                        VoxelHash::ToFloat01(VoxelHash::Mix(CellHash ^ 0xBEEFu)));
+                    if (FMath::Square(ShaftX) + FMath::Square(ShaftY)
+                        < FMath::Square(World.Generator->OriginSpineRadius + 24.0f))
+                    {
+                        continue;
+                    }
+
+                    for (int32 Level = 0; Level < 16; ++Level)
+                    {
+                        const float Z = InnerBottom + (static_cast<float>(Level) + 0.5f) * Period;
+                        if (Z >= InnerTop)
+                        {
+                            break;
+                        }
+                        const FVector AxisPoint(ShaftX, ShaftY, Z);
+                        const FRadialSection FinalSection = VF_SampleSection(
+                            AxisPoint, FVector(1.0f, 0.0f, 0.0f), FinalDensity);
+                        const FRadialSection CoreSection = VF_SampleSection(
+                            AxisPoint, FVector(1.0f, 0.0f, 0.0f), CoreDensity);
+                        if (!FinalSection.bValid || !CoreSection.bValid)
+                        {
+                            continue;
+                        }
+                        OutFinalSection = FinalSection;
+                        OutCoreSection = CoreSection;
+                        OutNominalRadius = Radius;
+                        OutDescription = FString::Printf(
+                            TEXT("shaft cell=(%d,%d) center=(%.2f,%.2f) z=%.2f"),
+                            CellX, CellY, ShaftX, ShaftY, Z);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    class FEmptyRoomSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        float SampleDensity(float, float, float WorldZ) const override
+        {
+            // A 20 m square room: z=0.5 is the one-cell solid floor and every sampled
+            // cell above it is empty air. This is deliberately a control for the stencil,
+            // not a generation change.
+            return WorldZ < 1.0f ? -1.0f : 1.0f;
+        }
+    };
+
+    class FGeneratorSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        explicit FGeneratorSampler(const UVoxelGenerator& InGenerator)
+            : Generator(InGenerator) {}
+
+        float SampleDensity(float WorldX, float WorldY, float WorldZ) const override
+        {
+            return Generator.GetDensityAt(WorldX, WorldY, WorldZ);
+        }
+
+    private:
+        const UVoxelGenerator& Generator;
+    };
+
+    float VF_BoundarySealForCandidate(const FVoxelStrateComposerCandidate& Candidate)
+    {
+        switch (Candidate.Archetype)
+        {
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+            return Candidate.ArchetypeParams.TunnelNetworkParams.BoundarySealThickness;
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+            return Candidate.ArchetypeParams.SlabParams.BoundarySealThickness;
+        case ECaveGeneratorType::Maze:
+            return Candidate.ArchetypeParams.MazeParams.BoundarySealThickness;
+        case ECaveGeneratorType::SurfaceWorld:
+            return Candidate.ArchetypeParams.SurfaceParams.BoundarySealThickness;
+        case ECaveGeneratorType::VerticalShafts:
+            return Candidate.ArchetypeParams.VerticalShaftParams.BoundarySealThickness;
+        case ECaveGeneratorType::FloatingIslands:
+            return Candidate.ArchetypeParams.FloatingIslandParams.BoundarySealThickness;
+        default:
+            return 0.0f;
+        }
+    }
+
+    void VF_ReportPlayerFitRow(
+        FAutomationTestBase& Test,
+        const TCHAR* Label,
+        const FVoxelStrateMetrics& Metrics,
+        const FVoxelConnectivityDiagnostics& Diagnostics)
+    {
+        Test.AddInfo(FString::Printf(
+            TEXT("PLAYER_FIT step=1 fitted-window %s: fit_cells=%lld components=%d "
+                 "largest_component_cells=%lld arrival_component_cells=%lld "
+                 "departure_component_cells=%lld mouth_component_gap_voxels=%.3f "
+                 "fit_fraction=%.9f traversable_share=%.9f law=%s"),
+            Label,
+            static_cast<long long>(Metrics.NumPlayerFitCells),
+            Metrics.NumTraversableComponents,
+            static_cast<long long>(Metrics.LargestTraversableComponentCells),
+            static_cast<long long>(Diagnostics.StartComponentCells),
+            static_cast<long long>(Diagnostics.GoalComponentCells),
+            Diagnostics.StartToGoalComponentDistanceCells,
+            Metrics.PlayerFitFraction,
+            Metrics.TraversableComponentShare,
+            VF_DiagnosisConnectivityName(Diagnostics.Result)));
+    }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FVoxelForgeScaleDiagnosisTest,
+    "VoxelForge.Composer.ScaleDiagnosis",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
+{
+    using namespace VoxelForgeTest;
+    (void)Parameters;
+
+    UVoxelSettings* AuthoredSettings = LoadObject<UVoxelSettings>(
+        nullptr, TEXT("/Game/VoxelForge/DA_Settings.DA_Settings"));
+    if (AuthoredSettings == nullptr)
+    {
+        AddError(TEXT("Could not load /Game/VoxelForge/DA_Settings.DA_Settings."));
+        return false;
+    }
+
+    FVoxelStrateCorpus Corpus;
+    FString CorpusReport;
+    const bool bCorpusLoaded = Corpus.LoadFromAssetRegistry(CorpusReport);
+    AddInfo(CorpusReport);
+    TestTrue(TEXT("scale-diagnosis corpus is usable"), bCorpusLoaded && Corpus.IsValid());
+    if (!bCorpusLoaded || !Corpus.IsValid())
+    {
+        return false;
+    }
+
+    FTestWorld World;
+    World.Build(DiagnosisSeed, 2, true, 8);
+    if (!World.IsValid())
+    {
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    const FVoxelStrateComposerCandidate MazeCandidate = VF_RollStrateCandidate(
+        Corpus, DiagnosisSeed, MazeCandidateIndex, false);
+    const FVoxelStrateComposerCandidate TunnelCandidate = VF_RollStrateCandidate(
+        Corpus, DiagnosisSeed, TunnelCandidateIndex, false);
+    const FVoxelStrateComposerCandidate ShaftCandidate = VF_RollStrateCandidate(
+        Corpus, DiagnosisSeed, ShaftCandidateIndex, false);
+    TestTrue(TEXT("seed 0 index 50 is a valid Maze candidate"),
+             MazeCandidate.bValid && MazeCandidate.Archetype == ECaveGeneratorType::Maze);
+    TestTrue(TEXT("seed 0 index 61 is a valid TunnelNetwork candidate"),
+             TunnelCandidate.bValid && TunnelCandidate.Archetype == ECaveGeneratorType::TunnelNetwork);
+    TestTrue(TEXT("seed 0 index 34 is a valid VerticalShafts candidate"),
+             ShaftCandidate.bValid && ShaftCandidate.Archetype == ECaveGeneratorType::VerticalShafts);
+
+    // H1 — direct GetDensityAt radial crossings. The Maze is the fourth one-based layout slot
+    // (FTestWorld uses zero-based SlotMaze == 3), matching the requested "slot 4".
+    const int32 MazeSlot = FTestWorld::SlotMaze;
+    VF_SetCandidateOnSlot(World, MazeCandidate, MazeSlot);
+    int32 MazeTop = 0;
+    int32 MazeBottom = 0;
+    TestTrue(TEXT("Maze diagnosis slot has a Z range"),
+             World.GetSlotVoxelZRange(MazeSlot, MazeTop, MazeBottom));
+    const FMazeGenerationParams MazeParams = World.StrateManager->GetMazeParamsForChunk(
+        FIntVector(0, 0, VF_MidChunkZ(World, MazeSlot)));
+    FRadialSection MazeFinal;
+    FRadialSection MazeCore;
+    FString MazeAxisDescription;
+    const bool bHaveMazeAxis = VF_FindMazeAxis(
+        World, MazeParams, MazeSlot, MazeFinal, MazeCore, MazeAxisDescription);
+    TestTrue(TEXT("Maze diagnosis found an open corridor axis"), bHaveMazeAxis);
+    if (bHaveMazeAxis)
+    {
+        AddInfo(FString::Printf(
+            TEXT("BORE maze seed=%d candidate=%d slot=%d(one-based 4) %s: "
+                 "parameter_radius=%.3f vox (%.3f m), parameter_bore=%.3f m; "
+                 "GetDensityAt +ray crossing=%.3f vox (%.3f m), first_solid_step=%d "
+                 "core_without_structural_posts +ray=%.3f vox (%.3f m); "
+                 "-ray final=%.3f vox (%.3f m), -ray core=%.3f vox (%.3f m)"),
+            DiagnosisSeed, MazeCandidateIndex, MazeSlot, *MazeAxisDescription,
+            MazeParams.CorridorRadius, MazeParams.CorridorRadius * 0.25f,
+            MazeParams.CorridorRadius * 2.0f * 0.25f,
+            MazeFinal.Positive.CrossingRadiusVoxels,
+            MazeFinal.Positive.CrossingRadiusVoxels * 0.25f,
+            MazeFinal.Positive.FirstSolidStep,
+            MazeCore.Positive.CrossingRadiusVoxels,
+            MazeCore.Positive.CrossingRadiusVoxels * 0.25f,
+            MazeFinal.Negative.CrossingRadiusVoxels,
+            MazeFinal.Negative.CrossingRadiusVoxels * 0.25f,
+            MazeCore.Negative.CrossingRadiusVoxels,
+            MazeCore.Negative.CrossingRadiusVoxels * 0.25f));
+    }
+
+    // TunnelNetwork — use the current fixed showcase roll and recover a real cached tunnel
+    // segment, then sample the final GetDensityAt field at a locally centred radial section.
+    const int32 TunnelSlot = FTestWorld::SlotTunnelNetwork;
+    VF_SetCandidateOnSlot(World, TunnelCandidate, TunnelSlot);
+    const FStrateGenerationParams TunnelParams = World.StrateManager->GetGenerationParams(
+        FIntVector(0, 0, VF_MidChunkZ(World, TunnelSlot)));
+    FTunnelAxisCandidate TunnelAxis;
+    const bool bHaveTunnelAxis = VF_FindTunnelAxis(
+        World, TunnelParams, TunnelSlot, TunnelAxis);
+    TestTrue(TEXT("TunnelNetwork diagnosis found a tunnel axis"), bHaveTunnelAxis);
+    if (bHaveTunnelAxis)
+    {
+        AddInfo(FString::Printf(
+            TEXT("BORE tunnel seed=%d candidate=%d %s: parameter_radius_range=%.3f..%.3f vox "
+                 "(%.3f..%.3f m), nominal_radius_at_probe=%.3f vox (%.3f m); "
+                 "GetDensityAt +ray crossing=%.3f vox (%.3f m), -ray=%.3f vox (%.3f m); "
+                 "core_without_structural_posts +ray=%.3f vox (%.3f m), -ray=%.3f vox (%.3f m)"),
+            DiagnosisSeed, TunnelCandidateIndex, *TunnelAxis.Description,
+            TunnelParams.TunnelMinRadius, TunnelParams.TunnelMaxRadius,
+            TunnelParams.TunnelMinRadius * 0.25f, TunnelParams.TunnelMaxRadius * 0.25f,
+            TunnelAxis.NominalRadius, TunnelAxis.NominalRadius * 0.25f,
+            TunnelAxis.FinalSection.Positive.CrossingRadiusVoxels,
+            TunnelAxis.FinalSection.Positive.CrossingRadiusVoxels * 0.25f,
+            TunnelAxis.FinalSection.Negative.CrossingRadiusVoxels,
+            TunnelAxis.FinalSection.Negative.CrossingRadiusVoxels * 0.25f,
+            TunnelAxis.CoreSection.Positive.CrossingRadiusVoxels,
+            TunnelAxis.CoreSection.Positive.CrossingRadiusVoxels * 0.25f,
+            TunnelAxis.CoreSection.Negative.CrossingRadiusVoxels,
+            TunnelAxis.CoreSection.Negative.CrossingRadiusVoxels * 0.25f));
+    }
+
+    // VerticalShafts — recover the deterministic shaft centre from the same hash contract as
+    // production, then sample horizontally at a non-ledge height.
+    const int32 ShaftSlot = FTestWorld::SlotVerticalShafts;
+    VF_SetCandidateOnSlot(World, ShaftCandidate, ShaftSlot);
+    const FVerticalShaftParams ShaftParams = World.StrateManager->GetVerticalShaftParamsForChunk(
+        FIntVector(0, 0, VF_MidChunkZ(World, ShaftSlot)));
+    FRadialSection ShaftFinal;
+    FRadialSection ShaftCore;
+    float ShaftNominalRadius = 0.0f;
+    FString ShaftAxisDescription;
+    const bool bHaveShaftAxis = VF_FindShaftAxis(
+        World, ShaftParams, ShaftSlot, ShaftFinal, ShaftCore,
+        ShaftNominalRadius, ShaftAxisDescription);
+    TestTrue(TEXT("VerticalShafts diagnosis found a shaft axis"), bHaveShaftAxis);
+    if (bHaveShaftAxis)
+    {
+        AddInfo(FString::Printf(
+            TEXT("BORE shaft seed=%d candidate=%d %s: parameter_radius_range=%.3f..%.3f vox "
+                 "(%.3f..%.3f m), nominal_radius_at_probe=%.3f vox (%.3f m); "
+                 "GetDensityAt +ray crossing=%.3f vox (%.3f m), -ray=%.3f vox (%.3f m); "
+                 "core_without_structural_posts +ray=%.3f vox (%.3f m), -ray=%.3f vox (%.3f m)"),
+            DiagnosisSeed, ShaftCandidateIndex, *ShaftAxisDescription,
+            ShaftParams.ShaftMinRadius, ShaftParams.ShaftMaxRadius,
+            ShaftParams.ShaftMinRadius * 0.25f, ShaftParams.ShaftMaxRadius * 0.25f,
+            ShaftNominalRadius, ShaftNominalRadius * 0.25f,
+            ShaftFinal.Positive.CrossingRadiusVoxels,
+            ShaftFinal.Positive.CrossingRadiusVoxels * 0.25f,
+            ShaftFinal.Negative.CrossingRadiusVoxels,
+            ShaftFinal.Negative.CrossingRadiusVoxels * 0.25f,
+            ShaftCore.Positive.CrossingRadiusVoxels,
+            ShaftCore.Positive.CrossingRadiusVoxels * 0.25f,
+            ShaftCore.Negative.CrossingRadiusVoxels,
+            ShaftCore.Negative.CrossingRadiusVoxels * 0.25f));
+    }
+
+    // H2 — a known-open control with a solid floor. This must produce non-zero fit cells.
+    FEmptyRoomSampler EmptyRoom;
+    FVoxelStrateMeasureSettings ControlSettings;
+    ControlSettings.SampleStep = 1;
+    ControlSettings.RadiusInVoxels = 40; // 80 voxels = 20 m across.
+    ControlSettings.CenterXY = FVector2D::ZeroVector;
+    ControlSettings.MaxCells = 300000;
+    ControlSettings.HeadroomCells = 2;
+    ControlSettings.InteriorMarginVoxels = 0;
+    FVoxelStrateMetrics ControlMetrics = VF_MeasureStrateWithSampler(
+        EmptyRoom, 0, 32, 0.0f, ControlSettings, nullptr);
+    TestTrue(TEXT("empty-room player-fit control resolved"),
+             ControlMetrics.bValid && ControlMetrics.bPlayerFitResolved);
+    AddInfo(FString::Printf(
+        TEXT("CONTROL empty_room=20m_square_with_one_cell_floor step=1: "
+             "sampled=%lld air=%lld fit_cells=%lld fit_fraction=%.9f "
+             "components=%d largest_component_cells=%lld traversable_share=%.9f"),
+        static_cast<long long>(ControlMetrics.NumSampled),
+        static_cast<long long>(ControlMetrics.NumAir),
+        static_cast<long long>(ControlMetrics.NumPlayerFitCells),
+        ControlMetrics.PlayerFitFraction,
+        ControlMetrics.NumTraversableComponents,
+        static_cast<long long>(ControlMetrics.LargestTraversableComponentCells),
+        ControlMetrics.TraversableComponentShare));
+    AddInfo(FString::Printf(
+        TEXT("PLAYER_STENCIL radius=%.3f voxels (%.2f m), half_height=%.3f voxels "
+             "(%.2f m), height=%.3f voxels (%.2f m); rows=ceil(height)=%d "
+             "relative rows 0..%d; floor=air anchor with exactly one solid cell at Z-1; "
+             "no floor tolerance; horizontal integer offsets are center plus four cardinals "
+             "in rows 0..6 and center-only forced in row 7; HeadroomCells=%d is legacy-only"),
+        ControlSettings.PlayerCapsuleRadiusVoxels,
+        ControlSettings.PlayerCapsuleRadiusVoxels * 0.25f,
+        ControlSettings.PlayerCapsuleHalfHeightVoxels,
+        ControlSettings.PlayerCapsuleHalfHeightVoxels * 0.25f,
+        FVoxelPlayerCapsuleConstants::HeightVoxels,
+        FVoxelPlayerCapsuleConstants::HeightVoxels * 0.25f,
+        FMath::CeilToInt(2.0f * ControlSettings.PlayerCapsuleHalfHeightVoxels),
+        FMath::CeilToInt(2.0f * ControlSettings.PlayerCapsuleHalfHeightVoxels) - 1,
+        ControlSettings.HeadroomCells));
+
+    // H3 — the eight fixed showcase identities, measured at step 1 on a mouth-fitted window.
+    // The Maze identity is intentionally the requested seed 0 / index 50 / fourth one-based slot.
+    struct FShowcaseSelection
+    {
+        ECaveGeneratorType Archetype;
+        int32 Seed;
+        int32 CandidateIndex;
+        int32 TargetSlot;
+        const TCHAR* Label;
+    };
+    const FShowcaseSelection Selections[] = {
+        { ECaveGeneratorType::CrystalChamber, 0,   36, FTestWorld::SlotFlatPlain, TEXT("CrystalChamber") },
+        { ECaveGeneratorType::FlatPlain,       0,   11, FTestWorld::SlotFlatPlain, TEXT("FlatPlain") },
+        { ECaveGeneratorType::FloatingIslands, 0,   15, FTestWorld::SlotFlatPlain, TEXT("FloatingIslands") },
+        { ECaveGeneratorType::Maze,            0,   50, FTestWorld::SlotMaze,      TEXT("Maze") },
+        { ECaveGeneratorType::SurfaceWorld,    0,   10, FTestWorld::SlotSurfaceWorld, TEXT("SurfaceWorld") },
+        { ECaveGeneratorType::TunnelNetwork,   0,   61, FTestWorld::SlotFlatPlain, TEXT("TunnelNetwork") },
+        { ECaveGeneratorType::Underwater,      0,   63, FTestWorld::SlotFlatPlain, TEXT("Underwater") },
+        { ECaveGeneratorType::VerticalShafts,  0,   34, FTestWorld::SlotFlatPlain, TEXT("VerticalShafts") },
+    };
+
+    for (const FShowcaseSelection& Selection : Selections)
+    {
+        const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
+            Corpus, Selection.Seed, Selection.CandidateIndex, false);
+        TestTrue(FString::Printf(TEXT("H3 %s candidate identity is valid"), Selection.Label),
+                 Candidate.bValid && Candidate.Archetype == Selection.Archetype);
+        if (!Candidate.bValid || Candidate.Archetype != Selection.Archetype)
+        {
+            continue;
+        }
+        VF_SetCandidateOnSlot(World, Candidate, Selection.TargetSlot);
+        FVector ArrivalPoint = FVector::ZeroVector;
+        FVector DeparturePoint = FVector::ZeroVector;
+        int32 ArrivalCount = 0;
+        int32 DepartureCount = 0;
+        for (const FVoxelPassage& Passage : World.StrateManager->GetPassages())
+        {
+            if (Passage.LowerStrateIndex == Selection.TargetSlot
+                && Passage.UpperStrateIndex + 1 == Selection.TargetSlot)
+            {
+                ArrivalPoint = Passage.LowerPoint;
+                ++ArrivalCount;
+            }
+            if (Passage.UpperStrateIndex == Selection.TargetSlot
+                && Passage.LowerStrateIndex == Selection.TargetSlot + 1)
+            {
+                DeparturePoint = Passage.UpperPoint;
+                ++DepartureCount;
+            }
+        }
+        if (ArrivalCount != 1 || DepartureCount != 1)
+        {
+            AddInfo(FString::Printf(
+                TEXT("PLAYER_FIT step=1 fitted-window %s: mouths unavailable arrival=%d departure=%d"),
+                Selection.Label, ArrivalCount, DepartureCount));
+            continue;
+        }
+
+        FVoxelStrateMeasureSettings Settings;
+        Settings.SampleStep = 1;
+        Settings.RadiusInVoxels = 64;
+        Settings.CenterXY = FVector2D(
+            0.5f * (ArrivalPoint.X + DeparturePoint.X),
+            0.5f * (ArrivalPoint.Y + DeparturePoint.Y));
+        Settings.CoverPointA = FVector2D(ArrivalPoint.X, ArrivalPoint.Y);
+        Settings.CoverPointB = FVector2D(DeparturePoint.X, DeparturePoint.Y);
+        Settings.CoverMarginVoxels = FMath::CeilToFloat(
+            Settings.PlayerCapsuleRadiusVoxels) + 2.0f;
+        Settings.MaxCells = FineDiagnosisMaxCells;
+        Settings.MaxRouteRetries = 16;
+        Settings.HeadroomCells = 2;
+        Settings.InteriorMarginVoxels = -1;
+
+        int32 TopVoxelZ = 0;
+        int32 BottomVoxelZ = 0;
+        if (!World.GetSlotVoxelZRange(Selection.TargetSlot, TopVoxelZ, BottomVoxelZ))
+        {
+            AddError(FString::Printf(TEXT("PLAYER_FIT %s: target slot has no Z range."),
+                                     Selection.Label));
+            continue;
+        }
+        FGeneratorSampler GeneratorSampler(*World.Generator);
+        FVoxelStrateMetrics Metrics;
+        const FVoxelConnectivityDiagnostics Diagnostics =
+            VF_DiagnosePlayerFitConnectivityWithSampler(
+                GeneratorSampler, BottomVoxelZ, TopVoxelZ + 1,
+                VF_BoundarySealForCandidate(Candidate), ArrivalPoint, DeparturePoint,
+                Settings, &Metrics);
+        VF_ReportPlayerFitRow(*this, Selection.Label, Metrics, Diagnostics);
+    }
+
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
