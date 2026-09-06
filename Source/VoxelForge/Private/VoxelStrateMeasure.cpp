@@ -34,7 +34,8 @@ namespace VoxelStrateMeasurePrivate
 
         // 1 = air, 0 = solid. The polarity is deliberately explicit at the sampling site below.
         TArray<uint8> Air;
-        // Optional exact scalar samples retained only for an explicit preview capture.
+        // Exact scalar samples retained when the player-fit stencil needs a bounded local
+        // surface/clearance interpolation, or when an explicit preview capture requests them.
         TArray<float> Density;
 
         FORCEINLINE int32 Index(int32 X, int32 Y, int32 Z) const
@@ -587,6 +588,302 @@ namespace VoxelStrateMeasurePrivate
         TArray<FIntPoint> HorizontalOffsets;
     };
 
+    bool HasScalarDensity(const FSampleGrid& Grid)
+    {
+        return Grid.Density.Num() == Grid.CellCount;
+    }
+
+    float CellDensity(const FSampleGrid& Grid, int32 Cell)
+    {
+        return HasScalarDensity(Grid)
+            ? Grid.Density[Cell]
+            : (Grid.Air[Cell] != 0u ? 1.0f : -1.0f);
+    }
+
+    bool SampleGridDensity(
+        const FSampleGrid& Grid,
+        const FVector& Point,
+        float& OutDensity)
+    {
+        if (!Grid.ContainsPoint(Point))
+        {
+            return false;
+        }
+
+        const float Step = static_cast<float>(Grid.SampleStep);
+        const float LocalX = (Point.X - Grid.MinX) / Step - 0.5f;
+        const float LocalY = (Point.Y - Grid.MinY) / Step - 0.5f;
+        const float LocalZ = (Point.Z - Grid.MinZ) / Step - 0.5f;
+
+        if (!HasScalarDensity(Grid))
+        {
+            const int32 X = FMath::Clamp(
+                FMath::FloorToInt((Point.X - Grid.MinX) / Step), 0, Grid.NumX - 1);
+            const int32 Y = FMath::Clamp(
+                FMath::FloorToInt((Point.Y - Grid.MinY) / Step), 0, Grid.NumY - 1);
+            const int32 Z = FMath::Clamp(
+                FMath::FloorToInt((Point.Z - Grid.MinZ) / Step), 0, Grid.NumZ - 1);
+            OutDensity = CellDensity(Grid, Grid.Index(X, Y, Z));
+            return FMath::IsFinite(OutDensity);
+        }
+
+        const int32 X0 = FMath::Clamp(FMath::FloorToInt(LocalX), 0, Grid.NumX - 1);
+        const int32 Y0 = FMath::Clamp(FMath::FloorToInt(LocalY), 0, Grid.NumY - 1);
+        const int32 Z0 = FMath::Clamp(FMath::FloorToInt(LocalZ), 0, Grid.NumZ - 1);
+        const int32 X1 = FMath::Min(X0 + 1, Grid.NumX - 1);
+        const int32 Y1 = FMath::Min(Y0 + 1, Grid.NumY - 1);
+        const int32 Z1 = FMath::Min(Z0 + 1, Grid.NumZ - 1);
+        const float AlphaX = FMath::Clamp(LocalX - static_cast<float>(X0), 0.0f, 1.0f);
+        const float AlphaY = FMath::Clamp(LocalY - static_cast<float>(Y0), 0.0f, 1.0f);
+        const float AlphaZ = FMath::Clamp(LocalZ - static_cast<float>(Z0), 0.0f, 1.0f);
+
+        const float D000 = CellDensity(Grid, Grid.Index(X0, Y0, Z0));
+        const float D100 = CellDensity(Grid, Grid.Index(X1, Y0, Z0));
+        const float D010 = CellDensity(Grid, Grid.Index(X0, Y1, Z0));
+        const float D110 = CellDensity(Grid, Grid.Index(X1, Y1, Z0));
+        const float D001 = CellDensity(Grid, Grid.Index(X0, Y0, Z1));
+        const float D101 = CellDensity(Grid, Grid.Index(X1, Y0, Z1));
+        const float D011 = CellDensity(Grid, Grid.Index(X0, Y1, Z1));
+        const float D111 = CellDensity(Grid, Grid.Index(X1, Y1, Z1));
+        const float D00 = FMath::Lerp(D000, D100, AlphaX);
+        const float D10 = FMath::Lerp(D010, D110, AlphaX);
+        const float D01 = FMath::Lerp(D001, D101, AlphaX);
+        const float D11 = FMath::Lerp(D011, D111, AlphaX);
+        const float D0 = FMath::Lerp(D00, D10, AlphaY);
+        const float D1 = FMath::Lerp(D01, D11, AlphaY);
+        OutDensity = FMath::Lerp(D0, D1, AlphaZ);
+        return FMath::IsFinite(OutDensity);
+    }
+
+    bool FindSupportSurfaceBelow(
+        const FSampleGrid& Grid,
+        int32 X,
+        int32 Y,
+        int32 CandidateAnchorZ,
+        int32 MaxDownwardSearchCells,
+        float MaxStepHeightVoxels,
+        float& OutSurfaceHeight,
+        int32& OutSurfaceAnchorZ)
+    {
+        const float Step = static_cast<float>(Grid.SampleStep);
+        const float CandidateBottom = Grid.MinZ
+            + static_cast<float>(CandidateAnchorZ) * Step;
+        const float LowestAllowedSurface = CandidateBottom - MaxStepHeightVoxels;
+        const int32 LowestAnchorZ = FMath::Max(
+            1, CandidateAnchorZ - MaxDownwardSearchCells);
+
+        // Search from the free pose downwards. The first transition in a column is the nearest
+        // supporting surface; lower transitions are relevant only after the candidate has been
+        // lifted by the bounded step-height tolerance.
+        for (int32 SurfaceAnchorZ = CandidateAnchorZ;
+             SurfaceAnchorZ >= LowestAnchorZ;
+             --SurfaceAnchorZ)
+        {
+            const int32 SolidZ = SurfaceAnchorZ - 1;
+            if (SolidZ < 0 || SurfaceAnchorZ >= Grid.NumZ)
+            {
+                continue;
+            }
+            const int32 SolidCell = Grid.Index(X, Y, SolidZ);
+            const int32 AirCell = Grid.Index(X, Y, SurfaceAnchorZ);
+            if (Grid.Air[SolidCell] != 0u || Grid.Air[AirCell] == 0u)
+            {
+                continue;
+            }
+
+            float SurfaceHeight = Grid.MinZ + static_cast<float>(SurfaceAnchorZ) * Step;
+            if (HasScalarDensity(Grid))
+            {
+                const float LowerDensity = CellDensity(Grid, SolidCell);
+                const float UpperDensity = CellDensity(Grid, AirCell);
+                const float Denominator = UpperDensity - LowerDensity;
+                if (!FMath::IsFinite(LowerDensity) || !FMath::IsFinite(UpperDensity)
+                    || !FMath::IsFinite(Denominator) || Denominator <= 0.0f)
+                {
+                    continue;
+                }
+                const float Fraction = FMath::Clamp(
+                    -LowerDensity / Denominator, 0.0f, 1.0f);
+                SurfaceHeight = Grid.CellCenter(X, Y, SolidZ).Z + Fraction * Step;
+            }
+
+            if (FMath::IsFinite(SurfaceHeight)
+                && SurfaceHeight <= CandidateBottom + KINDA_SMALL_NUMBER
+                && SurfaceHeight >= LowestAllowedSurface - KINDA_SMALL_NUMBER)
+            {
+                OutSurfaceHeight = SurfaceHeight;
+                OutSurfaceAnchorZ = SurfaceAnchorZ;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool BuildPlayerSupportPatchOffsets(
+        const FVoxelStrateMeasureSettings& Settings,
+        TArray<FIntPoint>& OutOffsets,
+        int32& OutCentreOffsetIndex,
+        FString& OutReason)
+    {
+        OutOffsets.Reset();
+        OutCentreOffsetIndex = INDEX_NONE;
+        const double Radius = static_cast<double>(Settings.PlayerCapsuleRadiusVoxels);
+        if (!FMath::IsFinite(Radius) || Radius <= 0.0)
+        {
+            return Refuse(OutReason,
+                          TEXT("Player capsule radius must be finite and greater than zero."));
+        }
+
+        const double MaxOffsetReal = FMath::CeilToDouble(Radius);
+        constexpr double MaxSupportPatchOffsets = static_cast<double>(1ll << 20);
+        if (!FMath::IsFinite(MaxOffsetReal) || MaxOffsetReal > 4096.0)
+        {
+            return Refuse(OutReason,
+                          TEXT("The player support patch radius exceeds the bounded fit stencil."));
+        }
+        const int32 MaxOffset = static_cast<int32>(MaxOffsetReal);
+        int64 NumOffsets = 0;
+        for (int32 OffsetY = -MaxOffset; OffsetY <= MaxOffset; ++OffsetY)
+        {
+            for (int32 OffsetX = -MaxOffset; OffsetX <= MaxOffset; ++OffsetX)
+            {
+                if (static_cast<double>(OffsetX * OffsetX + OffsetY * OffsetY)
+                    > Radius * Radius + KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+                if (NumOffsets >= static_cast<int64>(MaxSupportPatchOffsets))
+                {
+                    return Refuse(
+                        OutReason,
+                        TEXT("The player support patch exceeds its bounded work limit."));
+                }
+                if (OffsetX == 0 && OffsetY == 0)
+                {
+                    OutCentreOffsetIndex = OutOffsets.Num();
+                }
+                OutOffsets.Add(FIntPoint(OffsetX, OffsetY));
+                ++NumOffsets;
+            }
+        }
+        if (OutCentreOffsetIndex == INDEX_NONE || OutOffsets.IsEmpty())
+        {
+            return Refuse(OutReason, TEXT("The player support patch has no footprint samples."));
+        }
+        return true;
+    }
+
+    bool IsWalkableSupportPatch(
+        const TArray<FIntPoint>& SupportOffsets,
+        const TArray<float>& SupportHeights,
+        const TArray<uint8>& bSupported,
+        int32 CentreOffsetIndex,
+        int32 RequiredSupportCount,
+        float MinimumWalkableNormalZ,
+        int32& OutSupportCount,
+        float& OutSupportHeight,
+        int32& OutSupportAnchorZ,
+        const TArray<int32>& SupportAnchorZs)
+    {
+        OutSupportCount = 0;
+        OutSupportHeight = -FLT_MAX;
+        OutSupportAnchorZ = INDEX_NONE;
+        if (!bSupported.IsValidIndex(CentreOffsetIndex)
+            || bSupported[CentreOffsetIndex] == 0u)
+        {
+            return false;
+        }
+
+        for (int32 Index = 0; Index < SupportOffsets.Num(); ++Index)
+        {
+            if (bSupported[Index] == 0u)
+            {
+                continue;
+            }
+            ++OutSupportCount;
+            if (SupportHeights[Index] > OutSupportHeight
+                || (SupportHeights[Index] == OutSupportHeight
+                    && (OutSupportAnchorZ == INDEX_NONE
+                        || SupportAnchorZs[Index] > OutSupportAnchorZ)))
+            {
+                OutSupportHeight = SupportHeights[Index];
+                OutSupportAnchorZ = SupportAnchorZs[Index];
+            }
+        }
+        if (OutSupportCount < RequiredSupportCount || OutSupportAnchorZ == INDEX_NONE)
+        {
+            return false;
+        }
+
+        // The worst pairwise secant is intentionally conservative: an isolated height jump in
+        // the footprint cannot hide behind an average plane normal. For the default 1.36-voxel
+        // capsule this checks the centre and the four cardinal support samples.
+        float MaximumGradient = 0.0f;
+        for (int32 First = 0; First < SupportOffsets.Num(); ++First)
+        {
+            if (bSupported[First] == 0u)
+            {
+                continue;
+            }
+            for (int32 Second = First + 1; Second < SupportOffsets.Num(); ++Second)
+            {
+                if (bSupported[Second] == 0u)
+                {
+                    continue;
+                }
+                const float DX = static_cast<float>(
+                    SupportOffsets[Second].X - SupportOffsets[First].X);
+                const float DY = static_cast<float>(
+                    SupportOffsets[Second].Y - SupportOffsets[First].Y);
+                const float HorizontalDistance = FMath::Sqrt(DX * DX + DY * DY);
+                if (HorizontalDistance <= KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+                MaximumGradient = FMath::Max(
+                    MaximumGradient,
+                    FMath::Abs(SupportHeights[Second] - SupportHeights[First])
+                        / HorizontalDistance);
+            }
+        }
+        const float SupportNormalZ = 1.0f / FMath::Sqrt(
+            1.0f + MaximumGradient * MaximumGradient);
+        return FMath::IsFinite(SupportNormalZ)
+            && SupportNormalZ + KINDA_SMALL_NUMBER >= MinimumWalkableNormalZ;
+    }
+
+    bool CapsuleClearAtSupportHeight(
+        const FSampleGrid& Grid,
+        const TArray<FPlayerCapsuleStencilRow>& StencilRows,
+        int32 X,
+        int32 Y,
+        float SupportHeight)
+    {
+        const float Step = static_cast<float>(Grid.SampleStep);
+        const float BaseX = Grid.MinX + (static_cast<float>(X) + 0.5f) * Step;
+        const float BaseY = Grid.MinY + (static_cast<float>(Y) + 0.5f) * Step;
+        for (const FPlayerCapsuleStencilRow& Row : StencilRows)
+        {
+            const float SampleZ = SupportHeight + static_cast<float>(Row.RelativeZ) + 0.5f * Step;
+            for (const FIntPoint& Offset : Row.HorizontalOffsets)
+            {
+                float Density = 0.0f;
+                if (!SampleGridDensity(
+                        Grid,
+                        FVector(
+                            BaseX + static_cast<float>(Offset.X) * Step,
+                            BaseY + static_cast<float>(Offset.Y) * Step,
+                            SampleZ),
+                        Density)
+                    || !(Density > 0.0f))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     bool IsPointInsideCapsule(
         float RelativeZ,
         int32 OffsetX,
@@ -594,9 +891,9 @@ namespace VoxelStrateMeasurePrivate
         float Radius,
         float HalfHeight)
     {
-        // The capsule is upright and its centre is HalfHeight above the top face of the solid
-        // floor cell. This is a direct capsule test in the fine voxel lattice; it deliberately
-        // does not infer occupancy from Manhattan distance.
+        // The capsule is upright and this row is evaluated relative to the resolved support
+        // surface. This is a direct capsule test in the fine voxel lattice; it deliberately does
+        // not infer occupancy from Manhattan distance.
         const float AxisHalfLength = FMath::Max(0.0f, HalfHeight - Radius);
         const float DistanceToAxis = FMath::Max(
             FMath::Abs(RelativeZ) - AxisHalfLength, 0.0f);
@@ -682,10 +979,9 @@ namespace VoxelStrateMeasurePrivate
                 }
             }
 
-            // The full-height floor rule still requires one clear voxel in rows whose voxel
-            // centre lies outside the rounded cap (normally the top partial voxel of a 7.04
-            // voxel player). This is what makes 176 cm a full-height requirement rather than a
-            // 7-centre-point approximation.
+            // Keep a centre sample for every row. This matters for the top partial row of a
+            // capsule whose height is not an integer number of voxels: the full-height clearance
+            // requirement must not silently become a seven-centre-point approximation.
             if (Row.HorizontalOffsets.IsEmpty())
             {
                 Row.HorizontalOffsets.Add(FIntPoint::ZeroValue);
@@ -712,6 +1008,62 @@ namespace VoxelStrateMeasurePrivate
                     Grid.SampleStep));
         }
 
+        if (!FMath::IsFinite(Settings.PlayerMaxStepHeightMeters)
+            || Settings.PlayerMaxStepHeightMeters < 0.0f)
+        {
+            return Refuse(
+                OutReason,
+                TEXT("PlayerMaxStepHeightMeters must be finite and non-negative."));
+        }
+        if (!FMath::IsFinite(Settings.PlayerWalkableFloorAngleDegrees)
+            || Settings.PlayerWalkableFloorAngleDegrees < 0.0f
+            || Settings.PlayerWalkableFloorAngleDegrees > 90.0f)
+        {
+            return Refuse(
+                OutReason,
+                TEXT("PlayerWalkableFloorAngleDegrees must be finite and within [0,90]."));
+        }
+        if (!FMath::IsFinite(Settings.PlayerSupportPatchMinCoverageFraction)
+            || Settings.PlayerSupportPatchMinCoverageFraction <= 0.0f
+            || Settings.PlayerSupportPatchMinCoverageFraction > 1.0f)
+        {
+            return Refuse(
+                OutReason,
+                TEXT("PlayerSupportPatchMinCoverageFraction must be within (0,1]."));
+        }
+
+        const double MaxStepHeightVoxelsReal =
+            static_cast<double>(Settings.PlayerMaxStepHeightMeters)
+            / static_cast<double>(FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        constexpr double MaxSupportSearchHeightVoxels = 4096.0;
+        if (!FMath::IsFinite(MaxStepHeightVoxelsReal)
+            || MaxStepHeightVoxelsReal < 0.0
+            || MaxStepHeightVoxelsReal > MaxSupportSearchHeightVoxels)
+        {
+            return Refuse(
+                OutReason,
+                TEXT("PlayerMaxStepHeightMeters exceeds the bounded support search."));
+        }
+        const int32 MaxDownwardSearchCells = static_cast<int32>(
+            FMath::CeilToDouble(MaxStepHeightVoxelsReal));
+        const float MaxStepHeightVoxels = static_cast<float>(MaxStepHeightVoxelsReal);
+        const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+            Settings.PlayerWalkableFloorAngleDegrees));
+
+        TArray<FIntPoint> SupportOffsets;
+        int32 CentreOffsetIndex = INDEX_NONE;
+        if (!BuildPlayerSupportPatchOffsets(
+                Settings, SupportOffsets, CentreOffsetIndex, OutReason))
+        {
+            return false;
+        }
+        const int32 RequiredSupportCount = FMath::Clamp(
+            FMath::CeilToInt(
+                Settings.PlayerSupportPatchMinCoverageFraction
+                    * static_cast<float>(SupportOffsets.Num())),
+            1,
+            SupportOffsets.Num());
+
         TArray<FPlayerCapsuleStencilRow> StencilRows;
         if (!BuildPlayerCapsuleStencil(Settings, StencilRows, OutReason))
         {
@@ -719,6 +1071,12 @@ namespace VoxelStrateMeasurePrivate
         }
 
         OutPlayerFit.Init(0u, Grid.CellCount);
+        TArray<float> SupportHeights;
+        SupportHeights.SetNumUninitialized(SupportOffsets.Num());
+        TArray<int32> SupportAnchorZs;
+        SupportAnchorZs.SetNumUninitialized(SupportOffsets.Num());
+        TArray<uint8> bSupported;
+        bSupported.Init(0u, SupportOffsets.Num());
         for (int32 Z = 1; Z < Grid.NumZ; ++Z)
         {
             for (int32 Y = 0; Y < Grid.NumY; ++Y)
@@ -726,44 +1084,95 @@ namespace VoxelStrateMeasurePrivate
                 for (int32 X = 0; X < Grid.NumX; ++X)
                 {
                     const int32 Current = Grid.Index(X, Y, Z);
-                    if (Grid.Air[Current] == 0u
-                        || Grid.Air[Grid.Index(X, Y, Z - 1)] != 0u)
+                    // This is the free-pose candidate. Its support is resolved independently
+                    // below, so an air cell one or two voxels above a surface can be lowered to
+                    // that surface when the character's named step height permits it.
+                    if (Grid.Air[Current] == 0u)
                     {
                         continue;
                     }
 
-                    bool bFits = true;
-                    for (const FPlayerCapsuleStencilRow& Row : StencilRows)
+                    int32 NumSupported = 0;
+                    for (int32 SupportIndex = 0;
+                         SupportIndex < SupportOffsets.Num();
+                         ++SupportIndex)
                     {
-                        const int32 TargetZ = Z + Row.RelativeZ;
-                        if (TargetZ < 0 || TargetZ >= Grid.NumZ)
+                        const FIntPoint& Offset = SupportOffsets[SupportIndex];
+                        const int32 SupportX = X + Offset.X;
+                        const int32 SupportY = Y + Offset.Y;
+                        bSupported[SupportIndex] = 0u;
+                        if (SupportX < 0 || SupportX >= Grid.NumX
+                            || SupportY < 0 || SupportY >= Grid.NumY)
                         {
-                            bFits = false;
-                            break;
+                            continue;
                         }
-                        for (const FIntPoint& Offset : Row.HorizontalOffsets)
+
+                        float SurfaceHeight = 0.0f;
+                        int32 SurfaceAnchorZ = INDEX_NONE;
+                        if (FindSupportSurfaceBelow(
+                                Grid,
+                                SupportX,
+                                SupportY,
+                                Z,
+                                MaxDownwardSearchCells,
+                                MaxStepHeightVoxels,
+                                SurfaceHeight,
+                                SurfaceAnchorZ))
                         {
-                            const int32 TargetX = X + Offset.X;
-                            const int32 TargetY = Y + Offset.Y;
-                            if (TargetX < 0 || TargetX >= Grid.NumX
-                                || TargetY < 0 || TargetY >= Grid.NumY
-                                || Grid.Air[Grid.Index(TargetX, TargetY, TargetZ)] == 0u)
-                            {
-                                bFits = false;
-                                break;
-                            }
-                        }
-                        if (!bFits)
-                        {
-                            break;
+                            bSupported[SupportIndex] = 1u;
+                            SupportHeights[SupportIndex] = SurfaceHeight;
+                            SupportAnchorZs[SupportIndex] = SurfaceAnchorZ;
+                            ++NumSupported;
                         }
                     }
 
-                    if (bFits)
+                    if (NumSupported < RequiredSupportCount
+                        || bSupported[CentreOffsetIndex] == 0u)
                     {
-                        OutPlayerFit[Current] = 1u;
-                        ++OutNumPlayerFitCells;
+                        continue;
                     }
+
+                    int32 SupportCount = 0;
+                    float SupportHeight = 0.0f;
+                    int32 SupportAnchorZ = INDEX_NONE;
+                    if (!IsWalkableSupportPatch(
+                            SupportOffsets,
+                            SupportHeights,
+                            bSupported,
+                            CentreOffsetIndex,
+                            RequiredSupportCount,
+                            MinimumWalkableNormalZ,
+                            SupportCount,
+                            SupportHeight,
+                            SupportAnchorZ,
+                            SupportAnchorZs))
+                    {
+                        continue;
+                    }
+
+                    // Resolve the pose to the highest coherent support in the patch and run the
+                    // full capsule stencil again there. The support search alone is not allowed
+                    // to turn a ledge or an overhang into a fit result. Keep the original free
+                    // pose cell in the mask: every accepted pose is a valid point in the
+                    // existing 6-neighbour traversal graph, and retaining the bounded vertical
+                    // band is what lets adjacent gently sloped surfaces overlap instead of
+                    // becoming diagonal, disconnected floor anchors.
+                    if (!CapsuleClearAtSupportHeight(
+                            Grid, StencilRows, X, Y, SupportHeight))
+                    {
+                        continue;
+                    }
+
+                    if (SupportAnchorZ < 1 || SupportAnchorZ >= Grid.NumZ)
+                    {
+                        continue;
+                    }
+                    if (OutPlayerFit[Current] != 0u)
+                    {
+                        continue;
+                    }
+                    OutPlayerFit[Current] = 1u;
+                    ++OutNumPlayerFitCells;
                 }
             }
         }
@@ -1341,8 +1750,8 @@ namespace VoxelStrateMeasurePrivate
 
         if (EligibilityMask != nullptr)
         {
-            // A player-fit route is deliberately a graph over floor anchors, not a second air
-            // route with a coarse-cell illusion. The mask was built at SampleStep=1 and every
+            // A player-fit route is deliberately a graph over supported free poses, not a second
+            // air route with a coarse-cell illusion. The mask was built at SampleStep=1 and every
             // edge below is between adjacent player-fitting cells.
             for (int32 PathIndex = 0; PathIndex < Path.Num(); ++PathIndex)
             {
@@ -1797,7 +2206,7 @@ namespace VoxelStrateMeasurePrivate
         if (!BuildSampleGrid(Generator, Manager, Sampler, StrateIndex,
                              ExplicitBottomWorldZ, ExplicitTopWorldZ,
                              ExplicitBoundarySealThickness, bUseExplicitBounds,
-                             Settings, false, Grid, RefusalReason))
+                             Settings, bPlayerFitRestricted, Grid, RefusalReason))
         {
             if (OutDiagnostics != nullptr)
             {
@@ -1909,7 +2318,8 @@ FVoxelStrateMetrics VF_MeasureStrate(
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             &Generator, &Manager, nullptr, StrateIndex, 0, 0, 0.0f, false,
-            Settings, OutSampleGrid != nullptr, Grid, Result.RefusalReason))
+            Settings, OutSampleGrid != nullptr || Settings.SampleStep == 1,
+            Grid, Result.RefusalReason))
     {
         return Result;
     }
@@ -1953,7 +2363,8 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     VoxelStrateMeasurePrivate::FSampleGrid Grid;
     if (!VoxelStrateMeasurePrivate::BuildSampleGrid(
             nullptr, nullptr, &Sampler, INDEX_NONE, StrateBottomWorldZ, StrateTopWorldZ,
-            BoundarySealThickness, true, Settings, OutSampleGrid != nullptr,
+            BoundarySealThickness, true, Settings,
+            OutSampleGrid != nullptr || Settings.SampleStep == 1,
             Grid, Result.RefusalReason))
     {
         return Result;

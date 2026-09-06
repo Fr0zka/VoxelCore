@@ -4,6 +4,10 @@
 
 #include "Misc/AutomationTest.h"
 
+#include "Components/CapsuleComponent.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+
 #include "VoxelCaveMorphology.h"
 #include "VoxelDensityOpStack.h"
 #include "VoxelForgeTestFixture.h"
@@ -557,6 +561,126 @@ namespace
         const UVoxelGenerator& Generator;
     };
 
+    class FVerticalWallSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        float SampleDensity(float WorldX, float, float) const override
+        {
+            // A wall that spans the whole measured height has no lower supporting surface.
+            // It catches a stencil that treats a nearby solid column as a floor pixel.
+            return FMath::Abs(WorldX) < 1.0f ? -1.0f : 1.0f;
+        }
+    };
+
+    class FIsolatedLedgeSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        float SampleDensity(float WorldX, float WorldY, float WorldZ) const override
+        {
+            // With one-voxel sampling and bounds [-8,8), this is exactly one solid floor cell
+            // at the (0.5,0.5,0.5) sample. It must fail the 4-of-5 support patch.
+            const bool bSingleCell = WorldZ < 1.0f
+                && FMath::Abs(WorldX) < 1.0f
+                && FMath::Abs(WorldY) < 1.0f;
+            return bSingleCell ? -1.0f : 1.0f;
+        }
+    };
+
+    class FOverhangSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        float SampleDensity(float, float, float WorldZ) const override
+        {
+            // Air below an overhang/ceiling, with solid continuing above the measured window.
+            // A downward-only support search must not use that ceiling as a floor.
+            return WorldZ >= 4.0f ? -1.0f : 1.0f;
+        }
+    };
+
+    class FSteepRampSampler final : public IVoxelStrateDensitySampler
+    {
+    public:
+        float SampleDensity(float WorldX, float, float WorldZ) const override
+        {
+            // One voxel of rise per one voxel of run is 45 degrees. The project CDO's 44.8
+            // degree limit must reject the support patch instead of averaging this into floor.
+            const float FloorHeight = 8.0f + WorldX;
+            return WorldZ < FloorHeight ? -1.0f : 1.0f;
+        }
+    };
+
+    bool VF_ApplyProjectCharacterFitDefaults(
+        FAutomationTestBase& Test,
+        FVoxelStrateMeasureSettings& InOutSettings)
+    {
+        constexpr const TCHAR* CharacterCDOPath =
+            TEXT("/Game/FirstPerson/Blueprints/BP_FirstPersonCharacter.BP_FirstPersonCharacter_C");
+        UClass* CharacterClass = LoadObject<UClass>(nullptr, CharacterCDOPath);
+        if (CharacterClass == nullptr || !CharacterClass->IsChildOf(ACharacter::StaticClass()))
+        {
+            Test.AddError(FString::Printf(
+                TEXT("Could not load the project character CDO at %s."), CharacterCDOPath));
+            return false;
+        }
+
+        const ACharacter* CharacterCDO = CharacterClass->GetDefaultObject<ACharacter>();
+        const UCapsuleComponent* Capsule = CharacterCDO != nullptr
+            ? CharacterCDO->GetCapsuleComponent() : nullptr;
+        const UCharacterMovementComponent* Movement = CharacterCDO != nullptr
+            ? CharacterCDO->GetCharacterMovement() : nullptr;
+        if (Capsule == nullptr || Movement == nullptr)
+        {
+            Test.AddError(TEXT("The project character CDO has no capsule or movement component."));
+            return false;
+        }
+
+        const float RadiusCentimeters = Capsule->GetUnscaledCapsuleRadius();
+        const float HalfHeightCentimeters = Capsule->GetUnscaledCapsuleHalfHeight();
+        const float MaxStepHeightMeters = Movement->MaxStepHeight / 100.0f;
+        const float WalkableFloorAngleDegrees = Movement->GetWalkableFloorAngle();
+        if (!FMath::IsFinite(RadiusCentimeters) || RadiusCentimeters <= 0.0f
+            || !FMath::IsFinite(HalfHeightCentimeters) || HalfHeightCentimeters <= 0.0f
+            || !FMath::IsFinite(MaxStepHeightMeters) || MaxStepHeightMeters < 0.0f
+            || !FMath::IsFinite(WalkableFloorAngleDegrees)
+            || WalkableFloorAngleDegrees < 0.0f || WalkableFloorAngleDegrees > 90.0f)
+        {
+            Test.AddError(TEXT("The project character CDO has invalid fit parameters."));
+            return false;
+        }
+
+        // Keep the existing 34 cm / 88 cm metric capsule fixed for before/after comparability.
+        // The task-specific movement limits below are read from the project character CDO.
+        Test.AddInfo(FString::Printf(
+            TEXT("PLAYER_CHARACTER capsule CDO reports radius=%.1f cm, half_height=%.1f cm; "
+                 "measurement dimensions remain radius=%.1f cm, half_height=%.1f cm "
+                 "to isolate the stencil change"),
+            RadiusCentimeters,
+            HalfHeightCentimeters,
+            FVoxelPlayerCapsuleConstants::RadiusCentimeters,
+            FVoxelPlayerCapsuleConstants::HalfHeightCentimeters));
+        InOutSettings.PlayerMaxStepHeightMeters = MaxStepHeightMeters;
+        InOutSettings.PlayerWalkableFloorAngleDegrees = WalkableFloorAngleDegrees;
+        return true;
+    }
+
+    int32 VF_CountSupportFootprintColumns(float RadiusVoxels)
+    {
+        const int32 MaxOffset = FMath::CeilToInt(RadiusVoxels);
+        int32 Count = 0;
+        for (int32 Y = -MaxOffset; Y <= MaxOffset; ++Y)
+        {
+            for (int32 X = -MaxOffset; X <= MaxOffset; ++X)
+            {
+                if (static_cast<float>(X * X + Y * Y)
+                    <= RadiusVoxels * RadiusVoxels + KINDA_SMALL_NUMBER)
+                {
+                    ++Count;
+                }
+            }
+        }
+        return Count;
+    }
+
     float VF_BoundarySealForCandidate(const FVoxelStrateComposerCandidate& Candidate)
     {
         switch (Candidate.Archetype)
@@ -639,6 +763,11 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         AddError(World.WhyInvalid());
         return false;
     }
+    TestTrue(TEXT("scale diagnosis keeps WorldRadiusVoxels at zero"),
+             World.Settings->WorldRadiusVoxels == 0.0f
+                 && World.Generator->WorldRadiusVoxels == 0.0f);
+    TestFalse(TEXT("scale diagnosis keeps lateral regions gated off"),
+              VF_LateralRegionsAreShippable());
 
     const FVoxelStrateComposerCandidate MazeCandidate = VF_RollStrateCandidate(
         Corpus, DiagnosisSeed, MazeCandidateIndex, false);
@@ -757,9 +886,42 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
             ShaftCore.Negative.CrossingRadiusVoxels * 0.25f));
     }
 
+    FVoxelStrateMeasureSettings CharacterFitSettings;
+    if (!VF_ApplyProjectCharacterFitDefaults(*this, CharacterFitSettings))
+    {
+        return false;
+    }
+
+    const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+        CharacterFitSettings.PlayerWalkableFloorAngleDegrees));
+    const int32 SupportFootprintColumns = VF_CountSupportFootprintColumns(
+        CharacterFitSettings.PlayerCapsuleRadiusVoxels);
+    const int32 RequiredSupportColumns = FMath::Clamp(
+        FMath::CeilToInt(CharacterFitSettings.PlayerSupportPatchMinCoverageFraction
+                         * static_cast<float>(SupportFootprintColumns)),
+        1, SupportFootprintColumns);
+    const int32 MaxDownwardSearchCells = FMath::CeilToInt(
+        CharacterFitSettings.PlayerMaxStepHeightMeters
+        / FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+    AddInfo(FString::Printf(
+        TEXT("PLAYER_CHARACTER movement source=%s: MaxStepHeight=%.3f m "
+             "(%.3f vox; search<=%d cells), WalkableFloorAngle=%.1f deg "
+             "(normal_z>=%.6f); support_patch=%.1f%% requires %d/%d integer footprint columns "
+             "and always requires the centre"),
+        TEXT("/Game/FirstPerson/Blueprints/BP_FirstPersonCharacter CDO"),
+        CharacterFitSettings.PlayerMaxStepHeightMeters,
+        CharacterFitSettings.PlayerMaxStepHeightMeters
+            / FVoxelPlayerCapsuleConstants::VoxelSizeMeters,
+        MaxDownwardSearchCells,
+        CharacterFitSettings.PlayerWalkableFloorAngleDegrees,
+        MinimumWalkableNormalZ,
+        CharacterFitSettings.PlayerSupportPatchMinCoverageFraction * 100.0f,
+        RequiredSupportColumns,
+        SupportFootprintColumns));
+
     // H2 — a known-open control with a solid floor. This must produce non-zero fit cells.
     FEmptyRoomSampler EmptyRoom;
-    FVoxelStrateMeasureSettings ControlSettings;
+    FVoxelStrateMeasureSettings ControlSettings = CharacterFitSettings;
     ControlSettings.SampleStep = 1;
     ControlSettings.RadiusInVoxels = 40; // 80 voxels = 20 m across.
     ControlSettings.CenterXY = FVector2D::ZeroVector;
@@ -781,12 +943,65 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         ControlMetrics.NumTraversableComponents,
         static_cast<long long>(ControlMetrics.LargestTraversableComponentCells),
         ControlMetrics.TraversableComponentShare));
+
+    FVoxelStrateMeasureSettings CoarseControlSettings = ControlSettings;
+    CoarseControlSettings.SampleStep = 4;
+    const FVoxelStrateMetrics CoarseControlMetrics = VF_MeasureStrateWithSampler(
+        EmptyRoom, 0, 32, 0.0f, CoarseControlSettings, nullptr);
+    const bool bCoarseRefused = CoarseControlMetrics.bValid
+        && !CoarseControlMetrics.bPlayerFitResolved
+        && CoarseControlMetrics.PlayerFitRefusalReason.Contains(TEXT("SampleStep=4"));
+    TestTrue(TEXT("coarse player-fit control refuses unresolved capsule fit"), bCoarseRefused);
+    AddInfo(FString::Printf(
+        TEXT("CONTROL coarse_step4_player_fit: refused=%s reason=%s"),
+        bCoarseRefused ? TEXT("true") : TEXT("false"),
+        CoarseControlMetrics.PlayerFitRefusalReason.IsEmpty()
+            ? TEXT("none") : *CoarseControlMetrics.PlayerFitRefusalReason));
+
+    // A permissive stencil must fail these deliberately pathological supports. The wall has no
+    // downward transition, the ledge covers only 1/5 of the footprint, and the overhang has
+    // solid above rather than below the candidate. All controls use the same character-derived
+    // settings and a bounded 16x16x12-voxel window.
+    FVoxelStrateMeasureSettings RejectionSettings = CharacterFitSettings;
+    RejectionSettings.SampleStep = 1;
+    RejectionSettings.RadiusInVoxels = 8;
+    RejectionSettings.CenterXY = FVector2D::ZeroVector;
+    RejectionSettings.MaxCells = 100000;
+    RejectionSettings.InteriorMarginVoxels = 0;
+    auto RunStencilRejectionControl = [this, &RejectionSettings](
+        const TCHAR* Label, const IVoxelStrateDensitySampler& Sampler)
+    {
+        const FVoxelStrateMetrics Metrics = VF_MeasureStrateWithSampler(
+            Sampler, 0, 12, 0.0f, RejectionSettings, nullptr);
+        const bool bRejected = Metrics.bValid && Metrics.bPlayerFitResolved
+            && Metrics.NumPlayerFitCells == 0;
+        TestTrue(FString::Printf(TEXT("stencil rejects %s"), Label), bRejected);
+        AddInfo(FString::Printf(
+            TEXT("CONTROL stencil_rejection %s: rejected=%s fit_cells=%lld "
+                 "resolved=%s reason=%s"),
+            Label,
+            bRejected ? TEXT("true") : TEXT("false"),
+            static_cast<long long>(Metrics.NumPlayerFitCells),
+            Metrics.bPlayerFitResolved ? TEXT("true") : TEXT("false"),
+            Metrics.PlayerFitRefusalReason.IsEmpty()
+                ? TEXT("none") : *Metrics.PlayerFitRefusalReason));
+    };
+    FVerticalWallSampler VerticalWall;
+    FIsolatedLedgeSampler IsolatedLedge;
+    FOverhangSampler Overhang;
+    FSteepRampSampler SteepRamp;
+    RunStencilRejectionControl(TEXT("vertical_shaft_wall"), VerticalWall);
+    RunStencilRejectionControl(TEXT("isolated_1_voxel_ledge"), IsolatedLedge);
+    RunStencilRejectionControl(TEXT("overhang_underside"), Overhang);
+    RunStencilRejectionControl(TEXT("over_44_degree_ramp"), SteepRamp);
+
     AddInfo(FString::Printf(
         TEXT("PLAYER_STENCIL radius=%.3f voxels (%.2f m), half_height=%.3f voxels "
              "(%.2f m), height=%.3f voxels (%.2f m); rows=ceil(height)=%d "
-             "relative rows 0..%d; floor=air anchor with exactly one solid cell at Z-1; "
-             "no floor tolerance; horizontal integer offsets are center plus four cardinals "
-             "in rows 0..6 and center-only forced in row 7; HeadroomCells=%d is legacy-only"),
+             "relative rows 0..%d; support=nearest scalar solid-to-air surface searched "
+             "down <=%.3f m/%d cells; support patch=%d/%d columns with centre required; "
+             "walkable slope<=%.1f deg; capsule clearance is re-tested at resolved support; "
+             "HeadroomCells=%d is legacy-only"),
         ControlSettings.PlayerCapsuleRadiusVoxels,
         ControlSettings.PlayerCapsuleRadiusVoxels * 0.25f,
         ControlSettings.PlayerCapsuleHalfHeightVoxels,
@@ -795,6 +1010,11 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         FVoxelPlayerCapsuleConstants::HeightVoxels * 0.25f,
         FMath::CeilToInt(2.0f * ControlSettings.PlayerCapsuleHalfHeightVoxels),
         FMath::CeilToInt(2.0f * ControlSettings.PlayerCapsuleHalfHeightVoxels) - 1,
+        ControlSettings.PlayerMaxStepHeightMeters,
+        MaxDownwardSearchCells,
+        RequiredSupportColumns,
+        SupportFootprintColumns,
+        ControlSettings.PlayerWalkableFloorAngleDegrees,
         ControlSettings.HeadroomCells));
 
     // H3 — the eight fixed showcase identities, measured at step 1 on a mouth-fitted window.
@@ -818,13 +1038,44 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         { ECaveGeneratorType::VerticalShafts,  0,   34, FTestWorld::SlotFlatPlain, TEXT("VerticalShafts") },
     };
 
+    // Baseline rows from the pre-fix fitted-window report. The supplied VerticalShafts row is
+    // retained verbatim (it came from the owner's scale report); it is deliberately labelled as
+    // a comparison row rather than recomputed by this test.
+    struct FShowcaseBaseline
+    {
+        int64 FitCells;
+        int32 Components;
+        int64 LargestComponent;
+        int64 ArrivalComponent;
+        int64 DepartureComponent;
+        float MouthGap;
+        const TCHAR* Law;
+    };
+    const FShowcaseBaseline Baselines[] = {
+        {655, 197, 24, 1, 1, 47.529f, TEXT("NotConnectedAtThisResolution")},
+        {1116, 45, 259, 1, 1, 48.104f, TEXT("NotConnectedAtThisResolution")},
+        {4, 2, 3, 1, 1, 0.000f, TEXT("Connected")},
+        {2801, 309, 176, 43, 81, 206.630f, TEXT("NotConnectedAtThisResolution")},
+        {713, 520, 6, 1, 1, 110.648f, TEXT("NotConnectedAtThisResolution")},
+        {2748, 467, 1292, 2, 1, 164.405f, TEXT("NotConnectedAtThisResolution")},
+        {337, 86, 35, 3, 11, 142.499f, TEXT("NotConnectedAtThisResolution")},
+        {1156, 112, 96, 3, 36, 94.000f, TEXT("NotConnectedAtThisResolution")},
+    };
+    static_assert(UE_ARRAY_COUNT(Selections) == UE_ARRAY_COUNT(Baselines),
+                  "H3 before/after rows must remain paired.");
+    int32 NumH3Connected = 0;
+    int32 NumH3DegenerateConnected = 0;
+    int32 NumH3Measured = 0;
+
     for (const FShowcaseSelection& Selection : Selections)
     {
         const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
             Corpus, Selection.Seed, Selection.CandidateIndex, false);
         TestTrue(FString::Printf(TEXT("H3 %s candidate identity is valid"), Selection.Label),
-                 Candidate.bValid && Candidate.Archetype == Selection.Archetype);
-        if (!Candidate.bValid || Candidate.Archetype != Selection.Archetype)
+                 Candidate.bValid && Candidate.Archetype == Selection.Archetype
+                     && Candidate.Regions.IsSingleRegion());
+        if (!Candidate.bValid || Candidate.Archetype != Selection.Archetype
+            || !Candidate.Regions.IsSingleRegion())
         {
             continue;
         }
@@ -856,7 +1107,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
             continue;
         }
 
-        FVoxelStrateMeasureSettings Settings;
+        FVoxelStrateMeasureSettings Settings = CharacterFitSettings;
         Settings.SampleStep = 1;
         Settings.RadiusInVoxels = 64;
         Settings.CenterXY = FVector2D(
@@ -887,7 +1138,56 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
                 VF_BoundarySealForCandidate(Candidate), ArrivalPoint, DeparturePoint,
                 Settings, &Metrics);
         VF_ReportPlayerFitRow(*this, Selection.Label, Metrics, Diagnostics);
+        ++NumH3Measured;
+        if (Diagnostics.Result == EVoxelConnectivityResult::Connected)
+        {
+            ++NumH3Connected;
+            if (Metrics.NumPlayerFitCells <= 4)
+            {
+                ++NumH3DegenerateConnected;
+            }
+        }
+        const FShowcaseBaseline& Before = Baselines[&Selection - Selections];
+        FString DeltaReport = TEXT("H3_DELTA step1 ");
+        DeltaReport += Selection.Label;
+        DeltaReport += FString::Printf(
+            TEXT(": before=%lld/%d/%lld/%lld/%lld/%.3f/"),
+            static_cast<long long>(Before.FitCells), Before.Components,
+            static_cast<long long>(Before.LargestComponent),
+            static_cast<long long>(Before.ArrivalComponent),
+            static_cast<long long>(Before.DepartureComponent), Before.MouthGap);
+        DeltaReport += Before.Law;
+        DeltaReport += FString::Printf(
+            TEXT("; after=%lld/%d/%lld/%lld/%lld/%.3f/"),
+            static_cast<long long>(Metrics.NumPlayerFitCells), Metrics.NumTraversableComponents,
+            static_cast<long long>(Metrics.LargestTraversableComponentCells),
+            static_cast<long long>(Diagnostics.StartComponentCells),
+            static_cast<long long>(Diagnostics.GoalComponentCells),
+            Diagnostics.StartToGoalComponentDistanceCells);
+        DeltaReport += VF_DiagnosisConnectivityName(Diagnostics.Result);
+        DeltaReport += FString::Printf(
+            TEXT("; delta_fit=%lld delta_components=%d delta_largest=%lld "
+                 "delta_arrival=%lld delta_departure=%lld delta_gap=%.3f"),
+            static_cast<long long>(Metrics.NumPlayerFitCells - Before.FitCells),
+            Metrics.NumTraversableComponents - Before.Components,
+            static_cast<long long>(Metrics.LargestTraversableComponentCells - Before.LargestComponent),
+            static_cast<long long>(Diagnostics.StartComponentCells - Before.ArrivalComponent),
+            static_cast<long long>(Diagnostics.GoalComponentCells - Before.DepartureComponent),
+            Diagnostics.StartToGoalComponentDistanceCells - Before.MouthGap);
+        AddInfo(DeltaReport);
     }
+
+    // The old tally's one Connected row was the four-cell FloatingIslands pocket. Keep that
+    // degenerate fact visible beside the new tally so a tiny connected island is not mistaken for
+    // an instrument-wide success.
+    AddInfo(FString::Printf(
+        TEXT("LAW_TALLY restricted step1: before_connected=1/8 "
+             "before_connected_through_4_cells=1; after_connected=%d/%d "
+             "after_connected_through_4_cells=%d measured=%d/8"),
+        NumH3Connected,
+        UE_ARRAY_COUNT(Selections),
+        NumH3DegenerateConnected,
+        NumH3Measured));
 
     return true;
 }

@@ -1957,7 +1957,15 @@ namespace VoxelSeasonCompositionPrivate
             && FMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
             && Settings.PlayerCapsuleRadiusVoxels > 0.0f
             && FMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
-            && Settings.PlayerCapsuleHalfHeightVoxels > 0.0f;
+            && Settings.PlayerCapsuleHalfHeightVoxels > 0.0f
+            && FMath::IsFinite(Settings.PlayerMaxStepHeightMeters)
+            && Settings.PlayerMaxStepHeightMeters >= 0.0f
+            && FMath::IsFinite(Settings.PlayerWalkableFloorAngleDegrees)
+            && Settings.PlayerWalkableFloorAngleDegrees >= 0.0f
+            && Settings.PlayerWalkableFloorAngleDegrees <= 90.0f
+            && FMath::IsFinite(Settings.PlayerSupportPatchMinCoverageFraction)
+            && Settings.PlayerSupportPatchMinCoverageFraction > 0.0f
+            && Settings.PlayerSupportPatchMinCoverageFraction <= 1.0f;
     }
 
     bool IsBossSlot(int32 DepthIndex, int32 TotalStrates, int32 Interval)

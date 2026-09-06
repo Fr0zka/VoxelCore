@@ -8,18 +8,27 @@ class UVoxelGenerator;
 class UVoxelStrateManager;
 
 /**
- * The confirmed base ACharacter capsule in voxel-space defaults.
+ * The pinned metric capsule dimensions in voxel-space.
  *
  * 25 cm/voxel is the authored world scale: radius = 34 cm / 25 = 1.36 voxels and
  * half-height = 88 cm / 25 = 3.52 voxels, hence a 176 cm / 25 = 7.04 voxel total height.
  * The measure settings copy these values so a future character can change the query without
- * changing generation.
+ * changing generation. The diagnosis test separately reads movement limits from the project's
+ * character CDO.
  */
 struct VOXELFORGE_API FVoxelPlayerCapsuleConstants
 {
     static constexpr float VoxelSizeCentimeters = 25.0f;
+    static constexpr float VoxelSizeMeters = VoxelSizeCentimeters / 100.0f;
     static constexpr float RadiusCentimeters = 34.0f;
     static constexpr float HalfHeightCentimeters = 88.0f;
+    // UCharacterMovementComponent's UE 5.7 default. Callers that have a character CDO should
+    // copy its authored value into PlayerMaxStepHeightMeters.
+    static constexpr float MaxStepHeightCentimeters = 45.0f;
+    static constexpr float MaxStepHeightMeters = MaxStepHeightCentimeters / 100.0f;
+    // UE 5.7's WalkableFloorZ=0.71 resolves to about 44.8 degrees; a character CDO may expose
+    // the precise angle. The diagnosis test copies that precise project value when available.
+    static constexpr float WalkableFloorAngleDegrees = 44.8f;
     static constexpr float RadiusVoxels = RadiusCentimeters / VoxelSizeCentimeters;
     static constexpr float HalfHeightVoxels = HalfHeightCentimeters / VoxelSizeCentimeters;
     static constexpr float HeightVoxels = 2.0f * HalfHeightVoxels;
@@ -61,7 +70,7 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     float CoverMarginVoxels = 48.0f;
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     MaxRouteRetries = 16; // Alternate coarse routes to full-resolution-check after the first route.
-    int32     HeadroomCells  = 2;    // Air cells above a floor cell required for walkable.
+    int32     HeadroomCells  = 2;    // Legacy walkable-column metric only.
     int32     InteriorMarginVoxels = -1; // <0 = derive from BoundarySealThickness (2x, clamped); explicit 0 includes the seal.
 
     // Base ACharacter defaults at 25 cm/voxel: 34 cm radius / 25 = 1.36 voxels and
@@ -69,6 +78,15 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     // generation values, so another playable capsule can be measured without a code change.
     float PlayerCapsuleRadiusVoxels = FVoxelPlayerCapsuleConstants::RadiusVoxels;
     float PlayerCapsuleHalfHeightVoxels = FVoxelPlayerCapsuleConstants::HalfHeightVoxels;
+
+    // Character-derived fit parameters. MaxStepHeight is deliberately named and stored in
+    // metres, matching UCharacterMovementComponent's authored unit. The measurement converts it
+    // to voxels only for the bounded downward support search.
+    float PlayerMaxStepHeightMeters = FVoxelPlayerCapsuleConstants::MaxStepHeightMeters;
+    float PlayerWalkableFloorAngleDegrees = FVoxelPlayerCapsuleConstants::WalkableFloorAngleDegrees;
+    // A support patch is sampled at the integer columns covered by the capsule radius. 0.75 with
+    // the default 1.36-voxel radius requires 4 of 5 columns, including the centre column.
+    float PlayerSupportPatchMinCoverageFraction = 0.75f;
 };
 
 /**
@@ -163,16 +181,16 @@ struct VOXELFORGE_API FVoxelStrateMetrics
     int32 MedianVerticalClearance = 0;
 
     // Player-fit metrics are answered only by a one-voxel grid. A coarse grid refuses to infer
-    // clearance because SampleStep=4 cannot resolve a 1.36-voxel radius capsule.
+    // support or clearance because SampleStep=4 cannot resolve a 1.36-voxel radius capsule.
     bool bPlayerFitResolved = false;
     FString PlayerFitRefusalReason;
     int64 NumPlayerFitCells = 0;
-    float PlayerFitFraction = 0.0f; // Player-fitting floor anchors / all air cells.
+    float PlayerFitFraction = 0.0f; // Accepted free supported poses / all air cells.
     int32 NumTraversableComponents = 0;
     int64 LargestTraversableComponentCells = 0;
     float TraversableComponentShare = 0.0f; // Largest player-fit component / player-fit cells.
-    // Minimum horizontal Chebyshev clearance, in voxels, among player-fit floor anchors. This
-    // is a diagnostic only; player occupancy itself uses a direct capsule stencil, never the old
+    // Minimum horizontal Chebyshev clearance, in voxels, among accepted supported poses. This is
+    // a diagnostic only; player occupancy itself uses a direct capsule stencil, never the old
     // Manhattan distance transform.
     float MinimumPlayerClearanceVoxels = 0.0f;
 
