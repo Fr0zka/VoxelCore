@@ -112,9 +112,10 @@ remains `0`, and lateral regions remain gated off.
 ### 3.1 Module & build
 | File | Role |
 |------|------|
-| `../../VoxelForge.uplugin` | Plugin manifest. One Runtime module `VoxelForge`. Beta. |
+| `../../VoxelForge.uplugin` | Plugin manifest. Runtime module `VoxelForge` plus the Editor-only `VoxelForgeEditor` commandlet module. Beta. |
 | `VoxelForge.Build.cs` | Deps: Core, CoreUObject, Engine, **GameplayTags**, **RealtimeMeshComponent**. |
 | `Public/VoxelForgeModule.h` / `Private/VoxelForgeModule.cpp` | `FVoxelForgeModule` boilerplate (Startup/Shutdown just log). |
+| `Source/VoxelForgeEditor/VoxelForgeEditor.Build.cs` / `Private/VoxelForgeExploreCommandlet.*` | Editor/commandlet-only `-run=VoxelForgeExplore`; owns bounded render/`VF_` walk/OBJ export orchestration and is not linked by Game/Shipping. |
 | `Public/VoxelStats.h` / `Private/VoxelStats.cpp` | `stat VoxelForge` DWORD counters for tile classification, skipping, meshing, operator-stack verdicts, and cave-bail diagnosis. The former ambiguous `Cave Bail Not Op Stack` is split into `Sole Slot`, `Boundary Tile`, `No Layout`, and late `Recheck` counters, so each increment names one guard/context. |
 
 ### 3.2 Foundational types — `Public/VoxelTypes.h` (no UClass, everyone includes it)
@@ -400,6 +401,16 @@ No UObject state, cache, actor, world, or PIE is required.
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; resolves either the legacy centered square or the two-point fitted AABB, and refuses invalid bounds or a grid over `MaxCells`. |
 | `VF_AreConnected` | Coarse 6-connected BFS plus deterministic blocked-edge retries, with a full-resolution air recheck for every candidate route and explicit endpoint-solid, out-of-window, `NotConnectedAtThisResolution`, `CoarseLiedBudgetExhausted` (unknown), and connected outcomes; diagnostics include endpoint component facts and the retry count from that same grid. |
 | `VF_DiagnoseConnectivity` | The same query plus each mouth's air-component size/share and exact geometric distance to the nearest cell of the other component; proximity is measured in coarse-cell coordinates and does not claim a route through solid. |
+| `FVoxelPlayerFitWalkReport` / `VF_MeasurePlayerFitWalkWithSampler` | Editor-only experiential instrument over the existing exact `VF_` capsule/floor-fit mask: deterministic graph-walk distance, dead ends, reachable fit volume, and a labelled narrow-gap proxy; no second movement model. |
+
+`VoxelForgeExploreCommandlet` builds a transient, fixed-definition world and calls the production
+`UVoxelGenerator::GetDensityAt` and `UVoxelMarchingCubesMesher::GenerateMesh` paths. `render` uses
+fixed density samples (default 0.25 voxel) with bisection at sign crossings instead of sphere tracing;
+`walk` uses `VF_MeasurePlayerFitWalkWithSampler`; `export` calls the canonical 32³ mesher in a
+deterministic tile grid (four tiles per axis for the 128³ default), streams only its returned tile
+arrays into metre-space OBJ plus `manifest.json` (canonical UVs remain voxel-space), and never retains the full region mesh. Output JSON/manifest are emitted by fixed-order writers and compared with a second
+serialization before it is written. The commandlet keeps `WorldRadiusVoxels=0`, does not touch an
+authored asset or diff layer, and refuses bounded-grid/export requests before allocating them.
 
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`
 Header is rich with inline docs. Two namespaces + a per-chunk cache system.
@@ -794,6 +805,8 @@ Stage order (negative=solid throughout). Each stage's anchor:
   are dropped in `ProcessPendingChunks`. Always carry the epoch through new async paths.
 - **Generated code** under `Intermediate/` and `Binaries/` is build output — never edit.
   `*.generated.h` / `*.gen.cpp` are UHT output for the `UCLASS`/`USTRUCT` above.
+- **`UPackage` completeness:** files that call `NewObject(..., GetTransientPackage(), ...)` must include
+  `UObject/Package.h` directly; files that do not include `VoxelForgeTestFixture.h` do not get it transitively.
 
 ---
 

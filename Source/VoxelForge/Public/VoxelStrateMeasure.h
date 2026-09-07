@@ -256,6 +256,61 @@ struct VOXELFORGE_API FVoxelConnectivityDiagnostics
 };
 
 /**
+ * Experiential traversal facts over the exact VF player-fit mask.
+ *
+ * This is intentionally a report, not a new movement implementation. The mask is built by the
+ * same direct capsule stencil used by VF_DiagnosePlayerFitConnectivityWithSampler; the explorer's
+ * deterministic graph walk only instruments that already-resolved six-neighbour pose graph.
+ * Distances are metres so the result can be read beside a human-scale screenshot.
+ */
+struct VOXELFORGE_API FVoxelPlayerFitWalkReport
+{
+    bool bValid = false;
+    FString RefusalReason;
+    EVoxelConnectivityResult Result = EVoxelConnectivityResult::OutOfWindow;
+    bool bCanReachDeparture = false;
+    bool bStartSnapped = false;
+    bool bGoalSnapped = false;
+    int32 NumRouteRetries = 0;
+
+    int64 PlayerFitVolumeCells = 0;
+    int64 ReachablePlayerFitCells = 0;
+    float ReachablePlayerFitFraction = 0.0f;
+    int32 SampledNumX = 0;
+    int32 SampledNumY = 0;
+    int32 SampledNumZ = 0;
+    int32 SampledMinZ = 0;
+    int32 SampledMaxZ = 0;
+    float SampledMinX = 0.0f;
+    float SampledMaxX = 0.0f;
+    float SampledMinY = 0.0f;
+    float SampledMaxY = 0.0f;
+
+    // The agent follows a fixed-order depth-first walk over the already-resolved fit graph. A
+    // branch edge is counted twice when the agent backtracks, which makes this an instrument of
+    // traversal experience rather than a shortest-path length.
+    int64 AgentGraphTraversals = 0;
+    int64 DeadEndsEncountered = 0;
+    float DeadEndsPer100m = 0.0f;
+    float DistanceTravelledMeters = 0.0f;
+    float StraightLineMeters = 0.0f;
+    float Tortuosity = 0.0f;
+
+    // A narrow-gap event is a traversed graph edge touching a route cell whose widest
+    // axis-aligned horizontal air span is below the threshold. This deliberately reports the
+    // operational proxy instead of pretending the voxel mask contains an oriented corridor width.
+    int64 NarrowGapTraversals = 0;
+    float NarrowGapFraction = 0.0f;
+    float NarrowGapThresholdMeters = 0.0f;
+    float NarrowGapEventsPer100m = 0.0f;
+
+    float CapsuleRadiusMeters = 0.0f;
+    float CapsuleWidthMeters = 0.0f;
+    float CapsuleHeightMeters = 0.0f;
+    FString NarrowGapDefinition;
+};
+
+/**
  * Measure one strate in actor-space voxel coordinates.
  *
  * The pass samples the requested strate between a resolved margin inside its top and bottom
@@ -395,3 +450,18 @@ VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnosePlayerFitConnectivityWit
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
     FVoxelStrateMetrics* OutPlayerMetrics = nullptr);
+
+/**
+ * Instrument a deterministic agent over the same exact player-fit graph used by the route gate.
+ * The return value is false only when the bounded fine grid/stencil could not be built; a valid
+ * report may still say NotConnectedAtThisResolution or another explicit connectivity result.
+ */
+VOXELFORGE_API bool VF_MeasurePlayerFitWalkWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelPlayerFitWalkReport& OutReport);

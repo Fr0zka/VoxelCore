@@ -1338,6 +1338,37 @@ namespace VoxelStrateMeasurePrivate
         }
     }
 
+    void BuildPlayerFitConnectivityMetrics(
+        const FSampleGrid& Grid,
+        const FVoxelStrateMeasureSettings& Settings,
+        FVoxelStrateMetrics& OutMetrics,
+        TArray<uint8>& OutPlayerFitMask)
+    {
+        OutMetrics = FVoxelStrateMetrics();
+        OutMetrics.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
+        OutMetrics.SampledMinZ = Grid.SampledMinZ;
+        OutMetrics.SampledMaxZ = Grid.SampledMaxZ;
+        OutMetrics.SampledNumX = Grid.NumX;
+        OutMetrics.SampledNumY = Grid.NumY;
+        OutMetrics.SampledNumZ = Grid.NumZ;
+        OutMetrics.SampledMinX = Grid.MinX;
+        OutMetrics.SampledMaxX = Grid.MaxX;
+        OutMetrics.SampledMinY = Grid.MinY;
+        OutMetrics.SampledMaxY = Grid.MaxY;
+        OutMetrics.NumSampled = Grid.CellCount;
+        for (const uint8 bAir : Grid.Air)
+        {
+            OutMetrics.NumAir += bAir != 0u ? 1 : 0;
+        }
+        OutMetrics.NumSolid = static_cast<int64>(Grid.CellCount) - OutMetrics.NumAir;
+        OutMetrics.AirFraction = OutMetrics.NumSampled > 0
+            ? static_cast<float>(static_cast<double>(OutMetrics.NumAir)
+                / static_cast<double>(OutMetrics.NumSampled))
+            : 0.0f;
+        BuildPlayerFitMetrics(Grid, Settings, OutMetrics, &OutPlayerFitMask);
+        OutMetrics.bValid = OutMetrics.NumSampled > 0;
+    }
+
     float MedianFloat(TArray<float>& Values)
     {
         if (Values.Num() == 0) return 0.0f;
@@ -1948,7 +1979,6 @@ namespace VoxelStrateMeasurePrivate
         bOutStartSnapped = false;
         bOutGoalSnapped = false;
         OutNumRouteRetries = 0;
-
         const EEndpointCellResult StartCell = ResolveEndpointCell(
             Grid, AVoxel, OutStart, bOutStartSnapped, EligibilityMask);
         const EEndpointCellResult GoalCell = ResolveEndpointCell(
@@ -2243,28 +2273,7 @@ namespace VoxelStrateMeasurePrivate
             // Manhattan feature transform here: those values belong to the separate legacy
             // measurement pass, and recomputing them for every fine candidate made the gate
             // needlessly expensive without changing its answer.
-            PlayerMetrics.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
-            PlayerMetrics.SampledMinZ = Grid.SampledMinZ;
-            PlayerMetrics.SampledMaxZ = Grid.SampledMaxZ;
-            PlayerMetrics.SampledNumX = Grid.NumX;
-            PlayerMetrics.SampledNumY = Grid.NumY;
-            PlayerMetrics.SampledNumZ = Grid.NumZ;
-            PlayerMetrics.SampledMinX = Grid.MinX;
-            PlayerMetrics.SampledMaxX = Grid.MaxX;
-            PlayerMetrics.SampledMinY = Grid.MinY;
-            PlayerMetrics.SampledMaxY = Grid.MaxY;
-            PlayerMetrics.NumSampled = Grid.CellCount;
-            for (const uint8 bAir : Grid.Air)
-            {
-                PlayerMetrics.NumAir += bAir != 0u ? 1 : 0;
-            }
-            PlayerMetrics.NumSolid = static_cast<int64>(Grid.CellCount) - PlayerMetrics.NumAir;
-            PlayerMetrics.AirFraction = PlayerMetrics.NumSampled > 0
-                ? static_cast<float>(static_cast<double>(PlayerMetrics.NumAir)
-                    / static_cast<double>(PlayerMetrics.NumSampled))
-                : 0.0f;
-            BuildPlayerFitMetrics(Grid, Settings, PlayerMetrics, &PlayerFitMask);
-            PlayerMetrics.bValid = PlayerMetrics.NumSampled > 0;
+            BuildPlayerFitConnectivityMetrics(Grid, Settings, PlayerMetrics, PlayerFitMask);
             if (OutPlayerMetrics != nullptr)
             {
                 *OutPlayerMetrics = PlayerMetrics;
@@ -2313,6 +2322,227 @@ namespace VoxelStrateMeasurePrivate
             }
         }
         return Result;
+    }
+
+    int32 GetSixNeighbour(const FSampleGrid& Grid, int32 Cell, int32 Direction)
+    {
+        int32 X = 0;
+        int32 Y = 0;
+        int32 Z = 0;
+        DecodeIndex(Grid, Cell, X, Y, Z);
+        switch (Direction)
+        {
+        case 0: return X + 1 < Grid.NumX ? Grid.Index(X + 1, Y, Z) : INDEX_NONE;
+        case 1: return X > 0 ? Grid.Index(X - 1, Y, Z) : INDEX_NONE;
+        case 2: return Y + 1 < Grid.NumY ? Grid.Index(X, Y + 1, Z) : INDEX_NONE;
+        case 3: return Y > 0 ? Grid.Index(X, Y - 1, Z) : INDEX_NONE;
+        case 4: return Z + 1 < Grid.NumZ ? Grid.Index(X, Y, Z + 1) : INDEX_NONE;
+        case 5: return Z > 0 ? Grid.Index(X, Y, Z - 1) : INDEX_NONE;
+        default: return INDEX_NONE;
+        }
+    }
+
+    bool IsEligiblePlayerFitCell(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        int32 Cell)
+    {
+        return Cell >= 0
+            && Cell < Grid.CellCount
+            && Grid.Air[Cell] != 0u
+            && PlayerFitMask[Cell] != 0u;
+    }
+
+    int32 CountPlayerFitNeighbours(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        int32 Cell)
+    {
+        int32 Count = 0;
+        for (int32 Direction = 0; Direction < 6; ++Direction)
+        {
+            if (IsEligiblePlayerFitCell(
+                    Grid, PlayerFitMask, GetSixNeighbour(Grid, Cell, Direction)))
+            {
+                ++Count;
+            }
+        }
+        return Count;
+    }
+
+    int32 LocalAirSpanVoxels(
+        const FSampleGrid& Grid,
+        int32 Cell,
+        int32 Axis,
+        int32 MaxRelevantSpanVoxels)
+    {
+        if (Cell < 0 || Cell >= Grid.CellCount || Grid.Air[Cell] == 0u)
+        {
+            return 0;
+        }
+
+        int32 CentreX = 0;
+        int32 CentreY = 0;
+        int32 CentreZ = 0;
+        DecodeIndex(Grid, Cell, CentreX, CentreY, CentreZ);
+        int32 Span = 1;
+        bool bTouchesWindowBoundary = false;
+        for (const int32 Sign : { -1, 1 })
+        {
+            int32 Offset = 1;
+            for (;; ++Offset)
+            {
+                if (Span >= MaxRelevantSpanVoxels)
+                {
+                    return Span;
+                }
+                const int32 X = Axis == 0 ? CentreX + Sign * Offset : CentreX;
+                const int32 Y = Axis == 1 ? CentreY + Sign * Offset : CentreY;
+                const int32 Z = CentreZ;
+                if (X < 0 || X >= Grid.NumX || Y < 0 || Y >= Grid.NumY)
+                {
+                    bTouchesWindowBoundary = true;
+                    break;
+                }
+                if (Grid.Air[Grid.Index(X, Y, Z)] == 0u)
+                {
+                    break;
+                }
+                ++Span;
+            }
+        }
+        // A window edge is a lower bound, not a solid wall. Do not label a corridor narrow merely
+        // because the fitted diagnostic box clipped the air span before reaching rock.
+        return bTouchesWindowBoundary ? MAX_int32 : Span * Grid.SampleStep;
+    }
+
+    float LocalWidestHorizontalAirSpanVoxels(
+        const FSampleGrid& Grid,
+        int32 Cell,
+        float NarrowGapThresholdVoxels)
+    {
+        const int32 MaxRelevantSpanVoxels = FMath::Max(
+            1,
+            FMath::CeilToInt(NarrowGapThresholdVoxels));
+        return static_cast<float>(FMath::Max(
+            LocalAirSpanVoxels(Grid, Cell, 0, MaxRelevantSpanVoxels),
+            LocalAirSpanVoxels(Grid, Cell, 1, MaxRelevantSpanVoxels)));
+    }
+
+    void WalkPlayerFitGraph(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        int32 Start,
+        int32 Goal,
+        float NarrowGapThresholdVoxels,
+        FVoxelPlayerFitWalkReport& InOutReport)
+    {
+        if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, Start)
+            || !IsEligiblePlayerFitCell(Grid, PlayerFitMask, Goal))
+        {
+            return;
+        }
+
+        TArray<uint8> Visited;
+        Visited.Init(0u, Grid.CellCount);
+        TArray<uint8> NarrowCell;
+        NarrowCell.Init(255u, Grid.CellCount);
+        TArray<int32> Stack;
+        TArray<int32> NextDirection;
+        // Reserve the full bounded capacity up front. TArray growth slack is otherwise allowed
+        // to exceed the walker's stated memory budget while the DFS discovers a large component.
+        Stack.Reserve(Grid.CellCount);
+        NextDirection.Reserve(Grid.CellCount);
+        Stack.Add(Start);
+        NextDirection.Add(0);
+        Visited[Start] = 1u;
+
+        auto RecordTraversal = [&](int32 From, int32 To)
+        {
+            ++InOutReport.AgentGraphTraversals;
+            auto IsNarrowCell = [&](int32 Cell)
+            {
+                if (NarrowCell[Cell] == 255u)
+                {
+                    NarrowCell[Cell] = LocalWidestHorizontalAirSpanVoxels(
+                        Grid, Cell, NarrowGapThresholdVoxels)
+                        < NarrowGapThresholdVoxels ? 1u : 0u;
+                }
+                return NarrowCell[Cell] != 0u;
+            };
+            const bool bNarrow = IsNarrowCell(From) || IsNarrowCell(To);
+            if (bNarrow)
+            {
+                ++InOutReport.NarrowGapTraversals;
+            }
+        };
+
+        while (Stack.Num() > 0)
+        {
+            const int32 Current = Stack.Last();
+            if (Current == Goal)
+            {
+                InOutReport.bCanReachDeparture = true;
+                break;
+            }
+
+            bool bAdvanced = false;
+            while (NextDirection.Last() < 6)
+            {
+                const int32 Direction = NextDirection.Last()++;
+                const int32 Neighbour = GetSixNeighbour(Grid, Current, Direction);
+                if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, Neighbour)
+                    || Visited[Neighbour] != 0u)
+                {
+                    continue;
+                }
+
+                Visited[Neighbour] = 1u;
+                RecordTraversal(Current, Neighbour);
+                Stack.Add(Neighbour);
+                NextDirection.Add(0);
+                bAdvanced = true;
+                break;
+            }
+
+            if (bAdvanced)
+            {
+                continue;
+            }
+
+            // A degree-one pose is an actual topological dead end. A higher-degree pose with all
+            // branches already visited is merely a DFS backtrack through a loop/junction.
+            if (Current != Start && Current != Goal
+                && CountPlayerFitNeighbours(Grid, PlayerFitMask, Current) <= 1)
+            {
+                ++InOutReport.DeadEndsEncountered;
+            }
+
+            Stack.Pop();
+            NextDirection.Pop();
+            if (Stack.Num() > 0)
+            {
+                RecordTraversal(Current, Stack.Last());
+            }
+        }
+
+        const float DistanceMeters = static_cast<float>(InOutReport.AgentGraphTraversals)
+            * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        InOutReport.DistanceTravelledMeters = DistanceMeters;
+        InOutReport.NarrowGapFraction = InOutReport.AgentGraphTraversals > 0
+            ? static_cast<float>(static_cast<double>(InOutReport.NarrowGapTraversals)
+                / static_cast<double>(InOutReport.AgentGraphTraversals))
+            : 0.0f;
+        InOutReport.NarrowGapEventsPer100m = DistanceMeters > KINDA_SMALL_NUMBER
+            ? static_cast<float>(static_cast<double>(InOutReport.NarrowGapTraversals)
+                * 100.0 / static_cast<double>(DistanceMeters))
+            : 0.0f;
+        InOutReport.DeadEndsPer100m = DistanceMeters > KINDA_SMALL_NUMBER
+            ? static_cast<float>(static_cast<double>(InOutReport.DeadEndsEncountered)
+                * 100.0 / static_cast<double>(DistanceMeters))
+            : 0.0f;
+        InOutReport.DeadEndsEncountered = FMath::Max<int64>(
+            InOutReport.DeadEndsEncountered, 0);
     }
 }
 
@@ -2585,6 +2815,184 @@ FVoxelConnectivityDiagnostics VF_DiagnosePlayerFitConnectivityWithSampler(
         AVoxel, BVoxel, Settings, Result.bStartSnapped, Result.bGoalSnapped,
         NumRouteRetries, &Result, true, OutPlayerMetrics);
     return Result;
+}
+
+bool VF_MeasurePlayerFitWalkWithSampler(
+    const IVoxelStrateDensitySampler& Sampler,
+    int32 StrateBottomWorldZ,
+    int32 StrateTopWorldZ,
+    float BoundarySealThickness,
+    const FVector& AVoxel,
+    const FVector& BVoxel,
+    const FVoxelStrateMeasureSettings& Settings,
+    FVoxelPlayerFitWalkReport& OutReport)
+{
+    using namespace VoxelStrateMeasurePrivate;
+
+    OutReport = FVoxelPlayerFitWalkReport();
+    OutReport.CapsuleRadiusMeters = Settings.PlayerCapsuleRadiusVoxels
+        * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+    OutReport.CapsuleWidthMeters = 2.0f * OutReport.CapsuleRadiusMeters;
+    OutReport.CapsuleHeightMeters = 2.0f * Settings.PlayerCapsuleHalfHeightVoxels
+        * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+    OutReport.NarrowGapThresholdMeters = 1.5f * OutReport.CapsuleWidthMeters;
+    OutReport.NarrowGapDefinition = TEXT(
+        "widest axis-aligned horizontal air span at each traversed fit-graph cell");
+
+    const bool bFiniteEndpoints = FMath::IsFinite(AVoxel.X)
+        && FMath::IsFinite(AVoxel.Y)
+        && FMath::IsFinite(AVoxel.Z)
+        && FMath::IsFinite(BVoxel.X)
+        && FMath::IsFinite(BVoxel.Y)
+        && FMath::IsFinite(BVoxel.Z);
+    if (!bFiniteEndpoints)
+    {
+        OutReport.RefusalReason = TEXT("Arrival and departure points must be finite.");
+        return false;
+    }
+    if (Settings.MaxRouteRetries < 0)
+    {
+        OutReport.RefusalReason = TEXT("MaxRouteRetries cannot be negative.");
+        return false;
+    }
+    if (Settings.SampleStep != 1)
+    {
+        OutReport.RefusalReason = TEXT(
+            "Player-fit walk refused: exact capsule fit requires SampleStep=1.");
+        return false;
+    }
+
+    FSampleGrid Grid;
+    FString RefusalReason;
+    if (!BuildSampleGrid(
+            nullptr,
+            nullptr,
+            &Sampler,
+            INDEX_NONE,
+            StrateBottomWorldZ,
+            StrateTopWorldZ,
+            BoundarySealThickness,
+            true,
+            Settings,
+            true,
+            Grid,
+            RefusalReason))
+    {
+        OutReport.RefusalReason = RefusalReason;
+        return false;
+    }
+
+    TArray<uint8> PlayerFitMask;
+    int64 NumPlayerFitCells = 0;
+    if (!BuildPlayerFitMask(
+            Grid,
+            Settings,
+            PlayerFitMask,
+            NumPlayerFitCells,
+            RefusalReason))
+    {
+        OutReport.RefusalReason = RefusalReason;
+        return false;
+    }
+
+    int32 Start = INDEX_NONE;
+    int32 Goal = INDEX_NONE;
+    int32 NumRouteRetries = 0;
+    const EVoxelConnectivityResult Result = EvaluateConnectivityOnGrid(
+        nullptr,
+        &Sampler,
+        Grid,
+        AVoxel,
+        BVoxel,
+        Start,
+        Goal,
+        OutReport.bStartSnapped,
+        OutReport.bGoalSnapped,
+        NumRouteRetries,
+        Settings.MaxRouteRetries,
+        &PlayerFitMask);
+
+    FVoxelConnectivityDiagnostics Diagnostics;
+    PopulateConnectivityDiagnostics(
+        Grid,
+        Start,
+        Goal,
+        Result,
+        OutReport.bStartSnapped,
+        OutReport.bGoalSnapped,
+        NumRouteRetries,
+        Diagnostics,
+        &PlayerFitMask);
+
+    OutReport.bValid = true;
+    OutReport.Result = Result;
+    OutReport.NumRouteRetries = NumRouteRetries;
+    OutReport.SampledNumX = Grid.NumX;
+    OutReport.SampledNumY = Grid.NumY;
+    OutReport.SampledNumZ = Grid.NumZ;
+    OutReport.SampledMinZ = Grid.SampledMinZ;
+    OutReport.SampledMaxZ = Grid.SampledMaxZ;
+    OutReport.SampledMinX = Grid.MinX;
+    OutReport.SampledMaxX = Grid.MaxX;
+    OutReport.SampledMinY = Grid.MinY;
+    OutReport.SampledMaxY = Grid.MaxY;
+    OutReport.PlayerFitVolumeCells = NumPlayerFitCells;
+    OutReport.ReachablePlayerFitCells = FMath::Max<int64>(
+        Diagnostics.StartComponentCells, 0);
+    OutReport.ReachablePlayerFitFraction = OutReport.PlayerFitVolumeCells > 0
+        ? static_cast<float>(static_cast<double>(OutReport.ReachablePlayerFitCells)
+            / static_cast<double>(OutReport.PlayerFitVolumeCells))
+        : 0.0f;
+    OutReport.StraightLineMeters = FVector::Dist(AVoxel, BVoxel)
+        * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+
+    if (Start >= 0 && Goal >= 0)
+    {
+        const float NarrowGapThresholdVoxels = OutReport.NarrowGapThresholdMeters
+            / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        WalkPlayerFitGraph(
+            Grid,
+            PlayerFitMask,
+            Start,
+            Goal,
+            NarrowGapThresholdVoxels,
+            OutReport);
+    }
+
+    OutReport.bCanReachDeparture = Result == EVoxelConnectivityResult::Connected;
+    OutReport.Tortuosity = OutReport.StraightLineMeters > KINDA_SMALL_NUMBER
+        ? OutReport.DistanceTravelledMeters / OutReport.StraightLineMeters
+        : 0.0f;
+    OutReport.DeadEndsEncountered = FMath::Max<int64>(
+        OutReport.DeadEndsEncountered, 0);
+    OutReport.NarrowGapEventsPer100m = OutReport.DistanceTravelledMeters
+        > KINDA_SMALL_NUMBER
+        ? static_cast<float>(static_cast<double>(OutReport.NarrowGapTraversals)
+            * 100.0 / static_cast<double>(OutReport.DistanceTravelledMeters))
+        : 0.0f;
+    OutReport.DeadEndsPer100m = OutReport.DistanceTravelledMeters
+        > KINDA_SMALL_NUMBER
+        ? static_cast<float>(static_cast<double>(OutReport.DeadEndsEncountered)
+            * 100.0 / static_cast<double>(OutReport.DistanceTravelledMeters))
+        : 0.0f;
+
+    if (Result == EVoxelConnectivityResult::StartCellNotPlayerFit)
+    {
+        OutReport.RefusalReason = TEXT("arrival endpoint is not a player-fitting floor cell");
+    }
+    else if (Result == EVoxelConnectivityResult::GoalCellNotPlayerFit)
+    {
+        OutReport.RefusalReason = TEXT("departure endpoint is not a player-fitting floor cell");
+    }
+    else if (Result == EVoxelConnectivityResult::OutOfWindow)
+    {
+        OutReport.RefusalReason = TEXT("arrival or departure point is outside the fitted walk window");
+    }
+    else
+    {
+        OutReport.RefusalReason = Diagnostics.RefusalReason;
+    }
+    return true;
 }
 
 #endif // WITH_EDITOR — measurement never ships

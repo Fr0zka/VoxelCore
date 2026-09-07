@@ -972,6 +972,41 @@ generic biome field), not just SurfaceWorld. Empty `Biomes[]` ⇒ all-zero colou
 - **Status:** C++ ✅ BUILT & WORKING (ticked 2026-07-27). The master material graph is still
   editor-side work and is deliberately NOT ticked — that half is Jahni's, not the code's.
 
+### 8.16 Explorer commandlet — one authoritative field, three consumers
+`-run=VoxelForgeExplore` lives in the separate `VoxelForgeEditor` module, so the commandlet and its
+PNG/JSON/OBJ writers are editor/commandlet-only and cannot enter a Game or Shipping link. It creates
+only transient settings, definitions, manager, generator, diff layer, and mesher objects; no authored
+asset, live manager, generator, or diff layer is mutated. The transient world keeps
+`WorldRadiusVoxels=0` and `InterStrateGapChunks=0`, preserving the lateral-region gate.
+
+- **Render.** The renderer samples `UVoxelGenerator::GetDensityAt` at a fixed 0.25-voxel default
+  step (overrideable down to 0.125), detects the MC density sign crossing, and refines it with ten
+  bisection iterations. It never treats density as an SDF and never sphere-traces. Each of three
+  deterministic views overlays a projected 1.76 m human-height marker; the JSON records the step,
+  metre conversion, refinement count, and marker projection status.
+- **Walk.** `VF_MeasurePlayerFitWalkWithSampler` builds the existing step-1 capsule/floor-fit stencil
+  and uses the same six-neighbour/full-resolution route gate as the existing diagnostics. Its
+  deterministic depth-first agent walk counts metres travelled (including branch backtracking),
+  dead ends per 100 m, the arrival component's reachable fit volume, and traversed edges touching a
+  narrow-gap proxy below 1.5× the 0.68 m capsule width. The proxy is explicitly axis-aligned air span;
+  it is not a second player-fit or movement definition. The explorer passes the shared measurement
+  `MaxCells` refusal at a 32,000,000-cell default cap, with a conservative 20-byte/cell estimate
+  against a documented 768 MiB working-memory budget. Reachable fit volume is explicitly the bounded
+  fitted route window because `WorldRadiusVoxels=0` deliberately has no finite whole-world volume.
+- **Export.** `UVoxelMarchingCubesMesher::GenerateMesh` is the only mesher. Because that canonical
+  entry point deliberately clamps one call to a 32³ tile, a 128³ request is four-by-four-by-four
+  canonical calls whose returned vertices/triangles are streamed with an index offset; no second
+  mesher or density evaluator exists. The bounded result is metre-space OBJ with source winding,
+  voxel-space UVs, normals, and ground/ceiling material groups, accompanied by a manifest containing seed,
+  archetype, slot, bounds, and player dimensions. Tile skirts are disabled at the export boundary
+  because they are a render seam aid that would extend beyond the manifest box. A conservative
+  preflight cap is checked before the canonical mesher is called.
+
+The report and export manifest use fixed-order writers and serialize twice in-process to assert the
+deterministic contract. Timings are console diagnostics only; putting wall-clock durations in the report would
+break byte identity. The browser viewer remains a separate display-only consumer: it must load this
+OBJ/manifest and never evaluate density or generate geometry.
+
 ## 9. Multiplayer model (listen-server first, dedicated-friendly)
 
 > **Status: transport is DESIGN ONLY — nothing is networked in-tree yet** (no `Replicated`/`HasAuthority`/RPCs; a
