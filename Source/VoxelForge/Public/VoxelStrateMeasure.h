@@ -73,6 +73,10 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     // this enabled for that topology; an over-cap route window is then refused honestly instead
     // of being cropped back to a mouth-only box.
     bool bIncludeOriginInCoverWindow = false;
+    // Diagnostic-only strengthening of the preceding policy: ensure the sampled box contains an
+    // actual one-voxel column around (0,0), rather than ending exactly at the exclusive upper
+    // bound when both mouths lie on one side of the origin.
+    bool bForceOriginColumnInCoverWindow = false;
     int32     MaxCells       = 8000000; // Refuse a grid larger than this many cells.
     int32     MaxRouteRetries = 16; // Alternate coarse routes to full-resolution-check after the first route.
     int32     HeadroomCells  = 2;    // Legacy walkable-column metric only.
@@ -308,6 +312,34 @@ struct VOXELFORGE_API FVoxelPlayerFitWalkReport
     float CapsuleWidthMeters = 0.0f;
     float CapsuleHeightMeters = 0.0f;
     FString NarrowGapDefinition;
+
+    // Component facts are retained from the same fit-mask flood fill that drives the route
+    // verdict.  They are exposed here so an editor diagnostic does not need to sample the field
+    // a second time just to explain a failed mouth-to-mouth walk.
+    int32 PlayerFitComponents = 0;
+    int64 LargestPlayerFitComponentCells = 0;
+    int64 ArrivalComponentCells = 0;
+    int64 DepartureComponentCells = 0;
+    float MouthComponentGapVoxels = -1.0f;
+
+    // The DFS returns to its root when the target component is unreachable.  Keep both the
+    // physical end of that walk and the last newly reached pose: the latter is the useful
+    // failure-frontier point for a render, while the former is the literal final pose.
+    bool bHasAgentFinalPosition = false;
+    FVector AgentFinalVoxels = FVector::ZeroVector;
+    bool bHasLastReachedPosition = false;
+    FVector LastReachedVoxels = FVector::ZeroVector;
+    bool bHasTargetComponentNearestCell = false;
+    FVector TargetComponentNearestVoxels = FVector::ZeroVector;
+    float AgentToTargetComponentGapVoxels = -1.0f;
+
+    // Origin checks are facts about the sampled fit mask.  An origin-inclusive secondary probe
+    // can populate these even when the primary mouth-sized window deliberately excludes (0,0).
+    bool bOriginColumnInSampledWindow = false;
+    bool bOriginColumnHasPlayerFit = false;
+    int64 OriginColumnPlayerFitCells = 0;
+    bool bOriginColumnReachable = false;
+    float ReachableSetToOriginColumnVoxels = -1.0f;
 };
 
 /**

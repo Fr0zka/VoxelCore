@@ -213,6 +213,16 @@ namespace VoxelStrateMeasurePrivate
                 MinY64 = FMath::Min(MinY64, 0.0);
                 MaxY64 = FMath::Max(MaxY64, 0.0);
             }
+            if (Settings.bForceOriginColumnInCoverWindow)
+            {
+                // Upper bounds are exclusive.  The ordinary origin policy can therefore stop at
+                // exactly X=0/Y=0 when both mouths are on one side; a diagnostic column probe
+                // needs one real sampled column straddling the origin instead.
+                MinX64 = FMath::Min(MinX64, -1.0);
+                MaxX64 = FMath::Max(MaxX64, 1.0);
+                MinY64 = FMath::Min(MinY64, -1.0);
+                MaxY64 = FMath::Max(MaxY64, 1.0);
+            }
             WindowCenter = FVector2D(
                 static_cast<float>(0.5 * (MinX64 + MaxX64)),
                 static_cast<float>(0.5 * (MinY64 + MaxY64)));
@@ -2092,9 +2102,19 @@ namespace VoxelStrateMeasurePrivate
         bool bGoalSnapped,
         int32 NumRouteRetries,
         FVoxelConnectivityDiagnostics& OutDiagnostics,
-        const TArray<uint8>* EligibilityMask = nullptr)
+        const TArray<uint8>* EligibilityMask = nullptr,
+        TArray<int32>* OutComponents = nullptr,
+        int32* OutNumComponents = nullptr)
     {
         OutDiagnostics = FVoxelConnectivityDiagnostics();
+        if (OutComponents != nullptr)
+        {
+            OutComponents->Reset();
+        }
+        if (OutNumComponents != nullptr)
+        {
+            *OutNumComponents = 0;
+        }
         OutDiagnostics.Result = ConnectivityResult;
         OutDiagnostics.bPlayerFitRestricted = EligibilityMask != nullptr;
         OutDiagnostics.bPlayerFitResolved = EligibilityMask != nullptr;
@@ -2130,6 +2150,15 @@ namespace VoxelStrateMeasurePrivate
             NumComponentsAtLeast1Pct,
             nullptr,
             EligibilityMask);
+
+        if (OutComponents != nullptr)
+        {
+            *OutComponents = Components;
+        }
+        if (OutNumComponents != nullptr)
+        {
+            *OutNumComponents = NumComponents;
+        }
 
         const int32 StartComponent = Components[Start];
         const int32 GoalComponent = Components[Goal];
@@ -2435,13 +2464,20 @@ namespace VoxelStrateMeasurePrivate
         int32 Start,
         int32 Goal,
         float NarrowGapThresholdVoxels,
-        FVoxelPlayerFitWalkReport& InOutReport)
+        FVoxelPlayerFitWalkReport& InOutReport,
+        int32& OutFinalCell,
+        int32& OutLastReachedCell)
     {
+        OutFinalCell = INDEX_NONE;
+        OutLastReachedCell = INDEX_NONE;
         if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, Start)
             || !IsEligiblePlayerFitCell(Grid, PlayerFitMask, Goal))
         {
             return;
         }
+
+        OutFinalCell = Start;
+        OutLastReachedCell = Start;
 
         TArray<uint8> Visited;
         Visited.Init(0u, Grid.CellCount);
@@ -2480,6 +2516,7 @@ namespace VoxelStrateMeasurePrivate
         while (Stack.Num() > 0)
         {
             const int32 Current = Stack.Last();
+            OutFinalCell = Current;
             if (Current == Goal)
             {
                 InOutReport.bCanReachDeparture = true;
@@ -2501,6 +2538,7 @@ namespace VoxelStrateMeasurePrivate
                 RecordTraversal(Current, Neighbour);
                 Stack.Add(Neighbour);
                 NextDirection.Add(0);
+                OutLastReachedCell = Neighbour;
                 bAdvanced = true;
                 break;
             }
@@ -2913,6 +2951,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         &PlayerFitMask);
 
     FVoxelConnectivityDiagnostics Diagnostics;
+    TArray<int32> Components;
+    int32 NumComponents = 0;
     PopulateConnectivityDiagnostics(
         Grid,
         Start,
@@ -2922,7 +2962,9 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         OutReport.bGoalSnapped,
         NumRouteRetries,
         Diagnostics,
-        &PlayerFitMask);
+        &PlayerFitMask,
+        &Components,
+        &NumComponents);
 
     OutReport.bValid = true;
     OutReport.Result = Result;
@@ -2943,9 +2985,16 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         ? static_cast<float>(static_cast<double>(OutReport.ReachablePlayerFitCells)
             / static_cast<double>(OutReport.PlayerFitVolumeCells))
         : 0.0f;
+    OutReport.PlayerFitComponents = NumComponents;
+    OutReport.LargestPlayerFitComponentCells = Diagnostics.LargestComponentCells;
+    OutReport.ArrivalComponentCells = Diagnostics.StartComponentCells;
+    OutReport.DepartureComponentCells = Diagnostics.GoalComponentCells;
+    OutReport.MouthComponentGapVoxels = Diagnostics.StartToGoalComponentDistanceCells;
     OutReport.StraightLineMeters = FVector::Dist(AVoxel, BVoxel)
         * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
 
+    int32 AgentFinalCell = INDEX_NONE;
+    int32 LastReachedCell = INDEX_NONE;
     if (Start >= 0 && Goal >= 0)
     {
         const float NarrowGapThresholdVoxels = OutReport.NarrowGapThresholdMeters
@@ -2956,7 +3005,127 @@ bool VF_MeasurePlayerFitWalkWithSampler(
             Start,
             Goal,
             NarrowGapThresholdVoxels,
-            OutReport);
+            OutReport,
+            AgentFinalCell,
+            LastReachedCell);
+    }
+
+    auto RecordCellPosition = [&Grid](
+        int32 Cell,
+        bool& bOutHasPosition,
+        FVector& OutPosition)
+    {
+        if (Cell >= 0 && Cell < Grid.CellCount)
+        {
+            int32 X = 0;
+            int32 Y = 0;
+            int32 Z = 0;
+            DecodeIndex(Grid, Cell, X, Y, Z);
+            bOutHasPosition = true;
+            OutPosition = Grid.CellCenter(X, Y, Z);
+        }
+    };
+    RecordCellPosition(
+        AgentFinalCell,
+        OutReport.bHasAgentFinalPosition,
+        OutReport.AgentFinalVoxels);
+    RecordCellPosition(
+        LastReachedCell,
+        OutReport.bHasLastReachedPosition,
+        OutReport.LastReachedVoxels);
+
+    const int32 StartComponent = Start >= 0 && Components.IsValidIndex(Start)
+        ? Components[Start] : INDEX_NONE;
+    const int32 GoalComponent = Goal >= 0 && Components.IsValidIndex(Goal)
+        ? Components[Goal] : INDEX_NONE;
+    if (StartComponent >= 0)
+    {
+        float BestOriginDistanceSquared = FLT_MAX;
+        for (int32 Cell = 0; Cell < Grid.CellCount; ++Cell)
+        {
+            if (!Components.IsValidIndex(Cell) || Components[Cell] != StartComponent)
+            {
+                continue;
+            }
+            int32 X = 0;
+            int32 Y = 0;
+            int32 Z = 0;
+            DecodeIndex(Grid, Cell, X, Y, Z);
+            const FVector Position = Grid.CellCenter(X, Y, Z);
+            BestOriginDistanceSquared = FMath::Min(
+                BestOriginDistanceSquared,
+                Position.X * Position.X + Position.Y * Position.Y);
+        }
+        if (BestOriginDistanceSquared < FLT_MAX)
+        {
+            OutReport.ReachableSetToOriginColumnVoxels = FMath::Sqrt(
+                BestOriginDistanceSquared);
+        }
+    }
+
+    const bool bOriginPointInWindow = 0.0f >= Grid.MinX && 0.0f < Grid.MaxX
+        && 0.0f >= Grid.MinY && 0.0f < Grid.MaxY;
+    if (bOriginPointInWindow)
+    {
+        const int32 OriginX = FMath::Clamp(
+            FMath::FloorToInt((0.0f - Grid.MinX) / static_cast<float>(Grid.SampleStep)),
+            0,
+            Grid.NumX - 1);
+        const int32 OriginY = FMath::Clamp(
+            FMath::FloorToInt((0.0f - Grid.MinY) / static_cast<float>(Grid.SampleStep)),
+            0,
+            Grid.NumY - 1);
+        OutReport.bOriginColumnInSampledWindow = true;
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        {
+            const int32 Cell = Grid.Index(OriginX, OriginY, Z);
+            if (PlayerFitMask[Cell] == 0u)
+            {
+                continue;
+            }
+            ++OutReport.OriginColumnPlayerFitCells;
+            OutReport.bOriginColumnHasPlayerFit = true;
+            if (Components.IsValidIndex(Cell) && Components[Cell] == StartComponent)
+            {
+                OutReport.bOriginColumnReachable = true;
+            }
+        }
+    }
+
+    if (AgentFinalCell >= 0 && AgentFinalCell < Grid.CellCount && GoalComponent >= 0)
+    {
+        const FVector AgentPosition = OutReport.AgentFinalVoxels;
+        float BestTargetDistanceSquared = FLT_MAX;
+        int32 BestTargetCell = INDEX_NONE;
+        for (int32 Cell = 0; Cell < Grid.CellCount; ++Cell)
+        {
+            if (!Components.IsValidIndex(Cell) || Components[Cell] != GoalComponent)
+            {
+                continue;
+            }
+            int32 X = 0;
+            int32 Y = 0;
+            int32 Z = 0;
+            DecodeIndex(Grid, Cell, X, Y, Z);
+            const float DistanceSquared = FVector::DistSquared(
+                AgentPosition, Grid.CellCenter(X, Y, Z));
+            if (DistanceSquared < BestTargetDistanceSquared
+                || (DistanceSquared == BestTargetDistanceSquared
+                    && (BestTargetCell == INDEX_NONE || Cell < BestTargetCell)))
+            {
+                BestTargetDistanceSquared = DistanceSquared;
+                BestTargetCell = Cell;
+            }
+        }
+        if (BestTargetCell >= 0)
+        {
+            RecordCellPosition(
+                BestTargetCell,
+                OutReport.bHasTargetComponentNearestCell,
+                OutReport.TargetComponentNearestVoxels);
+            OutReport.AgentToTargetComponentGapVoxels = FMath::Sqrt(
+                BestTargetDistanceSquared);
+        }
     }
 
     OutReport.bCanReachDeparture = Result == EVoxelConnectivityResult::Connected;

@@ -165,6 +165,7 @@ struct FExploreArguments
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
+    bool bFailureFocusRender = false;
     FString OutDirectory;
 
     int32 RenderWidth = DefaultRenderWidth;
@@ -205,6 +206,9 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("rendermaxdistance="), OutArguments.RenderMaxDistanceVoxels);
     FParse::Value(*Params, TEXT("exportsize="), OutArguments.ExportSize);
     FParse::Value(*Params, TEXT("maxwalkcells="), OutArguments.MaxWalkCells);
+    int32 FailureFocusRender = 0;
+    FParse::Value(*Params, TEXT("failurefocus="), FailureFocusRender);
+    OutArguments.bFailureFocusRender = FailureFocusRender != 0;
 
     if (!ParseArchetype(ArchetypeText, OutArguments.Archetype))
     {
@@ -467,10 +471,12 @@ private:
 struct FExploreRenderFrame
 {
     FString FileName;
+    FString Purpose = TEXT("overview");
     FVector CameraVoxels = FVector::ZeroVector;
     FVector TargetVoxels = FVector::ZeroVector;
     int32 HitPixels = 0;
     bool bScaleMarkerProjected = false;
+    bool bFailureMarkersProjected = false;
 };
 
 struct FExploreRenderOutput
@@ -500,6 +506,10 @@ struct FExploreWalkOutput
     FVector DepartureVoxels = FVector::ZeroVector;
     FString WindowPolicy;
     FVoxelPlayerFitWalkReport Report;
+    bool bOriginCheckAttempted = false;
+    bool bOriginCheckAvailable = false;
+    FString OriginCheckRefusalReason;
+    FVoxelPlayerFitWalkReport OriginCheckReport;
 };
 
 struct FExploreExportOutput
@@ -990,6 +1000,257 @@ bool RunRender(
     return true;
 }
 
+void DrawPointMarker(
+    TArray<FColor>& Pixels,
+    int32 Width,
+    int32 Height,
+    const FVector& Point,
+    const FVector& CameraPosition,
+    const FExploreCameraBasis& Basis,
+    const FColor& Color,
+    bool& bOutProjected)
+{
+    FIntPoint Pixel = FIntPoint::ZeroValue;
+    bOutProjected = ProjectPoint(
+        Point, CameraPosition, Basis, Width, Height, Pixel);
+    if (!bOutProjected)
+    {
+        return;
+    }
+
+    constexpr int32 MarkerRadius = 7;
+    DrawLine(
+        Pixels, Width, Height,
+        Pixel.X - MarkerRadius, Pixel.Y,
+        Pixel.X + MarkerRadius, Pixel.Y,
+        Color);
+    DrawLine(
+        Pixels, Width, Height,
+        Pixel.X, Pixel.Y - MarkerRadius,
+        Pixel.X, Pixel.Y + MarkerRadius,
+        Color);
+    DrawLine(
+        Pixels, Width, Height,
+        Pixel.X - 4, Pixel.Y - 4,
+        Pixel.X + 4, Pixel.Y + 4,
+        Color);
+    DrawLine(
+        Pixels, Width, Height,
+        Pixel.X - 4, Pixel.Y + 4,
+        Pixel.X + 4, Pixel.Y - 4,
+        Color);
+}
+
+bool RunFailureBoundaryRender(
+    const FExploreArguments& Arguments,
+    const FExploreWorld& World,
+    const FExploreWalkOutput& Walk,
+    FExploreRenderOutput& InOutOutput)
+{
+    const FVoxelPlayerFitWalkReport& Report = Walk.Report;
+    if (!Report.bHasAgentFinalPosition || !Report.bHasTargetComponentNearestCell)
+    {
+        return false;
+    }
+
+    const FVector AgentFinal = Report.AgentFinalVoxels;
+    const FVector TargetComponentCell = Report.TargetComponentNearestVoxels;
+    const FVector LastReached = Report.LastReachedVoxels;
+    const bool bHaveLastReached = Report.bHasLastReachedPosition;
+    const FVector Focus = (AgentFinal + TargetComponentCell) * 0.5f;
+    const FVector Segment = TargetComponentCell - AgentFinal;
+    const FVector SegmentDirection = Segment.GetSafeNormal();
+    if (SegmentDirection.IsNearlyZero())
+    {
+        return false;
+    }
+    FVector ViewSide = FVector::CrossProduct(SegmentDirection, FVector::UpVector).GetSafeNormal();
+    if (ViewSide.IsNearlyZero())
+    {
+        ViewSide = FVector::CrossProduct(SegmentDirection, FVector::RightVector).GetSafeNormal();
+    }
+    const float SegmentLength = Segment.Size();
+    const float ViewSideOffset = FMath::Min(64.0f, FMath::Max(16.0f, 0.25f * SegmentLength));
+    const FVector CameraCandidates[][3] = {
+        {
+            AgentFinal - SegmentDirection * 4.0f,
+            bHaveLastReached ? LastReached : AgentFinal,
+            AgentFinal,
+        },
+        {
+            TargetComponentCell + SegmentDirection * 4.0f,
+            TargetComponentCell,
+            TargetComponentCell,
+        },
+    };
+    const FVector ViewTargets[] = {
+        Focus + ViewSide * ViewSideOffset,
+        Focus - ViewSide * ViewSideOffset,
+    };
+
+    for (int32 ViewIndex = 0; ViewIndex < UE_ARRAY_COUNT(ViewTargets); ++ViewIndex)
+    {
+        FVector CameraPosition = CameraCandidates[ViewIndex][2];
+        for (int32 CandidateIndex = 0; CandidateIndex < 3; ++CandidateIndex)
+        {
+            const FVector Candidate = CameraCandidates[ViewIndex][CandidateIndex];
+            const float Density = World.Generator->GetDensityAt(Candidate.X, Candidate.Y, Candidate.Z);
+            if (FMath::IsFinite(Density) && Density > 0.0f)
+            {
+                CameraPosition = Candidate;
+                break;
+            }
+        }
+        const float FailureMaxDistanceVoxels = FMath::Max(
+            Arguments.RenderMaxDistanceVoxels,
+            FMath::Max(
+                FVector::Dist(CameraPosition, AgentFinal),
+                FVector::Dist(CameraPosition, TargetComponentCell)) + 32.0f);
+        FExploreCameraBasis Basis;
+        if (!BuildCameraBasis(
+                CameraPosition,
+                ViewTargets[ViewIndex],
+                70.0f,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                Basis))
+        {
+            return false;
+        }
+
+        TArray<FColor> Pixels;
+        Pixels.Init(FColor(7, 11, 18, 255), Arguments.RenderWidth * Arguments.RenderHeight);
+        int32 HitPixels = 0;
+        const FVector LightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
+        for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
+        {
+            for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
+            {
+                const FVector RayDirection = MakeRayDirection(
+                    Basis,
+                    PixelX,
+                    PixelY,
+                    Arguments.RenderWidth,
+                    Arguments.RenderHeight);
+                FVector HitPoint;
+                FVector Normal;
+                if (!TraceDensityRay(
+                    *World.Generator,
+                    CameraPosition,
+                    RayDirection,
+                    Arguments.RenderStepVoxels,
+                    FailureMaxDistanceVoxels,
+                    InOutOutput.BisectionIterations,
+                    HitPoint,
+                    Normal))
+                {
+                    continue;
+                }
+
+                ++HitPixels;
+                const float Diffuse = FMath::Max(0.0f, FVector::DotProduct(Normal, LightDirection));
+                const float Brightness = 0.18f + 0.82f * Diffuse;
+                const uint8 RockR = static_cast<uint8>(FMath::Clamp(54.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockG = static_cast<uint8>(FMath::Clamp(72.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockB = static_cast<uint8>(FMath::Clamp(92.0f * Brightness, 0.0f, 255.0f));
+                PutPixel(
+                    Pixels,
+                    Arguments.RenderWidth,
+                    Arguments.RenderHeight,
+                    PixelX,
+                    PixelY,
+                    FColor(RockR, RockG, RockB, 255));
+            }
+        }
+
+        bool bAgentProjected = false;
+        bool bTargetProjected = false;
+        bool bLastReachedProjected = false;
+        DrawPointMarker(
+            Pixels,
+            Arguments.RenderWidth,
+            Arguments.RenderHeight,
+            AgentFinal,
+            CameraPosition,
+            Basis,
+            FColor(242, 72, 72, 255),
+            bAgentProjected);
+        DrawPointMarker(
+            Pixels,
+            Arguments.RenderWidth,
+            Arguments.RenderHeight,
+            TargetComponentCell,
+            CameraPosition,
+            Basis,
+            FColor(72, 242, 112, 255),
+            bTargetProjected);
+        if (bHaveLastReached)
+        {
+            DrawPointMarker(
+                Pixels,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                LastReached,
+                CameraPosition,
+                Basis,
+                FColor(242, 176, 56, 255),
+                bLastReachedProjected);
+        }
+
+        FIntPoint AgentPixel = FIntPoint::ZeroValue;
+        FIntPoint TargetPixel = FIntPoint::ZeroValue;
+        if (ProjectPoint(
+                AgentFinal,
+                CameraPosition,
+                Basis,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                AgentPixel)
+            && ProjectPoint(
+                TargetComponentCell,
+                CameraPosition,
+                Basis,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                TargetPixel))
+        {
+            DrawLine(
+                Pixels,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                AgentPixel.X,
+                AgentPixel.Y,
+                TargetPixel.X,
+                TargetPixel.Y,
+                FColor(244, 214, 72, 255));
+        }
+
+        FExploreRenderFrame& Frame = InOutOutput.Frames.AddDefaulted_GetRef();
+        Frame.FileName = FString::Printf(TEXT("failure_boundary_%02d.png"), ViewIndex);
+        Frame.Purpose = TEXT("agent_final_red_target_component_nearest_green_last_reached_orange");
+        Frame.CameraVoxels = CameraPosition;
+        Frame.TargetVoxels = ViewTargets[ViewIndex];
+        Frame.HitPixels = HitPixels;
+        Frame.bFailureMarkersProjected = bAgentProjected && bTargetProjected
+            && (!bHaveLastReached || bLastReachedProjected);
+
+        FString Error;
+        if (!SavePng(
+                FPaths::Combine(Arguments.OutDirectory, Frame.FileName),
+                Pixels,
+                Arguments.RenderWidth,
+                Arguments.RenderHeight,
+                Error))
+        {
+            InOutOutput.Status = TEXT("error");
+            InOutOutput.RefusalReason = Error;
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool RunWalk(
     const FExploreArguments& Arguments,
     const FExploreWorld& World,
@@ -1052,6 +1313,30 @@ bool RunWalk(
         OutOutput.Status = TEXT("refused");
         OutOutput.RefusalReason = OutOutput.Report.RefusalReason;
         return false;
+    }
+
+    // Part C is a separate observation window.  Keep the Part A mouth-sized result untouched,
+    // then repeat the same exact fit walk with the route window expanded to include (0,0).  This
+    // is measurement-only: it changes neither the density field nor any generation parameter.
+    OutOutput.bOriginCheckAttempted = true;
+    FVoxelStrateMeasureSettings OriginSettings = Settings;
+    OriginSettings.bIncludeOriginInCoverWindow = true;
+    OriginSettings.bForceOriginColumnInCoverWindow = true;
+    if (VF_MeasurePlayerFitWalkWithSampler(
+            Sampler,
+            World.TargetBottomWorldZ,
+            World.TargetTopWorldZ,
+            World.TargetBoundarySealThickness,
+            OutOutput.ArrivalVoxels,
+            OutOutput.DepartureVoxels,
+            OriginSettings,
+            OutOutput.OriginCheckReport))
+    {
+        OutOutput.bOriginCheckAvailable = true;
+    }
+    else
+    {
+        OutOutput.OriginCheckRefusalReason = OutOutput.OriginCheckReport.RefusalReason;
     }
 
     OutOutput.Status = TEXT("ok");
@@ -1431,6 +1716,7 @@ FString BuildExploreJson(
     if (Arguments.bWalk) Writer->WriteValue(TEXT("walk"));
     if (Arguments.bExport) Writer->WriteValue(TEXT("export"));
     Writer->WriteArrayEnd();
+    Writer->WriteValue(TEXT("failure_focus_render"), Arguments.bFailureFocusRender);
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
@@ -1477,11 +1763,13 @@ FString BuildExploreJson(
         for (const FExploreRenderFrame& Frame : Output.Render.Frames)
         {
             Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("purpose"), Frame.Purpose);
             Writer->WriteValue(TEXT("file"), Frame.FileName);
             WriteJsonVector(*Writer, TEXT("camera_voxels"), Frame.CameraVoxels, 1.0f);
             WriteJsonVector(*Writer, TEXT("target_voxels"), Frame.TargetVoxels, 1.0f);
             Writer->WriteValue(TEXT("hit_pixels"), Frame.HitPixels);
             Writer->WriteValue(TEXT("scale_marker_projected"), Frame.bScaleMarkerProjected);
+            Writer->WriteValue(TEXT("failure_markers_projected"), Frame.bFailureMarkersProjected);
             Writer->WriteValue(TEXT("scale_marker_height_m"), 1.76);
             Writer->WriteObjectEnd();
         }
@@ -1550,6 +1838,90 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("narrow_gap_fraction"), static_cast<double>(Report.NarrowGapFraction));
         Writer->WriteValue(TEXT("narrow_gap_events_per_100m"), static_cast<double>(Report.NarrowGapEventsPer100m));
         Writer->WriteValue(TEXT("narrow_gap_definition"), Report.NarrowGapDefinition);
+        Writer->WriteValue(TEXT("player_fit_components"), Report.PlayerFitComponents);
+        Writer->WriteValue(TEXT("largest_player_fit_component_cells"), Report.LargestPlayerFitComponentCells);
+        Writer->WriteValue(TEXT("arrival_component_cells"), Report.ArrivalComponentCells);
+        Writer->WriteValue(TEXT("departure_component_cells"), Report.DepartureComponentCells);
+        Writer->WriteValue(TEXT("mouth_component_gap_voxels"), static_cast<double>(Report.MouthComponentGapVoxels));
+        Writer->WriteValue(TEXT("mouth_component_gap_m"), static_cast<double>(Report.MouthComponentGapVoxels)
+            * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        Writer->WriteValue(TEXT("agent_final_position_available"), Report.bHasAgentFinalPosition);
+        if (Report.bHasAgentFinalPosition)
+        {
+            WriteJsonVector(*Writer, TEXT("agent_final_position_voxels"), Report.AgentFinalVoxels, 1.0f);
+            WriteJsonVector(*Writer, TEXT("agent_final_position_metres"), Report.AgentFinalVoxels, 0.25f);
+        }
+        Writer->WriteValue(TEXT("last_reached_position_available"), Report.bHasLastReachedPosition);
+        if (Report.bHasLastReachedPosition)
+        {
+            WriteJsonVector(*Writer, TEXT("last_reached_position_voxels"), Report.LastReachedVoxels, 1.0f);
+            WriteJsonVector(*Writer, TEXT("last_reached_position_metres"), Report.LastReachedVoxels, 0.25f);
+        }
+        Writer->WriteValue(TEXT("target_component_nearest_cell_available"), Report.bHasTargetComponentNearestCell);
+        if (Report.bHasTargetComponentNearestCell)
+        {
+            WriteJsonVector(*Writer, TEXT("target_component_nearest_cell_voxels"),
+                Report.TargetComponentNearestVoxels, 1.0f);
+            WriteJsonVector(*Writer, TEXT("target_component_nearest_cell_metres"),
+                Report.TargetComponentNearestVoxels, 0.25f);
+        }
+        Writer->WriteValue(TEXT("agent_to_target_component_gap_voxels"),
+            static_cast<double>(Report.AgentToTargetComponentGapVoxels));
+        Writer->WriteValue(TEXT("agent_to_target_component_gap_m"),
+            static_cast<double>(Report.AgentToTargetComponentGapVoxels)
+                * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        Writer->WriteValue(TEXT("origin_column_in_sampled_window"), Report.bOriginColumnInSampledWindow);
+        Writer->WriteValue(TEXT("origin_column_has_player_fit"), Report.bOriginColumnHasPlayerFit);
+        Writer->WriteValue(TEXT("origin_column_player_fit_cells"), Report.OriginColumnPlayerFitCells);
+        Writer->WriteValue(TEXT("origin_column_reachable_from_arrival"), Report.bOriginColumnReachable);
+        Writer->WriteValue(TEXT("reachable_set_to_origin_column_voxels"),
+            static_cast<double>(Report.ReachableSetToOriginColumnVoxels));
+        Writer->WriteValue(TEXT("reachable_set_to_origin_column_m"),
+            static_cast<double>(Report.ReachableSetToOriginColumnVoxels)
+                * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        Writer->WriteObjectStart(TEXT("origin_check"));
+        Writer->WriteValue(TEXT("attempted"), Output.Walk.bOriginCheckAttempted);
+        Writer->WriteValue(TEXT("available"), Output.Walk.bOriginCheckAvailable);
+        Writer->WriteValue(TEXT("refusal_or_error"), Output.Walk.OriginCheckRefusalReason);
+        if (Output.Walk.bOriginCheckAvailable)
+        {
+            const FVoxelPlayerFitWalkReport& OriginReport = Output.Walk.OriginCheckReport;
+            Writer->WriteValue(TEXT("window_policy"), TEXT("origin-inclusive mouth-AABB + margin"));
+            Writer->WriteValue(TEXT("connectivity_result"), ConnectivityResultName(OriginReport.Result));
+            Writer->WriteValue(TEXT("can_reach_departure"), OriginReport.bCanReachDeparture);
+            Writer->WriteValue(TEXT("sampled_num_x"), OriginReport.SampledNumX);
+            Writer->WriteValue(TEXT("sampled_num_y"), OriginReport.SampledNumY);
+            Writer->WriteValue(TEXT("sampled_num_z"), OriginReport.SampledNumZ);
+            Writer->WriteValue(TEXT("sampled_min_x"), static_cast<double>(OriginReport.SampledMinX));
+            Writer->WriteValue(TEXT("sampled_max_x_exclusive"), static_cast<double>(OriginReport.SampledMaxX));
+            Writer->WriteValue(TEXT("sampled_min_y"), static_cast<double>(OriginReport.SampledMinY));
+            Writer->WriteValue(TEXT("sampled_max_y_exclusive"), static_cast<double>(OriginReport.SampledMaxY));
+            Writer->WriteValue(TEXT("sampled_min_z"), OriginReport.SampledMinZ);
+            Writer->WriteValue(TEXT("sampled_max_z_exclusive"), OriginReport.SampledMaxZ);
+            Writer->WriteValue(TEXT("player_fit_cells"), OriginReport.PlayerFitVolumeCells);
+            Writer->WriteValue(TEXT("reachable_player_fit_cells"), OriginReport.ReachablePlayerFitCells);
+            Writer->WriteValue(TEXT("reachable_player_fit_fraction"),
+                static_cast<double>(OriginReport.ReachablePlayerFitFraction));
+            Writer->WriteValue(TEXT("player_fit_components"), OriginReport.PlayerFitComponents);
+            Writer->WriteValue(TEXT("arrival_component_cells"), OriginReport.ArrivalComponentCells);
+            Writer->WriteValue(TEXT("departure_component_cells"), OriginReport.DepartureComponentCells);
+            Writer->WriteValue(TEXT("mouth_component_gap_voxels"),
+                static_cast<double>(OriginReport.MouthComponentGapVoxels));
+            Writer->WriteValue(TEXT("origin_column_in_sampled_window"),
+                OriginReport.bOriginColumnInSampledWindow);
+            Writer->WriteValue(TEXT("origin_column_has_player_fit"),
+                OriginReport.bOriginColumnHasPlayerFit);
+            Writer->WriteValue(TEXT("origin_column_player_fit_cells"),
+                OriginReport.OriginColumnPlayerFitCells);
+            Writer->WriteValue(TEXT("origin_column_reachable_from_arrival"),
+                OriginReport.bOriginColumnReachable);
+            Writer->WriteValue(TEXT("reachable_set_to_origin_column_voxels"),
+                static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels));
+            Writer->WriteValue(TEXT("reachable_set_to_origin_column_m"),
+                static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels)
+                    * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
+        }
+        Writer->WriteObjectEnd();
         Writer->WriteObjectEnd();
     }
 
@@ -1651,6 +2023,21 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] walk %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Walk.Status);
+    }
+    if (Arguments.bFailureFocusRender && Arguments.bRender && Arguments.bWalk)
+    {
+        const double Start = FPlatformTime::Seconds();
+        if (!RunFailureBoundaryRender(Arguments, World, Output.Walk, Output.Render))
+        {
+            bRequestedModeFailed = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeExplore] failure-focus render could not produce a boundary image."));
+        }
+        else
+        {
+            UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] failure-focus render %.3fs (ok)"),
+                FPlatformTime::Seconds() - Start);
+        }
     }
     if (Arguments.bExport)
     {
