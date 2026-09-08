@@ -145,6 +145,8 @@ class VOXELFORGE_API UVoxelStrateManager : public UObject
     GENERATED_BODY()
 
 public:
+    UVoxelStrateManager();
+
     //=========================================================================
     // INITIALIZATION
     //=========================================================================
@@ -177,6 +179,15 @@ public:
     bool IsUsingSeason() const { return !ActiveSeasonContentHash.IsEmpty(); }
     const FString& GetSeasonContentHash() const { return ActiveSeasonContentHash; }
     int32 GetWorldSeed() const { return CachedSeed; }
+
+    /**
+     * Monotonic identity of this manager UObject instance.
+     *
+     * PassagesVersion intentionally starts over for every layout, so it cannot distinguish a
+     * cached stack built by an older PIE manager that happened to have the same layout version.
+     * Worker-local generator caches use this identity as their manager-lifetime boundary.
+     */
+    uint64 GetCacheLifetimeId() const { return CacheLifetimeId; }
 
 #if WITH_EDITOR
     /**
@@ -429,6 +440,10 @@ protected:
     // override. EvaluateModifierSDF and all generator thread_local memos use this to invalidate
     // cached passage/strate data after either kind of live change.
     uint32 PassagesVersion = 0;
+
+    // Never reused for the lifetime of the process. This is deliberately not a UObject pointer:
+    // allocator address reuse must not make a stale worker-local stack look current.
+    uint64 CacheLifetimeId = 0;
 
     // How many chunks at strate boundaries are blended (transition zone)
     int32 BlendChunks = 2;

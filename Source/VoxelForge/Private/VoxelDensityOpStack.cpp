@@ -1814,9 +1814,9 @@ namespace
 
         void Eval(float X, float Y, float Z, FVoxelOpSample& InOut) const override
         {
-            if (Manager)
+            if (const UVoxelStrateManager* LiveManager = Manager.Get())
             {
-                Manager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
+                LiveManager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
             }
             // Keep the source and op-stack operation order identical: the origin room is carved
             // before the boundary seal, then its support floor is reasserted after the passage
@@ -1829,23 +1829,24 @@ namespace
         // simplement branchée au bon endroit au lieu d'être un cas particulier du classifieur.
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
-            if (!Manager) { return EVoxelOpEffect::Identity; }
+            const UVoxelStrateManager* LiveManager = Manager.Get();
+            if (!LiveManager) { return EVoxelOpEffect::Identity; }
             if (VoxelPassageGeometry::OriginLandingFloorTouchesBox(
                     VoxelBox, TopZ, BotZ, Seal, SpineRadius)
-                || Manager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
+                || LiveManager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
             {
                 // The room carves air, while its support slab force-writes solid. Both
                 // hypotheses must therefore be killed for a box touching that slab.
                 return EVoxelOpEffect::Both;
             }
-            return Manager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
+            return LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
         const TCHAR* DebugName() const override { return TEXT("PassageCarveOp"); }
 
     private:
-        const UVoxelStrateManager* Manager;
+        TWeakObjectPtr<const UVoxelStrateManager> Manager;
         float Base, Seal, TopZ, BotZ, SpineRadius;
     };
 
@@ -2805,6 +2806,7 @@ namespace
         FRoomGraphSource(const FStrateGenerationParams& InP, int32 InSeed,
                          const UVoxelStrateManager* InManager)
             : P(InP), Seed(InSeed), SeedU((uint32)InSeed), Manager(InManager)
+            , ManagerLifetimeId(InManager ? InManager->GetCacheLifetimeId() : 0)
             , ParamsFingerprint(FCrc::MemCrc32(&InP, sizeof(InP)))
         {}
 
@@ -2853,6 +2855,7 @@ namespace
             uint32 CachedSeed = 0;
             uint32 CachedFingerprint = 0xFFFFFFFFu;
             uint32 CachedLayout = 0xFFFFFFFFu;
+            uint64 CachedManagerLifetimeId = 0;
 
             /** La salle de SDF minimal pour le dernier voxel évalué. -1 = aucune. */
             int32 NearestRoom = -1;
@@ -2991,6 +2994,18 @@ namespace
             // sur chaque voxel de roc profond, ce que l'original ne paie pas.)
             S.bLocalParamsValid = false;
 
+            const UVoxelStrateManager* LiveManager = Manager.Get();
+            // A cached stack may outlive its UObject owner when an editor world is stopped. The
+            // generator's manager-lifetime key prevents selecting it normally; this guard is the
+            // final boundary for a task that is already inside an old stack. Keep commandlet stacks
+            // (which deliberately have no manager) functional, but never evaluate stale room data.
+            if (ManagerLifetimeId != 0 && LiveManager == nullptr)
+            {
+                S.Cache = FChunkSDFCache();
+                InOut.Sdf = FLT_MAX;
+                return;
+            }
+
             if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return; }   // Sdf reste FLT_MAX
 
             const float EffectiveZ = EffZ(WorldZ);
@@ -3046,18 +3061,19 @@ namespace
             // Index de strate — mémo (chunk-Z, version de layout), transcrit tel quel. La requête
             // vise le CENTRE de la bande, donc le résultat est une fonction pure de la clé.
             int32 StrateIdx = 0;
-            if (Manager)
+            if (LiveManager)
             {
                 thread_local int32  SI_ChunkZ  = INT32_MAX;
                 thread_local uint32 SI_Version = 0xFFFFFFFFu;
                 thread_local int32  SI_Index   = 0;
                 const int32 QZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
-                const uint32 LV = Manager->GetLayoutVersion();
+                const uint32 LV = LiveManager->GetLayoutVersion();
                 if (QZ != SI_ChunkZ || LV != SI_Version)
                 {
                     SI_ChunkZ  = QZ;
                     SI_Version = LV;
-                    SI_Index = Manager->GetStrateIndex(((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+                    SI_Index = LiveManager->GetStrateIndex(
+                        ((float)QZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
                 }
                 StrateIdx = SI_Index;
             }
@@ -3065,6 +3081,7 @@ namespace
             const bool bNeedRebuild =
                 StrateIdx != S.CachedStrate || SeedU != S.CachedSeed ||
                 ParamsFingerprint != S.CachedFingerprint || LayoutVersion != S.CachedLayout ||
+                ManagerLifetimeId != S.CachedManagerLifetimeId ||
                 WarpedX < S.CachedSMinX || WarpedX > S.CachedSMaxX ||
                 WarpedY < S.CachedSMinY || WarpedY > S.CachedSMaxY;
 
@@ -3084,10 +3101,10 @@ namespace
                 const float SMaxY = ChunkMaxY + Expansion;
 
                 const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-                if (Manager)
+                if (LiveManager)
                 {
                     const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
-                    UVoxelStrateDefinition* Def = Manager->GetStrateForChunk(
+                    UVoxelStrateDefinition* Def = LiveManager->GetStrateForChunk(
                         FIntVector(CacheChunkX, CacheChunkY, ChunkZ));
                     if (Def) { TerrainOps = &Def->TerrainOperations; }
                 }
@@ -3101,6 +3118,7 @@ namespace
                 S.CachedSeed = SeedU;
                 S.CachedFingerprint = ParamsFingerprint;
                 S.CachedLayout = LayoutVersion;
+                S.CachedManagerLifetimeId = ManagerLifetimeId;
             }
 
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
@@ -3198,6 +3216,7 @@ namespace
             uint32 KeySeed = 0;
             uint32 KeyFingerprint = 0xFFFFFFFFu;
             uint32 KeyLayout = 0xFFFFFFFFu;
+            uint64 KeyManagerLifetimeId = 0;
             bool   bValid = false;
             EVoxelOpEffect Verdict = EVoxelOpEffect::Both;
             FVoxelBoxSdfInterval SdfInterval;
@@ -3281,6 +3300,7 @@ namespace
                                  const FVoxelOpContext& Ctx) const override
         {
             FBoxState& B = BoxState();
+            const UVoxelStrateManager* LiveManager = Manager.Get();
 
             auto Unknown = [&]()
             {
@@ -3289,6 +3309,12 @@ namespace
                 InOut.SetUnknown();
             };
             auto Finite = [](float V) { return FMath::IsFinite(V); };
+
+            if (ManagerLifetimeId != 0 && LiveManager == nullptr)
+            {
+                Unknown();
+                return;
+            }
 
             const float BoxMinX = (float)VoxelBox.Min.X;
             const float BoxMinY = (float)VoxelBox.Min.Y;
@@ -3362,13 +3388,13 @@ namespace
 
             int32 StrateIdx = 0;
             const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-            if (Manager)
+            if (LiveManager)
             {
-                StrateIdx = Manager->GetStrateIndex(
+                StrateIdx = LiveManager->GetStrateIndex(
                     ((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
                 for (int32 CZ = CZ0 + 1; CZ <= CZ1; ++CZ)
                 {
-                    if (Manager->GetStrateIndex(
+                    if (LiveManager->GetStrateIndex(
                             ((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
                     {
                         Unknown();
@@ -3380,12 +3406,12 @@ namespace
                 // columns from it. Every chunk touched by this query must therefore resolve to the
                 // same definition before one cache can represent the box.
                 UVoxelStrateDefinition* Def0 =
-                    Manager->GetStrateForChunk(FIntVector(CX0, CY0, CZ0));
+                    LiveManager->GetStrateForChunk(FIntVector(CX0, CY0, CZ0));
                 for (int32 CZ = CZ0; CZ <= CZ1; ++CZ)
                 for (int32 CY = CY0; CY <= CY1; ++CY)
                 for (int32 CX = CX0; CX <= CX1; ++CX)
                 {
-                    if (Manager->GetStrateForChunk(FIntVector(CX, CY, CZ)) != Def0)
+                    if (LiveManager->GetStrateForChunk(FIntVector(CX, CY, CZ)) != Def0)
                     {
                         Unknown();
                         return;
@@ -3396,7 +3422,8 @@ namespace
 
             const uint32 LV = Ctx.LayoutVersion;
             if (B.bValid && B.KeyBox == VoxelBox && B.KeyStrate == StrateIdx
-                && B.KeySeed == SeedU && B.KeyFingerprint == ParamsFingerprint && B.KeyLayout == LV)
+                && B.KeySeed == SeedU && B.KeyFingerprint == ParamsFingerprint && B.KeyLayout == LV
+                && B.KeyManagerLifetimeId == ManagerLifetimeId)
             {
                 InOut = B.SdfInterval;
                 return;
@@ -3603,6 +3630,7 @@ namespace
             B.KeySeed = SeedU;
             B.KeyFingerprint = ParamsFingerprint;
             B.KeyLayout = LV;
+            B.KeyManagerLifetimeId = ManagerLifetimeId;
             B.bValid = true;
             InOut = Own;
         }
@@ -3620,7 +3648,8 @@ namespace
         FStrateGenerationParams P;
         int32  Seed;
         uint32 SeedU;
-        const UVoxelStrateManager* Manager;   // NON possédant
+        TWeakObjectPtr<const UVoxelStrateManager> Manager;
+        uint64 ManagerLifetimeId = 0;
         uint32 ParamsFingerprint;
         uint32 LayoutVersion = 0;
     };

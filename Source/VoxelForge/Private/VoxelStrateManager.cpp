@@ -12,6 +12,18 @@
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 #include "UObject/UObjectGlobals.h"
 
+#include <atomic>
+
+namespace
+{
+    std::atomic<uint64> GNextStrateManagerLifetimeId { 0 };
+}
+
+UVoxelStrateManager::UVoxelStrateManager()
+    : CacheLifetimeId(GNextStrateManagerLifetimeId.fetch_add(1, std::memory_order_relaxed) + 1)
+{
+}
+
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
 
@@ -73,6 +85,7 @@ namespace
     struct FPassageEvaluationCache
     {
         const UVoxelStrateManager* Owner = nullptr;
+        uint64 OwnerLifetimeId = 0;
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         uint32 Version = 0xFFFFFFFFu;
         TArray<int32> Nearby;
@@ -90,12 +103,15 @@ namespace
     {
         FPassageEvaluationCache& Cache = VF_GetPassageEvaluationCache();
         const uint32 Version = Manager ? Manager->GetLayoutVersion() : 0u;
-        if (Cache.Owner == Manager && Cache.Chunk == ChunkCoord && Cache.Version == Version)
+        const uint64 LifetimeId = Manager ? Manager->GetCacheLifetimeId() : 0;
+        if (Cache.Owner == Manager && Cache.OwnerLifetimeId == LifetimeId
+            && Cache.Chunk == ChunkCoord && Cache.Version == Version)
         {
             return Cache.Nearby;
         }
 
         Cache.Owner = Manager;
+        Cache.OwnerLifetimeId = LifetimeId;
         Cache.Chunk = ChunkCoord;
         Cache.Version = Version;
         Cache.Nearby.Reset();

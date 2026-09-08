@@ -857,17 +857,18 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     // Signal all async tasks to bail out ASAP
     bShuttingDown.store(true, std::memory_order_release);
 
-    // Wait for all running tasks to finish before destroying UObjects.
-    // Tasks check bShuttingDown and exit early, so this should be fast.
-    // Timeout after 3 seconds to avoid hanging the editor.
+    // Wait for every running task before destroying UObjects. A timeout here is unsafe: a task
+    // already inside GenerateTileResult may still be evaluating a cached op stack that points at
+    // this world's manager. Log a slow drain, but never tear the world down underneath a reader.
     const double Deadline = FPlatformTime::Seconds() + 3.0;
+    bool bReportedSlowDrain = false;
     while (ActiveTaskCount.load(std::memory_order_relaxed) > 0)
     {
-        if (FPlatformTime::Seconds() > Deadline)
+        if (!bReportedSlowDrain && FPlatformTime::Seconds() > Deadline)
         {
-            UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] EndPlay: %d tasks still running after 3s timeout"),
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelWorld] EndPlay: waiting for %d tasks after 3s; UObject teardown is deferred"),
                 ActiveTaskCount.load(std::memory_order_relaxed));
-            break;
+            bReportedSlowDrain = true;
         }
         FPlatformProcess::Yield();  // Give CPU to other threads
     }

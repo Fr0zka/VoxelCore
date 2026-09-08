@@ -470,6 +470,7 @@ namespace
     {
         FChunkSDFCache Cache;
         uint64 OwnerId = 0;
+        uint64 ManagerLifetimeId = 0;
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         uint32 ParamsFingerprint = 0xFFFFFFFFu;
         uint32 LayoutVersion = 0xFFFFFFFFu;
@@ -492,6 +493,7 @@ namespace
     {
         bool bValid = false;
         uint64 OwnerId = 0;
+        uint64 ManagerLifetimeId = 0;
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         uint32 LayoutVersion = 0xFFFFFFFFu;
         ECaveGeneratorType GenType = ECaveGeneratorType::TunnelNetwork;
@@ -518,11 +520,13 @@ namespace
         const FStrateGenerationParams& Params,
         uint32 ParamsFingerprint,
         uint32 LayoutVersion,
+        uint64 ManagerLifetimeId,
         uint64 OwnerId,
         FTunnelCoreCacheState& OutState)
     {
         if (OutState.bValid
             && OutState.OwnerId == OwnerId
+            && OutState.ManagerLifetimeId == ManagerLifetimeId
             && OutState.Chunk == ChunkCoord
             && OutState.ParamsFingerprint == ParamsFingerprint
             && OutState.LayoutVersion == LayoutVersion)
@@ -546,6 +550,7 @@ namespace
             Params, static_cast<uint32>(Manager.GetWorldSeed()),
             StrateIndex, nullptr);
         OutState.OwnerId = OwnerId;
+        OutState.ManagerLifetimeId = ManagerLifetimeId;
         OutState.Chunk = ChunkCoord;
         OutState.ParamsFingerprint = ParamsFingerprint;
         OutState.LayoutVersion = LayoutVersion;
@@ -799,6 +804,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
+        thread_local uint64                    CP_ManagerLifetimeId = 0;
         thread_local FTunnelNetworkDensityCacheEntry CP_TunnelDensityCache[TunnelDensityCacheSlotCount];
         thread_local FTunnelNetworkDensityCacheEntry* CP_ActiveTunnelDensityCache = nullptr;
         // Cooked-season recipes and editor candidate recipes share this immutable worker-local
@@ -817,6 +823,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 #endif
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
+        const uint64 ManagerLifetimeId = StrateManager->GetCacheLifetimeId();
         FVoxelOpStack* ActiveOpStack = &CP_OpStack;
         FTunnelCoreCacheState* ActiveTunnelCoreCache = &GTunnelCoreCache;
         bool bLoadedTunnelDensityCache = false;
@@ -827,6 +834,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
             const bool bCacheKeyMatches = CachedEntry.bValid
                 && CachedEntry.OwnerId == DensityCacheOwnerId
+                && CachedEntry.ManagerLifetimeId == ManagerLifetimeId
                 && CachedEntry.Chunk == ChunkCoord
                 && CachedEntry.LayoutVersion == LayoutVersion
                 && (CachedEntry.GenType == ECaveGeneratorType::TunnelNetwork
@@ -836,6 +844,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 if (CP_ActiveTunnelDensityCache != &CachedEntry)
                 {
                     CP_OwnerId = CachedEntry.OwnerId;
+                    CP_ManagerLifetimeId = CachedEntry.ManagerLifetimeId;
                     CP_Version = CachedEntry.LayoutVersion;
                     CP_Chunk = CachedEntry.Chunk;
                     CP_GenType = CachedEntry.GenType;
@@ -856,8 +865,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         }
 
         const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
+        const bool bManagerChanged = ManagerLifetimeId != CP_ManagerLifetimeId;
         if (!bLoadedTunnelDensityCache
-            && (bOwnerChanged || ChunkCoord != CP_Chunk || LayoutVersion != CP_Version))
+            && (bOwnerChanged || bManagerChanged || ChunkCoord != CP_Chunk
+                || LayoutVersion != CP_Version))
         {
             CP_ActiveTunnelDensityCache = nullptr;
 
@@ -867,8 +878,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             // change : deux mondes peuvent partager version et coordonnées, jamais leur contexte.
             // The biome grid's XY box says nothing about its context. Owner changes invalidate it
             // too: two worlds may share version and coordinates, never cached params/context.
-            if (bOwnerChanged || LayoutVersion != CP_Version) { CP_BiomeCache.Invalidate(); }
+            if (bOwnerChanged || bManagerChanged || LayoutVersion != CP_Version)
+            {
+                CP_BiomeCache.Invalidate();
+            }
             CP_OwnerId = DensityCacheOwnerId;
+            CP_ManagerLifetimeId = ManagerLifetimeId;
             CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
@@ -944,7 +959,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             {
                 PrepareTunnelCoreCache(
                     *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
-                    LayoutVersion, DensityCacheOwnerId, GTunnelCoreCache);
+                    LayoutVersion, ManagerLifetimeId, DensityCacheOwnerId, GTunnelCoreCache);
             }
             else
             {
@@ -1072,6 +1087,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
                 CachedEntry.bValid = false;
                 CachedEntry.OwnerId = DensityCacheOwnerId;
+                CachedEntry.ManagerLifetimeId = ManagerLifetimeId;
                 CachedEntry.Chunk = ChunkCoord;
                 CachedEntry.LayoutVersion = LayoutVersion;
                 CachedEntry.GenType = CP_GenType;
