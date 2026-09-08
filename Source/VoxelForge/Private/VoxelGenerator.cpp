@@ -17,6 +17,7 @@
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
+#include "VoxelDensityProfile.h"
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -174,6 +175,7 @@ static thread_local FSurfaceColumnCache GSurfColCache;
 // T2.b — per-thread octave bias for the tile being meshed (see VoxelGenerator.h).
 // 0 = full quality; set by the mesher per tile from Step + Settings->LODOctaveDrop.
 thread_local int32 VoxelGenLOD::OctaveBias = 0;
+thread_local int32 VoxelGenLOD::SampleStep = 1;
 
 // NOTE (T2.a): the fBm/Ridged bodies moved to VoxelNoise.h, where octaves are evaluated
 // 4-wide via SSE (Perlin3D_x4). These thin wrappers keep every call site unchanged. They
@@ -273,6 +275,8 @@ static FORCEINLINE void ApplyOriginLandingFloor(float& Density,
 static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     const FStrateDisturbanceParams& D, uint32 Seed, bool bProtectVerticalShaftAir)
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::ApplyDisturbances);
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
     if (Z <= InnerBot || Z >= InnerTop) return;
@@ -487,7 +491,12 @@ namespace
     // result. Native TunnelNetwork/Underwater states are immutable after construction; the active
     // pointer below lets the hot sample path read the stored stack and tunnel-core cache without
     // moving them on every voxel.
-    constexpr int32 TunnelDensityCacheSlotCount = 128;
+    // The largest production coarse tile can touch thousands of exact chunk keys once its
+    // gradient halo is included.  A 128-slot direct map repeatedly evicts nearby keys (the LOD
+    // probe measured 1,734 misses for only 6,859 samples at L4), rebuilding the room/tunnel cache
+    // in the hot loop.  Keep the same deterministic key and open-addressed lookup, but size the
+    // bounded table for the measured L4 working set rather than the old 128-slot guess.
+    constexpr int32 TunnelDensityCacheSlotCount = 4096;
 
     struct FTunnelNetworkDensityCacheEntry
     {
@@ -728,6 +737,8 @@ void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
+    VoxelDensityProfile::FScopedTimer DensityProfileTimer(
+        VoxelDensityProfile::EBucket::GetDensityAt);
     // ── STRATE SYSTEM ──
     // Query per-chunk params from the manager so each strate has different caves.
     float Result;
@@ -827,20 +838,62 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         FVoxelOpStack* ActiveOpStack = &CP_OpStack;
         FTunnelCoreCacheState* ActiveTunnelCoreCache = &GTunnelCoreCache;
         bool bLoadedTunnelDensityCache = false;
+        FTunnelNetworkDensityCacheEntry* TunnelDensityCacheEntryForWrite = nullptr;
+
+        // The table is open-addressed rather than one-slot direct-mapped. A direct map is very
+        // cheap until a coarse tile's regular lattice happens to put two chunk keys in the same
+        // bucket; then the two keys evict each other on every row and rebuild the prepared graph.
+        // Probe deterministically to the first empty/stale slot, retaining the bounded memory cap.
+        auto FindTunnelDensityCacheEntry = [&](const FIntVector& QueryChunk,
+                                                FTunnelNetworkDensityCacheEntry*& OutEntry) -> bool
+        {
+            const int32 StartSlot = TunnelDensityCacheSlot(QueryChunk);
+            FTunnelNetworkDensityCacheEntry* ReuseEntry = nullptr;
+            for (int32 Probe = 0; Probe < TunnelDensityCacheSlotCount; ++Probe)
+            {
+                const int32 Slot = (StartSlot + Probe) & (TunnelDensityCacheSlotCount - 1);
+                FTunnelNetworkDensityCacheEntry& Candidate = CP_TunnelDensityCache[Slot];
+                if (!Candidate.bValid || Candidate.OwnerId != DensityCacheOwnerId)
+                {
+                    if (ReuseEntry == nullptr) { ReuseEntry = &Candidate; }
+                    if (!Candidate.bValid) { break; }
+                    continue;
+                }
+                const bool bKeyMatches = Candidate.ManagerLifetimeId == ManagerLifetimeId
+                    && Candidate.Chunk == QueryChunk
+                    && Candidate.LayoutVersion == LayoutVersion
+                    && (Candidate.GenType == ECaveGeneratorType::TunnelNetwork
+                        || Candidate.GenType == ECaveGeneratorType::Underwater);
+                if (bKeyMatches)
+                {
+                    OutEntry = &Candidate;
+                    return true;
+                }
+            }
+            OutEntry = ReuseEntry != nullptr
+                ? ReuseEntry
+                : &CP_TunnelDensityCache[StartSlot];
+            return false;
+        };
 
         if (!bIsGapChunk)
         {
-            FTunnelNetworkDensityCacheEntry& CachedEntry =
-                CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
-            const bool bCacheKeyMatches = CachedEntry.bValid
-                && CachedEntry.OwnerId == DensityCacheOwnerId
-                && CachedEntry.ManagerLifetimeId == ManagerLifetimeId
-                && CachedEntry.Chunk == ChunkCoord
-                && CachedEntry.LayoutVersion == LayoutVersion
-                && (CachedEntry.GenType == ECaveGeneratorType::TunnelNetwork
-                    || CachedEntry.GenType == ECaveGeneratorType::Underwater);
+            if (VoxelDensityProfile::IsEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelCacheLookup);
+            }
+            FTunnelNetworkDensityCacheEntry* CachedEntryPtr = nullptr;
+            const bool bCacheKeyMatches = FindTunnelDensityCacheEntry(ChunkCoord, CachedEntryPtr);
+            FTunnelNetworkDensityCacheEntry& CachedEntry = *CachedEntryPtr;
+            TunnelDensityCacheEntryForWrite = CachedEntryPtr;
             if (bCacheKeyMatches)
             {
+                if (VoxelDensityProfile::IsEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelCacheHit);
+                }
                 if (CP_ActiveTunnelDensityCache != &CachedEntry)
                 {
                     CP_OwnerId = CachedEntry.OwnerId;
@@ -861,6 +914,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 ActiveOpStack = &CachedEntry.OpStack;
                 ActiveTunnelCoreCache = &CachedEntry.TunnelCore;
                 bLoadedTunnelDensityCache = true;
+            }
+            else if (VoxelDensityProfile::IsEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelCacheMiss);
             }
         }
 
@@ -1083,8 +1141,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 #endif
             if (!bLoadedTunnelDensityCache && bCanStoreTunnelDensityCache)
             {
-                FTunnelNetworkDensityCacheEntry& CachedEntry =
-                    CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
+                FTunnelNetworkDensityCacheEntry& CachedEntry = TunnelDensityCacheEntryForWrite
+                    ? *TunnelDensityCacheEntryForWrite
+                    : CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
                 CachedEntry.bValid = false;
                 CachedEntry.OwnerId = DensityCacheOwnerId;
                 CachedEntry.ManagerLifetimeId = ManagerLifetimeId;
@@ -1253,34 +1312,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             Result, WorldX, WorldY, WorldZ,
             CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
             CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        StrateManager->ApplyPassageLandingAirMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
-            CP_Dist.BoundarySealThickness);
         VF_ApplyOriginLandingFloorMC(
             Result, WorldX, WorldY, WorldZ,
             CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
             CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        StrateManager->ApplyPassageLandingFloorMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
-        // A walkable tunnel's guaranteed air core is the final structural writer above its
-        // floor. This prevents a nearby passage's floor slab from capping the active route;
-        // the tunnel-floor predicate is false on the active floor itself, so support remains.
-        StrateManager->ApplyPassageTunnelAirMC(
+        StrateManager->ApplyPassageStructuralPostsMC(
             Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
             CP_Dist.BoundarySealThickness);
-        VF_ApplyOriginLandingAirMC(
-            Result, WorldX, WorldY, WorldZ,
-            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        StrateManager->ApplyPassageLandingAirMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
-            CP_Dist.BoundarySealThickness);
-        VF_ApplyOriginLandingFloorMC(
-            Result, WorldX, WorldY, WorldZ,
-            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        StrateManager->ApplyPassageLandingRoomFloorMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
 
         // Disturbance features are authored as a generic MC-space post and may add a ridge or
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
@@ -1288,17 +1326,21 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // never once per voxel.
         if (ActiveTunnelCoreCache->bValid)
         {
-            const bool bTunnelSupportFloor =
-                VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+            FTunnelCoreWorldEvaluation TunnelCore;
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(
+                    VoxelDensityProfile::EBucket::TunnelCorePosts);
+                TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache);
+            }
+            const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
             if (bTunnelSupportFloor)
             {
                 Result = FMath::Min(
                     Result,
                     -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
             }
-            const float CoreSDF = VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
-                WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache);
+            const float CoreSDF = TunnelCore.SDF;
             if (!bTunnelSupportFloor
                 && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
             {
@@ -1563,6 +1605,11 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
         if (bNeedRebuild)
         {
+            if (VoxelDensityProfile::IsEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::SdfCacheBuild);
+            }
             // Center the search box on this query's chunk. Search area = chunk XY extent
             // + CaveWarpStrength margin (covers warp displacement) + gradient sampling.
             // MaxInfluence (room/tunnel reach) is added internally by BuildChunkCache.

@@ -378,6 +378,10 @@ public:
     void ApplyPassageModifier(float& Density, float WorldX, float WorldY, float WorldZ,
                               float BaseDensity, float SealThickness) const;
 
+    /** Apply only the passage SDF carve. The shared MC post owns landing/tunnel support writes. */
+    void ApplyPassageCarvingOnly(float& Density, float WorldX, float WorldY, float WorldZ,
+                                 float BaseDensity, float SealThickness) const;
+
     /** Reapply the landing-only air carve in internal density (used after visual disturbances). */
     void ApplyPassageLandingAir(float& Density, float WorldX, float WorldY, float WorldZ,
                                 float BaseDensity, float SealThickness) const;
@@ -393,6 +397,10 @@ public:
     /** Re-assert walkable tunnel air after MC-space disturbances, still before the final XY seal. */
     void ApplyPassageTunnelAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
                                  float BaseDensity, float SealThickness) const;
+
+    /** Apply the landing/tunnel MC backstop in one cached passage scan after disturbances. */
+    void ApplyPassageStructuralPostsMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                       float BaseDensity, float SealThickness) const;
 
     /** Re-assert a landing floor after the landing air pass, still before the final XY seal. */
     void ApplyPassageLandingFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,

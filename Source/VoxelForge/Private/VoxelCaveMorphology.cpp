@@ -28,6 +28,7 @@
 //     this chunk are kept for the per-voxel loop, so hot-path cost stays low.
 
 #include "VoxelCaveMorphology.h"
+#include "VoxelDensityProfile.h"
 #include "VoxelDensityPrimitives.h"
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
@@ -3643,6 +3644,16 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float NearestRoomRawSDF = FLT_MAX;
     int32 NearestIdx = -1;
 
+    if (VoxelDensityProfile::IsEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::CaveRoomCandidates,
+            static_cast<uint64>(Cache.Rooms.Num()));
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::CaveTunnelCandidates,
+            static_cast<uint64>(Cache.Tunnels.Num()));
+    }
+
     //=========================================================================
     // Room SDFs
     //=========================================================================
@@ -3653,6 +3664,11 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         // --- DISTANCE CULL ---
         const float DistSq = FVector::DistSquared(Pos, Room.Center);
         if (DistSq > Room.CullRadiusSq) continue;
+        if (VoxelDensityProfile::IsEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::CaveRoomEvaluated);
+        }
 
         // --- SHAPE (pre-baked in BuildChunkCache — no per-voxel hash roll / trig) ---
         float RoomSDF;
@@ -3721,6 +3737,11 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         // --- BOUNDING SPHERE CULL ---
         const float DistSq = FVector::DistSquared(Pos, Tunnel.BoundCenter);
         if (DistSq > Tunnel.BoundRadiusSq) continue;
+        if (VoxelDensityProfile::IsEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::CaveTunnelEvaluated);
+        }
 
         float TunnelSDF;
 
@@ -3830,12 +3851,19 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
     return MinSDF;
 }
 
-float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
-    float MinSDF = FLT_MAX;
+    FTunnelCoreWorldEvaluation Result;
+
+    if (VoxelDensityProfile::IsEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
+            static_cast<uint64>(Cache.Tunnels.Num()));
+    }
 
     for (const FCachedTunnel& Tunnel : Cache.Tunnels)
     {
@@ -3850,6 +3878,11 @@ float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
         {
             continue;
         }
+        if (VoxelDensityProfile::IsEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
+        }
 
         const TArray<FVector>& ControlPoints = bHasWorldChain
             ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
@@ -3859,9 +3892,20 @@ float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
         {
             float FloorZ = 0.0f;
             float SupportRadius = 0.0f;
-            if (VoxelPassageGeometry::ProjectWalkableTunnelFloor(
-                    ControlPoints, ControlRadii, Pos, FloorZ, SupportRadius)
+            const bool bProjectedFloor = VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                ControlPoints, ControlRadii, Pos, FloorZ, SupportRadius);
+            const bool bWithinWorldBounds = Tunnel.WorldBoundRadiusSq <= 0.0f
+                || FVector::DistSquared(Pos, Tunnel.WorldBoundCenter)
+                    <= Tunnel.WorldBoundRadiusSq;
+            if (bProjectedFloor && bWithinWorldBounds
                 && WorldZ <= FloorZ
+                    + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
+                && WorldZ >= FloorZ
+                    - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+            {
+                Result.bSupportFloor = true;
+            }
+            if (bProjectedFloor && WorldZ <= FloorZ
                     + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels)
             {
                 // The finite floor slab owns the bottom of this tunnel. Another intersecting
@@ -3877,8 +3921,8 @@ float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
                  SegmentIndex + 1 < ControlPoints.Num();
                  ++SegmentIndex)
             {
-                MinSDF = FMath::Min(
-                    MinSDF,
+                Result.SDF = FMath::Min(
+                    Result.SDF,
                     VoxelSDF::TaperedCapsule(
                         Pos,
                         ControlPoints[SegmentIndex],
@@ -3889,28 +3933,35 @@ float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
         }
         else if (Tunnel.bHasMidpoint)
         {
-            MinSDF = FMath::Min(
-                MinSDF,
+            Result.SDF = FMath::Min(
+                Result.SDF,
                 VoxelSDF::TaperedCapsule(
                     Pos, Tunnel.EndpointA, Tunnel.Midpoint,
                     Tunnel.RadiusA, Tunnel.RadiusMid));
-            MinSDF = FMath::Min(
-                MinSDF,
+            Result.SDF = FMath::Min(
+                Result.SDF,
                 VoxelSDF::TaperedCapsule(
                     Pos, Tunnel.Midpoint, Tunnel.EndpointB,
                     Tunnel.RadiusMid, Tunnel.RadiusB));
         }
         else
         {
-            MinSDF = FMath::Min(
-                MinSDF,
+            Result.SDF = FMath::Min(
+                Result.SDF,
                 VoxelSDF::TaperedCapsule(
                     Pos, Tunnel.EndpointA, Tunnel.EndpointB,
                     Tunnel.RadiusA, Tunnel.RadiusB));
         }
     }
 
-    return MinSDF;
+    return Result;
+}
+
+float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+    float WorldX, float WorldY, float WorldZ,
+    const FChunkSDFCache& Cache)
+{
+    return EvaluateTunnelCoreWorld(WorldX, WorldY, WorldZ, Cache).SDF;
 }
 
 bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
@@ -3918,6 +3969,13 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     const FChunkSDFCache& Cache)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
+
+    if (VoxelDensityProfile::IsEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
+            static_cast<uint64>(Cache.Tunnels.Num()));
+    }
     for (const FCachedTunnel& Tunnel : Cache.Tunnels)
     {
         if (Tunnel.WorldControlPoints.Num() < 2
@@ -3944,6 +4002,11 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
             || FVector::DistSquared(Pos, Tunnel.WorldBoundCenter)
                 <= Tunnel.WorldBoundRadiusSq)
         {
+            if (VoxelDensityProfile::IsEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
+            }
             return true;
         }
     }

@@ -669,6 +669,13 @@ struct FChunkSDFCache
     TArray<FCachedColumn>  Columns;
 };
 
+/** Combined world-space tunnel post query; one cache scan supplies both support and air tests. */
+struct FTunnelCoreWorldEvaluation
+{
+    float SDF = FLT_MAX;
+    bool bSupportFloor = false;
+};
+
 //=============================================================================
 // CAVE MORPHOLOGY EVALUATOR
 //=============================================================================
@@ -753,6 +760,11 @@ namespace VoxelCaveMorphology
     // SDFs remain evaluated in warped coordinates; only this post uses world coordinates so its
     // walkable floor follows the authored chain exactly.
     VOXELFORGE_API float EvaluateTunnelCoreWorldSDF(
+        float WorldX, float WorldY, float WorldZ,
+        const FChunkSDFCache& Cache
+    );
+
+    VOXELFORGE_API FTunnelCoreWorldEvaluation EvaluateTunnelCoreWorld(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache
     );

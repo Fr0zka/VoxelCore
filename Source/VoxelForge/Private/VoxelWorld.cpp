@@ -31,12 +31,22 @@
 #include "Modules/ModuleManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "HAL/IConsoleManager.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
 #endif
+
+namespace
+{
+    int32 GVoxelForgeProfileTileGeneration = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeProfileTileGeneration(
+        TEXT("voxel.ProfileTileGeneration"),
+        GVoxelForgeProfileTileGeneration,
+        TEXT("Log worker tile generation time with level/step/cell count."));
+}
 
 AVoxelWorld::AVoxelWorld()
 {
@@ -855,7 +865,10 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
 void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     // Signal all async tasks to bail out ASAP
+    const double EndPlayStartSeconds = FPlatformTime::Seconds();
     bShuttingDown.store(true, std::memory_order_release);
+    UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: shutdown signalled; waiting for %d tasks"),
+        ActiveTaskCount.load(std::memory_order_relaxed));
 
     // Wait for every running task before destroying UObjects. A timeout here is unsafe: a task
     // already inside GenerateTileResult may still be evaluating a cached op stack that points at
@@ -872,6 +885,8 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         }
         FPlatformProcess::Yield();  // Give CPU to other threads
     }
+    UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: workers drained in %.6fs"),
+        FPlatformTime::Seconds() - EndPlayStartSeconds);
 
     // Drain any queued results
     FChunkResult Discard;
@@ -965,6 +980,7 @@ void AVoxelWorld::BeginPlay()
 
     Generator->InitializeSettings(Settings);
     Mesher->SetGenerator(Generator);
+    Mesher->SetShutdownFlag(&bShuttingDown);
     Mesher->bGenerateSkirts = Settings->bGenerateSkirts;
     Mesher->SkirtCells      = Settings->SkirtCells;
     Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
@@ -1161,6 +1177,13 @@ void AVoxelWorld::ProcessPendingChunks()
     {
         PendingTiles.Remove(DequeuedChunk.Tile);
 
+        // A worker can observe shutdown after entering the mesher. Do not turn that partial
+        // result into an all-air tile: it must remain eligible for a future generation epoch.
+        if (DequeuedChunk.bAborted)
+        {
+            continue;
+        }
+
         // ApplyTileResult does epoch check, mark-loaded, capture ingest, empty-release / mesh upload.
         // Only a real (visible) upload counts against the per-frame budget — stale/empty drain free.
         if (ApplyTileResult(DequeuedChunk))
@@ -1179,7 +1202,7 @@ void AVoxelWorld::ProcessPendingChunks()
 bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
 {
     // Discard results from a previous generation epoch (stale).
-    if (Result.Epoch != GenerationEpoch)
+    if (Result.bAborted || Result.Epoch != GenerationEpoch)
     {
         return false;
     }
@@ -2078,10 +2101,43 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                      int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
                                      FChunkResult& Result)
 {
+    const bool bProfileTile = GVoxelForgeProfileTileGeneration != 0;
+    const double TileStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+    auto EmitTileProfile = [&]()
+    {
+        if (bProfileTile)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTileProfile] level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d seconds=%.6f"),
+                Tile.Level, Step, Cells, bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
+                Result.bEmpty ? 1 : 0, FPlatformTime::Seconds() - TileStartSeconds);
+        }
+    };
+
     Result.Tile  = Tile;
     Result.Epoch = Epoch;
+    Result.bAborted = false;
+    Result.bEmpty = true;
+    Result.Streams.Reset();
+    Result.CaptureGrid.Reset();
     Result.BandChunkLo = BandChunkLo;   // strate content cut (MIN/MAX = uncut)
     Result.BandChunkHi = BandChunkHi;
+
+    // Shared by async workers and the synchronous carve path. An interrupted result is empty but
+    // explicitly discarded, never an all-air tile that gets marked loaded.
+    auto AbortResult = [&]()
+    {
+        Result.bAborted = true;
+        Result.bEmpty = true;
+        Result.Streams.Reset();
+        Result.CaptureGrid.Reset();
+    };
+    if (ShouldAbortWork())
+    {
+        AbortResult();
+        EmitTileProfile();
+        return;
+    }
 
     // T1.d — TRIVIAL-TILE REJECT: ~84 % des tuiles générées sortaient vides (tout-roc /
     // tout-air) en payant quand même le pré-échantillonnage complet. Le classifieur prouve
@@ -2096,6 +2152,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
         const EVoxelTileClass Verdict = Generator->ClassifyTile(OriginVoxels, Step, Cells);
+        if (ShouldAbortWork())
+        {
+            AbortResult();
+            EmitTileProfile();
+            return;
+        }
         if (Verdict == EVoxelTileClass::AllSolid)
         {
             INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllSolid);
@@ -2123,6 +2185,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                    bWantCapture ? &Result.CaptureGrid : nullptr,
                                    BandVoxLo, BandVoxHi);
         INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
+        if (ShouldAbortWork())
+        {
+            AbortResult();
+            EmitTileProfile();
+            return;
+        }
     }
 
     // T1.f — build the RMC geometry buffers HERE (worker), not on the game thread. Empty/all-air
@@ -2132,6 +2200,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
         Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
         BuildTileStreamSet(*Result.Streams, MeshData);
+        if (ShouldAbortWork())
+        {
+            AbortResult();
+            EmitTileProfile();
+            return;
+        }
         Result.bEmpty = false;
 
         // F17 — the mesher classified every triangle semantically (sky-cap vs ground, per
@@ -2143,6 +2217,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         Result.bHasCeilingTris = MeshData.NumCeilingTriangles > 0;
         Result.bHasGroundTris  = NumTris > MeshData.NumCeilingTriangles;
     }
+
+    EmitTileProfile();
 }
 
 // Section-group key shared by every tile component ("the" tile geometry group).

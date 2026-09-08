@@ -29,6 +29,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     const int32 OctaveBias = (LODOctaveDrop > 0 && Step > 1)
         ? LODOctaveDrop * (int32)FMath::FloorLog2((uint32)Step) : 0;
     TGuardValue<int32> OctaveBiasGuard(VoxelGenLOD::OctaveBias, OctaveBias);
+    TGuardValue<int32> SampleStepGuard(VoxelGenLOD::SampleStep, Step);
 
     // World-cm origin of the tile's min corner (positions are built relative to this).
     const FVector ChunkWorldPos = FVector(OriginVoxels) * VOXEL_SIZE;
@@ -225,8 +226,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     // gradient) sont échantillonnées — le reste du tampon reste non initialisé et non lu.
     for (int32 gz = GzLo; gz <= GzHi; gz++)
     {
+        if (ShouldAbortWork()) return FVoxelMeshData();
         for (int32 gy = -1; gy <= GridDim; gy++)
         {
+            if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 gx = -1; gx <= GridDim; gx++)
             {
                 // World voxel = tile origin + grid offset scaled by the cell size (Step).
@@ -289,8 +292,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     CapTris.Reset();
     for (int32 cz = CzLo; cz <= CzHi; cz++)            // bande de strate : cf. CzLo/CzHi plus haut
     {
+        if (ShouldAbortWork()) return FVoxelMeshData();
         for (int32 cy = 0; cy < CellsPerAxis; cy++)
         {
+            if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
                 // PASSE 1 : densités aux 8 coins + index de cas MC SEULEMENT.
@@ -498,6 +503,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateSheetMesh(FIntVector OriginVox
     SheetCols.SetNumUninitialized(MDim * MDim);
     for (int32 gy = -1; gy <= GridDim; ++gy)
     {
+        if (ShouldAbortWork()) return FVoxelMeshData();
         for (int32 gx = -1; gx <= GridDim; ++gx)
         {
             float Tz = 0.0f, Cz = 0.0f;
@@ -572,6 +578,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateSheetMesh(FIntVector OriginVox
 
     for (int32 cy = 0; cy < CellsXY; ++cy)
     {
+        if (ShouldAbortWork()) return FVoxelMeshData();
         for (int32 cx = 0; cx < CellsXY; ++cx)
         {
             if (CellInHole(cx, cy)) continue;   // couverte par les coquilles MC proches
@@ -638,6 +645,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateSheetMesh(FIntVector OriginVox
         // (pas dans le trou XY) — sinon mur flottant sans surface.
         for (int32 c = 0; c < CellsXY; ++c)
         {
+            if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 Pass = 0; Pass < 2; ++Pass)
             {
                 const bool bCap = (Pass == 1);

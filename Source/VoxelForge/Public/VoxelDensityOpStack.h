@@ -35,6 +35,7 @@
 
 #include "CoreMinimal.h"
 #include "VoxelDensityOp.h"
+#include "VoxelDensityProfile.h"
 #include "VoxelStrateTypes.h"   // FMazeGenerationParams
 #include "VoxelHeightOp.h"      // IVoxelBiomeField — BuildSurfaceStack takes ownership of one
 
@@ -85,6 +86,7 @@ private:
         bool bAdditive = false;
         EVoxelOpResourceMask RequiredResources = VoxelOpResources::None;
         EVoxelOpResourceMask ProvidedResources = VoxelOpResources::None;
+        const TCHAR* ProfileName = nullptr;
     };
 
 public:
@@ -121,6 +123,7 @@ public:
             Entry.bAdditive = Entry.Op->IsAdditive();
             Entry.RequiredResources = Entry.Op->RequiredResources();
             Entry.ProvidedResources = Entry.Op->ProvidedResources();
+            Entry.ProfileName = Entry.Op->DebugName();
         }
         Ops.Add(MoveTemp(Entry));
     }
@@ -153,7 +156,11 @@ public:
     FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
     {
         FVoxelOpSample S;
-        for (const FOpEntry& Entry : Ops) { Entry.Op->Eval(WorldX, WorldY, WorldZ, S); }
+        for (const FOpEntry& Entry : Ops)
+        {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileName);
+            Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
+        }
         return S;
     }
 

@@ -21,6 +21,7 @@
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/UObjectGlobals.h"
 #include "VoxelDiffLayer.h"
+#include "VoxelDensityProfile.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
@@ -172,6 +173,8 @@ struct FExploreArguments
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
+    bool bProfileDensity = false;
+    bool bProfileLod = false;
     bool bFailureFocusRender = false;
     FString OutDirectory;
 
@@ -209,6 +212,8 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("archetype="), ArchetypeText);
     FParse::Value(*Params, TEXT("slot="), OutArguments.Slot);
     FParse::Value(*Params, TEXT("modes="), ModesText);
+    OutArguments.bProfileDensity = FParse::Param(*Params, TEXT("profiledensity"));
+    OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
     FParse::Value(*Params, TEXT("renderheight="), OutArguments.RenderHeight);
@@ -3840,6 +3845,12 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] %s"), *Error);
         return 1;
     }
+
+    if (Arguments.bProfileDensity)
+    {
+        VoxelDensityProfile::Reset();
+        VoxelDensityProfile::SetEnabled(true);
+    }
     if (!IFileManager::Get().MakeDirectory(*Arguments.OutDirectory, true))
     {
         UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] Could not create output directory '%s'."),
@@ -3859,6 +3870,61 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         return 1;
     }
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
+
+    if (Arguments.bProfileLod)
+    {
+        const FIntVector ProbeOrigin(0, 0, World.TargetBottomWorldZ);
+        const int32 FullRes = World.Settings
+            ? FMath::Max(1, World.Settings->FullResClipLevels)
+            : 2;
+        const int32 CoarseCells = World.Settings
+            ? FMath::Clamp(World.Settings->CoarseTileCells, 4, CHUNK_SIZE)
+            : 16;
+        const int32 CutMin = World.Settings
+            ? World.Settings->StrateContentCutMinLevel
+            : 9;
+        for (int32 Level = 0; Level <= 4; ++Level)
+        {
+            // Match AVoxelWorld::LoadTile exactly: the probe is a production tile at this LOD,
+            // including the configured coarse sample count.  Using 1<<Level here would measure
+            // a denser mesh than the game generates at levels >= FullResClipLevels.
+            const int32 Extent = CHUNK_SIZE << Level;
+            const int32 Cells = Level < FullRes ? CHUNK_SIZE : CoarseCells;
+            const int32 Step = FMath::Max(1, Extent / Cells);
+            VoxelDensityProfile::Reset();
+            VoxelDensityProfile::SetEnabled(true);
+            const double Start = FPlatformTime::Seconds();
+            const bool bBanded = Level >= CutMin;
+            const FVoxelMeshData Mesh = World.Mesher->GenerateMesh(
+                ProbeOrigin, Step, Cells, nullptr,
+                bBanded ? World.TargetBottomWorldZ : INT32_MIN,
+                bBanded ? World.TargetTopWorldZ - 1 : INT32_MAX);
+            const double Seconds = FPlatformTime::Seconds() - Start;
+            const VoxelDensityProfile::FSnapshot Profile = VoxelDensityProfile::Snapshot();
+            const int32 DensityIndex = static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt);
+            const uint64 Calls = Profile.Calls[DensityIndex];
+            const uint64 Lookups = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::TunnelCacheLookup)];
+            const uint64 Hits = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::TunnelCacheHit)];
+            const uint64 SdfBuilds = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::SdfCacheBuild)];
+            const double DensityUs = static_cast<double>(Profile.Cycles[DensityIndex])
+                * FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeLODProfile] level=%d step=%d cells=%d banded=%d seconds=%.6f density_calls=%llu "
+                     "density_us_per_call=%.3f sdf_builds=%llu cache_lookups=%llu cache_hits=%llu cache_misses=%llu "
+                     "hit_rate=%.3f vertices=%d triangles=%d mesh_empty=%d"),
+                Level, Step, Cells, bBanded ? 1 : 0, Seconds,
+                static_cast<unsigned long long>(Calls),
+                Calls > 0 ? DensityUs / static_cast<double>(Calls) : 0.0,
+                static_cast<unsigned long long>(SdfBuilds),
+                static_cast<unsigned long long>(Lookups),
+                static_cast<unsigned long long>(Hits),
+                static_cast<unsigned long long>(Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::TunnelCacheMiss)]),
+                Lookups > 0 ? static_cast<double>(Hits) / static_cast<double>(Lookups) : 0.0,
+                Mesh.Vertices.Num(), Mesh.Triangles.Num() / 3,
+                Mesh.IsEmpty() ? 1 : 0);
+        }
+        VoxelDensityProfile::SetEnabled(false);
+    }
 
     FExploreRunOutput Output;
     if (Budget.ShouldStop(TEXT("setup")))
@@ -4044,5 +4110,48 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         FPlatformTime::Seconds() - MainStartSeconds,
         *ReportPath,
         (bPayloadRepeatEqual && bFinalRepeatEqual) ? TEXT("yes") : TEXT("no"));
+
+    if (Arguments.bProfileDensity)
+    {
+        const VoxelDensityProfile::FSnapshot Profile = VoxelDensityProfile::Snapshot();
+        const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
+        const uint64 DensityCalls = Profile.Calls[static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
+        const uint64 DensityCycles = Profile.Cycles[static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
+        const double DensityTotalUs = static_cast<double>(DensityCycles) * CycleToMicroseconds;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeDensityProfile] total calls=%llu total_us=%.3f us_per_call=%.6f"),
+            static_cast<unsigned long long>(DensityCalls), DensityTotalUs,
+            DensityCalls > 0 ? DensityTotalUs / static_cast<double>(DensityCalls) : 0.0);
+
+        for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
+        {
+            const VoxelDensityProfile::ECounter Counter =
+                static_cast<VoxelDensityProfile::ECounter>(Index);
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeDensityProfile] counter=%s value=%llu per_density_call=%.3f"),
+                VoxelDensityProfile::CounterName(Counter),
+                static_cast<unsigned long long>(Profile.Counters[Index]),
+                DensityCalls > 0
+                    ? static_cast<double>(Profile.Counters[Index])
+                        / static_cast<double>(DensityCalls)
+                    : 0.0);
+        }
+
+        for (int32 Index = 0; Index < VoxelDensityProfile::BucketCount; ++Index)
+        {
+            const uint64 Calls = Profile.Calls[Index];
+            if (Calls == 0 || Index == static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt))
+            {
+                continue;
+            }
+            const double TotalUs = static_cast<double>(Profile.Cycles[Index]) * CycleToMicroseconds;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeDensityProfile] op=%s calls=%llu total_us=%.3f us_per_call=%.6f"),
+                VoxelDensityProfile::BucketName(static_cast<VoxelDensityProfile::EBucket>(Index)),
+                static_cast<unsigned long long>(Calls), TotalUs,
+                TotalUs / static_cast<double>(Calls));
+        }
+        VoxelDensityProfile::SetEnabled(false);
+    }
     return bRequestedModeFailed ? 2 : 0;
 }

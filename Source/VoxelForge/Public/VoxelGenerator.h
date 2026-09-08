@@ -45,6 +45,11 @@ namespace VoxelGenLOD
     // (generator + mesher) are inside this module, so no export is needed anyway.
     extern thread_local int32 OctaveBias;
 
+    // Sampling step of the tile currently being meshed on this worker.  GetDensityAt itself has
+    // no Step parameter because callers outside the mesher are point queries; this TLS is only a
+    // read-only hint for caches that may safely widen their spatial window for coarse tiles.
+    extern thread_local int32 SampleStep;
+
     // Effective octave count for a per-voxel noise call site.
     // At least 1 octave always survives (the coarse base shape).
     FORCEINLINE int32 Eff(int32 Octaves) { return FMath::Max(1, Octaves - OctaveBias); }

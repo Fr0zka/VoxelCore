@@ -8,6 +8,7 @@
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
 #include "VoxelDensityPrimitives.h"  // Shared passage carve polarity/strength
+#include "VoxelDensityProfile.h"  // Opt-in targeted per-voxel attribution
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 #include "UObject/UObjectGlobals.h"
@@ -1687,6 +1688,12 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     // The shortlist is rebuilt once for a (manager, version, chunk) and is shared by the tube,
     // landing, and floor paths. No source-fit stencil or topology search is allowed below it.
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    if (VoxelDensityProfile::IsEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::PassageCandidates,
+            static_cast<uint64>(Nearby.Num()));
+    }
 
     if (Nearby.Num() == 0) return FLT_MAX;   // no passage near this chunk → no carve
 
@@ -1707,6 +1714,11 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         // capsule chain unconditionally — the dominant lag source once passages became
         // 12-segment worms. Now far passages cost a single squared-distance compare.
         if (FVector::DistSquared(Pos, P.BoundCenter) > P.BoundRadiusSq) continue;
+        if (VoxelDensityProfile::IsEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::PassageEvaluated);
+        }
 
         if (P.ControlPoints.Num() >= 2)
         {
@@ -1748,6 +1760,8 @@ void UVoxelStrateManager::ApplyPassageModifier(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageModifier);
     const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
     VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
     ApplyPassageLandingAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
@@ -1781,10 +1795,22 @@ void UVoxelStrateManager::ApplyPassageModifier(
     ApplyPassageTunnelAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
 }
 
+void UVoxelStrateManager::ApplyPassageCarvingOnly(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageModifier);
+    const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
+    VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
+}
+
 void UVoxelStrateManager::ApplyPassageLandingAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageLandingAir);
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
@@ -1846,6 +1872,8 @@ void UVoxelStrateManager::ApplyPassageTunnelAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageTunnelAir);
     const FVector Position(WorldX, WorldY, WorldZ);
     int32 PassageIndex = INDEX_NONE;
     float FloorZ = 0.0f;
@@ -1874,6 +1902,8 @@ void UVoxelStrateManager::ApplyPassageTunnelAirMC(
 void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ, float BaseDensity) const
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageLandingFloor);
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
@@ -1914,10 +1944,102 @@ static bool VF_IsPassageRoomFloor(
             <= FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
 }
 
+void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageStructuralPosts);
+
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    if (Nearby.Num() == 0) return;
+
+    const FVector Position(WorldX, WorldY, WorldZ);
+    const bool bSuppressFloor =
+        VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
+    bool bAnyPassageFloor = false;
+    bool bAnyRoomFloor = false;
+    bool bWalkableAir = false;
+    float MinLandingSDF = FLT_MAX;
+
+    // The four old MC backstops all walked the same immutable per-chunk shortlist. Gather their
+    // predicates in one pass; the writes below retain the old order (landing air, landing floor,
+    // tunnel air, room floor), including the vertical-shaft floor suppression marker.
+    for (const int32 PassageIndex : Nearby)
+    {
+        if (!Passages.IsValidIndex(PassageIndex)) continue;
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+
+        if (!bSuppressFloor
+            && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+                || VF_IsWalkableTunnelFloor(Passage, Position)))
+        {
+            bAnyPassageFloor = true;
+        }
+
+        if (!bSuppressFloor
+            && (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
+                || VF_IsPassageRoomFloor(Position, Passage.LowerLanding)))
+        {
+            bAnyRoomFloor = true;
+        }
+
+        if (!bWalkableAir
+            && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq
+            && VF_IsWalkableTunnelAir(Passage, Position))
+        {
+            bWalkableAir = true;
+        }
+
+        if (FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq)
+        {
+            const FVoxelPassageLanding* Landings[] = {
+                &Passage.UpperLanding, &Passage.LowerLanding };
+            for (const FVoxelPassageLanding* Landing : Landings)
+            {
+                MinLandingSDF = FMath::Min(
+                    MinLandingSDF,
+                    VF_EvaluatePassageLandingSDF(Position, *Landing));
+            }
+        }
+    }
+
+    if (!bAnyPassageFloor && MinLandingSDF < FLT_MAX)
+    {
+        float InternalDensity = -Density;
+        VF_ApplyPassageLandingCarving(
+            InternalDensity, MinLandingSDF, BaseDensity, SealThickness);
+        Density = -InternalDensity;
+    }
+
+    if (bAnyPassageFloor)
+    {
+        Density = FMath::Min(Density, -BaseDensity);
+    }
+
+    if (bWalkableAir)
+    {
+        Density = FMath::Max(
+            Density, BaseDensity * 2.0f + SealThickness + 4.0f);
+    }
+
+    if (bAnyRoomFloor)
+    {
+        Density = FMath::Min(Density, -BaseDensity);
+    }
+}
+
 void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity) const
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::PassageLandingRoomFloor);
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include <atomic>
 #include "VoxelTypes.h"   // Pour FVoxelMeshData, CHUNK_SIZE, VOXEL_SIZE, etc.
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.generated.h"
@@ -87,6 +88,20 @@ public:
     const UVoxelGenerator* Generator = nullptr;
 
     void SetGenerator(const UVoxelGenerator* InGenerator) { Generator = InGenerator; }
+
+    // AVoxelWorld installs its bShuttingDown flag here. The commandlet path leaves it null.
+    // This is intentionally read-only: workers may observe shutdown, but never mutate world state.
+    void SetShutdownFlag(const std::atomic<bool>* InShutdownFlag) { ShutdownFlag = InShutdownFlag; }
+
+private:
+    FORCEINLINE bool ShouldAbortWork() const
+    {
+        return ShutdownFlag && ShutdownFlag->load(std::memory_order_relaxed);
+    }
+
+    const std::atomic<bool>* ShutdownFlag = nullptr;
+
+public:
 
     //=========================================================================
     // SETTINGS

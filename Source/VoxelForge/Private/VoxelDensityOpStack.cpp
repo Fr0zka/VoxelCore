@@ -340,7 +340,6 @@ namespace
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
-
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             if (!(Strength > 0.0f)) { return; }
@@ -1816,7 +1815,9 @@ namespace
         {
             if (const UVoxelStrateManager* LiveManager = Manager.Get())
             {
-                LiveManager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
+                // Landing/tunnel support is a shared MC-space post after disturbances. Calling the
+                // legacy full modifier here repeats those same writers before the shared post.
+                LiveManager->ApplyPassageCarvingOnly(InOut.Density, X, Y, Z, Base, Seal);
             }
             // Keep the source and op-stack operation order identical: the origin room is carved
             // before the boundary seal, then its support floor is reasserted after the passage
@@ -2780,6 +2781,85 @@ namespace
         uint32 Salt;
     };
 
+    // The mesher's coarse samples are sparse enough that one sample can land in a different
+    // exact 32-voxel chunk every time.  Keeping one SDF cache inside every exact-chunk op-stack
+    // therefore turns L4 into thousands of BuildChunkCache calls.  These worker-local entries
+    // share the immutable room graph cache by its complete deterministic input key.  A wider
+    // region is safe because BuildChunkCache's collect/store construction is window-invariant;
+    // the key still includes every value that can change the graph or its terrain-op rolls.
+    constexpr int32 RoomGraphCacheSlotCount = 128;
+
+    struct FRoomGraphCacheEntry
+    {
+        bool bValid = false;
+        uint32 Seed = 0;
+        int32 StrateIndex = INT32_MIN;
+        uint32 ParamsFingerprint = 0xFFFFFFFFu;
+        uint32 LayoutVersion = 0xFFFFFFFFu;
+        uint64 ManagerLifetimeId = 0;
+        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+        int32 RegionMinX = 0;
+        int32 RegionMinY = 0;
+        int32 RegionSize = 0;
+        FChunkSDFCache Cache;
+    };
+
+    static thread_local FRoomGraphCacheEntry GRoomGraphCache[RoomGraphCacheSlotCount];
+
+    FORCEINLINE int32 RoomGraphCacheSlot(
+        uint32 Seed, int32 StrateIndex, uint32 ParamsFingerprint, uint32 LayoutVersion,
+        uint64 ManagerLifetimeId, int32 RegionMinX, int32 RegionMinY, int32 RegionSize)
+    {
+        uint32 Hash = Seed * 0x9E3779B9u;
+        Hash ^= static_cast<uint32>(StrateIndex) * 0x85EBCA6Bu;
+        Hash ^= ParamsFingerprint * 0xC2B2AE35u;
+        Hash ^= LayoutVersion * 0x27D4EB2Fu;
+        Hash ^= static_cast<uint32>(ManagerLifetimeId)
+            ^ static_cast<uint32>(ManagerLifetimeId >> 32);
+        Hash ^= static_cast<uint32>(RegionMinX) * 0x165667B1u;
+        Hash ^= static_cast<uint32>(RegionMinY) * 0xD3A2646Cu;
+        Hash ^= static_cast<uint32>(RegionSize) * 0xFD7046C5u;
+        Hash ^= Hash >> 16;
+        return static_cast<int32>(Hash & (RoomGraphCacheSlotCount - 1));
+    }
+
+    FRoomGraphCacheEntry* FindRoomGraphCacheEntry(
+        uint32 Seed, int32 StrateIndex, uint32 ParamsFingerprint, uint32 LayoutVersion,
+        uint64 ManagerLifetimeId, const TArray<FStrateTerrainOpEntry>* TerrainOps,
+        int32 RegionMinX, int32 RegionMinY, int32 RegionSize)
+    {
+        const int32 StartSlot = RoomGraphCacheSlot(
+            Seed, StrateIndex, ParamsFingerprint, LayoutVersion, ManagerLifetimeId,
+            RegionMinX, RegionMinY, RegionSize);
+        FRoomGraphCacheEntry* ReuseEntry = nullptr;
+        for (int32 Probe = 0; Probe < RoomGraphCacheSlotCount; ++Probe)
+        {
+            FRoomGraphCacheEntry& Candidate = GRoomGraphCache[
+                (StartSlot + Probe) & (RoomGraphCacheSlotCount - 1)];
+            if (!Candidate.bValid)
+            {
+                return ReuseEntry != nullptr ? ReuseEntry : &Candidate;
+            }
+            if (Candidate.Seed == Seed
+                && Candidate.StrateIndex == StrateIndex
+                && Candidate.ParamsFingerprint == ParamsFingerprint
+                && Candidate.LayoutVersion == LayoutVersion
+                && Candidate.ManagerLifetimeId == ManagerLifetimeId
+                && Candidate.TerrainOps == TerrainOps
+                && Candidate.RegionMinX == RegionMinX
+                && Candidate.RegionMinY == RegionMinY
+                && Candidate.RegionSize == RegionSize)
+            {
+                return &Candidate;
+            }
+            if (ReuseEntry == nullptr && Candidate.ManagerLifetimeId != ManagerLifetimeId)
+            {
+                ReuseEntry = &Candidate;
+            }
+        }
+        return ReuseEntry != nullptr ? ReuseEntry : &GRoomGraphCache[StartSlot];
+    }
+
     //=========================================================================
     // RÔLE 1 — SOURCE : GRAPHE DE SALLES / ROOM GRAPH  (TunnelNetwork)
     //=========================================================================
@@ -2833,29 +2913,17 @@ namespace
         // Dans l'original tout cela vit dans des `thread_local` d'une seule fonction de 1080 lignes ;
         // ici la source les possède et les expose.
         //
-        // ⚠️ `static` (donc PARTAGÉ ENTRE INSTANCES), pas un membre : c'est exactement ce que fait
-        // l'original, et le contrôle 3 du test en DÉPEND — deux piles construites côte à côte se
-        // partagent ce cache, et c'est l'empreinte de params dans la clé (pas une copie par pile) qui
-        // les empêche de se servir mutuellement leurs salles. En faire un membre ferait passer ce
-        // contrôle pour de mauvaises raisons.
-        //
-        // ⚠️ MÊME MOTIF QUE `FOverhangShelfMod` ← `FSurfaceColumnSource` et `FShaftLedgeMod` ←
-        // `FShaftFieldSource` : un opérateur possède l'état, les autres le lisent par pointeur non
-        // possédant remis à la construction. C'est un motif ÉTABLI dans ce fichier, pas une invention.
-        //
-        // Per-worker state, deliberately `static` (shared between instances) because that is what the
-        // original does and what the test's stale-cache check rests on. Detail ops read it through a
-        // non-owning pointer, the same way the surface and shaft ports already do.
+        // The state belongs to this source instance. The outer tunnel cache retains the immutable
+        // op stack, so retaining the source's prepared SDF window with that stack avoids rebuilding
+        // the room graph every time a coarse tile switches between cached chunk keys. It remains
+        // worker-local because each op stack lives in the thread-local density cache.
         struct FState
         {
+            // Fallback only for the invalid-owner path. Normal evaluations point at the worker-local
+            // shared cache bank below, so switching exact chunk op-stacks does not rebuild the room
+            // graph merely because the stack object changed.
             FChunkSDFCache Cache;
-            float  CachedSMinX = 1.0f, CachedSMaxX = -1.0f;   // invalide au départ (min > max)
-            float  CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
-            int32  CachedStrate = INT32_MIN;
-            uint32 CachedSeed = 0;
-            uint32 CachedFingerprint = 0xFFFFFFFFu;
-            uint32 CachedLayout = 0xFFFFFFFFu;
-            uint64 CachedManagerLifetimeId = 0;
+            const FChunkSDFCache* ActiveCache = nullptr;
 
             /** La salle de SDF minimal pour le dernier voxel évalué. -1 = aucune. */
             int32 NearestRoom = -1;
@@ -2874,14 +2942,23 @@ namespace
             bool bLocalParamsValid = false;
         };
 
-        static FState& State()
+        FState& State() const
         {
-            thread_local FState S;
-            return S;
+            // The prepared SDF data lives in the worker-local keyed cache bank above.  This state
+            // is only scratch for the current EvalSample: Eval resets NearestRoom and the local
+            // parameter memo before its detail ops consume them.  A single TLS slot is therefore
+            // safe even when this worker switches between immutable source instances, and avoids
+            // a map lookup on every sample.  A mutable member is not safe because stacks can be
+            // shared by concurrent readers during generation.
+            static thread_local FState Scratch;
+            return Scratch;
         }
 
         /** Le cache que la source vient de bâtir/servir pour ce voxel. Lu par les colonnes (4d). */
-        const FChunkSDFCache& GetCache() const { return State().Cache; }
+        const FChunkSDFCache& GetCache() const
+        {
+            return State().ActiveCache != nullptr ? *State().ActiveCache : State().Cache;
+        }
 
         /** L'index de la salle la plus proche pour le dernier voxel évalué. -1 = aucune.
          *  Lu par les arches, les dômes, le pincement et le biais de sol. */
@@ -2896,7 +2973,7 @@ namespace
         {
             const FVector& Position = State().LastWorldPosition;
             return VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
-                Position.X, Position.Y, Position.Z, State().Cache);
+                Position.X, Position.Y, Position.Z, GetCache());
         }
 
         /**
@@ -2933,9 +3010,10 @@ namespace
             if (!S.bLocalParamsValid)
             {
                 S.LocalParams = P;
-                if (S.NearestRoom >= 0 && S.Cache.Rooms.IsValidIndex(S.NearestRoom))
+                const FChunkSDFCache& Cache = GetCache();
+                if (S.NearestRoom >= 0 && Cache.Rooms.IsValidIndex(S.NearestRoom))
                 {
-                    const FCachedRoom& NR = S.Cache.Rooms[S.NearestRoom];
+                    const FCachedRoom& NR = Cache.Rooms[S.NearestRoom];
                     if (NR.RoomOp)
                     {
                         // N'écrit que les champs propres au type de l'op ; tout le reste garde la
@@ -2964,7 +3042,7 @@ namespace
          */
         float ProbeSdfUnwarped(float X, float Y, float Z) const
         {
-            return VoxelCaveMorphology::EvaluateSDFCached(X, Y, Z, State().Cache, P.SDFBlendRadius);
+            return VoxelCaveMorphology::EvaluateSDFCached(X, Y, Z, GetCache(), P.SDFBlendRadius);
         }
 
         /** Le Z « effectif » : `VerticalScale` étire le monde AVANT le bruit. Pure fonction de Z et
@@ -3002,11 +3080,16 @@ namespace
             if (ManagerLifetimeId != 0 && LiveManager == nullptr)
             {
                 S.Cache = FChunkSDFCache();
+                S.ActiveCache = &S.Cache;
                 InOut.Sdf = FLT_MAX;
                 return;
             }
 
-            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f)) { return; }   // Sdf reste FLT_MAX
+            if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f))
+            {
+                S.ActiveCache = &S.Cache;
+                return;   // Sdf reste FLT_MAX
+            }
 
             const float EffectiveZ = EffZ(WorldZ);
 
@@ -3078,51 +3161,78 @@ namespace
                 StrateIdx = SI_Index;
             }
 
-            const bool bNeedRebuild =
-                StrateIdx != S.CachedStrate || SeedU != S.CachedSeed ||
-                ParamsFingerprint != S.CachedFingerprint || LayoutVersion != S.CachedLayout ||
-                ManagerLifetimeId != S.CachedManagerLifetimeId ||
-                WarpedX < S.CachedSMinX || WarpedX > S.CachedSMaxX ||
-                WarpedY < S.CachedSMinY || WarpedY > S.CachedSMaxY;
+            // A coarse LOD samples a new exact 32-voxel chunk at nearly every point.  The graph is
+            // window-invariant, so group those samples into a larger deterministic XY region.  The
+            // step is supplied by the mesher through VoxelGenLOD TLS; ordinary point queries keep
+            // the original one-chunk window.  The cache key retains the exact params/strate/op-pool
+            // identity, so no blended chunk can borrow another chunk's room graph.
+            const int32 SampleStep = FMath::Max(VoxelGenLOD::SampleStep, 1);
+            const int32 RegionChunks = SampleStep <= 1
+                ? 1
+                : SampleStep >= 32
+                    ? 4
+                    : FMath::Clamp((SampleStep + 3) / 4, 1, 4);
+            const int32 RegionSize = CHUNK_SIZE * RegionChunks;
+            const int32 RegionCellX = FMath::FloorToInt(WorldX / (float)RegionSize);
+            const int32 RegionCellY = FMath::FloorToInt(WorldY / (float)RegionSize);
+            const int32 RegionMinX = RegionCellX * RegionSize;
+            const int32 RegionMinY = RegionCellY * RegionSize;
 
-            if (bNeedRebuild)
+            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+            if (LiveManager)
             {
-                const int32 CacheChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
-                const int32 CacheChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
-                const float ChunkMinX = CacheChunkX * (float)CHUNK_SIZE;
-                const float ChunkMinY = CacheChunkY * (float)CHUNK_SIZE;
-                const float ChunkMaxX = ChunkMinX + (float)CHUNK_SIZE;
-                const float ChunkMaxY = ChunkMinY + (float)CHUNK_SIZE;
-                const float Expansion = P.CaveWarpStrength + 2.0f;
-
-                const float SMinX = ChunkMinX - Expansion;
-                const float SMinY = ChunkMinY - Expansion;
-                const float SMaxX = ChunkMaxX + Expansion;
-                const float SMaxY = ChunkMaxY + Expansion;
-
-                const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-                if (LiveManager)
-                {
-                    const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
-                    UVoxelStrateDefinition* Def = LiveManager->GetStrateForChunk(
-                        FIntVector(CacheChunkX, CacheChunkY, ChunkZ));
-                    if (Def) { TerrainOps = &Def->TerrainOperations; }
-                }
-
-                VoxelCaveMorphology::BuildChunkCache(
-                    S.Cache, SMinX, SMinY, SMaxX, SMaxY, P, SeedU, StrateIdx, TerrainOps);
-
-                S.CachedSMinX = SMinX; S.CachedSMaxX = SMaxX;
-                S.CachedSMinY = SMinY; S.CachedSMaxY = SMaxY;
-                S.CachedStrate = StrateIdx;
-                S.CachedSeed = SeedU;
-                S.CachedFingerprint = ParamsFingerprint;
-                S.CachedLayout = LayoutVersion;
-                S.CachedManagerLifetimeId = ManagerLifetimeId;
+                const int32 ChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
+                const int32 ChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
+                const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+                UVoxelStrateDefinition* Def = LiveManager->GetStrateForChunk(
+                    FIntVector(ChunkX, ChunkY, ChunkZ));
+                if (Def) { TerrainOps = &Def->TerrainOperations; }
             }
 
+            FRoomGraphCacheEntry* SharedCache = FindRoomGraphCacheEntry(
+                SeedU, StrateIdx, ParamsFingerprint, LayoutVersion, ManagerLifetimeId,
+                TerrainOps, RegionMinX, RegionMinY, RegionSize);
+            const bool bCacheMatches = SharedCache->bValid
+                && SharedCache->Seed == SeedU
+                && SharedCache->StrateIndex == StrateIdx
+                && SharedCache->ParamsFingerprint == ParamsFingerprint
+                && SharedCache->LayoutVersion == LayoutVersion
+                && SharedCache->ManagerLifetimeId == ManagerLifetimeId
+                && SharedCache->TerrainOps == TerrainOps
+                && SharedCache->RegionMinX == RegionMinX
+                && SharedCache->RegionMinY == RegionMinY
+                && SharedCache->RegionSize == RegionSize;
+            if (!bCacheMatches)
+            {
+                if (VoxelDensityProfile::IsEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::SdfCacheBuild);
+                }
+                SharedCache->bValid = false;
+                SharedCache->Seed = SeedU;
+                SharedCache->StrateIndex = StrateIdx;
+                SharedCache->ParamsFingerprint = ParamsFingerprint;
+                SharedCache->LayoutVersion = LayoutVersion;
+                SharedCache->ManagerLifetimeId = ManagerLifetimeId;
+                SharedCache->TerrainOps = TerrainOps;
+                SharedCache->RegionMinX = RegionMinX;
+                SharedCache->RegionMinY = RegionMinY;
+                SharedCache->RegionSize = RegionSize;
+                const float Expansion = P.CaveWarpStrength + 2.0f;
+                VoxelCaveMorphology::BuildChunkCache(
+                    SharedCache->Cache,
+                    (float)RegionMinX - Expansion,
+                    (float)RegionMinY - Expansion,
+                    (float)(RegionMinX + RegionSize) + Expansion,
+                    (float)(RegionMinY + RegionSize) + Expansion,
+                    P, SeedU, StrateIdx, TerrainOps);
+                SharedCache->bValid = true;
+            }
+            S.ActiveCache = &SharedCache->Cache;
+
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
-                WarpedX, WarpedY, WarpedZ, S.Cache, P.SDFBlendRadius, &S.NearestRoom);
+                WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius, &S.NearestRoom);
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -3132,7 +3242,7 @@ namespace
             // mais à des coordonnées NON warpées. Sous un modèle de frames il aurait fallu les sortir
             // du frame tout en gardant le canal — exprimable, mais tordu. Dans un opérateur unique la
             // difficulté disparaît : le warp est une variable locale, pas un contexte hérité.
-            for (const FCachedPit& Pit : S.Cache.Pits)
+            for (const FCachedPit& Pit : GetCache().Pits)
             {
                 const float DZ = WorldZ - Pit.TopZ;
                 if (DZ >= Pit.BlendK) { continue; }
@@ -3160,7 +3270,7 @@ namespace
                 CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
             }
 
-            for (const FCachedChimney& Chim : S.Cache.Chimneys)
+            for (const FCachedChimney& Chim : GetCache().Chimneys)
             {
                 const float DZ = WorldZ - Chim.BottomZ;
                 if (-DZ >= Chim.BlendK) { continue; }
@@ -3641,7 +3751,7 @@ namespace
         {
             const FVector& Position = State().LastWorldPosition;
             return VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-                Position.X, Position.Y, Position.Z, State().Cache);
+                Position.X, Position.Y, Position.Z, GetCache());
         }
 
     private:
@@ -3820,6 +3930,7 @@ namespace
         EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("CaveRoughnessMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4017,6 +4128,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("CaveTerraceMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4127,6 +4239,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("LayerLineMod"); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4216,6 +4329,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("RibbingMod"); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4300,6 +4414,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("CaveOverhangMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4401,6 +4516,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("CaveCliffMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4476,6 +4592,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("ScallopMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4568,6 +4685,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("CaveArchMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4685,6 +4803,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("RoomColumnMod"); }
 
         void Eval(float WorldX, float WorldY, float, FVoxelOpSample& InOut) const override
         {
@@ -4749,6 +4868,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("DomeMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4857,6 +4977,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("PinchMod"); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -4977,6 +5098,7 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        const TCHAR* DebugName() const override { return TEXT("FloorBiasMod"); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -5815,10 +5937,9 @@ namespace VoxelDensityOps
             OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                           P.BoundarySealThickness, P.BaseDensity,
                                           SpineRadius, StrateManager, false);
-            OutStack.Add(MakeUnique<FCaveTunnelFloorOp>(RoomPtr, P.BaseDensity));
-            OutStack.Add(MakeUnique<FCaveTunnelAirOp>(
-                RoomPtr, P.BaseDensity,
-                VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels));
+            // The generator's shared MC post evaluates the prepared tunnel-core cache after
+            // disturbances. Keeping these pre-disturbance graph scans here duplicated both the
+            // support and air queries for every voxel; the feature remains in that shared post.
             OutStack.Add(MakeUnique<FXYEdgeSealOp>(P.BaseDensity));
         }
     }

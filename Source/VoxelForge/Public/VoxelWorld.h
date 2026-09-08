@@ -84,6 +84,7 @@ struct FChunkResult
     // Null ⇒ empty/all-air tile (no component).
     TSharedPtr<RealtimeMesh::FRealtimeMeshStreamSet> Streams;
     uint32 Epoch = 0;         // Generation epoch — discard if stale
+    bool bAborted = false;    // Worker observed shutdown; never mark this tile loaded
     bool bEmpty = true;       // true ⇒ all-air tile (Streams null); still marked loaded so we don't re-submit
     // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
     // column's CeilSurf; overhangs/cave roofs stay ground) and packs them as two contiguous runs
