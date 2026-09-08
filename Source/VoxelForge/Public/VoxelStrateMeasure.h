@@ -35,7 +35,12 @@ struct VOXELFORGE_API FVoxelPlayerCapsuleConstants
     static constexpr float HeightVoxels = VoxelPassageGeometry::PlayerHeightVoxels;
 };
 
-/** Read-only density source used by the offline Tier 2 pass for a materialised custom stack. */
+/**
+ * Read-only density source used by the offline Tier 2 pass for a materialised custom stack.
+ *
+ * SampleDensity is called concurrently during grid sampling; implementations must be const,
+ * re-entrant, and safe for concurrent read-only calls, just like UVoxelGenerator::GetDensityAt.
+ */
 class VOXELFORGE_API IVoxelStrateDensitySampler
 {
 public:
@@ -70,7 +75,7 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     TOptional<FVector2D> CoverPointB;
     float CoverMarginVoxels = 48.0f;
     // Origin-rooted topologies can route from one mouth to the other through the finite (0,0)
-    // landing room and its explicitly carved connector network.
+    // landing room and its local room/join geometry. There is no hidden radial connector network.
     // When true, include (0,0) in the fitted AABB before applying MaxCells. A caller must keep
     // this enabled for that topology; an over-cap route window is then refused honestly instead
     // of being cropped back to a mouth-only box.

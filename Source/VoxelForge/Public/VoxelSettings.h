@@ -393,9 +393,10 @@ public:
 	//=========================================================================
 
     // Authored radius (voxels) of the guaranteed (0,0) landing room in EVERY strate, regardless
-    // of archetype. The §6.5 body-sized formulas turn it into a flat-floored room; this setting
-    // no longer bores a vertical column. 0 = disabled. The room is top-anchored inside each
-    // strate, and the seals remain solid until a progression passage is opened.
+    // of archetype. The §6.5 body-sized formulas turn it into a flat-floored room reserved for a
+    // future straight shaft of diameter 2 * this radius. At the default 14-voxel radius that is
+    // 28 voxels / 7 m, with a three-voxel / 0.75 m floor ledge around it. This setting does not bore the
+    // shaft today: lower seals remain solid until a progression passage is opened.
     //   10-14 → compact landing room (default) · 20+ → broad landing room
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Spine", meta = (ClampMin = "0.0"))
 	float OriginSpineRadius = 14.0f;

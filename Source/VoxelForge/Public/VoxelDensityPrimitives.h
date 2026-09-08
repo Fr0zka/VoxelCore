@@ -141,7 +141,10 @@ FORCEINLINE void VF_ApplyOriginSpine(float& Density, float WorldX, float WorldY,
         && FMath::Abs(WorldX) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f)
         && FMath::Abs(WorldY) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f))
     {
-        Density = FMath::Max(Density, BaseDensity);
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker())
+        {
+            Density = FMath::Max(Density, BaseDensity);
+        }
     }
 }
 
@@ -176,7 +179,10 @@ FORCEINLINE void VF_ApplyOriginLandingFloor(float& Density,
         && FMath::Abs(WorldX) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f)
         && FMath::Abs(WorldY) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f))
     {
-        Density = FMath::Max(Density, BaseDensity);
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker())
+        {
+            Density = FMath::Max(Density, BaseDensity);
+        }
     }
 }
 

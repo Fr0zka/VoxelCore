@@ -24,6 +24,11 @@ namespace VoxelPassageGeometry
     constexpr float SealSafetyMarginVoxels = 4.0f;
     constexpr float RoomRoundingVoxels = 1.5f;
     constexpr float LandingCarveBlendVoxels = 4.0f;
+    // The origin landing is reserved for the same straight spine that the vertical-shaft
+    // generator uses: OriginSpineRadius on each side, with a three-voxel / 0.75 m floor ledge
+    // around it after the support patch's one-voxel inset. At the default radius (14 voxels) this
+    // is a 28-voxel / 7 m future shaft diameter.
+    constexpr float OriginShaftFloorClearanceVoxels = 4.0f;
     // Level tunnel apron outside each room-floor edge.  It covers the room/tunnel SDF blend and
     // keeps the ramp from starting while the route is still over the room's square support patch.
     constexpr float WalkableTunnelLandingApronVoxels = 6.0f; // 1.5 m
@@ -33,17 +38,15 @@ namespace VoxelPassageGeometry
     // ownership band: the floor writer owns the plane, while the air writer owns the capsule
     // volume above it even when two overlapping passage projections differ by a fraction.
     constexpr float WalkableTunnelFloorAirClearanceVoxels = 0.5f;
+    // The graph-tunnel post owns the interior above its floor after terrain and passage-floor
+    // writers have run. The support-floor predicate is also an exclusion mask for the air post,
+    // so overlapping graph tubes cannot erase one another's walkable support band.
+    constexpr float CaveTunnelAirCoreInsetVoxels = 0.5f;
 
     // A 15 degree ramp is comfortably below the 44 degree engine walkability ceiling.  The
     // latter is a scramble limit, not a sensible default for a tunnel the player walks through.
     constexpr float WalkableTunnelMaxGradientDegrees = 15.0f;
     constexpr float WalkableTunnelMaxGradient = 0.2679491924311227f; // tan(15 degrees)
-
-    // The network connector retains the §6.5 single-file dimensions: 2.5 m clear width and 3 m
-    // clear height.  These values are in voxels because all passage descriptors are voxel-space.
-    constexpr float ConnectorRadiusVoxels = 5.0f;
-    constexpr float ConnectorHeightVoxels = 12.0f;
-    constexpr float RootOverlapVoxels = 2.25f;
 
     // The walkability contract is about the floor carried by the tube, not only its centreline.
     // A tapered tube changes that floor by the radius delta, so the construction and the audit
@@ -51,6 +54,204 @@ namespace VoxelPassageGeometry
     FORCEINLINE float TunnelFloorZ(const FVector& Centreline, float Radius)
     {
         return Centreline.Z - FMath::Abs(Radius);
+    }
+
+    // Vertical-shaft tree links are round air capsules, but the player-fit graph needs a
+    // deterministic support plane to walk between shafts. Keep that plane on the first
+    // seal-safe ledge shared by the whole strate, so every tree edge has the same walk level.
+    // This is shaft-network support, not an origin landing connector.
+    FORCEINLINE float VerticalShaftConnectorFloorThickness(float Radius)
+    {
+        return FMath::Min(
+            LandingFloorThicknessVoxels,
+            FMath::Max(0.5f, FMath::Abs(Radius) * 0.5f));
+    }
+
+    FORCEINLINE float VerticalShaftConnectorFloorZ(
+        float StrateBottomZ,
+        float InteriorBottomZ,
+        float InteriorTopZ,
+        float LedgeSpacing,
+        float LedgeDepth,
+        float ConnectorRadius)
+    {
+        const float FloorThickness = VerticalShaftConnectorFloorThickness(ConnectorRadius);
+        const float MinimumFloor = InteriorBottomZ
+            + FloorThickness + SealSafetyMarginVoxels;
+        const float MaximumFloor = InteriorTopZ
+            - PlayerHeightVoxels - SealSafetyMarginVoxels;
+        if (!FMath::IsFinite(StrateBottomZ)
+            || !FMath::IsFinite(InteriorBottomZ)
+            || !FMath::IsFinite(InteriorTopZ)
+            || !FMath::IsFinite(LedgeSpacing)
+            || !FMath::IsFinite(LedgeDepth)
+            || !FMath::IsFinite(MinimumFloor)
+            || !FMath::IsFinite(MaximumFloor)
+            || !(MaximumFloor > MinimumFloor))
+        {
+            return 0.5f * (InteriorBottomZ + InteriorTopZ);
+        }
+
+        if (LedgeSpacing > 0.0f && LedgeDepth > 0.0f)
+        {
+            const float RelativeBottom = InteriorBottomZ - StrateBottomZ;
+            const int32 FirstPeriod = FMath::FloorToInt(RelativeBottom / LedgeSpacing);
+            // The small fixed bound keeps malformed authored values from turning generation into
+            // an unbounded search. Normal shaft strates find the first or second period.
+            constexpr int32 MaxPeriods = 64;
+            for (int32 PeriodOffset = 0; PeriodOffset < MaxPeriods; ++PeriodOffset)
+            {
+                const float PeriodStart = static_cast<float>(FirstPeriod + PeriodOffset)
+                    * LedgeSpacing;
+                const float Candidate = StrateBottomZ + PeriodStart + LedgeDepth;
+                if (Candidate > MinimumFloor && Candidate < MaximumFloor)
+                {
+                    return Candidate;
+                }
+            }
+        }
+
+        return FMath::Clamp(
+            0.5f * (InteriorBottomZ + InteriorTopZ), MinimumFloor, MaximumFloor);
+    }
+
+    FORCEINLINE float VerticalShaftConnectorCenterZ(
+        float StrateBottomZ,
+        float InteriorBottomZ,
+        float InteriorTopZ,
+        float LedgeSpacing,
+        float LedgeDepth,
+        float ConnectorRadius)
+    {
+        const float SafeRadius = FMath::Abs(ConnectorRadius);
+        const float FloorThickness = VerticalShaftConnectorFloorThickness(SafeRadius);
+        return VerticalShaftConnectorFloorZ(
+            StrateBottomZ, InteriorBottomZ, InteriorTopZ,
+            LedgeSpacing, LedgeDepth, SafeRadius)
+            + SafeRadius - FloorThickness;
+    }
+
+    /** Add a flat, inset support band below one horizontal shaft-tree capsule. */
+    FORCEINLINE void VF_ApplyVerticalShaftConnectorFloor(
+        float& Density,
+        float WorldX,
+        float WorldY,
+        float WorldZ,
+        const FVector& Start,
+        const FVector& End,
+        float Radius,
+        float FloorZ,
+        float BaseDensity)
+    {
+        const float SafeRadius = FMath::Abs(Radius);
+        const float FloorThickness = VerticalShaftConnectorFloorThickness(SafeRadius);
+        const float FloorRadius = FMath::Max(0.5f, SafeRadius - 0.5f);
+        if (!(SafeRadius > 0.0f)
+            || !(BaseDensity > 0.0f)
+            || !FMath::IsFinite(WorldX)
+            || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(WorldZ)
+            || !FMath::IsFinite(FloorZ)
+            || !FMath::IsFinite(Start.X) || !FMath::IsFinite(Start.Y)
+            || !FMath::IsFinite(End.X) || !FMath::IsFinite(End.Y))
+        {
+            return;
+        }
+
+        const FVector2D A(Start.X, Start.Y);
+        const FVector2D Delta(End.X - Start.X, End.Y - Start.Y);
+        const float LengthSquared = Delta.SizeSquared();
+        const float T = LengthSquared > KINDA_SMALL_NUMBER
+            ? FMath::Clamp(
+                FVector2D::DotProduct(FVector2D(WorldX, WorldY) - A, Delta)
+                    / LengthSquared,
+                0.0f, 1.0f)
+            : 0.0f;
+        const FVector2D Closest = A + Delta * T;
+        if ((FVector2D(WorldX, WorldY) - Closest).SizeSquared()
+                > FMath::Square(FloorRadius))
+        {
+            return;
+        }
+
+        if (WorldZ <= FloorZ + KINDA_SMALL_NUMBER
+            && WorldZ > FloorZ - FloorThickness)
+        {
+            Density = FMath::Max(Density, BaseDensity);
+        }
+    }
+
+    // ApplyVerticalShaftConnectorAir runs before the generator's shared disturbance pass.  Keep
+    // this one-bit, call-local hand-off so a bridge/ridge cannot refill the core it just opened.
+    // It is thread-local state, never a per-voxel cache, and is reset around every density query.
+    FORCEINLINE bool& VerticalShaftConnectorAirMarker()
+    {
+        static thread_local bool bMarked = false;
+        return bMarked;
+    }
+
+    FORCEINLINE void ResetVerticalShaftConnectorAirMarker()
+    {
+        VerticalShaftConnectorAirMarker() = false;
+    }
+
+    /** Reassert the walkable air core above one horizontal shaft-tree floor band. */
+    FORCEINLINE void VF_ApplyVerticalShaftConnectorAir(
+        float& Density,
+        float WorldX,
+        float WorldY,
+        float WorldZ,
+        const FVector& Start,
+        const FVector& End,
+        float Radius,
+        float FloorZ,
+        float BaseDensity)
+    {
+        const float SafeRadius = FMath::Abs(Radius);
+        // Leave a one-voxel wall band for the roughness/solid shell, while retaining more than
+        // enough width for the 1.36-voxel player capsule and its support stencil.
+        const float CoreRadius = FMath::Max(0.5f, SafeRadius - 1.0f);
+        if (!(SafeRadius > 0.0f)
+            || !(BaseDensity > 0.0f)
+            || !FMath::IsFinite(WorldX)
+            || !FMath::IsFinite(WorldY)
+            || !FMath::IsFinite(WorldZ)
+            || !FMath::IsFinite(FloorZ)
+            || !FMath::IsFinite(Start.X) || !FMath::IsFinite(Start.Y)
+            || !FMath::IsFinite(Start.Z)
+            || !FMath::IsFinite(End.X) || !FMath::IsFinite(End.Y)
+            || !FMath::IsFinite(End.Z))
+        {
+            return;
+        }
+
+        // The exact floor sample belongs to the air core's lower ownership edge. The floor
+        // writer only owns the three voxels below FloorZ, so clearing from the half-voxel band
+        // above it cannot remove support.
+        if (WorldZ + KINDA_SMALL_NUMBER
+            < FloorZ + WalkableTunnelFloorAirClearanceVoxels)
+        {
+            return;
+        }
+
+        const FVector Delta = End - Start;
+        const float LengthSquared = Delta.SizeSquared();
+        const float T = LengthSquared > KINDA_SMALL_NUMBER
+            ? FMath::Clamp(FVector::DotProduct(FVector(WorldX, WorldY, WorldZ) - Start, Delta)
+                / LengthSquared, 0.0f, 1.0f)
+            : 0.0f;
+        const FVector Closest = Start + Delta * T;
+        if ((FVector(WorldX, WorldY, WorldZ) - Closest).SizeSquared()
+            > FMath::Square(CoreRadius))
+        {
+            return;
+        }
+
+        // Internal convention: negative is air, positive is solid. This is intentionally a
+        // post-ledge write; a partial shaft shelf must not cap the tree route's player-height
+        // envelope after the capsule has already carved it.
+        VerticalShaftConnectorAirMarker() = true;
+        Density = FMath::Min(Density, -BaseDensity);
     }
 
     FORCEINLINE float TunnelFloorGradient(
@@ -194,7 +395,14 @@ namespace VoxelPassageGeometry
             return Result;
         }
 
-        Result.HalfWidth = LandingHalfWidthForRadius(OriginRadius);
+        // Keep a solid walking ledge around the future shaft, not merely a room whose wall is
+        // tangent to it. The shaft diameter is 2 * OriginRadius; the extra four voxels leave a
+        // three-voxel / 0.75 m floor margin after the support patch's one-voxel inset at the
+        // authored 25 cm scale.
+        Result.HalfWidth = FMath::Max(
+            LandingHalfWidthForRadius(OriginRadius),
+            FMath::Max(FMath::Abs(OriginRadius), 1.0f)
+                + OriginShaftFloorClearanceVoxels);
         const float DesiredHeight = LandingHeightForRadius(OriginRadius);
         const float SafeSeal = FMath::Max(SealThickness, 0.0f);
         const float InnerBottom = StrateBottomZ + SafeSeal;

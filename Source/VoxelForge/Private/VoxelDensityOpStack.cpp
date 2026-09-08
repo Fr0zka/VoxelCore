@@ -196,42 +196,6 @@ namespace
         return A + B;
     }
 
-    // Structural tree capsules must meet shaft axes without landing inside a ledge band. This is
-    // the same pure helper as the generator path: one deterministic safe interval is shared by the
-    // whole strate, so a link cannot be blocked when it crosses an unrelated shaft's ledge.
-    FORCEINLINE float VF_SelectVerticalTreeConnectorZ(
-        const FVerticalShaftParams& Params,
-        float BottomZ,
-        float TopZ,
-        uint32 LinkHash)
-    {
-        if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
-        {
-            const float Period = Params.LedgeSpacing;
-            const float RelativeBottom = BottomZ - Params.StrateBottomWorldZ;
-            const float RelativeTop = TopZ - Params.StrateBottomWorldZ;
-            const int32 FirstPeriod = FMath::FloorToInt(RelativeBottom / Period);
-            const float Random01 = VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash));
-
-            for (int32 PeriodOffset = 0; PeriodOffset <= 1; ++PeriodOffset)
-            {
-                const float PeriodStart = static_cast<float>(FirstPeriod + PeriodOffset) * Period;
-                const float SafeStart = FMath::Max(
-                    RelativeBottom, PeriodStart + Params.LedgeDepth + 0.01f);
-                const float SafeEnd = FMath::Min(
-                    RelativeTop, PeriodStart + Period - Params.LedgeDepth - 0.01f);
-                if (SafeEnd > SafeStart)
-                {
-                    return Params.StrateBottomWorldZ
-                        + FMath::Lerp(SafeStart, SafeEnd, Random01);
-                }
-            }
-        }
-
-        return FMath::Lerp(BottomZ, TopZ,
-                           VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
-    }
-
     //=========================================================================
     // RÔLE 1 — SOURCE : CHAMP CONSTANT / CONSTANT FIELD  (roc ET vide)
     //=========================================================================
@@ -1856,7 +1820,7 @@ namespace
             }
             // Keep the source and op-stack operation order identical: the origin room is carved
             // before the boundary seal, then its support floor is reasserted after the passage
-            // post so no connector can remove the standing surface.
+            // post so no passage-air post can remove the standing surface.
             VF_ApplyOriginLandingFloor(
                 InOut.Density, X, Y, Z, TopZ, BotZ, Seal, Base, SpineRadius);
         }
@@ -1925,7 +1889,13 @@ namespace
         void PrepareChunk(const FVoxelOpContext&) override {}
 
         struct FShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
-        struct FConn  { FVector A, B; float Radius; };
+        struct FConn
+        {
+            FVector A, B;
+            float Radius = 0.0f;
+            float FloorZ = 0.0f;
+            bool bWalkableFloor = false;
+        };
 
         // ⚠️ DÉCLARÉE ICI, avant toute fonction qui la renvoie. Un type imbriqué doit exister au
         // moment où le COMPILATEUR lit la SIGNATURE — les corps de méthodes sont différés, pas les
@@ -2178,17 +2148,26 @@ namespace
 
                 auto EmitTreeConnector = [&](const FShaft& Child, const FShaft* Parent)
                 {
-                    const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
-                    const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
-                    const uint32 LinkHash = VoxelHash::Pair(
-                        Child.CellX, Child.CellY, ParentCellX, ParentCellY, Salt ^ TreeSalt);
-                    const float Zc = VF_SelectVerticalTreeConnectorZ(
-                        P, BottomZ, TopZ, LinkHash);
+                    const float Zc = VoxelPassageGeometry::VerticalShaftConnectorCenterZ(
+                        P.StrateBottomWorldZ,
+                        BottomZ,
+                        TopZ,
+                        P.LedgeSpacing,
+                        P.LedgeDepth,
+                        TreeRadius);
+                    const float FloorZ = VoxelPassageGeometry::VerticalShaftConnectorFloorZ(
+                        P.StrateBottomWorldZ,
+                        BottomZ,
+                        TopZ,
+                        P.LedgeSpacing,
+                        P.LedgeDepth,
+                        TreeRadius);
                     const FVector ParentPoint = Parent != nullptr
                         ? FVector(Parent->X, Parent->Y, Zc)
                         : FVector(0.0f, 0.0f, Zc);
                     const FConn Conn{
-                        FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius };
+                        FVector(Child.X, Child.Y, Zc), ParentPoint, TreeRadius,
+                        FloorZ, true };
                     if (ConnectorMayReachCell(Conn))
                     {
                         Cache.Conns.Add(Conn);
@@ -2310,7 +2289,8 @@ namespace
                         const float ConnectorR = bSpineConnector
                             ? SpineConnectorRadius() : P.ConnectorRadius;
                         const FConn Conn{
-                            FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR };
+                            FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR,
+                            0.0f, false };
                         if (ConnectorMayReachCell(Conn))
                         {
                             Cache.Conns.Add(Conn);
@@ -2402,6 +2382,109 @@ namespace
     private:
         FVerticalShaftParams P;
         const FShaftFieldSource* Field;   // NON possédant : la pile possède la source
+    };
+
+    // The deterministic shaft tree is a walkable network as well as an air topology. Reassert
+    // its air core after partial shaft ledges, then add the same inset floor band as the native
+    // path at the common first ledge level. This lets a player-fit route cross between shafts
+    // without restoring the removed landing-to-origin roads.
+    class FShaftConnectorAirMod final : public IVoxelDensityOp
+    {
+    public:
+        explicit FShaftConnectorAirMod(const FShaftFieldSource* InField, float InBaseDensity)
+            : Field(InField), BaseDensity(InBaseDensity) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::ShaftGeometry; }
+        bool IsAdditive() const override { return false; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ,
+                  FVoxelOpSample& InOut) const override
+        {
+            if (Field == nullptr) return;
+            const FShaftFieldSource::FCells& Cells = Field->GetCellsAt(WorldX, WorldY);
+            static thread_local bool bLoggedTemporaryShaftConnectors = false;
+            if (!bLoggedTemporaryShaftConnectors
+                && FMath::IsNearlyEqual(WorldZ, -700.0f)
+                && WorldX > -180.0f && WorldX < -170.0f
+                && WorldY > -48.0f && WorldY < -38.0f)
+            {
+                bLoggedTemporaryShaftConnectors = true;
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeExplore][TemporaryShaftConnectors] query=(%.3f,%.3f,%.3f) count=%d"),
+                    WorldX, WorldY, WorldZ, Cells.Conns.Num());
+                for (const FShaftFieldSource::FConn& DebugConn : Cells.Conns)
+                {
+                    UE_LOG(LogTemp, Display,
+                        TEXT("[VoxelForgeExplore][TemporaryShaftConnectors] A=(%.3f,%.3f,%.3f) "
+                             "B=(%.3f,%.3f,%.3f) radius=%.3f floor=%.3f walk=%d"),
+                        DebugConn.A.X, DebugConn.A.Y, DebugConn.A.Z,
+                        DebugConn.B.X, DebugConn.B.Y, DebugConn.B.Z,
+                        DebugConn.Radius, DebugConn.FloorZ,
+                        DebugConn.bWalkableFloor ? 1 : 0);
+                }
+            }
+            for (const FShaftFieldSource::FConn& Conn : Cells.Conns)
+            {
+                if (!Conn.bWalkableFloor) continue;
+                VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorAir(
+                    InOut.Density, WorldX, WorldY, WorldZ,
+                    Conn.A, Conn.B, Conn.Radius, Conn.FloorZ, BaseDensity);
+            }
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return Field != nullptr ? EVoxelOpEffect::Both : EVoxelOpEffect::Identity;
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("ShaftConnectorAirOp"); }
+
+    private:
+        const FShaftFieldSource* Field = nullptr; // NON possédant : la pile possède la source
+        float BaseDensity = 8.0f;
+    };
+
+    class FShaftConnectorFloorMod final : public IVoxelDensityOp
+    {
+    public:
+        FShaftConnectorFloorMod(const FShaftFieldSource* InField, float InBaseDensity)
+            : Field(InField), BaseDensity(InBaseDensity) {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::DetailModifier; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::ShaftGeometry; }
+        bool IsAdditive() const override { return false; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float WorldX, float WorldY, float WorldZ,
+                  FVoxelOpSample& InOut) const override
+        {
+            if (Field == nullptr) return;
+            const FShaftFieldSource::FCells& Cells = Field->GetCellsAt(WorldX, WorldY);
+            for (const FShaftFieldSource::FConn& Conn : Cells.Conns)
+            {
+                if (!Conn.bWalkableFloor) continue;
+                VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorFloor(
+                    InOut.Density, WorldX, WorldY, WorldZ,
+                    Conn.A, Conn.B, Conn.Radius, Conn.FloorZ, BaseDensity);
+            }
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return Field != nullptr ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("ShaftConnectorFloorOp"); }
+
+    private:
+        const FShaftFieldSource* Field = nullptr; // NON possédant : la pile possède la source
+        float BaseDensity = 8.0f;
     };
 
     //=========================================================================
@@ -2774,6 +2857,12 @@ namespace
             /** La salle de SDF minimal pour le dernier voxel évalué. -1 = aucune. */
             int32 NearestRoom = -1;
 
+        /** The warped SDF-space position belonging to the current voxel. */
+        FVector LastWarpedPosition = FVector::ZeroVector;
+
+        /** The unwarped position belonging to the current voxel. */
+        FVector LastWorldPosition = FVector::ZeroVector;
+
             /** ÉTAPE C1 — les params de la strate avec l'op de CETTE salle appliqué par-dessus.
              *  Mémo par voxel : invalidé au début de chaque `Eval`, calculé au PREMIER modificateur
              *  qui le demande. C'est ce qui reproduit le coût de l'original (une copie de struct par
@@ -2794,6 +2883,18 @@ namespace
         /** L'index de la salle la plus proche pour le dernier voxel évalué. -1 = aucune.
          *  Lu par les arches, les dômes, le pincement et le biais de sol. */
         int32 GetNearestRoomIdx() const { return State().NearestRoom; }
+
+        bool HasTunnelAirGeometry() const
+        {
+            return P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f;
+        }
+
+        float GetTunnelCoreSDF() const
+        {
+            const FVector& Position = State().LastWorldPosition;
+            return VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+                Position.X, Position.Y, Position.Z, State().Cache);
+        }
 
         /**
          * ÉTAPE C1 — L'OVERRIDE D'OP PAR SALLE. Les params de la strate avec l'op de terrain tiré
@@ -2875,6 +2976,7 @@ namespace
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             FState& S = State();
+            S.LastWorldPosition = FVector(WorldX, WorldY, WorldZ);
 
             // ⚠️ REMIS À -1 INCONDITIONNELLEMENT, ce que l'original ne fait pas : chez lui
             // `NearestRoomIdx` est un `thread_local` qui, quand `RoomDensity <= 0`, garde la valeur
@@ -2919,6 +3021,7 @@ namespace
                     WorldY * WF + 9.7f,
                     EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
             }
+            S.LastWarpedPosition = FVector(WarpedX, WarpedY, WarpedZ);
 
             //---------------------------------------------------------------
             // LE CACHE PAR BOÎTE DE RECHERCHE
@@ -3388,37 +3491,61 @@ namespace
 
             for (const FCachedTunnel& Tunnel : B.Cache.Tunnels)
             {
-                const float MaxRadius = FMath::Max3(
-                    FMath::Abs(Tunnel.RadiusA), FMath::Abs(Tunnel.RadiusB),
-                    Tunnel.bHasMidpoint ? FMath::Abs(Tunnel.RadiusMid) : 0.0f);
-                const FVector SegmentAMin(
-                    FMath::Min(Tunnel.EndpointA.X, Tunnel.bHasMidpoint ? Tunnel.Midpoint.X : Tunnel.EndpointB.X),
-                    FMath::Min(Tunnel.EndpointA.Y, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Y : Tunnel.EndpointB.Y),
-                    FMath::Min(Tunnel.EndpointA.Z, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Z : Tunnel.EndpointB.Z));
-                const FVector SegmentAMax(
-                    FMath::Max(Tunnel.EndpointA.X, Tunnel.bHasMidpoint ? Tunnel.Midpoint.X : Tunnel.EndpointB.X),
-                    FMath::Max(Tunnel.EndpointA.Y, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Y : Tunnel.EndpointB.Y),
-                    FMath::Max(Tunnel.EndpointA.Z, Tunnel.bHasMidpoint ? Tunnel.Midpoint.Z : Tunnel.EndpointB.Z));
-
-                float TunnelLower = VF_DistanceBetweenBoxes(
-                    QMin, QMax, SegmentAMin, SegmentAMax) - MaxRadius;
-                if (Tunnel.bHasMidpoint)
+                float MaxRadius = FMath::Max(
+                    FMath::Abs(Tunnel.RadiusA), FMath::Abs(Tunnel.RadiusB));
+                float TunnelLower = FLT_MAX;
+                if (Tunnel.ControlPoints.Num() >= 2
+                    && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
                 {
-                    const FVector SegmentBMin(
-                        FMath::Min(Tunnel.Midpoint.X, Tunnel.EndpointB.X),
-                        FMath::Min(Tunnel.Midpoint.Y, Tunnel.EndpointB.Y),
-                        FMath::Min(Tunnel.Midpoint.Z, Tunnel.EndpointB.Z));
-                    const FVector SegmentBMax(
-                        FMath::Max(Tunnel.Midpoint.X, Tunnel.EndpointB.X),
-                        FMath::Max(Tunnel.Midpoint.Y, Tunnel.EndpointB.Y),
-                        FMath::Max(Tunnel.Midpoint.Z, Tunnel.EndpointB.Z));
-                    TunnelLower = FMath::Min(
-                        TunnelLower,
-                        VF_DistanceBetweenBoxes(QMin, QMax, SegmentBMin, SegmentBMax) - MaxRadius);
+                    for (int32 SegmentIndex = 0;
+                         SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                         ++SegmentIndex)
+                    {
+                        const FVector& A = Tunnel.ControlPoints[SegmentIndex];
+                        const FVector& BPoint = Tunnel.ControlPoints[SegmentIndex + 1];
+                        MaxRadius = FMath::Max(
+                            MaxRadius,
+                            FMath::Max(FMath::Abs(Tunnel.ControlRadii[SegmentIndex]),
+                                       FMath::Abs(Tunnel.ControlRadii[SegmentIndex + 1])));
+                        const FVector SegmentMin(
+                            FMath::Min(A.X, BPoint.X),
+                            FMath::Min(A.Y, BPoint.Y),
+                            FMath::Min(A.Z, BPoint.Z));
+                        const FVector SegmentMax(
+                            FMath::Max(A.X, BPoint.X),
+                            FMath::Max(A.Y, BPoint.Y),
+                            FMath::Max(A.Z, BPoint.Z));
+                        TunnelLower = FMath::Min(
+                            TunnelLower,
+                            VF_DistanceBetweenBoxes(QMin, QMax, SegmentMin, SegmentMax));
+                    }
+                    TunnelLower -= MaxRadius;
+                }
+                else
+                {
+                    const FVector SegmentMin(
+                        FMath::Min(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                        FMath::Min(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                        FMath::Min(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
+                    const FVector SegmentMax(
+                        FMath::Max(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                        FMath::Max(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                        FMath::Max(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
+                    TunnelLower = VF_DistanceBetweenBoxes(
+                        QMin, QMax, SegmentMin, SegmentMax) - MaxRadius;
                 }
 
+                const FVector NoWarpSegmentMin(
+                    FMath::Min(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                    FMath::Min(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                    FMath::Min(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
+                const FVector NoWarpSegmentMax(
+                    FMath::Max(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                    FMath::Max(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                    FMath::Max(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
                 const float TunnelLowerNoWarp = VF_DistanceBetweenBoxes(
-                    NoWarpMin, NoWarpMax, SegmentAMin, SegmentAMax) - MaxRadius;
+                    NoWarpMin, NoWarpMax, NoWarpSegmentMin, NoWarpSegmentMax)
+                    - MaxRadius;
                 Consider(TunnelLower);
                 CountThreshold(TunnelLower, B.HitTunnels);
                 CountThreshold(TunnelLowerNoWarp, B.HitTunnelsNoWarp);
@@ -3482,6 +3609,13 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("RoomGraphSource"); }
 
+        bool IsTunnelSupportFloor() const
+        {
+            const FVector& Position = State().LastWorldPosition;
+            return VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+                Position.X, Position.Y, Position.Z, State().Cache);
+        }
+
     private:
         FStrateGenerationParams P;
         int32  Seed;
@@ -3489,6 +3623,99 @@ namespace
         const UVoxelStrateManager* Manager;   // NON possédant
         uint32 ParamsFingerprint;
         uint32 LayoutVersion = 0;
+    };
+
+    // The graph tunnel floor closes the rounded bottom of the core into a finite, walkable support
+    // slab. It is separate from the inter-strate passage floor: this owns only the wandering
+    // intra-strate graph edges and does not create any new corridor.
+    class FCaveTunnelFloorOp final : public IVoxelDensityOp
+    {
+    public:
+        FCaveTunnelFloorOp(const FRoomGraphSource* InRooms, float InBase)
+            : Rooms(InRooms), Base(InBase)
+        {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override
+        {
+            return VoxelOpResources::RoomGeometry;
+        }
+        bool IsAdditive() const override { return false; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float, float, float, FVoxelOpSample& InOut) const override
+        {
+            if (Rooms != nullptr && Rooms->IsTunnelSupportFloor())
+            {
+                InOut.Density = FMath::Max(
+                    InOut.Density,
+                    FMath::Max(Base * 2.0f, 1.0f));
+            }
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return Rooms != nullptr && Rooms->HasTunnelAirGeometry()
+                ? EVoxelOpEffect::Both
+                : EVoxelOpEffect::Identity;
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("CaveTunnelFloorOp"); }
+
+    private:
+        const FRoomGraphSource* Rooms = nullptr;
+        float Base = 8.0f;
+    };
+
+    // A graph tunnel's raw SDF is the structural air contract for the wandering chain. It runs
+    // after the passage post because a different passage can project a solid support floor onto
+    // the same voxel; the core keeps its own half-voxel support band and restores the route above
+    // it. FRoomGraphSource evaluates this post against the cached world-space chain, so the cave
+    // warp cannot turn a walkable floor ramp into a vertical break.
+    class FCaveTunnelAirOp final : public IVoxelDensityOp
+    {
+    public:
+        FCaveTunnelAirOp(const FRoomGraphSource* InRooms, float InBase, float InInset)
+            : Rooms(InRooms), Base(InBase), Inset(InInset)
+        {}
+
+        EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
+        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
+        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
+        EVoxelOpResourceMask RequiredResources() const override
+        {
+            return VoxelOpResources::RoomGeometry;
+        }
+        bool IsAdditive() const override { return false; }
+        void PrepareChunk(const FVoxelOpContext&) override {}
+
+        void Eval(float, float, float, FVoxelOpSample& InOut) const override
+        {
+            if (Rooms != nullptr
+                && !Rooms->IsTunnelSupportFloor()
+                && Rooms->GetTunnelCoreSDF() < -Inset)
+            {
+                InOut.Density = FMath::Min(
+                    InOut.Density,
+                    -FMath::Max(Base * 2.0f, 1.0f));
+            }
+        }
+
+        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return Rooms != nullptr && Rooms->HasTunnelAirGeometry()
+                ? EVoxelOpEffect::CarveOnly
+                : EVoxelOpEffect::Identity;
+        }
+
+        const TCHAR* DebugName() const override { return TEXT("CaveTunnelAirOp"); }
+
+    private:
+        const FRoomGraphSource* Rooms = nullptr;
+        float Base = 8.0f;
+        float Inset = 2.0f;
     };
 
     //=========================================================================
@@ -5215,7 +5442,8 @@ bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
 
 void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
                                          float SealThickness, float BaseDensity, float SpineRadius,
-                                         const UVoxelStrateManager* StrateManager)
+                                         const UVoxelStrateManager* StrateManager,
+                                         bool bAppendEdgeSeal)
 {
     // ORDRE NON NÉGOCIABLE : la spine creuse l'intérieur (et ne touche JAMAIS les bandes de seal),
     // le seal vertical re-solidifie ses bandes, les passages (tube + landing + support) percent
@@ -5226,7 +5454,10 @@ void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBott
     Add(MakeUnique<FBoundarySealOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity));
     Add(MakeUnique<FPassageCarveOp>(StrateManager, BaseDensity, SealThickness,
                                     StrateTopWorldZ, StrateBottomWorldZ, SpineRadius));
-    Add(MakeUnique<FXYEdgeSealOp>(BaseDensity));
+    if (bAppendEdgeSeal)
+    {
+        Add(MakeUnique<FXYEdgeSealOp>(BaseDensity));
+    }
 }
 
 //=============================================================================
@@ -5466,6 +5697,8 @@ namespace VoxelDensityOps
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.1f, 3, P.SurfaceRoughness + 4.0f));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
         OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
+        OutStack.Add(MakeUnique<FShaftConnectorAirMod>(ShaftPtr, P.BaseDensity));
+        OutStack.Add(MakeUnique<FShaftConnectorFloorMod>(ShaftPtr, P.BaseDensity));
 
         if (bAppendStructuralPosts)
         {
@@ -5552,7 +5785,12 @@ namespace VoxelDensityOps
         {
             OutStack.AppendStructuralPost(P.StrateTopWorldZ, P.StrateBottomWorldZ,
                                           P.BoundarySealThickness, P.BaseDensity,
-                                          SpineRadius, StrateManager);
+                                          SpineRadius, StrateManager, false);
+            OutStack.Add(MakeUnique<FCaveTunnelFloorOp>(RoomPtr, P.BaseDensity));
+            OutStack.Add(MakeUnique<FCaveTunnelAirOp>(
+                RoomPtr, P.BaseDensity,
+                VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels));
+            OutStack.Add(MakeUnique<FXYEdgeSealOp>(P.BaseDensity));
         }
     }
 

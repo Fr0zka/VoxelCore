@@ -492,7 +492,6 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     int32 NumLandingEnds = 0;
     int32 NumLandingFloorsPassed = 0;
     int32 NumLandingFloorFailures = 0;
-    int32 NumLandingNetworkJoins = 0;
     int32 NumLandingSealFailures = 0;
     int32 NumLandingFloorBoxes = 0;
     int32 NumLandingBoxProofs = 0;
@@ -500,17 +499,12 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     int32 NumLandingBoxAllAir = 0;
     int32 NumLandingBoxViolations = 0;
     int32 NumLandingSourceFit = 0;
-    int32 NumLandingConnectorSlopesPassed = 0;
-    int32 NumLandingConnectorSlopeFailures = 0;
     float WorstLandingFloorGradient = 0.0f;
-    float WorstLandingConnectorGradient = 0.0f;
     FString FirstLandingFailure;
     FString LandingSlopeReport;
     FWalkableTunnelAudit TunnelAudit;
     constexpr float LandingWalkableAngleDegrees =
         VoxelPassageGeometry::WalkableTunnelMaxGradientDegrees;
-    constexpr float LandingWalkableSlope =
-        VoxelPassageGeometry::WalkableTunnelMaxGradient;
 
     for (const FVoxelPassage& Passage : Passages)
     {
@@ -985,65 +979,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                     FMath::DegreesToRadians(LandingWalkableAngleDegrees));
             }
 
-            float ConnectorGradient = -1.0f;
-            bool bConnectorSlopePassed = false;
-            if (Landing.bHasNetworkConnector
-                && FMath::IsFinite(Landing.ConnectorStart.X)
-                && FMath::IsFinite(Landing.ConnectorStart.Y)
-                && FMath::IsFinite(Landing.ConnectorEnd.X)
-                && FMath::IsFinite(Landing.ConnectorEnd.Y)
-                && (!Landing.bHasConnectorBend
-                    || (FMath::IsFinite(Landing.ConnectorControl.X)
-                        && FMath::IsFinite(Landing.ConnectorControl.Y)))
-                && FMath::IsFinite(Landing.RootFloorZ)
-                && FMath::IsFinite(Landing.FloorZ))
-            {
-                const FVector2D ConnectorStart(
-                    Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
-                const FVector2D ConnectorEnd(
-                    Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
-                const float DirectLength = (ConnectorEnd - ConnectorStart).Size();
-                if (Landing.bHasConnectorBend)
-                {
-                    const FVector2D ConnectorControl(
-                        Landing.ConnectorControl.X, Landing.ConnectorControl.Y);
-                    const float FinalLegLength = (ConnectorEnd - ConnectorControl).Size();
-                    const float RampLength = FMath::Max(
-                        FinalLegLength - (Landing.RootSpineRadius > 0.0f
-                            ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f),
-                        KINDA_SMALL_NUMBER);
-                    ConnectorGradient = FMath::Abs(
-                        Landing.RootFloorZ - Landing.FloorZ) / RampLength;
-                }
-                else
-                {
-                    const float RampLength = FMath::Max(
-                        DirectLength - FMath::Max(Landing.HalfWidth - 1.0f, 0.0f)
-                            - (Landing.RootSpineRadius > 0.0f
-                                ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f),
-                        KINDA_SMALL_NUMBER);
-                    ConnectorGradient = FMath::Abs(
-                        Landing.RootFloorZ - Landing.FloorZ) / RampLength;
-                }
-                bConnectorSlopePassed = FMath::IsFinite(ConnectorGradient)
-                    && ConnectorGradient <= LandingWalkableSlope + KINDA_SMALL_NUMBER;
-            }
-
-            if (bConnectorSlopePassed)
-            {
-                ++NumLandingConnectorSlopesPassed;
-                WorstLandingConnectorGradient = FMath::Max(
-                    WorstLandingConnectorGradient, ConnectorGradient);
-            }
-            else
-            {
-                ++NumLandingConnectorSlopeFailures;
-                RecordFailure(FString::Printf(
-                    TEXT("landing at strate %d has connector slope %.6f above the %.6f walkable limit"),
-                    StrateIndex, ConnectorGradient, LandingWalkableSlope));
-            }
-
-            const bool bLandingSlopePassed = bFloorPassed && bConnectorSlopePassed;
+            // Landing rooms are intentionally local now. Their flat floors are the only landing
+            // contract; the removed radial root connectors were the source of the straight roads
+            // through unrelated rooms.
+            const bool bLandingSlopePassed = bFloorPassed;
             if (bLandingSlopePassed)
             {
                 ++NumLandingFloorsPassed;
@@ -1075,16 +1014,6 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
             if (Landing.bSourcePlayerFit)
             {
                 ++NumLandingSourceFit;
-            }
-            if (Landing.bHasNetworkConnector)
-            {
-                ++NumLandingNetworkJoins;
-            }
-            else
-            {
-                RecordFailure(FString::Printf(
-                    TEXT("landing at strate %d has neither a source fit nor a deterministic network connector"),
-                    StrateIndex));
             }
 
             // Exercise the same box shortcut that can otherwise erase a support slab. A uniform
@@ -1146,15 +1075,12 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
 
             const FString LandingArchetype = ArchetypeName(Definition->GeneratorType);
             LandingSlopeReport += FString::Printf(
-                TEXT("%s[%d:%s]=floor:%s(%.6f),connector:%s(%.6f)%s "),
+                TEXT("%s[%d:%s]=flat-floor:%s(%.6f) "),
                 *LandingArchetype,
                 StrateIndex,
                 EndIndex == 0 ? TEXT("upper") : TEXT("lower"),
                 bFloorPassed ? TEXT("PASS") : TEXT("FAIL"),
-                LandingGradient,
-                bConnectorSlopePassed ? TEXT("PASS") : TEXT("FAIL"),
-                ConnectorGradient,
-                Landing.bHasConnectorBend ? TEXT("[bend]") : TEXT(""));
+                LandingGradient);
         }
     }
 
@@ -1237,17 +1163,11 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         NumUnsupported,
         NumSupportedWithoutPoint));
     AddInfo(FString::Printf(
-        TEXT("Landing geometry: %d/%d ends passed the final-density floor test (worst room gradient %.6f), connector slopes %d/%d (worst %.6f; walkable limit %.6f), source-fit anchors %d/%d, explicit root-network joins %d/%d, seal violations %d, geometry/floor failures %d."),
+        TEXT("Landing geometry: %d/%d ends passed the final-density flat-floor test (worst gradient %.6f), source-fit anchors %d/%d, seal violations %d, geometry/floor failures %d."),
         NumLandingFloorsPassed,
         NumLandingEnds,
         WorstLandingFloorGradient,
-        NumLandingConnectorSlopesPassed,
-        NumLandingEnds,
-        WorstLandingConnectorGradient,
-        LandingWalkableSlope,
         NumLandingSourceFit,
-        NumLandingEnds,
-        NumLandingNetworkJoins,
         NumLandingEnds,
         NumLandingSealFailures,
         NumLandingFloorFailures));
@@ -1372,9 +1292,6 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     return NumInterStratePassages > 0
         && NumLandingEnds == NumInterStratePassages * 2
         && NumLandingFloorsPassed == NumLandingEnds
-        && NumLandingConnectorSlopesPassed == NumLandingEnds
-        && NumLandingConnectorSlopeFailures == 0
-        && NumLandingNetworkJoins == NumLandingEnds
         && NumLandingSealFailures == 0
         && NumLandingFloorFailures == 0
         && NumLandingBoxViolations == 0

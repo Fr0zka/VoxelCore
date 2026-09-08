@@ -620,8 +620,8 @@ struct VOXELFORGE_API FStrateGenerationParams
 
     // How much tunnel paths curve (in voxels of sideways displacement).
     // Without this, tunnels are straight lines between rooms.
-    // This adds a hash-derived midpoint offset to each tunnel, creating
-    // unique curves — some bend left, some right, some are nearly straight.
+    // This adds deterministic hash-jittered control points along each tunnel, creating
+    // unique wandering chains — some bend left, some right, some are nearly straight.
     // Capped at 25% of tunnel length to prevent kinky short tunnels.
     //   0   → perfectly straight tunnels (artificial look)
     //   8-12→ gentle natural curves
@@ -642,21 +642,20 @@ struct VOXELFORGE_API FStrateGenerationParams
     // Topology of the guaranteed tunnel network.
     // true  → each room links to its best candidate among rooms CLOSER to (0,0): the whole
     //         network becomes a tree rooted at the origin room — every cave is reachable
-    //         from the spine hub, tunnels flow inward like tributaries (intentional descent
-    //         structure). TunnelDensity still adds loops on top.
+    //         from the graph root, tunnels flow inward like tributaries (intentional descent
+    //         structure). This graph root is not a radial landing-to-hub road. TunnelDensity
+    //         still adds loops on top.
     // false → legacy nearest-neighbor pairing: organic scattered clusters, but connectivity
     //         between clusters is NOT guaranteed (isolated pockets are common).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels")
     bool bTunnelsFlowTowardOrigin = true;
 
-    // How much tunnel endpoints shift up/down within rooms (0-1).
-    // Fraction of the room's vertical radius. Each tunnel endpoint gets
-    // a hash-derived Z offset, so tunnels enter rooms at different heights.
-    // Combined with terrain ops (cliffs, terraces), this creates multi-level rooms
-    // where one tunnel exits at the upper ledge and another at the lower floor.
-    //   0.0 → all tunnels connect at room center height
-    //   0.25 → endpoints use a restrained quarter-height offset (default)
-    //   1.0 → full range — tunnels can enter near floor or ceiling
+    // Vertical wander amount for tunnel control points (0-1). Endpoints are always tangent to
+    // their room's deterministic floor so a room join cannot be vertically severed; this value
+    // controls only the interior chain's bounded up/down variation.
+    //   0.0 → level floor-to-floor chain
+    //   0.25 → restrained vertical wander (default)
+    //   1.0 → strongest interior vertical variation
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float TunnelEndpointZOffset = 0.25f;
 
@@ -1787,15 +1786,15 @@ struct VOXELFORGE_API FStratePassageConfig
 
     // ----- WIDTH (tapers along the length) -----
     // Radius at the two mouths (entry/exit) and at the middle. Equal = uniform tube;
-    // The walkable default is deliberately single-file: 3.0 m diameter at mouths and 2.5 m at
-    // the waist (6/5 voxel radii at 25 cm per voxel). The §6.5 landing room remains wider for
-    // turning.
+    // The walkable default is 1.5x the original comfortable profile: 4.5 m diameter at mouths
+    // and 3.75 m at the waist (9/7.5 voxel radii at 25 cm per voxel). The §6.5 landing room
+    // remains wider for turning.
     // Mouth > Mid = chambers at the ends with a squeeze between; Mid > Mouth = a bulge.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MouthRadius = 6.0f;
+    float MouthRadius = 9.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MidRadius = 5.0f;
+    float MidRadius = 7.5f;
 
     // ----- LENGTH -----
     // How far the tunnel reaches INTO each strate (voxels). Auto-capped to the interior;

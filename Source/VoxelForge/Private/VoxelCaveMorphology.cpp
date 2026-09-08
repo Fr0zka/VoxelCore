@@ -8,9 +8,9 @@
 //           Called PER VOXEL using the cached data.
 //
 // FEATURES:
-// - Origin room: guaranteed large room at (0,0) per strate — the hub / (0,0) spine
+// - Origin room: guaranteed finite landing room at (0,0) per strate — reserved for the spine
 // - Hash-based rooms: ellipsoid, rounded box, and capsule shapes
-// - Tunnels: tapered capsules with curved paths (midpoint warping)
+// - Tunnels: tapered capsules with deterministic wandering control-point chains
 // - Horizontal bias: tunnels prefer horizontal connections
 // - Endpoint Z offset: tunnels enter rooms at different heights
 // - Per-room/tunnel distance culling: skip SDFs that can't affect this voxel
@@ -50,6 +50,9 @@ struct FBuildRoom
     bool bIsOrigin;         // True for the origin room at (0,0)
     bool bStore;            // True if this room can affect a voxel in THIS chunk
                             // (collected for connectivity decisions either way).
+    FVector PlayerFitPoint = FVector::ZeroVector;
+    bool bHasPlayerFitPoint = false;
+    bool bPlayerFitAttempted = false;
 };
 
 //=============================================================================
@@ -479,20 +482,146 @@ namespace
         bool bOrigin = false;
     };
 
-    float VF_RoomFloorZ(
-        const FVFRoomLandingSite& Site,
+    FVector VF_ApplyCaveWarp(
+        const FVector& WorldPoint,
+        const FStrateGenerationParams& Params,
+        uint32 Seed)
+    {
+        float EffectiveZ = WorldPoint.Z;
+        if (Params.VerticalScale > 0.0f && Params.VerticalScale != 1.0f)
+        {
+            EffectiveZ = WorldPoint.Z / Params.VerticalScale;
+        }
+
+        FVector Warped(WorldPoint.X, WorldPoint.Y, EffectiveZ);
+        if (Params.CaveWarpStrength <= 0.0f)
+        {
+            return Warped;
+        }
+
+        const float Frequency = Params.CaveWarpFrequency;
+        const float Strength = Params.CaveWarpStrength;
+        Warped.X += VoxelNoise::Perlin3D(
+            WorldPoint.X * Frequency + VoxelHash::SeedOffset(Seed, 0.37f),
+            WorldPoint.Y * Frequency + 1.3f,
+            EffectiveZ * Frequency + 5.7f)
+            * VOXEL_NOISE_SCALE * Strength;
+        Warped.Y += VoxelNoise::Perlin3D(
+            WorldPoint.X * Frequency + 7.1f,
+            WorldPoint.Y * Frequency + VoxelHash::SeedOffset(Seed, 0.59f),
+            EffectiveZ * Frequency + 2.3f)
+            * VOXEL_NOISE_SCALE * Strength;
+        Warped.Z += VoxelNoise::Perlin3D(
+            WorldPoint.X * Frequency + 11.3f,
+            WorldPoint.Y * Frequency + 9.7f,
+            EffectiveZ * Frequency + VoxelHash::SeedOffset(Seed, 0.41f))
+            * VOXEL_NOISE_SCALE * Strength;
+        return Warped;
+    }
+
+    FVector VF_UnwarpCavePoint(
+        const FVector& TargetSDFPoint,
+        const FStrateGenerationParams& Params,
+        uint32 Seed)
+    {
+        FVector WorldPoint = TargetSDFPoint;
+        const float ZScale = Params.VerticalScale > 0.0f
+            ? Params.VerticalScale : 1.0f;
+        if (ZScale != 1.0f)
+        {
+            WorldPoint.Z *= ZScale;
+        }
+        if (Params.CaveWarpStrength <= 0.0f)
+        {
+            return WorldPoint;
+        }
+
+        // The default warp is a contraction at its authored frequency. A fixed eight-step
+        // Newton/Picard correction is enough to put a world landing back on the exact cached SDF
+        // point, while keeping the query allocation-free and deterministic.
+        for (int32 Iteration = 0; Iteration < 8; ++Iteration)
+        {
+            const FVector Mapped = VF_ApplyCaveWarp(WorldPoint, Params, Seed);
+            const FVector Error = TargetSDFPoint - Mapped;
+            if (!Error.ContainsNaN()
+                && FMath::IsFinite(Error.X)
+                && FMath::IsFinite(Error.Y)
+                && FMath::IsFinite(Error.Z))
+            {
+                WorldPoint.X += Error.X;
+                WorldPoint.Y += Error.Y;
+                WorldPoint.Z += Error.Z * ZScale;
+            }
+        }
+        return WorldPoint;
+    }
+
+    float VF_RoomFloorZFromParts(
+        const FVector& RoomCenter,
+        float RoomRadiusXY,
+        float RoomRadiusZ,
+        uint32 RoomHash,
+        uint32 WarpSeed,
         const FStrateGenerationParams& Params)
     {
-        if (Params.RoomFloorCutMin >= 1.0f && Params.RoomFloorCutMax >= 1.0f)
-        {
-            return Site.Center.Z - Site.RadiusZ;
-        }
-        const float Roll = VoxelHash::ToFloat01(VoxelHash::Mix(Site.Hash ^ 0xF100F2u));
+        const float Roll = VoxelHash::ToFloat01(VoxelHash::Mix(RoomHash ^ 0xF100F2u));
         const float FloorCut = FMath::Lerp(
             FMath::Min(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
             FMath::Max(Params.RoomFloorCutMin, Params.RoomFloorCutMax),
             Roll);
-        return Site.Center.Z - Site.RadiusZ * FloorCut;
+        float FloorZ = FloorCut < 1.0f
+            ? RoomCenter.Z - RoomRadiusZ * FloorCut
+            : RoomCenter.Z - RoomRadiusZ;
+        if (FloorCut < 1.0f && Params.FloorReliefStrength > 0.0f)
+        {
+            // Match the evaluator's domain-warped XY input at the room centre. The local landing
+            // query still searches a bounded vertical band for the support patch around this
+            // estimate because the capsule covers neighbouring XY samples too.
+            const float EffectiveZ = Params.VerticalScale > 0.0f
+                ? RoomCenter.Z / Params.VerticalScale : RoomCenter.Z;
+            float SampleX = RoomCenter.X;
+            float SampleY = RoomCenter.Y;
+            if (Params.CaveWarpStrength > 0.0f)
+            {
+                const float Frequency = Params.CaveWarpFrequency;
+                const float Strength = Params.CaveWarpStrength;
+                SampleX += VoxelNoise::Perlin3D(
+                    RoomCenter.X * Frequency + VoxelHash::SeedOffset(WarpSeed, 0.37f),
+                    RoomCenter.Y * Frequency + 1.3f,
+                    EffectiveZ * Frequency + 5.7f)
+                    * VOXEL_NOISE_SCALE * Strength;
+                SampleY += VoxelNoise::Perlin3D(
+                    RoomCenter.X * Frequency + 7.1f,
+                    RoomCenter.Y * Frequency + VoxelHash::SeedOffset(WarpSeed, 0.59f),
+                    EffectiveZ * Frequency + 2.3f)
+                    * VOXEL_NOISE_SCALE * Strength;
+            }
+
+            const float Frequency = Params.FloorReliefFrequency;
+            const float FloorSeed = static_cast<float>(
+                VoxelHash::Mix(RoomHash ^ 0xF100F1u)) * 0.00001f;
+            float Noise = FMath::PerlinNoise2D(FVector2D(
+                SampleX * Frequency + FloorSeed,
+                SampleY * Frequency + FloorSeed * 1.7f)) * 0.65f;
+            Noise += FMath::PerlinNoise2D(FVector2D(
+                SampleX * Frequency * 2.3f + FloorSeed * 3.1f,
+                SampleY * Frequency * 2.3f + FloorSeed * 5.3f)) * 0.35f;
+            FloorZ += Noise * VOXEL_NOISE_SCALE * Params.FloorReliefStrength;
+        }
+        // Keep this in the same (unwarped SDF) coordinate space as FCachedRoom::FloorCutZ. The
+        // production caller warps the query position before EvaluateSDFCached, and the exact fit
+        // predicate below samples that same warped field. This value is only a bounded search
+        // anchor; it must not pre-apply the Z warp or the room would be shifted twice.
+        return FloorZ;
+    }
+
+    float VF_RoomFloorZ(
+        const FVFRoomLandingSite& Site,
+        uint32 WarpSeed,
+        const FStrateGenerationParams& Params)
+    {
+        return VF_RoomFloorZFromParts(
+            Site.Center, Site.RadiusXY, Site.RadiusZ, Site.Hash, WarpSeed, Params);
     }
 
     float VF_EvaluateRoomLandingDensity(
@@ -505,33 +634,8 @@ namespace
         float WorldY,
         float WorldZ)
     {
-        float EffectiveZ = WorldZ;
-        if (Params.VerticalScale > 0.0f && Params.VerticalScale != 1.0f)
-        {
-            EffectiveZ = WorldZ / Params.VerticalScale;
-        }
-
-        FVector Position(WorldX, WorldY, EffectiveZ);
-        if (Params.CaveWarpStrength > 0.0f)
-        {
-            const float Frequency = Params.CaveWarpFrequency;
-            const float Strength = Params.CaveWarpStrength;
-            Position.X += VoxelNoise::Perlin3D(
-                WorldX * Frequency + VoxelHash::SeedOffset(Seed, 0.37f),
-                WorldY * Frequency + 1.3f,
-                EffectiveZ * Frequency + 5.7f)
-                * VOXEL_NOISE_SCALE * Strength;
-            Position.Y += VoxelNoise::Perlin3D(
-                WorldX * Frequency + 7.1f,
-                WorldY * Frequency + VoxelHash::SeedOffset(Seed, 0.59f),
-                EffectiveZ * Frequency + 2.3f)
-                * VOXEL_NOISE_SCALE * Strength;
-            Position.Z += VoxelNoise::Perlin3D(
-                WorldX * Frequency + 11.3f,
-                WorldY * Frequency + 9.7f,
-                EffectiveZ * Frequency + VoxelHash::SeedOffset(Seed, 0.41f))
-                * VOXEL_NOISE_SCALE * Strength;
-        }
+        const FVector Position = VF_ApplyCaveWarp(
+            FVector(WorldX, WorldY, WorldZ), Params, static_cast<uint32>(Seed));
 
         const uint32 ShapeHash = VoxelHash::Mix(Site.Hash ^ 0xDEADBEEFu);
         const float ShapeRoll = Site.bOrigin ? 0.0f : VoxelHash::ToFloat01(ShapeHash);
@@ -595,6 +699,109 @@ namespace
             Params.BoundarySealThickness, 1.0f);
         // Query-facing density uses the same MC polarity as the measurement: positive is air.
         return -InternalDensity;
+    }
+
+    bool VF_FindPlayerFitPointForRoom(
+        const FStrateGenerationParams& Params,
+        const FVFRoomLandingSite& Site,
+        float StrateTopZ,
+        float StrateBottomZ,
+        uint32 WarpSeed,
+        FVector& OutPoint)
+    {
+        OutPoint = FVector::ZeroVector;
+        const float FloorZ = VF_RoomFloorZ(Site, WarpSeed, Params);
+        if (!FMath::IsFinite(FloorZ))
+        {
+            return false;
+        }
+
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const float FloorReliefBound = FMath::Abs(Params.FloorReliefStrength)
+            * VOXEL_NOISE_SCALE;
+        const float CaveWarpBound = FMath::Abs(Params.CaveWarpStrength)
+            * VOXEL_NOISE_SCALE;
+        const int32 ReliefSearch = FMath::Clamp(
+            FMath::CeilToInt(FloorReliefBound + CaveWarpBound) + 8,
+            8,
+            128);
+        FVoxelStrateMeasureSettings FitSettings;
+        const auto SampleRoom = [&](float X, float Y, float Z)
+        {
+            return VF_EvaluateRoomLandingDensity(
+                Site, Params, WarpSeed,
+                StrateTopZ, StrateBottomZ, X, Y, Z);
+        };
+
+        const int32 LocalExtent = 0;
+        TArray<FIntPoint, TInlineAllocator<128>> LocalProbes;
+        for (int32 LocalY = -LocalExtent; LocalY <= LocalExtent; LocalY += 2)
+        {
+            for (int32 LocalX = -LocalExtent; LocalX <= LocalExtent; LocalX += 2)
+            {
+                if (static_cast<float>(LocalX * LocalX + LocalY * LocalY)
+                    > FMath::Square(Site.RadiusXY * 0.75f))
+                {
+                    continue;
+                }
+                LocalProbes.Add(FIntPoint(LocalX, LocalY));
+            }
+        }
+        if ((LocalExtent & 1) != 0)
+        {
+            LocalProbes.Add(FIntPoint::ZeroValue);
+        }
+        LocalProbes.Sort([](const FIntPoint& A, const FIntPoint& B)
+        {
+            const int32 ADistanceSq = A.X * A.X + A.Y * A.Y;
+            const int32 BDistanceSq = B.X * B.X + B.Y * B.Y;
+            if (ADistanceSq != BDistanceSq)
+            {
+                return ADistanceSq < BDistanceSq;
+            }
+            return A.X != B.X ? A.X < B.X : A.Y < B.Y;
+        });
+
+        for (const FIntPoint& LocalProbe : LocalProbes)
+        {
+            const FVector CandidateFeetBase = VF_UnwarpCavePoint(
+                FVector(
+                    Site.Center.X + static_cast<float>(LocalProbe.X),
+                    Site.Center.Y + static_cast<float>(LocalProbe.Y),
+                    FloorZ + MaxStepHeightVoxels + 0.5f),
+                Params,
+                WarpSeed);
+            for (int32 OffsetIndex = 0;
+                 OffsetIndex <= ReliefSearch * 2;
+                 ++OffsetIndex)
+            {
+                const int32 SignedOffset = OffsetIndex == 0
+                    ? 0
+                    : ((OffsetIndex & 1) != 0
+                        ? -((OffsetIndex + 1) / 2)
+                        : OffsetIndex / 2);
+                if (FMath::Abs(SignedOffset) > ReliefSearch)
+                {
+                    continue;
+                }
+                const FVector CandidateFeet = CandidateFeetBase
+                    + FVector(0.0f, 0.0f, static_cast<float>(SignedOffset));
+                if (VF_ValidatePlayerFitPose(
+                        FitSettings,
+                        CandidateFeet,
+                        StrateTopZ,
+                        StrateBottomZ,
+                        Params.BoundarySealThickness,
+                        SampleRoom,
+                        OutPoint))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     float VF_EvaluateSlabLandingDensity(
@@ -864,7 +1071,8 @@ namespace
     // recherche est bornée : un voisinage vide signifie "pas de réponse", jamais un point inventé.
     bool VF_FindNearestHashRoomLandingPoint(
         const FStrateGenerationParams& Params,
-        int32 Seed,
+        int32 RoomSeed,
+        int32 WarpSeed,
         float StrateTopZ,
         float StrateBottomZ,
         float WorldX,
@@ -935,10 +1143,19 @@ namespace
         int32 BestCellY = 0;
         bool bFound = false;
 
+        struct FRoomCandidate
+        {
+            FVFRoomLandingSite Site;
+            float DistSq = FLT_MAX;
+            int32 CellX = 0;
+            int32 CellY = 0;
+        };
+        TArray<FRoomCandidate, TInlineAllocator<64>> Candidates;
+
         auto ConsiderCell = [&](int32 CellX, int32 CellY)
         {
             // Keep this roll byte-for-byte aligned with BuildChunkCache's room placement.
-            const uint32 CellHash = VoxelHash::Cell(CellX, CellY, (uint32)Seed);
+            const uint32 CellHash = VoxelHash::Cell(CellX, CellY, (uint32)RoomSeed);
             if (VoxelHash::ToFloat01(CellHash) >= Params.RoomDensity) return;
 
             const float JitterX = VoxelHash::ToFloat01(VoxelHash::Mix(CellHash ^ 0x12345678u));
@@ -951,6 +1168,25 @@ namespace
             const float DX = RoomX - WorldX;
             const float DY = RoomY - WorldY;
             const float DistSq = DX * DX + DY * DY;
+
+            FRoomCandidate Candidate;
+            Candidate.Site = FVFRoomLandingSite{
+                FVector(RoomX, RoomY, RoomZ),
+                0.0f,
+                0.0f,
+                CellHash,
+                false };
+            const float CandidateSizeFactor = VoxelHash::ToFloat01(
+                VoxelHash::Mix(CellHash ^ 0xFEDCBA98u));
+            Candidate.Site.RadiusXY = FMath::Lerp(
+                FMath::Min(Params.MinRoomRadius, Params.MaxRoomRadius),
+                FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius),
+                CandidateSizeFactor);
+            Candidate.Site.RadiusZ = Candidate.Site.RadiusXY * Params.RoomHeightRatio;
+            Candidate.DistSq = DistSq;
+            Candidate.CellX = CellX;
+            Candidate.CellY = CellY;
+            Candidates.Add(Candidate);
 
             const bool bCloser = DistSq < BestDistSq;
             const bool bTie = DistSq == BestDistSq
@@ -1053,38 +1289,133 @@ namespace
         // The budget is bounded on purpose: passages sit at a deliberate distance from the (0,0)
         // spine so a lost player can find them, and an unbounded snap would dissolve that silently.
         // Over budget => decline, and the caller keeps its old random reach.
-        if (BestDistSq > MaxLateralSnap * MaxLateralSnap)
-        {
-            return false;
-        }
-
-        const FVFRoomLandingSite Site{
-            FVector(BestRoomX, BestRoomY, BestZ),
-            BestRadiusXY,
-            BestRadiusZ,
-            BestHash,
-            false };
-        const float FloorZ = VF_RoomFloorZ(Site, Params);
-        FVoxelStrateMeasureSettings FitSettings;
+        const float MaxLateralSnapSq = MaxLateralSnap * MaxLateralSnap;
         const float MaxStepHeightVoxels =
             FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
                 / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
-        const FVector CandidateFeet(
-            Site.Center.X, Site.Center.Y, FloorZ + MaxStepHeightVoxels + 0.5f);
-        const auto SampleRoom = [&](float X, float Y, float Z)
+        // The room-centre estimate is analytic, but production evaluates the room after the
+        // bounded XYZ cave warp.  A support stencil must be allowed to descend through that
+        // displacement as well as the authored floor relief; otherwise a valid room can be
+        // incorrectly downgraded to a random mouth whenever its shape bottom is more than one
+        // player step below the nominal cut.
+        const float FloorReliefBound = FMath::Abs(Params.FloorReliefStrength)
+            * VOXEL_NOISE_SCALE;
+        const float CaveWarpBound = FMath::Abs(Params.CaveWarpStrength)
+            * VOXEL_NOISE_SCALE;
+        const int32 ReliefSearch = FMath::Clamp(
+            FMath::CeilToInt(FloorReliefBound + CaveWarpBound) + 8,
+            8,
+            128);
+        FVoxelStrateMeasureSettings FitSettings;
+
+        // The nearest room is preferred, but it is not allowed to turn a local relief/shape
+        // quirk into a random landing. Test every deterministic candidate inside the lateral
+        // budget, nearest first, and return only after the full source fit stencil succeeds.
+        Candidates.Sort([](const FRoomCandidate& A, const FRoomCandidate& B)
         {
-            return VF_EvaluateRoomLandingDensity(
-                Site, Params, static_cast<uint32>(Seed),
-                StrateTopZ, StrateBottomZ, X, Y, Z);
-        };
-        return VF_ValidatePlayerFitPose(
-            FitSettings,
-            CandidateFeet,
-            StrateTopZ,
-            StrateBottomZ,
-            Params.BoundarySealThickness,
-            SampleRoom,
-            OutPoint);
+            if (A.DistSq != B.DistSq)
+            {
+                return A.DistSq < B.DistSq;
+            }
+            return A.CellX != B.CellX ? A.CellX < B.CellX : A.CellY < B.CellY;
+        });
+
+        for (const FRoomCandidate& Candidate : Candidates)
+        {
+            if (Candidate.DistSq > MaxLateralSnapSq)
+            {
+                continue;
+            }
+
+            const FVFRoomLandingSite& Site = Candidate.Site;
+            const float FloorZ = VF_RoomFloorZ(Site, static_cast<uint32>(WarpSeed), Params);
+            const auto SampleRoom = [&](float X, float Y, float Z)
+            {
+                return VF_EvaluateRoomLandingDensity(
+                    Site, Params, static_cast<uint32>(WarpSeed),
+                    StrateTopZ, StrateBottomZ, X, Y, Z);
+            };
+            // Cave warp can move the unwarped room centre close to a wall. Probe a deterministic
+            // coarse disk around that centre, nearest first, while leaving the final decision to
+            // the exact capsule/stencil test. The disk stays well inside the authored room so it
+            // cannot silently turn an adjacent room into this room's landing.
+            const int32 LocalExtent = FMath::Max(
+                2,
+                FMath::FloorToInt(FMath::Min(
+                    Site.RadiusXY * 0.75f,
+                    FMath::Max(CaveWarpBound + 4.0f, 8.0f))));
+            TArray<FIntPoint, TInlineAllocator<128>> LocalProbes;
+            for (int32 LocalY = -LocalExtent; LocalY <= LocalExtent; LocalY += 2)
+            {
+                for (int32 LocalX = -LocalExtent; LocalX <= LocalExtent; LocalX += 2)
+                {
+                    if (static_cast<float>(LocalX * LocalX + LocalY * LocalY)
+                        > FMath::Square(Site.RadiusXY * 0.75f))
+                    {
+                        continue;
+                    }
+                    LocalProbes.Add(FIntPoint(LocalX, LocalY));
+                }
+            }
+            if ((LocalExtent & 1) != 0)
+            {
+                LocalProbes.Add(FIntPoint::ZeroValue);
+            }
+            LocalProbes.Sort([](const FIntPoint& A, const FIntPoint& B)
+            {
+                const int32 ADistanceSq = A.X * A.X + A.Y * A.Y;
+                const int32 BDistanceSq = B.X * B.X + B.Y * B.Y;
+                if (ADistanceSq != BDistanceSq)
+                {
+                    return ADistanceSq < BDistanceSq;
+                }
+                return A.X != B.X ? A.X < B.X : A.Y < B.Y;
+            });
+
+            for (const FIntPoint& LocalProbe : LocalProbes)
+            {
+                const FVector CandidateFeetBase = VF_UnwarpCavePoint(
+                    FVector(
+                    Site.Center.X + static_cast<float>(LocalProbe.X),
+                        Site.Center.Y + static_cast<float>(LocalProbe.Y),
+                        FloorZ + MaxStepHeightVoxels + 0.5f),
+                    Params,
+                    static_cast<uint32>(WarpSeed));
+
+                // The production room floor includes bounded hash relief and the remaining local
+                // warp variation. Search a deterministic vertical band around the analytic anchor
+                // so valid rooms are never downgraded merely because the centre estimate is off by
+                // a few voxels.
+                for (int32 OffsetIndex = 0;
+                     OffsetIndex <= ReliefSearch * 2;
+                     ++OffsetIndex)
+                {
+                    const int32 SignedOffset = OffsetIndex == 0
+                        ? 0
+                        : ((OffsetIndex & 1) != 0
+                            ? -((OffsetIndex + 1) / 2)
+                            : OffsetIndex / 2);
+                    if (FMath::Abs(SignedOffset) > ReliefSearch)
+                    {
+                        continue;
+                    }
+                    const FVector CandidateFeet = CandidateFeetBase
+                        + FVector(0.0f, 0.0f, static_cast<float>(SignedOffset));
+                    if (VF_ValidatePlayerFitPose(
+                            FitSettings,
+                            CandidateFeet,
+                            StrateTopZ,
+                            StrateBottomZ,
+                            Params.BoundarySealThickness,
+                            SampleRoom,
+                            OutPoint))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     // The slab source is an XY height band. Evaluate the same two pure height fields as
@@ -1650,6 +1981,14 @@ namespace
                         SampleShaft,
                         OutPoint))
                 {
+                    if (Seed == 14 && FMath::IsNearlyEqual(StrateBottomZ, -736.0f))
+                    {
+                        UE_LOG(LogTemp, Display,
+                            TEXT("[VoxelForgeExplore][TemporaryVerticalLanding] axis=(%.3f,%.3f) "
+                                 "safeRadius=%.3f candidate=(%.3f,%.3f,%.3f)"),
+                            BestAxisX, BestAxisY, BestSafeRadius,
+                            CandidateFeet.X, CandidateFeet.Y, CandidateFeet.Z);
+                    }
                     return true;
                 }
             }
@@ -2060,123 +2399,14 @@ namespace
 {
     constexpr float VF_LandingCarveSafetyMargin =
         VoxelPassageGeometry::SealSafetyMarginVoxels;
+}
 
-    struct FVoxelPassageLandingConnectorProjection
-    {
-        FVector2D Closest = FVector2D::ZeroVector;
-        float DistanceAlong = 0.0f;
-        float TotalLength = 0.0f;
-        float SegmentLength = 0.0f;
-        float SegmentParameter = 0.0f;
-        int32 SegmentIndex = 0;
-    };
-
-    FVoxelPassageLandingConnectorProjection VF_ProjectPassageLandingConnector(
-        const FVector& Position,
-        const FVoxelPassageLanding& Landing)
-    {
-        const FVector2D A(Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
-        const FVector2D Control(Landing.ConnectorControl.X, Landing.ConnectorControl.Y);
-        const FVector2D B(Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
-        const FVector2D P(Position.X, Position.Y);
-        const bool bBend = Landing.bHasConnectorBend;
-        const FVector2D FirstEnd = bBend ? Control : B;
-        const FVector2D FirstVector = FirstEnd - A;
-        const FVector2D SecondVector = B - Control;
-        const float FirstLength = FirstVector.Size();
-        const float SecondLength = bBend ? SecondVector.Size() : 0.0f;
-
-        FVoxelPassageLandingConnectorProjection Result;
-        Result.TotalLength = FirstLength + SecondLength;
-        Result.Closest = A;
-        Result.SegmentLength = FirstLength;
-        if (Result.TotalLength <= KINDA_SMALL_NUMBER)
-        {
-            return Result;
-        }
-
-        float BestDistanceSquared = FLT_MAX;
-        const auto ProjectSegment = [&](const FVector2D& SegmentStart,
-                                        const FVector2D& SegmentEnd,
-                                        float SegmentOffset,
-                                        int32 SegmentIndex)
-        {
-            const FVector2D Segment = SegmentEnd - SegmentStart;
-            const float LengthSquared = Segment.SizeSquared();
-            const float Parameter = LengthSquared > KINDA_SMALL_NUMBER
-                ? FMath::Clamp(FVector2D::DotProduct(P - SegmentStart, Segment)
-                               / LengthSquared, 0.0f, 1.0f)
-                : 0.0f;
-            const FVector2D Candidate = SegmentStart + Segment * Parameter;
-            const float DistanceSquared = (P - Candidate).SizeSquared();
-            if (DistanceSquared < BestDistanceSquared
-                || (DistanceSquared == BestDistanceSquared
-                    && SegmentIndex < Result.SegmentIndex))
-            {
-                BestDistanceSquared = DistanceSquared;
-                Result.Closest = Candidate;
-                Result.DistanceAlong = SegmentOffset
-                    + FMath::Sqrt(FMath::Max(LengthSquared, 0.0f)) * Parameter;
-                Result.SegmentLength = FMath::Sqrt(FMath::Max(LengthSquared, 0.0f));
-                Result.SegmentParameter = Parameter;
-                Result.SegmentIndex = SegmentIndex;
-            }
-        };
-
-        ProjectSegment(A, FirstEnd, 0.0f, 0);
-        if (bBend)
-        {
-            ProjectSegment(Control, B, FirstLength, 1);
-        }
-        return Result;
-    }
-
-    float VF_PassageLandingConnectorFloorParameter(
-        const FVoxelPassageLandingConnectorProjection& Projection,
-        const FVoxelPassageLanding& Landing)
-    {
-        if (Projection.TotalLength <= KINDA_SMALL_NUMBER)
-        {
-            return 0.0f;
-        }
-
-        if (Landing.bHasConnectorBend)
-        {
-            // The first leg is deliberately level with the room. The second leg carries the
-            // complete rise and ends with a short level overlap inside the root landing room.
-            if (Projection.SegmentIndex == 0)
-            {
-                return 0.0f;
-            }
-            const float RootFlatLength = Landing.RootSpineRadius > 0.0f
-                ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f;
-            const float RampLength = FMath::Max(
-                Projection.SegmentLength - RootFlatLength, KINDA_SMALL_NUMBER);
-            return FMath::Clamp(
-                Projection.SegmentParameter * Projection.SegmentLength / RampLength,
-                0.0f, 1.0f);
-        }
-
-        // The direct zero-rise case remains a single segment. Keep the old end aprons for
-        // descriptors produced by older cooked data, even though new passages use the bend when
-        // a non-zero rise needs a guaranteed slope.
-        const float SourceFlatLength = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
-        const float RootFlatLength = Landing.RootSpineRadius > 0.0f
-            ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f;
-        const float SourceDistance = FMath::Clamp(
-            SourceFlatLength, 0.0f, Projection.TotalLength * 0.49f);
-        const float RootDistance = FMath::Clamp(
-            Projection.TotalLength - RootFlatLength,
-            Projection.TotalLength * 0.51f, Projection.TotalLength);
-        if (RootDistance <= SourceDistance + KINDA_SMALL_NUMBER)
-        {
-            return FMath::Clamp(
-                Projection.DistanceAlong / Projection.TotalLength, 0.0f, 1.0f);
-        }
-        return FMath::Clamp(
-            (Projection.DistanceAlong - SourceDistance)
-                / (RootDistance - SourceDistance), 0.0f, 1.0f);
-    }
+FVector VoxelCaveMorphology::ApplyCaveWarp(
+    const FVector& WorldPoint,
+    const FStrateGenerationParams& Params,
+    uint32 Seed)
+{
+    return VF_ApplyCaveWarp(WorldPoint, Params, Seed);
 }
 
 FVoxelPassageLanding VF_BuildPassageLanding(
@@ -2186,10 +2416,7 @@ FVoxelPassageLanding VF_BuildPassageLanding(
     float StrateTopZ,
     float StrateBottomZ,
     float BoundarySealThickness,
-    bool bSourcePlayerFit,
-    bool bHasNetworkConnector,
-    const FVector& NetworkPoint,
-    float RootSpineRadius)
+    bool bSourcePlayerFit)
 {
     FVoxelPassageLanding Landing;
 
@@ -2213,11 +2440,7 @@ FVoxelPassageLanding VF_BuildPassageLanding(
     Landing.CeilingZ = Landing.FloorZ + DesiredHeight;
     Landing.FloorThickness = VoxelPassageGeometry::LandingFloorThicknessVoxels;
     Landing.DoorDirection = Direction;
-    Landing.RootSpineRadius = FMath::Max(RootSpineRadius, 0.0f);
     Landing.bSourcePlayerFit = bSourcePlayerFit;
-    Landing.bHasNetworkConnector = false;
-    Landing.RootFloorZ = Landing.FloorZ;
-    Landing.RootCeilingZ = Landing.CeilingZ;
 
     // Keep the complete room and its floor strictly inside the vertical seal. Normal authored
     // strates have far more room than this bound; the clamp is a fail-safe for a source pose near
@@ -2257,125 +2480,6 @@ FVoxelPassageLanding VF_BuildPassageLanding(
         + Direction * FMath::Max(0.0f, Landing.HalfWidth - 1.0f);
     Landing.DoorPoint.Z = Landing.FloorZ + SafeMouthRadius;
 
-    if (bHasNetworkConnector
-        && FMath::IsFinite(NetworkPoint.X)
-        && FMath::IsFinite(NetworkPoint.Y)
-        && FMath::IsFinite(NetworkPoint.Z))
-    {
-        // The connector is a swept rectangular ramp.  Its source end keeps the authored landing
-        // floor; its root end is the common, deterministic interior floor supplied by the
-        // manager.  This is what joins two mouths in one strate when their source floors sit at
-        // opposite sides of the strate.  The manager chooses the common level inside the same
-        // seal-safe interval as this builder, so no source query or passage order can affect it.
-        // Five voxels = 1.25 m half-width / 2.5 m clear width.  This is the smallest whole-voxel
-        // root corridor that leaves a 1.36-voxel player capsule a two-voxel fit margin on
-        // the support lattice, while the landing itself remains the 3 m turn floor.  Its separate
-        // 12-voxel (3 m) clear height gives the 1.76 m capsule more than 1 m of headroom while the
-        // player walks out to the origin landing room.  The floor rise is linear along the
-        // horizontal run; if the direct run is too short, a level dog-leg makes the final ramp
-        // satisfy the same 15 degree walkable-tunnel limit by construction.
-        Landing.ConnectorRadius = VoxelPassageGeometry::ConnectorRadiusVoxels;
-        const float ConnectorHeight = VoxelPassageGeometry::ConnectorHeightVoxels;
-        Landing.ConnectorCeilingZ = Landing.FloorZ + ConnectorHeight;
-        Landing.RootFloorZ = NetworkPoint.Z;
-        Landing.RootCeilingZ = Landing.RootFloorZ + ConnectorHeight;
-
-        // Clamp the supplied common level again at the geometry boundary.  This is deliberately
-        // a clamp, not a per-passage repair: all callers derive NetworkPoint.Z from the strate's
-        // bounds, and malformed tiny strates remain sealed rather than producing a root breach.
-        if (FMath::IsFinite(InnerBottom) && FMath::IsFinite(InnerTop)
-            && InnerTop > InnerBottom)
-        {
-            const float RootMinFloor = InnerBottom + Landing.FloorThickness
-                + VF_LandingCarveSafetyMargin;
-            const float RootMaxFloor = InnerTop - ConnectorHeight
-                - VF_LandingCarveSafetyMargin;
-            if (RootMaxFloor >= RootMinFloor)
-            {
-                Landing.RootFloorZ = FMath::Clamp(
-                    Landing.RootFloorZ, RootMinFloor, RootMaxFloor);
-                Landing.RootCeilingZ = Landing.RootFloorZ + ConnectorHeight;
-            }
-            else
-            {
-                // There is no seal-safe interval for a full landing connector in a malformed
-                // tiny strate. Fail closed: a partial ramp that reaches a boundary is worse than
-                // an explicit unanswered landing, and normal authored strates never enter this
-                // branch.
-                return Landing;
-            }
-        }
-        else
-        {
-            return Landing;
-        }
-
-        const float ConnectorZ = (Landing.FloorZ + Landing.ConnectorCeilingZ) * 0.5f;
-        const float RootConnectorZ = (Landing.RootFloorZ + Landing.RootCeilingZ) * 0.5f;
-        // The origin is now a finite landing room, not a vertical air column. End the connector
-        // at the requested room centre so its floor meets the room floor directly. The room's
-        // own rounded-box SDF and floor post provide the complete volume; no annular shaft hub is
-        // synthesized here, and no floor is omitted at the centre.
-        const FVector2D RootEntryXY(NetworkPoint.X, NetworkPoint.Y);
-        Landing.ConnectorStart = FVector(
-            Landing.StandingPoint.X, Landing.StandingPoint.Y, ConnectorZ);
-        Landing.ConnectorEnd = FVector(RootEntryXY.X, RootEntryXY.Y, RootConnectorZ);
-
-        // A direct source-to-root ramp is usually gentle, but its length is not a contract: a
-        // legal source pose can be close to the spine while its floor is near a strate face. Add a
-        // deterministic level dog-leg whenever the direct run cannot meet the 15-degree law.
-        // The final leg is the only rising part, and its extra horizontal run includes the root
-        // room overlap. This makes the slope a construction guarantee for every seed, rather
-        // than a property observed in today's showcase seeds. WorldRadiusVoxels is deliberately
-        // zero, so the bounded world rim cannot be approached by this lateral safety run.
-        constexpr float WalkableSlope =
-            VoxelPassageGeometry::WalkableTunnelMaxGradient;
-        constexpr float RootFlatLength = VoxelPassageGeometry::RootOverlapVoxels;
-        const FVector2D SourceXY(Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
-        const FVector2D RootXY(Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
-        const FVector2D Direct = RootXY - SourceXY;
-        const float DirectLength = Direct.Size();
-        const float FloorRise = FMath::Abs(Landing.RootFloorZ - Landing.FloorZ);
-        const float RequiredRampLength = FloorRise / WalkableSlope;
-        const float SourceFlatLength = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
-        if (FloorRise > KINDA_SMALL_NUMBER
-            && (DirectLength <= KINDA_SMALL_NUMBER
-                || DirectLength < RequiredRampLength + RootFlatLength + SourceFlatLength))
-        {
-            FVector2D Along = Direct;
-            if (!Along.Normalize())
-            {
-                Along = FVector2D(Direction.X, Direction.Y);
-                if (!Along.Normalize())
-                {
-                    Along = FVector2D(1.0f, 0.0f);
-                }
-            }
-            const FVector2D Perpendicular(-Along.Y, Along.X);
-            const float DogLegLength = RequiredRampLength + RootFlatLength + 1.0f;
-            const FVector2D ControlXY = RootXY + Perpendicular * DogLegLength;
-            Landing.ConnectorControl = FVector(ControlXY.X, ControlXY.Y, ConnectorZ);
-            Landing.bHasConnectorBend = true;
-        }
-        else if (FloorRise > KINDA_SMALL_NUMBER)
-        {
-            // Keep the same straight geometry when it already satisfies the bound. The explicit
-            // false flag is part of the descriptor so the evaluator and order-independence test
-            // cannot infer a different topology from an uninitialised control point.
-            Landing.ConnectorControl = FVector::ZeroVector;
-            Landing.bHasConnectorBend = false;
-        }
-        else
-        {
-            Landing.ConnectorControl = FVector(
-                (Landing.ConnectorStart.X + Landing.ConnectorEnd.X) * 0.5f,
-                (Landing.ConnectorStart.Y + Landing.ConnectorEnd.Y) * 0.5f,
-                ConnectorZ);
-            Landing.bHasConnectorBend = false;
-        }
-        Landing.bHasNetworkConnector = true;
-    }
-
     return Landing;
 }
 
@@ -2412,34 +2516,6 @@ float VF_EvaluatePassageLandingSDF(
         VoxelSDF::RoundedBox(Position, RoomCenter, RoomHalfExtent, RoomRounding),
         Landing.FloorZ - Position.Z);
 
-    if (Landing.bHasNetworkConnector && Landing.ConnectorRadius > 0.0f
-        && FMath::IsFinite(Landing.ConnectorCeilingZ)
-        && Landing.ConnectorCeilingZ > Landing.FloorZ
-        && FMath::IsFinite(Landing.RootFloorZ)
-        && FMath::IsFinite(Landing.RootCeilingZ)
-        && Landing.RootCeilingZ > Landing.RootFloorZ)
-    {
-        const FVoxelPassageLandingConnectorProjection Projection =
-            VF_ProjectPassageLandingConnector(Position, Landing);
-        const float FloorT = VF_PassageLandingConnectorFloorParameter(Projection, Landing);
-        const float HorizontalSDF = (FVector2D(Position.X, Position.Y)
-                                     - Projection.Closest).Size()
-            - Landing.ConnectorRadius;
-        const float ConnectorFloorZ = FMath::Lerp(
-            Landing.FloorZ, Landing.RootFloorZ, FloorT);
-        const float ConnectorCeilingZ = FMath::Lerp(
-            Landing.ConnectorCeilingZ, Landing.RootCeilingZ, FloorT);
-        const float VerticalSDF = FMath::Max(
-            ConnectorFloorZ - Position.Z,
-            Position.Z - ConnectorCeilingZ);
-        // A swept box with a flat source leg and a measured-slope final ramp, not a round bore:
-        // the floor normal is deterministic and bounded, while the fixed twelve-voxel clear height
-        // follows the route. The source and root ends are exactly the two flat landing floors.
-        const float ConnectorSDF = FMath::Max(HorizontalSDF, VerticalSDF);
-        LandingSDF = VoxelSDF::SmoothMin(LandingSDF, ConnectorSDF, 3.0f);
-
-    }
-
     return LandingSDF;
 }
 
@@ -2475,34 +2551,6 @@ bool VF_IsPassageLandingFloor(
         }
     }
 
-    if (Landing.bHasNetworkConnector && Landing.ConnectorRadius > 0.0f
-        && FMath::IsFinite(Landing.RootFloorZ)
-        && FMath::IsFinite(Landing.RootCeilingZ)
-        && Landing.RootCeilingZ > Landing.RootFloorZ)
-    {
-        const FVoxelPassageLandingConnectorProjection Projection =
-            VF_ProjectPassageLandingConnector(Position, Landing);
-        const FVector2D& Closest = Projection.Closest;
-        const float FloorT = VF_PassageLandingConnectorFloorParameter(Projection, Landing);
-        const float ConnectorFloorZ = FMath::Lerp(
-            Landing.FloorZ, Landing.RootFloorZ, FloorT);
-        if (IsInFloorBand(Position.Z, ConnectorFloorZ, Landing.FloorThickness))
-        {
-            // Keep connector support inset by half a voxel from its clear width.  The landing
-            // chamber—not this narrow transit leg—owns the 3 m turn floor; this inset preserves
-            // a solid walking strip without capping a neighbouring shaft at its edge.
-            const float FloorRadius = FMath::Max(
-                Landing.ConnectorRadius - 0.5f,
-                FVoxelPlayerCapsuleConstants::RadiusVoxels);
-            if ((FVector2D(Position.X, Position.Y) - Closest).SizeSquared()
-                    <= FMath::Square(FloorRadius))
-            {
-                return true;
-            }
-        }
-
-    }
-
     return false;
 }
 
@@ -2516,13 +2564,17 @@ bool VF_SuggestLandingPoint(
     float DesiredX,
     float DesiredY,
     float MaxLateralSnap,
-    FVector& OutPoint)
+    FVector& OutPoint,
+    int32 WorldSeed)
 {
     switch (Archetype)
     {
     case ECaveGeneratorType::TunnelNetwork:
     case ECaveGeneratorType::Underwater:
-        return VF_FindNearestHashRoomLandingPoint(CaveParams, Seed, StrateTopZ, StrateBottomZ,
+        return VF_FindNearestHashRoomLandingPoint(
+            CaveParams, Seed,
+            WorldSeed == MIN_int32 ? Seed : WorldSeed,
+            StrateTopZ, StrateBottomZ,
                                                   DesiredX, DesiredY, MaxLateralSnap, OutPoint);
 
     case ECaveGeneratorType::FlatPlain:
@@ -2551,13 +2603,17 @@ bool VF_SuggestLandingPoint(
     float DesiredX,
     float DesiredY,
     float MaxLateralSnap,
-    FVector& OutPoint)
+    FVector& OutPoint,
+    int32 WorldSeed)
 {
     switch (Archetype)
     {
     case ECaveGeneratorType::TunnelNetwork:
     case ECaveGeneratorType::Underwater:
-        return VF_FindNearestHashRoomLandingPoint(CaveParams, Seed, StrateTopZ, StrateBottomZ,
+        return VF_FindNearestHashRoomLandingPoint(
+            CaveParams, Seed,
+            WorldSeed == MIN_int32 ? Seed : WorldSeed,
+            StrateTopZ, StrateBottomZ,
                                                   DesiredX, DesiredY, MaxLateralSnap, OutPoint);
 
     case ECaveGeneratorType::FlatPlain:
@@ -2595,7 +2651,7 @@ bool VF_SuggestLandingPoint(
 //=============================================================================
 // Collects all rooms in the COLLECT region, computes a window-invariant
 // nearest-neighbor backbone for connectivity, decides tunnel connections, and
-// pre-computes all tunnel geometry (radii, Z offsets, midpoint warping, bounding
+// pre-computes all tunnel geometry (radii, floor-aligned wandering chains, bounding
 // spheres). Only rooms/tunnels relevant to the chunk (STORE region) are kept.
 //
 // The result is stored in OutCache and reused for every voxel in the chunk.
@@ -2610,6 +2666,7 @@ void VoxelCaveMorphology::BuildChunkCache(
 {
     // Clear previous data (arrays keep their allocation for reuse)
     OutCache.Rooms.Reset();
+    OutCache.RoomFloorJoins.Reset();
     OutCache.Tunnels.Reset();
     OutCache.Pits.Reset();
     OutCache.Chimneys.Reset();
@@ -2716,7 +2773,8 @@ void VoxelCaveMorphology::BuildChunkCache(
     TArray<FBuildRoom, TInlineAllocator<64>> BuildRooms;
 
     // --- ORIGIN ROOM ---
-    // Guaranteed large room at (0, 0) in each strate — the (0,0) descent spine hub.
+    // Guaranteed large origin landing at (0, 0) in each strate — the future shaft landing and
+    // graph root room. Inter-strate passage mouths are placed elsewhere and have no radial road.
     // Collected whenever (0,0) is inside the COLLECT region so it participates in the
     // connectivity decision; only stored if it can reach this chunk.
     int32 OriginIdx = -1;
@@ -2782,6 +2840,15 @@ void VoxelCaveMorphology::BuildChunkCache(
 
     const int32 NumRooms = BuildRooms.Num();
     if (NumRooms == 0) return;
+
+    // Keep the room floor calculation in one place so tunnel mouths and overlap joins use the
+    // same deterministic support plane as the emitted room. It includes the room-centre relief;
+    // the evaluator still applies the spatial relief field per voxel around that anchor.
+    const auto RoomFloorZFor = [&Params, Seed](const FBuildRoom& Room) -> float
+    {
+        return VF_RoomFloorZFromParts(
+            Room.Center, Room.RadiusXY, Room.RadiusZ, Room.Hash, Seed, Params);
+    };
 
     //=========================================================================
     // Window-invariant guaranteed backbone
@@ -2919,6 +2986,34 @@ void VoxelCaveMorphology::BuildChunkCache(
     TArray<bool, TInlineAllocator<64>> RoomConnected;
     RoomConnected.Init(false, NumRooms);
 
+    const auto ResolvePlayerFitPoint = [](FBuildRoom& Room, const FStrateGenerationParams& InParams,
+                                          uint32 InWorldSeed) -> bool
+    {
+        if (Room.bIsOrigin)
+        {
+            return false;
+        }
+        if (Room.bPlayerFitAttempted)
+        {
+            return Room.bHasPlayerFitPoint;
+        }
+        Room.bPlayerFitAttempted = true;
+        const FVFRoomLandingSite Site{
+            Room.Center,
+            Room.RadiusXY,
+            Room.RadiusZ,
+            Room.Hash,
+            false};
+        Room.bHasPlayerFitPoint = VF_FindPlayerFitPointForRoom(
+            InParams,
+            Site,
+            InParams.StrateTopWorldZ,
+            InParams.StrateBottomWorldZ,
+            InWorldSeed,
+            Room.PlayerFitPoint);
+        return Room.bHasPlayerFitPoint;
+    };
+
     for (int32 I = 0; I < NumRooms; I++)
     {
         for (int32 J = I + 1; J < NumRooms; J++)
@@ -2979,14 +3074,60 @@ void VoxelCaveMorphology::BuildChunkCache(
             const float RadA = FMath::Lerp(Params.TunnelMinRadius, Params.TunnelMaxRadius, FactorA);
             const float RadB = FMath::Lerp(Params.TunnelMinRadius, Params.TunnelMaxRadius, FactorB);
 
-            // --- ENDPOINT Z OFFSET ---
-            const float ZOffsetA = VoxelHash::ToFloatSigned(VoxelHash::Mix(TunnelHash ^ 0xA1B2C3D4u))
-                * RoomA.RadiusZ * Params.TunnelEndpointZOffset;
-            const float ZOffsetB = VoxelHash::ToFloatSigned(VoxelHash::Mix(TunnelHash ^ 0xD4C3B2A1u))
-                * RoomB.RadiusZ * Params.TunnelEndpointZOffset;
+            // --- ENDPOINT FLOOR ALIGNMENT ---
+            // The old endpoint Z roll entered each room at an arbitrary height. When the two
+            // rooms had different floor cuts, the tube then met one floor several metres above or
+            // below the other and the player-fit graph saw a vertical severance. Anchor each tube
+            // tangent to the two rooms' deterministic floor planes instead. Interior control
+            // points still receive bounded vertical wander, so this removes the lip without
+            // turning the whole network into a level grid.
+            const float RoomFloorA = RoomFloorZFor(RoomA);
+            const float RoomFloorB = RoomFloorZFor(RoomB);
+            const float SafeFloorA = FMath::IsFinite(RoomFloorA)
+                ? RoomFloorA : RoomA.Center.Z - RoomA.RadiusZ;
+            const float SafeFloorB = FMath::IsFinite(RoomFloorB)
+                ? RoomFloorB : RoomB.Center.Z - RoomB.RadiusZ;
+            FVector EndA = RoomA.Center + FVector(0.0f, 0.0f, SafeFloorA
+                + RadA - RoomA.Center.Z);
+            FVector EndB = RoomB.Center + FVector(0.0f, 0.0f, SafeFloorB
+                + RadB - RoomB.Center.Z);
 
-            FVector EndA = RoomA.Center + FVector(0.0f, 0.0f, ZOffsetA);
-            FVector EndB = RoomB.Center + FVector(0.0f, 0.0f, ZOffsetB);
+            // The passage landing query is allowed to move inside a warped room until the
+            // capsule actually fits.  Use that same deterministic fit anchor for graph mouths;
+            // otherwise a room whose centre needs a local correction gets a tunnel mouth at one
+            // point and the inter-strate/player-fit landing at another.  Querying with zero
+            // lateral budget pins the source site to this exact room centre (the helper still
+            // performs its bounded local fit search).  If a malformed asset cannot produce a
+            // source fit, retain the analytic room-floor fallback above.  PlayerFitPoint is a
+            // feet point; the tunnel floor's authored support band ends half a voxel below it,
+            // and the route probe stands one voxel above the tunnel-floor plane.  Subtracting a
+            // full voxel here makes that probe exactly the same feet point as the room landing.
+            FVector WorldEndA = VF_UnwarpCavePoint(EndA, Params, Seed);
+            FVector WorldEndB = VF_UnwarpCavePoint(EndB, Params, Seed);
+            if (!RoomA.bIsOrigin)
+            {
+                if (ResolvePlayerFitPoint(
+                        BuildRooms[I], Params, Seed))
+                {
+                    WorldEndA = FVector(
+                        RoomA.PlayerFitPoint.X,
+                        RoomA.PlayerFitPoint.Y,
+                        RoomA.PlayerFitPoint.Z - 1.0f + RadA);
+                    EndA = VF_ApplyCaveWarp(WorldEndA, Params, Seed);
+                }
+            }
+            if (!RoomB.bIsOrigin)
+            {
+                if (ResolvePlayerFitPoint(
+                        BuildRooms[J], Params, Seed))
+                {
+                    WorldEndB = FVector(
+                        RoomB.PlayerFitPoint.X,
+                        RoomB.PlayerFitPoint.Y,
+                        RoomB.PlayerFitPoint.Z - 1.0f + RadB);
+                    EndB = VF_ApplyCaveWarp(WorldEndB, Params, Seed);
+                }
+            }
 
             // --- BUILD CACHED TUNNEL ---
             FCachedTunnel CT;
@@ -2995,52 +3136,276 @@ void VoxelCaveMorphology::BuildChunkCache(
             CT.RadiusA = RadA;
             CT.RadiusB = RadB;
 
-            // --- PATH WARPING ---
-            const float TunnelLength = FVector::Dist(EndA, EndB);
+            // A room edge is not a straight capsule between cell centres. Build a deterministic
+            // chain of hash-jittered control points instead. The chain is keyed only by the pair
+            // hash, so every chunk that collects this edge reconstructs the same path; the wide
+            // collect region above keeps that topology seam-safe. The envelope is zero at both
+            // mouths so the room/tunnel join remains anchored, while the interior is allowed to
+            // wander in the horizontal plane perpendicular to the tunnel axis.
+            //
+            // The cache stores the graph in SDF coordinates, but the player walks in world
+            // coordinates. Building the chain directly in SDF space made the non-linear cave warp
+            // bend the floor and could turn a modest authored slope into a vertical severance.
+            // Pick the exact world-space mouth anchors by inversion, lay out the wandering chain
+            // there, then map each control point back into SDF space. This keeps the generated
+            // route deterministic and seam-safe while making its walkable floor the authored
+            // world-space interpolation between the two room floors.
+            const float TunnelLength = FVector::Dist(WorldEndA, WorldEndB);
+            const int32 WanderSegments = TunnelLength > 1.0f
+                ? FMath::Clamp(FMath::CeilToInt(TunnelLength / 48.0f), 3, 12)
+                : 1;
+            CT.ControlPoints.Reserve(WanderSegments + 1);
+            CT.ControlRadii.Reserve(WanderSegments + 1);
+            CT.WorldControlPoints.Reserve(WanderSegments + 1);
+            CT.WorldControlRadii.Reserve(WanderSegments + 1);
 
-            if (Params.TunnelWarpStrength > 0.0f && TunnelLength > 1.0f)
+            FVector HorizontalAxis(
+                WorldEndB.X - WorldEndA.X, WorldEndB.Y - WorldEndA.Y, 0.0f);
+            FVector PerpA;
+            if (HorizontalAxis.Normalize())
             {
-                FVector TunnelDir = (EndB - EndA).GetSafeNormal();
-                FVector PerpH = FVector(-TunnelDir.Y, TunnelDir.X, 0.0f);
-
-                float MaxWarp = FMath::Min(Params.TunnelWarpStrength, TunnelLength * 0.25f);
-                float WarpH = VoxelHash::ToFloatSigned(VoxelHash::Mix(TunnelHash ^ 0x1234ABCDu)) * MaxWarp;
-                float WarpV = VoxelHash::ToFloatSigned(VoxelHash::Mix(TunnelHash ^ 0x5678EF01u)) * MaxWarp * 0.3f;
-
-                FVector Mid = (EndA + EndB) * 0.5f;
-                Mid += PerpH * WarpH + FVector(0.0f, 0.0f, WarpV);
-
-                CT.Midpoint = Mid;
-                CT.RadiusMid = (RadA + RadB) * 0.5f;
-                CT.bHasMidpoint = true;
-
-                // Bounding sphere: encloses all 3 control points + max radius
-                CT.BoundCenter = (EndA + Mid + EndB) / 3.0f;
-                float MaxR = FMath::Max3(RadA, RadB, CT.RadiusMid) + BlendK;
-                float DistA = FVector::Dist(CT.BoundCenter, EndA);
-                float DistM = FVector::Dist(CT.BoundCenter, Mid);
-                float DistB = FVector::Dist(CT.BoundCenter, EndB);
-                float BoundR = FMath::Max3(DistA, DistM, DistB) + MaxR;
-                CT.BoundRadiusSq = BoundR * BoundR;
+                PerpA = FVector(-HorizontalAxis.Y, HorizontalAxis.X, 0.0f);
             }
             else
             {
-                CT.Midpoint = FVector::ZeroVector;
-                CT.RadiusMid = 0.0f;
-                CT.bHasMidpoint = false;
-
-                // Bounding sphere: encloses both endpoints + max radius
-                CT.BoundCenter = (EndA + EndB) * 0.5f;
-                float MaxR = FMath::Max(RadA, RadB) + BlendK;
-                float HalfLen = TunnelLength * 0.5f;
-                float BoundR = HalfLen + MaxR;
-                CT.BoundRadiusSq = BoundR * BoundR;
+                PerpA = FVector::RightVector;
             }
 
-            // Store only if this tunnel can actually reach a voxel in this chunk.
-            if (SphereTouchesSearchXY(CT.BoundCenter, CT.BoundRadiusSq))
+            const float MaxWander = FMath::Min(
+                FMath::Max(Params.TunnelWarpStrength, 0.0f), TunnelLength * 0.25f);
+            const float MaxRadiusVariation = 0.18f;
+            float PreviousSide = 0.0f;
+            for (int32 ControlIndex = 0;
+                 ControlIndex <= WanderSegments;
+                 ++ControlIndex)
+            {
+                const float T = static_cast<float>(ControlIndex)
+                    / static_cast<float>(WanderSegments);
+                const float Envelope = FMath::Sin(T * PI);
+                FVector WorldControlPoint = FMath::Lerp(WorldEndA, WorldEndB, T);
+                const float RadiusBase = FMath::Lerp(RadA, RadB, T);
+                float ControlRadius = RadiusBase;
+
+                if (ControlIndex > 0 && ControlIndex < WanderSegments)
+                {
+                    const uint32 PointHash = VoxelHash::Mix(
+                        TunnelHash ^ (0xBADC0DEu
+                            + static_cast<uint32>(ControlIndex) * 0x9E3779B9u));
+                    const float RawSide = VoxelHash::ToFloatSigned(
+                        VoxelHash::Mix(PointHash ^ 0x13579BDFu));
+                    // A short deterministic low-pass keeps the chain organic instead of making
+                    // every control point a sharp alternating zig-zag.
+                    const float Side = RawSide * 0.65f + PreviousSide * 0.35f;
+                    WorldControlPoint += PerpA * (Side * MaxWander * Envelope);
+                    PreviousSide = Side;
+
+                    const float RadiusNoise = VoxelHash::ToFloatSigned(
+                        VoxelHash::Mix(PointHash ^ 0x5A17EADu));
+                    ControlRadius = FMath::Max(
+                        0.5f,
+                        RadiusBase * (1.0f + RadiusNoise * MaxRadiusVariation * Envelope));
+                }
+                else if (ControlIndex == 0)
+                {
+                    PreviousSide = 0.0f;
+                }
+
+                // Pin the endpoints after all arithmetic. This is the seam and room-mouth
+                // contract: no residual sin(PI) or interpolation rounding moves a mouth.
+                if (ControlIndex == 0)
+                {
+                    WorldControlPoint = WorldEndA;
+                    ControlRadius = RadA;
+                }
+                else if (ControlIndex == WanderSegments)
+                {
+                    WorldControlPoint = WorldEndB;
+                    ControlRadius = RadB;
+                }
+                CT.WorldControlPoints.Add(WorldControlPoint);
+                CT.WorldControlRadii.Add(ControlRadius);
+                const FVector ControlPoint = (ControlIndex == 0)
+                    ? EndA
+                    : ((ControlIndex == WanderSegments)
+                        ? EndB
+                        : VF_ApplyCaveWarp(WorldControlPoint, Params, Seed));
+                CT.ControlPoints.Add(ControlPoint);
+                CT.ControlRadii.Add(ControlRadius);
+            }
+
+            CT.Midpoint = CT.ControlPoints.Num() > 2
+                ? CT.ControlPoints[CT.ControlPoints.Num() / 2]
+                : FVector::ZeroVector;
+            CT.RadiusMid = CT.ControlRadii.Num() > 2
+                ? CT.ControlRadii[CT.ControlRadii.Num() / 2]
+                : 0.0f;
+            CT.bHasMidpoint = CT.ControlPoints.Num() > 2;
+
+            // Bounding sphere: enclose every control point and the widest local tube. The bound
+            // is built from the complete chain, not a midpoint approximation, so culling cannot
+            // clip a bend at a chunk edge.
+            CT.BoundCenter = FVector::ZeroVector;
+            for (const FVector& Point : CT.ControlPoints)
+            {
+                CT.BoundCenter += Point;
+            }
+            CT.BoundCenter /= static_cast<float>(FMath::Max(CT.ControlPoints.Num(), 1));
+            float MaxTunnelRadius = 0.0f;
+            float BoundR = 0.0f;
+            for (int32 PointIndex = 0; PointIndex < CT.ControlPoints.Num(); ++PointIndex)
+            {
+                MaxTunnelRadius = FMath::Max(
+                    MaxTunnelRadius, FMath::Abs(CT.ControlRadii[PointIndex]));
+                BoundR = FMath::Max(
+                    BoundR, FVector::Dist(CT.BoundCenter, CT.ControlPoints[PointIndex]));
+            }
+            BoundR += MaxTunnelRadius + BlendK;
+            CT.BoundRadiusSq = BoundR * BoundR;
+
+            // Keep a separate bound for the world-space structural backstop. The SDF and world
+            // chains have the same topology but their cave-warped coordinates do not share a
+            // useful rejection sphere.
+            CT.WorldBoundCenter = FVector::ZeroVector;
+            for (const FVector& Point : CT.WorldControlPoints)
+            {
+                CT.WorldBoundCenter += Point;
+            }
+            CT.WorldBoundCenter /= static_cast<float>(
+                FMath::Max(CT.WorldControlPoints.Num(), 1));
+            float WorldBoundR = 0.0f;
+            for (int32 PointIndex = 0;
+                 PointIndex < CT.WorldControlPoints.Num();
+                 ++PointIndex)
+            {
+                WorldBoundR = FMath::Max(
+                    WorldBoundR,
+                    FVector::Dist(CT.WorldBoundCenter, CT.WorldControlPoints[PointIndex]));
+            }
+            WorldBoundR += MaxTunnelRadius + BlendK;
+            CT.WorldBoundRadiusSq = WorldBoundR * WorldBoundR;
+
+            // Store if either representation can reach a voxel in this chunk. The warped SDF
+            // chain is needed by the room morphology; the world chain is needed by the final
+            // walkable-air backstop. Their bounds differ by design, so testing only the former
+            // could make a world-space route disappear at a chunk edge.
+            if (SphereTouchesSearchXY(CT.BoundCenter, CT.BoundRadiusSq)
+                || SphereTouchesSearchXY(CT.WorldBoundCenter, CT.WorldBoundRadiusSq))
             {
                 OutCache.Tunnels.Add(CT);
+            }
+        }
+    }
+
+    //==========================================================================
+    // FLATTEN INTERSECTING ROOMS
+    //==========================================================================
+    // A spherical room union is not automatically walkable when the two rooms' floor cuts land
+    // at different Z values. For every overlapping, connected room pair, add a short flat bridge
+    // only inside their actual horizontal overlap. This is a floor repair, not a graph edge: it
+    // does not connect a landing to the origin and it never creates a corridor through unrelated
+    // cells. The common plane is the higher of the two existing floors, so it does not cut below a
+    // room's authored support; the bridge is admitted only when the shared player/headroom volume
+    // still fits below both room ceilings.
+    OutCache.RoomFloorJoins.Reserve(NumRooms / 2);
+    const float JoinRequiredHeight =
+        VoxelPassageGeometry::PlayerHeightVoxels
+        + VoxelPassageGeometry::HeadroomVoxels;
+    const float JoinMinimumRadius =
+        VoxelPassageGeometry::PlayerRadiusVoxels + 0.5f;
+    const float JoinCentreClearance =
+        VoxelPassageGeometry::PlayerRadiusVoxels + 2.0f;
+    for (int32 I = 0; I < NumRooms; ++I)
+    {
+        const FBuildRoom& RoomA = BuildRooms[I];
+        if (!RoomA.bStore || !RoomConnected[I]) continue;
+
+        for (int32 J = I + 1; J < NumRooms; ++J)
+        {
+            const FBuildRoom& RoomB = BuildRooms[J];
+            if (!RoomB.bStore || !RoomConnected[J]) continue;
+
+            const FVector2D DeltaXY(
+                RoomB.Center.X - RoomA.Center.X,
+                RoomB.Center.Y - RoomA.Center.Y);
+            const float DistanceXY = DeltaXY.Size();
+            if (DistanceXY <= KINDA_SMALL_NUMBER
+                || DistanceXY >= RoomA.RadiusXY + RoomB.RadiusXY)
+            {
+                continue;
+            }
+
+            const float VerticalReach = RoomA.RadiusZ + RoomB.RadiusZ;
+            if (FMath::Abs(RoomB.Center.Z - RoomA.Center.Z) >= VerticalReach)
+            {
+                continue;
+            }
+
+            const float FloorA = RoomFloorZFor(RoomA);
+            const float FloorB = RoomFloorZFor(RoomB);
+            const float CommonFloor = FMath::Max(FloorA, FloorB);
+            const float SharedCeiling = FMath::Min(
+                RoomA.Center.Z + RoomA.RadiusZ,
+                RoomB.Center.Z + RoomB.RadiusZ);
+            if (!FMath::IsFinite(CommonFloor)
+                || !FMath::IsFinite(SharedCeiling)
+                || SharedCeiling - CommonFloor < JoinRequiredHeight)
+            {
+                continue;
+            }
+
+            // Along the centre-centre line, the two projected disks overlap over this interval.
+            // Trim both ends so the bridge remains a local room-edge join and leaves each room's
+            // player-fit centre untouched for the pure landing query.
+            const float OverlapStart = FMath::Max(
+                0.0f, DistanceXY - RoomB.RadiusXY);
+            const float OverlapEnd = FMath::Min(
+                DistanceXY, RoomA.RadiusXY);
+            const float OverlapLength = OverlapEnd - OverlapStart;
+            if (OverlapLength < 2.0f * JoinCentreClearance)
+            {
+                continue;
+            }
+
+            const float EdgeInset = FMath::Min(2.0f, OverlapLength * 0.2f);
+            const float StartDistance = FMath::Max(
+                OverlapStart + EdgeInset, JoinCentreClearance);
+            const float EndDistance = FMath::Min(
+                OverlapEnd - EdgeInset, DistanceXY - JoinCentreClearance);
+            if (EndDistance <= StartDistance)
+            {
+                continue;
+            }
+
+            const float JoinRadius = FMath::Min(
+                FMath::Min(RoomA.RadiusXY, RoomB.RadiusXY) * 0.35f,
+                (EndDistance - StartDistance) * 0.5f);
+            if (!FMath::IsFinite(JoinRadius) || JoinRadius < JoinMinimumRadius)
+            {
+                continue;
+            }
+
+            const FVector2D AxisXY = DeltaXY / DistanceXY;
+            const float JoinCentreZ = CommonFloor + 0.5f * JoinRequiredHeight;
+            FCachedRoomFloorJoin Join;
+            Join.Start = FVector(
+                RoomA.Center.X + AxisXY.X * StartDistance,
+                RoomA.Center.Y + AxisXY.Y * StartDistance,
+                JoinCentreZ);
+            Join.End = FVector(
+                RoomA.Center.X + AxisXY.X * EndDistance,
+                RoomA.Center.Y + AxisXY.Y * EndDistance,
+                JoinCentreZ);
+            Join.Radius = JoinRadius;
+            Join.FloorZ = CommonFloor;
+            Join.CeilingZ = CommonFloor + JoinRequiredHeight;
+            Join.BoundCenter = (Join.Start + Join.End) * 0.5f;
+            const float BoundRadius = 0.5f * FVector::Dist(Join.Start, Join.End)
+                + Join.Radius + BlendK;
+            Join.BoundRadiusSq = BoundRadius * BoundRadius;
+
+            if (SphereTouchesSearchXY(Join.BoundCenter, Join.BoundRadiusSq))
+            {
+                OutCache.RoomFloorJoins.Add(MoveTemp(Join));
             }
         }
     }
@@ -3076,7 +3441,7 @@ void VoxelCaveMorphology::BuildChunkCache(
         if (!BR.bStore) continue;  // Far room — collected for connectivity only
 
         // Sealed-bubble cull: a room no tunnel ever reaches would be an isolated air
-        // pocket — don't carve it at all. The origin room is always kept (spine hub).
+        // pocket — don't carve it at all. The origin landing is always kept (future shaft/root).
         if (!RoomConnected[RoomIdx] && !BR.bIsOrigin) continue;
 
         FCachedRoom CR;
@@ -3327,6 +3692,27 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         MinSDF = VoxelSDF::SmoothMin(MinSDF, RoomSDF, BlendK);
     }
 
+    //==========================================================================
+    // Flattened room joins
+    //==========================================================================
+    // These short bridges exist only where two room bodies already overlap. Their floor is a
+    // single horizontal plane, so a player crossing the shared volume cannot meet the tall lip
+    // produced by two independent floor cuts. They are deliberately not reported as rooms and do
+    // not participate in nearest-room terrain-op ownership.
+    for (const FCachedRoomFloorJoin& Join : Cache.RoomFloorJoins)
+    {
+        const float DistSq = FVector::DistSquared(Pos, Join.BoundCenter);
+        if (DistSq > Join.BoundRadiusSq) continue;
+
+        const float HorizontalSDF = VoxelSDF::Capsule(
+            Pos, Join.Start, Join.End, Join.Radius);
+        const float VerticalSDF = FMath::Max(
+            Join.FloorZ - Pos.Z,
+            Pos.Z - Join.CeilingZ);
+        const float JoinSDF = FMath::Max(HorizontalSDF, VerticalSDF);
+        MinSDF = VoxelSDF::SmoothMin(MinSDF, JoinSDF, BlendK);
+    }
+
     //=========================================================================
     // Tunnel SDFs
     //=========================================================================
@@ -3338,9 +3724,30 @@ float VoxelCaveMorphology::EvaluateSDFCached(
 
         float TunnelSDF;
 
-        if (Tunnel.bHasMidpoint)
+        if (Tunnel.ControlPoints.Num() >= 2
+            && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
         {
-            // Two-segment curved tunnel: A→Mid and Mid→B
+            // A wandering chain is evaluated segment-by-segment. Min keeps the shared control
+            // point watertight and preserves the old capsule union semantics; the outer
+            // SmoothMin is still the room/tunnel blend.
+            TunnelSDF = FLT_MAX;
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                 ++SegmentIndex)
+            {
+                TunnelSDF = FMath::Min(
+                    TunnelSDF,
+                    VoxelSDF::TaperedCapsule(
+                        Pos,
+                        Tunnel.ControlPoints[SegmentIndex],
+                        Tunnel.ControlPoints[SegmentIndex + 1],
+                        Tunnel.ControlRadii[SegmentIndex],
+                        Tunnel.ControlRadii[SegmentIndex + 1]));
+            }
+        }
+        else if (Tunnel.bHasMidpoint)
+        {
+            // Backward-compatible descriptor path for older cooked caches.
             float SegA = VoxelSDF::TaperedCapsule(Pos, Tunnel.EndpointA, Tunnel.Midpoint,
                                                    Tunnel.RadiusA, Tunnel.RadiusMid);
             float SegB = VoxelSDF::TaperedCapsule(Pos, Tunnel.Midpoint, Tunnel.EndpointB,
@@ -3349,7 +3756,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         }
         else
         {
-            // Straight single-segment tunnel
+            // Backward-compatible straight descriptor path.
             TunnelSDF = VoxelSDF::TaperedCapsule(Pos, Tunnel.EndpointA, Tunnel.EndpointB,
                                                   Tunnel.RadiusA, Tunnel.RadiusB);
         }
@@ -3364,6 +3771,183 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     }
 
     return MinSDF;
+}
+
+float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
+    float WorldX, float WorldY, float WorldZ,
+    const FChunkSDFCache& Cache)
+{
+    const FVector Pos(WorldX, WorldY, WorldZ);
+    float MinSDF = FLT_MAX;
+
+    for (const FCachedTunnel& Tunnel : Cache.Tunnels)
+    {
+        if (FVector::DistSquared(Pos, Tunnel.BoundCenter) > Tunnel.BoundRadiusSq)
+        {
+            continue;
+        }
+
+        if (Tunnel.ControlPoints.Num() >= 2
+            && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
+        {
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                 ++SegmentIndex)
+            {
+                MinSDF = FMath::Min(
+                    MinSDF,
+                    VoxelSDF::TaperedCapsule(
+                        Pos,
+                        Tunnel.ControlPoints[SegmentIndex],
+                        Tunnel.ControlPoints[SegmentIndex + 1],
+                        Tunnel.ControlRadii[SegmentIndex],
+                        Tunnel.ControlRadii[SegmentIndex + 1]));
+            }
+        }
+        else if (Tunnel.bHasMidpoint)
+        {
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.EndpointA, Tunnel.Midpoint,
+                    Tunnel.RadiusA, Tunnel.RadiusMid));
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.Midpoint, Tunnel.EndpointB,
+                    Tunnel.RadiusMid, Tunnel.RadiusB));
+        }
+        else
+        {
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.EndpointA, Tunnel.EndpointB,
+                    Tunnel.RadiusA, Tunnel.RadiusB));
+        }
+    }
+
+    return MinSDF;
+}
+
+float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+    float WorldX, float WorldY, float WorldZ,
+    const FChunkSDFCache& Cache)
+{
+    const FVector Pos(WorldX, WorldY, WorldZ);
+    float MinSDF = FLT_MAX;
+
+    for (const FCachedTunnel& Tunnel : Cache.Tunnels)
+    {
+        const bool bHasWorldChain = Tunnel.WorldControlPoints.Num() >= 2
+            && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num();
+        const FVector& BoundCenter = bHasWorldChain
+            ? Tunnel.WorldBoundCenter : Tunnel.BoundCenter;
+        const float BoundRadiusSq = bHasWorldChain
+            ? Tunnel.WorldBoundRadiusSq : Tunnel.BoundRadiusSq;
+        if (BoundRadiusSq > 0.0f
+            && FVector::DistSquared(Pos, BoundCenter) > BoundRadiusSq)
+        {
+            continue;
+        }
+
+        const TArray<FVector>& ControlPoints = bHasWorldChain
+            ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
+        const TArray<float>& ControlRadii = bHasWorldChain
+            ? Tunnel.WorldControlRadii : Tunnel.ControlRadii;
+        if (bHasWorldChain)
+        {
+            float FloorZ = 0.0f;
+            float SupportRadius = 0.0f;
+            if (VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                    ControlPoints, ControlRadii, Pos, FloorZ, SupportRadius)
+                && WorldZ <= FloorZ
+                    + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels)
+            {
+                // The finite floor slab owns the bottom of this tunnel. Another intersecting
+                // tunnel may still win below its own floor; the loop continues so that air
+                // ownership remains the union of all valid tunnel cores.
+                continue;
+            }
+        }
+        if (ControlPoints.Num() >= 2
+            && ControlRadii.Num() == ControlPoints.Num())
+        {
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < ControlPoints.Num();
+                 ++SegmentIndex)
+            {
+                MinSDF = FMath::Min(
+                    MinSDF,
+                    VoxelSDF::TaperedCapsule(
+                        Pos,
+                        ControlPoints[SegmentIndex],
+                        ControlPoints[SegmentIndex + 1],
+                        ControlRadii[SegmentIndex],
+                        ControlRadii[SegmentIndex + 1]));
+            }
+        }
+        else if (Tunnel.bHasMidpoint)
+        {
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.EndpointA, Tunnel.Midpoint,
+                    Tunnel.RadiusA, Tunnel.RadiusMid));
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.Midpoint, Tunnel.EndpointB,
+                    Tunnel.RadiusMid, Tunnel.RadiusB));
+        }
+        else
+        {
+            MinSDF = FMath::Min(
+                MinSDF,
+                VoxelSDF::TaperedCapsule(
+                    Pos, Tunnel.EndpointA, Tunnel.EndpointB,
+                    Tunnel.RadiusA, Tunnel.RadiusB));
+        }
+    }
+
+    return MinSDF;
+}
+
+bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+    float WorldX, float WorldY, float WorldZ,
+    const FChunkSDFCache& Cache)
+{
+    const FVector Pos(WorldX, WorldY, WorldZ);
+    for (const FCachedTunnel& Tunnel : Cache.Tunnels)
+    {
+        if (Tunnel.WorldControlPoints.Num() < 2
+            || Tunnel.WorldControlRadii.Num() != Tunnel.WorldControlPoints.Num())
+        {
+            continue;
+        }
+
+        float FloorZ = 0.0f;
+        float SupportRadius = 0.0f;
+        if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                Tunnel.WorldControlPoints,
+                Tunnel.WorldControlRadii,
+                Pos,
+                FloorZ,
+                SupportRadius)
+            || WorldZ > FloorZ + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
+            || WorldZ < FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+        {
+            continue;
+        }
+
+        if (Tunnel.WorldBoundRadiusSq <= 0.0f
+            || FVector::DistSquared(Pos, Tunnel.WorldBoundCenter)
+                <= Tunnel.WorldBoundRadiusSq)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 //=============================================================================

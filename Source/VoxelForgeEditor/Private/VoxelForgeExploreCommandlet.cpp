@@ -22,6 +22,7 @@
 #include "VoxelDiffLayer.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
+#include "VoxelNoise.h"
 #include "VoxelSettings.h"
 #include "VoxelStrateDefinition.h"
 #include "VoxelStrateManager.h"
@@ -32,21 +33,21 @@ namespace
 {
 using FExploreJsonWriter = TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>;
 
-constexpr int32 DefaultRenderWidth = 192;
-constexpr int32 DefaultRenderHeight = 128;
+constexpr int32 DefaultRenderWidth = 512;
+constexpr int32 DefaultRenderHeight = 288;
 constexpr float DefaultRenderStepVoxels = 0.25f;
-constexpr float DefaultRenderMaxDistanceVoxels = 256.0f;
+constexpr float DefaultRenderMaxDistanceVoxels = 160.0f;
 constexpr int32 DefaultExportSize = 128;
 constexpr int32 DefaultMaxWalkCells = 32000000;
 constexpr int32 MaxSyntheticStrates = 64;
 constexpr int32 MaxRenderPixels = 1048576;
-constexpr int64 MaxRenderDensitySamples = 200000000ll;
+constexpr int64 MaxRenderDensitySamples = 400000000ll;
 constexpr int32 MaxExportSize = 128;
 constexpr int64 MaxWalkWorkingBytes = 768ll * 1024ll * 1024ll;
-// The exact fine-grid walk retains Air + Density + player-fit bits, and can transiently hold
-// Parent + Queue + Path or Visited + NarrowCell + DFS stacks. 20 bytes/cell is a conservative
-// preflight figure for those arrays, including allocator slack/headroom.
-constexpr int64 EstimatedWalkBytesPerCell = 20ll;
+// The exact fine-grid walk retains Air + Density + player-fit bits + non-finite flags, and can
+// transiently hold Parent + Queue + Path or Visited + NarrowCell + DFS stacks. 21 bytes/cell is a
+// conservative preflight figure for those arrays, including allocator slack/headroom.
+constexpr int64 EstimatedWalkBytesPerCell = 21ll;
 constexpr int64 MaxExportWorkingBytes = 1024ll * 1024ll * 1024ll;
 
 const TCHAR* ArchetypeName(ECaveGeneratorType Archetype)
@@ -475,6 +476,8 @@ struct FExploreRenderFrame
 {
     FString FileName;
     FString Purpose = TEXT("overview");
+    FString CameraSeedSource = TEXT("player_fit");
+    FVector CameraSeedPoseVoxels = FVector::ZeroVector;
     FVector CameraVoxels = FVector::ZeroVector;
     FVector TargetVoxels = FVector::ZeroVector;
     int32 HitPixels = 0;
@@ -494,6 +497,9 @@ struct FExploreRenderOutput
     float MaxDistanceVoxels = 0.0f;
     int64 EstimatedFixedDensitySamples = 0;
     FString StepRationale;
+    FString CameraSeedPolicy;
+    int32 CameraSeedCount = 0;
+    bool bAllCamerasPlayerFit = false;
     TArray<FExploreRenderFrame> Frames;
 };
 
@@ -888,6 +894,7 @@ bool SavePng(
 bool RunRender(
     const FExploreArguments& Arguments,
     const FExploreWorld& World,
+    const FExploreWalkOutput& CameraSeedWalk,
     FExploreRenderOutput& OutOutput)
 {
     OutOutput = FExploreRenderOutput();
@@ -910,17 +917,120 @@ bool RunRender(
         "fixed 0.25-voxel default step (override with -renderstep), detects density sign crossings, "
         "and refines each crossing with 10 bisection iterations; it never sphere-traces.");
 
-    const float MiddleZ = 0.5f * static_cast<float>(World.TargetBottomWorldZ + World.TargetTopWorldZ);
-    const FVector Target(0.0f, 0.0f, MiddleZ);
-    const FVector CameraPositions[] = {
-        FVector(0.0f, -192.0f, MiddleZ + 32.0f),
-        FVector(192.0f, -160.0f, MiddleZ + 64.0f),
-        FVector(-160.0f, 128.0f, MiddleZ + 96.0f),
+    OutOutput.CameraSeedPolicy = TEXT(
+        "Every camera origin is a density-checked pose from the exact player-fit walk mask: "
+        "arrival, departure, last reached, and agent-final poses are considered in fixed order; "
+        "duplicate poses are removed. The target is offset toward the fitted route so the view is "
+        "from inside the walkable space.");
+
+    TArray<TPair<FVector, FString>, TInlineAllocator<4>> CameraSeeds;
+    const auto AddCameraSeed = [&](bool bAvailable, const FVector& Position, const TCHAR* Source)
+    {
+        if (!bAvailable
+            || !FMath::IsFinite(Position.X)
+            || !FMath::IsFinite(Position.Y)
+            || !FMath::IsFinite(Position.Z))
+        {
+            return;
+        }
+
+        // The walk mask is authoritative, but this guard catches stale/corrupt report data before
+        // a render can silently start inside rock.
+        const float Density = World.Generator->GetDensityAt(Position.X, Position.Y, Position.Z);
+        if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+        {
+            return;
+        }
+        for (const TPair<FVector, FString>& Existing : CameraSeeds)
+        {
+            if (Existing.Key.Equals(Position, 0.001f))
+            {
+                return;
+            }
+        }
+        CameraSeeds.Emplace(Position, FString(Source));
     };
 
-    for (int32 ViewIndex = 0; ViewIndex < UE_ARRAY_COUNT(CameraPositions); ++ViewIndex)
+    AddCameraSeed(
+        CameraSeedWalk.bHasArrival,
+        CameraSeedWalk.ArrivalVoxels,
+        TEXT("arrival_player_fit"));
+    AddCameraSeed(
+        CameraSeedWalk.bHasDeparture,
+        CameraSeedWalk.DepartureVoxels,
+        TEXT("departure_player_fit"));
+    AddCameraSeed(
+        CameraSeedWalk.Report.bHasLastReachedPosition,
+        CameraSeedWalk.Report.LastReachedVoxels,
+        TEXT("last_reached_player_fit"));
+    AddCameraSeed(
+        CameraSeedWalk.Report.bHasAgentFinalPosition,
+        CameraSeedWalk.Report.AgentFinalVoxels,
+        TEXT("agent_final_player_fit"));
+
+    if (CameraSeeds.Num() == 0)
     {
-        const FVector CameraPosition = CameraPositions[ViewIndex];
+        OutOutput.Status = TEXT("refused");
+        OutOutput.RefusalReason = TEXT(
+            "The player-fit seed pass produced no density-positive pose; refusing an inside-rock camera.");
+        return false;
+    }
+
+    OutOutput.CameraSeedCount = CameraSeeds.Num();
+    OutOutput.bAllCamerasPlayerFit = true;
+    FVector RouteFocus = FVector::ZeroVector;
+    int32 RouteFocusCount = 0;
+    if (CameraSeedWalk.bHasArrival)
+    {
+        RouteFocus += CameraSeedWalk.ArrivalVoxels;
+        ++RouteFocusCount;
+    }
+    if (CameraSeedWalk.bHasDeparture)
+    {
+        RouteFocus += CameraSeedWalk.DepartureVoxels;
+        ++RouteFocusCount;
+    }
+    if (RouteFocusCount > 0)
+    {
+        RouteFocus /= static_cast<float>(RouteFocusCount);
+    }
+    else
+    {
+        RouteFocus = CameraSeeds[0].Key;
+    }
+
+    const FVector KeyLightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
+    const FVector FillLightDirection = FVector(0.65f, 0.30f, 0.70f).GetSafeNormal();
+    constexpr float AmbientFill = 0.62f;
+    constexpr float KeyLightStrength = 0.50f;
+    constexpr float FillLightStrength = 0.24f;
+
+    for (int32 ViewIndex = 0; ViewIndex < CameraSeeds.Num(); ++ViewIndex)
+    {
+        const FVector CameraSeedPose = CameraSeeds[ViewIndex].Key;
+        const FVector CameraPosition = CameraSeedPose
+            + FVector::UpVector * (FVoxelPlayerCapsuleConstants::HalfHeightVoxels - 0.5f);
+        const float CameraDensity = World.Generator->GetDensityAt(
+            CameraPosition.X, CameraPosition.Y, CameraPosition.Z);
+        if (!FMath::IsFinite(CameraDensity) || !(CameraDensity > 0.0f))
+        {
+            OutOutput.Status = TEXT("refused");
+            OutOutput.RefusalReason = TEXT(
+                "The eye-height offset of a player-fit camera entered solid density.");
+            return false;
+        }
+        FVector LookDirection = RouteFocus - CameraPosition;
+        LookDirection.Z = 0.0f;
+        LookDirection.Normalize();
+        if (LookDirection.IsNearlyZero())
+        {
+            LookDirection = FVector(
+                ViewIndex == 1 ? -0.6f : 0.8f,
+                ViewIndex == 2 ? 0.7f : -0.4f,
+                0.18f).GetSafeNormal();
+        }
+        // Keep the camera at the fitted pose, while aiming at roughly eye level in the route.
+        const FVector Target = CameraPosition + LookDirection * 96.0f + FVector::UpVector * 8.0f;
         FExploreCameraBasis Basis;
         if (!BuildCameraBasis(
                 CameraPosition,
@@ -936,9 +1046,8 @@ bool RunRender(
         }
 
         TArray<FColor> Pixels;
-        Pixels.Init(FColor(7, 11, 18, 255), Arguments.RenderWidth * Arguments.RenderHeight);
+        Pixels.Init(FColor(12, 18, 28, 255), Arguments.RenderWidth * Arguments.RenderHeight);
         int32 HitPixels = 0;
-        const FVector LightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
         for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
         {
             for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
@@ -965,11 +1074,16 @@ bool RunRender(
                 }
 
                 ++HitPixels;
-                const float Diffuse = FMath::Max(0.0f, FVector::DotProduct(Normal, LightDirection));
-                const float Brightness = 0.18f + 0.82f * Diffuse;
-                const uint8 RockR = static_cast<uint8>(FMath::Clamp(54.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockG = static_cast<uint8>(FMath::Clamp(72.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockB = static_cast<uint8>(FMath::Clamp(92.0f * Brightness, 0.0f, 255.0f));
+                const float Key = FMath::Max(
+                    0.0f, FVector::DotProduct(Normal, KeyLightDirection));
+                const float Fill = FMath::Max(
+                    0.0f, FVector::DotProduct(Normal, FillLightDirection));
+                const float Brightness = FMath::Clamp(
+                    AmbientFill + KeyLightStrength * Key + FillLightStrength * Fill,
+                    0.0f, 1.25f);
+                const uint8 RockR = static_cast<uint8>(FMath::Clamp(100.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockG = static_cast<uint8>(FMath::Clamp(128.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockB = static_cast<uint8>(FMath::Clamp(160.0f * Brightness, 0.0f, 255.0f));
                 PutPixel(
                     Pixels,
                     Arguments.RenderWidth,
@@ -992,6 +1106,9 @@ bool RunRender(
 
         FExploreRenderFrame& Frame = OutOutput.Frames.AddDefaulted_GetRef();
         Frame.FileName = FString::Printf(TEXT("render_%02d.png"), ViewIndex);
+        Frame.Purpose = CameraSeeds[ViewIndex].Value;
+        Frame.CameraSeedSource = CameraSeeds[ViewIndex].Value;
+        Frame.CameraSeedPoseVoxels = CameraSeedPose;
         Frame.CameraVoxels = CameraPosition;
         Frame.TargetVoxels = Target;
         Frame.HitPixels = HitPixels;
@@ -1086,17 +1203,12 @@ bool RunFailureBoundaryRender(
     }
     const float SegmentLength = Segment.Size();
     const float ViewSideOffset = FMath::Min(64.0f, FMath::Max(16.0f, 0.25f * SegmentLength));
-    const FVector CameraCandidates[][3] = {
-        {
-            AgentFinal - SegmentDirection * 4.0f,
-            bHaveLastReached ? LastReached : AgentFinal,
-            AgentFinal,
-        },
-        {
-            TargetComponentCell + SegmentDirection * 4.0f,
-            TargetComponentCell,
-            TargetComponentCell,
-        },
+    // Failure-focus views are still required to originate from the fitted graph. The old
+    // implementation nudged the camera four voxels toward/away from the boundary and could put
+    // the viewpoint in the very rock that this diagnostic is meant to explain.
+    const FVector CameraCandidates[] = {
+        AgentFinal,
+        bHaveLastReached ? LastReached : AgentFinal,
     };
     const FVector ViewTargets[] = {
         Focus + ViewSide * ViewSideOffset,
@@ -1105,16 +1217,17 @@ bool RunFailureBoundaryRender(
 
     for (int32 ViewIndex = 0; ViewIndex < UE_ARRAY_COUNT(ViewTargets); ++ViewIndex)
     {
-        FVector CameraPosition = CameraCandidates[ViewIndex][2];
-        for (int32 CandidateIndex = 0; CandidateIndex < 3; ++CandidateIndex)
+        const FVector CameraSeedPose = CameraCandidates[ViewIndex];
+        const FVector CameraPosition = CameraSeedPose
+            + FVector::UpVector * (FVoxelPlayerCapsuleConstants::HalfHeightVoxels - 0.5f);
+        const float CameraDensity = World.Generator->GetDensityAt(
+            CameraPosition.X, CameraPosition.Y, CameraPosition.Z);
+        if (!FMath::IsFinite(CameraDensity) || !(CameraDensity > 0.0f))
         {
-            const FVector Candidate = CameraCandidates[ViewIndex][CandidateIndex];
-            const float Density = World.Generator->GetDensityAt(Candidate.X, Candidate.Y, Candidate.Z);
-            if (FMath::IsFinite(Density) && Density > 0.0f)
-            {
-                CameraPosition = Candidate;
-                break;
-            }
+            UE_LOG(LogTemp, Warning,
+                TEXT("[VoxelForgeExplore] refusing failure-focus camera %d: fitted pose is not air."),
+                ViewIndex);
+            return false;
         }
         const float FailureMaxDistanceVoxels = FMath::Max(
             Arguments.RenderMaxDistanceVoxels,
@@ -1134,9 +1247,13 @@ bool RunFailureBoundaryRender(
         }
 
         TArray<FColor> Pixels;
-        Pixels.Init(FColor(7, 11, 18, 255), Arguments.RenderWidth * Arguments.RenderHeight);
+        Pixels.Init(FColor(12, 18, 28, 255), Arguments.RenderWidth * Arguments.RenderHeight);
         int32 HitPixels = 0;
-        const FVector LightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
+        const FVector KeyLightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
+        const FVector FillLightDirection = FVector(0.65f, 0.30f, 0.70f).GetSafeNormal();
+        constexpr float AmbientFill = 0.62f;
+        constexpr float KeyLightStrength = 0.50f;
+        constexpr float FillLightStrength = 0.24f;
         for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
         {
             for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
@@ -1163,11 +1280,16 @@ bool RunFailureBoundaryRender(
                 }
 
                 ++HitPixels;
-                const float Diffuse = FMath::Max(0.0f, FVector::DotProduct(Normal, LightDirection));
-                const float Brightness = 0.18f + 0.82f * Diffuse;
-                const uint8 RockR = static_cast<uint8>(FMath::Clamp(54.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockG = static_cast<uint8>(FMath::Clamp(72.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockB = static_cast<uint8>(FMath::Clamp(92.0f * Brightness, 0.0f, 255.0f));
+                const float Key = FMath::Max(
+                    0.0f, FVector::DotProduct(Normal, KeyLightDirection));
+                const float Fill = FMath::Max(
+                    0.0f, FVector::DotProduct(Normal, FillLightDirection));
+                const float Brightness = FMath::Clamp(
+                    AmbientFill + KeyLightStrength * Key + FillLightStrength * Fill,
+                    0.0f, 1.25f);
+                const uint8 RockR = static_cast<uint8>(FMath::Clamp(100.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockG = static_cast<uint8>(FMath::Clamp(128.0f * Brightness, 0.0f, 255.0f));
+                const uint8 RockB = static_cast<uint8>(FMath::Clamp(160.0f * Brightness, 0.0f, 255.0f));
                 PutPixel(
                     Pixels,
                     Arguments.RenderWidth,
@@ -1243,6 +1365,10 @@ bool RunFailureBoundaryRender(
         FExploreRenderFrame& Frame = InOutOutput.Frames.AddDefaulted_GetRef();
         Frame.FileName = FString::Printf(TEXT("failure_boundary_%02d.png"), ViewIndex);
         Frame.Purpose = TEXT("agent_final_red_target_component_nearest_green_last_reached_orange");
+        Frame.CameraSeedSource = bHaveLastReached && ViewIndex == 1
+            ? TEXT("last_reached_player_fit")
+            : TEXT("agent_final_player_fit");
+        Frame.CameraSeedPoseVoxels = CameraSeedPose;
         Frame.CameraVoxels = CameraPosition;
         Frame.TargetVoxels = ViewTargets[ViewIndex];
         Frame.HitPixels = HitPixels;
@@ -1273,8 +1399,8 @@ bool RunWalk(
 {
     OutOutput = FExploreWalkOutput();
     OutOutput.WindowPolicy = NeedsOriginInWindow(Arguments.Archetype)
-        ? TEXT("origin-inclusive mouth-AABB + margin")
-        : TEXT("mouth-AABB + margin");
+        ? TEXT("origin-inclusive target-strate passage-envelope AABB + margin")
+        : TEXT("target-strate passage-envelope AABB + margin");
 
     const int64 EstimatedWorkingBytes = static_cast<int64>(Arguments.MaxWalkCells)
         * EstimatedWalkBytesPerCell;
@@ -1308,6 +1434,57 @@ bool RunWalk(
     OutOutput.bHasArrival = true;
     OutOutput.bHasDeparture = true;
 
+    // Temporary seed-14 probe while diagnosing the fitted VerticalShafts junction. This is
+    // intentionally narrow and will be removed after the floor/tree seam is corrected.
+    if (Arguments.Archetype == ECaveGeneratorType::VerticalShafts && Arguments.Seed == 14)
+    {
+        const FVector ProbeA = OutOutput.ArrivalVoxels;
+        const FVector ProbeB(-100.8f, -26.9f, ProbeA.Z);
+        for (int32 Index = 0; Index <= 10; ++Index)
+        {
+            const float T = static_cast<float>(Index) / 10.0f;
+            const FVector P = FMath::Lerp(ProbeA, ProbeB, T);
+            const float Dm704 = World.Generator->GetDensityAt(P.X, P.Y, -704.0f);
+            const float Dm702 = World.Generator->GetDensityAt(P.X, P.Y, -702.0f);
+            const float Dm7005 = World.Generator->GetDensityAt(P.X, P.Y, -700.5f);
+            const float Dm700 = World.Generator->GetDensityAt(P.X, P.Y, -700.0f);
+            const float Dm6995 = World.Generator->GetDensityAt(P.X, P.Y, -699.5f);
+            const float Dm697 = World.Generator->GetDensityAt(P.X, P.Y, -697.0f);
+            float MinBody = FLT_MAX;
+            int32 NumSolidBody = 0;
+            int32 SolidOffsetX = 0;
+            int32 SolidOffsetY = 0;
+            int32 SolidBodyRow = -1;
+            for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+            {
+                for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+                {
+                    for (int32 BodyRow = 0; BodyRow < 8; ++BodyRow)
+                    {
+                        const float BodyDensity = World.Generator->GetDensityAt(
+                            P.X + static_cast<float>(OffsetX),
+                            P.Y + static_cast<float>(OffsetY),
+                            -699.5f + static_cast<float>(BodyRow));
+                        if (BodyDensity < MinBody)
+                        {
+                            MinBody = BodyDensity;
+                            SolidOffsetX = OffsetX;
+                            SolidOffsetY = OffsetY;
+                            SolidBodyRow = BodyRow;
+                        }
+                        NumSolidBody += BodyDensity <= 0.0f ? 1 : 0;
+                    }
+                }
+            }
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeExplore][TemporaryShaftProbe] t=%.2f xy=(%.2f,%.2f) "
+                     "d[-704,-702,-700.5,-700,-699.5,-697]=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] "
+                     "bodyMin=%.3f bodySolid=%d/72 firstMinOffset=(%d,%d) row=%d"),
+                T, P.X, P.Y, Dm704, Dm702, Dm7005, Dm700, Dm6995, Dm697,
+                MinBody, NumSolidBody, SolidOffsetX, SolidOffsetY, SolidBodyRow);
+        }
+    }
+
     FVoxelStrateMeasureSettings Settings;
     Settings.SampleStep = 1;
     Settings.MaxCells = Arguments.MaxWalkCells;
@@ -1316,9 +1493,86 @@ bool RunWalk(
     Settings.CoverPointB = FVector2D(OutOutput.DepartureVoxels.X, OutOutput.DepartureVoxels.Y);
     Settings.CoverMarginVoxels = FMath::CeilToFloat(
         Settings.PlayerCapsuleRadiusVoxels) + 2.0f;
+
+    // A mouth-AABB is not a landing window: the landing door and its local apron can legitimately
+    // leave that box before the player reaches the next room. Expand the same two-point box just
+    // enough to contain the selected production mouth envelope. This is still a bounded,
+    // deterministic measurement window; the central inter-strate descent belongs to the adjacent
+    // strata and is not folded into this intra-strate walk question.
+    const float WindowMinX = FMath::Min(OutOutput.ArrivalVoxels.X, OutOutput.DepartureVoxels.X);
+    const float WindowMaxX = FMath::Max(OutOutput.ArrivalVoxels.X, OutOutput.DepartureVoxels.X);
+    const float WindowMinY = FMath::Min(OutOutput.ArrivalVoxels.Y, OutOutput.DepartureVoxels.Y);
+    const float WindowMaxY = FMath::Max(OutOutput.ArrivalVoxels.Y, OutOutput.DepartureVoxels.Y);
+    const auto IncludeTargetPassageEnvelope = [&](
+        const FVoxelPassage* Passage,
+        const FVoxelPassageLanding& Landing)
+    {
+        if (Passage == nullptr)
+        {
+            return;
+        }
+
+        const auto IncludeXY = [&](const FVector& Point, float Radius)
+        {
+            if (!FMath::IsFinite(Point.X) || !FMath::IsFinite(Point.Y)
+                || !FMath::IsFinite(Point.Z) || !FMath::IsFinite(Radius))
+            {
+                return;
+            }
+            const float AbsRadius = FMath::Abs(Radius);
+            // Include control points whose centreline belongs to the measured strate. A control
+            // point just outside the boundary belongs to the adjacent strate's descent; pulling
+            // that whole switchback into this bounded walk box can multiply the sampled volume
+            // without improving the intra-strate mouth-to-mouth question.
+            if (Point.Z < static_cast<float>(World.TargetBottomWorldZ)
+                || Point.Z > static_cast<float>(World.TargetTopWorldZ))
+            {
+                return;
+            }
+            const float ExcessX = FMath::Max(
+                0.0f,
+                FMath::Max(
+                    WindowMinX - (Point.X + AbsRadius),
+                    (Point.X - AbsRadius) - WindowMaxX));
+            const float ExcessY = FMath::Max(
+                0.0f,
+                FMath::Max(
+                    WindowMinY - (Point.Y + AbsRadius),
+                    (Point.Y - AbsRadius) - WindowMaxY));
+            Settings.CoverMarginVoxels = FMath::Max(
+                Settings.CoverMarginVoxels,
+                FMath::Max(ExcessX, ExcessY));
+        };
+
+        IncludeXY(
+            Landing.StandingPoint,
+            Landing.HalfWidth + VoxelPassageGeometry::LandingCarveBlendVoxels);
+        // The first/last three points are the production mouth, apron, and first slope section.
+        // Do not pull the whole inter-strate switchback into the bounded target-strate test.
+        const int32 NumLocalPoints = FMath::Min(3, Passage->ControlPoints.Num());
+        const bool bUseUpperEnd = &Landing == &Passage->UpperLanding;
+        const int32 FirstPoint = bUseUpperEnd
+            ? 0 : FMath::Max(0, Passage->ControlPoints.Num() - NumLocalPoints);
+        const int32 LastPoint = bUseUpperEnd
+            ? NumLocalPoints : Passage->ControlPoints.Num();
+        for (int32 PointIndex = FirstPoint; PointIndex < LastPoint; ++PointIndex)
+        {
+            const float Radius = Passage->ControlRadii.IsValidIndex(PointIndex)
+                ? Passage->ControlRadii[PointIndex] : Passage->Radius;
+            IncludeXY(Passage->ControlPoints[PointIndex], Radius
+                + VoxelPassageGeometry::LandingCarveBlendVoxels);
+        }
+    };
+    IncludeTargetPassageEnvelope(
+        ArrivalPassage,
+        ArrivalPassage != nullptr ? ArrivalPassage->LowerLanding : FVoxelPassageLanding());
+    IncludeTargetPassageEnvelope(
+        DeparturePassage,
+        DeparturePassage != nullptr ? DeparturePassage->UpperLanding : FVoxelPassageLanding());
     Settings.bIncludeOriginInCoverWindow = NeedsOriginInWindow(Arguments.Archetype);
 
     TArray<FVector> LandingRoomProbePoints;
+
     auto AppendLandingRoomProbes = [&LandingRoomProbePoints](
         const FVoxelPassageLanding& Landing)
     {
@@ -1386,9 +1640,12 @@ bool RunWalk(
     }
     const int32 ArrivalProbeCount = ArrivalPassage != nullptr ? 5 : 0;
     const int32 DepartureProbeCount = DeparturePassage != nullptr ? 5 : 0;
+    const int32 LandingProbeCount = ArrivalProbeCount + DepartureProbeCount;
     OutOutput.ArrivalLandingRoomProbeCount = ArrivalProbeCount;
     OutOutput.DepartureLandingRoomProbeCount = DepartureProbeCount;
-    for (int32 ProbeIndex = 0; ProbeIndex < OutOutput.Report.ComponentProbePlayerFit.Num();
+    for (int32 ProbeIndex = 0;
+         ProbeIndex < FMath::Min(LandingProbeCount,
+             OutOutput.Report.ComponentProbePlayerFit.Num());
          ++ProbeIndex)
     {
         const bool bPlayerFit = OutOutput.Report.ComponentProbePlayerFit[ProbeIndex] != 0u;
@@ -1408,7 +1665,6 @@ bool RunWalk(
                 bInArrivalComponent ? 1 : 0;
         }
     }
-
     OutOutput.Status = TEXT("ok");
     return true;
 }
@@ -1829,11 +2085,15 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("bisection_iterations"), Output.Render.BisectionIterations);
         Writer->WriteValue(TEXT("human_marker_height_m"), 1.76);
         Writer->WriteValue(TEXT("step_rationale"), Output.Render.StepRationale);
+        Writer->WriteValue(TEXT("camera_seed_policy"), Output.Render.CameraSeedPolicy);
+        Writer->WriteValue(TEXT("camera_seed_count"), Output.Render.CameraSeedCount);
+        Writer->WriteValue(TEXT("all_cameras_player_fit"), Output.Render.bAllCamerasPlayerFit);
         Writer->WriteArrayStart(TEXT("images"));
         for (const FExploreRenderFrame& Frame : Output.Render.Frames)
         {
             Writer->WriteObjectStart();
             Writer->WriteValue(TEXT("purpose"), Frame.Purpose);
+            Writer->WriteValue(TEXT("camera_seed_source"), Frame.CameraSeedSource);
             Writer->WriteValue(TEXT("file"), Frame.FileName);
             WriteJsonVector(*Writer, TEXT("camera_voxels"), Frame.CameraVoxels, 1.0f);
             WriteJsonVector(*Writer, TEXT("target_voxels"), Frame.TargetVoxels, 1.0f);
@@ -2102,16 +2362,8 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
 
     FExploreRunOutput Output;
     bool bRequestedModeFailed = false;
-    if (Arguments.bRender)
-    {
-        const double Start = FPlatformTime::Seconds();
-        if (!RunRender(Arguments, World, Output.Render))
-        {
-            bRequestedModeFailed = true;
-        }
-        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render %.3fs (%s)"),
-            FPlatformTime::Seconds() - Start, *Output.Render.Status);
-    }
+    FExploreWalkOutput RenderSeedWalk;
+    const FExploreWalkOutput* CameraSeedWalk = nullptr;
     if (Arguments.bWalk)
     {
         const double Start = FPlatformTime::Seconds();
@@ -2121,6 +2373,31 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] walk %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Walk.Status);
+        CameraSeedWalk = &Output.Walk;
+    }
+    else if (Arguments.bRender)
+    {
+        // A render-only invocation still has to obey the inside-walkable-space contract. Run the
+        // same focused walk as a private seed pass; it is intentionally omitted from the render-only
+        // JSON so the selected mode remains render.
+        const double Start = FPlatformTime::Seconds();
+        if (!RunWalk(Arguments, World, RenderSeedWalk))
+        {
+            bRequestedModeFailed = true;
+        }
+        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render camera seed walk %.3fs (%s)"),
+            FPlatformTime::Seconds() - Start, *RenderSeedWalk.Status);
+        CameraSeedWalk = &RenderSeedWalk;
+    }
+    if (Arguments.bRender)
+    {
+        const double Start = FPlatformTime::Seconds();
+        if (CameraSeedWalk == nullptr || !RunRender(Arguments, World, *CameraSeedWalk, Output.Render))
+        {
+            bRequestedModeFailed = true;
+        }
+        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render %.3fs (%s)"),
+            FPlatformTime::Seconds() - Start, *Output.Render.Status);
     }
     if (Arguments.bFailureFocusRender && Arguments.bRender && Arguments.bWalk)
     {

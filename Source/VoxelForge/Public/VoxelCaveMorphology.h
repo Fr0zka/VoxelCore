@@ -10,17 +10,17 @@
 // infinite worlds without storing anything.
 //
 // ROOMS:
-// - Origin room: guaranteed large room at (0,0) per strate — the hub
+// - Origin room: guaranteed large room at (0,0) per strate — the future shaft landing
 // - Hash rooms: ellipsoids, rounded boxes, or elongated capsules
 // - All blended with smooth-min for organic junctions
 //
 // TUNNELS:
 // - Connect pairs of rooms based on distance and probability
 // - Tapered (variable min/max radius at each endpoint)
-// - Curved (midpoint displaced perpendicular to tunnel direction)
+// - Curved wandering chains with deterministic perpendicular control-point jitter
 // - Horizontal bias (vertical connections penalized)
-// - Endpoint Z offset (tunnels enter rooms at different heights)
-// - Origin room forces connections to all nearby rooms
+// - Floor-aligned endpoints and variable radii preserve walkable room joins
+// - The origin room is not joined to landings by radial connector roads
 //
 // PIPELINE POSITION:
 // Step 3 (cave warp) bends the SDF query coordinates before we evaluate.
@@ -48,14 +48,10 @@ enum class ECaveGeneratorType : uint8;
  * `FloorZ = StandingPoint.Z - 0.5`.  The chamber is deliberately separate from the tube endpoint
  * so a sloped/vertical tube never presents the player with a hole as its first standing position.
  *
- * A source query answer selects the landing's XY/Z anchor.  Because that pure query does not
- * flood-fill the live network, every inter-strate end also gets a deterministic root connector
- * (`bHasNetworkConnector`).  Its flat floor ramps to the same common interior root level for that
- * strate, so both mouths enter the finite landing room at (0,0) even when their authored floors
- * are at opposite sides of the strate.  `RootSpineRadius` supplies the small endpoint overlap that
- * joins the connector to that room; it does not create a vertical shaft.  If the direct run would
- * be steeper than the named 15 degree tunnel contract, the connector uses a deterministic level
- * dog-leg before its final ramp; the bend is geometry, not a per-voxel search.
+ * A source query answer selects the landing's XY/Z anchor. The landing is deliberately local to
+ * that answer: it is a flat-floored room where the inter-strate tube meets a legal player-fit
+ * pose. The (0,0) landing is the only place reserved for the future straight surface shaft;
+ * progression mouths do not receive hidden radial roads to that spine room.
  */
 struct VOXELFORGE_API FVoxelPassageLanding
 {
@@ -63,23 +59,12 @@ struct VOXELFORGE_API FVoxelPassageLanding
     FVector DoorPoint = FVector::ZeroVector;
     FVector DoorDirection = FVector(1.0f, 0.0f, 0.0f);
 
-    FVector ConnectorStart = FVector::ZeroVector;
-    FVector ConnectorControl = FVector::ZeroVector;
-    FVector ConnectorEnd = FVector::ZeroVector;
-
     float FloorZ = 0.0f;
     float CeilingZ = 0.0f;
     float HalfWidth = 0.0f;
     float FloorThickness = 3.0f;
-    float ConnectorRadius = 0.0f;
-    float ConnectorCeilingZ = 0.0f;
-    float RootFloorZ = 0.0f;
-    float RootCeilingZ = 0.0f;
-    float RootSpineRadius = 0.0f;
 
     bool bSourcePlayerFit = false;
-    bool bHasNetworkConnector = false;
-    bool bHasConnectorBend = false;
 };
 
 //=============================================================================
@@ -202,17 +187,14 @@ VOXELFORGE_API FVoxelPassageLanding VF_BuildPassageLanding(
     float StrateTopZ,
     float StrateBottomZ,
     float BoundarySealThickness,
-    bool bSourcePlayerFit,
-    bool bHasNetworkConnector,
-    const FVector& NetworkPoint,
-    float RootSpineRadius = 0.0f);
+    bool bSourcePlayerFit);
 
-/** Signed distance of the room + optional root connector. Negative means passage air. */
+/** Signed distance of the local landing room. Negative means passage air. */
 VOXELFORGE_API float VF_EvaluatePassageLandingSDF(
     const FVector& Position,
     const FVoxelPassageLanding& Landing);
 
-/** True when a point belongs to the guaranteed solid floor slab of the landing/connector. */
+/** True when a point belongs to the guaranteed solid floor slab of the landing room. */
 VOXELFORGE_API bool VF_IsPassageLandingFloor(
     const FVector& Position,
     const FVoxelPassageLanding& Landing);
@@ -537,7 +519,7 @@ namespace VoxelNoise
 //   - Determine room existence, position, size
 //   - Run O(N²) nearest-neighbor backbone
 //   - Decide O(N²) tunnel connections with hash lookups
-//   - Compute tunnel radii, Z offsets, midpoint warping
+//   - Compute tunnel radii, floor-aligned endpoints, and wandering control chains
 //
 // With caching: build once, evaluate 32K times with just SDF math.
 // This is the single biggest CPU performance win for cave generation.
@@ -588,19 +570,41 @@ struct FCachedRoom
     float   ShapeR = 0.0f;
 };
 
-// A pre-computed tunnel segment — all connection decisions and hash-derived
-// properties (radius, Z offset, midpoint warp) are resolved during cache build.
+// A local flat-floor bridge over the overlap of two room bodies. It is not a new graph edge: it
+// only gives an existing spherical-room intersection one shared walkable floor level, removing
+// the high lip that otherwise appears when the two room floor cuts disagree.
+struct FCachedRoomFloorJoin
+{
+    FVector Start;
+    FVector End;
+    float Radius = 0.0f;
+    float FloorZ = 0.0f;
+    float CeilingZ = 0.0f;
+    FVector BoundCenter;
+    float BoundRadiusSq = 0.0f;
+};
+
+// A pre-computed wandering tunnel chain — all connection decisions and hash-derived properties
+// (radii, Z offsets, control points) are resolved during cache build.
 struct FCachedTunnel
 {
-    FVector EndpointA;    // First room's connection point (with Z offset)
-    FVector EndpointB;    // Second room's connection point (with Z offset)
+    FVector EndpointA;    // First room's floor-tangent connection point in SDF coordinates
+    FVector EndpointB;    // Second room's floor-tangent connection point in SDF coordinates
     float RadiusA;        // Tube radius at endpoint A
     float RadiusB;        // Tube radius at endpoint B
-    // Warped midpoint — only used if bHasMidpoint is true.
-    // Creates a two-segment curved path instead of a straight tube.
+    // Compatibility summary of the chain's first/middle/last points. These fields are retained
+    // for diagnostics and old cache consumers; EvaluateSDFCached uses ControlPoints when present.
     FVector Midpoint;
-    float RadiusMid;      // Radius at the midpoint (average of A and B)
-    bool bHasMidpoint;    // True when TunnelWarpStrength > 0 and tunnel is long enough
+    float RadiusMid;
+    bool bHasMidpoint;
+    TArray<FVector> ControlPoints;
+    TArray<float> ControlRadii;
+    // World-space copy used by the final structural air backstop. Evaluating this copy avoids
+    // turning a gentle authored floor ramp into a vertical break when the cave warp is nonlinear.
+    TArray<FVector> WorldControlPoints;
+    TArray<float> WorldControlRadii;
+    FVector WorldBoundCenter = FVector::ZeroVector;
+    float WorldBoundRadiusSq = 0.0f;
     // Bounding sphere for quick per-voxel rejection
     FVector BoundCenter;  // Center of the bounding sphere
     float BoundRadiusSq;  // Squared radius — if voxel is further, skip this tunnel
@@ -657,7 +661,8 @@ struct FCachedColumn
 // for every voxel in the chunk. Typically contains 5-15 rooms and 10-30 tunnels.
 struct FChunkSDFCache
 {
-    TArray<FCachedRoom>    Rooms;
+    TArray<FCachedRoom>          Rooms;
+    TArray<FCachedRoomFloorJoin> RoomFloorJoins;
     TArray<FCachedTunnel>  Tunnels;
     TArray<FCachedPit>     Pits;
     TArray<FCachedChimney> Chimneys;
@@ -681,6 +686,15 @@ namespace VoxelCaveMorphology
         return VoxelHash::Mix(WorldSeed ^ (uint32)(StrateIndex * 7919 + 104729));
     }
 
+    // Map a world-space query to the SDF coordinate space used by the room/tunnel cache. Keeping
+    // this transform in the morphology module lets the generator's post-disturbance structural
+    // check share the exact same warp as the source and the landing query.
+    VOXELFORGE_API FVector ApplyCaveWarp(
+        const FVector& WorldPoint,
+        const FStrateGenerationParams& Params,
+        uint32 Seed
+    );
+
     // PHASE 1: Build the SDF cache for a rectangular region.
     // Collects all rooms, computes nearest-neighbor backbone, decides tunnel
     // connections, and pre-computes all tunnel geometry (radii, offsets, midpoints).
@@ -697,7 +711,7 @@ namespace VoxelCaveMorphology
     // @param Seed         — world seed
     // @param StrateIndex  — which strate (offsets hash for variety)
     // @param TerrainOps   — optional probability pool; null = no per-room ops
-    void BuildChunkCache(
+    VOXELFORGE_API void BuildChunkCache(
         FChunkSDFCache& OutCache,
         float SearchMinX, float SearchMinY,
         float SearchMaxX, float SearchMaxY,
@@ -720,11 +734,35 @@ namespace VoxelCaveMorphology
     //                                  per-room terrain op assigned to this voxel's room.
     // (Room shape variety is baked into FCachedRoom by BuildChunkCache — no per-voxel roll.)
     // @return negative = inside cave, positive = solid rock
-    float EvaluateSDFCached(
+    VOXELFORGE_API float EvaluateSDFCached(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
         float SDFBlendRadius,
         int32* OutNearestRoomIdx = nullptr
+    );
+
+    // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
+    // the SmoothMin morphology: the generator uses it after terrain/passage posts to reassert the
+    // tunnel's walkable air core without reintroducing a connector or changing room ownership.
+    VOXELFORGE_API float EvaluateTunnelCoreSDF(
+        float WorldX, float WorldY, float WorldZ,
+        const FChunkSDFCache& Cache
+    );
+
+    // Evaluate the final structural air contract against the world-space wandering chain. Room
+    // SDFs remain evaluated in warped coordinates; only this post uses world coordinates so its
+    // walkable floor follows the authored chain exactly.
+    VOXELFORGE_API float EvaluateTunnelCoreWorldSDF(
+        float WorldX, float WorldY, float WorldZ,
+        const FChunkSDFCache& Cache
+    );
+
+    // True for the finite support slab beneath a world-space graph tunnel. The native density
+    // path and the operator stack use this same predicate before reopening the air core, keeping
+    // the rounded capsule's bottom from becoming an unsupported point.
+    VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
+        float WorldX, float WorldY, float WorldZ,
+        const FChunkSDFCache& Cache
     );
 
     // CONVENIENCE WRAPPER: builds a temporary cache and evaluates in one call.
@@ -748,7 +786,9 @@ namespace VoxelCaveMorphology
  * clear capsule volume. The local source stencil deliberately does not claim flood-fill
  * connectivity or a measured component size; it selects a topology-backed feature core instead.
  * For TunnelNetwork/Underwater, Seed must be the strate-specific room seed returned by
- * VoxelCaveMorphology::MakeStrateSeed; for slab, maze, shaft, and island archetypes, Seed is the
+ * VoxelCaveMorphology::MakeStrateSeed; the optional WorldSeed selects the production cave-warp
+ * field and should be the generator world seed. If omitted, the room seed is used for both for
+ * backward-compatible standalone queries. For slab, maze, shaft, and island archetypes, Seed is the
  * generator world seed consumed by their source. SurfaceWorld deliberately has no answer here:
  * its production height can be selected by manager-owned biome context and per-chunk state,
  * which this re-entrant query cannot inspect.
@@ -772,7 +812,8 @@ VOXELFORGE_API bool VF_SuggestLandingPoint(
     float DesiredX,
     float DesiredY,
     float MaxLateralSnap,
-    FVector& OutPoint
+    FVector& OutPoint,
+    int32 WorldSeed = MIN_int32
 );
 
 /**
@@ -797,5 +838,6 @@ VOXELFORGE_API bool VF_SuggestLandingPoint(
     float DesiredX,
     float DesiredY,
     float MaxLateralSnap,
-    FVector& OutPoint
+    FVector& OutPoint,
+    int32 WorldSeed = MIN_int32
 );

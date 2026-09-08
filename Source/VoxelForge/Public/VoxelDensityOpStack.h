@@ -250,7 +250,7 @@ public:
 
     /**
      * RÔLE 4 — ajoute les invariants de monde, dans l'ordre fixe, à la fin de la pile.
-     * spine (0,0) → seal de frontière → carve de passage → seal de limite XY.
+     * spine (0,0) → seal de frontière → carve de passage → [posts spécifiques] → seal de limite XY.
      *
      * ⚠️ La couche de diff (édits joueur) n'est PAS ici : elle vit dans `GetDensityAt`, APRÈS la
      * négation MC, avec les disturbances. Elle rejoindra la pile quand les disturbances seront
@@ -266,7 +266,8 @@ public:
      */
     VOXELFORGE_API void AppendStructuralPost(float StrateTopWorldZ, float StrateBottomWorldZ,
                                              float SealThickness, float BaseDensity, float SpineRadius,
-                                             const UVoxelStrateManager* StrateManager);
+                                             const UVoxelStrateManager* StrateManager,
+                                             bool bAppendEdgeSeal = true);
 
 private:
     TArray<FOpEntry> Ops;
@@ -387,10 +388,10 @@ namespace VoxelDensityOps
                                                 bool bAppendStructuralPosts = true);
 
     /**
-     * TunnelNetwork — **COMPLET, 20 ops** :
+     * TunnelNetwork — **COMPLET** :
      *   ConstantRock → RoomGraph(warp + pits + cheminées) → SdfCarve → CaveRoughness(4b)
      *   → Terrace → LayerLines → Ribbing → Overhang → Cliff → Scallop → Arch → RoomColumn(4d)
-     *   → Dome(4g) → Pinch(4h) → FloorBias → Worms → [structural ×4]
+     *   → Dome(4g) → Pinch(4h) → FloorBias → Worms → [spine, boundary, passage, graph-air, XY seal]
      *
      * L'override d'op PAR SALLE (étape C1) n'ajoute aucun opérateur : `FRoomGraphSource` publie
      * `LocalParams()` — les params de la strate avec l'op de la salle la plus proche appliqué — et

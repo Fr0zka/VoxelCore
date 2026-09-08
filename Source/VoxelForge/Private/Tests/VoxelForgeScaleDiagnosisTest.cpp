@@ -420,16 +420,23 @@ namespace
         for (int32 TunnelIndex = 0; TunnelIndex < Cache.Tunnels.Num(); ++TunnelIndex)
         {
             const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIndex];
-            if (Tunnel.bHasMidpoint)
+            if (Tunnel.ControlPoints.Num() >= 2
+                && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
             {
-                VF_ConsiderTunnelSegment(
-                    World, Params, Core, Tunnel.EndpointA, Tunnel.Midpoint,
-                    Tunnel.RadiusA, Tunnel.RadiusMid,
-                    FString::Printf(TEXT("tunnel[%d].A-mid"), TunnelIndex), OutBest);
-                VF_ConsiderTunnelSegment(
-                    World, Params, Core, Tunnel.Midpoint, Tunnel.EndpointB,
-                    Tunnel.RadiusMid, Tunnel.RadiusB,
-                    FString::Printf(TEXT("tunnel[%d].mid-B"), TunnelIndex), OutBest);
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                     ++SegmentIndex)
+                {
+                    VF_ConsiderTunnelSegment(
+                        World, Params, Core,
+                        Tunnel.ControlPoints[SegmentIndex],
+                        Tunnel.ControlPoints[SegmentIndex + 1],
+                        Tunnel.ControlRadii[SegmentIndex],
+                        Tunnel.ControlRadii[SegmentIndex + 1],
+                        FString::Printf(TEXT("tunnel[%d].segment%d"),
+                            TunnelIndex, SegmentIndex),
+                        OutBest);
+                }
             }
             else
             {

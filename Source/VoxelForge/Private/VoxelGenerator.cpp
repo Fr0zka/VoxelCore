@@ -230,44 +230,6 @@ static float CellularNoise3D(const FVector& Position)
     return VoxelNoise::Cellular3D(Position);
 }
 
-// Structural tree capsules must meet shaft axes without landing inside a ledge band. A single
-// deterministic safe interval is enough for the whole tree: every shaft in one strate shares the
-// same ledge phase, and keeping every tree link in that interval also keeps crossings of unrelated
-// shafts out of their additive ledges. The fallback is only for malformed settings with no safe
-// interval; the stock params always take the proven branch.
-static float VF_SelectVerticalTreeConnectorZ(
-    const FVerticalShaftParams& Params,
-    float BottomZ,
-    float TopZ,
-    uint32 LinkHash)
-{
-    if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f)
-    {
-        const float Period = Params.LedgeSpacing;
-        const float RelativeBottom = BottomZ - Params.StrateBottomWorldZ;
-        const float RelativeTop = TopZ - Params.StrateBottomWorldZ;
-        const int32 FirstPeriod = FMath::FloorToInt(RelativeBottom / Period);
-        const float Random01 = VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash));
-
-        for (int32 PeriodOffset = 0; PeriodOffset <= 1; ++PeriodOffset)
-        {
-            const float PeriodStart = static_cast<float>(FirstPeriod + PeriodOffset) * Period;
-            const float SafeStart = FMath::Max(
-                RelativeBottom, PeriodStart + Params.LedgeDepth + 0.01f);
-            const float SafeEnd = FMath::Min(
-                RelativeTop, PeriodStart + Period - Params.LedgeDepth - 0.01f);
-            if (SafeEnd > SafeStart)
-            {
-                return Params.StrateBottomWorldZ
-                    + FMath::Lerp(SafeStart, SafeEnd, Random01);
-            }
-        }
-    }
-
-    return FMath::Lerp(BottomZ, TopZ,
-                       VoxelHash::ToFloat01(VoxelHash::Mix(LinkHash)));
-}
-
 //=============================================================================
 // DENSITY PIPELINE HELPERS (partagés entre TunnelNetwork et Slab)
 //=============================================================================
@@ -309,7 +271,7 @@ static FORCEINLINE void ApplyOriginLandingFloor(float& Density,
 // it works uniformly for every generator type. Stays inside the seal bands so it can
 // never breach a strate boundary. All features are hash-placed and deterministic.
 static void ApplyDisturbances(float& MC, float X, float Y, float Z,
-    const FStrateDisturbanceParams& D, uint32 Seed)
+    const FStrateDisturbanceParams& D, uint32 Seed, bool bProtectVerticalShaftAir)
 {
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
@@ -418,7 +380,10 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
         {
             float f = FMath::Clamp((Blend - sdf) / (Blend * 2.0f), 0.0f, 1.0f);
             f = SmoothStep01(f);
-            MC = FMath::Min(MC, -f * Solid);  // force solid
+            if (!bProtectVerticalShaftAir)
+            {
+                MC = FMath::Min(MC, -f * Solid);  // force solid
+            }
         }
     }
 
@@ -465,7 +430,10 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
                 f = SmoothStep01(f) * zFade;
                 best = FMath::Max(best, f);
             }
-            if (best > 0.0f) MC = FMath::Min(MC, -best * Solid);  // force solid
+            if (best > 0.0f && !bProtectVerticalShaftAir)
+            {
+                MC = FMath::Min(MC, -best * Solid);  // force solid
+            }
         }
     }
 }
@@ -497,6 +465,57 @@ namespace
     // A monotonic identity prevents stale CP_* reuse even if UObject allocation later recycles an
     // address. Relaxed ordering is sufficient: this allocates uniqueness, it publishes no data.
     std::atomic<uint64> GNextDensityCacheOwnerId { 0 };
+
+    struct FTunnelCoreCacheState
+    {
+        FChunkSDFCache Cache;
+        uint64 OwnerId = 0;
+        FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+        uint32 ParamsFingerprint = 0xFFFFFFFFu;
+        uint32 LayoutVersion = 0xFFFFFFFFu;
+        bool bValid = false;
+    };
+
+    static thread_local FTunnelCoreCacheState GTunnelCoreCache;
+    void PrepareTunnelCoreCache(
+        const UVoxelStrateManager& Manager,
+        const FIntVector& ChunkCoord,
+        const FStrateGenerationParams& Params,
+        uint32 ParamsFingerprint,
+        uint32 LayoutVersion,
+        uint64 OwnerId,
+        FTunnelCoreCacheState& OutState)
+    {
+        if (OutState.bValid
+            && OutState.OwnerId == OwnerId
+            && OutState.Chunk == ChunkCoord
+            && OutState.ParamsFingerprint == ParamsFingerprint
+            && OutState.LayoutVersion == LayoutVersion)
+        {
+            return;
+        }
+
+        const float ChunkMinX = static_cast<float>(ChunkCoord.X * CHUNK_SIZE);
+        const float ChunkMinY = static_cast<float>(ChunkCoord.Y * CHUNK_SIZE);
+        const float ChunkMaxX = ChunkMinX + static_cast<float>(CHUNK_SIZE);
+        const float ChunkMaxY = ChunkMinY + static_cast<float>(CHUNK_SIZE);
+        const float Expansion = FMath::Max(Params.CaveWarpStrength, 0.0f) + 2.0f;
+        const int32 StrateIndex = Manager.GetStrateIndex(
+            (static_cast<float>(ChunkCoord.Z) + 0.5f)
+            * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
+
+        VoxelCaveMorphology::BuildChunkCache(
+            OutState.Cache,
+            ChunkMinX - Expansion, ChunkMinY - Expansion,
+            ChunkMaxX + Expansion, ChunkMaxY + Expansion,
+            Params, static_cast<uint32>(Manager.GetWorldSeed()),
+            StrateIndex, nullptr);
+        OutState.OwnerId = OwnerId;
+        OutState.Chunk = ChunkCoord;
+        OutState.ParamsFingerprint = ParamsFingerprint;
+        OutState.LayoutVersion = LayoutVersion;
+        OutState.bValid = true;
+    }
 
     struct FVoxelStackParamRefs
     {
@@ -673,6 +692,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     // Query per-chunk params from the manager so each strate has different caves.
     float Result;
 
+    // A vertical tree connector may need to stay open through the shared disturbance and
+    // structural-post tail below. This is one bit for this density call, not cached voxel data.
+    VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+
     FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / CHUNK_SIZE),
         FMath::FloorToInt(WorldY / CHUNK_SIZE),
@@ -831,6 +854,23 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             // silently fall back to the old one-archetype switch.
             CP_UseOpStack = CP_UseOpStack || CP_UseComposerRegions;
 #endif
+            bool bUseNativeTunnelCore = !CP_UseCustomRecipe
+                && (CP_GenType == ECaveGeneratorType::TunnelNetwork
+                    || CP_GenType == ECaveGeneratorType::Underwater);
+#if WITH_EDITOR
+            bUseNativeTunnelCore = bUseNativeTunnelCore && !CP_UseComposerRegions;
+#endif
+            if (bUseNativeTunnelCore)
+            {
+                PrepareTunnelCoreCache(
+                    *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
+                    LayoutVersion, DensityCacheOwnerId, GTunnelCoreCache);
+            }
+            else
+            {
+                GTunnelCoreCache.bValid = false;
+            }
+
             if (CP_UseOpStack)
             {
                 CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
@@ -997,8 +1037,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                                           CP_TunnelFP, LayoutVersion);                break;
         }
 
-        // Disturbance layer (the "wow" post-process) — cached params, MC convention.
-        ApplyDisturbances(Result, WorldX, WorldY, WorldZ, CP_Dist, (uint32)Seed);
+        // Disturbance layer (the "wow" post-process) — cached params, MC convention. The
+        // vertical shaft tree opens a walkable route before this shared pass, so a bridge/ridge
+        // must not refill it. Both native and operator-stack paths use the same marker helper.
+        const bool bProtectVerticalShaftAir =
+            VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
+        ApplyDisturbances(Result, WorldX, WorldY, WorldZ, CP_Dist, (uint32)Seed,
+            bProtectVerticalShaftAir);
 
         // A disturbance is allowed to add visual detail, but it must not refill the landing's
         // measured air volume or turn its support slab back into a hole. Reassert the landing
@@ -1103,6 +1148,45 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
         StrateManager->ApplyPassageLandingRoomFloorMC(
             Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+
+        // Disturbance features are authored as a generic MC-space post and may add a ridge or
+        // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
+        // solid floor writer but before the global XY seal. This cache is built once per chunk,
+        // never once per voxel.
+        if (GTunnelCoreCache.bValid)
+        {
+            const bool bTunnelSupportFloor =
+                VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+                    WorldX, WorldY, WorldZ, GTunnelCoreCache.Cache);
+            if (bTunnelSupportFloor)
+            {
+                Result = FMath::Min(
+                    Result,
+                    -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
+            }
+            const float CoreSDF = VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+                WorldX, WorldY, WorldZ, GTunnelCoreCache.Cache);
+            if (!bTunnelSupportFloor
+                && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
+            {
+                Result = FMath::Max(
+                    Result,
+                    FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
+            }
+
+            // The graph tunnel can overlap an inter-strate landing at a room mouth. Its air
+            // backstop is allowed to reopen the tunnel, but the landing's proved support floor
+            // must own the final floor band; otherwise the graph post can erase the only support
+            // surface at the mouth and leave the player-fit graph with a disconnected pocket.
+            VF_ApplyOriginLandingFloorMC(
+                Result, WorldX, WorldY, WorldZ,
+                CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+            StrateManager->ApplyPassageLandingFloorMC(
+                Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+            StrateManager->ApplyPassageLandingRoomFloorMC(
+                Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+        }
     }
     else
     {
@@ -1164,6 +1248,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         }
     }
 
+    VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
     return Result;
 }
 
@@ -2261,6 +2346,28 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         StrateManager->ApplyPassageModifier(
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
+    }
+
+    // Terrain operations and passage support floors are allowed to write solid density, but the
+    // graph's own tunnel floor/core are structural route geometry. Close the rounded bottom first,
+    // then reopen only the core above its half-voxel air clearance. Both predicates are shared
+    // with the operator stack and are evaluated from the per-chunk cache, never per-voxel rebuilt.
+    const bool bTunnelSupportFloor =
+        VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+            WorldX, WorldY, WorldZ, SDFCache);
+    if (bTunnelSupportFloor)
+    {
+        Density = FMath::Max(Density, FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
+    }
+    const float TunnelCoreSDF = (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
+        ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(WorldX, WorldY, WorldZ, SDFCache)
+        : FLT_MAX;
+    if (!bTunnelSupportFloor
+        && TunnelCoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
+    {
+        Density = FMath::Min(
+            Density,
+            -FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
     }
     ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
         Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
@@ -4271,7 +4378,13 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     //     them. That matters: a capsule from a child to a parent two or three cells away must be
     //     present in the cells along its segment, not only in the cache centred on the child.
     struct FLocalShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
-    struct FLocalConn  { FVector A, B; float Radius; };
+    struct FLocalConn
+    {
+        FVector A, B;
+        float Radius = 0.0f;
+        float FloorZ = 0.0f;
+        bool bWalkableFloor = false;
+    };
     thread_local TArray<FLocalShaft, TInlineAllocator<10>> Shafts;
     thread_local TArray<FLocalConn, TInlineAllocator<32>> Conns;
     thread_local TArray<FLocalShaft, TInlineAllocator<81>> TreeEmitShafts;
@@ -4396,17 +4509,26 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
 
         auto EmitTreeConnector = [&](const FLocalShaft& Child, const FLocalShaft* Parent)
         {
-            const int32 ParentCellX = Parent != nullptr ? Parent->CellX : 0;
-            const int32 ParentCellY = Parent != nullptr ? Parent->CellY : 0;
-            const uint32 LinkHash = VoxelHash::Pair(
-                Child.CellX, Child.CellY, ParentCellX, ParentCellY, S ^ TreeSalt);
-            const float Zc = VF_SelectVerticalTreeConnectorZ(
-                Params, BottomZ, TopZ, LinkHash);
+            const float Zc = VoxelPassageGeometry::VerticalShaftConnectorCenterZ(
+                Params.StrateBottomWorldZ,
+                BottomZ,
+                TopZ,
+                Params.LedgeSpacing,
+                Params.LedgeDepth,
+                TreeConnectorRadius);
+            const float FloorZ = VoxelPassageGeometry::VerticalShaftConnectorFloorZ(
+                Params.StrateBottomWorldZ,
+                BottomZ,
+                TopZ,
+                Params.LedgeSpacing,
+                Params.LedgeDepth,
+                TreeConnectorRadius);
             const FVector ParentPoint = Parent != nullptr
                 ? FVector(Parent->X, Parent->Y, Zc)
                 : FVector(0.0f, 0.0f, Zc);
             const FLocalConn Conn{
-                FVector(Child.X, Child.Y, Zc), ParentPoint, TreeConnectorRadius };
+                FVector(Child.X, Child.Y, Zc), ParentPoint, TreeConnectorRadius,
+                FloorZ, true };
             if (ConnectorMayReachCell(Conn))
             {
                 Conns.Add(Conn);
@@ -4531,7 +4653,8 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
                         RoughnessReach + 1.0f)
                     : Params.ConnectorRadius;
                 const FLocalConn Conn{
-                    FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR };
+                    FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR,
+                    0.0f, false };
                 if (ConnectorMayReachCell(Conn))
                 {
                     Conns.Add(Conn);
@@ -4595,6 +4718,29 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
                 float Shelf = 1.0f - SmoothStep01(BandT / Params.LedgeDepth);
                 Density = FMath::Max(Density, Shelf * Params.BaseDensity);
             }
+        }
+    }
+
+    // The drainage tree is a walkable shaft network, not only a connected air SDF. Reassert its
+    // air core after partial shaft ledges, then emit support bands at the common first ledge level
+    // so every parent edge can be traversed by the player-fit stencil. This remains local to
+    // shaft edges; no landing-to-origin road is added.
+    for (const FLocalConn& C : Conns)
+    {
+        if (C.bWalkableFloor)
+        {
+            VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorAir(
+                Density, WorldX, WorldY, WorldZ,
+                C.A, C.B, C.Radius, C.FloorZ, Params.BaseDensity);
+        }
+    }
+    for (const FLocalConn& C : Conns)
+    {
+        if (C.bWalkableFloor)
+        {
+            VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorFloor(
+                Density, WorldX, WorldY, WorldZ,
+                C.A, C.B, C.Radius, C.FloorZ, Params.BaseDensity);
         }
     }
 

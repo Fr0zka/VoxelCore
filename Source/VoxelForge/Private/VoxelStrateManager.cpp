@@ -269,9 +269,10 @@ static bool VF_IsAnyPassageFloorAt(
             continue;
         }
         const FVoxelPassage& Passage = Passages[PassageIndex];
-        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            || VF_IsWalkableTunnelFloor(Passage, Position))
+            || VF_IsWalkableTunnelFloor(Passage, Position)))
         {
             return true;
         }
@@ -826,8 +827,6 @@ void UVoxelStrateManager::GeneratePassages()
     int32 TotalPassages = 0;
     int32 NumAimedAtUpperPlayerFit = 0;
     int32 NumAimedAtLowerPlayerFit = 0;
-    int32 NumUpperRootConnectors = 0;
-    int32 NumLowerRootConnectors = 0;
     TSet<FString> NoQueryArchetypes;
 
     const auto ArchetypeName = [](ECaveGeneratorType Archetype)
@@ -915,39 +914,6 @@ void UVoxelStrateManager::GeneratePassages()
         }
     };
 
-    const auto CommonRootFloorFor = [&](float StrateTopZ, float StrateBottomZ,
-                                        float BoundarySealThickness) -> float
-    {
-        // The two mouth queries may legitimately return floors near opposite strate faces.  The
-        // root is the origin landing room's floor, not a hidden continuous shaft and not a
-        // passage-order-dependent midpoint.  Reusing the same top-anchored geometry here makes
-        // every connector meet the (0,0) room at its actual support level.
-        const VoxelPassageGeometry::FOriginLandingGeometry OriginLanding =
-            VoxelPassageGeometry::BuildOriginLandingGeometry(
-                StrateTopZ, StrateBottomZ, BoundarySealThickness, OriginSpineRadius);
-        if (OriginLanding.bValid)
-        {
-            return OriginLanding.FloorZ;
-        }
-
-        // Malformed tiny strates still fail closed. This fallback is only for the descriptor
-        // builder's diagnostic path; normal authored strates always satisfy the room interval.
-        const float Seal = FMath::Max(BoundarySealThickness, 0.0f);
-        const float InnerBottom = StrateBottomZ + Seal;
-        const float InnerTop = StrateTopZ - Seal;
-        const float ConnectorHeight = FMath::Max(
-            12.0f, FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f);
-        constexpr float PassageBlendSafety = 4.0f;
-        const float MinimumFloor = InnerBottom + 3.0f + PassageBlendSafety;
-        const float MaximumFloor = InnerTop - ConnectorHeight - PassageBlendSafety;
-        if (FMath::IsFinite(MinimumFloor) && FMath::IsFinite(MaximumFloor)
-            && MaximumFloor >= MinimumFloor)
-        {
-            return 0.5f * (MinimumFloor + MaximumFloor);
-        }
-        return 0.5f * (InnerBottom + InnerTop);
-    };
-
     //=========================================================================
     // INTER-STRATE PASSAGES: tunnels connecting consecutive strates.
     // Each passage is randomly assigned one of 5 types, which determines
@@ -974,6 +940,17 @@ void UVoxelStrateManager::GeneratePassages()
 
         const float DistLo = FMath::Min(Cfg.DistanceMin, Cfg.DistanceMax);
         const float DistHi = FMath::Max(Cfg.DistanceMin, Cfg.DistanceMax);
+        // The origin room owns the future straight shaft. Keep the progression mouth outside its
+        // carve/blend envelope, then choose a deterministic point in the authored annulus. If an
+        // asset has an invalid inner radius, repair only that radius; the outer authored radius is
+        // preserved unless it is too small to contain the required inner edge.
+        const float OriginLandingHalfWidth =
+            VoxelPassageGeometry::LandingHalfWidthForRadius(OriginSpineRadius);
+        const float MinimumDescentDistance = FMath::Max(
+            OriginLandingHalfWidth + VoxelPassageGeometry::LandingCarveBlendVoxels,
+            VoxelPassageGeometry::MinimumTurnFloorWidthVoxels);
+        const float PlacementLo = FMath::Max(DistLo, MinimumDescentDistance);
+        const float PlacementHi = FMath::Max(DistHi, PlacementLo);
 
         const int32 Conns = FMath::Max(0, Cfg.Connections);
         for (int32 c = 0; c < Conns; c++)
@@ -1010,9 +987,11 @@ void UVoxelStrateManager::GeneratePassages()
                 break;
             }
 
-            // PLACEMENT: random angle, distance from the (0,0) spine within config range.
+            // PLACEMENT: random angle, distance from the (0,0) spine within a deterministic
+            // annulus. It is deliberately not the spine: that room is reserved for the future
+            // surface shaft, while this passage opens a separate room in the strate network.
             const float Angle = PassageRandom01(PassageSaltAngle) * (2.0f * PI);
-            const float Distance = PassageRandomRange(DistLo, DistHi, PassageSaltDistance);
+            const float Distance = PassageRandomRange(PlacementLo, PlacementHi, PassageSaltDistance);
             const float PX = FMath::Cos(Angle) * Distance;
             const float PY = FMath::Sin(Angle) * Distance;
 
@@ -1049,7 +1028,8 @@ void UVoxelStrateManager::GeneratePassages()
                     PX,
                     PY,
                     MaxLateralSnapFor(*UpperDef),
-                    SuggestedUpperPoint);
+                    SuggestedUpperPoint,
+                    CachedSeed);
 
                 if (bAimedUpperAtPlayerFitPoint)
                 {
@@ -1088,7 +1068,8 @@ void UVoxelStrateManager::GeneratePassages()
                     PX,
                     PY,
                     MaxLateralSnap,
-                    SuggestedLowerPoint);
+                    SuggestedLowerPoint,
+                    CachedSeed);
 
                 if (bAimedLowerAtPlayerFitPoint)
                 {
@@ -1289,10 +1270,9 @@ void UVoxelStrateManager::GeneratePassages()
                     : FVector::ZeroVector,
                 PassageRandom01(PassageSaltLowerDoor) * 2.0f * PI);
 
-            // A source-fit answer proves only a local pose; none of the pure queries performs a
-            // flood fill over the live strate. Every mouth therefore receives the same explicit
-            // flat-floor connector to the deterministic root, including answered mouths. This
-            // is what makes the join guaranteed rather than merely probable.
+            // A source-fit answer is the landing itself. Keep it local to the requested room: the
+            // (0,0) landing is reserved for the future straight shaft, so no radial connector is
+            // synthesized here.
             Passage.UpperLanding = VF_BuildPassageLanding(
                 FVector(UpperX, UpperY, TopZ),
                 Cfg.MouthRadius,
@@ -1300,13 +1280,7 @@ void UVoxelStrateManager::GeneratePassages()
                 UpperTopZ,
                 UpperBottomZ,
                 UpperDef ? BoundarySealThicknessFor(*UpperDef) : 0.0f,
-                bAimedUpperAtPlayerFitPoint,
-                /*bHasNetworkConnector=*/true,
-                FVector(0.0f, 0.0f,
-                    CommonRootFloorFor(
-                        UpperTopZ, UpperBottomZ,
-                        UpperDef ? BoundarySealThicknessFor(*UpperDef) : 0.0f)),
-                OriginSpineRadius);
+                bAimedUpperAtPlayerFitPoint);
             Passage.LowerLanding = VF_BuildPassageLanding(
                 FVector(LowerX, LowerY, BottomZ),
                 Cfg.MouthRadius,
@@ -1314,17 +1288,9 @@ void UVoxelStrateManager::GeneratePassages()
                 LowerTopZ,
                 (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
                 LowerDef ? BoundarySealThicknessFor(*LowerDef) : 0.0f,
-                bAimedLowerAtPlayerFitPoint,
-                /*bHasNetworkConnector=*/true,
-                FVector(0.0f, 0.0f,
-                    CommonRootFloorFor(
-                        LowerTopZ, (float)(Lower.BottomChunkZ) * CHUNK_SIZE,
-                        LowerDef ? BoundarySealThicknessFor(*LowerDef) : 0.0f)),
-                OriginSpineRadius);
+                bAimedLowerAtPlayerFitPoint);
             Passage.UpperPoint = Passage.UpperLanding.StandingPoint;
             Passage.LowerPoint = Passage.LowerLanding.StandingPoint;
-            if (Passage.UpperLanding.bHasNetworkConnector) ++NumUpperRootConnectors;
-            if (Passage.LowerLanding.bHasNetworkConnector) ++NumLowerRootConnectors;
 
             if (Cfg.Style == EVoxelPassageStyle::Straight
                 && Passage.UpperLanding.HalfWidth > 0.0f
@@ -1554,14 +1520,11 @@ void UVoxelStrateManager::GeneratePassages()
             }
             // Fallback / bounds if an invalid authored width produced no positive profile.
             Passage.Radius = FMath::Max(Passage.Radius, FMath::Max(Cfg.MouthRadius, Cfg.MidRadius));
-            Passage.Radius = FMath::Max(Passage.Radius,
-                FMath::Max(Passage.UpperLanding.ConnectorRadius,
-                           Passage.LowerLanding.ConnectorRadius));
 
-            // Bounding sphere over the tube, both rooms, both floor slabs, and both optional root
-            // connectors (+ widest radius + blend) for culling. Under-sizing this sphere would
-            // cull a real landing and leave a sealed pocket, so the room's full box diagonal is
-            // included rather than treating the standing anchor as a point.
+            // Bounding sphere over the tube, both rooms, and both floor slabs (+ widest radius +
+            // blend) for culling. Under-sizing this sphere would cull a real landing and leave a
+            // sealed pocket, so the room's full box diagonal is included rather than treating the
+            // standing anchor as a point.
             {
                 FVector BoundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
                 FVector BoundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
@@ -1590,31 +1553,6 @@ void UVoxelStrateManager::GeneratePassages()
                         + 0.25f * FMath::Square(Height))
                         + Landing.FloorThickness + 4.0f;
                     IncludePoint(RoomCenter, RoomRadius);
-                    if (Landing.bHasNetworkConnector)
-                    {
-                        const float HubRadius = Landing.RootSpineRadius
-                            + Landing.ConnectorRadius;
-                        const float HubHalfHeight = 0.5f * FMath::Max(
-                            Landing.RootCeilingZ - Landing.RootFloorZ, 0.0f);
-                        IncludePoint(FVector(0.0f, 0.0f,
-                                             (Landing.RootFloorZ + Landing.RootCeilingZ) * 0.5f),
-                                     FMath::Sqrt(FMath::Square(HubRadius)
-                                         + FMath::Square(HubHalfHeight))
-                                         + Landing.FloorThickness + 4.0f);
-                        const float ConnectorHalfHeight = FMath::Max(
-                            0.5f * FMath::Max(
-                                Landing.ConnectorCeilingZ - Landing.FloorZ, 0.0f),
-                            Landing.ConnectorRadius);
-                        IncludePoint(Landing.ConnectorStart,
-                            ConnectorHalfHeight + 4.0f);
-                        if (Landing.bHasConnectorBend)
-                        {
-                            IncludePoint(Landing.ConnectorControl,
-                                ConnectorHalfHeight + 4.0f);
-                        }
-                        IncludePoint(Landing.ConnectorEnd,
-                            ConnectorHalfHeight + 4.0f);
-                    }
                 };
                 IncludeLanding(Passage.UpperLanding);
                 IncludeLanding(Passage.LowerLanding);
@@ -1646,13 +1584,11 @@ void UVoxelStrateManager::GeneratePassages()
     }
 
     UE_LOG(LogTemp, Log,
-        TEXT("[StrateManager] Passage landings: upper %d/%d and lower %d/%d source-fit; root floor connectors %d/%d; %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
+        TEXT("[StrateManager] Passage landings: upper %d/%d and lower %d/%d source-fit; %d/%d mouth queries fell back to random reach (archetypes with no query: %s)."),
         NumAimedAtUpperPlayerFit,
         TotalPassages,
         NumAimedAtLowerPlayerFit,
         TotalPassages,
-        NumUpperRootConnectors,
-        NumLowerRootConnectors,
         (TotalPassages * 2) - NumAimedAtUpperPlayerFit - NumAimedAtLowerPlayerFit,
         TotalPassages * 2,
         *NoQueryList);
@@ -1686,7 +1622,9 @@ void UVoxelStrateManager::GeneratePassages()
             // Keep the legacy type: this is the explicitly opted-in above-ground vertical opening,
             // not the default inter-strate descent style.
             Entry.PassageType = EVoxelPassageType::VerticalShaft;
-            Entry.Radius = FMath::Max(OriginSpineRadius * 0.7f, 4.0f);
+            // Match the reserved future shaft envelope exactly. The entry is only opened through
+            // the top seal into the finite landing room; lower strate seals remain untouched.
+            Entry.Radius = FMath::Max(OriginSpineRadius, 1.0f);
             Entry.UpperPoint = FVector(0.0f, 0.0f, TopZ + CHUNK_SIZE);
             // The capsule's lower tangent meets the room ceiling; it never bores through the
             // room's floor or creates an origin column in strate 0.
@@ -1779,8 +1717,8 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         }
 
         // A landing is a real room with a hard flat-floor half-space, not a sphere around the
-        // tube endpoint. The optional connector is the same fixed SDF geometry selected during
-        // GeneratePassages; it never performs a source query here.
+        // tube endpoint. It is the same fixed SDF geometry selected during GeneratePassages; it
+        // never performs a source query here and does not synthesize a radial root connector.
         const float UpperLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.UpperLanding);
         const float LowerLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.LowerLanding);
         MinSDF = VoxelSDF::SmoothMin(MinSDF, UpperLandingSDF, BlendK);
@@ -1807,9 +1745,10 @@ void UVoxelStrateManager::ApplyPassageModifier(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
-        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            || VF_IsWalkableTunnelFloor(Passage, Position))
+            || VF_IsWalkableTunnelFloor(Passage, Position)))
         {
             // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
             // support slab. It is deliberately applied after the air carve so a tube can never
@@ -1928,9 +1867,10 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
-        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            || VF_IsWalkableTunnelFloor(Passage, Position))
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+                || VF_IsWalkableTunnelFloor(Passage, Position)))
         {
             // Result is in MC convention here (negative = solid). This reassertion is the
             // structural floor backstop after the optional MC-space disturbance layer.
@@ -1971,8 +1911,9 @@ void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
-        if (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
-            || VF_IsPassageRoomFloor(Position, Passage.LowerLanding))
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
+                || VF_IsPassageRoomFloor(Position, Passage.LowerLanding)))
         {
             Density = FMath::Min(Density, -BaseDensity);
             break;
@@ -2030,50 +1971,6 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
                 return true;
             }
 
-            // The fallback connector carries the same support slab away from the room.  Its
-            // segment is not covered by the room AABB above; omitting it would let a tile that
-            // contains only the connector floor prove AllAir and erase the guaranteed join.
-            if (Landing->bHasNetworkConnector && Landing->ConnectorRadius > 0.0f
-                && FMath::IsFinite(Landing->ConnectorStart.X)
-                && FMath::IsFinite(Landing->ConnectorStart.Y)
-                && FMath::IsFinite(Landing->ConnectorStart.Z)
-                && FMath::IsFinite(Landing->ConnectorEnd.X)
-                && FMath::IsFinite(Landing->ConnectorEnd.Y)
-                && FMath::IsFinite(Landing->ConnectorEnd.Z))
-            {
-                const float ConnectorPad = Landing->ConnectorRadius + Pad;
-                float ConnectorMinX = FMath::Min(
-                    Landing->ConnectorStart.X, Landing->ConnectorEnd.X) - ConnectorPad;
-                float ConnectorMaxX = FMath::Max(
-                    Landing->ConnectorStart.X, Landing->ConnectorEnd.X) + ConnectorPad;
-                float ConnectorMinY = FMath::Min(
-                    Landing->ConnectorStart.Y, Landing->ConnectorEnd.Y) - ConnectorPad;
-                float ConnectorMaxY = FMath::Max(
-                    Landing->ConnectorStart.Y, Landing->ConnectorEnd.Y) + ConnectorPad;
-                if (Landing->bHasConnectorBend)
-                {
-                    ConnectorMinX = FMath::Min(
-                        ConnectorMinX, Landing->ConnectorControl.X - ConnectorPad);
-                    ConnectorMaxX = FMath::Max(
-                        ConnectorMaxX, Landing->ConnectorControl.X + ConnectorPad);
-                    ConnectorMinY = FMath::Min(
-                        ConnectorMinY, Landing->ConnectorControl.Y - ConnectorPad);
-                    ConnectorMaxY = FMath::Max(
-                        ConnectorMaxY, Landing->ConnectorControl.Y + ConnectorPad);
-                }
-                const float ConnectorMinZ = FMath::Min(
-                    Landing->FloorZ, Landing->RootFloorZ)
-                    - Landing->FloorThickness - Pad;
-                const float ConnectorMaxZ = FMath::Max(
-                    Landing->FloorZ, Landing->RootFloorZ) + Pad;
-                if (ConnectorMaxX >= MinVoxel.X && ConnectorMinX <= MaxVoxel.X
-                    && ConnectorMaxY >= MinVoxel.Y && ConnectorMinY <= MaxVoxel.Y
-                    && ConnectorMaxZ >= MinVoxel.Z && ConnectorMinZ <= MaxVoxel.Z)
-                {
-                    return true;
-                }
-
-            }
         }
 
         // The default tube also owns a three-voxel support band. Its conservative segment AABB

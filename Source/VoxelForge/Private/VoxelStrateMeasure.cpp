@@ -7,6 +7,7 @@
 #include "VoxelGenerator.h"
 #include "VoxelStrateManager.h"
 #include "VoxelTypes.h"
+#include "Async/ParallelFor.h"
 
 namespace VoxelStrateMeasurePrivate
 {
@@ -388,21 +389,26 @@ namespace VoxelStrateMeasurePrivate
             OutGrid.Density.SetNumUninitialized(OutGrid.CellCount);
         }
 
-        bool bSawNonFiniteDensity = false;
-        int32 CellIndex = 0;
-        for (int32 Z = 0; Z < OutGrid.NumZ; ++Z)
+        // Each Z slab writes a disjoint contiguous region. GetDensityAt is a const, read-only
+        // query used concurrently by the mesher, and custom samplers are required to provide
+        // the same const/thread-safe contract. The non-finite flag is also per-cell so the
+        // diagnostic reduction below never depends on task completion order.
+        TArray<uint8> NonFiniteFlags;
+        NonFiniteFlags.Init(0u, OutGrid.CellCount);
+        ParallelFor(OutGrid.NumZ, [&](int32 Z)
         {
             for (int32 Y = 0; Y < OutGrid.NumY; ++Y)
             {
                 for (int32 X = 0; X < OutGrid.NumX; ++X)
                 {
+                    const int32 CellIndex = OutGrid.Index(X, Y, Z);
                     const FVector Sample = OutGrid.CellCenter(X, Y, Z);
                     const float Density = Sampler != nullptr
                         ? Sampler->SampleDensity(Sample.X, Sample.Y, Sample.Z)
                         : Generator->GetDensityAt(Sample.X, Sample.Y, Sample.Z);
                     if (!FMath::IsFinite(Density))
                     {
-                        bSawNonFiniteDensity = true;
+                        NonFiniteFlags[CellIndex] = 1u;
                     }
 
                     // MC convention in this codebase: negative is solid, positive is air.
@@ -410,11 +416,16 @@ namespace VoxelStrateMeasurePrivate
                     {
                         OutGrid.Density[CellIndex] = Density;
                     }
-                    OutGrid.Air[CellIndex++] = Density > 0.0f ? 1u : 0u;
+                    OutGrid.Air[CellIndex] = Density > 0.0f ? 1u : 0u;
                 }
             }
-        }
+        });
 
+        bool bSawNonFiniteDensity = false;
+        for (int32 CellIndex = 0; CellIndex < OutGrid.CellCount; ++CellIndex)
+        {
+            bSawNonFiniteDensity |= NonFiniteFlags[CellIndex] != 0u;
+        }
         if (bSawNonFiniteDensity)
         {
             return Refuse(OutReason, TEXT("At least one density sample was non-finite."));
@@ -552,54 +563,104 @@ namespace VoxelStrateMeasurePrivate
 
     void BuildManhattanDistanceToSolid(const FSampleGrid& Grid, TArray<int32>& OutDistances)
     {
-        // Two raster passes with 6-neighbour Manhattan relaxation. The result is an approximation
-        // of distance-to-solid in the original field: each coarse grid unit is SampleStep VOXELS.
+        // Two wavefront passes with 6-neighbour Manhattan relaxation. A cell depends only on the
+        // immediately preceding diagonal in the forward pass (or following diagonal in the
+        // reverse pass), so each diagonal is safe to process in parallel while the diagonal
+        // barriers preserve the exact raster result. Each coarse grid unit is SampleStep VOXELS.
         constexpr int32 Infinity = INT32_MAX;
         OutDistances.SetNumUninitialized(Grid.CellCount);
-        for (int32 Index = 0; Index < Grid.CellCount; ++Index)
+        ParallelFor(Grid.CellCount, [&](int32 Index)
         {
             OutDistances[Index] = Grid.Air[Index] == 0u ? 0 : Infinity;
-        }
+        });
 
-        auto Relax = [&](int32 Current, int32 Neighbor)
+        const int32 LastDiagonal = Grid.NumX + Grid.NumY + Grid.NumZ - 3;
+        const auto ProcessDiagonal = [&](int32 Diagonal, bool bForward)
         {
-            if (OutDistances[Neighbor] == Infinity)
+            const int32 MinZ = FMath::Max(
+                0, Diagonal - (Grid.NumX - 1) - (Grid.NumY - 1));
+            const int32 MaxZ = FMath::Min(Grid.NumZ - 1, Diagonal);
+            if (MinZ > MaxZ)
             {
                 return;
             }
-            const int32 Candidate = OutDistances[Neighbor] == INT32_MAX - 1
-                ? Infinity : OutDistances[Neighbor] + 1;
-            OutDistances[Current] = FMath::Min(OutDistances[Current], Candidate);
+
+            int32 DiagonalCellCount = 0;
+            for (int32 Z = MinZ; Z <= MaxZ; ++Z)
+            {
+                const int32 MinY = FMath::Max(
+                    0, Diagonal - Z - (Grid.NumX - 1));
+                const int32 MaxY = FMath::Min(Grid.NumY - 1, Diagonal - Z);
+                DiagonalCellCount += FMath::Max(0, MaxY - MinY + 1);
+            }
+
+            const auto ProcessZ = [&](int32 Z)
+            {
+                const int32 MinY = FMath::Max(
+                    0, Diagonal - Z - (Grid.NumX - 1));
+                const int32 MaxY = FMath::Min(Grid.NumY - 1, Diagonal - Z);
+                for (int32 Y = MinY; Y <= MaxY; ++Y)
+                {
+                    const int32 X = Diagonal - Z - Y;
+                    const int32 Current = Grid.Index(X, Y, Z);
+                    if (Grid.Air[Current] == 0u)
+                    {
+                        continue;
+                    }
+
+                    const auto Relax = [&](int32 Neighbor)
+                    {
+                        if (OutDistances[Neighbor] == Infinity)
+                        {
+                            return;
+                        }
+                        const int32 Candidate = OutDistances[Neighbor] == INT32_MAX - 1
+                            ? Infinity : OutDistances[Neighbor] + 1;
+                        OutDistances[Current] = FMath::Min(
+                            OutDistances[Current], Candidate);
+                    };
+
+                    if (bForward)
+                    {
+                        if (X > 0) Relax(Grid.Index(X - 1, Y, Z));
+                        if (Y > 0) Relax(Grid.Index(X, Y - 1, Z));
+                        if (Z > 0) Relax(Grid.Index(X, Y, Z - 1));
+                    }
+                    else
+                    {
+                        if (X + 1 < Grid.NumX) Relax(Grid.Index(X + 1, Y, Z));
+                        if (Y + 1 < Grid.NumY) Relax(Grid.Index(X, Y + 1, Z));
+                        if (Z + 1 < Grid.NumZ) Relax(Grid.Index(X, Y, Z + 1));
+                    }
+                }
+            };
+
+            // Tiny edge diagonals are cheaper to execute directly; substantial diagonals get
+            // one task per Z row, with every row writing a disjoint set of cells.
+            const int32 ZCount = MaxZ - MinZ + 1;
+            if (ZCount > 1 && DiagonalCellCount >= 256)
+            {
+                ParallelFor(ZCount, [&](int32 ZOffset)
+                {
+                    ProcessZ(MinZ + ZOffset);
+                });
+            }
+            else
+            {
+                for (int32 Z = MinZ; Z <= MaxZ; ++Z)
+                {
+                    ProcessZ(Z);
+                }
+            }
         };
 
-        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        for (int32 Diagonal = 0; Diagonal <= LastDiagonal; ++Diagonal)
         {
-            for (int32 Y = 0; Y < Grid.NumY; ++Y)
-            {
-                for (int32 X = 0; X < Grid.NumX; ++X)
-                {
-                    const int32 Current = Grid.Index(X, Y, Z);
-                    if (Grid.Air[Current] == 0u) continue;
-                    if (X > 0) Relax(Current, Grid.Index(X - 1, Y, Z));
-                    if (Y > 0) Relax(Current, Grid.Index(X, Y - 1, Z));
-                    if (Z > 0) Relax(Current, Grid.Index(X, Y, Z - 1));
-                }
-            }
+            ProcessDiagonal(Diagonal, true);
         }
-
-        for (int32 Z = Grid.NumZ - 1; Z >= 0; --Z)
+        for (int32 Diagonal = LastDiagonal; Diagonal >= 0; --Diagonal)
         {
-            for (int32 Y = Grid.NumY - 1; Y >= 0; --Y)
-            {
-                for (int32 X = Grid.NumX - 1; X >= 0; --X)
-                {
-                    const int32 Current = Grid.Index(X, Y, Z);
-                    if (Grid.Air[Current] == 0u) continue;
-                    if (X + 1 < Grid.NumX) Relax(Current, Grid.Index(X + 1, Y, Z));
-                    if (Y + 1 < Grid.NumY) Relax(Current, Grid.Index(X, Y + 1, Z));
-                    if (Z + 1 < Grid.NumZ) Relax(Current, Grid.Index(X, Y, Z + 1));
-                }
-            }
+            ProcessDiagonal(Diagonal, false);
         }
     }
 
@@ -1092,14 +1153,23 @@ namespace VoxelStrateMeasurePrivate
         }
 
         OutPlayerFit.Init(0u, Grid.CellCount);
-        TArray<float> SupportHeights;
-        SupportHeights.SetNumUninitialized(SupportOffsets.Num());
-        TArray<int32> SupportAnchorZs;
-        SupportAnchorZs.SetNumUninitialized(SupportOffsets.Num());
-        TArray<uint8> bSupported;
-        bSupported.Init(0u, SupportOffsets.Num());
-        for (int32 Z = 1; Z < Grid.NumZ; ++Z)
+        TArray<int64> PlayerFitCounts;
+        PlayerFitCounts.Init(0, Grid.NumZ);
+
+        // A candidate pose only reads the immutable sampled grid and writes its own mask cell.
+        // Give each Z slab private stencil scratch, then reduce the per-slab counts in Z order
+        // below. This removes the old shared scratch/count race without changing any predicate.
+        ParallelFor(FMath::Max(Grid.NumZ - 1, 0), [&](int32 SliceIndex)
         {
+            const int32 Z = SliceIndex + 1;
+            TArray<float> SupportHeights;
+            SupportHeights.SetNumUninitialized(SupportOffsets.Num());
+            TArray<int32> SupportAnchorZs;
+            SupportAnchorZs.SetNumUninitialized(SupportOffsets.Num());
+            TArray<uint8> bSupported;
+            bSupported.Init(0u, SupportOffsets.Num());
+            int64 NumPlayerFitInSlice = 0;
+
             for (int32 Y = 0; Y < Grid.NumY; ++Y)
             {
                 for (int32 X = 0; X < Grid.NumX; ++X)
@@ -1188,14 +1258,18 @@ namespace VoxelStrateMeasurePrivate
                     {
                         continue;
                     }
-                    if (OutPlayerFit[Current] != 0u)
-                    {
-                        continue;
-                    }
                     OutPlayerFit[Current] = 1u;
-                    ++OutNumPlayerFitCells;
+                    ++NumPlayerFitInSlice;
                 }
             }
+            PlayerFitCounts[Z] = NumPlayerFitInSlice;
+        });
+
+        // Fixed-index reduction is intentional: even though the terms are integral, keeping the
+        // reduction serial documents the determinism rule shared by the floating metrics below.
+        for (int32 Z = 1; Z < Grid.NumZ; ++Z)
+        {
+            OutNumPlayerFitCells += PlayerFitCounts[Z];
         }
         return true;
     }
@@ -1211,11 +1285,16 @@ namespace VoxelStrateMeasurePrivate
 
         const int32 PlaneCells = Grid.NumX * Grid.NumY;
         constexpr int32 Infinity = INT32_MAX / 4;
-        TArray<int32> Distances;
-        Distances.SetNumUninitialized(PlaneCells);
-        int32 MinimumDistance = Infinity;
-        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        TArray<int32> PerSliceMinimum;
+        PerSliceMinimum.Init(Infinity, Grid.NumZ);
+
+        // Each horizontal distance transform is independent. Keep its mutable raster in the
+        // worker and publish one integer result per Z slice; the final minimum is reduced in
+        // ascending Z order for an explicit deterministic reduction.
+        ParallelFor(Grid.NumZ, [&](int32 Z)
         {
+            TArray<int32> Distances;
+            Distances.SetNumUninitialized(PlaneCells);
             for (int32 Y = 0; Y < Grid.NumY; ++Y)
             {
                 for (int32 X = 0; X < Grid.NumX; ++X)
@@ -1269,6 +1348,7 @@ namespace VoxelStrateMeasurePrivate
                 }
             }
 
+            int32 SliceMinimum = Infinity;
             for (int32 Y = 0; Y < Grid.NumY; ++Y)
             {
                 for (int32 X = 0; X < Grid.NumX; ++X)
@@ -1276,11 +1356,18 @@ namespace VoxelStrateMeasurePrivate
                     const int32 Cell = Grid.Index(X, Y, Z);
                     if (PlayerFit[Cell] != 0u)
                     {
-                        MinimumDistance = FMath::Min(
-                            MinimumDistance, Distances[X + Grid.NumX * Y]);
+                        SliceMinimum = FMath::Min(
+                            SliceMinimum, Distances[X + Grid.NumX * Y]);
                     }
                 }
             }
+            PerSliceMinimum[Z] = SliceMinimum;
+        });
+
+        int32 MinimumDistance = Infinity;
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        {
+            MinimumDistance = FMath::Min(MinimumDistance, PerSliceMinimum[Z]);
         }
 
         return MinimumDistance == Infinity
