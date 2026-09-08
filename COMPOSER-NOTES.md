@@ -1283,27 +1283,28 @@ The content half is deliberately not built here; landmark meshes, lights, sound,
 policy belong to the content system. The landing supplies the stable, walkable, deterministic
 `PassageMouth` anchor that content placement needs, without inventing landmark geometry here.
 
-The dimensions derive from the capsule and the existing two-abreast corridor rule: player diameter
+The dimensions derive from the capsule and the existing turning-floor rule: player diameter
 `2×0.34/0.25 = 2.72` voxels; floor width `3/0.25 = 12` voxels; capsule height
 `2×0.88/0.25 = 7.04` voxels; and 1 m headroom adds 4 voxels. The room uses
 `HalfWidth=max(7, MouthRadius+2)`, so its one-voxel-inset support floor is at least 12 voxels /
 3 m wide while the authored room is at least 14 voxels / 3.5 m wide. Its height is
-`max(12, 7.04+4, 2×MouthRadius+2)`; with the stock 8-voxel mouth, that is 18 voxels / 4.5 m.
+`max(12, 7.04+4, 2×MouthRadius+2)`; with the stock 6-voxel mouth, that is 14 voxels / 3.5 m
+high and 8 voxels / 2 m half-width (4 m full width).
 The floor is at `StandingPoint.Z−0.5`, three voxels / 0.75 m thick, and the tube centreline meets
 the room at `FloorZ+MouthRadius`, so the lower tube tangent is the floor rather than a hole with a
 step. The connector is 5 voxels / 1.25 m radius (2.5 m clear width), 12 voxels / 3 m clear height,
 with a 4.5-voxel support inset; the room, not the transit leg, owns the turn floor. At the root it
-joins a common per-strate annular hub outside the origin spine. A direct ramp is used when it can
-stay ≤44°; otherwise the deterministic connector inserts a level dog-leg before its final ramp.
-The final-density audit checks every floor normal against the explicit ≤44° walkable-slope limit
-(the movement CDO currently reports 44.8°, so this landing contract is conservative).
+joins the finite origin landing room, not a vertical hub. The default inter-strate tunnel is a
+two-leg switchback with a named 15° floor-gradient limit; the connector uses the same limit. The
+final-density audit checks the room floor and the capsule at every tunnel step. This is deliberately
+well below the movement CDO's roughly 44.8° scramble ceiling.
 
 The join is guaranteed rather than likely because a source query is only a local capsule proof — it
 does not flood-fill the live graph. `GeneratePassages` therefore adds the same deterministic
-connector for answered and refused source queries, ending at the common annular hub around `(0,0)`.
-The hub is the explicit walkable root network; it is outside the vertical spine, so the spine stays
-open while every connector has a floor and a common interior level. It is generated from the
-passage seed and is included in the conservative passage bounds. Its structural
+connector for answered and refused source queries, ending at the finite landing room around `(0,0)`.
+That room is the explicit walkable root network; it has a floor and a common interior level, and no
+continuous vertical spine is carved between strates. It is generated from the passage seed and is
+included in the conservative passage bounds. Its structural
 post order is `origin spine → vertical seal → passage tube + landing/floor → XY edge seal`; the
 landing is clamped inside the vertical seal, the floor backstop runs before the final XY edge seal,
 and the edge seal wins at the world rim. `ClassifyTile` and the op-stack both treat a landing floor
@@ -1343,14 +1344,25 @@ classification.
 
 ### 6.8 The (0,0) spine, exactly
 
-`VF_ApplyOriginSpine` carves a guaranteed-open vertical column at actor-local XY (0,0), through every
-strate, archetype-independent, appended automatically. **It carves only the strate INTERIOR and leaves
-the seals intact on purpose** — its own comment: *"so the player must still dig through to descend"*. It
-provides a clean landing space, not a continuous open shaft.
+`VF_ApplyOriginSpine` no longer carves a full-height cylinder. It builds one finite, rounded landing
+room at actor-local XY (0,0) in each strate, with a flat support floor. The old cylinder guaranteed
+open air but supplied no surface to stand on except at its bottom; that was both an unusable hub and
+an accidental fall shaft. The room is archetype-independent, appended automatically, and sized by
+the §6.5 body arithmetic. It is clamped inside the strate's vertical seal interval and never crosses
+the XY edge seal.
 
-⇒ The hand-authored descent shaft is the **above-ground continuation of the spine**. Nothing new to
-build. The city's hole must sit above the VoxelWorld actor's origin (see §6.9), and the shaft's diameter
-should match the spine's `Radius` or the join will visibly step.
+The seals between strates remain solid. A lower room is therefore not an open shaft destination: it
+becomes reachable when progression opens the inter-strate passage, and the player arrives on that
+strate's room floor. `bOpenSurfaceEntry` is the one explicit exception: when enabled, strate 0 may
+open its top seal down to the top room ceiling as the city's above-ground continuation. It does not
+open any lower seal or bore the rooms together.
+
+The base inter-strate connection is a small walkable tunnel. Its default is a deterministic
+two-leg switchback, with a named 15° maximum floor gradient, level landing aprons, and a floor-backed
+capsule-clear tube. A 32 m vertical drop needs `32/tan(15°) = 119.4 m` of horizontal run before
+aprons and turn transitions, so a single straight ramp would be implausibly long; the switchback is
+an explicit design choice. `VerticalShaft`, `SpiralDescent`, `CascadingDrops`, and `CrackCrevice`
+remain available as exotic descriptors, but they do not receive the default walkability guarantee.
 
 ### ✅ 6.9 Actor space — DONE (built and confirmed off-origin, 2026-08-17)
 
@@ -1792,6 +1804,10 @@ outside-gate sample count; neither is a Maze or box-soundness failure.
 
 ### 12.3 2026-09-06 §6.5 landing geometry pass
 
+> Historical snapshot. This section describes the pre-§6.8 origin-spine correction (including the
+> annular root hub and the 44° connector law). The current finite landing-room and walkable-tunnel
+> measurements are recorded in §12.4 below.
+
 The mouth is now a place rather than the end of a bore. `GeneratePassages` builds both ends of all
 seven inter-strate passages as `FVoxelPassageLanding` descriptors. Each descriptor contains a
 rounded room, a three-voxel support slab, a tube doorway at the floor tangent, and an explicit
@@ -1931,6 +1947,85 @@ assert only that nothing it reports is wrong.*
   count and brace balance after any structural edit.**
 - **Do not run builds while a Codex task is active** — `CodexGuidance.md` §Collaboration: one agent per
   working tree.
+
+---
+
+### 12.4 2026-09-08 §6.8 finite origin landings and walkable base descent
+
+This is the current geometry and measurement record. `VF_ApplyOriginSpine` now creates one finite
+rounded room at `(0,0)` in every strate. The room is top-anchored inside the safe interval
+`[StrateBottomZ+Seal, StrateTopZ-Seal]`: `FloorZ = InnerTop - RoomHeight - 4`, with a 4-voxel
+(`1 m`) seal-safety margin. The three-voxel (`0.75 m`) support slab and the final-density floor
+backstop are inside the room; neither vertical seal is breached, and no lower room is connected by
+a default vertical bore. Only `bOpenSurfaceEntry` may add the top-strate continuation from above.
+
+The dimensions reuse the §6.5 body arithmetic at `0.25 m/voxel`: player radius `0.34 m = 1.36`
+voxels, diameter `0.68 m = 2.72` voxels, capsule height `1.76 m = 7.04` voxels, and one metre
+headroom `=4` voxels. The shared formulas are `HalfWidth=max(7,Radius+2)` and
+`RoomHeight=max(12,7.04+4,2×Radius+2)`. Thus the authored default origin radius `14` gives a
+16-voxel half-width (`4 m` half-width, `8 m` full width) and a 30-voxel (`7.5 m`) room height;
+the stock passage mouth radius `6` gives an 8-voxel half-width and a 14-voxel (`3.5 m`) room
+height. The one-voxel floor inset leaves at least the 3 m turning floor required by §6.5, with
+space to stand, turn, and leave.
+
+The default inter-strate connection is `EVoxelPassageType::SlopedTunnel`, authored as a deterministic
+two-leg switchback. It is a single-file tube: 6-voxel mouth radius (`3 m` diameter), 5-voxel waist
+radius (`2.5 m` diameter), and a nominal `2.5 m` clear height. Level aprons and turn transitions
+are 17 and 6 voxels respectively in the stock configuration (`4.25 m` and `1.5 m`). The named
+`WalkableTunnelMaxGradientDegrees=15°` contract (`tan(15°)=0.267949`) is deliberately far below the
+movement system's roughly 44° scramble ceiling: 44° is not a sensible walking default for a
+1.76 m-tall player in a small tunnel. For a 32 m drop, the required horizontal floor run is
+`32/tan(15°)=119.43 m` (`477.70` voxels), or about `59.7 m` per switchback leg before adding the
+level aprons and turn transitions. A straight gentle ramp would therefore be implausibly long;
+the switchback is an explicit design decision. `VerticalShaft`, `SpiralDescent`, `CascadingDrops`,
+and `CrackCrevice` remain in the enum for future exotic rolls, but the first three cannot be
+continuously walkable as currently authored and the crack has no player-fit guarantee.
+
+The focused final-density audit passed **7 passages / 42 segments**, with **5,916/5,916** floor
+samples and **5,916/5,916** player-capsule samples. Gradient, floor, and capsule failures were all
+zero; worst geometric gradient was `0.267758`, worst authored-route gradient `0.267793`, both below
+`0.267949`. All **14/14** passage ends passed their floor test, all **14/14** explicit root joins
+were present, seal violations were **0**, and geometry/floor failures were **0**. The cross-section
+gradient diagnostic (`13.966`) is not the route contract; it reflects overlapping tapered SDF
+cross-sections and is not counted as a walkability failure. Landing box checks saw **14** boxes,
+zero uniform proofs (`AllSolid=0`, `AllAir=0`), and **0** violations. The per-chunk shortlist cache
+timed at **1.259 μs** per forced rebuild and **1.243 μs** per hot same-chunk call on the validation
+machine; there is no per-voxel cache rebuild and no per-sample logging.
+
+The commandlet sweep used `-run=VoxelForgeExplore -modes=walk`, 8 archetypes × 8 seeds, target slot
+4, six 4-chunk strates (`4×32×0.25=32 m` each), `WorldRadiusVoxels=0`, and schema-2 JSON. All
+64 commandlets exited 0 and wrote valid JSON. `Connected` is the exact player-fit arrival→departure
+law; `Exact` additionally excludes start/goal snapping.
+
+| Archetype | Connected / exact | Origin fit / reachable | Arrival probes fit / in arrival component | Departure probes fit / in arrival component |
+|---|---:|---:|---:|---:|
+| CrystalChamber | 0 / 0 | 8 / 2 | 40/40 / 40/40 | 40/40 / 0/40 |
+| FlatPlain | 0 / 0 | 8 / 2 | 40/40 / 40/40 | 40/40 / 0/40 |
+| FloatingIslands | 3 / 2 | 8 / 1 | 35/40 / 35/40 | 35/40 / 10/40 |
+| Maze | 0 / 0 | 7 / 0 | 40/40 / 40/40 | 40/40 / 0/40 |
+| SurfaceWorld | 0 / 0 | 8 / 0 | 40/40 / 40/40 | 40/40 / 0/40 |
+| TunnelNetwork | 0 / 0 | 8 / 1 | 40/40 / 40/40 | 40/40 / 0/40 |
+| Underwater | 0 / 0 | 8 / 1 | 40/40 / 40/40 | 40/40 / 0/40 |
+| VerticalShafts | 3 / 3 | 8 / 0 | 40/40 / 40/40 | 40/40 / 15/40 |
+| **Total** | **6 / 5** | **63 / 7** | **315/320 / 315/320** | **315/320 / 25/320** |
+
+The five-point room probe is the centre plus ±2 voxels in X/Y. Therefore 63/64 runs had every
+arrival-room probe both player-fit and in the arrival component; all 315 arrival probes that fit
+were in that component. The departure room had player-fit probes in 63/64 runs, but only 25/320
+departure probes were in the arrival component (5/64 runs had all five there). The player-fit law
+is **6/64 connected (5/64 exact; 58/64 not connected at this resolution)**. This is not tuned away:
+the remaining failures are the separate intra-strate connectivity problem, not a tunnel gradient
+or floor failure.
+
+The origin-inclusive commandlet window changed the supplied baseline from **0/64 origin-reachable**
+and **17/64 with any origin player-fit cell** to **7/64 reachable** and **63/64 with any fit cell**.
+The no-fit case is Maze seed 7. The origin measurement is intentionally reported separately from
+the mouth-sized route window; `WorldRadiusVoxels=0` means the report is a bounded fitted window, not
+a claim about a finite whole-world volume.
+
+Fresh commandlet walk timings were **0.653 s minimum, 13.411 s mean, 34.265 s maximum** across the
+64 cases. The full Editor automation gate after the change was **32/32 successful, 0 failed**;
+`LayoutOrderIndependence`, the box verdict tests, and all op-stack equivalence tests were green.
 
 ---
 

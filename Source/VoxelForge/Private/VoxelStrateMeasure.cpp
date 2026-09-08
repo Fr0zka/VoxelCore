@@ -2863,7 +2863,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     const FVector& AVoxel,
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
-    FVoxelPlayerFitWalkReport& OutReport)
+    FVoxelPlayerFitWalkReport& OutReport,
+    const TArray<FVector>* ComponentProbePoints)
 {
     using namespace VoxelStrateMeasurePrivate;
 
@@ -3038,6 +3039,28 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         ? Components[Start] : INDEX_NONE;
     const int32 GoalComponent = Goal >= 0 && Components.IsValidIndex(Goal)
         ? Components[Goal] : INDEX_NONE;
+
+    if (ComponentProbePoints != nullptr)
+    {
+        OutReport.ComponentProbePlayerFit.Init(0u, ComponentProbePoints->Num());
+        OutReport.ComponentProbeInStartComponent.Init(0u, ComponentProbePoints->Num());
+        for (int32 ProbeIndex = 0; ProbeIndex < ComponentProbePoints->Num(); ++ProbeIndex)
+        {
+            int32 ProbeCell = INDEX_NONE;
+            const FVector& ProbePoint = (*ComponentProbePoints)[ProbeIndex];
+            if (!FindCellForPoint(Grid, ProbePoint, ProbeCell)
+                || !IsEligiblePlayerFitCell(Grid, PlayerFitMask, ProbeCell))
+            {
+                continue;
+            }
+            OutReport.ComponentProbePlayerFit[ProbeIndex] = 1u;
+            if (StartComponent >= 0 && Components.IsValidIndex(ProbeCell)
+                && Components[ProbeCell] == StartComponent)
+            {
+                OutReport.ComponentProbeInStartComponent[ProbeIndex] = 1u;
+            }
+        }
+    }
     if (StartComponent >= 0)
     {
         float BestOriginDistanceSquared = FLT_MAX;

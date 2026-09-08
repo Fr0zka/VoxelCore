@@ -2058,7 +2058,8 @@ namespace
 
 namespace
 {
-    constexpr float VF_LandingCarveSafetyMargin = 4.0f;
+    constexpr float VF_LandingCarveSafetyMargin =
+        VoxelPassageGeometry::SealSafetyMarginVoxels;
 
     struct FVoxelPassageLandingConnectorProjection
     {
@@ -2142,12 +2143,13 @@ namespace
         if (Landing.bHasConnectorBend)
         {
             // The first leg is deliberately level with the room. The second leg carries the
-            // complete rise and ends with a short level overlap inside the root annulus.
+            // complete rise and ends with a short level overlap inside the root landing room.
             if (Projection.SegmentIndex == 0)
             {
                 return 0.0f;
             }
-            const float RootFlatLength = Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f;
+            const float RootFlatLength = Landing.RootSpineRadius > 0.0f
+                ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f;
             const float RampLength = FMath::Max(
                 Projection.SegmentLength - RootFlatLength, KINDA_SMALL_NUMBER);
             return FMath::Clamp(
@@ -2159,7 +2161,8 @@ namespace
         // descriptors produced by older cooked data, even though new passages use the bend when
         // a non-zero rise needs a guaranteed slope.
         const float SourceFlatLength = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
-        const float RootFlatLength = Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f;
+        const float RootFlatLength = Landing.RootSpineRadius > 0.0f
+            ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f;
         const float SourceDistance = FMath::Clamp(
             SourceFlatLength, 0.0f, Projection.TotalLength * 0.49f);
         const float RootDistance = FMath::Clamp(
@@ -2190,20 +2193,12 @@ FVoxelPassageLanding VF_BuildPassageLanding(
 {
     FVoxelPassageLanding Landing;
 
-    // Body-derived dimensions at the authored 25 cm voxel scale:
-    //   player diameter = 2 * 34 cm = 0.68 m = 2.72 voxels;
-    //   a 3 m turn floor is 3 / 0.25 = 12 voxels across;
-    //   capsule height = 2 * 88 cm = 1.76 m = 7.04 voxels;
-    //   1 m of headroom adds 4 voxels, so the minimum room height rounds to 12 voxels (3 m).
-    // The tube radius adds two voxels of clearance around the doorway.  The support writer keeps
-    // one voxel inside the room wall, so HalfWidth=max(7, MouthRadius+2) gives a guaranteed
-    // 12-voxel = 3 m flat support floor, while the authored chamber is 14 voxels = 3.5 m wide.
+    // Body-derived dimensions at the authored 25 cm voxel scale are shared with the origin
+    // landing.  In particular, the 0.68 m player diameter, 3 m turning patch, 1.76 m capsule
+    // height and 1 m headroom become the common §6.5 formulas in VoxelPassageGeometry.
     const float SafeMouthRadius = FMath::Max(FMath::Abs(MouthRadius), 1.0f);
-    const float DesiredHalfWidth = FMath::Max(7.0f, SafeMouthRadius + 2.0f);
-    const float BodyHeightWithHeadroom = FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f;
-    const float DesiredHeight = FMath::Max(
-        FMath::Max(12.0f, BodyHeightWithHeadroom),
-        2.0f * SafeMouthRadius + 2.0f);
+    const float DesiredHalfWidth = VoxelPassageGeometry::LandingHalfWidthForRadius(MouthRadius);
+    const float DesiredHeight = VoxelPassageGeometry::LandingHeightForRadius(MouthRadius);
     const float SafeSeal = FMath::Max(BoundarySealThickness, 0.0f);
 
     FVector Direction(InDoorDirection.X, InDoorDirection.Y, 0.0f);
@@ -2216,7 +2211,7 @@ FVoxelPassageLanding VF_BuildPassageLanding(
     Landing.FloorZ = InStandingPoint.Z - 0.5f;
     Landing.HalfWidth = DesiredHalfWidth;
     Landing.CeilingZ = Landing.FloorZ + DesiredHeight;
-    Landing.FloorThickness = 3.0f;
+    Landing.FloorThickness = VoxelPassageGeometry::LandingFloorThicknessVoxels;
     Landing.DoorDirection = Direction;
     Landing.RootSpineRadius = FMath::Max(RootSpineRadius, 0.0f);
     Landing.bSourcePlayerFit = bSourcePlayerFit;
@@ -2273,15 +2268,14 @@ FVoxelPassageLanding VF_BuildPassageLanding(
         // opposite sides of the strate.  The manager chooses the common level inside the same
         // seal-safe interval as this builder, so no source query or passage order can affect it.
         // Five voxels = 1.25 m half-width / 2.5 m clear width.  This is the smallest whole-voxel
-        // annular root corridor that leaves a 1.36-voxel player capsule a two-voxel fit margin on
+        // root corridor that leaves a 1.36-voxel player capsule a two-voxel fit margin on
         // the support lattice, while the landing itself remains the 3 m turn floor.  Its separate
         // 12-voxel (3 m) clear height gives the 1.76 m capsule more than 1 m of headroom while the
-        // player walks out to the network root.  The floor rise is linear along the horizontal
-        // run; if the direct run is too short, a level dog-leg makes the final ramp satisfy the
-        // same 44 degree walkable limit by construction.
-        Landing.ConnectorRadius = 5.0f;
-        const float ConnectorHeight = FMath::Max(
-            12.0f, FVoxelPlayerCapsuleConstants::HeightVoxels + 4.0f);
+        // player walks out to the origin landing room.  The floor rise is linear along the
+        // horizontal run; if the direct run is too short, a level dog-leg makes the final ramp
+        // satisfy the same 15 degree walkable-tunnel limit by construction.
+        Landing.ConnectorRadius = VoxelPassageGeometry::ConnectorRadiusVoxels;
+        const float ConnectorHeight = VoxelPassageGeometry::ConnectorHeightVoxels;
         Landing.ConnectorCeilingZ = Landing.FloorZ + ConnectorHeight;
         Landing.RootFloorZ = NetworkPoint.Z;
         Landing.RootCeilingZ = Landing.RootFloorZ + ConnectorHeight;
@@ -2318,41 +2312,25 @@ FVoxelPassageLanding VF_BuildPassageLanding(
 
         const float ConnectorZ = (Landing.FloorZ + Landing.ConnectorCeilingZ) * 0.5f;
         const float RootConnectorZ = (Landing.RootFloorZ + Landing.RootCeilingZ) * 0.5f;
-        FVector2D RootEntryDirection(
-            Landing.StandingPoint.X - NetworkPoint.X,
-            Landing.StandingPoint.Y - NetworkPoint.Y);
-        if (!RootEntryDirection.Normalize())
-        {
-            RootEntryDirection = FVector2D(Direction.X, Direction.Y);
-            if (!RootEntryDirection.Normalize())
-            {
-                RootEntryDirection = FVector2D(1.0f, 0.0f);
-            }
-        }
-
-        // The structural spine is a vertical air column, so its centre is not a standing
-        // endpoint. End the ramp in the middle of the support annulus instead: with the 1.36-voxel
-        // capsule radius, a centre at RootSpineRadius+2.25 sits at least one capsule radius outside
-        // the spine and at least one capsule radius inside the 4.5-voxel support edge. Every
-        // passage therefore enters the same continuous, floor-backed annular hub, while the spine
-        // itself remains open and unsealed.
-        const float RootEntryRadius = Landing.RootSpineRadius + 2.25f;
-        const FVector2D RootEntryXY(
-            NetworkPoint.X + RootEntryDirection.X * RootEntryRadius,
-            NetworkPoint.Y + RootEntryDirection.Y * RootEntryRadius);
+        // The origin is now a finite landing room, not a vertical air column. End the connector
+        // at the requested room centre so its floor meets the room floor directly. The room's
+        // own rounded-box SDF and floor post provide the complete volume; no annular shaft hub is
+        // synthesized here, and no floor is omitted at the centre.
+        const FVector2D RootEntryXY(NetworkPoint.X, NetworkPoint.Y);
         Landing.ConnectorStart = FVector(
             Landing.StandingPoint.X, Landing.StandingPoint.Y, ConnectorZ);
         Landing.ConnectorEnd = FVector(RootEntryXY.X, RootEntryXY.Y, RootConnectorZ);
 
         // A direct source-to-root ramp is usually gentle, but its length is not a contract: a
         // legal source pose can be close to the spine while its floor is near a strate face. Add a
-        // deterministic level dog-leg whenever the direct run cannot meet the 44-degree law.
+        // deterministic level dog-leg whenever the direct run cannot meet the 15-degree law.
         // The final leg is the only rising part, and its extra horizontal run includes the root
-        // annulus overlap. This makes the slope a construction guarantee for every seed, rather
+        // room overlap. This makes the slope a construction guarantee for every seed, rather
         // than a property observed in today's showcase seeds. WorldRadiusVoxels is deliberately
         // zero, so the bounded world rim cannot be approached by this lateral safety run.
-        constexpr float WalkableSlope = 0.9656888f; // tan(44 degrees)
-        constexpr float RootFlatLength = 2.25f;
+        constexpr float WalkableSlope =
+            VoxelPassageGeometry::WalkableTunnelMaxGradient;
+        constexpr float RootFlatLength = VoxelPassageGeometry::RootOverlapVoxels;
         const FVector2D SourceXY(Landing.ConnectorStart.X, Landing.ConnectorStart.Y);
         const FVector2D RootXY(Landing.ConnectorEnd.X, Landing.ConnectorEnd.Y);
         const FVector2D Direct = RootXY - SourceXY;
@@ -2460,23 +2438,6 @@ float VF_EvaluatePassageLandingSDF(
         const float ConnectorSDF = FMath::Max(HorizontalSDF, VerticalSDF);
         LandingSDF = VoxelSDF::SmoothMin(LandingSDF, ConnectorSDF, 3.0f);
 
-        if (Landing.RootSpineRadius >= 0.0f)
-        {
-            // A shared hub turns the guaranteed root join into a walkable network. With the normal
-            // origin spine it is an annulus outside that shaft; with a disabled spine it safely
-            // degenerates to a disk, so the landing contract still has a guaranteed root volume.
-            const float HubRadius = Landing.RootSpineRadius + Landing.ConnectorRadius;
-            const float RadialDistance = FMath::Sqrt(
-                FMath::Square(Position.X) + FMath::Square(Position.Y));
-            const float HubHorizontalSDF = FMath::Max(
-                Landing.RootSpineRadius - RadialDistance,
-                RadialDistance - HubRadius);
-            const float HubVerticalSDF = FMath::Max(
-                Landing.RootFloorZ - Position.Z,
-                Position.Z - Landing.RootCeilingZ);
-            const float HubSDF = FMath::Max(HubHorizontalSDF, HubVerticalSDF);
-            LandingSDF = VoxelSDF::SmoothMin(LandingSDF, HubSDF, 3.0f);
-        }
     }
 
     return LandingSDF;
@@ -2502,14 +2463,9 @@ bool VF_IsPassageLandingFloor(
         // backstop cannot disappear at an exact floor sample.
         return Z <= FloorZ + KINDA_SMALL_NUMBER && Z > FloorZ - Thickness;
     };
-    const bool bInsideRootSpine = Landing.RootSpineRadius > 0.0f
-        && FMath::Square(Position.X) + FMath::Square(Position.Y)
-            <= FMath::Square(Landing.RootSpineRadius);
-
     // The room floor is a true horizontal landing: it is the only floor that owns the full
-    // three-metre turning patch.  The central root spine is left open.
-    if (IsInFloorBand(Position.Z, Landing.FloorZ, Landing.FloorThickness)
-        && !bInsideRootSpine)
+    // three-metre turning patch.  The origin room owns its centre, including its support floor.
+    if (IsInFloorBand(Position.Z, Landing.FloorZ, Landing.FloorThickness))
     {
         const float FloorHalfWidth = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
         if (FMath::Abs(Position.X - Landing.StandingPoint.X) <= FloorHalfWidth
@@ -2530,8 +2486,7 @@ bool VF_IsPassageLandingFloor(
         const float FloorT = VF_PassageLandingConnectorFloorParameter(Projection, Landing);
         const float ConnectorFloorZ = FMath::Lerp(
             Landing.FloorZ, Landing.RootFloorZ, FloorT);
-        if (!bInsideRootSpine
-            && IsInFloorBand(Position.Z, ConnectorFloorZ, Landing.FloorThickness))
+        if (IsInFloorBand(Position.Z, ConnectorFloorZ, Landing.FloorThickness))
         {
             // Keep connector support inset by half a voxel from its clear width.  The landing
             // chamber—not this narrow transit leg—owns the 3 m turn floor; this inset preserves
@@ -2546,25 +2501,6 @@ bool VF_IsPassageLandingFloor(
             }
         }
 
-        if (IsInFloorBand(Position.Z, Landing.RootFloorZ, Landing.FloorThickness))
-        {
-            // The common root hub is a walkable annulus, not a cap over the vertical spine.  Its
-            // 4.5-voxel support inset leaves the same 0.5-voxel air clearance at the outer wall as
-            // the connector and never writes inside the spine radius.
-            const float RadialDistanceSquared = FMath::Square(Position.X)
-                + FMath::Square(Position.Y);
-            const float HubInnerRadius = Landing.RootSpineRadius;
-            const float HubOuterSupportRadius = Landing.RootSpineRadius
-                + FMath::Max(Landing.ConnectorRadius - 0.5f,
-                             FVoxelPlayerCapsuleConstants::RadiusVoxels);
-            const bool bOutsideSpine = Landing.RootSpineRadius <= 0.0f
-                || RadialDistanceSquared > FMath::Square(HubInnerRadius);
-            if (bOutsideSpine
-                && RadialDistanceSquared <= FMath::Square(HubOuterSupportRadius))
-            {
-                return true;
-            }
-        }
     }
 
     return false;

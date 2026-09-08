@@ -26,6 +26,7 @@
 
 #include "CoreMinimal.h"
 #include "VoxelTypes.h"   // SmoothStep01
+#include "VoxelPassageGeometry.h" // shared body-sized landing/tunnel geometry
 
 //=============================================================================
 // SEAL DE FRONTIÈRE / BOUNDARY SEAL
@@ -110,31 +111,95 @@ FORCEINLINE void VF_ApplyPassageLandingCarving(float& Density, float LandingSDF,
 }
 
 //=============================================================================
-// SPINE DE DESCENTE (0,0) / (0,0) DESCENT SPINE
+// LANDING ROOM ORIGINE (0,0) / ORIGIN LANDING ROOM
 //=============================================================================
-// Creuse une colonne verticale garantie ouverte au XY monde (0,0) dans l'INTÉRIEUR de la strate
-// (entre les seals haut et bas). Les seals sont laissés intacts pour que le joueur doive encore
-// creuser à travers pour descendre — ceci ne fait qu'un espace d'atterrissage propre, indépendant
-// de l'archétype, aligné à travers toutes les strates.
+// The old implementation carved a full-height cylinder. That made the origin visually open but
+// left no floor anywhere except at the bottom, so it was a fall shaft rather than a landing. The
+// origin primitive is now a top-anchored rounded room with a real flat floor in every strate.
+// It never crosses either vertical seal. The inter-strate seal remains solid until a passage (or
+// the player) opens it; there is no default vertical bore between rooms.
 FORCEINLINE void VF_ApplyOriginSpine(float& Density, float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
     if (Radius <= 0.0f) return;
 
-    // Stay within the interior — never touch the seal bands.
-    const float InnerTop = StrateTopZ - SealThickness;
-    const float InnerBot = StrateBottomZ + SealThickness;
-    if (WorldZ <= InnerBot || WorldZ >= InnerTop) return;
+    const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
+        VoxelPassageGeometry::BuildOriginLandingGeometry(
+            StrateTopZ, StrateBottomZ, SealThickness, Radius);
+    if (!Geometry.bValid) return;
 
-    const float DistXY = FMath::Sqrt(WorldX * WorldX + WorldY * WorldY);
-    const float SDF = DistXY - Radius;  // < 0 inside the column
-    const float Blend = 3.0f;
-    if (SDF < Blend)
+    const float RoomSDF = VoxelPassageGeometry::OriginLandingRoomSDF(
+        FVector(WorldX, WorldY, WorldZ), Geometry);
+    VF_ApplyPassageLandingCarving(
+        Density, RoomSDF, BaseDensity, SealThickness);
+
+    // The floor is intentionally written after the room carve. It is also reasserted after the
+    // passage/disturbance posts by the callers below; doing it here makes the standalone primitive
+    // itself a complete landing-room operation.
+    if (WorldZ <= Geometry.FloorZ + KINDA_SMALL_NUMBER
+        && WorldZ > Geometry.FloorZ - Geometry.FloorThickness
+        && FMath::Abs(WorldX) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f)
+        && FMath::Abs(WorldY) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f))
     {
-        float Carve = FMath::Clamp((Blend - SDF) / (Blend * 2.0f), 0.0f, 1.0f);
-        Carve = SmoothStep01(Carve);
-        Density -= Carve * (BaseDensity * 2.0f + SealThickness);
+        Density = FMath::Max(Density, BaseDensity);
     }
+}
+
+/** Reassert only the origin-room air volume after a post-process that may add rock. */
+FORCEINLINE void VF_ApplyOriginLandingAir(float& Density,
+    float WorldX, float WorldY, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
+{
+    if (Radius <= 0.0f) return;
+    const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
+        VoxelPassageGeometry::BuildOriginLandingGeometry(
+            StrateTopZ, StrateBottomZ, SealThickness, Radius);
+    if (!Geometry.bValid) return;
+    const float RoomSDF = VoxelPassageGeometry::OriginLandingRoomSDF(
+        FVector(WorldX, WorldY, WorldZ), Geometry);
+    VF_ApplyPassageLandingCarving(
+        Density, RoomSDF, BaseDensity, SealThickness);
+}
+
+/** Reassert only the origin-room support slab after an air carve/post-process. */
+FORCEINLINE void VF_ApplyOriginLandingFloor(float& Density,
+    float WorldX, float WorldY, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
+{
+    if (Radius <= 0.0f) return;
+    const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
+        VoxelPassageGeometry::BuildOriginLandingGeometry(
+            StrateTopZ, StrateBottomZ, SealThickness, Radius);
+    if (!Geometry.bValid) return;
+    if (WorldZ <= Geometry.FloorZ + KINDA_SMALL_NUMBER
+        && WorldZ > Geometry.FloorZ - Geometry.FloorThickness
+        && FMath::Abs(WorldX) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f)
+        && FMath::Abs(WorldY) <= FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f))
+    {
+        Density = FMath::Max(Density, BaseDensity);
+    }
+}
+
+/** MC-facing origin-room air backstop for the post-disturbance path. */
+FORCEINLINE void VF_ApplyOriginLandingAirMC(float& Density,
+    float WorldX, float WorldY, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
+{
+    float InternalDensity = -Density;
+    VF_ApplyOriginLandingAir(InternalDensity, WorldX, WorldY, WorldZ,
+        StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
+    Density = -InternalDensity;
+}
+
+/** MC-facing origin-room floor backstop for the post-disturbance path. */
+FORCEINLINE void VF_ApplyOriginLandingFloorMC(float& Density,
+    float WorldX, float WorldY, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
+{
+    float InternalDensity = -Density;
+    VF_ApplyOriginLandingFloor(InternalDensity, WorldX, WorldY, WorldZ,
+        StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
+    Density = -InternalDensity;
 }
 
 //=============================================================================

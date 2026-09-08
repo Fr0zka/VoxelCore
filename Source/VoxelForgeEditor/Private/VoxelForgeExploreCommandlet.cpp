@@ -384,7 +384,10 @@ struct FExploreWorld
                 Index));
             Definition->StrateDescription = FText::FromString(
                 TEXT("Transient, deterministic commandlet definition."));
-            Definition->StrateHeightInChunks = 8;
+            // The commandlet's acceptance sweep uses the owner-facing base spacing:
+            // 4 chunks * 32 voxels * 0.25 m = 32 m per strate. Production assets may be taller;
+            // this keeps the measured tunnel arithmetic tied to the stated ~32 m descent.
+            Definition->StrateHeightInChunks = 4;
             Definition->TransitionType = EVoxelStrateTransition::Hard;
             Definition->GeneratorType = Index == Arguments.Slot
                 ? Arguments.Archetype
@@ -510,6 +513,12 @@ struct FExploreWalkOutput
     bool bOriginCheckAvailable = false;
     FString OriginCheckRefusalReason;
     FVoxelPlayerFitWalkReport OriginCheckReport;
+    int32 ArrivalLandingRoomProbeCount = 0;
+    int32 ArrivalLandingRoomPlayerFitProbeCount = 0;
+    int32 ArrivalLandingRoomArrivalComponentProbeCount = 0;
+    int32 DepartureLandingRoomProbeCount = 0;
+    int32 DepartureLandingRoomPlayerFitProbeCount = 0;
+    int32 DepartureLandingRoomArrivalComponentProbeCount = 0;
 };
 
 struct FExploreExportOutput
@@ -542,12 +551,16 @@ bool FindMouths(
     FVector& OutArrival,
     FVector& OutDeparture,
     int32& OutArrivalCount,
-    int32& OutDepartureCount)
+    int32& OutDepartureCount,
+    const FVoxelPassage*& OutArrivalPassage,
+    const FVoxelPassage*& OutDeparturePassage)
 {
     OutArrival = FVector::ZeroVector;
     OutDeparture = FVector::ZeroVector;
     OutArrivalCount = 0;
     OutDepartureCount = 0;
+    OutArrivalPassage = nullptr;
+    OutDeparturePassage = nullptr;
     for (const FVoxelPassage& Passage : Manager.GetPassages())
     {
         if (Passage.LowerStrateIndex == TargetSlot
@@ -556,6 +569,7 @@ bool FindMouths(
             if (OutArrivalCount == 0)
             {
                 OutArrival = Passage.LowerPoint;
+                OutArrivalPassage = &Passage;
             }
             ++OutArrivalCount;
         }
@@ -565,6 +579,7 @@ bool FindMouths(
             if (OutDepartureCount == 0)
             {
                 OutDeparture = Passage.UpperPoint;
+                OutDeparturePassage = &Passage;
             }
             ++OutDepartureCount;
         }
@@ -1273,13 +1288,17 @@ bool RunWalk(
         return false;
     }
 
+    const FVoxelPassage* ArrivalPassage = nullptr;
+    const FVoxelPassage* DeparturePassage = nullptr;
     if (!FindMouths(
             *World.Manager,
             Arguments.Slot,
             OutOutput.ArrivalVoxels,
             OutOutput.DepartureVoxels,
             OutOutput.ArrivalPassageCount,
-            OutOutput.DeparturePassageCount))
+            OutOutput.DeparturePassageCount,
+            ArrivalPassage,
+            DeparturePassage))
     {
         OutOutput.Status = TEXT("refused");
         OutOutput.RefusalReason = TEXT(
@@ -1299,6 +1318,32 @@ bool RunWalk(
         Settings.PlayerCapsuleRadiusVoxels) + 2.0f;
     Settings.bIncludeOriginInCoverWindow = NeedsOriginInWindow(Arguments.Archetype);
 
+    TArray<FVector> LandingRoomProbePoints;
+    auto AppendLandingRoomProbes = [&LandingRoomProbePoints](
+        const FVoxelPassageLanding& Landing)
+    {
+        const float ProbeOffset = FMath::Min(
+            2.0f,
+            FMath::Max(0.0f, Landing.HalfWidth - 2.0f));
+        LandingRoomProbePoints.Add(Landing.StandingPoint);
+        LandingRoomProbePoints.Add(
+            Landing.StandingPoint + FVector(ProbeOffset, 0.0f, 0.0f));
+        LandingRoomProbePoints.Add(
+            Landing.StandingPoint + FVector(-ProbeOffset, 0.0f, 0.0f));
+        LandingRoomProbePoints.Add(
+            Landing.StandingPoint + FVector(0.0f, ProbeOffset, 0.0f));
+        LandingRoomProbePoints.Add(
+            Landing.StandingPoint + FVector(0.0f, -ProbeOffset, 0.0f));
+    };
+    if (ArrivalPassage != nullptr)
+    {
+        AppendLandingRoomProbes(ArrivalPassage->LowerLanding);
+    }
+    if (DeparturePassage != nullptr)
+    {
+        AppendLandingRoomProbes(DeparturePassage->UpperLanding);
+    }
+
     const FGeneratorDensitySampler Sampler(*World.Generator);
     if (!VF_MeasurePlayerFitWalkWithSampler(
             Sampler,
@@ -1308,7 +1353,8 @@ bool RunWalk(
             OutOutput.ArrivalVoxels,
             OutOutput.DepartureVoxels,
             Settings,
-            OutOutput.Report))
+            OutOutput.Report,
+            &LandingRoomProbePoints))
     {
         OutOutput.Status = TEXT("refused");
         OutOutput.RefusalReason = OutOutput.Report.RefusalReason;
@@ -1337,6 +1383,30 @@ bool RunWalk(
     else
     {
         OutOutput.OriginCheckRefusalReason = OutOutput.OriginCheckReport.RefusalReason;
+    }
+    const int32 ArrivalProbeCount = ArrivalPassage != nullptr ? 5 : 0;
+    const int32 DepartureProbeCount = DeparturePassage != nullptr ? 5 : 0;
+    OutOutput.ArrivalLandingRoomProbeCount = ArrivalProbeCount;
+    OutOutput.DepartureLandingRoomProbeCount = DepartureProbeCount;
+    for (int32 ProbeIndex = 0; ProbeIndex < OutOutput.Report.ComponentProbePlayerFit.Num();
+         ++ProbeIndex)
+    {
+        const bool bPlayerFit = OutOutput.Report.ComponentProbePlayerFit[ProbeIndex] != 0u;
+        const bool bInArrivalComponent =
+            OutOutput.Report.ComponentProbeInStartComponent.IsValidIndex(ProbeIndex)
+            && OutOutput.Report.ComponentProbeInStartComponent[ProbeIndex] != 0u;
+        if (ProbeIndex < ArrivalProbeCount)
+        {
+            OutOutput.ArrivalLandingRoomPlayerFitProbeCount += bPlayerFit ? 1 : 0;
+            OutOutput.ArrivalLandingRoomArrivalComponentProbeCount +=
+                bInArrivalComponent ? 1 : 0;
+        }
+        else
+        {
+            OutOutput.DepartureLandingRoomPlayerFitProbeCount += bPlayerFit ? 1 : 0;
+            OutOutput.DepartureLandingRoomArrivalComponentProbeCount +=
+                bInArrivalComponent ? 1 : 0;
+        }
     }
 
     OutOutput.Status = TEXT("ok");
@@ -1509,7 +1579,7 @@ FString BuildManifestJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 1);
+    Writer->WriteValue(TEXT("schema_version"), 2);
     Writer->WriteValue(TEXT("format"), TEXT("OBJ"));
     Writer->WriteValue(TEXT("mesh_file"), Export.MeshFileName);
     Writer->WriteValue(TEXT("mesh_positions_units"), TEXT("metres"));
@@ -1703,7 +1773,7 @@ FString BuildExploreJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 1);
+    Writer->WriteValue(TEXT("schema_version"), 2);
     Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
     Writer->WriteValue(TEXT("read_only_generation"), true);
 
@@ -1780,6 +1850,11 @@ FString BuildExploreJson(
     if (Arguments.bWalk)
     {
         const FVoxelPlayerFitWalkReport& Report = Output.Walk.Report;
+        // The primary report is the mouth-sized arrival/departure window.  Origin reachability is
+        // a separate, explicitly origin-inclusive measurement; expose that report at the legacy
+        // top-level keys so a sweep cannot accidentally count a window that omitted (0,0).
+        const FVoxelPlayerFitWalkReport& OriginReport = Output.Walk.bOriginCheckAvailable
+            ? Output.Walk.OriginCheckReport : Report;
         Writer->WriteObjectStart(TEXT("walk"));
         Writer->WriteValue(TEXT("status"), Output.Walk.Status);
         Writer->WriteValue(TEXT("refusal_or_error"), Output.Walk.RefusalReason);
@@ -1795,6 +1870,27 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("working_memory_cap_bytes"), MaxWalkWorkingBytes);
         Writer->WriteValue(TEXT("arrival_passage_count"), Output.Walk.ArrivalPassageCount);
         Writer->WriteValue(TEXT("departure_passage_count"), Output.Walk.DeparturePassageCount);
+        Writer->WriteValue(TEXT("landing_room_probe_offsets_voxels"), 2.0);
+        Writer->WriteValue(TEXT("arrival_landing_room_probe_count"),
+            Output.Walk.ArrivalLandingRoomProbeCount);
+        Writer->WriteValue(TEXT("arrival_landing_room_player_fit_probe_count"),
+            Output.Walk.ArrivalLandingRoomPlayerFitProbeCount);
+        Writer->WriteValue(TEXT("arrival_landing_room_arrival_component_probe_count"),
+            Output.Walk.ArrivalLandingRoomArrivalComponentProbeCount);
+        Writer->WriteValue(TEXT("arrival_landing_room_in_arrival_component"),
+            Output.Walk.ArrivalLandingRoomProbeCount > 0
+            && Output.Walk.ArrivalLandingRoomArrivalComponentProbeCount
+                == Output.Walk.ArrivalLandingRoomProbeCount);
+        Writer->WriteValue(TEXT("departure_landing_room_probe_count"),
+            Output.Walk.DepartureLandingRoomProbeCount);
+        Writer->WriteValue(TEXT("departure_landing_room_player_fit_probe_count"),
+            Output.Walk.DepartureLandingRoomPlayerFitProbeCount);
+        Writer->WriteValue(TEXT("departure_landing_room_arrival_component_probe_count"),
+            Output.Walk.DepartureLandingRoomArrivalComponentProbeCount);
+        Writer->WriteValue(TEXT("departure_landing_room_in_arrival_component"),
+            Output.Walk.DepartureLandingRoomProbeCount > 0
+            && Output.Walk.DepartureLandingRoomArrivalComponentProbeCount
+                == Output.Walk.DepartureLandingRoomProbeCount);
         if (Output.Walk.bHasArrival)
         {
             WriteJsonVector(*Writer, TEXT("arrival_mouth_voxels"), Output.Walk.ArrivalVoxels, 1.0f);
@@ -1870,14 +1966,16 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("agent_to_target_component_gap_m"),
             static_cast<double>(Report.AgentToTargetComponentGapVoxels)
                 * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
-        Writer->WriteValue(TEXT("origin_column_in_sampled_window"), Report.bOriginColumnInSampledWindow);
-        Writer->WriteValue(TEXT("origin_column_has_player_fit"), Report.bOriginColumnHasPlayerFit);
-        Writer->WriteValue(TEXT("origin_column_player_fit_cells"), Report.OriginColumnPlayerFitCells);
-        Writer->WriteValue(TEXT("origin_column_reachable_from_arrival"), Report.bOriginColumnReachable);
+        Writer->WriteValue(TEXT("origin_column_measurement_window"),
+            TEXT("origin-inclusive mouth-AABB + margin"));
+        Writer->WriteValue(TEXT("origin_column_in_sampled_window"), OriginReport.bOriginColumnInSampledWindow);
+        Writer->WriteValue(TEXT("origin_column_has_player_fit"), OriginReport.bOriginColumnHasPlayerFit);
+        Writer->WriteValue(TEXT("origin_column_player_fit_cells"), OriginReport.OriginColumnPlayerFitCells);
+        Writer->WriteValue(TEXT("origin_column_reachable_from_arrival"), OriginReport.bOriginColumnReachable);
         Writer->WriteValue(TEXT("reachable_set_to_origin_column_voxels"),
-            static_cast<double>(Report.ReachableSetToOriginColumnVoxels));
+            static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels));
         Writer->WriteValue(TEXT("reachable_set_to_origin_column_m"),
-            static_cast<double>(Report.ReachableSetToOriginColumnVoxels)
+            static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels)
                 * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
         Writer->WriteObjectStart(TEXT("origin_check"));
         Writer->WriteValue(TEXT("attempted"), Output.Walk.bOriginCheckAttempted);
@@ -1885,40 +1983,40 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("refusal_or_error"), Output.Walk.OriginCheckRefusalReason);
         if (Output.Walk.bOriginCheckAvailable)
         {
-            const FVoxelPlayerFitWalkReport& OriginReport = Output.Walk.OriginCheckReport;
+            const FVoxelPlayerFitWalkReport& OriginCheckReport = Output.Walk.OriginCheckReport;
             Writer->WriteValue(TEXT("window_policy"), TEXT("origin-inclusive mouth-AABB + margin"));
-            Writer->WriteValue(TEXT("connectivity_result"), ConnectivityResultName(OriginReport.Result));
-            Writer->WriteValue(TEXT("can_reach_departure"), OriginReport.bCanReachDeparture);
-            Writer->WriteValue(TEXT("sampled_num_x"), OriginReport.SampledNumX);
-            Writer->WriteValue(TEXT("sampled_num_y"), OriginReport.SampledNumY);
-            Writer->WriteValue(TEXT("sampled_num_z"), OriginReport.SampledNumZ);
-            Writer->WriteValue(TEXT("sampled_min_x"), static_cast<double>(OriginReport.SampledMinX));
-            Writer->WriteValue(TEXT("sampled_max_x_exclusive"), static_cast<double>(OriginReport.SampledMaxX));
-            Writer->WriteValue(TEXT("sampled_min_y"), static_cast<double>(OriginReport.SampledMinY));
-            Writer->WriteValue(TEXT("sampled_max_y_exclusive"), static_cast<double>(OriginReport.SampledMaxY));
-            Writer->WriteValue(TEXT("sampled_min_z"), OriginReport.SampledMinZ);
-            Writer->WriteValue(TEXT("sampled_max_z_exclusive"), OriginReport.SampledMaxZ);
-            Writer->WriteValue(TEXT("player_fit_cells"), OriginReport.PlayerFitVolumeCells);
-            Writer->WriteValue(TEXT("reachable_player_fit_cells"), OriginReport.ReachablePlayerFitCells);
+            Writer->WriteValue(TEXT("connectivity_result"), ConnectivityResultName(OriginCheckReport.Result));
+            Writer->WriteValue(TEXT("can_reach_departure"), OriginCheckReport.bCanReachDeparture);
+            Writer->WriteValue(TEXT("sampled_num_x"), OriginCheckReport.SampledNumX);
+            Writer->WriteValue(TEXT("sampled_num_y"), OriginCheckReport.SampledNumY);
+            Writer->WriteValue(TEXT("sampled_num_z"), OriginCheckReport.SampledNumZ);
+            Writer->WriteValue(TEXT("sampled_min_x"), static_cast<double>(OriginCheckReport.SampledMinX));
+            Writer->WriteValue(TEXT("sampled_max_x_exclusive"), static_cast<double>(OriginCheckReport.SampledMaxX));
+            Writer->WriteValue(TEXT("sampled_min_y"), static_cast<double>(OriginCheckReport.SampledMinY));
+            Writer->WriteValue(TEXT("sampled_max_y_exclusive"), static_cast<double>(OriginCheckReport.SampledMaxY));
+            Writer->WriteValue(TEXT("sampled_min_z"), OriginCheckReport.SampledMinZ);
+            Writer->WriteValue(TEXT("sampled_max_z_exclusive"), OriginCheckReport.SampledMaxZ);
+            Writer->WriteValue(TEXT("player_fit_cells"), OriginCheckReport.PlayerFitVolumeCells);
+            Writer->WriteValue(TEXT("reachable_player_fit_cells"), OriginCheckReport.ReachablePlayerFitCells);
             Writer->WriteValue(TEXT("reachable_player_fit_fraction"),
-                static_cast<double>(OriginReport.ReachablePlayerFitFraction));
-            Writer->WriteValue(TEXT("player_fit_components"), OriginReport.PlayerFitComponents);
-            Writer->WriteValue(TEXT("arrival_component_cells"), OriginReport.ArrivalComponentCells);
-            Writer->WriteValue(TEXT("departure_component_cells"), OriginReport.DepartureComponentCells);
+                static_cast<double>(OriginCheckReport.ReachablePlayerFitFraction));
+            Writer->WriteValue(TEXT("player_fit_components"), OriginCheckReport.PlayerFitComponents);
+            Writer->WriteValue(TEXT("arrival_component_cells"), OriginCheckReport.ArrivalComponentCells);
+            Writer->WriteValue(TEXT("departure_component_cells"), OriginCheckReport.DepartureComponentCells);
             Writer->WriteValue(TEXT("mouth_component_gap_voxels"),
-                static_cast<double>(OriginReport.MouthComponentGapVoxels));
+                static_cast<double>(OriginCheckReport.MouthComponentGapVoxels));
             Writer->WriteValue(TEXT("origin_column_in_sampled_window"),
-                OriginReport.bOriginColumnInSampledWindow);
+                OriginCheckReport.bOriginColumnInSampledWindow);
             Writer->WriteValue(TEXT("origin_column_has_player_fit"),
-                OriginReport.bOriginColumnHasPlayerFit);
+                OriginCheckReport.bOriginColumnHasPlayerFit);
             Writer->WriteValue(TEXT("origin_column_player_fit_cells"),
-                OriginReport.OriginColumnPlayerFitCells);
+                OriginCheckReport.OriginColumnPlayerFitCells);
             Writer->WriteValue(TEXT("origin_column_reachable_from_arrival"),
-                OriginReport.bOriginColumnReachable);
+                OriginCheckReport.bOriginColumnReachable);
             Writer->WriteValue(TEXT("reachable_set_to_origin_column_voxels"),
-                static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels));
+                static_cast<double>(OriginCheckReport.ReachableSetToOriginColumnVoxels));
             Writer->WriteValue(TEXT("reachable_set_to_origin_column_m"),
-                static_cast<double>(OriginReport.ReachableSetToOriginColumnVoxels)
+                static_cast<double>(OriginCheckReport.ReachableSetToOriginColumnVoxels)
                     * FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
         }
         Writer->WriteObjectEnd();

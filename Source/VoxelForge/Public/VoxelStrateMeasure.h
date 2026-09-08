@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelPassageGeometry.h"
 
 class UVoxelGenerator;
 class UVoxelStrateManager;
@@ -19,7 +20,7 @@ class UVoxelStrateManager;
 struct VOXELFORGE_API FVoxelPlayerCapsuleConstants
 {
     static constexpr float VoxelSizeCentimeters = 25.0f;
-    static constexpr float VoxelSizeMeters = VoxelSizeCentimeters / 100.0f;
+    static constexpr float VoxelSizeMeters = VoxelPassageGeometry::VoxelSizeMeters;
     static constexpr float RadiusCentimeters = 34.0f;
     static constexpr float HalfHeightCentimeters = 88.0f;
     // UCharacterMovementComponent's UE 5.7 default. Callers that have a character CDO should
@@ -29,9 +30,9 @@ struct VOXELFORGE_API FVoxelPlayerCapsuleConstants
     // UE 5.7's WalkableFloorZ=0.71 resolves to about 44.8 degrees; a character CDO may expose
     // the precise angle. The diagnosis test copies that precise project value when available.
     static constexpr float WalkableFloorAngleDegrees = 44.8f;
-    static constexpr float RadiusVoxels = RadiusCentimeters / VoxelSizeCentimeters;
-    static constexpr float HalfHeightVoxels = HalfHeightCentimeters / VoxelSizeCentimeters;
-    static constexpr float HeightVoxels = 2.0f * HalfHeightVoxels;
+    static constexpr float RadiusVoxels = VoxelPassageGeometry::PlayerRadiusVoxels;
+    static constexpr float HalfHeightVoxels = VoxelPassageGeometry::PlayerHalfHeightVoxels;
+    static constexpr float HeightVoxels = VoxelPassageGeometry::PlayerHeightVoxels;
 };
 
 /** Read-only density source used by the offline Tier 2 pass for a materialised custom stack. */
@@ -68,7 +69,8 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     TOptional<FVector2D> CoverPointA;
     TOptional<FVector2D> CoverPointB;
     float CoverMarginVoxels = 48.0f;
-    // Origin-rooted topologies can route from one mouth to the other through the (0,0) spine.
+    // Origin-rooted topologies can route from one mouth to the other through the finite (0,0)
+    // landing room and its explicitly carved connector network.
     // When true, include (0,0) in the fitted AABB before applying MaxCells. A caller must keep
     // this enabled for that topology; an over-cap route window is then refused honestly instead
     // of being cropped back to a mouth-only box.
@@ -322,6 +324,12 @@ struct VOXELFORGE_API FVoxelPlayerFitWalkReport
     int64 DepartureComponentCells = 0;
     float MouthComponentGapVoxels = -1.0f;
 
+    // Optional room probes evaluated against this same grid and start component.  The arrays are
+    // empty for ordinary callers; when supplied, each entry is 1 only when the probe is both a
+    // player-fit cell and in the arrival/start component.
+    TArray<uint8> ComponentProbePlayerFit;
+    TArray<uint8> ComponentProbeInStartComponent;
+
     // The DFS returns to its root when the target component is unreachable.  Keep both the
     // physical end of that walk and the last newly reached pose: the latter is the useful
     // failure-frontier point for a render, while the former is the literal final pose.
@@ -496,4 +504,5 @@ VOXELFORGE_API bool VF_MeasurePlayerFitWalkWithSampler(
     const FVector& AVoxel,
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
-    FVoxelPlayerFitWalkReport& OutReport);
+    FVoxelPlayerFitWalkReport& OutReport,
+    const TArray<FVector>* ComponentProbePoints = nullptr);

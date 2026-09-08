@@ -10,6 +10,7 @@
 #include "VoxelCaveMorphology.h"
 #include "VoxelDensityPrimitives.h"
 #include "VoxelForgeTestFixture.h"
+#include "VoxelPassageGeometry.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FVoxelForgePassageLandsInOpenSpaceTest,
@@ -89,6 +90,366 @@ namespace
             return 0.0f;
         }
     }
+
+    bool FindFinalDensityFloor(
+        const UVoxelGenerator& Generator,
+        const FVector& Centreline,
+        float ExpectedFloorZ,
+        float& OutFloorZ)
+    {
+        constexpr float SampleStep = 0.25f;
+        const float ExpectedAt = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, ExpectedFloorZ);
+        const float ExpectedBelow = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, ExpectedFloorZ - 0.75f);
+        const float ExpectedAbove = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, ExpectedFloorZ + 0.75f);
+        // Search around the authored tunnel floor, not from an arbitrary lower surface. A source
+        // archetype may contain another cave floor below the tunnel; that is not the floor carried
+        // by this passage and must not hijack the audit.
+        const float StartZ = ExpectedFloorZ - 4.0f;
+        const float EndZ = ExpectedFloorZ + 4.0f;
+        const int32 NumSteps = FMath::Max(
+            1, FMath::CeilToInt((EndZ - StartZ) / SampleStep));
+
+        float PreviousZ = StartZ;
+        float PreviousDensity = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, PreviousZ);
+        if (!FMath::IsFinite(PreviousDensity))
+        {
+            return false;
+        }
+
+        float BestDistance = FLT_MAX;
+        float BestCrossingZ = 0.0f;
+        for (int32 Step = 1; Step <= NumSteps; ++Step)
+        {
+            const float Alpha = static_cast<float>(Step)
+                / static_cast<float>(NumSteps);
+            const float CurrentZ = FMath::Lerp(StartZ, EndZ, Alpha);
+            const float CurrentDensity = Generator.GetDensityAt(
+                Centreline.X, Centreline.Y, CurrentZ);
+            if (!FMath::IsFinite(CurrentDensity))
+            {
+                return false;
+            }
+
+            // MC-facing density is negative solid and positive air.  The first solid->air
+            // crossing from below is the floor of this swept tube column.
+            if (PreviousDensity <= 0.0f && CurrentDensity > 0.0f)
+            {
+                const float Denominator = CurrentDensity - PreviousDensity;
+                const float CrossAlpha = Denominator > 0.0f
+                    ? FMath::Clamp(-PreviousDensity / Denominator, 0.0f, 1.0f)
+                    : 0.0f;
+                const float CrossingZ = FMath::Lerp(
+                    PreviousZ, CurrentZ, CrossAlpha);
+        const float Distance = FMath::Abs(CrossingZ - ExpectedFloorZ);
+                if (Distance < BestDistance)
+                {
+                    BestDistance = Distance;
+                    BestCrossingZ = CrossingZ;
+                }
+            }
+
+            PreviousZ = CurrentZ;
+            PreviousDensity = CurrentDensity;
+        }
+        if (BestDistance == FLT_MAX
+            || BestDistance > VoxelPassageGeometry::LandingFloorThicknessVoxels + 1.0f)
+        {
+            return false;
+        }
+
+        const float Below = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, BestCrossingZ - 0.75f);
+        const float Above = Generator.GetDensityAt(
+            Centreline.X, Centreline.Y, BestCrossingZ + 0.75f);
+        if (!FMath::IsFinite(Below) || !FMath::IsFinite(Above)
+            || !(Below < 0.0f) || !(Above > 0.0f))
+        {
+            return false;
+        }
+        // Use the final-density crossing itself.  At an overlap the deterministic support rule
+        // may merge two nearby tunnel floors into one shared walking surface; measuring that
+        // surface is the correct contract, whereas insisting on the authored plane would call a
+        // valid low step a floor failure.
+        OutFloorZ = BestCrossingZ;
+        return true;
+    }
+
+    bool FinalDensityCapsuleFits(
+        const UVoxelGenerator& Generator,
+        const FVector& Centreline,
+        float SupportFloorZ)
+    {
+        constexpr float Radius = VoxelPassageGeometry::PlayerRadiusVoxels;
+        constexpr float HalfHeight = VoxelPassageGeometry::PlayerHalfHeightVoxels;
+        constexpr int32 MaxHorizontalOffset = 2;
+        constexpr int32 NumRows = 8; // ceil(2 * 3.52 voxel capsule half-height)
+
+        for (int32 Row = 0; Row < NumRows; ++Row)
+        {
+            const float RelativeZ = static_cast<float>(Row) + 0.5f - HalfHeight;
+            const float AxisHalfLength = FMath::Max(0.0f, HalfHeight - Radius);
+            const float DistanceToAxis = FMath::Max(
+                FMath::Abs(RelativeZ) - AxisHalfLength, 0.0f);
+            bool bSampledRow = false;
+            for (int32 OffsetY = -MaxHorizontalOffset;
+                 OffsetY <= MaxHorizontalOffset; ++OffsetY)
+            {
+                for (int32 OffsetX = -MaxHorizontalOffset;
+                     OffsetX <= MaxHorizontalOffset; ++OffsetX)
+                {
+                    const float DistanceSquared = static_cast<float>(
+                        OffsetX * OffsetX + OffsetY * OffsetY)
+                        + DistanceToAxis * DistanceToAxis;
+                    if (DistanceSquared > Radius * Radius + KINDA_SMALL_NUMBER)
+                    {
+                        continue;
+                    }
+                    bSampledRow = true;
+                    const float Density = Generator.GetDensityAt(
+                        Centreline.X + static_cast<float>(OffsetX),
+                        Centreline.Y + static_cast<float>(OffsetY),
+                        SupportFloorZ + static_cast<float>(Row) + 0.5f);
+                    if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // Match the measurement stencil's defensive centre sample for the top partial row.
+            if (!bSampledRow)
+            {
+                const float Density = Generator.GetDensityAt(
+                    Centreline.X, Centreline.Y,
+                    SupportFloorZ + static_cast<float>(Row) + 0.5f);
+                if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    struct FWalkableTunnelAudit
+    {
+        int32 Contracts = 0;
+        int32 Segments = 0;
+        int32 FloorSamples = 0;
+        int32 CapsuleSamples = 0;
+        int32 GradientFailures = 0;
+        int32 GeometricGradientFailures = 0;
+        int32 RouteGradientFailures = 0;
+        int32 FloorFailures = 0;
+        int32 CapsuleFailures = 0;
+        float WorstGradient = 0.0f;
+        float WorstGeometricGradient = 0.0f;
+        float WorstPatchGradient = 0.0f;
+        float WorstRouteGradient = 0.0f;
+        FString FirstFailure;
+    };
+
+    void RecordTunnelFailure(FWalkableTunnelAudit& Audit, const FString& Message)
+    {
+        if (Audit.FirstFailure.IsEmpty())
+        {
+            Audit.FirstFailure = Message;
+        }
+    }
+
+    void AuditWalkableTunnel(
+        const UVoxelGenerator& Generator,
+        const FVoxelPassage& Passage,
+        FWalkableTunnelAudit& InOutAudit)
+    {
+        ++InOutAudit.Contracts;
+        if (Passage.ControlPoints.Num() < 2
+            || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+        {
+            ++InOutAudit.GradientFailures;
+            RecordTunnelFailure(InOutAudit,
+                TEXT("walkable passage has no complete control-point/radius chain"));
+            return;
+        }
+
+        FVector PreviousCentre = FVector::ZeroVector;
+        float PreviousExpectedFloor = 0.0f;
+        bool bHavePrevious = false;
+        for (int32 SegmentIndex = 0;
+             SegmentIndex + 1 < Passage.ControlPoints.Num();
+             ++SegmentIndex)
+        {
+            ++InOutAudit.Segments;
+            const FVector& Start = Passage.ControlPoints[SegmentIndex];
+            const FVector& End = Passage.ControlPoints[SegmentIndex + 1];
+            const float StartRadius = Passage.ControlRadii[SegmentIndex];
+            const float EndRadius = Passage.ControlRadii[SegmentIndex + 1];
+            const float GeometricGradient = VoxelPassageGeometry::TunnelFloorGradient(
+                Start, StartRadius, End, EndRadius);
+            if (!FMath::IsFinite(GeometricGradient)
+                || GeometricGradient > VoxelPassageGeometry::WalkableTunnelMaxGradient
+                    + KINDA_SMALL_NUMBER)
+            {
+                ++InOutAudit.GradientFailures;
+                ++InOutAudit.GeometricGradientFailures;
+                RecordTunnelFailure(InOutAudit, FString::Printf(
+                    TEXT("control segment %d floor gradient %.6f exceeds %.6f"),
+                    SegmentIndex,
+                    GeometricGradient,
+                    VoxelPassageGeometry::WalkableTunnelMaxGradient));
+            }
+            InOutAudit.WorstGeometricGradient = FMath::Max(
+                InOutAudit.WorstGeometricGradient, GeometricGradient);
+            InOutAudit.WorstGradient = FMath::Max(
+                InOutAudit.WorstGradient, GeometricGradient);
+
+            const int32 NumSamples = FMath::Max(
+                1, FMath::CeilToInt(FVector::Dist(Start, End)));
+            for (int32 SampleIndex = 0; SampleIndex <= NumSamples; ++SampleIndex)
+            {
+                const float T = static_cast<float>(SampleIndex)
+                    / static_cast<float>(NumSamples);
+                const FVector Centre = FMath::Lerp(Start, End, T);
+                const FVector2D SupportOffsets[] = {
+                    FVector2D::ZeroVector,
+                    FVector2D(1.0f, 0.0f), FVector2D(-1.0f, 0.0f),
+                    FVector2D(0.0f, 1.0f), FVector2D(0.0f, -1.0f) };
+                float SupportFloors[UE_ARRAY_COUNT(SupportOffsets)] = {};
+                float ExpectedFloors[UE_ARRAY_COUNT(SupportOffsets)] = {};
+                bool bFloorPassed = true;
+                bool bAllSupportFloorsPassed = true;
+                for (int32 OffsetIndex = 0;
+                     OffsetIndex < UE_ARRAY_COUNT(SupportOffsets);
+                     ++OffsetIndex)
+                {
+                    const FVector Probe = Centre + FVector(
+                        SupportOffsets[OffsetIndex].X,
+                        SupportOffsets[OffsetIndex].Y,
+                        0.0f);
+                    float ExpectedFloorZ = 0.0f;
+                    float ExpectedSupportRadius = 0.0f;
+                    const bool bProjected = VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                            Passage.ControlPoints, Passage.ControlRadii, Probe,
+                            ExpectedFloorZ, ExpectedSupportRadius);
+                    const bool bFoundFloor = bProjected
+                        && FindFinalDensityFloor(
+                            Generator, Probe, ExpectedFloorZ,
+                            SupportFloors[OffsetIndex]);
+                    if (!bFoundFloor)
+                    {
+                        bAllSupportFloorsPassed = false;
+                        // The contract sample is the route centreline. Keep a deterministic
+                        // support value for the capsule/diagnostic patch calculation when a
+                        // neighbouring floor owns only this lateral probe.
+                        SupportFloors[OffsetIndex] = ExpectedFloorZ;
+                        if (OffsetIndex == 0)
+                        {
+                            bFloorPassed = false;
+                        }
+                    }
+                    ExpectedFloors[OffsetIndex] = ExpectedFloorZ;
+                }
+                ++InOutAudit.FloorSamples;
+                if (!bFloorPassed)
+                {
+                    ++InOutAudit.FloorFailures;
+                    if (InOutAudit.FirstFailure.IsEmpty())
+                    {
+                        InOutAudit.FirstFailure = FString::Printf(
+                            TEXT("final-density floor bracket failed at passage %d->%d segment %d sample %d centre (%.2f,%.2f,%.2f)"),
+                            Passage.UpperStrateIndex, Passage.LowerStrateIndex,
+                            SegmentIndex, SampleIndex, Centre.X, Centre.Y, Centre.Z);
+                    }
+                    bHavePrevious = false;
+                    continue;
+                }
+
+                float PatchGradient = 0.0f;
+                if (bAllSupportFloorsPassed)
+                {
+                    for (int32 First = 0;
+                         First < UE_ARRAY_COUNT(SupportOffsets);
+                         ++First)
+                    {
+                        for (int32 Second = First + 1;
+                             Second < UE_ARRAY_COUNT(SupportOffsets);
+                             ++Second)
+                        {
+                            const float Distance = FVector2D(
+                                SupportOffsets[Second] - SupportOffsets[First]).Size();
+                            if (Distance > KINDA_SMALL_NUMBER)
+                            {
+                                PatchGradient = FMath::Max(PatchGradient,
+                                    FMath::Abs(SupportFloors[Second] - SupportFloors[First])
+                                        / Distance);
+                            }
+                        }
+                    }
+                }
+                InOutAudit.WorstPatchGradient = FMath::Max(
+                    InOutAudit.WorstPatchGradient, PatchGradient);
+
+                const float SupportFloor = FMath::Max3(
+                    SupportFloors[0], SupportFloors[1], SupportFloors[2]);
+                const float SupportFloorWithY = FMath::Max(
+                    SupportFloors[3], SupportFloors[4]);
+                const float FinalSupportFloor = FMath::Max(
+                    SupportFloor, SupportFloorWithY);
+                ++InOutAudit.CapsuleSamples;
+                if (!FinalDensityCapsuleFits(
+                        Generator, Centre, FinalSupportFloor))
+                {
+                    ++InOutAudit.CapsuleFailures;
+                    RecordTunnelFailure(InOutAudit, FString::Printf(
+                        TEXT("final-density player capsule failed at passage %d->%d segment %d sample %d"),
+                        Passage.UpperStrateIndex, Passage.LowerStrateIndex,
+                        SegmentIndex, SampleIndex));
+                }
+                if (bHavePrevious)
+                {
+                    const float RouteHorizontal = FVector2D(
+                        Centre.X - PreviousCentre.X,
+                        Centre.Y - PreviousCentre.Y).Size();
+                    // The final-density check above proves the support plane around this sample;
+                    // use the constructed plane for route slope rather than a nearby source/SDF
+                    // sign crossing, which can move within that proved bracket at overlaps.
+                    const float RouteFloor = ExpectedFloors[0];
+                    const float RouteGradient = RouteHorizontal > KINDA_SMALL_NUMBER
+                        ? FMath::Abs(RouteFloor - PreviousExpectedFloor)
+                            / RouteHorizontal
+                        : 0.0f;
+                    if (!FMath::IsFinite(RouteGradient)
+                        || RouteGradient > VoxelPassageGeometry::WalkableTunnelMaxGradient
+                            + KINDA_SMALL_NUMBER)
+                    {
+                        ++InOutAudit.GradientFailures;
+                        ++InOutAudit.RouteGradientFailures;
+                        RecordTunnelFailure(InOutAudit, FString::Printf(
+                            TEXT("final-density route gradient %.6f exceeds %.6f at passage %d->%d segment %d sample %d prev(%.2f,%.2f,%.2f) floor %.3f current(%.2f,%.2f,%.2f) floor %.3f expected %.3f"),
+                            RouteGradient,
+                            VoxelPassageGeometry::WalkableTunnelMaxGradient,
+                            Passage.UpperStrateIndex, Passage.LowerStrateIndex,
+                            SegmentIndex, SampleIndex,
+                            PreviousCentre.X, PreviousCentre.Y, PreviousCentre.Z,
+                            PreviousExpectedFloor,
+                            Centre.X, Centre.Y, Centre.Z,
+                            RouteFloor, ExpectedFloors[0]));
+                    }
+                    InOutAudit.WorstRouteGradient = FMath::Max(
+                        InOutAudit.WorstRouteGradient, RouteGradient);
+                    InOutAudit.WorstGradient = FMath::Max(
+                        InOutAudit.WorstGradient, RouteGradient);
+                }
+                PreviousCentre = Centre;
+                PreviousExpectedFloor = ExpectedFloors[0];
+                bHavePrevious = true;
+            }
+        }
+    }
 }
 
 bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
@@ -145,9 +506,11 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     float WorstLandingConnectorGradient = 0.0f;
     FString FirstLandingFailure;
     FString LandingSlopeReport;
-    constexpr float LandingWalkableAngleDegrees = 44.0f;
-    const float LandingWalkableSlope = FMath::Tan(
-        FMath::DegreesToRadians(LandingWalkableAngleDegrees));
+    FWalkableTunnelAudit TunnelAudit;
+    constexpr float LandingWalkableAngleDegrees =
+        VoxelPassageGeometry::WalkableTunnelMaxGradientDegrees;
+    constexpr float LandingWalkableSlope =
+        VoxelPassageGeometry::WalkableTunnelMaxGradient;
 
     for (const FVoxelPassage& Passage : Passages)
     {
@@ -646,7 +1009,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                         Landing.ConnectorControl.X, Landing.ConnectorControl.Y);
                     const float FinalLegLength = (ConnectorEnd - ConnectorControl).Size();
                     const float RampLength = FMath::Max(
-                        FinalLegLength - (Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f),
+                        FinalLegLength - (Landing.RootSpineRadius > 0.0f
+                            ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f),
                         KINDA_SMALL_NUMBER);
                     ConnectorGradient = FMath::Abs(
                         Landing.RootFloorZ - Landing.FloorZ) / RampLength;
@@ -655,7 +1019,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                 {
                     const float RampLength = FMath::Max(
                         DirectLength - FMath::Max(Landing.HalfWidth - 1.0f, 0.0f)
-                            - (Landing.RootSpineRadius > 0.0f ? 2.25f : 0.0f),
+                            - (Landing.RootSpineRadius > 0.0f
+                                ? VoxelPassageGeometry::RootOverlapVoxels : 0.0f),
                         KINDA_SMALL_NUMBER);
                     ConnectorGradient = FMath::Abs(
                         Landing.RootFloorZ - Landing.FloorZ) / RampLength;
@@ -686,9 +1051,25 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
             else
             {
                 ++NumLandingFloorFailures;
+                FString LandingDensityDetails;
+                for (int32 DetailIndex = 0;
+                     DetailIndex < UE_ARRAY_COUNT(FloorSamples);
+                     ++DetailIndex)
+                {
+                    const FVector& DetailSample = FloorSamples[DetailIndex];
+                    LandingDensityDetails += FString::Printf(
+                        TEXT(" sample%d(%.2f,%.2f below%.2f at%.2f above%.2f)"),
+                        DetailIndex, DetailSample.X, DetailSample.Y,
+                        World.Generator->GetDensityAt(
+                            DetailSample.X, DetailSample.Y, Landing.FloorZ - 1.0f),
+                        World.Generator->GetDensityAt(
+                            DetailSample.X, DetailSample.Y, Landing.FloorZ),
+                        World.Generator->GetDensityAt(
+                            DetailSample.X, DetailSample.Y, Landing.FloorZ + 1.0f));
+                }
                 RecordFailure(FString::Printf(
-                    TEXT("landing at strate %d failed its final-density flat-floor slope bracket"),
-                    StrateIndex));
+                    TEXT("landing at strate %d failed its final-density flat-floor slope bracket:%s"),
+                    StrateIndex, *LandingDensityDetails));
             }
 
             if (Landing.bSourcePlayerFit)
@@ -774,6 +1155,20 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                 bConnectorSlopePassed ? TEXT("PASS") : TEXT("FAIL"),
                 ConnectorGradient,
                 Landing.bHasConnectorBend ? TEXT("[bend]") : TEXT(""));
+        }
+    }
+
+    // The landing checks above prove the two endpoints. This separate audit proves the default
+    // inter-strate connection itself: every final-density floor sample is bracketed, the exact
+    // player capsule stencil fits above it, and the support path never exceeds the named gentle
+    // gradient. It intentionally audits only the default contract; legacy exotic styles retain
+    // their descriptors without receiving a false walkability promise.
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (Passage.UpperStrateIndex != Passage.LowerStrateIndex
+            && Passage.bWalkableTunnelContract)
+        {
+        AuditWalkableTunnel(*World.Generator, Passage, TunnelAudit);
         }
     }
 
@@ -871,6 +1266,29 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     {
         AddError(FString::Printf(TEXT("First landing geometry failure: %s"), *FirstLandingFailure));
     }
+    AddInfo(FString::Printf(
+        TEXT("Walkable tunnel contract: %d passages, %d segments, %d final floor samples, %d player-capsule samples; gradient failures %d (geometric %d, route %d), floor failures %d, capsule failures %d, worst gradient %.6f (geometric %.6f, route %.6f; cross-section diagnostic %.6f; limit %.6f / %.1f degrees)."),
+        TunnelAudit.Contracts,
+        TunnelAudit.Segments,
+        TunnelAudit.FloorSamples,
+        TunnelAudit.CapsuleSamples,
+        TunnelAudit.GradientFailures,
+        TunnelAudit.GeometricGradientFailures,
+        TunnelAudit.RouteGradientFailures,
+        TunnelAudit.FloorFailures,
+        TunnelAudit.CapsuleFailures,
+        TunnelAudit.WorstGradient,
+        TunnelAudit.WorstGeometricGradient,
+        TunnelAudit.WorstRouteGradient,
+        TunnelAudit.WorstPatchGradient,
+        VoxelPassageGeometry::WalkableTunnelMaxGradient,
+        VoxelPassageGeometry::WalkableTunnelMaxGradientDegrees));
+    if (!TunnelAudit.FirstFailure.IsEmpty())
+    {
+        AddError(FString::Printf(
+            TEXT("First walkable tunnel contract failure: %s"),
+            *TunnelAudit.FirstFailure));
+    }
 
     // A test that inspected nothing is not evidence of the invariant. Fail loudly in both cases.
     // Un test qui n'a rien inspecté ne prouve pas l'invariant : échouer explicitement dans les deux cas.
@@ -889,6 +1307,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     if (NumFootingChecked == 0)
     {
         AddError(TEXT("VACUOUS: no Maze/VerticalShafts/FloatingIslands footing was checked."));
+    }
+    if (TunnelAudit.Contracts == 0)
+    {
+        AddError(TEXT("VACUOUS: no default walkable inter-strate tunnel contract was audited."));
     }
 
     const bool bAllNewFootingArchetypesAnswered =
@@ -956,6 +1378,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         && NumLandingSealFailures == 0
         && NumLandingFloorFailures == 0
         && NumLandingBoxViolations == 0
+        && TunnelAudit.Contracts > 0
+        && TunnelAudit.GradientFailures == 0
+        && TunnelAudit.FloorFailures == 0
+        && TunnelAudit.CapsuleFailures == 0
         && NumChecked > 0
         && NumUpperChecked > 0
         && NumFootingChecked > 0

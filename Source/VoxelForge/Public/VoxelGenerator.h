@@ -77,9 +77,9 @@ public:
     // Les formes créatives viennent ensuite des params de strate.
     int32 Seed = 0;
 
-    // Radius (voxels) of the guaranteed open vertical landing column carved at world
-    // XY (0,0) in every strate — the (0,0) descent spine. Copied from VoxelSettings.
-    // 0 disables the spine carve.
+    // Authored radius (voxels) of the guaranteed flat-floored landing room at world XY (0,0) in
+    // every strate — the old “spine” setting now sizes a room and never creates a vertical bore.
+    // 0 disables the origin landing rooms. Copied from VoxelSettings.
     float OriginSpineRadius = 14.0f;
 
     // Radius (voxels) of the bounded world in actor-space XY, measured from (0,0).

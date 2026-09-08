@@ -296,6 +296,14 @@ static FORCEINLINE void ApplyOriginSpine(float& Density, float WorldX, float Wor
         StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
 }
 
+static FORCEINLINE void ApplyOriginLandingFloor(float& Density,
+    float WorldX, float WorldY, float WorldZ,
+    float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
+{
+    VF_ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
+}
+
 // DISTURBANCE LAYER — the "wow" post-process. Operates on the FINAL MC density
 // (negative = solid, positive = air), AFTER the archetype produced its terrain, so
 // it works uniformly for every generator type. Stays inside the seal bands so it can
@@ -1061,10 +1069,39 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 break;
             }
         }
+        // Origin rooms are structural too. Reassert their air before either support writer so a
+        // bridge/ridge cannot plug a landing, while the two floor writers remain last.
+        VF_ApplyOriginLandingAirMC(
+            Result, WorldX, WorldY, WorldZ,
+            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
         StrateManager->ApplyPassageLandingAirMC(
             Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
             CP_Dist.BoundarySealThickness);
+        VF_ApplyOriginLandingFloorMC(
+            Result, WorldX, WorldY, WorldZ,
+            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
         StrateManager->ApplyPassageLandingFloorMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+        // A walkable tunnel's guaranteed air core is the final structural writer above its
+        // floor. This prevents a nearby passage's floor slab from capping the active route;
+        // the tunnel-floor predicate is false on the active floor itself, so support remains.
+        StrateManager->ApplyPassageTunnelAirMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
+            CP_Dist.BoundarySealThickness);
+        VF_ApplyOriginLandingAirMC(
+            Result, WorldX, WorldY, WorldZ,
+            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+        StrateManager->ApplyPassageLandingAirMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
+            CP_Dist.BoundarySealThickness);
+        VF_ApplyOriginLandingFloorMC(
+            Result, WorldX, WorldY, WorldZ,
+            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+        StrateManager->ApplyPassageLandingRoomFloorMC(
             Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
     }
     else
@@ -2225,6 +2262,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
     // Fourth structural post: the XY edge wins over a passage near the rim.
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
@@ -2448,6 +2488,9 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
         WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
@@ -2569,6 +2612,9 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
         WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
@@ -2833,6 +2879,9 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
             Density, WorldX, WorldY, WorldZ,
             S.BaseDensity, S.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        S.StrateTopWorldZ, S.StrateBottomWorldZ,
+        S.BoundarySealThickness, S.BaseDensity, OriginSpineRadius);
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
         WorldRadiusVoxels, EdgeSealThickness, S.BaseDensity);
@@ -3223,13 +3272,20 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     {
         bCanAir = false;
     }
-    if (OriginSpineRadius > 0.0f)
+    if (StrateManager->AnyOriginLandingNearBox(
+            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
     {
-        // Spine (0,0) : colonne XY rayon R + blend 3 (cf. ApplyOriginSpine). Test cercle/boîte XY.
-        const float Reach = OriginSpineRadius + 3.0f;
-        const float CX = FMath::Clamp(0.0f, (float)MinX, (float)MaxX);
-        const float CY = FMath::Clamp(0.0f, (float)MinY, (float)MaxY);
-        if (CX * CX + CY * CY <= Reach * Reach) bCanSolid = false;
+        // The origin post is a room carve, not a full-height spine. Its conservative manager
+        // guard is per tile, so it retains the hot-path invariant while covering every strate's
+        // room AABB and its four-voxel carve blend.
+        bCanSolid = false;
+    }
+    if (StrateManager->AnyOriginLandingFloorNearBox(
+            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
+    {
+        // The same origin room also owns a guaranteed support slab, so a tile touching only that
+        // slab cannot be proved uniformly air.
+        bCanAir = false;
     }
 
     // ── Catégorisation par Z du treillis : gap bedrock = solide ; hors layout = air constant ;
@@ -4556,6 +4612,9 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
         WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
@@ -4717,6 +4776,9 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
             Density, WorldX, WorldY, WorldZ,
             Params.BaseDensity, Params.BoundarySealThickness);
     }
+    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
     VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
         WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);

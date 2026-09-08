@@ -392,10 +392,11 @@ public:
 	// SPINE & INTER-STRATE CONNECTIONS  (the (0,0) descent axis)
 	//=========================================================================
 
-	// Radius (voxels) of the guaranteed open vertical "landing" column carved at
-	// world XY (0,0) in EVERY strate, regardless of archetype. This is the prepared
-	// space the player digs THROUGH the seal into when descending. 0 = disabled.
-	//   10-14 → cozy shaft (default) · 20+ → wide landing chamber
+    // Authored radius (voxels) of the guaranteed (0,0) landing room in EVERY strate, regardless
+    // of archetype. The §6.5 body-sized formulas turn it into a flat-floored room; this setting
+    // no longer bores a vertical column. 0 = disabled. The room is top-anchored inside each
+    // strate, and the seals remain solid until a progression passage is opened.
+    //   10-14 → compact landing room (default) · 20+ → broad landing room
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Spine", meta = (ClampMin = "0.0"))
 	float OriginSpineRadius = 14.0f;
 

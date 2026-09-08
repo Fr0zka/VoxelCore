@@ -135,10 +135,12 @@ its row. The design lives in `OPSTACK-PLAN.md` / `OPSTACK-DECOMPOSITION.md`, the
 what the world IS, and both paths compute it.
 
 ### 8.2 (0,0) spine & hybrid connections
-- `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) carves a guaranteed open vertical
-  column at XY (0,0) in every strate's **interior** (seals untouched). Radius =
-  `UVoxelGenerator::OriginSpineRadius` ← `VoxelSettings::OriginSpineRadius`. Called before
-  every `ApplyBoundarySeal`.
+- `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) builds a finite, rounded landing room with
+  a flat support floor at XY (0,0) in every strate's **interior**. It no longer carves a continuous
+  vertical column: the old column supplied open air but no standable surface except at its bottom.
+  Room half-width and height reuse the §6.5 capsule formulas; the room and slab are clamped away
+  from both vertical seals. Radius = `UVoxelGenerator::OriginSpineRadius` ←
+  `VoxelSettings::OriginSpineRadius`. Called before every `ApplyBoundarySeal`.
 - `VerticalShafts` treats that structural column as a **connector endpoint**, not as a second
   density primitive. A thread-local rebuild collects a direct-indexed geometric halo once (with
   the stock settings: 9×9 tree-emission cells and a 15×15 roll), emits tree links only for the
@@ -156,11 +158,16 @@ what the world IS, and both paths compute it.
   ledge-free Z interval. `BuildVerticalShaftStack` mirrors the same tree, random links, windows,
   hashes, radius, and connector-Z rule; `VF_ApplyOriginSpine` remains the sole owner of the
   vertical column itself.
-- Descent is **player-dug** through the thin seals at (0,0). The single auto-opened
-  connection is the **surface entry shaft** at (0,0) through the top of strate 0
-  (`GeneratePassages`, `bOpenSurfaceEntry`).
-- **Hybrid extras:** auto-carved *shortcut* passages per boundary, placed away from (0,0).
-  Now fully **per-strate** — see §8.8 (the upper strate's `PassageConfig` drives count/style/shape).
+- The seals between rooms remain closed until progression opens the next connection. The one
+  optional above-ground opening is the top room's ceiling through strate 0
+  (`GeneratePassages`, `bOpenSurfaceEntry`); it never bores the lower rooms together.
+- **Base connection:** the default inter-strate passage is a small, single-file, two-leg
+  walkable switchback with a named 15° floor-gradient cap and final-density floor/capsule audit.
+  A 32 m drop needs 119.4 m of horizontal run at that gradient, so a single direct ramp is not a
+  plausible default. The switchback is explicit geometry, not a fall shaft.
+- **Hybrid extras:** auto-carved passages per boundary, placed away from (0,0). The upper
+  strate's `PassageConfig` still drives count/style/shape; the legacy vertical/spiral/cascade/
+  crack styles remain descriptors without the base walkability guarantee.
 
 The tree is a construction guarantee for the shaft field: every seeded shaft has one inward edge,
 and every chain strictly decreases distance to the origin until it reaches a local minimum that
@@ -503,28 +510,30 @@ historical random reach and are reported diagnostically.
 
 The source query proves only a local pose; it does not flood-fill the live network. Therefore every
 inter-strate end also receives an explicit `FVoxelPassageLanding`: a rounded chamber with a hard
-flat floor and a deterministic connector to the strate's guaranteed origin-root network at `(0,0)`.
+flat floor and a deterministic connector to that strate's finite origin landing room at `(0,0)`.
 This is the join guarantee, including for a source-fit answer — it is not a probability claim about
 a nearby room. The connector is a swept flat-floor corridor with a 5-voxel (1.25 m) radius / 2.5 m
 clear width and a 12-voxel (3 m) clear height. Its 4.5-voxel support inset is enough for the
-1.36-voxel player radius and avoids capping unrelated shaft air; support stops at the configured
-origin-spine radius, so the existing vertical root column remains open. At the root, every connector
-joins an annular hub outside the spine, with a common per-strate floor derived from the sealed
-interior bounds. If the direct floor run would exceed 44°, the deterministic builder inserts a
-level dog-leg before the final ramp. The hub and the connector floor are therefore a real walkable
-network, not a point anchor or nearest-component guess, and no per-passage ordering is involved.
+1.36-voxel player radius and avoids capping unrelated shaft air; the origin room owns the root
+floor, so there is no continuous root column. A connector's level dog-leg is sized against the same
+named 15° floor-gradient limit as the default inter-strate tunnel. The room and connector floor are
+therefore real walkable geometry, not a point anchor or nearest-component guess, and no
+per-passage ordering is involved.
 
 The chamber dimensions come directly from the capsule: player diameter `2×0.34/0.25 = 2.72`
 voxels; required floor width `3/0.25 = 12` voxels; capsule height `2×0.88/0.25 = 7.04` voxels;
 one metre of headroom adds 4 voxels. `HalfWidth=max(7, MouthRadius+2)` leaves
 `2×(HalfWidth−1) >= 12` voxels of flat support after the one-voxel wall inset; the authored room
 is therefore at least 14 voxels (3.5 m) wide. Height is
-`max(12, 7.04+4, 2×MouthRadius+2)`; the stock 8-voxel mouth is an 18-voxel (4.5 m) room.
+`max(12, 7.04+4, 2×MouthRadius+2)`; the stock 6-voxel mouth is a 14-voxel (3.5 m) room with
+an 8-voxel half-width (4 m full width).
 `FloorZ=StandingPoint.Z−0.5`, floor thickness is 3 voxels (0.75 m), and the tube centreline
 meets the room at `FloorZ+MouthRadius`, so its lower tangent is the floor and there is no step lip.
-The final-density floor audit samples the flat plane and checks its normal against the explicit ≤44°
-landing contract; it also checks the analytic connector ramps against the same limit. The movement
-CDO currently reports 44.8°, so the landing audit is intentionally the stricter criterion.
+The final-density floor audit samples the flat plane and checks the player-fit capsule above it. The
+default tunnel audit samples every route step against the final density and checks the analytic and
+measured route gradients against the explicit ≤15° walkable-tunnel contract. This is deliberately
+well below the movement CDO's roughly 44.8° scramble ceiling: 44° is not a sensible default for a
+tunnel the player is meant to walk.
 
 The landing is part of the structural post, in the fixed order
 `origin spine → vertical seal → passage tube + landing/floor → XY edge seal`. The floor is applied

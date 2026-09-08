@@ -8,6 +8,7 @@
 
 #include "VoxelForgeTestFixture.h"
 #include "VoxelCaveMorphology.h"
+#include "VoxelPassageGeometry.h"
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"
 
@@ -1732,7 +1733,6 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
 
     for (int32 StrateIndex = 0; StrateIndex < Layout.Num(); ++StrateIndex)
     {
-        const FStrateSlot& Slot = Layout[StrateIndex];
         const FVoxelStrateMetrics& Window = DerivedMetricsByIndex[StrateIndex];
         if (!Window.bValid || Window.SampledMinZ >= Window.SampledMaxZ) continue;
 
@@ -1745,22 +1745,36 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         const FConnectivityProbe Probe = ProbeRoute(
             StrateIndex, A, B, /*bCountInGuard=*/true, /*bCountAsAnchorProbe=*/false,
             /*bCountAsArrivalDeparture=*/false);
-        if (Probe.Result == EVoxelConnectivityResult::Connected
-            && FullResolutionDirectSegmentHasSolid(*World.Generator, A, B))
-        {
-            AddError(FString::Printf(
-                TEXT("HARD FAILURE: VF_AreConnected returned CONNECTED for %s while its "
-                     "full-resolution direct walk contained a solid sample."),
-                *ArchetypeName(Slot)));
-            bAllChecksPassed = false;
-        }
+        // A and B are deliberately a vertical diagnostic line, not the recovered route.  A
+        // connected verdict is allowed to detour around solid terrain; only the route selected by
+        // VF_AreConnected is required to pass its own full-resolution re-walk.  Comparing this
+        // unrelated direct segment to the verdict used to reject valid detours, and became
+        // especially misleading once the origin spine became a finite landing room.
+        (void)Probe;
     }
 
     // Controlled negative route: at SampleStep 4, the two coarse centres at X=-2 and X=+2
     // remain air while the three full-resolution voxels at X=-1,0,+1 are filled solid.
     const FVoxelStrateMetrics& WallWindow = DerivedMetricsByIndex[0];
-    const float WallZ = static_cast<float>(WallWindow.SampledMinZ)
-        + 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep);
+    const FStrateSlot& WallSlot = Layout[0];
+    const float WallTopZ = (static_cast<float>(WallSlot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+    const float WallBottomZ = static_cast<float>(WallSlot.BottomChunkZ) * CHUNK_SIZE;
+    const VoxelPassageGeometry::FOriginLandingGeometry WallLanding =
+        VoxelPassageGeometry::BuildOriginLandingGeometry(
+            WallTopZ,
+            WallBottomZ,
+            WallSlot.Definition != nullptr
+                ? WallSlot.Definition->GenerationParams.BoundarySealThickness
+                : 0.0f,
+            World.Generator->OriginSpineRadius);
+    // The controlled wall must start in known air.  The old probe used the bottom sample of the
+    // strate, which was only air because the old spine was a full-height cylinder.  Put it in the
+    // finite top landing room instead; this keeps the coarse-lie control about the wall, not about
+    // an unrelated start-cell-solid result.
+    const float WallZ = WallLanding.bValid
+        ? WallLanding.FloorZ + 4.0f
+        : static_cast<float>(WallWindow.SampledMinZ)
+            + 0.5f * static_cast<float>(DerivedWindowSettings.SampleStep);
     const FVector WallA(Settings.CenterXY.X - 2.0f, Settings.CenterXY.Y + 2.0f, WallZ);
     const FVector WallB(Settings.CenterXY.X + 2.0f, Settings.CenterXY.Y + 2.0f, WallZ);
 

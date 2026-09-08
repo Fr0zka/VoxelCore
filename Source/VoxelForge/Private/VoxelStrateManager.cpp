@@ -120,6 +120,165 @@ namespace
     }
 }
 
+static float VF_BoundarySealThicknessForDefinition(
+    const UVoxelStrateDefinition& Definition)
+{
+    switch (Definition.GeneratorType)
+    {
+    case ECaveGeneratorType::TunnelNetwork:
+    case ECaveGeneratorType::Underwater:
+        return Definition.GenerationParams.BoundarySealThickness;
+    case ECaveGeneratorType::FlatPlain:
+    case ECaveGeneratorType::CrystalChamber:
+        return Definition.SlabParams.BoundarySealThickness;
+    case ECaveGeneratorType::Maze:
+        return Definition.MazeParams.BoundarySealThickness;
+    case ECaveGeneratorType::SurfaceWorld:
+        return Definition.SurfaceParams.BoundarySealThickness;
+    case ECaveGeneratorType::VerticalShafts:
+        return Definition.VerticalShaftParams.BoundarySealThickness;
+    case ECaveGeneratorType::FloatingIslands:
+        return Definition.FloatingIslandParams.BoundarySealThickness;
+    default:
+        return 0.0f;
+    }
+}
+
+/**
+ * The default inter-strate tunnel is a carved tube plus an explicit support slab.  The tube's
+ * rounded SDF guarantees clearance, but it cannot guarantee a standable surface over a source
+ * field or a disturbance that was solid before the passage post.  Project the query into the
+ * nearest horizontal control segment and return the conservative floor carried by that segment.
+ * This is a fixed-size arithmetic loop over the already-built descriptor; it performs no source
+ * search, allocation, or topology work.
+ */
+static bool VF_IsWalkableTunnelFloor(
+    const FVoxelPassage& Passage,
+    const FVector& Position)
+{
+    if (!Passage.bWalkableTunnelContract
+        || Passage.ControlPoints.Num() < 2
+        || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+    {
+        return false;
+    }
+
+    float FloorZ = 0.0f;
+    float SupportRadius = 0.0f;
+    if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+            Passage.ControlPoints, Passage.ControlRadii, Position,
+            FloorZ, SupportRadius))
+    {
+        return false;
+    }
+
+    return Position.Z <= FloorZ + KINDA_SMALL_NUMBER
+        && Position.Z > FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels;
+}
+
+static bool VF_IsWalkableTunnelAir(
+    const FVoxelPassage& Passage,
+    const FVector& Position)
+{
+    if (!Passage.bWalkableTunnelContract
+        || Passage.ControlPoints.Num() < 2
+        || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+    {
+        return false;
+    }
+
+    float FloorZ = 0.0f;
+    float SupportRadius = 0.0f;
+    if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+            Passage.ControlPoints, Passage.ControlRadii, Position,
+            FloorZ, SupportRadius))
+    {
+        return false;
+    }
+
+    // The carved tube is wider than this guaranteed core.  The core is deliberately expressed as
+    // a vertical prism over the projected floor: it gives the final-density player stencil a
+    // stable air volume even when a source archetype or a disturbance would otherwise refill the
+    // shallow part of the rounded SDF.  The floor writer below owns the closed lower face.
+    const float AirHeight = 2.0f * SupportRadius;
+    return Position.Z > FloorZ
+        + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
+        && Position.Z < FloorZ + AirHeight - KINDA_SMALL_NUMBER;
+}
+
+static bool VF_FindWalkableTunnelAir(
+    const UVoxelStrateManager* Manager,
+    const FVector& Position,
+    int32& OutPassageIndex,
+    float& OutFloorZ,
+    float& OutSupportRadius)
+{
+    OutPassageIndex = INDEX_NONE;
+    OutFloorZ = 0.0f;
+    OutSupportRadius = 0.0f;
+    if (Manager == nullptr)
+    {
+        return false;
+    }
+
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(Position.X / (float)CHUNK_SIZE),
+        FMath::FloorToInt(Position.Y / (float)CHUNK_SIZE),
+        FMath::FloorToInt(Position.Z / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(Manager, ChunkCoord);
+    const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+    for (const int32 PassageIndex : Nearby)
+    {
+        if (!Passages.IsValidIndex(PassageIndex))
+        {
+            continue;
+        }
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq
+            || !VF_IsWalkableTunnelAir(Passage, Position))
+        {
+            continue;
+        }
+        VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+            Passage.ControlPoints, Passage.ControlRadii, Position,
+            OutFloorZ, OutSupportRadius);
+        OutPassageIndex = PassageIndex;
+        return true;
+    }
+    return false;
+}
+
+static bool VF_IsAnyPassageFloorAt(
+    const UVoxelStrateManager* Manager,
+    const FVector& Position)
+{
+    if (Manager == nullptr)
+    {
+        return false;
+    }
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(Position.X / (float)CHUNK_SIZE),
+        FMath::FloorToInt(Position.Y / (float)CHUNK_SIZE),
+        FMath::FloorToInt(Position.Z / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(Manager, ChunkCoord);
+    const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+    for (const int32 PassageIndex : Nearby)
+    {
+        if (!Passages.IsValidIndex(PassageIndex))
+        {
+            continue;
+        }
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
+            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+            || VF_IsWalkableTunnelFloor(Passage, Position))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 {
     if (!Settings)
@@ -756,14 +915,23 @@ void UVoxelStrateManager::GeneratePassages()
         }
     };
 
-    const auto CommonRootFloorFor = [](float StrateTopZ, float StrateBottomZ,
-                                       float BoundarySealThickness) -> float
+    const auto CommonRootFloorFor = [&](float StrateTopZ, float StrateBottomZ,
+                                        float BoundarySealThickness) -> float
     {
-        // The two mouth queries may legitimately return floors near opposite strate faces.  A
-        // shared root level is therefore derived from the strate bounds, never from passage
-        // iteration order. Leave the floor slab and the full 12-voxel connector clearance beyond
-        // the four-voxel passage blend away from both seals; the landing builder repeats this
-        // clamp as its final safety boundary.
+        // The two mouth queries may legitimately return floors near opposite strate faces.  The
+        // root is the origin landing room's floor, not a hidden continuous shaft and not a
+        // passage-order-dependent midpoint.  Reusing the same top-anchored geometry here makes
+        // every connector meet the (0,0) room at its actual support level.
+        const VoxelPassageGeometry::FOriginLandingGeometry OriginLanding =
+            VoxelPassageGeometry::BuildOriginLandingGeometry(
+                StrateTopZ, StrateBottomZ, BoundarySealThickness, OriginSpineRadius);
+        if (OriginLanding.bValid)
+        {
+            return OriginLanding.FloorZ;
+        }
+
+        // Malformed tiny strates still fail closed. This fallback is only for the descriptor
+        // builder's diagnostic path; normal authored strates always satisfy the room interval.
         const float Seal = FMath::Max(BoundarySealThickness, 0.0f);
         const float InnerBottom = StrateBottomZ + Seal;
         const float InnerTop = StrateTopZ - Seal;
@@ -790,8 +958,9 @@ void UVoxelStrateManager::GeneratePassages()
         const FStrateSlot& Upper = StrateLayout[i];
         const FStrateSlot& Lower = StrateLayout[i + 1];
 
-        // This (upper) strate's PassageConfig controls the descent tunnels to the layer
-        // below. The (0,0) spine descent is separate (player-dug); these are the shortcuts.
+        // This (upper) strate's PassageConfig controls the progression tunnel to the layer below.
+        // Each strate already owns a finite (0,0) landing room; this passage is the connection
+        // that opens the next room rather than a second vertical spine.
         const UVoxelStrateDefinition* UpperDef = Upper.Definition;
         if (!UpperDef) continue;
         const FStratePassageConfig& Cfg = UpperDef->PassageConfig;
@@ -821,10 +990,25 @@ void UVoxelStrateManager::GeneratePassages()
             FVoxelPassage Passage;
             Passage.UpperStrateIndex = i;
             Passage.LowerStrateIndex = i + 1;
-            // PassageType has no random draw in the current implementation; preserve its existing
-            // default while PassageConfig::Style controls the generated control-point shape.
-            // PassageType n'a pas de tirage aléatoire ici ; conserver son défaut, tandis que
-            // PassageConfig::Style contrôle la forme des points de contrôle générés.
+            // The authored style is also reflected in the legacy passage type.  In particular,
+            // only Straight receives the walkable-tunnel contract; a future style roll cannot
+            // silently inherit the default's player-fit promise.
+            switch (Cfg.Style)
+            {
+            case EVoxelPassageStyle::Straight:
+                Passage.PassageType = EVoxelPassageType::SlopedTunnel;
+                break;
+            case EVoxelPassageStyle::Spiral:
+                Passage.PassageType = EVoxelPassageType::SpiralDescent;
+                break;
+            case EVoxelPassageStyle::Cascading:
+                Passage.PassageType = EVoxelPassageType::CascadingDrops;
+                break;
+            case EVoxelPassageStyle::Worm:
+            default:
+                Passage.PassageType = EVoxelPassageType::CrackCrevice;
+                break;
+            }
 
             // PLACEMENT: random angle, distance from the (0,0) spine within config range.
             const float Angle = PassageRandom01(PassageSaltAngle) * (2.0f * PI);
@@ -1142,7 +1326,223 @@ void UVoxelStrateManager::GeneratePassages()
             if (Passage.UpperLanding.bHasNetworkConnector) ++NumUpperRootConnectors;
             if (Passage.LowerLanding.bHasNetworkConnector) ++NumLowerRootConnectors;
 
-            if (Passage.ControlPoints.Num() > 0)
+            if (Cfg.Style == EVoxelPassageStyle::Straight
+                && Passage.UpperLanding.HalfWidth > 0.0f
+                && Passage.LowerLanding.HalfWidth > 0.0f)
+            {
+                // BASE CONNECTION: a walkable two-leg switchback.  A direct line between the
+                // mouths would often be nearly vertical because both requests are placed at the
+                // same XY radius.  Put the turn on the perpendicular bisector and give each leg
+                // at least half of the horizontal run required by the named 15-degree law.
+                // This is deliberately a construction rule, not a seed-dependent observation.
+                const float SwitchbackAngle =
+                    PassageRandom01(PassageSaltUpperDoor) * 2.0f * PI;
+                FVector2D SwitchbackDirection(
+                    FMath::Cos(SwitchbackAngle), FMath::Sin(SwitchbackAngle));
+                if (!SwitchbackDirection.Normalize())
+                {
+                    SwitchbackDirection = FVector2D(1.0f, 0.0f);
+                }
+
+                const FVector DoorDirection(
+                    SwitchbackDirection.X, SwitchbackDirection.Y, 0.0f);
+                Passage.UpperLanding.DoorDirection = DoorDirection;
+                // A real switchback turns around: the lower doorway faces back toward the upper
+                // leg. Keeping both doors on the same side would make the two sloped legs retrace
+                // one XY line at different heights, leaving the floor projection ambiguous.
+                const FVector TunnelLowerDoorDirection = -DoorDirection;
+                Passage.LowerLanding.DoorDirection = TunnelLowerDoorDirection;
+                const float UpperDoorOffset = FMath::Max(
+                    Passage.UpperLanding.HalfWidth - 1.0f, 0.0f);
+                const float LowerDoorOffset = FMath::Max(
+                    Passage.LowerLanding.HalfWidth - 1.0f, 0.0f);
+                const float SafeMouthRadius = FMath::Max(
+                    FMath::Abs(Cfg.MouthRadius), 1.0f);
+                Passage.UpperLanding.DoorPoint =
+                    Passage.UpperLanding.StandingPoint + DoorDirection * UpperDoorOffset;
+                Passage.UpperLanding.DoorPoint.Z =
+                    Passage.UpperLanding.FloorZ + SafeMouthRadius;
+                Passage.LowerLanding.DoorPoint =
+                    Passage.LowerLanding.StandingPoint
+                        + TunnelLowerDoorDirection * LowerDoorOffset;
+                Passage.LowerLanding.DoorPoint.Z =
+                    Passage.LowerLanding.FloorZ + SafeMouthRadius;
+
+                const FVector UpperDoor = Passage.UpperLanding.DoorPoint;
+                const FVector LowerDoor = Passage.LowerLanding.DoorPoint;
+                // Keep a short level apron beyond each room floor. The door anchor is one voxel
+                // inside the room's support square; a diagonal door direction can therefore need
+                // several voxels before it leaves that square and its four-voxel SDF blend.
+                // The level apron must clear the room half-width, the tube radius, and the
+                // smooth carve band before the sloped leg begins.  The final six-voxel transition
+                // is measured from that clear point back toward the turn, so include it too.  For
+                // the default 8-voxel half-width / 6-voxel mouth this is 17 voxels (4.25 m), not
+                // the old 6-voxel minimum that left the sloped capsule inside the landing room.
+                const float LandingApron = FMath::Max(
+                    VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
+                    VoxelPassageGeometry::WalkableTunnelTurnTransitionVoxels
+                        + SafeMouthRadius
+                        + VoxelPassageGeometry::LandingCarveBlendVoxels
+                        + 1.0f);
+                const FVector UpperApronEnd = UpperDoor
+                    + DoorDirection * LandingApron;
+                const FVector LowerApronBegin = LowerDoor
+                    + TunnelLowerDoorDirection * LandingApron;
+                const float VerticalDrop = FMath::Abs(UpperDoor.Z - LowerDoor.Z);
+                const float UpperFloorZ = VoxelPassageGeometry::TunnelFloorZ(
+                    UpperDoor, Cfg.MouthRadius);
+                const float LowerFloorZ = VoxelPassageGeometry::TunnelFloorZ(
+                    LowerDoor, Cfg.MouthRadius);
+                const float MidFloorZ = 0.5f * (UpperFloorZ + LowerFloorZ);
+                const FVector2D RampStartMid(
+                    0.5f * (UpperApronEnd.X + LowerApronBegin.X),
+                    0.5f * (UpperApronEnd.Y + LowerApronBegin.Y));
+                // The turn offset must be perpendicular to the actual two-apron endpoint chord,
+                // not merely perpendicular to the standing-point chord.  Opposite-facing doors
+                // add their offsets to that chord; using the old direction could make the two
+                // sloped legs nearly collinear and bring the lower leg back beside the upper door.
+                FVector2D TurnDirection(
+                    LowerApronBegin.Y - UpperApronEnd.Y,
+                    -(LowerApronBegin.X - UpperApronEnd.X));
+                if (!TurnDirection.Normalize())
+                {
+                    TurnDirection = FVector2D(-DoorDirection.Y, DoorDirection.X);
+                    if (!TurnDirection.Normalize())
+                    {
+                        TurnDirection = FVector2D(0.0f, 1.0f);
+                    }
+                }
+                // There are two sides on which the switchback can turn. Choose the side whose
+                // two sloped legs initially move away from their own landing rooms; the old fixed
+                // sign could send a slope back through a room floor before reaching open space.
+                FVector2D UpperOutward(
+                    UpperApronEnd.X - Passage.UpperLanding.StandingPoint.X,
+                    UpperApronEnd.Y - Passage.UpperLanding.StandingPoint.Y);
+                FVector2D LowerOutward(
+                    LowerApronBegin.X - Passage.LowerLanding.StandingPoint.X,
+                    LowerApronBegin.Y - Passage.LowerLanding.StandingPoint.Y);
+                UpperOutward.Normalize();
+                LowerOutward.Normalize();
+                const float TurnOffsetForScore =
+                    0.5f * VoxelPassageGeometry::RequiredHorizontalRunForFloorDrop(
+                        UpperFloorZ - 0.5f * (UpperFloorZ + LowerFloorZ),
+                        0.5f * (UpperFloorZ + LowerFloorZ) - LowerFloorZ)
+                    + VoxelPassageGeometry::WalkableTunnelTurnTransitionVoxels;
+                const FVector2D TurnMidPlus(
+                    RampStartMid.X + TurnDirection.X * TurnOffsetForScore,
+                    RampStartMid.Y + TurnDirection.Y * TurnOffsetForScore);
+                const FVector2D TurnMidMinus(
+                    RampStartMid.X - TurnDirection.X * TurnOffsetForScore,
+                    RampStartMid.Y - TurnDirection.Y * TurnOffsetForScore);
+                const auto OutwardTurnScore = [
+                    &UpperOutward, &LowerOutward, &UpperApronEnd, &LowerApronBegin]
+                    (const FVector2D& Candidate) -> float
+                {
+                    return FVector2D::DotProduct(
+                               Candidate - FVector2D(
+                                   UpperApronEnd.X, UpperApronEnd.Y), UpperOutward)
+                        + FVector2D::DotProduct(
+                               FVector2D(LowerApronBegin.X, LowerApronBegin.Y) - Candidate,
+                               LowerOutward);
+                };
+                if (OutwardTurnScore(TurnMidMinus) > OutwardTurnScore(TurnMidPlus))
+                {
+                    TurnDirection *= -1.0f;
+                }
+                const float UpperFloorDrop = UpperFloorZ - MidFloorZ;
+                const float LowerFloorDrop = MidFloorZ - LowerFloorZ;
+                const float RequiredHorizontalRun =
+                    VoxelPassageGeometry::RequiredHorizontalRunForFloorDrop(
+                        UpperFloorDrop, LowerFloorDrop);
+                // Move the level turn farther than half the required run. Each slope then loses
+                // only the named transition length to its level segment and still retains the
+                // full horizontal run required by the 15-degree floor law.
+                const float TurnTransition =
+                    VoxelPassageGeometry::WalkableTunnelTurnTransitionVoxels;
+                const float TurnOffset =
+                    0.5f * RequiredHorizontalRun + TurnTransition;
+                const FVector2D FloorSafeDoorMid(
+                    RampStartMid.X
+                        + TurnDirection.X * TurnOffset,
+                    RampStartMid.Y
+                        + TurnDirection.Y * TurnOffset);
+                FVector2D UpperSlopeDirection(
+                    FloorSafeDoorMid.X - UpperApronEnd.X,
+                    FloorSafeDoorMid.Y - UpperApronEnd.Y);
+                if (!UpperSlopeDirection.Normalize())
+                {
+                    UpperSlopeDirection = FVector2D(
+                        DoorDirection.X, DoorDirection.Y);
+                }
+                FVector2D LowerSlopeDirection(
+                    LowerApronBegin.X - FloorSafeDoorMid.X,
+                    LowerApronBegin.Y - FloorSafeDoorMid.Y);
+                if (!LowerSlopeDirection.Normalize())
+                {
+                    LowerSlopeDirection = -UpperSlopeDirection;
+                }
+                const FVector2D UpperSlopeStartXY(
+                    UpperApronEnd.X + UpperSlopeDirection.X * TurnTransition,
+                    UpperApronEnd.Y + UpperSlopeDirection.Y * TurnTransition);
+                const FVector2D LowerSlopeEndXY(
+                    LowerApronBegin.X - LowerSlopeDirection.X * TurnTransition,
+                    LowerApronBegin.Y - LowerSlopeDirection.Y * TurnTransition);
+                const FVector UpperApronEndPoint(
+                    UpperApronEnd.X, UpperApronEnd.Y,
+                    UpperFloorZ + FMath::Abs(Cfg.MouthRadius));
+                const FVector UpperSlopeStart(
+                    UpperSlopeStartXY.X, UpperSlopeStartXY.Y,
+                    UpperFloorZ + FMath::Abs(Cfg.MouthRadius));
+                const FVector MidPoint(
+                    FloorSafeDoorMid.X, FloorSafeDoorMid.Y,
+                    MidFloorZ + FMath::Abs(Cfg.MidRadius));
+                const FVector LowerSlopeEnd(
+                    LowerSlopeEndXY.X, LowerSlopeEndXY.Y,
+                    LowerFloorZ + FMath::Abs(Cfg.MouthRadius));
+                const FVector LowerApronBeginPoint(
+                    LowerApronBegin.X, LowerApronBegin.Y,
+                    LowerFloorZ + FMath::Abs(Cfg.MouthRadius));
+
+                Passage.ControlPoints.Reset(7);
+                Passage.ControlRadii.Reset(7);
+                Passage.ControlPoints.Add(UpperDoor);
+                Passage.ControlPoints.Add(UpperApronEndPoint);
+                Passage.ControlPoints.Add(UpperSlopeStart);
+                Passage.ControlPoints.Add(MidPoint);
+                Passage.ControlPoints.Add(LowerSlopeEnd);
+                Passage.ControlPoints.Add(LowerApronBeginPoint);
+                Passage.ControlPoints.Add(LowerDoor);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MidRadius);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MouthRadius);
+
+                Passage.PassageType = EVoxelPassageType::SlopedTunnel;
+                Passage.bWalkableTunnelContract = true;
+                Passage.TunnelMaxGradientDegrees =
+                    VoxelPassageGeometry::WalkableTunnelMaxGradientDegrees;
+                Passage.TunnelVerticalDropVoxels = VerticalDrop;
+                Passage.TunnelRequiredHorizontalRunVoxels = RequiredHorizontalRun;
+                Passage.TunnelHorizontalPathLengthVoxels = 0.0f;
+                for (int32 ControlIndex = 0;
+                     ControlIndex + 1 < Passage.ControlPoints.Num();
+                     ++ControlIndex)
+                {
+                    Passage.TunnelHorizontalPathLengthVoxels += FVector2D(
+                        Passage.ControlPoints[ControlIndex + 1].X
+                            - Passage.ControlPoints[ControlIndex].X,
+                        Passage.ControlPoints[ControlIndex + 1].Y
+                            - Passage.ControlPoints[ControlIndex].Y).Size();
+                }
+                Passage.TunnelMinimumClearWidthVoxels = 2.0f * FMath::Max(
+                    FMath::Min(FMath::Abs(Cfg.MouthRadius), FMath::Abs(Cfg.MidRadius)),
+                    0.0f);
+                Passage.TunnelClearHeightVoxels = Passage.TunnelMinimumClearWidthVoxels;
+            }
+            else if (Passage.ControlPoints.Num() > 0)
             {
                 Passage.ControlPoints[0] = Passage.UpperLanding.DoorPoint;
                 Passage.ControlPoints.Last() = Passage.LowerLanding.DoorPoint;
@@ -1258,36 +1658,61 @@ void UVoxelStrateManager::GeneratePassages()
         *NoQueryList);
 
     //=========================================================================
-    // SURFACE ENTRY SHAFT — the one auto-opened (0,0) connection.
-    // A straight vertical shaft at (0,0) piercing the TOP seal of the topmost
-    // strate, so the world begins with "a hole opened to the surface". All other
-    // (0,0) descents between strates remain player-dug.
+    // SURFACE ENTRY — the one optional above-ground opening.
+    // It opens the top seal and stops at the ceiling of strate 0's origin landing room. It does
+    // not continue down the room or into lower strates: every lower seal remains closed until the
+    // corresponding progression passage is opened.
     //=========================================================================
-    if (bOpenSurfaceEntry && StrateLayout.Num() > 0)
+    if (bOpenSurfaceEntry && OriginSpineRadius > 0.0f && StrateLayout.Num() > 0)
     {
         const FStrateSlot& Top = StrateLayout[0];
         const float TopZ = (float)(Top.TopChunkZ + 1) * CHUNK_SIZE;
-
-        FVoxelPassage Entry;
-        Entry.UpperStrateIndex = 0;
-        Entry.LowerStrateIndex = 0;
-        Entry.PassageType = EVoxelPassageType::VerticalShaft;
-        Entry.Radius = FMath::Max(OriginSpineRadius * 0.7f, 4.0f);
-        // From a little above the strate top (open air outside all strates) down
-        // past the seal into the interior, so the seal at (0,0) is breached.
-        Entry.UpperPoint = FVector(0.0f, 0.0f, TopZ + CHUNK_SIZE);
-        Entry.LowerPoint = FVector(0.0f, 0.0f, TopZ - CHUNK_SIZE);
+        const float BottomZ = (float)Top.BottomChunkZ * CHUNK_SIZE;
+        const float TopSeal = Top.Definition
+            ? BoundarySealThicknessFor(*Top.Definition) : 0.0f;
+        const VoxelPassageGeometry::FOriginLandingGeometry OriginLanding =
+            VoxelPassageGeometry::BuildOriginLandingGeometry(
+                TopZ, BottomZ, TopSeal, OriginSpineRadius);
+        if (!OriginLanding.bValid)
         {
-            const FVector C = (Entry.UpperPoint + Entry.LowerPoint) * 0.5f;
-            const float R = (float)FVector::Dist(C, Entry.UpperPoint) + Entry.Radius + 4.0f;
-            Entry.BoundCenter = C;
-            Entry.BoundRadius = R;
-            Entry.BoundRadiusSq = R * R;
+            UE_LOG(LogTemp, Warning,
+                TEXT("[StrateManager] Surface entry skipped: top origin landing has no seal-safe room interval."));
         }
-        Passages.Add(Entry);
+        else
+        {
+            FVoxelPassage Entry;
+            Entry.UpperStrateIndex = 0;
+            Entry.LowerStrateIndex = 0;
+            // Keep the legacy type: this is the explicitly opted-in above-ground vertical opening,
+            // not the default inter-strate descent style.
+            Entry.PassageType = EVoxelPassageType::VerticalShaft;
+            Entry.Radius = FMath::Max(OriginSpineRadius * 0.7f, 4.0f);
+            Entry.UpperPoint = FVector(0.0f, 0.0f, TopZ + CHUNK_SIZE);
+            // The capsule's lower tangent meets the room ceiling; it never bores through the
+            // room's floor or creates an origin column in strate 0.
+            Entry.LowerPoint = FVector(
+                0.0f, 0.0f, OriginLanding.CeilingZ + Entry.Radius);
+            Entry.ControlPoints.Reset(2);
+            Entry.ControlPoints.Add(Entry.UpperPoint);
+            Entry.ControlPoints.Add(Entry.LowerPoint);
+            Entry.ControlRadii.Reset(2);
+            Entry.ControlRadii.Add(Entry.Radius);
+            Entry.ControlRadii.Add(Entry.Radius);
+            Entry.TunnelClearHeightVoxels = 2.0f * Entry.Radius;
+            Entry.TunnelMinimumClearWidthVoxels = 2.0f * Entry.Radius;
+            {
+                const FVector C = (Entry.UpperPoint + Entry.LowerPoint) * 0.5f;
+                const float R = (float)FVector::Dist(C, Entry.UpperPoint) + Entry.Radius + 4.0f;
+                Entry.BoundCenter = C;
+                Entry.BoundRadius = R;
+                Entry.BoundRadiusSq = R * R;
+            }
+            Passages.Add(Entry);
 
-        UE_LOG(LogTemp, Log, TEXT("[StrateManager] Surface entry shaft at (0,0) topZ=%.0f R=%.1f"),
-            TopZ, Entry.Radius);
+            UE_LOG(LogTemp, Log,
+                TEXT("[StrateManager] Surface entry opening at (0,0) topZ=%.0f roomFloor=%.1f roomCeiling=%.1f R=%.1f"),
+                TopZ, OriginLanding.FloorZ, OriginLanding.CeilingZ, Entry.Radius);
+        }
     }
 
     // Invalidate any thread_local per-chunk passage shortlists (see EvaluateModifierSDF).
@@ -1383,7 +1808,8 @@ void UVoxelStrateManager::ApplyPassageModifier(
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
         if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding))
+            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+            || VF_IsWalkableTunnelFloor(Passage, Position))
         {
             // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
             // support slab. It is deliberately applied after the air carve so a tube can never
@@ -1392,6 +1818,12 @@ void UVoxelStrateManager::ApplyPassageModifier(
             break;
         }
     }
+
+    // A neighbouring passage may own a floor at this XY while this point is in the air core of
+    // the current walkable tunnel.  Reassert tunnel air after all floor posts so overlap cannot
+    // turn a valid route into a solid plug.  At the tunnel's own floor the air predicate is false,
+    // so the support plane remains solid.
+    ApplyPassageTunnelAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
 }
 
 void UVoxelStrateManager::ApplyPassageLandingAir(
@@ -1406,6 +1838,13 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     if (Nearby.Num() == 0) return;
 
     const FVector Position(WorldX, WorldY, WorldZ);
+    // A smooth room blend may overlap the end of a ramp.  The analytic support plane owns that
+    // overlap; otherwise landing air can erase the tunnel's final-density floor after the tunnel
+    // air post has deliberately stopped above it.
+    if (VF_IsAnyPassageFloorAt(this, Position))
+    {
+        return;
+    }
     float MinLandingSDF = FLT_MAX;
     for (const int32 PassageIndex : Nearby)
     {
@@ -1448,6 +1887,35 @@ void UVoxelStrateManager::ApplyPassageLandingAirMC(
     Density = -InternalDensity;
 }
 
+void UVoxelStrateManager::ApplyPassageTunnelAir(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    const FVector Position(WorldX, WorldY, WorldZ);
+    int32 PassageIndex = INDEX_NONE;
+    float FloorZ = 0.0f;
+    float SupportRadius = 0.0f;
+    const bool bFoundWalkableAir = VF_FindWalkableTunnelAir(
+        this, Position, PassageIndex, FloorZ, SupportRadius);
+    if (bFoundWalkableAir)
+    {
+        const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
+        Density = FMath::Min(Density, AirTarget);
+    }
+}
+
+void UVoxelStrateManager::ApplyPassageTunnelAirMC(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity, float SealThickness) const
+{
+    // The disturbance layer uses MC polarity (negative = solid), so reuse the exact internal
+    // tunnel-air operation rather than maintaining a second polarity-specific formula.
+    float InternalDensity = -Density;
+    ApplyPassageTunnelAir(
+        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+    Density = -InternalDensity;
+}
+
 void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ, float BaseDensity) const
 {
@@ -1461,10 +1929,51 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     {
         const FVoxelPassage& Passage = Passages[PassageIndex];
         if (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding))
+            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+            || VF_IsWalkableTunnelFloor(Passage, Position))
         {
             // Result is in MC convention here (negative = solid). This reassertion is the
             // structural floor backstop after the optional MC-space disturbance layer.
+            Density = FMath::Min(Density, -BaseDensity);
+            break;
+        }
+    }
+}
+
+static bool VF_IsPassageRoomFloor(
+    const FVector& Position, const FVoxelPassageLanding& Landing)
+{
+    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+        || !FMath::IsFinite(Position.Z) || !FMath::IsFinite(Landing.FloorZ)
+        || !FMath::IsFinite(Landing.FloorThickness)
+        || Landing.FloorThickness <= 0.0f || Landing.HalfWidth <= 0.0f)
+    {
+        return false;
+    }
+    return Position.Z <= Landing.FloorZ + KINDA_SMALL_NUMBER
+        && Position.Z > Landing.FloorZ - Landing.FloorThickness
+        && FMath::Abs(Position.X - Landing.StandingPoint.X)
+            <= FMath::Max(Landing.HalfWidth - 1.0f, 0.0f)
+        && FMath::Abs(Position.Y - Landing.StandingPoint.Y)
+            <= FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
+}
+
+void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity) const
+{
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVector Position(WorldX, WorldY, WorldZ);
+    for (const int32 PassageIndex : Nearby)
+    {
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
+            || VF_IsPassageRoomFloor(Position, Passage.LowerLanding))
+        {
             Density = FMath::Min(Density, -BaseDensity);
             break;
         }
@@ -1564,22 +2073,92 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
                     return true;
                 }
 
-                if (Landing->RootSpineRadius >= 0.0f)
+            }
+        }
+
+        // The default tube also owns a three-voxel support band. Its conservative segment AABB
+        // keeps a classifier from proving AllAir over the floor and then dropping that support
+        // during meshing. False positives are intentional; false negatives would be a hole.
+        if (Passage.bWalkableTunnelContract
+            && Passage.ControlPoints.Num() >= 2
+            && Passage.ControlRadii.Num() == Passage.ControlPoints.Num())
+        {
+            constexpr float Pad = 1.0f;
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Passage.ControlPoints.Num();
+                 ++SegmentIndex)
+            {
+                const FVector& A = Passage.ControlPoints[SegmentIndex];
+                const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                const float SupportRadius = FMath::Max(
+                    FMath::Min(
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex]),
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
+                    VoxelPassageGeometry::PlayerRadiusVoxels);
+                const float FloorMinZ = FMath::Min(
+                    VoxelPassageGeometry::TunnelFloorZ(
+                        A, Passage.ControlRadii[SegmentIndex]),
+                    VoxelPassageGeometry::TunnelFloorZ(
+                        B, Passage.ControlRadii[SegmentIndex + 1]))
+                    - VoxelPassageGeometry::LandingFloorThicknessVoxels - Pad;
+                const float FloorMaxZ = FMath::Max(
+                    VoxelPassageGeometry::TunnelFloorZ(
+                        A, Passage.ControlRadii[SegmentIndex]),
+                    VoxelPassageGeometry::TunnelFloorZ(
+                        B, Passage.ControlRadii[SegmentIndex + 1])) + Pad;
+                const float FloorMinX = FMath::Min(A.X, B.X) - SupportRadius - Pad;
+                const float FloorMaxX = FMath::Max(A.X, B.X) + SupportRadius + Pad;
+                const float FloorMinY = FMath::Min(A.Y, B.Y) - SupportRadius - Pad;
+                const float FloorMaxY = FMath::Max(A.Y, B.Y) + SupportRadius + Pad;
+                if (FloorMaxX >= MinVoxel.X && FloorMinX <= MaxVoxel.X
+                    && FloorMaxY >= MinVoxel.Y && FloorMinY <= MaxVoxel.Y
+                    && FloorMaxZ >= MinVoxel.Z && FloorMinZ <= MaxVoxel.Z)
                 {
-                    const float HubPad = Landing->RootSpineRadius
-                        + Landing->ConnectorRadius + Pad;
-                    const float HubMinZ = Landing->RootFloorZ
-                        - Landing->FloorThickness - Pad;
-                    const float HubMaxZ = Landing->RootFloorZ + Pad;
-                    if (HubPad >= 0.0f
-                        && HubPad >= MinVoxel.X && -HubPad <= MaxVoxel.X
-                        && HubPad >= MinVoxel.Y && -HubPad <= MaxVoxel.Y
-                        && HubMaxZ >= MinVoxel.Z && HubMinZ <= MaxVoxel.Z)
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyOriginLandingNearBox(
+    const FVector& MinVoxel, const FVector& MaxVoxel) const
+{
+    if (OriginSpineRadius <= 0.0f) return false;
+    const FBox VoxelBox(MinVoxel, MaxVoxel);
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr) continue;
+        const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+        const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        if (VoxelPassageGeometry::OriginLandingRoomTouchesBox(
+                VoxelBox, TopZ, BottomZ,
+                VF_BoundarySealThicknessForDefinition(*Slot.Definition),
+                OriginSpineRadius))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyOriginLandingFloorNearBox(
+    const FVector& MinVoxel, const FVector& MaxVoxel) const
+{
+    if (OriginSpineRadius <= 0.0f) return false;
+    const FBox VoxelBox(MinVoxel, MaxVoxel);
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr) continue;
+        const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+        const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        if (VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                VoxelBox, TopZ, BottomZ,
+                VF_BoundarySealThicknessForDefinition(*Slot.Definition),
+                OriginSpineRadius))
+        {
+            return true;
         }
     }
     return false;

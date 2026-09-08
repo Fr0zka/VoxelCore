@@ -32,19 +32,18 @@ class AActor;                  // IWYU : paramètre de TSubclassOf seulement / T
  * of the carved tunnel (control point layout, radius, overall feel).
  *
  * Types:
- *   SlopedTunnel   — Angled bore with a horizontal midpoint offset (default/legacy).
- *   VerticalShaft  — Straight or near-straight drop between strates.
- *   SpiralDescent  — Helical corkscrew path winding downward.
- *   CascadingDrops — Series of short vertical pits connected by horizontal ledges.
- *   CrackCrevice   — Narrow fracture passage, tight squeeze through rock.
+ *   SlopedTunnel   — The default walkable, gentle-gradient tunnel between landing rooms.
+ *   VerticalShaft  — A vertical drop; never a continuous walkable descent.
+ *   SpiralDescent  — An exotic helix; walkability requires a separately designed ramp contract.
+ *   CascadingDrops — Drops and ledges; never a continuous walkable descent as authored.
+ *   CrackCrevice   — A narrow fracture; no player-fit guarantee.
  */
 UENUM(BlueprintType)
 enum class EVoxelPassageType : uint8
 {
-    // Angled bore connecting two layers with a horizontal midpoint offset.
-    // Two capsule segments: Upper→Mid, Mid→Lower. Comfortable radius (~5 voxels).
-    // This is the original passage type — feels like a natural sloped tunnel.
-    SlopedTunnel    UMETA(DisplayName = "Sloped Tunnel (angled bore)"),
+    // Walkable single-file tunnel. The runtime builds a deterministic switchback whose each ramp
+    // is below VoxelPassageGeometry::WalkableTunnelMaxGradientDegrees.
+    SlopedTunnel    UMETA(DisplayName = "Sloped Tunnel (walkable default)"),
 
     // Straight vertical drop between strates. Same XY for upper and lower points.
     // Wider radius (~7-8 voxels) to feel like a natural shaft or sinkhole.
@@ -1758,7 +1757,9 @@ struct VOXELFORGE_API FStrateDisturbanceParams
 UENUM(BlueprintType)
 enum class EVoxelPassageStyle : uint8
 {
-    Straight  UMETA(DisplayName = "Straight (vertical shaft)"),
+    // “Straight” is retained as the authored style name for the base connection, but its runtime
+    // geometry is a gentle two-leg switchback rather than a vertical shaft.
+    Straight  UMETA(DisplayName = "Straight (walkable sloped tunnel)"),
     Worm      UMETA(DisplayName = "Worm (organic meander around the axis)"),
     Spiral    UMETA(DisplayName = "Spiral (corkscrew descent)"),
     Cascading UMETA(DisplayName = "Cascading (ledge + drop staircase)")
@@ -1768,8 +1769,8 @@ enum class EVoxelPassageStyle : uint8
  * FStratePassageConfig — how THIS strate connects DOWN to the strate below it.
  *
  * Lives on each UVoxelStrateDefinition: the upper strate of every boundary controls its
- * own descent tunnels, so different layers connect differently. The (0,0) spine descent
- * is separate (player-dug); these are the auto-carved shortcuts placed away from it.
+ * own progression tunnel, so different layers connect differently. Each strate has a finite
+ * (0,0) landing room; this config controls the passage that opens the next room.
  */
 USTRUCT(BlueprintType)
 struct VOXELFORGE_API FStratePassageConfig
@@ -1782,17 +1783,19 @@ struct VOXELFORGE_API FStratePassageConfig
 
     // Tunnel shape.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage")
-    EVoxelPassageStyle Style = EVoxelPassageStyle::Worm;
+    EVoxelPassageStyle Style = EVoxelPassageStyle::Straight;
 
     // ----- WIDTH (tapers along the length) -----
     // Radius at the two mouths (entry/exit) and at the middle. Equal = uniform tube;
-    // The defaults are 2 m radius / 4 m bore at mouths and 1.5 m radius / 3 m bore in the middle.
+    // The walkable default is deliberately single-file: 3.0 m diameter at mouths and 2.5 m at
+    // the waist (6/5 voxel radii at 25 cm per voxel). The §6.5 landing room remains wider for
+    // turning.
     // Mouth > Mid = chambers at the ends with a squeeze between; Mid > Mouth = a bulge.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MouthRadius = 8.0f;
+    float MouthRadius = 6.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Width", meta = (ClampMin = "1.0"))
-    float MidRadius = 6.0f;
+    float MidRadius = 5.0f;
 
     // ----- LENGTH -----
     // How far the tunnel reaches INTO each strate (voxels). Auto-capped to the interior;
@@ -1813,7 +1816,8 @@ struct VOXELFORGE_API FStratePassageConfig
     float DistanceMax = 192.0f;
 
     // ----- SHAPE detail -----
-    // Worm: max sideways excursion from the axis (voxels). 24 = 6 m; 0 = straight even in Worm style.
+    // Exotic styles only: max sideways excursion from the axis (voxels). 24 = 6 m; 0 = straight
+    // even in Worm style. The default walkable switchback does not use this wander value.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passage|Shape", meta = (ClampMin = "0.0"))
     float Wander = 24.0f;
 

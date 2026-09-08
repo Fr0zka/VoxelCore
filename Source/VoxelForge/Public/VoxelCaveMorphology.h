@@ -51,12 +51,11 @@ enum class ECaveGeneratorType : uint8;
  * A source query answer selects the landing's XY/Z anchor.  Because that pure query does not
  * flood-fill the live network, every inter-strate end also gets a deterministic root connector
  * (`bHasNetworkConnector`).  Its flat floor ramps to the same common interior root level for that
- * strate, so both mouths enter one walkable hub even when their authored floors are at opposite
- * sides of the strate.  The hub is an annular walkable network around (0,0), not the pre-existing
- * vertical air shaft.  `RootSpineRadius` keeps both the hub air and support slab outside that shaft,
- * so the spine remains open.  If the direct run would be steeper than 44 degrees, the connector
- * uses a deterministic level dog-leg before its final ramp; the bend is geometry, not a per-voxel
- * search.
+ * strate, so both mouths enter the finite landing room at (0,0) even when their authored floors
+ * are at opposite sides of the strate.  `RootSpineRadius` supplies the small endpoint overlap that
+ * joins the connector to that room; it does not create a vertical shaft.  If the direct run would
+ * be steeper than the named 15 degree tunnel contract, the connector uses a deterministic level
+ * dog-leg before its final ramp; the bend is geometry, not a per-voxel search.
  */
 struct VOXELFORGE_API FVoxelPassageLanding
 {

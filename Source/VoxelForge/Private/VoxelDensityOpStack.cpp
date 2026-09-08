@@ -1677,23 +1677,18 @@ namespace
             VF_ApplyOriginSpine(InOut.Density, X, Y, Z, TopZ, BotZ, Seal, Base, Radius);
         }
 
-        // Ne fait QUE de l'air ⇒ tue AllSolid, jamais AllAir. Identity quand le cercle XY rate la
-        // boîte, ou quand la boîte est entièrement hors de l'intérieur de la strate.
-        // ≡ le test cercle/boîte écrit à la main dans ClassifyTile aujourd'hui.
+        // The room kills AllSolid; its support slab also kills AllAir. Identity when the room
+        // misses the box or the box is wholly outside this strate's safe interior.
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
-            if (Radius <= 0.0f) { return EVoxelOpEffect::Identity; }
-
-            const float InnerTop = TopZ - Seal;
-            const float InnerBot = BotZ + Seal;
-            if (VoxelBox.Max.Z <= InnerBot || VoxelBox.Min.Z >= InnerTop) { return EVoxelOpEffect::Identity; }
-
-            const float Reach = Radius + VoxelDensityReach::SpineBlend;
-            const float CX = FMath::Clamp(0.0f, (float)VoxelBox.Min.X, (float)VoxelBox.Max.X);
-            const float CY = FMath::Clamp(0.0f, (float)VoxelBox.Min.Y, (float)VoxelBox.Max.Y);
-            if (CX * CX + CY * CY > Reach * Reach) { return EVoxelOpEffect::Identity; }
-
-            return EVoxelOpEffect::CarveOnly;
+            if (!VoxelPassageGeometry::OriginLandingRoomTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, Radius))
+            {
+                return EVoxelOpEffect::Identity;
+            }
+            return VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, Radius)
+                ? EVoxelOpEffect::Both : EVoxelOpEffect::CarveOnly;
         }
 
         const TCHAR* DebugName() const override { return TEXT("OriginSpineOp"); }
@@ -1842,8 +1837,10 @@ namespace
     class FPassageCarveOp final : public IVoxelDensityOp
     {
     public:
-        FPassageCarveOp(const UVoxelStrateManager* InManager, float InBase, float InSeal)
-            : Manager(InManager), Base(InBase), Seal(InSeal) {}
+        FPassageCarveOp(const UVoxelStrateManager* InManager, float InBase, float InSeal,
+                        float InTopZ, float InBotZ, float InSpineRadius)
+            : Manager(InManager), Base(InBase), Seal(InSeal),
+              TopZ(InTopZ), BotZ(InBotZ), SpineRadius(InSpineRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
@@ -1853,8 +1850,15 @@ namespace
 
         void Eval(float X, float Y, float Z, FVoxelOpSample& InOut) const override
         {
-            if (!Manager) { return; }
-            Manager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
+            if (Manager)
+            {
+                Manager->ApplyPassageModifier(InOut.Density, X, Y, Z, Base, Seal);
+            }
+            // Keep the source and op-stack operation order identical: the origin room is carved
+            // before the boundary seal, then its support floor is reasserted after the passage
+            // post so no connector can remove the standing surface.
+            VF_ApplyOriginLandingFloor(
+                InOut.Density, X, Y, Z, TopZ, BotZ, Seal, Base, SpineRadius);
         }
 
         // ≡ la garde `AnyPassageNearBox` écrite à la main dans ClassifyTile — déjà écrite, ici
@@ -1862,7 +1866,9 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
             if (!Manager) { return EVoxelOpEffect::Identity; }
-            if (Manager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
+            if (VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, SpineRadius)
+                || Manager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
             {
                 // The room carves air, while its support slab force-writes solid. Both
                 // hypotheses must therefore be killed for a box touching that slab.
@@ -1876,7 +1882,7 @@ namespace
 
     private:
         const UVoxelStrateManager* Manager;
-        float Base, Seal;
+        float Base, Seal, TopZ, BotZ, SpineRadius;
     };
 
     //=========================================================================
@@ -5218,7 +5224,8 @@ void FVoxelOpStack::AppendStructuralPost(float StrateTopWorldZ, float StrateBott
     // restent le dernier post de GetDensityAt, hors de cette pile, comme avant.
     Add(MakeUnique<FOriginSpineOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity, SpineRadius));
     Add(MakeUnique<FBoundarySealOp>(StrateTopWorldZ, StrateBottomWorldZ, SealThickness, BaseDensity));
-    Add(MakeUnique<FPassageCarveOp>(StrateManager, BaseDensity, SealThickness));
+    Add(MakeUnique<FPassageCarveOp>(StrateManager, BaseDensity, SealThickness,
+                                    StrateTopWorldZ, StrateBottomWorldZ, SpineRadius));
     Add(MakeUnique<FXYEdgeSealOp>(BaseDensity));
 }
 

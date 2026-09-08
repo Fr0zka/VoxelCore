@@ -66,18 +66,17 @@ struct FVoxelPassage
     FVector RequestedLowerPoint = FVector::ZeroVector;
 
     // Passage dimensions — how wide the carved tunnel is (in voxels).
-    // Varies by type: VerticalShaft ~7-8, SpiralDescent ~4, CrackCrevice ~2-3, others ~5.
+    // The default SlopedTunnel is a single-file 2.5 m clear bore at its narrowest point;
+    // authored exotic styles retain their own widths and are not covered by the walkable law.
     float Radius = 5.0f;
 
     // The shape/style of this passage. Determines how control points are generated
     // and how the passage feels to navigate (shaft, spiral, ledges, crack, etc.).
     EVoxelPassageType PassageType = EVoxelPassageType::SlopedTunnel;
 
-    // Multi-segment control points for complex passage shapes.
-    // Used by SpiralDescent (helix points) and CascadingDrops (ledge+drop points).
-    // When non-empty, the SDF evaluator walks this array as a capsule chain
-    // instead of using Upper→Mid→Lower logic.
-    // Empty for simple types (SlopedTunnel, VerticalShaft, CrackCrevice).
+    // Multi-segment control points for passage shapes. The default SlopedTunnel contains the two
+    // gentle ramp legs of its deterministic switchback; exotic styles retain their authored chain.
+    // When non-empty, the SDF evaluator walks this array as a capsule chain.
     TArray<FVector> ControlPoints;
 
     // Per-control-point tube radius (parallel to ControlPoints) for tapered tunnels —
@@ -89,6 +88,16 @@ struct FVoxelPassage
     // standing anchors returned by the source query; the tube enters each room at DoorPoint.
     FVoxelPassageLanding UpperLanding;
     FVoxelPassageLanding LowerLanding;
+
+    // Construction-time walkability facts for diagnostics and the commandlet report. These are
+    // metadata, not a second runtime decision: the final-density sampler remains authoritative.
+    bool bWalkableTunnelContract = false;
+    float TunnelMaxGradientDegrees = 0.0f;
+    float TunnelVerticalDropVoxels = 0.0f;
+    float TunnelRequiredHorizontalRunVoxels = 0.0f;
+    float TunnelHorizontalPathLengthVoxels = 0.0f;
+    float TunnelMinimumClearWidthVoxels = 0.0f;
+    float TunnelClearHeightVoxels = 0.0f;
 
     // Bounding sphere enclosing the whole passage (+ radius + blend), in voxel coords.
     // Computed once in GeneratePassages; lets EvaluateModifierSDF reject far voxels with
@@ -362,13 +371,25 @@ public:
     void ApplyPassageLandingAir(float& Density, float WorldX, float WorldY, float WorldZ,
                                 float BaseDensity, float SealThickness) const;
 
+    /** Reassert the default walkable tunnel's clear air in internal density after any post. */
+    void ApplyPassageTunnelAir(float& Density, float WorldX, float WorldY, float WorldZ,
+                               float BaseDensity, float SealThickness) const;
+
     /** Re-assert landing air after MC-space disturbances, still before the final XY seal. */
     void ApplyPassageLandingAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
                                   float BaseDensity, float SealThickness) const;
 
+    /** Re-assert walkable tunnel air after MC-space disturbances, still before the final XY seal. */
+    void ApplyPassageTunnelAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                 float BaseDensity, float SealThickness) const;
+
     /** Re-assert a landing floor after the landing air pass, still before the final XY seal. */
     void ApplyPassageLandingFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,
                                     float BaseDensity) const;
+
+    /** Re-assert only the flat room floors after the tunnel-air post; never writes tunnel floors. */
+    void ApplyPassageLandingRoomFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                        float BaseDensity) const;
 
     /**
      * True si la sphère englobante d'un passage (élargie du rayon de blend de carve) touche la
@@ -379,6 +400,10 @@ public:
 
     /** Conservative box guard for the floor fill; unlike a tube it can affect the all-air proof. */
     bool AnyPassageLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
+
+    /** Conservative box guards for the per-strate (0,0) landing rooms and their floor slabs. */
+    bool AnyOriginLandingNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
+    bool AnyOriginLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
 
     /** Get all generated passages (for debug display). */
     const TArray<FVoxelPassage>& GetPassages() const { return Passages; }
@@ -411,12 +436,12 @@ protected:
     // World seed (stored for passage generation)
     int32 CachedSeed = 0;
 
-    // Whether to auto-open the (0,0) entry shaft through the top of strate 0.
+    // Whether to auto-open the (0,0) origin landing room from above in strate 0.
     // Copied from VoxelSettings::bOpenSurfaceEntry during Initialize().
     bool bOpenSurfaceEntry = true;
 
-    // Radius (voxels) of the surface entry shaft at (0,0). Copied from
-    // VoxelSettings::OriginSpineRadius so the entry matches the spine landing.
+    // Authored radius (voxels) of the origin landing room and its optional surface opening.
+    // Copied from VoxelSettings::OriginSpineRadius.
     float OriginSpineRadius = 14.0f;
 
     // Solid-bedrock gap between consecutive strates, in chunks. Copied from

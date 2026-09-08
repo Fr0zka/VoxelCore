@@ -211,9 +211,11 @@ public:
     //=========================================================================
     // INTER-STRATE PASSAGES (how THIS strate connects DOWN to the next)
     //=========================================================================
-    // Auto-carved descent tunnels from this strate to the one below it: count, style
-    // (straight / worm / spiral / cascade), tapered width, length, placement. The (0,0)
-    // spine descent is separate (player-dug); these are the extra shortcuts.
+    // Auto-carved passages from this strate to the one below it: count, style
+    // (walkable sloped tunnel / worm / spiral / cascade), tapered width, length, placement.
+    // Every strate has its own finite (0,0) landing room; the passage opens the next room through
+    // progression. The non-default styles are retained as exotic, non-walkability-guaranteed
+    // descriptors.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Passages")
     FStratePassageConfig PassageConfig;
 
