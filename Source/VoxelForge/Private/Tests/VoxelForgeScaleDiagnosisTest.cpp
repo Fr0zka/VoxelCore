@@ -19,12 +19,16 @@
 namespace
 {
     constexpr int32 DiagnosisSeed = 0;
-    constexpr int32 MazeCandidateIndex = 50;
-    // These are single-region seed-0 identities after the Maze default/range change updates the
-    // corpus content hash. Keep the probes on real candidates rather than silently testing fixture
-    // defaults when a historical index moves to another family.
-    constexpr int32 TunnelCandidateIndex = 4;
-    constexpr int32 ShaftCandidateIndex = 6;
+    // These are single-region seed-0 identities in the current corpus asset/default set. Keep the
+    // probes on real candidates rather than silently testing fixture defaults when a field changes.
+    constexpr int32 CrystalCandidateIndex = 50;
+    constexpr int32 FlatCandidateIndex = 28;
+    constexpr int32 FloatingCandidateIndex = 4;
+    constexpr int32 MazeCandidateIndex = 9;
+    constexpr int32 SurfaceCandidateIndex = 11;
+    constexpr int32 TunnelCandidateIndex = 20;
+    constexpr int32 UnderwaterCandidateIndex = 6;
+    constexpr int32 ShaftCandidateIndex = 10;
     constexpr int32 RadialSampleMaxVoxels = 48;
     constexpr int32 FineDiagnosisMaxCells = 4000000;
 
@@ -845,6 +849,8 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         return false;
     }
 
+    // The corpus asset changed after d97373c; keep the current-corpus identity probes explicit
+    // while the historical H3 rows below remain comparison baselines.
     FTestWorld World;
     World.Build(DiagnosisSeed, 2, true, 8);
     if (!World.IsValid())
@@ -864,11 +870,14 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         Corpus, DiagnosisSeed, TunnelCandidateIndex, false);
     const FVoxelStrateComposerCandidate ShaftCandidate = VF_RollStrateCandidate(
         Corpus, DiagnosisSeed, ShaftCandidateIndex, false);
-    TestTrue(TEXT("seed 0 index 50 is a valid Maze candidate"),
+    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid Maze candidate"),
+                             DiagnosisSeed, MazeCandidateIndex),
              MazeCandidate.bValid && MazeCandidate.Archetype == ECaveGeneratorType::Maze);
-    TestTrue(TEXT("seed 0 index 61 is a valid TunnelNetwork candidate"),
+    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid TunnelNetwork candidate"),
+                             DiagnosisSeed, TunnelCandidateIndex),
              TunnelCandidate.bValid && TunnelCandidate.Archetype == ECaveGeneratorType::TunnelNetwork);
-    TestTrue(TEXT("seed 0 index 34 is a valid VerticalShafts candidate"),
+    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid VerticalShafts candidate"),
+                             DiagnosisSeed, ShaftCandidateIndex),
              ShaftCandidate.bValid && ShaftCandidate.Archetype == ECaveGeneratorType::VerticalShafts);
 
     // H1 — direct GetDensityAt radial crossings. The Maze is the fourth one-based layout slot
@@ -1151,6 +1160,8 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
             PartABase.InteriorMarginVoxels = -1;
 
             FGeneratorSampler GeneratorSampler(*World.Generator);
+            const FString MazeDiagnosisLabel = FString::Printf(
+                TEXT("Maze seed=%d index=%d slot=4"), DiagnosisSeed, MazeCandidateIndex);
             auto RunPartAWindow =
                 [&](const FString& WindowLabel, const FVoxelStrateMeasureSettings& Settings)
             {
@@ -1161,7 +1172,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
                         VF_BoundarySealForCandidate(MazeCandidate),
                         ArrivalPoint, DeparturePoint, Settings, &Metrics);
                 VF_ReportPlayerFitRow(
-                    *this, TEXT("Maze seed=0 index=50 slot=4"), WindowLabel,
+                    *this, *MazeDiagnosisLabel, WindowLabel,
                     Settings.SampleStep, Metrics, Diagnostics);
                 return TTuple<FVoxelStrateMetrics, FVoxelConnectivityDiagnostics>(
                     MoveTemp(Metrics), Diagnostics);
@@ -1213,9 +1224,8 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         }
     }
 
-    // H3 — the eight fixed showcase identities, measured at step 1 on the topology-aware fitted
-    // window. Origin-rooted families include (0,0) before the MaxCells refusal check.
-    // The Maze identity is intentionally the requested seed 0 / index 50 / fourth one-based slot.
+    // H3 — the eight fixed current-corpus identities, measured at step 1 on the topology-aware
+    // fitted window. Origin-rooted families include (0,0) before the MaxCells refusal check.
     struct FShowcaseSelection
     {
         ECaveGeneratorType Archetype;
@@ -1225,14 +1235,14 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         const TCHAR* Label;
     };
     const FShowcaseSelection Selections[] = {
-        { ECaveGeneratorType::CrystalChamber, 0,   28, FTestWorld::SlotFlatPlain, TEXT("CrystalChamber") },
-        { ECaveGeneratorType::FlatPlain,       0,   37, FTestWorld::SlotFlatPlain, TEXT("FlatPlain") },
-        { ECaveGeneratorType::FloatingIslands, 0,    9, FTestWorld::SlotFlatPlain, TEXT("FloatingIslands") },
-        { ECaveGeneratorType::Maze,            0,   50, FTestWorld::SlotMaze,      TEXT("Maze") },
-        { ECaveGeneratorType::SurfaceWorld,    0,   27, FTestWorld::SlotSurfaceWorld, TEXT("SurfaceWorld") },
-        { ECaveGeneratorType::TunnelNetwork,   0,    4, FTestWorld::SlotFlatPlain, TEXT("TunnelNetwork") },
-        { ECaveGeneratorType::Underwater,      0,   16, FTestWorld::SlotFlatPlain, TEXT("Underwater") },
-        { ECaveGeneratorType::VerticalShafts,  0,    6, FTestWorld::SlotFlatPlain, TEXT("VerticalShafts") },
+        { ECaveGeneratorType::CrystalChamber,  0, CrystalCandidateIndex,  FTestWorld::SlotFlatPlain,       TEXT("CrystalChamber") },
+        { ECaveGeneratorType::FlatPlain,       0, FlatCandidateIndex,     FTestWorld::SlotFlatPlain,       TEXT("FlatPlain") },
+        { ECaveGeneratorType::FloatingIslands, 0, FloatingCandidateIndex, FTestWorld::SlotFlatPlain,       TEXT("FloatingIslands") },
+        { ECaveGeneratorType::Maze,            0, MazeCandidateIndex,     FTestWorld::SlotMaze,            TEXT("Maze") },
+        { ECaveGeneratorType::SurfaceWorld,    0, SurfaceCandidateIndex,  FTestWorld::SlotSurfaceWorld,   TEXT("SurfaceWorld") },
+        { ECaveGeneratorType::TunnelNetwork,  0, TunnelCandidateIndex,   FTestWorld::SlotFlatPlain,       TEXT("TunnelNetwork") },
+        { ECaveGeneratorType::Underwater,     0, UnderwaterCandidateIndex,FTestWorld::SlotFlatPlain,       TEXT("Underwater") },
+        { ECaveGeneratorType::VerticalShafts, 0, ShaftCandidateIndex,     FTestWorld::SlotFlatPlain,       TEXT("VerticalShafts") },
     };
 
     // Baseline rows from the pre-fix fitted-window report. The supplied VerticalShafts row is

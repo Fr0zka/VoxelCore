@@ -1,6 +1,7 @@
 #include "VoxelForgeExploreCommandlet.h"
 
 #include "CoreMinimal.h"
+#include "Async/ParallelFor.h"
 #include "Commandlets/Commandlet.h"
 #include "Containers/StringConv.h"
 #include "HAL/FileManager.h"
@@ -29,6 +30,9 @@
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"
 
+#include <algorithm>
+#include <atomic>
+
 namespace
 {
 using FExploreJsonWriter = TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>;
@@ -39,6 +43,8 @@ constexpr float DefaultRenderStepVoxels = 0.25f;
 constexpr float DefaultRenderMaxDistanceVoxels = 160.0f;
 constexpr int32 DefaultExportSize = 128;
 constexpr int32 DefaultMaxWalkCells = 32000000;
+constexpr float DefaultBudgetMinutes = 25.0f;
+constexpr float MaxBudgetMinutes = 30.0f;
 constexpr int32 MaxSyntheticStrates = 64;
 constexpr int32 MaxRenderPixels = 1048576;
 constexpr int64 MaxRenderDensitySamples = 400000000ll;
@@ -175,6 +181,9 @@ struct FExploreArguments
     float RenderMaxDistanceVoxels = DefaultRenderMaxDistanceVoxels;
     int32 ExportSize = DefaultExportSize;
     int32 MaxWalkCells = DefaultMaxWalkCells;
+    float BudgetMinutes = DefaultBudgetMinutes;
+    bool bSurfaceRoughnessOverride = false;
+    float SurfaceRoughness = 0.0f;
 
     FString CanonicalModes() const
     {
@@ -207,6 +216,12 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("rendermaxdistance="), OutArguments.RenderMaxDistanceVoxels);
     FParse::Value(*Params, TEXT("exportsize="), OutArguments.ExportSize);
     FParse::Value(*Params, TEXT("maxwalkcells="), OutArguments.MaxWalkCells);
+    FParse::Value(*Params, TEXT("budget="), OutArguments.BudgetMinutes);
+    const bool bSurfaceRoughnessSpecified = Params.Contains(
+        TEXT("surfaceroughness="), ESearchCase::IgnoreCase);
+    const bool bSurfaceRoughnessParsed = FParse::Value(
+        *Params, TEXT("surfaceroughness="), OutArguments.SurfaceRoughness);
+    OutArguments.bSurfaceRoughnessOverride = bSurfaceRoughnessSpecified;
     int32 FailureFocusRender = 0;
     FParse::Value(*Params, TEXT("failurefocus="), FailureFocusRender);
     OutArguments.bFailureFocusRender = FailureFocusRender != 0;
@@ -290,22 +305,9 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         OutError = TEXT("rendermaxdistance must be finite and in (0,2048] voxels.");
         return false;
     }
-    const int64 StepsPerRay = static_cast<int64>(FMath::Max(
-        1,
-        FMath::CeilToInt(
-            OutArguments.RenderMaxDistanceVoxels / OutArguments.RenderStepVoxels)));
-    const int64 EstimatedRenderSamples = static_cast<int64>(OutArguments.RenderWidth)
-        * static_cast<int64>(OutArguments.RenderHeight)
-        * 3ll
-        * StepsPerRay;
-    if (EstimatedRenderSamples > MaxRenderDensitySamples)
-    {
-        OutError = FString::Printf(
-            TEXT("render request would take about %lld fixed density samples, over the cap %lld."),
-            static_cast<long long>(EstimatedRenderSamples),
-            static_cast<long long>(MaxRenderDensitySamples));
-        return false;
-    }
+    // Render no longer budgets density samples: pixels are rasterised from the one canonical
+    // mesh. Keep the legacy renderstep/maxdistance arguments for compatible invocations and use
+    // only maxdistance as the raster depth clip.
     if (OutArguments.ExportSize < CHUNK_SIZE
         || OutArguments.ExportSize > MaxExportSize
         || OutArguments.ExportSize % CHUNK_SIZE != 0)
@@ -320,6 +322,27 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     if (OutArguments.MaxWalkCells <= 0)
     {
         OutError = TEXT("maxwalkcells must be greater than zero.");
+        return false;
+    }
+    if (!FMath::IsFinite(OutArguments.BudgetMinutes)
+        || OutArguments.BudgetMinutes <= 0.0f
+        || OutArguments.BudgetMinutes > MaxBudgetMinutes)
+    {
+        OutError = FString::Printf(
+            TEXT("budget must be finite and in (0,%g] minutes."), MaxBudgetMinutes);
+        return false;
+    }
+    if (OutArguments.bSurfaceRoughnessOverride
+        && !bSurfaceRoughnessParsed)
+    {
+        OutError = TEXT("surfaceroughness must be a finite number greater than or equal to zero.");
+        return false;
+    }
+    if (OutArguments.bSurfaceRoughnessOverride
+        && (!FMath::IsFinite(OutArguments.SurfaceRoughness)
+            || OutArguments.SurfaceRoughness < 0.0f))
+    {
+        OutError = TEXT("surfaceroughness must be finite and greater than or equal to zero.");
         return false;
     }
 
@@ -340,6 +363,92 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     return true;
 }
 
+struct FExploreBudget
+{
+    double StartSeconds = 0.0;
+    double LimitSeconds = 0.0;
+    bool bTruncated = false;
+    FString TruncatedDuring;
+    TArray<FString> CompletedModes;
+
+    FExploreBudget(double InStartSeconds, double InLimitSeconds)
+        : StartSeconds(InStartSeconds)
+        , LimitSeconds(InLimitSeconds)
+    {
+    }
+
+    double ElapsedSeconds() const
+    {
+        return FPlatformTime::Seconds() - StartSeconds;
+    }
+
+    double RemainingSeconds() const
+    {
+        return LimitSeconds - ElapsedSeconds();
+    }
+
+    bool ShouldStop(const TCHAR* Phase)
+    {
+        if (bTruncated)
+        {
+            return true;
+        }
+
+        // Leave a small deterministic cleanup window for the current phase to close files and
+        // emit the report. The owner-facing hard ceiling is still enforced by the argument cap at
+        // 30 minutes; the default 25-minute budget leaves substantially more headroom.
+        constexpr double CleanupReserveSeconds = 0.25;
+        if (RemainingSeconds() <= CleanupReserveSeconds)
+        {
+            bTruncated = true;
+            TruncatedDuring = Phase != nullptr ? FString(Phase) : TEXT("unknown");
+            UE_LOG(LogTemp, Warning,
+                TEXT("[VoxelForgeExplore] budget reached during %s; keeping completed artifacts."),
+                *TruncatedDuring);
+            return true;
+        }
+        return false;
+    }
+
+    void CompleteMode(const TCHAR* Mode)
+    {
+        if (Mode == nullptr || bTruncated)
+        {
+            return;
+        }
+        CompletedModes.AddUnique(FString(Mode));
+    }
+};
+
+struct FExploreMeshTriangle
+{
+    FVector A = FVector::ZeroVector;
+    FVector B = FVector::ZeroVector;
+    FVector C = FVector::ZeroVector;
+    FVector NormalA = FVector::UpVector;
+    FVector NormalB = FVector::UpVector;
+    FVector NormalC = FVector::UpVector;
+    FVector Min = FVector::ZeroVector;
+    FVector Max = FVector::ZeroVector;
+    FVector Centre = FVector::ZeroVector;
+    FVector Normal = FVector::UpVector;
+};
+
+struct FExploreMeshBvhNode
+{
+    FVector Min = FVector::ZeroVector;
+    FVector Max = FVector::ZeroVector;
+    int32 Left = INDEX_NONE;
+    int32 Right = INDEX_NONE;
+    int32 FirstTriangle = 0;
+    int32 TriangleCount = 0;
+
+    bool IsLeaf() const
+    {
+        return Left == INDEX_NONE && Right == INDEX_NONE;
+    }
+};
+
 struct FExploreWorld
 {
     TStrongObjectPtr<UVoxelSettings> Settings;
@@ -348,6 +457,27 @@ struct FExploreWorld
     TStrongObjectPtr<UVoxelGenerator> Generator;
     TStrongObjectPtr<UVoxelMarchingCubesMesher> Mesher;
     TArray<TStrongObjectPtr<UVoxelStrateDefinition>> Definitions;
+
+    // One canonical mesh cache for this commandlet run. Render and export consume these exact
+    // triangles; neither path is allowed to ask the density field once per pixel.
+    FVoxelMeshData ExploreMesh;
+    FIntVector ExploreMeshOrigin = FIntVector::ZeroValue;
+    int32 ExploreMeshSize = 0;
+    int32 ExploreMeshTileCount = 0;
+    int32 ExploreMeshTilesCompleted = 0;
+    double ExploreMeshSeconds = 0.0;
+    bool bExploreMeshBuilt = false;
+    bool bExploreMeshComplete = false;
+    FString ExploreMeshError;
+
+    // A deterministic CPU acceleration structure over the canonical triangles. It is built once
+    // after meshing and reused by every viewpoint; no density query is reachable from raster.
+    TArray<FExploreMeshTriangle> ExploreTriangles;
+    TArray<int32> ExploreTriangleOrder;
+    TArray<FExploreMeshBvhNode> ExploreBvhNodes;
+    int32 ExploreBvhRoot = INDEX_NONE;
+    double ExploreAccelerationSeconds = 0.0;
+    bool bExploreAccelerationBuilt = false;
 
     int32 TargetBottomWorldZ = 0;
     int32 TargetTopWorldZ = 0;
@@ -422,6 +552,37 @@ struct FExploreWorld
             OutError = TEXT("The requested target slot has no resolved definition.");
             return false;
         }
+        if (Arguments.bSurfaceRoughnessOverride)
+        {
+            // This is deliberately applied after layout construction and only to the target slot's
+            // resolved definition. Passage placement and every neighbouring strate retain their
+            // authored/default values; only the sampled target field gets the experiment knob.
+            switch (Arguments.Archetype)
+            {
+            case ECaveGeneratorType::FlatPlain:
+            case ECaveGeneratorType::CrystalChamber:
+                Target.Definition->SlabParams.FloorRoughness = Arguments.SurfaceRoughness;
+                Target.Definition->SlabParams.CeilingRoughness = Arguments.SurfaceRoughness;
+                break;
+            case ECaveGeneratorType::Maze:
+                Target.Definition->MazeParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                break;
+            case ECaveGeneratorType::SurfaceWorld:
+                Target.Definition->SurfaceParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                break;
+            case ECaveGeneratorType::VerticalShafts:
+                Target.Definition->VerticalShaftParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                break;
+            case ECaveGeneratorType::FloatingIslands:
+                Target.Definition->FloatingIslandParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                break;
+            case ECaveGeneratorType::TunnelNetwork:
+            case ECaveGeneratorType::Underwater:
+            default:
+                Target.Definition->GenerationParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                break;
+            }
+        }
         TargetBottomWorldZ = Target.BottomChunkZ * CHUNK_SIZE;
         TargetTopWorldZ = (Target.TopChunkZ + 1) * CHUNK_SIZE;
         TargetBoundarySealThickness = BoundarySealForArchetype(
@@ -483,6 +644,7 @@ struct FExploreRenderFrame
     int32 HitPixels = 0;
     bool bScaleMarkerProjected = false;
     bool bFailureMarkersProjected = false;
+    bool bPartial = false;
 };
 
 struct FExploreRenderOutput
@@ -496,10 +658,19 @@ struct FExploreRenderOutput
     int32 BisectionIterations = 0;
     float MaxDistanceVoxels = 0.0f;
     int64 EstimatedFixedDensitySamples = 0;
+    int64 LegacyTwoViewEstimatedDensitySamples = 0;
     FString StepRationale;
     FString CameraSeedPolicy;
     int32 CameraSeedCount = 0;
     bool bAllCamerasPlayerFit = false;
+    double MeshSeconds = 0.0;
+    double RasterSeconds = 0.0;
+    double FirstViewRasterSeconds = 0.0;
+    double AdditionalViewRasterSeconds = 0.0;
+    int32 RequestedViewpointCount = 8;
+    bool bMeshComplete = false;
+    double MeshAccelerationSeconds = 0.0;
+    bool bTruncated = false;
     TArray<FExploreRenderFrame> Frames;
 };
 
@@ -525,6 +696,55 @@ struct FExploreWalkOutput
     int32 DepartureLandingRoomProbeCount = 0;
     int32 DepartureLandingRoomPlayerFitProbeCount = 0;
     int32 DepartureLandingRoomArrivalComponentProbeCount = 0;
+    // Captured by the one walk pass and consumed by render camera selection. These are internal
+    // hand-off buffers, not a second source of truth for the field.
+    FVoxelStrateSampleGrid SharedSampleGrid;
+    TArray<FVector> CameraSeedPoses;
+    TArray<FString> CameraSeedSources;
+};
+
+struct FExploreMeshMetrics
+{
+    int32 VertexCount = 0;
+    int32 TriangleCount = 0;
+    int32 SharedEdgeCount = 0;
+    int32 DihedralSampleCount = 0;
+    int32 NormalComparisonTriangleCount = 0;
+    float EdgeLengthP50Meters = 0.0f;
+    float EdgeLengthP99Meters = 0.0f;
+    float EdgeLengthMaxMeters = 0.0f;
+    float DihedralP50Degrees = 0.0f;
+    float DihedralP75Degrees = 0.0f;
+    float DihedralP90Degrees = 0.0f;
+    float DihedralP95Degrees = 0.0f;
+    float DihedralP99Degrees = 0.0f;
+    float DihedralFractionOver20Degrees = 0.0f;
+    float DihedralFractionOver40Degrees = 0.0f;
+    float FaceNormalVsMeanVertexNormalP50Degrees = 0.0f;
+    float FaceNormalVsMeanVertexNormalP90Degrees = 0.0f;
+};
+
+struct FExploreMeshEdgeKey
+{
+    FIntVector First = FIntVector::ZeroValue;
+    FIntVector Second = FIntVector::ZeroValue;
+
+    bool operator==(const FExploreMeshEdgeKey& Other) const
+    {
+        return First == Other.First && Second == Other.Second;
+    }
+};
+
+FORCEINLINE uint32 GetTypeHash(const FExploreMeshEdgeKey& Key)
+{
+    return HashCombine(GetTypeHash(Key.First), GetTypeHash(Key.Second));
+}
+
+struct FExploreMeshEdgeIncident
+{
+    int32 IncidentCount = 0;
+    int32 FirstTriangle = INDEX_NONE;
+    int32 SecondTriangle = INDEX_NONE;
 };
 
 struct FExploreExportOutput
@@ -536,12 +756,16 @@ struct FExploreExportOutput
     FIntVector RegionOrigin = FIntVector::ZeroValue;
     int32 RegionSize = 0;
     int32 MesherTileCount = 0;
+    int32 MesherTilesCompleted = 0;
     int64 EstimatedWorkingBytes = 0;
     int64 WorkingMemoryCapBytes = MaxExportWorkingBytes;
     int64 MeshArrayBytes = 0;
     int64 MeshFileSizeBytes = 0;
     int32 VertexCount = 0;
     int32 TriangleCount = 0;
+    FExploreMeshMetrics SurfaceMetrics;
+    double MeshSeconds = 0.0;
+    bool bTruncated = false;
 };
 
 struct FExploreRunOutput
@@ -549,7 +773,18 @@ struct FExploreRunOutput
     FExploreRenderOutput Render;
     FExploreWalkOutput Walk;
     FExploreExportOutput Export;
+    double BudgetSeconds = 0.0;
+    double ElapsedSeconds = 0.0;
+    bool bTruncated = false;
+    FString TruncatedDuring;
+    TArray<FString> CompletedModes;
 };
+
+bool ValidateCanonicalTile(const FVoxelMeshData& MeshData, FString& OutError);
+bool MeasureExploreMesh(
+    const FVoxelMeshData& MeshData,
+    FExploreMeshMetrics& OutMetrics,
+    FString& OutError);
 
 bool FindMouths(
     const UVoxelStrateManager& Manager,
@@ -624,123 +859,6 @@ bool BuildCameraBasis(
     OutBasis.Aspect = static_cast<float>(Width) / static_cast<float>(Height);
     OutBasis.TanHalfFov = FMath::Tan(FMath::DegreesToRadians(FieldOfViewDegrees * 0.5f));
     return OutBasis.Aspect > 0.0f && OutBasis.TanHalfFov > 0.0f;
-}
-
-FVector MakeRayDirection(
-    const FExploreCameraBasis& Basis,
-    int32 PixelX,
-    int32 PixelY,
-    int32 Width,
-    int32 Height)
-{
-    const float NormalizedX = (2.0f * (static_cast<float>(PixelX) + 0.5f)
-        / static_cast<float>(Width)) - 1.0f;
-    const float NormalizedY = 1.0f - (2.0f * (static_cast<float>(PixelY) + 0.5f)
-        / static_cast<float>(Height));
-    return (Basis.Forward
-        + Basis.Right * (NormalizedX * Basis.Aspect * Basis.TanHalfFov)
-        + Basis.Up * (NormalizedY * Basis.TanHalfFov)).GetSafeNormal();
-}
-
-bool TraceDensityRay(
-    const UVoxelGenerator& Generator,
-    const FVector& Origin,
-    const FVector& Direction,
-    float FixedStepVoxels,
-    float MaxDistanceVoxels,
-    int32 BisectionIterations,
-    FVector& OutHitPoint,
-    FVector& OutNormal)
-{
-    float PreviousDensity = Generator.GetDensityAt(Origin.X, Origin.Y, Origin.Z);
-    if (!FMath::IsFinite(PreviousDensity))
-    {
-        return false;
-    }
-    if (PreviousDensity == 0.0f)
-    {
-        OutHitPoint = Origin;
-        OutNormal = FVector::UpVector;
-        return true;
-    }
-
-    const int32 NumSteps = FMath::Max(
-        1,
-        FMath::CeilToInt(MaxDistanceVoxels / FixedStepVoxels));
-    float PreviousDistance = 0.0f;
-    for (int32 StepIndex = 1; StepIndex <= NumSteps; ++StepIndex)
-    {
-        const float CurrentDistance = FMath::Min(
-            MaxDistanceVoxels,
-            static_cast<float>(StepIndex) * FixedStepVoxels);
-        const FVector CurrentPoint = Origin + Direction * CurrentDistance;
-        const float CurrentDensity = Generator.GetDensityAt(
-            CurrentPoint.X, CurrentPoint.Y, CurrentPoint.Z);
-        if (!FMath::IsFinite(CurrentDensity))
-        {
-            return false;
-        }
-
-        const bool bPreviousAir = PreviousDensity > 0.0f;
-        const bool bCurrentAir = CurrentDensity > 0.0f;
-        if (bPreviousAir != bCurrentAir || CurrentDensity == 0.0f)
-        {
-            float LowDistance = PreviousDistance;
-            float HighDistance = CurrentDistance;
-            const bool bLowAir = bPreviousAir;
-            for (int32 Iteration = 0; Iteration < BisectionIterations; ++Iteration)
-            {
-                const float MidDistance = 0.5f * (LowDistance + HighDistance);
-                const FVector MidPoint = Origin + Direction * MidDistance;
-                const float MidDensity = Generator.GetDensityAt(
-                    MidPoint.X, MidPoint.Y, MidPoint.Z);
-                if (!FMath::IsFinite(MidDensity))
-                {
-                    return false;
-                }
-                if ((MidDensity > 0.0f) == bLowAir)
-                {
-                    LowDistance = MidDistance;
-                }
-                else
-                {
-                    HighDistance = MidDistance;
-                }
-            }
-
-            const float HitDistance = 0.5f * (LowDistance + HighDistance);
-            OutHitPoint = Origin + Direction * HitDistance;
-            const float NormalStep = 0.5f;
-            const float DXP = Generator.GetDensityAt(
-                OutHitPoint.X + NormalStep, OutHitPoint.Y, OutHitPoint.Z);
-            const float DXN = Generator.GetDensityAt(
-                OutHitPoint.X - NormalStep, OutHitPoint.Y, OutHitPoint.Z);
-            const float DYP = Generator.GetDensityAt(
-                OutHitPoint.X, OutHitPoint.Y + NormalStep, OutHitPoint.Z);
-            const float DYN = Generator.GetDensityAt(
-                OutHitPoint.X, OutHitPoint.Y - NormalStep, OutHitPoint.Z);
-            const float DZP = Generator.GetDensityAt(
-                OutHitPoint.X, OutHitPoint.Y, OutHitPoint.Z + NormalStep);
-            const float DZN = Generator.GetDensityAt(
-                OutHitPoint.X, OutHitPoint.Y, OutHitPoint.Z - NormalStep);
-            if (!FMath::IsFinite(DXP) || !FMath::IsFinite(DXN)
-                || !FMath::IsFinite(DYP) || !FMath::IsFinite(DYN)
-                || !FMath::IsFinite(DZP) || !FMath::IsFinite(DZN))
-            {
-                return false;
-            }
-            OutNormal = FVector(DXP - DXN, DYP - DYN, DZP - DZN).GetSafeNormal();
-            if (OutNormal.IsNearlyZero())
-            {
-                OutNormal = FVector::UpVector;
-            }
-            return true;
-        }
-
-        PreviousDistance = CurrentDistance;
-        PreviousDensity = CurrentDensity;
-    }
-    return false;
 }
 
 void PutPixel(TArray<FColor>& Pixels, int32 Width, int32 Height, int32 X, int32 Y, const FColor& Color)
@@ -891,11 +1009,767 @@ bool SavePng(
     return true;
 }
 
+FIntVector ChooseExploreMeshOrigin(
+    const FExploreArguments& Arguments,
+    const FExploreWalkOutput* CameraSeedWalk,
+    int32 MeshSize,
+    int32 TargetMiddleWorldZ)
+{
+    FVector Centre(0.0f, 0.0f, static_cast<float>(TargetMiddleWorldZ));
+    if (CameraSeedWalk != nullptr && CameraSeedWalk->CameraSeedPoses.Num() > 0)
+    {
+        Centre = CameraSeedWalk->CameraSeedPoses[0];
+    }
+
+    const auto AlignTileOrigin = [MeshSize](float CentreCoordinate)
+    {
+        return FMath::FloorToInt(
+            (CentreCoordinate - 0.5f * static_cast<float>(MeshSize))
+                / static_cast<float>(CHUNK_SIZE))
+            * CHUNK_SIZE;
+    };
+    return FIntVector(
+        AlignTileOrigin(Centre.X),
+        AlignTileOrigin(Centre.Y),
+        AlignTileOrigin(Centre.Z));
+}
+
+bool AppendCanonicalMesh(
+    FVoxelMeshData& Destination,
+    const FVoxelMeshData& Source,
+    FString& OutError)
+{
+    if (!ValidateCanonicalTile(Source, OutError))
+    {
+        return false;
+    }
+
+    const int32 VertexOffset = Destination.Vertices.Num();
+    for (const int32 Index : Source.Triangles)
+    {
+        if (Index < 0 || Index >= Source.Vertices.Num())
+        {
+            OutError = TEXT("Canonical mesher returned an out-of-range triangle index.");
+            return false;
+        }
+    }
+
+    Destination.Vertices.Append(Source.Vertices);
+    Destination.Normals.Append(Source.Normals);
+    Destination.UVs.Append(Source.UVs);
+    Destination.Colors.Append(Source.Colors);
+    Destination.Triangles.Reserve(Destination.Triangles.Num() + Source.Triangles.Num());
+    for (const int32 Index : Source.Triangles)
+    {
+        Destination.Triangles.Add(Index + VertexOffset);
+    }
+    // A multi-tile aggregate interleaves each tile's ground/cap runs. The CPU rasterizer uses
+    // flat geometry and the OBJ path is material-neutral, so there is deliberately no invented
+    // global ceiling run here.
+    Destination.NumCeilingTriangles = 0;
+    return true;
+}
+
+bool EnsureExploreMesh(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    const FExploreWalkOutput* CameraSeedWalk,
+    FExploreBudget& Budget,
+    FString& OutError)
+{
+    if (World.bExploreMeshBuilt)
+    {
+        OutError = World.ExploreMeshError;
+        return World.bExploreMeshComplete;
+    }
+
+    World.bExploreMeshBuilt = true;
+    World.bExploreMeshComplete = false;
+    World.ExploreMeshError.Reset();
+    World.ExploreMesh.Clear();
+    World.ExploreMeshSize = Arguments.ExportSize;
+    const int32 TilesPerAxis = Arguments.ExportSize / CHUNK_SIZE;
+    World.ExploreMeshTileCount = TilesPerAxis * TilesPerAxis * TilesPerAxis;
+    World.ExploreMeshTilesCompleted = 0;
+    World.ExploreMeshOrigin = ChooseExploreMeshOrigin(
+        Arguments,
+        CameraSeedWalk,
+        World.ExploreMeshSize,
+        FMath::FloorToInt(0.5f * static_cast<float>(
+            World.TargetBottomWorldZ + World.TargetTopWorldZ)));
+    World.ExploreMeshSeconds = 0.0;
+
+    if (Budget.ShouldStop(TEXT("mesh")))
+    {
+        World.ExploreMeshError = TEXT("The wall-clock budget elapsed before meshing began.");
+        OutError = World.ExploreMeshError;
+        return false;
+    }
+
+    // This is the same canonical UVoxelMarchingCubesMesher used by export and runtime chunk
+    // generation. Skirts are presentation geometry for LOD seams and would extend outside the
+    // bounded explorer region, so the shared mesh uses the export setting.
+    World.Mesher->bGenerateSkirts = false;
+
+    const double MeshStartSeconds = FPlatformTime::Seconds();
+    if (Budget.ShouldStop(TEXT("mesh")))
+    {
+        World.ExploreMeshError = TEXT("The wall-clock budget elapsed before mesh tiles began.");
+        OutError = World.ExploreMeshError;
+        World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+        return false;
+    }
+
+    // Generate each tile through the canonical mesher on worker threads, then append strictly in
+    // Z/Y/X order. The mesher's scratch buffers and the generator's hot caches are thread-local;
+    // the fixed merge order keeps the aggregate mesh and all downstream raster/export bytes
+    // deterministic even though tile completion order is not.
+    TArray<FVoxelMeshData> TileMeshes;
+    TileMeshes.SetNum(World.ExploreMeshTileCount);
+    TArray<FString> TileErrors;
+    TileErrors.SetNum(World.ExploreMeshTileCount);
+    TArray<uint8> TileCompleted;
+    TileCompleted.Init(0, World.ExploreMeshTileCount);
+    std::atomic<bool> bTileWorkCancelled(false);
+    const double TileWorkDeadline = Budget.StartSeconds + Budget.LimitSeconds - 0.25;
+    ParallelFor(
+        World.ExploreMeshTileCount,
+        [&](int32 LinearTileIndex)
+        {
+            if (bTileWorkCancelled.load(std::memory_order_relaxed)
+                || FPlatformTime::Seconds() >= TileWorkDeadline)
+            {
+                bTileWorkCancelled.store(true, std::memory_order_relaxed);
+                return;
+            }
+
+            const int32 TileX = LinearTileIndex % TilesPerAxis;
+            const int32 TileY = (LinearTileIndex / TilesPerAxis) % TilesPerAxis;
+            const int32 TileZ = LinearTileIndex / (TilesPerAxis * TilesPerAxis);
+            const FIntVector TileOrigin = World.ExploreMeshOrigin
+                + FIntVector(TileX * CHUNK_SIZE, TileY * CHUNK_SIZE, TileZ * CHUNK_SIZE);
+            TileMeshes[LinearTileIndex] = World.Mesher->GenerateMesh(
+                TileOrigin,
+                1,
+                CHUNK_SIZE);
+
+            FString TileError;
+            if (!ValidateCanonicalTile(TileMeshes[LinearTileIndex], TileError))
+            {
+                TileErrors[LinearTileIndex] = MoveTemp(TileError);
+                bTileWorkCancelled.store(true, std::memory_order_relaxed);
+                return;
+            }
+            TileCompleted[LinearTileIndex] = 1;
+        });
+
+    int32 CompletedTiles = 0;
+    FString MeshError;
+    for (; CompletedTiles < World.ExploreMeshTileCount; ++CompletedTiles)
+    {
+        if (!TileCompleted[CompletedTiles])
+        {
+            break;
+        }
+        if (!AppendCanonicalMesh(
+                World.ExploreMesh,
+                TileMeshes[CompletedTiles],
+                MeshError))
+        {
+            World.ExploreMeshError = MeshError;
+            OutError = MeshError;
+            World.ExploreMeshTilesCompleted = CompletedTiles;
+            World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+            return false;
+        }
+        World.ExploreMeshTilesCompleted = CompletedTiles + 1;
+    }
+
+    if (CompletedTiles < World.ExploreMeshTileCount)
+    {
+        if (!TileErrors[CompletedTiles].IsEmpty())
+        {
+            World.ExploreMeshError = TileErrors[CompletedTiles];
+            OutError = World.ExploreMeshError;
+            World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+            return false;
+        }
+
+        Budget.ShouldStop(TEXT("mesh"));
+        World.ExploreMeshError = FString::Printf(
+            TEXT("Mesh was truncated after %d/%d canonical tiles."),
+            CompletedTiles,
+            World.ExploreMeshTileCount);
+        OutError = World.ExploreMeshError;
+        World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+        return false;
+    }
+
+    World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+    World.bExploreMeshComplete = true;
+    OutError.Reset();
+    return true;
+}
+
+float ExploreAxisValue(const FVector& Value, int32 Axis)
+{
+    switch (Axis)
+    {
+    case 1: return Value.Y;
+    case 2: return Value.Z;
+    default: return Value.X;
+    }
+}
+
+FVector ExploreTriangleMin(const FVector& A, const FVector& B, const FVector& C)
+{
+    return FVector(
+        FMath::Min3(A.X, B.X, C.X),
+        FMath::Min3(A.Y, B.Y, C.Y),
+        FMath::Min3(A.Z, B.Z, C.Z));
+}
+
+FVector ExploreTriangleMax(const FVector& A, const FVector& B, const FVector& C)
+{
+    return FVector(
+        FMath::Max3(A.X, B.X, C.X),
+        FMath::Max3(A.Y, B.Y, C.Y),
+        FMath::Max3(A.Z, B.Z, C.Z));
+}
+
+bool EnsureExploreAcceleration(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    FExploreBudget& Budget,
+    FString& OutError)
+{
+    if (World.bExploreAccelerationBuilt)
+    {
+        OutError.Reset();
+        return true;
+    }
+
+    World.ExploreTriangles.Reset();
+    World.ExploreTriangleOrder.Reset();
+    World.ExploreBvhNodes.Reset();
+    World.ExploreBvhRoot = INDEX_NONE;
+    World.ExploreAccelerationSeconds = 0.0;
+    const double AccelerationStartSeconds = FPlatformTime::Seconds();
+
+    if (!World.bExploreMeshComplete)
+    {
+        OutError = TEXT("Cannot build mesh acceleration before the canonical mesh is complete.");
+        return false;
+    }
+    if (Budget.ShouldStop(TEXT("mesh-acceleration")))
+    {
+        OutError = TEXT("The wall-clock budget elapsed before mesh acceleration began.");
+        return false;
+    }
+
+    const FVoxelMeshData& Mesh = World.ExploreMesh;
+    if (Mesh.Triangles.Num() % 3 != 0)
+    {
+        OutError = TEXT("Canonical mesh triangle index data is not divisible by three.");
+        return false;
+    }
+
+    World.ExploreTriangles.Reserve(Mesh.Triangles.Num() / 3);
+    for (int32 TriangleIndex = 0;
+         TriangleIndex + 2 < Mesh.Triangles.Num();
+         TriangleIndex += 3)
+    {
+        if ((TriangleIndex & 16383) == 0
+            && Budget.ShouldStop(TEXT("mesh-acceleration")))
+        {
+            OutError = TEXT("Mesh acceleration was truncated before its triangle cache completed.");
+            World.ExploreTriangles.Reset();
+            return false;
+        }
+
+        const int32 IndexA = Mesh.Triangles[TriangleIndex];
+        const int32 IndexB = Mesh.Triangles[TriangleIndex + 1];
+        const int32 IndexC = Mesh.Triangles[TriangleIndex + 2];
+        if (!Mesh.Vertices.IsValidIndex(IndexA)
+            || !Mesh.Vertices.IsValidIndex(IndexB)
+            || !Mesh.Vertices.IsValidIndex(IndexC))
+        {
+            OutError = TEXT("Canonical mesh acceleration saw an out-of-range triangle index.");
+            World.ExploreTriangles.Reset();
+            return false;
+        }
+
+        const FVector A = Mesh.Vertices[IndexA] / VOXEL_SIZE;
+        const FVector B = Mesh.Vertices[IndexB] / VOXEL_SIZE;
+        const FVector C = Mesh.Vertices[IndexC] / VOXEL_SIZE;
+        if (!FMath::IsFinite(A.X) || !FMath::IsFinite(A.Y) || !FMath::IsFinite(A.Z)
+            || !FMath::IsFinite(B.X) || !FMath::IsFinite(B.Y) || !FMath::IsFinite(B.Z)
+            || !FMath::IsFinite(C.X) || !FMath::IsFinite(C.Y) || !FMath::IsFinite(C.Z))
+        {
+            OutError = TEXT("Canonical mesh acceleration saw a non-finite vertex.");
+            World.ExploreTriangles.Reset();
+            return false;
+        }
+
+        const FVector Cross = FVector::CrossProduct(B - A, C - A);
+        if (Cross.SizeSquared() <= SMALL_NUMBER)
+        {
+            // Degenerate canonical triangles have no raster contribution. Keep them out of the
+            // acceleration structure without changing the source mesh or its export semantics.
+            continue;
+        }
+
+        FExploreMeshTriangle& Triangle = World.ExploreTriangles.AddDefaulted_GetRef();
+        Triangle.A = A;
+        Triangle.B = B;
+        Triangle.C = C;
+        Triangle.NormalA = Mesh.Normals[IndexA].GetSafeNormal();
+        Triangle.NormalB = Mesh.Normals[IndexB].GetSafeNormal();
+        Triangle.NormalC = Mesh.Normals[IndexC].GetSafeNormal();
+        Triangle.Min = ExploreTriangleMin(A, B, C);
+        Triangle.Max = ExploreTriangleMax(A, B, C);
+        Triangle.Centre = (A + B + C) / 3.0f;
+        Triangle.Normal = Cross.GetSafeNormal();
+    }
+
+    if (World.ExploreTriangles.Num() == 0)
+    {
+        // A valid empty mesh is still a complete mesh render: every pixel remains the explicit
+        // background colour. The root sentinel lets the rasterizer handle this deterministically.
+        World.ExploreAccelerationSeconds = FPlatformTime::Seconds() - AccelerationStartSeconds;
+        World.bExploreAccelerationBuilt = true;
+        OutError.Reset();
+        return true;
+    }
+
+    World.ExploreTriangleOrder.SetNumUninitialized(World.ExploreTriangles.Num());
+    for (int32 TriangleIndex = 0;
+         TriangleIndex < World.ExploreTriangleOrder.Num();
+         ++TriangleIndex)
+    {
+        World.ExploreTriangleOrder[TriangleIndex] = TriangleIndex;
+    }
+
+    World.ExploreBvhNodes.Reserve(World.ExploreTriangles.Num() / 4 + 2);
+    bool bBuildFailed = false;
+    TFunction<int32(int32, int32)> BuildNode;
+    BuildNode = [&](int32 Start, int32 Count) -> int32
+    {
+        if (bBuildFailed || Count <= 0)
+        {
+            return INDEX_NONE;
+        }
+        if (Budget.ShouldStop(TEXT("mesh-acceleration")))
+        {
+            bBuildFailed = true;
+            return INDEX_NONE;
+        }
+
+        const int32 NodeIndex = World.ExploreBvhNodes.AddDefaulted();
+        FExploreMeshBvhNode Node;
+        Node.Min = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+        Node.Max = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        FVector CentroidMin = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+        FVector CentroidMax = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (int32 Offset = 0; Offset < Count; ++Offset)
+        {
+            const int32 TriangleIndex = World.ExploreTriangleOrder[Start + Offset];
+            const FExploreMeshTriangle& Triangle = World.ExploreTriangles[TriangleIndex];
+            Node.Min.X = FMath::Min(Node.Min.X, Triangle.Min.X);
+            Node.Min.Y = FMath::Min(Node.Min.Y, Triangle.Min.Y);
+            Node.Min.Z = FMath::Min(Node.Min.Z, Triangle.Min.Z);
+            Node.Max.X = FMath::Max(Node.Max.X, Triangle.Max.X);
+            Node.Max.Y = FMath::Max(Node.Max.Y, Triangle.Max.Y);
+            Node.Max.Z = FMath::Max(Node.Max.Z, Triangle.Max.Z);
+            CentroidMin.X = FMath::Min(CentroidMin.X, Triangle.Centre.X);
+            CentroidMin.Y = FMath::Min(CentroidMin.Y, Triangle.Centre.Y);
+            CentroidMin.Z = FMath::Min(CentroidMin.Z, Triangle.Centre.Z);
+            CentroidMax.X = FMath::Max(CentroidMax.X, Triangle.Centre.X);
+            CentroidMax.Y = FMath::Max(CentroidMax.Y, Triangle.Centre.Y);
+            CentroidMax.Z = FMath::Max(CentroidMax.Z, Triangle.Centre.Z);
+        }
+
+        constexpr int32 LeafTriangleCount = 8;
+        if (Count <= LeafTriangleCount)
+        {
+            Node.FirstTriangle = Start;
+            Node.TriangleCount = Count;
+            World.ExploreBvhNodes[NodeIndex] = Node;
+            return NodeIndex;
+        }
+
+        const FVector CentroidExtent = CentroidMax - CentroidMin;
+        int32 SplitAxis = 0;
+        if (CentroidExtent.Y > CentroidExtent.X
+            && CentroidExtent.Y >= CentroidExtent.Z)
+        {
+            SplitAxis = 1;
+        }
+        else if (CentroidExtent.Z > CentroidExtent.X
+            && CentroidExtent.Z > CentroidExtent.Y)
+        {
+            SplitAxis = 2;
+        }
+
+        int32* OrderBegin = World.ExploreTriangleOrder.GetData() + Start;
+        int32* OrderEnd = OrderBegin + Count;
+        std::sort(
+            OrderBegin,
+            OrderEnd,
+            [&](int32 LeftIndex, int32 RightIndex)
+            {
+                const float LeftValue = ExploreAxisValue(
+                    World.ExploreTriangles[LeftIndex].Centre, SplitAxis);
+                const float RightValue = ExploreAxisValue(
+                    World.ExploreTriangles[RightIndex].Centre, SplitAxis);
+                if (LeftValue != RightValue)
+                {
+                    return LeftValue < RightValue;
+                }
+                return LeftIndex < RightIndex;
+            });
+
+        const int32 LeftCount = Count / 2;
+        const int32 RightCount = Count - LeftCount;
+        const int32 LeftNode = BuildNode(Start, LeftCount);
+        const int32 RightNode = BuildNode(Start + LeftCount, RightCount);
+        if (LeftNode == INDEX_NONE || RightNode == INDEX_NONE)
+        {
+            bBuildFailed = true;
+            return INDEX_NONE;
+        }
+
+        Node.Left = LeftNode;
+        Node.Right = RightNode;
+        World.ExploreBvhNodes[NodeIndex] = Node;
+        return NodeIndex;
+    };
+
+    World.ExploreBvhRoot = BuildNode(0, World.ExploreTriangles.Num());
+    if (bBuildFailed || World.ExploreBvhRoot == INDEX_NONE || Budget.bTruncated)
+    {
+        World.ExploreTriangles.Reset();
+        World.ExploreTriangleOrder.Reset();
+        World.ExploreBvhNodes.Reset();
+        World.ExploreBvhRoot = INDEX_NONE;
+        OutError = TEXT("Mesh acceleration was truncated before its BVH completed.");
+        return false;
+    }
+
+    World.ExploreAccelerationSeconds = FPlatformTime::Seconds() - AccelerationStartSeconds;
+    World.bExploreAccelerationBuilt = true;
+    OutError.Reset();
+    return true;
+}
+
+bool ExploreRayAabb(
+    const FVector& Origin,
+    const FVector& Direction,
+    const FVector& BoundsMin,
+    const FVector& BoundsMax,
+    float MaxDistance,
+    float& OutNear)
+{
+    float NearDistance = 0.0f;
+    float FarDistance = MaxDistance;
+    for (int32 Axis = 0; Axis < 3; ++Axis)
+    {
+        const float OriginComponent = ExploreAxisValue(Origin, Axis);
+        const float DirectionComponent = ExploreAxisValue(Direction, Axis);
+        const float MinComponent = ExploreAxisValue(BoundsMin, Axis);
+        const float MaxComponent = ExploreAxisValue(BoundsMax, Axis);
+        if (FMath::Abs(DirectionComponent) <= KINDA_SMALL_NUMBER)
+        {
+            if (OriginComponent < MinComponent || OriginComponent > MaxComponent)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        const float InverseDirection = 1.0f / DirectionComponent;
+        float AxisNear = (MinComponent - OriginComponent) * InverseDirection;
+        float AxisFar = (MaxComponent - OriginComponent) * InverseDirection;
+        if (AxisNear > AxisFar)
+        {
+            Swap(AxisNear, AxisFar);
+        }
+        NearDistance = FMath::Max(NearDistance, AxisNear);
+        FarDistance = FMath::Min(FarDistance, AxisFar);
+        if (NearDistance > FarDistance)
+        {
+            return false;
+        }
+    }
+
+    OutNear = NearDistance;
+    return true;
+}
+
+bool ExploreRayTriangle(
+    const FVector& Origin,
+    const FVector& Direction,
+    const FExploreMeshTriangle& Triangle,
+    float MaxDistance,
+    float& OutDistance,
+    float& OutU,
+    float& OutV)
+{
+    const FVector Edge1 = Triangle.B - Triangle.A;
+    const FVector Edge2 = Triangle.C - Triangle.A;
+    const FVector Perpendicular = FVector::CrossProduct(Direction, Edge2);
+    const float Determinant = FVector::DotProduct(Edge1, Perpendicular);
+    if (FMath::Abs(Determinant) <= KINDA_SMALL_NUMBER)
+    {
+        return false;
+    }
+
+    const float InverseDeterminant = 1.0f / Determinant;
+    const FVector ToOrigin = Origin - Triangle.A;
+    const float U = FVector::DotProduct(ToOrigin, Perpendicular) * InverseDeterminant;
+    if (U < 0.0f || U > 1.0f)
+    {
+        return false;
+    }
+
+    const FVector CrossOrigin = FVector::CrossProduct(ToOrigin, Edge1);
+    const float V = FVector::DotProduct(Direction, CrossOrigin) * InverseDeterminant;
+    if (V < 0.0f || U + V > 1.0f)
+    {
+        return false;
+    }
+
+    const float Distance = FVector::DotProduct(Edge2, CrossOrigin) * InverseDeterminant;
+    if (Distance <= 0.01f || Distance >= MaxDistance)
+    {
+        return false;
+    }
+    OutDistance = Distance;
+    OutU = U;
+    OutV = V;
+    return true;
+}
+
+bool RasterizeExploreMesh(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    const FVector& CameraPosition,
+    const FVector& Target,
+    FExploreBudget& Budget,
+    TArray<FColor>& OutPixels,
+    int32& OutHitPixels,
+    bool& bOutTruncated)
+{
+    OutPixels.Init(FColor(12, 18, 28, 255), Arguments.RenderWidth * Arguments.RenderHeight);
+    OutHitPixels = 0;
+    bOutTruncated = false;
+
+    if (!World.bExploreAccelerationBuilt)
+    {
+        FString AccelerationError;
+        if (!EnsureExploreAcceleration(Arguments, World, Budget, AccelerationError))
+        {
+            if (Budget.bTruncated)
+            {
+                bOutTruncated = true;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    FExploreCameraBasis Basis;
+    if (!BuildCameraBasis(
+            CameraPosition,
+            Target,
+            70.0f,
+            Arguments.RenderWidth,
+            Arguments.RenderHeight,
+            Basis))
+    {
+        return false;
+    }
+
+    const FVector KeyLightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
+    const FVector FillLightDirection = FVector(0.65f, 0.30f, 0.70f).GetSafeNormal();
+    constexpr float AmbientFill = 0.62f;
+    constexpr float KeyLightStrength = 0.50f;
+    constexpr float FillLightStrength = 0.24f;
+
+    for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
+    {
+        if (Budget.ShouldStop(TEXT("raster")))
+        {
+            bOutTruncated = true;
+            return true;
+        }
+
+        for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
+        {
+            const float NormalizedX = (2.0f * (static_cast<float>(PixelX) + 0.5f)
+                / static_cast<float>(Arguments.RenderWidth)) - 1.0f;
+            const float NormalizedY = 1.0f - (2.0f * (static_cast<float>(PixelY) + 0.5f)
+                / static_cast<float>(Arguments.RenderHeight));
+            const FVector Direction = (
+                Basis.Forward
+                + Basis.Right * (NormalizedX * Basis.Aspect * Basis.TanHalfFov)
+                + Basis.Up * (NormalizedY * Basis.TanHalfFov)).GetSafeNormal();
+
+            float ClosestDistance = Arguments.RenderMaxDistanceVoxels;
+            int32 ClosestTriangleIndex = INDEX_NONE;
+            float ClosestU = 0.0f;
+            float ClosestV = 0.0f;
+            int32 NodeStack[256];
+            int32 StackCount = 0;
+            if (World.ExploreBvhRoot != INDEX_NONE)
+            {
+                NodeStack[StackCount++] = World.ExploreBvhRoot;
+            }
+
+            while (StackCount > 0)
+            {
+                const int32 NodeIndex = NodeStack[--StackCount];
+                if (!World.ExploreBvhNodes.IsValidIndex(NodeIndex))
+                {
+                    continue;
+                }
+
+                const FExploreMeshBvhNode& Node = World.ExploreBvhNodes[NodeIndex];
+                float NodeNear = 0.0f;
+                if (!ExploreRayAabb(
+                        CameraPosition,
+                        Direction,
+                        Node.Min,
+                        Node.Max,
+                        ClosestDistance,
+                        NodeNear))
+                {
+                    continue;
+                }
+
+                if (Node.IsLeaf())
+                {
+                    for (int32 Offset = 0; Offset < Node.TriangleCount; ++Offset)
+                    {
+                        const int32 OrderIndex = Node.FirstTriangle + Offset;
+                        if (!World.ExploreTriangleOrder.IsValidIndex(OrderIndex))
+                        {
+                            continue;
+                        }
+                        const int32 TriangleIndex = World.ExploreTriangleOrder[OrderIndex];
+                        if (!World.ExploreTriangles.IsValidIndex(TriangleIndex))
+                        {
+                            continue;
+                        }
+                        float TriangleDistance = 0.0f;
+                        float TriangleU = 0.0f;
+                        float TriangleV = 0.0f;
+                        if (ExploreRayTriangle(
+                                CameraPosition,
+                                Direction,
+                                World.ExploreTriangles[TriangleIndex],
+                                ClosestDistance,
+                                TriangleDistance,
+                                TriangleU,
+                                TriangleV))
+                        {
+                            ClosestDistance = TriangleDistance;
+                            ClosestTriangleIndex = TriangleIndex;
+                            ClosestU = TriangleU;
+                            ClosestV = TriangleV;
+                        }
+                    }
+                    continue;
+                }
+
+                const int32 LeftNodeIndex = Node.Left;
+                const int32 RightNodeIndex = Node.Right;
+                float LeftNear = 0.0f;
+                float RightNear = 0.0f;
+                const bool bHitLeft = World.ExploreBvhNodes.IsValidIndex(LeftNodeIndex)
+                    && ExploreRayAabb(
+                        CameraPosition,
+                        Direction,
+                        World.ExploreBvhNodes[LeftNodeIndex].Min,
+                        World.ExploreBvhNodes[LeftNodeIndex].Max,
+                        ClosestDistance,
+                        LeftNear);
+                const bool bHitRight = World.ExploreBvhNodes.IsValidIndex(RightNodeIndex)
+                    && ExploreRayAabb(
+                        CameraPosition,
+                        Direction,
+                        World.ExploreBvhNodes[RightNodeIndex].Min,
+                        World.ExploreBvhNodes[RightNodeIndex].Max,
+                        ClosestDistance,
+                        RightNear);
+                if (bHitLeft && bHitRight)
+                {
+                    if (LeftNear < RightNear)
+                    {
+                        if (StackCount + 2 <= UE_ARRAY_COUNT(NodeStack))
+                        {
+                            NodeStack[StackCount++] = RightNodeIndex;
+                            NodeStack[StackCount++] = LeftNodeIndex;
+                        }
+                    }
+                    else if (StackCount + 2 <= UE_ARRAY_COUNT(NodeStack))
+                    {
+                        NodeStack[StackCount++] = LeftNodeIndex;
+                        NodeStack[StackCount++] = RightNodeIndex;
+                    }
+                }
+                else if (bHitLeft && StackCount < UE_ARRAY_COUNT(NodeStack))
+                {
+                    NodeStack[StackCount++] = LeftNodeIndex;
+                }
+                else if (bHitRight && StackCount < UE_ARRAY_COUNT(NodeStack))
+                {
+                    NodeStack[StackCount++] = RightNodeIndex;
+                }
+            }
+
+            if (ClosestTriangleIndex == INDEX_NONE)
+            {
+                continue;
+            }
+
+            const FExploreMeshTriangle& Triangle = World.ExploreTriangles[ClosestTriangleIndex];
+            FVector ShadingNormal = (
+                Triangle.NormalA * (1.0f - ClosestU - ClosestV)
+                + Triangle.NormalB * ClosestU
+                + Triangle.NormalC * ClosestV).GetSafeNormal();
+            if (ShadingNormal.IsNearlyZero())
+            {
+                // The canonical mesher supplies non-zero gradient normals. Keep a defensive
+                // fallback for malformed mesh data without reintroducing camera-facing flips.
+                ShadingNormal = Triangle.Normal;
+            }
+            const float Key = FMath::Max(
+                0.0f, FVector::DotProduct(ShadingNormal, KeyLightDirection));
+            const float Fill = FMath::Max(
+                0.0f, FVector::DotProduct(ShadingNormal, FillLightDirection));
+            const float Brightness = FMath::Clamp(
+                AmbientFill + KeyLightStrength * Key + FillLightStrength * Fill,
+                0.0f,
+                1.25f);
+            const int32 PixelIndex = PixelX + Arguments.RenderWidth * PixelY;
+            OutPixels[PixelIndex] = FColor(
+                static_cast<uint8>(FMath::Clamp(100.0f * Brightness, 0.0f, 255.0f)),
+                static_cast<uint8>(FMath::Clamp(128.0f * Brightness, 0.0f, 255.0f)),
+                static_cast<uint8>(FMath::Clamp(160.0f * Brightness, 0.0f, 255.0f)),
+                255);
+            ++OutHitPixels;
+        }
+    }
+    return true;
+}
+
 bool RunRender(
     const FExploreArguments& Arguments,
-    const FExploreWorld& World,
+    FExploreWorld& World,
     const FExploreWalkOutput& CameraSeedWalk,
-    FExploreRenderOutput& OutOutput)
+    FExploreRenderOutput& OutOutput,
+    FExploreBudget& Budget)
 {
     OutOutput = FExploreRenderOutput();
     OutOutput.Width = Arguments.RenderWidth;
@@ -903,27 +1777,70 @@ bool RunRender(
     OutOutput.FixedStepVoxels = Arguments.RenderStepVoxels;
     OutOutput.FixedStepMeters = Arguments.RenderStepVoxels
         * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
-    OutOutput.BisectionIterations = 10;
+    OutOutput.BisectionIterations = 0;
     OutOutput.MaxDistanceVoxels = Arguments.RenderMaxDistanceVoxels;
-    OutOutput.EstimatedFixedDensitySamples = static_cast<int64>(Arguments.RenderWidth)
+    OutOutput.EstimatedFixedDensitySamples = 0;
+    OutOutput.LegacyTwoViewEstimatedDensitySamples = static_cast<int64>(Arguments.RenderWidth)
         * static_cast<int64>(Arguments.RenderHeight)
         * 3ll
         * static_cast<int64>(FMath::Max(
             1,
             FMath::CeilToInt(
-                Arguments.RenderMaxDistanceVoxels / Arguments.RenderStepVoxels)));
+                Arguments.RenderMaxDistanceVoxels / Arguments.RenderStepVoxels)))
+        * 2ll;
+    OutOutput.RequestedViewpointCount = 8;
     OutOutput.StepRationale = TEXT(
-        "Density has no signed-distance/Lipschitz contract. The renderer therefore advances at a "
-        "fixed 0.25-voxel default step (override with -renderstep), detects density sign crossings, "
-        "and refines each crossing with 10 bisection iterations; it never sphere-traces.");
+        "The renderer meshes the bounded region once with UVoxelMarchingCubesMesher, then CPU "
+        "rasterises its canonical triangles through a deterministic BVH-assisted depth pass. "
+        "-renderstep is retained only for legacy invocation compatibility; no render pixel samples "
+        "the density field.");
 
     OutOutput.CameraSeedPolicy = TEXT(
-        "Every camera origin is a density-checked pose from the exact player-fit walk mask: "
-        "arrival, departure, last reached, and agent-final poses are considered in fixed order; "
-        "duplicate poses are removed. The target is offset toward the fitted route so the view is "
-        "from inside the walkable space.");
+        "Eight deterministic viewpoints are selected from the one shared player-fit mask. Their "
+        "eye-height origins are density-checked, and their azimuths are rotated in fixed 45-degree "
+        "increments so every image is from inside walkable space.");
 
-    TArray<TPair<FVector, FString>, TInlineAllocator<4>> CameraSeeds;
+    FString MeshError;
+    if (!EnsureExploreMesh(Arguments, World, &CameraSeedWalk, Budget, MeshError))
+    {
+        OutOutput.MeshSeconds = World.ExploreMeshSeconds;
+        OutOutput.bMeshComplete = World.bExploreMeshComplete;
+        if (Budget.bTruncated)
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.bTruncated = true;
+            OutOutput.RefusalReason = MeshError;
+        }
+        else
+        {
+            OutOutput.Status = TEXT("error");
+            OutOutput.RefusalReason = MeshError;
+        }
+        return false;
+    }
+    OutOutput.MeshSeconds = World.ExploreMeshSeconds;
+    OutOutput.bMeshComplete = true;
+    FString AccelerationError;
+    if (!EnsureExploreAcceleration(Arguments, World, Budget, AccelerationError))
+    {
+        OutOutput.MeshAccelerationSeconds = World.ExploreAccelerationSeconds;
+        if (Budget.bTruncated)
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.bTruncated = true;
+            OutOutput.RefusalReason = AccelerationError;
+        }
+        else
+        {
+            OutOutput.Status = TEXT("error");
+            OutOutput.RefusalReason = AccelerationError;
+        }
+        return false;
+    }
+    OutOutput.MeshAccelerationSeconds = World.ExploreAccelerationSeconds;
+    const double RasterStartSeconds = FPlatformTime::Seconds();
+
+    TArray<TPair<FVector, FString>, TInlineAllocator<8>> CameraSeeds;
     const auto AddCameraSeed = [&](bool bAvailable, const FVector& Position, const TCHAR* Source)
     {
         if (!bAvailable
@@ -951,22 +1868,20 @@ bool RunRender(
         CameraSeeds.Emplace(Position, FString(Source));
     };
 
-    AddCameraSeed(
-        CameraSeedWalk.bHasArrival,
-        CameraSeedWalk.ArrivalVoxels,
-        TEXT("arrival_player_fit"));
-    AddCameraSeed(
-        CameraSeedWalk.bHasDeparture,
-        CameraSeedWalk.DepartureVoxels,
-        TEXT("departure_player_fit"));
-    AddCameraSeed(
-        CameraSeedWalk.Report.bHasLastReachedPosition,
-        CameraSeedWalk.Report.LastReachedVoxels,
-        TEXT("last_reached_player_fit"));
-    AddCameraSeed(
-        CameraSeedWalk.Report.bHasAgentFinalPosition,
-        CameraSeedWalk.Report.AgentFinalVoxels,
-        TEXT("agent_final_player_fit"));
+    for (int32 SeedIndex = 0; SeedIndex < CameraSeedWalk.CameraSeedPoses.Num(); ++SeedIndex)
+    {
+        const FString Source = CameraSeedWalk.CameraSeedSources.IsValidIndex(SeedIndex)
+            ? CameraSeedWalk.CameraSeedSources[SeedIndex]
+            : FString::Printf(TEXT("player_fit_%02d"), SeedIndex);
+        AddCameraSeed(
+            true,
+            CameraSeedWalk.CameraSeedPoses[SeedIndex],
+            *Source);
+        if (CameraSeeds.Num() >= OutOutput.RequestedViewpointCount)
+        {
+            break;
+        }
+    }
 
     if (CameraSeeds.Num() == 0)
     {
@@ -974,6 +1889,17 @@ bool RunRender(
         OutOutput.RefusalReason = TEXT(
             "The player-fit seed pass produced no density-positive pose; refusing an inside-rock camera.");
         return false;
+    }
+
+    // A small room can contain fewer than eight distinct lattice cells. Reusing the same valid
+    // player-fit origin with another deterministic angle is still a valid viewpoint and keeps
+    // the contract (all camera origins are inside walkable space) without fabricating positions.
+    while (CameraSeeds.Num() < OutOutput.RequestedViewpointCount)
+    {
+        const TPair<FVector, FString>& Anchor = CameraSeeds[0];
+        CameraSeeds.Emplace(
+            Anchor.Key,
+            FString::Printf(TEXT("%s_angle_%02d"), *Anchor.Value, CameraSeeds.Num()));
     }
 
     OutOutput.CameraSeedCount = CameraSeeds.Num();
@@ -999,14 +1925,16 @@ bool RunRender(
         RouteFocus = CameraSeeds[0].Key;
     }
 
-    const FVector KeyLightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
-    const FVector FillLightDirection = FVector(0.65f, 0.30f, 0.70f).GetSafeNormal();
-    constexpr float AmbientFill = 0.62f;
-    constexpr float KeyLightStrength = 0.50f;
-    constexpr float FillLightStrength = 0.24f;
-
     for (int32 ViewIndex = 0; ViewIndex < CameraSeeds.Num(); ++ViewIndex)
     {
+        if (Budget.ShouldStop(TEXT("render")))
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.bTruncated = true;
+            OutOutput.RefusalReason = TEXT("The wall-clock budget stopped viewpoint generation.");
+            return false;
+        }
+
         const FVector CameraSeedPose = CameraSeeds[ViewIndex].Key;
         const FVector CameraPosition = CameraSeedPose
             + FVector::UpVector * (FVoxelPlayerCapsuleConstants::HalfHeightVoxels - 0.5f);
@@ -1029,8 +1957,31 @@ bool RunRender(
                 ViewIndex == 2 ? 0.7f : -0.4f,
                 0.18f).GetSafeNormal();
         }
-        // Keep the camera at the fitted pose, while aiming at roughly eye level in the route.
+        // Keep the camera at the fitted pose while changing the azimuth for each viewpoint.
+        LookDirection = LookDirection.RotateAngleAxis(
+            45.0f * static_cast<float>(ViewIndex),
+            FVector::UpVector).GetSafeNormal();
         const FVector Target = CameraPosition + LookDirection * 96.0f + FVector::UpVector * 8.0f;
+
+        const double ViewStartSeconds = FPlatformTime::Seconds();
+        TArray<FColor> Pixels;
+        int32 HitPixels = 0;
+        bool bRasterTruncated = false;
+        if (!RasterizeExploreMesh(
+                Arguments,
+                World,
+                CameraPosition,
+                Target,
+                Budget,
+                Pixels,
+                HitPixels,
+                bRasterTruncated))
+        {
+            OutOutput.Status = TEXT("error");
+            OutOutput.RefusalReason = TEXT("Could not construct a mesh raster camera.");
+            return false;
+        }
+
         FExploreCameraBasis Basis;
         if (!BuildCameraBasis(
                 CameraPosition,
@@ -1043,55 +1994,6 @@ bool RunRender(
             OutOutput.Status = TEXT("error");
             OutOutput.RefusalReason = TEXT("Could not construct a render camera basis.");
             return false;
-        }
-
-        TArray<FColor> Pixels;
-        Pixels.Init(FColor(12, 18, 28, 255), Arguments.RenderWidth * Arguments.RenderHeight);
-        int32 HitPixels = 0;
-        for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
-        {
-            for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
-            {
-                const FVector RayDirection = MakeRayDirection(
-                    Basis,
-                    PixelX,
-                    PixelY,
-                    Arguments.RenderWidth,
-                    Arguments.RenderHeight);
-                FVector HitPoint;
-                FVector Normal;
-                if (!TraceDensityRay(
-                        *World.Generator,
-                        CameraPosition,
-                        RayDirection,
-                        Arguments.RenderStepVoxels,
-                        Arguments.RenderMaxDistanceVoxels,
-                        OutOutput.BisectionIterations,
-                        HitPoint,
-                        Normal))
-                {
-                    continue;
-                }
-
-                ++HitPixels;
-                const float Key = FMath::Max(
-                    0.0f, FVector::DotProduct(Normal, KeyLightDirection));
-                const float Fill = FMath::Max(
-                    0.0f, FVector::DotProduct(Normal, FillLightDirection));
-                const float Brightness = FMath::Clamp(
-                    AmbientFill + KeyLightStrength * Key + FillLightStrength * Fill,
-                    0.0f, 1.25f);
-                const uint8 RockR = static_cast<uint8>(FMath::Clamp(100.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockG = static_cast<uint8>(FMath::Clamp(128.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockB = static_cast<uint8>(FMath::Clamp(160.0f * Brightness, 0.0f, 255.0f));
-                PutPixel(
-                    Pixels,
-                    Arguments.RenderWidth,
-                    Arguments.RenderHeight,
-                    PixelX,
-                    PixelY,
-                    FColor(RockR, RockG, RockB, 255));
-            }
         }
 
         bool bScaleMarkerProjected = false;
@@ -1113,6 +2015,7 @@ bool RunRender(
         Frame.TargetVoxels = Target;
         Frame.HitPixels = HitPixels;
         Frame.bScaleMarkerProjected = bScaleMarkerProjected;
+        Frame.bPartial = bRasterTruncated;
 
         FString Error;
         if (!SavePng(
@@ -1126,10 +2029,34 @@ bool RunRender(
             OutOutput.RefusalReason = Error;
             return false;
         }
+
+        const double ViewSeconds = FPlatformTime::Seconds() - ViewStartSeconds;
+        if (ViewIndex == 0)
+        {
+            OutOutput.FirstViewRasterSeconds = ViewSeconds;
+        }
+
+        if (bRasterTruncated)
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.bTruncated = true;
+            OutOutput.RefusalReason = TEXT("The wall-clock budget stopped triangle rasterisation.");
+            break;
+        }
     }
 
-    OutOutput.Status = TEXT("ok");
-    return true;
+    OutOutput.MeshSeconds = World.ExploreMeshSeconds;
+    OutOutput.RasterSeconds = FPlatformTime::Seconds() - RasterStartSeconds;
+    const int32 AdditionalViewCount = FMath::Max(0, OutOutput.Frames.Num() - 1);
+    OutOutput.AdditionalViewRasterSeconds = AdditionalViewCount > 0
+        ? (OutOutput.RasterSeconds - OutOutput.FirstViewRasterSeconds)
+            / static_cast<double>(AdditionalViewCount)
+        : 0.0;
+    if (!OutOutput.bTruncated)
+    {
+        OutOutput.Status = TEXT("ok");
+    }
+    return !OutOutput.bTruncated;
 }
 
 void DrawPointMarker(
@@ -1175,9 +2102,10 @@ void DrawPointMarker(
 
 bool RunFailureBoundaryRender(
     const FExploreArguments& Arguments,
-    const FExploreWorld& World,
+    FExploreWorld& World,
     const FExploreWalkOutput& Walk,
-    FExploreRenderOutput& InOutOutput)
+    FExploreRenderOutput& InOutOutput,
+    FExploreBudget& Budget)
 {
     const FVoxelPlayerFitWalkReport& Report = Walk.Report;
     if (!Report.bHasAgentFinalPosition || !Report.bHasTargetComponentNearestCell)
@@ -1217,6 +2145,15 @@ bool RunFailureBoundaryRender(
 
     for (int32 ViewIndex = 0; ViewIndex < UE_ARRAY_COUNT(ViewTargets); ++ViewIndex)
     {
+        if (Budget.ShouldStop(TEXT("failure-focus-render")))
+        {
+            InOutOutput.Status = TEXT("truncated");
+            InOutOutput.bTruncated = true;
+            InOutOutput.RefusalReason = TEXT(
+                "The wall-clock budget stopped failure-focus viewpoint generation.");
+            return false;
+        }
+
         const FVector CameraSeedPose = CameraCandidates[ViewIndex];
         const FVector CameraPosition = CameraSeedPose
             + FVector::UpVector * (FVoxelPlayerCapsuleConstants::HalfHeightVoxels - 0.5f);
@@ -1229,75 +2166,35 @@ bool RunFailureBoundaryRender(
                 ViewIndex);
             return false;
         }
-        const float FailureMaxDistanceVoxels = FMath::Max(
-            Arguments.RenderMaxDistanceVoxels,
-            FMath::Max(
-                FVector::Dist(CameraPosition, AgentFinal),
-                FVector::Dist(CameraPosition, TargetComponentCell)) + 32.0f);
+        const FVector Target = ViewTargets[ViewIndex];
+        TArray<FColor> Pixels;
+        int32 HitPixels = 0;
+        bool bRasterTruncated = false;
+        if (!RasterizeExploreMesh(
+                Arguments,
+                World,
+                CameraPosition,
+                Target,
+                Budget,
+                Pixels,
+                HitPixels,
+                bRasterTruncated))
+        {
+            InOutOutput.Status = TEXT("error");
+            InOutOutput.RefusalReason = TEXT("Could not construct failure-focus mesh raster.");
+            return false;
+        }
+
         FExploreCameraBasis Basis;
         if (!BuildCameraBasis(
                 CameraPosition,
-                ViewTargets[ViewIndex],
+                Target,
                 70.0f,
                 Arguments.RenderWidth,
                 Arguments.RenderHeight,
                 Basis))
         {
             return false;
-        }
-
-        TArray<FColor> Pixels;
-        Pixels.Init(FColor(12, 18, 28, 255), Arguments.RenderWidth * Arguments.RenderHeight);
-        int32 HitPixels = 0;
-        const FVector KeyLightDirection = FVector(-0.35f, -0.45f, 0.82f).GetSafeNormal();
-        const FVector FillLightDirection = FVector(0.65f, 0.30f, 0.70f).GetSafeNormal();
-        constexpr float AmbientFill = 0.62f;
-        constexpr float KeyLightStrength = 0.50f;
-        constexpr float FillLightStrength = 0.24f;
-        for (int32 PixelY = 0; PixelY < Arguments.RenderHeight; ++PixelY)
-        {
-            for (int32 PixelX = 0; PixelX < Arguments.RenderWidth; ++PixelX)
-            {
-                const FVector RayDirection = MakeRayDirection(
-                    Basis,
-                    PixelX,
-                    PixelY,
-                    Arguments.RenderWidth,
-                    Arguments.RenderHeight);
-                FVector HitPoint;
-                FVector Normal;
-                if (!TraceDensityRay(
-                    *World.Generator,
-                    CameraPosition,
-                    RayDirection,
-                    Arguments.RenderStepVoxels,
-                    FailureMaxDistanceVoxels,
-                    InOutOutput.BisectionIterations,
-                    HitPoint,
-                    Normal))
-                {
-                    continue;
-                }
-
-                ++HitPixels;
-                const float Key = FMath::Max(
-                    0.0f, FVector::DotProduct(Normal, KeyLightDirection));
-                const float Fill = FMath::Max(
-                    0.0f, FVector::DotProduct(Normal, FillLightDirection));
-                const float Brightness = FMath::Clamp(
-                    AmbientFill + KeyLightStrength * Key + FillLightStrength * Fill,
-                    0.0f, 1.25f);
-                const uint8 RockR = static_cast<uint8>(FMath::Clamp(100.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockG = static_cast<uint8>(FMath::Clamp(128.0f * Brightness, 0.0f, 255.0f));
-                const uint8 RockB = static_cast<uint8>(FMath::Clamp(160.0f * Brightness, 0.0f, 255.0f));
-                PutPixel(
-                    Pixels,
-                    Arguments.RenderWidth,
-                    Arguments.RenderHeight,
-                    PixelX,
-                    PixelY,
-                    FColor(RockR, RockG, RockB, 255));
-            }
         }
 
         bool bAgentProjected = false;
@@ -1370,10 +2267,22 @@ bool RunFailureBoundaryRender(
             : TEXT("agent_final_player_fit");
         Frame.CameraSeedPoseVoxels = CameraSeedPose;
         Frame.CameraVoxels = CameraPosition;
-        Frame.TargetVoxels = ViewTargets[ViewIndex];
+        Frame.TargetVoxels = Target;
         Frame.HitPixels = HitPixels;
         Frame.bFailureMarkersProjected = bAgentProjected && bTargetProjected
             && (!bHaveLastReached || bLastReachedProjected);
+        Frame.bPartial = bRasterTruncated;
+
+        bool bScaleMarkerProjected = false;
+        DrawScaleMarker(
+            Pixels,
+            Arguments.RenderWidth,
+            Arguments.RenderHeight,
+            CameraPosition,
+            Target,
+            Basis,
+            bScaleMarkerProjected);
+        Frame.bScaleMarkerProjected = bScaleMarkerProjected;
 
         FString Error;
         if (!SavePng(
@@ -1387,6 +2296,15 @@ bool RunFailureBoundaryRender(
             InOutOutput.RefusalReason = Error;
             return false;
         }
+
+        if (bRasterTruncated)
+        {
+            InOutOutput.Status = TEXT("truncated");
+            InOutOutput.bTruncated = true;
+            InOutOutput.RefusalReason = TEXT(
+                "The wall-clock budget stopped failure-focus rasterisation.");
+            return false;
+        }
     }
 
     return true;
@@ -1395,7 +2313,8 @@ bool RunFailureBoundaryRender(
 bool RunWalk(
     const FExploreArguments& Arguments,
     const FExploreWorld& World,
-    FExploreWalkOutput& OutOutput)
+    FExploreWalkOutput& OutOutput,
+    FExploreBudget& Budget)
 {
     OutOutput = FExploreWalkOutput();
     OutOutput.WindowPolicy = NeedsOriginInWindow(Arguments.Archetype)
@@ -1411,6 +2330,12 @@ bool RunWalk(
             TEXT("Refused before sampling: estimated walk memory %lld bytes exceeds cap %lld bytes."),
             static_cast<long long>(EstimatedWorkingBytes),
             static_cast<long long>(MaxWalkWorkingBytes));
+        return false;
+    }
+    if (Budget.ShouldStop(TEXT("walk")))
+    {
+        OutOutput.Status = TEXT("truncated");
+        OutOutput.RefusalReason = TEXT("The wall-clock budget elapsed before walk sampling.");
         return false;
     }
 
@@ -1608,35 +2533,161 @@ bool RunWalk(
             OutOutput.DepartureVoxels,
             Settings,
             OutOutput.Report,
-            &LandingRoomProbePoints))
+            &LandingRoomProbePoints,
+            &OutOutput.SharedSampleGrid))
     {
         OutOutput.Status = TEXT("refused");
         OutOutput.RefusalReason = OutOutput.Report.RefusalReason;
         return false;
     }
 
-    // Part C is a separate observation window.  Keep the Part A mouth-sized result untouched,
-    // then repeat the same exact fit walk with the route window expanded to include (0,0).  This
-    // is measurement-only: it changes neither the density field nor any generation parameter.
-    OutOutput.bOriginCheckAttempted = true;
-    FVoxelStrateMeasureSettings OriginSettings = Settings;
-    OriginSettings.bIncludeOriginInCoverWindow = true;
-    OriginSettings.bForceOriginColumnInCoverWindow = true;
-    if (VF_MeasurePlayerFitWalkWithSampler(
-            Sampler,
-            World.TargetBottomWorldZ,
-            World.TargetTopWorldZ,
-            World.TargetBoundarySealThickness,
-            OutOutput.ArrivalVoxels,
-            OutOutput.DepartureVoxels,
-            OriginSettings,
-            OutOutput.OriginCheckReport))
+    // Camera seeds are selected from this exact captured mask. The first valid fit cell anchors
+    // the bounded render mesh; subsequent cells are kept local to that anchor so the mesh region
+    // contains every requested viewpoint rather than silently rendering a distant empty box.
+    OutOutput.CameraSeedPoses.Reset();
+    OutOutput.CameraSeedSources.Reset();
+    FVector CameraAnchor = FVector::ZeroVector;
+    bool bHaveCameraAnchor = false;
+    const auto AddCameraSeed = [&](const FVector& Position, const TCHAR* Source)
     {
+        if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+            || !FMath::IsFinite(Position.Z)
+            || !OutOutput.SharedSampleGrid.ContainsPoint(Position))
+        {
+            return;
+        }
+        const float Step = static_cast<float>(OutOutput.SharedSampleGrid.SampleStep);
+        const int32 X = FMath::Clamp(
+            FMath::FloorToInt((Position.X - OutOutput.SharedSampleGrid.MinX) / Step),
+            0,
+            OutOutput.SharedSampleGrid.NumX - 1);
+        const int32 Y = FMath::Clamp(
+            FMath::FloorToInt((Position.Y - OutOutput.SharedSampleGrid.MinY) / Step),
+            0,
+            OutOutput.SharedSampleGrid.NumY - 1);
+        const int32 Z = FMath::Clamp(
+            FMath::FloorToInt((Position.Z - OutOutput.SharedSampleGrid.MinZ) / Step),
+            0,
+            OutOutput.SharedSampleGrid.NumZ - 1);
+        const int32 Cell = OutOutput.SharedSampleGrid.Index(X, Y, Z);
+        if (!OutOutput.SharedSampleGrid.PlayerFitMask.IsValidIndex(Cell)
+            || OutOutput.SharedSampleGrid.PlayerFitMask[Cell] == 0u)
+        {
+            return;
+        }
+        if (!bHaveCameraAnchor)
+        {
+            CameraAnchor = Position;
+            bHaveCameraAnchor = true;
+        }
+        if (FVector::DistSquared(Position, CameraAnchor) > FMath::Square(40.0f))
+        {
+            return;
+        }
+        for (const FVector& Existing : OutOutput.CameraSeedPoses)
+        {
+            if (Existing.Equals(Position, 0.001f))
+            {
+                return;
+            }
+        }
+        OutOutput.CameraSeedPoses.Add(Position);
+        OutOutput.CameraSeedSources.Add(
+            Source != nullptr ? FString(Source)
+                              : FString::Printf(TEXT("player_fit_%02d"),
+                                  OutOutput.CameraSeedPoses.Num() - 1));
+    };
+    AddCameraSeed(OutOutput.ArrivalVoxels, TEXT("arrival_player_fit"));
+    AddCameraSeed(OutOutput.DepartureVoxels, TEXT("departure_player_fit"));
+    if (OutOutput.Report.bHasLastReachedPosition)
+    {
+        AddCameraSeed(
+            OutOutput.Report.LastReachedVoxels,
+            TEXT("last_reached_player_fit"));
+    }
+    if (OutOutput.Report.bHasAgentFinalPosition)
+    {
+        AddCameraSeed(
+            OutOutput.Report.AgentFinalVoxels,
+            TEXT("agent_final_player_fit"));
+    }
+    if (!bHaveCameraAnchor)
+    {
+        for (int32 Cell = 0;
+             Cell < OutOutput.SharedSampleGrid.PlayerFitMask.Num();
+             ++Cell)
+        {
+            if (OutOutput.SharedSampleGrid.PlayerFitMask[Cell] == 0u)
+            {
+                continue;
+            }
+            const int32 Plane = OutOutput.SharedSampleGrid.NumX
+                * OutOutput.SharedSampleGrid.NumY;
+            const int32 Z = Cell / Plane;
+            const int32 InPlane = Cell - Z * Plane;
+            const int32 Y = InPlane / OutOutput.SharedSampleGrid.NumX;
+            const int32 X = InPlane - Y * OutOutput.SharedSampleGrid.NumX;
+            AddCameraSeed(
+                FVector(
+                    OutOutput.SharedSampleGrid.MinX
+                        + (static_cast<float>(X) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep,
+                    OutOutput.SharedSampleGrid.MinY
+                        + (static_cast<float>(Y) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep,
+                    OutOutput.SharedSampleGrid.MinZ
+                        + (static_cast<float>(Z) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep),
+                TEXT("player_fit_grid"));
+            if (bHaveCameraAnchor)
+            {
+                break;
+            }
+        }
+    }
+    if (bHaveCameraAnchor)
+    {
+        const int32 NumCandidates = OutOutput.SharedSampleGrid.PlayerFitMask.Num();
+        for (int32 Cell = 0; Cell < NumCandidates && OutOutput.CameraSeedPoses.Num() < 8; ++Cell)
+        {
+            if (OutOutput.SharedSampleGrid.PlayerFitMask[Cell] == 0u)
+            {
+                continue;
+            }
+            const int32 Plane = OutOutput.SharedSampleGrid.NumX
+                * OutOutput.SharedSampleGrid.NumY;
+            const int32 Z = Cell / Plane;
+            const int32 InPlane = Cell - Z * Plane;
+            const int32 Y = InPlane / OutOutput.SharedSampleGrid.NumX;
+            const int32 X = InPlane - Y * OutOutput.SharedSampleGrid.NumX;
+            AddCameraSeed(
+                FVector(
+                    OutOutput.SharedSampleGrid.MinX
+                        + (static_cast<float>(X) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep,
+                    OutOutput.SharedSampleGrid.MinY
+                        + (static_cast<float>(Y) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep,
+                    OutOutput.SharedSampleGrid.MinZ
+                        + (static_cast<float>(Z) + 0.5f)
+                            * OutOutput.SharedSampleGrid.SampleStep),
+                TEXT("player_fit_grid"));
+        }
+    }
+
+    // The origin observation is now a view over the shared primary grid. A second, expanded
+    // walk would defeat the one-grid contract; callers that need origin coverage must request an
+    // origin-inclusive archetype window, which is already selected before the single sample pass.
+    OutOutput.bOriginCheckAttempted = true;
+    if (OutOutput.Report.bOriginColumnInSampledWindow)
+    {
+        OutOutput.OriginCheckReport = OutOutput.Report;
         OutOutput.bOriginCheckAvailable = true;
     }
     else
     {
-        OutOutput.OriginCheckRefusalReason = OutOutput.OriginCheckReport.RefusalReason;
+        OutOutput.OriginCheckRefusalReason = TEXT(
+            "Origin is outside the shared primary sample window; no second grid was sampled.");
     }
     const int32 ArrivalProbeCount = ArrivalPassage != nullptr ? 5 : 0;
     const int32 DepartureProbeCount = DeparturePassage != nullptr ? 5 : 0;
@@ -1665,6 +2716,12 @@ bool RunWalk(
                 bInArrivalComponent ? 1 : 0;
         }
     }
+    if (Budget.ShouldStop(TEXT("walk")))
+    {
+        OutOutput.Status = TEXT("truncated");
+        OutOutput.RefusalReason = TEXT("The wall-clock budget elapsed after walk sampling.");
+        return false;
+    }
     OutOutput.Status = TEXT("ok");
     return true;
 }
@@ -1677,9 +2734,10 @@ int64 EstimateExportWorkingBytes(int32 RegionSize)
     const int64 TileGridSamples = static_cast<int64>(CHUNK_SIZE + 3)
         * static_cast<int64>(CHUNK_SIZE + 3)
         * static_cast<int64>(CHUNK_SIZE + 3);
-    // Export streams one canonical tile at a time. This preflight covers one mesher tile's scalar
-    // grid, edge map, mesh arrays, and temporary triangle lists; the region's OBJ is not retained
-    // in memory. RegionSize is still accepted here to keep the call site's contract explicit.
+    // This preflight covers one canonical tile's scalar grid, edge map, mesh arrays, and temporary
+    // triangle lists. The run-level canonical aggregate is retained separately so render and
+    // export consume the same mesh. RegionSize is still accepted here to keep the call site's
+    // contract explicit.
     (void)RegionSize;
     return TileGridSamples * static_cast<int64>(sizeof(float)) + TileCells * 448ll;
 }
@@ -1704,6 +2762,224 @@ bool ValidateCanonicalTile(const FVoxelMeshData& MeshData, FString& OutError)
         OutError = TEXT("Canonical mesher returned non-parallel mesh arrays.");
         return false;
     }
+    return true;
+}
+
+bool ExploreMetricVectorIsFinite(const FVector& Value)
+{
+    return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
+}
+
+FIntVector ExploreMetricWeldPosition(const FVector& PositionCm)
+{
+    // Mesh positions are Unreal centimetres. 0.01 cm is deliberately much smaller than a
+    // marching-cubes cell and only absorbs independent-tile floating-point round-off.
+    constexpr float WeldQuantumCm = 0.01f;
+    return FIntVector(
+        FMath::RoundToInt(PositionCm.X / WeldQuantumCm),
+        FMath::RoundToInt(PositionCm.Y / WeldQuantumCm),
+        FMath::RoundToInt(PositionCm.Z / WeldQuantumCm));
+}
+
+FExploreMeshEdgeKey ExploreMetricMakeEdgeKey(
+    const FVector& PositionA,
+    const FVector& PositionB)
+{
+    const FIntVector A = ExploreMetricWeldPosition(PositionA);
+    const FIntVector B = ExploreMetricWeldPosition(PositionB);
+    const bool bAFirst = A.X < B.X
+        || (A.X == B.X && (A.Y < B.Y || (A.Y == B.Y && A.Z <= B.Z)));
+    return bAFirst
+        ? FExploreMeshEdgeKey{A, B}
+        : FExploreMeshEdgeKey{B, A};
+}
+
+float ExploreMetricPercentile(const TArray<float>& SortedValues, float Quantile)
+{
+    if (SortedValues.Num() == 0)
+    {
+        return 0.0f;
+    }
+    const float Position = FMath::Clamp(Quantile, 0.0f, 1.0f)
+        * static_cast<float>(SortedValues.Num() - 1);
+    const int32 Lower = FMath::FloorToInt(Position);
+    const int32 Upper = FMath::Min(Lower + 1, SortedValues.Num() - 1);
+    return FMath::Lerp(SortedValues[Lower], SortedValues[Upper], Position - static_cast<float>(Lower));
+}
+
+bool MeasureExploreMesh(
+    const FVoxelMeshData& MeshData,
+    FExploreMeshMetrics& OutMetrics,
+    FString& OutError)
+{
+    OutMetrics = FExploreMeshMetrics();
+    if (!ValidateCanonicalTile(MeshData, OutError))
+    {
+        return false;
+    }
+
+    const int32 NumTriangles = MeshData.Triangles.Num() / 3;
+    OutMetrics.VertexCount = MeshData.Vertices.Num();
+    OutMetrics.TriangleCount = NumTriangles;
+
+    TArray<float> EdgeLengthsMeters;
+    TArray<float> DihedralAnglesDegrees;
+    TArray<float> FaceNormalDivergencesDegrees;
+    EdgeLengthsMeters.Reserve(NumTriangles * 3);
+    DihedralAnglesDegrees.Reserve(NumTriangles * 2);
+    FaceNormalDivergencesDegrees.Reserve(NumTriangles);
+
+    TArray<FVector> FaceNormals;
+    FaceNormals.Init(FVector::ZeroVector, NumTriangles);
+    TArray<uint8> ValidFaceNormals;
+    ValidFaceNormals.Init(0, NumTriangles);
+    TMap<FExploreMeshEdgeKey, FExploreMeshEdgeIncident> EdgeIncidents;
+    EdgeIncidents.Reserve(FMath::Max(1, NumTriangles * 2));
+
+    const auto AddEdgeIncident = [&EdgeIncidents](
+        const FVector& PositionA, const FVector& PositionB, int32 TriangleIndex)
+    {
+        const FExploreMeshEdgeKey Key = ExploreMetricMakeEdgeKey(PositionA, PositionB);
+        if (Key.First == Key.Second)
+        {
+            return;
+        }
+        FExploreMeshEdgeIncident& Incident = EdgeIncidents.FindOrAdd(Key);
+        if (Incident.IncidentCount == 0)
+        {
+            Incident.FirstTriangle = TriangleIndex;
+        }
+        else if (Incident.IncidentCount == 1)
+        {
+            Incident.SecondTriangle = TriangleIndex;
+        }
+        Incident.IncidentCount = FMath::Min(Incident.IncidentCount + 1, 3);
+    };
+
+    for (int32 TriangleIndex = 0; TriangleIndex < NumTriangles; ++TriangleIndex)
+    {
+        const int32 Base = TriangleIndex * 3;
+        const int32 IndexA = MeshData.Triangles[Base];
+        const int32 IndexB = MeshData.Triangles[Base + 1];
+        const int32 IndexC = MeshData.Triangles[Base + 2];
+        if (!MeshData.Vertices.IsValidIndex(IndexA)
+            || !MeshData.Vertices.IsValidIndex(IndexB)
+            || !MeshData.Vertices.IsValidIndex(IndexC)
+            || !MeshData.Normals.IsValidIndex(IndexA)
+            || !MeshData.Normals.IsValidIndex(IndexB)
+            || !MeshData.Normals.IsValidIndex(IndexC))
+        {
+            OutError = TEXT("Surface metric measurement saw an out-of-range mesh index.");
+            return false;
+        }
+
+        const FVector& A = MeshData.Vertices[IndexA];
+        const FVector& B = MeshData.Vertices[IndexB];
+        const FVector& C = MeshData.Vertices[IndexC];
+        if (!ExploreMetricVectorIsFinite(A)
+            || !ExploreMetricVectorIsFinite(B)
+            || !ExploreMetricVectorIsFinite(C))
+        {
+            OutError = TEXT("Surface metric measurement saw a non-finite vertex.");
+            return false;
+        }
+
+        EdgeLengthsMeters.Add(FVector::Dist(A, B) * 0.01f);
+        EdgeLengthsMeters.Add(FVector::Dist(B, C) * 0.01f);
+        EdgeLengthsMeters.Add(FVector::Dist(C, A) * 0.01f);
+
+        const FVector Cross = FVector::CrossProduct(B - A, C - A);
+        if (Cross.SizeSquared() > SMALL_NUMBER)
+        {
+            const FVector MeanVertexNormal = (
+                MeshData.Normals[IndexA]
+                + MeshData.Normals[IndexB]
+                + MeshData.Normals[IndexC]).GetSafeNormal();
+            if (ExploreMetricVectorIsFinite(MeanVertexNormal)
+                && !MeanVertexNormal.IsNearlyZero())
+            {
+                // The canonical marching-cubes table is emitted with the winding required by
+                // the runtime mesh path, while the density-gradient normals point solid-to-air.
+                // Orient the geometric face normal to that same outward convention before
+                // measuring the relief divergence; otherwise a winding convention change would
+                // report ~180 degrees for an otherwise smooth surface.
+                FVector FaceNormal = Cross.GetSafeNormal();
+                if (FVector::DotProduct(FaceNormal, MeanVertexNormal) < 0.0f)
+                {
+                    FaceNormal *= -1.0f;
+                }
+                FaceNormals[TriangleIndex] = FaceNormal;
+                ValidFaceNormals[TriangleIndex] = 1;
+                const float Dot = FMath::Clamp(
+                    FVector::DotProduct(FaceNormal, MeanVertexNormal), -1.0f, 1.0f);
+                FaceNormalDivergencesDegrees.Add(
+                    FMath::RadiansToDegrees(FMath::Acos(Dot)));
+                ++OutMetrics.NormalComparisonTriangleCount;
+            }
+        }
+
+        AddEdgeIncident(A, B, TriangleIndex);
+        AddEdgeIncident(B, C, TriangleIndex);
+        AddEdgeIncident(C, A, TriangleIndex);
+    }
+
+    for (const TPair<FExploreMeshEdgeKey, FExploreMeshEdgeIncident>& Pair : EdgeIncidents)
+    {
+        const FExploreMeshEdgeIncident& Incident = Pair.Value;
+        if (Incident.IncidentCount != 2)
+        {
+            continue;
+        }
+        ++OutMetrics.SharedEdgeCount;
+        if (!ValidFaceNormals.IsValidIndex(Incident.FirstTriangle)
+            || !ValidFaceNormals.IsValidIndex(Incident.SecondTriangle)
+            || !ValidFaceNormals[Incident.FirstTriangle]
+            || !ValidFaceNormals[Incident.SecondTriangle])
+        {
+            continue;
+        }
+        const float Dot = FMath::Clamp(
+            FVector::DotProduct(
+                FaceNormals[Incident.FirstTriangle],
+                FaceNormals[Incident.SecondTriangle]),
+            -1.0f,
+            1.0f);
+        DihedralAnglesDegrees.Add(FMath::RadiansToDegrees(FMath::Acos(Dot)));
+    }
+
+    EdgeLengthsMeters.Sort();
+    DihedralAnglesDegrees.Sort();
+    FaceNormalDivergencesDegrees.Sort();
+
+    OutMetrics.DihedralSampleCount = DihedralAnglesDegrees.Num();
+    OutMetrics.EdgeLengthP50Meters = ExploreMetricPercentile(EdgeLengthsMeters, 0.50f);
+    OutMetrics.EdgeLengthP99Meters = ExploreMetricPercentile(EdgeLengthsMeters, 0.99f);
+    OutMetrics.EdgeLengthMaxMeters = EdgeLengthsMeters.Num() > 0
+        ? EdgeLengthsMeters.Last() : 0.0f;
+    OutMetrics.DihedralP50Degrees = ExploreMetricPercentile(DihedralAnglesDegrees, 0.50f);
+    OutMetrics.DihedralP75Degrees = ExploreMetricPercentile(DihedralAnglesDegrees, 0.75f);
+    OutMetrics.DihedralP90Degrees = ExploreMetricPercentile(DihedralAnglesDegrees, 0.90f);
+    OutMetrics.DihedralP95Degrees = ExploreMetricPercentile(DihedralAnglesDegrees, 0.95f);
+    OutMetrics.DihedralP99Degrees = ExploreMetricPercentile(DihedralAnglesDegrees, 0.99f);
+    if (DihedralAnglesDegrees.Num() > 0)
+    {
+        int32 Over20 = 0;
+        int32 Over40 = 0;
+        for (const float Angle : DihedralAnglesDegrees)
+        {
+            Over20 += Angle > 20.0f ? 1 : 0;
+            Over40 += Angle > 40.0f ? 1 : 0;
+        }
+        OutMetrics.DihedralFractionOver20Degrees = static_cast<float>(Over20)
+            / static_cast<float>(DihedralAnglesDegrees.Num());
+        OutMetrics.DihedralFractionOver40Degrees = static_cast<float>(Over40)
+            / static_cast<float>(DihedralAnglesDegrees.Num());
+    }
+    OutMetrics.FaceNormalVsMeanVertexNormalP50Degrees =
+        ExploreMetricPercentile(FaceNormalDivergencesDegrees, 0.50f);
+    OutMetrics.FaceNormalVsMeanVertexNormalP90Degrees =
+        ExploreMetricPercentile(FaceNormalDivergencesDegrees, 0.90f);
+    OutError.Reset();
     return true;
 }
 
@@ -1786,6 +3062,101 @@ bool WriteObjTile(
     return true;
 }
 
+bool WriteObjMesh(
+    FArchive& Archive,
+    const FVoxelMeshData& MeshData,
+    FExploreBudget& Budget,
+    FString& OutError,
+    bool& bOutTruncated,
+    int32& OutVerticesWritten,
+    int32& OutTrianglesWritten)
+{
+    bOutTruncated = false;
+    OutVerticesWritten = 0;
+    OutTrianglesWritten = 0;
+    if (!ValidateCanonicalTile(MeshData, OutError))
+    {
+        return false;
+    }
+
+    bool bOk = true;
+    for (int32 VertexIndex = 0; VertexIndex < MeshData.Vertices.Num(); ++VertexIndex)
+    {
+        if ((VertexIndex & 255) == 0 && Budget.ShouldStop(TEXT("export-write")))
+        {
+            bOutTruncated = true;
+            return true;
+        }
+        const FVector& Vertex = MeshData.Vertices[VertexIndex];
+        bOk = bOk && WriteUtf8(Archive, FString::Printf(
+            TEXT("v %.9f %.9f %.9f\n"),
+            Vertex.X / 100.0,
+            Vertex.Y / 100.0,
+            Vertex.Z / 100.0));
+        ++OutVerticesWritten;
+    }
+    for (int32 UVIndex = 0; UVIndex < MeshData.UVs.Num(); ++UVIndex)
+    {
+        if ((UVIndex & 255) == 0 && Budget.ShouldStop(TEXT("export-write")))
+        {
+            bOutTruncated = true;
+            return true;
+        }
+        const FVector2D& UV = MeshData.UVs[UVIndex];
+        bOk = bOk && WriteUtf8(Archive, FString::Printf(
+            TEXT("vt %.9f %.9f\n"), UV.X, UV.Y));
+    }
+    for (int32 NormalIndex = 0; NormalIndex < MeshData.Normals.Num(); ++NormalIndex)
+    {
+        if ((NormalIndex & 255) == 0 && Budget.ShouldStop(TEXT("export-write")))
+        {
+            bOutTruncated = true;
+            return true;
+        }
+        const FVector& Normal = MeshData.Normals[NormalIndex];
+        bOk = bOk && WriteUtf8(Archive, FString::Printf(
+            TEXT("vn %.9f %.9f %.9f\n"), Normal.X, Normal.Y, Normal.Z));
+    }
+
+    const int32 NumTriangles = MeshData.Triangles.Num() / 3;
+    if (NumTriangles > 0)
+    {
+        bOk = bOk && WriteUtf8(Archive, TEXT("usemtl VoxelGround\n"));
+    }
+    for (int32 Triangle = 0; Triangle < NumTriangles; ++Triangle)
+    {
+        if ((Triangle & 255) == 0 && Budget.ShouldStop(TEXT("export-write")))
+        {
+            bOutTruncated = true;
+            return true;
+        }
+        const int32 Base = Triangle * 3;
+        const int32 A = MeshData.Triangles[Base];
+        const int32 B = MeshData.Triangles[Base + 1];
+        const int32 C = MeshData.Triangles[Base + 2];
+        if (A < 0 || B < 0 || C < 0
+            || A >= MeshData.Vertices.Num()
+            || B >= MeshData.Vertices.Num()
+            || C >= MeshData.Vertices.Num())
+        {
+            OutError = TEXT("Canonical aggregate mesh returned an out-of-range triangle index.");
+            return false;
+        }
+        bOk = bOk && WriteUtf8(Archive, FString::Printf(
+            TEXT("f %d/%d/%d %d/%d/%d %d/%d/%d\n"),
+            A + 1, A + 1, A + 1,
+            B + 1, B + 1, B + 1,
+            C + 1, C + 1, C + 1));
+        ++OutTrianglesWritten;
+    }
+    if (!bOk || Archive.IsError())
+    {
+        OutError = TEXT("Could not write the canonical aggregate OBJ.");
+        return false;
+    }
+    return true;
+}
+
 void WriteJsonVector(FExploreJsonWriter& Writer, const TCHAR* Key, const FVector& Value, float Scale)
 {
     Writer.WriteObjectStart(Key);
@@ -1827,6 +3198,42 @@ void WriteJsonBounds(
     Writer.WriteObjectEnd();
 }
 
+void WriteSurfaceReliefMetrics(
+    FExploreJsonWriter& Writer,
+    const FExploreMeshMetrics& Metrics)
+{
+    Writer.WriteObjectStart(TEXT("surface_relief_metrics"));
+    Writer.WriteValue(TEXT("vertex_count"), Metrics.VertexCount);
+    Writer.WriteValue(TEXT("triangle_count"), Metrics.TriangleCount);
+    Writer.WriteValue(TEXT("shared_edge_count"), Metrics.SharedEdgeCount);
+    Writer.WriteValue(TEXT("dihedral_sample_count"), Metrics.DihedralSampleCount);
+    Writer.WriteValue(TEXT("normal_comparison_triangle_count"), Metrics.NormalComparisonTriangleCount);
+    Writer.WriteValue(TEXT("vertex_weld_quantum_cm"), 0.01);
+    Writer.WriteObjectStart(TEXT("triangle_edge_length_m"));
+    Writer.WriteValue(TEXT("p50"), static_cast<double>(Metrics.EdgeLengthP50Meters));
+    Writer.WriteValue(TEXT("p99"), static_cast<double>(Metrics.EdgeLengthP99Meters));
+    Writer.WriteValue(TEXT("max"), static_cast<double>(Metrics.EdgeLengthMaxMeters));
+    Writer.WriteObjectEnd();
+    Writer.WriteObjectStart(TEXT("dihedral_angle_degrees"));
+    Writer.WriteValue(TEXT("p50"), static_cast<double>(Metrics.DihedralP50Degrees));
+    Writer.WriteValue(TEXT("p75"), static_cast<double>(Metrics.DihedralP75Degrees));
+    Writer.WriteValue(TEXT("p90"), static_cast<double>(Metrics.DihedralP90Degrees));
+    Writer.WriteValue(TEXT("p95"), static_cast<double>(Metrics.DihedralP95Degrees));
+    Writer.WriteValue(TEXT("p99"), static_cast<double>(Metrics.DihedralP99Degrees));
+    Writer.WriteValue(TEXT("fraction_over_20_degrees"),
+        static_cast<double>(Metrics.DihedralFractionOver20Degrees));
+    Writer.WriteValue(TEXT("fraction_over_40_degrees"),
+        static_cast<double>(Metrics.DihedralFractionOver40Degrees));
+    Writer.WriteObjectEnd();
+    Writer.WriteObjectStart(TEXT("face_normal_vs_mean_vertex_normal_degrees"));
+    Writer.WriteValue(TEXT("p50"),
+        static_cast<double>(Metrics.FaceNormalVsMeanVertexNormalP50Degrees));
+    Writer.WriteValue(TEXT("p90"),
+        static_cast<double>(Metrics.FaceNormalVsMeanVertexNormalP90Degrees));
+    Writer.WriteObjectEnd();
+    Writer.WriteObjectEnd();
+}
+
 FString BuildManifestJson(
     const FExploreArguments& Arguments,
     const FExploreExportOutput& Export)
@@ -1835,7 +3242,7 @@ FString BuildManifestJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 2);
+    Writer->WriteValue(TEXT("schema_version"), 3);
     Writer->WriteValue(TEXT("format"), TEXT("OBJ"));
     Writer->WriteValue(TEXT("mesh_file"), Export.MeshFileName);
     Writer->WriteValue(TEXT("mesh_positions_units"), TEXT("metres"));
@@ -1847,13 +3254,23 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("skirts"), false);
     Writer->WriteValue(TEXT("vertex_count"), Export.VertexCount);
     Writer->WriteValue(TEXT("triangle_count"), Export.TriangleCount);
+    WriteSurfaceReliefMetrics(*Writer, Export.SurfaceMetrics);
     Writer->WriteValue(TEXT("mesh_file_size_bytes"), Export.MeshFileSizeBytes);
     Writer->WriteValue(TEXT("mesh_array_bytes_sum_over_tiles"), Export.MeshArrayBytes);
     Writer->WriteValue(TEXT("canonical_mesher_tile_cells"), CHUNK_SIZE);
     Writer->WriteValue(TEXT("canonical_mesher_tile_count"), Export.MesherTileCount);
+    Writer->WriteValue(TEXT("canonical_mesher_tiles_completed"), Export.MesherTilesCompleted);
+    Writer->WriteValue(TEXT("mesh_seconds"), Export.MeshSeconds);
+    Writer->WriteValue(TEXT("truncated"), Export.bTruncated);
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
+    Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
+    if (Arguments.bSurfaceRoughnessOverride)
+    {
+        Writer->WriteValue(TEXT("surface_roughness"),
+            static_cast<double>(Arguments.SurfaceRoughness));
+    }
     WriteJsonIntVector(*Writer, TEXT("region_origin_voxels"), Export.RegionOrigin);
     WriteJsonBounds(*Writer, TEXT("region_bounds_voxels"), Export.RegionOrigin, Export.RegionSize, 0.25f);
     Writer->WriteObjectStart(TEXT("region_bounds_metres"));
@@ -1888,18 +3305,12 @@ FString BuildManifestJson(
 bool RunExport(
     const FExploreArguments& Arguments,
     FExploreWorld& World,
-    FExploreExportOutput& OutOutput)
+    const FExploreWalkOutput* SharedSampling,
+    FExploreExportOutput& OutOutput,
+    FExploreBudget& Budget)
 {
     OutOutput = FExploreExportOutput();
     OutOutput.RegionSize = Arguments.ExportSize;
-    const int32 TilesPerAxis = Arguments.ExportSize / CHUNK_SIZE;
-    OutOutput.MesherTileCount = TilesPerAxis * TilesPerAxis * TilesPerAxis;
-    const int32 TargetMiddleZ = FMath::FloorToInt(
-        0.5f * static_cast<float>(World.TargetBottomWorldZ + World.TargetTopWorldZ));
-    OutOutput.RegionOrigin = FIntVector(
-        -Arguments.ExportSize / 2,
-        -Arguments.ExportSize / 2,
-        TargetMiddleZ - Arguments.ExportSize / 2);
     OutOutput.EstimatedWorkingBytes = EstimateExportWorkingBytes(Arguments.ExportSize);
     if (OutOutput.EstimatedWorkingBytes > OutOutput.WorkingMemoryCapBytes)
     {
@@ -1911,10 +3322,20 @@ bool RunExport(
         return false;
     }
 
-    // Skirts are a tile-rendering seam aid and extend beyond a bounded export box. The mesh is
-    // still generated by the canonical mesher; disabling only that presentation option keeps the
-    // browser asset's geometry inside the manifest bounds.
-    World.Mesher->bGenerateSkirts = false;
+    FString MeshError;
+    const bool bMeshComplete = EnsureExploreMesh(
+        Arguments, World, SharedSampling, Budget, MeshError);
+    if (!bMeshComplete && !Budget.bTruncated)
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = MeshError;
+        return false;
+    }
+    OutOutput.RegionSize = World.ExploreMeshSize;
+    OutOutput.MesherTileCount = World.ExploreMeshTileCount;
+    OutOutput.MesherTilesCompleted = World.ExploreMeshTilesCompleted;
+    OutOutput.RegionOrigin = World.ExploreMeshOrigin;
+
     FString Error;
     OutOutput.MeshFileName = TEXT("geometry.obj");
     OutOutput.ManifestFileName = TEXT("manifest.json");
@@ -1933,36 +3354,35 @@ bool RunExport(
         return false;
     }
 
-    int32 VertexOffset = 0;
-    for (int32 TileZ = 0; TileZ < TilesPerAxis; ++TileZ)
+    if (!MeasureExploreMesh(World.ExploreMesh, OutOutput.SurfaceMetrics, Error))
     {
-        for (int32 TileY = 0; TileY < TilesPerAxis; ++TileY)
-        {
-            for (int32 TileX = 0; TileX < TilesPerAxis; ++TileX)
-            {
-                const FIntVector TileOrigin = OutOutput.RegionOrigin
-                    + FIntVector(TileX * CHUNK_SIZE, TileY * CHUNK_SIZE, TileZ * CHUNK_SIZE);
-                const FVoxelMeshData TileMesh = World.Mesher->GenerateMesh(
-                    TileOrigin,
-                    1,
-                    CHUNK_SIZE);
-                if (!WriteObjTile(*Archive, TileMesh, VertexOffset, Error))
-                {
-                    OutOutput.Status = TEXT("error");
-                    OutOutput.RefusalReason = Error;
-                    return false;
-                }
-                const int64 TileArrayBytes = static_cast<int64>(TileMesh.Vertices.Num()) * sizeof(FVector)
-                    + static_cast<int64>(TileMesh.Normals.Num()) * sizeof(FVector)
-                    + static_cast<int64>(TileMesh.UVs.Num()) * sizeof(FVector2D)
-                    + static_cast<int64>(TileMesh.Colors.Num()) * sizeof(FColor)
-                    + static_cast<int64>(TileMesh.Triangles.Num()) * sizeof(int32);
-                OutOutput.MeshArrayBytes += TileArrayBytes;
-                OutOutput.VertexCount += TileMesh.Vertices.Num();
-                OutOutput.TriangleCount += TileMesh.Triangles.Num() / 3;
-                VertexOffset += TileMesh.Vertices.Num();
-            }
-        }
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = Error;
+        return false;
+    }
+    OutOutput.MeshArrayBytes = static_cast<int64>(World.ExploreMesh.Vertices.Num()) * sizeof(FVector)
+        + static_cast<int64>(World.ExploreMesh.Normals.Num()) * sizeof(FVector)
+        + static_cast<int64>(World.ExploreMesh.UVs.Num()) * sizeof(FVector2D)
+        + static_cast<int64>(World.ExploreMesh.Colors.Num()) * sizeof(FColor)
+        + static_cast<int64>(World.ExploreMesh.Triangles.Num()) * sizeof(int32);
+    OutOutput.VertexCount = World.ExploreMesh.Vertices.Num();
+    OutOutput.TriangleCount = World.ExploreMesh.Triangles.Num() / 3;
+    OutOutput.MeshSeconds = World.ExploreMeshSeconds;
+    bool bObjWriteTruncated = false;
+    int32 VerticesWritten = 0;
+    int32 TrianglesWritten = 0;
+    if (!WriteObjMesh(
+            *Archive,
+            World.ExploreMesh,
+            Budget,
+            Error,
+            bObjWriteTruncated,
+            VerticesWritten,
+            TrianglesWritten))
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = Error;
+        return false;
     }
     if (Archive->IsError())
     {
@@ -1977,6 +3397,19 @@ bool RunExport(
         OutOutput.Status = TEXT("error");
         OutOutput.RefusalReason = TEXT("OBJ was written but its file size could not be read.");
         return false;
+    }
+
+    OutOutput.bTruncated = Budget.bTruncated
+        || !World.bExploreMeshComplete
+        || bObjWriteTruncated;
+    if (OutOutput.bTruncated)
+    {
+        OutOutput.VertexCount = VerticesWritten;
+        OutOutput.TriangleCount = TrianglesWritten;
+        OutOutput.Status = TEXT("truncated");
+        OutOutput.RefusalReason = !World.bExploreMeshComplete
+            ? MeshError
+            : TEXT("The wall-clock budget stopped export after writing a partial mesh.");
     }
 
     const FString ManifestJson = BuildManifestJson(Arguments, OutOutput);
@@ -2002,8 +3435,11 @@ bool RunExport(
         OutOutput.RefusalReason = TEXT("Could not write export manifest.json.");
         return false;
     }
-    OutOutput.Status = TEXT("ok");
-    return true;
+    if (!OutOutput.bTruncated)
+    {
+        OutOutput.Status = TEXT("ok");
+    }
+    return !OutOutput.bTruncated;
 }
 
 void WritePlayerDimensions(FExploreJsonWriter& Writer, const TCHAR* Key)
@@ -2029,7 +3465,7 @@ FString BuildExploreJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 2);
+    Writer->WriteValue(TEXT("schema_version"), 3);
     Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
     Writer->WriteValue(TEXT("read_only_generation"), true);
 
@@ -2037,12 +3473,19 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
+    Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
+    if (Arguments.bSurfaceRoughnessOverride)
+    {
+        Writer->WriteValue(TEXT("surface_roughness"),
+            static_cast<double>(Arguments.SurfaceRoughness));
+    }
     Writer->WriteArrayStart(TEXT("modes"));
     if (Arguments.bRender) Writer->WriteValue(TEXT("render"));
     if (Arguments.bWalk) Writer->WriteValue(TEXT("walk"));
     if (Arguments.bExport) Writer->WriteValue(TEXT("export"));
     Writer->WriteArrayEnd();
     Writer->WriteValue(TEXT("failure_focus_render"), Arguments.bFailureFocusRender);
+    Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
@@ -2051,6 +3494,41 @@ FString BuildExploreJson(
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
         *Arguments.CanonicalModes()));
+    Writer->WriteObjectEnd();
+
+    Writer->WriteObjectStart(TEXT("run"));
+    Writer->WriteValue(TEXT("budget_seconds"), Output.BudgetSeconds);
+    Writer->WriteValue(TEXT("elapsed_seconds"), Output.ElapsedSeconds);
+    Writer->WriteValue(TEXT("truncated"), Output.bTruncated);
+    Writer->WriteValue(TEXT("truncated_during"), Output.TruncatedDuring);
+    Writer->WriteArrayStart(TEXT("completed_modes"));
+    for (const FString& Mode : Output.CompletedModes)
+    {
+        Writer->WriteValue(Mode);
+    }
+    Writer->WriteArrayEnd();
+    Writer->WriteObjectEnd();
+
+    Writer->WriteObjectStart(TEXT("shared_sampling"));
+    const FVoxelStrateSampleGrid* SharedGrid = nullptr;
+    if (Arguments.bWalk || Arguments.bRender)
+    {
+        SharedGrid = &Output.Walk.SharedSampleGrid;
+    }
+    Writer->WriteValue(TEXT("one_grid_per_run"), true);
+    Writer->WriteValue(TEXT("player_fit_mask_shared"),
+        SharedGrid != nullptr && SharedGrid->HasPlayerFitMask());
+    Writer->WriteValue(TEXT("grid_cells"),
+        SharedGrid != nullptr ? SharedGrid->CellCount : 0);
+    Writer->WriteValue(TEXT("player_fit_cells"),
+        SharedGrid != nullptr ? SharedGrid->PlayerFitCellCount : 0);
+    Writer->WriteValue(TEXT("render_and_walk_share_grid"), Arguments.bRender && Arguments.bWalk);
+    Writer->WriteValue(TEXT("export_uses_grid"),
+        Arguments.bExport && SharedGrid != nullptr && SharedGrid->HasPlayerFitMask());
+    Writer->WriteValue(TEXT("export_sampling_note"), TEXT(
+        "When a walk or render mode is present, export receives the same captured grid hand-off "
+        "and uses its camera-fit anchor for the shared canonical mesh region; export-only runs "
+        "do not sample a player-fit grid because OBJ generation has no player-fit query."));
     Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("world"));
@@ -2088,6 +3566,20 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("camera_seed_policy"), Output.Render.CameraSeedPolicy);
         Writer->WriteValue(TEXT("camera_seed_count"), Output.Render.CameraSeedCount);
         Writer->WriteValue(TEXT("all_cameras_player_fit"), Output.Render.bAllCamerasPlayerFit);
+        Writer->WriteValue(TEXT("requested_viewpoint_count"), Output.Render.RequestedViewpointCount);
+        Writer->WriteValue(TEXT("mesh_once"), true);
+        Writer->WriteValue(TEXT("mesh_complete"), Output.Render.bMeshComplete);
+        Writer->WriteValue(TEXT("mesh_seconds"), Output.Render.MeshSeconds);
+        Writer->WriteValue(TEXT("mesh_acceleration_seconds"), Output.Render.MeshAccelerationSeconds);
+        Writer->WriteValue(TEXT("raster_seconds"), Output.Render.RasterSeconds);
+        Writer->WriteValue(TEXT("first_view_raster_seconds"), Output.Render.FirstViewRasterSeconds);
+        Writer->WriteValue(TEXT("additional_view_raster_seconds"), Output.Render.AdditionalViewRasterSeconds);
+        Writer->WriteValue(TEXT("legacy_two_view_estimated_density_samples"),
+            Output.Render.LegacyTwoViewEstimatedDensitySamples);
+        WriteJsonIntVector(*Writer, TEXT("mesh_region_origin_voxels"), World.ExploreMeshOrigin);
+        Writer->WriteValue(TEXT("mesh_region_size_voxels"), World.ExploreMeshSize);
+        Writer->WriteValue(TEXT("mesh_vertex_count"), World.ExploreMesh.Vertices.Num());
+        Writer->WriteValue(TEXT("mesh_triangle_count"), World.ExploreMesh.Triangles.Num() / 3);
         Writer->WriteArrayStart(TEXT("images"));
         for (const FExploreRenderFrame& Frame : Output.Render.Frames)
         {
@@ -2100,6 +3592,7 @@ FString BuildExploreJson(
             Writer->WriteValue(TEXT("hit_pixels"), Frame.HitPixels);
             Writer->WriteValue(TEXT("scale_marker_projected"), Frame.bScaleMarkerProjected);
             Writer->WriteValue(TEXT("failure_markers_projected"), Frame.bFailureMarkersProjected);
+            Writer->WriteValue(TEXT("partial"), Frame.bPartial);
             Writer->WriteValue(TEXT("scale_marker_height_m"), 1.76);
             Writer->WriteObjectEnd();
         }
@@ -2110,9 +3603,8 @@ FString BuildExploreJson(
     if (Arguments.bWalk)
     {
         const FVoxelPlayerFitWalkReport& Report = Output.Walk.Report;
-        // The primary report is the mouth-sized arrival/departure window.  Origin reachability is
-        // a separate, explicitly origin-inclusive measurement; expose that report at the legacy
-        // top-level keys so a sweep cannot accidentally count a window that omitted (0,0).
+        // The primary report and origin observation are views over the one captured grid. There
+        // is no second origin-inclusive sampling pass in this run.
         const FVoxelPlayerFitWalkReport& OriginReport = Output.Walk.bOriginCheckAvailable
             ? Output.Walk.OriginCheckReport : Report;
         Writer->WriteObjectStart(TEXT("walk"));
@@ -2309,6 +3801,10 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("mesh_file_size_bytes"), Output.Export.MeshFileSizeBytes);
         Writer->WriteValue(TEXT("vertex_count"), Output.Export.VertexCount);
         Writer->WriteValue(TEXT("triangle_count"), Output.Export.TriangleCount);
+        WriteSurfaceReliefMetrics(*Writer, Output.Export.SurfaceMetrics);
+        Writer->WriteValue(TEXT("mesh_seconds"), Output.Export.MeshSeconds);
+        Writer->WriteValue(TEXT("truncated"), Output.Export.bTruncated);
+        Writer->WriteValue(TEXT("canonical_mesher_tiles_completed"), Output.Export.MesherTilesCompleted);
         Writer->WriteObjectEnd();
     }
 
@@ -2351,6 +3847,10 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         return 1;
     }
 
+    FExploreBudget Budget(
+        MainStartSeconds,
+        static_cast<double>(Arguments.BudgetMinutes) * 60.0);
+
     const double SetupStartSeconds = FPlatformTime::Seconds();
     FExploreWorld World;
     if (!World.Build(Arguments, Error))
@@ -2361,19 +3861,29 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
 
     FExploreRunOutput Output;
+    if (Budget.ShouldStop(TEXT("setup")))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelForgeExplore] setup consumed the wall-clock budget; no mode was started."));
+    }
     bool bRequestedModeFailed = false;
     FExploreWalkOutput RenderSeedWalk;
     const FExploreWalkOutput* CameraSeedWalk = nullptr;
     if (Arguments.bWalk)
     {
         const double Start = FPlatformTime::Seconds();
-        if (!RunWalk(Arguments, World, Output.Walk))
+        const bool bWalkOk = RunWalk(Arguments, World, Output.Walk, Budget);
+        if (!bWalkOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] walk %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Walk.Status);
         CameraSeedWalk = &Output.Walk;
+        if (bWalkOk && !Budget.bTruncated)
+        {
+            Budget.CompleteMode(TEXT("walk"));
+        }
     }
     else if (Arguments.bRender)
     {
@@ -2381,30 +3891,55 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         // same focused walk as a private seed pass; it is intentionally omitted from the render-only
         // JSON so the selected mode remains render.
         const double Start = FPlatformTime::Seconds();
-        if (!RunWalk(Arguments, World, RenderSeedWalk))
+        const bool bWalkOk = RunWalk(Arguments, World, RenderSeedWalk, Budget);
+        if (!bWalkOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render camera seed walk %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *RenderSeedWalk.Status);
         CameraSeedWalk = &RenderSeedWalk;
+        // Keep the private render seed capture available to the run-level shared-grid report;
+        // the walk object is still omitted from the public JSON when walk was not requested.
+        Output.Walk = MoveTemp(RenderSeedWalk);
+        CameraSeedWalk = &Output.Walk;
     }
     if (Arguments.bRender)
     {
         const double Start = FPlatformTime::Seconds();
-        if (CameraSeedWalk == nullptr || !RunRender(Arguments, World, *CameraSeedWalk, Output.Render))
+        bool bRenderOk = false;
+        if (!Budget.bTruncated && CameraSeedWalk != nullptr)
+        {
+            bRenderOk = RunRender(
+                Arguments, World, *CameraSeedWalk, Output.Render, Budget);
+        }
+        if (!bRenderOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
+        }
+        if (Budget.bTruncated && Output.Render.Status.IsEmpty())
+        {
+            Output.Render.Status = TEXT("truncated");
+            Output.Render.bTruncated = true;
+            Output.Render.RefusalReason = TEXT("The wall-clock budget stopped before rendering.");
+        }
+        if (bRenderOk && !Budget.bTruncated)
+        {
+            Budget.CompleteMode(TEXT("render"));
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Render.Status);
     }
-    if (Arguments.bFailureFocusRender && Arguments.bRender && Arguments.bWalk)
+    if (Arguments.bFailureFocusRender && Arguments.bRender && Arguments.bWalk
+        && !Budget.bTruncated)
     {
         const double Start = FPlatformTime::Seconds();
-        if (!RunFailureBoundaryRender(Arguments, World, Output.Walk, Output.Render))
+        if (!RunFailureBoundaryRender(Arguments, World, Output.Walk, Output.Render, Budget))
         {
-            bRequestedModeFailed = true;
+            if (!Budget.bTruncated)
+            {
+                bRequestedModeFailed = true;
+            }
             UE_LOG(LogTemp, Error,
                 TEXT("[VoxelForgeExplore] failure-focus render could not produce a boundary image."));
         }
@@ -2417,13 +3952,48 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
     if (Arguments.bExport)
     {
         const double Start = FPlatformTime::Seconds();
-        if (!RunExport(Arguments, World, Output.Export))
+        const bool bExportOk = !Budget.bTruncated
+            && RunExport(Arguments, World, CameraSeedWalk, Output.Export, Budget);
+        if (!bExportOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
+        }
+        if (Budget.bTruncated && Output.Export.Status.IsEmpty())
+        {
+            Output.Export.Status = TEXT("truncated");
+            Output.Export.bTruncated = true;
+            Output.Export.RefusalReason = TEXT("The wall-clock budget stopped before export.");
+        }
+        if (bExportOk && !Budget.bTruncated)
+        {
+            Budget.CompleteMode(TEXT("export"));
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] export %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Export.Status);
     }
+
+    // A phase can finish just inside its own check and cross the deadline while its artifact is
+    // being closed. Mark that state before serialising the report so the JSON never claims a full
+    // run after the budget has actually expired.
+    Budget.ShouldStop(TEXT("report"));
+    if (Budget.bTruncated)
+    {
+        if (Arguments.bWalk && Output.Walk.Status.IsEmpty())
+        {
+            Output.Walk.Status = TEXT("truncated");
+            Output.Walk.RefusalReason = TEXT("The wall-clock budget stopped before walk completion.");
+        }
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelForgeExplore] truncated during %s after %.3fs; completed modes=%s"),
+            *Budget.TruncatedDuring,
+            Budget.ElapsedSeconds(),
+            *FString::Join(Budget.CompletedModes, TEXT(",")));
+    }
+    Output.BudgetSeconds = Budget.LimitSeconds;
+    Output.ElapsedSeconds = FPlatformTime::Seconds() - MainStartSeconds;
+    Output.bTruncated = Budget.bTruncated;
+    Output.TruncatedDuring = Budget.TruncatedDuring;
+    Output.CompletedModes = Budget.CompletedModes;
 
     // Build the payload twice before adding the assertion itself. This is deliberately a string
     // comparison over a fixed-order writer, not a TMap/pretty-printer whose key order could drift.

@@ -455,6 +455,8 @@ namespace VoxelStrateMeasurePrivate
         // only when it explicitly requested a capture.
         Destination.Air = MoveTemp(Source.Air);
         Destination.Density = MoveTemp(Source.Density);
+        Destination.PlayerFitMask.Reset();
+        Destination.PlayerFitCellCount = 0;
     }
 
     void DecodeIndex(const FSampleGrid& Grid, int32 Index, int32& OutX, int32& OutY, int32& OutZ)
@@ -1374,6 +1376,37 @@ namespace VoxelStrateMeasurePrivate
             ? 0.0f : static_cast<float>(MinimumDistance);
     }
 
+    int64 CountAirCells(
+        const FSampleGrid& Grid,
+        const TArray<uint8>* EligibilityMask = nullptr)
+    {
+        TArray<int64> AirCountsByZ;
+        AirCountsByZ.Init(0, Grid.NumZ);
+        ParallelFor(Grid.NumZ, [&](int32 Z)
+        {
+            int64 Count = 0;
+            for (int32 Y = 0; Y < Grid.NumY; ++Y)
+            {
+                for (int32 X = 0; X < Grid.NumX; ++X)
+                {
+                    const int32 Cell = Grid.Index(X, Y, Z);
+                    Count += Grid.Air[Cell] != 0u
+                        && (EligibilityMask == nullptr || (*EligibilityMask)[Cell] != 0u)
+                        ? 1
+                        : 0;
+                }
+            }
+            AirCountsByZ[Z] = Count;
+        });
+
+        int64 Total = 0;
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        {
+            Total += AirCountsByZ[Z];
+        }
+        return Total;
+    }
+
     void BuildPlayerFitMetrics(
         const FSampleGrid& Grid,
         const FVoxelStrateMeasureSettings& Settings,
@@ -1453,10 +1486,7 @@ namespace VoxelStrateMeasurePrivate
         OutMetrics.SampledMinY = Grid.MinY;
         OutMetrics.SampledMaxY = Grid.MaxY;
         OutMetrics.NumSampled = Grid.CellCount;
-        for (const uint8 bAir : Grid.Air)
-        {
-            OutMetrics.NumAir += bAir != 0u ? 1 : 0;
-        }
+        OutMetrics.NumAir = CountAirCells(Grid);
         OutMetrics.NumSolid = static_cast<int64>(Grid.CellCount) - OutMetrics.NumAir;
         OutMetrics.AirFraction = OutMetrics.NumSampled > 0
             ? static_cast<float>(static_cast<double>(OutMetrics.NumAir)
@@ -1487,11 +1517,7 @@ namespace VoxelStrateMeasurePrivate
         TArray<int32> Components;
         int32 NumComponents = 0;
 
-        int64 NumAir = 0;
-        for (const uint8 bAir : Grid.Air)
-        {
-            NumAir += bAir != 0u ? 1 : 0;
-        }
+        const int64 NumAir = CountAirCells(Grid);
 
         int64 LargestComponentCells = 0;
         int32 LargestComponentLowestCell = INDEX_NONE;
@@ -1537,8 +1563,21 @@ namespace VoxelStrateMeasurePrivate
         TArray<uint8> WalkableColumns;
         WalkableColumns.Init(0u, static_cast<int32>(XYColumnCount64));
 
-        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        // Candidate poses read only the immutable sampled field. Keep every worker's clearance
+        // values and compact column flags private, then merge by fixed Z order so the median and
+        // projected surface graph remain deterministic.
+        TArray<int64> WalkableCountsByZ;
+        WalkableCountsByZ.Init(0, Grid.NumZ);
+        TArray<TArray<int32>> ClearanceValuesByZ;
+        ClearanceValuesByZ.SetNum(Grid.NumZ);
+        TArray<TArray<uint8>> WalkableColumnsByZ;
+        WalkableColumnsByZ.SetNum(Grid.NumZ);
+        ParallelFor(Grid.NumZ, [&](int32 Z)
         {
+            TArray<int32>& SliceClearanceValues = ClearanceValuesByZ[Z];
+            TArray<uint8>& SliceWalkableColumns = WalkableColumnsByZ[Z];
+            SliceWalkableColumns.Init(0u, static_cast<int32>(XYColumnCount64));
+            int64 SliceWalkableCount = 0;
             for (int32 Y = 0; Y < Grid.NumY; ++Y)
             {
                 for (int32 X = 0; X < Grid.NumX; ++X)
@@ -1563,8 +1602,8 @@ namespace VoxelStrateMeasurePrivate
                     }
                     if (!bHasHeadroom) continue;
 
-                    ++NumWalkable;
-                    WalkableColumns[X + Grid.NumX * Y] = 1u;
+                    ++SliceWalkableCount;
+                    SliceWalkableColumns[X + Grid.NumX * Y] = 1u;
                     int32 ClearanceCells = 0;
                     while (static_cast<int64>(Z) + ClearanceCells < Grid.NumZ
                         && Grid.Air[Grid.Index(X, Y, Z + ClearanceCells)] != 0u)
@@ -1573,10 +1612,25 @@ namespace VoxelStrateMeasurePrivate
                     }
                     const int64 ClearanceVoxels = static_cast<int64>(ClearanceCells)
                         * Settings.SampleStep;
-                    ClearanceValues.Add(ClearanceVoxels > INT32_MAX
+                    SliceClearanceValues.Add(ClearanceVoxels > INT32_MAX
                         ? INT32_MAX : static_cast<int32>(ClearanceVoxels));
                 }
             }
+            WalkableCountsByZ[Z] = SliceWalkableCount;
+        });
+
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
+        {
+            NumWalkable += WalkableCountsByZ[Z];
+            const TArray<uint8>& SliceWalkableColumns = WalkableColumnsByZ[Z];
+            for (int32 Column = 0; Column < SliceWalkableColumns.Num(); ++Column)
+            {
+                if (SliceWalkableColumns[Column] != 0u)
+                {
+                    WalkableColumns[Column] = 1u;
+                }
+            }
+            ClearanceValues.Append(ClearanceValuesByZ[Z]);
         }
 
         InOutMetrics.WalkableFraction = NumAir > 0
@@ -1654,15 +1708,29 @@ namespace VoxelStrateMeasurePrivate
             TArray<int32> Distances;
             BuildManhattanDistanceToSolid(Grid, Distances);
 
+            TArray<TArray<float>> FeatureScalesByZ;
+            FeatureScalesByZ.SetNum(Grid.NumZ);
+            ParallelFor(Grid.NumZ, [&](int32 Z)
+            {
+                TArray<float>& SliceFeatureScales = FeatureScalesByZ[Z];
+                for (int32 Y = 0; Y < Grid.NumY; ++Y)
+                {
+                    for (int32 X = 0; X < Grid.NumX; ++X)
+                    {
+                        const int32 Index = Grid.Index(X, Y, Z);
+                        if (Grid.Air[Index] != 0u)
+                        {
+                            SliceFeatureScales.Add(static_cast<float>(Distances[Index])
+                                * static_cast<float>(Settings.SampleStep));
+                        }
+                    }
+                }
+            });
             TArray<float> FeatureScales;
             FeatureScales.Reserve(static_cast<int32>(NumAir));
-            for (int32 Index = 0; Index < Grid.CellCount; ++Index)
+            for (int32 Z = 0; Z < Grid.NumZ; ++Z)
             {
-                if (Grid.Air[Index] != 0u)
-                {
-                    FeatureScales.Add(static_cast<float>(Distances[Index])
-                        * static_cast<float>(Settings.SampleStep));
-                }
+                FeatureScales.Append(FeatureScalesByZ[Z]);
             }
             InOutMetrics.MedianFeatureScale = MedianFloat(FeatureScales);
         }
@@ -2220,13 +2288,7 @@ namespace VoxelStrateMeasurePrivate
         int64 LargestComponentCells = 0;
         int32 LargestComponentLowestCell = INDEX_NONE;
         int32 NumComponentsAtLeast1Pct = 0;
-        int64 NumAir = 0;
-        for (int32 Index = 0; Index < Grid.CellCount; ++Index)
-        {
-            NumAir += Grid.Air[Index] != 0u
-                && (EligibilityMask == nullptr || (*EligibilityMask)[Index] != 0u)
-                ? 1 : 0;
-        }
+        const int64 NumAir = CountAirCells(Grid, EligibilityMask);
         FloodFillAir(
             Grid,
             Components,
@@ -2284,10 +2346,16 @@ namespace VoxelStrateMeasurePrivate
             OutDiagnostics.StartComponentCells == LargestComponentCells;
         OutDiagnostics.bGoalComponentIsLargest =
             OutDiagnostics.GoalComponentCells == LargestComponentCells;
-        OutDiagnostics.StartToGoalComponentDistanceCells = DistanceToComponent(
-            Grid, Start, GoalComponent, Components);
-        OutDiagnostics.GoalToStartComponentDistanceCells = DistanceToComponent(
-            Grid, Goal, StartComponent, Components);
+        TArray<float> ComponentDistances;
+        ComponentDistances.Init(0.0f, 2);
+        ParallelFor(2, [&](int32 DistanceIndex)
+        {
+            ComponentDistances[DistanceIndex] = DistanceIndex == 0
+                ? DistanceToComponent(Grid, Start, GoalComponent, Components)
+                : DistanceToComponent(Grid, Goal, StartComponent, Components);
+        });
+        OutDiagnostics.StartToGoalComponentDistanceCells = ComponentDistances[0];
+        OutDiagnostics.GoalToStartComponentDistanceCells = ComponentDistances[1];
     }
 
     EVoxelConnectivityResult QueryConnectivity(
@@ -2702,7 +2770,12 @@ FVoxelStrateMetrics VF_MeasureStrate(
     Result.SampledMaxX = Grid.MaxX;
     Result.SampledMinY = Grid.MinY;
     Result.SampledMaxY = Grid.MaxY;
-    VoxelStrateMeasurePrivate::BuildMetricsFromGrid(Grid, Settings, Result);
+    TArray<uint8> PlayerFitMask;
+    VoxelStrateMeasurePrivate::BuildMetricsFromGrid(
+        Grid,
+        Settings,
+        Result,
+        OutSampleGrid != nullptr ? &PlayerFitMask : nullptr);
     Result.bValid = Result.NumSampled > 0;
     if (!Result.bValid)
     {
@@ -2711,6 +2784,8 @@ FVoxelStrateMetrics VF_MeasureStrate(
     if (OutSampleGrid != nullptr && Result.bValid)
     {
         VoxelStrateMeasurePrivate::ExportSampleGrid(Grid, *OutSampleGrid);
+        OutSampleGrid->PlayerFitMask = MoveTemp(PlayerFitMask);
+        OutSampleGrid->PlayerFitCellCount = Result.NumPlayerFitCells;
     }
     return Result;
 }
@@ -2748,7 +2823,12 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     Result.SampledMaxX = Grid.MaxX;
     Result.SampledMinY = Grid.MinY;
     Result.SampledMaxY = Grid.MaxY;
-    VoxelStrateMeasurePrivate::BuildMetricsFromGrid(Grid, Settings, Result);
+    TArray<uint8> PlayerFitMask;
+    VoxelStrateMeasurePrivate::BuildMetricsFromGrid(
+        Grid,
+        Settings,
+        Result,
+        OutSampleGrid != nullptr ? &PlayerFitMask : nullptr);
     Result.bValid = Result.NumSampled > 0;
     if (!Result.bValid)
     {
@@ -2757,6 +2837,8 @@ FVoxelStrateMetrics VF_MeasureStrateWithSampler(
     if (OutSampleGrid != nullptr && Result.bValid)
     {
         VoxelStrateMeasurePrivate::ExportSampleGrid(Grid, *OutSampleGrid);
+        OutSampleGrid->PlayerFitMask = MoveTemp(PlayerFitMask);
+        OutSampleGrid->PlayerFitCellCount = Result.NumPlayerFitCells;
     }
     return Result;
 }
@@ -2951,11 +3033,16 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
     FVoxelPlayerFitWalkReport& OutReport,
-    const TArray<FVector>* ComponentProbePoints)
+    const TArray<FVector>* ComponentProbePoints,
+    FVoxelStrateSampleGrid* OutSampleGrid)
 {
     using namespace VoxelStrateMeasurePrivate;
 
     OutReport = FVoxelPlayerFitWalkReport();
+    if (OutSampleGrid != nullptr)
+    {
+        *OutSampleGrid = FVoxelStrateSampleGrid();
+    }
     OutReport.CapsuleRadiusMeters = Settings.PlayerCapsuleRadiusVoxels
         * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
     OutReport.CapsuleWidthMeters = 2.0f * OutReport.CapsuleRadiusMeters;
@@ -3270,6 +3357,13 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     else
     {
         OutReport.RefusalReason = Diagnostics.RefusalReason;
+    }
+
+    if (OutSampleGrid != nullptr)
+    {
+        ExportSampleGrid(Grid, *OutSampleGrid);
+        OutSampleGrid->PlayerFitMask = MoveTemp(PlayerFitMask);
+        OutSampleGrid->PlayerFitCellCount = NumPlayerFitCells;
     }
     return true;
 }

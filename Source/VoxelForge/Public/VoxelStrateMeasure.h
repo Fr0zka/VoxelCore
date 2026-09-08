@@ -142,6 +142,12 @@ struct VOXELFORGE_API FVoxelStrateSampleGrid
     // empty on legacy/binary-only callers. This is never used by generation.
     TArray<float> Density;
 
+    // 1 = the exact player-fit pose predicate accepted this cell, 0 = rejected. This is
+    // populated when a player-fit walk explicitly captures its shared grid. It is kept beside
+    // Air so render, walk, and diagnostics can consume one sampled field and one fit mask.
+    TArray<uint8> PlayerFitMask;
+    int64 PlayerFitCellCount = 0;
+
     FORCEINLINE int32 Index(int32 X, int32 Y, int32 Z) const
     {
         return static_cast<int32>(
@@ -162,6 +168,19 @@ struct VOXELFORGE_API FVoxelStrateSampleGrid
     bool HasScalarDensity() const
     {
         return IsValid() && Density.Num() == CellCount;
+    }
+
+    bool HasPlayerFitMask() const
+    {
+        return IsValid() && PlayerFitMask.Num() == CellCount;
+    }
+
+    bool ContainsPoint(const FVector& Point) const
+    {
+        return IsValid()
+            && Point.X >= MinX && Point.X < MaxX
+            && Point.Y >= MinY && Point.Y < MaxY
+            && Point.Z >= MinZ && Point.Z < MaxZ;
     }
 };
 
@@ -510,4 +529,5 @@ VOXELFORGE_API bool VF_MeasurePlayerFitWalkWithSampler(
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings,
     FVoxelPlayerFitWalkReport& OutReport,
-    const TArray<FVector>* ComponentProbePoints = nullptr);
+    const TArray<FVector>* ComponentProbePoints = nullptr,
+    FVoxelStrateSampleGrid* OutSampleGrid = nullptr);

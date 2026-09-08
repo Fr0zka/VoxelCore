@@ -397,20 +397,23 @@ No UObject state, cache, actor, world, or PIE is required.
 | Symbol | Role |
 |--------|------|
 | `FVoxelStrateMeasureSettings` / `FVoxelStrateMetrics` | Plain settings/result structs for bounded strate sampling and derived measurements; callers may override the interior margin (including zero to sample the seal) or fit the XY window to two points with a margin, and results identify the resolved window/dimensions/Z range, deterministic air-component facts, walkable floor-area columns/fraction, projected surface components/share, and median clearance. |
-| `FVoxelStrateSampleGrid` | Optional one-pass `density > 0` `Air` polarity plus exact scalar `Density` capture exported by measurement functions; bounded by `MaxCells`, consumed by editor/automation previews, never retained on ordinary metrics calls. |
+| `FVoxelStrateSampleGrid` | Optional one-pass `density > 0` `Air` polarity plus exact scalar `Density` capture; player-fit walks may also export the exact `PlayerFitMask` and count. Bounded by `MaxCells`, shared by explorer render/walk/export, and never retained on ordinary metrics calls. |
 | `VF_MeasureStrate` | One-grid/one-flood-fill strate metrics; resolves either the legacy centered square or the two-point fitted AABB, and refuses invalid bounds or a grid over `MaxCells`. |
 | `VF_AreConnected` | Coarse 6-connected BFS plus deterministic blocked-edge retries, with a full-resolution air recheck for every candidate route and explicit endpoint-solid, out-of-window, `NotConnectedAtThisResolution`, `CoarseLiedBudgetExhausted` (unknown), and connected outcomes; diagnostics include endpoint component facts and the retry count from that same grid. |
 | `VF_DiagnoseConnectivity` | The same query plus each mouth's air-component size/share and exact geometric distance to the nearest cell of the other component; proximity is measured in coarse-cell coordinates and does not claim a route through solid. |
-| `FVoxelPlayerFitWalkReport` / `VF_MeasurePlayerFitWalkWithSampler` | Editor-only experiential instrument over the existing exact `VF_` capsule/floor-fit mask: deterministic graph-walk distance, dead ends, reachable fit volume, and a labelled narrow-gap proxy; no second movement model. |
+| `FVoxelPlayerFitWalkReport` / `VF_MeasurePlayerFitWalkWithSampler` | Editor-only experiential instrument over the existing exact `VF_` capsule/floor-fit mask: deterministic graph-walk distance, dead ends, reachable fit volume, and a labelled narrow-gap proxy; optionally exports the one sampled grid/mask for other explorer consumers; no second movement model. |
 
 `VoxelForgeExploreCommandlet` builds a transient, fixed-definition world and calls the production
-`UVoxelGenerator::GetDensityAt` and `UVoxelMarchingCubesMesher::GenerateMesh` paths. `render` uses
-fixed density samples (default 0.25 voxel) with bisection at sign crossings instead of sphere tracing;
-`walk` uses `VF_MeasurePlayerFitWalkWithSampler`; `export` calls the canonical 32³ mesher in a
-deterministic tile grid (four tiles per axis for the 128³ default), streams only its returned tile
-arrays into metre-space OBJ plus `manifest.json` (canonical UVs remain voxel-space), and never retains the full region mesh. Output JSON/manifest are emitted by fixed-order writers and compared with a second
-serialization before it is written. The commandlet keeps `WorldRadiusVoxels=0`, does not touch an
-authored asset or diff layer, and refuses bounded-grid/export requests before allocating them.
+`UVoxelGenerator::GetDensityAt` and `UVoxelMarchingCubesMesher::GenerateMesh` paths. `walk` (or the
+private seed walk used by render-only runs) captures one exact sampled grid and player-fit mask;
+render and export reuse that hand-off. `render` calls the canonical 32³ mesher in a deterministic
+tile grid (four tiles per axis for the 128³ default), merges the region once, builds a deterministic
+CPU BVH, and rasterises eight viewpoints from the mesh without per-pixel density calls. `export`
+uses that same canonical aggregate for metre-space OBJ plus `manifest.json` (canonical UVs remain
+voxel-space). Output JSON/manifest are emitted by fixed-order writers and compared with a second
+serialization before they are written. The commandlet keeps `WorldRadiusVoxels=0`, does not touch an
+authored asset or diff layer, and enforces the default 25-minute / maximum 30-minute wall-clock
+budget, reporting partial artifacts and completed modes on truncation.
 
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`
 Header is rich with inline docs. Two namespaces + a per-chunk cache system.

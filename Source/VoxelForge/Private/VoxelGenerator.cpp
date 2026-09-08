@@ -477,6 +477,41 @@ namespace
     };
 
     static thread_local FTunnelCoreCacheState GTunnelCoreCache;
+
+    // A mesher tile samples an expanded grid (-1..Cells+1), so one worker visits several exact
+    // chunk coordinates even while it is generating one tile. The old CP_* cache retained only
+    // the last coordinate and consequently rebuilt the whole TunnelNetwork stack whenever the
+    // sampling cursor crossed a chunk boundary. Keep a deterministic direct-mapped set of states
+    // instead: collisions only cause a safe rebuild, never a stale read or an order-dependent
+    // result. Native TunnelNetwork/Underwater states are immutable after construction; the active
+    // pointer below lets the hot sample path read the stored stack and tunnel-core cache without
+    // moving them on every voxel.
+    constexpr int32 TunnelDensityCacheSlotCount = 128;
+
+    struct FTunnelNetworkDensityCacheEntry
+    {
+        bool bValid = false;
+        uint64 OwnerId = 0;
+        FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+        uint32 LayoutVersion = 0xFFFFFFFFu;
+        ECaveGeneratorType GenType = ECaveGeneratorType::TunnelNetwork;
+        FStrateGenerationParams Tunnel;
+        uint32 TunnelFingerprint = 0xFFFFFFFFu;
+        FStrateDisturbanceParams Disturbance;
+        bool bUseOpStack = false;
+        FVoxelOpStack OpStack;
+        FTunnelCoreCacheState TunnelCore;
+    };
+
+    FORCEINLINE int32 TunnelDensityCacheSlot(const FIntVector& Chunk)
+    {
+        uint32 Hash = static_cast<uint32>(Chunk.X) * 0x9E3779B9u;
+        Hash ^= static_cast<uint32>(Chunk.Y) * 0x85EBCA6Bu;
+        Hash ^= static_cast<uint32>(Chunk.Z) * 0xC2B2AE35u;
+        Hash ^= Hash >> 16;
+        return static_cast<int32>(Hash & (TunnelDensityCacheSlotCount - 1));
+    }
+
     void PrepareTunnelCoreCache(
         const UVoxelStrateManager& Manager,
         const FIntVector& ChunkCoord,
@@ -702,7 +737,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         FMath::FloorToInt(WorldZ / CHUNK_SIZE)
     );
 
-    if (StrateManager && StrateManager->IsGapChunk(ChunkCoord))
+    const bool bIsGapChunk = StrateManager && StrateManager->IsGapChunk(ChunkCoord);
+
+    if (StrateManager && bIsGapChunk)
     {
         // SOLID BEDROCK gap between two strates. The auto-carved passages still tunnel
         // through it, but the (0,0) descent stays solid here so the player digs the gap
@@ -762,6 +799,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
+        thread_local FTunnelNetworkDensityCacheEntry CP_TunnelDensityCache[TunnelDensityCacheSlotCount];
+        thread_local FTunnelNetworkDensityCacheEntry* CP_ActiveTunnelDensityCache = nullptr;
         // Cooked-season recipes and editor candidate recipes share this immutable worker-local
         // hand-off. Recipe materialisation is runtime; rolling/selection remains editor-only.
         thread_local bool                       CP_UseCustomRecipe = false;
@@ -778,9 +817,50 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 #endif
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
-        const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
-        if (bOwnerChanged || ChunkCoord != CP_Chunk || LayoutVersion != CP_Version)
+        FVoxelOpStack* ActiveOpStack = &CP_OpStack;
+        FTunnelCoreCacheState* ActiveTunnelCoreCache = &GTunnelCoreCache;
+        bool bLoadedTunnelDensityCache = false;
+
+        if (!bIsGapChunk)
         {
+            FTunnelNetworkDensityCacheEntry& CachedEntry =
+                CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
+            const bool bCacheKeyMatches = CachedEntry.bValid
+                && CachedEntry.OwnerId == DensityCacheOwnerId
+                && CachedEntry.Chunk == ChunkCoord
+                && CachedEntry.LayoutVersion == LayoutVersion
+                && (CachedEntry.GenType == ECaveGeneratorType::TunnelNetwork
+                    || CachedEntry.GenType == ECaveGeneratorType::Underwater);
+            if (bCacheKeyMatches)
+            {
+                if (CP_ActiveTunnelDensityCache != &CachedEntry)
+                {
+                    CP_OwnerId = CachedEntry.OwnerId;
+                    CP_Version = CachedEntry.LayoutVersion;
+                    CP_Chunk = CachedEntry.Chunk;
+                    CP_GenType = CachedEntry.GenType;
+                    CP_Tunnel = CachedEntry.Tunnel;
+                    CP_TunnelFP = CachedEntry.TunnelFingerprint;
+                    CP_Dist = CachedEntry.Disturbance;
+                    CP_UseOpStack = CachedEntry.bUseOpStack;
+                    CP_UseCustomRecipe = false;
+#if WITH_EDITOR
+                    CP_UseComposerRegions = false;
+#endif
+                    CP_ActiveTunnelDensityCache = &CachedEntry;
+                }
+                ActiveOpStack = &CachedEntry.OpStack;
+                ActiveTunnelCoreCache = &CachedEntry.TunnelCore;
+                bLoadedTunnelDensityCache = true;
+            }
+        }
+
+        const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
+        if (!bLoadedTunnelDensityCache
+            && (bOwnerChanged || ChunkCoord != CP_Chunk || LayoutVersion != CP_Version))
+        {
+            CP_ActiveTunnelDensityCache = nullptr;
+
             // La grille de biome est validée par une BOÎTE XY, qui ne dit rien du FBiomeContext
             // ayant servi à classer ses cellules : sur un changement de version elle est périmée
             // même si la boîte couvre encore la requête. Même invalidation quand le propriétaire
@@ -976,6 +1056,43 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     }
                 }
             }
+
+            const bool bNativeTunnelCacheCandidate = !CP_UseCustomRecipe
+                && (CP_GenType == ECaveGeneratorType::TunnelNetwork
+                    || CP_GenType == ECaveGeneratorType::Underwater);
+#if WITH_EDITOR
+            const bool bCanStoreTunnelDensityCache = bNativeTunnelCacheCandidate
+                && !CP_UseComposerRegions;
+#else
+            const bool bCanStoreTunnelDensityCache = bNativeTunnelCacheCandidate;
+#endif
+            if (!bLoadedTunnelDensityCache && bCanStoreTunnelDensityCache)
+            {
+                FTunnelNetworkDensityCacheEntry& CachedEntry =
+                    CP_TunnelDensityCache[TunnelDensityCacheSlot(ChunkCoord)];
+                CachedEntry.bValid = false;
+                CachedEntry.OwnerId = DensityCacheOwnerId;
+                CachedEntry.Chunk = ChunkCoord;
+                CachedEntry.LayoutVersion = LayoutVersion;
+                CachedEntry.GenType = CP_GenType;
+                CachedEntry.Tunnel = CP_Tunnel;
+                CachedEntry.TunnelFingerprint = CP_TunnelFP;
+                CachedEntry.Disturbance = CP_Dist;
+                CachedEntry.bUseOpStack = CP_UseOpStack;
+                CachedEntry.OpStack = MoveTemp(CP_OpStack);
+                CachedEntry.TunnelCore = MoveTemp(GTunnelCoreCache);
+                GTunnelCoreCache = FTunnelCoreCacheState();
+                CachedEntry.bValid = true;
+                CP_ActiveTunnelDensityCache = &CachedEntry;
+                ActiveOpStack = &CachedEntry.OpStack;
+                ActiveTunnelCoreCache = &CachedEntry.TunnelCore;
+            }
+            else if (!bLoadedTunnelDensityCache)
+            {
+                ActiveOpStack = &CP_OpStack;
+                ActiveTunnelCoreCache = &GTunnelCoreCache;
+            }
+
         }
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
@@ -983,7 +1100,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // de diff qui suivent ne voient aucune différence.
         if (CP_UseOpStack)
         {
-            Result = CP_OpStack.EvalMC(WorldX, WorldY, WorldZ);
+            Result = ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
         }
         else switch (CP_GenType)
         {
@@ -1153,11 +1270,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
         // never once per voxel.
-        if (GTunnelCoreCache.bValid)
+        if (ActiveTunnelCoreCache->bValid)
         {
             const bool bTunnelSupportFloor =
                 VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-                    WorldX, WorldY, WorldZ, GTunnelCoreCache.Cache);
+                    WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache);
             if (bTunnelSupportFloor)
             {
                 Result = FMath::Min(
@@ -1165,7 +1282,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
             }
             const float CoreSDF = VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
-                WorldX, WorldY, WorldZ, GTunnelCoreCache.Cache);
+                WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache);
             if (!bTunnelSupportFloor
                 && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
             {
