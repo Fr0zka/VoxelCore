@@ -6,6 +6,7 @@
 #include "Containers/StringConv.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/PlatformTLS.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Misc/CommandLine.h"
@@ -210,6 +211,10 @@ struct FExploreArguments
     float RenderMaxDistanceVoxels = DefaultRenderMaxDistanceVoxels;
     int32 ExportSize = DefaultExportSize;
     int32 ExportStep = DefaultExportStep;
+    // The canonical export owns one immutable lattice for the whole run.  Batch cases can pass
+    // density_grid_reuse=false to produce a matched wall-clock control.
+    bool bReuseDensityGrid = true;
+    int32 MeshMinBatchSize = 1;
     int32 MaxWalkCells = DefaultMaxWalkCells;
     float BudgetMinutes = DefaultBudgetMinutes;
     bool bSurfaceRoughnessOverride = false;
@@ -267,6 +272,11 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("rendermaxdistance="), OutArguments.RenderMaxDistanceVoxels);
     FParse::Value(*Params, TEXT("exportsize="), OutArguments.ExportSize);
     FParse::Value(*Params, TEXT("exportstep="), OutArguments.ExportStep);
+    int32 DensityGridReuse = OutArguments.bReuseDensityGrid ? 1 : 0;
+    FParse::Value(*Params, TEXT("densitygridreuse="), DensityGridReuse);
+    OutArguments.bReuseDensityGrid = DensityGridReuse != 0;
+    FParse::Value(*Params, TEXT("meshminbatch="), OutArguments.MeshMinBatchSize);
+    OutArguments.MeshMinBatchSize = FMath::Clamp(OutArguments.MeshMinBatchSize, 1, 64);
     int32 Lod = 0;
     if (FParse::Value(*Params, TEXT("lod="), Lod))
     {
@@ -548,11 +558,27 @@ struct FExploreWorld
     // One canonical mesh cache for this commandlet run. Render and export consume these exact
     // triangles; neither path is allowed to ask the density field once per pixel.
     FVoxelMeshData ExploreMesh;
+    FVoxelSharedDensityGrid ExploreSharedDensityGrid;
     FIntVector ExploreMeshOrigin = FIntVector::ZeroValue;
     int32 ExploreMeshSize = 0;
     int32 ExploreMeshTileCount = 0;
     int32 ExploreMeshTilesCompleted = 0;
     double ExploreMeshSeconds = 0.0;
+    double ExploreDensityGridSeconds = 0.0;
+    int64 ExploreDensityGridTotalSamples = 0;
+    int64 ExploreDensityGridUniqueSamples = 0;
+    int64 ExploreDensityGridDuplicateSamplesBefore = 0;
+    int64 ExploreDensityGridDuplicateSamplesAfter = 0;
+    bool bExploreDensityGridReused = false;
+    int32 ExploreMeshTaskWorkerCount = 0;
+    int32 ExploreMeshTaskJobCount = 0;
+    int32 ExploreMeshTaskMinBatchSize = 1;
+    double ExploreMeshTaskMinSeconds = 0.0;
+    double ExploreMeshTaskMeanSeconds = 0.0;
+    double ExploreMeshTaskMaxSeconds = 0.0;
+    double ExploreMeshTaskSumSeconds = 0.0;
+    double ExploreMeshTaskWallSeconds = 0.0;
+    double ExploreMeshTaskLaunchOverheadSeconds = 0.0;
     bool bExploreMeshBuilt = false;
     bool bExploreMeshComplete = false;
     FString ExploreMeshError;
@@ -1253,6 +1279,23 @@ bool EnsureExploreMesh(
         FMath::FloorToInt(0.5f * static_cast<float>(
             World.TargetBottomWorldZ + World.TargetTopWorldZ)));
     World.ExploreMeshSeconds = 0.0;
+    World.ExploreDensityGridSeconds = 0.0;
+    World.ExploreDensityGridTotalSamples = 0;
+    World.ExploreDensityGridUniqueSamples = 0;
+    World.ExploreDensityGridDuplicateSamplesBefore = 0;
+    World.ExploreDensityGridDuplicateSamplesAfter = 0;
+    World.bExploreDensityGridReused = false;
+    World.ExploreMeshTaskWorkerCount = 0;
+    World.ExploreMeshTaskJobCount = 0;
+    World.ExploreMeshTaskMinBatchSize = FMath::Clamp(Arguments.MeshMinBatchSize, 1, 64);
+    World.ExploreMeshTaskMinSeconds = 0.0;
+    World.ExploreMeshTaskMeanSeconds = 0.0;
+    World.ExploreMeshTaskMaxSeconds = 0.0;
+    World.ExploreMeshTaskSumSeconds = 0.0;
+    World.ExploreMeshTaskWallSeconds = 0.0;
+    World.ExploreMeshTaskLaunchOverheadSeconds = 0.0;
+    World.Mesher->SetSharedDensityGrid(nullptr);
+    World.ExploreSharedDensityGrid.Reset();
 
     if (Budget.ShouldStop(TEXT("mesh")))
     {
@@ -1275,6 +1318,114 @@ bool EnsureExploreMesh(
         return false;
     }
 
+    // Adjacent tiles ask for the same one-point-halo planes.  Build one immutable lattice for
+    // the whole export when requested, then let each tile copy its local window from it.  The
+    // precomputation is inside MeshStartSeconds on purpose: this is an end-to-end export number,
+    // not a profiled bucket hiding the cost of producing the cache.
+    const int32 CellsPerTile = CHUNK_SIZE / Arguments.ExportStep;
+    const int32 PointsPerTile = CellsPerTile + 3;
+    const int64 TileGridSamples = static_cast<int64>(PointsPerTile)
+        * static_cast<int64>(PointsPerTile)
+        * static_cast<int64>(PointsPerTile);
+    const int32 SharedGridDim = Arguments.ExportSize / Arguments.ExportStep + 3;
+    const int64 SharedGridSamples = static_cast<int64>(SharedGridDim)
+        * static_cast<int64>(SharedGridDim)
+        * static_cast<int64>(SharedGridDim);
+    World.ExploreDensityGridTotalSamples = static_cast<int64>(World.ExploreMeshTileCount)
+        * TileGridSamples;
+    World.ExploreDensityGridUniqueSamples = SharedGridSamples;
+    World.ExploreDensityGridDuplicateSamplesBefore = FMath::Max<int64>(
+        0, World.ExploreDensityGridTotalSamples - SharedGridSamples);
+    World.ExploreDensityGridDuplicateSamplesAfter =
+        Arguments.bReuseDensityGrid ? 0 : World.ExploreDensityGridDuplicateSamplesBefore;
+
+    if (Arguments.bReuseDensityGrid)
+    {
+        const double DensityGridStartSeconds = FPlatformTime::Seconds();
+        World.ExploreSharedDensityGrid.OriginVoxels = World.ExploreMeshOrigin
+            - FIntVector(Arguments.ExportStep);
+        World.ExploreSharedDensityGrid.Step = Arguments.ExportStep;
+        World.ExploreSharedDensityGrid.Dim = SharedGridDim;
+        World.ExploreSharedDensityGrid.Samples.SetNumUninitialized(
+            SharedGridDim * SharedGridDim * SharedGridDim);
+        std::atomic<bool> bGridWorkCancelled(false);
+        const double GridWorkDeadline = Budget.StartSeconds + Budget.LimitSeconds - 0.25;
+        const int32 GridTileCount = TilesPerAxis;
+        ParallelFor(
+            TEXT("VoxelForgeExploreDensityGrid"),
+            World.ExploreMeshTileCount,
+            World.ExploreMeshTaskMinBatchSize,
+            [&](int32 LinearOwnerIndex)
+            {
+                if (bGridWorkCancelled.load(std::memory_order_relaxed)
+                    || FPlatformTime::Seconds() >= GridWorkDeadline)
+                {
+                    bGridWorkCancelled.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                const int32 GridOctaveBias = (World.Mesher->LODOctaveDrop > 0
+                    && Arguments.ExportStep > 1)
+                    ? World.Mesher->LODOctaveDrop
+                        * (int32)FMath::FloorLog2((uint32)Arguments.ExportStep)
+                    : 0;
+                const int32 PreviousOctaveBias = VoxelGenLOD::GetThreadOctaveBias();
+                const int32 PreviousSampleStep = VoxelGenLOD::GetThreadSampleStep();
+                VoxelGenLOD::SetThreadOctaveBias(GridOctaveBias);
+                VoxelGenLOD::SetThreadSampleStep(Arguments.ExportStep);
+                const int32 OwnerX = LinearOwnerIndex % GridTileCount;
+                const int32 OwnerY = (LinearOwnerIndex / GridTileCount) % GridTileCount;
+                const int32 OwnerZ = LinearOwnerIndex / (GridTileCount * GridTileCount);
+                // Partition the shared lattice into disjoint rectangular owner regions.  A
+                // boundary sample belongs to exactly one owner; tile windows may read it from
+                // either side.  This keeps the generator's spatial locality while guaranteeing
+                // one evaluation per global lattice point.
+                const auto OwnerMinGrid = [CellsPerTile](int32 Owner) -> int32
+                {
+                    return Owner == 0 ? 0 : 1 + Owner * CellsPerTile;
+                };
+                const auto OwnerMaxGrid = [CellsPerTile, SharedGridDim, GridTileCount](int32 Owner) -> int32
+                {
+                    return Owner == GridTileCount - 1
+                        ? SharedGridDim
+                        : 1 + (Owner + 1) * CellsPerTile;
+                };
+                const int32 GxMin = OwnerMinGrid(OwnerX);
+                const int32 GxMax = OwnerMaxGrid(OwnerX);
+                const int32 GyMin = OwnerMinGrid(OwnerY);
+                const int32 GyMax = OwnerMaxGrid(OwnerY);
+                const int32 GzMin = OwnerMinGrid(OwnerZ);
+                const int32 GzMax = OwnerMaxGrid(OwnerZ);
+                for (int32 Gz = GzMin; Gz < GzMax; ++Gz)
+                {
+                    for (int32 Gy = GyMin; Gy < GyMax; ++Gy)
+                    {
+                        for (int32 Gx = GxMin; Gx < GxMax; ++Gx)
+                        {
+                            const int32 Index = (Gz * SharedGridDim + Gy) * SharedGridDim + Gx;
+                            World.ExploreSharedDensityGrid.Samples[Index] =
+                                World.Generator->GetDensityAt(
+                                    World.ExploreSharedDensityGrid.OriginVoxels.X + Gx * Arguments.ExportStep,
+                                    World.ExploreSharedDensityGrid.OriginVoxels.Y + Gy * Arguments.ExportStep,
+                                    World.ExploreSharedDensityGrid.OriginVoxels.Z + Gz * Arguments.ExportStep);
+                        }
+                    }
+                }
+                VoxelGenLOD::SetThreadOctaveBias(PreviousOctaveBias);
+                VoxelGenLOD::SetThreadSampleStep(PreviousSampleStep);
+            },
+            EParallelForFlags::None);
+        World.ExploreDensityGridSeconds = FPlatformTime::Seconds() - DensityGridStartSeconds;
+        if (bGridWorkCancelled.load(std::memory_order_relaxed))
+        {
+            World.ExploreMeshError = TEXT("The wall-clock budget elapsed while building the shared density grid.");
+            OutError = World.ExploreMeshError;
+            World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+            return false;
+        }
+        World.Mesher->SetSharedDensityGrid(&World.ExploreSharedDensityGrid);
+        World.bExploreDensityGridReused = true;
+    }
+
     // Generate each tile through the canonical mesher on worker threads, then append strictly in
     // Z/Y/X order. The mesher's scratch buffers and the generator's hot caches are thread-local;
     // the fixed merge order keeps the aggregate mesh and all downstream raster/export bytes
@@ -1285,10 +1436,21 @@ bool EnsureExploreMesh(
     TileErrors.SetNum(World.ExploreMeshTileCount);
     TArray<uint8> TileCompleted;
     TileCompleted.Init(0, World.ExploreMeshTileCount);
+    TArray<double> TileDurations;
+    TileDurations.Init(0.0, World.ExploreMeshTileCount);
+    TArray<double> TileStartOffsets;
+    TileStartOffsets.Init(-1.0, World.ExploreMeshTileCount);
+    TArray<double> TileEndOffsets;
+    TileEndOffsets.Init(-1.0, World.ExploreMeshTileCount);
+    TArray<uint32> TileThreadIds;
+    TileThreadIds.Init(0, World.ExploreMeshTileCount);
     std::atomic<bool> bTileWorkCancelled(false);
     const double TileWorkDeadline = Budget.StartSeconds + Budget.LimitSeconds - 0.25;
+    const double ParallelStartSeconds = FPlatformTime::Seconds();
     ParallelFor(
+        TEXT("VoxelForgeExploreMeshTiles"),
         World.ExploreMeshTileCount,
+        World.ExploreMeshTaskMinBatchSize,
         [&](int32 LinearTileIndex)
         {
             if (bTileWorkCancelled.load(std::memory_order_relaxed)
@@ -1297,6 +1459,10 @@ bool EnsureExploreMesh(
                 bTileWorkCancelled.store(true, std::memory_order_relaxed);
                 return;
             }
+
+            const double TileStartSeconds = FPlatformTime::Seconds();
+            TileStartOffsets[LinearTileIndex] = TileStartSeconds - ParallelStartSeconds;
+            TileThreadIds[LinearTileIndex] = FPlatformTLS::GetCurrentThreadId();
 
             const int32 TileX = LinearTileIndex % TilesPerAxis;
             const int32 TileY = (LinearTileIndex / TilesPerAxis) % TilesPerAxis;
@@ -1313,10 +1479,54 @@ bool EnsureExploreMesh(
             {
                 TileErrors[LinearTileIndex] = MoveTemp(TileError);
                 bTileWorkCancelled.store(true, std::memory_order_relaxed);
+                const double TileEndSeconds = FPlatformTime::Seconds();
+                TileEndOffsets[LinearTileIndex] = TileEndSeconds - ParallelStartSeconds;
+                TileDurations[LinearTileIndex] = TileEndSeconds - TileStartSeconds;
                 return;
             }
             TileCompleted[LinearTileIndex] = 1;
-        });
+            const double TileEndSeconds = FPlatformTime::Seconds();
+            TileEndOffsets[LinearTileIndex] = TileEndSeconds - ParallelStartSeconds;
+            TileDurations[LinearTileIndex] = TileEndSeconds - TileStartSeconds;
+        },
+        EParallelForFlags::None);
+    const double ParallelEndSeconds = FPlatformTime::Seconds();
+
+    TArray<double> CompletedTileDurations;
+    TSet<uint32> WorkerIds;
+    double EarliestTileStart = 1.0e30;
+    double LatestTileEnd = 0.0;
+    for (int32 TileIndex = 0; TileIndex < World.ExploreMeshTileCount; ++TileIndex)
+    {
+        if (!TileCompleted[TileIndex])
+        {
+            continue;
+        }
+        CompletedTileDurations.Add(TileDurations[TileIndex]);
+        WorkerIds.Add(TileThreadIds[TileIndex]);
+        EarliestTileStart = FMath::Min(EarliestTileStart, TileStartOffsets[TileIndex]);
+        LatestTileEnd = FMath::Max(LatestTileEnd, TileEndOffsets[TileIndex]);
+    }
+    if (CompletedTileDurations.Num() > 0)
+    {
+        CompletedTileDurations.Sort();
+        World.ExploreMeshTaskJobCount = CompletedTileDurations.Num();
+        World.ExploreMeshTaskWorkerCount = WorkerIds.Num();
+        World.ExploreMeshTaskMinSeconds = CompletedTileDurations[0];
+        World.ExploreMeshTaskMaxSeconds = CompletedTileDurations.Last();
+        for (const double Duration : CompletedTileDurations)
+        {
+            World.ExploreMeshTaskSumSeconds += Duration;
+        }
+        World.ExploreMeshTaskMeanSeconds = World.ExploreMeshTaskSumSeconds
+            / static_cast<double>(CompletedTileDurations.Num());
+    }
+    World.ExploreMeshTaskWallSeconds = ParallelEndSeconds - ParallelStartSeconds;
+    if (EarliestTileStart < 1.0e30)
+    {
+        World.ExploreMeshTaskLaunchOverheadSeconds = FMath::Max(0.0, EarliestTileStart)
+            + FMath::Max(0.0, World.ExploreMeshTaskWallSeconds - LatestTileEnd);
+    }
 
     int32 CompletedTiles = 0;
     FString MeshError;
@@ -3656,6 +3866,8 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("render_step_voxels"), static_cast<double>(Arguments.RenderStepVoxels));
     Writer->WriteValue(TEXT("export_size"), Arguments.ExportSize);
     Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
+    Writer->WriteValue(TEXT("density_grid_reuse"), Arguments.bReuseDensityGrid);
+    Writer->WriteValue(TEXT("mesh_min_batch_size"), Arguments.MeshMinBatchSize);
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
@@ -3693,6 +3905,26 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("us_per_voxel"), SummaryUsPerVoxel);
     Writer->WriteValue(TEXT("triangle_count"), SummaryTriangleCount);
     Writer->WriteValue(TEXT("geometry_hash"), SummaryGeometryHash);
+    Writer->WriteObjectStart(TEXT("density_grid_reuse"));
+    Writer->WriteValue(TEXT("enabled"), World.bExploreDensityGridReused);
+    Writer->WriteValue(TEXT("total_tile_grid_samples"), World.ExploreDensityGridTotalSamples);
+    Writer->WriteValue(TEXT("unique_shared_grid_samples"), World.ExploreDensityGridUniqueSamples);
+    Writer->WriteValue(TEXT("duplicate_evaluations_before"), World.ExploreDensityGridDuplicateSamplesBefore);
+    Writer->WriteValue(TEXT("duplicate_evaluations_after"), World.ExploreDensityGridDuplicateSamplesAfter);
+    Writer->WriteValue(TEXT("precompute_seconds"), World.ExploreDensityGridSeconds);
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectStart(TEXT("mesher_tasks"));
+    Writer->WriteValue(TEXT("min_batch_size"), World.ExploreMeshTaskMinBatchSize);
+    Writer->WriteValue(TEXT("worker_count"), World.ExploreMeshTaskWorkerCount);
+    Writer->WriteValue(TEXT("job_count"), World.ExploreMeshTaskJobCount);
+    Writer->WriteValue(TEXT("job_min_seconds"), World.ExploreMeshTaskMinSeconds);
+    Writer->WriteValue(TEXT("job_mean_seconds"), World.ExploreMeshTaskMeanSeconds);
+    Writer->WriteValue(TEXT("job_max_seconds"), World.ExploreMeshTaskMaxSeconds);
+    Writer->WriteValue(TEXT("job_sum_seconds"), World.ExploreMeshTaskSumSeconds);
+    Writer->WriteValue(TEXT("parallel_wall_seconds"), World.ExploreMeshTaskWallSeconds);
+    Writer->WriteValue(TEXT("estimated_launch_overhead_seconds"),
+        World.ExploreMeshTaskLaunchOverheadSeconds);
+    Writer->WriteObjectEnd();
     Writer->WriteObjectStart(TEXT("counters"));
     for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
     {
@@ -4013,6 +4245,20 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("mesh_seconds"), Output.Export.MeshSeconds);
         Writer->WriteValue(TEXT("mesh_us_per_voxel"), Output.Export.MeshUsPerVoxel);
         Writer->WriteValue(TEXT("geometry_hash"), Output.Export.GeometryHash);
+        Writer->WriteValue(TEXT("density_grid_reuse"), World.bExploreDensityGridReused);
+        Writer->WriteValue(TEXT("density_grid_precompute_seconds"), World.ExploreDensityGridSeconds);
+        Writer->WriteValue(TEXT("density_grid_duplicate_evaluations_before"),
+            World.ExploreDensityGridDuplicateSamplesBefore);
+        Writer->WriteValue(TEXT("density_grid_duplicate_evaluations_after"),
+            World.ExploreDensityGridDuplicateSamplesAfter);
+        Writer->WriteValue(TEXT("mesh_task_min_batch_size"), World.ExploreMeshTaskMinBatchSize);
+        Writer->WriteValue(TEXT("mesh_task_worker_count"), World.ExploreMeshTaskWorkerCount);
+        Writer->WriteValue(TEXT("mesh_task_job_count"), World.ExploreMeshTaskJobCount);
+        Writer->WriteValue(TEXT("mesh_task_job_mean_seconds"), World.ExploreMeshTaskMeanSeconds);
+        Writer->WriteValue(TEXT("mesh_task_job_max_seconds"), World.ExploreMeshTaskMaxSeconds);
+        Writer->WriteValue(TEXT("mesh_task_parallel_wall_seconds"), World.ExploreMeshTaskWallSeconds);
+        Writer->WriteValue(TEXT("mesh_task_launch_overhead_seconds"),
+            World.ExploreMeshTaskLaunchOverheadSeconds);
         Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
         Writer->WriteValue(TEXT("truncated"), Output.Export.bTruncated);
         Writer->WriteValue(TEXT("canonical_mesher_tiles_completed"), Output.Export.MesherTilesCompleted);
@@ -4853,6 +5099,14 @@ bool BuildBatchCaseParams(
         ExportStep = 1 << Lod;
     }
 
+    bool bReuseDensityGrid = true;
+    JsonBool(Case, TEXT("density_grid_reuse"), bReuseDensityGrid);
+    int32 MeshMinBatchSize = 1;
+    if (JsonNumber(Case, TEXT("mesh_min_batch_size"), Number))
+    {
+        MeshMinBatchSize = FMath::Clamp(FMath::RoundToInt(Number), 1, 64);
+    }
+
     FString Modes = TEXT("export");
     JsonString(Case, TEXT("modes"), Modes);
     bool bOperatorStack = true;
@@ -4869,9 +5123,11 @@ bool BuildBatchCaseParams(
 
     OutParams = FString::Printf(
         TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
-             "-exportsize=%d -exportstep=%d -failurefocus=%d -out=\"%s\""),
+             "-exportsize=%d -exportstep=%d -densitygridreuse=%d -meshminbatch=%d "
+             "-failurefocus=%d -out=\"%s\""),
         Seed, *Archetype, Slot, *Modes, bOperatorStack ? 1 : 0,
-        ExportSize, ExportStep, bFailureFocus ? 1 : 0, *CaseOutDirectory);
+        ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0, MeshMinBatchSize,
+        bFailureFocus ? 1 : 0, *CaseOutDirectory);
 
     if (bProfileDensity)
     {

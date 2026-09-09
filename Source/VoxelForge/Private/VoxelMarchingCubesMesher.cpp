@@ -231,6 +231,26 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     // capacité, donc plus de malloc/free de ~170 Ko (35³ floats) par tuile.
     static thread_local TArray<float> DensityGrid;
     DensityGrid.SetNumUninitialized(MDim * MDim * MDim);
+    const FVoxelSharedDensityGrid* ReuseGrid = SharedDensityGrid;
+    const int32 SharedDeltaX = ReuseGrid
+        ? (OriginVoxels.X - ReuseGrid->OriginVoxels.X) / Step : 0;
+    const int32 SharedDeltaY = ReuseGrid
+        ? (OriginVoxels.Y - ReuseGrid->OriginVoxels.Y) / Step : 0;
+    const int32 SharedDeltaZ = ReuseGrid
+        ? (OriginVoxels.Z - ReuseGrid->OriginVoxels.Z) / Step : 0;
+    const bool bUseSharedDensityGrid = ReuseGrid
+        && ReuseGrid->Step == Step
+        && ReuseGrid->Dim > 0
+        && ReuseGrid->Samples.Num() == ReuseGrid->Dim * ReuseGrid->Dim * ReuseGrid->Dim
+        && (OriginVoxels.X - ReuseGrid->OriginVoxels.X) % Step == 0
+        && (OriginVoxels.Y - ReuseGrid->OriginVoxels.Y) % Step == 0
+        && (OriginVoxels.Z - ReuseGrid->OriginVoxels.Z) % Step == 0
+        && SharedDeltaX - 1 >= 0
+        && SharedDeltaY - 1 >= 0
+        && SharedDeltaZ - 1 >= 0
+        && SharedDeltaX + GridDim < ReuseGrid->Dim
+        && SharedDeltaY + GridDim < ReuseGrid->Dim
+        && SharedDeltaZ + GridDim < ReuseGrid->Dim;
     // Bande de strate : seules les rangées Z réellement lues (cellules CzLo..CzHi + marges de
     // gradient) sont échantillonnées — le reste du tampon reste non initialisé et non lu.
     VoxelDensityProfile::FScopedTimer MesherDensityGridTimer(
@@ -243,12 +263,23 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 gx = -1; gx <= GridDim; gx++)
             {
-                // World voxel = tile origin + grid offset scaled by the cell size (Step).
-                DensityGrid[((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1)] =
-                    Generator->GetDensityAt(
+                const int32 LocalIndex = ((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1);
+                if (bUseSharedDensityGrid)
+                {
+                    const int32 SharedX = SharedDeltaX + gx;
+                    const int32 SharedY = SharedDeltaY + gy;
+                    const int32 SharedZ = SharedDeltaZ + gz;
+                    DensityGrid[LocalIndex] = ReuseGrid->Samples[
+                        (SharedZ * ReuseGrid->Dim + SharedY) * ReuseGrid->Dim + SharedX];
+                }
+                else
+                {
+                    // World voxel = tile origin + grid offset scaled by the cell size (Step).
+                    DensityGrid[LocalIndex] = Generator->GetDensityAt(
                         OriginVoxels.X + gx * Step,
                         OriginVoxels.Y + gy * Step,
                         OriginVoxels.Z + gz * Step);
+                }
             }
         }
     }

@@ -41,14 +41,20 @@ class UVoxelBiomeDefinition;
 // the same thread, and biome/climate must stay LOD-independent.
 namespace VoxelGenLOD
 {
-    // NOT VOXELFORGE_API: MSVC forbids dll-interface on thread_local (C2492). Both users
-    // (generator + mesher) are inside this module, so no export is needed anyway.
+    // The TLS variables themselves stay module-local because MSVC forbids exporting thread_local
+    // data (C2492).  These tiny accessors let the editor explorer build a shared LOD grid without
+    // linking directly to the storage in the game module.
     extern thread_local int32 OctaveBias;
 
     // Sampling step of the tile currently being meshed on this worker.  GetDensityAt itself has
     // no Step parameter because callers outside the mesher are point queries; this TLS is only a
     // read-only hint for caches that may safely widen their spatial window for coarse tiles.
     extern thread_local int32 SampleStep;
+
+    VOXELFORGE_API int32 GetThreadOctaveBias();
+    VOXELFORGE_API void SetThreadOctaveBias(int32 Value);
+    VOXELFORGE_API int32 GetThreadSampleStep();
+    VOXELFORGE_API void SetThreadSampleStep(int32 Value);
 
     // Effective octave count for a per-voxel noise call site.
     // At least 1 octave always survives (the coarse base shape).

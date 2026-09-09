@@ -17,6 +17,27 @@
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.generated.h"
 
+// A run-scoped, read-only density lattice.  The explorer owns the storage and installs the
+// pointer only while its canonical tiles are being meshed.  The lattice includes the one-point
+// halo needed by every tile, so each world sample is generated once and copied into both adjacent
+// tile scratch grids.  It is deliberately not a UObject or a cache with eviction: ownership,
+// lifetime, and iteration order remain explicit and deterministic.
+struct FVoxelSharedDensityGrid
+{
+    FIntVector OriginVoxels = FIntVector::ZeroValue;
+    int32 Step = 1;
+    int32 Dim = 0;
+    TArray<float> Samples;
+
+    void Reset()
+    {
+        OriginVoxels = FIntVector::ZeroValue;
+        Step = 1;
+        Dim = 0;
+        Samples.Reset();
+    }
+};
+
 UCLASS(BlueprintType)
 class VOXELFORGE_API UVoxelMarchingCubesMesher : public UObject
 {
@@ -93,6 +114,11 @@ public:
     // This is intentionally read-only: workers may observe shutdown, but never mutate world state.
     void SetShutdownFlag(const std::atomic<bool>* InShutdownFlag) { ShutdownFlag = InShutdownFlag; }
 
+    // Optional run-scoped shared lattice.  The caller must keep it alive and immutable until all
+    // GenerateMesh calls finish.  A malformed/incomplete lattice is ignored and falls back to
+    // the canonical generator path rather than changing geometry.
+    void SetSharedDensityGrid(const FVoxelSharedDensityGrid* InGrid) { SharedDensityGrid = InGrid; }
+
 private:
     FORCEINLINE bool ShouldAbortWork() const
     {
@@ -100,6 +126,7 @@ private:
     }
 
     const std::atomic<bool>* ShutdownFlag = nullptr;
+    const FVoxelSharedDensityGrid* SharedDensityGrid = nullptr;
 
 public:
 

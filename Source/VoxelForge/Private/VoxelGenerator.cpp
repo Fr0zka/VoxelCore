@@ -178,6 +178,26 @@ static thread_local FSurfaceColumnCache GSurfColCache;
 thread_local int32 VoxelGenLOD::OctaveBias = 0;
 thread_local int32 VoxelGenLOD::SampleStep = 1;
 
+int32 VoxelGenLOD::GetThreadOctaveBias()
+{
+    return OctaveBias;
+}
+
+void VoxelGenLOD::SetThreadOctaveBias(int32 Value)
+{
+    OctaveBias = Value;
+}
+
+int32 VoxelGenLOD::GetThreadSampleStep()
+{
+    return SampleStep;
+}
+
+void VoxelGenLOD::SetThreadSampleStep(int32 Value)
+{
+    SampleStep = Value;
+}
+
 // NOTE (T2.a): the fBm/Ridged bodies moved to VoxelNoise.h, where octaves are evaluated
 // 4-wide via SSE (Perlin3D_x4). These thin wrappers keep every call site unchanged. They
 // sample a DIFFERENT (float hash-gradient) noise field than the old FMath::PerlinNoise3D,
