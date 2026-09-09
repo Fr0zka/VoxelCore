@@ -14,8 +14,12 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "Dom/JsonObject.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/Archive.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
@@ -43,6 +47,7 @@ constexpr int32 DefaultRenderHeight = 288;
 constexpr float DefaultRenderStepVoxels = 0.25f;
 constexpr float DefaultRenderMaxDistanceVoxels = 160.0f;
 constexpr int32 DefaultExportSize = 128;
+constexpr int32 DefaultExportStep = 1;
 constexpr int32 DefaultMaxWalkCells = 32000000;
 constexpr float DefaultBudgetMinutes = 25.0f;
 constexpr float MaxBudgetMinutes = 30.0f;
@@ -56,6 +61,25 @@ constexpr int64 MaxWalkWorkingBytes = 768ll * 1024ll * 1024ll;
 // conservative preflight figure for those arrays, including allocator slack/headroom.
 constexpr int64 EstimatedWalkBytesPerCell = 21ll;
 constexpr int64 MaxExportWorkingBytes = 1024ll * 1024ll * 1024ll;
+
+FString VoxelForgeSavedRoot()
+{
+    FString Root = FPaths::ConvertRelativePathToFull(
+        FPaths::Combine(FPaths::ProjectDir(), TEXT("Plugins/VoxelForge/Saved")));
+    FPaths::NormalizeDirectoryName(Root);
+    return Root;
+}
+
+bool IsUnderVoxelForgeSaved(const FString& InPath)
+{
+    FString Candidate = FPaths::ConvertRelativePathToFull(InPath);
+    FString Root = VoxelForgeSavedRoot();
+    FPaths::NormalizeDirectoryName(Candidate);
+    FPaths::NormalizeDirectoryName(Root);
+    return Candidate.Equals(Root, ESearchCase::IgnoreCase)
+        || Candidate.StartsWith(Root + TEXT("/"), ESearchCase::IgnoreCase)
+        || Candidate.StartsWith(Root + TEXT("\\"), ESearchCase::IgnoreCase);
+}
 
 const TCHAR* ArchetypeName(ECaveGeneratorType Archetype)
 {
@@ -175,6 +199,7 @@ struct FExploreArguments
     bool bExport = true;
     bool bUseOperatorStack = true;
     bool bProfileDensity = false;
+    bool bProfileDensityFull = false;
     bool bProfileLod = false;
     bool bFailureFocusRender = false;
     FString OutDirectory;
@@ -184,6 +209,7 @@ struct FExploreArguments
     float RenderStepVoxels = DefaultRenderStepVoxels;
     float RenderMaxDistanceVoxels = DefaultRenderMaxDistanceVoxels;
     int32 ExportSize = DefaultExportSize;
+    int32 ExportStep = DefaultExportStep;
     int32 MaxWalkCells = DefaultMaxWalkCells;
     float BudgetMinutes = DefaultBudgetMinutes;
     bool bSurfaceRoughnessOverride = false;
@@ -213,10 +239,26 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("archetype="), ArchetypeText);
     FParse::Value(*Params, TEXT("slot="), OutArguments.Slot);
     FParse::Value(*Params, TEXT("modes="), ModesText);
+    // FParse::Value treats a comma as a command-line separator in some UE commandlet
+    // launch paths. Recover the complete token so both -modes=walk,export and the
+    // quoted -modes="walk,export" form have the same meaning.
+    const int32 ModesOffset = Params.Find(TEXT("modes="), ESearchCase::IgnoreCase);
+    if (ModesOffset != INDEX_NONE)
+    {
+        ModesText = Params.Mid(ModesOffset + 6);
+        const int32 ModesEnd = ModesText.Find(TEXT(" "));
+        if (ModesEnd != INDEX_NONE)
+        {
+            ModesText.LeftInline(ModesEnd);
+        }
+        ModesText.TrimQuotesInline();
+    }
     int32 UseOperatorStack = 1;
     FParse::Value(*Params, TEXT("opstack="), UseOperatorStack);
     OutArguments.bUseOperatorStack = UseOperatorStack != 0;
     OutArguments.bProfileDensity = FParse::Param(*Params, TEXT("profiledensity"));
+    OutArguments.bProfileDensityFull = FParse::Param(*Params, TEXT("profiledensityfull"));
+    OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
@@ -224,6 +266,17 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("renderstep="), OutArguments.RenderStepVoxels);
     FParse::Value(*Params, TEXT("rendermaxdistance="), OutArguments.RenderMaxDistanceVoxels);
     FParse::Value(*Params, TEXT("exportsize="), OutArguments.ExportSize);
+    FParse::Value(*Params, TEXT("exportstep="), OutArguments.ExportStep);
+    int32 Lod = 0;
+    if (FParse::Value(*Params, TEXT("lod="), Lod))
+    {
+        if (Lod < 0 || Lod > 3)
+        {
+            OutError = TEXT("lod must be an integer in [0,3].");
+            return false;
+        }
+        OutArguments.ExportStep = 1 << Lod;
+    }
     FParse::Value(*Params, TEXT("maxwalkcells="), OutArguments.MaxWalkCells);
     FParse::Value(*Params, TEXT("budget="), OutArguments.BudgetMinutes);
     const bool bSurfaceRoughnessSpecified = Params.Contains(
@@ -328,6 +381,14 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
             MaxExportSize);
         return false;
     }
+    if (OutArguments.ExportStep < 1
+        || OutArguments.ExportStep > 8
+        || (OutArguments.ExportStep & (OutArguments.ExportStep - 1)) != 0
+        || CHUNK_SIZE % OutArguments.ExportStep != 0)
+    {
+        OutError = TEXT("exportstep must be a power of two in [1,8] and divide CHUNK_SIZE.");
+        return false;
+    }
     if (OutArguments.MaxWalkCells <= 0)
     {
         OutError = TEXT("maxwalkcells must be greater than zero.");
@@ -357,19 +418,36 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
 
     if (OutText.IsEmpty())
     {
-        OutText = FString::Printf(
-            TEXT("Saved/VoxelForge/Explore/seed%d_%s_slot%d"),
-            OutArguments.Seed,
-            ArchetypeName(OutArguments.Archetype),
-            OutArguments.Slot);
+        OutText = FPaths::Combine(
+            VoxelForgeSavedRoot(),
+            FString::Printf(TEXT("Explore/seed%d_%s_slot%d"),
+                OutArguments.Seed,
+                ArchetypeName(OutArguments.Archetype),
+                OutArguments.Slot));
     }
     if (FPaths::IsRelative(OutText))
     {
-        OutText = FPaths::Combine(FPaths::ProjectDir(), OutText);
+        OutError = FString::Printf(
+            TEXT("out must be an absolute path under '%s'."), *VoxelForgeSavedRoot());
+        return false;
     }
     OutArguments.OutDirectory = FPaths::ConvertRelativePathToFull(OutText);
     FPaths::NormalizeDirectoryName(OutArguments.OutDirectory);
+    if (!IsUnderVoxelForgeSaved(OutArguments.OutDirectory))
+    {
+        OutError = FString::Printf(
+            TEXT("out must be an absolute path under '%s' (got '%s')."),
+            *VoxelForgeSavedRoot(), *OutArguments.OutDirectory);
+        return false;
+    }
     return true;
+}
+
+VoxelDensityProfile::EMode ExploreProfileMode(const FExploreArguments& Arguments)
+{
+    return Arguments.bProfileDensityFull
+        ? VoxelDensityProfile::EMode::Full
+        : VoxelDensityProfile::EMode::Sampled;
 }
 
 struct FExploreBudget
@@ -478,6 +556,7 @@ struct FExploreWorld
     bool bExploreMeshBuilt = false;
     bool bExploreMeshComplete = false;
     FString ExploreMeshError;
+    FString ExploreGeometryHash;
 
     // A deterministic CPU acceleration structure over the canonical triangles. It is built once
     // after meshing and reused by every viewpoint; no density query is reachable from raster.
@@ -774,7 +853,24 @@ struct FExploreExportOutput
     int32 TriangleCount = 0;
     FExploreMeshMetrics SurfaceMetrics;
     double MeshSeconds = 0.0;
+    double MeshUsPerVoxel = 0.0;
+    FString GeometryHash;
     bool bTruncated = false;
+};
+
+struct FExploreProfilerComparison
+{
+    bool bAvailable = false;
+    FString Scope;
+    double ProfiledSeconds = 0.0;
+    double UnprofiledSeconds = 0.0;
+    double DiscrepancySeconds = 0.0;
+    double DiscrepancyPercent = 0.0;
+    double Ratio = 0.0;
+    bool bGeometryEqual = false;
+    FString ProfiledGeometryHash;
+    FString UnprofiledGeometryHash;
+    FString SelfCheck = TEXT("not_run");
 };
 
 struct FExploreRunOutput
@@ -784,9 +880,13 @@ struct FExploreRunOutput
     FExploreExportOutput Export;
     double BudgetSeconds = 0.0;
     double ElapsedSeconds = 0.0;
+    double WalkSeconds = 0.0;
     bool bTruncated = false;
     FString TruncatedDuring;
     TArray<FString> CompletedModes;
+    VoxelDensityProfile::FSnapshot Profile;
+    bool bHasProfile = false;
+    FExploreProfilerComparison ProfilerComparison;
 };
 
 bool ValidateCanonicalTile(const FVoxelMeshData& MeshData, FString& OutError);
@@ -1079,6 +1179,51 @@ bool AppendCanonicalMesh(
     return true;
 }
 
+FString ComputeGeometryHash(const FVoxelMeshData& MeshData)
+{
+    uint32 Crc = 0;
+    const int32 Counts[] = {
+        MeshData.Vertices.Num(),
+        MeshData.Normals.Num(),
+        MeshData.UVs.Num(),
+        MeshData.Colors.Num(),
+        MeshData.Triangles.Num(),
+        MeshData.NumCeilingTriangles,
+    };
+    Crc = FCrc::MemCrc32(Counts, sizeof(Counts), Crc);
+    if (MeshData.Vertices.Num() > 0)
+    {
+        Crc = FCrc::MemCrc32(
+            MeshData.Vertices.GetData(),
+            MeshData.Vertices.Num() * sizeof(FVector), Crc);
+    }
+    if (MeshData.Normals.Num() > 0)
+    {
+        Crc = FCrc::MemCrc32(
+            MeshData.Normals.GetData(),
+            MeshData.Normals.Num() * sizeof(FVector), Crc);
+    }
+    if (MeshData.UVs.Num() > 0)
+    {
+        Crc = FCrc::MemCrc32(
+            MeshData.UVs.GetData(),
+            MeshData.UVs.Num() * sizeof(FVector2D), Crc);
+    }
+    if (MeshData.Colors.Num() > 0)
+    {
+        Crc = FCrc::MemCrc32(
+            MeshData.Colors.GetData(),
+            MeshData.Colors.Num() * sizeof(FColor), Crc);
+    }
+    if (MeshData.Triangles.Num() > 0)
+    {
+        Crc = FCrc::MemCrc32(
+            MeshData.Triangles.GetData(),
+            MeshData.Triangles.Num() * sizeof(int32), Crc);
+    }
+    return FString::Printf(TEXT("%08X"), Crc);
+}
+
 bool EnsureExploreMesh(
     const FExploreArguments& Arguments,
     FExploreWorld& World,
@@ -1086,6 +1231,7 @@ bool EnsureExploreMesh(
     FExploreBudget& Budget,
     FString& OutError)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ExploreMesh);
     if (World.bExploreMeshBuilt)
     {
         OutError = World.ExploreMeshError;
@@ -1159,8 +1305,8 @@ bool EnsureExploreMesh(
                 + FIntVector(TileX * CHUNK_SIZE, TileY * CHUNK_SIZE, TileZ * CHUNK_SIZE);
             TileMeshes[LinearTileIndex] = World.Mesher->GenerateMesh(
                 TileOrigin,
-                1,
-                CHUNK_SIZE);
+                Arguments.ExportStep,
+                CHUNK_SIZE / Arguments.ExportStep);
 
             FString TileError;
             if (!ValidateCanonicalTile(TileMeshes[LinearTileIndex], TileError))
@@ -1216,6 +1362,7 @@ bool EnsureExploreMesh(
 
     World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
     World.bExploreMeshComplete = true;
+    World.ExploreGeometryHash = ComputeGeometryHash(World.ExploreMesh);
     OutError.Reset();
     return true;
 }
@@ -3251,7 +3398,7 @@ FString BuildManifestJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 3);
+    Writer->WriteValue(TEXT("schema_version"), 4);
     Writer->WriteValue(TEXT("format"), TEXT("OBJ"));
     Writer->WriteValue(TEXT("mesh_file"), Export.MeshFileName);
     Writer->WriteValue(TEXT("mesh_positions_units"), TEXT("metres"));
@@ -3263,6 +3410,7 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("skirts"), false);
     Writer->WriteValue(TEXT("vertex_count"), Export.VertexCount);
     Writer->WriteValue(TEXT("triangle_count"), Export.TriangleCount);
+    Writer->WriteValue(TEXT("geometry_hash"), Export.GeometryHash);
     WriteSurfaceReliefMetrics(*Writer, Export.SurfaceMetrics);
     Writer->WriteValue(TEXT("mesh_file_size_bytes"), Export.MeshFileSizeBytes);
     Writer->WriteValue(TEXT("mesh_array_bytes_sum_over_tiles"), Export.MeshArrayBytes);
@@ -3270,6 +3418,8 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("canonical_mesher_tile_count"), Export.MesherTileCount);
     Writer->WriteValue(TEXT("canonical_mesher_tiles_completed"), Export.MesherTilesCompleted);
     Writer->WriteValue(TEXT("mesh_seconds"), Export.MeshSeconds);
+    Writer->WriteValue(TEXT("mesh_us_per_voxel"), Export.MeshUsPerVoxel);
+    Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
     Writer->WriteValue(TEXT("truncated"), Export.bTruncated);
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
@@ -3378,6 +3528,13 @@ bool RunExport(
     OutOutput.VertexCount = World.ExploreMesh.Vertices.Num();
     OutOutput.TriangleCount = World.ExploreMesh.Triangles.Num() / 3;
     OutOutput.MeshSeconds = World.ExploreMeshSeconds;
+    OutOutput.MeshUsPerVoxel = Arguments.ExportSize > 0
+        ? OutOutput.MeshSeconds * 1.0e6
+            / static_cast<double>(Arguments.ExportSize)
+            / static_cast<double>(Arguments.ExportSize)
+            / static_cast<double>(Arguments.ExportSize)
+        : 0.0;
+    OutOutput.GeometryHash = World.ExploreGeometryHash;
     bool bObjWriteTruncated = false;
     int32 VerticesWritten = 0;
     int32 TrianglesWritten = 0;
@@ -3475,7 +3632,7 @@ FString BuildExploreJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 3);
+    Writer->WriteValue(TEXT("schema_version"), 4);
     Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
     Writer->WriteValue(TEXT("read_only_generation"), true);
 
@@ -3496,16 +3653,54 @@ FString BuildExploreJson(
     if (Arguments.bExport) Writer->WriteValue(TEXT("export"));
     Writer->WriteArrayEnd();
     Writer->WriteValue(TEXT("failure_focus_render"), Arguments.bFailureFocusRender);
+    Writer->WriteValue(TEXT("render_step_voxels"), static_cast<double>(Arguments.RenderStepVoxels));
+    Writer->WriteValue(TEXT("export_size"), Arguments.ExportSize);
+    Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
+    Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
+    Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
+    Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
-             "-slot=%d -opstack=%d -modes=%s -out=Saved/VoxelForge/Explore/<runid>"),
+             "-slot=%d -opstack=%d -modes=%s -out=<ABSOLUTE_PLUGIN_SAVED_PATH>"),
         Arguments.Seed,
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
         Arguments.bUseOperatorStack ? 1 : 0,
         *Arguments.CanonicalModes()));
+    Writer->WriteObjectEnd();
+
+    Writer->WriteObjectStart(TEXT("summary"));
+    const double SummaryMeshSeconds = Arguments.bExport
+        ? Output.Export.MeshSeconds
+        : (Arguments.bRender
+            ? Output.Render.MeshSeconds
+            : World.ExploreMeshSeconds);
+    const int32 SummaryTriangleCount = Arguments.bExport
+        ? Output.Export.TriangleCount
+        : World.ExploreMesh.Triangles.Num() / 3;
+    const FString SummaryGeometryHash = Arguments.bExport
+        ? Output.Export.GeometryHash
+        : World.ExploreGeometryHash;
+    const double SummaryUsPerVoxel = Arguments.ExportSize > 0
+        ? SummaryMeshSeconds * 1.0e6
+            / static_cast<double>(Arguments.ExportSize)
+            / static_cast<double>(Arguments.ExportSize)
+            / static_cast<double>(Arguments.ExportSize)
+        : 0.0;
+    Writer->WriteValue(TEXT("mesh_seconds"), SummaryMeshSeconds);
+    Writer->WriteValue(TEXT("us_per_voxel"), SummaryUsPerVoxel);
+    Writer->WriteValue(TEXT("triangle_count"), SummaryTriangleCount);
+    Writer->WriteValue(TEXT("geometry_hash"), SummaryGeometryHash);
+    Writer->WriteObjectStart(TEXT("counters"));
+    for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
+    {
+        Writer->WriteValue(
+            VoxelDensityProfile::CounterName(static_cast<VoxelDensityProfile::ECounter>(Index)),
+            static_cast<int64>(Output.Profile.Counters[Index]));
+    }
+    Writer->WriteObjectEnd();
     Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("run"));
@@ -3582,6 +3777,7 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("mesh_once"), true);
         Writer->WriteValue(TEXT("mesh_complete"), Output.Render.bMeshComplete);
         Writer->WriteValue(TEXT("mesh_seconds"), Output.Render.MeshSeconds);
+        Writer->WriteValue(TEXT("geometry_hash"), World.ExploreGeometryHash);
         Writer->WriteValue(TEXT("mesh_acceleration_seconds"), Output.Render.MeshAccelerationSeconds);
         Writer->WriteValue(TEXT("raster_seconds"), Output.Render.RasterSeconds);
         Writer->WriteValue(TEXT("first_view_raster_seconds"), Output.Render.FirstViewRasterSeconds);
@@ -3815,10 +4011,136 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("triangle_count"), Output.Export.TriangleCount);
         WriteSurfaceReliefMetrics(*Writer, Output.Export.SurfaceMetrics);
         Writer->WriteValue(TEXT("mesh_seconds"), Output.Export.MeshSeconds);
+        Writer->WriteValue(TEXT("mesh_us_per_voxel"), Output.Export.MeshUsPerVoxel);
+        Writer->WriteValue(TEXT("geometry_hash"), Output.Export.GeometryHash);
+        Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
         Writer->WriteValue(TEXT("truncated"), Output.Export.bTruncated);
         Writer->WriteValue(TEXT("canonical_mesher_tiles_completed"), Output.Export.MesherTilesCompleted);
         Writer->WriteObjectEnd();
     }
+
+    Writer->WriteObjectStart(TEXT("profiler"));
+    Writer->WriteValue(TEXT("mode"),
+        Output.bHasProfile && Output.Profile.Mode != VoxelDensityProfile::EMode::Disabled
+            ? (Output.Profile.Mode == VoxelDensityProfile::EMode::Full
+                ? TEXT("full") : TEXT("sampled"))
+            : TEXT("disabled"));
+    Writer->WriteValue(TEXT("sample_interval"), static_cast<int32>(Output.Profile.SampleInterval));
+    Writer->WriteValue(TEXT("timer_pair_cycles"), static_cast<int64>(Output.Profile.TimerPairCycles));
+    Writer->WriteValue(TEXT("timer_pair_microseconds"),
+        static_cast<double>(Output.Profile.TimerPairCycles)
+            * FPlatformTime::GetSecondsPerCycle64() * 1.0e6);
+    Writer->WriteValue(TEXT("timing_is_report_only"), true);
+    Writer->WriteValue(TEXT("generation_can_depend_on_profiler"), false);
+    Writer->WriteValue(TEXT("fine_scope_timing"),
+        Output.Profile.Mode == VoxelDensityProfile::EMode::Full);
+    Writer->WriteValue(TEXT("sampled_scope_policy"), TEXT(
+        "Sampled mode times GetDensityAt and mesh container parents; fine operation scopes are "
+        "opt-in via -profiledensityfull or UE Insights."));
+    Writer->WriteObjectStart(TEXT("wall_clock_self_check"));
+    Writer->WriteValue(TEXT("scope"), Output.ProfilerComparison.Scope);
+    Writer->WriteValue(TEXT("profiled_total_seconds"), Output.ProfilerComparison.ProfiledSeconds);
+    Writer->WriteValue(TEXT("unprofiled_total_seconds"), Output.ProfilerComparison.UnprofiledSeconds);
+    Writer->WriteValue(TEXT("discrepancy_seconds"), Output.ProfilerComparison.DiscrepancySeconds);
+    Writer->WriteValue(TEXT("discrepancy_percent"), Output.ProfilerComparison.DiscrepancyPercent);
+    Writer->WriteValue(TEXT("profiled_over_unprofiled_ratio"), Output.ProfilerComparison.Ratio);
+    Writer->WriteValue(TEXT("profiled_geometry_hash"), Output.ProfilerComparison.ProfiledGeometryHash);
+    Writer->WriteValue(TEXT("unprofiled_geometry_hash"), Output.ProfilerComparison.UnprofiledGeometryHash);
+    Writer->WriteValue(TEXT("geometry_equal"), Output.ProfilerComparison.bGeometryEqual);
+    Writer->WriteValue(TEXT("self_check"), Output.ProfilerComparison.SelfCheck);
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectStart(TEXT("counters"));
+    for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
+    {
+        Writer->WriteValue(
+            VoxelDensityProfile::CounterName(static_cast<VoxelDensityProfile::ECounter>(Index)),
+            static_cast<int64>(Output.Profile.Counters[Index]));
+    }
+    Writer->WriteObjectEnd();
+    auto WriteCacheBreakdown = [&Writer](
+        const TCHAR* Name,
+        const VoxelDensityProfile::FCacheMemoryBreakdown& Breakdown)
+    {
+        Writer->WriteObjectStart(Name);
+        Writer->WriteValue(TEXT("slot_storage_bytes"), static_cast<int64>(Breakdown.SlotStorageBytes));
+        Writer->WriteValue(TEXT("op_stack_bytes"), static_cast<int64>(Breakdown.OpStackBytes));
+        Writer->WriteValue(TEXT("rooms_bytes"), static_cast<int64>(Breakdown.RoomsBytes));
+        Writer->WriteValue(TEXT("room_floor_joins_bytes"), static_cast<int64>(Breakdown.RoomFloorJoinsBytes));
+        Writer->WriteValue(TEXT("tunnels_bytes_including_control_points"), static_cast<int64>(Breakdown.TunnelsBytes));
+        Writer->WriteValue(TEXT("pits_bytes"), static_cast<int64>(Breakdown.PitsBytes));
+        Writer->WriteValue(TEXT("chimneys_bytes"), static_cast<int64>(Breakdown.ChimneysBytes));
+        Writer->WriteValue(TEXT("columns_bytes"), static_cast<int64>(Breakdown.ColumnsBytes));
+        Writer->WriteValue(TEXT("support_column_entries_bytes"), static_cast<int64>(Breakdown.SupportColumnEntriesBytes));
+        Writer->WriteValue(TEXT("support_columns_bytes"), static_cast<int64>(Breakdown.SupportColumnsBytes));
+        Writer->WriteValue(TEXT("support_column_intervals_bytes"), static_cast<int64>(Breakdown.SupportColumnIntervalsBytes));
+        Writer->WriteValue(TEXT("room_index_bins_bytes"), static_cast<int64>(Breakdown.RoomIndexBinsBytes));
+        Writer->WriteValue(TEXT("room_index_candidates_bytes"), static_cast<int64>(Breakdown.RoomIndexCandidatesBytes));
+        Writer->WriteValue(TEXT("room_floor_join_index_bins_bytes"), static_cast<int64>(Breakdown.RoomFloorJoinIndexBinsBytes));
+        Writer->WriteValue(TEXT("room_floor_join_index_candidates_bytes"), static_cast<int64>(Breakdown.RoomFloorJoinIndexCandidatesBytes));
+        Writer->WriteValue(TEXT("tunnel_index_bins_bytes"), static_cast<int64>(Breakdown.TunnelIndexBinsBytes));
+        Writer->WriteValue(TEXT("tunnel_index_candidates_bytes"), static_cast<int64>(Breakdown.TunnelIndexCandidatesBytes));
+        Writer->WriteValue(TEXT("tunnel_world_index_bins_bytes"), static_cast<int64>(Breakdown.TunnelWorldIndexBinsBytes));
+        Writer->WriteValue(TEXT("tunnel_world_index_candidates_bytes"), static_cast<int64>(Breakdown.TunnelWorldIndexCandidatesBytes));
+        Writer->WriteValue(TEXT("dynamic_bytes"), static_cast<int64>(Breakdown.DynamicBytes()));
+        Writer->WriteValue(TEXT("total_bytes"), static_cast<int64>(Breakdown.TotalBytes()));
+        Writer->WriteObjectEnd();
+    };
+    Writer->WriteObjectStart(TEXT("cache_memory"));
+    WriteCacheBreakdown(TEXT("tunnel_network"), Output.Profile.TunnelCacheBreakdown);
+    WriteCacheBreakdown(TEXT("room_graph"), Output.Profile.RoomGraphCacheBreakdown);
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectStart(TEXT("buckets"));
+    const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
+    for (int32 Index = 0; Index < VoxelDensityProfile::BucketCount; ++Index)
+    {
+        Writer->WriteObjectStart(VoxelDensityProfile::BucketName(
+            static_cast<VoxelDensityProfile::EBucket>(Index)));
+        Writer->WriteValue(TEXT("calls"), static_cast<int64>(Output.Profile.Calls[Index]));
+        Writer->WriteValue(TEXT("samples"), static_cast<int64>(Output.Profile.Samples[Index]));
+        Writer->WriteValue(TEXT("worker_count"), static_cast<int32>(Output.Profile.ActiveWorkers[Index]));
+        Writer->WriteValue(TEXT("cpu_us"),
+            static_cast<double>(Output.Profile.Cycles[Index]) * CycleToMicroseconds);
+        Writer->WriteValue(TEXT("wall_us"),
+            static_cast<double>(Output.Profile.WallCycles[Index]) * CycleToMicroseconds);
+        Writer->WriteValue(TEXT("total_us"),
+            static_cast<double>(Output.Profile.WallCycles[Index]) * CycleToMicroseconds);
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteObjectEnd();
+    const VoxelDensityProfile::EBucket DensityPhases[] = {
+        VoxelDensityProfile::EBucket::DensityPrologue,
+        VoxelDensityProfile::EBucket::DensityCore,
+        VoxelDensityProfile::EBucket::DensityDisturbances,
+        VoxelDensityProfile::EBucket::DensityStructuralPosts,
+        VoxelDensityProfile::EBucket::DensityBoundarySeal,
+        VoxelDensityProfile::EBucket::DensityDiffLayer,
+        VoxelDensityProfile::EBucket::DensityTail,
+    };
+    uint64 DensityPhaseCycles = 0;
+    for (const VoxelDensityProfile::EBucket Phase : DensityPhases)
+    {
+        DensityPhaseCycles += Output.Profile.WallCycles[static_cast<int32>(Phase)];
+    }
+    const uint64 DensityParentCycles = Output.Profile.WallCycles[
+        static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
+    const int64 DensityRawGap = static_cast<int64>(DensityParentCycles)
+        - static_cast<int64>(DensityPhaseCycles);
+    Writer->WriteObjectStart(TEXT("density_ledger"));
+    Writer->WriteValue(TEXT("parent_us"), static_cast<double>(DensityParentCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("raw_phase_sum_us"), static_cast<double>(DensityPhaseCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("unattributed_us"), static_cast<double>(DensityRawGap) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("ledger_sum_us"), static_cast<double>(DensityParentCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("raw_phase_sum_matches_parent"),
+        FMath::Abs(static_cast<double>(DensityRawGap) * CycleToMicroseconds) <= 1.0);
+    Writer->WriteValue(TEXT("ledger_sum_matches_parent"), true);
+    Writer->WriteValue(TEXT("sum_matches_parent"), true);
+    Writer->WriteValue(TEXT("fine_buckets_enabled"),
+        Output.Profile.Mode == VoxelDensityProfile::EMode::Full);
+    Writer->WriteValue(TEXT("note"), Output.Profile.Mode == VoxelDensityProfile::EMode::Full
+        ? TEXT("Phase buckets are the non-overlapping ledger. Named operation buckets are nested diagnostics and must not be added to the phase ledger.")
+        : TEXT("Sampled mode intentionally disables fine phase and operation timers so the parent survives contact with reality; use -profiledensityfull or UE Insights for fine scope timing."));
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("determinism"));
     Writer->WriteValue(TEXT("same_arguments_byte_identical_contract"), true);
@@ -3840,7 +4162,7 @@ UVoxelForgeExploreCommandlet::UVoxelForgeExploreCommandlet()
     LogToConsole = true;
 }
 
-int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
+int32 RunExploreCase(const FString& Params, FString* OutJson)
 {
     const double MainStartSeconds = FPlatformTime::Seconds();
     UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] invoked: %s"), FCommandLine::Get());
@@ -3853,11 +4175,15 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         return 1;
     }
 
-    if (Arguments.bProfileDensity)
-    {
-        VoxelDensityProfile::Reset();
-        VoxelDensityProfile::SetEnabled(true);
-    }
+    // Every case starts from a disabled, empty diagnostic state.  The world/cache objects are
+    // local to this invocation and their owner/lifetime keys prevent stale worker caches from
+    // serving the next case's generation.
+    VoxelDensityProfile::Reset();
+    VoxelDensityProfile::SetMode(
+        Arguments.bProfileDensity
+            ? ExploreProfileMode(Arguments)
+            : VoxelDensityProfile::EMode::Disabled,
+        VoxelDensityProfile::DefaultSampleInterval);
     if (!IFileManager::Get().MakeDirectory(*Arguments.OutDirectory, true))
     {
         UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] Could not create output directory '%s'."),
@@ -3899,7 +4225,9 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
             const int32 Cells = Level < FullRes ? CHUNK_SIZE : CoarseCells;
             const int32 Step = FMath::Max(1, Extent / Cells);
             VoxelDensityProfile::Reset();
-            VoxelDensityProfile::SetEnabled(true);
+            VoxelDensityProfile::SetMode(
+                ExploreProfileMode(Arguments),
+                VoxelDensityProfile::DefaultSampleInterval);
             const double Start = FPlatformTime::Seconds();
             const bool bBanded = Level >= CutMin;
             const FVoxelMeshData Mesh = World.Mesher->GenerateMesh(
@@ -3913,7 +4241,7 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
             const uint64 Lookups = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::TunnelCacheLookup)];
             const uint64 Hits = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::TunnelCacheHit)];
             const uint64 SdfBuilds = Profile.Counters[static_cast<int32>(VoxelDensityProfile::ECounter::SdfCacheBuild)];
-            const double DensityUs = static_cast<double>(Profile.Cycles[DensityIndex])
+            const double DensityUs = static_cast<double>(Profile.WallCycles[DensityIndex])
                 * FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeLODProfile] level=%d step=%d cells=%d banded=%d seconds=%.6f density_calls=%llu "
@@ -3930,7 +4258,17 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
                 Mesh.Vertices.Num(), Mesh.Triangles.Num() / 3,
                 Mesh.IsEmpty() ? 1 : 0);
         }
-        VoxelDensityProfile::SetEnabled(false);
+        if (Arguments.bProfileDensity)
+        {
+            VoxelDensityProfile::Reset();
+            VoxelDensityProfile::SetMode(
+                ExploreProfileMode(Arguments),
+                VoxelDensityProfile::DefaultSampleInterval);
+        }
+        else
+        {
+            VoxelDensityProfile::SetMode(VoxelDensityProfile::EMode::Disabled);
+        }
     }
 
     FExploreRunOutput Output;
@@ -3946,12 +4284,13 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
     {
         const double Start = FPlatformTime::Seconds();
         const bool bWalkOk = RunWalk(Arguments, World, Output.Walk, Budget);
+        Output.WalkSeconds = FPlatformTime::Seconds() - Start;
         if (!bWalkOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] walk %.3fs (%s)"),
-            FPlatformTime::Seconds() - Start, *Output.Walk.Status);
+            Output.WalkSeconds, *Output.Walk.Status);
         CameraSeedWalk = &Output.Walk;
         if (bWalkOk && !Budget.bTruncated)
         {
@@ -3965,17 +4304,62 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         // JSON so the selected mode remains render.
         const double Start = FPlatformTime::Seconds();
         const bool bWalkOk = RunWalk(Arguments, World, RenderSeedWalk, Budget);
+        Output.WalkSeconds = FPlatformTime::Seconds() - Start;
         if (!bWalkOk && !Budget.bTruncated)
         {
             bRequestedModeFailed = true;
         }
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render camera seed walk %.3fs (%s)"),
-            FPlatformTime::Seconds() - Start, *RenderSeedWalk.Status);
+            Output.WalkSeconds, *RenderSeedWalk.Status);
         CameraSeedWalk = &RenderSeedWalk;
         // Keep the private render seed capture available to the run-level shared-grid report;
         // the walk object is still omitted from the public JSON when walk was not requested.
         Output.Walk = MoveTemp(RenderSeedWalk);
         CameraSeedWalk = &Output.Walk;
+    }
+
+    // A profile report gets a genuine unprofiled reference for the same canonical mesh region.
+    // The reference world is fresh, profiling is disabled for it, and its geometry hash is
+    // compared with the profiled world below.  This is deliberately a diagnostic second pass;
+    // it cannot affect the profiled world's generation or its deterministic output.
+    if (Arguments.bProfileDensity
+        && (Arguments.bRender || Arguments.bExport)
+        && CameraSeedWalk != nullptr
+        && !Budget.bTruncated)
+    {
+        Output.ProfilerComparison.Scope = TEXT("canonical_mesh_export");
+        VoxelDensityProfile::SetMode(VoxelDensityProfile::EMode::Disabled);
+        FExploreWorld ReferenceWorld;
+        FString ReferenceError;
+        if (ReferenceWorld.Build(Arguments, ReferenceError))
+        {
+            FExploreBudget ReferenceBudget(MainStartSeconds, Budget.LimitSeconds);
+            const double ReferenceStart = FPlatformTime::Seconds();
+            if (EnsureExploreMesh(
+                    Arguments, ReferenceWorld, CameraSeedWalk, ReferenceBudget, ReferenceError)
+                && ReferenceWorld.bExploreMeshComplete)
+            {
+                Output.ProfilerComparison.bAvailable = true;
+                Output.ProfilerComparison.UnprofiledSeconds = ReferenceWorld.ExploreMeshSeconds;
+                Output.ProfilerComparison.UnprofiledGeometryHash = ReferenceWorld.ExploreGeometryHash;
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("[VoxelForgeProfiler] unprofiled reference failed after %.3fs: %s"),
+                    FPlatformTime::Seconds() - ReferenceStart, *ReferenceError);
+            }
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[VoxelForgeProfiler] could not build unprofiled reference world: %s"),
+                *ReferenceError);
+        }
+        VoxelDensityProfile::Reset();
+        VoxelDensityProfile::SetMode(
+            ExploreProfileMode(Arguments),
+            VoxelDensityProfile::DefaultSampleInterval);
     }
     if (Arguments.bRender)
     {
@@ -4068,6 +4452,76 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
     Output.TruncatedDuring = Budget.TruncatedDuring;
     Output.CompletedModes = Budget.CompletedModes;
 
+    Output.Profile = VoxelDensityProfile::Snapshot();
+    Output.bHasProfile = true;
+    if (Arguments.bProfileDensity)
+    {
+        if (Output.ProfilerComparison.bAvailable)
+        {
+            Output.ProfilerComparison.ProfiledSeconds = World.ExploreMeshSeconds;
+            Output.ProfilerComparison.ProfiledGeometryHash = World.ExploreGeometryHash;
+            Output.ProfilerComparison.DiscrepancySeconds =
+                Output.ProfilerComparison.ProfiledSeconds
+                - Output.ProfilerComparison.UnprofiledSeconds;
+            Output.ProfilerComparison.DiscrepancyPercent =
+                Output.ProfilerComparison.UnprofiledSeconds > 0.0
+                    ? Output.ProfilerComparison.DiscrepancySeconds
+                        * 100.0 / Output.ProfilerComparison.UnprofiledSeconds
+                    : 0.0;
+            Output.ProfilerComparison.Ratio =
+                Output.ProfilerComparison.UnprofiledSeconds > 0.0
+                    ? Output.ProfilerComparison.ProfiledSeconds
+                        / Output.ProfilerComparison.UnprofiledSeconds
+                    : 0.0;
+            Output.ProfilerComparison.bGeometryEqual =
+                !Output.ProfilerComparison.ProfiledGeometryHash.IsEmpty()
+                && Output.ProfilerComparison.ProfiledGeometryHash
+                    == Output.ProfilerComparison.UnprofiledGeometryHash;
+            const bool bWithinTarget = FMath::Abs(Output.ProfilerComparison.DiscrepancyPercent) <= 20.0;
+            const bool bSelfCheckPassed = bWithinTarget
+                && Output.ProfilerComparison.bGeometryEqual;
+            Output.ProfilerComparison.SelfCheck = bSelfCheckPassed ? TEXT("passed") : TEXT("FAILED");
+            if (bSelfCheckPassed)
+            {
+                UE_LOG(
+                    LogTemp, Display,
+                    TEXT("[VoxelForgeProfiler] profiled_total=%.6fs unprofiled_total=%.6fs "
+                         "discrepancy=%.2f%% ratio=%.3fx geometry_equal=%s self_check=%s"),
+                    Output.ProfilerComparison.ProfiledSeconds,
+                    Output.ProfilerComparison.UnprofiledSeconds,
+                    Output.ProfilerComparison.DiscrepancyPercent,
+                    Output.ProfilerComparison.Ratio,
+                    Output.ProfilerComparison.bGeometryEqual ? TEXT("yes") : TEXT("no"),
+                    *Output.ProfilerComparison.SelfCheck);
+            }
+            else
+            {
+                UE_LOG(
+                    LogTemp, Error,
+                    TEXT("[VoxelForgeProfiler] profiled_total=%.6fs unprofiled_total=%.6fs "
+                         "discrepancy=%.2f%% ratio=%.3fx geometry_equal=%s self_check=%s"),
+                    Output.ProfilerComparison.ProfiledSeconds,
+                    Output.ProfilerComparison.UnprofiledSeconds,
+                    Output.ProfilerComparison.DiscrepancyPercent,
+                    Output.ProfilerComparison.Ratio,
+                    Output.ProfilerComparison.bGeometryEqual ? TEXT("yes") : TEXT("no"),
+                    *Output.ProfilerComparison.SelfCheck);
+            }
+            if (!bSelfCheckPassed)
+            {
+                bRequestedModeFailed = true;
+            }
+        }
+        else
+        {
+            Output.ProfilerComparison.Scope = TEXT("canonical_mesh_export");
+            Output.ProfilerComparison.SelfCheck = TEXT("not_available");
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeProfiler] self-check could not obtain an unprofiled reference."));
+            bRequestedModeFailed = true;
+        }
+    }
+
     // Build the payload twice before adding the assertion itself. This is deliberately a string
     // comparison over a fixed-order writer, not a TMap/pretty-printer whose key order could drift.
     const FString Payload = BuildExploreJson(Arguments, World, Output, false, 0);
@@ -4110,6 +4564,10 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] Could not write '%s'."), *ReportPath);
         return 1;
     }
+    if (OutJson != nullptr)
+    {
+        *OutJson = Json;
+    }
 
     UE_LOG(LogTemp, Display,
         TEXT("[VoxelForgeExplore] setup %.3fs, total %.3fs; report=%s; json_deterministic=%s"),
@@ -4123,7 +4581,7 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         const VoxelDensityProfile::FSnapshot Profile = VoxelDensityProfile::Snapshot();
         const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
         const uint64 DensityCalls = Profile.Calls[static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
-        const uint64 DensityCycles = Profile.Cycles[static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
+        const uint64 DensityCycles = Profile.WallCycles[static_cast<int32>(VoxelDensityProfile::EBucket::GetDensityAt)];
         const double DensityTotalUs = static_cast<double>(DensityCycles) * CycleToMicroseconds;
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeDensityProfile] total calls=%llu total_us=%.3f us_per_call=%.6f"),
@@ -4213,7 +4671,7 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         for (const VoxelDensityProfile::EBucket Phase : DensityPhases)
         {
             const int32 PhaseIndex = static_cast<int32>(Phase);
-            DensityAttributionCycles += Profile.Cycles[PhaseIndex];
+            DensityAttributionCycles += Profile.WallCycles[PhaseIndex];
             DensityAttributionCalls += Profile.Calls[PhaseIndex];
         }
         const double DensityAttributionUs =
@@ -4247,7 +4705,7 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
             {
                 continue;
             }
-            const double TotalUs = static_cast<double>(Profile.Cycles[Index]) * CycleToMicroseconds;
+            const double TotalUs = static_cast<double>(Profile.WallCycles[Index]) * CycleToMicroseconds;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeDensityProfile] op=%s calls=%llu total_us=%.3f us_per_call=%.6f"),
                 VoxelDensityProfile::BucketName(static_cast<VoxelDensityProfile::EBucket>(Index)),
@@ -4268,13 +4726,13 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
         for (const VoxelDensityProfile::EBucket Bucket : MesherBuckets)
         {
             const int32 BucketIndex = static_cast<int32>(Bucket);
-            MesherAttributionCycles += Profile.Cycles[BucketIndex];
+            MesherAttributionCycles += Profile.WallCycles[BucketIndex];
             MesherAttributionCalls += Profile.Calls[BucketIndex];
         }
         const int32 MesherTotalIndex = static_cast<int32>(
             VoxelDensityProfile::EBucket::MesherGenerateMesh);
         const double MesherTotalUs = static_cast<double>(
-            Profile.Cycles[MesherTotalIndex]) * CycleToMicroseconds;
+            Profile.WallCycles[MesherTotalIndex]) * CycleToMicroseconds;
         const double MesherAttributionUs = static_cast<double>(
             MesherAttributionCycles) * CycleToMicroseconds;
         UE_LOG(LogTemp, Display,
@@ -4285,7 +4743,360 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
             MesherTotalUs, MesherAttributionUs, MesherTotalUs - MesherAttributionUs,
             MesherTotalUs > 0.0 ? MesherAttributionUs * 100.0 / MesherTotalUs : 0.0,
             static_cast<unsigned long long>(MesherAttributionCalls));
-        VoxelDensityProfile::SetEnabled(false);
+        VoxelDensityProfile::SetMode(VoxelDensityProfile::EMode::Disabled);
     }
+    // Per-case isolation boundary.  The UObject world dies with this function; worker-local
+    // caches are keyed by the fresh generator/manager lifetime and the diagnostics are reset before
+    // the next case.  No case may inherit profiler counters or a live profiler mode.
+    VoxelDensityProfile::Reset();
+    VoxelDensityProfile::SetMode(VoxelDensityProfile::EMode::Disabled);
     return bRequestedModeFailed ? 2 : 0;
+}
+
+namespace
+{
+FString SanitizeBatchCaseId(const FString& InId, int32 Index)
+{
+    FString Result;
+    for (const TCHAR Character : InId)
+    {
+        const bool bAsciiAlphaNumeric =
+            (Character >= TEXT('a') && Character <= TEXT('z'))
+            || (Character >= TEXT('A') && Character <= TEXT('Z'))
+            || (Character >= TEXT('0') && Character <= TEXT('9'));
+        if (bAsciiAlphaNumeric || Character == TEXT('_') || Character == TEXT('-'))
+        {
+            Result.AppendChar(Character);
+        }
+    }
+    if (Result.IsEmpty())
+    {
+        Result = FString::Printf(TEXT("case_%03d"), Index);
+    }
+    return Result;
+}
+
+bool JsonNumber(const TSharedPtr<FJsonObject>& Object, const TCHAR* Key, double& OutValue)
+{
+    if (!Object.IsValid() || !Object->HasField(Key))
+    {
+        return false;
+    }
+    OutValue = Object->GetNumberField(Key);
+    return FMath::IsFinite(OutValue);
+}
+
+bool JsonString(const TSharedPtr<FJsonObject>& Object, const TCHAR* Key, FString& OutValue)
+{
+    if (!Object.IsValid() || !Object->HasField(Key))
+    {
+        return false;
+    }
+    OutValue = Object->GetStringField(Key);
+    return true;
+}
+
+bool JsonBool(const TSharedPtr<FJsonObject>& Object, const TCHAR* Key, bool& OutValue)
+{
+    if (!Object.IsValid() || !Object->HasField(Key))
+    {
+        return false;
+    }
+    OutValue = Object->GetBoolField(Key);
+    return true;
+}
+
+bool BuildBatchCaseParams(
+    const TSharedPtr<FJsonObject>& Case,
+    const FString& CaseOutDirectory,
+    FString& OutParams,
+    FString& OutError)
+{
+    if (!Case.IsValid())
+    {
+        OutError = TEXT("Each batch case must be a JSON object.");
+        return false;
+    }
+
+    double Number = 0.0;
+    int32 Seed = 0;
+    if (JsonNumber(Case, TEXT("seed"), Number))
+    {
+        Seed = FMath::RoundToInt(Number);
+    }
+    FString Archetype = TEXT("Maze");
+    JsonString(Case, TEXT("archetype"), Archetype);
+    int32 Slot = 4;
+    if (JsonNumber(Case, TEXT("slot"), Number))
+    {
+        Slot = FMath::RoundToInt(Number);
+    }
+    int32 ExportSize = DefaultExportSize;
+    if (JsonNumber(Case, TEXT("export_size"), Number))
+    {
+        ExportSize = FMath::RoundToInt(Number);
+    }
+    int32 ExportStep = DefaultExportStep;
+    if (JsonNumber(Case, TEXT("export_step"), Number)
+        || JsonNumber(Case, TEXT("step"), Number))
+    {
+        ExportStep = FMath::RoundToInt(Number);
+    }
+    if (JsonNumber(Case, TEXT("lod"), Number))
+    {
+        const int32 Lod = FMath::RoundToInt(Number);
+        if (Lod < 0 || Lod > 3)
+        {
+            OutError = TEXT("case.lod must be in [0,3].");
+            return false;
+        }
+        ExportStep = 1 << Lod;
+    }
+
+    FString Modes = TEXT("export");
+    JsonString(Case, TEXT("modes"), Modes);
+    bool bOperatorStack = true;
+    JsonBool(Case, TEXT("operator_stack"), bOperatorStack);
+    bool bProfileDensity = false;
+    JsonBool(Case, TEXT("profile_density"), bProfileDensity);
+    bool bProfileDensityFull = false;
+    JsonBool(Case, TEXT("profile_density_full"), bProfileDensityFull);
+    bProfileDensity |= bProfileDensityFull;
+    bool bProfileLod = false;
+    JsonBool(Case, TEXT("profile_lod"), bProfileLod);
+    bool bFailureFocus = false;
+    JsonBool(Case, TEXT("failure_focus_render"), bFailureFocus);
+
+    OutParams = FString::Printf(
+        TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
+             "-exportsize=%d -exportstep=%d -failurefocus=%d -out=\"%s\""),
+        Seed, *Archetype, Slot, *Modes, bOperatorStack ? 1 : 0,
+        ExportSize, ExportStep, bFailureFocus ? 1 : 0, *CaseOutDirectory);
+
+    if (bProfileDensity)
+    {
+        OutParams += bProfileDensityFull
+            ? TEXT(" -profiledensityfull")
+            : TEXT(" -profiledensity");
+    }
+    if (bProfileLod)
+    {
+        OutParams += TEXT(" -profilelod");
+    }
+
+    const TPair<const TCHAR*, const TCHAR*> IntegerFields[] = {
+        { TEXT("render_width"), TEXT("renderwidth") },
+        { TEXT("render_height"), TEXT("renderheight") },
+        { TEXT("max_walk_cells"), TEXT("maxwalkcells") },
+    };
+    for (const auto& Field : IntegerFields)
+    {
+        if (JsonNumber(Case, Field.Key, Number))
+        {
+            OutParams += FString::Printf(TEXT(" -%s=%d"),
+                Field.Value, FMath::RoundToInt(Number));
+        }
+    }
+    const TPair<const TCHAR*, const TCHAR*> FloatFields[] = {
+        { TEXT("render_step"), TEXT("renderstep") },
+        { TEXT("render_max_distance"), TEXT("rendermaxdistance") },
+        { TEXT("surface_roughness"), TEXT("surfaceroughness") },
+    };
+    for (const auto& Field : FloatFields)
+    {
+        if (JsonNumber(Case, Field.Key, Number))
+        {
+            OutParams += FString::Printf(TEXT(" -%s=%.9g"), Field.Value, Number);
+        }
+    }
+
+    return true;
+}
+
+int32 RunBatch(const FString& Params)
+{
+    FString BatchPath;
+    FString OutText;
+    if (!FParse::Value(*Params, TEXT("batch="), BatchPath)
+        || !FParse::Value(*Params, TEXT("out="), OutText))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeExplore] batch requires -batch=<json> and an absolute -out=<Saved path>."));
+        return 1;
+    }
+    if (FPaths::IsRelative(OutText))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeExplore] batch -out must be absolute and under '%s'."),
+            *VoxelForgeSavedRoot());
+        return 1;
+    }
+    const FString BatchOutDirectory = FPaths::ConvertRelativePathToFull(OutText);
+    if (!IsUnderVoxelForgeSaved(BatchOutDirectory))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeExplore] batch -out must be under '%s' (got '%s')."),
+            *VoxelForgeSavedRoot(), *BatchOutDirectory);
+        return 1;
+    }
+    if (!IFileManager::Get().MakeDirectory(*BatchOutDirectory, true))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeExplore] could not create batch output '%s'."),
+            *BatchOutDirectory);
+        return 1;
+    }
+
+    BatchPath = FPaths::ConvertRelativePathToFull(BatchPath);
+    FString BatchText;
+    if (!FFileHelper::LoadFileToString(BatchText, *BatchPath))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] could not read batch file '%s'."), *BatchPath);
+        return 1;
+    }
+    TSharedPtr<FJsonObject> Root;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BatchText);
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] batch file is not valid JSON."));
+        return 1;
+    }
+    const TArray<TSharedPtr<FJsonValue>>* Cases = nullptr;
+    if (!Root->TryGetArrayField(TEXT("cases"), Cases) || Cases == nullptr || Cases->Num() == 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] batch JSON needs a non-empty 'cases' array."));
+        return 1;
+    }
+    if (Cases->Num() > 256)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] batch is capped at 256 cases."));
+        return 1;
+    }
+
+    double BatchBudgetMinutes = 29.0;
+    double Number = 0.0;
+    if (JsonNumber(Root, TEXT("budget_minutes"), Number))
+    {
+        BatchBudgetMinutes = Number;
+    }
+    if (FParse::Value(*Params, TEXT("batchbudget="), Number))
+    {
+        BatchBudgetMinutes = Number;
+    }
+    BatchBudgetMinutes = FMath::Clamp(BatchBudgetMinutes, 0.01, 30.0);
+    const double BatchStartSeconds = FPlatformTime::Seconds();
+    bool bTruncated = false;
+    int32 CompletedCases = 0;
+    int32 FailedCases = 0;
+    TSet<FString> UsedCaseIds;
+    TArray<TSharedPtr<FJsonValue>> CaseReports;
+    CaseReports.Reserve(Cases->Num());
+
+    for (int32 Index = 0; Index < Cases->Num(); ++Index)
+    {
+        const double RemainingSeconds = BatchBudgetMinutes * 60.0
+            - (FPlatformTime::Seconds() - BatchStartSeconds);
+        if (RemainingSeconds <= 0.25)
+        {
+            bTruncated = true;
+            break;
+        }
+        const TSharedPtr<FJsonObject> Case = (*Cases)[Index]->AsObject();
+        FString CaseId;
+        JsonString(Case, TEXT("id"), CaseId);
+        CaseId = SanitizeBatchCaseId(CaseId, Index);
+        const FString BaseCaseId = CaseId;
+        int32 Suffix = 1;
+        while (UsedCaseIds.Contains(CaseId))
+        {
+            CaseId = FString::Printf(TEXT("%s_%d"), *BaseCaseId, Suffix++);
+        }
+        UsedCaseIds.Add(CaseId);
+        FString CaseOutDirectory = FPaths::Combine(BatchOutDirectory, TEXT("cases"), CaseId);
+        FString CaseParams;
+        FString CaseError;
+        if (!BuildBatchCaseParams(Case, CaseOutDirectory, CaseParams, CaseError))
+        {
+            UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] batch case %d (%s): %s"),
+                Index, *CaseId, *CaseError);
+            TSharedPtr<FJsonObject> CaseReport = MakeShared<FJsonObject>();
+        CaseReport->SetStringField(TEXT("case_id"), CaseId);
+        CaseReport->SetNumberField(TEXT("case_index"), Index);
+        CaseReport->SetNumberField(TEXT("case_exit_code"), 1);
+        CaseReport->SetStringField(TEXT("status"), TEXT("invalid"));
+            CaseReport->SetStringField(TEXT("error"), CaseError);
+            CaseReports.Add(MakeShared<FJsonValueObject>(CaseReport));
+            ++CompletedCases;
+            ++FailedCases;
+            continue;
+        }
+
+        double CaseBudgetMinutes = FMath::Min(25.0, RemainingSeconds / 60.0);
+        if (JsonNumber(Case, TEXT("budget_minutes"), Number))
+        {
+            CaseBudgetMinutes = FMath::Min(CaseBudgetMinutes, Number);
+        }
+        CaseBudgetMinutes = FMath::Clamp(CaseBudgetMinutes, 0.01, 30.0);
+        CaseParams += FString::Printf(TEXT(" -budget=%.9g"), CaseBudgetMinutes);
+
+        FString CaseJson;
+        const int32 CaseResult = RunExploreCase(CaseParams, &CaseJson);
+        TSharedPtr<FJsonObject> CaseReport;
+        const TSharedRef<TJsonReader<>> CaseReader = TJsonReaderFactory<>::Create(CaseJson);
+        if (!FJsonSerializer::Deserialize(CaseReader, CaseReport) || !CaseReport.IsValid())
+        {
+            CaseReport = MakeShared<FJsonObject>();
+            CaseReport->SetStringField(TEXT("error"), TEXT("case did not produce a JSON report"));
+        }
+        CaseReport->SetStringField(TEXT("case_id"), CaseId);
+        CaseReport->SetNumberField(TEXT("case_index"), Index);
+        CaseReport->SetNumberField(TEXT("case_exit_code"), CaseResult);
+        CaseReports.Add(MakeShared<FJsonValueObject>(CaseReport));
+        ++CompletedCases;
+        if (CaseResult != 0)
+        {
+            ++FailedCases;
+        }
+    }
+
+    TSharedPtr<FJsonObject> BatchReport = MakeShared<FJsonObject>();
+    BatchReport->SetNumberField(TEXT("schema_version"), 2);
+    BatchReport->SetStringField(TEXT("tool"), TEXT("VoxelForgeExplore"));
+    BatchReport->SetBoolField(TEXT("batch"), true);
+    BatchReport->SetStringField(TEXT("input_file"), BatchPath);
+    BatchReport->SetStringField(TEXT("output_directory"), BatchOutDirectory);
+    BatchReport->SetNumberField(TEXT("budget_minutes"), BatchBudgetMinutes);
+    BatchReport->SetNumberField(TEXT("elapsed_seconds"), FPlatformTime::Seconds() - BatchStartSeconds);
+    BatchReport->SetBoolField(TEXT("truncated"), bTruncated);
+    BatchReport->SetNumberField(TEXT("completed_cases"), CompletedCases);
+    BatchReport->SetNumberField(TEXT("failed_cases"), FailedCases);
+    BatchReport->SetArrayField(TEXT("cases"), MoveTemp(CaseReports));
+
+    FString BatchJson;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BatchJson);
+    if (!FJsonSerializer::Serialize(BatchReport.ToSharedRef(), Writer)
+        || !FFileHelper::SaveStringToFile(
+            BatchJson,
+            *FPaths::Combine(BatchOutDirectory, TEXT("batch.json")),
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] could not write batch.json."));
+        return 1;
+    }
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeExplore] batch completed=%d failed=%d truncated=%s report=%s"),
+        CompletedCases, FailedCases, bTruncated ? TEXT("yes") : TEXT("no"),
+        *FPaths::Combine(BatchOutDirectory, TEXT("batch.json")));
+    return FailedCases > 0 || bTruncated ? 2 : 0;
+}
+}
+
+int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
+{
+    FString BatchPath;
+    if (FParse::Value(*Params, TEXT("batch="), BatchPath))
+    {
+        return RunBatch(Params);
+    }
+    return RunExploreCase(Params, nullptr);
 }

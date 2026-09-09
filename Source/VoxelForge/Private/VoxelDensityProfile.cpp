@@ -5,6 +5,9 @@ namespace VoxelDensityProfile
     namespace
     {
         std::atomic<bool> GEnabled(false);
+        std::atomic<EMode> GMode(EMode::Disabled);
+        std::atomic<uint32> GSampleInterval(DefaultSampleInterval);
+        std::atomic<uint64> GTimerPairCycles(0);
 
         // The old implementation performed a contended atomic fetch_add for every timer and
         // counter.  A TunnelNetwork sample can close twenty-plus ranges and add several
@@ -15,7 +18,12 @@ namespace VoxelDensityProfile
         {
             uint64 Calls[BucketCount]{};
             uint64 Cycles[BucketCount]{};
+            uint64 Samples[BucketCount]{};
             uint64 Counters[CounterCount]{};
+            uint32 SampleSequence[BucketCount]{};
+            uint32 BlockCallCount[BucketCount]{};
+            uint64 BlockStartCycles[BucketCount]{};
+            bool BlockActive[BucketCount]{};
 
             uint64 TunnelCacheCapacityEntries = 0;
             uint64 TunnelCacheValidEntries = 0;
@@ -24,6 +32,7 @@ namespace VoxelDensityProfile
             uint64 TunnelCacheEntryBytes = 0;
             uint64 TunnelCacheLargestEntryBytes = 0;
             uint64 TunnelCacheLargestWorkerValidEntries = 0;
+            FCacheMemoryBreakdown TunnelCacheBreakdown;
 
             uint64 RoomGraphCacheCapacityEntries = 0;
             uint64 RoomGraphCacheValidEntries = 0;
@@ -32,12 +41,16 @@ namespace VoxelDensityProfile
             uint64 RoomGraphCacheEntryBytes = 0;
             uint64 RoomGraphCacheLargestEntryBytes = 0;
             uint64 RoomGraphCacheLargestWorkerValidEntries = 0;
+            FCacheMemoryBreakdown RoomGraphCacheBreakdown;
 
             std::atomic<FThreadState*> Next{nullptr};
         };
 
         std::atomic<FThreadState*> GThreadStates{nullptr};
         thread_local FThreadState* GThreadState = nullptr;
+        thread_local uint32 GScopeDepth = 0;
+        thread_local bool GScopeSampled = false;
+        thread_local bool GSampledScopeActive = false;
 
         FThreadState& GetThreadState()
         {
@@ -64,16 +77,88 @@ namespace VoxelDensityProfile
                 ? Index
                 : static_cast<int32>(EBucket::OtherOp);
         }
+
+        bool IsSampledScopeEnabled(EBucket Bucket)
+        {
+            // Sampled mode pays for the trustworthy parent and mesh containers only.  Fine
+            // operation scopes remain available in Full mode, or through UE Insights scopes,
+            // without putting a Begin/End and thread-local bookkeeping on every density call.
+            switch (Bucket)
+            {
+            case EBucket::GetDensityAt:
+            case EBucket::MesherGenerateMesh:
+            case EBucket::MesherDensityGrid:
+            case EBucket::MesherOther:
+                return true;
+            default:
+                return false;
+            }
+        }
     }
 
     void SetEnabled(bool bEnabled)
     {
-        GEnabled.store(bEnabled, std::memory_order_relaxed);
+        SetMode(bEnabled ? EMode::Sampled : EMode::Disabled, DefaultSampleInterval);
+    }
+
+    void SetMode(EMode Mode, uint32 SampleInterval)
+    {
+        if (SampleInterval == 0)
+        {
+            SampleInterval = DefaultSampleInterval;
+        }
+        GSampleInterval.store(SampleInterval, std::memory_order_relaxed);
+        GMode.store(Mode, std::memory_order_relaxed);
+        GEnabled.store(Mode != EMode::Disabled, std::memory_order_relaxed);
+        if (Mode != EMode::Disabled && GTimerPairCycles.load(std::memory_order_relaxed) == 0)
+        {
+            CalibrateTimer();
+        }
     }
 
     bool IsEnabled()
     {
         return GEnabled.load(std::memory_order_relaxed);
+    }
+
+    bool IsCycleTimingEnabled()
+    {
+        return GMode.load(std::memory_order_relaxed) != EMode::Disabled;
+    }
+
+    EMode GetMode()
+    {
+        return GMode.load(std::memory_order_relaxed);
+    }
+
+    uint32 GetSampleInterval()
+    {
+        return GSampleInterval.load(std::memory_order_relaxed);
+    }
+
+    uint64 GetTimerPairCycles()
+    {
+        return GTimerPairCycles.load(std::memory_order_relaxed);
+    }
+
+    void CalibrateTimer()
+    {
+        constexpr uint32 Iterations = 100000;
+        volatile uint64 Sink = 0;
+        const uint64 Start = FPlatformTime::Cycles64();
+        for (uint32 Index = 0; Index < Iterations; ++Index)
+        {
+            const uint64 A = FPlatformTime::Cycles64();
+            const uint64 B = FPlatformTime::Cycles64();
+            Sink ^= (B - A);
+        }
+        const uint64 End = FPlatformTime::Cycles64();
+        const uint64 Total = End - Start;
+        const uint64 PairCycles = Total > 0
+            ? FMath::Max<uint64>(1, Total / Iterations)
+            : 1;
+        GTimerPairCycles.store(PairCycles, std::memory_order_relaxed);
+        (void)Sink;
     }
 
     void Reset()
@@ -86,12 +171,37 @@ namespace VoxelDensityProfile
             {
                 State->Calls[Index] = 0;
                 State->Cycles[Index] = 0;
+                State->Samples[Index] = 0;
             }
             for (int32 Index = 0; Index < CounterCount; ++Index)
             {
                 State->Counters[Index] = 0;
             }
+            for (int32 Index = 0; Index < BucketCount; ++Index)
+            {
+                State->SampleSequence[Index] = 0;
+                State->BlockCallCount[Index] = 0;
+                State->BlockStartCycles[Index] = 0;
+                State->BlockActive[Index] = false;
+            }
+            State->TunnelCacheCapacityEntries = 0;
+            State->TunnelCacheValidEntries = 0;
+            State->TunnelCacheStaticBytes = 0;
+            State->TunnelCacheDynamicBytes = 0;
+            State->TunnelCacheEntryBytes = 0;
+            State->TunnelCacheLargestEntryBytes = 0;
+            State->TunnelCacheBreakdown = FCacheMemoryBreakdown();
+            State->RoomGraphCacheCapacityEntries = 0;
+            State->RoomGraphCacheValidEntries = 0;
+            State->RoomGraphCacheStaticBytes = 0;
+            State->RoomGraphCacheDynamicBytes = 0;
+            State->RoomGraphCacheEntryBytes = 0;
+            State->RoomGraphCacheLargestEntryBytes = 0;
+            State->RoomGraphCacheBreakdown = FCacheMemoryBreakdown();
         }
+        GScopeDepth = 0;
+        GScopeSampled = false;
+        GSampledScopeActive = false;
     }
 
     FSnapshot Snapshot()
@@ -104,7 +214,39 @@ namespace VoxelDensityProfile
             for (int32 Index = 0; Index < BucketCount; ++Index)
             {
                 Result.Calls[Index] += State->Calls[Index];
-                Result.Cycles[Index] += State->Cycles[Index];
+                Result.Samples[Index] += State->Samples[Index];
+                if (State->Samples[Index] == 0)
+                {
+                    Result.Cycles[Index] += State->Cycles[Index];
+                }
+                else
+                {
+                    // Store raw sampled cycles in the worker-local state.  Estimate the bucket
+                    // from its observed call/sample ratio at aggregation time.  This matters for
+                    // small buckets: multiplying every sample by 64 would overstate a bucket with
+                    // only eight calls where all eight were sampled.
+                    const double Scale = static_cast<double>(State->Calls[Index])
+                        / static_cast<double>(State->Samples[Index]);
+                    const double EstimatedCycles = static_cast<double>(State->Cycles[Index]) * Scale;
+                    Result.Cycles[Index] += EstimatedCycles > static_cast<double>(MAX_uint64)
+                        ? MAX_uint64
+                        : static_cast<uint64>(EstimatedCycles + 0.5);
+                }
+
+                if (State->Calls[Index] > 0)
+                {
+                    ++Result.ActiveWorkers[Index];
+                    const double EstimatedWorkerCycles = State->Samples[Index] == 0
+                        ? static_cast<double>(State->Cycles[Index])
+                        : static_cast<double>(State->Cycles[Index])
+                            * static_cast<double>(State->Calls[Index])
+                            / static_cast<double>(State->Samples[Index]);
+                    Result.WallCycles[Index] = FMath::Max(
+                        Result.WallCycles[Index],
+                        EstimatedWorkerCycles > static_cast<double>(MAX_uint64)
+                            ? MAX_uint64
+                            : static_cast<uint64>(EstimatedWorkerCycles + 0.5));
+                }
             }
             for (int32 Index = 0; Index < CounterCount; ++Index)
             {
@@ -129,6 +271,7 @@ namespace VoxelDensityProfile
                     State->TunnelCacheValidEntries);
                 Result.TunnelCacheLargestWorkerBytes = FMath::Max(
                     Result.TunnelCacheLargestWorkerBytes, TunnelWorkerBytes);
+                Result.TunnelCacheBreakdown += State->TunnelCacheBreakdown;
             }
 
             const uint64 RoomGraphWorkerBytes = State->RoomGraphCacheStaticBytes
@@ -149,8 +292,12 @@ namespace VoxelDensityProfile
                     State->RoomGraphCacheValidEntries);
                 Result.RoomGraphCacheLargestWorkerBytes = FMath::Max(
                     Result.RoomGraphCacheLargestWorkerBytes, RoomGraphWorkerBytes);
+                Result.RoomGraphCacheBreakdown += State->RoomGraphCacheBreakdown;
             }
         }
+        Result.TimerPairCycles = GetTimerPairCycles();
+        Result.SampleInterval = GetSampleInterval();
+        Result.Mode = GetMode();
         return Result;
     }
 
@@ -171,11 +318,52 @@ namespace VoxelDensityProfile
         State.Cycles[Index] += Cycles;
     }
 
+    void RecordCall(EBucket Bucket)
+    {
+        const int32 Index = ToIndex(Bucket);
+        GetThreadState().Calls[Index] += 1;
+    }
+
+    bool ShouldSample(EBucket Bucket)
+    {
+        if (!IsCycleTimingEnabled())
+        {
+            return false;
+        }
+        if (GetMode() == EMode::Full)
+        {
+            return true;
+        }
+
+        FThreadState& State = GetThreadState();
+        const int32 Index = ToIndex(Bucket);
+        const uint32 Sequence = State.SampleSequence[Index]++;
+        const uint32 Interval = GetSampleInterval();
+        if ((Interval & (Interval - 1u)) == 0u)
+        {
+            return (Sequence & (Interval - 1u)) == 0u;
+        }
+        return (Sequence % Interval) == 0u;
+    }
+
+    void AddSampledMeasurement(EBucket Bucket, uint64 RawCycles)
+    {
+        const int32 Index = ToIndex(Bucket);
+        FThreadState& State = GetThreadState();
+        const uint64 TimerCost = GetTimerPairCycles();
+        const uint64 AdjustedCycles = RawCycles > TimerCost
+            ? RawCycles - TimerCost
+            : 0;
+        State.Cycles[Index] += AdjustedCycles;
+        State.Samples[Index] += 1;
+    }
+
     void SetWorkerTunnelCacheFootprint(
         uint64 CapacityEntries, uint64 ValidEntries,
         uint64 StaticBytes, uint64 DynamicBytes,
         uint64 EntryBytes, uint64 LargestEntryBytes,
-        uint64 LargestWorkerValidEntries)
+        uint64 LargestWorkerValidEntries,
+        const FCacheMemoryBreakdown& Breakdown)
     {
         if (!IsEnabled()) { return; }
         FThreadState& State = GetThreadState();
@@ -186,13 +374,15 @@ namespace VoxelDensityProfile
         State.TunnelCacheEntryBytes = EntryBytes;
         State.TunnelCacheLargestEntryBytes = LargestEntryBytes;
         State.TunnelCacheLargestWorkerValidEntries = LargestWorkerValidEntries;
+        State.TunnelCacheBreakdown = Breakdown;
     }
 
     void SetWorkerRoomGraphCacheFootprint(
         uint64 CapacityEntries, uint64 ValidEntries,
         uint64 StaticBytes, uint64 DynamicBytes,
         uint64 EntryBytes, uint64 LargestEntryBytes,
-        uint64 LargestWorkerValidEntries)
+        uint64 LargestWorkerValidEntries,
+        const FCacheMemoryBreakdown& Breakdown)
     {
         if (!IsEnabled()) { return; }
         FThreadState& State = GetThreadState();
@@ -203,6 +393,7 @@ namespace VoxelDensityProfile
         State.RoomGraphCacheEntryBytes = EntryBytes;
         State.RoomGraphCacheLargestEntryBytes = LargestEntryBytes;
         State.RoomGraphCacheLargestWorkerValidEntries = LargestWorkerValidEntries;
+        State.RoomGraphCacheBreakdown = Breakdown;
     }
 
     const TCHAR* CounterName(ECounter Counter)
@@ -356,6 +547,105 @@ namespace VoxelDensityProfile
         return TEXT("Unknown");
     }
 
+    FScopeToken BeginScope(EBucket Bucket)
+    {
+        FScopeToken Token;
+        const EMode Mode = GetMode();
+        if (!IsEnabled()
+            || (Mode == EMode::Sampled && !IsSampledScopeEnabled(Bucket)))
+        {
+            return Token;
+        }
+
+        Token.bEntered = true;
+        Token.bPreviousSampled = GScopeSampled;
+        Token.bPreviousSampledScopeActive = GSampledScopeActive;
+        ++GScopeDepth;
+
+        // For the hot parent, amortise the timer over a deterministic block of calls.  A timer
+        // pair around one ~100 ns operation is mostly the timer; a pair around 64 calls is cheap
+        // and estimates the parent from real elapsed work rather than instrumentation latency.
+        if (Mode == EMode::Sampled && Bucket == EBucket::GetDensityAt)
+        {
+            FThreadState& State = GetThreadState();
+            const int32 Index = ToIndex(Bucket);
+            const uint32 Sequence = State.SampleSequence[Index]++;
+            Token.bBlockTiming = true;
+            const uint32 Interval = GetSampleInterval();
+            const bool bBlockBoundary = (Interval & (Interval - 1u)) == 0u
+                ? (Sequence & (Interval - 1u)) == 0u
+                : (Sequence % Interval) == 0u;
+            if (bBlockBoundary && !State.BlockActive[Index])
+            {
+                State.BlockActive[Index] = true;
+                State.BlockCallCount[Index] = 0;
+                State.BlockStartCycles[Index] = FPlatformTime::Cycles64();
+            }
+            GScopeSampled = false;
+            return Token;
+        }
+
+        // Every bucket samples independently, but only one nested non-container scope owns a
+        // timer at a time.  Otherwise a sampled GetDensityAt would also start timers for every
+        // phase and operation inside that same call, measuring instrumentation instead of work.
+        // Mesher container ranges deliberately remain transparent so their grid can still expose
+        // density samples underneath them.
+        const bool bContainerScope = Bucket == EBucket::MesherGenerateMesh
+            || Bucket == EBucket::MesherDensityGrid;
+        Token.bSampled = Mode == EMode::Full
+            ? true
+            : (!GSampledScopeActive && ShouldSample(Bucket));
+        GScopeSampled = Token.bSampled;
+        if (Token.bSampled)
+        {
+            if (Mode == EMode::Sampled && !bContainerScope)
+            {
+                GSampledScopeActive = true;
+            }
+            Token.StartCycles = FPlatformTime::Cycles64();
+        }
+        return Token;
+    }
+
+    void EndScope(EBucket Bucket, const FScopeToken& Token)
+    {
+        if (!Token.bEntered)
+        {
+            return;
+        }
+
+        RecordCall(Bucket);
+        if (Token.bBlockTiming)
+        {
+            FThreadState& State = GetThreadState();
+            const int32 Index = ToIndex(Bucket);
+            ++State.BlockCallCount[Index];
+            const uint32 Interval = GetSampleInterval();
+            if (State.BlockActive[Index] && State.BlockCallCount[Index] >= Interval)
+            {
+                const uint64 RawCycles = FPlatformTime::Cycles64() - State.BlockStartCycles[Index];
+                const uint64 TimerCost = GetTimerPairCycles();
+                const uint64 AdjustedCycles = RawCycles > TimerCost
+                    ? RawCycles - TimerCost
+                    : 0;
+                State.Cycles[Index] += AdjustedCycles / FMath::Max<uint32>(1, Interval);
+                State.Samples[Index] += 1;
+                State.BlockActive[Index] = false;
+                State.BlockCallCount[Index] = 0;
+                State.BlockStartCycles[Index] = 0;
+            }
+        }
+        else if (Token.bSampled)
+        {
+            AddSampledMeasurement(Bucket, FPlatformTime::Cycles64() - Token.StartCycles);
+        }
+
+        check(GScopeDepth > 0);
+        --GScopeDepth;
+        GScopeSampled = Token.bPreviousSampled;
+        GSampledScopeActive = Token.bPreviousSampledScopeActive;
+    }
+
     FScopedTimer::~FScopedTimer()
     {
         End();
@@ -363,8 +653,8 @@ namespace VoxelDensityProfile
 
     void FScopedTimer::End()
     {
-        if (!bActive) { return; }
-        AddMeasurement(Bucket, FPlatformTime::Cycles64() - StartCycles, 1);
-        bActive = false;
+        if (!Token.bEntered) { return; }
+        EndScope(Bucket, Token);
+        Token.bEntered = false;
     }
 }

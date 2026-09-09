@@ -1688,7 +1688,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     // The shortlist is rebuilt once for a (manager, version, chunk) and is shared by the tube,
     // landing, and floor paths. No source-fit stencil or topology search is allowed below it.
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::PassageCandidates,
@@ -1714,7 +1714,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         // capsule chain unconditionally — the dominant lag source once passages became
         // 12-segment worms. Now far passages cost a single squared-distance compare.
         if (FVector::DistSquared(Pos, P.BoundCenter) > P.BoundRadiusSq) continue;
-        if (VoxelDensityProfile::IsEnabled())
+        if (VoxelDensityProfile::AreCountersEnabled())
         {
             VoxelDensityProfile::AddCounter(
                 VoxelDensityProfile::ECounter::PassageEvaluated);

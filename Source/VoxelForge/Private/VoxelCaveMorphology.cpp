@@ -346,42 +346,47 @@ bool FCaveSpatialIndex::GetColumnCandidates(
 
 SIZE_T FChunkSDFCache::GetAllocatedSize() const
 {
-    SIZE_T Bytes = 0;
-    auto AddArray = [&Bytes](const auto& Array)
+    return static_cast<SIZE_T>(GetAllocatedSizeBreakdown().TotalBytes());
+}
+
+VoxelDensityProfile::FCacheMemoryBreakdown FChunkSDFCache::GetAllocatedSizeBreakdown() const
+{
+    VoxelDensityProfile::FCacheMemoryBreakdown Breakdown;
+    auto ArrayBytes = [](const auto& Array) -> uint64
     {
-        Bytes += static_cast<SIZE_T>(Array.GetAllocatedSize());
+        return static_cast<uint64>(Array.GetAllocatedSize());
     };
 
-    AddArray(Rooms);
-    AddArray(RoomFloorJoins);
-    AddArray(Tunnels);
-    AddArray(Pits);
-    AddArray(Chimneys);
-    AddArray(Columns);
-    AddArray(SupportColumnEntries);
-    AddArray(SupportColumns);
+    Breakdown.RoomsBytes = ArrayBytes(Rooms);
+    Breakdown.RoomFloorJoinsBytes = ArrayBytes(RoomFloorJoins);
+    Breakdown.TunnelsBytes = ArrayBytes(Tunnels);
+    Breakdown.PitsBytes = ArrayBytes(Pits);
+    Breakdown.ChimneysBytes = ArrayBytes(Chimneys);
+    Breakdown.ColumnsBytes = ArrayBytes(Columns);
+    Breakdown.SupportColumnEntriesBytes = ArrayBytes(SupportColumnEntries);
+    Breakdown.SupportColumnsBytes = ArrayBytes(SupportColumns);
     for (const FTunnelSupportFloorColumn& Column : SupportColumns)
     {
-        AddArray(Column.Intervals);
+        Breakdown.SupportColumnIntervalsBytes += ArrayBytes(Column.Intervals);
     }
 
     for (const FCachedTunnel& Tunnel : Tunnels)
     {
-        AddArray(Tunnel.ControlPoints);
-        AddArray(Tunnel.ControlRadii);
-        AddArray(Tunnel.WorldControlPoints);
-        AddArray(Tunnel.WorldControlRadii);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.ControlPoints);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.ControlRadii);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlPoints);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlRadii);
     }
 
-    const FCaveSpatialIndex* Indices[] = {
-        &RoomIndex, &RoomFloorJoinIndex, &TunnelIndex, &TunnelWorldIndex,
-    };
-    for (const FCaveSpatialIndex* Index : Indices)
-    {
-        AddArray(Index->Bins);
-        AddArray(Index->CandidateIndices);
-    }
-    return Bytes;
+    Breakdown.RoomIndexBinsBytes = ArrayBytes(RoomIndex.Bins);
+    Breakdown.RoomIndexCandidatesBytes = ArrayBytes(RoomIndex.CandidateIndices);
+    Breakdown.RoomFloorJoinIndexBinsBytes = ArrayBytes(RoomFloorJoinIndex.Bins);
+    Breakdown.RoomFloorJoinIndexCandidatesBytes = ArrayBytes(RoomFloorJoinIndex.CandidateIndices);
+    Breakdown.TunnelIndexBinsBytes = ArrayBytes(TunnelIndex.Bins);
+    Breakdown.TunnelIndexCandidatesBytes = ArrayBytes(TunnelIndex.CandidateIndices);
+    Breakdown.TunnelWorldIndexBinsBytes = ArrayBytes(TunnelWorldIndex.Bins);
+    Breakdown.TunnelWorldIndexCandidatesBytes = ArrayBytes(TunnelWorldIndex.CandidateIndices);
+    return Breakdown;
 }
 
 //=============================================================================
@@ -3311,7 +3316,7 @@ void VoxelCaveMorphology::BuildChunkCache(
     const float MaxInfluence = FMath::Max(
         RoomRadiusEnvelope + FloorReliefEnvelope,
         FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope
-    ) + BlendEnvelope;
+    ) + BlendEnvelope * 3.0f;
 
     const float MaxTunnelLen = FMath::Max(Params.MaxTunnelLength, 0.0f);
 
@@ -3897,7 +3902,7 @@ void VoxelCaveMorphology::BuildChunkCache(
                 BoundR = FMath::Max(
                     BoundR, FVector::Dist(CT.BoundCenter, CT.ControlPoints[PointIndex]));
             }
-            BoundR += MaxTunnelRadius + FMath::Max(BlendK, 0.0f);
+            BoundR += MaxTunnelRadius + FMath::Max(BlendK, 0.0f) * 3.0f;
             CT.BoundRadiusSq = BoundR * BoundR;
 
             // Keep a separate bound for the world-space structural backstop. The SDF and world
@@ -4042,7 +4047,8 @@ void VoxelCaveMorphology::BuildChunkCache(
             Join.CeilingZ = CommonFloor + JoinRequiredHeight;
             Join.BoundCenter = (Join.Start + Join.End) * 0.5f;
             const float BoundRadius = 0.5f * FVector::Dist(Join.Start, Join.End)
-                + FMath::Abs(Join.Radius) + FMath::Max(BlendK, 0.0f);
+                + FMath::Abs(Join.Radius)
+                + FMath::Max(BlendK, 0.0f) * 3.0f;
             Join.BoundRadiusSq = BoundRadius * BoundRadius;
 
             if (SphereTouchesSearchXY(Join.BoundCenter, Join.BoundRadiusSq))
@@ -4392,7 +4398,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     int32 RoomCount = 0;
     const bool bIndexedRooms = Cache.RoomIndex.GetBin(
         WorldX, WorldY, WorldZ, RoomFirst, RoomCount);
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::CaveRoomCandidates,
@@ -4409,7 +4415,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         // --- DISTANCE CULL ---
         const float DistSq = VF_FloatDistSquared(WorldX, WorldY, WorldZ, Room.Center);
         if (DistSq > Room.CullRadiusSq) return;
-        if (VoxelDensityProfile::IsEnabled())
+        if (VoxelDensityProfile::AreCountersEnabled())
         {
             VoxelDensityProfile::AddCounter(
                 VoxelDensityProfile::ECounter::CaveRoomEvaluated);
@@ -4515,7 +4521,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     int32 TunnelCount = 0;
     const bool bIndexedTunnels = Cache.TunnelIndex.GetBin(
         WorldX, WorldY, WorldZ, TunnelFirst, TunnelCount);
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::CaveTunnelCandidates,
@@ -4536,7 +4542,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         // --- BOUNDING SPHERE CULL ---
         const float DistSq = VF_FloatDistSquared(WorldX, WorldY, WorldZ, Tunnel.BoundCenter);
         if (DistSq > Tunnel.BoundRadiusSq) return;
-        if (VoxelDensityProfile::IsEnabled())
+        if (VoxelDensityProfile::AreCountersEnabled())
         {
             VoxelDensityProfile::AddCounter(
                 VoxelDensityProfile::ECounter::CaveTunnelEvaluated);
@@ -4714,12 +4720,12 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     int32 TunnelCount = 0;
     const bool bIndexedTunnels = Cache.TunnelWorldIndex.GetBin(
         WorldX, WorldY, WorldZ, TunnelFirst, TunnelCount);
-    if (SupportColumn != nullptr && VoxelDensityProfile::IsEnabled())
+    if (SupportColumn != nullptr && VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
     }
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelCoreCandidates,
@@ -4753,7 +4759,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
         {
             return;
         }
-        if (VoxelDensityProfile::IsEnabled())
+        if (VoxelDensityProfile::AreCountersEnabled())
         {
             VoxelDensityProfile::AddCounter(
                 VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
@@ -4765,7 +4771,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
             ? Tunnel.WorldControlRadii : Tunnel.ControlRadii;
         if (bHasWorldChain)
         {
-            if (SupportColumn != nullptr && VoxelDensityProfile::IsEnabled())
+            if (SupportColumn != nullptr && VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::TunnelSupportFloorChecks);
@@ -4881,7 +4887,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     int32 TunnelCount = 0;
     const bool bIndexedTunnels = Cache.TunnelWorldIndex.GetBin(
         WorldX, WorldY, WorldZ, TunnelFirst, TunnelCount);
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelCoreCandidates,
@@ -4941,7 +4947,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
             if (TestTunnel(TunnelIdx))
             {
                 bSupport = true;
-                if (VoxelDensityProfile::IsEnabled())
+                if (VoxelDensityProfile::AreCountersEnabled())
                 {
                     VoxelDensityProfile::AddCounter(
                         VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
@@ -4957,7 +4963,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
             if (TestTunnel(TunnelIdx))
             {
                 bSupport = true;
-                if (VoxelDensityProfile::IsEnabled())
+                if (VoxelDensityProfile::AreCountersEnabled())
                 {
                     VoxelDensityProfile::AddCounter(
                         VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
@@ -4976,7 +4982,7 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
 {
     OutColumn.Reset();
 
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelSupportColumnBuilds);
@@ -4993,7 +4999,7 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
         }
     }
 
-    if (VoxelDensityProfile::IsEnabled())
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates,
@@ -5131,7 +5137,7 @@ float VoxelCaveMorphology::EvaluateSDF(
     const float Margin = FMath::Max(
         RoomRadiusEnvelope + FloorReliefEnvelope,
         FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope
-    ) + BlendEnvelope;
+    ) + BlendEnvelope * 3.0f;
 
     FChunkSDFCache TempCache;
     BuildChunkCache(

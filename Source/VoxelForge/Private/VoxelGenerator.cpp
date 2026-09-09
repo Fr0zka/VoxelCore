@@ -18,6 +18,7 @@
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 #include "VoxelDensityProfile.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -535,6 +536,7 @@ namespace
         uint64 EntryBytes = 0;
         uint64 LargestEntryBytes = 0;
         uint64 ValidEntries = 0;
+        VoxelDensityProfile::FCacheMemoryBreakdown Breakdown;
         for (int32 Index = 0; Index < TunnelDensityCacheSlotCount; ++Index)
         {
             const FTunnelNetworkDensityCacheEntry& Entry = Entries[Index];
@@ -547,6 +549,8 @@ namespace
             const uint64 StackBytes = static_cast<uint64>(Entry.OpStack.GetAllocatedSize());
             const uint64 TunnelCoreBytes = static_cast<uint64>(
                 Entry.TunnelCore.Cache.GetAllocatedSize());
+            Breakdown.OpStackBytes += StackBytes;
+            Breakdown += Entry.TunnelCore.Cache.GetAllocatedSizeBreakdown();
             const uint64 EntryDynamicBytes = StackBytes + TunnelCoreBytes;
             const uint64 FullEntryBytes = static_cast<uint64>(
                 sizeof(FTunnelNetworkDensityCacheEntry)) + EntryDynamicBytes;
@@ -554,6 +558,8 @@ namespace
             EntryBytes += FullEntryBytes;
             LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
         }
+        Breakdown.SlotStorageBytes = static_cast<uint64>(sizeof(FTunnelNetworkDensityCacheEntry))
+            * TunnelDensityCacheSlotCount;
 
         VoxelDensityProfile::SetWorkerTunnelCacheFootprint(
             TunnelDensityCacheSlotCount,
@@ -563,7 +569,8 @@ namespace
             DynamicBytes,
             EntryBytes,
             LargestEntryBytes,
-            ValidEntries);
+            ValidEntries,
+            Breakdown);
     }
 
     FORCEINLINE int32 TunnelDensityCacheSlot(const FIntVector& Chunk)
@@ -852,6 +859,7 @@ void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
@@ -998,7 +1006,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 
         if (!bIsGapChunk)
         {
-            if (VoxelDensityProfile::IsEnabled())
+            if (VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::TunnelCacheLookup);
@@ -1009,7 +1017,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             TunnelDensityCacheEntryForWrite = CachedEntryPtr;
             if (bCacheKeyMatches)
             {
-                if (VoxelDensityProfile::IsEnabled())
+                if (VoxelDensityProfile::AreCountersEnabled())
                 {
                     VoxelDensityProfile::AddCounter(
                         VoxelDensityProfile::ECounter::TunnelCacheHit);
@@ -1035,7 +1043,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 ActiveTunnelCoreCache = &CachedEntry.TunnelCore;
                 bLoadedTunnelDensityCache = true;
             }
-            else if (VoxelDensityProfile::IsEnabled())
+            else if (VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::TunnelCacheMiss);
@@ -1765,7 +1773,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
         if (bNeedRebuild)
         {
-            if (VoxelDensityProfile::IsEnabled())
+            if (VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::SdfCacheBuild);

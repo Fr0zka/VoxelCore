@@ -30,6 +30,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelDensityProfile.h"
 
 // Forward declarations
 struct FStrateGenerationParams;
@@ -825,6 +826,7 @@ struct FChunkSDFCache
     // arrays.  The returned value excludes sizeof(FChunkSDFCache) itself so callers can add the
     // enclosing entry's inline storage exactly once.
     SIZE_T GetAllocatedSize() const;
+    VoxelDensityProfile::FCacheMemoryBreakdown GetAllocatedSizeBreakdown() const;
 };
 
 /** Combined world-space tunnel post query; one cache scan supplies both support and air tests. */

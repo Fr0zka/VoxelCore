@@ -3293,7 +3293,7 @@ namespace
                 && SharedCache->RegionSize == RegionSize;
             if (!bCacheMatches)
             {
-                if (VoxelDensityProfile::IsEnabled())
+                if (VoxelDensityProfile::AreCountersEnabled())
                 {
                     VoxelDensityProfile::AddCounter(
                         VoxelDensityProfile::ECounter::SdfCacheBuild);
@@ -3844,7 +3844,7 @@ namespace
             FState& S = State();
             const FVector& Position = S.LastWorldPosition;
             const FChunkSDFCache& Cache = GetCache();
-            if (VoxelDensityProfile::IsEnabled())
+            if (VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
@@ -5534,6 +5534,7 @@ void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
     uint64 EntryBytes = 0;
     uint64 LargestEntryBytes = 0;
     uint64 ValidEntries = 0;
+    VoxelDensityProfile::FCacheMemoryBreakdown Breakdown;
     for (int32 Index = 0; Index < RoomGraphCacheSlotCount; ++Index)
     {
         const FRoomGraphCacheEntry& Entry = GRoomGraphCache[Index];
@@ -5543,6 +5544,7 @@ void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
         }
 
         ++ValidEntries;
+        Breakdown += Entry.Cache.GetAllocatedSizeBreakdown();
         const uint64 EntryDynamicBytes = static_cast<uint64>(Entry.Cache.GetAllocatedSize());
         const uint64 FullEntryBytes = static_cast<uint64>(sizeof(FRoomGraphCacheEntry))
             + EntryDynamicBytes;
@@ -5550,6 +5552,7 @@ void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
         EntryBytes += FullEntryBytes;
         LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
     }
+    Breakdown.SlotStorageBytes = static_cast<uint64>(sizeof(GRoomGraphCache));
 
     VoxelDensityProfile::SetWorkerRoomGraphCacheFootprint(
         RoomGraphCacheSlotCount,
@@ -5558,7 +5561,8 @@ void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
         DynamicBytes,
         EntryBytes,
         LargestEntryBytes,
-        ValidEntries);
+        ValidEntries,
+        Breakdown);
 }
 
 //=============================================================================

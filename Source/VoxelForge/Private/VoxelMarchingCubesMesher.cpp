@@ -4,6 +4,7 @@
 #include "VoxelMarchingCubesMesher.h"
 #include "MarchingCubesTables.h"
 #include "VoxelDensityProfile.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 //=============================================================================
 // MAIN ALGORITHM
@@ -15,6 +16,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                                                        TArray<uint8>* OutCaptureGrid,
                                                        int32 BandZMinVox, int32 BandZMaxVox)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_MesherGenerateMesh);
     FVoxelMeshData MeshData;
     if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (!Generator) return MeshData;
@@ -300,11 +302,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     static thread_local TArray<int32> CapTris;
     GroundTris.Reset();
     CapTris.Reset();
-    const bool bProfileMesher = VoxelDensityProfile::IsEnabled();
-    uint64 CellClassificationCycles = 0;
-    uint64 GradientCycles = 0;
-    uint64 VertexInterpolationCycles = 0;
-    uint64 StreamBuildingCycles = 0;
+    const bool bProfileMesher = VoxelDensityProfile::IsCycleTimingEnabled();
     uint64 CellClassificationCalls = 0;
     uint64 SurfaceCellCalls = 0;
     for (int32 cz = CzLo; cz <= CzHi; cz++)            // bande de strate : cf. CzLo/CzHi plus haut
@@ -315,7 +313,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
-                const uint64 ClassificationStart = bProfileMesher
+                const bool bSampleCell = bProfileMesher
+                    && VoxelDensityProfile::ShouldSample(
+                        VoxelDensityProfile::EBucket::MesherCellClassification);
+                const uint64 ClassificationStart = bSampleCell
                     ? FPlatformTime::Cycles64() : 0;
                 // PASSE 1 : densités aux 8 coins + index de cas MC SEULEMENT.
                 // ~70% des cellules d'un chunk sont tout-roc ou tout-air (aucune surface) ;
@@ -334,16 +335,18 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                 }
 
                 const bool bHasSurface = MCEdgeTable[CaseIndex] != 0;
-                if (bProfileMesher)
+                if (bSampleCell)
                 {
-                    CellClassificationCycles += FPlatformTime::Cycles64() - ClassificationStart;
-                    ++CellClassificationCalls;
+                    VoxelDensityProfile::AddSampledMeasurement(
+                        VoxelDensityProfile::EBucket::MesherCellClassification,
+                        FPlatformTime::Cycles64() - ClassificationStart);
                 }
+                ++CellClassificationCalls;
                 if (!bHasSurface) continue;  // Pas de surface ici → skip
-                if (bProfileMesher) { ++SurfaceCellCalls; }
+                ++SurfaceCellCalls;
 
                 // PASSE 2 : positions + gradients aux 8 coins (uniquement si surface présente).
-                const uint64 GradientStart = bProfileMesher
+                const uint64 GradientStart = bSampleCell
                     ? FPlatformTime::Cycles64() : 0;
                 FVector Positions[8];
                 FVector Gradients[8];
@@ -356,15 +359,17 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         + FVector(GX * Step, GY * Step, GZ * Step) * VOXEL_SIZE;
                     Gradients[i] = GradAt(GX, GY, GZ);
                 }
-                if (bProfileMesher)
+                if (bSampleCell)
                 {
-                    GradientCycles += FPlatformTime::Cycles64() - GradientStart;
+                    VoxelDensityProfile::AddSampledMeasurement(
+                        VoxelDensityProfile::EBucket::MesherGradientNormals,
+                        FPlatformTime::Cycles64() - GradientStart);
                 }
 
                 // Interpolation des positions + normales sur les arêtes traversées. t = point de
                 // traversée de l'iso entre les deux coins (clampé, milieu si densités quasi-égales) ;
                 // la normale interpole les gradients de coin par le même t.
-                const uint64 VertexInterpolationStart = bProfileMesher
+                const uint64 VertexInterpolationStart = bSampleCell
                     ? FPlatformTime::Cycles64() : 0;
                 FVector EdgeVertices[12];
                 FVector EdgeNormals[12];
@@ -382,15 +387,16 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         EdgeNormals[i]  = Gradients[A] + T * (Gradients[B] - Gradients[A]);
                     }
                 }
-                if (bProfileMesher)
+                if (bSampleCell)
                 {
-                    VertexInterpolationCycles +=
-                        FPlatformTime::Cycles64() - VertexInterpolationStart;
+                    VoxelDensityProfile::AddSampledMeasurement(
+                        VoxelDensityProfile::EBucket::MesherVertexInterpolation,
+                        FPlatformTime::Cycles64() - VertexInterpolationStart);
                 }
 
                 // Génère les triangles avec vertices dédupliqués.
                 // Ordre 0, 2, 1 (pas 0, 1, 2) pour le winding attendu par RealtimeMesh.
-                const uint64 StreamBuildingStart = bProfileMesher
+                const uint64 StreamBuildingStart = bSampleCell
                     ? FPlatformTime::Cycles64() : 0;
                 for (int32 i = 0; MCTriTable[CaseIndex][i] != -1; i += 3)
                 {
@@ -410,9 +416,11 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     Dst.Add(Idx2);
                     Dst.Add(Idx1);
                 }
-                if (bProfileMesher)
+                if (bSampleCell)
                 {
-                    StreamBuildingCycles += FPlatformTime::Cycles64() - StreamBuildingStart;
+                    VoxelDensityProfile::AddSampledMeasurement(
+                        VoxelDensityProfile::EBucket::MesherStreamBuilding,
+                        FPlatformTime::Cycles64() - StreamBuildingStart);
                 }
             }
         }
@@ -422,16 +430,16 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     {
         VoxelDensityProfile::AddMeasurement(
             VoxelDensityProfile::EBucket::MesherCellClassification,
-            CellClassificationCycles, CellClassificationCalls);
+            0, CellClassificationCalls);
         VoxelDensityProfile::AddMeasurement(
             VoxelDensityProfile::EBucket::MesherGradientNormals,
-            GradientCycles, SurfaceCellCalls);
+            0, SurfaceCellCalls);
         VoxelDensityProfile::AddMeasurement(
             VoxelDensityProfile::EBucket::MesherVertexInterpolation,
-            VertexInterpolationCycles, SurfaceCellCalls);
+            0, SurfaceCellCalls);
         VoxelDensityProfile::AddMeasurement(
             VoxelDensityProfile::EBucket::MesherStreamBuilding,
-            StreamBuildingCycles, SurfaceCellCalls);
+            0, SurfaceCellCalls);
     }
 
     VoxelDensityProfile::FScopedTimer MesherFinalisationTimer(
