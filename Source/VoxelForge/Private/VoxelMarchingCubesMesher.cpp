@@ -3,6 +3,7 @@
 
 #include "VoxelMarchingCubesMesher.h"
 #include "MarchingCubesTables.h"
+#include "VoxelDensityProfile.h"
 
 //=============================================================================
 // MAIN ALGORITHM
@@ -17,6 +18,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     FVoxelMeshData MeshData;
     if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (!Generator) return MeshData;
+    VoxelDensityProfile::FScopedTimer MesherProfileTimer(
+        VoxelDensityProfile::EBucket::MesherGenerateMesh);
+    VoxelDensityProfile::FScopedTimer MesherSetupTimer(
+        VoxelDensityProfile::EBucket::MesherOther);
 
     // Cell size in voxels. No upper clamp: coarse clipmap levels use bigger steps (the EXTENT
     // grows). Coarse tiles also use FEWER cells (InCellsPerAxis) for cheaper gen.
@@ -218,12 +223,16 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     const int32 GzLo = CzLo - 1;                       // coins CzLo..CzHi+1, gradients ±1
     const int32 GzHi = CzHi + 2;                       // (== -1..GridDim sans bande)
 
+    MesherSetupTimer.End();
+
     // Réutilise le tampon entre tuiles (thread_local) : SetNumUninitialized garde la
     // capacité, donc plus de malloc/free de ~170 Ko (35³ floats) par tuile.
     static thread_local TArray<float> DensityGrid;
     DensityGrid.SetNumUninitialized(MDim * MDim * MDim);
     // Bande de strate : seules les rangées Z réellement lues (cellules CzLo..CzHi + marges de
     // gradient) sont échantillonnées — le reste du tampon reste non initialisé et non lu.
+    VoxelDensityProfile::FScopedTimer MesherDensityGridTimer(
+        VoxelDensityProfile::EBucket::MesherDensityGrid);
     for (int32 gz = GzLo; gz <= GzHi; gz++)
     {
         if (ShouldAbortWork()) return FVoxelMeshData();
@@ -241,6 +250,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             }
         }
     }
+    MesherDensityGridTimer.End();
 
     // ── CAPTURE-DURING-MESHING ──
     // Si demandé et que la tuile est pleine résolution (CellsPerAxis==CHUNK_SIZE ⇒ Step==1<<Level,
@@ -290,6 +300,13 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     static thread_local TArray<int32> CapTris;
     GroundTris.Reset();
     CapTris.Reset();
+    const bool bProfileMesher = VoxelDensityProfile::IsEnabled();
+    uint64 CellClassificationCycles = 0;
+    uint64 GradientCycles = 0;
+    uint64 VertexInterpolationCycles = 0;
+    uint64 StreamBuildingCycles = 0;
+    uint64 CellClassificationCalls = 0;
+    uint64 SurfaceCellCalls = 0;
     for (int32 cz = CzLo; cz <= CzHi; cz++)            // bande de strate : cf. CzLo/CzHi plus haut
     {
         if (ShouldAbortWork()) return FVoxelMeshData();
@@ -298,6 +315,8 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
+                const uint64 ClassificationStart = bProfileMesher
+                    ? FPlatformTime::Cycles64() : 0;
                 // PASSE 1 : densités aux 8 coins + index de cas MC SEULEMENT.
                 // ~70% des cellules d'un chunk sont tout-roc ou tout-air (aucune surface) ;
                 // on les rejette ICI, AVANT de payer les 8 positions + 8 gradients (48 lectures
@@ -314,9 +333,18 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     if (D >= IsoLevel) CaseIndex |= (1 << i);
                 }
 
-                if (MCEdgeTable[CaseIndex] == 0) continue;  // Pas de surface ici → skip
+                const bool bHasSurface = MCEdgeTable[CaseIndex] != 0;
+                if (bProfileMesher)
+                {
+                    CellClassificationCycles += FPlatformTime::Cycles64() - ClassificationStart;
+                    ++CellClassificationCalls;
+                }
+                if (!bHasSurface) continue;  // Pas de surface ici → skip
+                if (bProfileMesher) { ++SurfaceCellCalls; }
 
                 // PASSE 2 : positions + gradients aux 8 coins (uniquement si surface présente).
+                const uint64 GradientStart = bProfileMesher
+                    ? FPlatformTime::Cycles64() : 0;
                 FVector Positions[8];
                 FVector Gradients[8];
                 for (int32 i = 0; i < 8; i++)
@@ -328,10 +356,16 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         + FVector(GX * Step, GY * Step, GZ * Step) * VOXEL_SIZE;
                     Gradients[i] = GradAt(GX, GY, GZ);
                 }
+                if (bProfileMesher)
+                {
+                    GradientCycles += FPlatformTime::Cycles64() - GradientStart;
+                }
 
                 // Interpolation des positions + normales sur les arêtes traversées. t = point de
                 // traversée de l'iso entre les deux coins (clampé, milieu si densités quasi-égales) ;
                 // la normale interpole les gradients de coin par le même t.
+                const uint64 VertexInterpolationStart = bProfileMesher
+                    ? FPlatformTime::Cycles64() : 0;
                 FVector EdgeVertices[12];
                 FVector EdgeNormals[12];
                 for (int32 i = 0; i < 12; i++)
@@ -348,9 +382,16 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         EdgeNormals[i]  = Gradients[A] + T * (Gradients[B] - Gradients[A]);
                     }
                 }
+                if (bProfileMesher)
+                {
+                    VertexInterpolationCycles +=
+                        FPlatformTime::Cycles64() - VertexInterpolationStart;
+                }
 
                 // Génère les triangles avec vertices dédupliqués.
                 // Ordre 0, 2, 1 (pas 0, 1, 2) pour le winding attendu par RealtimeMesh.
+                const uint64 StreamBuildingStart = bProfileMesher
+                    ? FPlatformTime::Cycles64() : 0;
                 for (int32 i = 0; MCTriTable[CaseIndex][i] != -1; i += 3)
                 {
                     const int32 E0 = MCTriTable[CaseIndex][i];
@@ -369,9 +410,32 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     Dst.Add(Idx2);
                     Dst.Add(Idx1);
                 }
+                if (bProfileMesher)
+                {
+                    StreamBuildingCycles += FPlatformTime::Cycles64() - StreamBuildingStart;
+                }
             }
         }
     }
+
+    if (bProfileMesher)
+    {
+        VoxelDensityProfile::AddMeasurement(
+            VoxelDensityProfile::EBucket::MesherCellClassification,
+            CellClassificationCycles, CellClassificationCalls);
+        VoxelDensityProfile::AddMeasurement(
+            VoxelDensityProfile::EBucket::MesherGradientNormals,
+            GradientCycles, SurfaceCellCalls);
+        VoxelDensityProfile::AddMeasurement(
+            VoxelDensityProfile::EBucket::MesherVertexInterpolation,
+            VertexInterpolationCycles, SurfaceCellCalls);
+        VoxelDensityProfile::AddMeasurement(
+            VoxelDensityProfile::EBucket::MesherStreamBuilding,
+            StreamBuildingCycles, SurfaceCellCalls);
+    }
+
+    VoxelDensityProfile::FScopedTimer MesherFinalisationTimer(
+        VoxelDensityProfile::EBucket::MesherOther);
 
     //=========================================================================
     // SKIRTS — boucheurs de fissures aux coutures de LOD (clipmap)

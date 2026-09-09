@@ -47,6 +47,25 @@ namespace VoxelDensityProfile
         CaveTunnelAirOp,
         XYEdgeSealOp,
         OtherOp,
+        // Non-overlapping top-level phases.  The named operation buckets above are intentionally
+        // nested diagnostics; these phase buckets are the accounting ledger that must add up to
+        // GetDensityAt without double-counting a stack op inside its enclosing phase.
+        DensityPrologue,
+        DensityCore,
+        DensityDisturbances,
+        DensityStructuralPosts,
+        DensityBoundarySeal,
+        DensityDiffLayer,
+        DensityTail,
+        // Mesher-side accounting.  GenerateMesh is the inclusive total; the following buckets
+        // cover its regular-grid work and its non-grid setup/finalisation.
+        MesherGenerateMesh,
+        MesherDensityGrid,
+        MesherCellClassification,
+        MesherGradientNormals,
+        MesherVertexInterpolation,
+        MesherStreamBuilding,
+        MesherOther,
         Count
     };
 
@@ -64,6 +83,10 @@ namespace VoxelDensityProfile
         CaveTunnelEvaluated,
         TunnelCoreCandidates,
         TunnelCoreEvaluated,
+        TunnelSupportColumnBuilds,
+        TunnelSupportColumnCandidates,
+        TunnelSupportFloorQueries,
+        TunnelSupportFloorChecks,
         PassageCandidates,
         PassageEvaluated,
         Count
@@ -76,6 +99,29 @@ namespace VoxelDensityProfile
         uint64 Calls[BucketCount]{};
         uint64 Cycles[BucketCount]{};
         uint64 Counters[CounterCount]{};
+
+        // Opt-in worker-cache footprint snapshot.  These are current per-thread values (not
+        // allocation-event counters), so Snapshot() reports the resident cache footprint at the
+        // end of a profiling run rather than multiplying bytes by cache churn.
+        uint64 TunnelCacheWorkers = 0;
+        uint64 TunnelCacheCapacityEntries = 0;
+        uint64 TunnelCacheValidEntries = 0;
+        uint64 TunnelCacheStaticBytes = 0;
+        uint64 TunnelCacheDynamicBytes = 0;
+        uint64 TunnelCacheEntryBytes = 0;
+        uint64 TunnelCacheLargestEntryBytes = 0;
+        uint64 TunnelCacheLargestWorkerValidEntries = 0;
+        uint64 TunnelCacheLargestWorkerBytes = 0;
+
+        uint64 RoomGraphCacheWorkers = 0;
+        uint64 RoomGraphCacheCapacityEntries = 0;
+        uint64 RoomGraphCacheValidEntries = 0;
+        uint64 RoomGraphCacheStaticBytes = 0;
+        uint64 RoomGraphCacheDynamicBytes = 0;
+        uint64 RoomGraphCacheEntryBytes = 0;
+        uint64 RoomGraphCacheLargestEntryBytes = 0;
+        uint64 RoomGraphCacheLargestWorkerValidEntries = 0;
+        uint64 RoomGraphCacheLargestWorkerBytes = 0;
     };
 
     VOXELFORGE_API void SetEnabled(bool bEnabled);
@@ -83,6 +129,18 @@ namespace VoxelDensityProfile
     VOXELFORGE_API void Reset();
     VOXELFORGE_API FSnapshot Snapshot();
     VOXELFORGE_API void AddCounter(ECounter Counter, uint64 Amount = 1);
+    VOXELFORGE_API void AddMeasurement(EBucket Bucket, uint64 Cycles, uint64 Calls = 1);
+
+    VOXELFORGE_API void SetWorkerTunnelCacheFootprint(
+        uint64 CapacityEntries, uint64 ValidEntries,
+        uint64 StaticBytes, uint64 DynamicBytes,
+        uint64 EntryBytes, uint64 LargestEntryBytes,
+        uint64 LargestWorkerValidEntries);
+    VOXELFORGE_API void SetWorkerRoomGraphCacheFootprint(
+        uint64 CapacityEntries, uint64 ValidEntries,
+        uint64 StaticBytes, uint64 DynamicBytes,
+        uint64 EntryBytes, uint64 LargestEntryBytes,
+        uint64 LargestWorkerValidEntries);
     VOXELFORGE_API const TCHAR* CounterName(ECounter Counter);
     VOXELFORGE_API EBucket BucketFromName(const TCHAR* Name);
     VOXELFORGE_API const TCHAR* BucketName(EBucket Bucket);
@@ -110,6 +168,10 @@ namespace VoxelDensityProfile
         }
 
         ~FScopedTimer();
+
+        // End a range before its lexical scope ends.  This lets GetDensityAt split its enclosing
+        // total into disjoint prologue/core/post phases without moving the large cache block.
+        void End();
 
         FScopedTimer(const FScopedTimer&) = delete;
         FScopedTimer& operator=(const FScopedTimer&) = delete;

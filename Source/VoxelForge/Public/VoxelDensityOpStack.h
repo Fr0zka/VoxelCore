@@ -130,6 +130,10 @@ public:
 
     int32 Num() const { return Ops.Num(); }
 
+    // Allocator-backed bytes owned by the stack, including each concrete operator allocation.
+    // The enclosing cache entry adds sizeof(FVoxelOpStack) separately.
+    SIZE_T GetAllocatedSize() const;
+
     /** Hoist chunk-constant work for every op. Une fois par chunk et par worker.
      *  Non-const : ça MUTE l'état par-chunk des opérateurs, et le prétendre const serait un
      *  mensonge utile qui finirait par masquer une course. */
@@ -448,6 +452,9 @@ namespace VoxelDensityOps
     };
 
     VOXELFORGE_API FRoomBoxDiagnostic GetLastRoomBoxDiagnostic();
+
+    /** Current worker-local room-graph cache footprint; profiling/diagnostic use only. */
+    VOXELFORGE_API void ReportWorkerRoomGraphCacheFootprint();
 
     /**
      * FloatingIslands — 8 ops, et **la pile tourne à l'ENVERS** :

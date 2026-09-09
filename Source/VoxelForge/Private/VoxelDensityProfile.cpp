@@ -5,9 +5,57 @@ namespace VoxelDensityProfile
     namespace
     {
         std::atomic<bool> GEnabled(false);
-        std::atomic<uint64> GCalls[BucketCount];
-        std::atomic<uint64> GCycles[BucketCount];
-        std::atomic<uint64> GCounters[CounterCount];
+
+        // The old implementation performed a contended atomic fetch_add for every timer and
+        // counter.  A TunnelNetwork sample can close twenty-plus ranges and add several
+        // candidate counters, so profiling changed the workload it was supposed to measure.
+        // Keep one accumulator per worker and only aggregate at Snapshot().  Commandlet resets
+        // happen between completed jobs, so the deliberately light-weight list is sufficient.
+        struct FThreadState
+        {
+            uint64 Calls[BucketCount]{};
+            uint64 Cycles[BucketCount]{};
+            uint64 Counters[CounterCount]{};
+
+            uint64 TunnelCacheCapacityEntries = 0;
+            uint64 TunnelCacheValidEntries = 0;
+            uint64 TunnelCacheStaticBytes = 0;
+            uint64 TunnelCacheDynamicBytes = 0;
+            uint64 TunnelCacheEntryBytes = 0;
+            uint64 TunnelCacheLargestEntryBytes = 0;
+            uint64 TunnelCacheLargestWorkerValidEntries = 0;
+
+            uint64 RoomGraphCacheCapacityEntries = 0;
+            uint64 RoomGraphCacheValidEntries = 0;
+            uint64 RoomGraphCacheStaticBytes = 0;
+            uint64 RoomGraphCacheDynamicBytes = 0;
+            uint64 RoomGraphCacheEntryBytes = 0;
+            uint64 RoomGraphCacheLargestEntryBytes = 0;
+            uint64 RoomGraphCacheLargestWorkerValidEntries = 0;
+
+            std::atomic<FThreadState*> Next{nullptr};
+        };
+
+        std::atomic<FThreadState*> GThreadStates{nullptr};
+        thread_local FThreadState* GThreadState = nullptr;
+
+        FThreadState& GetThreadState()
+        {
+            if (GThreadState == nullptr)
+            {
+                GThreadState = new FThreadState();
+                FThreadState* Head = GThreadStates.load(std::memory_order_relaxed);
+                do
+                {
+                    GThreadState->Next.store(Head, std::memory_order_relaxed);
+                }
+                while (!GThreadStates.compare_exchange_weak(
+                    Head, GThreadState,
+                    std::memory_order_release,
+                    std::memory_order_relaxed));
+            }
+            return *GThreadState;
+        }
 
         int32 ToIndex(EBucket Bucket)
         {
@@ -30,28 +78,78 @@ namespace VoxelDensityProfile
 
     void Reset()
     {
-        for (int32 Index = 0; Index < BucketCount; ++Index)
+        for (FThreadState* State = GThreadStates.load(std::memory_order_acquire);
+             State != nullptr;
+             State = State->Next.load(std::memory_order_acquire))
         {
-            GCalls[Index].store(0, std::memory_order_relaxed);
-            GCycles[Index].store(0, std::memory_order_relaxed);
-        }
-        for (int32 Index = 0; Index < CounterCount; ++Index)
-        {
-            GCounters[Index].store(0, std::memory_order_relaxed);
+            for (int32 Index = 0; Index < BucketCount; ++Index)
+            {
+                State->Calls[Index] = 0;
+                State->Cycles[Index] = 0;
+            }
+            for (int32 Index = 0; Index < CounterCount; ++Index)
+            {
+                State->Counters[Index] = 0;
+            }
         }
     }
 
     FSnapshot Snapshot()
     {
         FSnapshot Result;
-        for (int32 Index = 0; Index < BucketCount; ++Index)
+        for (FThreadState* State = GThreadStates.load(std::memory_order_acquire);
+             State != nullptr;
+             State = State->Next.load(std::memory_order_acquire))
         {
-            Result.Calls[Index] = GCalls[Index].load(std::memory_order_relaxed);
-            Result.Cycles[Index] = GCycles[Index].load(std::memory_order_relaxed);
-        }
-        for (int32 Index = 0; Index < CounterCount; ++Index)
-        {
-            Result.Counters[Index] = GCounters[Index].load(std::memory_order_relaxed);
+            for (int32 Index = 0; Index < BucketCount; ++Index)
+            {
+                Result.Calls[Index] += State->Calls[Index];
+                Result.Cycles[Index] += State->Cycles[Index];
+            }
+            for (int32 Index = 0; Index < CounterCount; ++Index)
+            {
+                Result.Counters[Index] += State->Counters[Index];
+            }
+
+            const uint64 TunnelWorkerBytes = State->TunnelCacheStaticBytes
+                + State->TunnelCacheDynamicBytes;
+            if (State->TunnelCacheCapacityEntries > 0)
+            {
+                ++Result.TunnelCacheWorkers;
+                Result.TunnelCacheCapacityEntries += State->TunnelCacheCapacityEntries;
+                Result.TunnelCacheValidEntries += State->TunnelCacheValidEntries;
+                Result.TunnelCacheStaticBytes += State->TunnelCacheStaticBytes;
+                Result.TunnelCacheDynamicBytes += State->TunnelCacheDynamicBytes;
+                Result.TunnelCacheEntryBytes += State->TunnelCacheEntryBytes;
+                Result.TunnelCacheLargestEntryBytes = FMath::Max(
+                    Result.TunnelCacheLargestEntryBytes,
+                    State->TunnelCacheLargestEntryBytes);
+                Result.TunnelCacheLargestWorkerValidEntries = FMath::Max(
+                    Result.TunnelCacheLargestWorkerValidEntries,
+                    State->TunnelCacheValidEntries);
+                Result.TunnelCacheLargestWorkerBytes = FMath::Max(
+                    Result.TunnelCacheLargestWorkerBytes, TunnelWorkerBytes);
+            }
+
+            const uint64 RoomGraphWorkerBytes = State->RoomGraphCacheStaticBytes
+                + State->RoomGraphCacheDynamicBytes;
+            if (State->RoomGraphCacheCapacityEntries > 0)
+            {
+                ++Result.RoomGraphCacheWorkers;
+                Result.RoomGraphCacheCapacityEntries += State->RoomGraphCacheCapacityEntries;
+                Result.RoomGraphCacheValidEntries += State->RoomGraphCacheValidEntries;
+                Result.RoomGraphCacheStaticBytes += State->RoomGraphCacheStaticBytes;
+                Result.RoomGraphCacheDynamicBytes += State->RoomGraphCacheDynamicBytes;
+                Result.RoomGraphCacheEntryBytes += State->RoomGraphCacheEntryBytes;
+                Result.RoomGraphCacheLargestEntryBytes = FMath::Max(
+                    Result.RoomGraphCacheLargestEntryBytes,
+                    State->RoomGraphCacheLargestEntryBytes);
+                Result.RoomGraphCacheLargestWorkerValidEntries = FMath::Max(
+                    Result.RoomGraphCacheLargestWorkerValidEntries,
+                    State->RoomGraphCacheValidEntries);
+                Result.RoomGraphCacheLargestWorkerBytes = FMath::Max(
+                    Result.RoomGraphCacheLargestWorkerBytes, RoomGraphWorkerBytes);
+            }
         }
         return Result;
     }
@@ -61,8 +159,50 @@ namespace VoxelDensityProfile
         const int32 Index = static_cast<int32>(Counter);
         if (Index >= 0 && Index < CounterCount)
         {
-            GCounters[Index].fetch_add(Amount, std::memory_order_relaxed);
+            GetThreadState().Counters[Index] += Amount;
         }
+    }
+
+    void AddMeasurement(EBucket Bucket, uint64 Cycles, uint64 Calls)
+    {
+        const int32 Index = ToIndex(Bucket);
+        FThreadState& State = GetThreadState();
+        State.Calls[Index] += Calls;
+        State.Cycles[Index] += Cycles;
+    }
+
+    void SetWorkerTunnelCacheFootprint(
+        uint64 CapacityEntries, uint64 ValidEntries,
+        uint64 StaticBytes, uint64 DynamicBytes,
+        uint64 EntryBytes, uint64 LargestEntryBytes,
+        uint64 LargestWorkerValidEntries)
+    {
+        if (!IsEnabled()) { return; }
+        FThreadState& State = GetThreadState();
+        State.TunnelCacheCapacityEntries = CapacityEntries;
+        State.TunnelCacheValidEntries = ValidEntries;
+        State.TunnelCacheStaticBytes = StaticBytes;
+        State.TunnelCacheDynamicBytes = DynamicBytes;
+        State.TunnelCacheEntryBytes = EntryBytes;
+        State.TunnelCacheLargestEntryBytes = LargestEntryBytes;
+        State.TunnelCacheLargestWorkerValidEntries = LargestWorkerValidEntries;
+    }
+
+    void SetWorkerRoomGraphCacheFootprint(
+        uint64 CapacityEntries, uint64 ValidEntries,
+        uint64 StaticBytes, uint64 DynamicBytes,
+        uint64 EntryBytes, uint64 LargestEntryBytes,
+        uint64 LargestWorkerValidEntries)
+    {
+        if (!IsEnabled()) { return; }
+        FThreadState& State = GetThreadState();
+        State.RoomGraphCacheCapacityEntries = CapacityEntries;
+        State.RoomGraphCacheValidEntries = ValidEntries;
+        State.RoomGraphCacheStaticBytes = StaticBytes;
+        State.RoomGraphCacheDynamicBytes = DynamicBytes;
+        State.RoomGraphCacheEntryBytes = EntryBytes;
+        State.RoomGraphCacheLargestEntryBytes = LargestEntryBytes;
+        State.RoomGraphCacheLargestWorkerValidEntries = LargestWorkerValidEntries;
     }
 
     const TCHAR* CounterName(ECounter Counter)
@@ -79,6 +219,10 @@ namespace VoxelDensityProfile
         case ECounter::CaveTunnelEvaluated:return TEXT("CaveTunnelEvaluated");
         case ECounter::TunnelCoreCandidates:return TEXT("TunnelCoreCandidates");
         case ECounter::TunnelCoreEvaluated:return TEXT("TunnelCoreEvaluated");
+        case ECounter::TunnelSupportColumnBuilds:return TEXT("TunnelSupportColumnBuilds");
+        case ECounter::TunnelSupportColumnCandidates:return TEXT("TunnelSupportColumnCandidates");
+        case ECounter::TunnelSupportFloorQueries:return TEXT("TunnelSupportFloorQueries");
+        case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::Count:              break;
@@ -130,6 +274,20 @@ namespace VoxelDensityProfile
             { TEXT("CaveTunnelFloorOp"), EBucket::CaveTunnelFloorOp },
             { TEXT("CaveTunnelAirOp"),   EBucket::CaveTunnelAirOp },
             { TEXT("XYEdgeSealOp"),      EBucket::XYEdgeSealOp },
+            { TEXT("DensityPrologue"),   EBucket::DensityPrologue },
+            { TEXT("DensityCore"),       EBucket::DensityCore },
+            { TEXT("DensityDisturbances"), EBucket::DensityDisturbances },
+            { TEXT("DensityStructuralPosts"), EBucket::DensityStructuralPosts },
+            { TEXT("DensityBoundarySeal"), EBucket::DensityBoundarySeal },
+            { TEXT("DensityDiffLayer"),  EBucket::DensityDiffLayer },
+            { TEXT("DensityTail"),       EBucket::DensityTail },
+            { TEXT("MesherGenerateMesh"), EBucket::MesherGenerateMesh },
+            { TEXT("MesherDensityGrid"), EBucket::MesherDensityGrid },
+            { TEXT("MesherCellClassification"), EBucket::MesherCellClassification },
+            { TEXT("MesherGradientNormals"), EBucket::MesherGradientNormals },
+            { TEXT("MesherVertexInterpolation"), EBucket::MesherVertexInterpolation },
+            { TEXT("MesherStreamBuilding"), EBucket::MesherStreamBuilding },
+            { TEXT("MesherOther"),       EBucket::MesherOther },
         };
         for (const FNameBucket& Entry : Names)
         {
@@ -179,6 +337,20 @@ namespace VoxelDensityProfile
         case EBucket::CaveTunnelAirOp:  return TEXT("CaveTunnelAirOp");
         case EBucket::XYEdgeSealOp:     return TEXT("XYEdgeSealOp");
         case EBucket::OtherOp:           return TEXT("OtherOp");
+        case EBucket::DensityPrologue:   return TEXT("DensityPrologue");
+        case EBucket::DensityCore:       return TEXT("DensityCore");
+        case EBucket::DensityDisturbances:return TEXT("DensityDisturbances");
+        case EBucket::DensityStructuralPosts:return TEXT("DensityStructuralPosts");
+        case EBucket::DensityBoundarySeal:return TEXT("DensityBoundarySeal");
+        case EBucket::DensityDiffLayer:  return TEXT("DensityDiffLayer");
+        case EBucket::DensityTail:       return TEXT("DensityTail");
+        case EBucket::MesherGenerateMesh:return TEXT("MesherGenerateMesh");
+        case EBucket::MesherDensityGrid:return TEXT("MesherDensityGrid");
+        case EBucket::MesherCellClassification:return TEXT("MesherCellClassification");
+        case EBucket::MesherGradientNormals:return TEXT("MesherGradientNormals");
+        case EBucket::MesherVertexInterpolation:return TEXT("MesherVertexInterpolation");
+        case EBucket::MesherStreamBuilding:return TEXT("MesherStreamBuilding");
+        case EBucket::MesherOther:       return TEXT("MesherOther");
         case EBucket::Count:             break;
         }
         return TEXT("Unknown");
@@ -186,10 +358,13 @@ namespace VoxelDensityProfile
 
     FScopedTimer::~FScopedTimer()
     {
+        End();
+    }
+
+    void FScopedTimer::End()
+    {
         if (!bActive) { return; }
-        const int32 Index = ToIndex(Bucket);
-        GCalls[Index].fetch_add(1, std::memory_order_relaxed);
-        GCycles[Index].fetch_add(FPlatformTime::Cycles64() - StartCycles,
-                                 std::memory_order_relaxed);
+        AddMeasurement(Bucket, FPlatformTime::Cycles64() - StartCycles, 1);
+        bActive = false;
     }
 }

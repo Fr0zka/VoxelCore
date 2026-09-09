@@ -181,10 +181,10 @@ thread_local int32 VoxelGenLOD::SampleStep = 1;
 // 4-wide via SSE (Perlin3D_x4). These thin wrappers keep every call site unchanged. They
 // sample a DIFFERENT (float hash-gradient) noise field than the old FMath::PerlinNoise3D,
 // so worlds re-tune once — but the fBm/Ridged math/contracts ([-1,1]) are identical.
-static float FractalNoise3D(const FVector& Position, int32 Octaves = 4,
-                             float Lacunarity = 2.0f, float Persistence = 0.5f)
+static float FractalNoise3D(const FVector3f& Position, int32 Octaves = 4,
+                            float Lacunarity = 2.0f, float Persistence = 0.5f)
 {
-    return VoxelNoise::FBM((float)Position.X, (float)Position.Y, (float)Position.Z,
+    return VoxelNoise::FBM(Position.X, Position.Y, Position.Z,
                            Octaves, Lacunarity, Persistence);
 }
 
@@ -199,10 +199,10 @@ static float FractalNoise3D(const FVector& Position, int32 Octaves = 4,
 // Returns approximately [-1, 1] to match FractalNoise3D's range.
 // Character: craggy cliffs, natural erosion patterns, sharp corridors.
 
-static float RidgedNoise3D(const FVector& Position, int32 Octaves = 4,
-                            float Lacunarity = 2.0f, float Persistence = 0.5f)
+static float RidgedNoise3D(const FVector3f& Position, int32 Octaves = 4,
+                           float Lacunarity = 2.0f, float Persistence = 0.5f)
 {
-    return VoxelNoise::Ridged((float)Position.X, (float)Position.Y, (float)Position.Z,
+    return VoxelNoise::Ridged(Position.X, Position.Y, Position.Z,
                               Octaves, Lacunarity, Persistence);
 }
 
@@ -225,9 +225,9 @@ static float RidgedNoise3D(const FVector& Position, int32 Octaves = 4,
 // qui voit déjà `VoxelHash` : la pile d'opérateurs a besoin exactement du même bruit pour la
 // rugosité (4b, type Cellular) et pour les festons (4f), et deux copies d'une fonction pure finissent
 // par diverger — c'est littéralement `AUDIT §C1`. Ce forwarder garde les ~3 sites d'appel ci-dessous
-// inchangés, comme l'ont fait FractalNoise3D et RidgedNoise3D lors de T2.a. Aucun changement de
-// comportement : corps identique, mêmes doubles de `FVector`, même ordre d'opérations.
-static float CellularNoise3D(const FVector& Position)
+// inchangés, comme l'ont fait FractalNoise3D et RidgedNoise3D lors de T2.a. Le chemin chaud garde
+// maintenant les coordonnées en float : la compatibilité d'arrondi historique est abandonnée.
+static float CellularNoise3D(const FVector3f& Position)
 {
     return VoxelNoise::Cellular3D(Position);
 }
@@ -483,6 +483,16 @@ namespace
 
     static thread_local FTunnelCoreCacheState GTunnelCoreCache;
 
+    static void BuildTunnelSupportColumnsForChunk(
+        FChunkSDFCache& Cache,
+        const FIntVector& ChunkCoord);
+
+    static const FTunnelSupportFloorColumn* FindTunnelSupportColumn(
+        const FChunkSDFCache& Cache,
+        int32 X,
+        int32 Y,
+        const FTunnelSupportFloorColumn& EmptyColumn);
+
     // A mesher tile samples an expanded grid (-1..Cells+1), so one worker visits several exact
     // chunk coordinates even while it is generating one tile. The old CP_* cache retained only
     // the last coordinate and consequently rebuilt the whole TunnelNetwork stack whenever the
@@ -491,12 +501,11 @@ namespace
     // result. Native TunnelNetwork/Underwater states are immutable after construction; the active
     // pointer below lets the hot sample path read the stored stack and tunnel-core cache without
     // moving them on every voxel.
-    // The largest production coarse tile can touch thousands of exact chunk keys once its
-    // gradient halo is included.  A 128-slot direct map repeatedly evicts nearby keys (the LOD
-    // probe measured 1,734 misses for only 6,859 samples at L4), rebuilding the room/tunnel cache
-    // in the hot loop.  Keep the same deterministic key and open-addressed lookup, but size the
-    // bounded table for the measured L4 working set rather than the old 128-slot guess.
-    constexpr int32 TunnelDensityCacheSlotCount = 4096;
+    // The cache is open-addressed and bounded.  The 128-slot budget is evidence-sized: the
+    // 128³ production export measured at most 102 live tunnel entries on one worker, leaving
+    // 26 slots of headroom; the old 4,096-slot experiment reserved 3.34 MiB per worker before
+    // one operator or SDF allocation existed.  Collisions only cause a safe deterministic rebuild.
+    constexpr int32 TunnelDensityCacheSlotCount = 128;
 
     struct FTunnelNetworkDensityCacheEntry
     {
@@ -513,6 +522,49 @@ namespace
         FVoxelOpStack OpStack;
         FTunnelCoreCacheState TunnelCore;
     };
+
+    void ReportTunnelDensityCacheFootprint(
+        const FTunnelNetworkDensityCacheEntry* Entries)
+    {
+        if (!VoxelDensityProfile::IsEnabled() || Entries == nullptr)
+        {
+            return;
+        }
+
+        uint64 DynamicBytes = 0;
+        uint64 EntryBytes = 0;
+        uint64 LargestEntryBytes = 0;
+        uint64 ValidEntries = 0;
+        for (int32 Index = 0; Index < TunnelDensityCacheSlotCount; ++Index)
+        {
+            const FTunnelNetworkDensityCacheEntry& Entry = Entries[Index];
+            if (!Entry.bValid)
+            {
+                continue;
+            }
+
+            ++ValidEntries;
+            const uint64 StackBytes = static_cast<uint64>(Entry.OpStack.GetAllocatedSize());
+            const uint64 TunnelCoreBytes = static_cast<uint64>(
+                Entry.TunnelCore.Cache.GetAllocatedSize());
+            const uint64 EntryDynamicBytes = StackBytes + TunnelCoreBytes;
+            const uint64 FullEntryBytes = static_cast<uint64>(
+                sizeof(FTunnelNetworkDensityCacheEntry)) + EntryDynamicBytes;
+            DynamicBytes += EntryDynamicBytes;
+            EntryBytes += FullEntryBytes;
+            LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
+        }
+
+        VoxelDensityProfile::SetWorkerTunnelCacheFootprint(
+            TunnelDensityCacheSlotCount,
+            ValidEntries,
+            static_cast<uint64>(sizeof(FTunnelNetworkDensityCacheEntry))
+                * TunnelDensityCacheSlotCount,
+            DynamicBytes,
+            EntryBytes,
+            LargestEntryBytes,
+            ValidEntries);
+    }
 
     FORCEINLINE int32 TunnelDensityCacheSlot(const FIntVector& Chunk)
     {
@@ -547,7 +599,8 @@ namespace
         const float ChunkMinY = static_cast<float>(ChunkCoord.Y * CHUNK_SIZE);
         const float ChunkMaxX = ChunkMinX + static_cast<float>(CHUNK_SIZE);
         const float ChunkMaxY = ChunkMinY + static_cast<float>(CHUNK_SIZE);
-        const float Expansion = FMath::Max(Params.CaveWarpStrength, 0.0f) + 2.0f;
+        const float Expansion = FMath::Abs(Params.CaveWarpStrength)
+            * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
         const int32 StrateIndex = Manager.GetStrateIndex(
             (static_cast<float>(ChunkCoord.Z) + 0.5f)
             * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
@@ -558,12 +611,74 @@ namespace
             ChunkMaxX + Expansion, ChunkMaxY + Expansion,
             Params, static_cast<uint32>(Manager.GetWorldSeed()),
             StrateIndex, nullptr);
+        BuildTunnelSupportColumnsForChunk(OutState.Cache, ChunkCoord);
         OutState.OwnerId = OwnerId;
         OutState.ManagerLifetimeId = ManagerLifetimeId;
         OutState.Chunk = ChunkCoord;
         OutState.ParamsFingerprint = ParamsFingerprint;
         OutState.LayoutVersion = LayoutVersion;
         OutState.bValid = true;
+    }
+
+    static void BuildTunnelSupportColumnsForChunk(
+        FChunkSDFCache& Cache,
+        const FIntVector& ChunkCoord)
+    {
+        const int32 MinX = ChunkCoord.X * CHUNK_SIZE - 1;
+        const int32 MinY = ChunkCoord.Y * CHUNK_SIZE - 1;
+        const int32 Cells = CHUNK_SIZE + 2;
+        Cache.SupportColumnMinX = MinX;
+        Cache.SupportColumnMinY = MinY;
+        Cache.SupportColumnCellsX = Cells;
+        Cache.SupportColumnCellsY = Cells;
+        Cache.SupportColumnEntries.Init(INDEX_NONE, Cells * Cells);
+        Cache.SupportColumns.Reset();
+
+        // Empty columns are represented only by INDEX_NONE in the slot map, so
+        // each stored column retains the inline bands for actual graph tubes.
+        for (int32 Y = 0; Y < Cells; ++Y)
+        {
+            for (int32 X = 0; X < Cells; ++X)
+            {
+                FTunnelSupportFloorColumn Column;
+                VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                    static_cast<float>(MinX + X),
+                    static_cast<float>(MinY + Y),
+                    Cache,
+                    Column);
+                if (Column.Intervals.Num() == 0)
+                {
+                    continue;
+                }
+
+                const int32 EntryIndex = Cache.SupportColumns.Add(MoveTemp(Column));
+                Cache.SupportColumnEntries[Y * Cells + X] = EntryIndex;
+            }
+        }
+    }
+
+    static const FTunnelSupportFloorColumn* FindTunnelSupportColumn(
+        const FChunkSDFCache& Cache,
+        int32 X,
+        int32 Y,
+        const FTunnelSupportFloorColumn& EmptyColumn)
+    {
+        if (Cache.SupportColumnCellsX <= 0
+            || X < Cache.SupportColumnMinX
+            || X >= Cache.SupportColumnMinX + Cache.SupportColumnCellsX
+            || Y < Cache.SupportColumnMinY
+            || Y >= Cache.SupportColumnMinY + Cache.SupportColumnCellsY)
+        {
+            return nullptr;
+        }
+
+        const int32 Slot =
+            (Y - Cache.SupportColumnMinY) * Cache.SupportColumnCellsX
+            + (X - Cache.SupportColumnMinX);
+        const int32 EntryIndex = Cache.SupportColumnEntries[Slot];
+        return EntryIndex == INDEX_NONE
+            ? &EmptyColumn
+            : &Cache.SupportColumns[EntryIndex];
     }
 
     struct FVoxelStackParamRefs
@@ -739,6 +854,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 {
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
+    VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
+        VoxelDensityProfile::EBucket::DensityPrologue);
     // ── STRATE SYSTEM ──
     // Query per-chunk params from the manager so each strate has different caves.
     float Result;
@@ -762,6 +879,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // to reach the next layer. No caves, no spine, no vertical seal — just rock + passage
         // tube/landing;
         // the global XY edge seal is applied below for bounded worlds.
+        DensityPrologueTimer.End();
+        VoxelDensityProfile::FScopedTimer DensityCoreTimer(
+            VoxelDensityProfile::EBucket::DensityCore);
         float Density = 8.0f;  // bedrock solidity (positive = solid)
         StrateManager->ApplyPassageModifier(
             Density, WorldX, WorldY, WorldZ, 8.0f, 0.0f);
@@ -1161,6 +1281,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_ActiveTunnelDensityCache = &CachedEntry;
                 ActiveOpStack = &CachedEntry.OpStack;
                 ActiveTunnelCoreCache = &CachedEntry.TunnelCore;
+                ReportTunnelDensityCacheFootprint(CP_TunnelDensityCache);
             }
             else if (!bLoadedTunnelDensityCache)
             {
@@ -1169,6 +1290,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             }
 
         }
+
+        DensityPrologueTimer.End();
+        VoxelDensityProfile::FScopedTimer DensityCoreTimer(
+            VoxelDensityProfile::EBucket::DensityCore);
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
@@ -1226,21 +1351,28 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         default:
             // Underwater shares tunnel rock (water table is a render-side overlay).
             Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
-                                          CP_TunnelFP, LayoutVersion);                break;
+                                          CP_TunnelFP, LayoutVersion,
+                                          /*bApplyLegacyStructuralPosts=*/false);       break;
         }
+        DensityCoreTimer.End();
 
         // Disturbance layer (the "wow" post-process) — cached params, MC convention. The
         // vertical shaft tree opens a walkable route before this shared pass, so a bridge/ridge
         // must not refill it. Both native and operator-stack paths use the same marker helper.
+        VoxelDensityProfile::FScopedTimer DensityDisturbancesTimer(
+            VoxelDensityProfile::EBucket::DensityDisturbances);
         const bool bProtectVerticalShaftAir =
             VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
         ApplyDisturbances(Result, WorldX, WorldY, WorldZ, CP_Dist, (uint32)Seed,
             bProtectVerticalShaftAir);
+        DensityDisturbancesTimer.End();
 
         // A disturbance is allowed to add visual detail, but it must not refill the landing's
         // measured air volume or turn its support slab back into a hole. Reassert the landing
         // air first, then the structural floor, in MC space before the final XY seal. The two
         // calls use the same landing geometry already evaluated by the legacy and op-stack post.
+        VoxelDensityProfile::FScopedTimer DensityStructuralPostsTimer(
+            VoxelDensityProfile::EBucket::DensityStructuralPosts);
         float LandingBaseDensity = CP_Dist.BaseDensity;
 #if WITH_EDITOR
         // A composer parent can deliberately use a different structural base than the authored
@@ -1326,12 +1458,26 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // never once per voxel.
         if (ActiveTunnelCoreCache->bValid)
         {
+            const FTunnelSupportFloorColumn* SupportColumn = nullptr;
+            FTunnelSupportFloorColumn EmptySupportColumn;
+            const bool bIntegerXY =
+                WorldX == FMath::FloorToFloat(WorldX)
+                && WorldY == FMath::FloorToFloat(WorldY);
+            if (bIntegerXY)
+            {
+                const int32 IX = FMath::FloorToInt(WorldX);
+                const int32 IY = FMath::FloorToInt(WorldY);
+                SupportColumn = FindTunnelSupportColumn(
+                    ActiveTunnelCoreCache->Cache, IX, IY, EmptySupportColumn);
+            }
+
             FTunnelCoreWorldEvaluation TunnelCore;
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                    WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache);
+                    WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
+                    SupportColumn);
             }
             const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
             if (bTunnelSupportFloor)
@@ -1362,6 +1508,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             StrateManager->ApplyPassageLandingRoomFloorMC(
                 Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
         }
+        DensityStructuralPostsTimer.End();
     }
     else
     {
@@ -1371,16 +1518,23 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // aussi. La calculer une fois évite un CRC par voxel sur un chemin qui n'en a aucun besoin.
         // `LayoutVersion = 0` : sans `StrateManager` il n'y a pas de layout, donc rien qui puisse
         // périmer — et l'empreinte constante suffit à distinguer ce cache de tous les autres.
+        DensityPrologueTimer.End();
+        VoxelDensityProfile::FScopedTimer DensityCoreTimer(
+            VoxelDensityProfile::EBucket::DensityCore);
         static const FStrateGenerationParams FallbackParams;
         static const uint32 FallbackFP = FCrc::MemCrc32(&FallbackParams, sizeof(FallbackParams));
         Result = GetDensityWithParams(WorldX, WorldY, WorldZ, FallbackParams, FallbackFP, 0);
+        DensityCoreTimer.End();
     }
 
     // The edge is the final generated structural invariant. Passage carving is ordered before it
     // in every archetype/stack, and this MC-facing pass also covers out-of-layout air plus any
     // disturbance that might otherwise carve back into the shell. Player edits remain separate
     // below and are deliberately still the user override path.
+    VoxelDensityProfile::FScopedTimer DensityBoundarySealTimer(
+        VoxelDensityProfile::EBucket::DensityBoundarySeal);
     VF_ApplyXYEdgeSealMC(Result, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
+    DensityBoundarySealTimer.End();
 
     //=========================================================================
     // PLAYER MODIFICATIONS (diff layer)
@@ -1391,6 +1545,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     // we subtract the diff offset:
     //   Carve (diff < 0) → Result -= negative → Result increases → more air ✓
     //   Fill  (diff > 0) → Result -= positive → Result decreases → more solid ✓
+    VoxelDensityProfile::FScopedTimer DensityDiffLayerTimer(
+        VoxelDensityProfile::EBucket::DensityDiffLayer);
     if (DiffLayer && DiffLayer->HasAnyMods())
     {
         // ── PER-CHUNK MOD SNAPSHOT ──
@@ -1422,14 +1578,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             Result -= UVoxelDiffLayer::EvaluateMods(Slot.Mods, WorldX, WorldY, WorldZ);
         }
     }
+    DensityDiffLayerTimer.End();
 
+    VoxelDensityProfile::FScopedTimer DensityTailTimer(
+        VoxelDensityProfile::EBucket::DensityTail);
     VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
     return Result;
 }
 
 float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
                                              const FStrateGenerationParams& Params,
-                                             uint32 ParamsFingerprint, uint32 LayoutVersion) const
+                                             uint32 ParamsFingerprint, uint32 LayoutVersion,
+                                             bool bApplyLegacyStructuralPosts) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -1505,15 +1665,15 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // Three independent Perlin fields offset by irrational-ish numbers
         // so the X/Y/Z warp channels don't correlate with each other.
         // Single octave to keep per-voxel cost low (3 Perlin calls total).
-        WarpedX += VoxelNoise::Perlin3D(FVector(
+        WarpedX += VoxelNoise::Perlin3D(FVector3f(
             WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
             WorldY * WF + 1.3f,
             EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedY += VoxelNoise::Perlin3D(FVector(
+        WarpedY += VoxelNoise::Perlin3D(FVector3f(
             WorldX * WF + 7.1f,
             WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
             EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedZ += VoxelNoise::Perlin3D(FVector(
+        WarpedZ += VoxelNoise::Perlin3D(FVector3f(
             WorldX * WF + 11.3f,
             WorldY * WF + 9.7f,
             EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
@@ -1619,7 +1779,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             const float ChunkMinY = CacheChunkY * (float)CHUNK_SIZE;
             const float ChunkMaxX = ChunkMinX + (float)CHUNK_SIZE;
             const float ChunkMaxY = ChunkMinY + (float)CHUNK_SIZE;
-            const float Expansion = Params.CaveWarpStrength + 2.0f;
+            const float Expansion = FMath::Abs(Params.CaveWarpStrength)
+                * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
 
             const float SMinX = ChunkMinX - Expansion;
             const float SMinY = ChunkMinY - Expansion;
@@ -1786,12 +1947,12 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             float RF = Params.RoughnessFrequency;
 
             // Base noise input positions (with seed offsets for uniqueness)
-            FVector MainPos(
+            FVector3f MainPos(
                 WorldX * RF + VoxelHash::SeedOffset(SeedU, 11.3f),
                 WorldY * RF + VoxelHash::SeedOffset(SeedU, 13.7f),
                 EffectiveZ * RF + VoxelHash::SeedOffset(SeedU, 17.1f)
             );
-            FVector FinePos(
+            FVector3f FinePos(
                 WorldX * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 19.1f) + 2000.0f,
                 WorldY * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 23.7f) + 2500.0f,
                 EffectiveZ * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 29.3f) + 3000.0f
@@ -1807,26 +1968,26 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 float WS = Params.DomainWarpStrength;
 
                 // Sample three independent noise fields for X, Y, Z warp
-                float WarpX = VoxelNoise::Perlin3D(FVector(
+                float WarpX = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + VoxelHash::SeedOffset(SeedU, 5.2f),
                     WorldY * WF + VoxelHash::SeedOffset(SeedU, 1.3f),
                     EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 9.7f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                float WarpY = VoxelNoise::Perlin3D(FVector(
+                float WarpY = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 100.0f + VoxelHash::SeedOffset(SeedU, 7.7f),
                     WorldY * WF + 200.0f + VoxelHash::SeedOffset(SeedU, 3.1f),
                     EffectiveZ * WF + 300.0f
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                float WarpZ = VoxelNoise::Perlin3D(FVector(
+                float WarpZ = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 400.0f,
                     WorldY * WF + 500.0f + VoxelHash::SeedOffset(SeedU, 11.9f),
                     EffectiveZ * WF + 600.0f + VoxelHash::SeedOffset(SeedU, 13.3f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
                 // Apply warp to both noise positions
-                FVector WarpOffset(WarpX, WarpY, WarpZ);
+                FVector3f WarpOffset(WarpX, WarpY, WarpZ);
                 MainPos += WarpOffset;
                 FinePos += WarpOffset;
             }
@@ -1978,7 +2139,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             float NoisedZ = WorldZ;
             if (Params.TerraceNoiseDisplacement > 0.0f)
             {
-                float DispNoise = FractalNoise3D(FVector(
+                float DispNoise = FractalNoise3D(FVector3f(
                     WorldX * 0.04f + VoxelHash::SeedOffset(SeedU, 31.1f),
                     WorldY * 0.04f + VoxelHash::SeedOffset(SeedU, 37.3f),
                     WorldZ * 0.02f + VoxelHash::SeedOffset(SeedU, 41.7f)
@@ -2104,7 +2265,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         if (DistFromSurface < OverhangRange)
         {
             // Low Z frequency (0.15x of XY) → features extend horizontally
-            float OverhangNoise = FractalNoise3D(FVector(
+            float OverhangNoise = FractalNoise3D(FVector3f(
                 WorldX * Params.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
                 WorldY * Params.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
                 EffectiveZ * Params.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
@@ -2144,7 +2305,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // Near the surface (CaveSDF ≈ 0), the sign of CaveSDF tells us which
             // side we're on: negative = inside cave, positive = solid rock.
             // We use a noise-modulated vertical gradient to detect steep faces.
-            float VertGrad = VoxelNoise::Perlin3D(FVector(
+            float VertGrad = VoxelNoise::Perlin3D(FVector3f(
                 WorldX * 0.05f + VoxelHash::SeedOffset(SeedU, 71.3f),
                 WorldY * 0.05f + VoxelHash::SeedOffset(SeedU, 73.7f),
                 EffectiveZ * 0.15f + VoxelHash::SeedOffset(SeedU, 79.1f)  // 3x faster in Z → detects vertical features
@@ -2185,7 +2346,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             // Cellular noise: returns ~[-1, 1] where positive = cell interior (bowl)
             float SF = Params.ScallopFrequency;
-            float ScallopNoise = CellularNoise3D(FVector(
+            float ScallopNoise = CellularNoise3D(FVector3f(
                 WorldX * SF + VoxelHash::SeedOffset(SeedU, 83.1f),
                 WorldY * SF + VoxelHash::SeedOffset(SeedU, 89.3f),
                 EffectiveZ * SF + VoxelHash::SeedOffset(SeedU, 97.7f)
@@ -2212,47 +2373,21 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         && NearestRoomIdx >= 0)
     {
         const FCachedRoom& Room = SDFCache.Rooms[NearestRoomIdx];
-        const int32 MaxArches = 3;
         const FVector VoxPos(WorldX, WorldY, WorldZ);
 
-        for (int32 i = 0; i < MaxArches; i++)
+        for (int32 i = 0; i < 3; i++)
         {
-            uint32 AH = VoxelHash::Mix(Room.Hash ^ (0xA4C400u + (uint32)i * 7369u));
-
-            if (VoxelHash::ToFloat01(AH) > Params.ArchDensity) continue;
-
-            // Arch center XY: small offset from room center
-            uint32 AH2 = VoxelHash::Mix(AH ^ 0xA4C4u);
-            float ArcCX = Room.Center.X + VoxelHash::ToFloatSigned(AH2) * Room.RadiusXY * 0.3f;
-            float ArcCY = Room.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(AH2)) * Room.RadiusXY * 0.3f;
-
-            // Arch height: mid-room Z (bridging the open space)
-            uint32 AH3 = VoxelHash::Mix(AH2 ^ 0xB41Du);
-            float ArcCZ = Room.Center.Z + VoxelHash::ToFloatSigned(AH3) * Room.RadiusZ * 0.4f;
-
-            // Arch direction and span: stretch across most of the room
-            uint32 AH4 = VoxelHash::Mix(AH3 ^ 0xCAFEu);
-            float Angle    = VoxelHash::ToFloat01(AH4) * PI;
-            float HalfSpan = Room.RadiusXY * (0.5f + VoxelHash::ToFloat01(VoxelHash::Mix(AH4)) * 0.35f);
-
-            float CosA = FMath::Cos(Angle);
-            float SinA = FMath::Sin(Angle);
-            FVector ArchA(ArcCX - CosA * HalfSpan, ArcCY - SinA * HalfSpan, ArcCZ);
-            FVector ArchB(ArcCX + CosA * HalfSpan, ArcCY + SinA * HalfSpan, ArcCZ);
-
-            // Arch thickness
-            uint32 AH5 = VoxelHash::Mix(AH4 ^ 0xF00Du);
-            float ArchRadius = FMath::Lerp(Params.ArchMinRadius, Params.ArchMaxRadius,
-                                             VoxelHash::ToFloat01(AH5));
-
-            float ArchSDF = VoxelSDF::Capsule(VoxPos, ArchA, ArchB, ArchRadius);
+            const FCachedArch& Arch = Room.Arches[i];
+            if (!Arch.bActive) { continue; }
+            const float ArchSDF = VoxelSDF::Capsule(
+                VoxPos, Arch.EndpointA, Arch.EndpointB, Arch.Radius);
 
             const float ArchBlend = 2.0f;
             if (ArchSDF < ArchBlend)
             {
                 float Fill = FMath::Clamp((ArchBlend - ArchSDF) / (ArchBlend * 2.0f), 0.0f, 1.0f);
                 Fill = SmoothStep01(Fill);
-                Density += Fill * Params.BaseDensity * 1.5f;
+                Density += Fill * Arch.BaseDensity * 1.5f;
             }
         }
     }
@@ -2356,58 +2491,32 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         && NearestRoomIdx >= 0)
     {
         const FCachedRoom& Room = SDFCache.Rooms[NearestRoomIdx];
-        // Pinches on the perimeter of the room (near tunnel entry points)
-        const float Spread = 0.85f;
-        const int32 MaxPinches = 3;
-
-        for (int32 i = 0; i < MaxPinches; i++)
+        for (int32 i = 0; i < 3; i++)
         {
-            uint32 PnH = VoxelHash::Mix(Room.Hash ^ (0xF1C400u + (uint32)i * 5417u));
-
-            if (VoxelHash::ToFloat01(PnH) > Params.PinchDensity) continue;
-
-            // XY: near room perimeter (where tunnels meet the room)
-            uint32 PnH2 = VoxelHash::Mix(PnH ^ 0xF1C4u);
-            float PnX = Room.Center.X + VoxelHash::ToFloatSigned(PnH2) * Room.RadiusXY * Spread;
-            float PnY = Room.Center.Y + VoxelHash::ToFloatSigned(VoxelHash::Mix(PnH2)) * Room.RadiusXY * Spread;
-
-            // Z: mid-height within the room
-            uint32 PnH3 = VoxelHash::Mix(PnH2 ^ 0x5432u);
-            float PnZ = Room.Center.Z + VoxelHash::ToFloatSigned(PnH3) * Room.RadiusZ * 0.5f;
-
-            // Pinch direction aligned toward room center (squeezes inward)
-            uint32 PnH4 = VoxelHash::Mix(PnH3 ^ 0x9A3Bu);
-            float PnAngle = VoxelHash::ToFloat01(PnH4) * PI;
-            float CosPN = FMath::Cos(PnAngle);
-            float SinPN = FMath::Sin(PnAngle);
-
-            float DXPn = WorldX - PnX;
-            float DYPn = WorldY - PnY;
-            float DZPn = WorldZ - PnZ;
+            const FCachedPinch& Pinch = Room.Pinches[i];
+            if (!Pinch.bActive) { continue; }
+            const float DXPn = WorldX - Pinch.CenterX;
+            const float DYPn = WorldY - Pinch.CenterY;
+            const float DZPn = WorldZ - Pinch.CenterZ;
 
             // Quick reject
-            float MaxExtent = FMath::Max(Params.PinchLength, Params.PinchStrength) + 5.0f;
-            if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > MaxExtent) continue;
+            if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > Pinch.MaxExtent) continue;
 
-            float Along  =  DXPn * CosPN + DYPn * SinPN;
-            float Across = -DXPn * SinPN + DYPn * CosPN;
+            const float Along  =  DXPn * Pinch.CosAngle + DYPn * Pinch.SinAngle;
+            const float Across = -DXPn * Pinch.SinAngle + DYPn * Pinch.CosAngle;
 
-            float HalfLength   = Params.PinchLength * 0.5f;
-            float HalfNarrow   = Params.PinchStrength;
-            float HalfVertical = Params.PinchStrength * 1.5f;
-
-            float NAlong   = Along   / HalfLength;
-            float NAcross  = Across  / HalfNarrow;
-            float NUp      = DZPn    / HalfVertical;
-            float EllipDist = NAlong * NAlong + NAcross * NAcross + NUp * NUp;
+            const float NAlong   = Along   / Pinch.HalfLength;
+            const float NAcross  = Across  / Pinch.HalfNarrow;
+            const float NUp      = DZPn    / Pinch.HalfVertical;
+            const float EllipDist = NAlong * NAlong + NAcross * NAcross + NUp * NUp;
 
             if (EllipDist < 1.0f)
             {
                 float Fill = 1.0f - EllipDist;
                 Fill = SmoothStep01(Fill);
-                float AxisDist = FMath::Sqrt(NAcross * NAcross + NUp * NUp);
-                float SideFactor = FMath::Clamp(AxisDist * 2.0f, 0.0f, 1.0f);
-                Density += Fill * SideFactor * Params.BaseDensity * 1.5f;
+                const float AxisDist = FMath::Sqrt(NAcross * NAcross + NUp * NUp);
+                const float SideFactor = FMath::Clamp(AxisDist * 2.0f, 0.0f, 1.0f);
+                Density += Fill * SideFactor * Pinch.BaseDensity * 1.5f;
             }
         }
     }
@@ -2480,7 +2589,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
 
-            float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+            float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
                 WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
                 WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
                 EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
@@ -2490,7 +2599,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // skip the second Perlin entirely (most voxels; bit-identical output).
             if (N1 < Params.WormThreshold)
             {
-                float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+                float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
                     WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
                     WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
                     EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
@@ -2523,39 +2632,54 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //=========================================================================
     if (StrateManager)
     {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            Params.BaseDensity, Params.BoundarySealThickness);
+        if (bApplyLegacyStructuralPosts)
+        {
+            StrateManager->ApplyPassageModifier(
+                Density, WorldX, WorldY, WorldZ,
+                Params.BaseDensity, Params.BoundarySealThickness);
+        }
+        else
+        {
+            // GetDensityAt owns one common MC-space structural tail after either the legacy or
+            // operator-stack branch.  Keep the actual tube carve here, but do not repeat its
+            // landing air/floor/tunnel-air posts before the shared disturbance/post sequence.
+            StrateManager->ApplyPassageCarvingOnly(
+                Density, WorldX, WorldY, WorldZ,
+                Params.BaseDensity, Params.BoundarySealThickness);
+        }
     }
 
-    // Terrain operations and passage support floors are allowed to write solid density, but the
-    // graph's own tunnel floor/core are structural route geometry. Close the rounded bottom first,
-    // then reopen only the core above its half-voxel air clearance. Both predicates are shared
-    // with the operator stack and are evaluated from the per-chunk cache, never per-voxel rebuilt.
-    const bool bTunnelSupportFloor =
-        VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-            WorldX, WorldY, WorldZ, SDFCache);
-    if (bTunnelSupportFloor)
+    if (bApplyLegacyStructuralPosts)
     {
-        Density = FMath::Max(Density, FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
-    }
-    const float TunnelCoreSDF = (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
-        ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(WorldX, WorldY, WorldZ, SDFCache)
-        : FLT_MAX;
-    if (!bTunnelSupportFloor
-        && TunnelCoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
-    {
-        Density = FMath::Min(
-            Density,
-            -FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
+        // Terrain operations and passage support floors are allowed to write solid density, but
+        // the graph's own tunnel floor/core are structural route geometry.  Direct callers of
+        // GetDensityWithParams retain this historical tail; GetDensityAt skips it and applies the
+        // same predicates once in its common MC-space post section below both generation paths.
+        const bool bTunnelSupportFloor =
+            VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+                WorldX, WorldY, WorldZ, SDFCache);
+        if (bTunnelSupportFloor)
+        {
+            Density = FMath::Max(Density, FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
+        }
+        const float TunnelCoreSDF = (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
+            ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(WorldX, WorldY, WorldZ, SDFCache)
+            : FLT_MAX;
+        if (!bTunnelSupportFloor
+            && TunnelCoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
+        {
+            Density = FMath::Min(
+                Density,
+                -FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
+        }
+        ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
+            Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+            Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
 
-    // Fourth structural post: the XY edge wins over a passage near the rim.
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
+        // Fourth structural post: the XY edge wins over a passage near the rim.
+        VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
+            WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
+    }
 
     // Convention MC: négatif = solide, positif = air.
     // La logique interne utilise positif = solide (plus lisible), donc on négate.
@@ -2609,7 +2733,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     if (Params.FloorRoughness > 0.0f)
     {
         float FF = Params.FloorRoughnessFrequency;
-        FloorNoise = FractalNoise3D(FVector(
+        FloorNoise = FractalNoise3D(FVector3f(
             WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
             WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
             0.0f                          // XY-pur : plus aucune dépendance en Z / no Z dependence
@@ -2640,7 +2764,7 @@ float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
     if (Params.CeilingRoughness > 0.0f)
     {
         float CF = Params.CeilingRoughnessFrequency;
-        float RawNoise = FractalNoise3D(FVector(
+        float RawNoise = FractalNoise3D(FVector3f(
             WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
             WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
             3000.0f                         // XY-pur : décalage de décorrélation seul / offset only
@@ -2872,7 +2996,7 @@ float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
     // Wall roughness: perturb the corridor surface.
     if (Params.SurfaceRoughness > 0.0f && MazeSDF < R + Params.SurfaceRoughness + 2.0f)
     {
-        MazeSDF += FractalNoise3D(FVector(WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f), VoxelGenLOD::Eff(3))
+        MazeSDF += FractalNoise3D(FVector3f(WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f), VoxelGenLOD::Eff(3))
                  * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 
@@ -2933,8 +3057,8 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
     if (Params.HeightWarpStrength > 0.0f)
     {
         const float WF = Params.HeightWarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.31f), WorldY * WF + 4.2f, VoxelHash::SeedOffset(SeedU, 1.7f)));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 8.6f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.53f), VoxelHash::SeedOffset(SeedU, 2.9f)));
+        const float wx = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.31f), WorldY * WF + 4.2f, VoxelHash::SeedOffset(SeedU, 1.7f)));
+        const float wy = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + 8.6f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.53f), VoxelHash::SeedOffset(SeedU, 2.9f)));
         QX += wx * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * Params.HeightWarpStrength;
     }
@@ -2944,12 +3068,12 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
     const float Relief = SampleRelief(WorldX, WorldY, Params.ReliefFrequency, Params.ReliefContrast);
     const float M = FMath::Lerp(1.0f, Relief, Params.ReliefStrength);
 
-    float Cont = FractalNoise3D(FVector(
+        float Cont = FractalNoise3D(FVector3f(
         QX * Params.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 3.1f),
         QY * Params.ContinentFrequency + VoxelHash::SeedOffset(SeedU, 5.7f),
         VoxelHash::SeedOffset(SeedU, 0.7f)), 4);  // [-1,1]
 
-    float Detail = FractalNoise3D(FVector(
+        float Detail = FractalNoise3D(FVector3f(
         WorldX * Params.DetailFrequency + 11.0f,
         WorldY * Params.DetailFrequency + 22.0f,
         VoxelHash::SeedOffset(SeedU, 1.3f)), 3);  // [-1,1]
@@ -2957,7 +3081,7 @@ float UVoxelGenerator::SampleSurfaceStructuralZ(float WorldX, float WorldY,
     float Mountain = 0.0f;
     if (Params.MountainStrength > 0.0f)
     {
-        float Ridge = RidgedNoise3D(FVector(
+        float Ridge = RidgedNoise3D(FVector3f(
             QX * Params.MountainFrequency + 99.0f,
             QY * Params.MountainFrequency + 77.0f,
             VoxelHash::SeedOffset(SeedU, 0.9f)), 4);     // [-1,1]
@@ -3072,8 +3196,8 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     if (Params.CeilingWarpStrength > 0.0f)
     {
         const float WF = Params.CeilingWarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.71f), WorldY * WF + 2.3f,  VoxelHash::SeedOffset(SeedU, 3.3f)));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 6.1f,          WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.19f), VoxelHash::SeedOffset(SeedU, 4.7f)));
+        const float wx = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.71f), WorldY * WF + 2.3f,  VoxelHash::SeedOffset(SeedU, 3.3f)));
+        const float wy = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + 6.1f,          WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.19f), VoxelHash::SeedOffset(SeedU, 4.7f)));
         QX += wx * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * Params.CeilingWarpStrength;
     }
@@ -3081,7 +3205,7 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     // Broad SIGNED swell: raises/lowers the whole cap → big inverted hills and valleys.
     if (Params.CeilingUndulation > 0.0f)
     {
-        const float Swell = FractalNoise3D(FVector(
+        const float Swell = FractalNoise3D(FVector3f(
             QX * Params.CeilingUndulationFrequency + VoxelHash::SeedOffset(SeedU, 1.9f),
             QY * Params.CeilingUndulationFrequency + 13.0f,
             VoxelHash::SeedOffset(SeedU, 0.5f)), 3);   // [-1,1]
@@ -3093,14 +3217,14 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     float Hang = 0.0f;
     if (Params.CeilingRoughness > 0.0f)
     {
-        Hang += FMath::Abs(FractalNoise3D(FVector(
+        Hang += FMath::Abs(FractalNoise3D(FVector3f(
             WorldX * Params.CeilingRoughnessFrequency + 5.0f,
             WorldY * Params.CeilingRoughnessFrequency + 6.0f,
             VoxelHash::SeedOffset(SeedU, 2.1f)), 3)) * VOXEL_NOISE_SCALE * Params.CeilingRoughness;
     }
     if (Params.CeilingRidgeStrength > 0.0f)
     {
-        float Ridge = RidgedNoise3D(FVector(
+        float Ridge = RidgedNoise3D(FVector3f(
             QX * Params.CeilingRidgeFrequency + 31.0f,
             QY * Params.CeilingRidgeFrequency + 47.0f,
             VoxelHash::SeedOffset(SeedU, 1.1f)), 4);            // [-1,1]
@@ -3132,7 +3256,7 @@ float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, floa
         const uint32 SeedU = (uint32)Seed;
         const float f     = S.OverhangFrequency;
         // Shelf-shape noise [0,1]; the Z term makes the reach fold/curl with height (ragged, not a lip).
-        const float Ns = FractalNoise3D(FVector(
+        const float Ns = FractalNoise3D(FVector3f(
             WorldX * f + VoxelHash::SeedOffset(SeedU, 17.3f),
             WorldY * f + VoxelHash::SeedOffset(SeedU, 23.9f),
             WorldZ * f * S.OverhangZScale + VoxelHash::SeedOffset(SeedU, 5.1f)), 3) * 0.5f + 0.5f;   // [0,1]
@@ -4146,7 +4270,7 @@ float UVoxelGenerator::SampleRelief(float WorldX, float WorldY, float Frequency,
     const uint32 SeedU = (uint32)Seed;
     // Same offsets/octaves as the original SurfaceWorld relief so existing worlds are
     // unchanged (this is the function that code path now calls).
-    float R = FractalNoise3D(FVector(
+    float R = FractalNoise3D(FVector3f(
         WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 7.3f),
         WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 2.1f),
         VoxelHash::SeedOffset(SeedU, 0.5f)), 2) * 0.5f + 0.5f;                 // [0,1]
@@ -4157,7 +4281,7 @@ float UVoxelGenerator::SampleRelief(float WorldX, float WorldY, float Frequency,
 float UVoxelGenerator::SampleMoisture(float WorldX, float WorldY, float Frequency) const
 {
     const uint32 SeedU = (uint32)Seed;
-    const float N = FractalNoise3D(FVector(
+    const float N = FractalNoise3D(FVector3f(
         WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 4.7f),
         WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 8.9f),
         VoxelHash::SeedOffset(SeedU, 1.3f)), 2) * 0.5f + 0.5f;                 // [0,1]
@@ -4241,8 +4365,8 @@ FBiomeSample UVoxelGenerator::SampleBiomeAt(float WorldX, float WorldY, const FB
     {
         const uint32 SeedU = (uint32)Seed;
         const float WF = MP.WarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
+        const float wx = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
+        const float wy = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
         QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
     }
@@ -4373,8 +4497,8 @@ FBiomeSample UVoxelGenerator::ResolveBiomeSampleAt(float WorldX, float WorldY, i
     {
         const uint32 SeedU = (uint32)Seed;
         const float WF = MP.WarpFrequency;
-        const float wx = VoxelNoise::Perlin3D(FVector(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
-        const float wy = VoxelNoise::Perlin3D(FVector(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
+        const float wx = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.27f), WorldY * WF + 3.1f, VoxelHash::SeedOffset(SeedU, 1.1f)));
+        const float wy = VoxelNoise::Perlin3D(FVector3f(WorldX * WF + 7.7f, WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.61f), VoxelHash::SeedOffset(SeedU, 2.3f)));
         QX += wx * VOXEL_NOISE_SCALE * MP.WarpStrength;
         QY += wy * VOXEL_NOISE_SCALE * MP.WarpStrength;
     }
@@ -4861,7 +4985,7 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     // Wall roughness.
     if (Params.SurfaceRoughness > 0.0f && CaveSDF < Params.SurfaceRoughness + 4.0f)
     {
-        CaveSDF += FractalNoise3D(FVector(WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f), VoxelGenLOD::Eff(3))
+        CaveSDF += FractalNoise3D(FVector3f(WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f), VoxelGenLOD::Eff(3))
                  * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 
@@ -4986,9 +5110,9 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // NOTE : `SeedOffset` quantifie la clé de site par ×100, donc 0.0007 → site 0. Unique aujourd'hui
     // (toutes les autres clés du plugin sont ≥ 0.19) ; la prochaine clé sous 0.005 devra en choisir
     // une autre plutôt que de collisionner en silence.
-    const float WX = WorldX + FractalNoise3D(FVector(WorldX * 0.04f + VoxelHash::SeedOffset(S, 0.0007f), WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
+    const float WX = WorldX + FractalNoise3D(FVector3f(WorldX * 0.04f + VoxelHash::SeedOffset(S, 0.0007f), WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;
-    const float WY = WorldY + FractalNoise3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
+    const float WY = WorldY + FractalNoise3D(FVector3f(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                               * VOXEL_NOISE_SCALE * WarpAmp;
 
     // Per-island constants (existence roll, jitter, radius, Z anchor, taper) are pure functions
@@ -5075,7 +5199,7 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // Craggy shells.
     if (Params.SurfaceRoughness > 0.0f && IslandSDF < Params.SurfaceRoughness + BlendK + 2.0f)
     {
-        IslandSDF += FractalNoise3D(FVector(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f), VoxelGenLOD::Eff(4))
+        IslandSDF += FractalNoise3D(FVector3f(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f), VoxelGenLOD::Eff(4))
                    * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
     }
 

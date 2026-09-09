@@ -90,21 +90,20 @@ namespace
     static constexpr float VF_PerlinAbsBound = 1.5f;
 
     /** La même enveloppe que `FractalNoise3D` de VoxelGenerator.cpp (qui y est `static`, donc
-     *  invisible ici). Le détour par `FVector` est délibéré — voir l'en-tête de ce fichier. */
-    FORCEINLINE float HFractal3D(const FVector& Position, int32 Octaves = 4,
+     *  invisible ici). Les coordonnées de bruit restent en float : FVector est double dans UE5
+     *  et son aller-retour ne servait qu'à conserver l'ancien arrondi, exigence abandonnée. */
+    FORCEINLINE float HFractal3D(const FVector3f& Position, int32 Octaves = 4,
                                  float Lacunarity = 2.0f, float Persistence = 0.5f)
     {
-        return VoxelNoise::FBM((float)Position.X, (float)Position.Y, (float)Position.Z,
+        return VoxelNoise::FBM(Position.X, Position.Y, Position.Z,
                                Octaves, Lacunarity, Persistence);
     }
 
-    /** Idem pour `RidgedNoise3D` (également `static` dans VoxelGenerator.cpp). Le bruit cellulaire,
-     *  lui, n'a pas besoin d'enveloppe : son corps a migré dans VoxelCaveMorphology.h et s'appelle
-     *  `VoxelNoise::Cellular3D`, avec la MÊME signature `const FVector&` que l'original. */
-    FORCEINLINE float HRidged3D(const FVector& Position, int32 Octaves = 4,
+    /** Idem pour `RidgedNoise3D` (également `static` dans VoxelGenerator.cpp). */
+    FORCEINLINE float HRidged3D(const FVector3f& Position, int32 Octaves = 4,
                                 float Lacunarity = 2.0f, float Persistence = 0.5f)
     {
-        return VoxelNoise::Ridged((float)Position.X, (float)Position.Y, (float)Position.Z,
+        return VoxelNoise::Ridged(Position.X, Position.Y, Position.Z,
                                   Octaves, Lacunarity, Persistence);
     }
 
@@ -285,12 +284,12 @@ namespace
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             const float Frequency = 1.0f / CellSize;
-            const FVector NoisePos(
+            const FVector3f NoisePos(
                 WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 3.17f),
                 WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 7.31f),
                 WorldZ * Frequency + VoxelHash::SeedOffset(SeedU, 11.47f));
             const float Ribbon = FMath::Clamp(
-                FMath::Abs(VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                FMath::Abs(VoxelNoise::FBM(NoisePos.X, NoisePos.Y, NoisePos.Z,
                                            VoxelGenLOD::Eff(3), 2.0f, 0.5f))
                     * VOXEL_NOISE_SCALE,
                 0.0f, 2.0f);
@@ -343,12 +342,12 @@ namespace
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             if (!(Strength > 0.0f)) { return; }
-            const FVector NoisePos(
+            const FVector3f NoisePos(
                 WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 13.2f),
                 WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 17.8f),
                 WorldZ * Frequency + VoxelHash::SeedOffset(SeedU, 23.4f));
             const float Noise01 = FMath::Clamp(
-                VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                VoxelNoise::FBM(NoisePos.X, NoisePos.Y, NoisePos.Z,
                                 VoxelGenLOD::Eff(Octaves), 2.0f, 0.5f) * 0.5f + 0.5f,
                 0.0f, 1.0f);
             const float Delta = Strength * Noise01;
@@ -693,17 +692,16 @@ namespace
         }
 
     private:
-        // Les deux surfaces, transcrites au caractère près depuis GetSlabDensity — y compris le
-        // détour par FVector, qui est le même piège d'arrondi que dans FSdfRoughnessMod
-        // (float → double → float sous /fp:fast). Ne pas « simplifier ».
+        // The surface coordinates stay in float; the old FVector round-trip only preserved
+        // legacy rounding and is no longer part of the output contract.
         float SurfaceFloor(float WorldX, float WorldY) const
         {
             if (FloorRoughness <= 0.0f) { return FloorZ; }
             const float FF = FloorFrequency;
-            const FVector NoisePos(WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
+            const FVector3f NoisePos(WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
                                    WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
                                    0.0f);
-            const float N = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+            const float N = VoxelNoise::FBM(NoisePos.X, NoisePos.Y, NoisePos.Z,
                                             VoxelGenLOD::Eff(3), 2.0f, 0.5f)
                           * VOXEL_NOISE_SCALE * FloorRoughness;
             return FloorZ + N;
@@ -715,10 +713,10 @@ namespace
             if (CeilRoughness > 0.0f)
             {
                 const float CF = CeilFrequency;
-                const FVector NoisePos(WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
+                const FVector3f NoisePos(WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
                                        WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
                                        3000.0f);
-                const float Raw = VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+                const float Raw = VoxelNoise::FBM(NoisePos.X, NoisePos.Y, NoisePos.Z,
                                                   VoxelGenLOD::Eff(3), 2.0f, 0.5f)
                                 * VOXEL_NOISE_SCALE;
                 // abs() ⇒ les formations ne pendent QUE vers le bas.
@@ -1199,7 +1197,7 @@ namespace
             const float f = P.OverhangFrequency;
             // Bruit de forme d'étagère [0,1] ; le terme en Z fait onduler la portée avec la hauteur
             // (déchiqueté, pas une lèvre lisse).
-            const float Ns = HFractal3D(FVector(
+            const float Ns = HFractal3D(FVector3f(
                 WorldX * f + VoxelHash::SeedOffset(SeedU, 17.3f),
                 WorldY * f + VoxelHash::SeedOffset(SeedU, 23.9f),
                 WorldZ * f * P.OverhangZScale + VoxelHash::SeedOffset(SeedU, 5.1f)), 3) * 0.5f + 0.5f;   // [0,1]
@@ -1259,24 +1257,10 @@ namespace
         {
             if (Strength <= 0.0f || InOut.Sdf >= ApplyWithin) { return; }
 
-            // ⚠️ LE DÉTOUR PAR FVector EST DÉLIBÉRÉ — ne pas « simplifier ».
-            // L'original écrit `FractalNoise3D(FVector(WorldX * 0.12f, ...), Eff(3))`, et
-            // FractalNoise3D fait `VoxelNoise::FBM((float)Position.X, ...)`. FVector étant en
-            // DOUBLE (UE5), le produit flottant y transite par un double avant d'être re-arrondi
-            // en float. Passer directement des floats saute cet aller-retour, et sous /fp:fast
-            // les deux chemins ne s'arrondissent pas au même endroit : ~1 ULP d'écart sur le SDF,
-            // qui ressort en 1 ULP sur la densité finale. Reproduire le détour, c'est reproduire
-            // l'arrondi. VERIFIE par MazeEquivalence : le détour conserve l'identité binaire avec
-            // GetMazeDensity (0 écart sur 20,000 échantillons). Si cela change, le candidat suivant
-            // est une contraction FMA entre unités de compilation.
-            //
-            // THE FVector ROUND-TRIP IS DELIBERATE — do not "simplify" it. MazeEquivalence
-            // verifies the resulting path against GetMazeDensity (0 differences / 20,000 samples).
-            // The original goes float -> double (FVector is double in UE5) -> float; going straight
-            // through floats skips a rounding step, and under /fp:fast the two paths round in
-            // different places. Reproducing the detour reproduces the rounding.
-            const FVector NoisePos(WorldX * Frequency, WorldY * Frequency, WorldZ * Frequency);
-            InOut.Sdf += VoxelNoise::FBM((float)NoisePos.X, (float)NoisePos.Y, (float)NoisePos.Z,
+            // Keep hot noise coordinates in float. The old FVector round-trip only preserved
+            // legacy rounding; output compatibility with that field is intentionally abandoned.
+            const FVector3f NoisePos(WorldX * Frequency, WorldY * Frequency, WorldZ * Frequency);
+            InOut.Sdf += VoxelNoise::FBM(NoisePos.X, NoisePos.Y, NoisePos.Z,
                                          VoxelGenLOD::Eff(BaseOctaves), 2.0f, 0.5f)
                        * VOXEL_NOISE_SCALE * Strength;
         }
@@ -1300,9 +1284,8 @@ namespace
             }
             if (Strength <= 0.0f) { return; }
 
-            // The noise input is float after the deliberate FVector round-trip in Eval. If an
-            // authored frequency/box product overflows, Eval can publish a non-finite SDF and no
-            // finite interval is a proof. Unknown costs the skip and protects the geometry.
+            // If an authored frequency/box product overflows, Eval can publish a non-finite SDF
+            // and no finite interval is a proof. Unknown costs the skip and protects the geometry.
             const float MaxAbsCoord = FMath::Max3(
                 FMath::Max(FMath::Abs((float)VoxelBox.Min.X), FMath::Abs((float)VoxelBox.Max.X)),
                 FMath::Max(FMath::Abs((float)VoxelBox.Min.Y), FMath::Abs((float)VoxelBox.Max.Y)),
@@ -2546,10 +2529,10 @@ namespace
             // partagé par toutes les îles proches — chacune échantillonne une autre partie du champ,
             // d'où des silhouettes distinctes.
             const float WarpAmp = (P.IslandMinRadius + P.IslandMaxRadius) * 0.5f * 0.35f;
-            const float WX = WorldX + HFractal3D(FVector(WorldX * 0.04f + VoxelHash::SeedOffset(Salt, 0.0007f),
+            const float WX = WorldX + HFractal3D(FVector3f(WorldX * 0.04f + VoxelHash::SeedOffset(Salt, 0.0007f),
                                                          WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                                       * VOXEL_NOISE_SCALE * WarpAmp;
-            const float WY = WorldY + HFractal3D(FVector(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f,
+            const float WY = WorldY + HFractal3D(FVector3f(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f,
                                                          WorldZ * 0.012f), VoxelGenLOD::Eff(3))
                                       * VOXEL_NOISE_SCALE * WarpAmp;
 
@@ -2931,8 +2914,112 @@ namespace
         /** The warped SDF-space position belonging to the current voxel. */
         FVector LastWarpedPosition = FVector::ZeroVector;
 
-        /** The unwarped position belonging to the current voxel. */
-        FVector LastWorldPosition = FVector::ZeroVector;
+            /** The unwarped position belonging to the current voxel. */
+            FVector LastWorldPosition = FVector::ZeroVector;
+
+            // Support-floor projection depends only on XY for one immutable SDF cache.  The
+            // mesher traverses Z outside X/Y, so keep a small worker-local LRU of XY boxes rather
+            // than only the immediately previous column; each integer column is then projected
+            // once and both structural posts reuse its interval for every Z sample.
+            struct FSupportColumnBox
+            {
+                static constexpr int32 Halo = CHUNK_SIZE + 8;
+                static constexpr int32 Dim = 2 * Halo + 1;
+
+                const FChunkSDFCache* Cache = nullptr;
+                int32 BaseX = 0;
+                int32 BaseY = 0;
+                uint32 LastUse = 0;
+                bool bValid = false;
+                TArray<int32> SlotToEntry;
+                TArray<FTunnelSupportFloorColumn> Columns;
+
+                void Clear()
+                {
+                    Cache = nullptr;
+                    bValid = false;
+                    LastUse = 0;
+                    SlotToEntry.Reset();
+                    Columns.Reset();
+                }
+
+                FTunnelSupportFloorColumn* AcquireColumn(
+                    int32 X, int32 Y, const FChunkSDFCache* InCache,
+                    uint32 InUse, bool& bOutNew)
+                {
+                    bOutNew = false;
+                    if (!bValid || Cache != InCache
+                        || X < BaseX || X >= BaseX + Dim
+                        || Y < BaseY || Y >= BaseY + Dim)
+                    {
+                        Cache = InCache;
+                        BaseX = X - Halo;
+                        BaseY = Y - Halo;
+                        LastUse = InUse;
+                        bValid = true;
+                        SlotToEntry.Init(INDEX_NONE, Dim * Dim);
+                        Columns.Reset();
+                    }
+                    else
+                    {
+                        LastUse = InUse;
+                    }
+
+                    const int32 Slot = (Y - BaseY) * Dim + (X - BaseX);
+                    int32& EntryIndex = SlotToEntry[Slot];
+                    if (EntryIndex == INDEX_NONE)
+                    {
+                        EntryIndex = Columns.AddDefaulted();
+                        bOutNew = true;
+                    }
+                    return &Columns[EntryIndex];
+                }
+            };
+
+            struct FSupportColumnCache
+            {
+                static constexpr int32 NumBoxes = 4;
+                FSupportColumnBox Boxes[NumBoxes];
+                uint32 Clock = 0;
+
+                void Invalidate()
+                {
+                    for (FSupportColumnBox& Box : Boxes)
+                    {
+                        Box.Clear();
+                    }
+                    Clock = 0;
+                }
+
+                FSupportColumnBox& AcquireBox(
+                    int32 X, int32 Y, const FChunkSDFCache* Cache)
+                {
+                    ++Clock;
+                    for (FSupportColumnBox& Box : Boxes)
+                    {
+                        if (Box.bValid && Box.Cache == Cache
+                            && X >= Box.BaseX && X < Box.BaseX + FSupportColumnBox::Dim
+                            && Y >= Box.BaseY && Y < Box.BaseY + FSupportColumnBox::Dim)
+                        {
+                            Box.LastUse = Clock;
+                            return Box;
+                        }
+                    }
+
+                    FSupportColumnBox* Victim = &Boxes[0];
+                    for (FSupportColumnBox& Box : Boxes)
+                    {
+                        if (!Box.bValid || Box.LastUse < Victim->LastUse)
+                        {
+                            Victim = &Box;
+                        }
+                    }
+                    Victim->Clear();
+                    return *Victim;
+                }
+            } SupportColumns;
+
+            FTunnelSupportFloorColumn FractionalSupportColumn;
 
             /** ÉTAPE C1 — les params de la strate avec l'op de CETTE salle appliqué par-dessus.
              *  Mémo par voxel : invalidé au début de chaque `Eval`, calculé au PREMIER modificateur
@@ -3081,6 +3168,7 @@ namespace
             {
                 S.Cache = FChunkSDFCache();
                 S.ActiveCache = &S.Cache;
+                S.SupportColumns.Invalidate();
                 InOut.Sdf = FLT_MAX;
                 return;
             }
@@ -3088,6 +3176,7 @@ namespace
             if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f))
             {
                 S.ActiveCache = &S.Cache;
+                S.SupportColumns.Invalidate();
                 return;   // Sdf reste FLT_MAX
             }
 
@@ -3106,15 +3195,15 @@ namespace
             {
                 const float WF = P.CaveWarpFrequency;
                 const float WS = P.CaveWarpStrength;
-                WarpedX += VoxelNoise::Perlin3D(FVector(
+                WarpedX += VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
                     WorldY * WF + 1.3f,
                     EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
-                WarpedY += VoxelNoise::Perlin3D(FVector(
+                WarpedY += VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 7.1f,
                     WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
                     EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
-                WarpedZ += VoxelNoise::Perlin3D(FVector(
+                WarpedZ += VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 11.3f,
                     WorldY * WF + 9.7f,
                     EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
@@ -3219,7 +3308,8 @@ namespace
                 SharedCache->RegionMinX = RegionMinX;
                 SharedCache->RegionMinY = RegionMinY;
                 SharedCache->RegionSize = RegionSize;
-                const float Expansion = P.CaveWarpStrength + 2.0f;
+                const float Expansion = FMath::Abs(P.CaveWarpStrength)
+                    * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f;
                 VoxelCaveMorphology::BuildChunkCache(
                     SharedCache->Cache,
                     (float)RegionMinX - Expansion,
@@ -3228,6 +3318,8 @@ namespace
                     (float)(RegionMinY + RegionSize) + Expansion,
                     P, SeedU, StrateIdx, TerrainOps);
                 SharedCache->bValid = true;
+                VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint();
+                S.SupportColumns.Invalidate();
             }
             S.ActiveCache = &SharedCache->Cache;
 
@@ -3749,9 +3841,48 @@ namespace
 
         bool IsTunnelSupportFloor() const
         {
-            const FVector& Position = State().LastWorldPosition;
-            return VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-                Position.X, Position.Y, Position.Z, GetCache());
+            FState& S = State();
+            const FVector& Position = S.LastWorldPosition;
+            const FChunkSDFCache& Cache = GetCache();
+            if (VoxelDensityProfile::IsEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
+            }
+
+            // Density-grid samples are integer XY. Keep fractional callers exact by using a
+            // scratch column; they are uncommon gradient/debug queries and must not alias a
+            // neighbouring integer column.
+            const bool bIntegerXY =
+                Position.X == FMath::FloorToFloat(static_cast<float>(Position.X))
+                && Position.Y == FMath::FloorToFloat(static_cast<float>(Position.Y));
+            if (bIntegerXY)
+            {
+                const int32 IX = FMath::FloorToInt(static_cast<float>(Position.X));
+                const int32 IY = FMath::FloorToInt(static_cast<float>(Position.Y));
+                FState::FSupportColumnBox& Box = S.SupportColumns.AcquireBox(IX, IY, &Cache);
+                bool bNewColumn = false;
+                FTunnelSupportFloorColumn* Column = Box.AcquireColumn(
+                    IX, IY, &Cache, S.SupportColumns.Clock, bNewColumn);
+                if (bNewColumn)
+                {
+                    VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                        static_cast<float>(Position.X),
+                        static_cast<float>(Position.Y),
+                        Cache,
+                        *Column);
+                }
+                return VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
+                    static_cast<float>(Position.Z), *Column);
+            }
+
+            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                static_cast<float>(Position.X),
+                static_cast<float>(Position.Y),
+                Cache,
+                S.FractionalSupportColumn);
+            return VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
+                static_cast<float>(Position.Z), S.FractionalSupportColumn);
         }
 
     private:
@@ -3947,15 +4078,14 @@ namespace
 
             const float RF = P.RoughnessFrequency;
 
-            // ⚠️ LE DÉTOUR PAR FVector EST DÉLIBÉRÉ (même raison que dans FSdfRoughnessMod) :
-            // FVector est en DOUBLE, donc chaque produit transite par un double avant d'être
-            // re-arrondi en float à l'appel du bruit. Sauter l'aller-retour change l'arrondi.
-            FVector MainPos(
+            // Keep both hot noise-coordinate chains in float. The old FVector round-trip only
+            // preserved legacy rounding; output compatibility with that field is abandoned.
+            FVector3f MainPos(
                 WorldX * RF + VoxelHash::SeedOffset(SeedU, 11.3f),
                 WorldY * RF + VoxelHash::SeedOffset(SeedU, 13.7f),
                 EffectiveZ * RF + VoxelHash::SeedOffset(SeedU, 17.1f)
             );
-            FVector FinePos(
+            FVector3f FinePos(
                 WorldX * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 19.1f) + 2000.0f,
                 WorldY * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 23.7f) + 2500.0f,
                 EffectiveZ * RF * 3.0f + VoxelHash::SeedOffset(SeedU, 29.3f) + 3000.0f
@@ -3969,25 +4099,25 @@ namespace
                 const float WF = P.DomainWarpFrequency;
                 const float WS = P.DomainWarpStrength;
 
-                const float WarpX = VoxelNoise::Perlin3D(FVector(
+                const float WarpX = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + VoxelHash::SeedOffset(SeedU, 5.2f),
                     WorldY * WF + VoxelHash::SeedOffset(SeedU, 1.3f),
                     EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 9.7f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                const float WarpY = VoxelNoise::Perlin3D(FVector(
+                const float WarpY = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 100.0f + VoxelHash::SeedOffset(SeedU, 7.7f),
                     WorldY * WF + 200.0f + VoxelHash::SeedOffset(SeedU, 3.1f),
                     EffectiveZ * WF + 300.0f
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                const float WarpZ = VoxelNoise::Perlin3D(FVector(
+                const float WarpZ = VoxelNoise::Perlin3D(FVector3f(
                     WorldX * WF + 400.0f,
                     WorldY * WF + 500.0f + VoxelHash::SeedOffset(SeedU, 11.9f),
                     EffectiveZ * WF + 600.0f + VoxelHash::SeedOffset(SeedU, 13.3f)
                 )) * VOXEL_NOISE_SCALE * WS;
 
-                const FVector WarpOffset(WarpX, WarpY, WarpZ);
+                const FVector3f WarpOffset(WarpX, WarpY, WarpZ);
                 MainPos += WarpOffset;
                 FinePos += WarpOffset;
             }
@@ -4161,7 +4291,7 @@ namespace
             float NoisedZ = WorldZ;
             if (LP.TerraceNoiseDisplacement > 0.0f)
             {
-                const float DispNoise = HFractal3D(FVector(
+                const float DispNoise = HFractal3D(FVector3f(
                     WorldX * 0.04f + VoxelHash::SeedOffset(SeedU, 31.1f),
                     WorldY * 0.04f + VoxelHash::SeedOffset(SeedU, 37.3f),
                     WorldZ * 0.02f + VoxelHash::SeedOffset(SeedU, 41.7f)
@@ -4432,7 +4562,7 @@ namespace
                                    ? (WorldZ / P.VerticalScale) : WorldZ;
 
             // Fréquence en Z à 0.15× celle de XY ⇒ les motifs s'étirent horizontalement.
-            const float OverhangNoise = HFractal3D(FVector(
+            const float OverhangNoise = HFractal3D(FVector3f(
                 WorldX * LP.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 53.1f),
                 WorldY * LP.OverhangFrequency + VoxelHash::SeedOffset(SeedU, 59.3f),
                 EffectiveZ * LP.OverhangFrequency * 0.15f + VoxelHash::SeedOffset(SeedU, 61.7f)
@@ -4533,7 +4663,7 @@ namespace
             const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
                                    ? (WorldZ / P.VerticalScale) : WorldZ;
 
-            const float VertGrad = VoxelNoise::Perlin3D(FVector(
+            const float VertGrad = VoxelNoise::Perlin3D(FVector3f(
                 WorldX * 0.05f + VoxelHash::SeedOffset(SeedU, 71.3f),
                 WorldY * 0.05f + VoxelHash::SeedOffset(SeedU, 73.7f),
                 EffectiveZ * 0.15f + VoxelHash::SeedOffset(SeedU, 79.1f)   // 3× plus vite en Z
@@ -4610,7 +4740,7 @@ namespace
                                    ? (WorldZ / P.VerticalScale) : WorldZ;
 
             const float SF = LP.ScallopFrequency;
-            const float ScallopNoise = VoxelNoise::Cellular3D(FVector(
+            const float ScallopNoise = VoxelNoise::Cellular3D(FVector3f(
                 WorldX * SF + VoxelHash::SeedOffset(SeedU, 83.1f),
                 WorldY * SF + VoxelHash::SeedOffset(SeedU, 89.3f),
                 EffectiveZ * SF + VoxelHash::SeedOffset(SeedU, 97.7f)
@@ -4710,45 +4840,21 @@ namespace
             if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }
             const FCachedRoom& Room = Cache.Rooms[NearestRoomIdx];
 
-            const int32 MaxArches = 3;
             const FVector VoxPos(WorldX, WorldY, WorldZ);
 
-            for (int32 i = 0; i < MaxArches; i++)
+            for (int32 i = 0; i < 3; i++)
             {
-                const uint32 AH = VoxelHash::Mix(Room.Hash ^ (0xA4C400u + (uint32)i * 7369u));
-
-                if (VoxelHash::ToFloat01(AH) > LP.ArchDensity) { continue; }
-
-                const uint32 AH2 = VoxelHash::Mix(AH ^ 0xA4C4u);
-                const float ArcCX = Room.Center.X + VoxelHash::ToFloatSigned(AH2) * Room.RadiusXY * 0.3f;
-                const float ArcCY = Room.Center.Y
-                                  + VoxelHash::ToFloatSigned(VoxelHash::Mix(AH2)) * Room.RadiusXY * 0.3f;
-
-                const uint32 AH3 = VoxelHash::Mix(AH2 ^ 0xB41Du);
-                const float ArcCZ = Room.Center.Z + VoxelHash::ToFloatSigned(AH3) * Room.RadiusZ * 0.4f;
-
-                const uint32 AH4 = VoxelHash::Mix(AH3 ^ 0xCAFEu);
-                const float Angle    = VoxelHash::ToFloat01(AH4) * PI;
-                const float HalfSpan = Room.RadiusXY
-                                     * (0.5f + VoxelHash::ToFloat01(VoxelHash::Mix(AH4)) * 0.35f);
-
-                const float CosA = FMath::Cos(Angle);
-                const float SinA = FMath::Sin(Angle);
-                const FVector ArchA(ArcCX - CosA * HalfSpan, ArcCY - SinA * HalfSpan, ArcCZ);
-                const FVector ArchB(ArcCX + CosA * HalfSpan, ArcCY + SinA * HalfSpan, ArcCZ);
-
-                const uint32 AH5 = VoxelHash::Mix(AH4 ^ 0xF00Du);
-                const float ArchRadius = FMath::Lerp(LP.ArchMinRadius, LP.ArchMaxRadius,
-                                                     VoxelHash::ToFloat01(AH5));
-
-                const float ArchSDF = VoxelSDF::Capsule(VoxPos, ArchA, ArchB, ArchRadius);
+                const FCachedArch& Arch = Room.Arches[i];
+                if (!Arch.bActive) { continue; }
+                const float ArchSDF = VoxelSDF::Capsule(
+                    VoxPos, Arch.EndpointA, Arch.EndpointB, Arch.Radius);
 
                 const float ArchBlend = 2.0f;
                 if (ArchSDF < ArchBlend)
                 {
                     float Fill = FMath::Clamp((ArchBlend - ArchSDF) / (ArchBlend * 2.0f), 0.0f, 1.0f);
                     Fill = SmoothStep01(Fill);
-                    InOut.Density += Fill * LP.BaseDensity * 1.5f;
+                    InOut.Density += Fill * Arch.BaseDensity * 1.5f;
                 }
             }
         }
@@ -4997,45 +5103,22 @@ namespace
             if (!Cache.Rooms.IsValidIndex(NearestRoomIdx)) { return; }   // cf. FCaveArchMod
             const FCachedRoom& Room = Cache.Rooms[NearestRoomIdx];
 
-            const float Spread = 0.85f;
-            const int32 MaxPinches = 3;
-
-            for (int32 i = 0; i < MaxPinches; i++)
+            for (int32 i = 0; i < 3; i++)
             {
-                const uint32 PnH = VoxelHash::Mix(Room.Hash ^ (0xF1C400u + (uint32)i * 5417u));
+                const FCachedPinch& Pinch = Room.Pinches[i];
+                if (!Pinch.bActive) { continue; }
+                const float DXPn = WorldX - Pinch.CenterX;
+                const float DYPn = WorldY - Pinch.CenterY;
+                const float DZPn = WorldZ - Pinch.CenterZ;
 
-                if (VoxelHash::ToFloat01(PnH) > LP.PinchDensity) { continue; }
+                if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > Pinch.MaxExtent) { continue; }
 
-                const uint32 PnH2 = VoxelHash::Mix(PnH ^ 0xF1C4u);
-                const float PnX = Room.Center.X + VoxelHash::ToFloatSigned(PnH2) * Room.RadiusXY * Spread;
-                const float PnY = Room.Center.Y
-                                + VoxelHash::ToFloatSigned(VoxelHash::Mix(PnH2)) * Room.RadiusXY * Spread;
+                const float Along  =  DXPn * Pinch.CosAngle + DYPn * Pinch.SinAngle;
+                const float Across = -DXPn * Pinch.SinAngle + DYPn * Pinch.CosAngle;
 
-                const uint32 PnH3 = VoxelHash::Mix(PnH2 ^ 0x5432u);
-                const float PnZ = Room.Center.Z + VoxelHash::ToFloatSigned(PnH3) * Room.RadiusZ * 0.5f;
-
-                const uint32 PnH4 = VoxelHash::Mix(PnH3 ^ 0x9A3Bu);
-                const float PnAngle = VoxelHash::ToFloat01(PnH4) * PI;
-                const float CosPN = FMath::Cos(PnAngle);
-                const float SinPN = FMath::Sin(PnAngle);
-
-                const float DXPn = WorldX - PnX;
-                const float DYPn = WorldY - PnY;
-                const float DZPn = WorldZ - PnZ;
-
-                const float MaxExtent = FMath::Max(LP.PinchLength, LP.PinchStrength) + 5.0f;
-                if (FMath::Abs(DXPn) + FMath::Abs(DYPn) + FMath::Abs(DZPn) > MaxExtent) { continue; }
-
-                const float Along  =  DXPn * CosPN + DYPn * SinPN;
-                const float Across = -DXPn * SinPN + DYPn * CosPN;
-
-                const float HalfLength   = LP.PinchLength * 0.5f;
-                const float HalfNarrow   = LP.PinchStrength;
-                const float HalfVertical = LP.PinchStrength * 1.5f;
-
-                const float NAlong   = Along   / HalfLength;
-                const float NAcross  = Across  / HalfNarrow;
-                const float NUp      = DZPn    / HalfVertical;
+                const float NAlong   = Along   / Pinch.HalfLength;
+                const float NAcross  = Across  / Pinch.HalfNarrow;
+                const float NUp      = DZPn    / Pinch.HalfVertical;
                 const float EllipDist = NAlong * NAlong + NAcross * NAcross + NUp * NUp;
 
                 if (EllipDist < 1.0f)
@@ -5044,7 +5127,7 @@ namespace
                     Fill = SmoothStep01(Fill);
                     const float AxisDist = FMath::Sqrt(NAcross * NAcross + NUp * NUp);
                     const float SideFactor = FMath::Clamp(AxisDist * 2.0f, 0.0f, 1.0f);
-                    InOut.Density += Fill * SideFactor * LP.BaseDensity * 1.5f;
+                    InOut.Density += Fill * SideFactor * Pinch.BaseDensity * 1.5f;
                 }
             }
         }
@@ -5192,7 +5275,7 @@ namespace
 
             const float WormZFreq = P.WormFrequency * P.WormHorizontalBias;
 
-            const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+            const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
                 WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
                 WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
                 EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
@@ -5202,7 +5285,7 @@ namespace
             // second Perlin (le cas courant ; sortie bit-identique). Transcrit tel quel.
             if (N1 >= P.WormThreshold) { return; }
 
-            const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector(
+            const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
                 WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
                 WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
                 EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
@@ -5440,9 +5523,60 @@ VoxelDensityOps::FRoomBoxDiagnostic VoxelDensityOps::GetLastRoomBoxDiagnostic()
     return D;
 }
 
+void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
+{
+    if (!VoxelDensityProfile::IsEnabled())
+    {
+        return;
+    }
+
+    uint64 DynamicBytes = 0;
+    uint64 EntryBytes = 0;
+    uint64 LargestEntryBytes = 0;
+    uint64 ValidEntries = 0;
+    for (int32 Index = 0; Index < RoomGraphCacheSlotCount; ++Index)
+    {
+        const FRoomGraphCacheEntry& Entry = GRoomGraphCache[Index];
+        if (!Entry.bValid)
+        {
+            continue;
+        }
+
+        ++ValidEntries;
+        const uint64 EntryDynamicBytes = static_cast<uint64>(Entry.Cache.GetAllocatedSize());
+        const uint64 FullEntryBytes = static_cast<uint64>(sizeof(FRoomGraphCacheEntry))
+            + EntryDynamicBytes;
+        DynamicBytes += EntryDynamicBytes;
+        EntryBytes += FullEntryBytes;
+        LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
+    }
+
+    VoxelDensityProfile::SetWorkerRoomGraphCacheFootprint(
+        RoomGraphCacheSlotCount,
+        ValidEntries,
+        static_cast<uint64>(sizeof(GRoomGraphCache)),
+        DynamicBytes,
+        EntryBytes,
+        LargestEntryBytes,
+        ValidEntries);
+}
+
 //=============================================================================
 // FVoxelOpStack
 //=============================================================================
+
+SIZE_T FVoxelOpStack::GetAllocatedSize() const
+{
+    SIZE_T Bytes = static_cast<SIZE_T>(Ops.GetAllocatedSize());
+    for (const FOpEntry& Entry : Ops)
+    {
+        if (Entry.Op.IsValid())
+        {
+            Bytes += FMemory::GetAllocSize(const_cast<IVoxelDensityOp*>(Entry.Op.Get()));
+        }
+    }
+    return Bytes;
+}
 
 bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const
 {

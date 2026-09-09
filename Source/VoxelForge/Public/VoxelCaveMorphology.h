@@ -439,16 +439,16 @@ namespace VoxelMazeTopology
 // point le plus bas qui voit déjà le hash, et le générateur comme la pile d'opérateurs l'appellent.
 //
 // Ce corps était `static float CellularNoise3D(const FVector&)` dans VoxelGenerator.cpp, invisible
-// à la pile d'opérateurs. Déplacement LITTÉRAL : mêmes opérations, même ordre, même passage par
-// `FVector` (donc par des doubles) — l'égalité binaire du portage TunnelNetwork en dépend.
-// `UVoxelGenerator`'s copy is now a one-line forwarder; the body moved verbatim.
+// à la pile d'opérateurs. Il vit ici pour que les deux chemins partagent la même implémentation.
+// The hot overload uses FVector3f: noise coordinates are floats, so no double round-trip is paid
+// before the hash/lattice arithmetic. Output compatibility with the old field is not a contract.
 //
 // Algorithme : distance au point-feature le plus proche dans une grille hachée.
 //   1. cellule entière du point   2. voisinage 3×3×3   3. rendre (F2 − F1), normalisé ~[-1, 1]
 // F2−F1 donne des frontières de cellules lisses avec des arêtes entre elles.
 namespace VoxelNoise
 {
-    FORCEINLINE float Cellular3D(const FVector& Position)
+    FORCEINLINE float Cellular3D(const FVector3f& Position)
     {
         // Integer cell coordinates
         int32 CellX = FMath::FloorToInt(Position.X);
@@ -508,6 +508,11 @@ namespace VoxelNoise
         // Result is in [0, ~1.0]. Map to [-1, 1] for compatibility with other noise types.
         return Result * 2.0f - 1.0f;
     }
+
+    FORCEINLINE float Cellular3D(const FVector& Position)
+    {
+        return Cellular3D(FVector3f((float)Position.X, (float)Position.Y, (float)Position.Z));
+    }
 }
 
 //=============================================================================
@@ -523,6 +528,32 @@ namespace VoxelNoise
 //
 // With caching: build once, evaluate 32K times with just SDF math.
 // This is the single biggest CPU performance win for cave generation.
+
+// Room-relative detail geometry whose hash/trigonometry is constant for a cached room.
+// These are built once with the room's terrain-op parameters and then only evaluated per voxel.
+struct FCachedArch
+{
+    bool bActive = false;
+    FVector EndpointA = FVector::ZeroVector;
+    FVector EndpointB = FVector::ZeroVector;
+    float Radius = 0.0f;
+    float BaseDensity = 0.0f;
+};
+
+struct FCachedPinch
+{
+    bool bActive = false;
+    float CenterX = 0.0f;
+    float CenterY = 0.0f;
+    float CenterZ = 0.0f;
+    float CosAngle = 1.0f;
+    float SinAngle = 0.0f;
+    float MaxExtent = 0.0f;
+    float HalfLength = 0.0f;
+    float HalfNarrow = 0.0f;
+    float HalfVertical = 0.0f;
+    float BaseDensity = 0.0f;
+};
 
 // A room in the cache — everything needed for per-voxel SDF evaluation.
 // Internal details (CellX, CellY) used during cache building are NOT stored here.
@@ -568,6 +599,11 @@ struct FCachedRoom
     FVector ShapeA = FVector::ZeroVector;
     FVector ShapeB = FVector::ZeroVector;
     float   ShapeR = 0.0f;
+
+    // Hash-derived room details.  The old evaluator rebuilt these hashes and angles for every
+    // surface sample; the cache build is the only place where their geometry can change.
+    FCachedArch  Arches[3];
+    FCachedPinch Pinches[3];
 };
 
 // A local flat-floor bridge over the overlap of two room bodies. It is not a new graph edge: it
@@ -605,9 +641,110 @@ struct FCachedTunnel
     TArray<float> WorldControlRadii;
     FVector WorldBoundCenter = FVector::ZeroVector;
     float WorldBoundRadiusSq = 0.0f;
+    // Centerline AABBs and scalar influence radii used by the immutable broad phase.  The
+    // AABB test is a cheap lower bound on distance to the whole chain; the existing squared
+    // sphere test remains the exact conservative second-stage reject.
+    FVector SDFCenterlineMin = FVector::ZeroVector;
+    FVector SDFCenterlineMax = FVector::ZeroVector;
+    float SDFInfluenceRadius = 0.0f;
+    FVector WorldCenterlineMin = FVector::ZeroVector;
+    FVector WorldCenterlineMax = FVector::ZeroVector;
+    float WorldInfluenceRadius = 0.0f;
     // Bounding sphere for quick per-voxel rejection
     FVector BoundCenter;  // Center of the bounding sphere
     float BoundRadiusSq;  // Squared radius — if voxel is further, skip this tunnel
+};
+
+// A deterministic uniform-grid broad phase.  Build() is called while a chunk cache is being
+// assembled; after that the arrays are immutable and workers only read a bin range.  Entries are
+// supplied in candidate order, so each bin is already sorted by candidate ID and no runtime sort
+// or allocation is needed.  A failed/overflowing build leaves bValid=false and callers fall back
+// to the exact legacy scan rather than risking a false negative.
+struct FCaveSpatialIndexEntry
+{
+    int32 CandidateIndex = INDEX_NONE;
+    FVector Min = FVector::ZeroVector;
+    FVector Max = FVector::ZeroVector;
+};
+
+struct FCaveSpatialIndexBin
+{
+    int32 First = 0;
+    int32 Count = 0;
+};
+
+struct FCaveSpatialIndex
+{
+    static constexpr int32 BinSizeVoxels = 16;
+
+    bool bValid = false;
+    int32 MinBinX = 0;
+    int32 MinBinY = 0;
+    int32 MinBinZ = 0;
+    int32 CellsX = 0;
+    int32 CellsY = 0;
+    int32 CellsZ = 0;
+    TArray<FCaveSpatialIndexBin> Bins;
+    TArray<int32> CandidateIndices;
+
+    void Reset();
+    void Build(const TArray<FCaveSpatialIndexEntry>& Entries);
+
+    // Returns false only when the index is invalid.  A valid query outside its extent returns
+    // true with an empty range, which is the normal cheap reject for that sample.
+    bool GetBin(float X, float Y, float Z, int32& OutFirst, int32& OutCount) const;
+
+    // Build-time/column-query helper.  Coordinates are already integer cell coordinates.
+    bool GetBinAt(int32 CellX, int32 CellY, int32 CellZ,
+                  int32& OutFirst, int32& OutCount) const;
+
+    // A support-floor column is Z-dependent but not Z-search-dependent.  Gather the unique
+    // tunnel IDs from every height bin crossing one XY cell once, then reuse the resulting floor
+    // intervals for all samples in that column.
+    template <typename AllocatorType>
+    bool GetColumnCandidates(float X, float Y, TArray<int32, AllocatorType>& OutCandidates) const;
+};
+
+struct FTunnelSupportFloorInterval
+{
+    int32 TunnelIndex = INDEX_NONE;
+    float FloorZ = 0.0f;
+    float MinZ = 0.0f;
+    float MaxZ = 0.0f;
+};
+
+struct FTunnelSupportFloorColumn
+{
+    TArray<FTunnelSupportFloorInterval, TInlineAllocator<16>> Intervals;
+
+    FTunnelSupportFloorColumn() = default;
+
+    FTunnelSupportFloorColumn(const FTunnelSupportFloorColumn& Other)
+        : Intervals(Other.Intervals)
+    {
+    }
+
+    FTunnelSupportFloorColumn& operator=(const FTunnelSupportFloorColumn& Other)
+    {
+        Intervals = Other.Intervals;
+        return *this;
+    }
+
+    FTunnelSupportFloorColumn(FTunnelSupportFloorColumn&& Other)
+        : Intervals(MoveTemp(Other.Intervals))
+    {
+    }
+
+    FTunnelSupportFloorColumn& operator=(FTunnelSupportFloorColumn&& Other)
+    {
+        Intervals = MoveTemp(Other.Intervals);
+        return *this;
+    }
+
+    void Reset()
+    {
+        Intervals.Reset();
+    }
 };
 
 // A pre-baked pit shaft — position and dimensions resolved during BuildChunkCache.
@@ -667,6 +804,27 @@ struct FChunkSDFCache
     TArray<FCachedPit>     Pits;
     TArray<FCachedChimney> Chimneys;
     TArray<FCachedColumn>  Columns;
+
+    // Immutable broad-phase indices.  The world index is also the source for per-column support
+    // intervals; its Z bins are traversed only when a column is first built.
+    FCaveSpatialIndex RoomIndex;
+    FCaveSpatialIndex RoomFloorJoinIndex;
+    FCaveSpatialIndex TunnelIndex;
+    FCaveSpatialIndex TunnelWorldIndex;
+
+    // Sparse immutable support-column table. SupportColumnEntries is a dense
+    // integer-XY slot map whose values index only non-empty SupportColumns.
+    int32 SupportColumnMinX = 0;
+    int32 SupportColumnMinY = 0;
+    int32 SupportColumnCellsX = 0;
+    int32 SupportColumnCellsY = 0;
+    TArray<int32> SupportColumnEntries;
+    TArray<FTunnelSupportFloorColumn> SupportColumns;
+
+    // Allocator-backed bytes owned by this cache, including the nested tunnel chains and index
+    // arrays.  The returned value excludes sizeof(FChunkSDFCache) itself so callers can add the
+    // enclosing entry's inline storage exactly once.
+    SIZE_T GetAllocatedSize() const;
 };
 
 /** Combined world-space tunnel post query; one cache scan supplies both support and air tests. */
@@ -766,7 +924,8 @@ namespace VoxelCaveMorphology
 
     VOXELFORGE_API FTunnelCoreWorldEvaluation EvaluateTunnelCoreWorld(
         float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache
+        const FChunkSDFCache& Cache,
+        const FTunnelSupportFloorColumn* SupportColumn = nullptr
     );
 
     // True for the finite support slab beneath a world-space graph tunnel. The native density
@@ -775,6 +934,30 @@ namespace VoxelCaveMorphology
     VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache
+    );
+
+    // Build/query the same support-floor predicate at column granularity.  This changes only
+    // where the deterministic projection is computed; it does not change the floor interval.
+    VOXELFORGE_API void BuildTunnelSupportFloorColumn(
+        float WorldX, float WorldY,
+        const FChunkSDFCache& Cache,
+        FTunnelSupportFloorColumn& OutColumn
+    );
+
+    VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(
+        float WorldZ,
+        const FTunnelSupportFloorColumn& Column
+    );
+
+    // Returns the exact projected floor band for one tunnel at this XY column.
+    // The world evaluator uses FloorZ for its per-tunnel air ownership rule and
+    // Min/Max for the support slab itself.
+    VOXELFORGE_API bool GetTunnelSupportFloorColumnBand(
+        int32 TunnelIndex,
+        const FTunnelSupportFloorColumn& Column,
+        float& OutFloorZ,
+        float& OutMinZ,
+        float& OutMaxZ
     );
 
     // CONVENIENCE WRAPPER: builds a temporary cache and evaluates in one call.

@@ -132,6 +132,15 @@ FORCEINLINE float Perlin3D(const FVector& P)
     return Perlin3D((float)P.X, (float)P.Y, (float)P.Z);
 }
 
+// Hot density callers already own float voxel coordinates.  Keeping this overload separate from
+// FVector avoids constructing UE5's double-precision FVector merely to round the coordinates back
+// to float at the noise entry point.  It is the same scalar formula and remains deterministic on
+// every build of the module.
+FORCEINLINE float Perlin3D(const FVector3f& P)
+{
+    return Perlin3D(P.X, P.Y, P.Z);
+}
+
 //=============================================================================
 // 4-WIDE BATCH — the SIMD multiplier. Computes 4 independent Perlin samples.
 // Inputs are 4-element arrays; unused lanes must be zero-filled by the caller

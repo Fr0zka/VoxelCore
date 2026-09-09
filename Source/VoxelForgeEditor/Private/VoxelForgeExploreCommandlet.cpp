@@ -173,6 +173,7 @@ struct FExploreArguments
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
+    bool bUseOperatorStack = true;
     bool bProfileDensity = false;
     bool bProfileLod = false;
     bool bFailureFocusRender = false;
@@ -212,6 +213,9 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FParse::Value(*Params, TEXT("archetype="), ArchetypeText);
     FParse::Value(*Params, TEXT("slot="), OutArguments.Slot);
     FParse::Value(*Params, TEXT("modes="), ModesText);
+    int32 UseOperatorStack = 1;
+    FParse::Value(*Params, TEXT("opstack="), UseOperatorStack);
+    OutArguments.bUseOperatorStack = UseOperatorStack != 0;
     OutArguments.bProfileDensity = FParse::Param(*Params, TEXT("profiledensity"));
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     FParse::Value(*Params, TEXT("out="), OutText);
@@ -528,9 +532,9 @@ struct FExploreWorld
             Definition->GeneratorType = Index == Arguments.Slot
                 ? Arguments.Archetype
                 : ECaveGeneratorType::TunnelNetwork;
-            // Exercise the production operator-stack opt-in where it is implemented (Maze),
-            // while the runtime switch safely falls back for other archetypes.
-            Definition->bUseOperatorStack = true;
+            // Explicitly select the production switch so the same synthetic layout, seed and
+            // mesher invocation can be measured through both density branches.
+            Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
 
             const TSoftObjectPtr<UVoxelStrateDefinition> SoftDefinition(Definition);
             Settings->FixedStrates.Add(Index, SoftDefinition);
@@ -3270,6 +3274,7 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
+    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
@@ -3478,6 +3483,7 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
+    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
@@ -3494,10 +3500,11 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
-             "-slot=%d -modes=%s -out=Saved/VoxelForge/Explore/<runid>"),
+             "-slot=%d -opstack=%d -modes=%s -out=Saved/VoxelForge/Explore/<runid>"),
         Arguments.Seed,
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
+        Arguments.bUseOperatorStack ? 1 : 0,
         *Arguments.CanonicalModes()));
     Writer->WriteObjectEnd();
 
@@ -4123,6 +4130,102 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
             static_cast<unsigned long long>(DensityCalls), DensityTotalUs,
             DensityCalls > 0 ? DensityTotalUs / static_cast<double>(DensityCalls) : 0.0);
 
+        const uint64 CacheTotalStaticBytes = Profile.TunnelCacheStaticBytes
+            + Profile.RoomGraphCacheStaticBytes;
+        const uint64 CacheTotalDynamicBytes = Profile.TunnelCacheDynamicBytes
+            + Profile.RoomGraphCacheDynamicBytes;
+        const uint64 CacheTotalBytes = CacheTotalStaticBytes + CacheTotalDynamicBytes;
+        const uint64 CacheWorkers = FMath::Max(
+            Profile.TunnelCacheWorkers, Profile.RoomGraphCacheWorkers);
+        const uint64 CacheValidEntries = Profile.TunnelCacheValidEntries
+            + Profile.RoomGraphCacheValidEntries;
+        const uint64 CacheEntryBytes = Profile.TunnelCacheEntryBytes
+            + Profile.RoomGraphCacheEntryBytes;
+        const uint64 CacheCapacityEntries = Profile.TunnelCacheCapacityEntries
+            + Profile.RoomGraphCacheCapacityEntries;
+        const uint64 CacheLargestEntryBytes = FMath::Max(
+            Profile.TunnelCacheLargestEntryBytes,
+            Profile.RoomGraphCacheLargestEntryBytes);
+        const uint64 CacheLargestWorkerBytes = FMath::Max(
+            Profile.TunnelCacheLargestWorkerBytes,
+            Profile.RoomGraphCacheLargestWorkerBytes);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCacheMemory] workers=%llu capacity_entries=%llu valid_entries=%llu "
+                 "static_bytes=%llu dynamic_bytes=%llu total_bytes=%llu "
+                 "avg_valid_entry_bytes=%.1f largest_entry_bytes=%llu "
+                 "avg_worker_bytes=%.1f largest_worker_bytes=%llu "
+                 "tunnel_avg_entry_bytes=%.1f tunnel_largest_entry_bytes=%llu "
+                 "tunnel_largest_worker_valid=%llu "
+                 "roomgraph_avg_entry_bytes=%.1f roomgraph_largest_entry_bytes=%llu "
+                 "roomgraph_largest_worker_valid=%llu "
+                 "tunnel_workers=%llu tunnel_capacity=%llu tunnel_valid=%llu "
+                 "tunnel_static=%llu tunnel_dynamic=%llu roomgraph_workers=%llu "
+                 "roomgraph_capacity=%llu roomgraph_valid=%llu roomgraph_static=%llu "
+                 "roomgraph_dynamic=%llu"),
+            static_cast<unsigned long long>(CacheWorkers),
+            static_cast<unsigned long long>(CacheCapacityEntries),
+            static_cast<unsigned long long>(CacheValidEntries),
+            static_cast<unsigned long long>(CacheTotalStaticBytes),
+            static_cast<unsigned long long>(CacheTotalDynamicBytes),
+            static_cast<unsigned long long>(CacheTotalBytes),
+            CacheValidEntries > 0
+                ? static_cast<double>(CacheEntryBytes) / static_cast<double>(CacheValidEntries)
+                : 0.0,
+            static_cast<unsigned long long>(CacheLargestEntryBytes),
+            CacheWorkers > 0
+                ? static_cast<double>(CacheTotalBytes) / static_cast<double>(CacheWorkers)
+                : 0.0,
+            static_cast<unsigned long long>(CacheLargestWorkerBytes),
+            Profile.TunnelCacheValidEntries > 0
+                ? static_cast<double>(Profile.TunnelCacheEntryBytes)
+                    / static_cast<double>(Profile.TunnelCacheValidEntries)
+                : 0.0,
+            static_cast<unsigned long long>(Profile.TunnelCacheLargestEntryBytes),
+            static_cast<unsigned long long>(Profile.TunnelCacheLargestWorkerValidEntries),
+            Profile.RoomGraphCacheValidEntries > 0
+                ? static_cast<double>(Profile.RoomGraphCacheEntryBytes)
+                    / static_cast<double>(Profile.RoomGraphCacheValidEntries)
+                : 0.0,
+            static_cast<unsigned long long>(Profile.RoomGraphCacheLargestEntryBytes),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheLargestWorkerValidEntries),
+            static_cast<unsigned long long>(Profile.TunnelCacheWorkers),
+            static_cast<unsigned long long>(Profile.TunnelCacheCapacityEntries),
+            static_cast<unsigned long long>(Profile.TunnelCacheValidEntries),
+            static_cast<unsigned long long>(Profile.TunnelCacheStaticBytes),
+            static_cast<unsigned long long>(Profile.TunnelCacheDynamicBytes),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheWorkers),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheCapacityEntries),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheValidEntries),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheStaticBytes),
+            static_cast<unsigned long long>(Profile.RoomGraphCacheDynamicBytes));
+
+        const VoxelDensityProfile::EBucket DensityPhases[] = {
+            VoxelDensityProfile::EBucket::DensityPrologue,
+            VoxelDensityProfile::EBucket::DensityCore,
+            VoxelDensityProfile::EBucket::DensityDisturbances,
+            VoxelDensityProfile::EBucket::DensityStructuralPosts,
+            VoxelDensityProfile::EBucket::DensityBoundarySeal,
+            VoxelDensityProfile::EBucket::DensityDiffLayer,
+            VoxelDensityProfile::EBucket::DensityTail,
+        };
+        uint64 DensityAttributionCycles = 0;
+        uint64 DensityAttributionCalls = 0;
+        for (const VoxelDensityProfile::EBucket Phase : DensityPhases)
+        {
+            const int32 PhaseIndex = static_cast<int32>(Phase);
+            DensityAttributionCycles += Profile.Cycles[PhaseIndex];
+            DensityAttributionCalls += Profile.Calls[PhaseIndex];
+        }
+        const double DensityAttributionUs =
+            static_cast<double>(DensityAttributionCycles) * CycleToMicroseconds;
+        const double DensityUnattributedUs = DensityTotalUs - DensityAttributionUs;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeDensityProfile] attribution_sum_us=%.3f unattributed_us=%.3f "
+                 "coverage=%.2f%% phase_calls=%llu"),
+            DensityAttributionUs, DensityUnattributedUs,
+            DensityTotalUs > 0.0 ? DensityAttributionUs * 100.0 / DensityTotalUs : 0.0,
+            static_cast<unsigned long long>(DensityAttributionCalls));
+
         for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
         {
             const VoxelDensityProfile::ECounter Counter =
@@ -4151,6 +4254,37 @@ int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
                 static_cast<unsigned long long>(Calls), TotalUs,
                 TotalUs / static_cast<double>(Calls));
         }
+
+        const VoxelDensityProfile::EBucket MesherBuckets[] = {
+            VoxelDensityProfile::EBucket::MesherDensityGrid,
+            VoxelDensityProfile::EBucket::MesherCellClassification,
+            VoxelDensityProfile::EBucket::MesherGradientNormals,
+            VoxelDensityProfile::EBucket::MesherVertexInterpolation,
+            VoxelDensityProfile::EBucket::MesherStreamBuilding,
+            VoxelDensityProfile::EBucket::MesherOther,
+        };
+        uint64 MesherAttributionCycles = 0;
+        uint64 MesherAttributionCalls = 0;
+        for (const VoxelDensityProfile::EBucket Bucket : MesherBuckets)
+        {
+            const int32 BucketIndex = static_cast<int32>(Bucket);
+            MesherAttributionCycles += Profile.Cycles[BucketIndex];
+            MesherAttributionCalls += Profile.Calls[BucketIndex];
+        }
+        const int32 MesherTotalIndex = static_cast<int32>(
+            VoxelDensityProfile::EBucket::MesherGenerateMesh);
+        const double MesherTotalUs = static_cast<double>(
+            Profile.Cycles[MesherTotalIndex]) * CycleToMicroseconds;
+        const double MesherAttributionUs = static_cast<double>(
+            MesherAttributionCycles) * CycleToMicroseconds;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeMesherProfile] total_calls=%llu total_us=%.3f "
+                 "attribution_sum_us=%.3f unattributed_us=%.3f coverage=%.2f%% "
+                 "phase_calls=%llu"),
+            static_cast<unsigned long long>(Profile.Calls[MesherTotalIndex]),
+            MesherTotalUs, MesherAttributionUs, MesherTotalUs - MesherAttributionUs,
+            MesherTotalUs > 0.0 ? MesherAttributionUs * 100.0 / MesherTotalUs : 0.0,
+            static_cast<unsigned long long>(MesherAttributionCalls));
         VoxelDensityProfile::SetEnabled(false);
     }
     return bRequestedModeFailed ? 2 : 0;
