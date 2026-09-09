@@ -147,6 +147,11 @@ public:
     // l'écart vers un voisin un niveau plus grossier (cellule 2×). Monter si des fissures persistent.
     float SkirtCells = 2.0f;
 
+    // Optional conservative block classifier. When enabled, 8x8x8 cell regions proven uniformly
+    // solid or air by UVoxelGenerator::ClassifyTile skip the marching-cubes cell loop. The density
+    // grid is still produced in full, so this switch cannot change samples or geometry.
+    bool bUseBlockEarlyOut = false;
+
     // T2.b — LOD-aware octave reduction (opt-in, copied from UVoxelSettings::LODOctaveDrop).
     // Octaves dropped from per-voxel volumetric noise PER Step doubling: a tile at Step=S
     // drops LODOctaveDrop * log2(S) octaves (see VoxelGenLOD in VoxelGenerator.h).

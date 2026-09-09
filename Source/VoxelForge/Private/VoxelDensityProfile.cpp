@@ -416,6 +416,9 @@ namespace VoxelDensityProfile
         case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
+        case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");
+        case ECounter::MesherBlockAllSolid:return TEXT("MesherBlockAllSolid");
+        case ECounter::MesherBlockAllAir: return TEXT("MesherBlockAllAir");
         case ECounter::Count:              break;
         }
         return TEXT("Unknown");

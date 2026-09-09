@@ -231,6 +231,40 @@ public:
         return H.Resolve();
     }
 
+    /**
+     * Per-operator box-bound audit. This deliberately replays the same fold as ClassifyBox while
+     * also brute-forcing Eval on the queried lattice. It is report/test infrastructure only: it
+     * must never be used to make a generation decision.
+     */
+    struct FOpBoxDiagnostic
+    {
+        int32 Index = INDEX_NONE;
+        FString Name;
+        EVoxelOpEffect Effect = EVoxelOpEffect::Identity;
+        EVoxelTileClass ForcedVerdict = EVoxelTileClass::Mixed;
+        bool bForced = false;
+        bool bWritesSdf = false;
+        float ForcedMargin = 0.0f;
+        float MaxCarve = 0.0f;
+        float MaxFill = 0.0f;
+        bool bHasDensityDelta = false;
+        float ActualDensityDeltaMin = FLT_MAX;
+        float ActualDensityDeltaMax = -FLT_MAX;
+        bool bHasSdfValue = false;
+        float ActualSdfMin = FLT_MAX;
+        float ActualSdfMax = -FLT_MAX;
+        bool bHasSdfBound = false;
+        float SdfBoundMin = FLT_MAX;
+        float SdfBoundMax = FLT_MAX;
+        bool bCarveBoundViolated = false;
+        bool bFillBoundViolated = false;
+        uint64 SampleCount = 0;
+    };
+
+    VOXELFORGE_API void DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                    int32 SampleStep, TArray<FOpBoxDiagnostic>& OutDiagnostics,
+                                    EVoxelTileClass* OutVerdict = nullptr) const;
+
     /** Nom lisible d'un opérateur, pour les rapports de test. Voir `IVoxelDensityOp::DebugName`. */
     const TCHAR* GetOpDebugName(int32 Index) const
     {

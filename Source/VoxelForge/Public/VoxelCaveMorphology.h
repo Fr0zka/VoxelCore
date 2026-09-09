@@ -656,56 +656,6 @@ struct FCachedTunnel
     float BoundRadiusSq;  // Squared radius — if voxel is further, skip this tunnel
 };
 
-// A deterministic uniform-grid broad phase.  Build() is called while a chunk cache is being
-// assembled; after that the arrays are immutable and workers only read a bin range.  Entries are
-// supplied in candidate order, so each bin is already sorted by candidate ID and no runtime sort
-// or allocation is needed.  A failed/overflowing build leaves bValid=false and callers fall back
-// to the exact legacy scan rather than risking a false negative.
-struct FCaveSpatialIndexEntry
-{
-    int32 CandidateIndex = INDEX_NONE;
-    FVector Min = FVector::ZeroVector;
-    FVector Max = FVector::ZeroVector;
-};
-
-struct FCaveSpatialIndexBin
-{
-    int32 First = 0;
-    int32 Count = 0;
-};
-
-struct FCaveSpatialIndex
-{
-    static constexpr int32 BinSizeVoxels = 16;
-
-    bool bValid = false;
-    int32 MinBinX = 0;
-    int32 MinBinY = 0;
-    int32 MinBinZ = 0;
-    int32 CellsX = 0;
-    int32 CellsY = 0;
-    int32 CellsZ = 0;
-    TArray<FCaveSpatialIndexBin> Bins;
-    TArray<int32> CandidateIndices;
-
-    void Reset();
-    void Build(const TArray<FCaveSpatialIndexEntry>& Entries);
-
-    // Returns false only when the index is invalid.  A valid query outside its extent returns
-    // true with an empty range, which is the normal cheap reject for that sample.
-    bool GetBin(float X, float Y, float Z, int32& OutFirst, int32& OutCount) const;
-
-    // Build-time/column-query helper.  Coordinates are already integer cell coordinates.
-    bool GetBinAt(int32 CellX, int32 CellY, int32 CellZ,
-                  int32& OutFirst, int32& OutCount) const;
-
-    // A support-floor column is Z-dependent but not Z-search-dependent.  Gather the unique
-    // tunnel IDs from every height bin crossing one XY cell once, then reuse the resulting floor
-    // intervals for all samples in that column.
-    template <typename AllocatorType>
-    bool GetColumnCandidates(float X, float Y, TArray<int32, AllocatorType>& OutCandidates) const;
-};
-
 struct FTunnelSupportFloorInterval
 {
     int32 TunnelIndex = INDEX_NONE;
@@ -806,13 +756,6 @@ struct FChunkSDFCache
     TArray<FCachedChimney> Chimneys;
     TArray<FCachedColumn>  Columns;
 
-    // Immutable broad-phase indices.  The world index is also the source for per-column support
-    // intervals; its Z bins are traversed only when a column is first built.
-    FCaveSpatialIndex RoomIndex;
-    FCaveSpatialIndex RoomFloorJoinIndex;
-    FCaveSpatialIndex TunnelIndex;
-    FCaveSpatialIndex TunnelWorldIndex;
-
     // Sparse immutable support-column table. SupportColumnEntries is a dense
     // integer-XY slot map whose values index only non-empty SupportColumns.
     int32 SupportColumnMinX = 0;
@@ -822,9 +765,9 @@ struct FChunkSDFCache
     TArray<int32> SupportColumnEntries;
     TArray<FTunnelSupportFloorColumn> SupportColumns;
 
-    // Allocator-backed bytes owned by this cache, including the nested tunnel chains and index
-    // arrays.  The returned value excludes sizeof(FChunkSDFCache) itself so callers can add the
-    // enclosing entry's inline storage exactly once.
+    // Allocator-backed bytes owned by this cache, including the nested tunnel chains. The returned
+    // value excludes sizeof(FChunkSDFCache) itself so callers can add the enclosing entry's inline
+    // storage exactly once.
     SIZE_T GetAllocatedSize() const;
     VoxelDensityProfile::FCacheMemoryBreakdown GetAllocatedSizeBreakdown() const;
 };

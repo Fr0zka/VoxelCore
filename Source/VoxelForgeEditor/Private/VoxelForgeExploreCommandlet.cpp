@@ -25,7 +25,9 @@
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/UObjectGlobals.h"
+#include "VoxelCaveMorphology.h"
 #include "VoxelDiffLayer.h"
+#include "VoxelDensityOpStack.h"
 #include "VoxelDensityProfile.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
@@ -202,6 +204,7 @@ struct FExploreArguments
     bool bProfileDensity = false;
     bool bProfileDensityFull = false;
     bool bProfileLod = false;
+    bool bOpBounds = false;
     bool bFailureFocusRender = false;
     FString OutDirectory;
 
@@ -214,6 +217,7 @@ struct FExploreArguments
     // The canonical export owns one immutable lattice for the whole run.  Batch cases can pass
     // density_grid_reuse=false to produce a matched wall-clock control.
     bool bReuseDensityGrid = true;
+    bool bBlockEarlyOut = false;
     int32 MeshMinBatchSize = 1;
     int32 MaxWalkCells = DefaultMaxWalkCells;
     float BudgetMinutes = DefaultBudgetMinutes;
@@ -226,6 +230,7 @@ struct FExploreArguments
         if (bRender) Result += TEXT("render,");
         if (bWalk) Result += TEXT("walk,");
         if (bExport) Result += TEXT("export,");
+        if (bOpBounds) Result += TEXT("opbounds,");
         if (Result.EndsWith(TEXT(",")))
         {
             Result.LeftChopInline(1);
@@ -265,6 +270,7 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     OutArguments.bProfileDensityFull = FParse::Param(*Params, TEXT("profiledensityfull"));
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
+    OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
     FParse::Value(*Params, TEXT("renderheight="), OutArguments.RenderHeight);
@@ -275,6 +281,9 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     int32 DensityGridReuse = OutArguments.bReuseDensityGrid ? 1 : 0;
     FParse::Value(*Params, TEXT("densitygridreuse="), DensityGridReuse);
     OutArguments.bReuseDensityGrid = DensityGridReuse != 0;
+    int32 BlockEarlyOut = OutArguments.bBlockEarlyOut ? 1 : 0;
+    FParse::Value(*Params, TEXT("blockearlyout="), BlockEarlyOut);
+    OutArguments.bBlockEarlyOut = BlockEarlyOut != 0;
     FParse::Value(*Params, TEXT("meshminbatch="), OutArguments.MeshMinBatchSize);
     OutArguments.MeshMinBatchSize = FMath::Clamp(OutArguments.MeshMinBatchSize, 1, 64);
     int32 Lod = 0;
@@ -322,6 +331,10 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
             OutArguments.bWalk = true;
             OutArguments.bExport = true;
         }
+        else if (Mode == TEXT("opbounds"))
+        {
+            OutArguments.bOpBounds = true;
+        }
         else if (Mode == TEXT("render"))
         {
             OutArguments.bRender = true;
@@ -337,11 +350,12 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         else
         {
             OutError = FString::Printf(
-                TEXT("Unknown mode '%s'. Expected render, walk, export, or all."), *Mode);
+                TEXT("Unknown mode '%s'. Expected render, walk, export, opbounds, or all."), *Mode);
             return false;
         }
     }
-    if (!OutArguments.bRender && !OutArguments.bWalk && !OutArguments.bExport)
+    if (!OutArguments.bRender && !OutArguments.bWalk && !OutArguments.bExport
+        && !OutArguments.bOpBounds)
     {
         OutError = TEXT("At least one mode must be selected.");
         return false;
@@ -717,6 +731,7 @@ struct FExploreWorld
         Mesher = TStrongObjectPtr<UVoxelMarchingCubesMesher>(
             NewObject<UVoxelMarchingCubesMesher>(GetTransientPackage(), NAME_None, RF_Transient));
         Mesher->SetGenerator(Generator.Get());
+        Mesher->bUseBlockEarlyOut = Arguments.bBlockEarlyOut;
 
         if (Settings->WorldRadiusVoxels != 0.0f
             || Generator->WorldRadiusVoxels != 0.0f
@@ -3861,26 +3876,31 @@ FString BuildExploreJson(
     if (Arguments.bRender) Writer->WriteValue(TEXT("render"));
     if (Arguments.bWalk) Writer->WriteValue(TEXT("walk"));
     if (Arguments.bExport) Writer->WriteValue(TEXT("export"));
+    if (Arguments.bOpBounds) Writer->WriteValue(TEXT("opbounds"));
     Writer->WriteArrayEnd();
     Writer->WriteValue(TEXT("failure_focus_render"), Arguments.bFailureFocusRender);
     Writer->WriteValue(TEXT("render_step_voxels"), static_cast<double>(Arguments.RenderStepVoxels));
     Writer->WriteValue(TEXT("export_size"), Arguments.ExportSize);
     Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
     Writer->WriteValue(TEXT("density_grid_reuse"), Arguments.bReuseDensityGrid);
+    Writer->WriteValue(TEXT("block_early_out"), Arguments.bBlockEarlyOut);
     Writer->WriteValue(TEXT("mesh_min_batch_size"), Arguments.MeshMinBatchSize);
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
+    Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
-             "-slot=%d -opstack=%d -modes=%s -out=<ABSOLUTE_PLUGIN_SAVED_PATH>"),
+             "-slot=%d -opstack=%d -modes=%s -blockearlyout=%d "
+             "-out=<ABSOLUTE_PLUGIN_SAVED_PATH>"),
         Arguments.Seed,
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
         Arguments.bUseOperatorStack ? 1 : 0,
-        *Arguments.CanonicalModes()));
+        *Arguments.CanonicalModes(),
+        Arguments.bBlockEarlyOut ? 1 : 0));
     Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("summary"));
@@ -4319,14 +4339,6 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("support_column_entries_bytes"), static_cast<int64>(Breakdown.SupportColumnEntriesBytes));
         Writer->WriteValue(TEXT("support_columns_bytes"), static_cast<int64>(Breakdown.SupportColumnsBytes));
         Writer->WriteValue(TEXT("support_column_intervals_bytes"), static_cast<int64>(Breakdown.SupportColumnIntervalsBytes));
-        Writer->WriteValue(TEXT("room_index_bins_bytes"), static_cast<int64>(Breakdown.RoomIndexBinsBytes));
-        Writer->WriteValue(TEXT("room_index_candidates_bytes"), static_cast<int64>(Breakdown.RoomIndexCandidatesBytes));
-        Writer->WriteValue(TEXT("room_floor_join_index_bins_bytes"), static_cast<int64>(Breakdown.RoomFloorJoinIndexBinsBytes));
-        Writer->WriteValue(TEXT("room_floor_join_index_candidates_bytes"), static_cast<int64>(Breakdown.RoomFloorJoinIndexCandidatesBytes));
-        Writer->WriteValue(TEXT("tunnel_index_bins_bytes"), static_cast<int64>(Breakdown.TunnelIndexBinsBytes));
-        Writer->WriteValue(TEXT("tunnel_index_candidates_bytes"), static_cast<int64>(Breakdown.TunnelIndexCandidatesBytes));
-        Writer->WriteValue(TEXT("tunnel_world_index_bins_bytes"), static_cast<int64>(Breakdown.TunnelWorldIndexBinsBytes));
-        Writer->WriteValue(TEXT("tunnel_world_index_candidates_bytes"), static_cast<int64>(Breakdown.TunnelWorldIndexCandidatesBytes));
         Writer->WriteValue(TEXT("dynamic_bytes"), static_cast<int64>(Breakdown.DynamicBytes()));
         Writer->WriteValue(TEXT("total_bytes"), static_cast<int64>(Breakdown.TotalBytes()));
         Writer->WriteObjectEnd();
@@ -4398,6 +4410,513 @@ FString BuildExploreJson(
     return Writer->Close() ? Json : FString();
 }
 
+const TCHAR* ExploreEffectName(EVoxelOpEffect Effect)
+{
+    switch (Effect)
+    {
+    case EVoxelOpEffect::Identity:  return TEXT("Identity");
+    case EVoxelOpEffect::CarveOnly: return TEXT("CarveOnly");
+    case EVoxelOpEffect::FillOnly:  return TEXT("FillOnly");
+    case EVoxelOpEffect::Both:      return TEXT("Both");
+    default:                        return TEXT("Unknown");
+    }
+}
+
+const TCHAR* ExploreTileClassName(EVoxelTileClass Class)
+{
+    switch (Class)
+    {
+    case EVoxelTileClass::AllSolid: return TEXT("AllSolid");
+    case EVoxelTileClass::AllAir:   return TEXT("AllAir");
+    case EVoxelTileClass::Mixed:    return TEXT("Mixed");
+    default:                        return TEXT("Unknown");
+    }
+}
+
+// Density-bound APIs use FLT_MAX as the documented "unknown/unbounded" sentinel.  It is finite
+// according to IEEE-754, so FMath::IsFinite alone would misreport the very failure this audit is
+// intended to expose as a real numeric envelope.
+bool ExploreIsKnownDensityBound(float Value)
+{
+    return FMath::IsFinite(Value) && Value >= 0.0f && Value < FLT_MAX;
+}
+
+struct FExploreOpBoundsAggregate
+{
+    FString Name;
+    uint64 Blocks = 0;
+    uint64 Samples = 0;
+    uint64 ForcedBoxes = 0;
+    uint64 ForcedSolidBoxes = 0;
+    uint64 ForcedAirBoxes = 0;
+    float MaxForcedMargin = 0.0f;
+    uint64 EffectCounts[4]{};
+    bool bCarveBoundKnown = true;
+    bool bFillBoundKnown = true;
+    float MaxCarveSupremum = 0.0f;
+    float MaxFillSupremum = 0.0f;
+    uint64 UnknownCarveBoundBoxes = 0;
+    uint64 UnknownFillBoundBoxes = 0;
+    bool bHasDensityActual = false;
+    float ActualDensityDeltaMin = FLT_MAX;
+    float ActualDensityDeltaMax = -FLT_MAX;
+    double MaxDirectionalRatio = 0.0;
+    double MaxConservativeRatio = 0.0;
+    bool bRatioFinite = true;
+    uint64 CarveBoundViolations = 0;
+    uint64 FillBoundViolations = 0;
+    bool bSdfBoundKnown = true;
+    bool bHasSdfBound = false;
+    float SdfBoundMin = FLT_MAX;
+    float SdfBoundMax = -FLT_MAX;
+    bool bHasSdfActual = false;
+    float ActualSdfMin = FLT_MAX;
+    float ActualSdfMax = -FLT_MAX;
+    uint64 SdfBoundViolations = 0;
+};
+
+int32 ExploreEffectIndex(EVoxelOpEffect Effect)
+{
+    switch (Effect)
+    {
+    case EVoxelOpEffect::Identity:  return 0;
+    case EVoxelOpEffect::CarveOnly: return 1;
+    case EVoxelOpEffect::FillOnly:  return 2;
+    case EVoxelOpEffect::Both:      return 3;
+    default:                        return 0;
+    }
+}
+
+void AccumulateExploreOpDiagnostic(
+    const FVoxelOpStack::FOpBoxDiagnostic& Diagnostic,
+    FExploreOpBoundsAggregate& Aggregate)
+{
+    Aggregate.Name = Diagnostic.Name;
+    ++Aggregate.Blocks;
+    Aggregate.Samples += Diagnostic.SampleCount;
+    ++Aggregate.EffectCounts[ExploreEffectIndex(Diagnostic.Effect)];
+    if (Diagnostic.bForced)
+    {
+        ++Aggregate.ForcedBoxes;
+        if (FMath::IsFinite(Diagnostic.ForcedMargin))
+        {
+            Aggregate.MaxForcedMargin = FMath::Max(
+                Aggregate.MaxForcedMargin, Diagnostic.ForcedMargin);
+        }
+        if (Diagnostic.ForcedVerdict == EVoxelTileClass::AllSolid)
+        {
+            ++Aggregate.ForcedSolidBoxes;
+        }
+        else if (Diagnostic.ForcedVerdict == EVoxelTileClass::AllAir)
+        {
+            ++Aggregate.ForcedAirBoxes;
+        }
+    }
+    else
+    {
+        if (!ExploreIsKnownDensityBound(Diagnostic.MaxCarve))
+        {
+            Aggregate.bCarveBoundKnown = false;
+            ++Aggregate.UnknownCarveBoundBoxes;
+            if (Diagnostic.Effect == EVoxelOpEffect::CarveOnly
+                || Diagnostic.Effect == EVoxelOpEffect::Both)
+            {
+                Aggregate.bRatioFinite = false;
+            }
+        }
+        else
+        {
+            Aggregate.MaxCarveSupremum = FMath::Max(
+                Aggregate.MaxCarveSupremum, Diagnostic.MaxCarve);
+        }
+        if (!ExploreIsKnownDensityBound(Diagnostic.MaxFill))
+        {
+            Aggregate.bFillBoundKnown = false;
+            ++Aggregate.UnknownFillBoundBoxes;
+            if (Diagnostic.Effect == EVoxelOpEffect::FillOnly
+                || Diagnostic.Effect == EVoxelOpEffect::Both)
+            {
+                Aggregate.bRatioFinite = false;
+            }
+        }
+        else
+        {
+            Aggregate.MaxFillSupremum = FMath::Max(
+                Aggregate.MaxFillSupremum, Diagnostic.MaxFill);
+        }
+    }
+
+    if (Diagnostic.bCarveBoundViolated) { ++Aggregate.CarveBoundViolations; }
+    if (Diagnostic.bFillBoundViolated)  { ++Aggregate.FillBoundViolations; }
+
+    if (Diagnostic.bHasDensityDelta)
+    {
+        Aggregate.bHasDensityActual = true;
+        Aggregate.ActualDensityDeltaMin = FMath::Min(
+            Aggregate.ActualDensityDeltaMin, Diagnostic.ActualDensityDeltaMin);
+        Aggregate.ActualDensityDeltaMax = FMath::Max(
+            Aggregate.ActualDensityDeltaMax, Diagnostic.ActualDensityDeltaMax);
+
+        if (!Diagnostic.bForced)
+        {
+            const double ActualCarve = FMath::Max(
+                0.0, -static_cast<double>(Diagnostic.ActualDensityDeltaMin));
+            const double ActualFill = FMath::Max(
+                0.0, static_cast<double>(Diagnostic.ActualDensityDeltaMax));
+            double Ratio = 0.0;
+            if (ExploreIsKnownDensityBound(Diagnostic.MaxCarve)
+                && Diagnostic.MaxCarve > 0.0f)
+            {
+                Ratio = FMath::Max(Ratio, ActualCarve / Diagnostic.MaxCarve);
+                if (ActualCarve > 1.0e-4)
+                {
+                    Aggregate.MaxConservativeRatio = FMath::Max(
+                        Aggregate.MaxConservativeRatio,
+                        static_cast<double>(Diagnostic.MaxCarve) / ActualCarve);
+                }
+            }
+            else if (ActualCarve > 1.0e-4)
+            {
+                Aggregate.bRatioFinite = false;
+            }
+            if (ExploreIsKnownDensityBound(Diagnostic.MaxFill)
+                && Diagnostic.MaxFill > 0.0f)
+            {
+                Ratio = FMath::Max(Ratio, ActualFill / Diagnostic.MaxFill);
+                if (ActualFill > 1.0e-4)
+                {
+                    Aggregate.MaxConservativeRatio = FMath::Max(
+                        Aggregate.MaxConservativeRatio,
+                        static_cast<double>(Diagnostic.MaxFill) / ActualFill);
+                }
+            }
+            else if (ActualFill > 1.0e-4)
+            {
+                Aggregate.bRatioFinite = false;
+            }
+            if (FMath::IsFinite(Ratio))
+            {
+                Aggregate.MaxDirectionalRatio = FMath::Max(
+                    Aggregate.MaxDirectionalRatio, Ratio);
+            }
+            else
+            {
+                Aggregate.bRatioFinite = false;
+            }
+        }
+    }
+
+    if (Diagnostic.bHasSdfBound)
+    {
+        Aggregate.bHasSdfBound = true;
+        Aggregate.SdfBoundMin = FMath::Min(
+            Aggregate.SdfBoundMin, Diagnostic.SdfBoundMin);
+        Aggregate.SdfBoundMax = FMath::Max(
+            Aggregate.SdfBoundMax, Diagnostic.SdfBoundMax);
+        if (Diagnostic.bHasSdfValue)
+        {
+            const float Epsilon = 1.0e-4f * FMath::Max(
+                1.0f, FMath::Max(FMath::Abs(Diagnostic.SdfBoundMin),
+                                  FMath::Abs(Diagnostic.SdfBoundMax)));
+            if (Diagnostic.ActualSdfMin < Diagnostic.SdfBoundMin - Epsilon
+                || Diagnostic.ActualSdfMax > Diagnostic.SdfBoundMax + Epsilon)
+            {
+                ++Aggregate.SdfBoundViolations;
+            }
+        }
+    }
+    else if (Diagnostic.bWritesSdf)
+    {
+        Aggregate.bSdfBoundKnown = false;
+    }
+
+    if (Diagnostic.bHasSdfValue)
+    {
+        Aggregate.bHasSdfActual = true;
+        Aggregate.ActualSdfMin = FMath::Min(
+            Aggregate.ActualSdfMin, Diagnostic.ActualSdfMin);
+        Aggregate.ActualSdfMax = FMath::Max(
+            Aggregate.ActualSdfMax, Diagnostic.ActualSdfMax);
+    }
+}
+
+bool WriteExploreOpBoundsReport(
+    const FExploreArguments& Arguments,
+    const FExploreWorld& World,
+    int32 BlocksTested,
+    int32 RandomBlocksTested,
+    int32 AllSolidBlocks,
+    int32 AllAirBlocks,
+    int32 MixedBlocks,
+    const TArray<int32>& StackSolidKillerCounts,
+    const TArray<int32>& StackAirKillerCounts,
+    int32 StackVerdictMismatches,
+    const TArray<FExploreOpBoundsAggregate>& Aggregates,
+    FString& OutError)
+{
+    FString Json;
+    TSharedRef<FExploreJsonWriter> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
+    Writer->WriteObjectStart();
+    Writer->WriteValue(TEXT("schema_version"), 1);
+    Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
+    Writer->WriteValue(TEXT("purpose"), TEXT(
+        "Conservative EffectOverBox/ClassifyBox bounds compared with brute-force Eval over the same "
+        "one-voxel-halo domain of an 8-cell block."));
+    Writer->WriteValue(TEXT("seed"), Arguments.Seed);
+    Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
+    Writer->WriteValue(TEXT("slot"), Arguments.Slot);
+    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
+    Writer->WriteValue(TEXT("sample_step"), 1);
+    Writer->WriteValue(TEXT("block_cells"), 8);
+    Writer->WriteValue(TEXT("classifier_blocks_tested"), BlocksTested);
+    Writer->WriteValue(TEXT("classifier_all_solid_blocks"), AllSolidBlocks);
+    Writer->WriteValue(TEXT("classifier_all_air_blocks"), AllAirBlocks);
+    Writer->WriteValue(TEXT("classifier_mixed_blocks"), MixedBlocks);
+    Writer->WriteValue(TEXT("classifier_skip_rate"), BlocksTested > 0
+        ? static_cast<double>(AllSolidBlocks + AllAirBlocks) / BlocksTested : 0.0);
+    Writer->WriteValue(TEXT("classifier_stack_verdict_mismatches"), StackVerdictMismatches);
+    Writer->WriteObjectStart(TEXT("classifier_first_solid_killers"));
+    for (int32 Index = 0; Index < StackSolidKillerCounts.Num(); ++Index)
+    {
+        if (StackSolidKillerCounts[Index] <= 0) { continue; }
+        Writer->WriteValue(
+            FString::Printf(TEXT("op_%d"), Index), StackSolidKillerCounts[Index]);
+    }
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectStart(TEXT("classifier_first_air_killers"));
+    for (int32 Index = 0; Index < StackAirKillerCounts.Num(); ++Index)
+    {
+        if (StackAirKillerCounts[Index] <= 0) { continue; }
+        Writer->WriteValue(
+            FString::Printf(TEXT("op_%d"), Index), StackAirKillerCounts[Index]);
+    }
+    Writer->WriteObjectEnd();
+    Writer->WriteValue(TEXT("random_blocks_tested"), RandomBlocksTested);
+    Writer->WriteValue(TEXT("bruteforce_block_index_min"), 1);
+    Writer->WriteValue(TEXT("bruteforce_block_index_max_inclusive"), 14);
+    Writer->WriteValue(TEXT("bounds_validated"), true);
+    Writer->WriteValue(TEXT("target_bottom_world_z"), World.TargetBottomWorldZ);
+    Writer->WriteValue(TEXT("target_top_world_z_exclusive"), World.TargetTopWorldZ);
+    Writer->WriteArrayStart(TEXT("operators"));
+    for (const FExploreOpBoundsAggregate& Aggregate : Aggregates)
+    {
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("name"), Aggregate.Name);
+        Writer->WriteValue(TEXT("blocks"), static_cast<int64>(Aggregate.Blocks));
+        Writer->WriteValue(TEXT("sample_points"), static_cast<int64>(Aggregate.Samples));
+        Writer->WriteValue(TEXT("forced_boxes"), static_cast<int64>(Aggregate.ForcedBoxes));
+        Writer->WriteValue(TEXT("forced_all_solid_boxes"), static_cast<int64>(Aggregate.ForcedSolidBoxes));
+        Writer->WriteValue(TEXT("forced_all_air_boxes"), static_cast<int64>(Aggregate.ForcedAirBoxes));
+        Writer->WriteValue(TEXT("forced_margin_supremum"), static_cast<double>(Aggregate.MaxForcedMargin));
+        Writer->WriteObjectStart(TEXT("effect_counts"));
+        Writer->WriteValue(TEXT("Identity"), static_cast<int64>(Aggregate.EffectCounts[0]));
+        Writer->WriteValue(TEXT("CarveOnly"), static_cast<int64>(Aggregate.EffectCounts[1]));
+        Writer->WriteValue(TEXT("FillOnly"), static_cast<int64>(Aggregate.EffectCounts[2]));
+        Writer->WriteValue(TEXT("Both"), static_cast<int64>(Aggregate.EffectCounts[3]));
+        Writer->WriteObjectEnd();
+        Writer->WriteValue(TEXT("carve_bound_known"), Aggregate.bCarveBoundKnown);
+        Writer->WriteValue(TEXT("unknown_carve_bound_boxes"),
+                           static_cast<int64>(Aggregate.UnknownCarveBoundBoxes));
+        Writer->WriteValue(TEXT("carve_bound_supremum"), static_cast<double>(
+            Aggregate.bCarveBoundKnown ? Aggregate.MaxCarveSupremum : 0.0f));
+        Writer->WriteValue(TEXT("fill_bound_known"), Aggregate.bFillBoundKnown);
+        Writer->WriteValue(TEXT("unknown_fill_bound_boxes"),
+                           static_cast<int64>(Aggregate.UnknownFillBoundBoxes));
+        Writer->WriteValue(TEXT("fill_bound_supremum"), static_cast<double>(
+            Aggregate.bFillBoundKnown ? Aggregate.MaxFillSupremum : 0.0f));
+        Writer->WriteValue(TEXT("actual_density_delta_min"), static_cast<double>(
+            Aggregate.bHasDensityActual ? Aggregate.ActualDensityDeltaMin : 0.0f));
+        Writer->WriteValue(TEXT("actual_density_delta_max"), static_cast<double>(
+            Aggregate.bHasDensityActual ? Aggregate.ActualDensityDeltaMax : 0.0f));
+        Writer->WriteValue(TEXT("actual_carve_supremum"), Aggregate.bHasDensityActual
+            ? static_cast<double>(FMath::Max(0.0f, -Aggregate.ActualDensityDeltaMin)) : 0.0);
+        Writer->WriteValue(TEXT("actual_fill_supremum"), Aggregate.bHasDensityActual
+            ? static_cast<double>(FMath::Max(0.0f, Aggregate.ActualDensityDeltaMax)) : 0.0);
+        Writer->WriteValue(TEXT("directional_ratio_known"), Aggregate.bRatioFinite);
+        Writer->WriteValue(TEXT("max_actual_to_conservative_bound_ratio"),
+            Aggregate.bRatioFinite ? Aggregate.MaxDirectionalRatio : 0.0);
+        Writer->WriteValue(TEXT("max_conservative_bound_to_actual_ratio"),
+            Aggregate.bRatioFinite ? Aggregate.MaxConservativeRatio : 0.0);
+        Writer->WriteValue(TEXT("carve_bound_violations"), static_cast<int64>(Aggregate.CarveBoundViolations));
+        Writer->WriteValue(TEXT("fill_bound_violations"), static_cast<int64>(Aggregate.FillBoundViolations));
+        Writer->WriteValue(TEXT("sdf_bound_known"), Aggregate.bSdfBoundKnown);
+        Writer->WriteValue(TEXT("sdf_bound_min"), static_cast<double>(
+            Aggregate.bHasSdfBound ? Aggregate.SdfBoundMin : 0.0f));
+        Writer->WriteValue(TEXT("sdf_bound_max"), static_cast<double>(
+            Aggregate.bHasSdfBound ? Aggregate.SdfBoundMax : 0.0f));
+        Writer->WriteValue(TEXT("actual_sdf_min"), static_cast<double>(
+            Aggregate.bHasSdfActual ? Aggregate.ActualSdfMin : 0.0f));
+        Writer->WriteValue(TEXT("actual_sdf_max"), static_cast<double>(
+            Aggregate.bHasSdfActual ? Aggregate.ActualSdfMax : 0.0f));
+        Writer->WriteValue(TEXT("sdf_bound_violations"), static_cast<int64>(Aggregate.SdfBoundViolations));
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteArrayEnd();
+    Writer->WriteObjectEnd();
+
+    if (!Writer->Close() || Json.IsEmpty()
+        || !FFileHelper::SaveStringToFile(
+            Json,
+            *FPaths::Combine(Arguments.OutDirectory, TEXT("op_bounds.json")),
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        OutError = TEXT("Could not write op_bounds.json.");
+        return false;
+    }
+    OutError.Reset();
+    return true;
+}
+
+bool RunOpBounds(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    FExploreBudget& Budget,
+    FString& OutError)
+{
+    if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork
+        || !Arguments.bUseOperatorStack)
+    {
+        OutError = TEXT("opbounds requires archetype=TunnelNetwork and opstack=1.");
+        return false;
+    }
+
+    const FIntVector TargetChunk(0, 0, World.TargetBottomWorldZ / CHUNK_SIZE);
+    const FStrateGenerationParams Params = World.Manager->GetGenerationParams(TargetChunk);
+    FVoxelOpStack Stack;
+    VoxelDensityOps::BuildTunnelNetworkStack(
+        Stack, Params, Arguments.Seed, World.Settings->OriginSpineRadius,
+        World.Manager.Get());
+    FVoxelOpContext Context;
+    Context.ChunkCoord = TargetChunk;
+    Context.Step = 1;
+    Context.Seed = static_cast<uint32>(Arguments.Seed);
+    Context.LayoutVersion = World.Manager->GetLayoutVersion();
+    Context.WorldRadiusVoxels = World.Settings->WorldRadiusVoxels;
+    Context.EdgeSealThickness = World.Settings->EdgeSealThickness;
+    Context.StrateTopWorldZ = World.TargetTopWorldZ;
+    Context.StrateBottomWorldZ = World.TargetBottomWorldZ;
+    Stack.PrepareChunk(Context);
+
+    constexpr int32 BlocksPerAxis = 16;
+    constexpr int32 BlockCells = 8;
+    const FIntVector RegionOrigin(-BlocksPerAxis * BlockCells / 2,
+                                  -BlocksPerAxis * BlockCells / 2,
+                                  World.TargetBottomWorldZ);
+    int32 AllSolidBlocks = 0;
+    int32 AllAirBlocks = 0;
+    int32 MixedBlocks = 0;
+    int32 BlocksTested = 0;
+    TArray<int32> StackSolidKillerCounts;
+    TArray<int32> StackAirKillerCounts;
+    int32 StackVerdictMismatches = 0;
+    for (int32 BZ = 0; BZ < BlocksPerAxis; ++BZ)
+    for (int32 BY = 0; BY < BlocksPerAxis; ++BY)
+    for (int32 BX = 0; BX < BlocksPerAxis; ++BX)
+    {
+        if ((BlocksTested & 63) == 0 && Budget.ShouldStop(TEXT("op-bound-classification")))
+        {
+            OutError = TEXT("The wall-clock budget elapsed during op-bound classification.");
+            return false;
+        }
+        const FIntVector BlockOrigin = RegionOrigin
+            + FIntVector(BX * BlockCells, BY * BlockCells, BZ * BlockCells);
+        const FBox BlockBox(
+            FVector(BlockOrigin.X - 1, BlockOrigin.Y - 1, BlockOrigin.Z - 1),
+            FVector(BlockOrigin.X + BlockCells + 1,
+                    BlockOrigin.Y + BlockCells + 1,
+                    BlockOrigin.Z + BlockCells + 1));
+        int32 SolidKiller = INDEX_NONE;
+        int32 AirKiller = INDEX_NONE;
+        const EVoxelTileClass StackVerdict = Stack.ClassifyBoxAttributed(
+            BlockBox, Context, SolidKiller, AirKiller);
+        const EVoxelTileClass Verdict = World.Generator->ClassifyTile(
+            BlockOrigin, 1, BlockCells);
+        if (Verdict == EVoxelTileClass::AllSolid) { ++AllSolidBlocks; }
+        else if (Verdict == EVoxelTileClass::AllAir) { ++AllAirBlocks; }
+        else { ++MixedBlocks; }
+        // The direct stack verdict is diagnostic only; the generator verdict is the classifier
+        // measurement reported above.
+        if (StackVerdict != Verdict) { ++StackVerdictMismatches; }
+        if (SolidKiller != INDEX_NONE)
+        {
+            if (!StackSolidKillerCounts.IsValidIndex(SolidKiller))
+            {
+                StackSolidKillerCounts.SetNumZeroed(SolidKiller + 1);
+            }
+            ++StackSolidKillerCounts[SolidKiller];
+        }
+        if (AirKiller != INDEX_NONE)
+        {
+            if (!StackAirKillerCounts.IsValidIndex(AirKiller))
+            {
+                StackAirKillerCounts.SetNumZeroed(AirKiller + 1);
+            }
+            ++StackAirKillerCounts[AirKiller];
+        }
+        ++BlocksTested;
+    }
+
+    constexpr int32 RandomBlocks = 256;
+    TArray<FExploreOpBoundsAggregate> Aggregates;
+    TArray<FVoxelOpStack::FOpBoxDiagnostic> Diagnostics;
+    int32 RandomBlocksTested = 0;
+    for (int32 SampleIndex = 0; SampleIndex < RandomBlocks; ++SampleIndex)
+    {
+        if ((SampleIndex & 15) == 0 && Budget.ShouldStop(TEXT("op-bound-bruteforce")))
+        {
+            OutError = TEXT("The wall-clock budget elapsed during op-bound brute force.");
+            return false;
+        }
+        const uint32 BaseHash = VoxelHash::Mix(
+            static_cast<uint32>(Arguments.Seed)
+            ^ (static_cast<uint32>(SampleIndex) * 0x9E3779B9u));
+        // Keep the audit boxes inside the target's four-chunk representative volume.  Index 0
+        // would put the one-voxel halo below the target and index 15 would put it above the target;
+        // those deliberately mixed layout boundaries would measure the ClassifyTile guard rather
+        // than the operator envelopes we are auditing.
+        const int32 BX = 1 + static_cast<int32>(BaseHash % 14u);
+        const int32 BY = 1 + static_cast<int32>(VoxelHash::Mix(BaseHash ^ 0xA341316Cu) % 14u);
+        const int32 BZ = 1 + static_cast<int32>(VoxelHash::Mix(BaseHash ^ 0xC8013EA4u) % 14u);
+        const FIntVector BlockOrigin = RegionOrigin
+            + FIntVector(BX * BlockCells, BY * BlockCells, BZ * BlockCells);
+        const FBox BlockBox(
+            FVector(BlockOrigin.X - 1, BlockOrigin.Y - 1, BlockOrigin.Z - 1),
+            FVector(BlockOrigin.X + BlockCells + 1,
+                    BlockOrigin.Y + BlockCells + 1,
+                    BlockOrigin.Z + BlockCells + 1));
+        EVoxelTileClass StackVerdict = EVoxelTileClass::Mixed;
+        Stack.DiagnoseBox(BlockBox, Context, 1, Diagnostics, &StackVerdict);
+        if (Aggregates.Num() == 0)
+        {
+            Aggregates.SetNum(Diagnostics.Num());
+        }
+        for (int32 OpIndex = 0; OpIndex < Diagnostics.Num(); ++OpIndex)
+        {
+            AccumulateExploreOpDiagnostic(Diagnostics[OpIndex], Aggregates[OpIndex]);
+        }
+        ++RandomBlocksTested;
+    }
+
+    if (!WriteExploreOpBoundsReport(
+            Arguments, World, BlocksTested, RandomBlocksTested,
+            AllSolidBlocks, AllAirBlocks, MixedBlocks,
+            StackSolidKillerCounts, StackAirKillerCounts,
+            StackVerdictMismatches, Aggregates, OutError))
+    {
+        return false;
+    }
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeOpBounds] blocks=%d all_solid=%d all_air=%d mixed=%d skip_rate=%.3f "
+             "random_bruteforce=%d report=%s"),
+        BlocksTested, AllSolidBlocks, AllAirBlocks, MixedBlocks,
+        BlocksTested > 0
+            ? static_cast<double>(AllSolidBlocks + AllAirBlocks) / BlocksTested : 0.0,
+        RandomBlocksTested,
+        *FPaths::Combine(Arguments.OutDirectory, TEXT("op_bounds.json")));
+    return true;
+}
+
 } // namespace
 
 UVoxelForgeExploreCommandlet::UVoxelForgeExploreCommandlet()
@@ -4449,6 +4968,26 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         return 1;
     }
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
+
+    bool bRequestedModeFailed = false;
+    if (Arguments.bOpBounds)
+    {
+        const double Start = FPlatformTime::Seconds();
+        const bool bOpBoundsOk = !Budget.bTruncated
+            && RunOpBounds(Arguments, World, Budget, Error);
+        if (!bOpBoundsOk && !Budget.bTruncated)
+        {
+            bRequestedModeFailed = true;
+            UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] opbounds failed: %s"), *Error);
+        }
+        if (bOpBoundsOk && !Budget.bTruncated)
+        {
+            Budget.CompleteMode(TEXT("opbounds"));
+        }
+        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] opbounds %.3fs (%s)"),
+            FPlatformTime::Seconds() - Start,
+            bOpBoundsOk ? TEXT("ok") : (Budget.bTruncated ? TEXT("truncated") : TEXT("error")));
+    }
 
     if (Arguments.bProfileLod)
     {
@@ -4523,7 +5062,6 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         UE_LOG(LogTemp, Warning,
             TEXT("[VoxelForgeExplore] setup consumed the wall-clock budget; no mode was started."));
     }
-    bool bRequestedModeFailed = false;
     FExploreWalkOutput RenderSeedWalk;
     const FExploreWalkOutput* CameraSeedWalk = nullptr;
     if (Arguments.bWalk)
@@ -4570,7 +5108,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
     // it cannot affect the profiled world's generation or its deterministic output.
     if (Arguments.bProfileDensity
         && (Arguments.bRender || Arguments.bExport)
-        && CameraSeedWalk != nullptr
+        && (CameraSeedWalk != nullptr || Arguments.bExport)
         && !Budget.bTruncated)
     {
         Output.ProfilerComparison.Scope = TEXT("canonical_mesh_export");
@@ -5101,6 +5639,8 @@ bool BuildBatchCaseParams(
 
     bool bReuseDensityGrid = true;
     JsonBool(Case, TEXT("density_grid_reuse"), bReuseDensityGrid);
+    bool bBlockEarlyOut = false;
+    JsonBool(Case, TEXT("block_early_out"), bBlockEarlyOut);
     int32 MeshMinBatchSize = 1;
     if (JsonNumber(Case, TEXT("mesh_min_batch_size"), Number))
     {
@@ -5118,15 +5658,19 @@ bool BuildBatchCaseParams(
     bProfileDensity |= bProfileDensityFull;
     bool bProfileLod = false;
     JsonBool(Case, TEXT("profile_lod"), bProfileLod);
+    bool bOpBounds = false;
+    JsonBool(Case, TEXT("op_bounds"), bOpBounds);
     bool bFailureFocus = false;
     JsonBool(Case, TEXT("failure_focus_render"), bFailureFocus);
 
     OutParams = FString::Printf(
         TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
-             "-exportsize=%d -exportstep=%d -densitygridreuse=%d -meshminbatch=%d "
+             "-exportsize=%d -exportstep=%d -densitygridreuse=%d "
+             "-blockearlyout=%d -meshminbatch=%d "
              "-failurefocus=%d -out=\"%s\""),
         Seed, *Archetype, Slot, *Modes, bOperatorStack ? 1 : 0,
-        ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0, MeshMinBatchSize,
+        ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0,
+        bBlockEarlyOut ? 1 : 0, MeshMinBatchSize,
         bFailureFocus ? 1 : 0, *CaseOutDirectory);
 
     if (bProfileDensity)
@@ -5138,6 +5682,10 @@ bool BuildBatchCaseParams(
     if (bProfileLod)
     {
         OutParams += TEXT(" -profilelod");
+    }
+    if (bOpBounds)
+    {
+        OutParams += TEXT(" -opbounds");
     }
 
     const TPair<const TCHAR*, const TCHAR*> IntegerFields[] = {

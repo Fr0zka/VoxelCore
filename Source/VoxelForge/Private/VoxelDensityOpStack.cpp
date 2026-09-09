@@ -89,6 +89,12 @@ namespace
      */
     static constexpr float VF_PerlinAbsBound = 1.5f;
 
+    // Cellular3D returns 2*(F2-F1)-1 without a clamp. Every searched feature point is at most
+    // sqrt(12) from the query's unit cell, so F2-F1 <= sqrt(12) and the positive supremum is
+    // 2*sqrt(12)-1 = 5.9282... . Round that up for float evaluation instead of trusting the
+    // "~[-1,1]" comment in the noise implementation (which is an observation, not a proof).
+    static constexpr float VF_CellularAbsBound = 6.0f;
+
     /** La même enveloppe que `FractalNoise3D` de VoxelGenerator.cpp (qui y est `static`, donc
      *  invisible ici). Les coordonnées de bruit restent en float : FVector est double dans UE5
      *  et son aller-retour ne servait qu'à conserver l'ancien arrondi, exigence abandonnée. */
@@ -1637,6 +1643,22 @@ namespace
                 ? EVoxelOpEffect::Both : EVoxelOpEffect::CarveOnly;
         }
 
+        // The landing carve interpolates from the incoming density toward an air target, so its
+        // delta is unbounded without an input-density interval.  It is nevertheless exactly
+        // inactive outside the geometric influence box; return zero there so an unrelated block
+        // does not inherit the interface's conservative FLT_MAX sentinel.
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            const EVoxelOpEffect Effect = EffectOverBox(VoxelBox, Ctx);
+            return (Effect == EVoxelOpEffect::CarveOnly || Effect == EVoxelOpEffect::Both)
+                 ? FLT_MAX : 0.0f;
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Both ? FLT_MAX : 0.0f;
+        }
+
         const TCHAR* DebugName() const override { return TEXT("OriginSpineOp"); }
 
     private:
@@ -1709,6 +1731,15 @@ namespace
             return EVoxelOpEffect::FillOnly;
         }
 
+        // A partial seal can raise an arbitrarily negative incoming density, so its fill delta is
+        // genuinely unbounded through this API.  Outside both bands it is an exact identity.
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity ? 0.0f : FLT_MAX;
+        }
+
         const TCHAR* DebugName() const override { return TEXT("BoundarySealOp"); }
 
     private:
@@ -1765,7 +1796,14 @@ namespace
         {
             return VF_XYEdgeSealBoxTouchesBand(
                 VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness)
-                ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+                 ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Identity ? 0.0f : FLT_MAX;
         }
 
         bool IsXYPure() const override { return true; }
@@ -1825,6 +1863,21 @@ namespace
             }
             return LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
+        }
+
+        // The current-density Lerp/Min passage carve has no finite delta bound for an arbitrary
+        // incoming density.  Keep that honest where it can affect a box, but expose exact identity
+        // for the overwhelmingly common no-passage case.
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            const EVoxelOpEffect Effect = EffectOverBox(VoxelBox, Ctx);
+            return (Effect == EVoxelOpEffect::CarveOnly || Effect == EVoxelOpEffect::Both)
+                 ? FLT_MAX : 0.0f;
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        {
+            return EffectOverBox(VoxelBox, Ctx) == EVoxelOpEffect::Both ? FLT_MAX : 0.0f;
         }
 
         const TCHAR* DebugName() const override { return TEXT("PassageCarveOp"); }
@@ -3486,6 +3539,93 @@ namespace
             return EVoxelOpEffect::Identity;
         }
 
+        // This operator publishes SDF and does not change Density.  Reporting zero here is
+        // important: FLT_MAX means "an unknown density delta", whereas this source has no density
+        // delta at all.  The SDF interval remains the source's separate box contract below.
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        /**
+         * State-aware detail gate support.  A room terrain op can replace the strate-level
+         * activation/strength fields for the room selected by Eval.  Until the cache tells us
+         * that the queried box contains no such override, a detail bound based on P alone would be
+         * unsound.  Returning true on an invalid box state deliberately loses a skip rather than
+         * manufacturing one.
+         */
+        bool HasRoomTerrainOverrideForLastBox() const
+        {
+            const FBoxState& B = BoxState();
+            if (!B.bValid) { return true; }
+            for (const FCachedRoom& Room : B.Cache.Rooms)
+            {
+                if (Room.RoomOp != nullptr) { return true; }
+            }
+            return false;
+        }
+
+        bool HasRoomColumnsForLastBox() const
+        {
+            const FBoxState& B = BoxState();
+            return !B.bValid || B.Cache.Columns.Num() > 0;
+        }
+
+        float RoomColumnFillSupremumForLastBox() const
+        {
+            const FBoxState& B = BoxState();
+            if (!B.bValid) { return FLT_MAX; }
+
+            float Supremum = 0.0f;
+            for (const FCachedColumn& Column : B.Cache.Columns)
+            {
+                if (!FMath::IsFinite(Column.BaseDensity) || Column.BaseDensity < 0.0f)
+                {
+                    // Eval multiplies by BaseDensity.  A negative authored value reverses the
+                    // declared FillOnly direction, so the state-aware caller must fall back to
+                    // Both/unknown rather than pretend this is a fill envelope.
+                    return FLT_MAX;
+                }
+                const float Contribution = Column.BaseDensity * 1.5f;
+                if (!FMath::IsFinite(Contribution)
+                    || Supremum > FLT_MAX - Contribution)
+                {
+                    return FLT_MAX;
+                }
+                Supremum += Contribution;
+            }
+            return Supremum;
+        }
+
+        float FloorBiasFillSupremumForLastBox() const
+        {
+            const FBoxState& B = BoxState();
+            if (!B.bValid) { return FLT_MAX; }
+
+            // Eval uses NormZ² only below the room centre.  The largest value over the queried
+            // box is therefore the squared distance from the room centre to Box.Min.Z, divided by
+            // max(RadiusZ, 1)².  Taking the maximum over cached rooms is conservative for whichever
+            // room wins the nearest-SDF query, and is finite without assuming a global room height.
+            float Supremum = 0.0f;
+            const float BoxMinZ = static_cast<float>(B.KeyBox.Min.Z);
+            if (!FMath::IsFinite(BoxMinZ)) { return FLT_MAX; }
+            for (const FCachedRoom& Room : B.Cache.Rooms)
+            {
+                const float CenterZ = static_cast<float>(Room.Center.Z);
+                const float RadiusZ = Room.RadiusZ;
+                if (!FMath::IsFinite(CenterZ) || !FMath::IsFinite(RadiusZ)
+                    || !FMath::IsFinite(P.FloorBias) || P.FloorBias < 0.0f)
+                {
+                    return FLT_MAX;
+                }
+                const float Denominator = FMath::Max(RadiusZ, 1.0f);
+                const float Below = FMath::Max(CenterZ - BoxMinZ, 0.0f);
+                const float Normalized = Below / Denominator;
+                const float Contribution = Normalized * Normalized * P.FloorBias;
+                if (!FMath::IsFinite(Contribution)) { return FLT_MAX; }
+                Supremum = FMath::Max(Supremum, Contribution);
+            }
+            return Supremum;
+        }
+
         /**
          * Publish a conservative interval for this source alone.
          *
@@ -4007,17 +4147,29 @@ namespace
     {
         // A detail op with no room source has the same no-op guard as Eval. An unknown interval is
         // not a reason to claim Identity: uncertainty costs a skip, while a false skip is a hole.
-        return (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius))
-             ? EVoxelOpEffect::Identity : Intrinsic;
+        if (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius))
+        {
+            return EVoxelOpEffect::Identity;
+        }
+        // A terrain op is allowed to replace the strate-level activation fields for the room that
+        // Eval selects.  Its exact direction is not part of the generic cache proof, so preserve
+        // safety with Both whenever one is present.  The common no-override TunnelNetwork path
+        // gets the real intrinsic direction and finite amplitude below.
+        return Rooms->HasRoomTerrainOverrideForLastBox()
+             ? EVoxelOpEffect::Both : Intrinsic;
     }
 
     FORCEINLINE float VF_CaveDetailMax(const FRoomGraphSource* Rooms,
                                        const FVoxelBoxHypotheses& H,
-                                       float SDFBlendRadius)
+                                       float SDFBlendRadius,
+                                       float IntrinsicMax)
     {
         // Per-room overrides can activate or enlarge a modifier even when the strate-level
-        // parameter is zero. Near/unknown therefore returns the safe default amplitude.
-        return (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius)) ? 0.0f : FLT_MAX;
+        // parameter is zero.  A valid cache with no override makes the strate-level supremum
+        // exact for these modifiers; an unknown/overridden cache keeps the old safe default.
+        if (Rooms == nullptr || VF_CaveBoxIsFar(H, SDFBlendRadius)) { return 0.0f; }
+        if (Rooms->HasRoomTerrainOverrideForLastBox()) { return FLT_MAX; }
+        return IntrinsicMax;
     }
 
     //=========================================================================
@@ -4197,11 +4349,11 @@ namespace
 
         /**
          * ✅ Borne consommée par le pliage numérique. `RoughNoise` et `FineNoise` respectent tous
-         * deux sont couverts par la borne prouvée `VF_PerlinAbsBound = 1.5`, mis à l'échelle par
-         * `VOXEL_NOISE_SCALE`, et `TotalRough = Rough·S + Fine·S·0.4` ⇒
-         * `|TotalRough| ≤ 2.1 · S · SCALE`. Le fade est
-         * dans `[0,1]`. Le clamp anti-remplissage ne fait que RÉDUIRE côté fill ; on ne s'appuie pas
-         * dessus (il ne s'applique que dans l'air certain), donc la borne fill reste la même.
+         * `FBM` est couvert par la borne prouvée `VF_PerlinAbsBound = 1.5`, mis à l'échelle par
+         * `VOXEL_NOISE_SCALE`.  `Ridged` is in [-1,1] after its square/fold, while the unclamped
+         * cellular mapping needs its own finite envelope below.  The two octaves contribute
+         * `|Rough| + 0.4·|Fine|`; the fade is in `[0,1]`.  The anti-fill clamp only reduces the
+         * positive side, so the same envelope is valid in both directions.
          */
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
         float MaxFillOverBox (const FBox&, const FVoxelOpContext&) const override { return MaxAmplitude(); }
@@ -4221,8 +4373,29 @@ namespace
         /** La borne d'amplitude, en unités de densité. */
         float MaxAmplitude() const
         {
-            return (P.SurfaceRoughness > 0.0f)
-                 ? (2.1f * P.SurfaceRoughness * VOXEL_NOISE_SCALE) : 0.0f;
+            if (!(P.SurfaceRoughness > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.SurfaceRoughness)) { return FLT_MAX; }
+
+            float NoiseBound = VF_PerlinAbsBound;
+            switch (P.RoughnessNoiseType)
+            {
+            case EVoxelNoiseType::Ridged:
+                NoiseBound = 1.0f;
+                break;
+            case EVoxelNoiseType::Mixed:
+                NoiseBound = 0.5f * (VF_PerlinAbsBound + 1.0f);
+                break;
+            case EVoxelNoiseType::Cellular:
+                NoiseBound = VF_CellularAbsBound;
+                break;
+            case EVoxelNoiseType::FBM:
+            default:
+                NoiseBound = VF_PerlinAbsBound;
+                break;
+            }
+
+            const float Result = 1.4f * NoiseBound * P.SurfaceRoughness * VOXEL_NOISE_SCALE;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -4339,7 +4512,45 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::Both);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxCarveOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxFillOverBox(VoxelBox, Ctx));
+        }
+
+        /**
+         * `TerracedZ` is one staircase step below or above `NoisedZ`; the modulo phase is in
+         * [0,1], so the safe supremum of `abs(TerracedZ - NoisedZ)` is one full step, not StepH/2.
+         * The noise displacement changes which phase is selected but cannot enlarge that interval.
+         */
+        float MaxAmplitude() const
+        {
+            return (P.TerraceStepHeight > 0.0f
+                    && FMath::IsFinite(P.TerraceStepHeight)
+                    && FMath::IsFinite(P.TerraceHardness)
+                    && P.TerraceHardness >= 0.0f && P.TerraceHardness <= 1.0f)
+                 ? P.TerraceStepHeight : (P.TerraceStepHeight > 0.0f ? FLT_MAX : 0.0f);
         }
 
     private:
@@ -4407,7 +4618,7 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::CarveOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
         }
 
         /** `LineValue = max(sin,0)³ ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ retrait ≤ `LayerLineDepth`.
@@ -4417,17 +4628,24 @@ namespace
          *  réglée par le même correctif — AVANT que `ClassifyTile` ne consomme `ClassifyBox`. */
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return (P.LayerLineSpacing > 0.0f) ? FMath::Max(P.LayerLineDepth, 0.0f) : 0.0f;
+            return MaxAmplitude();
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
 
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
                               const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius, MaxAmplitude());
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
                              const FVoxelBoxHypotheses&) const override { return 0.0f; }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.LayerLineSpacing > 0.0f)) { return 0.0f; }
+            return FMath::IsFinite(P.LayerLineDepth)
+                 ? FMath::Max(P.LayerLineDepth, 0.0f) : FLT_MAX;
+        }
 
     private:
         FStrateGenerationParams P;
@@ -4496,7 +4714,7 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
         }
 
         /** `RibValue = max(sin,0)² ∈ [0,1]`, `Fade ∈ [0,1]` ⇒ ajout ≤ `RibbingDepth`.
@@ -4504,7 +4722,7 @@ namespace
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return (P.RibbingSpacing > 0.0f) ? FMath::Max(P.RibbingDepth, 0.0f) : 0.0f;
+            return MaxAmplitude();
         }
 
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
@@ -4512,7 +4730,14 @@ namespace
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
                              const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius, MaxAmplitude());
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.RibbingSpacing > 0.0f)) { return 0.0f; }
+            return FMath::IsFinite(P.RibbingDepth)
+                 ? FMath::Max(P.RibbingDepth, 0.0f) : FLT_MAX;
         }
 
     private:
@@ -4588,7 +4813,7 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
         }
 
         /** fBM ∈ [-1,1] × `VOXEL_NOISE_SCALE`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ ajout
@@ -4596,9 +4821,7 @@ namespace
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return VOXEL_NOISE_SCALE * VF_PerlinAbsBound
-                 * FMath::Max(P.OverhangDepth, 0.0f)
-                 * FMath::Max(P.OverhangStrength, 0.0f);
+            return MaxAmplitude();
         }
 
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
@@ -4606,7 +4829,20 @@ namespace
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
                              const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius, MaxAmplitude());
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.OverhangDepth)
+                || !FMath::IsFinite(P.OverhangStrength))
+            {
+                return FLT_MAX;
+            }
+            const float Result = VOXEL_NOISE_SCALE * VF_PerlinAbsBound
+                 * P.OverhangDepth * P.OverhangStrength;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -4689,7 +4925,41 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::Both);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        /** `|VertGrad| ≤ SCALE·1.5`, `|CaveSDF| < 8`, `Fade ≤ 1`, final multiplier `3`. */
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxCarveOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxFillOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.CliffStrength > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.CliffStrength)) { return FLT_MAX; }
+            const float Result = 8.0f * 3.0f * VOXEL_NOISE_SCALE
+                               * VF_PerlinAbsBound * P.CliffStrength;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -4765,24 +5035,33 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::CarveOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
         }
 
-        /** `Cellular3D ∈ [-1,1]`, lobe positif seulement, `Fade ∈ [0,1]` ⇒ retrait ≤
-         *  `ScallopStrength`. Même réserve « params de strate ». */
+        /** The implementation maps an unclamped F2-F1 distance to `2*d-1`; the proven finite
+         *  envelope used here is `VF_CellularAbsBound`, not the approximate [-1,1] comment beside
+         *  the noise function.  The positive lobe and `Fade ∈ [0,1]` then bound the carve. */
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return VF_PerlinAbsBound * FMath::Max(P.ScallopStrength, 0.0f);
+            return MaxAmplitude();
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
 
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
                               const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius);
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius, MaxAmplitude());
         }
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
                              const FVoxelBoxHypotheses&) const override { return 0.0f; }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.ScallopStrength > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.ScallopStrength)) { return FLT_MAX; }
+            const float Result = VF_CellularAbsBound * P.ScallopStrength;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+        }
 
     private:
         FStrateGenerationParams P;
@@ -4863,14 +5142,49 @@ namespace
          *  consomme l'intervalle SDF publié par la source, comme les autres détails de salle. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return (P.ArchDensity > 0.0f) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
+            if (!(P.ArchDensity > 0.0f)) { return EVoxelOpEffect::Identity; }
+            if (P.BaseDensity > 0.0f) { return EVoxelOpEffect::FillOnly; }
+            if (P.BaseDensity < 0.0f) { return EVoxelOpEffect::CarveOnly; }
+            return EVoxelOpEffect::Identity;
         }
 
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return P.BaseDensity < 0.0f ? MaxAmplitude() : 0.0f;
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return P.BaseDensity > 0.0f ? MaxAmplitude() : 0.0f;
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxCarveOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxFillOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.ArchDensity > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            const float Result = FMath::Abs(P.BaseDensity) * 3.0f * 1.5f;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -4935,8 +5249,8 @@ namespace
             }
         }
 
-        /** N'AJOUTE que du solide ⇒ `FillOnly`. On ne peut pas rendre `Identity` sans consulter le
-         *  cache pour la boîte interrogée — même dette que le graphe de salles. */
+        /** The cached column list is the complete source of this op's work.  A valid empty list is
+         *  therefore an exact Identity result; an invalid box cache stays conservative. */
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             return EVoxelOpEffect::FillOnly;
@@ -4945,8 +5259,35 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                                      const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+            if (Rooms == nullptr || VF_CaveBoxIsFar(H, P.SDFBlendRadius))
+            {
+                return EVoxelOpEffect::Identity;
+            }
+            const float Bound = Rooms->RoomColumnFillSupremumForLastBox();
+            if (!(Bound > 0.0f)) { return EVoxelOpEffect::Identity; }
+            return FMath::IsFinite(Bound) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Both;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return FLT_MAX;
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            if (Rooms == nullptr || VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return 0.0f; }
+            const float Bound = Rooms->RoomColumnFillSupremumForLastBox();
+            return FMath::IsFinite(Bound) ? 0.0f : Bound;
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            if (Rooms == nullptr || VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return 0.0f; }
+            return Rooms->RoomColumnFillSupremumForLastBox();
         }
 
     private:
@@ -5053,7 +5394,38 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::CarveOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return 0.0f;
+        }
+
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxCarveOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses&) const override
+        {
+            return 0.0f;
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.DomeDensity > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            const float Result = FMath::Abs(P.BaseDensity) * 2.0f * 1.5f;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -5142,7 +5514,35 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return MaxAmplitude();
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius, 0.0f);
+        }
+
+        float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveDetailMax(Rooms, H, P.SDFBlendRadius,
+                                    MaxFillOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxAmplitude() const
+        {
+            if (!(P.PinchDensity > 0.0f)) { return 0.0f; }
+            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            const float Result = FMath::Abs(P.BaseDensity) * 3.0f * 1.5f;
+            return FMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -5217,7 +5617,28 @@ namespace
                                      const FVoxelBoxHypotheses& H) const override
         {
             return VF_CaveDetailEffect(Rooms, H, P.SDFBlendRadius,
-                                        EVoxelOpEffect::FillOnly);
+                                        EffectOverBox(VoxelBox, Ctx));
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
+        {
+            return FMath::IsFinite(P.FloorBias) && P.FloorBias >= 0.0f
+                 ? P.FloorBias : (P.FloorBias < 0.0f ? 0.0f : FLT_MAX);
+        }
+
+        float MaxCarveOverBox(const FBox&, const FVoxelOpContext&,
+                              const FVoxelBoxHypotheses& H) const override
+        {
+            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? 0.0f : 0.0f;
+        }
+
+        float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
+                             const FVoxelBoxHypotheses& H) const override
+        {
+            if (Rooms == nullptr || VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return 0.0f; }
+            return Rooms->FloorBiasFillSupremumForLastBox();
         }
 
     private:
@@ -5359,7 +5780,8 @@ namespace
          *  réseau, c'est `MaxCarveOverBox` qui l'applique. */
         float MaxCarveAmplitude() const
         {
-            return (P.WormStrength > 0.0f && P.WormThreshold > 0.0f) ? P.WormStrength : 0.0f;
+            if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return 0.0f; }
+            return FMath::IsFinite(P.WormStrength) ? P.WormStrength : FLT_MAX;
         }
 
         const TCHAR* DebugName() const override { return TEXT("WormFieldSource"); }
@@ -5580,6 +6002,167 @@ SIZE_T FVoxelOpStack::GetAllocatedSize() const
         }
     }
     return Bytes;
+}
+
+void FVoxelOpStack::DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                                int32 SampleStep, TArray<FOpBoxDiagnostic>& OutDiagnostics,
+                                EVoxelTileClass* OutVerdict) const
+{
+    OutDiagnostics.Reset();
+    OutDiagnostics.SetNum(Ops.Num());
+    if (OutVerdict != nullptr)
+    {
+        *OutVerdict = EVoxelTileClass::Mixed;
+    }
+
+    if (!VoxelBox.IsValid || SampleStep <= 0)
+    {
+        return;
+    }
+
+    FVoxelBoxHypotheses H;
+    for (int32 Index = 0; Index < Ops.Num(); ++Index)
+    {
+        const FOpEntry& Entry = Ops[Index];
+        FOpBoxDiagnostic& Diagnostic = OutDiagnostics[Index];
+        Diagnostic.Index = Index;
+        Diagnostic.Name = Entry.Op.IsValid() ? FString(Entry.Op->DebugName()) : TEXT("(null op)");
+        Diagnostic.bWritesSdf = (Entry.Writes & VoxelOpChannels::Sdf) != 0;
+
+        if (!Entry.Op.IsValid())
+        {
+            continue;
+        }
+
+        // This is intentionally the same order and branch structure as VF_FoldOp. The diagnostic
+        // must explain the production classifier, not an approximation of it.
+        const EVoxelTileClass Forced = Entry.Op->ClassifyBox(VoxelBox, Ctx);
+        Diagnostic.ForcedVerdict = Forced;
+        Diagnostic.bForced = Forced != EVoxelTileClass::Mixed;
+        if (Diagnostic.bForced)
+        {
+            Diagnostic.Effect = EVoxelOpEffect::Identity;
+            Diagnostic.ForcedMargin = Entry.Op->ForcedMarginOverBox(VoxelBox, Ctx);
+            VF_ForceHypotheses(H, Forced, Diagnostic.ForcedMargin);
+            if (Diagnostic.bWritesSdf)
+            {
+                Entry.Op->PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx);
+                Diagnostic.bHasSdfBound = H.Sdf.IsKnown();
+                if (Diagnostic.bHasSdfBound)
+                {
+                    Diagnostic.SdfBoundMin = H.Sdf.Min;
+                    Diagnostic.SdfBoundMax = H.Sdf.Max;
+                }
+            }
+        }
+        else
+        {
+            Diagnostic.Effect = Entry.Op->EffectOverBox(VoxelBox, Ctx, H);
+            Diagnostic.MaxCarve = Entry.Op->MaxCarveOverBox(VoxelBox, Ctx, H);
+            Diagnostic.MaxFill = Entry.Op->MaxFillOverBox(VoxelBox, Ctx, H);
+            VF_FoldEffect(H, Diagnostic.Effect, Diagnostic.MaxCarve, Diagnostic.MaxFill);
+            if (Diagnostic.bWritesSdf)
+            {
+                Entry.Op->PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx);
+                Diagnostic.bHasSdfBound = H.Sdf.IsKnown();
+                if (Diagnostic.bHasSdfBound)
+                {
+                    Diagnostic.SdfBoundMin = H.Sdf.Min;
+                    Diagnostic.SdfBoundMax = H.Sdf.Max;
+                }
+            }
+        }
+    }
+
+    if (OutVerdict != nullptr)
+    {
+        *OutVerdict = H.Resolve();
+    }
+
+    const int32 MinX = FMath::CeilToInt(static_cast<float>(VoxelBox.Min.X));
+    const int32 MinY = FMath::CeilToInt(static_cast<float>(VoxelBox.Min.Y));
+    const int32 MinZ = FMath::CeilToInt(static_cast<float>(VoxelBox.Min.Z));
+    const int32 MaxX = FMath::FloorToInt(static_cast<float>(VoxelBox.Max.X));
+    const int32 MaxY = FMath::FloorToInt(static_cast<float>(VoxelBox.Max.Y));
+    const int32 MaxZ = FMath::FloorToInt(static_cast<float>(VoxelBox.Max.Z));
+    if (MinX > MaxX || MinY > MaxY || MinZ > MaxZ)
+    {
+        return;
+    }
+
+    constexpr float BoundEpsilon = 1.0e-4f;
+    for (int32 Z = MinZ; Z <= MaxZ; )
+    {
+        for (int32 Y = MinY; Y <= MaxY; )
+        {
+            for (int32 X = MinX; X <= MaxX; )
+            {
+                FVoxelOpSample Sample;
+                for (int32 Index = 0; Index < Ops.Num(); ++Index)
+                {
+                    const FOpEntry& Entry = Ops[Index];
+                    FOpBoxDiagnostic& Diagnostic = OutDiagnostics[Index];
+                    if (!Entry.Op.IsValid())
+                    {
+                        continue;
+                    }
+
+                    const float DensityBefore = Sample.Density;
+                    Entry.Op->Eval(static_cast<float>(X), static_cast<float>(Y),
+                                   static_cast<float>(Z), Sample);
+                    const float DensityDelta = Sample.Density - DensityBefore;
+                    if (FMath::IsFinite(DensityDelta))
+                    {
+                        Diagnostic.bHasDensityDelta = true;
+                        Diagnostic.ActualDensityDeltaMin =
+                            FMath::Min(Diagnostic.ActualDensityDeltaMin, DensityDelta);
+                        Diagnostic.ActualDensityDeltaMax =
+                            FMath::Max(Diagnostic.ActualDensityDeltaMax, DensityDelta);
+
+                        // A forced classifier is a stronger statement than a directional delta
+                        // bound. Its density can legitimately replace an arbitrary incoming
+                        // value (the constant source is the canonical example), so do not call
+                        // that replacement a MaxFill/MaxCarve violation. ForcedMargin records the
+                        // proof margin separately for the report.
+                        if (!Diagnostic.bForced)
+                        {
+                            const float CarveEpsilon = BoundEpsilon
+                                * FMath::Max(1.0f, FMath::Abs(Diagnostic.MaxCarve));
+                            const float FillEpsilon = BoundEpsilon
+                                * FMath::Max(1.0f, FMath::Abs(Diagnostic.MaxFill));
+                            if (FMath::IsFinite(Diagnostic.MaxCarve)
+                                && DensityDelta < -Diagnostic.MaxCarve - CarveEpsilon)
+                            {
+                                Diagnostic.bCarveBoundViolated = true;
+                            }
+                            if (FMath::IsFinite(Diagnostic.MaxFill)
+                                && DensityDelta > Diagnostic.MaxFill + FillEpsilon)
+                            {
+                                Diagnostic.bFillBoundViolated = true;
+                            }
+                        }
+                    }
+
+                    if (Diagnostic.bWritesSdf && FMath::IsFinite(Sample.Sdf))
+                    {
+                        Diagnostic.bHasSdfValue = true;
+                        Diagnostic.ActualSdfMin = FMath::Min(
+                            Diagnostic.ActualSdfMin, Sample.Sdf);
+                        Diagnostic.ActualSdfMax = FMath::Max(
+                            Diagnostic.ActualSdfMax, Sample.Sdf);
+                    }
+                    ++Diagnostic.SampleCount;
+                }
+
+                if (X > MaxX - SampleStep) { break; }
+                X += SampleStep;
+            }
+            if (Y > MaxY - SampleStep) { break; }
+            Y += SampleStep;
+        }
+        if (Z > MaxZ - SampleStep) { break; }
+        Z += SampleStep;
+    }
 }
 
 bool FVoxelOpStack::ValidateChannelOrder(FString* OutError) const

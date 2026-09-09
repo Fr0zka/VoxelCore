@@ -100,6 +100,9 @@ namespace VoxelDensityProfile
         TunnelSupportFloorChecks,
         PassageCandidates,
         PassageEvaluated,
+        MesherBlockTests,
+        MesherBlockAllSolid,
+        MesherBlockAllAir,
         Count
     };
 
@@ -122,25 +125,12 @@ namespace VoxelDensityProfile
         uint64 SupportColumnEntriesBytes = 0;
         uint64 SupportColumnsBytes = 0;
         uint64 SupportColumnIntervalsBytes = 0;
-        uint64 RoomIndexBinsBytes = 0;
-        uint64 RoomIndexCandidatesBytes = 0;
-        uint64 RoomFloorJoinIndexBinsBytes = 0;
-        uint64 RoomFloorJoinIndexCandidatesBytes = 0;
-        uint64 TunnelIndexBinsBytes = 0;
-        uint64 TunnelIndexCandidatesBytes = 0;
-        uint64 TunnelWorldIndexBinsBytes = 0;
-        uint64 TunnelWorldIndexCandidatesBytes = 0;
-
         uint64 TotalBytes() const
         {
             return SlotStorageBytes + OpStackBytes
                 + RoomsBytes + RoomFloorJoinsBytes + TunnelsBytes + PitsBytes
                 + ChimneysBytes + ColumnsBytes + SupportColumnEntriesBytes
-                + SupportColumnsBytes + SupportColumnIntervalsBytes
-                + RoomIndexBinsBytes + RoomIndexCandidatesBytes
-                + RoomFloorJoinIndexBinsBytes + RoomFloorJoinIndexCandidatesBytes
-                + TunnelIndexBinsBytes + TunnelIndexCandidatesBytes
-                + TunnelWorldIndexBinsBytes + TunnelWorldIndexCandidatesBytes;
+                + SupportColumnsBytes + SupportColumnIntervalsBytes;
         }
 
         uint64 DynamicBytes() const
@@ -161,14 +151,6 @@ namespace VoxelDensityProfile
             SupportColumnEntriesBytes += Other.SupportColumnEntriesBytes;
             SupportColumnsBytes += Other.SupportColumnsBytes;
             SupportColumnIntervalsBytes += Other.SupportColumnIntervalsBytes;
-            RoomIndexBinsBytes += Other.RoomIndexBinsBytes;
-            RoomIndexCandidatesBytes += Other.RoomIndexCandidatesBytes;
-            RoomFloorJoinIndexBinsBytes += Other.RoomFloorJoinIndexBinsBytes;
-            RoomFloorJoinIndexCandidatesBytes += Other.RoomFloorJoinIndexCandidatesBytes;
-            TunnelIndexBinsBytes += Other.TunnelIndexBinsBytes;
-            TunnelIndexCandidatesBytes += Other.TunnelIndexCandidatesBytes;
-            TunnelWorldIndexBinsBytes += Other.TunnelWorldIndexBinsBytes;
-            TunnelWorldIndexCandidatesBytes += Other.TunnelWorldIndexCandidatesBytes;
             return *this;
         }
     };
