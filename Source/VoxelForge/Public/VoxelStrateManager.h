@@ -420,9 +420,24 @@ public:
     /** Conservative box guard for the floor fill; unlike a tube it can affect the all-air proof. */
     bool AnyPassageLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
 
+    /** Exact-lattice counterparts used by ClassifyTile's MC-grid proof. */
+    bool AnyPassageNearLattice(const FBox& VoxelBox,
+                               const FIntVector& LatticeOrigin, int32 Step) const;
+    /** Exact maximum of the passage carve factor on the mesher lattice; 0 means no tube/landing
+     * carve reaches a sampled point. Invalid geometry returns 1 conservatively. */
+    float MaxPassageCarveFactorNearLattice(const FBox& VoxelBox,
+                                           const FIntVector& LatticeOrigin, int32 Step) const;
+    bool AnyPassageLandingFloorNearLattice(const FBox& VoxelBox,
+                                           const FIntVector& LatticeOrigin, int32 Step) const;
+
     /** Conservative box guards for the per-strate (0,0) landing rooms and their floor slabs. */
     bool AnyOriginLandingNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
     bool AnyOriginLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
+
+    bool AnyOriginLandingNearLattice(const FBox& VoxelBox,
+                                     const FIntVector& LatticeOrigin, int32 Step) const;
+    bool AnyOriginLandingFloorNearLattice(const FBox& VoxelBox,
+                                          const FIntVector& LatticeOrigin, int32 Step) const;
 
     /** Get all generated passages (for debug display). */
     const TArray<FVoxelPassage>& GetPassages() const { return Passages; }

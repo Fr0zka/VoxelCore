@@ -33,6 +33,10 @@
 #include "VoxelStats.h"
 
 #include <atomic>                     // l'id d'instance non recyclé du mémo de colonne
+#include "HAL/CriticalSection.h"
+#include "HAL/Event.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/ScopeLock.h"
 
 namespace
 {
@@ -88,6 +92,180 @@ namespace
      * PROVED above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
      */
     static constexpr float VF_PerlinAbsBound = 1.5f;
+
+    struct FVFInterval
+    {
+        float Min = 0.0f;
+        float Max = 0.0f;
+    };
+
+    FORCEINLINE FVFInterval VF_AddInterval(const FVFInterval& A, const FVFInterval& B)
+    {
+        return {A.Min + B.Min, A.Max + B.Max};
+    }
+
+    FORCEINLINE FVFInterval VF_NegateInterval(const FVFInterval& A)
+    {
+        return {-A.Max, -A.Min};
+    }
+
+    FORCEINLINE FVFInterval VF_MultiplyNonNegativeInterval(
+        const FVFInterval& A, const FVFInterval& B)
+    {
+        const float P0 = A.Min * B.Min;
+        const float P1 = A.Min * B.Max;
+        const float P2 = A.Max * B.Min;
+        const float P3 = A.Max * B.Max;
+        return {FMath::Min(FMath::Min(P0, P1), FMath::Min(P2, P3)),
+                FMath::Max(FMath::Max(P0, P1), FMath::Max(P2, P3))};
+    }
+
+    /** Exact interval for GradDot on one subdivision of one Perlin cell. */
+    FORCEINLINE FVFInterval VF_GradDotInterval(
+        uint32 Hash, const FVFInterval& X, const FVFInterval& Y, const FVFInterval& Z)
+    {
+        const uint32 H = Hash & 15u;
+        const FVFInterval* Axes[3] = {&X, &Y, &Z};
+        const FVFInterval& U = *Axes[(H & 8u) == 0u ? 0 : 1];
+
+        int32 VAxis = 2;
+        if ((H & 12u) == 0u)
+        {
+            VAxis = 1;
+        }
+        else if ((H & 13u) == 12u)
+        {
+            VAxis = 0;
+        }
+
+        const FVFInterval SignedU = (H & 1u) == 0u ? U : VF_NegateInterval(U);
+        const FVFInterval SignedV = (H & 2u) == 0u
+            ? *Axes[VAxis] : VF_NegateInterval(*Axes[VAxis]);
+        return VF_AddInterval(SignedU, SignedV);
+    }
+
+    /**
+     * Conservative local envelope for the exact scalar Perlin3D implementation.
+     *
+     * Perlin3D is a trilinear blend of eight linear GradDot values in each integer cell.  We split
+     * every intersected cell into two pieces per axis and interval-evaluate the same fade/lerp
+     * formula.  The result is therefore a proof over the whole finite box, not a sample-based
+     * guess.  Large/invalid boxes fall back to the already-proven global envelope.
+     */
+    FORCEINLINE float VF_PerlinAbsBoundOverBox(
+        const FVector3f& InMin, const FVector3f& InMax)
+    {
+        if (!FMath::IsFinite(InMin.X) || !FMath::IsFinite(InMin.Y)
+            || !FMath::IsFinite(InMin.Z) || !FMath::IsFinite(InMax.X)
+            || !FMath::IsFinite(InMax.Y) || !FMath::IsFinite(InMax.Z)
+            || InMin.X > InMax.X || InMin.Y > InMax.Y || InMin.Z > InMax.Z
+            || FMath::Abs(InMin.X) > 1000000.0f || FMath::Abs(InMax.X) > 1000000.0f
+            || FMath::Abs(InMin.Y) > 1000000.0f || FMath::Abs(InMax.Y) > 1000000.0f
+            || FMath::Abs(InMin.Z) > 1000000.0f || FMath::Abs(InMax.Z) > 1000000.0f)
+        {
+            return VF_PerlinAbsBound;
+        }
+
+        const int32 X0 = FMath::FloorToInt(InMin.X);
+        const int32 Y0 = FMath::FloorToInt(InMin.Y);
+        const int32 Z0 = FMath::FloorToInt(InMin.Z);
+        const int32 X1 = FMath::FloorToInt(InMax.X);
+        const int32 Y1 = FMath::FloorToInt(InMax.Y);
+        const int32 Z1 = FMath::FloorToInt(InMax.Z);
+        const int64 CellCount = ((int64)X1 - X0 + 1)
+                              * ((int64)Y1 - Y0 + 1)
+                              * ((int64)Z1 - Z0 + 1);
+        if (X1 < X0 || Y1 < Y0 || Z1 < Z0 || CellCount <= 0 || CellCount > 64)
+        {
+            return VF_PerlinAbsBound;
+        }
+
+        constexpr int32 Subdivisions = 8;
+        float Bound = 0.0f;
+        for (int32 CellZ = Z0; CellZ <= Z1; ++CellZ)
+        for (int32 CellY = Y0; CellY <= Y1; ++CellY)
+        for (int32 CellX = X0; CellX <= X1; ++CellX)
+        {
+            const float TX0 = FMath::Clamp(InMin.X - (float)CellX, 0.0f, 1.0f);
+            const float TY0 = FMath::Clamp(InMin.Y - (float)CellY, 0.0f, 1.0f);
+            const float TZ0 = FMath::Clamp(InMin.Z - (float)CellZ, 0.0f, 1.0f);
+            const float TX1 = FMath::Clamp(InMax.X - (float)CellX, 0.0f, 1.0f);
+            const float TY1 = FMath::Clamp(InMax.Y - (float)CellY, 0.0f, 1.0f);
+            const float TZ1 = FMath::Clamp(InMax.Z - (float)CellZ, 0.0f, 1.0f);
+
+            for (int32 SZ = 0; SZ < Subdivisions; ++SZ)
+            for (int32 SY = 0; SY < Subdivisions; ++SY)
+            for (int32 SX = 0; SX < Subdivisions; ++SX)
+            {
+                const float AX = TX0 + (TX1 - TX0) * (float)SX / Subdivisions;
+                const float BX = TX0 + (TX1 - TX0) * (float)(SX + 1) / Subdivisions;
+                const float AY = TY0 + (TY1 - TY0) * (float)SY / Subdivisions;
+                const float BY = TY0 + (TY1 - TY0) * (float)(SY + 1) / Subdivisions;
+                const float AZ = TZ0 + (TZ1 - TZ0) * (float)SZ / Subdivisions;
+                const float BZ = TZ0 + (TZ1 - TZ0) * (float)(SZ + 1) / Subdivisions;
+
+                const float FX0 = VoxelNoise::Detail::Fade(AX);
+                const float FX1 = VoxelNoise::Detail::Fade(BX);
+                const float FY0 = VoxelNoise::Detail::Fade(AY);
+                const float FY1 = VoxelNoise::Detail::Fade(BY);
+                const float FZ0 = VoxelNoise::Detail::Fade(AZ);
+                const float FZ1 = VoxelNoise::Detail::Fade(BZ);
+                const float WXMin[2] = {1.0f - FX1, FX0};
+                const float WXMax[2] = {1.0f - FX0, FX1};
+                const float WYMin[2] = {1.0f - FY1, FY0};
+                const float WYMax[2] = {1.0f - FY0, FY1};
+                const float WZMin[2] = {1.0f - FZ1, FZ0};
+                const float WZMax[2] = {1.0f - FZ0, FZ1};
+
+                float ValueMin = 0.0f;
+                float ValueMax = 0.0f;
+                for (int32 CZ = 0; CZ < 2; ++CZ)
+                for (int32 CY = 0; CY < 2; ++CY)
+                for (int32 CX = 0; CX < 2; ++CX)
+                {
+                    const FVFInterval Grad = VF_GradDotInterval(
+                        VoxelNoise::Detail::HashCorner(CellX + CX, CellY + CY, CellZ + CZ),
+                        {AX - (float)CX, BX - (float)CX},
+                        {AY - (float)CY, BY - (float)CY},
+                        {AZ - (float)CZ, BZ - (float)CZ});
+                    const FVFInterval Weight = VF_MultiplyNonNegativeInterval(
+                        {WXMin[CX], WXMax[CX]},
+                        VF_MultiplyNonNegativeInterval(
+                            {WYMin[CY], WYMax[CY]}, {WZMin[CZ], WZMax[CZ]}));
+                    const FVFInterval Contribution = VF_MultiplyNonNegativeInterval(Weight, Grad);
+                    ValueMin += Contribution.Min;
+                    ValueMax += Contribution.Max;
+                }
+
+                if (!FMath::IsFinite(ValueMin) || !FMath::IsFinite(ValueMax))
+                {
+                    return VF_PerlinAbsBound;
+                }
+                Bound = FMath::Max(Bound, FMath::Max(FMath::Abs(ValueMin), FMath::Abs(ValueMax)));
+            }
+        }
+
+        // Cover the finite-precision rounding in the nested float lerps.  If the interval proof is
+        // looser than the global theorem, retaining the theorem is both cheaper and safer.
+        Bound += 0.002f;
+        return FMath::Min(FMath::Max(Bound, 0.0f), VF_PerlinAbsBound);
+    }
+
+    FORCEINLINE float VF_PerlinAbsBoundOverWorldBox(
+        float WorldMinX, float WorldMaxX, float WorldMinY, float WorldMaxY,
+        float EffectiveMinZ, float EffectiveMaxZ, float Frequency,
+        float OffsetX, float OffsetY, float OffsetZ)
+    {
+        const float X0 = WorldMinX * Frequency + OffsetX;
+        const float X1 = WorldMaxX * Frequency + OffsetX;
+        const float Y0 = WorldMinY * Frequency + OffsetY;
+        const float Y1 = WorldMaxY * Frequency + OffsetY;
+        const float Z0 = EffectiveMinZ * Frequency + OffsetZ;
+        const float Z1 = EffectiveMaxZ * Frequency + OffsetZ;
+        return VF_PerlinAbsBoundOverBox(
+            FVector3f(FMath::Min(X0, X1), FMath::Min(Y0, Y1), FMath::Min(Z0, Z1)),
+            FVector3f(FMath::Max(X0, X1), FMath::Max(Y0, Y1), FMath::Max(Z0, Z1)));
+    }
 
     // Cellular3D returns 2*(F2-F1)-1 without a clamp. Every searched feature point is at most
     // sqrt(12) from the query's unit cell, so F2-F1 <= sqrt(12) and the positive supremum is
@@ -191,6 +369,74 @@ namespace
         const float DX = FMath::Max3((float)(Box.Min.X - X), 0.0f, (float)(X - Box.Max.X));
         const float DY = FMath::Max3((float)(Box.Min.Y - Y), 0.0f, (float)(Y - Box.Max.Y));
         return FMath::Sqrt(DX * DX + DY * DY);
+    }
+
+    /** Distance from the nearest exact lattice coordinate in one axis to a point. The continuous
+     * box proof uses the interval [BoxMin, BoxMax]; the lattice proof uses only
+     * Origin + integer * Step values inside that interval. Extra is a per-axis displacement
+     * envelope (the cave warp); subtracting it keeps the result conservative. */
+    FORCEINLINE float VF_LatticeAxisDistanceToPoint(
+        float BoxMin, float BoxMax, float Origin, float Step, float Target, float Extra)
+    {
+        if (!(Step > 0.0f) || !FMath::IsFinite(BoxMin) || !FMath::IsFinite(BoxMax)
+            || !FMath::IsFinite(Origin) || !FMath::IsFinite(Target)
+            || BoxMin > BoxMax)
+        {
+            return FLT_MAX;
+        }
+
+        const int32 GMin = FMath::CeilToInt((BoxMin - Origin) / Step - 1.0e-4f);
+        const int32 GMax = FMath::FloorToInt((BoxMax - Origin) / Step + 1.0e-4f);
+        if (GMin > GMax) { return FLT_MAX; }
+
+        const int32 Near = FMath::FloorToInt((Target - Origin) / Step);
+        float Distance = FLT_MAX;
+        auto Consider = [&](int32 G)
+        {
+            G = FMath::Clamp(G, GMin, GMax);
+            Distance = FMath::Min(Distance,
+                FMath::Abs((Origin + static_cast<float>(G) * Step) - Target));
+        };
+        Consider(GMin);
+        Consider(GMax);
+        Consider(Near);
+        Consider(Near + 1);
+        return FMath::Max(0.0f, Distance - FMath::Max(Extra, 0.0f));
+    }
+
+    /** Same discrete distance, but to an axis-aligned interval. */
+    FORCEINLINE float VF_LatticeAxisDistanceToInterval(
+        float BoxMin, float BoxMax, float Origin, float Step,
+        float TargetMin, float TargetMax, float Extra)
+    {
+        if (!(Step > 0.0f) || !FMath::IsFinite(TargetMin) || !FMath::IsFinite(TargetMax)
+            || TargetMin > TargetMax)
+        {
+            return FLT_MAX;
+        }
+
+        const int32 GMin = FMath::CeilToInt((BoxMin - Origin) / Step - 1.0e-4f);
+        const int32 GMax = FMath::FloorToInt((BoxMax - Origin) / Step + 1.0e-4f);
+        if (GMin > GMax) { return FLT_MAX; }
+
+        const int32 NearMin = FMath::FloorToInt((TargetMin - Origin) / Step);
+        const int32 NearMax = FMath::FloorToInt((TargetMax - Origin) / Step);
+        float Distance = FLT_MAX;
+        auto Consider = [&](int32 G)
+        {
+            G = FMath::Clamp(G, GMin, GMax);
+            const float Value = Origin + static_cast<float>(G) * Step;
+            const float Delta = Value < TargetMin ? TargetMin - Value
+                              : Value > TargetMax ? Value - TargetMax : 0.0f;
+            Distance = FMath::Min(Distance, Delta);
+        };
+        Consider(GMin);
+        Consider(GMax);
+        Consider(NearMin);
+        Consider(NearMin + 1);
+        Consider(NearMax);
+        Consider(NearMax + 1);
+        return FMath::Max(0.0f, Distance - FMath::Max(Extra, 0.0f));
     }
 
     FORCEINLINE float VF_SaturatingAdd(float A, float B)
@@ -1631,15 +1877,26 @@ namespace
 
         // The room kills AllSolid; its support slab also kills AllAir. Identity when the room
         // misses the box or the box is wholly outside this strate's safe interior.
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox,
+                                     const FVoxelOpContext& Ctx) const override
         {
-            if (!VoxelPassageGeometry::OriginLandingRoomTouchesBox(
-                    VoxelBox, TopZ, BotZ, Seal, Radius))
+            const bool bRoomTouches = Ctx.bUseLatticeProof
+                ? VoxelPassageGeometry::OriginLandingRoomTouchesLattice(
+                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
+                    TopZ, BotZ, Seal, Radius)
+                : VoxelPassageGeometry::OriginLandingRoomTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, Radius);
+            if (!bRoomTouches)
             {
                 return EVoxelOpEffect::Identity;
             }
-            return VoxelPassageGeometry::OriginLandingFloorTouchesBox(
-                    VoxelBox, TopZ, BotZ, Seal, Radius)
+            const bool bFloorTouches = Ctx.bUseLatticeProof
+                ? VoxelPassageGeometry::OriginLandingFloorTouchesLattice(
+                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
+                    TopZ, BotZ, Seal, Radius)
+                : VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, Radius);
+            return bFloorTouches
                 ? EVoxelOpEffect::Both : EVoxelOpEffect::CarveOnly;
         }
 
@@ -1849,30 +2106,69 @@ namespace
 
         // ≡ la garde `AnyPassageNearBox` écrite à la main dans ClassifyTile — déjà écrite, ici
         // simplement branchée au bon endroit au lieu d'être un cas particulier du classifieur.
-        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
+        EVoxelOpEffect EffectOverBox(const FBox& VoxelBox,
+                                     const FVoxelOpContext& Ctx) const override
         {
             const UVoxelStrateManager* LiveManager = Manager.Get();
             if (!LiveManager) { return EVoxelOpEffect::Identity; }
-            if (VoxelPassageGeometry::OriginLandingFloorTouchesBox(
-                    VoxelBox, TopZ, BotZ, Seal, SpineRadius)
-                || LiveManager->AnyPassageLandingFloorNearBox(VoxelBox.Min, VoxelBox.Max))
+            const bool bOriginFloor = Ctx.bUseLatticeProof
+                ? VoxelPassageGeometry::OriginLandingFloorTouchesLattice(
+                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
+                    TopZ, BotZ, Seal, SpineRadius)
+                : VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                    VoxelBox, TopZ, BotZ, Seal, SpineRadius);
+            const bool bPassageFloor = Ctx.bUseLatticeProof
+                ? LiveManager->AnyPassageLandingFloorNearLattice(
+                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
+                : LiveManager->AnyPassageLandingFloorNearBox(
+                    VoxelBox.Min, VoxelBox.Max);
+            if (bOriginFloor || bPassageFloor)
             {
                 // The room carves air, while its support slab force-writes solid. Both
                 // hypotheses must therefore be killed for a box touching that slab.
                 return EVoxelOpEffect::Both;
             }
-            return LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max)
+            const bool bPassageCarve = Ctx.bUseLatticeProof
+                ? LiveManager->AnyPassageNearLattice(
+                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
+                : LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max);
+            return bPassageCarve
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
 
         // The current-density Lerp/Min passage carve has no finite delta bound for an arbitrary
-        // incoming density.  Keep that honest where it can affect a box, but expose exact identity
-        // for the overwhelmingly common no-passage case.
-        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
+        // incoming density.  Once the preceding stack has proved a positive solid margin,
+        // however, the monotone carve can be bounded exactly on the MC lattice: evaluate the
+        // largest carve factor, apply it to the lower input bound, and keep the resulting positive
+        // margin.  This preserves the old conservative fallback for non-lattice callers.
+        float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
+                              const FVoxelBoxHypotheses& H) const override
         {
-            const EVoxelOpEffect Effect = EffectOverBox(VoxelBox, Ctx);
-            return (Effect == EVoxelOpEffect::CarveOnly || Effect == EVoxelOpEffect::Both)
-                 ? FLT_MAX : 0.0f;
+            const UVoxelStrateManager* LiveManager = Manager.Get();
+            if (!LiveManager) { return 0.0f; }
+            if (!Ctx.bUseLatticeProof)
+            {
+                const EVoxelOpEffect Effect = EffectOverBox(VoxelBox, Ctx);
+                return (Effect == EVoxelOpEffect::CarveOnly || Effect == EVoxelOpEffect::Both)
+                     ? FLT_MAX : 0.0f;
+            }
+
+            const float MaxFactor = LiveManager->MaxPassageCarveFactorNearLattice(
+                VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step);
+            if (!(MaxFactor > 0.0f)) { return 0.0f; }
+            if (!(H.SolidMargin > 0.0f) || !FMath::IsFinite(H.SolidMargin)
+                || !FMath::IsFinite(Base) || !FMath::IsFinite(Seal))
+            {
+                return FLT_MAX;
+            }
+
+            const float AirTarget = -(Base * 2.0f + Seal + 4.0f);
+            if (!FMath::IsFinite(AirTarget)) { return FLT_MAX; }
+            const float LowerAfterCarve = FMath::Min(
+                H.SolidMargin,
+                FMath::Lerp(H.SolidMargin, AirTarget, FMath::Clamp(MaxFactor, 0.0f, 1.0f)));
+            if (!FMath::IsFinite(LowerAfterCarve)) { return FLT_MAX; }
+            return FMath::Max(0.0f, H.SolidMargin - LowerAfterCarve);
         }
 
         float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
@@ -2823,7 +3119,12 @@ namespace
     // share the immutable room graph cache by its complete deterministic input key.  A wider
     // region is safe because BuildChunkCache's collect/store construction is window-invariant;
     // the key still includes every value that can change the graph or its terrain-op rolls.
+    // A coarse tile traverses several deterministic XY search windows while LODs are generated
+    // concurrently.  One mixed table made fine and coarse windows evict one another before the
+    // next tile could reuse them.  Keep a bounded table per region-size class: this is a cache
+    // partition only, not a change to the graph key or to graph construction.
     constexpr int32 RoomGraphCacheSlotCount = 128;
+    constexpr int32 RoomGraphCacheBankCount = 3;
 
     struct FRoomGraphCacheEntry
     {
@@ -2837,10 +3138,19 @@ namespace
         int32 RegionMinX = 0;
         int32 RegionMinY = 0;
         int32 RegionSize = 0;
+        uint32 LastUse = 0;
         FChunkSDFCache Cache;
     };
 
-    static thread_local FRoomGraphCacheEntry GRoomGraphCache[RoomGraphCacheSlotCount];
+    static thread_local FRoomGraphCacheEntry GRoomGraphCache[
+        RoomGraphCacheBankCount][RoomGraphCacheSlotCount];
+    static thread_local uint32 GRoomGraphCacheClock = 0;
+
+    FORCEINLINE int32 RoomGraphCacheBank(int32 RegionSize)
+    {
+        return RegionSize <= CHUNK_SIZE ? 0
+             : (RegionSize <= 2 * CHUNK_SIZE ? 1 : 2);
+    }
 
     FORCEINLINE int32 RoomGraphCacheSlot(
         uint32 Seed, int32 StrateIndex, uint32 ParamsFingerprint, uint32 LayoutVersion,
@@ -2864,17 +3174,22 @@ namespace
         uint64 ManagerLifetimeId, const TArray<FStrateTerrainOpEntry>* TerrainOps,
         int32 RegionMinX, int32 RegionMinY, int32 RegionSize)
     {
+        const int32 Bank = RoomGraphCacheBank(RegionSize);
+        const uint32 Use = ++GRoomGraphCacheClock;
         const int32 StartSlot = RoomGraphCacheSlot(
             Seed, StrateIndex, ParamsFingerprint, LayoutVersion, ManagerLifetimeId,
             RegionMinX, RegionMinY, RegionSize);
         FRoomGraphCacheEntry* ReuseEntry = nullptr;
+        FRoomGraphCacheEntry* LeastRecentlyUsed = nullptr;
         for (int32 Probe = 0; Probe < RoomGraphCacheSlotCount; ++Probe)
         {
-            FRoomGraphCacheEntry& Candidate = GRoomGraphCache[
+            FRoomGraphCacheEntry& Candidate = GRoomGraphCache[Bank][
                 (StartSlot + Probe) & (RoomGraphCacheSlotCount - 1)];
             if (!Candidate.bValid)
             {
-                return ReuseEntry != nullptr ? ReuseEntry : &Candidate;
+                FRoomGraphCacheEntry* Selected = ReuseEntry != nullptr ? ReuseEntry : &Candidate;
+                Selected->LastUse = Use;
+                return Selected;
             }
             if (Candidate.Seed == Seed
                 && Candidate.StrateIndex == StrateIndex
@@ -2886,14 +3201,196 @@ namespace
                 && Candidate.RegionMinY == RegionMinY
                 && Candidate.RegionSize == RegionSize)
             {
+                Candidate.LastUse = Use;
                 return &Candidate;
             }
             if (ReuseEntry == nullptr && Candidate.ManagerLifetimeId != ManagerLifetimeId)
             {
                 ReuseEntry = &Candidate;
             }
+            if (LeastRecentlyUsed == nullptr || Candidate.LastUse < LeastRecentlyUsed->LastUse)
+            {
+                LeastRecentlyUsed = &Candidate;
+            }
         }
-        return ReuseEntry != nullptr ? ReuseEntry : &GRoomGraphCache[StartSlot];
+        FRoomGraphCacheEntry* Selected = ReuseEntry != nullptr
+            ? ReuseEntry : LeastRecentlyUsed;
+        Selected->LastUse = Use;
+        return Selected != nullptr ? Selected : &GRoomGraphCache[Bank][StartSlot];
+    }
+
+    // Classification is dispatched across many workers before most of those workers have
+    // evaluated a density sample.  A thread-local cache prevents races, but it also makes every
+    // worker rebuild the same deterministic collect/NN graph.  Keep a small process-local set of
+    // immutable classifier caches: construction is serialized, publication happens only after
+    // BuildChunkCache has completed, and each consumer holds a shared reference while refining.
+    // This cache never stores mutable manager state; all manager/terrain data are read while the
+    // entry is built and the resulting FChunkSDFCache is read-only thereafter.
+    struct FSharedRoomGraphCacheEntry
+    {
+        uint32 Seed = 0;
+        int32 StrateIndex = INT32_MIN;
+        uint32 ParamsFingerprint = 0xFFFFFFFFu;
+        uint32 LayoutVersion = 0xFFFFFFFFu;
+        uint64 ManagerLifetimeId = 0;
+        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+        int32 RegionMinX = 0;
+        int32 RegionMinY = 0;
+        int32 RegionSize = 0;
+        uint32 LastUse = 0;
+        bool bBuilding = false;
+        FEvent* ReadyEvent = nullptr;
+        TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe> Cache;
+
+        ~FSharedRoomGraphCacheEntry()
+        {
+            if (ReadyEvent != nullptr)
+            {
+                FPlatformProcess::ReturnSynchEventToPool(ReadyEvent);
+            }
+        }
+    };
+
+    static FCriticalSection GSharedRoomGraphCacheMutex;
+    static TArray<TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe>>
+        GSharedRoomGraphCache;
+    static uint32 GSharedRoomGraphCacheClock = 0;
+    constexpr int32 SharedRoomGraphCacheMaxEntries = 128;
+
+    TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> FindOrBuildSharedRoomGraphCache(
+        uint32 Seed, int32 StrateIndex, uint32 ParamsFingerprint, uint32 LayoutVersion,
+        uint64 ManagerLifetimeId, const TArray<FStrateTerrainOpEntry>* TerrainOps,
+        int32 RegionMinX, int32 RegionMinY, int32 RegionSize,
+        float SearchMinX, float SearchMinY, float SearchMaxX, float SearchMaxY,
+        const FStrateGenerationParams& Params)
+    {
+        for (;;)
+        {
+            TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> Entry;
+            bool bBuild = false;
+            {
+                FScopeLock Lock(&GSharedRoomGraphCacheMutex);
+                const uint32 Use = ++GSharedRoomGraphCacheClock;
+                for (const TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe>& Candidate
+                     : GSharedRoomGraphCache)
+                {
+                    if (Candidate->Seed == Seed
+                        && Candidate->StrateIndex == StrateIndex
+                        && Candidate->ParamsFingerprint == ParamsFingerprint
+                        && Candidate->LayoutVersion == LayoutVersion
+                        && Candidate->ManagerLifetimeId == ManagerLifetimeId
+                        && Candidate->TerrainOps == TerrainOps
+                        && Candidate->RegionMinX == RegionMinX
+                        && Candidate->RegionMinY == RegionMinY
+                        && Candidate->RegionSize == RegionSize)
+                    {
+                        Candidate->LastUse = Use;
+                        Entry = Candidate;
+                        break;
+                    }
+                }
+
+                if (!Entry.IsValid())
+                {
+                    Entry = MakeShared<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe>();
+                    Entry->Seed = Seed;
+                    Entry->StrateIndex = StrateIndex;
+                    Entry->ParamsFingerprint = ParamsFingerprint;
+                    Entry->LayoutVersion = LayoutVersion;
+                    Entry->ManagerLifetimeId = ManagerLifetimeId;
+                    Entry->TerrainOps = TerrainOps;
+                    Entry->RegionMinX = RegionMinX;
+                    Entry->RegionMinY = RegionMinY;
+                    Entry->RegionSize = RegionSize;
+                    Entry->LastUse = Use;
+                    Entry->bBuilding = true;
+                    Entry->ReadyEvent = FPlatformProcess::GetSynchEventFromPool(true);
+                    GSharedRoomGraphCache.Add(Entry);
+                    bBuild = true;
+                    if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+                    {
+                        UE_LOG(LogTemp, Warning,
+                               TEXT("[Task4SharedCache] phase=create key=(%u,%d,%u,%u,%llu,%p,%d,%d,%d)"),
+                               Seed, StrateIndex, ParamsFingerprint, LayoutVersion,
+                               (unsigned long long)ManagerLifetimeId, TerrainOps,
+                               RegionMinX, RegionMinY, RegionSize);
+                    }
+                }
+                else if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+                {
+                    UE_LOG(LogTemp, Warning,
+                           TEXT("[Task4SharedCache] phase=found building=%d cache=%d"),
+                           Entry->bBuilding ? 1 : 0, Entry->Cache.IsValid() ? 1 : 0);
+                }
+            }
+
+            if (bBuild)
+            {
+                if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("[Task4SharedCache] phase=build_begin"));
+                }
+                TSharedPtr<FChunkSDFCache, ESPMode::ThreadSafe> BuiltCache =
+                    MakeShared<FChunkSDFCache, ESPMode::ThreadSafe>();
+                VoxelCaveMorphology::BuildChunkCache(
+                    *BuiltCache, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
+                    Params, Seed, StrateIndex, TerrainOps);
+                if (VoxelDensityProfile::AreCountersEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::SdfCacheBuild);
+                }
+
+                if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("[Task4SharedCache] phase=build_done"));
+                }
+
+                {
+                    FScopeLock Lock(&GSharedRoomGraphCacheMutex);
+                    Entry->Cache = BuiltCache;
+                    Entry->bBuilding = false;
+                    Entry->ReadyEvent->Trigger();
+                    if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+                    {
+                        UE_LOG(LogTemp, Warning,
+                               TEXT("[Task4SharedCache] phase=published cache=%d"),
+                               Entry->Cache.IsValid() ? 1 : 0);
+                    }
+                    if (GSharedRoomGraphCache.Num() > SharedRoomGraphCacheMaxEntries)
+                    {
+                        int32 OldestIndex = INDEX_NONE;
+                        for (int32 Index = 0; Index < GSharedRoomGraphCache.Num(); ++Index)
+                        {
+                            const TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe>& Candidate =
+                                GSharedRoomGraphCache[Index];
+                            if (!Candidate->bBuilding
+                                && (OldestIndex == INDEX_NONE
+                                    || Candidate->LastUse
+                                       < GSharedRoomGraphCache[OldestIndex]->LastUse))
+                            {
+                                OldestIndex = Index;
+                            }
+                        }
+                        if (OldestIndex != INDEX_NONE)
+                        {
+                            GSharedRoomGraphCache.RemoveAtSwap(
+                                OldestIndex, 1, EAllowShrinking::No);
+                        }
+                    }
+                }
+                VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint();
+                return Entry;
+            }
+
+            // A different worker is building this exact immutable key.  Waiting on its event
+            // avoids duplicate graph work without serializing unrelated region keys.
+            if (RegionMinX == 0 && RegionMinY == 0 && RegionSize == 128)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[Task4SharedCache] phase=wait"));
+            }
+            Entry->ReadyEvent->Wait();
+        }
     }
 
     //=========================================================================
@@ -2969,6 +3466,13 @@ namespace
 
             /** The unwarped position belonging to the current voxel. */
             FVector LastWorldPosition = FVector::ZeroVector;
+
+            // The common generator tail runs after disturbances.  The tunnel structural posts
+            // already evaluate this immutable result inside the stack; retain the exact same
+            // sample's answer so the tail does not scan the tunnel list a second time.
+            FTunnelCoreWorldEvaluation LastTunnelCoreWorldEvaluation;
+            FVector LastTunnelCoreEvaluationPosition = FVector::ZeroVector;
+            bool bLastTunnelCoreWorldEvaluationValid = false;
 
             // Support-floor projection depends only on XY for one immutable SDF cache.  The
             // mesher traverses Z outside X/Y, so keep a small worker-local LRU of XY boxes rather
@@ -3109,11 +3613,77 @@ namespace
             return P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f;
         }
 
+        const FTunnelSupportFloorColumn* GetSupportColumn(const FVector& Position) const
+        {
+            FState& S = State();
+            const bool bIntegerXY =
+                Position.X == FMath::FloorToFloat(static_cast<float>(Position.X))
+                && Position.Y == FMath::FloorToFloat(static_cast<float>(Position.Y));
+            if (bIntegerXY)
+            {
+                const int32 IX = FMath::FloorToInt(static_cast<float>(Position.X));
+                const int32 IY = FMath::FloorToInt(static_cast<float>(Position.Y));
+                const FChunkSDFCache& Cache = GetCache();
+                FState::FSupportColumnBox& Box = S.SupportColumns.AcquireBox(
+                    IX, IY, &Cache);
+                bool bNewColumn = false;
+                FTunnelSupportFloorColumn* Column = Box.AcquireColumn(
+                    IX, IY, &Cache, S.SupportColumns.Clock, bNewColumn);
+                if (bNewColumn)
+                {
+                    VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                        static_cast<float>(Position.X),
+                        static_cast<float>(Position.Y),
+                        Cache,
+                        *Column);
+                }
+                return Column;
+            }
+
+            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                static_cast<float>(Position.X), static_cast<float>(Position.Y),
+                GetCache(), S.FractionalSupportColumn);
+            return &S.FractionalSupportColumn;
+        }
+
         float GetTunnelCoreSDF() const
         {
-            const FVector& Position = State().LastWorldPosition;
-            return VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
-                Position.X, Position.Y, Position.Z, GetCache());
+            FState& S = State();
+            const FVector& Position = S.LastWorldPosition;
+            const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(Position);
+            S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+                Position.X, Position.Y, Position.Z, GetCache(), SupportColumn);
+            S.LastTunnelCoreEvaluationPosition = Position;
+            S.bLastTunnelCoreWorldEvaluationValid = true;
+            return S.LastTunnelCoreWorldEvaluation.SDF;
+        }
+
+        bool TryGetLastTunnelCoreWorldEvaluation(
+            FTunnelCoreWorldEvaluation& OutEvaluation) const override
+        {
+            FState& S = State();
+            if (!S.bLastTunnelCoreWorldEvaluationValid
+                || S.LastTunnelCoreEvaluationPosition != S.LastWorldPosition)
+            {
+                if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f))
+                {
+                    return false;
+                }
+
+                // The common generator tail runs after EvalMC.  The stack has already evaluated
+                // the graph source for this exact sample, but the native tunnel-core post is
+                // intentionally outside the stack because it must remain after disturbances.  On
+                // demand, publish the one combined result here so the tail can reuse it without
+                // building/scanning a second native cache.
+                const FVector& Position = S.LastWorldPosition;
+                const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(Position);
+                S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+                    Position.X, Position.Y, Position.Z, GetCache(), SupportColumn);
+                S.LastTunnelCoreEvaluationPosition = Position;
+                S.bLastTunnelCoreWorldEvaluationValid = true;
+            }
+            OutEvaluation = S.LastTunnelCoreWorldEvaluation;
+            return true;
         }
 
         /**
@@ -3198,6 +3768,7 @@ namespace
         {
             FState& S = State();
             S.LastWorldPosition = FVector(WorldX, WorldY, WorldZ);
+            S.bLastTunnelCoreWorldEvaluationValid = false;
 
             // ⚠️ REMIS À -1 INCONDITIONNELLEMENT, ce que l'original ne fait pas : chez lui
             // `NearestRoomIdx` est un `thread_local` qui, quand `RoomDensity <= 0`, garde la valeur
@@ -3311,9 +3882,7 @@ namespace
             const int32 SampleStep = FMath::Max(VoxelGenLOD::SampleStep, 1);
             const int32 RegionChunks = SampleStep <= 1
                 ? 1
-                : SampleStep >= 32
-                    ? 4
-                    : FMath::Clamp((SampleStep + 3) / 4, 1, 4);
+                : (SampleStep >= 32 ? 4 : FMath::Clamp((SampleStep + 3) / 4, 1, 4));
             const int32 RegionSize = CHUNK_SIZE * RegionChunks;
             const int32 RegionCellX = FMath::FloorToInt(WorldX / (float)RegionSize);
             const int32 RegionCellY = FMath::FloorToInt(WorldY / (float)RegionSize);
@@ -3466,13 +4035,40 @@ namespace
         struct FBoxState
         {
             FChunkSDFCache Cache;
+            const FChunkSDFCache* ActiveCache = nullptr;
             FBox   KeyBox = FBox(ForceInit);
             int32  KeyStrate = INT32_MIN;
             uint32 KeySeed = 0;
             uint32 KeyFingerprint = 0xFFFFFFFFu;
             uint32 KeyLayout = 0xFFFFFFFFu;
             uint64 KeyManagerLifetimeId = 0;
+            bool   KeyUsesLatticeProof = false;
+            bool   KeyTightenWarpProof = false;
+            FIntVector KeyLatticeOrigin = FIntVector::ZeroValue;
+            int32  KeyLatticeStep = 1;
             bool   bValid = false;
+
+            // A refined tile proof asks the same source about a root box and then many child
+            // boxes.  The morphology cache is window-invariant, so keep the root's superset
+            // cache alive for all children instead of rebuilding the graph once per child.
+            FBox   CacheWindowBox = FBox(ForceInit);
+            int32  CacheWindowStrate = INT32_MIN;
+            uint32 CacheWindowSeed = 0;
+            uint32 CacheWindowFingerprint = 0xFFFFFFFFu;
+            uint32 CacheWindowLayout = 0xFFFFFFFFu;
+            uint64 CacheWindowManagerLifetimeId = 0;
+            const TArray<FStrateTerrainOpEntry>* CacheWindowTerrainOps = nullptr;
+            bool   CacheWindowUsesLatticeProof = false;
+            bool   CacheWindowTightenWarpProof = false;
+            FIntVector CacheWindowLatticeOrigin = FIntVector::ZeroValue;
+            int32  CacheWindowLatticeStep = 1;
+            TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> CacheWindowSharedEntry;
+            int32  CacheWindowSharedRegionMinX = 0;
+            int32  CacheWindowSharedRegionMinY = 0;
+            int32  CacheWindowSharedRegionSize = 0;
+            bool   bCacheWindowUsesShared = false;
+            bool   bCacheWindowValid = false;
+
             EVoxelOpEffect Verdict = EVoxelOpEffect::Both;
             FVoxelBoxSdfInterval SdfInterval;
 
@@ -3492,6 +4088,12 @@ namespace
         {
             thread_local FBoxState S;
             return S;
+        }
+
+        const FChunkSDFCache& GetBoxCache() const
+        {
+            const FBoxState& B = BoxState();
+            return B.ActiveCache != nullptr ? *B.ActiveCache : B.Cache;
         }
 
         /**
@@ -3556,7 +4158,7 @@ namespace
         {
             const FBoxState& B = BoxState();
             if (!B.bValid) { return true; }
-            for (const FCachedRoom& Room : B.Cache.Rooms)
+            for (const FCachedRoom& Room : GetBoxCache().Rooms)
             {
                 if (Room.RoomOp != nullptr) { return true; }
             }
@@ -3566,7 +4168,7 @@ namespace
         bool HasRoomColumnsForLastBox() const
         {
             const FBoxState& B = BoxState();
-            return !B.bValid || B.Cache.Columns.Num() > 0;
+            return !B.bValid || GetBoxCache().Columns.Num() > 0;
         }
 
         float RoomColumnFillSupremumForLastBox() const
@@ -3575,7 +4177,7 @@ namespace
             if (!B.bValid) { return FLT_MAX; }
 
             float Supremum = 0.0f;
-            for (const FCachedColumn& Column : B.Cache.Columns)
+            for (const FCachedColumn& Column : GetBoxCache().Columns)
             {
                 if (!FMath::IsFinite(Column.BaseDensity) || Column.BaseDensity < 0.0f)
                 {
@@ -3607,7 +4209,7 @@ namespace
             float Supremum = 0.0f;
             const float BoxMinZ = static_cast<float>(B.KeyBox.Min.Z);
             if (!FMath::IsFinite(BoxMinZ)) { return FLT_MAX; }
-            for (const FCachedRoom& Room : B.Cache.Rooms)
+            for (const FCachedRoom& Room : GetBoxCache().Rooms)
             {
                 const float CenterZ = static_cast<float>(Room.Center.Z);
                 const float RadiusZ = Room.RadiusZ;
@@ -3643,10 +4245,30 @@ namespace
         {
             FBoxState& B = BoxState();
             const UVoxelStrateManager* LiveManager = Manager.Get();
+            const bool bTask4SourceProbe = Ctx.bUseLatticeProof
+                && Ctx.LatticeOriginVoxels == FIntVector(32, 0, -32)
+                && Ctx.Step == 1;
+            const uint64 Task4SourceStartCycles = bTask4SourceProbe
+                ? FPlatformTime::Cycles64() : 0;
+            if (bTask4SourceProbe)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4SourceProbe] phase=enter box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) tight=%d"),
+                       (float)VoxelBox.Min.X, (float)VoxelBox.Min.Y, (float)VoxelBox.Min.Z,
+                       (float)VoxelBox.Max.X, (float)VoxelBox.Max.Y, (float)VoxelBox.Max.Z,
+                       Ctx.bTightenWarpProof ? 1 : 0);
+            }
 
             auto Unknown = [&]()
             {
                 B.bValid = false;
+                B.ActiveCache = nullptr;
+                B.CacheWindowSharedEntry.Reset();
+                B.CacheWindowSharedRegionMinX = 0;
+                B.CacheWindowSharedRegionMinY = 0;
+                B.CacheWindowSharedRegionSize = 0;
+                B.bCacheWindowUsesShared = false;
+                B.bCacheWindowValid = false;
                 B.SdfInterval.SetUnknown();
                 InOut.SetUnknown();
             };
@@ -3695,6 +4317,10 @@ namespace
             if (!(P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f))
             {
                 B.bValid = false;
+                B.ActiveCache = nullptr;
+                B.CacheWindowSharedEntry.Reset();
+                B.bCacheWindowUsesShared = false;
+                B.bCacheWindowValid = false;
                 B.NumRooms = B.NumTunnels = B.NumPits = B.NumChimneys = 0;
                 B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
                 B.HitRoomsNoWarp = B.HitTunnelsNoWarp = 0;
@@ -3722,7 +4348,19 @@ namespace
             const int64 SpanX = (int64)CX1 - (int64)CX0 + 1;
             const int64 SpanY = (int64)CY1 - (int64)CY0 + 1;
             const int64 SpanZ = (int64)CZ1 - (int64)CZ0 + 1;
-            if (SpanX <= 0 || SpanY <= 0 || SpanZ <= 0 || SpanX * SpanY * SpanZ > 64)
+            if (SpanX <= 0 || SpanY <= 0 || SpanZ <= 0)
+            {
+                Unknown();
+                return;
+            }
+
+            // The ordinary (non-lattice) proof keeps its original bounded query contract.  A
+            // tile proof is different: its first query is the root box and its descendants are
+            // all inside that box.  Build the root cache once even when the root spans more than
+            // 64 chunk keys, then let the bounded child boxes use that same superset.  This is
+            // what prevents a step-32 tile from paying one graph bake per coarse sample.
+            constexpr int64 MaxNonLatticeChunkSpan = 64;
+            if (!Ctx.bUseLatticeProof && SpanX * SpanY * SpanZ > MaxNonLatticeChunkSpan)
             {
                 Unknown();
                 return;
@@ -3762,38 +4400,255 @@ namespace
                 if (Def0) { TerrainOps = &Def0->TerrainOperations; }
             }
 
+            if (bTask4SourceProbe)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4SourceProbe] phase=layout box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) chunks=(%d,%d,%d)-(%d,%d,%d) strate=%d"),
+                       BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                       CX0, CY0, CZ0, CX1, CY1, CZ1, StrateIdx);
+            }
+
             const uint32 LV = Ctx.LayoutVersion;
+            auto IsSharedCacheCurrent = [&]() -> bool
+            {
+                const FSharedRoomGraphCacheEntry* Entry = B.CacheWindowSharedEntry.Get();
+                return Entry != nullptr
+                    && Entry->Seed == SeedU
+                    && Entry->StrateIndex == StrateIdx
+                    && Entry->ParamsFingerprint == ParamsFingerprint
+                    && Entry->LayoutVersion == LayoutVersion
+                    && Entry->ManagerLifetimeId == ManagerLifetimeId
+                    && Entry->TerrainOps == TerrainOps
+                    && Entry->RegionMinX == B.CacheWindowSharedRegionMinX
+                    && Entry->RegionMinY == B.CacheWindowSharedRegionMinY
+                    && Entry->RegionSize == B.CacheWindowSharedRegionSize;
+            };
             if (B.bValid && B.KeyBox == VoxelBox && B.KeyStrate == StrateIdx
                 && B.KeySeed == SeedU && B.KeyFingerprint == ParamsFingerprint && B.KeyLayout == LV
-                && B.KeyManagerLifetimeId == ManagerLifetimeId)
+                && B.KeyManagerLifetimeId == ManagerLifetimeId
+                && B.KeyUsesLatticeProof == Ctx.bUseLatticeProof
+                && (!B.bCacheWindowUsesShared || IsSharedCacheCurrent())
+                && B.KeyTightenWarpProof == Ctx.bTightenWarpProof
+                && (!Ctx.bUseLatticeProof
+                    || (B.KeyLatticeOrigin == Ctx.LatticeOriginVoxels
+                        && B.KeyLatticeStep == Ctx.Step)))
             {
+                if (bTask4SourceProbe)
+                {
+                    UE_LOG(LogTemp, Warning,
+                           TEXT("[Task4SourceProbe] phase=box_cache_hit box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) ms=%.3f"),
+                           BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                           FPlatformTime::ToMilliseconds64(
+                               FPlatformTime::Cycles64() - Task4SourceStartCycles));
+                }
                 InOut = B.SdfInterval;
                 return;
             }
-
-            const float Warp = (P.CaveWarpStrength > 0.0f)
-                             ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
-                             : 0.0f;
-            if (!Finite(Warp))
-            {
-                Unknown();
-                return;
-            }
-
-            // The search window is a superset of every warped point in the box, with the same
-            // two-voxel gradient margin used by Eval's cache path.
-            VoxelCaveMorphology::BuildChunkCache(
-                B.Cache,
-                BoxMinX - Warp - 2.0f, BoxMinY - Warp - 2.0f,
-                BoxMaxX + Warp + 2.0f, BoxMaxY + Warp + 2.0f,
-                P, SeedU, StrateIdx, TerrainOps);
 
             const float EffectiveMinZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
                                       ? BoxMinZ / P.VerticalScale : BoxMinZ;
             const float EffectiveMaxZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
                                       ? BoxMaxZ / P.VerticalScale : BoxMaxZ;
-            const FVector QMin(BoxMinX - Warp, BoxMinY - Warp, EffectiveMinZ - Warp);
-            const FVector QMax(BoxMaxX + Warp, BoxMaxY + Warp, EffectiveMaxZ + Warp);
+            const float GlobalWarp = (P.CaveWarpStrength > 0.0f)
+                                   ? P.CaveWarpStrength * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
+                                   : 0.0f;
+            if (!Finite(GlobalWarp) || !Finite(EffectiveMinZ) || !Finite(EffectiveMaxZ))
+            {
+                Unknown();
+                return;
+            }
+
+            FVector WarpEnvelope(GlobalWarp, GlobalWarp, GlobalWarp);
+            if (Ctx.bTightenWarpProof && P.CaveWarpStrength > 0.0f
+                && P.CaveWarpFrequency > 0.0f)
+            {
+                const float WarpAmplitude = P.CaveWarpStrength * VOXEL_NOISE_SCALE;
+                WarpEnvelope.X = WarpAmplitude * VF_PerlinAbsBoundOverWorldBox(
+                    BoxMinX, BoxMaxX, BoxMinY, BoxMaxY, EffectiveMinZ, EffectiveMaxZ,
+                    P.CaveWarpFrequency, VoxelHash::SeedOffset(SeedU, 0.37f), 1.3f, 5.7f);
+                WarpEnvelope.Y = WarpAmplitude * VF_PerlinAbsBoundOverWorldBox(
+                    BoxMinX, BoxMaxX, BoxMinY, BoxMaxY, EffectiveMinZ, EffectiveMaxZ,
+                    P.CaveWarpFrequency, 7.1f, VoxelHash::SeedOffset(SeedU, 0.59f), 2.3f);
+                WarpEnvelope.Z = WarpAmplitude * VF_PerlinAbsBoundOverWorldBox(
+                    BoxMinX, BoxMaxX, BoxMinY, BoxMaxY, EffectiveMinZ, EffectiveMaxZ,
+                    P.CaveWarpFrequency, 11.3f, 9.7f, VoxelHash::SeedOffset(SeedU, 0.41f));
+                if (!Finite((float)WarpEnvelope.X) || !Finite((float)WarpEnvelope.Y)
+                    || !Finite((float)WarpEnvelope.Z))
+                {
+                    Unknown();
+                    return;
+                }
+            }
+
+            // The search window is a superset of every warped point in the box, with the same
+            // two-voxel gradient margin used by Eval's cache path.  In lattice mode, retain the
+            // first/root window and reuse it for every refined child.  A larger morphology
+            // window is sound for a child because BuildChunkCache's collect/store contract is
+            // explicitly window-invariant; it is also the only way to keep refinement from
+            // turning into one graph build per child box.
+            const bool bWindowKeyMatches = B.bCacheWindowValid
+                && B.CacheWindowStrate == StrateIdx
+                && B.CacheWindowSeed == SeedU
+                && B.CacheWindowFingerprint == ParamsFingerprint
+                && B.CacheWindowLayout == LV
+                && B.CacheWindowManagerLifetimeId == ManagerLifetimeId
+                && B.CacheWindowTerrainOps == TerrainOps
+                && B.CacheWindowUsesLatticeProof == Ctx.bUseLatticeProof
+                // A non-tight cache is built from the global warp envelope and is therefore a
+                // superset cache for a later tight retry.  The reverse is not safe: a tight cache
+                // may omit primitives needed by the conservative global-envelope query.
+                && (!Ctx.bUseLatticeProof
+                    // Tight queries may use either an equally tight cache or the larger global
+                    // envelope cache. A global query must not reuse a tight cache.
+                    || Ctx.bTightenWarpProof
+                    || !B.CacheWindowTightenWarpProof)
+                 && (!Ctx.bUseLatticeProof
+                     || (B.CacheWindowLatticeOrigin == Ctx.LatticeOriginVoxels
+                         && B.CacheWindowLatticeStep == Ctx.Step))
+                 && (!B.bCacheWindowUsesShared || IsSharedCacheCurrent())
+                 && B.CacheWindowBox.Min.X <= BoxMinX
+                && B.CacheWindowBox.Min.Y <= BoxMinY
+                && B.CacheWindowBox.Min.Z <= BoxMinZ
+                && B.CacheWindowBox.Max.X >= BoxMaxX
+                && B.CacheWindowBox.Max.Y >= BoxMaxY
+                && B.CacheWindowBox.Max.Z >= BoxMaxZ;
+
+            if (!bWindowKeyMatches)
+            {
+                B.ActiveCache = nullptr;
+                B.CacheWindowSharedEntry.Reset();
+                B.CacheWindowSharedRegionMinX = 0;
+                B.CacheWindowSharedRegionMinY = 0;
+                B.CacheWindowSharedRegionSize = 0;
+                B.bCacheWindowUsesShared = false;
+
+                // The morphology builder is window-invariant.  For the bounded lattice boxes,
+                // reuse the worker-local graph cache used by Eval, but at a 128/256-voxel region
+                // granularity.  A classifier root otherwise rebuilds the same collect/NN graph
+                // for every neighbouring tile before the regular density path has a chance to
+                // populate its cache.  The shared window is always built from the global warp
+                // envelope, so it is a superset of this tight query and can only add conservative
+                // primitives to the interval.
+                bool bUsedSharedCache = false;
+                if (Ctx.bUseLatticeProof && SpanX <= 8 && SpanY <= 8)
+                {
+                    int32 SharedRegionSize = 4 * CHUNK_SIZE;
+                    int32 SharedRegionMinX = 0;
+                    int32 SharedRegionMinY = 0;
+                    bool bCoversBox = false;
+                    for (int32 Attempt = 0; Attempt < 3; ++Attempt)
+                    {
+                        SharedRegionMinX = FMath::FloorToInt(
+                            BoxMinX / (float)SharedRegionSize) * SharedRegionSize;
+                        SharedRegionMinY = FMath::FloorToInt(
+                            BoxMinY / (float)SharedRegionSize) * SharedRegionSize;
+                        bCoversBox = BoxMaxX <= (float)(SharedRegionMinX + SharedRegionSize)
+                            && BoxMaxY <= (float)(SharedRegionMinY + SharedRegionSize);
+                        if (bCoversBox) { break; }
+                        SharedRegionSize *= 2;
+                    }
+
+                    if (bCoversBox && SharedRegionSize <= 8 * CHUNK_SIZE)
+                    {
+                        const float Expansion = FMath::Abs(P.CaveWarpStrength)
+                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f;
+                        if (bTask4SourceProbe)
+                        {
+                            UE_LOG(LogTemp, Warning,
+                                   TEXT("[Task4SourceProbe] phase=shared_begin region=(%d,%d,%d) ms=%.3f"),
+                                   SharedRegionMinX, SharedRegionMinY, SharedRegionSize,
+                                   FPlatformTime::ToMilliseconds64(
+                                       FPlatformTime::Cycles64() - Task4SourceStartCycles));
+                        }
+                        TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> SharedCache =
+                            FindOrBuildSharedRoomGraphCache(
+                                SeedU, StrateIdx, ParamsFingerprint, LayoutVersion,
+                                ManagerLifetimeId, TerrainOps,
+                                SharedRegionMinX, SharedRegionMinY, SharedRegionSize,
+                                (float)SharedRegionMinX - Expansion,
+                                (float)SharedRegionMinY - Expansion,
+                                (float)(SharedRegionMinX + SharedRegionSize) + Expansion,
+                                (float)(SharedRegionMinY + SharedRegionSize) + Expansion,
+                                P);
+                        B.ActiveCache = SharedCache->Cache.Get();
+                        B.CacheWindowSharedEntry = SharedCache;
+                        B.CacheWindowSharedRegionMinX = SharedRegionMinX;
+                        B.CacheWindowSharedRegionMinY = SharedRegionMinY;
+                        B.CacheWindowSharedRegionSize = SharedRegionSize;
+                        B.bCacheWindowUsesShared = true;
+                        bUsedSharedCache = true;
+                        if (bTask4SourceProbe)
+                        {
+                            UE_LOG(LogTemp, Warning,
+                                   TEXT("[Task4SourceProbe] phase=shared_ready box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) ms=%.3f rooms=%d tunnels=%d"),
+                                   BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                                   FPlatformTime::ToMilliseconds64(
+                                       FPlatformTime::Cycles64() - Task4SourceStartCycles),
+                                   SharedCache->Cache->Rooms.Num(), SharedCache->Cache->Tunnels.Num());
+                        }
+                    }
+                }
+
+                if (!bUsedSharedCache)
+                {
+                    VoxelCaveMorphology::BuildChunkCache(
+                        B.Cache,
+                        BoxMinX - (float)WarpEnvelope.X - 2.0f,
+                        BoxMinY - (float)WarpEnvelope.Y - 2.0f,
+                        BoxMaxX + (float)WarpEnvelope.X + 2.0f,
+                        BoxMaxY + (float)WarpEnvelope.Y + 2.0f,
+                        P, SeedU, StrateIdx, TerrainOps);
+                    B.ActiveCache = &B.Cache;
+                }
+
+                B.CacheWindowBox = VoxelBox;
+                B.CacheWindowStrate = StrateIdx;
+                B.CacheWindowSeed = SeedU;
+                B.CacheWindowFingerprint = ParamsFingerprint;
+                B.CacheWindowLayout = LV;
+                B.CacheWindowManagerLifetimeId = ManagerLifetimeId;
+                B.CacheWindowTerrainOps = TerrainOps;
+                B.CacheWindowUsesLatticeProof = Ctx.bUseLatticeProof;
+                B.CacheWindowTightenWarpProof = bUsedSharedCache
+                    ? false : Ctx.bTightenWarpProof;
+                B.CacheWindowLatticeOrigin = Ctx.LatticeOriginVoxels;
+                B.CacheWindowLatticeStep = Ctx.Step;
+                B.bCacheWindowValid = true;
+            }
+            else if (B.bCacheWindowUsesShared)
+            {
+                B.ActiveCache = B.CacheWindowSharedEntry->Cache.Get();
+            }
+
+            // Large root boxes are only a cache warm-up.  Their interval is intentionally still
+            // unknown; proof resumes at bounded descendants where all bounds below are finite.
+            if (SpanX * SpanY * SpanZ > 64)
+            {
+                // Keep the freshly built window alive for the descendants.  This is deliberately
+                // different from Unknown(): the root is not invalid, it is merely too large to
+                // publish a finite interval in one pass.
+                B.bValid = false;
+                B.SdfInterval.SetUnknown();
+                InOut.SetUnknown();
+                return;
+            }
+
+            if (bTask4SourceProbe)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4SourceProbe] phase=bounded box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) ms=%.3f rooms=%d tunnels=%d"),
+                       BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                       FPlatformTime::ToMilliseconds64(
+                           FPlatformTime::Cycles64() - Task4SourceStartCycles),
+                       GetBoxCache().Rooms.Num(), GetBoxCache().Tunnels.Num());
+            }
+
+            const FVector QMin(BoxMinX - (float)WarpEnvelope.X,
+                               BoxMinY - (float)WarpEnvelope.Y,
+                               EffectiveMinZ - (float)WarpEnvelope.Z);
+            const FVector QMax(BoxMaxX + (float)WarpEnvelope.X,
+                               BoxMaxY + (float)WarpEnvelope.Y,
+                               EffectiveMaxZ + (float)WarpEnvelope.Z);
             const FVector RMin(BoxMinX, BoxMinY, BoxMinZ);
             const FVector RMax(BoxMaxX, BoxMaxY, BoxMaxZ);
             if (!Finite((float)QMin.X) || !Finite((float)QMin.Y) || !Finite((float)QMin.Z)
@@ -3803,13 +4658,743 @@ namespace
                 return;
             }
 
+            // In lattice mode the queried box is a proof domain for the exact MC samples, not
+            // for every continuous point between them.  The room/tunnel bounds below therefore
+            // use the nearest lattice coordinate in each axis and subtract the same per-axis warp
+            // envelope as the continuous proof.  A sub-box containing no lattice point has no
+            // samples to constrain and contributes the exact SDF identity.
+            const bool bUseLatticeProof = Ctx.bUseLatticeProof;
+            const float LatticeOriginX = static_cast<float>(Ctx.LatticeOriginVoxels.X);
+            const float LatticeOriginY = static_cast<float>(Ctx.LatticeOriginVoxels.Y);
+            const float LatticeOriginZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
+                ? static_cast<float>(Ctx.LatticeOriginVoxels.Z) / P.VerticalScale
+                : static_cast<float>(Ctx.LatticeOriginVoxels.Z);
+            const float LatticeStepXY = static_cast<float>(Ctx.Step);
+            const float LatticeStepZ = (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
+                ? static_cast<float>(Ctx.Step) / P.VerticalScale
+                : static_cast<float>(Ctx.Step);
+            if (bUseLatticeProof)
+            {
+                auto HasAxisSample = [](float Min, float Max, float Origin, float Step) -> bool
+                {
+                    return Step > 0.0f
+                        && FMath::CeilToInt((Min - Origin) / Step - 1.0e-4f)
+                           <= FMath::FloorToInt((Max - Origin) / Step + 1.0e-4f);
+                };
+                if (!HasAxisSample(BoxMinX, BoxMaxX, LatticeOriginX, LatticeStepXY)
+                    || !HasAxisSample(BoxMinY, BoxMaxY, LatticeOriginY, LatticeStepXY)
+                    || !HasAxisSample(BoxMinZ, BoxMaxZ, LatticeOriginZ, LatticeStepZ))
+                {
+                    B.bValid = false;
+                    B.ActiveCache = nullptr;
+                B.CacheWindowSharedEntry.Reset();
+                    B.bCacheWindowUsesShared = false;
+                    B.bCacheWindowValid = false;
+                    B.SdfInterval.Set(FLT_MAX, FLT_MAX);
+                    InOut = B.SdfInterval;
+                    return;
+                }
+            }
+
+            // A tight retry is a proof over the exact lattice the mesher will read.  Keep both
+            // coordinate spaces: the room graph is queried in warped SDF space, while pits and
+            // chimneys deliberately use the original world-space sample.  The old implementation
+            // retained only an AABB at LOD0; that still admitted a tunnel when the warped samples
+            // themselves missed it.  The exact primitive minima below remove that false overlap
+            // without changing the lattice or the density evaluator used by the mesher.
+            TArray<FVector> ExactLatticeWarpedQueries;
+            TArray<FVector> ExactLatticeWorldQueries;
+            FVector ExactLatticeQueryMin(FLT_MAX, FLT_MAX, FLT_MAX);
+            FVector ExactLatticeQueryMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            int32 ExactIX0 = 0, ExactIY0 = 0, ExactIZ0 = 0;
+            int32 ExactNX = 0, ExactNY = 0, ExactNZ = 0;
+            struct FExactLatticeBlock
+            {
+                int32 IX0 = 0, IX1 = -1;
+                int32 IY0 = 0, IY1 = -1;
+                int32 IZ0 = 0, IZ1 = -1;
+                FVector WarpedMin = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+                FVector WarpedMax = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                FVector WorldMin = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+                FVector WorldMax = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            };
+            TArray<FExactLatticeBlock, TInlineAllocator<128>> ExactLatticeBlocks;
+            const float MaxBoxExtent = FMath::Max3(
+                BoxMaxX - BoxMinX, BoxMaxY - BoxMinY, BoxMaxZ - BoxMinZ);
+            const float ExactChildExtent = 16.0f * (float)FMath::Max(Ctx.Step, 1);
+            const bool bTryExactLatticeWarp = bUseLatticeProof && Ctx.bTightenWarpProof
+                // The root is a cache warm-up.  Exact warped lattice distances are only needed
+                // once the refinement has reduced the domain to a child; this avoids rebuilding
+                // a 33^3 query list before the eight 17^3 child proofs that actually decide the
+                // residual solid tile.  A non-exact root remains conservative and cannot create a
+                // skip on its own.
+                // Strictly smaller excludes the tile root when it is exactly one coarse child
+                // wide (the common 16-cell LOD0 case).  The root is only a cache warm-up; doing
+                // a full 17^3 warped-query scan there paid the expensive exact primitive loop
+                // once per empty tile before refinement had had a chance to narrow the box.
+                && MaxBoxExtent < ExactChildExtent;
+            if (bTryExactLatticeWarp)
+            {
+                 const int32 IX0 = FMath::CeilToInt(
+                    (BoxMinX - LatticeOriginX) / LatticeStepXY - 1.0e-4f);
+                const int32 IY0 = FMath::CeilToInt(
+                    (BoxMinY - LatticeOriginY) / LatticeStepXY - 1.0e-4f);
+                const int32 IZ0 = FMath::CeilToInt(
+                    (BoxMinZ - static_cast<float>(Ctx.LatticeOriginVoxels.Z))
+                    / static_cast<float>(Ctx.Step) - 1.0e-4f);
+                const int32 IX1 = FMath::FloorToInt(
+                    (BoxMaxX - LatticeOriginX) / LatticeStepXY + 1.0e-4f);
+                const int32 IY1 = FMath::FloorToInt(
+                    (BoxMaxY - LatticeOriginY) / LatticeStepXY + 1.0e-4f);
+                const int32 IZ1 = FMath::FloorToInt(
+                    (BoxMaxZ - static_cast<float>(Ctx.LatticeOriginVoxels.Z))
+                    / static_cast<float>(Ctx.Step) + 1.0e-4f);
+                const int64 Count = ((int64)IX1 - IX0 + 1)
+                                 * ((int64)IY1 - IY0 + 1)
+                                 * ((int64)IZ1 - IZ0 + 1);
+                 if (IX1 >= IX0 && IY1 >= IY0 && IZ1 >= IZ0
+                     && Count > 0 && Count <= 100000)
+                 {
+                    ExactIX0 = IX0;
+                    ExactIY0 = IY0;
+                    ExactIZ0 = IZ0;
+                    ExactNX = IX1 - IX0 + 1;
+                    ExactNY = IY1 - IY0 + 1;
+                    ExactNZ = IZ1 - IZ0 + 1;
+                    ExactLatticeWarpedQueries.Reserve(static_cast<int32>(Count));
+                    ExactLatticeWorldQueries.Reserve(static_cast<int32>(Count));
+                    const float WorldOriginZ = static_cast<float>(Ctx.LatticeOriginVoxels.Z);
+                    const float WarpAmplitude = P.CaveWarpStrength * VOXEL_NOISE_SCALE;
+                    for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+                    for (int32 IY = IY0; IY <= IY1; ++IY)
+                    for (int32 IX = IX0; IX <= IX1; ++IX)
+                    {
+                        const float WorldX = LatticeOriginX + (float)IX * LatticeStepXY;
+                        const float WorldY = LatticeOriginY + (float)IY * LatticeStepXY;
+                        const float WorldZ = WorldOriginZ + (float)IZ * (float)Ctx.Step;
+                        const float EffectiveZ = (P.VerticalScale > 0.0f
+                                                  && P.VerticalScale != 1.0f)
+                                               ? WorldZ / P.VerticalScale : WorldZ;
+                        ExactLatticeWorldQueries.Add(FVector(WorldX, WorldY, WorldZ));
+                        FVector Query(WorldX, WorldY, EffectiveZ);
+                        if (P.CaveWarpStrength > 0.0f)
+                        {
+                            const float Frequency = P.CaveWarpFrequency;
+                            Query.X += VoxelNoise::Perlin3D(
+                                WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 0.37f),
+                                WorldY * Frequency + 1.3f,
+                                EffectiveZ * Frequency + 5.7f) * WarpAmplitude;
+                            Query.Y += VoxelNoise::Perlin3D(
+                                WorldX * Frequency + 7.1f,
+                                WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 0.59f),
+                                EffectiveZ * Frequency + 2.3f) * WarpAmplitude;
+                            Query.Z += VoxelNoise::Perlin3D(
+                                WorldX * Frequency + 11.3f,
+                                WorldY * Frequency + 9.7f,
+                                EffectiveZ * Frequency + VoxelHash::SeedOffset(SeedU, 0.41f))
+                                * WarpAmplitude;
+                        }
+                        ExactLatticeWarpedQueries.Add(Query);
+                        ExactLatticeQueryMin.X = FMath::Min(ExactLatticeQueryMin.X, (float)Query.X);
+                        ExactLatticeQueryMin.Y = FMath::Min(ExactLatticeQueryMin.Y, (float)Query.Y);
+                        ExactLatticeQueryMin.Z = FMath::Min(ExactLatticeQueryMin.Z, (float)Query.Z);
+                        ExactLatticeQueryMax.X = FMath::Max(ExactLatticeQueryMax.X, (float)Query.X);
+                        ExactLatticeQueryMax.Y = FMath::Max(ExactLatticeQueryMax.Y, (float)Query.Y);
+                        ExactLatticeQueryMax.Z = FMath::Max(ExactLatticeQueryMax.Z, (float)Query.Z);
+                    }
+
+                    constexpr int32 BlockAxisSize = 2;
+                    ExactLatticeBlocks.Reserve(
+                        ((ExactNX + BlockAxisSize - 1) / BlockAxisSize)
+                        * ((ExactNY + BlockAxisSize - 1) / BlockAxisSize)
+                        * ((ExactNZ + BlockAxisSize - 1) / BlockAxisSize));
+                    for (int32 IZBlock = ExactIZ0; IZBlock <= IZ1; IZBlock += BlockAxisSize)
+                    for (int32 IYBlock = ExactIY0; IYBlock <= IY1; IYBlock += BlockAxisSize)
+                    for (int32 IXBlock = ExactIX0; IXBlock <= IX1; IXBlock += BlockAxisSize)
+                    {
+                        FExactLatticeBlock& Block = ExactLatticeBlocks.AddDefaulted_GetRef();
+                        Block.IX0 = IXBlock;
+                        Block.IX1 = FMath::Min(IXBlock + BlockAxisSize, IX1);
+                        Block.IY0 = IYBlock;
+                        Block.IY1 = FMath::Min(IYBlock + BlockAxisSize, IY1);
+                        Block.IZ0 = IZBlock;
+                        Block.IZ1 = FMath::Min(IZBlock + BlockAxisSize, IZ1);
+                        for (int32 IZ = Block.IZ0; IZ <= Block.IZ1; ++IZ)
+                        for (int32 IY = Block.IY0; IY <= Block.IY1; ++IY)
+                        for (int32 IX = Block.IX0; IX <= Block.IX1; ++IX)
+                        {
+                            const int32 FlatIndex =
+                                ((IZ - ExactIZ0) * ExactNY + (IY - ExactIY0)) * ExactNX
+                                + (IX - ExactIX0);
+                            const FVector& Query = ExactLatticeWarpedQueries[FlatIndex];
+                            const FVector& World = ExactLatticeWorldQueries[FlatIndex];
+                            Block.WarpedMin.X = FMath::Min(Block.WarpedMin.X, (float)Query.X);
+                            Block.WarpedMin.Y = FMath::Min(Block.WarpedMin.Y, (float)Query.Y);
+                            Block.WarpedMin.Z = FMath::Min(Block.WarpedMin.Z, (float)Query.Z);
+                            Block.WarpedMax.X = FMath::Max(Block.WarpedMax.X, (float)Query.X);
+                            Block.WarpedMax.Y = FMath::Max(Block.WarpedMax.Y, (float)Query.Y);
+                            Block.WarpedMax.Z = FMath::Max(Block.WarpedMax.Z, (float)Query.Z);
+                            Block.WorldMin.X = FMath::Min(Block.WorldMin.X, (float)World.X);
+                            Block.WorldMin.Y = FMath::Min(Block.WorldMin.Y, (float)World.Y);
+                            Block.WorldMin.Z = FMath::Min(Block.WorldMin.Z, (float)World.Z);
+                            Block.WorldMax.X = FMath::Max(Block.WorldMax.X, (float)World.X);
+                            Block.WorldMax.Y = FMath::Max(Block.WorldMax.Y, (float)World.Y);
+                            Block.WorldMax.Z = FMath::Max(Block.WorldMax.Z, (float)World.Z);
+                        }
+                    }
+                }
+            }
+
+            const bool bUseExactLatticeWarp = ExactLatticeWarpedQueries.Num() > 0;
+            const bool bUseExactLatticeBox = !bUseExactLatticeWarp
+                && ExactLatticeQueryMin.X <= ExactLatticeQueryMax.X
+                && ExactLatticeQueryMin.Y <= ExactLatticeQueryMax.Y
+                && ExactLatticeQueryMin.Z <= ExactLatticeQueryMax.Z;
+            bool bInvalidBound = false;
+            float ExactSdfLower = FLT_MAX;
+            float CheapSdfLower = FLT_MAX;
+            int32 ExactRoomRefinements = 0;
+            int32 ExactJoinRefinements = 0;
+            int32 ExactTunnelRefinements = 0;
+            int32 ExactPitRefinements = 0;
+            int32 ExactChimneyRefinements = 0;
+
+            auto ExactLatticePointDistance = [&](const FVector& Target) -> float
+            {
+                float Distance = FLT_MAX;
+                for (const FVector& Query : ExactLatticeWarpedQueries)
+                {
+                    Distance = FMath::Min(Distance, (float)FVector::Dist(Query, Target));
+                }
+                return FMath::Max(0.0f, Distance - 0.001f);
+            };
+
+            auto ExactLatticeBoxDistance = [&](const FVector& TargetMin,
+                                               const FVector& TargetMax) -> float
+            {
+                float Distance = FLT_MAX;
+                for (const FVector& Query : ExactLatticeWarpedQueries)
+                {
+                    Distance = FMath::Min(
+                        Distance, VF_DistanceBetweenBoxes(Query, Query, TargetMin, TargetMax));
+                }
+                return FMath::Max(0.0f, Distance - 0.001f);
+            };
+
+            auto ForEachExactQueryInWorldBox = [&](const FVector& WorldMin,
+                                                   const FVector& WorldMax,
+                                                   auto&& Callback)
+            {
+                if (ExactNX <= 0 || ExactNY <= 0 || ExactNZ <= 0) { return; }
+                const int32 IX0 = FMath::Max(
+                    ExactIX0,
+                    FMath::CeilToInt(
+                        (WorldMin.X - LatticeOriginX) / LatticeStepXY - 1.0e-4f));
+                const int32 IY0 = FMath::Max(
+                    ExactIY0,
+                    FMath::CeilToInt(
+                        (WorldMin.Y - LatticeOriginY) / LatticeStepXY - 1.0e-4f));
+                const int32 IZ0 = FMath::Max(
+                    ExactIZ0,
+                    FMath::CeilToInt(
+                        (WorldMin.Z - static_cast<float>(Ctx.LatticeOriginVoxels.Z))
+                        / static_cast<float>(Ctx.Step) - 1.0e-4f));
+                const int32 IX1 = FMath::Min(
+                    ExactIX0 + ExactNX - 1,
+                    FMath::FloorToInt(
+                        (WorldMax.X - LatticeOriginX) / LatticeStepXY + 1.0e-4f));
+                const int32 IY1 = FMath::Min(
+                    ExactIY0 + ExactNY - 1,
+                    FMath::FloorToInt(
+                        (WorldMax.Y - LatticeOriginY) / LatticeStepXY + 1.0e-4f));
+                const int32 IZ1 = FMath::Min(
+                    ExactIZ0 + ExactNZ - 1,
+                    FMath::FloorToInt(
+                        (WorldMax.Z - static_cast<float>(Ctx.LatticeOriginVoxels.Z))
+                        / static_cast<float>(Ctx.Step) + 1.0e-4f));
+                if (IX1 < IX0 || IY1 < IY0 || IZ1 < IZ0) { return; }
+
+                for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+                for (int32 IY = IY0; IY <= IY1; ++IY)
+                for (int32 IX = IX0; IX <= IX1; ++IX)
+                {
+                    const int32 FlatIndex =
+                        ((IZ - ExactIZ0) * ExactNY + (IY - ExactIY0)) * ExactNX
+                        + (IX - ExactIX0);
+                    Callback(
+                        ExactLatticeWarpedQueries[FlatIndex],
+                        ExactLatticeWorldQueries[FlatIndex]);
+                }
+            };
+
+            auto EffectiveZRangeToWorld = [&](float MinEffectiveZ,
+                                               float MaxEffectiveZ) -> FVector2D
+            {
+                if (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
+                {
+                    const float WorldA = MinEffectiveZ * P.VerticalScale;
+                    const float WorldB = MaxEffectiveZ * P.VerticalScale;
+                    return FVector2D(FMath::Min(WorldA, WorldB), FMath::Max(WorldA, WorldB));
+                }
+                return FVector2D(MinEffectiveZ, MaxEffectiveZ);
+            };
+
+            auto DistanceBlockToInfiniteLineLower = [&](const FExactLatticeBlock& Block,
+                                                         const FVector& A,
+                                                         const FVector& BPoint) -> float
+            {
+                const FVector Direction = BPoint - A;
+                const float LengthSq = Direction.SizeSquared();
+                if (!(LengthSq > KINDA_SMALL_NUMBER))
+                {
+                    return VF_DistanceBetweenBoxes(
+                        Block.WarpedMin, Block.WarpedMax, A, A);
+                }
+
+                auto LinearRange = [](float Coefficient, float MinValue, float MaxValue,
+                                      float Offset, float& OutMin, float& OutMax)
+                {
+                    const float AValue = Coefficient * (MinValue - Offset);
+                    const float BValue = Coefficient * (MaxValue - Offset);
+                    OutMin = FMath::Min(AValue, BValue);
+                    OutMax = FMath::Max(AValue, BValue);
+                };
+                auto DistanceToZero = [](float MinValue, float MaxValue) -> float
+                {
+                    return MinValue > 0.0f ? MinValue
+                         : MaxValue < 0.0f ? -MaxValue : 0.0f;
+                };
+
+                float XYMin = 0.0f, XYMax = 0.0f;
+                float ZYMin = 0.0f, ZYMax = 0.0f;
+                float XZMin = 0.0f, XZMax = 0.0f;
+                float YXMin = 0.0f, YXMax = 0.0f;
+                float ZXMin = 0.0f, ZXMax = 0.0f;
+                float ZY2Min = 0.0f, ZY2Max = 0.0f;
+                LinearRange(Direction.Y, Block.WarpedMin.Z, Block.WarpedMax.Z,
+                            (float)A.Z, ZYMin, ZYMax);
+                LinearRange(Direction.Z, Block.WarpedMin.Y, Block.WarpedMax.Y,
+                            (float)A.Y, YXMin, YXMax);
+                LinearRange(Direction.Z, Block.WarpedMin.X, Block.WarpedMax.X,
+                            (float)A.X, XZMin, XZMax);
+                LinearRange(Direction.X, Block.WarpedMin.Z, Block.WarpedMax.Z,
+                            (float)A.Z, ZXMin, ZXMax);
+                LinearRange(Direction.X, Block.WarpedMin.Y, Block.WarpedMax.Y,
+                            (float)A.Y, XYMin, XYMax);
+                LinearRange(Direction.Y, Block.WarpedMin.X, Block.WarpedMax.X,
+                            (float)A.X, ZY2Min, ZY2Max);
+
+                const float CrossXMin = ZYMin - YXMax;
+                const float CrossXMax = ZYMax - YXMin;
+                const float CrossYMin = XZMin - ZXMax;
+                const float CrossYMax = XZMax - ZXMin;
+                const float CrossZMin = XYMin - ZY2Max;
+                const float CrossZMax = XYMax - ZY2Min;
+                const float DX = DistanceToZero(CrossXMin, CrossXMax);
+                const float DY = DistanceToZero(CrossYMin, CrossYMax);
+                const float DZ = DistanceToZero(CrossZMin, CrossZMax);
+                return FMath::Sqrt((DX * DX + DY * DY + DZ * DZ) / LengthSq);
+            };
+
+            auto LatticePointDistance = [&](const FVector& Target, const FVector& Extra) -> float
+            {
+                if (bUseExactLatticeWarp)
+                {
+                    return ExactLatticePointDistance(Target);
+                }
+                if (bUseExactLatticeBox)
+                {
+                    return VF_DistanceBetweenBoxes(
+                        ExactLatticeQueryMin, ExactLatticeQueryMax, Target, Target);
+                }
+                const float DX = VF_LatticeAxisDistanceToPoint(
+                    BoxMinX, BoxMaxX, LatticeOriginX, LatticeStepXY,
+                    static_cast<float>(Target.X), (float)Extra.X);
+                const float DY = VF_LatticeAxisDistanceToPoint(
+                    BoxMinY, BoxMaxY, LatticeOriginY, LatticeStepXY,
+                    static_cast<float>(Target.Y), (float)Extra.Y);
+                const float DZ = VF_LatticeAxisDistanceToPoint(
+                    BoxMinZ, BoxMaxZ, LatticeOriginZ, LatticeStepZ,
+                    static_cast<float>(Target.Z), (float)Extra.Z);
+                return FMath::Sqrt(DX * DX + DY * DY + DZ * DZ);
+            };
+
+            auto LatticeBoxDistance = [&](const FVector& TargetMin,
+                                          const FVector& TargetMax,
+                                          const FVector& Extra) -> float
+            {
+                if (bUseExactLatticeWarp)
+                {
+                    return ExactLatticeBoxDistance(TargetMin, TargetMax);
+                }
+                if (bUseExactLatticeBox)
+                {
+                    return VF_DistanceBetweenBoxes(
+                        ExactLatticeQueryMin, ExactLatticeQueryMax, TargetMin, TargetMax);
+                }
+                const float DX = VF_LatticeAxisDistanceToInterval(
+                    BoxMinX, BoxMaxX, LatticeOriginX, LatticeStepXY,
+                    static_cast<float>(TargetMin.X), static_cast<float>(TargetMax.X),
+                    (float)Extra.X);
+                const float DY = VF_LatticeAxisDistanceToInterval(
+                    BoxMinY, BoxMaxY, LatticeOriginY, LatticeStepXY,
+                    static_cast<float>(TargetMin.Y), static_cast<float>(TargetMax.Y),
+                    (float)Extra.Y);
+                const float DZ = VF_LatticeAxisDistanceToInterval(
+                    BoxMinZ, BoxMaxZ, LatticeOriginZ, LatticeStepZ,
+                    static_cast<float>(TargetMin.Z), static_cast<float>(TargetMax.Z),
+                    (float)Extra.Z);
+                return FMath::Sqrt(DX * DX + DY * DY + DZ * DZ);
+            };
+
+            // The exact warped lattice list is also an exact AABB superset.  Use that cheap
+            // distance as a first test and pay the primitive-by-query walk only when this bound is
+            // close enough to affect the source's active threshold.  A far primitive can only
+            // raise the lower bound; retaining its AABB bound is conservative and avoids scanning
+            // 729 queries for every cached room/tunnel in every refined child.
+            auto ExactLatticeAabbPointDistance = [&](const FVector& Target) -> float
+            {
+                return bUseExactLatticeWarp
+                    && ExactLatticeQueryMin.X <= ExactLatticeQueryMax.X
+                    && ExactLatticeQueryMin.Y <= ExactLatticeQueryMax.Y
+                    && ExactLatticeQueryMin.Z <= ExactLatticeQueryMax.Z
+                    ? VF_DistanceBetweenBoxes(
+                        ExactLatticeQueryMin, ExactLatticeQueryMax, Target, Target)
+                    : FLT_MAX;
+            };
+            auto ExactLatticeAabbBoxDistance = [&](const FVector& TargetMin,
+                                                   const FVector& TargetMax) -> float
+            {
+                return bUseExactLatticeWarp
+                    && ExactLatticeQueryMin.X <= ExactLatticeQueryMax.X
+                    && ExactLatticeQueryMin.Y <= ExactLatticeQueryMax.Y
+                    && ExactLatticeQueryMin.Z <= ExactLatticeQueryMax.Z
+                    ? VF_DistanceBetweenBoxes(
+                        ExactLatticeQueryMin, ExactLatticeQueryMax, TargetMin, TargetMax)
+                    : FLT_MAX;
+            };
+
+            // Exact lower bounds for the primitive values at the sampled points.  These mirror
+            // EvaluateSDFCached's broad-phase culls before evaluating the same primitive, so a
+            // skipped point contributes the identity (FLT_MAX), not a guessed distance.  The
+            // smooth-min fold below is monotone in both operands; folding each primitive's exact
+            // sampled minimum in the same order is therefore a conservative lower bound for every
+            // lattice sample, while being much tighter than the AABB distance.
+            auto ExactRoomLower = [&](const FCachedRoom& Room) -> float
+            {
+                float LowerBound = FLT_MAX;
+                const float CullRadius = FMath::Sqrt(FMath::Max(Room.CullRadiusSq, 0.0f));
+                for (const FExactLatticeBlock& Block : ExactLatticeBlocks)
+                {
+                    if (VF_DistanceBetweenBoxes(
+                            Block.WarpedMin, Block.WarpedMax,
+                            Room.Center, Room.Center) > CullRadius)
+                    {
+                        continue;
+                    }
+                    for (int32 IZ = Block.IZ0; IZ <= Block.IZ1; ++IZ)
+                    for (int32 IY = Block.IY0; IY <= Block.IY1; ++IY)
+                    for (int32 IX = Block.IX0; IX <= Block.IX1; ++IX)
+                    {
+                        const int32 FlatIndex =
+                            ((IZ - ExactIZ0) * ExactNY + (IY - ExactIY0)) * ExactNX
+                            + (IX - ExactIX0);
+                        const FVector& Query = ExactLatticeWarpedQueries[FlatIndex];
+                    const float DX = (float)Query.X - (float)Room.Center.X;
+                    const float DY = (float)Query.Y - (float)Room.Center.Y;
+                    const float DZ = (float)Query.Z - (float)Room.Center.Z;
+                    if (DX * DX + DY * DY + DZ * DZ > Room.CullRadiusSq)
+                    {
+                        continue;
+                    }
+
+                    float RoomSDF = 0.0f;
+                    switch (Room.ShapeType)
+                    {
+                    case 1:
+                        RoomSDF = VoxelSDF::RoundedBox(
+                            Query, Room.Center, Room.ShapeA, Room.ShapeR);
+                        break;
+                    case 2:
+                        RoomSDF = VoxelSDF::Capsule(
+                            Query, Room.ShapeA, Room.ShapeB, Room.ShapeR);
+                        break;
+                    default:
+                        RoomSDF = VoxelSDF::Ellipsoid(
+                            Query, Room.Center, Room.ShapeA);
+                        break;
+                    }
+
+                    if (Room.FloorCutZ > -FLT_MAX)
+                    {
+                        float FloorZ = Room.FloorCutZ;
+                        if (Room.FloorReliefStrength > 0.0f)
+                        {
+                            const float RF = Room.FloorReliefFrequency;
+                            const float SF = (float)Room.FloorSeed * 0.00001f;
+                            float N = FMath::PerlinNoise2D(
+                                FVector2D((float)Query.X * RF + SF,
+                                          (float)Query.Y * RF + SF * 1.7f)) * 0.65f
+                                + FMath::PerlinNoise2D(
+                                FVector2D((float)Query.X * RF * 2.3f + SF * 3.1f,
+                                          (float)Query.Y * RF * 2.3f + SF * 5.3f)) * 0.35f;
+                            N *= VOXEL_NOISE_SCALE;
+                            FloorZ += N * Room.FloorReliefStrength;
+                        }
+                        RoomSDF = VoxelSDF::SmoothMax(
+                            RoomSDF, FloorZ - (float)Query.Z, P.SDFBlendRadius * 0.35f);
+                    }
+                        LowerBound = FMath::Min(LowerBound, RoomSDF);
+                    }
+                }
+                return LowerBound;
+            };
+
+            auto ExactJoinLower = [&](const FCachedRoomFloorJoin& Join) -> float
+            {
+                float LowerBound = FLT_MAX;
+                const float BoundRadius = FMath::Sqrt(FMath::Max(Join.BoundRadiusSq, 0.0f));
+                for (const FExactLatticeBlock& Block : ExactLatticeBlocks)
+                {
+                    if (VF_DistanceBetweenBoxes(
+                            Block.WarpedMin, Block.WarpedMax,
+                            Join.BoundCenter, Join.BoundCenter) > BoundRadius)
+                    {
+                        continue;
+                    }
+                    for (int32 IZ = Block.IZ0; IZ <= Block.IZ1; ++IZ)
+                    for (int32 IY = Block.IY0; IY <= Block.IY1; ++IY)
+                    for (int32 IX = Block.IX0; IX <= Block.IX1; ++IX)
+                    {
+                        const int32 FlatIndex =
+                            ((IZ - ExactIZ0) * ExactNY + (IY - ExactIY0)) * ExactNX
+                            + (IX - ExactIX0);
+                        const FVector& Query = ExactLatticeWarpedQueries[FlatIndex];
+                    const float DX = (float)Query.X - (float)Join.BoundCenter.X;
+                    const float DY = (float)Query.Y - (float)Join.BoundCenter.Y;
+                    const float DZ = (float)Query.Z - (float)Join.BoundCenter.Z;
+                    if (DX * DX + DY * DY + DZ * DZ > Join.BoundRadiusSq)
+                    {
+                        continue;
+                    }
+                    const float HorizontalSDF = VoxelSDF::Capsule(
+                        Query, Join.Start, Join.End, Join.Radius);
+                    const float VerticalSDF = FMath::Max(
+                        Join.FloorZ - (float)Query.Z,
+                        (float)Query.Z - Join.CeilingZ);
+                        LowerBound = FMath::Min(
+                            LowerBound, FMath::Max(HorizontalSDF, VerticalSDF));
+                    }
+                }
+                return LowerBound;
+            };
+
+            auto ExactTunnelLower = [&](const FCachedTunnel& Tunnel) -> float
+            {
+                float LowerBound = FLT_MAX;
+                const float BoundRadius = FMath::Sqrt(FMath::Max(Tunnel.BoundRadiusSq, 0.0f));
+                auto EvaluateSegment = [&](const FVector& A, const FVector& BPoint,
+                                           float RadiusA, float RadiusB)
+                {
+                    // Every point in the block is at least this far from the segment's
+                    // infinite centerline.  Subtracting the largest endpoint radius is a
+                    // conservative lower bound for the tapered capsule and lets a good result
+                    // from an earlier segment reject the rest of this segment without changing
+                    // the exact point walk.
+                    const float SegmentRadius = FMath::Max(FMath::Abs(RadiusA), FMath::Abs(RadiusB));
+                    for (const FExactLatticeBlock& Block : ExactLatticeBlocks)
+                    {
+                        if (Tunnel.SDFInfluenceRadius > 0.0f
+                            && VF_DistanceBetweenBoxes(
+                                Block.WarpedMin, Block.WarpedMax,
+                                Tunnel.SDFCenterlineMin, Tunnel.SDFCenterlineMax)
+                                > Tunnel.SDFInfluenceRadius)
+                        {
+                            continue;
+                        }
+                        if (VF_DistanceBetweenBoxes(
+                                Block.WarpedMin, Block.WarpedMax,
+                                Tunnel.BoundCenter, Tunnel.BoundCenter)
+                                > BoundRadius)
+                        {
+                            continue;
+                        }
+                        if (FMath::IsFinite(LowerBound)
+                            && DistanceBlockToInfiniteLineLower(Block, A, BPoint)
+                                   - SegmentRadius >= LowerBound)
+                        {
+                            continue;
+                        }
+                        for (int32 IZ = Block.IZ0; IZ <= Block.IZ1; ++IZ)
+                        for (int32 IY = Block.IY0; IY <= Block.IY1; ++IY)
+                        for (int32 IX = Block.IX0; IX <= Block.IX1; ++IX)
+                        {
+                            const int32 FlatIndex =
+                                ((IZ - ExactIZ0) * ExactNY + (IY - ExactIY0)) * ExactNX
+                                + (IX - ExactIX0);
+                            const FVector& Query = ExactLatticeWarpedQueries[FlatIndex];
+                            const float DX = (float)Query.X - (float)Tunnel.BoundCenter.X;
+                            const float DY = (float)Query.Y - (float)Tunnel.BoundCenter.Y;
+                            const float DZ = (float)Query.Z - (float)Tunnel.BoundCenter.Z;
+                            if (DX * DX + DY * DY + DZ * DZ > Tunnel.BoundRadiusSq)
+                            {
+                                continue;
+                            }
+                            LowerBound = FMath::Min(
+                                LowerBound,
+                                VoxelSDF::TaperedCapsule(
+                                    Query, A, BPoint, RadiusA, RadiusB));
+                        }
+                    }
+                };
+
+                if (Tunnel.ControlPoints.Num() >= 2
+                    && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
+                {
+                    for (int32 SegmentIndex = 0;
+                         SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                         ++SegmentIndex)
+                    {
+                        EvaluateSegment(
+                            Tunnel.ControlPoints[SegmentIndex],
+                            Tunnel.ControlPoints[SegmentIndex + 1],
+                            Tunnel.ControlRadii[SegmentIndex],
+                            Tunnel.ControlRadii[SegmentIndex + 1]);
+                    }
+                }
+                else if (Tunnel.bHasMidpoint)
+                {
+                    EvaluateSegment(Tunnel.EndpointA, Tunnel.Midpoint,
+                                    Tunnel.RadiusA, Tunnel.RadiusMid);
+                    EvaluateSegment(Tunnel.Midpoint, Tunnel.EndpointB,
+                                    Tunnel.RadiusMid, Tunnel.RadiusB);
+                }
+                else
+                {
+                    EvaluateSegment(Tunnel.EndpointA, Tunnel.EndpointB,
+                                    Tunnel.RadiusA, Tunnel.RadiusB);
+                }
+                return LowerBound;
+            };
+
+            auto ExactPitLower = [&](const FCachedPit& Pit) -> float
+            {
+                float LowerBound = FLT_MAX;
+                const float Radius = FMath::Sqrt(FMath::Max(Pit.BoundXYRadiusSq, 0.0f));
+                const FVector CandidateMin(
+                    Pit.CenterX - Radius, Pit.CenterY - Radius,
+                    Pit.TopZ - Pit.Depth - Pit.BlendK);
+                const FVector CandidateMax(
+                    Pit.CenterX + Radius, Pit.CenterY + Radius,
+                    Pit.TopZ + Pit.BlendK);
+                ForEachExactQueryInWorldBox(
+                    CandidateMin, CandidateMax,
+                    [&](const FVector&, const FVector& Query)
+                {
+                    const float DZ = (float)Query.Z - Pit.TopZ;
+                    if (DZ >= Pit.BlendK || -DZ > Pit.Depth + Pit.BlendK)
+                    {
+                        return;
+                    }
+                    const float DX = (float)Query.X - Pit.CenterX;
+                    const float DY = (float)Query.Y - Pit.CenterY;
+                    const float XYDistSq = DX * DX + DY * DY;
+                    if (XYDistSq > Pit.BoundXYRadiusSq) { return; }
+                    float PitSDF;
+                    if (DZ <= 0.0f)
+                    {
+                        float FlareFactor = FMath::Clamp(
+                            1.0f - (-DZ) / Pit.FlareDist, 0.0f, 1.0f);
+                        FlareFactor *= FlareFactor;
+                        PitSDF = FMath::Sqrt(XYDistSq)
+                               - (Pit.Radius + Pit.FlareExtra * FlareFactor);
+                    }
+                    else
+                    {
+                        PitSDF = FMath::Sqrt(XYDistSq)
+                               - (Pit.Radius + Pit.FlareExtra);
+                    }
+                    LowerBound = FMath::Min(LowerBound, PitSDF);
+                });
+                return LowerBound;
+            };
+
+            auto ExactChimneyLower = [&](const FCachedChimney& Chimney) -> float
+            {
+                float LowerBound = FLT_MAX;
+                const float Radius = FMath::Sqrt(FMath::Max(Chimney.BoundXYRadiusSq, 0.0f));
+                const FVector CandidateMin(
+                    Chimney.CenterX - Radius, Chimney.CenterY - Radius,
+                    Chimney.BottomZ - Chimney.BlendK);
+                const FVector CandidateMax(
+                    Chimney.CenterX + Radius, Chimney.CenterY + Radius,
+                    Chimney.BottomZ + Chimney.Height + Chimney.BlendK);
+                ForEachExactQueryInWorldBox(
+                    CandidateMin, CandidateMax,
+                    [&](const FVector&, const FVector& Query)
+                {
+                    const float DZ = (float)Query.Z - Chimney.BottomZ;
+                    if (-DZ >= Chimney.BlendK || DZ > Chimney.Height + Chimney.BlendK)
+                    {
+                        return;
+                    }
+                    const float DX = (float)Query.X - Chimney.CenterX;
+                    const float DY = (float)Query.Y - Chimney.CenterY;
+                    const float XYDistSq = DX * DX + DY * DY;
+                    if (XYDistSq > Chimney.BoundXYRadiusSq) { return; }
+                    float ChimneySDF;
+                    if (DZ >= 0.0f)
+                    {
+                        float FlareFactor = FMath::Clamp(
+                            1.0f - DZ / Chimney.FlareDist, 0.0f, 1.0f);
+                        FlareFactor *= FlareFactor;
+                        ChimneySDF = FMath::Sqrt(XYDistSq)
+                                   - (Chimney.Radius + Chimney.FlareExtra * FlareFactor);
+                    }
+                    else
+                    {
+                        ChimneySDF = FMath::Sqrt(XYDistSq)
+                                   - (Chimney.Radius + Chimney.FlareExtra);
+                    }
+                    LowerBound = FMath::Min(LowerBound, ChimneySDF);
+                });
+                return LowerBound;
+            };
+
+            auto ConsiderExact = [&](float PrimitiveLower, float BlendRadius)
+            {
+                if (!Finite(PrimitiveLower) || !Finite(BlendRadius))
+                {
+                    bInvalidBound = true;
+                    return;
+                }
+                ExactSdfLower = VoxelSDF::SmoothMin(
+                    ExactSdfLower, PrimitiveLower, BlendRadius);
+            };
+            auto ConsiderCheapExact = [&](float PrimitiveLower, float BlendRadius)
+            {
+                if (Finite(PrimitiveLower) && Finite(BlendRadius))
+                {
+                    CheapSdfLower = VoxelSDF::SmoothMin(
+                        CheapSdfLower, PrimitiveLower, BlendRadius);
+                }
+            };
+
+            auto LatticeXYPointDistance = [&](float X, float Y) -> float
+            {
+                const float DX = VF_LatticeAxisDistanceToPoint(
+                    BoxMinX, BoxMaxX, LatticeOriginX, LatticeStepXY, X, 0.0f);
+                const float DY = VF_LatticeAxisDistanceToPoint(
+                    BoxMinY, BoxMaxY, LatticeOriginY, LatticeStepXY, Y, 0.0f);
+                return FMath::Sqrt(DX * DX + DY * DY);
+            };
+
             const float K = P.SDFBlendRadius;
             const float WormThreshold = FMath::IsFinite(P.WormNetworkRange)
                                        ? FMath::Max(3.0f * K, P.WormNetworkRange) : FLT_MAX;
             const float ThresholdWithBlend = VF_SaturatingAdd(WormThreshold, K);
             float Lower = FLT_MAX;
             bool bAnyPrimitive = false;
-            bool bInvalidBound = false;
 
             auto Consider = [&](float Candidate)
             {
@@ -3826,18 +5411,19 @@ namespace
                 if (Finite(Candidate) && Candidate < ThresholdWithBlend) { ++Count; }
             };
 
-            B.NumRooms = B.Cache.Rooms.Num();
-            B.NumTunnels = B.Cache.Tunnels.Num();
-            B.NumPits = B.Cache.Pits.Num();
-            B.NumChimneys = B.Cache.Chimneys.Num();
+            B.NumRooms = GetBoxCache().Rooms.Num();
+            B.NumTunnels = GetBoxCache().Tunnels.Num();
+            B.NumPits = GetBoxCache().Pits.Num();
+            B.NumChimneys = GetBoxCache().Chimneys.Num();
             B.HitRooms = B.HitTunnels = B.HitPits = B.HitChimneys = 0;
             B.HitRoomsNoWarp = B.HitTunnelsNoWarp = 0;
-            B.WarpDilation = Warp;
+            B.WarpDilation = FMath::Max3(
+                (float)WarpEnvelope.X, (float)WarpEnvelope.Y, (float)WarpEnvelope.Z);
 
             const FVector NoWarpMin(BoxMinX, BoxMinY, EffectiveMinZ);
             const FVector NoWarpMax(BoxMaxX, BoxMaxY, EffectiveMaxZ);
 
-            for (const FCachedRoom& Room : B.Cache.Rooms)
+            for (const FCachedRoom& Room : GetBoxCache().Rooms)
             {
                 const float CullRadiusSq = Room.CullRadiusSq;
                 if (!Finite((float)Room.Center.X) || !Finite((float)Room.Center.Y)
@@ -3849,21 +5435,122 @@ namespace
                 }
 
                 const float RoomRadius = FMath::Sqrt(CullRadiusSq);
-                const float RoomLower = VF_DistanceBetweenBoxes(
-                    QMin, QMax, Room.Center, Room.Center) - RoomRadius;
+                const float FastRoomLower = bUseExactLatticeWarp
+                    ? ExactLatticeAabbPointDistance(Room.Center) - RoomRadius
+                    : (bUseLatticeProof
+                        ? LatticePointDistance(Room.Center, WarpEnvelope) - RoomRadius
+                        : VF_DistanceBetweenBoxes(QMin, QMax, Room.Center, Room.Center) - RoomRadius);
+                const float RoomLower = bUseExactLatticeWarp
+                    && FastRoomLower < ThresholdWithBlend
+                    ? (ExactRoomRefinements++, ExactRoomLower(Room)) : FastRoomLower;
                 const float RoomLowerNoWarp = VF_DistanceBetweenBoxes(
                     NoWarpMin, NoWarpMax, Room.Center, Room.Center) - RoomRadius;
                 Consider(RoomLower);
+                if (bUseExactLatticeWarp) { ConsiderCheapExact(FastRoomLower, K); }
+                if (bUseExactLatticeWarp) { ConsiderExact(RoomLower, K); }
                 CountThreshold(RoomLower, B.HitRooms);
                 CountThreshold(RoomLowerNoWarp, B.HitRoomsNoWarp);
             }
 
-            for (const FCachedTunnel& Tunnel : B.Cache.Tunnels)
+            // Room-floor joins are part of EvaluateSDFCached's same smooth-min union.  They were
+            // absent from the old box proof, which could only lose skips; include them here so the
+            // exact retry remains a proof of the complete source rather than just rooms/tunnels.
+            for (const FCachedRoomFloorJoin& Join : GetBoxCache().RoomFloorJoins)
+            {
+                const float JoinRadius = FMath::Sqrt(FMath::Max(Join.BoundRadiusSq, 0.0f));
+                const float FastJoinLower = bUseExactLatticeWarp
+                    ? ExactLatticeAabbPointDistance(Join.BoundCenter) - JoinRadius
+                    : VF_DistanceBetweenBoxes(
+                        QMin, QMax, Join.BoundCenter, Join.BoundCenter) - JoinRadius;
+                const float JoinLower = bUseExactLatticeWarp
+                    && FastJoinLower < ThresholdWithBlend
+                    ? (ExactJoinRefinements++, ExactJoinLower(Join)) : FastJoinLower;
+                Consider(JoinLower);
+                if (bUseExactLatticeWarp) { ConsiderCheapExact(FastJoinLower, K); }
+                if (bUseExactLatticeWarp) { ConsiderExact(JoinLower, K); }
+            }
+
+            for (const FCachedTunnel& Tunnel : GetBoxCache().Tunnels)
             {
                 float MaxRadius = FMath::Max(
                     FMath::Abs(Tunnel.RadiusA), FMath::Abs(Tunnel.RadiusB));
                 float TunnelLower = FLT_MAX;
-                if (Tunnel.ControlPoints.Num() >= 2
+                if (bUseExactLatticeWarp)
+                {
+                    if (Tunnel.ControlPoints.Num() >= 2
+                        && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
+                    {
+                        for (int32 SegmentIndex = 0;
+                             SegmentIndex + 1 < Tunnel.ControlPoints.Num();
+                             ++SegmentIndex)
+                        {
+                            const FVector& A = Tunnel.ControlPoints[SegmentIndex];
+                            const FVector& BPoint = Tunnel.ControlPoints[SegmentIndex + 1];
+                            MaxRadius = FMath::Max(
+                                MaxRadius,
+                                FMath::Max(FMath::Abs(Tunnel.ControlRadii[SegmentIndex]),
+                                           FMath::Abs(Tunnel.ControlRadii[SegmentIndex + 1])));
+                            const FVector SegmentMin(
+                                FMath::Min(A.X, BPoint.X),
+                                FMath::Min(A.Y, BPoint.Y),
+                                FMath::Min(A.Z, BPoint.Z));
+                            const FVector SegmentMax(
+                                FMath::Max(A.X, BPoint.X),
+                                FMath::Max(A.Y, BPoint.Y),
+                                FMath::Max(A.Z, BPoint.Z));
+                            TunnelLower = FMath::Min(
+                                TunnelLower,
+                                ExactLatticeAabbBoxDistance(SegmentMin, SegmentMax));
+                        }
+                    }
+                    else if (Tunnel.bHasMidpoint)
+                    {
+                        const FVector SegmentMin(
+                            FMath::Min3(Tunnel.EndpointA.X, Tunnel.Midpoint.X,
+                                        Tunnel.EndpointB.X),
+                            FMath::Min3(Tunnel.EndpointA.Y, Tunnel.Midpoint.Y,
+                                        Tunnel.EndpointB.Y),
+                            FMath::Min3(Tunnel.EndpointA.Z, Tunnel.Midpoint.Z,
+                                        Tunnel.EndpointB.Z));
+                        const FVector SegmentMax(
+                            FMath::Max3(Tunnel.EndpointA.X, Tunnel.Midpoint.X,
+                                        Tunnel.EndpointB.X),
+                            FMath::Max3(Tunnel.EndpointA.Y, Tunnel.Midpoint.Y,
+                                        Tunnel.EndpointB.Y),
+                            FMath::Max3(Tunnel.EndpointA.Z, Tunnel.Midpoint.Z,
+                                        Tunnel.EndpointB.Z));
+                        MaxRadius = FMath::Max(
+                            MaxRadius,
+                            FMath::Max(FMath::Abs(Tunnel.RadiusMid),
+                                       FMath::Max(FMath::Abs(Tunnel.RadiusA),
+                                                  FMath::Abs(Tunnel.RadiusB))));
+                        TunnelLower = ExactLatticeAabbBoxDistance(SegmentMin, SegmentMax);
+                    }
+                    else
+                    {
+                        const FVector SegmentMin(
+                            FMath::Min(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                            FMath::Min(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                            FMath::Min(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
+                        const FVector SegmentMax(
+                            FMath::Max(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
+                            FMath::Max(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
+                            FMath::Max(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
+                        TunnelLower = ExactLatticeAabbBoxDistance(SegmentMin, SegmentMax);
+                    }
+                    TunnelLower -= MaxRadius;
+                    const float FastTunnelLower = TunnelLower;
+                    if (TunnelLower < ThresholdWithBlend)
+                    {
+                        ++ExactTunnelRefinements;
+                        TunnelLower = ExactTunnelLower(Tunnel);
+                    }
+                    if (bUseExactLatticeWarp)
+                    {
+                        ConsiderCheapExact(FastTunnelLower, K);
+                    }
+                }
+                else if (Tunnel.ControlPoints.Num() >= 2
                     && Tunnel.ControlRadii.Num() == Tunnel.ControlPoints.Num())
                 {
                     for (int32 SegmentIndex = 0;
@@ -3886,7 +5573,9 @@ namespace
                             FMath::Max(A.Z, BPoint.Z));
                         TunnelLower = FMath::Min(
                             TunnelLower,
-                            VF_DistanceBetweenBoxes(QMin, QMax, SegmentMin, SegmentMax));
+                            bUseLatticeProof
+                                ? LatticeBoxDistance(SegmentMin, SegmentMax, WarpEnvelope)
+                                : VF_DistanceBetweenBoxes(QMin, QMax, SegmentMin, SegmentMax));
                     }
                     TunnelLower -= MaxRadius;
                 }
@@ -3900,8 +5589,9 @@ namespace
                         FMath::Max(Tunnel.EndpointA.X, Tunnel.EndpointB.X),
                         FMath::Max(Tunnel.EndpointA.Y, Tunnel.EndpointB.Y),
                         FMath::Max(Tunnel.EndpointA.Z, Tunnel.EndpointB.Z));
-                    TunnelLower = VF_DistanceBetweenBoxes(
-                        QMin, QMax, SegmentMin, SegmentMax) - MaxRadius;
+                    TunnelLower = (bUseLatticeProof
+                        ? LatticeBoxDistance(SegmentMin, SegmentMax, WarpEnvelope)
+                        : VF_DistanceBetweenBoxes(QMin, QMax, SegmentMin, SegmentMax)) - MaxRadius;
                 }
 
                 const FVector NoWarpSegmentMin(
@@ -3916,11 +5606,12 @@ namespace
                     NoWarpMin, NoWarpMax, NoWarpSegmentMin, NoWarpSegmentMax)
                     - MaxRadius;
                 Consider(TunnelLower);
+                if (bUseExactLatticeWarp) { ConsiderExact(TunnelLower, K); }
                 CountThreshold(TunnelLower, B.HitTunnels);
                 CountThreshold(TunnelLowerNoWarp, B.HitTunnelsNoWarp);
             }
 
-            for (const FCachedPit& Pit : B.Cache.Pits)
+            for (const FCachedPit& Pit : GetBoxCache().Pits)
             {
                 if (!(BoxMinZ < Pit.TopZ + Pit.BlendK)
                     || !(BoxMaxZ >= Pit.TopZ - Pit.Depth - Pit.BlendK))
@@ -3928,13 +5619,21 @@ namespace
                     continue;
                 }
                 const float MaxRadius = FMath::Abs(Pit.Radius) + FMath::Abs(Pit.FlareExtra);
-                const float PitLower = VF_DistanceBoxToPointXY(
-                    FBox(RMin, RMax), Pit.CenterX, Pit.CenterY) - MaxRadius;
+                const float FastPitLower = bUseExactLatticeWarp
+                    ? LatticeXYPointDistance(Pit.CenterX, Pit.CenterY) - MaxRadius
+                    : (bUseLatticeProof
+                        ? LatticeXYPointDistance(Pit.CenterX, Pit.CenterY)
+                        : VF_DistanceBoxToPointXY(FBox(RMin, RMax), Pit.CenterX, Pit.CenterY)) - MaxRadius;
+                const float PitLower = bUseExactLatticeWarp
+                    && FastPitLower < ThresholdWithBlend
+                    ? (ExactPitRefinements++, ExactPitLower(Pit)) : FastPitLower;
                 Consider(PitLower);
+                if (bUseExactLatticeWarp) { ConsiderCheapExact(FastPitLower, Pit.BlendK); }
+                if (bUseExactLatticeWarp) { ConsiderExact(PitLower, Pit.BlendK); }
                 CountThreshold(PitLower, B.HitPits);
             }
 
-            for (const FCachedChimney& Chimney : B.Cache.Chimneys)
+            for (const FCachedChimney& Chimney : GetBoxCache().Chimneys)
             {
                 if (!(BoxMaxZ > Chimney.BottomZ - Chimney.BlendK)
                     || !(BoxMinZ <= Chimney.BottomZ + Chimney.Height + Chimney.BlendK))
@@ -3942,10 +5641,29 @@ namespace
                     continue;
                 }
                 const float MaxRadius = FMath::Abs(Chimney.Radius) + FMath::Abs(Chimney.FlareExtra);
-                const float ChimneyLower = VF_DistanceBoxToPointXY(
-                    FBox(RMin, RMax), Chimney.CenterX, Chimney.CenterY) - MaxRadius;
+                const float FastChimneyLower = bUseExactLatticeWarp
+                    ? LatticeXYPointDistance(Chimney.CenterX, Chimney.CenterY) - MaxRadius
+                    : (bUseLatticeProof
+                        ? LatticeXYPointDistance(Chimney.CenterX, Chimney.CenterY)
+                        : VF_DistanceBoxToPointXY(FBox(RMin, RMax), Chimney.CenterX, Chimney.CenterY)) - MaxRadius;
+                const float ChimneyLower = bUseExactLatticeWarp
+                    && FastChimneyLower < ThresholdWithBlend
+                    ? (ExactChimneyRefinements++, ExactChimneyLower(Chimney)) : FastChimneyLower;
                 Consider(ChimneyLower);
+                if (bUseExactLatticeWarp) { ConsiderCheapExact(FastChimneyLower, Chimney.BlendK); }
+                if (bUseExactLatticeWarp) { ConsiderExact(ChimneyLower, Chimney.BlendK); }
                 CountThreshold(ChimneyLower, B.HitChimneys);
+            }
+
+            if (bTask4SourceProbe)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4SourceProbe] box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) exact=%d queries=%d rooms=%d joins=%d tunnels=%d ms=%.3f"),
+                       BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                       bUseExactLatticeWarp ? 1 : 0, ExactLatticeWarpedQueries.Num(),
+                       GetBoxCache().Rooms.Num(), GetBoxCache().RoomFloorJoins.Num(), GetBoxCache().Tunnels.Num(),
+                       FPlatformTime::ToMilliseconds64(
+                           FPlatformTime::Cycles64() - Task4SourceStartCycles));
             }
 
             if (bInvalidBound)
@@ -3955,7 +5673,11 @@ namespace
             }
 
             FVoxelBoxSdfInterval Own;
-            if (!bAnyPrimitive)
+            if (bUseExactLatticeWarp)
+            {
+                Own.Set(ExactSdfLower, FLT_MAX);
+            }
+            else if (!bAnyPrimitive)
             {
                 Own.Set(FLT_MAX, FLT_MAX);
             }
@@ -3973,7 +5695,28 @@ namespace
             B.KeyFingerprint = ParamsFingerprint;
             B.KeyLayout = LV;
             B.KeyManagerLifetimeId = ManagerLifetimeId;
+            B.KeyUsesLatticeProof = bUseLatticeProof;
+            B.KeyTightenWarpProof = Ctx.bTightenWarpProof;
+            B.KeyLatticeOrigin = Ctx.LatticeOriginVoxels;
+            B.KeyLatticeStep = Ctx.Step;
             B.bValid = true;
+            if (Ctx.bUseLatticeProof
+                && Ctx.LatticeOriginVoxels == FIntVector(32, 0, -32)
+                && Ctx.Step == 1)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4RoomBoxProbe] box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) exact=%d queries=%d rooms=%d joins=%d tunnels=%d pits=%d chimneys=%d lower=%.6g"),
+                       BoxMinX, BoxMinY, BoxMinZ, BoxMaxX, BoxMaxY, BoxMaxZ,
+                       bUseExactLatticeWarp ? 1 : 0, ExactLatticeWarpedQueries.Num(),
+                       GetBoxCache().Rooms.Num(), GetBoxCache().RoomFloorJoins.Num(), GetBoxCache().Tunnels.Num(),
+                       GetBoxCache().Pits.Num(), GetBoxCache().Chimneys.Num(),
+                       bUseExactLatticeWarp ? ExactSdfLower : Lower);
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4RoomCheapProbe] cheap=%.6g exact=%.6g threshold=%.6g refine=%d,%d,%d,%d,%d"),
+                       CheapSdfLower, ExactSdfLower, ThresholdWithBlend,
+                       ExactRoomRefinements, ExactJoinRefinements, ExactTunnelRefinements,
+                       ExactPitRefinements, ExactChimneyRefinements);
+            }
             InOut = Own;
         }
 
@@ -3983,46 +5726,21 @@ namespace
         {
             FState& S = State();
             const FVector& Position = S.LastWorldPosition;
-            const FChunkSDFCache& Cache = GetCache();
             if (VoxelDensityProfile::AreCountersEnabled())
             {
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
             }
 
-            // Density-grid samples are integer XY. Keep fractional callers exact by using a
-            // scratch column; they are uncommon gradient/debug queries and must not alias a
-            // neighbouring integer column.
-            const bool bIntegerXY =
-                Position.X == FMath::FloorToFloat(static_cast<float>(Position.X))
-                && Position.Y == FMath::FloorToFloat(static_cast<float>(Position.Y));
-            if (bIntegerXY)
-            {
-                const int32 IX = FMath::FloorToInt(static_cast<float>(Position.X));
-                const int32 IY = FMath::FloorToInt(static_cast<float>(Position.Y));
-                FState::FSupportColumnBox& Box = S.SupportColumns.AcquireBox(IX, IY, &Cache);
-                bool bNewColumn = false;
-                FTunnelSupportFloorColumn* Column = Box.AcquireColumn(
-                    IX, IY, &Cache, S.SupportColumns.Clock, bNewColumn);
-                if (bNewColumn)
-                {
-                    VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                        static_cast<float>(Position.X),
-                        static_cast<float>(Position.Y),
-                        Cache,
-                        *Column);
-                }
-                return VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
+            const FTunnelSupportFloorColumn* Column = GetSupportColumn(Position);
+            const bool bSupport = Column != nullptr
+                && VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
                     static_cast<float>(Position.Z), *Column);
-            }
-
-            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                static_cast<float>(Position.X),
-                static_cast<float>(Position.Y),
-                Cache,
-                S.FractionalSupportColumn);
-            return VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
-                static_cast<float>(Position.Z), S.FractionalSupportColumn);
+            S.LastTunnelCoreWorldEvaluation = FTunnelCoreWorldEvaluation();
+            S.LastTunnelCoreWorldEvaluation.bSupportFloor = bSupport;
+            S.LastTunnelCoreEvaluationPosition = Position;
+            S.bLastTunnelCoreWorldEvaluationValid = true;
+            return bSupport;
         }
 
     private:
@@ -4344,7 +6062,7 @@ namespace
         {
             const EVoxelOpEffect Intrinsic = EffectOverBox(VoxelBox, Ctx);
             if (Intrinsic == EVoxelOpEffect::Identity) { return Intrinsic; }
-            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? EVoxelOpEffect::Identity : Intrinsic;
+            return IsInactiveFromSdf(H) ? EVoxelOpEffect::Identity : Intrinsic;
         }
 
         /**
@@ -4361,13 +6079,13 @@ namespace
         float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                               const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? 0.0f : MaxCarveOverBox(VoxelBox, Ctx);
+            return IsInactiveFromSdf(H) ? 0.0f : MaxCarveOverBox(VoxelBox, Ctx);
         }
 
         float MaxFillOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                              const FVoxelBoxHypotheses& H) const override
         {
-            return VF_CaveBoxIsFar(H, P.SDFBlendRadius) ? 0.0f : MaxFillOverBox(VoxelBox, Ctx);
+            return IsInactiveFromSdf(H) ? 0.0f : MaxFillOverBox(VoxelBox, Ctx);
         }
 
         /** La borne d'amplitude, en unités de densité. */
@@ -4399,6 +6117,21 @@ namespace
         }
 
     private:
+        bool IsInactiveFromSdf(const FVoxelBoxHypotheses& H) const
+        {
+            if (VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return true; }
+            if (!(P.SurfaceRoughness > 0.0f) || !FMath::IsFinite(P.SurfaceRoughness))
+            {
+                return P.SurfaceRoughness <= 0.0f;
+            }
+            const float RoughnessDepth = P.SurfaceRoughness * 2.0f;
+            // Eval's second gate is abs(CaveSDF) < SurfaceRoughness*2.  A known positive
+            // lower endpoint at or beyond that depth therefore proves the op is an identity even
+            // when the broader shared near-surface gate (SDFBlendRadius*3) remains open.
+            return FMath::IsFinite(RoughnessDepth) && H.Sdf.IsKnown()
+                && H.Sdf.Min >= RoughnessDepth;
+        }
+
         FStrateGenerationParams P;
         uint32 SeedU;
     };
@@ -5765,9 +7498,122 @@ namespace
         float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                               const FVoxelBoxHypotheses& H) const override
         {
-            return (P.WormNetworkRange > 0.0f && H.Sdf.IsKnown()
-                    && H.Sdf.Min >= P.WormNetworkRange)
-                 ? 0.0f : MaxCarveOverBox(VoxelBox, Ctx);
+            const float Strength = MaxCarveOverBox(VoxelBox, Ctx);
+            if (!(Strength > 0.0f) || !FMath::IsFinite(Strength))
+            {
+                return Strength;
+            }
+            if (!(P.WormNetworkRange > 0.0f) || !FMath::IsFinite(P.WormNetworkRange)
+                || !H.Sdf.IsKnown() || !FMath::IsFinite(H.Sdf.Min))
+            {
+                return Strength;
+            }
+
+            // The classifier's lattice proof is about the exact MC vertices, not the continuum
+            // between them.  On a refined child, evaluate the worm's two threshold noises at
+            // those vertices once and bound the actual carve factor there.  The root is left on
+            // the cheap interval path; a refined step-32 child has at most 17^3 vertices and the
+            // explicit count cap keeps this check bounded.  The network mask still uses the SDF
+            // interval's worst case, so this never assumes a room value that the preceding source
+            // did not prove.
+            if (Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
+                && FMath::IsFinite(P.WormFrequency)
+                && FMath::IsFinite(P.WormHorizontalBias)
+                && FMath::IsFinite(P.WormThreshold)
+                && P.WormThreshold > 0.0f
+                && FMath::IsFinite(P.VerticalScale))
+            {
+                const int32 Step = FMath::Max(Ctx.Step, 1);
+                const float OriginX = static_cast<float>(Ctx.LatticeOriginVoxels.X);
+                const float OriginY = static_cast<float>(Ctx.LatticeOriginVoxels.Y);
+                const float OriginZ = static_cast<float>(Ctx.LatticeOriginVoxels.Z);
+                const int32 IX0 = FMath::CeilToInt(
+                    ((float)VoxelBox.Min.X - OriginX) / (float)Step - 1.0e-4f);
+                const int32 IY0 = FMath::CeilToInt(
+                    ((float)VoxelBox.Min.Y - OriginY) / (float)Step - 1.0e-4f);
+                const int32 IZ0 = FMath::CeilToInt(
+                    ((float)VoxelBox.Min.Z - OriginZ) / (float)Step - 1.0e-4f);
+                const int32 IX1 = FMath::FloorToInt(
+                    ((float)VoxelBox.Max.X - OriginX) / (float)Step + 1.0e-4f);
+                const int32 IY1 = FMath::FloorToInt(
+                    ((float)VoxelBox.Max.Y - OriginY) / (float)Step + 1.0e-4f);
+                const int32 IZ1 = FMath::FloorToInt(
+                    ((float)VoxelBox.Max.Z - OriginZ) / (float)Step + 1.0e-4f);
+                const int64 Count = ((int64)IX1 - IX0 + 1)
+                                 * ((int64)IY1 - IY0 + 1)
+                                 * ((int64)IZ1 - IZ0 + 1);
+                // A full LOD0 root is intentionally left on the cheap interval path.  Refined
+                // child boxes are at most 17^3 lattice vertices, so their exact threshold bound
+                // couples the worm's spatial maximum to each child's SDF lower bound without
+                // evaluating the room graph 35,937 times.
+                if (IX1 >= IX0 && IY1 >= IY0 && IZ1 >= IZ0
+                    && Count > 0 && Count <= 10000)
+                {
+                    float MaxThresholdFactor = 0.0f;
+                    const float WormZFrequency = P.WormFrequency * P.WormHorizontalBias;
+                    for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+                    for (int32 IY = IY0; IY <= IY1; ++IY)
+                    for (int32 IX = IX0; IX <= IX1; ++IX)
+                    {
+                        const float WorldX = OriginX + (float)IX * (float)Step;
+                        const float WorldY = OriginY + (float)IY * (float)Step;
+                        const float WorldZ = OriginZ + (float)IZ * (float)Step;
+                        const float EffectiveZ = (P.VerticalScale != 1.0f
+                                                   && P.VerticalScale > 0.0f)
+                                                ? WorldZ / P.VerticalScale : WorldZ;
+                        const FVector3f NoiseBase(
+                            WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
+                            WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
+                            EffectiveZ * WormZFrequency + VoxelHash::SeedOffset(SeedU, 2.3f));
+                        const float N1 = FMath::Abs(VoxelNoise::Perlin3D(NoiseBase)
+                                                   * VOXEL_NOISE_SCALE);
+                        if (N1 >= P.WormThreshold) { continue; }
+
+                        const FVector3f NoiseOffset(
+                            137.0f, 259.0f, 431.0f);
+                        const float N2 = FMath::Abs(VoxelNoise::Perlin3D(
+                            NoiseBase + NoiseOffset) * VOXEL_NOISE_SCALE);
+                        const float WormValue = N1 + N2;
+                        if (WormValue < P.WormThreshold)
+                        {
+                            MaxThresholdFactor = FMath::Max(
+                                MaxThresholdFactor,
+                                1.0f - WormValue / P.WormThreshold);
+                        }
+                    }
+
+                    if (!(MaxThresholdFactor > 0.0f)) { return 0.0f; }
+                    float MaxNetworkMask = 1.0f;
+                    if (H.Sdf.Min >= P.WormNetworkRange)
+                    {
+                        MaxNetworkMask = 0.0f;
+                    }
+                    else if (H.Sdf.Min > 0.0f)
+                    {
+                        MaxNetworkMask = 1.0f - SmoothStep01(
+                            FMath::Clamp(H.Sdf.Min / P.WormNetworkRange, 0.0f, 1.0f));
+                    }
+                    return Strength * MaxThresholdFactor
+                        * FMath::Clamp(MaxNetworkMask, 0.0f, 1.0f);
+                }
+            }
+
+            // NetworkMask is monotone non-increasing in CaveSDF.  The source interval's lower
+            // endpoint therefore gives a sound upper bound for the mask across the whole box,
+            // not just the old all-or-nothing test at WormNetworkRange.  This matters in deep
+            // solid: a positive SDF can leave only a fraction of the worm amplitude, enough for
+            // the constant-rock margin to survive even when the full WormStrength would not.
+            float MaxNetworkMask = 1.0f;
+            if (H.Sdf.Min >= P.WormNetworkRange)
+            {
+                MaxNetworkMask = 0.0f;
+            }
+            else if (H.Sdf.Min > 0.0f)
+            {
+                MaxNetworkMask = 1.0f - SmoothStep01(
+                    FMath::Clamp(H.Sdf.Min / P.WormNetworkRange, 0.0f, 1.0f));
+            }
+            return Strength * FMath::Clamp(MaxNetworkMask, 0.0f, 1.0f);
         }
 
         /** Le ver ne REMPLIT jamais : `InOut.Density -= …` avec un terme positif. */
@@ -5957,27 +7803,30 @@ void VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint()
     uint64 LargestEntryBytes = 0;
     uint64 ValidEntries = 0;
     VoxelDensityProfile::FCacheMemoryBreakdown Breakdown;
-    for (int32 Index = 0; Index < RoomGraphCacheSlotCount; ++Index)
+    for (int32 Bank = 0; Bank < RoomGraphCacheBankCount; ++Bank)
     {
-        const FRoomGraphCacheEntry& Entry = GRoomGraphCache[Index];
-        if (!Entry.bValid)
+        for (int32 Index = 0; Index < RoomGraphCacheSlotCount; ++Index)
         {
-            continue;
-        }
+            const FRoomGraphCacheEntry& Entry = GRoomGraphCache[Bank][Index];
+            if (!Entry.bValid)
+            {
+                continue;
+            }
 
-        ++ValidEntries;
-        Breakdown += Entry.Cache.GetAllocatedSizeBreakdown();
-        const uint64 EntryDynamicBytes = static_cast<uint64>(Entry.Cache.GetAllocatedSize());
-        const uint64 FullEntryBytes = static_cast<uint64>(sizeof(FRoomGraphCacheEntry))
-            + EntryDynamicBytes;
-        DynamicBytes += EntryDynamicBytes;
-        EntryBytes += FullEntryBytes;
-        LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
+            ++ValidEntries;
+            Breakdown += Entry.Cache.GetAllocatedSizeBreakdown();
+            const uint64 EntryDynamicBytes = static_cast<uint64>(Entry.Cache.GetAllocatedSize());
+            const uint64 FullEntryBytes = static_cast<uint64>(sizeof(FRoomGraphCacheEntry))
+                + EntryDynamicBytes;
+            DynamicBytes += EntryDynamicBytes;
+            EntryBytes += FullEntryBytes;
+            LargestEntryBytes = FMath::Max(LargestEntryBytes, FullEntryBytes);
+        }
     }
     Breakdown.SlotStorageBytes = static_cast<uint64>(sizeof(GRoomGraphCache));
 
     VoxelDensityProfile::SetWorkerRoomGraphCacheFootprint(
-        RoomGraphCacheSlotCount,
+        RoomGraphCacheBankCount * RoomGraphCacheSlotCount,
         ValidEntries,
         static_cast<uint64>(sizeof(GRoomGraphCache)),
         DynamicBytes,
@@ -6002,6 +7851,22 @@ SIZE_T FVoxelOpStack::GetAllocatedSize() const
         }
     }
     return Bytes;
+}
+
+bool FVoxelOpStack::TryGetLastTunnelCoreWorldEvaluation(
+    FTunnelCoreWorldEvaluation& OutEvaluation) const
+{
+    // The last provider wins in the same way the structural tail is ordered.  At present the
+    // tunnel source is the only provider; walking backwards keeps this safe if a composed stack
+    // later adds another structural core provider.
+    for (int32 Index = Ops.Num() - 1; Index >= 0; --Index)
+    {
+        if (Ops[Index].Op->TryGetLastTunnelCoreWorldEvaluation(OutEvaluation))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void FVoxelOpStack::DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
@@ -6648,9 +8513,6 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
         OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
         OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
-        // The worm consumes the SDF interval carried by the fold; it has no pointer to, and no
-        // dependency on, this particular room source. That keeps the same operator safe behind a
-        // different SDF writer assembled by the composer.
         OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
 
         if (bAppendStructuralPosts)

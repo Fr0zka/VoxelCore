@@ -2157,6 +2157,444 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
     return false;
 }
 
+namespace
+{
+    static bool VF_LatticeAxisRange(
+        float Min, float Max, float Origin, int32 Step,
+        int32& OutFirst, int32& OutLast)
+    {
+        if (Step <= 0 || !FMath::IsFinite(Min) || !FMath::IsFinite(Max)
+            || !FMath::IsFinite(Origin) || Min > Max)
+        {
+            return false;
+        }
+        const float InvStep = 1.0f / static_cast<float>(Step);
+        OutFirst = FMath::CeilToInt((Min - Origin) * InvStep - 1.0e-4f);
+        OutLast  = FMath::FloorToInt((Max - Origin) * InvStep + 1.0e-4f);
+        return OutFirst <= OutLast;
+    }
+
+    static bool VF_LatticeAxisNearestDistance(
+        float Min, float Max, float Origin, int32 Step, float Target, float& OutDistance)
+    {
+        int32 First = 0, Last = -1;
+        if (!VF_LatticeAxisRange(Min, Max, Origin, Step, First, Last))
+        {
+            return false;
+        }
+        const int32 Nearest = FMath::Clamp(
+            FMath::RoundToInt((Target - Origin) / static_cast<float>(Step)), First, Last);
+        OutDistance = FMath::Abs(
+            Origin + static_cast<float>(Nearest * Step) - Target);
+        return true;
+    }
+
+    static bool VF_LatticeBoxTouchesSphere(
+        const FBox& Box, const FIntVector& Origin, int32 Step,
+        const FVector& Center, float Radius)
+    {
+        float DX = 0.0f, DY = 0.0f, DZ = 0.0f;
+        if (!VF_LatticeAxisNearestDistance(
+                (float)Box.Min.X, (float)Box.Max.X, (float)Origin.X,
+                Step, (float)Center.X, DX)
+            || !VF_LatticeAxisNearestDistance(
+                (float)Box.Min.Y, (float)Box.Max.Y, (float)Origin.Y,
+                Step, (float)Center.Y, DY)
+            || !VF_LatticeAxisNearestDistance(
+                (float)Box.Min.Z, (float)Box.Max.Z, (float)Origin.Z,
+                Step, (float)Center.Z, DZ))
+        {
+            return false;
+        }
+        return DX * DX + DY * DY + DZ * DZ <= FMath::Square(Radius);
+    }
+
+    static bool VF_AnyPassageBoundTouchesLattice(
+        const TArray<FVoxelPassage>& Passages,
+        const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step)
+    {
+        if (Step <= 0 || !VoxelBox.IsValid)
+        {
+            // An invalid query must never manufacture an identity proof.
+            return true;
+        }
+
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            const float Reach = Passage.BoundRadius + 4.0f;
+            if (!FMath::IsFinite(Reach) || Reach < 0.0f)
+            {
+                // Invalid generated geometry is an unknown, not an empty passage set.
+                return true;
+            }
+            if (VF_LatticeBoxTouchesSphere(
+                    VoxelBox, LatticeOrigin, Step, Passage.BoundCenter, Reach))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // MaxPassageCarveFactorNearLattice is queried once for the root and once for every refined
+    // child.  The child lattice is a strict subset of the root lattice, so retaining the exact
+    // carve factor at each root point is a sound memo: a child reads the same values the old
+    // implementation would have recomputed, in the same deterministic order.  The cache is
+    // worker-local because classifier calls can run concurrently and no mutable state may be
+    // published through the immutable strate manager.
+    struct FPassageLatticeBoundCache
+    {
+        const UVoxelStrateManager* Owner = nullptr;
+        uint64 OwnerLifetimeId = 0;
+        uint32 Version = 0xFFFFFFFFu;
+        FIntVector Origin = FIntVector::ZeroValue;
+        int32 Step = 0;
+        int32 FirstX = 0, LastX = -1;
+        int32 FirstY = 0, LastY = -1;
+        int32 FirstZ = 0, LastZ = -1;
+        bool bValid = false;
+        bool bNoCandidate = false;
+        TArray<float> Factors;
+
+        void Reset()
+        {
+            Owner = nullptr;
+            OwnerLifetimeId = 0;
+            Version = 0xFFFFFFFFu;
+            Origin = FIntVector::ZeroValue;
+            Step = 0;
+            FirstX = 0; LastX = -1;
+            FirstY = 0; LastY = -1;
+            FirstZ = 0; LastZ = -1;
+            bValid = false;
+            bNoCandidate = false;
+            Factors.Reset();
+        }
+
+        void Begin(const UVoxelStrateManager* InOwner, uint64 InLifetimeId,
+                   uint32 InVersion, const FIntVector& InOrigin, int32 InStep,
+                   int32 InFirstX, int32 InLastX,
+                   int32 InFirstY, int32 InLastY,
+                   int32 InFirstZ, int32 InLastZ,
+                   bool bInNoCandidate)
+        {
+            Owner = InOwner;
+            OwnerLifetimeId = InLifetimeId;
+            Version = InVersion;
+            Origin = InOrigin;
+            Step = InStep;
+            FirstX = InFirstX; LastX = InLastX;
+            FirstY = InFirstY; LastY = InLastY;
+            FirstZ = InFirstZ; LastZ = InLastZ;
+            bValid = true;
+            bNoCandidate = bInNoCandidate;
+            Factors.Reset();
+        }
+
+        bool Contains(const UVoxelStrateManager* InOwner, uint64 InLifetimeId,
+                      uint32 InVersion, const FIntVector& InOrigin, int32 InStep,
+                      int32 InFirstX, int32 InLastX,
+                      int32 InFirstY, int32 InLastY,
+                      int32 InFirstZ, int32 InLastZ) const
+        {
+            return bValid && Owner == InOwner && OwnerLifetimeId == InLifetimeId
+                && Version == InVersion && Origin == InOrigin && Step == InStep
+                && InFirstX >= FirstX && InLastX <= LastX
+                && InFirstY >= FirstY && InLastY <= LastY
+                && InFirstZ >= FirstZ && InLastZ <= LastZ;
+        }
+
+        int32 Index(int32 IX, int32 IY, int32 IZ) const
+        {
+            const int32 DimX = LastX - FirstX + 1;
+            const int32 DimY = LastY - FirstY + 1;
+            return ((IZ - FirstZ) * DimY + (IY - FirstY)) * DimX + (IX - FirstX);
+        }
+
+        float MaxIn(const int32 InFirstX, const int32 InLastX,
+                    const int32 InFirstY, const int32 InLastY,
+                    const int32 InFirstZ, const int32 InLastZ) const
+        {
+            if (bNoCandidate) { return 0.0f; }
+
+            float Result = 0.0f;
+            for (int32 IZ = InFirstZ; IZ <= InLastZ; ++IZ)
+            {
+                for (int32 IY = InFirstY; IY <= InLastY; ++IY)
+                {
+                    for (int32 IX = InFirstX; IX <= InLastX; ++IX)
+                    {
+                        Result = FMath::Max(Result, Factors[Index(IX, IY, IZ)]);
+                        if (Result >= 1.0f)
+                        {
+                            return Result;
+                        }
+                    }
+                }
+            }
+            return Result;
+        }
+    };
+
+    FPassageLatticeBoundCache& VF_GetPassageLatticeBoundCache()
+    {
+        thread_local FPassageLatticeBoundCache Cache;
+        return Cache;
+    }
+
+    static bool VF_LatticeBoxTouchesAABB(
+        const FBox& Box, const FIntVector& Origin, int32 Step,
+        float MinX, float MaxX, float MinY, float MaxY, float MinZ, float MaxZ)
+    {
+        return VoxelPassageGeometry::LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)Box.Min.X, MinX),
+                   FMath::Min((float)Box.Max.X, MaxX),
+                   (float)Origin.X, Step)
+            && VoxelPassageGeometry::LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)Box.Min.Y, MinY),
+                   FMath::Min((float)Box.Max.Y, MaxY),
+                   (float)Origin.Y, Step)
+            && VoxelPassageGeometry::LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)Box.Min.Z, MinZ),
+                   FMath::Min((float)Box.Max.Z, MaxZ),
+                   (float)Origin.Z, Step);
+    }
+}
+
+bool UVoxelStrateManager::AnyPassageNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    // This is deliberately only the conservative spatial candidate test.  The old implementation
+    // evaluated the complete modifier SDF here and then evaluated it a second time in
+    // MaxPassageCarveFactorNearLattice during the same fold.  A bound hit is sufficient to keep
+    // the carve hypothesis alive; MaxPassageCarveFactorNearLattice supplies the exact lattice
+    // amplitude before the fold can preserve AllSolid.
+    return VF_AnyPassageBoundTouchesLattice(
+        Passages, VoxelBox, LatticeOrigin, Step);
+}
+
+float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    // The passage bound is only a cheap candidate test.  It encloses an entire multi-segment
+    // passage, so using it as the final lattice proof turns a long tunnel into a false positive
+    // for every tile inside its enclosing sphere.  That is particularly damaging at LOD0: the
+    // classifier then falls through to a full density grid even when every sampled point is rock.
+    //
+    // Once a bound reaches this lattice, ask the same exact modifier SDF used by
+    // ApplyPassageCarvingOnly at the actual MC samples.  This is still a proof, not a sampling
+    // shortcut: the operator is evaluated at precisely the points the mesher will evaluate, and
+    // a non-finite result remains conservative.  The common no-candidate path stays O(P), while a
+    // false-positive bound pays one exact lattice walk and can then be classified as Identity.
+    if (Step <= 0 || !VoxelBox.IsValid)
+    {
+        return 1.0f;
+    }
+
+    int32 FirstX = 0, LastX = -1;
+    int32 FirstY = 0, LastY = -1;
+    int32 FirstZ = 0, LastZ = -1;
+    if (!VF_LatticeAxisRange(
+            VoxelBox.Min.X, VoxelBox.Max.X, (float)LatticeOrigin.X, Step, FirstX, LastX)
+        || !VF_LatticeAxisRange(
+            VoxelBox.Min.Y, VoxelBox.Max.Y, (float)LatticeOrigin.Y, Step, FirstY, LastY)
+        || !VF_LatticeAxisRange(
+            VoxelBox.Min.Z, VoxelBox.Max.Z, (float)LatticeOrigin.Z, Step, FirstZ, LastZ))
+    {
+        return 1.0f;
+    }
+
+    FPassageLatticeBoundCache& Cache = VF_GetPassageLatticeBoundCache();
+    const uint64 LifetimeId = GetCacheLifetimeId();
+    const uint32 Version = GetLayoutVersion();
+    if (Cache.Contains(
+            this, LifetimeId, Version, LatticeOrigin, Step,
+            FirstX, LastX, FirstY, LastY, FirstZ, LastZ))
+    {
+        return Cache.MaxIn(FirstX, LastX, FirstY, LastY, FirstZ, LastZ);
+    }
+
+    if (!VF_AnyPassageBoundTouchesLattice(
+            Passages, VoxelBox, LatticeOrigin, Step))
+    {
+        Cache.Begin(
+            this, LifetimeId, Version, LatticeOrigin, Step,
+            FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
+            /*bInNoCandidate*/ true);
+        return 0.0f;
+    }
+
+    constexpr float PassageCarveThreshold = 4.0f;
+    auto CarveFactorFromSDF = [](float ModifierSDF)
+    {
+        if (!(ModifierSDF < PassageCarveThreshold))
+        {
+            return 0.0f;
+        }
+        float CarveFactor = FMath::Clamp(
+            (PassageCarveThreshold - ModifierSDF)
+                / (PassageCarveThreshold * 2.0f),
+            0.0f, 1.0f);
+        return SmoothStep01(CarveFactor);
+    };
+
+    const int64 DimX = static_cast<int64>(LastX) - FirstX + 1;
+    const int64 DimY = static_cast<int64>(LastY) - FirstY + 1;
+    const int64 DimZ = static_cast<int64>(LastZ) - FirstZ + 1;
+    const int64 SampleCount = DimX * DimY * DimZ;
+    constexpr int64 MaxCachedLatticeSamples = 65536;
+    if (SampleCount > 0 && SampleCount <= MaxCachedLatticeSamples)
+    {
+        Cache.Begin(
+            this, LifetimeId, Version, LatticeOrigin, Step,
+            FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
+            /*bInNoCandidate*/ false);
+        Cache.Factors.SetNumUninitialized(static_cast<int32>(SampleCount));
+
+        float MaxCarveFactor = 0.0f;
+        for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+        {
+            const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
+            for (int32 IY = FirstY; IY <= LastY; ++IY)
+            {
+                const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+                for (int32 IX = FirstX; IX <= LastX; ++IX)
+                {
+                    const float X = (float)LatticeOrigin.X + (float)(IX * Step);
+                    const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
+                    const float CarveFactor = FMath::IsFinite(ModifierSDF)
+                        ? CarveFactorFromSDF(ModifierSDF) : 1.0f;
+                    Cache.Factors[Cache.Index(IX, IY, IZ)] = CarveFactor;
+                    MaxCarveFactor = FMath::Max(MaxCarveFactor, CarveFactor);
+                    if (MaxCarveFactor >= 1.0f)
+                    {
+                        // The remaining values are still filled below. Descendant queries need
+                        // the complete exact lattice, not merely this query's maximum.
+                        for (int32 RemainingZ = IZ; RemainingZ <= LastZ; ++RemainingZ)
+                        {
+                            const float RemainingWorldZ =
+                                (float)LatticeOrigin.Z + (float)(RemainingZ * Step);
+                            const int32 StartY = RemainingZ == IZ ? IY : FirstY;
+                            for (int32 RemainingY = StartY; RemainingY <= LastY; ++RemainingY)
+                            {
+                                const float RemainingWorldY =
+                                    (float)LatticeOrigin.Y + (float)(RemainingY * Step);
+                                const int32 StartX =
+                                    (RemainingZ == IZ && RemainingY == IY) ? IX + 1 : FirstX;
+                                for (int32 RemainingX = StartX; RemainingX <= LastX; ++RemainingX)
+                                {
+                                    const float RemainingWorldX =
+                                        (float)LatticeOrigin.X + (float)(RemainingX * Step);
+                                    const float RemainingSDF = EvaluateModifierSDF(
+                                        RemainingWorldX, RemainingWorldY, RemainingWorldZ);
+                                    Cache.Factors[Cache.Index(RemainingX, RemainingY, RemainingZ)] =
+                                        FMath::IsFinite(RemainingSDF)
+                                            ? CarveFactorFromSDF(RemainingSDF) : 1.0f;
+                                }
+                            }
+                        }
+                        return MaxCarveFactor;
+                    }
+                }
+            }
+        }
+        return MaxCarveFactor;
+    }
+
+    // Very large or unusual external queries do not enter the bounded worker memo. Keep the
+    // original exact walk for them; refusing the cache must never change the proof.
+    Cache.Reset();
+    float MaxCarveFactor = 0.0f;
+    for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+    {
+        const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
+        for (int32 IY = FirstY; IY <= LastY; ++IY)
+        {
+            const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+            for (int32 IX = FirstX; IX <= LastX; ++IX)
+            {
+                const float X = (float)LatticeOrigin.X + (float)(IX * Step);
+                const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
+                if (!FMath::IsFinite(ModifierSDF))
+                {
+                    return 1.0f;
+                }
+                MaxCarveFactor = FMath::Max(
+                    MaxCarveFactor, CarveFactorFromSDF(ModifierSDF));
+                if (MaxCarveFactor >= 1.0f)
+                {
+                    return MaxCarveFactor;
+                }
+            }
+        }
+    }
+    return MaxCarveFactor;
+}
+
+bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (Landing->HalfWidth <= 0.0f || Landing->FloorThickness <= 0.0f)
+            {
+                continue;
+            }
+            constexpr float Pad = 1.0f;
+            if (VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    Landing->StandingPoint.X - Landing->HalfWidth - Pad,
+                    Landing->StandingPoint.X + Landing->HalfWidth + Pad,
+                    Landing->StandingPoint.Y - Landing->HalfWidth - Pad,
+                    Landing->StandingPoint.Y + Landing->HalfWidth + Pad,
+                    Landing->FloorZ - Landing->FloorThickness - Pad,
+                    Landing->FloorZ + Pad))
+            {
+                return true;
+            }
+        }
+
+        if (Passage.bWalkableTunnelContract
+            && Passage.ControlPoints.Num() >= 2
+            && Passage.ControlRadii.Num() == Passage.ControlPoints.Num())
+        {
+            constexpr float Pad = 1.0f;
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+            {
+                const FVector& A = Passage.ControlPoints[SegmentIndex];
+                const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                const float SupportRadius = FMath::Max(
+                    FMath::Min(
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex]),
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
+                    VoxelPassageGeometry::PlayerRadiusVoxels);
+                const float FloorA = VoxelPassageGeometry::TunnelFloorZ(
+                    A, Passage.ControlRadii[SegmentIndex]);
+                const float FloorB = VoxelPassageGeometry::TunnelFloorZ(
+                    B, Passage.ControlRadii[SegmentIndex + 1]);
+                if (VF_LatticeBoxTouchesAABB(
+                        VoxelBox, LatticeOrigin, Step,
+                        FMath::Min(A.X, B.X) - SupportRadius - Pad,
+                        FMath::Max(A.X, B.X) + SupportRadius + Pad,
+                        FMath::Min(A.Y, B.Y) - SupportRadius - Pad,
+                        FMath::Max(A.Y, B.Y) + SupportRadius + Pad,
+                        FMath::Min(FloorA, FloorB)
+                            - VoxelPassageGeometry::LandingFloorThicknessVoxels - Pad,
+                        FMath::Max(FloorA, FloorB) + Pad))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 bool UVoxelStrateManager::AnyOriginLandingNearBox(
     const FVector& MinVoxel, const FVector& MaxVoxel) const
 {
@@ -2192,6 +2630,44 @@ bool UVoxelStrateManager::AnyOriginLandingFloorNearBox(
                 VoxelBox, TopZ, BottomZ,
                 VF_BoundarySealThicknessForDefinition(*Slot.Definition),
                 OriginSpineRadius))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyOriginLandingNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    if (OriginSpineRadius <= 0.0f) return false;
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr) continue;
+        const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+        const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        const float Seal = VF_BoundarySealThicknessForDefinition(*Slot.Definition);
+        if (VoxelPassageGeometry::OriginLandingRoomTouchesLattice(
+                VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyOriginLandingFloorNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    if (OriginSpineRadius <= 0.0f) return false;
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr) continue;
+        const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+        const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        const float Seal = VF_BoundarySealThicknessForDefinition(*Slot.Definition);
+        if (VoxelPassageGeometry::OriginLandingFloorTouchesLattice(
+                VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius))
         {
             return true;
         }

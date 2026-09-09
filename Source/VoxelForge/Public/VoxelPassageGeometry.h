@@ -433,6 +433,73 @@ namespace VoxelPassageGeometry
         return MaxA >= MinB && MinA <= MaxB;
     }
 
+    /** True when the exact MC lattice has at least one sample in a closed interval. */
+    FORCEINLINE bool LatticeAxisHasSampleInInterval(
+        float Min, float Max, float Origin, int32 Step)
+    {
+        if (Step <= 0 || !FMath::IsFinite(Min) || !FMath::IsFinite(Max)
+            || !FMath::IsFinite(Origin) || Min > Max)
+        {
+            return false;
+        }
+        const float InvStep = 1.0f / static_cast<float>(Step);
+        const int32 First = FMath::CeilToInt(
+            (Min - Origin) * InvStep - 1.0e-4f);
+        const int32 Last = FMath::FloorToInt(
+            (Max - Origin) * InvStep + 1.0e-4f);
+        return First <= Last;
+    }
+
+    FORCEINLINE bool OriginLandingRoomTouchesLattice(
+        const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+        float StrateTopZ, float StrateBottomZ, float SealThickness, float OriginRadius)
+    {
+        if (!VoxelBox.IsValid) return false;
+        const FOriginLandingGeometry Geometry = BuildOriginLandingGeometry(
+            StrateTopZ, StrateBottomZ, SealThickness, OriginRadius);
+        if (!Geometry.bValid) return false;
+        const float Pad = LandingCarveBlendVoxels;
+        return LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.X, -Geometry.HalfWidth - Pad),
+                   FMath::Min((float)VoxelBox.Max.X, Geometry.HalfWidth + Pad),
+                   (float)LatticeOrigin.X, Step)
+            && LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.Y, -Geometry.HalfWidth - Pad),
+                   FMath::Min((float)VoxelBox.Max.Y, Geometry.HalfWidth + Pad),
+                   (float)LatticeOrigin.Y, Step)
+            && LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.Z, Geometry.FloorZ - Pad),
+                   FMath::Min((float)VoxelBox.Max.Z, Geometry.CeilingZ + Pad),
+                   (float)LatticeOrigin.Z, Step);
+    }
+
+    FORCEINLINE bool OriginLandingFloorTouchesLattice(
+        const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+        float StrateTopZ, float StrateBottomZ, float SealThickness, float OriginRadius)
+    {
+        if (!VoxelBox.IsValid) return false;
+        const FOriginLandingGeometry Geometry = BuildOriginLandingGeometry(
+            StrateTopZ, StrateBottomZ, SealThickness, OriginRadius);
+        if (!Geometry.bValid) return false;
+
+        constexpr float ProofPad = 1.0f;
+        const float FloorHalfWidth = FMath::Max(
+            Geometry.HalfWidth - 1.0f, 0.0f);
+        return LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.X, -FloorHalfWidth - ProofPad),
+                   FMath::Min((float)VoxelBox.Max.X, FloorHalfWidth + ProofPad),
+                   (float)LatticeOrigin.X, Step)
+            && LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.Y, -FloorHalfWidth - ProofPad),
+                   FMath::Min((float)VoxelBox.Max.Y, FloorHalfWidth + ProofPad),
+                   (float)LatticeOrigin.Y, Step)
+            && LatticeAxisHasSampleInInterval(
+                   FMath::Max((float)VoxelBox.Min.Z,
+                              Geometry.FloorZ - Geometry.FloorThickness - ProofPad),
+                   FMath::Min((float)VoxelBox.Max.Z, Geometry.FloorZ + ProofPad),
+                   (float)LatticeOrigin.Z, Step);
+    }
+
     /** Conservative influence box for the origin room's air carve. */
     FORCEINLINE bool OriginLandingRoomTouchesBox(
         const FBox& VoxelBox,

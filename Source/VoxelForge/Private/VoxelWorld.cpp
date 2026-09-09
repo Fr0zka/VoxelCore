@@ -1207,6 +1207,14 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
 
+    if (GVoxelForgeProfileTileGeneration != 0 && Result.RequestStartCycles != 0)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeTileReady] level=%d empty=%d request_to_ready=%.6f"),
+            Result.Tile.Level, Result.bEmpty || !Result.Streams ? 1 : 0,
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - Result.RequestStartCycles));
+    }
+
     // Mark the tile loaded (even if empty — so we don't re-submit it).
     LoadedTiles.Add(Result.Tile);
 
@@ -1270,6 +1278,8 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     }
 
     FChunkResult Result;
+    Result.RequestStartCycles = GVoxelForgeProfileTileGeneration != 0
+        ? FPlatformTime::Cycles64() : 0;
     GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
                        BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                        /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
@@ -1966,6 +1976,8 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         return;  // Budget full — wait for a task to finish.
     }
     PendingTiles.Add(Tile);
+    const uint64 RequestStartCycles = GVoxelForgeProfileTileGeneration != 0
+        ? FPlatformTime::Cycles64() : 0;
 
     const FIntVector OriginVoxels = Tile.OriginVoxels();   // min corner, voxel coords
 
@@ -2019,6 +2031,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             FChunkResult Empty;
             Empty.Tile  = Tile;
             Empty.Epoch = TaskEpoch;
+            Empty.RequestStartCycles = RequestStartCycles;
             ProcessQueue.Enqueue(MoveTemp(Empty));
             return;
         }
@@ -2048,6 +2061,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             FChunkResult Empty;
             Empty.Tile        = Tile;
             Empty.Epoch       = TaskEpoch;
+            Empty.RequestStartCycles = RequestStartCycles;
             Empty.BandChunkLo = BandChunkLo;
             Empty.BandChunkHi = BandChunkHi;
             ProcessQueue.Enqueue(MoveTemp(Empty));
@@ -2069,7 +2083,8 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         : UE::Tasks::ETaskPriority::BackgroundNormal;
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                                          BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                                         bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY]()
+                                         bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
+                                         RequestStartCycles]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -2084,6 +2099,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                            BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                            bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY, Result);
+        Result.RequestStartCycles = RequestStartCycles;
 
         if (!ShouldAbortWork())
         {
@@ -2103,14 +2119,21 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
 {
     const bool bProfileTile = GVoxelForgeProfileTileGeneration != 0;
     const double TileStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+    double ClassifySeconds = 0.0;
+    double MeshSeconds = 0.0;
+    double StreamSeconds = 0.0;
+    int32 ClassifyVerdict = -1; // Mixed = 0, AllSolid = 1, AllAir = 2
     auto EmitTileProfile = [&]()
     {
         if (bProfileTile)
         {
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileProfile] level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d seconds=%.6f"),
-                Tile.Level, Step, Cells, bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
-                Result.bEmpty ? 1 : 0, FPlatformTime::Seconds() - TileStartSeconds);
+                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
+                     "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f"),
+                Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
+                bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
+                Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
+                FPlatformTime::Seconds() - TileStartSeconds);
         }
     };
 
@@ -2151,7 +2174,10 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
+        const double ClassifyStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
         const EVoxelTileClass Verdict = Generator->ClassifyTile(OriginVoxels, Step, Cells);
+        ClassifySeconds = bProfileTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
+        ClassifyVerdict = static_cast<int32>(Verdict);
         if (ShouldAbortWork())
         {
             AbortResult();
@@ -2178,12 +2204,14 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     if (!bTrivialEmpty)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
+        const double MeshStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
         MeshData = bSheetTile
             ? Mesher->GenerateSheetMesh(OriginVoxels, Step, Cells, SheetChunkZ,
                                         HoleMinX, HoleMinY, HoleMaxX, HoleMaxY)
             : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
                                    bWantCapture ? &Result.CaptureGrid : nullptr,
                                    BandVoxLo, BandVoxHi);
+        MeshSeconds = bProfileTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
         INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
         if (ShouldAbortWork())
         {
@@ -2198,8 +2226,10 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     if (!MeshData.IsEmpty())
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
+        const double StreamStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
         Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
         BuildTileStreamSet(*Result.Streams, MeshData);
+        StreamSeconds = bProfileTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
         if (ShouldAbortWork())
         {
             AbortResult();

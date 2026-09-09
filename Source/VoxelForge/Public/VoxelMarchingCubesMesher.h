@@ -147,9 +147,12 @@ public:
     // l'écart vers un voisin un niveau plus grossier (cellule 2×). Monter si des fissures persistent.
     float SkirtCells = 2.0f;
 
-    // Optional conservative block classifier. When enabled, 8x8x8 cell regions proven uniformly
-    // solid or air by UVoxelGenerator::ClassifyTile skip the marching-cubes cell loop. The density
-    // grid is still produced in full, so this switch cannot change samples or geometry.
+    // Conservative 8x8x8 block classifier. Uniform blocks skip the marching-cubes cell loop;
+    // when every relevant block has the same verdict, the density grid is skipped as well.
+    // ClassifyTile is proof-only, so no samples, resolution, or geometry are removed.
+    // The tile classifier is the cheap, whole-tile proof. Keep the optional 8^3-block refinement
+    // available for focused diagnostics, but leave it disabled in streaming: repeating a proof on
+    // every mixed tile can cost more than the density grid it is meant to avoid.
     bool bUseBlockEarlyOut = false;
 
     // T2.b — LOD-aware octave reduction (opt-in, copied from UVoxelSettings::LODOctaveDrop).

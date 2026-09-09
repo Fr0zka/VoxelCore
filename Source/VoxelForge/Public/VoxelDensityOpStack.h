@@ -174,6 +174,10 @@ public:
         return -EvalInternal(WorldX, WorldY, WorldZ);
     }
 
+    /** Return a same-sample structural-core result published by a source in this stack. */
+    bool TryGetLastTunnelCoreWorldEvaluation(
+        FTunnelCoreWorldEvaluation& OutEvaluation) const;
+
     /**
      * Le pliage générique qui remplacera les gardes écrites à la main dans ClassifyTile.
      * Voir `VF_FoldOp` (VoxelDensityOp.h) pour la sémantique — en particulier pourquoi un
@@ -182,10 +186,25 @@ public:
     EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
         FVoxelBoxHypotheses H;
+        const bool bTask4OpProbe = Ctx.bUseLatticeProof
+            && Ctx.LatticeOriginVoxels == FIntVector(32, 0, -32)
+            && Ctx.Step == 1;
         for (const FOpEntry& Entry : Ops)
         {
+            const uint64 Task4OpStartCycles = bTask4OpProbe
+                ? FPlatformTime::Cycles64() : 0;
             VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx,
                       (Entry.Writes & VoxelOpChannels::Sdf) != 0);
+            if (bTask4OpProbe)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4OpProbe] box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) op=%s ms=%.3f"),
+                       (float)VoxelBox.Min.X, (float)VoxelBox.Min.Y, (float)VoxelBox.Min.Z,
+                       (float)VoxelBox.Max.X, (float)VoxelBox.Max.Y, (float)VoxelBox.Max.Z,
+                       Entry.Op->DebugName(),
+                       FPlatformTime::ToMilliseconds64(
+                           FPlatformTime::Cycles64() - Task4OpStartCycles));
+            }
             // Do not early-out on a dead hypothesis: a later forcing structural post may
             // deliberately overwrite it (the XY edge seal is appended after passage tube/landing
             // carving and support).

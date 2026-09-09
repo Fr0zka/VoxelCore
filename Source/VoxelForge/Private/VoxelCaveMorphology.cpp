@@ -33,6 +33,44 @@
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
 #include "VoxelStrateTypes.h"
+#include "HAL/PlatformTime.h"
+
+namespace
+{
+    struct FTask4BuildProbeScope
+    {
+        FChunkSDFCache& Cache;
+        const float MinX;
+        const float MinY;
+        const float MaxX;
+        const float MaxY;
+        const uint64 StartCycles;
+        const bool bEnabled;
+
+        FTask4BuildProbeScope(FChunkSDFCache& InCache, float InMinX, float InMinY,
+                               float InMaxX, float InMaxY)
+            : Cache(InCache), MinX(InMinX), MinY(InMinY), MaxX(InMaxX), MaxY(InMaxY)
+            , StartCycles(FPlatformTime::Cycles64())
+            , bEnabled((InMaxX - InMinX) > 120.0f && (InMaxX - InMinX) < 220.0f
+                       && (InMaxY - InMinY) > 120.0f && (InMaxY - InMinY) < 220.0f
+                       && InMinX > -512.0f && InMaxX < 512.0f
+                       && InMinY > -512.0f && InMaxY < 512.0f)
+        {}
+
+        ~FTask4BuildProbeScope()
+        {
+            if (bEnabled)
+            {
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4BuildProbe] search=(%.0f,%.0f)-(%.0f,%.0f) rooms=%d joins=%d tunnels=%d pits=%d chimneys=%d ms=%.3f"),
+                       MinX, MinY, MaxX, MaxY, Cache.Rooms.Num(), Cache.RoomFloorJoins.Num(),
+                       Cache.Tunnels.Num(), Cache.Pits.Num(), Cache.Chimneys.Num(),
+                       FPlatformTime::ToMilliseconds64(
+                           FPlatformTime::Cycles64() - StartCycles));
+            }
+        }
+    };
+}
 #include "VoxelNoise.h"           // Pure FBM used by the slab landing query
 #include "VoxelPassageGeometry.h"
 #include "VoxelTerrainOpDefinition.h"
@@ -2828,6 +2866,8 @@ void VoxelCaveMorphology::BuildChunkCache(
     uint32 Seed, int32 StrateIndex,
     const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
+    FTask4BuildProbeScope Task4BuildProbe(OutCache, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY);
+
     // Clear previous data (arrays keep their allocation for reuse)
     OutCache.Rooms.Reset();
     OutCache.RoomFloorJoins.Reset();

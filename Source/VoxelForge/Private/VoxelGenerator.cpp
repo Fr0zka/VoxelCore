@@ -522,10 +522,9 @@ namespace
     // result. Native TunnelNetwork/Underwater states are immutable after construction; the active
     // pointer below lets the hot sample path read the stored stack and tunnel-core cache without
     // moving them on every voxel.
-    // The cache is open-addressed and bounded.  The 128-slot budget is evidence-sized: the
-    // 128³ production export measured at most 102 live tunnel entries on one worker, leaving
-    // 26 slots of headroom; the old 4,096-slot experiment reserved 3.34 MiB per worker before
-    // one operator or SDF allocation existed.  Collisions only cause a safe deterministic rebuild.
+    // The cache is open-addressed and bounded.  Keep the worker footprint at the established
+    // 128-entry cap; the expensive native tunnel-core cache is not prepared for an operator-stack
+    // chunk because the stack publishes the same result to the common post below.
     constexpr int32 TunnelDensityCacheSlotCount = 128;
 
     struct FTunnelNetworkDensityCacheEntry
@@ -983,6 +982,20 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 
         const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
         const uint64 ManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+        // TunnelNetwork/Underwater operator-stack parameters are selected from chunk Z only.
+        // A coarse tile samples thousands of exact XY chunk keys, but those keys describe the
+        // same immutable stack whenever the selected archetype is operator-stack backed.  Share
+        // that prepared state by Z; the stack still queries the actual world position, and its
+        // room-graph cache remains keyed by the real XY search window.  Legacy tunnel states keep
+        // the full XYZ key because their native cache is built for one XY window.
+        const ECaveGeneratorType QueryGeneratorType =
+            StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
+        const bool bShareTunnelStackByZ = !bIsGapChunk
+            && (QueryGeneratorType == ECaveGeneratorType::TunnelNetwork
+                || QueryGeneratorType == ECaveGeneratorType::Underwater)
+            && StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+        const FIntVector TunnelCacheKey = bShareTunnelStackByZ
+            ? FIntVector(0, 0, ChunkCoord.Z) : ChunkCoord;
         FVoxelOpStack* ActiveOpStack = &CP_OpStack;
         FTunnelCoreCacheState* ActiveTunnelCoreCache = &GTunnelCoreCache;
         bool bLoadedTunnelDensityCache = false;
@@ -995,7 +1008,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         auto FindTunnelDensityCacheEntry = [&](const FIntVector& QueryChunk,
                                                 FTunnelNetworkDensityCacheEntry*& OutEntry) -> bool
         {
-            const int32 StartSlot = TunnelDensityCacheSlot(QueryChunk);
+            const int32 StartSlot = TunnelDensityCacheSlot(TunnelCacheKey);
             FTunnelNetworkDensityCacheEntry* ReuseEntry = nullptr;
             for (int32 Probe = 0; Probe < TunnelDensityCacheSlotCount; ++Probe)
             {
@@ -1008,8 +1021,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     continue;
                 }
                 const bool bKeyMatches = Candidate.ManagerLifetimeId == ManagerLifetimeId
-                    && Candidate.Chunk == QueryChunk
+                    && Candidate.Chunk == TunnelCacheKey
                     && Candidate.LayoutVersion == LayoutVersion
+                    && Candidate.bUseOpStack == bShareTunnelStackByZ
                     && (Candidate.GenType == ECaveGeneratorType::TunnelNetwork
                         || Candidate.GenType == ECaveGeneratorType::Underwater);
                 if (bKeyMatches)
@@ -1155,23 +1169,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             // silently fall back to the old one-archetype switch.
             CP_UseOpStack = CP_UseOpStack || CP_UseComposerRegions;
 #endif
-            bool bUseNativeTunnelCore = !CP_UseCustomRecipe
-                && (CP_GenType == ECaveGeneratorType::TunnelNetwork
-                    || CP_GenType == ECaveGeneratorType::Underwater);
-#if WITH_EDITOR
-            bUseNativeTunnelCore = bUseNativeTunnelCore && !CP_UseComposerRegions;
-#endif
-            if (bUseNativeTunnelCore)
-            {
-                PrepareTunnelCoreCache(
-                    *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
-                    LayoutVersion, ManagerLifetimeId, DensityCacheOwnerId, GTunnelCoreCache);
-            }
-            else
-            {
-                GTunnelCoreCache.bValid = false;
-            }
-
             if (CP_UseOpStack)
             {
                 CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
@@ -1278,6 +1275,31 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 }
             }
 
+            // The legacy path needs its prepared native tunnel-core cache.  An operator-stack
+            // tunnel source publishes the same world-space result after EvalMC, so preparing a
+            // second full graph/core cache here would only duplicate the work that made coarse
+            // streaming expensive in the first place.  Custom/composer paths retain the legacy
+            // cache unless their own stack supplies the hand-off.
+            const bool bNativeTunnelCore = !CP_UseCustomRecipe
+                && (CP_GenType == ECaveGeneratorType::TunnelNetwork
+                    || CP_GenType == ECaveGeneratorType::Underwater);
+#if WITH_EDITOR
+            const bool bCanPrepareNativeTunnelCore = bNativeTunnelCore
+                && (!CP_UseOpStack || CP_UseComposerRegions);
+#else
+            const bool bCanPrepareNativeTunnelCore = bNativeTunnelCore && !CP_UseOpStack;
+#endif
+            if (bCanPrepareNativeTunnelCore)
+            {
+                PrepareTunnelCoreCache(
+                    *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
+                    LayoutVersion, ManagerLifetimeId, DensityCacheOwnerId, GTunnelCoreCache);
+            }
+            else
+            {
+                GTunnelCoreCache.bValid = false;
+            }
+
             const bool bNativeTunnelCacheCandidate = !CP_UseCustomRecipe
                 && (CP_GenType == ECaveGeneratorType::TunnelNetwork
                     || CP_GenType == ECaveGeneratorType::Underwater);
@@ -1295,7 +1317,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CachedEntry.bValid = false;
                 CachedEntry.OwnerId = DensityCacheOwnerId;
                 CachedEntry.ManagerLifetimeId = ManagerLifetimeId;
-                CachedEntry.Chunk = ChunkCoord;
+                CachedEntry.Chunk = TunnelCacheKey;
                 CachedEntry.LayoutVersion = LayoutVersion;
                 CachedEntry.GenType = CP_GenType;
                 CachedEntry.Tunnel = CP_Tunnel;
@@ -1484,57 +1506,64 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
         // never once per voxel.
-        if (ActiveTunnelCoreCache->bValid)
+        if (ActiveTunnelCoreCache->bValid || CP_UseOpStack)
         {
-            const FTunnelSupportFloorColumn* SupportColumn = nullptr;
-            FTunnelSupportFloorColumn EmptySupportColumn;
-            const bool bIntegerXY =
-                WorldX == FMath::FloorToFloat(WorldX)
-                && WorldY == FMath::FloorToFloat(WorldY);
-            if (bIntegerXY)
-            {
-                const int32 IX = FMath::FloorToInt(WorldX);
-                const int32 IY = FMath::FloorToInt(WorldY);
-                SupportColumn = FindTunnelSupportColumn(
-                    ActiveTunnelCoreCache->Cache, IX, IY, EmptySupportColumn);
-            }
-
             FTunnelCoreWorldEvaluation TunnelCore;
+            bool bHaveTunnelCore = CP_UseOpStack
+                && ActiveOpStack->TryGetLastTunnelCoreWorldEvaluation(TunnelCore);
+            if (!bHaveTunnelCore && ActiveTunnelCoreCache->bValid)
             {
+                const FTunnelSupportFloorColumn* SupportColumn = nullptr;
+                FTunnelSupportFloorColumn EmptySupportColumn;
+                const bool bIntegerXY =
+                    WorldX == FMath::FloorToFloat(WorldX)
+                    && WorldY == FMath::FloorToFloat(WorldY);
+                if (bIntegerXY)
+                {
+                    const int32 IX = FMath::FloorToInt(WorldX);
+                    const int32 IY = FMath::FloorToInt(WorldY);
+                    SupportColumn = FindTunnelSupportColumn(
+                        ActiveTunnelCoreCache->Cache, IX, IY, EmptySupportColumn);
+                }
+
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
                     SupportColumn);
+                bHaveTunnelCore = true;
             }
-            const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
-            if (bTunnelSupportFloor)
+            if (bHaveTunnelCore)
             {
-                Result = FMath::Min(
-                    Result,
-                    -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
-            }
-            const float CoreSDF = TunnelCore.SDF;
-            if (!bTunnelSupportFloor
-                && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
-            {
-                Result = FMath::Max(
-                    Result,
-                    FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
-            }
+                const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
+                if (bTunnelSupportFloor)
+                {
+                    Result = FMath::Min(
+                        Result,
+                        -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
+                }
+                const float CoreSDF = TunnelCore.SDF;
+                if (!bTunnelSupportFloor
+                    && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
+                {
+                    Result = FMath::Max(
+                        Result,
+                        FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
+                }
 
-            // The graph tunnel can overlap an inter-strate landing at a room mouth. Its air
-            // backstop is allowed to reopen the tunnel, but the landing's proved support floor
-            // must own the final floor band; otherwise the graph post can erase the only support
-            // surface at the mouth and leave the player-fit graph with a disconnected pocket.
-            VF_ApplyOriginLandingFloorMC(
-                Result, WorldX, WorldY, WorldZ,
-                CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-                CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-            StrateManager->ApplyPassageLandingFloorMC(
-                Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
-            StrateManager->ApplyPassageLandingRoomFloorMC(
-                Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+                // The graph tunnel can overlap an inter-strate landing at a room mouth. Its air
+                // backstop is allowed to reopen the tunnel, but the landing's proved support floor
+                // must own the final floor band; otherwise the graph post can erase the only support
+                // surface at the mouth and leave the player-fit graph with a disconnected pocket.
+                VF_ApplyOriginLandingFloorMC(
+                    Result, WorldX, WorldY, WorldZ,
+                    CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                    CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+                StrateManager->ApplyPassageLandingFloorMC(
+                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+                StrateManager->ApplyPassageLandingRoomFloorMC(
+                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+            }
         }
         DensityStructuralPostsTimer.End();
     }
@@ -3468,17 +3497,284 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
 // disturbances/diff. Tout ce qui n'est pas prouvable ⇒ Mixed (le seul coût d'un
 // faux Mixed est du CPU ; un faux AllSolid/AllAir serait un trou).
 
+// A full tile can be Mixed even when every smaller region is provably the same class. This is
+// particularly common at level 0: broad operator bounds overlap an unbounded carve, while the
+// actual tile-sized sub-boxes are all air. Refine only an already-Mixed proof. Every child must
+// resolve, and all resolved children must agree; an unresolved or conflicting child remains Mixed.
+// This is a proof refinement, never a density/sample shortcut.
+static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
+                                              const FBox& VoxelBox,
+                                              const FVoxelOpContext& Context,
+                                              const UVoxelGenerator* Generator,
+                                              const UVoxelStrateManager* StructuralManager)
+{
+    // The ordinary proof stays shallow.  The finite-domain warp retry is paid only by a
+    // tile that already failed the cheap proof, and can afford one more split level because
+    // its purpose is to discharge the LOD0 false-Mixed cases without sampling the field.
+    const int32 MaxRefinementDepth = Context.bTightenWarpProof ? 5 : 2;
+    const bool bTask4TimingProbe = Context.bUseLatticeProof
+        && Context.LatticeOriginVoxels == FIntVector(32, 0, -32)
+        && Context.Step == 1;
+    int32 RefineNodeCount = 0;
+    int32 ExactLeafCount = 0;
+    int32 ExactSampleCount = 0;
+    uint64 StackClassifyCycles = 0;
+    uint64 ExactSampleCycles = 0;
+    const bool bTask4ExactProbe = Context.bUseLatticeProof
+        && (Context.LatticeOriginVoxels == FIntVector(-64, -64, -64)
+            || Context.LatticeOriginVoxels == FIntVector(-64, -96, -64))
+        && Context.Step == 1;
+    auto ClassifyExactLatticeLeaf = [&](const FBox& Box, bool bUseFinalField) -> EVoxelTileClass
+    {
+        if (!Context.bUseLatticeProof || Context.Step <= 0)
+        {
+            return EVoxelTileClass::Mixed;
+        }
+
+        const float Step = static_cast<float>(Context.Step);
+        const FVector Origin(static_cast<float>(Context.LatticeOriginVoxels.X),
+                             static_cast<float>(Context.LatticeOriginVoxels.Y),
+                             static_cast<float>(Context.LatticeOriginVoxels.Z));
+        const int32 IX0 = FMath::CeilToInt((static_cast<float>(Box.Min.X) - Origin.X) / Step - 1.0e-4f);
+        const int32 IY0 = FMath::CeilToInt((static_cast<float>(Box.Min.Y) - Origin.Y) / Step - 1.0e-4f);
+        const int32 IZ0 = FMath::CeilToInt((static_cast<float>(Box.Min.Z) - Origin.Z) / Step - 1.0e-4f);
+        const int32 IX1 = FMath::FloorToInt((static_cast<float>(Box.Max.X) - Origin.X) / Step + 1.0e-4f);
+        const int32 IY1 = FMath::FloorToInt((static_cast<float>(Box.Max.Y) - Origin.Y) / Step + 1.0e-4f);
+        const int32 IZ1 = FMath::FloorToInt((static_cast<float>(Box.Max.Z) - Origin.Z) / Step + 1.0e-4f);
+        const int64 Count = ((int64)IX1 - IX0 + 1)
+                          * ((int64)IY1 - IY0 + 1)
+                          * ((int64)IZ1 - IZ0 + 1);
+        if (IX1 < IX0 || IY1 < IY0 || IZ1 < IZ0 || Count <= 0 || Count > 256)
+        {
+            return EVoxelTileClass::Mixed;
+        }
+
+        bool bAllSolid = true;
+        bool bAllAir = true;
+        int32 PositiveCount = 0;
+        int32 NegativeCount = 0;
+        int32 ZeroOrInvalidCount = 0;
+        float MinDensity = FLT_MAX;
+        float MaxDensity = -FLT_MAX;
+        for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+        for (int32 IY = IY0; IY <= IY1; ++IY)
+        for (int32 IX = IX0; IX <= IX1; ++IX)
+        {
+            const float WorldX = Origin.X + static_cast<float>(IX) * Step;
+            const float WorldY = Origin.Y + static_cast<float>(IY) * Step;
+            const float WorldZ = Origin.Z + static_cast<float>(IZ) * Step;
+            // The operator stack is the cheap proof field.  A passage/landing post is applied
+            // after that stack by GetDensityAt; for a small child that intersects one of those
+            // exact lattice modifiers, certify the final MC-facing field instead of trusting a
+            // core-stack verdict that is deliberately conservative at the post boundary.
+            const uint64 SampleStartCycles = bTask4TimingProbe ? FPlatformTime::Cycles64() : 0;
+            const float Density = bUseFinalField
+                ? -Generator->GetDensityAt(WorldX, WorldY, WorldZ)
+                : Stack.EvalInternal(WorldX, WorldY, WorldZ);
+            if (bTask4TimingProbe)
+            {
+                ExactSampleCycles += FPlatformTime::Cycles64() - SampleStartCycles;
+                ++ExactSampleCount;
+            }
+            if (!FMath::IsFinite(Density) || Density == 0.0f)
+            {
+                ++ZeroOrInvalidCount;
+                IZ = IZ1;
+                IY = IY1;
+                break;
+            }
+            MinDensity = FMath::Min(MinDensity, Density);
+            MaxDensity = FMath::Max(MaxDensity, Density);
+            if (Density > 0.0f) { ++PositiveCount; bAllAir = false; }
+            else                 { ++NegativeCount; bAllSolid = false; }
+            if (!bAllSolid && !bAllAir)
+            {
+                IZ = IZ1;
+                IY = IY1;
+                break;
+            }
+        }
+        const EVoxelTileClass Verdict = ZeroOrInvalidCount > 0 || (PositiveCount > 0 && NegativeCount > 0)
+            ? EVoxelTileClass::Mixed
+            : (bAllSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir);
+        if (bTask4ExactProbe)
+        {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[Task4ExactProbe] depth_box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) count=%lld pos=%d neg=%d zero=%d min=%.6g max=%.6g verdict=%d"),
+                   (float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z,
+                   (float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z,
+                   (long long)Count, PositiveCount, NegativeCount, ZeroOrInvalidCount,
+                   MinDensity, MaxDensity, static_cast<int32>(Verdict));
+        }
+        return Verdict;
+    };
+    auto Refine = [&](auto&& Self, const FBox& Box, int32 Depth) -> EVoxelTileClass
+    {
+        ++RefineNodeCount;
+        const uint64 StackStartCycles = bTask4TimingProbe ? FPlatformTime::Cycles64() : 0;
+        const EVoxelTileClass Whole = Stack.ClassifyBox(Box, Context);
+        if (bTask4TimingProbe)
+        {
+            StackClassifyCycles += FPlatformTime::Cycles64() - StackStartCycles;
+        }
+        const bool bHasStructuralCandidate = StructuralManager != nullptr
+            && (StructuralManager->AnyPassageNearLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step)
+                || StructuralManager->AnyPassageLandingFloorNearLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step)
+                || StructuralManager->AnyOriginLandingNearLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step)
+                || StructuralManager->AnyOriginLandingFloorNearLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step));
+        // A resolved core box already includes the conservative passage carve bound.  Only a
+        // Mixed core box needs the post-disturbance/floor evaluator; applying it to every resolved
+        // child would turn one narrow landing into hundreds of tiny GetDensityAt walks.
+        const bool bNeedsFinalField = Generator != nullptr
+            && bHasStructuralCandidate
+            && Whole == EVoxelTileClass::Mixed;
+        const bool bTask4RefineProbe = Context.bUseLatticeProof
+            && (Context.LatticeOriginVoxels == FIntVector(-96, 96, -96)
+                || Context.LatticeOriginVoxels == FIntVector(-32, 64, -64)
+                || Context.LatticeOriginVoxels == FIntVector(-64, -64, -64)
+                || Context.LatticeOriginVoxels == FIntVector(-64, -96, -64))
+            && Context.Step == 1;
+        if (bTask4RefineProbe)
+        {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[Task4RefineProbe] depth=%d box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) verdict=%d"),
+                   Depth, (float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z,
+                   (float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z,
+                   static_cast<int32>(Whole));
+        }
+        if (Whole != EVoxelTileClass::Mixed)
+        {
+            return Whole;
+        }
+        // At this size the box contains at most 5^3 exact MC vertices. Evaluating those same
+        // vertices is a small, sound certificate for the lattice field the mesher will consume;
+        // it is not a lower-resolution fallback and never changes GenerateMesh's sample count.
+        // This discharges the last conservative SDF interval misses without walking another
+        // refinement level or rebuilding the morphology bounds for every half-box.
+        if (Depth >= 3)
+        {
+            ++ExactLeafCount;
+            const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, bNeedsFinalField);
+            if (Exact != EVoxelTileClass::Mixed)
+            {
+                return Exact;
+            }
+            // The final-field leaf is deliberately a conservative sampling certificate.  A
+            // mixed result means this child really contains both final signs (or an invalid
+            // sample); splitting it again cannot prove the parent uniform and only repeats the
+            // expensive post-aware evaluator.
+            if (bNeedsFinalField)
+            {
+                return EVoxelTileClass::Mixed;
+            }
+        }
+        if (Depth >= MaxRefinementDepth)
+        {
+            return bNeedsFinalField ? EVoxelTileClass::Mixed : Whole;
+        }
+
+        const FVector Mid = (Box.Min + Box.Max) * 0.5f;
+        bool bSawSolid = false;
+        bool bSawAir = false;
+        for (int32 Z = 0; Z < 2; ++Z)
+        for (int32 Y = 0; Y < 2; ++Y)
+        for (int32 X = 0; X < 2; ++X)
+        {
+            const FVector ChildMin(
+                X == 0 ? Box.Min.X : Mid.X,
+                Y == 0 ? Box.Min.Y : Mid.Y,
+                Z == 0 ? Box.Min.Z : Mid.Z);
+            const FVector ChildMax(
+                X == 0 ? Mid.X : Box.Max.X,
+                Y == 0 ? Mid.Y : Box.Max.Y,
+                Z == 0 ? Mid.Z : Box.Max.Z);
+            const EVoxelTileClass Child = Self(Self, FBox(ChildMin, ChildMax), Depth + 1);
+            if (Child == EVoxelTileClass::Mixed)
+            {
+                return EVoxelTileClass::Mixed;
+            }
+            bSawSolid |= Child == EVoxelTileClass::AllSolid;
+            bSawAir   |= Child == EVoxelTileClass::AllAir;
+            if (bSawSolid && bSawAir)
+            {
+                return EVoxelTileClass::Mixed;
+            }
+        }
+        return bSawSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
+    };
+    const EVoxelTileClass Result = Refine(Refine, VoxelBox, 0);
+    if (bTask4TimingProbe)
+    {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[Task4TimingProbe] origin=(%d,%d,%d) step=%d nodes=%d exact_leaves=%d samples=%d stack_ms=%.3f sample_ms=%.3f result=%d"),
+               Context.LatticeOriginVoxels.X, Context.LatticeOriginVoxels.Y,
+               Context.LatticeOriginVoxels.Z, Context.Step,
+               RefineNodeCount, ExactLeafCount, ExactSampleCount,
+               FPlatformTime::ToMilliseconds64(StackClassifyCycles),
+               FPlatformTime::ToMilliseconds64(ExactSampleCycles),
+               static_cast<int32>(Result));
+    }
+    return Result;
+}
+
+// The ordinary proof is deliberately cheap.  Only a box that remains Mixed after its bounded
+// spatial refinement pays for the finite-domain warp interval; this keeps the common empty-tile
+// path at its existing cost while giving the few conservative misses a second sound chance.
+static EVoxelTileClass VF_ClassifyBoxWithWarpRetry(const FVoxelOpStack& Stack,
+                                                   const FBox& VoxelBox,
+                                                   const FVoxelOpContext& Context,
+                                                   const UVoxelGenerator* Generator = nullptr,
+                                                   const UVoxelStrateManager* StructuralManager = nullptr)
+{
+    const EVoxelTileClass Initial = VF_ClassifyBoxRefined(
+        Stack, VoxelBox, Context, Generator, StructuralManager);
+    // A Mixed fine tile is not evidence of geometry: it can be the conservative result of a
+    // coarse operator interval.  Keep the bounded retry for every LOD; skipping it recreates
+    // the false-Mixed empty tiles that send the mesher through the expensive path.
+    if (Initial != EVoxelTileClass::Mixed
+        || Context.bTightenWarpProof)
+    {
+        return Initial;
+    }
+
+    FVoxelOpContext TightContext = Context;
+    TightContext.bTightenWarpProof = true;
+    return VF_ClassifyBoxRefined(
+        Stack, VoxelBox, TightContext, Generator, StructuralManager);
+}
+
 EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
 {
     // Mêmes clamps que GenerateMesh — le verdict doit couvrir le treillis réellement échantillonné.
     Step = FMath::Max(1, Step);
+    // ClassifyTile runs before GenerateMesh installs its LOD TLS. The room-graph source uses this
+    // value only to choose a sound, window-invariant cache region; leaving the previous worker
+    // value (normally 1) makes an LOD4 proof rebuild fine per-chunk graph windows across the
+    // coarse tile. Scope it exactly like the mesher does so standalone classifier calls are also
+    // keyed by their actual lattice step.
+    TGuardValue<int32> ClassifySampleStepGuard(VoxelGenLOD::SampleStep, Step);
     const int32 CPA     = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
-    const int32 GridDim = CPA + 1;   // g ∈ [-1, GridDim] par axe (marge des normales incluse)
+    const int32 GridDim = CPA + 1;   // cell-vertex count: g ∈ [0, CPA]
 
-    // Boîte voxel englobant tous les échantillons du treillis.
-    const int32 MinX = OriginVoxels.X - Step, MaxX = OriginVoxels.X + GridDim * Step;
-    const int32 MinY = OriginVoxels.Y - Step, MaxY = OriginVoxels.Y + GridDim * Step;
-    const int32 MinZ = OriginVoxels.Z - Step, MaxZ = OriginVoxels.Z + GridDim * Step;
+    // The mesher's outer one-sample halo is used only for central-difference normals. It cannot
+    // create a marching-cubes cell: every case index reads vertices g ∈ [0, CPA]. Classify those
+    // actual cell vertices, not the halo. Including g=-1/CPA+1 made a coarse tile look Mixed when
+    // the halo crossed a surface outside the tile while every cell in the tile was uniform.
+    const int32 MinX = OriginVoxels.X, MaxX = OriginVoxels.X + CPA * Step;
+    const int32 MinY = OriginVoxels.Y, MaxY = OriginVoxels.Y + CPA * Step;
+    const int32 MinZ = OriginVoxels.Z, MaxZ = OriginVoxels.Z + CPA * Step;
+    const bool bTask4Probe =
+        (OriginVoxels == FIntVector(-96, 96, -96) && Step == 1)
+        || (OriginVoxels == FIntVector(-32, 64, -64) && Step == 1)
+        || (OriginVoxels == FIntVector(-64, -64, -64) && Step == 1)
+        || (OriginVoxels == FIntVector(-64, -96, -64) && Step == 1)
+        || (OriginVoxels == FIntVector(0, 32, -96) && Step == 2)
+        || (OriginVoxels == FIntVector(-32, -32, -32) && Step == 8)
+        || (OriginVoxels == FIntVector(-96, -32, -32) && Step == 16);
 
     // Division entière PLANCHER (les coords négatives tronquent vers 0 en C++ — pas floor).
     auto FloorDivC = [](int32 A, int32 B) -> int32
@@ -3535,16 +3831,17 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         int32 RecipeBottomChunkZ = 0;
         if (!StrateManager->GetStrateChunkZBounds(
                 RecipeMinChunkZ, RecipeTopChunkZ, RecipeBottomChunkZ)
-            || RecipeMinChunkZ < RecipeBottomChunkZ
-            || RecipeMaxChunkZ > RecipeTopChunkZ)
+                || RecipeMinChunkZ < RecipeBottomChunkZ
+                || RecipeMaxChunkZ > RecipeTopChunkZ)
         {
             return EVoxelTileClass::Mixed;
         }
 
-        const int32 RecipeMinChunkX = FloorDivC(MinX, CHUNK_SIZE);
-        const int32 RecipeMaxChunkX = FloorDivC(MaxX, CHUNK_SIZE);
-        const int32 RecipeMinChunkY = FloorDivC(MinY, CHUNK_SIZE);
-        const int32 RecipeMaxChunkY = FloorDivC(MaxY, CHUNK_SIZE);
+        // Recipes and disturbances are selected from the strate slot's Z only.  The manager
+        // copies the recipe arrays into the output parameters, so repeating this check for every
+        // XY key in the sampled box turns one coarse tile into thousands of identical deep copies.
+        // Keep one representative per distinct Z: this is equivalent for the APIs above and still
+        // rejects a tile when any touched Z changes recipe, bounds, or disturbance state.
         for (int32 CZ = RecipeMinChunkZ; CZ <= RecipeMaxChunkZ; ++CZ)
         {
             int32 TouchedTop = 0;
@@ -3554,33 +3851,27 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             {
                 return EVoxelTileClass::Mixed;
             }
-            for (int32 CY = RecipeMinChunkY; CY <= RecipeMaxChunkY; ++CY)
+            int32 TouchedSeed = 0;
+            ECaveGeneratorType TouchedArchetype = ECaveGeneratorType::TunnelNetwork;
+            FVoxelStrateArchetypeParams TouchedParams;
+            FVoxelOpStackRecipe TouchedRecipe;
+            const FIntVector TouchedChunk(0, 0, CZ);
+            if (!StrateManager->GetRecipeForChunk(
+                    TouchedChunk, TouchedSeed, TouchedArchetype,
+                    TouchedParams, TouchedRecipe)
+                || TouchedSeed != RecipeSeed
+                || TouchedArchetype != RecipeArchetype)
             {
-                for (int32 CX = RecipeMinChunkX; CX <= RecipeMaxChunkX; ++CX)
-                {
-                    int32 TouchedSeed = 0;
-                    ECaveGeneratorType TouchedArchetype = ECaveGeneratorType::TunnelNetwork;
-                    FVoxelStrateArchetypeParams TouchedParams;
-                    FVoxelOpStackRecipe TouchedRecipe;
-                    const FIntVector TouchedChunk(CX, CY, CZ);
-                    if (!StrateManager->GetRecipeForChunk(
-                            TouchedChunk, TouchedSeed, TouchedArchetype,
-                            TouchedParams, TouchedRecipe)
-                        || TouchedSeed != RecipeSeed
-                        || TouchedArchetype != RecipeArchetype)
-                    {
-                        return EVoxelTileClass::Mixed;
-                    }
+                return EVoxelTileClass::Mixed;
+            }
 
-                    const FStrateDisturbanceParams Disturbances =
-                        StrateManager->GetDisturbanceParamsForChunk(TouchedChunk);
-                    if (Disturbances.ChasmDensity > 0.0f
-                        || Disturbances.BridgeDensity > 0.0f
-                        || Disturbances.RidgeDensity > 0.0f)
-                    {
-                        return EVoxelTileClass::Mixed;
-                    }
-                }
+            const FStrateDisturbanceParams Disturbances =
+                StrateManager->GetDisturbanceParamsForChunk(TouchedChunk);
+            if (Disturbances.ChasmDensity > 0.0f
+                || Disturbances.BridgeDensity > 0.0f
+                || Disturbances.RidgeDensity > 0.0f)
+            {
+                return EVoxelTileClass::Mixed;
             }
         }
 
@@ -3593,13 +3884,17 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             return EVoxelTileClass::Mixed;
         }
         RecipeContext.ChunkCoord = FIntVector(
-            RecipeMinChunkX, RecipeMinChunkY, RecipeMinChunkZ);
+            FloorDivC(MinX, CHUNK_SIZE), FloorDivC(MinY, CHUNK_SIZE), RecipeMinChunkZ);
         RecipeContext.Step = Step;
         RecipeContext.LayoutVersion = StrateManager->GetLayoutVersion();
         RecipeContext.WorldRadiusVoxels = WorldRadiusVoxels;
         RecipeContext.EdgeSealThickness = EdgeSealThickness;
+        RecipeContext.bUseLatticeProof = true;
+        RecipeContext.LatticeOriginVoxels = OriginVoxels;
         RecipeStack.PrepareChunk(RecipeContext);
-        return RecipeStack.ClassifyBox(TileVoxelBox, RecipeContext);
+        const EVoxelTileClass RecipeVerdict =
+            VF_ClassifyBoxWithWarpRetry(RecipeStack, TileVoxelBox, RecipeContext);
+        return RecipeVerdict;
     }
 
 #if WITH_EDITOR
@@ -3687,46 +3982,18 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         RegionContext.LayoutVersion = StrateManager->GetLayoutVersion();
         RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
         RegionContext.EdgeSealThickness = EdgeSealThickness;
+        RegionContext.bUseLatticeProof = true;
+        RegionContext.LatticeOriginVoxels = OriginVoxels;
         RegionStack.PrepareChunk(RegionContext);
-        return RegionStack.ClassifyBox(TileVoxelBox, RegionContext);
+        const EVoxelTileClass RegionVerdict =
+            VF_ClassifyBoxWithWarpRetry(RegionStack, TileVoxelBox, RegionContext);
+        return RegionVerdict;
     }
 
 #endif
 
     bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
     bool bCanAir   = true;   // "tout le treillis est air" encore prouvable
-
-    // ── Gardes "carveurs d'air" : cassent AllSolid, jamais AllAir (ils n'ajoutent pas de roche). ──
-    if (StrateManager->AnyPassageNearBox(FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
-    {
-        bCanSolid = false;
-    }
-    // A landing is bidirectional geometry: its chamber kills the AllSolid hypothesis, while its
-    // guaranteed support slab kills AllAir.  Without this second guard a tile covering only the
-    // floor could be classified uniformly air and the mesher would skip the solid support that
-    // keeps the player from falling through it.  The operator-stack path returns Both for the
-    // same box, so the hand-written legacy fold must carry the identical hypothesis kill here.
-    if (StrateManager->AnyPassageLandingFloorNearBox(
-            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
-    {
-        bCanAir = false;
-    }
-    if (StrateManager->AnyOriginLandingNearBox(
-            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
-    {
-        // The origin post is a room carve, not a full-height spine. Its conservative manager
-        // guard is per tile, so it retains the hot-path invariant while covering every strate's
-        // room AABB and its four-voxel carve blend.
-        bCanSolid = false;
-    }
-    if (StrateManager->AnyOriginLandingFloorNearBox(
-            FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ)))
-    {
-        // The same origin room also owns a guaranteed support slab, so a tile touching only that
-        // slab cannot be proved uniformly air.
-        bCanAir = false;
-    }
-
     // ── Catégorisation par Z du treillis : gap bedrock = solide ; hors layout = air constant ;
     //    SurfaceWorld = test colonne ; un slot cave opt-in = verdict de pile sur sa sous-boîte. ──
     struct FSurfSlot
@@ -3780,7 +4047,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         int32 UnusedTopCZ = 0, UnusedBotCZ = 0;
         return StrateManager->GetStrateChunkZBounds(Z, UnusedTopCZ, UnusedBotCZ);
     };
-    for (int32 g = -1; g <= GridDim; ++g)
+    for (int32 g = 0; g <= CPA; ++g)
     {
         const int32 Zi = OriginVoxels.Z + g * Step;
         const int32 ChunkZ = FloorDivC(Zi, CHUNK_SIZE);
@@ -3965,10 +4232,65 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             if (bInBand) { bCanAir = false; }
             else         { S.InteriorZ.Add(Z); }
         }
-        if (!bCanSolid && !bCanAir) return EVoxelTileClass::Mixed;
+        if (!bCanSolid && !bCanAir) { return EVoxelTileClass::Mixed; }
     }
 
-    //=========================================================================
+    if (bTask4Probe)
+    {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[Task4Probe] phase=z origin=(%d,%d,%d) step=%d solid=%d air=%d cave=%d gap=%d surface=%d out=%d cave_z=(%d,%d)"),
+               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+               bCanSolid ? 1 : 0, bCanAir ? 1 : 0, bAnyCave ? 1 : 0,
+               bAnyGap ? 1 : 0, bAnySurface ? 1 : 0, bAnyOutOfLayout ? 1 : 0,
+               CaveMinZ, CaveMaxZ);
+    }
+
+    // Out-of-layout is a constant-air field. Passage tubes and origin rooms can only carve that
+    // field, so they cannot invalidate AllAir; only their guaranteed support floors can add solid
+    // voxels. Do this after the cheap Z categorisation so open-air LOD tiles avoid the exact
+    // passage-carve lattice walk and the room scan entirely. A floor-only tile remains Mixed and
+    // is meshed normally, preserving the support backstops.
+    if (bAnyOutOfLayout && !bAnyCave && !bAnySurface && !bAnyGap)
+    {
+        if (StrateManager->AnyPassageLandingFloorNearLattice(
+                TileVoxelBox, OriginVoxels, Step)
+            || StrateManager->AnyOriginLandingFloorNearLattice(
+                TileVoxelBox, OriginVoxels, Step))
+        {
+            return EVoxelTileClass::Mixed;
+        }
+        return EVoxelTileClass::AllAir;
+    }
+
+    // ── Structural passage/origin guards for non-open-air categories. ──
+    // Carvers kill AllSolid but never add rock; landing and origin support floors kill AllAir.
+    if (StrateManager->AnyPassageNearLattice(
+            TileVoxelBox, OriginVoxels, Step))
+    {
+        bCanSolid = false;
+    }
+    if (StrateManager->AnyPassageLandingFloorNearLattice(
+            TileVoxelBox, OriginVoxels, Step))
+    {
+        bCanAir = false;
+    }
+    if (StrateManager->AnyOriginLandingNearLattice(
+            TileVoxelBox, OriginVoxels, Step))
+    {
+        bCanSolid = false;
+    }
+    if (StrateManager->AnyOriginLandingFloorNearLattice(
+            TileVoxelBox, OriginVoxels, Step))
+    {
+        bCanAir = false;
+    }
+    if (bTask4Probe)
+    {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[Task4Probe] phase=guards origin=(%d,%d,%d) step=%d solid=%d air=%d"),
+               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+               bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
+    }
     // ── LE PLIAGE DE LA PILE D'OPÉRATEURS, POUR LES ARCHÉTYPES DE CAVE ──
     //=========================================================================
     // ⚠️ ERREUR ICI = TROU, PAS RÉGRESSION. Un verdict non-Mixed fait SAUTER `GenerateMesh` : pas
@@ -4017,10 +4339,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // represented by this stack; their hypotheses were folded separately in the Z pass.
         const int32 CZ0 = FloorDivC(CaveMinZ, CHUNK_SIZE), CZ1 = FloorDivC(CaveMaxZ, CHUNK_SIZE);
 
-        // Une tuile très étalée (Step élevé) toucherait trop de chunks pour que cette vérification
-        // reste bon marché. Au-delà, `Mixed` — on renonce au gain, jamais à la sûreté.
+        // Keep the parameter identity check bounded, but do not use the old 27-key cutoff here:
+        // LOD4 legitimately covers 19^3 = 6,859 chunk keys.  Returning Mixed at that point sent
+        // the tile straight to GenerateMesh, where GetDensityAt rebuilt one exact-chunk state for
+        // almost every coarse sample.  The operator proof now shares its root morphology cache
+        // across refined children, so this scan is cheap compared with the fallback it prevents.
         const int64 NumChunkCoords = (int64)(CX1 - CX0 + 1) * (int64)(CY1 - CY0 + 1) * (int64)(CZ1 - CZ0 + 1);
-        if (NumChunkCoords > 27)
+        constexpr int64 MaxClassifiedChunkCoords = 262144;
+        if (NumChunkCoords > MaxClassifiedChunkCoords)
         {
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailParams);
             return EVoxelTileClass::Mixed;
@@ -4144,6 +4470,9 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         OpCtx.Step          = Step;
         OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
         OpCtx.EdgeSealThickness = EdgeSealThickness;
+        OpCtx.bUseLatticeProof = true;
+        OpCtx.bTightenWarpProof = Step <= 2;
+        OpCtx.LatticeOriginVoxels = OriginVoxels;
 
         FVoxelOpStack TileStack;
         if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
@@ -4158,15 +4487,90 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
         const FBox CaveBox(FVector((float)MinX, (float)MinY, (float)CaveMinZ),
                            FVector((float)MaxX, (float)MaxY, (float)CaveMaxZ));
-        const EVoxelTileClass StackVerdict = TileStack.ClassifyBox(CaveBox, OpCtx);
+        const EVoxelTileClass StackVerdict = VF_ClassifyBoxWithWarpRetry(
+            TileStack, CaveBox, OpCtx, this, StrateManager);
+        if (bTask4Probe)
+        {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[Task4Probe] phase=stack origin=(%d,%d,%d) step=%d verdict=%d solid=%d air=%d"),
+                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+                   static_cast<int32>(StackVerdict), bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
+        }
         if (StackVerdict == EVoxelTileClass::Mixed)
         {
+        if (bTask4Probe)
+        {
+            int32 SolidKiller = INDEX_NONE;
+            int32 AirKiller = INDEX_NONE;
+            const EVoxelTileClass Attributed = TileStack.ClassifyBoxAttributed(
+                    CaveBox, OpCtx, SolidKiller, AirKiller);
+                UE_LOG(LogTemp, Warning,
+                       TEXT("[Task4Probe] stack_attributed origin=(%d,%d,%d) step=%d verdict=%d solid_killer=%d:%s air_killer=%d:%s"),
+                       OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+                       static_cast<int32>(Attributed), SolidKiller,
+                       TileStack.GetOpDebugName(SolidKiller), AirKiller,
+                       TileStack.GetOpDebugName(AirKiller));
+
+            int32 FinalPositive = 0;
+            int32 FinalNegative = 0;
+            int32 FinalZeroOrInvalid = 0;
+            float FinalMin = FLT_MAX;
+            float FinalMax = -FLT_MAX;
+            for (int32 Z = MinZ; Z <= MaxZ; Z += Step)
+            for (int32 Y = MinY; Y <= MaxY; Y += Step)
+            for (int32 X = MinX; X <= MaxX; X += Step)
+            {
+                const float FinalDensity = GetDensityAt((float)X, (float)Y, (float)Z);
+                if (!FMath::IsFinite(FinalDensity) || FinalDensity == 0.0f)
+                {
+                    ++FinalZeroOrInvalid;
+                }
+                else if (FinalDensity > 0.0f)
+                {
+                    ++FinalPositive;
+                    FinalMin = FMath::Min(FinalMin, FinalDensity);
+                    FinalMax = FMath::Max(FinalMax, FinalDensity);
+                }
+                else
+                {
+                    ++FinalNegative;
+                    FinalMin = FMath::Min(FinalMin, FinalDensity);
+                    FinalMax = FMath::Max(FinalMax, FinalDensity);
+                }
+            }
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[Task4Probe] final_samples origin=(%d,%d,%d) step=%d pos=%d neg=%d zero=%d min=%.6g max=%.6g"),
+                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+                   FinalPositive, FinalNegative, FinalZeroOrInvalid, FinalMin, FinalMax);
+        }
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailStackVerdict);
             return EVoxelTileClass::Mixed;
         }
 
-        if (StackVerdict == EVoxelTileClass::AllSolid) { bCanAir = false; }
-        else                                           { bCanSolid = false; }
+        const bool bCaveOnlyTile = bAnyCave
+            && !bAnyGap && !bAnySurface && !bAnyOutOfLayout
+            && CaveMinZ == MinZ && CaveMaxZ == MaxZ;
+        if (bCaveOnlyTile && StackVerdict == EVoxelTileClass::AllSolid)
+        {
+            // The stack verdict covers the complete cave-only MC lattice. Its exact structural
+            // post path was supplied above, so a broad conservative passage guard must not force
+            // this already-certified solid tile through GenerateMesh.
+            bCanSolid = true;
+            bCanAir = false;
+        }
+        else if (bCaveOnlyTile && StackVerdict == EVoxelTileClass::AllAir)
+        {
+            bCanSolid = false;
+            bCanAir = true;
+        }
+        else if (StackVerdict == EVoxelTileClass::AllSolid)
+        {
+            bCanAir = false;
+        }
+        else
+        {
+            bCanSolid = false;
+        }
 
         // Le verdict cave se plie avec gap=solide, hors-layout=air, seals surface=solide. Si les
         // deux hypothèses sont mortes ici, les catégories se contredisent : ce n'est PAS un échec
@@ -4240,18 +4644,28 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         && (Slots[0].InteriorZ.Num() > 0 || (NumSlots > 1 && Slots[1].InteriorZ.Num() > 0));
     if (bNeedColumns)
     {
-        const int32 PreStride = FMath::Max(1, (GridDim + 1) / 4);
-        for (int32 gy = -1; gy <= GridDim; gy += PreStride)
-            for (int32 gx = -1; gx <= GridDim; gx += PreStride)
+        const int32 PreStride = FMath::Max(1, GridDim / 4);
+        for (int32 gy = 0; gy <= CPA; gy += PreStride)
+            for (int32 gx = 0; gx <= CPA; gx += PreStride)
                 if (!TestColumn(gx, gy)) return EVoxelTileClass::Mixed;
-        for (int32 gy = -1; gy <= GridDim; ++gy)
-            for (int32 gx = -1; gx <= GridDim; ++gx)
+        for (int32 gy = 0; gy <= CPA; ++gy)
+            for (int32 gx = 0; gx <= CPA; ++gx)
                 if (!TestColumn(gx, gy)) return EVoxelTileClass::Mixed;
     }
 
     // Ici exactement UNE hypothèse doit survivre (chaque point testé en tue une ; les tuiles
     // sans point intérieur ont tué AllAir via gap/seal). Égalité = prudence → Mixed.
-    if (bCanSolid == bCanAir) return EVoxelTileClass::Mixed;
+    if (bCanSolid == bCanAir)
+    {
+        if (bTask4Probe)
+        {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[Task4Probe] phase=final origin=(%d,%d,%d) step=%d verdict=0 solid=%d air=%d"),
+                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+                   bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
+        }
+        return EVoxelTileClass::Mixed;
+    }
     if (bAnyCave)
     {
         // Compte seulement les verdicts FINAUX qui sautent réellement une tuile. Une pile peut avoir
@@ -4260,6 +4674,13 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // invalidate the hypothesis proved for the cave sub-box.
         if (bCanSolid) { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid); }
         else           { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir); }
+    }
+    if (bTask4Probe)
+    {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[Task4Probe] phase=final origin=(%d,%d,%d) step=%d verdict=%d solid=%d air=%d"),
+               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
+               bCanSolid ? 1 : 2, bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
     }
     return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
 }

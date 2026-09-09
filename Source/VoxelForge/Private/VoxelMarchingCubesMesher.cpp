@@ -227,6 +227,85 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
 
     MesherSetupTimer.End();
 
+    // Optional 8x8x8-cell block proof.  The tile classifier has already returned Mixed, but
+    // that is a conservative answer over the whole tile.  A tile can still be uniformly solid
+    // (or uniformly air) when its smaller blocks are each provable.  Do this before allocating
+    // or filling the density grid: the grid is only needed when at least one block can contain
+    // a surface.  A whole-tile early return is allowed only when every relevant block has the
+    // SAME verdict; adjacent uniform blocks with opposite signs can contain a surface between
+    // them.  This is a proof-only optimization: ClassifyTile is conservative and no samples or
+    // resolution are removed from a tile that reaches the mesher.
+    TArray<uint8> BlockSkip;
+    int32 BlocksPerAxis = 0;
+    if (bUseBlockEarlyOut && !OutCaptureGrid && Step == 1)
+    {
+        constexpr int32 BlockCells = 8;
+        BlocksPerAxis = (CellsPerAxis + BlockCells - 1) / BlockCells;
+        BlockSkip.Init(0, BlocksPerAxis * BlocksPerAxis * BlocksPerAxis);
+        bool bHaveUniformBlock = false;
+        EVoxelTileClass FirstUniformVerdict = EVoxelTileClass::Mixed;
+        bool bAllRelevantBlocksUniform = true;
+        bool bAllRelevantBlocksSame = true;
+
+        for (int32 BlockZ = 0; BlockZ < BlocksPerAxis; ++BlockZ)
+        {
+            const int32 BlockMinZ = BlockZ * BlockCells;
+            const int32 BlockMaxZ = FMath::Min(CellsPerAxis - 1,
+                                               BlockMinZ + BlockCells - 1);
+            if (BlockMaxZ < CzLo || BlockMinZ > CzHi)
+            {
+                continue;
+            }
+            for (int32 BlockY = 0; BlockY < BlocksPerAxis; ++BlockY)
+            {
+                for (int32 BlockX = 0; BlockX < BlocksPerAxis; ++BlockX)
+                {
+                    const FIntVector BlockOrigin = OriginVoxels + FIntVector(
+                        BlockX * BlockCells * Step,
+                        BlockY * BlockCells * Step,
+                        BlockMinZ * Step);
+                    if (VoxelDensityProfile::AreCountersEnabled())
+                    {
+                        VoxelDensityProfile::AddCounter(
+                            VoxelDensityProfile::ECounter::MesherBlockTests);
+                    }
+                    const EVoxelTileClass Verdict = Generator->ClassifyTile(
+                        BlockOrigin, Step, BlockCells);
+                    if (Verdict == EVoxelTileClass::AllSolid
+                        || Verdict == EVoxelTileClass::AllAir)
+                    {
+                        BlockSkip[((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX] = 1;
+                        if (VoxelDensityProfile::AreCountersEnabled())
+                        {
+                            VoxelDensityProfile::AddCounter(
+                                Verdict == EVoxelTileClass::AllSolid
+                                    ? VoxelDensityProfile::ECounter::MesherBlockAllSolid
+                                    : VoxelDensityProfile::ECounter::MesherBlockAllAir);
+                        }
+                        if (!bHaveUniformBlock)
+                        {
+                            FirstUniformVerdict = Verdict;
+                            bHaveUniformBlock = true;
+                        }
+                        else if (FirstUniformVerdict != Verdict)
+                        {
+                            bAllRelevantBlocksSame = false;
+                        }
+                    }
+                    else
+                    {
+                        bAllRelevantBlocksUniform = false;
+                    }
+                }
+            }
+        }
+
+        if (bHaveUniformBlock && bAllRelevantBlocksUniform && bAllRelevantBlocksSame)
+        {
+            return MeshData;
+        }
+    }
+
     // Réutilise le tampon entre tuiles (thread_local) : SetNumUninitialized garde la
     // capacité, donc plus de malloc/free de ~170 Ko (35³ floats) par tuile.
     static thread_local TArray<float> DensityGrid;
@@ -284,58 +363,6 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         }
     }
     MesherDensityGridTimer.End();
-
-    // Optional 8x8x8-cell block early-out. ClassifyTile uses the same one-point halo and the
-    // same cave/disturbance/diff-layer guards as production tile loading. It is deliberately
-    // performed after the density grid is complete: skipping only the Marching Cubes work keeps
-    // the grid, capture buffer, geometry, normals, and all density-side effects identical.
-    TArray<uint8> BlockSkip;
-    int32 BlocksPerAxis = 0;
-    if (bUseBlockEarlyOut)
-    {
-        constexpr int32 BlockCells = 8;
-        BlocksPerAxis = (CellsPerAxis + BlockCells - 1) / BlockCells;
-        BlockSkip.Init(0, BlocksPerAxis * BlocksPerAxis * BlocksPerAxis);
-        for (int32 BlockZ = 0; BlockZ < BlocksPerAxis; ++BlockZ)
-        {
-            const int32 BlockMinZ = BlockZ * BlockCells;
-            const int32 BlockMaxZ = FMath::Min(CellsPerAxis - 1,
-                                               BlockMinZ + BlockCells - 1);
-            if (BlockMaxZ < CzLo || BlockMinZ > CzHi)
-            {
-                continue;
-            }
-            for (int32 BlockY = 0; BlockY < BlocksPerAxis; ++BlockY)
-            {
-                for (int32 BlockX = 0; BlockX < BlocksPerAxis; ++BlockX)
-                {
-                    const FIntVector BlockOrigin = OriginVoxels + FIntVector(
-                        BlockX * BlockCells * Step,
-                        BlockY * BlockCells * Step,
-                        BlockMinZ * Step);
-                    if (VoxelDensityProfile::AreCountersEnabled())
-                    {
-                        VoxelDensityProfile::AddCounter(
-                            VoxelDensityProfile::ECounter::MesherBlockTests);
-                    }
-                    const EVoxelTileClass Verdict = Generator->ClassifyTile(
-                        BlockOrigin, Step, BlockCells);
-                    if (Verdict == EVoxelTileClass::AllSolid
-                        || Verdict == EVoxelTileClass::AllAir)
-                    {
-                        BlockSkip[((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX] = 1;
-                        if (VoxelDensityProfile::AreCountersEnabled())
-                        {
-                            VoxelDensityProfile::AddCounter(
-                                Verdict == EVoxelTileClass::AllSolid
-                                    ? VoxelDensityProfile::ECounter::MesherBlockAllSolid
-                                    : VoxelDensityProfile::ECounter::MesherBlockAllAir);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // ── CAPTURE-DURING-MESHING ──
     // Si demandé et que la tuile est pleine résolution (CellsPerAxis==CHUNK_SIZE ⇒ Step==1<<Level,
@@ -396,7 +423,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
-                if (bUseBlockEarlyOut
+                if (bUseBlockEarlyOut && Step == 1
                     && BlockSkip[((cz / 8) * BlocksPerAxis + (cy / 8)) * BlocksPerAxis + (cx / 8)] != 0)
                 {
                     continue;

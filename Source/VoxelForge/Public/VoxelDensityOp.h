@@ -102,6 +102,7 @@
 #include "VoxelTypes.h"        // CHUNK_SIZE, EVoxelTileClass
 
 struct FBiomeContext;
+struct FTunnelCoreWorldEvaluation;
 
 //=============================================================================
 // LES QUATRE RÔLES / THE FOUR ROLES
@@ -284,6 +285,18 @@ struct FVoxelOpContext
     float StrateTopWorldZ = 0.0f;
     float StrateBottomWorldZ = 0.0f;
 
+    // ClassifyTile may ask box bounds about the exact marching-cubes lattice rather than the
+    // continuous volume between samples.  Production voxel evaluation leaves this disabled;
+    // when enabled, operators may tighten a conservative bound only for points
+    // LatticeOriginVoxels + n * Step that lie inside the queried box.
+    bool bUseLatticeProof = false;
+    FIntVector LatticeOriginVoxels = FIntVector::ZeroValue;
+
+    // A mixed tile may opt into a tighter, still conservative finite-box bound for domain-warped
+    // sources.  The normal classifier leaves this off; ClassifyTile retries only the few boxes
+    // that the cheap global proof could not resolve.
+    bool bTightenWarpProof = false;
+
     // null = cette strate n'a pas de champ de biome.
     const FBiomeContext* Biome = nullptr;
 };
@@ -456,6 +469,14 @@ public:
      * VoxelForge.Determinism.DensityPurity vérifie cela.
      */
     virtual void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const = 0;
+
+    /** Optional hand-off for the common structural tail.  The default keeps custom operators
+     * conservative: the caller uses its canonical cache path when no source publishes a result. */
+    virtual bool TryGetLastTunnelCoreWorldEvaluation(
+        FTunnelCoreWorldEvaluation& OutEvaluation) const
+    {
+        return false;
+    }
 
     /**
      * CONSERVATIF. The two-argument method is the intrinsic fallback. The state-aware overload
@@ -717,7 +738,9 @@ FORCEINLINE void VF_ForceHypotheses(FVoxelBoxHypotheses& H, EVoxelTileClass Forc
  * c'est la propriété de sûreté, et le pliage numérique ne l'affaiblit pas : une marge ne peut que
  * DESCENDRE, jamais remonter, en dehors d'un opérateur forçant.
  *
- * ⚠️ `MaxCarve` / `MaxFill` valent `FLT_MAX` par défaut = « amplitude inconnue ». La soustraction
+ * ⚠️ `MaxCarve` / `MaxFill` valent `FLT_MAX` par défaut = « amplitude inconnue ». Une borne finie
+ * nulle signifie au contraire « identité prouvée » pour cette direction : l'opérateur peut être
+ * géométriquement présent mais ne modifie aucun échantillon de la boîte. La soustraction
  * fait alors passer la marge très en dessous de zéro et l'hypothèse meurt, exactement comme la
  * version purement directionnelle de ce pliage. Aucun opérateur existant ne change de verdict.
  * (Arithmétique volontairement laissée en float sans garde : `0 − FLT_MAX` vaut `−FLT_MAX`,
@@ -733,21 +756,67 @@ FORCEINLINE void VF_FoldEffect(FVoxelBoxHypotheses& H, EVoxelOpEffect Effect,
         break;
 
     case EVoxelOpEffect::CarveOnly:
+        // A finite zero bound is a proved identity for this direction. This matters for
+        // state-aware structural guards: a passage may be geometrically present in a box while
+        // its exact lattice carve factor is zero, and that must not kill an otherwise valid
+        // AllSolid hypothesis merely because its margin is zero/unknown.
+        if (MaxCarve == 0.0f)
+        {
+            break;
+        }
+        if (!(MaxCarve >= 0.0f))
+        {
+            H.bCanBeAllSolid = false;
+            H.SolidMargin = -FLT_MAX;
+            break;
+        }
         H.SolidMargin -= MaxCarve;
         if (!(H.SolidMargin > 0.0f)) { H.bCanBeAllSolid = false; }
         break;
 
     case EVoxelOpEffect::FillOnly:
+        if (MaxFill == 0.0f)
+        {
+            break;
+        }
+        if (!(MaxFill >= 0.0f))
+        {
+            H.bCanBeAllAir = false;
+            H.AirMargin = -FLT_MAX;
+            break;
+        }
         H.AirMargin -= MaxFill;
         if (!(H.AirMargin > 0.0f)) { H.bCanBeAllAir = false; }
         break;
 
     case EVoxelOpEffect::Both:
     default:
-        H.SolidMargin -= MaxCarve;
-        if (!(H.SolidMargin > 0.0f)) { H.bCanBeAllSolid = false; }
-        H.AirMargin -= MaxFill;
-        if (!(H.AirMargin > 0.0f)) { H.bCanBeAllAir = false; }
+        if (MaxCarve != 0.0f)
+        {
+            if (!(MaxCarve >= 0.0f))
+            {
+                H.bCanBeAllSolid = false;
+                H.SolidMargin = -FLT_MAX;
+            }
+            else
+            {
+                H.SolidMargin -= MaxCarve;
+                if (!(H.SolidMargin > 0.0f)) { H.bCanBeAllSolid = false; }
+            }
+        }
+        if (MaxFill != 0.0f)
+        {
+            if (!(MaxFill >= 0.0f))
+            {
+                H.bCanBeAllAir = false;
+                H.AirMargin = -FLT_MAX;
+            }
+            else
+            {
+                H.AirMargin -= MaxFill;
+                if (!(H.AirMargin > 0.0f)) { H.bCanBeAllAir = false; }
+            }
+        }
         break;
     }
 }
