@@ -1172,11 +1172,22 @@ void AVoxelWorld::ProcessPendingChunks()
     // This prevents stutters from applying too many meshes in one frame.
     // Budget limits how many VISIBLE mesh applies we do per frame (GPU upload cost).
     // Empty meshes and stale results are free to drain — don't count them.
-    const int32 MaxApplies = Settings ? Settings->MaxMeshAppliesPerFrame : 4;
+    const bool bProfileApply = GVoxelForgeProfileTileGeneration != 0;
+    const uint64 DrainStartCycles = FPlatformTime::Cycles64();
+    const int32 MaxApplies = FMath::Max(
+        Settings ? Settings->MaxMeshAppliesPerFrame : 4, 1);
+    const float ApplyBudgetMilliseconds = Settings
+        ? FMath::Max(Settings->MaxMeshApplyMilliseconds, 0.0f)
+        : 2.0f;
+    const double ApplyBudgetSeconds =
+        static_cast<double>(ApplyBudgetMilliseconds) * 0.001;
     int32 MeshesApplied = 0;
+    int32 ResultsDrained = 0;
+    bool bTimeBudgetHit = false;
     FChunkResult DequeuedChunk;
     while (ProcessQueue.Dequeue(DequeuedChunk))
     {
+        ++ResultsDrained;
         PendingTiles.Remove(DequeuedChunk.Tile);
 
         // A worker can observe shutdown after entering the mesher. Do not turn that partial
@@ -1190,13 +1201,37 @@ void AVoxelWorld::ProcessPendingChunks()
         // Only a real (visible) upload counts against the per-frame budget — stale/empty drain free.
         if (ApplyTileResult(DequeuedChunk))
         {
-            if (++MeshesApplied >= MaxApplies)
-            {
-                break;
-            }
+            ++MeshesApplied;
+        }
+
+        // Time-box the entire game-thread drain, not only visible uploads. Empty releases and
+        // stale-result cleanup normally cost nothing, but a pooled component teardown or a
+        // backend callback can still be the one result that produces the player's hitch.
+        if (ApplyBudgetSeconds > 0.0
+            && FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - DrainStartCycles)
+                >= ApplyBudgetSeconds)
+        {
+            bTimeBudgetHit = true;
+            break;
+        }
+        if (MeshesApplied >= MaxApplies)
+        {
+            break;
         }
     }
 
+    if (bProfileApply && ResultsDrained > 0)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeApplyFrame] drained=%d meshes=%d elapsed=%.6f "
+                 "max_meshes=%d budget_ms=%.3f budget_hit=%d"),
+            ResultsDrained,
+            MeshesApplied,
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - DrainStartCycles),
+            MaxApplies,
+            ApplyBudgetMilliseconds,
+            bTimeBudgetHit ? 1 : 0);
+    }
 }
 
 // Game-thread apply for one gen result. Shared by ProcessPendingChunks (async drain) and
@@ -1209,13 +1244,21 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
 
-    if (GVoxelForgeProfileTileGeneration != 0 && Result.RequestStartCycles != 0)
+    // "Ready" is deliberately emitted after the game-thread apply, not when the worker result is
+    // dequeued. This makes request-to-ready include component setup, stream/buffer submission,
+    // and collision configuration—the point at which the chunk is actually visible/collidable.
+    const bool bResultEmpty = Result.bEmpty || !Result.Streams;
+    const auto LogTileReady = [&]()
     {
-        UE_LOG(LogTemp, Display,
-            TEXT("[VoxelForgeTileReady] level=%d empty=%d request_to_ready=%.6f"),
-            Result.Tile.Level, Result.bEmpty || !Result.Streams ? 1 : 0,
-            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - Result.RequestStartCycles));
-    }
+        if (GVoxelForgeProfileTileGeneration != 0 && Result.RequestStartCycles != 0)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTileReady] level=%d empty=%d request_to_ready=%.6f"),
+                Result.Tile.Level, bResultEmpty ? 1 : 0,
+                FPlatformTime::ToSeconds64(
+                    FPlatformTime::Cycles64() - Result.RequestStartCycles));
+        }
+    };
 
     // Mark the tile loaded (even if empty — so we don't re-submit it).
     LoadedTiles.Add(Result.Tile);
@@ -1240,17 +1283,35 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         // bande déplacée hors de la tuile, ou skip cellule-plus-haute-que-la-bande après un
         // changement de strate (LoadTile). L'ancien composant doit tomber, sinon sa vieille
         // géométrie (l'autre strate !) reste affichée. Première gen vide : Find rate, no-op.
+        const uint64 EmptyReleaseStartCycles = GVoxelForgeProfileTileGeneration != 0
+            ? FPlatformTime::Cycles64() : 0;
+        bool bReleasedComponent = false;
         if (URealtimeMeshComponent** OldComp = TileComponents.Find(Result.Tile))
         {
-            if (*OldComp) { ReleaseTileComponent(*OldComp); }
+            if (*OldComp)
+            {
+                ReleaseTileComponent(*OldComp);
+                bReleasedComponent = true;
+            }
             TileComponents.Remove(Result.Tile);
         }
+        if (GVoxelForgeProfileTileGeneration != 0)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeApplyProfile] level=%d empty=1 component_release=%d total=%.6f"),
+                Result.Tile.Level,
+                bReleasedComponent ? 1 : 0,
+                FPlatformTime::ToSeconds64(
+                    FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
+        }
+        LogTileReady();
         return false;
     }
 
     // Apply mesh (GPU upload). The vertex/index buffers were already built (T1.f, on the worker for
     // the async path or inline for the sync carve path); the game thread only uploads them here.
     ApplyMeshToTile(Result);
+    LogTileReady();
     return true;
 }
 
@@ -2291,8 +2352,15 @@ static FRealtimeMeshSectionGroupKey VoxelTileGroupKey()
 //=============================================================================
 // Recycler les composants de tuile au lieu de les détruire/recréer.
 
-URealtimeMeshComponent* AVoxelWorld::AcquireTileComponent()
+URealtimeMeshComponent* AVoxelWorld::AcquireTileComponent(
+    double* OutCreationSeconds,
+    double* OutRegistrationSeconds,
+    bool* bOutCreated)
 {
+    if (OutCreationSeconds != nullptr) { *OutCreationSeconds = 0.0; }
+    if (OutRegistrationSeconds != nullptr) { *OutRegistrationSeconds = 0.0; }
+    if (bOutCreated != nullptr) { *bOutCreated = false; }
+
     // Reuse a parked component when one is available — skips NewObject + RegisterComponent
     // (and the full proxy teardown/GC of a destroy) during fast travel & regen bursts.
     while (TileComponentPool.Num() > 0)
@@ -2305,6 +2373,10 @@ URealtimeMeshComponent* AVoxelWorld::AcquireTileComponent()
         }
     }
 
+    const bool bMeasureComponentPhases = OutCreationSeconds != nullptr
+        || OutRegistrationSeconds != nullptr;
+    const uint64 CreationStartCycles = bMeasureComponentPhases
+        ? FPlatformTime::Cycles64() : 0;
     URealtimeMeshComponent* MeshComp = NewObject<URealtimeMeshComponent>(this);
     // Generated once, never moves → Static so RMC's cached static draw path + VSM shadow
     // caching apply (see the root SetMobility note in BeginPlay). Must be set before register.
@@ -2313,8 +2385,21 @@ URealtimeMeshComponent* AVoxelWorld::AcquireTileComponent()
     MeshComp->SetMobility(EComponentMobility::Static);
     MeshComp->SetGenerateOverlapEvents(false);   // chunks use raycasts, not overlaps
     MeshComp->SetCanEverAffectNavigation(false);
+    if (OutCreationSeconds != nullptr)
+    {
+        *OutCreationSeconds = FPlatformTime::ToSeconds64(
+            FPlatformTime::Cycles64() - CreationStartCycles);
+    }
+    const uint64 RegistrationStartCycles = bMeasureComponentPhases
+        ? FPlatformTime::Cycles64() : 0;
     MeshComp->RegisterComponent();
     MeshComp->AttachToComponent(GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+    if (OutRegistrationSeconds != nullptr)
+    {
+        *OutRegistrationSeconds = FPlatformTime::ToSeconds64(
+            FPlatformTime::Cycles64() - RegistrationStartCycles);
+    }
+    if (bOutCreated != nullptr) { *bOutCreated = true; }
     return MeshComp;
 }
 
@@ -2357,6 +2442,9 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
 void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ApplyMeshToChunk);
+
+    const bool bProfileApply = GVoxelForgeProfileTileGeneration != 0;
+    const uint64 ApplyStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
 
     // Streams are pre-built on the worker (T1.f) and guaranteed non-empty by the caller
     // (ProcessPendingChunks skips empty tiles). This path is game-thread-CHEAP: material lookup +
@@ -2414,6 +2502,9 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
         if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(GroundMaterial))  { GroundMaterial = MID; }
         if (UMaterialInstanceDynamic* MID = GetOrCreateTerrainMID(CeilingMaterial)) { CeilingMaterial = MID; }
     }
+    const double MaterialSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles)
+        : 0.0;
 
     // The geometry stream set was built on the worker (BuildTileStreamSet, T1.f); we just upload it.
     // Vertices are world-space; the component sits at the actor origin.
@@ -2422,11 +2513,22 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     // cheap on the game thread (no batching needed). Collision + content are level-0 only.
     // T2.c: the component comes from the pool when one is parked (see AcquireTileComponent).
     URealtimeMeshComponent* MeshComp = TileComponents.FindRef(Tile);
+    const bool bComponentAlreadyPresent = MeshComp != nullptr;
+    const uint64 ComponentStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
+    double ComponentCreationSeconds = 0.0;
+    double ComponentRegistrationSeconds = 0.0;
+    bool bComponentCreated = false;
     if (!MeshComp)
     {
-        MeshComp = AcquireTileComponent();
+        MeshComp = AcquireTileComponent(
+            bProfileApply ? &ComponentCreationSeconds : nullptr,
+            bProfileApply ? &ComponentRegistrationSeconds : nullptr,
+            bProfileApply ? &bComponentCreated : nullptr);
         TileComponents.Add(Tile, MeshComp);
     }
+    const double ComponentSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ComponentStartCycles)
+        : 0.0;
 
     // §9.4 RENDER-SKIP — a tile only a CollisionOnly anchor wants (not the player clipmap) cooks its
     // collision below but is hidden (no draw / VSM). Set every apply (overrides the pool's default-
@@ -2438,8 +2540,22 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     // calling it unconditionally (as before) orphaned one mesh object per re-apply to the GC.
     // The RemoveSectionGroup below does the actual geometry clearing on reuse.
     URealtimeMeshSimple* RTMesh = MeshComp->GetRealtimeMeshAs<URealtimeMeshSimple>();
+    const uint64 MeshInitStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     if (!RTMesh) { RTMesh = MeshComp->InitializeRealtimeMesh<URealtimeMeshSimple>(); }
-    if (!RTMesh) { return; }
+    const double MeshInitSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - MeshInitStartCycles)
+        : 0.0;
+    if (!RTMesh)
+    {
+        if (bProfileApply)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[VoxelForgeApplyProfile] level=%d empty=0 failed_mesh_init=1 total=%.6f"),
+                Tile.Level,
+                FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles));
+        }
+        return;
+    }
     // Shadow casting: far (level >= 2) tiles never cast; the sky-cap SECTION never casts either
     // — otherwise the high rock ceiling shadows the entire terrain below it. F17: shadow is now
     // PER SECTION, so a mixed tile keeps its ground shadow while its cap stays shadowless.
@@ -2447,17 +2563,33 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     MeshComp->SetCastShadow(bCastShadow);
 
     const FRealtimeMeshSectionGroupKey GroupKey = VoxelTileGroupKey();
+    const uint64 RemoveGroupStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     RTMesh->RemoveSectionGroup(GroupKey);                    // clear old geometry on re-mesh
                                                              // (no-op on a fresh/pooled mesh)
+    const double RemoveGroupSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - RemoveGroupStartCycles)
+        : 0.0;
+    const uint64 MaterialSlotStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     RTMesh->SetupMaterialSlot(0, "Main",   GroundMaterial);
     RTMesh->SetupMaterialSlot(1, "SkyCap", CeilingMaterial);
+    const double MaterialSlotSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - MaterialSlotStartCycles)
+        : 0.0;
+    // RMC owns both the CPU stream-to-buffer conversion and the render-resource upload behind
+    // CreateSectionGroup. Keep this as one phase: it is the exact plugin/RMC boundary we can
+    // budget without modifying RealtimeMeshComponent.
+    const uint64 StreamUploadStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     RTMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    const double StreamUploadSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - StreamUploadStartCycles)
+        : 0.0;
 
     // RMC casts shadows PER SECTION (FRealtimeMeshSectionConfig::bCastsShadow, default true) — the
     // component-level UPrimitiveComponent::CastShadow is NOT honored by the RMC proxy, so the real
     // shadow lever is the section flag. RMC auto-created one section per non-empty polygroup above
     // (default config already maps material slot = polygroup index); only config sections that
     // exist — the bHas* flags come from the worker. Collision at level 0 only (T1.c), both groups.
+    const uint64 CollisionConfigStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     if (bHasGroundTris)
     {
         FRealtimeMeshSectionConfig GroundConfig(0);
@@ -2473,6 +2605,35 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
         RTMesh->UpdateSectionConfig(
             FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 1),
             CapConfig, /*bShouldCreateCollision*/ bLevel0);
+    }
+    const double CollisionConfigSeconds = bProfileApply
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - CollisionConfigStartCycles)
+        : 0.0;
+
+    if (bProfileApply)
+    {
+        const double TotalSeconds = FPlatformTime::ToSeconds64(
+            FPlatformTime::Cycles64() - ApplyStartCycles);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeApplyProfile] level=%d empty=0 created=%d pooled=%d "
+                 "material=%.6f component=%.6f component_create=%.6f "
+                 "component_register=%.6f mesh_init=%.6f remove_group=%.6f "
+                 "material_slots=%.6f stream_upload=%.6f create_section_group=%.6f "
+                 "collision_config=%.6f total=%.6f"),
+            Tile.Level,
+            bComponentCreated ? 1 : 0,
+            (!bComponentAlreadyPresent && !bComponentCreated) ? 1 : 0,
+            MaterialSeconds,
+            ComponentSeconds,
+            ComponentCreationSeconds,
+            ComponentRegistrationSeconds,
+            MeshInitSeconds,
+            RemoveGroupSeconds,
+            MaterialSlotSeconds,
+            StreamUploadSeconds,
+            StreamUploadSeconds,
+            CollisionConfigSeconds,
+            TotalSeconds);
     }
 
     // Water is no longer spawned per tile — it's a single player-following ocean plane (UpdateWater,

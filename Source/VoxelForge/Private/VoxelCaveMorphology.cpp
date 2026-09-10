@@ -35,6 +35,17 @@
 #include "VoxelStrateTypes.h"
 namespace
 {
+    using FVFPlayerDensitySampler = FTunnelSupportFloorDensitySampler;
+
+    bool VF_ValidatePlayerFitPose(
+        const FVoxelStrateMeasureSettings& Settings,
+        const FVector& CandidateFeetPoint,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float BoundarySealThickness,
+        FVFPlayerDensitySampler SampleDensity,
+        FVector& OutPoint);
+
 }
 #include "VoxelNoise.h"           // Pure FBM used by the slab landing query
 #include "VoxelPassageGeometry.h"
@@ -70,6 +81,173 @@ namespace
             ? static_cast<float>(Min.Z) - Z
             : (Z > static_cast<float>(Max.Z) ? Z - static_cast<float>(Max.Z) : 0.0f);
         return DX * DX + DY * DY + DZ * DZ;
+    }
+
+    // A graph tunnel's rounded capsule is a candidate natural floor only in the part of the tube
+    // where the player's complete support footprint remains inside a sufficiently wide,
+    // sufficiently flat cross-section.  This analytic prefilter only saves density probes; it is
+    // never the decision by itself. The exact no-floor field is passed through the same player-fit
+    // validator used by the capability measurement, and failure retains the old support slab.
+    bool VF_IsNaturalTunnelFloorWalkable(
+        const FCachedTunnel& Tunnel,
+        float WorldX,
+        float WorldY,
+        float FloorZ,
+        float SupportRadius,
+        int32 SegmentIndex,
+        const FTunnelSupportFloorDensitySampler* NaturalSampler,
+        float StrateTopZ,
+        float StrateBottomZ,
+        float BoundarySealThickness)
+    {
+        if (SegmentIndex < 0
+            || SegmentIndex + 1 >= Tunnel.WorldControlPoints.Num()
+            || Tunnel.WorldControlRadii.Num() != Tunnel.WorldControlPoints.Num())
+        {
+            return false;
+        }
+
+        const FVector& Start = Tunnel.WorldControlPoints[SegmentIndex];
+        const FVector& End = Tunnel.WorldControlPoints[SegmentIndex + 1];
+        const float StartRadius = FMath::Abs(Tunnel.WorldControlRadii[SegmentIndex]);
+        const float EndRadius = FMath::Abs(Tunnel.WorldControlRadii[SegmentIndex + 1]);
+        const FVector2D Delta(End.X - Start.X, End.Y - Start.Y);
+        const float LengthSquared = Delta.SizeSquared();
+        if (!(LengthSquared > KINDA_SMALL_NUMBER)
+            || !FMath::IsFinite(StartRadius)
+            || !FMath::IsFinite(EndRadius)
+            || !FMath::IsFinite(FloorZ)
+            || !FMath::IsFinite(SupportRadius))
+        {
+            return false;
+        }
+
+        const FVector2D Query(WorldX, WorldY);
+        const float T = FMath::Clamp(
+            FVector2D::DotProduct(Query - FVector2D(Start.X, Start.Y), Delta)
+                / LengthSquared,
+            0.0f, 1.0f);
+        const FVector2D Closest = FVector2D(Start.X, Start.Y) + Delta * T;
+        const float CentrelineDistance = (Query - Closest).Size();
+        const float TubeRadius = FMath::Lerp(StartRadius, EndRadius, T);
+        constexpr float CapsuleSafetyMargin = 0.25f;
+        // The first candidate was still too permissive: the analytic tube was walkable, but
+        // roughness outside the structural core could remove the last supporting voxels.  Only
+        // the broad, nearly-centreline part of the widest tubes is a certificate strong enough to
+        // replace the authored floor; all marginal geometry keeps the slab.
+        constexpr float NaturalMinimumTubeRadius = 7.5f;
+        constexpr float NaturalCentrelineTolerance = 0.5f;
+        constexpr float NaturalWallMargin = 2.0f;
+        constexpr float NaturalMaximumAxialGradient = 0.12f;
+        const float PlayerRadius = VoxelPassageGeometry::PlayerRadiusVoxels;
+        const float FootprintRadius = PlayerRadius + CapsuleSafetyMargin;
+        if (TubeRadius < NaturalMinimumTubeRadius
+            || CentrelineDistance > NaturalCentrelineTolerance
+            || !(TubeRadius > 0.0f)
+            || CentrelineDistance + FootprintRadius
+                > TubeRadius - NaturalWallMargin
+            || SupportRadius + KINDA_SMALL_NUMBER < PlayerRadius)
+        {
+            return false;
+        }
+
+        const float FarthestSupportRadius = CentrelineDistance + FootprintRadius;
+        const float CrossSectionHalfWidth = FMath::Sqrt(FMath::Max(
+            TubeRadius * TubeRadius
+                - FarthestSupportRadius * FarthestSupportRadius,
+            0.0f));
+        if (2.0f * CrossSectionHalfWidth
+                < VoxelPassageGeometry::PlayerHeightVoxels
+                    + 2.0f * CapsuleSafetyMargin)
+        {
+            return false;
+        }
+
+        // The round floor's steepest support-patch slope is attained at its outer edge.  Keep it
+        // no steeper than the authored 15-degree tunnel contract, rather than using a generous
+        // engine walkability ceiling merely to make the optimization fire more often.
+        const float RadialDenominator = FMath::Sqrt(FMath::Max(
+            TubeRadius * TubeRadius
+                - FarthestSupportRadius * FarthestSupportRadius,
+            KINDA_SMALL_NUMBER));
+        const float RadialGradient = FarthestSupportRadius / RadialDenominator;
+        const float AxialGradient = VoxelPassageGeometry::TunnelFloorGradient(
+            Start, StartRadius, End, EndRadius);
+        if (!FMath::IsFinite(RadialGradient)
+            || !FMath::IsFinite(AxialGradient)
+            || RadialGradient > VoxelPassageGeometry::WalkableTunnelMaxGradient
+            || AxialGradient > NaturalMaximumAxialGradient)
+        {
+            return false;
+        }
+
+        // Reject bends and segment endpoints where the projected support plane changes abruptly.
+        // The flat-floor path remains responsible for those transition columns.
+        constexpr float ProbeDistance = 1.0f;
+        const FVector ProbePositions[] = {
+            FVector(WorldX - ProbeDistance, WorldY, 0.0f),
+            FVector(WorldX + ProbeDistance, WorldY, 0.0f),
+            FVector(WorldX, WorldY - ProbeDistance, 0.0f),
+            FVector(WorldX, WorldY + ProbeDistance, 0.0f)
+        };
+        for (const FVector& Probe : ProbePositions)
+        {
+            float ProbeFloorZ = 0.0f;
+            float ProbeSupportRadius = 0.0f;
+            int32 ProbeSegmentIndex = INDEX_NONE;
+            if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                    Tunnel.WorldControlPoints,
+                    Tunnel.WorldControlRadii,
+                    Probe,
+                    ProbeFloorZ,
+                    ProbeSupportRadius,
+                    &ProbeSegmentIndex)
+                || ProbeSegmentIndex != SegmentIndex
+                || FMath::Abs(ProbeFloorZ - FloorZ)
+                    > VoxelPassageGeometry::WalkableTunnelMaxGradient
+                        * ProbeDistance + CapsuleSafetyMargin)
+            {
+                return false;
+            }
+        }
+
+        if (NaturalSampler == nullptr)
+        {
+            return false;
+        }
+
+        FVoxelStrateMeasureSettings FitSettings;
+        const float MaxStepHeightVoxels =
+            FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+                / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        // The projected graph floor is the centreline's authored support level, but natural rock
+        // may leave a legal footing a little above or below it. Search a small fixed offset set so
+        // that the conditional path does not mistake a vertically displaced natural ledge for a
+        // failed walkability test. The validator still enforces the actual max-step and capsule
+        // clearance rules for every trial; no geometry is accepted by this search alone.
+        constexpr int32 FeetOffsetCount = 3;
+        const float FeetOffsets[FeetOffsetCount] = {
+            0.0f, -1.0f, 1.0f
+        };
+        for (int32 OffsetIndex = 0; OffsetIndex < FeetOffsetCount; ++OffsetIndex)
+        {
+            const FVector CandidateFeet(
+                WorldX, WorldY,
+                FloorZ + MaxStepHeightVoxels + 0.5f + FeetOffsets[OffsetIndex]);
+            FVector FitPoint = FVector::ZeroVector;
+            if (VF_ValidatePlayerFitPose(
+                    FitSettings,
+                    CandidateFeet,
+                    StrateTopZ,
+                    StrateBottomZ,
+                    BoundarySealThickness,
+                    *NaturalSampler,
+                    FitPoint))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
 }
@@ -902,8 +1080,6 @@ namespace
             OutSupportOffsets.Num());
         return true;
     }
-
-    using FVFPlayerDensitySampler = TFunctionRef<float(float, float, float)>;
 
     bool VF_GetPlayerFitInteriorBounds(
         const FVoxelStrateMeasureSettings& Settings,
@@ -5114,7 +5290,8 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
                 Tunnel.WorldControlRadii,
                 Pos,
                 FloorZ,
-                SupportRadius)
+                SupportRadius,
+                nullptr)
             || WorldZ > FloorZ + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
             || WorldZ < FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels)
         {
@@ -5150,7 +5327,11 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
 void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
     float WorldX, float WorldY,
     const FChunkSDFCache& Cache,
-    FTunnelSupportFloorColumn& OutColumn)
+    FTunnelSupportFloorColumn& OutColumn,
+    const FTunnelSupportFloorDensitySampler* NaturalSampler,
+    float NaturalStrateTopZ,
+    float NaturalStrateBottomZ,
+    float NaturalBoundarySealThickness)
 {
     OutColumn.Reset();
 
@@ -5183,13 +5364,33 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
         const FVector ColumnPosition(WorldX, WorldY, 0.0f);
         float FloorZ = 0.0f;
         float SupportRadius = 0.0f;
+        int32 SegmentIndex = INDEX_NONE;
         if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
                 Tunnel.WorldControlPoints,
                 Tunnel.WorldControlRadii,
                 ColumnPosition,
                 FloorZ,
-                SupportRadius))
+                SupportRadius,
+                &SegmentIndex))
         {
+            continue;
+        }
+
+        if (NaturalSampler != nullptr && VoxelDensityProfile::AreCountersEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelSupportFloorNaturalTests);
+        }
+        if (VF_IsNaturalTunnelFloorWalkable(
+            Tunnel, WorldX, WorldY, FloorZ, SupportRadius, SegmentIndex,
+            NaturalSampler, NaturalStrateTopZ, NaturalStrateBottomZ,
+            NaturalBoundarySealThickness))
+        {
+            if (VoxelDensityProfile::AreCountersEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelSupportFloorNaturalSkips);
+            }
             continue;
         }
 

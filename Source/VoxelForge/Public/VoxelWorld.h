@@ -206,7 +206,10 @@ public:
     static constexpr int32 MaxPooledTileComponents = 256;
 
     /** Pop a pooled tile component (made visible again) or create + register a fresh one. */
-    URealtimeMeshComponent* AcquireTileComponent();
+    URealtimeMeshComponent* AcquireTileComponent(
+        double* OutCreationSeconds = nullptr,
+        double* OutRegistrationSeconds = nullptr,
+        bool* bOutCreated = nullptr);
 
     /** Park a tile component in the pool (strip geometry/collision, hide) — or destroy it
      *  for real when the pool is full. */

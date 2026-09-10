@@ -98,6 +98,8 @@ namespace VoxelDensityProfile
         TunnelSupportColumnCandidates,
         TunnelSupportFloorQueries,
         TunnelSupportFloorChecks,
+        TunnelSupportFloorNaturalTests,
+        TunnelSupportFloorNaturalSkips,
         PassageCandidates,
         PassageEvaluated,
         MesherBlockTests,

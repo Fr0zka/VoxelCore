@@ -698,6 +698,12 @@ struct FTunnelSupportFloorColumn
     }
 };
 
+// A non-owning probe used only while a support-column is being prepared.  The caller supplies the
+// exact MC-facing density field with the graph support slab disabled; the morphology layer then
+// runs the same player-fit predicate used by the capability measurement.  A missing sampler is a
+// deliberate safe fallback: retain the authored support band rather than making an unproven skip.
+using FTunnelSupportFloorDensitySampler = TFunctionRef<float(float, float, float)>;
+
 // A pre-baked pit shaft — position and dimensions resolved during BuildChunkCache.
 //
 // Pits are included in the main SDF evaluation (SmoothMin alongside rooms and
@@ -903,12 +909,18 @@ namespace VoxelCaveMorphology
         const FChunkSDFCache& Cache
     );
 
-    // Build/query the same support-floor predicate at column granularity.  This changes only
-    // where the deterministic projection is computed; it does not change the floor interval.
+    // Build/query the same support-floor predicate at column granularity.  When NaturalSampler is
+    // supplied, a projected band is omitted only if the exact field with that graph slab disabled
+    // accepts a player-fit pose at this column.  Without that proof the old interval is retained.
+    // The sampler is synchronous and non-owning; it is never retained by the cache.
     VOXELFORGE_API void BuildTunnelSupportFloorColumn(
         float WorldX, float WorldY,
         const FChunkSDFCache& Cache,
-        FTunnelSupportFloorColumn& OutColumn
+        FTunnelSupportFloorColumn& OutColumn,
+        const FTunnelSupportFloorDensitySampler* NaturalSampler = nullptr,
+        float NaturalStrateTopZ = 0.0f,
+        float NaturalStrateBottomZ = 0.0f,
+        float NaturalBoundarySealThickness = 0.0f
     );
 
     VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(

@@ -39,6 +39,7 @@
 #include "VoxelStrateTypes.h"   // FMazeGenerationParams
 #include "VoxelHeightOp.h"      // IVoxelBiomeField — BuildSurfaceStack takes ownership of one
 
+class UVoxelGenerator;
 class UVoxelStrateManager;
 struct FVoxelOpStackRecipe;
 struct FVoxelStrateArchetypeParams;
@@ -473,7 +474,8 @@ namespace VoxelDensityOps
                                                 const FStrateGenerationParams& P,
                                                 int32 Seed, float SpineRadius,
                                                 const UVoxelStrateManager* StrateManager,
-                                                bool bAppendStructuralPosts = true);
+                                                bool bAppendStructuralPosts = true,
+                                                const UVoxelGenerator* Generator = nullptr);
 
     /**
      * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE de la dernière propagation d'intervalle

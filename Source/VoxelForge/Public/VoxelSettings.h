@@ -53,6 +53,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming")
 	int32 MaxMeshAppliesPerFrame = 4;
 
+	// Wall-clock cap for the complete game-thread result drain, including component teardown and
+	// collision configuration. The count cap remains the second guard. A zero value disables this
+	// cap; the default keeps one burst of chunk application below a small frame-time budget without
+	// changing worker resolution or mesh quality.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0.0"))
+	float MaxMeshApplyMilliseconds = 2.0f;
+
 	// Max tile teardowns (component destroy + content-actor Destroy) per frame. A fast traversal
 	// culls a whole shell of tiles at once; doing every destroy in one frame is a game-thread spike
 	// ("stuff torn down behind you"). This spreads it. The drain auto-scales up if the backlog grows

@@ -3591,8 +3591,10 @@ namespace
     {
     public:
         FRoomGraphSource(const FStrateGenerationParams& InP, int32 InSeed,
-                         const UVoxelStrateManager* InManager)
+                         const UVoxelStrateManager* InManager,
+                         const UVoxelGenerator* InGenerator = nullptr)
             : P(InP), Seed(InSeed), SeedU((uint32)InSeed), Manager(InManager)
+            , Generator(InGenerator)
             , ManagerLifetimeId(InManager ? InManager->GetCacheLifetimeId() : 0)
             , ParamsFingerprint(FCrc::MemCrc32(&InP, sizeof(InP)))
         {}
@@ -3791,6 +3793,37 @@ namespace
             return P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f;
         }
 
+        void BuildSupportColumn(
+            float WorldX, float WorldY,
+            const FChunkSDFCache& Cache,
+            FTunnelSupportFloorColumn& OutColumn) const
+        {
+            if (Generator == nullptr)
+            {
+                VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                    WorldX, WorldY, Cache, OutColumn);
+                return;
+            }
+
+            // This is a synchronous, non-owning view of the exact field with only the graph
+            // support slab disabled. BuildTunnelSupportFloorColumn consumes it immediately and
+            // retains only the proven interval decision in the worker-local column cache.
+            const auto SampleWithoutTunnelSupportFloor =
+                [this](float X, float Y, float Z) -> float
+            {
+                return Generator->GetDensityWithParams(
+                    X, Y, Z, P, ParamsFingerprint, LayoutVersion,
+                    /*bApplyLegacyStructuralPosts=*/true,
+                    /*bApplyTunnelSupportFloor=*/false);
+            };
+            FTunnelSupportFloorDensitySampler NaturalSampler =
+                SampleWithoutTunnelSupportFloor;
+            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                WorldX, WorldY, Cache, OutColumn, &NaturalSampler,
+                P.StrateTopWorldZ, P.StrateBottomWorldZ,
+                P.BoundarySealThickness);
+        }
+
         const FTunnelSupportFloorColumn* GetSupportColumn(const FVector& Position) const
         {
             FState& S = State();
@@ -3809,7 +3842,7 @@ namespace
                     IX, IY, &Cache, S.SupportColumns.Clock, bNewColumn);
                 if (bNewColumn)
                 {
-                    VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                    BuildSupportColumn(
                         static_cast<float>(Position.X),
                         static_cast<float>(Position.Y),
                         Cache,
@@ -3818,7 +3851,7 @@ namespace
                 return Column;
             }
 
-            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+            BuildSupportColumn(
                 static_cast<float>(Position.X), static_cast<float>(Position.Y),
                 GetCache(), S.FractionalSupportColumn);
             return &S.FractionalSupportColumn;
@@ -6633,6 +6666,7 @@ namespace
         int32  Seed;
         uint32 SeedU;
         TWeakObjectPtr<const UVoxelStrateManager> Manager;
+        const UVoxelGenerator* Generator = nullptr;
         uint64 ManagerLifetimeId = 0;
         uint32 ParamsFingerprint;
         uint32 LayoutVersion = 0;
@@ -9408,7 +9442,8 @@ namespace VoxelDensityOps
 
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
-                                 bool bAppendStructuralPosts)
+                                 bool bAppendStructuralPosts,
+                                 const UVoxelGenerator* Generator)
     {
         // ⚠️ ÉTAPES A + B + C1 — LA PILE EST COMPLÈTE POUR CET ARCHÉTYPE.
         // Portés : échelle verticale, roc de base, warp, graphe de salles (+ pits + cheminées),
@@ -9452,7 +9487,8 @@ namespace VoxelDensityOps
 
         // La source de salles est retenue par pointeur non possédant : les terrasses re-interrogent
         // son cache SDF en Z±1. Même motif que `FShaftFieldSource` → `FShaftLedgeMod`.
-        TUniquePtr<FRoomGraphSource> RoomSource = MakeUnique<FRoomGraphSource>(P, Seed, StrateManager);
+        TUniquePtr<FRoomGraphSource> RoomSource = MakeUnique<FRoomGraphSource>(
+            P, Seed, StrateManager, Generator);
         const FRoomGraphSource* RoomPtr = RoomSource.Get();
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));

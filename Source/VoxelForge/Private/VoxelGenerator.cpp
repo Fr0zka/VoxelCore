@@ -507,7 +507,11 @@ namespace
 
     static void BuildTunnelSupportColumnsForChunk(
         FChunkSDFCache& Cache,
-        const FIntVector& ChunkCoord);
+        const FIntVector& ChunkCoord,
+        const UVoxelGenerator* Generator,
+        const FStrateGenerationParams& Params,
+        uint32 ParamsFingerprint,
+        uint32 LayoutVersion);
 
     static const FTunnelSupportFloorColumn* FindTunnelSupportColumn(
         const FChunkSDFCache& Cache,
@@ -603,6 +607,7 @@ namespace
     }
 
     void PrepareTunnelCoreCache(
+        const UVoxelGenerator& Generator,
         const UVoxelStrateManager& Manager,
         const FIntVector& ChunkCoord,
         const FStrateGenerationParams& Params,
@@ -638,7 +643,9 @@ namespace
             ChunkMaxX + Expansion, ChunkMaxY + Expansion,
             Params, static_cast<uint32>(Manager.GetWorldSeed()),
             StrateIndex, nullptr);
-        BuildTunnelSupportColumnsForChunk(OutState.Cache, ChunkCoord);
+        BuildTunnelSupportColumnsForChunk(
+            OutState.Cache, ChunkCoord, &Generator, Params,
+            ParamsFingerprint, LayoutVersion);
         OutState.OwnerId = OwnerId;
         OutState.ManagerLifetimeId = ManagerLifetimeId;
         OutState.Chunk = ChunkCoord;
@@ -649,7 +656,11 @@ namespace
 
     static void BuildTunnelSupportColumnsForChunk(
         FChunkSDFCache& Cache,
-        const FIntVector& ChunkCoord)
+        const FIntVector& ChunkCoord,
+        const UVoxelGenerator* Generator,
+        const FStrateGenerationParams& Params,
+        uint32 ParamsFingerprint,
+        uint32 LayoutVersion)
     {
         const int32 MinX = ChunkCoord.X * CHUNK_SIZE - 1;
         const int32 MinY = ChunkCoord.Y * CHUNK_SIZE - 1;
@@ -660,6 +671,25 @@ namespace
         Cache.SupportColumnCellsY = Cells;
         Cache.SupportColumnEntries.Init(INDEX_NONE, Cells * Cells);
         Cache.SupportColumns.Reset();
+
+        // The conditional floor is tested against the exact density pipeline with only the
+        // graph support slab disabled.  The sampler is synchronous and lives only for this cache
+        // build; the immutable cache stores the resulting interval decision, never the callback.
+        const auto SampleWithoutTunnelSupportFloor =
+            [Generator, &Params, ParamsFingerprint, LayoutVersion](
+                float X, float Y, float Z) -> float
+        {
+            return Generator != nullptr
+                ? Generator->GetDensityWithParams(
+                    X, Y, Z, Params, ParamsFingerprint, LayoutVersion,
+                    /*bApplyLegacyStructuralPosts=*/true,
+                    /*bApplyTunnelSupportFloor=*/false)
+                : 0.0f;
+        };
+        FTunnelSupportFloorDensitySampler NaturalSamplerRef =
+            SampleWithoutTunnelSupportFloor;
+        const FTunnelSupportFloorDensitySampler* NaturalSampler =
+            Generator != nullptr ? &NaturalSamplerRef : nullptr;
 
         // Empty columns are represented only by INDEX_NONE in the slot map, so
         // each stored column retains the inline bands for actual graph tubes.
@@ -672,7 +702,11 @@ namespace
                     static_cast<float>(MinX + X),
                     static_cast<float>(MinY + Y),
                     Cache,
-                    Column);
+                    Column,
+                    NaturalSampler,
+                    Params.StrateTopWorldZ,
+                    Params.StrateBottomWorldZ,
+                    Params.BoundarySealThickness);
                 if (Column.Intervals.Num() == 0)
                 {
                     continue;
@@ -736,7 +770,8 @@ namespace
      */
     bool VF_BuildOpStackForChunk(ECaveGeneratorType Type, FVoxelStackParamRefs& Refs,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* SM,
-                                 FVoxelOpStack& OutStack, FVoxelOpContext& OutCtx)
+                                 FVoxelOpStack& OutStack, FVoxelOpContext& OutCtx,
+                                 const UVoxelGenerator* Generator = nullptr)
     {
         switch (Type)
         {
@@ -793,7 +828,9 @@ namespace
             if (!Refs.Tunnel) { return false; }
             OutCtx.StrateTopWorldZ    = Refs.Tunnel->StrateTopWorldZ;
             OutCtx.StrateBottomWorldZ = Refs.Tunnel->StrateBottomWorldZ;
-            VoxelDensityOps::BuildTunnelNetworkStack(OutStack, *Refs.Tunnel, Seed, SpineRadius, SM);
+            VoxelDensityOps::BuildTunnelNetworkStack(
+                OutStack, *Refs.Tunnel, Seed, SpineRadius, SM,
+                /*bAppendStructuralPosts=*/true, Generator);
             return true;
 
         default:
@@ -1259,7 +1296,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 
                         CP_UseOpStack = VF_BuildOpStackForChunk(
                             CP_GenType, Refs, Seed, OriginSpineRadius,
-                            StrateManager, CP_OpStack, OpCtx);
+                            StrateManager, CP_OpStack, OpCtx, this);
 
                 // Le test appelle PrepareChunk, pas la production : c'est exactement la divergence
                 // qui rend un opérateur vert en test et faux en jeu. Les sept `PrepareChunk`
@@ -1293,7 +1330,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (bCanPrepareNativeTunnelCore)
             {
                 PrepareTunnelCoreCache(
-                    *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
+                    *this, *StrateManager, ChunkCoord, CP_Tunnel, CP_TunnelFP,
                     LayoutVersion, ManagerLifetimeId, DensityCacheOwnerId, GTunnelCoreCache);
             }
             else
@@ -1647,7 +1684,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
                                              const FStrateGenerationParams& Params,
                                              uint32 ParamsFingerprint, uint32 LayoutVersion,
-                                             bool bApplyLegacyStructuralPosts) const
+                                             bool bApplyLegacyStructuralPosts,
+                                             bool bApplyTunnelSupportFloor) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -2713,8 +2751,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // the graph's own tunnel floor/core are structural route geometry.  Direct callers of
         // GetDensityWithParams retain this historical tail; GetDensityAt skips it and applies the
         // same predicates once in its common MC-space post section below both generation paths.
-        const bool bTunnelSupportFloor =
-            VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+        const bool bTunnelSupportFloor = bApplyTunnelSupportFloor
+            && VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
                 WorldX, WorldY, WorldZ, SDFCache);
         if (bTunnelSupportFloor)
         {
@@ -4753,7 +4791,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
         FVoxelOpStack TileStack;
         if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
-                                     StrateManager, TileStack, OpCtx))
+                                     StrateManager, TileStack, OpCtx, this))
         {
             // Strate dégénérée ou archétype non porté : `GetDensityAt` retomberait sur le `switch`,
             // donc la pile ne décrit pas ce que le mesher verra. Aucun verdict.

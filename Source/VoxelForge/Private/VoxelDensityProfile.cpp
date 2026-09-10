@@ -414,6 +414,8 @@ namespace VoxelDensityProfile
         case ECounter::TunnelSupportColumnCandidates:return TEXT("TunnelSupportColumnCandidates");
         case ECounter::TunnelSupportFloorQueries:return TEXT("TunnelSupportFloorQueries");
         case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
+        case ECounter::TunnelSupportFloorNaturalTests:return TEXT("TunnelSupportFloorNaturalTests");
+        case ECounter::TunnelSupportFloorNaturalSkips:return TEXT("TunnelSupportFloorNaturalSkips");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");
