@@ -237,7 +237,13 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     // resolution are removed from a tile that reaches the mesher.
     TArray<uint8> BlockSkip;
     int32 BlocksPerAxis = 0;
-    if (bUseBlockEarlyOut && !OutCaptureGrid && Step == 1)
+    // LOD2's 16-cell tile is the remaining false-Mixed empty case in the streamed game path.
+    // Its step-8 lattice can use the same proof-only 8-cell block partition as LOD0. Keep the
+    // gate off for steps 2/16/32: their meshing work is already smaller than repeating a full
+    // tile classifier per block, and this preserves the established coarse-LOD latency profile.
+    const bool bUseProofBlocks = bUseBlockEarlyOut && !OutCaptureGrid
+        && (Step == 1 || Step == 8);
+    if (bUseProofBlocks)
     {
         constexpr int32 BlockCells = 8;
         BlocksPerAxis = (CellsPerAxis + BlockCells - 1) / BlockCells;
@@ -246,6 +252,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         EVoxelTileClass FirstUniformVerdict = EVoxelTileClass::Mixed;
         bool bAllRelevantBlocksUniform = true;
         bool bAllRelevantBlocksSame = true;
+        TArray<int32> MixedBlockIndices;
 
         for (int32 BlockZ = 0; BlockZ < BlocksPerAxis; ++BlockZ)
         {
@@ -271,17 +278,22 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     }
                     const EVoxelTileClass Verdict = Generator->ClassifyTile(
                         BlockOrigin, Step, BlockCells);
+                    if (Verdict == EVoxelTileClass::Mixed)
+                    {
+                        MixedBlockIndices.Add(
+                            ((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX);
+                    }
                     if (Verdict == EVoxelTileClass::AllSolid
                         || Verdict == EVoxelTileClass::AllAir)
                     {
-                        BlockSkip[((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX] = 1;
-                        if (VoxelDensityProfile::AreCountersEnabled())
-                        {
-                            VoxelDensityProfile::AddCounter(
-                                Verdict == EVoxelTileClass::AllSolid
-                                    ? VoxelDensityProfile::ECounter::MesherBlockAllSolid
-                                    : VoxelDensityProfile::ECounter::MesherBlockAllAir);
-                        }
+                        // Keep the classifier result as a candidate until the exact density grid
+                        // used by this mesher has been filled.  ClassifyTile is conservative by
+                        // contract, but its proof and the mesher share worker-local caches; a
+                        // cache replacement must never turn that contract into a cell skip by
+                        // itself.  The post-grid sign check below is the final proof consumed by
+                        // the cell loop and clears any candidate whose actual MC vertices disagree.
+                        BlockSkip[((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX] =
+                            Verdict == EVoxelTileClass::AllSolid ? 1 : 2;
                         if (!bHaveUniformBlock)
                         {
                             FirstUniformVerdict = Verdict;
@@ -300,10 +312,84 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             }
         }
 
-        if (bHaveUniformBlock && bAllRelevantBlocksUniform && bAllRelevantBlocksSame)
+        // A conservative whole-tile proof can leave a small block unresolved even when every
+        // other block has the same verdict. Resolve that tail on the exact MC lattice. This uses
+        // the final GetDensityAt field, checks every cell corner, treats zero/non-finite values
+        // as unknown, and never changes the grid resolution or skips an uncertified block.
+        if (bHaveUniformBlock && bAllRelevantBlocksSame && !bAllRelevantBlocksUniform
+            && MixedBlockIndices.Num() <= 4)
+        {
+            int32 RemainingMixedBlocks = MixedBlockIndices.Num();
+            for (const int32 MixedBlockIndex : MixedBlockIndices)
+            {
+                const int32 BlockX = MixedBlockIndex % BlocksPerAxis;
+                const int32 BlockY = (MixedBlockIndex / BlocksPerAxis) % BlocksPerAxis;
+                const int32 BlockZ = MixedBlockIndex / (BlocksPerAxis * BlocksPerAxis);
+                const FIntVector BlockOrigin = OriginVoxels + FIntVector(
+                    BlockX * BlockCells * Step,
+                    BlockY * BlockCells * Step,
+                    BlockZ * BlockCells * Step);
+
+                bool bAllSolid = true;
+                bool bAllAir = true;
+                for (int32 Z = 0; Z <= BlockCells && (bAllSolid || bAllAir); ++Z)
+                {
+                    for (int32 Y = 0; Y <= BlockCells && (bAllSolid || bAllAir); ++Y)
+                    {
+                        for (int32 X = 0; X <= BlockCells; ++X)
+                        {
+                            const float Density = Generator->GetDensityAt(
+                                BlockOrigin.X + X * Step,
+                                BlockOrigin.Y + Y * Step,
+                                BlockOrigin.Z + Z * Step);
+                            if (!FMath::IsFinite(Density) || Density == 0.0f)
+                            {
+                                bAllSolid = false;
+                                bAllAir = false;
+                                break;
+                            }
+                            bAllSolid &= Density < 0.0f;
+                            bAllAir &= Density > 0.0f;
+                            if (!bAllSolid && !bAllAir)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                const EVoxelTileClass ExactVerdict = bAllSolid
+                    ? EVoxelTileClass::AllSolid
+                    : (bAllAir ? EVoxelTileClass::AllAir : EVoxelTileClass::Mixed);
+                if (ExactVerdict == EVoxelTileClass::AllSolid
+                    || ExactVerdict == EVoxelTileClass::AllAir)
+                {
+                    BlockSkip[MixedBlockIndex] =
+                        ExactVerdict == EVoxelTileClass::AllSolid ? 1 : 2;
+                    --RemainingMixedBlocks;
+                    if (ExactVerdict != FirstUniformVerdict)
+                    {
+                        bAllRelevantBlocksSame = false;
+                    }
+                }
+            }
+            bAllRelevantBlocksUniform = RemainingMixedBlocks == 0;
+        }
+
+        // Every relevant block has independently proved the same sign.  This is a complete
+        // certificate for the tile's MC lattice: the block boxes share their boundary vertices,
+        // so equal signs on both sides cannot hide a surface between blocks.  The whole-tile
+        // ClassifyTile path already relies on this same non-Mixed proof contract. Return before
+        // allocating the density grid; no samples are skipped for a tile that can contain
+        // geometry, and the final geometry remains byte-identical because this path emits none.
+        if (bHaveUniformBlock && bAllRelevantBlocksSame && bAllRelevantBlocksUniform)
         {
             return MeshData;
         }
+
+        // A mixed or differently signed block set still needs the exact mesher grid.  Classifier
+        // results remain candidates only in that case; the grid validation below keeps the cell
+        // skip independent of worker-local cache state and preserves geometry byte-for-byte.
     }
 
     // Réutilise le tampon entre tuiles (thread_local) : SetNumUninitialized garde la
@@ -364,6 +450,69 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     }
     MesherDensityGridTimer.End();
 
+    if (bUseProofBlocks)
+    {
+        // Finalize every block candidate against the exact density samples that the marching-
+        // cubes loop will consume.  This is intentionally redundant with ClassifyTile: it is a
+        // cheap soundness fence around the proof/cache hand-off.  Unknown, zero, or opposite-sign
+        // vertices clear the candidate, so an unproven block pays the ordinary cell path.
+        constexpr int32 BlockCells = 8;
+        for (int32 BlockZ = 0; BlockZ < BlocksPerAxis; ++BlockZ)
+        {
+            const int32 BlockMinZ = BlockZ * BlockCells;
+            const int32 BlockMaxZ = FMath::Min(CellsPerAxis - 1,
+                                               BlockMinZ + BlockCells - 1);
+            if (BlockMaxZ < CzLo || BlockMinZ > CzHi)
+            {
+                continue;
+            }
+            for (int32 BlockY = 0; BlockY < BlocksPerAxis; ++BlockY)
+            for (int32 BlockX = 0; BlockX < BlocksPerAxis; ++BlockX)
+            {
+                const int32 BlockIndex =
+                    ((BlockZ * BlocksPerAxis) + BlockY) * BlocksPerAxis + BlockX;
+                const uint8 Candidate = BlockSkip[BlockIndex];
+                if (Candidate == 0)
+                {
+                    continue;
+                }
+
+                const int32 BlockMaxX = FMath::Min(CellsPerAxis - 1,
+                                                   BlockX * BlockCells + BlockCells - 1);
+                const int32 BlockMaxY = FMath::Min(CellsPerAxis - 1,
+                                                   BlockY * BlockCells + BlockCells - 1);
+                bool bUniform = true;
+                for (int32 Z = BlockMinZ; Z <= BlockMaxZ + 1 && bUniform; ++Z)
+                for (int32 Y = BlockY * BlockCells; Y <= BlockMaxY + 1 && bUniform; ++Y)
+                for (int32 X = BlockX * BlockCells; X <= BlockMaxX + 1; ++X)
+                {
+                    const float Density = DensityGrid[
+                        ((Z + 1) * MDim + (Y + 1)) * MDim + (X + 1)];
+                    if (!FMath::IsFinite(Density)
+                        || Density == 0.0f
+                        || (Candidate == 1 ? Density >= 0.0f : Density <= 0.0f))
+                    {
+                        bUniform = false;
+                        break;
+                    }
+                }
+                if (!bUniform)
+                {
+                    BlockSkip[BlockIndex] = 0;
+                    continue;
+                }
+
+                if (VoxelDensityProfile::AreCountersEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        Candidate == 1
+                            ? VoxelDensityProfile::ECounter::MesherBlockAllSolid
+                            : VoxelDensityProfile::ECounter::MesherBlockAllAir);
+                }
+            }
+        }
+    }
+
     // ── CAPTURE-DURING-MESHING ──
     // Si demandé et que la tuile est pleine résolution (CellsPerAxis==CHUNK_SIZE ⇒ Step==1<<Level,
     // donc chaque point de grille = exactement une cellule du clipmap de densité), on recopie les
@@ -423,7 +572,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
             if (ShouldAbortWork()) return FVoxelMeshData();
             for (int32 cx = 0; cx < CellsPerAxis; cx++)
             {
-                if (bUseBlockEarlyOut && Step == 1
+                if (bUseProofBlocks
                     && BlockSkip[((cz / 8) * BlocksPerAxis + (cy / 8)) * BlocksPerAxis + (cx / 8)] != 0)
                 {
                     continue;

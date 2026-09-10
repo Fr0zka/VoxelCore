@@ -4940,6 +4940,10 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         return 1;
     }
 
+    // A commandlet can run several fresh manager lifetimes in one process. Release completed
+    // immutable proof caches from the preceding case before constructing this one.
+    VoxelDensityOps::TrimSharedRoomGraphCache();
+
     // Every case starts from a disabled, empty diagnostic state.  The world/cache objects are
     // local to this invocation and their owner/lifetime keys prevent stale worker caches from
     // serving the next case's generation.
@@ -5529,6 +5533,8 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
             static_cast<unsigned long long>(MesherAttributionCalls));
         VoxelDensityProfile::SetMode(VoxelDensityProfile::EMode::Disabled);
     }
+    VoxelDensityOps::ReportSharedRoomGraphCacheFootprint();
+    VoxelDensityOps::TrimSharedRoomGraphCache();
     // Per-case isolation boundary.  The UObject world dies with this function; worker-local
     // caches are keyed by the fresh generator/manager lifetime and the diagnostics are reset before
     // the next case.  No case may inherit profiler counters or a live profiler mode.
@@ -5861,6 +5867,12 @@ int32 RunBatch(const FString& Params)
         {
             ++FailedCases;
         }
+
+        // RunExploreCase owns a complete transient UObject world.  Release that case's strong
+        // roots before starting the next one and collect now; otherwise a batch retains every
+        // completed mesh/settings/manager graph until the commandlet exits, making peak RSS grow
+        // with the number of cases even though no report needs those objects afterward.
+        CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
     }
 
     TSharedPtr<FJsonObject> BatchReport = MakeShared<FJsonObject>();

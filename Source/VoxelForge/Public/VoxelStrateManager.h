@@ -427,8 +427,16 @@ public:
      * carve reaches a sampled point. Invalid geometry returns 1 conservatively. */
     float MaxPassageCarveFactorNearLattice(const FBox& VoxelBox,
                                            const FIntVector& LatticeOrigin, int32 Step) const;
+    /** Exact conservative candidate for the post-stack passage air writers on the MC lattice.
+     * This deliberately excludes the passage modifier already folded by FPassageCarveOp. */
+    bool AnyPassageAirPostNearLattice(const FBox& VoxelBox,
+                                      const FIntVector& LatticeOrigin, int32 Step,
+                                      float BaseDensity, float SealThickness) const;
     bool AnyPassageLandingFloorNearLattice(const FBox& VoxelBox,
                                            const FIntVector& LatticeOrigin, int32 Step) const;
+    /** Exact presence test for a structural floor write on the MC lattice. */
+    bool AnyLandingFloorAtLattice(const FBox& VoxelBox,
+                                  const FIntVector& LatticeOrigin, int32 Step) const;
 
     /** Conservative box guards for the per-strate (0,0) landing rooms and their floor slabs. */
     bool AnyOriginLandingNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
@@ -436,6 +444,10 @@ public:
 
     bool AnyOriginLandingNearLattice(const FBox& VoxelBox,
                                      const FIntVector& LatticeOrigin, int32 Step) const;
+    /** Exact conservative candidate for the post-disturbance origin-room air reassertion. */
+    bool AnyOriginLandingAirNearLattice(const FBox& VoxelBox,
+                                        const FIntVector& LatticeOrigin, int32 Step,
+                                        float BaseDensity, float SealThickness) const;
     bool AnyOriginLandingFloorNearLattice(const FBox& VoxelBox,
                                           const FIntVector& LatticeOrigin, int32 Step) const;
 

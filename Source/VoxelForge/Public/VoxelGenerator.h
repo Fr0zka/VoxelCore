@@ -340,7 +340,11 @@ public:
      * des gardes conservatrices. Worker-safe (lecture seule + caches thread_local partagés avec
      * GetDensityAt — un verdict Mixed laisse les colonnes chaudes pour la génération qui suit).
      */
-    EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const;
+    EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
+                                 int32 CellsPerAxis) const;
+    EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
+                                 int32 CellsPerAxis,
+                                 struct FVoxelTileClassificationStats* OutStats) const;
 
 private:
     /** Identité process-unique du propriétaire des caches `CP_*` thread_local.
@@ -379,4 +383,42 @@ private:
     /** (Re)build the per-chunk biome cell grid covering chunk (X,Y) footprint + margin. */
     void RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,
                           const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const;
+};
+
+/**
+ * Optional diagnostics for one ClassifyTile call.  This is populated only when the caller asks
+ * for it (the streaming profiler does); it is never consulted by the proof and cannot affect a
+ * verdict.  Keeping the counters beside the classifier lets the game profile distinguish cache,
+ * interval refinement, and exact-lattice work without sampling a different code path.
+ */
+struct FVoxelTileClassificationStats
+{
+    uint32 RefineNodes = 0;
+    uint32 StackBoxCalls = 0;
+    uint32 WholeMixedNodes = 0;
+    uint32 WholeSolidNodes = 0;
+    uint32 WholeAirNodes = 0;
+    uint32 NeedsFinalFieldNodes = 0;
+    uint32 SplitNodes = 0;
+    uint32 MaxRefinementDepth = 0;
+    uint32 ExactCoreSamples = 0;
+    uint32 ExactFinalSamples = 0;
+    uint32 ExactCoreCacheHits = 0;
+    uint32 ExactFinalCacheHits = 0;
+    uint32 ExactCoreLeaves = 0;
+    uint32 ExactFinalLeaves = 0;
+    uint64 StackBoxCycles = 0;
+    uint64 ExactCoreCycles = 0;
+    uint64 ExactFinalCycles = 0;
+    uint32 RoomTailQueries = 0;
+    uint32 RoomTailEvaluated = 0;
+    uint64 RoomTailCycles = 0;
+    uint64 RoomPropagateCycles = 0;
+    uint64 RoomExactPrimitiveCycles = 0;
+    uint64 RoomCacheWindowCycles = 0;
+    int32 RoomNumRooms = 0;
+    int32 RoomNumTunnels = 0;
+    int32 RoomNumRoomFloorJoins = 0;
+    int32 RoomNumPits = 0;
+    int32 RoomNumChimneys = 0;
 };

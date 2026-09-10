@@ -2174,42 +2174,168 @@ namespace
         return OutFirst <= OutLast;
     }
 
-    static bool VF_LatticeAxisNearestDistance(
-        float Min, float Max, float Origin, int32 Step, float Target, float& OutDistance)
+    struct FVoxelPassageModifierDomain
     {
-        int32 First = 0, Last = -1;
-        if (!VF_LatticeAxisRange(Min, Max, Origin, Step, First, Last))
+        FVector Min = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+        FVector Max = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    };
+
+    static bool VF_LatticeBoxTouchesAABB(
+        const FBox& Box, const FIntVector& Origin, int32 Step,
+        float MinX, float MaxX, float MinY, float MaxY, float MinZ, float MaxZ);
+
+    static bool VF_BuildPassageModifierDomains(
+        const TArray<FVoxelPassage>& Passages,
+        TArray<FVoxelPassageModifierDomain, TInlineAllocator<128>>& Domains)
+    {
+        constexpr int32 MaxControlPointsForBound = 4096;
+        Domains.Reset();
+
+        auto AddDomain = [&](const FVector& Min, const FVector& Max) -> bool
         {
-            return false;
+            if (!FMath::IsFinite(Min.X) || !FMath::IsFinite(Min.Y)
+                || !FMath::IsFinite(Min.Z) || !FMath::IsFinite(Max.X)
+                || !FMath::IsFinite(Max.Y) || !FMath::IsFinite(Max.Z)
+                || Min.X > Max.X || Min.Y > Max.Y || Min.Z > Max.Z)
+            {
+                return false;
+            }
+            Domains.Add({Min, Max});
+            return true;
+        };
+
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (!FMath::IsFinite(Passage.BoundCenter.X)
+                || !FMath::IsFinite(Passage.BoundCenter.Y)
+                || !FMath::IsFinite(Passage.BoundCenter.Z)
+                || !FMath::IsFinite(Passage.BoundRadius)
+                || !FMath::IsFinite(Passage.BoundRadiusSq)
+                || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+            {
+                // Invalid generated geometry is an unknown, not an empty passage set.
+                return false;
+            }
+
+            if (Passage.ControlPoints.Num() >= 2)
+            {
+                if (Passage.ControlPoints.Num() > MaxControlPointsForBound)
+                {
+                    return false;
+                }
+                const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+                if (!bTaper && !FMath::IsFinite(Passage.Radius))
+                {
+                    return false;
+                }
+                for (int32 PointIndex = 0;
+                     PointIndex < Passage.ControlPoints.Num(); ++PointIndex)
+                {
+                    const FVector& Point = Passage.ControlPoints[PointIndex];
+                    if (!FMath::IsFinite(Point.X) || !FMath::IsFinite(Point.Y)
+                        || !FMath::IsFinite(Point.Z))
+                    {
+                        return false;
+                    }
+                    if (bTaper && !FMath::IsFinite(Passage.ControlRadii[PointIndex]))
+                    {
+                        return false;
+                    }
+                }
+
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+                {
+                    const FVector& A = Passage.ControlPoints[SegmentIndex];
+                    const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                    const float RadiusA = bTaper
+                        ? Passage.ControlRadii[SegmentIndex] : Passage.Radius;
+                    const float RadiusB = bTaper
+                        ? Passage.ControlRadii[SegmentIndex + 1] : Passage.Radius;
+                    const float Radius = FMath::Max(FMath::Abs(RadiusA), FMath::Abs(RadiusB));
+                    if (!FMath::IsFinite(Radius))
+                    {
+                        return false;
+                    }
+                    if (!AddDomain(
+                            FVector(FMath::Min(A.X, B.X) - Radius,
+                                    FMath::Min(A.Y, B.Y) - Radius,
+                                    FMath::Min(A.Z, B.Z) - Radius),
+                            FVector(FMath::Max(A.X, B.X) + Radius,
+                                    FMath::Max(A.Y, B.Y) + Radius,
+                                    FMath::Max(A.Z, B.Z) + Radius)))
+                    {
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                if (!FMath::IsFinite(Passage.UpperPoint.X)
+                    || !FMath::IsFinite(Passage.UpperPoint.Y)
+                    || !FMath::IsFinite(Passage.UpperPoint.Z)
+                    || !FMath::IsFinite(Passage.LowerPoint.X)
+                    || !FMath::IsFinite(Passage.LowerPoint.Y)
+                    || !FMath::IsFinite(Passage.LowerPoint.Z)
+                    || !FMath::IsFinite(Passage.Radius))
+                {
+                    return false;
+                }
+                const float Radius = FMath::Abs(Passage.Radius);
+                if (!AddDomain(
+                        FVector(FMath::Min(Passage.UpperPoint.X, Passage.LowerPoint.X) - Radius,
+                                FMath::Min(Passage.UpperPoint.Y, Passage.LowerPoint.Y) - Radius,
+                                FMath::Min(Passage.UpperPoint.Z, Passage.LowerPoint.Z) - Radius),
+                        FVector(FMath::Max(Passage.UpperPoint.X, Passage.LowerPoint.X) + Radius,
+                                FMath::Max(Passage.UpperPoint.Y, Passage.LowerPoint.Y) + Radius,
+                                FMath::Max(Passage.UpperPoint.Z, Passage.LowerPoint.Z) + Radius)))
+                {
+                    return false;
+                }
+            }
+
+            const FVoxelPassageLanding* Landings[] = {
+                &Passage.UpperLanding, &Passage.LowerLanding };
+            for (const FVoxelPassageLanding* Landing : Landings)
+            {
+                if (!FMath::IsFinite(Landing->StandingPoint.X)
+                    || !FMath::IsFinite(Landing->StandingPoint.Y)
+                    || !FMath::IsFinite(Landing->FloorZ)
+                    || !FMath::IsFinite(Landing->CeilingZ)
+                    || !FMath::IsFinite(Landing->HalfWidth))
+                {
+                    // The canonical evaluator returns FLT_MAX for this landing. Treating it as
+                    // unknown is safer for future evaluator changes and only gives up a skip.
+                    return false;
+                }
+                if (Landing->HalfWidth <= 0.0f
+                    || Landing->CeilingZ <= Landing->FloorZ)
+                {
+                    continue;
+                }
+                constexpr float RoomRounding = 1.5f;
+                const float Height = Landing->CeilingZ - Landing->FloorZ;
+                const float HalfX = FMath::Max(Landing->HalfWidth - RoomRounding, 0.25f);
+                const float HalfZ = FMath::Max(Height * 0.5f - RoomRounding, 0.25f);
+                const float CenterZ = (Landing->FloorZ + Landing->CeilingZ) * 0.5f;
+                if (!AddDomain(
+                        FVector(Landing->StandingPoint.X - HalfX - RoomRounding,
+                                Landing->StandingPoint.Y - HalfX - RoomRounding,
+                                FMath::Min(Landing->FloorZ,
+                                           CenterZ - HalfZ - RoomRounding)),
+                        FVector(Landing->StandingPoint.X + HalfX + RoomRounding,
+                                Landing->StandingPoint.Y + HalfX + RoomRounding,
+                                FMath::Max(Landing->CeilingZ,
+                                           CenterZ + HalfZ + RoomRounding))))
+                {
+                    return false;
+                }
+            }
         }
-        const int32 Nearest = FMath::Clamp(
-            FMath::RoundToInt((Target - Origin) / static_cast<float>(Step)), First, Last);
-        OutDistance = FMath::Abs(
-            Origin + static_cast<float>(Nearest * Step) - Target);
         return true;
     }
 
-    static bool VF_LatticeBoxTouchesSphere(
-        const FBox& Box, const FIntVector& Origin, int32 Step,
-        const FVector& Center, float Radius)
-    {
-        float DX = 0.0f, DY = 0.0f, DZ = 0.0f;
-        if (!VF_LatticeAxisNearestDistance(
-                (float)Box.Min.X, (float)Box.Max.X, (float)Origin.X,
-                Step, (float)Center.X, DX)
-            || !VF_LatticeAxisNearestDistance(
-                (float)Box.Min.Y, (float)Box.Max.Y, (float)Origin.Y,
-                Step, (float)Center.Y, DY)
-            || !VF_LatticeAxisNearestDistance(
-                (float)Box.Min.Z, (float)Box.Max.Z, (float)Origin.Z,
-                Step, (float)Center.Z, DZ))
-        {
-            return false;
-        }
-        return DX * DX + DY * DY + DZ * DZ <= FMath::Square(Radius);
-    }
-
-    static bool VF_AnyPassageBoundTouchesLattice(
+    static bool VF_AnyPassageModifierDomainTouchesLattice(
         const TArray<FVoxelPassage>& Passages,
         const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step)
     {
@@ -2219,21 +2345,463 @@ namespace
             return true;
         }
 
-        for (const FVoxelPassage& Passage : Passages)
+        // EvaluateModifierSDF smooth-mins every finite primitive in passage order. The polynomial
+        // smooth-min can dip below the smallest raw term by at most K/6 per combine (K=3 here).
+        // Build a conservative AABB for each actual tube/landing primitive, then pad the union by
+        // the worst finite dip. This is materially tighter than Passage.BoundRadius for a long,
+        // thin inter-strate route, while still being a pure reject gate: a miss proves only that
+        // the modifier cannot be < 4 at any MC lattice point. Malformed data remains Unknown.
+        constexpr float CarveThreshold = 4.0f;
+        constexpr float SmoothMinK = 3.0f;
+        TArray<FVoxelPassageModifierDomain, TInlineAllocator<128>> Domains;
+        if (!VF_BuildPassageModifierDomains(Passages, Domains))
         {
-            const float Reach = Passage.BoundRadius + 4.0f;
-            if (!FMath::IsFinite(Reach) || Reach < 0.0f)
-            {
-                // Invalid generated geometry is an unknown, not an empty passage set.
-                return true;
-            }
-            if (VF_LatticeBoxTouchesSphere(
-                    VoxelBox, LatticeOrigin, Step, Passage.BoundCenter, Reach))
+            return true;
+        }
+        if (Domains.Num() == 0)
+        {
+            return false;
+        }
+        const int64 DomainCount = Domains.Num();
+        const float SmoothDip = static_cast<float>(DomainCount - 1)
+            * (SmoothMinK / 6.0f);
+        const float Padding = CarveThreshold + SmoothDip;
+        if (!FMath::IsFinite(Padding) || Padding < 0.0f)
+        {
+            return true;
+        }
+        for (const FVoxelPassageModifierDomain& Domain : Domains)
+        {
+            if (VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    Domain.Min.X - Padding, Domain.Max.X + Padding,
+                    Domain.Min.Y - Padding, Domain.Max.Y + Padding,
+                    Domain.Min.Z - Padding, Domain.Max.Z + Padding))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    static FORCEINLINE float VF_DistanceToSegmentLowerBound(
+        const FVector& Position, const FVector& A, const FVector& B, float Radius)
+    {
+        const FVector AB = B - A;
+        const FVector AP = Position - A;
+        const float LenSq = FVector::DotProduct(AB, AB);
+        const float T = LenSq > KINDA_SMALL_NUMBER
+            ? FMath::Clamp(FVector::DotProduct(AP, AB) / LenSq, 0.0f, 1.0f)
+            : 0.0f;
+        const FVector Closest = A + AB * T;
+        return FVector::Dist(Position, Closest) - Radius;
+    }
+
+    static bool VF_PointMayHavePassageCarve(
+        const TArray<FVoxelPassage>& Passages,
+        const FVector& Position)
+    {
+        if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+            || !FMath::IsFinite(Position.Z))
+        {
+            return true;
+        }
+
+        constexpr float BlendK = 3.0f;
+        constexpr float CarveThreshold = 4.0f;
+        constexpr float NumericalSafetyMargin = 1.0e-3f;
+        float ModifierLowerBound = FLT_MAX;
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (!FMath::IsFinite(Passage.BoundCenter.X)
+                || !FMath::IsFinite(Passage.BoundCenter.Y)
+                || !FMath::IsFinite(Passage.BoundCenter.Z)
+                || !FMath::IsFinite(Passage.BoundRadius)
+                || !FMath::IsFinite(Passage.BoundRadiusSq)
+                || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+            {
+                return true;
+            }
+            if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq)
+            {
+                continue;
+            }
+
+            float PassageLowerBound = FLT_MAX;
+            if (Passage.ControlPoints.Num() >= 2)
+            {
+                if (Passage.ControlPoints.Num() > 4096)
+                {
+                    return true;
+                }
+                const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+                if (!bTaper && !FMath::IsFinite(Passage.Radius))
+                {
+                    return true;
+                }
+                for (int32 PointIndex = 0;
+                     PointIndex < Passage.ControlPoints.Num(); ++PointIndex)
+                {
+                    const FVector& Point = Passage.ControlPoints[PointIndex];
+                    if (!FMath::IsFinite(Point.X) || !FMath::IsFinite(Point.Y)
+                        || !FMath::IsFinite(Point.Z))
+                    {
+                        return true;
+                    }
+                    if (bTaper && !FMath::IsFinite(Passage.ControlRadii[PointIndex]))
+                    {
+                        return true;
+                    }
+                }
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+                {
+                    const FVector& A = Passage.ControlPoints[SegmentIndex];
+                    const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                    const float RadiusA = bTaper
+                        ? Passage.ControlRadii[SegmentIndex] : Passage.Radius;
+                    const float RadiusB = bTaper
+                        ? Passage.ControlRadii[SegmentIndex + 1] : Passage.Radius;
+                    const float Radius = FMath::Max(FMath::Abs(RadiusA), FMath::Abs(RadiusB));
+                    const float SegmentLowerBound = VF_DistanceToSegmentLowerBound(
+                        Position, A, B, Radius);
+                    if (!FMath::IsFinite(SegmentLowerBound))
+                    {
+                        return true;
+                    }
+                    PassageLowerBound = VoxelSDF::SmoothMin(
+                        PassageLowerBound, SegmentLowerBound, BlendK);
+                }
+            }
+            else
+            {
+                if (!FMath::IsFinite(Passage.UpperPoint.X)
+                    || !FMath::IsFinite(Passage.UpperPoint.Y)
+                    || !FMath::IsFinite(Passage.UpperPoint.Z)
+                    || !FMath::IsFinite(Passage.LowerPoint.X)
+                    || !FMath::IsFinite(Passage.LowerPoint.Y)
+                    || !FMath::IsFinite(Passage.LowerPoint.Z)
+                    || !FMath::IsFinite(Passage.Radius))
+                {
+                    return true;
+                }
+                PassageLowerBound = VF_DistanceToSegmentLowerBound(
+                    Position, Passage.UpperPoint, Passage.LowerPoint,
+                    FMath::Abs(Passage.Radius));
+                if (!FMath::IsFinite(PassageLowerBound))
+                {
+                    return true;
+                }
+            }
+
+            const FVoxelPassageLanding* Landings[] = {
+                &Passage.UpperLanding, &Passage.LowerLanding };
+            for (const FVoxelPassageLanding* Landing : Landings)
+            {
+                if (!FMath::IsFinite(Landing->StandingPoint.X)
+                    || !FMath::IsFinite(Landing->StandingPoint.Y)
+                    || !FMath::IsFinite(Landing->FloorZ)
+                    || !FMath::IsFinite(Landing->CeilingZ)
+                    || !FMath::IsFinite(Landing->HalfWidth))
+                {
+                    return true;
+                }
+                if (Landing->HalfWidth <= 0.0f
+                    || Landing->CeilingZ <= Landing->FloorZ)
+                {
+                    continue;
+                }
+                const float LandingSDF = VF_EvaluatePassageLandingSDF(Position, *Landing);
+                if (!FMath::IsFinite(LandingSDF))
+                {
+                    return true;
+                }
+                PassageLowerBound = VoxelSDF::SmoothMin(
+                    PassageLowerBound, LandingSDF, BlendK);
+            }
+
+            ModifierLowerBound = VoxelSDF::SmoothMin(
+                ModifierLowerBound, PassageLowerBound, BlendK);
+        }
+        return !FMath::IsFinite(ModifierLowerBound)
+            || ModifierLowerBound < CarveThreshold + NumericalSafetyMargin;
+    }
+
+    static float VF_DistanceBetweenAABBs(
+        const FVector& MinA, const FVector& MaxA,
+        const FVector& MinB, const FVector& MaxB)
+    {
+        const float DX = MaxA.X < MinB.X ? MinB.X - MaxA.X
+            : MaxB.X < MinA.X ? MinA.X - MaxB.X : 0.0f;
+        const float DY = MaxA.Y < MinB.Y ? MinB.Y - MaxA.Y
+            : MaxB.Y < MinA.Y ? MinA.Y - MaxB.Y : 0.0f;
+        const float DZ = MaxA.Z < MinB.Z ? MinB.Z - MaxA.Z
+            : MaxB.Z < MinA.Z ? MinA.Z - MaxB.Z : 0.0f;
+        return FMath::Sqrt(DX * DX + DY * DY + DZ * DZ);
+    }
+
+    // Exact minimum distance between a finite segment and an axis-aligned box. The squared
+    // distance to a box is piecewise quadratic along the segment; the only breakpoints are where
+    // one segment coordinate crosses one of the six box planes. This is a small, allocation-free
+    // lower-bound primitive for the passage proof, not a change to the runtime SDF evaluator.
+    static bool VF_SegmentDistanceToBox(
+        const FVector& A, const FVector& B, const FBox& Box, float& OutDistance)
+    {
+        if (!FMath::IsFinite(A.X) || !FMath::IsFinite(A.Y) || !FMath::IsFinite(A.Z)
+            || !FMath::IsFinite(B.X) || !FMath::IsFinite(B.Y) || !FMath::IsFinite(B.Z)
+            || !Box.IsValid)
+        {
+            return false;
+        }
+
+        const FVector D = B - A;
+        float Breaks[8] = { 0.0f, 1.0f };
+        int32 BreakCount = 2;
+        const float AValues[3] = { A.X, A.Y, A.Z };
+        const float DValues[3] = { D.X, D.Y, D.Z };
+        const float BoxMinValues[3] = {
+            (float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z };
+        const float BoxMaxValues[3] = {
+            (float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z };
+        for (int32 Axis = 0; Axis < 3; ++Axis)
+        {
+            // This is a lower-bound proof.  A nonzero direction, however small, can cross a
+            // box plane and reduce the segment distance; treating it as stationary would make
+            // the bound too high and could incorrectly skip geometry.
+            if (DValues[Axis] == 0.0f)
+            {
+                continue;
+            }
+            const float TMin = (BoxMinValues[Axis] - AValues[Axis]) / DValues[Axis];
+            const float TMax = (BoxMaxValues[Axis] - AValues[Axis]) / DValues[Axis];
+            if (TMin > 0.0f && TMin < 1.0f && BreakCount < UE_ARRAY_COUNT(Breaks))
+            {
+                Breaks[BreakCount++] = TMin;
+            }
+            if (TMax > 0.0f && TMax < 1.0f && BreakCount < UE_ARRAY_COUNT(Breaks))
+            {
+                Breaks[BreakCount++] = TMax;
+            }
+        }
+        for (int32 I = 1; I < BreakCount; ++I)
+        {
+            const float Value = Breaks[I];
+            int32 J = I - 1;
+            while (J >= 0 && Breaks[J] > Value)
+            {
+                Breaks[J + 1] = Breaks[J];
+                --J;
+            }
+            Breaks[J + 1] = Value;
+        }
+
+        float MinimumDistanceSquared = FLT_MAX;
+        for (int32 Interval = 0; Interval + 1 < BreakCount; ++Interval)
+        {
+            const float T0 = Breaks[Interval];
+            const float T1 = Breaks[Interval + 1];
+            const float TM = 0.5f * (T0 + T1);
+            float QuadraticA = 0.0f;
+            float QuadraticB = 0.0f;
+            float QuadraticC = 0.0f;
+            for (int32 Axis = 0; Axis < 3; ++Axis)
+            {
+                const float Mid = AValues[Axis] + DValues[Axis] * TM;
+                float Offset = 0.0f;
+                if (Mid < BoxMinValues[Axis])
+                {
+                    Offset = AValues[Axis] - BoxMinValues[Axis];
+                }
+                else if (Mid > BoxMaxValues[Axis])
+                {
+                    Offset = AValues[Axis] - BoxMaxValues[Axis];
+                }
+                else
+                {
+                    continue;
+                }
+                QuadraticA += DValues[Axis] * DValues[Axis];
+                QuadraticB += 2.0f * Offset * DValues[Axis];
+                QuadraticC += Offset * Offset;
+            }
+            float T = T0;
+            if (QuadraticA > 0.0f)
+            {
+                T = FMath::Clamp(
+                    -QuadraticB / (2.0f * QuadraticA), T0, T1);
+            }
+            const float DistanceSquared = FMath::Max(
+                0.0f,
+                (QuadraticA * T + QuadraticB) * T + QuadraticC);
+            MinimumDistanceSquared = FMath::Min(
+                MinimumDistanceSquared, DistanceSquared);
+        }
+        if (!FMath::IsFinite(MinimumDistanceSquared))
+        {
+            return false;
+        }
+        OutDistance = FMath::Sqrt(MinimumDistanceSquared);
+        return FMath::IsFinite(OutDistance);
+    }
+
+    static bool VF_LandingLowerBoundOverBox(
+        const FVoxelPassageLanding& Landing, const FBox& Box, float& OutLowerBound)
+    {
+        if (!FMath::IsFinite(Landing.StandingPoint.X)
+            || !FMath::IsFinite(Landing.StandingPoint.Y)
+            || !FMath::IsFinite(Landing.FloorZ)
+            || !FMath::IsFinite(Landing.CeilingZ)
+            || !FMath::IsFinite(Landing.HalfWidth)
+            || !Box.IsValid)
+        {
+            return false;
+        }
+        if (Landing.HalfWidth <= 0.0f || Landing.CeilingZ <= Landing.FloorZ)
+        {
+            OutLowerBound = FLT_MAX;
+            return true;
+        }
+
+        constexpr float RoomRounding = 1.5f;
+        const float Height = Landing.CeilingZ - Landing.FloorZ;
+        const FVector Center(
+            Landing.StandingPoint.X, Landing.StandingPoint.Y,
+            (Landing.FloorZ + Landing.CeilingZ) * 0.5f);
+        const FVector HalfExtent(
+            FMath::Max(Landing.HalfWidth - RoomRounding, 0.25f),
+            FMath::Max(Landing.HalfWidth - RoomRounding, 0.25f),
+            FMath::Max(Height * 0.5f - RoomRounding, 0.25f));
+        const FVector OuterMin = Center - HalfExtent - FVector(RoomRounding);
+        const FVector OuterMax = Center + HalfExtent + FVector(RoomRounding);
+        const FVector BoxMin((float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z);
+        const FVector BoxMax((float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z);
+        const float OuterDistance = VF_DistanceBetweenAABBs(
+            BoxMin, BoxMax, OuterMin, OuterMax);
+        const float RoundedBoxLower = OuterDistance > 0.0f
+            ? OuterDistance
+            : -FMath::Max(HalfExtent.X,
+                FMath::Max(HalfExtent.Y, HalfExtent.Z)) - RoomRounding;
+        OutLowerBound = FMath::Max(
+            RoundedBoxLower, Landing.FloorZ - (float)Box.Max.Z);
+        return FMath::IsFinite(OutLowerBound);
+    }
+
+    static bool VF_PassageModifierLowerBoundOverBox(
+        const TArray<FVoxelPassage>& Passages,
+        const FBox& Box, float& OutLowerBound)
+    {
+        if (!Box.IsValid)
+        {
+            return false;
+        }
+
+        constexpr float BlendK = 3.0f;
+        float ModifierLowerBound = FLT_MAX;
+        const FVector BoxMin((float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z);
+        const FVector BoxMax((float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z);
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (!FMath::IsFinite(Passage.BoundCenter.X)
+                || !FMath::IsFinite(Passage.BoundCenter.Y)
+                || !FMath::IsFinite(Passage.BoundCenter.Z)
+                || !FMath::IsFinite(Passage.BoundRadius)
+                || !FMath::IsFinite(Passage.BoundRadiusSq)
+                || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+            {
+                return false;
+            }
+            const FVector ClosestPoint(
+                FMath::Clamp(Passage.BoundCenter.X, BoxMin.X, BoxMax.X),
+                FMath::Clamp(Passage.BoundCenter.Y, BoxMin.Y, BoxMax.Y),
+                FMath::Clamp(Passage.BoundCenter.Z, BoxMin.Z, BoxMax.Z));
+            if (FVector::DistSquared(ClosestPoint, Passage.BoundCenter)
+                > Passage.BoundRadiusSq)
+            {
+                continue;
+            }
+
+            float PassageLowerBound = FLT_MAX;
+            if (Passage.ControlPoints.Num() >= 2)
+            {
+                if (Passage.ControlPoints.Num() > 4096)
+                {
+                    return false;
+                }
+                const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+                if (!bTaper && !FMath::IsFinite(Passage.Radius))
+                {
+                    return false;
+                }
+                for (int32 PointIndex = 0;
+                     PointIndex < Passage.ControlPoints.Num(); ++PointIndex)
+                {
+                    const FVector& Point = Passage.ControlPoints[PointIndex];
+                    if (!FMath::IsFinite(Point.X) || !FMath::IsFinite(Point.Y)
+                        || !FMath::IsFinite(Point.Z)
+                        || (bTaper && !FMath::IsFinite(Passage.ControlRadii[PointIndex])))
+                    {
+                        return false;
+                    }
+                }
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+                {
+                    const float RadiusA = bTaper
+                        ? Passage.ControlRadii[SegmentIndex] : Passage.Radius;
+                    const float RadiusB = bTaper
+                        ? Passage.ControlRadii[SegmentIndex + 1] : Passage.Radius;
+                    const float Radius = FMath::Max(FMath::Abs(RadiusA), FMath::Abs(RadiusB));
+                    float SegmentDistance = 0.0f;
+                    if (!FMath::IsFinite(Radius)
+                        || !VF_SegmentDistanceToBox(
+                            Passage.ControlPoints[SegmentIndex],
+                            Passage.ControlPoints[SegmentIndex + 1], Box, SegmentDistance))
+                    {
+                        return false;
+                    }
+                    PassageLowerBound = VoxelSDF::SmoothMin(
+                        PassageLowerBound, SegmentDistance - Radius, BlendK);
+                }
+            }
+            else
+            {
+                if (!FMath::IsFinite(Passage.UpperPoint.X)
+                    || !FMath::IsFinite(Passage.UpperPoint.Y)
+                    || !FMath::IsFinite(Passage.UpperPoint.Z)
+                    || !FMath::IsFinite(Passage.LowerPoint.X)
+                    || !FMath::IsFinite(Passage.LowerPoint.Y)
+                    || !FMath::IsFinite(Passage.LowerPoint.Z)
+                    || !FMath::IsFinite(Passage.Radius))
+                {
+                    return false;
+                }
+                float SegmentDistance = 0.0f;
+                if (!VF_SegmentDistanceToBox(
+                        Passage.UpperPoint, Passage.LowerPoint, Box, SegmentDistance))
+                {
+                    return false;
+                }
+                PassageLowerBound = SegmentDistance - FMath::Abs(Passage.Radius);
+            }
+
+            const FVoxelPassageLanding* Landings[] = {
+                &Passage.UpperLanding, &Passage.LowerLanding };
+            for (const FVoxelPassageLanding* Landing : Landings)
+            {
+                float LandingLowerBound = FLT_MAX;
+                if (!VF_LandingLowerBoundOverBox(
+                        *Landing, Box, LandingLowerBound))
+                {
+                    return false;
+                }
+                PassageLowerBound = VoxelSDF::SmoothMin(
+                    PassageLowerBound, LandingLowerBound, BlendK);
+            }
+            ModifierLowerBound = VoxelSDF::SmoothMin(
+                ModifierLowerBound, PassageLowerBound, BlendK);
+        }
+        OutLowerBound = ModifierLowerBound;
+        return FMath::IsFinite(OutLowerBound);
     }
 
     // MaxPassageCarveFactorNearLattice is queried once for the root and once for every refined
@@ -2369,8 +2937,334 @@ bool UVoxelStrateManager::AnyPassageNearLattice(
     // MaxPassageCarveFactorNearLattice during the same fold.  A bound hit is sufficient to keep
     // the carve hypothesis alive; MaxPassageCarveFactorNearLattice supplies the exact lattice
     // amplitude before the fold can preserve AllSolid.
-    return VF_AnyPassageBoundTouchesLattice(
+    return VF_AnyPassageModifierDomainTouchesLattice(
         Passages, VoxelBox, LatticeOrigin, Step);
+}
+
+bool UVoxelStrateManager::AnyPassageAirPostNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float BaseDensity, float SealThickness) const
+{
+    // FPassageCarveOp already evaluates the complete passage modifier in the stack.  The only
+    // passage work still outside that proof is the post-disturbance landing/tunnel-air backstop.
+    // Do not use the enclosing passage sphere as its candidate: that sphere is deliberately much
+    // wider than a walkable core and was the false-positive that made LOD0 all-solid tiles recurse.
+    if (Step <= 0 || !VoxelBox.IsValid
+        || VoxelPassageGeometry::VerticalShaftConnectorAirMarker())
+    {
+        return true;
+    }
+    if (!FMath::IsFinite(BaseDensity) || !(BaseDensity > 0.0f)
+        || !FMath::IsFinite(SealThickness) || SealThickness < 0.0f)
+    {
+        return true;
+    }
+
+    int32 FirstX = 0, LastX = -1;
+    int32 FirstY = 0, LastY = -1;
+    int32 FirstZ = 0, LastZ = -1;
+    if (!VF_LatticeAxisRange(
+            VoxelBox.Min.X, VoxelBox.Max.X, (float)LatticeOrigin.X, Step, FirstX, LastX)
+        || !VF_LatticeAxisRange(
+            VoxelBox.Min.Y, VoxelBox.Max.Y, (float)LatticeOrigin.Y, Step, FirstY, LastY)
+        || !VF_LatticeAxisRange(
+            VoxelBox.Min.Z, VoxelBox.Max.Z, (float)LatticeOrigin.Z, Step, FirstZ, LastZ))
+    {
+        return true;
+    }
+
+    const int64 DimX = (int64)LastX - FirstX + 1;
+    const int64 DimY = (int64)LastY - FirstY + 1;
+    const int64 DimZ = (int64)LastZ - FirstZ + 1;
+    const int64 SampleCount = DimX * DimY * DimZ;
+    // This query is a proof helper, not a second unbounded density grid.  An unusual external
+    // caller gets Unknown/candidate and therefore keeps the normal mesher path.
+    if (SampleCount <= 0 || SampleCount > 65536)
+    {
+        return true;
+    }
+
+    // The tunnel-air post is a vertical prism over the nearest horizontal control segment.  Its
+    // existence on a lattice does not require a 3-D walk: project each XY lattice point once,
+    // then ask whether the resulting floor interval contains a Z lattice sample.  The interval is
+    // deliberately closed at both ends here, so strict predicate boundaries can only create a
+    // false candidate; they can never hide a real air sample.
+    constexpr int32 MaxTunnelControlPointsForQuery = 4096;
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (!Passage.bWalkableTunnelContract)
+        {
+            continue;
+        }
+        if (Passage.ControlPoints.Num() < 2
+            || Passage.ControlRadii.Num() != Passage.ControlPoints.Num()
+            || Passage.ControlPoints.Num() > MaxTunnelControlPointsForQuery)
+        {
+            return true;
+        }
+        for (int32 PointIndex = 0;
+             PointIndex < Passage.ControlPoints.Num(); ++PointIndex)
+        {
+            const FVector& Point = Passage.ControlPoints[PointIndex];
+            if (!FMath::IsFinite(Point.X) || !FMath::IsFinite(Point.Y)
+                || !FMath::IsFinite(Point.Z)
+                || !FMath::IsFinite(Passage.ControlRadii[PointIndex]))
+            {
+                return true;
+            }
+        }
+
+        for (int32 IY = FirstY; IY <= LastY; ++IY)
+        {
+            const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+            for (int32 IX = FirstX; IX <= LastX; ++IX)
+            {
+                const FVector Position(
+                    (float)LatticeOrigin.X + (float)(IX * Step), Y, 0.0f);
+                float FloorZ = 0.0f;
+                float SupportRadius = 0.0f;
+                if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                        Passage.ControlPoints, Passage.ControlRadii, Position,
+                        FloorZ, SupportRadius))
+                {
+                    continue;
+                }
+                const float AirMinZ = FMath::Max(
+                    (float)VoxelBox.Min.Z,
+                    FloorZ + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels);
+                const float AirMaxZ = FMath::Min(
+                    (float)VoxelBox.Max.Z,
+                    FloorZ + 2.0f * SupportRadius);
+                if (VoxelPassageGeometry::LatticeAxisHasSampleInInterval(
+                        AirMinZ, AirMaxZ,
+                        (float)LatticeOrigin.Z, Step))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    constexpr float LandingBlendRadius = 4.0f;
+    TArray<int32, TInlineAllocator<32>> Candidates;
+    struct FPostPotentialDomain
+    {
+        int32 PassageIndex = INDEX_NONE;
+        FVector Min = FVector(FLT_MAX, FLT_MAX, FLT_MAX);
+        FVector Max = FVector(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    };
+    TArray<FPostPotentialDomain, TInlineAllocator<64>> PotentialDomains;
+    float PotentialMinX = FLT_MAX;
+    float PotentialMinY = FLT_MAX;
+    float PotentialMinZ = FLT_MAX;
+    float PotentialMaxX = -FLT_MAX;
+    float PotentialMaxY = -FLT_MAX;
+    float PotentialMaxZ = -FLT_MAX;
+
+    // BoundCenter/BoundRadius encloses the whole passage, which is intentionally much larger
+    // than the post writers. Using that sphere here made every LOD0 child along a long route
+    // walk its complete 17^3 lattice even when the route's landing/tunnel-air AABBs were many
+    // chunks away. Build a conservative union of the actual post domains instead. A point
+    // outside these AABBs cannot satisfy either VF_EvaluatePassageLandingSDF or
+    // VF_IsWalkableTunnelAir; the exact predicates below still decide every point inside.
+    auto AddPotentialAABB = [&](int32 PassageIndex,
+                                float MinX, float MaxX, float MinY, float MaxY,
+                                float MinZ, float MaxZ, bool& bTouches) -> bool
+    {
+        if (!FMath::IsFinite(MinX) || !FMath::IsFinite(MaxX)
+            || !FMath::IsFinite(MinY) || !FMath::IsFinite(MaxY)
+            || !FMath::IsFinite(MinZ) || !FMath::IsFinite(MaxZ)
+            || MinX > MaxX || MinY > MaxY || MinZ > MaxZ)
+        {
+            return false;
+        }
+        if (VF_LatticeBoxTouchesAABB(
+                VoxelBox, LatticeOrigin, Step,
+                MinX, MaxX, MinY, MaxY, MinZ, MaxZ))
+        {
+            bTouches = true;
+            PotentialMinX = FMath::Min(PotentialMinX, MinX);
+            PotentialMinY = FMath::Min(PotentialMinY, MinY);
+            PotentialMinZ = FMath::Min(PotentialMinZ, MinZ);
+            PotentialMaxX = FMath::Max(PotentialMaxX, MaxX);
+            PotentialMaxY = FMath::Max(PotentialMaxY, MaxY);
+            PotentialMaxZ = FMath::Max(PotentialMaxZ, MaxZ);
+            PotentialDomains.Add({
+                PassageIndex,
+                FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ) });
+        }
+        return true;
+    };
+
+    for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
+    {
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (!FMath::IsFinite(Passage.BoundCenter.X)
+            || !FMath::IsFinite(Passage.BoundCenter.Y)
+            || !FMath::IsFinite(Passage.BoundCenter.Z)
+            || !FMath::IsFinite(Passage.BoundRadius)
+            || !FMath::IsFinite(Passage.BoundRadiusSq)
+            || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+        {
+            return true;
+        }
+
+        bool bPassageTouches = false;
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            // A passage such as the optional surface entry has no landing post and therefore
+            // leaves this descriptor at its zero-valued default. VF_EvaluatePassageLandingSDF
+            // treats that descriptor as FLT_MAX (the writer is a known no-op), so it must not
+            // turn the whole tile into an Unknown/candidate. FloorThickness is intentionally
+            // not part of this validity check: the landing-air writer reads the SDF fields even
+            // when a separate floor descriptor is degenerate.
+            const bool bLandingSdfValid =
+                FMath::IsFinite(Landing->StandingPoint.X)
+                && FMath::IsFinite(Landing->StandingPoint.Y)
+                && FMath::IsFinite(Landing->FloorZ)
+                && FMath::IsFinite(Landing->CeilingZ)
+                && FMath::IsFinite(Landing->HalfWidth)
+                && Landing->HalfWidth > 0.0f
+                && Landing->CeilingZ > Landing->FloorZ;
+            if (bLandingSdfValid)
+            {
+                const float HalfExtent = Landing->HalfWidth + LandingBlendRadius;
+                if (!AddPotentialAABB(
+                        PassageIndex,
+                        Landing->StandingPoint.X - HalfExtent,
+                        Landing->StandingPoint.X + HalfExtent,
+                        Landing->StandingPoint.Y - HalfExtent,
+                        Landing->StandingPoint.Y + HalfExtent,
+                        Landing->FloorZ - LandingBlendRadius,
+                        Landing->CeilingZ + LandingBlendRadius,
+                        bPassageTouches))
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (bPassageTouches)
+        {
+            Candidates.Add(PassageIndex);
+        }
+    }
+    if (Candidates.Num() == 0)
+    {
+        return false;
+    }
+
+    // The union above is conservative but can be much smaller than the queried box. Restrict the
+    // exact walk to its lattice intersection; a false positive still pays the exact predicates,
+    // while a far-away long-passage sphere no longer does.
+    if (!VF_LatticeAxisRange(
+            FMath::Max((float)VoxelBox.Min.X, PotentialMinX),
+            FMath::Min((float)VoxelBox.Max.X, PotentialMaxX),
+            (float)LatticeOrigin.X, Step, FirstX, LastX)
+        || !VF_LatticeAxisRange(
+            FMath::Max((float)VoxelBox.Min.Y, PotentialMinY),
+            FMath::Min((float)VoxelBox.Max.Y, PotentialMaxY),
+            (float)LatticeOrigin.Y, Step, FirstY, LastY)
+        || !VF_LatticeAxisRange(
+            FMath::Max((float)VoxelBox.Min.Z, PotentialMinZ),
+            FMath::Min((float)VoxelBox.Max.Z, PotentialMaxZ),
+            (float)LatticeOrigin.Z, Step, FirstZ, LastZ))
+    {
+        return false;
+    }
+
+    const int64 PotentialSampleCount = ((int64)LastX - FirstX + 1)
+        * ((int64)LastY - FirstY + 1)
+        * ((int64)LastZ - FirstZ + 1);
+    if (PotentialSampleCount <= 0 || PotentialSampleCount > 65536)
+    {
+        return true;
+    }
+
+    const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
+    if (!FMath::IsFinite(AirTarget))
+    {
+        return true;
+    }
+    for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+    {
+        const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
+        for (int32 IY = FirstY; IY <= LastY; ++IY)
+        {
+            const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+            for (int32 IX = FirstX; IX <= LastX; ++IX)
+            {
+                const FVector Position(
+                    (float)LatticeOrigin.X + (float)(IX * Step), Y, Z);
+                float MinLandingSDF = FLT_MAX;
+
+                for (const int32 PassageIndex : Candidates)
+                {
+                    const FVoxelPassage& Passage = Passages[PassageIndex];
+                    bool bInPotentialDomain = false;
+                    for (const FPostPotentialDomain& Domain : PotentialDomains)
+                    {
+                        if (Domain.PassageIndex == PassageIndex
+                            && Position.X >= Domain.Min.X && Position.X <= Domain.Max.X
+                            && Position.Y >= Domain.Min.Y && Position.Y <= Domain.Max.Y
+                            && Position.Z >= Domain.Min.Z && Position.Z <= Domain.Max.Z)
+                        {
+                            bInPotentialDomain = true;
+                            break;
+                        }
+                    }
+                    if (!bInPotentialDomain)
+                    {
+                        continue;
+                    }
+                    const float DistanceSquared =
+                        FVector::DistSquared(Position, Passage.BoundCenter);
+                    if (DistanceSquared > Passage.BoundRadiusSq)
+                    {
+                        continue;
+                    }
+
+                    const float UpperSDF = VF_EvaluatePassageLandingSDF(
+                        Position, Passage.UpperLanding);
+                    const float LowerSDF = VF_EvaluatePassageLandingSDF(
+                        Position, Passage.LowerLanding);
+                    if (!FMath::IsFinite(UpperSDF) || !FMath::IsFinite(LowerSDF))
+                    {
+                        // A malformed landing is an unknown post, never an identity proof.
+                        return true;
+                    }
+                    MinLandingSDF = FMath::Min(
+                        MinLandingSDF, FMath::Min(UpperSDF, LowerSDF));
+                }
+
+                // The floor writer can only suppress a landing-air post, so omitting that
+                // exclusion here is deliberately conservative: it can retain a final-field
+                // candidate, but can never prove an empty tile that owns a support floor.
+                // The exact same SDF threshold as the post is sufficient for the current-density
+                // interpolation: SDF < 4 is exactly its activation domain.
+                if (MinLandingSDF < LandingBlendRadius)
+                {
+                    float CarveFactor = FMath::Clamp(
+                        (LandingBlendRadius - MinLandingSDF)
+                            / (LandingBlendRadius * 2.0f),
+                        0.0f, 1.0f);
+                    CarveFactor = SmoothStep01(CarveFactor);
+                    const float LandingThreshold = FMath::Lerp(
+                        BaseDensity, AirTarget, CarveFactor);
+                    if (!FMath::IsFinite(LandingThreshold)
+                        || LandingThreshold <= 0.0f)
+                    {
+                        // Zero is not solid under the mesher's sign convention, so it is part of
+                        // the final-field risk just like a strictly air threshold.
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
 }
 
 float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
@@ -2414,8 +3308,60 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
         return Cache.MaxIn(FirstX, LastX, FirstY, LastY, FirstZ, LastZ);
     }
 
-    if (!VF_AnyPassageBoundTouchesLattice(
-            Passages, VoxelBox, LatticeOrigin, Step))
+    constexpr float PassageCarveThreshold = 4.0f;
+    constexpr float SmoothMinK = 3.0f;
+    float ModifierBoxLowerBound = 0.0f;
+    if (VF_PassageModifierLowerBoundOverBox(
+            Passages, VoxelBox, ModifierBoxLowerBound)
+        && ModifierBoxLowerBound >= PassageCarveThreshold + 1.0e-3f)
+    {
+        Cache.Begin(
+            this, LifetimeId, Version, LatticeOrigin, Step,
+            FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
+            /*bInNoCandidate*/ true);
+        return 0.0f;
+    }
+    TArray<FVoxelPassageModifierDomain, TInlineAllocator<128>> ModifierDomains;
+    bool bKnownModifierDomains = VF_BuildPassageModifierDomains(
+        Passages, ModifierDomains);
+    float ModifierDomainPadding = FLT_MAX;
+    bool bModifierDomainTouchesLattice = true;
+    if (bKnownModifierDomains)
+    {
+        if (ModifierDomains.Num() == 0)
+        {
+            bModifierDomainTouchesLattice = false;
+        }
+        else
+        {
+            const float SmoothDip = static_cast<float>(ModifierDomains.Num() - 1)
+                * (SmoothMinK / 6.0f);
+            const float Padding = PassageCarveThreshold + SmoothDip;
+            ModifierDomainPadding = Padding;
+            if (!FMath::IsFinite(Padding) || Padding < 0.0f)
+            {
+                bKnownModifierDomains = false;
+            }
+            else
+            {
+                bModifierDomainTouchesLattice = false;
+                for (const FVoxelPassageModifierDomain& Domain : ModifierDomains)
+                {
+                    if (VF_LatticeBoxTouchesAABB(
+                            VoxelBox, LatticeOrigin, Step,
+                            Domain.Min.X - Padding, Domain.Max.X + Padding,
+                            Domain.Min.Y - Padding, Domain.Max.Y + Padding,
+                            Domain.Min.Z - Padding, Domain.Max.Z + Padding))
+                    {
+                        bModifierDomainTouchesLattice = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (bKnownModifierDomains && !bModifierDomainTouchesLattice)
     {
         Cache.Begin(
             this, LifetimeId, Version, LatticeOrigin, Step,
@@ -2424,7 +3370,6 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
         return 0.0f;
     }
 
-    constexpr float PassageCarveThreshold = 4.0f;
     auto CarveFactorFromSDF = [](float ModifierSDF)
     {
         if (!(ModifierSDF < PassageCarveThreshold))
@@ -2438,6 +3383,193 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
         return SmoothStep01(CarveFactor);
     };
 
+    // A domain hit is still much wider than the tapered capsule itself.  Before paying for the
+    // full modifier evaluator, use a point-level lower-bound fold over the actual primitive
+    // domains.  It preserves the saturating SmoothMin behavior, so a far segment contributes no
+    // artificial global K/6 penalty.  This keeps the proof exact while avoiding a 33^3 walk
+    // through every segment for a tile that merely grazes a passage's old sphere.
+    const auto MayEvaluatePoint = [&](const FVector& Position) -> bool
+    {
+        if (!bKnownModifierDomains)
+        {
+            return true;
+        }
+        bool bInsideModifierDomain = false;
+        for (const FVoxelPassageModifierDomain& Domain : ModifierDomains)
+        {
+            if (Position.X >= Domain.Min.X - ModifierDomainPadding
+                && Position.X <= Domain.Max.X + ModifierDomainPadding
+                && Position.Y >= Domain.Min.Y - ModifierDomainPadding
+                && Position.Y <= Domain.Max.Y + ModifierDomainPadding
+                && Position.Z >= Domain.Min.Z - ModifierDomainPadding
+                && Position.Z <= Domain.Max.Z + ModifierDomainPadding)
+            {
+                bInsideModifierDomain = true;
+                break;
+            }
+        }
+        return bInsideModifierDomain
+            && VF_PointMayHavePassageCarve(Passages, Position);
+    };
+
+    // Do not sweep the complete 33^3 lattice merely because a continuous passage domain enters
+    // the tile. Recursively split the sample index box and use the exact segment/box lower bound
+    // above to discard whole groups. A leaf still evaluates only the original MC vertices; this is
+    // a proof acceleration, not a lower-resolution sample.
+    const int64 FullSampleCount =
+        (static_cast<int64>(LastX) - FirstX + 1)
+        * (static_cast<int64>(LastY) - FirstY + 1)
+        * (static_cast<int64>(LastZ) - FirstZ + 1);
+    constexpr int64 MaxRecursiveLatticeSamples = 65536;
+    if (bKnownModifierDomains && FullSampleCount > 0
+        && FullSampleCount <= MaxRecursiveLatticeSamples)
+    {
+        Cache.Begin(
+            this, LifetimeId, Version, LatticeOrigin, Step,
+            FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
+            /*bInNoCandidate*/ false);
+        Cache.Factors.SetNumZeroed(static_cast<int32>(FullSampleCount));
+
+        float MaxCarveFactor = 0.0f;
+        auto EvaluatePoint = [&](int32 IX, int32 IY, int32 IZ)
+        {
+            const float X = (float)LatticeOrigin.X + (float)(IX * Step);
+            const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+            const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
+            const FVector Position(X, Y, Z);
+            if (!MayEvaluatePoint(Position))
+            {
+                return;
+            }
+            const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
+            const float CarveFactor = FMath::IsFinite(ModifierSDF)
+                ? CarveFactorFromSDF(ModifierSDF) : 1.0f;
+            Cache.Factors[Cache.Index(IX, IY, IZ)] = CarveFactor;
+            MaxCarveFactor = FMath::Max(MaxCarveFactor, CarveFactor);
+        };
+        auto Visit = [&](auto&& Self,
+                         int32 IX0, int32 IX1,
+                         int32 IY0, int32 IY1,
+                         int32 IZ0, int32 IZ1) -> void
+        {
+            const FVector NodeMin(
+                (float)LatticeOrigin.X + (float)(IX0 * Step),
+                (float)LatticeOrigin.Y + (float)(IY0 * Step),
+                (float)LatticeOrigin.Z + (float)(IZ0 * Step));
+            const FVector NodeMax(
+                (float)LatticeOrigin.X + (float)(IX1 * Step),
+                (float)LatticeOrigin.Y + (float)(IY1 * Step),
+                (float)LatticeOrigin.Z + (float)(IZ1 * Step));
+            const FBox NodeBox(NodeMin, NodeMax);
+            float NodeLowerBound = 0.0f;
+            if (VF_PassageModifierLowerBoundOverBox(
+                    Passages, NodeBox, NodeLowerBound)
+                && NodeLowerBound >= PassageCarveThreshold + 1.0e-3f)
+            {
+                return;
+            }
+
+            const int64 NodeSampleCount =
+                (static_cast<int64>(IX1) - IX0 + 1)
+                * (static_cast<int64>(IY1) - IY0 + 1)
+                * (static_cast<int64>(IZ1) - IZ0 + 1);
+            if (NodeSampleCount <= 64)
+            {
+                for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+                for (int32 IY = IY0; IY <= IY1; ++IY)
+                for (int32 IX = IX0; IX <= IX1; ++IX)
+                {
+                    EvaluatePoint(IX, IY, IZ);
+                }
+                return;
+            }
+
+            const int32 SpanX = IX1 - IX0;
+            const int32 SpanY = IY1 - IY0;
+            const int32 SpanZ = IZ1 - IZ0;
+            if (SpanX >= SpanY && SpanX >= SpanZ && SpanX > 0)
+            {
+                const int32 Mid = IX0 + SpanX / 2;
+                Self(Self, IX0, Mid, IY0, IY1, IZ0, IZ1);
+                Self(Self, Mid + 1, IX1, IY0, IY1, IZ0, IZ1);
+            }
+            else if (SpanY >= SpanZ && SpanY > 0)
+            {
+                const int32 Mid = IY0 + SpanY / 2;
+                Self(Self, IX0, IX1, IY0, Mid, IZ0, IZ1);
+                Self(Self, IX0, IX1, Mid + 1, IY1, IZ0, IZ1);
+            }
+            else if (SpanZ > 0)
+            {
+                const int32 Mid = IZ0 + SpanZ / 2;
+                Self(Self, IX0, IX1, IY0, IY1, IZ0, Mid);
+                Self(Self, IX0, IX1, IY0, IY1, Mid + 1, IZ1);
+            }
+            else
+            {
+                EvaluatePoint(IX0, IY0, IZ0);
+            }
+        };
+        Visit(Visit, FirstX, LastX, FirstY, LastY, FirstZ, LastZ);
+        return MaxCarveFactor;
+    }
+
+    int32 EvaluationFirstX = FirstX, EvaluationLastX = LastX;
+    int32 EvaluationFirstY = FirstY, EvaluationLastY = LastY;
+    int32 EvaluationFirstZ = FirstZ, EvaluationLastZ = LastZ;
+    if (bKnownModifierDomains)
+    {
+        float CandidateMinX = FLT_MAX;
+        float CandidateMinY = FLT_MAX;
+        float CandidateMinZ = FLT_MAX;
+        float CandidateMaxX = -FLT_MAX;
+        float CandidateMaxY = -FLT_MAX;
+        float CandidateMaxZ = -FLT_MAX;
+        for (const FVoxelPassageModifierDomain& Domain : ModifierDomains)
+        {
+            CandidateMinX = FMath::Min(CandidateMinX,
+                                       Domain.Min.X - ModifierDomainPadding);
+            CandidateMinY = FMath::Min(CandidateMinY,
+                                       Domain.Min.Y - ModifierDomainPadding);
+            CandidateMinZ = FMath::Min(CandidateMinZ,
+                                       Domain.Min.Z - ModifierDomainPadding);
+            CandidateMaxX = FMath::Max(CandidateMaxX,
+                                       Domain.Max.X + ModifierDomainPadding);
+            CandidateMaxY = FMath::Max(CandidateMaxY,
+                                       Domain.Max.Y + ModifierDomainPadding);
+            CandidateMaxZ = FMath::Max(CandidateMaxZ,
+                                       Domain.Max.Z + ModifierDomainPadding);
+        }
+        if (!FMath::IsFinite(CandidateMinX) || !FMath::IsFinite(CandidateMinY)
+            || !FMath::IsFinite(CandidateMinZ) || !FMath::IsFinite(CandidateMaxX)
+            || !FMath::IsFinite(CandidateMaxY) || !FMath::IsFinite(CandidateMaxZ))
+        {
+            bKnownModifierDomains = false;
+        }
+        else if (!VF_LatticeAxisRange(
+                     FMath::Max((float)VoxelBox.Min.X, CandidateMinX),
+                     FMath::Min((float)VoxelBox.Max.X, CandidateMaxX),
+                     (float)LatticeOrigin.X, Step,
+                     EvaluationFirstX, EvaluationLastX)
+            || !VF_LatticeAxisRange(
+                   FMath::Max((float)VoxelBox.Min.Y, CandidateMinY),
+                   FMath::Min((float)VoxelBox.Max.Y, CandidateMaxY),
+                   (float)LatticeOrigin.Y, Step,
+                   EvaluationFirstY, EvaluationLastY)
+            || !VF_LatticeAxisRange(
+                   FMath::Max((float)VoxelBox.Min.Z, CandidateMinZ),
+                   FMath::Min((float)VoxelBox.Max.Z, CandidateMaxZ),
+                   (float)LatticeOrigin.Z, Step,
+                   EvaluationFirstZ, EvaluationLastZ))
+        {
+            Cache.Begin(
+                this, LifetimeId, Version, LatticeOrigin, Step,
+                FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
+                /*bInNoCandidate*/ true);
+            return 0.0f;
+        }
+    }
+
     const int64 DimX = static_cast<int64>(LastX) - FirstX + 1;
     const int64 DimY = static_cast<int64>(LastY) - FirstY + 1;
     const int64 DimZ = static_cast<int64>(LastZ) - FirstZ + 1;
@@ -2449,21 +3581,33 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
             this, LifetimeId, Version, LatticeOrigin, Step,
             FirstX, LastX, FirstY, LastY, FirstZ, LastZ,
             /*bInNoCandidate*/ false);
-        Cache.Factors.SetNumUninitialized(static_cast<int32>(SampleCount));
+        if (bKnownModifierDomains)
+        {
+            Cache.Factors.SetNumZeroed(static_cast<int32>(SampleCount));
+        }
+        else
+        {
+            Cache.Factors.SetNumUninitialized(static_cast<int32>(SampleCount));
+        }
 
         float MaxCarveFactor = 0.0f;
-        for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+        for (int32 IZ = EvaluationFirstZ; IZ <= EvaluationLastZ; ++IZ)
         {
             const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
-            for (int32 IY = FirstY; IY <= LastY; ++IY)
+            for (int32 IY = EvaluationFirstY; IY <= EvaluationLastY; ++IY)
             {
                 const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
-                for (int32 IX = FirstX; IX <= LastX; ++IX)
+                for (int32 IX = EvaluationFirstX; IX <= EvaluationLastX; ++IX)
                 {
                     const float X = (float)LatticeOrigin.X + (float)(IX * Step);
-                    const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
-                    const float CarveFactor = FMath::IsFinite(ModifierSDF)
-                        ? CarveFactorFromSDF(ModifierSDF) : 1.0f;
+                    const FVector Position(X, Y, Z);
+                    float CarveFactor = 0.0f;
+                    if (MayEvaluatePoint(Position))
+                    {
+                        const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
+                        CarveFactor = FMath::IsFinite(ModifierSDF)
+                            ? CarveFactorFromSDF(ModifierSDF) : 1.0f;
+                    }
                     Cache.Factors[Cache.Index(IX, IY, IZ)] = CarveFactor;
                     MaxCarveFactor = FMath::Max(MaxCarveFactor, CarveFactor);
                     if (MaxCarveFactor >= 1.0f)
@@ -2485,11 +3629,18 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
                                 {
                                     const float RemainingWorldX =
                                         (float)LatticeOrigin.X + (float)(RemainingX * Step);
-                                    const float RemainingSDF = EvaluateModifierSDF(
+                                    const FVector RemainingPosition(
                                         RemainingWorldX, RemainingWorldY, RemainingWorldZ);
-                                    Cache.Factors[Cache.Index(RemainingX, RemainingY, RemainingZ)] =
-                                        FMath::IsFinite(RemainingSDF)
+                                    float RemainingFactor = 0.0f;
+                                    if (MayEvaluatePoint(RemainingPosition))
+                                    {
+                                        const float RemainingSDF = EvaluateModifierSDF(
+                                            RemainingWorldX, RemainingWorldY, RemainingWorldZ);
+                                        RemainingFactor = FMath::IsFinite(RemainingSDF)
                                             ? CarveFactorFromSDF(RemainingSDF) : 1.0f;
+                                    }
+                                    Cache.Factors[Cache.Index(RemainingX, RemainingY, RemainingZ)] =
+                                        RemainingFactor;
                                 }
                             }
                         }
@@ -2505,15 +3656,20 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
     // original exact walk for them; refusing the cache must never change the proof.
     Cache.Reset();
     float MaxCarveFactor = 0.0f;
-    for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+    for (int32 IZ = EvaluationFirstZ; IZ <= EvaluationLastZ; ++IZ)
     {
         const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
-        for (int32 IY = FirstY; IY <= LastY; ++IY)
+        for (int32 IY = EvaluationFirstY; IY <= EvaluationLastY; ++IY)
         {
             const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
-            for (int32 IX = FirstX; IX <= LastX; ++IX)
+            for (int32 IX = EvaluationFirstX; IX <= EvaluationLastX; ++IX)
             {
                 const float X = (float)LatticeOrigin.X + (float)(IX * Step);
+                const FVector Position(X, Y, Z);
+                if (!MayEvaluatePoint(Position))
+                {
+                    continue;
+                }
                 const float ModifierSDF = EvaluateModifierSDF(X, Y, Z);
                 if (!FMath::IsFinite(ModifierSDF))
                 {
@@ -2534,12 +3690,24 @@ float UVoxelStrateManager::MaxPassageCarveFactorNearLattice(
 bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
     const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
 {
+    if (Step <= 0 || !VoxelBox.IsValid)
+    {
+        return true;
+    }
     for (const FVoxelPassage& Passage : Passages)
     {
         const FVoxelPassageLanding* Landings[] = {
             &Passage.UpperLanding, &Passage.LowerLanding };
         for (const FVoxelPassageLanding* Landing : Landings)
         {
+            if (!FMath::IsFinite(Landing->StandingPoint.X)
+                || !FMath::IsFinite(Landing->StandingPoint.Y)
+                || !FMath::IsFinite(Landing->FloorZ)
+                || !FMath::IsFinite(Landing->HalfWidth)
+                || !FMath::IsFinite(Landing->FloorThickness))
+            {
+                return true;
+            }
             if (Landing->HalfWidth <= 0.0f || Landing->FloorThickness <= 0.0f)
             {
                 continue;
@@ -2558,16 +3726,27 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
             }
         }
 
-        if (Passage.bWalkableTunnelContract
-            && Passage.ControlPoints.Num() >= 2
-            && Passage.ControlRadii.Num() == Passage.ControlPoints.Num())
+        if (Passage.bWalkableTunnelContract)
         {
+            if (Passage.ControlPoints.Num() < 2
+                || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+            {
+                return true;
+            }
             constexpr float Pad = 1.0f;
             for (int32 SegmentIndex = 0;
                  SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
             {
                 const FVector& A = Passage.ControlPoints[SegmentIndex];
                 const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                if (!FMath::IsFinite(A.X) || !FMath::IsFinite(A.Y)
+                    || !FMath::IsFinite(A.Z) || !FMath::IsFinite(B.X)
+                    || !FMath::IsFinite(B.Y) || !FMath::IsFinite(B.Z)
+                    || !FMath::IsFinite(Passage.ControlRadii[SegmentIndex])
+                    || !FMath::IsFinite(Passage.ControlRadii[SegmentIndex + 1]))
+                {
+                    return true;
+                }
                 const float SupportRadius = FMath::Max(
                     FMath::Min(
                         FMath::Abs(Passage.ControlRadii[SegmentIndex]),
@@ -2589,6 +3768,208 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
                 {
                     return true;
                 }
+            }
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyLandingFloorAtLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+{
+    // This query is used only after the stack has proved AllAir.  The broad floor guards above
+    // are intentionally padded for sound interval folding, but that padding turns a long tunnel
+    // or landing AABB into a false final-field candidate.  Check the actual writer predicates on
+    // the same MC lattice before asking GetDensityAt for a certificate.  Unknown inputs remain
+    // candidates; this function is never allowed to manufacture an empty proof.
+    if (Step <= 0 || !VoxelBox.IsValid
+        || VoxelPassageGeometry::VerticalShaftConnectorAirMarker())
+    {
+        return true;
+    }
+
+    const bool bBroadPassageFloor = AnyPassageLandingFloorNearLattice(
+        VoxelBox, LatticeOrigin, Step);
+    const bool bBroadOriginFloor = AnyOriginLandingFloorNearLattice(
+        VoxelBox, LatticeOrigin, Step);
+    if (!bBroadPassageFloor && !bBroadOriginFloor)
+    {
+        return false;
+    }
+
+    auto GetRange = [&](float Min, float Max, int32& OutFirst, int32& OutLast) -> bool
+    {
+        return VF_LatticeAxisRange(
+            Min, Max, static_cast<float>(LatticeOrigin.X), Step, OutFirst, OutLast);
+    };
+    auto GetYRange = [&](float Min, float Max, int32& OutFirst, int32& OutLast) -> bool
+    {
+        return VF_LatticeAxisRange(
+            Min, Max, static_cast<float>(LatticeOrigin.Y), Step, OutFirst, OutLast);
+    };
+    auto GetZRange = [&](float Min, float Max, int32& OutFirst, int32& OutLast) -> bool
+    {
+        return VF_LatticeAxisRange(
+            Min, Max, static_cast<float>(LatticeOrigin.Z), Step, OutFirst, OutLast);
+    };
+
+    auto HasAnyLandingSample = [&](const FVoxelPassageLanding& Landing) -> bool
+    {
+        if (!FMath::IsFinite(Landing.StandingPoint.X)
+            || !FMath::IsFinite(Landing.StandingPoint.Y)
+            || !FMath::IsFinite(Landing.FloorZ)
+            || !FMath::IsFinite(Landing.HalfWidth)
+            || !FMath::IsFinite(Landing.FloorThickness)
+            || Landing.HalfWidth <= 0.0f || Landing.FloorThickness <= 0.0f)
+        {
+            // This function gates an AllAir proof. Invalid authored floor data is an unknown
+            // structural writer, not evidence that the writer is absent.
+            return true;
+        }
+        const float HalfWidth = FMath::Max(Landing.HalfWidth - 1.0f, 0.0f);
+        int32 IX0 = 0, IX1 = -1, IY0 = 0, IY1 = -1, IZ0 = 0, IZ1 = -1;
+        return VF_LatticeAxisRange(
+                   FMath::Max((float)VoxelBox.Min.X,
+                              Landing.StandingPoint.X - HalfWidth),
+                   FMath::Min((float)VoxelBox.Max.X,
+                              Landing.StandingPoint.X + HalfWidth),
+                   (float)LatticeOrigin.X, Step, IX0, IX1)
+            && VF_LatticeAxisRange(
+                   FMath::Max((float)VoxelBox.Min.Y,
+                              Landing.StandingPoint.Y - HalfWidth),
+                   FMath::Min((float)VoxelBox.Max.Y,
+                              Landing.StandingPoint.Y + HalfWidth),
+                   (float)LatticeOrigin.Y, Step, IY0, IY1)
+            && VF_LatticeAxisRange(
+                   FMath::Max((float)VoxelBox.Min.Z,
+                              Landing.FloorZ - Landing.FloorThickness),
+                   FMath::Min((float)VoxelBox.Max.Z,
+                              Landing.FloorZ + KINDA_SMALL_NUMBER),
+                   (float)LatticeOrigin.Z, Step, IZ0, IZ1);
+    };
+
+    if (bBroadPassageFloor)
+    {
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (HasAnyLandingSample(Passage.UpperLanding)
+                || HasAnyLandingSample(Passage.LowerLanding))
+            {
+                return true;
+            }
+
+            if (!Passage.bWalkableTunnelContract)
+            {
+                continue;
+            }
+            if (Passage.ControlPoints.Num() < 2
+                || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+            {
+                return true;
+            }
+
+            constexpr float Pad = 1.0f;
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+            {
+                const FVector& A = Passage.ControlPoints[SegmentIndex];
+                const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                if (!FMath::IsFinite(A.X) || !FMath::IsFinite(A.Y)
+                    || !FMath::IsFinite(A.Z) || !FMath::IsFinite(B.X)
+                    || !FMath::IsFinite(B.Y) || !FMath::IsFinite(B.Z)
+                    || !FMath::IsFinite(Passage.ControlRadii[SegmentIndex])
+                    || !FMath::IsFinite(Passage.ControlRadii[SegmentIndex + 1]))
+                {
+                    return true;
+                }
+                const float SupportRadius = FMath::Max(
+                    FMath::Min(
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex]),
+                        FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
+                    VoxelPassageGeometry::PlayerRadiusVoxels);
+                const float FloorA = VoxelPassageGeometry::TunnelFloorZ(
+                    A, Passage.ControlRadii[SegmentIndex]);
+                const float FloorB = VoxelPassageGeometry::TunnelFloorZ(
+                    B, Passage.ControlRadii[SegmentIndex + 1]);
+                const float MinX = FMath::Min(A.X, B.X) - SupportRadius - Pad;
+                const float MaxX = FMath::Max(A.X, B.X) + SupportRadius + Pad;
+                const float MinY = FMath::Min(A.Y, B.Y) - SupportRadius - Pad;
+                const float MaxY = FMath::Max(A.Y, B.Y) + SupportRadius + Pad;
+                const float MinZ = FMath::Min(FloorA, FloorB)
+                    - VoxelPassageGeometry::LandingFloorThicknessVoxels - Pad;
+                const float MaxZ = FMath::Max(FloorA, FloorB) + Pad;
+                if (!FMath::IsFinite(MinX) || !FMath::IsFinite(MaxX)
+                    || !FMath::IsFinite(MinY) || !FMath::IsFinite(MaxY)
+                    || !FMath::IsFinite(MinZ) || !FMath::IsFinite(MaxZ))
+                {
+                    return true;
+                }
+
+                int32 IX0 = 0, IX1 = -1, IY0 = 0, IY1 = -1, IZ0 = 0, IZ1 = -1;
+                if (!GetRange(FMath::Max((float)VoxelBox.Min.X, MinX),
+                              FMath::Min((float)VoxelBox.Max.X, MaxX), IX0, IX1)
+                    || !GetYRange(FMath::Max((float)VoxelBox.Min.Y, MinY),
+                                  FMath::Min((float)VoxelBox.Max.Y, MaxY), IY0, IY1)
+                    || !GetZRange(FMath::Max((float)VoxelBox.Min.Z, MinZ),
+                                  FMath::Min((float)VoxelBox.Max.Z, MaxZ), IZ0, IZ1))
+                {
+                    continue;
+                }
+
+                for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
+                {
+                    const float Z = (float)LatticeOrigin.Z + (float)(IZ * Step);
+                    for (int32 IY = IY0; IY <= IY1; ++IY)
+                    {
+                        const float Y = (float)LatticeOrigin.Y + (float)(IY * Step);
+                        for (int32 IX = IX0; IX <= IX1; ++IX)
+                        {
+                            const FVector Position(
+                                (float)LatticeOrigin.X + (float)(IX * Step), Y, Z);
+                            if (VF_IsWalkableTunnelFloor(Passage, Position))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (bBroadOriginFloor)
+    {
+        for (const FStrateSlot& Slot : StrateLayout)
+        {
+            if (Slot.Definition == nullptr) continue;
+            const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+            const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+            const float Seal = VF_BoundarySealThicknessForDefinition(*Slot.Definition);
+            const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
+                VoxelPassageGeometry::BuildOriginLandingGeometry(
+                    TopZ, BottomZ, Seal, OriginSpineRadius);
+            if (!Geometry.bValid)
+            {
+                continue;
+            }
+            const float HalfWidth = FMath::Max(Geometry.HalfWidth - 1.0f, 0.0f);
+            int32 IX0 = 0, IX1 = -1, IY0 = 0, IY1 = -1, IZ0 = 0, IZ1 = -1;
+            if (VF_LatticeAxisRange(
+                    FMath::Max((float)VoxelBox.Min.X, -HalfWidth - 0.0f),
+                    FMath::Min((float)VoxelBox.Max.X, HalfWidth + 0.0f),
+                    (float)LatticeOrigin.X, Step, IX0, IX1)
+                && VF_LatticeAxisRange(
+                    FMath::Max((float)VoxelBox.Min.Y, -HalfWidth - 0.0f),
+                    FMath::Min((float)VoxelBox.Max.Y, HalfWidth + 0.0f),
+                    (float)LatticeOrigin.Y, Step, IY0, IY1)
+                && VF_LatticeAxisRange(
+                    FMath::Max((float)VoxelBox.Min.Z,
+                               Geometry.FloorZ - Geometry.FloorThickness),
+                    FMath::Min((float)VoxelBox.Max.Z,
+                               Geometry.FloorZ + KINDA_SMALL_NUMBER),
+                    (float)LatticeOrigin.Z, Step, IZ0, IZ1))
+            {
+                return true;
             }
         }
     }
@@ -2651,6 +4032,101 @@ bool UVoxelStrateManager::AnyOriginLandingNearLattice(
                 VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius))
         {
             return true;
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyOriginLandingAirNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float BaseDensity, float SealThickness) const
+{
+    if (Step <= 0 || !VoxelBox.IsValid || OriginSpineRadius <= 0.0f)
+    {
+        return true;
+    }
+    if (!FMath::IsFinite(BaseDensity) || !(BaseDensity > 0.0f)
+        || !FMath::IsFinite(SealThickness) || SealThickness < 0.0f)
+    {
+        return true;
+    }
+    const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
+    if (!FMath::IsFinite(AirTarget))
+    {
+        return true;
+    }
+
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr)
+        {
+            continue;
+        }
+        const float TopZ = (static_cast<float>(Slot.TopChunkZ) + 1.0f) * CHUNK_SIZE;
+        const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
+        const float Seal = VF_BoundarySealThicknessForDefinition(*Slot.Definition);
+        const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
+            VoxelPassageGeometry::BuildOriginLandingGeometry(
+                TopZ, BottomZ, Seal, OriginSpineRadius);
+        if (!Geometry.bValid)
+        {
+            continue;
+        }
+        if (!VoxelPassageGeometry::OriginLandingRoomTouchesLattice(
+                VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius))
+        {
+            continue;
+        }
+
+        int32 FirstX = 0, LastX = -1;
+        int32 FirstY = 0, LastY = -1;
+        int32 FirstZ = 0, LastZ = -1;
+        if (!VF_LatticeAxisRange(
+                VoxelBox.Min.X, VoxelBox.Max.X, (float)LatticeOrigin.X, Step, FirstX, LastX)
+            || !VF_LatticeAxisRange(
+                VoxelBox.Min.Y, VoxelBox.Max.Y, (float)LatticeOrigin.Y, Step, FirstY, LastY)
+            || !VF_LatticeAxisRange(
+                VoxelBox.Min.Z, VoxelBox.Max.Z, (float)LatticeOrigin.Z, Step, FirstZ, LastZ))
+        {
+            return true;
+        }
+        const int64 SampleCount = ((int64)LastX - FirstX + 1)
+            * ((int64)LastY - FirstY + 1)
+            * ((int64)LastZ - FirstZ + 1);
+        if (SampleCount <= 0 || SampleCount > 65536)
+        {
+            return true;
+        }
+
+        for (int32 IZ = FirstZ; IZ <= LastZ; ++IZ)
+        for (int32 IY = FirstY; IY <= LastY; ++IY)
+        for (int32 IX = FirstX; IX <= LastX; ++IX)
+        {
+            const FVector Position(
+                (float)LatticeOrigin.X + (float)(IX * Step),
+                (float)LatticeOrigin.Y + (float)(IY * Step),
+                (float)LatticeOrigin.Z + (float)(IZ * Step));
+            const float RoomSDF = VoxelPassageGeometry::OriginLandingRoomSDF(
+                Position, Geometry);
+            if (!FMath::IsFinite(RoomSDF))
+            {
+                return true;
+            }
+            if (RoomSDF < VoxelPassageGeometry::LandingCarveBlendVoxels)
+            {
+                float CarveFactor = FMath::Clamp(
+                    (VoxelPassageGeometry::LandingCarveBlendVoxels - RoomSDF)
+                        / (VoxelPassageGeometry::LandingCarveBlendVoxels * 2.0f),
+                    0.0f, 1.0f);
+                CarveFactor = SmoothStep01(CarveFactor);
+                const float LandingThreshold = FMath::Lerp(
+                    BaseDensity, AirTarget, CarveFactor);
+                if (!FMath::IsFinite(LandingThreshold)
+                    || LandingThreshold <= 0.0f)
+                {
+                    return true;
+                }
+            }
         }
     }
     return false;

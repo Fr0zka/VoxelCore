@@ -11,6 +11,7 @@
 #include "VoxelTerrainOpDefinition.h"
 #include "VoxelContentManager.h"
 #include "VoxelDensityVolume.h"
+#include "VoxelDensityOpStack.h"
 #include "VoxelStats.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
@@ -984,6 +985,7 @@ void AVoxelWorld::BeginPlay()
     Mesher->bGenerateSkirts = Settings->bGenerateSkirts;
     Mesher->SkirtCells      = Settings->SkirtCells;
     Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
+    Mesher->bUseBlockEarlyOut = true;
 
     // Système de strates — a cooked season takes precedence; otherwise the authored pool path is
     // exactly the legacy one.
@@ -2123,17 +2125,43 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     double MeshSeconds = 0.0;
     double StreamSeconds = 0.0;
     int32 ClassifyVerdict = -1; // Mixed = 0, AllSolid = 1, AllAir = 2
+    FVoxelTileClassificationStats ClassifierStats;
     auto EmitTileProfile = [&]()
     {
         if (bProfileTile)
         {
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
-                     "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f"),
+                     "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
+                     "refine=%u stack=%u core_samples=%u final_samples=%u core_hits=%u final_hits=%u "
+                     "core_leaves=%u final_leaves=%u tail_queries=%u tail_eval=%u "
+                     "stack_work=%.6f core_work=%.6f final_work=%.6f tail_work=%.6f "
+                     "room_work=%.6f room_exact=%.6f cache_work=%.6f "
+                     "rooms=%d tunnels=%d joins=%d pits=%d chimneys=%d "
+                     "whole_mixed=%u whole_solid=%u whole_air=%u final_nodes=%u "
+                     "split_nodes=%u max_depth=%u"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
-                FPlatformTime::Seconds() - TileStartSeconds);
+                FPlatformTime::Seconds() - TileStartSeconds,
+                ClassifierStats.RefineNodes, ClassifierStats.StackBoxCalls,
+                ClassifierStats.ExactCoreSamples, ClassifierStats.ExactFinalSamples,
+                ClassifierStats.ExactCoreCacheHits, ClassifierStats.ExactFinalCacheHits,
+                ClassifierStats.ExactCoreLeaves, ClassifierStats.ExactFinalLeaves,
+                ClassifierStats.RoomTailQueries, ClassifierStats.RoomTailEvaluated,
+                FPlatformTime::ToSeconds64(ClassifierStats.StackBoxCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.ExactCoreCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.ExactFinalCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.RoomTailCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.RoomPropagateCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.RoomExactPrimitiveCycles),
+                FPlatformTime::ToSeconds64(ClassifierStats.RoomCacheWindowCycles),
+                ClassifierStats.RoomNumRooms, ClassifierStats.RoomNumTunnels,
+                ClassifierStats.RoomNumRoomFloorJoins, ClassifierStats.RoomNumPits,
+                ClassifierStats.RoomNumChimneys,
+                ClassifierStats.WholeMixedNodes, ClassifierStats.WholeSolidNodes,
+                ClassifierStats.WholeAirNodes, ClassifierStats.NeedsFinalFieldNodes,
+                ClassifierStats.SplitNodes, ClassifierStats.MaxRefinementDepth);
         }
     };
 
@@ -2175,7 +2203,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
         const double ClassifyStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
-        const EVoxelTileClass Verdict = Generator->ClassifyTile(OriginVoxels, Step, Cells);
+        const EVoxelTileClass Verdict = Generator->ClassifyTile(
+            OriginVoxels, Step, Cells, bProfileTile ? &ClassifierStats : nullptr);
         ClassifySeconds = bProfileTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
         ClassifyVerdict = static_cast<int32>(Verdict);
         if (ShouldAbortWork())

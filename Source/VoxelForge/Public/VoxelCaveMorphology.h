@@ -768,6 +768,14 @@ struct FChunkSDFCache
     // Allocator-backed bytes owned by this cache, including the nested tunnel chains. The returned
     // value excludes sizeof(FChunkSDFCache) itself so callers can add the enclosing entry's inline
     // storage exactly once.
+    // Reset keeps the allocated backing storage and clears the immutable contents.
+    // It is used when a classifier proves that the current search window has no
+    // possible room/tunnel feature.
+    void Reset();
+    // Release all backing storage. Used when a worker has moved from a populated
+    // classifier window to a feature-free one and the retained capacity is no
+    // longer useful; this is intentionally separate from hot-path Reset().
+    void Release();
     SIZE_T GetAllocatedSize() const;
     VoxelDensityProfile::FCacheMemoryBreakdown GetAllocatedSizeBreakdown() const;
 };
@@ -828,6 +836,20 @@ namespace VoxelCaveMorphology
         const FStrateGenerationParams& Params,
         uint32 Seed, int32 StrateIndex,
         const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr
+    );
+
+    // Conservative, geometry-free preflight for BuildChunkCache. It recreates
+    // the deterministic room candidates and edge decisions, but does not build
+    // player-fit points or tunnel control chains. False means that the same
+    // cache window is guaranteed to contain no room, join, decoration, or
+    // connected tunnel. Any malformed or unbounded input returns true.
+    VOXELFORGE_API bool MayHaveFeatureInSearchBox(
+        float SearchMinX, float SearchMinY,
+        float SearchMaxX, float SearchMaxY,
+        const FStrateGenerationParams& Params,
+        uint32 Seed, int32 StrateIndex,
+        bool bUseZ = false,
+        float SearchMinZ = 0.0f, float SearchMaxZ = 0.0f
     );
 
     // PHASE 2: Evaluate the SDF at a single world position using cached data.

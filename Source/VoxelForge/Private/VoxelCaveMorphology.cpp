@@ -33,43 +33,8 @@
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
 #include "VoxelStrateTypes.h"
-#include "HAL/PlatformTime.h"
-
 namespace
 {
-    struct FTask4BuildProbeScope
-    {
-        FChunkSDFCache& Cache;
-        const float MinX;
-        const float MinY;
-        const float MaxX;
-        const float MaxY;
-        const uint64 StartCycles;
-        const bool bEnabled;
-
-        FTask4BuildProbeScope(FChunkSDFCache& InCache, float InMinX, float InMinY,
-                               float InMaxX, float InMaxY)
-            : Cache(InCache), MinX(InMinX), MinY(InMinY), MaxX(InMaxX), MaxY(InMaxY)
-            , StartCycles(FPlatformTime::Cycles64())
-            , bEnabled((InMaxX - InMinX) > 120.0f && (InMaxX - InMinX) < 220.0f
-                       && (InMaxY - InMinY) > 120.0f && (InMaxY - InMinY) < 220.0f
-                       && InMinX > -512.0f && InMaxX < 512.0f
-                       && InMinY > -512.0f && InMaxY < 512.0f)
-        {}
-
-        ~FTask4BuildProbeScope()
-        {
-            if (bEnabled)
-            {
-                UE_LOG(LogTemp, Warning,
-                       TEXT("[Task4BuildProbe] search=(%.0f,%.0f)-(%.0f,%.0f) rooms=%d joins=%d tunnels=%d pits=%d chimneys=%d ms=%.3f"),
-                       MinX, MinY, MaxX, MaxY, Cache.Rooms.Num(), Cache.RoomFloorJoins.Num(),
-                       Cache.Tunnels.Num(), Cache.Pits.Num(), Cache.Chimneys.Num(),
-                       FPlatformTime::ToMilliseconds64(
-                           FPlatformTime::Cycles64() - StartCycles));
-            }
-        }
-    };
 }
 #include "VoxelNoise.h"           // Pure FBM used by the slab landing query
 #include "VoxelPassageGeometry.h"
@@ -107,6 +72,40 @@ namespace
         return DX * DX + DY * DY + DZ * DZ;
     }
 
+}
+
+void FChunkSDFCache::Reset()
+{
+    // Keep the allocations: classifier windows can alternate between empty and
+    // populated regions on adjacent requests.
+    Rooms.Reset();
+    RoomFloorJoins.Reset();
+    Tunnels.Reset();
+    Pits.Reset();
+    Chimneys.Reset();
+    Columns.Reset();
+    SupportColumnMinX = 0;
+    SupportColumnMinY = 0;
+    SupportColumnCellsX = 0;
+    SupportColumnCellsY = 0;
+    SupportColumnEntries.Reset();
+    SupportColumns.Reset();
+}
+
+void FChunkSDFCache::Release()
+{
+    Rooms.Empty();
+    RoomFloorJoins.Empty();
+    Tunnels.Empty();
+    Pits.Empty();
+    Chimneys.Empty();
+    Columns.Empty();
+    SupportColumnEntries.Empty();
+    SupportColumns.Empty();
+    SupportColumnMinX = 0;
+    SupportColumnMinY = 0;
+    SupportColumnCellsX = 0;
+    SupportColumnCellsY = 0;
 }
 
 SIZE_T FChunkSDFCache::GetAllocatedSize() const
@@ -165,6 +164,473 @@ struct FBuildRoom
     bool bHasPlayerFitPoint = false;
     bool bPlayerFitAttempted = false;
 };
+
+struct FVFRoomGraphReach
+{
+    float DirectRoomReach = 0.0f;
+    float FloorReliefEnvelope = 0.0f;
+    float BlendEnvelope = 0.0f;
+    float MaxTunnelLength = 0.0f;
+    float PairAabbReach = 0.0f;
+    float PairZReach = 0.0f;
+    float CollectMargin = 0.0f;
+};
+
+static float VF_RoomShapeReachUpperBound(float RadiusXY, float RadiusZ)
+{
+    const float RXY = FMath::Abs(RadiusXY);
+    const float RZ = FMath::Abs(RadiusZ);
+    const float Ellipsoid = FMath::Max(RXY, RZ);
+    const FVector BoxExtent(
+        RXY * 0.8f + RXY * 0.25f,
+        RXY * 0.8f + RXY * 0.25f,
+        RZ * 0.8f + RXY * 0.25f);
+    const float RoundedBox = BoxExtent.Size();
+    const float Capsule = RXY * 0.7f + FMath::Min(RXY * 0.6f, RZ);
+    return FMath::Max3(Ellipsoid, RoundedBox, Capsule);
+}
+
+static bool VF_ComputeRoomGraphReach(
+    const FStrateGenerationParams& Params,
+    FVFRoomGraphReach& OutReach)
+{
+    const float RelevantParams[] = {
+        Params.RoomDensity,
+        Params.RoomSpacing,
+        Params.MinRoomRadius,
+        Params.MaxRoomRadius,
+        Params.RoomHeightRatio,
+        Params.RoomFloorCutMin,
+        Params.RoomFloorCutMax,
+        Params.FloorReliefStrength,
+        Params.FloorReliefFrequency,
+        Params.OriginRoomRadius,
+        Params.TunnelMinRadius,
+        Params.TunnelMaxRadius,
+        Params.TunnelDensity,
+        Params.MaxTunnelLength,
+        Params.TunnelWarpStrength,
+        Params.TunnelHorizontalBias,
+        Params.TunnelEndpointZOffset,
+        Params.SDFBlendRadius,
+        Params.CaveWarpStrength,
+        Params.CaveWarpFrequency,
+        Params.VerticalScale,
+        Params.BoundarySealThickness,
+        Params.StrateTopWorldZ,
+        Params.StrateBottomWorldZ};
+    for (const float Value : RelevantParams)
+    {
+        if (!FMath::IsFinite(Value))
+        {
+            return false;
+        }
+    }
+
+    if (Params.RoomSpacing <= 0.0f
+        || Params.RoomDensity < 0.0f
+        || Params.MinRoomRadius < 0.0f
+        || Params.MaxRoomRadius < 0.0f
+        || Params.RoomHeightRatio < 0.0f
+        || Params.OriginRoomRadius < 0.0f
+        || Params.TunnelMinRadius < 0.0f
+        || Params.TunnelMaxRadius < 0.0f
+        || Params.SDFBlendRadius < 0.0f
+        || FMath::Abs(Params.FloorReliefStrength) > 1000000.0f
+        || FMath::Abs(Params.CaveWarpStrength) > 1000000.0f
+        || FMath::Abs(Params.RoomFloorCutMin) > 1000000.0f
+        || FMath::Abs(Params.RoomFloorCutMax) > 1000000.0f
+        || FMath::Max(Params.MaxTunnelLength, 0.0f) > 1000000.0f)
+    {
+        return false;
+    }
+
+    // The cache's room centres and the world-space tunnel chain have separate
+    // Z conventions when VerticalScale != 1. A proof that ignores that
+    // conversion could under-estimate the chain length used for its lateral
+    // wander. Let the normal cache path handle those authored variants.
+    if (Params.VerticalScale > 0.0f
+        && FMath::Abs(Params.VerticalScale - 1.0f) > 1.0e-6f)
+    {
+        return false;
+    }
+
+    const float RoomRadiusEnvelope = FMath::Max(
+        FMath::Abs(Params.MinRoomRadius),
+        FMath::Abs(Params.MaxRoomRadius));
+    const float AllRoomRadiusEnvelope = FMath::Max(
+        RoomRadiusEnvelope, FMath::Abs(Params.OriginRoomRadius));
+    const float AllRoomHeightEnvelope = AllRoomRadiusEnvelope
+        * FMath::Abs(Params.RoomHeightRatio);
+    const float FloorReliefEnvelope = FMath::Abs(Params.FloorReliefStrength)
+        * VOXEL_NOISE_SCALE * 1.5f;
+    const float BlendEnvelope = FMath::Max(Params.SDFBlendRadius, 0.0f);
+    const float TunnelRadiusEnvelope = FMath::Max(
+        0.5f,
+        FMath::Max(
+            FMath::Abs(Params.TunnelMinRadius),
+            FMath::Abs(Params.TunnelMaxRadius)) * 1.18f);
+    const float MaxTunnelLength = FMath::Max(
+        Params.MaxTunnelLength, 0.0f);
+    const float MaxInfluence = FMath::Max(
+        RoomRadiusEnvelope + FloorReliefEnvelope,
+        FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope)
+        + BlendEnvelope * 3.0f;
+    const float DirectRoomReach = VF_RoomShapeReachUpperBound(
+        AllRoomRadiusEnvelope, AllRoomHeightEnvelope)
+        + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+
+    // A fitted tunnel mouth may move by one bounded cave-warp displacement in
+    // each XY axis. The chain then wanders by at most 25.5% of its authored
+    // length. Bound the endpoint's possible Z correction too, because that
+    // length controls the lateral wander even though the preflight is XY-only.
+    const float CaveWarpRaw = FMath::Abs(Params.CaveWarpStrength)
+        * VOXEL_NOISE_SCALE;
+    const float CaveWarpEnvelope = CaveWarpRaw * 1.5f;
+    const float EndpointXY = FMath::Sqrt(2.0f)
+        * CaveWarpEnvelope;
+    const float FloorCutEnvelope = FMath::Max(
+        1.0f,
+        FMath::Max(
+            FMath::Abs(Params.RoomFloorCutMin),
+            FMath::Abs(Params.RoomFloorCutMax)));
+    const float ReliefSearch = static_cast<float>(FMath::Clamp(
+        FMath::CeilToInt(FMath::Abs(Params.FloorReliefStrength)
+            * VOXEL_NOISE_SCALE + CaveWarpRaw) + 8,
+        8,
+        128));
+    const float MaxStepHeight = FVoxelPlayerCapsuleConstants::MaxStepHeightMeters
+        / FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+    const float EndpointVertical = AllRoomHeightEnvelope * FloorCutEnvelope
+        + FloorReliefEnvelope + CaveWarpEnvelope + ReliefSearch
+        + MaxStepHeight + TunnelRadiusEnvelope + 2.0f;
+    const float EndpointOffset = FMath::Sqrt(
+        EndpointXY * EndpointXY
+        + EndpointVertical * EndpointVertical);
+    const float TunnelLengthBound = MaxTunnelLength
+        + 2.0f * EndpointOffset;
+    const float WorldFloorPad = FMath::Max(
+        VoxelPassageGeometry::LandingFloorThicknessVoxels,
+        BlendEnvelope);
+    const float TunnelTubeReach = TunnelRadiusEnvelope
+        + WorldFloorPad + BlendEnvelope * 3.0f
+        + CaveWarpEnvelope + 2.0f;
+    const float PairAabbReach = EndpointXY
+        + TunnelLengthBound * 0.255f
+        + FMath::Max(MaxInfluence, TunnelTubeReach);
+    const float PairZReach = EndpointVertical + TunnelTubeReach;
+    const float CollectMargin = 2.0f * MaxTunnelLength + MaxInfluence;
+
+    if (!FMath::IsFinite(DirectRoomReach)
+        || !FMath::IsFinite(PairAabbReach)
+        || !FMath::IsFinite(PairZReach)
+        || !FMath::IsFinite(CollectMargin)
+        || DirectRoomReach < 0.0f
+        || PairAabbReach < 0.0f
+        || PairZReach < 0.0f
+        || CollectMargin < 0.0f)
+    {
+        return false;
+    }
+
+    OutReach.DirectRoomReach = DirectRoomReach;
+    OutReach.FloorReliefEnvelope = FloorReliefEnvelope;
+    OutReach.BlendEnvelope = BlendEnvelope;
+    OutReach.MaxTunnelLength = MaxTunnelLength;
+    OutReach.PairAabbReach = PairAabbReach;
+    OutReach.PairZReach = PairZReach;
+    OutReach.CollectMargin = CollectMargin;
+    return true;
+}
+
+template <typename AllocatorType>
+static bool VF_MayHaveRoomGraphFeature(
+    const TArray<FBuildRoom, AllocatorType>& Rooms,
+    float SearchMinX, float SearchMinY,
+    float SearchMaxX, float SearchMaxY,
+    const FStrateGenerationParams& Params,
+    uint32 StrateSeed,
+    const FVFRoomGraphReach& Reach,
+    bool bUseZ = false,
+    float SearchMinZ = 0.0f,
+    float SearchMaxZ = 0.0f)
+{
+    auto AabbDistanceSquared = [&](
+        float X, float Y, float MinX, float MinY,
+        float MaxX, float MaxY) -> float
+    {
+        const float DX = X < MinX ? MinX - X
+            : (X > MaxX ? X - MaxX : 0.0f);
+        const float DY = Y < MinY ? MinY - Y
+            : (Y > MaxY ? Y - MaxY : 0.0f);
+        return DX * DX + DY * DY;
+    };
+
+    for (const FBuildRoom& Room : Rooms)
+    {
+        if (!FMath::IsFinite(Room.Center.X)
+            || !FMath::IsFinite(Room.Center.Y)
+            || !FMath::IsFinite(Room.Center.Z)
+            || !FMath::IsFinite(Room.RadiusXY)
+            || !FMath::IsFinite(Room.RadiusZ))
+        {
+            return true;
+        }
+        const float RoomReach = VF_RoomShapeReachUpperBound(
+            Room.RadiusXY, Room.RadiusZ)
+            + Reach.FloorReliefEnvelope + Reach.BlendEnvelope * 3.0f;
+        if (!FMath::IsFinite(RoomReach) || RoomReach < 0.0f)
+        {
+            return true;
+        }
+        if (bUseZ
+            && (static_cast<float>(Room.Center.Z) + RoomReach < SearchMinZ
+                || static_cast<float>(Room.Center.Z) - RoomReach > SearchMaxZ))
+        {
+            continue;
+        }
+        const float DistanceSquared = AabbDistanceSquared(
+            static_cast<float>(Room.Center.X),
+            static_cast<float>(Room.Center.Y),
+            SearchMinX - RoomReach,
+            SearchMinY - RoomReach,
+            SearchMaxX + RoomReach,
+            SearchMaxY + RoomReach);
+        if (!FMath::IsFinite(DistanceSquared))
+        {
+            return true;
+        }
+        if (DistanceSquared <= KINDA_SMALL_NUMBER)
+        {
+            return true;
+        }
+    }
+
+    if (Reach.MaxTunnelLength <= 0.0f || Rooms.Num() < 2)
+    {
+        return false;
+    }
+
+    // A pair whose broad centerline envelope can reach the query is enough to
+    // keep the full graph path. This deliberately treats every geometrically
+    // eligible pair as potential; the exact backbone/random decision remains
+    // owned by BuildChunkCache. It keeps this preflight linear in the common
+    // feature-present case and avoids player-fit work in the feature-free case.
+    for (int32 First = 0; First < Rooms.Num(); ++First)
+    {
+        for (int32 Second = First + 1; Second < Rooms.Num(); ++Second)
+        {
+            const FVector& FirstCenter = Rooms[First].Center;
+            const FVector& SecondCenter = Rooms[Second].Center;
+            if (bUseZ
+                && (FMath::Max(
+                        static_cast<float>(FirstCenter.Z),
+                        static_cast<float>(SecondCenter.Z))
+                        + Reach.PairZReach < SearchMinZ
+                    || FMath::Min(
+                        static_cast<float>(FirstCenter.Z),
+                        static_cast<float>(SecondCenter.Z))
+                        - Reach.PairZReach > SearchMaxZ))
+            {
+                continue;
+            }
+            const float EuclideanDistance = static_cast<float>(
+                FVector::Dist(FirstCenter, SecondCenter));
+            if (!FMath::IsFinite(EuclideanDistance))
+            {
+                return true;
+            }
+            if (EuclideanDistance > Reach.MaxTunnelLength)
+            {
+                continue;
+            }
+            const float PairMinX = FMath::Min(
+                static_cast<float>(FirstCenter.X),
+                static_cast<float>(SecondCenter.X))
+                - Reach.PairAabbReach;
+            const float PairMinY = FMath::Min(
+                static_cast<float>(FirstCenter.Y),
+                static_cast<float>(SecondCenter.Y))
+                - Reach.PairAabbReach;
+            const float PairMaxX = FMath::Max(
+                static_cast<float>(FirstCenter.X),
+                static_cast<float>(SecondCenter.X))
+                + Reach.PairAabbReach;
+            const float PairMaxY = FMath::Max(
+                static_cast<float>(FirstCenter.Y),
+                static_cast<float>(SecondCenter.Y))
+                + Reach.PairAabbReach;
+            if (!FMath::IsFinite(PairMinX) || !FMath::IsFinite(PairMinY)
+                || !FMath::IsFinite(PairMaxX) || !FMath::IsFinite(PairMaxY))
+            {
+                return true;
+            }
+            if (PairMaxX >= SearchMinX && PairMaxY >= SearchMinY
+                && PairMinX <= SearchMaxX && PairMinY <= SearchMaxY)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+
+#if 0
+    const float MaxTunnelLengthSquared =
+        Reach.MaxTunnelLength * Reach.MaxTunnelLength;
+    if (!FMath::IsFinite(MaxTunnelLengthSquared))
+    {
+        return true;
+    }
+
+    TArray<int32, TInlineAllocator<128>> NearestNeighbor;
+    NearestNeighbor.SetNumUninitialized(Rooms.Num());
+    const bool bFlowToOrigin = Params.bTunnelsFlowTowardOrigin;
+    auto OriginKeySquared = [&](int32 Index) -> float
+    {
+        const FVector& Center = Rooms[Index].Center;
+        return static_cast<float>(
+            Center.X * Center.X + Center.Y * Center.Y);
+    };
+    auto LinkMetric = [&](int32 First, int32 Second) -> float
+    {
+        const float Distance = static_cast<float>(
+            FVector::Dist(Rooms[First].Center, Rooms[Second].Center));
+        const float VerticalSeparation = FMath::Abs(
+            static_cast<float>(
+                Rooms[First].Center.Z - Rooms[Second].Center.Z));
+        return Distance
+            + VerticalSeparation * Params.TunnelHorizontalBias * 5.0f;
+    };
+    auto PickNeighbor = [&](int32 Index) -> int32
+    {
+        const float MyKeySquared = OriginKeySquared(Index);
+        float BestInward = FLT_MAX;
+        int32 BestInwardIndex = -1;
+        float BestAny = FLT_MAX;
+        int32 BestAnyIndex = -1;
+        for (int32 Other = 0; Other < Rooms.Num(); ++Other)
+        {
+            if (Other == Index)
+            {
+                continue;
+            }
+            const float DistanceSquared = static_cast<float>(
+                FVector::DistSquared(
+                    Rooms[Index].Center, Rooms[Other].Center));
+            if (!FMath::IsFinite(DistanceSquared))
+            {
+                return -2;
+            }
+            if (DistanceSquared > MaxTunnelLengthSquared)
+            {
+                continue;
+            }
+            const float Metric = LinkMetric(Index, Other);
+            if (!FMath::IsFinite(Metric))
+            {
+                return -2;
+            }
+            if (Metric < BestAny)
+            {
+                BestAny = Metric;
+                BestAnyIndex = Other;
+            }
+            if (bFlowToOrigin
+                && OriginKeySquared(Other) < MyKeySquared
+                && Metric < BestInward)
+            {
+                BestInward = Metric;
+                BestInwardIndex = Other;
+            }
+        }
+        return (bFlowToOrigin && BestInwardIndex != -1)
+            ? BestInwardIndex : BestAnyIndex;
+    };
+    for (int32 Index = 0; Index < Rooms.Num(); ++Index)
+    {
+        NearestNeighbor[Index] = PickNeighbor(Index);
+        if (NearestNeighbor[Index] == -2)
+        {
+            return true;
+        }
+    }
+
+    for (int32 First = 0; First < Rooms.Num(); ++First)
+    {
+        for (int32 Second = First + 1; Second < Rooms.Num(); ++Second)
+        {
+            const float EuclideanDistance = static_cast<float>(
+                FVector::Dist(Rooms[First].Center, Rooms[Second].Center));
+            if (!FMath::IsFinite(EuclideanDistance))
+            {
+                return true;
+            }
+            bool bBackbone = NearestNeighbor[First] == Second
+                || NearestNeighbor[Second] == First;
+            float CheckDistance = EuclideanDistance;
+            if (!bBackbone && Params.TunnelHorizontalBias > 0.0f)
+            {
+                const float VerticalSeparation = FMath::Abs(
+                    static_cast<float>(
+                        Rooms[First].Center.Z - Rooms[Second].Center.Z));
+                CheckDistance += VerticalSeparation
+                    * Params.TunnelHorizontalBias * 5.0f;
+            }
+            if (!FMath::IsFinite(CheckDistance)
+                || CheckDistance > Reach.MaxTunnelLength)
+            {
+                continue;
+            }
+            if (!bBackbone)
+            {
+                if (Params.TunnelDensity <= 0.0f)
+                {
+                    continue;
+                }
+                const uint32 PairHash = VoxelHash::Pair(
+                    Rooms[First].CellX, Rooms[First].CellY,
+                    Rooms[Second].CellX, Rooms[Second].CellY,
+                    StrateSeed);
+                if (VoxelHash::ToFloat01(PairHash) >= Params.TunnelDensity)
+                {
+                    continue;
+                }
+            }
+
+            const float PairMinX = FMath::Min(
+                static_cast<float>(Rooms[First].Center.X),
+                static_cast<float>(Rooms[Second].Center.X))
+                - Reach.PairAabbReach;
+            const float PairMinY = FMath::Min(
+                static_cast<float>(Rooms[First].Center.Y),
+                static_cast<float>(Rooms[Second].Center.Y))
+                - Reach.PairAabbReach;
+            const float PairMaxX = FMath::Max(
+                static_cast<float>(Rooms[First].Center.X),
+                static_cast<float>(Rooms[Second].Center.X))
+                + Reach.PairAabbReach;
+            const float PairMaxY = FMath::Max(
+                static_cast<float>(Rooms[First].Center.Y),
+                static_cast<float>(Rooms[Second].Center.Y))
+                + Reach.PairAabbReach;
+            if (!FMath::IsFinite(PairMinX) || !FMath::IsFinite(PairMinY)
+                || !FMath::IsFinite(PairMaxX) || !FMath::IsFinite(PairMaxY))
+            {
+                return true;
+            }
+            if (PairMaxX >= SearchMinX && PairMaxY >= SearchMinY
+                && PairMinX <= SearchMaxX && PairMinY <= SearchMaxY)
+            {
+                // A backbone link is considered potential even if the origin
+                // connection cap later downgrades it. That only sacrifices a
+                // skip; it can never turn a real tunnel into an empty proof.
+                return true;
+            }
+        }
+    }
+    return false;
+#endif
+}
 
 //=============================================================================
 // INTERNAL: Shared hash-placement skeleton for the per-room baked features
@@ -2848,6 +3314,175 @@ bool VF_SuggestLandingPoint(
     }
 }
 
+bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
+    float SearchMinX, float SearchMinY,
+    float SearchMaxX, float SearchMaxY,
+    const FStrateGenerationParams& Params,
+    uint32 Seed, int32 StrateIndex,
+    bool bUseZ, float SearchMinZ, float SearchMaxZ)
+{
+    if (!FMath::IsFinite(SearchMinX) || !FMath::IsFinite(SearchMinY)
+        || !FMath::IsFinite(SearchMaxX) || !FMath::IsFinite(SearchMaxY)
+        || SearchMinX > SearchMaxX || SearchMinY > SearchMaxY)
+    {
+        return true;
+    }
+    if (bUseZ
+        && (!FMath::IsFinite(SearchMinZ) || !FMath::IsFinite(SearchMaxZ)
+            || SearchMinZ > SearchMaxZ))
+    {
+        return true;
+    }
+    if (Params.RoomSpacing <= 0.0f)
+    {
+        // BuildChunkCache returns an empty cache before creating the origin
+        // room when spacing is non-positive.
+        return false;
+    }
+
+    FVFRoomGraphReach Reach;
+    if (!VF_ComputeRoomGraphReach(Params, Reach))
+    {
+        return true;
+    }
+
+    const float CollectMinX = SearchMinX - Reach.CollectMargin;
+    const float CollectMinY = SearchMinY - Reach.CollectMargin;
+    const float CollectMaxX = SearchMaxX + Reach.CollectMargin;
+    const float CollectMaxY = SearchMaxY + Reach.CollectMargin;
+    if (!FMath::IsFinite(CollectMinX) || !FMath::IsFinite(CollectMinY)
+        || !FMath::IsFinite(CollectMaxX) || !FMath::IsFinite(CollectMaxY))
+    {
+        return true;
+    }
+
+    auto FloorCell = [](double Value, double CellSize, int32& OutCell) -> bool
+    {
+        const double Cell = FMath::FloorToDouble(Value / CellSize);
+        if (!FMath::IsFinite(Cell)
+            || Cell < static_cast<double>(MIN_int32) + 2.0
+            || Cell > static_cast<double>(MAX_int32) - 2.0)
+        {
+            return false;
+        }
+        OutCell = static_cast<int32>(Cell);
+        return true;
+    };
+    int32 CellMinX = 0;
+    int32 CellMaxX = 0;
+    int32 CellMinY = 0;
+    int32 CellMaxY = 0;
+    if (!FloorCell(
+            static_cast<double>(CollectMinX),
+            static_cast<double>(Params.RoomSpacing), CellMinX)
+        || !FloorCell(
+            static_cast<double>(CollectMaxX),
+            static_cast<double>(Params.RoomSpacing), CellMaxX)
+        || !FloorCell(
+            static_cast<double>(CollectMinY),
+            static_cast<double>(Params.RoomSpacing), CellMinY)
+        || !FloorCell(
+            static_cast<double>(CollectMaxY),
+            static_cast<double>(Params.RoomSpacing), CellMaxY))
+    {
+        return true;
+    }
+
+    const int64 SpanX = static_cast<int64>(CellMaxX)
+        - static_cast<int64>(CellMinX) + 1;
+    const int64 SpanY = static_cast<int64>(CellMaxY)
+        - static_cast<int64>(CellMinY) + 1;
+    // This is deliberately a bounded proof pass. If an authored asset asks
+    // BuildChunkCache to hash a pathological number of cells, keep the old
+    // conservative path instead of making classification unbounded.
+    if (SpanX <= 0 || SpanY <= 0 || SpanX > 4096 || SpanY > 4096
+        || SpanX > 262144 / FMath::Max<int64>(SpanY, 1))
+    {
+        return true;
+    }
+
+    const float RoomRadiusEnvelope = FMath::Max(
+        FMath::Abs(Params.MinRoomRadius),
+        FMath::Abs(Params.MaxRoomRadius));
+    const float RoomZBuffer = RoomRadiusEnvelope * Params.RoomHeightRatio;
+    const float StrateMinZ = Params.StrateBottomWorldZ
+        + Params.BoundarySealThickness + RoomZBuffer;
+    const float StrateMaxZ = Params.StrateTopWorldZ
+        - Params.BoundarySealThickness - RoomZBuffer;
+    const float StrateRangeZ = StrateMaxZ - StrateMinZ;
+    const float StrateCenterZ = (StrateMinZ + StrateMaxZ) * 0.5f;
+    if (!FMath::IsFinite(StrateMinZ) || !FMath::IsFinite(StrateMaxZ)
+        || !FMath::IsFinite(StrateRangeZ)
+        || !FMath::IsFinite(StrateCenterZ))
+    {
+        return true;
+    }
+
+    TArray<FBuildRoom, TInlineAllocator<128>> Rooms;
+    if (Params.OriginRoomRadius > 0.0f)
+    {
+        FBuildRoom OriginRoom{};
+        OriginRoom.Center = FVector(0.0f, 0.0f, StrateCenterZ);
+        OriginRoom.RadiusXY = Params.OriginRoomRadius;
+        OriginRoom.RadiusZ = Params.OriginRoomRadius
+            * Params.RoomHeightRatio;
+        OriginRoom.CellX = INT32_MAX;
+        OriginRoom.CellY = INT32_MAX;
+        OriginRoom.Hash = VoxelHash::Cell(
+            0, 0, VoxelCaveMorphology::MakeStrateSeed(Seed, StrateIndex)
+                ^ 0x0A161Cu);
+        OriginRoom.bIsOrigin = true;
+        OriginRoom.bStore = true;
+        Rooms.Add(OriginRoom);
+    }
+
+    const uint32 StrateSeed = VoxelCaveMorphology::MakeStrateSeed(
+        Seed, StrateIndex);
+    if (Params.RoomDensity > 0.0f)
+    {
+        for (int32 CY = CellMinY; CY <= CellMaxY; ++CY)
+        {
+            for (int32 CX = CellMinX; CX <= CellMaxX; ++CX)
+            {
+                const uint32 CellHash = VoxelHash::Cell(
+                    CX, CY, StrateSeed);
+                if (VoxelHash::ToFloat01(CellHash) >= Params.RoomDensity)
+                {
+                    continue;
+                }
+
+                const float JitterX = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(CellHash ^ 0x12345678u));
+                const float JitterY = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(CellHash ^ 0x9ABCDEF0u));
+                const float JitterZ = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(CellHash ^ 0x55AA55AAu));
+                FBuildRoom Room{};
+                Room.CellX = CX;
+                Room.CellY = CY;
+                Room.Hash = CellHash;
+                Room.Center.X = (static_cast<float>(CX) + 0.15f
+                    + JitterX * 0.7f) * Params.RoomSpacing;
+                Room.Center.Y = (static_cast<float>(CY) + 0.15f
+                    + JitterY * 0.7f) * Params.RoomSpacing;
+                Room.Center.Z = StrateMinZ + JitterZ
+                    * FMath::Max(StrateRangeZ, 1.0f);
+                const float SizeFactor = VoxelHash::ToFloat01(
+                    VoxelHash::Mix(CellHash ^ 0xFEDCBA98u));
+                Room.RadiusXY = FMath::Lerp(
+                    Params.MinRoomRadius, Params.MaxRoomRadius, SizeFactor);
+                Room.RadiusZ = Room.RadiusXY * Params.RoomHeightRatio;
+                Room.bStore = true;
+                Rooms.Add(Room);
+            }
+        }
+    }
+
+    return VF_MayHaveRoomGraphFeature(
+        Rooms, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
+        Params, StrateSeed, Reach, bUseZ, SearchMinZ, SearchMaxZ);
+}
+
 //=============================================================================
 // PHASE 1: BUILD CHUNK CACHE
 //=============================================================================
@@ -2866,21 +3501,8 @@ void VoxelCaveMorphology::BuildChunkCache(
     uint32 Seed, int32 StrateIndex,
     const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
-    FTask4BuildProbeScope Task4BuildProbe(OutCache, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY);
-
     // Clear previous data (arrays keep their allocation for reuse)
-    OutCache.Rooms.Reset();
-    OutCache.RoomFloorJoins.Reset();
-    OutCache.Tunnels.Reset();
-    OutCache.Pits.Reset();
-    OutCache.Chimneys.Reset();
-    OutCache.Columns.Reset();
-    OutCache.SupportColumnMinX = 0;
-    OutCache.SupportColumnMinY = 0;
-    OutCache.SupportColumnCellsX = 0;
-    OutCache.SupportColumnCellsY = 0;
-    OutCache.SupportColumnEntries.Reset();
-    OutCache.SupportColumns.Reset();
+    OutCache.Reset();
 
     // Combine world seed with strate index so each strate gets unique caves
     const uint32 StrateSeed = VoxelCaveMorphology::MakeStrateSeed(Seed, StrateIndex);
@@ -2970,23 +3592,9 @@ void VoxelCaveMorphology::BuildChunkCache(
     // That's FALSE for the origin room (OriginRoomRadius >> MaxRoomRadius) — chunks inside
     // the big room but > MaxInfluence from (0,0) didn't store it, so its carve clipped at an
     // arbitrary chunk-aligned radius — and slightly false even for hash rooms (1.5x stretch).
-    const auto RoomShapeReachUpperBound = [](float RadiusXY, float RadiusZ) -> float
-    {
-        const float RXY = FMath::Abs(RadiusXY);
-        const float RZ = FMath::Abs(RadiusZ);
-        const float Ellipsoid = FMath::Max(RXY, RZ);
-        const FVector BoxExtent(
-            RXY * 0.8f + RXY * 0.25f,
-            RXY * 0.8f + RXY * 0.25f,
-            RZ * 0.8f + RXY * 0.25f);
-        const float RoundedBox = BoxExtent.Size();
-        const float Capsule = RXY * 0.7f + FMath::Min(RXY * 0.6f, RZ);
-        return FMath::Max3(Ellipsoid, RoundedBox, Capsule);
-    };
-
     auto RoomReachesSearchBox = [&](const FVector& C, float RadiusXY, float RadiusZ) -> bool
     {
-        const float ShapeReach = RoomShapeReachUpperBound(RadiusXY, RadiusZ);
+        const float ShapeReach = VF_RoomShapeReachUpperBound(RadiusXY, RadiusZ);
         const float Reach = ShapeReach + FloorReliefEnvelope + BlendEnvelope * 3.0f;
         const float dx = FMath::Max3((float)(SearchMinX - C.X), 0.0f, (float)(C.X - SearchMaxX));
         const float dy = FMath::Max3((float)(SearchMinY - C.Y), 0.0f, (float)(C.Y - SearchMaxY));
@@ -3000,6 +3608,60 @@ void VoxelCaveMorphology::BuildChunkCache(
         const float dx = FMath::Max3((float)(SearchMinX - C.X), 0.0f, (float)(C.X - SearchMaxX));
         const float dy = FMath::Max3((float)(SearchMinY - C.Y), 0.0f, (float)(C.Y - SearchMaxY));
         return (dx * dx + dy * dy) <= RSq;
+    };
+
+    // A connected edge can be discarded before the expensive player-fit bake when even a
+    // conservative AABB around its entire possible chain misses the search window. The endpoint
+    // fit stays inside 75% of its room radius; each cave-warped endpoint/control point can move by
+    // at most two proven warp envelopes (fit inversion plus the final map); the interior wander is
+    // bounded by TunnelWarpStrength. This is only a reject gate: non-finite inputs retain the old
+    // full build, and a touching envelope still takes the exact path below.
+    const float CaveWarpBound = FMath::Abs(Params.CaveWarpStrength)
+        * VOXEL_NOISE_SCALE * 1.5f;
+    auto PossibleTunnelTouchesSearchXY = [&](const FBuildRoom& RoomA,
+                                             const FBuildRoom& RoomB) -> bool
+    {
+        const float RadiusA = FMath::Abs(RoomA.RadiusXY);
+        const float RadiusB = FMath::Abs(RoomB.RadiusXY);
+        const float RoomEndpointShift = FMath::Max(
+            2.0f, 0.75f * FMath::Max(RadiusA, RadiusB)) + CaveWarpBound;
+        const float TunnelRadius = FMath::Max(
+            0.5f,
+            FMath::Max(FMath::Abs(Params.TunnelMinRadius),
+                       FMath::Abs(Params.TunnelMaxRadius)) * 1.18f);
+        const float ChainReach = RoomEndpointShift
+            + FMath::Abs(Params.TunnelWarpStrength)
+            + TunnelRadius
+            + FMath::Max(
+                FMath::Max(Params.SDFBlendRadius, 0.0f) * 3.0f,
+                VoxelPassageGeometry::LandingFloorThicknessVoxels);
+        if (!FMath::IsFinite(CaveWarpBound)
+            || !FMath::IsFinite(ChainReach)
+            || ChainReach < 0.0f
+            || !FMath::IsFinite((float)RoomA.Center.X)
+            || !FMath::IsFinite((float)RoomA.Center.Y)
+            || !FMath::IsFinite((float)RoomB.Center.X)
+            || !FMath::IsFinite((float)RoomB.Center.Y))
+        {
+            return true;
+        }
+
+        const float MinX = FMath::Min(
+            static_cast<float>(RoomA.Center.X), static_cast<float>(RoomB.Center.X))
+            - ChainReach;
+        const float MinY = FMath::Min(
+            static_cast<float>(RoomA.Center.Y), static_cast<float>(RoomB.Center.Y))
+            - ChainReach;
+        const float MaxX = FMath::Max(
+            static_cast<float>(RoomA.Center.X), static_cast<float>(RoomB.Center.X))
+            + ChainReach;
+        const float MaxY = FMath::Max(
+            static_cast<float>(RoomA.Center.Y), static_cast<float>(RoomB.Center.Y))
+            + ChainReach;
+        return FMath::IsFinite(MinX) && FMath::IsFinite(MinY)
+            && FMath::IsFinite(MaxX) && FMath::IsFinite(MaxY)
+            && MaxX >= SearchMinX && MaxY >= SearchMinY
+            && MinX <= SearchMaxX && MinY <= SearchMaxY;
     };
 
     // Temporary array with cell coordinates for tunnel connection decisions
@@ -3069,6 +3731,21 @@ void VoxelCaveMorphology::BuildChunkCache(
 
             BuildRooms.Add(Room);
         }
+    }
+
+    // The collect window is intentionally much wider than the stored window:
+    // it is needed to make the nearest-neighbor graph seam-invariant. Prove
+    // the genuinely feature-free case before the O(N^2) graph and player-fit
+    // bake. The helper repeats only the deterministic graph decisions that can
+    // affect whether a room/tunnel bound reaches this search window.
+    FVFRoomGraphReach FeatureReach;
+    if (VF_ComputeRoomGraphReach(Params, FeatureReach)
+        && !VF_MayHaveRoomGraphFeature(
+            BuildRooms, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
+            Params, StrateSeed, FeatureReach))
+    {
+        VF_FinalizeCacheBroadPhaseBounds(OutCache, BlendK);
+        return;
     }
 
     const int32 NumRooms = BuildRooms.Num();
@@ -3298,6 +3975,14 @@ void VoxelCaveMorphology::BuildChunkCache(
             RoomConnected[I] = true;
             RoomConnected[J] = true;
 
+            if (!PossibleTunnelTouchesSearchXY(RoomA, RoomB))
+            {
+                // The graph decision is retained above; only the search-window geometry is
+                // omitted. This preserves connectivity, joins, and all neighbouring-window
+                // decisions while avoiding player-fit work for edges that cannot be stored.
+                continue;
+            }
+
             // --- TUNNEL HASH (for deriving all tunnel properties) ---
             const uint32 TunnelHash = VoxelHash::Pair(
                 RoomA.CellX, RoomA.CellY,
@@ -3343,8 +4028,9 @@ void VoxelCaveMorphology::BuildChunkCache(
             FVector WorldEndB = VF_UnwarpCavePoint(EndB, Params, Seed);
             if (!RoomA.bIsOrigin)
             {
-                if (ResolvePlayerFitPoint(
-                        BuildRooms[I], Params, Seed))
+                const bool bHasPlayerFit = ResolvePlayerFitPoint(
+                    BuildRooms[I], Params, Seed);
+                if (bHasPlayerFit)
                 {
                     WorldEndA = FVector(
                         RoomA.PlayerFitPoint.X,
@@ -3355,8 +4041,9 @@ void VoxelCaveMorphology::BuildChunkCache(
             }
             if (!RoomB.bIsOrigin)
             {
-                if (ResolvePlayerFitPoint(
-                        BuildRooms[J], Params, Seed))
+                const bool bHasPlayerFit = ResolvePlayerFitPoint(
+                    BuildRooms[J], Params, Seed);
+                if (bHasPlayerFit)
                 {
                     WorldEndB = FVector(
                         RoomB.PlayerFitPoint.X,

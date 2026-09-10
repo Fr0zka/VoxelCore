@@ -130,6 +130,23 @@ public:
 
     int32 Num() const { return Ops.Num(); }
 
+    /** True when this stack publishes the requested immutable geometry resource. */
+    bool ProvidesResource(EVoxelOpResourceMask Resource) const
+    {
+        if (Resource == VoxelOpResources::None)
+        {
+            return false;
+        }
+        for (const FOpEntry& Entry : Ops)
+        {
+            if ((Entry.ProvidedResources & Resource) == Resource)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Allocator-backed bytes owned by the stack, including each concrete operator allocation.
     // The enclosing cache entry adds sizeof(FVoxelOpStack) separately.
     SIZE_T GetAllocatedSize() const;
@@ -186,25 +203,10 @@ public:
     EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const
     {
         FVoxelBoxHypotheses H;
-        const bool bTask4OpProbe = Ctx.bUseLatticeProof
-            && Ctx.LatticeOriginVoxels == FIntVector(32, 0, -32)
-            && Ctx.Step == 1;
         for (const FOpEntry& Entry : Ops)
         {
-            const uint64 Task4OpStartCycles = bTask4OpProbe
-                ? FPlatformTime::Cycles64() : 0;
             VF_FoldOp(H, *Entry.Op, VoxelBox, Ctx,
                       (Entry.Writes & VoxelOpChannels::Sdf) != 0);
-            if (bTask4OpProbe)
-            {
-                UE_LOG(LogTemp, Warning,
-                       TEXT("[Task4OpProbe] box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) op=%s ms=%.3f"),
-                       (float)VoxelBox.Min.X, (float)VoxelBox.Min.Y, (float)VoxelBox.Min.Z,
-                       (float)VoxelBox.Max.X, (float)VoxelBox.Max.Y, (float)VoxelBox.Max.Z,
-                       Entry.Op->DebugName(),
-                       FPlatformTime::ToMilliseconds64(
-                           FPlatformTime::Cycles64() - Task4OpStartCycles));
-            }
             // Do not early-out on a dead hypothesis: a later forcing structural post may
             // deliberately overwrite it (the XY edge seal is appended after passage tube/landing
             // carving and support).
@@ -502,12 +504,32 @@ namespace VoxelDensityOps
          *  resserrement autour du mauvais terme. */
         int32 HitRoomsNoWarp = 0, HitTunnelsNoWarp = 0;
         float WarpDilation = 0.0f;
+
+        /** Conservative candidate for the world-space tunnel-core post that runs after EvalMC.
+         *  This is derived from the final post's own world-chain bounds, not from the warped SDF
+         *  source's broader threshold hit count. */
+        bool bMayHaveTunnelCoreAir = false;
+        bool bMayHaveTunnelSupportFloor = false;
+        bool bMayHaveTunnelCoreTail = false;
+        uint32 ExactTailQueries = 0;
+        uint32 ExactTailEvaluated = 0;
+        uint64 ExactTailCycles = 0;
+        uint64 PropagateCycles = 0;
+        uint64 ExactPrimitiveCycles = 0;
+        uint64 CacheWindowCycles = 0;
+        int32 NumRoomFloorJoins = 0;
     };
 
     VOXELFORGE_API FRoomBoxDiagnostic GetLastRoomBoxDiagnostic();
 
     /** Current worker-local room-graph cache footprint; profiling/diagnostic use only. */
     VOXELFORGE_API void ReportWorkerRoomGraphCacheFootprint();
+
+    /** Current process-wide immutable room-graph proof-cache footprint; diagnostic use only. */
+    VOXELFORGE_API void ReportSharedRoomGraphCacheFootprint();
+
+    /** Drop completed proof caches from older manager lifetimes, or all of them when zero. */
+    VOXELFORGE_API void TrimSharedRoomGraphCache(uint64 KeepManagerLifetimeId = 0);
 
     /**
      * FloatingIslands — 8 ops, et **la pile tourne à l'ENVERS** :

@@ -19,6 +19,7 @@
 #include "VoxelStats.h"
 #include "VoxelDensityProfile.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "HAL/PlatformTime.h"
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -3506,47 +3507,206 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
                                               const FBox& VoxelBox,
                                               const FVoxelOpContext& Context,
                                               const UVoxelGenerator* Generator,
-                                              const UVoxelStrateManager* StructuralManager)
+                                              const UVoxelStrateManager* StructuralManager,
+                                              float StructuralBaseDensity = 8.0f,
+                                              FVoxelTileClassificationStats* Stats = nullptr)
 {
     // The ordinary proof stays shallow.  The finite-domain warp retry is paid only by a
     // tile that already failed the cheap proof, and can afford one more split level because
     // its purpose is to discharge the LOD0 false-Mixed cases without sampling the field.
     const int32 MaxRefinementDepth = Context.bTightenWarpProof ? 5 : 2;
-    const bool bTask4TimingProbe = Context.bUseLatticeProof
-        && Context.LatticeOriginVoxels == FIntVector(32, 0, -32)
-        && Context.Step == 1;
-    int32 RefineNodeCount = 0;
-    int32 ExactLeafCount = 0;
-    int32 ExactSampleCount = 0;
-    uint64 StackClassifyCycles = 0;
-    uint64 ExactSampleCycles = 0;
-    const bool bTask4ExactProbe = Context.bUseLatticeProof
-        && (Context.LatticeOriginVoxels == FIntVector(-64, -64, -64)
-            || Context.LatticeOriginVoxels == FIntVector(-64, -96, -64))
-        && Context.Step == 1;
-    auto ClassifyExactLatticeLeaf = [&](const FBox& Box, bool bUseFinalField) -> EVoxelTileClass
+
+    // Exact certificates are still the mesher's lattice, never a reduced-resolution shortcut.
+    // Keep the samples local to this one classifier call. The old recursive fallback evaluated
+    // the same shared lattice vertices once per depth-3 leaf (up to 64,000 calls for one LOD0
+    // tile); besides being wasteful, that made an empty tile look like a brute-force generation.
+    // A byte validity plane is intentional: it is transient, bounded by one tile, and must not
+    // become another process-wide cache.
+    int32 ExactCacheX0 = 0, ExactCacheY0 = 0, ExactCacheZ0 = 0;
+    int32 ExactCacheNX = 0, ExactCacheNY = 0, ExactCacheNZ = 0;
+    TArray<float> ExactCoreValues;
+    TArray<float> ExactFinalValues;
+    TArray<uint8> ExactCoreValid;
+    TArray<uint8> ExactFinalValid;
+    // A negative structural result is monotone over nested boxes. Compute it once for the root
+    // lattice and carry that absence through the refinement tree; otherwise every AllSolid child
+    // repeats the same 33³ post-air scan even though a false root result already excludes all of
+    // its descendants. A positive result is not cached as absent and keeps the old conservative
+    // per-child checks.
+    bool bRootPassageAirKnownAbsent = false;
+    bool bRootOriginAirKnownAbsent = false;
+    const bool bUseExactCache = Context.bUseLatticeProof && Context.Step > 0
+        && [&]()
+        {
+            const float Step = static_cast<float>(Context.Step);
+            const FVector Origin(static_cast<float>(Context.LatticeOriginVoxels.X),
+                                 static_cast<float>(Context.LatticeOriginVoxels.Y),
+                                 static_cast<float>(Context.LatticeOriginVoxels.Z));
+            ExactCacheX0 = FMath::CeilToInt((static_cast<float>(VoxelBox.Min.X) - Origin.X)
+                                            / Step - 1.0e-4f);
+            ExactCacheY0 = FMath::CeilToInt((static_cast<float>(VoxelBox.Min.Y) - Origin.Y)
+                                            / Step - 1.0e-4f);
+            ExactCacheZ0 = FMath::CeilToInt((static_cast<float>(VoxelBox.Min.Z) - Origin.Z)
+                                            / Step - 1.0e-4f);
+            const int32 X1 = FMath::FloorToInt((static_cast<float>(VoxelBox.Max.X) - Origin.X)
+                                               / Step + 1.0e-4f);
+            const int32 Y1 = FMath::FloorToInt((static_cast<float>(VoxelBox.Max.Y) - Origin.Y)
+                                               / Step + 1.0e-4f);
+            const int32 Z1 = FMath::FloorToInt((static_cast<float>(VoxelBox.Max.Z) - Origin.Z)
+                                               / Step + 1.0e-4f);
+            ExactCacheNX = X1 - ExactCacheX0 + 1;
+            ExactCacheNY = Y1 - ExactCacheY0 + 1;
+            ExactCacheNZ = Z1 - ExactCacheZ0 + 1;
+            const int64 Count = static_cast<int64>(ExactCacheNX)
+                              * static_cast<int64>(ExactCacheNY)
+                              * static_cast<int64>(ExactCacheNZ);
+            if (ExactCacheNX <= 0 || ExactCacheNY <= 0 || ExactCacheNZ <= 0
+                || Count <= 0 || Count > 100000)
+            {
+                ExactCacheNX = ExactCacheNY = ExactCacheNZ = 0;
+                return false;
+            }
+
+            const int32 NumVertices = static_cast<int32>(Count);
+            ExactCoreValues.SetNumUninitialized(NumVertices);
+            ExactFinalValues.SetNumUninitialized(NumVertices);
+            ExactCoreValid.Init(0, NumVertices);
+            ExactFinalValid.Init(0, NumVertices);
+            return true;
+        }();
+
+    auto GetLatticeBounds = [&](const FBox& Box,
+                                int32& OutX0, int32& OutY0, int32& OutZ0,
+                                int32& OutX1, int32& OutY1, int32& OutZ1,
+                                int64& OutCount) -> bool
     {
         if (!Context.bUseLatticeProof || Context.Step <= 0)
         {
-            return EVoxelTileClass::Mixed;
+            return false;
         }
-
         const float Step = static_cast<float>(Context.Step);
         const FVector Origin(static_cast<float>(Context.LatticeOriginVoxels.X),
                              static_cast<float>(Context.LatticeOriginVoxels.Y),
                              static_cast<float>(Context.LatticeOriginVoxels.Z));
-        const int32 IX0 = FMath::CeilToInt((static_cast<float>(Box.Min.X) - Origin.X) / Step - 1.0e-4f);
-        const int32 IY0 = FMath::CeilToInt((static_cast<float>(Box.Min.Y) - Origin.Y) / Step - 1.0e-4f);
-        const int32 IZ0 = FMath::CeilToInt((static_cast<float>(Box.Min.Z) - Origin.Z) / Step - 1.0e-4f);
-        const int32 IX1 = FMath::FloorToInt((static_cast<float>(Box.Max.X) - Origin.X) / Step + 1.0e-4f);
-        const int32 IY1 = FMath::FloorToInt((static_cast<float>(Box.Max.Y) - Origin.Y) / Step + 1.0e-4f);
-        const int32 IZ1 = FMath::FloorToInt((static_cast<float>(Box.Max.Z) - Origin.Z) / Step + 1.0e-4f);
-        const int64 Count = ((int64)IX1 - IX0 + 1)
-                          * ((int64)IY1 - IY0 + 1)
-                          * ((int64)IZ1 - IZ0 + 1);
-        if (IX1 < IX0 || IY1 < IY0 || IZ1 < IZ0 || Count <= 0 || Count > 256)
+        OutX0 = FMath::CeilToInt((static_cast<float>(Box.Min.X) - Origin.X)
+                                 / Step - 1.0e-4f);
+        OutY0 = FMath::CeilToInt((static_cast<float>(Box.Min.Y) - Origin.Y)
+                                 / Step - 1.0e-4f);
+        OutZ0 = FMath::CeilToInt((static_cast<float>(Box.Min.Z) - Origin.Z)
+                                 / Step - 1.0e-4f);
+        OutX1 = FMath::FloorToInt((static_cast<float>(Box.Max.X) - Origin.X)
+                                  / Step + 1.0e-4f);
+        OutY1 = FMath::FloorToInt((static_cast<float>(Box.Max.Y) - Origin.Y)
+                                  / Step + 1.0e-4f);
+        OutZ1 = FMath::FloorToInt((static_cast<float>(Box.Max.Z) - Origin.Z)
+                                  / Step + 1.0e-4f);
+        OutCount = static_cast<int64>(OutX1 - OutX0 + 1)
+                 * static_cast<int64>(OutY1 - OutY0 + 1)
+                 * static_cast<int64>(OutZ1 - OutZ0 + 1);
+        return OutX1 >= OutX0 && OutY1 >= OutY0 && OutZ1 >= OutZ0 && OutCount > 0;
+    };
+
+    auto EvaluateExactLatticeValue = [&](int32 IX, int32 IY, int32 IZ,
+                                         bool bUseFinalField) -> float
+    {
+        const float Step = static_cast<float>(Context.Step);
+        const FVector Origin(static_cast<float>(Context.LatticeOriginVoxels.X),
+                             static_cast<float>(Context.LatticeOriginVoxels.Y),
+                             static_cast<float>(Context.LatticeOriginVoxels.Z));
+        TArray<float>& Values = bUseFinalField ? ExactFinalValues : ExactCoreValues;
+        TArray<uint8>& Valid = bUseFinalField ? ExactFinalValid : ExactCoreValid;
+        int32 CacheIndex = INDEX_NONE;
+        if (bUseExactCache
+            && IX >= ExactCacheX0 && IX < ExactCacheX0 + ExactCacheNX
+            && IY >= ExactCacheY0 && IY < ExactCacheY0 + ExactCacheNY
+            && IZ >= ExactCacheZ0 && IZ < ExactCacheZ0 + ExactCacheNZ)
+        {
+            CacheIndex = (IZ - ExactCacheZ0) * ExactCacheNY * ExactCacheNX
+                       + (IY - ExactCacheY0) * ExactCacheNX
+                       + (IX - ExactCacheX0);
+            if (Valid[CacheIndex] != 0)
+            {
+                if (Stats)
+                {
+                    if (bUseFinalField) { ++Stats->ExactFinalCacheHits; }
+                    else                { ++Stats->ExactCoreCacheHits; }
+                }
+                return Values[CacheIndex];
+            }
+        }
+
+        const float WorldX = Origin.X + static_cast<float>(IX) * Step;
+        const float WorldY = Origin.Y + static_cast<float>(IY) * Step;
+        const float WorldZ = Origin.Z + static_cast<float>(IZ) * Step;
+        // The operator stack is the cheap proof field. A passage/landing post is applied after
+        // that stack by GetDensityAt; for a child intersecting one of those modifiers, certify
+        // the final MC-facing field rather than trusting the conservative core proof.
+        const float Density = bUseFinalField
+            ? -Generator->GetDensityAt(WorldX, WorldY, WorldZ)
+            : Stack.EvalInternal(WorldX, WorldY, WorldZ);
+        if (Stats)
+        {
+            if (bUseFinalField) { ++Stats->ExactFinalSamples; }
+            else                { ++Stats->ExactCoreSamples; }
+        }
+        if (CacheIndex != INDEX_NONE)
+        {
+            Values[CacheIndex] = Density;
+            Valid[CacheIndex] = 1;
+        }
+        return Density;
+    };
+
+    auto CornersHaveOneSign = [&](const FBox& Box, bool bUseFinalField) -> bool
+    {
+        int32 IX0 = 0, IY0 = 0, IZ0 = 0, IX1 = 0, IY1 = 0, IZ1 = 0;
+        int64 Count = 0;
+        if (!GetLatticeBounds(Box, IX0, IY0, IZ0, IX1, IY1, IZ1, Count))
+        {
+            return false;
+        }
+        bool bHaveSign = false;
+        bool bPositive = false;
+        const int32 Xs[2] = { IX0, IX1 };
+        const int32 Ys[2] = { IY0, IY1 };
+        const int32 Zs[2] = { IZ0, IZ1 };
+        for (const int32 IZ : Zs)
+        for (const int32 IY : Ys)
+        for (const int32 IX : Xs)
+        {
+            const float Density = EvaluateExactLatticeValue(IX, IY, IZ, bUseFinalField);
+            if (!FMath::IsFinite(Density) || Density == 0.0f)
+            {
+                return false;
+            }
+            const bool bThisPositive = Density > 0.0f;
+            if (!bHaveSign)
+            {
+                bHaveSign = true;
+                bPositive = bThisPositive;
+            }
+            else if (bPositive != bThisPositive)
+            {
+                return false;
+            }
+        }
+        return bHaveSign;
+    };
+
+    auto ClassifyExactLatticeLeaf = [&](const FBox& Box, bool bUseFinalField) -> EVoxelTileClass
+    {
+        const uint64 ExactStartCycles = Stats ? FPlatformTime::Cycles64() : 0;
+        int32 IX0 = 0, IY0 = 0, IZ0 = 0, IX1 = 0, IY1 = 0, IZ1 = 0;
+        int64 Count = 0;
+        if (!GetLatticeBounds(Box, IX0, IY0, IZ0, IX1, IY1, IZ1, Count)
+            || Count > 8192)
         {
             return EVoxelTileClass::Mixed;
+        }
+        if (Stats)
+        {
+            if (bUseFinalField) { ++Stats->ExactFinalLeaves; }
+            else                { ++Stats->ExactCoreLeaves; }
         }
 
         bool bAllSolid = true;
@@ -3554,28 +3714,11 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         int32 PositiveCount = 0;
         int32 NegativeCount = 0;
         int32 ZeroOrInvalidCount = 0;
-        float MinDensity = FLT_MAX;
-        float MaxDensity = -FLT_MAX;
         for (int32 IZ = IZ0; IZ <= IZ1; ++IZ)
         for (int32 IY = IY0; IY <= IY1; ++IY)
         for (int32 IX = IX0; IX <= IX1; ++IX)
         {
-            const float WorldX = Origin.X + static_cast<float>(IX) * Step;
-            const float WorldY = Origin.Y + static_cast<float>(IY) * Step;
-            const float WorldZ = Origin.Z + static_cast<float>(IZ) * Step;
-            // The operator stack is the cheap proof field.  A passage/landing post is applied
-            // after that stack by GetDensityAt; for a small child that intersects one of those
-            // exact lattice modifiers, certify the final MC-facing field instead of trusting a
-            // core-stack verdict that is deliberately conservative at the post boundary.
-            const uint64 SampleStartCycles = bTask4TimingProbe ? FPlatformTime::Cycles64() : 0;
-            const float Density = bUseFinalField
-                ? -Generator->GetDensityAt(WorldX, WorldY, WorldZ)
-                : Stack.EvalInternal(WorldX, WorldY, WorldZ);
-            if (bTask4TimingProbe)
-            {
-                ExactSampleCycles += FPlatformTime::Cycles64() - SampleStartCycles;
-                ++ExactSampleCount;
-            }
+            const float Density = EvaluateExactLatticeValue(IX, IY, IZ, bUseFinalField);
             if (!FMath::IsFinite(Density) || Density == 0.0f)
             {
                 ++ZeroOrInvalidCount;
@@ -3583,8 +3726,6 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
                 IY = IY1;
                 break;
             }
-            MinDensity = FMath::Min(MinDensity, Density);
-            MaxDensity = FMath::Max(MaxDensity, Density);
             if (Density > 0.0f) { ++PositiveCount; bAllAir = false; }
             else                 { ++NegativeCount; bAllSolid = false; }
             if (!bAllSolid && !bAllAir)
@@ -3597,56 +3738,156 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         const EVoxelTileClass Verdict = ZeroOrInvalidCount > 0 || (PositiveCount > 0 && NegativeCount > 0)
             ? EVoxelTileClass::Mixed
             : (bAllSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir);
-        if (bTask4ExactProbe)
+        if (Stats)
         {
-            UE_LOG(LogTemp, Warning,
-                   TEXT("[Task4ExactProbe] depth_box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) count=%lld pos=%d neg=%d zero=%d min=%.6g max=%.6g verdict=%d"),
-                   (float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z,
-                   (float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z,
-                   (long long)Count, PositiveCount, NegativeCount, ZeroOrInvalidCount,
-                   MinDensity, MaxDensity, static_cast<int32>(Verdict));
+            const uint64 Elapsed = FPlatformTime::Cycles64() - ExactStartCycles;
+            if (bUseFinalField) { Stats->ExactFinalCycles += Elapsed; }
+            else                { Stats->ExactCoreCycles += Elapsed; }
         }
         return Verdict;
     };
     auto Refine = [&](auto&& Self, const FBox& Box, int32 Depth) -> EVoxelTileClass
     {
-        ++RefineNodeCount;
-        const uint64 StackStartCycles = bTask4TimingProbe ? FPlatformTime::Cycles64() : 0;
+        if (Stats) { ++Stats->RefineNodes; }
+        const uint64 StackStartCycles = Stats ? FPlatformTime::Cycles64() : 0;
         const EVoxelTileClass Whole = Stack.ClassifyBox(Box, Context);
-        if (bTask4TimingProbe)
+        if (Stats)
         {
-            StackClassifyCycles += FPlatformTime::Cycles64() - StackStartCycles;
+            ++Stats->StackBoxCalls;
+            Stats->StackBoxCycles += FPlatformTime::Cycles64() - StackStartCycles;
+            switch (Whole)
+            {
+            case EVoxelTileClass::Mixed:    ++Stats->WholeMixedNodes; break;
+            case EVoxelTileClass::AllSolid: ++Stats->WholeSolidNodes; break;
+            case EVoxelTileClass::AllAir:   ++Stats->WholeAirNodes; break;
+            default: break;
+            }
+            Stats->MaxRefinementDepth = FMath::Max(
+                Stats->MaxRefinementDepth, static_cast<uint32>(Depth));
         }
-        const bool bHasStructuralCandidate = StructuralManager != nullptr
-            && (StructuralManager->AnyPassageNearLattice(
-                    Box, Context.LatticeOriginVoxels, Context.Step)
-                || StructuralManager->AnyPassageLandingFloorNearLattice(
-                    Box, Context.LatticeOriginVoxels, Context.Step)
-                || StructuralManager->AnyOriginLandingNearLattice(
-                    Box, Context.LatticeOriginVoxels, Context.Step)
-                || StructuralManager->AnyOriginLandingFloorNearLattice(
-                    Box, Context.LatticeOriginVoxels, Context.Step));
-        // A resolved core box already includes the conservative passage carve bound.  Only a
-        // Mixed core box needs the post-disturbance/floor evaluator; applying it to every resolved
-        // child would turn one narrow landing into hundreds of tiny GetDensityAt walks.
+        // The graph stack is not the complete MC field: GetDensityAt reasserts the walkable
+        // tunnel core after the stack and after the disturbance/landing posts.  The source's
+        // box audit tells us whether that post can have a tunnel candidate in this exact box.
+        // Keep this test local to room-graph stacks; the diagnostic is thread-local and would be
+        // stale for a slab/maze stack.  A candidate only widens the work, never grants a skip.
+        if (Depth == 0 && Context.bUseLatticeProof && StructuralManager != nullptr)
+        {
+            bRootPassageAirKnownAbsent = !StructuralManager->AnyPassageAirPostNearLattice(
+                VoxelBox, Context.LatticeOriginVoxels, Context.Step,
+                StructuralBaseDensity, Context.EdgeSealThickness);
+            bRootOriginAirKnownAbsent = !StructuralManager->AnyOriginLandingAirNearLattice(
+                VoxelBox, Context.LatticeOriginVoxels, Context.Step,
+                StructuralBaseDensity, Context.EdgeSealThickness);
+        }
+        const bool bHasRoomGeometry = Stack.ProvidesResource(VoxelOpResources::RoomGeometry);
+        const VoxelDensityOps::FRoomBoxDiagnostic RoomBox = bHasRoomGeometry
+            ? VoxelDensityOps::GetLastRoomBoxDiagnostic()
+            : VoxelDensityOps::FRoomBoxDiagnostic();
+        if (Stats && bHasRoomGeometry)
+        {
+            Stats->RoomTailQueries += RoomBox.ExactTailQueries;
+            Stats->RoomTailEvaluated += RoomBox.ExactTailEvaluated;
+            Stats->RoomTailCycles += RoomBox.ExactTailCycles;
+            Stats->RoomPropagateCycles += RoomBox.PropagateCycles;
+            Stats->RoomExactPrimitiveCycles += RoomBox.ExactPrimitiveCycles;
+            Stats->RoomCacheWindowCycles += RoomBox.CacheWindowCycles;
+            Stats->RoomNumRooms = RoomBox.NumRooms;
+            Stats->RoomNumTunnels = RoomBox.NumTunnels;
+            Stats->RoomNumRoomFloorJoins = RoomBox.NumRoomFloorJoins;
+            Stats->RoomNumPits = RoomBox.NumPits;
+            Stats->RoomNumChimneys = RoomBox.NumChimneys;
+        }
+        const bool bHasTunnelAirCandidate = bHasRoomGeometry
+            && RoomBox.bMayHaveTunnelCoreAir;
+        const bool bHasTunnelSupportCandidate = bHasRoomGeometry
+            && RoomBox.bMayHaveTunnelSupportFloor;
+        // The tail has two polarities.  A solid-only tail cannot turn a proven solid child into
+        // geometry, and an air-only tail cannot turn a proven air child into geometry.  Keep the
+        // uncertain Mixed parent conservative by descending; at the resolved children only the
+        // polarity that can change the answer is allowed to request a final-field certificate.
+        const bool bHasTunnelCoreCandidate = Whole == EVoxelTileClass::AllSolid
+            ? bHasTunnelAirCandidate
+            : Whole == EVoxelTileClass::AllAir
+                ? bHasTunnelSupportCandidate
+                : false;
+        // FPassageCarveOp and FOriginSpine are already in the stack.  Reusing their broad spatial
+        // candidates here was the LOD0 bug: a passage that the stack had already proved to miss
+        // the sampled sign still forced a final-field refinement of every mixed parent.  Only the
+        // writers that run after the stack remain candidates in this section: post-disturbance
+        // air, and support floors that can add solid.  Unknown/non-finite input remains a
+        // candidate in each exact helper, so this separation cannot authorize a false skip.
+        // A Mixed core is not a verdict yet.  Descend until the interval proof resolves its
+        // polarity; an air post matters to an AllSolid child, while a solid floor/support post
+        // matters to an AllAir child.  Checking both writers on every Mixed ancestor was the
+        // remaining LOD0 classifier tax and could not improve the answer before the child split.
+        const bool bNeedsPostAirCandidate = Whole == EVoxelTileClass::AllSolid;
+        const bool bPassageAirCandidate = bNeedsPostAirCandidate
+            && !bRootPassageAirKnownAbsent
+            && StructuralManager != nullptr
+            && StructuralManager->AnyPassageAirPostNearLattice(
+                Box, Context.LatticeOriginVoxels, Context.Step,
+                StructuralBaseDensity, Context.EdgeSealThickness);
+        const bool bOriginAirCandidate = bNeedsPostAirCandidate
+            && !bRootOriginAirKnownAbsent
+            && StructuralManager != nullptr
+            && StructuralManager->AnyOriginLandingAirNearLattice(
+                Box, Context.LatticeOriginVoxels, Context.Step,
+                StructuralBaseDensity, Context.EdgeSealThickness);
+        // Floors only add solid.  They matter when this core box is already AllAir; on a Mixed
+        // parent, descending to its children preserves the proof while avoiding a padded floor
+        // AABB forcing a final-field walk over every mixed ancestor.  Ask the exact lattice floor
+        // predicate only at an AllAir child.  It is conservative on malformed data and never
+        // grants a skip.
+        const bool bHasCarveCandidate = bPassageAirCandidate || bOriginAirCandidate;
+        const bool bHasStructuralCandidate = Whole == EVoxelTileClass::AllSolid
+                ? bHasCarveCandidate
+                : Whole == EVoxelTileClass::AllAir
+                    && (StructuralManager != nullptr
+                    && StructuralManager->AnyLandingFloorAtLattice(
+                        Box, Context.LatticeOriginVoxels, Context.Step));
+        // A resolved core box still needs a finite-lattice certificate when a common MC tail can
+        // rewrite it (passage/landing posts or the graph tunnel-core backstop).  Without this,
+        // the interval proves the stack's "all solid" field and silently skips a core tunnel
+        // that GetDensityAt opens afterwards.  Boxes with no tail candidate retain the cheap
+        // interval path.
         const bool bNeedsFinalField = Generator != nullptr
-            && bHasStructuralCandidate
-            && Whole == EVoxelTileClass::Mixed;
-        const bool bTask4RefineProbe = Context.bUseLatticeProof
-            && (Context.LatticeOriginVoxels == FIntVector(-96, 96, -96)
-                || Context.LatticeOriginVoxels == FIntVector(-32, 64, -64)
-                || Context.LatticeOriginVoxels == FIntVector(-64, -64, -64)
-                || Context.LatticeOriginVoxels == FIntVector(-64, -96, -64))
-            && Context.Step == 1;
-        if (bTask4RefineProbe)
+            && (bHasStructuralCandidate || bHasTunnelCoreCandidate);
+        if (Stats && bNeedsFinalField)
         {
-            UE_LOG(LogTemp, Warning,
-                   TEXT("[Task4RefineProbe] depth=%d box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) verdict=%d"),
-                   Depth, (float)Box.Min.X, (float)Box.Min.Y, (float)Box.Min.Z,
-                   (float)Box.Max.X, (float)Box.Max.Y, (float)Box.Max.Z,
-                   static_cast<int32>(Whole));
+            ++Stats->NeedsFinalFieldNodes;
         }
-        if (Whole != EVoxelTileClass::Mixed)
+        // A final-field certificate is exact on the same MC lattice as GenerateMesh.  Use it for
+        // the small block-sized tail-risk boxes, including an already-resolved AllSolid/AllAir
+        // box.  The common streamed tile is deliberately not a final-field sampling job: a
+        // coarse tile can contain thousands of MC vertices, and its proof must stay interval-only.
+        // Larger tail-risk boxes remain conservative Mixed until the mesher's normal sampling.
+        bool bAttemptedExact = false;
+        const float FinalFieldBoxExtent = FMath::Max3(
+            static_cast<float>(Box.Max.X - Box.Min.X),
+            static_cast<float>(Box.Max.Y - Box.Min.Y),
+            static_cast<float>(Box.Max.Z - Box.Min.Z));
+        const bool bSmallFinalFieldBox = bNeedsFinalField
+            && FinalFieldBoxExtent <= 8.0f;
+        if (bSmallFinalFieldBox)
+        {
+            int32 ExactIX0 = 0, ExactIY0 = 0, ExactIZ0 = 0;
+            int32 ExactIX1 = 0, ExactIY1 = 0, ExactIZ1 = 0;
+            int64 ExactCount = 0;
+            if (GetLatticeBounds(Box, ExactIX0, ExactIY0, ExactIZ0,
+                                 ExactIX1, ExactIY1, ExactIZ1, ExactCount)
+                && ExactCount <= 8192)
+            {
+                bAttemptedExact = true;
+                const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, true);
+                if (Exact != EVoxelTileClass::Mixed)
+                {
+                    return Exact;
+                }
+                return EVoxelTileClass::Mixed;
+            }
+        }
+
+        if (Whole != EVoxelTileClass::Mixed && !bNeedsFinalField)
         {
             return Whole;
         }
@@ -3655,10 +3896,41 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         // it is not a lower-resolution fallback and never changes GenerateMesh's sample count.
         // This discharges the last conservative SDF interval misses without walking another
         // refinement level or rebuilding the morphology bounds for every half-box.
-        if (Depth >= 3)
+        // The corner check is only a work gate. It is not a proof: matching corners still pay the
+        // complete exact lattice certificate, so a thin cave or a zero/invalid sample cannot be
+        // skipped accidentally. For a genuinely uniform LOD0 empty box this collapses the old
+        // 585-node/64k-sample fallback to at most the 33^3 unique lattice vertices.
+        // A depth-1 box still contains 17^3 MC vertices; probing its corners and then certifying
+        // the whole child is more expensive than the interval refinement it was meant to avoid.
+        // Wait until the depth-3 tail (at most 9^3 vertices) before paying an exact core walk.
+        const bool bCornersHaveOneSign = !bNeedsFinalField && Depth >= 3
+            && CornersHaveOneSign(Box, false);
+        if (bCornersHaveOneSign)
         {
-            ++ExactLeafCount;
-            const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, bNeedsFinalField);
+            bAttemptedExact = true;
+            const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, false);
+            if (Exact != EVoxelTileClass::Mixed)
+            {
+                return Exact;
+            }
+        }
+
+        // A two-voxel unresolved tail is still cheap to certify on the final MC lattice (3^3
+        // points). Doing this before the last split avoids eight more interval folds for the
+        // localized passage/post boundary that caused the original LOD0 false-Mixed bail.
+        if (!bAttemptedExact && Whole == EVoxelTileClass::Mixed && !bNeedsFinalField
+            && Context.bUseLatticeProof && Depth >= 4 && FinalFieldBoxExtent <= 2.0f)
+        {
+            const EVoxelTileClass ExactFinal = ClassifyExactLatticeLeaf(Box, true);
+            if (ExactFinal != EVoxelTileClass::Mixed)
+            {
+                return ExactFinal;
+            }
+            bAttemptedExact = true;
+        }
+        if (!bAttemptedExact && Depth >= 3 && (!bNeedsFinalField || bSmallFinalFieldBox))
+        {
+            const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, bSmallFinalFieldBox);
             if (Exact != EVoxelTileClass::Mixed)
             {
                 return Exact;
@@ -3674,10 +3946,24 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         }
         if (Depth >= MaxRefinementDepth)
         {
+            // The operator interval can remain Mixed at a one-voxel tail even though the final
+            // MC-facing field is uniform after a structural post.  Certify that tiny tail on the
+            // exact lattice before conceding the whole tile to the mesher.  This is a proof over
+            // all corners the mesher would consume; zero/non-finite values remain Mixed.
+            if (Whole == EVoxelTileClass::Mixed && !bNeedsFinalField
+                && Context.bUseLatticeProof && FinalFieldBoxExtent <= 1.0f)
+            {
+                const EVoxelTileClass ExactFinal = ClassifyExactLatticeLeaf(Box, true);
+                if (ExactFinal != EVoxelTileClass::Mixed)
+                {
+                    return ExactFinal;
+                }
+            }
             return bNeedsFinalField ? EVoxelTileClass::Mixed : Whole;
         }
 
         const FVector Mid = (Box.Min + Box.Max) * 0.5f;
+        if (Stats) { ++Stats->SplitNodes; }
         bool bSawSolid = false;
         bool bSawAir = false;
         for (int32 Z = 0; Z < 2; ++Z)
@@ -3707,17 +3993,6 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         return bSawSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
     };
     const EVoxelTileClass Result = Refine(Refine, VoxelBox, 0);
-    if (bTask4TimingProbe)
-    {
-        UE_LOG(LogTemp, Warning,
-               TEXT("[Task4TimingProbe] origin=(%d,%d,%d) step=%d nodes=%d exact_leaves=%d samples=%d stack_ms=%.3f sample_ms=%.3f result=%d"),
-               Context.LatticeOriginVoxels.X, Context.LatticeOriginVoxels.Y,
-               Context.LatticeOriginVoxels.Z, Context.Step,
-               RefineNodeCount, ExactLeafCount, ExactSampleCount,
-               FPlatformTime::ToMilliseconds64(StackClassifyCycles),
-               FPlatformTime::ToMilliseconds64(ExactSampleCycles),
-               static_cast<int32>(Result));
-    }
     return Result;
 }
 
@@ -3728,10 +4003,12 @@ static EVoxelTileClass VF_ClassifyBoxWithWarpRetry(const FVoxelOpStack& Stack,
                                                    const FBox& VoxelBox,
                                                    const FVoxelOpContext& Context,
                                                    const UVoxelGenerator* Generator = nullptr,
-                                                   const UVoxelStrateManager* StructuralManager = nullptr)
+                                                   const UVoxelStrateManager* StructuralManager = nullptr,
+                                                   float StructuralBaseDensity = 8.0f,
+                                                   FVoxelTileClassificationStats* Stats = nullptr)
 {
     const EVoxelTileClass Initial = VF_ClassifyBoxRefined(
-        Stack, VoxelBox, Context, Generator, StructuralManager);
+        Stack, VoxelBox, Context, Generator, StructuralManager, StructuralBaseDensity, Stats);
     // A Mixed fine tile is not evidence of geometry: it can be the conservative result of a
     // coarse operator interval.  Keep the bounded retry for every LOD; skipping it recreates
     // the false-Mixed empty tiles that send the mesher through the expensive path.
@@ -3744,11 +4021,20 @@ static EVoxelTileClass VF_ClassifyBoxWithWarpRetry(const FVoxelOpStack& Stack,
     FVoxelOpContext TightContext = Context;
     TightContext.bTightenWarpProof = true;
     return VF_ClassifyBoxRefined(
-        Stack, VoxelBox, TightContext, Generator, StructuralManager);
+        Stack, VoxelBox, TightContext, Generator, StructuralManager, StructuralBaseDensity, Stats);
 }
 
-EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
+EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels,
+                                              int32 Step, int32 CellsPerAxis) const
 {
+    return ClassifyTile(OriginVoxels, Step, CellsPerAxis, nullptr);
+}
+
+EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
+                                              int32 CellsPerAxis,
+                                              FVoxelTileClassificationStats* OutStats) const
+{
+    if (OutStats) { *OutStats = FVoxelTileClassificationStats(); }
     // Mêmes clamps que GenerateMesh — le verdict doit couvrir le treillis réellement échantillonné.
     Step = FMath::Max(1, Step);
     // ClassifyTile runs before GenerateMesh installs its LOD TLS. The room-graph source uses this
@@ -3767,15 +4053,6 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     const int32 MinX = OriginVoxels.X, MaxX = OriginVoxels.X + CPA * Step;
     const int32 MinY = OriginVoxels.Y, MaxY = OriginVoxels.Y + CPA * Step;
     const int32 MinZ = OriginVoxels.Z, MaxZ = OriginVoxels.Z + CPA * Step;
-    const bool bTask4Probe =
-        (OriginVoxels == FIntVector(-96, 96, -96) && Step == 1)
-        || (OriginVoxels == FIntVector(-32, 64, -64) && Step == 1)
-        || (OriginVoxels == FIntVector(-64, -64, -64) && Step == 1)
-        || (OriginVoxels == FIntVector(-64, -96, -64) && Step == 1)
-        || (OriginVoxels == FIntVector(0, 32, -96) && Step == 2)
-        || (OriginVoxels == FIntVector(-32, -32, -32) && Step == 8)
-        || (OriginVoxels == FIntVector(-96, -32, -32) && Step == 16);
-
     // Division entière PLANCHER (les coords négatives tronquent vers 0 en C++ — pas floor).
     auto FloorDivC = [](int32 A, int32 B) -> int32
     {
@@ -3893,7 +4170,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         RecipeContext.LatticeOriginVoxels = OriginVoxels;
         RecipeStack.PrepareChunk(RecipeContext);
         const EVoxelTileClass RecipeVerdict =
-            VF_ClassifyBoxWithWarpRetry(RecipeStack, TileVoxelBox, RecipeContext);
+            VF_ClassifyBoxWithWarpRetry(RecipeStack, TileVoxelBox, RecipeContext,
+                                        nullptr, nullptr, 8.0f, OutStats);
+        if (RecipeVerdict == EVoxelTileClass::Mixed)
+        {
+        }
         return RecipeVerdict;
     }
 
@@ -3953,7 +4234,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                         || TouchedRegions.RegionCount != ComposerRegions.RegionCount
                         || TouchedRegions.PartitionSeed != ComposerRegions.PartitionSeed
                         || TouchedRegions.LatticeCellSize != ComposerRegions.LatticeCellSize
-                        || TouchedRegions.BlendWidth != ComposerRegions.BlendWidth)
+                || TouchedRegions.BlendWidth != ComposerRegions.BlendWidth)
                     {
                         return EVoxelTileClass::Mixed;
                     }
@@ -3986,7 +4267,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         RegionContext.LatticeOriginVoxels = OriginVoxels;
         RegionStack.PrepareChunk(RegionContext);
         const EVoxelTileClass RegionVerdict =
-            VF_ClassifyBoxWithWarpRetry(RegionStack, TileVoxelBox, RegionContext);
+            VF_ClassifyBoxWithWarpRetry(RegionStack, TileVoxelBox, RegionContext,
+                                        nullptr, nullptr, 8.0f, OutStats);
+        if (RegionVerdict == EVoxelTileClass::Mixed)
+        {
+        }
         return RegionVerdict;
     }
 
@@ -4100,7 +4385,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             {
                 // Retrouve (ou résout) le slot de strate — l'identité vient des bornes chunk-Z du layout.
                 int32 TopCZ = 0, BotCZ = 0;
-                if (!StrateManager->GetStrateChunkZBounds(ChunkZ, TopCZ, BotCZ)) return EVoxelTileClass::Mixed;
+                if (!StrateManager->GetStrateChunkZBounds(ChunkZ, TopCZ, BotCZ))
+                {
+                    return EVoxelTileClass::Mixed;
+                }
                 MemoSlotIdx = -1;
                 for (int32 s = 0; s < NumSlots; ++s)
                 {
@@ -4108,7 +4396,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 }
                 if (MemoSlotIdx < 0)
                 {
-                    if (NumSlots >= 2) return EVoxelTileClass::Mixed;   // >2 strates surface dans une tuile : improbable
+                    if (NumSlots >= 2)
+                    {
+                        return EVoxelTileClass::Mixed;   // >2 strates surface dans une tuile : improbable
+                    }
                     MemoSlotIdx = NumSlots++;
                     FSurfSlot& S = Slots[MemoSlotIdx];
                     S.BotChunkZ  = BotCZ;
@@ -4232,17 +4523,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             if (bInBand) { bCanAir = false; }
             else         { S.InteriorZ.Add(Z); }
         }
-        if (!bCanSolid && !bCanAir) { return EVoxelTileClass::Mixed; }
-    }
-
-    if (bTask4Probe)
-    {
-        UE_LOG(LogTemp, Warning,
-               TEXT("[Task4Probe] phase=z origin=(%d,%d,%d) step=%d solid=%d air=%d cave=%d gap=%d surface=%d out=%d cave_z=(%d,%d)"),
-               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-               bCanSolid ? 1 : 0, bCanAir ? 1 : 0, bAnyCave ? 1 : 0,
-               bAnyGap ? 1 : 0, bAnySurface ? 1 : 0, bAnyOutOfLayout ? 1 : 0,
-               CaveMinZ, CaveMaxZ);
+        if (!bCanSolid && !bCanAir)
+        {
+            return EVoxelTileClass::Mixed;
+        }
     }
 
     // Out-of-layout is a constant-air field. Passage tubes and origin rooms can only carve that
@@ -4283,13 +4567,6 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             TileVoxelBox, OriginVoxels, Step))
     {
         bCanAir = false;
-    }
-    if (bTask4Probe)
-    {
-        UE_LOG(LogTemp, Warning,
-               TEXT("[Task4Probe] phase=guards origin=(%d,%d,%d) step=%d solid=%d air=%d"),
-               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-               bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
     }
     // ── LE PLIAGE DE LA PILE D'OPÉRATEURS, POUR LES ARCHÉTYPES DE CAVE ──
     //=========================================================================
@@ -4484,65 +4761,12 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
             return EVoxelTileClass::Mixed;
         }
         TileStack.PrepareChunk(OpCtx);
-
         const FBox CaveBox(FVector((float)MinX, (float)MinY, (float)CaveMinZ),
                            FVector((float)MaxX, (float)MaxY, (float)CaveMaxZ));
         const EVoxelTileClass StackVerdict = VF_ClassifyBoxWithWarpRetry(
-            TileStack, CaveBox, OpCtx, this, StrateManager);
-        if (bTask4Probe)
-        {
-            UE_LOG(LogTemp, Warning,
-                   TEXT("[Task4Probe] phase=stack origin=(%d,%d,%d) step=%d verdict=%d solid=%d air=%d"),
-                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-                   static_cast<int32>(StackVerdict), bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
-        }
+            TileStack, CaveBox, OpCtx, this, StrateManager, TileTunnel.BaseDensity, OutStats);
         if (StackVerdict == EVoxelTileClass::Mixed)
         {
-        if (bTask4Probe)
-        {
-            int32 SolidKiller = INDEX_NONE;
-            int32 AirKiller = INDEX_NONE;
-            const EVoxelTileClass Attributed = TileStack.ClassifyBoxAttributed(
-                    CaveBox, OpCtx, SolidKiller, AirKiller);
-                UE_LOG(LogTemp, Warning,
-                       TEXT("[Task4Probe] stack_attributed origin=(%d,%d,%d) step=%d verdict=%d solid_killer=%d:%s air_killer=%d:%s"),
-                       OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-                       static_cast<int32>(Attributed), SolidKiller,
-                       TileStack.GetOpDebugName(SolidKiller), AirKiller,
-                       TileStack.GetOpDebugName(AirKiller));
-
-            int32 FinalPositive = 0;
-            int32 FinalNegative = 0;
-            int32 FinalZeroOrInvalid = 0;
-            float FinalMin = FLT_MAX;
-            float FinalMax = -FLT_MAX;
-            for (int32 Z = MinZ; Z <= MaxZ; Z += Step)
-            for (int32 Y = MinY; Y <= MaxY; Y += Step)
-            for (int32 X = MinX; X <= MaxX; X += Step)
-            {
-                const float FinalDensity = GetDensityAt((float)X, (float)Y, (float)Z);
-                if (!FMath::IsFinite(FinalDensity) || FinalDensity == 0.0f)
-                {
-                    ++FinalZeroOrInvalid;
-                }
-                else if (FinalDensity > 0.0f)
-                {
-                    ++FinalPositive;
-                    FinalMin = FMath::Min(FinalMin, FinalDensity);
-                    FinalMax = FMath::Max(FinalMax, FinalDensity);
-                }
-                else
-                {
-                    ++FinalNegative;
-                    FinalMin = FMath::Min(FinalMin, FinalDensity);
-                    FinalMax = FMath::Max(FinalMax, FinalDensity);
-                }
-            }
-            UE_LOG(LogTemp, Warning,
-                   TEXT("[Task4Probe] final_samples origin=(%d,%d,%d) step=%d pos=%d neg=%d zero=%d min=%.6g max=%.6g"),
-                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-                   FinalPositive, FinalNegative, FinalZeroOrInvalid, FinalMin, FinalMax);
-        }
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailStackVerdict);
             return EVoxelTileClass::Mixed;
         }
@@ -4657,13 +4881,6 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
     // sans point intérieur ont tué AllAir via gap/seal). Égalité = prudence → Mixed.
     if (bCanSolid == bCanAir)
     {
-        if (bTask4Probe)
-        {
-            UE_LOG(LogTemp, Warning,
-                   TEXT("[Task4Probe] phase=final origin=(%d,%d,%d) step=%d verdict=0 solid=%d air=%d"),
-                   OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-                   bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
-        }
         return EVoxelTileClass::Mixed;
     }
     if (bAnyCave)
@@ -4674,13 +4891,6 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // invalidate the hypothesis proved for the cave sub-box.
         if (bCanSolid) { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackSolid); }
         else           { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir); }
-    }
-    if (bTask4Probe)
-    {
-        UE_LOG(LogTemp, Warning,
-               TEXT("[Task4Probe] phase=final origin=(%d,%d,%d) step=%d verdict=%d solid=%d air=%d"),
-               OriginVoxels.X, OriginVoxels.Y, OriginVoxels.Z, Step,
-               bCanSolid ? 1 : 2, bCanSolid ? 1 : 0, bCanAir ? 1 : 0);
     }
     return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
 }
