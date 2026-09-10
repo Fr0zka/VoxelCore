@@ -3591,10 +3591,8 @@ namespace
     {
     public:
         FRoomGraphSource(const FStrateGenerationParams& InP, int32 InSeed,
-                         const UVoxelStrateManager* InManager,
-                         const UVoxelGenerator* InGenerator = nullptr)
+                         const UVoxelStrateManager* InManager)
             : P(InP), Seed(InSeed), SeedU((uint32)InSeed), Manager(InManager)
-            , Generator(InGenerator)
             , ManagerLifetimeId(InManager ? InManager->GetCacheLifetimeId() : 0)
             , ParamsFingerprint(FCrc::MemCrc32(&InP, sizeof(InP)))
         {}
@@ -3788,40 +3786,13 @@ namespace
          *  Lu par les arches, les dômes, le pincement et le biais de sol. */
         int32 GetNearestRoomIdx() const { return State().NearestRoom; }
 
-        bool HasTunnelAirGeometry() const
-        {
-            return P.RoomDensity > 0.0f && P.RoomSpacing > 0.0f;
-        }
-
         void BuildSupportColumn(
             float WorldX, float WorldY,
             const FChunkSDFCache& Cache,
             FTunnelSupportFloorColumn& OutColumn) const
         {
-            if (Generator == nullptr)
-            {
-                VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                    WorldX, WorldY, Cache, OutColumn);
-                return;
-            }
-
-            // This is a synchronous, non-owning view of the exact field with only the graph
-            // support slab disabled. BuildTunnelSupportFloorColumn consumes it immediately and
-            // retains only the proven interval decision in the worker-local column cache.
-            const auto SampleWithoutTunnelSupportFloor =
-                [this](float X, float Y, float Z) -> float
-            {
-                return Generator->GetDensityWithParams(
-                    X, Y, Z, P, ParamsFingerprint, LayoutVersion,
-                    /*bApplyLegacyStructuralPosts=*/true,
-                    /*bApplyTunnelSupportFloor=*/false);
-            };
-            FTunnelSupportFloorDensitySampler NaturalSampler =
-                SampleWithoutTunnelSupportFloor;
             VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                WorldX, WorldY, Cache, OutColumn, &NaturalSampler,
-                P.StrateTopWorldZ, P.StrateBottomWorldZ,
-                P.BoundarySealThickness);
+                WorldX, WorldY, Cache, OutColumn);
         }
 
         const FTunnelSupportFloorColumn* GetSupportColumn(const FVector& Position) const
@@ -3855,18 +3826,6 @@ namespace
                 static_cast<float>(Position.X), static_cast<float>(Position.Y),
                 GetCache(), S.FractionalSupportColumn);
             return &S.FractionalSupportColumn;
-        }
-
-        float GetTunnelCoreSDF() const
-        {
-            FState& S = State();
-            const FVector& Position = S.LastWorldPosition;
-            const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(Position);
-            S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                Position.X, Position.Y, Position.Z, GetCache(), SupportColumn);
-            S.LastTunnelCoreEvaluationPosition = Position;
-            S.bLastTunnelCoreWorldEvaluationValid = true;
-            return S.LastTunnelCoreWorldEvaluation.SDF;
         }
 
         bool TryGetLastTunnelCoreWorldEvaluation(
@@ -4200,7 +4159,8 @@ namespace
             }
 
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
-                WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius, &S.NearestRoom);
+                WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius,
+                &S.NearestRoom);
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -6640,129 +6600,14 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("RoomGraphSource"); }
 
-        bool IsTunnelSupportFloor() const
-        {
-            FState& S = State();
-            const FVector& Position = S.LastWorldPosition;
-            if (VoxelDensityProfile::AreCountersEnabled())
-            {
-                VoxelDensityProfile::AddCounter(
-                    VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
-            }
-
-            const FTunnelSupportFloorColumn* Column = GetSupportColumn(Position);
-            const bool bSupport = Column != nullptr
-                && VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
-                    static_cast<float>(Position.Z), *Column);
-            S.LastTunnelCoreWorldEvaluation = FTunnelCoreWorldEvaluation();
-            S.LastTunnelCoreWorldEvaluation.bSupportFloor = bSupport;
-            S.LastTunnelCoreEvaluationPosition = Position;
-            S.bLastTunnelCoreWorldEvaluationValid = true;
-            return bSupport;
-        }
-
     private:
         FStrateGenerationParams P;
         int32  Seed;
         uint32 SeedU;
         TWeakObjectPtr<const UVoxelStrateManager> Manager;
-        const UVoxelGenerator* Generator = nullptr;
         uint64 ManagerLifetimeId = 0;
         uint32 ParamsFingerprint;
         uint32 LayoutVersion = 0;
-    };
-
-    // The graph tunnel floor closes the rounded bottom of the core into a finite, walkable support
-    // slab. It is separate from the inter-strate passage floor: this owns only the wandering
-    // intra-strate graph edges and does not create any new corridor.
-    class FCaveTunnelFloorOp final : public IVoxelDensityOp
-    {
-    public:
-        FCaveTunnelFloorOp(const FRoomGraphSource* InRooms, float InBase)
-            : Rooms(InRooms), Base(InBase)
-        {}
-
-        EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
-        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
-        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
-        EVoxelOpResourceMask RequiredResources() const override
-        {
-            return VoxelOpResources::RoomGeometry;
-        }
-        bool IsAdditive() const override { return false; }
-        void PrepareChunk(const FVoxelOpContext&) override {}
-
-        void Eval(float, float, float, FVoxelOpSample& InOut) const override
-        {
-            if (Rooms != nullptr && Rooms->IsTunnelSupportFloor())
-            {
-                InOut.Density = FMath::Max(
-                    InOut.Density,
-                    FMath::Max(Base * 2.0f, 1.0f));
-            }
-        }
-
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
-        {
-            return Rooms != nullptr && Rooms->HasTunnelAirGeometry()
-                ? EVoxelOpEffect::Both
-                : EVoxelOpEffect::Identity;
-        }
-
-        const TCHAR* DebugName() const override { return TEXT("CaveTunnelFloorOp"); }
-
-    private:
-        const FRoomGraphSource* Rooms = nullptr;
-        float Base = 8.0f;
-    };
-
-    // A graph tunnel's raw SDF is the structural air contract for the wandering chain. It runs
-    // after the passage post because a different passage can project a solid support floor onto
-    // the same voxel; the core keeps its own half-voxel support band and restores the route above
-    // it. FRoomGraphSource evaluates this post against the cached world-space chain, so the cave
-    // warp cannot turn a walkable floor ramp into a vertical break.
-    class FCaveTunnelAirOp final : public IVoxelDensityOp
-    {
-    public:
-        FCaveTunnelAirOp(const FRoomGraphSource* InRooms, float InBase, float InInset)
-            : Rooms(InRooms), Base(InBase), Inset(InInset)
-        {}
-
-        EVoxelOpRole GetRole() const override { return EVoxelOpRole::StructuralPost; }
-        EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::Density; }
-        EVoxelOpChannelMask ChannelWrites() const override { return VoxelOpChannels::Density; }
-        EVoxelOpResourceMask RequiredResources() const override
-        {
-            return VoxelOpResources::RoomGeometry;
-        }
-        bool IsAdditive() const override { return false; }
-        void PrepareChunk(const FVoxelOpContext&) override {}
-
-        void Eval(float, float, float, FVoxelOpSample& InOut) const override
-        {
-            if (Rooms != nullptr
-                && !Rooms->IsTunnelSupportFloor()
-                && Rooms->GetTunnelCoreSDF() < -Inset)
-            {
-                InOut.Density = FMath::Min(
-                    InOut.Density,
-                    -FMath::Max(Base * 2.0f, 1.0f));
-            }
-        }
-
-        EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
-        {
-            return Rooms != nullptr && Rooms->HasTunnelAirGeometry()
-                ? EVoxelOpEffect::CarveOnly
-                : EVoxelOpEffect::Identity;
-        }
-
-        const TCHAR* DebugName() const override { return TEXT("CaveTunnelAirOp"); }
-
-    private:
-        const FRoomGraphSource* Rooms = nullptr;
-        float Base = 8.0f;
-        float Inset = 2.0f;
     };
 
     //=========================================================================
@@ -9442,8 +9287,7 @@ namespace VoxelDensityOps
 
     void BuildTunnelNetworkStack(FVoxelOpStack& OutStack, const FStrateGenerationParams& P,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
-                                 bool bAppendStructuralPosts,
-                                 const UVoxelGenerator* Generator)
+                                 bool bAppendStructuralPosts)
     {
         // ⚠️ ÉTAPES A + B + C1 — LA PILE EST COMPLÈTE POUR CET ARCHÉTYPE.
         // Portés : échelle verticale, roc de base, warp, graphe de salles (+ pits + cheminées),
@@ -9488,7 +9332,7 @@ namespace VoxelDensityOps
         // La source de salles est retenue par pointeur non possédant : les terrasses re-interrogent
         // son cache SDF en Z±1. Même motif que `FShaftFieldSource` → `FShaftLedgeMod`.
         TUniquePtr<FRoomGraphSource> RoomSource = MakeUnique<FRoomGraphSource>(
-            P, Seed, StrateManager, Generator);
+            P, Seed, StrateManager);
         const FRoomGraphSource* RoomPtr = RoomSource.Get();
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));

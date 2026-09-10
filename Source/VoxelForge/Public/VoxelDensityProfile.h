@@ -54,8 +54,6 @@ namespace VoxelDensityProfile
         OriginSpineOp,
         BoundarySealOp,
         PassageCarveOp,
-        CaveTunnelFloorOp,
-        CaveTunnelAirOp,
         XYEdgeSealOp,
         OtherOp,
         // Non-overlapping top-level phases.  The named operation buckets above are intentionally
@@ -98,8 +96,6 @@ namespace VoxelDensityProfile
         TunnelSupportColumnCandidates,
         TunnelSupportFloorQueries,
         TunnelSupportFloorChecks,
-        TunnelSupportFloorNaturalTests,
-        TunnelSupportFloorNaturalSkips,
         PassageCandidates,
         PassageEvaluated,
         MesherBlockTests,

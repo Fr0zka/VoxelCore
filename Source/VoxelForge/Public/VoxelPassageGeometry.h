@@ -21,6 +21,7 @@ namespace VoxelPassageGeometry
         MinimumTurnFloorWidthVoxels * 0.5f;
     constexpr float MinimumRoomHeightVoxels = 12.0f;       // 3 m
     constexpr float LandingFloorThicknessVoxels = 3.0f;
+    constexpr float MaxStepHeightVoxels = 1.8f;              // 45 cm at 25 cm/voxel
     constexpr float SealSafetyMarginVoxels = 4.0f;
     constexpr float RoomRoundingVoxels = 1.5f;
     constexpr float LandingCarveBlendVoxels = 4.0f;
@@ -47,6 +48,10 @@ namespace VoxelPassageGeometry
     // latter is a scramble limit, not a sensible default for a tunnel the player walks through.
     constexpr float WalkableTunnelMaxGradientDegrees = 15.0f;
     constexpr float WalkableTunnelMaxGradient = 0.2679491924311227f; // tan(15 degrees)
+    // Player-fit measurements use the engine's 44 degree walkability contract.  The 15 degree
+    // value above remains the preferred authored tunnel ramp; this wider bound is only the
+    // fallback threshold at which a room-to-room floor must become a terrace.
+    constexpr float PlayerWalkableFloorMaxGradient = 0.9656887748070738f; // tan(44 degrees)
 
     // The walkability contract is about the floor carried by the tube, not only its centreline.
     // A tapered tube changes that floor by the radius delta, so the construction and the audit

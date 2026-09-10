@@ -414,8 +414,6 @@ namespace VoxelDensityProfile
         case ECounter::TunnelSupportColumnCandidates:return TEXT("TunnelSupportColumnCandidates");
         case ECounter::TunnelSupportFloorQueries:return TEXT("TunnelSupportFloorQueries");
         case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
-        case ECounter::TunnelSupportFloorNaturalTests:return TEXT("TunnelSupportFloorNaturalTests");
-        case ECounter::TunnelSupportFloorNaturalSkips:return TEXT("TunnelSupportFloorNaturalSkips");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");
@@ -467,8 +465,6 @@ namespace VoxelDensityProfile
             { TEXT("OriginSpineOp"),     EBucket::OriginSpineOp },
             { TEXT("BoundarySealOp"),    EBucket::BoundarySealOp },
             { TEXT("PassageCarveOp"),    EBucket::PassageCarveOp },
-            { TEXT("CaveTunnelFloorOp"), EBucket::CaveTunnelFloorOp },
-            { TEXT("CaveTunnelAirOp"),   EBucket::CaveTunnelAirOp },
             { TEXT("XYEdgeSealOp"),      EBucket::XYEdgeSealOp },
             { TEXT("DensityPrologue"),   EBucket::DensityPrologue },
             { TEXT("DensityCore"),       EBucket::DensityCore },
@@ -529,8 +525,6 @@ namespace VoxelDensityProfile
         case EBucket::OriginSpineOp:    return TEXT("OriginSpineOp");
         case EBucket::BoundarySealOp:   return TEXT("BoundarySealOp");
         case EBucket::PassageCarveOp:   return TEXT("PassageCarveOp");
-        case EBucket::CaveTunnelFloorOp:return TEXT("CaveTunnelFloorOp");
-        case EBucket::CaveTunnelAirOp:  return TEXT("CaveTunnelAirOp");
         case EBucket::XYEdgeSealOp:     return TEXT("XYEdgeSealOp");
         case EBucket::OtherOp:           return TEXT("OtherOp");
         case EBucket::DensityPrologue:   return TEXT("DensityPrologue");

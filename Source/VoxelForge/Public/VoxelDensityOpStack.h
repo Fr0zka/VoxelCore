@@ -474,8 +474,7 @@ namespace VoxelDensityOps
                                                 const FStrateGenerationParams& P,
                                                 int32 Seed, float SpineRadius,
                                                 const UVoxelStrateManager* StrateManager,
-                                                bool bAppendStructuralPosts = true,
-                                                const UVoxelGenerator* Generator = nullptr);
+                                                bool bAppendStructuralPosts = true);
 
     /**
      * DIAGNOSTIC — la ventilation par CLASSE DE PRIMITIVE de la dernière propagation d'intervalle

@@ -167,8 +167,7 @@ public:
     float GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
                                const FStrateGenerationParams& Params,
                                uint32 ParamsFingerprint, uint32 LayoutVersion,
-                               bool bApplyLegacyStructuralPosts = true,
-                               bool bApplyTunnelSupportFloor = true) const;
+                               bool bApplyLegacyStructuralPosts = true) const;
 
     /**
      * Densité pour une strate Slab (FlatPlain / CrystalChamber).

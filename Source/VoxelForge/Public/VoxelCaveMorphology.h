@@ -640,6 +640,11 @@ struct FCachedTunnel
     // turning a gentle authored floor ramp into a vertical break when the cave warp is nonlinear.
     TArray<FVector> WorldControlPoints;
     TArray<float> WorldControlRadii;
+    // The corridor floor is a swept SmoothMax cut, not a later slab.  These are copied from the
+    // same strate fields used by room floors; the seed is derived once from the tunnel pair hash.
+    float FloorReliefStrength = 0.0f;
+    float FloorReliefFrequency = 0.015f;
+    uint32 FloorSeed = 0;
     FVector WorldBoundCenter = FVector::ZeroVector;
     float WorldBoundRadiusSq = 0.0f;
     // Centerline AABBs and scalar influence radii used by the immutable broad phase.  The
@@ -697,12 +702,6 @@ struct FTunnelSupportFloorColumn
         Intervals.Reset();
     }
 };
-
-// A non-owning probe used only while a support-column is being prepared.  The caller supplies the
-// exact MC-facing density field with the graph support slab disabled; the morphology layer then
-// runs the same player-fit predicate used by the capability measurement.  A missing sampler is a
-// deliberate safe fallback: retain the authored support band rather than making an unproven skip.
-using FTunnelSupportFloorDensitySampler = TFunctionRef<float(float, float, float)>;
 
 // A pre-baked pit shaft — position and dimensions resolved during BuildChunkCache.
 //
@@ -770,6 +769,10 @@ struct FChunkSDFCache
     int32 SupportColumnCellsY = 0;
     TArray<int32> SupportColumnEntries;
     TArray<FTunnelSupportFloorColumn> SupportColumns;
+
+    // Kept with the cache because the world-space structural evaluator has no params argument.
+    // A zero value is a valid hard-intersection fallback for legacy/empty caches.
+    float SDFBlendRadius = 0.0f;
 
     // Allocator-backed bytes owned by this cache, including the nested tunnel chains. The returned
     // value excludes sizeof(FChunkSDFCache) itself so callers can add the enclosing entry's inline
@@ -909,18 +912,13 @@ namespace VoxelCaveMorphology
         const FChunkSDFCache& Cache
     );
 
-    // Build/query the same support-floor predicate at column granularity.  When NaturalSampler is
-    // supplied, a projected band is omitted only if the exact field with that graph slab disabled
-    // accepts a player-fit pose at this column.  Without that proof the old interval is retained.
-    // The sampler is synchronous and non-owning; it is never retained by the cache.
+    // Build/query the same support-floor predicate at column granularity. The column stores its
+    // finite support interval, so every Z sample in a chunk reuses the same deterministic
+    // projection and never re-runs a natural-floor validator.
     VOXELFORGE_API void BuildTunnelSupportFloorColumn(
         float WorldX, float WorldY,
         const FChunkSDFCache& Cache,
-        FTunnelSupportFloorColumn& OutColumn,
-        const FTunnelSupportFloorDensitySampler* NaturalSampler = nullptr,
-        float NaturalStrateTopZ = 0.0f,
-        float NaturalStrateBottomZ = 0.0f,
-        float NaturalBoundarySealThickness = 0.0f
+        FTunnelSupportFloorColumn& OutColumn
     );
 
     VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(
