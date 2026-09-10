@@ -103,6 +103,13 @@ struct VOXELFORGE_API FVoxelStrateMeasureSettings
     // A support patch is sampled at the integer columns covered by the capsule radius. 0.75 with
     // the default 1.36-voxel radius requires 4 of 5 columns, including the centre column.
     float PlayerSupportPatchMinCoverageFraction = 0.75f;
+
+    // Traversal is still constrained by the exact player-fit mask, but a planned climbing
+    // mechanic may cross a higher supported neighbouring column. This is a measurement policy,
+    // not a runtime movement change. The surface remains required to be supported; the extra
+    // height only changes whether that supported edge is traversable.
+    bool bPlayerClimbingEnabled = true;
+    float PlayerMaxClimbHeightMeters = 3.0f;
 };
 
 /**
@@ -302,6 +309,8 @@ struct VOXELFORGE_API FVoxelPlayerFitWalkReport
     bool bStartSnapped = false;
     bool bGoalSnapped = false;
     int32 NumRouteRetries = 0;
+    bool bClimbingEnabled = false;
+    float MaxClimbHeightMeters = 0.0f;
 
     int64 PlayerFitVolumeCells = 0;
     int64 ReachablePlayerFitCells = 0;
@@ -320,6 +329,7 @@ struct VOXELFORGE_API FVoxelPlayerFitWalkReport
     // branch edge is counted twice when the agent backtracks, which makes this an instrument of
     // traversal experience rather than a shortest-path length.
     int64 AgentGraphTraversals = 0;
+    int64 ClimbTraversals = 0;
     int64 DeadEndsEncountered = 0;
     float DeadEndsPer100m = 0.0f;
     float DistanceTravelledMeters = 0.0f;

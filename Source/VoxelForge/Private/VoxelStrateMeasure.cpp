@@ -468,6 +468,244 @@ namespace VoxelStrateMeasurePrivate
         OutX = InPlane - OutY * Grid.NumX;
     }
 
+    struct FPlayerTraversalNeighbour
+    {
+        int32 Cell = INDEX_NONE;
+        bool bClimb = false;
+    };
+
+    bool IsEligiblePlayerFitCell(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        int32 Cell)
+    {
+        return Cell >= 0
+            && Cell < Grid.CellCount
+            && Grid.Air[Cell] != 0u
+            && PlayerFitMask.IsValidIndex(Cell)
+            && PlayerFitMask[Cell] != 0u;
+    }
+
+    bool IsClimbableSurfaceEdge(
+        const FSampleGrid& Grid,
+        int32 First,
+        int32 Second,
+        float FirstSupportHeight,
+        float SecondSupportHeight)
+    {
+        int32 FirstX = 0;
+        int32 FirstY = 0;
+        int32 FirstZ = 0;
+        DecodeIndex(Grid, First, FirstX, FirstY, FirstZ);
+        int32 SecondX = 0;
+        int32 SecondY = 0;
+        int32 SecondZ = 0;
+        DecodeIndex(Grid, Second, SecondX, SecondY, SecondZ);
+        if (FMath::Abs(FirstX - SecondX) + FMath::Abs(FirstY - SecondY) != 1)
+        {
+            return false;
+        }
+
+        const bool bFirstIsHigher = FirstSupportHeight > SecondSupportHeight;
+        const int32 LowerColumnX = bFirstIsHigher ? SecondX : FirstX;
+        const int32 LowerColumnY = bFirstIsHigher ? SecondY : FirstY;
+        const int32 HigherColumnX = bFirstIsHigher ? FirstX : SecondX;
+        const int32 HigherColumnY = bFirstIsHigher ? FirstY : SecondY;
+        const float LowerHeight = FMath::Min(FirstSupportHeight, SecondSupportHeight);
+        const float HigherHeight = FMath::Max(FirstSupportHeight, SecondSupportHeight);
+        const float Step = static_cast<float>(Grid.SampleStep);
+        if (!FMath::IsFinite(Step) || Step <= 0.0f
+            || !FMath::IsFinite(LowerHeight) || !FMath::IsFinite(HigherHeight))
+        {
+            return false;
+        }
+
+        // A climb edge must meet a solid riser, not connect two independently supported
+        // floating poses across an empty gap. Exclude the top support cell itself: that cell is
+        // present for every supported platform and is not evidence of a climbable face.
+        const int32 FirstRiserZ = FMath::Max(
+            0,
+            FMath::FloorToInt((LowerHeight - Grid.MinZ) / Step));
+        const int32 LastRiserZ = FMath::Min(
+            Grid.NumZ - 1,
+            FMath::CeilToInt((HigherHeight - Grid.MinZ) / Step) - 2);
+        for (int32 Z = FirstRiserZ; Z <= LastRiserZ; ++Z)
+        {
+            if (Grid.Air[Grid.Index(HigherColumnX, HigherColumnY, Z)] == 0u
+                || Grid.Air[Grid.Index(LowerColumnX, LowerColumnY, Z)] == 0u)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsPlayerTraversalEdge(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        const TArray<float>* PlayerFitSupportHeights,
+        const FVoxelStrateMeasureSettings* Settings,
+        int32 First,
+        int32 Second,
+        bool& bOutClimb)
+    {
+        bOutClimb = false;
+        if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, First)
+            || !IsEligiblePlayerFitCell(Grid, PlayerFitMask, Second))
+        {
+            return false;
+        }
+        if (PlayerFitSupportHeights == nullptr || Settings == nullptr)
+        {
+            // Callers that do not carry support data retain the historical six-neighbour graph.
+            return true;
+        }
+        if (!PlayerFitSupportHeights->IsValidIndex(First)
+            || !PlayerFitSupportHeights->IsValidIndex(Second))
+        {
+            return false;
+        }
+
+        int32 FirstX = 0;
+        int32 FirstY = 0;
+        int32 FirstZ = 0;
+        DecodeIndex(Grid, First, FirstX, FirstY, FirstZ);
+        int32 SecondX = 0;
+        int32 SecondY = 0;
+        int32 SecondZ = 0;
+        DecodeIndex(Grid, Second, SecondX, SecondY, SecondZ);
+        const int32 DeltaX = FMath::Abs(FirstX - SecondX);
+        const int32 DeltaY = FMath::Abs(FirstY - SecondY);
+        const int32 DeltaZ = FMath::Abs(FirstZ - SecondZ);
+        if (DeltaX + DeltaY == 0 && DeltaZ == 1)
+        {
+            return true;
+        }
+        if (DeltaX + DeltaY != 1)
+        {
+            return false;
+        }
+
+        const float FirstHeight = (*PlayerFitSupportHeights)[First];
+        const float SecondHeight = (*PlayerFitSupportHeights)[Second];
+        if (!FMath::IsFinite(FirstHeight) || !FMath::IsFinite(SecondHeight))
+        {
+            return false;
+        }
+        const float VoxelSize = FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const float StepHeightVoxels = Settings->PlayerMaxStepHeightMeters / VoxelSize;
+        const float ClimbHeightVoxels = Settings->PlayerMaxClimbHeightMeters / VoxelSize;
+        if (!FMath::IsFinite(StepHeightVoxels) || StepHeightVoxels < 0.0f
+            || !FMath::IsFinite(ClimbHeightVoxels) || ClimbHeightVoxels < 0.0f)
+        {
+            return false;
+        }
+        const float HeightDelta = FMath::Abs(FirstHeight - SecondHeight);
+        if (HeightDelta <= StepHeightVoxels + KINDA_SMALL_NUMBER)
+        {
+            return true;
+        }
+        if (!Settings->bPlayerClimbingEnabled
+            || HeightDelta > ClimbHeightVoxels + KINDA_SMALL_NUMBER)
+        {
+            return false;
+        }
+
+        bOutClimb = IsClimbableSurfaceEdge(
+            Grid, First, Second, FirstHeight, SecondHeight);
+        return bOutClimb;
+    }
+
+    void AppendPlayerTraversalNeighbours(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        const TArray<float>* PlayerFitSupportHeights,
+        const FVoxelStrateMeasureSettings* Settings,
+        int32 Cell,
+        TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>>& OutNeighbours)
+    {
+        OutNeighbours.Reset();
+        if (Cell < 0 || Cell >= Grid.CellCount)
+        {
+            return;
+        }
+
+        int32 X = 0;
+        int32 Y = 0;
+        int32 Z = 0;
+        DecodeIndex(Grid, Cell, X, Y, Z);
+        auto TryAdd = [&](int32 Neighbor)
+        {
+            if (Neighbor == INDEX_NONE || Neighbor == Cell)
+            {
+                return;
+            }
+            bool bClimb = false;
+            if (IsPlayerTraversalEdge(
+                    Grid, PlayerFitMask, PlayerFitSupportHeights, Settings,
+                    Cell, Neighbor, bClimb))
+            {
+                OutNeighbours.Add({ Neighbor, bClimb });
+            }
+        };
+
+        // Preserve the old direction order for ordinary movement. Extra climb edges are appended
+        // in a fixed direction/height order, so the route and all derived counts are stable.
+        if (X + 1 < Grid.NumX) TryAdd(Grid.Index(X + 1, Y, Z));
+        if (X > 0)            TryAdd(Grid.Index(X - 1, Y, Z));
+        if (Y + 1 < Grid.NumY) TryAdd(Grid.Index(X, Y + 1, Z));
+        if (Y > 0)             TryAdd(Grid.Index(X, Y - 1, Z));
+        if (Z + 1 < Grid.NumZ) TryAdd(Grid.Index(X, Y, Z + 1));
+        if (Z > 0)             TryAdd(Grid.Index(X, Y, Z - 1));
+
+        if (PlayerFitSupportHeights == nullptr || Settings == nullptr
+            || !Settings->bPlayerClimbingEnabled)
+        {
+            return;
+        }
+        const float VoxelSize = FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+        const float ClimbHeightVoxels = Settings->PlayerMaxClimbHeightMeters / VoxelSize;
+        if (!FMath::IsFinite(ClimbHeightVoxels) || ClimbHeightVoxels <= 0.0f)
+        {
+            return;
+        }
+        const int32 SearchCells = FMath::Min(
+            4096,
+            FMath::Max(1, FMath::CeilToInt(ClimbHeightVoxels)));
+        const int32 DirectionX[4] = { 1, -1, 0, 0 };
+        const int32 DirectionY[4] = { 0, 0, 1, -1 };
+        for (int32 Direction = 0; Direction < 4; ++Direction)
+        {
+            const int32 TargetX = X + DirectionX[Direction];
+            const int32 TargetY = Y + DirectionY[Direction];
+            if (TargetX < 0 || TargetX >= Grid.NumX
+                || TargetY < 0 || TargetY >= Grid.NumY)
+            {
+                continue;
+            }
+            for (int32 OffsetZ = -SearchCells; OffsetZ <= SearchCells; ++OffsetZ)
+            {
+                if (OffsetZ == 0)
+                {
+                    continue;
+                }
+                const int32 TargetZ = Z + OffsetZ;
+                if (TargetZ >= 0 && TargetZ < Grid.NumZ)
+                {
+                    const int32 Neighbor = Grid.Index(TargetX, TargetY, TargetZ);
+                    bool bClimb = false;
+                    if (IsPlayerTraversalEdge(
+                            Grid, PlayerFitMask, PlayerFitSupportHeights, Settings,
+                            Cell, Neighbor, bClimb)
+                        && bClimb)
+                    {
+                        OutNeighbours.Add({ Neighbor, true });
+                    }
+                }
+            }
+        }
+    }
+
     void FloodFillAir(
         const FSampleGrid& Grid,
         TArray<int32>& OutComponents,
@@ -477,7 +715,9 @@ namespace VoxelStrateMeasurePrivate
         int32& OutLargestComponentLowestCell,
         int32& OutNumComponentsAtLeast1Pct,
         TArray<int64>* OutComponentCells,
-        const TArray<uint8>* EligibilityMask = nullptr)
+        const TArray<uint8>* EligibilityMask = nullptr,
+        const TArray<float>* PlayerFitSupportHeights = nullptr,
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
     {
         OutComponents.SetNumUninitialized(Grid.CellCount);
         for (int32 Index = 0; Index < Grid.CellCount; ++Index)
@@ -533,13 +773,29 @@ namespace VoxelStrateMeasurePrivate
                     }
                 };
 
-                // Fixed order keeps every derived value independent of container iteration order.
-                if (X + 1 < Grid.NumX) Visit(Grid.Index(X + 1, Y, Z));
-                if (X > 0)            Visit(Grid.Index(X - 1, Y, Z));
-                if (Y + 1 < Grid.NumY) Visit(Grid.Index(X, Y + 1, Z));
-                if (Y > 0)             Visit(Grid.Index(X, Y - 1, Z));
-                if (Z + 1 < Grid.NumZ) Visit(Grid.Index(X, Y, Z + 1));
-                if (Z > 0)             Visit(Grid.Index(X, Y, Z - 1));
+                if (EligibilityMask != nullptr
+                    && PlayerFitSupportHeights != nullptr
+                    && TraversalSettings != nullptr)
+                {
+                    TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
+                    AppendPlayerTraversalNeighbours(
+                        Grid, *EligibilityMask, PlayerFitSupportHeights,
+                        TraversalSettings, Current, Neighbours);
+                    for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
+                    {
+                        Visit(Neighbour.Cell);
+                    }
+                }
+                else
+                {
+                    // Fixed order keeps every derived value independent of container iteration order.
+                    if (X + 1 < Grid.NumX) Visit(Grid.Index(X + 1, Y, Z));
+                    if (X > 0)            Visit(Grid.Index(X - 1, Y, Z));
+                    if (Y + 1 < Grid.NumY) Visit(Grid.Index(X, Y + 1, Z));
+                    if (Y > 0)             Visit(Grid.Index(X, Y - 1, Z));
+                    if (Z + 1 < Grid.NumZ) Visit(Grid.Index(X, Y, Z + 1));
+                    if (Z > 0)             Visit(Grid.Index(X, Y, Z - 1));
+                }
             }
 
             const int64 ComponentCells64 = static_cast<int64>(ComponentCells);
@@ -1079,10 +1335,15 @@ namespace VoxelStrateMeasurePrivate
         const FVoxelStrateMeasureSettings& Settings,
         TArray<uint8>& OutPlayerFit,
         int64& OutNumPlayerFitCells,
-        FString& OutReason)
+        FString& OutReason,
+        TArray<float>* OutPlayerFitSupportHeights = nullptr)
     {
         OutPlayerFit.Reset();
         OutNumPlayerFitCells = 0;
+        if (OutPlayerFitSupportHeights != nullptr)
+        {
+            OutPlayerFitSupportHeights->Reset();
+        }
         if (Grid.SampleStep != 1)
         {
             return Refuse(
@@ -1155,6 +1416,10 @@ namespace VoxelStrateMeasurePrivate
         }
 
         OutPlayerFit.Init(0u, Grid.CellCount);
+        if (OutPlayerFitSupportHeights != nullptr)
+        {
+            OutPlayerFitSupportHeights->Init(-FLT_MAX, Grid.CellCount);
+        }
         TArray<int64> PlayerFitCounts;
         PlayerFitCounts.Init(0, Grid.NumZ);
 
@@ -1261,6 +1526,10 @@ namespace VoxelStrateMeasurePrivate
                         continue;
                     }
                     OutPlayerFit[Current] = 1u;
+                    if (OutPlayerFitSupportHeights != nullptr)
+                    {
+                        (*OutPlayerFitSupportHeights)[Current] = SupportHeight;
+                    }
                     ++NumPlayerFitInSlice;
                 }
             }
@@ -1411,7 +1680,8 @@ namespace VoxelStrateMeasurePrivate
         const FSampleGrid& Grid,
         const FVoxelStrateMeasureSettings& Settings,
         FVoxelStrateMetrics& InOutMetrics,
-        TArray<uint8>* OutPlayerFitMask = nullptr)
+        TArray<uint8>* OutPlayerFitMask = nullptr,
+        TArray<float>* OutPlayerFitSupportHeights = nullptr)
     {
         InOutMetrics.bPlayerFitResolved = false;
         InOutMetrics.PlayerFitRefusalReason.Reset();
@@ -1423,9 +1693,11 @@ namespace VoxelStrateMeasurePrivate
         InOutMetrics.MinimumPlayerClearanceVoxels = 0.0f;
 
         TArray<uint8> PlayerFit;
+        TArray<float> PlayerFitSupportHeights;
         if (!BuildPlayerFitMask(
                 Grid, Settings, PlayerFit, InOutMetrics.NumPlayerFitCells,
-                InOutMetrics.PlayerFitRefusalReason))
+                InOutMetrics.PlayerFitRefusalReason,
+                &PlayerFitSupportHeights))
         {
             if (OutPlayerFitMask != nullptr)
             {
@@ -1453,7 +1725,9 @@ namespace VoxelStrateMeasurePrivate
             LargestComponentLowestCell,
             NumComponentsAtLeast1Pct,
             nullptr,
-            &PlayerFit);
+            &PlayerFit,
+            &PlayerFitSupportHeights,
+            &Settings);
         InOutMetrics.NumTraversableComponents = NumComponents;
         InOutMetrics.LargestTraversableComponentCells = LargestComponentCells;
         InOutMetrics.TraversableComponentShare = InOutMetrics.NumPlayerFitCells > 0
@@ -1466,13 +1740,18 @@ namespace VoxelStrateMeasurePrivate
         {
             *OutPlayerFitMask = MoveTemp(PlayerFit);
         }
+        if (OutPlayerFitSupportHeights != nullptr)
+        {
+            *OutPlayerFitSupportHeights = MoveTemp(PlayerFitSupportHeights);
+        }
     }
 
     void BuildPlayerFitConnectivityMetrics(
         const FSampleGrid& Grid,
         const FVoxelStrateMeasureSettings& Settings,
         FVoxelStrateMetrics& OutMetrics,
-        TArray<uint8>& OutPlayerFitMask)
+        TArray<uint8>& OutPlayerFitMask,
+        TArray<float>& OutPlayerFitSupportHeights)
     {
         OutMetrics = FVoxelStrateMetrics();
         OutMetrics.ResolvedMarginVoxels = Grid.ResolvedMarginVoxels;
@@ -1492,7 +1771,9 @@ namespace VoxelStrateMeasurePrivate
             ? static_cast<float>(static_cast<double>(OutMetrics.NumAir)
                 / static_cast<double>(OutMetrics.NumSampled))
             : 0.0f;
-        BuildPlayerFitMetrics(Grid, Settings, OutMetrics, &OutPlayerFitMask);
+        BuildPlayerFitMetrics(
+            Grid, Settings, OutMetrics, &OutPlayerFitMask,
+            &OutPlayerFitSupportHeights);
         OutMetrics.bValid = OutMetrics.NumSampled > 0;
     }
 
@@ -1951,7 +2232,9 @@ namespace VoxelStrateMeasurePrivate
         const FVector& B,
         const TArray<int32>& Path,
         FCoarseEdge& OutFailedEdge,
-        const TArray<uint8>* EligibilityMask = nullptr)
+        const TArray<uint8>* EligibilityMask = nullptr,
+        const TArray<float>* PlayerFitSupportHeights = nullptr,
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
     {
         OutFailedEdge = FCoarseEdge();
 
@@ -1971,6 +2254,20 @@ namespace VoxelStrateMeasurePrivate
                             Path[PathIndex - 1], Path[PathIndex]);
                     }
                     return false;
+                }
+                if (PathIndex > 0
+                    && PlayerFitSupportHeights != nullptr
+                    && TraversalSettings != nullptr)
+                {
+                    bool bClimb = false;
+                    if (!IsPlayerTraversalEdge(
+                            Grid, *EligibilityMask, PlayerFitSupportHeights,
+                            TraversalSettings, Path[PathIndex - 1], Path[PathIndex], bClimb))
+                    {
+                        OutFailedEdge = MakeCoarseEdge(
+                            Path[PathIndex - 1], Path[PathIndex]);
+                        return false;
+                    }
                 }
             }
             int32 StartX = 0;
@@ -2045,7 +2342,9 @@ namespace VoxelStrateMeasurePrivate
         int32 Goal,
         const TArray<FCoarseEdge>& BlockedEdges,
         TArray<int32>& OutPath,
-        const TArray<uint8>* EligibilityMask = nullptr)
+        const TArray<uint8>* EligibilityMask = nullptr,
+        const TArray<float>* PlayerFitSupportHeights = nullptr,
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
     {
         const auto IsEligible = [&, EligibilityMask](int32 Cell)
         {
@@ -2090,14 +2389,30 @@ namespace VoxelStrateMeasurePrivate
                 }
             };
 
-            // The order is fixed so the recovered route is deterministic. This is a real BFS
-            // parent chain, not just a component-membership answer.
-            if (X + 1 < Grid.NumX) Visit(Grid.Index(X + 1, Y, Z));
-            if (X > 0)            Visit(Grid.Index(X - 1, Y, Z));
-            if (Y + 1 < Grid.NumY) Visit(Grid.Index(X, Y + 1, Z));
-            if (Y > 0)             Visit(Grid.Index(X, Y - 1, Z));
-            if (Z + 1 < Grid.NumZ) Visit(Grid.Index(X, Y, Z + 1));
-            if (Z > 0)             Visit(Grid.Index(X, Y, Z - 1));
+            if (EligibilityMask != nullptr
+                && PlayerFitSupportHeights != nullptr
+                && TraversalSettings != nullptr)
+            {
+                TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
+                AppendPlayerTraversalNeighbours(
+                    Grid, *EligibilityMask, PlayerFitSupportHeights,
+                    TraversalSettings, Current, Neighbours);
+                for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
+                {
+                    Visit(Neighbour.Cell);
+                }
+            }
+            else
+            {
+                // The order is fixed so the recovered route is deterministic. This is a real BFS
+                // parent chain, not just a component-membership answer.
+                if (X + 1 < Grid.NumX) Visit(Grid.Index(X + 1, Y, Z));
+                if (X > 0)            Visit(Grid.Index(X - 1, Y, Z));
+                if (Y + 1 < Grid.NumY) Visit(Grid.Index(X, Y + 1, Z));
+                if (Y > 0)             Visit(Grid.Index(X, Y - 1, Z));
+                if (Z + 1 < Grid.NumZ) Visit(Grid.Index(X, Y, Z + 1));
+                if (Z > 0)             Visit(Grid.Index(X, Y, Z - 1));
+            }
         }
 
         if (Parent[Goal] == -2)
@@ -2137,7 +2452,9 @@ namespace VoxelStrateMeasurePrivate
         bool& bOutGoalSnapped,
         int32& OutNumRouteRetries,
         int32 MaxRouteRetries,
-        const TArray<uint8>* EligibilityMask = nullptr)
+        const TArray<uint8>* EligibilityMask = nullptr,
+        const TArray<float>* PlayerFitSupportHeights = nullptr,
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
     {
         OutStart = -1;
         OutGoal = -1;
@@ -2175,7 +2492,8 @@ namespace VoxelStrateMeasurePrivate
         for (;;)
         {
             if (!FindCoarsePath(
-                    Grid, OutStart, OutGoal, BlockedEdges, Path, EligibilityMask))
+                    Grid, OutStart, OutGoal, BlockedEdges, Path, EligibilityMask,
+                    PlayerFitSupportHeights, TraversalSettings))
             {
                 // This is a negative verdict only after all edges excluded by earlier
                 // full-resolution failures leave no coarse route at this resolution.
@@ -2188,7 +2506,7 @@ namespace VoxelStrateMeasurePrivate
             FCoarseEdge FailedEdge;
             if (FullResolutionPathIsAir(
                     Generator, Sampler, Grid, AVoxel, BVoxel, Path, FailedEdge,
-                    EligibilityMask))
+                    EligibilityMask, PlayerFitSupportHeights, TraversalSettings))
             {
                 return EVoxelConnectivityResult::Connected;
             }
@@ -2259,7 +2577,9 @@ namespace VoxelStrateMeasurePrivate
         FVoxelConnectivityDiagnostics& OutDiagnostics,
         const TArray<uint8>* EligibilityMask = nullptr,
         TArray<int32>* OutComponents = nullptr,
-        int32* OutNumComponents = nullptr)
+        int32* OutNumComponents = nullptr,
+        const TArray<float>* PlayerFitSupportHeights = nullptr,
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
     {
         OutDiagnostics = FVoxelConnectivityDiagnostics();
         if (OutComponents != nullptr)
@@ -2298,7 +2618,9 @@ namespace VoxelStrateMeasurePrivate
             LargestComponentLowestCell,
             NumComponentsAtLeast1Pct,
             nullptr,
-            EligibilityMask);
+            EligibilityMask,
+            PlayerFitSupportHeights,
+            TraversalSettings);
 
         if (OutComponents != nullptr)
         {
@@ -2449,6 +2771,7 @@ namespace VoxelStrateMeasurePrivate
         }
 
         TArray<uint8> PlayerFitMask;
+        TArray<float> PlayerFitSupportHeights;
         FVoxelStrateMetrics PlayerMetrics;
         if (bPlayerFitRestricted)
         {
@@ -2457,7 +2780,8 @@ namespace VoxelStrateMeasurePrivate
             // Manhattan feature transform here: those values belong to the separate legacy
             // measurement pass, and recomputing them for every fine candidate made the gate
             // needlessly expensive without changing its answer.
-            BuildPlayerFitConnectivityMetrics(Grid, Settings, PlayerMetrics, PlayerFitMask);
+            BuildPlayerFitConnectivityMetrics(
+                Grid, Settings, PlayerMetrics, PlayerFitMask, PlayerFitSupportHeights);
             if (OutPlayerMetrics != nullptr)
             {
                 *OutPlayerMetrics = PlayerMetrics;
@@ -2483,7 +2807,9 @@ namespace VoxelStrateMeasurePrivate
             bOutGoalSnapped,
             OutNumRouteRetries,
             Settings.MaxRouteRetries,
-            bPlayerFitRestricted ? &PlayerFitMask : nullptr);
+            bPlayerFitRestricted ? &PlayerFitMask : nullptr,
+            bPlayerFitRestricted ? &PlayerFitSupportHeights : nullptr,
+            bPlayerFitRestricted ? &Settings : nullptr);
         if (OutDiagnostics != nullptr)
         {
             PopulateConnectivityDiagnostics(
@@ -2495,7 +2821,11 @@ namespace VoxelStrateMeasurePrivate
                 bOutGoalSnapped,
                 OutNumRouteRetries,
                 *OutDiagnostics,
-                bPlayerFitRestricted ? &PlayerFitMask : nullptr);
+                bPlayerFitRestricted ? &PlayerFitMask : nullptr,
+                nullptr,
+                nullptr,
+                bPlayerFitRestricted ? &PlayerFitSupportHeights : nullptr,
+                bPlayerFitRestricted ? &Settings : nullptr);
             if (bPlayerFitRestricted &&
                 (Result == EVoxelConnectivityResult::StartCellNotPlayerFit
                  || Result == EVoxelConnectivityResult::GoalCellNotPlayerFit))
@@ -2526,30 +2856,20 @@ namespace VoxelStrateMeasurePrivate
         }
     }
 
-    bool IsEligiblePlayerFitCell(
-        const FSampleGrid& Grid,
-        const TArray<uint8>& PlayerFitMask,
-        int32 Cell)
-    {
-        return Cell >= 0
-            && Cell < Grid.CellCount
-            && Grid.Air[Cell] != 0u
-            && PlayerFitMask[Cell] != 0u;
-    }
-
     int32 CountPlayerFitNeighbours(
         const FSampleGrid& Grid,
         const TArray<uint8>& PlayerFitMask,
+        const TArray<float>* PlayerFitSupportHeights,
+        const FVoxelStrateMeasureSettings* Settings,
         int32 Cell)
     {
+        TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
+        AppendPlayerTraversalNeighbours(
+            Grid, PlayerFitMask, PlayerFitSupportHeights, Settings, Cell, Neighbours);
         int32 Count = 0;
-        for (int32 Direction = 0; Direction < 6; ++Direction)
+        for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
         {
-            if (IsEligiblePlayerFitCell(
-                    Grid, PlayerFitMask, GetSixNeighbour(Grid, Cell, Direction)))
-            {
-                ++Count;
-            }
+            ++Count;
         }
         return Count;
     }
@@ -2616,6 +2936,8 @@ namespace VoxelStrateMeasurePrivate
     void WalkPlayerFitGraph(
         const FSampleGrid& Grid,
         const TArray<uint8>& PlayerFitMask,
+        const TArray<float>* PlayerFitSupportHeights,
+        const FVoxelStrateMeasureSettings* TraversalSettings,
         int32 Start,
         int32 Goal,
         float NarrowGapThresholdVoxels,
@@ -2651,6 +2973,15 @@ namespace VoxelStrateMeasurePrivate
         auto RecordTraversal = [&](int32 From, int32 To)
         {
             ++InOutReport.AgentGraphTraversals;
+            bool bClimb = false;
+            if (PlayerFitSupportHeights != nullptr && TraversalSettings != nullptr
+                && IsPlayerTraversalEdge(
+                    Grid, PlayerFitMask, PlayerFitSupportHeights, TraversalSettings,
+                    From, To, bClimb)
+                && bClimb)
+            {
+                ++InOutReport.ClimbTraversals;
+            }
             auto IsNarrowCell = [&](int32 Cell)
             {
                 if (NarrowCell[Cell] == 255u)
@@ -2678,11 +3009,15 @@ namespace VoxelStrateMeasurePrivate
                 break;
             }
 
+            TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
+            AppendPlayerTraversalNeighbours(
+                Grid, PlayerFitMask, PlayerFitSupportHeights, TraversalSettings,
+                Current, Neighbours);
             bool bAdvanced = false;
-            while (NextDirection.Last() < 6)
+            while (NextDirection.Last() < Neighbours.Num())
             {
                 const int32 Direction = NextDirection.Last()++;
-                const int32 Neighbour = GetSixNeighbour(Grid, Current, Direction);
+                const int32 Neighbour = Neighbours[Direction].Cell;
                 if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, Neighbour)
                     || Visited[Neighbour] != 0u)
                 {
@@ -2706,7 +3041,9 @@ namespace VoxelStrateMeasurePrivate
             // A degree-one pose is an actual topological dead end. A higher-degree pose with all
             // branches already visited is merely a DFS backtrack through a loop/junction.
             if (Current != Start && Current != Goal
-                && CountPlayerFitNeighbours(Grid, PlayerFitMask, Current) <= 1)
+                && CountPlayerFitNeighbours(
+                    Grid, PlayerFitMask, PlayerFitSupportHeights,
+                    TraversalSettings, Current) <= 1)
             {
                 ++InOutReport.DeadEndsEncountered;
             }
@@ -3048,6 +3385,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     OutReport.CapsuleWidthMeters = 2.0f * OutReport.CapsuleRadiusMeters;
     OutReport.CapsuleHeightMeters = 2.0f * Settings.PlayerCapsuleHalfHeightVoxels
         * FVoxelPlayerCapsuleConstants::VoxelSizeMeters;
+    OutReport.bClimbingEnabled = Settings.bPlayerClimbingEnabled;
+    OutReport.MaxClimbHeightMeters = Settings.PlayerMaxClimbHeightMeters;
     OutReport.NarrowGapThresholdMeters = 1.5f * OutReport.CapsuleWidthMeters;
     OutReport.NarrowGapDefinition = TEXT(
         "widest axis-aligned horizontal air span at each traversed fit-graph cell");
@@ -3096,13 +3435,15 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     }
 
     TArray<uint8> PlayerFitMask;
+    TArray<float> PlayerFitSupportHeights;
     int64 NumPlayerFitCells = 0;
     if (!BuildPlayerFitMask(
             Grid,
             Settings,
             PlayerFitMask,
             NumPlayerFitCells,
-            RefusalReason))
+            RefusalReason,
+            &PlayerFitSupportHeights))
     {
         OutReport.RefusalReason = RefusalReason;
         return false;
@@ -3123,7 +3464,9 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         OutReport.bGoalSnapped,
         NumRouteRetries,
         Settings.MaxRouteRetries,
-        &PlayerFitMask);
+        &PlayerFitMask,
+        &PlayerFitSupportHeights,
+        &Settings);
 
     FVoxelConnectivityDiagnostics Diagnostics;
     TArray<int32> Components;
@@ -3139,7 +3482,9 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         Diagnostics,
         &PlayerFitMask,
         &Components,
-        &NumComponents);
+        &NumComponents,
+        &PlayerFitSupportHeights,
+        &Settings);
 
     OutReport.bValid = true;
     OutReport.Result = Result;
@@ -3177,6 +3522,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         WalkPlayerFitGraph(
             Grid,
             PlayerFitMask,
+            &PlayerFitSupportHeights,
+            &Settings,
             Start,
             Goal,
             NarrowGapThresholdVoxels,

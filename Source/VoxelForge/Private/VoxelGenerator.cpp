@@ -1540,11 +1540,30 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (bHaveTunnelCore)
             {
                 const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
+                if (TunnelCore.bRoomFloor)
+                {
+                    if (VoxelDensityProfile::AreCountersEnabled())
+                    {
+                        VoxelDensityProfile::AddCounter(
+                            VoxelDensityProfile::ECounter::TunnelRoomFloorBackstopFires);
+                    }
+                    // A tunnel that penetrates a room cannot reassert its own floor through the
+                    // room's floor. The morphology query marks only the finite room support band;
+                    // preserve it after the generic post-disturbance air backstop.
+                    Result = FMath::Min(
+                        Result,
+                        -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
+                }
                 // The swept capsule owns the relief profile, while this finite support band is
                 // the conservative post-disturbance backstop that keeps terrain modifiers from
                 // removing the only player support at a mouth or a narrow cross-section.
                 if (bTunnelSupportFloor)
                 {
+                    if (VoxelDensityProfile::AreCountersEnabled())
+                    {
+                        VoxelDensityProfile::AddCounter(
+                            VoxelDensityProfile::ECounter::TunnelSupportFloorBackstopFires);
+                    }
                     Result = FMath::Min(
                         Result,
                         -FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
@@ -2727,6 +2746,11 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // operator-stack path; its support band follows the same relieved swept floor.
         if (bTunnelSupportFloor)
         {
+            if (VoxelDensityProfile::AreCountersEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelSupportFloorBackstopFires);
+            }
             Density = FMath::Max(Density, FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
         }
         const float TunnelCoreSDF = (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)

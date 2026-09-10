@@ -223,6 +223,20 @@ struct FExploreArguments
     float BudgetMinutes = DefaultBudgetMinutes;
     bool bSurfaceRoughnessOverride = false;
     float SurfaceRoughness = 0.0f;
+    bool bTunnelFloorEnabledOverride = false;
+    int32 TunnelFloorEnabled = 1;
+    bool bTunnelFloorTerracingOverride = false;
+    int32 TunnelFloorTerracing = 1;
+    bool bTunnelFloorStepOverride = false;
+    float TunnelFloorStep = 0.0f;
+    bool bTunnelFloorMaxLedgeOverride = false;
+    float TunnelFloorMaxLedge = 0.0f;
+    bool bTunnelFloorGentleOverride = false;
+    float TunnelFloorGentle = 0.0f;
+    bool bTunnelFloorLedgesOverride = false;
+    int32 TunnelFloorLedges = 0;
+    bool bTunnelFloorMaxLedgesOverride = false;
+    int32 TunnelFloorMaxLedges = 0;
 
     FString CanonicalModes() const
     {
@@ -303,6 +317,41 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     const bool bSurfaceRoughnessParsed = FParse::Value(
         *Params, TEXT("surfaceroughness="), OutArguments.SurfaceRoughness);
     OutArguments.bSurfaceRoughnessOverride = bSurfaceRoughnessSpecified;
+    const bool bTunnelFloorEnabledSpecified = Params.Contains(
+        TEXT("tunnelfloor="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorEnabledParsed = FParse::Value(
+        *Params, TEXT("tunnelfloor="), OutArguments.TunnelFloorEnabled);
+    OutArguments.bTunnelFloorEnabledOverride = bTunnelFloorEnabledSpecified;
+    const bool bTunnelFloorTerracingSpecified = Params.Contains(
+        TEXT("tunnelfloorterracing="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorTerracingParsed = FParse::Value(
+        *Params, TEXT("tunnelfloorterracing="), OutArguments.TunnelFloorTerracing);
+    OutArguments.bTunnelFloorTerracingOverride = bTunnelFloorTerracingSpecified;
+    const bool bTunnelFloorStepSpecified = Params.Contains(
+        TEXT("tunnelfloorstep="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorStepParsed = FParse::Value(
+        *Params, TEXT("tunnelfloorstep="), OutArguments.TunnelFloorStep);
+    OutArguments.bTunnelFloorStepOverride = bTunnelFloorStepSpecified;
+    const bool bTunnelFloorMaxLedgeSpecified = Params.Contains(
+        TEXT("tunnelfloormaxledge="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorMaxLedgeParsed = FParse::Value(
+        *Params, TEXT("tunnelfloormaxledge="), OutArguments.TunnelFloorMaxLedge);
+    OutArguments.bTunnelFloorMaxLedgeOverride = bTunnelFloorMaxLedgeSpecified;
+    const bool bTunnelFloorGentleSpecified = Params.Contains(
+        TEXT("tunnelfloorgentle="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorGentleParsed = FParse::Value(
+        *Params, TEXT("tunnelfloorgentle="), OutArguments.TunnelFloorGentle);
+    OutArguments.bTunnelFloorGentleOverride = bTunnelFloorGentleSpecified;
+    const bool bTunnelFloorLedgesSpecified = Params.Contains(
+        TEXT("tunnelfloorledges="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorLedgesParsed = FParse::Value(
+        *Params, TEXT("tunnelfloorledges="), OutArguments.TunnelFloorLedges);
+    OutArguments.bTunnelFloorLedgesOverride = bTunnelFloorLedgesSpecified;
+    const bool bTunnelFloorMaxLedgesSpecified = Params.Contains(
+        TEXT("tunnelfloormaxledges="), ESearchCase::IgnoreCase);
+    const bool bTunnelFloorMaxLedgesParsed = FParse::Value(
+        *Params, TEXT("tunnelfloormaxledges="), OutArguments.TunnelFloorMaxLedges);
+    OutArguments.bTunnelFloorMaxLedgesOverride = bTunnelFloorMaxLedgesSpecified;
     int32 FailureFocusRender = 0;
     FParse::Value(*Params, TEXT("failurefocus="), FailureFocusRender);
     OutArguments.bFailureFocusRender = FailureFocusRender != 0;
@@ -437,6 +486,62 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
             || OutArguments.SurfaceRoughness < 0.0f))
     {
         OutError = TEXT("surfaceroughness must be finite and greater than or equal to zero.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorEnabledOverride
+        && (!bTunnelFloorEnabledParsed
+            || (OutArguments.TunnelFloorEnabled != 0
+                && OutArguments.TunnelFloorEnabled != 1)))
+    {
+        OutError = TEXT("tunnelfloor must be 0 or 1.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorTerracingOverride
+        && (!bTunnelFloorTerracingParsed
+            || (OutArguments.TunnelFloorTerracing != 0
+                && OutArguments.TunnelFloorTerracing != 1)))
+    {
+        OutError = TEXT("tunnelfloorterracing must be 0 or 1.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorStepOverride
+        && (!bTunnelFloorStepParsed
+            || !FMath::IsFinite(OutArguments.TunnelFloorStep)
+            || OutArguments.TunnelFloorStep < 0.0f))
+    {
+        OutError = TEXT("tunnelfloorstep must be finite and non-negative.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorMaxLedgeOverride
+        && (!bTunnelFloorMaxLedgeParsed
+            || !FMath::IsFinite(OutArguments.TunnelFloorMaxLedge)
+            || OutArguments.TunnelFloorMaxLedge <= 0.0f))
+    {
+        OutError = TEXT("tunnelfloormaxledge must be finite and greater than zero.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorGentleOverride
+        && (!bTunnelFloorGentleParsed
+            || !FMath::IsFinite(OutArguments.TunnelFloorGentle)
+            || OutArguments.TunnelFloorGentle < 0.0f))
+    {
+        OutError = TEXT("tunnelfloorgentle must be finite and non-negative.");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorLedgesOverride
+        && (!bTunnelFloorLedgesParsed
+            || OutArguments.TunnelFloorLedges < 0
+            || OutArguments.TunnelFloorLedges > 4096))
+    {
+        OutError = TEXT("tunnelfloorledges must be an integer in [0,4096].");
+        return false;
+    }
+    if (OutArguments.bTunnelFloorMaxLedgesOverride
+        && (!bTunnelFloorMaxLedgesParsed
+            || OutArguments.TunnelFloorMaxLedges < 1
+            || OutArguments.TunnelFloorMaxLedges > 4096))
+    {
+        OutError = TEXT("tunnelfloormaxledges must be an integer in [1,4096].");
         return false;
     }
 
@@ -710,6 +815,40 @@ struct FExploreWorld
                 Target.Definition->GenerationParams.SurfaceRoughness = Arguments.SurfaceRoughness;
                 break;
             }
+        }
+        // Floor controls are applied only to the requested target definition.  They are
+        // commandlet overrides for measured archetype comparisons; authored assets still carry
+        // the defaults/rolled values in FStrateGenerationParams.
+        FStrateGenerationParams& TargetTunnelParams = Target.Definition->GenerationParams;
+        if (Arguments.bTunnelFloorEnabledOverride)
+        {
+            TargetTunnelParams.bTunnelFloorEnabled =
+                Arguments.TunnelFloorEnabled != 0;
+        }
+        if (Arguments.bTunnelFloorTerracingOverride)
+        {
+            TargetTunnelParams.bTunnelFloorTerracingEnabled =
+                Arguments.TunnelFloorTerracing != 0;
+        }
+        if (Arguments.bTunnelFloorStepOverride)
+        {
+            TargetTunnelParams.TunnelFloorTerraceStepHeight = Arguments.TunnelFloorStep;
+        }
+        if (Arguments.bTunnelFloorMaxLedgeOverride)
+        {
+            TargetTunnelParams.TunnelFloorMaxLedgeHeight = Arguments.TunnelFloorMaxLedge;
+        }
+        if (Arguments.bTunnelFloorGentleOverride)
+        {
+            TargetTunnelParams.TunnelFloorGentleSlopeThreshold = Arguments.TunnelFloorGentle;
+        }
+        if (Arguments.bTunnelFloorLedgesOverride)
+        {
+            TargetTunnelParams.TunnelFloorLedgeCountPreference = Arguments.TunnelFloorLedges;
+        }
+        if (Arguments.bTunnelFloorMaxLedgesOverride)
+        {
+            TargetTunnelParams.TunnelFloorMaxLedges = Arguments.TunnelFloorMaxLedges;
         }
         TargetBottomWorldZ = Target.BottomChunkZ * CHUNK_SIZE;
         TargetTopWorldZ = (Target.TopChunkZ + 1) * CHUNK_SIZE;
@@ -3615,6 +3754,52 @@ void WriteSurfaceReliefMetrics(
     Writer.WriteObjectEnd();
 }
 
+void WriteTunnelFloorOverrides(
+    FExploreJsonWriter& Writer,
+    const FExploreArguments& Arguments)
+{
+    Writer.WriteObjectStart(TEXT("tunnel_floor_overrides"));
+    Writer.WriteValue(TEXT("enabled_override"), Arguments.bTunnelFloorEnabledOverride);
+    if (Arguments.bTunnelFloorEnabledOverride)
+    {
+        Writer.WriteValue(TEXT("enabled"), Arguments.TunnelFloorEnabled != 0);
+    }
+    Writer.WriteValue(TEXT("terracing_override"), Arguments.bTunnelFloorTerracingOverride);
+    if (Arguments.bTunnelFloorTerracingOverride)
+    {
+        Writer.WriteValue(TEXT("terracing"), Arguments.TunnelFloorTerracing != 0);
+    }
+    Writer.WriteValue(TEXT("step_height_override"), Arguments.bTunnelFloorStepOverride);
+    if (Arguments.bTunnelFloorStepOverride)
+    {
+        Writer.WriteValue(TEXT("step_height_voxels"),
+            static_cast<double>(Arguments.TunnelFloorStep));
+    }
+    Writer.WriteValue(TEXT("max_ledge_height_override"), Arguments.bTunnelFloorMaxLedgeOverride);
+    if (Arguments.bTunnelFloorMaxLedgeOverride)
+    {
+        Writer.WriteValue(TEXT("max_ledge_height_voxels"),
+            static_cast<double>(Arguments.TunnelFloorMaxLedge));
+    }
+    Writer.WriteValue(TEXT("gentle_slope_override"), Arguments.bTunnelFloorGentleOverride);
+    if (Arguments.bTunnelFloorGentleOverride)
+    {
+        Writer.WriteValue(TEXT("gentle_slope"),
+            static_cast<double>(Arguments.TunnelFloorGentle));
+    }
+    Writer.WriteValue(TEXT("ledge_count_override"), Arguments.bTunnelFloorLedgesOverride);
+    if (Arguments.bTunnelFloorLedgesOverride)
+    {
+        Writer.WriteValue(TEXT("ledge_count"), Arguments.TunnelFloorLedges);
+    }
+    Writer.WriteValue(TEXT("max_ledges_override"), Arguments.bTunnelFloorMaxLedgesOverride);
+    if (Arguments.bTunnelFloorMaxLedgesOverride)
+    {
+        Writer.WriteValue(TEXT("max_ledges"), Arguments.TunnelFloorMaxLedges);
+    }
+    Writer.WriteObjectEnd();
+}
+
 FString BuildManifestJson(
     const FExploreArguments& Arguments,
     const FExploreExportOutput& Export)
@@ -3623,7 +3808,7 @@ FString BuildManifestJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 4);
+    Writer->WriteValue(TEXT("schema_version"), 6);
     Writer->WriteValue(TEXT("format"), TEXT("OBJ"));
     Writer->WriteValue(TEXT("mesh_file"), Export.MeshFileName);
     Writer->WriteValue(TEXT("mesh_positions_units"), TEXT("metres"));
@@ -3650,6 +3835,7 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
+    WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
@@ -3842,6 +4028,8 @@ void WritePlayerDimensions(FExploreJsonWriter& Writer, const TCHAR* Key)
     Writer.WriteValue(TEXT("capsule_half_height_m"), static_cast<double>(FVoxelPlayerCapsuleConstants::HalfHeightCentimeters) / 100.0);
     Writer.WriteValue(TEXT("capsule_height_m"), static_cast<double>(2.0f * FVoxelPlayerCapsuleConstants::HalfHeightCentimeters) / 100.0);
     Writer.WriteValue(TEXT("max_step_height_m"), static_cast<double>(FVoxelPlayerCapsuleConstants::MaxStepHeightMeters));
+    Writer.WriteValue(TEXT("climbing_enabled"), true);
+    Writer.WriteValue(TEXT("max_climb_height_m"), 3.0);
     Writer.WriteValue(TEXT("walkable_floor_angle_degrees"), static_cast<double>(FVoxelPlayerCapsuleConstants::WalkableFloorAngleDegrees));
     Writer.WriteObjectEnd();
 }
@@ -3855,9 +4043,9 @@ FString BuildExploreJson(
 {
     FString Json;
     TSharedRef<FExploreJsonWriter> Writer =
-        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
+    TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 4);
+    Writer->WriteValue(TEXT("schema_version"), 6);
     Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
     Writer->WriteValue(TEXT("read_only_generation"), true);
 
@@ -3866,6 +4054,7 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
+    WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
@@ -4072,7 +4261,7 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("refusal_or_error"), Output.Walk.RefusalReason);
         Writer->WriteValue(TEXT("window_policy"), Output.Walk.WindowPolicy);
         Writer->WriteValue(TEXT("agent_policy"), TEXT(
-            "fixed-order depth-first walk over the exact VF player-fit six-neighbour graph; stop at departure"));
+            "fixed-order depth-first walk over the exact VF player-fit graph; six-neighbour movement plus supported climb edges; stop at departure"));
         Writer->WriteValue(TEXT("player_fit_volume_scope"), TEXT(
             "bounded fitted route window; WorldRadiusVoxels=0 has no finite whole-world volume"));
         Writer->WriteValue(TEXT("max_cells_cap"), Arguments.MaxWalkCells);
@@ -4119,6 +4308,8 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("start_snapped"), Report.bStartSnapped);
         Writer->WriteValue(TEXT("goal_snapped"), Report.bGoalSnapped);
         Writer->WriteValue(TEXT("route_retries"), Report.NumRouteRetries);
+        Writer->WriteValue(TEXT("climbing_enabled"), Report.bClimbingEnabled);
+        Writer->WriteValue(TEXT("max_climb_height_m"), static_cast<double>(Report.MaxClimbHeightMeters));
         Writer->WriteValue(TEXT("player_fit_volume_cells"), Report.PlayerFitVolumeCells);
         Writer->WriteValue(TEXT("reachable_player_fit_cells"), Report.ReachablePlayerFitCells);
         Writer->WriteValue(TEXT("reachable_player_fit_fraction"), static_cast<double>(Report.ReachablePlayerFitFraction));
@@ -4133,6 +4324,7 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("sampled_min_y"), static_cast<double>(Report.SampledMinY));
         Writer->WriteValue(TEXT("sampled_max_y_exclusive"), static_cast<double>(Report.SampledMaxY));
         Writer->WriteValue(TEXT("agent_graph_traversals"), Report.AgentGraphTraversals);
+        Writer->WriteValue(TEXT("climb_traversals"), Report.ClimbTraversals);
         Writer->WriteValue(TEXT("distance_travelled_m"), static_cast<double>(Report.DistanceTravelledMeters));
         Writer->WriteValue(TEXT("straight_line_m"), static_cast<double>(Report.StraightLineMeters));
         Writer->WriteValue(TEXT("tortuosity"), static_cast<double>(Report.Tortuosity));
@@ -5668,6 +5860,12 @@ bool BuildBatchCaseParams(
     JsonBool(Case, TEXT("op_bounds"), bOpBounds);
     bool bFailureFocus = false;
     JsonBool(Case, TEXT("failure_focus_render"), bFailureFocus);
+    bool bTunnelFloorEnabled = true;
+    const bool bHasTunnelFloorEnabled = JsonBool(
+        Case, TEXT("tunnel_floor_enabled"), bTunnelFloorEnabled);
+    bool bTunnelFloorTerracing = true;
+    const bool bHasTunnelFloorTerracing = JsonBool(
+        Case, TEXT("tunnel_floor_terracing"), bTunnelFloorTerracing);
 
     OutParams = FString::Printf(
         TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
@@ -5678,6 +5876,17 @@ bool BuildBatchCaseParams(
         ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0,
         bBlockEarlyOut ? 1 : 0, MeshMinBatchSize,
         bFailureFocus ? 1 : 0, *CaseOutDirectory);
+
+    if (bHasTunnelFloorEnabled)
+    {
+        OutParams += FString::Printf(
+            TEXT(" -tunnelfloor=%d"), bTunnelFloorEnabled ? 1 : 0);
+    }
+    if (bHasTunnelFloorTerracing)
+    {
+        OutParams += FString::Printf(
+            TEXT(" -tunnelfloorterracing=%d"), bTunnelFloorTerracing ? 1 : 0);
+    }
 
     if (bProfileDensity)
     {
@@ -5711,12 +5920,28 @@ bool BuildBatchCaseParams(
         { TEXT("render_step"), TEXT("renderstep") },
         { TEXT("render_max_distance"), TEXT("rendermaxdistance") },
         { TEXT("surface_roughness"), TEXT("surfaceroughness") },
+        { TEXT("tunnel_floor_step_height"), TEXT("tunnelfloorstep") },
+        { TEXT("tunnel_floor_max_ledge_height"), TEXT("tunnelfloormaxledge") },
+        { TEXT("tunnel_floor_gentle_slope"), TEXT("tunnelfloorgentle") },
     };
     for (const auto& Field : FloatFields)
     {
         if (JsonNumber(Case, Field.Key, Number))
         {
             OutParams += FString::Printf(TEXT(" -%s=%.9g"), Field.Value, Number);
+        }
+    }
+
+    const TPair<const TCHAR*, const TCHAR*> IntegerFloorFields[] = {
+        { TEXT("tunnel_floor_ledge_count"), TEXT("tunnelfloorledges") },
+        { TEXT("tunnel_floor_max_ledges"), TEXT("tunnelfloormaxledges") },
+    };
+    for (const auto& Field : IntegerFloorFields)
+    {
+        if (JsonNumber(Case, Field.Key, Number))
+        {
+            OutParams += FString::Printf(TEXT(" -%s=%d"),
+                Field.Value, FMath::RoundToInt(Number));
         }
     }
 

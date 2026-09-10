@@ -621,6 +621,18 @@ struct FCachedRoomFloorJoin
     float BoundRadiusSq = 0.0f;
 };
 
+// One immutable floor segment authored while the tunnel chain is built. NumSteps == 0 is a
+// continuous segment; a positive value quantizes the interpolation to that many whole-chain
+// ledge intervals. ReliefScale is baked with the same derivative bound as the old evaluator, so
+// evaluation only reads this profile and never decides terrace count per voxel.
+struct FTunnelFloorSegmentProfile
+{
+    float StartFloorZ = 0.0f;
+    float EndFloorZ = 0.0f;
+    float ReliefScale = 0.0f;
+    int32 NumSteps = 0;
+};
+
 // A pre-computed wandering tunnel chain — all connection decisions and hash-derived properties
 // (radii, Z offsets, control points) are resolved during cache build.
 struct FCachedTunnel
@@ -640,11 +652,43 @@ struct FCachedTunnel
     // turning a gentle authored floor ramp into a vertical break when the cave warp is nonlinear.
     TArray<FVector> WorldControlPoints;
     TArray<float> WorldControlRadii;
+    // Build-time floor authoring. SDF and world chains each keep their own profile because cave
+    // warp changes the control-point Z values. The normal path has one entry per chain segment;
+    // malformed/legacy caches fall back to the old local evaluator.
+    TArray<FTunnelFloorSegmentProfile> FloorProfiles;
+    TArray<FTunnelFloorSegmentProfile> WorldFloorProfiles;
     // The corridor floor is a swept SmoothMax cut, not a later slab.  These are copied from the
     // same strate fields used by room floors; the seed is derived once from the tunnel pair hash.
     float FloorReliefStrength = 0.0f;
     float FloorReliefFrequency = 0.015f;
     uint32 FloorSeed = 0;
+    // Only the two rooms that actually form this edge may own its mouth floor. A nearby unrelated
+    // room must not clip a tunnel merely because the two shapes overlap in a crowded graph.
+    bool bHasFloorRoomOwnership = false;
+    uint32 FloorRoomHashA = 0;
+    uint32 FloorRoomHashB = 0;
+    // World-space mouth ownership is resolved from the baked chain, not by comparing a warped
+    // query against an SDF-space room. These values make the post-disturbance hand-off exact in
+    // the same coordinate space in which the player and the support backstop are evaluated.
+    // The room's full radius is deliberately not used as the ownership region.  A tunnel's
+    // floor should hand off to the room over a short mouth apron, not overwrite the room floor
+    // across the entire chamber.  These are the build-time capped hand-off radii in both query
+    // coordinate spaces.
+    float SDFMouthBlendRadiusA = 0.0f;
+    float SDFMouthBlendRadiusB = 0.0f;
+    float WorldMouthBlendRadiusA = 0.0f;
+    float WorldMouthBlendRadiusB = 0.0f;
+    float SDFMouthFloorZA = -FLT_MAX;
+    float SDFMouthFloorZB = -FLT_MAX;
+    float WorldMouthFloorZA = -FLT_MAX;
+    float WorldMouthFloorZB = -FLT_MAX;
+    bool bTunnelFloorEnabled = true;
+    bool bTunnelFloorTerracingEnabled = true;
+    float TunnelFloorTerraceStepHeight = 1.71f;
+    float TunnelFloorMaxLedgeHeight = 12.0f;
+    float TunnelFloorGentleSlopeThreshold = 0.9656888f;
+    int32 TunnelFloorLedgeCountPreference = 0;
+    int32 TunnelFloorMaxLedges = 4096;
     FVector WorldBoundCenter = FVector::ZeroVector;
     float WorldBoundRadiusSq = 0.0f;
     // Centerline AABBs and scalar influence radii used by the immutable broad phase.  The
@@ -794,6 +838,9 @@ struct FTunnelCoreWorldEvaluation
 {
     float SDF = FLT_MAX;
     bool bSupportFloor = false;
+    // The room floor owns the overlap band. The common post uses this marker to restore
+    // the room's support after the raw tunnel-air backstop has run.
+    bool bRoomFloor = false;
 };
 
 //=============================================================================

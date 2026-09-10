@@ -283,6 +283,13 @@ enum class EVoxelStrateTransition : uint8
     LERPF(TunnelHorizontalBias) \
     SNAPF(bTunnelsFlowTowardOrigin) \
     LERPF(TunnelEndpointZOffset) \
+    SNAPF(bTunnelFloorEnabled) \
+    SNAPF(bTunnelFloorTerracingEnabled) \
+    LERPF(TunnelFloorTerraceStepHeight) \
+    LERPF(TunnelFloorMaxLedgeHeight) \
+    LERPF(TunnelFloorGentleSlopeThreshold) \
+    SNAPF(TunnelFloorLedgeCountPreference) \
+    SNAPF(TunnelFloorMaxLedges) \
     LERPF(SDFBlendRadius) \
     LERPF(WaterLevelRelative) \
     /* Cave warp */ \
@@ -658,6 +665,55 @@ struct VOXELFORGE_API FStrateGenerationParams
     //   1.0 → strongest interior vertical variation
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float TunnelEndpointZOffset = 0.25f;
+
+    // ===== TUNNEL FLOOR AUTHORING =====
+    //
+    // The corridor floor is authored into the swept tunnel during cache construction. These
+    // controls are intentionally separate from FCaveTerraceMod::TerraceStepHeight: that field
+    // terraces walls after morphology, while these fields describe the tunnel's own floor profile.
+    // FloorReliefStrength/Frequency above are shared with room floors and are reused here.
+
+    // Whether the swept tunnel receives its authored floor cut. Disable only for an archetype that
+    // deliberately wants the bare capsule; the structural support backstop remains a measured
+    // fallback for malformed/legacy caches and is not a replacement for this shape.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor")
+    bool bTunnelFloorEnabled = true;
+
+    // Enables the floor profile's terrace decisions. With the default legacy ledge preference of
+    // zero, this preserves the existing per-segment walkable staircase. A positive preference
+    // selects the build-time whole-chain ledge policy.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor")
+    bool bTunnelFloorTerracingEnabled = true;
+
+    // Maximum riser height used by the compatibility/per-segment profile, in voxels. The default
+    // is the previous 1.8 voxel step with its 0.95 safety margin (1.71 voxels).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
+        meta = (ClampMin = "0.0"))
+    float TunnelFloorTerraceStepHeight = 1.71f;
+
+    // Maximum height of one authored ledge in the whole-chain profile, in voxels. This may exceed
+    // the walking step because ledges are climbable surfaces under the measurement envelope.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
+        meta = (ClampMin = "0.0"))
+    float TunnelFloorMaxLedgeHeight = 12.0f;
+
+    // Whole-chain floor gradient below which the tunnel descends continuously instead of placing
+    // ledges. The default is tan(44 degrees), matching the walkable-floor bound.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
+        meta = (ClampMin = "0.0"))
+    float TunnelFloorGentleSlopeThreshold = 0.9656888f;
+
+    // Preferred number of large ledges for a steep whole-chain floor. Zero is the compatibility
+    // mode (the old per-segment step-count rule); positive values request that many transitions,
+    // subject to the max-height and available control-segment constraints.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
+        meta = (ClampMin = "0", ClampMax = "32"))
+    int32 TunnelFloorLedgeCountPreference = 0;
+
+    // Safety bound on the number of transitions emitted by either floor profile.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
+        meta = (ClampMin = "1", ClampMax = "4096"))
+    int32 TunnelFloorMaxLedges = 4096;
 
     // ===== SDF BLEND (junction smoothness) =====
 

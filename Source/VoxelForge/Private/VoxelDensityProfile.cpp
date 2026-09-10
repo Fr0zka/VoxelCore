@@ -414,6 +414,11 @@ namespace VoxelDensityProfile
         case ECounter::TunnelSupportColumnCandidates:return TEXT("TunnelSupportColumnCandidates");
         case ECounter::TunnelSupportFloorQueries:return TEXT("TunnelSupportFloorQueries");
         case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
+        case ECounter::TunnelSupportFloorBackstopFires:return TEXT("TunnelSupportFloorBackstopFires");
+        case ECounter::TunnelRoomFloorBackstopFires:return TEXT("TunnelRoomFloorBackstopFires");
+        case ECounter::TunnelFloorProfileBuilds:return TEXT("TunnelFloorProfileBuilds");
+        case ECounter::TunnelFloorProfileSegments:return TEXT("TunnelFloorProfileSegments");
+        case ECounter::TunnelFloorProfileLedges:return TEXT("TunnelFloorProfileLedges");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");

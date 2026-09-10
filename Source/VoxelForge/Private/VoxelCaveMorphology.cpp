@@ -90,6 +90,11 @@ namespace
     // is only used to skip a floor evaluation when the existing SmoothMax is provably the identity;
     // it never changes a value that could affect the isosurface.
     constexpr float VF_FloorReliefNoiseAbsBound = 1.01f;
+    // A room owns a short, build-authored mouth apron.  The full room radius is intentionally
+    // not used here: doing so lets a centre-to-centre tunnel floor overwrite the room floor far
+    // inside the chamber and recreates the broad raised shelf this hand-off is meant to remove.
+    constexpr float VF_TunnelMouthBlendRadiusVoxels =
+        VoxelPassageGeometry::WalkableTunnelLandingApronVoxels;
 
     enum class EVFFloorReliefFeature : uint8
     {
@@ -443,6 +448,326 @@ namespace
             0.0f, VF_MaxTunnelFloorReliefScale);
     }
 
+    FORCEINLINE float VF_TunnelFloorReliefScaleForGradient(
+        const FVector& A, const FVector& B,
+        int32 SegmentIndex, int32 NumSegments,
+        const FCachedTunnel& Tunnel,
+        float BaseGradient, bool bTerraced)
+    {
+        if (bTerraced
+            || !(Tunnel.FloorReliefStrength > 0.0f)
+            || !FMath::IsFinite(Tunnel.FloorReliefStrength)
+            || !FMath::IsFinite(Tunnel.FloorReliefFrequency))
+        {
+            return 0.0f;
+        }
+
+        const float HorizontalRun = FVector2D(
+            static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
+        if (!(HorizontalRun > KINDA_SMALL_NUMBER)
+            || !FMath::IsFinite(BaseGradient)
+            || BaseGradient < 0.0f)
+        {
+            return 0.0f;
+        }
+
+        const float AvailableGradient =
+            VoxelPassageGeometry::PlayerWalkableFloorMaxGradient - BaseGradient;
+        if (!(AvailableGradient > 0.0f))
+        {
+            return 0.0f;
+        }
+
+        const float Frequency = FMath::Abs(Tunnel.FloorReliefFrequency);
+        const float Amplitude = FMath::Abs(Tunnel.FloorReliefStrength)
+            * VOXEL_NOISE_SCALE;
+        const float OctaveFrequencyWeight = 0.65f + 0.35f * 2.3f;
+        const float NoiseGradientBound =
+            1.4142135623730951f * VF_Perlin2DPartialAbsBound
+            * OctaveFrequencyWeight * Frequency * Amplitude;
+        const int32 LandingEnvelopeCount = (SegmentIndex == 0 ? 1 : 0)
+            + (SegmentIndex + 1 == NumSegments ? 1 : 0);
+        const float EnvelopeDerivativeBound = LandingEnvelopeCount > 0
+            ? (1.5f * static_cast<float>(LandingEnvelopeCount)
+                / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels)
+                * Amplitude
+            : 0.0f;
+        const float ReliefGradientBound = NoiseGradientBound
+            + EnvelopeDerivativeBound;
+        if (!(ReliefGradientBound > KINDA_SMALL_NUMBER)
+            || !FMath::IsFinite(ReliefGradientBound))
+        {
+            return 0.0f;
+        }
+
+        return FMath::Clamp(
+            FMath::Min(
+                VF_MaxTunnelFloorReliefScale,
+                AvailableGradient / ReliefGradientBound),
+            0.0f, VF_MaxTunnelFloorReliefScale);
+    }
+
+    static void VF_BuildTunnelFloorProfile(
+        const TArray<FVector>& ControlPoints,
+        const TArray<float>& ControlRadii,
+        const FCachedTunnel& Tunnel,
+        TArray<FTunnelFloorSegmentProfile>& OutProfiles)
+    {
+        OutProfiles.Reset();
+        if (ControlPoints.Num() < 2
+            || ControlRadii.Num() != ControlPoints.Num())
+        {
+            return;
+        }
+
+        const int32 NumSegments = ControlPoints.Num() - 1;
+        OutProfiles.SetNum(NumSegments);
+        TArray<float, TInlineAllocator<16>> FloorAtControl;
+        FloorAtControl.SetNum(ControlPoints.Num());
+        for (int32 Index = 0; Index < ControlPoints.Num(); ++Index)
+        {
+            FloorAtControl[Index] = VoxelPassageGeometry::TunnelFloorZ(
+                ControlPoints[Index], FMath::Abs(ControlRadii[Index]));
+        }
+
+        const float GentleThreshold = FMath::IsFinite(
+                Tunnel.TunnelFloorGentleSlopeThreshold)
+            ? FMath::Max(Tunnel.TunnelFloorGentleSlopeThreshold, 0.0f)
+            : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
+        const float LegacyStepHeight = FMath::IsFinite(
+                Tunnel.TunnelFloorTerraceStepHeight)
+            ? FMath::Max(Tunnel.TunnelFloorTerraceStepHeight, 0.0f)
+            : 0.0f;
+        const int32 MaxLedges = FMath::Clamp(
+            Tunnel.TunnelFloorMaxLedges, 1, 4096);
+        const int32 PreferredLedges = FMath::Max(
+            Tunnel.TunnelFloorLedgeCountPreference, 0);
+
+        bool bGlobalTerrace = false;
+        int32 GlobalLedgeCount = 0;
+        if (Tunnel.bTunnelFloorTerracingEnabled && PreferredLedges > 0)
+        {
+            float TotalHorizontalRun = 0.0f;
+            for (int32 SegmentIndex = 0; SegmentIndex < NumSegments; ++SegmentIndex)
+            {
+                TotalHorizontalRun += FVector2D(
+                    static_cast<float>(ControlPoints[SegmentIndex + 1].X
+                        - ControlPoints[SegmentIndex].X),
+                    static_cast<float>(ControlPoints[SegmentIndex + 1].Y
+                        - ControlPoints[SegmentIndex].Y)).Size();
+            }
+            const float TotalFloorDelta = FMath::Abs(
+                FloorAtControl.Last() - FloorAtControl[0]);
+            bGlobalTerrace = TotalHorizontalRun > KINDA_SMALL_NUMBER
+                && TotalFloorDelta > TotalHorizontalRun * GentleThreshold;
+            if (bGlobalTerrace)
+            {
+                const float MaxLedgeHeight = FMath::IsFinite(
+                        Tunnel.TunnelFloorMaxLedgeHeight)
+                    ? FMath::Max(Tunnel.TunnelFloorMaxLedgeHeight, KINDA_SMALL_NUMBER)
+                    : KINDA_SMALL_NUMBER;
+                const int32 HeightDrivenCount = FMath::CeilToInt(
+                    TotalFloorDelta / MaxLedgeHeight);
+                GlobalLedgeCount = FMath::Clamp(
+                    FMath::Max(PreferredLedges, HeightDrivenCount),
+                    1, FMath::Min(MaxLedges, NumSegments));
+            }
+        }
+
+        for (int32 SegmentIndex = 0; SegmentIndex < NumSegments; ++SegmentIndex)
+        {
+            FTunnelFloorSegmentProfile& Profile = OutProfiles[SegmentIndex];
+            const FVector& A = ControlPoints[SegmentIndex];
+            const FVector& B = ControlPoints[SegmentIndex + 1];
+            const float FloorA = FloorAtControl[SegmentIndex];
+            const float FloorB = FloorAtControl[SegmentIndex + 1];
+            const float HorizontalRun = FVector2D(
+                static_cast<float>(B.X - A.X),
+                static_cast<float>(B.Y - A.Y)).Size();
+            Profile.StartFloorZ = FloorA;
+            Profile.EndFloorZ = FloorB;
+            Profile.NumSteps = 0;
+
+            if (bGlobalTerrace && GlobalLedgeCount > 0)
+            {
+                // Place at most one transition at a control-point boundary. Rounding the
+                // normalized control index distributes the few requested ledges over the full
+                // chain and, because the count is capped by NumSegments, never skips a level.
+                const int32 StartLevel = FMath::RoundToInt(
+                    static_cast<float>(SegmentIndex * GlobalLedgeCount)
+                        / static_cast<float>(NumSegments));
+                const int32 EndLevel = FMath::RoundToInt(
+                    static_cast<float>((SegmentIndex + 1) * GlobalLedgeCount)
+                        / static_cast<float>(NumSegments));
+                const float TotalDelta = FloorAtControl.Last() - FloorAtControl[0];
+                Profile.StartFloorZ = FloorAtControl[0]
+                    + TotalDelta * static_cast<float>(StartLevel)
+                        / static_cast<float>(GlobalLedgeCount);
+                Profile.EndFloorZ = FloorAtControl[0]
+                    + TotalDelta * static_cast<float>(EndLevel)
+                        / static_cast<float>(GlobalLedgeCount);
+                Profile.NumSteps = EndLevel > StartLevel ? 1 : 0;
+            }
+            else if (Tunnel.bTunnelFloorTerracingEnabled
+                && PreferredLedges == 0
+                && HorizontalRun > KINDA_SMALL_NUMBER
+                && LegacyStepHeight > KINDA_SMALL_NUMBER
+                && FMath::Abs(FloorB - FloorA)
+                    > HorizontalRun * GentleThreshold)
+            {
+                Profile.NumSteps = FMath::Clamp(
+                    FMath::CeilToInt(FMath::Abs(FloorB - FloorA)
+                        / LegacyStepHeight),
+                    1, MaxLedges);
+            }
+
+            const bool bTransition = Profile.NumSteps > 0
+                && !FMath::IsNearlyEqual(Profile.StartFloorZ, Profile.EndFloorZ);
+            const float ProfileGradient = (!bTransition && HorizontalRun > KINDA_SMALL_NUMBER)
+                ? FMath::Abs(Profile.EndFloorZ - Profile.StartFloorZ) / HorizontalRun
+                : 0.0f;
+            Profile.ReliefScale = VF_TunnelFloorReliefScaleForGradient(
+                A, B, SegmentIndex, NumSegments, Tunnel,
+                ProfileGradient, bTransition);
+        }
+
+        if (VoxelDensityProfile::AreCountersEnabled())
+        {
+            uint64 AuthoredLedges = 0;
+            for (const FTunnelFloorSegmentProfile& Profile : OutProfiles)
+            {
+                if (Profile.NumSteps > 0)
+                {
+                    // In whole-chain mode NumSteps is a transition marker. Compatibility mode
+                    // retains the old per-segment count, so report the actual authored step count
+                    // in both cases.
+                    AuthoredLedges += bGlobalTerrace
+                        ? 1u : static_cast<uint64>(Profile.NumSteps);
+                }
+            }
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileBuilds);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileSegments,
+                static_cast<uint64>(OutProfiles.Num()));
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileLedges,
+                AuthoredLedges);
+        }
+    }
+
+    struct FVFRoomFloorOwnership
+    {
+        bool bValid = false;
+        float FloorZ = 0.0f;
+        float Weight = 0.0f;
+        uint32 RoomHash = 0;
+    };
+
+    static FVFRoomFloorOwnership VF_FindTunnelMouthOwnership(
+        const FVector& Position,
+        const TArray<FVector>& ControlPoints,
+        const TArray<float>& ControlRadii,
+        float MouthBlendRadiusA,
+        float MouthBlendRadiusB,
+        float MouthFloorZA,
+        float MouthFloorZB,
+        uint32 FloorRoomHashA,
+        uint32 FloorRoomHashB,
+        float SDFBlendRadius)
+    {
+        FVFRoomFloorOwnership Result;
+        if (ControlPoints.Num() < 2
+            || ControlRadii.Num() != ControlPoints.Num())
+        {
+            return Result;
+        }
+
+        const float Fade = FMath::Max(
+            FMath::Max(SDFBlendRadius, 0.0f) * 0.35f,
+            1.0f);
+        float BestScore = FLT_MAX;
+        for (int32 Endpoint = 0; Endpoint < 2; ++Endpoint)
+        {
+            const int32 ControlIndex = Endpoint == 0
+                ? 0 : ControlPoints.Num() - 1;
+            const FVector& Mouth = ControlPoints[ControlIndex];
+            const float DX = static_cast<float>(Position.X - Mouth.X);
+            const float DY = static_cast<float>(Position.Y - Mouth.Y);
+            const float Distance = FMath::Sqrt(DX * DX + DY * DY);
+            const float BlendRadius = FMath::Max(
+                Endpoint == 0 ? MouthBlendRadiusA : MouthBlendRadiusB,
+                0.0f);
+            const float RelativeDistance = Distance - BlendRadius;
+            const float Weight = RelativeDistance <= 0.0f
+                ? 1.0f
+                : (RelativeDistance < Fade
+                    ? 1.0f - SmoothStep01(RelativeDistance / Fade)
+                    : 0.0f);
+            if (!(Weight > 0.0f))
+            {
+                continue;
+            }
+
+            // Prefer the nearest normalized mouth. Endpoint order is the deterministic tie-break
+            // when two large rooms overlap the same tunnel entrance.
+            const float Score = Distance / FMath::Max(BlendRadius, 1.0f);
+            if (Score >= BestScore)
+            {
+                continue;
+            }
+            const float DefaultFloorZ = static_cast<float>(Mouth.Z)
+                - FMath::Abs(ControlRadii[ControlIndex]);
+            const float StoredFloorZ = Endpoint == 0 ? MouthFloorZA : MouthFloorZB;
+            const float FloorZ = StoredFloorZ > -FLT_MAX
+                && FMath::IsFinite(StoredFloorZ)
+                ? StoredFloorZ
+                : DefaultFloorZ;
+            if (!FMath::IsFinite(FloorZ))
+            {
+                continue;
+            }
+            BestScore = Score;
+            Result.bValid = true;
+            Result.FloorZ = FloorZ;
+            Result.Weight = Weight;
+            Result.RoomHash = Endpoint == 0 ? FloorRoomHashA : FloorRoomHashB;
+        }
+        return Result;
+    }
+
+    static FVFRoomFloorOwnership VF_FindSDFTunnelMouthOwnership(
+        const FVector& Position,
+        const FCachedTunnel& Tunnel,
+        float SDFBlendRadius)
+    {
+        if (!Tunnel.bHasFloorRoomOwnership)
+        {
+            return FVFRoomFloorOwnership();
+        }
+        return VF_FindTunnelMouthOwnership(
+            Position, Tunnel.ControlPoints, Tunnel.ControlRadii,
+            Tunnel.SDFMouthBlendRadiusA, Tunnel.SDFMouthBlendRadiusB,
+            Tunnel.SDFMouthFloorZA, Tunnel.SDFMouthFloorZB,
+            Tunnel.FloorRoomHashA, Tunnel.FloorRoomHashB, SDFBlendRadius);
+    }
+
+    static FVFRoomFloorOwnership VF_FindWorldTunnelMouthOwnership(
+        const FVector& Position,
+        const FCachedTunnel& Tunnel,
+        float SDFBlendRadius)
+    {
+        if (!Tunnel.bHasFloorRoomOwnership)
+        {
+            return FVFRoomFloorOwnership();
+        }
+        return VF_FindTunnelMouthOwnership(
+            Position, Tunnel.WorldControlPoints, Tunnel.WorldControlRadii,
+            Tunnel.WorldMouthBlendRadiusA, Tunnel.WorldMouthBlendRadiusB,
+            Tunnel.WorldMouthFloorZA, Tunnel.WorldMouthFloorZB,
+            Tunnel.FloorRoomHashA, Tunnel.FloorRoomHashB, SDFBlendRadius);
+    }
+
     struct FVFTunnelFloorTerms
     {
         float BaseFloorZ = 0.0f;
@@ -454,15 +779,66 @@ namespace
         const FVector& A, float RadiusA,
         const FVector& B, float RadiusB,
         float T, int32 SegmentIndex, int32 NumSegments,
-        const FCachedTunnel& Tunnel)
+        const FCachedTunnel& Tunnel,
+        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles,
+        const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         FVFTunnelFloorTerms Terms;
-        const float ProfileT = VF_TunnelFloorProfileT(
-            A, RadiusA, B, RadiusB, T);
-        Terms.BaseFloorZ = FMath::Lerp(
-            VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)),
-            VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB)),
-            ProfileT);
+        if (FloorProfiles != nullptr
+            && FloorProfiles->Num() == NumSegments
+            && FloorProfiles->IsValidIndex(SegmentIndex))
+        {
+            const FTunnelFloorSegmentProfile& Profile = (*FloorProfiles)[SegmentIndex];
+            const float ClampedT = FMath::Clamp(T, 0.0f, 1.0f);
+            const float ProfileT = Profile.NumSteps > 0
+                ? (ClampedT >= 1.0f
+                    ? 1.0f
+                    : FMath::FloorToFloat(ClampedT
+                        * static_cast<float>(Profile.NumSteps))
+                        / static_cast<float>(Profile.NumSteps))
+                : ClampedT;
+            Terms.BaseFloorZ = FMath::Lerp(
+                Profile.StartFloorZ, Profile.EndFloorZ, ProfileT);
+            Terms.ReliefScale = Profile.ReliefScale;
+        }
+        else
+        {
+            const float ProfileT = VF_TunnelFloorProfileT(
+                A, RadiusA, B, RadiusB, T);
+            Terms.BaseFloorZ = FMath::Lerp(
+                VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)),
+                VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB)),
+                ProfileT);
+            Terms.ReliefScale = VF_TunnelFloorReliefScale(
+                A, RadiusA, B, RadiusB, SegmentIndex, NumSegments, Tunnel);
+        }
+
+        // The room is the owner of its own floor volume. A tunnel capsule penetrates past the
+        // mouth into that room; without this reconciliation its floor cut can leave a raised or
+        // lowered apron in the room. Blend only across the SDF mouth band so the tunnel remains
+        // unchanged in open corridor space.
+        const bool bOwnsThisTunnelMouth = RoomFloorOwnership != nullptr
+            && RoomFloorOwnership->bValid
+            && Tunnel.bHasFloorRoomOwnership
+            && (RoomFloorOwnership->RoomHash == Tunnel.FloorRoomHashA
+                || RoomFloorOwnership->RoomHash == Tunnel.FloorRoomHashB);
+        if (bOwnsThisTunnelMouth)
+        {
+            // A raised tunnel apron is the demonstrated failure mode. Lower it toward the room
+            // floor, but never raise an existing tunnel floor into solid space: that one-sided
+            // ownership rule is conservative for the capability contract and leaves a lower
+            // tunnel to be handled by the room's own floor union.
+            const float OwnedFloorZ = FMath::Min(
+                Terms.BaseFloorZ, RoomFloorOwnership->FloorZ);
+            Terms.BaseFloorZ = FMath::Lerp(
+                Terms.BaseFloorZ,
+                OwnedFloorZ,
+                FMath::Clamp(RoomFloorOwnership->Weight, 0.0f, 1.0f));
+            // The room's floor relief is already included in FloorZ. Fade the tunnel relief out
+            // with the ownership blend, so the transition cannot stack two independent floors.
+            Terms.ReliefScale *= 1.0f - FMath::Clamp(
+                RoomFloorOwnership->Weight, 0.0f, 1.0f);
+        }
 
         const float HorizontalRun = FVector2D(
             static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
@@ -481,8 +857,6 @@ namespace
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
-        Terms.ReliefScale = VF_TunnelFloorReliefScale(
-            A, RadiusA, B, RadiusB, SegmentIndex, NumSegments, Tunnel);
         return Terms;
     }
 
@@ -513,11 +887,14 @@ namespace
         const FCachedTunnel& Tunnel,
         const void* CacheIdentity, int32 TunnelIndex,
         bool bEvaluateRelief,
-        const FVFFloorReliefColumnKey& Column)
+        const FVFFloorReliefColumnKey& Column,
+        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles,
+        const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         const FVFTunnelFloorTerms Terms = VF_TunnelFloorTerms(
             A, RadiusA, B, RadiusB,
-            T, SegmentIndex, NumSegments, Tunnel);
+            T, SegmentIndex, NumSegments, Tunnel, FloorProfiles,
+            RoomFloorOwnership);
         return VF_TunnelFloorFromTerms(
             Position, Tunnel, Terms,
             CacheIdentity, TunnelIndex, bEvaluateRelief, Column);
@@ -556,7 +933,9 @@ namespace
         float SDFBlendRadius,
         bool bApplyFloorCut,
         const void* CacheIdentity, int32 TunnelIndex,
-        const FVFFloorReliefColumnKey& ReliefColumn)
+        const FVFFloorReliefColumnKey& ReliefColumn,
+        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles,
+        const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         FVFTunnelShapeEvaluation Result;
         if (ControlPoints.Num() < 2
@@ -592,7 +971,8 @@ namespace
 
             const FVFTunnelFloorTerms FloorTerms = VF_TunnelFloorTerms(
                 A, RadiusA, B, RadiusB,
-                T, SegmentIndex, NumSegments, Tunnel);
+                T, SegmentIndex, NumSegments, Tunnel, FloorProfiles,
+                RoomFloorOwnership);
             const float SupportRadius = FMath::Max(
                 FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
                 VoxelPassageGeometry::PlayerRadiusVoxels);
@@ -623,6 +1003,17 @@ namespace
                         + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels;
                 bEvaluateRelief = !bFloorCannotAffect || !bCannotBeSupport;
             }
+            if (bApplyFloorCut && RoomFloorOwnership != nullptr
+                && RoomFloorOwnership->bValid
+                && Tunnel.bHasFloorRoomOwnership
+                && (RoomFloorOwnership->RoomHash == Tunnel.FloorRoomHashA
+                    || RoomFloorOwnership->RoomHash == Tunnel.FloorRoomHashB)
+                && RoomFloorOwnership->Weight > 0.0f)
+            {
+                // Room ownership can move the floor even when the uncapped tunnel floor is
+                // outside its own relief bound. Keep the exact room relief in that mouth band.
+                bEvaluateRelief = true;
+            }
 
             const float FloorZ = VF_TunnelFloorFromTerms(
                 Position, Tunnel, FloorTerms,
@@ -633,7 +1024,8 @@ namespace
                 : SegmentSDF;
             Result.SDF = FMath::Min(Result.SDF, SegmentResultSDF);
 
-            if (SegmentSDF <= 0.0f
+            if (bApplyFloorCut && Tunnel.bTunnelFloorEnabled
+                && SegmentSDF <= 0.0f
                 && HorizontalDistanceSquared <= FMath::Square(SupportRadius)
                 && Position.Z >= FloorZ
                     - VoxelPassageGeometry::LandingFloorThicknessVoxels
@@ -652,7 +1044,8 @@ namespace
         bool bWorldChain,
         float SDFBlendRadius,
         bool bApplyFloorCut,
-        const void* CacheIdentity, int32 TunnelIndex)
+        const void* CacheIdentity, int32 TunnelIndex,
+        const FVFRoomFloorOwnership* RoomFloorOwnership = nullptr)
     {
         const FVFFloorReliefColumnKey ReliefColumn =
             VF_MakeFloorReliefColumnKey(
@@ -667,7 +1060,9 @@ namespace
             return VF_EvaluateSweptTunnelChain(
                 Position, ShapeControlPoints, ShapeControlRadii,
                 Tunnel, SDFBlendRadius, bApplyFloorCut,
-                CacheIdentity, TunnelIndex, ReliefColumn);
+                CacheIdentity, TunnelIndex, ReliefColumn,
+                bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
+                RoomFloorOwnership);
         }
 
         if (Tunnel.bHasMidpoint)
@@ -685,7 +1080,9 @@ namespace
             return VF_EvaluateSweptTunnelChain(
                 Position, Points, Radii,
                 Tunnel, SDFBlendRadius, bApplyFloorCut,
-                CacheIdentity, TunnelIndex, ReliefColumn);
+                CacheIdentity, TunnelIndex, ReliefColumn,
+                bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
+                RoomFloorOwnership);
         }
 
         TArray<FVector> Points;
@@ -697,7 +1094,9 @@ namespace
         return VF_EvaluateSweptTunnelChain(
             Position, Points, Radii,
             Tunnel, SDFBlendRadius, bApplyFloorCut,
-            CacheIdentity, TunnelIndex, ReliefColumn);
+            CacheIdentity, TunnelIndex, ReliefColumn,
+            bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
+            RoomFloorOwnership);
     }
 
     static bool VF_ProjectSweptTunnelFloor(
@@ -706,8 +1105,13 @@ namespace
         bool bWorldChain,
         float& OutFloorZ,
         float& OutSupportRadius,
-        const void* CacheIdentity, int32 TunnelIndex)
+        const void* CacheIdentity, int32 TunnelIndex,
+        const FVFRoomFloorOwnership* RoomFloorOwnership = nullptr)
     {
+        if (!Tunnel.bTunnelFloorEnabled)
+        {
+            return false;
+        }
         const FVFFloorReliefColumnKey ReliefColumn =
             VF_MakeFloorReliefColumnKey(
                 static_cast<float>(Position.X), static_cast<float>(Position.Y));
@@ -746,7 +1150,9 @@ namespace
                 ControlPoints[SegmentIndex + 1], RadiusB,
                 T, SegmentIndex, NumSegments, Position, Tunnel,
                 CacheIdentity, TunnelIndex, /*bEvaluateRelief=*/true,
-                ReliefColumn);
+                ReliefColumn,
+                bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
+                RoomFloorOwnership);
             OutSupportRadius = FMath::Max(
                 FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
                 VoxelPassageGeometry::PlayerRadiusVoxels);
@@ -768,6 +1174,11 @@ void FChunkSDFCache::Reset()
     // populated regions on adjacent requests.
     Rooms.Reset();
     RoomFloorJoins.Reset();
+    for (FCachedTunnel& Tunnel : Tunnels)
+    {
+        Tunnel.FloorProfiles.Reset();
+        Tunnel.WorldFloorProfiles.Reset();
+    }
     Tunnels.Reset();
     Pits.Reset();
     Chimneys.Reset();
@@ -829,6 +1240,8 @@ VoxelDensityProfile::FCacheMemoryBreakdown FChunkSDFCache::GetAllocatedSizeBreak
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.ControlRadii);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlPoints);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlRadii);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.FloorProfiles);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldFloorProfiles);
     }
 
     return Breakdown;
@@ -4773,6 +5186,16 @@ void VoxelCaveMorphology::BuildChunkCache(
             CT.FloorReliefStrength = Params.FloorReliefStrength;
             CT.FloorReliefFrequency = Params.FloorReliefFrequency;
             CT.FloorSeed = VoxelHash::Mix(TunnelHash ^ 0xF100F1u);
+            CT.bHasFloorRoomOwnership = true;
+            CT.FloorRoomHashA = RoomA.Hash;
+            CT.FloorRoomHashB = RoomB.Hash;
+            CT.bTunnelFloorEnabled = Params.bTunnelFloorEnabled;
+            CT.bTunnelFloorTerracingEnabled = Params.bTunnelFloorTerracingEnabled;
+            CT.TunnelFloorTerraceStepHeight = Params.TunnelFloorTerraceStepHeight;
+            CT.TunnelFloorMaxLedgeHeight = Params.TunnelFloorMaxLedgeHeight;
+            CT.TunnelFloorGentleSlopeThreshold = Params.TunnelFloorGentleSlopeThreshold;
+            CT.TunnelFloorLedgeCountPreference = Params.TunnelFloorLedgeCountPreference;
+            CT.TunnelFloorMaxLedges = Params.TunnelFloorMaxLedges;
 
             // A room edge is not a straight capsule between cell centres. Build a deterministic
             // chain of hash-jittered control points instead. The chain is keyed only by the pair
@@ -4869,6 +5292,44 @@ void VoxelCaveMorphology::BuildChunkCache(
                         : VF_ApplyCaveWarp(WorldControlPoint, Params, Seed));
                 CT.ControlPoints.Add(ControlPoint);
                 CT.ControlRadii.Add(ControlRadius);
+            }
+
+            // Author the complete floor profile once, after both representations of the chain
+            // are known. Evaluation now only projects onto this immutable profile; no sample can
+            // independently decide how many terraces the tunnel needs.
+            VF_BuildTunnelFloorProfile(
+                CT.ControlPoints, CT.ControlRadii, CT, CT.FloorProfiles);
+            VF_BuildTunnelFloorProfile(
+                CT.WorldControlPoints, CT.WorldControlRadii, CT, CT.WorldFloorProfiles);
+            // The floor hand-off is a short apron around each destination, not a second floor
+            // that owns the whole room. Bake the same bounded region in both coordinate spaces;
+            // this keeps the room/tunnel boolean deterministic even though the cave warp is 3D.
+            CT.SDFMouthBlendRadiusA = FMath::Min(
+                FMath::Max(RoomA.RadiusXY, 0.0f), VF_TunnelMouthBlendRadiusVoxels);
+            CT.SDFMouthBlendRadiusB = FMath::Min(
+                FMath::Max(RoomB.RadiusXY, 0.0f), VF_TunnelMouthBlendRadiusVoxels);
+            CT.WorldMouthBlendRadiusA = CT.SDFMouthBlendRadiusA;
+            CT.WorldMouthBlendRadiusB = CT.SDFMouthBlendRadiusB;
+            if (CT.FloorProfiles.Num() == CT.ControlPoints.Num() - 1
+                && CT.FloorProfiles.Num() > 0)
+            {
+                CT.SDFMouthFloorZA = CT.FloorProfiles[0].StartFloorZ;
+                CT.SDFMouthFloorZB = CT.FloorProfiles.Last().EndFloorZ;
+            }
+            if (CT.WorldFloorProfiles.Num() == CT.WorldControlPoints.Num() - 1
+                && CT.WorldFloorProfiles.Num() > 0)
+            {
+                CT.WorldMouthFloorZA = CT.WorldFloorProfiles[0].StartFloorZ;
+                CT.WorldMouthFloorZB = CT.WorldFloorProfiles.Last().EndFloorZ;
+            }
+            else
+            {
+                CT.WorldMouthFloorZA = static_cast<float>(
+                    CT.WorldControlPoints[0].Z)
+                    - FMath::Abs(CT.WorldControlRadii[0]);
+                CT.WorldMouthFloorZB = static_cast<float>(
+                    CT.WorldControlPoints.Last().Z)
+                    - FMath::Abs(CT.WorldControlRadii.Last());
             }
 
             CT.Midpoint = CT.ControlPoints.Num() > 2
@@ -5420,7 +5881,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         {
         case 1:  RoomSDF = VoxelSDF::RoundedBox(Pos, Room.Center, Room.ShapeA, Room.ShapeR); break;
         case 2:  RoomSDF = VoxelSDF::Capsule(Pos, Room.ShapeA, Room.ShapeB, Room.ShapeR);    break;
-        default: RoomSDF = VoxelSDF::Ellipsoid(Pos, Room.Center, Room.ShapeA);               break;
+            default: RoomSDF = VoxelSDF::Ellipsoid(Pos, Room.Center, Room.ShapeA);               break;
         }
 
         // Soft floor: SmoothMax of the room SDF and the floor half-space.
@@ -5534,10 +5995,15 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         }
 
         // The corridor is a swept floor cut: each tapered capsule segment is intersected with
-        // its interpolated floor half-space before the tunnel union is blended into rooms.
+        // its interpolated floor half-space before the tunnel union is blended into rooms.  The
+        // room wins naturally in this union (SmoothMin): a tunnel floor is a solid half-space,
+        // so it cannot replace the room's air above the room floor.  Do not lower the SDF floor
+        // from a proximity-only mouth test; a warped query can be near an endpoint without being
+        // inside that endpoint's room, and changing it there loses capability.
         const float TunnelSDF = VF_EvaluateSweptTunnel(
             Pos, Tunnel, /*bWorldChain=*/false, BlendK,
-            /*bApplyFloorCut=*/true, &Cache, TunnelIdx).SDF;
+            /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled, &Cache, TunnelIdx,
+            nullptr).SDF;
 
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
     };
@@ -5648,6 +6114,10 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
         }
 
+        const FVFRoomFloorOwnership RoomMouthOwnership =
+            VF_FindWorldTunnelMouthOwnership(Pos, Tunnel, Cache.SDFBlendRadius);
+        const bool bRoomOwnsThisTunnel = RoomMouthOwnership.bValid;
+        bool bRaisedTunnelFloor = false;
         if (bHasWorldChain)
         {
             if (SupportColumn != nullptr && VoxelDensityProfile::AreCountersEnabled())
@@ -5665,7 +6135,25 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 : VF_ProjectSweptTunnelFloor(
                     Pos, Tunnel, /*bWorldChain=*/true, FloorZ, SupportRadius,
                     &Cache, TunnelIdx);
-            if (bProjectedFloor
+            bRaisedTunnelFloor = bRoomOwnsThisTunnel
+                && bProjectedFloor
+                && FloorZ > RoomMouthOwnership.FloorZ
+                    + KINDA_SMALL_NUMBER;
+            if (bRaisedTunnelFloor
+                && WorldZ <= RoomMouthOwnership.FloorZ
+                    + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels)
+            {
+                if (WorldZ > RoomMouthOwnership.FloorZ
+                        - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+                {
+                    Result.bRoomFloor = true;
+                }
+                // A raised tunnel apron is the artifact being clipped. Keep the room floor in
+                // its finite support band and do not reopen the room below it.
+                return;
+            }
+            if (!bRaisedTunnelFloor
+                && bProjectedFloor
                 && WorldZ <= FloorZ
                     + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
                 && (SupportColumn == nullptr
@@ -5675,20 +6163,21 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
             {
                 Result.bSupportFloor = true;
             }
-            if (bProjectedFloor && WorldZ <= FloorZ
+            if (!bRaisedTunnelFloor
+                && bProjectedFloor && WorldZ <= FloorZ
                     + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels)
             {
                 // Preserve the established ownership contract while the SDF-space evaluator is
-                // still raw: the floor owns the lower half of the corridor, and the capsule owns
-                // only the air above it. This diagnostic is what distinguishes a coordinate-space
-                // mismatch from a genuine swept-floor capability loss.
-                return;
+            // still raw: the floor owns the lower half of the corridor, and the capsule owns
+            // only the air above it. This is a shape-level ownership hand-off, not a later slab.
+            return;
             }
         }
 
         const FVFTunnelShapeEvaluation TunnelShape = VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true, &Cache, TunnelIdx);
+            /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled && !bRaisedTunnelFloor,
+            &Cache, TunnelIdx, nullptr);
         Result.SDF = FMath::Min(Result.SDF, TunnelShape.SDF);
     };
 
@@ -5749,9 +6238,28 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
             return false;
         }
 
+        const FVFRoomFloorOwnership RoomMouthOwnership =
+            VF_FindWorldTunnelMouthOwnership(Pos, Tunnel, Cache.SDFBlendRadius);
+        if (RoomMouthOwnership.bValid)
+        {
+            float ProjectedFloorZ = 0.0f;
+            float SupportRadius = 0.0f;
+            if (VF_ProjectSweptTunnelFloor(
+                    Pos, Tunnel, bHasWorldChain, ProjectedFloorZ, SupportRadius,
+                    &Cache, TunnelIdx)
+                && ProjectedFloorZ > RoomMouthOwnership.FloorZ + KINDA_SMALL_NUMBER)
+            {
+                // Only a raised tunnel apron is clipped. If the tunnel is lower, the room's
+                // SmoothMax floor already wins naturally and retaining this support band is
+                // capability-safe for legacy callers.
+                return false;
+            }
+        }
+
         return VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true, &Cache, TunnelIdx).bSupportFloor;
+            /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled, &Cache, TunnelIdx,
+            nullptr).bSupportFloor;
     };
 
     bool bSupport = false;
@@ -5791,6 +6299,8 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             static_cast<uint64>(Cache.Tunnels.Num()));
     }
 
+    const FVector ColumnPosition(WorldX, WorldY, 0.0f);
+
     for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
     {
         if (!Cache.Tunnels.IsValidIndex(TunnelIdx))
@@ -5798,7 +6308,6 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             continue;
         }
         const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
-        const FVector ColumnPosition(WorldX, WorldY, 0.0f);
         float FloorZ = 0.0f;
         float SupportRadius = 0.0f;
         if (!VF_ProjectSweptTunnelFloor(

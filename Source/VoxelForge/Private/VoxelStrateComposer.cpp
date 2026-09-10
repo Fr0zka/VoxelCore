@@ -1137,6 +1137,9 @@ namespace
             if (FieldName == TEXT("TunnelWarpStrength")) return Set(0.0f, H);
             if (FieldName == TEXT("TunnelHorizontalBias")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("TunnelEndpointZOffset")) return Set(0.0f, 1.0f);
+            if (FieldName == TEXT("TunnelFloorTerraceStepHeight")) return Set(0.25f, FMath::Max(2.0f, HQuarter));
+            if (FieldName == TEXT("TunnelFloorMaxLedgeHeight")) return Set(1.0f, FMath::Max(4.0f, HQuarter));
+            if (FieldName == TEXT("TunnelFloorGentleSlopeThreshold")) return Set(0.0f, 1.5f);
             if (FieldName == TEXT("SDFBlendRadius")) return Set(2.0f, FMath::Max(4.0f, H * 0.15f));
             if (FieldName == TEXT("WaterLevelRelative")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("CaveWarpStrength")) return Set(0.0f, HHalf);
@@ -1366,6 +1369,28 @@ namespace
         if (FCString::Strcmp(FieldName, TEXT("bTunnelsFlowTowardOrigin")) == 0)
         {
             Params.bTunnelsFlowTowardOrigin = CategoryRng.FRand() < 0.5f;
+            return true;
+        }
+        if (FCString::Strcmp(FieldName, TEXT("bTunnelFloorEnabled")) == 0)
+        {
+            // The floor is a capability feature, not a corpus-free variation axis. Keep it on
+            // for every generated candidate so a roll cannot manufacture an invalid bare tube.
+            Params.bTunnelFloorEnabled = true;
+            return true;
+        }
+        if (FCString::Strcmp(FieldName, TEXT("bTunnelFloorTerracingEnabled")) == 0)
+        {
+            Params.bTunnelFloorTerracingEnabled = CategoryRng.FRand() < 0.75f;
+            return true;
+        }
+        if (FCString::Strcmp(FieldName, TEXT("TunnelFloorLedgeCountPreference")) == 0)
+        {
+            Params.TunnelFloorLedgeCountPreference = CategoryRng.RandRange(0, 3);
+            return true;
+        }
+        if (FCString::Strcmp(FieldName, TEXT("TunnelFloorMaxLedges")) == 0)
+        {
+            Params.TunnelFloorMaxLedges = CategoryRng.RandRange(1, 8);
             return true;
         }
         if (FCString::Strcmp(FieldName, TEXT("RoughnessNoiseType")) == 0)
