@@ -85,12 +85,227 @@ namespace
     constexpr float VF_Perlin2DPartialAbsBound = 8.5f;
     constexpr float VF_MaxTunnelFloorReliefScale = 0.20f;
 
+    // The weighted two-octave field is bounded by one in exact arithmetic.  Leave a margin for
+    // the implementation's interpolation/rounding before using it as a proof bound.  This bound
+    // is only used to skip a floor evaluation when the existing SmoothMax is provably the identity;
+    // it never changes a value that could affect the isosurface.
+    constexpr float VF_FloorReliefNoiseAbsBound = 1.01f;
+
+    enum class EVFFloorReliefFeature : uint8
+    {
+        RoomDouble,
+        TunnelFloat,
+        LandingFloat,
+        LandingDouble
+    };
+
+    struct FVFFloorReliefColumnKey
+    {
+        bool bInteger = false;
+        int32 X = 0;
+        int32 Y = 0;
+    };
+
+    FORCEINLINE FVFFloorReliefColumnKey VF_MakeFloorReliefColumnKey(
+        double X, double Y)
+    {
+        FVFFloorReliefColumnKey Key;
+        const bool bIntegerX = FMath::IsFinite(X)
+            && X >= static_cast<double>(MIN_int32)
+            && X <= static_cast<double>(MAX_int32)
+            && FMath::FloorToDouble(X) == X;
+        const bool bIntegerY = FMath::IsFinite(Y)
+            && Y >= static_cast<double>(MIN_int32)
+            && Y <= static_cast<double>(MAX_int32)
+            && FMath::FloorToDouble(Y) == Y;
+        if (bIntegerX && bIntegerY)
+        {
+            Key.bInteger = true;
+            Key.X = FMath::FloorToInt(X);
+            Key.Y = FMath::FloorToInt(Y);
+        }
+        return Key;
+    }
+
+    // Relief is a function of the actual SDF-domain X/Y, not necessarily the original world X/Y:
+    // CaveWarp is a 3D warp and therefore makes those coordinates vary with Z.  A cache keyed by
+    // the actual domain is exact in both cases: it hits on genuine repeated columns (the world
+    // structural path and unwarped queries), and safely falls through to the original calculation
+    // when a warped sample is not the same column.  The table is direct-mapped and fixed-size so
+    // it cannot become another retained per-tile allocation. Collisions only lose a hit.
+    struct FVFFloorReliefCacheEntry
+    {
+        const void* CacheIdentity = nullptr;
+        EVFFloorReliefFeature Feature = EVFFloorReliefFeature::RoomDouble;
+        int32 FeatureIndex = INDEX_NONE;
+        int32 X = 0;
+        int32 Y = 0;
+        uint32 FloorSeed = 0;
+        float Frequency = 0.0f;
+        float Noise = 0.0f;
+        bool bValid = false;
+    };
+
+    struct FVFFloorReliefCache
+    {
+        // About 1.25 MiB on the current x64 layout, bounded independently of chunk/region size.
+        static constexpr int32 Capacity = 32768;
+        static_assert((Capacity & (Capacity - 1)) == 0, "floor relief cache must be a power of two");
+        FVFFloorReliefCacheEntry Entries[Capacity];
+
+        FORCEINLINE static uint32 HashKey(
+            const void* CacheIdentity,
+            EVFFloorReliefFeature Feature,
+            int32 FeatureIndex,
+            int32 X,
+            int32 Y,
+            uint32 FloorSeed,
+            float Frequency)
+        {
+            const UPTRINT PointerBits = reinterpret_cast<UPTRINT>(CacheIdentity);
+            uint32 Hash = static_cast<uint32>(PointerBits)
+                ^ static_cast<uint32>(PointerBits >> 32);
+            auto Combine = [&Hash](uint32 Value)
+            {
+                Hash ^= Value + 0x9e3779b9u + (Hash << 6) + (Hash >> 2);
+            };
+            Combine(static_cast<uint32>(Feature));
+            Combine(static_cast<uint32>(FeatureIndex));
+            Combine(static_cast<uint32>(X));
+            Combine(static_cast<uint32>(Y));
+            Combine(FloorSeed);
+            Combine(GetTypeHash(Frequency));
+            return VoxelHash::Mix(Hash);
+        }
+
+        FORCEINLINE float GetOrCompute(
+            double X, double Y,
+            uint32 FloorSeed, float Frequency,
+            const void* CacheIdentity,
+            EVFFloorReliefFeature Feature,
+            int32 FeatureIndex,
+            const FVFFloorReliefColumnKey& Column,
+            float (*Compute)(double, double, uint32, float))
+        {
+            if (!Column.bInteger)
+            {
+                return Compute(X, Y, FloorSeed, Frequency);
+            }
+
+            FVFFloorReliefCacheEntry& Entry = Entries[HashKey(
+                CacheIdentity, Feature, FeatureIndex,
+                Column.X, Column.Y, FloorSeed, Frequency)
+                & (Capacity - 1)];
+            if (Entry.bValid
+                && Entry.CacheIdentity == CacheIdentity
+                && Entry.Feature == Feature
+                && Entry.FeatureIndex == FeatureIndex
+                && Entry.X == Column.X
+                && Entry.Y == Column.Y
+                && Entry.FloorSeed == FloorSeed
+                && Entry.Frequency == Frequency)
+            {
+                return Entry.Noise;
+            }
+
+            const float Noise = Compute(X, Y, FloorSeed, Frequency);
+            Entry.CacheIdentity = CacheIdentity;
+            Entry.Feature = Feature;
+            Entry.FeatureIndex = FeatureIndex;
+            Entry.X = Column.X;
+            Entry.Y = Column.Y;
+            Entry.FloorSeed = FloorSeed;
+            Entry.Frequency = Frequency;
+            Entry.Noise = Noise;
+            Entry.bValid = true;
+            return Noise;
+        }
+    };
+
+    static thread_local FVFFloorReliefCache GFloorReliefCache;
+
+    FORCEINLINE float VF_ComputeFloorReliefNoiseDouble(
+        double X, double Y, uint32 FloorSeed, float Frequency)
+    {
+        const float SF = static_cast<float>(FloorSeed) * 0.00001f;
+        float Noise = FMath::PerlinNoise2D(
+            FVector2D(X * Frequency + SF, Y * Frequency + SF * 1.7f)) * 0.65f;
+        Noise += FMath::PerlinNoise2D(
+            FVector2D(X * Frequency * 2.3f + SF * 3.1f,
+                       Y * Frequency * 2.3f + SF * 5.3f)) * 0.35f;
+        return Noise;
+    }
+
+    FORCEINLINE float VF_ComputeFloorReliefNoiseFloat(
+        double X, double Y, uint32 FloorSeed, float Frequency)
+    {
+        const float FX = static_cast<float>(X);
+        const float FY = static_cast<float>(Y);
+        const float SF = static_cast<float>(FloorSeed) * 0.00001f;
+        float Noise = FMath::PerlinNoise2D(
+            FVector2D(FX * Frequency + SF, FY * Frequency + SF * 1.7f)) * 0.65f;
+        Noise += FMath::PerlinNoise2D(
+            FVector2D(FX * Frequency * 2.3f + SF * 3.1f,
+                       FY * Frequency * 2.3f + SF * 5.3f)) * 0.35f;
+        return Noise;
+    }
+
+    FORCEINLINE float VF_FloorReliefNoiseDouble(
+        double X, double Y, uint32 FloorSeed, float Frequency,
+        const void* CacheIdentity,
+        EVFFloorReliefFeature Feature,
+        int32 FeatureIndex,
+        const FVFFloorReliefColumnKey& Column)
+    {
+        return GFloorReliefCache.GetOrCompute(
+            X, Y, FloorSeed, Frequency, CacheIdentity, Feature, FeatureIndex,
+            Column,
+            &VF_ComputeFloorReliefNoiseDouble);
+    }
+
+    FORCEINLINE float VF_FloorReliefNoiseFloat(
+        float X, float Y, uint32 FloorSeed, float Frequency,
+        const void* CacheIdentity,
+        EVFFloorReliefFeature Feature,
+        int32 FeatureIndex,
+        const FVFFloorReliefColumnKey& Column)
+    {
+        return GFloorReliefCache.GetOrCompute(
+            static_cast<double>(X), static_cast<double>(Y),
+            FloorSeed, Frequency, CacheIdentity, Feature, FeatureIndex,
+            Column,
+            &VF_ComputeFloorReliefNoiseFloat);
+    }
+
+    FORCEINLINE bool VF_GetFloorReliefBound(
+        float Strength, float Envelope, float ReliefScale, float Frequency,
+        float& OutBound)
+    {
+        OutBound = 0.0f;
+        if (!(Strength > 0.0f)
+            || !FMath::IsFinite(Strength)
+            || !FMath::IsFinite(Frequency)
+            || !(Envelope > 0.0f)
+            || !FMath::IsFinite(Envelope)
+            || !(ReliefScale > 0.0f)
+            || !FMath::IsFinite(ReliefScale))
+        {
+            return false;
+        }
+
+        OutBound = FMath::Abs(Strength) * VOXEL_NOISE_SCALE
+            * VF_FloorReliefNoiseAbsBound * Envelope * ReliefScale;
+        return FMath::IsFinite(OutBound) && OutBound >= 0.0f;
+    }
+
     // Keep corridor relief on the exact two-octave field already used by room floors.  The
     // endpoint fade is not a second noise system: it is the landing apron that lets the swept
     // corridor meet the room's own floor without a seed-dependent vertical lip.
     FORCEINLINE float VF_TunnelFloorRelief(
         float X, float Y, const FCachedTunnel& Tunnel,
-        float Envelope, float ReliefScale)
+        float Envelope, float ReliefScale,
+        const void* CacheIdentity, int32 TunnelIndex,
+        const FVFFloorReliefColumnKey& Column)
     {
         if (!(Tunnel.FloorReliefStrength > 0.0f)
             || !FMath::IsFinite(Tunnel.FloorReliefStrength)
@@ -101,13 +316,10 @@ namespace
             return 0.0f;
         }
 
-        const float RF = Tunnel.FloorReliefFrequency;
-        const float SF = static_cast<float>(Tunnel.FloorSeed) * 0.00001f;
-        float Noise = FMath::PerlinNoise2D(
-            FVector2D(X * RF + SF, Y * RF + SF * 1.7f)) * 0.65f;
-        Noise += FMath::PerlinNoise2D(
-            FVector2D(X * RF * 2.3f + SF * 3.1f,
-                       Y * RF * 2.3f + SF * 5.3f)) * 0.35f;
+        const float Noise = VF_FloorReliefNoiseFloat(
+            X, Y, Tunnel.FloorSeed, Tunnel.FloorReliefFrequency,
+            CacheIdentity, EVFFloorReliefFeature::TunnelFloat, TunnelIndex,
+            Column);
         return Noise * VOXEL_NOISE_SCALE * Tunnel.FloorReliefStrength
             * Envelope * ReliefScale;
     }
@@ -231,43 +443,84 @@ namespace
             0.0f, VF_MaxTunnelFloorReliefScale);
     }
 
-    FORCEINLINE float VF_TunnelFloorAtSegment(
+    struct FVFTunnelFloorTerms
+    {
+        float BaseFloorZ = 0.0f;
+        float ReliefEnvelope = 0.0f;
+        float ReliefScale = 0.0f;
+    };
+
+    FORCEINLINE FVFTunnelFloorTerms VF_TunnelFloorTerms(
         const FVector& A, float RadiusA,
         const FVector& B, float RadiusB,
         float T, int32 SegmentIndex, int32 NumSegments,
-        const FVector& Position,
         const FCachedTunnel& Tunnel)
     {
+        FVFTunnelFloorTerms Terms;
         const float ProfileT = VF_TunnelFloorProfileT(
             A, RadiusA, B, RadiusB, T);
-        float FloorZ = FMath::Lerp(
+        Terms.BaseFloorZ = FMath::Lerp(
             VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)),
             VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB)),
             ProfileT);
 
         const float HorizontalRun = FVector2D(
             static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
-        float ReliefEnvelope = 1.0f;
+        Terms.ReliefEnvelope = 1.0f;
         if (SegmentIndex == 0)
         {
-            ReliefEnvelope *= SmoothStep01(FMath::Clamp(
+            Terms.ReliefEnvelope *= SmoothStep01(FMath::Clamp(
                 (T * HorizontalRun)
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
         if (SegmentIndex + 1 == NumSegments)
         {
-            ReliefEnvelope *= SmoothStep01(FMath::Clamp(
+            Terms.ReliefEnvelope *= SmoothStep01(FMath::Clamp(
                 ((1.0f - T) * HorizontalRun)
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
-        const float ReliefScale = VF_TunnelFloorReliefScale(
+        Terms.ReliefScale = VF_TunnelFloorReliefScale(
             A, RadiusA, B, RadiusB, SegmentIndex, NumSegments, Tunnel);
-        FloorZ += VF_TunnelFloorRelief(
-            static_cast<float>(Position.X), static_cast<float>(Position.Y),
-            Tunnel, ReliefEnvelope, ReliefScale);
+        return Terms;
+    }
+
+    FORCEINLINE float VF_TunnelFloorFromTerms(
+        const FVector& Position,
+        const FCachedTunnel& Tunnel,
+        const FVFTunnelFloorTerms& Terms,
+        const void* CacheIdentity, int32 TunnelIndex,
+        bool bEvaluateRelief,
+        const FVFFloorReliefColumnKey& Column)
+    {
+        float FloorZ = Terms.BaseFloorZ;
+        if (bEvaluateRelief)
+        {
+            FloorZ += VF_TunnelFloorRelief(
+                static_cast<float>(Position.X), static_cast<float>(Position.Y),
+                Tunnel, Terms.ReliefEnvelope, Terms.ReliefScale,
+                CacheIdentity, TunnelIndex, Column);
+        }
         return FloorZ;
+    }
+
+    FORCEINLINE float VF_TunnelFloorAtSegment(
+        const FVector& A, float RadiusA,
+        const FVector& B, float RadiusB,
+        float T, int32 SegmentIndex, int32 NumSegments,
+        const FVector& Position,
+        const FCachedTunnel& Tunnel,
+        const void* CacheIdentity, int32 TunnelIndex,
+        bool bEvaluateRelief,
+        const FVFFloorReliefColumnKey& Column)
+    {
+        const FVFTunnelFloorTerms Terms = VF_TunnelFloorTerms(
+            A, RadiusA, B, RadiusB,
+            T, SegmentIndex, NumSegments, Tunnel);
+        return VF_TunnelFloorFromTerms(
+            Position, Tunnel, Terms,
+            CacheIdentity, TunnelIndex, bEvaluateRelief, Column);
     }
 
     FORCEINLINE bool VF_ProjectTunnelSegmentXY(
@@ -301,7 +554,9 @@ namespace
         const TArray<float>& ControlRadii,
         const FCachedTunnel& Tunnel,
         float SDFBlendRadius,
-        bool bApplyFloorCut)
+        bool bApplyFloorCut,
+        const void* CacheIdentity, int32 TunnelIndex,
+        const FVFFloorReliefColumnKey& ReliefColumn)
     {
         FVFTunnelShapeEvaluation Result;
         if (ControlPoints.Num() < 2
@@ -335,18 +590,49 @@ namespace
                 continue;
             }
 
-            const float FloorZ = VF_TunnelFloorAtSegment(
+            const FVFTunnelFloorTerms FloorTerms = VF_TunnelFloorTerms(
                 A, RadiusA, B, RadiusB,
-                T, SegmentIndex, NumSegments, Position, Tunnel);
+                T, SegmentIndex, NumSegments, Tunnel);
+            const float SupportRadius = FMath::Max(
+                FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
+                VoxelPassageGeometry::PlayerRadiusVoxels);
+            float ReliefBound = 0.0f;
+            const bool bHasReliefBound = VF_GetFloorReliefBound(
+                Tunnel.FloorReliefStrength,
+                FloorTerms.ReliefEnvelope,
+                FloorTerms.ReliefScale,
+                Tunnel.FloorReliefFrequency,
+                ReliefBound);
+
+            bool bEvaluateRelief = bApplyFloorCut;
+            if (bEvaluateRelief && bHasReliefBound)
+            {
+                // If the capsule is already above the highest possible floor by at least the
+                // SmoothMax radius, the cut is exactly the identity. The support test below is a
+                // separate obligation: a floor that does not alter SDF at this sample may still
+                // be the support band queried by the post stack.
+                const bool bFloorCannotAffect = SegmentSDF >=
+                    FloorTerms.BaseFloorZ + ReliefBound
+                    - static_cast<float>(Position.Z) + FloorBlend;
+                const bool bCannotBeSupport =
+                    SegmentSDF > 0.0f
+                    || HorizontalDistanceSquared > FMath::Square(SupportRadius)
+                    || Position.Z < FloorTerms.BaseFloorZ - ReliefBound
+                        - VoxelPassageGeometry::LandingFloorThicknessVoxels
+                    || Position.Z > FloorTerms.BaseFloorZ + ReliefBound
+                        + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels;
+                bEvaluateRelief = !bFloorCannotAffect || !bCannotBeSupport;
+            }
+
+            const float FloorZ = VF_TunnelFloorFromTerms(
+                Position, Tunnel, FloorTerms,
+                CacheIdentity, TunnelIndex, bEvaluateRelief, ReliefColumn);
             const float SegmentResultSDF = bApplyFloorCut
                 ? VoxelSDF::SmoothMax(
                     SegmentSDF, FloorZ - static_cast<float>(Position.Z), FloorBlend)
                 : SegmentSDF;
             Result.SDF = FMath::Min(Result.SDF, SegmentResultSDF);
 
-            const float SupportRadius = FMath::Max(
-                FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
-                VoxelPassageGeometry::PlayerRadiusVoxels);
             if (SegmentSDF <= 0.0f
                 && HorizontalDistanceSquared <= FMath::Square(SupportRadius)
                 && Position.Z >= FloorZ
@@ -365,8 +651,12 @@ namespace
         const FCachedTunnel& Tunnel,
         bool bWorldChain,
         float SDFBlendRadius,
-        bool bApplyFloorCut)
+        bool bApplyFloorCut,
+        const void* CacheIdentity, int32 TunnelIndex)
     {
+        const FVFFloorReliefColumnKey ReliefColumn =
+            VF_MakeFloorReliefColumnKey(
+                static_cast<float>(Position.X), static_cast<float>(Position.Y));
         const TArray<FVector>& ShapeControlPoints = bWorldChain
             ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
         const TArray<float>& ShapeControlRadii = bWorldChain
@@ -376,7 +666,8 @@ namespace
         {
             return VF_EvaluateSweptTunnelChain(
                 Position, ShapeControlPoints, ShapeControlRadii,
-                Tunnel, SDFBlendRadius, bApplyFloorCut);
+                Tunnel, SDFBlendRadius, bApplyFloorCut,
+                CacheIdentity, TunnelIndex, ReliefColumn);
         }
 
         if (Tunnel.bHasMidpoint)
@@ -393,7 +684,8 @@ namespace
             // temporary arrays stay inline and do not allocate on the normal chain path.
             return VF_EvaluateSweptTunnelChain(
                 Position, Points, Radii,
-                Tunnel, SDFBlendRadius, bApplyFloorCut);
+                Tunnel, SDFBlendRadius, bApplyFloorCut,
+                CacheIdentity, TunnelIndex, ReliefColumn);
         }
 
         TArray<FVector> Points;
@@ -404,7 +696,8 @@ namespace
         Radii.Add(Tunnel.RadiusB);
         return VF_EvaluateSweptTunnelChain(
             Position, Points, Radii,
-            Tunnel, SDFBlendRadius, bApplyFloorCut);
+            Tunnel, SDFBlendRadius, bApplyFloorCut,
+            CacheIdentity, TunnelIndex, ReliefColumn);
     }
 
     static bool VF_ProjectSweptTunnelFloor(
@@ -412,8 +705,12 @@ namespace
         const FCachedTunnel& Tunnel,
         bool bWorldChain,
         float& OutFloorZ,
-        float& OutSupportRadius)
+        float& OutSupportRadius,
+        const void* CacheIdentity, int32 TunnelIndex)
     {
+        const FVFFloorReliefColumnKey ReliefColumn =
+            VF_MakeFloorReliefColumnKey(
+                static_cast<float>(Position.X), static_cast<float>(Position.Y));
         const TArray<FVector>& ControlPoints = bWorldChain
             ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
         const TArray<float>& ControlRadii = bWorldChain
@@ -447,7 +744,9 @@ namespace
             OutFloorZ = VF_TunnelFloorAtSegment(
                 ControlPoints[SegmentIndex], RadiusA,
                 ControlPoints[SegmentIndex + 1], RadiusB,
-                T, SegmentIndex, NumSegments, Position, Tunnel);
+                T, SegmentIndex, NumSegments, Position, Tunnel,
+                CacheIdentity, TunnelIndex, /*bEvaluateRelief=*/true,
+                ReliefColumn);
             OutSupportRadius = FMath::Max(
                 FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
                 VoxelPassageGeometry::PlayerRadiusVoxels);
@@ -1654,14 +1953,13 @@ namespace
             }
 
             const float Frequency = Params.FloorReliefFrequency;
-            const float FloorSeed = static_cast<float>(
-                VoxelHash::Mix(RoomHash ^ 0xF100F1u)) * 0.00001f;
-            float Noise = FMath::PerlinNoise2D(FVector2D(
-                SampleX * Frequency + FloorSeed,
-                SampleY * Frequency + FloorSeed * 1.7f)) * 0.65f;
-            Noise += FMath::PerlinNoise2D(FVector2D(
-                SampleX * Frequency * 2.3f + FloorSeed * 3.1f,
-                SampleY * Frequency * 2.3f + FloorSeed * 5.3f)) * 0.35f;
+            const uint32 FloorSeed = VoxelHash::Mix(RoomHash ^ 0xF100F1u);
+            const FVFFloorReliefColumnKey ReliefColumn =
+                VF_MakeFloorReliefColumnKey(SampleX, SampleY);
+            const float Noise = VF_FloorReliefNoiseFloat(
+                SampleX, SampleY, FloorSeed, Frequency,
+                nullptr, EVFFloorReliefFeature::LandingFloat,
+                static_cast<int32>(RoomHash), ReliefColumn);
             FloorZ += Noise * VOXEL_NOISE_SCALE * Params.FloorReliefStrength;
         }
         // Keep this in the same (unwarped SDF) coordinate space as FCachedRoom::FloorCutZ. The
@@ -1732,21 +2030,45 @@ namespace
         if (FloorCut < 1.0f)
         {
             float FloorZ = Site.Center.Z - Site.RadiusZ * FloorCut;
+            bool bFloorCutIsIdentityForDensity = false;
             if (Params.FloorReliefStrength > 0.0f)
             {
                 const float Frequency = Params.FloorReliefFrequency;
-                const float FloorSeed = static_cast<float>(
-                    VoxelHash::Mix(Site.Hash ^ 0xF100F1u)) * 0.00001f;
-                float Noise = FMath::PerlinNoise2D(FVector2D(
-                    Position.X * Frequency + FloorSeed,
-                    Position.Y * Frequency + FloorSeed * 1.7f)) * 0.65f;
-                Noise += FMath::PerlinNoise2D(FVector2D(
-                    Position.X * Frequency * 2.3f + FloorSeed * 3.1f,
-                    Position.Y * Frequency * 2.3f + FloorSeed * 5.3f)) * 0.35f;
-                FloorZ += Noise * VOXEL_NOISE_SCALE * Params.FloorReliefStrength;
+                const uint32 FloorSeed = VoxelHash::Mix(Site.Hash ^ 0xF100F1u);
+                float ReliefBound = 0.0f;
+                const float FloorBlend = Params.SDFBlendRadius * 0.35f;
+                const float BaseFloorSDF = static_cast<float>(
+                    FloorZ - Position.Z);
+                const float BaseCutSDF = VoxelSDF::SmoothMax(
+                    RoomSDF, BaseFloorSDF, FloorBlend);
+                if (VF_GetFloorReliefBound(
+                        Params.FloorReliefStrength, 1.0f, 1.0f,
+                        Frequency, ReliefBound)
+                    && FMath::Abs(BaseCutSDF) > ReliefBound)
+                {
+                    // This helper exposes only the sign of the room density. SmoothMax is
+                    // one-Lipschitz in its floor argument, so the relief cannot change that
+                    // sign when the unrelieved result is farther from zero than its bound.
+                    RoomSDF = BaseCutSDF;
+                    bFloorCutIsIdentityForDensity = true;
+                }
+                else
+                {
+                    const FVFFloorReliefColumnKey ReliefColumn =
+                        VF_MakeFloorReliefColumnKey(Position.X, Position.Y);
+                    const float Noise = VF_FloorReliefNoiseDouble(
+                        Position.X, Position.Y,
+                        FloorSeed, Frequency,
+                        nullptr, EVFFloorReliefFeature::LandingDouble,
+                        static_cast<int32>(Site.Hash), ReliefColumn);
+                    FloorZ += Noise * VOXEL_NOISE_SCALE * Params.FloorReliefStrength;
+                }
             }
-            RoomSDF = VoxelSDF::SmoothMax(
-                RoomSDF, FloorZ - Position.Z, Params.SDFBlendRadius * 0.35f);
+            if (!bFloorCutIsIdentityForDensity)
+            {
+                RoomSDF = VoxelSDF::SmoothMax(
+                    RoomSDF, FloorZ - Position.Z, Params.SDFBlendRadius * 0.35f);
+            }
         }
 
         float InternalDensity = RoomSDF < 0.0f ? -1.0f : 1.0f;
@@ -5059,6 +5381,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float MinSDF = FLT_MAX;
     const float BlendK = SDFBlendRadius;
     const FVector Pos(WorldX, WorldY, WorldZ);
+    const FVFFloorReliefColumnKey ReliefColumn =
+        VF_MakeFloorReliefColumnKey(Pos.X, Pos.Y);
 
     // Track which room contributes the smallest (most-inside) raw SDF.
     // This is used by the terrain ops system to find the "owning" room for
@@ -5103,19 +5427,39 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         if (Room.FloorCutZ > -FLT_MAX)
         {
             float FloorZ = Room.FloorCutZ;
-
+            const float FloorBlend = BlendK * 0.35f;
+            bool bFloorCutIsIdentity = false;
             if (Room.FloorReliefStrength > 0.0f)
             {
-                const float RF = Room.FloorReliefFrequency;
-                const float SF = (float)Room.FloorSeed * 0.00001f;
+                float ReliefBound = 0.0f;
+                if (VF_GetFloorReliefBound(
+                        Room.FloorReliefStrength, 1.0f, 1.0f,
+                        Room.FloorReliefFrequency, ReliefBound))
+                {
+                    // SmoothMax(A, B, K) is exactly A when A >= B + K. Use the highest
+                    // possible relieved floor as B's bound. The extra margin is deliberately
+                    // conservative; an uncertain sample pays for the two noise octaves.
+                    bFloorCutIsIdentity = RoomSDF >=
+                        Room.FloorCutZ + ReliefBound - static_cast<float>(Pos.Z)
+                        + FMath::Max(FloorBlend, 0.0f);
+                }
 
-                float N = FMath::PerlinNoise2D(FVector2D(Pos.X * RF + SF,       Pos.Y * RF + SF * 1.7f)) * 0.65f
-                        + FMath::PerlinNoise2D(FVector2D(Pos.X * RF * 2.3f + SF * 3.1f, Pos.Y * RF * 2.3f + SF * 5.3f)) * 0.35f;
-                N *= VOXEL_NOISE_SCALE;
-                FloorZ += N * Room.FloorReliefStrength;
+                if (!bFloorCutIsIdentity)
+                {
+                    float N = VF_FloorReliefNoiseDouble(
+                        Pos.X, Pos.Y,
+                        Room.FloorSeed, Room.FloorReliefFrequency,
+                        &Cache, EVFFloorReliefFeature::RoomDouble, RoomIdx,
+                        ReliefColumn);
+                    N *= VOXEL_NOISE_SCALE;
+                    FloorZ += N * Room.FloorReliefStrength;
+                }
             }
 
-            RoomSDF = VoxelSDF::SmoothMax(RoomSDF, FloorZ - Pos.Z, BlendK * 0.35f);
+            if (!bFloorCutIsIdentity)
+            {
+                RoomSDF = VoxelSDF::SmoothMax(RoomSDF, FloorZ - Pos.Z, FloorBlend);
+            }
         }
 
         // Track the room whose SDF is smallest (most inside).
@@ -5193,7 +5537,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         // its interpolated floor half-space before the tunnel union is blended into rooms.
         const float TunnelSDF = VF_EvaluateSweptTunnel(
             Pos, Tunnel, /*bWorldChain=*/false, BlendK,
-            /*bApplyFloorCut=*/true).SDF;
+            /*bApplyFloorCut=*/true, &Cache, TunnelIdx).SDF;
 
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
     };
@@ -5240,7 +5584,7 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
             MinSDF,
             VF_EvaluateSweptTunnel(
                 Pos, Tunnel, /*bWorldChain=*/false, Cache.SDFBlendRadius,
-                /*bApplyFloorCut=*/false).SDF);
+                /*bApplyFloorCut=*/false, &Cache, TunnelIdx).SDF);
     };
 
     for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
@@ -5319,7 +5663,8 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 ? VoxelCaveMorphology::GetTunnelSupportFloorColumnBand(
                     TunnelIdx, *SupportColumn, FloorZ, SupportMinZ, SupportMaxZ)
                 : VF_ProjectSweptTunnelFloor(
-                    Pos, Tunnel, /*bWorldChain=*/true, FloorZ, SupportRadius);
+                    Pos, Tunnel, /*bWorldChain=*/true, FloorZ, SupportRadius,
+                    &Cache, TunnelIdx);
             if (bProjectedFloor
                 && WorldZ <= FloorZ
                     + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
@@ -5343,7 +5688,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
 
         const FVFTunnelShapeEvaluation TunnelShape = VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true);
+            /*bApplyFloorCut=*/true, &Cache, TunnelIdx);
         Result.SDF = FMath::Min(Result.SDF, TunnelShape.SDF);
     };
 
@@ -5406,7 +5751,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
 
         return VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true).bSupportFloor;
+            /*bApplyFloorCut=*/true, &Cache, TunnelIdx).bSupportFloor;
     };
 
     bool bSupport = false;
@@ -5458,7 +5803,7 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
         float SupportRadius = 0.0f;
         if (!VF_ProjectSweptTunnelFloor(
                 ColumnPosition, Tunnel, /*bWorldChain=*/true,
-                FloorZ, SupportRadius))
+                FloorZ, SupportRadius, &Cache, TunnelIdx))
         {
             continue;
         }
