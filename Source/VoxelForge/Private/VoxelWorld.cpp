@@ -1306,15 +1306,36 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
     // dequeued. This makes request-to-ready include component setup, stream/buffer submission,
     // and collision configuration—the point at which the chunk is actually visible/collidable.
     const bool bResultEmpty = Result.bEmpty || !Result.Streams;
+    const uint64 ApplyStartCycles = GVoxelForgeProfileTileGeneration != 0
+        ? FPlatformTime::Cycles64() : 0;
     const auto LogTileReady = [&]()
     {
         if (GVoxelForgeProfileTileGeneration != 0 && Result.RequestStartCycles != 0)
         {
+            const uint64 ReadyCycles = FPlatformTime::Cycles64();
+            const bool bHaveWorkerTiming = Result.GenerationStartCycles != 0
+                && Result.GenerationEndCycles >= Result.GenerationStartCycles;
+            const double RequestToReady = FPlatformTime::ToSeconds64(
+                ReadyCycles - Result.RequestStartCycles);
+            const double ApplySeconds = ApplyStartCycles != 0
+                ? FPlatformTime::ToSeconds64(ReadyCycles - ApplyStartCycles) : 0.0;
+            const double GenerationSeconds = bHaveWorkerTiming
+                ? FPlatformTime::ToSeconds64(
+                    Result.GenerationEndCycles - Result.GenerationStartCycles) : 0.0;
+            const double WorkerQueueSeconds = bHaveWorkerTiming
+                ? FPlatformTime::ToSeconds64(
+                    Result.GenerationStartCycles - Result.RequestStartCycles) : 0.0;
+            const double ResultQueueSeconds = bHaveWorkerTiming
+                ? FMath::Max(0.0, RequestToReady - WorkerQueueSeconds
+                    - GenerationSeconds - ApplySeconds) : 0.0;
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileReady] level=%d empty=%d request_to_ready=%.6f"),
+                TEXT("[VoxelForgeTileReady] tile=(%d,%d,%d) level=%d empty=%d "
+                     "request_to_ready=%.6f worker_queue=%.6f generation=%.6f "
+                     "result_queue=%.6f apply=%.6f"),
+                Result.Tile.Coord.X, Result.Tile.Coord.Y, Result.Tile.Coord.Z,
                 Result.Tile.Level, bResultEmpty ? 1 : 0,
-                FPlatformTime::ToSeconds64(
-                    FPlatformTime::Cycles64() - Result.RequestStartCycles));
+                RequestToReady, WorkerQueueSeconds, GenerationSeconds,
+                ResultQueueSeconds, ApplySeconds);
         }
     };
 
@@ -1405,10 +1426,13 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     Result.RequestStartCycles = bProfileModification
         ? FPlatformTime::Cycles64() : 0;
     const uint64 GenerateStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
+    Result.GenerationStartCycles = GenerateStartCycles;
     GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
                        BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                        /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
                        /*Hole*/ 0, 0, 0, 0, Result);   // hole unused (not a sheet tile)
+    Result.GenerationEndCycles = GenerateStartCycles != 0
+        ? FPlatformTime::Cycles64() : 0;
 
     const double GenerateSeconds = bProfileModification
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - GenerateStartCycles)
@@ -2290,9 +2314,14 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         if (ShouldAbortWork()) return;
 
         FChunkResult Result;
+        const uint64 GenerationStartCycles = GVoxelForgeProfileTileGeneration != 0
+            ? FPlatformTime::Cycles64() : 0;
+        Result.GenerationStartCycles = GenerationStartCycles;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                            BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                            bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY, Result);
+        Result.GenerationEndCycles = GenerationStartCycles != 0
+            ? FPlatformTime::Cycles64() : 0;
         Result.RequestStartCycles = RequestStartCycles;
 
         if (!ShouldAbortWork())

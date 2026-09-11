@@ -87,6 +87,10 @@ struct FChunkResult
     // Monotonic request timestamp used only for streaming telemetry. It is carried through the
     // worker queue so the profile can report request-to-ready, not just worker generation time.
     uint64 RequestStartCycles = 0;
+    // Worker timing boundaries for separating scheduler wait from generation and result/apply wait.
+    // These are telemetry-only and remain zero when tile profiling is disabled.
+    uint64 GenerationStartCycles = 0;
+    uint64 GenerationEndCycles = 0;
     bool bAborted = false;    // Worker observed shutdown; never mark this tile loaded
     bool bEmpty = true;       // true ⇒ all-air tile (Streams null); still marked loaded so we don't re-submit
     // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
