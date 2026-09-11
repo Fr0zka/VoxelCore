@@ -474,6 +474,15 @@ namespace VoxelStrateMeasurePrivate
         bool bClimb = false;
     };
 
+    // Walk is the hard capability contract.  The climb policy is used only for the diagnostic
+    // tier; keeping it explicit at every graph operation prevents a future caller from silently
+    // turning a climbable ledge into a walk-only connectivity pass.
+    enum class EPlayerTraversalPolicy : uint8
+    {
+        WalkOnly,
+        WalkAndClimb,
+    };
+
     bool IsEligiblePlayerFitCell(
         const FSampleGrid& Grid,
         const TArray<uint8>& PlayerFitMask,
@@ -507,8 +516,6 @@ namespace VoxelStrateMeasurePrivate
         }
 
         const bool bFirstIsHigher = FirstSupportHeight > SecondSupportHeight;
-        const int32 LowerColumnX = bFirstIsHigher ? SecondX : FirstX;
-        const int32 LowerColumnY = bFirstIsHigher ? SecondY : FirstY;
         const int32 HigherColumnX = bFirstIsHigher ? FirstX : SecondX;
         const int32 HigherColumnY = bFirstIsHigher ? FirstY : SecondY;
         const float LowerHeight = FMath::Min(FirstSupportHeight, SecondSupportHeight);
@@ -521,18 +528,19 @@ namespace VoxelStrateMeasurePrivate
         }
 
         // A climb edge must meet a solid riser, not connect two independently supported
-        // floating poses across an empty gap. Exclude the top support cell itself: that cell is
-        // present for every supported platform and is not evidence of a climbable face.
-        const int32 FirstRiserZ = FMath::Max(
-            0,
-            FMath::FloorToInt((LowerHeight - Grid.MinZ) / Step));
-        const int32 LastRiserZ = FMath::Min(
-            Grid.NumZ - 1,
-            FMath::CeilToInt((HigherHeight - Grid.MinZ) / Step) - 2);
-        for (int32 Z = FirstRiserZ; Z <= LastRiserZ; ++Z)
+        // floating poses across an empty gap. Test the actual vertical interval between the two
+        // support surfaces in the higher column. The old floor/ceil/-2 indexing skipped the only
+        // solid sample for short quantised ledges and was especially brittle when the support
+        // heights came from scalar interpolation rather than an integer cell boundary.
+        for (int32 Z = 0; Z < Grid.NumZ; ++Z)
         {
-            if (Grid.Air[Grid.Index(HigherColumnX, HigherColumnY, Z)] == 0u
-                || Grid.Air[Grid.Index(LowerColumnX, LowerColumnY, Z)] == 0u)
+            const float SampleZ = Grid.MinZ + (static_cast<float>(Z) + 0.5f) * Step;
+            if (SampleZ + KINDA_SMALL_NUMBER < LowerHeight
+                || SampleZ >= HigherHeight - KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+            if (Grid.Air[Grid.Index(HigherColumnX, HigherColumnY, Z)] == 0u)
             {
                 return true;
             }
@@ -547,7 +555,8 @@ namespace VoxelStrateMeasurePrivate
         const FVoxelStrateMeasureSettings* Settings,
         int32 First,
         int32 Second,
-        bool& bOutClimb)
+        bool& bOutClimb,
+        EPlayerTraversalPolicy Policy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         bOutClimb = false;
         if (!IsEligiblePlayerFitCell(Grid, PlayerFitMask, First)
@@ -605,7 +614,8 @@ namespace VoxelStrateMeasurePrivate
         {
             return true;
         }
-        if (!Settings->bPlayerClimbingEnabled
+        if (Policy == EPlayerTraversalPolicy::WalkOnly
+            || !Settings->bPlayerClimbingEnabled
             || HeightDelta > ClimbHeightVoxels + KINDA_SMALL_NUMBER)
         {
             return false;
@@ -622,7 +632,8 @@ namespace VoxelStrateMeasurePrivate
         const TArray<float>* PlayerFitSupportHeights,
         const FVoxelStrateMeasureSettings* Settings,
         int32 Cell,
-        TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>>& OutNeighbours)
+        TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>>& OutNeighbours,
+        EPlayerTraversalPolicy Policy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         OutNeighbours.Reset();
         if (Cell < 0 || Cell >= Grid.CellCount)
@@ -643,7 +654,7 @@ namespace VoxelStrateMeasurePrivate
             bool bClimb = false;
             if (IsPlayerTraversalEdge(
                     Grid, PlayerFitMask, PlayerFitSupportHeights, Settings,
-                    Cell, Neighbor, bClimb))
+                    Cell, Neighbor, bClimb, Policy))
             {
                 OutNeighbours.Add({ Neighbor, bClimb });
             }
@@ -658,7 +669,8 @@ namespace VoxelStrateMeasurePrivate
         if (Z + 1 < Grid.NumZ) TryAdd(Grid.Index(X, Y, Z + 1));
         if (Z > 0)             TryAdd(Grid.Index(X, Y, Z - 1));
 
-        if (PlayerFitSupportHeights == nullptr || Settings == nullptr
+        if (Policy == EPlayerTraversalPolicy::WalkOnly
+            || PlayerFitSupportHeights == nullptr || Settings == nullptr
             || !Settings->bPlayerClimbingEnabled)
         {
             return;
@@ -695,8 +707,8 @@ namespace VoxelStrateMeasurePrivate
                     const int32 Neighbor = Grid.Index(TargetX, TargetY, TargetZ);
                     bool bClimb = false;
                     if (IsPlayerTraversalEdge(
-                            Grid, PlayerFitMask, PlayerFitSupportHeights, Settings,
-                            Cell, Neighbor, bClimb)
+                        Grid, PlayerFitMask, PlayerFitSupportHeights, Settings,
+                            Cell, Neighbor, bClimb, Policy)
                         && bClimb)
                     {
                         OutNeighbours.Add({ Neighbor, true });
@@ -717,7 +729,8 @@ namespace VoxelStrateMeasurePrivate
         TArray<int64>* OutComponentCells,
         const TArray<uint8>* EligibilityMask = nullptr,
         const TArray<float>* PlayerFitSupportHeights = nullptr,
-        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr,
+        EPlayerTraversalPolicy TraversalPolicy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         OutComponents.SetNumUninitialized(Grid.CellCount);
         for (int32 Index = 0; Index < Grid.CellCount; ++Index)
@@ -780,7 +793,7 @@ namespace VoxelStrateMeasurePrivate
                     TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
                     AppendPlayerTraversalNeighbours(
                         Grid, *EligibilityMask, PlayerFitSupportHeights,
-                        TraversalSettings, Current, Neighbours);
+                        TraversalSettings, Current, Neighbours, TraversalPolicy);
                     for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
                     {
                         Visit(Neighbour.Cell);
@@ -1727,7 +1740,8 @@ namespace VoxelStrateMeasurePrivate
             nullptr,
             &PlayerFit,
             &PlayerFitSupportHeights,
-            &Settings);
+            &Settings,
+            EPlayerTraversalPolicy::WalkOnly);
         InOutMetrics.NumTraversableComponents = NumComponents;
         InOutMetrics.LargestTraversableComponentCells = LargestComponentCells;
         InOutMetrics.TraversableComponentShare = InOutMetrics.NumPlayerFitCells > 0
@@ -2234,7 +2248,8 @@ namespace VoxelStrateMeasurePrivate
         FCoarseEdge& OutFailedEdge,
         const TArray<uint8>* EligibilityMask = nullptr,
         const TArray<float>* PlayerFitSupportHeights = nullptr,
-        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr,
+        EPlayerTraversalPolicy TraversalPolicy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         OutFailedEdge = FCoarseEdge();
 
@@ -2262,7 +2277,8 @@ namespace VoxelStrateMeasurePrivate
                     bool bClimb = false;
                     if (!IsPlayerTraversalEdge(
                             Grid, *EligibilityMask, PlayerFitSupportHeights,
-                            TraversalSettings, Path[PathIndex - 1], Path[PathIndex], bClimb))
+                            TraversalSettings, Path[PathIndex - 1], Path[PathIndex], bClimb,
+                            TraversalPolicy))
                     {
                         OutFailedEdge = MakeCoarseEdge(
                             Path[PathIndex - 1], Path[PathIndex]);
@@ -2344,7 +2360,8 @@ namespace VoxelStrateMeasurePrivate
         TArray<int32>& OutPath,
         const TArray<uint8>* EligibilityMask = nullptr,
         const TArray<float>* PlayerFitSupportHeights = nullptr,
-        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr,
+        EPlayerTraversalPolicy TraversalPolicy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         const auto IsEligible = [&, EligibilityMask](int32 Cell)
         {
@@ -2396,7 +2413,7 @@ namespace VoxelStrateMeasurePrivate
                 TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
                 AppendPlayerTraversalNeighbours(
                     Grid, *EligibilityMask, PlayerFitSupportHeights,
-                    TraversalSettings, Current, Neighbours);
+                    TraversalSettings, Current, Neighbours, TraversalPolicy);
                 for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
                 {
                     Visit(Neighbour.Cell);
@@ -2454,7 +2471,8 @@ namespace VoxelStrateMeasurePrivate
         int32 MaxRouteRetries,
         const TArray<uint8>* EligibilityMask = nullptr,
         const TArray<float>* PlayerFitSupportHeights = nullptr,
-        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr,
+        EPlayerTraversalPolicy TraversalPolicy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         OutStart = -1;
         OutGoal = -1;
@@ -2493,7 +2511,7 @@ namespace VoxelStrateMeasurePrivate
         {
             if (!FindCoarsePath(
                     Grid, OutStart, OutGoal, BlockedEdges, Path, EligibilityMask,
-                    PlayerFitSupportHeights, TraversalSettings))
+                    PlayerFitSupportHeights, TraversalSettings, TraversalPolicy))
             {
                 // This is a negative verdict only after all edges excluded by earlier
                 // full-resolution failures leave no coarse route at this resolution.
@@ -2506,7 +2524,7 @@ namespace VoxelStrateMeasurePrivate
             FCoarseEdge FailedEdge;
             if (FullResolutionPathIsAir(
                     Generator, Sampler, Grid, AVoxel, BVoxel, Path, FailedEdge,
-                    EligibilityMask, PlayerFitSupportHeights, TraversalSettings))
+                    EligibilityMask, PlayerFitSupportHeights, TraversalSettings, TraversalPolicy))
             {
                 return EVoxelConnectivityResult::Connected;
             }
@@ -2579,7 +2597,8 @@ namespace VoxelStrateMeasurePrivate
         TArray<int32>* OutComponents = nullptr,
         int32* OutNumComponents = nullptr,
         const TArray<float>* PlayerFitSupportHeights = nullptr,
-        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr)
+        const FVoxelStrateMeasureSettings* TraversalSettings = nullptr,
+        EPlayerTraversalPolicy TraversalPolicy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         OutDiagnostics = FVoxelConnectivityDiagnostics();
         if (OutComponents != nullptr)
@@ -2620,7 +2639,8 @@ namespace VoxelStrateMeasurePrivate
             nullptr,
             EligibilityMask,
             PlayerFitSupportHeights,
-            TraversalSettings);
+            TraversalSettings,
+            TraversalPolicy);
 
         if (OutComponents != nullptr)
         {
@@ -2678,6 +2698,115 @@ namespace VoxelStrateMeasurePrivate
         });
         OutDiagnostics.StartToGoalComponentDistanceCells = ComponentDistances[0];
         OutDiagnostics.GoalToStartComponentDistanceCells = ComponentDistances[1];
+    }
+
+    // The hard capability graph is deliberately flooded with walking edges only.  This second
+    // pass contracts each walk-only component to one node and adds only the explicitly supported
+    // climb edges between nodes.  It gives the reporting tiers without allowing a climb to turn a
+    // failed primordial walk-only verdict into a pass.
+    void BuildClimbTierFromWalkComponents(
+        const FSampleGrid& Grid,
+        const TArray<uint8>& PlayerFitMask,
+        const TArray<float>& PlayerFitSupportHeights,
+        const FVoxelStrateMeasureSettings& Settings,
+        const TArray<int32>& Components,
+        int32 NumComponents,
+        int32 StartCell,
+        int32 GoalCell,
+        int64 PlayerFitCells,
+        int64& OutWalkOnlyReachableCells,
+        int64& OutClimbReachableCells,
+        int64& OutMineRequiredCells,
+        bool& bOutClimbCanReach,
+        int64& OutClimbEdges)
+    {
+        OutWalkOnlyReachableCells = 0;
+        OutClimbReachableCells = 0;
+        OutMineRequiredCells = 0;
+        bOutClimbCanReach = false;
+        OutClimbEdges = 0;
+
+        if (NumComponents <= 0
+            || Components.Num() != Grid.CellCount
+            || !Components.IsValidIndex(StartCell)
+            || !Components.IsValidIndex(GoalCell))
+        {
+            return;
+        }
+
+        const int32 StartComponent = Components[StartCell];
+        const int32 GoalComponent = Components[GoalCell];
+        if (StartComponent < 0 || StartComponent >= NumComponents
+            || GoalComponent < 0 || GoalComponent >= NumComponents)
+        {
+            return;
+        }
+
+        TArray<TArray<int32>> CellsByComponent;
+        CellsByComponent.SetNum(NumComponents);
+        for (int32 Cell = 0; Cell < Grid.CellCount; ++Cell)
+        {
+            const int32 Component = Components[Cell];
+            if (Component >= 0 && Component < NumComponents
+                && IsEligiblePlayerFitCell(Grid, PlayerFitMask, Cell))
+            {
+                CellsByComponent[Component].Add(Cell);
+            }
+        }
+
+        OutWalkOnlyReachableCells = CellsByComponent[StartComponent].Num();
+
+        TArray<uint8> ReachedComponents;
+        ReachedComponents.Init(0u, NumComponents);
+        TArray<int32> Queue;
+        Queue.Reserve(NumComponents);
+        ReachedComponents[StartComponent] = 1u;
+        Queue.Add(StartComponent);
+
+        for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+        {
+            const int32 Component = Queue[QueueIndex];
+            for (const int32 Cell : CellsByComponent[Component])
+            {
+                TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
+                AppendPlayerTraversalNeighbours(
+                    Grid,
+                    PlayerFitMask,
+                    &PlayerFitSupportHeights,
+                    &Settings,
+                    Cell,
+                    Neighbours,
+                    EPlayerTraversalPolicy::WalkAndClimb);
+                for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
+                {
+                    if (!Neighbour.bClimb || !Components.IsValidIndex(Neighbour.Cell))
+                    {
+                        continue;
+                    }
+                    ++OutClimbEdges;
+                    const int32 NeighbourComponent = Components[Neighbour.Cell];
+                    if (NeighbourComponent >= 0 && NeighbourComponent < NumComponents
+                        && NeighbourComponent != Component
+                        && ReachedComponents[NeighbourComponent] == 0u)
+                    {
+                        ReachedComponents[NeighbourComponent] = 1u;
+                        Queue.Add(NeighbourComponent);
+                    }
+                }
+            }
+        }
+
+        for (int32 Component = 0; Component < NumComponents; ++Component)
+        {
+            if (ReachedComponents[Component] != 0u)
+            {
+                OutClimbReachableCells += CellsByComponent[Component].Num();
+            }
+        }
+        bOutClimbCanReach = ReachedComponents[GoalComponent] != 0u;
+        OutMineRequiredCells = FMath::Max<int64>(
+            0,
+            PlayerFitCells - OutClimbReachableCells);
     }
 
     EVoxelConnectivityResult QueryConnectivity(
@@ -2809,7 +2938,10 @@ namespace VoxelStrateMeasurePrivate
             Settings.MaxRouteRetries,
             bPlayerFitRestricted ? &PlayerFitMask : nullptr,
             bPlayerFitRestricted ? &PlayerFitSupportHeights : nullptr,
-            bPlayerFitRestricted ? &Settings : nullptr);
+            bPlayerFitRestricted ? &Settings : nullptr,
+            bPlayerFitRestricted
+                ? EPlayerTraversalPolicy::WalkOnly
+                : EPlayerTraversalPolicy::WalkAndClimb);
         if (OutDiagnostics != nullptr)
         {
             PopulateConnectivityDiagnostics(
@@ -2825,7 +2957,10 @@ namespace VoxelStrateMeasurePrivate
                 nullptr,
                 nullptr,
                 bPlayerFitRestricted ? &PlayerFitSupportHeights : nullptr,
-                bPlayerFitRestricted ? &Settings : nullptr);
+                bPlayerFitRestricted ? &Settings : nullptr,
+                bPlayerFitRestricted
+                    ? EPlayerTraversalPolicy::WalkOnly
+                    : EPlayerTraversalPolicy::WalkAndClimb);
             if (bPlayerFitRestricted &&
                 (Result == EVoxelConnectivityResult::StartCellNotPlayerFit
                  || Result == EVoxelConnectivityResult::GoalCellNotPlayerFit))
@@ -2861,11 +2996,12 @@ namespace VoxelStrateMeasurePrivate
         const TArray<uint8>& PlayerFitMask,
         const TArray<float>* PlayerFitSupportHeights,
         const FVoxelStrateMeasureSettings* Settings,
-        int32 Cell)
+        int32 Cell,
+        EPlayerTraversalPolicy Policy = EPlayerTraversalPolicy::WalkAndClimb)
     {
         TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
         AppendPlayerTraversalNeighbours(
-            Grid, PlayerFitMask, PlayerFitSupportHeights, Settings, Cell, Neighbours);
+            Grid, PlayerFitMask, PlayerFitSupportHeights, Settings, Cell, Neighbours, Policy);
         int32 Count = 0;
         for (const FPlayerTraversalNeighbour& Neighbour : Neighbours)
         {
@@ -2938,6 +3074,7 @@ namespace VoxelStrateMeasurePrivate
         const TArray<uint8>& PlayerFitMask,
         const TArray<float>* PlayerFitSupportHeights,
         const FVoxelStrateMeasureSettings* TraversalSettings,
+        EPlayerTraversalPolicy TraversalPolicy,
         int32 Start,
         int32 Goal,
         float NarrowGapThresholdVoxels,
@@ -2977,7 +3114,7 @@ namespace VoxelStrateMeasurePrivate
             if (PlayerFitSupportHeights != nullptr && TraversalSettings != nullptr
                 && IsPlayerTraversalEdge(
                     Grid, PlayerFitMask, PlayerFitSupportHeights, TraversalSettings,
-                    From, To, bClimb)
+                    From, To, bClimb, TraversalPolicy)
                 && bClimb)
             {
                 ++InOutReport.ClimbTraversals;
@@ -3012,7 +3149,7 @@ namespace VoxelStrateMeasurePrivate
             TArray<FPlayerTraversalNeighbour, TInlineAllocator<128>> Neighbours;
             AppendPlayerTraversalNeighbours(
                 Grid, PlayerFitMask, PlayerFitSupportHeights, TraversalSettings,
-                Current, Neighbours);
+                Current, Neighbours, TraversalPolicy);
             bool bAdvanced = false;
             while (NextDirection.Last() < Neighbours.Num())
             {
@@ -3043,7 +3180,7 @@ namespace VoxelStrateMeasurePrivate
             if (Current != Start && Current != Goal
                 && CountPlayerFitNeighbours(
                     Grid, PlayerFitMask, PlayerFitSupportHeights,
-                    TraversalSettings, Current) <= 1)
+                    TraversalSettings, Current, TraversalPolicy) <= 1)
             {
                 ++InOutReport.DeadEndsEncountered;
             }
@@ -3466,7 +3603,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         Settings.MaxRouteRetries,
         &PlayerFitMask,
         &PlayerFitSupportHeights,
-        &Settings);
+        &Settings,
+        EPlayerTraversalPolicy::WalkOnly);
 
     FVoxelConnectivityDiagnostics Diagnostics;
     TArray<int32> Components;
@@ -3484,7 +3622,8 @@ bool VF_MeasurePlayerFitWalkWithSampler(
         &Components,
         &NumComponents,
         &PlayerFitSupportHeights,
-        &Settings);
+        &Settings,
+        EPlayerTraversalPolicy::WalkOnly);
 
     OutReport.bValid = true;
     OutReport.Result = Result;
@@ -3499,10 +3638,32 @@ bool VF_MeasurePlayerFitWalkWithSampler(
     OutReport.SampledMinY = Grid.MinY;
     OutReport.SampledMaxY = Grid.MaxY;
     OutReport.PlayerFitVolumeCells = NumPlayerFitCells;
-    OutReport.ReachablePlayerFitCells = FMath::Max<int64>(
+    OutReport.WalkOnlyReachablePlayerFitCells = FMath::Max<int64>(
         Diagnostics.StartComponentCells, 0);
+    OutReport.ReachablePlayerFitCells = OutReport.WalkOnlyReachablePlayerFitCells;
+    OutReport.bWalkOnlyCanReachDeparture = Result == EVoxelConnectivityResult::Connected;
+    OutReport.bCanReachDeparture = OutReport.bWalkOnlyCanReachDeparture;
+    BuildClimbTierFromWalkComponents(
+        Grid,
+        PlayerFitMask,
+        PlayerFitSupportHeights,
+        Settings,
+        Components,
+        NumComponents,
+        Start,
+        Goal,
+        NumPlayerFitCells,
+        OutReport.WalkOnlyReachablePlayerFitCells,
+        OutReport.ClimbReachablePlayerFitCells,
+        OutReport.MineRequiredPlayerFitCells,
+        OutReport.bClimbCanReachDeparture,
+        OutReport.ClimbEdges);
     OutReport.ReachablePlayerFitFraction = OutReport.PlayerFitVolumeCells > 0
         ? static_cast<float>(static_cast<double>(OutReport.ReachablePlayerFitCells)
+            / static_cast<double>(OutReport.PlayerFitVolumeCells))
+        : 0.0f;
+    OutReport.ClimbReachablePlayerFitFraction = OutReport.PlayerFitVolumeCells > 0
+        ? static_cast<float>(static_cast<double>(OutReport.ClimbReachablePlayerFitCells)
             / static_cast<double>(OutReport.PlayerFitVolumeCells))
         : 0.0f;
     OutReport.PlayerFitComponents = NumComponents;
@@ -3524,6 +3685,7 @@ bool VF_MeasurePlayerFitWalkWithSampler(
             PlayerFitMask,
             &PlayerFitSupportHeights,
             &Settings,
+            EPlayerTraversalPolicy::WalkOnly,
             Start,
             Goal,
             NarrowGapThresholdVoxels,

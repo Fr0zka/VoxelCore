@@ -46,6 +46,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming")
 	int32 MaxConcurrentTasks = 16;
 
+	// Optional hard cap for the generation worker budget. 0 keeps the safe automatic cap of
+	// logical cores minus two; a positive value makes that cap visible and authorable beside the
+	// task budget instead of hiding it in AVoxelWorld. The effective task count is still the
+	// minimum of this value and MaxConcurrentTasks.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
+	int32 MaxGenerationWorkerCores = 0;
+
 	// Nombre max de meshes appliqués (upload GPU) par frame. Seuls les vrais applies
 	// comptent (chunks vides/périmés se vident gratuitement). À 32³ chaque apply est léger
 	// (~0.1 ms) — tunable en live sur l'asset : montez (8-16) si le remplissage traîne,
@@ -282,12 +289,12 @@ public:
 	// frame. A region is applied once ALL its cells have finished marching, in one batched AddInstances
 	// per mesh; this throttles that burst. The expensive ray-march runs async on workers. (Named "Cells"
 	// for asset back-compat — the apply unit is now a region of DecorationRegionSizeCells^2 cells.)
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "1"))
 	int32 MaxDecorationCellsPerFrame = 2;
 
 	// Max decoration ray-march tasks in flight at once. Keeps decoration marching from crowding the
 	// mesh-gen workers (which are the streaming bottleneck). 0 disables decorations entirely.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Content", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
 	int32 MaxConcurrentDecorationTasks = 4;
 
 	//=========================================================================

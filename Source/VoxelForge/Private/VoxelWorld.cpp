@@ -31,6 +31,7 @@
 #include "IImageWrapperModule.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/FileHelper.h"
+#include "Misc/CommandLine.h"
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
@@ -47,6 +48,18 @@ namespace
         TEXT("voxel.ProfileTileGeneration"),
         GVoxelForgeProfileTileGeneration,
         TEXT("Log worker tile generation time with level/step/cell count."));
+
+    // Startup command-line cvars can arrive before the game world has spawned AVoxelWorld (or
+    // before its first tiles have become visible). Keep the diagnostic edit pending until Tick has
+    // a loaded tile; otherwise a startup measurement silently becomes a no-op or edits the wrong
+    // position.
+    int32 GVoxelForgePendingTestModification = 0;
+    float GVoxelForgePendingModificationRadius = 3.0f;
+    float GVoxelForgePendingModificationStrength = 10.0f;
+    bool GVoxelForgeTestModificationCommandLineConsumed = false;
+    bool GVoxelForgeStreamingBudgetReported = false;
+    bool GVoxelForgeGenerationCapHitReported = false;
+    int32 GVoxelForgeMaxPendingTilesObserved = 0;
 }
 
 AVoxelWorld::AVoxelWorld()
@@ -1075,7 +1088,52 @@ void AVoxelWorld::Tick(float DeltaTime)
         // Independent of the density volume (self-guards on OrbLightMPC); this is the replacement path.
         UpdateOrbLightMPC();
     }
+    // The diagnostic harness uses an explicit command-line token rather than a console command:
+    // Unreal processes startup ExecCmds before this runtime module's console registrations are
+    // guaranteed to exist. Reading the command line here is order-independent, and the actual edit
+    // still waits for a loaded tile and goes through the ordinary modification path below.
+    if (!GVoxelForgeTestModificationCommandLineConsumed)
+    {
+        GVoxelForgeTestModificationCommandLineConsumed = true;
+        const FString CommandLine(FCommandLine::Get());
+        if (CommandLine.Contains(TEXT("-voxel.TestModification=1"), ESearchCase::IgnoreCase))
+        {
+            GVoxelForgePendingModificationRadius = 3.0f;
+            GVoxelForgePendingModificationStrength = 10.0f;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTestModification] queued radius=%.2f strength=%.2f"),
+                GVoxelForgePendingModificationRadius,
+                GVoxelForgePendingModificationStrength);
+            GVoxelForgePendingTestModification = 1;
+        }
+    }
     ProcessPendingChunks();
+
+    // Complete the one-shot diagnostic request only after the player's level-0 centre tile is
+    // loaded and idle. Waiting for any coarse tile would take the async-neighbour branch and would
+    // not measure the normal synchronous centre remesh that makes a local edit feel expensive.
+    FVector ModificationPosition = PlayerLastPos;
+    if (ModificationPosition == FVector::ZeroVector)
+    {
+        ModificationPosition = GetActorLocation();
+    }
+    const FVoxelTileKey ModificationCenterTile(
+        WorldToChunkCoord(WorldToLocalCm(ModificationPosition)), 0);
+    if (GVoxelForgePendingTestModification != 0
+        && DiffLayer
+        && LoadedTiles.Contains(ModificationCenterTile)
+        && !PendingTiles.Contains(ModificationCenterTile))
+    {
+        GVoxelForgePendingTestModification = 0;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeTestModification] applying position=(%.2f,%.2f,%.2f) radius=%.2f strength=%.2f"),
+            ModificationPosition.X, ModificationPosition.Y, ModificationPosition.Z,
+            GVoxelForgePendingModificationRadius, GVoxelForgePendingModificationStrength);
+        CarveAtPosition(
+            ModificationPosition,
+            GVoxelForgePendingModificationRadius,
+            GVoxelForgePendingModificationStrength);
+    }
     ProcessUnloadQueue();
 
 #if ENABLE_DRAW_DEBUG
@@ -1322,6 +1380,9 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
 {
     if (!Generator || !Mesher || ShouldAbortWork()) return;
 
+    const bool bProfileModification = GVoxelForgeProfileTileGeneration != 0;
+    const uint64 SyncStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
+
     const FIntVector OriginVoxels = Tile.OriginVoxels();
     const int32 Cells = CHUNK_SIZE;   // level 0 is always full-res (level 0 < FullResClipLevels)
     const int32 Step  = 1;            // Extent(=CHUNK_SIZE) / Cells
@@ -1341,14 +1402,30 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     }
 
     FChunkResult Result;
-    Result.RequestStartCycles = GVoxelForgeProfileTileGeneration != 0
+    Result.RequestStartCycles = bProfileModification
         ? FPlatformTime::Cycles64() : 0;
+    const uint64 GenerateStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
     GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
                        BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                        /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
                        /*Hole*/ 0, 0, 0, 0, Result);   // hole unused (not a sheet tile)
 
+    const double GenerateSeconds = bProfileModification
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - GenerateStartCycles)
+        : 0.0;
+    const uint64 ApplyStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
     ApplyTileResult(Result);
+    if (bProfileModification)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeSyncRemeshProfile] tile=(%d,%d,%d) empty=%d generation=%.6f "
+                 "apply=%.6f total=%.6f"),
+            Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z,
+            (Result.bEmpty || !Result.Streams) ? 1 : 0,
+            GenerateSeconds,
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles),
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - SyncStartCycles));
+    }
 }
 
 void AVoxelWorld::ProcessUnloadQueue()
@@ -1717,18 +1794,46 @@ bool AVoxelWorld::IsTileInClipRange(const FVoxelTileKey& Tile, const FIntVector&
 
 int32 AVoxelWorld::GetMaxConcurrentTasks() const
 {
-    // T2.d — the asset value, capped to the spare LOGICAL cores. BackgroundNormal priority
-    // (see LoadTile) already stops gen from starving the frame; this cap stops a flat 16 from
-    // thrashing context switches on small CPUs where 16 > the machine's spare parallelism.
+    // T2.d — both sides of the cap are authored in Voxel|Streaming. BackgroundNormal priority
+    // (see LoadTile) already stops gen from starving the frame; this cap stops a flat task count
+    // from thrashing context switches on small CPUs where it exceeds spare parallelism.
     const int32 Asset = Settings ? Settings->MaxConcurrentTasks : 16;
-    const int32 SpareCores = FMath::Max(2, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 2);
-    return FMath::Clamp(Asset, 1, SpareCores);
+    const int32 LogicalCores = FMath::Max(
+        1, FPlatformMisc::NumberOfCoresIncludingHyperthreads());
+    const int32 AutomaticCap = FMath::Max(2, LogicalCores - 2);
+    const int32 AuthoredCoreCap = Settings ? Settings->MaxGenerationWorkerCores : 0;
+    const int32 CoreCap = AuthoredCoreCap > 0
+        ? FMath::Clamp(AuthoredCoreCap, 1, LogicalCores)
+        : AutomaticCap;
+    return FMath::Clamp(Asset, 1, CoreCap);
 }
 
 void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
     const int32 MaxTasks = GetMaxConcurrentTasks();
+    if (GVoxelForgeProfileTileGeneration != 0
+        && !GVoxelForgeStreamingBudgetReported)
+    {
+        const int32 LogicalCores = FMath::Max(
+            1, FPlatformMisc::NumberOfCoresIncludingHyperthreads());
+        const int32 AutomaticCap = FMath::Max(2, LogicalCores - 2);
+        const int32 AssetCap = Settings ? Settings->MaxConcurrentTasks : 16;
+        const int32 AuthoredCoreCap = Settings ? Settings->MaxGenerationWorkerCores : 0;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStreamingBudget] logical_cores=%d automatic_core_cap=%d "
+                 "authored_core_cap=%d asset_task_cap=%d effective_generation_cap=%d "
+                 "max_mesh_applies=%d max_apply_ms=%.3f max_unloads=%d"),
+            LogicalCores,
+            AutomaticCap,
+            AuthoredCoreCap,
+            AssetCap,
+            MaxTasks,
+            Settings ? Settings->MaxMeshAppliesPerFrame : 4,
+            Settings ? Settings->MaxMeshApplyMilliseconds : 2.0f,
+            Settings ? Settings->MaxUnloadsPerFrame : 6);
+        GVoxelForgeStreamingBudgetReported = true;
+    }
 
     const FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
     CurrentCenterChunk = CenterChunk;
@@ -2013,6 +2118,24 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
             ++Submitted;
         }
 
+        if (GVoxelForgeProfileTileGeneration != 0
+            && PendingTiles.Num() > GVoxelForgeMaxPendingTilesObserved)
+        {
+            GVoxelForgeMaxPendingTilesObserved = PendingTiles.Num();
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeStreamingBudget] pending_max=%d effective=%d submitted=%d"),
+                GVoxelForgeMaxPendingTilesObserved, MaxTasks, Submitted);
+        }
+        if (GVoxelForgeProfileTileGeneration != 0
+            && PendingTiles.Num() >= MaxTasks
+            && !GVoxelForgeGenerationCapHitReported)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeStreamingBudget] generation_cap_hit=1 pending=%d effective=%d"),
+                PendingTiles.Num(), MaxTasks);
+            GVoxelForgeGenerationCapHitReported = true;
+        }
+
         if (Submitted == 0 && PendingTiles.Num() == 0 && BandRemeshQueue.Num() == 0 && DirtyRemeshQueue.Num() == 0)
         {
             // Everything desired is loaded → load-before-unload is satisfied: drop the
@@ -2036,6 +2159,14 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     const int32 MaxTasks = GetMaxConcurrentTasks();   // T2.d — core-clamped
     if (PendingTiles.Num() >= MaxTasks)
     {
+        if (GVoxelForgeProfileTileGeneration != 0
+            && !GVoxelForgeGenerationCapHitReported)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeStreamingBudget] generation_cap_hit=1 pending=%d effective=%d"),
+                PendingTiles.Num(), MaxTasks);
+            GVoxelForgeGenerationCapHitReported = true;
+        }
         return;  // Budget full — wait for a task to finish.
     }
     PendingTiles.Add(Tile);
@@ -2727,7 +2858,13 @@ void AVoxelWorld::FillAtPosition(FVector Position, float Radius, float Strength)
 void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
 {
     if (!DiffLayer) return;
+    const bool bProfileModification = GVoxelForgeProfileTileGeneration != 0;
+    const uint64 ModificationStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
+    const uint64 DiffStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
     TArray<FIntVector> AffectedChunks = DiffLayer->ApplyModification(Modification);
+    const double DiffSeconds = bProfileModification
+        ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - DiffStartCycles)
+        : 0.0;
 
     // INSTANT DIG FEEL — synchronously re-mesh the level-0 tile the brush CENTRE sits in, so the hole
     // appears THIS frame right where the player is looking. Neighbour tiles (brush edge) re-mesh async
@@ -2743,11 +2880,30 @@ void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
         && LoadedTiles.Contains(CenterTile)
         && !PendingTiles.Contains(CenterTile))
     {
+        const uint64 SyncStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
         SyncRemeshTile(CenterTile);
+        if (bProfileModification)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeModificationProfile] center_sync=%.6f"),
+                FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - SyncStartCycles));
+        }
         bSyncedCenter = true;
     }
 
+    const uint64 QueueStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
     RemeshDirtyChunks(AffectedChunks, bSyncedCenter ? &CenterTile : nullptr);
+    if (bProfileModification)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeModificationProfile] affected=%d diff=%.6f queue=%.6f total=%.6f "
+                 "center_synced=%d"),
+            AffectedChunks.Num(),
+            DiffSeconds,
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - QueueStartCycles),
+            FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ModificationStartCycles),
+            bSyncedCenter ? 1 : 0);
+    }
 
     // Remove decorations inside the modified volume so grass doesn't float over a dug hole (or bury under a
     // fill). Instant + flicker-free (only the affected instances go); the placer already skips carved columns

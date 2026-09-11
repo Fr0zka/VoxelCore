@@ -398,9 +398,10 @@ public:
     void ApplyPassageTunnelAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
                                  float BaseDensity, float SealThickness) const;
 
-    /** Apply the landing/tunnel MC backstop in one cached passage scan after disturbances. */
+    /** Apply the landing/tunnel MC post in one cached passage scan after disturbances. */
     void ApplyPassageStructuralPostsMC(float& Density, float WorldX, float WorldY, float WorldZ,
-                                       float BaseDensity, float SealThickness) const;
+                                       float BaseDensity, float SealThickness,
+                                       bool bProtectAuthoredTunnelFloor = false) const;
 
     /** Re-assert a landing floor after the landing air pass, still before the final XY seal. */
     void ApplyPassageLandingFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,

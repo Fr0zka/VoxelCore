@@ -183,6 +183,23 @@ public:
             VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileName);
             Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
         }
+
+        // The floor profile is authored by the room-graph source, before any detail op runs. Keep
+        // that source-level clearance invariant through the complete stack. This is intentionally
+        // one final clamp, rather than a per-op query or a support-column revalidation: the source
+        // has already proved the current sample belongs to its finite authored floor band.
+        if (S.bProtectedStructuralFloor
+            && FMath::IsFinite(S.StructuralFloorMinimumDensity)
+            && S.StructuralFloorMinimumDensity > 0.0f)
+        {
+            if (S.Density < S.StructuralFloorMinimumDensity
+                && VoxelDensityProfile::AreCountersEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelAuthoredFloorProtectionClamps);
+            }
+            S.Density = FMath::Max(S.Density, S.StructuralFloorMinimumDensity);
+        }
         return S;
     }
 

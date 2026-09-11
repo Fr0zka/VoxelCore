@@ -416,9 +416,17 @@ namespace VoxelDensityProfile
         case ECounter::TunnelSupportFloorChecks:return TEXT("TunnelSupportFloorChecks");
         case ECounter::TunnelSupportFloorBackstopFires:return TEXT("TunnelSupportFloorBackstopFires");
         case ECounter::TunnelRoomFloorBackstopFires:return TEXT("TunnelRoomFloorBackstopFires");
+        case ECounter::TunnelAuthoredFloorSamples:return TEXT("TunnelAuthoredFloorSamples");
+        case ECounter::TunnelAuthoredFloorProtectionClamps:return TEXT("TunnelAuthoredFloorProtectionClamps");
+        case ECounter::TunnelAuthoredFloorDisturbanceSkips:return TEXT("TunnelAuthoredFloorDisturbanceSkips");
+        case ECounter::TunnelFloorProfileFallbacks:return TEXT("TunnelFloorProfileFallbacks");
         case ECounter::TunnelFloorProfileBuilds:return TEXT("TunnelFloorProfileBuilds");
         case ECounter::TunnelFloorProfileSegments:return TEXT("TunnelFloorProfileSegments");
         case ECounter::TunnelFloorProfileLedges:return TEXT("TunnelFloorProfileLedges");
+        case ECounter::TunnelFloorProfileLedgesBelow2Voxels:return TEXT("TunnelFloorProfileLedgesBelow2Voxels");
+        case ECounter::TunnelFloorProfileLedges2To4Voxels:return TEXT("TunnelFloorProfileLedges2To4Voxels");
+        case ECounter::TunnelFloorProfileLedges4To8Voxels:return TEXT("TunnelFloorProfileLedges4To8Voxels");
+        case ECounter::TunnelFloorProfileLedges8PlusVoxels:return TEXT("TunnelFloorProfileLedges8PlusVoxels");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");

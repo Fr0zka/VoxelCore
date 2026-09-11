@@ -1946,7 +1946,8 @@ static bool VF_IsPassageRoomFloor(
 
 void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness) const
+    float BaseDensity, float SealThickness,
+    bool bProtectAuthoredTunnelFloor) const
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageStructuralPosts);
@@ -2009,7 +2010,12 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         }
     }
 
-    if (!bAnyPassageFloor && MinLandingSDF < FLT_MAX)
+    // A graph tunnel floor is authored by the room-graph source with its complete clearance
+    // budget. A neighbouring inter-strate landing must not reopen that finite support band; its
+    // carve remains valid everywhere else. Legacy callers leave this false and retain the old
+    // passage-owned behavior.
+    if (!bProtectAuthoredTunnelFloor
+        && !bAnyPassageFloor && MinLandingSDF < FLT_MAX)
     {
         float InternalDensity = -Density;
         VF_ApplyPassageLandingCarving(
@@ -2022,7 +2028,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         Density = FMath::Min(Density, -BaseDensity);
     }
 
-    if (bWalkableAir)
+    if (bWalkableAir && !bProtectAuthoredTunnelFloor)
     {
         Density = FMath::Max(
             Density, BaseDensity * 2.0f + SealThickness + 4.0f);

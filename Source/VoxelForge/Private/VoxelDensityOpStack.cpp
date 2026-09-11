@@ -4226,6 +4226,35 @@ namespace
             }
 
             InOut.Sdf = CaveSDF;
+
+            // The swept floor is part of the cached tunnel shape, but the common structural tail
+            // used to discover the same band only after all detail ops had run. Publish that
+            // build-time ownership now so the stack can preserve the authored support through its
+            // remaining modifiers without a second floor-writing pass. TryGet... below reuses the
+            // exact same cached result for the generator's post-disturbance hand-off.
+            const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(
+                S.LastWorldPosition);
+            S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+                WorldX, WorldY, WorldZ, GetCache(), SupportColumn);
+            S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
+            S.bLastTunnelCoreWorldEvaluationValid = true;
+            if (S.LastTunnelCoreWorldEvaluation.bSupportFloor
+                || S.LastTunnelCoreWorldEvaluation.bRoomFloor)
+            {
+                const float StructuralFloorMinimumDensity =
+                    FMath::Max(P.BaseDensity * 2.0f, 1.0f);
+                if (FMath::IsFinite(StructuralFloorMinimumDensity)
+                    && StructuralFloorMinimumDensity > 0.0f)
+                {
+                    InOut.bProtectedStructuralFloor = true;
+                    InOut.StructuralFloorMinimumDensity = StructuralFloorMinimumDensity;
+                    if (VoxelDensityProfile::AreCountersEnabled())
+                    {
+                        VoxelDensityProfile::AddCounter(
+                            VoxelDensityProfile::ECounter::TunnelAuthoredFloorSamples);
+                    }
+                }
+            }
         }
 
         //---------------------------------------------------------------------

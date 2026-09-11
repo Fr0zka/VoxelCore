@@ -586,6 +586,8 @@ namespace
                 static_cast<float>(B.Y - A.Y)).Size();
             Profile.StartFloorZ = FloorA;
             Profile.EndFloorZ = FloorB;
+            Profile.NaturalStartFloorZ = FloorA;
+            Profile.NaturalEndFloorZ = FloorB;
             Profile.NumSteps = 0;
 
             if (bGlobalTerrace && GlobalLedgeCount > 0)
@@ -606,7 +608,10 @@ namespace
                 Profile.EndFloorZ = FloorAtControl[0]
                     + TotalDelta * static_cast<float>(EndLevel)
                         / static_cast<float>(GlobalLedgeCount);
-                Profile.NumSteps = EndLevel > StartLevel ? 1 : 0;
+                // A ledge is a level transition in either direction.  The old one-sided test
+                // accidentally left descending tunnels as a ramp, which is the exact opposite
+                // of the authored "few large drops" policy.
+                Profile.NumSteps = EndLevel != StartLevel ? 1 : 0;
             }
             else if (Tunnel.bTunnelFloorTerracingEnabled
                 && PreferredLedges == 0
@@ -634,6 +639,10 @@ namespace
         if (VoxelDensityProfile::AreCountersEnabled())
         {
             uint64 AuthoredLedges = 0;
+            uint64 LedgesBelow2 = 0;
+            uint64 Ledges2To4 = 0;
+            uint64 Ledges4To8 = 0;
+            uint64 Ledges8Plus = 0;
             for (const FTunnelFloorSegmentProfile& Profile : OutProfiles)
             {
                 if (Profile.NumSteps > 0)
@@ -643,6 +652,14 @@ namespace
                     // in both cases.
                     AuthoredLedges += bGlobalTerrace
                         ? 1u : static_cast<uint64>(Profile.NumSteps);
+                    const float HeightPerLedge = FMath::Abs(
+                        Profile.EndFloorZ - Profile.StartFloorZ)
+                        / static_cast<float>(bGlobalTerrace
+                            ? 1 : FMath::Max(Profile.NumSteps, 1));
+                    if (HeightPerLedge < 2.0f) { ++LedgesBelow2; }
+                    else if (HeightPerLedge < 4.0f) { ++Ledges2To4; }
+                    else if (HeightPerLedge < 8.0f) { ++Ledges4To8; }
+                    else { ++Ledges8Plus; }
                 }
             }
             VoxelDensityProfile::AddCounter(
@@ -653,6 +670,18 @@ namespace
             VoxelDensityProfile::AddCounter(
                 VoxelDensityProfile::ECounter::TunnelFloorProfileLedges,
                 AuthoredLedges);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileLedgesBelow2Voxels,
+                LedgesBelow2);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileLedges2To4Voxels,
+                Ledges2To4);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileLedges4To8Voxels,
+                Ledges4To8);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TunnelFloorProfileLedges8PlusVoxels,
+                Ledges8Plus);
         }
     }
 
@@ -803,6 +832,11 @@ namespace
         }
         else
         {
+            if (VoxelDensityProfile::AreCountersEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelFloorProfileFallbacks);
+            }
             const float ProfileT = VF_TunnelFloorProfileT(
                 A, RadiusA, B, RadiusB, T);
             Terms.BaseFloorZ = FMath::Lerp(
@@ -824,15 +858,13 @@ namespace
                 || RoomFloorOwnership->RoomHash == Tunnel.FloorRoomHashB);
         if (bOwnsThisTunnelMouth)
         {
-            // A raised tunnel apron is the demonstrated failure mode. Lower it toward the room
-            // floor, but never raise an existing tunnel floor into solid space: that one-sided
-            // ownership rule is conservative for the capability contract and leaves a lower
-            // tunnel to be handled by the room's own floor union.
-            const float OwnedFloorZ = FMath::Min(
-                Terms.BaseFloorZ, RoomFloorOwnership->FloorZ);
+            // The room is A and the corridor is B: inside the finite mouth hand-off, A owns the
+            // floor regardless of which endpoint happened to be higher.  The old one-sided Min
+            // only removed a raised tunnel apron; a lower tunnel still won the SmoothMin union
+            // and left a lowered shelf in the chamber.  Interpolate to the room floor in the
+            // authored apron so both representations agree at the room boundary.
             Terms.BaseFloorZ = FMath::Lerp(
-                Terms.BaseFloorZ,
-                OwnedFloorZ,
+                Terms.BaseFloorZ, RoomFloorOwnership->FloorZ,
                 FMath::Clamp(RoomFloorOwnership->Weight, 0.0f, 1.0f));
             // The room's floor relief is already included in FloorZ. Fade the tunnel relief out
             // with the ownership blend, so the transition cannot stack two independent floors.
@@ -954,8 +986,6 @@ namespace
             const FVector& B = ControlPoints[SegmentIndex + 1];
             const float RadiusA = ControlRadii[SegmentIndex];
             const float RadiusB = ControlRadii[SegmentIndex + 1];
-            const float SegmentSDF = VoxelSDF::TaperedCapsule(
-                Position, A, B, RadiusA, RadiusB);
 
             float T = 0.0f;
             float HorizontalDistanceSquared = FLT_MAX;
@@ -965,7 +995,9 @@ namespace
             {
                 // A vertical/degenerate XY segment has no finite floor projection.  Retain the
                 // capsule for air, but never invent a support surface there.
-                Result.SDF = FMath::Min(Result.SDF, SegmentSDF);
+                Result.SDF = FMath::Min(
+                    Result.SDF,
+                    VoxelSDF::TaperedCapsule(Position, A, B, RadiusA, RadiusB));
                 continue;
             }
 
@@ -973,6 +1005,22 @@ namespace
                 A, RadiusA, B, RadiusB,
                 T, SegmentIndex, NumSegments, Tunnel, FloorProfiles,
                 RoomFloorOwnership);
+            const FTunnelFloorSegmentProfile* Profile = nullptr;
+            if (FloorProfiles != nullptr
+                && FloorProfiles->Num() == NumSegments
+                && FloorProfiles->IsValidIndex(SegmentIndex))
+            {
+                Profile = &(*FloorProfiles)[SegmentIndex];
+            }
+            const float NaturalFloorZ = Profile != nullptr
+                ? FMath::Lerp(
+                    Profile->NaturalStartFloorZ,
+                    Profile->NaturalEndFloorZ,
+                    FMath::Clamp(T, 0.0f, 1.0f))
+                : FMath::Lerp(
+                    VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)),
+                    VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB)),
+                    FMath::Clamp(T, 0.0f, 1.0f));
             const float SupportRadius = FMath::Max(
                 FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
                 VoxelPassageGeometry::PlayerRadiusVoxels);
@@ -983,6 +1031,38 @@ namespace
                 FloorTerms.ReliefScale,
                 Tunnel.FloorReliefFrequency,
                 ReliefBound);
+
+            // The corridor is authored as one shape: translate this tapered capsule so its
+            // bottom follows the immutable floor profile.  A zero shift is deliberately kept on
+            // the original call, preserving the natural path exactly.  The provisional shift
+            // excludes relief only long enough to decide whether the bounded relief can matter;
+            // the final shift below includes the actual cached column value.
+            // Preference 0 is the compatibility profile: keep its established floor field and
+            // its established capsule so the default archetype does not silently change.  A
+            // positive ledge preference is an explicit authored-shape opt-in; there the baked
+            // profile owns both the floor and the arch and the capsule follows it at evaluation.
+            const bool bUseAuthoredProfile = bApplyFloorCut
+                && Profile != nullptr
+                && Tunnel.TunnelFloorLedgeCountPreference > 0;
+            const bool bAnchorCapsule = bUseAuthoredProfile
+                && FMath::IsFinite(NaturalFloorZ);
+            const auto EvaluateAnchoredCapsule = [
+                &Position, &A, &B, RadiusA, RadiusB, NaturalFloorZ, bAnchorCapsule]
+                (float FloorZ) -> float
+            {
+                const float Shift = FloorZ - NaturalFloorZ;
+                if (!bAnchorCapsule
+                    || !FMath::IsFinite(Shift)
+                    || FMath::Abs(Shift) <= KINDA_SMALL_NUMBER)
+                {
+                    return VoxelSDF::TaperedCapsule(
+                        Position, A, B, RadiusA, RadiusB);
+                }
+                const FVector Offset(0.0f, 0.0f, Shift);
+                return VoxelSDF::TaperedCapsule(
+                    Position, A + Offset, B + Offset, RadiusA, RadiusB);
+            };
+            float SegmentSDF = EvaluateAnchoredCapsule(FloorTerms.BaseFloorZ);
 
             bool bEvaluateRelief = bApplyFloorCut;
             if (bEvaluateRelief && bHasReliefBound)
@@ -1018,6 +1098,15 @@ namespace
             const float FloorZ = VF_TunnelFloorFromTerms(
                 Position, Tunnel, FloorTerms,
                 CacheIdentity, TunnelIndex, bEvaluateRelief, ReliefColumn);
+            // Relief belongs to the authored floor as well as to its SmoothMax cut.  Re-evaluate
+            // the translated arch only when the column relief actually changed its anchor; most
+            // samples retain the cheap provisional result.
+            if (bAnchorCapsule
+                && FMath::IsFinite(FloorZ)
+                && FMath::Abs(FloorZ - FloorTerms.BaseFloorZ) > KINDA_SMALL_NUMBER)
+            {
+                SegmentSDF = EvaluateAnchoredCapsule(FloorZ);
+            }
             const float SegmentResultSDF = bApplyFloorCut
                 ? VoxelSDF::SmoothMax(
                     SegmentSDF, FloorZ - static_cast<float>(Position.Z), FloorBlend)
@@ -5301,6 +5390,11 @@ void VoxelCaveMorphology::BuildChunkCache(
                 CT.ControlPoints, CT.ControlRadii, CT, CT.FloorProfiles);
             VF_BuildTunnelFloorProfile(
                 CT.WorldControlPoints, CT.WorldControlRadii, CT, CT.WorldFloorProfiles);
+            CT.bHasCompleteFloorProfile = CT.FloorProfiles.Num() == CT.ControlPoints.Num() - 1
+                && CT.FloorProfiles.Num() > 0;
+            CT.bHasCompleteWorldFloorProfile = CT.WorldFloorProfiles.Num()
+                == CT.WorldControlPoints.Num() - 1
+                && CT.WorldFloorProfiles.Num() > 0;
             // The floor hand-off is a short apron around each destination, not a second floor
             // that owns the whole room. Bake the same bounded region in both coordinate spaces;
             // this keeps the room/tunnel boolean deterministic even though the cave warp is 3D.
@@ -5995,15 +6089,15 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         }
 
         // The corridor is a swept floor cut: each tapered capsule segment is intersected with
-        // its interpolated floor half-space before the tunnel union is blended into rooms.  The
-        // room wins naturally in this union (SmoothMin): a tunnel floor is a solid half-space,
-        // so it cannot replace the room's air above the room floor.  Do not lower the SDF floor
-        // from a proximity-only mouth test; a warped query can be near an endpoint without being
-        // inside that endpoint's room, and changing it there loses capability.
+        // its build-time floor profile before the tunnel union is blended into rooms. The room's
+        // finite mouth ownership is also passed into that same shape evaluation; this is the SDF
+        // side of A > B, while the world-space post keeps the disturbance path consistent.
+        const FVFRoomFloorOwnership RoomMouthOwnership =
+            VF_FindSDFTunnelMouthOwnership(Pos, Tunnel, BlendK);
         const float TunnelSDF = VF_EvaluateSweptTunnel(
             Pos, Tunnel, /*bWorldChain=*/false, BlendK,
             /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled, &Cache, TunnelIdx,
-            nullptr).SDF;
+            &RoomMouthOwnership).SDF;
 
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
     };
@@ -6134,7 +6228,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     TunnelIdx, *SupportColumn, FloorZ, SupportMinZ, SupportMaxZ)
                 : VF_ProjectSweptTunnelFloor(
                     Pos, Tunnel, /*bWorldChain=*/true, FloorZ, SupportRadius,
-                    &Cache, TunnelIdx);
+                    &Cache, TunnelIdx, &RoomMouthOwnership);
             bRaisedTunnelFloor = bRoomOwnsThisTunnel
                 && bProjectedFloor
                 && FloorZ > RoomMouthOwnership.FloorZ
@@ -6177,7 +6271,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
         const FVFTunnelShapeEvaluation TunnelShape = VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
             /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled && !bRaisedTunnelFloor,
-            &Cache, TunnelIdx, nullptr);
+            &Cache, TunnelIdx, &RoomMouthOwnership);
         Result.SDF = FMath::Min(Result.SDF, TunnelShape.SDF);
     };
 
@@ -6246,7 +6340,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
             float SupportRadius = 0.0f;
             if (VF_ProjectSweptTunnelFloor(
                     Pos, Tunnel, bHasWorldChain, ProjectedFloorZ, SupportRadius,
-                    &Cache, TunnelIdx)
+                    &Cache, TunnelIdx, &RoomMouthOwnership)
                 && ProjectedFloorZ > RoomMouthOwnership.FloorZ + KINDA_SMALL_NUMBER)
             {
                 // Only a raised tunnel apron is clipped. If the tunnel is lower, the room's
@@ -6259,7 +6353,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
         return VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
             /*bApplyFloorCut=*/Tunnel.bTunnelFloorEnabled, &Cache, TunnelIdx,
-            nullptr).bSupportFloor;
+            &RoomMouthOwnership).bSupportFloor;
     };
 
     bool bSupport = false;
@@ -6308,11 +6402,13 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             continue;
         }
         const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FVFRoomFloorOwnership RoomMouthOwnership =
+            VF_FindWorldTunnelMouthOwnership(ColumnPosition, Tunnel, Cache.SDFBlendRadius);
         float FloorZ = 0.0f;
         float SupportRadius = 0.0f;
         if (!VF_ProjectSweptTunnelFloor(
                 ColumnPosition, Tunnel, /*bWorldChain=*/true,
-                FloorZ, SupportRadius, &Cache, TunnelIdx))
+                FloorZ, SupportRadius, &Cache, TunnelIdx, &RoomMouthOwnership))
         {
             continue;
         }

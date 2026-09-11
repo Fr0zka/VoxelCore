@@ -334,6 +334,13 @@ struct FVoxelOpSample
     // placées quand aucune primitive n'atteint ce voxel).
     // FLT_MAX = "no surface nearby" — the initial state, and the early-out placed sources use.
     float Sdf = FLT_MAX;
+
+    // The room-graph source can author a finite tunnel/room floor band while it is building the
+    // shape. This structural metadata is not a third composable field: it tells the stack that
+    // later detail operators must not turn the already-authored support back into air. Carrying it
+    // with the sample keeps the rule true even when a detail op is unaware of the room graph.
+    bool bProtectedStructuralFloor = false;
+    float StructuralFloorMinimumDensity = 0.0f;
 };
 
 /**

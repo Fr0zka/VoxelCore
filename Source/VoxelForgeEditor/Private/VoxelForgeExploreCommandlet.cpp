@@ -4261,7 +4261,7 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("refusal_or_error"), Output.Walk.RefusalReason);
         Writer->WriteValue(TEXT("window_policy"), Output.Walk.WindowPolicy);
         Writer->WriteValue(TEXT("agent_policy"), TEXT(
-            "fixed-order depth-first walk over the exact VF player-fit graph; six-neighbour movement plus supported climb edges; stop at departure"));
+            "fixed-order depth-first walk over the exact VF player-fit graph; walk-only six-neighbour movement; climb is reported separately and never authorizes the result; stop at departure"));
         Writer->WriteValue(TEXT("player_fit_volume_scope"), TEXT(
             "bounded fitted route window; WorldRadiusVoxels=0 has no finite whole-world volume"));
         Writer->WriteValue(TEXT("max_cells_cap"), Arguments.MaxWalkCells);
@@ -4305,6 +4305,8 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("connectivity_result"), ConnectivityResultName(Report.Result));
         Writer->WriteValue(TEXT("connectivity_result_code"), static_cast<int32>(Report.Result));
         Writer->WriteValue(TEXT("can_reach_departure"), Report.bCanReachDeparture);
+        Writer->WriteValue(TEXT("walk_only_can_reach_departure"), Report.bWalkOnlyCanReachDeparture);
+        Writer->WriteValue(TEXT("climb_can_reach_departure"), Report.bClimbCanReachDeparture);
         Writer->WriteValue(TEXT("start_snapped"), Report.bStartSnapped);
         Writer->WriteValue(TEXT("goal_snapped"), Report.bGoalSnapped);
         Writer->WriteValue(TEXT("route_retries"), Report.NumRouteRetries);
@@ -4313,6 +4315,15 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("player_fit_volume_cells"), Report.PlayerFitVolumeCells);
         Writer->WriteValue(TEXT("reachable_player_fit_cells"), Report.ReachablePlayerFitCells);
         Writer->WriteValue(TEXT("reachable_player_fit_fraction"), static_cast<double>(Report.ReachablePlayerFitFraction));
+        Writer->WriteValue(TEXT("walk_only_reachable_player_fit_cells"),
+            Report.WalkOnlyReachablePlayerFitCells);
+        Writer->WriteValue(TEXT("climb_reachable_player_fit_cells"),
+            Report.ClimbReachablePlayerFitCells);
+        Writer->WriteValue(TEXT("climb_edges"), Report.ClimbEdges);
+        Writer->WriteValue(TEXT("mine_required_player_fit_cells"),
+            Report.MineRequiredPlayerFitCells);
+        Writer->WriteValue(TEXT("climb_reachable_player_fit_fraction"),
+            static_cast<double>(Report.ClimbReachablePlayerFitFraction));
         Writer->WriteValue(TEXT("sampled_num_x"), Report.SampledNumX);
         Writer->WriteValue(TEXT("sampled_num_y"), Report.SampledNumY);
         Writer->WriteValue(TEXT("sampled_num_z"), Report.SampledNumZ);
@@ -4391,6 +4402,10 @@ FString BuildExploreJson(
             Writer->WriteValue(TEXT("window_policy"), TEXT("origin-inclusive mouth-AABB + margin"));
             Writer->WriteValue(TEXT("connectivity_result"), ConnectivityResultName(OriginCheckReport.Result));
             Writer->WriteValue(TEXT("can_reach_departure"), OriginCheckReport.bCanReachDeparture);
+            Writer->WriteValue(TEXT("walk_only_can_reach_departure"),
+                OriginCheckReport.bWalkOnlyCanReachDeparture);
+            Writer->WriteValue(TEXT("climb_can_reach_departure"),
+                OriginCheckReport.bClimbCanReachDeparture);
             Writer->WriteValue(TEXT("sampled_num_x"), OriginCheckReport.SampledNumX);
             Writer->WriteValue(TEXT("sampled_num_y"), OriginCheckReport.SampledNumY);
             Writer->WriteValue(TEXT("sampled_num_z"), OriginCheckReport.SampledNumZ);
@@ -4404,6 +4419,15 @@ FString BuildExploreJson(
             Writer->WriteValue(TEXT("reachable_player_fit_cells"), OriginCheckReport.ReachablePlayerFitCells);
             Writer->WriteValue(TEXT("reachable_player_fit_fraction"),
                 static_cast<double>(OriginCheckReport.ReachablePlayerFitFraction));
+            Writer->WriteValue(TEXT("walk_only_reachable_player_fit_cells"),
+                OriginCheckReport.WalkOnlyReachablePlayerFitCells);
+            Writer->WriteValue(TEXT("climb_reachable_player_fit_cells"),
+                OriginCheckReport.ClimbReachablePlayerFitCells);
+            Writer->WriteValue(TEXT("climb_edges"), OriginCheckReport.ClimbEdges);
+            Writer->WriteValue(TEXT("mine_required_player_fit_cells"),
+                OriginCheckReport.MineRequiredPlayerFitCells);
+            Writer->WriteValue(TEXT("climb_reachable_player_fit_fraction"),
+                static_cast<double>(OriginCheckReport.ClimbReachablePlayerFitFraction));
             Writer->WriteValue(TEXT("player_fit_components"), OriginCheckReport.PlayerFitComponents);
             Writer->WriteValue(TEXT("arrival_component_cells"), OriginCheckReport.ArrivalComponentCells);
             Writer->WriteValue(TEXT("departure_component_cells"), OriginCheckReport.DepartureComponentCells);

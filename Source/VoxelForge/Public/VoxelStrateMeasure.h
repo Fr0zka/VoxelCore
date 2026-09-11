@@ -311,10 +311,23 @@ struct VOXELFORGE_API FVoxelPlayerFitWalkReport
     int32 NumRouteRetries = 0;
     bool bClimbingEnabled = false;
     float MaxClimbHeightMeters = 0.0f;
+    // The primordial capability contract is walk-only.  The existing reachable fields below
+    // therefore remain walk-only; climb is reported as a separate tier and never makes the hard
+    // connectivity verdict pass.
+    bool bWalkOnlyCanReachDeparture = false;
+    bool bClimbCanReachDeparture = false;
 
     int64 PlayerFitVolumeCells = 0;
     int64 ReachablePlayerFitCells = 0;
+    int64 WalkOnlyReachablePlayerFitCells = 0;
+    int64 ClimbReachablePlayerFitCells = 0;
+    int64 ClimbEdges = 0;
+    // Fit poses outside the walk+climb reachable set need an edit/mining action to become
+    // reachable. This is a reporting remainder, not a promise that arbitrary mining can reach
+    // every such pose without a separate excavation model.
+    int64 MineRequiredPlayerFitCells = 0;
     float ReachablePlayerFitFraction = 0.0f;
+    float ClimbReachablePlayerFitFraction = 0.0f;
     int32 SampledNumX = 0;
     int32 SampledNumY = 0;
     int32 SampledNumZ = 0;

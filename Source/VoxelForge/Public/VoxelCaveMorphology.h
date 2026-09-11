@@ -629,6 +629,11 @@ struct FTunnelFloorSegmentProfile
 {
     float StartFloorZ = 0.0f;
     float EndFloorZ = 0.0f;
+    // The unmodified tapered-capsule bottom at the same two control points.  Keeping these
+    // alongside the authored floor lets evaluation translate the arch to the baked floor without
+    // re-deriving a second profile (and makes the build-time floor/arch relationship explicit).
+    float NaturalStartFloorZ = 0.0f;
+    float NaturalEndFloorZ = 0.0f;
     float ReliefScale = 0.0f;
     int32 NumSteps = 0;
 };
@@ -657,6 +662,8 @@ struct FCachedTunnel
     // malformed/legacy caches fall back to the old local evaluator.
     TArray<FTunnelFloorSegmentProfile> FloorProfiles;
     TArray<FTunnelFloorSegmentProfile> WorldFloorProfiles;
+    bool bHasCompleteFloorProfile = false;
+    bool bHasCompleteWorldFloorProfile = false;
     // The corridor floor is a swept SmoothMax cut, not a later slab.  These are copied from the
     // same strate fields used by room floors; the seed is derived once from the tunnel pair hash.
     float FloorReliefStrength = 0.0f;
