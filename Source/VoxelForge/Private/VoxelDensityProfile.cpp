@@ -427,6 +427,8 @@ namespace VoxelDensityProfile
         case ECounter::TunnelFloorProfileLedges2To4Voxels:return TEXT("TunnelFloorProfileLedges2To4Voxels");
         case ECounter::TunnelFloorProfileLedges4To8Voxels:return TEXT("TunnelFloorProfileLedges4To8Voxels");
         case ECounter::TunnelFloorProfileLedges8PlusVoxels:return TEXT("TunnelFloorProfileLedges8PlusVoxels");
+        case ECounter::PassageSupportFloorBackstopFires:return TEXT("PassageSupportFloorBackstopFires");
+        case ECounter::PassageNativeFloorCompositions:return TEXT("PassageNativeFloorCompositions");
         case ECounter::PassageCandidates: return TEXT("PassageCandidates");
         case ECounter::PassageEvaluated:  return TEXT("PassageEvaluated");
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");

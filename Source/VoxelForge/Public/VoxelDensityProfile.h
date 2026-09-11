@@ -109,6 +109,8 @@ namespace VoxelDensityProfile
         TunnelFloorProfileLedges2To4Voxels,
         TunnelFloorProfileLedges4To8Voxels,
         TunnelFloorProfileLedges8PlusVoxels,
+        PassageSupportFloorBackstopFires,
+        PassageNativeFloorCompositions,
         PassageCandidates,
         PassageEvaluated,
         MesherBlockTests,

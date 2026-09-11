@@ -2151,7 +2151,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         StrateManager->ApplyPassageStructuralPostsMC(
             Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
             CP_Dist.BoundarySealThickness, bProtectAuthoredTunnelFloor);
-
         // Disturbance features are authored as a generic MC-space post and may add a ridge or
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
@@ -2256,6 +2255,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
             }
         }
+        // Inter-strate passages own the same final D-floor contract as graph tunnels.  This is
+        // composed from the immutable construction-time profile after generic writers and the
+        // graph overlap, so the legacy passage support slab can be disabled without losing the
+        // floor to a disturbance refill.
+        StrateManager->ApplyPassageNativeFloorMC(
+            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
         DensityStructuralPostsTimer.End();
     }
     else

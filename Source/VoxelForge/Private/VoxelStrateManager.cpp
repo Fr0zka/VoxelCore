@@ -11,7 +11,9 @@
 #include "VoxelDensityProfile.h"  // Opt-in targeted per-voxel attribution
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
+#include "Misc/CommandLine.h"
 #include "Misc/Crc.h"
+#include "Misc/Parse.h"
 #include "UObject/UObjectGlobals.h"
 
 #include <atomic>
@@ -19,6 +21,111 @@
 namespace
 {
     std::atomic<uint64> GNextStrateManagerLifetimeId { 0 };
+
+    struct FRuntimeRoughnessOverrides
+    {
+        bool bSurfaceRoughness = false;
+        float SurfaceRoughness = 0.0f;
+        bool bFrequency = false;
+        float Frequency = 0.0f;
+        bool bNoiseType = false;
+        EVoxelNoiseType NoiseType = EVoxelNoiseType::FBM;
+    };
+
+    const FRuntimeRoughnessOverrides& VF_GetRuntimeRoughnessOverrides()
+    {
+        // These are diagnostic command-line inputs, captured once per process.  Keeping the
+        // override at the params boundary makes every chunk, classifier, and mesher see the same
+        // immutable values without putting a command-line parse in the voxel hot loop.
+        static const FRuntimeRoughnessOverrides Overrides = []()
+        {
+            FRuntimeRoughnessOverrides Result;
+            const FString CommandLine(FCommandLine::Get());
+
+            Result.bSurfaceRoughness = FParse::Value(
+                *CommandLine, TEXT("voxel.surfaceroughness="), Result.SurfaceRoughness);
+            if (Result.bSurfaceRoughness
+                && (!FMath::IsFinite(Result.SurfaceRoughness) || Result.SurfaceRoughness < 0.0f))
+            {
+                Result.bSurfaceRoughness = false;
+            }
+
+            Result.bFrequency = FParse::Value(
+                *CommandLine, TEXT("voxel.roughnessfrequency="), Result.Frequency);
+            if (Result.bFrequency
+                && (!FMath::IsFinite(Result.Frequency) || Result.Frequency <= 0.0f))
+            {
+                Result.bFrequency = false;
+            }
+
+            FString NoiseTypeText;
+            if (FParse::Value(
+                    *CommandLine, TEXT("voxel.roughnesstype="), NoiseTypeText))
+            {
+                NoiseTypeText.TrimStartAndEndInline();
+                NoiseTypeText.ToLowerInline();
+                NoiseTypeText.ReplaceInline(TEXT("_"), TEXT(""));
+                NoiseTypeText.ReplaceInline(TEXT("-"), TEXT(""));
+                if (NoiseTypeText == TEXT("fbm") || NoiseTypeText == TEXT("fractal"))
+                {
+                    Result.NoiseType = EVoxelNoiseType::FBM;
+                    Result.bNoiseType = true;
+                }
+                else if (NoiseTypeText == TEXT("ridged") || NoiseTypeText == TEXT("ridge"))
+                {
+                    Result.NoiseType = EVoxelNoiseType::Ridged;
+                    Result.bNoiseType = true;
+                }
+                else if (NoiseTypeText == TEXT("mixed"))
+                {
+                    Result.NoiseType = EVoxelNoiseType::Mixed;
+                    Result.bNoiseType = true;
+                }
+                else if (NoiseTypeText == TEXT("cellular") || NoiseTypeText == TEXT("worley"))
+                {
+                    Result.NoiseType = EVoxelNoiseType::Cellular;
+                    Result.bNoiseType = true;
+                }
+            }
+
+            if (Result.bSurfaceRoughness || Result.bFrequency || Result.bNoiseType)
+            {
+                UE_LOG(LogTemp, Display,
+                    TEXT("[StrateManager] Runtime roughness override: strength=%s%.3f frequency=%s%.6f type=%s"),
+                    Result.bSurfaceRoughness ? TEXT("") : TEXT("(asset) "),
+                    Result.SurfaceRoughness,
+                    Result.bFrequency ? TEXT("") : TEXT("(asset) "),
+                    Result.Frequency,
+                    Result.bNoiseType
+                        ? (Result.NoiseType == EVoxelNoiseType::FBM ? TEXT("FBM")
+                            : Result.NoiseType == EVoxelNoiseType::Ridged ? TEXT("Ridged")
+                            : Result.NoiseType == EVoxelNoiseType::Mixed ? TEXT("Mixed")
+                            : TEXT("Cellular"))
+                        : TEXT("(asset)"));
+            }
+            return Result;
+        }();
+        return Overrides;
+    }
+
+    static FStrateGenerationParams VF_ApplyRuntimeRoughnessOverrides(
+        FStrateGenerationParams Params)
+    {
+        const FRuntimeRoughnessOverrides& Overrides = VF_GetRuntimeRoughnessOverrides();
+        if (Overrides.bSurfaceRoughness)
+        {
+            Params.SurfaceRoughness = Overrides.SurfaceRoughness;
+        }
+        if (Overrides.bFrequency)
+        {
+            Params.RoughnessFrequency = Overrides.Frequency;
+        }
+        if (Overrides.bNoiseType)
+        {
+            Params.RoughnessNoiseType = Overrides.NoiseType;
+        }
+        return Params;
+    }
 }
 
 UVoxelStrateManager::UVoxelStrateManager()
@@ -136,6 +243,399 @@ namespace
         }
         return Cache.Nearby;
     }
+
+    // Passage relief is a function of the immutable passage descriptor and the actual XY column.
+    // Keep the cache fixed-size and thread-local, like the morphology floor cache: a long export
+    // cannot retain one entry per tile, and collisions only lose a hit.  Fractional normal
+    // samples intentionally fall through to the exact same two-octave calculation.
+    struct FVoxelPassageReliefCacheEntry
+    {
+        const UVoxelStrateManager* Owner = nullptr;
+        uint64 OwnerLifetimeId = 0;
+        uint32 LayoutVersion = 0;
+        int32 PassageIndex = INDEX_NONE;
+        int32 X = 0;
+        int32 Y = 0;
+        float Noise = 0.0f;
+        bool bValid = false;
+    };
+
+    struct FVoxelPassageReliefCache
+    {
+        static constexpr int32 Capacity = 16384;
+        static_assert((Capacity & (Capacity - 1)) == 0,
+            "passage relief cache must be a power of two");
+        FVoxelPassageReliefCacheEntry Entries[Capacity];
+
+        static uint32 HashKey(
+            const UVoxelStrateManager* Owner, uint64 LifetimeId, uint32 Version,
+            int32 PassageIndex, int32 X, int32 Y)
+        {
+            uint32 Hash = static_cast<uint32>(reinterpret_cast<UPTRINT>(Owner));
+            Hash ^= static_cast<uint32>(reinterpret_cast<UPTRINT>(Owner) >> 32);
+            const auto Combine = [&Hash](uint32 Value)
+            {
+                Hash ^= Value + 0x9E3779B9u + (Hash << 6) + (Hash >> 2);
+            };
+            Combine(static_cast<uint32>(LifetimeId));
+            Combine(static_cast<uint32>(LifetimeId >> 32));
+            Combine(Version);
+            Combine(static_cast<uint32>(PassageIndex));
+            Combine(static_cast<uint32>(X));
+            Combine(static_cast<uint32>(Y));
+            return VoxelHash::Mix(Hash);
+        }
+    };
+
+    FVoxelPassageReliefCache& VF_GetPassageReliefCache()
+    {
+        thread_local FVoxelPassageReliefCache Cache;
+        return Cache;
+    }
+
+    FORCEINLINE float VF_ComputePassageReliefNoise(
+        double X, double Y, uint32 FloorSeed, float Frequency)
+    {
+        const float SF = static_cast<float>(FloorSeed) * 0.00001f;
+        float Noise = FMath::PerlinNoise2D(
+            FVector2D(
+                static_cast<float>(X) * Frequency + SF,
+                static_cast<float>(Y) * Frequency + SF * 1.7f)) * 0.65f;
+        Noise += FMath::PerlinNoise2D(
+            FVector2D(
+                static_cast<float>(X) * Frequency * 2.3f + SF * 3.1f,
+                static_cast<float>(Y) * Frequency * 2.3f + SF * 5.3f)) * 0.35f;
+        return Noise;
+    }
+
+    FORCEINLINE float VF_PassageReliefNoise(
+        const UVoxelStrateManager* Manager, int32 PassageIndex,
+        const FVoxelPassage& Passage, double X, double Y)
+    {
+        if (!(Passage.NativeFloorReliefStrength > 0.0f)
+            || !FMath::IsFinite(Passage.NativeFloorReliefStrength)
+            || !FMath::IsFinite(Passage.NativeFloorReliefFrequency)
+            || !(FMath::Abs(Passage.NativeFloorReliefFrequency) > KINDA_SMALL_NUMBER))
+        {
+            return 0.0f;
+        }
+
+        const bool bInteger = FMath::IsFinite(X) && FMath::IsFinite(Y)
+            && FMath::FloorToDouble(X) == X && FMath::FloorToDouble(Y) == Y
+            && X >= static_cast<double>(MIN_int32) && X <= static_cast<double>(MAX_int32)
+            && Y >= static_cast<double>(MIN_int32) && Y <= static_cast<double>(MAX_int32);
+        if (!bInteger || Manager == nullptr || PassageIndex == INDEX_NONE)
+        {
+            return VF_ComputePassageReliefNoise(
+                X, Y, Passage.NativeFloorSeed, Passage.NativeFloorReliefFrequency);
+        }
+
+        const int32 IX = FMath::FloorToInt(X);
+        const int32 IY = FMath::FloorToInt(Y);
+        FVoxelPassageReliefCache& Cache = VF_GetPassageReliefCache();
+        const uint64 LifetimeId = Manager->GetCacheLifetimeId();
+        const uint32 Version = Manager->GetLayoutVersion();
+        FVoxelPassageReliefCacheEntry& Entry = Cache.Entries[
+            FVoxelPassageReliefCache::HashKey(
+                Manager, LifetimeId, Version, PassageIndex, IX, IY)
+            & (FVoxelPassageReliefCache::Capacity - 1)];
+        if (Entry.bValid
+            && Entry.Owner == Manager
+            && Entry.OwnerLifetimeId == LifetimeId
+            && Entry.LayoutVersion == Version
+            && Entry.PassageIndex == PassageIndex
+            && Entry.X == IX && Entry.Y == IY)
+        {
+            return Entry.Noise;
+        }
+
+        const float Noise = VF_ComputePassageReliefNoise(
+            X, Y, Passage.NativeFloorSeed, Passage.NativeFloorReliefFrequency);
+        Entry.Owner = Manager;
+        Entry.OwnerLifetimeId = LifetimeId;
+        Entry.LayoutVersion = Version;
+        Entry.PassageIndex = PassageIndex;
+        Entry.X = IX;
+        Entry.Y = IY;
+        Entry.Noise = Noise;
+        Entry.bValid = true;
+        return Noise;
+    }
+}
+
+namespace
+{
+    // The graph-tunnel relief proof is intentionally repeated here instead of sharing a loose
+    // "noise amplitude" constant.  The passage uses the same weighted two-octave field and the
+    // same conservative partial-derivative bound; a zero scale is the fail-closed result.
+    constexpr float VF_PassagePerlin2DPartialAbsBound = 8.5f;
+    constexpr float VF_PassageMaxReliefScale = 0.20f;
+
+    static float VF_BuildPassageReliefScale(
+        const FVector& A, const FVector& B,
+        float BaseGradient, int32 SegmentIndex, int32 NumSegments,
+        float Strength, float Frequency)
+    {
+        if (!(Strength > 0.0f)
+            || !FMath::IsFinite(Strength)
+            || !FMath::IsFinite(Frequency)
+            || !(FMath::Abs(Frequency) > KINDA_SMALL_NUMBER)
+            || !FMath::IsFinite(BaseGradient)
+            || BaseGradient < 0.0f)
+        {
+            return 0.0f;
+        }
+
+        const float AvailableGradient =
+            VoxelPassageGeometry::PlayerWalkableFloorMaxGradient - BaseGradient;
+        if (!(AvailableGradient > 0.0f))
+        {
+            return 0.0f;
+        }
+
+        const float Amplitude = FMath::Abs(Strength) * VOXEL_NOISE_SCALE;
+        const float OctaveFrequencyWeight = 0.65f + 0.35f * 2.3f;
+        const float NoiseGradientBound =
+            1.4142135623730951f * VF_PassagePerlin2DPartialAbsBound
+            * OctaveFrequencyWeight * FMath::Abs(Frequency) * Amplitude;
+        const int32 LandingEnvelopeCount = (SegmentIndex == 0 ? 1 : 0)
+            + (SegmentIndex + 1 == NumSegments ? 1 : 0);
+        const float HorizontalRun = FVector2D(
+            static_cast<float>(B.X - A.X),
+            static_cast<float>(B.Y - A.Y)).Size();
+        const float EnvelopeDerivativeBound = LandingEnvelopeCount > 0
+            ? (1.5f * static_cast<float>(LandingEnvelopeCount)
+                / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels)
+                * Amplitude
+            : 0.0f;
+        const float ReliefGradientBound =
+            NoiseGradientBound + EnvelopeDerivativeBound;
+        if (!(ReliefGradientBound > KINDA_SMALL_NUMBER)
+            || !FMath::IsFinite(ReliefGradientBound)
+            || !(HorizontalRun > KINDA_SMALL_NUMBER))
+        {
+            return 0.0f;
+        }
+
+        return FMath::Clamp(
+            FMath::Min(
+                VF_PassageMaxReliefScale,
+                AvailableGradient / ReliefGradientBound),
+            0.0f, VF_PassageMaxReliefScale);
+    }
+
+    static bool VF_ProjectNativePassageFloor(
+        const FVoxelPassage& Passage, const FVector& Position,
+        float& OutFloorZ, float& OutSupportRadius,
+        const UVoxelStrateManager* Manager = nullptr,
+        int32 PassageIndex = INDEX_NONE)
+    {
+        if (!Passage.bNativeFloorEnabled
+            || Passage.ControlPoints.Num() < 2
+            || Passage.ControlRadii.Num() != Passage.ControlPoints.Num()
+            || Passage.NativeFloorProfileZ.Num() != Passage.ControlPoints.Num())
+        {
+            return false;
+        }
+
+        float BestDistanceSquared = FLT_MAX;
+        int32 BestSegment = INDEX_NONE;
+        float BestT = 0.0f;
+        float BestSupportRadius = 0.0f;
+        for (int32 SegmentIndex = 0;
+             SegmentIndex + 1 < Passage.ControlPoints.Num();
+             ++SegmentIndex)
+        {
+            const FVector& A = Passage.ControlPoints[SegmentIndex];
+            const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+            const FVector2D Delta(
+                static_cast<float>(B.X - A.X),
+                static_cast<float>(B.Y - A.Y));
+            const float LengthSquared = Delta.SizeSquared();
+            if (!(LengthSquared > KINDA_SMALL_NUMBER))
+            {
+                continue;
+            }
+
+            const FVector2D QueryXY(
+                static_cast<float>(Position.X),
+                static_cast<float>(Position.Y));
+            const FVector2D AXY(
+                static_cast<float>(A.X), static_cast<float>(A.Y));
+            const float T = FMath::Clamp(
+                FVector2D::DotProduct(QueryXY - AXY, Delta) / LengthSquared,
+                0.0f, 1.0f);
+            const FVector2D ClosestXY = AXY + Delta * T;
+            const float DistanceSquared = (QueryXY - ClosestXY).SizeSquared();
+            if (DistanceSquared >= BestDistanceSquared)
+            {
+                continue;
+            }
+
+            BestDistanceSquared = DistanceSquared;
+            BestSegment = SegmentIndex;
+            BestT = T;
+            BestSupportRadius = FMath::Max(
+                FMath::Min(
+                    FMath::Abs(Passage.ControlRadii[SegmentIndex]),
+                    FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
+                VoxelPassageGeometry::PlayerRadiusVoxels);
+        }
+
+        if (BestSegment == INDEX_NONE
+            || BestDistanceSquared > FMath::Square(BestSupportRadius))
+        {
+            return false;
+        }
+
+        const float ClampedT = FMath::Clamp(BestT, 0.0f, 1.0f);
+        OutFloorZ = FMath::Lerp(
+            Passage.NativeFloorProfileZ[BestSegment],
+            Passage.NativeFloorProfileZ[BestSegment + 1],
+            ClampedT);
+
+        float ReliefScale = 0.0f;
+        if (Passage.NativeFloorReliefScales.IsValidIndex(BestSegment))
+        {
+            ReliefScale = Passage.NativeFloorReliefScales[BestSegment];
+        }
+        float Envelope = 1.0f;
+        const float HorizontalRun = FVector2D(
+            static_cast<float>(Passage.ControlPoints[BestSegment + 1].X
+                - Passage.ControlPoints[BestSegment].X),
+            static_cast<float>(Passage.ControlPoints[BestSegment + 1].Y
+                - Passage.ControlPoints[BestSegment].Y)).Size();
+        if (BestSegment == 0)
+        {
+            Envelope *= SmoothStep01(FMath::Clamp(
+                (ClampedT * HorizontalRun)
+                    / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
+                0.0f, 1.0f));
+        }
+        if (BestSegment + 1 == Passage.ControlPoints.Num() - 1)
+        {
+            Envelope *= SmoothStep01(FMath::Clamp(
+                ((1.0f - ClampedT) * HorizontalRun)
+                    / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
+                0.0f, 1.0f));
+        }
+        OutFloorZ += VF_PassageReliefNoise(
+            Manager, PassageIndex, Passage,
+            static_cast<double>(Position.X), static_cast<double>(Position.Y))
+            * VOXEL_NOISE_SCALE * Passage.NativeFloorReliefStrength
+            * Envelope * ReliefScale;
+        OutSupportRadius = BestSupportRadius;
+        return FMath::IsFinite(OutFloorZ)
+            && FMath::IsFinite(OutSupportRadius)
+            && OutSupportRadius > 0.0f;
+    }
+
+    static bool VF_ProjectPassageFloor(
+        const FVoxelPassage& Passage, const FVector& Position,
+        float& OutFloorZ, float& OutSupportRadius,
+        const UVoxelStrateManager* Manager = nullptr,
+        int32 PassageIndex = INDEX_NONE)
+    {
+        if (VF_ProjectNativePassageFloor(
+                Passage, Position, OutFloorZ, OutSupportRadius,
+                Manager, PassageIndex))
+        {
+            return true;
+        }
+        if (!Passage.bWalkableTunnelContract)
+        {
+            return false;
+        }
+        return VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+            Passage.ControlPoints, Passage.ControlRadii, Position,
+            OutFloorZ, OutSupportRadius);
+    }
+}
+
+static void VF_AuthorNativePassageFloor(
+    FVoxelPassage& Passage,
+    const UVoxelStrateDefinition* UpperDefinition,
+    const UVoxelStrateDefinition* LowerDefinition,
+    uint32 PassageSeed)
+{
+    Passage.bNativeFloorEnabled = false;
+    Passage.NativeFloorProfileZ.Reset();
+    Passage.NativeFloorReliefScales.Reset();
+    Passage.NativeFloorReliefStrength = 0.0f;
+    Passage.NativeFloorReliefFrequency = 0.015f;
+    Passage.NativeFloorSeed = 0;
+
+    if (!Passage.bWalkableTunnelContract
+        || Passage.ControlPoints.Num() < 2
+        || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+    {
+        return;
+    }
+
+    // Inter-strate passages can connect to non-cave archetypes.  Keep the native D profile for
+    // the walkable contract in all cases, but only borrow relief from a cave strate that actually
+    // owns the same room-floor field.  A malformed/unknown parameter source fails closed to a
+    // flat floor rather than inventing a second relief system.
+    const FStrateGenerationParams* ReliefParams = nullptr;
+    if (UpperDefinition != nullptr
+        && (UpperDefinition->GeneratorType == ECaveGeneratorType::TunnelNetwork
+            || UpperDefinition->GeneratorType == ECaveGeneratorType::Underwater))
+    {
+        ReliefParams = &UpperDefinition->GenerationParams;
+    }
+    else if (LowerDefinition != nullptr
+        && (LowerDefinition->GeneratorType == ECaveGeneratorType::TunnelNetwork
+            || LowerDefinition->GeneratorType == ECaveGeneratorType::Underwater))
+    {
+        ReliefParams = &LowerDefinition->GenerationParams;
+    }
+    if (ReliefParams != nullptr)
+    {
+        Passage.NativeFloorReliefStrength = FMath::Max(
+            ReliefParams->FloorReliefStrength, 0.0f);
+        Passage.NativeFloorReliefFrequency = ReliefParams->FloorReliefFrequency;
+    }
+    Passage.NativeFloorSeed = VoxelHash::Mix(PassageSeed ^ 0xD00DF10Eu);
+    Passage.NativeFloorProfileZ.SetNum(Passage.ControlPoints.Num());
+    for (int32 PointIndex = 0;
+         PointIndex < Passage.ControlPoints.Num();
+         ++PointIndex)
+    {
+        const float Radius = FMath::Abs(Passage.ControlRadii[PointIndex]);
+        const float FloorZ = VoxelPassageGeometry::TunnelFloorZ(
+            Passage.ControlPoints[PointIndex], Radius);
+        if (!FMath::IsFinite(FloorZ))
+        {
+            Passage.NativeFloorProfileZ.Reset();
+            return;
+        }
+        Passage.NativeFloorProfileZ[PointIndex] = FloorZ;
+    }
+
+    const int32 NumSegments = Passage.ControlPoints.Num() - 1;
+    Passage.NativeFloorReliefScales.SetNumZeroed(NumSegments);
+    for (int32 SegmentIndex = 0;
+         SegmentIndex < NumSegments;
+         ++SegmentIndex)
+    {
+        const FVector& A = Passage.ControlPoints[SegmentIndex];
+        const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+        const float HorizontalRun = FVector2D(
+            static_cast<float>(B.X - A.X),
+            static_cast<float>(B.Y - A.Y)).Size();
+        const float BaseGradient = HorizontalRun > KINDA_SMALL_NUMBER
+            ? FMath::Abs(
+                Passage.NativeFloorProfileZ[SegmentIndex + 1]
+                    - Passage.NativeFloorProfileZ[SegmentIndex]) / HorizontalRun
+            : FLT_MAX;
+        Passage.NativeFloorReliefScales[SegmentIndex] =
+            VF_BuildPassageReliefScale(
+                A, B, BaseGradient, SegmentIndex, NumSegments,
+                Passage.NativeFloorReliefStrength,
+                Passage.NativeFloorReliefFrequency);
+    }
+    Passage.bNativeFloorEnabled =
+        Passage.NativeFloorProfileZ.Num() == Passage.ControlPoints.Num();
 }
 
 static float VF_BoundarySealThicknessForDefinition(
@@ -172,7 +672,9 @@ static float VF_BoundarySealThicknessForDefinition(
  */
 static bool VF_IsWalkableTunnelFloor(
     const FVoxelPassage& Passage,
-    const FVector& Position)
+    const FVector& Position,
+    const UVoxelStrateManager* Manager = nullptr,
+    int32 PassageIndex = INDEX_NONE)
 {
     if (!Passage.bWalkableTunnelContract
         || Passage.ControlPoints.Num() < 2
@@ -183,9 +685,8 @@ static bool VF_IsWalkableTunnelFloor(
 
     float FloorZ = 0.0f;
     float SupportRadius = 0.0f;
-    if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
-            Passage.ControlPoints, Passage.ControlRadii, Position,
-            FloorZ, SupportRadius))
+    if (!VF_ProjectPassageFloor(
+            Passage, Position, FloorZ, SupportRadius, Manager, PassageIndex))
     {
         return false;
     }
@@ -196,7 +697,9 @@ static bool VF_IsWalkableTunnelFloor(
 
 static bool VF_IsWalkableTunnelAir(
     const FVoxelPassage& Passage,
-    const FVector& Position)
+    const FVector& Position,
+    const UVoxelStrateManager* Manager = nullptr,
+    int32 PassageIndex = INDEX_NONE)
 {
     if (!Passage.bWalkableTunnelContract
         || Passage.ControlPoints.Num() < 2
@@ -207,9 +710,8 @@ static bool VF_IsWalkableTunnelAir(
 
     float FloorZ = 0.0f;
     float SupportRadius = 0.0f;
-    if (!VoxelPassageGeometry::ProjectWalkableTunnelFloor(
-            Passage.ControlPoints, Passage.ControlRadii, Position,
-            FloorZ, SupportRadius))
+    if (!VF_ProjectPassageFloor(
+            Passage, Position, FloorZ, SupportRadius, Manager, PassageIndex))
     {
         return false;
     }
@@ -253,13 +755,13 @@ static bool VF_FindWalkableTunnelAir(
         }
         const FVoxelPassage& Passage = Passages[PassageIndex];
         if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq
-            || !VF_IsWalkableTunnelAir(Passage, Position))
+            || !VF_IsWalkableTunnelAir(Passage, Position, Manager, PassageIndex))
         {
             continue;
         }
-        VoxelPassageGeometry::ProjectWalkableTunnelFloor(
-            Passage.ControlPoints, Passage.ControlRadii, Position,
-            OutFloorZ, OutSupportRadius);
+        VF_ProjectPassageFloor(
+            Passage, Position, OutFloorZ, OutSupportRadius,
+            Manager, PassageIndex);
         OutPassageIndex = PassageIndex;
         return true;
     }
@@ -291,7 +793,7 @@ static bool VF_IsAnyPassageFloorAt(
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
             || (Manager->ArePassageSupportFloorWritesEnabledForDiagnostics()
-                && VF_IsWalkableTunnelFloor(Passage, Position))))
+                && VF_IsWalkableTunnelFloor(Passage, Position, Manager, PassageIndex))))
         {
             return true;
         }
@@ -1540,6 +2042,13 @@ void UVoxelStrateManager::GeneratePassages()
             // Fallback / bounds if an invalid authored width produced no positive profile.
             Passage.Radius = FMath::Max(Passage.Radius, FMath::Max(Cfg.MouthRadius, Cfg.MidRadius));
 
+            // The passage now owns its D-section at construction time.  Both landing floors,
+            // the complete control chain, and the room-derived relief source are known here;
+            // no voxel query needs to decide whether this particular passage deserves a floor.
+            VF_AuthorNativePassageFloor(
+                Passage, UpperDef, LowerDef,
+                PassageSeed ^ VoxelHash::Cell(i, c, PassageSeed));
+
             // Bounding sphere over the tube, both rooms, and both floor slabs (+ widest radius +
             // blend) for culling. Under-sizing this sphere would cull a real landing and leave a
             // sealed pocket, so the room's full box diagonal is included rather than treating the
@@ -1737,6 +2246,26 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
                     Pos, P.ControlPoints[j], P.ControlPoints[j + 1], rA, rB);
                 PassageSDF = VoxelSDF::SmoothMin(PassageSDF, SegSDF, BlendK);
             }
+
+            // A walkable inter-strate passage is a D-shaped primitive, not a capsule followed
+            // by a slab.  The profile and its bounded relief were authored in GeneratePassages;
+            // projecting once here selects the nearest immutable floor segment for this sample.
+            // Unknown/malformed descriptors deliberately retain the bare capsule and the legacy
+            // diagnostic backstop remains available.
+            if (P.bNativeFloorEnabled)
+            {
+                float NativeFloorZ = 0.0f;
+                float NativeSupportRadius = 0.0f;
+                if (VF_ProjectNativePassageFloor(
+                        P, Pos, NativeFloorZ, NativeSupportRadius,
+                        this, PIdx))
+                {
+                    PassageSDF = VoxelSDF::SmoothMax(
+                        PassageSDF,
+                        NativeFloorZ - static_cast<float>(Pos.Z),
+                        BlendK * 0.35f);
+                }
+            }
             MinSDF = VoxelSDF::SmoothMin(MinSDF, PassageSDF, BlendK);
         }
         else
@@ -1780,8 +2309,12 @@ void UVoxelStrateManager::ApplyPassageModifier(
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
+            // A valid native profile owns its D-floor in the shape and in the final MC
+            // composition.  Keep the old support slab only as a fail-closed fallback for a
+            // malformed/non-native descriptor; it must not patch a floor the shape already owns.
             || (bPassageSupportFloorWritesEnabled
-                && VF_IsWalkableTunnelFloor(Passage, Position))))
+                && !Passage.bNativeFloorEnabled
+                && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex))))
         {
             // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
             // support slab. It is deliberately applied after the air carve so a tube can never
@@ -1920,7 +2453,8 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
                 || (bPassageSupportFloorWritesEnabled
-                    && VF_IsWalkableTunnelFloor(Passage, Position))))
+                    && !Passage.bNativeFloorEnabled
+                    && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex))))
         {
             // Result is in MC convention here (negative = solid). This reassertion is the
             // structural floor backstop after the optional MC-space disturbance layer.
@@ -1967,6 +2501,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     const bool bSuppressFloor =
         VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
     bool bAnyPassageFloor = false;
+    bool bLegacyTunnelSupportFloor = false;
     bool bAnyRoomFloor = false;
     bool bWalkableAir = false;
     float MinLandingSDF = FLT_MAX;
@@ -1979,13 +2514,20 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         if (!Passages.IsValidIndex(PassageIndex)) continue;
         const FVoxelPassage& Passage = Passages[PassageIndex];
 
+        const bool bTunnelSupportFloor =
+            bPassageSupportFloorWritesEnabled
+            && !Passage.bNativeFloorEnabled
+            && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
         if (!bSuppressFloor
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-                || (bPassageSupportFloorWritesEnabled
-                    && VF_IsWalkableTunnelFloor(Passage, Position))))
+                || bTunnelSupportFloor))
         {
             bAnyPassageFloor = true;
+        }
+        if (!bSuppressFloor && bTunnelSupportFloor)
+        {
+            bLegacyTunnelSupportFloor = true;
         }
 
         if (!bSuppressFloor
@@ -1997,7 +2539,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
 
         if (!bWalkableAir
             && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq
-            && VF_IsWalkableTunnelAir(Passage, Position))
+            && VF_IsWalkableTunnelAir(Passage, Position, this, PassageIndex))
         {
             bWalkableAir = true;
         }
@@ -2042,6 +2584,65 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     if (bAnyRoomFloor)
     {
         Density = FMath::Min(Density, -BaseDensity);
+    }
+
+    if (bLegacyTunnelSupportFloor && VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::PassageSupportFloorBackstopFires);
+    }
+}
+
+void UVoxelStrateManager::ApplyPassageNativeFloorMC(
+    float& Density, float WorldX, float WorldY, float WorldZ,
+    float BaseDensity) const
+{
+    const FIntVector ChunkCoord(
+        FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
+        FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
+    const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    if (Nearby.Num() == 0
+        || VoxelPassageGeometry::VerticalShaftConnectorAirMarker())
+    {
+        return;
+    }
+
+    const FVector Position(WorldX, WorldY, WorldZ);
+    for (const int32 PassageIndex : Nearby)
+    {
+        if (!Passages.IsValidIndex(PassageIndex))
+        {
+            continue;
+        }
+        const FVoxelPassage& Passage = Passages[PassageIndex];
+        if (!Passage.bNativeFloorEnabled)
+        {
+            continue;
+        }
+
+        float FloorZ = 0.0f;
+        float SupportRadius = 0.0f;
+        if (!VF_ProjectNativePassageFloor(
+                Passage, Position, FloorZ, SupportRadius,
+                this, PassageIndex))
+        {
+            continue;
+        }
+        if (Position.Z <= FloorZ + KINDA_SMALL_NUMBER
+            && Position.Z > FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+        {
+            // The old support slab is now disabled in the A/B run.  This final write is the
+            // D-shaped primitive's floor ownership, derived from its build-time profile; it is
+            // intentionally not controlled by bPassageSupportFloorWritesEnabled.
+            Density = FMath::Min(Density, -FMath::Max(BaseDensity, 1.0f));
+            if (VoxelDensityProfile::AreCountersEnabled())
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::PassageNativeFloorCompositions);
+            }
+            break;
+        }
     }
 }
 
@@ -4622,7 +5223,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
         // A candidate is a hard replacement of this slot. Do not blend its rolled vector with an
         // authored neighbour at a boundary; this is also how the offline fixture measures it.
-        return Result;
+        return VF_ApplyRuntimeRoughnessOverrides(Result);
     }
 #endif
 
@@ -4633,7 +5234,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
         // Season vectors are already final, measured slot records. Vertical structural posts own
         // their boundary; blending them with another selected recipe would describe neither one.
-        return Result;
+        return VF_ApplyRuntimeRoughnessOverrides(Result);
     }
 
     FStrateGenerationParams BaseParams = BuildParamsFromDefinition(Slot.Definition);
@@ -4728,7 +5329,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 float Alpha = 1.0f - ((float)DistFromBottom / (float)EffectiveBlend);
                 Alpha = FMath::Clamp(Alpha, 0.0f, 1.0f);
 
-                return FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha);
+                return VF_ApplyRuntimeRoughnessOverrides(
+                    FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha));
             }
             break;
         }
@@ -4781,7 +5383,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 // Only blend if alpha > 0 (we're inside the warped transition zone)
                 if (Alpha > 0.0f)
                 {
-                    return FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha);
+                    return VF_ApplyRuntimeRoughnessOverrides(
+                        FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha));
                 }
             }
             break;
@@ -4822,7 +5425,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 float Alpha = 1.0f - ((float)DistFromTop / (float)EffectiveBlend);
                 Alpha = FMath::Clamp(Alpha, 0.0f, 1.0f);
 
-                return FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha);
+                return VF_ApplyRuntimeRoughnessOverrides(
+                    FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha));
             }
             break;
         }
@@ -4851,7 +5455,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
                 if (Alpha > 0.0f)
                 {
-                    return FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha);
+                    return VF_ApplyRuntimeRoughnessOverrides(
+                        FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha));
                 }
             }
             break;
@@ -4860,7 +5465,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     }
 
     // Not near any boundary (or Hard transition) — use this strate's params directly
-    return BaseParams;
+    return VF_ApplyRuntimeRoughnessOverrides(BaseParams);
 }
 
 //=============================================================================
@@ -4886,6 +5491,17 @@ FStrateGenerationParams UVoxelStrateManager::BuildParamsFromDefinition(const UVo
 
 uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
 {
+    // The diagnostic command-line override changes density inputs without changing an asset.  Do
+    // not let a verdict from the unoverridden layout survive into an overridden session (or vice
+    // versa); a zero fingerprint conservatively disables persistence for that session.
+    const FRuntimeRoughnessOverrides& RoughnessOverrides = VF_GetRuntimeRoughnessOverrides();
+    if (RoughnessOverrides.bSurfaceRoughness
+        || RoughnessOverrides.bFrequency
+        || RoughnessOverrides.bNoiseType)
+    {
+        return 0;
+    }
+
     // The session cache is deliberately conservative.  These inputs are valid density inputs but
     // are not represented by the fixed-size hash below, so returning zero disables verdict reuse
     // instead of pretending that a partial key is complete.

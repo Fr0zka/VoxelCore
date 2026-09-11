@@ -60,6 +60,33 @@ namespace
     bool GVoxelForgeStreamingBudgetReported = false;
     bool GVoxelForgeGenerationCapHitReported = false;
     int32 GVoxelForgeMaxPendingTilesObserved = 0;
+    bool GVoxelForgeTestStreamingCenterParsed = false;
+    bool GVoxelForgeUseTestStreamingCenter = false;
+    FIntVector GVoxelForgeTestStreamingCenter = FIntVector::ZeroValue;
+
+    void VF_ParseTestStreamingCenter()
+    {
+        if (GVoxelForgeTestStreamingCenterParsed) return;
+        GVoxelForgeTestStreamingCenterParsed = true;
+
+        int32 X = 0, Y = 0, Z = 0;
+        const TCHAR* CommandLine = FCommandLine::Get();
+        const bool bHaveX = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterX="), X);
+        const bool bHaveY = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterY="), Y);
+        const bool bHaveZ = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterZ="), Z);
+        if (!bHaveX || !bHaveY || !bHaveZ)
+        {
+            return;
+        }
+
+        GVoxelForgeTestStreamingCenter = FIntVector(X, Y, Z);
+        GVoxelForgeUseTestStreamingCenter = true;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForge] diagnostic fixed streaming center: (%d,%d,%d)"),
+            GVoxelForgeTestStreamingCenter.X,
+            GVoxelForgeTestStreamingCenter.Y,
+            GVoxelForgeTestStreamingCenter.Z);
+    }
 }
 
 AVoxelWorld::AVoxelWorld()
@@ -1835,6 +1862,7 @@ int32 AVoxelWorld::GetMaxConcurrentTasks() const
 void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
+    VF_ParseTestStreamingCenter();
     const int32 MaxTasks = GetMaxConcurrentTasks();
     if (GVoxelForgeProfileTileGeneration != 0
         && !GVoxelForgeStreamingBudgetReported)
@@ -1859,7 +1887,11 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         GVoxelForgeStreamingBudgetReported = true;
     }
 
-    const FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
+    FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
+    if (GVoxelForgeUseTestStreamingCenter)
+    {
+        CenterChunk = GVoxelForgeTestStreamingCenter;
+    }
     CurrentCenterChunk = CenterChunk;
 
     // Streaming anchors (AI / remote players, §9.3): prune dead ones + detect chunk crossings so the

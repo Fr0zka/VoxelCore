@@ -92,6 +92,15 @@ struct FVoxelPassage
     // Construction-time walkability facts for diagnostics and the commandlet report. These are
     // metadata, not a second runtime decision: the final-density sampler remains authoritative.
     bool bWalkableTunnelContract = false;
+    // Passage floors are authored once, after the final control chain and both landing floors are
+    // known.  The evaluator uses this immutable profile to turn each tapered capsule into a D
+    // section; it never invents a support plane from the current voxel.
+    bool bNativeFloorEnabled = false;
+    TArray<float> NativeFloorProfileZ;
+    TArray<float> NativeFloorReliefScales;
+    float NativeFloorReliefStrength = 0.0f;
+    float NativeFloorReliefFrequency = 0.015f;
+    uint32 NativeFloorSeed = 0;
     float TunnelMaxGradientDegrees = 0.0f;
     float TunnelVerticalDropVoxels = 0.0f;
     float TunnelRequiredHorizontalRunVoxels = 0.0f;
@@ -423,6 +432,14 @@ public:
                                        float BaseDensity, float SealThickness,
                                        bool bProtectAuthoredTunnelFloor = false) const;
 
+    /**
+     * Compose the build-authored passage D-floor after generic MC writers.  This is the native
+     * passage shape's final ownership step, not the diagnostic legacy support slab controlled by
+     * bPassageSupportFloorWritesEnabled.
+     */
+    void ApplyPassageNativeFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,
+                                   float BaseDensity) const;
+
     /** Re-assert a landing floor after the landing air pass, still before the final XY seal. */
     void ApplyPassageLandingFloorMC(float& Density, float WorldX, float WorldY, float WorldZ,
                                     float BaseDensity) const;
@@ -519,7 +536,9 @@ protected:
     // VoxelSettings::InterStrateGapChunks during Initialize().
     int32 InterStrateGapChunks = 0;
 
-    // Production is true. This diagnostic switch never changes the passage carve or air contract.
+    // Production keeps the legacy writer available only as a fail-closed fallback for a
+    // non-native/malformed passage; native D-floors bypass it. This switch never changes the
+    // passage carve or air contract.
     bool bPassageSupportFloorWritesEnabled = true;
 
     // Per-passage tunnel shape now lives on each UVoxelStrateDefinition::PassageConfig
