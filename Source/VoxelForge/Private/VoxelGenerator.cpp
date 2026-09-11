@@ -178,6 +178,193 @@ static thread_local FSurfaceColumnCache GSurfColCache;
 // T2.b — per-thread octave bias for the tile being meshed (see VoxelGenerator.h).
 // 0 = full quality; set by the mesher per tile from Step + Settings->LODOctaveDrop.
 thread_local int32 VoxelGenLOD::OctaveBias = 0;
+
+//=============================================================================
+// OP-MAJOR DENSITY BLOCK HAND-OFF
+//=============================================================================
+// The public Begin/End pair is only a lifetime marker.  The actual storage is worker-local and
+// bounded by the current mesher lattice.  A tile may cross several chunk keys; each key is filled
+// by the already-prepared stack that GetDensityAt selected for that key, so no mutable stack state
+// is shared across chunk boundaries.
+struct FVoxelDensityBlockSession
+{
+    bool bActive = false;
+    FIntVector Origin = FIntVector::ZeroValue;
+    int32 Step = 1;
+    int32 SizeX = 0;
+    int32 SizeY = 0;
+    int32 SizeZ = 0;
+    TArray<FVoxelOpSample> Samples;
+    TArray<uint8> Valid;
+    TArray<FVoxelOpSample> BlockScratch;
+    TArray<int32> ActiveOps;
+
+    void Begin(FIntVector InOrigin, int32 InStep, int32 InSizeX, int32 InSizeY, int32 InSizeZ)
+    {
+        bActive = InStep > 0 && InSizeX > 0 && InSizeY > 0 && InSizeZ > 0;
+        Origin = InOrigin;
+        Step = FMath::Max(InStep, 1);
+        SizeX = FMath::Max(InSizeX, 0);
+        SizeY = FMath::Max(InSizeY, 0);
+        SizeZ = FMath::Max(InSizeZ, 0);
+        if (!bActive)
+        {
+            Samples.Reset();
+            Valid.Reset();
+            BlockScratch.Reset();
+            ActiveOps.Reset();
+            return;
+        }
+
+        // Allocate lazily on the first operator-stack sample.  Legacy archetypes still use the
+        // ordinary scalar generator and should not pay for a block scratch lattice merely because
+        // the mesher opened the scoped hand-off.
+        BlockScratch.Reset();
+    }
+
+    void End()
+    {
+        bActive = false;
+        // Keep capacity for the next tile on this worker, but never retain a verdict between
+        // sessions.  A stale sample can only cost the next task a block fill, never change it.
+        Samples.Reset();
+        Valid.Reset();
+        BlockScratch.Reset();
+        ActiveOps.Reset();
+    }
+
+    int32 Index(int32 X, int32 Y, int32 Z) const
+    {
+        return (Z * SizeY + Y) * SizeX + X;
+    }
+
+    bool LocalIndex(FIntVector World, int32& OutX, int32& OutY, int32& OutZ) const
+    {
+        const int32 DX = World.X - Origin.X;
+        const int32 DY = World.Y - Origin.Y;
+        const int32 DZ = World.Z - Origin.Z;
+        if (DX % Step != 0 || DY % Step != 0 || DZ % Step != 0) { return false; }
+        OutX = DX / Step;
+        OutY = DY / Step;
+        OutZ = DZ / Step;
+        return OutX >= 0 && OutX < SizeX
+            && OutY >= 0 && OutY < SizeY
+            && OutZ >= 0 && OutZ < SizeZ;
+    }
+
+    bool FindAxisRange(int32 Axis, int32 TargetChunk, int32& OutMin, int32& OutMax) const
+    {
+        OutMin = INT32_MAX;
+        OutMax = INT32_MIN;
+        const int32 Limit = Axis == 0 ? SizeX : (Axis == 1 ? SizeY : SizeZ);
+        const int32 Base = Axis == 0 ? Origin.X : (Axis == 1 ? Origin.Y : Origin.Z);
+        for (int32 I = 0; I < Limit; ++I)
+        {
+            const int32 Coordinate = Base + I * Step;
+            if (FMath::FloorToInt(static_cast<float>(Coordinate) / CHUNK_SIZE) == TargetChunk)
+            {
+                OutMin = FMath::Min(OutMin, I);
+                OutMax = FMath::Max(OutMax, I);
+            }
+        }
+        return OutMin != INT32_MAX;
+    }
+
+    bool FillChunk(const FVoxelOpStack& Stack, FIntVector ChunkCoord, FIntVector World,
+                   FVoxelOpSample& OutSample)
+    {
+        int32 X = 0, Y = 0, Z = 0;
+        if (!LocalIndex(World, X, Y, Z)) { return false; }
+        const int32 Count = SizeX * SizeY * SizeZ;
+        if (Samples.Num() != Count || Valid.Num() != Count)
+        {
+            Samples.SetNum(Count);
+            Valid.Init(0, Count);
+        }
+        const int32 GlobalIndex = Index(X, Y, Z);
+        if (Valid[GlobalIndex] != 0)
+        {
+            OutSample = Samples[GlobalIndex];
+            return true;
+        }
+
+        int32 MinX = 0, MaxX = 0, MinY = 0, MaxY = 0, MinZ = 0, MaxZ = 0;
+        if (!FindAxisRange(0, ChunkCoord.X, MinX, MaxX)
+            || !FindAxisRange(1, ChunkCoord.Y, MinY, MaxY)
+            || !FindAxisRange(2, ChunkCoord.Z, MinZ, MaxZ))
+        {
+            return false;
+        }
+
+        const int32 BlockSizeX = MaxX - MinX + 1;
+        const int32 BlockSizeY = MaxY - MinY + 1;
+        const int32 BlockSizeZ = MaxZ - MinZ + 1;
+        const int32 BlockCount = BlockSizeX * BlockSizeY * BlockSizeZ;
+        BlockScratch.SetNum(BlockCount);
+        for (FVoxelOpSample& Sample : BlockScratch)
+        {
+            Sample = FVoxelOpSample();
+        }
+
+        FVoxelOpBlock Block;
+        Block.OriginVoxels = Origin + FIntVector(MinX * Step, MinY * Step, MinZ * Step);
+        Block.Step = Step;
+        Block.SizeX = BlockSizeX;
+        Block.SizeY = BlockSizeY;
+        Block.SizeZ = BlockSizeZ;
+        Block.Samples = BlockScratch.GetData();
+        const FIntVector BlockLast = Block.OriginVoxels
+            + FIntVector((BlockSizeX - 1) * Step,
+                         (BlockSizeY - 1) * Step,
+                         (BlockSizeZ - 1) * Step);
+        const FBox BlockBox(
+            FVector(static_cast<float>(Block.OriginVoxels.X),
+                    static_cast<float>(Block.OriginVoxels.Y),
+                    static_cast<float>(Block.OriginVoxels.Z)),
+            FVector(static_cast<float>(BlockLast.X),
+                    static_cast<float>(BlockLast.Y),
+                    static_cast<float>(BlockLast.Z)));
+        const int32 ActiveCount = Stack.BuildActiveOpList(
+            BlockBox, Step, Block.OriginVoxels, ActiveOps);
+        Stack.EvalBlock(Block, ActiveOps);
+
+        for (int32 Bz = 0; Bz < BlockSizeZ; ++Bz)
+        {
+            for (int32 By = 0; By < BlockSizeY; ++By)
+            {
+                for (int32 Bx = 0; Bx < BlockSizeX; ++Bx)
+                {
+                    const int32 Global = Index(MinX + Bx, MinY + By, MinZ + Bz);
+                    const int32 Local = (Bz * BlockSizeY + By) * BlockSizeX + Bx;
+                    Samples[Global] = BlockScratch[Local];
+                    Valid[Global] = 1;
+                }
+            }
+        }
+
+        if (VoxelDensityProfile::AreCountersEnabled())
+        {
+            VoxelDensityProfile::AddCounter(VoxelDensityProfile::ECounter::OpBlockBuilds);
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockSamples,
+                static_cast<uint64>(BlockCount));
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockOperators,
+                static_cast<uint64>(Stack.Num()));
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockActiveOperators,
+                static_cast<uint64>(ActiveCount));
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockPrunedOperators,
+                static_cast<uint64>(FMath::Max(Stack.Num() - ActiveCount, 0)));
+        }
+
+        OutSample = Samples[GlobalIndex];
+        return true;
+    }
+};
+
+static thread_local FVoxelDensityBlockSession GVoxelDensityBlockSession;
 thread_local int32 VoxelGenLOD::SampleStep = 1;
 
 int32 VoxelGenLOD::GetThreadOctaveBias()
@@ -1489,6 +1676,17 @@ void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
     InvalidateTileVerdictCache();
 }
 
+void UVoxelGenerator::BeginDensityBlock(FIntVector OriginVoxels, int32 Step,
+                                         int32 SizeX, int32 SizeY, int32 SizeZ) const
+{
+    GVoxelDensityBlockSession.Begin(OriginVoxels, Step, SizeX, SizeY, SizeZ);
+}
+
+void UVoxelGenerator::EndDensityBlock() const
+{
+    GVoxelDensityBlockSession.End();
+}
+
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
@@ -1958,12 +2156,36 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         VoxelDensityProfile::FScopedTimer DensityCoreTimer(
             VoxelDensityProfile::EBucket::DensityCore);
 
+        FVoxelOpSample BlockCoreSample;
+        bool bUsedOpBlockSample = false;
+
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
         // de diff qui suivent ne voient aucune différence.
         if (CP_UseOpStack)
         {
-            Result = ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
+            const bool bIntegerLatticePoint =
+                WorldX == FMath::FloorToFloat(WorldX)
+                && WorldY == FMath::FloorToFloat(WorldY)
+                && WorldZ == FMath::FloorToFloat(WorldZ);
+            const bool bBlockSafeGenerator =
+                CP_GenType == ECaveGeneratorType::TunnelNetwork
+                || CP_GenType == ECaveGeneratorType::Underwater;
+            if (bIntegerLatticePoint && bBlockSafeGenerator
+                && GVoxelDensityBlockSession.bActive)
+            {
+                bUsedOpBlockSample = GVoxelDensityBlockSession.FillChunk(
+                    *ActiveOpStack,
+                    ChunkCoord,
+                    FIntVector(
+                        FMath::RoundToInt(WorldX),
+                        FMath::RoundToInt(WorldY),
+                        FMath::RoundToInt(WorldZ)),
+                    BlockCoreSample);
+            }
+            Result = bUsedOpBlockSample
+                ? -BlockCoreSample.Density
+                : ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
         }
         else switch (CP_GenType)
         {
@@ -2028,8 +2250,20 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         bool bHavePreDisturbanceTunnelCore = false;
         if (CP_UseOpStack)
         {
-            bHavePreDisturbanceTunnelCore = ActiveOpStack->TryGetLastTunnelCoreWorldEvaluation(
-                PreDisturbanceTunnelCore);
+            if (bUsedOpBlockSample && BlockCoreSample.bHasTunnelCoreWorldEvaluation)
+            {
+                PreDisturbanceTunnelCore.SDF = BlockCoreSample.TunnelCoreWorldSDF;
+                PreDisturbanceTunnelCore.bSupportFloor =
+                    BlockCoreSample.bTunnelCoreSupportFloor;
+                PreDisturbanceTunnelCore.bRoomFloor =
+                    BlockCoreSample.bTunnelCoreRoomFloor;
+                bHavePreDisturbanceTunnelCore = true;
+            }
+            else
+            {
+                bHavePreDisturbanceTunnelCore = ActiveOpStack->TryGetLastTunnelCoreWorldEvaluation(
+                    PreDisturbanceTunnelCore);
+            }
         }
         if (!bHavePreDisturbanceTunnelCore && ActiveTunnelCoreCache->bValid)
         {

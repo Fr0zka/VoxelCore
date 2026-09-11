@@ -103,6 +103,7 @@
 
 struct FBiomeContext;
 struct FTunnelCoreWorldEvaluation;
+struct FChunkSDFCache;
 
 //=============================================================================
 // LES QUATRE RÔLES / THE FOUR ROLES
@@ -341,6 +342,47 @@ struct FVoxelOpSample
     // with the sample keeps the rule true even when a detail op is unaware of the room graph.
     bool bProtectedStructuralFloor = false;
     float StructuralFloorMinimumDensity = 0.0f;
+
+    // Block evaluation keeps the room source's per-sample selection explicit.  The scalar path
+    // still uses the source's worker-local state, but a later block-capable modifier must never
+    // observe the state belonging to the last sample of the preceding operator.
+    const FChunkSDFCache* RoomCache = nullptr;
+    int32 NearestRoomIndex = INDEX_NONE;
+
+    // The common generator tail consumes these values after the block has left the stack.  They
+    // are the small, exact subset of FTunnelCoreWorldEvaluation that the tail needs; keeping them
+    // in the sample avoids re-running the world-space tunnel scan or consulting a last-sample TLS
+    // value after an op-major evaluation.
+    bool bHasTunnelCoreWorldEvaluation = false;
+    float TunnelCoreWorldSDF = FLT_MAX;
+    bool bTunnelCoreSupportFloor = false;
+    bool bTunnelCoreRoomFloor = false;
+};
+
+/**
+ * A regular world lattice handed to one operator at a time.
+ *
+ * The default implementation is deliberately scalar and therefore source-compatible with custom
+ * operators.  An operator may override EvalBlock only when it preserves the exact per-sample
+ * semantics of Eval.  Samples are laid out X-fastest, then Y, then Z; all coordinates are voxel
+ * coordinates and are formed as Origin + index * Step using the same integer arithmetic as the
+ * mesher's scalar path.
+ */
+struct FVoxelOpBlock
+{
+    FIntVector OriginVoxels = FIntVector::ZeroValue;
+    int32 Step = 1;
+    int32 SizeX = 0;
+    int32 SizeY = 0;
+    int32 SizeZ = 0;
+    FVoxelOpSample* Samples = nullptr;
+
+    int32 NumSamples() const { return SizeX * SizeY * SizeZ; }
+
+    FORCEINLINE FVoxelOpSample& At(int32 X, int32 Y, int32 Z) const
+    {
+        return Samples[(Z * SizeY + Y) * SizeX + X];
+    }
 };
 
 /**
@@ -476,6 +518,42 @@ public:
      * VoxelForge.Determinism.DensityPurity vérifie cela.
      */
     virtual void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const = 0;
+
+    /**
+     * Op-major evaluation seam.  The conservative default is intentionally not clever: it calls
+     * the canonical scalar Eval for every sample.  This lets the stack and mesher be converted in
+     * reviewable stages while byte-identical output remains the acceptance test.  Stateful ops
+     * may restore their per-sample hand-off from FVoxelOpSample in PrepareBlockSample; the default
+     * invokes that hook before each scalar fallback call.
+     */
+    virtual void EvalBlock(const FVoxelOpBlock& Block) const
+    {
+        if (Block.Samples == nullptr || Block.Step <= 0
+            || Block.SizeX <= 0 || Block.SizeY <= 0 || Block.SizeZ <= 0)
+        {
+            return;
+        }
+
+        for (int32 Z = 0; Z < Block.SizeZ; ++Z)
+        {
+            for (int32 Y = 0; Y < Block.SizeY; ++Y)
+            {
+                for (int32 X = 0; X < Block.SizeX; ++X)
+                {
+                    FVoxelOpSample& Sample = Block.At(X, Y, Z);
+                    PrepareBlockSample(Sample);
+                    Eval(
+                        static_cast<float>(Block.OriginVoxels.X + X * Block.Step),
+                        static_cast<float>(Block.OriginVoxels.Y + Y * Block.Step),
+                        static_cast<float>(Block.OriginVoxels.Z + Z * Block.Step),
+                        Sample);
+                }
+            }
+        }
+    }
+
+    /** Restore a source-owned per-sample context before a scalar fallback in EvalBlock. */
+    virtual void PrepareBlockSample(const FVoxelOpSample&) const {}
 
     /** Optional hand-off for the common structural tail.  The default keeps custom operators
      * conservative: the caller uses its canonical cache path when no source publishes a result. */

@@ -88,6 +88,7 @@ private:
         EVoxelOpResourceMask RequiredResources = VoxelOpResources::None;
         EVoxelOpResourceMask ProvidedResources = VoxelOpResources::None;
         const TCHAR* ProfileName = nullptr;
+        VoxelDensityProfile::EBucket ProfileBucket = VoxelDensityProfile::EBucket::OtherOp;
     };
 
 public:
@@ -125,6 +126,7 @@ public:
             Entry.RequiredResources = Entry.Op->RequiredResources();
             Entry.ProvidedResources = Entry.Op->ProvidedResources();
             Entry.ProfileName = Entry.Op->DebugName();
+            Entry.ProfileBucket = VoxelDensityProfile::BucketFromName(Entry.ProfileName);
         }
         Ops.Add(MoveTemp(Entry));
     }
@@ -157,6 +159,8 @@ public:
      *  mensonge utile qui finirait par masquer une course. */
     void PrepareChunk(const FVoxelOpContext& Ctx)
     {
+        PreparedContext = Ctx;
+        bHasPreparedContext = true;
         for (const FOpEntry& Entry : Ops) { Entry.Op->PrepareChunk(Ctx); }
     }
 
@@ -178,10 +182,21 @@ public:
     FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
     {
         FVoxelOpSample S;
+        // Fine operation timers are a diagnostic mode.  Keeping their construction out of the
+        // ordinary scalar path matters for callers that still use fractional samples or an
+        // archetype without a block session; the block path already times one scope per op/block.
+        const bool bProfileOps = VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Full;
         for (const FOpEntry& Entry : Ops)
         {
-            VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileName);
-            Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
+            if (bProfileOps)
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileBucket);
+                Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
+            }
+            else
+            {
+                Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
+            }
         }
 
         // The room-graph source publishes the authored floor ownership while evaluating the
@@ -192,6 +207,118 @@ public:
         // at the final MC boundary.  The metadata remains on the sample for that hand-off and for
         // diagnostics, but it is no longer allowed to modify density inside the operator stack.
         return S;
+    }
+
+    /**
+     * Evaluate one regular lattice in operator order.  The caller owns and initializes the sample
+     * array (normally to FVoxelOpSample defaults); each operator transforms that same array before
+     * the next operator runs.  The timer is intentionally one scope per operator/block rather than
+     * one scope per operator/sample.  Operators without a block implementation use the conservative
+     * scalar fallback supplied by IVoxelDensityOp, so this entry point is safe to introduce before
+     * converting the concrete operators.
+     */
+    void EvalBlock(const FVoxelOpBlock& Block) const
+    {
+        if (Block.Samples == nullptr || Block.Step <= 0
+            || Block.SizeX <= 0 || Block.SizeY <= 0 || Block.SizeZ <= 0)
+        {
+            return;
+        }
+
+        const bool bProfileOps = VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Full;
+        for (const FOpEntry& Entry : Ops)
+        {
+            if (bProfileOps)
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileBucket);
+                Entry.Op->EvalBlock(Block);
+            }
+            else
+            {
+                Entry.Op->EvalBlock(Block);
+            }
+        }
+    }
+
+    /** Evaluate only the entries that the interval fold proved non-identity for this block. */
+    void EvalBlock(const FVoxelOpBlock& Block, const TArray<int32>& ActiveOps) const
+    {
+        if (Block.Samples == nullptr || Block.Step <= 0
+            || Block.SizeX <= 0 || Block.SizeY <= 0 || Block.SizeZ <= 0)
+        {
+            return;
+        }
+
+        const bool bProfileOps = VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Full;
+        for (const int32 OpIndex : ActiveOps)
+        {
+            if (!Ops.IsValidIndex(OpIndex)) { continue; }
+            const FOpEntry& Entry = Ops[OpIndex];
+            if (bProfileOps)
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(Entry.ProfileBucket);
+                Entry.Op->EvalBlock(Block);
+            }
+            else
+            {
+                Entry.Op->EvalBlock(Block);
+            }
+        }
+    }
+
+    /**
+     * Build a conservative active list for one exact mesher lattice block.  An operator may be
+     * omitted only when its state-aware box contract says Identity and it does not publish SDF.
+     * SDF writers remain in the list even when their density effect is Identity: their SDF is a
+     * channel consumed by a later converter, and an unchanged-looking interval is not by itself a
+     * pointwise proof.  Unknown costs the operator visit, never the geometry.
+     */
+    int32 BuildActiveOpList(const FBox& VoxelBox, int32 InStep,
+                            FIntVector InLatticeOrigin, TArray<int32>& OutActiveOps) const
+    {
+        OutActiveOps.Reset();
+        if (!bHasPreparedContext)
+        {
+            for (int32 Index = 0; Index < Ops.Num(); ++Index) { OutActiveOps.Add(Index); }
+            return OutActiveOps.Num();
+        }
+
+        FVoxelOpContext Ctx = PreparedContext;
+        Ctx.Step = FMath::Max(InStep, 1);
+        Ctx.LatticeOriginVoxels = InLatticeOrigin;
+        Ctx.bUseLatticeProof = true;
+
+        FVoxelBoxHypotheses H;
+        for (int32 Index = 0; Index < Ops.Num(); ++Index)
+        {
+            const FOpEntry& Entry = Ops[Index];
+            const bool bWritesSdf = (Entry.Writes & VoxelOpChannels::Sdf) != 0;
+            const bool bPublishesResource = Entry.ProvidedResources != VoxelOpResources::None;
+            const EVoxelTileClass Forced = Entry.Op->ClassifyBox(VoxelBox, Ctx);
+            bool bCanSkip = false;
+
+            if (Forced != EVoxelTileClass::Mixed)
+            {
+                VF_ForceHypotheses(H, Forced, Entry.Op->ForcedMarginOverBox(VoxelBox, Ctx));
+                if (bWritesSdf) { Entry.Op->PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx); }
+            }
+            else
+            {
+                const EVoxelOpEffect Effect =
+                    Entry.Op->EffectOverBox(VoxelBox, Ctx, H);
+                bCanSkip = Effect == EVoxelOpEffect::Identity
+                    && !bWritesSdf
+                    && !bPublishesResource;
+                VF_FoldEffect(H,
+                              Effect,
+                              Entry.Op->MaxCarveOverBox(VoxelBox, Ctx, H),
+                              Entry.Op->MaxFillOverBox(VoxelBox, Ctx, H));
+                if (bWritesSdf) { Entry.Op->PropagateSdfOverBox(H.Sdf, VoxelBox, Ctx); }
+            }
+
+            if (!bCanSkip) { OutActiveOps.Add(Index); }
+        }
+        return OutActiveOps.Num();
     }
 
     /** Le même, négaté pour le mesher (négatif = solide). */
@@ -346,6 +473,8 @@ public:
 
 private:
     TArray<FOpEntry> Ops;
+    FVoxelOpContext PreparedContext;
+    bool bHasPreparedContext = false;
 };
 
 //=============================================================================

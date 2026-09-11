@@ -144,6 +144,19 @@ public:
     float GetDensityAt(float WorldX, float WorldY, float WorldZ) const;
 
     /**
+     * Open a worker-local lattice hand-off for the following GetDensityAt calls.  The mesher uses
+     * this around one tile's density-grid fill.  The first sample in each resolved chunk lets the
+     * generator run the operator stack once in EvalBlock; later samples consume the exact cached
+     * per-sample result while the ordinary post-stack tail still runs in canonical order.
+     *
+     * This is intentionally a scoped service rather than a persistent world cache: its lifetime is
+     * one tile task, it is thread-local, and EndDensityBlock must be called on every exit path.
+     */
+    void BeginDensityBlock(FIntVector OriginVoxels, int32 Step,
+                           int32 SizeX, int32 SizeY, int32 SizeZ) const;
+    void EndDensityBlock() const;
+
+    /**
      * Densité pour une strate TunnelNetwork (rooms + tunnels + worm noise).
      * Utilisée en interne par GetDensityAt quand la strate est de ce type.
      * Exposée pour permettre des tests isolés avec des params custom.

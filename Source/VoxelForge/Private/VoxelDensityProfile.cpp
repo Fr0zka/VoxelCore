@@ -301,6 +301,48 @@ namespace VoxelDensityProfile
         return Result;
     }
 
+    FSnapshot SnapshotCurrentThread()
+    {
+        FSnapshot Result;
+        FThreadState* State = GThreadState;
+        if (State == nullptr)
+        {
+            Result.TimerPairCycles = GetTimerPairCycles();
+            Result.SampleInterval = GetSampleInterval();
+            Result.Mode = GetMode();
+            return Result;
+        }
+
+        for (int32 Index = 0; Index < BucketCount; ++Index)
+        {
+            Result.Calls[Index] = State->Calls[Index];
+            Result.Samples[Index] = State->Samples[Index];
+            if (State->Samples[Index] == 0)
+            {
+                Result.Cycles[Index] = State->Cycles[Index];
+            }
+            else
+            {
+                const double Scale = static_cast<double>(State->Calls[Index])
+                    / static_cast<double>(State->Samples[Index]);
+                const double EstimatedCycles = static_cast<double>(State->Cycles[Index]) * Scale;
+                Result.Cycles[Index] = EstimatedCycles > static_cast<double>(MAX_uint64)
+                    ? MAX_uint64
+                    : static_cast<uint64>(EstimatedCycles + 0.5);
+            }
+            Result.WallCycles[Index] = Result.Cycles[Index];
+            Result.ActiveWorkers[Index] = State->Calls[Index] > 0 ? 1 : 0;
+        }
+        for (int32 Index = 0; Index < CounterCount; ++Index)
+        {
+            Result.Counters[Index] = State->Counters[Index];
+        }
+        Result.TimerPairCycles = GetTimerPairCycles();
+        Result.SampleInterval = GetSampleInterval();
+        Result.Mode = GetMode();
+        return Result;
+    }
+
     void AddCounter(ECounter Counter, uint64 Amount)
     {
         const int32 Index = static_cast<int32>(Counter);
@@ -441,6 +483,11 @@ namespace VoxelDensityProfile
         case ECounter::TileVerdictCacheHits: return TEXT("TileVerdictCacheHits");
         case ECounter::TileVerdictRegionHits: return TEXT("TileVerdictRegionHits");
         case ECounter::TileVerdictCacheStores: return TEXT("TileVerdictCacheStores");
+        case ECounter::OpBlockBuilds: return TEXT("OpBlockBuilds");
+        case ECounter::OpBlockSamples: return TEXT("OpBlockSamples");
+        case ECounter::OpBlockOperators: return TEXT("OpBlockOperators");
+        case ECounter::OpBlockActiveOperators: return TEXT("OpBlockActiveOperators");
+        case ECounter::OpBlockPrunedOperators: return TEXT("OpBlockPrunedOperators");
         case ECounter::Count:              break;
         }
         return TEXT("Unknown");

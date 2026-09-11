@@ -42,6 +42,40 @@
 namespace
 {
     /**
+     * Concrete block thunks use the scalar body with the concrete operator type visible to the
+     * compiler.  This is deliberately not a second numerical implementation: the scalar Eval is
+     * still the single source of truth, but the op-major caller pays one virtual dispatch for the
+     * block and the inner calls can inline/devirtualize.  Operators with a block-native kernel can
+     * replace this helper later without changing the stack contract.
+     */
+    template<typename TOp>
+    FORCEINLINE void VF_EvalBlockByScalar(const TOp& Op, const FVoxelOpBlock& Block)
+    {
+        if (Block.Samples == nullptr || Block.Step <= 0
+            || Block.SizeX <= 0 || Block.SizeY <= 0 || Block.SizeZ <= 0)
+        {
+            return;
+        }
+
+        for (int32 Z = 0; Z < Block.SizeZ; ++Z)
+        {
+            for (int32 Y = 0; Y < Block.SizeY; ++Y)
+            {
+                for (int32 X = 0; X < Block.SizeX; ++X)
+                {
+                    FVoxelOpSample& Sample = Block.At(X, Y, Z);
+                    Op.PrepareBlockSample(Sample);
+                    Op.Eval(
+                        static_cast<float>(Block.OriginVoxels.X + X * Block.Step),
+                        static_cast<float>(Block.OriginVoxels.Y + Y * Block.Step),
+                        static_cast<float>(Block.OriginVoxels.Z + Z * Block.Step),
+                        Sample);
+                }
+            }
+        }
+    }
+
+    /**
      * BORNE **PROUVABLE** DE `|Perlin3D|`, ET ELLE N'EST PAS 1.0.
      *
      * L'en-tête de `VoxelNoise::Perlin3D` annonce « ~[-1,1] (typiquement [-0.7,0.7]) ». Le `~`
@@ -515,6 +549,11 @@ namespace
         }
 
         const TCHAR* DebugName() const override { return TEXT("ConstantFieldSource"); }
+
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
 
     private:
         float Value;
@@ -1839,6 +1878,11 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("SdfConvertOp"); }
 
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
+
     private:
         bool IsInactive(const FVoxelBoxHypotheses& H) const
         {
@@ -1926,6 +1970,11 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("OriginSpineOp"); }
 
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
+
     private:
         float TopZ, BotZ, Seal, Base, Radius;
     };
@@ -2007,6 +2056,11 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("BoundarySealOp"); }
 
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
+
     private:
         float TopZ, BotZ, Thickness, Base;
     };
@@ -2073,6 +2127,11 @@ namespace
 
         bool IsXYPure() const override { return true; }
         const TCHAR* DebugName() const override { return TEXT("XYEdgeSealOp"); }
+
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
 
     private:
         float Base = 8.0f;
@@ -2185,6 +2244,11 @@ namespace
         }
 
         const TCHAR* DebugName() const override { return TEXT("PassageCarveOp"); }
+
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
 
     private:
         TWeakObjectPtr<const UVoxelStrateManager> Manager;
@@ -3786,6 +3850,15 @@ namespace
          *  Lu par les arches, les dômes, le pincement et le biais de sol. */
         int32 GetNearestRoomIdx() const { return State().NearestRoom; }
 
+        /** Restore the source-owned state belonging to one sample before a later block op reads it. */
+        void RestoreBlockSample(const FVoxelOpSample& Sample) const
+        {
+            FState& S = State();
+            S.ActiveCache = Sample.RoomCache;
+            S.NearestRoom = Sample.NearestRoomIndex;
+            S.bLocalParamsValid = false;
+        }
+
         void BuildSupportColumn(
             float WorldX, float WorldY,
             const FChunkSDFCache& Cache,
@@ -4255,6 +4328,16 @@ namespace
                     }
                 }
             }
+
+            // These are the per-sample hand-offs needed by an op-major block.  The scalar path
+            // continues to use FState directly; publishing them here only makes the dependency
+            // explicit for a later modifier and does not alter Density/Sdf.
+            InOut.RoomCache = &GetCache();
+            InOut.NearestRoomIndex = S.NearestRoom;
+            InOut.bHasTunnelCoreWorldEvaluation = true;
+            InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
+            InOut.bTunnelCoreSupportFloor = S.LastTunnelCoreWorldEvaluation.bSupportFloor;
+            InOut.bTunnelCoreRoomFloor = S.LastTunnelCoreWorldEvaluation.bRoomFloor;
         }
 
         //---------------------------------------------------------------------
@@ -6629,6 +6712,11 @@ namespace
 
         const TCHAR* DebugName() const override { return TEXT("RoomGraphSource"); }
 
+        void EvalBlock(const FVoxelOpBlock& Block) const override
+        {
+            VF_EvalBlockByScalar(*this, Block);
+        }
+
     private:
         FStrateGenerationParams P;
         int32  Seed;
@@ -6725,6 +6813,7 @@ namespace
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
         const TCHAR* DebugName() const override { return TEXT("CaveRoughnessMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -6957,7 +7046,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("CaveTerraceMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7106,7 +7200,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("LayerLineMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7203,7 +7302,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("RibbingMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7295,7 +7399,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("CaveOverhangMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7408,7 +7517,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("CaveCliffMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7518,7 +7632,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("ScallopMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7620,7 +7739,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("CaveArchMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7749,7 +7873,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("RoomColumnMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float, FVoxelOpSample& InOut) const override
         {
@@ -7841,7 +7970,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("DomeMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -7981,7 +8115,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("PinchMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -8107,7 +8246,12 @@ namespace
         EVoxelOpResourceMask RequiredResources() const override { return VoxelOpResources::RoomGeometry; }
         bool IsAdditive() const override { return true; }
         void PrepareChunk(const FVoxelOpContext&) override {}
+        void PrepareBlockSample(const FVoxelOpSample& Sample) const override
+        {
+            if (Rooms != nullptr) { Rooms->RestoreBlockSample(Sample); }
+        }
         const TCHAR* DebugName() const override { return TEXT("FloorBiasMod"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
         void Eval(float, float, float WorldZ, FVoxelOpSample& InOut) const override
         {
@@ -8424,6 +8568,7 @@ namespace
         }
 
         const TCHAR* DebugName() const override { return TEXT("WormFieldSource"); }
+        void EvalBlock(const FVoxelOpBlock& Block) const override { VF_EvalBlockByScalar(*this, Block); }
 
     private:
         FStrateGenerationParams P;

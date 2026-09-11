@@ -12,6 +12,7 @@
 #include "VoxelContentManager.h"
 #include "VoxelDensityVolume.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelDensityProfile.h"
 #include "VoxelStats.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
@@ -48,6 +49,17 @@ namespace
         TEXT("voxel.ProfileTileGeneration"),
         GVoxelForgeProfileTileGeneration,
         TEXT("Log worker tile generation time with level/step/cell count."));
+
+    int32 GVoxelForgeProfileDensity = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeProfileDensity(
+        TEXT("voxel.ProfileDensity"),
+        GVoxelForgeProfileDensity,
+        TEXT("Collect sampled per-density profiling for the game path."));
+    int32 GVoxelForgeProfileDensityFull = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeProfileDensityFull(
+        TEXT("voxel.ProfileDensityFull"),
+        GVoxelForgeProfileDensityFull,
+        TEXT("Collect full per-operator profiling for the game path."));
 
     // Startup command-line cvars can arrive before the game world has spawned AVoxelWorld (or
     // before its first tiles have become visible). Keep the diagnostic edit pending until Tick has
@@ -971,6 +983,39 @@ void AVoxelWorld::BeginPlay()
 {
     Super::BeginPlay();
     bShuttingDown.store(false, std::memory_order_relaxed);
+
+    // Some headless harnesses load module CVars after the engine's startup-CVar pass. Read the
+    // profiling switches explicitly as well, so a reported game profile cannot silently run with
+    // the default mode because of startup ordering.
+    int32 CommandLineProfile = GVoxelForgeProfileDensity;
+    int32 CommandLineProfileFull = GVoxelForgeProfileDensityFull;
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
+    {
+        GVoxelForgeProfileDensity = CommandLineProfile;
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensityFull="), CommandLineProfileFull))
+    {
+        GVoxelForgeProfileDensityFull = CommandLineProfileFull;
+    }
+
+    if (GVoxelForgeProfileDensityFull != 0)
+    {
+        VoxelDensityProfile::SetMode(
+            VoxelDensityProfile::EMode::Full,
+            VoxelDensityProfile::DefaultSampleInterval);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeDensityProfile] game_mode=full sample_interval=%u"),
+            VoxelDensityProfile::DefaultSampleInterval);
+    }
+    else if (GVoxelForgeProfileDensity != 0)
+    {
+        VoxelDensityProfile::SetMode(
+            VoxelDensityProfile::EMode::Sampled,
+            VoxelDensityProfile::DefaultSampleInterval);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeDensityProfile] game_mode=sampled sample_interval=%u"),
+            VoxelDensityProfile::DefaultSampleInterval);
+    }
 
     if (!Settings)
     {
@@ -2379,10 +2424,24 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     double StreamSeconds = 0.0;
     int32 ClassifyVerdict = -1; // Mixed = 0, AllSolid = 1, AllAir = 2
     FVoxelTileClassificationStats ClassifierStats;
+    const bool bProfileOps = bProfileTile
+        && VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Full;
+    const VoxelDensityProfile::FSnapshot TileProfileStart = bProfileTile
+        ? VoxelDensityProfile::SnapshotCurrentThread()
+        : VoxelDensityProfile::FSnapshot();
     auto EmitTileProfile = [&]()
     {
         if (bProfileTile)
         {
+            const VoxelDensityProfile::FSnapshot TileProfileEnd = bProfileTile
+                ? VoxelDensityProfile::SnapshotCurrentThread()
+                : VoxelDensityProfile::FSnapshot();
+            const auto CounterDelta = [&](VoxelDensityProfile::ECounter Counter) -> uint64
+            {
+                const int32 Index = static_cast<int32>(Counter);
+                return bProfileTile && TileProfileEnd.Counters[Index] >= TileProfileStart.Counters[Index]
+                    ? TileProfileEnd.Counters[Index] - TileProfileStart.Counters[Index] : 0;
+            };
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
                      "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
@@ -2392,7 +2451,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "room_work=%.6f room_exact=%.6f cache_work=%.6f "
                      "rooms=%d tunnels=%d joins=%d pits=%d chimneys=%d "
                      "whole_mixed=%u whole_solid=%u whole_air=%u final_nodes=%u "
-                     "split_nodes=%u max_depth=%u"),
+                     "split_nodes=%u max_depth=%u block_builds=%llu block_samples=%llu "
+                     "block_ops=%llu block_active=%llu block_pruned=%llu"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
@@ -2414,7 +2474,53 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 ClassifierStats.RoomNumChimneys,
                 ClassifierStats.WholeMixedNodes, ClassifierStats.WholeSolidNodes,
                 ClassifierStats.WholeAirNodes, ClassifierStats.NeedsFinalFieldNodes,
-                ClassifierStats.SplitNodes, ClassifierStats.MaxRefinementDepth);
+                ClassifierStats.SplitNodes, ClassifierStats.MaxRefinementDepth,
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockBuilds)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockSamples)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockOperators)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockActiveOperators)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockPrunedOperators)));
+
+            if (bProfileOps)
+            {
+                static const VoxelDensityProfile::EBucket GameOpBuckets[] = {
+                    VoxelDensityProfile::EBucket::RoomGraphSource,
+                    VoxelDensityProfile::EBucket::SdfCarve,
+                    VoxelDensityProfile::EBucket::CaveRoughnessMod,
+                    VoxelDensityProfile::EBucket::CaveTerraceMod,
+                    VoxelDensityProfile::EBucket::LayerLineMod,
+                    VoxelDensityProfile::EBucket::RibbingMod,
+                    VoxelDensityProfile::EBucket::CaveOverhangMod,
+                    VoxelDensityProfile::EBucket::CaveCliffMod,
+                    VoxelDensityProfile::EBucket::ScallopMod,
+                    VoxelDensityProfile::EBucket::CaveArchMod,
+                    VoxelDensityProfile::EBucket::RoomColumnMod,
+                    VoxelDensityProfile::EBucket::DomeMod,
+                    VoxelDensityProfile::EBucket::PinchMod,
+                    VoxelDensityProfile::EBucket::FloorBiasMod,
+                    VoxelDensityProfile::EBucket::WormFieldSource,
+                    VoxelDensityProfile::EBucket::OriginSpineOp,
+                    VoxelDensityProfile::EBucket::BoundarySealOp,
+                    VoxelDensityProfile::EBucket::PassageCarveOp,
+                    VoxelDensityProfile::EBucket::XYEdgeSealOp,
+                };
+                for (const VoxelDensityProfile::EBucket Bucket : GameOpBuckets)
+                {
+                    const int32 Index = static_cast<int32>(Bucket);
+                    const uint64 Calls = TileProfileEnd.Calls[Index] >= TileProfileStart.Calls[Index]
+                        ? TileProfileEnd.Calls[Index] - TileProfileStart.Calls[Index] : 0;
+                    const uint64 Cycles = TileProfileEnd.WallCycles[Index] >= TileProfileStart.WallCycles[Index]
+                        ? TileProfileEnd.WallCycles[Index] - TileProfileStart.WallCycles[Index] : 0;
+                    if (Calls == 0) { continue; }
+                    UE_LOG(LogTemp, Display,
+                        TEXT("[VoxelForgeGameOpProfile] tile=(%d,%d,%d) level=%d op=%s calls=%llu total_us=%.3f us_per_call=%.6f"),
+                        Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level,
+                        VoxelDensityProfile::BucketName(Bucket),
+                        static_cast<unsigned long long>(Calls),
+                        FPlatformTime::ToSeconds64(Cycles) * 1.0e6,
+                        FPlatformTime::ToSeconds64(Cycles) * 1.0e6 / static_cast<double>(Calls));
+                }
+            }
         }
     };
 

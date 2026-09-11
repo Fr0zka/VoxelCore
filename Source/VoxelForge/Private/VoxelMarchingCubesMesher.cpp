@@ -5,6 +5,29 @@
 #include "MarchingCubesTables.h"
 #include "VoxelDensityProfile.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"
+
+namespace
+{
+    int32 GVoxelForgeUseOperatorBlock = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeUseOperatorBlock(
+        TEXT("voxel.UseOperatorBlock"),
+        GVoxelForgeUseOperatorBlock,
+        TEXT("Use the operator-major density block path for non-shared mesher grids."));
+    bool GVoxelForgeBlockSwitchParsed = false;
+
+    void VF_ParseOperatorBlockSwitch()
+    {
+        if (GVoxelForgeBlockSwitchParsed) { return; }
+        GVoxelForgeBlockSwitchParsed = true;
+        int32 CommandLineValue = GVoxelForgeUseOperatorBlock;
+        if (FParse::Value(FCommandLine::Get(), TEXT("voxel.UseOperatorBlock="), CommandLineValue))
+        {
+            GVoxelForgeUseOperatorBlock = CommandLineValue;
+        }
+    }
+}
 
 //=============================================================================
 // MAIN ALGORITHM
@@ -17,6 +40,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                                                        int32 BandZMinVox, int32 BandZMaxVox)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_MesherGenerateMesh);
+    VF_ParseOperatorBlockSwitch();
     FVoxelMeshData MeshData;
     if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (!Generator) return MeshData;
@@ -420,12 +444,30 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     // gradient) sont échantillonnées — le reste du tampon reste non initialisé et non lu.
     VoxelDensityProfile::FScopedTimer MesherDensityGridTimer(
         VoxelDensityProfile::EBucket::MesherDensityGrid);
+    const bool bUseOperatorBlock = !bUseSharedDensityGrid
+        && GVoxelForgeUseOperatorBlock != 0;
+    if (bUseOperatorBlock)
+    {
+        // The grid includes one sample of halo on every side.  The generator groups these exact
+        // lattice points by chunk key and lets the prepared op stack fill each group once.
+        Generator->BeginDensityBlock(
+            OriginVoxels + FIntVector(-Step, -Step, GzLo * Step),
+            Step, MDim, MDim, GzHi - GzLo + 1);
+    }
     for (int32 gz = GzLo; gz <= GzHi; gz++)
     {
-        if (ShouldAbortWork()) return FVoxelMeshData();
+        if (ShouldAbortWork())
+        {
+            if (bUseOperatorBlock) { Generator->EndDensityBlock(); }
+            return FVoxelMeshData();
+        }
         for (int32 gy = -1; gy <= GridDim; gy++)
         {
-            if (ShouldAbortWork()) return FVoxelMeshData();
+            if (ShouldAbortWork())
+            {
+                if (bUseOperatorBlock) { Generator->EndDensityBlock(); }
+                return FVoxelMeshData();
+            }
             for (int32 gx = -1; gx <= GridDim; gx++)
             {
                 const int32 LocalIndex = ((gz + 1) * MDim + (gy + 1)) * MDim + (gx + 1);
@@ -447,6 +489,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                 }
             }
         }
+    }
+    if (bUseOperatorBlock)
+    {
+        Generator->EndDensityBlock();
     }
     MesherDensityGridTimer.End();
 

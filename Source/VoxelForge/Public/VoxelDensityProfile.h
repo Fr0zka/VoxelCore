@@ -123,6 +123,11 @@ namespace VoxelDensityProfile
         TileVerdictCacheHits,
         TileVerdictRegionHits,
         TileVerdictCacheStores,
+        OpBlockBuilds,
+        OpBlockSamples,
+        OpBlockOperators,
+        OpBlockActiveOperators,
+        OpBlockPrunedOperators,
         Count
     };
 
@@ -231,6 +236,9 @@ namespace VoxelDensityProfile
     VOXELFORGE_API void CalibrateTimer();
     VOXELFORGE_API void Reset();
     VOXELFORGE_API FSnapshot Snapshot();
+    // Worker-local snapshot for a tile profile.  GenerateTileResult is single-owner on its worker,
+    // so this avoids attributing another worker's concurrent tile to the current tile diagnostic.
+    VOXELFORGE_API FSnapshot SnapshotCurrentThread();
     VOXELFORGE_API void AddCounter(ECounter Counter, uint64 Amount = 1);
     VOXELFORGE_API void AddMeasurement(EBucket Bucket, uint64 Cycles, uint64 Calls = 1);
     VOXELFORGE_API void RecordCall(EBucket Bucket);
