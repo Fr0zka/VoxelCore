@@ -13,6 +13,7 @@
 #include "VoxelDensityVolume.h"
 #include "VoxelDensityOpStack.h"
 #include "VoxelDensityProfile.h"
+#include "VoxelStartupTrace.h"
 #include "VoxelStats.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
@@ -976,11 +977,18 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
 #endif
 
+    if (VoxelForgeStartupTrace::IsActive())
+    {
+        VoxelForgeStartupTrace::Finish(TEXT("end_play_before_steady_state"));
+    }
+
     Super::EndPlay(EndPlayReason);
 }
 
 void AVoxelWorld::BeginPlay()
 {
+    VoxelForgeStartupTrace::BeginFromCommandLine();
+    VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("BeginPlay"));
     Super::BeginPlay();
     bShuttingDown.store(false, std::memory_order_relaxed);
 
@@ -1021,6 +1029,27 @@ void AVoxelWorld::BeginPlay()
     {
         UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] No Settings assigned — world won't generate."));
         return;
+    }
+
+    if (VoxelForgeStartupTrace::IsActive())
+    {
+        FString SettingsPath = Settings->GetPathName();
+        SettingsPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+        SettingsPath.ReplaceInline(TEXT("\""), TEXT("\\\""));
+        VoxelForgeStartupTrace::RecordEvent(TEXT("settings_resolved"), FString::Printf(
+            TEXT("\"asset\":\"%s\",\"seed\":%d,\"total_strates\":%d,\"inter_strate_gap_chunks\":%d,"
+                 "\"strate_pool\":%d,\"max_clip_level\":%d,\"clip_radius\":%d,"
+                 "\"render_distance_chunks\":%d,\"far_sheet_ring\":%d,\"far_sheet_span_levels\":%d,"
+                 "\"enable_density_volume\":%d,\"density_volume_resolution\":%d,\"density_volume_levels\":%d,"
+                 "\"density_volume_max_tasks\":%d,\"density_volume_gpu_upload\":%d"),
+            *SettingsPath,
+            Settings->GetEffectiveWorldSeed(), Settings->TotalStrates,
+            Settings->InterStrateGapChunks, Settings->StratePool.Num(), Settings->MaxClipLevel,
+            Settings->ClipRadius, Settings->RenderDistanceChunks,
+            Settings->bFarSheetRing ? 1 : 0, Settings->FarSheetSpanLevels,
+            Settings->bEnableDensityVolume ? 1 : 0, Settings->DensityVolumeResolution,
+            Settings->DensityVolumeLevels, Settings->DensityVolumeMaxTasks,
+            Settings->bDensityVolumeGPUUpload ? 1 : 0));
     }
 
     // Tiles never move once generated, so make the actor root STATIC. RMC already requests the
@@ -1072,6 +1101,11 @@ void AVoxelWorld::BeginPlay()
     Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
     Mesher->bUseBlockEarlyOut = true;
 
+    VoxelForgeStartupTrace::RecordEvent(TEXT("generator_mesher_constructed"), FString::Printf(
+        TEXT("\"generator\":1,\"mesher\":1,\"generate_skirts\":%d,\"full_res_clip_levels\":%d,\"coarse_tile_cells\":%d"),
+        Settings->bGenerateSkirts ? 1 : 0,
+        Settings->FullResClipLevels, Settings->CoarseTileCells));
+
     // Système de strates — a cooked season takes precedence; otherwise the authored pool path is
     // exactly the legacy one.
     if (!Settings->Season.IsNull() || Settings->StratePool.Num() > 0)
@@ -1114,6 +1148,12 @@ void AVoxelWorld::BeginPlay()
         DensityVolume = NewObject<UVoxelDensityVolume>(this);
         DensityVolume->Initialize(this, Generator, Settings);
     }
+
+    VoxelForgeStartupTrace::RecordEvent(TEXT("density_volume_resolved"), FString::Printf(
+        TEXT("\"enabled\":%d,\"created\":%d,\"gpu_upload\":%d,\"resolution\":%d,\"levels\":%d"),
+        Settings->bEnableDensityVolume ? 1 : 0, DensityVolume != nullptr ? 1 : 0,
+        Settings->bDensityVolumeGPUUpload ? 1 : 0,
+        Settings->DensityVolumeResolution, Settings->DensityVolumeLevels));
 
 #if WITH_EDITOR
     // Listen for data asset edits during PIE so live edit can detect
@@ -1180,6 +1220,57 @@ void AVoxelWorld::Tick(float DeltaTime)
         }
     }
     ProcessPendingChunks();
+
+    // The startup trace stops at the same point the streaming policy declares itself settled:
+    // every desired key is loaded, no generation task remains, and the game-thread result drain
+    // has run for the frame. This is intentionally after ProcessPendingChunks so request-to-ready
+    // includes the final apply.
+    if (VoxelForgeStartupTrace::IsActive()
+        && bAllChunksLoaded
+        && PendingTiles.Num() == 0
+        && bStartupTraceDesiredRecorded)
+    {
+        TMap<int32, int32> SteadyLevelCounts;
+        TMap<int32, FIntVector> SteadyLevelMins;
+        TMap<int32, FIntVector> SteadyLevelMaxs;
+        for (const FVoxelTileKey& Key : DesiredSorted)
+        {
+            ++SteadyLevelCounts.FindOrAdd(Key.Level);
+            FIntVector& Min = SteadyLevelMins.FindOrAdd(Key.Level, FIntVector(MAX_int32, MAX_int32, MAX_int32));
+            FIntVector& Max = SteadyLevelMaxs.FindOrAdd(Key.Level, FIntVector(MIN_int32, MIN_int32, MIN_int32));
+            Min.X = FMath::Min(Min.X, Key.Coord.X);
+            Min.Y = FMath::Min(Min.Y, Key.Coord.Y);
+            Min.Z = FMath::Min(Min.Z, Key.Coord.Z);
+            Max.X = FMath::Max(Max.X, Key.Coord.X);
+            Max.Y = FMath::Max(Max.Y, Key.Coord.Y);
+            Max.Z = FMath::Max(Max.Z, Key.Coord.Z);
+        }
+        VoxelForgeStartupTrace::RecordEvent(TEXT("steady_state"), FString::Printf(
+            TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"pending_tiles\":%d,\"pending_unload\":%d,\"generation_epoch\":%u"),
+            DesiredSorted.Num(), LoadedTiles.Num(), PendingTiles.Num(), PendingUnload.Num(), GenerationEpoch));
+        TArray<int32> SteadyLevels;
+        SteadyLevelCounts.GetKeys(SteadyLevels);
+        SteadyLevels.Sort();
+        for (const int32 Level : SteadyLevels)
+        {
+            const FIntVector Min = SteadyLevelMins.FindChecked(Level);
+            const FIntVector Max = SteadyLevelMaxs.FindChecked(Level);
+            const int32 ExtentVoxels = CHUNK_SIZE << Level;
+            const double TileExtentMetres = static_cast<double>(ExtentVoxels) * VOXEL_SIZE / 100.0;
+            const double SpanX = static_cast<double>(Max.X - Min.X + 1) * TileExtentMetres;
+            const double SpanY = static_cast<double>(Max.Y - Min.Y + 1) * TileExtentMetres;
+            const double SpanZ = static_cast<double>(Max.Z - Min.Z + 1) * TileExtentMetres;
+            VoxelForgeStartupTrace::RecordEvent(TEXT("steady_desired_level"), FString::Printf(
+                TEXT("\"level\":%d,\"tiles\":%d,\"min_coord\":[%d,%d,%d],\"max_coord\":[%d,%d,%d],"
+                     "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s],\"sheet\":%d"),
+                Level, SteadyLevelCounts.FindChecked(Level),
+                Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z,
+                *FString::SanitizeFloat(TileExtentMetres),
+                *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
+                Settings && Level > Settings->MaxClipLevel ? 1 : 0));
+        }
+        VoxelForgeStartupTrace::Finish(TEXT("desired_set_satisfied_and_queue_drained"));
+    }
 
     // Complete the one-shot diagnostic request only after the player's level-0 centre tile is
     // loaded and idle. Waiting for any coarse tile would take the async-neighbour branch and would
@@ -1378,11 +1469,14 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
     // dequeued. This makes request-to-ready include component setup, stream/buffer submission,
     // and collision configuration—the point at which the chunk is actually visible/collidable.
     const bool bResultEmpty = Result.bEmpty || !Result.Streams;
-    const uint64 ApplyStartCycles = GVoxelForgeProfileTileGeneration != 0
+    const bool bTraceTile = VoxelForgeStartupTrace::IsActive();
+    const bool bTelemetry = GVoxelForgeProfileTileGeneration != 0 || bTraceTile;
+    const uint64 ApplyStartCycles = bTelemetry
         ? FPlatformTime::Cycles64() : 0;
     const auto LogTileReady = [&]()
     {
-        if (GVoxelForgeProfileTileGeneration != 0 && Result.RequestStartCycles != 0)
+        if ((GVoxelForgeProfileTileGeneration != 0 || bTraceTile)
+            && Result.RequestStartCycles != 0)
         {
             const uint64 ReadyCycles = FPlatformTime::Cycles64();
             const bool bHaveWorkerTiming = Result.GenerationStartCycles != 0
@@ -1399,15 +1493,39 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                     Result.GenerationStartCycles - Result.RequestStartCycles) : 0.0;
             const double ResultQueueSeconds = bHaveWorkerTiming
                 ? FMath::Max(0.0, RequestToReady - WorkerQueueSeconds
-                    - GenerationSeconds - ApplySeconds) : 0.0;
-            UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileReady] tile=(%d,%d,%d) level=%d empty=%d "
-                     "request_to_ready=%.6f worker_queue=%.6f generation=%.6f "
-                     "result_queue=%.6f apply=%.6f"),
-                Result.Tile.Coord.X, Result.Tile.Coord.Y, Result.Tile.Coord.Z,
-                Result.Tile.Level, bResultEmpty ? 1 : 0,
-                RequestToReady, WorkerQueueSeconds, GenerationSeconds,
-                ResultQueueSeconds, ApplySeconds);
+                    - GenerationSeconds - ApplySeconds)
+                : FMath::Max(0.0, RequestToReady - ApplySeconds);
+            if (GVoxelForgeProfileTileGeneration != 0)
+            {
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeTileReady] tile=(%d,%d,%d) level=%d empty=%d "
+                         "request_to_ready=%.6f worker_queue=%.6f generation=%.6f "
+                         "result_queue=%.6f apply=%.6f"),
+                    Result.Tile.Coord.X, Result.Tile.Coord.Y, Result.Tile.Coord.Z,
+                    Result.Tile.Level, bResultEmpty ? 1 : 0,
+                    RequestToReady, WorkerQueueSeconds, GenerationSeconds,
+                    ResultQueueSeconds, ApplySeconds);
+            }
+            if (bTraceTile)
+            {
+                VoxelForgeStartupTrace::FTileSample Sample;
+                Sample.Level = Result.Tile.Level;
+                Sample.Verdict = Result.ClassifyVerdict;
+                Sample.bEmpty = bResultEmpty;
+                Sample.bCacheHit = Result.bClassifierCacheHit;
+                Sample.bRegionHit = Result.bClassifierRegionHit;
+                Sample.Triangles = Result.NumTriangles;
+                Sample.RequestToReadySeconds = RequestToReady;
+                Sample.WorkerQueueSeconds = WorkerQueueSeconds;
+                Sample.ResultQueueSeconds = ResultQueueSeconds;
+                Sample.QueueWaitSeconds = WorkerQueueSeconds + ResultQueueSeconds;
+                Sample.GenerationSeconds = GenerationSeconds;
+                Sample.ClassifySeconds = Result.ClassifySeconds;
+                Sample.MeshSeconds = Result.MeshSeconds;
+                Sample.StreamSeconds = Result.StreamSeconds;
+                Sample.ApplySeconds = ApplySeconds;
+                VoxelForgeStartupTrace::RecordTile(Sample);
+            }
         }
     };
 
@@ -1977,7 +2095,79 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         // finissent hors desired sont capturées à l'apply (ProcessPendingChunks → TransitionHold),
         // et le settled cull (tout chargé) reste le filet de sécurité plein-scan.
         TArray<FVoxelTileKey> Leavers;
+        const bool bTraceFirstDesired = VoxelForgeStartupTrace::IsActive()
+            && !bStartupTraceDesiredRecorded;
+        if (bTraceFirstDesired)
+        {
+            VoxelForgeStartupTrace::StageBegin(TEXT("BuildDesiredTiles.first"));
+        }
         BuildDesiredTiles(CenterChunk, Leavers);
+        if (bTraceFirstDesired)
+        {
+            VoxelForgeStartupTrace::StageEnd(TEXT("BuildDesiredTiles.first"));
+
+            struct FDesiredLevelSummary
+            {
+                int32 Level = -1;
+                int32 Count = 0;
+                FIntVector Min = FIntVector(MAX_int32, MAX_int32, MAX_int32);
+                FIntVector Max = FIntVector(MIN_int32, MIN_int32, MIN_int32);
+            };
+            TArray<FDesiredLevelSummary> LevelSummaries;
+            for (const FVoxelTileKey& Key : DesiredSorted)
+            {
+                int32 SummaryIndex = INDEX_NONE;
+                for (int32 Index = 0; Index < LevelSummaries.Num(); ++Index)
+                {
+                    if (LevelSummaries[Index].Level == Key.Level)
+                    {
+                        SummaryIndex = Index;
+                        break;
+                    }
+                }
+                if (SummaryIndex == INDEX_NONE)
+                {
+                    SummaryIndex = LevelSummaries.AddDefaulted();
+                    LevelSummaries[SummaryIndex].Level = Key.Level;
+                }
+                FDesiredLevelSummary& Summary = LevelSummaries[SummaryIndex];
+                ++Summary.Count;
+                Summary.Min.X = FMath::Min(Summary.Min.X, Key.Coord.X);
+                Summary.Min.Y = FMath::Min(Summary.Min.Y, Key.Coord.Y);
+                Summary.Min.Z = FMath::Min(Summary.Min.Z, Key.Coord.Z);
+                Summary.Max.X = FMath::Max(Summary.Max.X, Key.Coord.X);
+                Summary.Max.Y = FMath::Max(Summary.Max.Y, Key.Coord.Y);
+                Summary.Max.Z = FMath::Max(Summary.Max.Z, Key.Coord.Z);
+            }
+            LevelSummaries.Sort([](const FDesiredLevelSummary& A, const FDesiredLevelSummary& B)
+            {
+                return A.Level < B.Level;
+            });
+
+            VoxelForgeStartupTrace::RecordEvent(TEXT("desired_set"), FString::Printf(
+                TEXT("\"center_chunk\":[%d,%d,%d],\"total\":%d,\"levels\":%d,\"leavers\":%d,"
+                     "\"collision_only\":%d"),
+                CenterChunk.X, CenterChunk.Y, CenterChunk.Z, DesiredSorted.Num(),
+                LevelSummaries.Num(), Leavers.Num(), CollisionOnlyTiles.Num()));
+            for (const FDesiredLevelSummary& Summary : LevelSummaries)
+            {
+                const int32 ExtentVoxels = CHUNK_SIZE << Summary.Level;
+                const double TileExtentMetres = static_cast<double>(ExtentVoxels) * VOXEL_SIZE / 100.0;
+                const double SpanX = static_cast<double>(Summary.Max.X - Summary.Min.X + 1) * TileExtentMetres;
+                const double SpanY = static_cast<double>(Summary.Max.Y - Summary.Min.Y + 1) * TileExtentMetres;
+                const double SpanZ = static_cast<double>(Summary.Max.Z - Summary.Min.Z + 1) * TileExtentMetres;
+                VoxelForgeStartupTrace::RecordEvent(TEXT("desired_level"), FString::Printf(
+                    TEXT("\"level\":%d,\"tiles\":%d,\"min_coord\":[%d,%d,%d],\"max_coord\":[%d,%d,%d],"
+                         "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s],\"sheet\":%d"),
+                    Summary.Level, Summary.Count,
+                    Summary.Min.X, Summary.Min.Y, Summary.Min.Z,
+                    Summary.Max.X, Summary.Max.Y, Summary.Max.Z,
+                    *FString::SanitizeFloat(TileExtentMetres),
+                    *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
+                    Settings && Summary.Level > Settings->MaxClipLevel ? 1 : 0));
+            }
+            bStartupTraceDesiredRecorded = true;
+        }
 
         // §9.4 — toggle visibility on already-loaded tiles that flipped render↔collision-only this
         // crossing (a CollisionOnly cluster the player just walked toward/away from). No-op w/o anchors.
@@ -2271,7 +2461,9 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         return;  // Budget full — wait for a task to finish.
     }
     PendingTiles.Add(Tile);
-    const uint64 RequestStartCycles = GVoxelForgeProfileTileGeneration != 0
+    const bool bTelemetry = GVoxelForgeProfileTileGeneration != 0
+        || VoxelForgeStartupTrace::IsActive();
+    const uint64 RequestStartCycles = bTelemetry
         ? FPlatformTime::Cycles64() : 0;
 
     const FIntVector OriginVoxels = Tile.OriginVoxels();   // min corner, voxel coords
@@ -2379,7 +2571,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                                          BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                                          bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
-                                         RequestStartCycles]()
+                                         RequestStartCycles, bTelemetry]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -2391,7 +2583,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         if (ShouldAbortWork()) return;
 
         FChunkResult Result;
-        const uint64 GenerationStartCycles = GVoxelForgeProfileTileGeneration != 0
+        const uint64 GenerationStartCycles = bTelemetry
             ? FPlatformTime::Cycles64() : 0;
         Result.GenerationStartCycles = GenerationStartCycles;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
@@ -2417,29 +2609,30 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                      int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
                                      FChunkResult& Result)
 {
-    const bool bProfileTile = GVoxelForgeProfileTileGeneration != 0;
-    const double TileStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+    const bool bLogTileProfile = GVoxelForgeProfileTileGeneration != 0;
+    const bool bMeasureTile = bLogTileProfile || VoxelForgeStartupTrace::IsActive();
+    const double TileStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
     double ClassifySeconds = 0.0;
     double MeshSeconds = 0.0;
     double StreamSeconds = 0.0;
     int32 ClassifyVerdict = -1; // Mixed = 0, AllSolid = 1, AllAir = 2
     FVoxelTileClassificationStats ClassifierStats;
-    const bool bProfileOps = bProfileTile
+    const bool bProfileOps = bLogTileProfile
         && VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Full;
-    const VoxelDensityProfile::FSnapshot TileProfileStart = bProfileTile
+    const VoxelDensityProfile::FSnapshot TileProfileStart = bMeasureTile
         ? VoxelDensityProfile::SnapshotCurrentThread()
         : VoxelDensityProfile::FSnapshot();
     auto EmitTileProfile = [&]()
     {
-        if (bProfileTile)
+        if (bLogTileProfile)
         {
-            const VoxelDensityProfile::FSnapshot TileProfileEnd = bProfileTile
+            const VoxelDensityProfile::FSnapshot TileProfileEnd = bMeasureTile
                 ? VoxelDensityProfile::SnapshotCurrentThread()
                 : VoxelDensityProfile::FSnapshot();
             const auto CounterDelta = [&](VoxelDensityProfile::ECounter Counter) -> uint64
             {
                 const int32 Index = static_cast<int32>(Counter);
-                return bProfileTile && TileProfileEnd.Counters[Index] >= TileProfileStart.Counters[Index]
+                return bMeasureTile && TileProfileEnd.Counters[Index] >= TileProfileStart.Counters[Index]
                     ? TileProfileEnd.Counters[Index] - TileProfileStart.Counters[Index] : 0;
             };
             UE_LOG(LogTemp, Display,
@@ -2528,6 +2721,13 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     Result.Epoch = Epoch;
     Result.bAborted = false;
     Result.bEmpty = true;
+    Result.ClassifyVerdict = -1;
+    Result.bClassifierCacheHit = false;
+    Result.bClassifierRegionHit = false;
+    Result.ClassifySeconds = 0.0;
+    Result.MeshSeconds = 0.0;
+    Result.StreamSeconds = 0.0;
+    Result.NumTriangles = 0;
     Result.Streams.Reset();
     Result.CaptureGrid.Reset();
     Result.BandChunkLo = BandChunkLo;   // strate content cut (MIN/MAX = uncut)
@@ -2561,11 +2761,25 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
-        const double ClassifyStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+        const double ClassifyStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
         const EVoxelTileClass Verdict = Generator->ClassifyTile(
-            OriginVoxels, Step, Cells, bProfileTile ? &ClassifierStats : nullptr);
-        ClassifySeconds = bProfileTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
+            OriginVoxels, Step, Cells, bMeasureTile ? &ClassifierStats : nullptr);
+        ClassifySeconds = bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
+        if (bMeasureTile)
+        {
+            const VoxelDensityProfile::FSnapshot ClassifyProfileEnd =
+                VoxelDensityProfile::SnapshotCurrentThread();
+            const int32 CacheHitIndex = static_cast<int32>(
+                VoxelDensityProfile::ECounter::TileVerdictCacheHits);
+            const int32 RegionHitIndex = static_cast<int32>(
+                VoxelDensityProfile::ECounter::TileVerdictRegionHits);
+            Result.bClassifierCacheHit =
+                ClassifyProfileEnd.Counters[CacheHitIndex] > TileProfileStart.Counters[CacheHitIndex];
+            Result.bClassifierRegionHit =
+                ClassifyProfileEnd.Counters[RegionHitIndex] > TileProfileStart.Counters[RegionHitIndex];
+        }
         ClassifyVerdict = static_cast<int32>(Verdict);
+        Result.ClassifyVerdict = ClassifyVerdict;
         if (ShouldAbortWork())
         {
             AbortResult();
@@ -2592,14 +2806,14 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     if (!bTrivialEmpty)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
-        const double MeshStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+        const double MeshStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
         MeshData = bSheetTile
             ? Mesher->GenerateSheetMesh(OriginVoxels, Step, Cells, SheetChunkZ,
                                         HoleMinX, HoleMinY, HoleMaxX, HoleMaxY)
             : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
                                    bWantCapture ? &Result.CaptureGrid : nullptr,
                                    BandVoxLo, BandVoxHi);
-        MeshSeconds = bProfileTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
+        MeshSeconds = bMeasureTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
         INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
         if (ShouldAbortWork())
         {
@@ -2614,10 +2828,10 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     if (!MeshData.IsEmpty())
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
-        const double StreamStartSeconds = bProfileTile ? FPlatformTime::Seconds() : 0.0;
+        const double StreamStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
         Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
         BuildTileStreamSet(*Result.Streams, MeshData);
-        StreamSeconds = bProfileTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
+        StreamSeconds = bMeasureTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
         if (ShouldAbortWork())
         {
             AbortResult();
@@ -2632,10 +2846,14 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         // (Replaces the whole-tile normal VOTE, which painted mixed coarse tiles — terrain
         // AND cap in one tile — entirely with the winner's material.)
         const int32 NumTris = MeshData.Triangles.Num() / 3;
+        Result.NumTriangles = NumTris;
         Result.bHasCeilingTris = MeshData.NumCeilingTriangles > 0;
         Result.bHasGroundTris  = NumTris > MeshData.NumCeilingTriangles;
     }
 
+    Result.ClassifySeconds = ClassifySeconds;
+    Result.MeshSeconds = MeshSeconds;
+    Result.StreamSeconds = StreamSeconds;
     EmitTileProfile();
 }
 

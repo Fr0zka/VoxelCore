@@ -9,6 +9,7 @@
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
 #include "VoxelDensityPrimitives.h"  // Shared passage carve polarity/strength
 #include "VoxelDensityProfile.h"  // Opt-in targeted per-voxel attribution
+#include "VoxelStartupTrace.h"
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
 #include "Misc/CommandLine.h"
@@ -803,6 +804,7 @@ static bool VF_IsAnyPassageFloorAt(
 
 bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 {
+    VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("StrateManager.Initialize"));
     if (!Settings)
     {
         UE_LOG(LogTemp, Error, TEXT("[StrateManager] No settings provided!"));
@@ -1009,6 +1011,23 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
         StrateLayout.Add(Slot);
 
+        if (VoxelForgeStartupTrace::IsActive())
+        {
+            FString DefinitionPath = Slot.Definition ? Slot.Definition->GetPathName() : FString();
+            DefinitionPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+            DefinitionPath.ReplaceInline(TEXT("\""), TEXT("\\\""));
+            const UEnum* ArchetypeEnum = StaticEnum<ECaveGeneratorType>();
+            const FString ArchetypeName = ArchetypeEnum
+                ? ArchetypeEnum->GetNameStringByValue(static_cast<int64>(Slot.Definition->GeneratorType))
+                : FString::Printf(TEXT("Value_%d"), static_cast<int32>(Slot.Definition->GeneratorType));
+            VoxelForgeStartupTrace::RecordEvent(TEXT("strate_slot"), FString::Printf(
+                TEXT("\"index\":%d,\"definition\":\"%s\",\"archetype\":\"%s\",\"top_chunk_z\":%d,"
+                     "\"bottom_chunk_z\":%d,\"height_chunks\":%d,\"operator_stack\":%d"),
+                Slot.StrateIndex, *DefinitionPath, *ArchetypeName,
+                Slot.TopChunkZ, Slot.BottomChunkZ, Slot.HeightInChunks,
+                Slot.Definition->bUseOperatorStack ? 1 : 0));
+        }
+
         UE_LOG(LogTemp, Log, TEXT("[StrateManager] Strate %d: '%s' | Z chunks [%d to %d] | %d chunks tall"),
             i,
             *Slot.Definition->StrateName.ToString(),
@@ -1124,6 +1143,10 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
 
     UE_LOG(LogTemp, Log, TEXT("[StrateManager] Initialized %d strates (seed=%d)"),
         StrateLayout.Num(), WorldSeed);
+
+    VoxelForgeStartupTrace::RecordEvent(TEXT("strate_layout_ready"), FString::Printf(
+        TEXT("\"strates\":%d,\"seed\":%d,\"inter_strate_gap_chunks\":%d,\"season\":%d"),
+        StrateLayout.Num(), WorldSeed, InterStrateGapChunks, bUseSeason ? 1 : 0));
 
     // Generate passages between consecutive strates
     GeneratePassages();
@@ -1323,9 +1346,14 @@ bool UVoxelStrateManager::GetRecipeForChunk(
 
 void UVoxelStrateManager::GeneratePassages()
 {
+    VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("GeneratePassages"));
     Passages.Empty();
 
-    if (StrateLayout.Num() < 1) return;
+    if (StrateLayout.Num() < 1)
+    {
+        VoxelForgeStartupTrace::RecordEvent(TEXT("passages_ready"), TEXT("\"passages\":0"));
+        return;
+    }
 
     // Deterministic per-value hashes from the world seed. Every draw is keyed by its boundary
     // strate index, connection index, and a unique salt, so one passage cannot shift another.
@@ -2183,6 +2211,10 @@ void UVoxelStrateManager::GeneratePassages()
 
     // Invalidate any thread_local per-chunk passage shortlists (see EvaluateModifierSDF).
     ++PassagesVersion;
+
+    VoxelForgeStartupTrace::RecordEvent(TEXT("passages_ready"), FString::Printf(
+        TEXT("\"passages\":%d,\"passages_version\":%u,\"upper_source_fit\":%d,\"lower_source_fit\":%d"),
+        Passages.Num(), PassagesVersion, NumAimedAtUpperPlayerFit, NumAimedAtLowerPlayerFit));
 }
 
 //=============================================================================
