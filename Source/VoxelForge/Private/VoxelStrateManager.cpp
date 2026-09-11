@@ -2938,13 +2938,22 @@ namespace
 bool UVoxelStrateManager::AnyPassageNearLattice(
     const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
 {
-    // This is deliberately only the conservative spatial candidate test.  The old implementation
-    // evaluated the complete modifier SDF here and then evaluated it a second time in
-    // MaxPassageCarveFactorNearLattice during the same fold.  A bound hit is sufficient to keep
-    // the carve hypothesis alive; MaxPassageCarveFactorNearLattice supplies the exact lattice
-    // amplitude before the fold can preserve AllSolid.
-    return VF_AnyPassageModifierDomainTouchesLattice(
-        Passages, VoxelBox, LatticeOrigin, Step);
+    // This query feeds FPassageCarveOp::EffectOverBox, so a spatial candidate is not enough:
+    // returning true kills the AllSolid hypothesis even when the exact MC samples all have a
+    // zero carve factor.  That was the LOD0 false-Mixed path. Keep the cheap domain test as the
+    // common reject, then use the same exact lattice factor that MaxCarveOverBox consumes. The
+    // manager cache makes the second call in the fold free for the same box.
+    if (!VF_AnyPassageModifierDomainTouchesLattice(
+            Passages, VoxelBox, LatticeOrigin, Step))
+    {
+        return false;
+    }
+
+    const float MaxFactor = MaxPassageCarveFactorNearLattice(
+        VoxelBox, LatticeOrigin, Step);
+    // Invalid input deliberately returns 1.0 from the exact helper. A non-finite result is also
+    // retained as a candidate rather than becoming an identity proof.
+    return !FMath::IsFinite(MaxFactor) || MaxFactor > 0.0f;
 }
 
 bool UVoxelStrateManager::AnyPassageAirPostNearLattice(

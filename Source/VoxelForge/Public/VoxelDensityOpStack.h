@@ -184,22 +184,13 @@ public:
             Entry.Op->Eval(WorldX, WorldY, WorldZ, S);
         }
 
-        // The floor profile is authored by the room-graph source, before any detail op runs. Keep
-        // that source-level clearance invariant through the complete stack. This is intentionally
-        // one final clamp, rather than a per-op query or a support-column revalidation: the source
-        // has already proved the current sample belongs to its finite authored floor band.
-        if (S.bProtectedStructuralFloor
-            && FMath::IsFinite(S.StructuralFloorMinimumDensity)
-            && S.StructuralFloorMinimumDensity > 0.0f)
-        {
-            if (S.Density < S.StructuralFloorMinimumDensity
-                && VoxelDensityProfile::AreCountersEnabled())
-            {
-                VoxelDensityProfile::AddCounter(
-                    VoxelDensityProfile::ECounter::TunnelAuthoredFloorProtectionClamps);
-            }
-            S.Density = FMath::Max(S.Density, S.StructuralFloorMinimumDensity);
-        }
+        // The room-graph source publishes the authored floor ownership while evaluating the
+        // shape, but it must not be reasserted here.  This stack is followed by the common
+        // disturbance/passage writers; composing the floor at this point made every authored
+        // floor sample look like a post-hoc clamp (and counted 100% of them).  The generator now
+        // consumes the same immutable core result after those writers and composes the floor once,
+        // at the final MC boundary.  The metadata remains on the sample for that hand-off and for
+        // diagnostics, but it is no longer allowed to modify density inside the operator stack.
         return S;
     }
 

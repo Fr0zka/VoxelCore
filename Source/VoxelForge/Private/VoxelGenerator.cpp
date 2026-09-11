@@ -479,6 +479,435 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     }
 }
 
+// The disturbance pass is deterministic and spatially sparse.  ClassifyTile used to treat a
+// non-zero density as a world-wide influence, which made an otherwise proven all-solid/all-air
+// LOD0 box fall back to the full mesher.  These predicates are deliberately one-sided: they only
+// prove that no hash-placed primitive can touch the queried box.  An intersecting candidate, an
+// invalid range, or an unknown parameter keeps the conservative Mixed result.
+static FORCEINLINE bool VF_DisturbanceBandTouchesBox(
+    const FBox& Box, const FStrateDisturbanceParams& D)
+{
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    {
+        return true; // Unknown boundary placement must not discharge a proof.
+    }
+    return Box.Max.Z > InnerBot && Box.Min.Z < InnerTop;
+}
+
+static FORCEINLINE float VF_DistanceSquaredToXYBox(
+    float X, float Y, const FBox& Box)
+{
+    const float DX = X < Box.Min.X ? Box.Min.X - X : X > Box.Max.X ? X - Box.Max.X : 0.0f;
+    const float DY = Y < Box.Min.Y ? Box.Min.Y - Y : Y > Box.Max.Y ? Y - Box.Max.Y : 0.0f;
+    return DX * DX + DY * DY;
+}
+
+static FORCEINLINE bool VF_ClosedIntervalsOverlap(
+    float AMin, float AMax, float BMin, float BMax)
+{
+    return AMax >= BMin && BMax >= AMin;
+}
+
+static FORCEINLINE bool VF_InflatedSegmentAabbTouchesBox(
+    const FVector& A, const FVector& B, float Inflation, const FBox& Box)
+{
+    const float MinX = FMath::Min(A.X, B.X) - Inflation;
+    const float MaxX = FMath::Max(A.X, B.X) + Inflation;
+    const float MinY = FMath::Min(A.Y, B.Y) - Inflation;
+    const float MaxY = FMath::Max(A.Y, B.Y) + Inflation;
+    const float MinZ = FMath::Min(A.Z, B.Z) - Inflation;
+    const float MaxZ = FMath::Max(A.Z, B.Z) + Inflation;
+    return VF_ClosedIntervalsOverlap(MinX, MaxX, Box.Min.X, Box.Max.X)
+        && VF_ClosedIntervalsOverlap(MinY, MaxY, Box.Min.Y, Box.Max.Y)
+        && VF_ClosedIntervalsOverlap(MinZ, MaxZ, Box.Min.Z, Box.Max.Z);
+}
+
+static FORCEINLINE float VF_DistanceSquaredToXYSegment(
+    float X, float Y, float AX, float AY, float BX, float BY)
+{
+    const float ABX = BX - AX, ABY = BY - AY;
+    const float APX = X - AX, APY = Y - AY;
+    const float Denom = FMath::Max(ABX * ABX + ABY * ABY, KINDA_SMALL_NUMBER);
+    const float T = FMath::Clamp((APX * ABX + APY * ABY) / Denom, 0.0f, 1.0f);
+    const float CX = AX + ABX * T, CY = AY + ABY * T;
+    return FMath::Square(X - CX) + FMath::Square(Y - CY);
+}
+
+static FORCEINLINE bool VF_AnyLatticeZInOpenBand(
+    const FIntVector& Origin, int32 Step, int32 Cells, float MinZ, float MaxZ)
+{
+    for (int32 GZ = 0; GZ <= Cells; ++GZ)
+    {
+        const float Z = static_cast<float>(Origin.Z + GZ * Step);
+        if (Z > MinZ && Z < MaxZ)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyChasmCanTouchLattice(
+    const FIntVector& Origin, int32 Step, int32 Cells,
+    const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.ChasmDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
+        || D.ChasmDensity > 1.0f || !FMath::IsFinite(D.ChasmSpacing)
+        || !FMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
+        || D.ChasmRadius < 0.0f)
+    {
+        return true;
+    }
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    {
+        return true;
+    }
+    if (!VF_AnyLatticeZInOpenBand(Origin, Step, Cells, InnerBot, InnerTop))
+    {
+        return false;
+    }
+
+    const float Spacing = D.ChasmSpacing;
+    const float InfluenceRadius = D.ChasmRadius + 3.0f;
+    const float InfluenceRadiusSq = InfluenceRadius * InfluenceRadius;
+    for (int32 GY = 0; GY <= Cells; ++GY)
+    for (int32 GX = 0; GX <= Cells; ++GX)
+    {
+        const float X = static_cast<float>(Origin.X + GX * Step);
+        const float Y = static_cast<float>(Origin.Y + GY * Step);
+        const int32 CX = FMath::FloorToInt(X / Spacing);
+        const int32 CY = FMath::FloorToInt(Y / Spacing);
+        for (int32 DY = -1; DY <= 1; ++DY)
+        for (int32 DX = -1; DX <= 1; ++DX)
+        {
+            const int32 NX = CX + DX, NY = CY + DY;
+            const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x43480001u);
+            if (VoxelHash::ToFloat01(H) > D.ChasmDensity)
+            {
+                continue;
+            }
+            const float ChasmX = (NX + 0.15f
+                + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u)) * 0.7f) * Spacing;
+            const float ChasmY = (NY + 0.15f
+                + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u)) * 0.7f) * Spacing;
+            if (FMath::Square(X - ChasmX) + FMath::Square(Y - ChasmY) <= InfluenceRadiusSq)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyBridgeCanTouchLattice(
+    const FIntVector& Origin, int32 Step, int32 Cells,
+    const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.BridgeDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
+        || D.BridgeDensity > 1.0f || !FMath::IsFinite(D.BridgeSpacing)
+        || !FMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
+        || D.BridgeRadius < 0.0f)
+    {
+        return true;
+    }
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    {
+        return true;
+    }
+
+    const float Spacing = D.BridgeSpacing;
+    const float Inflation = D.BridgeRadius + 3.0f;
+    const float InflationSq = Inflation * Inflation;
+    for (int32 GY = 0; GY <= Cells; ++GY)
+    for (int32 GX = 0; GX <= Cells; ++GX)
+    {
+        const float X = static_cast<float>(Origin.X + GX * Step);
+        const float Y = static_cast<float>(Origin.Y + GY * Step);
+        const int32 CX = FMath::FloorToInt(X / Spacing);
+        const int32 CY = FMath::FloorToInt(Y / Spacing);
+        for (int32 DY = -1; DY <= 1; ++DY)
+        for (int32 DX = -1; DX <= 1; ++DX)
+        {
+            const int32 NX = CX + DX, NY = CY + DY;
+            const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x42520001u);
+            if (VoxelHash::ToFloat01(H) > D.BridgeDensity)
+            {
+                continue;
+            }
+            const float ZC = FMath::Lerp(
+                InnerBot + 8.0f, InnerTop - 8.0f,
+                VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB1u)));
+            const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB2u)) * PI;
+            const float DXU = FMath::Cos(Angle), DYU = FMath::Sin(Angle);
+            const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
+            const float Half = Spacing * 0.6f;
+            const float HorizontalSq = VF_DistanceSquaredToXYSegment(
+                X, Y, BX - DXU * Half, BY - DYU * Half,
+                BX + DXU * Half, BY + DYU * Half);
+            if (HorizontalSq > InflationSq)
+            {
+                continue;
+            }
+            for (int32 GZ = 0; GZ <= Cells; ++GZ)
+            {
+                const float Z = static_cast<float>(Origin.Z + GZ * Step);
+                if (FMath::Square(Z - ZC) + HorizontalSq <= InflationSq)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyRidgeCanTouchLattice(
+    const FIntVector& Origin, int32 Step, int32 Cells,
+    const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.RidgeDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
+        || D.RidgeDensity > 1.0f || !FMath::IsFinite(D.RidgeSpacing)
+        || !FMath::IsFinite(D.RidgeHeight) || !FMath::IsFinite(D.RidgeThickness)
+        || D.RidgeSpacing <= 0.0f || D.RidgeHeight <= 0.0f || D.RidgeThickness < 0.0f)
+    {
+        return true;
+    }
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    {
+        return true;
+    }
+    const float TopZ = FMath::Min(InnerBot + D.RidgeHeight, InnerTop);
+    bool bHasRidgeZ = false;
+    for (int32 GZ = 0; GZ <= Cells; ++GZ)
+    {
+        if (static_cast<float>(Origin.Z + GZ * Step) < TopZ)
+        {
+            bHasRidgeZ = true;
+            break;
+        }
+    }
+    if (!bHasRidgeZ)
+    {
+        return false;
+    }
+
+    const float Spacing = D.RidgeSpacing;
+    const float InfluenceRadius = D.RidgeThickness + 3.0f;
+    const float InfluenceRadiusSq = InfluenceRadius * InfluenceRadius;
+    for (int32 GY = 0; GY <= Cells; ++GY)
+    for (int32 GX = 0; GX <= Cells; ++GX)
+    {
+        const float X = static_cast<float>(Origin.X + GX * Step);
+        const float Y = static_cast<float>(Origin.Y + GY * Step);
+        const int32 CX = FMath::FloorToInt(X / Spacing);
+        const int32 CY = FMath::FloorToInt(Y / Spacing);
+        for (int32 DY = -1; DY <= 1; ++DY)
+        for (int32 DX = -1; DX <= 1; ++DX)
+        {
+            const int32 NX = CX + DX, NY = CY + DY;
+            const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x52470001u);
+            if (VoxelHash::ToFloat01(H) > D.RidgeDensity)
+            {
+                continue;
+            }
+            const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9001u)) * PI;
+            const float DXU = FMath::Cos(Angle), DYU = FMath::Sin(Angle);
+            const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
+            const float Half = Spacing * 0.45f;
+            if (VF_DistanceSquaredToXYSegment(
+                    X, Y, BX - DXU * Half, BY - DYU * Half,
+                    BX + DXU * Half, BY + DYU * Half) <= InfluenceRadiusSq)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyChasmCanTouchBox(
+    const FBox& Box, const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.ChasmDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
+        || D.ChasmDensity > 1.0f || !FMath::IsFinite(D.ChasmSpacing)
+        || !FMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
+        || D.ChasmRadius < 0.0f)
+    {
+        return true;
+    }
+    if (!VF_DisturbanceBandTouchesBox(Box, D))
+    {
+        return false;
+    }
+
+    const float Spacing = D.ChasmSpacing;
+    const int32 CellX0 = FMath::FloorToInt(Box.Min.X / Spacing) - 1;
+    const int32 CellX1 = FMath::FloorToInt(Box.Max.X / Spacing) + 1;
+    const int32 CellY0 = FMath::FloorToInt(Box.Min.Y / Spacing) - 1;
+    const int32 CellY1 = FMath::FloorToInt(Box.Max.Y / Spacing) + 1;
+    const float InfluenceRadius = D.ChasmRadius + 3.0f; // ApplyDisturbances' Blend.
+    const float InfluenceRadiusSq = InfluenceRadius * InfluenceRadius;
+
+    for (int32 NY = CellY0; NY <= CellY1; ++NY)
+    for (int32 NX = CellX0; NX <= CellX1; ++NX)
+    {
+        const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x43480001u);
+        if (VoxelHash::ToFloat01(H) > D.ChasmDensity)
+        {
+            continue;
+        }
+        const float CX = (NX + 0.15f
+            + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u)) * 0.7f) * Spacing;
+        const float CY = (NY + 0.15f
+            + VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u)) * 0.7f) * Spacing;
+        if (VF_DistanceSquaredToXYBox(CX, CY, Box) <= InfluenceRadiusSq)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyBridgeCanTouchBox(
+    const FBox& Box, const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.BridgeDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
+        || D.BridgeDensity > 1.0f || !FMath::IsFinite(D.BridgeSpacing)
+        || !FMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
+        || D.BridgeRadius < 0.0f)
+    {
+        return true;
+    }
+    if (!VF_DisturbanceBandTouchesBox(Box, D))
+    {
+        return false;
+    }
+
+    const float Spacing = D.BridgeSpacing;
+    const int32 CellX0 = FMath::FloorToInt(Box.Min.X / Spacing) - 1;
+    const int32 CellX1 = FMath::FloorToInt(Box.Max.X / Spacing) + 1;
+    const int32 CellY0 = FMath::FloorToInt(Box.Min.Y / Spacing) - 1;
+    const int32 CellY1 = FMath::FloorToInt(Box.Max.Y / Spacing) + 1;
+    const float Inflation = D.BridgeRadius + 3.0f; // Capsule radius plus Blend.
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+
+    for (int32 NY = CellY0; NY <= CellY1; ++NY)
+    for (int32 NX = CellX0; NX <= CellX1; ++NX)
+    {
+        const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x42520001u);
+        if (VoxelHash::ToFloat01(H) > D.BridgeDensity)
+        {
+            continue;
+        }
+        const float ZC = FMath::Lerp(
+            InnerBot + 8.0f, InnerTop - 8.0f,
+            VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB1u)));
+        const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB2u)) * PI;
+        const float DX = FMath::Cos(Angle), DY = FMath::Sin(Angle);
+        const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
+        const float Half = Spacing * 0.6f;
+        const FVector A(BX - DX * Half, BY - DY * Half, ZC);
+        const FVector B(BX + DX * Half, BY + DY * Half, ZC);
+        if (VF_InflatedSegmentAabbTouchesBox(A, B, Inflation, Box))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool VF_AnyRidgeCanTouchBox(
+    const FBox& Box, const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    if (D.RidgeDensity == 0.0f)
+    {
+        return false;
+    }
+    if (!FMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
+        || D.RidgeDensity > 1.0f || !FMath::IsFinite(D.RidgeSpacing)
+        || !FMath::IsFinite(D.RidgeHeight) || !FMath::IsFinite(D.RidgeThickness)
+        || D.RidgeSpacing <= 0.0f || D.RidgeHeight <= 0.0f || D.RidgeThickness < 0.0f)
+    {
+        return true;
+    }
+    if (!VF_DisturbanceBandTouchesBox(Box, D))
+    {
+        return false;
+    }
+
+    const float Spacing = D.RidgeSpacing;
+    const int32 CellX0 = FMath::FloorToInt(Box.Min.X / Spacing) - 1;
+    const int32 CellX1 = FMath::FloorToInt(Box.Max.X / Spacing) + 1;
+    const int32 CellY0 = FMath::FloorToInt(Box.Min.Y / Spacing) - 1;
+    const int32 CellY1 = FMath::FloorToInt(Box.Max.Y / Spacing) + 1;
+    const float Inflation = D.RidgeThickness + 3.0f; // Footprint radius plus Blend.
+    const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
+    const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
+    const float TopZ = FMath::Min(InnerBot + D.RidgeHeight, InnerTop);
+    if (Box.Min.Z >= TopZ)
+    {
+        return false;
+    }
+
+    for (int32 NY = CellY0; NY <= CellY1; ++NY)
+    for (int32 NX = CellX0; NX <= CellX1; ++NX)
+    {
+        const uint32 H = VoxelHash::Cell(NX, NY, Seed ^ 0x52470001u);
+        if (VoxelHash::ToFloat01(H) > D.RidgeDensity)
+        {
+            continue;
+        }
+        const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9001u)) * PI;
+        const float DX = FMath::Cos(Angle), DY = FMath::Sin(Angle);
+        const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
+        const float Half = Spacing * 0.45f;
+        const FVector A(BX - DX * Half, BY - DY * Half, InnerBot);
+        const FVector B(BX + DX * Half, BY + DY * Half, InnerBot);
+        if (VF_InflatedSegmentAabbTouchesBox(A, B, Inflation, Box))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static FORCEINLINE bool VF_AnyDisturbanceCanTouchBox(
+    const FBox& Box, const FStrateDisturbanceParams& D, uint32 Seed)
+{
+    return VF_AnyChasmCanTouchBox(Box, D, Seed)
+        || VF_AnyBridgeCanTouchBox(Box, D, Seed)
+        || VF_AnyRidgeCanTouchBox(Box, D, Seed);
+}
+
 //=============================================================================
 // LE MAPPING « ARCHÉTYPE → PILE D'OPÉRATEURS » — UNE SEULE DÉFINITION
 //=============================================================================
@@ -1595,7 +2024,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (bHaveTunnelCore)
             {
                 const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
-                if (TunnelCore.bRoomFloor && !bProtectAuthoredTunnelFloor)
+                // The graph floor is now composed here, after disturbances and passage writers.
+                // The source has already baked the floor profile and published the exact same
+                // core result; this final ownership step only changes an actually-air sample.
+                // Previously the operator stack raised every authored floor sample to a strong
+                // internal density before those writers ran, which made the protection counter
+                // fire for solid samples as well as genuine breaches.
+                if (TunnelCore.bRoomFloor)
                 {
                     const float StructuralSolidDensity =
                         -FMath::Max(LandingBaseDensity * 2.0f, 1.0f);
@@ -1609,15 +2044,15 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     }
                     // A tunnel that penetrates a room cannot reassert its own floor through the
                     // room's floor. The morphology query marks only the finite room support band;
-                    // preserve it after the generic post-disturbance air backstop.
+                    // preserve it after every generic post-disturbance writer.
                     Result = FMath::Min(
                         Result,
                         StructuralSolidDensity);
                 }
-                // The swept capsule owns the relief profile, while this finite support band is
-                // the conservative post-disturbance backstop that keeps terrain modifiers from
-                // removing the only player support at a mouth or a narrow cross-section.
-                if (bTunnelSupportFloor && !bProtectAuthoredTunnelFloor)
+                // The swept capsule owns the relief profile. This finite support band is now the
+                // final composition of that authored shape, after every writer, rather than a
+                // pre-disturbance clamp in FVoxelOpStack::EvalSample.
+                if (bTunnelSupportFloor)
                 {
                     const float StructuralSolidDensity =
                         -FMath::Max(LandingBaseDensity * 2.0f, 1.0f);
@@ -4247,9 +4682,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
             const FStrateDisturbanceParams Disturbances =
                 StrateManager->GetDisturbanceParamsForChunk(TouchedChunk);
-            if (Disturbances.ChasmDensity > 0.0f
-                || Disturbances.BridgeDensity > 0.0f
-                || Disturbances.RidgeDensity > 0.0f)
+            if (VF_AnyDisturbanceCanTouchBox(TileVoxelBox, Disturbances, (uint32)Seed))
             {
                 return EVoxelTileClass::Mixed;
             }
@@ -4344,9 +4777,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
 
                     const FStrateDisturbanceParams Disturbances =
                         StrateManager->GetDisturbanceParamsForChunk(TouchedChunk);
-                    if (Disturbances.ChasmDensity > 0.0f
-                        || Disturbances.BridgeDensity > 0.0f
-                        || Disturbances.RidgeDensity > 0.0f)
+                    if (VF_AnyDisturbanceCanTouchBox(TileVoxelBox, Disturbances, (uint32)Seed))
                     {
                         return EVoxelTileClass::Mixed;
                     }
@@ -4479,7 +4910,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
                 // l'une peut agir ici, on ne prouve rien. Les chasms ne font que creuser ⇒ ils ne
                 // menacent pas un verdict d'air.
                 const FStrateDisturbanceParams DOut = StrateManager->GetDisturbanceParamsForChunk(CC);
-                if (DOut.BridgeDensity > 0.0f || DOut.RidgeDensity > 0.0f)
+                if (VF_AnyBridgeCanTouchBox(TileVoxelBox, DOut, (uint32)Seed)
+                    || VF_AnyRidgeCanTouchBox(TileVoxelBox, DOut, (uint32)Seed))
                 {
                     return EVoxelTileClass::Mixed;
                 }
@@ -4917,8 +5349,21 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, in
         // SurfaceWorld plus haut, pour la même raison.
         //---------------------------------------------------------------------
         const FStrateDisturbanceParams D = StrateManager->GetDisturbanceParamsForChunk(RepCC);
-        if (D.ChasmDensity  > 0.0f) { bCanSolid = false; }
-        if (D.BridgeDensity > 0.0f || D.RidgeDensity > 0.0f) { bCanAir = false; }
+        // A non-zero strate density is only a possibility.  Discharge it when no deterministic
+        // hash-placed primitive can touch this exact tile; a hit keeps the old polarity-specific
+        // conservative result (chasms kill AllSolid, bridges/ridges kill AllAir).
+        if (VF_AnyChasmCanTouchLattice(
+                OriginVoxels, Step, CPA, D, (uint32)Seed))
+        {
+            bCanSolid = false;
+        }
+        if (VF_AnyBridgeCanTouchLattice(
+                OriginVoxels, Step, CPA, D, (uint32)Seed)
+            || VF_AnyRidgeCanTouchLattice(
+                OriginVoxels, Step, CPA, D, (uint32)Seed))
+        {
+            bCanAir = false;
+        }
 
         if (!bCanSolid && !bCanAir)
         {
