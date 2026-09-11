@@ -11,6 +11,7 @@
 #include "VoxelDensityProfile.h"  // Opt-in targeted per-voxel attribution
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
+#include "Misc/Crc.h"
 #include "UObject/UObjectGlobals.h"
 
 #include <atomic>
@@ -289,7 +290,8 @@ static bool VF_IsAnyPassageFloorAt(
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            || VF_IsWalkableTunnelFloor(Passage, Position)))
+            || (Manager->ArePassageSupportFloorWritesEnabledForDiagnostics()
+                && VF_IsWalkableTunnelFloor(Passage, Position))))
         {
             return true;
         }
@@ -1778,7 +1780,8 @@ void UVoxelStrateManager::ApplyPassageModifier(
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            || VF_IsWalkableTunnelFloor(Passage, Position)))
+            || (bPassageSupportFloorWritesEnabled
+                && VF_IsWalkableTunnelFloor(Passage, Position))))
         {
             // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
             // support slab. It is deliberately applied after the air carve so a tube can never
@@ -1916,7 +1919,8 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-                || VF_IsWalkableTunnelFloor(Passage, Position)))
+                || (bPassageSupportFloorWritesEnabled
+                    && VF_IsWalkableTunnelFloor(Passage, Position))))
         {
             // Result is in MC convention here (negative = solid). This reassertion is the
             // structural floor backstop after the optional MC-space disturbance layer.
@@ -1978,7 +1982,8 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         if (!bSuppressFloor
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-                || VF_IsWalkableTunnelFloor(Passage, Position)))
+                || (bPassageSupportFloorWritesEnabled
+                    && VF_IsWalkableTunnelFloor(Passage, Position))))
         {
             bAnyPassageFloor = true;
         }
@@ -4877,4 +4882,79 @@ FStrateGenerationParams UVoxelStrateManager::BuildParamsFromDefinition(const UVo
 
     // Base params only — terrain op fields stay 0 until per-room assignment.
     return Definition->GenerationParams;
+}
+
+uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
+{
+    // The session cache is deliberately conservative.  These inputs are valid density inputs but
+    // are not represented by the fixed-size hash below, so returning zero disables verdict reuse
+    // instead of pretending that a partial key is complete.
+    if (IsUsingSeason())
+    {
+        return 0;
+    }
+#if WITH_EDITOR
+    if (ComposerOverrides.Num() > 0)
+    {
+        return 0;
+    }
+#endif
+
+    uint32 A = 0x9E3779B9u;
+    uint32 B = 0x85EBCA6Bu;
+    auto HashBytes = [&A, &B](const void* Data, int32 Size)
+    {
+        A = FCrc::MemCrc32(Data, Size, A);
+        B = FCrc::MemCrc32(Data, Size, B ^ 0xA511E9B3u);
+    };
+    auto HashValue = [&HashBytes](const auto& Value)
+    {
+        HashBytes(&Value, sizeof(Value));
+    };
+
+    HashValue(CachedSeed);
+    HashValue(bOpenSurfaceEntry);
+    HashValue(OriginSpineRadius);
+    HashValue(InterStrateGapChunks);
+    const int32 LayoutCount = StrateLayout.Num();
+    HashValue(LayoutCount);
+
+    for (const FStrateSlot& Slot : StrateLayout)
+    {
+        if (Slot.Definition == nullptr)
+        {
+            return 0;
+        }
+
+        // BuildChunkCache resolves these arrays into the room cache.  Hashing UObject pointers or
+        // asset names would not prove the asset contents, so dynamic operation/biome layouts
+        // conservatively opt out.  The normal synthetic/runtime profile has neither array.
+        if (Slot.Definition->TerrainOperations.Num() > 0
+            || Slot.Definition->Biomes.Num() > 0)
+        {
+            return 0;
+        }
+
+        HashValue(Slot.StrateIndex);
+        HashValue(Slot.TopChunkZ);
+        HashValue(Slot.BottomChunkZ);
+        HashValue(Slot.HeightInChunks);
+        HashValue(Slot.Definition->GeneratorType);
+        HashValue(Slot.Definition->bUseOperatorStack);
+        HashValue(Slot.Definition->StrateHeightInChunks);
+        HashValue(Slot.Definition->TransitionType);
+        HashValue(Slot.Definition->TransitionBlendChunks);
+        HashValue(Slot.Definition->GenerationParams);
+        HashValue(Slot.Definition->SlabParams);
+        HashValue(Slot.Definition->MazeParams);
+        HashValue(Slot.Definition->SurfaceParams);
+        HashValue(Slot.Definition->VerticalShaftParams);
+        HashValue(Slot.Definition->FloatingIslandParams);
+        HashValue(Slot.Definition->PassageConfig);
+        HashValue(Slot.Definition->bHasWater);
+        HashValue(Slot.Definition->BiomeMapParams);
+    }
+
+    const uint64 Result = (static_cast<uint64>(B) << 32) | static_cast<uint64>(A);
+    return Result != 0 ? Result : 1;
 }

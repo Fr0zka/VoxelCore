@@ -272,6 +272,8 @@ enum class EVoxelStrateTransition : uint8
     LERPF(RoomFloorCutMax) \
     LERPF(FloorReliefStrength) \
     LERPF(FloorReliefFrequency) \
+    LERPF(RoomMouthRiseStrength) \
+    LERPF(RoomMouthRiseBlendVoxels) \
     LERPF(OriginRoomRadius) \
     SNAPF(OriginRoomMaxConnections) \
     /* Cave morphology — tunnels */ \
@@ -558,6 +560,17 @@ struct VOXELFORGE_API FStrateGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms",
         meta = (ClampMin = "0.001", EditCondition = "RoomFloorCutMin < 1.0"))
     float FloorReliefFrequency = 0.015f;
+
+    // Optional local room-floor bench that rises toward a higher tunnel mouth.  It is authored
+    // from the build-time tunnel descriptor, not discovered by a post-generation validator.
+    // Strength 0 keeps the legacy room/tunnel hand-off; 1 reaches the compatible mouth floor.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms|Mouth Blend",
+        meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float RoomMouthRiseStrength = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Rooms|Mouth Blend",
+        meta = (ClampMin = "8.0", ClampMax = "128.0"))
+    float RoomMouthRiseBlendVoxels = 8.0f;
 
     // How much variety in room shapes (0 = all ellipsoids, 1 = full variety).
     // At 0: every room is a smooth ellipsoid (uniform, organic caves).

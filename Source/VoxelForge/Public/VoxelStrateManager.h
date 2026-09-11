@@ -241,6 +241,26 @@ public:
     uint32 GetLayoutVersion() const { return PassagesVersion; }
 
     /**
+     * Fingerprint of the immutable density inputs used by the generator.
+     *
+     * Returns zero when the manager has dynamic inputs that this compact cache key intentionally
+     * does not serialize (seasons, composer recipes, biome maps, or terrain-op assets). Zero is a
+     * fail-closed answer: callers must skip verdict reuse rather than risk an old all-air proof.
+     */
+    uint64 GetGenerationParamsFingerprint() const;
+
+    /** Diagnostic-only switch for isolating the inter-strate support writer. */
+    void SetPassageSupportFloorWritesEnabledForDiagnostics(bool bEnabled)
+    {
+        bPassageSupportFloorWritesEnabled = bEnabled;
+    }
+
+    bool ArePassageSupportFloorWritesEnabledForDiagnostics() const
+    {
+        return bPassageSupportFloorWritesEnabled;
+    }
+
+    /**
      * Get the strate definition for a specific chunk coordinate.
      *
      * @param ChunkCoord - The chunk position
@@ -498,6 +518,9 @@ protected:
     // Solid-bedrock gap between consecutive strates, in chunks. Copied from
     // VoxelSettings::InterStrateGapChunks during Initialize().
     int32 InterStrateGapChunks = 0;
+
+    // Production is true. This diagnostic switch never changes the passage carve or air contract.
+    bool bPassageSupportFloorWritesEnabled = true;
 
     // Per-passage tunnel shape now lives on each UVoxelStrateDefinition::PassageConfig
     // (the upper strate of each boundary controls its own descent tunnels).

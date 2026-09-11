@@ -9,6 +9,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/CriticalSection.h"
 #include "VoxelTypes.h"
 #include "VoxelStrateTypes.h"
 #include "VoxelBiomeTypes.h"
@@ -114,8 +115,16 @@ public:
     UPROPERTY()
     const UVoxelDiffLayer* DiffLayer = nullptr;
 
-    void SetStrateManager(const UVoxelStrateManager* InManager) { StrateManager = InManager; }
-    void SetDiffLayer(const UVoxelDiffLayer* InDiffLayer)       { DiffLayer = InDiffLayer; }
+    void SetStrateManager(const UVoxelStrateManager* InManager)
+    {
+        StrateManager = InManager;
+        InvalidateTileVerdictCache();
+    }
+    void SetDiffLayer(const UVoxelDiffLayer* InDiffLayer)
+    {
+        DiffLayer = InDiffLayer;
+        InvalidateTileVerdictCache();
+    }
 
     // Copie le seed depuis les settings. Appelé au démarrage et lors d'un ChangeSeed.
     void InitializeSettings(const UVoxelSettings* Settings);
@@ -350,6 +359,57 @@ private:
     /** Identité process-unique du propriétaire des caches `CP_*` thread_local.
      *  Process-unique owner identity for the `CP_*` thread-local cache key. */
     uint64 DensityCacheOwnerId = 0;
+
+    /**
+     * A bounded, session-resident proof cache for uniform MC tiles.
+     *
+     * This is deliberately not a disk cache: a verdict is only useful while the exact generator
+     * and its immutable layout are alive, and a stale "all air" verdict would be a hole.  The key
+     * carries every runtime invalidator that can change the sampled field.  Entries are only
+     * stored for AllSolid/AllAir; Mixed is never remembered because it is not a proof.
+     *
+     * A larger proven tile is also a proof for an aligned sub-tile.  FindTileVerdict therefore
+     * accepts an enclosing entry and records that separately from an exact revisit.  Capacity is
+     * fixed so repeated exploration cannot grow memory without bound.
+     */
+    struct FTileVerdictCacheEntry
+    {
+        FIntVector Origin = FIntVector::ZeroValue;
+        int32 Step = 1;
+        int32 CellsPerAxis = 0;
+        int32 GeneratorSeed = 0;
+        int32 ManagerWorldSeed = 0;
+        float OriginSpineRadius = 0.0f;
+        float WorldRadiusVoxels = 0.0f;
+        float EdgeSealThickness = 0.0f;
+        uint64 ManagerLifetimeId = 0;
+        uint32 LayoutVersion = 0;
+        uint32 DiffVersion = 0;
+        uint64 ParamsFingerprint = 0;
+        uint8 PassageSupportFloorWrites = 1;
+        EVoxelTileClass Verdict = EVoxelTileClass::Mixed;
+        uint32 LastUse = 0;
+    };
+
+    static constexpr int32 TileVerdictCacheCapacity = 512;
+    mutable FCriticalSection TileVerdictCacheLock;
+    mutable TArray<FTileVerdictCacheEntry> TileVerdictCache;
+    mutable uint32 TileVerdictCacheClock = 0;
+
+    void InvalidateTileVerdictCache() const;
+    bool FindTileVerdict(
+        const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+        int32 ManagerWorldSeed, uint32 LayoutVersion, uint32 DiffVersion,
+        uint64 ParamsFingerprint, uint8 PassageSupportFloorWrites,
+        EVoxelTileClass& OutVerdict, bool& bOutRegionHit) const;
+    void StoreTileVerdict(
+        const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+        int32 ManagerWorldSeed, uint32 LayoutVersion, uint32 DiffVersion,
+        uint64 ParamsFingerprint, uint8 PassageSupportFloorWrites,
+        EVoxelTileClass Verdict) const;
+    EVoxelTileClass ClassifyTileUncached(
+        const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+        struct FVoxelTileClassificationStats* OutStats) const;
 
     /** Pick the biome (index into Ctx.Biomes) for a Voronoi site, by its climate. */
     int32 ClassifyBiomeAtSite(float SiteX, float SiteY, const FBiomeContext& Ctx, uint32 SiteHash) const;

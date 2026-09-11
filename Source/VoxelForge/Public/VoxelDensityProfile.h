@@ -114,6 +114,13 @@ namespace VoxelDensityProfile
         MesherBlockTests,
         MesherBlockAllSolid,
         MesherBlockAllAir,
+        TileClassifyCalls,
+        TileClassifyAllSolid,
+        TileClassifyAllAir,
+        TileClassifyMixed,
+        TileVerdictCacheHits,
+        TileVerdictRegionHits,
+        TileVerdictCacheStores,
         Count
     };
 

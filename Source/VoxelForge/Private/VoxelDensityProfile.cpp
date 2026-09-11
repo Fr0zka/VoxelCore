@@ -432,6 +432,13 @@ namespace VoxelDensityProfile
         case ECounter::MesherBlockTests:  return TEXT("MesherBlockTests");
         case ECounter::MesherBlockAllSolid:return TEXT("MesherBlockAllSolid");
         case ECounter::MesherBlockAllAir: return TEXT("MesherBlockAllAir");
+        case ECounter::TileClassifyCalls: return TEXT("TileClassifyCalls");
+        case ECounter::TileClassifyAllSolid: return TEXT("TileClassifyAllSolid");
+        case ECounter::TileClassifyAllAir: return TEXT("TileClassifyAllAir");
+        case ECounter::TileClassifyMixed: return TEXT("TileClassifyMixed");
+        case ECounter::TileVerdictCacheHits: return TEXT("TileVerdictCacheHits");
+        case ECounter::TileVerdictRegionHits: return TEXT("TileVerdictRegionHits");
+        case ECounter::TileVerdictCacheStores: return TEXT("TileVerdictCacheStores");
         case ECounter::Count:              break;
         }
         return TEXT("Unknown");

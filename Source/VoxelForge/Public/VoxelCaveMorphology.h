@@ -556,6 +556,16 @@ struct FCachedPinch
     float BaseDensity = 0.0f;
 };
 
+// A build-time room-floor bench authored from one tunnel mouth.  The room evaluator only reads
+// these immutable descriptors; it never searches the graph or decides a correction per sample.
+struct FCachedRoomMouthRise
+{
+    FVector Mouth = FVector::ZeroVector;
+    float TargetFloorZ = 0.0f;
+    float BlendRadius = 8.0f;
+    float Strength = 0.0f;
+};
+
 // A room in the cache — everything needed for per-voxel SDF evaluation.
 // Internal details (CellX, CellY) used during cache building are NOT stored here.
 struct FCachedRoom
@@ -578,6 +588,10 @@ struct FCachedRoom
     float FloorReliefStrength;
     float FloorReliefFrequency;
     uint32 FloorSeed;  // Deterministic seed offset for this room's floor noise
+
+    // Optional build-time floor benches leading to higher tunnel mouths.  Empty in the default
+    // compatibility profile, so the baseline field is unchanged until an archetype opts in.
+    TArray<FCachedRoomMouthRise> MouthRises;
 
     // Per-room terrain operation, hash-rolled during BuildChunkCache from the
     // strate's probability pool (FStrateTerrainOpEntry::Probability).

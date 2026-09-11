@@ -20,6 +20,7 @@
 #include "VoxelDensityProfile.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/ScopeLock.h"
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -1314,6 +1315,169 @@ UVoxelGenerator::UVoxelGenerator()
 {
 }
 
+void UVoxelGenerator::InvalidateTileVerdictCache() const
+{
+    FScopeLock Lock(&TileVerdictCacheLock);
+    TileVerdictCache.Reset();
+    TileVerdictCacheClock = 0;
+}
+
+bool UVoxelGenerator::FindTileVerdict(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+    int32 ManagerWorldSeed, uint32 LayoutVersion, uint32 DiffVersion,
+    uint64 ParamsFingerprint, uint8 PassageSupportFloorWrites,
+    EVoxelTileClass& OutVerdict, bool& bOutRegionHit) const
+{
+    bOutRegionHit = false;
+    FScopeLock Lock(&TileVerdictCacheLock);
+    ++TileVerdictCacheClock;
+
+    const int64 RequestMaxX = static_cast<int64>(OriginVoxels.X)
+        + static_cast<int64>(CellsPerAxis) * Step;
+    const int64 RequestMaxY = static_cast<int64>(OriginVoxels.Y)
+        + static_cast<int64>(CellsPerAxis) * Step;
+    const int64 RequestMaxZ = static_cast<int64>(OriginVoxels.Z)
+        + static_cast<int64>(CellsPerAxis) * Step;
+
+    int32 BestIndex = INDEX_NONE;
+    bool bBestExact = false;
+    for (int32 Index = 0; Index < TileVerdictCache.Num(); ++Index)
+    {
+        FTileVerdictCacheEntry& Entry = TileVerdictCache[Index];
+        if (Entry.GeneratorSeed != Seed
+            || Entry.ManagerWorldSeed != ManagerWorldSeed
+            || Entry.OriginSpineRadius != OriginSpineRadius
+            || Entry.WorldRadiusVoxels != WorldRadiusVoxels
+            || Entry.EdgeSealThickness != EdgeSealThickness
+            || Entry.ManagerLifetimeId != (StrateManager ? StrateManager->GetCacheLifetimeId() : 0)
+            || Entry.LayoutVersion != LayoutVersion
+            || Entry.DiffVersion != DiffVersion
+            || Entry.ParamsFingerprint != ParamsFingerprint
+            || Entry.PassageSupportFloorWrites != PassageSupportFloorWrites
+            || Entry.Step != Step
+            || Entry.CellsPerAxis < CellsPerAxis)
+        {
+            continue;
+        }
+
+        const int64 EntryMaxX = static_cast<int64>(Entry.Origin.X)
+            + static_cast<int64>(Entry.CellsPerAxis) * Step;
+        const int64 EntryMaxY = static_cast<int64>(Entry.Origin.Y)
+            + static_cast<int64>(Entry.CellsPerAxis) * Step;
+        const int64 EntryMaxZ = static_cast<int64>(Entry.Origin.Z)
+            + static_cast<int64>(Entry.CellsPerAxis) * Step;
+        const int64 DeltaX = static_cast<int64>(OriginVoxels.X) - Entry.Origin.X;
+        const int64 DeltaY = static_cast<int64>(OriginVoxels.Y) - Entry.Origin.Y;
+        const int64 DeltaZ = static_cast<int64>(OriginVoxels.Z) - Entry.Origin.Z;
+        if (DeltaX < 0 || DeltaY < 0 || DeltaZ < 0
+            || (DeltaX % Step) != 0 || (DeltaY % Step) != 0 || (DeltaZ % Step) != 0
+            || RequestMaxX > EntryMaxX || RequestMaxY > EntryMaxY || RequestMaxZ > EntryMaxZ)
+        {
+            continue;
+        }
+
+        const bool bExact = Entry.Origin == OriginVoxels
+            && Entry.CellsPerAxis == CellsPerAxis;
+        if (BestIndex == INDEX_NONE || (bExact && !bBestExact)
+            || (bExact == bBestExact
+                && Entry.CellsPerAxis < TileVerdictCache[BestIndex].CellsPerAxis))
+        {
+            BestIndex = Index;
+            bBestExact = bExact;
+        }
+    }
+
+    if (BestIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    FTileVerdictCacheEntry& Entry = TileVerdictCache[BestIndex];
+    Entry.LastUse = TileVerdictCacheClock;
+    OutVerdict = Entry.Verdict;
+    bOutRegionHit = !(Entry.Origin == OriginVoxels
+        && Entry.CellsPerAxis == CellsPerAxis);
+    return OutVerdict != EVoxelTileClass::Mixed;
+}
+
+void UVoxelGenerator::StoreTileVerdict(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+    int32 ManagerWorldSeed, uint32 LayoutVersion, uint32 DiffVersion,
+    uint64 ParamsFingerprint, uint8 PassageSupportFloorWrites,
+    EVoxelTileClass Verdict) const
+{
+    if (Verdict == EVoxelTileClass::Mixed)
+    {
+        return;
+    }
+
+    FScopeLock Lock(&TileVerdictCacheLock);
+    ++TileVerdictCacheClock;
+
+    int32 SlotIndex = INDEX_NONE;
+    int32 VictimIndex = INDEX_NONE;
+    uint32 OldestUse = MAX_uint32;
+    for (int32 Index = 0; Index < TileVerdictCache.Num(); ++Index)
+    {
+        FTileVerdictCacheEntry& Entry = TileVerdictCache[Index];
+        if (Entry.GeneratorSeed == Seed
+            && Entry.ManagerWorldSeed == ManagerWorldSeed
+            && Entry.OriginSpineRadius == OriginSpineRadius
+            && Entry.WorldRadiusVoxels == WorldRadiusVoxels
+            && Entry.EdgeSealThickness == EdgeSealThickness
+            && Entry.ManagerLifetimeId == (StrateManager ? StrateManager->GetCacheLifetimeId() : 0)
+            && Entry.LayoutVersion == LayoutVersion
+            && Entry.DiffVersion == DiffVersion
+            && Entry.ParamsFingerprint == ParamsFingerprint
+            && Entry.PassageSupportFloorWrites == PassageSupportFloorWrites
+            && Entry.Origin == OriginVoxels
+            && Entry.Step == Step
+            && Entry.CellsPerAxis == CellsPerAxis)
+        {
+            SlotIndex = Index;
+            break;
+        }
+        if (Entry.LastUse < OldestUse)
+        {
+            OldestUse = Entry.LastUse;
+            VictimIndex = Index;
+        }
+    }
+
+    if (SlotIndex == INDEX_NONE)
+    {
+        if (TileVerdictCache.Num() < TileVerdictCacheCapacity)
+        {
+            SlotIndex = TileVerdictCache.AddDefaulted();
+        }
+        else if (VictimIndex != INDEX_NONE)
+        {
+            SlotIndex = VictimIndex;
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    FTileVerdictCacheEntry& Entry = TileVerdictCache[SlotIndex];
+    Entry.Origin = OriginVoxels;
+    Entry.Step = Step;
+    Entry.CellsPerAxis = CellsPerAxis;
+    Entry.GeneratorSeed = Seed;
+    Entry.ManagerWorldSeed = ManagerWorldSeed;
+    Entry.OriginSpineRadius = OriginSpineRadius;
+    Entry.WorldRadiusVoxels = WorldRadiusVoxels;
+    Entry.EdgeSealThickness = EdgeSealThickness;
+    Entry.ManagerLifetimeId = StrateManager ? StrateManager->GetCacheLifetimeId() : 0;
+    Entry.LayoutVersion = LayoutVersion;
+    Entry.DiffVersion = DiffVersion;
+    Entry.ParamsFingerprint = ParamsFingerprint;
+    Entry.PassageSupportFloorWrites = PassageSupportFloorWrites;
+    Entry.Verdict = Verdict;
+    Entry.LastUse = TileVerdictCacheClock;
+}
+
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
     // Les paramètres globaux sont copiés ici une seule fois : le chemin voxel ne doit pas
@@ -1322,6 +1486,7 @@ void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
     OriginSpineRadius = Settings ? Settings->GetEffectiveOriginSpineRadius() : 14.0f;
     WorldRadiusVoxels = Settings ? Settings->GetEffectiveWorldRadiusVoxels() : 0.0f;
     EdgeSealThickness = Settings ? Settings->EdgeSealThickness : 64.0f;
+    InvalidateTileVerdictCache();
 }
 
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
@@ -4571,6 +4736,92 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels,
 EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
                                               int32 CellsPerAxis,
                                               FVoxelTileClassificationStats* OutStats) const
+{
+    if (OutStats)
+    {
+        *OutStats = FVoxelTileClassificationStats();
+    }
+
+    const int32 NormalizedStep = FMath::Max(1, Step);
+    const int32 NormalizedCellsPerAxis = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
+    VoxelDensityProfile::AddCounter(
+        VoxelDensityProfile::ECounter::TileClassifyCalls);
+
+    const uint64 ParamsFingerprint = StrateManager
+        ? StrateManager->GetGenerationParamsFingerprint() : 0;
+    const bool bCacheable = ParamsFingerprint != 0;
+    const uint32 LayoutVersion = StrateManager ? StrateManager->GetLayoutVersion() : 0;
+    const uint32 DiffVersion = DiffLayer ? DiffLayer->GetModsVersion() : 0;
+    const int32 ManagerWorldSeed = StrateManager ? StrateManager->GetWorldSeed() : 0;
+    const uint8 PassageSupportFloorWrites = StrateManager
+        && StrateManager->ArePassageSupportFloorWritesEnabledForDiagnostics() ? 1u : 0u;
+
+    EVoxelTileClass CachedVerdict = EVoxelTileClass::Mixed;
+    bool bRegionHit = false;
+    if (bCacheable
+        && FindTileVerdict(
+            OriginVoxels, NormalizedStep, NormalizedCellsPerAxis,
+            ManagerWorldSeed, LayoutVersion, DiffVersion, ParamsFingerprint,
+            PassageSupportFloorWrites, CachedVerdict, bRegionHit))
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TileVerdictCacheHits);
+        if (bRegionHit)
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TileVerdictRegionHits);
+        }
+        if (CachedVerdict == EVoxelTileClass::AllSolid)
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TileClassifyAllSolid);
+        }
+        else if (CachedVerdict == EVoxelTileClass::AllAir)
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TileClassifyAllAir);
+        }
+        else
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::TileClassifyMixed);
+        }
+        return CachedVerdict;
+    }
+
+    const EVoxelTileClass Verdict = ClassifyTileUncached(
+        OriginVoxels, NormalizedStep, NormalizedCellsPerAxis, OutStats);
+    if (Verdict == EVoxelTileClass::AllSolid)
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TileClassifyAllSolid);
+    }
+    else if (Verdict == EVoxelTileClass::AllAir)
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TileClassifyAllAir);
+    }
+    else
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TileClassifyMixed);
+    }
+
+    if (bCacheable && Verdict != EVoxelTileClass::Mixed)
+    {
+        StoreTileVerdict(
+            OriginVoxels, NormalizedStep, NormalizedCellsPerAxis,
+            ManagerWorldSeed, LayoutVersion, DiffVersion, ParamsFingerprint,
+            PassageSupportFloorWrites, Verdict);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TileVerdictCacheStores);
+    }
+    return Verdict;
+}
+
+EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+    FVoxelTileClassificationStats* OutStats) const
 {
     if (OutStats) { *OutStats = FVoxelTileClassificationStats(); }
     // Mêmes clamps que GenerateMesh — le verdict doit couvrir le treillis réellement échantillonné.

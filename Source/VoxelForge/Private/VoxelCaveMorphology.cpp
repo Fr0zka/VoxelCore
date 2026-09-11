@@ -1333,6 +1333,11 @@ VoxelDensityProfile::FCacheMemoryBreakdown FChunkSDFCache::GetAllocatedSizeBreak
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldFloorProfiles);
     }
 
+    for (const FCachedRoom& Room : Rooms)
+    {
+        Breakdown.RoomsBytes += ArrayBytes(Room.MouthRises);
+    }
+
     return Breakdown;
 }
 
@@ -1354,6 +1359,15 @@ struct FBuildRoom
     FVector PlayerFitPoint = FVector::ZeroVector;
     bool bHasPlayerFitPoint = false;
     bool bPlayerFitAttempted = false;
+};
+
+struct FBuildRoomMouthRise
+{
+    int32 RoomIndex = INDEX_NONE;
+    FVector Mouth = FVector::ZeroVector;
+    float TargetFloorZ = 0.0f;
+    float BlendRadius = 0.0f;
+    float Strength = 0.0f;
 };
 
 struct FVFRoomGraphReach
@@ -1395,6 +1409,8 @@ static bool VF_ComputeRoomGraphReach(
         Params.RoomFloorCutMax,
         Params.FloorReliefStrength,
         Params.FloorReliefFrequency,
+        Params.RoomMouthRiseStrength,
+        Params.RoomMouthRiseBlendVoxels,
         Params.OriginRoomRadius,
         Params.TunnelMinRadius,
         Params.TunnelMaxRadius,
@@ -5112,6 +5128,7 @@ void VoxelCaveMorphology::BuildChunkCache(
     // set (and each candidate's own candidates) lies inside the COLLECT region.
     TArray<bool, TInlineAllocator<64>> RoomConnected;
     RoomConnected.Init(false, NumRooms);
+    TArray<FBuildRoomMouthRise, TInlineAllocator<64>> RoomMouthRises;
 
     const auto ResolvePlayerFitPoint = [](FBuildRoom& Room, const FStrateGenerationParams& InParams,
                                           uint32 InWorldSeed) -> bool
@@ -5424,6 +5441,59 @@ void VoxelCaveMorphology::BuildChunkCache(
                 CT.WorldMouthFloorZB = static_cast<float>(
                     CT.WorldControlPoints.Last().Z)
                     - FMath::Abs(CT.WorldControlRadii.Last());
+            }
+
+            // Author optional room-side benches now that the tunnel mouth floors are known.  A
+            // rise is admitted only toward a higher mouth and only when the room's own ceiling
+            // still contains the player capsule.  The evaluator later reads this descriptor after
+            // the room's base floor is resolved; no per-sample tunnel search or correction is
+            // involved.  Strength zero is the exact legacy path.
+            const float MouthRiseStrength = FMath::Clamp(
+                FMath::IsFinite(Params.RoomMouthRiseStrength)
+                    ? Params.RoomMouthRiseStrength : 0.0f,
+                0.0f, 1.0f);
+            const float MouthRiseBlend = FMath::Clamp(
+                FMath::IsFinite(Params.RoomMouthRiseBlendVoxels)
+                    ? Params.RoomMouthRiseBlendVoxels : 8.0f,
+                8.0f, 128.0f);
+            const float RequiredRoomClearance =
+                VoxelPassageGeometry::PlayerHeightVoxels
+                + VoxelPassageGeometry::HeadroomVoxels;
+            const auto AddRoomMouthRise = [
+                &RoomMouthRises, &RoomFloorZFor, MouthRiseStrength,
+                MouthRiseBlend, RequiredRoomClearance](
+                    int32 RoomIndex, const FBuildRoom& Room,
+                    const FVector& Mouth, float TargetFloorZ)
+            {
+                if (!(MouthRiseStrength > 0.0f)
+                    || !FMath::IsFinite(TargetFloorZ)
+                    || !FMath::IsFinite(Mouth.X)
+                    || !FMath::IsFinite(Mouth.Y)
+                    || !FMath::IsFinite(Mouth.Z))
+                {
+                    return;
+                }
+                const float BaseFloorZ = RoomFloorZFor(Room);
+                if (!FMath::IsFinite(BaseFloorZ)
+                    || TargetFloorZ <= BaseFloorZ + KINDA_SMALL_NUMBER
+                    || Room.Center.Z + Room.RadiusZ - TargetFloorZ
+                        < RequiredRoomClearance)
+                {
+                    return;
+                }
+                FBuildRoomMouthRise& Rise = RoomMouthRises.Emplace_GetRef();
+                Rise.RoomIndex = RoomIndex;
+                Rise.Mouth = Mouth;
+                Rise.TargetFloorZ = TargetFloorZ;
+                Rise.BlendRadius = MouthRiseBlend;
+                Rise.Strength = MouthRiseStrength;
+            };
+            if (CT.ControlPoints.Num() >= 2)
+            {
+                AddRoomMouthRise(
+                    I, RoomA, CT.ControlPoints[0], CT.SDFMouthFloorZA);
+                AddRoomMouthRise(
+                    J, RoomB, CT.ControlPoints.Last(), CT.SDFMouthFloorZB);
             }
 
             CT.Midpoint = CT.ControlPoints.Num() > 2
@@ -5838,6 +5908,28 @@ void VoxelCaveMorphology::BuildChunkCache(
             }
         }
 
+        // Attach the complete room-side mouth descriptors after the room shape/floor fields are
+        // baked.  Expand the conservative room cull to cover the local blend even when the mouth
+        // is offset from the room centre.
+        for (const FBuildRoomMouthRise& AuthoredRise : RoomMouthRises)
+        {
+            if (AuthoredRise.RoomIndex != RoomIdx)
+            {
+                continue;
+            }
+            FCachedRoomMouthRise& Rise = CR.MouthRises.Emplace_GetRef();
+            Rise.Mouth = AuthoredRise.Mouth;
+            Rise.TargetFloorZ = AuthoredRise.TargetFloorZ;
+            Rise.BlendRadius = AuthoredRise.BlendRadius;
+            Rise.Strength = AuthoredRise.Strength;
+            const float Reach = static_cast<float>(FVector::Dist(
+                CR.Center, Rise.Mouth)) + FMath::Max(Rise.BlendRadius, 0.0f);
+            if (FMath::IsFinite(Reach))
+            {
+                CR.CullRadiusSq = FMath::Max(CR.CullRadiusSq, Reach * Reach);
+            }
+        }
+
         OutCache.Rooms.Add(CR);
 
         //---------------------------------------------------------------------
@@ -5982,6 +6074,27 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         if (Room.FloorCutZ > -FLT_MAX)
         {
             float FloorZ = Room.FloorCutZ;
+            for (const FCachedRoomMouthRise& Rise : Room.MouthRises)
+            {
+                const float DX = static_cast<float>(Pos.X - Rise.Mouth.X);
+                const float DY = static_cast<float>(Pos.Y - Rise.Mouth.Y);
+                const float Radius = FMath::Max(Rise.BlendRadius, 1.0f);
+                const float Distance = FMath::Sqrt(DX * DX + DY * DY);
+                if (Distance >= Radius
+                    || !(Rise.Strength > 0.0f)
+                    || !FMath::IsFinite(Rise.TargetFloorZ))
+                {
+                    continue;
+                }
+                const float Weight = 1.0f - SmoothStep01(
+                    FMath::Clamp(Distance / Radius, 0.0f, 1.0f));
+                const float DesiredFloorZ = FMath::Lerp(
+                    FloorZ, Rise.TargetFloorZ,
+                    Weight * FMath::Clamp(Rise.Strength, 0.0f, 1.0f));
+                // A lower tunnel never cuts down into the room.  The room remains the owner of
+                // its floor, while a higher mouth receives a deliberate, smooth bench.
+                FloorZ = FMath::Max(FloorZ, DesiredFloorZ);
+            }
             const float FloorBlend = BlendK * 0.35f;
             bool bFloorCutIsIdentity = false;
             if (Room.FloorReliefStrength > 0.0f)

@@ -147,6 +147,69 @@ bool ParseArchetype(const FString& Text, ECaveGeneratorType& OutArchetype)
     return false;
 }
 
+const TCHAR* NoiseTypeName(EVoxelNoiseType NoiseType)
+{
+    switch (NoiseType)
+    {
+    case EVoxelNoiseType::FBM:      return TEXT("FBM");
+    case EVoxelNoiseType::Ridged:   return TEXT("Ridged");
+    case EVoxelNoiseType::Mixed:    return TEXT("Mixed");
+    case EVoxelNoiseType::Cellular: return TEXT("Cellular");
+    default:                        return TEXT("Unknown");
+    }
+}
+
+bool ParseNoiseType(const FString& Text, EVoxelNoiseType& OutNoiseType)
+{
+    FString Normalized = Text;
+    Normalized.TrimStartAndEndInline();
+    Normalized.ToLowerInline();
+    Normalized.ReplaceInline(TEXT("_"), TEXT(""));
+    Normalized.ReplaceInline(TEXT("-"), TEXT(""));
+
+    if (Normalized == TEXT("fbm") || Normalized == TEXT("fractal"))
+    {
+        OutNoiseType = EVoxelNoiseType::FBM;
+        return true;
+    }
+    if (Normalized == TEXT("ridged") || Normalized == TEXT("ridge"))
+    {
+        OutNoiseType = EVoxelNoiseType::Ridged;
+        return true;
+    }
+    if (Normalized == TEXT("mixed"))
+    {
+        OutNoiseType = EVoxelNoiseType::Mixed;
+        return true;
+    }
+    if (Normalized == TEXT("cellular") || Normalized == TEXT("worley"))
+    {
+        OutNoiseType = EVoxelNoiseType::Cellular;
+        return true;
+    }
+    return false;
+}
+
+bool ParseRenderCamera(const FString& Text, FVector& OutCamera)
+{
+    TArray<FString> Components;
+    Text.ParseIntoArray(Components, TEXT(","), true);
+    if (Components.Num() != 3)
+    {
+        return false;
+    }
+
+    const float X = FCString::Atof(*Components[0]);
+    const float Y = FCString::Atof(*Components[1]);
+    const float Z = FCString::Atof(*Components[2]);
+    if (!FMath::IsFinite(X) || !FMath::IsFinite(Y) || !FMath::IsFinite(Z))
+    {
+        return false;
+    }
+    OutCamera = FVector(X, Y, Z);
+    return true;
+}
+
 bool NeedsOriginInWindow(ECaveGeneratorType Archetype)
 {
     // This is the same topology policy as VoxelForgePlayerFitWindow.h. That header is test-only,
@@ -205,6 +268,7 @@ struct FExploreArguments
     bool bProfileDensityFull = false;
     bool bProfileLod = false;
     bool bOpBounds = false;
+    bool bProfileTileVerdictCache = false;
     bool bFailureFocusRender = false;
     FString OutDirectory;
 
@@ -223,6 +287,10 @@ struct FExploreArguments
     float BudgetMinutes = DefaultBudgetMinutes;
     bool bSurfaceRoughnessOverride = false;
     float SurfaceRoughness = 0.0f;
+    bool bRoughnessNoiseTypeOverride = false;
+    EVoxelNoiseType RoughnessNoiseType = EVoxelNoiseType::FBM;
+    bool bRoughnessFrequencyOverride = false;
+    float RoughnessFrequency = 0.0f;
     bool bTunnelFloorEnabledOverride = false;
     int32 TunnelFloorEnabled = 1;
     bool bTunnelFloorTerracingOverride = false;
@@ -237,6 +305,14 @@ struct FExploreArguments
     int32 TunnelFloorLedges = 0;
     bool bTunnelFloorMaxLedgesOverride = false;
     int32 TunnelFloorMaxLedges = 0;
+    bool bRoomMouthRiseOverride = false;
+    float RoomMouthRise = 0.0f;
+    bool bRoomMouthRiseBlendOverride = false;
+    float RoomMouthRiseBlend = 0.0f;
+    bool bPassageFloorWritesOverride = false;
+    int32 PassageFloorWrites = 1;
+    bool bRenderCameraOverride = false;
+    FVector RenderCamera = FVector::ZeroVector;
 
     FString CanonicalModes() const
     {
@@ -285,6 +361,8 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
+    OutArguments.bProfileTileVerdictCache = FParse::Param(
+        *Params, TEXT("profiletileverdictcache"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
     FParse::Value(*Params, TEXT("renderheight="), OutArguments.RenderHeight);
@@ -317,6 +395,18 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     const bool bSurfaceRoughnessParsed = FParse::Value(
         *Params, TEXT("surfaceroughness="), OutArguments.SurfaceRoughness);
     OutArguments.bSurfaceRoughnessOverride = bSurfaceRoughnessSpecified;
+    FString RoughnessNoiseTypeText;
+    const bool bRoughnessNoiseTypeSpecified = Params.Contains(
+        TEXT("roughnesstype="), ESearchCase::IgnoreCase);
+    const bool bRoughnessNoiseTypeParsed = FParse::Value(
+        *Params, TEXT("roughnesstype="), RoughnessNoiseTypeText)
+        && ParseNoiseType(RoughnessNoiseTypeText, OutArguments.RoughnessNoiseType);
+    OutArguments.bRoughnessNoiseTypeOverride = bRoughnessNoiseTypeSpecified;
+    const bool bRoughnessFrequencySpecified = Params.Contains(
+        TEXT("roughnessfrequency="), ESearchCase::IgnoreCase);
+    const bool bRoughnessFrequencyParsed = FParse::Value(
+        *Params, TEXT("roughnessfrequency="), OutArguments.RoughnessFrequency);
+    OutArguments.bRoughnessFrequencyOverride = bRoughnessFrequencySpecified;
     const bool bTunnelFloorEnabledSpecified = Params.Contains(
         TEXT("tunnelfloor="), ESearchCase::IgnoreCase);
     const bool bTunnelFloorEnabledParsed = FParse::Value(
@@ -352,6 +442,42 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     const bool bTunnelFloorMaxLedgesParsed = FParse::Value(
         *Params, TEXT("tunnelfloormaxledges="), OutArguments.TunnelFloorMaxLedges);
     OutArguments.bTunnelFloorMaxLedgesOverride = bTunnelFloorMaxLedgesSpecified;
+    const bool bRoomMouthRiseSpecified = Params.Contains(
+        TEXT("roommouthrise="), ESearchCase::IgnoreCase);
+    const bool bRoomMouthRiseParsed = FParse::Value(
+        *Params, TEXT("roommouthrise="), OutArguments.RoomMouthRise);
+    OutArguments.bRoomMouthRiseOverride = bRoomMouthRiseSpecified;
+    const bool bRoomMouthRiseBlendSpecified = Params.Contains(
+        TEXT("roommouthriseblend="), ESearchCase::IgnoreCase);
+    const bool bRoomMouthRiseBlendParsed = FParse::Value(
+        *Params, TEXT("roommouthriseblend="), OutArguments.RoomMouthRiseBlend);
+    OutArguments.bRoomMouthRiseBlendOverride = bRoomMouthRiseBlendSpecified;
+    const bool bPassageFloorWritesSpecified = Params.Contains(
+        TEXT("passagefloorwrites="), ESearchCase::IgnoreCase);
+    const bool bPassageFloorWritesParsed = FParse::Value(
+        *Params, TEXT("passagefloorwrites="), OutArguments.PassageFloorWrites);
+    OutArguments.bPassageFloorWritesOverride = bPassageFloorWritesSpecified;
+
+    FString RenderCameraText;
+    const bool bRenderCameraSpecified = Params.Contains(
+        TEXT("rendercamera="), ESearchCase::IgnoreCase);
+    bool bRenderCameraParsed = false;
+    if (bRenderCameraSpecified)
+    {
+        const int32 CameraOffset = Params.Find(TEXT("rendercamera="), ESearchCase::IgnoreCase);
+        if (CameraOffset != INDEX_NONE)
+        {
+            RenderCameraText = Params.Mid(CameraOffset + 13);
+            const int32 CameraEnd = RenderCameraText.Find(TEXT(" "));
+            if (CameraEnd != INDEX_NONE)
+            {
+                RenderCameraText.LeftInline(CameraEnd);
+            }
+            RenderCameraText.TrimQuotesInline();
+            bRenderCameraParsed = ParseRenderCamera(RenderCameraText, OutArguments.RenderCamera);
+        }
+    }
+    OutArguments.bRenderCameraOverride = bRenderCameraSpecified;
     int32 FailureFocusRender = 0;
     FParse::Value(*Params, TEXT("failurefocus="), FailureFocusRender);
     OutArguments.bFailureFocusRender = FailureFocusRender != 0;
@@ -488,6 +614,19 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         OutError = TEXT("surfaceroughness must be finite and greater than or equal to zero.");
         return false;
     }
+    if (OutArguments.bRoughnessNoiseTypeOverride && !bRoughnessNoiseTypeParsed)
+    {
+        OutError = TEXT("roughnesstype must be FBM, Ridged, Mixed, or Cellular.");
+        return false;
+    }
+    if (OutArguments.bRoughnessFrequencyOverride
+        && (!bRoughnessFrequencyParsed
+            || !FMath::IsFinite(OutArguments.RoughnessFrequency)
+            || OutArguments.RoughnessFrequency <= 0.0f))
+    {
+        OutError = TEXT("roughnessfrequency must be finite and greater than zero.");
+        return false;
+    }
     if (OutArguments.bTunnelFloorEnabledOverride
         && (!bTunnelFloorEnabledParsed
             || (OutArguments.TunnelFloorEnabled != 0
@@ -542,6 +681,37 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
             || OutArguments.TunnelFloorMaxLedges > 4096))
     {
         OutError = TEXT("tunnelfloormaxledges must be an integer in [1,4096].");
+        return false;
+    }
+    if (OutArguments.bRoomMouthRiseOverride
+        && (!bRoomMouthRiseParsed
+            || !FMath::IsFinite(OutArguments.RoomMouthRise)
+            || OutArguments.RoomMouthRise < 0.0f
+            || OutArguments.RoomMouthRise > 1.0f))
+    {
+        OutError = TEXT("roommouthrise must be finite and in [0,1].");
+        return false;
+    }
+    if (OutArguments.bRoomMouthRiseBlendOverride
+        && (!bRoomMouthRiseBlendParsed
+            || !FMath::IsFinite(OutArguments.RoomMouthRiseBlend)
+            || OutArguments.RoomMouthRiseBlend < 8.0f
+            || OutArguments.RoomMouthRiseBlend > 128.0f))
+    {
+        OutError = TEXT("roommouthriseblend must be finite and in [8,128].");
+        return false;
+    }
+    if (OutArguments.bPassageFloorWritesOverride
+        && (!bPassageFloorWritesParsed
+            || (OutArguments.PassageFloorWrites != 0
+                && OutArguments.PassageFloorWrites != 1)))
+    {
+        OutError = TEXT("passagefloorwrites must be 0 or 1.");
+        return false;
+    }
+    if (OutArguments.bRenderCameraOverride && !bRenderCameraParsed)
+    {
+        OutError = TEXT("rendercamera must be three finite comma-separated voxel coordinates.");
         return false;
     }
 
@@ -773,6 +943,11 @@ struct FExploreWorld
             OutError = TEXT("UVoxelStrateManager::Initialize refused the transient layout.");
             return false;
         }
+        if (Arguments.bPassageFloorWritesOverride)
+        {
+            Manager->SetPassageSupportFloorWritesEnabledForDiagnostics(
+                Arguments.PassageFloorWrites != 0);
+        }
 
         if (!Manager->GetLayout().IsValidIndex(Arguments.Slot))
         {
@@ -816,6 +991,27 @@ struct FExploreWorld
                 break;
             }
         }
+        if (Arguments.bRoughnessNoiseTypeOverride
+            || Arguments.bRoughnessFrequencyOverride)
+        {
+            if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork
+                && Arguments.Archetype != ECaveGeneratorType::Underwater)
+            {
+                OutError = TEXT(
+                    "roughnesstype/roughnessfrequency are only supported by TunnelNetwork or Underwater.");
+                return false;
+            }
+            if (Arguments.bRoughnessNoiseTypeOverride)
+            {
+                Target.Definition->GenerationParams.RoughnessNoiseType =
+                    Arguments.RoughnessNoiseType;
+            }
+            if (Arguments.bRoughnessFrequencyOverride)
+            {
+                Target.Definition->GenerationParams.RoughnessFrequency =
+                    Arguments.RoughnessFrequency;
+            }
+        }
         // Floor controls are applied only to the requested target definition.  They are
         // commandlet overrides for measured archetype comparisons; authored assets still carry
         // the defaults/rolled values in FStrateGenerationParams.
@@ -849,6 +1045,14 @@ struct FExploreWorld
         if (Arguments.bTunnelFloorMaxLedgesOverride)
         {
             TargetTunnelParams.TunnelFloorMaxLedges = Arguments.TunnelFloorMaxLedges;
+        }
+        if (Arguments.bRoomMouthRiseOverride)
+        {
+            TargetTunnelParams.RoomMouthRiseStrength = Arguments.RoomMouthRise;
+        }
+        if (Arguments.bRoomMouthRiseBlendOverride)
+        {
+            TargetTunnelParams.RoomMouthRiseBlendVoxels = Arguments.RoomMouthRiseBlend;
         }
         TargetBottomWorldZ = Target.BottomChunkZ * CHUNK_SIZE;
         TargetTopWorldZ = (Target.TopChunkZ + 1) * CHUNK_SIZE;
@@ -2388,6 +2592,11 @@ bool RunRender(
         CameraSeeds.Emplace(Position, FString(Source));
     };
 
+    if (Arguments.bRenderCameraOverride)
+    {
+        AddCameraSeed(true, Arguments.RenderCamera, TEXT("render_camera_override"));
+    }
+
     for (int32 SeedIndex = 0; SeedIndex < CameraSeedWalk.CameraSeedPoses.Num(); ++SeedIndex)
     {
         const FString Source = CameraSeedWalk.CameraSeedSources.IsValidIndex(SeedIndex)
@@ -3797,6 +4006,13 @@ void WriteTunnelFloorOverrides(
     {
         Writer.WriteValue(TEXT("max_ledges"), Arguments.TunnelFloorMaxLedges);
     }
+    Writer.WriteValue(TEXT("passage_support_floor_writes_override"),
+        Arguments.bPassageFloorWritesOverride);
+    if (Arguments.bPassageFloorWritesOverride)
+    {
+        Writer.WriteValue(TEXT("passage_support_floor_writes"),
+            Arguments.PassageFloorWrites != 0);
+    }
     Writer.WriteObjectEnd();
 }
 
@@ -3836,11 +4052,43 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     WriteTunnelFloorOverrides(*Writer, Arguments);
+    Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
+    if (Arguments.bRoomMouthRiseOverride)
+    {
+        Writer->WriteValue(TEXT("room_mouth_rise_strength"),
+            static_cast<double>(Arguments.RoomMouthRise));
+    }
+    Writer->WriteValue(TEXT("room_mouth_rise_blend_override"),
+        Arguments.bRoomMouthRiseBlendOverride);
+    if (Arguments.bRoomMouthRiseBlendOverride)
+    {
+        Writer->WriteValue(TEXT("room_mouth_rise_blend_voxels"),
+            static_cast<double>(Arguments.RoomMouthRiseBlend));
+    }
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
         Writer->WriteValue(TEXT("surface_roughness"),
             static_cast<double>(Arguments.SurfaceRoughness));
+    }
+    Writer->WriteValue(TEXT("roughness_noise_type_override"),
+        Arguments.bRoughnessNoiseTypeOverride);
+    if (Arguments.bRoughnessNoiseTypeOverride)
+    {
+        Writer->WriteValue(TEXT("roughness_noise_type"),
+            NoiseTypeName(Arguments.RoughnessNoiseType));
+    }
+    Writer->WriteValue(TEXT("roughness_frequency_override"),
+        Arguments.bRoughnessFrequencyOverride);
+    if (Arguments.bRoughnessFrequencyOverride)
+    {
+        Writer->WriteValue(TEXT("roughness_frequency"),
+            static_cast<double>(Arguments.RoughnessFrequency));
+    }
+    Writer->WriteValue(TEXT("render_camera_override"), Arguments.bRenderCameraOverride);
+    if (Arguments.bRenderCameraOverride)
+    {
+        WriteJsonVector(*Writer, TEXT("render_camera_voxels"), Arguments.RenderCamera, 1.0f);
     }
     WriteJsonIntVector(*Writer, TEXT("region_origin_voxels"), Export.RegionOrigin);
     WriteJsonBounds(*Writer, TEXT("region_bounds_voxels"), Export.RegionOrigin, Export.RegionSize, 0.25f);
@@ -4055,11 +4303,38 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     WriteTunnelFloorOverrides(*Writer, Arguments);
+    Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
+    if (Arguments.bRoomMouthRiseOverride)
+    {
+        Writer->WriteValue(TEXT("room_mouth_rise_strength"),
+            static_cast<double>(Arguments.RoomMouthRise));
+    }
+    Writer->WriteValue(TEXT("room_mouth_rise_blend_override"),
+        Arguments.bRoomMouthRiseBlendOverride);
+    if (Arguments.bRoomMouthRiseBlendOverride)
+    {
+        Writer->WriteValue(TEXT("room_mouth_rise_blend_voxels"),
+            static_cast<double>(Arguments.RoomMouthRiseBlend));
+    }
     Writer->WriteValue(TEXT("surface_roughness_override"), Arguments.bSurfaceRoughnessOverride);
     if (Arguments.bSurfaceRoughnessOverride)
     {
         Writer->WriteValue(TEXT("surface_roughness"),
             static_cast<double>(Arguments.SurfaceRoughness));
+    }
+    Writer->WriteValue(TEXT("roughness_noise_type_override"),
+        Arguments.bRoughnessNoiseTypeOverride);
+    if (Arguments.bRoughnessNoiseTypeOverride)
+    {
+        Writer->WriteValue(TEXT("roughness_noise_type"),
+            NoiseTypeName(Arguments.RoughnessNoiseType));
+    }
+    Writer->WriteValue(TEXT("roughness_frequency_override"),
+        Arguments.bRoughnessFrequencyOverride);
+    if (Arguments.bRoughnessFrequencyOverride)
+    {
+        Writer->WriteValue(TEXT("roughness_frequency"),
+            static_cast<double>(Arguments.RoughnessFrequency));
     }
     Writer->WriteArrayStart(TEXT("modes"));
     if (Arguments.bRender) Writer->WriteValue(TEXT("render"));
@@ -4077,6 +4352,8 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
+    Writer->WriteValue(TEXT("profile_tile_verdict_cache"),
+        Arguments.bProfileTileVerdictCache);
     Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
@@ -5133,6 +5410,66 @@ bool RunOpBounds(
     return true;
 }
 
+bool RunTileVerdictCacheProbe(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    FString& OutError)
+{
+    if (!World.Generator)
+    {
+        OutError = TEXT("tile-verdict cache probe has no generator.");
+        return false;
+    }
+
+    // Deliberately use a region well above the synthetic layout.  The first 32-cell proof is a
+    // genuine enclosing-region certificate; the 8-cell requests below are aligned subregions of
+    // that same lattice.  No generated cave data is involved in this probe.
+    const FIntVector RegionOrigin(-32, -32, World.TargetTopWorldZ + 1024);
+    const EVoxelTileClass RegionVerdict = World.Generator->ClassifyTile(
+        RegionOrigin, 1, 32);
+    if (RegionVerdict != EVoxelTileClass::AllAir)
+    {
+        OutError = FString::Printf(
+            TEXT("tile-verdict cache probe expected an all-air enclosing region, got %d."),
+            static_cast<int32>(RegionVerdict));
+        return false;
+    }
+
+    auto ClassifyChildren = [&World, &RegionOrigin]()
+    {
+        for (int32 Z = 0; Z < 32; Z += 8)
+        for (int32 Y = 0; Y < 32; Y += 8)
+        for (int32 X = 0; X < 32; X += 8)
+        {
+            World.Generator->ClassifyTile(
+                RegionOrigin + FIntVector(X, Y, Z), 1, 8);
+        }
+    };
+
+    ClassifyChildren();
+    World.Generator->ClassifyTile(RegionOrigin, 1, 32);
+    ClassifyChildren();
+
+    const VoxelDensityProfile::FSnapshot Snapshot = VoxelDensityProfile::Snapshot();
+    const int32 CallsIndex = static_cast<int32>(
+        VoxelDensityProfile::ECounter::TileClassifyCalls);
+    const int32 HitsIndex = static_cast<int32>(
+        VoxelDensityProfile::ECounter::TileVerdictCacheHits);
+    const int32 RegionHitsIndex = static_cast<int32>(
+        VoxelDensityProfile::ECounter::TileVerdictRegionHits);
+    const int32 StoresIndex = static_cast<int32>(
+        VoxelDensityProfile::ECounter::TileVerdictCacheStores);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileVerdictCache] probe region=(%d,%d,%d) cells=32 verdict=AllAir "
+             "calls=%llu hits=%llu region_hits=%llu stores=%llu"),
+        RegionOrigin.X, RegionOrigin.Y, RegionOrigin.Z,
+        static_cast<unsigned long long>(Snapshot.Counters[CallsIndex]),
+        static_cast<unsigned long long>(Snapshot.Counters[HitsIndex]),
+        static_cast<unsigned long long>(Snapshot.Counters[RegionHitsIndex]),
+        static_cast<unsigned long long>(Snapshot.Counters[StoresIndex]));
+    return true;
+}
+
 } // namespace
 
 UVoxelForgeExploreCommandlet::UVoxelForgeExploreCommandlet()
@@ -5188,6 +5525,16 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         return 1;
     }
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
+
+    if (Arguments.bProfileTileVerdictCache)
+    {
+        if (!RunTileVerdictCacheProbe(Arguments, World, Error))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeExplore] tile-verdict cache probe failed: %s"), *Error);
+            return 1;
+        }
+    }
 
     bool bRequestedModeFailed = false;
     if (Arguments.bOpBounds)
@@ -5303,18 +5650,36 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
     }
     else if (Arguments.bRender)
     {
-        // A render-only invocation still has to obey the inside-walkable-space contract. Run the
-        // same focused walk as a private seed pass; it is intentionally omitted from the render-only
-        // JSON so the selected mode remains render.
-        const double Start = FPlatformTime::Seconds();
-        const bool bWalkOk = RunWalk(Arguments, World, RenderSeedWalk, Budget);
-        Output.WalkSeconds = FPlatformTime::Seconds() - Start;
-        if (!bWalkOk && !Budget.bTruncated)
+        if (Arguments.bRenderCameraOverride)
         {
-            bRequestedModeFailed = true;
+            // Controlled diagnostic renders can supply a player-fit seed captured from a baseline
+            // run. This keeps the mesh region, camera pose, and raster target identical while a
+            // single generator writer is toggled. The density guard in RunRender still refuses a
+            // stale/inside-rock pose.
+            RenderSeedWalk.CameraSeedPoses.Add(Arguments.RenderCamera);
+            RenderSeedWalk.CameraSeedSources.Add(TEXT("render_camera_override"));
+            RenderSeedWalk.Status = TEXT("override");
+            Output.WalkSeconds = 0.0;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeExplore] render camera seed override (%.3f, %.3f, %.3f)"),
+                Arguments.RenderCamera.X, Arguments.RenderCamera.Y, Arguments.RenderCamera.Z);
         }
-        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] render camera seed walk %.3fs (%s)"),
-            Output.WalkSeconds, *RenderSeedWalk.Status);
+        else
+        {
+            // A render-only invocation still has to obey the inside-walkable-space contract. Run
+            // the same focused walk as a private seed pass; it is intentionally omitted from the
+            // render-only JSON so the selected mode remains render.
+            const double Start = FPlatformTime::Seconds();
+            const bool bWalkOk = RunWalk(Arguments, World, RenderSeedWalk, Budget);
+            Output.WalkSeconds = FPlatformTime::Seconds() - Start;
+            if (!bWalkOk && !Budget.bTruncated)
+            {
+                bRequestedModeFailed = true;
+            }
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeExplore] render camera seed walk %.3fs (%s)"),
+                Output.WalkSeconds, *RenderSeedWalk.Status);
+        }
         CameraSeedWalk = &RenderSeedWalk;
         // Keep the private render seed capture available to the run-level shared-grid report;
         // the walk object is still omitted from the public JSON when walk was not requested.
@@ -5944,6 +6309,9 @@ bool BuildBatchCaseParams(
         { TEXT("render_step"), TEXT("renderstep") },
         { TEXT("render_max_distance"), TEXT("rendermaxdistance") },
         { TEXT("surface_roughness"), TEXT("surfaceroughness") },
+        { TEXT("roughness_frequency"), TEXT("roughnessfrequency") },
+        { TEXT("room_mouth_rise_strength"), TEXT("roommouthrise") },
+        { TEXT("room_mouth_rise_blend_voxels"), TEXT("roommouthriseblend") },
         { TEXT("tunnel_floor_step_height"), TEXT("tunnelfloorstep") },
         { TEXT("tunnel_floor_max_ledge_height"), TEXT("tunnelfloormaxledge") },
         { TEXT("tunnel_floor_gentle_slope"), TEXT("tunnelfloorgentle") },
@@ -5954,6 +6322,12 @@ bool BuildBatchCaseParams(
         {
             OutParams += FString::Printf(TEXT(" -%s=%.9g"), Field.Value, Number);
         }
+    }
+
+    FString RoughnessType;
+    if (JsonString(Case, TEXT("roughness_noise_type"), RoughnessType))
+    {
+        OutParams += FString::Printf(TEXT(" -roughnesstype=%s"), *RoughnessType);
     }
 
     const TPair<const TCHAR*, const TCHAR*> IntegerFloorFields[] = {
