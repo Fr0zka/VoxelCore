@@ -60,7 +60,7 @@ floor waits.
 **Do**: abort no-longer-desired tiles; sort from the true pawn position; give the occupied tile and the
 next tile along the heading absolute priority.
 
-## 4. Collapse the duplicated field semantics  ·  MAINTENANCE  ·  medium-large
+## 4. Collapse the duplicated field semantics  ·  PERFORMANCE ARCHITECTURE  ·  medium-large  
 
 The effective field now lives in three places: the operator stack, the classifier's parallel interval
 logic, and a post-stack repair tail in `GetDensityAt` (origin floors, passage structure, passage
@@ -71,6 +71,12 @@ The audit calls this *"the clearest sign of overengineering"*: later fixes compe
 operation sits in the pipeline. It also makes interval proofs harder to trust.
 
 **Do**: make the stack the single semantic source of truth. Likely overlaps heavily with item 2.
+
+**Promoted 2026-09-12**: this is performance architecture, not maintenance. The classifier is a
+second evaluator (interval proofs, exact certificates, and final-field validation) beside the
+canonical lowered evaluator, and the runtime can validate the same tile again before meshing.
+Items 1 and 2 in the current round deliberately leave this lowering work untouched; any
+classifier retained later must consume the lowered representation and reusable density data.
 
 ## 5. Verdict cache removed after moving-session audit  ·  complete
 
