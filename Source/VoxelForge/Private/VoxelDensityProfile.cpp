@@ -2,10 +2,11 @@
 
 namespace VoxelDensityProfile
 {
+    std::atomic<bool> GEnabled(false);
+    std::atomic<EMode> GMode(EMode::Disabled);
+
     namespace
     {
-        std::atomic<bool> GEnabled(false);
-        std::atomic<EMode> GMode(EMode::Disabled);
         std::atomic<uint32> GSampleInterval(DefaultSampleInterval);
         std::atomic<uint64> GTimerPairCycles(0);
 
@@ -24,6 +25,7 @@ namespace VoxelDensityProfile
             uint32 BlockCallCount[BucketCount]{};
             uint64 BlockStartCycles[BucketCount]{};
             bool BlockActive[BucketCount]{};
+            FSnapshot::FClassifierStats Classifier;
 
             uint64 TunnelCacheCapacityEntries = 0;
             uint64 TunnelCacheValidEntries = 0;
@@ -50,7 +52,6 @@ namespace VoxelDensityProfile
         thread_local FThreadState* GThreadState = nullptr;
         thread_local uint32 GScopeDepth = 0;
         thread_local bool GScopeSampled = false;
-        thread_local bool GSampledScopeActive = false;
 
         FThreadState& GetThreadState()
         {
@@ -80,9 +81,9 @@ namespace VoxelDensityProfile
 
         bool IsSampledScopeEnabled(EBucket Bucket)
         {
-            // Sampled mode pays for the trustworthy parent and mesh containers only.  Fine
-            // operation scopes remain available in Full mode, or through UE Insights scopes,
-            // without putting a Begin/End and thread-local bookkeeping on every density call.
+            // Sampled mode pays for the trustworthy parent and mesh containers only. Attribution
+            // additionally exposes the component scopes, but still samples them; Full remains the
+            // deliberately invasive mode for per-call scope timing.
             switch (Bucket)
             {
             case EBucket::GetDensityAt:
@@ -93,6 +94,127 @@ namespace VoxelDensityProfile
             default:
                 return false;
             }
+        }
+
+        bool IsAttributionScope(EBucket Bucket)
+        {
+            switch (Bucket)
+            {
+            case EBucket::GetDensityAt:
+            case EBucket::ApplyDisturbances:
+            case EBucket::PassageModifier:
+            case EBucket::PassageLandingAir:
+            case EBucket::PassageLandingFloor:
+            case EBucket::PassageLandingRoomFloor:
+            case EBucket::PassageTunnelAir:
+            case EBucket::PassageStructuralPosts:
+            case EBucket::TunnelCoreSupport:
+            case EBucket::TunnelCoreSdf:
+            case EBucket::TunnelCorePosts:
+            case EBucket::StructuralTail:
+            case EBucket::RoomGraphSource:
+            case EBucket::SdfCarve:
+            case EBucket::FusedEvaluator:
+            case EBucket::InterpretedOpStack:
+            case EBucket::OperatorBlock:
+            case EBucket::RoomGraphBuild:
+            case EBucket::RoomGraphSdf:
+            case EBucket::TunnelCoreWorld:
+            case EBucket::FusedDetail:
+            case EBucket::FusedWorm:
+            case EBucket::FusedStructural:
+            case EBucket::ClassifierTotal:
+            case EBucket::ClassifierIntervalProof:
+            case EBucket::ClassifierExactCore:
+            case EBucket::ClassifierExactFinal:
+            case EBucket::ClassifierRoomTail:
+            case EBucket::RuntimeStreamBuilding:
+            case EBucket::DensityPrologue:
+            case EBucket::DensityCore:
+            case EBucket::DensityDisturbances:
+            case EBucket::DensityStructuralPosts:
+            case EBucket::DensityBoundarySeal:
+            case EBucket::DensityDiffLayer:
+            case EBucket::DensityTail:
+            case EBucket::MesherGenerateMesh:
+            case EBucket::MesherDensityGrid:
+            case EBucket::MesherCellClassification:
+            case EBucket::MesherGradientNormals:
+            case EBucket::MesherVertexInterpolation:
+            case EBucket::MesherStreamBuilding:
+            case EBucket::MesherOther:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool IsAttributionAlwaysTimed(EBucket Bucket)
+        {
+            switch (Bucket)
+            {
+            case EBucket::MesherGenerateMesh:
+            case EBucket::MesherDensityGrid:
+            case EBucket::MesherOther:
+            case EBucket::RoomGraphBuild:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        uint64 ScaleSampledValue(uint64 Value, uint64 Calls, uint64 Samples)
+        {
+            if (Samples == 0 || Calls <= Samples)
+            {
+                return Value;
+            }
+            const double Scaled = static_cast<double>(Value)
+                * static_cast<double>(Calls) / static_cast<double>(Samples);
+            return Scaled > static_cast<double>(MAX_uint64)
+                ? MAX_uint64
+                : static_cast<uint64>(Scaled + 0.5);
+        }
+
+        void AddClassifierStatsScaled(
+            FSnapshot::FClassifierStats& Destination,
+            const FSnapshot::FClassifierStats& Source,
+            uint64 Calls,
+            uint64 Samples)
+        {
+            Destination.RefineNodes += ScaleSampledValue(Source.RefineNodes, Calls, Samples);
+            Destination.StackBoxCalls += ScaleSampledValue(Source.StackBoxCalls, Calls, Samples);
+            Destination.WholeMixedNodes += ScaleSampledValue(Source.WholeMixedNodes, Calls, Samples);
+            Destination.WholeSolidNodes += ScaleSampledValue(Source.WholeSolidNodes, Calls, Samples);
+            Destination.WholeAirNodes += ScaleSampledValue(Source.WholeAirNodes, Calls, Samples);
+            Destination.NeedsFinalFieldNodes += ScaleSampledValue(Source.NeedsFinalFieldNodes, Calls, Samples);
+            Destination.SplitNodes += ScaleSampledValue(Source.SplitNodes, Calls, Samples);
+            Destination.MaxRefinementDepth = FMath::Max(
+                Destination.MaxRefinementDepth, Source.MaxRefinementDepth);
+            Destination.ExactCoreSamples += ScaleSampledValue(Source.ExactCoreSamples, Calls, Samples);
+            Destination.ExactFinalSamples += ScaleSampledValue(Source.ExactFinalSamples, Calls, Samples);
+            Destination.ExactCoreCacheHits += ScaleSampledValue(Source.ExactCoreCacheHits, Calls, Samples);
+            Destination.ExactFinalCacheHits += ScaleSampledValue(Source.ExactFinalCacheHits, Calls, Samples);
+            Destination.ExactCoreLeaves += ScaleSampledValue(Source.ExactCoreLeaves, Calls, Samples);
+            Destination.ExactFinalLeaves += ScaleSampledValue(Source.ExactFinalLeaves, Calls, Samples);
+            Destination.StackBoxCycles += ScaleSampledValue(Source.StackBoxCycles, Calls, Samples);
+            Destination.ExactCoreCycles += ScaleSampledValue(Source.ExactCoreCycles, Calls, Samples);
+            Destination.ExactFinalCycles += ScaleSampledValue(Source.ExactFinalCycles, Calls, Samples);
+            Destination.RoomTailQueries += ScaleSampledValue(Source.RoomTailQueries, Calls, Samples);
+            Destination.RoomTailEvaluated += ScaleSampledValue(Source.RoomTailEvaluated, Calls, Samples);
+            Destination.RoomTailCycles += ScaleSampledValue(Source.RoomTailCycles, Calls, Samples);
+            Destination.RoomPropagateCycles += ScaleSampledValue(Source.RoomPropagateCycles, Calls, Samples);
+            Destination.RoomExactPrimitiveCycles += ScaleSampledValue(Source.RoomExactPrimitiveCycles, Calls, Samples);
+            Destination.RoomCacheWindowCycles += ScaleSampledValue(Source.RoomCacheWindowCycles, Calls, Samples);
+            // These are topology descriptors, not per-call work counts.  Keep the largest observed
+            // descriptor instead of multiplying one sampled graph description by the classifier
+            // call expansion factor.
+            Destination.RoomNumRooms = FMath::Max(Destination.RoomNumRooms, Source.RoomNumRooms);
+            Destination.RoomNumTunnels = FMath::Max(Destination.RoomNumTunnels, Source.RoomNumTunnels);
+            Destination.RoomNumRoomFloorJoins = FMath::Max(
+                Destination.RoomNumRoomFloorJoins, Source.RoomNumRoomFloorJoins);
+            Destination.RoomNumPits = FMath::Max(Destination.RoomNumPits, Source.RoomNumPits);
+            Destination.RoomNumChimneys = FMath::Max(Destination.RoomNumChimneys, Source.RoomNumChimneys);
         }
     }
 
@@ -184,6 +306,7 @@ namespace VoxelDensityProfile
                 State->BlockStartCycles[Index] = 0;
                 State->BlockActive[Index] = false;
             }
+            State->Classifier = FSnapshot::FClassifierStats();
             State->TunnelCacheCapacityEntries = 0;
             State->TunnelCacheValidEntries = 0;
             State->TunnelCacheStaticBytes = 0;
@@ -252,6 +375,14 @@ namespace VoxelDensityProfile
             {
                 Result.Counters[Index] += State->Counters[Index];
             }
+
+            Result.Classifier.Calls += State->Classifier.Calls;
+            Result.Classifier.SampledCalls += State->Classifier.SampledCalls;
+            AddClassifierStatsScaled(
+                Result.Classifier,
+                State->Classifier,
+                State->Classifier.Calls,
+                State->Classifier.SampledCalls);
 
             const uint64 TunnelWorkerBytes = State->TunnelCacheStaticBytes
                 + State->TunnelCacheDynamicBytes;
@@ -337,6 +468,19 @@ namespace VoxelDensityProfile
         {
             Result.Counters[Index] = State->Counters[Index];
         }
+        Result.Classifier = State->Classifier;
+        if (State->Classifier.SampledCalls > 0)
+        {
+            FSnapshot::FClassifierStats Raw = State->Classifier;
+            Result.Classifier = FSnapshot::FClassifierStats();
+            Result.Classifier.Calls = State->Classifier.Calls;
+            Result.Classifier.SampledCalls = State->Classifier.SampledCalls;
+            AddClassifierStatsScaled(
+                Result.Classifier,
+                Raw,
+                State->Classifier.Calls,
+                State->Classifier.SampledCalls);
+        }
         Result.TimerPairCycles = GetTimerPairCycles();
         Result.SampleInterval = GetSampleInterval();
         Result.Mode = GetMode();
@@ -345,6 +489,10 @@ namespace VoxelDensityProfile
 
     void AddCounter(ECounter Counter, uint64 Amount)
     {
+        if (!IsEnabledFast())
+        {
+            return;
+        }
         const int32 Index = static_cast<int32>(Counter);
         if (Index >= 0 && Index < CounterCount)
         {
@@ -364,6 +512,56 @@ namespace VoxelDensityProfile
     {
         const int32 Index = ToIndex(Bucket);
         GetThreadState().Calls[Index] += 1;
+    }
+
+    void RecordClassifierCall(bool bSampled)
+    {
+        FThreadState& State = GetThreadState();
+        ++State.Classifier.Calls;
+        if (bSampled)
+        {
+            ++State.Classifier.SampledCalls;
+        }
+        ++State.Calls[ToIndex(EBucket::ClassifierTotal)];
+    }
+
+    void AddClassifierStats(const FSnapshot::FClassifierStats& Stats)
+    {
+        FThreadState& State = GetThreadState();
+        State.Classifier.RefineNodes += Stats.RefineNodes;
+        State.Classifier.StackBoxCalls += Stats.StackBoxCalls;
+        State.Classifier.WholeMixedNodes += Stats.WholeMixedNodes;
+        State.Classifier.WholeSolidNodes += Stats.WholeSolidNodes;
+        State.Classifier.WholeAirNodes += Stats.WholeAirNodes;
+        State.Classifier.NeedsFinalFieldNodes += Stats.NeedsFinalFieldNodes;
+        State.Classifier.SplitNodes += Stats.SplitNodes;
+        State.Classifier.MaxRefinementDepth = FMath::Max(
+            State.Classifier.MaxRefinementDepth, Stats.MaxRefinementDepth);
+        State.Classifier.ExactCoreSamples += Stats.ExactCoreSamples;
+        State.Classifier.ExactFinalSamples += Stats.ExactFinalSamples;
+        State.Classifier.ExactCoreCacheHits += Stats.ExactCoreCacheHits;
+        State.Classifier.ExactFinalCacheHits += Stats.ExactFinalCacheHits;
+        State.Classifier.ExactCoreLeaves += Stats.ExactCoreLeaves;
+        State.Classifier.ExactFinalLeaves += Stats.ExactFinalLeaves;
+        State.Classifier.StackBoxCycles += Stats.StackBoxCycles;
+        State.Classifier.ExactCoreCycles += Stats.ExactCoreCycles;
+        State.Classifier.ExactFinalCycles += Stats.ExactFinalCycles;
+        State.Classifier.RoomTailQueries += Stats.RoomTailQueries;
+        State.Classifier.RoomTailEvaluated += Stats.RoomTailEvaluated;
+        State.Classifier.RoomTailCycles += Stats.RoomTailCycles;
+        State.Classifier.RoomPropagateCycles += Stats.RoomPropagateCycles;
+        State.Classifier.RoomExactPrimitiveCycles += Stats.RoomExactPrimitiveCycles;
+        State.Classifier.RoomCacheWindowCycles += Stats.RoomCacheWindowCycles;
+        State.Classifier.RoomNumRooms = FMath::Max(
+            State.Classifier.RoomNumRooms, Stats.RoomNumRooms);
+        State.Classifier.RoomNumTunnels = FMath::Max(
+            State.Classifier.RoomNumTunnels, Stats.RoomNumTunnels);
+        State.Classifier.RoomNumRoomFloorJoins = FMath::Max(
+            State.Classifier.RoomNumRoomFloorJoins, Stats.RoomNumRoomFloorJoins);
+        State.Classifier.RoomNumPits = FMath::Max(
+            State.Classifier.RoomNumPits, Stats.RoomNumPits);
+        State.Classifier.RoomNumChimneys = FMath::Max(
+            State.Classifier.RoomNumChimneys, Stats.RoomNumChimneys);
     }
 
     bool ShouldSample(EBucket Bucket)
@@ -488,6 +686,12 @@ namespace VoxelDensityProfile
         case ECounter::OpBlockOperators: return TEXT("OpBlockOperators");
         case ECounter::OpBlockActiveOperators: return TEXT("OpBlockActiveOperators");
         case ECounter::OpBlockPrunedOperators: return TEXT("OpBlockPrunedOperators");
+        case ECounter::MesherDensityGridBytes: return TEXT("MesherDensityGridBytes");
+        case ECounter::MesherSharedGridReadBytes: return TEXT("MesherSharedGridReadBytes");
+        case ECounter::MesherOutputArrayBytes: return TEXT("MesherOutputArrayBytes");
+        case ECounter::MesherOutputAllocatedBytes: return TEXT("MesherOutputAllocatedBytes");
+        case ECounter::OpBlockScratchBytes: return TEXT("OpBlockScratchBytes");
+        case ECounter::OpBlockCopyBytes: return TEXT("OpBlockCopyBytes");
         case ECounter::Count:              break;
         }
         return TEXT("Unknown");
@@ -535,6 +739,21 @@ namespace VoxelDensityProfile
             { TEXT("BoundarySealOp"),    EBucket::BoundarySealOp },
             { TEXT("PassageCarveOp"),    EBucket::PassageCarveOp },
             { TEXT("XYEdgeSealOp"),      EBucket::XYEdgeSealOp },
+            { TEXT("FusedEvaluator"),    EBucket::FusedEvaluator },
+            { TEXT("InterpretedOpStack"),EBucket::InterpretedOpStack },
+            { TEXT("OperatorBlock"),     EBucket::OperatorBlock },
+            { TEXT("RoomGraphBuild"),    EBucket::RoomGraphBuild },
+            { TEXT("RoomGraphSdf"),      EBucket::RoomGraphSdf },
+            { TEXT("TunnelCoreWorld"),   EBucket::TunnelCoreWorld },
+            { TEXT("FusedDetail"),       EBucket::FusedDetail },
+            { TEXT("FusedWorm"),         EBucket::FusedWorm },
+            { TEXT("FusedStructural"),   EBucket::FusedStructural },
+            { TEXT("ClassifierTotal"),   EBucket::ClassifierTotal },
+            { TEXT("ClassifierIntervalProof"), EBucket::ClassifierIntervalProof },
+            { TEXT("ClassifierExactCore"), EBucket::ClassifierExactCore },
+            { TEXT("ClassifierExactFinal"), EBucket::ClassifierExactFinal },
+            { TEXT("ClassifierRoomTail"), EBucket::ClassifierRoomTail },
+            { TEXT("RuntimeStreamBuilding"), EBucket::RuntimeStreamBuilding },
             { TEXT("DensityPrologue"),   EBucket::DensityPrologue },
             { TEXT("DensityCore"),       EBucket::DensityCore },
             { TEXT("DensityDisturbances"), EBucket::DensityDisturbances },
@@ -596,6 +815,21 @@ namespace VoxelDensityProfile
         case EBucket::PassageCarveOp:   return TEXT("PassageCarveOp");
         case EBucket::XYEdgeSealOp:     return TEXT("XYEdgeSealOp");
         case EBucket::OtherOp:           return TEXT("OtherOp");
+        case EBucket::FusedEvaluator:    return TEXT("FusedEvaluator");
+        case EBucket::InterpretedOpStack:return TEXT("InterpretedOpStack");
+        case EBucket::OperatorBlock:     return TEXT("OperatorBlock");
+        case EBucket::RoomGraphBuild:    return TEXT("RoomGraphBuild");
+        case EBucket::RoomGraphSdf:      return TEXT("RoomGraphSdf");
+        case EBucket::TunnelCoreWorld:   return TEXT("TunnelCoreWorld");
+        case EBucket::FusedDetail:       return TEXT("FusedDetail");
+        case EBucket::FusedWorm:         return TEXT("FusedWorm");
+        case EBucket::FusedStructural:   return TEXT("FusedStructural");
+        case EBucket::ClassifierTotal:   return TEXT("ClassifierTotal");
+        case EBucket::ClassifierIntervalProof:return TEXT("ClassifierIntervalProof");
+        case EBucket::ClassifierExactCore:return TEXT("ClassifierExactCore");
+        case EBucket::ClassifierExactFinal:return TEXT("ClassifierExactFinal");
+        case EBucket::ClassifierRoomTail:return TEXT("ClassifierRoomTail");
+        case EBucket::RuntimeStreamBuilding:return TEXT("RuntimeStreamBuilding");
         case EBucket::DensityPrologue:   return TEXT("DensityPrologue");
         case EBucket::DensityCore:       return TEXT("DensityCore");
         case EBucket::DensityDisturbances:return TEXT("DensityDisturbances");
@@ -618,9 +852,14 @@ namespace VoxelDensityProfile
     FScopeToken BeginScope(EBucket Bucket)
     {
         FScopeToken Token;
+        if (!IsEnabledFast())
+        {
+            return Token;
+        }
         const EMode Mode = GetMode();
-        if (!IsEnabled()
-            || (Mode == EMode::Sampled && !IsSampledScopeEnabled(Bucket)))
+        const bool bSampledMode = Mode == EMode::Sampled || Mode == EMode::Attribution;
+        if ((Mode == EMode::Sampled && !IsSampledScopeEnabled(Bucket))
+            || (Mode == EMode::Attribution && !IsAttributionScope(Bucket)))
         {
             return Token;
         }
@@ -633,7 +872,7 @@ namespace VoxelDensityProfile
         // For the hot parent, amortise the timer over a deterministic block of calls.  A timer
         // pair around one ~100 ns operation is mostly the timer; a pair around 64 calls is cheap
         // and estimates the parent from real elapsed work rather than instrumentation latency.
-        if (Mode == EMode::Sampled && Bucket == EBucket::GetDensityAt)
+        if (bSampledMode && Bucket == EBucket::GetDensityAt)
         {
             FThreadState& State = GetThreadState();
             const int32 Index = ToIndex(Bucket);
@@ -649,7 +888,11 @@ namespace VoxelDensityProfile
                 State.BlockCallCount[Index] = 0;
                 State.BlockStartCycles[Index] = FPlatformTime::Cycles64();
             }
-            GScopeSampled = false;
+            // The selected call admits all nested component scopes.  Every other call exits the
+            // inline FScopedTimer fast path before crossing into this translation unit.
+            GScopeSampled = bBlockBoundary;
+            GSampledScopeActive = bBlockBoundary;
+            Token.bSampled = bBlockBoundary;
             return Token;
         }
 
@@ -660,13 +903,21 @@ namespace VoxelDensityProfile
         // density samples underneath them.
         const bool bContainerScope = Bucket == EBucket::MesherGenerateMesh
             || Bucket == EBucket::MesherDensityGrid;
+        const bool bInheritedAttributionSample = Mode == EMode::Attribution
+            && GSampledScopeActive;
         Token.bSampled = Mode == EMode::Full
             ? true
-            : (!GSampledScopeActive && ShouldSample(Bucket));
+            : ((Mode == EMode::Attribution && IsAttributionAlwaysTimed(Bucket))
+                ? true
+                : (bInheritedAttributionSample
+                    ? true
+                    : (Mode == EMode::Attribution && IsAttributionScope(Bucket)
+                        ? ShouldSample(Bucket)
+                        : (!GSampledScopeActive && ShouldSample(Bucket)))));
         GScopeSampled = Token.bSampled;
         if (Token.bSampled)
         {
-            if (Mode == EMode::Sampled && !bContainerScope)
+            if ((Mode == EMode::Sampled || Mode == EMode::Attribution) && !bContainerScope)
             {
                 GSampledScopeActive = true;
             }

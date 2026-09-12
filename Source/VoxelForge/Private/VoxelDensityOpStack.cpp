@@ -4009,6 +4009,8 @@ namespace
 
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::RoomGraphSource);
             FState& S = State();
             S.LastWorldPosition = FVector(WorldX, WorldY, WorldZ);
             S.bLastTunnelCoreWorldEvaluationValid = false;

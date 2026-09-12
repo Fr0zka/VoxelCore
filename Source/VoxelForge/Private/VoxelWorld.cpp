@@ -68,6 +68,11 @@ namespace
         TEXT("voxel.ProfileDensityFull"),
         GVoxelForgeProfileDensityFull,
         TEXT("Collect full per-operator profiling for the game path."));
+    int32 GVoxelForgePerfAttribution = 0;
+    FAutoConsoleVariableRef CVarVoxelForgePerfAttribution(
+        TEXT("voxel.PerfAttribution"),
+        GVoxelForgePerfAttribution,
+        TEXT("Collect low-overhead component attribution for the game path."));
 
     // Startup command-line cvars can arrive before the game world has spawned AVoxelWorld (or
     // before its first tiles have become visible). Keep the diagnostic edit pending until Tick has
@@ -1038,6 +1043,7 @@ void AVoxelWorld::BeginPlay()
     // the default mode because of startup ordering.
     int32 CommandLineProfile = GVoxelForgeProfileDensity;
     int32 CommandLineProfileFull = GVoxelForgeProfileDensityFull;
+    int32 CommandLinePerfAttribution = GVoxelForgePerfAttribution;
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
     {
         GVoxelForgeProfileDensity = CommandLineProfile;
@@ -1046,8 +1052,21 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgeProfileDensityFull = CommandLineProfileFull;
     }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.PerfAttribution="), CommandLinePerfAttribution))
+    {
+        GVoxelForgePerfAttribution = CommandLinePerfAttribution;
+    }
 
-    if (GVoxelForgeProfileDensityFull != 0)
+    if (GVoxelForgePerfAttribution != 0)
+    {
+        VoxelDensityProfile::SetMode(
+            VoxelDensityProfile::EMode::Attribution,
+            VoxelDensityProfile::DefaultSampleInterval);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeDensityProfile] game_mode=attribution sample_interval=%u"),
+            VoxelDensityProfile::DefaultSampleInterval);
+    }
+    else if (GVoxelForgeProfileDensityFull != 0)
     {
         VoxelDensityProfile::SetMode(
             VoxelDensityProfile::EMode::Full,
@@ -2084,7 +2103,8 @@ void AVoxelWorld::LogStreamingLatencySummary() const
     const double TravelP95Metres = RequestP95
         * static_cast<double>(PeakObservedPawnSpeedCmPerSecond) / 100.0;
     const bool bDiagnosticsEnabled = GVoxelForgeProfileTileGeneration != 0
-        || VoxelForgeStartupTrace::IsActive();
+        || VoxelForgeStartupTrace::IsActive()
+        || VoxelDensityProfile::GetMode() != VoxelDensityProfile::EMode::Disabled;
     UE_LOG(LogTemp, Display,
         TEXT("[VoxelForgeStreamingLatency] mode=%s diagnostics=%s lod0_ready_samples=%d "
              "request_to_ready_s[p50=%.6f p95=%.6f max=%.6f] "
@@ -3651,7 +3671,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                       const std::atomic<bool>* ObsoleteFlag)
 {
     const bool bLogTileProfile = GVoxelForgeProfileTileGeneration != 0;
-    const bool bMeasureTile = bLogTileProfile || VoxelForgeStartupTrace::IsActive();
+    const bool bMeasureTile = bLogTileProfile
+        || VoxelDensityProfile::GetMode() == VoxelDensityProfile::EMode::Attribution
+        || VoxelForgeStartupTrace::IsActive();
     const double TileStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
     double ClassifySeconds = 0.0;
     double MeshSeconds = 0.0;
@@ -3919,6 +3941,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildStreams);
         const double StreamStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
         Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
+        VoxelDensityProfile::FScopedTimer RuntimeStreamTimer(
+            VoxelDensityProfile::EBucket::RuntimeStreamBuilding);
         BuildTileStreamSet(*Result.Streams, MeshData);
         StreamSeconds = bMeasureTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
         if (ShouldAbortWork(ObsoleteFlag))

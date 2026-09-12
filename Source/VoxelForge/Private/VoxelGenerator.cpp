@@ -330,7 +330,15 @@ struct FVoxelDensityBlockSession
         const int32 BlockSizeY = MaxY - MinY + 1;
         const int32 BlockSizeZ = MaxZ - MinZ + 1;
         const int32 BlockCount = BlockSizeX * BlockSizeY * BlockSizeZ;
+        VoxelDensityProfile::FScopedTimer OperatorBlockTimer(
+            VoxelDensityProfile::EBucket::OperatorBlock);
         BlockScratch.SetNum(BlockCount);
+        if (VoxelDensityProfile::AreCountersEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockScratchBytes,
+                static_cast<uint64>(BlockCount) * sizeof(FVoxelOpSample));
+        }
         for (FVoxelOpSample& Sample : BlockScratch)
         {
             Sample = FVoxelOpSample();
@@ -370,6 +378,13 @@ struct FVoxelDensityBlockSession
                     Valid[Global] = 1;
                 }
             }
+        }
+        if (VoxelDensityProfile::AreCountersEnabled())
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::OpBlockCopyBytes,
+                static_cast<uint64>(BlockCount)
+                    * (sizeof(FVoxelOpSample) + sizeof(uint8)));
         }
 
         if (VoxelDensityProfile::AreCountersEnabled())
@@ -2053,6 +2068,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 // interpreted stack, plus the source's structural hand-off, without allocating
                 // FVoxelOpSample or traversing the graph one operator at a time for this voxel.
                 bUsedFusedEvaluator = true;
+                VoxelDensityProfile::FScopedTimer FusedEvaluatorTimer(
+                    VoxelDensityProfile::EBucket::FusedEvaluator);
                 Result = GetDensityWithParams(
                     WorldX, WorldY, WorldZ, CP_Tunnel, CP_TunnelFP, LayoutVersion,
                     /*bApplyLegacyStructuralPosts=*/false,
@@ -2074,14 +2091,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 // must not construct a per-sample FVoxelOpSample merely because this compatibility
                 // path still needs one when the block session is enabled.
                 FVoxelOpSample BlockCoreSample;
-                bUsedOpBlockSample = GVoxelDensityBlockSession.FillChunk(
-                    *ActiveOpStack,
-                    ChunkCoord,
-                    FIntVector(
-                        FMath::RoundToInt(WorldX),
-                        FMath::RoundToInt(WorldY),
-                        FMath::RoundToInt(WorldZ)),
-                    BlockCoreSample);
+                {
+                    VoxelDensityProfile::FScopedTimer OperatorBlockTimer(
+                        VoxelDensityProfile::EBucket::OperatorBlock);
+                    bUsedOpBlockSample = GVoxelDensityBlockSession.FillChunk(
+                        *ActiveOpStack,
+                        ChunkCoord,
+                        FIntVector(
+                            FMath::RoundToInt(WorldX),
+                            FMath::RoundToInt(WorldY),
+                            FMath::RoundToInt(WorldZ)),
+                        BlockCoreSample);
+                }
                 if (bUsedOpBlockSample)
                 {
                     BlockDensity = BlockCoreSample.Density;
@@ -2093,9 +2114,16 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             }
             if (!bUsedFusedEvaluator)
             {
-                Result = bUsedOpBlockSample
-                    ? -BlockDensity
-                    : ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
+                if (bUsedOpBlockSample)
+                {
+                    Result = -BlockDensity;
+                }
+                else
+                {
+                    VoxelDensityProfile::FScopedTimer InterpretedOpStackTimer(
+                        VoxelDensityProfile::EBucket::InterpretedOpStack);
+                    Result = ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
+                }
             }
         }
         else switch (CP_GenType)
@@ -2221,6 +2249,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // calls use the same landing geometry already evaluated by the legacy and op-stack post.
         VoxelDensityProfile::FScopedTimer DensityStructuralPostsTimer(
             VoxelDensityProfile::EBucket::DensityStructuralPosts);
+        VoxelDensityProfile::FScopedTimer StructuralTailTimer(
+            VoxelDensityProfile::EBucket::StructuralTail);
         float LandingBaseDensity = CP_Dist.BaseDensity;
 #if WITH_EDITOR
         // A composer parent can deliberately use a different structural base than the authored
@@ -2288,17 +2318,29 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         }
         // Origin rooms are structural too. Reassert their air before either support writer so a
         // bridge/ridge cannot plug a landing, while the two floor writers remain last.
-        VF_ApplyOriginLandingAirMC(
-            Result, WorldX, WorldY, WorldZ,
-            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        VF_ApplyOriginLandingFloorMC(
-            Result, WorldX, WorldY, WorldZ,
-            CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-            CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-        StrateManager->ApplyPassageStructuralPostsMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
-            CP_Dist.BoundarySealThickness, bProtectAuthoredTunnelFloor);
+        {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageLandingAir);
+            VF_ApplyOriginLandingAirMC(
+                Result, WorldX, WorldY, WorldZ,
+                CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+        }
+        {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageLandingFloor);
+            VF_ApplyOriginLandingFloorMC(
+                Result, WorldX, WorldY, WorldZ,
+                CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+        }
+        {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageStructuralPosts);
+            StrateManager->ApplyPassageStructuralPostsMC(
+                Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
+                CP_Dist.BoundarySealThickness, bProtectAuthoredTunnelFloor);
+        }
         // Disturbance features are authored as a generic MC-space post and may add a ridge or
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
@@ -2393,22 +2435,39 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 // backstop is allowed to reopen the tunnel, but the landing's proved support floor
                 // must own the final floor band; otherwise the graph post can erase the only support
                 // surface at the mouth and leave the player-fit graph with a disconnected pocket.
-                VF_ApplyOriginLandingFloorMC(
-                    Result, WorldX, WorldY, WorldZ,
-                    CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-                    CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-                StrateManager->ApplyPassageLandingFloorMC(
-                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
-                StrateManager->ApplyPassageLandingRoomFloorMC(
-                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+                {
+                    VoxelDensityProfile::FScopedTimer ProfileTimer(
+                        VoxelDensityProfile::EBucket::PassageLandingFloor);
+                    VF_ApplyOriginLandingFloorMC(
+                        Result, WorldX, WorldY, WorldZ,
+                        CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                        CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+                }
+                {
+                    VoxelDensityProfile::FScopedTimer ProfileTimer(
+                        VoxelDensityProfile::EBucket::PassageLandingFloor);
+                    StrateManager->ApplyPassageLandingFloorMC(
+                        Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+                }
+                {
+                    VoxelDensityProfile::FScopedTimer ProfileTimer(
+                        VoxelDensityProfile::EBucket::PassageLandingRoomFloor);
+                    StrateManager->ApplyPassageLandingRoomFloorMC(
+                        Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+                }
             }
         }
         // Inter-strate passages own the same final D-floor contract as graph tunnels.  This is
         // composed from the immutable construction-time profile after generic writers and the
         // graph overlap, so the legacy passage support slab can be disabled without losing the
         // floor to a disturbance refill.
-        StrateManager->ApplyPassageNativeFloorMC(
-            Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+        {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageLandingFloor);
+            StrateManager->ApplyPassageNativeFloorMC(
+                Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+        }
+        StructuralTailTimer.End();
         DensityStructuralPostsTimer.End();
     }
     else
@@ -2434,7 +2493,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     // below and are deliberately still the user override path.
     VoxelDensityProfile::FScopedTimer DensityBoundarySealTimer(
         VoxelDensityProfile::EBucket::DensityBoundarySeal);
-    VF_ApplyXYEdgeSealMC(Result, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
+    {
+        VoxelDensityProfile::FScopedTimer ProfileTimer(
+            VoxelDensityProfile::EBucket::XYEdgeSealOp);
+        VF_ApplyXYEdgeSealMC(Result, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
+    }
     DensityBoundarySealTimer.End();
 
     //=========================================================================
@@ -2878,6 +2941,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 ? VoxelDensityProfile::ECounter::FusedTunnelDetailSamples
                 : VoxelDensityProfile::ECounter::FusedTunnelDetailSkipped);
     }
+
+    VoxelDensityProfile::FScopedTimer FusedDetailTimer(
+        VoxelDensityProfile::EBucket::FusedDetail);
 
     //=========================================================================
     // STEP 4b: SURFACE ROUGHNESS (volumetric, SDF-based)
@@ -3502,6 +3568,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     }
 
     } // end bNearCaveSurface (terrain ops)
+    FusedDetailTimer.End();
 
     // Steps 4e / 4f (pits and chimneys) are now handled by the CaveSDF SmoothMin
     // block inserted above (between EvaluateSDFCached and the CarveFactor section).
@@ -3524,6 +3591,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // already computed by Step 4 — free): full strength at the network, smooth fade to zero
     // at Range. Worms become braids/shortcuts hugging the cave system; no isolated speckle.
     // Range = 0 → unmasked legacy behaviour. Bonus: fully-masked voxels skip both Perlins.
+    VoxelDensityProfile::FScopedTimer FusedWormTimer(
+        VoxelDensityProfile::EBucket::FusedWorm);
     if (Params.WormStrength > 0.0f && Params.WormThreshold > 0.0f)
     {
         float NetworkMask = 1.0f;
@@ -3570,16 +3639,28 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         }
     }
 
+    FusedWormTimer.End();
+
     //=========================================================================
     // STEP 6: STRATE BOUNDARY SEAL (haut + bas)
     //=========================================================================
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
+    VoxelDensityProfile::FScopedTimer FusedStructuralTimer(
+        VoxelDensityProfile::EBucket::FusedStructural);
+    {
+        VoxelDensityProfile::FScopedTimer ProfileTimer(
+            VoxelDensityProfile::EBucket::OriginSpineOp);
+        ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
+            Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+            Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
+    }
 
-    ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
+    {
+        VoxelDensityProfile::FScopedTimer ProfileTimer(
+            VoxelDensityProfile::EBucket::BoundarySealOp);
+        ApplyBoundarySeal(Density, WorldZ,
+            Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+            Params.BoundarySealThickness, Params.BaseDensity);
+    }
 
     //=========================================================================
     // STEP 7: INTER-STRATE PASSAGES (perce le seal)
@@ -3588,6 +3669,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     {
         if (bApplyLegacyStructuralPosts)
         {
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageModifier);
             StrateManager->ApplyPassageModifier(
                 Density, WorldX, WorldY, WorldZ,
                 Params.BaseDensity, Params.BoundarySealThickness);
@@ -3597,6 +3680,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             // GetDensityAt owns one common MC-space structural tail after either the legacy or
             // operator-stack branch.  Keep the actual tube carve here, but do not repeat its
             // landing air/floor/tunnel-air posts before the shared disturbance/post sequence.
+            VoxelDensityProfile::FScopedTimer ProfileTimer(
+                VoxelDensityProfile::EBucket::PassageCarveOp);
             StrateManager->ApplyPassageCarvingOnly(
                 Density, WorldX, WorldY, WorldZ,
                 Params.BaseDensity, Params.BoundarySealThickness);
@@ -3645,6 +3730,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
             WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
     }
+
+    FusedStructuralTimer.End();
 
     // Convention MC: négatif = solide, positif = air.
     // La logique interne utilise positif = solide (plus lisible), donc on négate.

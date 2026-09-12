@@ -300,8 +300,96 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         VoxelDensityProfile::AddCounter(
                             VoxelDensityProfile::ECounter::MesherBlockTests);
                     }
+                    const bool bAttributeClassifier =
+                        VoxelDensityProfile::GetMode()
+                            == VoxelDensityProfile::EMode::Attribution;
+                    const bool bSampleClassifier = bAttributeClassifier
+                        && VoxelDensityProfile::ShouldSample(
+                            VoxelDensityProfile::EBucket::ClassifierTotal);
+                    const uint64 ClassifierStartCycles = bSampleClassifier
+                        ? FPlatformTime::Cycles64() : 0;
+                    FVoxelTileClassificationStats ClassifierStats;
+                    if (bAttributeClassifier)
+                    {
+                        VoxelDensityProfile::RecordClassifierCall(bSampleClassifier);
+                    }
                     const EVoxelTileClass Verdict = Generator->ClassifyTile(
-                        BlockOrigin, Step, BlockCells);
+                        BlockOrigin, Step, BlockCells,
+                        bSampleClassifier ? &ClassifierStats : nullptr);
+                    if (bSampleClassifier)
+                    {
+                        VoxelDensityProfile::AddSampledMeasurement(
+                            VoxelDensityProfile::EBucket::ClassifierTotal,
+                            FPlatformTime::Cycles64() - ClassifierStartCycles);
+                        VoxelDensityProfile::FSnapshot::FClassifierStats ProfileStats;
+                        ProfileStats.RefineNodes = ClassifierStats.RefineNodes;
+                        ProfileStats.StackBoxCalls = ClassifierStats.StackBoxCalls;
+                        ProfileStats.WholeMixedNodes = ClassifierStats.WholeMixedNodes;
+                        ProfileStats.WholeSolidNodes = ClassifierStats.WholeSolidNodes;
+                        ProfileStats.WholeAirNodes = ClassifierStats.WholeAirNodes;
+                        ProfileStats.NeedsFinalFieldNodes = ClassifierStats.NeedsFinalFieldNodes;
+                        ProfileStats.SplitNodes = ClassifierStats.SplitNodes;
+                        ProfileStats.MaxRefinementDepth = ClassifierStats.MaxRefinementDepth;
+                        ProfileStats.ExactCoreSamples = ClassifierStats.ExactCoreSamples;
+                        ProfileStats.ExactFinalSamples = ClassifierStats.ExactFinalSamples;
+                        ProfileStats.ExactCoreCacheHits = ClassifierStats.ExactCoreCacheHits;
+                        ProfileStats.ExactFinalCacheHits = ClassifierStats.ExactFinalCacheHits;
+                        ProfileStats.ExactCoreLeaves = ClassifierStats.ExactCoreLeaves;
+                        ProfileStats.ExactFinalLeaves = ClassifierStats.ExactFinalLeaves;
+                        ProfileStats.StackBoxCycles = ClassifierStats.StackBoxCycles;
+                        ProfileStats.ExactCoreCycles = ClassifierStats.ExactCoreCycles;
+                        ProfileStats.ExactFinalCycles = ClassifierStats.ExactFinalCycles;
+                        ProfileStats.RoomTailQueries = ClassifierStats.RoomTailQueries;
+                        ProfileStats.RoomTailEvaluated = ClassifierStats.RoomTailEvaluated;
+                        ProfileStats.RoomTailCycles = ClassifierStats.RoomTailCycles;
+                        ProfileStats.RoomPropagateCycles = ClassifierStats.RoomPropagateCycles;
+                        ProfileStats.RoomExactPrimitiveCycles = ClassifierStats.RoomExactPrimitiveCycles;
+                        ProfileStats.RoomCacheWindowCycles = ClassifierStats.RoomCacheWindowCycles;
+                        ProfileStats.RoomNumRooms = FMath::Max(ClassifierStats.RoomNumRooms, 0);
+                        ProfileStats.RoomNumTunnels = FMath::Max(ClassifierStats.RoomNumTunnels, 0);
+                        ProfileStats.RoomNumRoomFloorJoins = FMath::Max(
+                            ClassifierStats.RoomNumRoomFloorJoins, 0);
+                        ProfileStats.RoomNumPits = FMath::Max(ClassifierStats.RoomNumPits, 0);
+                        ProfileStats.RoomNumChimneys = FMath::Max(ClassifierStats.RoomNumChimneys, 0);
+                        VoxelDensityProfile::AddClassifierStats(ProfileStats);
+
+                        if (ClassifierStats.StackBoxCalls > 0)
+                        {
+                            VoxelDensityProfile::AddMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierIntervalProof,
+                                0, ClassifierStats.StackBoxCalls);
+                            VoxelDensityProfile::AddSampledMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierIntervalProof,
+                                ClassifierStats.StackBoxCycles);
+                        }
+                        if (ClassifierStats.ExactCoreLeaves > 0)
+                        {
+                            VoxelDensityProfile::AddMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierExactCore,
+                                0, ClassifierStats.ExactCoreLeaves);
+                            VoxelDensityProfile::AddSampledMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierExactCore,
+                                ClassifierStats.ExactCoreCycles);
+                        }
+                        if (ClassifierStats.ExactFinalLeaves > 0)
+                        {
+                            VoxelDensityProfile::AddMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierExactFinal,
+                                0, ClassifierStats.ExactFinalLeaves);
+                            VoxelDensityProfile::AddSampledMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierExactFinal,
+                                ClassifierStats.ExactFinalCycles);
+                        }
+                        if (ClassifierStats.RoomTailQueries > 0)
+                        {
+                            VoxelDensityProfile::AddMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierRoomTail,
+                                0, ClassifierStats.RoomTailQueries);
+                            VoxelDensityProfile::AddSampledMeasurement(
+                                VoxelDensityProfile::EBucket::ClassifierRoomTail,
+                                ClassifierStats.RoomTailCycles);
+                        }
+                    }
                     if (Verdict == EVoxelTileClass::Mixed)
                     {
                         MixedBlockIndices.Add(
@@ -488,6 +576,21 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                         OriginVoxels.Z + gz * Step);
                 }
             }
+        }
+    }
+    if (VoxelDensityProfile::AreCountersEnabled())
+    {
+        const uint64 GridSampleCount = static_cast<uint64>(GzHi - GzLo + 1)
+            * static_cast<uint64>(MDim)
+            * static_cast<uint64>(MDim);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::MesherDensityGridBytes,
+            GridSampleCount * sizeof(float));
+        if (bUseSharedDensityGrid)
+        {
+            VoxelDensityProfile::AddCounter(
+                VoxelDensityProfile::ECounter::MesherSharedGridReadBytes,
+                GridSampleCount * sizeof(float));
         }
     }
     if (bUseOperatorBlock)
@@ -834,6 +937,26 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     MeshData.Triangles.Append(GroundTris);
     MeshData.Triangles.Append(CapTris);
     MeshData.NumCeilingTriangles = CapTris.Num() / 3;
+
+    if (VoxelDensityProfile::AreCountersEnabled())
+    {
+        const uint64 OutputArrayBytes = static_cast<uint64>(MeshData.Vertices.Num()) * sizeof(FVector)
+            + static_cast<uint64>(MeshData.Normals.Num()) * sizeof(FVector)
+            + static_cast<uint64>(MeshData.UVs.Num()) * sizeof(FVector2D)
+            + static_cast<uint64>(MeshData.Colors.Num()) * sizeof(FColor)
+            + static_cast<uint64>(MeshData.Triangles.Num()) * sizeof(int32);
+        const uint64 OutputAllocatedBytes = static_cast<uint64>(MeshData.Vertices.GetAllocatedSize())
+            + static_cast<uint64>(MeshData.Normals.GetAllocatedSize())
+            + static_cast<uint64>(MeshData.UVs.GetAllocatedSize())
+            + static_cast<uint64>(MeshData.Colors.GetAllocatedSize())
+            + static_cast<uint64>(MeshData.Triangles.GetAllocatedSize());
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::MesherOutputArrayBytes,
+            OutputArrayBytes);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::MesherOutputAllocatedBytes,
+            OutputAllocatedBytes);
+    }
 
     return MeshData;
 }

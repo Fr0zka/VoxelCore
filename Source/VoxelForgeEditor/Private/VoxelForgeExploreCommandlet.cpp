@@ -266,6 +266,7 @@ struct FExploreArguments
     bool bUseOperatorStack = true;
     bool bProfileDensity = false;
     bool bProfileDensityFull = false;
+    bool bPerfAttribution = false;
     bool bProfileLod = false;
     bool bOpBounds = false;
     bool bFailureFocusRender = false;
@@ -313,6 +314,11 @@ struct FExploreArguments
     bool bRenderCameraOverride = false;
     FVector RenderCamera = FVector::ZeroVector;
 
+    bool IsDensityProfilingEnabled() const
+    {
+        return bProfileDensity || bPerfAttribution;
+    }
+
     FString CanonicalModes() const
     {
         FString Result;
@@ -358,6 +364,7 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     OutArguments.bProfileDensity = FParse::Param(*Params, TEXT("profiledensity"));
     OutArguments.bProfileDensityFull = FParse::Param(*Params, TEXT("profiledensityfull"));
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
+    OutArguments.bPerfAttribution = FParse::Param(*Params, TEXT("perfattribution"));
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
     FParse::Value(*Params, TEXT("out="), OutText);
@@ -741,6 +748,10 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
 
 VoxelDensityProfile::EMode ExploreProfileMode(const FExploreArguments& Arguments)
 {
+    if (Arguments.bPerfAttribution)
+    {
+        return VoxelDensityProfile::EMode::Attribution;
+    }
     return Arguments.bProfileDensityFull
         ? VoxelDensityProfile::EMode::Full
         : VoxelDensityProfile::EMode::Sampled;
@@ -850,6 +861,14 @@ struct FExploreWorld
     int32 ExploreMeshTileCount = 0;
     int32 ExploreMeshTilesCompleted = 0;
     double ExploreMeshSeconds = 0.0;
+    // Exact wall-clock partition of ExploreMeshSeconds.  The first three fields end at the
+    // parallel tile launch; merge closes the mesh clock.  Remainder is intentionally retained
+    // instead of rounding the ledger to 100%.
+    double ExploreMeshPreparationSeconds = 0.0;
+    double ExploreMeshPreTileSetupSeconds = 0.0;
+    double ExploreMeshMergeSeconds = 0.0;
+    double ExploreMeshAccountingRemainderSeconds = 0.0;
+    double ExploreMeshHashSeconds = 0.0;
     double ExploreDensityGridSeconds = 0.0;
     int64 ExploreDensityGridTotalSamples = 0;
     int64 ExploreDensityGridUniqueSamples = 0;
@@ -1235,6 +1254,11 @@ struct FExploreExportOutput
     FExploreMeshMetrics SurfaceMetrics;
     double MeshSeconds = 0.0;
     double MeshUsPerVoxel = 0.0;
+    double MeasureSeconds = 0.0;
+    double ObjWriteSeconds = 0.0;
+    double ManifestSeconds = 0.0;
+    double ExportWallSeconds = 0.0;
+    double ExportAccountingRemainderSeconds = 0.0;
     FString GeometryHash;
     bool bTruncated = false;
 };
@@ -1634,6 +1658,11 @@ bool EnsureExploreMesh(
         FMath::FloorToInt(0.5f * static_cast<float>(
             World.TargetBottomWorldZ + World.TargetTopWorldZ)));
     World.ExploreMeshSeconds = 0.0;
+    World.ExploreMeshPreparationSeconds = 0.0;
+    World.ExploreMeshPreTileSetupSeconds = 0.0;
+    World.ExploreMeshMergeSeconds = 0.0;
+    World.ExploreMeshAccountingRemainderSeconds = 0.0;
+    World.ExploreMeshHashSeconds = 0.0;
     World.ExploreDensityGridSeconds = 0.0;
     World.ExploreDensityGridTotalSamples = 0;
     World.ExploreDensityGridUniqueSamples = 0;
@@ -1694,6 +1723,7 @@ bool EnsureExploreMesh(
     World.ExploreDensityGridDuplicateSamplesAfter =
         Arguments.bReuseDensityGrid ? 0 : World.ExploreDensityGridDuplicateSamplesBefore;
 
+    const double DensityStageStartSeconds = FPlatformTime::Seconds();
     if (Arguments.bReuseDensityGrid)
     {
         const double DensityGridStartSeconds = FPlatformTime::Seconds();
@@ -1780,6 +1810,8 @@ bool EnsureExploreMesh(
         World.Mesher->SetSharedDensityGrid(&World.ExploreSharedDensityGrid);
         World.bExploreDensityGridReused = true;
     }
+    const double DensityStageEndSeconds = FPlatformTime::Seconds();
+    World.ExploreMeshPreparationSeconds = DensityStageStartSeconds - MeshStartSeconds;
 
     // Generate each tile through the canonical mesher on worker threads, then append strictly in
     // Z/Y/X order. The mesher's scratch buffers and the generator's hot caches are thread-local;
@@ -1802,6 +1834,7 @@ bool EnsureExploreMesh(
     std::atomic<bool> bTileWorkCancelled(false);
     const double TileWorkDeadline = Budget.StartSeconds + Budget.LimitSeconds - 0.25;
     const double ParallelStartSeconds = FPlatformTime::Seconds();
+    World.ExploreMeshPreTileSetupSeconds = ParallelStartSeconds - DensityStageEndSeconds;
     ParallelFor(
         TEXT("VoxelForgeExploreMeshTiles"),
         World.ExploreMeshTileCount,
@@ -1925,9 +1958,20 @@ bool EnsureExploreMesh(
         return false;
     }
 
-    World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
+    const double MeshEndSeconds = FPlatformTime::Seconds();
+    World.ExploreMeshSeconds = MeshEndSeconds - MeshStartSeconds;
+    World.ExploreMeshMergeSeconds = MeshEndSeconds - ParallelEndSeconds;
+    const double MeshStageSumSeconds = World.ExploreMeshPreparationSeconds
+        + World.ExploreDensityGridSeconds
+        + World.ExploreMeshPreTileSetupSeconds
+        + World.ExploreMeshTaskWallSeconds
+        + World.ExploreMeshMergeSeconds;
+    World.ExploreMeshAccountingRemainderSeconds =
+        World.ExploreMeshSeconds - MeshStageSumSeconds;
     World.bExploreMeshComplete = true;
+    const double GeometryHashStartSeconds = FPlatformTime::Seconds();
     World.ExploreGeometryHash = ComputeGeometryHash(World.ExploreMesh);
+    World.ExploreMeshHashSeconds = FPlatformTime::Seconds() - GeometryHashStartSeconds;
     OutError.Reset();
     return true;
 }
@@ -4021,7 +4065,7 @@ FString BuildManifestJson(
     TSharedRef<FExploreJsonWriter> Writer =
         TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 6);
+    Writer->WriteValue(TEXT("schema_version"), 7);
     Writer->WriteValue(TEXT("format"), TEXT("OBJ"));
     Writer->WriteValue(TEXT("mesh_file"), Export.MeshFileName);
     Writer->WriteValue(TEXT("mesh_positions_units"), TEXT("metres"));
@@ -4126,6 +4170,7 @@ bool RunExport(
     FExploreBudget& Budget)
 {
     OutOutput = FExploreExportOutput();
+    const double ExportStartSeconds = FPlatformTime::Seconds();
     OutOutput.RegionSize = Arguments.ExportSize;
     OutOutput.EstimatedWorkingBytes = EstimateExportWorkingBytes(Arguments.ExportSize);
     if (OutOutput.EstimatedWorkingBytes > OutOutput.WorkingMemoryCapBytes)
@@ -4163,6 +4208,7 @@ bool RunExport(
         OutOutput.RefusalReason = FString::Printf(TEXT("Could not create OBJ '%s'."), *MeshPath);
         return false;
     }
+    const double ObjWriteStartSeconds = FPlatformTime::Seconds();
     if (!WriteObjHeader(*Archive))
     {
         OutOutput.Status = TEXT("error");
@@ -4170,12 +4216,14 @@ bool RunExport(
         return false;
     }
 
+    const double MeasureStartSeconds = FPlatformTime::Seconds();
     if (!MeasureExploreMesh(World.ExploreMesh, OutOutput.SurfaceMetrics, Error))
     {
         OutOutput.Status = TEXT("error");
         OutOutput.RefusalReason = Error;
         return false;
     }
+    OutOutput.MeasureSeconds = FPlatformTime::Seconds() - MeasureStartSeconds;
     OutOutput.MeshArrayBytes = static_cast<int64>(World.ExploreMesh.Vertices.Num()) * sizeof(FVector)
         + static_cast<int64>(World.ExploreMesh.Normals.Num()) * sizeof(FVector)
         + static_cast<int64>(World.ExploreMesh.UVs.Num()) * sizeof(FVector2D)
@@ -4221,6 +4269,7 @@ bool RunExport(
         OutOutput.RefusalReason = TEXT("OBJ was written but its file size could not be read.");
         return false;
     }
+    OutOutput.ObjWriteSeconds = FPlatformTime::Seconds() - ObjWriteStartSeconds;
 
     OutOutput.bTruncated = Budget.bTruncated
         || !World.bExploreMeshComplete
@@ -4235,6 +4284,7 @@ bool RunExport(
             : TEXT("The wall-clock budget stopped export after writing a partial mesh.");
     }
 
+    const double ManifestStartSeconds = FPlatformTime::Seconds();
     const FString ManifestJson = BuildManifestJson(Arguments, OutOutput);
     const FString ManifestJsonRepeat = BuildManifestJson(Arguments, OutOutput);
     if (ManifestJson.IsEmpty() || ManifestJsonRepeat.IsEmpty())
@@ -4258,6 +4308,13 @@ bool RunExport(
         OutOutput.RefusalReason = TEXT("Could not write export manifest.json.");
         return false;
     }
+    OutOutput.ManifestSeconds = FPlatformTime::Seconds() - ManifestStartSeconds;
+    OutOutput.ExportWallSeconds = FPlatformTime::Seconds() - ExportStartSeconds;
+    OutOutput.ExportAccountingRemainderSeconds = OutOutput.ExportWallSeconds
+        - (World.ExploreMeshSeconds
+            + World.ExploreMeshHashSeconds
+            + OutOutput.ObjWriteSeconds
+            + OutOutput.ManifestSeconds);
     if (!OutOutput.bTruncated)
     {
         OutOutput.Status = TEXT("ok");
@@ -4348,6 +4405,7 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("mesh_min_batch_size"), Arguments.MeshMinBatchSize);
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
+    Writer->WriteValue(TEXT("perf_attribution"), Arguments.bPerfAttribution);
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
     Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
@@ -4386,6 +4444,27 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("us_per_voxel"), SummaryUsPerVoxel);
     Writer->WriteValue(TEXT("triangle_count"), SummaryTriangleCount);
     Writer->WriteValue(TEXT("geometry_hash"), SummaryGeometryHash);
+    Writer->WriteObjectStart(TEXT("mesh_wall_ledger"));
+    Writer->WriteValue(TEXT("mesh_seconds"), World.ExploreMeshSeconds);
+    Writer->WriteValue(TEXT("preparation_seconds"), World.ExploreMeshPreparationSeconds);
+    Writer->WriteValue(TEXT("density_grid_seconds"), World.ExploreDensityGridSeconds);
+    Writer->WriteValue(TEXT("pre_tile_setup_seconds"), World.ExploreMeshPreTileSetupSeconds);
+    Writer->WriteValue(TEXT("tile_parallel_wall_seconds"), World.ExploreMeshTaskWallSeconds);
+    Writer->WriteValue(TEXT("tile_merge_seconds"), World.ExploreMeshMergeSeconds);
+    Writer->WriteValue(TEXT("accounting_remainder_seconds"),
+        World.ExploreMeshAccountingRemainderSeconds);
+    Writer->WriteValue(TEXT("stage_sum_seconds"),
+        World.ExploreMeshPreparationSeconds
+            + World.ExploreDensityGridSeconds
+            + World.ExploreMeshPreTileSetupSeconds
+            + World.ExploreMeshTaskWallSeconds
+            + World.ExploreMeshMergeSeconds);
+    Writer->WriteValue(TEXT("sum_matches_mesh"),
+        FMath::Abs(World.ExploreMeshAccountingRemainderSeconds) <= 0.000001);
+    Writer->WriteValue(TEXT("geometry_hash_seconds"), World.ExploreMeshHashSeconds);
+    Writer->WriteValue(TEXT("note"), TEXT(
+        "The stage rows are one additive wall-clock ledger. Profiler buckets below are nested worker diagnostics and are not added to this ledger."));
+    Writer->WriteObjectEnd();
     Writer->WriteObjectStart(TEXT("density_grid_reuse"));
     Writer->WriteValue(TEXT("enabled"), World.bExploreDensityGridReused);
     Writer->WriteValue(TEXT("total_tile_grid_samples"), World.ExploreDensityGridTotalSamples);
@@ -4752,6 +4831,13 @@ FString BuildExploreJson(
         WriteSurfaceReliefMetrics(*Writer, Output.Export.SurfaceMetrics);
         Writer->WriteValue(TEXT("mesh_seconds"), Output.Export.MeshSeconds);
         Writer->WriteValue(TEXT("mesh_us_per_voxel"), Output.Export.MeshUsPerVoxel);
+        Writer->WriteValue(TEXT("geometry_hash_seconds"), World.ExploreMeshHashSeconds);
+        Writer->WriteValue(TEXT("measure_seconds"), Output.Export.MeasureSeconds);
+        Writer->WriteValue(TEXT("obj_write_seconds"), Output.Export.ObjWriteSeconds);
+        Writer->WriteValue(TEXT("manifest_seconds"), Output.Export.ManifestSeconds);
+        Writer->WriteValue(TEXT("export_wall_seconds"), Output.Export.ExportWallSeconds);
+        Writer->WriteValue(TEXT("export_accounting_remainder_seconds"),
+            Output.Export.ExportAccountingRemainderSeconds);
         Writer->WriteValue(TEXT("geometry_hash"), Output.Export.GeometryHash);
         Writer->WriteValue(TEXT("density_grid_reuse"), World.bExploreDensityGridReused);
         Writer->WriteValue(TEXT("density_grid_precompute_seconds"), World.ExploreDensityGridSeconds);
@@ -4777,7 +4863,9 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("mode"),
         Output.bHasProfile && Output.Profile.Mode != VoxelDensityProfile::EMode::Disabled
             ? (Output.Profile.Mode == VoxelDensityProfile::EMode::Full
-                ? TEXT("full") : TEXT("sampled"))
+                ? TEXT("full")
+                : (Output.Profile.Mode == VoxelDensityProfile::EMode::Attribution
+                    ? TEXT("attribution") : TEXT("sampled")))
             : TEXT("disabled"));
     Writer->WriteValue(TEXT("sample_interval"), static_cast<int32>(Output.Profile.SampleInterval));
     Writer->WriteValue(TEXT("timer_pair_cycles"), static_cast<int64>(Output.Profile.TimerPairCycles));
@@ -4788,9 +4876,12 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("generation_can_depend_on_profiler"), false);
     Writer->WriteValue(TEXT("fine_scope_timing"),
         Output.Profile.Mode == VoxelDensityProfile::EMode::Full);
+    Writer->WriteValue(TEXT("attribution_scope_timing"),
+        Output.Profile.Mode == VoxelDensityProfile::EMode::Attribution);
     Writer->WriteValue(TEXT("sampled_scope_policy"), TEXT(
-        "Sampled mode times GetDensityAt and mesh container parents; fine operation scopes are "
-        "opt-in via -profiledensityfull or UE Insights."));
+        "Attribution mode keeps the parent and additive mesh ledger wall clocks, samples hot "
+        "component scopes, and records classifier detail; full mode remains the invasive per-scope "
+        "diagnostic."));
     Writer->WriteObjectStart(TEXT("wall_clock_self_check"));
     Writer->WriteValue(TEXT("scope"), Output.ProfilerComparison.Scope);
     Writer->WriteValue(TEXT("profiled_total_seconds"), Output.ProfilerComparison.ProfiledSeconds);
@@ -4803,6 +4894,7 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("geometry_equal"), Output.ProfilerComparison.bGeometryEqual);
     Writer->WriteValue(TEXT("self_check"), Output.ProfilerComparison.SelfCheck);
     Writer->WriteObjectEnd();
+    const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
     Writer->WriteObjectStart(TEXT("counters"));
     for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
     {
@@ -4810,6 +4902,42 @@ FString BuildExploreJson(
             VoxelDensityProfile::CounterName(static_cast<VoxelDensityProfile::ECounter>(Index)),
             static_cast<int64>(Output.Profile.Counters[Index]));
     }
+    Writer->WriteObjectEnd();
+    const VoxelDensityProfile::FSnapshot::FClassifierStats& Classifier = Output.Profile.Classifier;
+    Writer->WriteObjectStart(TEXT("classifier"));
+    Writer->WriteValue(TEXT("calls"), static_cast<int64>(Classifier.Calls));
+    Writer->WriteValue(TEXT("sampled_calls"), static_cast<int64>(Classifier.SampledCalls));
+    Writer->WriteValue(TEXT("sample_fraction"), Classifier.Calls > 0
+        ? static_cast<double>(Classifier.SampledCalls) / static_cast<double>(Classifier.Calls)
+        : 0.0);
+    Writer->WriteValue(TEXT("refine_nodes"), static_cast<int64>(Classifier.RefineNodes));
+    Writer->WriteValue(TEXT("interval_stack_box_calls"), static_cast<int64>(Classifier.StackBoxCalls));
+    Writer->WriteValue(TEXT("whole_mixed_nodes"), static_cast<int64>(Classifier.WholeMixedNodes));
+    Writer->WriteValue(TEXT("whole_solid_nodes"), static_cast<int64>(Classifier.WholeSolidNodes));
+    Writer->WriteValue(TEXT("whole_air_nodes"), static_cast<int64>(Classifier.WholeAirNodes));
+    Writer->WriteValue(TEXT("needs_final_field_nodes"), static_cast<int64>(Classifier.NeedsFinalFieldNodes));
+    Writer->WriteValue(TEXT("split_nodes"), static_cast<int64>(Classifier.SplitNodes));
+    Writer->WriteValue(TEXT("max_refinement_depth"), static_cast<int64>(Classifier.MaxRefinementDepth));
+    Writer->WriteValue(TEXT("exact_core_samples"), static_cast<int64>(Classifier.ExactCoreSamples));
+    Writer->WriteValue(TEXT("exact_final_samples"), static_cast<int64>(Classifier.ExactFinalSamples));
+    Writer->WriteValue(TEXT("exact_core_cache_hits"), static_cast<int64>(Classifier.ExactCoreCacheHits));
+    Writer->WriteValue(TEXT("exact_final_cache_hits"), static_cast<int64>(Classifier.ExactFinalCacheHits));
+    Writer->WriteValue(TEXT("exact_core_leaves"), static_cast<int64>(Classifier.ExactCoreLeaves));
+    Writer->WriteValue(TEXT("exact_final_leaves"), static_cast<int64>(Classifier.ExactFinalLeaves));
+    Writer->WriteValue(TEXT("interval_stack_box_us"), static_cast<double>(Classifier.StackBoxCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("exact_core_us"), static_cast<double>(Classifier.ExactCoreCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("exact_final_us"), static_cast<double>(Classifier.ExactFinalCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("room_tail_queries"), static_cast<int64>(Classifier.RoomTailQueries));
+    Writer->WriteValue(TEXT("room_tail_evaluated"), static_cast<int64>(Classifier.RoomTailEvaluated));
+    Writer->WriteValue(TEXT("room_tail_us"), static_cast<double>(Classifier.RoomTailCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("room_propagate_us"), static_cast<double>(Classifier.RoomPropagateCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("room_exact_primitive_us"), static_cast<double>(Classifier.RoomExactPrimitiveCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("room_cache_window_us"), static_cast<double>(Classifier.RoomCacheWindowCycles) * CycleToMicroseconds);
+    Writer->WriteValue(TEXT("room_count"), static_cast<int64>(Classifier.RoomNumRooms));
+    Writer->WriteValue(TEXT("tunnel_count"), static_cast<int64>(Classifier.RoomNumTunnels));
+    Writer->WriteValue(TEXT("room_floor_join_count"), static_cast<int64>(Classifier.RoomNumRoomFloorJoins));
+    Writer->WriteValue(TEXT("pit_count"), static_cast<int64>(Classifier.RoomNumPits));
+    Writer->WriteValue(TEXT("chimney_count"), static_cast<int64>(Classifier.RoomNumChimneys));
     Writer->WriteObjectEnd();
     auto WriteCacheBreakdown = [&Writer](
         const TCHAR* Name,
@@ -4836,7 +4964,6 @@ FString BuildExploreJson(
     WriteCacheBreakdown(TEXT("room_graph"), Output.Profile.RoomGraphCacheBreakdown);
     Writer->WriteObjectEnd();
     Writer->WriteObjectStart(TEXT("buckets"));
-    const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
     for (int32 Index = 0; Index < VoxelDensityProfile::BucketCount; ++Index)
     {
         Writer->WriteObjectStart(VoxelDensityProfile::BucketName(
@@ -4884,7 +5011,9 @@ FString BuildExploreJson(
         Output.Profile.Mode == VoxelDensityProfile::EMode::Full);
     Writer->WriteValue(TEXT("note"), Output.Profile.Mode == VoxelDensityProfile::EMode::Full
         ? TEXT("Phase buckets are the non-overlapping ledger. Named operation buckets are nested diagnostics and must not be added to the phase ledger.")
-        : TEXT("Sampled mode intentionally disables fine phase and operation timers so the parent survives contact with reality; use -profiledensityfull or UE Insights for fine scope timing."));
+        : (Output.Profile.Mode == VoxelDensityProfile::EMode::Attribution
+            ? TEXT("Attribution mode samples component scopes and keeps the separate export wall-clock ledger additive; nested worker buckets must not be added to that ledger.")
+            : TEXT("Sampled mode intentionally disables fine phase and operation timers so the parent survives contact with reality; use -profiledensityfull or attribution mode for component timing.")));
     Writer->WriteObjectEnd();
     Writer->WriteObjectEnd();
 
@@ -5437,7 +5566,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
     // serving the next case's generation.
     VoxelDensityProfile::Reset();
     VoxelDensityProfile::SetMode(
-        Arguments.bProfileDensity
+        Arguments.IsDensityProfilingEnabled()
             ? ExploreProfileMode(Arguments)
             : VoxelDensityProfile::EMode::Disabled,
         VoxelDensityProfile::DefaultSampleInterval);
@@ -5535,7 +5664,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
                 Mesh.Vertices.Num(), Mesh.Triangles.Num() / 3,
                 Mesh.IsEmpty() ? 1 : 0);
         }
-        if (Arguments.bProfileDensity)
+        if (Arguments.IsDensityProfilingEnabled())
         {
             VoxelDensityProfile::Reset();
             VoxelDensityProfile::SetMode(
@@ -5616,7 +5745,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
     // The reference world is fresh, profiling is disabled for it, and its geometry hash is
     // compared with the profiled world below.  This is deliberately a diagnostic second pass;
     // it cannot affect the profiled world's generation or its deterministic output.
-    if (Arguments.bProfileDensity
+    if (Arguments.IsDensityProfilingEnabled()
         && (Arguments.bRender || Arguments.bExport)
         && (CameraSeedWalk != nullptr || Arguments.bExport)
         && !Budget.bTruncated)
@@ -5748,7 +5877,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
 
     Output.Profile = VoxelDensityProfile::Snapshot();
     Output.bHasProfile = true;
-    if (Arguments.bProfileDensity)
+    if (Arguments.IsDensityProfilingEnabled())
     {
         if (Output.ProfilerComparison.bAvailable)
         {
@@ -5870,7 +5999,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         *ReportPath,
         (bPayloadRepeatEqual && bFinalRepeatEqual) ? TEXT("yes") : TEXT("no"));
 
-    if (Arguments.bProfileDensity)
+    if (Arguments.IsDensityProfilingEnabled())
     {
         const VoxelDensityProfile::FSnapshot Profile = VoxelDensityProfile::Snapshot();
         const double CycleToMicroseconds = FPlatformTime::GetSecondsPerCycle64() * 1.0e6;
@@ -6168,6 +6297,8 @@ bool BuildBatchCaseParams(
     bool bProfileDensityFull = false;
     JsonBool(Case, TEXT("profile_density_full"), bProfileDensityFull);
     bProfileDensity |= bProfileDensityFull;
+    bool bPerfAttribution = false;
+    JsonBool(Case, TEXT("perf_attribution"), bPerfAttribution);
     bool bProfileLod = false;
     JsonBool(Case, TEXT("profile_lod"), bProfileLod);
     bool bOpBounds = false;
@@ -6207,6 +6338,10 @@ bool BuildBatchCaseParams(
         OutParams += bProfileDensityFull
             ? TEXT(" -profiledensityfull")
             : TEXT(" -profiledensity");
+    }
+    if (bPerfAttribution)
+    {
+        OutParams += TEXT(" -perfattribution");
     }
     if (bProfileLod)
     {

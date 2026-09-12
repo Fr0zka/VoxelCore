@@ -4729,6 +4729,8 @@ void VoxelCaveMorphology::BuildChunkCache(
     uint32 Seed, int32 StrateIndex,
     const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::RoomGraphBuild);
     // Clear previous data (arrays keep their allocation for reuse)
     OutCache.Reset();
     OutCache.SDFBlendRadius = Params.SDFBlendRadius;
@@ -6025,6 +6027,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float SDFBlendRadius,
     int32* OutNearestRoomIdx)
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::RoomGraphSdf);
     float MinSDF = FLT_MAX;
     const float BlendK = SDFBlendRadius;
     const FVector Pos(WorldX, WorldY, WorldZ);
@@ -6273,6 +6277,8 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     const FChunkSDFCache& Cache,
     const FTunnelSupportFloorColumn* SupportColumn)
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::TunnelCoreWorld);
     const FVector Pos(WorldX, WorldY, WorldZ);
     FTunnelCoreWorldEvaluation Result;
 
@@ -6491,6 +6497,8 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
     const FChunkSDFCache& Cache,
     FTunnelSupportFloorColumn& OutColumn)
 {
+    VoxelDensityProfile::FScopedTimer ProfileTimer(
+        VoxelDensityProfile::EBucket::TunnelCoreSupport);
     OutColumn.Reset();
 
     if (VoxelDensityProfile::AreCountersEnabled())

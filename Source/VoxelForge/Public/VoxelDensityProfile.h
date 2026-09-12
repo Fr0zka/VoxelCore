@@ -15,12 +15,15 @@ namespace VoxelDensityProfile
     {
         Disabled,
         Sampled,
+        // Low-overhead attribution: keeps the parent and stage ledger trustworthy, samples
+        // hot component scopes, and collects classifier detail without the old full-scope storm.
+        Attribution,
         Full,
     };
 
     // Count-based sampling is deterministic with respect to the profiler's own counters, but the
     // report is intentionally diagnostic only.  It never participates in density or mesh output.
-    constexpr uint32 DefaultSampleInterval = 64;
+    constexpr uint32 DefaultSampleInterval = 128;
 
     enum class EBucket : uint8
     {
@@ -56,6 +59,23 @@ namespace VoxelDensityProfile
         PassageCarveOp,
         XYEdgeSealOp,
         OtherOp,
+        // Attribution components.  These are nested diagnostics; the non-overlapping phase
+        // buckets below remain the density accounting ledger.
+        FusedEvaluator,
+        InterpretedOpStack,
+        OperatorBlock,
+        RoomGraphBuild,
+        RoomGraphSdf,
+        TunnelCoreWorld,
+        FusedDetail,
+        FusedWorm,
+        FusedStructural,
+        ClassifierTotal,
+        ClassifierIntervalProof,
+        ClassifierExactCore,
+        ClassifierExactFinal,
+        ClassifierRoomTail,
+        RuntimeStreamBuilding,
         // Non-overlapping top-level phases.  The named operation buckets above are intentionally
         // nested diagnostics; these phase buckets are the accounting ledger that must add up to
         // GetDensityAt without double-counting a stack op inside its enclosing phase.
@@ -128,10 +148,23 @@ namespace VoxelDensityProfile
         OpBlockOperators,
         OpBlockActiveOperators,
         OpBlockPrunedOperators,
+        MesherDensityGridBytes,
+        MesherSharedGridReadBytes,
+        MesherOutputArrayBytes,
+        MesherOutputAllocatedBytes,
+        OpBlockScratchBytes,
+        OpBlockCopyBytes,
         Count
     };
 
     constexpr int32 CounterCount = static_cast<int32>(ECounter::Count);
+
+    // Export the one fast-path bit so callers in the editor module can skip instrumentation
+    // without crossing the DLL boundary for every scoped timer or counter.  It is diagnostic
+    // state only; it never participates in density or mesh decisions.
+    VOXELFORGE_API extern std::atomic<bool> GEnabled;
+    VOXELFORGE_API extern std::atomic<EMode> GMode;
+    inline thread_local bool GSampledScopeActive = false;
 
     // Resident allocator-backed bytes for one worker's generation cache family.  The profiler
     // aggregates this by worker; the fields intentionally describe allocations owned by the
@@ -193,6 +226,44 @@ namespace VoxelDensityProfile
         uint32 ActiveWorkers[BucketCount]{};
         uint64 Counters[CounterCount]{};
 
+        // Classifier detail is sampled separately from the timer buckets.  Calls is the exact
+        // number of classifier invocations; the remaining fields are worker-local samples
+        // expanded at Snapshot() using Calls / SampledCalls.
+        struct FClassifierStats
+        {
+            uint64 Calls = 0;
+            uint64 SampledCalls = 0;
+            uint64 RefineNodes = 0;
+            uint64 StackBoxCalls = 0;
+            uint64 WholeMixedNodes = 0;
+            uint64 WholeSolidNodes = 0;
+            uint64 WholeAirNodes = 0;
+            uint64 NeedsFinalFieldNodes = 0;
+            uint64 SplitNodes = 0;
+            uint64 MaxRefinementDepth = 0;
+            uint64 ExactCoreSamples = 0;
+            uint64 ExactFinalSamples = 0;
+            uint64 ExactCoreCacheHits = 0;
+            uint64 ExactFinalCacheHits = 0;
+            uint64 ExactCoreLeaves = 0;
+            uint64 ExactFinalLeaves = 0;
+            uint64 StackBoxCycles = 0;
+            uint64 ExactCoreCycles = 0;
+            uint64 ExactFinalCycles = 0;
+            uint64 RoomTailQueries = 0;
+            uint64 RoomTailEvaluated = 0;
+            uint64 RoomTailCycles = 0;
+            uint64 RoomPropagateCycles = 0;
+            uint64 RoomExactPrimitiveCycles = 0;
+            uint64 RoomCacheWindowCycles = 0;
+            uint64 RoomNumRooms = 0;
+            uint64 RoomNumTunnels = 0;
+            uint64 RoomNumRoomFloorJoins = 0;
+            uint64 RoomNumPits = 0;
+            uint64 RoomNumChimneys = 0;
+        };
+        FClassifierStats Classifier;
+
         uint64 TimerPairCycles = 0;
         uint32 SampleInterval = DefaultSampleInterval;
         EMode Mode = EMode::Disabled;
@@ -225,9 +296,47 @@ namespace VoxelDensityProfile
 
     VOXELFORGE_API void SetEnabled(bool bEnabled);
     VOXELFORGE_API void SetMode(EMode Mode, uint32 SampleInterval = DefaultSampleInterval);
-    // Coarse counters are intentionally always collected, even when cycle timing is disabled.
-    // They are the low-cost diagnostic path; only cycle timing is opt-in.
-    FORCEINLINE bool AreCountersEnabled() { return true; }
+    // Counters are collected only while a diagnostic mode is enabled.  In the ordinary clean
+    // path this is a single relaxed load, so the measurement hooks stay dormant.
+    FORCEINLINE bool IsEnabledFast()
+    {
+        return GEnabled.load(std::memory_order_relaxed);
+    }
+    FORCEINLINE bool AreCountersEnabled() { return IsEnabledFast(); }
+    FORCEINLINE bool ShouldProbeScopeFast(EBucket Bucket)
+    {
+        const EMode Mode = GMode.load(std::memory_order_relaxed);
+        if (Mode == EMode::Full)
+        {
+            return true;
+        }
+        if (Mode == EMode::Sampled)
+        {
+            return Bucket == EBucket::GetDensityAt
+                || Bucket == EBucket::MesherGenerateMesh
+                || Bucket == EBucket::MesherDensityGrid
+                || Bucket == EBucket::MesherOther;
+        }
+        if (Mode == EMode::Attribution)
+        {
+            switch (Bucket)
+            {
+            case EBucket::GetDensityAt:
+            case EBucket::MesherGenerateMesh:
+            case EBucket::MesherDensityGrid:
+            case EBucket::MesherCellClassification:
+            case EBucket::MesherGradientNormals:
+            case EBucket::MesherVertexInterpolation:
+            case EBucket::MesherStreamBuilding:
+            case EBucket::MesherOther:
+            case EBucket::RoomGraphBuild:
+                return true;
+            default:
+                return GSampledScopeActive;
+            }
+        }
+        return false;
+    }
     VOXELFORGE_API bool IsEnabled();
     VOXELFORGE_API bool IsCycleTimingEnabled();
     VOXELFORGE_API EMode GetMode();
@@ -242,6 +351,8 @@ namespace VoxelDensityProfile
     VOXELFORGE_API void AddCounter(ECounter Counter, uint64 Amount = 1);
     VOXELFORGE_API void AddMeasurement(EBucket Bucket, uint64 Cycles, uint64 Calls = 1);
     VOXELFORGE_API void RecordCall(EBucket Bucket);
+    VOXELFORGE_API void RecordClassifierCall(bool bSampled);
+    VOXELFORGE_API void AddClassifierStats(const FSnapshot::FClassifierStats& Stats);
     VOXELFORGE_API bool ShouldSample(EBucket Bucket);
     VOXELFORGE_API void AddSampledMeasurement(EBucket Bucket, uint64 RawCycles);
 
@@ -279,15 +390,24 @@ namespace VoxelDensityProfile
     public:
         explicit FScopedTimer(EBucket InBucket)
             : Bucket(InBucket)
-            , Token(BeginScope(InBucket))
         {
+            if (IsEnabledFast() && ShouldProbeScopeFast(InBucket))
+            {
+                Token = BeginScope(InBucket);
+            }
         }
 
         explicit FScopedTimer(const TCHAR* InName)
             : Bucket(EBucket::OtherOp)
         {
-            Bucket = BucketFromName(InName);
-            Token = BeginScope(Bucket);
+            if (IsEnabledFast())
+            {
+                Bucket = BucketFromName(InName);
+                if (ShouldProbeScopeFast(Bucket))
+                {
+                    Token = BeginScope(Bucket);
+                }
+            }
         }
 
         ~FScopedTimer();
