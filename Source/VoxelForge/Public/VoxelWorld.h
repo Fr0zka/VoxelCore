@@ -33,6 +33,13 @@ class UMaterialInstanceDynamic;
 class FScopedGenerationPause;
 namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
+/** Per-request cancellation state. The game thread flips the flag when a pending tile leaves the
+ * desired set; workers only read it and return an aborted result through the normal MPSC queue. */
+struct FVoxelTileCancellationState
+{
+    std::atomic<bool> bObsolete{false};
+};
+
 /**
  * How a streaming anchor wants its tiles built (ARCHITECTURE §9.3). The local player is an implicit
  * FullVisual anchor (the clipmap). Extra anchors — AI, and later remote players — are registered so
@@ -89,14 +96,21 @@ struct FChunkResult
     // Null ⇒ no-surface tile (uniform all-air/all-solid or an empty content band; no component).
     TSharedPtr<RealtimeMesh::FRealtimeMeshStreamSet> Streams;
     uint32 Epoch = 0;         // Generation epoch — discard if stale
-    // Monotonic request timestamp used only for streaming telemetry. It is carried through the
-    // worker queue so the profile can report request-to-apply, not just worker generation time.
+    // Monotonic request timestamp used for the low-overhead streaming latency summary and the
+    // opt-in profile. It is carried through the worker queue so the report can separate scheduler
+    // wait from generation time.
     uint64 RequestStartCycles = 0;
     // Worker timing boundaries for separating scheduler wait from generation and result/apply wait.
-    // These are telemetry-only and remain zero when tile profiling is disabled.
+    // These are captured with low overhead for the clean streaming-latency summary; expensive
+    // per-tile profiling remains opt-in.
     uint64 GenerationStartCycles = 0;
-    uint64 GenerationEndCycles = 0; int32 ClassifyVerdict = -1; bool bClassifierCacheHit = false; bool bClassifierRegionHit = false; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
-    bool bAborted = false;    // Worker observed shutdown; never mark this tile loaded
+    uint64 GenerationEndCycles = 0;
+    uint64 ApplyStartCycles = 0;
+    int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
+    bool bAborted = false;    // Worker observed shutdown or cancellation; never mark this tile loaded
+    bool bObsolete = false;   // Worker observed per-tile desired-set cancellation
+    uint32 DesiredEpoch = 0;  // Desired-set epoch captured at request time
+    bool bRecordStreamingLatency = true;
     bool bEmpty = true;       // true ⇒ no surface (uniform all-air/all-solid or empty band); still loaded
     // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
     // column's CeilSurf; overhangs/cave roofs stay ground) and packs them as two contiguous runs
@@ -225,6 +239,12 @@ public:
         uint64 CollisionSubmittedCycles = 0;
         bool bBodyUpdatedEventSeen = false;
         uint64 BodyUpdatedEventCycles = 0;
+        // Game-thread-only timing copied from the generation result for the clean LOD0 summary.
+        uint64 RequestStartCycles = 0;
+        uint64 GenerationStartCycles = 0;
+        uint64 GenerationEndCycles = 0;
+        uint64 ApplyStartCycles = 0;
+        bool bRecordStreamingLatency = false;
     };
 
     /** One serialised completion record per tile. The serial prevents a late RMC future from
@@ -474,6 +494,14 @@ private:
     /** Apply the current TVP0..4 + level-0 volume texture to one MID (also used on MID creation). */
     void SetVolumeParamsOnMID(UMaterialInstanceDynamic* MID) const;
 
+    /** Explicitly opt-in headless streaming validation. This is a command-line-only harness path;
+     * normal gameplay never moves the pawn here. It supplies a repeatable moving session and lets
+     * -nullrhi request a graceful EndPlay so the clean latency summary is flushed. */
+    void ConfigureHeadlessStreamingTest();
+    void AdvanceHeadlessStreamingTest(FVector& InOutPlayerPosition,
+                                      FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void MaybeFinishHeadlessStreamingTest();
+
     // Packed shader params, recomputed each Tick. ALL meaningful data is in .xyz — a material Vector
     // Parameter only delivers float3 (RGB) into a Custom node (the alpha is dropped), so we never use .w.
     //   TVP0 = L0 WindowOrigin.xyz (world cm)   TVP1 = L0 OriginMod.xyz (cells)
@@ -647,7 +675,8 @@ public:
      *
      * @param CenterPosition - Usually the player's position
      */
-    void UpdateChunksAroundPosition(const FVector& CenterPosition);
+    void UpdateChunksAroundPosition(const FVector& CenterPosition, APawn* PlayerPawn,
+                                    const FVector& PlayerHeading);
 
     /**
      * Load a single chunk at the given coordinate.
@@ -673,7 +702,8 @@ public:
                             int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
                             bool bSheetTile, int32 SheetChunkZ,
                             int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
-                            FChunkResult& Result);
+                            FChunkResult& Result,
+                            const std::atomic<bool>* ObsoleteFlag = nullptr);
 
     /**
      * Game-thread apply for one gen result (shared by ProcessPendingChunks + SyncRemeshTile):
@@ -736,7 +766,10 @@ public:
     /** Build the clipmap desired-tile set (concentric shells) around the player tile.
      *  OutLeavers = les tuiles désirées au crossing PRÉCÉDENT qui ne le sont plus — les seuls
      *  candidats au cull (delta), au lieu de re-scanner TOUTES les tuiles chargées par crossing. */
-    void BuildDesiredTiles(const FIntVector& CenterChunkCoord, TArray<FVoxelTileKey>& OutLeavers);
+    void BuildDesiredTiles(const FIntVector& CenterChunkCoord, const FVector& PlayerPosition,
+                           APawn* PlayerPawn, const FVector& PlayerHeading,
+                           TArray<FVoxelTileKey>& OutLeavers);
+    void CancelObsoleteTileWork();
 
     /** True if a tile's world footprint is still within the outermost clip shell (so a
      *  not-desired loaded tile there is mid-LOD-transition and must wait for its replacement,
@@ -779,6 +812,10 @@ public:
     void BindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh);
     void UnbindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh);
     void HandleRealtimeMeshCollisionBodyUpdated(URealtimeMesh* Mesh, UBodySetup* BodySetup);
+    void RecordLOD0ReadySample(uint64 RequestStartCycles, uint64 GenerationStartCycles,
+                               uint64 GenerationEndCycles, uint64 ApplyStartCycles,
+                               uint64 ReadyCycles, uint64 CollisionSubmittedCycles);
+    void LogStreamingLatencySummary() const;
 
     // (GetLODForChunk / LODToStep / IsChunkInRange removed — dead since the clipmap
     //  streaming replaced the distance-LOD scheme; the level lives in FVoxelTileKey.)
@@ -793,6 +830,9 @@ public:
     // budget is exhausted and streaming stalls permanently. Mpsc guards the producer side.
     TQueue<FChunkResult, EQueueMode::Mpsc> ProcessQueue;
     TSet<FVoxelTileKey> PendingTiles;   // tiles with a gen task in flight
+    // Game-thread-owned map; workers retain the shared token and only read its atomic flag.
+    TMap<FVoxelTileKey, TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe>>
+        PendingTileCancellation;
 
     // STRATE CONTENT CUT (see UVoxelSettings::StrateContentCutMinLevel) — the player-strate
     // chunk-Z band coarse tiles are meshed to (MIN/MAX sentinels = no cut, e.g. in the gap).
@@ -830,10 +870,12 @@ public:
     // Number of async tasks currently running — EndPlay waits for this to reach 0
     std::atomic<int32> ActiveTaskCount{0};
 
-    FORCEINLINE bool ShouldAbortWork() const
+    FORCEINLINE bool ShouldAbortWork(const std::atomic<bool>* ObsoleteFlag = nullptr) const
     {
         return bShuttingDown.load(std::memory_order_relaxed)
-            || bGenerationPaused.load(std::memory_order_relaxed);
+            || bGenerationPaused.load(std::memory_order_relaxed)
+            || (ObsoleteFlag != nullptr
+                && ObsoleteFlag->load(std::memory_order_relaxed));
     }
 
     // Player's level-0 tile coord (= chunk coord). The desired set is rebuilt when this changes.
@@ -861,13 +903,40 @@ public:
     void ReconcileAnchorTileVisibility();
 
     // --- Streaming work-avoidance (perf) ---
-    // The desired tile set only changes when the player crosses a level-0 tile boundary.
-    // We cache it and only rebuild/cull/sort on a real move, and go idle once every desired
-    // tile is streamed in — so a stationary player costs ~nothing per frame.
+    // The desired tile set only changes when the player/anchor crosses a level-0 tile boundary or
+    // a rebuild is forced. We cache it and only rebuild/cull/sort then, and go idle once every
+    // desired tile is streamed in — so a stationary player costs ~nothing per frame.
     FIntVector LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bool bAllChunksLoaded = false;
     bool bStartupTraceDesiredRecorded = false;
-    TArray<FVoxelTileKey> DesiredSorted;   // desired tiles, nearest-first
+    TArray<FVoxelTileKey> DesiredSorted;   // critical floor prefix, then true-pawn distance-first
+    TArray<FVoxelTileKey> CriticalDesiredTiles; // occupied/support tile, then heading tile
+    uint32 DesiredEpoch = 0;               // increments whenever DesiredStamped is rebuilt
+    int32 ObsoleteTileAbortCount = 0;      // cumulative per-world moving-session cancellation count
+    float PeakObservedPawnSpeedCmPerSecond = 0.0f;
+
+    struct FStreamingLatencySample
+    {
+        double RequestToReadySeconds = 0.0;
+        double QueueWaitSeconds = 0.0;
+        double GenerationSeconds = 0.0;
+        double CollisionCookSeconds = 0.0;
+    };
+    TArray<FStreamingLatencySample> LOD0ReadySamples;
+
+    // Headless validation hook. These are intentionally non-UPROPERTY state and are enabled only
+    // by explicit command-line switches; they do not alter ordinary player movement or streaming.
+    bool bHeadlessStreamingTestMovement = false;
+    bool bHeadlessStreamingTestExitRequested = false;
+    int32 HeadlessStreamingTestMoveAttempts = 0;
+    double HeadlessStreamingTestDistanceCm = 0.0;
+    float HeadlessStreamingTestSpeedCmPerSecond = 0.0f;
+    float HeadlessStreamingTestStartSeconds = 0.0f;
+    float HeadlessStreamingTestExitSeconds = 0.0f;
+    FVector HeadlessStreamingTestDirection = FVector::XAxisVector;
+    FVector HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
+    double HeadlessStreamingTestBeginSeconds = 0.0;
+    double HeadlessStreamingTestLastElapsedSeconds = 0.0;
 
     // PLAYER COLLISION GATE — the pawn is allowed to enter/leave a tile only when the level-0
     // collision body covering its feet has completed the RMC cook. The movement component state is

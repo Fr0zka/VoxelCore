@@ -42,6 +42,7 @@
 #include "Misc/CommandLine.h"
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformMisc.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
 #if WITH_EDITOR
@@ -79,33 +80,6 @@ namespace
     bool GVoxelForgeStreamingBudgetReported = false;
     bool GVoxelForgeGenerationCapHitReported = false;
     int32 GVoxelForgeMaxPendingTilesObserved = 0;
-    bool GVoxelForgeTestStreamingCenterParsed = false;
-    bool GVoxelForgeUseTestStreamingCenter = false;
-    FIntVector GVoxelForgeTestStreamingCenter = FIntVector::ZeroValue;
-
-    void VF_ParseTestStreamingCenter()
-    {
-        if (GVoxelForgeTestStreamingCenterParsed) return;
-        GVoxelForgeTestStreamingCenterParsed = true;
-
-        int32 X = 0, Y = 0, Z = 0;
-        const TCHAR* CommandLine = FCommandLine::Get();
-        const bool bHaveX = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterX="), X);
-        const bool bHaveY = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterY="), Y);
-        const bool bHaveZ = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterZ="), Z);
-        if (!bHaveX || !bHaveY || !bHaveZ)
-        {
-            return;
-        }
-
-        GVoxelForgeTestStreamingCenter = FIntVector(X, Y, Z);
-        GVoxelForgeUseTestStreamingCenter = true;
-        UE_LOG(LogTemp, Display,
-            TEXT("[VoxelForge] diagnostic fixed streaming center: (%d,%d,%d)"),
-            GVoxelForgeTestStreamingCenter.X,
-            GVoxelForgeTestStreamingCenter.Y,
-            GVoxelForgeTestStreamingCenter.Z);
-    }
 }
 
 AVoxelWorld::AVoxelWorld()
@@ -473,8 +447,22 @@ void AVoxelWorld::RegenerateAllChunks()
     // Density volume: bump epoch (drop in-flight fills) + drop data → full refill next Tick.
     if (DensityVolume) { DensityVolume->Reset(); }
 
-    // Clear pending set — stale tasks will be discarded by the epoch check.
-    PendingTiles.Empty();
+    // Mark any still-running request obsolete. Keep its PendingTiles slot and token map until the
+    // worker/result drains; otherwise a late old result could remove the slot belonging to a new
+    // request for the same key. Live-edit callers normally arrive with generation paused (and no
+    // active tasks), in which case the stale queue can be discarded immediately.
+    for (TPair<FVoxelTileKey, TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe>>& Pair :
+         PendingTileCancellation)
+    {
+        if (Pair.Value) { Pair.Value->bObsolete.store(true, std::memory_order_release); }
+    }
+    if (ActiveTaskCount.load(std::memory_order_relaxed) == 0)
+    {
+        FChunkResult StaleResult;
+        while (ProcessQueue.Dequeue(StaleResult)) {}
+        PendingTiles.Empty();
+        PendingTileCancellation.Empty();
+    }
     // Tiles are already destroyed above — drop any deferred-teardown keys so the drain doesn't
     // try to UnloadTile coords that no longer exist.
     PendingUnload.Empty();
@@ -489,7 +477,9 @@ void AVoxelWorld::RegenerateAllChunks()
     LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bAllChunksLoaded = false;
     DesiredSorted.Reset();
+    CriticalDesiredTiles.Reset();
     DesiredStamped.Reset();
+    ++DesiredEpoch;
     TransitionHold.Reset();
     TransitionHoldQueue.Reset();
     TransitionHoldCursor = 0;
@@ -970,13 +960,17 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         }
         FPlatformProcess::Yield();  // Give CPU to other threads
     }
-    UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: workers drained in %.6fs"),
-        FPlatformTime::Seconds() - EndPlayStartSeconds);
-
     // Drain any queued results
     FChunkResult Discard;
-    while (ProcessQueue.Dequeue(Discard)) {}
+    while (ProcessQueue.Dequeue(Discard))
+    {
+        if (Discard.bObsolete) { ++ObsoleteTileAbortCount; }
+    }
+    UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: workers drained in %.6fs; obsolete_tile_aborts=%d"),
+        FPlatformTime::Seconds() - EndPlayStartSeconds, ObsoleteTileAbortCount);
+    LogStreamingLatencySummary();
     PendingTiles.Empty();
+    PendingTileCancellation.Empty();
     PendingUnload.Empty();
     DirtyRemeshQueue.Empty();
     BandRemeshQueue.Empty();
@@ -1034,6 +1028,10 @@ void AVoxelWorld::BeginPlay()
     VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("BeginPlay"));
     Super::BeginPlay();
     bShuttingDown.store(false, std::memory_order_relaxed);
+    LOD0ReadySamples.Reset();
+    ObsoleteTileAbortCount = 0;
+    PeakObservedPawnSpeedCmPerSecond = 0.0f;
+    ConfigureHeadlessStreamingTest();
 
     // Some headless harnesses load module CVars after the engine's startup-CVar pass. Read the
     // profiling switches explicitly as well, so a reported game profile cannot silently run with
@@ -1216,6 +1214,155 @@ void AVoxelWorld::BeginPlay()
     }
 }
 
+void AVoxelWorld::ConfigureHeadlessStreamingTest()
+{
+    bHeadlessStreamingTestMovement = false;
+    bHeadlessStreamingTestExitRequested = false;
+    HeadlessStreamingTestMoveAttempts = 0;
+    HeadlessStreamingTestDistanceCm = 0.0;
+    HeadlessStreamingTestSpeedCmPerSecond = 0.0f;
+    HeadlessStreamingTestStartSeconds = 0.0f;
+    HeadlessStreamingTestExitSeconds = 0.0f;
+    HeadlessStreamingTestDirection = FVector::XAxisVector;
+    HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
+    HeadlessStreamingTestBeginSeconds = 0.0;
+    HeadlessStreamingTestLastElapsedSeconds = 0.0;
+
+    const TCHAR* CommandLine = FCommandLine::Get();
+    int32 MoveValue = 0;
+    const bool bMoveRequested =
+        (FParse::Value(CommandLine, TEXT("voxel.TestMove="), MoveValue) && MoveValue != 0)
+        || FParse::Param(CommandLine, TEXT("voxel.TestMove"));
+    float Speed = 800.0f;
+    float StartSeconds = 20.0f;
+    float ExitSeconds = 0.0f;
+    FParse::Value(CommandLine, TEXT("voxel.TestMoveSpeedCmPerSecond="), Speed);
+    FParse::Value(CommandLine, TEXT("voxel.TestMoveStartSeconds="), StartSeconds);
+    FParse::Value(CommandLine, TEXT("voxel.TestExitSeconds="), ExitSeconds);
+
+    if (bMoveRequested)
+    {
+        FString DirectionText;
+        if (FParse::Value(CommandLine, TEXT("voxel.TestMoveDirection="), DirectionText))
+        {
+            TArray<FString> Components;
+            DirectionText.ParseIntoArray(Components, TEXT(","), true);
+            if (Components.Num() == 3)
+            {
+                HeadlessStreamingTestDirection = FVector(
+                    FCString::Atof(*Components[0]),
+                    FCString::Atof(*Components[1]),
+                    FCString::Atof(*Components[2]));
+            }
+        }
+        HeadlessStreamingTestDirection = HeadlessStreamingTestDirection.GetSafeNormal();
+        if (HeadlessStreamingTestDirection.IsNearlyZero())
+        {
+            HeadlessStreamingTestDirection = FVector::XAxisVector;
+        }
+        HeadlessStreamingTestSpeedCmPerSecond = FMath::Max(Speed, 0.0f);
+        HeadlessStreamingTestStartSeconds = FMath::Max(StartSeconds, 0.0f);
+        bHeadlessStreamingTestMovement = HeadlessStreamingTestSpeedCmPerSecond > 0.0f;
+    }
+
+    HeadlessStreamingTestExitSeconds = FMath::Max(ExitSeconds, 0.0f);
+    if (bHeadlessStreamingTestMovement || HeadlessStreamingTestExitSeconds > 0.0f)
+    {
+        HeadlessStreamingTestBeginSeconds = FPlatformTime::Seconds();
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStreamingTest] clean=1 movement=%d speed_cm_s=%.3f start_s=%.3f "
+                 "exit_s=%.3f direction=(%.3f,%.3f,%.3f)"),
+            bHeadlessStreamingTestMovement ? 1 : 0,
+            HeadlessStreamingTestSpeedCmPerSecond,
+            HeadlessStreamingTestStartSeconds,
+            HeadlessStreamingTestExitSeconds,
+            HeadlessStreamingTestDirection.X,
+            HeadlessStreamingTestDirection.Y,
+            HeadlessStreamingTestDirection.Z);
+    }
+}
+
+void AVoxelWorld::AdvanceHeadlessStreamingTest(
+    FVector& InOutPlayerPosition, FVector& InOutPlayerHeading, APawn* PlayerPawn)
+{
+    if (!bHeadlessStreamingTestMovement || !PlayerPawn || HeadlessStreamingTestBeginSeconds <= 0.0)
+    {
+        return;
+    }
+
+    const double ElapsedSeconds = FPlatformTime::Seconds() - HeadlessStreamingTestBeginSeconds;
+    if (ElapsedSeconds < static_cast<double>(HeadlessStreamingTestStartSeconds))
+    {
+        return;
+    }
+
+    // The headless game runs uncapped, so simulation DeltaTime is not a stable movement clock. Use
+    // wall time for this explicit harness path; both A/B runs then cover exactly the same distance
+    // regardless of how much work the scheduler is doing per frame.
+    const double PreviousElapsedSeconds = FMath::Max(
+        HeadlessStreamingTestLastElapsedSeconds,
+        static_cast<double>(HeadlessStreamingTestStartSeconds));
+    const double MoveSeconds = FMath::Max(0.0, ElapsedSeconds - PreviousElapsedSeconds);
+    HeadlessStreamingTestLastElapsedSeconds = ElapsedSeconds;
+    if (MoveSeconds <= 0.0)
+    {
+        return;
+    }
+
+    const FVector NewPosition = InOutPlayerPosition
+        + HeadlessStreamingTestDirection
+        * HeadlessStreamingTestSpeedCmPerSecond
+        * static_cast<float>(MoveSeconds);
+    const bool bMoved = PlayerPawn->SetActorLocation(
+        NewPosition, false, nullptr, ETeleportType::TeleportPhysics);
+    ++HeadlessStreamingTestMoveAttempts;
+    if (bMoved)
+    {
+        const FVector ActualPosition = PlayerPawn->GetActorLocation();
+        HeadlessStreamingTestDistanceCm += FVector::Dist(InOutPlayerPosition, ActualPosition);
+        HeadlessStreamingTestLastActualPosition = ActualPosition;
+        InOutPlayerPosition = ActualPosition;
+        InOutPlayerHeading = HeadlessStreamingTestDirection * HeadlessStreamingTestSpeedCmPerSecond;
+
+        // The explicit -nullrhi harness moves the pawn from this world's pre-physics tick. Keep
+        // the template character movement component from applying its own zero-input/gravity step
+        // afterward and undoing the synthetic teleport before the next scheduler observation.
+        if (ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
+            {
+                CharacterMovement->StopMovementImmediately();
+                CharacterMovement->SetMovementMode(MOVE_None);
+            }
+        }
+    }
+}
+
+void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
+{
+    if (bHeadlessStreamingTestExitRequested || HeadlessStreamingTestExitSeconds <= 0.0f
+        || HeadlessStreamingTestBeginSeconds <= 0.0)
+    {
+        return;
+    }
+
+    if (FPlatformTime::Seconds() - HeadlessStreamingTestBeginSeconds
+        < static_cast<double>(HeadlessStreamingTestExitSeconds))
+    {
+        return;
+    }
+
+    bHeadlessStreamingTestExitRequested = true;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeStreamingTest] complete; moves=%d distance_m=%.6f last_position=(%.1f,%.1f,%.1f); requesting graceful exit after clean session"),
+        HeadlessStreamingTestMoveAttempts,
+        HeadlessStreamingTestDistanceCm / 100.0,
+        HeadlessStreamingTestLastActualPosition.X,
+        HeadlessStreamingTestLastActualPosition.Y,
+        HeadlessStreamingTestLastActualPosition.Z);
+    FPlatformMisc::RequestExit(false, TEXT("VoxelForge headless streaming test complete"));
+}
+
 void AVoxelWorld::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
@@ -1225,8 +1372,15 @@ void AVoxelWorld::Tick(float DeltaTime)
     const bool bHasPlayer = TryGetPlayerPosition(PlayerLastPos, &PlayerPawn);
 
     if (bHasPlayer) {
+        // Capture velocity before the collision gate can deliberately zero it while the support
+        // tile is cooking. The scheduler uses this as the movement heading for its next-tile
+        // critical prefix; a stationary pawn falls back to actor forward in BuildDesiredTiles.
+        FVector PlayerHeading = PlayerPawn ? PlayerPawn->GetVelocity() : FVector::ZeroVector;
+        AdvanceHeadlessStreamingTest(PlayerLastPos, PlayerHeading, PlayerPawn);
+        PeakObservedPawnSpeedCmPerSecond = FMath::Max(
+            PeakObservedPawnSpeedCmPerSecond, PlayerHeading.Size2D());
         UpdatePawnCollisionGate(PlayerPawn, PlayerLastPos, DeltaTime);
-        UpdateChunksAroundPosition(PlayerLastPos);
+        UpdateChunksAroundPosition(PlayerLastPos, PlayerPawn, PlayerHeading);
         if (AtmosphereManager)
         {
             AtmosphereManager->UpdateForPlayer(PlayerLastPos);
@@ -1320,13 +1474,15 @@ void AVoxelWorld::Tick(float DeltaTime)
             Max.Z = FMath::Max(Max.Z, Key.Coord.Z);
         }
         VoxelForgeStartupTrace::RecordEvent(TEXT("steady_state"), FString::Printf(
-            TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"collision_ready_tiles\":%d,"
-                 "\"collision_not_required_tiles\":%d,\"pending_collision_cooks\":%d,"
-                 "\"pawn_collision_gate_engaged\":%d,"
+             TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"collision_ready_tiles\":%d,"
+                  "\"collision_not_required_tiles\":%d,\"pending_collision_cooks\":%d,"
+                  "\"pawn_collision_gate_engaged\":%d,"
+                  "\"obsolete_tile_aborts\":%d,\"desired_epoch\":%u,"
                  "\"pending_tiles\":%d,\"pending_unload\":%d,\"generation_epoch\":%u"),
             DesiredSorted.Num(), LoadedTiles.Num(), CollisionReadyTiles.Num(),
             CollisionNotRequiredTiles.Num(), PendingCollisionCooks.Num(),
             bPawnCollisionGateEngaged ? 1 : 0,
+            ObsoleteTileAbortCount, DesiredEpoch,
             PendingTiles.Num(), PendingUnload.Num(), GenerationEpoch));
         TArray<int32> SteadyLevels;
         SteadyLevelCounts.GetKeys(SteadyLevels);
@@ -1376,6 +1532,7 @@ void AVoxelWorld::Tick(float DeltaTime)
             GVoxelForgePendingModificationStrength);
     }
     ProcessUnloadQueue();
+    MaybeFinishHeadlessStreamingTest();
 
 #if ENABLE_DRAW_DEBUG
     // Density-volume overlay (step 1a): cyan boxes for solid level-0 cells near the player.
@@ -1856,6 +2013,95 @@ void AVoxelWorld::HandleRealtimeMeshCollisionBodyUpdated(URealtimeMesh* Mesh, UB
     }
 }
 
+void AVoxelWorld::RecordLOD0ReadySample(
+    uint64 RequestStartCycles, uint64 GenerationStartCycles, uint64 GenerationEndCycles,
+    uint64 ApplyStartCycles, uint64 ReadyCycles, uint64 CollisionSubmittedCycles)
+{
+    if (RequestStartCycles == 0 || ReadyCycles < RequestStartCycles)
+    {
+        return;
+    }
+
+    const auto SecondsBetween = [](uint64 Later, uint64 Earlier) -> double
+    {
+        return Later >= Earlier ? FPlatformTime::ToSeconds64(Later - Earlier) : 0.0;
+    };
+
+    FStreamingLatencySample Sample;
+    Sample.RequestToReadySeconds = SecondsBetween(ReadyCycles, RequestStartCycles);
+    Sample.GenerationSeconds = (GenerationStartCycles != 0 && GenerationEndCycles >= GenerationStartCycles)
+        ? SecondsBetween(GenerationEndCycles, GenerationStartCycles) : 0.0;
+
+    // Queue wait is deliberately only the time before generation plus the result wait before the
+    // game-thread apply. Mesh upload and the RMC collision cook stay in request-to-ready but are not
+    // mislabeled as scheduler time.
+    const double WorkerQueueSeconds = GenerationStartCycles != 0
+        ? SecondsBetween(GenerationStartCycles, RequestStartCycles) : 0.0;
+    const double ResultQueueSeconds = GenerationEndCycles != 0 && ApplyStartCycles != 0
+        ? SecondsBetween(ApplyStartCycles, GenerationEndCycles)
+        : (GenerationStartCycles == 0 ? SecondsBetween(ApplyStartCycles, RequestStartCycles) : 0.0);
+    Sample.QueueWaitSeconds = WorkerQueueSeconds + ResultQueueSeconds;
+    Sample.CollisionCookSeconds = CollisionSubmittedCycles != 0
+        ? SecondsBetween(ReadyCycles, CollisionSubmittedCycles) : 0.0;
+    LOD0ReadySamples.Add(Sample);
+}
+
+void AVoxelWorld::LogStreamingLatencySummary() const
+{
+    TArray<double> RequestToReady;
+    TArray<double> QueueWait;
+    TArray<double> Generation;
+    TArray<double> CollisionCook;
+    RequestToReady.Reserve(LOD0ReadySamples.Num());
+    QueueWait.Reserve(LOD0ReadySamples.Num());
+    Generation.Reserve(LOD0ReadySamples.Num());
+    CollisionCook.Reserve(LOD0ReadySamples.Num());
+    for (const FStreamingLatencySample& Sample : LOD0ReadySamples)
+    {
+        RequestToReady.Add(Sample.RequestToReadySeconds);
+        QueueWait.Add(Sample.QueueWaitSeconds);
+        Generation.Add(Sample.GenerationSeconds);
+        CollisionCook.Add(Sample.CollisionCookSeconds);
+    }
+
+    const auto Percentile = [](TArray<double> Values, double Fraction) -> double
+    {
+        if (Values.Num() == 0) return 0.0;
+        Values.Sort();
+        const int32 Index = FMath::Clamp(
+            FMath::CeilToInt(Fraction * static_cast<double>(Values.Num() - 1)),
+            0, Values.Num() - 1);
+        return Values[Index];
+    };
+    const auto Maximum = [](const TArray<double>& Values) -> double
+    {
+        double Result = 0.0;
+        for (const double Value : Values) { Result = FMath::Max(Result, Value); }
+        return Result;
+    };
+
+    const double RequestP95 = Percentile(RequestToReady, 0.95);
+    const double TravelP95Metres = RequestP95
+        * static_cast<double>(PeakObservedPawnSpeedCmPerSecond) / 100.0;
+    const bool bDiagnosticsEnabled = GVoxelForgeProfileTileGeneration != 0
+        || VoxelForgeStartupTrace::IsActive();
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeStreamingLatency] mode=%s diagnostics=%s lod0_ready_samples=%d "
+             "request_to_ready_s[p50=%.6f p95=%.6f max=%.6f] "
+             "queue_wait_s[p50=%.6f p95=%.6f max=%.6f] "
+             "generation_s[p50=%.6f p95=%.6f max=%.6f] "
+             "collision_cook_s[p50=%.6f p95=%.6f max=%.6f] "
+             "peak_speed_cm_s=%.3f p95_travel_m=%.6f obsolete_tile_aborts=%d"),
+        bDiagnosticsEnabled ? TEXT("profiled") : TEXT("clean"),
+        bDiagnosticsEnabled ? TEXT("on") : TEXT("off"),
+        LOD0ReadySamples.Num(),
+        Percentile(RequestToReady, 0.50), RequestP95, Maximum(RequestToReady),
+        Percentile(QueueWait, 0.50), Percentile(QueueWait, 0.95), Maximum(QueueWait),
+        Percentile(Generation, 0.50), Percentile(Generation, 0.95), Maximum(Generation),
+        Percentile(CollisionCook, 0.50), Percentile(CollisionCook, 0.95), Maximum(CollisionCook),
+        PeakObservedPawnSpeedCmPerSecond, TravelP95Metres, ObsoleteTileAbortCount);
+}
+
 void AVoxelWorld::HandleTileCollisionCookComplete(
     const FVoxelTileKey& Tile, uint64 SubmissionId, URealtimeMesh* Mesh, uint8 Result)
 {
@@ -1893,6 +2139,11 @@ void AVoxelWorld::HandleTileCollisionCookComplete(
     const uint64 MeasuredCollisionSubmittedCycles = Pending->CollisionSubmittedCycles;
     const bool bBodyUpdatedEventSeen = Pending->bBodyUpdatedEventSeen;
     const uint64 BodyUpdatedEventCycles = Pending->BodyUpdatedEventCycles;
+    const uint64 MeasuredRequestStartCycles = Pending->RequestStartCycles;
+    const uint64 MeasuredGenerationStartCycles = Pending->GenerationStartCycles;
+    const uint64 MeasuredGenerationEndCycles = Pending->GenerationEndCycles;
+    const uint64 MeasuredApplyStartCycles = Pending->ApplyStartCycles;
+    const bool bRecordStreamingLatency = Pending->bRecordStreamingLatency;
     PendingCollisionCooks.Remove(Tile);
 
     const ERealtimeMeshCollisionUpdateResult CollisionResult =
@@ -1913,6 +2164,12 @@ void AVoxelWorld::HandleTileCollisionCookComplete(
     }
 
     const uint64 ReadyCycles = FPlatformTime::Cycles64();
+    if (bBodyInstalled && Tile.Level == 0 && bRecordStreamingLatency)
+    {
+        RecordLOD0ReadySample(MeasuredRequestStartCycles, MeasuredGenerationStartCycles,
+                              MeasuredGenerationEndCycles, MeasuredApplyStartCycles,
+                              ReadyCycles, MeasuredCollisionSubmittedCycles);
+    }
     const double MeshToCookSeconds = FPlatformTime::ToSeconds64(
         ReadyCycles - MeasuredMeshSubmittedCycles);
     const double CollisionRequestToCookSeconds = FPlatformTime::ToSeconds64(
@@ -2008,12 +2265,25 @@ void AVoxelWorld::ProcessPendingChunks()
     while (ProcessQueue.Dequeue(DequeuedChunk))
     {
         ++ResultsDrained;
+        const TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe> Cancellation =
+            PendingTileCancellation.FindRef(DequeuedChunk.Tile);
+        const bool bRequestObsolete = DequeuedChunk.bObsolete
+            || (Cancellation.IsValid()
+                && Cancellation->bObsolete.load(std::memory_order_acquire));
+        PendingTileCancellation.Remove(DequeuedChunk.Tile);
         PendingTiles.Remove(DequeuedChunk.Tile);
 
         // A worker can observe shutdown after entering the mesher. Do not turn that partial
         // result into an all-air tile: it must remain eligible for a future generation epoch.
-        if (DequeuedChunk.bAborted)
+        // Read the token here as well as on the worker: cancellation can race the final worker
+        // check after it has already enqueued a complete result. This also drops a stale result
+        // if the tile leaves and re-enters the desired set before the queue is drained.
+        if (DequeuedChunk.bAborted || bRequestObsolete)
         {
+            if (bRequestObsolete)
+            {
+                ++ObsoleteTileAbortCount;
+            }
             continue;
         }
 
@@ -2059,8 +2329,11 @@ void AVoxelWorld::ProcessPendingChunks()
 // SyncRemeshTile (synchronous carve). Returns true iff a visible mesh was uploaded (budget).
 bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
 {
-    // Discard results from a previous generation epoch (stale).
-    if (Result.bAborted || Result.Epoch != GenerationEpoch)
+    // Discard results from a previous generation epoch (stale), or for a tile that has since left
+    // the desired set. ProcessPendingChunks also reads the per-request token before removing it,
+    // closing the race where the worker enqueues just after CancelObsoleteTileWork flips the flag.
+    if (Result.bAborted || Result.Epoch != GenerationEpoch
+        || !IsDesired(Result.Tile))
     {
         return false;
     }
@@ -2070,9 +2343,8 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
     // in HandleTileCollisionCookComplete.
     const bool bResultEmpty = Result.bEmpty || !Result.Streams;
     const bool bTraceTile = VoxelForgeStartupTrace::IsActive();
-    const bool bTelemetry = GVoxelForgeProfileTileGeneration != 0 || bTraceTile;
-    const uint64 ApplyStartCycles = bTelemetry
-        ? FPlatformTime::Cycles64() : 0;
+    const uint64 ApplyStartCycles = FPlatformTime::Cycles64();
+    Result.ApplyStartCycles = ApplyStartCycles;
     const auto LogTileApplied = [&]()
     {
         if ((GVoxelForgeProfileTileGeneration != 0 || bTraceTile)
@@ -2112,8 +2384,6 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 Sample.Level = Result.Tile.Level;
                 Sample.Verdict = Result.ClassifyVerdict;
                 Sample.bEmpty = bResultEmpty;
-                Sample.bCacheHit = Result.bClassifierCacheHit;
-                Sample.bRegionHit = Result.bClassifierRegionHit;
                 Sample.Triangles = Result.NumTriangles;
                 Sample.RequestToApplySeconds = RequestToApply;
                 Sample.WorkerQueueSeconds = WorkerQueueSeconds;
@@ -2179,11 +2449,13 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
         }
         LoadedTiles.Add(Result.Tile);
-        // Une tuile en vol n'est JAMAIS annulée : si le desired set a bougé pendant sa gen, elle
-        // arrive ici hors desired — le delta cull ne re-scanne plus tout, donc on l'inscrit en
-        // TransitionHold pour qu'elle soit re-considérée au prochain crossing (ou au settled cull).
-        if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
         LogTileApplied();
+        if (Result.Tile.Level == 0 && Result.bRecordStreamingLatency)
+        {
+            RecordLOD0ReadySample(Result.RequestStartCycles, Result.GenerationStartCycles,
+                                   Result.GenerationEndCycles, Result.ApplyStartCycles,
+                                   FPlatformTime::Cycles64(), 0);
+        }
         return false;
     }
 
@@ -2204,7 +2476,6 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
     LoadedTiles.Add(Result.Tile);
-    if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
     LogTileApplied();
     return true;
 }
@@ -2238,6 +2509,8 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     }
 
     FChunkResult Result;
+    Result.DesiredEpoch = DesiredEpoch;
+    Result.bRecordStreamingLatency = false;
     Result.RequestStartCycles = bProfileModification
         ? FPlatformTime::Cycles64() : 0;
     const uint64 GenerateStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
@@ -2245,7 +2518,7 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
                        BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                        /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
-                       /*Hole*/ 0, 0, 0, 0, Result);   // hole unused (not a sheet tile)
+                        /*Hole*/ 0, 0, 0, 0, Result, nullptr);   // hole unused (not a sheet tile)
     Result.GenerationEndCycles = GenerateStartCycles != 0
         ? FPlatformTime::Cycles64() : 0;
 
@@ -2335,13 +2608,17 @@ static FORCEINLINE void VF_OuterShell(const UVoxelSettings* Settings, int32 R, i
     }
 }
 
-void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, TArray<FVoxelTileKey>& OutLeavers)
+void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& PlayerPosition,
+                                    APawn* PlayerPawn, const FVector& PlayerHeading,
+                                    TArray<FVoxelTileKey>& OutLeavers)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_BuildDesiredTiles);
     DesiredSorted.Reset();
+    CriticalDesiredTiles.Reset();
     OutLeavers.Reset();
     CollisionOnlyTiles.Reset();   // §9.4 — rebuilt by AddAnchorDesiredTiles below
     ++DesiredStamp;   // les upserts ci-dessous marquent le crossing courant
+    ++DesiredEpoch;
 
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
     const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
@@ -2487,14 +2764,110 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, TArray<FVoxelTileK
         }
     }
 
-    // Nearest-first (by tile-centre distance to the player), so the closest tiles stream first.
-    const FVector PlayerVoxel = (FVector(Center) + FVector(0.5f, 0.5f, 0.5f)) * (float)CHUNK_SIZE;
+    // Cancel work that no longer belongs to this desired set before scheduling replacements. A
+    // worker owns no mutable world state; it only observes its request token in GenerateTileResult.
+    CancelObsoleteTileWork();
+
+    // Nearest-first (by tile-centre distance to the TRUE pawn position), so a large tile's
+    // artificial chunk-centre approximation cannot put work behind the player. The explicit key
+    // tie-break keeps equal-distance ordering deterministic across runs.
+    const FVector PlayerVoxel = WorldToLocalCm(PlayerPosition) / VOXEL_SIZE;
     DesiredSorted.Sort([&PlayerVoxel](const FVoxelTileKey& A, const FVoxelTileKey& B)
     {
         const FVector CA = A.CenterCm() / VOXEL_SIZE;
         const FVector CB = B.CenterCm() / VOXEL_SIZE;
-        return FVector::DistSquared(CA, PlayerVoxel) < FVector::DistSquared(CB, PlayerVoxel);
+        const float DA = FVector::DistSquared(CA, PlayerVoxel);
+        const float DB = FVector::DistSquared(CB, PlayerVoxel);
+        if (DA != DB) { return DA < DB; }
+        if (A.Level != B.Level) { return A.Level < B.Level; }
+        if (A.Coord.X != B.Coord.X) { return A.Coord.X < B.Coord.X; }
+        if (A.Coord.Y != B.Coord.Y) { return A.Coord.Y < B.Coord.Y; }
+        return A.Coord.Z < B.Coord.Z;
     });
+
+    // Absolute floor priority. The support tile is the level-0 tile under the pawn's feet — the
+    // one that can catch a falling pawn — followed by the adjacent tile in the dominant movement
+    // direction. Keep the actor-centre tile as a fallback for capsule/offset edge cases. Only keys
+    // in the current desired set are promoted, so this never expands the streaming footprint.
+    const FVoxelTileKey PlayerTile(
+        WorldToChunkCoord(WorldToLocalCm(PlayerPosition)), 0);
+    FVoxelTileKey OccupiedTile = PlayerTile;
+    FVoxelTileKey SupportTile;
+    if (GetPlayerSupportTile(PlayerPawn, PlayerPosition, SupportTile))
+    {
+        OccupiedTile = SupportTile;
+    }
+
+    auto AddCriticalTile = [this](const FVoxelTileKey& Key)
+    {
+        if (IsDesired(Key) && !CriticalDesiredTiles.Contains(Key))
+        {
+            CriticalDesiredTiles.Add(Key);
+        }
+    };
+    AddCriticalTile(OccupiedTile);
+
+    FVector Heading = PlayerHeading;
+    if (Heading.IsNearlyZero() && IsValid(PlayerPawn))
+    {
+        Heading = PlayerPawn->GetActorForwardVector();
+    }
+    Heading = GetActorTransform().InverseTransformVectorNoScale(Heading);
+    const float AbsX = FMath::Abs(Heading.X);
+    const float AbsY = FMath::Abs(Heading.Y);
+    const float AbsZ = FMath::Abs(Heading.Z);
+    FIntVector HeadingStep = FIntVector::ZeroValue;
+    if (AbsX > KINDA_SMALL_NUMBER || AbsY > KINDA_SMALL_NUMBER || AbsZ > KINDA_SMALL_NUMBER)
+    {
+        if (AbsX >= AbsY && AbsX >= AbsZ)
+        {
+            HeadingStep.X = Heading.X >= 0.0f ? 1 : -1;
+        }
+        else if (AbsY >= AbsZ)
+        {
+            HeadingStep.Y = Heading.Y >= 0.0f ? 1 : -1;
+        }
+        else
+        {
+            HeadingStep.Z = Heading.Z >= 0.0f ? 1 : -1;
+        }
+    }
+    if (HeadingStep != FIntVector::ZeroValue)
+    {
+        FVoxelTileKey NextTile = OccupiedTile;
+        NextTile.Coord += HeadingStep;
+        AddCriticalTile(NextTile);
+    }
+    AddCriticalTile(PlayerTile);
+
+    // Insert in reverse so CriticalDesiredTiles[0] remains the occupied floor, [1] the heading
+    // tile, and all ordinary distance-sorted work follows both.
+    for (int32 Index = CriticalDesiredTiles.Num() - 1; Index >= 0; --Index)
+    {
+        const int32 ExistingIndex = DesiredSorted.Find(CriticalDesiredTiles[Index]);
+        if (ExistingIndex > 0)
+        {
+            const FVoxelTileKey Key = DesiredSorted[ExistingIndex];
+            DesiredSorted.RemoveAt(ExistingIndex, 1, EAllowShrinking::No);
+            DesiredSorted.Insert(Key, 0);
+        }
+    }
+}
+
+void AVoxelWorld::CancelObsoleteTileWork()
+{
+    for (const FVoxelTileKey& Tile : PendingTiles)
+    {
+        if (IsDesired(Tile))
+        {
+            continue;
+        }
+        if (TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe>* Cancellation =
+                PendingTileCancellation.Find(Tile))
+        {
+            (*Cancellation)->bObsolete.store(true, std::memory_order_release);
+        }
+    }
 }
 
 // Fold every registered anchor's small level-0 box into the current desired set (§9.3). Runs inside
@@ -2648,10 +3021,10 @@ int32 AVoxelWorld::GetMaxConcurrentTasks() const
     return FMath::Clamp(Asset, 1, CoreCap);
 }
 
-void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
+void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APawn* PlayerPawn,
+                                             const FVector& PlayerHeading)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
-    VF_ParseTestStreamingCenter();
     const int32 MaxTasks = GetMaxConcurrentTasks();
     if (GVoxelForgeProfileTileGeneration != 0
         && !GVoxelForgeStreamingBudgetReported)
@@ -2676,11 +3049,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         GVoxelForgeStreamingBudgetReported = true;
     }
 
-    FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
-    if (GVoxelForgeUseTestStreamingCenter)
-    {
-        CenterChunk = GVoxelForgeTestStreamingCenter;
-    }
+    const FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(CenterPosition));  // player's level-0 tile
     CurrentCenterChunk = CenterChunk;
 
     // Streaming anchors (AI / remote players, §9.3): prune dead ones + detect chunk crossings so the
@@ -2714,12 +3083,11 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         bAllChunksLoaded = false;
         bForceDesiredRebuild = false;   // consumed
 
-        // DELTA CULL: BuildDesiredTiles renvoie les LEAVERS (désirées au crossing précédent, plus
-        // maintenant). Seuls candidats au cull : ces leavers + la TransitionHold (retenues des
-        // crossings passés). Fini le re-scan de TOUTES les tuiles chargées à chaque crossing —
-        // c'était le spike CullTiles ~1.6 ms/crossing (trace 2026-07-05). Les tuiles en vol qui
-        // finissent hors desired sont capturées à l'apply (ProcessPendingChunks → TransitionHold),
-        // et le settled cull (tout chargé) reste le filet de sécurité plein-scan.
+        // DELTA CULL: BuildDesiredTiles returns the LEAVERS (desired on the previous crossing, but
+        // not now). Only those leavers + TransitionHold (retained across prior crossings) enter
+        // the cull. Pending work that leaves desired is marked obsolete before replacement submit;
+        // its aborted result is drained and dropped, while the settled cull remains the full-scan
+        // safety net.
         TArray<FVoxelTileKey> Leavers;
         const bool bTraceFirstDesired = VoxelForgeStartupTrace::IsActive()
             && !bStartupTraceDesiredRecorded;
@@ -2727,7 +3095,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         {
             VoxelForgeStartupTrace::StageBegin(TEXT("BuildDesiredTiles.first"));
         }
-        BuildDesiredTiles(CenterChunk, Leavers);
+        BuildDesiredTiles(CenterChunk, CenterPosition, PlayerPawn, PlayerHeading, Leavers);
         if (bTraceFirstDesired)
         {
             VoxelForgeStartupTrace::StageEnd(TEXT("BuildDesiredTiles.first"));
@@ -2992,7 +3360,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
     }
 
     //=========================================================================
-    // Submit pending work (budgeted, nearest-first). Once everything desired is loaded,
+    // Submit pending work (budgeted, critical floor prefix then nearest-first). Once everything desired is loaded,
     // do the "settled" cull of the deferred LOD-transition tiles, then go idle.
     //=========================================================================
     if (!bAllChunksLoaded)
@@ -3000,14 +3368,25 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_SubmitTiles);
         int32 Submitted = 0;
 
-        // DIG RESPONSIVENESS — drain player-carve re-meshes FIRST (ahead of streaming + band) at
-        // BackgroundHigh, so a dig gets the task budget before any streaming gen. A tile that's still
-        // in flight is KEPT queued (retried next frame) so its stale pre-carve result is corrected.
+        // FLOOR RESPONSIVENESS — the occupied support tile and the next tile along the pawn heading
+        // are an absolute prefix, ahead of dirty remeshes, band work, and ordinary clipmap work.
+        // They run at BackgroundHigh so the pawn's floor gets the first available worker.
+        for (const FVoxelTileKey& T : CriticalDesiredTiles)
+        {
+            if (PendingTiles.Num() >= MaxTasks) break;
+            if (PendingTiles.Contains(T) || LoadedTiles.Contains(T)) continue;
+            LoadTile(T, /*bHighPriority*/ true);
+            ++Submitted;
+        }
+
+        // DIG RESPONSIVENESS — drain player-carve re-meshes next at BackgroundHigh. A tile that's
+        // still in flight is KEPT queued (retried next frame) so its stale pre-carve result is corrected.
         for (auto It = DirtyRemeshQueue.CreateIterator(); It; ++It)
         {
             if (PendingTiles.Num() >= MaxTasks) break;
             const FVoxelTileKey T = *It;
             if (!LoadedTiles.Contains(T)) { It.RemoveCurrent(); continue; }  // unloaded — drop
+            if (!IsDesired(T)) { It.RemoveCurrent(); continue; }             // obsolete — drop
             if (PendingTiles.Contains(T)) { continue; }                     // in flight — retry after it lands
             It.RemoveCurrent();
             LoadTile(T, /*bHighPriority*/ true);
@@ -3030,7 +3409,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition)
             if (PendingTiles.Num() >= MaxTasks) break;
             const FVoxelTileKey T = *It;
             It.RemoveCurrent();
-            if (PendingTiles.Contains(T) || !LoadedTiles.Contains(T)) continue;
+            if (!IsDesired(T) || PendingTiles.Contains(T) || !LoadedTiles.Contains(T)) continue;
             LoadTile(T);
             ++Submitted;
         }
@@ -3087,10 +3466,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         return;  // Budget full — wait for a task to finish.
     }
     PendingTiles.Add(Tile);
-    const bool bTelemetry = GVoxelForgeProfileTileGeneration != 0
-        || VoxelForgeStartupTrace::IsActive();
-    const uint64 RequestStartCycles = bTelemetry
-        ? FPlatformTime::Cycles64() : 0;
+    const uint64 RequestStartCycles = FPlatformTime::Cycles64();
 
     const FIntVector OriginVoxels = Tile.OriginVoxels();   // min corner, voxel coords
 
@@ -3118,6 +3494,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     }
     const int32 Step    = FMath::Max(1, Extent / Cells);
     const uint32 TaskEpoch = GenerationEpoch;
+    const uint32 TaskDesiredEpoch = DesiredEpoch;
 
     // CAPTURE-DURING-MESHING: only level-0 full-res tiles map 1:1 onto a density-clipmap level
     // (Step == 1<<Level, Cells == CHUNK_SIZE). When the density volume is active, ask the mesher to
@@ -3144,6 +3521,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             FChunkResult Empty;
             Empty.Tile  = Tile;
             Empty.Epoch = TaskEpoch;
+            Empty.DesiredEpoch = TaskDesiredEpoch;
             Empty.RequestStartCycles = RequestStartCycles;
             ProcessQueue.Enqueue(MoveTemp(Empty));
             return;
@@ -3174,6 +3552,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             FChunkResult Empty;
             Empty.Tile        = Tile;
             Empty.Epoch       = TaskEpoch;
+            Empty.DesiredEpoch = TaskDesiredEpoch;
             Empty.RequestStartCycles = RequestStartCycles;
             Empty.BandChunkLo = BandChunkLo;
             Empty.BandChunkHi = BandChunkHi;
@@ -3182,22 +3561,25 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         }
     }
 
+    const TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe> Cancellation =
+        MakeShared<FVoxelTileCancellationState, ESPMode::ThreadSafe>();
+    PendingTileCancellation.Add(Tile, Cancellation);
     ActiveTaskCount.fetch_add(1, std::memory_order_relaxed);
 
     // BackgroundNormal priority: gen runs on background workers that YIELD to foreground
     // (game/render-thread) tasks. Without this, raising MaxConcurrentTasks past the spare
     // core count saturates the scheduler and starves the frame (the "over 12 = lag" symptom).
     // At background priority the frame keeps its cores; gen just fills in around it.
-    // DIG RESPONSIVENESS: player carves launch at BackgroundHigh (bHighPriority) — still a background
-    // worker (yields to the frame, keeps the invariant) but jumps AHEAD of all pending streaming gen,
-    // so a dig is never queued behind a shell of streaming tasks.
+    // FLOOR/DIG RESPONSIVENESS: critical support requests and player carves launch at BackgroundHigh
+    // (bHighPriority) — still a background worker (yields to the frame, keeps the invariant) but
+    // jumps AHEAD of ordinary pending streaming gen.
     const UE::Tasks::ETaskPriority TaskPriority = bHighPriority
         ? UE::Tasks::ETaskPriority::BackgroundHigh
         : UE::Tasks::ETaskPriority::BackgroundNormal;
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
-                                         BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                                         bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
-                                         RequestStartCycles, bTelemetry]()
+                                          BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
+                                          bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
+                                          RequestStartCycles, TaskDesiredEpoch, Cancellation]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -3206,18 +3588,50 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             ~FTaskGuard() { Counter.fetch_sub(1, std::memory_order_relaxed); }
         } Guard{ActiveTaskCount};
 
+        auto EnqueueObsoleteResult = [&]()
+        {
+            if (bShuttingDown.load(std::memory_order_relaxed)
+                || bGenerationPaused.load(std::memory_order_relaxed))
+            {
+                return;
+            }
+            FChunkResult Canceled;
+            Canceled.Tile = Tile;
+            Canceled.Epoch = TaskEpoch;
+            Canceled.DesiredEpoch = TaskDesiredEpoch;
+            Canceled.RequestStartCycles = RequestStartCycles;
+            Canceled.bAborted = true;
+            Canceled.bObsolete = true;
+            ProcessQueue.Enqueue(MoveTemp(Canceled));
+        };
+
         if (ShouldAbortWork()) return;
+        if (Cancellation->bObsolete.load(std::memory_order_relaxed))
+        {
+            EnqueueObsoleteResult();
+            return;
+        }
 
         FChunkResult Result;
-        const uint64 GenerationStartCycles = bTelemetry
-            ? FPlatformTime::Cycles64() : 0;
+        Result.DesiredEpoch = TaskDesiredEpoch;
+        const uint64 GenerationStartCycles = FPlatformTime::Cycles64();
         Result.GenerationStartCycles = GenerationStartCycles;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                            BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY, Result);
+                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
+                           Result, &Cancellation->bObsolete);
         Result.GenerationEndCycles = GenerationStartCycles != 0
             ? FPlatformTime::Cycles64() : 0;
         Result.RequestStartCycles = RequestStartCycles;
+
+        if (Cancellation->bObsolete.load(std::memory_order_relaxed) || Result.bAborted)
+        {
+            if (!ShouldAbortWork())
+            {
+                EnqueueObsoleteResult();
+            }
+            return;
+        }
 
         if (!ShouldAbortWork())
         {
@@ -3229,11 +3643,12 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
 // Worker-side gen for one tile (shared by the async ChunkGen task and the synchronous carve path).
 // READS Generator/Mesher only — safe on a worker or the game thread. Fills Result; no enqueue.
 void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
-                                     int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
-                                     int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
-                                     bool bSheetTile, int32 SheetChunkZ,
-                                     int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
-                                     FChunkResult& Result)
+                                      int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
+                                      int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
+                                      bool bSheetTile, int32 SheetChunkZ,
+                                      int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
+                                      FChunkResult& Result,
+                                      const std::atomic<bool>* ObsoleteFlag)
 {
     const bool bLogTileProfile = GVoxelForgeProfileTileGeneration != 0;
     const bool bMeasureTile = bLogTileProfile || VoxelForgeStartupTrace::IsActive();
@@ -3346,10 +3761,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     Result.Tile  = Tile;
     Result.Epoch = Epoch;
     Result.bAborted = false;
+    Result.bObsolete = false;
     Result.bEmpty = true;
     Result.ClassifyVerdict = -1;
-    Result.bClassifierCacheHit = false;
-    Result.bClassifierRegionHit = false;
     Result.ClassifySeconds = 0.0;
     Result.MeshSeconds = 0.0;
     Result.StreamSeconds = 0.0;
@@ -3364,11 +3778,13 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     auto AbortResult = [&]()
     {
         Result.bAborted = true;
+        Result.bObsolete = ObsoleteFlag != nullptr
+            && ObsoleteFlag->load(std::memory_order_relaxed);
         Result.bEmpty = true;
         Result.Streams.Reset();
         Result.CaptureGrid.Reset();
     };
-    if (ShouldAbortWork())
+    if (ShouldAbortWork(ObsoleteFlag))
     {
         AbortResult();
         EmitTileProfile();
@@ -3414,7 +3830,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             bool bExactUniform = true;
             for (int32 Z = 0; Z <= ValidationCells && bExactUniform && !bValidationAborted; ++Z)
             {
-                if (ShouldAbortWork())
+                if (ShouldAbortWork(ObsoleteFlag))
                 {
                     bValidationAborted = true;
                     break;
@@ -3451,22 +3867,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             return;
         }
         ClassifySeconds = bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
-        if (bMeasureTile)
-        {
-            const VoxelDensityProfile::FSnapshot ClassifyProfileEnd =
-                VoxelDensityProfile::SnapshotCurrentThread();
-            const int32 CacheHitIndex = static_cast<int32>(
-                VoxelDensityProfile::ECounter::TileVerdictCacheHits);
-            const int32 RegionHitIndex = static_cast<int32>(
-                VoxelDensityProfile::ECounter::TileVerdictRegionHits);
-            Result.bClassifierCacheHit =
-                ClassifyProfileEnd.Counters[CacheHitIndex] > TileProfileStart.Counters[CacheHitIndex];
-            Result.bClassifierRegionHit =
-                ClassifyProfileEnd.Counters[RegionHitIndex] > TileProfileStart.Counters[RegionHitIndex];
-        }
         ClassifyVerdict = static_cast<int32>(ValidatedVerdict);
         Result.ClassifyVerdict = ClassifyVerdict;
-        if (ShouldAbortWork())
+        if (ShouldAbortWork(ObsoleteFlag))
         {
             AbortResult();
             EmitTileProfile();
@@ -3501,7 +3904,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                    BandVoxLo, BandVoxHi);
         MeshSeconds = bMeasureTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
         INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
-        if (ShouldAbortWork())
+        if (ShouldAbortWork(ObsoleteFlag))
         {
             AbortResult();
             EmitTileProfile();
@@ -3518,7 +3921,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         Result.Streams = MakeShared<RealtimeMesh::FRealtimeMeshStreamSet>();
         BuildTileStreamSet(*Result.Streams, MeshData);
         StreamSeconds = bMeasureTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
-        if (ShouldAbortWork())
+        if (ShouldAbortWork(ObsoleteFlag))
         {
             AbortResult();
             EmitTileProfile();
@@ -3640,6 +4043,13 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
 {
     // RMC futures are not cancellable from the world side. Remove this tile's state first so a
     // late completion from the old component cannot resurrect readiness after pool reuse.
+    // Generation work is different: mark it obsolete and let its normal aborted result drain so
+    // PendingTiles cannot be removed on behalf of an older request after a replacement is queued.
+    if (TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe>* Cancellation =
+            PendingTileCancellation.Find(Tile))
+    {
+        (*Cancellation)->bObsolete.store(true, std::memory_order_release);
+    }
     CollisionReadyTiles.Remove(Tile);
     CollisionNotRequiredTiles.Remove(Tile);
     CollisionSolidTiles.Remove(Tile);
@@ -3652,7 +4062,6 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
         TileComponents.Remove(Tile);
     }
     LoadedTiles.Remove(Tile);
-    PendingTiles.Remove(Tile);
     TransitionHold.Remove(Tile);   // couvre aussi le settled cull (qui ne tient pas la hold à jour)
 }
 
@@ -3866,6 +4275,11 @@ bool AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
         Pending.SubmissionId = SubmissionId;
         Pending.MeshSubmittedCycles = MeshSubmittedCycles;
         Pending.CollisionSubmittedCycles = CollisionSubmittedCycles;
+        Pending.RequestStartCycles = Result.RequestStartCycles;
+        Pending.GenerationStartCycles = Result.GenerationStartCycles;
+        Pending.GenerationEndCycles = Result.GenerationEndCycles;
+        Pending.ApplyStartCycles = Result.ApplyStartCycles;
+        Pending.bRecordStreamingLatency = Result.bRecordStreamingLatency;
         PendingCollisionCooks.Add(Tile, Pending);
 
         // Register the serial before asking RMC to dirty collision. The current implementation

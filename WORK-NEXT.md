@@ -72,14 +72,15 @@ operation sits in the pipeline. It also makes interval proofs harder to trust.
 
 **Do**: make the stack the single semantic source of truth. Likely overlaps heavily with item 2.
 
-## 5. Prove the verdict cache earns its place, or remove it  ·  small
+## 5. Verdict cache removed after moving-session audit  ·  complete
 
-Zero outer hits in **both** traces. Global lock, linear scan, 512 entries, keyed on sample step so it
-barely reuses across LODs. It helped a deliberately repeated commandlet case, which is not how a
-moving player streams.
+The clean moving-session audit found zero outer or nested hits: 2,109 outer probes and 19,904 nested
+probes produced 15,877 stores and 15,365 replacements in the full 512-entry table. Same-binary
+cache-on/cache-off request-to-ready was 0.367645/0.365978 s p95 and generation was 0.285559/0.285992
+s p95, so the cache was neutral within run noise while paying the global lock and linear scans.
 
-**Do**: measure nested/outer calls, hits and evictions on a real session. If it is neutral or negative,
-take it out and reclaim the memory.
+The global verdict cache, lock, entry table, invalidation path, cache-only profiler fields, and
+deliberate cache probe are removed. The proof classifier remains; item 4 is still deliberately untouched.
 
 ## 6. Three small, sharp ones  ·  tiny
 

@@ -480,9 +480,6 @@ namespace VoxelDensityProfile
         case ECounter::TileClassifyAllSolid: return TEXT("TileClassifyAllSolid");
         case ECounter::TileClassifyAllAir: return TEXT("TileClassifyAllAir");
         case ECounter::TileClassifyMixed: return TEXT("TileClassifyMixed");
-        case ECounter::TileVerdictCacheHits: return TEXT("TileVerdictCacheHits");
-        case ECounter::TileVerdictRegionHits: return TEXT("TileVerdictRegionHits");
-        case ECounter::TileVerdictCacheStores: return TEXT("TileVerdictCacheStores");
         case ECounter::FusedTunnelSamples: return TEXT("FusedTunnelSamples");
         case ECounter::FusedTunnelDetailSamples: return TEXT("FusedTunnelDetailSamples");
         case ECounter::FusedTunnelDetailSkipped: return TEXT("FusedTunnelDetailSkipped");

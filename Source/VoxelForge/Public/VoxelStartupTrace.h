@@ -12,8 +12,6 @@ namespace VoxelForgeStartupTrace
         int32 Level = -1;
         int32 Verdict = -1; // Mixed=0, AllSolid=1, AllAir=2, -1=not classified (sheet/early path)
         bool bEmpty = true;
-        bool bCacheHit = false;
-        bool bRegionHit = false;
         int32 Triangles = 0;
         // This is worker-result -> game-thread mesh submission. Collision readiness is a later
         // per-tile RMC completion event recorded separately as collision_ready.

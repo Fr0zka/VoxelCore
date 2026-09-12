@@ -268,7 +268,6 @@ struct FExploreArguments
     bool bProfileDensityFull = false;
     bool bProfileLod = false;
     bool bOpBounds = false;
-    bool bProfileTileVerdictCache = false;
     bool bFailureFocusRender = false;
     FString OutDirectory;
 
@@ -361,8 +360,6 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
-    OutArguments.bProfileTileVerdictCache = FParse::Param(
-        *Params, TEXT("profiletileverdictcache"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
     FParse::Value(*Params, TEXT("renderheight="), OutArguments.RenderHeight);
@@ -4352,8 +4349,6 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
-    Writer->WriteValue(TEXT("profile_tile_verdict_cache"),
-        Arguments.bProfileTileVerdictCache);
     Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
@@ -5410,66 +5405,6 @@ bool RunOpBounds(
     return true;
 }
 
-bool RunTileVerdictCacheProbe(
-    const FExploreArguments& Arguments,
-    FExploreWorld& World,
-    FString& OutError)
-{
-    if (!World.Generator)
-    {
-        OutError = TEXT("tile-verdict cache probe has no generator.");
-        return false;
-    }
-
-    // Deliberately use a region well above the synthetic layout.  The first 32-cell proof is a
-    // genuine enclosing-region certificate; the 8-cell requests below are aligned subregions of
-    // that same lattice.  No generated cave data is involved in this probe.
-    const FIntVector RegionOrigin(-32, -32, World.TargetTopWorldZ + 1024);
-    const EVoxelTileClass RegionVerdict = World.Generator->ClassifyTile(
-        RegionOrigin, 1, 32);
-    if (RegionVerdict != EVoxelTileClass::AllAir)
-    {
-        OutError = FString::Printf(
-            TEXT("tile-verdict cache probe expected an all-air enclosing region, got %d."),
-            static_cast<int32>(RegionVerdict));
-        return false;
-    }
-
-    auto ClassifyChildren = [&World, &RegionOrigin]()
-    {
-        for (int32 Z = 0; Z < 32; Z += 8)
-        for (int32 Y = 0; Y < 32; Y += 8)
-        for (int32 X = 0; X < 32; X += 8)
-        {
-            World.Generator->ClassifyTile(
-                RegionOrigin + FIntVector(X, Y, Z), 1, 8);
-        }
-    };
-
-    ClassifyChildren();
-    World.Generator->ClassifyTile(RegionOrigin, 1, 32);
-    ClassifyChildren();
-
-    const VoxelDensityProfile::FSnapshot Snapshot = VoxelDensityProfile::Snapshot();
-    const int32 CallsIndex = static_cast<int32>(
-        VoxelDensityProfile::ECounter::TileClassifyCalls);
-    const int32 HitsIndex = static_cast<int32>(
-        VoxelDensityProfile::ECounter::TileVerdictCacheHits);
-    const int32 RegionHitsIndex = static_cast<int32>(
-        VoxelDensityProfile::ECounter::TileVerdictRegionHits);
-    const int32 StoresIndex = static_cast<int32>(
-        VoxelDensityProfile::ECounter::TileVerdictCacheStores);
-    UE_LOG(LogTemp, Display,
-        TEXT("[VoxelForgeTileVerdictCache] probe region=(%d,%d,%d) cells=32 verdict=AllAir "
-             "calls=%llu hits=%llu region_hits=%llu stores=%llu"),
-        RegionOrigin.X, RegionOrigin.Y, RegionOrigin.Z,
-        static_cast<unsigned long long>(Snapshot.Counters[CallsIndex]),
-        static_cast<unsigned long long>(Snapshot.Counters[HitsIndex]),
-        static_cast<unsigned long long>(Snapshot.Counters[RegionHitsIndex]),
-        static_cast<unsigned long long>(Snapshot.Counters[StoresIndex]));
-    return true;
-}
-
 } // namespace
 
 UVoxelForgeExploreCommandlet::UVoxelForgeExploreCommandlet()
@@ -5525,16 +5460,6 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         return 1;
     }
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
-
-    if (Arguments.bProfileTileVerdictCache)
-    {
-        if (!RunTileVerdictCacheProbe(Arguments, World, Error))
-        {
-            UE_LOG(LogTemp, Error,
-                TEXT("[VoxelForgeExplore] tile-verdict cache probe failed: %s"), *Error);
-            return 1;
-        }
-    }
 
     bool bRequestedModeFailed = false;
     if (Arguments.bOpBounds)

@@ -557,10 +557,16 @@ ApplyModification` (BlueprintCallable) + `EditorCarveSphere/EditorFillSphere` (C
 driven by `EditorBrush*` props.
 
 ### 8.10 Performance invariants (DON'T regress)
-- **Streaming** (`UpdateChunksAroundPosition`): rebuild/cull the desired set ONLY when the
-  player crosses a chunk boundary (`LastUpdateCenter`); use the `DesiredSet` TSet for the cull;
-  idle via `bAllChunksLoaded`. Stationary player ≈ free. (Old per-frame O(loaded×desired) scan = 22ms.)
-- **LOD** changes HOT-SWAP (`LoadChunk` only, never unload-first) → no holes. LOD
+- **Streaming** (`UpdateChunksAroundPosition`): rebuild/cull the desired set only when the player
+  crosses a level-0 chunk boundary, an anchor moves, or a rebuild is forced; use the stamped
+  desired map for the cull and idle via `bAllChunksLoaded`. On every rebuild, pending requests whose
+  keys left the desired set are marked obsolete through a per-request atomic token. Workers only
+  read that token (and `bShuttingDown`/generation pause), abort between expensive stages, and send
+  the result through the normal MPSC queue; the game thread reads the token again before applying.
+  `FChunkResult::Epoch` still guards the generation epoch. Desired work is sorted from the true pawn
+  position, with the occupied/support LOD0 tile and the next tile along the heading in an absolute
+  high-priority prefix. Stationary player ≈ free. (Old per-frame O(loaded×desired) scan = 22ms.)
+- **LOD** changes HOT-SWAP (`LoadTile` only, never unload-first) → no holes. LOD
   reconciliation lives in the PERSISTENT per-frame submit loop (same loop as new-chunk loads),
   NOT as a one-shot on the boundary-cross frame — a one-shot drops every chunk past the task
   budget and strands it at a stale LOD. Idle (`bAllChunksLoaded`) only when a full scan finds
@@ -688,9 +694,13 @@ driven by `EditorBrush*` props.
   tile is replaced by several finer tiles, so the old center-owner
   check (`ReplacementLoaded`) dropped it as soon as the ONE tile over its centre loaded → the not-yet-
   ready edges flashed a hole; the full-coverage check keeps the old tile at its current resolution until
-  the better mesh is wholly in, then swaps. In-flight (pending) tiles are NEVER cancelled on a rebuild —
-  they finish, apply, and are culled later if no longer desired. Collision level-0 only; water level-0
-  only; shadows off for level≥2. **Decorations are NO LONGER tied to tiles** — they stream on a fixed world
+  the better mesh is wholly in, then swaps. In-flight requests are cancelled when their key leaves the
+  desired set: the game thread flips the request token, the worker returns an aborted result, and the
+  queue consumer drops it even if cancellation raced the final enqueue. A result must also match the
+  current generation epoch and desired membership before it can apply. `TransitionHold` therefore
+  protects only already-applied geometry during a LOD transition; obsolete work never becomes loaded
+  geometry. Collision level-0 only; water level-0 only; shadows off for level≥2. **Decorations are NO
+  LONGER tied to tiles** — they stream on a fixed world
   grid by distance (§8.5), so they don't pop on LOD swaps. Settings: `VoxelSettings::ClipRadius` (full-res near radius, tiles/level),
   `MaxClipLevel` (far reach). **NEAR-FIELD GEN COST levers** (`LoadTile`): levels `< FullResClipLevels`
   mesh at full `CHUNK_SIZE` cells (≈35³ `GetDensityAt` incl. margin ring), coarser levels at
@@ -756,11 +766,13 @@ driven by `EditorBrush*` props.
   (stale stamp — removed + returned). The cull then considers ONLY leavers + `TransitionHold`
   (tiles kept by load-before-unload from earlier crossings) instead of re-scanning EVERY loaded
   tile per crossing — that scan was the measured ~1.6 ms/crossing `CullTiles` spike (2026-07-05
-  trace, plus `BuildDesiredTiles` 0.66 ms on the same frames). In-flight tiles that finish while
-  no longer desired are caught at apply time (`ProcessPendingChunks` adds them to the hold);
-  `UnloadTile` drops hold entries; the settled cull (everything loaded) keeps its full scan as
-  the safety net. `DesiredPending` for the overlap test is now built LAZILY (only when an
-  in-range transition candidate exists). **The hold is re-evaluated on a ROTATING BUDGET**
+  trace, plus `BuildDesiredTiles` 0.66 ms on the same frames). Pending requests that become leavers
+  are marked obsolete before replacement submission; `ProcessPendingChunks` reads the token, drops
+  the aborted result, and does not put it in the hold. `ApplyTileResult` independently rejects a
+  wrong generation epoch or undesired key. `UnloadTile` drops hold entries; the settled cull
+  (everything loaded) keeps its full scan as the safety net. `DesiredPending` for the overlap test is
+  now built LAZILY (only when an in-range transition candidate exists). **The hold is re-evaluated on
+  a ROTATING BUDGET**
   (`TransitionHoldQueue` + cursor, ~256 tiles/crossing): re-scanning the whole hold each
   crossing degenerates back to the O(loaded) scan whenever streaming never settles (measured
   2.47 ms/crossing in the first packaged capture) — keeping a tile a few crossings longer is
