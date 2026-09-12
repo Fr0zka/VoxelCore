@@ -113,7 +113,7 @@ namespace
             if (Sample.bCacheHit) ++CacheHits;
             if (Sample.bRegionHit) ++RegionHits;
             Triangles += Sample.Triangles;
-            Request.Add(Sample.RequestToReadySeconds);
+            Request.Add(Sample.RequestToApplySeconds);
             Queue.Add(Sample.QueueWaitSeconds);
             Generation.Add(Sample.GenerationSeconds);
             Classify.Add(Sample.ClassifySeconds);
@@ -123,7 +123,7 @@ namespace
 
         return FString::Printf(
             TEXT("{\"count\":%d,\"empty\":%d,\"all_air\":%d,\"all_solid\":%d,\"mixed\":%d,\"cache_hits\":%d,\"region_hits\":%d,\"triangles\":%lld,"
-                 "\"request_ready_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
+                 "\"request_apply_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"queue_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"generation_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"classify_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
@@ -265,11 +265,11 @@ void RecordTile(const FTileSample& Sample)
     ++GState->TileRecordsWritten;
     WriteEventLocked(*GState, TEXT("tile"), FString::Printf(
         TEXT("\"level\":%d,\"verdict\":%d,\"empty\":%d,\"cache_hit\":%d,\"region_hit\":%d,\"triangles\":%d,"
-             "\"request_to_ready_s\":%s,\"queue_wait_s\":%s,\"worker_queue_s\":%s,\"result_queue_s\":%s,"
+             "\"request_to_apply_s\":%s,\"queue_wait_s\":%s,\"worker_queue_s\":%s,\"result_queue_s\":%s,"
              "\"generation_s\":%s,\"classify_s\":%s,\"mesh_s\":%s,\"stream_s\":%s,\"apply_s\":%s"),
         Sample.Level, Sample.Verdict, Sample.bEmpty ? 1 : 0,
         Sample.bCacheHit ? 1 : 0, Sample.bRegionHit ? 1 : 0, Sample.Triangles,
-        *Number(Sample.RequestToReadySeconds), *Number(Sample.QueueWaitSeconds),
+        *Number(Sample.RequestToApplySeconds), *Number(Sample.QueueWaitSeconds),
         *Number(Sample.WorkerQueueSeconds), *Number(Sample.ResultQueueSeconds),
         *Number(Sample.GenerationSeconds), *Number(Sample.ClassifySeconds),
         *Number(Sample.MeshSeconds), *Number(Sample.StreamSeconds), *Number(Sample.ApplySeconds)));

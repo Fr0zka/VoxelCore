@@ -15,7 +15,9 @@ namespace VoxelForgeStartupTrace
         bool bCacheHit = false;
         bool bRegionHit = false;
         int32 Triangles = 0;
-        double RequestToReadySeconds = 0.0;
+        // This is worker-result -> game-thread mesh submission. Collision readiness is a later
+        // per-tile RMC completion event recorded separately as collision_ready.
+        double RequestToApplySeconds = 0.0;
         double QueueWaitSeconds = 0.0;
         double WorkerQueueSeconds = 0.0;
         double ResultQueueSeconds = 0.0;

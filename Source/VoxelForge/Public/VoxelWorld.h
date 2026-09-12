@@ -16,7 +16,12 @@
 
 // Forward declaration
 class URealtimeMeshComponent;
+class URealtimeMesh;
 class URealtimeMeshSimple;
+class UBodySetup;
+class APawn;
+class UPawnMovementComponent;
+class UCharacterMovementComponent;
 class UVoxelDiffLayer;
 class UVoxelContentManager;
 class UVoxelAtmosphereManager;
@@ -81,18 +86,18 @@ struct FChunkResult
     // so the game thread only uploads them — the per-vertex builder loop was the dominant
     // game-thread cost while moving (the apply drain). TSharedPtr (not a by-value StreamSet) so
     // FChunkResult stays movable through the MPSC queue with the type only FORWARD-DECLARED here.
-    // Null ⇒ empty/all-air tile (no component).
+    // Null ⇒ no-surface tile (uniform all-air/all-solid or an empty content band; no component).
     TSharedPtr<RealtimeMesh::FRealtimeMeshStreamSet> Streams;
     uint32 Epoch = 0;         // Generation epoch — discard if stale
     // Monotonic request timestamp used only for streaming telemetry. It is carried through the
-    // worker queue so the profile can report request-to-ready, not just worker generation time.
+    // worker queue so the profile can report request-to-apply, not just worker generation time.
     uint64 RequestStartCycles = 0;
     // Worker timing boundaries for separating scheduler wait from generation and result/apply wait.
     // These are telemetry-only and remain zero when tile profiling is disabled.
     uint64 GenerationStartCycles = 0;
     uint64 GenerationEndCycles = 0; int32 ClassifyVerdict = -1; bool bClassifierCacheHit = false; bool bClassifierRegionHit = false; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
     bool bAborted = false;    // Worker observed shutdown; never mark this tile loaded
-    bool bEmpty = true;       // true ⇒ all-air tile (Streams null); still marked loaded so we don't re-submit
+    bool bEmpty = true;       // true ⇒ no surface (uniform all-air/all-solid or empty band); still loaded
     // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
     // column's CeilSurf; overhangs/cave roofs stay ground) and packs them as two contiguous runs
     // (ground then cap) in the index buffer → polygroups 0/1 → two RMC sections with their own
@@ -193,8 +198,40 @@ public:
     // game-thread problem (this supersedes the earlier region-batching). Collision + content
     // are level-0 only.
 
-    /** Tiles fully loaded — INCLUDING empty/all-air tiles, so we never re-submit them. */
+    /** Tiles whose result was successfully applied — INCLUDING empty/all-air tiles, so we never
+     *  re-submit them. A non-empty level-0 tile is not collision-ready until its RMC cook callback
+     *  has added it to CollisionReadyTiles. */
     TSet<FVoxelTileKey> LoadedTiles;
+
+    /** Level-0 tiles whose latest submitted RMC collision body has finished cooking and was
+     *  installed. This is the authoritative collision-readiness set used by the pawn gate; mesh
+     *  submission and LoadedTiles are intentionally not sufficient. */
+    TSet<FVoxelTileKey> CollisionReadyTiles;
+
+    /** Level-0 tiles whose applied result is known to contain no surface (uniform empty/solid).
+     *  They need no BodySetup themselves, but the pawn gate may walk past them while looking for
+     *  the first resolved collidable support tile. */
+    TSet<FVoxelTileKey> CollisionNotRequiredTiles;
+
+    /** Subset of CollisionNotRequiredTiles proved all-solid. A support probe inside one of these
+     *  tiles searches upward for the boundary tile; all-air/empty tiles search downward. */
+    TSet<FVoxelTileKey> CollisionSolidTiles;
+
+    struct FPendingCollisionCook
+    {
+        TWeakObjectPtr<URealtimeMesh> Mesh;
+        uint64 SubmissionId = 0;
+        uint64 MeshSubmittedCycles = 0;
+        uint64 CollisionSubmittedCycles = 0;
+        bool bBodyUpdatedEventSeen = false;
+        uint64 BodyUpdatedEventCycles = 0;
+    };
+
+    /** One serialised completion record per tile. The serial prevents a late RMC future from
+     *  making a remeshed tile, or a pooled component reused by another tile, appear ready. */
+    TMap<FVoxelTileKey, FPendingCollisionCook> PendingCollisionCooks;
+    uint64 NextCollisionSubmissionId = 0;
+    TMap<URealtimeMesh*, FDelegateHandle> CollisionBodyUpdatedHandles;
 
     /** Render component per NON-empty loaded tile (GC-safe via actor ownership; not UPROPERTY
      *  because FVoxelTileKey isn't a USTRUCT key). */
@@ -640,9 +677,11 @@ public:
 
     /**
      * Game-thread apply for one gen result (shared by ProcessPendingChunks + SyncRemeshTile):
-     * epoch check, mark loaded, ingest capture, then either release the tile's component (empty) or
-     * ApplyMeshToTile. Returns true iff a VISIBLE mesh was uploaded (counts against the apply budget).
-     * Does NOT touch PendingTiles — the caller owns that.
+     * epoch check, ingest capture, then either release the tile's component (empty) or submit a mesh
+     * through ApplyMeshToTile. Returns true iff a VISIBLE mesh was submitted (counts against the
+     * apply budget); collision readiness is a later RMC completion.
+     * Does NOT touch PendingTiles — the caller owns that. A non-empty result counts as applied only
+     * after mesh submission succeeds; collision readiness arrives asynchronously afterwards.
      */
     bool ApplyTileResult(FChunkResult& Result);
 
@@ -681,7 +720,7 @@ public:
      * the strate content band the mesh was cut to; material lookups clamp into that band).
      * Never called for empty results.
      */
-    void ApplyMeshToTile(FChunkResult& Result);
+    bool ApplyMeshToTile(FChunkResult& Result);
 
     /** Mini-sun lighting (bounded directional). Each frame writes the nearest 4 active orbs' WORLD
      *  positions (+ reach radius in .w) into OrbLightMPC's Orb0..3 vector params; the Directional
@@ -708,8 +747,38 @@ public:
     // HELPERS
     //=========================================================================
 
-    /** Get the current player position (or zero if no player) */
+    /** Return the current player position and distinguish "no pawn" from a valid origin position. */
+    bool TryGetPlayerPosition(FVector& OutPosition, APawn** OutPawn = nullptr) const;
+
+    /** Compatibility wrapper for callers that only need the location. A real pawn at the origin
+     *  therefore returns FVector::ZeroVector just like any other valid position. */
     FVector GetPlayerPosition() const;
+
+    /** Level-0 tile under the pawn's feet. This is deliberately separate from the actor-center tile:
+     *  the floor that catches a falling pawn is what must be cooked before movement is released. */
+    bool GetPlayerSupportTile(APawn* Pawn, const FVector& PlayerPosition,
+                              FVoxelTileKey& OutSupportTile) const;
+
+    bool IsTileCollisionReady(const FVoxelTileKey& Tile) const;
+    bool IsCollisionReadyFromSupportTile(const FVoxelTileKey& CandidateTile,
+                                         FVoxelTileKey* OutSupportTile = nullptr) const;
+    bool IsPlayerSupportCollisionReady(APawn* Pawn, const FVector& PlayerPosition,
+                                       FVoxelTileKey* OutSupportTile = nullptr) const;
+
+    /** Gate pawn movement until its current and, when moving, next support tile have a completed
+     *  level-0 RMC collision body. The world tick is installed as the pawn prerequisite in the
+     *  implementation (and directly on its movement component) so this check runs before
+     *  CharacterMovementComponent physics. */
+    void UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosition, float DeltaTime);
+    void EngagePawnCollisionGate(APawn* Pawn);
+    void ReleasePawnCollisionGate();
+
+    /** Called by the RMC collision future after async cook + BodySetup installation. */
+    void HandleTileCollisionCookComplete(const FVoxelTileKey& Tile, uint64 SubmissionId,
+                                         URealtimeMesh* Mesh, uint8 Result);
+    void BindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh);
+    void UnbindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh);
+    void HandleRealtimeMeshCollisionBodyUpdated(URealtimeMesh* Mesh, UBodySetup* BodySetup);
 
     // (GetLODForChunk / LODToStep / IsChunkInRange removed — dead since the clipmap
     //  streaming replaced the distance-LOD scheme; the level lives in FVoxelTileKey.)
@@ -799,6 +868,23 @@ public:
     bool bAllChunksLoaded = false;
     bool bStartupTraceDesiredRecorded = false;
     TArray<FVoxelTileKey> DesiredSorted;   // desired tiles, nearest-first
+
+    // PLAYER COLLISION GATE — the pawn is allowed to enter/leave a tile only when the level-0
+    // collision body covering its feet has completed the RMC cook. The movement component state is
+    // saved so a temporary stream wait does not permanently change a character's movement mode.
+    TWeakObjectPtr<APawn> PawnTickPrerequisite;
+    TWeakObjectPtr<UPawnMovementComponent> PawnMovementTickPrerequisite;
+    TWeakObjectPtr<APawn> CollisionGatedPawn;
+    TWeakObjectPtr<UPawnMovementComponent> CollisionGatedPawnMovement;
+    TWeakObjectPtr<UCharacterMovementComponent> CollisionGatedCharacterMovement;
+    uint8 SavedCharacterMovementMode = 0;
+    uint8 SavedCharacterCustomMovementMode = 0;
+    bool bSavedCharacterMovementMode = false;
+    bool bSavedPawnMovementActive = false;
+    bool bPawnCollisionGateEngaged = false;
+    bool bPawnGateWaitingForPredictedSupport = false;
+    FVoxelTileKey PawnGatePredictedSupportTile;
+    bool bPawnGateUnsupportedReported = false;
 
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
     // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp

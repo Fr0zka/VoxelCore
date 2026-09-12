@@ -5,6 +5,7 @@
 #include "VoxelDiffLayer.h"
 #include "RealtimeMeshComponent.h"
 #include "RealtimeMeshSimple.h"
+#include "Core/RealtimeMeshCollision.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelStrateDefinition.h"
 #include "VoxelBiomeDefinition.h"
@@ -23,6 +24,11 @@
 // it. APlayerController was complete transitively only; include it explicitly.
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PawnMovementComponent.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Components/CapsuleComponent.h"
+#include "Async/Async.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Kismet/KismetMaterialLibrary.h"
@@ -105,6 +111,9 @@ namespace
 AVoxelWorld::AVoxelWorld()
 {
     PrimaryActorTick.bCanEverTick = true;
+    // Run the collision-readiness check before physics. The pawn receives this actor as a tick
+    // prerequisite once it is possessed, so a movement step cannot race the gate on the same frame.
+    PrimaryActorTick.TickGroup = TG_PrePhysics;
 }
 
 //=============================================================================
@@ -453,6 +462,10 @@ void AVoxelWorld::RegenerateAllChunks()
     for (auto& Pair : TileComponents) { if (Pair.Value) ReleaseTileComponent(Pair.Value); }
     TileComponents.Empty();
     LoadedTiles.Empty();
+    CollisionReadyTiles.Empty();
+    CollisionNotRequiredTiles.Empty();
+    CollisionSolidTiles.Empty();
+    PendingCollisionCooks.Empty();
 
     // Decorations/water are keyed per level-0 chunk — clear them all.
     if (ContentManager) { ContentManager->ClearAll(); }
@@ -532,7 +545,14 @@ void AVoxelWorld::ValidateDeterminism()
         return;
     }
 
-    const FIntVector CenterChunk = WorldToChunkCoord(GetPlayerPosition());
+    FVector PlayerPosition = FVector::ZeroVector;
+    if (!TryGetPlayerPosition(PlayerPosition))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelForge] ValidateDeterminism: no player pawn — run during PIE after possession."));
+        return;
+    }
+    const FIntVector CenterChunk = WorldToChunkCoord(WorldToLocalCm(PlayerPosition));
 
     float MaxRepeatDelta = 0.0f;   // same alignment sampled twice — must be 0 (statelessness)
     float MaxWindowDelta = 0.0f;   // left-warmed vs right-warmed — must be 0 (window invariance)
@@ -921,6 +941,17 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     // Signal all async tasks to bail out ASAP
     const double EndPlayStartSeconds = FPlatformTime::Seconds();
     bShuttingDown.store(true, std::memory_order_release);
+    ReleasePawnCollisionGate();
+    if (APawn* Pawn = PawnTickPrerequisite.Get())
+    {
+        Pawn->RemoveTickPrerequisiteActor(this);
+    }
+    if (UPawnMovementComponent* PawnMovement = PawnMovementTickPrerequisite.Get())
+    {
+        PawnMovement->RemoveTickPrerequisiteActor(this);
+    }
+    PawnTickPrerequisite.Reset();
+    PawnMovementTickPrerequisite.Reset();
     UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: shutdown signalled; waiting for %d tasks"),
         ActiveTaskCount.load(std::memory_order_relaxed));
 
@@ -949,6 +980,18 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     PendingUnload.Empty();
     DirtyRemeshQueue.Empty();
     BandRemeshQueue.Empty();
+    PendingCollisionCooks.Empty();
+    CollisionReadyTiles.Empty();
+    CollisionNotRequiredTiles.Empty();
+    CollisionSolidTiles.Empty();
+    for (const TPair<URealtimeMesh*, FDelegateHandle>& Pair : CollisionBodyUpdatedHandles)
+    {
+        if (Pair.Key != nullptr)
+        {
+            Pair.Key->OnCollisionBodyUpdated().Remove(Pair.Value);
+        }
+    }
+    CollisionBodyUpdatedHandles.Empty();
 
     // Stop + drain the decoration march tasks (they read the Generator) before UObject teardown.
     if (ContentManager)
@@ -1162,15 +1205,27 @@ void AVoxelWorld::BeginPlay()
     OnObjectModifiedHandle = FCoreUObjectDelegates::OnObjectModified.AddUObject(
         this, &AVoxelWorld::OnObjectModifiedInEditor);
 #endif
+
+    // A possessed pawn may already exist when BeginPlay runs. Engage the same pre-physics gate
+    // immediately; Tick repeats the check for late possession and for pawn replacement.
+    FVector InitialPlayerPosition = FVector::ZeroVector;
+    APawn* InitialPawn = nullptr;
+    if (TryGetPlayerPosition(InitialPlayerPosition, &InitialPawn))
+    {
+        UpdatePawnCollisionGate(InitialPawn, InitialPlayerPosition, 0.0f);
+    }
 }
 
 void AVoxelWorld::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_Tick);   // game-thread streaming orchestration breakdown
-    FVector PlayerLastPos = GetPlayerPosition();
+    FVector PlayerLastPos = FVector::ZeroVector;
+    APawn* PlayerPawn = nullptr;
+    const bool bHasPlayer = TryGetPlayerPosition(PlayerLastPos, &PlayerPawn);
 
-    if ((PlayerLastPos != FVector::ZeroVector)) {
+    if (bHasPlayer) {
+        UpdatePawnCollisionGate(PlayerPawn, PlayerLastPos, DeltaTime);
         UpdateChunksAroundPosition(PlayerLastPos);
         if (AtmosphereManager)
         {
@@ -1200,6 +1255,20 @@ void AVoxelWorld::Tick(float DeltaTime)
         // Independent of the density volume (self-guards on OrbLightMPC); this is the replacement path.
         UpdateOrbLightMPC();
     }
+    else
+    {
+        ReleasePawnCollisionGate();
+        if (APawn* PreviousPawn = PawnTickPrerequisite.Get())
+        {
+            PreviousPawn->RemoveTickPrerequisiteActor(this);
+        }
+        if (UPawnMovementComponent* PreviousMovement = PawnMovementTickPrerequisite.Get())
+        {
+            PreviousMovement->RemoveTickPrerequisiteActor(this);
+        }
+        PawnTickPrerequisite.Reset();
+        PawnMovementTickPrerequisite.Reset();
+    }
     // The diagnostic harness uses an explicit command-line token rather than a console command:
     // Unreal processes startup ExecCmds before this runtime module's console registrations are
     // guaranteed to exist. Reading the command line here is order-independent, and the actual edit
@@ -1223,12 +1292,17 @@ void AVoxelWorld::Tick(float DeltaTime)
 
     // The startup trace stops at the same point the streaming policy declares itself settled:
     // every desired key is loaded, no generation task remains, and the game-thread result drain
-    // has run for the frame. This is intentionally after ProcessPendingChunks so request-to-ready
-    // includes the final apply.
+    // has run for the frame. This is intentionally after ProcessPendingChunks so request-to-apply
+    // includes the final submission; the separate collision_ready events carry cook latency.
     if (VoxelForgeStartupTrace::IsActive()
         && bAllChunksLoaded
         && PendingTiles.Num() == 0
-        && bStartupTraceDesiredRecorded)
+        && bStartupTraceDesiredRecorded
+        && PendingCollisionCooks.Num() == 0
+        // The desired set being applied is not the player-ready point: the feet tile must have
+        // received its completed LOD0 RMC body first. If no pawn exists, there is no gate to wait
+        // for and the headless trace keeps its old completion behavior.
+        && (!bHasPlayer || IsPlayerSupportCollisionReady(PlayerPawn, PlayerLastPos)))
     {
         TMap<int32, int32> SteadyLevelCounts;
         TMap<int32, FIntVector> SteadyLevelMins;
@@ -1246,8 +1320,14 @@ void AVoxelWorld::Tick(float DeltaTime)
             Max.Z = FMath::Max(Max.Z, Key.Coord.Z);
         }
         VoxelForgeStartupTrace::RecordEvent(TEXT("steady_state"), FString::Printf(
-            TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"pending_tiles\":%d,\"pending_unload\":%d,\"generation_epoch\":%u"),
-            DesiredSorted.Num(), LoadedTiles.Num(), PendingTiles.Num(), PendingUnload.Num(), GenerationEpoch));
+            TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"collision_ready_tiles\":%d,"
+                 "\"collision_not_required_tiles\":%d,\"pending_collision_cooks\":%d,"
+                 "\"pawn_collision_gate_engaged\":%d,"
+                 "\"pending_tiles\":%d,\"pending_unload\":%d,\"generation_epoch\":%u"),
+            DesiredSorted.Num(), LoadedTiles.Num(), CollisionReadyTiles.Num(),
+            CollisionNotRequiredTiles.Num(), PendingCollisionCooks.Num(),
+            bPawnCollisionGateEngaged ? 1 : 0,
+            PendingTiles.Num(), PendingUnload.Num(), GenerationEpoch));
         TArray<int32> SteadyLevels;
         SteadyLevelCounts.GetKeys(SteadyLevels);
         SteadyLevels.Sort();
@@ -1275,11 +1355,9 @@ void AVoxelWorld::Tick(float DeltaTime)
     // Complete the one-shot diagnostic request only after the player's level-0 centre tile is
     // loaded and idle. Waiting for any coarse tile would take the async-neighbour branch and would
     // not measure the normal synchronous centre remesh that makes a local edit feel expensive.
-    FVector ModificationPosition = PlayerLastPos;
-    if (ModificationPosition == FVector::ZeroVector)
-    {
-        ModificationPosition = GetActorLocation();
-    }
+    // No pawn is a distinct state from a pawn at (0,0,0); keep the diagnostic fallback for
+    // headless/editor use without making the world-origin pawn skip streaming.
+    FVector ModificationPosition = bHasPlayer ? PlayerLastPos : GetActorLocation();
     const FVoxelTileKey ModificationCenterTile(
         WorldToChunkCoord(WorldToLocalCm(ModificationPosition)), 0);
     if (GVoxelForgePendingTestModification != 0
@@ -1356,15 +1434,536 @@ FVector AVoxelWorld::LocalVoxelToWorld(FVector VoxelPos) const
     return GetActorTransform().TransformPosition(VoxelPos * VOXEL_SIZE);
 }
 
+bool AVoxelWorld::TryGetPlayerPosition(FVector& OutPosition, APawn** OutPawn) const
+{
+    OutPosition = FVector::ZeroVector;
+    if (OutPawn != nullptr)
+    {
+        *OutPawn = nullptr;
+    }
+
+    UWorld* World = GetWorld();
+    APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+    APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+    if (!IsValid(Pawn))
+    {
+        return false;
+    }
+
+    const FVector Position = Pawn->GetActorLocation();
+    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
+        || !FMath::IsFinite(Position.Z))
+    {
+        return false;
+    }
+
+    OutPosition = Position;
+    if (OutPawn != nullptr)
+    {
+        *OutPawn = Pawn;
+    }
+    return true;
+}
+
 FVector AVoxelWorld::GetPlayerPosition() const
 {
-    // This one is tricky with Unreal's API, so I'll give you more help:
-    APlayerController* PC = GetWorld()->GetFirstPlayerController();
-    if (PC && PC->GetPawn())
+    FVector Position = FVector::ZeroVector;
+    TryGetPlayerPosition(Position);
+    return Position;
+}
+
+bool AVoxelWorld::GetPlayerSupportTile(APawn* Pawn, const FVector& PlayerPosition,
+                                        FVoxelTileKey& OutSupportTile) const
+{
+    if (!IsValid(Pawn))
     {
-        return PC->GetPawn()->GetActorLocation();
+        return false;
     }
-    return FVector::ZeroVector;
+
+    float HalfHeightCm = 0.0f;
+    if (const ACharacter* Character = Cast<ACharacter>(Pawn))
+    {
+        if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+        {
+            HalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+        }
+    }
+    else
+    {
+        // APawn is not required to be a character. Use its colliding component bounds as a
+        // conservative feet estimate so custom pawn movement still gets the same safety gate.
+        FVector BoundsOrigin = FVector::ZeroVector;
+        FVector BoundsExtent = FVector::ZeroVector;
+        Pawn->GetActorBounds(/*bOnlyCollidingComponents*/ true, BoundsOrigin, BoundsExtent);
+        HalfHeightCm = FMath::Max(0.0f, BoundsExtent.Z);
+    }
+    if (!FMath::IsFinite(HalfHeightCm))
+    {
+        return false;
+    }
+
+    // Probe one centimetre below the feet. At an exact chunk boundary this selects the tile
+    // containing the solid surface below, rather than the empty tile immediately above it.
+    FVector LocalFeet = WorldToLocalCm(PlayerPosition);
+    LocalFeet.Z -= HalfHeightCm + 1.0f;
+    OutSupportTile = FVoxelTileKey(WorldToChunkCoord(LocalFeet), 0);
+    return true;
+}
+
+bool AVoxelWorld::IsTileCollisionReady(const FVoxelTileKey& Tile) const
+{
+    if (Tile.Level != 0 || !CollisionReadyTiles.Contains(Tile) || !LoadedTiles.Contains(Tile))
+    {
+        return false;
+    }
+
+    URealtimeMeshComponent* MeshComp = TileComponents.FindRef(Tile);
+    if (!IsValid(MeshComp))
+    {
+        return false;
+    }
+
+    URealtimeMeshSimple* Mesh = MeshComp->GetRealtimeMeshAs<URealtimeMeshSimple>();
+    return Mesh != nullptr && Mesh->GetBodySetup() != nullptr;
+}
+
+bool AVoxelWorld::IsCollisionReadyFromSupportTile(
+    const FVoxelTileKey& InitialTile, FVoxelTileKey* OutSupportTile) const
+{
+    FVoxelTileKey CandidateTile = InitialTile;
+    const int32 Direction = CollisionSolidTiles.Contains(InitialTile) ? 1 : -1;
+
+    // A pawn above an all-air/empty band searches down. If its probe lands inside an all-solid
+    // tile (including an exact chunk-boundary case), search up instead: the MC boundary can be
+    // emitted by the first non-solid tile above it. Never cross an unresolved tile.
+    constexpr int32 MaxSupportSearchTiles = 64;
+    for (int32 Depth = 0; Depth < MaxSupportSearchTiles; ++Depth)
+    {
+        if (IsTileCollisionReady(CandidateTile))
+        {
+            if (OutSupportTile != nullptr)
+            {
+                *OutSupportTile = CandidateTile;
+            }
+            return true;
+        }
+        if (!CollisionNotRequiredTiles.Contains(CandidateTile))
+        {
+            if (OutSupportTile != nullptr)
+            {
+                *OutSupportTile = CandidateTile;
+            }
+            return false;
+        }
+        CandidateTile.Coord.Z += Direction;
+    }
+    if (OutSupportTile != nullptr)
+    {
+        *OutSupportTile = CandidateTile;
+    }
+    return false;
+}
+
+bool AVoxelWorld::IsPlayerSupportCollisionReady(APawn* Pawn, const FVector& PlayerPosition,
+                                                 FVoxelTileKey* OutSupportTile) const
+{
+    FVoxelTileKey CandidateTile;
+    if (!GetPlayerSupportTile(Pawn, PlayerPosition, CandidateTile))
+    {
+        return false;
+    }
+
+    return IsCollisionReadyFromSupportTile(CandidateTile, OutSupportTile);
+}
+
+void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosition,
+                                           float DeltaTime)
+{
+    if (!IsValid(Pawn) || bShuttingDown.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    // Tick prerequisites are kept even while the gate is open. That makes the next movement
+    // decision happen before pawn physics, including the first frame after a tile-boundary crossing.
+    if (PawnTickPrerequisite.Get() != Pawn)
+    {
+        if (APawn* PreviousPawn = PawnTickPrerequisite.Get())
+        {
+            PreviousPawn->RemoveTickPrerequisiteActor(this);
+        }
+        if (UPawnMovementComponent* PreviousMovement = PawnMovementTickPrerequisite.Get())
+        {
+            PreviousMovement->RemoveTickPrerequisiteActor(this);
+        }
+        PawnTickPrerequisite = Pawn;
+        Pawn->AddTickPrerequisiteActor(this);
+        bPawnGateUnsupportedReported = false;
+    }
+
+    // The actor prerequisite covers the pawn tick; attach the same prerequisite directly to its
+    // movement component because CharacterMovementComponent has its own component tick function.
+    // Re-check this even for the same pawn: possession/setup code can replace the component late.
+    UPawnMovementComponent* CurrentMovement = Pawn->GetMovementComponent();
+    if (PawnMovementTickPrerequisite.Get() != CurrentMovement)
+    {
+        if (UPawnMovementComponent* PreviousMovement = PawnMovementTickPrerequisite.Get())
+        {
+            PreviousMovement->RemoveTickPrerequisiteActor(this);
+        }
+        if (CurrentMovement != nullptr)
+        {
+            CurrentMovement->AddTickPrerequisiteActor(this);
+        }
+        PawnMovementTickPrerequisite = CurrentMovement;
+    }
+
+    if (bPawnCollisionGateEngaged && CollisionGatedPawn.Get() == Pawn
+        && CollisionGatedCharacterMovement.Get() != CurrentMovement
+        && CollisionGatedPawnMovement.Get() != CurrentMovement)
+    {
+        // The component was replaced while the pawn was stopped. Restore the old component (if it
+        // still exists) and let the normal path engage the replacement against the same readiness
+        // decision below.
+        ReleasePawnCollisionGate();
+    }
+
+    if (bPawnCollisionGateEngaged && CollisionGatedPawn.Get() != Pawn)
+    {
+        ReleasePawnCollisionGate();
+    }
+
+    FVoxelTileKey CurrentSupportTile;
+    const bool bCurrentSupportReady = IsPlayerSupportCollisionReady(
+        Pawn, PlayerPosition, &CurrentSupportTile);
+    bool bCanRelease = bCurrentSupportReady;
+    bool bWaitingForPredictedSupport = false;
+    FVoxelTileKey PredictedSupportTile;
+
+    // Check the movement path ahead while the gate is open. Without this, a pawn could leave a
+    // ready tile on this frame and enter an un-cooked tile before the next world tick observes it.
+    if (bCurrentSupportReady && DeltaTime > 0.0f)
+    {
+        const FVector Velocity = Pawn->GetVelocity();
+        if (!Velocity.IsNearlyZero(1.0f))
+        {
+            constexpr float SupportProbeSpacingCm = CHUNK_SIZE * VOXEL_SIZE * 0.5f;
+            constexpr int32 MaxPredictedSupportProbes = 64;
+            const int32 NumPredictedProbes = FMath::Clamp(
+                FMath::CeilToInt(Velocity.Size() * DeltaTime / SupportProbeSpacingCm),
+                1, MaxPredictedSupportProbes);
+            for (int32 ProbeIndex = 1; ProbeIndex <= NumPredictedProbes; ++ProbeIndex)
+            {
+                const float Alpha = static_cast<float>(ProbeIndex)
+                    / static_cast<float>(NumPredictedProbes);
+                const FVector PredictedPosition = PlayerPosition + Velocity * DeltaTime * Alpha;
+                const bool bHavePredictedSupport = GetPlayerSupportTile(
+                    Pawn, PredictedPosition, PredictedSupportTile);
+                const bool bPredictedSupportReady = bHavePredictedSupport
+                    && IsPlayerSupportCollisionReady(
+                        Pawn, PredictedPosition, &PredictedSupportTile);
+                if (!bPredictedSupportReady)
+                {
+                    bCanRelease = false;
+                    bWaitingForPredictedSupport = bHavePredictedSupport;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Engage() stops velocity, so the blocked tile must be remembered across subsequent ticks;
+    // otherwise a gate caused by a predicted crossing would release immediately on the next tick.
+    if (bPawnCollisionGateEngaged && bPawnGateWaitingForPredictedSupport)
+    {
+        if (!IsCollisionReadyFromSupportTile(PawnGatePredictedSupportTile,
+                                              &PredictedSupportTile))
+        {
+            bCanRelease = false;
+            bWaitingForPredictedSupport = true;
+        }
+    }
+
+    if (bCanRelease)
+    {
+        bPawnGateWaitingForPredictedSupport = false;
+        ReleasePawnCollisionGate();
+        return;
+    }
+
+    if (bWaitingForPredictedSupport)
+    {
+        bPawnGateWaitingForPredictedSupport = true;
+        PawnGatePredictedSupportTile = PredictedSupportTile;
+    }
+    else if (!bCurrentSupportReady)
+    {
+        bPawnGateWaitingForPredictedSupport = false;
+    }
+
+    if (!bPawnCollisionGateEngaged)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGate] waiting pawn=%s current_support=(%d,%d,%d) ready=%d "
+                 "predicted_wait=%d"),
+            *Pawn->GetName(),
+            CurrentSupportTile.Coord.X, CurrentSupportTile.Coord.Y, CurrentSupportTile.Coord.Z,
+            bCurrentSupportReady ? 1 : 0,
+            bWaitingForPredictedSupport ? 1 : 0);
+    }
+    EngagePawnCollisionGate(Pawn);
+}
+
+void AVoxelWorld::EngagePawnCollisionGate(APawn* Pawn)
+{
+    if (!IsValid(Pawn))
+    {
+        return;
+    }
+    if (bPawnCollisionGateEngaged)
+    {
+        return;
+    }
+
+    CollisionGatedPawn = Pawn;
+
+    if (ACharacter* Character = Cast<ACharacter>(Pawn))
+    {
+        if (UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
+        {
+            CollisionGatedCharacterMovement = CharacterMovement;
+            SavedCharacterMovementMode = static_cast<uint8>(CharacterMovement->MovementMode);
+            SavedCharacterCustomMovementMode = CharacterMovement->CustomMovementMode;
+            bSavedCharacterMovementMode = true;
+
+            CharacterMovement->StopMovementImmediately();
+            CharacterMovement->SetMovementMode(MOVE_None);
+            bPawnCollisionGateEngaged = true;
+            return;
+        }
+    }
+
+    if (UPawnMovementComponent* PawnMovement = Pawn->GetMovementComponent())
+    {
+        CollisionGatedPawnMovement = PawnMovement;
+        bSavedPawnMovementActive = PawnMovement->IsActive();
+        PawnMovement->StopMovementImmediately();
+        PawnMovement->Deactivate();
+        bPawnCollisionGateEngaged = true;
+        return;
+    }
+
+    if (!bPawnGateUnsupportedReported)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[VoxelForgeCollisionGate] pawn=%s has no movement component; cannot gate it "
+                 "while support collision cooks"),
+            *Pawn->GetName());
+        bPawnGateUnsupportedReported = true;
+    }
+}
+
+void AVoxelWorld::ReleasePawnCollisionGate()
+{
+    if (!bPawnCollisionGateEngaged)
+    {
+        CollisionGatedPawn.Reset();
+        CollisionGatedPawnMovement.Reset();
+        CollisionGatedCharacterMovement.Reset();
+        bSavedCharacterMovementMode = false;
+        bSavedPawnMovementActive = false;
+        bPawnGateWaitingForPredictedSupport = false;
+        return;
+    }
+
+    if (UCharacterMovementComponent* CharacterMovement = CollisionGatedCharacterMovement.Get())
+    {
+        if (bSavedCharacterMovementMode)
+        {
+            CharacterMovement->SetMovementMode(
+                static_cast<EMovementMode>(SavedCharacterMovementMode),
+                SavedCharacterCustomMovementMode);
+        }
+    }
+    else if (UPawnMovementComponent* PawnMovement = CollisionGatedPawnMovement.Get())
+    {
+        if (bSavedPawnMovementActive)
+        {
+            PawnMovement->Activate(true);
+        }
+        else
+        {
+            PawnMovement->Deactivate();
+        }
+    }
+
+    if (APawn* Pawn = CollisionGatedPawn.Get())
+    {
+        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeCollisionGate] released pawn=%s"), *Pawn->GetName());
+    }
+    CollisionGatedPawn.Reset();
+    CollisionGatedPawnMovement.Reset();
+    CollisionGatedCharacterMovement.Reset();
+    bSavedCharacterMovementMode = false;
+    bSavedPawnMovementActive = false;
+    bPawnCollisionGateEngaged = false;
+    bPawnGateWaitingForPredictedSupport = false;
+}
+
+void AVoxelWorld::BindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh)
+{
+    if (Mesh == nullptr || CollisionBodyUpdatedHandles.Contains(Mesh))
+    {
+        return;
+    }
+    CollisionBodyUpdatedHandles.Add(
+        Mesh,
+        Mesh->OnCollisionBodyUpdated().AddUObject(
+            this, &AVoxelWorld::HandleRealtimeMeshCollisionBodyUpdated));
+}
+
+void AVoxelWorld::UnbindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh)
+{
+    if (Mesh == nullptr)
+    {
+        return;
+    }
+    if (FDelegateHandle* Handle = CollisionBodyUpdatedHandles.Find(Mesh))
+    {
+        Mesh->OnCollisionBodyUpdated().Remove(*Handle);
+        CollisionBodyUpdatedHandles.Remove(Mesh);
+    }
+}
+
+void AVoxelWorld::HandleRealtimeMeshCollisionBodyUpdated(URealtimeMesh* Mesh, UBodySetup* BodySetup)
+{
+    // RMC dispatches this event on the game thread after installing BodySetup. Keep the future as
+    // the per-request authority, but use the native delegate as an independent completion witness
+    // and diagnostic boundary (it has no tile/request serial of its own).
+    if (!IsInGameThread())
+    {
+        return;
+    }
+    for (TPair<FVoxelTileKey, FPendingCollisionCook>& Pair : PendingCollisionCooks)
+    {
+        FPendingCollisionCook& Pending = Pair.Value;
+        if (Pending.Mesh.Get() == Mesh && BodySetup != nullptr)
+        {
+            Pending.bBodyUpdatedEventSeen = true;
+            Pending.BodyUpdatedEventCycles = FPlatformTime::Cycles64();
+            return;
+        }
+    }
+}
+
+void AVoxelWorld::HandleTileCollisionCookComplete(
+    const FVoxelTileKey& Tile, uint64 SubmissionId, URealtimeMesh* Mesh, uint8 Result)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<AVoxelWorld> WeakWorld(this);
+        AsyncTask(ENamedThreads::GameThread,
+            [WeakWorld, Tile, SubmissionId, Mesh, Result]()
+            {
+                if (AVoxelWorld* World = WeakWorld.Get())
+                {
+                    World->HandleTileCollisionCookComplete(
+                        Tile, SubmissionId, Mesh, Result);
+                }
+            });
+        return;
+    }
+
+    if (bShuttingDown.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    FPendingCollisionCook* Pending = PendingCollisionCooks.Find(Tile);
+    URealtimeMesh* CompletedMesh = Pending ? Pending->Mesh.Get() : nullptr;
+    if (Pending == nullptr || Pending->SubmissionId != SubmissionId
+        || CompletedMesh == nullptr || CompletedMesh != Mesh)
+    {
+        // A remesh, unload, or pool reuse superseded this future. It must not change the newer
+        // tile state, even if RMC finishes the old cook after that transition.
+        return;
+    }
+
+    const uint64 MeasuredMeshSubmittedCycles = Pending->MeshSubmittedCycles;
+    const uint64 MeasuredCollisionSubmittedCycles = Pending->CollisionSubmittedCycles;
+    const bool bBodyUpdatedEventSeen = Pending->bBodyUpdatedEventSeen;
+    const uint64 BodyUpdatedEventCycles = Pending->BodyUpdatedEventCycles;
+    PendingCollisionCooks.Remove(Tile);
+
+    const ERealtimeMeshCollisionUpdateResult CollisionResult =
+        static_cast<ERealtimeMeshCollisionUpdateResult>(Result);
+    const bool bBodyInstalled = CollisionResult == ERealtimeMeshCollisionUpdateResult::Updated
+        && CompletedMesh->GetBodySetup() != nullptr;
+    if (bBodyInstalled)
+    {
+        CollisionReadyTiles.Add(Tile);
+    }
+    else
+    {
+        CollisionReadyTiles.Remove(Tile);
+        // A failed/ignored current cook is not a loaded guarantee. Leaving the tile unloaded makes
+        // the normal submit loop retry it while the pawn remains gated.
+        LoadedTiles.Remove(Tile);
+        bAllChunksLoaded = false;
+    }
+
+    const uint64 ReadyCycles = FPlatformTime::Cycles64();
+    const double MeshToCookSeconds = FPlatformTime::ToSeconds64(
+        ReadyCycles - MeasuredMeshSubmittedCycles);
+    const double CollisionRequestToCookSeconds = FPlatformTime::ToSeconds64(
+        ReadyCycles - MeasuredCollisionSubmittedCycles);
+    const double BodyEventToFutureSeconds = bBodyUpdatedEventSeen
+        && ReadyCycles >= BodyUpdatedEventCycles
+        ? FPlatformTime::ToSeconds64(ReadyCycles - BodyUpdatedEventCycles) : -1.0;
+    const TCHAR* ResultName = TEXT("Unknown");
+    switch (CollisionResult)
+    {
+        case ERealtimeMeshCollisionUpdateResult::Updated: ResultName = TEXT("Updated"); break;
+        case ERealtimeMeshCollisionUpdateResult::Ignored: ResultName = TEXT("Ignored"); break;
+        case ERealtimeMeshCollisionUpdateResult::Error:   ResultName = TEXT("Error");   break;
+        default: break;
+    }
+    if (GVoxelForgeProfileTileGeneration != 0 || VoxelForgeStartupTrace::IsActive()
+        || !bBodyInstalled)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionReady] tile=(%d,%d,%d) level=%d result=%s body_setup=%d "
+                 "ready=%d body_event=%d mesh_submit_to_cook=%.6f "
+                 "collision_request_to_cook=%.6f body_event_to_future=%.6f"),
+            Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, ResultName,
+            CompletedMesh->GetBodySetup() != nullptr ? 1 : 0,
+            bBodyInstalled ? 1 : 0,
+            bBodyUpdatedEventSeen ? 1 : 0,
+            MeshToCookSeconds, CollisionRequestToCookSeconds, BodyEventToFutureSeconds);
+    }
+    if (VoxelForgeStartupTrace::IsActive())
+    {
+        VoxelForgeStartupTrace::RecordEvent(TEXT("collision_ready"), FString::Printf(
+            TEXT("\"tile\":[%d,%d,%d],\"level\":%d,\"result\":\"%s\",\"body_setup\":%d,"
+                 "\"ready\":%d,\"body_update_event\":%d,"
+                 "\"mesh_submit_to_cook_s\":%s,\"collision_request_to_cook_s\":%s,"
+                 "\"body_event_to_future_s\":%s"),
+            Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, ResultName,
+            CompletedMesh->GetBodySetup() != nullptr ? 1 : 0, bBodyInstalled ? 1 : 0,
+            bBodyUpdatedEventSeen ? 1 : 0,
+            *FString::SanitizeFloat(MeshToCookSeconds),
+            *FString::SanitizeFloat(CollisionRequestToCookSeconds),
+            *FString::SanitizeFloat(BodyEventToFutureSeconds)));
+    }
+
+    // A completion can occur between world ticks. Refresh immediately so the pawn is released on
+    // the same game-thread turn once its feet tile is truly collidable.
+    FVector PlayerPosition = FVector::ZeroVector;
+    APawn* PlayerPawn = nullptr;
+    if (TryGetPlayerPosition(PlayerPosition, &PlayerPawn))
+    {
+        UpdatePawnCollisionGate(PlayerPawn, PlayerPosition, 0.0f);
+    }
 }
 
 void AVoxelWorld::ProcessPendingChunks()
@@ -1418,8 +2017,9 @@ void AVoxelWorld::ProcessPendingChunks()
             continue;
         }
 
-        // ApplyTileResult does epoch check, mark-loaded, capture ingest, empty-release / mesh upload.
-        // Only a real (visible) upload counts against the per-frame budget — stale/empty drain free.
+        // ApplyTileResult does epoch check, capture ingest, empty-release / mesh submission, and
+        // only then records the tile as loaded. Only a real (visible) upload counts against the
+        // per-frame budget — stale/empty drains are free.
         if (ApplyTileResult(DequeuedChunk))
         {
             ++MeshesApplied;
@@ -1465,26 +2065,26 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
 
-    // "Ready" is deliberately emitted after the game-thread apply, not when the worker result is
-    // dequeued. This makes request-to-ready include component setup, stream/buffer submission,
-    // and collision configuration—the point at which the chunk is actually visible/collidable.
+    // Applied is emitted after the game-thread submission, not when the worker result is dequeued.
+    // It deliberately does NOT mean collision-ready: RMC's cook future records that later boundary
+    // in HandleTileCollisionCookComplete.
     const bool bResultEmpty = Result.bEmpty || !Result.Streams;
     const bool bTraceTile = VoxelForgeStartupTrace::IsActive();
     const bool bTelemetry = GVoxelForgeProfileTileGeneration != 0 || bTraceTile;
     const uint64 ApplyStartCycles = bTelemetry
         ? FPlatformTime::Cycles64() : 0;
-    const auto LogTileReady = [&]()
+    const auto LogTileApplied = [&]()
     {
         if ((GVoxelForgeProfileTileGeneration != 0 || bTraceTile)
             && Result.RequestStartCycles != 0)
         {
-            const uint64 ReadyCycles = FPlatformTime::Cycles64();
+            const uint64 AppliedCycles = FPlatformTime::Cycles64();
             const bool bHaveWorkerTiming = Result.GenerationStartCycles != 0
                 && Result.GenerationEndCycles >= Result.GenerationStartCycles;
-            const double RequestToReady = FPlatformTime::ToSeconds64(
-                ReadyCycles - Result.RequestStartCycles);
+            const double RequestToApply = FPlatformTime::ToSeconds64(
+                AppliedCycles - Result.RequestStartCycles);
             const double ApplySeconds = ApplyStartCycles != 0
-                ? FPlatformTime::ToSeconds64(ReadyCycles - ApplyStartCycles) : 0.0;
+                ? FPlatformTime::ToSeconds64(AppliedCycles - ApplyStartCycles) : 0.0;
             const double GenerationSeconds = bHaveWorkerTiming
                 ? FPlatformTime::ToSeconds64(
                     Result.GenerationEndCycles - Result.GenerationStartCycles) : 0.0;
@@ -1492,18 +2092,18 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 ? FPlatformTime::ToSeconds64(
                     Result.GenerationStartCycles - Result.RequestStartCycles) : 0.0;
             const double ResultQueueSeconds = bHaveWorkerTiming
-                ? FMath::Max(0.0, RequestToReady - WorkerQueueSeconds
+                ? FMath::Max(0.0, RequestToApply - WorkerQueueSeconds
                     - GenerationSeconds - ApplySeconds)
-                : FMath::Max(0.0, RequestToReady - ApplySeconds);
+                : FMath::Max(0.0, RequestToApply - ApplySeconds);
             if (GVoxelForgeProfileTileGeneration != 0)
             {
                 UE_LOG(LogTemp, Display,
-                    TEXT("[VoxelForgeTileReady] tile=(%d,%d,%d) level=%d empty=%d "
-                         "request_to_ready=%.6f worker_queue=%.6f generation=%.6f "
+                    TEXT("[VoxelForgeTileApplied] tile=(%d,%d,%d) level=%d empty=%d "
+                         "request_to_apply=%.6f worker_queue=%.6f generation=%.6f "
                          "result_queue=%.6f apply=%.6f"),
                     Result.Tile.Coord.X, Result.Tile.Coord.Y, Result.Tile.Coord.Z,
                     Result.Tile.Level, bResultEmpty ? 1 : 0,
-                    RequestToReady, WorkerQueueSeconds, GenerationSeconds,
+                    RequestToApply, WorkerQueueSeconds, GenerationSeconds,
                     ResultQueueSeconds, ApplySeconds);
             }
             if (bTraceTile)
@@ -1515,7 +2115,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 Sample.bCacheHit = Result.bClassifierCacheHit;
                 Sample.bRegionHit = Result.bClassifierRegionHit;
                 Sample.Triangles = Result.NumTriangles;
-                Sample.RequestToReadySeconds = RequestToReady;
+                Sample.RequestToApplySeconds = RequestToApply;
                 Sample.WorkerQueueSeconds = WorkerQueueSeconds;
                 Sample.ResultQueueSeconds = ResultQueueSeconds;
                 Sample.QueueWaitSeconds = WorkerQueueSeconds + ResultQueueSeconds;
@@ -1529,14 +2129,6 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         }
     };
 
-    // Mark the tile loaded (even if empty — so we don't re-submit it).
-    LoadedTiles.Add(Result.Tile);
-
-    // Une tuile en vol n'est JAMAIS annulée : si le desired set a bougé pendant sa gen, elle
-    // arrive ici hors desired — le delta cull ne re-scanne plus tout, donc on l'inscrit en
-    // TransitionHold pour qu'elle soit re-considérée au prochain crossing (ou au settled cull).
-    if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
-
     // CAPTURE-DURING-MESHING: hand the mesher's captured density grid to the clipmap BEFORE the
     // empty-tile early-out — all-air / all-solid tiles are exactly the uniform cells the volume
     // needs, and they carry a valid CaptureGrid even though they render nothing.
@@ -1545,9 +2137,22 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         DensityVolume->IngestTileCapture(Result.Tile.Coord, MoveTemp(Result.CaptureGrid));
     }
 
-    // Empty mesh = all-air tile — nothing to render, but still "loaded".
+    // Empty mesh = no-surface tile — nothing to render, but still "loaded".
     if (Result.bEmpty || !Result.Streams)
     {
+        // An empty re-gen invalidates any previous body and any completion future for the old
+        // geometry. Empty tiles are loaded bookkeeping, never collision-ready.
+        CollisionReadyTiles.Remove(Result.Tile);
+        CollisionSolidTiles.Remove(Result.Tile);
+        if (Result.Tile.Level == 0)
+        {
+            CollisionNotRequiredTiles.Add(Result.Tile);
+            if (Result.ClassifyVerdict == static_cast<int32>(EVoxelTileClass::AllSolid))
+            {
+                CollisionSolidTiles.Add(Result.Tile);
+            }
+        }
+        PendingCollisionCooks.Remove(Result.Tile);
         // Une RE-GEN (BandRemeshQueue / RemeshDirtyChunks) peut passer de "contenu" à "vide" :
         // bande déplacée hors de la tuile, ou skip cellule-plus-haute-que-la-bande après un
         // changement de strate (LoadTile). L'ancien composant doit tomber, sinon sa vieille
@@ -1571,16 +2176,36 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 Result.Tile.Level,
                 bReleasedComponent ? 1 : 0,
                 FPlatformTime::ToSeconds64(
-                    FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
+                FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
         }
-        LogTileReady();
+        LoadedTiles.Add(Result.Tile);
+        // Une tuile en vol n'est JAMAIS annulée : si le desired set a bougé pendant sa gen, elle
+        // arrive ici hors desired — le delta cull ne re-scanne plus tout, donc on l'inscrit en
+        // TransitionHold pour qu'elle soit re-considérée au prochain crossing (ou au settled cull).
+        if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
+        LogTileApplied();
         return false;
     }
 
     // Apply mesh (GPU upload). The vertex/index buffers were already built (T1.f, on the worker for
     // the async path or inline for the sync carve path); the game thread only uploads them here.
-    ApplyMeshToTile(Result);
-    LogTileReady();
+    const bool bApplied = ApplyMeshToTile(Result);
+    if (!bApplied)
+    {
+        // A component/mesh initialisation failure is recoverable. Do not poison LoadedTiles: the
+        // ordinary submit loop will retry this desired tile on a later frame.
+        CollisionReadyTiles.Remove(Result.Tile);
+        CollisionNotRequiredTiles.Remove(Result.Tile);
+        CollisionSolidTiles.Remove(Result.Tile);
+        PendingCollisionCooks.Remove(Result.Tile);
+        LoadedTiles.Remove(Result.Tile);
+        bAllChunksLoaded = false;
+        LogTileApplied();
+        return false;
+    }
+    LoadedTiles.Add(Result.Tile);
+    if (!IsDesired(Result.Tile)) { AddToTransitionHold(Result.Tile); }
+    LogTileApplied();
     return true;
 }
 
@@ -1628,6 +2253,7 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - GenerateStartCycles)
         : 0.0;
     const uint64 ApplyStartCycles = bProfileModification ? FPlatformTime::Cycles64() : 0;
+    const bool bResultEmpty = Result.bEmpty || !Result.Streams;
     ApplyTileResult(Result);
     if (bProfileModification)
     {
@@ -1635,7 +2261,7 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
             TEXT("[VoxelForgeSyncRemeshProfile] tile=(%d,%d,%d) empty=%d generation=%.6f "
                  "apply=%.6f total=%.6f"),
             Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z,
-            (Result.bEmpty || !Result.Streams) ? 1 : 0,
+            bResultEmpty ? 1 : 0,
             GenerateSeconds,
             FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles),
             FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - SyncStartCycles));
@@ -2764,6 +3390,66 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         const double ClassifyStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
         const EVoxelTileClass Verdict = Generator->ClassifyTile(
             OriginVoxels, Step, Cells, bMeasureTile ? &ClassifierStats : nullptr);
+
+        // ITEM 6 — the outer classifier is a proof candidate, not the final skip decision. The
+        // mesher's block path validates candidates against the exact MC vertex lattice before it
+        // skips anything; whole-tile verdicts need the same fence. Sample the core vertices
+        // g=0..Cells (the halo is normal-only) with the mesher's LOD TLS, so a coarse tile is
+        // checked against the field the mesher would actually consume.
+        EVoxelTileClass ValidatedVerdict = Verdict;
+        bool bValidationAborted = false;
+        if (Verdict != EVoxelTileClass::Mixed)
+        {
+            const int32 ValidationStep = FMath::Max(1, Step);
+            const int32 ValidationCells = FMath::Clamp(Cells, 2, CHUNK_SIZE);
+            const int32 ValidationOctaveBias = (Mesher->LODOctaveDrop > 0 && ValidationStep > 1)
+                ? Mesher->LODOctaveDrop
+                    * static_cast<int32>(FMath::FloorLog2(static_cast<uint32>(ValidationStep)))
+                : 0;
+            TGuardValue<int32> ValidationOctaveBiasGuard(
+                VoxelGenLOD::OctaveBias, ValidationOctaveBias);
+            TGuardValue<int32> ValidationSampleStepGuard(
+                VoxelGenLOD::SampleStep, ValidationStep);
+
+            bool bExactUniform = true;
+            for (int32 Z = 0; Z <= ValidationCells && bExactUniform && !bValidationAborted; ++Z)
+            {
+                if (ShouldAbortWork())
+                {
+                    bValidationAborted = true;
+                    break;
+                }
+                for (int32 Y = 0; Y <= ValidationCells && bExactUniform && !bValidationAborted; ++Y)
+                {
+                    for (int32 X = 0; X <= ValidationCells; ++X)
+                    {
+                        const float Density = Generator->GetDensityAt(
+                            OriginVoxels.X + X * ValidationStep,
+                            OriginVoxels.Y + Y * ValidationStep,
+                            OriginVoxels.Z + Z * ValidationStep);
+                        if (!FMath::IsFinite(Density) || Density == 0.0f
+                            || (Verdict == EVoxelTileClass::AllSolid && Density >= 0.0f)
+                            || (Verdict == EVoxelTileClass::AllAir && Density <= 0.0f))
+                        {
+                            bExactUniform = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!bExactUniform)
+            {
+                // A false Mixed costs meshing; a false uniform verdict removes both render and
+                // collision geometry. Fall back to the safe path whenever one exact vertex disagrees.
+                ValidatedVerdict = EVoxelTileClass::Mixed;
+            }
+        }
+        if (bValidationAborted)
+        {
+            AbortResult();
+            EmitTileProfile();
+            return;
+        }
         ClassifySeconds = bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
         if (bMeasureTile)
         {
@@ -2778,7 +3464,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             Result.bClassifierRegionHit =
                 ClassifyProfileEnd.Counters[RegionHitIndex] > TileProfileStart.Counters[RegionHitIndex];
         }
-        ClassifyVerdict = static_cast<int32>(Verdict);
+        ClassifyVerdict = static_cast<int32>(ValidatedVerdict);
         Result.ClassifyVerdict = ClassifyVerdict;
         if (ShouldAbortWork())
         {
@@ -2786,15 +3472,15 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             EmitTileProfile();
             return;
         }
-        if (Verdict == EVoxelTileClass::AllSolid)
+        if (ValidatedVerdict == EVoxelTileClass::AllSolid)
         {
             INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllSolid);
         }
-        else if (Verdict == EVoxelTileClass::AllAir)
+        else if (ValidatedVerdict == EVoxelTileClass::AllAir)
         {
             INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllAir);
         }
-        bTrivialEmpty = (Verdict != EVoxelTileClass::Mixed);
+        bTrivialEmpty = (ValidatedVerdict != EVoxelTileClass::Mixed);
     }
 
     // F18 — feuille : deux heightfields sol/cap échantillonnés par colonne (pas de marching
@@ -2923,8 +3609,17 @@ void AVoxelWorld::ReleaseTileComponent(URealtimeMeshComponent* Comp)
 {
     if (!IsValid(Comp)) { return; }
 
+    // A pooled component may still have its previous BodySetup while RMC processes the asynchronous
+    // RemoveSectionGroup collision update. Disable the component first so that stale geometry can
+    // never act as a collision barrier for another tile while it is parked.
+    Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
     if (TileComponentPool.Num() >= MaxPooledTileComponents)
     {
+        if (URealtimeMeshSimple* RTMesh = Comp->GetRealtimeMeshAs<URealtimeMeshSimple>())
+        {
+            UnbindRealtimeMeshCollisionEvent(RTMesh);
+        }
         Comp->DestroyComponent();
         return;
     }
@@ -2943,6 +3638,12 @@ void AVoxelWorld::ReleaseTileComponent(URealtimeMeshComponent* Comp)
 
 void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
 {
+    // RMC futures are not cancellable from the world side. Remove this tile's state first so a
+    // late completion from the old component cannot resurrect readiness after pool reuse.
+    CollisionReadyTiles.Remove(Tile);
+    CollisionNotRequiredTiles.Remove(Tile);
+    CollisionSolidTiles.Remove(Tile);
+    PendingCollisionCooks.Remove(Tile);
     // Water + decorations are no longer tile-bound (water is one player-following ocean plane via
     // UpdateWater; decorations stream by distance via UpdateDecorations) — nothing to clear per tile.
     if (URealtimeMeshComponent** Comp = TileComponents.Find(Tile))
@@ -2955,7 +3656,7 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
     TransitionHold.Remove(Tile);   // couvre aussi le settled cull (qui ne tient pas la hold à jour)
 }
 
-void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
+bool AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ApplyMeshToChunk);
 
@@ -2970,6 +3671,13 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     const bool bHasGroundTris  = Result.bHasGroundTris;
     const bool bHasCeilingTris = Result.bHasCeilingTris;
     const bool bLevel0 = (Tile.Level == 0);
+
+    // A new mesh submission replaces the previous collision body. Invalidate readiness before any
+    // RMC mutation; the old completion future remains alive but its serial/map entry is gone.
+    CollisionReadyTiles.Remove(Tile);
+    CollisionNotRequiredTiles.Remove(Tile);
+    CollisionSolidTiles.Remove(Tile);
+    PendingCollisionCooks.Remove(Tile);
 
     // F17 — materials per POLYGROUP, not per tile. The mesher classified each triangle
     // semantically (sky-cap = down-facing near the column's CeilSurf; terrain overhangs and
@@ -3042,6 +3750,18 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
             bProfileApply ? &bComponentCreated : nullptr);
         TileComponents.Add(Tile, MeshComp);
     }
+    if (!IsValid(MeshComp))
+    {
+        TileComponents.Remove(Tile);
+        if (bProfileApply)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[VoxelForgeApplyProfile] level=%d empty=0 failed_component_acquire=1 total=%.6f"),
+                Tile.Level,
+                FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles));
+        }
+        return false;
+    }
     const double ComponentSeconds = bProfileApply
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ComponentStartCycles)
         : 0.0;
@@ -3050,6 +3770,8 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     // collision below but is hidden (no draw / VSM). Set every apply (overrides the pool's default-
     // visible state); ReconcileAnchorTileVisibility handles later flips on already-loaded tiles.
     MeshComp->SetVisibility(!CollisionOnlyTiles.Contains(Tile));
+    MeshComp->SetCollisionEnabled(
+        bLevel0 ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
 
     // Reuse the component's existing mesh object when it has one (pooled component or carve
     // re-mesh) — InitializeRealtimeMesh allocates a brand-new URealtimeMesh EVERY call, so
@@ -3070,8 +3792,11 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
                 Tile.Level,
                 FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - ApplyStartCycles));
         }
-        return;
+        TileComponents.Remove(Tile);
+        ReleaseTileComponent(MeshComp);
+        return false;
     }
+    BindRealtimeMeshCollisionEvent(RTMesh);
     // Shadow casting: far (level >= 2) tiles never cast; the sky-cap SECTION never casts either
     // — otherwise the high rock ceiling shadows the entire terrain below it. F17: shadow is now
     // PER SECTION, so a mixed tile keeps its ground shadow while its cap stays shadowless.
@@ -3096,6 +3821,7 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     // budget without modifying RealtimeMeshComponent.
     const uint64 StreamUploadStartCycles = bProfileApply ? FPlatformTime::Cycles64() : 0;
     RTMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    const uint64 MeshSubmittedCycles = FPlatformTime::Cycles64();
     const double StreamUploadSeconds = bProfileApply
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - StreamUploadStartCycles)
         : 0.0;
@@ -3126,6 +3852,41 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - CollisionConfigStartCycles)
         : 0.0;
 
+    if (bLevel0)
+    {
+        // RMC's collision future is fulfilled only after its async cook has been applied to the
+        // mesh BodySetup. This is the per-apply completion boundary; no submission-time guess is
+        // promoted to CollisionReadyTiles.
+        const uint64 SubmissionId = ++NextCollisionSubmissionId;
+        const FRealtimeMeshCollisionConfiguration CollisionConfig = RTMesh->GetCollisionConfig();
+        const uint64 CollisionSubmittedCycles = FPlatformTime::Cycles64();
+
+        FPendingCollisionCook Pending;
+        Pending.Mesh = RTMesh;
+        Pending.SubmissionId = SubmissionId;
+        Pending.MeshSubmittedCycles = MeshSubmittedCycles;
+        Pending.CollisionSubmittedCycles = CollisionSubmittedCycles;
+        PendingCollisionCooks.Add(Tile, Pending);
+
+        // Register the serial before asking RMC to dirty collision. The current implementation
+        // defers the future to end-of-frame, but this ordering also keeps an already-fulfilled
+        // future or an inline body-update event from racing the per-tile record.
+        TFuture<ERealtimeMeshCollisionUpdateResult> CollisionFuture =
+            RTMesh->SetCollisionConfig(CollisionConfig);
+
+        TWeakObjectPtr<AVoxelWorld> WeakWorld(this);
+        TWeakObjectPtr<URealtimeMesh> WeakMesh(RTMesh);
+        CollisionFuture.Next(
+            [WeakWorld, WeakMesh, Tile, SubmissionId](ERealtimeMeshCollisionUpdateResult CollisionResult)
+            {
+                if (AVoxelWorld* World = WeakWorld.Get())
+                {
+                    World->HandleTileCollisionCookComplete(
+                        Tile, SubmissionId, WeakMesh.Get(), static_cast<uint8>(CollisionResult));
+                }
+            });
+    }
+
     if (bProfileApply)
     {
         const double TotalSeconds = FPlatformTime::ToSeconds64(
@@ -3154,6 +3915,7 @@ void AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
 
     // Water is no longer spawned per tile — it's a single player-following ocean plane (UpdateWater,
     // driven from Tick), so it renders at every LOD and to the horizon with no per-tile gaps.
+    return true;
 }
 
 //=============================================================================

@@ -32,8 +32,8 @@ constexpr float VOXEL_SIZE = 25.0f;
 // TRIVIAL-TILE CLASSIFICATION (T1.d)
 //=============================================================================
 // Verdict de ClassifyTile pour une tuile AVANT le pré-échantillonnage 33³+ :
-// AllSolid / AllAir garantissent que CHAQUE point du treillis du mesher (marge
-// ±1 incluse) est du même côté de l'iso ⇒ maillage vide, GenerateMesh est
+// AllSolid / AllAir guarantee every core cell vertex of the mesher (g=0..Cells;
+// the ±1 halo is normal-only) is on the same side of the iso ⇒ empty mesh, GenerateMesh is
 // sautée. Mixed = "je ne peux pas le prouver" ⇒ génération normale. Un faux
 // Mixed coûte juste du CPU ; un faux AllSolid/AllAir ferait un TROU — les
 // verdicts ne sont donc émis que sur des bornes exactes (colonnes surface
