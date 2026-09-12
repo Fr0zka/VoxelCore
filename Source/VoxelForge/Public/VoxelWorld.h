@@ -107,6 +107,11 @@ struct FChunkResult
     uint64 GenerationEndCycles = 0;
     uint64 ApplyStartCycles = 0;
     int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
+    // Clean, low-overhead work counters. These are carried with the result so the worker can
+    // count exact validation and mesher density calls locally, then publish one aggregate update.
+    int64 ValidationDensityCalls = 0;
+    int64 MesherDensityCalls = 0;
+    bool bValidationCoreReused = false;
     bool bAborted = false;    // Worker observed shutdown or cancellation; never mark this tile loaded
     bool bObsolete = false;   // Worker observed per-tile desired-set cancellation
     uint32 DesiredEpoch = 0;  // Desired-set epoch captured at request time
@@ -914,6 +919,19 @@ public:
     uint32 DesiredEpoch = 0;               // increments whenever DesiredStamped is rebuilt
     int32 ObsoleteTileAbortCount = 0;      // cumulative per-world moving-session cancellation count
     float PeakObservedPawnSpeedCmPerSecond = 0.0f;
+
+    // Clean performance accounting. LOD 0..8 covers every marching-cubes clip level; sheet tiles
+    // above the configured MC range never enter the outer classifier.
+    static constexpr int32 TrackedClassifierLODCount = 9;
+    std::atomic<uint64> TotalWorkerGenerationCycles{0};
+    std::atomic<uint64> TotalWorkerGenerationTasks{0};
+    std::atomic<uint64> TotalObsoleteWorkerCycles{0};
+    std::atomic<uint64> TotalObsoleteWorkerTasks{0};
+    std::atomic<uint64> TotalValidationDensityCalls{0};
+    std::atomic<uint64> TotalMesherDensityCalls{0};
+    std::atomic<uint64> TotalValidationCoreReuseTiles{0};
+    std::atomic<uint64> OuterClassifierCallsByLOD[TrackedClassifierLODCount]{};
+    std::atomic<uint64> OuterClassifierVerdictsByLOD[TrackedClassifierLODCount][3]{};
 
     struct FStreamingLatencySample
     {

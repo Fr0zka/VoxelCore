@@ -74,6 +74,22 @@ namespace
         GVoxelForgePerfAttribution,
         TEXT("Collect low-overhead component attribution for the game path."));
 
+    // The nested 8^3 proof is useful for focused/offline measurements, but it is opt-in for
+    // streaming because every qualifying mixed tile would pay the recursive proof again.
+    int32 GVoxelForgeUseBlockEarlyOut = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeUseBlockEarlyOut(
+        TEXT("voxel.UseBlockEarlyOut"),
+        GVoxelForgeUseBlockEarlyOut,
+        TEXT("Use the optional nested 8x8x8 mesher classifier in streaming."));
+
+    // Outer classifier benchmark modes: 0 = disabled, 1 = current discarded exact validation,
+    // 2 = exact validation core reused by the mesher when the candidate fails validation.
+    int32 GVoxelForgeOuterClassifierMode = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeOuterClassifierMode(
+        TEXT("voxel.OuterClassifierMode"),
+        GVoxelForgeOuterClassifierMode,
+        TEXT("Outer tile classifier mode: 0 off, 1 discarded validation, 2 validation-core reuse."));
+
     // Startup command-line cvars can arrive before the game world has spawned AVoxelWorld (or
     // before its first tiles have become visible). Keep the diagnostic edit pending until Tick has
     // a loaded tile; otherwise a startup measurement silently becomes a no-op or edits the wrong
@@ -1036,6 +1052,21 @@ void AVoxelWorld::BeginPlay()
     LOD0ReadySamples.Reset();
     ObsoleteTileAbortCount = 0;
     PeakObservedPawnSpeedCmPerSecond = 0.0f;
+    TotalWorkerGenerationCycles.store(0, std::memory_order_relaxed);
+    TotalWorkerGenerationTasks.store(0, std::memory_order_relaxed);
+    TotalObsoleteWorkerCycles.store(0, std::memory_order_relaxed);
+    TotalObsoleteWorkerTasks.store(0, std::memory_order_relaxed);
+    TotalValidationDensityCalls.store(0, std::memory_order_relaxed);
+    TotalMesherDensityCalls.store(0, std::memory_order_relaxed);
+    TotalValidationCoreReuseTiles.store(0, std::memory_order_relaxed);
+    for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
+    {
+        OuterClassifierCallsByLOD[LOD].store(0, std::memory_order_relaxed);
+        for (int32 Verdict = 0; Verdict < 3; ++Verdict)
+        {
+            OuterClassifierVerdictsByLOD[LOD][Verdict].store(0, std::memory_order_relaxed);
+        }
+    }
     ConfigureHeadlessStreamingTest();
 
     // Some headless harnesses load module CVars after the engine's startup-CVar pass. Read the
@@ -1044,6 +1075,8 @@ void AVoxelWorld::BeginPlay()
     int32 CommandLineProfile = GVoxelForgeProfileDensity;
     int32 CommandLineProfileFull = GVoxelForgeProfileDensityFull;
     int32 CommandLinePerfAttribution = GVoxelForgePerfAttribution;
+    int32 CommandLineUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut;
+    int32 CommandLineOuterClassifierMode = GVoxelForgeOuterClassifierMode;
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
     {
         GVoxelForgeProfileDensity = CommandLineProfile;
@@ -1056,6 +1089,16 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgePerfAttribution = CommandLinePerfAttribution;
     }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.UseBlockEarlyOut="), CommandLineUseBlockEarlyOut))
+    {
+        GVoxelForgeUseBlockEarlyOut = CommandLineUseBlockEarlyOut;
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.OuterClassifierMode="), CommandLineOuterClassifierMode))
+    {
+        GVoxelForgeOuterClassifierMode = CommandLineOuterClassifierMode;
+    }
+    GVoxelForgeUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0 ? 1 : 0;
+    GVoxelForgeOuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 2);
 
     if (GVoxelForgePerfAttribution != 0)
     {
@@ -1159,7 +1202,11 @@ void AVoxelWorld::BeginPlay()
     Mesher->bGenerateSkirts = Settings->bGenerateSkirts;
     Mesher->SkirtCells      = Settings->SkirtCells;
     Mesher->LODOctaveDrop   = Settings->LODOctaveDrop;   // T2.b — 0 = off
-    Mesher->bUseBlockEarlyOut = true;
+    Mesher->bUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0;
+
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeClassifierConfig] outer_mode=%d nested_block_early_out=%d"),
+        GVoxelForgeOuterClassifierMode, Mesher->bUseBlockEarlyOut ? 1 : 0);
 
     VoxelForgeStartupTrace::RecordEvent(TEXT("generator_mesher_constructed"), FString::Printf(
         TEXT("\"generator\":1,\"mesher\":1,\"generate_skirts\":%d,\"full_res_clip_levels\":%d,\"coarse_tile_cells\":%d"),
@@ -2102,6 +2149,25 @@ void AVoxelWorld::LogStreamingLatencySummary() const
     const double RequestP95 = Percentile(RequestToReady, 0.95);
     const double TravelP95Metres = RequestP95
         * static_cast<double>(PeakObservedPawnSpeedCmPerSecond) / 100.0;
+    FString ClassifierVerdictSummary;
+    for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
+    {
+        if (LOD > 0)
+        {
+            ClassifierVerdictSummary += TEXT(";");
+        }
+        ClassifierVerdictSummary += FString::Printf(
+            TEXT("l%d[c=%llu,m=%llu,s=%llu,a=%llu]"),
+            LOD,
+            static_cast<unsigned long long>(OuterClassifierCallsByLOD[LOD].load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(OuterClassifierVerdictsByLOD[LOD][0].load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(OuterClassifierVerdictsByLOD[LOD][1].load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(OuterClassifierVerdictsByLOD[LOD][2].load(std::memory_order_relaxed)));
+    }
+    const uint64 WorkerGenerationCycles =
+        TotalWorkerGenerationCycles.load(std::memory_order_relaxed);
+    const uint64 ObsoleteWorkerCycles =
+        TotalObsoleteWorkerCycles.load(std::memory_order_relaxed);
     const bool bDiagnosticsEnabled = GVoxelForgeProfileTileGeneration != 0
         || VoxelForgeStartupTrace::IsActive()
         || VoxelDensityProfile::GetMode() != VoxelDensityProfile::EMode::Disabled;
@@ -2111,7 +2177,13 @@ void AVoxelWorld::LogStreamingLatencySummary() const
              "queue_wait_s[p50=%.6f p95=%.6f max=%.6f] "
              "generation_s[p50=%.6f p95=%.6f max=%.6f] "
              "collision_cook_s[p50=%.6f p95=%.6f max=%.6f] "
-             "peak_speed_cm_s=%.3f p95_travel_m=%.6f obsolete_tile_aborts=%d"),
+             "peak_speed_cm_s=%.3f p95_travel_m=%.6f obsolete_tile_aborts=%d "
+             "outer_classifier_mode=%d nested_block_early_out=%d "
+             "worker_generation_tasks=%llu worker_generation_sum_s=%.6f "
+             "validation_density_calls=%llu mesher_density_calls=%llu "
+             "validation_core_reuse_tiles=%llu "
+             "obsolete_worker_tasks=%llu obsolete_worker_sum_s=%.6f "
+             "outer_classifier_verdicts=%s"),
         bDiagnosticsEnabled ? TEXT("profiled") : TEXT("clean"),
         bDiagnosticsEnabled ? TEXT("on") : TEXT("off"),
         LOD0ReadySamples.Num(),
@@ -2119,7 +2191,16 @@ void AVoxelWorld::LogStreamingLatencySummary() const
         Percentile(QueueWait, 0.50), Percentile(QueueWait, 0.95), Maximum(QueueWait),
         Percentile(Generation, 0.50), Percentile(Generation, 0.95), Maximum(Generation),
         Percentile(CollisionCook, 0.50), Percentile(CollisionCook, 0.95), Maximum(CollisionCook),
-        PeakObservedPawnSpeedCmPerSecond, TravelP95Metres, ObsoleteTileAbortCount);
+        PeakObservedPawnSpeedCmPerSecond, TravelP95Metres, ObsoleteTileAbortCount,
+        GVoxelForgeOuterClassifierMode, GVoxelForgeUseBlockEarlyOut,
+        static_cast<unsigned long long>(TotalWorkerGenerationTasks.load(std::memory_order_relaxed)),
+        FPlatformTime::ToSeconds64(WorkerGenerationCycles),
+        static_cast<unsigned long long>(TotalValidationDensityCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(TotalMesherDensityCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(TotalValidationCoreReuseTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(TotalObsoleteWorkerTasks.load(std::memory_order_relaxed)),
+        FPlatformTime::ToSeconds64(ObsoleteWorkerCycles),
+        *ClassifierVerdictSummary);
 }
 
 void AVoxelWorld::HandleTileCollisionCookComplete(
@@ -3644,7 +3725,19 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             ? FPlatformTime::Cycles64() : 0;
         Result.RequestStartCycles = RequestStartCycles;
 
-        if (Cancellation->bObsolete.load(std::memory_order_relaxed) || Result.bAborted)
+        const uint64 WorkerGenerationCycles = Result.GenerationEndCycles >= GenerationStartCycles
+            ? Result.GenerationEndCycles - GenerationStartCycles : 0;
+        TotalWorkerGenerationTasks.fetch_add(1, std::memory_order_relaxed);
+        TotalWorkerGenerationCycles.fetch_add(WorkerGenerationCycles, std::memory_order_relaxed);
+        const bool bObsoleteWork = Cancellation->bObsolete.load(std::memory_order_relaxed)
+            || Result.bObsolete;
+        if (bObsoleteWork)
+        {
+            TotalObsoleteWorkerTasks.fetch_add(1, std::memory_order_relaxed);
+            TotalObsoleteWorkerCycles.fetch_add(WorkerGenerationCycles, std::memory_order_relaxed);
+        }
+
+        if (bObsoleteWork || Result.bAborted)
         {
             if (!ShouldAbortWork())
             {
@@ -3790,6 +3883,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     Result.MeshSeconds = 0.0;
     Result.StreamSeconds = 0.0;
     Result.NumTriangles = 0;
+    Result.ValidationDensityCalls = 0;
+    Result.MesherDensityCalls = 0;
+    Result.bValidationCoreReused = false;
     Result.Streams.Reset();
     Result.CaptureGrid.Reset();
     Result.BandChunkLo = BandChunkLo;   // strate content cut (MIN/MAX = uncut)
@@ -3821,7 +3917,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     // même pour les cellules uniformes, et ces tuiles sont rares (fenêtre d'ombre).
     // (Gate IsoLevel == 0 : les verdicts du classifieur supposent l'iso MC à zéro exactement.)
     bool bTrivialEmpty = false;
-    if (!bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
+    FVoxelMesherCoreDensityGrid ValidationCoreGrid;
+    const FVoxelMesherCoreDensityGrid* ReusableCoreGrid = nullptr;
+    const int32 OuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 2);
+    const bool bUseValidationCoreReuse = OuterClassifierMode == 2;
+    if (OuterClassifierMode != 0
+        && !bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
@@ -3849,37 +3950,73 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             TGuardValue<int32> ValidationSampleStepGuard(
                 VoxelGenLOD::SampleStep, ValidationStep);
 
+            if (bUseValidationCoreReuse)
+            {
+                ValidationCoreGrid.OriginVoxels = OriginVoxels;
+                ValidationCoreGrid.Step = ValidationStep;
+                ValidationCoreGrid.CellsPerAxis = ValidationCells;
+                const int32 ValidationDim = ValidationCells + 1;
+                ValidationCoreGrid.Samples.SetNumUninitialized(
+                    ValidationDim * ValidationDim * ValidationDim);
+            }
+
             bool bExactUniform = true;
-            for (int32 Z = 0; Z <= ValidationCells && bExactUniform && !bValidationAborted; ++Z)
+            for (int32 Z = 0; Z <= ValidationCells
+                && (bUseValidationCoreReuse || bExactUniform) && !bValidationAborted; ++Z)
             {
                 if (ShouldAbortWork(ObsoleteFlag))
                 {
                     bValidationAborted = true;
                     break;
                 }
-                for (int32 Y = 0; Y <= ValidationCells && bExactUniform && !bValidationAborted; ++Y)
+                for (int32 Y = 0; Y <= ValidationCells
+                    && (bUseValidationCoreReuse || bExactUniform) && !bValidationAborted; ++Y)
                 {
                     for (int32 X = 0; X <= ValidationCells; ++X)
                     {
+                        if (ShouldAbortWork(ObsoleteFlag))
+                        {
+                            bValidationAborted = true;
+                            break;
+                        }
                         const float Density = Generator->GetDensityAt(
                             OriginVoxels.X + X * ValidationStep,
                             OriginVoxels.Y + Y * ValidationStep,
                             OriginVoxels.Z + Z * ValidationStep);
-                        if (!FMath::IsFinite(Density) || Density == 0.0f
-                            || (Verdict == EVoxelTileClass::AllSolid && Density >= 0.0f)
-                            || (Verdict == EVoxelTileClass::AllAir && Density <= 0.0f))
+                        ++Result.ValidationDensityCalls;
+                        if (bUseValidationCoreReuse)
+                        {
+                            const int32 ValidationDim = ValidationCells + 1;
+                            ValidationCoreGrid.Samples[
+                                (Z * ValidationDim + Y) * ValidationDim + X] = Density;
+                        }
+                        const bool bSampleAgrees = FMath::IsFinite(Density) && Density != 0.0f
+                            && (Verdict != EVoxelTileClass::AllSolid || Density < 0.0f)
+                            && (Verdict != EVoxelTileClass::AllAir || Density > 0.0f);
+                        if (!bSampleAgrees)
                         {
                             bExactUniform = false;
-                            break;
+                            if (!bUseValidationCoreReuse)
+                            {
+                                break;
+                            }
                         }
                     }
                 }
             }
+            TotalValidationDensityCalls.fetch_add(
+                static_cast<uint64>(Result.ValidationDensityCalls), std::memory_order_relaxed);
             if (!bExactUniform)
             {
                 // A false Mixed costs meshing; a false uniform verdict removes both render and
                 // collision geometry. Fall back to the safe path whenever one exact vertex disagrees.
                 ValidatedVerdict = EVoxelTileClass::Mixed;
+                if (bUseValidationCoreReuse && !bValidationAborted)
+                {
+                    ReusableCoreGrid = &ValidationCoreGrid;
+                    Result.bValidationCoreReused = true;
+                    TotalValidationCoreReuseTiles.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
         if (bValidationAborted)
@@ -3891,6 +4028,13 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         ClassifySeconds = bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
         ClassifyVerdict = static_cast<int32>(ValidatedVerdict);
         Result.ClassifyVerdict = ClassifyVerdict;
+        const int32 TrackedLOD = FMath::Clamp(Tile.Level, 0, TrackedClassifierLODCount - 1);
+        OuterClassifierCallsByLOD[TrackedLOD].fetch_add(1, std::memory_order_relaxed);
+        if (ClassifyVerdict >= 0 && ClassifyVerdict < 3)
+        {
+            OuterClassifierVerdictsByLOD[TrackedLOD][ClassifyVerdict].fetch_add(
+                1, std::memory_order_relaxed);
+        }
         if (ShouldAbortWork(ObsoleteFlag))
         {
             AbortResult();
@@ -3923,7 +4067,10 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                                         HoleMinX, HoleMinY, HoleMaxX, HoleMaxY)
             : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
                                    bWantCapture ? &Result.CaptureGrid : nullptr,
-                                   BandVoxLo, BandVoxHi);
+                                   BandVoxLo, BandVoxHi, ReusableCoreGrid,
+                                   &Result.MesherDensityCalls);
+        TotalMesherDensityCalls.fetch_add(
+            static_cast<uint64>(Result.MesherDensityCalls), std::memory_order_relaxed);
         MeshSeconds = bMeasureTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
         INC_DWORD_STAT(STAT_VoxelForgeTilesMeshed);
         if (ShouldAbortWork(ObsoleteFlag))
