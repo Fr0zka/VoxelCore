@@ -9539,6 +9539,13 @@ namespace VoxelDensityOps
             // disturbances. Keeping these pre-disturbance graph scans here duplicated both the
             // support and air queries for every voxel; the feature remains in that shared post.
             OutStack.Add(MakeUnique<FXYEdgeSealOp>(P.BaseDensity));
+
+            // Lower only the canonical native graph.  The old scalar TunnelNetwork evaluator is
+            // the fused form of exactly these authored stages: it keeps density/SDF/room state in
+            // locals and gates the complete 4b-4h detail suite per sample.  Marking the plan after
+            // the final op is important: recipes and composer stacks keep the interpreted/block
+            // fallback, even when they happen to contain a similar-looking subset of operators.
+            OutStack.SetFusedEvaluator(EVoxelOpFusedEvaluator::TunnelNetwork);
         }
     }
 

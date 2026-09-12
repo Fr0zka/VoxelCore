@@ -20,6 +20,7 @@ class UVoxelSettings;
 class UVoxelStrateManager;
 class UVoxelDiffLayer;
 class UVoxelBiomeDefinition;
+struct FTunnelCoreWorldEvaluation;
 
 //=============================================================================
 // LOD-AWARE OCTAVE REDUCTION (T2.b)
@@ -189,7 +190,14 @@ public:
     float GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
                                const FStrateGenerationParams& Params,
                                uint32 ParamsFingerprint, uint32 LayoutVersion,
-                               bool bApplyLegacyStructuralPosts = true) const;
+                               bool bApplyLegacyStructuralPosts = true,
+                               // Optional hand-off used by a lowered canonical evaluator. When
+                               // non-null, this receives the pre-disturbance TunnelNetwork core;
+                               // it does not alter the scalar field result.
+                               FTunnelCoreWorldEvaluation* OutTunnelCore = nullptr,
+                               // Diagnostics are opt-in so ordinary/reference calls do not pay
+                               // for fused-path counters.
+                               bool bCollectFusedDiagnostics = false) const;
 
     /**
      * Densité pour une strate Slab (FlatPlain / CrystalChamber).

@@ -20,6 +20,8 @@
 #include "VoxelDensityProfile.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"
 #include "Misc/ScopeLock.h"
 
 #if WITH_EDITOR
@@ -27,6 +29,34 @@
 #endif
 
 #include <atomic>
+
+namespace
+{
+    // The canonical native TunnelNetwork/Underwater graph has a hand-lowered evaluator.  Keep a
+    // command-line switch so every change can be A/B'd against the existing interpreted/block
+    // path without changing the authored graph or rebuilding a different world definition.
+    int32 GVoxelForgeUseFusedEvaluator = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeUseFusedEvaluator(
+        TEXT("voxel.UseFusedEvaluator"),
+        GVoxelForgeUseFusedEvaluator,
+        TEXT("Use the lowered fused evaluator for canonical TunnelNetwork operator stacks."));
+    bool GVoxelForgeFusedEvaluatorSwitchParsed = false;
+
+    void VF_ParseFusedEvaluatorSwitch()
+    {
+        if (GVoxelForgeFusedEvaluatorSwitchParsed)
+        {
+            return;
+        }
+        GVoxelForgeFusedEvaluatorSwitchParsed = true;
+        int32 CommandLineValue = GVoxelForgeUseFusedEvaluator;
+        if (FParse::Value(
+                FCommandLine::Get(), TEXT("voxel.UseFusedEvaluator="), CommandLineValue))
+        {
+            GVoxelForgeUseFusedEvaluator = CommandLineValue;
+        }
+    }
+}
 
 //=============================================================================
 // L'ADAPTATEUR DE CHAMP DE BIOMES / THE BIOME FIELD ADAPTER
@@ -1690,6 +1720,7 @@ void UVoxelGenerator::EndDensityBlock() const
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
+    VF_ParseFusedEvaluatorSwitch();
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
@@ -2156,14 +2187,43 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         VoxelDensityProfile::FScopedTimer DensityCoreTimer(
             VoxelDensityProfile::EBucket::DensityCore);
 
-        FVoxelOpSample BlockCoreSample;
         bool bUsedOpBlockSample = false;
+        float BlockDensity = 0.f;
+        bool bBlockHasTunnelCore = false;
+        float BlockTunnelCoreSDF = FLT_MAX;
+        bool bBlockTunnelCoreSupportFloor = false;
+        bool bBlockTunnelCoreRoomFloor = false;
+        bool bUsedFusedEvaluator = false;
+        FTunnelCoreWorldEvaluation FusedTunnelCore;
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
         // de diff qui suivent ne voient aucune différence.
         if (CP_UseOpStack)
         {
+            const bool bCanUseFusedEvaluator =
+                GVoxelForgeUseFusedEvaluator != 0
+                && !CP_UseCustomRecipe
+                && (CP_GenType == ECaveGeneratorType::TunnelNetwork
+                    || CP_GenType == ECaveGeneratorType::Underwater)
+#if WITH_EDITOR
+                && !CP_UseComposerRegions
+#endif
+                && ActiveOpStack->GetFusedEvaluator()
+                    == EVoxelOpFusedEvaluator::TunnelNetwork;
+            if (bCanUseFusedEvaluator)
+            {
+                // This is the lowered canonical graph.  It returns the same MC core as the
+                // interpreted stack, plus the source's structural hand-off, without allocating
+                // FVoxelOpSample or traversing the graph one operator at a time for this voxel.
+                bUsedFusedEvaluator = true;
+                Result = GetDensityWithParams(
+                    WorldX, WorldY, WorldZ, CP_Tunnel, CP_TunnelFP, LayoutVersion,
+                    /*bApplyLegacyStructuralPosts=*/false,
+                    &FusedTunnelCore,
+                    /*bCollectFusedDiagnostics=*/true);
+            }
+
             const bool bIntegerLatticePoint =
                 WorldX == FMath::FloorToFloat(WorldX)
                 && WorldY == FMath::FloorToFloat(WorldY)
@@ -2171,9 +2231,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             const bool bBlockSafeGenerator =
                 CP_GenType == ECaveGeneratorType::TunnelNetwork
                 || CP_GenType == ECaveGeneratorType::Underwater;
-            if (bIntegerLatticePoint && bBlockSafeGenerator
+            if (!bUsedFusedEvaluator && bIntegerLatticePoint && bBlockSafeGenerator
                 && GVoxelDensityBlockSession.bActive)
             {
+                // Keep the rich hand-off object in the fallback branch.  The lowered evaluator
+                // must not construct a per-sample FVoxelOpSample merely because this compatibility
+                // path still needs one when the block session is enabled.
+                FVoxelOpSample BlockCoreSample;
                 bUsedOpBlockSample = GVoxelDensityBlockSession.FillChunk(
                     *ActiveOpStack,
                     ChunkCoord,
@@ -2182,10 +2246,21 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                         FMath::RoundToInt(WorldY),
                         FMath::RoundToInt(WorldZ)),
                     BlockCoreSample);
+                if (bUsedOpBlockSample)
+                {
+                    BlockDensity = BlockCoreSample.Density;
+                    bBlockHasTunnelCore = BlockCoreSample.bHasTunnelCoreWorldEvaluation;
+                    BlockTunnelCoreSDF = BlockCoreSample.TunnelCoreWorldSDF;
+                    bBlockTunnelCoreSupportFloor = BlockCoreSample.bTunnelCoreSupportFloor;
+                    bBlockTunnelCoreRoomFloor = BlockCoreSample.bTunnelCoreRoomFloor;
+                }
             }
-            Result = bUsedOpBlockSample
-                ? -BlockCoreSample.Density
-                : ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
+            if (!bUsedFusedEvaluator)
+            {
+                Result = bUsedOpBlockSample
+                    ? -BlockDensity
+                    : ActiveOpStack->EvalMC(WorldX, WorldY, WorldZ);
+            }
         }
         else switch (CP_GenType)
         {
@@ -2250,13 +2325,16 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         bool bHavePreDisturbanceTunnelCore = false;
         if (CP_UseOpStack)
         {
-            if (bUsedOpBlockSample && BlockCoreSample.bHasTunnelCoreWorldEvaluation)
+            if (bUsedFusedEvaluator)
             {
-                PreDisturbanceTunnelCore.SDF = BlockCoreSample.TunnelCoreWorldSDF;
-                PreDisturbanceTunnelCore.bSupportFloor =
-                    BlockCoreSample.bTunnelCoreSupportFloor;
-                PreDisturbanceTunnelCore.bRoomFloor =
-                    BlockCoreSample.bTunnelCoreRoomFloor;
+                PreDisturbanceTunnelCore = FusedTunnelCore;
+                bHavePreDisturbanceTunnelCore = true;
+            }
+            else if (bUsedOpBlockSample && bBlockHasTunnelCore)
+            {
+                PreDisturbanceTunnelCore.SDF = BlockTunnelCoreSDF;
+                PreDisturbanceTunnelCore.bSupportFloor = bBlockTunnelCoreSupportFloor;
+                PreDisturbanceTunnelCore.bRoomFloor = bBlockTunnelCoreRoomFloor;
                 bHavePreDisturbanceTunnelCore = true;
             }
             else
@@ -2576,7 +2654,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float WorldZ,
                                              const FStrateGenerationParams& Params,
                                              uint32 ParamsFingerprint, uint32 LayoutVersion,
-                                             bool bApplyLegacyStructuralPosts) const
+                                             bool bApplyLegacyStructuralPosts,
+                                             FTunnelCoreWorldEvaluation* OutTunnelCore,
+                                             bool bCollectFusedDiagnostics) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -2602,6 +2682,16 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // Convention: positive density = solid, negative = air (internally).
     // At the end, we negate for the MC table (negative = solid there).
     //=========================================================================
+
+    if (OutTunnelCore != nullptr)
+    {
+        *OutTunnelCore = FTunnelCoreWorldEvaluation();
+    }
+    if (bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::FusedTunnelSamples);
+    }
 
     const uint32 SeedU = (uint32)Seed;
 
@@ -2708,6 +2798,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // transition, ce qui est le nombre de reconstructions que ce cache aurait toujours dû faire.
     thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
     thread_local uint32 CachedLayout      = 0xFFFFFFFFu;
+    thread_local bool CachedUsesFusedCacheWindow = false;
+
+    const bool bUseFusedCacheWindow = OutTunnelCore != nullptr;
 
     // Index of the room with the smallest (most-inside) SDF for this voxel.
     // Written by EvaluateSDFCached, read by the terrain ops block to pick the
@@ -2747,6 +2840,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         const bool bNeedRebuild =
             StrateIdx != CachedStrate || (uint32)Seed != CachedSeed ||
             ParamsFingerprint != CachedFingerprint || LayoutVersion != CachedLayout ||
+            bUseFusedCacheWindow != CachedUsesFusedCacheWindow ||
             WarpedX < CachedSMinX || WarpedX > CachedSMaxX ||
             WarpedY < CachedSMinY || WarpedY > CachedSMaxY;
 
@@ -2757,15 +2851,24 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 VoxelDensityProfile::AddCounter(
                     VoxelDensityProfile::ECounter::SdfCacheBuild);
             }
-            // Center the search box on this query's chunk. Search area = chunk XY extent
-            // + CaveWarpStrength margin (covers warp displacement) + gradient sampling.
-            // MaxInfluence (room/tunnel reach) is added internally by BuildChunkCache.
-            const int32 CacheChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
-            const int32 CacheChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
-            const float ChunkMinX = CacheChunkX * (float)CHUNK_SIZE;
-            const float ChunkMinY = CacheChunkY * (float)CHUNK_SIZE;
-            const float ChunkMaxX = ChunkMinX + (float)CHUNK_SIZE;
-            const float ChunkMaxY = ChunkMinY + (float)CHUNK_SIZE;
+            // The lowered evaluator uses the same window-invariance contract as the prepared
+            // room-graph source, but keeps a four-chunk XY window per worker.  A tile worker can
+            // visit neighbouring chunk keys in an arbitrary order; the larger deterministic
+            // window prevents those jumps from rebuilding the graph for every small tile while
+            // preserving the pointwise SDF.  The public/reference call keeps its historical
+            // one-chunk window.
+            const int32 QueryChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
+            const int32 QueryChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
+            const int32 CacheRegionChunks = bUseFusedCacheWindow ? 4 : 1;
+            const int32 CacheRegionSize = CHUNK_SIZE * CacheRegionChunks;
+            const int32 CacheRegionX = FMath::FloorToInt(
+                WorldX / static_cast<float>(CacheRegionSize));
+            const int32 CacheRegionY = FMath::FloorToInt(
+                WorldY / static_cast<float>(CacheRegionSize));
+            const float ChunkMinX = CacheRegionX * (float)CacheRegionSize;
+            const float ChunkMinY = CacheRegionY * (float)CacheRegionSize;
+            const float ChunkMaxX = ChunkMinX + (float)CacheRegionSize;
+            const float ChunkMaxY = ChunkMinY + (float)CacheRegionSize;
             const float Expansion = FMath::Abs(Params.CaveWarpStrength)
                 * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
 
@@ -2781,7 +2884,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             {
                 const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
                 UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(
-                    FIntVector(CacheChunkX, CacheChunkY, ChunkZ));
+                    FIntVector(
+                        bUseFusedCacheWindow ? QueryChunkX : CacheRegionX,
+                        bUseFusedCacheWindow ? QueryChunkY : CacheRegionY,
+                        ChunkZ));
                 if (Def) TerrainOps = &Def->TerrainOperations;
             }
 
@@ -2798,6 +2904,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             CachedSeed = (uint32)Seed;
             CachedFingerprint = ParamsFingerprint;
             CachedLayout      = LayoutVersion;
+            CachedUsesFusedCacheWindow = bUseFusedCacheWindow;
         }
 
         // Evaluate SDF using cached rooms and tunnels (WARPED coordinates).
@@ -2901,6 +3008,21 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         }
     }
 
+    // The canonical stack's source publishes this same structural result before its detail
+    // modifiers run.  The lowered path asks the scalar evaluator for it directly, so the common
+    // post-disturbance tail can consume the result without allocating an FVoxelOpSample or
+    // invoking the interpreted stack a second time for this sample.
+    if (OutTunnelCore != nullptr
+        && Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
+    {
+        // The no-column form is the exact scalar reference path: it performs the world-bound and
+        // floor projection for the current point without eagerly materialising a whole XY table.
+        // The interpreted source has a lazy worker LRU for block evaluation; building that table
+        // here would turn a cache-window change into hundreds of unnecessary column builds.
+        *OutTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+            WorldX, WorldY, WorldZ, SDFCache, nullptr);
+    }
+
     //=========================================================================
     // EARLY-OUT: Skip detail work for deep-solid voxels
     //=========================================================================
@@ -2913,6 +3035,13 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // seal / modifiers, so we jump to Step 5 instead of returning early.
     const float DetailThreshold = Params.SDFBlendRadius * 3.0f;
     const bool bNearCaveSurface = (CaveSDF < DetailThreshold) && (CaveSDF < FLT_MAX);
+    if (bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            bNearCaveSurface
+                ? VoxelDensityProfile::ECounter::FusedTunnelDetailSamples
+                : VoxelDensityProfile::ECounter::FusedTunnelDetailSkipped);
+    }
 
     //=========================================================================
     // STEP 4b: SURFACE ROUGHNESS (volumetric, SDF-based)

@@ -58,6 +58,19 @@ struct VOXELFORGE_API FVoxelStrateOpContract
 };
 
 /**
+ * A lowered evaluator selected when a stack has a proven, canonical implementation.
+ *
+ * The authored operator list remains present for classification, diagnostics, tests, and the
+ * fallback evaluator.  This is a plan choice made while the stack is assembled, not a runtime
+ * CPU-feature dispatch and not a second semantic graph.
+ */
+enum class EVoxelOpFusedEvaluator : uint8
+{
+    None,
+    TunnelNetwork,
+};
+
+/**
  * FVoxelOpStack — une liste ordonnée d'opérateurs + le pliage de verdict de boîte.
  *
  * PROPRIÉTÉ (rôle 4) : les opérateurs STRUCTURELS sont ajoutés par `AppendStructuralPost` et
@@ -114,6 +127,9 @@ public:
 
     void Add(TUniquePtr<IVoxelDensityOp> Op)
     {
+        // Adding an op invalidates any previously selected lowered plan.  Factories mark the plan
+        // only after the complete authored graph has been assembled.
+        FusedEvaluator = EVoxelOpFusedEvaluator::None;
         FOpEntry Entry;
         Entry.Op = MoveTemp(Op);
         if (Entry.Op.Get() != nullptr)
@@ -132,6 +148,18 @@ public:
     }
 
     int32 Num() const { return Ops.Num(); }
+
+    /** Select the lowered evaluator for this complete authored graph. */
+    void SetFusedEvaluator(EVoxelOpFusedEvaluator InEvaluator)
+    {
+        FusedEvaluator = InEvaluator;
+    }
+
+    /** The lowered plan, or None when the general interpreted/block path must be used. */
+    EVoxelOpFusedEvaluator GetFusedEvaluator() const
+    {
+        return FusedEvaluator;
+    }
 
     /** True when this stack publishes the requested immutable geometry resource. */
     bool ProvidesResource(EVoxelOpResourceMask Resource) const
@@ -475,6 +503,7 @@ private:
     TArray<FOpEntry> Ops;
     FVoxelOpContext PreparedContext;
     bool bHasPreparedContext = false;
+    EVoxelOpFusedEvaluator FusedEvaluator = EVoxelOpFusedEvaluator::None;
 };
 
 //=============================================================================

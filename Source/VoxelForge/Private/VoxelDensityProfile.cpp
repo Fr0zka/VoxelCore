@@ -483,6 +483,9 @@ namespace VoxelDensityProfile
         case ECounter::TileVerdictCacheHits: return TEXT("TileVerdictCacheHits");
         case ECounter::TileVerdictRegionHits: return TEXT("TileVerdictRegionHits");
         case ECounter::TileVerdictCacheStores: return TEXT("TileVerdictCacheStores");
+        case ECounter::FusedTunnelSamples: return TEXT("FusedTunnelSamples");
+        case ECounter::FusedTunnelDetailSamples: return TEXT("FusedTunnelDetailSamples");
+        case ECounter::FusedTunnelDetailSkipped: return TEXT("FusedTunnelDetailSkipped");
         case ECounter::OpBlockBuilds: return TEXT("OpBlockBuilds");
         case ECounter::OpBlockSamples: return TEXT("OpBlockSamples");
         case ECounter::OpBlockOperators: return TEXT("OpBlockOperators");
