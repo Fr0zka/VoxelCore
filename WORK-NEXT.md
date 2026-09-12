@@ -107,6 +107,34 @@ deliberate cache probe are removed. The proof classifier remains; item 4 is stil
 
 ---
 
+## Outer-classifier A/B — measured 2026-09-12 (nested refinement OFF in every mode)
+
+Clean, diagnostics off, headless game path. Static = 343 LOD0 samples, two runs per mode; moving =
+160 m at 8 m/s, 1,274 LOD0 samples. Density calls = validation + mesher.
+
+| mode | ready p95 static | gen p95 static | worker CPU static | density calls static | ready p95 moving | gen p95 moving | density calls moving |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 no outer classifier | **182.4-182.7 ms** | **124.9-127.0 ms** | **184.9-193.5 s** | **18.05 M** | **198.9 ms** | **129.9 ms** | **57.7 M** |
+| 1 current (validate, discard) | 189.7-194.8 ms | 139.1-140.6 ms | 201.2-202.3 s | 21.89 M | 208.0 ms | 143.4 ms | 69.6 M |
+| 2 validation-grid reuse | 190.0-194.7 ms | 140.3-141.3 ms | 201.2-201.3 s | 21.89 M | 210.7 ms | 143.3 ms | 69.6 M |
+
+**Verdict: the outer classifier is net-negative on the game path.** Mode 0 is better on every latency
+figure and does ~18% fewer density calls. It cannot remove geometry, since it skips nothing.
+
+**Mode 2 cannot win as designed.** It reuses the validation grid only when a uniform verdict is
+*disproved* (`VoxelWorld.cpp` ~4012), and validation disproved none: 0 reuse tiles in every run. Mixed
+tiles, the ones that actually need a grid, never run validation, so there is nothing to reuse.
+
+**Recommendation, pending the owner:** set `GVoxelForgeOuterClassifierMode` default to 0. It stays
+switchable by `voxel.OuterClassifierMode`.
+
+⚠️ **Correction to `f204413`.** Its message says the nested classifier's 3.5x "cannot be reproduced".
+That was my measurement error: I passed `-voxel.UseBlockEarlyOut=1` (the STREAMING console variable)
+to the export commandlet, which reads its own `-blockearlyout=` argument, so both of my runs had
+nested refinement off. Re-run with the right flag: `-blockearlyout=0` 0.553 / 0.572 s,
+`-blockearlyout=1` 2.036 / 2.060 s, which is **3.6x**, with byte-identical geometry. The 3.5x was real,
+and disabling nested refinement in streaming (`f204413`) was worth it.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
