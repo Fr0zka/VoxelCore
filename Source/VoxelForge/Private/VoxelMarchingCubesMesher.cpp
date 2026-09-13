@@ -459,7 +459,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                                 BlockOrigin.X + X * Step,
                                 BlockOrigin.Y + Y * Step,
                                 BlockOrigin.Z + Z * Step);
-                            if (!FMath::IsFinite(Density) || Density == 0.0f)
+                            if (!VoxelMath::IsFinite(Density) || Density == 0.0f)
                             {
                                 bAllSolid = false;
                                 bAllAir = false;
@@ -646,7 +646,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                 {
                     const float Density = DensityGrid[
                         ((Z + 1) * MDim + (Y + 1)) * MDim + (X + 1)];
-                    if (!FMath::IsFinite(Density)
+                    if (!VoxelMath::IsFinite(Density)
                         || Density == 0.0f
                         || (Candidate == 1 ? Density >= 0.0f : Density <= 0.0f))
                     {

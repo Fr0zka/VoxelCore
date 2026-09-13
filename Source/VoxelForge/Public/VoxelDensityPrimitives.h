@@ -222,9 +222,9 @@ FORCEINLINE void VF_ApplyXYEdgeSeal(float& Density, float WorldX, float WorldY,
     float WorldRadiusVoxels, float Thickness, float BaseDensity)
 {
     if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f) || !(BaseDensity > 0.0f)) return;
-    if (!FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-        || !FMath::IsFinite(WorldRadiusVoxels) || !FMath::IsFinite(Thickness)
-        || !FMath::IsFinite(BaseDensity)) return;
+    if (!VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+        || !VoxelMath::IsFinite(WorldRadiusVoxels) || !VoxelMath::IsFinite(Thickness)
+        || !VoxelMath::IsFinite(BaseDensity)) return;
 
     const float InnerRadius = WorldRadiusVoxels - Thickness;
     const float InnerRadiusSq = InnerRadius * InnerRadius;
@@ -282,10 +282,10 @@ FORCEINLINE bool VF_IsValidXYEdgeSealProofInput(const FBox& VoxelBox,
     float WorldRadiusVoxels, float Thickness, float BaseDensity)
 {
     return VoxelBox.IsValid
-        && FMath::IsFinite(VoxelBox.Min.X) && FMath::IsFinite(VoxelBox.Min.Y)
-        && FMath::IsFinite(VoxelBox.Max.X) && FMath::IsFinite(VoxelBox.Max.Y)
-        && FMath::IsFinite(WorldRadiusVoxels) && FMath::IsFinite(Thickness)
-        && FMath::IsFinite(BaseDensity)
+        && VoxelMath::IsFinite(VoxelBox.Min.X) && VoxelMath::IsFinite(VoxelBox.Min.Y)
+        && VoxelMath::IsFinite(VoxelBox.Max.X) && VoxelMath::IsFinite(VoxelBox.Max.Y)
+        && VoxelMath::IsFinite(WorldRadiusVoxels) && VoxelMath::IsFinite(Thickness)
+        && VoxelMath::IsFinite(BaseDensity)
         && WorldRadiusVoxels > 0.0f && Thickness > 0.0f && BaseDensity > 0.0f;
 }
 
@@ -344,7 +344,7 @@ FORCEINLINE bool VF_XYEdgeSealBoxTouchesBand(const FBox& VoxelBox,
     float WorldRadiusVoxels, float Thickness)
 {
     if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f)
-        || !FMath::IsFinite(WorldRadiusVoxels) || !FMath::IsFinite(Thickness)) return false;
+        || !VoxelMath::IsFinite(WorldRadiusVoxels) || !VoxelMath::IsFinite(Thickness)) return false;
 
     const float InnerRadius = WorldRadiusVoxels - Thickness;
     return VF_XYEdgeFarthestRadiusSq(VoxelBox) > InnerRadius * InnerRadius;

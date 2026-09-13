@@ -29,8 +29,37 @@
 
 #include <atomic>
 
+namespace VoxelMath
+{
+    VOXELFORGE_API int32 GFastIsFinite = 1;
+}
+
 namespace
 {
+    // The default-on branch uses VoxelMath::IsFiniteFast, while 0 retains the original
+    // FMath::IsFinite call for a real within-round A/B and sampler comparison.
+    FAutoConsoleVariableRef CVarVoxelForgeFastIsFinite(
+        TEXT("voxel.FastIsFinite"),
+        VoxelMath::GFastIsFinite,
+        TEXT("Use the exact inline IEEE-754 bit test instead of the CRT-backed FMath::IsFinite."));
+    bool GVoxelForgeFastIsFiniteSwitchParsed = false;
+
+    void VF_ParseFastIsFiniteSwitch()
+    {
+        if (GVoxelForgeFastIsFiniteSwitchParsed)
+        {
+            return;
+        }
+        GVoxelForgeFastIsFiniteSwitchParsed = true;
+        int32 CommandLineValue = VoxelMath::GFastIsFinite;
+        if (FParse::Value(
+                FCommandLine::Get(), TEXT("voxel.FastIsFinite="), CommandLineValue))
+        {
+            VoxelMath::GFastIsFinite = CommandLineValue;
+        }
+        VoxelMath::GFastIsFinite = VoxelMath::GFastIsFinite != 0 ? 1 : 0;
+    }
+
     // The canonical native TunnelNetwork/Underwater graph has a hand-lowered evaluator.  Keep a
     // command-line switch so every change can be A/B'd against the existing interpreted/block
     // path without changing the authored graph or rebuilding a different world definition.
@@ -861,7 +890,7 @@ static FORCEINLINE bool VF_DisturbanceBandTouchesBox(
 {
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
-    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    if (!VoxelMath::IsFinite(InnerTop) || !VoxelMath::IsFinite(InnerBot))
     {
         return true; // Unknown boundary placement must not discharge a proof.
     }
@@ -929,16 +958,16 @@ static bool VF_AnyChasmCanTouchLattice(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
-        || D.ChasmDensity > 1.0f || !FMath::IsFinite(D.ChasmSpacing)
-        || !FMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
+    if (!VoxelMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
+        || D.ChasmDensity > 1.0f || !VoxelMath::IsFinite(D.ChasmSpacing)
+        || !VoxelMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
         || D.ChasmRadius < 0.0f)
     {
         return true;
     }
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
-    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    if (!VoxelMath::IsFinite(InnerTop) || !VoxelMath::IsFinite(InnerBot))
     {
         return true;
     }
@@ -987,16 +1016,16 @@ static bool VF_AnyBridgeCanTouchLattice(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
-        || D.BridgeDensity > 1.0f || !FMath::IsFinite(D.BridgeSpacing)
-        || !FMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
+    if (!VoxelMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
+        || D.BridgeDensity > 1.0f || !VoxelMath::IsFinite(D.BridgeSpacing)
+        || !VoxelMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
         || D.BridgeRadius < 0.0f)
     {
         return true;
     }
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
-    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    if (!VoxelMath::IsFinite(InnerTop) || !VoxelMath::IsFinite(InnerBot))
     {
         return true;
     }
@@ -1055,16 +1084,16 @@ static bool VF_AnyRidgeCanTouchLattice(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
-        || D.RidgeDensity > 1.0f || !FMath::IsFinite(D.RidgeSpacing)
-        || !FMath::IsFinite(D.RidgeHeight) || !FMath::IsFinite(D.RidgeThickness)
+    if (!VoxelMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
+        || D.RidgeDensity > 1.0f || !VoxelMath::IsFinite(D.RidgeSpacing)
+        || !VoxelMath::IsFinite(D.RidgeHeight) || !VoxelMath::IsFinite(D.RidgeThickness)
         || D.RidgeSpacing <= 0.0f || D.RidgeHeight <= 0.0f || D.RidgeThickness < 0.0f)
     {
         return true;
     }
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
-    if (!FMath::IsFinite(InnerTop) || !FMath::IsFinite(InnerBot))
+    if (!VoxelMath::IsFinite(InnerTop) || !VoxelMath::IsFinite(InnerBot))
     {
         return true;
     }
@@ -1124,9 +1153,9 @@ static bool VF_AnyChasmCanTouchBox(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
-        || D.ChasmDensity > 1.0f || !FMath::IsFinite(D.ChasmSpacing)
-        || !FMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
+    if (!VoxelMath::IsFinite(D.ChasmDensity) || D.ChasmDensity < 0.0f
+        || D.ChasmDensity > 1.0f || !VoxelMath::IsFinite(D.ChasmSpacing)
+        || !VoxelMath::IsFinite(D.ChasmRadius) || D.ChasmSpacing <= 0.0f
         || D.ChasmRadius < 0.0f)
     {
         return true;
@@ -1171,9 +1200,9 @@ static bool VF_AnyBridgeCanTouchBox(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
-        || D.BridgeDensity > 1.0f || !FMath::IsFinite(D.BridgeSpacing)
-        || !FMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
+    if (!VoxelMath::IsFinite(D.BridgeDensity) || D.BridgeDensity < 0.0f
+        || D.BridgeDensity > 1.0f || !VoxelMath::IsFinite(D.BridgeSpacing)
+        || !VoxelMath::IsFinite(D.BridgeRadius) || D.BridgeSpacing <= 0.0f
         || D.BridgeRadius < 0.0f)
     {
         return true;
@@ -1224,9 +1253,9 @@ static bool VF_AnyRidgeCanTouchBox(
     {
         return false;
     }
-    if (!FMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
-        || D.RidgeDensity > 1.0f || !FMath::IsFinite(D.RidgeSpacing)
-        || !FMath::IsFinite(D.RidgeHeight) || !FMath::IsFinite(D.RidgeThickness)
+    if (!VoxelMath::IsFinite(D.RidgeDensity) || D.RidgeDensity < 0.0f
+        || D.RidgeDensity > 1.0f || !VoxelMath::IsFinite(D.RidgeSpacing)
+        || !VoxelMath::IsFinite(D.RidgeHeight) || !VoxelMath::IsFinite(D.RidgeThickness)
         || D.RidgeSpacing <= 0.0f || D.RidgeHeight <= 0.0f || D.RidgeThickness < 0.0f)
     {
         return true;
@@ -1758,6 +1787,7 @@ UVoxelGenerator::UVoxelGenerator()
 
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
+    VF_ParseFastIsFiniteSwitch();
     // Les paramètres globaux sont copiés ici une seule fois : le chemin voxel ne doit pas
     // déréférencer l'asset de settings.
     Seed = Settings ? Settings->GetEffectiveWorldSeed() : 0;
@@ -1780,6 +1810,7 @@ void UVoxelGenerator::EndDensityBlock() const
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
+    VF_ParseFastIsFiniteSwitch();
     VF_ParseFusedEvaluatorSwitch();
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
@@ -5009,7 +5040,7 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         for (const int32 IX : Xs)
         {
             const float Density = EvaluateExactLatticeValue(IX, IY, IZ, bUseFinalField);
-            if (!FMath::IsFinite(Density) || Density == 0.0f)
+            if (!VoxelMath::IsFinite(Density) || Density == 0.0f)
             {
                 return false;
             }
@@ -5053,7 +5084,7 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
         for (int32 IX = IX0; IX <= IX1; ++IX)
         {
             const float Density = EvaluateExactLatticeValue(IX, IY, IZ, bUseFinalField);
-            if (!FMath::IsFinite(Density) || Density == 0.0f)
+            if (!VoxelMath::IsFinite(Density) || Density == 0.0f)
             {
                 ++ZeroOrInvalidCount;
                 IZ = IZ1;

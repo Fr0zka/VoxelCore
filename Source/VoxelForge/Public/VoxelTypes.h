@@ -9,6 +9,51 @@
 #include "CoreMinimal.h"
 
 //=============================================================================
+// EXACT FINITE PREDICATE / PREDICAT FINI EXACT
+//=============================================================================
+// The CRT-backed FMath::IsFinite is an out-of-line call on the MSVC game path.  A finite
+// IEEE-754 value is identified entirely by its exponent bits, so this helper has the same
+// boolean result for every bit pattern without doing a floating-point comparison.
+namespace VoxelMath
+{
+    // Runtime policy switch.  The fast helper below is deliberately independent of this value so
+    // the equivalence test can compare it directly with FMath::IsFinite.  IsFinite() is the A/B
+    // entry point used by generation code.
+    VOXELFORGE_API extern int32 GFastIsFinite;
+
+    FORCEINLINE bool IsFiniteFast(float Value)
+    {
+        static_assert(sizeof(float) == sizeof(uint32), "VoxelMath::IsFiniteFast requires IEEE float");
+        uint32 Bits = 0;
+        FMemory::Memcpy(&Bits, &Value, sizeof(Bits));
+        constexpr uint32 ExponentMask = 0x7F800000u;
+        return (Bits & ExponentMask) != ExponentMask;
+    }
+
+    FORCEINLINE bool IsFiniteFast(double Value)
+    {
+        static_assert(sizeof(double) == sizeof(uint64), "VoxelMath::IsFiniteFast requires IEEE double");
+        uint64 Bits = 0;
+        FMemory::Memcpy(&Bits, &Value, sizeof(Bits));
+        constexpr uint64 ExponentMask = 0x7FF0000000000000ull;
+        return (Bits & ExponentMask) != ExponentMask;
+    }
+
+    // Keep the switch at the call site while keeping the exact bit test separate and directly
+    // testable.  In the default-on game path this inlines to the bit load/mask/branch; the 0 path
+    // is retained for within-round performance and sampler A/B runs.
+    FORCEINLINE bool IsFinite(float Value)
+    {
+        return GFastIsFinite != 0 ? IsFiniteFast(Value) : FMath::IsFinite(Value);
+    }
+
+    FORCEINLINE bool IsFinite(double Value)
+    {
+        return GFastIsFinite != 0 ? IsFiniteFast(Value) : FMath::IsFinite(Value);
+    }
+}
+
+//=============================================================================
 // CHUNK CONSTANTS
 //=============================================================================
 //

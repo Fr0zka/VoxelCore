@@ -415,7 +415,7 @@ struct FVoxelBoxSdfInterval
 
     void Set(float InMin, float InMax)
     {
-        if (!FMath::IsFinite(InMin) || !FMath::IsFinite(InMax) || InMin > InMax)
+        if (!VoxelMath::IsFinite(InMin) || !VoxelMath::IsFinite(InMax) || InMin > InMax)
         {
             SetUnknown();
             return;

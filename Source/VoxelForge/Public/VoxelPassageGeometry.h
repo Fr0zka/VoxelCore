@@ -7,6 +7,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelTypes.h"
 
 namespace VoxelPassageGeometry
 {
@@ -85,13 +86,13 @@ namespace VoxelPassageGeometry
             + FloorThickness + SealSafetyMarginVoxels;
         const float MaximumFloor = InteriorTopZ
             - PlayerHeightVoxels - SealSafetyMarginVoxels;
-        if (!FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(InteriorBottomZ)
-            || !FMath::IsFinite(InteriorTopZ)
-            || !FMath::IsFinite(LedgeSpacing)
-            || !FMath::IsFinite(LedgeDepth)
-            || !FMath::IsFinite(MinimumFloor)
-            || !FMath::IsFinite(MaximumFloor)
+        if (!VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(InteriorBottomZ)
+            || !VoxelMath::IsFinite(InteriorTopZ)
+            || !VoxelMath::IsFinite(LedgeSpacing)
+            || !VoxelMath::IsFinite(LedgeDepth)
+            || !VoxelMath::IsFinite(MinimumFloor)
+            || !VoxelMath::IsFinite(MaximumFloor)
             || !(MaximumFloor > MinimumFloor))
         {
             return 0.5f * (InteriorBottomZ + InteriorTopZ);
@@ -153,12 +154,12 @@ namespace VoxelPassageGeometry
         const float FloorRadius = FMath::Max(0.5f, SafeRadius - 0.5f);
         if (!(SafeRadius > 0.0f)
             || !(BaseDensity > 0.0f)
-            || !FMath::IsFinite(WorldX)
-            || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(WorldZ)
-            || !FMath::IsFinite(FloorZ)
-            || !FMath::IsFinite(Start.X) || !FMath::IsFinite(Start.Y)
-            || !FMath::IsFinite(End.X) || !FMath::IsFinite(End.Y))
+            || !VoxelMath::IsFinite(WorldX)
+            || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(WorldZ)
+            || !VoxelMath::IsFinite(FloorZ)
+            || !VoxelMath::IsFinite(Start.X) || !VoxelMath::IsFinite(Start.Y)
+            || !VoxelMath::IsFinite(End.X) || !VoxelMath::IsFinite(End.Y))
         {
             return;
         }
@@ -218,14 +219,14 @@ namespace VoxelPassageGeometry
         const float CoreRadius = FMath::Max(0.5f, SafeRadius - 1.0f);
         if (!(SafeRadius > 0.0f)
             || !(BaseDensity > 0.0f)
-            || !FMath::IsFinite(WorldX)
-            || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(WorldZ)
-            || !FMath::IsFinite(FloorZ)
-            || !FMath::IsFinite(Start.X) || !FMath::IsFinite(Start.Y)
-            || !FMath::IsFinite(Start.Z)
-            || !FMath::IsFinite(End.X) || !FMath::IsFinite(End.Y)
-            || !FMath::IsFinite(End.Z))
+            || !VoxelMath::IsFinite(WorldX)
+            || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(WorldZ)
+            || !VoxelMath::IsFinite(FloorZ)
+            || !VoxelMath::IsFinite(Start.X) || !VoxelMath::IsFinite(Start.Y)
+            || !VoxelMath::IsFinite(Start.Z)
+            || !VoxelMath::IsFinite(End.X) || !VoxelMath::IsFinite(End.Y)
+            || !VoxelMath::IsFinite(End.Z))
         {
             return;
         }
@@ -360,8 +361,8 @@ namespace VoxelPassageGeometry
         }
 
         return bFoundSegment
-            && FMath::IsFinite(OutFloorZ)
-            && FMath::IsFinite(OutSupportRadius)
+            && VoxelMath::IsFinite(OutFloorZ)
+            && VoxelMath::IsFinite(OutSupportRadius)
             && OutSupportRadius > 0.0f
             && BestDistanceSquared <= FMath::Square(OutSupportRadius);
     }
@@ -405,10 +406,10 @@ namespace VoxelPassageGeometry
     {
         FOriginLandingGeometry Result;
         if (!(OriginRadius > 0.0f)
-            || !FMath::IsFinite(StrateTopZ)
-            || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(SealThickness)
-            || !FMath::IsFinite(OriginRadius))
+            || !VoxelMath::IsFinite(StrateTopZ)
+            || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(SealThickness)
+            || !VoxelMath::IsFinite(OriginRadius))
         {
             return Result;
         }
@@ -429,10 +430,10 @@ namespace VoxelPassageGeometry
             + Result.FloorThickness + SealSafetyMarginVoxels;
         const float MaximumFloor = InnerTop
             - DesiredHeight - SealSafetyMarginVoxels;
-        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
+        if (!VoxelMath::IsFinite(InnerBottom) || !VoxelMath::IsFinite(InnerTop)
             || !(InnerTop > InnerBottom)
-            || !FMath::IsFinite(MinimumFloor)
-            || !FMath::IsFinite(MaximumFloor)
+            || !VoxelMath::IsFinite(MinimumFloor)
+            || !VoxelMath::IsFinite(MaximumFloor)
             || MaximumFloor < MinimumFloor)
         {
             Result.HalfWidth = 0.0f;
@@ -455,8 +456,8 @@ namespace VoxelPassageGeometry
     FORCEINLINE bool LatticeAxisHasSampleInInterval(
         float Min, float Max, float Origin, int32 Step)
     {
-        if (Step <= 0 || !FMath::IsFinite(Min) || !FMath::IsFinite(Max)
-            || !FMath::IsFinite(Origin) || Min > Max)
+        if (Step <= 0 || !VoxelMath::IsFinite(Min) || !VoxelMath::IsFinite(Max)
+            || !VoxelMath::IsFinite(Origin) || Min > Max)
         {
             return false;
         }

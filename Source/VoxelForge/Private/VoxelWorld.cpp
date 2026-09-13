@@ -436,7 +436,7 @@ namespace
                 ++OutMismatches;
             }
 
-            const float Delta = (FMath::IsFinite(Live) && FMath::IsFinite(Reference))
+            const float Delta = (VoxelMath::IsFinite(Live) && VoxelMath::IsFinite(Reference))
                 ? FMath::Abs(Live - Reference) : FLT_MAX;
             OutMaxDelta = FMath::Max(OutMaxDelta, Delta);
             ++OutSamples;
@@ -1720,8 +1720,8 @@ bool AVoxelWorld::TryGetPlayerPosition(FVector& OutPosition, APawn** OutPawn) co
     }
 
     const FVector Position = Pawn->GetActorLocation();
-    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
-        || !FMath::IsFinite(Position.Z))
+    if (!VoxelMath::IsFinite(Position.X) || !VoxelMath::IsFinite(Position.Y)
+        || !VoxelMath::IsFinite(Position.Z))
     {
         return false;
     }
@@ -1766,7 +1766,7 @@ bool AVoxelWorld::GetPlayerSupportTile(APawn* Pawn, const FVector& PlayerPositio
         Pawn->GetActorBounds(/*bOnlyCollidingComponents*/ true, BoundsOrigin, BoundsExtent);
         HalfHeightCm = FMath::Max(0.0f, BoundsExtent.Z);
     }
-    if (!FMath::IsFinite(HalfHeightCm))
+    if (!VoxelMath::IsFinite(HalfHeightCm))
     {
         return false;
     }
@@ -4060,7 +4060,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                             OriginVoxels.Y + Y * ValidationStep,
                             OriginVoxels.Z + Z * ValidationStep);
                         ++Result.ValidationDensityCalls;
-                        const bool bSampleAgrees = FMath::IsFinite(Density) && Density != 0.0f
+                        const bool bSampleAgrees = VoxelMath::IsFinite(Density) && Density != 0.0f
                             && (Verdict != EVoxelTileClass::AllSolid || Density < 0.0f)
                             && (Verdict != EVoxelTileClass::AllAir || Density > 0.0f);
                         if (!bSampleAgrees)

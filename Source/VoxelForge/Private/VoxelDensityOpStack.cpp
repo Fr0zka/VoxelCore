@@ -190,9 +190,9 @@ namespace
     FORCEINLINE float VF_PerlinAbsBoundOverBox(
         const FVector3f& InMin, const FVector3f& InMax)
     {
-        if (!FMath::IsFinite(InMin.X) || !FMath::IsFinite(InMin.Y)
-            || !FMath::IsFinite(InMin.Z) || !FMath::IsFinite(InMax.X)
-            || !FMath::IsFinite(InMax.Y) || !FMath::IsFinite(InMax.Z)
+        if (!VoxelMath::IsFinite(InMin.X) || !VoxelMath::IsFinite(InMin.Y)
+            || !VoxelMath::IsFinite(InMin.Z) || !VoxelMath::IsFinite(InMax.X)
+            || !VoxelMath::IsFinite(InMax.Y) || !VoxelMath::IsFinite(InMax.Z)
             || InMin.X > InMax.X || InMin.Y > InMax.Y || InMin.Z > InMax.Z
             || FMath::Abs(InMin.X) > 1000000.0f || FMath::Abs(InMax.X) > 1000000.0f
             || FMath::Abs(InMin.Y) > 1000000.0f || FMath::Abs(InMax.Y) > 1000000.0f
@@ -279,7 +279,7 @@ namespace
                     ValueMax += Contribution.Max;
                 }
 
-                if (!FMath::IsFinite(ValueMin) || !FMath::IsFinite(ValueMax))
+                if (!VoxelMath::IsFinite(ValueMin) || !VoxelMath::IsFinite(ValueMax))
                 {
                     return VF_PerlinAbsBound;
                 }
@@ -420,8 +420,8 @@ namespace
     FORCEINLINE float VF_LatticeAxisDistanceToPoint(
         float BoxMin, float BoxMax, float Origin, float Step, float Target, float Extra)
     {
-        if (!(Step > 0.0f) || !FMath::IsFinite(BoxMin) || !FMath::IsFinite(BoxMax)
-            || !FMath::IsFinite(Origin) || !FMath::IsFinite(Target)
+        if (!(Step > 0.0f) || !VoxelMath::IsFinite(BoxMin) || !VoxelMath::IsFinite(BoxMax)
+            || !VoxelMath::IsFinite(Origin) || !VoxelMath::IsFinite(Target)
             || BoxMin > BoxMax)
         {
             return FLT_MAX;
@@ -451,7 +451,7 @@ namespace
         float BoxMin, float BoxMax, float Origin, float Step,
         float TargetMin, float TargetMax, float Extra)
     {
-        if (!(Step > 0.0f) || !FMath::IsFinite(TargetMin) || !FMath::IsFinite(TargetMax)
+        if (!(Step > 0.0f) || !VoxelMath::IsFinite(TargetMin) || !VoxelMath::IsFinite(TargetMax)
             || TargetMin > TargetMax)
         {
             return FLT_MAX;
@@ -483,7 +483,7 @@ namespace
 
     FORCEINLINE float VF_SaturatingAdd(float A, float B)
     {
-        if (!FMath::IsFinite(A) || !FMath::IsFinite(B)) { return FLT_MAX; }
+        if (!VoxelMath::IsFinite(A) || !VoxelMath::IsFinite(B)) { return FLT_MAX; }
         if (B > 0.0f && A > FLT_MAX - B) { return FLT_MAX; }
         if (B < 0.0f && A < -FLT_MAX - B) { return -FLT_MAX; }
         return A + B;
@@ -603,7 +603,7 @@ namespace
         void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox&,
                                  const FVoxelOpContext&) const override
         {
-            if (!FMath::IsFinite(CellSize) || !FMath::IsFinite(CorridorRadius)
+            if (!VoxelMath::IsFinite(CellSize) || !VoxelMath::IsFinite(CorridorRadius)
                 || CellSize <= 0.0f || CorridorRadius < 0.0f)
             {
                 InOut.SetUnknown();
@@ -1575,8 +1575,8 @@ namespace
                                  const FVoxelOpContext&) const override
         {
             if (!InOut.IsKnown()) { return; }
-            if (!FMath::IsFinite(Strength) || !FMath::IsFinite(Frequency)
-                || !FMath::IsFinite(ApplyWithin) || BaseOctaves <= 0)
+            if (!VoxelMath::IsFinite(Strength) || !VoxelMath::IsFinite(Frequency)
+                || !VoxelMath::IsFinite(ApplyWithin) || BaseOctaves <= 0)
             {
                 InOut.SetUnknown();
                 return;
@@ -1589,7 +1589,7 @@ namespace
                 FMath::Max(FMath::Abs((float)VoxelBox.Min.X), FMath::Abs((float)VoxelBox.Max.X)),
                 FMath::Max(FMath::Abs((float)VoxelBox.Min.Y), FMath::Abs((float)VoxelBox.Max.Y)),
                 FMath::Max(FMath::Abs((float)VoxelBox.Min.Z), FMath::Abs((float)VoxelBox.Max.Z)));
-            if (!FMath::IsFinite(MaxAbsCoord) || !FMath::IsFinite(MaxAbsCoord * FMath::Abs(Frequency)))
+            if (!VoxelMath::IsFinite(MaxAbsCoord) || !VoxelMath::IsFinite(MaxAbsCoord * FMath::Abs(Frequency)))
             {
                 InOut.SetUnknown();
                 return;
@@ -1806,8 +1806,8 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             const float Coefficient = Sign * BaseDensity * 2.0f;
-            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
-                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!VoxelMath::IsFinite(Coefficient) || !VoxelMath::IsFinite(Blend)
+                || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return EVoxelOpEffect::Both;
             }
@@ -1831,8 +1831,8 @@ namespace
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             const float Coefficient = Sign * BaseDensity * 2.0f;
-            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
-                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!VoxelMath::IsFinite(Coefficient) || !VoxelMath::IsFinite(Blend)
+                || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return FLT_MAX;
             }
@@ -1842,8 +1842,8 @@ namespace
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
             const float Coefficient = Sign * BaseDensity * 2.0f;
-            if (!FMath::IsFinite(Coefficient) || !FMath::IsFinite(Blend)
-                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!VoxelMath::IsFinite(Coefficient) || !VoxelMath::IsFinite(Blend)
+                || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return FLT_MAX;
             }
@@ -1854,8 +1854,8 @@ namespace
                               const FVoxelBoxHypotheses& H) const override
         {
             const float Coefficient = Sign * BaseDensity * 2.0f;
-            if (!FMath::IsFinite(Coefficient)) { return FLT_MAX; }
-            if (!FMath::IsFinite(Blend) || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!VoxelMath::IsFinite(Coefficient)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(Blend) || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return FLT_MAX;
             }
@@ -1867,8 +1867,8 @@ namespace
                              const FVoxelBoxHypotheses& H) const override
         {
             const float Coefficient = Sign * BaseDensity * 2.0f;
-            if (!FMath::IsFinite(Coefficient)) { return FLT_MAX; }
-            if (!FMath::IsFinite(Blend) || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!VoxelMath::IsFinite(Coefficient)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(Blend) || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return FLT_MAX;
             }
@@ -1891,14 +1891,14 @@ namespace
 
         float MaxFactor(const FVoxelBoxHypotheses& H) const
         {
-            if (!H.Sdf.IsKnown() || !FMath::IsFinite(Blend)
-                || !FMath::IsFinite(MinDivisor) || Blend <= 0.0f)
+            if (!H.Sdf.IsKnown() || !VoxelMath::IsFinite(Blend)
+                || !VoxelMath::IsFinite(MinDivisor) || Blend <= 0.0f)
             {
                 return 1.0f;
             }
 
             const float Denom = FMath::Max(Blend * 2.0f, MinDivisor);
-            if (!(Denom > 0.0f) || !FMath::IsFinite(Denom)) { return 1.0f; }
+            if (!(Denom > 0.0f) || !VoxelMath::IsFinite(Denom)) { return 1.0f; }
 
             const float T = FMath::Clamp((Blend - H.Sdf.Min) / Denom, 0.0f, 1.0f);
             return SmoothStep01(T);
@@ -2223,18 +2223,18 @@ namespace
             const float MaxFactor = LiveManager->MaxPassageCarveFactorNearLattice(
                 VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step);
             if (!(MaxFactor > 0.0f)) { return 0.0f; }
-            if (!(H.SolidMargin > 0.0f) || !FMath::IsFinite(H.SolidMargin)
-                || !FMath::IsFinite(Base) || !FMath::IsFinite(Seal))
+            if (!(H.SolidMargin > 0.0f) || !VoxelMath::IsFinite(H.SolidMargin)
+                || !VoxelMath::IsFinite(Base) || !VoxelMath::IsFinite(Seal))
             {
                 return FLT_MAX;
             }
 
             const float AirTarget = -(Base * 2.0f + Seal + 4.0f);
-            if (!FMath::IsFinite(AirTarget)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(AirTarget)) { return FLT_MAX; }
             const float LowerAfterCarve = FMath::Min(
                 H.SolidMargin,
                 FMath::Lerp(H.SolidMargin, AirTarget, FMath::Clamp(MaxFactor, 0.0f, 1.0f)));
-            if (!FMath::IsFinite(LowerAfterCarve)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(LowerAfterCarve)) { return FLT_MAX; }
             return FMath::Max(0.0f, H.SolidMargin - LowerAfterCarve);
         }
 
@@ -2355,13 +2355,13 @@ namespace
         void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
                                  const FVoxelOpContext&) const override
         {
-            if (!FMath::IsFinite((float)VoxelBox.Min.X) || !FMath::IsFinite((float)VoxelBox.Min.Y)
-                || !FMath::IsFinite((float)VoxelBox.Min.Z)
-                || !FMath::IsFinite((float)VoxelBox.Max.X) || !FMath::IsFinite((float)VoxelBox.Max.Y)
-                || !FMath::IsFinite((float)VoxelBox.Max.Z)
+            if (!VoxelMath::IsFinite((float)VoxelBox.Min.X) || !VoxelMath::IsFinite((float)VoxelBox.Min.Y)
+                || !VoxelMath::IsFinite((float)VoxelBox.Min.Z)
+                || !VoxelMath::IsFinite((float)VoxelBox.Max.X) || !VoxelMath::IsFinite((float)VoxelBox.Max.Y)
+                || !VoxelMath::IsFinite((float)VoxelBox.Max.Z)
                 || VoxelBox.Min.X > VoxelBox.Max.X || VoxelBox.Min.Y > VoxelBox.Max.Y
                 || VoxelBox.Min.Z > VoxelBox.Max.Z
-                || !FMath::IsFinite(P.ShaftSpacing) || P.ShaftSpacing <= 0.0f)
+                || !VoxelMath::IsFinite(P.ShaftSpacing) || P.ShaftSpacing <= 0.0f)
             {
                 InOut.SetUnknown();
                 return;
@@ -3021,16 +3021,16 @@ namespace
         void PropagateSdfOverBox(FVoxelBoxSdfInterval& InOut, const FBox& VoxelBox,
                                  const FVoxelOpContext&) const override
         {
-            if (!FMath::IsFinite((float)VoxelBox.Min.X) || !FMath::IsFinite((float)VoxelBox.Min.Y)
-                || !FMath::IsFinite((float)VoxelBox.Min.Z)
-                || !FMath::IsFinite((float)VoxelBox.Max.X) || !FMath::IsFinite((float)VoxelBox.Max.Y)
-                || !FMath::IsFinite((float)VoxelBox.Max.Z)
+            if (!VoxelMath::IsFinite((float)VoxelBox.Min.X) || !VoxelMath::IsFinite((float)VoxelBox.Min.Y)
+                || !VoxelMath::IsFinite((float)VoxelBox.Min.Z)
+                || !VoxelMath::IsFinite((float)VoxelBox.Max.X) || !VoxelMath::IsFinite((float)VoxelBox.Max.Y)
+                || !VoxelMath::IsFinite((float)VoxelBox.Max.Z)
                 || VoxelBox.Min.X > VoxelBox.Max.X || VoxelBox.Min.Y > VoxelBox.Max.Y
                 || VoxelBox.Min.Z > VoxelBox.Max.Z
-                || !FMath::IsFinite(P.IslandSpacing) || !FMath::IsFinite(P.IslandDensity)
-                || !FMath::IsFinite(P.IslandMinRadius) || !FMath::IsFinite(P.IslandMaxRadius)
-                || !FMath::IsFinite(P.ThicknessRatio) || !FMath::IsFinite(P.VerticalJitter)
-                || !FMath::IsFinite(P.TopFlatten) || !FMath::IsFinite(P.SDFBlendRadius)
+                || !VoxelMath::IsFinite(P.IslandSpacing) || !VoxelMath::IsFinite(P.IslandDensity)
+                || !VoxelMath::IsFinite(P.IslandMinRadius) || !VoxelMath::IsFinite(P.IslandMaxRadius)
+                || !VoxelMath::IsFinite(P.ThicknessRatio) || !VoxelMath::IsFinite(P.VerticalJitter)
+                || !VoxelMath::IsFinite(P.TopFlatten) || !VoxelMath::IsFinite(P.SDFBlendRadius)
                 || P.IslandDensity < 0.0f)
             {
                 InOut.SetUnknown();
@@ -4389,7 +4389,7 @@ namespace
             {
                 const float StructuralFloorMinimumDensity =
                     FMath::Max(P.BaseDensity * 2.0f, 1.0f);
-                if (FMath::IsFinite(StructuralFloorMinimumDensity)
+                if (VoxelMath::IsFinite(StructuralFloorMinimumDensity)
                     && StructuralFloorMinimumDensity > 0.0f)
                 {
                     InOut.bProtectedStructuralFloor = true;
@@ -4629,7 +4629,7 @@ namespace
             float Supremum = 0.0f;
             for (const FCachedColumn& Column : GetBoxCache().Columns)
             {
-                if (!FMath::IsFinite(Column.BaseDensity) || Column.BaseDensity < 0.0f)
+                if (!VoxelMath::IsFinite(Column.BaseDensity) || Column.BaseDensity < 0.0f)
                 {
                     // Eval multiplies by BaseDensity.  A negative authored value reverses the
                     // declared FillOnly direction, so the state-aware caller must fall back to
@@ -4637,7 +4637,7 @@ namespace
                     return FLT_MAX;
                 }
                 const float Contribution = Column.BaseDensity * 1.5f;
-                if (!FMath::IsFinite(Contribution)
+                if (!VoxelMath::IsFinite(Contribution)
                     || Supremum > FLT_MAX - Contribution)
                 {
                     return FLT_MAX;
@@ -4658,13 +4658,13 @@ namespace
             // room wins the nearest-SDF query, and is finite without assuming a global room height.
             float Supremum = 0.0f;
             const float BoxMinZ = static_cast<float>(B.KeyBox.Min.Z);
-            if (!FMath::IsFinite(BoxMinZ)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(BoxMinZ)) { return FLT_MAX; }
             for (const FCachedRoom& Room : GetBoxCache().Rooms)
             {
                 const float CenterZ = static_cast<float>(Room.Center.Z);
                 const float RadiusZ = Room.RadiusZ;
-                if (!FMath::IsFinite(CenterZ) || !FMath::IsFinite(RadiusZ)
-                    || !FMath::IsFinite(P.FloorBias) || P.FloorBias < 0.0f)
+                if (!VoxelMath::IsFinite(CenterZ) || !VoxelMath::IsFinite(RadiusZ)
+                    || !VoxelMath::IsFinite(P.FloorBias) || P.FloorBias < 0.0f)
                 {
                     return FLT_MAX;
                 }
@@ -4672,7 +4672,7 @@ namespace
                 const float Below = FMath::Max(CenterZ - BoxMinZ, 0.0f);
                 const float Normalized = Below / Denominator;
                 const float Contribution = Normalized * Normalized * P.FloorBias;
-                if (!FMath::IsFinite(Contribution)) { return FLT_MAX; }
+                if (!VoxelMath::IsFinite(Contribution)) { return FLT_MAX; }
                 Supremum = FMath::Max(Supremum, Contribution);
             }
             return Supremum;
@@ -4745,7 +4745,7 @@ namespace
                 B.SdfInterval.SetUnknown();
                 InOut.SetUnknown();
             };
-            auto Finite = [](float V) { return FMath::IsFinite(V); };
+            auto Finite = [](float V) { return VoxelMath::IsFinite(V); };
 
             if (ManagerLifetimeId != 0 && LiveManager == nullptr)
             {
@@ -6262,7 +6262,7 @@ namespace
             };
 
             const float K = P.SDFBlendRadius;
-            const float WormThreshold = FMath::IsFinite(P.WormNetworkRange)
+            const float WormThreshold = VoxelMath::IsFinite(P.WormNetworkRange)
                                        ? FMath::Max(3.0f * K, P.WormNetworkRange) : FLT_MAX;
             const float ThresholdWithBlend = VF_SaturatingAdd(WormThreshold, K);
             float Lower = FLT_MAX;
@@ -6803,7 +6803,7 @@ namespace
                             static_cast<float>(World.Z), GetBoxCache(), SupportColumn,
                             VoxelGenLOD::ShouldUseSpatialIndex(false));
                     ++B.ExactTailEvaluated;
-                    if (!FMath::IsFinite(Evaluation.SDF))
+                    if (!VoxelMath::IsFinite(Evaluation.SDF))
                     {
                         bExactTailUnknown = true;
                         if (CachedTailState != nullptr) { *CachedTailState = 0x84u; }
@@ -6941,7 +6941,7 @@ namespace
     FORCEINLINE bool VF_CaveBoxIsFar(const FVoxelBoxHypotheses& H, float SDFBlendRadius)
     {
         const float Threshold = SDFBlendRadius * 3.0f;
-        return FMath::IsFinite(Threshold) && H.Sdf.IsKnown() && H.Sdf.Min >= Threshold;
+        return VoxelMath::IsFinite(Threshold) && H.Sdf.IsKnown() && H.Sdf.Min >= Threshold;
     }
 
     FORCEINLINE EVoxelOpEffect VF_CaveDetailEffect(const FRoomGraphSource* Rooms,
@@ -7179,7 +7179,7 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.SurfaceRoughness > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.SurfaceRoughness)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.SurfaceRoughness)) { return FLT_MAX; }
 
             float NoiseBound = VF_PerlinAbsBound;
             switch (P.RoughnessNoiseType)
@@ -7200,14 +7200,14 @@ namespace
             }
 
             const float Result = 1.4f * NoiseBound * P.SurfaceRoughness * VOXEL_NOISE_SCALE;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
         bool IsInactiveFromSdf(const FVoxelBoxHypotheses& H) const
         {
             if (VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return true; }
-            if (!(P.SurfaceRoughness > 0.0f) || !FMath::IsFinite(P.SurfaceRoughness))
+            if (!(P.SurfaceRoughness > 0.0f) || !VoxelMath::IsFinite(P.SurfaceRoughness))
             {
                 return P.SurfaceRoughness <= 0.0f;
             }
@@ -7215,7 +7215,7 @@ namespace
             // Eval's second gate is abs(CaveSDF) < SurfaceRoughness*2.  A known positive
             // lower endpoint at or beyond that depth therefore proves the op is an identity even
             // when the broader shared near-surface gate (SDFBlendRadius*3) remains open.
-            return FMath::IsFinite(RoughnessDepth) && H.Sdf.IsKnown()
+            return VoxelMath::IsFinite(RoughnessDepth) && H.Sdf.IsKnown()
                 && H.Sdf.Min >= RoughnessDepth;
         }
 
@@ -7372,8 +7372,8 @@ namespace
         float MaxAmplitude() const
         {
             return (P.TerraceStepHeight > 0.0f
-                    && FMath::IsFinite(P.TerraceStepHeight)
-                    && FMath::IsFinite(P.TerraceHardness)
+                    && VoxelMath::IsFinite(P.TerraceStepHeight)
+                    && VoxelMath::IsFinite(P.TerraceHardness)
                     && P.TerraceHardness >= 0.0f && P.TerraceHardness <= 1.0f)
                  ? P.TerraceStepHeight : (P.TerraceStepHeight > 0.0f ? FLT_MAX : 0.0f);
         }
@@ -7473,7 +7473,7 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.LayerLineSpacing > 0.0f)) { return 0.0f; }
-            return FMath::IsFinite(P.LayerLineDepth)
+            return VoxelMath::IsFinite(P.LayerLineDepth)
                  ? FMath::Max(P.LayerLineDepth, 0.0f) : FLT_MAX;
         }
 
@@ -7571,7 +7571,7 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.RibbingSpacing > 0.0f)) { return 0.0f; }
-            return FMath::IsFinite(P.RibbingDepth)
+            return VoxelMath::IsFinite(P.RibbingDepth)
                  ? FMath::Max(P.RibbingDepth, 0.0f) : FLT_MAX;
         }
 
@@ -7675,14 +7675,14 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.OverhangStrength > 0.0f && P.OverhangDepth > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.OverhangDepth)
-                || !FMath::IsFinite(P.OverhangStrength))
+            if (!VoxelMath::IsFinite(P.OverhangDepth)
+                || !VoxelMath::IsFinite(P.OverhangStrength))
             {
                 return FLT_MAX;
             }
             const float Result = VOXEL_NOISE_SCALE * VF_PerlinAbsBound
                  * P.OverhangDepth * P.OverhangStrength;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -7801,10 +7801,10 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.CliffStrength > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.CliffStrength)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.CliffStrength)) { return FLT_MAX; }
             const float Result = 8.0f * 3.0f * VOXEL_NOISE_SCALE
                                * VF_PerlinAbsBound * P.CliffStrength;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -7908,9 +7908,9 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.ScallopStrength > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.ScallopStrength)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.ScallopStrength)) { return FLT_MAX; }
             const float Result = VF_CellularAbsBound * P.ScallopStrength;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -8037,9 +8037,9 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.ArchDensity > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
             const float Result = FMath::Abs(P.BaseDensity) * 3.0f * 1.5f;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -8130,7 +8130,7 @@ namespace
             }
             const float Bound = Rooms->RoomColumnFillSupremumForLastBox();
             if (!(Bound > 0.0f)) { return EVoxelOpEffect::Identity; }
-            return FMath::IsFinite(Bound) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Both;
+            return VoxelMath::IsFinite(Bound) ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Both;
         }
 
         float MaxCarveOverBox(const FBox&, const FVoxelOpContext&) const override { return 0.0f; }
@@ -8145,7 +8145,7 @@ namespace
         {
             if (Rooms == nullptr || VF_CaveBoxIsFar(H, P.SDFBlendRadius)) { return 0.0f; }
             const float Bound = Rooms->RoomColumnFillSupremumForLastBox();
-            return FMath::IsFinite(Bound) ? 0.0f : Bound;
+            return VoxelMath::IsFinite(Bound) ? 0.0f : Bound;
         }
 
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&,
@@ -8293,9 +8293,9 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.DomeDensity > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
             const float Result = FMath::Abs(P.BaseDensity) * 2.0f * 1.5f;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -8415,9 +8415,9 @@ namespace
         float MaxAmplitude() const
         {
             if (!(P.PinchDensity > 0.0f)) { return 0.0f; }
-            if (!FMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
+            if (!VoxelMath::IsFinite(P.BaseDensity)) { return FLT_MAX; }
             const float Result = FMath::Abs(P.BaseDensity) * 3.0f * 1.5f;
-            return FMath::IsFinite(Result) ? Result : FLT_MAX;
+            return VoxelMath::IsFinite(Result) ? Result : FLT_MAX;
         }
 
     private:
@@ -8504,7 +8504,7 @@ namespace
 
         float MaxFillOverBox(const FBox&, const FVoxelOpContext&) const override
         {
-            return FMath::IsFinite(P.FloorBias) && P.FloorBias >= 0.0f
+            return VoxelMath::IsFinite(P.FloorBias) && P.FloorBias >= 0.0f
                  ? P.FloorBias : (P.FloorBias < 0.0f ? 0.0f : FLT_MAX);
         }
 
@@ -8646,12 +8646,12 @@ namespace
                               const FVoxelBoxHypotheses& H) const override
         {
             const float Strength = MaxCarveOverBox(VoxelBox, Ctx);
-            if (!(Strength > 0.0f) || !FMath::IsFinite(Strength))
+            if (!(Strength > 0.0f) || !VoxelMath::IsFinite(Strength))
             {
                 return Strength;
             }
-            if (!(P.WormNetworkRange > 0.0f) || !FMath::IsFinite(P.WormNetworkRange)
-                || !H.Sdf.IsKnown() || !FMath::IsFinite(H.Sdf.Min))
+            if (!(P.WormNetworkRange > 0.0f) || !VoxelMath::IsFinite(P.WormNetworkRange)
+                || !H.Sdf.IsKnown() || !VoxelMath::IsFinite(H.Sdf.Min))
             {
                 return Strength;
             }
@@ -8664,11 +8664,11 @@ namespace
             // interval's worst case, so this never assumes a room value that the preceding source
             // did not prove.
             if (Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
-                && FMath::IsFinite(P.WormFrequency)
-                && FMath::IsFinite(P.WormHorizontalBias)
-                && FMath::IsFinite(P.WormThreshold)
+                && VoxelMath::IsFinite(P.WormFrequency)
+                && VoxelMath::IsFinite(P.WormHorizontalBias)
+                && VoxelMath::IsFinite(P.WormThreshold)
                 && P.WormThreshold > 0.0f
-                && FMath::IsFinite(P.VerticalScale))
+                && VoxelMath::IsFinite(P.VerticalScale))
             {
                 const int32 Step = FMath::Max(Ctx.Step, 1);
                 const float OriginX = static_cast<float>(Ctx.LatticeOriginVoxels.X);
@@ -8774,7 +8774,7 @@ namespace
         float MaxCarveAmplitude() const
         {
             if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return 0.0f; }
-            return FMath::IsFinite(P.WormStrength) ? P.WormStrength : FLT_MAX;
+            return VoxelMath::IsFinite(P.WormStrength) ? P.WormStrength : FLT_MAX;
         }
 
         const TCHAR* DebugName() const override { return TEXT("WormFieldSource"); }
@@ -9200,7 +9200,7 @@ void FVoxelOpStack::DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx
                     Entry.Op->Eval(static_cast<float>(X), static_cast<float>(Y),
                                    static_cast<float>(Z), Sample);
                     const float DensityDelta = Sample.Density - DensityBefore;
-                    if (FMath::IsFinite(DensityDelta))
+                    if (VoxelMath::IsFinite(DensityDelta))
                     {
                         Diagnostic.bHasDensityDelta = true;
                         Diagnostic.ActualDensityDeltaMin =
@@ -9219,12 +9219,12 @@ void FVoxelOpStack::DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx
                                 * FMath::Max(1.0f, FMath::Abs(Diagnostic.MaxCarve));
                             const float FillEpsilon = BoundEpsilon
                                 * FMath::Max(1.0f, FMath::Abs(Diagnostic.MaxFill));
-                            if (FMath::IsFinite(Diagnostic.MaxCarve)
+                            if (VoxelMath::IsFinite(Diagnostic.MaxCarve)
                                 && DensityDelta < -Diagnostic.MaxCarve - CarveEpsilon)
                             {
                                 Diagnostic.bCarveBoundViolated = true;
                             }
-                            if (FMath::IsFinite(Diagnostic.MaxFill)
+                            if (VoxelMath::IsFinite(Diagnostic.MaxFill)
                                 && DensityDelta > Diagnostic.MaxFill + FillEpsilon)
                             {
                                 Diagnostic.bFillBoundViolated = true;
@@ -9232,7 +9232,7 @@ void FVoxelOpStack::DiagnoseBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx
                         }
                     }
 
-                    if (Diagnostic.bWritesSdf && FMath::IsFinite(Sample.Sdf))
+                    if (Diagnostic.bWritesSdf && VoxelMath::IsFinite(Sample.Sdf))
                     {
                         Diagnostic.bHasSdfValue = true;
                         Diagnostic.ActualSdfMin = FMath::Min(
@@ -10338,8 +10338,8 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
     const float Bottom = VoxelStrateRecipePrivate::Bottom(Params, Recipe.StructuralParamBlock);
     const float Seal = VoxelStrateRecipePrivate::BoundarySeal(Params, Recipe.StructuralParamBlock);
     const float Base = VoxelStrateRecipePrivate::BaseDensity(Params, Recipe.StructuralParamBlock);
-    if (!FMath::IsFinite(Top) || !FMath::IsFinite(Bottom) || Top <= Bottom
-        || !FMath::IsFinite(Seal) || !FMath::IsFinite(Base))
+    if (!VoxelMath::IsFinite(Top) || !VoxelMath::IsFinite(Bottom) || Top <= Bottom
+        || !VoxelMath::IsFinite(Seal) || !VoxelMath::IsFinite(Base))
     {
         return Fail(TEXT("Recipe structural parameters do not define a finite positive strate."));
     }
@@ -10574,9 +10574,9 @@ bool VF_BuildStrateRegionStack(
         ? Manifest.BoundarySealThickness : VF_RegionSeal(FirstParams, GlobalBlock);
     float Base = Manifest.bHasGlobalStructuralParams
         ? Manifest.BaseDensity : VF_RegionBase(FirstParams, GlobalBlock);
-    if (!FMath::IsFinite(Top) || !FMath::IsFinite(Bottom) || !(Top > Bottom)
-        || !FMath::IsFinite(Seal) || Seal < 0.0f
-        || !FMath::IsFinite(Base) || !(Base > 0.0f))
+    if (!VoxelMath::IsFinite(Top) || !VoxelMath::IsFinite(Bottom) || !(Top > Bottom)
+        || !VoxelMath::IsFinite(Seal) || Seal < 0.0f
+        || !VoxelMath::IsFinite(Base) || !(Base > 0.0f))
     {
         return Fail(TEXT("lateral region structural parameters are not a finite positive strate"));
     }

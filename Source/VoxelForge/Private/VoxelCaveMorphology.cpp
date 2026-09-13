@@ -121,11 +121,11 @@ namespace
         double X, double Y)
     {
         FVFFloorReliefColumnKey Key;
-        const bool bIntegerX = FMath::IsFinite(X)
+        const bool bIntegerX = VoxelMath::IsFinite(X)
             && X >= static_cast<double>(MIN_int32)
             && X <= static_cast<double>(MAX_int32)
             && FMath::FloorToDouble(X) == X;
-        const bool bIntegerY = FMath::IsFinite(Y)
+        const bool bIntegerY = VoxelMath::IsFinite(Y)
             && Y >= static_cast<double>(MIN_int32)
             && Y <= static_cast<double>(MAX_int32)
             && FMath::FloorToDouble(Y) == Y;
@@ -294,19 +294,19 @@ namespace
     {
         OutBound = 0.0f;
         if (!(Strength > 0.0f)
-            || !FMath::IsFinite(Strength)
-            || !FMath::IsFinite(Frequency)
+            || !VoxelMath::IsFinite(Strength)
+            || !VoxelMath::IsFinite(Frequency)
             || !(Envelope > 0.0f)
-            || !FMath::IsFinite(Envelope)
+            || !VoxelMath::IsFinite(Envelope)
             || !(ReliefScale > 0.0f)
-            || !FMath::IsFinite(ReliefScale))
+            || !VoxelMath::IsFinite(ReliefScale))
         {
             return false;
         }
 
         OutBound = FMath::Abs(Strength) * VOXEL_NOISE_SCALE
             * VF_FloorReliefNoiseAbsBound * Envelope * ReliefScale;
-        return FMath::IsFinite(OutBound) && OutBound >= 0.0f;
+        return VoxelMath::IsFinite(OutBound) && OutBound >= 0.0f;
     }
 
     // Keep corridor relief on the exact two-octave field already used by room floors.  The
@@ -319,8 +319,8 @@ namespace
         const FVFFloorReliefColumnKey& Column)
     {
         if (!(Tunnel.FloorReliefStrength > 0.0f)
-            || !FMath::IsFinite(Tunnel.FloorReliefStrength)
-            || !FMath::IsFinite(Tunnel.FloorReliefFrequency)
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefStrength)
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefFrequency)
             || !(Envelope > 0.0f)
             || !(ReliefScale > 0.0f))
         {
@@ -391,8 +391,8 @@ namespace
         const FCachedTunnel& Tunnel)
     {
         if (!(Tunnel.FloorReliefStrength > 0.0f)
-            || !FMath::IsFinite(Tunnel.FloorReliefStrength)
-            || !FMath::IsFinite(Tunnel.FloorReliefFrequency))
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefStrength)
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefFrequency))
         {
             return 0.0f;
         }
@@ -442,7 +442,7 @@ namespace
         const float ReliefGradientBound = NoiseGradientBound
             + EnvelopeDerivativeBound;
         if (!(ReliefGradientBound > KINDA_SMALL_NUMBER)
-            || !FMath::IsFinite(ReliefGradientBound))
+            || !VoxelMath::IsFinite(ReliefGradientBound))
         {
             return 0.0f;
         }
@@ -462,8 +462,8 @@ namespace
     {
         if (bTerraced
             || !(Tunnel.FloorReliefStrength > 0.0f)
-            || !FMath::IsFinite(Tunnel.FloorReliefStrength)
-            || !FMath::IsFinite(Tunnel.FloorReliefFrequency))
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefStrength)
+            || !VoxelMath::IsFinite(Tunnel.FloorReliefFrequency))
         {
             return 0.0f;
         }
@@ -471,7 +471,7 @@ namespace
         const float HorizontalRun = FVector2D(
             static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
         if (!(HorizontalRun > KINDA_SMALL_NUMBER)
-            || !FMath::IsFinite(BaseGradient)
+            || !VoxelMath::IsFinite(BaseGradient)
             || BaseGradient < 0.0f)
         {
             return 0.0f;
@@ -501,7 +501,7 @@ namespace
         const float ReliefGradientBound = NoiseGradientBound
             + EnvelopeDerivativeBound;
         if (!(ReliefGradientBound > KINDA_SMALL_NUMBER)
-            || !FMath::IsFinite(ReliefGradientBound))
+            || !VoxelMath::IsFinite(ReliefGradientBound))
         {
             return 0.0f;
         }
@@ -536,11 +536,11 @@ namespace
                 ControlPoints[Index], FMath::Abs(ControlRadii[Index]));
         }
 
-        const float GentleThreshold = FMath::IsFinite(
+        const float GentleThreshold = VoxelMath::IsFinite(
                 Tunnel.TunnelFloorGentleSlopeThreshold)
             ? FMath::Max(Tunnel.TunnelFloorGentleSlopeThreshold, 0.0f)
             : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
-        const float LegacyStepHeight = FMath::IsFinite(
+        const float LegacyStepHeight = VoxelMath::IsFinite(
                 Tunnel.TunnelFloorTerraceStepHeight)
             ? FMath::Max(Tunnel.TunnelFloorTerraceStepHeight, 0.0f)
             : 0.0f;
@@ -568,7 +568,7 @@ namespace
                 && TotalFloorDelta > TotalHorizontalRun * GentleThreshold;
             if (bGlobalTerrace)
             {
-                const float MaxLedgeHeight = FMath::IsFinite(
+                const float MaxLedgeHeight = VoxelMath::IsFinite(
                         Tunnel.TunnelFloorMaxLedgeHeight)
                     ? FMath::Max(Tunnel.TunnelFloorMaxLedgeHeight, KINDA_SMALL_NUMBER)
                     : KINDA_SMALL_NUMBER;
@@ -759,10 +759,10 @@ namespace
                 - FMath::Abs(ControlRadiusData[ControlIndex]);
             const float StoredFloorZ = Endpoint == 0 ? MouthFloorZA : MouthFloorZB;
             const float FloorZ = StoredFloorZ > -FLT_MAX
-                && FMath::IsFinite(StoredFloorZ)
+                && VoxelMath::IsFinite(StoredFloorZ)
                 ? StoredFloorZ
                 : DefaultFloorZ;
-            if (!FMath::IsFinite(FloorZ))
+            if (!VoxelMath::IsFinite(FloorZ))
             {
                 continue;
             }
@@ -1063,14 +1063,14 @@ namespace
                 && Profile != nullptr
                 && Tunnel.TunnelFloorLedgeCountPreference > 0;
             const bool bAnchorCapsule = bUseAuthoredProfile
-                && FMath::IsFinite(NaturalFloorZ);
+                && VoxelMath::IsFinite(NaturalFloorZ);
             const auto EvaluateAnchoredCapsule = [
                 &Position, &A, &B, RadiusA, RadiusB, NaturalFloorZ, bAnchorCapsule]
                 (float FloorZ) -> float
             {
                 const float Shift = FloorZ - NaturalFloorZ;
                 if (!bAnchorCapsule
-                    || !FMath::IsFinite(Shift)
+                    || !VoxelMath::IsFinite(Shift)
                     || FMath::Abs(Shift) <= KINDA_SMALL_NUMBER)
                 {
                     return VoxelSDF::TaperedCapsule(
@@ -1120,7 +1120,7 @@ namespace
             // the translated arch only when the column relief actually changed its anchor; most
             // samples retain the cheap provisional result.
             if (bAnchorCapsule
-                && FMath::IsFinite(FloorZ)
+                && VoxelMath::IsFinite(FloorZ)
                 && FMath::Abs(FloorZ - FloorTerms.BaseFloorZ) > KINDA_SMALL_NUMBER)
             {
                 SegmentSDF = EvaluateAnchoredCapsule(FloorZ);
@@ -1275,8 +1275,8 @@ namespace
         }
 
         return bFound
-            && FMath::IsFinite(OutFloorZ)
-            && FMath::IsFinite(OutSupportRadius)
+            && VoxelMath::IsFinite(OutFloorZ)
+            && VoxelMath::IsFinite(OutSupportRadius)
             && BestDistanceSquared <= FMath::Square(OutSupportRadius);
     }
 
@@ -1316,7 +1316,7 @@ bool FChunkSDFSpatialIndex::GetRange(
     OutBegin = 0;
     OutEnd = 0;
     if (!bValid
-        || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+        || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
         || NumCellsX <= 0 || NumCellsY <= 0)
     {
         return false;
@@ -1369,8 +1369,8 @@ namespace
     static bool VF_SetSpatialBounds(
         float CenterX, float CenterY, float Radius, FVFSpatialBounds& OutBounds)
     {
-        if (!FMath::IsFinite(CenterX) || !FMath::IsFinite(CenterY)
-            || !FMath::IsFinite(Radius) || Radius < 0.0f)
+        if (!VoxelMath::IsFinite(CenterX) || !VoxelMath::IsFinite(CenterY)
+            || !VoxelMath::IsFinite(Radius) || Radius < 0.0f)
         {
             return false;
         }
@@ -1378,8 +1378,8 @@ namespace
         OutBounds.MinY = CenterY - Radius;
         OutBounds.MaxX = CenterX + Radius;
         OutBounds.MaxY = CenterY + Radius;
-        return FMath::IsFinite(OutBounds.MinX) && FMath::IsFinite(OutBounds.MinY)
-            && FMath::IsFinite(OutBounds.MaxX) && FMath::IsFinite(OutBounds.MaxY)
+        return VoxelMath::IsFinite(OutBounds.MinX) && VoxelMath::IsFinite(OutBounds.MinY)
+            && VoxelMath::IsFinite(OutBounds.MaxX) && VoxelMath::IsFinite(OutBounds.MaxY)
             && OutBounds.MinX <= OutBounds.MaxX && OutBounds.MinY <= OutBounds.MaxY;
     }
 
@@ -1387,9 +1387,9 @@ namespace
         float MinX, float MinY, float MaxX, float MaxY,
         float Radius, FVFSpatialBounds& OutBounds)
     {
-        if (!FMath::IsFinite(MinX) || !FMath::IsFinite(MinY)
-            || !FMath::IsFinite(MaxX) || !FMath::IsFinite(MaxY)
-            || !FMath::IsFinite(Radius) || Radius < 0.0f
+        if (!VoxelMath::IsFinite(MinX) || !VoxelMath::IsFinite(MinY)
+            || !VoxelMath::IsFinite(MaxX) || !VoxelMath::IsFinite(MaxY)
+            || !VoxelMath::IsFinite(Radius) || Radius < 0.0f
             || MinX > MaxX || MinY > MaxY)
         {
             return false;
@@ -1398,8 +1398,8 @@ namespace
         OutBounds.MinY = MinY - Radius;
         OutBounds.MaxX = MaxX + Radius;
         OutBounds.MaxY = MaxY + Radius;
-        return FMath::IsFinite(OutBounds.MinX) && FMath::IsFinite(OutBounds.MinY)
-            && FMath::IsFinite(OutBounds.MaxX) && FMath::IsFinite(OutBounds.MaxY)
+        return VoxelMath::IsFinite(OutBounds.MinX) && VoxelMath::IsFinite(OutBounds.MinY)
+            && VoxelMath::IsFinite(OutBounds.MaxX) && VoxelMath::IsFinite(OutBounds.MaxY)
             && OutBounds.MinX <= OutBounds.MaxX && OutBounds.MinY <= OutBounds.MaxY;
     }
 
@@ -1855,7 +1855,7 @@ static bool VF_ComputeTerrainOpEnvelope(
 
     auto RecordAuthoredExtent = [&](float Extent) -> bool
     {
-        if (!FMath::IsFinite(Extent) || Extent < 0.0f)
+        if (!VoxelMath::IsFinite(Extent) || Extent < 0.0f)
         {
             return false;
         }
@@ -1865,12 +1865,12 @@ static bool VF_ComputeTerrainOpEnvelope(
     };
     auto RecordReach = [&](float Reach) -> bool
     {
-        if (!FMath::IsFinite(Reach) || Reach < 0.0f)
+        if (!VoxelMath::IsFinite(Reach) || Reach < 0.0f)
         {
             return false;
         }
         MaxReach = FMath::Max(MaxReach, Reach);
-        return FMath::IsFinite(MaxReach);
+        return VoxelMath::IsFinite(MaxReach);
     };
     auto RecordDetail = [&](float EffectRange) -> bool
     {
@@ -1922,7 +1922,7 @@ static bool VF_ComputeTerrainOpEnvelope(
             OpParams.PinchLength};
         for (const float Value : OperationValues)
         {
-            if (!FMath::IsFinite(Value))
+            if (!VoxelMath::IsFinite(Value))
             {
                 return false;
             }
@@ -2089,9 +2089,9 @@ static bool VF_ComputeTerrainOpEnvelope(
     {
         for (const FStrateTerrainOpEntry& Entry : *TerrainOps)
         {
-            if (!FMath::IsFinite(Entry.Probability)
+            if (!VoxelMath::IsFinite(Entry.Probability)
                 || Entry.Probability < 0.0f || Entry.Probability > 1.0f
-                || !FMath::IsFinite(Entry.Weight)
+                || !VoxelMath::IsFinite(Entry.Weight)
                 || Entry.Weight < 0.0f || Entry.Weight > 3.0f)
             {
                 return false;
@@ -2144,8 +2144,8 @@ static bool VF_ComputeTerrainOpEnvelope(
     // the legacy/no-op path store extra rooms and could change the canonical field.  Active pools
     // publish the wider envelope so the tile proof and STORE cull see pits/chimneys/detail reach.
     OutReach = bHasActiveTerrainOperation ? MaxReach : 0.0f;
-    return FMath::IsFinite(OutReach)
-        && FMath::IsFinite(MaxAuthoredExtent)
+    return VoxelMath::IsFinite(OutReach)
+        && VoxelMath::IsFinite(MaxAuthoredExtent)
         && MaxAuthoredExtent <= VF_MaxProvenTerrainOpExtent;
 }
 
@@ -2183,7 +2183,7 @@ static bool VF_ComputeRoomGraphReach(
         Params.StrateBottomWorldZ};
     for (const float Value : RelevantParams)
     {
-        if (!FMath::IsFinite(Value))
+        if (!VoxelMath::IsFinite(Value))
         {
             return false;
         }
@@ -2295,10 +2295,10 @@ static bool VF_ComputeRoomGraphReach(
     const float CollectMargin = 2.0f * MaxTunnelLength
         + FMath::Max(DirectRoomReach, PairAabbReach);
 
-    if (!FMath::IsFinite(DirectRoomReach)
-        || !FMath::IsFinite(PairAabbReach)
-        || !FMath::IsFinite(PairZReach)
-        || !FMath::IsFinite(CollectMargin)
+    if (!VoxelMath::IsFinite(DirectRoomReach)
+        || !VoxelMath::IsFinite(PairAabbReach)
+        || !VoxelMath::IsFinite(PairZReach)
+        || !VoxelMath::IsFinite(CollectMargin)
         || DirectRoomReach < 0.0f
         || PairAabbReach < 0.0f
         || PairZReach < 0.0f
@@ -2343,11 +2343,11 @@ static bool VF_MayHaveRoomGraphFeature(
 
     for (const FBuildRoom& Room : Rooms)
     {
-        if (!FMath::IsFinite(Room.Center.X)
-            || !FMath::IsFinite(Room.Center.Y)
-            || !FMath::IsFinite(Room.Center.Z)
-            || !FMath::IsFinite(Room.RadiusXY)
-            || !FMath::IsFinite(Room.RadiusZ))
+        if (!VoxelMath::IsFinite(Room.Center.X)
+            || !VoxelMath::IsFinite(Room.Center.Y)
+            || !VoxelMath::IsFinite(Room.Center.Z)
+            || !VoxelMath::IsFinite(Room.RadiusXY)
+            || !VoxelMath::IsFinite(Room.RadiusZ))
         {
             return true;
         }
@@ -2355,7 +2355,7 @@ static bool VF_MayHaveRoomGraphFeature(
             Room.RadiusXY, Room.RadiusZ)
             + Reach.FloorReliefEnvelope + Reach.BlendEnvelope * 3.0f;
         const float RoomReach = FMath::Max(BaseRoomReach, Reach.TerrainOpReach);
-        if (!FMath::IsFinite(RoomReach) || RoomReach < 0.0f)
+        if (!VoxelMath::IsFinite(RoomReach) || RoomReach < 0.0f)
         {
             return true;
         }
@@ -2372,7 +2372,7 @@ static bool VF_MayHaveRoomGraphFeature(
             SearchMinY - RoomReach,
             SearchMaxX + RoomReach,
             SearchMaxY + RoomReach);
-        if (!FMath::IsFinite(DistanceSquared))
+        if (!VoxelMath::IsFinite(DistanceSquared))
         {
             return true;
         }
@@ -2412,7 +2412,7 @@ static bool VF_MayHaveRoomGraphFeature(
             }
             const float EuclideanDistance = static_cast<float>(
                 FVector::Dist(FirstCenter, SecondCenter));
-            if (!FMath::IsFinite(EuclideanDistance))
+            if (!VoxelMath::IsFinite(EuclideanDistance))
             {
                 return true;
             }
@@ -2436,8 +2436,8 @@ static bool VF_MayHaveRoomGraphFeature(
                 static_cast<float>(FirstCenter.Y),
                 static_cast<float>(SecondCenter.Y))
                 + Reach.PairAabbReach;
-            if (!FMath::IsFinite(PairMinX) || !FMath::IsFinite(PairMinY)
-                || !FMath::IsFinite(PairMaxX) || !FMath::IsFinite(PairMaxY))
+            if (!VoxelMath::IsFinite(PairMinX) || !VoxelMath::IsFinite(PairMinY)
+                || !VoxelMath::IsFinite(PairMaxX) || !VoxelMath::IsFinite(PairMaxY))
             {
                 return true;
             }
@@ -2453,7 +2453,7 @@ static bool VF_MayHaveRoomGraphFeature(
 #if 0
     const float MaxTunnelLengthSquared =
         Reach.MaxTunnelLength * Reach.MaxTunnelLength;
-    if (!FMath::IsFinite(MaxTunnelLengthSquared))
+    if (!VoxelMath::IsFinite(MaxTunnelLengthSquared))
     {
         return true;
     }
@@ -2493,7 +2493,7 @@ static bool VF_MayHaveRoomGraphFeature(
             const float DistanceSquared = static_cast<float>(
                 FVector::DistSquared(
                     Rooms[Index].Center, Rooms[Other].Center));
-            if (!FMath::IsFinite(DistanceSquared))
+            if (!VoxelMath::IsFinite(DistanceSquared))
             {
                 return -2;
             }
@@ -2502,7 +2502,7 @@ static bool VF_MayHaveRoomGraphFeature(
                 continue;
             }
             const float Metric = LinkMetric(Index, Other);
-            if (!FMath::IsFinite(Metric))
+            if (!VoxelMath::IsFinite(Metric))
             {
                 return -2;
             }
@@ -2537,7 +2537,7 @@ static bool VF_MayHaveRoomGraphFeature(
         {
             const float EuclideanDistance = static_cast<float>(
                 FVector::Dist(Rooms[First].Center, Rooms[Second].Center));
-            if (!FMath::IsFinite(EuclideanDistance))
+            if (!VoxelMath::IsFinite(EuclideanDistance))
             {
                 return true;
             }
@@ -2552,7 +2552,7 @@ static bool VF_MayHaveRoomGraphFeature(
                 CheckDistance += VerticalSeparation
                     * Params.TunnelHorizontalBias * 5.0f;
             }
-            if (!FMath::IsFinite(CheckDistance)
+            if (!VoxelMath::IsFinite(CheckDistance)
                 || CheckDistance > Reach.MaxTunnelLength)
             {
                 continue;
@@ -2589,8 +2589,8 @@ static bool VF_MayHaveRoomGraphFeature(
                 static_cast<float>(Rooms[First].Center.Y),
                 static_cast<float>(Rooms[Second].Center.Y))
                 + Reach.PairAabbReach;
-            if (!FMath::IsFinite(PairMinX) || !FMath::IsFinite(PairMinY)
-                || !FMath::IsFinite(PairMaxX) || !FMath::IsFinite(PairMaxY))
+            if (!VoxelMath::IsFinite(PairMinX) || !VoxelMath::IsFinite(PairMinY)
+                || !VoxelMath::IsFinite(PairMaxX) || !VoxelMath::IsFinite(PairMaxY))
             {
                 return true;
             }
@@ -2813,16 +2813,16 @@ namespace
         OutCentreSupportIndex = INDEX_NONE;
         OutRequiredSupportCount = 0;
 
-        if (!FMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
+        if (!VoxelMath::IsFinite(Settings.PlayerCapsuleRadiusVoxels)
             || Settings.PlayerCapsuleRadiusVoxels <= 0.0f
-            || !FMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
+            || !VoxelMath::IsFinite(Settings.PlayerCapsuleHalfHeightVoxels)
             || Settings.PlayerCapsuleHalfHeightVoxels <= 0.0f
-            || !FMath::IsFinite(Settings.PlayerMaxStepHeightMeters)
+            || !VoxelMath::IsFinite(Settings.PlayerMaxStepHeightMeters)
             || Settings.PlayerMaxStepHeightMeters < 0.0f
-            || !FMath::IsFinite(Settings.PlayerWalkableFloorAngleDegrees)
+            || !VoxelMath::IsFinite(Settings.PlayerWalkableFloorAngleDegrees)
             || Settings.PlayerWalkableFloorAngleDegrees < 0.0f
             || Settings.PlayerWalkableFloorAngleDegrees > 90.0f
-            || !FMath::IsFinite(Settings.PlayerSupportPatchMinCoverageFraction)
+            || !VoxelMath::IsFinite(Settings.PlayerSupportPatchMinCoverageFraction)
             || Settings.PlayerSupportPatchMinCoverageFraction <= 0.0f
             || Settings.PlayerSupportPatchMinCoverageFraction > 1.0f)
         {
@@ -2924,9 +2924,9 @@ namespace
         float& OutInnerTop,
         float& OutInnerBottom)
     {
-        if (!FMath::IsFinite(StrateTopZ)
-            || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(BoundarySealThickness)
+        if (!VoxelMath::IsFinite(StrateTopZ)
+            || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(BoundarySealThickness)
             || BoundarySealThickness < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
@@ -2938,7 +2938,7 @@ namespace
         {
             const double DerivedMargin = 2.0
                 * static_cast<double>(BoundarySealThickness);
-            if (!FMath::IsFinite(DerivedMargin)
+            if (!VoxelMath::IsFinite(DerivedMargin)
                 || DerivedMargin > static_cast<double>(INT32_MAX))
             {
                 return false;
@@ -2952,8 +2952,8 @@ namespace
 
         OutInnerBottom = StrateBottomZ + static_cast<float>(InteriorMarginVoxels);
         OutInnerTop = StrateTopZ - static_cast<float>(InteriorMarginVoxels);
-        return FMath::IsFinite(OutInnerTop)
-            && FMath::IsFinite(OutInnerBottom)
+        return VoxelMath::IsFinite(OutInnerTop)
+            && VoxelMath::IsFinite(OutInnerBottom)
             && OutInnerTop > OutInnerBottom;
     }
 
@@ -2967,12 +2967,12 @@ namespace
         FVector& OutPoint)
     {
         OutPoint = FVector::ZeroVector;
-        if (!FMath::IsFinite(CandidateFeetPoint.X)
-            || !FMath::IsFinite(CandidateFeetPoint.Y)
-            || !FMath::IsFinite(CandidateFeetPoint.Z)
-            || !FMath::IsFinite(StrateTopZ)
-            || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(BoundarySealThickness)
+        if (!VoxelMath::IsFinite(CandidateFeetPoint.X)
+            || !VoxelMath::IsFinite(CandidateFeetPoint.Y)
+            || !VoxelMath::IsFinite(CandidateFeetPoint.Z)
+            || !VoxelMath::IsFinite(StrateTopZ)
+            || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(BoundarySealThickness)
             || BoundarySealThickness < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
@@ -2993,7 +2993,7 @@ namespace
         const double MaxStepHeightVoxelsReal =
             static_cast<double>(Settings.PlayerMaxStepHeightMeters)
             / static_cast<double>(FVoxelPlayerCapsuleConstants::VoxelSizeMeters);
-        if (!FMath::IsFinite(MaxStepHeightVoxelsReal)
+        if (!VoxelMath::IsFinite(MaxStepHeightVoxelsReal)
             || MaxStepHeightVoxelsReal < 0.0
             || MaxStepHeightVoxelsReal > 4096.0)
         {
@@ -3028,8 +3028,8 @@ namespace
                     CandidateFeetPoint.X + static_cast<float>(Offset.X),
                     CandidateFeetPoint.Y + static_cast<float>(Offset.Y),
                     UpperZ);
-                if (!FMath::IsFinite(LowerDensity)
-                    || !FMath::IsFinite(UpperDensity)
+                if (!VoxelMath::IsFinite(LowerDensity)
+                    || !VoxelMath::IsFinite(UpperDensity)
                     || !(LowerDensity <= 0.0f)
                     || !(UpperDensity > 0.0f))
                 {
@@ -3037,7 +3037,7 @@ namespace
                 }
 
                 const float Denominator = UpperDensity - LowerDensity;
-                if (!FMath::IsFinite(Denominator) || Denominator <= 0.0f)
+                if (!VoxelMath::IsFinite(Denominator) || Denominator <= 0.0f)
                 {
                     continue;
                 }
@@ -3045,7 +3045,7 @@ namespace
                     -LowerDensity / Denominator, 0.0f, 1.0f);
                 const float SurfaceHeight = LowerZ + Fraction;
                 const float CandidateBottom = CandidateFeetPoint.Z - 0.5f;
-                if (!FMath::IsFinite(SurfaceHeight)
+                if (!VoxelMath::IsFinite(SurfaceHeight)
                     || SurfaceHeight > CandidateBottom + KINDA_SMALL_NUMBER
                     || SurfaceHeight < CandidateBottom - MaxStepHeightVoxels
                         - KINDA_SMALL_NUMBER)
@@ -3074,7 +3074,7 @@ namespace
             ++SupportCount;
             SupportHeight = FMath::Max(SupportHeight, SupportHeights[Index]);
         }
-        if (SupportCount < RequiredSupportCount || !FMath::IsFinite(SupportHeight))
+        if (SupportCount < RequiredSupportCount || !VoxelMath::IsFinite(SupportHeight))
         {
             return false;
         }
@@ -3100,7 +3100,7 @@ namespace
         }
         const float SupportNormalZ = 1.0f / FMath::Sqrt(
             1.0f + MaximumGradient * MaximumGradient);
-        if (!FMath::IsFinite(SupportNormalZ)
+        if (!VoxelMath::IsFinite(SupportNormalZ)
             || SupportNormalZ + KINDA_SMALL_NUMBER < MinimumWalkableNormalZ)
         {
             return false;
@@ -3119,7 +3119,7 @@ namespace
                     CandidateFeetPoint.X + static_cast<float>(Offset.X),
                     CandidateFeetPoint.Y + static_cast<float>(Offset.Y),
                     SampleZ);
-                if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                if (!VoxelMath::IsFinite(Density) || !(Density > 0.0f))
                 {
                     return false;
                 }
@@ -3137,8 +3137,8 @@ namespace
         const float OutputZ = SupportHeight + 0.5f;
         const float OccupiedTop = SupportHeight
             + 2.0f * Settings.PlayerCapsuleHalfHeightVoxels;
-        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
-            || !FMath::IsFinite(OutputZ) || !FMath::IsFinite(OccupiedTop)
+        if (!VoxelMath::IsFinite(InnerBottom) || !VoxelMath::IsFinite(InnerTop)
+            || !VoxelMath::IsFinite(OutputZ) || !VoxelMath::IsFinite(OccupiedTop)
             || OutputZ <= InnerBottom
             || OccupiedTop >= InnerTop)
         {
@@ -3147,9 +3147,9 @@ namespace
 
         OutPoint = FVector(CandidateFeetPoint.X, CandidateFeetPoint.Y, OutputZ);
         return !OutPoint.ContainsNaN()
-            && FMath::IsFinite(OutPoint.X)
-            && FMath::IsFinite(OutPoint.Y)
-            && FMath::IsFinite(OutPoint.Z);
+            && VoxelMath::IsFinite(OutPoint.X)
+            && VoxelMath::IsFinite(OutPoint.Y)
+            && VoxelMath::IsFinite(OutPoint.Z);
     }
 
     struct FVFRoomLandingSite
@@ -3223,9 +3223,9 @@ namespace
             const FVector Mapped = VF_ApplyCaveWarp(WorldPoint, Params, Seed);
             const FVector Error = TargetSDFPoint - Mapped;
             if (!Error.ContainsNaN()
-                && FMath::IsFinite(Error.X)
-                && FMath::IsFinite(Error.Y)
-                && FMath::IsFinite(Error.Z))
+                && VoxelMath::IsFinite(Error.X)
+                && VoxelMath::IsFinite(Error.Y)
+                && VoxelMath::IsFinite(Error.Z))
             {
                 WorldPoint.X += Error.X;
                 WorldPoint.Y += Error.Y;
@@ -3413,7 +3413,7 @@ namespace
     {
         OutPoint = FVector::ZeroVector;
         const float FloorZ = VF_RoomFloorZ(Site, WarpSeed, Params);
-        if (!FMath::IsFinite(FloorZ))
+        if (!VoxelMath::IsFinite(FloorZ))
         {
             return false;
         }
@@ -4198,9 +4198,9 @@ namespace
         float MaxLateralSnap,
         FVector& OutPoint)
     {
-        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+        if (!VoxelMath::IsFinite(StrateTopZ) || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
@@ -4208,11 +4208,11 @@ namespace
 
         const float CellSize = Params.RoomSpacing;
         const float RadiusEnvelope = FMath::Max(Params.MinRoomRadius, Params.MaxRoomRadius);
-        if (!FMath::IsFinite(CellSize) || !FMath::IsFinite(Params.RoomDensity)
-            || !FMath::IsFinite(Params.MinRoomRadius) || !FMath::IsFinite(Params.MaxRoomRadius)
-            || !FMath::IsFinite(Params.RoomHeightRatio)
-            || !FMath::IsFinite(Params.BoundarySealThickness)
-            || !FMath::IsFinite(Params.MaxTunnelLength)
+        if (!VoxelMath::IsFinite(CellSize) || !VoxelMath::IsFinite(Params.RoomDensity)
+            || !VoxelMath::IsFinite(Params.MinRoomRadius) || !VoxelMath::IsFinite(Params.MaxRoomRadius)
+            || !VoxelMath::IsFinite(Params.RoomHeightRatio)
+            || !VoxelMath::IsFinite(Params.BoundarySealThickness)
+            || !VoxelMath::IsFinite(Params.MaxTunnelLength)
             || CellSize <= 0.0f || Params.RoomDensity <= 0.0f
             || Params.MaxTunnelLength <= 0.0f
             || RadiusEnvelope <= 0.0f || Params.RoomHeightRatio <= 0.0f
@@ -4231,7 +4231,7 @@ namespace
         const float StrateMinZ = StrateBottomZ + Params.BoundarySealThickness + RoomZBuffer;
         const float StrateMaxZ = StrateTopZ - Params.BoundarySealThickness - RoomZBuffer;
         const float StrateRangeZ = StrateMaxZ - StrateMinZ;
-        if (!FMath::IsFinite(StrateRangeZ) || StrateRangeZ <= 0.0f)
+        if (!VoxelMath::IsFinite(StrateRangeZ) || StrateRangeZ <= 0.0f)
         {
             return false;
         }
@@ -4380,7 +4380,7 @@ namespace
         // malformed but finite parameters never turn a boundary value into an open-point claim.
         const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
         const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
-        if (!FMath::IsFinite(BestZ) || BestZ <= InnerBottom || BestZ >= InnerTop)
+        if (!VoxelMath::IsFinite(BestZ) || BestZ <= InnerBottom || BestZ >= InnerTop)
         {
             return false;
         }
@@ -4550,26 +4550,26 @@ namespace
         float MaxLateralSnap,
         FVector& OutPoint)
     {
-        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+        if (!VoxelMath::IsFinite(StrateTopZ) || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
         }
 
-        if (!FMath::IsFinite(Params.FloorRelativeHeight)
-            || !FMath::IsFinite(Params.CeilingRelativeHeight)
-            || !FMath::IsFinite(Params.FloorRoughness)
-            || !FMath::IsFinite(Params.FloorRoughnessFrequency)
-            || !FMath::IsFinite(Params.CeilingRoughness)
-            || !FMath::IsFinite(Params.CeilingRoughnessFrequency)
-            || !FMath::IsFinite(Params.ColumnDensity)
-            || !FMath::IsFinite(Params.ColumnMinRadius)
-            || !FMath::IsFinite(Params.ColumnMaxRadius)
-            || !FMath::IsFinite(Params.ColumnSpacing)
-            || !FMath::IsFinite(Params.BoundarySealThickness)
-            || !FMath::IsFinite(Params.BaseDensity)
+        if (!VoxelMath::IsFinite(Params.FloorRelativeHeight)
+            || !VoxelMath::IsFinite(Params.CeilingRelativeHeight)
+            || !VoxelMath::IsFinite(Params.FloorRoughness)
+            || !VoxelMath::IsFinite(Params.FloorRoughnessFrequency)
+            || !VoxelMath::IsFinite(Params.CeilingRoughness)
+            || !VoxelMath::IsFinite(Params.CeilingRoughnessFrequency)
+            || !VoxelMath::IsFinite(Params.ColumnDensity)
+            || !VoxelMath::IsFinite(Params.ColumnMinRadius)
+            || !VoxelMath::IsFinite(Params.ColumnMaxRadius)
+            || !VoxelMath::IsFinite(Params.ColumnSpacing)
+            || !VoxelMath::IsFinite(Params.BoundarySealThickness)
+            || !VoxelMath::IsFinite(Params.BaseDensity)
             || Params.BoundarySealThickness < 0.0f)
         {
             return false;
@@ -4611,7 +4611,7 @@ namespace
         const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
         const float OpenBottom = FMath::Max(FloorSurface, InnerBottom);
         const float OpenTop = FMath::Min(CeilSurface, InnerTop);
-        if (!FMath::IsFinite(OpenBottom) || !FMath::IsFinite(OpenTop) || OpenTop <= OpenBottom)
+        if (!VoxelMath::IsFinite(OpenBottom) || !VoxelMath::IsFinite(OpenTop) || OpenTop <= OpenBottom)
         {
             return false;
         }
@@ -4689,21 +4689,21 @@ namespace
         float MaxLateralSnap,
         FVector& OutPoint)
     {
-        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+        if (!VoxelMath::IsFinite(StrateTopZ) || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
         }
 
-        if (!FMath::IsFinite(Params.CellSize)
-            || !FMath::IsFinite(Params.CorridorRadius)
-            || !FMath::IsFinite(Params.BranchProbability)
-            || !FMath::IsFinite(Params.Verticality)
-            || !FMath::IsFinite(Params.SurfaceRoughness)
-            || !FMath::IsFinite(Params.BoundarySealThickness)
-            || !FMath::IsFinite(Params.BaseDensity)
+        if (!VoxelMath::IsFinite(Params.CellSize)
+            || !VoxelMath::IsFinite(Params.CorridorRadius)
+            || !VoxelMath::IsFinite(Params.BranchProbability)
+            || !VoxelMath::IsFinite(Params.Verticality)
+            || !VoxelMath::IsFinite(Params.SurfaceRoughness)
+            || !VoxelMath::IsFinite(Params.BoundarySealThickness)
+            || !VoxelMath::IsFinite(Params.BaseDensity)
             || Params.CellSize <= 0.0f
             || Params.CorridorRadius <= 0.0f
             || Params.BranchProbability < 0.0f || Params.BranchProbability > 1.0f
@@ -4725,14 +4725,14 @@ namespace
         // A strict interior of the tube is needed. At the MC zero surface the source's smooth
         // carve is only half applied, so stopping at the nominal radius would be an air guess.
         const float SafeRadius = Radius - RoughnessBound - 0.25f;
-        if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
+        if (!VoxelMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
         {
             return false;
         }
 
         const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
         const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
-        if (!FMath::IsFinite(InnerBottom) || !FMath::IsFinite(InnerTop)
+        if (!VoxelMath::IsFinite(InnerBottom) || !VoxelMath::IsFinite(InnerTop)
             || InnerBottom >= InnerTop)
         {
             return false;
@@ -4835,8 +4835,8 @@ namespace
             }
         }
 
-        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestX)
-            || !FMath::IsFinite(BestY) || !FMath::IsFinite(BestZ))
+        if (!bFound || BestDistSq > MaxSnapSq || !VoxelMath::IsFinite(BestX)
+            || !VoxelMath::IsFinite(BestY) || !VoxelMath::IsFinite(BestZ))
         {
             return false;
         }
@@ -4912,25 +4912,25 @@ namespace
         float MaxLateralSnap,
         FVector& OutPoint)
     {
-        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+        if (!VoxelMath::IsFinite(StrateTopZ) || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
         }
 
-        if (!FMath::IsFinite(Params.ShaftSpacing)
-            || !FMath::IsFinite(Params.ShaftDensity)
-            || !FMath::IsFinite(Params.ShaftMinRadius)
-            || !FMath::IsFinite(Params.ShaftMaxRadius)
-            || !FMath::IsFinite(Params.CrossConnectChance)
-            || !FMath::IsFinite(Params.ConnectorRadius)
-            || !FMath::IsFinite(Params.LedgeSpacing)
-            || !FMath::IsFinite(Params.LedgeDepth)
-            || !FMath::IsFinite(Params.SurfaceRoughness)
-            || !FMath::IsFinite(Params.BoundarySealThickness)
-            || !FMath::IsFinite(Params.BaseDensity)
+        if (!VoxelMath::IsFinite(Params.ShaftSpacing)
+            || !VoxelMath::IsFinite(Params.ShaftDensity)
+            || !VoxelMath::IsFinite(Params.ShaftMinRadius)
+            || !VoxelMath::IsFinite(Params.ShaftMaxRadius)
+            || !VoxelMath::IsFinite(Params.CrossConnectChance)
+            || !VoxelMath::IsFinite(Params.ConnectorRadius)
+            || !VoxelMath::IsFinite(Params.LedgeSpacing)
+            || !VoxelMath::IsFinite(Params.LedgeDepth)
+            || !VoxelMath::IsFinite(Params.SurfaceRoughness)
+            || !VoxelMath::IsFinite(Params.BoundarySealThickness)
+            || !VoxelMath::IsFinite(Params.BaseDensity)
             || Params.ShaftSpacing <= 0.0f
             || Params.ShaftDensity <= 0.0f || Params.ShaftDensity > 1.0f
             || Params.ShaftMinRadius <= 0.0f
@@ -4979,7 +4979,7 @@ namespace
                 const float Radius = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
                     VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
                 const float SafeRadius = Radius - ShaftInteriorMargin;
-                if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
+                if (!VoxelMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f)
                 {
                     continue;
                 }
@@ -5013,8 +5013,8 @@ namespace
             }
         }
 
-        if (!bFound || BestDistSq > MaxSnapSq || !FMath::IsFinite(BestAxisX)
-            || !FMath::IsFinite(BestAxisY))
+        if (!bFound || BestDistSq > MaxSnapSq || !VoxelMath::IsFinite(BestAxisX)
+            || !VoxelMath::IsFinite(BestAxisY))
         {
             return false;
         }
@@ -5044,7 +5044,7 @@ namespace
         const float FirstCandidateZ = InnerBottom + 0.5f;
         const float LastCandidateZ = InnerTop
             - 2.0f * FitSettings.PlayerCapsuleHalfHeightVoxels - 0.5f;
-        if (!FMath::IsFinite(FirstCandidateZ) || !FMath::IsFinite(LastCandidateZ)
+        if (!VoxelMath::IsFinite(FirstCandidateZ) || !VoxelMath::IsFinite(LastCandidateZ)
             || LastCandidateZ < FirstCandidateZ)
         {
             return false;
@@ -5075,8 +5075,8 @@ namespace
             const float LateralDY = CandidateY - WorldY;
             const float LateralDistanceSq = FMath::Square(LateralDX)
                 + FMath::Square(LateralDY);
-            if (!FMath::IsFinite(CandidateX) || !FMath::IsFinite(CandidateY)
-                || !FMath::IsFinite(LateralDistanceSq)
+            if (!VoxelMath::IsFinite(CandidateX) || !VoxelMath::IsFinite(CandidateY)
+                || !VoxelMath::IsFinite(LateralDistanceSq)
                 || OffsetSq > FMath::Square(BestSafeRadius)
                 || LateralDistanceSq > MaxSnapSq + KINDA_SMALL_NUMBER)
             {
@@ -5220,25 +5220,25 @@ namespace
         float MaxLateralSnap,
         FVector& OutPoint)
     {
-        if (!FMath::IsFinite(StrateTopZ) || !FMath::IsFinite(StrateBottomZ)
-            || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
-            || !FMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
+        if (!VoxelMath::IsFinite(StrateTopZ) || !VoxelMath::IsFinite(StrateBottomZ)
+            || !VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
+            || !VoxelMath::IsFinite(MaxLateralSnap) || MaxLateralSnap < 0.0f
             || StrateTopZ <= StrateBottomZ)
         {
             return false;
         }
 
-        if (!FMath::IsFinite(Params.IslandSpacing)
-            || !FMath::IsFinite(Params.IslandDensity)
-            || !FMath::IsFinite(Params.IslandMinRadius)
-            || !FMath::IsFinite(Params.IslandMaxRadius)
-            || !FMath::IsFinite(Params.ThicknessRatio)
-            || !FMath::IsFinite(Params.VerticalJitter)
-            || !FMath::IsFinite(Params.TopFlatten)
-            || !FMath::IsFinite(Params.SurfaceRoughness)
-            || !FMath::IsFinite(Params.SDFBlendRadius)
-            || !FMath::IsFinite(Params.BoundarySealThickness)
-            || !FMath::IsFinite(Params.BaseDensity)
+        if (!VoxelMath::IsFinite(Params.IslandSpacing)
+            || !VoxelMath::IsFinite(Params.IslandDensity)
+            || !VoxelMath::IsFinite(Params.IslandMinRadius)
+            || !VoxelMath::IsFinite(Params.IslandMaxRadius)
+            || !VoxelMath::IsFinite(Params.ThicknessRatio)
+            || !VoxelMath::IsFinite(Params.VerticalJitter)
+            || !VoxelMath::IsFinite(Params.TopFlatten)
+            || !VoxelMath::IsFinite(Params.SurfaceRoughness)
+            || !VoxelMath::IsFinite(Params.SDFBlendRadius)
+            || !VoxelMath::IsFinite(Params.BoundarySealThickness)
+            || !VoxelMath::IsFinite(Params.BaseDensity)
             || Params.IslandSpacing <= 0.0f
             || Params.IslandDensity <= 0.0f || Params.IslandDensity > 1.0f
             || Params.IslandMinRadius <= 0.0f
@@ -5304,7 +5304,7 @@ namespace
             }
         }
 
-        if (Islands.Num() == 0 || !FMath::IsFinite(MinBotZ) || !FMath::IsFinite(MaxTopZ))
+        if (Islands.Num() == 0 || !VoxelMath::IsFinite(MinBotZ) || !VoxelMath::IsFinite(MaxTopZ))
         {
             return false;
         }
@@ -5316,7 +5316,7 @@ namespace
         const float SearchBottom = MinBotZ - SearchPad;
         constexpr float ScanStep = 0.5f;
         constexpr int32 MaxVerticalSamples = 2048;
-        if (!FMath::IsFinite(SearchTop) || !FMath::IsFinite(SearchBottom)
+        if (!VoxelMath::IsFinite(SearchTop) || !VoxelMath::IsFinite(SearchBottom)
             || SearchTop <= SearchBottom
             || (SearchTop - SearchBottom) / ScanStep > (float)MaxVerticalSamples)
         {
@@ -5334,7 +5334,7 @@ namespace
             float UpperZ = SearchTop;
             float UpperDensity = VF_EvaluateIslandInteriorDensity(
                 Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, UpperZ);
-            if (!FMath::IsFinite(UpperDensity) || UpperDensity > 0.0f)
+            if (!VoxelMath::IsFinite(UpperDensity) || UpperDensity > 0.0f)
             {
                 return false;
             }
@@ -5344,7 +5344,7 @@ namespace
                 const float LowerZ = FMath::Max(SearchBottom, UpperZ - ScanStep);
                 const float LowerDensity = VF_EvaluateIslandInteriorDensity(
                     Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, LowerZ);
-                if (!FMath::IsFinite(LowerDensity)) return false;
+                if (!VoxelMath::IsFinite(LowerDensity)) return false;
 
                 // Descending from guaranteed air, the first solid bracket is the highest actual
                 // blob top at this XY. That is the footing surface; no island-centre guess is
@@ -5358,7 +5358,7 @@ namespace
                         const float Mid = (SolidZ + AirZ) * 0.5f;
                         const float MidDensity = VF_EvaluateIslandInteriorDensity(
                             Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, Mid);
-                        if (!FMath::IsFinite(MidDensity)) return false;
+                        if (!VoxelMath::IsFinite(MidDensity)) return false;
                         if (MidDensity > 0.0f) SolidZ = Mid;
                         else                   AirZ = Mid;
                     }
@@ -5366,7 +5366,7 @@ namespace
                     const float InnerBottom = StrateBottomZ + Params.BoundarySealThickness;
                     const float InnerTop = StrateTopZ - Params.BoundarySealThickness;
                     const float LandingZ = AirZ + 0.5f;
-                    if (!FMath::IsFinite(LandingZ)
+                    if (!VoxelMath::IsFinite(LandingZ)
                         || LandingZ <= InnerBottom || LandingZ >= InnerTop
                         || VF_EvaluateIslandInteriorDensity(
                             Params, SeedU, Islands.GetData(), Islands.Num(), CandidateX, CandidateY, LandingZ) > 0.0f
@@ -5379,7 +5379,7 @@ namespace
                     }
 
                     OutLandingZ = LandingZ;
-                    return FMath::IsFinite(OutLandingZ);
+                    return VoxelMath::IsFinite(OutLandingZ);
                 }
 
                 UpperZ = LowerZ;
@@ -5418,7 +5418,7 @@ namespace
             // the one-voxel margin keeps a returned top away from the nominal radial edge. If no
             // such disk is within MaxLateralSnap, declining is preferable to an arbitrary jump.
             const float SafeRadius = Island.Rxy - WarpBound - 1.0f;
-            if (!FMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f) continue;
+            if (!VoxelMath::IsFinite(SafeRadius) || SafeRadius <= 0.0f) continue;
 
             const float DX = WorldX - Island.X;
             const float DY = WorldY - Island.Y;
@@ -5508,8 +5508,8 @@ namespace
         }
 
         OutPoint = BestPoint;
-        return FMath::IsFinite(OutPoint.X) && FMath::IsFinite(OutPoint.Y)
-            && FMath::IsFinite(OutPoint.Z);
+        return VoxelMath::IsFinite(OutPoint.X) && VoxelMath::IsFinite(OutPoint.Y)
+            && VoxelMath::IsFinite(OutPoint.Z);
     }
 }
 
@@ -5622,7 +5622,7 @@ FVoxelPassageLanding VF_BuildPassageLanding(
     // a seal and never moves a normal interior pose.
     const float InnerBottom = StrateBottomZ + SafeSeal;
     const float InnerTop = StrateTopZ - SafeSeal;
-    if (FMath::IsFinite(InnerBottom) && FMath::IsFinite(InnerTop)
+    if (VoxelMath::IsFinite(InnerBottom) && VoxelMath::IsFinite(InnerTop)
         && InnerTop > InnerBottom)
     {
         // Passage carving is intentionally ordered after the vertical seal and fades over its
@@ -5662,13 +5662,13 @@ float VF_EvaluatePassageLandingSDF(
     const FVector& Position,
     const FVoxelPassageLanding& Landing)
 {
-    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
-        || !FMath::IsFinite(Position.Z)
-        || !FMath::IsFinite(Landing.StandingPoint.X)
-        || !FMath::IsFinite(Landing.StandingPoint.Y)
-        || !FMath::IsFinite(Landing.FloorZ)
-        || !FMath::IsFinite(Landing.CeilingZ)
-        || !FMath::IsFinite(Landing.HalfWidth)
+    if (!VoxelMath::IsFinite(Position.X) || !VoxelMath::IsFinite(Position.Y)
+        || !VoxelMath::IsFinite(Position.Z)
+        || !VoxelMath::IsFinite(Landing.StandingPoint.X)
+        || !VoxelMath::IsFinite(Landing.StandingPoint.Y)
+        || !VoxelMath::IsFinite(Landing.FloorZ)
+        || !VoxelMath::IsFinite(Landing.CeilingZ)
+        || !VoxelMath::IsFinite(Landing.HalfWidth)
         || Landing.HalfWidth <= 0.0f
         || Landing.CeilingZ <= Landing.FloorZ)
     {
@@ -5698,9 +5698,9 @@ bool VF_IsPassageLandingFloor(
     const FVector& Position,
     const FVoxelPassageLanding& Landing)
 {
-    if (!FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y)
-        || !FMath::IsFinite(Position.Z) || !FMath::IsFinite(Landing.FloorZ)
-        || !FMath::IsFinite(Landing.FloorThickness)
+    if (!VoxelMath::IsFinite(Position.X) || !VoxelMath::IsFinite(Position.Y)
+        || !VoxelMath::IsFinite(Position.Z) || !VoxelMath::IsFinite(Landing.FloorZ)
+        || !VoxelMath::IsFinite(Landing.FloorThickness)
         || Landing.FloorThickness <= 0.0f || Landing.HalfWidth <= 0.0f)
     {
         return false;
@@ -5829,14 +5829,14 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
     bool bUseZ, float SearchMinZ, float SearchMaxZ,
     const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
-    if (!FMath::IsFinite(SearchMinX) || !FMath::IsFinite(SearchMinY)
-        || !FMath::IsFinite(SearchMaxX) || !FMath::IsFinite(SearchMaxY)
+    if (!VoxelMath::IsFinite(SearchMinX) || !VoxelMath::IsFinite(SearchMinY)
+        || !VoxelMath::IsFinite(SearchMaxX) || !VoxelMath::IsFinite(SearchMaxY)
         || SearchMinX > SearchMaxX || SearchMinY > SearchMaxY)
     {
         return true;
     }
     if (bUseZ
-        && (!FMath::IsFinite(SearchMinZ) || !FMath::IsFinite(SearchMaxZ)
+        && (!VoxelMath::IsFinite(SearchMinZ) || !VoxelMath::IsFinite(SearchMaxZ)
             || SearchMinZ > SearchMaxZ))
     {
         return true;
@@ -5858,8 +5858,8 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
     const float CollectMinY = SearchMinY - Reach.CollectMargin;
     const float CollectMaxX = SearchMaxX + Reach.CollectMargin;
     const float CollectMaxY = SearchMaxY + Reach.CollectMargin;
-    if (!FMath::IsFinite(CollectMinX) || !FMath::IsFinite(CollectMinY)
-        || !FMath::IsFinite(CollectMaxX) || !FMath::IsFinite(CollectMaxY))
+    if (!VoxelMath::IsFinite(CollectMinX) || !VoxelMath::IsFinite(CollectMinY)
+        || !VoxelMath::IsFinite(CollectMaxX) || !VoxelMath::IsFinite(CollectMaxY))
     {
         return true;
     }
@@ -5867,7 +5867,7 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
     auto FloorCell = [](double Value, double CellSize, int32& OutCell) -> bool
     {
         const double Cell = FMath::FloorToDouble(Value / CellSize);
-        if (!FMath::IsFinite(Cell)
+        if (!VoxelMath::IsFinite(Cell)
             || Cell < static_cast<double>(MIN_int32) + 2.0
             || Cell > static_cast<double>(MAX_int32) - 2.0)
         {
@@ -5919,9 +5919,9 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
         - Params.BoundarySealThickness - RoomZBuffer;
     const float StrateRangeZ = StrateMaxZ - StrateMinZ;
     const float StrateCenterZ = (StrateMinZ + StrateMaxZ) * 0.5f;
-    if (!FMath::IsFinite(StrateMinZ) || !FMath::IsFinite(StrateMaxZ)
-        || !FMath::IsFinite(StrateRangeZ)
-        || !FMath::IsFinite(StrateCenterZ))
+    if (!VoxelMath::IsFinite(StrateMinZ) || !VoxelMath::IsFinite(StrateMaxZ)
+        || !VoxelMath::IsFinite(StrateRangeZ)
+        || !VoxelMath::IsFinite(StrateCenterZ))
     {
         return true;
     }
@@ -6198,13 +6198,13 @@ void VoxelCaveMorphology::BuildChunkCache(
             + FMath::Max(
                 FMath::Max(Params.SDFBlendRadius, 0.0f) * 3.0f,
                 VoxelPassageGeometry::LandingFloorThicknessVoxels);
-        if (!FMath::IsFinite(CaveWarpBound)
-            || !FMath::IsFinite(ChainReach)
+        if (!VoxelMath::IsFinite(CaveWarpBound)
+            || !VoxelMath::IsFinite(ChainReach)
             || ChainReach < 0.0f
-            || !FMath::IsFinite((float)RoomA.Center.X)
-            || !FMath::IsFinite((float)RoomA.Center.Y)
-            || !FMath::IsFinite((float)RoomB.Center.X)
-            || !FMath::IsFinite((float)RoomB.Center.Y))
+            || !VoxelMath::IsFinite((float)RoomA.Center.X)
+            || !VoxelMath::IsFinite((float)RoomA.Center.Y)
+            || !VoxelMath::IsFinite((float)RoomB.Center.X)
+            || !VoxelMath::IsFinite((float)RoomB.Center.Y))
         {
             return true;
         }
@@ -6221,8 +6221,8 @@ void VoxelCaveMorphology::BuildChunkCache(
         const float MaxY = FMath::Max(
             static_cast<float>(RoomA.Center.Y), static_cast<float>(RoomB.Center.Y))
             + ChainReach;
-        return FMath::IsFinite(MinX) && FMath::IsFinite(MinY)
-            && FMath::IsFinite(MaxX) && FMath::IsFinite(MaxY)
+        return VoxelMath::IsFinite(MinX) && VoxelMath::IsFinite(MinY)
+            && VoxelMath::IsFinite(MaxX) && VoxelMath::IsFinite(MaxY)
             && MaxX >= SearchMinX && MaxY >= SearchMinY
             && MinX <= SearchMaxX && MinY <= SearchMaxY;
     };
@@ -6573,9 +6573,9 @@ void VoxelCaveMorphology::BuildChunkCache(
             // turning the whole network into a level grid.
             const float RoomFloorA = RoomFloorZFor(RoomA);
             const float RoomFloorB = RoomFloorZFor(RoomB);
-            const float SafeFloorA = FMath::IsFinite(RoomFloorA)
+            const float SafeFloorA = VoxelMath::IsFinite(RoomFloorA)
                 ? RoomFloorA : RoomA.Center.Z - RoomA.RadiusZ;
-            const float SafeFloorB = FMath::IsFinite(RoomFloorB)
+            const float SafeFloorB = VoxelMath::IsFinite(RoomFloorB)
                 ? RoomFloorB : RoomB.Center.Z - RoomB.RadiusZ;
             FVector EndA = RoomA.Center + FVector(0.0f, 0.0f, SafeFloorA
                 + RadA - RoomA.Center.Z);
@@ -6787,11 +6787,11 @@ void VoxelCaveMorphology::BuildChunkCache(
             // the room's base floor is resolved; no per-sample tunnel search or correction is
             // involved.  Strength zero is the exact legacy path.
             const float MouthRiseStrength = FMath::Clamp(
-                FMath::IsFinite(Params.RoomMouthRiseStrength)
+                VoxelMath::IsFinite(Params.RoomMouthRiseStrength)
                     ? Params.RoomMouthRiseStrength : 0.0f,
                 0.0f, 1.0f);
             const float MouthRiseBlend = FMath::Clamp(
-                FMath::IsFinite(Params.RoomMouthRiseBlendVoxels)
+                VoxelMath::IsFinite(Params.RoomMouthRiseBlendVoxels)
                     ? Params.RoomMouthRiseBlendVoxels : 8.0f,
                 8.0f, 128.0f);
             const float RequiredRoomClearance =
@@ -6804,15 +6804,15 @@ void VoxelCaveMorphology::BuildChunkCache(
                     const FVector& Mouth, float TargetFloorZ)
             {
                 if (!(MouthRiseStrength > 0.0f)
-                    || !FMath::IsFinite(TargetFloorZ)
-                    || !FMath::IsFinite(Mouth.X)
-                    || !FMath::IsFinite(Mouth.Y)
-                    || !FMath::IsFinite(Mouth.Z))
+                    || !VoxelMath::IsFinite(TargetFloorZ)
+                    || !VoxelMath::IsFinite(Mouth.X)
+                    || !VoxelMath::IsFinite(Mouth.Y)
+                    || !VoxelMath::IsFinite(Mouth.Z))
                 {
                     return;
                 }
                 const float BaseFloorZ = RoomFloorZFor(Room);
-                if (!FMath::IsFinite(BaseFloorZ)
+                if (!VoxelMath::IsFinite(BaseFloorZ)
                     || TargetFloorZ <= BaseFloorZ + KINDA_SMALL_NUMBER
                     || Room.Center.Z + Room.RadiusZ - TargetFloorZ
                         < RequiredRoomClearance)
@@ -6951,8 +6951,8 @@ void VoxelCaveMorphology::BuildChunkCache(
             const float SharedCeiling = FMath::Min(
                 RoomA.Center.Z + RoomA.RadiusZ,
                 RoomB.Center.Z + RoomB.RadiusZ);
-            if (!FMath::IsFinite(CommonFloor)
-                || !FMath::IsFinite(SharedCeiling)
+            if (!VoxelMath::IsFinite(CommonFloor)
+                || !VoxelMath::IsFinite(SharedCeiling)
                 || SharedCeiling - CommonFloor < JoinRequiredHeight)
             {
                 continue;
@@ -6984,7 +6984,7 @@ void VoxelCaveMorphology::BuildChunkCache(
             const float JoinRadius = FMath::Min(
                 FMath::Min(RoomA.RadiusXY, RoomB.RadiusXY) * 0.35f,
                 (EndDistance - StartDistance) * 0.5f);
-            if (!FMath::IsFinite(JoinRadius) || JoinRadius < JoinMinimumRadius)
+            if (!VoxelMath::IsFinite(JoinRadius) || JoinRadius < JoinMinimumRadius)
             {
                 continue;
             }
@@ -7266,7 +7266,7 @@ void VoxelCaveMorphology::BuildChunkCache(
             Rise.Strength = AuthoredRise.Strength;
             const float Reach = static_cast<float>(FVector::Dist(
                 CR.Center, Rise.Mouth)) + FMath::Max(Rise.BlendRadius, 0.0f);
-            if (FMath::IsFinite(Reach))
+            if (VoxelMath::IsFinite(Reach))
             {
                 CR.CullRadiusSq = FMath::Max(CR.CullRadiusSq, Reach * Reach);
             }
@@ -7423,7 +7423,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
                 const float Distance = FMath::Sqrt(DX * DX + DY * DY);
                 if (Distance >= Radius
                     || !(Rise.Strength > 0.0f)
-                    || !FMath::IsFinite(Rise.TargetFloorZ))
+                    || !VoxelMath::IsFinite(Rise.TargetFloorZ))
                 {
                     continue;
                 }
