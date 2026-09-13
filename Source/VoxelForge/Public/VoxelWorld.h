@@ -913,6 +913,7 @@ public:
     FIntVector LastUpdateCenter = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
     bool bAllChunksLoaded = false;
     bool bStartupTraceDesiredRecorded = false;
+    bool bSampleStacksStarted = false;
     TArray<FVoxelTileKey> DesiredSorted;   // critical floor prefix, then true-pawn distance-first
     TArray<FVoxelTileKey> CriticalDesiredTiles; // occupied/support tile, then heading tile
     uint32 DesiredEpoch = 0;               // increments whenever DesiredStamped is rebuilt
@@ -930,6 +931,12 @@ public:
     std::atomic<uint64> TotalMesherDensityCalls{0};
     std::atomic<uint64> OuterClassifierCallsByLOD[TrackedClassifierLODCount]{};
     std::atomic<uint64> OuterClassifierVerdictsByLOD[TrackedClassifierLODCount][3]{};
+
+    // Low-overhead game-thread geometry totals used to prove that sampler toggling does not alter
+    // the applied tile/triangle stream. These are measurement counters, not generation inputs.
+    uint64 AppliedTileCount = 0;
+    uint64 AppliedVisibleTileCount = 0;
+    uint64 AppliedTriangleCount = 0;
 
     struct FStreamingLatencySample
     {

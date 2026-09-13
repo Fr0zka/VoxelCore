@@ -15,6 +15,7 @@
 #include "VoxelDensityOpStack.h"
 #include "VoxelDensityProfile.h"
 #include "VoxelStartupTrace.h"
+#include "VoxelStackSampler.h"
 #include "VoxelStats.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
@@ -73,6 +74,11 @@ namespace
         TEXT("voxel.PerfAttribution"),
         GVoxelForgePerfAttribution,
         TEXT("Collect low-overhead component attribution for the game path."));
+    int32 GVoxelForgeSampleStacks = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeSampleStacks(
+        TEXT("voxel.SampleStacks"),
+        GVoxelForgeSampleStacks,
+        TEXT("Sample active generation worker stacks at the requested interval in microseconds; 0 is off."));
 
     // The nested 8^3 proof is useful for focused/offline measurements, but it is opt-in for
     // streaming because every qualifying mixed tile would pay the recursive proof again.
@@ -988,6 +994,11 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
     UE_LOG(LogTemp, Display, TEXT("[VoxelWorld] EndPlay: workers drained in %.6fs; obsolete_tile_aborts=%d"),
         FPlatformTime::Seconds() - EndPlayStartSeconds, ObsoleteTileAbortCount);
+    if (bSampleStacksStarted)
+    {
+        FVoxelStackSampler::Get().StopAndWrite();
+        bSampleStacksStarted = false;
+    }
     LogStreamingLatencySummary();
     PendingTiles.Empty();
     PendingTileCancellation.Empty();
@@ -1075,6 +1086,7 @@ void AVoxelWorld::BeginPlay()
     int32 CommandLinePerfAttribution = GVoxelForgePerfAttribution;
     int32 CommandLineUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut;
     int32 CommandLineOuterClassifierMode = GVoxelForgeOuterClassifierMode;
+    int32 CommandLineSampleStacks = GVoxelForgeSampleStacks;
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
     {
         GVoxelForgeProfileDensity = CommandLineProfile;
@@ -1095,8 +1107,16 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgeOuterClassifierMode = CommandLineOuterClassifierMode;
     }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.SampleStacks="), CommandLineSampleStacks))
+    {
+        GVoxelForgeSampleStacks = CommandLineSampleStacks;
+    }
     GVoxelForgeUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0 ? 1 : 0;
     GVoxelForgeOuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
+    GVoxelForgeSampleStacks = FMath::Clamp(
+        GVoxelForgeSampleStacks,
+        0,
+        static_cast<int32>(FVoxelStackSampler::MaxIntervalUs));
 
     if (GVoxelForgePerfAttribution != 0)
     {
@@ -1275,6 +1295,21 @@ void AVoxelWorld::BeginPlay()
     if (TryGetPlayerPosition(InitialPlayerPosition, &InitialPawn))
     {
         UpdatePawnCollisionGate(InitialPawn, InitialPlayerPosition, 0.0f);
+    }
+
+    if (GVoxelForgeSampleStacks > 0)
+    {
+        const FString SamplerOutputDirectory = FPaths::Combine(
+            FPaths::ProjectDir(), TEXT("Plugins/VoxelForge/Saved"));
+        bSampleStacksStarted = FVoxelStackSampler::Get().Start(
+            static_cast<uint32>(GVoxelForgeSampleStacks),
+            SamplerOutputDirectory,
+            TEXT("game"));
+        if (!bSampleStacksStarted)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelWorld] stack sampler requested but could not be started."));
+        }
     }
 }
 
@@ -2177,6 +2212,7 @@ void AVoxelWorld::LogStreamingLatencySummary() const
              "collision_cook_s[p50=%.6f p95=%.6f max=%.6f] "
              "peak_speed_cm_s=%.3f p95_travel_m=%.6f obsolete_tile_aborts=%d "
              "outer_classifier_mode=%d nested_block_early_out=%d "
+             "applied_tiles=%llu applied_visible_tiles=%llu applied_triangles=%llu "
              "worker_generation_tasks=%llu worker_generation_sum_s=%.6f "
              "validation_density_calls=%llu mesher_density_calls=%llu "
              "obsolete_worker_tasks=%llu obsolete_worker_sum_s=%.6f "
@@ -2188,9 +2224,12 @@ void AVoxelWorld::LogStreamingLatencySummary() const
         Percentile(QueueWait, 0.50), Percentile(QueueWait, 0.95), Maximum(QueueWait),
         Percentile(Generation, 0.50), Percentile(Generation, 0.95), Maximum(Generation),
         Percentile(CollisionCook, 0.50), Percentile(CollisionCook, 0.95), Maximum(CollisionCook),
-        PeakObservedPawnSpeedCmPerSecond, TravelP95Metres, ObsoleteTileAbortCount,
-        GVoxelForgeOuterClassifierMode, GVoxelForgeUseBlockEarlyOut,
-        static_cast<unsigned long long>(TotalWorkerGenerationTasks.load(std::memory_order_relaxed)),
+         PeakObservedPawnSpeedCmPerSecond, TravelP95Metres, ObsoleteTileAbortCount,
+         GVoxelForgeOuterClassifierMode, GVoxelForgeUseBlockEarlyOut,
+         static_cast<unsigned long long>(AppliedTileCount),
+         static_cast<unsigned long long>(AppliedVisibleTileCount),
+         static_cast<unsigned long long>(AppliedTriangleCount),
+         static_cast<unsigned long long>(TotalWorkerGenerationTasks.load(std::memory_order_relaxed)),
         FPlatformTime::ToSeconds64(WorkerGenerationCycles),
         static_cast<unsigned long long>(TotalValidationDensityCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(TotalMesherDensityCalls.load(std::memory_order_relaxed)),
@@ -2444,6 +2483,12 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
     Result.ApplyStartCycles = ApplyStartCycles;
     const auto LogTileApplied = [&]()
     {
+        ++AppliedTileCount;
+        if (!bResultEmpty)
+        {
+            ++AppliedVisibleTileCount;
+            AppliedTriangleCount += static_cast<uint64>(FMath::Max(0, Result.NumTriangles));
+        }
         if ((GVoxelForgeProfileTileGeneration != 0 || bTraceTile)
             && Result.RequestStartCycles != 0)
         {
@@ -3709,6 +3754,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             return;
         }
 
+        FScopedVoxelStackRegistration StackRegistration(Tile.Level);
         FChunkResult Result;
         Result.DesiredEpoch = TaskDesiredEpoch;
         const uint64 GenerationStartCycles = FPlatformTime::Cycles64();

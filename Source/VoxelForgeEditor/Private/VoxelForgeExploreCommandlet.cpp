@@ -33,6 +33,7 @@
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
 #include "VoxelSettings.h"
+#include "VoxelStackSampler.h"
 #include "VoxelStrateDefinition.h"
 #include "VoxelStrateManager.h"
 #include "VoxelStrateMeasure.h"
@@ -267,6 +268,8 @@ struct FExploreArguments
     bool bProfileDensity = false;
     bool bProfileDensityFull = false;
     bool bPerfAttribution = false;
+    bool bSampleStacks = false;
+    uint32 SampleStacksIntervalUs = FVoxelStackSampler::DefaultIntervalUs;
     bool bProfileLod = false;
     bool bOpBounds = false;
     bool bFailureFocusRender = false;
@@ -365,6 +368,14 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     OutArguments.bProfileDensityFull = FParse::Param(*Params, TEXT("profiledensityfull"));
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
     OutArguments.bPerfAttribution = FParse::Param(*Params, TEXT("perfattribution"));
+    OutArguments.bSampleStacks = FParse::Param(*Params, TEXT("samplestacks"));
+    int32 SampleStacksIntervalUs = static_cast<int32>(
+        FVoxelStackSampler::DefaultIntervalUs);
+    if (FParse::Value(*Params, TEXT("samplestacks="), SampleStacksIntervalUs))
+    {
+        OutArguments.bSampleStacks = true;
+        OutArguments.SampleStacksIntervalUs = static_cast<uint32>(FMath::Max(0, SampleStacksIntervalUs));
+    }
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
     FParse::Value(*Params, TEXT("out="), OutText);
@@ -603,6 +614,16 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     {
         OutError = FString::Printf(
             TEXT("budget must be finite and in (0,%g] minutes."), MaxBudgetMinutes);
+        return false;
+    }
+    if (OutArguments.bSampleStacks
+        && (OutArguments.SampleStacksIntervalUs < FVoxelStackSampler::MinIntervalUs
+            || OutArguments.SampleStacksIntervalUs > FVoxelStackSampler::MaxIntervalUs))
+    {
+        OutError = FString::Printf(
+            TEXT("samplestacks interval must be in [%u,%u] microseconds."),
+            FVoxelStackSampler::MinIntervalUs,
+            FVoxelStackSampler::MaxIntervalUs);
         return false;
     }
     if (OutArguments.bSurfaceRoughnessOverride
@@ -1294,6 +1315,36 @@ struct FExploreRunOutput
     FExploreProfilerComparison ProfilerComparison;
 };
 
+struct FExploreStackSamplerSession
+{
+    bool bStarted = false;
+
+    ~FExploreStackSamplerSession()
+    {
+        Stop();
+    }
+
+    bool Start(uint32 IntervalUs, const FString& OutputDirectory)
+    {
+        if (bStarted)
+        {
+            return true;
+        }
+        bStarted = FVoxelStackSampler::Get().Start(
+            IntervalUs, OutputDirectory, TEXT("commandlet"));
+        return bStarted;
+    }
+
+    void Stop()
+    {
+        if (bStarted)
+        {
+            FVoxelStackSampler::Get().StopAndWrite();
+            bStarted = false;
+        }
+    }
+};
+
 bool ValidateCanonicalTile(const FVoxelMeshData& MeshData, FString& OutError);
 bool MeasureExploreMesh(
     const FVoxelMeshData& MeshData,
@@ -1748,6 +1799,7 @@ bool EnsureExploreMesh(
                     bGridWorkCancelled.store(true, std::memory_order_relaxed);
                     return;
                 }
+                FScopedVoxelStackRegistration StackRegistration;
                 const int32 GridOctaveBias = (World.Mesher->LODOctaveDrop > 0
                     && Arguments.ExportStep > 1)
                     ? World.Mesher->LODOctaveDrop
@@ -1848,6 +1900,7 @@ bool EnsureExploreMesh(
                 return;
             }
 
+            FScopedVoxelStackRegistration StackRegistration;
             const double TileStartSeconds = FPlatformTime::Seconds();
             TileStartOffsets[LinearTileIndex] = TileStartSeconds - ParallelStartSeconds;
             TileThreadIds[LinearTileIndex] = FPlatformTLS::GetCurrentThreadId();
@@ -4406,6 +4459,9 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
     Writer->WriteValue(TEXT("perf_attribution"), Arguments.bPerfAttribution);
+    Writer->WriteValue(TEXT("sample_stacks"), Arguments.bSampleStacks);
+    Writer->WriteValue(TEXT("sample_stacks_interval_us"),
+        static_cast<double>(Arguments.SampleStacksIntervalUs));
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
     Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
@@ -5590,6 +5646,16 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
     }
     const double SetupSeconds = FPlatformTime::Seconds() - SetupStartSeconds;
 
+    FExploreStackSamplerSession StackSamplerSession;
+    if (Arguments.bSampleStacks
+        && !StackSamplerSession.Start(
+            Arguments.SampleStacksIntervalUs, Arguments.OutDirectory))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeExplore] stack sampler was requested but could not be started."));
+        return 1;
+    }
+
     bool bRequestedModeFailed = false;
     if (Arguments.bOpBounds)
     {
@@ -5851,6 +5917,11 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         UE_LOG(LogTemp, Display, TEXT("[VoxelForgeExplore] export %.3fs (%s)"),
             FPlatformTime::Seconds() - Start, *Output.Export.Status);
     }
+
+    // Stop before the report is assembled, while World still owns the generation state. This
+    // guarantees that the sampler's summary describes only this case and that all worker stacks
+    // have been released before the commandlet tears the world down.
+    StackSamplerSession.Stop();
 
     // A phase can finish just inside its own check and cross the deadline while its artifact is
     // being closed. Mark that state before serialising the report so the JSON never claims a full
@@ -6299,6 +6370,14 @@ bool BuildBatchCaseParams(
     bProfileDensity |= bProfileDensityFull;
     bool bPerfAttribution = false;
     JsonBool(Case, TEXT("perf_attribution"), bPerfAttribution);
+    bool bSampleStacks = false;
+    JsonBool(Case, TEXT("sample_stacks"), bSampleStacks);
+    int32 SampleStacksIntervalUs = static_cast<int32>(FVoxelStackSampler::DefaultIntervalUs);
+    if (JsonNumber(Case, TEXT("sample_stacks_interval_us"), Number))
+    {
+        SampleStacksIntervalUs = FMath::RoundToInt(Number);
+        bSampleStacks = true;
+    }
     bool bProfileLod = false;
     JsonBool(Case, TEXT("profile_lod"), bProfileLod);
     bool bOpBounds = false;
@@ -6342,6 +6421,11 @@ bool BuildBatchCaseParams(
     if (bPerfAttribution)
     {
         OutParams += TEXT(" -perfattribution");
+    }
+    if (bSampleStacks)
+    {
+        OutParams += FString::Printf(
+            TEXT(" -samplestacks=%d"), SampleStacksIntervalUs);
     }
     if (bProfileLod)
     {

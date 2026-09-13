@@ -2,6 +2,7 @@
 // Module implementation - boilerplate
 
 #include "VoxelForgeModule.h"
+#include "VoxelStackSampler.h"
 
 // This macro registers our module with Unreal
 // "VoxelForge" must match the module name in VoxelForge.Build.cs and .uplugin
@@ -17,6 +18,6 @@ void FVoxelForgeModule::StartupModule()
 void FVoxelForgeModule::ShutdownModule()
 {
 	// Called when plugin unloads
-	// Cleanup would go here if we had any global resources
+	FVoxelStackSampler::Get().Shutdown();
 	UE_LOG(LogTemp, Log, TEXT("VoxelForge module shutdown."));
 }
