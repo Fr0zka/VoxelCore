@@ -157,6 +157,19 @@ generation p50 is ~4% slower than at `2990009` (73 -> 77 ms static). Queued: att
 in-tree switches (first suspect: `voxel.SpatialIndex` auto-on at fused LOD1-2), never by running old
 commits.
 
+**Resolved 2026-09-13 (`ab4bbe3` + the switch sweep):** not the spatial index; every `SpatialIndex`
+setting is within ~1%. `TileCacheWindow=0` at HEAD is a different configuration from `2990009`, not
+the old path. It still thrashes at L3/L4 (p95 ~250 ms), now at 54 s. The DEFAULT beats `2990009` on
+every metric: static worker 48 -> 34 s, moving 125 -> 101 s, LOD0 generation p50 73 -> 66 ms static
+and 70 -> 62 ms moving. The "LOD0 ~4% slower" worry is gone. `SpatialIndex` now defaults to 1
+(marginally best, within noise). Per-tile identity: 0/841 tiles differ against traces recorded
+before the always-on LOD0 changes.
+
+**Next LOD0 target, found by the sampler's caller aggregation:** the "unknown" ~13.8% LOD0 leaf is
+`ucrtbase.dll!_finite`, the non-inlined CRT call behind `FMath::IsFinite`. Its callers are the tunnel
+chain, passage landing/floor checks and `GetDensityAt`. An inline bit test is exactly the same
+predicate, so it changes no field.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?

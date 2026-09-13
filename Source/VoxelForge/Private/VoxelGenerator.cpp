@@ -78,7 +78,7 @@ namespace
         GVoxelForgeTileCacheWindowOpStackMinLOD,
         TEXT("Minimum SampleStep LOD for the op-stack tile-sized room cache window."));
 
-    int32 GVoxelForgeSpatialIndex = -1;
+    int32 GVoxelForgeSpatialIndex = 1;
     FAutoConsoleVariableRef CVarVoxelForgeSpatialIndex(
         TEXT("voxel.SpatialIndex"),
         GVoxelForgeSpatialIndex,
