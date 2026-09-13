@@ -2745,11 +2745,6 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
         if (bNeedRebuild)
         {
-            if (VoxelDensityProfile::AreCountersEnabled())
-            {
-                VoxelDensityProfile::AddCounter(
-                    VoxelDensityProfile::ECounter::SdfCacheBuild);
-            }
             // The lowered evaluator uses the same window-invariance contract as the prepared
             // room-graph source, but keeps a four-chunk XY window per worker.  A tile worker can
             // visit neighbouring chunk keys in an arbitrary order; the larger deterministic

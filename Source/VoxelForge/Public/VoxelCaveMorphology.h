@@ -872,6 +872,13 @@ struct FTunnelCoreWorldEvaluation
 
 namespace VoxelCaveMorphology
 {
+    // The player-fit memo is process-wide and uses a fixed-size table. These controls are kept
+    // beside the cave source so the command-line value is applied before generation workers start,
+    // while the CVar remains available for an in-process A/B switch.
+    VOXELFORGE_API void ConfigurePlayerFitMemoFromCommandLine();
+    VOXELFORGE_API void ResetPlayerFitMemoStats();
+    VOXELFORGE_API void LogPlayerFitMemoStats();
+
     // The room graph's seed is the world seed salted by the strate index. Keep this formula
     // shared by BuildChunkCache and landing-site queries so a query cannot inspect another
     // strate's room layout. / La seed du graphe des salles est la seed monde salée par l'index

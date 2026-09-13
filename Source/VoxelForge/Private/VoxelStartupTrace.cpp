@@ -260,9 +260,10 @@ void RecordTile(const FTileSample& Sample)
     GState->Samples.Add(Sample);
     ++GState->TileRecordsWritten;
     WriteEventLocked(*GState, TEXT("tile"), FString::Printf(
-        TEXT("\"level\":%d,\"verdict\":%d,\"empty\":%d,\"triangles\":%d,"
+        TEXT("\"tile\":[%d,%d,%d],\"level\":%d,\"verdict\":%d,\"empty\":%d,\"triangles\":%d,"
              "\"request_to_apply_s\":%s,\"queue_wait_s\":%s,\"worker_queue_s\":%s,\"result_queue_s\":%s,"
              "\"generation_s\":%s,\"classify_s\":%s,\"mesh_s\":%s,\"stream_s\":%s,\"apply_s\":%s"),
+        Sample.TileX, Sample.TileY, Sample.TileZ,
         Sample.Level, Sample.Verdict, Sample.bEmpty ? 1 : 0, Sample.Triangles,
         *Number(Sample.RequestToApplySeconds), *Number(Sample.QueueWaitSeconds),
         *Number(Sample.WorkerQueueSeconds), *Number(Sample.ResultQueueSeconds),

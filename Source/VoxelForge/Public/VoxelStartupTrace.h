@@ -9,6 +9,9 @@ namespace VoxelForgeStartupTrace
 {
     struct VOXELFORGE_API FTileSample
     {
+        int32 TileX = 0;
+        int32 TileY = 0;
+        int32 TileZ = 0;
         int32 Level = -1;
         int32 Verdict = -1; // Mixed=0, AllSolid=1, AllAir=2, -1=not classified (sheet/early path)
         bool bEmpty = true;

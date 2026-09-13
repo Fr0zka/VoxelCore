@@ -17,6 +17,7 @@
 #include "VoxelStartupTrace.h"
 #include "VoxelStackSampler.h"
 #include "VoxelStats.h"
+#include "VoxelCaveMorphology.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
 // complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
@@ -999,6 +1000,7 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         FVoxelStackSampler::Get().StopAndWrite();
         bSampleStacksStarted = false;
     }
+    VoxelCaveMorphology::LogPlayerFitMemoStats();
     LogStreamingLatencySummary();
     PendingTiles.Empty();
     PendingTileCancellation.Empty();
@@ -1058,6 +1060,8 @@ void AVoxelWorld::BeginPlay()
     VoxelForgeStartupTrace::BeginFromCommandLine();
     VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("BeginPlay"));
     Super::BeginPlay();
+    VoxelCaveMorphology::ConfigurePlayerFitMemoFromCommandLine();
+    VoxelCaveMorphology::ResetPlayerFitMemoStats();
     bShuttingDown.store(false, std::memory_order_relaxed);
     LOD0ReadySamples.Reset();
     ObsoleteTileAbortCount = 0;
@@ -1084,6 +1088,7 @@ void AVoxelWorld::BeginPlay()
     int32 CommandLineProfile = GVoxelForgeProfileDensity;
     int32 CommandLineProfileFull = GVoxelForgeProfileDensityFull;
     int32 CommandLinePerfAttribution = GVoxelForgePerfAttribution;
+    int32 CommandLineProfileTileGeneration = GVoxelForgeProfileTileGeneration;
     int32 CommandLineUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut;
     int32 CommandLineOuterClassifierMode = GVoxelForgeOuterClassifierMode;
     int32 CommandLineSampleStacks = GVoxelForgeSampleStacks;
@@ -1099,6 +1104,13 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgePerfAttribution = CommandLinePerfAttribution;
     }
+    if (FParse::Value(
+            FCommandLine::Get(),
+            TEXT("voxel.ProfileTileGeneration="),
+            CommandLineProfileTileGeneration))
+    {
+        GVoxelForgeProfileTileGeneration = CommandLineProfileTileGeneration;
+    }
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.UseBlockEarlyOut="), CommandLineUseBlockEarlyOut))
     {
         GVoxelForgeUseBlockEarlyOut = CommandLineUseBlockEarlyOut;
@@ -1111,6 +1123,7 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgeSampleStacks = CommandLineSampleStacks;
     }
+    GVoxelForgeProfileTileGeneration = GVoxelForgeProfileTileGeneration != 0 ? 1 : 0;
     GVoxelForgeUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0 ? 1 : 0;
     GVoxelForgeOuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
     GVoxelForgeSampleStacks = FMath::Clamp(
@@ -2523,6 +2536,9 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
             if (bTraceTile)
             {
                 VoxelForgeStartupTrace::FTileSample Sample;
+                Sample.TileX = Result.Tile.Coord.X;
+                Sample.TileY = Result.Tile.Coord.Y;
+                Sample.TileZ = Result.Tile.Coord.Z;
                 Sample.Level = Result.Tile.Level;
                 Sample.Verdict = Result.ClassifyVerdict;
                 Sample.bEmpty = bResultEmpty;
@@ -3843,7 +3859,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "rooms=%d tunnels=%d joins=%d pits=%d chimneys=%d "
                      "whole_mixed=%u whole_solid=%u whole_air=%u final_nodes=%u "
                      "split_nodes=%u max_depth=%u block_builds=%llu block_samples=%llu "
-                     "block_ops=%llu block_active=%llu block_pruned=%llu"),
+                     "block_ops=%llu block_active=%llu block_pruned=%llu cache_builds=%llu"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
@@ -3870,7 +3886,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockSamples)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockOperators)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockActiveOperators)),
-                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockPrunedOperators)));
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockPrunedOperators)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::SdfCacheBuild)));
 
             if (bProfileOps)
             {

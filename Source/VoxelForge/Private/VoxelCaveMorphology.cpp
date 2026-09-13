@@ -36,6 +36,12 @@
 #include "VoxelNoise.h"           // Pure FBM used by the slab landing query
 #include "VoxelPassageGeometry.h"
 #include "VoxelTerrainOpDefinition.h"
+#include "HAL/IConsoleManager.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+
+#include <atomic>
 
 namespace
 {
@@ -2700,6 +2706,422 @@ namespace
         return false;
     }
 
+    // The room-fit result is pure with respect to the complete parameter value, room site, Z
+    // bounds, and warp seed. Keep the complete key explicit instead of hashing the USTRUCT's
+    // object representation: the latter would include padding and would become unsafe if a
+    // pointer/TArray field were ever added.
+#define VF_PLAYER_FIT_PARAM_COUNT_LERP(Name) +1
+#define VF_PLAYER_FIT_PARAM_COUNT_SNAP(Name) +1
+    static constexpr int32 VF_PlayerFitParamWordCount =
+        0 VF_STRATE_PARAM_FIELDS(
+            VF_PLAYER_FIT_PARAM_COUNT_LERP,
+            VF_PLAYER_FIT_PARAM_COUNT_SNAP);
+#undef VF_PLAYER_FIT_PARAM_COUNT_LERP
+#undef VF_PLAYER_FIT_PARAM_COUNT_SNAP
+
+    static constexpr int32 VF_PlayerFitVectorWordCount =
+        static_cast<int32>(sizeof(FVector::FReal) / sizeof(uint32));
+    static_assert(
+        VF_PlayerFitVectorWordCount == 1 || VF_PlayerFitVectorWordCount == 2,
+        "player-fit memo expects float or double FVector components");
+    static constexpr int32 VF_PlayerFitExtraKeyWordCount =
+        3 * VF_PlayerFitVectorWordCount + 8;
+    static constexpr int32 VF_PlayerFitKeyWordCount =
+        VF_PlayerFitParamWordCount + VF_PlayerFitExtraKeyWordCount;
+    static constexpr uint32 VF_PlayerFitMemoKeyVersion = 0x00010001u;
+
+    struct FVFPlayerFitMemoKey
+    {
+        uint32 Words[VF_PlayerFitKeyWordCount] = {};
+    };
+
+    template <typename T>
+    FORCEINLINE void VF_AppendPlayerFitMemoBits(
+        FVFPlayerFitMemoKey& Key,
+        int32& InOutWordIndex,
+        const T& Value)
+    {
+        static_assert(
+            sizeof(T) <= sizeof(uint64),
+            "player-fit memo key fields must be scalar values no wider than uint64");
+        constexpr int32 WordCount =
+            static_cast<int32>((sizeof(T) + sizeof(uint32) - 1) / sizeof(uint32));
+        for (int32 WordIndex = 0; WordIndex < WordCount; ++WordIndex)
+        {
+            Key.Words[InOutWordIndex + WordIndex] = 0u;
+        }
+        FMemory::Memcpy(
+            Key.Words + InOutWordIndex,
+            &Value,
+            sizeof(T));
+        InOutWordIndex += WordCount;
+    }
+
+    static FVFPlayerFitMemoKey VF_MakePlayerFitMemoKey(
+        const FStrateGenerationParams& Params,
+        const FVFRoomLandingSite& Site,
+        float StrateTopZ,
+        float StrateBottomZ,
+        uint32 WarpSeed)
+    {
+        FVFPlayerFitMemoKey Key;
+        int32 WordIndex = 0;
+
+#define VF_PLAYER_FIT_KEY_APPEND_LERP(Name) \
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Params.Name);
+#define VF_PLAYER_FIT_KEY_APPEND_SNAP(Name) \
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Params.Name);
+        VF_STRATE_PARAM_FIELDS(
+            VF_PLAYER_FIT_KEY_APPEND_LERP,
+            VF_PLAYER_FIT_KEY_APPEND_SNAP)
+#undef VF_PLAYER_FIT_KEY_APPEND_LERP
+#undef VF_PLAYER_FIT_KEY_APPEND_SNAP
+
+        // FVector is double-valued in the UE5 build used by this plugin. Append each component
+        // as raw words so the site key preserves its exact input bits on either float/double build.
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.Center.X);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.Center.Y);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.Center.Z);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.RadiusXY);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.RadiusZ);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.Hash);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, Site.bOrigin);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, StrateTopZ);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, StrateBottomZ);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, WarpSeed);
+        VF_AppendPlayerFitMemoBits(Key, WordIndex, VF_PlayerFitMemoKeyVersion);
+        check(WordIndex == VF_PlayerFitKeyWordCount);
+        return Key;
+    }
+
+    FORCEINLINE uint32 VF_HashPlayerFitMemoKey(const FVFPlayerFitMemoKey& Key)
+    {
+        uint32 Hash = 0xD14C4B7Du;
+        for (int32 WordIndex = 0; WordIndex < VF_PlayerFitKeyWordCount; ++WordIndex)
+        {
+            Hash ^= Key.Words[WordIndex]
+                + 0x9e3779b9u
+                + (Hash << 6)
+                + (Hash >> 2);
+        }
+        return VoxelHash::Mix(Hash);
+    }
+
+    // A slot has an atomic reader/writer state, but its key/result payload stays ordinary data.
+    // Readers increment the low counter before touching the payload; writers set the high bit,
+    // wait for existing readers, replace the payload, then publish the valid bit. This avoids
+    // a seqlock data race and avoids the ABA window of a finite sequence number.
+    struct FVFPlayerFitMemoSlot
+    {
+        static constexpr uint32 ReaderMask = (1u << 30) - 1u;
+        static constexpr uint32 ValidBit = 1u << 30;
+        static constexpr uint32 WriterBit = 1u << 31;
+
+        std::atomic<uint32> State;
+        std::atomic<uint32> KeyHash;
+        FVFPlayerFitMemoKey Key;
+        FVector Result = FVector::ZeroVector;
+        bool bFound = false;
+
+        FVFPlayerFitMemoSlot()
+            : State(0u)
+            , KeyHash(0u)
+        {
+        }
+
+        bool TryAcquireRead()
+        {
+            uint32 Current = State.load(std::memory_order_acquire);
+            for (;;)
+            {
+                if ((Current & ValidBit) == 0u
+                    || (Current & WriterBit) != 0u
+                    || (Current & ReaderMask) == ReaderMask)
+                {
+                    return false;
+                }
+                if (State.compare_exchange_weak(
+                        Current,
+                        Current + 1u,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed))
+                {
+                    return true;
+                }
+            }
+        }
+
+        void ReleaseRead()
+        {
+            State.fetch_sub(1u, std::memory_order_release);
+        }
+
+        bool AcquireWrite()
+        {
+            uint32 Current = State.load(std::memory_order_acquire);
+            for (;;)
+            {
+                if ((Current & WriterBit) != 0u)
+                {
+                    FPlatformProcess::YieldThread();
+                    Current = State.load(std::memory_order_acquire);
+                    continue;
+                }
+
+                const bool bWasValid = (Current & ValidBit) != 0u;
+                if (State.compare_exchange_weak(
+                        Current,
+                        Current | WriterBit,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+                {
+                    while ((State.load(std::memory_order_acquire) & ReaderMask) != 0u)
+                    {
+                        FPlatformProcess::YieldThread();
+                    }
+                    return bWasValid;
+                }
+            }
+        }
+
+    };
+
+    struct FVFPlayerFitMemoSetLock
+    {
+        std::atomic<bool> bLocked;
+
+        FVFPlayerFitMemoSetLock()
+            : bLocked(false)
+        {
+        }
+
+        void Lock()
+        {
+            bool bExpected = false;
+            while (!bLocked.compare_exchange_weak(
+                bExpected,
+                true,
+                std::memory_order_acquire,
+                std::memory_order_relaxed))
+            {
+                bExpected = false;
+                FPlatformProcess::YieldThread();
+            }
+        }
+
+        void Unlock()
+        {
+            bLocked.store(false, std::memory_order_release);
+        }
+    };
+
+    struct FVFPlayerFitMemo
+    {
+        static constexpr int32 NumSets = 4096;
+        static constexpr int32 NumWays = 4;
+        static constexpr int32 Capacity = NumSets * NumWays;
+        static_assert((NumSets & (NumSets - 1)) == 0, "player-fit memo sets must be a power of two");
+        static_assert((NumWays & (NumWays - 1)) == 0, "player-fit memo ways must be a power of two");
+
+        FVFPlayerFitMemoSlot Slots[Capacity];
+        FVFPlayerFitMemoSetLock SetLocks[NumSets];
+        std::atomic<uint32> ReplacementCursor[NumSets];
+
+        std::atomic<uint64> Requests{0};
+        std::atomic<uint64> Hits{0};
+        std::atomic<uint64> Misses{0};
+        std::atomic<uint64> Searches{0};
+        std::atomic<uint64> Evictions{0};
+        std::atomic<uint64> Bypasses{0};
+        std::atomic<uint64> OccupiedEntries{0};
+
+        FVFPlayerFitMemo()
+        {
+            for (int32 SetIndex = 0; SetIndex < NumSets; ++SetIndex)
+            {
+                ReplacementCursor[SetIndex].store(0u, std::memory_order_relaxed);
+            }
+        }
+
+        static FORCEINLINE int32 SlotIndex(uint32 KeyHash, int32 Way)
+        {
+            const int32 SetIndex = static_cast<int32>(KeyHash & (NumSets - 1));
+            return SetIndex * NumWays + Way;
+        }
+
+        bool TryFind(
+            const FVFPlayerFitMemoKey& InKey,
+            uint32 InKeyHash,
+            FVector& OutPoint,
+            bool& OutFound)
+        {
+            for (int32 Way = 0; Way < NumWays; ++Way)
+            {
+                FVFPlayerFitMemoSlot& Slot = Slots[SlotIndex(InKeyHash, Way)];
+                // A stale hash can only cause a miss. Exact key comparison below is still
+                // mandatory before returning the cached result.
+                if (Slot.KeyHash.load(std::memory_order_relaxed) != InKeyHash
+                    || !Slot.TryAcquireRead())
+                {
+                    continue;
+                }
+
+                bool bMatches = true;
+                for (int32 WordIndex = 0;
+                     WordIndex < VF_PlayerFitKeyWordCount;
+                     ++WordIndex)
+                {
+                    if (Slot.Key.Words[WordIndex] != InKey.Words[WordIndex])
+                    {
+                        bMatches = false;
+                        break;
+                    }
+                }
+
+                if (bMatches)
+                {
+                    OutPoint = Slot.Result;
+                    OutFound = Slot.bFound;
+                    Slot.ReleaseRead();
+                    return true;
+                }
+                Slot.ReleaseRead();
+            }
+            return false;
+        }
+
+        void Publish(
+            int32 SetIndex,
+            const FVFPlayerFitMemoKey& InKey,
+            uint32 InKeyHash,
+            bool bFound,
+            const FVector& Point)
+        {
+            int32 SelectedWay = INDEX_NONE;
+            for (int32 Way = 0; Way < NumWays; ++Way)
+            {
+                const FVFPlayerFitMemoSlot& Slot = Slots[SlotIndex(InKeyHash, Way)];
+                if ((Slot.State.load(std::memory_order_acquire)
+                        & FVFPlayerFitMemoSlot::ValidBit) == 0u)
+                {
+                    SelectedWay = Way;
+                    break;
+                }
+            }
+            if (SelectedWay == INDEX_NONE)
+            {
+                SelectedWay = static_cast<int32>(
+                    ReplacementCursor[SetIndex].fetch_add(
+                        1u, std::memory_order_relaxed)
+                    & (NumWays - 1));
+            }
+
+            FVFPlayerFitMemoSlot& Slot = Slots[SlotIndex(InKeyHash, SelectedWay)];
+            const bool bWasValid = Slot.AcquireWrite();
+            Slot.Key = InKey;
+            Slot.Result = Point;
+            Slot.bFound = bFound;
+            Slot.KeyHash.store(InKeyHash, std::memory_order_relaxed);
+            Slot.State.store(FVFPlayerFitMemoSlot::ValidBit, std::memory_order_release);
+            if (bWasValid)
+            {
+                Evictions.fetch_add(1u, std::memory_order_relaxed);
+            }
+            else
+            {
+                OccupiedEntries.fetch_add(1u, std::memory_order_relaxed);
+            }
+        }
+
+        template <typename ComputeFn>
+        bool FindOrCompute(
+            const FVFPlayerFitMemoKey& InKey,
+            FVector& OutPoint,
+            ComputeFn&& Compute)
+        {
+            const uint32 KeyHash = VF_HashPlayerFitMemoKey(InKey);
+            Requests.fetch_add(1u, std::memory_order_relaxed);
+
+            bool bFound = false;
+            FVector CachedPoint = FVector::ZeroVector;
+            if (TryFind(InKey, KeyHash, CachedPoint, bFound))
+            {
+                OutPoint = CachedPoint;
+                Hits.fetch_add(1u, std::memory_order_relaxed);
+                return bFound;
+            }
+
+            const int32 SetIndex = static_cast<int32>(KeyHash & (NumSets - 1));
+            SetLocks[SetIndex].Lock();
+            if (TryFind(InKey, KeyHash, CachedPoint, bFound))
+            {
+                SetLocks[SetIndex].Unlock();
+                OutPoint = CachedPoint;
+                Hits.fetch_add(1u, std::memory_order_relaxed);
+                return bFound;
+            }
+
+            FVector ComputedPoint = FVector::ZeroVector;
+            bFound = Compute(ComputedPoint);
+            Searches.fetch_add(1u, std::memory_order_relaxed);
+            Misses.fetch_add(1u, std::memory_order_relaxed);
+            Publish(SetIndex, InKey, KeyHash, bFound, ComputedPoint);
+            SetLocks[SetIndex].Unlock();
+
+            OutPoint = ComputedPoint;
+            return bFound;
+        }
+
+        void ResetStats()
+        {
+            Requests.store(0u, std::memory_order_relaxed);
+            Hits.store(0u, std::memory_order_relaxed);
+            Misses.store(0u, std::memory_order_relaxed);
+            Searches.store(0u, std::memory_order_relaxed);
+            Evictions.store(0u, std::memory_order_relaxed);
+            Bypasses.store(0u, std::memory_order_relaxed);
+        }
+    };
+
+    static FVFPlayerFitMemo GPlayerFitMemo;
+    static TAutoConsoleVariable<int32> CVarVoxelForgePlayerFitMemo(
+        TEXT("voxel.PlayerFitMemo"),
+        1,
+        TEXT("Memoize deterministic room player-fit points; 0 disables the memo."),
+        ECVF_Default);
+
+    bool VF_FindPlayerFitPointForRoomMemoized(
+        const FStrateGenerationParams& Params,
+        const FVFRoomLandingSite& Site,
+        float StrateTopZ,
+        float StrateBottomZ,
+        uint32 WarpSeed,
+        FVector& OutPoint)
+    {
+        if (CVarVoxelForgePlayerFitMemo.GetValueOnAnyThread() == 0)
+        {
+            GPlayerFitMemo.Bypasses.fetch_add(1u, std::memory_order_relaxed);
+            return VF_FindPlayerFitPointForRoom(
+                Params, Site, StrateTopZ, StrateBottomZ, WarpSeed, OutPoint);
+        }
+
+        const FVFPlayerFitMemoKey Key = VF_MakePlayerFitMemoKey(
+            Params, Site, StrateTopZ, StrateBottomZ, WarpSeed);
+        return GPlayerFitMemo.FindOrCompute(
+            Key,
+            OutPoint,
+            [&](FVector& ComputedPoint)
+            {
+                return VF_FindPlayerFitPointForRoom(
+                    Params,
+                    Site,
+                    StrateTopZ,
+                    StrateBottomZ,
+                    WarpSeed,
+                    ComputedPoint);
+            });
+    }
+
     float VF_EvaluateSlabLandingDensity(
         const FSlabGenerationParams& Params,
         uint32 Seed,
@@ -4305,6 +4727,63 @@ FVector VoxelCaveMorphology::ApplyCaveWarp(
     return VF_ApplyCaveWarp(WorldPoint, Params, Seed);
 }
 
+void VoxelCaveMorphology::ConfigurePlayerFitMemoFromCommandLine()
+{
+    int32 CommandLineValue = CVarVoxelForgePlayerFitMemo.GetValueOnAnyThread();
+    const bool bCommandLineValue = FParse::Value(
+        FCommandLine::Get(),
+        TEXT("voxel.PlayerFitMemo="),
+        CommandLineValue);
+    if (bCommandLineValue)
+    {
+        CVarVoxelForgePlayerFitMemo->Set(
+            CommandLineValue != 0 ? 1 : 0,
+            ECVF_SetByCommandline);
+    }
+
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelPlayerFitMemo] configured enabled=%d source=%s sets=%d ways=%d ")
+             TEXT("capacity=%d key_words=%d entry_bytes=%llu table_bytes=%llu"),
+        CVarVoxelForgePlayerFitMemo.GetValueOnAnyThread() != 0 ? 1 : 0,
+        bCommandLineValue ? TEXT("commandline") : TEXT("cvar/default"),
+        FVFPlayerFitMemo::NumSets,
+        FVFPlayerFitMemo::NumWays,
+        FVFPlayerFitMemo::Capacity,
+        VF_PlayerFitKeyWordCount,
+        static_cast<unsigned long long>(sizeof(FVFPlayerFitMemoSlot)),
+        static_cast<unsigned long long>(sizeof(FVFPlayerFitMemo)));
+}
+
+void VoxelCaveMorphology::ResetPlayerFitMemoStats()
+{
+    GPlayerFitMemo.ResetStats();
+}
+
+void VoxelCaveMorphology::LogPlayerFitMemoStats()
+{
+    const uint64 Requests = GPlayerFitMemo.Requests.load(std::memory_order_relaxed);
+    const uint64 Hits = GPlayerFitMemo.Hits.load(std::memory_order_relaxed);
+    const uint64 Misses = GPlayerFitMemo.Misses.load(std::memory_order_relaxed);
+    const double HitRate = Requests > 0
+        ? static_cast<double>(Hits) / static_cast<double>(Requests)
+        : 0.0;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelPlayerFitMemo] enabled=%d requests=%llu hits=%llu misses=%llu ")
+             TEXT("hit_rate=%.6f searches=%llu bypasses=%llu entries=%llu/%d ")
+             TEXT("bytes=%llu evictions=%llu"),
+        CVarVoxelForgePlayerFitMemo.GetValueOnAnyThread() != 0 ? 1 : 0,
+        static_cast<unsigned long long>(Requests),
+        static_cast<unsigned long long>(Hits),
+        static_cast<unsigned long long>(Misses),
+        HitRate,
+        static_cast<unsigned long long>(GPlayerFitMemo.Searches.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(GPlayerFitMemo.Bypasses.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(GPlayerFitMemo.OccupiedEntries.load(std::memory_order_relaxed)),
+        FVFPlayerFitMemo::Capacity,
+        static_cast<unsigned long long>(sizeof(FVFPlayerFitMemo)),
+        static_cast<unsigned long long>(GPlayerFitMemo.Evictions.load(std::memory_order_relaxed)));
+}
+
 FVoxelPassageLanding VF_BuildPassageLanding(
     const FVector& InStandingPoint,
     float MouthRadius,
@@ -4729,6 +5208,10 @@ void VoxelCaveMorphology::BuildChunkCache(
     uint32 Seed, int32 StrateIndex,
     const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
+    if (VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(VoxelDensityProfile::ECounter::SdfCacheBuild);
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::RoomGraphBuild);
     // Clear previous data (arrays keep their allocation for reuse)
@@ -5150,7 +5633,7 @@ void VoxelCaveMorphology::BuildChunkCache(
             Room.RadiusZ,
             Room.Hash,
             false};
-        Room.bHasPlayerFitPoint = VF_FindPlayerFitPointForRoom(
+        Room.bHasPlayerFitPoint = VF_FindPlayerFitPointForRoomMemoized(
             InParams,
             Site,
             InParams.StrateTopWorldZ,
