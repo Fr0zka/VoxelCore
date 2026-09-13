@@ -302,35 +302,48 @@ namespace VoxelPassageGeometry
             return false;
         }
 
-        const FVector2D QueryXY(Position.X, Position.Y);
+        const double QueryX = Position.X;
+        const double QueryY = Position.Y;
+        const int32 ControlPointCount = ControlPoints.Num();
+        const FVector* ControlPointData = ControlPoints.GetData();
+        const float* ControlRadiusData = ControlRadii.GetData();
         float BestDistanceSquared = FLT_MAX;
         bool bFoundSegment = false;
         for (int32 SegmentIndex = 0;
-             SegmentIndex + 1 < ControlPoints.Num();
+             SegmentIndex + 1 < ControlPointCount;
              ++SegmentIndex)
         {
-            const FVector& A = ControlPoints[SegmentIndex];
-            const FVector& B = ControlPoints[SegmentIndex + 1];
-            const FVector2D AXY(A.X, A.Y);
-            const FVector2D Delta = FVector2D(B.X, B.Y) - AXY;
-            const float LengthSquared = Delta.SizeSquared();
+            const FVector& A = ControlPointData[SegmentIndex];
+            const FVector& B = ControlPointData[SegmentIndex + 1];
+            const double AXY_X = A.X;
+            const double AXY_Y = A.Y;
+            const double DeltaX = B.X - AXY_X;
+            const double DeltaY = B.Y - AXY_Y;
+            const float LengthSquared = static_cast<float>(
+                DeltaX * DeltaX + DeltaY * DeltaY);
             if (LengthSquared <= KINDA_SMALL_NUMBER)
             {
                 continue;
             }
 
+            const double Dot = (QueryX - AXY_X) * DeltaX
+                + (QueryY - AXY_Y) * DeltaY;
             const float T = FMath::Clamp(
-                FVector2D::DotProduct(QueryXY - AXY, Delta) / LengthSquared,
+                Dot / LengthSquared,
                 0.0f, 1.0f);
-            const FVector2D ClosestXY = AXY + Delta * T;
-            const float DistanceSquared = (QueryXY - ClosestXY).SizeSquared();
+            const double ClosestX = AXY_X + DeltaX * T;
+            const double ClosestY = AXY_Y + DeltaY * T;
+            const double DistanceX = QueryX - ClosestX;
+            const double DistanceY = QueryY - ClosestY;
+            const float DistanceSquared = static_cast<float>(
+                DistanceX * DistanceX + DistanceY * DistanceY);
             if (DistanceSquared >= BestDistanceSquared)
             {
                 continue;
             }
 
-            const float StartRadius = FMath::Abs(ControlRadii[SegmentIndex]);
-            const float EndRadius = FMath::Abs(ControlRadii[SegmentIndex + 1]);
+            const float StartRadius = FMath::Abs(ControlRadiusData[SegmentIndex]);
+            const float EndRadius = FMath::Abs(ControlRadiusData[SegmentIndex + 1]);
             OutFloorZ = FMath::Lerp(
                 TunnelFloorZ(A, StartRadius),
                 TunnelFloorZ(B, EndRadius),

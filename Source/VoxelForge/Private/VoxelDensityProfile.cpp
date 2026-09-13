@@ -858,7 +858,7 @@ namespace VoxelDensityProfile
 
     FScopeToken BeginScope(EBucket Bucket)
     {
-        FScopeToken Token;
+        FScopeToken Token{};
         if (!IsEnabledFast())
         {
             return Token;
@@ -972,15 +972,4 @@ namespace VoxelDensityProfile
         GSampledScopeActive = Token.bPreviousSampledScopeActive;
     }
 
-    FScopedTimer::~FScopedTimer()
-    {
-        End();
-    }
-
-    void FScopedTimer::End()
-    {
-        if (!Token.bEntered) { return; }
-        EndScope(Bucket, Token);
-        Token.bEntered = false;
-    }
 }

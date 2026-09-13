@@ -383,12 +383,12 @@ namespace VoxelDensityProfile
 
     struct FScopeToken
     {
-        bool bEntered = false;
-        bool bSampled = false;
-        bool bBlockTiming = false;
-        bool bPreviousSampled = false;
-        bool bPreviousSampledScopeActive = false;
-        uint64 StartCycles = 0;
+        bool bEntered;
+        bool bSampled;
+        bool bBlockTiming;
+        bool bPreviousSampled;
+        bool bPreviousSampledScopeActive;
+        uint64 StartCycles;
     };
 
     VOXELFORGE_API FScopeToken BeginScope(EBucket Bucket);
@@ -398,16 +398,16 @@ namespace VoxelDensityProfile
     {
     public:
         explicit FScopedTimer(EBucket InBucket)
-            : Bucket(InBucket)
         {
             if (IsEnabledFast() && ShouldProbeScopeFast(InBucket))
             {
+                Bucket = InBucket;
                 Token = BeginScope(InBucket);
+                bActive = Token.bEntered;
             }
         }
 
         explicit FScopedTimer(const TCHAR* InName)
-            : Bucket(EBucket::OtherOp)
         {
             if (IsEnabledFast())
             {
@@ -415,21 +415,35 @@ namespace VoxelDensityProfile
                 if (ShouldProbeScopeFast(Bucket))
                 {
                     Token = BeginScope(Bucket);
+                    bActive = Token.bEntered;
                 }
             }
         }
 
-        ~FScopedTimer();
+        FORCEINLINE ~FScopedTimer()
+        {
+            End();
+        }
 
         // End a range before its lexical scope ends.  This lets GetDensityAt split its enclosing
         // total into disjoint prologue/core/post phases without moving the large cache block.
-        void End();
+        FORCEINLINE void End()
+        {
+            if (!bActive)
+            {
+                return;
+            }
+            EndScope(Bucket, Token);
+            Token.bEntered = false;
+            bActive = false;
+        }
 
         FScopedTimer(const FScopedTimer&) = delete;
         FScopedTimer& operator=(const FScopedTimer&) = delete;
 
     private:
-        EBucket Bucket = EBucket::OtherOp;
+        EBucket Bucket;
         FScopeToken Token;
+        bool bActive = false;
     };
 }

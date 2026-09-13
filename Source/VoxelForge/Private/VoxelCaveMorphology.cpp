@@ -712,11 +712,15 @@ namespace
         float SDFBlendRadius)
     {
         FVFRoomFloorOwnership Result;
-        if (ControlPoints.Num() < 2
-            || ControlRadii.Num() != ControlPoints.Num())
+        const int32 ControlPointCount = ControlPoints.Num();
+        if (ControlPointCount < 2
+            || ControlRadii.Num() != ControlPointCount)
         {
             return Result;
         }
+
+        const FVector* ControlPointData = ControlPoints.GetData();
+        const float* ControlRadiusData = ControlRadii.GetData();
 
         const float Fade = FMath::Max(
             FMath::Max(SDFBlendRadius, 0.0f) * 0.35f,
@@ -725,8 +729,8 @@ namespace
         for (int32 Endpoint = 0; Endpoint < 2; ++Endpoint)
         {
             const int32 ControlIndex = Endpoint == 0
-                ? 0 : ControlPoints.Num() - 1;
-            const FVector& Mouth = ControlPoints[ControlIndex];
+                ? 0 : ControlPointCount - 1;
+            const FVector& Mouth = ControlPointData[ControlIndex];
             const float DX = static_cast<float>(Position.X - Mouth.X);
             const float DY = static_cast<float>(Position.Y - Mouth.Y);
             const float Distance = FMath::Sqrt(DX * DX + DY * DY);
@@ -752,7 +756,7 @@ namespace
                 continue;
             }
             const float DefaultFloorZ = static_cast<float>(Mouth.Z)
-                - FMath::Abs(ControlRadii[ControlIndex]);
+                - FMath::Abs(ControlRadiusData[ControlIndex]);
             const float StoredFloorZ = Endpoint == 0 ? MouthFloorZA : MouthFloorZB;
             const float FloorZ = StoredFloorZ > -FLT_MAX
                 && FMath::IsFinite(StoredFloorZ)
@@ -815,26 +819,23 @@ namespace
         const FVector& B, float RadiusB,
         float T, int32 SegmentIndex, int32 NumSegments,
         const FCachedTunnel& Tunnel,
-        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles,
+        const FTunnelFloorSegmentProfile* FloorProfile,
         const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         FVFTunnelFloorTerms Terms;
-        if (FloorProfiles != nullptr
-            && FloorProfiles->Num() == NumSegments
-            && FloorProfiles->IsValidIndex(SegmentIndex))
+        if (FloorProfile != nullptr)
         {
-            const FTunnelFloorSegmentProfile& Profile = (*FloorProfiles)[SegmentIndex];
             const float ClampedT = FMath::Clamp(T, 0.0f, 1.0f);
-            const float ProfileT = Profile.NumSteps > 0
+            const float ProfileT = FloorProfile->NumSteps > 0
                 ? (ClampedT >= 1.0f
                     ? 1.0f
                     : FMath::FloorToFloat(ClampedT
-                        * static_cast<float>(Profile.NumSteps))
-                        / static_cast<float>(Profile.NumSteps))
+                        * static_cast<float>(FloorProfile->NumSteps))
+                        / static_cast<float>(FloorProfile->NumSteps))
                 : ClampedT;
             Terms.BaseFloorZ = FMath::Lerp(
-                Profile.StartFloorZ, Profile.EndFloorZ, ProfileT);
-            Terms.ReliefScale = Profile.ReliefScale;
+                FloorProfile->StartFloorZ, FloorProfile->EndFloorZ, ProfileT);
+            Terms.ReliefScale = FloorProfile->ReliefScale;
         }
         else
         {
@@ -878,8 +879,10 @@ namespace
                 RoomFloorOwnership->Weight, 0.0f, 1.0f);
         }
 
-        const float HorizontalRun = FVector2D(
-            static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
+        const double DeltaX = static_cast<double>(static_cast<float>(B.X - A.X));
+        const double DeltaY = static_cast<double>(static_cast<float>(B.Y - A.Y));
+        const float HorizontalRun = static_cast<float>(FMath::Sqrt(
+            DeltaX * DeltaX + DeltaY * DeltaY));
         Terms.ReliefEnvelope = 1.0f;
         if (SegmentIndex == 0)
         {
@@ -926,12 +929,12 @@ namespace
         const void* CacheIdentity, int32 TunnelIndex,
         bool bEvaluateRelief,
         const FVFFloorReliefColumnKey& Column,
-        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles,
+        const FTunnelFloorSegmentProfile* FloorProfile,
         const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         const FVFTunnelFloorTerms Terms = VF_TunnelFloorTerms(
             A, RadiusA, B, RadiusB,
-            T, SegmentIndex, NumSegments, Tunnel, FloorProfiles,
+            T, SegmentIndex, NumSegments, Tunnel, FloorProfile,
             RoomFloorOwnership);
         return VF_TunnelFloorFromTerms(
             Position, Tunnel, Terms,
@@ -942,10 +945,12 @@ namespace
         const FVector& Position, const FVector& A, const FVector& B,
         float& OutT, float& OutDistanceSquared)
     {
-        const FVector2D AXY(static_cast<float>(A.X), static_cast<float>(A.Y));
-        const FVector2D Delta(
-            static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y));
-        const float LengthSquared = Delta.SizeSquared();
+        const double AXY_X = static_cast<double>(static_cast<float>(A.X));
+        const double AXY_Y = static_cast<double>(static_cast<float>(A.Y));
+        const double DeltaX = static_cast<double>(static_cast<float>(B.X - A.X));
+        const double DeltaY = static_cast<double>(static_cast<float>(B.Y - A.Y));
+        const float LengthSquared = static_cast<float>(
+            DeltaX * DeltaX + DeltaY * DeltaY);
         if (LengthSquared <= KINDA_SMALL_NUMBER)
         {
             OutT = 0.0f;
@@ -953,13 +958,17 @@ namespace
             return false;
         }
 
-        const FVector2D QueryXY(
-            static_cast<float>(Position.X), static_cast<float>(Position.Y));
-        OutT = FMath::Clamp(
-            FVector2D::DotProduct(QueryXY - AXY, Delta) / LengthSquared,
-            0.0f, 1.0f);
-        const FVector2D ClosestXY = AXY + Delta * OutT;
-        OutDistanceSquared = (QueryXY - ClosestXY).SizeSquared();
+        const double QueryX = static_cast<double>(static_cast<float>(Position.X));
+        const double QueryY = static_cast<double>(static_cast<float>(Position.Y));
+        const double Dot = (QueryX - AXY_X) * DeltaX
+            + (QueryY - AXY_Y) * DeltaY;
+        OutT = FMath::Clamp(Dot / LengthSquared, 0.0f, 1.0f);
+        const double ClosestX = AXY_X + DeltaX * OutT;
+        const double ClosestY = AXY_Y + DeltaY * OutT;
+        const double DistanceX = QueryX - ClosestX;
+        const double DistanceY = QueryY - ClosestY;
+        OutDistanceSquared = static_cast<float>(
+            DistanceX * DistanceX + DistanceY * DistanceY);
         return true;
     }
 
@@ -976,22 +985,30 @@ namespace
         const FVFRoomFloorOwnership* RoomFloorOwnership)
     {
         FVFTunnelShapeEvaluation Result;
-        if (ControlPoints.Num() < 2
-            || ControlRadii.Num() != ControlPoints.Num())
+        const int32 ControlPointCount = ControlPoints.Num();
+        if (ControlPointCount < 2
+            || ControlRadii.Num() != ControlPointCount)
         {
             return Result;
         }
 
-        const int32 NumSegments = ControlPoints.Num() - 1;
+        const int32 NumSegments = ControlPointCount - 1;
+        const FVector* ControlPointData = ControlPoints.GetData();
+        const float* ControlRadiusData = ControlRadii.GetData();
+        const FTunnelFloorSegmentProfile* FloorProfileData = nullptr;
+        if (FloorProfiles != nullptr && FloorProfiles->Num() == NumSegments)
+        {
+            FloorProfileData = FloorProfiles->GetData();
+        }
         const float FloorBlend = FMath::Max(SDFBlendRadius, 0.0f) * 0.35f;
         for (int32 SegmentIndex = 0;
              SegmentIndex < NumSegments;
              ++SegmentIndex)
         {
-            const FVector& A = ControlPoints[SegmentIndex];
-            const FVector& B = ControlPoints[SegmentIndex + 1];
-            const float RadiusA = ControlRadii[SegmentIndex];
-            const float RadiusB = ControlRadii[SegmentIndex + 1];
+            const FVector& A = ControlPointData[SegmentIndex];
+            const FVector& B = ControlPointData[SegmentIndex + 1];
+            const float RadiusA = ControlRadiusData[SegmentIndex];
+            const float RadiusB = ControlRadiusData[SegmentIndex + 1];
 
             float T = 0.0f;
             float HorizontalDistanceSquared = FLT_MAX;
@@ -1007,17 +1024,12 @@ namespace
                 continue;
             }
 
+            const FTunnelFloorSegmentProfile* Profile = FloorProfileData != nullptr
+                ? FloorProfileData + SegmentIndex : nullptr;
             const FVFTunnelFloorTerms FloorTerms = VF_TunnelFloorTerms(
                 A, RadiusA, B, RadiusB,
-                T, SegmentIndex, NumSegments, Tunnel, FloorProfiles,
+                T, SegmentIndex, NumSegments, Tunnel, Profile,
                 RoomFloorOwnership);
-            const FTunnelFloorSegmentProfile* Profile = nullptr;
-            if (FloorProfiles != nullptr
-                && FloorProfiles->Num() == NumSegments
-                && FloorProfiles->IsValidIndex(SegmentIndex))
-            {
-                Profile = &(*FloorProfiles)[SegmentIndex];
-            }
             const float NaturalFloorZ = Profile != nullptr
                 ? FMath::Lerp(
                     Profile->NaturalStartFloorZ,
@@ -1220,7 +1232,14 @@ namespace
             return false;
         }
 
-        const int32 NumSegments = ControlPoints.Num() - 1;
+        const int32 ControlPointCount = ControlPoints.Num();
+        const int32 NumSegments = ControlPointCount - 1;
+        const FVector* ControlPointData = ControlPoints.GetData();
+        const float* ControlRadiusData = ControlRadii.GetData();
+        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles = bWorldChain
+            ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles;
+        const FTunnelFloorSegmentProfile* FloorProfileData =
+            FloorProfiles->Num() == NumSegments ? FloorProfiles->GetData() : nullptr;
         float BestDistanceSquared = FLT_MAX;
         bool bFound = false;
         for (int32 SegmentIndex = 0;
@@ -1231,22 +1250,22 @@ namespace
             float DistanceSquared = FLT_MAX;
             if (!VF_ProjectTunnelSegmentXY(
                     Position,
-                    ControlPoints[SegmentIndex], ControlPoints[SegmentIndex + 1],
+                    ControlPointData[SegmentIndex], ControlPointData[SegmentIndex + 1],
                     T, DistanceSquared)
                 || DistanceSquared >= BestDistanceSquared)
             {
                 continue;
             }
 
-            const float RadiusA = ControlRadii[SegmentIndex];
-            const float RadiusB = ControlRadii[SegmentIndex + 1];
+            const float RadiusA = ControlRadiusData[SegmentIndex];
+            const float RadiusB = ControlRadiusData[SegmentIndex + 1];
             OutFloorZ = VF_TunnelFloorAtSegment(
-                ControlPoints[SegmentIndex], RadiusA,
-                ControlPoints[SegmentIndex + 1], RadiusB,
+                ControlPointData[SegmentIndex], RadiusA,
+                ControlPointData[SegmentIndex + 1], RadiusB,
                 T, SegmentIndex, NumSegments, Position, Tunnel,
                 CacheIdentity, TunnelIndex, /*bEvaluateRelief=*/true,
                 ReliefColumn,
-                bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
+                FloorProfileData != nullptr ? FloorProfileData + SegmentIndex : nullptr,
                 RoomFloorOwnership);
             OutSupportRadius = FMath::Max(
                 FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
@@ -1331,8 +1350,9 @@ bool FChunkSDFSpatialIndex::GetRange(
         return false;
     }
 
-    OutBegin = CellOffsets[static_cast<int32>(Slot)];
-    OutEnd = CellOffsets[static_cast<int32>(Slot + 1)];
+    const int32* CellOffsetData = CellOffsets.GetData();
+    OutBegin = CellOffsetData[static_cast<int32>(Slot)];
+    OutEnd = CellOffsetData[static_cast<int32>(Slot + 1)];
     return OutBegin >= 0 && OutEnd >= OutBegin && OutEnd <= ItemIndices.Num();
 }
 
@@ -1546,9 +1566,10 @@ namespace
         int32 CandidateCount = 0;
         if (bUseSpatialIndex && Index.GetRange(WorldX, WorldY, Begin, End))
         {
+            const int32* ItemIndexData = Index.ItemIndices.GetData();
             for (int32 Cursor = Begin; Cursor < End; ++Cursor)
             {
-                const int32 ItemIndex = Index.ItemIndices[Cursor];
+                const int32 ItemIndex = ItemIndexData[Cursor];
                 if (ItemIndex >= 0 && ItemIndex < ItemCount)
                 {
                     ++CandidateCount;
@@ -7354,6 +7375,9 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     const FVector Pos(WorldX, WorldY, WorldZ);
     const FVFFloorReliefColumnKey ReliefColumn =
         VF_MakeFloorReliefColumnKey(Pos.X, Pos.Y);
+    const FCachedRoom* RoomData = Cache.Rooms.GetData();
+    const FCachedRoomFloorJoin* RoomFloorJoinData = Cache.RoomFloorJoins.GetData();
+    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
     // Track which room contributes the smallest (most-inside) raw SDF.
     // This is used by the terrain ops system to find the "owning" room for
@@ -7367,7 +7391,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     //=========================================================================
     auto EvaluateRoom = [&](int32 RoomIdx)
     {
-        const FCachedRoom& Room = Cache.Rooms[RoomIdx];
+        const FCachedRoom& Room = RoomData[RoomIdx];
 
         // --- DISTANCE CULL ---
         const float DistSq = VF_FloatDistSquared(WorldX, WorldY, WorldZ, Room.Center);
@@ -7476,7 +7500,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     // not participate in nearest-room terrain-op ownership.
     auto EvaluateJoin = [&](int32 JoinIdx)
     {
-        const FCachedRoomFloorJoin& Join = Cache.RoomFloorJoins[JoinIdx];
+        const FCachedRoomFloorJoin& Join = RoomFloorJoinData[JoinIdx];
         const float DistSq = VF_FloatDistSquared(WorldX, WorldY, WorldZ, Join.BoundCenter);
         if (DistSq > Join.BoundRadiusSq) return;
 
@@ -7497,7 +7521,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     //=========================================================================
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
-        const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
         if (Tunnel.SDFInfluenceRadius > 0.0f
             && VF_DistanceSquaredToAabb(
                 WorldX, WorldY, WorldZ,
@@ -7555,10 +7579,11 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
     float MinSDF = FLT_MAX;
+    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
-        const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
         if (Tunnel.SDFInfluenceRadius > 0.0f
             && VF_DistanceSquaredToAabb(
                 WorldX, WorldY, WorldZ,
@@ -7597,6 +7622,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
         VoxelDensityProfile::EBucket::TunnelCoreWorld);
     const FVector Pos(WorldX, WorldY, WorldZ);
     FTunnelCoreWorldEvaluation Result;
+    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
     if (SupportColumn != nullptr && VoxelDensityProfile::AreCountersEnabled())
     {
@@ -7605,7 +7631,7 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     }
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
-        const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
         const bool bHasWorldChain = Tunnel.WorldControlPoints.Num() >= 2
             && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num();
         const FVector& BoundCenter = bHasWorldChain
@@ -7731,10 +7757,11 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     bool bUseSpatialIndex)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
+    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
     auto TestTunnel = [&](int32 TunnelIdx) -> bool
     {
-        const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
         const bool bHasWorldChain = Tunnel.WorldControlPoints.Num() >= 2
             && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num();
         const FVector& CenterlineMin = bHasWorldChain
@@ -7789,9 +7816,10 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     int32 CandidateCount = 0;
     auto TestRange = [&](int32 Begin, int32 End)
     {
+        const int32* ItemIndexData = Cache.TunnelSpatialIndex.ItemIndices.GetData();
         for (int32 Cursor = Begin; Cursor < End; ++Cursor)
         {
-            const int32 TunnelIdx = Cache.TunnelSpatialIndex.ItemIndices[Cursor];
+            const int32 TunnelIdx = ItemIndexData[Cursor];
             if (!Cache.Tunnels.IsValidIndex(TunnelIdx))
             {
                 continue;
@@ -7858,10 +7886,11 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
     }
 
     const FVector ColumnPosition(WorldX, WorldY, 0.0f);
+    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
-        const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
+        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
         const FVFRoomFloorOwnership RoomMouthOwnership =
             VF_FindWorldTunnelMouthOwnership(ColumnPosition, Tunnel, Cache.SDFBlendRadius);
         float FloorZ = 0.0f;

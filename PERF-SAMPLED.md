@@ -766,3 +766,165 @@ No rank is assigned to the 74-field parameter copy: the sampler did not measure 
 ## Handoff
 
 This round changed only diagnostic instrumentation and report artifacts under E:\Projet Unreal\VoxelM\Plugins\VoxelForge. Engine source was not modified. No commit, push, or stash was performed. The key caveat is explicit: the instrument has good closure and a successful planted-cost proof, but its 1 ms game overhead is above the requested timing/worker-CPU noise on static and above timing noise on moving. Treat the large, repeated component differences as useful; do not treat small single-digit improvements as established until that overhead is brought inside the game baseline.
+
+## Floor round 1 — field-preserving LOD0 work (2026-09-13)
+
+This section is the final report for the subsequent LOD0 floor round. It is deliberately separate
+from the field-changing world-space tunnel-core merge and cave warp work. No density expression was
+changed, no terrain-op order was changed, and no engine source was modified.
+
+### Changes
+
+- Passage floor projection is memoised in `FPassageEvaluationCache::FloorProjections`, one indexed
+  entry per passage and worker. Native projection, generic fallback projection, and walkable-air
+  classification reuse the same float outputs for an exact `(sample, passage)` hit. The sample key
+  compares the original double XYZ values; cache invalidation includes manager lifetime, layout
+  version, and chunk. `voxel.FloorRound1PassageProjectionCache` disables only this cache for A/B.
+- Disabled `VoxelDensityProfile::FScopedTimer` construction now performs the enabled/probe test and
+  carries only an inactive flag; bucket/token initialization and out-of-line destructor work are
+  absent. Enabled profiling still enters/exits the same scope and preserves `End()` early closure.
+- Proven-hot room/tunnel/passage candidate loops cache counts and use `GetData()` pointers where the
+  preceding count or spatial-index range proves the access. Other array checks remain intact.
+- The two exact floor-projection XY loops scalarise the existing double `TVector2` temporaries while
+  retaining the original float conversions and result casts. `FVector::DistSquared` float paths were
+  left alone.
+- `FSurfaceColumn` is now a trivial payload. `ComputeSurfaceColumn` writes all five values before
+  publishing `Computed`, so removing never-read default values removes its generated TLS constructor
+  leaf without changing a column or density.
+
+### Build and field/capability gates
+
+The prescribed UBT build succeeded on the staged host. The loaded runtime was verified on every field,
+capability, and game process as:
+
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Binaries\Win64\UnrealEditor-VoxelForge.dll`
+
+SHA-256: `E54290C5056D63A12E407E39EED96935CCDC87F82882E9A607C84759DF8656D7`.
+
+Field runs:
+
+- `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\FloorR1BookField2Off_20260913Out`
+- `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\FloorR1BookField2On_20260913Out`
+
+Both reports are `status=ok`, deterministic repeat `passed`, geometry CRC `07C14005`, 82,273
+vertices, and 153,346 triangles. Both `geometry.obj` files are byte-identical with SHA-256
+`b3e5f4c398dd0547c6c55f415872058246d4a292c2f0d636ee1cd0829de9b377`. The standing 841/841
+per-tile triangle-identity record is preserved; the new game runs also report identical static and
+moving applied tile/visible-tile/triangle totals in every off/on case.
+
+Capability run:
+
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\FloorR1BookCapability_20260913Out\explore.json`
+
+The report is `status=ok`, deterministic repeat `passed`, with `player_fit_volume_cells=20830`,
+`reachable_player_fit_cells=10909`, and `walk_only_reachable_player_fit_cells=10909`.
+
+### Clean game A/B
+
+Sampler off, diagnostics off, LOD0, `voxel.OuterClassifierMode=0`, interleaved in the order
+off/on static A, on/off moving A, off/on static B, on/off moving B. Static runs had 343 LOD0 ready
+samples; moving runs had 1,274.
+
+| run | cache | request p50/p95 (s) | generation p50/p95 (s) | worker s | applied tiles / visible / triangles |
+|---|---:|---:|---:|---:|---:|
+| OffStaticA | 0 | 0.091413 / 0.145960 | 0.066545 / 0.108736 | 33.354203 | 841 / 447 / 669834 |
+| OnStaticA | 1 | 0.091688 / 0.151787 | 0.066298 / 0.107866 | 33.549964 | 841 / 447 / 669834 |
+| OnMovingA | 1 | 0.067281 / 0.138041 | 0.059686 / 0.108387 | 97.919700 | 2348 / 1055 / 1985216 |
+| OffMovingA | 0 | 0.067659 / 0.135287 | 0.059316 / 0.107414 | 98.007684 | 2348 / 1055 / 1985216 |
+| OffStaticB | 0 | 0.088911 / 0.146950 | 0.064988 / 0.104965 | 33.246204 | 841 / 447 / 669834 |
+| OnStaticB | 1 | 0.090368 / 0.151585 | 0.065554 / 0.107661 | 33.323367 | 841 / 447 / 669834 |
+| OnMovingB | 1 | 0.067540 / 0.139517 | 0.059545 / 0.108946 | 97.915109 | 2348 / 1055 / 1985216 |
+| OffMovingB | 0 | 0.067745 / 0.137666 | 0.059707 / 0.108898 | 97.926095 | 2348 / 1055 / 1985216 |
+
+Paired means, on relative to off:
+
+| mode | off request p50/p95 | on request p50/p95 | off generation p50/p95 | on generation p50/p95 | off worker s | on worker s | on vs off worker |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| static | 0.090162 / 0.146455 | 0.091028 / 0.151686 | 0.065767 / 0.106851 | 0.065926 / 0.107764 | 33.300204 | 33.436666 | +0.41% |
+| moving | 0.067702 / 0.136477 | 0.067411 / 0.138779 | 0.059512 / 0.108156 | 0.059616 / 0.108667 | 97.966890 | 97.917405 | −0.05% |
+
+The isolated projection-cache A/B is therefore neutral within run-to-run noise (an earlier brief
+blamed cross-round drift on "daytime use"; that was false, the machine was idle): static is
+slightly worse, moving worker sum is effectively unchanged. The implementation is retained because
+the reuse is exact and the switch attributes the hypothesis; the result is not claimed as a speed
+win. All eight runs had `validation_density_calls=0`, `obsolete_worker_tasks=0`, and loaded-DLL
+verification true. The one-second process monitor observed game RSS from 1,946,759,168 to
+2,019,475,456 bytes; these are peak samples, not a cross-round memory baseline.
+
+### Final sampler-on moving run
+
+Raw samples:
+
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSamples_game_3352.csv`
+
+Summary:
+
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSummary_game_3352.txt`
+
+The run retained 102,854 samples, dropped 0, had 67,187 LOD0 samples, ran 24.978248 s, and had
+unknown-frame fraction 0.472158. It reported 2,348 applied tiles, 1,055 visible tiles, 1,985,216
+triangles, 2,360 generation tasks, 103.016440 worker seconds, and zero obsolete worker tasks.
+
+LOD0 exclusive top 20:
+
+| # | samples | % | leaf |
+|---:|---:|---:|---|
+| 1 | 11531 | 17.1625 | `GetDensityWithParams` — `VoxelGenerator.cpp:2874` |
+| 2 | 8658 | 12.8864 | unknown |
+| 3 | 3068 | 4.5664 | `GetDensityAt` — `VoxelGenerator.cpp:1998` |
+| 4 | 2702 | 4.0216 | `Sqrt` |
+| 5 | 2312 | 3.4411 | `VoxelSDF::SmoothMin` |
+| 6 | 2209 | 3.2878 | `EvaluateTunnelCoreWorld` lambda — `VoxelCaveMorphology.cpp:7648` |
+| 7 | 1876 | 2.7922 | `EvaluateSDFCached` lambda — `VoxelCaveMorphology.cpp:7526` |
+| 8 | 1788 | 2.6612 | `VF_ProjectNativePassageFloorUncached` — `VoxelStrateManager.cpp:597` |
+| 9 | 1504 | 2.2385 | `VF_DistanceSquaredToAabb` — `VoxelCaveMorphology.cpp:68` |
+| 10 | 1419 | 2.1120 | `VF_ProjectTunnelSegmentXY` — `VoxelCaveMorphology.cpp:970` |
+| 11 | 1268 | 1.8873 | `ProjectWalkableTunnelFloor` — `VoxelPassageGeometry.h:314` |
+| 12 | 1241 | 1.8471 | `VF_EvaluateSweptTunnelChain` — `VoxelCaveMorphology.cpp:1006` |
+| 13 | 1009 | 1.5018 | swept-chain lambda — `VoxelCaveMorphology.cpp:1076` |
+| 14 | 880 | 1.3098 | `VF_EvaluatePassageLandingSDF` — `VoxelCaveMorphology.cpp:5690` |
+| 15 | 844 | 1.2562 | `GenerateMesh` — `VoxelMarchingCubesMesher.cpp:578` |
+| 16 | 758 | 1.1282 | `FScopedTimer::End` — `VoxelDensityProfile.h:432` |
+| 17 | 732 | 1.0895 | `EvaluateModifierSDF` — `VoxelStrateManager.cpp:2470` |
+| 18 | 729 | 1.0850 | `ApplyPassageStructuralPostsMC` — `VoxelStrateManager.cpp:2808` |
+| 19 | 700 | 1.0419 | `VF_GetPassageFloorProjectionCacheEntry` — `VoxelStrateManager.cpp:349` |
+| 20 | 609 | 0.9064 | `EvaluateSDFCached` lambda — `VoxelCaveMorphology.cpp:7397` |
+
+LOD0 inclusive top 20:
+
+| # | samples | % | inclusive function |
+|---:|---:|---:|---|
+| 1 | 67187 | 100.0000 | `Invoke` |
+| 2 | 67187 | 100.0000 | `LowLevelTasks::FTask::Init` lambda |
+| 3 | 67187 | 100.0000 | `LowLevelTasks::TTaskDelegate::Call` |
+| 4 | 67187 | 100.0000 | `UE::Tasks::Private::FTaskBase::Init` lambda |
+| 5 | 67187 | 100.0000 | `LowLevelTasks::TTaskDelegate::CallAndMove` |
+| 6 | 67187 | 100.0000 | `UE::Tasks::Private::FTaskBase::TryExecuteTask` |
+| 7 | 67187 | 100.0000 | `TExecutableTaskBase::ExecuteTask` |
+| 8 | 67187 | 100.0000 | `AVoxelWorld::LoadTile` lambda — `VoxelWorld.cpp:3782` |
+| 9 | 67186 | 99.9985 | `AVoxelWorld::GenerateTileResult` — `VoxelWorld.cpp:4126` |
+| 10 | 67100 | 99.8705 | `UVoxelMarchingCubesMesher::GenerateMesh` — `VoxelMarchingCubesMesher.cpp:578` |
+| 11 | 65522 | 97.5218 | `UVoxelGenerator::GetDensityAt` — `VoxelGenerator.cpp:2297` |
+| 12 | 40538 | 60.3361 | `UVoxelGenerator::GetDensityWithParams` — `VoxelGenerator.cpp:3117` |
+| 13 | 18270 | 27.1928 | `VF_ForEachSpatialCandidate` — `VoxelCaveMorphology.cpp:1582` |
+| 14 | 11093 | 16.5106 | `VoxelCaveMorphology::EvaluateSDFCached` — `VoxelCaveMorphology.cpp:7377` |
+| 15 | 8829 | 13.1409 | `EvaluateSDFCached` lambda — `VoxelCaveMorphology.cpp:7526` |
+| 16 | 8777 | 13.0635 | `VF_EvaluateSweptTunnel` — `VoxelCaveMorphology.cpp:1167` |
+| 17 | 8581 | 12.7718 | `VoxelCaveMorphology::EvaluateTunnelCoreWorld` — `VoxelCaveMorphology.cpp:7732` |
+| 18 | 8366 | 12.4518 | `VF_EvaluateSweptTunnelChain` — `VoxelCaveMorphology.cpp:1029` |
+| 19 | 7811 | 11.6258 | `ApplyPassageCarvingOnly` — `VoxelStrateManager.cpp:2596` |
+| 20 | 7682 | 11.4338 | `VF_ApplyPassageCarving` — `VoxelDensityPrimitives.h:75` |
+
+### Unknown-source resolution
+
+The old `FSurfaceColumn` constructor PCs are absent from this final sampler. The LOD0 unknown leaf
+is 8,658 samples (12.8864%), but the raw PC cluster that accounts for the largest part is not plugin
+code: `0x00007FF88382C080`, `...C08A`, `...C095`, `...C0A5`, and `...C0A9` map to the loaded
+`UnrealEditor-Core.dll` at runtime RVA `0xC080`, inside its private `.pdata` function range
+`0xB4D0–0xC32B`. The packaged Core binary has no PDB, so the source function name cannot be resolved.
+Smaller unresolved groups map to `UnrealEditor-Engine.dll + RVA 0x500947` (generated reflection
+`StaticStruct` code) and `UnrealEditor-CoreUObject.dll + RVA 0x76168`; none maps to
+`Plugins\VoxelForge`.
+
+This closes the actionable part of candidate 5: the previous plugin constructor was removed, while
+the remaining unknown is an engine-symbolisation limitation. No commit, push, or stash was performed.

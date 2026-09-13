@@ -12,6 +12,7 @@
 #include "VoxelStartupTrace.h"
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
+#include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Crc.h"
 #include "Misc/Parse.h"
@@ -22,6 +23,15 @@
 namespace
 {
     std::atomic<uint64> GNextStrateManagerLifetimeId { 0 };
+
+    // Exact A/B switch for the repeated passage-floor projection item.  The other field-
+    // preserving rewrites in this round are deliberately unconditional; this switch isolates
+    // the projection reuse without changing any density arithmetic.
+    int32 GVoxelForgeFloorRound1PassageProjectionCache = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeFloorRound1PassageProjectionCache(
+        TEXT("voxel.FloorRound1PassageProjectionCache"),
+        GVoxelForgeFloorRound1PassageProjectionCache,
+        TEXT("Reuse exact passage floor projections within one density sample; 0 disables the A/B cache."));
 
     struct FRuntimeRoughnessOverrides
     {
@@ -185,6 +195,43 @@ static float PassageFBM(float X, float Seed)
 
 namespace
 {
+    // One projection result per passage is enough for the current voxel sample.  The surrounding
+    // passage cache already moves with (manager, layout, chunk); a generation invalidates old flags
+    // before any caller can observe them.  Keeping the entries indexed by passage avoids the TMap
+    // rehash path that this hot loop used to carry, while a collision-free hit remains exact.
+    struct FPassageFloorProjectionCacheEntry
+    {
+        // The sample key lives once in FPassageEvaluationCache.  A monotonically increasing
+        // generation makes an entry's old flags inert without clearing its float payload.
+        // The payload is only read after the corresponding valid flag is set.
+        uint64 SampleGeneration = 0;
+        uint8 ComputedFlags = 0;
+        bool bNativeValid = false;
+        float NativeFloorZ = 0.0f;
+        float NativeSupportRadius = 0.0f;
+        bool bGenericValid = false;
+        float GenericFloorZ = 0.0f;
+        float GenericSupportRadius = 0.0f;
+        bool bWalkableAir = false;
+
+        enum : uint8
+        {
+            NativeComputed = 1u << 0,
+            GenericComputed = 1u << 1,
+            WalkableAirComputed = 1u << 2
+        };
+
+        FORCEINLINE bool Has(uint8 Flag) const
+        {
+            return (ComputedFlags & Flag) != 0;
+        }
+
+        FORCEINLINE void SetComputed(uint8 Flag)
+        {
+            ComputedFlags |= Flag;
+        }
+    };
+
     /**
      * One shared passage cache for the tube SDF and landing-floor fill.
      *
@@ -199,6 +246,12 @@ namespace
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         uint32 Version = 0xFFFFFFFFu;
         TArray<int32> Nearby;
+        TArray<FPassageFloorProjectionCacheEntry> FloorProjections;
+        bool bFloorProjectionSampleValid = false;
+        double FloorProjectionX = 0.0;
+        double FloorProjectionY = 0.0;
+        double FloorProjectionZ = 0.0;
+        uint64 FloorProjectionGeneration = 0;
     };
 
     FPassageEvaluationCache& VF_GetPassageEvaluationCache()
@@ -225,6 +278,8 @@ namespace
         Cache.Chunk = ChunkCoord;
         Cache.Version = Version;
         Cache.Nearby.Reset();
+        Cache.FloorProjections.Reset();
+        Cache.bFloorProjectionSampleValid = false;
         if (!Manager) return Cache.Nearby;
 
         const FVector ChunkCenter(
@@ -233,6 +288,7 @@ namespace
             (ChunkCoord.Z + 0.5f) * (float)CHUNK_SIZE);
         const float ChunkRadius = (float)CHUNK_SIZE * 0.8660254f + 3.0f;
         const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+        Cache.FloorProjections.SetNum(Passages.Num());
         for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
         {
             const FVoxelPassage& Passage = Passages[PassageIndex];
@@ -243,6 +299,59 @@ namespace
             }
         }
         return Cache.Nearby;
+    }
+
+    FPassageFloorProjectionCacheEntry* VF_GetPassageFloorProjectionCacheEntry(
+        const UVoxelStrateManager* Manager,
+        const FVector& Position,
+        int32 PassageIndex)
+    {
+        if (GVoxelForgeFloorRound1PassageProjectionCache == 0
+            || Manager == nullptr || PassageIndex < 0)
+        {
+            return nullptr;
+        }
+
+        FPassageEvaluationCache& Cache = VF_GetPassageEvaluationCache();
+        if (Cache.Owner != Manager
+            || Cache.OwnerLifetimeId != Manager->GetCacheLifetimeId()
+            || Cache.Version != Manager->GetLayoutVersion()
+            || PassageIndex >= Cache.FloorProjections.Num())
+        {
+            return nullptr;
+        }
+
+        if (!Cache.bFloorProjectionSampleValid
+            || Cache.FloorProjectionX != Position.X
+            || Cache.FloorProjectionY != Position.Y
+            || Cache.FloorProjectionZ != Position.Z)
+        {
+            Cache.bFloorProjectionSampleValid = true;
+            Cache.FloorProjectionX = Position.X;
+            Cache.FloorProjectionY = Position.Y;
+            Cache.FloorProjectionZ = Position.Z;
+            ++Cache.FloorProjectionGeneration;
+            if (Cache.FloorProjectionGeneration == 0)
+            {
+                // Keep generation zero reserved for never-initialized entries.  This is
+                // unreachable in a practical worker lifetime, but preserves the invariant if a
+                // process survives long enough to wrap the counter.
+                for (FPassageFloorProjectionCacheEntry& Candidate : Cache.FloorProjections)
+                {
+                    Candidate.SampleGeneration = 0;
+                }
+                ++Cache.FloorProjectionGeneration;
+            }
+        }
+
+        FPassageFloorProjectionCacheEntry* Entry =
+            Cache.FloorProjections.GetData() + PassageIndex;
+        if (Entry->SampleGeneration != Cache.FloorProjectionGeneration)
+        {
+            Entry->SampleGeneration = Cache.FloorProjectionGeneration;
+            Entry->ComputedFlags = 0;
+        }
+        return Entry;
     }
 
     // Passage relief is a function of the immutable passage descriptor and the actual XY column.
@@ -425,49 +534,58 @@ namespace
             0.0f, VF_PassageMaxReliefScale);
     }
 
-    static bool VF_ProjectNativePassageFloor(
+    static bool VF_ProjectNativePassageFloorUncached(
         const FVoxelPassage& Passage, const FVector& Position,
         float& OutFloorZ, float& OutSupportRadius,
         const UVoxelStrateManager* Manager = nullptr,
         int32 PassageIndex = INDEX_NONE)
     {
+        const int32 ControlPointCount = Passage.ControlPoints.Num();
         if (!Passage.bNativeFloorEnabled
-            || Passage.ControlPoints.Num() < 2
-            || Passage.ControlRadii.Num() != Passage.ControlPoints.Num()
-            || Passage.NativeFloorProfileZ.Num() != Passage.ControlPoints.Num())
+            || ControlPointCount < 2
+            || Passage.ControlRadii.Num() != ControlPointCount
+            || Passage.NativeFloorProfileZ.Num() != ControlPointCount)
         {
             return false;
         }
 
+        const FVector* ControlPointData = Passage.ControlPoints.GetData();
+        const float* ControlRadiusData = Passage.ControlRadii.GetData();
+        const float* NativeFloorProfileData = Passage.NativeFloorProfileZ.GetData();
+        const double QueryX = static_cast<double>(static_cast<float>(Position.X));
+        const double QueryY = static_cast<double>(static_cast<float>(Position.Y));
         float BestDistanceSquared = FLT_MAX;
         int32 BestSegment = INDEX_NONE;
         float BestT = 0.0f;
         float BestSupportRadius = 0.0f;
         for (int32 SegmentIndex = 0;
-             SegmentIndex + 1 < Passage.ControlPoints.Num();
+             SegmentIndex + 1 < ControlPointCount;
              ++SegmentIndex)
         {
-            const FVector& A = Passage.ControlPoints[SegmentIndex];
-            const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
-            const FVector2D Delta(
-                static_cast<float>(B.X - A.X),
-                static_cast<float>(B.Y - A.Y));
-            const float LengthSquared = Delta.SizeSquared();
+            const FVector& A = ControlPointData[SegmentIndex];
+            const FVector& B = ControlPointData[SegmentIndex + 1];
+            const double AXY_X = static_cast<double>(static_cast<float>(A.X));
+            const double AXY_Y = static_cast<double>(static_cast<float>(A.Y));
+            const double DeltaX = static_cast<double>(static_cast<float>(B.X - A.X));
+            const double DeltaY = static_cast<double>(static_cast<float>(B.Y - A.Y));
+            const float LengthSquared = static_cast<float>(
+                DeltaX * DeltaX + DeltaY * DeltaY);
             if (!(LengthSquared > KINDA_SMALL_NUMBER))
             {
                 continue;
             }
 
-            const FVector2D QueryXY(
-                static_cast<float>(Position.X),
-                static_cast<float>(Position.Y));
-            const FVector2D AXY(
-                static_cast<float>(A.X), static_cast<float>(A.Y));
+            const double Dot = (QueryX - AXY_X) * DeltaX
+                + (QueryY - AXY_Y) * DeltaY;
             const float T = FMath::Clamp(
-                FVector2D::DotProduct(QueryXY - AXY, Delta) / LengthSquared,
+                Dot / LengthSquared,
                 0.0f, 1.0f);
-            const FVector2D ClosestXY = AXY + Delta * T;
-            const float DistanceSquared = (QueryXY - ClosestXY).SizeSquared();
+            const double ClosestX = AXY_X + DeltaX * T;
+            const double ClosestY = AXY_Y + DeltaY * T;
+            const double DistanceX = QueryX - ClosestX;
+            const double DistanceY = QueryY - ClosestY;
+            const float DistanceSquared = static_cast<float>(
+                DistanceX * DistanceX + DistanceY * DistanceY);
             if (DistanceSquared >= BestDistanceSquared)
             {
                 continue;
@@ -478,8 +596,8 @@ namespace
             BestT = T;
             BestSupportRadius = FMath::Max(
                 FMath::Min(
-                    FMath::Abs(Passage.ControlRadii[SegmentIndex]),
-                    FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
+                    FMath::Abs(ControlRadiusData[SegmentIndex]),
+                    FMath::Abs(ControlRadiusData[SegmentIndex + 1])) - 0.5f,
                 VoxelPassageGeometry::PlayerRadiusVoxels);
         }
 
@@ -491,21 +609,25 @@ namespace
 
         const float ClampedT = FMath::Clamp(BestT, 0.0f, 1.0f);
         OutFloorZ = FMath::Lerp(
-            Passage.NativeFloorProfileZ[BestSegment],
-            Passage.NativeFloorProfileZ[BestSegment + 1],
+            NativeFloorProfileData[BestSegment],
+            NativeFloorProfileData[BestSegment + 1],
             ClampedT);
 
         float ReliefScale = 0.0f;
-        if (Passage.NativeFloorReliefScales.IsValidIndex(BestSegment))
+        const int32 ReliefScaleCount = Passage.NativeFloorReliefScales.Num();
+        if (BestSegment >= 0 && BestSegment < ReliefScaleCount)
         {
-            ReliefScale = Passage.NativeFloorReliefScales[BestSegment];
+            ReliefScale = Passage.NativeFloorReliefScales.GetData()[BestSegment];
         }
         float Envelope = 1.0f;
-        const float HorizontalRun = FVector2D(
-            static_cast<float>(Passage.ControlPoints[BestSegment + 1].X
-                - Passage.ControlPoints[BestSegment].X),
-            static_cast<float>(Passage.ControlPoints[BestSegment + 1].Y
-                - Passage.ControlPoints[BestSegment].Y)).Size();
+        const FVector& BestA = ControlPointData[BestSegment];
+        const FVector& BestB = ControlPointData[BestSegment + 1];
+        const double BestDeltaX = static_cast<double>(static_cast<float>(
+            BestB.X - BestA.X));
+        const double BestDeltaY = static_cast<double>(static_cast<float>(
+            BestB.Y - BestA.Y));
+        const float HorizontalRun = static_cast<float>(FMath::Sqrt(
+            BestDeltaX * BestDeltaX + BestDeltaY * BestDeltaY));
         if (BestSegment == 0)
         {
             Envelope *= SmoothStep01(FMath::Clamp(
@@ -513,7 +635,7 @@ namespace
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
-        if (BestSegment + 1 == Passage.ControlPoints.Num() - 1)
+        if (BestSegment + 1 == ControlPointCount - 1)
         {
             Envelope *= SmoothStep01(FMath::Clamp(
                 ((1.0f - ClampedT) * HorizontalRun)
@@ -531,25 +653,82 @@ namespace
             && OutSupportRadius > 0.0f;
     }
 
+    static bool VF_ProjectNativePassageFloor(
+        const FVoxelPassage& Passage, const FVector& Position,
+        float& OutFloorZ, float& OutSupportRadius,
+        const UVoxelStrateManager* Manager = nullptr,
+        int32 PassageIndex = INDEX_NONE)
+    {
+        FPassageFloorProjectionCacheEntry* Entry =
+            VF_GetPassageFloorProjectionCacheEntry(Manager, Position, PassageIndex);
+        if (Entry == nullptr)
+        {
+            return VF_ProjectNativePassageFloorUncached(
+                Passage, Position, OutFloorZ, OutSupportRadius,
+                Manager, PassageIndex);
+        }
+        if (!Entry->Has(FPassageFloorProjectionCacheEntry::NativeComputed))
+        {
+            Entry->bNativeValid = VF_ProjectNativePassageFloorUncached(
+                Passage, Position, Entry->NativeFloorZ,
+                Entry->NativeSupportRadius, Manager, PassageIndex);
+            Entry->SetComputed(FPassageFloorProjectionCacheEntry::NativeComputed);
+        }
+        if (Entry->bNativeValid)
+        {
+            OutFloorZ = Entry->NativeFloorZ;
+            OutSupportRadius = Entry->NativeSupportRadius;
+        }
+        return Entry->bNativeValid;
+    }
+
     static bool VF_ProjectPassageFloor(
         const FVoxelPassage& Passage, const FVector& Position,
         float& OutFloorZ, float& OutSupportRadius,
         const UVoxelStrateManager* Manager = nullptr,
         int32 PassageIndex = INDEX_NONE)
     {
-        if (VF_ProjectNativePassageFloor(
-                Passage, Position, OutFloorZ, OutSupportRadius,
-                Manager, PassageIndex))
+        FPassageFloorProjectionCacheEntry* Entry =
+            VF_GetPassageFloorProjectionCacheEntry(Manager, Position, PassageIndex);
+        if (Entry != nullptr
+            && Entry->Has(FPassageFloorProjectionCacheEntry::GenericComputed))
         {
-            return true;
+            if (Entry->bGenericValid)
+            {
+                OutFloorZ = Entry->GenericFloorZ;
+                OutSupportRadius = Entry->GenericSupportRadius;
+            }
+            return Entry->bGenericValid;
         }
-        if (!Passage.bWalkableTunnelContract)
+
+        float FloorZ = 0.0f;
+        float SupportRadius = 0.0f;
+        bool bValid = VF_ProjectNativePassageFloor(
+            Passage, Position, FloorZ, SupportRadius,
+            Manager, PassageIndex);
+        if (!bValid && Passage.bWalkableTunnelContract)
         {
-            return false;
+            bValid = VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+                Passage.ControlPoints, Passage.ControlRadii, Position,
+                FloorZ, SupportRadius);
         }
-        return VoxelPassageGeometry::ProjectWalkableTunnelFloor(
-            Passage.ControlPoints, Passage.ControlRadii, Position,
-            OutFloorZ, OutSupportRadius);
+
+        if (Entry != nullptr)
+        {
+            Entry->bGenericValid = bValid;
+            if (bValid)
+            {
+                Entry->GenericFloorZ = FloorZ;
+                Entry->GenericSupportRadius = SupportRadius;
+            }
+            Entry->SetComputed(FPassageFloorProjectionCacheEntry::GenericComputed);
+        }
+        if (bValid)
+        {
+            OutFloorZ = FloorZ;
+            OutSupportRadius = SupportRadius;
+        }
+        return bValid;
     }
 }
 
@@ -700,13 +879,34 @@ static bool VF_IsWalkableTunnelAir(
     const FVoxelPassage& Passage,
     const FVector& Position,
     const UVoxelStrateManager* Manager = nullptr,
-    int32 PassageIndex = INDEX_NONE)
+    int32 PassageIndex = INDEX_NONE,
+    float* OutFloorZ = nullptr,
+    float* OutSupportRadius = nullptr)
 {
     if (!Passage.bWalkableTunnelContract
         || Passage.ControlPoints.Num() < 2
         || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
     {
         return false;
+    }
+
+    FPassageFloorProjectionCacheEntry* Entry =
+        VF_GetPassageFloorProjectionCacheEntry(Manager, Position, PassageIndex);
+    if (Entry != nullptr
+        && Entry->Has(FPassageFloorProjectionCacheEntry::WalkableAirComputed))
+    {
+        if (Entry->bWalkableAir)
+        {
+            if (OutFloorZ != nullptr)
+            {
+                *OutFloorZ = Entry->GenericFloorZ;
+            }
+            if (OutSupportRadius != nullptr)
+            {
+                *OutSupportRadius = Entry->GenericSupportRadius;
+            }
+        }
+        return Entry->bWalkableAir;
     }
 
     float FloorZ = 0.0f;
@@ -722,9 +922,26 @@ static bool VF_IsWalkableTunnelAir(
     // stable air volume even when a source archetype or a disturbance would otherwise refill the
     // shallow part of the rounded SDF.  The floor writer below owns the closed lower face.
     const float AirHeight = 2.0f * SupportRadius;
-    return Position.Z > FloorZ
+    const bool bWalkableAir = Position.Z > FloorZ
         + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels
         && Position.Z < FloorZ + AirHeight - KINDA_SMALL_NUMBER;
+    if (Entry != nullptr)
+    {
+        Entry->bWalkableAir = bWalkableAir;
+        Entry->SetComputed(FPassageFloorProjectionCacheEntry::WalkableAirComputed);
+    }
+    if (bWalkableAir)
+    {
+        if (OutFloorZ != nullptr)
+        {
+            *OutFloorZ = FloorZ;
+        }
+        if (OutSupportRadius != nullptr)
+        {
+            *OutSupportRadius = SupportRadius;
+        }
+    }
+    return bWalkableAir;
 }
 
 static bool VF_FindWalkableTunnelAir(
@@ -748,21 +965,21 @@ static bool VF_FindWalkableTunnelAir(
         FMath::FloorToInt(Position.Z / (float)CHUNK_SIZE));
     const TArray<int32>& Nearby = VF_GetNearbyPassages(Manager, ChunkCoord);
     const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+    const FVoxelPassage* PassageData = Passages.GetData();
     for (const int32 PassageIndex : Nearby)
     {
         if (!Passages.IsValidIndex(PassageIndex))
         {
             continue;
         }
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq
-            || !VF_IsWalkableTunnelAir(Passage, Position, Manager, PassageIndex))
+            || !VF_IsWalkableTunnelAir(
+                Passage, Position, Manager, PassageIndex,
+                &OutFloorZ, &OutSupportRadius))
         {
             continue;
         }
-        VF_ProjectPassageFloor(
-            Passage, Position, OutFloorZ, OutSupportRadius,
-            Manager, PassageIndex);
         OutPassageIndex = PassageIndex;
         return true;
     }
@@ -783,13 +1000,14 @@ static bool VF_IsAnyPassageFloorAt(
         FMath::FloorToInt(Position.Z / (float)CHUNK_SIZE));
     const TArray<int32>& Nearby = VF_GetNearbyPassages(Manager, ChunkCoord);
     const TArray<FVoxelPassage>& Passages = Manager->GetPassages();
+    const FVoxelPassage* PassageData = Passages.GetData();
     for (const int32 PassageIndex : Nearby)
     {
         if (!Passages.IsValidIndex(PassageIndex))
         {
             continue;
         }
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
@@ -2242,6 +2460,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
 
     float MinSDF = FLT_MAX;
     const float BlendK = 3.0f;  // Smooth blend for passage junctions
+    const FVoxelPassage* PassageData = Passages.GetData();
 
     //=========================================================================
     // PASSAGES — tapered capsule chains between strates (per-strate PassageConfig).
@@ -2251,7 +2470,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     const FVector Pos(WorldX, WorldY, WorldZ);
     for (int32 PIdx : Nearby)
     {
-        const FVoxelPassage& P = Passages[PIdx];
+        const FVoxelPassage& P = PassageData[PIdx];
         // BOUNDING-SPHERE REJECT: skip passages this voxel can't possibly be inside.
         // EvaluateModifierSDF runs PER VOXEL and used to evaluate every passage's full
         // capsule chain unconditionally — the dominant lag source once passages became
@@ -2263,19 +2482,22 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
                 VoxelDensityProfile::ECounter::PassageEvaluated);
         }
 
-        if (P.ControlPoints.Num() >= 2)
+        const int32 ControlPointCount = P.ControlPoints.Num();
+        if (ControlPointCount >= 2)
         {
             // Tapered capsule chain along the control points. ControlRadii (if present)
             // gives the per-point width so the tunnel can flare at the mouths and pinch
             // in the middle; otherwise the uniform Radius is used.
             const bool bTaper = (P.ControlRadii.Num() == P.ControlPoints.Num());
+            const FVector* ControlPointData = P.ControlPoints.GetData();
+            const float* ControlRadiusData = P.ControlRadii.GetData();
             float PassageSDF = FLT_MAX;
-            for (int32 j = 0; j < P.ControlPoints.Num() - 1; j++)
+            for (int32 j = 0; j < ControlPointCount - 1; j++)
             {
-                const float rA = bTaper ? P.ControlRadii[j]     : P.Radius;
-                const float rB = bTaper ? P.ControlRadii[j + 1] : P.Radius;
+                const float rA = bTaper ? ControlRadiusData[j]     : P.Radius;
+                const float rB = bTaper ? ControlRadiusData[j + 1] : P.Radius;
                 const float SegSDF = VoxelSDF::TaperedCapsule(
-                    Pos, P.ControlPoints[j], P.ControlPoints[j + 1], rA, rB);
+                    Pos, ControlPointData[j], ControlPointData[j + 1], rA, rB);
                 PassageSDF = VoxelSDF::SmoothMin(PassageSDF, SegSDF, BlendK);
             }
 
@@ -2334,10 +2556,11 @@ void UVoxelStrateManager::ApplyPassageModifier(
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     for (const int32 PassageIndex : Nearby)
     {
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
             || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
@@ -2386,6 +2609,7 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
     if (Nearby.Num() == 0) return;
 
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     // A smooth room blend may overlap the end of a ramp.  The analytic support plane owns that
     // overlap; otherwise landing air can erase the tunnel's final-density floor after the tunnel
@@ -2397,7 +2621,7 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     float MinLandingSDF = FLT_MAX;
     for (const int32 PassageIndex : Nearby)
     {
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (FVector::DistSquared(Position, Passage.BoundCenter) > Passage.BoundRadiusSq)
         {
             continue;
@@ -2477,10 +2701,11 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     for (const int32 PassageIndex : Nearby)
     {
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
@@ -2529,6 +2754,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
     if (Nearby.Num() == 0) return;
 
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     const bool bSuppressFloor =
         VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
@@ -2544,7 +2770,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     for (const int32 PassageIndex : Nearby)
     {
         if (!Passages.IsValidIndex(PassageIndex)) continue;
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
 
         const bool bTunnelSupportFloor =
             bPassageSupportFloorWritesEnabled
@@ -2640,6 +2866,7 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
         return;
     }
 
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     for (const int32 PassageIndex : Nearby)
     {
@@ -2647,7 +2874,7 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
         {
             continue;
         }
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (!Passage.bNativeFloorEnabled)
         {
             continue;
@@ -2689,10 +2916,11 @@ void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE));
     const TArray<int32>& Nearby = VF_GetNearbyPassages(this, ChunkCoord);
+    const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
     for (const int32 PassageIndex : Nearby)
     {
-        const FVoxelPassage& Passage = Passages[PassageIndex];
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
         if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
             && (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageRoomFloor(Position, Passage.LowerLanding)))

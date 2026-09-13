@@ -206,8 +206,12 @@ private:
 // uphill). See SurfaceDensityFromColumn for the warped-terrain union that makes the shelf.
 struct FSurfaceColumn
 {
-    float TerrainZ = 0.0f; float CeilSurf = 0.0f;
-    float OverhangAmp = 0.0f; float DirX = 0.0f; float DirY = 0.0f;
+    // Toutes les sorties sont écrites par ComputeSurfaceColumn avant Computed=true ; les valeurs
+    // par défaut ne sont donc jamais lues et leur constructeur implicite coûte dans le TLS.
+    // Every output is written by ComputeSurfaceColumn before Computed=true; the defaults are never
+    // read, and removing them keeps FSurfaceColumn trivial so TLS construction has no leaf work.
+    float TerrainZ, CeilSurf;
+    float OverhangAmp, DirX, DirY;
 };
 
 struct FSurfaceColumnBox
@@ -2355,7 +2359,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             Result = GetMazeDensity(WorldX, WorldY, WorldZ, CP_Maze);                 break;
         case ECaveGeneratorType::SurfaceWorld:
         {
-            FSurfaceColumn Col;
             // Integer XY (the density grid) → reuse the column down its whole Z extent (T1.a).
             // Fractional XY (gradient-normal samples) → compute directly (no cache key).
             if (WorldX == FMath::FloorToFloat(WorldX) && WorldY == FMath::FloorToFloat(WorldY))
@@ -2373,17 +2376,20 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                         Box.Cols[CI].OverhangAmp, Box.Cols[CI].DirX, Box.Cols[CI].DirY);
                     Box.Computed[CI] = true;
                 }
-                Col = Box.Cols[CI];
+                const FSurfaceColumn& Col = Box.Cols[CI];
+                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
+                    Col.TerrainZ, Col.CeilSurf, Col.OverhangAmp,
+                    Col.DirX, Col.DirY, CP_Surface);
             }
             else
             {
+                float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY;
                 ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                    CP_SurfaceBiomeParams, CP_BiomeCache, Col.TerrainZ, Col.CeilSurf,
-                    Col.OverhangAmp, Col.DirX, Col.DirY);
+                    CP_SurfaceBiomeParams, CP_BiomeCache, TerrainZ, CeilSurf,
+                    OverhangAmp, DirX, DirY);
+                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
+                    TerrainZ, CeilSurf, OverhangAmp, DirX, DirY, CP_Surface);
             }
-
-            Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
-                Col.TerrainZ, Col.CeilSurf, Col.OverhangAmp, Col.DirX, Col.DirY, CP_Surface);
             break;
         }
         case ECaveGeneratorType::VerticalShafts:

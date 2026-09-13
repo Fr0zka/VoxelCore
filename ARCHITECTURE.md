@@ -492,6 +492,13 @@ shape draws for inter-strate passages are keyed by `(seed, upper-strate index, c
 per-value salt)` through `VoxelHash`, so one passage's connection count cannot shift any later
 passage. Global passage settings were removed from `VoxelSettings`.
 
+The repeated floor queries use the same `thread_local` passage state: `FPassageEvaluationCache` owns
+one indexed `FloorProjections` entry per passage, keyed by exact double `(X,Y,Z)` equality for the
+current sample. Native projection, generic fallback projection, and walkable-air classification
+reuse the cached float outputs and validity bits; manager lifetime, layout version, and chunk changes
+invalidate the cache. `voxel.FloorRound1PassageProjectionCache` is an A/B switch only. It changes no
+projection arithmetic and no density value; a cache hit is an exact reuse of the first result.
+
 After each passage's XY is selected, `GeneratePassages` asks **both** participating strates for a
 player-fit source point through the pure free function `VF_SuggestLandingPoint`
 (`VoxelCaveMorphology`).
@@ -674,6 +681,17 @@ driven by `EditorBrush*` props.
   **Used ONLY for integer-XY queries**; fractional queries compute directly → bit-identical. Don't
   re-introduce a ChunkZ key, don't feed it fractional coords. (`GetSurfaceHeightAt`'s own `OC_*` oracle
   cache is separate and still per-chunk — lower volume, not worth the LRU.)
+- **Surface-column construction (field-preserving follow-up)**: `FSurfaceColumn` is intentionally a
+  trivial payload. `ComputeSurfaceColumn` writes all five outputs before publishing `Computed`, so
+  its default member initialization was never observable; removing that generated TLS leaf avoids
+  constructor work without changing a height or density. Integer queries still read the cached
+  payload, and fractional queries still use the same direct locals.
+- **Sampler unknown-source audit**: the earlier plugin-side `FSurfaceColumn` constructor PCs no longer
+  occur after the trivial-payload change. The largest remaining LOD0 unknown cluster in the final
+  sampler raw CSV is `UnrealEditor-Core.dll + RVA 0xC080` (runtime PCs around
+  `0x7FF88382C080`), inside the private `.pdata` function range `0xB4D0–0xC32B`; the packaged Core
+  binary has no PDB, so a source function name cannot be recovered here. Smaller unresolved groups
+  map to generated engine reflection/CoreUObject code, not to `Plugins\VoxelForge`.
 - **Collision only at LOD0 (T1.c)** (`ApplyMeshToChunk`): `UpdateSectionConfig(..., LOD==0)`.
   LOD1/2 chunks are unreachable (the §8.10 reconciliation hot-swaps to LOD0 before the player
   arrives), so cooking their Chaos collision is waste. Don't force collision on for all LODs.
