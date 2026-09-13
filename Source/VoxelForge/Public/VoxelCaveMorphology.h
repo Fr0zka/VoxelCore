@@ -814,6 +814,71 @@ struct FCachedColumn
     float BoundXYRadiusSq;
 };
 
+// Build-site attribution is diagnostic only. It is deliberately passed to BuildChunkCache
+// rather than inferred from the caller's stack so the game report can separate the generator,
+// ordinary op-source, shared op-source, and classifier fallback windows without changing the
+// cache key or the generated field.
+enum class ERoomGraphBuildSite : uint8
+{
+    Unknown,
+    GeneratorTile,
+    GeneratorTunnelCore,
+    OpShared,
+    OpLocal,
+    ClassifierShared,
+    ClassifierLocal,
+};
+
+// Immutable XY broad phase for one cached primitive array.  Each bucket stores source-array
+// indices in ascending order, so switching from a full scan to a bucket scan cannot change the
+// order of SmoothMin/Min reductions or the selected nearest-room owner.  Invalid/oversized
+// bounds leave bValid false and callers deliberately fall back to the exact full scan.
+struct FChunkSDFSpatialIndex
+{
+    int32 MinChunkX = 0;
+    int32 MinChunkY = 0;
+    int32 NumCellsX = 0;
+    int32 NumCellsY = 0;
+    bool bValid = false;
+    TArray<int32> CellOffsets;
+    TArray<int32> ItemIndices;
+
+    void Reset();
+    void Release();
+    SIZE_T GetAllocatedSize() const;
+    bool GetRange(float WorldX, float WorldY, int32& OutBegin, int32& OutEnd) const;
+};
+
+template <typename FVisit>
+FORCEINLINE int32 VF_ForEachChunkSDFSpatialCandidate(
+    const FChunkSDFSpatialIndex& Index, int32 ItemCount,
+    float WorldX, float WorldY, FVisit&& Visit)
+{
+    int32 Begin = 0;
+    int32 End = 0;
+    int32 CandidateCount = 0;
+    if (Index.GetRange(WorldX, WorldY, Begin, End))
+    {
+        for (int32 Cursor = Begin; Cursor < End; ++Cursor)
+        {
+            const int32 ItemIndex = Index.ItemIndices[Cursor];
+            if (ItemIndex >= 0 && ItemIndex < ItemCount)
+            {
+                ++CandidateCount;
+                Visit(ItemIndex);
+            }
+        }
+        return CandidateCount;
+    }
+
+    for (int32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+    {
+        ++CandidateCount;
+        Visit(ItemIndex);
+    }
+    return CandidateCount;
+}
+
 // The complete SDF cache for a chunk region.
 // Built once per chunk by BuildChunkCache(), then passed to EvaluateSDFCached()
 // for every voxel in the chunk. Typically contains 5-15 rooms and 10-30 tunnels.
@@ -825,6 +890,15 @@ struct FChunkSDFCache
     TArray<FCachedPit>     Pits;
     TArray<FCachedChimney> Chimneys;
     TArray<FCachedColumn>  Columns;
+
+    // Per-primitive XY filters.  The bounds are conservative unions of every exact evaluator
+    // broad phase, so a failed index build is a performance fallback, never a density fallback.
+    FChunkSDFSpatialIndex RoomSpatialIndex;
+    FChunkSDFSpatialIndex RoomFloorJoinSpatialIndex;
+    FChunkSDFSpatialIndex TunnelSpatialIndex;
+    FChunkSDFSpatialIndex PitSpatialIndex;
+    FChunkSDFSpatialIndex ChimneySpatialIndex;
+    FChunkSDFSpatialIndex ColumnSpatialIndex;
 
     // Sparse immutable support-column table. SupportColumnEntries is a dense
     // integer-XY slot map whose values index only non-empty SupportColumns.
@@ -919,7 +993,8 @@ namespace VoxelCaveMorphology
         float SearchMaxX, float SearchMaxY,
         const FStrateGenerationParams& Params,
         uint32 Seed, int32 StrateIndex,
-        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr
+        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr,
+        ERoomGraphBuildSite BuildSite = ERoomGraphBuildSite::Unknown
     );
 
     // Conservative, geometry-free preflight for BuildChunkCache. It recreates
@@ -934,6 +1009,13 @@ namespace VoxelCaveMorphology
         uint32 Seed, int32 StrateIndex,
         bool bUseZ = false,
         float SearchMinZ = 0.0f, float SearchMaxZ = 0.0f
+    );
+
+    // True only for the finite parameter envelope for which BuildChunkCache's fixed collect
+    // margin proves window invariance. Callers may widen the XY store window to a whole tile only
+    // when this returns true; malformed or unbounded authored input must retain the legacy path.
+    VOXELFORGE_API bool IsRoomGraphWindowInvariant(
+        const FStrateGenerationParams& Params
     );
 
     // PHASE 2: Evaluate the SDF at a single world position using cached data.

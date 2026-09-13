@@ -644,6 +644,13 @@ namespace VoxelDensityProfile
         case ECounter::TunnelCacheHit:    return TEXT("TunnelCacheHit");
         case ECounter::TunnelCacheMiss:   return TEXT("TunnelCacheMiss");
         case ECounter::SdfCacheBuild:     return TEXT("SdfCacheBuild");
+        case ECounter::RoomGraphBuildGeneratorTile: return TEXT("RoomGraphBuildGeneratorTile");
+        case ECounter::RoomGraphBuildGeneratorTunnelCore: return TEXT("RoomGraphBuildGeneratorTunnelCore");
+        case ECounter::RoomGraphBuildOpShared: return TEXT("RoomGraphBuildOpShared");
+        case ECounter::RoomGraphBuildOpLocal: return TEXT("RoomGraphBuildOpLocal");
+        case ECounter::RoomGraphBuildClassifierShared: return TEXT("RoomGraphBuildClassifierShared");
+        case ECounter::RoomGraphBuildClassifierLocal: return TEXT("RoomGraphBuildClassifierLocal");
+        case ECounter::RoomGraphBuildUnknown: return TEXT("RoomGraphBuildUnknown");
         case ECounter::CaveRoomCandidates:return TEXT("CaveRoomCandidates");
         case ECounter::CaveRoomEvaluated: return TEXT("CaveRoomEvaluated");
         case ECounter::CaveTunnelCandidates:return TEXT("CaveTunnelCandidates");

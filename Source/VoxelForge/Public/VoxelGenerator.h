@@ -53,10 +53,19 @@ namespace VoxelGenLOD
     // read-only hint for caches that may safely widen their spatial window for coarse tiles.
     extern thread_local int32 SampleStep;
 
+    // Exact lattice footprint of the tile currently being meshed.  The cache-window switch
+    // uses this rather than inferring a region from an individual sample coordinate, so every
+    // sample in one tile shares one deterministic window even at tile/chunk boundaries.
+    extern thread_local FIntVector TileOriginVoxels;
+    extern thread_local int32 TileCellsPerAxis;
+
     VOXELFORGE_API int32 GetThreadOctaveBias();
     VOXELFORGE_API void SetThreadOctaveBias(int32 Value);
     VOXELFORGE_API int32 GetThreadSampleStep();
     VOXELFORGE_API void SetThreadSampleStep(int32 Value);
+    VOXELFORGE_API bool IsTileCacheWindowEnabled();
+    VOXELFORGE_API bool GetThreadTileCacheWindow(
+        FIntVector& OutOriginVoxels, int32& OutStep, int32& OutCellsPerAxis);
 
     // Effective octave count for a per-voxel noise call site.
     // At least 1 octave always survives (the coarse base shape).

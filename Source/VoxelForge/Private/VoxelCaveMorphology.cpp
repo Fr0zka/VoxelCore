@@ -1263,6 +1263,394 @@ namespace
 
 }
 
+void FChunkSDFSpatialIndex::Reset()
+{
+    MinChunkX = 0;
+    MinChunkY = 0;
+    NumCellsX = 0;
+    NumCellsY = 0;
+    bValid = false;
+    CellOffsets.Reset();
+    ItemIndices.Reset();
+}
+
+void FChunkSDFSpatialIndex::Release()
+{
+    MinChunkX = 0;
+    MinChunkY = 0;
+    NumCellsX = 0;
+    NumCellsY = 0;
+    bValid = false;
+    CellOffsets.Empty();
+    ItemIndices.Empty();
+}
+
+SIZE_T FChunkSDFSpatialIndex::GetAllocatedSize() const
+{
+    return static_cast<SIZE_T>(CellOffsets.GetAllocatedSize())
+        + static_cast<SIZE_T>(ItemIndices.GetAllocatedSize());
+}
+
+bool FChunkSDFSpatialIndex::GetRange(
+    float WorldX, float WorldY, int32& OutBegin, int32& OutEnd) const
+{
+    OutBegin = 0;
+    OutEnd = 0;
+    if (!bValid
+        || !FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY)
+        || NumCellsX <= 0 || NumCellsY <= 0)
+    {
+        return false;
+    }
+
+    const double ChunkXDouble = FMath::FloorToDouble(
+        static_cast<double>(WorldX) / static_cast<double>(CHUNK_SIZE));
+    const double ChunkYDouble = FMath::FloorToDouble(
+        static_cast<double>(WorldY) / static_cast<double>(CHUNK_SIZE));
+    if (ChunkXDouble < static_cast<double>(MIN_int32)
+        || ChunkXDouble > static_cast<double>(MAX_int32)
+        || ChunkYDouble < static_cast<double>(MIN_int32)
+        || ChunkYDouble > static_cast<double>(MAX_int32))
+    {
+        return false;
+    }
+
+    const int64 LocalX = static_cast<int64>(ChunkXDouble) - static_cast<int64>(MinChunkX);
+    const int64 LocalY = static_cast<int64>(ChunkYDouble) - static_cast<int64>(MinChunkY);
+    if (LocalX < 0 || LocalX >= static_cast<int64>(NumCellsX)
+        || LocalY < 0 || LocalY >= static_cast<int64>(NumCellsY))
+    {
+        // A point outside the indexed rectangle is uncommon for the requesting tile, but the
+        // exact fallback is safer than assuming the index covers a malformed/legacy query.
+        return false;
+    }
+
+    const int64 Slot = LocalY * static_cast<int64>(NumCellsX) + LocalX;
+    if (Slot < 0 || Slot + 1 >= static_cast<int64>(CellOffsets.Num()))
+    {
+        return false;
+    }
+
+    OutBegin = CellOffsets[static_cast<int32>(Slot)];
+    OutEnd = CellOffsets[static_cast<int32>(Slot + 1)];
+    return OutBegin >= 0 && OutEnd >= OutBegin && OutEnd <= ItemIndices.Num();
+}
+
+namespace
+{
+    struct FVFSpatialBounds
+    {
+        float MinX = 0.0f;
+        float MinY = 0.0f;
+        float MaxX = 0.0f;
+        float MaxY = 0.0f;
+    };
+
+    static bool VF_SetSpatialBounds(
+        float CenterX, float CenterY, float Radius, FVFSpatialBounds& OutBounds)
+    {
+        if (!FMath::IsFinite(CenterX) || !FMath::IsFinite(CenterY)
+            || !FMath::IsFinite(Radius) || Radius < 0.0f)
+        {
+            return false;
+        }
+        OutBounds.MinX = CenterX - Radius;
+        OutBounds.MinY = CenterY - Radius;
+        OutBounds.MaxX = CenterX + Radius;
+        OutBounds.MaxY = CenterY + Radius;
+        return FMath::IsFinite(OutBounds.MinX) && FMath::IsFinite(OutBounds.MinY)
+            && FMath::IsFinite(OutBounds.MaxX) && FMath::IsFinite(OutBounds.MaxY)
+            && OutBounds.MinX <= OutBounds.MaxX && OutBounds.MinY <= OutBounds.MaxY;
+    }
+
+    static bool VF_SetSpatialAabb(
+        float MinX, float MinY, float MaxX, float MaxY,
+        float Radius, FVFSpatialBounds& OutBounds)
+    {
+        if (!FMath::IsFinite(MinX) || !FMath::IsFinite(MinY)
+            || !FMath::IsFinite(MaxX) || !FMath::IsFinite(MaxY)
+            || !FMath::IsFinite(Radius) || Radius < 0.0f
+            || MinX > MaxX || MinY > MaxY)
+        {
+            return false;
+        }
+        OutBounds.MinX = MinX - Radius;
+        OutBounds.MinY = MinY - Radius;
+        OutBounds.MaxX = MaxX + Radius;
+        OutBounds.MaxY = MaxY + Radius;
+        return FMath::IsFinite(OutBounds.MinX) && FMath::IsFinite(OutBounds.MinY)
+            && FMath::IsFinite(OutBounds.MaxX) && FMath::IsFinite(OutBounds.MaxY)
+            && OutBounds.MinX <= OutBounds.MaxX && OutBounds.MinY <= OutBounds.MaxY;
+    }
+
+    static bool VF_IncludeSpatialBounds(
+        FVFSpatialBounds& InOut, const FVFSpatialBounds& Other, bool& bHasBounds)
+    {
+        if (!bHasBounds)
+        {
+            InOut = Other;
+            bHasBounds = true;
+            return true;
+        }
+        InOut.MinX = FMath::Min(InOut.MinX, Other.MinX);
+        InOut.MinY = FMath::Min(InOut.MinY, Other.MinY);
+        InOut.MaxX = FMath::Max(InOut.MaxX, Other.MaxX);
+        InOut.MaxY = FMath::Max(InOut.MaxY, Other.MaxY);
+        return true;
+    }
+
+    template <typename FGetBounds>
+    static void VF_BuildSpatialIndex(
+        FChunkSDFSpatialIndex& OutIndex, int32 ItemCount, FGetBounds&& GetBounds)
+    {
+        OutIndex.Reset();
+        if (ItemCount <= 0)
+        {
+            return;
+        }
+
+        // Never turn a malformed authored bound into a giant allocation.  A failed build is
+        // deliberately indistinguishable from the old path to the density evaluator.
+        constexpr int64 MaxBuckets = 1024 * 1024;
+        constexpr int64 MaxReferences = 4 * 1024 * 1024;
+        TArray<int32> ItemMinX;
+        TArray<int32> ItemMinY;
+        TArray<int32> ItemMaxX;
+        TArray<int32> ItemMaxY;
+        ItemMinX.SetNumUninitialized(ItemCount);
+        ItemMinY.SetNumUninitialized(ItemCount);
+        ItemMaxX.SetNumUninitialized(ItemCount);
+        ItemMaxY.SetNumUninitialized(ItemCount);
+
+        FVFSpatialBounds AllBounds;
+        bool bHasBounds = false;
+        int32 GlobalMinX = MAX_int32;
+        int32 GlobalMinY = MAX_int32;
+        int32 GlobalMaxX = MIN_int32;
+        int32 GlobalMaxY = MIN_int32;
+        int64 TotalReferences = 0;
+        for (int32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+        {
+            FVFSpatialBounds Bounds;
+            if (!GetBounds(ItemIndex, Bounds))
+            {
+                return;
+            }
+
+            const double MinChunkXDouble = FMath::FloorToDouble(
+                static_cast<double>(Bounds.MinX) / static_cast<double>(CHUNK_SIZE));
+            const double MinChunkYDouble = FMath::FloorToDouble(
+                static_cast<double>(Bounds.MinY) / static_cast<double>(CHUNK_SIZE));
+            const double MaxChunkXDouble = FMath::FloorToDouble(
+                static_cast<double>(Bounds.MaxX) / static_cast<double>(CHUNK_SIZE));
+            const double MaxChunkYDouble = FMath::FloorToDouble(
+                static_cast<double>(Bounds.MaxY) / static_cast<double>(CHUNK_SIZE));
+            if (MinChunkXDouble < static_cast<double>(MIN_int32)
+                || MinChunkXDouble > static_cast<double>(MAX_int32)
+                || MinChunkYDouble < static_cast<double>(MIN_int32)
+                || MinChunkYDouble > static_cast<double>(MAX_int32)
+                || MaxChunkXDouble < static_cast<double>(MIN_int32)
+                || MaxChunkXDouble > static_cast<double>(MAX_int32)
+                || MaxChunkYDouble < static_cast<double>(MIN_int32)
+                || MaxChunkYDouble > static_cast<double>(MAX_int32))
+            {
+                return;
+            }
+
+            const int32 MinX = static_cast<int32>(MinChunkXDouble);
+            const int32 MinY = static_cast<int32>(MinChunkYDouble);
+            const int32 MaxX = static_cast<int32>(MaxChunkXDouble);
+            const int32 MaxY = static_cast<int32>(MaxChunkYDouble);
+            if (MinX > MaxX || MinY > MaxY)
+            {
+                return;
+            }
+
+            ItemMinX[ItemIndex] = MinX;
+            ItemMinY[ItemIndex] = MinY;
+            ItemMaxX[ItemIndex] = MaxX;
+            ItemMaxY[ItemIndex] = MaxY;
+            GlobalMinX = FMath::Min(GlobalMinX, MinX);
+            GlobalMinY = FMath::Min(GlobalMinY, MinY);
+            GlobalMaxX = FMath::Max(GlobalMaxX, MaxX);
+            GlobalMaxY = FMath::Max(GlobalMaxY, MaxY);
+            TotalReferences += (static_cast<int64>(MaxX) - MinX + 1)
+                * (static_cast<int64>(MaxY) - MinY + 1);
+            if (TotalReferences > MaxReferences)
+            {
+                return;
+            }
+            VF_IncludeSpatialBounds(AllBounds, Bounds, bHasBounds);
+        }
+
+        const int64 NumCellsX64 = static_cast<int64>(GlobalMaxX) - GlobalMinX + 1;
+        const int64 NumCellsY64 = static_cast<int64>(GlobalMaxY) - GlobalMinY + 1;
+        if (!bHasBounds || NumCellsX64 <= 0 || NumCellsY64 <= 0
+            || NumCellsX64 > MAX_int32 || NumCellsY64 > MAX_int32
+            || NumCellsX64 * NumCellsY64 > MaxBuckets)
+        {
+            return;
+        }
+
+        OutIndex.MinChunkX = GlobalMinX;
+        OutIndex.MinChunkY = GlobalMinY;
+        OutIndex.NumCellsX = static_cast<int32>(NumCellsX64);
+        OutIndex.NumCellsY = static_cast<int32>(NumCellsY64);
+        const int64 BucketCount = NumCellsX64 * NumCellsY64;
+        OutIndex.CellOffsets.SetNumZeroed(static_cast<int32>(BucketCount + 1));
+
+        for (int32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+        {
+            for (int32 Y = ItemMinY[ItemIndex]; Y <= ItemMaxY[ItemIndex]; ++Y)
+            {
+                const int64 Row = static_cast<int64>(Y - OutIndex.MinChunkY)
+                    * static_cast<int64>(OutIndex.NumCellsX);
+                for (int32 X = ItemMinX[ItemIndex]; X <= ItemMaxX[ItemIndex]; ++X)
+                {
+                    const int64 Slot = Row + static_cast<int64>(X - OutIndex.MinChunkX);
+                    ++OutIndex.CellOffsets[static_cast<int32>(Slot + 1)];
+                }
+            }
+        }
+        for (int32 Slot = 0; Slot < static_cast<int32>(BucketCount); ++Slot)
+        {
+            OutIndex.CellOffsets[Slot + 1] += OutIndex.CellOffsets[Slot];
+        }
+
+        OutIndex.ItemIndices.SetNumUninitialized(static_cast<int32>(TotalReferences));
+        TArray<int32> WriteOffsets = OutIndex.CellOffsets;
+        for (int32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+        {
+            for (int32 Y = ItemMinY[ItemIndex]; Y <= ItemMaxY[ItemIndex]; ++Y)
+            {
+                const int64 Row = static_cast<int64>(Y - OutIndex.MinChunkY)
+                    * static_cast<int64>(OutIndex.NumCellsX);
+                for (int32 X = ItemMinX[ItemIndex]; X <= ItemMaxX[ItemIndex]; ++X)
+                {
+                    const int64 Slot = Row + static_cast<int64>(X - OutIndex.MinChunkX);
+                    OutIndex.ItemIndices[WriteOffsets[static_cast<int32>(Slot)]++] = ItemIndex;
+                }
+            }
+        }
+        OutIndex.bValid = true;
+    }
+
+    template <typename FVisit>
+    static int32 VF_ForEachSpatialCandidate(
+        const FChunkSDFSpatialIndex& Index, int32 ItemCount,
+        float WorldX, float WorldY, FVisit&& Visit)
+    {
+        int32 Begin = 0;
+        int32 End = 0;
+        int32 CandidateCount = 0;
+        if (Index.GetRange(WorldX, WorldY, Begin, End))
+        {
+            for (int32 Cursor = Begin; Cursor < End; ++Cursor)
+            {
+                const int32 ItemIndex = Index.ItemIndices[Cursor];
+                if (ItemIndex >= 0 && ItemIndex < ItemCount)
+                {
+                    ++CandidateCount;
+                    Visit(ItemIndex);
+                }
+            }
+            return CandidateCount;
+        }
+
+        for (int32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+        {
+            ++CandidateCount;
+            Visit(ItemIndex);
+        }
+        return CandidateCount;
+    }
+
+    static bool VF_GetRoomSpatialBounds(int32, const FCachedRoom& Room, FVFSpatialBounds& OutBounds)
+    {
+        return VF_SetSpatialBounds(
+            static_cast<float>(Room.Center.X), static_cast<float>(Room.Center.Y),
+            FMath::Sqrt(FMath::Max(Room.CullRadiusSq, 0.0f)), OutBounds);
+    }
+
+    static bool VF_GetJoinSpatialBounds(
+        int32, const FCachedRoomFloorJoin& Join, FVFSpatialBounds& OutBounds)
+    {
+        return VF_SetSpatialBounds(
+            static_cast<float>(Join.BoundCenter.X), static_cast<float>(Join.BoundCenter.Y),
+            FMath::Sqrt(FMath::Max(Join.BoundRadiusSq, 0.0f)), OutBounds);
+    }
+
+    static bool VF_GetTunnelSpatialBounds(
+        int32, const FCachedTunnel& Tunnel, FVFSpatialBounds& OutBounds)
+    {
+        bool bHasBounds = false;
+        auto IncludeCenterRadius = [&](float X, float Y, float Radius) -> bool
+        {
+            FVFSpatialBounds Bounds;
+            if (!VF_SetSpatialBounds(X, Y, Radius, Bounds))
+            {
+                return false;
+            }
+            return VF_IncludeSpatialBounds(OutBounds, Bounds, bHasBounds);
+        };
+        auto IncludeAabbRadius = [&](const FVector& Min, const FVector& Max, float Radius) -> bool
+        {
+            FVFSpatialBounds Bounds;
+            if (!VF_SetSpatialAabb(
+                    static_cast<float>(Min.X), static_cast<float>(Min.Y),
+                    static_cast<float>(Max.X), static_cast<float>(Max.Y),
+                    FMath::Max(Radius, 0.0f), Bounds))
+            {
+                return false;
+            }
+            return VF_IncludeSpatialBounds(OutBounds, Bounds, bHasBounds);
+        };
+
+        if (!IncludeCenterRadius(
+                static_cast<float>(Tunnel.BoundCenter.X),
+                static_cast<float>(Tunnel.BoundCenter.Y),
+                FMath::Sqrt(FMath::Max(Tunnel.BoundRadiusSq, 0.0f)))
+            || !IncludeCenterRadius(
+                static_cast<float>(Tunnel.WorldBoundCenter.X),
+                static_cast<float>(Tunnel.WorldBoundCenter.Y),
+                FMath::Sqrt(FMath::Max(Tunnel.WorldBoundRadiusSq, 0.0f)))
+            || !IncludeAabbRadius(
+                Tunnel.SDFCenterlineMin, Tunnel.SDFCenterlineMax,
+                Tunnel.SDFInfluenceRadius)
+            || !IncludeAabbRadius(
+                Tunnel.WorldCenterlineMin, Tunnel.WorldCenterlineMax,
+                Tunnel.WorldInfluenceRadius))
+        {
+            return false;
+        }
+        return bHasBounds;
+    }
+
+    static bool VF_GetPitSpatialBounds(
+        int32, const FCachedPit& Pit, FVFSpatialBounds& OutBounds)
+    {
+        return VF_SetSpatialBounds(
+            Pit.CenterX, Pit.CenterY,
+            FMath::Sqrt(FMath::Max(Pit.BoundXYRadiusSq, 0.0f)), OutBounds);
+    }
+
+    static bool VF_GetChimneySpatialBounds(
+        int32, const FCachedChimney& Chimney, FVFSpatialBounds& OutBounds)
+    {
+        return VF_SetSpatialBounds(
+            Chimney.CenterX, Chimney.CenterY,
+            FMath::Sqrt(FMath::Max(Chimney.BoundXYRadiusSq, 0.0f)), OutBounds);
+    }
+
+    static bool VF_GetColumnSpatialBounds(
+        int32, const FCachedColumn& Column, FVFSpatialBounds& OutBounds)
+    {
+        return VF_SetSpatialBounds(
+            Column.CenterX, Column.CenterY,
+            FMath::Sqrt(FMath::Max(Column.BoundXYRadiusSq, 0.0f)), OutBounds);
+    }
+}
+
 void FChunkSDFCache::Reset()
 {
     // Keep the allocations: classifier windows can alternate between empty and
@@ -1278,6 +1666,12 @@ void FChunkSDFCache::Reset()
     Pits.Reset();
     Chimneys.Reset();
     Columns.Reset();
+    RoomSpatialIndex.Reset();
+    RoomFloorJoinSpatialIndex.Reset();
+    TunnelSpatialIndex.Reset();
+    PitSpatialIndex.Reset();
+    ChimneySpatialIndex.Reset();
+    ColumnSpatialIndex.Reset();
     SupportColumnMinX = 0;
     SupportColumnMinY = 0;
     SupportColumnCellsX = 0;
@@ -1295,6 +1689,12 @@ void FChunkSDFCache::Release()
     Pits.Empty();
     Chimneys.Empty();
     Columns.Empty();
+    RoomSpatialIndex.Release();
+    RoomFloorJoinSpatialIndex.Release();
+    TunnelSpatialIndex.Release();
+    PitSpatialIndex.Release();
+    ChimneySpatialIndex.Release();
+    ColumnSpatialIndex.Release();
     SupportColumnEntries.Empty();
     SupportColumns.Empty();
     SupportColumnMinX = 0;
@@ -1324,6 +1724,13 @@ VoxelDensityProfile::FCacheMemoryBreakdown FChunkSDFCache::GetAllocatedSizeBreak
     Breakdown.ColumnsBytes = ArrayBytes(Columns);
     Breakdown.SupportColumnEntriesBytes = ArrayBytes(SupportColumnEntries);
     Breakdown.SupportColumnsBytes = ArrayBytes(SupportColumns);
+    Breakdown.SpatialIndexBytes = static_cast<uint64>(
+        RoomSpatialIndex.GetAllocatedSize()
+        + RoomFloorJoinSpatialIndex.GetAllocatedSize()
+        + TunnelSpatialIndex.GetAllocatedSize()
+        + PitSpatialIndex.GetAllocatedSize()
+        + ChimneySpatialIndex.GetAllocatedSize()
+        + ColumnSpatialIndex.GetAllocatedSize());
     for (const FTunnelSupportFloorColumn& Column : SupportColumns)
     {
         Breakdown.SupportColumnIntervalsBytes += ArrayBytes(Column.Intervals);
@@ -1485,13 +1892,12 @@ static bool VF_ComputeRoomGraphReach(
             FMath::Abs(Params.TunnelMaxRadius)) * 1.18f);
     const float MaxTunnelLength = FMath::Max(
         Params.MaxTunnelLength, 0.0f);
-    const float MaxInfluence = FMath::Max(
-        RoomRadiusEnvelope + FloorReliefEnvelope,
-        FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope)
-        + BlendEnvelope * 3.0f;
     const float DirectRoomReach = VF_RoomShapeReachUpperBound(
         AllRoomRadiusEnvelope, AllRoomHeightEnvelope)
         + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+    const float TunnelInfluence = FMath::Abs(Params.TunnelWarpStrength)
+        + TunnelRadiusEnvelope + BlendEnvelope * 3.0f;
+    const float MaxInfluence = FMath::Max(DirectRoomReach, TunnelInfluence);
 
     // A fitted tunnel mouth may move by one bounded cave-warp displacement in
     // each XY axis. The chain then wanders by at most 25.5% of its authored
@@ -1532,7 +1938,12 @@ static bool VF_ComputeRoomGraphReach(
         + TunnelLengthBound * 0.255f
         + FMath::Max(MaxInfluence, TunnelTubeReach);
     const float PairZReach = EndpointVertical + TunnelTubeReach;
-    const float CollectMargin = 2.0f * MaxTunnelLength + MaxInfluence;
+    // A stored feature can depend on a nearest-neighbour candidate two graph hops away: A's
+    // candidate B can select C, and both decisions affect the edge emitted near the search box.
+    // PairAabbReach is the complete endpoint/chain/tube envelope; using it here closes the old
+    // proof gap where the collect margin only covered the smaller direct influence estimate.
+    const float CollectMargin = 2.0f * MaxTunnelLength
+        + FMath::Max(DirectRoomReach, PairAabbReach);
 
     if (!FMath::IsFinite(DirectRoomReach)
         || !FMath::IsFinite(PairAabbReach)
@@ -1973,6 +2384,43 @@ static void BakeRoomFeature(
             FCachedTunnel& Tunnel = Cache.Tunnels[Index];
             VF_FinalizeTunnelBroadPhaseBounds(Tunnel, BlendK);
         }
+
+        VF_BuildSpatialIndex(
+            Cache.RoomSpatialIndex, Cache.Rooms.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetRoomSpatialBounds(Index, Cache.Rooms[Index], Bounds);
+            });
+        VF_BuildSpatialIndex(
+            Cache.RoomFloorJoinSpatialIndex, Cache.RoomFloorJoins.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetJoinSpatialBounds(Index, Cache.RoomFloorJoins[Index], Bounds);
+            });
+        VF_BuildSpatialIndex(
+            Cache.TunnelSpatialIndex, Cache.Tunnels.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetTunnelSpatialBounds(Index, Cache.Tunnels[Index], Bounds);
+            });
+        VF_BuildSpatialIndex(
+            Cache.PitSpatialIndex, Cache.Pits.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetPitSpatialBounds(Index, Cache.Pits[Index], Bounds);
+            });
+        VF_BuildSpatialIndex(
+            Cache.ChimneySpatialIndex, Cache.Chimneys.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetChimneySpatialBounds(Index, Cache.Chimneys[Index], Bounds);
+            });
+        VF_BuildSpatialIndex(
+            Cache.ColumnSpatialIndex, Cache.Columns.Num(),
+            [&Cache](int32 Index, FVFSpatialBounds& Bounds)
+            {
+                return VF_GetColumnSpatialBounds(Index, Cache.Columns[Index], Bounds);
+            });
     }
 namespace
 {
@@ -5190,6 +5638,13 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
         Params, StrateSeed, Reach, bUseZ, SearchMinZ, SearchMaxZ);
 }
 
+bool VoxelCaveMorphology::IsRoomGraphWindowInvariant(
+    const FStrateGenerationParams& Params)
+{
+    FVFRoomGraphReach Reach;
+    return VF_ComputeRoomGraphReach(Params, Reach);
+}
+
 //=============================================================================
 // PHASE 1: BUILD CHUNK CACHE
 //=============================================================================
@@ -5206,11 +5661,33 @@ void VoxelCaveMorphology::BuildChunkCache(
     float SearchMaxX, float SearchMaxY,
     const FStrateGenerationParams& Params,
     uint32 Seed, int32 StrateIndex,
-    const TArray<FStrateTerrainOpEntry>* TerrainOps)
+    const TArray<FStrateTerrainOpEntry>* TerrainOps,
+    ERoomGraphBuildSite BuildSite)
 {
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(VoxelDensityProfile::ECounter::SdfCacheBuild);
+        const VoxelDensityProfile::ECounter SiteCounter = [&]()
+            {
+                switch (BuildSite)
+                {
+                case ERoomGraphBuildSite::GeneratorTile:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildGeneratorTile;
+                case ERoomGraphBuildSite::GeneratorTunnelCore:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildGeneratorTunnelCore;
+                case ERoomGraphBuildSite::OpShared:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildOpShared;
+                case ERoomGraphBuildSite::OpLocal:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildOpLocal;
+                case ERoomGraphBuildSite::ClassifierShared:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildClassifierShared;
+                case ERoomGraphBuildSite::ClassifierLocal:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildClassifierLocal;
+                default:
+                    return VoxelDensityProfile::ECounter::RoomGraphBuildUnknown;
+                }
+            }();
+        VoxelDensityProfile::AddCounter(SiteCounter);
     }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::RoomGraphBuild);
@@ -5224,6 +5701,14 @@ void VoxelCaveMorphology::BuildChunkCache(
     const float CellSize = Params.RoomSpacing;
     if (CellSize <= 0.0f) return;
 
+    // This reach proof is shared with the feature-free preflight.  When it succeeds, the collect
+    // margin includes the largest direct room reach and the complete pair/chain/tube envelope;
+    // when it fails, keep the conservative legacy fallback and retain the malformed-input safety
+    // behavior below.  The tile-window optimization is only a field-preserving optimization for
+    // the finite parameter envelope accepted by VF_ComputeRoomGraphReach.
+    FVFRoomGraphReach FeatureReach;
+    const bool bHasFeatureReach = VF_ComputeRoomGraphReach(Params, FeatureReach);
+
     //=========================================================================
     // INFLUENCE RADII
     //=========================================================================
@@ -5234,6 +5719,10 @@ void VoxelCaveMorphology::BuildChunkCache(
     // so max(Min, Max) covers either radius without changing the authored roll.
     const float RoomRadiusEnvelope = FMath::Max(
         FMath::Abs(Params.MinRoomRadius), FMath::Abs(Params.MaxRoomRadius));
+    const float AllRoomRadiusEnvelope = FMath::Max(
+        RoomRadiusEnvelope, FMath::Abs(Params.OriginRoomRadius));
+    const float AllRoomHeightEnvelope = AllRoomRadiusEnvelope
+        * FMath::Abs(Params.RoomHeightRatio);
     // Interior control points can carry the authored radius variation (+/-18%). Include that
     // reach in collection; the per-tunnel index below uses each baked radius exactly.
     const float TunnelRadiusEnvelope = FMath::Max(
@@ -5243,10 +5732,13 @@ void VoxelCaveMorphology::BuildChunkCache(
     const float FloorReliefEnvelope = FMath::Abs(Params.FloorReliefStrength)
         * VOXEL_NOISE_SCALE * 1.5f;
     const float BlendEnvelope = FMath::Max(Params.SDFBlendRadius, 0.0f);
-    const float MaxInfluence = FMath::Max(
-        RoomRadiusEnvelope + FloorReliefEnvelope,
-        FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope
-    ) + BlendEnvelope * 3.0f;
+    const float DirectRoomReachFallback = VF_RoomShapeReachUpperBound(
+        AllRoomRadiusEnvelope, AllRoomHeightEnvelope)
+        + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+    const float MaxInfluenceFallback = FMath::Max(
+        DirectRoomReachFallback,
+        FMath::Abs(Params.TunnelWarpStrength)
+            + TunnelRadiusEnvelope + BlendEnvelope * 3.0f);
 
     const float MaxTunnelLen = FMath::Max(Params.MaxTunnelLength, 0.0f);
 
@@ -5262,13 +5754,13 @@ void VoxelCaveMorphology::BuildChunkCache(
     // To DECIDE the graph identically in neighboring chunks, we must see, for every
     // room that could emit a tunnel touching this chunk, that room's ENTIRE
     // nearest-neighbor candidate set (all rooms within MaxTunnelLength of it):
-    //   - A tunnel touching the chunk has BOTH endpoints within
-    //     (MaxTunnelLength + MaxInfluence) of the search box (capsule len <= MaxTunnelLength).
+    //   - A tunnel touching the box has both endpoint centers inside the pair envelope.
     //   - Each endpoint's NN candidates lie within MaxTunnelLength of that endpoint.
-    //   => collect within (2 * MaxTunnelLength + MaxInfluence) of the search box.
-    // Combined with NN candidates being filtered to <= MaxTunnelLength below, this
-    // makes the backbone decision for any STORED tunnel window-invariant.
-    const float CollectMargin = 2.0f * MaxTunnelLen + MaxInfluence;
+    //   => collect the pair envelope plus two graph hops.  This is independent of the search
+    //      box size, so it remains valid for a whole tile as well as a one-chunk window.
+    const float CollectMargin = bHasFeatureReach
+        ? FeatureReach.CollectMargin
+        : 2.0f * MaxTunnelLen + MaxInfluenceFallback;
     const float CollectMinX = SearchMinX - CollectMargin;
     const float CollectMinY = SearchMinY - CollectMargin;
     const float CollectMaxX = SearchMaxX + CollectMargin;
@@ -5389,14 +5881,19 @@ void VoxelCaveMorphology::BuildChunkCache(
     int32 OriginIdx = -1;
     if (Params.OriginRoomRadius > 0.0f)
     {
-        // Collected when (0,0) is in the COLLECT region (connectivity) OR when the room's
-        // own body can reach this chunk (store) — its radius may exceed the collect margin.
+        // For a valid reach proof, the origin's own body is necessarily inside the collect region
+        // whenever it can reach the search box.  Keep the old own-body fallback only for malformed
+        // or unsupported authored parameters, where the proof deliberately declines to claim
+        // window invariance.
         const bool bOriginInCollect =
             0.0f >= CollectMinX && 0.0f <= CollectMaxX &&
             0.0f >= CollectMinY && 0.0f <= CollectMaxY;
         const float OriginRZ = Params.OriginRoomRadius * Params.RoomHeightRatio;
-        if (bOriginInCollect ||
-            RoomReachesSearchBox(FVector(0.0f, 0.0f, StrateCenterZ), Params.OriginRoomRadius, OriginRZ))
+        if (bOriginInCollect
+            || (!bHasFeatureReach
+                && RoomReachesSearchBox(
+                    FVector(0.0f, 0.0f, StrateCenterZ),
+                    Params.OriginRoomRadius, OriginRZ)))
         {
             FBuildRoom OriginRoom;
             OriginRoom.CellX = INT32_MAX;  // Sentinel — never matches a real grid cell
@@ -5452,8 +5949,7 @@ void VoxelCaveMorphology::BuildChunkCache(
     // the genuinely feature-free case before the O(N^2) graph and player-fit
     // bake. The helper repeats only the deterministic graph decisions that can
     // affect whether a room/tunnel bound reaches this search window.
-    FVFRoomGraphReach FeatureReach;
-    if (VF_ComputeRoomGraphReach(Params, FeatureReach)
+    if (bHasFeatureReach
         && !VF_MayHaveRoomGraphFeature(
             BuildRooms, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
             Params, StrateSeed, FeatureReach))
@@ -6525,13 +7021,6 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float NearestRoomRawSDF = FLT_MAX;
     int32 NearestIdx = -1;
 
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::CaveRoomCandidates,
-            static_cast<uint64>(Cache.Rooms.Num()));
-    }
-
     //=========================================================================
     // Room SDFs
     //=========================================================================
@@ -6627,9 +7116,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         MinSDF = VoxelSDF::SmoothMin(MinSDF, RoomSDF, BlendK);
     };
 
-    for (int32 RoomIdx = 0; RoomIdx < Cache.Rooms.Num(); ++RoomIdx)
+    const int32 RoomCandidateCount = VF_ForEachSpatialCandidate(
+        Cache.RoomSpatialIndex, Cache.Rooms.Num(), WorldX, WorldY, EvaluateRoom);
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
-        EvaluateRoom(RoomIdx);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::CaveRoomCandidates,
+            static_cast<uint64>(RoomCandidateCount));
     }
 
     //==========================================================================
@@ -6653,21 +7146,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         const float JoinSDF = FMath::Max(HorizontalSDF, VerticalSDF);
         MinSDF = VoxelSDF::SmoothMin(MinSDF, JoinSDF, BlendK);
     };
-    for (int32 JoinIdx = 0; JoinIdx < Cache.RoomFloorJoins.Num(); ++JoinIdx)
-    {
-        EvaluateJoin(JoinIdx);
-    }
+    VF_ForEachSpatialCandidate(
+        Cache.RoomFloorJoinSpatialIndex, Cache.RoomFloorJoins.Num(),
+        WorldX, WorldY, EvaluateJoin);
 
     //=========================================================================
     // Tunnel SDFs
     //=========================================================================
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::CaveTunnelCandidates,
-            static_cast<uint64>(Cache.Tunnels.Num()));
-    }
-
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
         const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
@@ -6702,9 +7187,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
     };
 
-    for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
+    const int32 TunnelCandidateCount = VF_ForEachSpatialCandidate(
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
-        EvaluateTunnel(TunnelIdx);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::CaveTunnelCandidates,
+            static_cast<uint64>(TunnelCandidateCount));
     }
 
     // Write nearest room index for the caller (terrain ops system)
@@ -6747,10 +7236,8 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
                 /*bApplyFloorCut=*/false, &Cache, TunnelIdx).SDF);
     };
 
-    for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
-    {
-        EvaluateTunnel(TunnelIdx);
-    }
+    VF_ForEachSpatialCandidate(
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
 
     return MinSDF;
 }
@@ -6770,13 +7257,6 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::TunnelSupportFloorQueries);
     }
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
-            static_cast<uint64>(Cache.Tunnels.Num()));
-    }
-
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
         const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
@@ -6877,9 +7357,13 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
         Result.SDF = FMath::Min(Result.SDF, TunnelShape.SDF);
     };
 
-    for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
+    const int32 TunnelCandidateCount = VF_ForEachSpatialCandidate(
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+    if (VoxelDensityProfile::AreCountersEnabled())
     {
-        EvaluateTunnel(TunnelIdx);
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
+            static_cast<uint64>(TunnelCandidateCount));
     }
 
     return Result;
@@ -6897,13 +7381,6 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     const FChunkSDFCache& Cache)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
-
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
-            static_cast<uint64>(Cache.Tunnels.Num()));
-    }
 
     auto TestTunnel = [&](int32 TunnelIdx) -> bool
     {
@@ -6959,18 +7436,57 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     };
 
     bool bSupport = false;
-    for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
+    int32 CandidateCount = 0;
+    auto TestRange = [&](int32 Begin, int32 End)
     {
-        if (TestTunnel(TunnelIdx))
+        for (int32 Cursor = Begin; Cursor < End; ++Cursor)
         {
-            bSupport = true;
-            if (VoxelDensityProfile::AreCountersEnabled())
+            const int32 TunnelIdx = Cache.TunnelSpatialIndex.ItemIndices[Cursor];
+            if (!Cache.Tunnels.IsValidIndex(TunnelIdx))
             {
-                VoxelDensityProfile::AddCounter(
-                    VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
+                continue;
             }
-            break;
+            ++CandidateCount;
+            if (TestTunnel(TunnelIdx))
+            {
+                bSupport = true;
+                if (VoxelDensityProfile::AreCountersEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
+                }
+                break;
+            }
         }
+    };
+
+    int32 Begin = 0;
+    int32 End = 0;
+    if (Cache.TunnelSpatialIndex.GetRange(WorldX, WorldY, Begin, End))
+    {
+        TestRange(Begin, End);
+    }
+    else
+    {
+        for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num() && !bSupport; ++TunnelIdx)
+        {
+            ++CandidateCount;
+            if (TestTunnel(TunnelIdx))
+            {
+                bSupport = true;
+                if (VoxelDensityProfile::AreCountersEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
+                }
+            }
+        }
+    }
+    if (VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
+            static_cast<uint64>(CandidateCount));
     }
     return bSupport;
 }
@@ -6990,21 +7506,10 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             VoxelDensityProfile::ECounter::TunnelSupportColumnBuilds);
     }
 
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates,
-            static_cast<uint64>(Cache.Tunnels.Num()));
-    }
-
     const FVector ColumnPosition(WorldX, WorldY, 0.0f);
 
-    for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num(); ++TunnelIdx)
+    auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
-        if (!Cache.Tunnels.IsValidIndex(TunnelIdx))
-        {
-            continue;
-        }
         const FCachedTunnel& Tunnel = Cache.Tunnels[TunnelIdx];
         const FVFRoomFloorOwnership RoomMouthOwnership =
             VF_FindWorldTunnelMouthOwnership(ColumnPosition, Tunnel, Cache.SDFBlendRadius);
@@ -7014,7 +7519,7 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
                 ColumnPosition, Tunnel, /*bWorldChain=*/true,
                 FloorZ, SupportRadius, &Cache, TunnelIdx, &RoomMouthOwnership))
         {
-            continue;
+            return;
         }
 
         float MinZ = FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels;
@@ -7029,7 +7534,7 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             const float Remaining = Tunnel.WorldBoundRadiusSq - (DX * DX + DY * DY);
             if (Remaining < 0.0f)
             {
-                continue;
+                return;
             }
             const float HalfZ = FMath::Sqrt(Remaining);
             MinZ = FMath::Max(MinZ, static_cast<float>(Tunnel.WorldBoundCenter.Z) - HalfZ);
@@ -7045,6 +7550,14 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
             Interval.MinZ = MinZ;
             Interval.MaxZ = MaxZ;
         }
+    };
+    const int32 CandidateCount = VF_ForEachSpatialCandidate(
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+    if (VoxelDensityProfile::AreCountersEnabled())
+    {
+        VoxelDensityProfile::AddCounter(
+            VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates,
+            static_cast<uint64>(CandidateCount));
     }
 
     // Candidate IDs are deterministic and allow the world evaluator to find a

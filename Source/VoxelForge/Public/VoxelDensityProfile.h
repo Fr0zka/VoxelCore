@@ -106,6 +106,13 @@ namespace VoxelDensityProfile
         TunnelCacheHit,
         TunnelCacheMiss,
         SdfCacheBuild,
+        RoomGraphBuildGeneratorTile,
+        RoomGraphBuildGeneratorTunnelCore,
+        RoomGraphBuildOpShared,
+        RoomGraphBuildOpLocal,
+        RoomGraphBuildClassifierShared,
+        RoomGraphBuildClassifierLocal,
+        RoomGraphBuildUnknown,
         CaveRoomCandidates,
         CaveRoomEvaluated,
         CaveTunnelCandidates,
@@ -183,12 +190,13 @@ namespace VoxelDensityProfile
         uint64 SupportColumnEntriesBytes = 0;
         uint64 SupportColumnsBytes = 0;
         uint64 SupportColumnIntervalsBytes = 0;
+        uint64 SpatialIndexBytes = 0;
         uint64 TotalBytes() const
         {
             return SlotStorageBytes + OpStackBytes
                 + RoomsBytes + RoomFloorJoinsBytes + TunnelsBytes + PitsBytes
                 + ChimneysBytes + ColumnsBytes + SupportColumnEntriesBytes
-                + SupportColumnsBytes + SupportColumnIntervalsBytes;
+                + SupportColumnsBytes + SupportColumnIntervalsBytes + SpatialIndexBytes;
         }
 
         uint64 DynamicBytes() const
@@ -209,6 +217,7 @@ namespace VoxelDensityProfile
             SupportColumnEntriesBytes += Other.SupportColumnEntriesBytes;
             SupportColumnsBytes += Other.SupportColumnsBytes;
             SupportColumnIntervalsBytes += Other.SupportColumnIntervalsBytes;
+            SpatialIndexBytes += Other.SpatialIndexBytes;
             return *this;
         }
     };

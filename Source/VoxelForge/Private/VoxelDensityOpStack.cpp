@@ -3461,7 +3461,8 @@ namespace
         uint64 ManagerLifetimeId, const TArray<FStrateTerrainOpEntry>* TerrainOps,
         int32 RegionMinX, int32 RegionMinY, int32 RegionSize,
         float SearchMinX, float SearchMinY, float SearchMaxX, float SearchMaxY,
-        const FStrateGenerationParams& Params)
+        const FStrateGenerationParams& Params,
+        ERoomGraphBuildSite BuildSite)
     {
         for (;;)
         {
@@ -3533,13 +3534,8 @@ namespace
                     MakeShared<FChunkSDFCache, ESPMode::ThreadSafe>();
                 VoxelCaveMorphology::BuildChunkCache(
                     *BuiltCache, SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
-                    Params, Seed, StrateIndex, TerrainOps);
+                    Params, Seed, StrateIndex, TerrainOps, BuildSite);
                 const double CacheBuildSeconds = FPlatformTime::Seconds() - CacheBuildCallStart;
-                if (VoxelDensityProfile::AreCountersEnabled())
-                {
-                    VoxelDensityProfile::AddCounter(
-                        VoxelDensityProfile::ECounter::SdfCacheBuild);
-                }
 
                 const uint64 AllocatedBytes = static_cast<uint64>(sizeof(FSharedRoomGraphCacheEntry))
                     + static_cast<uint64>(sizeof(FChunkSDFCache))
@@ -4121,20 +4117,45 @@ namespace
                 StrateIdx = SI_Index;
             }
 
-            // A coarse LOD samples a new exact 32-voxel chunk at nearly every point.  The graph is
-            // window-invariant, so group those samples into a larger deterministic XY region.  The
-            // step is supplied by the mesher through VoxelGenLOD TLS; ordinary point queries keep
-            // the original one-chunk window.  The cache key retains the exact params/strate/op-pool
-            // identity, so no blended chunk can borrow another chunk's room graph.
+            // The graph is window-invariant, so a tile worker can use the exact requesting tile as
+            // its deterministic XY cache region.  The step/origin/cell extent is supplied by the
+            // mesher through VoxelGenLOD TLS; ordinary point queries keep the historical region
+            // policy.  The cache key retains the exact params/strate/op-pool identity, so no
+            // blended chunk can borrow another chunk's room graph.
             const int32 SampleStep = FMath::Max(VoxelGenLOD::SampleStep, 1);
-            const int32 RegionChunks = SampleStep <= 1
-                ? 1
-                : (SampleStep >= 32 ? 4 : FMath::Max(4, (SampleStep + 3) / 4));
-            const int32 RegionSize = CHUNK_SIZE * RegionChunks;
-            const int32 RegionCellX = FMath::FloorToInt(WorldX / (float)RegionSize);
-            const int32 RegionCellY = FMath::FloorToInt(WorldY / (float)RegionSize);
-            const int32 RegionMinX = RegionCellX * RegionSize;
-            const int32 RegionMinY = RegionCellY * RegionSize;
+            FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
+            int32 RequestedTileStep = SampleStep;
+            int32 RequestedTileCells = 0;
+            const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
+                && VoxelGenLOD::GetThreadTileCacheWindow(
+                    RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
+                && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P);
+            int32 RegionSize = 0;
+            int32 RegionMinX = 0;
+            int32 RegionMinY = 0;
+            if (bUseTileCacheWindow)
+            {
+                RegionSize = static_cast<int32>(
+                    static_cast<int64>(RequestedTileStep)
+                    * static_cast<int64>(RequestedTileCells));
+                RegionMinX = RequestedTileOrigin.X;
+                RegionMinY = RequestedTileOrigin.Y;
+            }
+            else
+            {
+                const int32 RegionChunks = SampleStep <= 1
+                    ? 1
+                    : (SampleStep >= 32 ? 4 : FMath::Max(4, (SampleStep + 3) / 4));
+                RegionSize = CHUNK_SIZE * RegionChunks;
+                const int32 RegionCellX = FMath::FloorToInt(WorldX / (float)RegionSize);
+                const int32 RegionCellY = FMath::FloorToInt(WorldY / (float)RegionSize);
+                RegionMinX = RegionCellX * RegionSize;
+                RegionMinY = RegionCellY * RegionSize;
+            }
+            const float CacheExpansion = FMath::Abs(P.CaveWarpStrength)
+                * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
+                + (bUseTileCacheWindow ? static_cast<float>(SampleStep) : 0.0f)
+                + 2.0f;
 
             const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
             if (LiveManager)
@@ -4165,17 +4186,16 @@ namespace
                     && S.SharedCacheEntry->RegionSize == RegionSize;
                 if (!bSharedCacheMatches)
                 {
-                    const float Expansion = FMath::Abs(P.CaveWarpStrength)
-                        * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f;
                     S.SharedCacheEntry = FindOrBuildSharedRoomGraphCache(
                         SeedU, StrateIdx, ParamsFingerprint, LayoutVersion,
                         ManagerLifetimeId, TerrainOps,
                         RegionMinX, RegionMinY, RegionSize,
-                        (float)RegionMinX - Expansion,
-                        (float)RegionMinY - Expansion,
-                        (float)(RegionMinX + RegionSize) + Expansion,
-                        (float)(RegionMinY + RegionSize) + Expansion,
-                        P);
+                        (float)RegionMinX - CacheExpansion,
+                        (float)RegionMinY - CacheExpansion,
+                        (float)(RegionMinX + RegionSize) + CacheExpansion,
+                        (float)(RegionMinY + RegionSize) + CacheExpansion,
+                        P,
+                        ERoomGraphBuildSite::OpShared);
                 }
                 S.ActiveCache = S.SharedCacheEntry->Cache.Get();
             }
@@ -4199,11 +4219,6 @@ namespace
                 if (!bCacheMatches)
                 {
                     bRebuiltLocalCache = true;
-                    if (VoxelDensityProfile::AreCountersEnabled())
-                    {
-                        VoxelDensityProfile::AddCounter(
-                            VoxelDensityProfile::ECounter::SdfCacheBuild);
-                    }
                     LocalCache->bValid = false;
                     LocalCache->Seed = SeedU;
                     LocalCache->StrateIndex = StrateIdx;
@@ -4214,15 +4229,14 @@ namespace
                     LocalCache->RegionMinX = RegionMinX;
                     LocalCache->RegionMinY = RegionMinY;
                     LocalCache->RegionSize = RegionSize;
-                    const float Expansion = FMath::Abs(P.CaveWarpStrength)
-                        * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f;
                     VoxelCaveMorphology::BuildChunkCache(
                         LocalCache->Cache,
-                        (float)RegionMinX - Expansion,
-                        (float)RegionMinY - Expansion,
-                        (float)(RegionMinX + RegionSize) + Expansion,
-                        (float)(RegionMinY + RegionSize) + Expansion,
-                        P, SeedU, StrateIdx, TerrainOps);
+                        (float)RegionMinX - CacheExpansion,
+                        (float)RegionMinY - CacheExpansion,
+                        (float)(RegionMinX + RegionSize) + CacheExpansion,
+                        (float)(RegionMinY + RegionSize) + CacheExpansion,
+                         P, SeedU, StrateIdx, TerrainOps,
+                         ERoomGraphBuildSite::OpLocal);
                     LocalCache->bValid = true;
                     VoxelDensityOps::ReportWorkerRoomGraphCacheFootprint();
                 }
@@ -4245,16 +4259,17 @@ namespace
             // mais à des coordonnées NON warpées. Sous un modèle de frames il aurait fallu les sortir
             // du frame tout en gardant le canal — exprimable, mais tordu. Dans un opérateur unique la
             // difficulté disparaît : le warp est une variable locale, pas un contexte hérité.
-            for (const FCachedPit& Pit : GetCache().Pits)
+            auto EvaluatePit = [&](int32 PitIndex)
             {
+                const FCachedPit& Pit = GetCache().Pits[PitIndex];
                 const float DZ = WorldZ - Pit.TopZ;
-                if (DZ >= Pit.BlendK) { continue; }
-                if (-DZ > Pit.Depth + Pit.BlendK) { continue; }
+                if (DZ >= Pit.BlendK) { return; }
+                if (-DZ > Pit.Depth + Pit.BlendK) { return; }
 
                 const float DX = WorldX - Pit.CenterX;
                 const float DY = WorldY - Pit.CenterY;
                 const float XYDistSq = DX * DX + DY * DY;
-                if (XYDistSq > Pit.BoundXYRadiusSq) { continue; }
+                if (XYDistSq > Pit.BoundXYRadiusSq) { return; }
 
                 float PitSDF;
                 if (DZ <= 0.0f)
@@ -4271,18 +4286,22 @@ namespace
                 }
 
                 CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
-            }
+            };
+            VF_ForEachChunkSDFSpatialCandidate(
+                GetCache().PitSpatialIndex, GetCache().Pits.Num(),
+                WorldX, WorldY, EvaluatePit);
 
-            for (const FCachedChimney& Chim : GetCache().Chimneys)
+            auto EvaluateChimney = [&](int32 ChimneyIndex)
             {
+                const FCachedChimney& Chim = GetCache().Chimneys[ChimneyIndex];
                 const float DZ = WorldZ - Chim.BottomZ;
-                if (-DZ >= Chim.BlendK) { continue; }
-                if (DZ > Chim.Height + Chim.BlendK) { continue; }
+                if (-DZ >= Chim.BlendK) { return; }
+                if (DZ > Chim.Height + Chim.BlendK) { return; }
 
                 const float DX = WorldX - Chim.CenterX;
                 const float DY = WorldY - Chim.CenterY;
                 const float XYDistSq = DX * DX + DY * DY;
-                if (XYDistSq > Chim.BoundXYRadiusSq) { continue; }
+                if (XYDistSq > Chim.BoundXYRadiusSq) { return; }
 
                 float ChmSDF;
                 if (DZ >= 0.0f)
@@ -4298,7 +4317,10 @@ namespace
                 }
 
                 CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
-            }
+            };
+            VF_ForEachChunkSDFSpatialCandidate(
+                GetCache().ChimneySpatialIndex, GetCache().Chimneys.Num(),
+                WorldX, WorldY, EvaluateChimney);
 
             InOut.Sdf = CaveSDF;
 
@@ -4388,13 +4410,16 @@ namespace
             const TArray<FStrateTerrainOpEntry>* CacheWindowTerrainOps = nullptr;
             bool   CacheWindowUsesLatticeProof = false;
             bool   CacheWindowTightenWarpProof = false;
-            FIntVector CacheWindowLatticeOrigin = FIntVector::ZeroValue;
             int32  CacheWindowLatticeStep = 1;
             TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> CacheWindowSharedEntry;
             int32  CacheWindowSharedRegionMinX = 0;
             int32  CacheWindowSharedRegionMinY = 0;
             int32  CacheWindowSharedRegionSize = 0;
             bool   bCacheWindowUsesShared = false;
+            bool   CacheWindowUsesTileCacheWindow = false;
+            FIntVector CacheWindowTileOrigin = FIntVector::ZeroValue;
+            int32  CacheWindowTileStep = 0;
+            int32  CacheWindowTileCells = 0;
             bool   bCacheWindowValid = false;
 
             // Tight warp bounds are proofs over a box. Refinement asks about nested child boxes,
@@ -4659,6 +4684,10 @@ namespace
                 B.CacheWindowSharedRegionMinY = 0;
                 B.CacheWindowSharedRegionSize = 0;
                 B.bCacheWindowUsesShared = false;
+                B.CacheWindowUsesTileCacheWindow = false;
+                B.CacheWindowTileOrigin = FIntVector::ZeroValue;
+                B.CacheWindowTileStep = 0;
+                B.CacheWindowTileCells = 0;
                 B.bCacheWindowValid = false;
                 B.bTightWarpEnvelopeValid = false;
                 B.bMayHaveTunnelCoreAir = false;
@@ -4753,6 +4782,45 @@ namespace
                 return;
             }
 
+            FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
+            int32 RequestedTileStep = FMath::Max(Ctx.Step, 1);
+            int32 RequestedTileCells = 0;
+            const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
+                && VoxelGenLOD::GetThreadTileCacheWindow(
+                    RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
+                && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P);
+            const float RequestedTileExtent = static_cast<float>(
+                static_cast<int64>(RequestedTileStep)
+                * static_cast<int64>(RequestedTileCells));
+            // FillChunk includes one sample-step of mesher halo around the requested tile.
+            // Keep the tile footprint as the shared-cache identity, but let every block in that
+            // halo reuse the same cache window.  The morphology search below includes the same
+            // coverage, so this widens reuse without changing the set of values evaluated.
+            const FBox CacheWindowCoverageBox = bUseTileCacheWindow
+                ? FBox(
+                    FVector(
+                        static_cast<float>(RequestedTileOrigin.X)
+                            - static_cast<float>(RequestedTileStep),
+                        static_cast<float>(RequestedTileOrigin.Y)
+                            - static_cast<float>(RequestedTileStep),
+                        static_cast<float>(RequestedTileOrigin.Z)
+                            - static_cast<float>(RequestedTileStep)),
+                    FVector(
+                        static_cast<float>(RequestedTileOrigin.X) + RequestedTileExtent,
+                        static_cast<float>(RequestedTileOrigin.Y) + RequestedTileExtent,
+                        static_cast<float>(RequestedTileOrigin.Z) + RequestedTileExtent)
+                        + FVector(
+                            static_cast<float>(RequestedTileStep),
+                            static_cast<float>(RequestedTileStep),
+                            static_cast<float>(RequestedTileStep)))
+                : VoxelBox;
+            const int64 RequestedTileChunkSpan = bUseTileCacheWindow
+                ? FMath::Max<int64>(
+                    1,
+                    (static_cast<int64>(RequestedTileExtent) + CHUNK_SIZE - 1)
+                        / CHUNK_SIZE)
+                : 0;
+
             // A coarse tile is allowed to warm the proof, but never by allocating a morphology
             // cache for the whole tile.  At LOD3/4 the root can cover hundreds or thousands of
             // chunk keys; that is a proof-domain size, not a useful working set.  Descendants
@@ -4760,7 +4828,10 @@ namespace
             // is deliberately the only answer here: it cannot authorize an empty-tile skip.
             constexpr int64 MaxLatticeProofChunkVolume = 512;
             if (Ctx.bUseLatticeProof
-                && SpanX * SpanY * SpanZ > MaxLatticeProofChunkVolume)
+                && SpanX * SpanY * SpanZ > MaxLatticeProofChunkVolume
+                && !(bUseTileCacheWindow
+                    && RequestedTileChunkSpan <= 64
+                    && SpanZ <= 16))
             {
                 Unknown();
                 return;
@@ -4906,6 +4977,47 @@ namespace
                     return;
                 }
             }
+            // A tile cache is a graph cache, not a proof-result cache.  Its search envelope must
+            // therefore be identical for the root and every block/child that asks about the
+            // tile.  In particular, a finite tight warp envelope is allowed to sharpen the
+            // interval proof below, but it must not make the first classifier block publish a
+            // smaller morphology cache for later blocks to reuse.
+            const float CacheWarpX = bUseTileCacheWindow
+                ? GlobalWarp : FMath::Max((float)WarpEnvelope.X, 0.0f);
+            const float CacheWarpY = bUseTileCacheWindow
+                ? GlobalWarp : FMath::Max((float)WarpEnvelope.Y, 0.0f);
+            const float CacheWarpZ = bUseTileCacheWindow
+                ? GlobalWarp : FMath::Max((float)WarpEnvelope.Z, 0.0f);
+            const float CacheSearchMinX = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.X)
+                    - CacheWarpX
+                    - static_cast<float>(RequestedTileStep) - 2.0f
+                : BoxMinX - CacheWarpX - 2.0f;
+            const float CacheSearchMinY = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.Y)
+                    - CacheWarpY
+                    - static_cast<float>(RequestedTileStep) - 2.0f
+                : BoxMinY - CacheWarpY - 2.0f;
+            const float CacheSearchMaxX = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.X) + RequestedTileExtent
+                    + CacheWarpX
+                    + static_cast<float>(RequestedTileStep) + 2.0f
+                : BoxMaxX + CacheWarpX + 2.0f;
+            const float CacheSearchMaxY = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.Y) + RequestedTileExtent
+                    + CacheWarpY
+                    + static_cast<float>(RequestedTileStep) + 2.0f
+                : BoxMaxY + CacheWarpY + 2.0f;
+            const float CacheSearchMinZ = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.Z)
+                    - CacheWarpZ
+                    - static_cast<float>(RequestedTileStep) - 2.0f
+                : BoxMinZ - CacheWarpZ - 2.0f;
+            const float CacheSearchMaxZ = bUseTileCacheWindow
+                ? static_cast<float>(RequestedTileOrigin.Z) + RequestedTileExtent
+                    + CacheWarpZ
+                    + static_cast<float>(RequestedTileStep) + 2.0f
+                : BoxMaxZ + CacheWarpZ + 2.0f;
             // The search window is a superset of every warped point in the box, with the same
             // two-voxel gradient margin used by Eval's cache path.  In lattice mode, retain the
             // first/root window and reuse it for every refined child.  A larger morphology
@@ -4920,6 +5032,11 @@ namespace
                 && B.CacheWindowManagerLifetimeId == ManagerLifetimeId
                 && B.CacheWindowTerrainOps == TerrainOps
                 && B.CacheWindowUsesLatticeProof == Ctx.bUseLatticeProof
+                && B.CacheWindowUsesTileCacheWindow == bUseTileCacheWindow
+                && (!bUseTileCacheWindow
+                    || (B.CacheWindowTileOrigin == RequestedTileOrigin
+                        && B.CacheWindowTileStep == RequestedTileStep
+                        && B.CacheWindowTileCells == RequestedTileCells))
                 // A non-tight cache is built from the global warp envelope and is therefore a
                 // superset cache for a later tight retry.  The reverse is not safe: a tight cache
                 // may omit primitives needed by the conservative global-envelope query.
@@ -4928,9 +5045,11 @@ namespace
                     // envelope cache. A global query must not reuse a tight cache.
                     || Ctx.bTightenWarpProof
                     || !B.CacheWindowTightenWarpProof)
+                 // The graph window is independent of which block's lattice origin requested it;
+                 // retain only the step because it controls the conservative finite-envelope gate
+                 // for non-tile proof windows.
                  && (!Ctx.bUseLatticeProof
-                     || (B.CacheWindowLatticeOrigin == Ctx.LatticeOriginVoxels
-                         && B.CacheWindowLatticeStep == Ctx.Step))
+                     || B.CacheWindowLatticeStep == Ctx.Step)
                  && (!B.bCacheWindowUsesShared || IsSharedCacheCurrent())
                  && B.CacheWindowBox.Min.X <= BoxMinX
                 && B.CacheWindowBox.Min.Y <= BoxMinY
@@ -4960,15 +5079,17 @@ namespace
                 // primitives to the interval.
                 const bool bFeatureFree =
                     !VoxelCaveMorphology::MayHaveFeatureInSearchBox(
-                        BoxMinX - (float)WarpEnvelope.X - 2.0f,
-                        BoxMinY - (float)WarpEnvelope.Y - 2.0f,
-                        BoxMaxX + (float)WarpEnvelope.X + 2.0f,
-                        BoxMaxY + (float)WarpEnvelope.Y + 2.0f,
+                        CacheSearchMinX,
+                        CacheSearchMinY,
+                        CacheSearchMaxX,
+                        CacheSearchMaxY,
                         P, SeedU, StrateIdx, true,
-                        BoxMinZ - (float)WarpEnvelope.Z - 2.0f,
-                        BoxMaxZ + (float)WarpEnvelope.Z + 2.0f);
-                bool bUsedSharedCache = false;
+                        CacheSearchMinZ,
+                        CacheSearchMaxZ);
                 const int64 MaxSharedChunkSpan = Ctx.Step >= 32 ? 32 : 16;
+                bool bUsedSharedCache = false;
+                const bool bTileWithinSharedBudget = bUseTileCacheWindow
+                    && RequestedTileChunkSpan <= 64;
                 if (!bFeatureFree
                     && Ctx.bUseLatticeProof
                     // Fine LOD0/LOD1 requests are latency-sensitive and each worker already has
@@ -4977,16 +5098,27 @@ namespace
                     // build itself is cheap). Coarse samples keep the shared window, where its
                     // larger footprint prevents thousands of per-chunk rebuilds.
                     && Ctx.Step > 1
-                    && SpanX <= MaxSharedChunkSpan
-                    && SpanY <= MaxSharedChunkSpan)
+                    && (bTileWithinSharedBudget
+                        || (SpanX <= MaxSharedChunkSpan
+                            && SpanY <= MaxSharedChunkSpan)))
                 {
-                    // Coarser LODs retain the four-chunk working set needed to amortise their
-                    // wider sample footprint. Fine LODs take the worker-local path above.
-                    int32 SharedRegionSize = 4 * CHUNK_SIZE;
-                    int32 SharedRegionMinX = 0;
-                    int32 SharedRegionMinY = 0;
-                    bool bCoversBox = false;
-                    for (int32 Attempt = 0; Attempt < 6; ++Attempt)
+                    // Coarser LODs retain a shared immutable cache. With the tile policy its key
+                    // is the exact tile footprint; the fallback keeps the historical expanding
+                    // four-chunk working set for point/non-tile callers.
+                    int32 SharedRegionSize = bUseTileCacheWindow
+                        ? static_cast<int32>(RequestedTileExtent)
+                        : 4 * CHUNK_SIZE;
+                    int32 SharedRegionMinX = bUseTileCacheWindow
+                        ? RequestedTileOrigin.X : 0;
+                    int32 SharedRegionMinY = bUseTileCacheWindow
+                        ? RequestedTileOrigin.Y : 0;
+                    bool bCoversBox = bUseTileCacheWindow
+                        ? (CacheWindowCoverageBox.Min.X <= BoxMinX
+                            && CacheWindowCoverageBox.Min.Y <= BoxMinY
+                            && CacheWindowCoverageBox.Max.X >= BoxMaxX
+                            && CacheWindowCoverageBox.Max.Y >= BoxMaxY)
+                        : false;
+                    for (int32 Attempt = 0; !bUseTileCacheWindow && Attempt < 6; ++Attempt)
                     {
                         SharedRegionMinX = FMath::FloorToInt(
                             BoxMinX / (float)SharedRegionSize) * SharedRegionSize;
@@ -4999,21 +5131,37 @@ namespace
                     }
 
                     if (bCoversBox
-                        && SharedRegionSize
-                           <= static_cast<int32>(MaxSharedChunkSpan) * CHUNK_SIZE)
+                        && (bUseTileCacheWindow
+                            || SharedRegionSize
+                               <= static_cast<int32>(MaxSharedChunkSpan) * CHUNK_SIZE))
                     {
-                        const float Expansion = FMath::Abs(P.CaveWarpStrength)
-                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f;
                         TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe> SharedCache =
                             FindOrBuildSharedRoomGraphCache(
                                 SeedU, StrateIdx, ParamsFingerprint, LayoutVersion,
                                 ManagerLifetimeId, TerrainOps,
                                 SharedRegionMinX, SharedRegionMinY, SharedRegionSize,
-                                (float)SharedRegionMinX - Expansion,
-                                (float)SharedRegionMinY - Expansion,
-                                (float)(SharedRegionMinX + SharedRegionSize) + Expansion,
-                                (float)(SharedRegionMinY + SharedRegionSize) + Expansion,
-                                P);
+                                bUseTileCacheWindow
+                                    ? CacheSearchMinX
+                                    : (float)SharedRegionMinX
+                                        - (FMath::Abs(P.CaveWarpStrength)
+                                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f),
+                                bUseTileCacheWindow
+                                    ? CacheSearchMinY
+                                    : (float)SharedRegionMinY
+                                        - (FMath::Abs(P.CaveWarpStrength)
+                                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f),
+                                bUseTileCacheWindow
+                                    ? CacheSearchMaxX
+                                    : (float)(SharedRegionMinX + SharedRegionSize)
+                                        + (FMath::Abs(P.CaveWarpStrength)
+                                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f),
+                                bUseTileCacheWindow
+                                    ? CacheSearchMaxY
+                                    : (float)(SharedRegionMinY + SharedRegionSize)
+                                        + (FMath::Abs(P.CaveWarpStrength)
+                                            * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f),
+                                P,
+                                ERoomGraphBuildSite::ClassifierShared);
                         B.ActiveCache = SharedCache->Cache.Get();
                         B.CacheWindowSharedEntry = SharedCache;
                         B.CacheWindowSharedRegionMinX = SharedRegionMinX;
@@ -5037,16 +5185,17 @@ namespace
                     {
                         VoxelCaveMorphology::BuildChunkCache(
                             B.Cache,
-                            BoxMinX - (float)WarpEnvelope.X - 2.0f,
-                            BoxMinY - (float)WarpEnvelope.Y - 2.0f,
-                            BoxMaxX + (float)WarpEnvelope.X + 2.0f,
-                            BoxMaxY + (float)WarpEnvelope.Y + 2.0f,
-                            P, SeedU, StrateIdx, TerrainOps);
+                            CacheSearchMinX,
+                            CacheSearchMinY,
+                            CacheSearchMaxX,
+                            CacheSearchMaxY,
+                            P, SeedU, StrateIdx, TerrainOps,
+                             ERoomGraphBuildSite::ClassifierLocal);
                     }
                     B.ActiveCache = &B.Cache;
                 }
 
-                B.CacheWindowBox = VoxelBox;
+                B.CacheWindowBox = CacheWindowCoverageBox;
                 B.CacheWindowStrate = StrateIdx;
                 B.CacheWindowSeed = SeedU;
                 B.CacheWindowFingerprint = ParamsFingerprint;
@@ -5054,9 +5203,15 @@ namespace
                 B.CacheWindowManagerLifetimeId = ManagerLifetimeId;
                 B.CacheWindowTerrainOps = TerrainOps;
                 B.CacheWindowUsesLatticeProof = Ctx.bUseLatticeProof;
-                B.CacheWindowTightenWarpProof = bUsedSharedCache
+                B.CacheWindowUsesTileCacheWindow = bUseTileCacheWindow;
+                B.CacheWindowTileOrigin = bUseTileCacheWindow
+                    ? RequestedTileOrigin : FIntVector::ZeroValue;
+                B.CacheWindowTileStep = bUseTileCacheWindow ? RequestedTileStep : 0;
+                B.CacheWindowTileCells = bUseTileCacheWindow ? RequestedTileCells : 0;
+                B.CacheWindowTightenWarpProof = bUseTileCacheWindow
+                    ? false
+                    : bUsedSharedCache
                     ? false : Ctx.bTightenWarpProof;
-                B.CacheWindowLatticeOrigin = Ctx.LatticeOriginVoxels;
                 B.CacheWindowLatticeStep = Ctx.Step;
                 B.bCacheWindowValid = true;
                 B.CacheWindowCycles = FPlatformTime::Cycles64() - CacheWindowStartCycles;
@@ -7887,12 +8042,13 @@ namespace
             if (!VF_NearCaveSurface(InOut.Sdf, P.SDFBlendRadius)) { return; }
             if (Rooms == nullptr) { return; }
 
-            for (const FCachedColumn& Col : Rooms->GetCache().Columns)
+            auto EvaluateColumn = [&](int32 ColumnIndex)
             {
+                const FCachedColumn& Col = Rooms->GetCache().Columns[ColumnIndex];
                 const float DX = WorldX - Col.CenterX;
                 const float DY = WorldY - Col.CenterY;
                 const float XYDistSq = DX * DX + DY * DY;
-                if (XYDistSq > Col.BoundXYRadiusSq) { continue; }
+                if (XYDistSq > Col.BoundXYRadiusSq) { return; }
 
                 const float CylSDF = FMath::Sqrt(XYDistSq) - Col.Radius;
 
@@ -7903,7 +8059,10 @@ namespace
                     Fill = SmoothStep01(Fill);
                     InOut.Density += Fill * Col.BaseDensity * 1.5f;
                 }
-            }
+            };
+            VF_ForEachChunkSDFSpatialCandidate(
+                Rooms->GetCache().ColumnSpatialIndex,
+                Rooms->GetCache().Columns.Num(), WorldX, WorldY, EvaluateColumn);
         }
 
         /** The cached column list is the complete source of this op's work.  A valid empty list is

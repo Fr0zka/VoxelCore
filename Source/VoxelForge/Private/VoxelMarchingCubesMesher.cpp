@@ -229,6 +229,10 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     const int32 CellsPerAxis = FMath::Clamp(InCellsPerAxis, 2, CHUNK_SIZE);  // coarse tiles use fewer
     const int32 GridDim      = CellsPerAxis + 1;
     const int32 MDim         = GridDim + 2;            // +1 marge de chaque côté
+    TGuardValue<FIntVector> TileOriginGuard(
+        VoxelGenLOD::TileOriginVoxels, OriginVoxels);
+    TGuardValue<int32> TileCellsGuard(
+        VoxelGenLOD::TileCellsPerAxis, CellsPerAxis);
     // COUPE DE CONTENU PAR STRATE — restreint le maillage (et l'échantillonnage) aux cellules
     // dont l'intervalle Z chevauche la bande [BandZMinVox, BandZMaxVox] (voxels inclusifs).
     // Les tuiles à capture ne sont jamais bandées (niveau 0 — garde-fou ci-dessous).

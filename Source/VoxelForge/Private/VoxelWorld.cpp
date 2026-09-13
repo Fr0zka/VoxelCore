@@ -3859,7 +3859,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "rooms=%d tunnels=%d joins=%d pits=%d chimneys=%d "
                      "whole_mixed=%u whole_solid=%u whole_air=%u final_nodes=%u "
                      "split_nodes=%u max_depth=%u block_builds=%llu block_samples=%llu "
-                     "block_ops=%llu block_active=%llu block_pruned=%llu cache_builds=%llu"),
+                     "block_ops=%llu block_active=%llu block_pruned=%llu cache_builds=%llu "
+                     "cache_generator=%llu cache_tunnel_core=%llu cache_op_shared=%llu "
+                     "cache_op_local=%llu cache_classifier_shared=%llu cache_classifier_local=%llu "
+                     "cache_unknown=%llu room_candidates=%llu room_evaluated=%llu "
+                     "tunnel_candidates=%llu tunnel_evaluated=%llu tunnel_core_candidates=%llu "
+                     "tunnel_core_evaluated=%llu support_column_candidates=%llu"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
@@ -3887,7 +3892,21 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockOperators)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockActiveOperators)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::OpBlockPrunedOperators)),
-                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::SdfCacheBuild)));
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::SdfCacheBuild)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildGeneratorTile)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildGeneratorTunnelCore)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildOpShared)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildOpLocal)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildClassifierShared)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildClassifierLocal)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::RoomGraphBuildUnknown)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::CaveRoomCandidates)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::CaveRoomEvaluated)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::CaveTunnelCandidates)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::CaveTunnelEvaluated)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelCoreCandidates)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelCoreEvaluated)),
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates)));
 
             if (bProfileOps)
             {

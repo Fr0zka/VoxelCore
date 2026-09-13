@@ -56,6 +56,32 @@ namespace
         }
     }
 
+    // A tile-sized cache window is the production default.  Keep the switch in the generator
+    // module so native and op-stack sources make the same A/B decision, including when a
+    // headless harness applies command-line CVars after module startup.
+    int32 GVoxelForgeTileCacheWindow = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeTileCacheWindow(
+        TEXT("voxel.TileCacheWindow"),
+        GVoxelForgeTileCacheWindow,
+        TEXT("Use the requesting tile's aligned footprint plus the deterministic warp/halo margin for room caches."));
+    bool GVoxelForgeTileCacheWindowSwitchParsed = false;
+
+    void VF_ParseTileCacheWindowSwitch()
+    {
+        if (GVoxelForgeTileCacheWindowSwitchParsed)
+        {
+            return;
+        }
+        GVoxelForgeTileCacheWindowSwitchParsed = true;
+        int32 CommandLineValue = GVoxelForgeTileCacheWindow;
+        if (FParse::Value(
+                FCommandLine::Get(), TEXT("voxel.TileCacheWindow="), CommandLineValue))
+        {
+            GVoxelForgeTileCacheWindow = CommandLineValue;
+        }
+        GVoxelForgeTileCacheWindow = GVoxelForgeTileCacheWindow != 0 ? 1 : 0;
+    }
+
 }
 
 //=============================================================================
@@ -411,6 +437,8 @@ struct FVoxelDensityBlockSession
 
 static thread_local FVoxelDensityBlockSession GVoxelDensityBlockSession;
 thread_local int32 VoxelGenLOD::SampleStep = 1;
+thread_local FIntVector VoxelGenLOD::TileOriginVoxels = FIntVector::ZeroValue;
+thread_local int32 VoxelGenLOD::TileCellsPerAxis = 0;
 
 int32 VoxelGenLOD::GetThreadOctaveBias()
 {
@@ -430,6 +458,31 @@ int32 VoxelGenLOD::GetThreadSampleStep()
 void VoxelGenLOD::SetThreadSampleStep(int32 Value)
 {
     SampleStep = Value;
+}
+
+bool VoxelGenLOD::IsTileCacheWindowEnabled()
+{
+    VF_ParseTileCacheWindowSwitch();
+    return GVoxelForgeTileCacheWindow != 0;
+}
+
+bool VoxelGenLOD::GetThreadTileCacheWindow(
+    FIntVector& OutOriginVoxels, int32& OutStep, int32& OutCellsPerAxis)
+{
+    OutOriginVoxels = TileOriginVoxels;
+    OutStep = FMath::Max(SampleStep, 1);
+    OutCellsPerAxis = TileCellsPerAxis;
+    if (TileCellsPerAxis <= 0)
+    {
+        return false;
+    }
+    const int64 Extent = static_cast<int64>(OutStep)
+        * static_cast<int64>(OutCellsPerAxis);
+    // The graph build is quadratic in the collected room count.  Keep the tile policy bounded
+    // to a 64-chunk side; the field's LOD4 tile is 32 chunks, while an accidentally giant request
+    // falls back to the older bounded window instead of turning one worker into an unbounded bake.
+    return Extent > 0 && Extent <= MAX_int32
+        && Extent <= static_cast<int64>(CHUNK_SIZE) * 64;
 }
 
 // NOTE (T2.a): the fBm/Ridged bodies moved to VoxelNoise.h, where octaves are evaluated
@@ -1175,8 +1228,15 @@ namespace
         uint64 OwnerId = 0;
         uint64 ManagerLifetimeId = 0;
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+        FIntVector TileOrigin = FIntVector::ZeroValue;
+        FIntVector SupportChunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+        int32 TileStep = 0;
+        int32 TileCells = 0;
+        int32 StrateIndex = INT32_MIN;
+        uint32 WorldSeed = 0xFFFFFFFFu;
         uint32 ParamsFingerprint = 0xFFFFFFFFu;
         uint32 LayoutVersion = 0xFFFFFFFFu;
+        bool bUsesTileCacheWindow = false;
         bool bValid = false;
     };
 
@@ -1217,6 +1277,7 @@ namespace
         uint32 TunnelFingerprint = 0xFFFFFFFFu;
         FStrateDisturbanceParams Disturbance;
         bool bUseOpStack = false;
+        bool bUsesTileCacheWindow = false;
         FVoxelOpStack OpStack;
         FTunnelCoreCacheState TunnelCore;
     };
@@ -1289,13 +1350,42 @@ namespace
         uint64 OwnerId,
         FTunnelCoreCacheState& OutState)
     {
-        if (OutState.bValid
+        FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
+        int32 RequestedTileStep = 1;
+        int32 RequestedTileCells = 0;
+        const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
+            && VoxelGenLOD::GetThreadTileCacheWindow(
+                RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
+            && VoxelCaveMorphology::IsRoomGraphWindowInvariant(Params);
+        const int32 StrateIndex = Manager.GetStrateIndex(
+            (static_cast<float>(ChunkCoord.Z) + 0.5f)
+            * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
+        const uint32 WorldSeed = static_cast<uint32>(Manager.GetWorldSeed());
+
+        const bool bSameGraphWindow = OutState.bValid
             && OutState.OwnerId == OwnerId
             && OutState.ManagerLifetimeId == ManagerLifetimeId
-            && OutState.Chunk == ChunkCoord
+            && OutState.StrateIndex == StrateIndex
+            && OutState.WorldSeed == WorldSeed
             && OutState.ParamsFingerprint == ParamsFingerprint
-            && OutState.LayoutVersion == LayoutVersion)
+            && OutState.LayoutVersion == LayoutVersion
+            && OutState.bUsesTileCacheWindow == bUseTileCacheWindow
+            && (!bUseTileCacheWindow
+                ? OutState.Chunk == ChunkCoord
+                : (OutState.TileOrigin == RequestedTileOrigin
+                    && OutState.TileStep == RequestedTileStep
+                    && OutState.TileCells == RequestedTileCells));
+        if (bSameGraphWindow)
         {
+            // The graph is shared by the whole tile, but the sparse support table is deliberately
+            // kept for the currently queried exact chunk. Rebuild only that small table when the
+            // density cursor crosses a chunk; the room/tunnel graph itself is not rebuilt.
+            if (OutState.SupportChunk != ChunkCoord)
+            {
+                BuildTunnelSupportColumnsForChunk(OutState.Cache, ChunkCoord);
+                OutState.SupportChunk = ChunkCoord;
+            }
+            OutState.Chunk = ChunkCoord;
             return;
         }
 
@@ -1303,25 +1393,48 @@ namespace
         const float ChunkMinY = static_cast<float>(ChunkCoord.Y * CHUNK_SIZE);
         const float ChunkMaxX = ChunkMinX + static_cast<float>(CHUNK_SIZE);
         const float ChunkMaxY = ChunkMinY + static_cast<float>(CHUNK_SIZE);
-        const float Expansion = FMath::Abs(Params.CaveWarpStrength)
+        const float WarpMargin = FMath::Abs(Params.CaveWarpStrength)
             * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
-        const int32 StrateIndex = Manager.GetStrateIndex(
-            (static_cast<float>(ChunkCoord.Z) + 0.5f)
-            * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
-
+        float SearchMinX = ChunkMinX - WarpMargin;
+        float SearchMinY = ChunkMinY - WarpMargin;
+        float SearchMaxX = ChunkMaxX + WarpMargin;
+        float SearchMaxY = ChunkMaxY + WarpMargin;
+        if (bUseTileCacheWindow)
+        {
+            const float TileMinX = static_cast<float>(RequestedTileOrigin.X);
+            const float TileMinY = static_cast<float>(RequestedTileOrigin.Y);
+            const float TileExtent = static_cast<float>(
+                static_cast<int64>(RequestedTileStep)
+                * static_cast<int64>(RequestedTileCells));
+            const float TileHalo = static_cast<float>(RequestedTileStep) + 2.0f;
+            const float Expansion = FMath::Abs(Params.CaveWarpStrength)
+                * VOXEL_NOISE_SCALE * 1.5f + TileHalo;
+            SearchMinX = TileMinX - Expansion;
+            SearchMinY = TileMinY - Expansion;
+            SearchMaxX = TileMinX + TileExtent + Expansion;
+            SearchMaxY = TileMinY + TileExtent + Expansion;
+        }
         VoxelCaveMorphology::BuildChunkCache(
             OutState.Cache,
-            ChunkMinX - Expansion, ChunkMinY - Expansion,
-            ChunkMaxX + Expansion, ChunkMaxY + Expansion,
-            Params, static_cast<uint32>(Manager.GetWorldSeed()),
-            StrateIndex, nullptr);
+            SearchMinX, SearchMinY, SearchMaxX, SearchMaxY,
+            Params, WorldSeed,
+            StrateIndex, nullptr,
+            ERoomGraphBuildSite::GeneratorTunnelCore);
         BuildTunnelSupportColumnsForChunk(
             OutState.Cache, ChunkCoord);
         OutState.OwnerId = OwnerId;
         OutState.ManagerLifetimeId = ManagerLifetimeId;
         OutState.Chunk = ChunkCoord;
+        OutState.TileOrigin = bUseTileCacheWindow
+            ? RequestedTileOrigin : FIntVector::ZeroValue;
+        OutState.TileStep = bUseTileCacheWindow ? RequestedTileStep : 0;
+        OutState.TileCells = bUseTileCacheWindow ? RequestedTileCells : 0;
+        OutState.SupportChunk = ChunkCoord;
+        OutState.StrateIndex = StrateIndex;
+        OutState.WorldSeed = WorldSeed;
         OutState.ParamsFingerprint = ParamsFingerprint;
         OutState.LayoutVersion = LayoutVersion;
+        OutState.bUsesTileCacheWindow = bUseTileCacheWindow;
         OutState.bValid = true;
     }
 
@@ -1689,6 +1802,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             && StrateManager->UsesOperatorStackForChunk(ChunkCoord);
         const FIntVector TunnelCacheKey = bShareTunnelStackByZ
             ? FIntVector(0, 0, ChunkCoord.Z) : ChunkCoord;
+        FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
+        int32 RequestedTileStep = 1;
+        int32 RequestedTileCells = 0;
+        const bool bTileCacheContext = VoxelGenLOD::IsTileCacheWindowEnabled()
+            && VoxelGenLOD::GetThreadTileCacheWindow(
+                RequestedTileOrigin, RequestedTileStep, RequestedTileCells);
         FVoxelOpStack* ActiveOpStack = &CP_OpStack;
         FTunnelCoreCacheState* ActiveTunnelCoreCache = &GTunnelCoreCache;
         bool bLoadedTunnelDensityCache = false;
@@ -1717,6 +1836,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     && Candidate.Chunk == TunnelCacheKey
                     && Candidate.LayoutVersion == LayoutVersion
                     && Candidate.bUseOpStack == bShareTunnelStackByZ
+                    && Candidate.bUsesTileCacheWindow == bTileCacheContext
                     && (Candidate.GenType == ECaveGeneratorType::TunnelNetwork
                         || Candidate.GenType == ECaveGeneratorType::Underwater);
                 if (bKeyMatches)
@@ -1998,9 +2118,15 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     || CP_GenType == ECaveGeneratorType::Underwater);
 #if WITH_EDITOR
             const bool bCanStoreTunnelDensityCache = bNativeTunnelCacheCandidate
-                && !CP_UseComposerRegions;
+                && !CP_UseComposerRegions
+                // A native direct core uses the worker-global state below. Keeping it in one
+                // per-exact-chunk entry would move the tile graph out and force the next chunk to
+                // rebuild it. Operator stacks do not prepare this native core, so they retain the
+                // existing prepared-stack cache even when the tile context is active.
+                && (!bTileCacheContext || CP_UseOpStack);
 #else
-            const bool bCanStoreTunnelDensityCache = bNativeTunnelCacheCandidate;
+            const bool bCanStoreTunnelDensityCache = bNativeTunnelCacheCandidate
+                && (!bTileCacheContext || CP_UseOpStack);
 #endif
             if (!bLoadedTunnelDensityCache && bCanStoreTunnelDensityCache)
             {
@@ -2017,6 +2143,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CachedEntry.TunnelFingerprint = CP_TunnelFP;
                 CachedEntry.Disturbance = CP_Dist;
                 CachedEntry.bUseOpStack = CP_UseOpStack;
+                CachedEntry.bUsesTileCacheWindow = bTileCacheContext;
                 CachedEntry.OpStack = MoveTemp(CP_OpStack);
                 CachedEntry.TunnelCore = MoveTemp(GTunnelCoreCache);
                 GTunnelCoreCache = FTunnelCoreCacheState();
@@ -2698,8 +2825,46 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
     thread_local uint32 CachedLayout      = 0xFFFFFFFFu;
     thread_local bool CachedUsesFusedCacheWindow = false;
+    thread_local bool CachedUsesTileCacheWindow = false;
+    thread_local FIntVector CachedTileOrigin = FIntVector::ZeroValue;
+    thread_local int32 CachedTileStep = 0;
+    thread_local int32 CachedTileCells = 0;
+    thread_local uint64 CachedManagerLifetimeId = 0;
+    thread_local const TArray<FStrateTerrainOpEntry>* CachedTerrainOps = nullptr;
 
     const bool bUseFusedCacheWindow = OutTunnelCore != nullptr;
+    FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
+    int32 RequestedTileStep = 1;
+    int32 RequestedTileCells = 0;
+    const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
+        && VoxelGenLOD::GetThreadTileCacheWindow(
+            RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
+        && VoxelCaveMorphology::IsRoomGraphWindowInvariant(Params);
+    const uint64 CurrentManagerLifetimeId = StrateManager
+        ? StrateManager->GetCacheLifetimeId() : 0;
+    const int32 QueryChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
+    const int32 QueryChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
+    const int32 QueryChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+    const int32 CacheRegionChunks = bUseFusedCacheWindow ? 4 : 1;
+    const int32 CacheRegionSize = CHUNK_SIZE * CacheRegionChunks;
+    const int32 CacheRegionX = FMath::FloorToInt(
+        WorldX / static_cast<float>(CacheRegionSize));
+    const int32 CacheRegionY = FMath::FloorToInt(
+        WorldY / static_cast<float>(CacheRegionSize));
+    // BuildChunkCache bakes the selected immutable terrain-operation pool into each stored room.
+    // A tile may cross a strate-definition boundary in XY, so the pool identity is part of the
+    // cache key just like the generation-parameter fingerprint. The manager lifetime guards an
+    // allocator-reused definition address after a live layout/world change.
+    const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+    if (StrateManager)
+    {
+        UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(
+            FIntVector(
+                bUseFusedCacheWindow ? QueryChunkX : CacheRegionX,
+                bUseFusedCacheWindow ? QueryChunkY : CacheRegionY,
+                QueryChunkZ));
+        if (Def) TerrainOps = &Def->TerrainOperations;
+    }
 
     // Index of the room with the smallest (most-inside) SDF for this voxel.
     // Written by EvaluateSDFCached, read by the terrain ops block to pick the
@@ -2739,57 +2904,66 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         const bool bNeedRebuild =
             StrateIdx != CachedStrate || (uint32)Seed != CachedSeed ||
             ParamsFingerprint != CachedFingerprint || LayoutVersion != CachedLayout ||
+            CurrentManagerLifetimeId != CachedManagerLifetimeId ||
+            TerrainOps != CachedTerrainOps ||
             bUseFusedCacheWindow != CachedUsesFusedCacheWindow ||
+            bUseTileCacheWindow != CachedUsesTileCacheWindow ||
+            (bUseTileCacheWindow
+                && (RequestedTileOrigin != CachedTileOrigin
+                    || RequestedTileStep != CachedTileStep
+                    || RequestedTileCells != CachedTileCells)) ||
             WarpedX < CachedSMinX || WarpedX > CachedSMaxX ||
             WarpedY < CachedSMinY || WarpedY > CachedSMaxY;
 
         if (bNeedRebuild)
         {
             // The lowered evaluator uses the same window-invariance contract as the prepared
-            // room-graph source, but keeps a four-chunk XY window per worker.  A tile worker can
-            // visit neighbouring chunk keys in an arbitrary order; the larger deterministic
-            // window prevents those jumps from rebuilding the graph for every small tile while
-            // preserving the pointwise SDF.  The public/reference call keeps its historical
-            // one-chunk window.
-            const int32 QueryChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
-            const int32 QueryChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
-            const int32 CacheRegionChunks = bUseFusedCacheWindow ? 4 : 1;
-            const int32 CacheRegionSize = CHUNK_SIZE * CacheRegionChunks;
-            const int32 CacheRegionX = FMath::FloorToInt(
-                WorldX / static_cast<float>(CacheRegionSize));
-            const int32 CacheRegionY = FMath::FloorToInt(
-                WorldY / static_cast<float>(CacheRegionSize));
+            // room-graph source.  With the switch enabled, the search box is the exact requesting
+            // tile footprint plus the one-sample normal halo and deterministic warp margin.  A
+            // tile worker can visit neighbouring chunk keys in an arbitrary order without
+            // rebuilding the graph at every coarse sample.  Point queries without a tile context
+            // retain the historical fused four-chunk / ordinary one-chunk fallback.
             const float ChunkMinX = CacheRegionX * (float)CacheRegionSize;
             const float ChunkMinY = CacheRegionY * (float)CacheRegionSize;
             const float ChunkMaxX = ChunkMinX + (float)CacheRegionSize;
             const float ChunkMaxY = ChunkMinY + (float)CacheRegionSize;
-            const float Expansion = FMath::Abs(Params.CaveWarpStrength)
-                * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
-
-            const float SMinX = ChunkMinX - Expansion;
-            const float SMinY = ChunkMinY - Expansion;
-            const float SMaxX = ChunkMaxX + Expansion;
-            const float SMaxY = ChunkMaxY + Expansion;
-
-            // Fetch the terrain op probability pool for this chunk's strate.
-            // BuildChunkCache uses this to hash-roll one terrain op per room.
-            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-            if (StrateManager)
+            const float WarpMargin = FMath::Abs(Params.CaveWarpStrength)
+                * VOXEL_NOISE_SCALE * 1.5f;
+            float SMinX = ChunkMinX;
+            float SMinY = ChunkMinY;
+            float SMaxX = ChunkMaxX;
+            float SMaxY = ChunkMaxY;
+            if (bUseTileCacheWindow)
             {
-                const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
-                UVoxelStrateDefinition* Def = StrateManager->GetStrateForChunk(
-                    FIntVector(
-                        bUseFusedCacheWindow ? QueryChunkX : CacheRegionX,
-                        bUseFusedCacheWindow ? QueryChunkY : CacheRegionY,
-                        ChunkZ));
-                if (Def) TerrainOps = &Def->TerrainOperations;
+                const float TileMinX = static_cast<float>(RequestedTileOrigin.X);
+                const float TileMinY = static_cast<float>(RequestedTileOrigin.Y);
+                const float TileExtent = static_cast<float>(
+                    static_cast<int64>(RequestedTileStep)
+                    * static_cast<int64>(RequestedTileCells));
+                const float TileMaxX = TileMinX + TileExtent;
+                const float TileMaxY = TileMinY + TileExtent;
+                const float TileHalo = static_cast<float>(RequestedTileStep) + 2.0f;
+                const float Expansion = WarpMargin + TileHalo;
+                SMinX = TileMinX - Expansion;
+                SMinY = TileMinY - Expansion;
+                SMaxX = TileMaxX + Expansion;
+                SMaxY = TileMaxY + Expansion;
+            }
+            else
+            {
+                const float Expansion = WarpMargin + 2.0f;
+                SMinX = ChunkMinX - Expansion;
+                SMinY = ChunkMinY - Expansion;
+                SMaxX = ChunkMaxX + Expansion;
+                SMaxY = ChunkMaxY + Expansion;
             }
 
             VoxelCaveMorphology::BuildChunkCache(
                 SDFCache,
                 SMinX, SMinY, SMaxX, SMaxY,
                 Params, (uint32)Seed, StrateIdx,
-                TerrainOps
+                TerrainOps,
+                ERoomGraphBuildSite::GeneratorTile
             );
 
             CachedSMinX = SMinX; CachedSMaxX = SMaxX;
@@ -2799,6 +2973,13 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             CachedFingerprint = ParamsFingerprint;
             CachedLayout      = LayoutVersion;
             CachedUsesFusedCacheWindow = bUseFusedCacheWindow;
+            CachedUsesTileCacheWindow = bUseTileCacheWindow;
+            CachedTileOrigin = bUseTileCacheWindow
+                ? RequestedTileOrigin : FIntVector::ZeroValue;
+            CachedTileStep = bUseTileCacheWindow ? RequestedTileStep : 0;
+            CachedTileCells = bUseTileCacheWindow ? RequestedTileCells : 0;
+            CachedManagerLifetimeId = CurrentManagerLifetimeId;
+            CachedTerrainOps = TerrainOps;
         }
 
         // Evaluate SDF using cached rooms and tunnels (WARPED coordinates).
@@ -2824,16 +3005,17 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         //     transition as tunnel-to-room (no hard seam at PitTopZ)
         //   - bNearCaveSurface becomes true inside the shaft — roughness clamp
         //     prevents fill-back, so this is safe
-        for (const FCachedPit& Pit : SDFCache.Pits)
+        auto EvaluatePit = [&](int32 PitIndex)
         {
+            const FCachedPit& Pit = SDFCache.Pits[PitIndex];
             const float DZ = WorldZ - Pit.TopZ;  // Negative = below anchor (shaft)
-            if (DZ >= Pit.BlendK) continue;       // Above even the blend fringe
-            if (-DZ > Pit.Depth + Pit.BlendK) continue;
+            if (DZ >= Pit.BlendK) return;       // Above even the blend fringe
+            if (-DZ > Pit.Depth + Pit.BlendK) return;
 
-            float DX = WorldX - Pit.CenterX;
-            float DY = WorldY - Pit.CenterY;
-            float XYDistSq = DX * DX + DY * DY;
-            if (XYDistSq > Pit.BoundXYRadiusSq) continue;
+            const float DX = WorldX - Pit.CenterX;
+            const float DY = WorldY - Pit.CenterY;
+            const float XYDistSq = DX * DX + DY * DY;
+            if (XYDistSq > Pit.BoundXYRadiusSq) return;
 
             float PitSDF;
             if (DZ <= 0.0f)
@@ -2855,18 +3037,21 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
 
             CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
-        }
+        };
+        VF_ForEachChunkSDFSpatialCandidate(
+            SDFCache.PitSpatialIndex, SDFCache.Pits.Num(), WorldX, WorldY, EvaluatePit);
 
-        for (const FCachedChimney& Chim : SDFCache.Chimneys)
+        auto EvaluateChimney = [&](int32 ChimneyIndex)
         {
+            const FCachedChimney& Chim = SDFCache.Chimneys[ChimneyIndex];
             const float DZ = WorldZ - Chim.BottomZ;  // Positive = above anchor (shaft)
-            if (-DZ >= Chim.BlendK) continue;         // Below even the blend fringe
-            if (DZ > Chim.Height + Chim.BlendK) continue;
+            if (-DZ >= Chim.BlendK) return;         // Below even the blend fringe
+            if (DZ > Chim.Height + Chim.BlendK) return;
 
-            float DX = WorldX - Chim.CenterX;
-            float DY = WorldY - Chim.CenterY;
-            float XYDistSq = DX * DX + DY * DY;
-            if (XYDistSq > Chim.BoundXYRadiusSq) continue;
+            const float DX = WorldX - Chim.CenterX;
+            const float DY = WorldY - Chim.CenterY;
+            const float XYDistSq = DX * DX + DY * DY;
+            if (XYDistSq > Chim.BoundXYRadiusSq) return;
 
             float ChmSDF;
             if (DZ >= 0.0f)
@@ -2883,7 +3068,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
 
             CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
-        }
+        };
+        VF_ForEachChunkSDFSpatialCandidate(
+            SDFCache.ChimneySpatialIndex, SDFCache.Chimneys.Num(),
+            WorldX, WorldY, EvaluateChimney);
 
         // Convert SDF to density carving:
         // CaveSDF < 0 means we're inside a room/tunnel/pit → carve to air
@@ -3413,14 +3601,15 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // Columns are now pre-baked into SDFCache.Columns — no NearestRoomIdx needed.
     // The old per-voxel approach had columns appear/disappear mid-height when
     // the owning room changed (NearestRoomIdx switch). Pre-baking fixes this.
-    for (const FCachedColumn& Col : SDFCache.Columns)
+    auto EvaluateColumn = [&](int32 ColumnIndex)
     {
-        float DX = WorldX - Col.CenterX;
-        float DY = WorldY - Col.CenterY;
-        float XYDistSq = DX * DX + DY * DY;
-        if (XYDistSq > Col.BoundXYRadiusSq) continue;
+        const FCachedColumn& Col = SDFCache.Columns[ColumnIndex];
+        const float DX = WorldX - Col.CenterX;
+        const float DY = WorldY - Col.CenterY;
+        const float XYDistSq = DX * DX + DY * DY;
+        if (XYDistSq > Col.BoundXYRadiusSq) return;
 
-        float CylSDF = FMath::Sqrt(XYDistSq) - Col.Radius;
+        const float CylSDF = FMath::Sqrt(XYDistSq) - Col.Radius;
 
         const float ColBlend = 3.0f;
         if (CylSDF < ColBlend)
@@ -3429,7 +3618,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             Fill = SmoothStep01(Fill);
             Density += Fill * Col.BaseDensity * 1.5f;
         }
-    }
+    };
+    VF_ForEachChunkSDFSpatialCandidate(
+        SDFCache.ColumnSpatialIndex, SDFCache.Columns.Num(), WorldX, WorldY, EvaluateColumn);
 
     //=========================================================================
     // STEP 4g: DOMES (room-relative hemispherical ceilings)
@@ -5068,6 +5259,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     // keyed by their actual lattice step.
     TGuardValue<int32> ClassifySampleStepGuard(VoxelGenLOD::SampleStep, Step);
     const int32 CPA     = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
+    TGuardValue<FIntVector> ClassifyTileOriginGuard(
+        VoxelGenLOD::TileOriginVoxels, OriginVoxels);
+    TGuardValue<int32> ClassifyTileCellsGuard(
+        VoxelGenLOD::TileCellsPerAxis, CPA);
     const int32 GridDim = CPA + 1;   // cell-vertex count: g ∈ [0, CPA]
 
     // The mesher's outer one-sample halo is used only for central-difference normals. It cannot

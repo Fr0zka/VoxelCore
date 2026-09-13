@@ -1117,6 +1117,30 @@ struct VOXELFORGE_API FStrateGenerationParams
     }
 };
 
+// Keep the cache-key/memo-key audit mechanically tied to the struct.  C++ has no portable
+// reflection for UPROPERTY members, so the X-macro can at least prove that its listed byte sum
+// and the completed POD layout still agree.  The eight bytes below are the current, intentional
+// padding between the three bool/enum members and their following four-byte fields on the UE
+// toolchains supported by this plugin.  A field added to the struct or the list without its
+// counterpart changes one side of this equality and fails here instead of silently changing the
+// blend/key coverage.
+#define VF_STRATE_PARAM_SIZE_FIELD(Name) \
+    + sizeof(((FStrateGenerationParams*)nullptr)->Name)
+#define VF_STRATE_PARAM_COUNT_FIELD(Name) + 1
+constexpr SIZE_T VF_StrateParamListedBytes =
+    0 VF_STRATE_PARAM_FIELDS(VF_STRATE_PARAM_SIZE_FIELD, VF_STRATE_PARAM_SIZE_FIELD);
+constexpr int32 VF_StrateParamListedFieldCount =
+    0 VF_STRATE_PARAM_FIELDS(VF_STRATE_PARAM_COUNT_FIELD, VF_STRATE_PARAM_COUNT_FIELD);
+#undef VF_STRATE_PARAM_SIZE_FIELD
+#undef VF_STRATE_PARAM_COUNT_FIELD
+
+static_assert(
+    VF_StrateParamListedFieldCount == 83,
+    "FStrateGenerationParams field count changed; update the struct and VF_STRATE_PARAM_FIELDS together.");
+static_assert(
+    sizeof(FStrateGenerationParams) == VF_StrateParamListedBytes + 8,
+    "FStrateGenerationParams and VF_STRATE_PARAM_FIELDS disagree; update both places and recheck the expected padding.");
+
 //=============================================================================
 // TERRAIN OPERATION REFERENCE
 //=============================================================================
