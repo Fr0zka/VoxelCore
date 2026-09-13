@@ -45,6 +45,9 @@ So: normals can cost as much as the entire density grid; a SurfaceWorld chunk do
 **T1.c — Collision only where it matters.** `bShouldCreateCollision = (LOD == 0)`. Distant chunks are unreachable by definition (if the player got there, they'd be LOD0 — and the LOD reconciliation loop §8.10 guarantees a hot-swap on approach). Kills Chaos cooking + collision memory for the large majority of loaded chunks. Also check RMC's async-collision setting is on. **Likely the best win-per-line-changed in the whole document.**
 
 **T1.d — Chunk classification: skip trivially solid/air chunks before sampling.** ✅ DONE 2026-07-05
+⛔ **Turned OFF in streaming 2026-09-13.** After the operator stack, it cost more than it saved on the
+game path (WORK-NEXT.md A/B). Do not re-propose tile classification without a design that is
+cheaper than meshing the tile.
 (v2 — `UVoxelGenerator::ClassifyTile`, see ARCHITECTURE §8.10; a 2026-06-26 v1 with a global ceiling
 bound was reverted for roof holes. Trigger: trace showed 84 % of GenerateMesh calls produced empty
 tiles.) In a tall multi-strate world most chunks in the desired set are full bedrock or full sky. Conservative per-chunk test before the 33³ sample: for heightfield strates, min/max terrain over the footprint (free from T1.a's column grid ± noise amplitude bound) vs the chunk's Z range; for cave strates, "no room/tunnel/passage/spine/seal/diff-layer bounds intersect" (all bounding data already exists). Fully-solid/air ⇒ empty MeshData, no component, done. Cuts whole chunks, not percentages — compounds with everything else.

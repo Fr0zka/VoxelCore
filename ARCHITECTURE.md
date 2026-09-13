@@ -794,6 +794,13 @@ driven by `EditorBrush*` props.
   shadow-casting tile emits a second shadow-pass draw; the far coarse tiles don't need it. NOTE: fps is
   RENDER-side (draws ≈ visible tile count × passes); generation cost (workers) and tile *resolution*
   (cuts triangles, not draws/components) don't move the game thread — tile COUNT does (hence the clipmap).
+- ⛔ **2026-09-13: streaming no longer calls `ClassifyTile` by default** (`voxel.OuterClassifierMode`
+  = 0; `=1` restores it as an A/B instrument). Measured on the headless game path with nested
+  refinement off, the classifier plus its exact validation cost more than they saved. Mode 0 had
+  ready p95 182 vs 190-195 ms, generation p95 125-127 vs 139-141 ms, and 18% fewer density calls,
+  with 841/841 tiles triangle-identical (WORK-NEXT.md). Proving a 33³ core uniform costs almost
+  as much as meshing 35³. The history below explains why it existed. Its soundness tests still
+  guard it.
 - **Trivial-empty tile reject (T1.d) — v2 SHIPPED (2026-07-05); v1 was reverted 2026-06-26.**
   `UVoxelGenerator::ClassifyTile(Origin, Step, Cells)` runs on the gen worker BEFORE the density
   pre-sample (`LoadTile` task, scope `VoxelForge_ClassifyTile`); `AllSolid`/`AllAir` ⇒ GenerateMesh is

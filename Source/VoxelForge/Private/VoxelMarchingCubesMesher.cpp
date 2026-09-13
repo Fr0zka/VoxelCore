@@ -38,7 +38,6 @@ namespace
 FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, int32 Step, int32 InCellsPerAxis,
                                                        TArray<uint8>* OutCaptureGrid,
                                                        int32 BandZMinVox, int32 BandZMaxVox,
-                                                       const FVoxelMesherCoreDensityGrid* ReusableCoreGrid,
                                                        int64* OutDensitySampleCount)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_MesherGenerateMesh);
@@ -230,13 +229,6 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     const int32 CellsPerAxis = FMath::Clamp(InCellsPerAxis, 2, CHUNK_SIZE);  // coarse tiles use fewer
     const int32 GridDim      = CellsPerAxis + 1;
     const int32 MDim         = GridDim + 2;            // +1 marge de chaque côté
-    const bool bUseReusableCoreGrid = !OutCaptureGrid
-        && ReusableCoreGrid
-        && ReusableCoreGrid->OriginVoxels == OriginVoxels
-        && ReusableCoreGrid->Step == Step
-        && ReusableCoreGrid->CellsPerAxis == CellsPerAxis
-        && ReusableCoreGrid->Samples.Num() == GridDim * GridDim * GridDim;
-
     // COUPE DE CONTENU PAR STRATE — restreint le maillage (et l'échantillonnage) aux cellules
     // dont l'intervalle Z chevauche la bande [BandZMinVox, BandZMaxVox] (voxels inclusifs).
     // Les tuiles à capture ne sont jamais bandées (niveau 0 — garde-fou ci-dessous).
@@ -541,7 +533,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     // gradient) sont échantillonnées — le reste du tampon reste non initialisé et non lu.
     VoxelDensityProfile::FScopedTimer MesherDensityGridTimer(
         VoxelDensityProfile::EBucket::MesherDensityGrid);
-    const bool bUseOperatorBlock = !bUseSharedDensityGrid && !bUseReusableCoreGrid
+    const bool bUseOperatorBlock = !bUseSharedDensityGrid
         && GVoxelForgeUseOperatorBlock != 0;
     if (bUseOperatorBlock)
     {
@@ -575,14 +567,6 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                     const int32 SharedZ = SharedDeltaZ + gz;
                     DensityGrid[LocalIndex] = ReuseGrid->Samples[
                         (SharedZ * ReuseGrid->Dim + SharedY) * ReuseGrid->Dim + SharedX];
-                }
-                else if (bUseReusableCoreGrid
-                    && gx >= 0 && gx < GridDim
-                    && gy >= 0 && gy < GridDim
-                    && gz >= 0 && gz < GridDim)
-                {
-                    DensityGrid[LocalIndex] = ReusableCoreGrid->Samples[
-                        (gz * GridDim + gy) * GridDim + gx];
                 }
                 else
                 {

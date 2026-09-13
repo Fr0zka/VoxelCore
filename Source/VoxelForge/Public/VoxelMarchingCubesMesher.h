@@ -38,8 +38,6 @@ struct FVoxelSharedDensityGrid
     }
 };
 
-struct FVoxelMesherCoreDensityGrid;
-
 UCLASS(BlueprintType)
 class VOXELFORGE_API UVoxelMarchingCubesMesher : public UObject
 {
@@ -72,7 +70,6 @@ public:
     FVoxelMeshData GenerateMesh(FIntVector OriginVoxels, int32 Step = 1, int32 CellsPerAxis = CHUNK_SIZE,
                                 TArray<uint8>* OutCaptureGrid = nullptr,
                                 int32 BandZMinVox = INT32_MIN, int32 BandZMaxVox = INT32_MAX,
-                                const FVoxelMesherCoreDensityGrid* ReusableCoreGrid = nullptr,
                                 int64* OutDensitySampleCount = nullptr);
 
     /**
@@ -165,23 +162,4 @@ public:
     // 0 (default) = off — every LOD samples full octaves, byte-identical to before.
     // Réduction d'octaves sur les tuiles grossières ; 0 = désactivé.
     int32 LODOctaveDrop = 0;
-};
-
-// A per-tile core lattice produced by the outer classifier's exact validation.  Unlike
-// FVoxelSharedDensityGrid this is intentionally local to one GenerateMesh call: validation can
-// run concurrently on several streaming workers without mutating shared mesher state.
-struct FVoxelMesherCoreDensityGrid
-{
-    FIntVector OriginVoxels = FIntVector::ZeroValue;
-    int32 Step = 1;
-    int32 CellsPerAxis = 0;
-    TArray<float> Samples;
-
-    void Reset()
-    {
-        OriginVoxels = FIntVector::ZeroValue;
-        Step = 1;
-        CellsPerAxis = 0;
-        Samples.Reset();
-    }
 };

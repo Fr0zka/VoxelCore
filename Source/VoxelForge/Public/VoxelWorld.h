@@ -111,7 +111,6 @@ struct FChunkResult
     // count exact validation and mesher density calls locally, then publish one aggregate update.
     int64 ValidationDensityCalls = 0;
     int64 MesherDensityCalls = 0;
-    bool bValidationCoreReused = false;
     bool bAborted = false;    // Worker observed shutdown or cancellation; never mark this tile loaded
     bool bObsolete = false;   // Worker observed per-tile desired-set cancellation
     uint32 DesiredEpoch = 0;  // Desired-set epoch captured at request time
@@ -929,7 +928,6 @@ public:
     std::atomic<uint64> TotalObsoleteWorkerTasks{0};
     std::atomic<uint64> TotalValidationDensityCalls{0};
     std::atomic<uint64> TotalMesherDensityCalls{0};
-    std::atomic<uint64> TotalValidationCoreReuseTiles{0};
     std::atomic<uint64> OuterClassifierCallsByLOD[TrackedClassifierLODCount]{};
     std::atomic<uint64> OuterClassifierVerdictsByLOD[TrackedClassifierLODCount][3]{};
 

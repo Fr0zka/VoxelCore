@@ -28,6 +28,10 @@ The player falls through the world. There is **no invariant** that a tile you oc
 **Do**: record cook-complete; gate the pawn (spawn and movement) on the supporting tile being
 collidable, not merely applied.
 
+✅ **Owner playtest, 2026-09-13: he can no longer fall through the world.** The gate uses RMC's
+`SetCollisionConfig()` future as the authority (`HandleTileCollisionCookComplete`,
+`IsPlayerSupportCollisionReady`).
+
 📖 **Reading `Plugins/RealtimeMeshComponent` is permitted for this item — READ ONLY.** Find whether a
 cook-complete delegate/flag exists. ⛔ No edits, no builds against it: the owner's copy carries custom
 modifications and was destroyed once by an over-broad delete.
@@ -125,8 +129,14 @@ figure and does ~18% fewer density calls. It cannot remove geometry, since it sk
 *disproved* (`VoxelWorld.cpp` ~4012), and validation disproved none: 0 reuse tiles in every run. Mixed
 tiles, the ones that actually need a grid, never run validation, so there is nothing to reuse.
 
-**Recommendation, pending the owner:** set `GVoxelForgeOuterClassifierMode` default to 0. It stays
-switchable by `voxel.OuterClassifierMode`.
+**Done 2026-09-13, owner approved:** `GVoxelForgeOuterClassifierMode` now defaults to 0, and mode 2
+is deleted along with its reuse grid, its mesher parameter and its counter. Mode 1 is still
+reachable with `voxel.OuterClassifierMode=1` as an A/B instrument. Verified:
+- export OBJ SHA-256 unchanged (`b3e5f4c3..9b377`)
+- a run without the override prints `outer_classifier_mode=0 validation_density_calls=0`
+- **841/841 tiles have identical triangle counts between mode 0 and mode 1**. The 394 tiles mode 1
+  skipped as uniform produce 0 triangles in mode 0, so the strate band cut was not hiding geometry
+  behind the classifier.
 
 ⚠️ **Correction to `f204413`.** Its message says the nested classifier's 3.5x "cannot be reproduced".
 That was my measurement error: I passed `-voxel.UseBlockEarlyOut=1` (the STREAMING console variable)
