@@ -145,6 +145,18 @@ nested refinement off. Re-run with the right flag: `-blockearlyout=0` 0.553 / 0.
 `-blockearlyout=1` 2.036 / 2.060 s, which is **3.6x**, with byte-identical geometry. The 3.5x was real,
 and disabling nested refinement in streaming (`f204413`) was worth it.
 
+## Room-cache work, 2026-09-13 (`2990009`, `2de603c`, `cfad3d1`)
+Player-fit memo, then the tile-sized room cache gated to LOD3+ (fused) / LOD4+ (op-stack). Against
+`2990009`, static worker CPU is 48 -> 39 s and moving 125 -> 114 s, with identical geometry.
+
+⚠️ **Correction to `cfad3d1`.** Its message says absolute numbers drift because "the machine is in
+daytime use." That was my unverified guess, and it is false: the owner had not used the PC all day.
+The real signal is systematic. The switch-off baseline came out at 58 s in two rounds hours apart,
+against 48 s at `2990009`. So something left ON with `voxel.TileCacheWindow=0` costs ~10 s, and LOD0
+generation p50 is ~4% slower than at `2990009` (73 -> 77 ms static). Queued: attribute it with
+in-tree switches (first suspect: `voxel.SpatialIndex` auto-on at fused LOD1-2), never by running old
+commits.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
