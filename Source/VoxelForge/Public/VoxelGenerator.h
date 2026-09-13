@@ -63,7 +63,7 @@ namespace VoxelGenLOD
     VOXELFORGE_API void SetThreadOctaveBias(int32 Value);
     VOXELFORGE_API int32 GetThreadSampleStep();
     VOXELFORGE_API void SetThreadSampleStep(int32 Value);
-    VOXELFORGE_API bool IsTileCacheWindowEnabled();
+    VOXELFORGE_API bool IsTileCacheWindowEnabled(bool bFusedPath = true);
     VOXELFORGE_API bool GetThreadTileCacheWindow(
         FIntVector& OutOriginVoxels, int32& OutStep, int32& OutCellsPerAxis);
 
@@ -425,6 +425,13 @@ private:
     void RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,
                           const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const;
 };
+
+namespace VoxelGenLOD
+{
+    // -1 uses the measured path/LOD policy; 0/1 force the spatial broad phase off/on for an A/B
+    // run. The policy affects candidate enumeration only, never cache contents or ordering.
+    VOXELFORGE_API bool ShouldUseSpatialIndex(bool bFusedPath);
+}
 
 /**
  * Optional diagnostics for one ClassifyTile call.  This is populated only when the caller asks

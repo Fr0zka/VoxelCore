@@ -3822,6 +3822,21 @@ namespace
              *  voxel PRÈS D'UNE SURFACE, pas partout) sans que onze opérateurs la refassent chacun. */
             FStrateGenerationParams LocalParams;
             bool bLocalParamsValid = false;
+
+            // Window invariance is a cache-policy proof, not a sample evaluator.  Keep its result
+            // beside the worker-local source state so LOD0 does not pay the full reach walk once
+            // per voxel.
+            bool bTileCachePolicyValid = false;
+            bool bTileCachePolicyResult = false;
+            bool bTileCachePolicyHasContext = false;
+            int32 TileCachePolicySampleStep = 0;
+            FIntVector TileCachePolicyOrigin = FIntVector::ZeroValue;
+            int32 TileCachePolicyStep = 0;
+            int32 TileCachePolicyCells = 0;
+            uint32 TileCachePolicyFingerprint = 0xFFFFFFFFu;
+            uint32 TileCachePolicyLayout = 0xFFFFFFFFu;
+            uint64 TileCachePolicyManagerLifetimeId = 0;
+            const TArray<FStrateTerrainOpEntry>* TileCachePolicyTerrainOps = nullptr;
         };
 
         FState& State() const
@@ -3861,7 +3876,8 @@ namespace
             FTunnelSupportFloorColumn& OutColumn) const
         {
             VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                WorldX, WorldY, Cache, OutColumn);
+                WorldX, WorldY, Cache, OutColumn,
+                VoxelGenLOD::ShouldUseSpatialIndex(false));
         }
 
         const FTunnelSupportFloorColumn* GetSupportColumn(const FVector& Position) const
@@ -3917,7 +3933,8 @@ namespace
                 const FVector& Position = S.LastWorldPosition;
                 const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(Position);
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                    Position.X, Position.Y, Position.Z, GetCache(), SupportColumn);
+                    Position.X, Position.Y, Position.Z, GetCache(), SupportColumn,
+                    VoxelGenLOD::ShouldUseSpatialIndex(false));
                 S.LastTunnelCoreEvaluationPosition = Position;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
             }
@@ -3991,7 +4008,9 @@ namespace
          */
         float ProbeSdfUnwarped(float X, float Y, float Z) const
         {
-            return VoxelCaveMorphology::EvaluateSDFCached(X, Y, Z, GetCache(), P.SDFBlendRadius);
+            return VoxelCaveMorphology::EvaluateSDFCached(
+                X, Y, Z, GetCache(), P.SDFBlendRadius, nullptr,
+                VoxelGenLOD::ShouldUseSpatialIndex(false));
         }
 
         /** Le Z « effectif » : `VerticalScale` étire le monde AVANT le bruit. Pure fonction de Z et
@@ -4126,10 +4145,47 @@ namespace
             FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
             int32 RequestedTileStep = SampleStep;
             int32 RequestedTileCells = 0;
-            const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
-                && VoxelGenLOD::GetThreadTileCacheWindow(
-                    RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
-                && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P);
+            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+            if (LiveManager)
+            {
+                const int32 ChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
+                const int32 ChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
+                const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
+                UVoxelStrateDefinition* Def = LiveManager->GetStrateForChunk(
+                    FIntVector(ChunkX, ChunkY, ChunkZ));
+                if (Def) { TerrainOps = &Def->TerrainOperations; }
+            }
+            const bool bTileWindowEligible = VoxelGenLOD::IsTileCacheWindowEnabled(false);
+            const bool bHasTileWindowContext = VoxelGenLOD::GetThreadTileCacheWindow(
+                RequestedTileOrigin, RequestedTileStep, RequestedTileCells);
+            const bool bTilePolicyKeyChanged =
+                !S.bTileCachePolicyValid
+                || S.bTileCachePolicyHasContext
+                    != (bTileWindowEligible && bHasTileWindowContext)
+                || S.TileCachePolicySampleStep != RequestedTileStep
+                || S.TileCachePolicyOrigin != RequestedTileOrigin
+                || S.TileCachePolicyStep != RequestedTileStep
+                || S.TileCachePolicyCells != RequestedTileCells
+                || S.TileCachePolicyFingerprint != ParamsFingerprint
+                || S.TileCachePolicyLayout != LayoutVersion
+                || S.TileCachePolicyManagerLifetimeId != ManagerLifetimeId
+                || S.TileCachePolicyTerrainOps != TerrainOps;
+            if (bTilePolicyKeyChanged)
+            {
+                S.bTileCachePolicyValid = true;
+                S.bTileCachePolicyHasContext = bTileWindowEligible && bHasTileWindowContext;
+                S.TileCachePolicySampleStep = RequestedTileStep;
+                S.TileCachePolicyOrigin = RequestedTileOrigin;
+                S.TileCachePolicyStep = RequestedTileStep;
+                S.TileCachePolicyCells = RequestedTileCells;
+                S.TileCachePolicyFingerprint = ParamsFingerprint;
+                S.TileCachePolicyLayout = LayoutVersion;
+                S.TileCachePolicyManagerLifetimeId = ManagerLifetimeId;
+                S.TileCachePolicyTerrainOps = TerrainOps;
+                S.bTileCachePolicyResult = S.bTileCachePolicyHasContext
+                    && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P, TerrainOps);
+            }
+            const bool bUseTileCacheWindow = S.bTileCachePolicyResult;
             int32 RegionSize = 0;
             int32 RegionMinX = 0;
             int32 RegionMinY = 0;
@@ -4143,9 +4199,11 @@ namespace
             }
             else
             {
-                const int32 RegionChunks = SampleStep <= 1
-                    ? 1
-                    : (SampleStep >= 32 ? 4 : FMath::Max(4, (SampleStep + 3) / 4));
+                // Fine requests retain the historical four-chunk worker window. The op-stack
+                // tile-sized window is gated to LOD4+ (the fused path starts at LOD3), so
+                // LOD0-LOD2 and the op-stack's LOD3 floor do not pay a full tile rebuild on their
+                // critical path while still reusing neighbouring chunks on the same worker.
+                const int32 RegionChunks = 4;
                 RegionSize = CHUNK_SIZE * RegionChunks;
                 const int32 RegionCellX = FMath::FloorToInt(WorldX / (float)RegionSize);
                 const int32 RegionCellY = FMath::FloorToInt(WorldY / (float)RegionSize);
@@ -4156,17 +4214,6 @@ namespace
                 * VOXEL_NOISE_SCALE * VF_PerlinAbsBound
                 + (bUseTileCacheWindow ? static_cast<float>(SampleStep) : 0.0f)
                 + 2.0f;
-
-            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-            if (LiveManager)
-            {
-                const int32 ChunkX = FMath::FloorToInt(WorldX / (float)CHUNK_SIZE);
-                const int32 ChunkY = FMath::FloorToInt(WorldY / (float)CHUNK_SIZE);
-                const int32 ChunkZ = FMath::FloorToInt(WorldZ / (float)CHUNK_SIZE);
-                UVoxelStrateDefinition* Def = LiveManager->GetStrateForChunk(
-                    FIntVector(ChunkX, ChunkY, ChunkZ));
-                if (Def) { TerrainOps = &Def->TerrainOperations; }
-            }
 
             const FChunkSDFCache* PreviousActiveCache = S.ActiveCache;
             bool bRebuiltLocalCache = false;
@@ -4247,9 +4294,10 @@ namespace
                 S.SupportColumns.Invalidate();
             }
 
+            const bool bUseSpatialIndex = VoxelGenLOD::ShouldUseSpatialIndex(false);
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
                 WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius,
-                &S.NearestRoom);
+                &S.NearestRoom, bUseSpatialIndex);
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -4289,7 +4337,7 @@ namespace
             };
             VF_ForEachChunkSDFSpatialCandidate(
                 GetCache().PitSpatialIndex, GetCache().Pits.Num(),
-                WorldX, WorldY, EvaluatePit);
+                WorldX, WorldY, EvaluatePit, bUseSpatialIndex);
 
             auto EvaluateChimney = [&](int32 ChimneyIndex)
             {
@@ -4320,7 +4368,7 @@ namespace
             };
             VF_ForEachChunkSDFSpatialCandidate(
                 GetCache().ChimneySpatialIndex, GetCache().Chimneys.Num(),
-                WorldX, WorldY, EvaluateChimney);
+                WorldX, WorldY, EvaluateChimney, bUseSpatialIndex);
 
             InOut.Sdf = CaveSDF;
 
@@ -4332,7 +4380,8 @@ namespace
             const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(
                 S.LastWorldPosition);
             S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                WorldX, WorldY, WorldZ, GetCache(), SupportColumn);
+                WorldX, WorldY, WorldZ, GetCache(), SupportColumn,
+                bUseSpatialIndex);
             S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
             S.bLastTunnelCoreWorldEvaluationValid = true;
             if (S.LastTunnelCoreWorldEvaluation.bSupportFloor
@@ -4782,13 +4831,49 @@ namespace
                 return;
             }
 
+            int32 StrateIdx = 0;
+            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
+            if (LiveManager)
+            {
+                StrateIdx = LiveManager->GetStrateIndex(
+                    ((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
+                for (int32 CZ = CZ0 + 1; CZ <= CZ1; ++CZ)
+                {
+                    if (LiveManager->GetStrateIndex(
+                            ((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
+                    {
+                        Unknown();
+                        return;
+                    }
+                }
+
+                // A room operation is part of the graph cache. Every Z slice covered by this
+                // proof must resolve to the same definition before one cache can represent it.
+                UVoxelStrateDefinition* Def0 = nullptr;
+                for (int32 CZ = CZ0; CZ <= CZ1; ++CZ)
+                {
+                    UVoxelStrateDefinition* Def =
+                        LiveManager->GetStrateForChunk(FIntVector(0, 0, CZ));
+                    if (CZ == CZ0)
+                    {
+                        Def0 = Def;
+                    }
+                    else if (Def != Def0)
+                    {
+                        Unknown();
+                        return;
+                    }
+                }
+                if (Def0) { TerrainOps = &Def0->TerrainOperations; }
+            }
+
             FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
             int32 RequestedTileStep = FMath::Max(Ctx.Step, 1);
             int32 RequestedTileCells = 0;
-            const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled()
+            const bool bUseTileCacheWindow = VoxelGenLOD::IsTileCacheWindowEnabled(false)
                 && VoxelGenLOD::GetThreadTileCacheWindow(
                     RequestedTileOrigin, RequestedTileStep, RequestedTileCells)
-                && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P);
+                && VoxelCaveMorphology::IsRoomGraphWindowInvariant(P, TerrainOps);
             const float RequestedTileExtent = static_cast<float>(
                 static_cast<int64>(RequestedTileStep)
                 * static_cast<int64>(RequestedTileCells));
@@ -4847,46 +4932,6 @@ namespace
             {
                 Unknown();
                 return;
-            }
-
-            int32 StrateIdx = 0;
-            const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr;
-            if (LiveManager)
-            {
-                StrateIdx = LiveManager->GetStrateIndex(
-                    ((float)CZ0 + 0.5f) * CHUNK_SIZE * VOXEL_SIZE);
-                for (int32 CZ = CZ0 + 1; CZ <= CZ1; ++CZ)
-                {
-                    if (LiveManager->GetStrateIndex(
-                            ((float)CZ + 0.5f) * CHUNK_SIZE * VOXEL_SIZE) != StrateIdx)
-                    {
-                        Unknown();
-                        return;
-                    }
-                }
-
-                // The room-op pool is part of the SDF: BuildChunkCache bakes pits, chimneys, and
-                // columns from it. Every chunk touched by this query must therefore resolve to the
-                // same definition before one cache can represent the box.
-                // GetStrateForChunk is a Z-layout lookup; the manager ignores
-                // X/Y. Check one representative per touched Z instead of
-                // repeating the same layout search for every coarse XY key.
-                UVoxelStrateDefinition* Def0 = nullptr;
-                for (int32 CZ = CZ0; CZ <= CZ1; ++CZ)
-                {
-                    UVoxelStrateDefinition* Def =
-                        LiveManager->GetStrateForChunk(FIntVector(0, 0, CZ));
-                    if (CZ == CZ0)
-                    {
-                        Def0 = Def;
-                    }
-                    else if (Def != Def0)
-                    {
-                        Unknown();
-                        return;
-                    }
-                }
-                if (Def0) { TerrainOps = &Def0->TerrainOperations; }
             }
 
             const uint32 LV = Ctx.LayoutVersion;
@@ -5085,7 +5130,8 @@ namespace
                         CacheSearchMaxY,
                         P, SeedU, StrateIdx, true,
                         CacheSearchMinZ,
-                        CacheSearchMaxZ);
+                        CacheSearchMaxZ,
+                        TerrainOps);
                 const int64 MaxSharedChunkSpan = Ctx.Step >= 32 ? 32 : 16;
                 bool bUsedSharedCache = false;
                 const bool bTileWithinSharedBudget = bUseTileCacheWindow
@@ -6747,13 +6793,15 @@ namespace
                     {
                         VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
                             static_cast<float>(World.X), static_cast<float>(World.Y),
-                            GetBoxCache(), EmptySupportColumn);
+                            GetBoxCache(), EmptySupportColumn,
+                            VoxelGenLOD::ShouldUseSpatialIndex(false));
                         SupportColumn = &EmptySupportColumn;
                     }
                     const FTunnelCoreWorldEvaluation Evaluation =
                         VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                             static_cast<float>(World.X), static_cast<float>(World.Y),
-                            static_cast<float>(World.Z), GetBoxCache(), SupportColumn);
+                            static_cast<float>(World.Z), GetBoxCache(), SupportColumn,
+                            VoxelGenLOD::ShouldUseSpatialIndex(false));
                     ++B.ExactTailEvaluated;
                     if (!FMath::IsFinite(Evaluation.SDF))
                     {
@@ -8062,7 +8110,8 @@ namespace
             };
             VF_ForEachChunkSDFSpatialCandidate(
                 Rooms->GetCache().ColumnSpatialIndex,
-                Rooms->GetCache().Columns.Num(), WorldX, WorldY, EvaluateColumn);
+                Rooms->GetCache().Columns.Num(), WorldX, WorldY, EvaluateColumn,
+                VoxelGenLOD::ShouldUseSpatialIndex(false));
         }
 
         /** The cached column list is the complete source of this op's work.  A valid empty list is

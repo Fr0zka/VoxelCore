@@ -735,6 +735,8 @@ struct FStoredSample
             const FResolvedProgramCounter* LeafEntry = nullptr;
             const FResolvedSymbol* LeafFunction = nullptr;
             const FResolvedSymbol* LeafSource = nullptr;
+            uint64 LeafProgramCounter = 0;
+            bool bHasLeafProgramCounter = false;
             bool bSampleHasResolvedLeaf = false;
             bool bSampleHasWaitLike = false;
 
@@ -755,8 +757,8 @@ struct FStoredSample
                     }
                     if (FrameIndex == 0)
                     {
-                        LeafEntry = Entry;
-                        LeafFunction = FrameFunction;
+                        LeafProgramCounter = ProgramCounter;
+                        bHasLeafProgramCounter = true;
                         bSampleHasResolvedLeaf = true;
                     }
                 }
@@ -769,12 +771,8 @@ struct FStoredSample
                 {
                     if (FrameIndex == 0)
                     {
-                        LeafEntry = Entry;
-                        if (LeafFunction == nullptr)
-                        {
-                            LeafFunction = FirstFunctionSymbol(*Entry);
-                        }
-                        LeafSource = FirstSourceSymbol(*Entry);
+                        LeafProgramCounter = ProgramCounter;
+                        bHasLeafProgramCounter = true;
                     }
                     for (const FResolvedSymbol& Symbol : Entry->Symbols)
                     {
@@ -792,9 +790,17 @@ struct FStoredSample
                 }
             }
 
-            if (LeafEntry != nullptr && LeafSource == nullptr)
+            // SymbolCache is a TMap. FindOrAdd while resolving later frames may rehash it, so
+            // pointers captured during the loop are not stable. Re-find the leaf only after all
+            // PCs for this sample have been inserted.
+            if (bHasLeafProgramCounter)
             {
-                LeafSource = FirstSourceSymbol(*LeafEntry);
+                LeafEntry = SymbolCache.Find(LeafProgramCounter);
+                if (LeafEntry != nullptr)
+                {
+                    LeafFunction = FirstFunctionSymbol(*LeafEntry);
+                    LeafSource = FirstSourceSymbol(*LeafEntry);
+                }
             }
 
             auto AddToAggregate = [&](FProfileAggregateSet& Aggregate)

@@ -3849,9 +3849,21 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 return bMeasureTile && TileProfileEnd.Counters[Index] >= TileProfileStart.Counters[Index]
                     ? TileProfileEnd.Counters[Index] - TileProfileStart.Counters[Index] : 0;
             };
+            const auto CycleDelta = [&](VoxelDensityProfile::EBucket Bucket) -> uint64
+            {
+                const int32 Index = static_cast<int32>(Bucket);
+                return bMeasureTile && TileProfileEnd.Cycles[Index] >= TileProfileStart.Cycles[Index]
+                    ? TileProfileEnd.Cycles[Index] - TileProfileStart.Cycles[Index] : 0;
+            };
+            const double TileSeconds = FPlatformTime::Seconds() - TileStartSeconds;
+            const double CacheBuildSeconds = FPlatformTime::ToSeconds64(
+                CycleDelta(VoxelDensityProfile::EBucket::RoomGraphBuild));
+            const double EvaluationSeconds = FMath::Max(
+                0.0, TileSeconds - CacheBuildSeconds);
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
                      "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
+                     "cache_build=%.6f evaluation=%.6f "
                      "refine=%u stack=%u core_samples=%u final_samples=%u core_hits=%u final_hits=%u "
                      "core_leaves=%u final_leaves=%u tail_queries=%u tail_eval=%u "
                      "stack_work=%.6f core_work=%.6f final_work=%.6f tail_work=%.6f "
@@ -3868,7 +3880,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
-                FPlatformTime::Seconds() - TileStartSeconds,
+                TileSeconds, CacheBuildSeconds, EvaluationSeconds,
                 ClassifierStats.RefineNodes, ClassifierStats.StackBoxCalls,
                 ClassifierStats.ExactCoreSamples, ClassifierStats.ExactFinalSamples,
                 ClassifierStats.ExactCoreCacheHits, ClassifierStats.ExactFinalCacheHits,

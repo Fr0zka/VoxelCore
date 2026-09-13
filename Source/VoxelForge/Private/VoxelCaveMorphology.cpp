@@ -1538,12 +1538,13 @@ namespace
     template <typename FVisit>
     static int32 VF_ForEachSpatialCandidate(
         const FChunkSDFSpatialIndex& Index, int32 ItemCount,
-        float WorldX, float WorldY, FVisit&& Visit)
+        float WorldX, float WorldY, FVisit&& Visit,
+        bool bUseSpatialIndex = true)
     {
         int32 Begin = 0;
         int32 End = 0;
         int32 CandidateCount = 0;
-        if (Index.GetRange(WorldX, WorldY, Begin, End))
+        if (bUseSpatialIndex && Index.GetRange(WorldX, WorldY, Begin, End))
         {
             for (int32 Cursor = Begin; Cursor < End; ++Cursor)
             {
@@ -1786,6 +1787,10 @@ struct FBuildRoomMouthRise
 struct FVFRoomGraphReach
 {
     float DirectRoomReach = 0.0f;
+    // Complete XY reach of a room body plus any authored terrain operation that can be selected
+    // for that room. This is also used by the STORE cull; leaving it out would drop a room whose
+    // pit/chimney/detail override extends beyond the base SDF body.
+    float TerrainOpReach = 0.0f;
     float FloorReliefEnvelope = 0.0f;
     float BlendEnvelope = 0.0f;
     float MaxTunnelLength = 0.0f;
@@ -1808,8 +1813,324 @@ static float VF_RoomShapeReachUpperBound(float RadiusXY, float RadiusZ)
     return FMath::Max3(Ellipsoid, RoundedBox, Capsule);
 }
 
+// Terrain operations are authored outside FStrateGenerationParams and are selected per room at
+// cache-build time. The tile-window proof must therefore include both the transported params and
+// every operation that the pool can select. The limit is deliberately finite: an authored feature
+// beyond it uses the legacy worker window, while the fixed-margin proof remains valid for all
+// assets that stay inside this envelope.
+static constexpr float VF_MaxProvenTerrainOpExtent = 256.0f;
+
+static bool VF_ComputeTerrainOpEnvelope(
+    const FStrateGenerationParams& Params,
+    const TArray<FStrateTerrainOpEntry>* TerrainOps,
+    float BaseRoomReach,
+    float AllRoomRadiusEnvelope,
+    float BlendEnvelope,
+    float& OutReach)
+{
+    float MaxReach = BaseRoomReach;
+    float MaxAuthoredExtent = 0.0f;
+    bool bHasActiveTerrainOperation = false;
+
+    auto RecordAuthoredExtent = [&](float Extent) -> bool
+    {
+        if (!FMath::IsFinite(Extent) || Extent < 0.0f)
+        {
+            return false;
+        }
+        bHasActiveTerrainOperation = true;
+        MaxAuthoredExtent = FMath::Max(MaxAuthoredExtent, Extent);
+        return MaxAuthoredExtent <= VF_MaxProvenTerrainOpExtent;
+    };
+    auto RecordReach = [&](float Reach) -> bool
+    {
+        if (!FMath::IsFinite(Reach) || Reach < 0.0f)
+        {
+            return false;
+        }
+        MaxReach = FMath::Max(MaxReach, Reach);
+        return FMath::IsFinite(MaxReach);
+    };
+    auto RecordDetail = [&](float EffectRange) -> bool
+    {
+        return RecordAuthoredExtent(EffectRange)
+            && RecordReach(BaseRoomReach + EffectRange);
+    };
+    auto RecordStructural = [&](float EffectExtent, float FeatureReach) -> bool
+    {
+        return RecordAuthoredExtent(EffectExtent)
+            && RecordReach(FeatureReach);
+    };
+
+    auto AccumulateParams = [&](const FStrateGenerationParams& OpParams) -> bool
+    {
+        const float OperationValues[] = {
+            OpParams.TerraceStepHeight,
+            OpParams.TerraceHardness,
+            OpParams.TerraceNoiseDisplacement,
+            OpParams.LayerLineSpacing,
+            OpParams.LayerLineDepth,
+            OpParams.OverhangStrength,
+            OpParams.OverhangDepth,
+            OpParams.OverhangFrequency,
+            OpParams.RibbingSpacing,
+            OpParams.RibbingDepth,
+            OpParams.CliffStrength,
+            OpParams.ScallopStrength,
+            OpParams.ScallopFrequency,
+            OpParams.ArchDensity,
+            OpParams.ArchMinRadius,
+            OpParams.ArchMaxRadius,
+            OpParams.ColumnDensity,
+            OpParams.ColumnMinRadius,
+            OpParams.ColumnMaxRadius,
+            OpParams.PitDensity,
+            OpParams.PitMinRadius,
+            OpParams.PitMaxRadius,
+            OpParams.PitDepth,
+            OpParams.ChimneyDensity,
+            OpParams.ChimneyMinRadius,
+            OpParams.ChimneyMaxRadius,
+            OpParams.ChimneyHeight,
+            OpParams.DomeDensity,
+            OpParams.DomeMinRadius,
+            OpParams.DomeMaxRadius,
+            OpParams.DomeHeightRatio,
+            OpParams.PinchDensity,
+            OpParams.PinchStrength,
+            OpParams.PinchLength};
+        for (const float Value : OperationValues)
+        {
+            if (!FMath::IsFinite(Value))
+            {
+                return false;
+            }
+        }
+
+        if (OpParams.TerraceStepHeight > 0.0f)
+        {
+            if (OpParams.TerraceHardness < 0.0f || OpParams.TerraceHardness > 1.0f
+                || OpParams.TerraceNoiseDisplacement < 0.0f)
+            {
+                return false;
+            }
+            if (!RecordDetail(
+                    OpParams.TerraceStepHeight * 3.0f
+                    + OpParams.TerraceNoiseDisplacement + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.LayerLineSpacing > 0.0f)
+        {
+            if (OpParams.LayerLineDepth < 0.0f
+                || !RecordDetail(OpParams.LayerLineSpacing
+                    + OpParams.LayerLineDepth + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.RibbingSpacing > 0.0f)
+        {
+            if (OpParams.RibbingDepth < 0.0f
+                || !RecordDetail(OpParams.RibbingSpacing
+                    + OpParams.RibbingDepth + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.CliffStrength > 0.0f)
+        {
+            if (!RecordDetail(OpParams.CliffStrength + 8.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.ScallopStrength > 0.0f)
+        {
+            if (OpParams.ScallopFrequency <= 0.0f
+                || !RecordDetail(
+                    4.0f / OpParams.ScallopFrequency
+                    + OpParams.ScallopStrength + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.OverhangStrength > 0.0f)
+        {
+            if (OpParams.OverhangDepth < 0.0f
+                || OpParams.OverhangFrequency <= 0.0f
+                || !RecordDetail(OpParams.OverhangDepth * 2.0f + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.ArchDensity > 0.0f)
+        {
+            if (OpParams.ArchMinRadius < 0.0f || OpParams.ArchMaxRadius < 0.0f)
+            {
+                return false;
+            }
+            const float Radius = FMath::Max(OpParams.ArchMinRadius, OpParams.ArchMaxRadius);
+            if (!RecordStructural(
+                    Radius + 4.0f,
+                    AllRoomRadiusEnvelope * 1.2f + Radius + BlendEnvelope * 3.0f + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.ColumnDensity > 0.0f)
+        {
+            if (OpParams.ColumnMinRadius < 0.0f || OpParams.ColumnMaxRadius < 0.0f)
+            {
+                return false;
+            }
+            const float Radius = FMath::Max(OpParams.ColumnMinRadius, OpParams.ColumnMaxRadius);
+            if (!RecordStructural(
+                    Radius + 6.0f,
+                    AllRoomRadiusEnvelope * 0.75f + Radius + 6.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.PitDensity > 0.0f)
+        {
+            if (OpParams.PitMinRadius < 0.0f || OpParams.PitMaxRadius < 0.0f
+                || OpParams.PitDepth < 0.0f)
+            {
+                return false;
+            }
+            const float Radius = FMath::Max(OpParams.PitMinRadius, OpParams.PitMaxRadius);
+            if (!RecordStructural(
+                    2.0f * Radius + OpParams.PitDepth + BlendEnvelope + 4.0f,
+                    AllRoomRadiusEnvelope * 0.6f + 2.0f * Radius
+                        + OpParams.PitDepth + BlendEnvelope + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.ChimneyDensity > 0.0f)
+        {
+            if (OpParams.ChimneyMinRadius < 0.0f || OpParams.ChimneyMaxRadius < 0.0f
+                || OpParams.ChimneyHeight < 0.0f)
+            {
+                return false;
+            }
+            const float Radius = FMath::Max(
+                OpParams.ChimneyMinRadius, OpParams.ChimneyMaxRadius);
+            if (!RecordStructural(
+                    2.0f * Radius + OpParams.ChimneyHeight + BlendEnvelope + 4.0f,
+                    AllRoomRadiusEnvelope * 0.6f + 2.0f * Radius
+                        + OpParams.ChimneyHeight + BlendEnvelope + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.DomeDensity > 0.0f)
+        {
+            if (OpParams.DomeMinRadius < 0.0f || OpParams.DomeMaxRadius < 0.0f
+                || OpParams.DomeHeightRatio < 0.0f)
+            {
+                return false;
+            }
+            const float Radius = FMath::Max(OpParams.DomeMinRadius, OpParams.DomeMaxRadius);
+            if (!RecordStructural(
+                    Radius * (1.0f + OpParams.DomeHeightRatio) + 4.0f,
+                    AllRoomRadiusEnvelope * 0.4f + Radius
+                        * (1.0f + OpParams.DomeHeightRatio) + 4.0f))
+            {
+                return false;
+            }
+        }
+        if (OpParams.PinchDensity > 0.0f)
+        {
+            if (OpParams.PinchStrength < 0.0f || OpParams.PinchLength < 0.0f)
+            {
+                return false;
+            }
+            const float Extent = FMath::Max(OpParams.PinchStrength, OpParams.PinchLength);
+            if (!RecordStructural(
+                    Extent + 5.0f,
+                    AllRoomRadiusEnvelope * 0.85f + Extent + 5.0f))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!AccumulateParams(Params))
+    {
+        return false;
+    }
+
+    if (TerrainOps != nullptr)
+    {
+        for (const FStrateTerrainOpEntry& Entry : *TerrainOps)
+        {
+            if (!FMath::IsFinite(Entry.Probability)
+                || Entry.Probability < 0.0f || Entry.Probability > 1.0f
+                || !FMath::IsFinite(Entry.Weight)
+                || Entry.Weight < 0.0f || Entry.Weight > 3.0f)
+            {
+                return false;
+            }
+            if (Entry.Probability <= 0.0f || Entry.Weight <= 0.0f)
+            {
+                continue;
+            }
+            if (Entry.Operation.IsNull())
+            {
+                continue;
+            }
+            const UVoxelTerrainOpDefinition* Operation = Entry.Operation.Get();
+            if (Operation == nullptr)
+            {
+                // A referenced but unloaded asset is not a proof of absence. Keep the legacy
+                // window until the manager has a concrete definition to inspect.
+                return false;
+            }
+            switch (Operation->Type)
+            {
+            case EVoxelTerrainOpType::Terrace:
+            case EVoxelTerrainOpType::LayerLines:
+            case EVoxelTerrainOpType::Ribbing:
+            case EVoxelTerrainOpType::Cliff:
+            case EVoxelTerrainOpType::Scallop:
+            case EVoxelTerrainOpType::Overhang:
+            case EVoxelTerrainOpType::Arch:
+            case EVoxelTerrainOpType::Column:
+            case EVoxelTerrainOpType::Pit:
+            case EVoxelTerrainOpType::Chimney:
+            case EVoxelTerrainOpType::Dome:
+            case EVoxelTerrainOpType::Pinch:
+                break;
+            default:
+                return false;
+            }
+
+            FStrateGenerationParams OperationParams{};
+            Operation->ApplyTo(OperationParams, Entry.Weight);
+            if (!AccumulateParams(OperationParams))
+            {
+                return false;
+            }
+        }
+    }
+
+    // Keep the field at zero when the strate has no active terrain operation.  The caller already
+    // has the base room envelope; using that same value as a second global room radius would make
+    // the legacy/no-op path store extra rooms and could change the canonical field.  Active pools
+    // publish the wider envelope so the tile proof and STORE cull see pits/chimneys/detail reach.
+    OutReach = bHasActiveTerrainOperation ? MaxReach : 0.0f;
+    return FMath::IsFinite(OutReach)
+        && FMath::IsFinite(MaxAuthoredExtent)
+        && MaxAuthoredExtent <= VF_MaxProvenTerrainOpExtent;
+}
+
 static bool VF_ComputeRoomGraphReach(
     const FStrateGenerationParams& Params,
+    const TArray<FStrateTerrainOpEntry>* TerrainOps,
     FVFRoomGraphReach& OutReach)
 {
     const float RelevantParams[] = {
@@ -1892,9 +2213,17 @@ static bool VF_ComputeRoomGraphReach(
             FMath::Abs(Params.TunnelMaxRadius)) * 1.18f);
     const float MaxTunnelLength = FMath::Max(
         Params.MaxTunnelLength, 0.0f);
-    const float DirectRoomReach = VF_RoomShapeReachUpperBound(
+    const float BaseDirectRoomReach = VF_RoomShapeReachUpperBound(
         AllRoomRadiusEnvelope, AllRoomHeightEnvelope)
         + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+    float TerrainOpReach = BaseDirectRoomReach;
+    if (!VF_ComputeTerrainOpEnvelope(
+            Params, TerrainOps, BaseDirectRoomReach,
+            AllRoomRadiusEnvelope, BlendEnvelope, TerrainOpReach))
+    {
+        return false;
+    }
+    const float DirectRoomReach = FMath::Max(BaseDirectRoomReach, TerrainOpReach);
     const float TunnelInfluence = FMath::Abs(Params.TunnelWarpStrength)
         + TunnelRadiusEnvelope + BlendEnvelope * 3.0f;
     const float MaxInfluence = FMath::Max(DirectRoomReach, TunnelInfluence);
@@ -1958,6 +2287,7 @@ static bool VF_ComputeRoomGraphReach(
     }
 
     OutReach.DirectRoomReach = DirectRoomReach;
+    OutReach.TerrainOpReach = TerrainOpReach;
     OutReach.FloorReliefEnvelope = FloorReliefEnvelope;
     OutReach.BlendEnvelope = BlendEnvelope;
     OutReach.MaxTunnelLength = MaxTunnelLength;
@@ -2000,9 +2330,10 @@ static bool VF_MayHaveRoomGraphFeature(
         {
             return true;
         }
-        const float RoomReach = VF_RoomShapeReachUpperBound(
+        const float BaseRoomReach = VF_RoomShapeReachUpperBound(
             Room.RadiusXY, Room.RadiusZ)
             + Reach.FloorReliefEnvelope + Reach.BlendEnvelope * 3.0f;
+        const float RoomReach = FMath::Max(BaseRoomReach, Reach.TerrainOpReach);
         if (!FMath::IsFinite(RoomReach) || RoomReach < 0.0f)
         {
             return true;
@@ -5474,7 +5805,8 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
     float SearchMaxX, float SearchMaxY,
     const FStrateGenerationParams& Params,
     uint32 Seed, int32 StrateIndex,
-    bool bUseZ, float SearchMinZ, float SearchMaxZ)
+    bool bUseZ, float SearchMinZ, float SearchMaxZ,
+    const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
     if (!FMath::IsFinite(SearchMinX) || !FMath::IsFinite(SearchMinY)
         || !FMath::IsFinite(SearchMaxX) || !FMath::IsFinite(SearchMaxY)
@@ -5496,7 +5828,7 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
     }
 
     FVFRoomGraphReach Reach;
-    if (!VF_ComputeRoomGraphReach(Params, Reach))
+    if (!VF_ComputeRoomGraphReach(Params, TerrainOps, Reach))
     {
         return true;
     }
@@ -5639,10 +5971,11 @@ bool VoxelCaveMorphology::MayHaveFeatureInSearchBox(
 }
 
 bool VoxelCaveMorphology::IsRoomGraphWindowInvariant(
-    const FStrateGenerationParams& Params)
+    const FStrateGenerationParams& Params,
+    const TArray<FStrateTerrainOpEntry>* TerrainOps)
 {
     FVFRoomGraphReach Reach;
-    return VF_ComputeRoomGraphReach(Params, Reach);
+    return VF_ComputeRoomGraphReach(Params, TerrainOps, Reach);
 }
 
 //=============================================================================
@@ -5707,7 +6040,8 @@ void VoxelCaveMorphology::BuildChunkCache(
     // behavior below.  The tile-window optimization is only a field-preserving optimization for
     // the finite parameter envelope accepted by VF_ComputeRoomGraphReach.
     FVFRoomGraphReach FeatureReach;
-    const bool bHasFeatureReach = VF_ComputeRoomGraphReach(Params, FeatureReach);
+    const bool bHasFeatureReach = VF_ComputeRoomGraphReach(
+        Params, TerrainOps, FeatureReach);
 
     //=========================================================================
     // INFLUENCE RADII
@@ -5801,7 +6135,9 @@ void VoxelCaveMorphology::BuildChunkCache(
     auto RoomReachesSearchBox = [&](const FVector& C, float RadiusXY, float RadiusZ) -> bool
     {
         const float ShapeReach = VF_RoomShapeReachUpperBound(RadiusXY, RadiusZ);
-        const float Reach = ShapeReach + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+        const float Reach = FMath::Max(
+            ShapeReach + FloorReliefEnvelope + BlendEnvelope * 3.0f,
+            bHasFeatureReach ? FeatureReach.TerrainOpReach : 0.0f);
         const float dx = FMath::Max3((float)(SearchMinX - C.X), 0.0f, (float)(C.X - SearchMaxX));
         const float dy = FMath::Max3((float)(SearchMinY - C.Y), 0.0f, (float)(C.Y - SearchMaxY));
         return (dx * dx + dy * dy) <= Reach * Reach;
@@ -6766,6 +7102,10 @@ void VoxelCaveMorphology::BuildChunkCache(
                     FMath::Abs(CR.ShapeA.Z));
             }
             MaxExtent = ShapeReach + FloorReliefEnvelope + BlendEnvelope * 3.0f;
+            if (bHasFeatureReach)
+            {
+                MaxExtent = FMath::Max(MaxExtent, FeatureReach.TerrainOpReach);
+            }
             CR.CullRadiusSq = MaxExtent * MaxExtent;
         }
 
@@ -7004,7 +7344,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache,
     float SDFBlendRadius,
-    int32* OutNearestRoomIdx)
+    int32* OutNearestRoomIdx,
+    bool bUseSpatialIndex)
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::RoomGraphSdf);
@@ -7117,7 +7458,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     };
 
     const int32 RoomCandidateCount = VF_ForEachSpatialCandidate(
-        Cache.RoomSpatialIndex, Cache.Rooms.Num(), WorldX, WorldY, EvaluateRoom);
+        Cache.RoomSpatialIndex, Cache.Rooms.Num(), WorldX, WorldY, EvaluateRoom,
+        bUseSpatialIndex);
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
@@ -7148,7 +7490,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     };
     VF_ForEachSpatialCandidate(
         Cache.RoomFloorJoinSpatialIndex, Cache.RoomFloorJoins.Num(),
-        WorldX, WorldY, EvaluateJoin);
+        WorldX, WorldY, EvaluateJoin, bUseSpatialIndex);
 
     //=========================================================================
     // Tunnel SDFs
@@ -7188,7 +7530,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     };
 
     const int32 TunnelCandidateCount = VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
+        bUseSpatialIndex);
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
@@ -7207,7 +7550,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
 
 float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
     float WorldX, float WorldY, float WorldZ,
-    const FChunkSDFCache& Cache)
+    const FChunkSDFCache& Cache,
+    bool bUseSpatialIndex)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
     float MinSDF = FLT_MAX;
@@ -7237,7 +7581,8 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
     };
 
     VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
+        bUseSpatialIndex);
 
     return MinSDF;
 }
@@ -7245,7 +7590,8 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
 FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache,
-    const FTunnelSupportFloorColumn* SupportColumn)
+    const FTunnelSupportFloorColumn* SupportColumn,
+    bool bUseSpatialIndex)
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::TunnelCoreWorld);
@@ -7358,7 +7704,8 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     };
 
     const int32 TunnelCandidateCount = VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
+        bUseSpatialIndex);
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
@@ -7371,14 +7718,17 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
 
 float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
     float WorldX, float WorldY, float WorldZ,
-    const FChunkSDFCache& Cache)
+    const FChunkSDFCache& Cache,
+    bool bUseSpatialIndex)
 {
-    return EvaluateTunnelCoreWorld(WorldX, WorldY, WorldZ, Cache).SDF;
+    return EvaluateTunnelCoreWorld(
+        WorldX, WorldY, WorldZ, Cache, nullptr, bUseSpatialIndex).SDF;
 }
 
 bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     float WorldX, float WorldY, float WorldZ,
-    const FChunkSDFCache& Cache)
+    const FChunkSDFCache& Cache,
+    bool bUseSpatialIndex)
 {
     const FVector Pos(WorldX, WorldY, WorldZ);
 
@@ -7462,7 +7812,7 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
 
     int32 Begin = 0;
     int32 End = 0;
-    if (Cache.TunnelSpatialIndex.GetRange(WorldX, WorldY, Begin, End))
+    if (bUseSpatialIndex && Cache.TunnelSpatialIndex.GetRange(WorldX, WorldY, Begin, End))
     {
         TestRange(Begin, End);
     }
@@ -7494,7 +7844,8 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
 void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
     float WorldX, float WorldY,
     const FChunkSDFCache& Cache,
-    FTunnelSupportFloorColumn& OutColumn)
+    FTunnelSupportFloorColumn& OutColumn,
+    bool bUseSpatialIndex)
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::TunnelCoreSupport);
@@ -7552,7 +7903,8 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
         }
     };
     const int32 CandidateCount = VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel);
+        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
+        bUseSpatialIndex);
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(

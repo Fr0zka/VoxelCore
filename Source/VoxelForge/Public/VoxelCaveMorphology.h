@@ -852,12 +852,13 @@ struct FChunkSDFSpatialIndex
 template <typename FVisit>
 FORCEINLINE int32 VF_ForEachChunkSDFSpatialCandidate(
     const FChunkSDFSpatialIndex& Index, int32 ItemCount,
-    float WorldX, float WorldY, FVisit&& Visit)
+    float WorldX, float WorldY, FVisit&& Visit,
+    bool bUseSpatialIndex = true)
 {
     int32 Begin = 0;
     int32 End = 0;
     int32 CandidateCount = 0;
-    if (Index.GetRange(WorldX, WorldY, Begin, End))
+    if (bUseSpatialIndex && Index.GetRange(WorldX, WorldY, Begin, End))
     {
         for (int32 Cursor = Begin; Cursor < End; ++Cursor)
         {
@@ -1008,14 +1009,16 @@ namespace VoxelCaveMorphology
         const FStrateGenerationParams& Params,
         uint32 Seed, int32 StrateIndex,
         bool bUseZ = false,
-        float SearchMinZ = 0.0f, float SearchMaxZ = 0.0f
+        float SearchMinZ = 0.0f, float SearchMaxZ = 0.0f,
+        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr
     );
 
     // True only for the finite parameter envelope for which BuildChunkCache's fixed collect
     // margin proves window invariance. Callers may widen the XY store window to a whole tile only
     // when this returns true; malformed or unbounded authored input must retain the legacy path.
     VOXELFORGE_API bool IsRoomGraphWindowInvariant(
-        const FStrateGenerationParams& Params
+        const FStrateGenerationParams& Params,
+        const TArray<FStrateTerrainOpEntry>* TerrainOps = nullptr
     );
 
     // PHASE 2: Evaluate the SDF at a single world position using cached data.
@@ -1036,7 +1039,8 @@ namespace VoxelCaveMorphology
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
         float SDFBlendRadius,
-        int32* OutNearestRoomIdx = nullptr
+        int32* OutNearestRoomIdx = nullptr,
+        bool bUseSpatialIndex = true
     );
 
     // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
@@ -1044,7 +1048,8 @@ namespace VoxelCaveMorphology
     // tunnel's walkable air core without reintroducing a connector or changing room ownership.
     VOXELFORGE_API float EvaluateTunnelCoreSDF(
         float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache
+        const FChunkSDFCache& Cache,
+        bool bUseSpatialIndex = true
     );
 
     // Evaluate the final structural air contract against the world-space wandering chain. Room
@@ -1052,13 +1057,15 @@ namespace VoxelCaveMorphology
     // walkable floor follows the authored chain exactly.
     VOXELFORGE_API float EvaluateTunnelCoreWorldSDF(
         float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache
+        const FChunkSDFCache& Cache,
+        bool bUseSpatialIndex = true
     );
 
     VOXELFORGE_API FTunnelCoreWorldEvaluation EvaluateTunnelCoreWorld(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
-        const FTunnelSupportFloorColumn* SupportColumn = nullptr
+        const FTunnelSupportFloorColumn* SupportColumn = nullptr,
+        bool bUseSpatialIndex = true
     );
 
     // True for the finite support slab beneath a world-space graph tunnel. The native density
@@ -1066,7 +1073,8 @@ namespace VoxelCaveMorphology
     // the rounded capsule's bottom from becoming an unsupported point.
     VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
         float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache
+        const FChunkSDFCache& Cache,
+        bool bUseSpatialIndex = true
     );
 
     // Build/query the same support-floor predicate at column granularity. The column stores its
@@ -1075,7 +1083,8 @@ namespace VoxelCaveMorphology
     VOXELFORGE_API void BuildTunnelSupportFloorColumn(
         float WorldX, float WorldY,
         const FChunkSDFCache& Cache,
-        FTunnelSupportFloorColumn& OutColumn
+        FTunnelSupportFloorColumn& OutColumn,
+        bool bUseSpatialIndex = true
     );
 
     VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(
