@@ -87,8 +87,8 @@ namespace
 
     // A proved N1-above-threshold block skips both worm noise calls.  The switch is parsed once
     // on the same scalar entry point as the other generation A/B switches; 0 is the exact legacy
-    // path, and 1 is the default after the proof/soundness test passes.
-    int32 GVoxelForgeWormBlockSkip = 1;
+    // path and remains the default until a tighter skip is justified by a future measurement.
+    int32 GVoxelForgeWormBlockSkip = 0;
     FAutoConsoleVariableRef CVarVoxelForgeWormBlockSkip(
         TEXT("voxel.WormBlockSkip"),
         GVoxelForgeWormBlockSkip,

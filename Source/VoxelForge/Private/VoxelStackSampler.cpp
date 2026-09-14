@@ -1,5 +1,5 @@
 // VoxelStackSampler.cpp
-// Fixed-storage sampling and post-run symbolization for VoxelForge generation workers.
+// Fixed-storage raw stack sampling for VoxelForge generation workers.
 
 #include "VoxelStackSampler.h"
 
@@ -18,6 +18,7 @@
 #include "Containers/StringConv.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
 #include "Serialization/Archive.h"
 #include "Templates/UniquePtr.h"
 
@@ -49,6 +50,20 @@ thread_local int32 GTlsRegisteredSlot = INDEX_NONE;
 thread_local uint64 GTlsRegistrationGeneration = 0;
 thread_local int32 GTlsRegistrationDepth = 0;
 thread_local int32 GTlsRegisteredLODLevel = INDEX_NONE;
+thread_local void* GTlsRegisteredImpl = nullptr;
+thread_local uint64 GTlsSamplerSessionGeneration = 0;
+
+std::atomic<uint64> GNextSamplerSessionGeneration(1);
+
+void ResetRegistrationTls()
+{
+    GTlsRegisteredSlot = INDEX_NONE;
+    GTlsRegistrationGeneration = 0;
+    GTlsRegistrationDepth = 0;
+    GTlsRegisteredLODLevel = INDEX_NONE;
+    GTlsRegisteredImpl = nullptr;
+    GTlsSamplerSessionGeneration = 0;
+}
 
 FString SanitizeLabel(const FString& InLabel)
 {
@@ -293,7 +308,7 @@ void AppendRows(
 
 struct FVoxelStackSampler::FImpl final : public FRunnable
 {
-struct FStoredSample
+    struct FStoredSample
     {
         uint64 ElapsedUs = 0;
         uint64 ThreadId = 0;
@@ -310,6 +325,7 @@ struct FStoredSample
     FString SummaryPath;
     double StartSeconds = 0.0;
     std::atomic<bool> bStop{false};
+    uint64 SamplerSessionGeneration = 0;
     std::atomic<uint64> NextRegistrationGeneration{1};
     FRegisteredThreadSlot Slots[MaxRegisteredThreads];
     TUniquePtr<FStoredSample[]> Samples;
@@ -337,6 +353,8 @@ struct FStoredSample
         , RunLabel(InRunLabel)
         , OutputDirectory(InOutputDirectory)
     {
+        SamplerSessionGeneration = GNextSamplerSessionGeneration.fetch_add(
+            1, std::memory_order_relaxed);
         const FString SafeLabel = SanitizeLabel(RunLabel);
         const uint32 ProcessId = FPlatformProcess::GetCurrentProcessId();
         RawSamplesPath = FPaths::Combine(
@@ -390,7 +408,9 @@ struct FStoredSample
     bool StartThread()
     {
 #if PLATFORM_WINDOWS
-        bStackWalkingInitialized = FPlatformStackWalk::InitStackWalking();
+        // CaptureThreadStackBackTrace uses the same-process context path and deliberately does
+        // not require DbgHelp. Initializing DbgHelp here made the measured process depend on
+        // global symbol-engine state before shutdown; symbolization is an offline concern.
         StartSeconds = FPlatformTime::Seconds();
 #endif
         Thread = FRunnableThread::Create(this, TEXT("VoxelStackSampler"), 0, TPri_Lowest);
@@ -414,8 +434,16 @@ struct FStoredSample
         const uint32 CurrentThreadId = FPlatformTLS::GetCurrentThreadId();
         if (GTlsRegistrationDepth > 0)
         {
-            ++GTlsRegistrationDepth;
-            return true;
+            if (GTlsRegisteredImpl == this
+                && GTlsSamplerSessionGeneration == SamplerSessionGeneration)
+            {
+                ++GTlsRegistrationDepth;
+                return true;
+            }
+
+            // A worker can outlive a session's owner-side shutdown. Never let stale TLS from
+            // that session masquerade as a nested registration in a later session.
+            ResetRegistrationTls();
         }
 
         const uint64 Generation = NextRegistrationGeneration.fetch_add(
@@ -439,6 +467,8 @@ struct FStoredSample
             GTlsRegistrationGeneration = Generation;
             GTlsRegistrationDepth = 1;
             GTlsRegisteredLODLevel = LODLevel;
+            GTlsRegisteredImpl = this;
+            GTlsSamplerSessionGeneration = SamplerSessionGeneration;
             return true;
         }
         return false;
@@ -467,9 +497,7 @@ struct FStoredSample
                 Slot.LODLevel.store(INDEX_NONE, std::memory_order_relaxed);
             }
         }
-        GTlsRegisteredSlot = INDEX_NONE;
-        GTlsRegistrationGeneration = 0;
-        GTlsRegisteredLODLevel = INDEX_NONE;
+        ResetRegistrationTls();
     }
 
     void CaptureRegisteredThreads(double NowSeconds)
@@ -598,7 +626,10 @@ struct FStoredSample
         Result.RunSeconds = FPlatformTime::Seconds() - StartSeconds;
 
         WriteRawSamples(Result);
-        SymbolizeAndWriteSummary(Result);
+        // Do not call the DbgHelp-backed symbolizer from the measured process. DbgHelp is a
+        // process-global state machine and can fault during shutdown even after the sampler
+        // thread has joined. The raw PCs remain available for a separate offline pass.
+        WriteRawOnlySummary(Result);
         return Result;
     }
 
@@ -639,6 +670,61 @@ struct FStoredSample
         }
         delete Archive;
         Result.bOutputWritten = true;
+    }
+
+    void WriteRawOnlySummary(FSummary& Result)
+    {
+        uint64 SamplesWithStack = 0;
+        for (uint32 SampleIndex = 0; SampleIndex < StoredSampleCount; ++SampleIndex)
+        {
+            if (Samples[SampleIndex].Depth > 0)
+            {
+                ++SamplesWithStack;
+            }
+        }
+
+        FString Summary;
+        Summary += TEXT("VoxelForge raw stack sampler\n");
+        Summary += TEXT("============================\n");
+        Summary.Appendf(TEXT("run_label: %s\n"), *RunLabel);
+        Summary.Appendf(TEXT("supported: %s\n"), Result.bSupported ? TEXT("yes") : TEXT("no"));
+        Summary += TEXT("raw_only: yes\n");
+        Summary += TEXT("symbolization: deferred\n");
+        Summary += TEXT("dbghelp_in_measured_process: no\n");
+        Summary.Appendf(TEXT("interval_us: %u\n"), IntervalUs);
+        Summary.Appendf(TEXT("max_stack_depth: %u\n"), MaxStackDepth);
+        Summary.Appendf(TEXT("max_stored_samples: %u\n"), MaxStoredSamples);
+        Summary.Appendf(TEXT("sampler_ticks: %llu\n"),
+            static_cast<unsigned long long>(SamplerTicks));
+        Summary.Appendf(TEXT("capture_attempts: %llu\n"),
+            static_cast<unsigned long long>(CaptureAttempts));
+        Summary.Appendf(TEXT("registered_thread_samples: %llu\n"),
+            static_cast<unsigned long long>(RegisteredThreadSamples));
+        Summary.Appendf(TEXT("registration_race_drops: %llu\n"),
+            static_cast<unsigned long long>(RegistrationRaceDrops));
+        Summary.Appendf(TEXT("capture_failures: %llu\n"),
+            static_cast<unsigned long long>(CaptureFailures));
+        Summary.Appendf(TEXT("retained_samples: %llu\n"),
+            static_cast<unsigned long long>(StoredSampleCount));
+        Summary.Appendf(TEXT("dropped_samples_after_bound: %llu\n"),
+            static_cast<unsigned long long>(DroppedSamples));
+        Summary.Appendf(TEXT("samples_with_stack: %llu\n"),
+            static_cast<unsigned long long>(SamplesWithStack));
+        Summary.Appendf(TEXT("total_frames: %llu\n"),
+            static_cast<unsigned long long>(TotalFrames));
+        Summary.Appendf(TEXT("max_active_registered_threads: %llu\n"),
+            static_cast<unsigned long long>(MaxActiveRegisteredThreads));
+        Summary.Appendf(TEXT("run_seconds: %.6f\n"), Result.RunSeconds);
+        Summary.Appendf(TEXT("raw_samples_path: %s\n"), *RawSamplesPath);
+        Summary += TEXT("\nThe target process records bounded raw PCs only; resolve symbols after the process exits.\n");
+
+        if (FFileHelper::SaveStringToFile(
+                Summary,
+                *SummaryPath,
+                FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+        {
+            Result.bOutputWritten = true;
+        }
     }
 
     void ResolveProgramCounter(
@@ -948,6 +1034,7 @@ bool FVoxelStackSampler::Start(
     const FString& OutputDirectory,
     const FString& RunLabel)
 {
+    FScopeLock LifecycleLock(&LifecycleMutex);
     if (Impl != nullptr)
     {
         return false;
@@ -982,6 +1069,7 @@ bool FVoxelStackSampler::Start(
 FVoxelStackSampler::FSummary FVoxelStackSampler::StopAndWrite()
 {
     GVoxelStackSamplerEnabled.store(false, std::memory_order_release);
+    FScopeLock LifecycleLock(&LifecycleMutex);
     FSummary Result;
     if (Impl == nullptr)
     {
@@ -1011,14 +1099,12 @@ FVoxelStackSampler::FSummary FVoxelStackSampler::StopAndWrite()
 
 void FVoxelStackSampler::Shutdown()
 {
-    if (Impl != nullptr)
-    {
-        StopAndWrite();
-    }
+    StopAndWrite();
 }
 
 bool FVoxelStackSampler::IsRunning() const
 {
+    FScopeLock LifecycleLock(&LifecycleMutex);
     return Impl != nullptr;
 }
 
@@ -1045,13 +1131,28 @@ bool FVoxelStackSampler::IsEnabled()
 
 bool FVoxelStackSampler::RegisterThreadInternal(int32 LODLevel)
 {
+    FScopeLock LifecycleLock(&LifecycleMutex);
     return Impl != nullptr && Impl->RegisterThread(LODLevel);
 }
 
 void FVoxelStackSampler::DeregisterThreadInternal()
 {
-    if (Impl != nullptr)
+    FScopeLock LifecycleLock(&LifecycleMutex);
+    if (GTlsRegistrationDepth <= 0)
+    {
+        ResetRegistrationTls();
+        return;
+    }
+
+    if (Impl != nullptr
+        && GTlsRegisteredImpl == Impl
+        && GTlsSamplerSessionGeneration == Impl->SamplerSessionGeneration)
     {
         Impl->DeregisterThread();
+        return;
     }
+
+    // StopAndWrite may have detached and destroyed the session before a worker's scope guard
+    // runs. Clear only this thread's stale registration; never dereference the old FImpl.
+    ResetRegistrationTls();
 }

@@ -1,21 +1,22 @@
 // VoxelStackSampler.h
-// Opt-in, out-of-process-symbolized stack sampling for active VoxelForge generation workers.
+// Opt-in raw stack sampling for active VoxelForge generation workers; symbols are resolved offline.
 
 #pragma once
 
 #include "CoreTypes.h"
 #include "Containers/UnrealString.h"
+#include "HAL/CriticalSection.h"
 
 /**
- * A diagnostic-only in-process stack sampler.
+ * A diagnostic-only raw stack sampler.
  *
  * The generation path only constructs FScopedVoxelStackRegistration at task entry.  When the
  * sampler is disabled that constructor performs one relaxed load of the global enable flag and
  * returns; it does not touch the registry, allocate, lock, or read a console variable.
  *
- * The sampler thread owns a bounded preallocated array of raw program counters.  Symbolization
- * and aggregation happen after the sampler thread has stopped, so DbgHelp and FString activity are
- * kept out of both generation workers and the sampling loop.
+ * The sampler thread owns a bounded preallocated array of raw program counters.  The measured
+ * process never initializes or calls DbgHelp: the raw CSV is the durable sampling artifact and
+ * symbolization is explicitly deferred to an offline consumer.
  */
 class VOXELFORGE_API FVoxelStackSampler
 {
@@ -66,7 +67,7 @@ public:
     /** Start one sampling session. Returns false when another session is active or setup fails. */
     bool Start(uint32 IntervalUs, const FString& OutputDirectory, const FString& RunLabel);
 
-    /** Stop, symbolize, aggregate, and write the bounded raw CSV plus readable summary. */
+    /** Stop and write the bounded raw CSV plus a symbolization-free readable summary. */
     FSummary StopAndWrite();
 
     /** Used by the module shutdown path as a final lifecycle backstop. */
@@ -87,6 +88,7 @@ private:
 
     struct FImpl;
     FImpl* Impl = nullptr;
+    mutable FCriticalSection LifecycleMutex;
 
     bool RegisterThreadInternal(int32 LODLevel);
     void DeregisterThreadInternal();
