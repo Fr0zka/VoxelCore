@@ -580,6 +580,16 @@ driven by `EditorBrush*` props.
   no loads AND no LOD mismatches outstanding.
 - **SDF cache** (`GetDensityWithParams`): search-BOX validity, not chunk-key — gradient ±1
   sampling must not thrash the (expensive) rebuild.
+- **Worm block skip** (`VF_TryGetWormBlockSkip`): inside the unchanged `WormNetworkRange` mask,
+  a worker-local direct-indexed cache covers the mesher's 4×4×4 lattice blocks (including the
+  normal halo). It samples N1 once at the transformed block centre and proves the entire block
+  clears the threshold with the actual 3D hash-gradient field bound
+  `L = (15/4) * sqrt(3) * VOXEL_NOISE_SCALE = 8.118988160`, plus a `1e-3` scaled-output
+  rounding margin. The radius is measured after the exact `WormFrequency`, `VerticalScale`, and
+  `WormHorizontalBias` transform, so anisotropic Z is included. The cache is thread-local and
+  keyed by generator owner, seed, params/layout fingerprint, tile origin, step, lattice size, and
+  worm parameters; malformed/non-lattice/failed proofs fall through. A proof only suppresses N1
+  and N2 because N2 is nonnegative; it never changes `NetworkMask` or density arithmetic.
 - **Operator channel metadata** (`FVoxelOpStack`): `ChannelReads`, `ChannelWrites`, and
   `IsAdditive` are called only when an operator is added to a stack and their values are cached in
   the stack entry. `ValidateChannelOrder` is assembly/diagnostic-only; no declaration virtual may

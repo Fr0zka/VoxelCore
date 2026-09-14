@@ -85,6 +85,32 @@ namespace
         }
     }
 
+    // A proved N1-above-threshold block skips both worm noise calls.  The switch is parsed once
+    // on the same scalar entry point as the other generation A/B switches; 0 is the exact legacy
+    // path, and 1 is the default after the proof/soundness test passes.
+    int32 GVoxelForgeWormBlockSkip = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeWormBlockSkip(
+        TEXT("voxel.WormBlockSkip"),
+        GVoxelForgeWormBlockSkip,
+        TEXT("Skip worm N1/N2 when a worker-local noise-space block proof says N1 >= threshold."));
+    bool GVoxelForgeWormBlockSkipSwitchParsed = false;
+
+    void VF_ParseWormBlockSkipSwitch()
+    {
+        if (GVoxelForgeWormBlockSkipSwitchParsed)
+        {
+            return;
+        }
+        GVoxelForgeWormBlockSkipSwitchParsed = true;
+        int32 CommandLineValue = GVoxelForgeWormBlockSkip;
+        if (FParse::Value(
+                FCommandLine::Get(), TEXT("voxel.WormBlockSkip="), CommandLineValue))
+        {
+            GVoxelForgeWormBlockSkip = CommandLineValue;
+        }
+        GVoxelForgeWormBlockSkip = GVoxelForgeWormBlockSkip != 0 ? 1 : 0;
+    }
+
     // A tile-sized cache window is the production default on the coarse paths where it wins.
     // Keep the switches in the generator module so native and op-stack sources make the same A/B
     // decision, including when a headless harness applies command-line CVars after module startup.
@@ -308,6 +334,257 @@ struct FSurfaceColumnCache
 // Les deux stockent des valeurs bit-identiques (même ComputeSurfaceColumn, champs purs en XY),
 // donc un ClassifyTile qui rend Mixed laisse ses colonnes chaudes pour le GenerateMesh qui suit.
 static thread_local FSurfaceColumnCache GSurfColCache;
+
+//=============================================================================
+// WORM N1 BLOCK PROOF (worker-local, scalar GetDensityAt hand-off)
+//=============================================================================
+// GenerateMesh installs TileOriginVoxels/SampleStep/TileCellsPerAxis around every density-grid
+// fill.  Keep the verdicts here, rather than in the mesher, because the scalar GetDensityAt path
+// owns the actual worm call and is also used by standalone/classifier queries.  The cache is
+// thread_local, direct-indexed by the block coordinate, and invalidated by every field identity
+// that can affect N1.  A miss or an invalid context always returns false and therefore executes
+// the old N1/N2 code.
+namespace
+{
+    constexpr int32 VF_WormBlockCacheAxis =
+        (CHUNK_SIZE + 3 + VoxelNoise::WormBlockSampleSide - 1)
+        / VoxelNoise::WormBlockSampleSide;
+    constexpr int32 VF_WormBlockCacheEntryCount =
+        VF_WormBlockCacheAxis * VF_WormBlockCacheAxis * VF_WormBlockCacheAxis;
+
+    static_assert(VF_WormBlockCacheAxis == 9,
+        "The fixed worm block table must cover the 32-cell mesher lattice plus its halo.");
+
+    FORCEINLINE uint32 VF_FloatBits(float Value)
+    {
+        uint32 Bits = 0;
+        FMemory::Memcpy(&Bits, &Value, sizeof(Bits));
+        return Bits;
+    }
+
+    struct FWormBlockSkipEntry
+    {
+        bool bValid = false;
+        bool bSkip = false;
+    };
+
+    struct FWormBlockSkipCache
+    {
+        bool bContextValid = false;
+        uint64 OwnerId = 0;
+        uint32 Seed = 0;
+        uint32 ParamsFingerprint = 0xFFFFFFFFu;
+        uint32 LayoutVersion = 0xFFFFFFFFu;
+        FIntVector TileOrigin = FIntVector::ZeroValue;
+        int32 Step = 0;
+        int32 Cells = 0;
+        uint32 WormFrequencyBits = 0;
+        uint32 WormHorizontalBiasBits = 0;
+        uint32 WormThresholdBits = 0;
+        uint32 VerticalScaleBits = 0;
+        FWormBlockSkipEntry Entries[VF_WormBlockCacheEntryCount];
+
+        void SetContext(
+            uint64 InOwnerId, uint32 InSeed, uint32 InParamsFingerprint,
+            uint32 InLayoutVersion, const FIntVector& InTileOrigin,
+            int32 InStep, int32 InCells, const FStrateGenerationParams& Params)
+        {
+            const uint32 InWormFrequencyBits = VF_FloatBits(Params.WormFrequency);
+            const uint32 InWormHorizontalBiasBits = VF_FloatBits(Params.WormHorizontalBias);
+            const uint32 InWormThresholdBits = VF_FloatBits(Params.WormThreshold);
+            const uint32 InVerticalScaleBits = VF_FloatBits(Params.VerticalScale);
+            const bool bChanged =
+                !bContextValid
+                || OwnerId != InOwnerId
+                || Seed != InSeed
+                || ParamsFingerprint != InParamsFingerprint
+                || LayoutVersion != InLayoutVersion
+                || TileOrigin != InTileOrigin
+                || Step != InStep
+                || Cells != InCells
+                || WormFrequencyBits != InWormFrequencyBits
+                || WormHorizontalBiasBits != InWormHorizontalBiasBits
+                || WormThresholdBits != InWormThresholdBits
+                || VerticalScaleBits != InVerticalScaleBits;
+            if (!bChanged)
+            {
+                return;
+            }
+
+            bContextValid = true;
+            OwnerId = InOwnerId;
+            Seed = InSeed;
+            ParamsFingerprint = InParamsFingerprint;
+            LayoutVersion = InLayoutVersion;
+            TileOrigin = InTileOrigin;
+            Step = InStep;
+            Cells = InCells;
+            WormFrequencyBits = InWormFrequencyBits;
+            WormHorizontalBiasBits = InWormHorizontalBiasBits;
+            WormThresholdBits = InWormThresholdBits;
+            VerticalScaleBits = InVerticalScaleBits;
+            FMemory::Memzero(Entries, sizeof(Entries));
+        }
+    };
+
+    static thread_local FWormBlockSkipCache GWormBlockSkipCache;
+
+    FORCEINLINE FVector3f VF_WormN1NoisePosition(
+        float WorldX, float WorldY, float WorldZ,
+        const FStrateGenerationParams& Params, uint32 SeedU)
+    {
+        float EffectiveZ = WorldZ;
+        if (Params.VerticalScale != 1.0f && Params.VerticalScale > 0.0f)
+        {
+            EffectiveZ = WorldZ / Params.VerticalScale;
+        }
+        const float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
+        return FVector3f(
+            WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
+            WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
+            EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f));
+    }
+
+    FORCEINLINE bool VF_TryGetWormBlockSkip(
+        uint64 OwnerId, uint32 SeedU, uint32 ParamsFingerprint, uint32 LayoutVersion,
+        float WorldX, float WorldY, float WorldZ,
+        const FStrateGenerationParams& Params, bool& bOutProofComputed)
+    {
+        bOutProofComputed = false;
+
+        // Point queries and malformed authored parameters stay on the exact original path. In
+        // particular, VerticalScale <= 0 has legacy "no division" semantics; declining the proof
+        // here avoids making a new promise for malformed data.
+        if (!FMath::IsFinite(WorldX) || !FMath::IsFinite(WorldY) || !FMath::IsFinite(WorldZ)
+            || WorldX != FMath::FloorToFloat(WorldX)
+            || WorldY != FMath::FloorToFloat(WorldY)
+            || WorldZ != FMath::FloorToFloat(WorldZ)
+            || !FMath::IsFinite(Params.WormFrequency)
+            || !FMath::IsFinite(Params.WormHorizontalBias)
+            || !FMath::IsFinite(Params.WormThreshold)
+            || !FMath::IsFinite(Params.VerticalScale)
+            || !(Params.WormThreshold > 0.0f)
+            || !(Params.VerticalScale > 0.0f)
+            || !FMath::IsFinite(Params.WormFrequency * Params.WormHorizontalBias))
+        {
+            return false;
+        }
+
+        const int32 Step = VoxelGenLOD::SampleStep;
+        const int32 Cells = VoxelGenLOD::TileCellsPerAxis;
+        if (Step <= 0 || Cells <= 0 || Cells > CHUNK_SIZE)
+        {
+            return false;
+        }
+
+        // FMath::RoundToInt is only reached after the finite/integer check and a range guard. The
+        // tile context itself is int32, so coordinates outside this range cannot belong to it.
+        constexpr float SafeInt32Min = -2147483008.0f;
+        constexpr float SafeInt32Max =  2147483008.0f;
+        if (WorldX < SafeInt32Min || WorldX > SafeInt32Max
+            || WorldY < SafeInt32Min || WorldY > SafeInt32Max
+            || WorldZ < SafeInt32Min || WorldZ > SafeInt32Max)
+        {
+            return false;
+        }
+        const int32 IX = FMath::RoundToInt(WorldX);
+        const int32 IY = FMath::RoundToInt(WorldY);
+        const int32 IZ = FMath::RoundToInt(WorldZ);
+        const FIntVector TileOrigin = VoxelGenLOD::TileOriginVoxels;
+        const int64 DX = static_cast<int64>(IX) - static_cast<int64>(TileOrigin.X);
+        const int64 DY = static_cast<int64>(IY) - static_cast<int64>(TileOrigin.Y);
+        const int64 DZ = static_cast<int64>(IZ) - static_cast<int64>(TileOrigin.Z);
+        if (DX % Step != 0 || DY % Step != 0 || DZ % Step != 0)
+        {
+            return false;
+        }
+
+        const int32 LocalX = static_cast<int32>(DX / Step);
+        const int32 LocalY = static_cast<int32>(DY / Step);
+        const int32 LocalZ = static_cast<int32>(DZ / Step);
+        const int32 MinLocalLattice = -1;
+        const int32 MaxLocalLattice = Cells + 1;
+        if (LocalX < MinLocalLattice || LocalX > MaxLocalLattice
+            || LocalY < MinLocalLattice || LocalY > MaxLocalLattice
+            || LocalZ < MinLocalLattice || LocalZ > MaxLocalLattice)
+        {
+            return false;
+        }
+
+        const int32 BlockX = (LocalX + 1) / VoxelNoise::WormBlockSampleSide;
+        const int32 BlockY = (LocalY + 1) / VoxelNoise::WormBlockSampleSide;
+        const int32 BlockZ = (LocalZ + 1) / VoxelNoise::WormBlockSampleSide;
+        if (BlockX < 0 || BlockX >= VF_WormBlockCacheAxis
+            || BlockY < 0 || BlockY >= VF_WormBlockCacheAxis
+            || BlockZ < 0 || BlockZ >= VF_WormBlockCacheAxis)
+        {
+            return false;
+        }
+
+        GWormBlockSkipCache.SetContext(
+            OwnerId, SeedU, ParamsFingerprint, LayoutVersion, TileOrigin, Step, Cells, Params);
+        FWormBlockSkipEntry& Entry = GWormBlockSkipCache.Entries[
+            (BlockZ * VF_WormBlockCacheAxis + BlockY) * VF_WormBlockCacheAxis + BlockX];
+        if (Entry.bValid)
+        {
+            return Entry.bSkip;
+        }
+
+        const int32 BlockMinX = BlockX * VoxelNoise::WormBlockSampleSide - 1;
+        const int32 BlockMinY = BlockY * VoxelNoise::WormBlockSampleSide - 1;
+        const int32 BlockMinZ = BlockZ * VoxelNoise::WormBlockSampleSide - 1;
+        const int32 BlockMaxX = FMath::Min(MaxLocalLattice,
+            BlockMinX + VoxelNoise::WormBlockSampleSide - 1);
+        const int32 BlockMaxY = FMath::Min(MaxLocalLattice,
+            BlockMinY + VoxelNoise::WormBlockSampleSide - 1);
+        const int32 BlockMaxZ = FMath::Min(MaxLocalLattice,
+            BlockMinZ + VoxelNoise::WormBlockSampleSide - 1);
+
+        const auto WorldAt = [Step, &TileOrigin](int32 Local, int32 Origin) -> int64
+        {
+            return static_cast<int64>(Origin) + static_cast<int64>(Local) * Step;
+        };
+        const int64 MinWorldX64 = WorldAt(BlockMinX, TileOrigin.X);
+        const int64 MinWorldY64 = WorldAt(BlockMinY, TileOrigin.Y);
+        const int64 MinWorldZ64 = WorldAt(BlockMinZ, TileOrigin.Z);
+        const int64 MaxWorldX64 = WorldAt(BlockMaxX, TileOrigin.X);
+        const int64 MaxWorldY64 = WorldAt(BlockMaxY, TileOrigin.Y);
+        const int64 MaxWorldZ64 = WorldAt(BlockMaxZ, TileOrigin.Z);
+        if (MinWorldX64 < MIN_int32 || MinWorldX64 > MAX_int32
+            || MinWorldY64 < MIN_int32 || MinWorldY64 > MAX_int32
+            || MinWorldZ64 < MIN_int32 || MinWorldZ64 > MAX_int32
+            || MaxWorldX64 < MIN_int32 || MaxWorldX64 > MAX_int32
+            || MaxWorldY64 < MIN_int32 || MaxWorldY64 > MAX_int32
+            || MaxWorldZ64 < MIN_int32 || MaxWorldZ64 > MAX_int32)
+        {
+            return false;
+        }
+
+        const FVector3f Q0 = VF_WormN1NoisePosition(
+            static_cast<float>(static_cast<int32>(MinWorldX64)),
+            static_cast<float>(static_cast<int32>(MinWorldY64)),
+            static_cast<float>(static_cast<int32>(MinWorldZ64)), Params, SeedU);
+        const FVector3f Q1 = VF_WormN1NoisePosition(
+            static_cast<float>(static_cast<int32>(MaxWorldX64)),
+            static_cast<float>(static_cast<int32>(MaxWorldY64)),
+            static_cast<float>(static_cast<int32>(MaxWorldZ64)), Params, SeedU);
+        const FVector3f QMin(
+            FMath::Min(Q0.X, Q1.X), FMath::Min(Q0.Y, Q1.Y), FMath::Min(Q0.Z, Q1.Z));
+        const FVector3f QMax(
+            FMath::Max(Q0.X, Q1.X), FMath::Max(Q0.Y, Q1.Y), FMath::Max(Q0.Z, Q1.Z));
+        const FVector3f QCenter(
+            static_cast<float>((static_cast<double>(QMin.X) + static_cast<double>(QMax.X)) * 0.5),
+            static_cast<float>((static_cast<double>(QMin.Y) + static_cast<double>(QMax.Y)) * 0.5),
+            static_cast<float>((static_cast<double>(QMin.Z) + static_cast<double>(QMax.Z)) * 0.5));
+
+        Entry.bSkip = VoxelNoise::ProvesScaledAbsPerlin3DAbove(
+            QCenter, QMin, QMax, Params.WormThreshold,
+            VoxelNoise::WormN1NoiseSpaceLipschitzBound);
+        Entry.bValid = true;
+        bOutProofComputed = true;
+        return Entry.bSkip;
+    }
+}
 
 //=============================================================================
 // FRACTAL NOISE (fBm — fractional Brownian motion)
@@ -1812,6 +2089,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
     VF_ParseFastIsFiniteSwitch();
     VF_ParseFusedEvaluatorSwitch();
+    VF_ParseWormBlockSkipSwitch();
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
@@ -3980,30 +4258,58 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
         if (NetworkMask > 0.0f)
         {
-            float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
-
-            float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
-                WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
-                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
-            )) * VOXEL_NOISE_SCALE);
-
-            // N2 >= 0, so if N1 alone already clears the threshold the sum can't carve —
-            // skip the second Perlin entirely (most voxels; bit-identical output).
-            if (N1 < Params.WormThreshold)
+            const bool bCollectWormDiagnostics =
+                bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled();
+            if (bCollectWormDiagnostics)
             {
-                float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                    WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
-                    WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
-                    EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::WormEligibleSamples);
+            }
+
+            bool bWormBlockProofComputed = false;
+            const bool bSkipWormBlock = GVoxelForgeWormBlockSkip != 0
+                && VF_TryGetWormBlockSkip(
+                    DensityCacheOwnerId, SeedU, ParamsFingerprint, LayoutVersion,
+                    WorldX, WorldY, WorldZ, Params, bWormBlockProofComputed);
+            if (bWormBlockProofComputed && bSkipWormBlock && bCollectWormDiagnostics)
+            {
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::WormBlockProofs);
+            }
+            if (bSkipWormBlock)
+            {
+                if (bCollectWormDiagnostics)
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::WormBlockSkippedSamples);
+                }
+            }
+            else
+            {
+                const float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
+                const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
+                    WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
+                    WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
+                    EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
                 )) * VOXEL_NOISE_SCALE);
 
-                float WormValue = N1 + N2;
-
-                if (WormValue < Params.WormThreshold)
+                // N2 >= 0, so if N1 alone already clears the threshold the sum can't carve —
+                // skip the second Perlin entirely (most voxels; bit-identical output).
+                if (N1 < Params.WormThreshold)
                 {
-                    float t = 1.0f - (WormValue / Params.WormThreshold);
-                    Density -= t * Params.WormStrength * NetworkMask;
+                    const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
+                        WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
+                        WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
+                        EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
+                    )) * VOXEL_NOISE_SCALE);
+
+                    const float WormValue = N1 + N2;
+
+                    if (WormValue < Params.WormThreshold)
+                    {
+                        const float t = 1.0f - (WormValue / Params.WormThreshold);
+                        Density -= t * Params.WormStrength * NetworkMask;
+                    }
                 }
             }
         }

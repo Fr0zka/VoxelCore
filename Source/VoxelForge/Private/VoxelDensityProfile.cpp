@@ -688,6 +688,9 @@ namespace VoxelDensityProfile
         case ECounter::FusedTunnelSamples: return TEXT("FusedTunnelSamples");
         case ECounter::FusedTunnelDetailSamples: return TEXT("FusedTunnelDetailSamples");
         case ECounter::FusedTunnelDetailSkipped: return TEXT("FusedTunnelDetailSkipped");
+        case ECounter::WormEligibleSamples: return TEXT("WormEligibleSamples");
+        case ECounter::WormBlockProofs: return TEXT("WormBlockProofs");
+        case ECounter::WormBlockSkippedSamples: return TEXT("WormBlockSkippedSamples");
         case ECounter::OpBlockBuilds: return TEXT("OpBlockBuilds");
         case ECounter::OpBlockSamples: return TEXT("OpBlockSamples");
         case ECounter::OpBlockOperators: return TEXT("OpBlockOperators");

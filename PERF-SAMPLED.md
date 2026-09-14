@@ -928,3 +928,175 @@ Smaller unresolved groups map to `UnrealEditor-Engine.dll + RVA 0x500947` (gener
 
 This closes the actionable part of candidate 5: the previous plugin constructor was removed, while
 the remaining unknown is an engine-symbolisation limitation. No commit, push, or stash was performed.
+
+## Worm block skip round (2026-09-14)
+
+### Proof and gates
+
+The worm skip is enabled by default through `voxel.WormBlockSkip=1`. It is fail-closed and only
+removes the two worm noise calls after the unchanged `WormNetworkRange` mask has passed. The
+worker-local cache is keyed by generator owner, seed, params/layout fingerprint, tile origin,
+step, lattice size, and worm parameters; it is never shared across tiles or workers.
+
+For this implementation's actual `GradDot` set, the unique gradients are
+`(±1,±1,0)`, `(±1,0,±1)`, and `(0,±1,±1)`. The exact finite-support partial-derivative relaxation
+with `Fade'(t)=30t²(1-t)²` has supremum `15/4`, attained at `(0.5,0.5,0.5)`. Therefore the
+noise-space vector bound is
+
+`L = (15/4) * sqrt(3) * VOXEL_NOISE_SCALE = 8.118988160` (`VOXEL_NOISE_SCALE=1.25`).
+
+The existing 2D floor constant was proven differently and does not transfer: its comment uses
+the loose component bound `[-1,1]`, four-edge interpolation difference bound, and
+`max SmoothCurve' = 1.875`, giving `1 + 4*1.875 = 8.5` per partial. The worm derives its
+bound from the actual 3D gradient support. The block radius is measured after the exact X/Y/Z
+noise transform, including `WormFrequency`, `VerticalScale`, and `WormHorizontalBias`; `Abs` is
+1-Lipschitz and the positive noise scale is included in `L`. A `1e-3` scaled-output margin is
+subtracted before the threshold comparison. It is deliberately much larger than the accumulated
+float rounding at the center/radius operations and is covered by the soundness test.
+
+The adversarial attack used dense corner/face sampling plus random pairs: 17,365,280 pairs,
+worst scaled ratio `3.187330411`, or `0.392577295*L`. The fail-capable automation test also
+audited 6,476 proved blocks over 355,945 exact lattice samples with zero violations. A deliberately
+halved `L` proves the negative-control block while the exact point has `N1=0.011259466 < 0.015`
+and the full `L` rejects it.
+
+Default-on export is byte-identical to the baseline: geometry hash
+`B3E5F4C398DD0547C6C55F415872058246D4A292C2F0D636EE1CD0829DE9B377`, 82,273 vertices,
+153,346 triangles. The static trace is 841/841 keyed tiles with zero field/empty/triangle
+differences. Capability remains 20,830 / 10,909.
+
+### Clean game A/B
+
+Sampler off, diagnostics off, `voxel.OuterClassifierMode=0`, interleaved static and moving runs.
+Static runs had 343 LOD0 ready samples; moving runs had 1,274. All valid runs had identical
+applied geometry totals, zero validation calls, zero obsolete worker tasks, and verified the loaded
+plugin module. The clean timings below used the staged runtime before the final counter-only
+diagnostic-accounting rebuild (`81F52389A78543E41EEC8E3E40DEF8F2634A79EB83E2A933FF35EE42CD611E12`).
+That patch is behind diagnostics, so it does not change this clean path. The final staged runtime
+used by the last diagnostic run is `E72E140100B3D258F28E9DBA19CD95D379D98794DA49D24C708FDD01B5B5FE08`.
+
+| run | switch | request p50/p95 (s) | generation p50/p95 (s) | worker s |
+|---|---|---:|---:|---:|
+| WormSkipGameOffStaticA_20260914 | off | 0.087151 / 0.150116 | 0.063115 / 0.104426 | 33.308914 |
+| WormSkipGameOnStaticA_Resume_20260914 | on | 0.092174 / 0.154458 | 0.065730 / 0.110507 | 34.980771 |
+| WormSkipGameOffMovingA_20260914 | off | 0.066421 / 0.138179 | 0.059918 / 0.108181 | 99.193222 |
+| WormSkipGameOnMovingA_20260914 | on | 0.064163 / 0.135519 | 0.059273 / 0.106991 | 97.624292 |
+| WormSkipGameOffStaticB_20260914 | off | 0.090372 / 0.160169 | 0.064016 / 0.109362 | 34.116813 |
+| WormSkipGameOnStaticB_Resume_20260914 | on | 0.091922 / 0.154718 | 0.063731 / 0.112871 | 33.892686 |
+| WormSkipGameOffMovingB_Resume_20260914 | off | 0.066659 / 0.142168 | 0.061916 / 0.110043 | 100.995082 |
+| WormSkipGameOnMovingB_Resume_20260914 | on | 0.065557 / 0.141592 | 0.060515 / 0.110629 | 99.716139 |
+
+Paired means, on relative to off:
+
+| mode | request p50/p95 | generation p50/p95 | worker s | on vs off worker |
+|---|---:|---:|---:|---:|
+| static | off 0.088762 / 0.155143; on 0.092048 / 0.154588 | off 0.063566 / 0.106894; on 0.064731 / 0.111689 | 33.712864 → 34.436729 | +2.1471% |
+| moving | off 0.066540 / 0.140174; on 0.064860 / 0.138556 | off 0.060917 / 0.109112; on 0.059894 / 0.108810 | 100.094152 → 98.670216 | −1.4226% |
+
+The two-run result is mixed: moving improves modestly, while static is within ordinary run noise
+and is slightly worse on worker sum. The switch remains default-on because the field proof is exact;
+the timing result is not presented as a universal speed claim.
+
+### Skip rate
+
+The final diagnostics-enabled moving run used the final DLL and emitted 2,360 tile profiles. The
+rate is `worm_block_skipped / worm_eligible`, not a fraction of all density samples:
+
+| LOD | worm-eligible samples | successful block proofs | skipped eligible samples | skip rate |
+|---:|---:|---:|---:|---:|
+| 0 | 12,381,885 | 9,541 | 503,696 | 4.068007% |
+| 1 | 4,821,000 | 0 | 0 | 0.000000% |
+| 2 | 188,063 | 0 | 0 | 0.000000% |
+| 3 | 58,276 | 0 | 0 | 0.000000% |
+| 4 | 25,253 | 0 | 0 | 0.000000% |
+
+### Sampler-on moving profile
+
+`WormSkipGameOnMovingSampler_20260914` retained 96,649 samples with zero drops and zero capture
+failures: 61,869 LOD0 and 34,780 LOD1+. It ran for 24.972305 s; resolved-frame fraction was
+52.9174%, unknown-frame fraction 47.0826%, wait-like fraction 0.1011%, and resolved-leaf
+fraction 95.3388%.
+
+LOD0 exclusive top 20:
+
+| # | samples | % | leaf |
+|---:|---:|---:|---|
+| 1 | 12472 | 20.1587 | `GetDensityWithParams` — `VoxelGenerator.cpp:3128` |
+| 2 | 3137 | 5.0704 | `GetDensityAt` — `VoxelGenerator.cpp:2994` |
+| 3 | 2853 | 4.6114 | unknown |
+| 4 | 2540 | 4.1054 | `Sqrt` |
+| 5 | 2238 | 3.6173 | `VoxelSDF::SmoothMin` — `VoxelCaveMorphology.h:170` |
+| 6 | 1736 | 2.8059 | `VF_ProjectNativePassageFloorUncached` — `VoxelStrateManager.cpp:561` |
+| 7 | 1704 | 2.7542 | `FChunkSDFSpatialIndex::GetRange` — `VoxelCaveMorphology.cpp:1356` |
+| 8 | 1434 | 2.3178 | `VF_ProjectTunnelSegmentXY` — `VoxelCaveMorphology.cpp:970` |
+| 9 | 1244 | 2.0107 | `ProjectWalkableTunnelFloor` — `VoxelPassageGeometry.h:338` |
+| 10 | 1229 | 1.9865 | `VF_EvaluateSweptTunnelChain` — `VoxelCaveMorphology.cpp:1128` |
+| 11 | 1151 | 1.8604 | `EvaluateTunnelCoreWorld` lambda — `VoxelCaveMorphology.cpp:7635` |
+| 12 | 1009 | 1.6309 | swept-chain lambda — `VoxelCaveMorphology.cpp:1074` |
+| 13 | 938 | 1.5161 | `EvaluateSDFCached` lambda — `VoxelCaveMorphology.cpp:7526` |
+| 14 | 819 | 1.3238 | `IsFiniteFast` — `VoxelTypes.h:30` |
+| 15 | 769 | 1.2429 | `IsFinite` — `VoxelTypes.h:47` |
+| 16 | 764 | 1.2349 | `EvaluateModifierSDF` — `VoxelStrateManager.cpp:2451` |
+| 17 | 748 | 1.2090 | `VF_EvaluatePassageLandingSDF` — `VoxelCaveMorphology.cpp:5673` |
+| 18 | 739 | 1.1945 | `GenerateMesh` — `VoxelMarchingCubesMesher.cpp:578` |
+| 19 | 724 | 1.1702 | `FScopedTimer::End` — `VoxelDensityProfile.h:435` |
+| 20 | 700 | 1.1314 | `VF_DistanceSquaredToAabb` — `VoxelCaveMorphology.cpp:74` |
+
+LOD0 inclusive top 20:
+
+| # | samples | % | inclusive function |
+|---:|---:|---:|---|
+| 1 | 61869 | 100.0000 | `Invoke` |
+| 2 | 61869 | 100.0000 | `LowLevelTasks::FTask::Init` lambda |
+| 3 | 61869 | 100.0000 | `LowLevelTasks::TTaskDelegate::Call` |
+| 4 | 61869 | 100.0000 | `UE::Tasks::Private::FTaskBase::Init` lambda |
+| 5 | 61869 | 100.0000 | `LowLevelTasks::TTaskDelegate::CallAndMove` |
+| 6 | 61869 | 100.0000 | `UE::Tasks::Private::FTaskBase::TryExecuteTask` |
+| 7 | 61869 | 100.0000 | `TExecutableTaskBase::ExecuteTask` |
+| 8 | 61869 | 100.0000 | `AVoxelWorld::LoadTile` lambda — `VoxelWorld.cpp:3782` |
+| 9 | 61869 | 100.0000 | `AVoxelWorld::GenerateTileResult` — `VoxelWorld.cpp:4142` |
+| 10 | 61774 | 99.8464 | `GenerateMesh` — `VoxelMarchingCubesMesher.cpp:578` |
+| 11 | 60310 | 97.4802 | `GetDensityAt` — `VoxelGenerator.cpp:2606` |
+| 12 | 38073 | 61.5381 | `GetDensityWithParams` — `VoxelGenerator.cpp:3426` |
+| 13 | 15666 | 25.3212 | `VF_ForEachSpatialCandidate` — `VoxelCaveMorphology.cpp:1570` |
+| 14 | 9775 | 15.7995 | `EvaluateSDFCached` — `VoxelCaveMorphology.cpp:7484` |
+| 15 | 7846 | 12.6816 | `VF_EvaluateSweptTunnel` — `VoxelCaveMorphology.cpp:1167` |
+| 16 | 7460 | 12.0577 | `VF_EvaluateSweptTunnelChain` — `VoxelCaveMorphology.cpp:1128` |
+| 17 | 7276 | 11.7603 | `ApplyPassageCarvingOnly` — `VoxelStrateManager.cpp:2596` |
+| 18 | 7209 | 11.6520 | `EvaluateTunnelCoreWorld` — `VoxelCaveMorphology.cpp:7732` |
+| 19 | 7128 | 11.5211 | `VF_ApplyPassageCarving` — `VoxelDensityPrimitives.h:75` |
+| 20 | 7106 | 11.4856 | `EvaluateModifierSDF` — `VoxelStrateManager.cpp:2538` |
+
+### Run ledger
+
+Every worm-round launch is listed here, including invalidated launches and the compile retry:
+
+| launch | outcome |
+|---|---|
+| Initial staged build | Failed compiling `VoxelForgeWormBlockSkipTest.cpp` because of an ambiguous `FMath::IsNearlyEqual` overload; fixed by an explicit cast. No Unreal process was launched. |
+| Rebuilt staged plugin | Succeeded; final build log reports `Result: Succeeded`. |
+| `VoxelForge.Determinism.WormBlockSkipSoundness` | Passed: 6,476 proofs / 355,945 lattice samples / 0 violations; halved-L control fails as intended. |
+| `WormSkipFieldOn_20260914` | Passed; export byte-identical and loaded module verified. |
+| `WormSkipStaticTrace_20260914` | Data passed 841/841; harness intentionally stopped the process after `.done` (`ExitCode=-1`), not a crash. |
+| `WormSkipCapability_20260914` | Passed; capability 20,830 / 10,909. |
+| `WormSkipGameOffStaticA_20260914` | Completed; valid off A. |
+| `WormSkipGameOnStaticA_20260914` | Launched before the stop; void by owner instruction and excluded, even though a complete artifact exists. |
+| `WormSkipGameOffMovingA_20260914` | Completed; valid on/off interleave partner. |
+| `WormSkipGameOnMovingA_20260914` | Completed; valid on/off interleave partner. |
+| `WormSkipGameOffStaticB_20260914` | Completed; valid off B. |
+| `WormSkipGameOnStaticB_20260914` | Interrupted at the stop; partial module/RSS artifacts only, void and excluded. |
+| `WormSkipGameOnStaticA_Resume_20260914` | Completed; valid on A replacement. |
+| `WormSkipGameOffMovingB_Resume_20260914` | Completed; valid off B replacement. |
+| `WormSkipGameOnMovingB_Resume_20260914` | Completed; valid on B replacement. |
+| `WormSkipGameOnStaticB_Resume_20260914` | Completed; valid on B replacement. |
+| `WormSkipGameOnMovingSampler_20260914` | Completed; sampler-on moving profile, zero drops/failures. |
+| `WormSkipDiagnosticsMoving_20260914` | Completed; superseded by the final counter-semantics diagnostic run, not used for reported skip rates. |
+| `WormSkipDiagnosticsMovingProofs_20260914` | Completed on final DLL; per-LOD skip rates above, module verified. |
+
+The Saved crash inventory also contains earlier-round UECC artifacts, which are kept visible here:
+three failed `Task4CurrentTracePIE` attempts on 2026-09-09 (plugin-manager/ShaderCore/DDC launch
+failures), `GameMovingOn_20260913` (fatal shutdown), `MemoGameStaticOffA_20260913` (no writable
+DDC graph; retried successfully), `TakeoverFinalMovingSamplerOnHost_20260913` (crash artifact;
+`...Host2` retry succeeded), `Final3MovingSamplerOn_20260913` (fatal shutdown), and
+`IsFiniteExact_20260913` (no writable DDC graph). No CrashReportClient crash occurred in the
+worm-round launches above.

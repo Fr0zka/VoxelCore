@@ -30,6 +30,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelTypes.h"
 
 #if !defined(VF_NOISE_USE_SIMD)
     #if PLATFORM_ENABLE_VECTORINTRINSICS && PLATFORM_CPU_X86_FAMILY
@@ -139,6 +140,104 @@ FORCEINLINE float Perlin3D(const FVector& P)
 FORCEINLINE float Perlin3D(const FVector3f& P)
 {
     return Perlin3D(P.X, P.Y, P.Z);
+}
+
+//=============================================================================
+// LIPSCHITZ BOUND FOR THE ACTUAL 3D FIELD
+//=============================================================================
+// This is deliberately derived from the implementation above, rather than borrowed from a
+// textbook Perlin constant. GradDot's h&15 table has the twelve UNNORMALIZED gradients
+//
+//   (±1,±1,0), (±1,0,±1), (0,±1,±1)
+//
+// (the four duplicate selectors do not add any vectors). For one partial derivative, write the
+// four x-edges of the trilinear interpolation as independent gradient pairs. With
+// d = Fade'(x) = 30 x²(1-x)², each edge contributes the support of the actual gradient set at
+//
+//   c0 = (1-x-dx, -dy, -dz),   c1 = (x-d(1-x), dy, dz).
+//
+// The support is max(|a|+|b|, |a|+|c|, |b|+|c|), because every allowed gradient has exactly two
+// non-zero ±1 components. Taking the four y/z edge weights and the exact fade derivative, a
+// finite case split over those three support branches has supremum 15/4 on [0,1]^3 (attained at
+// x=y=z=1/2). This maximization permits every corner hash to choose any member of the actual
+// set, so it is an upper bound for every hash cell; it is also the supremum of that finite support
+// relaxation, not the looser 1 + 4*max(Fade') = 8.5 bound used by the unrelated 2D floor relief.
+//
+// The vector bound below follows the same per-axis-bound × sqrt(dimension) method used by the
+// floor-relief proof. Abs is 1-Lipschitz and VOXEL_NOISE_SCALE is positive, so the scaled N1
+// field has this bound in noise-space coordinates. WormBlockSkip computes its radius after the
+// anisotropic world->noise transform, so the HBias and VerticalScale factors are included there.
+static constexpr double Perlin3DPartialAbsBound = 15.0 / 4.0;
+static constexpr double Perlin3DGradientBound =
+    Perlin3DPartialAbsBound * 1.732050807568877293527446341505872L;
+static constexpr double WormN1NoiseSpaceLipschitzBound =
+    static_cast<double>(VOXEL_NOISE_SCALE) * Perlin3DGradientBound;
+
+// A four-point side gives the natural small worker-local blocks for the mesher's 35-point
+// (32 cells + one-sample normal halo) LOD0 lattice. The cache is only an optimization; a failed
+// proof falls through to the original per-sample N1/N2 code.
+static constexpr int32 WormBlockSampleSide = 4;
+
+// The center value is evaluated with the same float Perlin expression as N1. The endpoint noise
+// coordinates are already float results of monotone positive/negative affine transforms, so their
+// min/max box contains every float lattice sample exactly. The 1e-3 scaled-N1 margin covers the
+// remaining center-evaluation/interpolation rounding with substantial headroom; the proof remains
+// strict because both the Lipschitz term and this margin are subtracted before comparing with T.
+static constexpr double WormBlockOutputRoundMargin = 1.0e-3;
+
+FORCEINLINE bool ProvesScaledAbsPerlin3DAbove(
+    const FVector3f& CenterNoisePosition,
+    const FVector3f& MinNoisePosition,
+    const FVector3f& MaxNoisePosition,
+    float Threshold,
+    double ScaledFieldLipschitzBound)
+{
+    if (!FMath::IsFinite(CenterNoisePosition.X)
+        || !FMath::IsFinite(CenterNoisePosition.Y)
+        || !FMath::IsFinite(CenterNoisePosition.Z)
+        || !FMath::IsFinite(MinNoisePosition.X)
+        || !FMath::IsFinite(MinNoisePosition.Y)
+        || !FMath::IsFinite(MinNoisePosition.Z)
+        || !FMath::IsFinite(MaxNoisePosition.X)
+        || !FMath::IsFinite(MaxNoisePosition.Y)
+        || !FMath::IsFinite(MaxNoisePosition.Z)
+        || !FMath::IsFinite(Threshold)
+        || !(Threshold > 0.0f)
+        || !FMath::IsFinite(ScaledFieldLipschitzBound)
+        || !(ScaledFieldLipschitzBound > 0.0))
+    {
+        return false;
+    }
+
+    const double Dx = FMath::Max(
+        FMath::Abs(static_cast<double>(MinNoisePosition.X)
+                   - static_cast<double>(CenterNoisePosition.X)),
+        FMath::Abs(static_cast<double>(MaxNoisePosition.X)
+                   - static_cast<double>(CenterNoisePosition.X)));
+    const double Dy = FMath::Max(
+        FMath::Abs(static_cast<double>(MinNoisePosition.Y)
+                   - static_cast<double>(CenterNoisePosition.Y)),
+        FMath::Abs(static_cast<double>(MaxNoisePosition.Y)
+                   - static_cast<double>(CenterNoisePosition.Y)));
+    const double Dz = FMath::Max(
+        FMath::Abs(static_cast<double>(MinNoisePosition.Z)
+                   - static_cast<double>(CenterNoisePosition.Z)),
+        FMath::Abs(static_cast<double>(MaxNoisePosition.Z)
+                   - static_cast<double>(CenterNoisePosition.Z)));
+    const double Radius = FMath::Sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+
+    // Keep this operation in float and in the same order as the production N1 expression. The
+    // double conversion is only for the conservative comparison below.
+    const float CenterN1 = FMath::Abs(
+        Perlin3D(CenterNoisePosition) * VOXEL_NOISE_SCALE);
+    if (!FMath::IsFinite(CenterN1))
+    {
+        return false;
+    }
+
+    return static_cast<double>(CenterN1)
+        - ScaledFieldLipschitzBound * Radius
+        >= static_cast<double>(Threshold) + WormBlockOutputRoundMargin;
 }
 
 //=============================================================================

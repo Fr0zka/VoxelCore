@@ -3860,6 +3860,16 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 CycleDelta(VoxelDensityProfile::EBucket::RoomGraphBuild));
             const double EvaluationSeconds = FMath::Max(
                 0.0, TileSeconds - CacheBuildSeconds);
+            const uint64 WormEligibleSamples = CounterDelta(
+                VoxelDensityProfile::ECounter::WormEligibleSamples);
+            const uint64 WormBlockProofs = CounterDelta(
+                VoxelDensityProfile::ECounter::WormBlockProofs);
+            const uint64 WormBlockSkippedSamples = CounterDelta(
+                VoxelDensityProfile::ECounter::WormBlockSkippedSamples);
+            const double WormBlockSkipRate = WormEligibleSamples > 0
+                ? static_cast<double>(WormBlockSkippedSamples)
+                    / static_cast<double>(WormEligibleSamples)
+                : 0.0;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
                      "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
@@ -3876,7 +3886,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "cache_op_local=%llu cache_classifier_shared=%llu cache_classifier_local=%llu "
                      "cache_unknown=%llu room_candidates=%llu room_evaluated=%llu "
                      "tunnel_candidates=%llu tunnel_evaluated=%llu tunnel_core_candidates=%llu "
-                     "tunnel_core_evaluated=%llu support_column_candidates=%llu"),
+                     "tunnel_core_evaluated=%llu support_column_candidates=%llu "
+                     "worm_eligible=%llu worm_block_proofs=%llu worm_block_skipped=%llu "
+                     "worm_skip_rate=%.6f"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
@@ -3918,7 +3930,11 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::CaveTunnelEvaluated)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelCoreCandidates)),
                 static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelCoreEvaluated)),
-                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates)));
+                static_cast<unsigned long long>(CounterDelta(VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates)),
+                static_cast<unsigned long long>(WormEligibleSamples),
+                static_cast<unsigned long long>(WormBlockProofs),
+                static_cast<unsigned long long>(WormBlockSkippedSamples),
+                WormBlockSkipRate);
 
             if (bProfileOps)
             {
