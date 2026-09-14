@@ -1,6 +1,7 @@
 // VoxelDensityOp.h
 // LE CONTRAT de la pile d'opérateurs de densité / THE density operator stack CONTRACT.
-// Phase 1 de OPSTACK-PLAN.md. HEADER SEUL — rien n'est encore branché dans GetDensityAt.
+// Phase 1 de OPSTACK-PLAN.md. The contract is implemented by the opt-in stack path in
+// UVoxelGenerator::GetDensityAt; the legacy archetype switch remains for non-opt-in strates.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // POURQUOI / WHY

@@ -70,6 +70,12 @@ public:
      *  the player hasn't crossed a level-0 cell boundary and nothing is dirty. */
     void Update(const FVector& PlayerWorldPos);
 
+    /** Stop/join the dedicated fill worker before a generation/layout mutation. */
+    void PauseForGenerationChange();
+
+    /** Allow the dedicated fill worker to restart lazily on the next Update. */
+    void ResumeAfterGenerationChange();
+
     /** A carve/fill touched this VOXEL box (inclusive, voxel coords) → refill the overlapping
      *  clipmap cells next Update. GetDensityAt already includes the diff layer, so re-sampling
      *  picks the edit up. Cheap + local. */
@@ -217,6 +223,7 @@ private:
     FRunnableThread* FillThread = nullptr;
     FEvent* FillWakeEvent = nullptr;
     std::atomic<bool> bFillThreadStop{ false };
+    std::atomic<bool> bGenerationPaused{ false };
 
     // CAPTURE-DURING-MESHING (level-0 only): tile coord → CHUNK_SIZE³ R8 captured density. Populated by
     // IngestTileCapture (free — the mesher already sampled it), consumed by RecenterLevel(0) to fill

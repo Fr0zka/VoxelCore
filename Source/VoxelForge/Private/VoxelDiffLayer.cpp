@@ -3,6 +3,98 @@
 
 #include "VoxelDiffLayer.h"
 
+namespace
+{
+    std::atomic<uint64> GNextDiffLayerLifetimeId{0};
+
+    bool IsFiniteVector(const FVector& Value)
+    {
+        return VoxelMath::IsFinite(Value.X)
+            && VoxelMath::IsFinite(Value.Y)
+            && VoxelMath::IsFinite(Value.Z);
+    }
+
+    bool IsValidModificationGeometry(const FVoxelModification& Mod)
+    {
+        if (!IsFiniteVector(Mod.Center) || !IsFiniteVector(Mod.BoxExtent)
+            || !IsFiniteVector(Mod.CapsuleEnd)
+            || !VoxelMath::IsFinite(Mod.Radius)
+            || !VoxelMath::IsFinite(Mod.Strength)
+            || !VoxelMath::IsFinite(Mod.Falloff)
+            || Mod.Radius <= 0.0f || Mod.Falloff < 0.0f)
+        {
+            return false;
+        }
+
+        switch (Mod.Shape)
+        {
+        case EVoxelBrushShape::Sphere:
+            return true;
+        case EVoxelBrushShape::Box:
+            return Mod.BoxExtent.X > 0.0f
+                && Mod.BoxExtent.Y > 0.0f
+                && Mod.BoxExtent.Z > 0.0f;
+        case EVoxelBrushShape::Capsule:
+            return true; // A coincident pair of endpoints is a valid spherical capsule.
+        default:
+            return false;
+        }
+    }
+
+    double GetModificationBudgetVolume(const FVoxelModification& Mod)
+    {
+        switch (Mod.Shape)
+        {
+        case EVoxelBrushShape::Box:
+        {
+            // The SDF's falloff is a rounded outer band, so the expanded axis-aligned box is a
+            // conservative charge and remains cheap to compute.
+            const double Ex = static_cast<double>(Mod.BoxExtent.X) + static_cast<double>(Mod.Falloff);
+            const double Ey = static_cast<double>(Mod.BoxExtent.Y) + static_cast<double>(Mod.Falloff);
+            const double Ez = static_cast<double>(Mod.BoxExtent.Z) + static_cast<double>(Mod.Falloff);
+            return 8.0 * Ex * Ey * Ez;
+        }
+        case EVoxelBrushShape::Capsule:
+        {
+            // Charge the full capsule including its falloff shell: cylinder + two hemispheres.
+            const double OuterRadius = static_cast<double>(Mod.Radius) + static_cast<double>(Mod.Falloff);
+            const double SegmentLength = static_cast<double>(FVector::Dist(Mod.Center, Mod.CapsuleEnd));
+            return PI * OuterRadius * OuterRadius * SegmentLength
+                + (4.0 / 3.0) * PI * OuterRadius * OuterRadius * OuterRadius;
+        }
+        case EVoxelBrushShape::Sphere:
+        default:
+        {
+            const double Radius = static_cast<double>(Mod.Radius);
+            return (4.0 / 3.0) * PI * Radius * Radius * Radius;
+        }
+        }
+    }
+}
+
+uint64 UVoxelDiffLayer::GetCacheLifetimeId() const
+{
+    uint64 LifetimeId = CacheLifetimeId.load(std::memory_order_acquire);
+    if (LifetimeId != 0)
+    {
+        return LifetimeId;
+    }
+
+    const uint64 NewLifetimeId = GNextDiffLayerLifetimeId.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (CacheLifetimeId.compare_exchange_strong(
+        LifetimeId,
+        NewLifetimeId,
+        std::memory_order_release,
+        std::memory_order_acquire))
+    {
+        return NewLifetimeId;
+    }
+
+    // Another worker initialized the identity first.  Its value is written into LifetimeId by
+    // compare_exchange_strong on failure.
+    return LifetimeId;
+}
+
 //=============================================================================
 // BUDGET CONFIGURATION
 //=============================================================================
@@ -19,8 +111,13 @@ void UVoxelDiffLayer::SetBudget(int32 InMaxMods, float InMaxRadius, float InMaxV
 
 bool UVoxelDiffLayer::CanModify(float Radius) const
 {
+    if (!VoxelMath::IsFinite(Radius) || Radius <= 0.0f)
+    {
+        return false;
+    }
+
     // Check radius limit (always enforced, even if "unlimited" count/volume)
-    if (Radius > BudgetMaxRadius)
+    if (BudgetMaxRadius > 0.0f && Radius > BudgetMaxRadius)
     {
         return false;
     }
@@ -34,13 +131,38 @@ bool UVoxelDiffLayer::CanModify(float Radius) const
     // Check volume limit: would this brush push us over?
     if (BudgetMaxVolume > 0.0f)
     {
-        const float BrushVolume = (4.0f / 3.0f) * PI * Radius * Radius * Radius;
-        if (AccumulatedVolume + BrushVolume > BudgetMaxVolume)
+        const double BrushVolume = (4.0 / 3.0) * PI
+            * static_cast<double>(Radius) * static_cast<double>(Radius) * static_cast<double>(Radius);
+        const double NewTotal = static_cast<double>(AccumulatedVolume) + BrushVolume;
+        if (!VoxelMath::IsFinite(BrushVolume) || BrushVolume > static_cast<double>(FLT_MAX)
+            || !VoxelMath::IsFinite(NewTotal)
+            || NewTotal > static_cast<double>(BudgetMaxVolume))
         {
             return false;
         }
     }
 
+    return true;
+}
+
+bool UVoxelDiffLayer::CanModify(const FVoxelModification& Mod) const
+{
+    if (!IsValidModificationGeometry(Mod)) return false;
+
+    // Radius is the radial cap for spheres/capsules. A box's largest half-extent is its analogous
+    // brush radius; checking it separately prevents a direct API caller from hiding a huge box behind
+    // an unrelated small Radius field.
+    const float GeometryRadius = (Mod.Shape == EVoxelBrushShape::Box)
+        ? FMath::Max3(Mod.BoxExtent.X, Mod.BoxExtent.Y, Mod.BoxExtent.Z)
+        : Mod.Radius;
+    if (BudgetMaxRadius > 0.0f && GeometryRadius > BudgetMaxRadius) return false;
+    if (BudgetMaxMods > 0 && ModificationCount >= BudgetMaxMods) return false;
+
+    const double BrushVolume = GetModificationBudgetVolume(Mod);
+    const double NewTotal = static_cast<double>(AccumulatedVolume) + BrushVolume;
+    if (!VoxelMath::IsFinite(BrushVolume) || BrushVolume > static_cast<double>(FLT_MAX)
+        || !VoxelMath::IsFinite(NewTotal)) return false;
+    if (BudgetMaxVolume > 0.0f && NewTotal > static_cast<double>(BudgetMaxVolume)) return false;
     return true;
 }
 
@@ -64,11 +186,25 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
 {
     TArray<FIntVector> AffectedChunks;
 
-    // --- Budget enforcement ---
-    // Clamp radius to max allowed
-    float ClampedRadius = FMath::Min(Mod.Radius, BudgetMaxRadius);
+    // Validate the complete geometry before radius clamping, budget accounting, or AABB math.
+    // FMath::Min(NaN, limit) and the shape switch's default sphere path would otherwise turn
+    // malformed API input into either a counter update or an invalid chunk range.
+    if (!IsValidModificationGeometry(Mod))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[DiffLayer] Modification REJECTED — non-finite or invalid brush geometry"));
+        return AffectedChunks;
+    }
 
-    if (!CanModify(ClampedRadius))
+    // --- Budget enforcement ---
+    // Preserve the historical radius clamp for spheres/capsules when a finite per-brush cap is set;
+    // the shape-aware check below still charges the resulting geometry and rejects oversized boxes.
+    const float ClampedRadius = (BudgetMaxRadius > 0.0f)
+        ? FMath::Min(Mod.Radius, BudgetMaxRadius) : Mod.Radius;
+    FVoxelModification ClampedMod = Mod;
+    ClampedMod.Radius = ClampedRadius;
+
+    if (!CanModify(ClampedMod))
     {
         UE_LOG(LogTemp, Warning,
             TEXT("[DiffLayer] Modification REJECTED — budget exceeded (count=%d/%d, volume=%.0f/%.0f)"),
@@ -76,34 +212,53 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
         return AffectedChunks;  // Empty = rejected
     }
 
-    // Use clamped radius for the actual modification
-    FVoxelModification ClampedMod = Mod;
-    ClampedMod.Radius = ClampedRadius;
+    // Complete the world-AABB calculation before mutating the budget counters.  Finite input can
+    // still overflow during Center +/- extent or address a chunk outside FIntVector's domain;
+    // neither case is a modification that this layer can store safely.
+    FVector BoundsMin, BoundsMax;
+    ClampedMod.GetWorldBounds(BoundsMin, BoundsMax);
+    auto WorldToChunk = [](float WorldCoord, int32& OutChunk) -> bool
+    {
+        if (!VoxelMath::IsFinite(WorldCoord))
+        {
+            return false;
+        }
+        const double ChunkCoord = FMath::FloorToDouble(
+            static_cast<double>(WorldCoord) / static_cast<double>(CHUNK_SIZE));
+        if (!VoxelMath::IsFinite(ChunkCoord)
+            || ChunkCoord < static_cast<double>(MIN_int32)
+            || ChunkCoord > static_cast<double>(MAX_int32))
+        {
+            return false;
+        }
+        OutChunk = static_cast<int32>(ChunkCoord);
+        return true;
+    };
+
+    int32 MinCX = 0, MaxCX = 0, MinCY = 0, MaxCY = 0, MinCZ = 0, MaxCZ = 0;
+    if (!WorldToChunk(BoundsMin.X, MinCX) || !WorldToChunk(BoundsMax.X, MaxCX)
+        || !WorldToChunk(BoundsMin.Y, MinCY) || !WorldToChunk(BoundsMax.Y, MaxCY)
+        || !WorldToChunk(BoundsMin.Z, MinCZ) || !WorldToChunk(BoundsMax.Z, MaxCZ))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[DiffLayer] Modification REJECTED — brush bounds are not representable"));
+        return TArray<FIntVector>();
+    }
 
     // Update budget counters
     ModificationCount++;
-    const float BrushVolume = (4.0f / 3.0f) * PI * ClampedRadius * ClampedRadius * ClampedRadius;
-    AccumulatedVolume += BrushVolume;
-
-    // Find every chunk the brush can touch, from its shape-aware world AABB.
-    FVector BoundsMin, BoundsMax;
-    ClampedMod.GetWorldBounds(BoundsMin, BoundsMax);
-    const int32 MinCX = FMath::FloorToInt(BoundsMin.X / CHUNK_SIZE);
-    const int32 MaxCX = FMath::FloorToInt(BoundsMax.X / CHUNK_SIZE);
-    const int32 MinCY = FMath::FloorToInt(BoundsMin.Y / CHUNK_SIZE);
-    const int32 MaxCY = FMath::FloorToInt(BoundsMax.Y / CHUNK_SIZE);
-    const int32 MinCZ = FMath::FloorToInt(BoundsMin.Z / CHUNK_SIZE);
-    const int32 MaxCZ = FMath::FloorToInt(BoundsMax.Z / CHUNK_SIZE);
+    const double BrushVolume = GetModificationBudgetVolume(ClampedMod);
+    AccumulatedVolume += static_cast<float>(BrushVolume);
 
     {
         // Write lock: blocks worker-thread readers (HasModifications / GetDensityOffset) while the map
         // is mutated/rehashed. AffectedChunks is local; populate it in the same pass.
         FWriteScopeLock Lock(ModsLock);
-        for (int32 CZ = MinCZ; CZ <= MaxCZ; CZ++)
+        for (int32 CZ = MinCZ;; ++CZ)
         {
-            for (int32 CY = MinCY; CY <= MaxCY; CY++)
+            for (int32 CY = MinCY;; ++CY)
             {
-                for (int32 CX = MinCX; CX <= MaxCX; CX++)
+                for (int32 CX = MinCX;; ++CX)
                 {
                     FIntVector ChunkCoord(CX, CY, CZ);
 
@@ -112,8 +267,12 @@ TArray<FIntVector> UVoxelDiffLayer::ApplyModification(const FVoxelModification& 
 
                     // Track which chunks need re-meshing
                     AffectedChunks.Add(ChunkCoord);
+
+                    if (CX == MaxCX) break;
                 }
+                if (CY == MaxCY) break;
             }
+            if (CZ == MaxCZ) break;
         }
         // Publish: subsequent readers must now take the lock instead of fast-rejecting, and
         // worker-side snapshots keyed on the version re-copy their chunk's list.
@@ -171,19 +330,30 @@ bool UVoxelDiffLayer::HasAnyModInChunkRange(const FIntVector& MinChunk, const FI
 {
     if (!bHasAnyMods.load(std::memory_order_acquire)) return false;
 
-    // Walk the modified-chunk KEYS under one read lock. Conservative: a mod is registered in every
-    // chunk its radius overlaps (ApplyModification), so key-in-range ⟺ the mod can reach the range.
-    FReadScopeLock Lock(ModsLock);
-    for (const auto& Pair : ChunkMods)
+    if (MinChunk.X > MaxChunk.X || MinChunk.Y > MaxChunk.Y || MinChunk.Z > MaxChunk.Z)
     {
-        const FIntVector& C = Pair.Key;
-        if (C.X >= MinChunk.X && C.X <= MaxChunk.X &&
-            C.Y >= MinChunk.Y && C.Y <= MaxChunk.Y &&
-            C.Z >= MinChunk.Z && C.Z <= MaxChunk.Z &&
-            Pair.Value.Num() > 0)
+        return false;
+    }
+
+    // ApplyModification registers a mod in every chunk its AABB overlaps, so looking up the keys in
+    // the queried range is conservative and proportional to that range. Do not walk ChunkMods:
+    // the edit history can grow without bound while a sealed-solid candidate is being proved.
+    FReadScopeLock Lock(ModsLock);
+    for (int32 CZ = MinChunk.Z;; ++CZ)
+    {
+        for (int32 CY = MinChunk.Y;; ++CY)
         {
-            return true;
+            for (int32 CX = MinChunk.X;; ++CX)
+            {
+                if (const TArray<FVoxelModification>* Mods = ChunkMods.Find(FIntVector(CX, CY, CZ)))
+                {
+                    if (Mods->Num() > 0) return true;
+                }
+                if (CX == MaxChunk.X) break;
+            }
+            if (CY == MaxChunk.Y) break;
         }
+        if (CZ == MaxChunk.Z) break;
     }
     return false;
 }

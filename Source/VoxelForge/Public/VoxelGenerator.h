@@ -465,7 +465,8 @@ private:
 
     /** (Re)build the per-chunk biome cell grid covering chunk (X,Y) footprint + margin. */
     void RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,
-                          const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const;
+                          const FBiomeContext& Ctx, FChunkBiomeCache& Cache,
+                          uint64 OwnerId, uint64 ManagerLifetimeId) const;
 };
 
 namespace VoxelGenLOD

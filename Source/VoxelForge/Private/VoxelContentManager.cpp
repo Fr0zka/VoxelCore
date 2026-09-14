@@ -31,13 +31,29 @@ static constexpr int32 GMaxCompanionsPerParent = 256;
 // decoration's per-cell MaxPerChunk keeps its "per chunk" meaning).
 static constexpr int32 DECO_CELL_VOXELS = CHUNK_SIZE;
 
-// Count of in-flight decoration march tasks (for the EndPlay drain). File-scope so the worker lambda's
-// RAII guard can touch it without keeping the UObject 'this' alive for that alone.
-static std::atomic<int32> GActiveDecoTasks{0};
-
 static FORCEINLINE int32 CellChebyshev(const FIntPoint& A, const FIntPoint& B)
 {
     return FMath::Max(FMath::Abs(A.X - B.X), FMath::Abs(A.Y - B.Y));
+}
+
+static bool VF_DecoTransformLess(const FTransform& A, const FTransform& B)
+{
+    // A transform is the complete deterministic identity of a placement. Comparing the matrix
+    // avoids the q/-q representation ambiguity of raw quaternions and gives the final region order
+    // the same result regardless of which worker cell completed first.
+    const FMatrix AM = A.ToMatrixWithScale();
+    const FMatrix BM = B.ToMatrixWithScale();
+    for (int32 Row = 0; Row < 4; ++Row)
+    {
+        for (int32 Col = 0; Col < 4; ++Col)
+        {
+            if (AM.M[Row][Col] != BM.M[Row][Col])
+            {
+                return AM.M[Row][Col] < BM.M[Row][Col];
+            }
+        }
+    }
+    return false;
 }
 
 void UVoxelContentManager::Initialize(AActor* InOwner, UVoxelStrateManager* InStrateManager,
@@ -59,6 +75,7 @@ void UVoxelContentManager::BeginDestroy()
 {
     // Backstop: stop any worker from touching us. EndPlay → NotifyShutdown should have already drained.
     bShuttingDown.store(true, std::memory_order_release);
+    JoinDecorationTasks();
     Super::BeginDestroy();
 }
 
@@ -66,9 +83,9 @@ void UVoxelContentManager::NotifyShutdown()
 {
     bShuttingDown.store(true, std::memory_order_release);
 
-    // Wait for in-flight march tasks to finish (they check the flag and bail). Timeout to avoid hangs.
-    const double Deadline = FPlatformTime::Seconds() + 3.0;
-    WaitForDecorationTasks(Deadline);
+    // A timeout is safe for the editor's pre-mutation probe, but not for UObject destruction:
+    // join this manager's tasks fully before dropping its worker-captured `this`.
+    JoinDecorationTasks();
 
     DrainDecoResults();
     ResetGridBuildState(NearGrid);
@@ -77,12 +94,20 @@ void UVoxelContentManager::NotifyShutdown()
 
 bool UVoxelContentManager::WaitForDecorationTasks(double Deadline)
 {
-    while (GActiveDecoTasks.load(std::memory_order_relaxed) > 0)
+    while (ActiveDecorationTasks.load(std::memory_order_relaxed) > 0)
     {
         if (FPlatformTime::Seconds() > Deadline) return false;
         FPlatformProcess::Yield();
     }
     return true;
+}
+
+void UVoxelContentManager::JoinDecorationTasks()
+{
+    while (ActiveDecorationTasks.load(std::memory_order_acquire) > 0)
+    {
+        FPlatformProcess::Yield();
+    }
 }
 
 void UVoxelContentManager::DrainDecoResults()
@@ -198,12 +223,24 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
 
     // Refresh each grid's (tier, radius, spacing) from settings for this update. Radius/spacing are read
     // every frame so live edits to the data asset take effect; the grids themselves persist across updates.
+    // A stationary player still needs a rebuild when one of these values changes: otherwise already
+    // loaded regions remain outside the new radius (or retain the old sampling density) forever.
+    const int32 NewNearRadius  = FMath::Max(1, Settings->DecorationNearRadiusChunks);
+    const int32 NewFarRadius   = FMath::Max(1, Settings->DecorationRadiusChunks);
+    const int32 NewNearSpacing = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
+    const int32 NewFarSpacing  = FMath::Clamp(Settings->DecorationFarSpacingVoxels, 1, CHUNK_SIZE);
+    const int32 NewRegionSize  = RegionSize();
+    const bool bDecorationGridConfigChanged =
+        NearGrid.Radius != NewNearRadius || FarGrid.Radius != NewFarRadius
+        || NearGrid.Spacing != NewNearSpacing || FarGrid.Spacing != NewFarSpacing
+        || LastRegionSize != NewRegionSize;
+
     NearGrid.Tier    = EDecoStreamTier::Near;
-    NearGrid.Radius  = FMath::Max(1, Settings->DecorationNearRadiusChunks);
-    NearGrid.Spacing = FMath::Clamp(Settings->DecorationSpacingVoxels, 1, CHUNK_SIZE);
+    NearGrid.Radius  = NewNearRadius;
+    NearGrid.Spacing = NewNearSpacing;
     FarGrid.Tier     = EDecoStreamTier::Far;
-    FarGrid.Radius   = FMath::Max(1, Settings->DecorationRadiusChunks);
-    FarGrid.Spacing  = FMath::Clamp(Settings->DecorationFarSpacingVoxels, 1, CHUNK_SIZE);
+    FarGrid.Radius   = NewFarRadius;
+    FarGrid.Spacing  = NewFarSpacing;
 
     // Build the decoration palette ONCE for this update, PARTITIONED by tier. With biomes, concatenate every
     // biome's deco list and tag each entry with its context-biome index; the worker resolves a column's biome
@@ -240,13 +277,19 @@ void UVoxelContentManager::UpdateDecorations(const FVector& PlayerWorldPos)
         }
     }
 
-    // Strate change → wipe + force a full rebuild (bumps epoch so old in-flight tasks are discarded).
-    if (StrateIndex != LastStrateIndex)
+    // Strate or grid configuration change → wipe + force a full rebuild. This also invalidates
+    // every old region build before the next stationary-player update can reuse it.
+    if (StrateIndex != LastStrateIndex || bDecorationGridConfigChanged)
     {
         ClearAllDecorations();
         LastStrateIndex = StrateIndex;
         LastDecoCell    = FIntPoint(INT32_MIN, INT32_MIN);
     }
+    LastNearRadius = NewNearRadius;
+    LastFarRadius = NewFarRadius;
+    LastNearSpacing = NewNearSpacing;
+    LastFarSpacing = NewFarSpacing;
+    LastRegionSize = NewRegionSize;
 
     if (PlayerCell != LastDecoCell)
     {
@@ -295,11 +338,22 @@ void UVoxelContentManager::RebuildDesiredCells(FDecoGrid& G, const FIntPoint& Pl
         }
     }
 
+    TArray<FIntPoint> DesiredRegionList;
+    DesiredRegionList.Reserve(DesiredRegions.Num());
+    for (const FIntPoint& Region : DesiredRegions)
+    {
+        DesiredRegionList.Add(Region);
+    }
+    DesiredRegionList.Sort([](const FIntPoint& A, const FIntPoint& B)
+    {
+        return (A.Y != B.Y) ? (A.Y < B.Y) : (A.X < B.X);
+    });
+
     // Start a build for each desired region that isn't already loaded or building. In-progress builds are
     // LEFT to finish even if they fell out of range (their cell tasks are already off-thread); the apply
     // step discards a completed build that is no longer desired (see ProcessDecoResults). Each new build
     // enqueues all RxR of its cells once — a building region is never re-queued (no duplicate launches).
-    for (const FIntPoint& Region : DesiredRegions)
+    for (const FIntPoint& Region : DesiredRegionList)
     {
         if (G.Regions.Contains(Region)) continue;     // already applied → leave it (no re-stream)
         if (G.Builds.Contains(Region)) continue;      // already marching its cells
@@ -320,7 +374,10 @@ void UVoxelContentManager::RebuildDesiredCells(FDecoGrid& G, const FIntPoint& Pl
     // build was already discarded) are cheaply skipped at launch, so PendingLaunch self-cleans as it drains.
     G.PendingLaunch.Sort([PlayerCell](const FIntPoint& A, const FIntPoint& B)
     {
-        return CellChebyshev(A, PlayerCell) < CellChebyshev(B, PlayerCell);
+        const int32 AD = CellChebyshev(A, PlayerCell);
+        const int32 BD = CellChebyshev(B, PlayerCell);
+        if (AD != BD) return AD < BD;
+        return (A.Y != B.Y) ? (A.Y < B.Y) : (A.X < B.X);
     });
 }
 
@@ -385,13 +442,17 @@ void UVoxelContentManager::LaunchDecoTasks(FDecoGrid& G, const FIntPoint& Player
         UVoxelGenerator* Gen = Generator;
 
         G.InFlightCells.Add(Cell);
-        GActiveDecoTasks.fetch_add(1, std::memory_order_relaxed);
+        ActiveDecorationTasks.fetch_add(1, std::memory_order_relaxed);
 
         UE::Tasks::Launch(TEXT("DecoMarch"),
             [this, Gen, OwnerXf, Cell, Ctx, LocalSeed, Spacing, Step, MaxCross, ColDepth, BuildId, GridTier,
              Entries = MoveTemp(EntriesCopy), EntryBiome = MoveTemp(EntryBiomeCopy)]() mutable
             {
-                struct FGuard { ~FGuard() { GActiveDecoTasks.fetch_sub(1, std::memory_order_relaxed); } } Guard;
+                struct FGuard
+                {
+                    UVoxelContentManager* Owner;
+                    ~FGuard() { Owner->ActiveDecorationTasks.fetch_sub(1, std::memory_order_release); }
+                } Guard{this};
 
                 if (bShuttingDown.load(std::memory_order_relaxed)) return;
 
@@ -788,6 +849,10 @@ void UVoxelContentManager::ProcessDecoResults(const FIntPoint& PlayerCell)
     for (FDecoGrid* GP : { &NearGrid, &FarGrid })
     {
         FDecoGrid& G = *GP;
+        G.Completed.Sort([](const FIntPoint& A, const FIntPoint& B)
+        {
+            return (A.Y != B.Y) ? (A.Y < B.Y) : (A.X < B.X);
+        });
         while (G.Completed.Num() > 0 && Applied < Budget)
         {
             const FIntPoint Region = G.Completed[0];
@@ -846,9 +911,21 @@ void UVoxelContentManager::MergeCellResult(FDecoGrid& G, const FDecoCellResult& 
         {
             if (!Prof.InstancedMesh) continue;
             // Bucket by MESH so cells (and biomes) sharing a mesh collapse into one region HISM. The first
-            // contributor sets the render tuning (cull/shadow/scale) for the whole region's instances.
+            // contributor in deterministic source order sets the render tuning (cull/shadow/scale) for the
+            // whole region's instances. Worker completion order must not choose that representative.
             FRegionMeshBucket& Bucket = Build->MeshBuckets.FindOrAdd(Prof.InstancedMesh);
-            if (Bucket.Xforms.Num() == 0) { Bucket.Profile = Prof; }
+            const bool bEarlierSource =
+                S.EntryIdx < Bucket.SourceEntryIdx
+                || (S.EntryIdx == Bucket.SourceEntryIdx && S.CompanionIdx < Bucket.SourceCompanionIdx)
+                || (S.EntryIdx == Bucket.SourceEntryIdx && S.CompanionIdx == Bucket.SourceCompanionIdx
+                    && S.SubIdx < Bucket.SourceSubIdx);
+            if (Bucket.Xforms.Num() == 0 || bEarlierSource)
+            {
+                Bucket.Profile = Prof;
+                Bucket.SourceEntryIdx = S.EntryIdx;
+                Bucket.SourceCompanionIdx = S.CompanionIdx;
+                Bucket.SourceSubIdx = S.SubIdx;
+            }
             Bucket.Xforms.Add(S.Xf);
         }
         else if (Prof.ActorClass)
@@ -893,6 +970,15 @@ void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FD
 
     FDecoRegionContent& Content = G.Regions.Add(Region);
 
+    Build.ActorSpawns.Sort([](const FRegionActorSpawn& A, const FRegionActorSpawn& B)
+    {
+        const FString AClass = A.ActorClass ? A.ActorClass->GetPathName() : FString();
+        const FString BClass = B.ActorClass ? B.ActorClass->GetPathName() : FString();
+        const int32 ClassCompare = FCString::Strcmp(*AClass, *BClass);
+        if (ClassCompare != 0) return ClassCompare < 0;
+        return VF_DecoTransformLess(A.Xf, B.Xf);
+    });
+
     // Non-instanced actors — spawn each (no batch path). Decorations live only in the player's strate
     // (the march is strate-bounded), so their lights are always legitimately visible — no extra culling.
     for (const FRegionActorSpawn& A : Build.ActorSpawns)
@@ -909,12 +995,26 @@ void UVoxelContentManager::ApplyRegion(FDecoGrid& G, const FIntPoint& Region, FD
 
     // One HISM per mesh for the ENTIRE region — the render-thread win: hundreds of per-cell components
     // collapse to a handful per region, so InitViews walks far fewer primitives every frame.
-    for (TPair<TWeakObjectPtr<UStaticMesh>, FRegionMeshBucket>& Pair : Build.MeshBuckets)
+    TArray<TWeakObjectPtr<UStaticMesh>> MeshKeys;
+    Build.MeshBuckets.GetKeys(MeshKeys);
+    MeshKeys.Sort([](const TWeakObjectPtr<UStaticMesh>& A, const TWeakObjectPtr<UStaticMesh>& B)
     {
-        FRegionMeshBucket& Bucket = Pair.Value;
-        UStaticMesh* Mesh = Pair.Key.Get();
+        const UStaticMesh* AMesh = A.Get();
+        const UStaticMesh* BMesh = B.Get();
+        const FString APath = AMesh ? AMesh->GetPathName() : FString();
+        const FString BPath = BMesh ? BMesh->GetPathName() : FString();
+        return FCString::Strcmp(*APath, *BPath) < 0;
+    });
+    for (const TWeakObjectPtr<UStaticMesh>& MeshKey : MeshKeys)
+    {
+        FRegionMeshBucket* BucketPtr = Build.MeshBuckets.Find(MeshKey);
+        if (!BucketPtr) continue;
+        FRegionMeshBucket& Bucket = *BucketPtr;
+        UStaticMesh* Mesh = MeshKey.Get();
         if (!Mesh || Bucket.Xforms.Num() == 0) continue;
         const FPlacementProfile& Prof = Bucket.Profile;
+
+        Bucket.Xforms.Sort(VF_DecoTransformLess);
 
         UHierarchicalInstancedStaticMeshComponent* HISM =
             NewObject<UHierarchicalInstancedStaticMeshComponent>(OwnerActor);
@@ -998,6 +1098,16 @@ void UVoxelContentManager::ClearAllDecorations()
     // Drain any results already enqueued by in-flight tasks. No epoch bump needed: their BuildIds are now
     // gone from the grids' Builds, so any straggler result is discarded on merge; new builds get fresh BuildIds.
     DrainDecoResults();
+    LastDecoCell = FIntPoint(INT32_MIN, INT32_MIN);
+}
+
+void UVoxelContentManager::InvalidateDecorationBuilds()
+{
+    // A terrain edit changes the worker's surface oracle. Clear both the applied regions and the
+    // in-progress build maps as one operation; any late result then fails the BuildId lookup and cannot
+    // resurrect pre-edit content. The next UpdateDecorations rebuilds the desired set even if the player
+    // has not moved.
+    ClearAllDecorations();
 }
 
 //=============================================================================
@@ -1307,6 +1417,10 @@ void UVoxelContentManager::UpdateLandmarks(const FVector& PlayerWorldPos)
         Ctx.bHasWater   = (Wv != -FLT_MAX);
         Ctx.WaterLocalZ = Ctx.bHasWater ? Wv * VOXEL_SIZE : -FLT_MAX;
     }
+    // Landmarks use the same per-column biome gates as decorations. Keep the complete POD biome
+    // context in the worker/game-thread placement context; a null/default context would silently
+    // bypass the authored RequiredBiome/Conditions decisions for landmarks.
+    Ctx.BiomeCtx = StrateManager->GetBiomeContextForChunk(RepChunk);
 
     const float Step     = (float)FMath::Max(1, Settings->DecorationMarchStepVoxels);
     const float ColDepth = (float)FMath::Max(8, Settings->DecorationColumnDepthVoxels);

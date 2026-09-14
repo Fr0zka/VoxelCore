@@ -406,16 +406,53 @@ bool FVoxelForgeComposerSeasonTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("legacy manager still initializes with Season unset"),
              LegacyManager->Initialize(LegacySettings.Get(), LegacySettings->Seed));
     TestTrue(TEXT("season unset remains the authored-pool path"),
-             LegacySettings->Season.IsNull()
-             && LegacyManager->GetNumStrates() == 1
+              LegacySettings->Season.IsNull()
+              && LegacyManager->GetNumStrates() == 1
              && LegacyManager->GetLayout()[0].Definition == LegacyDefinition.Get()
              && LegacyManager->GetLayout()[0].HeightInChunks == 7
              && LegacyManager->GetWorldSeed() == LegacySettings->Seed
              && LegacySettings->GetEffectiveWorldSeed() == LegacySettings->Seed
              && LegacySettings->GetEffectiveOriginSpineRadius()
                 == LegacySettings->OriginSpineRadius
-             && LegacySettings->GetEffectiveWorldRadiusVoxels()
-                == LegacySettings->WorldRadiusVoxels);
+              && LegacySettings->GetEffectiveWorldRadiusVoxels()
+                 == LegacySettings->WorldRadiusVoxels);
+
+    // Transactional live-rebuild regression: make a hash-valid manifest whose first authored
+    // definition cannot load. Initialize must reject it without destroying the prior valid layout,
+    // season hash, or passage-version snapshot.
+    if (Manifest.Strates.Num() > 0)
+    {
+        FVoxelSeasonManifest BrokenManifest = Manifest;
+        BrokenManifest.Strates[0].SourceDefinitionPath =
+            TEXT("/Game/VoxelForge/DefinitelyMissing/Definition.Definition");
+        BrokenManifest.ContentHash = VF_ComputeVoxelSeasonManifestContentHash(BrokenManifest);
+        BrokenManifest.SerializedJson = VF_SerializeVoxelSeasonManifest(BrokenManifest);
+
+        TStrongObjectPtr<UVoxelSeasonAsset> BrokenSeason(
+            NewObject<UVoxelSeasonAsset>(GetTransientPackage(), NAME_None, RF_Transient));
+        FString BrokenReport;
+        TestTrue(TEXT("broken test season keeps a valid content hash"),
+                 BrokenSeason->SetManifestJson(BrokenManifest.SerializedJson, BrokenReport));
+
+        TStrongObjectPtr<UVoxelStrateManager> TransactionalManager(
+            NewObject<UVoxelStrateManager>(GetTransientPackage(), NAME_None, RF_Transient));
+        TestTrue(TEXT("transactional manager starts from a valid layout"),
+                 TransactionalManager->Initialize(RuntimeSettings.Get(), RuntimeSettings->GetEffectiveWorldSeed()));
+        const int32 PreviousNumStrates = TransactionalManager->GetNumStrates();
+        const uint32 PreviousPassagesVersion = TransactionalManager->GetLayoutVersion();
+        const FString PreviousSeasonHash = TransactionalManager->GetSeasonContentHash();
+
+        RuntimeSettings->Season = TSoftObjectPtr<UVoxelSeasonAsset>(BrokenSeason.Get());
+        TestFalse(TEXT("invalid live season is rejected"),
+                  TransactionalManager->Initialize(RuntimeSettings.Get(), RuntimeSettings->GetEffectiveWorldSeed()));
+        TestEqual(TEXT("invalid live season preserves the previous layout"),
+                  TransactionalManager->GetNumStrates(), PreviousNumStrates);
+        TestEqual(TEXT("invalid live season preserves the previous passage version"),
+                  TransactionalManager->GetLayoutVersion(), PreviousPassagesVersion);
+        TestEqual(TEXT("invalid live season preserves the previous content hash"),
+                  TransactionalManager->GetSeasonContentHash(), PreviousSeasonHash);
+        RuntimeSettings->Season = TSoftObjectPtr<UVoxelSeasonAsset>(SeasonAsset.Get());
+    }
     return true;
 }
 

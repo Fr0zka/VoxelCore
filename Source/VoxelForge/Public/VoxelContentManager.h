@@ -120,6 +120,11 @@ public:
      *  future rebuild — this patches the LIVE instances. Returns how many were removed. Game-thread. */
     int32 RemoveDecorationsInSphere(const FVector& WorldCenter, float WorldRadius);
 
+    /** Invalidate decoration regions after a terrain edit. Existing regions and in-flight builds are
+     *  discarded together, so an old worker result cannot resurrect pre-edit content; the next update
+     *  rebuilds the desired cells from the edited density field. Game-thread. */
+    void InvalidateDecorationBuilds();
+
     /** Destroy all spawned content (decorations + water). Regenerate / season reset. Bumps the deco
      *  epoch so any in-flight march tasks' results are discarded. */
     void ClearAll();
@@ -179,6 +184,9 @@ private:
         FPlacementProfile  Profile;   // representative profile (mesh + HISM render tuning: cull/shadow) —
                                       // may be a decoration entry's OR a companion's (F7).
         TArray<FTransform> Xforms;
+        int32 SourceEntryIdx = INT32_MAX;
+        int32 SourceCompanionIdx = INT32_MAX;
+        int32 SourceSubIdx = INT32_MAX;
     };
     // A non-instanced actor placement, spawned when the region is applied.
     struct FRegionActorSpawn
@@ -287,6 +295,7 @@ private:
     void ClearAllDecorations();
     void DrainDecoResults();                          // discard every queued march result
     static void ResetGridBuildState(FDecoGrid& G);    // drop builds/queues (loaded regions untouched)
+    void JoinDecorationTasks();                       // real per-manager lifetime join
     // Region size in cells, clamped (>=1). Cell↔region math lives in file-static helpers in the .cpp.
     int32 RegionSize() const;
 
@@ -353,10 +362,18 @@ private:
 
     // Set in BeginDestroy; worker tasks check it before touching us.
     std::atomic<bool> bShuttingDown{false};
+    // Per-manager task count. A process-global count would make one world's shutdown wait on
+    // another world's decoration work and cannot prove this manager's UObject is safe to tear down.
+    std::atomic<int32> ActiveDecorationTasks{0};
 
     // Streaming state. INT_MIN sentinels force a full rebuild on the first update / after ClearAll.
     FIntPoint LastDecoCell    = FIntPoint(INT32_MIN, INT32_MIN);
     int32     LastStrateIndex = INT32_MIN;
+    int32     LastNearRadius = INT32_MIN;
+    int32     LastFarRadius  = INT32_MIN;
+    int32     LastNearSpacing = INT32_MIN;
+    int32     LastFarSpacing  = INT32_MIN;
+    int32     LastRegionSize  = INT32_MIN;
 
     // Shared strate context for the current update (recomputed each UpdateDecorations; the launch step
     // copies the PODs into each task). Same for both grids — a strate is a horizontal slab.

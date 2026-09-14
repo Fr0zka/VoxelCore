@@ -231,6 +231,14 @@ public:
 
         if (World->ContentManager && !World->ContentManager->WaitForDecorationTasks(Deadline)) return;
 
+        // DensityVolume owns a separate FRunnableThread; the world task counter and decoration
+        // counter cannot observe it. Stop/join it before mutating the generator or manager.
+        if (World->DensityVolume)
+        {
+            World->DensityVolume->PauseForGenerationChange();
+            bDensityVolumePaused = true;
+        }
+
         bAcquired = true;
     }
 
@@ -238,6 +246,10 @@ public:
     {
         if (World)
         {
+            if (bDensityVolumePaused && World->DensityVolume)
+            {
+                World->DensityVolume->ResumeAfterGenerationChange();
+            }
             World->bGenerationPaused.store(false, std::memory_order_release);
         }
     }
@@ -247,6 +259,7 @@ public:
 private:
     AVoxelWorld* World = nullptr;
     bool bAcquired = false;
+    bool bDensityVolumePaused = false;
 };
 
 #if WITH_EDITOR
@@ -561,6 +574,7 @@ void AVoxelWorld::RegenerateAllChunks()
 void AVoxelWorld::RebuildStrates()
 {
     bool bLayoutRebuilt = true;
+    bool bCreatedStrateManager = false;
     {
         FScopedGenerationPause Guard(this);
         if (!Guard.Acquired())
@@ -569,14 +583,73 @@ void AVoxelWorld::RebuildStrates()
             return;
         }
 
+        // A live Settings reference can change from no strata to a populated pool/season. Create
+        // the manager lazily in that case; Initialize itself is transactional, so an existing
+        // valid manager remains untouched when the new asset is invalid.
+        if (!StrateManager && Settings
+            && (!Settings->Season.IsNull() || Settings->StratePool.Num() > 0
+                || Settings->FixedStrates.Num() > 0))
+        {
+            StrateManager = NewObject<UVoxelStrateManager>(this);
+            bCreatedStrateManager = true;
+        }
+
         if (StrateManager && Settings)
         {
             // Re-applies layout + inter-strate gap + passage/spine settings from VoxelSettings.
             bLayoutRebuilt = StrateManager->Initialize(
                 Settings, Settings->GetEffectiveWorldSeed());
         }
-        if (AtmosphereManager) AtmosphereManager->Reset();
-        if (ContentManager)    ContentManager->ClearAll();
+
+        if (!bLayoutRebuilt)
+        {
+            // A newly-created manager has no valid previous state to preserve. Do not leave the
+            // generator wired to a failed temporary object when this was the first live setup.
+            if (bCreatedStrateManager) { StrateManager = nullptr; }
+        }
+        else
+        {
+            // Rebind every consumer of the settings snapshot while generation is paused. The
+            // manager layout alone is not sufficient: world radius, edge sealing, seed, mesher
+            // policy, edit budget, decoration state, and the optional density volume all cache
+            // settings-derived values independently.
+            if (Generator)
+            {
+                Generator->InitializeSettings(Settings);
+                Generator->SetStrateManager(StrateManager);
+                Generator->SetDiffLayer(DiffLayer);
+            }
+            if (Mesher && Settings)
+            {
+                Mesher->bGenerateSkirts   = Settings->bGenerateSkirts;
+                Mesher->SkirtCells        = Settings->SkirtCells;
+                Mesher->LODOctaveDrop     = Settings->LODOctaveDrop;
+                Mesher->bUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0;
+            }
+            if (DiffLayer && Settings)
+            {
+                DiffLayer->SetBudget(Settings->MaxModifications,
+                                     Settings->MaxBrushRadius,
+                                     Settings->MaxTotalVolume);
+            }
+            if (ContentManager)
+            {
+                ContentManager->Initialize(
+                    this, StrateManager, Generator, Settings,
+                    Settings ? Settings->GetEffectiveWorldSeed() : 0);
+                ContentManager->ClearAll();
+            }
+            if (Settings && Settings->bEnableDensityVolume && !DensityVolume)
+            {
+                DensityVolume = NewObject<UVoxelDensityVolume>(this);
+            }
+            if (DensityVolume && Settings)
+            {
+                DensityVolume->Initialize(this, Generator, Settings);
+                DensityVolume->Reset();
+            }
+            if (AtmosphereManager) AtmosphereManager->Reset();
+        }
     }
 
     if (!bLayoutRebuilt)
@@ -896,12 +969,21 @@ void AVoxelWorld::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedE
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
 
-    // During PIE with live edit on, regenerate when the actor's own properties change
-    // (e.g., Settings reference, bLiveEditStrates toggle, etc.)
-    // Data asset edits (strate definitions) are handled separately by OnObjectModifiedInEditor.
+    // During PIE with live edit on, a Settings reference change needs the full rebind path: the
+    // manager, generator, mesher, diff budget, decorations and density volume each own a snapshot.
+    // Data asset edits (and the settings asset itself) are handled separately by
+    // OnObjectModifiedInEditor.
     if (bLiveEditStrates && GetWorld() && GetWorld()->IsPlayInEditor())
     {
-        RegenerateAllChunks();
+        const FName ChangedProperty = PropertyChangedEvent.GetPropertyName();
+        if (ChangedProperty == GET_MEMBER_NAME_CHECKED(AVoxelWorld, Settings))
+        {
+            RebuildStrates();
+        }
+        else
+        {
+            RegenerateAllChunks();
+        }
     }
 }
 
@@ -910,13 +992,20 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
     // Only react during PIE with live edit enabled
     if (!bLiveEditStrates || !GetWorld() || !GetWorld()->IsPlayInEditor()) return;
 
-    // Only care about strate definition and terrain op definition edits.
-    // (This delegate fires for EVERY UObject modification in the editor.)
+    // Only care about generation-owned assets. This delegate fires for every UObject modification
+    // in the editor.
     bool bIsRelevant = false;
     FString AssetName;
 
-    // Case 1: A strate definition was modified
-    if (UVoxelStrateDefinition* ModifiedStrate = Cast<UVoxelStrateDefinition>(ModifiedObject))
+    // Case 1: the settings asset itself was modified
+    if (UVoxelSettings* ModifiedSettings = Cast<UVoxelSettings>(ModifiedObject))
+    {
+        if (ModifiedSettings != Settings) return;
+        bIsRelevant = true;
+        AssetName = ModifiedSettings->GetName();
+    }
+    // Case 2: A strate definition was modified
+    else if (UVoxelStrateDefinition* ModifiedStrate = Cast<UVoxelStrateDefinition>(ModifiedObject))
     {
         if (!Settings) return;
         AssetName = ModifiedStrate->GetName();
@@ -935,7 +1024,7 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
             }
         }
     }
-    // Case 2: A terrain op definition was modified — check if any strate references it
+    // Case 3: A terrain op definition was modified — check if any strate references it
     else if (UVoxelTerrainOpDefinition* ModifiedOp = Cast<UVoxelTerrainOpDefinition>(ModifiedObject))
     {
         if (!Settings || !StrateManager) return;
@@ -966,33 +1055,31 @@ void AVoxelWorld::OnObjectModifiedInEditor(UObject* ModifiedObject)
             }
         }
     }
+    // Case 4: a biome definition can change both terrain parameters and decoration/material
+    // resolution. Treat it like the owning strate definition, but only when this world references it.
+    else if (UVoxelBiomeDefinition* ModifiedBiome = Cast<UVoxelBiomeDefinition>(ModifiedObject))
+    {
+        if (!Settings || !StrateManager) return;
+        AssetName = ModifiedBiome->GetName();
+
+        for (const FStrateSlot& Slot : StrateManager->GetLayout())
+        {
+            if (Slot.Definition && Slot.Definition->Biomes.Contains(ModifiedBiome))
+            {
+                bIsRelevant = true;
+                break;
+            }
+        }
+    }
 
     if (!bIsRelevant) return;
 
     UE_LOG(LogTemp, Log, TEXT("[VoxelWorld] Live edit: '%s' modified, regenerating..."),
         *AssetName);
 
-    // Re-initialize the strate manager so it picks up the changed definition values,
-    // then regenerate all chunks with the updated params.
-    {
-        FScopedGenerationPause Guard(this);
-        if (!Guard.Acquired())
-        {
-            UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] OnObjectModifiedInEditor: generation pause timed out; no mutation applied."));
-            return;
-        }
-
-        if (StrateManager)
-        {
-            StrateManager->Initialize(Settings, Settings->GetEffectiveWorldSeed());
-        }
-        if (Generator)
-        {
-            Generator->InitializeSettings(Settings);
-        }
-    }
-
-    RegenerateAllChunks();
+    // Use the same transactional full rebind as a Settings-reference change. In particular, do not
+    // ignore Initialize's return value: an invalid live asset must leave the previous field intact.
+    RebuildStrates();
 }
 #endif
 
@@ -1311,7 +1398,8 @@ void AVoxelWorld::BeginPlay()
 
     // Système de strates — a cooked season takes precedence; otherwise the authored pool path is
     // exactly the legacy one.
-    if (!Settings->Season.IsNull() || Settings->StratePool.Num() > 0)
+    if (!Settings->Season.IsNull() || Settings->StratePool.Num() > 0
+        || Settings->FixedStrates.Num() > 0)
     {
         StrateManager = NewObject<UVoxelStrateManager>(this);
         if (!StrateManager->Initialize(Settings, Settings->GetEffectiveWorldSeed()))
@@ -5550,13 +5638,14 @@ void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
             bSyncedCenter ? 1 : 0);
     }
 
-    // Remove decorations inside the modified volume so grass doesn't float over a dug hole (or bury under a
-    // fill). Instant + flicker-free (only the affected instances go); the placer already skips carved columns
-    // on any future rebuild. Center/Radius are in voxels → world cm. Box/capsule use their bounding sphere.
+    // Invalidate the complete decoration build state after a terrain edit. This removes live instances,
+    // abandons in-flight pre-edit marches, and forces the next stationary update to resample the edited
+    // field. Clearing all regions is deliberately conservative: FVoxelModification is actor-local voxel
+    // geometry and may be a box/capsule, while decoration transforms are world-space; a partial sphere
+    // conversion here would risk leaving floaters or allowing an old result to resurrect one.
     if (ContentManager && AffectedChunks.Num() > 0)
     {
-        const FVector WorldCenter = Modification.Center * VOXEL_SIZE;   // Center was WorldPos/VOXEL_SIZE
-        ContentManager->RemoveDecorationsInSphere(WorldCenter, Modification.Radius * VOXEL_SIZE);
+        ContentManager->InvalidateDecorationBuilds();
     }
 }
 

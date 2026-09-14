@@ -280,6 +280,8 @@ struct FSurfaceColumnBox
     static constexpr int32 Dim  = 2 * Halo + 1;
     int32 BaseX = 0, BaseY = 0;                        // box origin (voxel coords)
     int32 StrateKey = MIN_int32, Seed = MIN_int32;     // key: same strate ⇒ identical heightfield params
+    uint64 OwnerId = 0;                                // generator/world identity
+    uint64 ManagerLifetimeId = 0;                     // strate-manager lifetime identity
     // AUDIT C2, étendu : StrateKey vaut round(StrateBottomWorldZ), donc une édition à chaud qui
     // change les params de terrain SANS déplacer la strate (fréquence de bruit, hauteur de
     // montagne, un biome…) laisse la clé identique et sert des colonnes périmées. C'est la forme
@@ -301,14 +303,17 @@ struct FSurfaceColumnCache
     FSurfaceColumnBox Boxes[NumBoxes];
     uint32 Clock = 0;
 
-    // Return the box covering (IX,IY) for this (StrateKey,Seed,LayoutVersion); allocate by
+    // Return the box covering (IX,IY) for this (owner,manager,StrateKey,Seed,LayoutVersion); allocate by
     // evicting the LRU box on miss.
-    FSurfaceColumnBox& Acquire(int32 IX, int32 IY, int32 InStrateKey, int32 InSeed, uint32 InLayoutVersion)
+    FSurfaceColumnBox& Acquire(int32 IX, int32 IY, int32 InStrateKey, int32 InSeed,
+                               uint32 InLayoutVersion, uint64 InOwnerId,
+                               uint64 InManagerLifetimeId)
     {
         ++Clock;
         for (FSurfaceColumnBox& B : Boxes)
         {
-            if (B.bValid && B.StrateKey == InStrateKey && B.Seed == InSeed
+            if (B.bValid && B.OwnerId == InOwnerId && B.ManagerLifetimeId == InManagerLifetimeId
+                && B.StrateKey == InStrateKey && B.Seed == InSeed
                 && B.LayoutVersion == InLayoutVersion
                 && IX >= B.BaseX && IX < B.BaseX + FSurfaceColumnBox::Dim
                 && IY >= B.BaseY && IY < B.BaseY + FSurfaceColumnBox::Dim)
@@ -324,6 +329,8 @@ struct FSurfaceColumnCache
         Victim->BaseY         = IY - FSurfaceColumnBox::Halo;
         Victim->StrateKey     = InStrateKey;
         Victim->Seed          = InSeed;
+        Victim->OwnerId       = InOwnerId;
+        Victim->ManagerLifetimeId = InManagerLifetimeId;
         Victim->LayoutVersion = InLayoutVersion;
         Victim->bValid        = true;
         Victim->LastUse       = Clock;
@@ -2798,6 +2805,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // The key MUST include the layout version, not just the chunk coord. Symptom without it:
         // "I tweaked the strate asset, regenerated, and one patch kept the old shape."
         thread_local uint32                   CP_Version = 0xFFFFFFFFu;
+        // The tunnel cache key also includes whether the current tile requested the coarse
+        // tile-window context. A cache hit moves the prepared stack/core out of these TLS values;
+        // when the other context misses, this bit must force the rebuild guard below to run.
+        thread_local bool                      CP_UsesTileCacheWindow = false;
         // OPSTACK Phase 1 — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
         // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide tant que
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
@@ -2916,6 +2927,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     CP_TunnelFP = CachedEntry.TunnelFingerprint;
                     CP_Dist = CachedEntry.Disturbance;
                     CP_UseOpStack = CachedEntry.bUseOpStack;
+                    CP_UsesTileCacheWindow = CachedEntry.bUsesTileCacheWindow;
                     CP_UseCustomRecipe = false;
 #if WITH_EDITOR
                     CP_UseComposerRegions = false;
@@ -2935,9 +2947,17 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
 
         const bool bOwnerChanged = DensityCacheOwnerId != CP_OwnerId;
         const bool bManagerChanged = ManagerLifetimeId != CP_ManagerLifetimeId;
+        // A cache hit may have moved CP_OpStack/GTunnelCoreCache into the shared entry.  If the
+        // next lookup misses (including an eviction/collision for the same shared Z key), the
+        // fallback TLS objects are moved-from and must never be evaluated as if they were valid.
+        // The active-entry pointer is the explicit moved-out marker; a miss therefore forces the
+        // normal rebuild even when the shared key happens to equal ChunkCoord at the origin.
+        const bool bMovedOutTunnelState = CP_ActiveTunnelDensityCache != nullptr;
         if (!bLoadedTunnelDensityCache
             && (bOwnerChanged || bManagerChanged || ChunkCoord != CP_Chunk
-                || LayoutVersion != CP_Version))
+                || LayoutVersion != CP_Version
+                || bTileCacheContext != CP_UsesTileCacheWindow
+                || bMovedOutTunnelState))
         {
             CP_ActiveTunnelDensityCache = nullptr;
 
@@ -2955,6 +2975,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             CP_ManagerLifetimeId = ManagerLifetimeId;
             CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
+            CP_UsesTileCacheWindow = bTileCacheContext;
             CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
             CP_UseCustomRecipe = false;
             bool bAllowCustomRecipe = true;
@@ -3305,7 +3326,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 const int32 IX = (int32)WorldX, IY = (int32)WorldY;
                 // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
                 // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
-                FSurfaceColumnBox& Box = GSurfColCache.Acquire(IX, IY, CP_StrateKey, Seed, LayoutVersion);
+                FSurfaceColumnBox& Box = GSurfColCache.Acquire(
+                    IX, IY, CP_StrateKey, Seed, LayoutVersion,
+                    DensityCacheOwnerId, ManagerLifetimeId);
                 const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
                 if (!Box.Computed[CI])
                 {
@@ -3695,15 +3718,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         struct FDiffSlot
         {
             FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+            uint64     OwnerId = 0;
             uint32     Version = 0;
             TArray<FVoxelModification> Mods;
         };
         static thread_local FDiffSlot DiffSlots[64];
 
+        const uint64 DiffLayerOwnerId = DiffLayer->GetCacheLifetimeId();
         const uint32 V = DiffLayer->GetModsVersion();
         FDiffSlot& Slot = DiffSlots[(ChunkCoord.X & 3) | ((ChunkCoord.Y & 3) << 2) | ((ChunkCoord.Z & 3) << 4)];
-        if (Slot.Chunk != ChunkCoord || Slot.Version != V)
+        if (Slot.OwnerId != DiffLayerOwnerId || Slot.Chunk != ChunkCoord || Slot.Version != V)
         {
+            Slot.OwnerId = DiffLayerOwnerId;
             Slot.Chunk = ChunkCoord;
             Slot.Version = V;
             DiffLayer->GetChunkModsSnapshot(ChunkCoord, Slot.Mods);   // ONE lock per chunk, not per voxel
@@ -5768,12 +5794,24 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
     thread_local TArray<FSurfaceGenerationParams> OC_BiomeParams;
     thread_local FChunkBiomeCache                OC_BiomeCache;
     thread_local uint32                          OC_Version = 0xFFFFFFFFu;   // AUDIT C2
+    thread_local uint64                          OC_OwnerId = 0;
+    thread_local uint64                          OC_ManagerLifetimeId = 0;
 
     const uint32 OC_LayoutVersion = StrateManager->GetLayoutVersion();
-    if (ChunkCoord != OC_Chunk || OC_LayoutVersion != OC_Version)
+    const uint64 OC_CurrentOwnerId = DensityCacheOwnerId;
+    const uint64 OC_CurrentManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+    if (ChunkCoord != OC_Chunk || OC_LayoutVersion != OC_Version
+        || OC_CurrentOwnerId != OC_OwnerId
+        || OC_CurrentManagerLifetimeId != OC_ManagerLifetimeId)
     {
-        if (OC_LayoutVersion != OC_Version) { OC_BiomeCache.Invalidate(); }
+        if (OC_LayoutVersion != OC_Version || OC_CurrentOwnerId != OC_OwnerId
+            || OC_CurrentManagerLifetimeId != OC_ManagerLifetimeId)
+        {
+            OC_BiomeCache.Invalidate();
+        }
         OC_Version = OC_LayoutVersion;
+        OC_OwnerId = OC_CurrentOwnerId;
+        OC_ManagerLifetimeId = OC_CurrentManagerLifetimeId;
         OC_Chunk = ChunkCoord;
         ResolveSurfaceChunkParams(ChunkCoord, OC_Surface, OC_BiomeCtx, OC_BiomeParams);
     }
@@ -6655,10 +6693,18 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     // AUDIT C2 — même discipline que le chemin densité : la grille de biome du classifieur survit
     // d'un appel à l'autre et sa boîte de validité ne dit rien du contexte qui l'a produite.
     static thread_local uint32 TC_SeenVersion = 0xFFFFFFFFu;
+    static thread_local uint64 TC_SeenOwnerId = 0;
+    static thread_local uint64 TC_SeenManagerLifetimeId = 0;
     const uint32 TC_LayoutVersion = StrateManager->GetLayoutVersion();
-    if (TC_LayoutVersion != TC_SeenVersion)
+    const uint64 TC_OwnerId = DensityCacheOwnerId;
+    const uint64 TC_ManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+    if (TC_LayoutVersion != TC_SeenVersion
+        || TC_OwnerId != TC_SeenOwnerId
+        || TC_ManagerLifetimeId != TC_SeenManagerLifetimeId)
     {
         TC_SeenVersion = TC_LayoutVersion;
+        TC_SeenOwnerId = TC_OwnerId;
+        TC_SeenManagerLifetimeId = TC_ManagerLifetimeId;
         TC_BiomeCache.Invalidate();
     }
     int32 NumSlots = 0;
@@ -7208,7 +7254,9 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         {
             FSurfSlot& S = Slots[s];
             if (S.InteriorZ.Num() == 0) continue;
-            FSurfaceColumnBox& Box = GSurfColCache.Acquire(Xi, Yi, S.StrateKey, Seed, TC_LayoutVersion);
+            FSurfaceColumnBox& Box = GSurfColCache.Acquire(
+                Xi, Yi, S.StrateKey, Seed, TC_LayoutVersion,
+                TC_OwnerId, TC_ManagerLifetimeId);
             const int32 CI = (Yi - Box.BaseY) * FSurfaceColumnBox::Dim + (Xi - Box.BaseX);
             if (!Box.Computed[CI])
             {
@@ -7447,10 +7495,13 @@ FBiomeSample UVoxelGenerator::SampleBiomeAt(float WorldX, float WorldY, const FB
 }
 
 void UVoxelGenerator::RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,
-                                       const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const
+                                       const FBiomeContext& Ctx, FChunkBiomeCache& Cache,
+                                       uint64 OwnerId, uint64 ManagerLifetimeId) const
 {
     Cache.ChunkZ  = ChunkZ;
     Cache.Seed    = Seed;
+    Cache.OwnerId = OwnerId;
+    Cache.ManagerLifetimeId = ManagerLifetimeId;
     Cache.bActive = Ctx.IsValid();
     Cache.Ctx     = Ctx;
     Cache.CellBiome.Reset();
@@ -7506,12 +7557,16 @@ FBiomeSample UVoxelGenerator::ResolveBiomeSampleAt(float WorldX, float WorldY, i
                                                    const FBiomeContext& Ctx, FChunkBiomeCache& Cache) const
 {
     FBiomeSample Out;
+    const uint64 OwnerId = DensityCacheOwnerId;
+    const uint64 ManagerLifetimeId = StrateManager
+        ? StrateManager->GetCacheLifetimeId() : 0;
 
     // Box-validated rebuild (perf-only; result is the pure function of XY either way).
-    if (!Cache.Contains(WorldX, WorldY, ChunkZ, Seed))
+    if (!Cache.Contains(WorldX, WorldY, ChunkZ, Seed, OwnerId, ManagerLifetimeId))
     {
         RebuildBiomeGrid(FMath::FloorToInt(WorldX / CHUNK_SIZE),
-                         FMath::FloorToInt(WorldY / CHUNK_SIZE), ChunkZ, Ctx, Cache);
+                         FMath::FloorToInt(WorldY / CHUNK_SIZE), ChunkZ, Ctx, Cache,
+                         OwnerId, ManagerLifetimeId);
     }
 
     if (!Cache.bActive) return Out;
@@ -7659,12 +7714,24 @@ void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float World
     thread_local FBiomeContext    BM_Ctx;
     thread_local FChunkBiomeCache BM_Cache;
     thread_local uint32           BM_Version = 0xFFFFFFFFu;   // AUDIT C2
+    thread_local uint64           BM_OwnerId = 0;
+    thread_local uint64           BM_ManagerLifetimeId = 0;
 
     const uint32 BM_LayoutVersion = StrateManager->GetLayoutVersion();
-    if (ChunkCoord != BM_Chunk || BM_LayoutVersion != BM_Version)
+    const uint64 BM_CurrentOwnerId = DensityCacheOwnerId;
+    const uint64 BM_CurrentManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+    if (ChunkCoord != BM_Chunk || BM_LayoutVersion != BM_Version
+        || BM_CurrentOwnerId != BM_OwnerId
+        || BM_CurrentManagerLifetimeId != BM_ManagerLifetimeId)
     {
-        if (BM_LayoutVersion != BM_Version) { BM_Cache.Invalidate(); }
+        if (BM_LayoutVersion != BM_Version || BM_CurrentOwnerId != BM_OwnerId
+            || BM_CurrentManagerLifetimeId != BM_ManagerLifetimeId)
+        {
+            BM_Cache.Invalidate();
+        }
         BM_Version = BM_LayoutVersion;
+        BM_OwnerId = BM_CurrentOwnerId;
+        BM_ManagerLifetimeId = BM_CurrentManagerLifetimeId;
         BM_Chunk = ChunkCoord;
         BM_Ctx   = StrateManager->GetBiomeContextForChunk(ChunkCoord);
     }
@@ -7727,14 +7794,15 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
     thread_local float  VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f, VS_MaxR = -1.0f,
                         VS_Cross = -1.0f, VS_ConnR = -1.0f, VS_Rough = -1.0f,
                         VS_SpineR = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX,
-                        VS_Seal = -1.0f;
+                        VS_Seal = -1.0f, VS_LedgeSpacing = -1.0f, VS_LedgeDepth = -1.0f;
 
     if (CX != VS_CX || CY != VS_CY || S != VS_Seed || Spacing != VS_Spacing ||
         Params.ShaftDensity != VS_Dens || Params.ShaftMinRadius != VS_MinR || Params.ShaftMaxRadius != VS_MaxR ||
         Params.CrossConnectChance != VS_Cross || Params.ConnectorRadius != VS_ConnR ||
         Params.SurfaceRoughness != VS_Rough || OriginSpineRadius != VS_SpineR ||
         Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ ||
-        Params.BoundarySealThickness != VS_Seal)
+        Params.BoundarySealThickness != VS_Seal
+        || Params.LedgeSpacing != VS_LedgeSpacing || Params.LedgeDepth != VS_LedgeDepth)
     {
         VS_CX = CX;  VS_CY = CY;  VS_Seed = S;  VS_Spacing = Spacing;
         VS_Dens = Params.ShaftDensity;  VS_MinR = Params.ShaftMinRadius;  VS_MaxR = Params.ShaftMaxRadius;
@@ -7742,6 +7810,8 @@ float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float
         VS_Rough = Params.SurfaceRoughness;    VS_SpineR = OriginSpineRadius;
         VS_BotZ = Params.StrateBottomWorldZ;  VS_TopZ = Params.StrateTopWorldZ;
         VS_Seal = Params.BoundarySealThickness;
+        VS_LedgeSpacing = Params.LedgeSpacing;
+        VS_LedgeDepth = Params.LedgeDepth;
         Shafts.Reset();
         Conns.Reset();
         TreeEmitShafts.Reset();
@@ -8154,17 +8224,20 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     thread_local int32  FI_CX = INT32_MAX, FI_CY = INT32_MAX;
     thread_local uint32 FI_Seed = 0xFFFFFFFFu;
     thread_local float  FI_Spacing = -1.0f, FI_Dens = -1.0f, FI_MinR = -1.0f, FI_MaxR = -1.0f,
-                        FI_Thick = -1.0f, FI_VJit = -1.0f, FI_BotZ = FLT_MAX, FI_TopZ = FLT_MAX;
+                        FI_Thick = -1.0f, FI_VJit = -1.0f, FI_BotZ = FLT_MAX, FI_TopZ = FLT_MAX,
+                        FI_Seal = -1.0f;
 
     if (CX != FI_CX || CY != FI_CY || S != FI_Seed || Spacing != FI_Spacing ||
         Params.IslandDensity != FI_Dens || Params.IslandMinRadius != FI_MinR || Params.IslandMaxRadius != FI_MaxR ||
         Params.ThicknessRatio != FI_Thick || Params.VerticalJitter != FI_VJit ||
-        Params.StrateBottomWorldZ != FI_BotZ || Params.StrateTopWorldZ != FI_TopZ)
+        Params.StrateBottomWorldZ != FI_BotZ || Params.StrateTopWorldZ != FI_TopZ
+        || Params.BoundarySealThickness != FI_Seal)
     {
         FI_CX = CX;  FI_CY = CY;  FI_Seed = S;  FI_Spacing = Spacing;
         FI_Dens = Params.IslandDensity;  FI_MinR = Params.IslandMinRadius;  FI_MaxR = Params.IslandMaxRadius;
         FI_Thick = Params.ThicknessRatio;  FI_VJit = Params.VerticalJitter;
         FI_BotZ = Params.StrateBottomWorldZ;  FI_TopZ = Params.StrateTopWorldZ;
+        FI_Seal = Params.BoundarySealThickness;
         Islands.Reset();
 
         for (int32 dy = -1; dy <= 1; dy++)

@@ -1084,6 +1084,27 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
         WorldSeed = SeasonManifest.Seed;
     }
 
+    // Keep a valid live layout intact until every season/layout validation step below has
+    // succeeded.  RebuildStrates is called from live edit while old meshes are still visible;
+    // returning false after clearing these members would leave those meshes backed by an empty or
+    // partial manager.  The copies are small (one entry per strate) and this path is not part of
+    // worker generation.
+    const TArray<FStrateSlot> PreviousLayout = StrateLayout;
+    const TArray<FVoxelSeasonStrate> PreviousSeasonStrates = SeasonStrates;
+    const FString PreviousSeasonContentHash = ActiveSeasonContentHash;
+#if WITH_EDITOR
+    const TMap<int32, TSharedPtr<FVoxelStrateComposerSlotOverride>> PreviousComposerOverrides = ComposerOverrides;
+#endif
+    auto RestorePreviousLayout = [&]()
+    {
+        StrateLayout = PreviousLayout;
+        SeasonStrates = PreviousSeasonStrates;
+        ActiveSeasonContentHash = PreviousSeasonContentHash;
+#if WITH_EDITOR
+        ComposerOverrides = PreviousComposerOverrides;
+#endif
+    };
+
     StrateLayout.Empty();
     SeasonStrates.Empty();
     ActiveSeasonContentHash.Reset();
@@ -1185,8 +1206,7 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
                     UE_LOG(LogTemp, Error,
                         TEXT("[StrateManager] Season slot %d could not load authored definition '%s'."),
                         i, *SeasonStrate.SourceDefinitionPath);
-                    StrateLayout.Empty();
-                    SeasonStrates.Empty();
+                    RestorePreviousLayout();
                     return false;
                 }
                 // Keep the authored content/passage/visual bag without mutating the cooked asset,
@@ -1228,8 +1248,7 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             {
                 UE_LOG(LogTemp, Error,
                     TEXT("[StrateManager] Season slot %d bounds do not describe the declared stacked layout."), i);
-                StrateLayout.Empty();
-                SeasonStrates.Empty();
+                RestorePreviousLayout();
                 return false;
             }
             SeasonStrates.Add(SeasonStrate);
@@ -1611,6 +1630,9 @@ bool UVoxelStrateManager::GetRecipeForChunk(
 void UVoxelStrateManager::GeneratePassages()
 {
     VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("GeneratePassages"));
+    // Invalidate worker-local passage shortlists even when the new layout is empty. Returning
+    // before this bump would leave a nearby-passage TLS list pointing at the cleared array.
+    ++PassagesVersion;
     Passages.Empty();
 
     if (StrateLayout.Num() < 1)
@@ -2472,9 +2494,6 @@ void UVoxelStrateManager::GeneratePassages()
                 TopZ, OriginLanding.FloorZ, OriginLanding.CeilingZ, Entry.Radius);
         }
     }
-
-    // Invalidate any thread_local per-chunk passage shortlists (see EvaluateModifierSDF).
-    ++PassagesVersion;
 
     VoxelForgeStartupTrace::RecordEvent(TEXT("passages_ready"), FString::Printf(
         TEXT("\"passages\":%d,\"passages_version\":%u,\"upper_source_fit\":%d,\"lower_source_fit\":%d"),
@@ -5691,7 +5710,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         {
             // GRADIENT TRANSITION: Classic smooth lerp across the blend zone.
             // Alpha goes from 0 (at the outer edge of the zone) to 1 (right at boundary).
-            if (DistFromBottom < EffectiveBlend)
+            if (EffectiveBlend > 0 && DistFromBottom < EffectiveBlend)
             {
                 FStrateGenerationParams BelowParams = BuildParamsFromDefinition(BelowSlot.Definition);
                 BelowParams.StrateTopWorldZ = (float)(BelowSlot.TopChunkZ + 1) * CHUNK_SIZE;
@@ -5709,6 +5728,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
         case EVoxelStrateTransition::Interleaved:
         {
+            if (EffectiveBlend <= 0) { break; }
+
             // INTERLEAVED TRANSITION: 3D noise warps the effective boundary Z.
             //
             // Instead of a flat boundary plane, the boundary becomes a wavy 3D surface.
@@ -5788,7 +5809,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
         case EVoxelStrateTransition::Gradient:
         {
-            if (DistFromTop < EffectiveBlend)
+            if (EffectiveBlend > 0 && DistFromTop < EffectiveBlend)
             {
                 FStrateGenerationParams AboveParams = BuildParamsFromDefinition(AboveSlot.Definition);
                 AboveParams.StrateTopWorldZ = (float)(AboveSlot.TopChunkZ + 1) * CHUNK_SIZE;
@@ -5805,6 +5826,8 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
         case EVoxelStrateTransition::Interleaved:
         {
+            if (EffectiveBlend <= 0) { break; }
+
             const float WarpAmplitude = 2.0f;
             const int32 CheckRange = EffectiveBlend + FMath::CeilToInt(WarpAmplitude);
 

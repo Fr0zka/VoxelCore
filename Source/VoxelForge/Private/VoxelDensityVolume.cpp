@@ -71,6 +71,7 @@ void UVoxelDensityVolume::Initialize(AActor* InOwner, UVoxelGenerator* InGenerat
     Generator = InGenerator;
     Settings = InSettings;
     bShuttingDown.store(false, std::memory_order_relaxed);
+    bGenerationPaused.store(false, std::memory_order_relaxed);
     bInitialized = true;
     // Arrays are allocated lazily on the first Update (EnsureAllocated) so a settings change
     // (resolution / level count) before play picks up cleanly.
@@ -80,6 +81,7 @@ void UVoxelDensityVolume::BeginDestroy()
 {
     // Backstop — EndPlay → NotifyShutdown should already have stopped the fill thread.
     bShuttingDown.store(true, std::memory_order_release);
+    bGenerationPaused.store(true, std::memory_order_release);
     StopFillThread();
     Super::BeginDestroy();
 }
@@ -87,6 +89,7 @@ void UVoxelDensityVolume::BeginDestroy()
 void UVoxelDensityVolume::NotifyShutdown()
 {
     bShuttingDown.store(true, std::memory_order_release);
+    bGenerationPaused.store(true, std::memory_order_release);
 
     // Stop the dedicated fill thread — Kill(true) blocks until Run() returns, so it can't read the
     // Generator after this (the owner tears UObjects down next). Then drop any queued/finished work.
@@ -100,6 +103,10 @@ void UVoxelDensityVolume::NotifyShutdown()
 
 void UVoxelDensityVolume::Reset()
 {
+    // Reset can be called by a live-edit/regeneration path, not only after EndPlay. Join first so
+    // no fill thread can still read Generator while the old epoch and queued work are discarded.
+    StopFillThread();
+
     // Bump the epoch so any in-flight fill lands stale and is dropped in DrainResults.
     ++VolumeEpoch;
     PendingFills.Reset();
@@ -116,6 +123,20 @@ void UVoxelDensityVolume::Reset()
     }
     CaptureCache.Empty();   // pre-reset grids belong to the old world (epoch bumped)
     LastPlayerVoxel = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+}
+
+void UVoxelDensityVolume::PauseForGenerationChange()
+{
+    bGenerationPaused.store(true, std::memory_order_release);
+    StopFillThread();
+}
+
+void UVoxelDensityVolume::ResumeAfterGenerationChange()
+{
+    if (!bShuttingDown.load(std::memory_order_acquire))
+    {
+        bGenerationPaused.store(false, std::memory_order_release);
+    }
 }
 
 //=============================================================================
@@ -284,7 +305,8 @@ bool UVoxelDensityVolume::GetLevelShaderParams(int32 Level, FIntVector& OutOrigi
 
 void UVoxelDensityVolume::Update(const FVector& PlayerWorldPos)
 {
-    if (!bInitialized || !Settings || !Settings->bEnableDensityVolume || !Generator) return;
+    if (bGenerationPaused.load(std::memory_order_acquire)
+        || !bInitialized || !Settings || !Settings->bEnableDensityVolume || !Generator) return;
     AActor* O = Owner.Get();
     if (!O) return;
 
@@ -557,6 +579,8 @@ void UVoxelDensityVolume::IngestTileCapture(const FIntVector& L0TileCoord, TArra
 void UVoxelDensityVolume::EnsureFillThread()
 {
     if (FillThread) return;
+    if (bGenerationPaused.load(std::memory_order_acquire)
+        || bShuttingDown.load(std::memory_order_acquire)) return;
     if (!Settings || !Settings->bEnableDensityVolume) return;
     bFillThreadStop.store(false, std::memory_order_release);
     if (!FillWakeEvent) { FillWakeEvent = FPlatformProcess::GetSynchEventFromPool(false); }   // auto-reset
@@ -588,6 +612,8 @@ void UVoxelDensityVolume::StopFillThread()
 void UVoxelDensityVolume::LaunchPendingFills()
 {
     if (PendingFills.Num() == 0) return;
+    if (bGenerationPaused.load(std::memory_order_acquire)
+        || bShuttingDown.load(std::memory_order_acquire)) return;
     EnsureFillThread();
     for (FPendingFill& F : PendingFills)
     {

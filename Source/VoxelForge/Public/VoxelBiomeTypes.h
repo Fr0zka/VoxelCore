@@ -217,7 +217,7 @@ struct FBiomeSample
  * done ONCE here, into a small grid covering the chunk footprint + margin; per voxel
  * the resolver then only warps + does a cheap 3x3 lookup + blend.
  *
- * VALIDITY IS A WORLD-XY BOX (+ ChunkZ + Seed), NOT a chunk key (CODEMAP §8.10). The
+ * VALIDITY IS A WORLD-XY BOX (+ ChunkZ + Seed + owner identities), NOT a chunk key (CODEMAP §8.10). The
  * grid covers a halo beyond the chunk, so gradient-normal samples and the +X/+Y chunk
  * boundary corners stay inside the valid box and DO NOT thrash the noise-heavy rebuild.
  * The box logic is identical in spirit to the SDF cache in GetDensityWithParams.
@@ -229,6 +229,8 @@ struct FChunkBiomeCache
     float ValidMinY = 0.0f, ValidMaxY = 0.0f;
     int32 ChunkZ = MIN_int32;                     // which strate slice this was built for
     int32 Seed = MIN_int32;
+    uint64 OwnerId = 0;                            // generator/world identity
+    uint64 ManagerLifetimeId = 0;                 // strate-manager lifetime identity
     bool bActive = false;                         // does this strate have biomes?
 
     FBiomeContext Ctx;                            // resolved biomes + map (for blending)
@@ -237,9 +239,11 @@ struct FChunkBiomeCache
     int32 BaseCellX = 0, BaseCellY = 0, CellsX = 0, CellsY = 0;
     TArray<int32> CellBiome;
 
-    bool Contains(float X, float Y, int32 InChunkZ, int32 InSeed) const
+    bool Contains(float X, float Y, int32 InChunkZ, int32 InSeed,
+                  uint64 InOwnerId, uint64 InManagerLifetimeId) const
     {
         return InSeed == Seed && InChunkZ == ChunkZ
+            && InOwnerId == OwnerId && InManagerLifetimeId == ManagerLifetimeId
             && X >= ValidMinX && X <= ValidMaxX
             && Y >= ValidMinY && Y <= ValidMaxY;
     }
@@ -254,5 +258,7 @@ struct FChunkBiomeCache
     {
         ValidMinX = 1.0f; ValidMaxX = -1.0f;   // min > max ⇒ Contains() is false everywhere
         ChunkZ = MIN_int32;
+        OwnerId = 0;
+        ManagerLifetimeId = 0;
     }
 };

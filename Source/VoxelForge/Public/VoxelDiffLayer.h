@@ -61,7 +61,8 @@ struct VOXELFORGE_API FVoxelModification
 {
     GENERATED_BODY()
 
-    // World-space center of the brush (endpoint A for Capsule).
+    // Actor-local voxel-space center of the brush (endpoint A for Capsule). The AVoxelWorld helper
+    // converts world centimetres to this space before calling the diff layer.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modification")
     FVector Center = FVector::ZeroVector;
 
@@ -83,7 +84,7 @@ struct VOXELFORGE_API FVoxelModification
         meta = (EditCondition = "Shape == EVoxelBrushShape::Box"))
     FVector BoxExtent = FVector(5.0f, 5.0f, 5.0f);
 
-    // Capsule second endpoint in world voxel coords (Capsule shape only).
+    // Capsule second endpoint in actor-local voxel coords (Capsule shape only).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modification",
         meta = (EditCondition = "Shape == EVoxelBrushShape::Capsule"))
     FVector CapsuleEnd = FVector::ZeroVector;
@@ -93,7 +94,7 @@ struct VOXELFORGE_API FVoxelModification
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modification", meta = (ClampMin = "0.1"))
     float Falloff = 2.0f;
 
-    // Conservative world-space AABB the brush can affect (used to find overlapping chunks).
+    // Conservative voxel-space AABB the brush can affect (used to find overlapping chunks).
     void GetWorldBounds(FVector& OutMin, FVector& OutMax) const
     {
         switch (Shape)
@@ -138,6 +139,9 @@ class VOXELFORGE_API UVoxelDiffLayer : public UObject
     GENERATED_BODY()
 
 public:
+    /** Process-unique identity for worker-local modification snapshots. */
+    uint64 GetCacheLifetimeId() const;
+
     //=========================================================================
     // BUDGET CONFIGURATION
     //=========================================================================
@@ -162,6 +166,10 @@ public:
      */
     bool CanModify(float Radius) const;
 
+    /** Shape-aware budget check used by ApplyModification. Boxes charge their affected outer box and
+     *  capsules charge their full swept volume, so a long tunnel cannot be billed as a small sphere. */
+    bool CanModify(const FVoxelModification& Mod) const;
+
     /**
      * Get remaining modification count (how many more operations the player can do).
      * Returns -1 if unlimited.
@@ -183,7 +191,7 @@ public:
     /**
      * Apply a carve or fill operation.
      *
-     * Stores the modification in every chunk the brush sphere overlaps.
+     * Stores the modification in every chunk the brush volume overlaps.
      * Returns the list of affected chunk coordinates so the world knows
      * which chunks need re-meshing.
      *
@@ -245,8 +253,8 @@ public:
 
     /** True si un chunk modifié intersecte [MinChunk, MaxChunk] (inclusif). Conservatif par
      *  construction : ApplyModification enregistre le mod dans TOUS les chunks que son rayon
-     *  touche, donc le test par clé de chunk suffit. Une passe de lecture sur les clés (les
-     *  mondes édités ont peu de chunks modifiés) — utilisé par ClassifyTile, PAS par voxel. */
+     *  touche, donc le test par clé de chunk suffit. La recherche parcourt directement les clés de
+     *  la plage demandée, pas tout l'historique des chunks — utilisé par ClassifyTile, PAS par voxel. */
     bool HasAnyModInChunkRange(const FIntVector& MinChunk, const FIntVector& MaxChunk) const;
 
     /** Evaluate a mod list at a voxel — the lock-free core shared by GetDensityOffset and the
@@ -269,6 +277,10 @@ public:
     int32 GetModifiedChunkCount() const;
 
 private:
+    // Never reused for the lifetime of the process: a recycled UObject address must not make a
+    // worker-local snapshot from another diff layer look current when its chunk/version match.
+    mutable std::atomic<uint64> CacheLifetimeId{0};
+
     //=========================================================================
     // STORAGE
     //=========================================================================
