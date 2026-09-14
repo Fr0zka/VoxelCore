@@ -2597,7 +2597,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
         // de diff qui suivent ne voient aucune différence.
-        if (!VoxelDensityAblation::IsTunnelCoreOff() && CP_UseOpStack)
+        if (CP_UseOpStack)
         {
             const bool bCanUseFusedEvaluator =
                 GVoxelForgeUseFusedEvaluator != 0
