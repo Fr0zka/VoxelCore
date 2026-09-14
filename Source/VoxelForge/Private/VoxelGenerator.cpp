@@ -1600,8 +1600,624 @@ static FORCEINLINE bool VF_AnyDisturbanceCanTouchBox(
         || VF_AnyRidgeCanTouchBox(Box, D, Seed);
 }
 
+static FORCEINLINE bool VF_SealedSolidProofGuardDisabled(
+    uint8 DisabledGuards, EVoxelSealedSolidProofGuard Guard)
+{
+    return (DisabledGuards & static_cast<uint8>(Guard)) != 0;
+}
+
+static FORCEINLINE bool VF_IsSafeBoundarySealLatticeZ(
+    float WorldZ, float StrateTopZ, float StrateBottomZ,
+    float SealThickness, float BaseDensity)
+{
+    // ApplyBoundarySeal is a positive internal-density lower bound.  At an exact lattice point,
+    // the original inequalities are sufficient: a strictly positive seal factor times a finite,
+    // positive base density makes the final MC density negative.  Do not widen the band here;
+    // false Mixed costs time, while the brute-force test below is the authority for this shortcut.
+    if (!VoxelMath::IsFinite(WorldZ)
+        || !VoxelMath::IsFinite(StrateTopZ)
+        || !VoxelMath::IsFinite(StrateBottomZ)
+        || !VoxelMath::IsFinite(SealThickness)
+        || !VoxelMath::IsFinite(BaseDensity)
+        || !(StrateTopZ > StrateBottomZ)
+        || !(SealThickness > 0.0f)
+        || !(BaseDensity > 0.0f))
+    {
+        return false;
+    }
+
+    const float DistTop = StrateTopZ - WorldZ;
+    const float DistBottom = WorldZ - StrateBottomZ;
+    return (DistTop >= 0.0f && DistTop < SealThickness)
+        || (DistBottom >= 0.0f && DistBottom < SealThickness);
+}
+
+static bool VF_SealedSolidProofPassageInputsAreValid(const UVoxelStrateManager& Manager)
+{
+    // AnyPassageNearBox is intentionally a cheap bounding-sphere test.  Its normal runtime inputs
+    // are generated data, but a malformed bound must fail closed: NaN distance comparisons would
+    // otherwise turn an unknown passage into a false "no passage" result.
+    for (const FVoxelPassage& Passage : Manager.GetPassages())
+    {
+        if (!VoxelMath::IsFinite(Passage.BoundCenter.X)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Y)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Z)
+            || !VoxelMath::IsFinite(Passage.BoundRadius)
+            || Passage.BoundRadius < 0.0f
+            || !VoxelMath::IsFinite(Passage.Radius)
+            || Passage.Radius < 0.0f)
+        {
+            return false;
+        }
+        for (const FVector& Point : Passage.ControlPoints)
+        {
+            if (!VoxelMath::IsFinite(Point.X)
+                || !VoxelMath::IsFinite(Point.Y)
+                || !VoxelMath::IsFinite(Point.Z))
+            {
+                return false;
+            }
+        }
+        for (const float Radius : Passage.ControlRadii)
+        {
+            if (!VoxelMath::IsFinite(Radius) || Radius < 0.0f)
+            {
+                return false;
+            }
+        }
+
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (!VoxelMath::IsFinite(Landing->StandingPoint.X)
+                || !VoxelMath::IsFinite(Landing->StandingPoint.Y)
+                || !VoxelMath::IsFinite(Landing->StandingPoint.Z)
+                || !VoxelMath::IsFinite(Landing->DoorPoint.X)
+                || !VoxelMath::IsFinite(Landing->DoorPoint.Y)
+                || !VoxelMath::IsFinite(Landing->DoorPoint.Z)
+                || !VoxelMath::IsFinite(Landing->FloorZ)
+                || !VoxelMath::IsFinite(Landing->CeilingZ)
+                || !VoxelMath::IsFinite(Landing->HalfWidth)
+                || !VoxelMath::IsFinite(Landing->FloorThickness)
+                || Landing->HalfWidth < 0.0f
+                || Landing->FloorThickness < 0.0f)
+            {
+                return false;
+            }
+        }
+
+        if (Passage.bWalkableTunnelContract
+            && (Passage.ControlPoints.Num() < 2
+                || Passage.ControlRadii.Num() != Passage.ControlPoints.Num()))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool VF_TryProveSealedSolidTile(
+    const UVoxelGenerator& Generator, const FIntVector& OriginVoxels,
+    int32 Step, int32 CellsPerAxis, uint8 DisabledGuards)
+{
+    const UVoxelStrateManager* Manager = Generator.StrateManager;
+    if (Manager == nullptr)
+    {
+        return false;
+    }
+
+    Step = FMath::Max(1, Step);
+    const int32 CPA = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
+
+    // Keep the integer arithmetic that defines the MC lattice identical to ClassifyTile, but
+    // reject a caller whose endpoint would overflow before any floor division or FBox creation.
+    const int64 MaxX64 = static_cast<int64>(OriginVoxels.X)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    const int64 MaxY64 = static_cast<int64>(OriginVoxels.Y)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    const int64 MaxZ64 = static_cast<int64>(OriginVoxels.Z)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    if (MaxX64 < MIN_int32 || MaxX64 > MAX_int32
+        || MaxY64 < MIN_int32 || MaxY64 > MAX_int32
+        || MaxZ64 < MIN_int32 || MaxZ64 > MAX_int32)
+    {
+        return false;
+    }
+
+    const int32 MinX = OriginVoxels.X;
+    const int32 MinY = OriginVoxels.Y;
+    const int32 MinZ = OriginVoxels.Z;
+    const int32 MaxX = static_cast<int32>(MaxX64);
+    const int32 MaxY = static_cast<int32>(MaxY64);
+    const int32 MaxZ = static_cast<int32>(MaxZ64);
+    const FBox TileVoxelBox(
+        FVector(static_cast<float>(MinX), static_cast<float>(MinY), static_cast<float>(MinZ)),
+        FVector(static_cast<float>(MaxX), static_cast<float>(MaxY), static_cast<float>(MaxZ)));
+
+    auto FloorDivC = [](int32 A, int32 B) -> int32
+    {
+        const int32 Q = A / B;
+        const int32 R = A % B;
+        return (R != 0 && ((R < 0) != (B < 0))) ? Q - 1 : Q;
+    };
+
+    // First pass is deliberately Z-only.  Most streaming tiles are neither gap nor seal, so they
+    // leave in this cheap loop without taking a diff lock, scanning passages, or copying params.
+    enum : uint8 { GapRow = 1u, SealRow = 2u };
+    int32 SampleChunkZ[CHUNK_SIZE + 1];
+    uint8 SampleKind[CHUNK_SIZE + 1];
+    bool bSawSeal = false;
+    bool bSawSolidRegion = false;
+    for (int32 G = 0; G <= CPA; ++G)
+    {
+        const int64 Z64 = static_cast<int64>(OriginVoxels.Z)
+            + static_cast<int64>(G) * static_cast<int64>(Step);
+        const int32 Z = static_cast<int32>(Z64);
+        const int32 ChunkZ = FloorDivC(Z, CHUNK_SIZE);
+        SampleChunkZ[G] = ChunkZ;
+        if (Manager->IsGapChunk(FIntVector(0, 0, ChunkZ)))
+        {
+            SampleKind[G] = GapRow;
+            bSawSolidRegion = true;
+            continue;
+        }
+
+        int32 UnusedTopChunkZ = 0;
+        int32 UnusedBottomChunkZ = 0;
+        if (!Manager->GetStrateChunkZBounds(
+                ChunkZ, UnusedTopChunkZ, UnusedBottomChunkZ))
+        {
+            // Above/below the stack is open air, not a solid gap.  A tile that touches it is not
+            // a sealed-solid candidate even if another row happens to be bedrock.
+            return false;
+        }
+        SampleKind[G] = SealRow;
+        bSawSeal = true;
+        bSawSolidRegion = true;
+    }
+    if (!bSawSolidRegion)
+    {
+        return false;
+    }
+    if (bSawSeal && VoxelDensityAblation::IsBoundarySealOff())
+    {
+        return false;
+    }
+
+    // Player edits are the final writer and can carve a tile that was structurally solid.  This
+    // is intentionally checked only after the Z pre-pass: ordinary mixed tiles avoid the lock.
+    const int32 MinChunkX = FloorDivC(MinX, CHUNK_SIZE);
+    const int32 MaxChunkX = FloorDivC(MaxX, CHUNK_SIZE);
+    const int32 MinChunkY = FloorDivC(MinY, CHUNK_SIZE);
+    const int32 MaxChunkY = FloorDivC(MaxY, CHUNK_SIZE);
+    const int32 MinChunkZ = FloorDivC(MinZ, CHUNK_SIZE);
+    const int32 MaxChunkZ = FloorDivC(MaxZ, CHUNK_SIZE);
+    if (!VF_SealedSolidProofGuardDisabled(
+            DisabledGuards, EVoxelSealedSolidProofGuard::DiffLayer)
+        && Generator.DiffLayer != nullptr
+        && Generator.DiffLayer->HasAnyMods())
+    {
+        if (Generator.DiffLayer->HasAnyModInChunkRange(
+                FIntVector(MinChunkX, MinChunkY, MinChunkZ),
+                FIntVector(MaxChunkX, MaxChunkY, MaxChunkZ)))
+        {
+            return false;
+        }
+    }
+
+    // PassageCarving's public box guard includes the 4-voxel carve blend pad on top of each
+    // generated passage bound.  Landing and structural-post air are also handled conservatively:
+    // if carving is ablated but another passage air writer remains active, reject any passage data
+    // rather than trusting an API whose historical early-out is specific to carving.
+    if (!VF_SealedSolidProofGuardDisabled(
+            DisabledGuards, EVoxelSealedSolidProofGuard::Passages))
+    {
+        const bool bPassageAirWriterActive =
+            !VoxelDensityAblation::IsPassageCarvingOff()
+            || !VoxelDensityAblation::IsLandingPostsOff()
+            || !VoxelDensityAblation::IsPassageStructuralPostsOff();
+        if (bPassageAirWriterActive)
+        {
+            if (!VF_SealedSolidProofPassageInputsAreValid(*Manager))
+            {
+                return false;
+            }
+            if (!VoxelDensityAblation::IsPassageCarvingOff())
+            {
+                if (Manager->AnyPassageNearBox(
+                        TileVoxelBox.Min, TileVoxelBox.Max))
+                {
+                    return false;
+                }
+            }
+            else if (Manager->GetPassages().Num() > 0)
+            {
+                // AnyPassageNearBox deliberately returns false when the carve stage is off.  The
+                // remaining landing/tunnel posts have no equivalent box API, so this is the
+                // capability-first answer under that development ablation.
+                return false;
+            }
+        }
+    }
+
+    // The origin landing is the (0,0) spine's current room-shaped air writer.  Its box guard is
+    // broader than the exact lattice guard used by ClassifyTile; false Mixed is cheap here.
+    if (!VF_SealedSolidProofGuardDisabled(
+            DisabledGuards, EVoxelSealedSolidProofGuard::OriginLanding)
+        && (!VoxelDensityAblation::IsOriginSpineOff()
+            || !VoxelDensityAblation::IsLandingPostsOff())
+        && Manager->AnyOriginLandingNearBox(TileVoxelBox.Min, TileVoxelBox.Max))
+    {
+        return false;
+    }
+
+    const int64 XYChunkCount =
+        (static_cast<int64>(MaxChunkX) - static_cast<int64>(MinChunkX) + 1)
+        * (static_cast<int64>(MaxChunkY) - static_cast<int64>(MinChunkY) + 1);
+    const int64 ZChunkCount = static_cast<int64>(MaxChunkZ) - static_cast<int64>(MinChunkZ) + 1;
+    // This is a per-tile proof, not a second coarse mesher.  A normal LOD0/LOD1 tile touches at
+    // most a handful of chunks.  Refuse pathological caller boxes before a nested loop can turn
+    // the cheap path into a large param walk.
+    constexpr int64 MaxProofChunkCoordinates = 65536;
+    if (XYChunkCount <= 0 || ZChunkCount <= 0
+        || XYChunkCount > MaxProofChunkCoordinates
+        || XYChunkCount * ZChunkCount > MaxProofChunkCoordinates)
+    {
+        return false;
+    }
+
+    auto ResolveSealFields = [&](const FIntVector& ChunkCoord,
+                                 float& OutTop, float& OutBottom,
+                                 float& OutThickness, float& OutBase) -> bool
+    {
+        switch (Manager->GetGeneratorTypeForChunk(ChunkCoord))
+        {
+        case ECaveGeneratorType::FlatPlain:
+        case ECaveGeneratorType::CrystalChamber:
+        {
+            const FSlabGenerationParams P = Manager->GetSlabParamsForChunk(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        case ECaveGeneratorType::Maze:
+        {
+            const FMazeGenerationParams P = Manager->GetMazeParamsForChunk(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        case ECaveGeneratorType::SurfaceWorld:
+        {
+            const FSurfaceGenerationParams P = Manager->GetSurfaceParamsForChunk(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        case ECaveGeneratorType::VerticalShafts:
+        {
+            const FVerticalShaftParams P = Manager->GetVerticalShaftParamsForChunk(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        case ECaveGeneratorType::FloatingIslands:
+        {
+            const FFloatingIslandParams P = Manager->GetFloatingIslandParamsForChunk(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        case ECaveGeneratorType::TunnelNetwork:
+        case ECaveGeneratorType::Underwater:
+        {
+            const FStrateGenerationParams P = Manager->GetGenerationParams(ChunkCoord);
+            OutTop = P.StrateTopWorldZ;
+            OutBottom = P.StrateBottomWorldZ;
+            OutThickness = P.BoundarySealThickness;
+            OutBase = P.BaseDensity;
+            return true;
+        }
+        default:
+            return false;
+        }
+    };
+
+    for (int32 ChunkZ = MinChunkZ; ChunkZ <= MaxChunkZ; ++ChunkZ)
+    {
+        bool bThisChunkHasSealRow = false;
+        for (int32 G = 0; G <= CPA; ++G)
+        {
+            if (SampleKind[G] == SealRow && SampleChunkZ[G] == ChunkZ)
+            {
+                bThisChunkHasSealRow = true;
+                break;
+            }
+        }
+        if (!bThisChunkHasSealRow)
+        {
+            continue;
+        }
+
+        for (int32 ChunkY = MinChunkY; ChunkY <= MaxChunkY; ++ChunkY)
+        for (int32 ChunkX = MinChunkX; ChunkX <= MaxChunkX; ++ChunkX)
+        {
+            const FIntVector ChunkCoord(ChunkX, ChunkY, ChunkZ);
+
+#if WITH_EDITOR
+            // A plain composer override changes the archetype/params, while a region override
+            // changes the lateral field.  Both must remain on the ordinary mesher/classifier path.
+            int32 ComposerSeed = 0;
+            ECaveGeneratorType ComposerArchetype = ECaveGeneratorType::TunnelNetwork;
+            FVoxelStrateArchetypeParams ComposerParams;
+            bool bComposerRecipe = false;
+            FVoxelOpStackRecipe ComposerRecipe;
+            if (Manager->GetComposerOverrideForChunk(
+                    ChunkCoord, ComposerSeed, ComposerArchetype, ComposerParams,
+                    bComposerRecipe, ComposerRecipe))
+            {
+                return false;
+            }
+            FVoxelStrateRegionManifest ComposerRegions;
+            if (Manager->GetComposerRegionOverrideForChunk(ChunkCoord, ComposerRegions))
+            {
+                return false;
+            }
+#endif
+
+            // Cooked seasons can materialise a custom recipe for a chunk.  The cheap proof only
+            // knows the native structural seal contract, so selected recipes fail closed.
+            int32 RecipeSeed = 0;
+            ECaveGeneratorType RecipeArchetype = ECaveGeneratorType::TunnelNetwork;
+            FVoxelStrateArchetypeParams RecipeParams;
+            FVoxelOpStackRecipe Recipe;
+            if (Manager->GetRecipeForChunk(
+                    ChunkCoord, RecipeSeed, RecipeArchetype, RecipeParams, Recipe))
+            {
+                return false;
+            }
+
+            float Top = 0.0f;
+            float Bottom = 0.0f;
+            float Thickness = 0.0f;
+            float BaseDensity = 0.0f;
+            if (!ResolveSealFields(ChunkCoord, Top, Bottom, Thickness, BaseDensity))
+            {
+                return false;
+            }
+
+            if (!VF_SealedSolidProofGuardDisabled(
+                    DisabledGuards, EVoxelSealedSolidProofGuard::DisturbanceChasms)
+                && !VoxelDensityAblation::IsDisturbancesOff())
+            {
+                const FStrateDisturbanceParams D =
+                    Manager->GetDisturbanceParamsForChunk(ChunkCoord);
+                if (VF_AnyChasmCanTouchBox(TileVoxelBox, D, static_cast<uint32>(Generator.Seed)))
+                {
+                    return false;
+                }
+            }
+
+            for (int32 G = 0; G <= CPA; ++G)
+            {
+                if (SampleKind[G] != SealRow || SampleChunkZ[G] != ChunkZ)
+                {
+                    continue;
+                }
+                const float Z = static_cast<float>(
+                    static_cast<int64>(OriginVoxels.Z)
+                    + static_cast<int64>(G) * static_cast<int64>(Step));
+                if (!VF_IsSafeBoundarySealLatticeZ(
+                        Z, Top, Bottom, Thickness, BaseDensity))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool VF_TryProveOutOfLayoutAirTile(
+    const UVoxelGenerator& Generator, const FIntVector& OriginVoxels,
+    int32 Step, int32 CellsPerAxis)
+{
+    const UVoxelStrateManager* Manager = Generator.StrateManager;
+    if (Manager == nullptr)
+    {
+        return false;
+    }
+
+    Step = FMath::Max(1, Step);
+    const int32 CPA = FMath::Clamp(CellsPerAxis, 2, CHUNK_SIZE);
+
+    const int64 MaxX64 = static_cast<int64>(OriginVoxels.X)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    const int64 MaxY64 = static_cast<int64>(OriginVoxels.Y)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    const int64 MaxZ64 = static_cast<int64>(OriginVoxels.Z)
+        + static_cast<int64>(CPA) * static_cast<int64>(Step);
+    if (MaxX64 < MIN_int32 || MaxX64 > MAX_int32
+        || MaxY64 < MIN_int32 || MaxY64 > MAX_int32
+        || MaxZ64 < MIN_int32 || MaxZ64 > MAX_int32)
+    {
+        return false;
+    }
+
+    const int32 MinX = OriginVoxels.X;
+    const int32 MinY = OriginVoxels.Y;
+    const int32 MinZ = OriginVoxels.Z;
+    const int32 MaxX = static_cast<int32>(MaxX64);
+    const int32 MaxY = static_cast<int32>(MaxY64);
+    const int32 MaxZ = static_cast<int32>(MaxZ64);
+    const FBox TileVoxelBox(
+        FVector(static_cast<float>(MinX), static_cast<float>(MinY), static_cast<float>(MinZ)),
+        FVector(static_cast<float>(MaxX), static_cast<float>(MaxY), static_cast<float>(MaxZ)));
+
+    auto FloorDivC = [](int32 A, int32 B) -> int32
+    {
+        const int32 Q = A / B;
+        const int32 R = A % B;
+        return (R != 0 && ((R < 0) != (B < 0))) ? Q - 1 : Q;
+    };
+
+    // All core lattice rows must be outside the layout. A gap or a real strate row means that
+    // this is no longer the constant-air case, even when another row is open air.
+    for (int32 G = 0; G <= CPA; ++G)
+    {
+        const int64 Z64 = static_cast<int64>(OriginVoxels.Z)
+            + static_cast<int64>(G) * static_cast<int64>(Step);
+        const int32 ChunkZ = FloorDivC(static_cast<int32>(Z64), CHUNK_SIZE);
+        if (Manager->IsGapChunk(FIntVector(0, 0, ChunkZ)))
+        {
+            return false;
+        }
+        int32 UnusedTopChunkZ = 0;
+        int32 UnusedBottomChunkZ = 0;
+        if (Manager->GetStrateChunkZBounds(
+                ChunkZ, UnusedTopChunkZ, UnusedBottomChunkZ))
+        {
+            return false;
+        }
+    }
+
+    const int32 MinChunkX = FloorDivC(MinX, CHUNK_SIZE);
+    const int32 MaxChunkX = FloorDivC(MaxX, CHUNK_SIZE);
+    const int32 MinChunkY = FloorDivC(MinY, CHUNK_SIZE);
+    const int32 MaxChunkY = FloorDivC(MaxY, CHUNK_SIZE);
+    const int32 MinChunkZ = FloorDivC(MinZ, CHUNK_SIZE);
+    const int32 MaxChunkZ = FloorDivC(MaxZ, CHUNK_SIZE);
+    if (Generator.DiffLayer != nullptr
+        && Generator.DiffLayer->HasAnyMods()
+        && Generator.DiffLayer->HasAnyModInChunkRange(
+            FIntVector(MinChunkX, MinChunkY, MinChunkZ),
+            FIntVector(MaxChunkX, MaxChunkY, MaxChunkZ)))
+    {
+        return false;
+    }
+
+    // The final XY pass can add rock to open air. Radius == 0 (and other non-positive inputs) is
+    // the documented no-op, so only validate and inspect the band when that writer is live.
+    if (!VoxelDensityAblation::IsXYEdgeSealOff()
+        && Generator.WorldRadiusVoxels > 0.0f
+        && Generator.EdgeSealThickness > 0.0f)
+    {
+        if (!VF_IsValidXYEdgeSealProofInput(
+                TileVoxelBox, Generator.WorldRadiusVoxels,
+                Generator.EdgeSealThickness, 1.0f))
+        {
+            return false;
+        }
+
+        // Use double arithmetic here: the production helper is float-based, while this proof
+        // must not turn a large finite coordinate into an overflowed squared-distance false
+        // negative. Equality is safe because the production inner test is <= as well.
+        const double FarthestX = FMath::Max(
+            FMath::Abs(static_cast<double>(TileVoxelBox.Min.X)),
+            FMath::Abs(static_cast<double>(TileVoxelBox.Max.X)));
+        const double FarthestY = FMath::Max(
+            FMath::Abs(static_cast<double>(TileVoxelBox.Min.Y)),
+            FMath::Abs(static_cast<double>(TileVoxelBox.Max.Y)));
+        const double InnerRadius = static_cast<double>(Generator.WorldRadiusVoxels)
+            - static_cast<double>(Generator.EdgeSealThickness);
+        if (!(InnerRadius > 0.0)
+            || FarthestX * FarthestX + FarthestY * FarthestY
+                > InnerRadius * InnerRadius)
+        {
+            return false;
+        }
+    }
+
+    if (Manager->GetPassages().Num() > 0)
+    {
+        if (!VF_SealedSolidProofPassageInputsAreValid(*Manager))
+        {
+            return false;
+        }
+
+        // Passage carving is air-monotone and therefore cannot invalidate an AllAir proof. Only
+        // the solid floor/support writers need a guard here. Use the same exact lattice floor
+        // predicate as ClassifyTile: its padded AABBs stay cheap, but do not reject an open-air
+        // tile merely because a harmless carve bound passes near it.
+        const bool bPassageFloorWriterActive =
+            !VoxelDensityAblation::IsPassageStructuralPostsOff()
+            || !VoxelDensityAblation::IsNativeFloorOff()
+            || !VoxelDensityAblation::IsLandingPostsOff();
+        if (bPassageFloorWriterActive
+            && Manager->AnyPassageLandingFloorNearLattice(
+                TileVoxelBox, OriginVoxels, Step))
+        {
+            return false;
+        }
+    }
+
+    // Origin rooms only carve open air, but their landing floors reassert solid. The manager's
+    // floor box includes every per-strate room; this is intentionally broader than the exact
+    // lattice query used by ClassifyTile because a false Mixed is cheaper than a dropped floor.
+    if (!VoxelDensityAblation::IsOriginSpineOff()
+        || !VoxelDensityAblation::IsLandingPostsOff())
+    {
+        if (!VoxelMath::IsFinite(Generator.OriginSpineRadius)
+            || Generator.OriginSpineRadius <= 0.0f)
+        {
+            return false;
+        }
+        if (Manager->AnyOriginLandingFloorNearLattice(
+                TileVoxelBox, OriginVoxels, Step))
+        {
+            return false;
+        }
+    }
+
+    if (!VoxelDensityAblation::IsDisturbancesOff())
+    {
+        const int64 XYChunkCount =
+            (static_cast<int64>(MaxChunkX) - static_cast<int64>(MinChunkX) + 1)
+            * (static_cast<int64>(MaxChunkY) - static_cast<int64>(MinChunkY) + 1);
+        const int64 ZChunkCount =
+            static_cast<int64>(MaxChunkZ) - static_cast<int64>(MinChunkZ) + 1;
+        constexpr int64 MaxProofChunkCoordinates = 65536;
+        if (XYChunkCount <= 0 || ZChunkCount <= 0
+            || XYChunkCount > MaxProofChunkCoordinates
+            || XYChunkCount * ZChunkCount > MaxProofChunkCoordinates)
+        {
+            return false;
+        }
+
+        // Out-of-layout chunks normally return disabled disturbance params. Still ask the exact
+        // bridge/ridge predicates for every touched chunk so a future out-of-layout decoration
+        // cannot silently turn this air proof into an invisible solid patch.
+        for (int32 ChunkZ = MinChunkZ; ChunkZ <= MaxChunkZ; ++ChunkZ)
+        for (int32 ChunkY = MinChunkY; ChunkY <= MaxChunkY; ++ChunkY)
+        for (int32 ChunkX = MinChunkX; ChunkX <= MaxChunkX; ++ChunkX)
+        {
+            const FStrateDisturbanceParams D =
+                Manager->GetDisturbanceParamsForChunk(FIntVector(ChunkX, ChunkY, ChunkZ));
+            if (VF_AnyBridgeCanTouchBox(TileVoxelBox, D, static_cast<uint32>(Generator.Seed))
+                || VF_AnyRidgeCanTouchBox(TileVoxelBox, D, static_cast<uint32>(Generator.Seed)))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 //=============================================================================
-// LE MAPPING « ARCHÉTYPE → PILE D'OPÉRATEURS » — UNE SEULE DÉFINITION
+// LE MAPPING « ARCHÉTYPE → PILE D’OPÉRATEURS » — UNE SEULE DÉFINITION
 //=============================================================================
 // ⚠️ EXTRAIT DE `GetDensityAt` PARCE QUE `ClassifyTile` EN A BESOIN AUSSI, ET QU'UNE DEUXIÈME COPIE
 // SERAIT LA PIRE FORME DE BUG DISPONIBLE ICI.
@@ -5712,6 +6328,29 @@ EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels,
 {
     return ClassifyTile(OriginVoxels, Step, CellsPerAxis, nullptr);
 }
+
+bool UVoxelGenerator::TryProveSealedSolidTile(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
+{
+    return VF_TryProveSealedSolidTile(
+        *this, OriginVoxels, Step, CellsPerAxis, /*DisabledGuards=*/0);
+}
+
+bool UVoxelGenerator::TryProveOutOfLayoutAirTile(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis) const
+{
+    return VF_TryProveOutOfLayoutAirTile(*this, OriginVoxels, Step, CellsPerAxis);
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+bool UVoxelGenerator::TryProveSealedSolidTileForTest(
+    const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+    uint8 DisabledGuards) const
+{
+    return VF_TryProveSealedSolidTile(
+        *this, OriginVoxels, Step, CellsPerAxis, DisabledGuards);
+}
+#endif
 
 EVoxelTileClass UVoxelGenerator::ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
                                               int32 CellsPerAxis,

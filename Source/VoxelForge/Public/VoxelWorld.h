@@ -107,6 +107,8 @@ struct FChunkResult
     uint64 GenerationEndCycles = 0;
     uint64 ApplyStartCycles = 0;
     int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
+    bool bSealedSolidProof = false; // true when the cheap gap/seal proof skipped meshing
+    bool bOutOfLayoutAirProof = false; // true when the exact constant-air guard skipped meshing
     // Clean, low-overhead work counters. These are carried with the result so the worker can
     // count exact validation and mesher density calls locally, then publish one aggregate update.
     int64 ValidationDensityCalls = 0;
@@ -934,6 +936,9 @@ public:
     std::atomic<uint64> TotalObsoleteWorkerTasks{0};
     std::atomic<uint64> TotalValidationDensityCalls{0};
     std::atomic<uint64> TotalMesherDensityCalls{0};
+    std::atomic<uint64> TotalSealedSolidProofCandidates{0};
+    std::atomic<uint64> TotalSealedSolidProofSkips{0};
+    std::atomic<uint64> TotalOutOfLayoutAirProofSkips{0};
     std::atomic<uint64> OuterClassifierCallsByLOD[TrackedClassifierLODCount]{};
     std::atomic<uint64> OuterClassifierVerdictsByLOD[TrackedClassifierLODCount][3]{};
 
@@ -959,6 +964,9 @@ public:
     // by explicit command-line switches; they do not alter ordinary player movement or streaming.
     bool bHeadlessStreamingTestMovement = false;
     bool bHeadlessStreamingTestExitRequested = false;
+    bool bStartupTraceThroughCrossing = false;
+    bool bHeadlessStreamingTestCenterOverride = false;
+    FVector HeadlessStreamingTestCenterVoxel = FVector::ZeroVector;
     int32 HeadlessStreamingTestMoveAttempts = 0;
     double HeadlessStreamingTestDistanceCm = 0.0;
     float HeadlessStreamingTestSpeedCmPerSecond = 0.0f;

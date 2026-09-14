@@ -22,6 +22,16 @@ class UVoxelDiffLayer;
 class UVoxelBiomeDefinition;
 struct FTunnelCoreWorldEvaluation;
 
+/** Guards which may be disabled only by the sealed-solid proof's soundness tests. */
+enum class EVoxelSealedSolidProofGuard : uint8
+{
+    None              = 0,
+    DiffLayer         = 1u << 0,
+    Passages          = 1u << 1,
+    OriginLanding     = 1u << 2,
+    DisturbanceChasms = 1u << 3,
+};
+
 //=============================================================================
 // LOD-AWARE OCTAVE REDUCTION (T2.b)
 //=============================================================================
@@ -165,6 +175,27 @@ public:
     void BeginDensityBlock(FIntVector OriginVoxels, int32 Step,
                            int32 SizeX, int32 SizeY, int32 SizeZ) const;
     void EndDensityBlock() const;
+
+    /**
+     * Prove that the mesher's core lattice is entirely solid from the cheap, structural rules
+     * that own inter-strate gaps and boundary seals.  This never samples density.  It is intended
+     * for an empty-tile fast path; a false answer is harmless, while a true answer must make every
+     * core lattice vertex negative in the final MC field.
+     *
+     * The proof is deliberately narrower than ClassifyTile: it accepts only a tile made entirely
+     * of gap/seal lattice rows and rejects recipes/composer overrides plus every known air-writing
+     * structural feature.  The mesher's +/-1 normal halo is not part of the cell lattice, matching
+     * ClassifyTile and GenerateMesh.
+     */
+    bool TryProveSealedSolidTile(const FIntVector& OriginVoxels, int32 Step,
+                                 int32 CellsPerAxis) const;
+
+#if WITH_DEV_AUTOMATION_TESTS
+    /** Test hook: disable named proof guards and require the brute-force oracle to catch it. */
+    bool TryProveSealedSolidTileForTest(
+        const FIntVector& OriginVoxels, int32 Step, int32 CellsPerAxis,
+        uint8 DisabledGuards) const;
+#endif
 
     /**
      * Densité pour une strate TunnelNetwork (rooms + tunnels + worm noise).
@@ -384,6 +415,15 @@ public:
     EVoxelTileClass ClassifyTile(const FIntVector& OriginVoxels, int32 Step,
                                  int32 CellsPerAxis,
                                  struct FVoxelTileClassificationStats* OutStats) const;
+
+    /**
+     * Prove the exact constant-air field above/below the strate layout for a mesher lattice.
+     * This is separate from TryProveSealedSolidTile: it never supplies collision support and its
+     * caller records AllAir, not AllSolid.  It shares the layout/diff/structural guards with the
+     * production classifier and returns false for every mixed or uncertain box.
+     */
+    bool TryProveOutOfLayoutAirTile(const FIntVector& OriginVoxels, int32 Step,
+                                    int32 CellsPerAxis) const;
 
 private:
     /** Identité process-unique du propriétaire des caches `CP_*` thread_local.

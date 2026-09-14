@@ -14,6 +14,7 @@ namespace VoxelForgeStartupTrace
         int32 TileZ = 0;
         int32 Level = -1;
         int32 Verdict = -1; // Mixed=0, AllSolid=1, AllAir=2, -1=not classified (sheet/early path)
+        bool bSealedSolidProof = false;
         bool bEmpty = true;
         int32 Triangles = 0;
         // This is worker-result -> game-thread mesh submission. Collision readiness is a later

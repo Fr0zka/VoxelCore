@@ -97,6 +97,15 @@ namespace
         GVoxelForgeOuterClassifierMode,
         TEXT("Outer tile classifier mode: 0 off, 1 discarded exact validation."));
 
+    // Cheap structural proofs for LOD tiles whose exact core lattice lies entirely in a gap/seal
+    // (AllSolid) or constant out-of-layout air (AllAir).  They are independent of the discarded
+    // full classifier and default on; 0 is retained for per-tile identity/A-B traces.
+    int32 GVoxelForgeSealedSolidProof = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeSealedSolidProof(
+        TEXT("voxel.SealedSolidProof"),
+        GVoxelForgeSealedSolidProof,
+        TEXT("Skip meshing only when an exact gap/seal or constant-air proof holds: 0 off, 1 on."));
+
     // Startup command-line cvars can arrive before the game world has spawned AVoxelWorld (or
     // before its first tiles have become visible). Keep the diagnostic edit pending until Tick has
     // a loaded tile; otherwise a startup measurement silently becomes a no-op or edits the wrong
@@ -104,6 +113,7 @@ namespace
     int32 GVoxelForgePendingTestModification = 0;
     float GVoxelForgePendingModificationRadius = 3.0f;
     float GVoxelForgePendingModificationStrength = 10.0f;
+    bool GVoxelForgeTestModificationLoadedProofTarget = false;
     bool GVoxelForgeTestModificationCommandLineConsumed = false;
     bool GVoxelForgeStreamingBudgetReported = false;
     bool GVoxelForgeGenerationCapHitReported = false;
@@ -1105,6 +1115,9 @@ void AVoxelWorld::BeginPlay()
     TotalObsoleteWorkerTasks.store(0, std::memory_order_relaxed);
     TotalValidationDensityCalls.store(0, std::memory_order_relaxed);
     TotalMesherDensityCalls.store(0, std::memory_order_relaxed);
+    TotalSealedSolidProofCandidates.store(0, std::memory_order_relaxed);
+    TotalSealedSolidProofSkips.store(0, std::memory_order_relaxed);
+    TotalOutOfLayoutAirProofSkips.store(0, std::memory_order_relaxed);
     AppliedTileCount = 0;
     AppliedVisibleTileCount = 0;
     AppliedTriangleCount = 0;
@@ -1133,6 +1146,7 @@ void AVoxelWorld::BeginPlay()
     int32 CommandLineProfileTileGeneration = GVoxelForgeProfileTileGeneration;
     int32 CommandLineUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut;
     int32 CommandLineOuterClassifierMode = GVoxelForgeOuterClassifierMode;
+    int32 CommandLineSealedSolidProof = GVoxelForgeSealedSolidProof;
     int32 CommandLineSampleStacks = GVoxelForgeSampleStacks;
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
     {
@@ -1161,6 +1175,10 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgeOuterClassifierMode = CommandLineOuterClassifierMode;
     }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.SealedSolidProof="), CommandLineSealedSolidProof))
+    {
+        GVoxelForgeSealedSolidProof = CommandLineSealedSolidProof;
+    }
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.SampleStacks="), CommandLineSampleStacks))
     {
         GVoxelForgeSampleStacks = CommandLineSampleStacks;
@@ -1168,6 +1186,7 @@ void AVoxelWorld::BeginPlay()
     GVoxelForgeProfileTileGeneration = GVoxelForgeProfileTileGeneration != 0 ? 1 : 0;
     GVoxelForgeUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0 ? 1 : 0;
     GVoxelForgeOuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
+    GVoxelForgeSealedSolidProof = GVoxelForgeSealedSolidProof != 0 ? 1 : 0;
     GVoxelForgeSampleStacks = FMath::Clamp(
         GVoxelForgeSampleStacks,
         0,
@@ -1281,8 +1300,9 @@ void AVoxelWorld::BeginPlay()
     Mesher->bUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0;
 
     UE_LOG(LogTemp, Display,
-        TEXT("[VoxelForgeClassifierConfig] outer_mode=%d nested_block_early_out=%d"),
-        GVoxelForgeOuterClassifierMode, Mesher->bUseBlockEarlyOut ? 1 : 0);
+        TEXT("[VoxelForgeClassifierConfig] outer_mode=%d sealed_solid_proof=%d nested_block_early_out=%d"),
+        GVoxelForgeOuterClassifierMode, GVoxelForgeSealedSolidProof,
+        Mesher->bUseBlockEarlyOut ? 1 : 0);
 
     VoxelForgeStartupTrace::RecordEvent(TEXT("generator_mesher_constructed"), FString::Printf(
         TEXT("\"generator\":1,\"mesher\":1,\"generate_skirts\":%d,\"full_res_clip_levels\":%d,\"coarse_tile_cells\":%d"),
@@ -1377,6 +1397,9 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
 {
     bHeadlessStreamingTestMovement = false;
     bHeadlessStreamingTestExitRequested = false;
+    bStartupTraceThroughCrossing = false;
+    bHeadlessStreamingTestCenterOverride = false;
+    HeadlessStreamingTestCenterVoxel = FVector::ZeroVector;
     HeadlessStreamingTestMoveAttempts = 0;
     HeadlessStreamingTestDistanceCm = 0.0;
     HeadlessStreamingTestSpeedCmPerSecond = 0.0f;
@@ -1470,6 +1493,33 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
             HeadlessStrateCrossingTestMaxGateSeconds,
             HeadlessStrateCrossingTestRouteTargetRadiusVoxels,
             HeadlessStrateCrossingTestRequestedPassageIndex);
+    }
+
+    int32 TraceThroughCrossingValue = 0;
+    if (FParse::Value(
+            CommandLine,
+            TEXT("voxel.StartupTraceThroughCrossing="),
+            TraceThroughCrossingValue))
+    {
+        bStartupTraceThroughCrossing = TraceThroughCrossingValue != 0;
+    }
+
+    float CenterX = 0.0f;
+    float CenterY = 0.0f;
+    float CenterZ = 0.0f;
+    const bool bCenterX = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterX="), CenterX);
+    const bool bCenterY = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterY="), CenterY);
+    const bool bCenterZ = FParse::Value(CommandLine, TEXT("voxel.StreamingTestCenterZ="), CenterZ);
+    if (bCenterX && bCenterY && bCenterZ
+        && VoxelMath::IsFinite(CenterX)
+        && VoxelMath::IsFinite(CenterY)
+        && VoxelMath::IsFinite(CenterZ))
+    {
+        bHeadlessStreamingTestCenterOverride = true;
+        HeadlessStreamingTestCenterVoxel = FVector(CenterX, CenterY, CenterZ);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStreamingTest] center_override=1 local_vox=(%.2f,%.2f,%.2f)"),
+            CenterX, CenterY, CenterZ);
     }
 
     if (bMoveRequested && !bHeadlessStrateCrossingTest)
@@ -2000,6 +2050,11 @@ void AVoxelWorld::MaybeFinishHeadlessStrateCrossingTest()
         HeadlessStrateCrossingTestLastActualPosition.X,
         HeadlessStrateCrossingTestLastActualPosition.Y,
         HeadlessStrateCrossingTestLastActualPosition.Z);
+    if (bStartupTraceThroughCrossing && VoxelForgeStartupTrace::IsActive())
+    {
+        VoxelForgeStartupTrace::Finish(
+            bPassed ? TEXT("strate_crossing_passed") : TEXT("strate_crossing_failed"));
+    }
     FPlatformMisc::RequestExitWithStatus(
         false, bPassed ? 0 : 1, TEXT("VoxelForge strate crossing test complete"));
 }
@@ -2110,7 +2165,10 @@ void AVoxelWorld::Tick(float DeltaTime)
             PeakObservedPawnSpeedCmPerSecond, PlayerHeading.Size2D());
         UpdatePawnCollisionGate(PlayerPawn, PlayerLastPos, DeltaTime);
         ObserveHeadlessStrateCrossingTest(PlayerLastPos, PlayerPawn);
-        UpdateChunksAroundPosition(PlayerLastPos, PlayerPawn, PlayerHeading);
+        const FVector StreamingCenterPosition = bHeadlessStreamingTestCenterOverride
+            ? LocalVoxelToWorld(HeadlessStreamingTestCenterVoxel)
+            : PlayerLastPos;
+        UpdateChunksAroundPosition(StreamingCenterPosition, PlayerPawn, PlayerHeading);
         if (AtmosphereManager)
         {
             AtmosphereManager->UpdateForPlayer(PlayerLastPos);
@@ -2165,10 +2223,20 @@ void AVoxelWorld::Tick(float DeltaTime)
         {
             GVoxelForgePendingModificationRadius = 3.0f;
             GVoxelForgePendingModificationStrength = 10.0f;
+            FString ModificationTarget;
+            if (FParse::Value(
+                    *CommandLine,
+                    TEXT("voxel.TestModificationTarget="),
+                    ModificationTarget)
+                && ModificationTarget.Equals(TEXT("loaded-proof"), ESearchCase::IgnoreCase))
+            {
+                GVoxelForgeTestModificationLoadedProofTarget = true;
+            }
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTestModification] queued radius=%.2f strength=%.2f"),
+                TEXT("[VoxelForgeTestModification] queued radius=%.2f strength=%.2f target=%s"),
                 GVoxelForgePendingModificationRadius,
-                GVoxelForgePendingModificationStrength);
+                GVoxelForgePendingModificationStrength,
+                GVoxelForgeTestModificationLoadedProofTarget ? TEXT("loaded-proof") : TEXT("player"));
             GVoxelForgePendingTestModification = 1;
         }
     }
@@ -2183,10 +2251,16 @@ void AVoxelWorld::Tick(float DeltaTime)
         && PendingTiles.Num() == 0
         && bStartupTraceDesiredRecorded
         && PendingCollisionCooks.Num() == 0
+        && (!bStartupTraceThroughCrossing
+            || !bHeadlessStrateCrossingTest
+            || bHeadlessStrateCrossingTestPassed
+            || bHeadlessStrateCrossingTestFailed)
         // The desired set being applied is not the player-ready point: the feet tile must have
         // received its completed LOD0 RMC body first. If no pawn exists, there is no gate to wait
         // for and the headless trace keeps its old completion behavior.
-        && (!bHasPlayer || IsPlayerSupportCollisionReady(PlayerPawn, PlayerLastPos)))
+        && (!bHasPlayer
+            || bHeadlessStreamingTestCenterOverride
+            || IsPlayerSupportCollisionReady(PlayerPawn, PlayerLastPos)))
     {
         TMap<int32, int32> SteadyLevelCounts;
         TMap<int32, FIntVector> SteadyLevelMins;
@@ -2244,22 +2318,75 @@ void AVoxelWorld::Tick(float DeltaTime)
     // No pawn is a distinct state from a pawn at (0,0,0); keep the diagnostic fallback for
     // headless/editor use without making the world-origin pawn skip streaming.
     FVector ModificationPosition = bHasPlayer ? PlayerLastPos : GetActorLocation();
-    const FVoxelTileKey ModificationCenterTile(
+    FVoxelTileKey ModificationCenterTile(
         WorldToChunkCoord(WorldToLocalCm(ModificationPosition)), 0);
+    bool bModificationTargetSelected = false;
+    if (GVoxelForgePendingTestModification != 0
+        && GVoxelForgeTestModificationLoadedProofTarget
+        && Generator)
+    {
+        // The diagnostic target is deliberately selected from the applied set.  That makes the
+        // edit exercise the normal loaded-tile synchronous remesh, while the proof query here is
+        // the same public predicate used by GenerateTileResult before the diff exists.
+        for (const FVoxelTileKey& CandidateTile : LoadedTiles)
+        {
+            if (CandidateTile.Level != 0
+                || PendingTiles.Contains(CandidateTile))
+            {
+                continue;
+            }
+            const FIntVector CandidateOrigin(
+                CandidateTile.Coord.X * CHUNK_SIZE,
+                CandidateTile.Coord.Y * CHUNK_SIZE,
+                CandidateTile.Coord.Z * CHUNK_SIZE);
+            if (!Generator->TryProveSealedSolidTile(CandidateOrigin, 1, CHUNK_SIZE))
+            {
+                continue;
+            }
+
+            const FIntVector CandidateCenter(
+                CandidateOrigin.X + CHUNK_SIZE / 2,
+                CandidateOrigin.Y + CHUNK_SIZE / 2,
+                CandidateOrigin.Z + CHUNK_SIZE / 2);
+            ModificationPosition = LocalVoxelToWorld(FVector(CandidateCenter));
+            ModificationCenterTile = CandidateTile;
+            bModificationTargetSelected = true;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTestModification] player_mine_target tile=(%d,%d,%d) "
+                     "local_center=(%d,%d,%d) before_proof=1"),
+                CandidateTile.Coord.X, CandidateTile.Coord.Y, CandidateTile.Coord.Z,
+                CandidateCenter.X, CandidateCenter.Y, CandidateCenter.Z);
+            break;
+        }
+    }
     if (GVoxelForgePendingTestModification != 0
         && DiffLayer
+        && (!GVoxelForgeTestModificationLoadedProofTarget || bModificationTargetSelected)
         && LoadedTiles.Contains(ModificationCenterTile)
         && !PendingTiles.Contains(ModificationCenterTile))
     {
         GVoxelForgePendingTestModification = 0;
         UE_LOG(LogTemp, Display,
-            TEXT("[VoxelForgeTestModification] applying position=(%.2f,%.2f,%.2f) radius=%.2f strength=%.2f"),
+            TEXT("[VoxelForgeTestModification] applying player_mine=1 tile=(%d,%d,%d) "
+                 "position=(%.2f,%.2f,%.2f) radius=%.2f strength=%.2f"),
+            ModificationCenterTile.Coord.X, ModificationCenterTile.Coord.Y, ModificationCenterTile.Coord.Z,
             ModificationPosition.X, ModificationPosition.Y, ModificationPosition.Z,
             GVoxelForgePendingModificationRadius, GVoxelForgePendingModificationStrength);
         CarveAtPosition(
             ModificationPosition,
             GVoxelForgePendingModificationRadius,
             GVoxelForgePendingModificationStrength);
+        const FIntVector ModifiedOrigin(
+            ModificationCenterTile.Coord.X * CHUNK_SIZE,
+            ModificationCenterTile.Coord.Y * CHUNK_SIZE,
+            ModificationCenterTile.Coord.Z * CHUNK_SIZE);
+        const bool bProofSurvivedCarve = Generator
+            && Generator->TryProveSealedSolidTile(ModifiedOrigin, 1, CHUNK_SIZE);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeTestModification] player_mine_complete tile=(%d,%d,%d) "
+                 "after_proof=%d"),
+            ModificationCenterTile.Coord.X, ModificationCenterTile.Coord.Y,
+            ModificationCenterTile.Coord.Z, bProofSurvivedCarve ? 1 : 0);
     }
     ProcessUnloadQueue();
     MaybeFinishHeadlessStreamingTest();
@@ -2849,6 +2976,12 @@ void AVoxelWorld::LogStreamingLatencySummary() const
         TotalWorkerGenerationCycles.load(std::memory_order_relaxed);
     const uint64 ObsoleteWorkerCycles =
         TotalObsoleteWorkerCycles.load(std::memory_order_relaxed);
+    const uint64 SealedSolidProofCandidates =
+        TotalSealedSolidProofCandidates.load(std::memory_order_relaxed);
+    const uint64 SealedSolidProofSkips =
+        TotalSealedSolidProofSkips.load(std::memory_order_relaxed);
+    const uint64 OutOfLayoutAirProofSkips =
+        TotalOutOfLayoutAirProofSkips.load(std::memory_order_relaxed);
     const bool bDiagnosticsEnabled = GVoxelForgeProfileTileGeneration != 0
         || VoxelForgeStartupTrace::IsActive()
         || VoxelDensityProfile::GetMode() != VoxelDensityProfile::EMode::Disabled;
@@ -2863,6 +2996,8 @@ void AVoxelWorld::LogStreamingLatencySummary() const
              "applied_tiles=%llu applied_visible_tiles=%llu applied_triangles=%llu "
              "worker_generation_tasks=%llu worker_generation_sum_s=%.6f "
              "validation_density_calls=%llu mesher_density_calls=%llu "
+             "sealed_solid_proof_candidates=%llu sealed_solid_proof_skips=%llu "
+             "out_of_layout_air_proof_skips=%llu "
              "obsolete_worker_tasks=%llu obsolete_worker_sum_s=%.6f "
              "outer_classifier_verdicts=%s applied_level_summary=%s band_level_summary=%s"),
         bDiagnosticsEnabled ? TEXT("profiled") : TEXT("clean"),
@@ -2881,6 +3016,9 @@ void AVoxelWorld::LogStreamingLatencySummary() const
         FPlatformTime::ToSeconds64(WorkerGenerationCycles),
         static_cast<unsigned long long>(TotalValidationDensityCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(TotalMesherDensityCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(SealedSolidProofCandidates),
+        static_cast<unsigned long long>(SealedSolidProofSkips),
+        static_cast<unsigned long long>(OutOfLayoutAirProofSkips),
         static_cast<unsigned long long>(TotalObsoleteWorkerTasks.load(std::memory_order_relaxed)),
         FPlatformTime::ToSeconds64(ObsoleteWorkerCycles),
         *ClassifierVerdictSummary,
@@ -3191,6 +3329,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 Sample.TileZ = Result.Tile.Coord.Z;
                 Sample.Level = Result.Tile.Level;
                 Sample.Verdict = Result.ClassifyVerdict;
+                Sample.bSealedSolidProof = Result.bSealedSolidProof;
                 Sample.bEmpty = bResultEmpty;
                 Sample.Triangles = Result.NumTriangles;
                 Sample.RequestToApplySeconds = RequestToApply;
@@ -4523,7 +4662,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d triangles=%d "
                      "band=(%d,%d) "
-                     "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
+                     "verdict=%d proof=%d air_proof=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
                      "cache_build=%.6f evaluation=%.6f "
                      "refine=%u stack=%u core_samples=%u final_samples=%u core_hits=%u final_hits=%u "
                      "core_leaves=%u final_leaves=%u tail_queries=%u tail_eval=%u "
@@ -4543,7 +4682,9 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, Result.NumTriangles, BandChunkLo, BandChunkHi,
-                ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
+                ClassifyVerdict, Result.bSealedSolidProof ? 1 : 0,
+                Result.bOutOfLayoutAirProof ? 1 : 0,
+                ClassifySeconds, MeshSeconds, StreamSeconds,
                 TileSeconds, CacheBuildSeconds, EvaluationSeconds,
                 ClassifierStats.RefineNodes, ClassifierStats.StackBoxCalls,
                 ClassifierStats.ExactCoreSamples, ClassifierStats.ExactFinalSamples,
@@ -4637,6 +4778,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     Result.bObsolete = false;
     Result.bEmpty = true;
     Result.ClassifyVerdict = -1;
+    Result.bSealedSolidProof = false;
+    Result.bOutOfLayoutAirProof = false;
     Result.ClassifySeconds = 0.0;
     Result.MeshSeconds = 0.0;
     Result.StreamSeconds = 0.0;
@@ -4674,8 +4817,49 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     // même pour les cellules uniformes, et ces tuiles sont rares (fenêtre d'ombre).
     // (Gate IsoLevel == 0 : les verdicts du classifieur supposent l'iso MC à zéro exactement.)
     bool bTrivialEmpty = false;
+    if (GVoxelForgeSealedSolidProof != 0
+        && !bSheetTile && !bWantCapture && Generator && Mesher
+        && Mesher->IsoLevel == 0.0f)
+    {
+        TotalSealedSolidProofCandidates.fetch_add(1, std::memory_order_relaxed);
+        const double ProofStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
+        if (Generator->TryProveSealedSolidTile(OriginVoxels, Step, Cells))
+        {
+            ClassifySeconds = bMeasureTile
+                ? FPlatformTime::Seconds() - ProofStartSeconds : 0.0;
+            ClassifyVerdict = static_cast<int32>(EVoxelTileClass::AllSolid);
+            Result.ClassifyVerdict = ClassifyVerdict;
+            Result.bSealedSolidProof = true;
+            TotalSealedSolidProofSkips.fetch_add(1, std::memory_order_relaxed);
+            INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllSolid);
+            bTrivialEmpty = true;
+        }
+        else if (Generator->TryProveOutOfLayoutAirTile(OriginVoxels, Step, Cells))
+        {
+            ClassifySeconds = bMeasureTile
+                ? FPlatformTime::Seconds() - ProofStartSeconds : 0.0;
+            ClassifyVerdict = static_cast<int32>(EVoxelTileClass::AllAir);
+            Result.ClassifyVerdict = ClassifyVerdict;
+            Result.bOutOfLayoutAirProof = true;
+            TotalOutOfLayoutAirProofSkips.fetch_add(1, std::memory_order_relaxed);
+            INC_DWORD_STAT(STAT_VoxelForgeTilesSkippedAllAir);
+            bTrivialEmpty = true;
+        }
+        else if (bMeasureTile)
+        {
+            // Keep the measured proof cost visible on a tile that continues through the normal
+            // path. The clean summary remains counter-only and pays no timer overhead.
+            ClassifySeconds = FPlatformTime::Seconds() - ProofStartSeconds;
+        }
+    }
+    if (ShouldAbortWork(ObsoleteFlag))
+    {
+        AbortResult();
+        EmitTileProfile();
+        return;
+    }
     const int32 OuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
-    if (OuterClassifierMode != 0
+    if (!bTrivialEmpty && OuterClassifierMode != 0
         && !bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
@@ -4754,7 +4938,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
             EmitTileProfile();
             return;
         }
-        ClassifySeconds = bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
+        ClassifySeconds += bMeasureTile ? FPlatformTime::Seconds() - ClassifyStartSeconds : 0.0;
         ClassifyVerdict = static_cast<int32>(ValidatedVerdict);
         Result.ClassifyVerdict = ClassifyVerdict;
         const int32 TrackedLOD = FMath::Clamp(Tile.Level, 0, TrackedClassifierLODCount - 1);
