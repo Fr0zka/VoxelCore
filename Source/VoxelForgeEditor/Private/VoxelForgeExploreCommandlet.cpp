@@ -5780,7 +5780,7 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
             ? FMath::Clamp(World.Settings->CoarseTileCells, 4, CHUNK_SIZE)
             : 16;
         const int32 CutMin = World.Settings
-            ? World.Settings->StrateContentCutMinLevel
+            ? World.Settings->GetEffectiveStrateContentCutMinLevel()
             : 9;
         for (int32 Level = 0; Level <= 4; ++Level)
         {

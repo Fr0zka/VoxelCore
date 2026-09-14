@@ -60,7 +60,9 @@ public:
      *                       les a déjà calculées). Vidé puis rempli ; reste vide si non éligible.
      * @param BandZMinVox / BandZMaxVox - COUPE DE CONTENU PAR STRATE (optionnel, voxels Z INCLUSIFS,
      *                       cf. UVoxelSettings::StrateContentCutMinLevel) : seules les cellules dont
-     *                       l'intervalle Z chevauche la bande sont maillées. Une tuile grossière qui
+     *                       l'intervalle Z chevauche la bande sont maillées. Le runtime ne passe
+     *                       jamais de bande aux tuiles LOD0, car elles possèdent la collision du pawn.
+     *                       Une tuile grossière qui
      *                       chevauche une frontière de strate ne maille que la strate du joueur —
      *                       supprime les trous d'aliasing (le bouchon seal/gap plus fin que Step
      *                       tombait entre deux points du treillis) et le mélange de matériaux entre

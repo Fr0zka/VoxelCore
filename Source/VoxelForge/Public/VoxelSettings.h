@@ -95,13 +95,26 @@ public:
 	// both strates' materials. From this clip level UP, the mesher only meshes cells inside the
 	// PLAYER's strate Z-band (the other strates are sealed/enclosed ⇒ invisible from here anyway);
 	// loaded coarse tiles re-queue automatically when the band changes (strate transition).
-	// Default 0 = cut at EVERY level (tested verdict 2026-07-05: level 0/1 straddler tiles were
-	// the visible mixers — a higher floor left them mixing and looked like "no improvement").
-	// Raise only if the descent/passage transition needs full tiles near the player. 9 = off.
+	// Default 1 = cut LOD1 and coarser. LOD0 is deliberately never content-cut because it owns pawn
+	// collision: cutting the passage, gap, or next-strate support tile would deadlock a walk at the
+	// current strate boundary. The runtime clamps legacy/hand-authored values below 1 to 1 as well.
+	// Raise only if a broader near-field view needs full coarse tiles. 9 = off.
 	// At ultra-coarse levels where one CELL is taller than the band itself, the tile is skipped
 	// entirely (see LoadTile) — cell-granular cutting there could only render garbage.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0", ClampMax = "9"))
-	int32 StrateContentCutMinLevel = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "1", ClampMax = "9"))
+	int32 StrateContentCutMinLevel = 1;
+
+	/**
+	 * Return the effective content-cut level used by runtime streaming.
+	 *
+	 * Existing data assets can contain a serialized legacy value of 0 even though the property now
+	 * documents 1 as the minimum. Keep the safety rule in code, at the consumer boundary: level 0
+	 * tiles are the collision tiles and must never receive a strate content band.
+	 */
+	int32 GetEffectiveStrateContentCutMinLevel() const
+	{
+		return FMath::Clamp(FMath::Max(StrateContentCutMinLevel, 1), 1, 9);
+	}
 
 	// Open-world SKY reach: the sky-cap ceiling of an open strate (SurfaceWorld / FloatingIslands)
 	// is FAR, so the ceiling BAND is streamed across a wider horizontal radius = ViewDistanceXY ×

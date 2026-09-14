@@ -504,6 +504,11 @@ private:
     void ConfigureHeadlessStreamingTest();
     void AdvanceHeadlessStreamingTest(FVector& InOutPlayerPosition,
                                       FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void InitializeHeadlessStrateCrossingTest();
+    void AdvanceHeadlessStrateCrossingTest(FVector& InOutPlayerPosition,
+                                            FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void ObserveHeadlessStrateCrossingTest(const FVector& PlayerPosition, APawn* PlayerPawn);
+    void MaybeFinishHeadlessStrateCrossingTest();
     void MaybeFinishHeadlessStreamingTest();
 
     // Packed shader params, recomputed each Tick. ALL meaningful data is in .xyz — a material Vector
@@ -937,6 +942,9 @@ public:
     uint64 AppliedTileCount = 0;
     uint64 AppliedVisibleTileCount = 0;
     uint64 AppliedTriangleCount = 0;
+    uint64 AppliedVisibleTileCountByLevel[TrackedClassifierLODCount]{};
+    uint64 AppliedTriangleCountByLevel[TrackedClassifierLODCount]{};
+    uint64 AppliedBandTileCountByLevel[TrackedClassifierLODCount]{};
 
     struct FStreamingLatencySample
     {
@@ -960,6 +968,39 @@ public:
     FVector HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
     double HeadlessStreamingTestBeginSeconds = 0.0;
     double HeadlessStreamingTestLastElapsedSeconds = 0.0;
+
+    // Real inter-strate crossing validation. This is enabled only by -voxel.TestStrateCrossing=1;
+    // the route is copied from UVoxelStrateManager's generated passage and movement is supplied to
+    // the ordinary pawn movement component. The initial placement onto the upper landing is test
+    // setup; every point after that is reached through swept character movement and the collision gate.
+    bool bHeadlessStrateCrossingTest = false;
+    bool bHeadlessStrateCrossingTestStartPlaced = false;
+    bool bHeadlessStrateCrossingTestStarted = false;
+    bool bHeadlessStrateCrossingTestPassed = false;
+    bool bHeadlessStrateCrossingTestFailed = false;
+    bool bHeadlessStrateCrossingTestExitRequested = false;
+    bool bHeadlessStrateCrossingTestGateWasEngaged = false;
+    int32 HeadlessStrateCrossingTestRequestedPassageIndex = INDEX_NONE;
+    int32 HeadlessStrateCrossingTestPassageIndex = INDEX_NONE;
+    int32 HeadlessStrateCrossingTestUpperStrateIndex = INDEX_NONE;
+    int32 HeadlessStrateCrossingTestLowerStrateIndex = INDEX_NONE;
+    int32 HeadlessStrateCrossingTestRouteTargetIndex = 1;
+    int32 HeadlessStrateCrossingTestLastReportedStrate = INDEX_NONE;
+    float HeadlessStrateCrossingTestSpeedCmPerSecond = 800.0f;
+    float HeadlessStrateCrossingTestStartDelaySeconds = 1.0f;
+    float HeadlessStrateCrossingTestTimeoutSeconds = 120.0f;
+    float HeadlessStrateCrossingTestMaxGateSeconds = 10.0f;
+    float HeadlessStrateCrossingTestRouteTargetRadiusVoxels = 2.0f;
+    float HeadlessStrateCrossingTestPlayerHalfHeightVoxels = 3.52f;
+    float HeadlessStrateCrossingTestMinFloorClearanceVoxels = 1000000.0f;
+    double HeadlessStrateCrossingTestBeginSeconds = 0.0;
+    double HeadlessStrateCrossingTestStartSeconds = 0.0;
+    double HeadlessStrateCrossingTestGateStartSeconds = 0.0;
+    double HeadlessStrateCrossingTestMaxGateDurationSeconds = 0.0;
+    double HeadlessStrateCrossingTestTotalGateDurationSeconds = 0.0;
+    FVector HeadlessStrateCrossingTestLastActualPosition = FVector::ZeroVector;
+    FString HeadlessStrateCrossingTestFailureReason;
+    TArray<FVector> HeadlessStrateCrossingTestRoute;
 
     // PLAYER COLLISION GATE — the pawn is allowed to enter/leave a tile only when the level-0
     // collision body covering its feet has completed the RMC cook. The movement component state is

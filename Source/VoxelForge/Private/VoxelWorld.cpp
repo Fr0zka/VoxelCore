@@ -18,6 +18,7 @@
 #include "VoxelStackSampler.h"
 #include "VoxelStats.h"
 #include "VoxelCaveMorphology.h"
+#include "VoxelPassageGeometry.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
 // complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
@@ -107,6 +108,38 @@ namespace
     bool GVoxelForgeStreamingBudgetReported = false;
     bool GVoxelForgeGenerationCapHitReported = false;
     int32 GVoxelForgeMaxPendingTilesObserved = 0;
+}
+
+static bool VF_ProjectHeadlessPassageFloor(
+    const FVoxelPassage& Passage, const FVector& PositionVoxel, float& OutFloorZ)
+{
+    const auto NearLanding = [&PositionVoxel](const FVoxelPassageLanding& Landing) -> bool
+    {
+        if (!(Landing.HalfWidth > 0.0f))
+        {
+            return false;
+        }
+        const FVector2D Delta(
+            PositionVoxel.X - Landing.StandingPoint.X,
+            PositionVoxel.Y - Landing.StandingPoint.Y);
+        return Delta.SizeSquared() <= FMath::Square(Landing.HalfWidth + 1.0f);
+    };
+
+    if (NearLanding(Passage.UpperLanding))
+    {
+        OutFloorZ = Passage.UpperLanding.FloorZ;
+        return VoxelMath::IsFinite(OutFloorZ);
+    }
+    if (NearLanding(Passage.LowerLanding))
+    {
+        OutFloorZ = Passage.LowerLanding.FloorZ;
+        return VoxelMath::IsFinite(OutFloorZ);
+    }
+
+    float SupportRadius = 0.0f;
+    return VoxelPassageGeometry::ProjectWalkableTunnelFloor(
+        Passage.ControlPoints, Passage.ControlRadii, PositionVoxel,
+        OutFloorZ, SupportRadius);
 }
 
 AVoxelWorld::AVoxelWorld()
@@ -1072,6 +1105,15 @@ void AVoxelWorld::BeginPlay()
     TotalObsoleteWorkerTasks.store(0, std::memory_order_relaxed);
     TotalValidationDensityCalls.store(0, std::memory_order_relaxed);
     TotalMesherDensityCalls.store(0, std::memory_order_relaxed);
+    AppliedTileCount = 0;
+    AppliedVisibleTileCount = 0;
+    AppliedTriangleCount = 0;
+    for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
+    {
+        AppliedVisibleTileCountByLevel[LOD] = 0;
+        AppliedTriangleCountByLevel[LOD] = 0;
+        AppliedBandTileCountByLevel[LOD] = 0;
+    }
     for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
     {
         OuterClassifierCallsByLOD[LOD].store(0, std::memory_order_relaxed);
@@ -1172,13 +1214,16 @@ void AVoxelWorld::BeginPlay()
         SettingsPath.ReplaceInline(TEXT("\""), TEXT("\\\""));
         VoxelForgeStartupTrace::RecordEvent(TEXT("settings_resolved"), FString::Printf(
             TEXT("\"asset\":\"%s\",\"seed\":%d,\"total_strates\":%d,\"inter_strate_gap_chunks\":%d,"
-                 "\"strate_pool\":%d,\"max_clip_level\":%d,\"clip_radius\":%d,"
+                 "\"strate_pool\":%d,\"strate_content_cut_min_level\":%d,"
+                 "\"effective_strate_content_cut_min_level\":%d,\"max_clip_level\":%d,\"clip_radius\":%d,"
                  "\"render_distance_chunks\":%d,\"far_sheet_ring\":%d,\"far_sheet_span_levels\":%d,"
                  "\"enable_density_volume\":%d,\"density_volume_resolution\":%d,\"density_volume_levels\":%d,"
                  "\"density_volume_max_tasks\":%d,\"density_volume_gpu_upload\":%d"),
             *SettingsPath,
             Settings->GetEffectiveWorldSeed(), Settings->TotalStrates,
-            Settings->InterStrateGapChunks, Settings->StratePool.Num(), Settings->MaxClipLevel,
+            Settings->InterStrateGapChunks, Settings->StratePool.Num(),
+            Settings->StrateContentCutMinLevel,
+            Settings->GetEffectiveStrateContentCutMinLevel(), Settings->MaxClipLevel,
             Settings->ClipRadius, Settings->RenderDistanceChunks,
             Settings->bFarSheetRing ? 1 : 0, Settings->FarSheetSpanLevels,
             Settings->bEnableDensityVolume ? 1 : 0, Settings->DensityVolumeResolution,
@@ -1262,6 +1307,8 @@ void AVoxelWorld::BeginPlay()
             StrateManager->GetNumStrates());
     }
 
+    InitializeHeadlessStrateCrossingTest();
+
     // Diff layer — stocke les modifications du joueur par dessus la densité
     // procédurale. Créé systématiquement (coût nul tant qu'il n'y a pas d'édit).
     DiffLayer = NewObject<UVoxelDiffLayer>(this);
@@ -1340,6 +1387,31 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessStreamingTestBeginSeconds = 0.0;
     HeadlessStreamingTestLastElapsedSeconds = 0.0;
 
+    bHeadlessStrateCrossingTest = false;
+    bHeadlessStrateCrossingTestStartPlaced = false;
+    bHeadlessStrateCrossingTestStarted = false;
+    bHeadlessStrateCrossingTestPassed = false;
+    bHeadlessStrateCrossingTestFailed = false;
+    bHeadlessStrateCrossingTestExitRequested = false;
+    bHeadlessStrateCrossingTestGateWasEngaged = false;
+    HeadlessStrateCrossingTestRequestedPassageIndex = INDEX_NONE;
+    HeadlessStrateCrossingTestPassageIndex = INDEX_NONE;
+    HeadlessStrateCrossingTestUpperStrateIndex = INDEX_NONE;
+    HeadlessStrateCrossingTestLowerStrateIndex = INDEX_NONE;
+    HeadlessStrateCrossingTestRouteTargetIndex = 1;
+    HeadlessStrateCrossingTestLastReportedStrate = INDEX_NONE;
+    HeadlessStrateCrossingTestPlayerHalfHeightVoxels =
+        VoxelPassageGeometry::PlayerHalfHeightVoxels;
+    HeadlessStrateCrossingTestMinFloorClearanceVoxels = 1000000.0f;
+    HeadlessStrateCrossingTestBeginSeconds = 0.0;
+    HeadlessStrateCrossingTestStartSeconds = 0.0;
+    HeadlessStrateCrossingTestGateStartSeconds = 0.0;
+    HeadlessStrateCrossingTestMaxGateDurationSeconds = 0.0;
+    HeadlessStrateCrossingTestTotalGateDurationSeconds = 0.0;
+    HeadlessStrateCrossingTestLastActualPosition = FVector::ZeroVector;
+    HeadlessStrateCrossingTestFailureReason.Reset();
+    HeadlessStrateCrossingTestRoute.Reset();
+
     const TCHAR* CommandLine = FCommandLine::Get();
     int32 MoveValue = 0;
     const bool bMoveRequested =
@@ -1352,7 +1424,55 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     FParse::Value(CommandLine, TEXT("voxel.TestMoveStartSeconds="), StartSeconds);
     FParse::Value(CommandLine, TEXT("voxel.TestExitSeconds="), ExitSeconds);
 
-    if (bMoveRequested)
+    int32 CrossingValue = 0;
+    bHeadlessStrateCrossingTest =
+        (FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossing="), CrossingValue)
+            && CrossingValue != 0)
+        || FParse::Param(CommandLine, TEXT("voxel.TestStrateCrossing"));
+    if (bHeadlessStrateCrossingTest)
+    {
+        bHeadlessStreamingTestMovement = false;
+        HeadlessStreamingTestExitSeconds = 0.0f;
+
+        HeadlessStrateCrossingTestSpeedCmPerSecond = 800.0f;
+        HeadlessStrateCrossingTestStartDelaySeconds = 1.0f;
+        HeadlessStrateCrossingTestTimeoutSeconds = 120.0f;
+        HeadlessStrateCrossingTestMaxGateSeconds = 10.0f;
+        HeadlessStrateCrossingTestRouteTargetRadiusVoxels = 2.0f;
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingSpeedCmPerSecond="),
+                      HeadlessStrateCrossingTestSpeedCmPerSecond);
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingStartDelaySeconds="),
+                      HeadlessStrateCrossingTestStartDelaySeconds);
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingTimeoutSeconds="),
+                      HeadlessStrateCrossingTestTimeoutSeconds);
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingMaxGateSeconds="),
+                      HeadlessStrateCrossingTestMaxGateSeconds);
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingTargetRadiusVoxels="),
+                      HeadlessStrateCrossingTestRouteTargetRadiusVoxels);
+        FParse::Value(CommandLine, TEXT("voxel.TestStrateCrossingPassageIndex="),
+                      HeadlessStrateCrossingTestRequestedPassageIndex);
+        HeadlessStrateCrossingTestSpeedCmPerSecond = FMath::Max(
+            HeadlessStrateCrossingTestSpeedCmPerSecond, 1.0f);
+        HeadlessStrateCrossingTestStartDelaySeconds = FMath::Max(
+            HeadlessStrateCrossingTestStartDelaySeconds, 0.0f);
+        HeadlessStrateCrossingTestTimeoutSeconds = FMath::Max(
+            HeadlessStrateCrossingTestTimeoutSeconds, 1.0f);
+        HeadlessStrateCrossingTestMaxGateSeconds = FMath::Max(
+            HeadlessStrateCrossingTestMaxGateSeconds, 0.1f);
+        HeadlessStrateCrossingTestRouteTargetRadiusVoxels = FMath::Max(
+            HeadlessStrateCrossingTestRouteTargetRadiusVoxels, 0.25f);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] configured=1 speed_cm_s=%.1f start_delay_s=%.3f "
+                 "timeout_s=%.3f max_gate_s=%.3f target_radius_vox=%.3f requested_passage=%d"),
+            HeadlessStrateCrossingTestSpeedCmPerSecond,
+            HeadlessStrateCrossingTestStartDelaySeconds,
+            HeadlessStrateCrossingTestTimeoutSeconds,
+            HeadlessStrateCrossingTestMaxGateSeconds,
+            HeadlessStrateCrossingTestRouteTargetRadiusVoxels,
+            HeadlessStrateCrossingTestRequestedPassageIndex);
+    }
+
+    if (bMoveRequested && !bHeadlessStrateCrossingTest)
     {
         FString DirectionText;
         if (FParse::Value(CommandLine, TEXT("voxel.TestMoveDirection="), DirectionText))
@@ -1378,7 +1498,8 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     }
 
     HeadlessStreamingTestExitSeconds = FMath::Max(ExitSeconds, 0.0f);
-    if (bHeadlessStreamingTestMovement || HeadlessStreamingTestExitSeconds > 0.0f)
+    if (!bHeadlessStrateCrossingTest
+        && (bHeadlessStreamingTestMovement || HeadlessStreamingTestExitSeconds > 0.0f))
     {
         HeadlessStreamingTestBeginSeconds = FPlatformTime::Seconds();
         UE_LOG(LogTemp, Display,
@@ -1392,6 +1513,495 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
             HeadlessStreamingTestDirection.Y,
             HeadlessStreamingTestDirection.Z);
     }
+}
+
+void AVoxelWorld::InitializeHeadlessStrateCrossingTest()
+{
+    if (!bHeadlessStrateCrossingTest)
+    {
+        return;
+    }
+
+    HeadlessStrateCrossingTestBeginSeconds = FPlatformTime::Seconds();
+    if (StrateManager == nullptr)
+    {
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("strate_manager_unavailable");
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeStrateCrossingTest] result=FAIL reason=%s"),
+            *HeadlessStrateCrossingTestFailureReason);
+        return;
+    }
+
+    const TArray<FVoxelPassage>& Passages = StrateManager->GetPassages();
+    auto IsUsablePassage = [](const FVoxelPassage& Passage) -> bool
+    {
+        return Passage.bWalkableTunnelContract
+            && Passage.UpperStrateIndex >= 0
+            && Passage.LowerStrateIndex == Passage.UpperStrateIndex + 1
+            && Passage.UpperLanding.HalfWidth > 0.0f
+            && Passage.LowerLanding.HalfWidth > 0.0f
+            && Passage.ControlPoints.Num() >= 2
+            && Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+    };
+
+    int32 SelectedPassageIndex = INDEX_NONE;
+    if (HeadlessStrateCrossingTestRequestedPassageIndex != INDEX_NONE)
+    {
+        if (Passages.IsValidIndex(HeadlessStrateCrossingTestRequestedPassageIndex)
+            && IsUsablePassage(Passages[HeadlessStrateCrossingTestRequestedPassageIndex]))
+        {
+            SelectedPassageIndex = HeadlessStrateCrossingTestRequestedPassageIndex;
+        }
+        else
+        {
+            bHeadlessStrateCrossingTestFailed = true;
+            HeadlessStrateCrossingTestFailureReason = TEXT("requested_passage_unusable");
+        }
+    }
+    else
+    {
+        // Prefer the first real A→B connection so the default test has a fixed, local route. The
+        // fallback still follows the manager's generated chain when the authored layout has more
+        // than two slots or a future layout changes the first passage's walkability metadata.
+        for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
+        {
+            if (IsUsablePassage(Passages[PassageIndex])
+                && Passages[PassageIndex].UpperStrateIndex == 0
+                && Passages[PassageIndex].LowerStrateIndex == 1)
+            {
+                SelectedPassageIndex = PassageIndex;
+                break;
+            }
+        }
+        if (SelectedPassageIndex == INDEX_NONE)
+        {
+            for (int32 PassageIndex = 0; PassageIndex < Passages.Num(); ++PassageIndex)
+            {
+                if (IsUsablePassage(Passages[PassageIndex]))
+                {
+                    SelectedPassageIndex = PassageIndex;
+                    break;
+                }
+            }
+        }
+        if (SelectedPassageIndex == INDEX_NONE)
+        {
+            bHeadlessStrateCrossingTestFailed = true;
+            HeadlessStrateCrossingTestFailureReason = TEXT("no_usable_inter_strate_passage");
+        }
+    }
+
+    if (bHeadlessStrateCrossingTestFailed)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeStrateCrossingTest] result=FAIL reason=%s passages=%d"),
+            *HeadlessStrateCrossingTestFailureReason, Passages.Num());
+        return;
+    }
+
+    const FVoxelPassage& Passage = Passages[SelectedPassageIndex];
+    HeadlessStrateCrossingTestPassageIndex = SelectedPassageIndex;
+    HeadlessStrateCrossingTestUpperStrateIndex = Passage.UpperStrateIndex;
+    HeadlessStrateCrossingTestLowerStrateIndex = Passage.LowerStrateIndex;
+    HeadlessStrateCrossingTestRoute.Reset();
+
+    const auto AddRoutePoint = [this](const FVector& Point)
+    {
+        if (!VoxelMath::IsFinite(Point.X) || !VoxelMath::IsFinite(Point.Y)
+            || !VoxelMath::IsFinite(Point.Z))
+        {
+            return;
+        }
+        if (HeadlessStrateCrossingTestRoute.Num() == 0
+            || FVector::DistSquared(HeadlessStrateCrossingTestRoute.Last(), Point)
+                > FMath::Square(0.01f))
+        {
+            HeadlessStrateCrossingTestRoute.Add(Point);
+        }
+    };
+
+    // ControlPoints starts/ends at the two DoorPoints. Keep both landing anchors around the chain
+    // so the test covers the actual walk from a standing pose into A, through the gap, and out to
+    // a standing pose in B; duplicate door points are collapsed by AddRoutePoint.
+    AddRoutePoint(Passage.UpperLanding.StandingPoint);
+    AddRoutePoint(Passage.UpperLanding.DoorPoint);
+    for (const FVector& Point : Passage.ControlPoints)
+    {
+        AddRoutePoint(Point);
+    }
+    AddRoutePoint(Passage.LowerLanding.DoorPoint);
+    AddRoutePoint(Passage.LowerLanding.StandingPoint);
+
+    if (HeadlessStrateCrossingTestRoute.Num() < 4)
+    {
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("passage_route_degenerate");
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeStrateCrossingTest] result=FAIL reason=%s passage=%d route_points=%d"),
+            *HeadlessStrateCrossingTestFailureReason,
+            SelectedPassageIndex, HeadlessStrateCrossingTestRoute.Num());
+        return;
+    }
+
+    HeadlessStrateCrossingTestRouteTargetIndex = 1;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeStrateCrossingTest] route_ready passage=%d upper_strate=%d lower_strate=%d "
+             "route_points=%d upper=(%.2f,%.2f,%.2f) lower=(%.2f,%.2f,%.2f) "
+             "control_points=%d vertical_drop_vox=%.2f horizontal_run_vox=%.2f"),
+        SelectedPassageIndex,
+        Passage.UpperStrateIndex,
+        Passage.LowerStrateIndex,
+        HeadlessStrateCrossingTestRoute.Num(),
+        Passage.UpperLanding.StandingPoint.X,
+        Passage.UpperLanding.StandingPoint.Y,
+        Passage.UpperLanding.FloorZ,
+        Passage.LowerLanding.StandingPoint.X,
+        Passage.LowerLanding.StandingPoint.Y,
+        Passage.LowerLanding.FloorZ,
+        Passage.ControlPoints.Num(),
+        Passage.TunnelVerticalDropVoxels,
+        Passage.TunnelHorizontalPathLengthVoxels);
+}
+
+void AVoxelWorld::AdvanceHeadlessStrateCrossingTest(
+    FVector& InOutPlayerPosition, FVector& InOutPlayerHeading, APawn* PlayerPawn)
+{
+    if (!bHeadlessStrateCrossingTest || bHeadlessStrateCrossingTestFailed
+        || bHeadlessStrateCrossingTestPassed || !IsValid(PlayerPawn)
+        || HeadlessStrateCrossingTestBeginSeconds <= 0.0
+        || !StrateManager
+        || !StrateManager->GetPassages().IsValidIndex(HeadlessStrateCrossingTestPassageIndex))
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    const double ElapsedSeconds = Now - HeadlessStrateCrossingTestBeginSeconds;
+    if (ElapsedSeconds < static_cast<double>(HeadlessStrateCrossingTestStartDelaySeconds))
+    {
+        return;
+    }
+
+    const FVoxelPassage& Passage =
+        StrateManager->GetPassages()[HeadlessStrateCrossingTestPassageIndex];
+    if (!bHeadlessStrateCrossingTestStartPlaced)
+    {
+        if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+            {
+                const float HalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+                if (VoxelMath::IsFinite(HalfHeightCm) && HalfHeightCm > 0.0f)
+                {
+                    HeadlessStrateCrossingTestPlayerHalfHeightVoxels =
+                        HalfHeightCm / VOXEL_SIZE;
+                }
+            }
+        }
+
+        FVector StartVoxel = Passage.UpperLanding.StandingPoint;
+        StartVoxel.Z = Passage.UpperLanding.FloorZ
+            + HeadlessStrateCrossingTestPlayerHalfHeightVoxels;
+        const FVector StartWorld = LocalVoxelToWorld(StartVoxel);
+        const bool bPlaced = PlayerPawn->SetActorLocation(
+            StartWorld, false, nullptr, ETeleportType::TeleportPhysics);
+        const FVector ActualPosition = PlayerPawn->GetActorLocation();
+        InOutPlayerPosition = ActualPosition;
+        InOutPlayerHeading = FVector::ZeroVector;
+        HeadlessStrateCrossingTestLastActualPosition = ActualPosition;
+        bHeadlessStrateCrossingTestStartPlaced = true;
+        bHeadlessStrateCrossingTestGateWasEngaged = false;
+        HeadlessStrateCrossingTestGateStartSeconds = 0.0;
+        HeadlessStrateCrossingTestStartSeconds = Now;
+
+        if (ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
+            {
+                // Keep the route test natural (AddMovementInput + the normal swept character
+                // movement), but make its requested speed explicit and identical across binaries.
+                CharacterMovement->MaxWalkSpeed = HeadlessStrateCrossingTestSpeedCmPerSecond;
+                CharacterMovement->MaxAcceleration = FMath::Max(
+                    CharacterMovement->MaxAcceleration,
+                    HeadlessStrateCrossingTestSpeedCmPerSecond * 4.0f);
+                CharacterMovement->BrakingDecelerationWalking = FMath::Max(
+                    CharacterMovement->BrakingDecelerationWalking,
+                    HeadlessStrateCrossingTestSpeedCmPerSecond * 4.0f);
+                CharacterMovement->StopMovementImmediately();
+            }
+        }
+
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] start_placed moved=%d world=(%.1f,%.1f,%.1f) "
+                 "local_vox=(%.2f,%.2f,%.2f) floor_vox=%.2f half_height_vox=%.3f"),
+            bPlaced ? 1 : 0,
+            ActualPosition.X, ActualPosition.Y, ActualPosition.Z,
+            StartVoxel.X, StartVoxel.Y, StartVoxel.Z,
+            Passage.UpperLanding.FloorZ,
+            HeadlessStrateCrossingTestPlayerHalfHeightVoxels);
+        return;
+    }
+
+    if (!bHeadlessStrateCrossingTestStarted)
+    {
+        if (!IsPlayerSupportCollisionReady(PlayerPawn, InOutPlayerPosition))
+        {
+            return;
+        }
+        bHeadlessStrateCrossingTestStarted = true;
+        HeadlessStrateCrossingTestStartSeconds = Now;
+        HeadlessStrateCrossingTestRouteTargetIndex = 1;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] natural_walk_started elapsed_s=%.3f "
+                 "route_target=%d/%d"),
+            ElapsedSeconds,
+            HeadlessStrateCrossingTestRouteTargetIndex,
+            HeadlessStrateCrossingTestRoute.Num());
+        return;
+    }
+
+    const FVector LocalPosition = WorldToLocalVoxel(InOutPlayerPosition);
+    while (HeadlessStrateCrossingTestRouteTargetIndex
+               < HeadlessStrateCrossingTestRoute.Num())
+    {
+        const FVector& Target = HeadlessStrateCrossingTestRoute[
+            HeadlessStrateCrossingTestRouteTargetIndex];
+        const FVector2D Delta(
+            Target.X - LocalPosition.X, Target.Y - LocalPosition.Y);
+        if (Delta.SizeSquared() > FMath::Square(
+                HeadlessStrateCrossingTestRouteTargetRadiusVoxels))
+        {
+            break;
+        }
+        ++HeadlessStrateCrossingTestRouteTargetIndex;
+        UE_LOG(LogTemp, Verbose,
+            TEXT("[VoxelForgeStrateCrossingTest] route_target_reached index=%d/%d"),
+            HeadlessStrateCrossingTestRouteTargetIndex,
+            HeadlessStrateCrossingTestRoute.Num());
+    }
+
+    const int32 CurrentStrate = GetStrateAtPosition(InOutPlayerPosition);
+    if (HeadlessStrateCrossingTestRouteTargetIndex
+            >= HeadlessStrateCrossingTestRoute.Num())
+    {
+        if (CurrentStrate == HeadlessStrateCrossingTestLowerStrateIndex)
+        {
+            bHeadlessStrateCrossingTestPassed = true;
+        }
+        else
+        {
+            bHeadlessStrateCrossingTestFailed = true;
+            HeadlessStrateCrossingTestFailureReason = TEXT("route_finished_without_lower_strate");
+        }
+        return;
+    }
+
+    if (bPawnCollisionGateEngaged)
+    {
+        InOutPlayerHeading = FVector::ZeroVector;
+        return;
+    }
+
+    const FVector& Target = HeadlessStrateCrossingTestRoute[
+        HeadlessStrateCrossingTestRouteTargetIndex];
+    const FVector LocalDirection(
+        Target.X - LocalPosition.X,
+        Target.Y - LocalPosition.Y,
+        0.0f);
+    const FVector WorldDirection = GetActorTransform().TransformVectorNoScale(
+        LocalDirection.GetSafeNormal());
+    if (!WorldDirection.IsNearlyZero())
+    {
+        const FVector NormalizedWorldDirection = WorldDirection.GetSafeNormal();
+        PlayerPawn->AddMovementInput(NormalizedWorldDirection, 1.0f, false);
+        InOutPlayerHeading = NormalizedWorldDirection
+            * HeadlessStrateCrossingTestSpeedCmPerSecond;
+    }
+}
+
+void AVoxelWorld::ObserveHeadlessStrateCrossingTest(
+    const FVector& PlayerPosition, APawn* PlayerPawn)
+{
+    if (!bHeadlessStrateCrossingTest || !bHeadlessStrateCrossingTestStartPlaced
+        || !IsValid(PlayerPawn) || bHeadlessStrateCrossingTestExitRequested)
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    if (bHeadlessStrateCrossingTestStarted)
+    {
+        HeadlessStreamingTestDistanceCm += FVector::Dist(
+            HeadlessStrateCrossingTestLastActualPosition, PlayerPosition);
+    }
+    HeadlessStrateCrossingTestLastActualPosition = PlayerPosition;
+
+    const bool bGateEngaged = bPawnCollisionGateEngaged;
+    if (bGateEngaged && !bHeadlessStrateCrossingTestGateWasEngaged)
+    {
+        HeadlessStrateCrossingTestGateStartSeconds = Now;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] gate=engaged elapsed_s=%.3f"),
+            Now - HeadlessStrateCrossingTestBeginSeconds);
+    }
+    else if (!bGateEngaged && bHeadlessStrateCrossingTestGateWasEngaged)
+    {
+        const double GateDuration = FMath::Max(
+            0.0, Now - HeadlessStrateCrossingTestGateStartSeconds);
+        HeadlessStrateCrossingTestTotalGateDurationSeconds += GateDuration;
+        HeadlessStrateCrossingTestMaxGateDurationSeconds = FMath::Max(
+            HeadlessStrateCrossingTestMaxGateDurationSeconds, GateDuration);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] gate=released duration_s=%.6f total_s=%.6f"),
+            GateDuration,
+            HeadlessStrateCrossingTestTotalGateDurationSeconds);
+    }
+    bHeadlessStrateCrossingTestGateWasEngaged = bGateEngaged;
+
+    if (bGateEngaged && HeadlessStrateCrossingTestGateStartSeconds > 0.0)
+    {
+        const double GateDuration = FMath::Max(
+            0.0, Now - HeadlessStrateCrossingTestGateStartSeconds);
+        HeadlessStrateCrossingTestMaxGateDurationSeconds = FMath::Max(
+            HeadlessStrateCrossingTestMaxGateDurationSeconds, GateDuration);
+        if (GateDuration > static_cast<double>(HeadlessStrateCrossingTestMaxGateSeconds))
+        {
+            bHeadlessStrateCrossingTestFailed = true;
+            HeadlessStrateCrossingTestFailureReason = TEXT("collision_gate_timeout");
+        }
+    }
+
+    if (!StrateManager->GetPassages().IsValidIndex(HeadlessStrateCrossingTestPassageIndex))
+    {
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("passage_invalidated");
+        return;
+    }
+
+    const FVoxelPassage& Passage =
+        StrateManager->GetPassages()[HeadlessStrateCrossingTestPassageIndex];
+    const FVector LocalPosition = WorldToLocalVoxel(PlayerPosition);
+    float PassageFloorZ = 0.0f;
+    if (VF_ProjectHeadlessPassageFloor(Passage, LocalPosition, PassageFloorZ))
+    {
+        const float FeetZ = LocalPosition.Z
+            - HeadlessStrateCrossingTestPlayerHalfHeightVoxels;
+        const float Clearance = FeetZ - PassageFloorZ;
+        HeadlessStrateCrossingTestMinFloorClearanceVoxels = FMath::Min(
+            HeadlessStrateCrossingTestMinFloorClearanceVoxels, Clearance);
+        constexpr float FloorViolationToleranceVoxels = 2.0f;
+        if (Clearance < -FloorViolationToleranceVoxels)
+        {
+            bHeadlessStrateCrossingTestFailed = true;
+            HeadlessStrateCrossingTestFailureReason = TEXT("pawn_below_passage_floor");
+        }
+    }
+
+    const int32 CurrentStrate = GetStrateAtPosition(PlayerPosition);
+    if (CurrentStrate != HeadlessStrateCrossingTestLastReportedStrate)
+    {
+        FVoxelTileKey SupportTile;
+        const bool bSupportReady = IsPlayerSupportCollisionReady(
+            PlayerPawn, PlayerPosition, &SupportTile);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeStrateCrossingTest] progress current_strate=%d target_strate=%d "
+                 "route=%d/%d position_vox=(%.2f,%.2f,%.2f) mesh_band=[%d..%d] "
+                 "band_remesh=%d pending_tiles=%d support=(%d,%d,%d) support_ready=%d gate=%d"),
+            CurrentStrate,
+            HeadlessStrateCrossingTestLowerStrateIndex,
+            HeadlessStrateCrossingTestRouteTargetIndex,
+            HeadlessStrateCrossingTestRoute.Num(),
+            LocalPosition.X, LocalPosition.Y, LocalPosition.Z,
+            MeshBandChunkLo, MeshBandChunkHi,
+            BandRemeshQueue.Num(), PendingTiles.Num(),
+            SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z,
+            bSupportReady ? 1 : 0,
+            bGateEngaged ? 1 : 0);
+        HeadlessStrateCrossingTestLastReportedStrate = CurrentStrate;
+    }
+
+    // Reaching the lower strate is the crossing contract (not the final room anchor). Requiring route index 2 means the pawn
+    // has consumed the upper landing door point and is following the generated passage chain; it
+    // cannot pass while merely standing at the test's initial upper landing. The lower landing
+    // anchor is intentionally not required: after the boundary is crossed, that extra room walk is
+    // outside the inter-strate streaming/collision transition being tested and can be affected by
+    // authored chamber furniture or a non-monotonic final XY turn.
+    if (!bHeadlessStrateCrossingTestFailed
+        && !bGateEngaged
+        && bHeadlessStrateCrossingTestStarted
+        && CurrentStrate == HeadlessStrateCrossingTestLowerStrateIndex
+        && HeadlessStrateCrossingTestRouteTargetIndex >= 2)
+    {
+        bHeadlessStrateCrossingTestPassed = true;
+    }
+
+    if (!bHeadlessStrateCrossingTestPassed
+        && !bHeadlessStrateCrossingTestFailed
+        && Now - HeadlessStrateCrossingTestBeginSeconds
+            > static_cast<double>(HeadlessStrateCrossingTestTimeoutSeconds))
+    {
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("crossing_timeout");
+    }
+}
+
+void AVoxelWorld::MaybeFinishHeadlessStrateCrossingTest()
+{
+    if (!bHeadlessStrateCrossingTest || bHeadlessStrateCrossingTestExitRequested
+        || HeadlessStrateCrossingTestBeginSeconds <= 0.0)
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    if (!bHeadlessStrateCrossingTestPassed && !bHeadlessStrateCrossingTestFailed
+        && Now - HeadlessStrateCrossingTestBeginSeconds
+            >= static_cast<double>(HeadlessStrateCrossingTestTimeoutSeconds))
+    {
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("crossing_timeout");
+    }
+    if (!bHeadlessStrateCrossingTestPassed && !bHeadlessStrateCrossingTestFailed)
+    {
+        return;
+    }
+
+    if (bHeadlessStrateCrossingTestGateWasEngaged
+        && HeadlessStrateCrossingTestGateStartSeconds > 0.0)
+    {
+        const double GateDuration = FMath::Max(
+            0.0, Now - HeadlessStrateCrossingTestGateStartSeconds);
+        HeadlessStrateCrossingTestMaxGateDurationSeconds = FMath::Max(
+            HeadlessStrateCrossingTestMaxGateDurationSeconds, GateDuration);
+    }
+
+    bHeadlessStrateCrossingTestExitRequested = true;
+    const bool bPassed = bHeadlessStrateCrossingTestPassed
+        && !bHeadlessStrateCrossingTestFailed;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeStrateCrossingTest] result=%s reason=%s passage=%d upper_strate=%d "
+             "lower_strate=%d elapsed_s=%.6f distance_m=%.6f route=%d/%d "
+             "max_gate_s=%.6f gate_limit_s=%.3f gate_total_s=%.6f "
+             "min_floor_clearance_vox=%.6f final_position=(%.1f,%.1f,%.1f)"),
+        bPassed ? TEXT("PASS") : TEXT("FAIL"),
+        bPassed ? TEXT("reached_lower_strate") : *HeadlessStrateCrossingTestFailureReason,
+        HeadlessStrateCrossingTestPassageIndex,
+        HeadlessStrateCrossingTestUpperStrateIndex,
+        HeadlessStrateCrossingTestLowerStrateIndex,
+        Now - HeadlessStrateCrossingTestBeginSeconds,
+        HeadlessStreamingTestDistanceCm / 100.0,
+        HeadlessStrateCrossingTestRouteTargetIndex,
+        HeadlessStrateCrossingTestRoute.Num(),
+        HeadlessStrateCrossingTestMaxGateDurationSeconds,
+        HeadlessStrateCrossingTestMaxGateSeconds,
+        HeadlessStrateCrossingTestTotalGateDurationSeconds,
+        HeadlessStrateCrossingTestMinFloorClearanceVoxels,
+        HeadlessStrateCrossingTestLastActualPosition.X,
+        HeadlessStrateCrossingTestLastActualPosition.Y,
+        HeadlessStrateCrossingTestLastActualPosition.Z);
+    FPlatformMisc::RequestExitWithStatus(
+        false, bPassed ? 0 : 1, TEXT("VoxelForge strate crossing test complete"));
 }
 
 void AVoxelWorld::AdvanceHeadlessStreamingTest(
@@ -1452,6 +2062,12 @@ void AVoxelWorld::AdvanceHeadlessStreamingTest(
 
 void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
 {
+    if (bHeadlessStrateCrossingTest)
+    {
+        MaybeFinishHeadlessStrateCrossingTest();
+        return;
+    }
+
     if (bHeadlessStreamingTestExitRequested || HeadlessStreamingTestExitSeconds <= 0.0f
         || HeadlessStreamingTestBeginSeconds <= 0.0)
     {
@@ -1489,9 +2105,11 @@ void AVoxelWorld::Tick(float DeltaTime)
         // critical prefix; a stationary pawn falls back to actor forward in BuildDesiredTiles.
         FVector PlayerHeading = PlayerPawn ? PlayerPawn->GetVelocity() : FVector::ZeroVector;
         AdvanceHeadlessStreamingTest(PlayerLastPos, PlayerHeading, PlayerPawn);
+        AdvanceHeadlessStrateCrossingTest(PlayerLastPos, PlayerHeading, PlayerPawn);
         PeakObservedPawnSpeedCmPerSecond = FMath::Max(
             PeakObservedPawnSpeedCmPerSecond, PlayerHeading.Size2D());
         UpdatePawnCollisionGate(PlayerPawn, PlayerLastPos, DeltaTime);
+        ObserveHeadlessStrateCrossingTest(PlayerLastPos, PlayerPawn);
         UpdateChunksAroundPosition(PlayerLastPos, PlayerPawn, PlayerHeading);
         if (AtmosphereManager)
         {
@@ -2210,6 +2828,23 @@ void AVoxelWorld::LogStreamingLatencySummary() const
             static_cast<unsigned long long>(OuterClassifierVerdictsByLOD[LOD][1].load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(OuterClassifierVerdictsByLOD[LOD][2].load(std::memory_order_relaxed)));
     }
+    FString AppliedLevelSummary;
+    FString BandLevelSummary;
+    for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
+    {
+        if (LOD > 0)
+        {
+            AppliedLevelSummary += TEXT(";");
+            BandLevelSummary += TEXT(";");
+        }
+        AppliedLevelSummary += FString::Printf(
+            TEXT("l%d[t=%llu,tri=%llu]"), LOD,
+            static_cast<unsigned long long>(AppliedVisibleTileCountByLevel[LOD]),
+            static_cast<unsigned long long>(AppliedTriangleCountByLevel[LOD]));
+        BandLevelSummary += FString::Printf(
+            TEXT("l%d[t=%llu]"), LOD,
+            static_cast<unsigned long long>(AppliedBandTileCountByLevel[LOD]));
+    }
     const uint64 WorkerGenerationCycles =
         TotalWorkerGenerationCycles.load(std::memory_order_relaxed);
     const uint64 ObsoleteWorkerCycles =
@@ -2229,7 +2864,7 @@ void AVoxelWorld::LogStreamingLatencySummary() const
              "worker_generation_tasks=%llu worker_generation_sum_s=%.6f "
              "validation_density_calls=%llu mesher_density_calls=%llu "
              "obsolete_worker_tasks=%llu obsolete_worker_sum_s=%.6f "
-             "outer_classifier_verdicts=%s"),
+             "outer_classifier_verdicts=%s applied_level_summary=%s band_level_summary=%s"),
         bDiagnosticsEnabled ? TEXT("profiled") : TEXT("clean"),
         bDiagnosticsEnabled ? TEXT("on") : TEXT("off"),
         LOD0ReadySamples.Num(),
@@ -2248,7 +2883,9 @@ void AVoxelWorld::LogStreamingLatencySummary() const
         static_cast<unsigned long long>(TotalMesherDensityCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(TotalObsoleteWorkerTasks.load(std::memory_order_relaxed)),
         FPlatformTime::ToSeconds64(ObsoleteWorkerCycles),
-        *ClassifierVerdictSummary);
+        *ClassifierVerdictSummary,
+        *AppliedLevelSummary,
+        *BandLevelSummary);
 }
 
 void AVoxelWorld::HandleTileCollisionCookComplete(
@@ -2497,10 +3134,21 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
     const auto LogTileApplied = [&]()
     {
         ++AppliedTileCount;
+        if (Result.Tile.Level >= 0 && Result.Tile.Level < TrackedClassifierLODCount
+            && Result.BandChunkLo != MIN_int32)
+        {
+            ++AppliedBandTileCountByLevel[Result.Tile.Level];
+        }
         if (!bResultEmpty)
         {
             ++AppliedVisibleTileCount;
-            AppliedTriangleCount += static_cast<uint64>(FMath::Max(0, Result.NumTriangles));
+            const uint64 Triangles = static_cast<uint64>(FMath::Max(0, Result.NumTriangles));
+            AppliedTriangleCount += Triangles;
+            if (Result.Tile.Level >= 0 && Result.Tile.Level < TrackedClassifierLODCount)
+            {
+                ++AppliedVisibleTileCountByLevel[Result.Tile.Level];
+                AppliedTriangleCountByLevel[Result.Tile.Level] += Triangles;
+            }
         }
         if ((GVoxelForgeProfileTileGeneration != 0 || bTraceTile)
             && Result.RequestStartCycles != 0)
@@ -2525,11 +3173,13 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
             if (GVoxelForgeProfileTileGeneration != 0)
             {
                 UE_LOG(LogTemp, Display,
-                    TEXT("[VoxelForgeTileApplied] tile=(%d,%d,%d) level=%d empty=%d "
+                    TEXT("[VoxelForgeTileApplied] tile=(%d,%d,%d) level=%d empty=%d triangles=%d "
+                         "band=(%d,%d) "
                          "request_to_apply=%.6f worker_queue=%.6f generation=%.6f "
                          "result_queue=%.6f apply=%.6f"),
                     Result.Tile.Coord.X, Result.Tile.Coord.Y, Result.Tile.Coord.Z,
-                    Result.Tile.Level, bResultEmpty ? 1 : 0,
+                    Result.Tile.Level, bResultEmpty ? 1 : 0, Result.NumTriangles,
+                    Result.BandChunkLo, Result.BandChunkHi,
                     RequestToApply, WorkerQueueSeconds, GenerationSeconds,
                     ResultQueueSeconds, ApplySeconds);
             }
@@ -2652,12 +3302,11 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     const int32 Cells = CHUNK_SIZE;   // level 0 is always full-res (level 0 < FullResClipLevels)
     const int32 Step  = 1;            // Extent(=CHUNK_SIZE) / Cells
 
-    // STRATE CONTENT CUT — identical to LoadTile (Tile.Level >= CutMin; for a level-0 tile inside the
-    // player strate the clamp is a no-op, but keep it bit-identical to the async path). Too-coarse
-    // skip never fires at Step 1.
+    // STRATE CONTENT CUT — identical to LoadTile. The effective minimum is at least 1, so a
+    // level-0 re-mesh always remains a complete collision tile; only LOD1+ can receive the band.
     int32 BandVoxLo = INT32_MIN, BandVoxHi = INT32_MAX;
     int32 BandChunkLo = MIN_int32, BandChunkHi = MAX_int32;
-    const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+    const int32 CutMin = Settings ? Settings->GetEffectiveStrateContentCutMinLevel() : 9;
     if (Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
     {
         BandChunkLo = MeshBandChunkLo;
@@ -3332,7 +3981,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         // on it — fully inside BOTH bands ⇒ identical either way; fully outside both ⇒ empty
         // either way; everything else re-gens in place via BandRemeshQueue (no visual pop).
         {
-            const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+            const int32 CutMin = Settings ? Settings->GetEffectiveStrateContentCutMinLevel() : 9;
             // F18 — l'anneau feuille dépend aussi de la bande (sa strate de référence) : on l'arme
             // dès que les feuilles sont actives, même si la coupe de contenu MC est désactivée.
             const bool bSheetsWantBand = Settings && Settings->bFarSheetRing
@@ -3663,9 +4312,10 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         && DensityVolume != nullptr && Settings && Settings->bEnableDensityVolume
         && DensityVolume->IsTileCaptureUseful(Tile.Coord);
 
-    // STRATE CONTENT CUT — coarse tiles mesh only the player-strate band (see the band update in
-    // UpdateChunksAroundPosition + UVoxelSettings::StrateContentCutMinLevel). Chunk band → voxels
-    // (inclusive). Fine tiles / no band (gap, feature off) mesh full.
+    // STRATE CONTENT CUT — LODs at/above the effective minimum mesh only the player-strate band
+    // (see the band update in UpdateChunksAroundPosition + UVoxelSettings::StrateContentCutMinLevel).
+    // Chunk band → voxels (inclusive). LOD0 is always full because it owns collision; finer LODs
+    // below the configured minimum and all LODs in the gap (no band) mesh full.
     int32 BandVoxLo = INT32_MIN, BandVoxHi = INT32_MAX;
     int32 BandChunkLo = MIN_int32, BandChunkHi = MAX_int32;
     int32 SheetChunkZ = 0;
@@ -3691,7 +4341,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     // F18 — trou XY courant (zone couverte par les coquilles MC, découpée des feuilles).
     const int32 HoleMinX = SheetHoleMinXVox, HoleMinY = SheetHoleMinYVox;
     const int32 HoleMaxX = SheetHoleMaxXVox, HoleMaxY = SheetHoleMaxYVox;
-    const int32 CutMin = Settings ? Settings->StrateContentCutMinLevel : 9;
+    const int32 CutMin = Settings ? Settings->GetEffectiveStrateContentCutMinLevel() : 9;
     if (!bSheetTile && Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
     {
         BandChunkLo = MeshBandChunkLo;
@@ -3871,7 +4521,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                     / static_cast<double>(WormEligibleSamples)
                 : 0.0;
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d "
+                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d triangles=%d "
+                     "band=(%d,%d) "
                      "verdict=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
                      "cache_build=%.6f evaluation=%.6f "
                      "refine=%u stack=%u core_samples=%u final_samples=%u core_hits=%u final_hits=%u "
@@ -3891,7 +4542,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "worm_skip_rate=%.6f"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
-                Result.bEmpty ? 1 : 0, ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
+                Result.bEmpty ? 1 : 0, Result.NumTriangles, BandChunkLo, BandChunkHi,
+                ClassifyVerdict, ClassifySeconds, MeshSeconds, StreamSeconds,
                 TileSeconds, CacheBuildSeconds, EvaluationSeconds,
                 ClassifierStats.RefineNodes, ClassifierStats.StackBoxCalls,
                 ClassifierStats.ExactCoreSamples, ClassifierStats.ExactFinalSamples,
