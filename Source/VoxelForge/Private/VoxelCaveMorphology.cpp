@@ -30,6 +30,7 @@
 #include "VoxelCaveMorphology.h"
 #include "VoxelDensityProfile.h"
 #include "VoxelDensityPrimitives.h"
+#include "VoxelDensityAblation.h"
 #include "VoxelStrateMeasure.h"
 #include "VoxelTypes.h"          // Pour VOXEL_NOISE_SCALE, SmoothStep01
 #include "VoxelStrateTypes.h"
@@ -3166,6 +3167,10 @@ namespace
         const FStrateGenerationParams& Params,
         uint32 Seed)
     {
+        if (VoxelDensityAblation::IsCaveWarpOff())
+        {
+            return WorldPoint;
+        }
         float EffectiveZ = WorldPoint.Z;
         if (Params.VerticalScale > 0.0f && Params.VerticalScale != 1.0f)
         {
@@ -7286,7 +7291,9 @@ void VoxelCaveMorphology::BuildChunkCache(
         CR.RoomOp->ApplyTo(OpParams, CR.RoomOpWeight);
 
         // PITS — downward shafts anchored in the room's lower half.
-        BakeRoomFeature(CR, /*Max*/2, OpParams.PitDensity,
+        if (!VoxelDensityAblation::IsPitChimneySDFOff())
+        {
+            BakeRoomFeature(CR, /*Max*/2, OpParams.PitDensity,
             0xDE1A7Eu, 6271u, 0xABCDu, 0x5EEDu,
             /*XYScale*/0.6f, OpParams.PitMinRadius, OpParams.PitMaxRadius,
             [&](float PX, float PY, float PitRadius, uint32 PH3)
@@ -7308,8 +7315,8 @@ void VoxelCaveMorphology::BuildChunkCache(
                 OutCache.Pits.Add(Pit);
             });
 
-        // CHIMNEYS — mirror of pits: upward tubes anchored in the room's upper half.
-        BakeRoomFeature(CR, /*Max*/2, OpParams.ChimneyDensity,
+            // CHIMNEYS — mirror of pits: upward tubes anchored in the room's upper half.
+            BakeRoomFeature(CR, /*Max*/2, OpParams.ChimneyDensity,
             0xC4F007u, 7919u, 0x1337u, 0xCAFEu,
             /*XYScale*/0.6f, OpParams.ChimneyMinRadius, OpParams.ChimneyMaxRadius,
             [&](float CX, float CY, float ChmRadius, uint32 CH3)
@@ -7330,6 +7337,7 @@ void VoxelCaveMorphology::BuildChunkCache(
                 Chim.BoundXYRadiusSq = MaxXYR * MaxXYR;
                 OutCache.Chimneys.Add(Chim);
             });
+        }
 
         // COLUMNS — full-height solid cylinders (no Z anchor, no flare).
         BakeRoomFeature(CR, /*Max*/4, OpParams.ColumnDensity,
@@ -7481,9 +7489,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         MinSDF = VoxelSDF::SmoothMin(MinSDF, RoomSDF, BlendK);
     };
 
-    const int32 RoomCandidateCount = VF_ForEachSpatialCandidate(
-        Cache.RoomSpatialIndex, Cache.Rooms.Num(), WorldX, WorldY, EvaluateRoom,
-        bUseSpatialIndex);
+    int32 RoomCandidateCount = 0;
+    if (!VoxelDensityAblation::IsRoomSDFOff())
+    {
+        RoomCandidateCount = VF_ForEachSpatialCandidate(
+            Cache.RoomSpatialIndex, Cache.Rooms.Num(), WorldX, WorldY, EvaluateRoom,
+            bUseSpatialIndex);
+    }
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
@@ -7512,9 +7524,12 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         const float JoinSDF = FMath::Max(HorizontalSDF, VerticalSDF);
         MinSDF = VoxelSDF::SmoothMin(MinSDF, JoinSDF, BlendK);
     };
-    VF_ForEachSpatialCandidate(
-        Cache.RoomFloorJoinSpatialIndex, Cache.RoomFloorJoins.Num(),
-        WorldX, WorldY, EvaluateJoin, bUseSpatialIndex);
+    if (!VoxelDensityAblation::IsRoomSDFOff())
+    {
+        VF_ForEachSpatialCandidate(
+            Cache.RoomFloorJoinSpatialIndex, Cache.RoomFloorJoins.Num(),
+            WorldX, WorldY, EvaluateJoin, bUseSpatialIndex);
+    }
 
     //=========================================================================
     // Tunnel SDFs
@@ -7553,9 +7568,13 @@ float VoxelCaveMorphology::EvaluateSDFCached(
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
     };
 
-    const int32 TunnelCandidateCount = VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
-        bUseSpatialIndex);
+    int32 TunnelCandidateCount = 0;
+    if (!VoxelDensityAblation::IsTunnelSDFOff())
+    {
+        TunnelCandidateCount = VF_ForEachSpatialCandidate(
+            Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
+            bUseSpatialIndex);
+    }
     if (VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
@@ -7577,6 +7596,10 @@ float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
     const FChunkSDFCache& Cache,
     bool bUseSpatialIndex)
 {
+    if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        return FLT_MAX;
+    }
     const FVector Pos(WorldX, WorldY, WorldZ);
     float MinSDF = FLT_MAX;
     const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
@@ -7618,6 +7641,10 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     const FTunnelSupportFloorColumn* SupportColumn,
     bool bUseSpatialIndex)
 {
+    if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        return FTunnelCoreWorldEvaluation();
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::TunnelCoreWorld);
     const FVector Pos(WorldX, WorldY, WorldZ);
@@ -7756,6 +7783,10 @@ bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
     const FChunkSDFCache& Cache,
     bool bUseSpatialIndex)
 {
+    if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        return false;
+    }
     const FVector Pos(WorldX, WorldY, WorldZ);
     const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
 
@@ -7875,6 +7906,11 @@ void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
     FTunnelSupportFloorColumn& OutColumn,
     bool bUseSpatialIndex)
 {
+    if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        OutColumn.Reset();
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::TunnelCoreSupport);
     OutColumn.Reset();

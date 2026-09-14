@@ -27,6 +27,7 @@
 #include "CoreMinimal.h"
 #include "VoxelTypes.h"   // SmoothStep01
 #include "VoxelPassageGeometry.h" // shared body-sized landing/tunnel geometry
+#include "VoxelDensityAblation.h" // development-only world-changing measurements
 
 //=============================================================================
 // SEAL DE FRONTIÈRE / BOUNDARY SEAL
@@ -43,7 +44,7 @@ FORCEINLINE void VF_ApplyBoundarySeal(float& Density, float WorldZ,
     float StrateTopZ, float StrateBottomZ,
     float Thickness, float BaseDensity)
 {
-    if (Thickness <= 0.0f) return;
+    if (VoxelDensityAblation::IsBoundarySealOff() || Thickness <= 0.0f) return;
 
     const float DistTop = StrateTopZ - WorldZ;     // + si on est sous le plafond
     const float DistBot = WorldZ - StrateBottomZ;  // + si on est au-dessus du sol
@@ -71,6 +72,7 @@ FORCEINLINE void VF_ApplyBoundarySeal(float& Density, float WorldZ,
 FORCEINLINE void VF_ApplyPassageCarving(float& Density, float ModSDF,
     float BaseDensity, float SealThickness)
 {
+    if (VoxelDensityAblation::IsPassageCarvingOff()) return;
     constexpr float PASSAGE_BLEND_RADIUS = 4.0f;
     if (ModSDF >= PASSAGE_BLEND_RADIUS) return;
 
@@ -121,7 +123,7 @@ FORCEINLINE void VF_ApplyPassageLandingCarving(float& Density, float LandingSDF,
 FORCEINLINE void VF_ApplyOriginSpine(float& Density, float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
-    if (Radius <= 0.0f) return;
+    if (VoxelDensityAblation::IsOriginSpineOff() || Radius <= 0.0f) return;
 
     const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
         VoxelPassageGeometry::BuildOriginLandingGeometry(
@@ -153,7 +155,7 @@ FORCEINLINE void VF_ApplyOriginLandingAir(float& Density,
     float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
-    if (Radius <= 0.0f) return;
+    if (VoxelDensityAblation::IsLandingPostsOff() || Radius <= 0.0f) return;
     const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
         VoxelPassageGeometry::BuildOriginLandingGeometry(
             StrateTopZ, StrateBottomZ, SealThickness, Radius);
@@ -169,7 +171,7 @@ FORCEINLINE void VF_ApplyOriginLandingFloor(float& Density,
     float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
-    if (Radius <= 0.0f) return;
+    if (VoxelDensityAblation::IsLandingPostsOff() || Radius <= 0.0f) return;
     const VoxelPassageGeometry::FOriginLandingGeometry Geometry =
         VoxelPassageGeometry::BuildOriginLandingGeometry(
             StrateTopZ, StrateBottomZ, SealThickness, Radius);
@@ -221,7 +223,8 @@ FORCEINLINE void VF_ApplyOriginLandingFloorMC(float& Density,
 FORCEINLINE void VF_ApplyXYEdgeSeal(float& Density, float WorldX, float WorldY,
     float WorldRadiusVoxels, float Thickness, float BaseDensity)
 {
-    if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f) || !(BaseDensity > 0.0f)) return;
+    if (VoxelDensityAblation::IsXYEdgeSealOff()
+        || !(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f) || !(BaseDensity > 0.0f)) return;
     if (!VoxelMath::IsFinite(WorldX) || !VoxelMath::IsFinite(WorldY)
         || !VoxelMath::IsFinite(WorldRadiusVoxels) || !VoxelMath::IsFinite(Thickness)
         || !VoxelMath::IsFinite(BaseDensity)) return;
@@ -256,7 +259,8 @@ FORCEINLINE void VF_ApplyXYEdgeSeal(float& Density, float WorldX, float WorldY,
 FORCEINLINE void VF_ApplyXYEdgeSealMC(float& Density, float WorldX, float WorldY,
     float WorldRadiusVoxels, float Thickness, float BaseDensity)
 {
-    if (!(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f)) return;
+    if (VoxelDensityAblation::IsXYEdgeSealOff()
+        || !(WorldRadiusVoxels > 0.0f) || !(Thickness > 0.0f)) return;
 
     float InternalDensity = -Density;
     VF_ApplyXYEdgeSeal(InternalDensity, WorldX, WorldY,

@@ -22,6 +22,7 @@
 #include "VoxelStrateComposer.h"
 
 #include "VoxelDensityPrimitives.h"   // VF_ApplyOriginSpine / seals / PassageCarving
+#include "VoxelDensityAblation.h"      // fingerprinted development-only stage measurements
 #include "VoxelCaveMorphology.h"      // VoxelSDF::Capsule, VoxelHash
 #include "VoxelGenerator.h"           // VoxelGenLOD::Eff
 #include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
@@ -1933,6 +1934,10 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox,
                                      const FVoxelOpContext& Ctx) const override
         {
+            if (VoxelDensityAblation::IsOriginSpineOff())
+            {
+                return EVoxelOpEffect::Identity;
+            }
             const bool bRoomTouches = Ctx.bUseLatticeProof
                 ? VoxelPassageGeometry::OriginLandingRoomTouchesLattice(
                     VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
@@ -2018,6 +2023,10 @@ namespace
          */
         EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
+            if (VoxelDensityAblation::IsBoundarySealOff())
+            {
+                return EVoxelTileClass::Mixed;
+            }
             if (Thickness <= 0.0f || Base <= 0.0f) { return EVoxelTileClass::Mixed; }
 
             constexpr float SafetyMargin = 1.0f;
@@ -2039,6 +2048,10 @@ namespace
         // Hors de sa bande, le seal ne fait rien du tout ; à cheval, il ne peut qu'ajouter du solide.
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
+            if (VoxelDensityAblation::IsBoundarySealOff())
+            {
+                return EVoxelOpEffect::Identity;
+            }
             if (Thickness <= 0.0f) { return EVoxelOpEffect::Identity; }
             const bool bTouchesTopBand = ((float)VoxelBox.Max.Z >= TopZ - Thickness) && ((float)VoxelBox.Min.Z <= TopZ);
             const bool bTouchesBotBand = ((float)VoxelBox.Min.Z <= BotZ + Thickness) && ((float)VoxelBox.Max.Z >= BotZ);
@@ -2100,6 +2113,10 @@ namespace
          */
         EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
+            if (VoxelDensityAblation::IsXYEdgeSealOff())
+            {
+                return EVoxelTileClass::Mixed;
+            }
             return VF_XYEdgeSealBoxIsForcedSolid(
                 VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness, Base)
                 ? EVoxelTileClass::AllSolid : EVoxelTileClass::Mixed;
@@ -2114,6 +2131,10 @@ namespace
         // In the inner world it is Identity; a box that reaches the radial band can only gain rock.
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx) const override
         {
+            if (VoxelDensityAblation::IsXYEdgeSealOff())
+            {
+                return EVoxelOpEffect::Identity;
+            }
             return VF_XYEdgeSealBoxTouchesBand(
                 VoxelBox, Ctx.WorldRadiusVoxels, Ctx.EdgeSealThickness)
                  ? EVoxelOpEffect::FillOnly : EVoxelOpEffect::Identity;
@@ -2177,29 +2198,39 @@ namespace
         EVoxelOpEffect EffectOverBox(const FBox& VoxelBox,
                                      const FVoxelOpContext& Ctx) const override
         {
+            if (VoxelDensityAblation::IsPassageCarvingOff()
+                && VoxelDensityAblation::IsLandingPostsOff()
+                && VoxelDensityAblation::IsPassageStructuralPostsOff()
+                && VoxelDensityAblation::IsOriginSpineOff())
+            {
+                return EVoxelOpEffect::Identity;
+            }
             const UVoxelStrateManager* LiveManager = Manager.Get();
             if (!LiveManager) { return EVoxelOpEffect::Identity; }
-            const bool bOriginFloor = Ctx.bUseLatticeProof
-                ? VoxelPassageGeometry::OriginLandingFloorTouchesLattice(
-                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
-                    TopZ, BotZ, Seal, SpineRadius)
-                : VoxelPassageGeometry::OriginLandingFloorTouchesBox(
-                    VoxelBox, TopZ, BotZ, Seal, SpineRadius);
-            const bool bPassageFloor = Ctx.bUseLatticeProof
-                ? LiveManager->AnyPassageLandingFloorNearLattice(
-                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
-                : LiveManager->AnyPassageLandingFloorNearBox(
-                    VoxelBox.Min, VoxelBox.Max);
+            const bool bOriginFloor = !VoxelDensityAblation::IsLandingPostsOff()
+                && (Ctx.bUseLatticeProof
+                    ? VoxelPassageGeometry::OriginLandingFloorTouchesLattice(
+                        VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step,
+                        TopZ, BotZ, Seal, SpineRadius)
+                    : VoxelPassageGeometry::OriginLandingFloorTouchesBox(
+                        VoxelBox, TopZ, BotZ, Seal, SpineRadius));
+            const bool bPassageFloor = !VoxelDensityAblation::IsLandingPostsOff()
+                && (Ctx.bUseLatticeProof
+                    ? LiveManager->AnyPassageLandingFloorNearLattice(
+                        VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
+                    : LiveManager->AnyPassageLandingFloorNearBox(
+                        VoxelBox.Min, VoxelBox.Max));
             if (bOriginFloor || bPassageFloor)
             {
                 // The room carves air, while its support slab force-writes solid. Both
                 // hypotheses must therefore be killed for a box touching that slab.
                 return EVoxelOpEffect::Both;
             }
-            const bool bPassageCarve = Ctx.bUseLatticeProof
-                ? LiveManager->AnyPassageNearLattice(
-                    VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
-                : LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max);
+            const bool bPassageCarve = !VoxelDensityAblation::IsPassageCarvingOff()
+                && (Ctx.bUseLatticeProof
+                    ? LiveManager->AnyPassageNearLattice(
+                        VoxelBox, Ctx.LatticeOriginVoxels, Ctx.Step)
+                    : LiveManager->AnyPassageNearBox(VoxelBox.Min, VoxelBox.Max));
             return bPassageCarve
                  ? EVoxelOpEffect::CarveOnly : EVoxelOpEffect::Identity;
         }
@@ -2212,6 +2243,10 @@ namespace
         float MaxCarveOverBox(const FBox& VoxelBox, const FVoxelOpContext& Ctx,
                               const FVoxelBoxHypotheses& H) const override
         {
+            if (VoxelDensityAblation::IsPassageCarvingOff())
+            {
+                return 0.0f;
+            }
             const UVoxelStrateManager* LiveManager = Manager.Get();
             if (!LiveManager) { return 0.0f; }
             if (!Ctx.bUseLatticeProof)
@@ -3917,6 +3952,10 @@ namespace
         bool TryGetLastTunnelCoreWorldEvaluation(
             FTunnelCoreWorldEvaluation& OutEvaluation) const override
         {
+            if (VoxelDensityAblation::IsTunnelCoreOff())
+            {
+                return false;
+            }
             FState& S = State();
             if (!S.bLastTunnelCoreWorldEvaluationValid
                 || S.LastTunnelCoreEvaluationPosition != S.LastWorldPosition)
@@ -4078,7 +4117,7 @@ namespace
             // un « frame » : sa portée est exactement UN opérateur, donc elle appartient à cet
             // opérateur.
             float WarpedX = WorldX, WarpedY = WorldY, WarpedZ = EffectiveZ;
-            if (P.CaveWarpStrength > 0.0f)
+            if (!VoxelDensityAblation::IsCaveWarpOff() && P.CaveWarpStrength > 0.0f)
             {
                 const float WF = P.CaveWarpFrequency;
                 const float WS = P.CaveWarpStrength;
@@ -4308,68 +4347,77 @@ namespace
             // mais à des coordonnées NON warpées. Sous un modèle de frames il aurait fallu les sortir
             // du frame tout en gardant le canal — exprimable, mais tordu. Dans un opérateur unique la
             // difficulté disparaît : le warp est une variable locale, pas un contexte hérité.
-            auto EvaluatePit = [&](int32 PitIndex)
+            if (!VoxelDensityAblation::IsPitChimneySDFOff())
             {
-                const FCachedPit& Pit = GetCache().Pits[PitIndex];
-                const float DZ = WorldZ - Pit.TopZ;
-                if (DZ >= Pit.BlendK) { return; }
-                if (-DZ > Pit.Depth + Pit.BlendK) { return; }
-
-                const float DX = WorldX - Pit.CenterX;
-                const float DY = WorldY - Pit.CenterY;
-                const float XYDistSq = DX * DX + DY * DY;
-                if (XYDistSq > Pit.BoundXYRadiusSq) { return; }
-
-                float PitSDF;
-                if (DZ <= 0.0f)
+                auto EvaluatePit = [&](int32 PitIndex)
                 {
-                    const float DepthBelow  = -DZ;
-                    float FlareFactor = FMath::Clamp(1.0f - DepthBelow / Pit.FlareDist, 0.0f, 1.0f);
-                    FlareFactor       = FlareFactor * FlareFactor;
-                    const float EffRadius = Pit.Radius + Pit.FlareExtra * FlareFactor;
-                    PitSDF = FMath::Sqrt(XYDistSq) - EffRadius;
-                }
-                else
-                {
-                    PitSDF = FMath::Sqrt(XYDistSq) - (Pit.Radius + Pit.FlareExtra);
-                }
+                    const FCachedPit& Pit = GetCache().Pits[PitIndex];
+                    const float DZ = WorldZ - Pit.TopZ;
+                    if (DZ >= Pit.BlendK) { return; }
+                    if (-DZ > Pit.Depth + Pit.BlendK) { return; }
 
-                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
-            };
-            VF_ForEachChunkSDFSpatialCandidate(
-                GetCache().PitSpatialIndex, GetCache().Pits.Num(),
-                WorldX, WorldY, EvaluatePit, bUseSpatialIndex);
+                    const float DX = WorldX - Pit.CenterX;
+                    const float DY = WorldY - Pit.CenterY;
+                    const float XYDistSq = DX * DX + DY * DY;
+                    if (XYDistSq > Pit.BoundXYRadiusSq) { return; }
 
-            auto EvaluateChimney = [&](int32 ChimneyIndex)
+                    float PitSDF;
+                    if (DZ <= 0.0f)
+                    {
+                        const float DepthBelow  = -DZ;
+                        float FlareFactor = FMath::Clamp(1.0f - DepthBelow / Pit.FlareDist, 0.0f, 1.0f);
+                        FlareFactor       = FlareFactor * FlareFactor;
+                        const float EffRadius = Pit.Radius + Pit.FlareExtra * FlareFactor;
+                        PitSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                    }
+                    else
+                    {
+                        PitSDF = FMath::Sqrt(XYDistSq) - (Pit.Radius + Pit.FlareExtra);
+                    }
+
+                    CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
+                };
+            if (!VoxelDensityAblation::IsPitChimneySDFOff())
             {
-                const FCachedChimney& Chim = GetCache().Chimneys[ChimneyIndex];
-                const float DZ = WorldZ - Chim.BottomZ;
-                if (-DZ >= Chim.BlendK) { return; }
-                if (DZ > Chim.Height + Chim.BlendK) { return; }
+                VF_ForEachChunkSDFSpatialCandidate(
+                    GetCache().PitSpatialIndex, GetCache().Pits.Num(),
+                    WorldX, WorldY, EvaluatePit, bUseSpatialIndex);
+            }
 
-                const float DX = WorldX - Chim.CenterX;
-                const float DY = WorldY - Chim.CenterY;
-                const float XYDistSq = DX * DX + DY * DY;
-                if (XYDistSq > Chim.BoundXYRadiusSq) { return; }
-
-                float ChmSDF;
-                if (DZ >= 0.0f)
+                auto EvaluateChimney = [&](int32 ChimneyIndex)
                 {
-                    float FlareFactor = FMath::Clamp(1.0f - DZ / Chim.FlareDist, 0.0f, 1.0f);
-                    FlareFactor       = FlareFactor * FlareFactor;
-                    const float EffRadius = Chim.Radius + Chim.FlareExtra * FlareFactor;
-                    ChmSDF = FMath::Sqrt(XYDistSq) - EffRadius;
-                }
-                else
-                {
-                    ChmSDF = FMath::Sqrt(XYDistSq) - (Chim.Radius + Chim.FlareExtra);
-                }
+                    const FCachedChimney& Chim = GetCache().Chimneys[ChimneyIndex];
+                    const float DZ = WorldZ - Chim.BottomZ;
+                    if (-DZ >= Chim.BlendK) { return; }
+                    if (DZ > Chim.Height + Chim.BlendK) { return; }
 
-                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
-            };
-            VF_ForEachChunkSDFSpatialCandidate(
-                GetCache().ChimneySpatialIndex, GetCache().Chimneys.Num(),
-                WorldX, WorldY, EvaluateChimney, bUseSpatialIndex);
+                    const float DX = WorldX - Chim.CenterX;
+                    const float DY = WorldY - Chim.CenterY;
+                    const float XYDistSq = DX * DX + DY * DY;
+                    if (XYDistSq > Chim.BoundXYRadiusSq) { return; }
+
+                    float ChmSDF;
+                    if (DZ >= 0.0f)
+                    {
+                        float FlareFactor = FMath::Clamp(1.0f - DZ / Chim.FlareDist, 0.0f, 1.0f);
+                        FlareFactor       = FlareFactor * FlareFactor;
+                        const float EffRadius = Chim.Radius + Chim.FlareExtra * FlareFactor;
+                        ChmSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                    }
+                    else
+                    {
+                        ChmSDF = FMath::Sqrt(XYDistSq) - (Chim.Radius + Chim.FlareExtra);
+                    }
+
+                    CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
+                };
+            if (!VoxelDensityAblation::IsPitChimneySDFOff())
+            {
+                VF_ForEachChunkSDFSpatialCandidate(
+                    GetCache().ChimneySpatialIndex, GetCache().Chimneys.Num(),
+                    WorldX, WorldY, EvaluateChimney, bUseSpatialIndex);
+            }
+            }
 
             InOut.Sdf = CaveSDF;
 
@@ -4378,40 +4426,46 @@ namespace
             // build-time ownership now so the stack can preserve the authored support through its
             // remaining modifiers without a second floor-writing pass. TryGet... below reuses the
             // exact same cached result for the generator's post-disturbance hand-off.
-            const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(
-                S.LastWorldPosition);
-            S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                WorldX, WorldY, WorldZ, GetCache(), SupportColumn,
-                bUseSpatialIndex);
-            S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
-            S.bLastTunnelCoreWorldEvaluationValid = true;
-            if (S.LastTunnelCoreWorldEvaluation.bSupportFloor
-                || S.LastTunnelCoreWorldEvaluation.bRoomFloor)
+            if (!VoxelDensityAblation::IsTunnelCoreOff())
             {
-                const float StructuralFloorMinimumDensity =
-                    FMath::Max(P.BaseDensity * 2.0f, 1.0f);
-                if (VoxelMath::IsFinite(StructuralFloorMinimumDensity)
-                    && StructuralFloorMinimumDensity > 0.0f)
+                const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(
+                    S.LastWorldPosition);
+                S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+                    WorldX, WorldY, WorldZ, GetCache(), SupportColumn,
+                    bUseSpatialIndex);
+                S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
+                S.bLastTunnelCoreWorldEvaluationValid = true;
+                if (S.LastTunnelCoreWorldEvaluation.bSupportFloor
+                    || S.LastTunnelCoreWorldEvaluation.bRoomFloor)
                 {
-                    InOut.bProtectedStructuralFloor = true;
-                    InOut.StructuralFloorMinimumDensity = StructuralFloorMinimumDensity;
-                    if (VoxelDensityProfile::AreCountersEnabled())
+                    const float StructuralFloorMinimumDensity =
+                        FMath::Max(P.BaseDensity * 2.0f, 1.0f);
+                    if (VoxelMath::IsFinite(StructuralFloorMinimumDensity)
+                        && StructuralFloorMinimumDensity > 0.0f)
                     {
-                        VoxelDensityProfile::AddCounter(
-                            VoxelDensityProfile::ECounter::TunnelAuthoredFloorSamples);
+                        InOut.bProtectedStructuralFloor = true;
+                        InOut.StructuralFloorMinimumDensity = StructuralFloorMinimumDensity;
+                        if (VoxelDensityProfile::AreCountersEnabled())
+                        {
+                            VoxelDensityProfile::AddCounter(
+                                VoxelDensityProfile::ECounter::TunnelAuthoredFloorSamples);
+                        }
                     }
                 }
+
+                // These are the per-sample hand-offs needed by an op-major block.  The scalar path
+                // continues to use FState directly; publishing them here only makes the dependency
+                // explicit for a later modifier and does not alter Density/Sdf.
+                InOut.bHasTunnelCoreWorldEvaluation = true;
+                InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
+                InOut.bTunnelCoreSupportFloor = S.LastTunnelCoreWorldEvaluation.bSupportFloor;
+                InOut.bTunnelCoreRoomFloor = S.LastTunnelCoreWorldEvaluation.bRoomFloor;
             }
 
-            // These are the per-sample hand-offs needed by an op-major block.  The scalar path
-            // continues to use FState directly; publishing them here only makes the dependency
-            // explicit for a later modifier and does not alter Density/Sdf.
+            // These cache hand-offs remain valid when tunnel core is off; detail operators still
+            // need the room graph and nearest-room ownership.
             InOut.RoomCache = &GetCache();
             InOut.NearestRoomIndex = S.NearestRoom;
-            InOut.bHasTunnelCoreWorldEvaluation = true;
-            InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
-            InOut.bTunnelCoreSupportFloor = S.LastTunnelCoreWorldEvaluation.bSupportFloor;
-            InOut.bTunnelCoreRoomFloor = S.LastTunnelCoreWorldEvaluation.bRoomFloor;
         }
 
         //---------------------------------------------------------------------
@@ -5418,7 +5472,7 @@ namespace
                                                   && P.VerticalScale != 1.0f)
                                                 ? WorldZ / P.VerticalScale : WorldZ;
                         FVector Query(WorldX, WorldY, EffectiveZ);
-                        if (P.CaveWarpStrength > 0.0f)
+            if (!VoxelDensityAblation::IsCaveWarpOff() && P.CaveWarpStrength > 0.0f)
                         {
                             const float Frequency = P.CaveWarpFrequency;
                             Query.X += VoxelNoise::Perlin3D(
@@ -8543,9 +8597,6 @@ namespace
         FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed)
             : P(InP)
             , SeedU((uint32)Seed)
-            , WormLatticeStep(
-                InP.WormStrength > 0.0f && InP.WormThreshold > 0.0f
-                    ? VoxelWormField::GetLatticeStep() : 0)
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -8585,7 +8636,7 @@ namespace
                 SeedU};
             const float WormValue = VoxelWormField::Evaluate(
                 WorldX, WorldY, WorldZ, P.WormThreshold,
-                WormParameters, WormLatticeStep);
+                WormParameters);
             if (WormValue < P.WormThreshold)
             {
                 const float t = 1.0f - (WormValue / P.WormThreshold);
@@ -8656,9 +8707,7 @@ namespace
             // explicit count cap keeps this check bounded.  The network mask still uses the SDF
             // interval's worst case, so this never assumes a room value that the preceding source
             // did not prove.
-            if (VoxelWormField::GetNoiseMode() == 0
-                && WormLatticeStep <= 1
-                && Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
+            if (Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
                 && VoxelMath::IsFinite(P.WormFrequency)
                 && VoxelMath::IsFinite(P.WormHorizontalBias)
                 && VoxelMath::IsFinite(P.WormThreshold)
@@ -8778,7 +8827,6 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
-        int32 WormLatticeStep = 0;
     };
 
 #if WITH_EDITOR
@@ -9722,6 +9770,8 @@ namespace VoxelDensityOps
         //    `Sdf < SDFBlendRadius·3` via VF_NearCaveSurface. Voir la note de l'étape B5 là-bas.
         //    L'ORDRE EST CELUI DE L'ORIGINAL et il compte : chacun lit la densité que le précédent
         //    a laissée (le biais de sol est un ajout indépendant appliqué à cette accumulation).
+        if (!VoxelDensityAblation::IsDetailOpsOff())
+        {
         OutStack.Add(MakeUnique<FCaveRoughnessMod>(P, Seed));            // 4b
         OutStack.Add(MakeUnique<FCaveTerraceMod>(P, Seed, RoomPtr));     // 4c — terrasses
         OutStack.Add(MakeUnique<FLayerLineMod>(P, RoomPtr));             // 4c — lignes de strates
@@ -9734,6 +9784,7 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
         OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
         OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
+        }
         if (P.WormStrength > 0.0f && P.WormThreshold > 0.0f)
         {
             OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));

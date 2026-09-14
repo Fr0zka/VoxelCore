@@ -1226,21 +1226,21 @@ Both runs also reported `canonical_repeat_equal=true`. The disabled asset path t
 the hand-zeroed control byte-for-byte at the exported geometry hash, while exceeding the required
 20,830 / 10,909 capability gate.
 
-### Part 2 — measured cheap field
+### Historical Part 2 — measured cheap field (reverted 2026-09-14)
 
-The selected field is `voxel.WormNoiseMode=1`: a deterministic scalar value-noise evaluation
-using the same worm coordinate mapping, threshold, N1 short-circuit, N2 offset, and strength
-contract. The code default is mode 1. Mode 0 remains the legacy gradient-Perlin exact control.
-`voxel.WormNoiseMode` and `voxel.WormLatticeStep` are documented development-only,
-world-changing experiments; they are not the multiplayer off switch and must be identical on
-all peers and on every regeneration of a world.
+The historical build selected `voxel.WormNoiseMode=1`: a deterministic scalar value-noise
+evaluation using the same worm coordinate mapping, threshold, N1 short-circuit, N2 offset, and
+strength contract. That selection was reverted after the ablation review. The current source is
+exact-only Perlin mode 0; `voxel.WormNoiseMode` and `voxel.WormLatticeStep`, their storage, and
+their switches no longer exist. The run names and measurements below are retained as historical
+evidence only.
 
 The coarser lattice was measured rather than assumed. The first lattice implementation was much
 slower because of cache churn; after the fixed tile-window cache, it returned to roughly the
 exact cost but did not improve it. Representative static worker seconds were exact 33.10,
 lattice-2 initial 160.86, lattice-2 cache-fixed 33.78, lattice-4 cache-fixed 33.25, and exact
-block-skip 33.10. The lattice path is retained as a bounded experiment, but is not the selected
-production mode. The exact block skip is also retained as a fail-closed exact-mode diagnostic;
+block-skip 33.10. The lattice path was a bounded historical experiment and is not retained. The
+exact block skip is retained as a fail-closed exact-mode diagnostic;
 it is not used as a correctness or performance claim for value noise because its Perlin proof
 does not cover the changed field.
 
@@ -1255,7 +1255,7 @@ The capability and geometry candidates were:
 | `WormCheapValueLattice2Explore_20260914` | value, lattice 2 | `C47567A2` | 75,132 | 20,857 / 10,917 | pass; no speed gain |
 | `WormCheapFastHashExplore_20260914` | value, lattice 0 | `6204C7E6` | 75,956 | 20,851 / 10,917 | selected |
 
-The selected mode changes the field, but the measured full-game gain is small rather than a
+The historical selected mode changed the field, but the measured full-game gain was small rather than a
 claim of a dramatic speedup. In two interleaved static pairs, exact averaged 0.087128 / 0.148415
 s request-to-ready p50/p95, 0.063042 / 0.105080 s generation p50/p95, and 33.213871 worker s;
 cheap averaged 0.087761 / 0.145897 s, 0.062863 / 0.106258 s, and 33.083774 worker s. In two
@@ -1438,3 +1438,230 @@ capability or comparison gate.
 | `WormFinalForceOffBuildSamplerOfflineRetry_20260914` | PASS; retried with writable `Saved\ZenData`/`Saved\DDC`, 733 modules, 10 loaded, zero identity mismatches, all 7,795 unique PCs mapped. |
 | `PerfSampledBuild_FinalFingerprint.log` | PASS; final cache-key hardening rebuild, Result: Succeeded. |
 | `WormFinalFingerprintSmoke_20260914` | PASS; post-hardening clean game smoke, exact staged runtime verified, writable DDC, zero crash folders/reporters. |
+## Cheap-worm revert and TunnelNetwork ablation round — 2026-09-14
+
+This section supersedes the historical cheap-worm selection above. The earlier value-noise
+experiment changed the field without producing a gain: static movement was within noise and the
+moving worker result was about 2.1% slower. The production/default path therefore keeps exact
+Perlin.
+
+### Revert and exactness
+
+- voxel.WormNoiseMode and voxel.WormLatticeStep, their storage, and their switches are removed.
+- VoxelWormField now has one evaluation path: exact Perlin, with the existing N1 short circuit.
+- The exact block skip remains available as voxel.WormBlockSkip, default 0. The asset-owned
+  bEnableWorms and the measurement-only voxel.WormsForceOff remain.
+- The generation fingerprint still hashes bEnableWorms and WormsForceOff, and now also hashes the
+  resolved TunnelNetwork ablation mask.
+- The new ablation controls are development-only, resolve once per process, are world-changing,
+  and are never gameplay or multiplayer switches. A nonzero bit means force that stage off; zero
+  means all stages on. Shipping builds resolve the mask to zero.
+
+The prescribed UBT command from this file was used after synchronizing the staged host copy under
+the plugin Saved directory. The final build log is
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_Ablation.log and reports
+Result: Succeeded. The loaded runtime was
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Binaries\Win64\UnrealEditor-VoxelForge.dll
+with SHA-256 A70528AC82641D7D610D8BA9497D0322B1EBDE22978B1E826A97FC4C0D038149. The editor module
+SHA-256 was 8EA2A71BB29F828C5DE7559EC200AC4E86CF61F7DB5C8470406208073E22456D.
+
+The two default commandlets both used
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\DDC and
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\ZenData:
+
+- AblationDefaultExact_20260914Out: mask 0; status ok; canonical 128^3 export SHA-256
+  B3E5F4C398DD0547C6C55F415872058246D4A292C2F0D636EE1CD0829DE9B377; geometry CRC 07C14005;
+  82,273 vertices and 153,346 triangles.
+- AblationDefaultCapability_20260914Out: mask 0; geometry CRC 311CA42C; 75,482 triangles;
+  player_fit_volume_cells 20,830; reachable_player_fit_cells 10,909; walk-only reachable
+  10,909; Connected; deterministic JSON.
+
+The current game startup trace
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\AblationDefaultStaticTrace_20260914.startup.jsonl
+was compared by tile key to
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\NextHeadStaticTrace_20260913.startup.jsonl:
+841 versus 841 tile records, zero missing, zero extra, zero verdict/empty/triangle mismatches,
+and identical all-tile and LOD0 triangle totals of 669,834 and 325,204. The current trace
+finished with desired_set_satisfied_and_queue_drained and the loaded runtime hash above.
+
+### Ablation controls
+
+| bit | CVar | stage forced off |
+|---:|---|---|
+| 0x0001 | voxel.TunnelAblateCaveWarp | the three cave-warp Perlin calls; CaveWarpStrength resolves to zero |
+| 0x0002 | voxel.TunnelAblateDetailOps | detail noise, roughness, and terrain operations |
+| 0x0004 | voxel.TunnelAblateRoomSDF | room SDF and room-SDF joins in EvaluateSDFCached |
+| 0x0008 | voxel.TunnelAblateTunnelSDF | tunnel SDF in EvaluateSDFCached |
+| 0x0010 | voxel.TunnelAblateTunnelCore | EvaluateTunnelCoreWorld, support/core SDF work, and its GetDensityAt tail |
+| 0x0020 | voxel.TunnelAblatePassageCarving | EvaluateModifierSDF and passage carving |
+| 0x0040 | voxel.TunnelAblatePassageStructuralPosts | passage structural posts and legacy structural floor support |
+| 0x0080 | voxel.TunnelAblateNativeFloor | native floor composition |
+| 0x0100 | voxel.TunnelAblateDisturbances | ApplyDisturbances |
+| 0x0200 | voxel.TunnelAblateOriginSpine | origin spine |
+| 0x0400 | voxel.TunnelAblateBoundarySeal | boundary seal |
+| 0x0800 | voxel.TunnelAblateLandingPosts | landing posts and landing-floor posts |
+| 0x1000 | voxel.TunnelAblateXYEdgeSeal | XY edge seal |
+| 0x2000 | voxel.TunnelAblatePitChimneySDF | pit and chimney SDF work |
+
+Each override is applied in the fused evaluator, operator-stack source/classifier paths, cached
+SDF/core paths, and modifier/floor paths where that stage exists. The resolved mask is emitted in
+the explore JSON and is part of the generation fingerprint. This is an ablation instrument, not a
+candidate field.
+
+### Measurement method and noise
+
+All game runs were sampler-off, NullRHI, operator block on, fused evaluator on, outer classifier
+off, and used a 15-second clean session. Static runs produced 343 LOD0 samples and 841 applied
+tiles. Each static row has two off runs; the two all-on static baselines are shared and interleaved
+across the two passes. The all-on static mean was 33.064458 worker seconds, generation p50
+0.064657 s, generation p95 0.105786 s. Baseline worker range was 0.27%; baseline generation-p95
+range was 1.62%.
+
+The table reports the mean of the two off runs, the saving against that all-on mean, and the
+off-run worker range as a compact noise indicator. Positive saving means the off run used fewer
+worker seconds. All rows completed 841 tiles with zero obsolete aborts.
+
+| component removed | runs | off worker s | saving s (%) | off generation p50 s | off generation p95 s | off worker range |
+|---|---:|---:|---:|---:|---:|---:|
+| tunnel SDF | 2 | 29.304 | 3.760 (11.37%) | 0.060813 | 0.084811 | 0.53% |
+| cave warp | 2 | 29.654 | 3.411 (10.31%) | 0.056881 | 0.098260 | 2.03% |
+| passage carving | 2 | 29.730 | 3.334 (10.08%) | 0.056336 | 0.096892 | 0.88% |
+| landing posts | 2 | 29.800 | 3.264 (9.87%) | 0.056776 | 0.097884 | 1.33% |
+| passage structural posts | 2 | 31.205 | 1.859 (5.62%) | 0.060143 | 0.099723 | 0.50% |
+| worms | 2 | 32.265 | 0.799 (2.42%) | 0.064232 | 0.099511 | 0.83% |
+| native floor | 2 | 32.347 | 0.718 (2.17%) | 0.063590 | 0.103897 | 0.45% |
+| origin spine | 2 | 32.529 | 0.535 (1.62%) | 0.063174 | 0.102446 | 0.61% |
+| room SDF | 2 | 32.542 | 0.522 (1.58%) | 0.064194 | 0.100999 | 0.90% |
+| pit/chimney SDF | 2 | 32.689 | 0.375 (1.13%) | 0.064599 | 0.103472 | 0.26% |
+| boundary seal | 2 | 32.814 | 0.251 (0.76%) | 0.064863 | 0.104105 | 1.21% |
+| detail ops | 2 | 32.838 | 0.227 (0.69%) | 0.065330 | 0.100864 | 0.69% |
+| XY edge seal | 2 | 32.901 | 0.164 (0.49%) | 0.065021 | 0.104411 | 1.30% |
+| disturbances | 2 | 33.208 | -0.144 (-0.43%) | 0.065100 | 0.106342 | 0.53% |
+| tunnel core | 2 | 95.468 | -62.404 (-188.73%) | 0.060597 | 0.098965 | 0.07% |
+
+The field was intentionally allowed to change. For example, tunnel-SDF off produced 643,388
+triangles, cave-warp off 655,726, passage-carving off 654,932, and tunnel-core off 655,654,
+against the all-on 669,834 static triangles. Some low-cost rows retained the same mesh totals in
+this window; they are still world-changing overrides and are not correctness candidates.
+
+The sum of positive standalone static savings is 19.218608 worker seconds, 58.125% of the
+33.064458-second baseline, leaving 13.845850 seconds (41.875%) as shared/unattributed cost in
+this ablation accounting. The signed sum over every row is -43.329105 seconds because tunnel-core
+removal is a large regression caused by the changed field; the rows are not additive and this is
+why the signed sum is not a speedup prediction.
+
+Moving confirmation covered the five largest positive static savers. Each row has two fresh
+all-on baselines interleaved with two off runs. Movement began at 3 seconds and ran at 800 cm/s;
+each run produced 882 LOD0 samples and 1,680 applied tiles, with zero obsolete aborts.
+
+| component removed | runs | all-on worker s | off worker s | saving s (%) | all-on gen p50/p95 s | off gen p50/p95 s | baseline/off worker range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tunnel SDF | 2+2 | 72.218 | 63.847 | 8.371 (11.59%) | 0.063238 / 0.104331 | 0.060117 / 0.082540 | 0.71% / 0.87% |
+| cave warp | 2+2 | 72.810 | 65.010 | 7.800 (10.71%) | 0.064610 / 0.105986 | 0.055398 / 0.094423 | 0.46% / 1.14% |
+| landing posts | 2+2 | 72.556 | 64.763 | 7.794 (10.74%) | 0.063820 / 0.105220 | 0.055539 / 0.096228 | 1.13% / 2.36% |
+| passage carving | 2+2 | 72.043 | 64.552 | 7.492 (10.40%) | 0.063507 / 0.104761 | 0.055276 / 0.096373 | 1.07% / 1.72% |
+| passage structural posts | 2+2 | 72.417 | 68.093 | 4.324 (5.97%) | 0.063779 / 0.104611 | 0.059068 / 0.101321 | 0.14% / 0.83% |
+
+The moving standalone saving sum is 35.780708 worker seconds. Because these are five separate
+ablations with separate baseline pairs, it is not a combined-speedup forecast; against the mean
+72.409-second baseline per row it is 49.4%, leaving 36.628 seconds of shared/unattributed work.
+
+### Ranking and plausible cheaper forms
+
+1. Tunnel SDF — the largest measured real cost in both paths. A plausible exact optimization is
+   sharing one cached swept-tunnel result between EvaluateSDFCached, tunnel-core metadata, and
+   the final density tail, while preserving the existing evaluation order and float values. That
+   would be field-preserving. A lower-resolution or analytic approximation would be field-changing
+   and would need a fresh capability/export gate.
+2. Cave warp — the three Perlin calls are expensive in the ablation. Exact reuse of the same
+   coordinates/results across the evaluator, cached graph, and op-stack paths is plausible and
+   field-preserving. Reducing frequency or replacing the noise is field-changing.
+3. Passage carving — exact memoization/reuse of modifier SDF and passage candidate results across
+   EvaluateModifierSDF, ApplyPassageCarvingOnly, and the structural/floor queries is plausible and
+   field-preserving. Simplifying the carving geometry is field-changing.
+4. Landing posts — exact per-tile reuse of landing/post/floor metadata is plausible and
+   field-preserving. Removing or thinning landing posts is field-changing.
+5. Passage structural posts — exact reuse of structural-post SDF/metadata is plausible and
+   field-preserving. Removing or merging posts is field-changing.
+
+Worms is sixth at 2.42% static and is now kept exact because the cheap alternatives had no gain.
+Native floor and origin spine follow at 2.17% and 1.62%. Room SDF, detail ops, seals,
+disturbances, and pit/chimney work are not attractive next-round targets on these measurements.
+Tunnel-core removal is explicitly not a candidate: it increased worker time by about 2.9x.
+These ablations explain why the old 19.4% line-level worm figure and the proposed tunnel-core
+line targets were unsafe attribution guides.
+
+### Complete launch ledger for this round
+
+All game and commandlet logs below are under
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved. Every commandlet used the writable DDC path
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\DDC. No offline symbolizer was needed or
+launched in this round. Every Unreal process that ran exited 0, verified the loaded runtime
+SHA-256 A70528AC82641D7D610D8BA9497D0322B1EBDE22978B1E826A97FC4C0D038149, and had no crash or
+retry; the two parser-only attempts below launched no Unreal process. Peak observed private
+memory was approximately 1.54–1.60 GiB per process, with no runaway growth.
+
+| launch | outcome |
+|---|---|
+| initial prescribed staged build | UP-TO-DATE report; staged host was stale, so no measurement was taken |
+| PerfSampledBuild_Ablation | PASS; prescribed UBT build, Result: Succeeded |
+| AblationDefaultExact_20260914 | PASS; canonical export exact |
+| AblationDefaultCapability_20260914 | PASS; 311CA42C, 75,482 triangles, 20,830 / 10,909 |
+| static ablation batch launch 1 | FAILED before process start; PowerShell parser error from a missing DDC-argument quote |
+| static ablation batch launch 2 | FAILED before process start; same quoting error; no Unreal process |
+| AblationStaticBaseA_20260914 | PASS |
+| AblationStaticBaseB_20260914 | PASS |
+| AblationStaticCaveWarpA_20260914 | PASS |
+| AblationStaticCaveWarpB_20260914 | PASS |
+| AblationStaticDetailOpsA_20260914 | PASS |
+| AblationStaticDetailOpsB_20260914 | PASS |
+| AblationStaticRoomSDFA_20260914 | PASS |
+| AblationStaticRoomSDFB_20260914 | PASS |
+| AblationStaticTunnelSDFA_20260914 | PASS |
+| AblationStaticTunnelSDFB_20260914 | PASS |
+| AblationStaticTunnelCoreA_20260914 | PASS; 95.436091 worker seconds |
+| AblationStaticTunnelCoreB_20260914 | PASS; 95.500636 worker seconds |
+| AblationStaticPassageCarvingA_20260914 | PASS |
+| AblationStaticPassageCarvingB_20260914 | PASS |
+| AblationStaticPassageStructuralPostsA_20260914 | PASS |
+| AblationStaticPassageStructuralPostsB_20260914 | PASS |
+| AblationStaticNativeFloorA_20260914 | PASS |
+| AblationStaticNativeFloorB_20260914 | PASS |
+| AblationStaticDisturbancesA_20260914 | PASS |
+| AblationStaticDisturbancesB_20260914 | PASS |
+| AblationStaticOriginSpineA_20260914 | PASS |
+| AblationStaticOriginSpineB_20260914 | PASS |
+| AblationStaticBoundarySealA_20260914 | PASS |
+| AblationStaticBoundarySealB_20260914 | PASS |
+| AblationStaticLandingPostsA_20260914 | PASS |
+| AblationStaticLandingPostsB_20260914 | PASS |
+| AblationStaticXYEdgeSealA_20260914 | PASS |
+| AblationStaticXYEdgeSealB_20260914 | PASS |
+| AblationStaticPitChimneySDFA_20260914 | PASS |
+| AblationStaticPitChimneySDFB_20260914 | PASS |
+| AblationStaticWormsOffA_20260914 | PASS |
+| AblationStaticWormsOffB_20260914 | PASS |
+| AblationMovingTunnelSDFBaseA_20260914 | PASS |
+| AblationMovingTunnelSDFA_20260914 | PASS |
+| AblationMovingTunnelSDFBaseB_20260914 | PASS |
+| AblationMovingTunnelSDFB_20260914 | PASS |
+| AblationMovingCaveWarpBaseA_20260914 | PASS |
+| AblationMovingCaveWarpA_20260914 | PASS |
+| AblationMovingCaveWarpBaseB_20260914 | PASS |
+| AblationMovingCaveWarpB_20260914 | PASS |
+| AblationMovingPassageCarvingBaseA_20260914 | PASS |
+| AblationMovingPassageCarvingA_20260914 | PASS |
+| AblationMovingPassageCarvingBaseB_20260914 | PASS |
+| AblationMovingPassageCarvingB_20260914 | PASS |
+| AblationMovingLandingPostsBaseA_20260914 | PASS |
+| AblationMovingLandingPostsA_20260914 | PASS |
+| AblationMovingLandingPostsBaseB_20260914 | PASS |
+| AblationMovingLandingPostsB_20260914 | PASS |
+| AblationMovingPassageStructuralPostsBaseA_20260914 | PASS |
+| AblationMovingPassageStructuralPostsA_20260914 | PASS |
+| AblationMovingPassageStructuralPostsBaseB_20260914 | PASS |
+| AblationMovingPassageStructuralPostsB_20260914 | PASS |
+| AblationDefaultStaticTrace_20260914 | PASS; current 841-tile trace, exact keyed comparison |
+
+No .uasset was edited. Engine source and binaries were not modified. No commit, push, or stash was
+performed.

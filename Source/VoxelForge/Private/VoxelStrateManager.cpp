@@ -8,11 +8,11 @@
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
 #include "VoxelCaveMorphology.h"  // For VoxelSDF and VoxelHash
 #include "VoxelDensityPrimitives.h"  // Shared passage carve polarity/strength
+#include "VoxelDensityAblation.h"  // Fingerprinted development-only stage overrides
 #include "VoxelDensityProfile.h"  // Opt-in targeted per-voxel attribution
 #include "VoxelStartupTrace.h"
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
-#include "VoxelWormField.h"  // World-changing worm evaluator mode/lattice identity
 #include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Crc.h"
@@ -2487,6 +2487,11 @@ void UVoxelStrateManager::GeneratePassages()
 
 float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const
 {
+    if (VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        return FLT_MAX;
+    }
+
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
@@ -2552,7 +2557,7 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
             // projecting once here selects the nearest immutable floor segment for this sample.
             // Unknown/malformed descriptors deliberately retain the bare capsule and the legacy
             // diagnostic backstop remains available.
-            if (P.bNativeFloorEnabled)
+            if (P.bNativeFloorEnabled && !VoxelDensityAblation::IsNativeFloorOff())
             {
                 float NativeFloorZ = 0.0f;
                 float NativeSupportRadius = 0.0f;
@@ -2593,8 +2598,11 @@ void UVoxelStrateManager::ApplyPassageModifier(
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageModifier);
-    const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
-    VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
+    if (!VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
+        VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
+    }
     ApplyPassageLandingAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
 
     const FIntVector ChunkCoord(
@@ -2607,15 +2615,15 @@ void UVoxelStrateManager::ApplyPassageModifier(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = PassageData[PassageIndex];
-        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+        const bool bLandingFloor = !VoxelDensityAblation::IsLandingPostsOff()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-            || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-            // A valid native profile owns its D-floor in the shape and in the final MC
-            // composition.  Keep the old support slab only as a fail-closed fallback for a
-            // malformed/non-native descriptor; it must not patch a floor the shape already owns.
-            || (bPassageSupportFloorWritesEnabled
-                && !Passage.bNativeFloorEnabled
-                && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex))))
+                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding));
+        const bool bLegacySupportFloor = !VoxelDensityAblation::IsPassageStructuralPostsOff()
+            && bPassageSupportFloorWritesEnabled
+            && !Passage.bNativeFloorEnabled
+            && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (bLandingFloor || bLegacySupportFloor))
         {
             // This is the one bidirectional part of PassageCarveOp: a floor is a proved solid
             // support slab. It is deliberately applied after the air carve so a tube can never
@@ -2636,6 +2644,10 @@ void UVoxelStrateManager::ApplyPassageCarvingOnly(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    if (VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageModifier);
     const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
@@ -2646,6 +2658,10 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    if (VoxelDensityAblation::IsLandingPostsOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageLandingAir);
     const FIntVector ChunkCoord(
@@ -2710,6 +2726,10 @@ void UVoxelStrateManager::ApplyPassageTunnelAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
 {
+    if (VoxelDensityAblation::IsPassageStructuralPostsOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageTunnelAir);
     const FVector Position(WorldX, WorldY, WorldZ);
@@ -2740,6 +2760,11 @@ void UVoxelStrateManager::ApplyPassageTunnelAirMC(
 void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ, float BaseDensity) const
 {
+    if (VoxelDensityAblation::IsLandingPostsOff()
+        && VoxelDensityAblation::IsPassageStructuralPostsOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageLandingFloor);
     const FIntVector ChunkCoord(
@@ -2752,12 +2777,15 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = PassageData[PassageIndex];
-        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+        const bool bLandingFloor = !VoxelDensityAblation::IsLandingPostsOff()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-                || (bPassageSupportFloorWritesEnabled
-                    && !Passage.bNativeFloorEnabled
-                    && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex))))
+                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding));
+        const bool bLegacySupportFloor = !VoxelDensityAblation::IsPassageStructuralPostsOff()
+            && bPassageSupportFloorWritesEnabled
+            && !Passage.bNativeFloorEnabled
+            && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
+        if (!VoxelPassageGeometry::VerticalShaftConnectorAirMarker()
+            && (bLandingFloor || bLegacySupportFloor))
         {
             // Result is in MC convention here (negative = solid). This reassertion is the
             // structural floor backstop after the optional MC-space disturbance layer.
@@ -2790,6 +2818,13 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     float BaseDensity, float SealThickness,
     bool bProtectAuthoredTunnelFloor) const
 {
+    const bool bDisableStructuralPosts = VoxelDensityAblation::IsPassageStructuralPostsOff();
+    const bool bDisableLandingPosts = VoxelDensityAblation::IsLandingPostsOff();
+    if (bDisableStructuralPosts && bDisableLandingPosts)
+    {
+        return;
+    }
+
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageStructuralPosts);
 
@@ -2804,7 +2839,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     const FVector Position(WorldX, WorldY, WorldZ);
     const bool bSuppressFloor =
         VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
-    bool bAnyPassageFloor = false;
+    bool bAnyLandingFloor = false;
     bool bLegacyTunnelSupportFloor = false;
     bool bAnyRoomFloor = false;
     bool bWalkableAir = false;
@@ -2819,36 +2854,37 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         const FVoxelPassage& Passage = PassageData[PassageIndex];
 
         const bool bTunnelSupportFloor =
-            bPassageSupportFloorWritesEnabled
+            !bDisableStructuralPosts
+            && bPassageSupportFloorWritesEnabled
             && !Passage.bNativeFloorEnabled
             && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
-        if (!bSuppressFloor
+        if (!bSuppressFloor && !bDisableLandingPosts
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
-                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)
-                || bTunnelSupportFloor))
+                || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)))
         {
-            bAnyPassageFloor = true;
+            bAnyLandingFloor = true;
         }
-        if (!bSuppressFloor && bTunnelSupportFloor)
+        if (!bSuppressFloor && !bDisableStructuralPosts && bTunnelSupportFloor)
         {
             bLegacyTunnelSupportFloor = true;
         }
 
-        if (!bSuppressFloor
+        if (!bSuppressFloor && !bDisableLandingPosts
             && (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageRoomFloor(Position, Passage.LowerLanding)))
         {
             bAnyRoomFloor = true;
         }
 
-        if (!bWalkableAir
+        if (!bDisableStructuralPosts && !bWalkableAir
             && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq
             && VF_IsWalkableTunnelAir(Passage, Position, this, PassageIndex))
         {
             bWalkableAir = true;
         }
 
-        if (FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq)
+        if (!bDisableLandingPosts
+            && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq)
         {
             const FVoxelPassageLanding* Landings[] = {
                 &Passage.UpperLanding, &Passage.LowerLanding };
@@ -2865,8 +2901,8 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     // budget. A neighbouring inter-strate landing must not reopen that finite support band; its
     // carve remains valid everywhere else. Legacy callers leave this false and retain the old
     // passage-owned behavior.
-    if (!bProtectAuthoredTunnelFloor
-        && !bAnyPassageFloor && MinLandingSDF < FLT_MAX)
+    if (!bDisableLandingPosts && !bProtectAuthoredTunnelFloor
+        && !bAnyLandingFloor && !bLegacyTunnelSupportFloor && MinLandingSDF < FLT_MAX)
     {
         float InternalDensity = -Density;
         VF_ApplyPassageLandingCarving(
@@ -2874,7 +2910,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         Density = -InternalDensity;
     }
 
-    if (bAnyPassageFloor)
+    if (bAnyLandingFloor || bLegacyTunnelSupportFloor)
     {
         Density = FMath::Min(Density, -BaseDensity);
     }
@@ -2901,6 +2937,10 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity) const
 {
+    if (VoxelDensityAblation::IsNativeFloorOff())
+    {
+        return;
+    }
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
@@ -2955,6 +2995,10 @@ void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity) const
 {
+    if (VoxelDensityAblation::IsLandingPostsOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageLandingRoomFloor);
     const FIntVector ChunkCoord(
@@ -2979,6 +3023,10 @@ void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
 
 bool UVoxelStrateManager::AnyPassageNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const
 {
+    if (VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        return false;
+    }
     // Le carve d'un passage atteint ModSDF < PASSAGE_BLEND_RADIUS (4, VoxelGenerator.cpp) au-delà de
     // sa surface ; BoundRadius inclut déjà rayon + blend, on re-pad par sécurité (conservatif).
     constexpr float CarvePad = 4.0f;
@@ -5530,7 +5578,12 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         {
             Result.WormStrength = 0.0f;
         }
-        return VF_ApplyRuntimeRoughnessOverrides(Result);
+        Result = VF_ApplyRuntimeRoughnessOverrides(Result);
+        if (VoxelDensityAblation::IsCaveWarpOff())
+        {
+            Result.CaveWarpStrength = 0.0f;
+        }
+        return Result;
     };
 
 #if WITH_EDITOR
@@ -5885,11 +5938,9 @@ uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
         HashValue(Slot.Definition->bUseOperatorStack);
         HashValue(Slot.Definition->bEnableWorms);
         HashValue(VF_WormsForceOff());
-        // The selected evaluator is a world input even though it is deliberately not part of
-        // FStrateGenerationParams (the fixed 83-field memo key). Keep persistent/verdict keys
-        // from crossing an explicit WormNoiseMode/WormLatticeStep experiment.
-        HashValue(VoxelWormField::GetNoiseMode());
-        HashValue(VoxelWormField::GetLatticeStep());
+        // Development-only stage ablations change the field and therefore belong in every
+        // persistent/verdict key even though they are not authored generation parameters.
+        HashValue(VoxelDensityAblation::GetResolvedMask());
         HashValue(Slot.Definition->StrateHeightInChunks);
         HashValue(Slot.Definition->TransitionType);
         HashValue(Slot.Definition->TransitionBlendChunks);

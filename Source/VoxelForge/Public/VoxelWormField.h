@@ -16,16 +16,6 @@ namespace VoxelWormField
         uint32 Seed = 0;
     };
 
-    /**
-     * Return the selected development experiment mode.
-     *
-     * 0 is the exact field.  2 and 4 evaluate the exact field on that many-voxel lattice and
-     * trilinearly interpolate it.  This is intentionally a WORLD-CHANGING development switch:
-     * it must not be changed between multiplayer peers or for an already generated world.
-     */
-    VOXELFORGE_API int32 GetLatticeStep();
-    VOXELFORGE_API int32 GetNoiseMode();
-
     /** Evaluate the exact two-noise field, retaining the N1 threshold short-circuit. */
     VOXELFORGE_API float EvaluateExact(
         float WorldX,
@@ -34,12 +24,11 @@ namespace VoxelWormField
         float Threshold,
         const FParameters& Parameters);
 
-    /** Evaluate the exact field or its selected cached lattice approximation. */
+    /** Evaluate the exact two-noise field. */
     VOXELFORGE_API float Evaluate(
         float WorldX,
         float WorldY,
         float WorldZ,
         float Threshold,
-        const FParameters& Parameters,
-        int32 LatticeStep);
+        const FParameters& Parameters);
 }

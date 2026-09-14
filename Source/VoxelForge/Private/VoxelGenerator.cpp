@@ -14,6 +14,7 @@
 #include "VoxelBiomeDefinition.h"
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
 #include "VoxelWormField.h"
+#include "VoxelDensityAblation.h" // fingerprinted development-only stage measurements
 #include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
@@ -985,6 +986,10 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     const FStrateDisturbanceParams& D, uint32 Seed, bool bProtectVerticalShaftAir,
     bool bProtectAuthoredTunnelFloor)
 {
+    if (VoxelDensityAblation::IsDisturbancesOff())
+    {
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::ApplyDisturbances);
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
@@ -2592,7 +2597,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
         // de diff qui suivent ne voient aucune différence.
-        if (CP_UseOpStack)
+        if (!VoxelDensityAblation::IsTunnelCoreOff() && CP_UseOpStack)
         {
             const bool bCanUseFusedEvaluator =
                 GVoxelForgeUseFusedEvaluator != 0
@@ -2751,7 +2756,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     PreDisturbanceTunnelCore);
             }
         }
-        if (!bHavePreDisturbanceTunnelCore && ActiveTunnelCoreCache->bValid)
+        if (!VoxelDensityAblation::IsTunnelCoreOff()
+            && !bHavePreDisturbanceTunnelCore && ActiveTunnelCoreCache->bValid)
         {
             const FTunnelSupportFloorColumn* SupportColumn = nullptr;
             FTunnelSupportFloorColumn EmptySupportColumn;
@@ -2891,7 +2897,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
         // never once per voxel.
-        if (ActiveTunnelCoreCache->bValid || CP_UseOpStack)
+        if (!VoxelDensityAblation::IsTunnelCoreOff()
+            && (ActiveTunnelCoreCache->bValid || CP_UseOpStack))
         {
             FTunnelCoreWorldEvaluation TunnelCore;
             bool bHaveTunnelCore = bHavePreDisturbanceTunnelCore;
@@ -3181,7 +3188,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     float WarpedY = WorldY;
     float WarpedZ = EffectiveZ;
 
-    if (Params.CaveWarpStrength > 0.0f)
+    if (!VoxelDensityAblation::IsCaveWarpOff() && Params.CaveWarpStrength > 0.0f)
     {
         const float WF = Params.CaveWarpFrequency;
         const float WS = Params.CaveWarpStrength;
@@ -3472,74 +3479,77 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         //     transition as tunnel-to-room (no hard seam at PitTopZ)
         //   - bNearCaveSurface becomes true inside the shaft — roughness clamp
         //     prevents fill-back, so this is safe
-        auto EvaluatePit = [&](int32 PitIndex)
+        if (!VoxelDensityAblation::IsPitChimneySDFOff())
         {
-            const FCachedPit& Pit = SDFCache.Pits[PitIndex];
-            const float DZ = WorldZ - Pit.TopZ;  // Negative = below anchor (shaft)
-            if (DZ >= Pit.BlendK) return;       // Above even the blend fringe
-            if (-DZ > Pit.Depth + Pit.BlendK) return;
-
-            const float DX = WorldX - Pit.CenterX;
-            const float DY = WorldY - Pit.CenterY;
-            const float XYDistSq = DX * DX + DY * DY;
-            if (XYDistSq > Pit.BoundXYRadiusSq) return;
-
-            float PitSDF;
-            if (DZ <= 0.0f)
+            auto EvaluatePit = [&](int32 PitIndex)
             {
-                // Shaft: tapered cylinder with flared opening
-                float DepthBelow  = -DZ;
-                float FlareFactor = FMath::Clamp(1.0f - DepthBelow / Pit.FlareDist, 0.0f, 1.0f);
-                FlareFactor       = FlareFactor * FlareFactor;
-                float EffRadius   = Pit.Radius + Pit.FlareExtra * FlareFactor;
-                PitSDF = FMath::Sqrt(XYDistSq) - EffRadius;
-            }
-            else
+                const FCachedPit& Pit = SDFCache.Pits[PitIndex];
+                const float DZ = WorldZ - Pit.TopZ;  // Negative = below anchor (shaft)
+                if (DZ >= Pit.BlendK) return;       // Above even the blend fringe
+                if (-DZ > Pit.Depth + Pit.BlendK) return;
+
+                const float DX = WorldX - Pit.CenterX;
+                const float DY = WorldY - Pit.CenterY;
+                const float XYDistSq = DX * DX + DY * DY;
+                if (XYDistSq > Pit.BoundXYRadiusSq) return;
+
+                float PitSDF;
+                if (DZ <= 0.0f)
+                {
+                    // Shaft: tapered cylinder with flared opening
+                    float DepthBelow  = -DZ;
+                    float FlareFactor = FMath::Clamp(1.0f - DepthBelow / Pit.FlareDist, 0.0f, 1.0f);
+                    FlareFactor       = FlareFactor * FlareFactor;
+                    float EffRadius   = Pit.Radius + Pit.FlareExtra * FlareFactor;
+                    PitSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                }
+                else
+                {
+                    // Above anchor: only the blend fringe matters here.
+                    // We still pass a SDF so SmoothMin can soften the rim from above.
+                    // Treat this zone as a flat disc at TopZ (XY cylinder, no Z factor)
+                    // so the blend fades horizontally into the room floor.
+                    PitSDF = FMath::Sqrt(XYDistSq) - (Pit.Radius + Pit.FlareExtra);
+                }
+
+                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
+            };
+            VF_ForEachChunkSDFSpatialCandidate(
+                SDFCache.PitSpatialIndex, SDFCache.Pits.Num(), WorldX, WorldY, EvaluatePit,
+                bUseSpatialIndex);
+
+            auto EvaluateChimney = [&](int32 ChimneyIndex)
             {
-                // Above anchor: only the blend fringe matters here.
-                // We still pass a SDF so SmoothMin can soften the rim from above.
-                // Treat this zone as a flat disc at TopZ (XY cylinder, no Z factor)
-                // so the blend fades horizontally into the room floor.
-                PitSDF = FMath::Sqrt(XYDistSq) - (Pit.Radius + Pit.FlareExtra);
-            }
+                const FCachedChimney& Chim = SDFCache.Chimneys[ChimneyIndex];
+                const float DZ = WorldZ - Chim.BottomZ;  // Positive = above anchor (shaft)
+                if (-DZ >= Chim.BlendK) return;         // Below even the blend fringe
+                if (DZ > Chim.Height + Chim.BlendK) return;
 
-            CaveSDF = VoxelSDF::SmoothMin(CaveSDF, PitSDF, Pit.BlendK);
-        };
-        VF_ForEachChunkSDFSpatialCandidate(
-            SDFCache.PitSpatialIndex, SDFCache.Pits.Num(), WorldX, WorldY, EvaluatePit,
-            bUseSpatialIndex);
+                const float DX = WorldX - Chim.CenterX;
+                const float DY = WorldY - Chim.CenterY;
+                const float XYDistSq = DX * DX + DY * DY;
+                if (XYDistSq > Chim.BoundXYRadiusSq) return;
 
-        auto EvaluateChimney = [&](int32 ChimneyIndex)
-        {
-            const FCachedChimney& Chim = SDFCache.Chimneys[ChimneyIndex];
-            const float DZ = WorldZ - Chim.BottomZ;  // Positive = above anchor (shaft)
-            if (-DZ >= Chim.BlendK) return;         // Below even the blend fringe
-            if (DZ > Chim.Height + Chim.BlendK) return;
+                float ChmSDF;
+                if (DZ >= 0.0f)
+                {
+                    float FlareFactor = FMath::Clamp(1.0f - DZ / Chim.FlareDist, 0.0f, 1.0f);
+                    FlareFactor       = FlareFactor * FlareFactor;
+                    float EffRadius   = Chim.Radius + Chim.FlareExtra * FlareFactor;
+                    ChmSDF = FMath::Sqrt(XYDistSq) - EffRadius;
+                }
+                else
+                {
+                    // Below anchor: flat disc blend into room ceiling
+                    ChmSDF = FMath::Sqrt(XYDistSq) - (Chim.Radius + Chim.FlareExtra);
+                }
 
-            const float DX = WorldX - Chim.CenterX;
-            const float DY = WorldY - Chim.CenterY;
-            const float XYDistSq = DX * DX + DY * DY;
-            if (XYDistSq > Chim.BoundXYRadiusSq) return;
-
-            float ChmSDF;
-            if (DZ >= 0.0f)
-            {
-                float FlareFactor = FMath::Clamp(1.0f - DZ / Chim.FlareDist, 0.0f, 1.0f);
-                FlareFactor       = FlareFactor * FlareFactor;
-                float EffRadius   = Chim.Radius + Chim.FlareExtra * FlareFactor;
-                ChmSDF = FMath::Sqrt(XYDistSq) - EffRadius;
-            }
-            else
-            {
-                // Below anchor: flat disc blend into room ceiling
-                ChmSDF = FMath::Sqrt(XYDistSq) - (Chim.Radius + Chim.FlareExtra);
-            }
-
-            CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
-        };
-        VF_ForEachChunkSDFSpatialCandidate(
-            SDFCache.ChimneySpatialIndex, SDFCache.Chimneys.Num(),
-            WorldX, WorldY, EvaluateChimney, bUseSpatialIndex);
+                CaveSDF = VoxelSDF::SmoothMin(CaveSDF, ChmSDF, Chim.BlendK);
+            };
+            VF_ForEachChunkSDFSpatialCandidate(
+                SDFCache.ChimneySpatialIndex, SDFCache.Chimneys.Num(),
+                WorldX, WorldY, EvaluateChimney, bUseSpatialIndex);
+        }
 
         // Convert SDF to density carving:
         // CaveSDF < 0 means we're inside a room/tunnel/pit → carve to air
@@ -3563,6 +3573,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // post-disturbance tail can consume the result without allocating an FVoxelOpSample or
     // invoking the interpreted stack a second time for this sample.
     if (OutTunnelCore != nullptr
+        && !VoxelDensityAblation::IsTunnelCoreOff()
         && Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
     {
         // The no-column form is the exact scalar reference path: it performs the world-bound and
@@ -3585,10 +3596,11 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // seal / modifiers, so we jump to Step 5 instead of returning early.
     const float DetailThreshold = Params.SDFBlendRadius * 3.0f;
     const bool bNearCaveSurface = (CaveSDF < DetailThreshold) && (CaveSDF < FLT_MAX);
+    const bool bRunDetail = !VoxelDensityAblation::IsDetailOpsOff() && bNearCaveSurface;
     if (bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled())
     {
         VoxelDensityProfile::AddCounter(
-            bNearCaveSurface
+            bRunDetail
                 ? VoxelDensityProfile::ECounter::FusedTunnelDetailSamples
                 : VoxelDensityProfile::ECounter::FusedTunnelDetailSkipped);
     }
@@ -3606,7 +3618,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // The noise type (fBM, Ridged, Mixed) and optional domain warping are
     // per-strate settings, so each strate can have fundamentally different
     // wall character — smooth lava tubes vs craggy erosion cliffs.
-    if (bNearCaveSurface && Params.SurfaceRoughness > 0.0f)
+    if (bRunDetail && Params.SurfaceRoughness > 0.0f)
     {
         float RoughnessDepth = Params.SurfaceRoughness * 2.0f;
         float DistFromSurface = FMath::Abs(CaveSDF);
@@ -3729,7 +3741,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //=========================================================================
     // All terrain ops only affect density near cave walls.
     // Deep-solid voxels skip this entire block (bNearCaveSurface = false).
-    if (bNearCaveSurface)
+    if (bRunDetail)
     {
     //=========================================================================
     // PER-ROOM TERRAIN PARAMS
@@ -4276,10 +4288,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
 
             bool bWormBlockProofComputed = false;
-            const int32 WormLatticeStep = VoxelWormField::GetLatticeStep();
-            const bool bSkipWormBlock = VoxelWormField::GetNoiseMode() == 0
-                && WormLatticeStep <= 1
-                && GVoxelForgeWormBlockSkip != 0
+            const bool bSkipWormBlock = GVoxelForgeWormBlockSkip != 0
                 && VF_TryGetWormBlockSkip(
                     DensityCacheOwnerId, SeedU, ParamsFingerprint, LayoutVersion,
                     WorldX, WorldY, WorldZ, Params, bWormBlockProofComputed);
@@ -4305,7 +4314,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                     SeedU};
                 const float WormValue = VoxelWormField::Evaluate(
                     WorldX, WorldY, WorldZ, Params.WormThreshold,
-                    WormParameters, WormLatticeStep);
+                    WormParameters);
 
                 if (WormValue < Params.WormThreshold)
                 {
@@ -4370,8 +4379,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // the graph's own tunnel floor/core are structural route geometry. Direct callers of
         // GetDensityWithParams retain this historical tail; GetDensityAt skips it and applies the
         // same predicates once in its common MC-space post section below both generation paths.
-        const bool bTunnelSupportFloor = VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-            WorldX, WorldY, WorldZ, SDFCache, bUseSpatialIndex);
+        const bool bTunnelCoreEnabled = !VoxelDensityAblation::IsTunnelCoreOff();
+        const bool bTunnelSupportFloor = bTunnelCoreEnabled
+            && VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
+                WorldX, WorldY, WorldZ, SDFCache, bUseSpatialIndex);
         // Keep the direct legacy entry point capability-safe for callers outside the canonical
         // operator-stack path; its support band follows the same relieved swept floor.
         if (bTunnelSupportFloor)
@@ -4388,7 +4399,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
             Density = FMath::Max(Density, StructuralSolidDensity);
         }
-        const float TunnelCoreSDF = (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
+        const float TunnelCoreSDF = bTunnelCoreEnabled
+            && (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
             ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
                 WorldX, WorldY, WorldZ, SDFCache, bUseSpatialIndex)
             : FLT_MAX;

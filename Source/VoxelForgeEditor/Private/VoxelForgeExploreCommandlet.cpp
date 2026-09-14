@@ -29,11 +29,11 @@
 #include "VoxelCaveMorphology.h"
 #include "VoxelDiffLayer.h"
 #include "VoxelDensityOpStack.h"
+#include "VoxelDensityAblation.h"
 #include "VoxelDensityProfile.h"
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
-#include "VoxelWormField.h"
 #include "VoxelSettings.h"
 #include "VoxelStackSampler.h"
 #include "VoxelStrateDefinition.h"
@@ -4202,8 +4202,8 @@ FString BuildManifestJson(
     {
         Writer->WriteValue(TEXT("worm_strength"), static_cast<double>(Arguments.WormStrength));
     }
-    Writer->WriteValue(TEXT("worm_lattice_step"), VoxelWormField::GetLatticeStep());
-    Writer->WriteValue(TEXT("worm_noise_mode"), VoxelWormField::GetNoiseMode());
+    Writer->WriteValue(TEXT("tunnel_ablation_mask"),
+        static_cast<int64>(VoxelDensityAblation::GetResolvedMask()));
     WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
     if (Arguments.bRoomMouthRiseOverride)
@@ -4478,8 +4478,8 @@ FString BuildExploreJson(
     {
         Writer->WriteValue(TEXT("worm_strength"), static_cast<double>(Arguments.WormStrength));
     }
-    Writer->WriteValue(TEXT("worm_lattice_step"), VoxelWormField::GetLatticeStep());
-    Writer->WriteValue(TEXT("worm_noise_mode"), VoxelWormField::GetNoiseMode());
+    Writer->WriteValue(TEXT("tunnel_ablation_mask"),
+        static_cast<int64>(VoxelDensityAblation::GetResolvedMask()));
     WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
     if (Arguments.bRoomMouthRiseOverride)
