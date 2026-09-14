@@ -34,6 +34,7 @@ public:
         bool bSupported = false;
         bool bStarted = false;
         bool bOutputWritten = false;
+        bool bModuleMapWritten = false;
         bool bStackWalkingInitialized = false;
         uint32 IntervalUs = 0;
         uint32 MaxDepth = 0;
@@ -47,6 +48,8 @@ public:
         uint64 RetainedSamples = 0;
         uint64 DroppedSamples = 0;
         uint64 TotalFrames = 0;
+        // Kept for source compatibility with the earlier in-process summary.  Raw sessions leave
+        // these zero; the offline summary owns all resolved-frame counts and tables.
         uint64 ResolvedFrames = 0;
         uint64 UnknownFrames = 0;
         uint64 WaitLikeFrames = 0;
@@ -55,10 +58,12 @@ public:
         uint64 UniqueProgramCounters = 0;
         uint64 InlineSymbols = 0;
         uint64 MaxActiveRegisteredThreads = 0;
+        uint64 ModuleCount = 0;
         double RunSeconds = 0.0;
 
         FString RunLabel;
         FString RawSamplesPath;
+        FString ModuleMapPath;
         FString SummaryPath;
     };
 

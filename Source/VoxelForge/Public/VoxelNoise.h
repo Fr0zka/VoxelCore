@@ -142,6 +142,56 @@ FORCEINLINE float Perlin3D(const FVector3f& P)
     return Perlin3D(P.X, P.Y, P.Z);
 }
 
+// A smooth, deterministic value-noise sample for the worm-only cost experiment. It keeps the
+// same unit lattice and quintic interpolation as Perlin3D, but uses one seeded scalar hash per
+// corner instead of the eight gradient selections and dot products. It is intentionally not used
+// by the terrain's other noise fields; WormNoiseMode gates it as an explicit world-changing test.
+FORCEINLINE uint32 ValueNoiseHash(int32 X, int32 Y, int32 Z, uint32 Seed, uint32 Salt)
+{
+    uint32 H = Detail::HashCorner(X, Y, Z) ^ Seed ^ Salt;
+    H ^= H >> 16;
+    H *= 0x7FEB352Du;
+    H ^= H >> 15;
+    return H;
+}
+
+FORCEINLINE float ValueNoise3D(const FVector3f& P, uint32 Seed, uint32 Salt)
+{
+    const float XFloor = FMath::FloorToFloat(P.X);
+    const float YFloor = FMath::FloorToFloat(P.Y);
+    const float ZFloor = FMath::FloorToFloat(P.Z);
+    const int32 X = static_cast<int32>(XFloor);
+    const int32 Y = static_cast<int32>(YFloor);
+    const int32 Z = static_cast<int32>(ZFloor);
+    const float Fx = P.X - XFloor;
+    const float Fy = P.Y - YFloor;
+    const float Fz = P.Z - ZFloor;
+    const float Sx = Detail::Fade(Fx);
+    const float Sy = Detail::Fade(Fy);
+    const float Sz = Detail::Fade(Fz);
+    constexpr float HashToSigned = 2.0f / 16777216.0f;
+    const auto Sample = [Seed, Salt, HashToSigned](int32 IX, int32 IY, int32 IZ) -> float
+    {
+        return static_cast<float>(ValueNoiseHash(IX, IY, IZ, Seed, Salt) & 0x00FFFFFFu)
+            * HashToSigned - 1.0f;
+    };
+    const float V000 = Sample(X, Y, Z);
+    const float V100 = Sample(X + 1, Y, Z);
+    const float V010 = Sample(X, Y + 1, Z);
+    const float V110 = Sample(X + 1, Y + 1, Z);
+    const float V001 = Sample(X, Y, Z + 1);
+    const float V101 = Sample(X + 1, Y, Z + 1);
+    const float V011 = Sample(X, Y + 1, Z + 1);
+    const float V111 = Sample(X + 1, Y + 1, Z + 1);
+    const float X00 = Detail::Lerp(V000, V100, Sx);
+    const float X10 = Detail::Lerp(V010, V110, Sx);
+    const float X01 = Detail::Lerp(V001, V101, Sx);
+    const float X11 = Detail::Lerp(V011, V111, Sx);
+    const float Y0 = Detail::Lerp(X00, X10, Sy);
+    const float Y1 = Detail::Lerp(X01, X11, Sy);
+    return Detail::Lerp(Y0, Y1, Sz);
+}
+
 //=============================================================================
 // LIPSCHITZ BOUND FOR THE ACTUAL 3D FIELD
 //=============================================================================

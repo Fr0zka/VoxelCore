@@ -66,6 +66,8 @@ namespace VoxelGenLOD
     VOXELFORGE_API bool IsTileCacheWindowEnabled(bool bFusedPath = true);
     VOXELFORGE_API bool GetThreadTileCacheWindow(
         FIntVector& OutOriginVoxels, int32& OutStep, int32& OutCellsPerAxis);
+    VOXELFORGE_API void SetThreadTileContext(
+        const FIntVector& OriginVoxels, int32 CellsPerAxis);
 
     // Effective octave count for a per-voxel noise call site.
     // At least 1 octave always survives (the coarse base shape).

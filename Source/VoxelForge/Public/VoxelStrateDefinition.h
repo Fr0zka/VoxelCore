@@ -136,6 +136,15 @@ public:
         meta = (DisplayName = "Use Operator Stack (experimental)"))
     bool bUseOperatorStack = false;
 
+    /**
+     * Authoritative per-strate worm switch. Existing assets default to enabled. The manager
+     * resolves a disabled strate to WormStrength == 0 before any fused, stack, composer, or
+     * interval path sees its parameters, so this is a geometry switch rather than a local CVar.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Generation",
+        meta = (DisplayName = "Enable Worms"))
+    bool bEnableWorms = true;
+
     //=========================================================================
     // TUNNEL NETWORK PARAMS (shown only for TunnelNetwork generator type)
     //=========================================================================

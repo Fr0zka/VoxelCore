@@ -12,6 +12,7 @@
 #include "VoxelStartupTrace.h"
 #include "VoxelTerrainOpDefinition.h"  // For UVoxelTerrainOpDefinition::ApplyTo
 #include "VoxelBiomeDefinition.h"  // For UVoxelBiomeDefinition (biome context flatten)
+#include "VoxelWormField.h"  // World-changing worm evaluator mode/lattice identity
 #include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Crc.h"
@@ -32,6 +33,42 @@ namespace
         TEXT("voxel.FloorRound1PassageProjectionCache"),
         GVoxelForgeFloorRound1PassageProjectionCache,
         TEXT("Reuse exact passage floor projections within one density sample; 0 disables the A/B cache."));
+
+    // This is a measurement override only. The asset-owned bEnableWorms field remains the real
+    // per-strate contract; this process-wide switch exists so the game harness can measure the
+    // cost of enabled versus disabled worms without editing an owner's asset. It is resolved once
+    // before generation params are published so workers cannot disagree mid-world.
+    int32 GVoxelForgeWormsForceOff = 0;
+    std::atomic<int32> GResolvedWormsForceOff(-1);
+    FAutoConsoleVariableRef CVarVoxelForgeWormsForceOff(
+        TEXT("voxel.WormsForceOff"),
+        GVoxelForgeWormsForceOff,
+        TEXT("WORLD-CHANGING DEVELOPMENT-ONLY measurement override. 0=asset behavior, 1=force "
+             "all worm strengths to zero. Never vary this between multiplayer peers or world "
+             "regenerations; it is not the per-strate off switch."),
+        ECVF_Default);
+
+    bool VF_WormsForceOff()
+    {
+        int32 Existing = GResolvedWormsForceOff.load(std::memory_order_acquire);
+        if (Existing >= 0)
+        {
+            return Existing != 0;
+        }
+
+        int32 CommandLineValue = GVoxelForgeWormsForceOff;
+        FParse::Value(
+            FCommandLine::Get(), TEXT("voxel.WormsForceOff="), CommandLineValue);
+        const int32 Resolved = CommandLineValue != 0 ? 1 : 0;
+        int32 Expected = -1;
+        if (!GResolvedWormsForceOff.compare_exchange_strong(
+                Expected, Resolved, std::memory_order_release, std::memory_order_acquire))
+        {
+            return Expected != 0;
+        }
+        GVoxelForgeWormsForceOff = Resolved;
+        return Resolved != 0;
+    }
 
     struct FRuntimeRoughnessOverrides
     {
@@ -1429,6 +1466,15 @@ bool UVoxelStrateManager::SetComposerOverrideForStrate(
     Override->CandidateSeed = CandidateSeed;
     Override->Archetype = Archetype;
     Override->Params = Params;
+    if ((VF_WormsForceOff() || !TargetSlot->Definition->bEnableWorms)
+        && (Archetype == ECaveGeneratorType::TunnelNetwork
+            || Archetype == ECaveGeneratorType::Underwater))
+    {
+        // The composer is allowed to roll a complete candidate, but a disabled asset must never
+        // retain a worm-enabled candidate in its runtime override, even for code that inspects
+        // the override before GetGenerationParams applies the final resolution gate.
+        Override->Params.TunnelNetworkParams.WormStrength = 0.0f;
+    }
     VF_SetComposerRuntimeBounds(
         Override->Params,
         (float)(TargetSlot->TopChunkZ + 1) * CHUNK_SIZE,
@@ -5474,6 +5520,19 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
     const FStrateSlot& Slot = StrateLayout[SlotIdx];
 
+    // This is the one final resolution gate for the asset-owned worm switch. It is deliberately
+    // applied after composer/season replacements and after boundary blending: a disabled current
+    // strate can never be re-enabled by a rolled candidate or by an enabled neighbour.
+    const auto ResolveFinalParams = [&Slot](FStrateGenerationParams Result)
+    {
+        if (VF_WormsForceOff()
+            || (Slot.Definition != nullptr && !Slot.Definition->bEnableWorms))
+        {
+            Result.WormStrength = 0.0f;
+        }
+        return VF_ApplyRuntimeRoughnessOverrides(Result);
+    };
+
 #if WITH_EDITOR
     if (const FVoxelStrateComposerSlotOverride* Override =
         FindComposerOverride(Slot.StrateIndex))
@@ -5483,7 +5542,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
         // A candidate is a hard replacement of this slot. Do not blend its rolled vector with an
         // authored neighbour at a boundary; this is also how the offline fixture measures it.
-        return VF_ApplyRuntimeRoughnessOverrides(Result);
+        return ResolveFinalParams(Result);
     }
 #endif
 
@@ -5494,7 +5553,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         Result.StrateBottomWorldZ = (float)Slot.BottomChunkZ * CHUNK_SIZE;
         // Season vectors are already final, measured slot records. Vertical structural posts own
         // their boundary; blending them with another selected recipe would describe neither one.
-        return VF_ApplyRuntimeRoughnessOverrides(Result);
+        return ResolveFinalParams(Result);
     }
 
     FStrateGenerationParams BaseParams = BuildParamsFromDefinition(Slot.Definition);
@@ -5589,7 +5648,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 float Alpha = 1.0f - ((float)DistFromBottom / (float)EffectiveBlend);
                 Alpha = FMath::Clamp(Alpha, 0.0f, 1.0f);
 
-                return VF_ApplyRuntimeRoughnessOverrides(
+                return ResolveFinalParams(
                     FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha));
             }
             break;
@@ -5643,7 +5702,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 // Only blend if alpha > 0 (we're inside the warped transition zone)
                 if (Alpha > 0.0f)
                 {
-                    return VF_ApplyRuntimeRoughnessOverrides(
+                    return ResolveFinalParams(
                         FStrateGenerationParams::Lerp(BaseParams, BelowParams, Alpha));
                 }
             }
@@ -5685,7 +5744,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
                 float Alpha = 1.0f - ((float)DistFromTop / (float)EffectiveBlend);
                 Alpha = FMath::Clamp(Alpha, 0.0f, 1.0f);
 
-                return VF_ApplyRuntimeRoughnessOverrides(
+                return ResolveFinalParams(
                     FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha));
             }
             break;
@@ -5715,7 +5774,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 
                 if (Alpha > 0.0f)
                 {
-                    return VF_ApplyRuntimeRoughnessOverrides(
+                    return ResolveFinalParams(
                         FStrateGenerationParams::Lerp(BaseParams, AboveParams, Alpha));
                 }
             }
@@ -5725,7 +5784,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     }
 
     // Not near any boundary (or Hard transition) — use this strate's params directly
-    return VF_ApplyRuntimeRoughnessOverrides(BaseParams);
+    return ResolveFinalParams(BaseParams);
 }
 
 //=============================================================================
@@ -5745,8 +5804,15 @@ FStrateGenerationParams UVoxelStrateManager::BuildParamsFromDefinition(const UVo
 {
     if (!Definition) return FStrateGenerationParams();
 
-    // Base params only — terrain op fields stay 0 until per-room assignment.
-    return Definition->GenerationParams;
+    // Base params only — terrain op fields stay 0 until per-room assignment. Resolve the asset
+    // switch here as well as at the final return so a disabled neighbour cannot leak worm strength
+    // back through a boundary blend.
+    FStrateGenerationParams Result = Definition->GenerationParams;
+    if (VF_WormsForceOff() || !Definition->bEnableWorms)
+    {
+        Result.WormStrength = 0.0f;
+    }
+    return Result;
 }
 
 uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
@@ -5817,6 +5883,13 @@ uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
         HashValue(Slot.HeightInChunks);
         HashValue(Slot.Definition->GeneratorType);
         HashValue(Slot.Definition->bUseOperatorStack);
+        HashValue(Slot.Definition->bEnableWorms);
+        HashValue(VF_WormsForceOff());
+        // The selected evaluator is a world input even though it is deliberately not part of
+        // FStrateGenerationParams (the fixed 83-field memo key). Keep persistent/verdict keys
+        // from crossing an explicit WormNoiseMode/WormLatticeStep experiment.
+        HashValue(VoxelWormField::GetNoiseMode());
+        HashValue(VoxelWormField::GetLatticeStep());
         HashValue(Slot.Definition->StrateHeightInChunks);
         HashValue(Slot.Definition->TransitionType);
         HashValue(Slot.Definition->TransitionBlendChunks);

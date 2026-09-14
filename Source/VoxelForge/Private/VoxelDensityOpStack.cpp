@@ -26,6 +26,7 @@
 #include "VoxelGenerator.h"           // VoxelGenLOD::Eff
 #include "VoxelHeightOp.h"            // FVoxelHeightStack — SurfaceWorld's two height stacks
 #include "VoxelNoise.h"               // VoxelNoise::FBM
+#include "VoxelWormField.h"
 #include "VoxelStrateDefinition.h"    // TerrainOperations — le pool que BuildChunkCache tire par salle
 #include "VoxelTerrainOpDefinition.h" // ApplyTo — l'override d'op PAR SALLE (étape C1)
 #include "VoxelStrateManager.h"       // EvaluateModifierSDF / AnyPassageNearBox
@@ -8540,7 +8541,12 @@ namespace
     {
     public:
         FWormFieldSource(const FStrateGenerationParams& InP, int32 Seed)
-            : P(InP), SeedU((uint32)Seed) {}
+            : P(InP)
+            , SeedU((uint32)Seed)
+            , WormLatticeStep(
+                InP.WormStrength > 0.0f && InP.WormThreshold > 0.0f
+                    ? VoxelWormField::GetLatticeStep() : 0)
+        {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override
@@ -8555,8 +8561,6 @@ namespace
         {
             if (!(P.WormStrength > 0.0f && P.WormThreshold > 0.0f)) { return; }
 
-            const float EffectiveZ = (P.VerticalScale != 1.0f && P.VerticalScale > 0.0f)
-                                   ? (WorldZ / P.VerticalScale) : WorldZ;
             const float CaveSDF = InOut.Sdf;
 
             float NetworkMask = 1.0f;
@@ -8574,25 +8578,14 @@ namespace
 
             if (NetworkMask <= 0.0f) { return; }
 
-            const float WormZFreq = P.WormFrequency * P.WormHorizontalBias;
-
-            const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
-                WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
-                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
-            )) * VOXEL_NOISE_SCALE);
-
-            // N2 ≥ 0, donc si N1 dépasse déjà le seuil la somme ne peut plus creuser — on saute le
-            // second Perlin (le cas courant ; sortie bit-identique). Transcrit tel quel.
-            if (N1 >= P.WormThreshold) { return; }
-
-            const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                WorldX * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
-                WorldY * P.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
-                EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
-            )) * VOXEL_NOISE_SCALE);
-
-            const float WormValue = N1 + N2;
+            const VoxelWormField::FParameters WormParameters{
+                P.WormFrequency,
+                P.WormHorizontalBias,
+                P.VerticalScale,
+                SeedU};
+            const float WormValue = VoxelWormField::Evaluate(
+                WorldX, WorldY, WorldZ, P.WormThreshold,
+                WormParameters, WormLatticeStep);
             if (WormValue < P.WormThreshold)
             {
                 const float t = 1.0f - (WormValue / P.WormThreshold);
@@ -8663,7 +8656,9 @@ namespace
             // explicit count cap keeps this check bounded.  The network mask still uses the SDF
             // interval's worst case, so this never assumes a room value that the preceding source
             // did not prove.
-            if (Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
+            if (VoxelWormField::GetNoiseMode() == 0
+                && WormLatticeStep <= 1
+                && Ctx.bUseLatticeProof && Ctx.bTightenWarpProof && Ctx.Step >= 1
                 && VoxelMath::IsFinite(P.WormFrequency)
                 && VoxelMath::IsFinite(P.WormHorizontalBias)
                 && VoxelMath::IsFinite(P.WormThreshold)
@@ -8783,6 +8778,7 @@ namespace
     private:
         FStrateGenerationParams P;
         uint32 SeedU;
+        int32 WormLatticeStep = 0;
     };
 
 #if WITH_EDITOR
@@ -9738,7 +9734,10 @@ namespace VoxelDensityOps
         OutStack.Add(MakeUnique<FDomeMod>(P, RoomPtr));                  // 4g — dômes
         OutStack.Add(MakeUnique<FPinchMod>(P, RoomPtr));                 // 4h — pincement
         OutStack.Add(MakeUnique<FFloorBiasMod>(P, RoomPtr));             // fin 4h — biais de sol
-        OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
+        if (P.WormStrength > 0.0f && P.WormThreshold > 0.0f)
+        {
+            OutStack.Add(MakeUnique<FWormFieldSource>(P, Seed));
+        }
 
         if (bAppendStructuralPosts)
         {
@@ -10324,6 +10323,14 @@ bool VF_BuildStackFromRecipe(const FVoxelOpStackRecipe& Recipe,
 
     for (const FVoxelOpRecipeEntry& Entry : Recipe.Modifiers)
     {
+        if (Entry.OpClass == EVoxelStrateOpClass::WormFieldSource
+            && !(Params.TunnelNetworkParams.WormStrength > 0.0f
+                 && Params.TunnelNetworkParams.WormThreshold > 0.0f))
+        {
+            // A disabled strate has no worm operator at all. This makes the off switch cheap on
+            // the interpreted path as well as exact in its interval/classifier fold.
+            continue;
+        }
         TUniquePtr<IVoxelDensityOp> Modifier =
             VoxelStrateRecipePrivate::BuildRecipeOp(Entry, Params, Seed, SpineRadius,
                                                     StrateManager, RoomPtr, ShaftPtr);

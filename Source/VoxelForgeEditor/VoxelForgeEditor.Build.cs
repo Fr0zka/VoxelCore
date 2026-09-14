@@ -25,5 +25,12 @@ public class VoxelForgeEditor : ModuleRules
 			"ImageWrapper",
 			"VoxelForge",
 		});
+
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			// DbgHelp is intentionally editor-only: the measured game/sampler process never links
+			// or initializes it. VoxelForgeExplore uses it only in its post-exit symbolizer mode.
+			PublicSystemLibraries.Add("Dbghelp.lib");
+		}
 	}
 }

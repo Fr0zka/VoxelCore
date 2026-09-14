@@ -1,4 +1,5 @@
 #include "VoxelForgeExploreCommandlet.h"
+#include "VoxelStackOfflineSymbolizer.h"
 
 #include "CoreMinimal.h"
 #include "Async/ParallelFor.h"
@@ -32,6 +33,7 @@
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
+#include "VoxelWormField.h"
 #include "VoxelSettings.h"
 #include "VoxelStackSampler.h"
 #include "VoxelStrateDefinition.h"
@@ -265,6 +267,10 @@ struct FExploreArguments
     bool bWalk = true;
     bool bExport = true;
     bool bUseOperatorStack = true;
+    bool bWormsEnabledOverride = false;
+    bool bWormsEnabled = true;
+    bool bWormStrengthOverride = false;
+    float WormStrength = 0.0f;
     bool bProfileDensity = false;
     bool bProfileDensityFull = false;
     bool bPerfAttribution = false;
@@ -364,6 +370,17 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     int32 UseOperatorStack = 1;
     FParse::Value(*Params, TEXT("opstack="), UseOperatorStack);
     OutArguments.bUseOperatorStack = UseOperatorStack != 0;
+    int32 WormsEnabled = 1;
+    if (FParse::Value(*Params, TEXT("wormsenabled="), WormsEnabled))
+    {
+        OutArguments.bWormsEnabledOverride = true;
+        OutArguments.bWormsEnabled = WormsEnabled != 0;
+    }
+    if (Params.Contains(TEXT("wormstrength="), ESearchCase::IgnoreCase)
+        && FParse::Value(*Params, TEXT("wormstrength="), OutArguments.WormStrength))
+    {
+        OutArguments.bWormStrengthOverride = true;
+    }
     OutArguments.bProfileDensity = FParse::Param(*Params, TEXT("profiledensity"));
     OutArguments.bProfileDensityFull = FParse::Param(*Params, TEXT("profiledensityfull"));
     OutArguments.bProfileDensity |= OutArguments.bProfileDensityFull;
@@ -881,6 +898,10 @@ struct FExploreWorld
     int32 ExploreMeshSize = 0;
     int32 ExploreMeshTileCount = 0;
     int32 ExploreMeshTilesCompleted = 0;
+    // Per-tile geometry identity is retained in canonical Z/Y/X order so an optimization can be
+    // compared without treating one aggregate hash or triangle total as a shape measurement.
+    TArray<int32> ExploreTileTriangleCounts;
+    TArray<FString> ExploreTileGeometryHashes;
     double ExploreMeshSeconds = 0.0;
     // Exact wall-clock partition of ExploreMeshSeconds.  The first three fields end at the
     // parallel tile launch; merge closes the mesh clock.  Remainder is intentionally retained
@@ -966,6 +987,16 @@ struct FExploreWorld
             // Explicitly select the production switch so the same synthetic layout, seed and
             // mesher invocation can be measured through both density branches.
             Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
+            if (Arguments.bWormsEnabledOverride)
+            {
+                Definition->bEnableWorms = Arguments.bWormsEnabled;
+            }
+            if (Arguments.bWormStrengthOverride
+                && (Definition->GeneratorType == ECaveGeneratorType::TunnelNetwork
+                    || Definition->GeneratorType == ECaveGeneratorType::Underwater))
+            {
+                Definition->GenerationParams.WormStrength = Arguments.WormStrength;
+            }
 
             const TSoftObjectPtr<UVoxelStrateDefinition> SoftDefinition(Definition);
             Settings->FixedStrates.Add(Index, SoftDefinition);
@@ -1702,6 +1733,8 @@ bool EnsureExploreMesh(
     const int32 TilesPerAxis = Arguments.ExportSize / CHUNK_SIZE;
     World.ExploreMeshTileCount = TilesPerAxis * TilesPerAxis * TilesPerAxis;
     World.ExploreMeshTilesCompleted = 0;
+    World.ExploreTileTriangleCounts.Init(0, World.ExploreMeshTileCount);
+    World.ExploreTileGeometryHashes.SetNum(World.ExploreMeshTileCount);
     World.ExploreMeshOrigin = ChooseExploreMeshOrigin(
         Arguments,
         CameraSeedWalk,
@@ -1812,6 +1845,15 @@ bool EnsureExploreMesh(
                 const int32 OwnerX = LinearOwnerIndex % GridTileCount;
                 const int32 OwnerY = (LinearOwnerIndex / GridTileCount) % GridTileCount;
                 const int32 OwnerZ = LinearOwnerIndex / (GridTileCount * GridTileCount);
+                FIntVector PreviousTileOrigin = FIntVector::ZeroValue;
+                int32 IgnoredPreviousTileStep = 1;
+                int32 PreviousTileCells = 0;
+                VoxelGenLOD::GetThreadTileCacheWindow(
+                    PreviousTileOrigin, IgnoredPreviousTileStep, PreviousTileCells);
+                VoxelGenLOD::SetThreadTileContext(
+                    World.ExploreMeshOrigin
+                        + FIntVector(OwnerX * CHUNK_SIZE, OwnerY * CHUNK_SIZE, OwnerZ * CHUNK_SIZE),
+                    CellsPerTile);
                 // Partition the shared lattice into disjoint rectangular owner regions.  A
                 // boundary sample belongs to exactly one owner; tile windows may read it from
                 // either side.  This keeps the generator's spatial locality while guaranteeing
@@ -1849,6 +1891,7 @@ bool EnsureExploreMesh(
                 }
                 VoxelGenLOD::SetThreadOctaveBias(PreviousOctaveBias);
                 VoxelGenLOD::SetThreadSampleStep(PreviousSampleStep);
+                VoxelGenLOD::SetThreadTileContext(PreviousTileOrigin, PreviousTileCells);
             },
             EParallelForFlags::None);
         World.ExploreDensityGridSeconds = FPlatformTime::Seconds() - DensityGridStartSeconds;
@@ -1988,6 +2031,10 @@ bool EnsureExploreMesh(
             World.ExploreMeshSeconds = FPlatformTime::Seconds() - MeshStartSeconds;
             return false;
         }
+        World.ExploreTileTriangleCounts[CompletedTiles] =
+            TileMeshes[CompletedTiles].Triangles.Num() / 3;
+        World.ExploreTileGeometryHashes[CompletedTiles] =
+            ComputeGeometryHash(TileMeshes[CompletedTiles]);
         World.ExploreMeshTilesCompleted = CompletedTiles + 1;
     }
 
@@ -4145,6 +4192,18 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
+    Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
+    if (Arguments.bWormsEnabledOverride)
+    {
+        Writer->WriteValue(TEXT("worms_enabled"), Arguments.bWormsEnabled);
+    }
+    Writer->WriteValue(TEXT("worm_strength_override"), Arguments.bWormStrengthOverride);
+    if (Arguments.bWormStrengthOverride)
+    {
+        Writer->WriteValue(TEXT("worm_strength"), static_cast<double>(Arguments.WormStrength));
+    }
+    Writer->WriteValue(TEXT("worm_lattice_step"), VoxelWormField::GetLatticeStep());
+    Writer->WriteValue(TEXT("worm_noise_mode"), VoxelWormField::GetNoiseMode());
     WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
     if (Arguments.bRoomMouthRiseOverride)
@@ -4409,6 +4468,18 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
     Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
+    Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
+    if (Arguments.bWormsEnabledOverride)
+    {
+        Writer->WriteValue(TEXT("worms_enabled"), Arguments.bWormsEnabled);
+    }
+    Writer->WriteValue(TEXT("worm_strength_override"), Arguments.bWormStrengthOverride);
+    if (Arguments.bWormStrengthOverride)
+    {
+        Writer->WriteValue(TEXT("worm_strength"), static_cast<double>(Arguments.WormStrength));
+    }
+    Writer->WriteValue(TEXT("worm_lattice_step"), VoxelWormField::GetLatticeStep());
+    Writer->WriteValue(TEXT("worm_noise_mode"), VoxelWormField::GetNoiseMode());
     WriteTunnelFloorOverrides(*Writer, Arguments);
     Writer->WriteValue(TEXT("room_mouth_rise_override"), Arguments.bRoomMouthRiseOverride);
     if (Arguments.bRoomMouthRiseOverride)
@@ -4540,6 +4611,29 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("parallel_wall_seconds"), World.ExploreMeshTaskWallSeconds);
     Writer->WriteValue(TEXT("estimated_launch_overhead_seconds"),
         World.ExploreMeshTaskLaunchOverheadSeconds);
+    Writer->WriteObjectEnd();
+    Writer->WriteObjectStart(TEXT("tile_ledger"));
+    Writer->WriteValue(TEXT("order"), TEXT("z_then_y_then_x"));
+    Writer->WriteValue(TEXT("tile_cells"), CHUNK_SIZE);
+    Writer->WriteValue(TEXT("tile_count"), World.ExploreMeshTileCount);
+    Writer->WriteValue(TEXT("completed_tiles"), World.ExploreMeshTilesCompleted);
+    Writer->WriteArrayStart(TEXT("tiles"));
+    for (int32 TileIndex = 0; TileIndex < World.ExploreMeshTilesCompleted; ++TileIndex)
+    {
+        const int32 TilesPerAxis = Arguments.ExportSize / CHUNK_SIZE;
+        const int32 TileX = TileIndex % TilesPerAxis;
+        const int32 TileY = (TileIndex / TilesPerAxis) % TilesPerAxis;
+        const int32 TileZ = TileIndex / (TilesPerAxis * TilesPerAxis);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("index"), TileIndex);
+        Writer->WriteValue(TEXT("x"), TileX);
+        Writer->WriteValue(TEXT("y"), TileY);
+        Writer->WriteValue(TEXT("z"), TileZ);
+        Writer->WriteValue(TEXT("triangle_count"), World.ExploreTileTriangleCounts[TileIndex]);
+        Writer->WriteValue(TEXT("geometry_hash"), World.ExploreTileGeometryHashes[TileIndex]);
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteArrayEnd();
     Writer->WriteObjectEnd();
     Writer->WriteObjectStart(TEXT("counters"));
     for (int32 Index = 0; Index < VoxelDensityProfile::CounterCount; ++Index)
@@ -6676,6 +6770,29 @@ int32 RunBatch(const FString& Params)
 
 int32 UVoxelForgeExploreCommandlet::Main(const FString& Params)
 {
+    FString SymbolizeCsvPath;
+    if (FParse::Value(*Params, TEXT("symbolizestacks="), SymbolizeCsvPath))
+    {
+        FString SymbolizedOutputPath;
+        FString SymbolPath;
+        FParse::Value(*Params, TEXT("symbolizedout="), SymbolizedOutputPath);
+        FParse::Value(*Params, TEXT("symbolpath="), SymbolPath);
+
+        FString SummaryPath;
+        FString Error;
+        if (!VoxelForgeOfflineStackSymbolizer::Run(
+                SymbolizeCsvPath, SymbolizedOutputPath, SymbolPath, SummaryPath, Error))
+        {
+            UE_LOG(LogTemp, Error, TEXT("[VoxelForgeExplore] offline stack symbolization failed: %s"),
+                *Error);
+            return 2;
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeExplore] offline stack symbolization completed summary=%s"),
+            *SummaryPath);
+        return 0;
+    }
+
     FString BatchPath;
     if (FParse::Value(*Params, TEXT("batch="), BatchPath))
     {

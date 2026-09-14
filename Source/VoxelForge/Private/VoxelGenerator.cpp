@@ -13,6 +13,7 @@
 #include "VoxelDiffLayer.h"
 #include "VoxelBiomeDefinition.h"
 #include "VoxelNoise.h"   // T2.a: float, SIMD-batched gradient-noise core
+#include "VoxelWormField.h"
 #include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
 #include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
@@ -856,6 +857,14 @@ bool VoxelGenLOD::GetThreadTileCacheWindow(
     // falls back to the older bounded window instead of turning one worker into an unbounded bake.
     return Extent > 0 && Extent <= MAX_int32
         && Extent <= static_cast<int64>(CHUNK_SIZE) * 64;
+}
+
+void VoxelGenLOD::SetThreadTileContext(
+    const FIntVector& OriginVoxels,
+    int32 CellsPerAxis)
+{
+    TileOriginVoxels = OriginVoxels;
+    TileCellsPerAxis = CellsPerAxis;
 }
 
 bool VoxelGenLOD::ShouldUseSpatialIndex(bool bFusedPath)
@@ -4239,10 +4248,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // already computed by Step 4 — free): full strength at the network, smooth fade to zero
     // at Range. Worms become braids/shortcuts hugging the cave system; no isolated speckle.
     // Range = 0 → unmasked legacy behaviour. Bonus: fully-masked voxels skip both Perlins.
-    VoxelDensityProfile::FScopedTimer FusedWormTimer(
-        VoxelDensityProfile::EBucket::FusedWorm);
     if (Params.WormStrength > 0.0f && Params.WormThreshold > 0.0f)
     {
+        VoxelDensityProfile::FScopedTimer FusedWormTimer(
+            VoxelDensityProfile::EBucket::FusedWorm);
         float NetworkMask = 1.0f;
         if (Params.WormNetworkRange > 0.0f)
         {
@@ -4267,7 +4276,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
 
             bool bWormBlockProofComputed = false;
-            const bool bSkipWormBlock = GVoxelForgeWormBlockSkip != 0
+            const int32 WormLatticeStep = VoxelWormField::GetLatticeStep();
+            const bool bSkipWormBlock = VoxelWormField::GetNoiseMode() == 0
+                && WormLatticeStep <= 1
+                && GVoxelForgeWormBlockSkip != 0
                 && VF_TryGetWormBlockSkip(
                     DensityCacheOwnerId, SeedU, ParamsFingerprint, LayoutVersion,
                     WorldX, WorldY, WorldZ, Params, bWormBlockProofComputed);
@@ -4286,36 +4298,24 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             }
             else
             {
-                const float WormZFreq = Params.WormFrequency * Params.WormHorizontalBias;
-                const float N1 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                    WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f),
-                    WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f),
-                    EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f)
-                )) * VOXEL_NOISE_SCALE);
+                const VoxelWormField::FParameters WormParameters{
+                    Params.WormFrequency,
+                    Params.WormHorizontalBias,
+                    Params.VerticalScale,
+                    SeedU};
+                const float WormValue = VoxelWormField::Evaluate(
+                    WorldX, WorldY, WorldZ, Params.WormThreshold,
+                    WormParameters, WormLatticeStep);
 
-                // N2 >= 0, so if N1 alone already clears the threshold the sum can't carve —
-                // skip the second Perlin entirely (most voxels; bit-identical output).
-                if (N1 < Params.WormThreshold)
+                if (WormValue < Params.WormThreshold)
                 {
-                    const float N2 = FMath::Abs(VoxelNoise::Perlin3D(FVector3f(
-                        WorldX * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.0f) + 137.0f,
-                        WorldY * Params.WormFrequency + VoxelHash::SeedOffset(SeedU, 1.7f) + 259.0f,
-                        EffectiveZ * WormZFreq + VoxelHash::SeedOffset(SeedU, 2.3f) + 431.0f
-                    )) * VOXEL_NOISE_SCALE);
-
-                    const float WormValue = N1 + N2;
-
-                    if (WormValue < Params.WormThreshold)
-                    {
-                        const float t = 1.0f - (WormValue / Params.WormThreshold);
-                        Density -= t * Params.WormStrength * NetworkMask;
-                    }
+                    const float t = 1.0f - (WormValue / Params.WormThreshold);
+                    Density -= t * Params.WormStrength * NetworkMask;
                 }
             }
         }
+        FusedWormTimer.End();
     }
-
-    FusedWormTimer.End();
 
     //=========================================================================
     // STEP 6: STRATE BOUNDARY SEAL (haut + bas)

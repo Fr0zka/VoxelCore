@@ -4,8 +4,6 @@
 #include "VoxelStackSampler.h"
 
 #include "Containers/Array.h"
-#include "Containers/Map.h"
-#include "Containers/Set.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformStackWalk.h"
@@ -17,6 +15,7 @@
 #include "Math/UnrealMathUtility.h"
 #include "Containers/StringConv.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Serialization/Archive.h"
@@ -24,6 +23,11 @@
 
 #if PLATFORM_WINDOWS
 #include "Windows/WindowsPlatformStackWalk.h"
+#include "Windows/AllowWindowsPlatformTypes.h"
+THIRD_PARTY_INCLUDES_START
+#include <Psapi.h>
+THIRD_PARTY_INCLUDES_END
+#include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
 #include <atomic>
@@ -89,221 +93,219 @@ void WriteUtf8(FArchive& Archive, const FString& Text)
     }
 }
 
-FString NormalizedForClassification(const FString& InValue)
+#if PLATFORM_WINDOWS
+struct FModuleMapRecord
+{
+    FString Path;
+    uint64 LoadBase = 0;
+    uint32 ImageSize = 0;
+    uint64 FileSize = 0;
+    uint64 LastWriteFileTime = 0;
+    FString PdbGuid;
+    uint32 PdbAge = 0;
+    FString PdbPath;
+};
+
+FString ModuleMapField(const FString& InValue)
 {
     FString Result = InValue;
-    Result.ToLowerInline();
-    Result.ReplaceInline(TEXT("\\"), TEXT("/"));
+    Result.ReplaceInline(TEXT("\t"), TEXT(" "));
+    Result.ReplaceInline(TEXT("\r"), TEXT(" "));
+    Result.ReplaceInline(TEXT("\n"), TEXT(" "));
     return Result;
 }
 
-struct FResolvedSymbol
+bool IsModuleImageRangeValid(uint32 Offset, uint64 Size, uint32 ImageSize)
 {
-    FString Module;
-    FString Function;
-    FString File;
-    int32 Line = 0;
-    bool bInline = false;
-};
-
-struct FResolvedProgramCounter
-{
-    bool bAttempted = false;
-    TArray<FResolvedSymbol> Symbols;
-};
-
-struct FProfileRow
-{
-    FString Key;
-    FString Function;
-    FString Module;
-    FString File;
-    FString Label;
-    int32 Line = 0;
-    uint64 Samples = 0;
-};
-
-struct FProfileAggregateSet
-{
-    TMap<FString, FProfileRow> ExclusiveFunctions;
-    TMap<FString, FProfileRow> InclusiveFunctions;
-    TMap<FString, FProfileRow> ExclusiveLines;
-    uint64 SamplesWithStack = 0;
-};
-
-const FResolvedSymbol* FirstFunctionSymbol(const FResolvedProgramCounter& Entry)
-{
-    for (const FResolvedSymbol& Symbol : Entry.Symbols)
-    {
-        if (!Symbol.Function.IsEmpty())
-        {
-            return &Symbol;
-        }
-    }
-    return nullptr;
+    return Offset <= ImageSize && Size <= static_cast<uint64>(ImageSize - Offset);
 }
 
-const FResolvedSymbol* FirstSourceSymbol(const FResolvedProgramCounter& Entry)
+void ReadModuleCodeViewIdentity(
+    FModuleMapRecord& Record, const uint8* ModuleBase, uint32 ImageSize)
 {
-    for (const FResolvedSymbol& Symbol : Entry.Symbols)
-    {
-        if (!Symbol.File.IsEmpty() && Symbol.Line > 0)
-        {
-            return &Symbol;
-        }
-    }
-    return nullptr;
-}
-
-FString SymbolLabel(const FResolvedSymbol& Symbol)
-{
-    if (Symbol.Function.IsEmpty())
-    {
-        return TEXT("unknown");
-    }
-
-    const FString FunctionLower = NormalizedForClassification(Symbol.Function);
-    if (FunctionLower.Contains(TEXT("std::")))
-    {
-        return TEXT("std");
-    }
-
-    const FString ModuleLower = NormalizedForClassification(Symbol.Module);
-    const FString FileLower = NormalizedForClassification(Symbol.File);
-    const bool bFileIsEngine = FileLower.Contains(TEXT("/engine/"));
-    if (bFileIsEngine)
-    {
-        return TEXT("engine");
-    }
-
-    const bool bVoxelForge = FunctionLower.Contains(TEXT("voxelforge"))
-        || FileLower.Contains(TEXT("/voxelforge/"))
-        || ModuleLower.Contains(TEXT("voxelforge"));
-    if (bVoxelForge)
-    {
-        return TEXT("plugin");
-    }
-
-    const bool bModuleIsEngine = ModuleLower.StartsWith(TEXT("unrealeditor-"))
-        || ModuleLower.StartsWith(TEXT("ue5-"));
-    return bModuleIsEngine ? TEXT("engine") : TEXT("other");
-}
-
-bool IsWaitLike(const FResolvedSymbol& Symbol)
-{
-    const FString FunctionLower = NormalizedForClassification(Symbol.Function);
-    return FunctionLower.Contains(TEXT("wait"))
-        || FunctionLower.Contains(TEXT("sleep"))
-        || FunctionLower.Contains(TEXT("semaphore"))
-        || FunctionLower.Contains(TEXT("fevent"));
-}
-
-FString FunctionKey(const FResolvedSymbol& Symbol)
-{
-    return SymbolLabel(Symbol) + TEXT("\x1f") + Symbol.Function;
-}
-
-FString SourceKey(const FResolvedSymbol* Symbol)
-{
-    if (Symbol == nullptr || Symbol->File.IsEmpty() || Symbol->Line <= 0)
-    {
-        return TEXT("unknown\x1f<unknown>");
-    }
-    return SymbolLabel(*Symbol) + TEXT("\x1f")
-        + FString::Printf(TEXT("%s:%d"), *Symbol->File, Symbol->Line);
-}
-
-void AddFunctionRow(
-    TMap<FString, FProfileRow>& Rows,
-    const FResolvedSymbol* Symbol,
-    uint64 SampleCount)
-{
-    if (Symbol == nullptr || Symbol->Function.IsEmpty())
+    if (ModuleBase == nullptr || ImageSize < sizeof(IMAGE_DOS_HEADER))
     {
         return;
     }
-    const FString Key = FunctionKey(*Symbol);
-    FProfileRow& Row = Rows.FindOrAdd(Key);
-    if (Row.Key.IsEmpty())
+
+    const IMAGE_DOS_HEADER* DosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ModuleBase);
+    if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE || DosHeader->e_lfanew < 0)
     {
-        Row.Key = Key;
-        Row.Function = Symbol->Function;
-        Row.Module = Symbol->Module;
-        Row.File = Symbol->File;
-        Row.Line = Symbol->Line;
-        Row.Label = SymbolLabel(*Symbol);
+        return;
     }
-    Row.Samples += SampleCount;
+
+    const uint32 NtOffset = static_cast<uint32>(DosHeader->e_lfanew);
+    if (!IsModuleImageRangeValid(NtOffset, sizeof(IMAGE_NT_HEADERS), ImageSize))
+    {
+        return;
+    }
+    const IMAGE_NT_HEADERS* NtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        ModuleBase + NtOffset);
+    if (NtHeaders->Signature != IMAGE_NT_SIGNATURE
+        || NtHeaders->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+    {
+        return;
+    }
+
+    const IMAGE_DATA_DIRECTORY& DebugDirectory =
+        NtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if (DebugDirectory.VirtualAddress == 0
+        || DebugDirectory.Size < sizeof(IMAGE_DEBUG_DIRECTORY)
+        || !IsModuleImageRangeValid(
+            DebugDirectory.VirtualAddress, DebugDirectory.Size, ImageSize))
+    {
+        return;
+    }
+
+    const IMAGE_DEBUG_DIRECTORY* Entries = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(
+        ModuleBase + DebugDirectory.VirtualAddress);
+    const uint32 EntryCount = DebugDirectory.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+    for (uint32 Index = 0; Index < EntryCount; ++Index)
+    {
+        const IMAGE_DEBUG_DIRECTORY& Entry = Entries[Index];
+        if (Entry.Type != IMAGE_DEBUG_TYPE_CODEVIEW || Entry.SizeOfData < 24
+            || Entry.AddressOfRawData == 0
+            || !IsModuleImageRangeValid(
+                Entry.AddressOfRawData, Entry.SizeOfData, ImageSize))
+        {
+            continue;
+        }
+
+        const uint8* CodeView = ModuleBase + Entry.AddressOfRawData;
+        if (CodeView[0] != 'R' || CodeView[1] != 'S'
+            || CodeView[2] != 'D' || CodeView[3] != 'S')
+        {
+            continue;
+        }
+
+        FGuid Guid;
+        FMemory::Memcpy(&Guid, CodeView + 4, sizeof(Guid));
+        Record.PdbGuid = Guid.ToString();
+        FMemory::Memcpy(&Record.PdbAge, CodeView + 20, sizeof(Record.PdbAge));
+
+        const uint32 PdbPathBytes = Entry.SizeOfData - 24;
+        if (PdbPathBytes > 0)
+        {
+            const ANSICHAR* PdbPathAnsi = reinterpret_cast<const ANSICHAR*>(CodeView + 24);
+            int32 Length = 0;
+            while (Length < static_cast<int32>(PdbPathBytes) && PdbPathAnsi[Length] != '\0')
+            {
+                ++Length;
+            }
+            if (Length > 0)
+            {
+                FUTF8ToTCHAR PdbPathUtf8(PdbPathAnsi, Length);
+                Record.PdbPath = FString(PdbPathUtf8.Get());
+            }
+        }
+        return;
+    }
 }
 
-void AddSourceRow(
-    TMap<FString, FProfileRow>& Rows,
-    const FResolvedSymbol* FunctionSymbol,
-    const FResolvedSymbol* SourceSymbol)
+bool CollectProcessModuleMap(TArray<FModuleMapRecord>& OutRecords, FString& OutError)
 {
-    const FString Key = SourceKey(SourceSymbol);
-    FProfileRow& Row = Rows.FindOrAdd(Key);
-    if (Row.Key.IsEmpty())
-    {
-        Row.Key = Key;
-        Row.Label = SourceSymbol != nullptr ? SymbolLabel(*SourceSymbol) : TEXT("unknown");
-        Row.File = SourceSymbol != nullptr ? SourceSymbol->File : TEXT("<unknown>");
-        Row.Line = SourceSymbol != nullptr ? SourceSymbol->Line : 0;
-        Row.Function = FunctionSymbol != nullptr ? FunctionSymbol->Function : TEXT("<unknown>");
-        Row.Module = FunctionSymbol != nullptr ? FunctionSymbol->Module : TEXT("<unknown>");
-    }
-    ++Row.Samples;
-}
+    OutRecords.Reset();
+    OutError.Reset();
 
-TArray<FProfileRow> SortedRows(const TMap<FString, FProfileRow>& InRows)
-{
-    TArray<FProfileRow> Rows;
-    Rows.Reserve(InRows.Num());
-    for (const TPair<FString, FProfileRow>& Pair : InRows)
+    // Keep PSAPI dynamic, like the engine stack-walk implementation. This records module state
+    // without touching DbgHelp or the process-global symbol engine.
+    void* PsapiHandle = FPlatformProcess::GetDllHandle(TEXT("PSAPI.DLL"));
+    if (PsapiHandle == nullptr)
     {
-        Rows.Add(Pair.Value);
+        OutError = TEXT("PSAPI.DLL could not be loaded");
+        return false;
     }
-    Rows.Sort([](const FProfileRow& A, const FProfileRow& B)
+
+    using FEnumProcessModules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    using FGetModuleFileNameExW = DWORD (WINAPI*)(HANDLE, HMODULE, LPWSTR, DWORD);
+    using FGetModuleInformation = BOOL (WINAPI*)(HANDLE, HMODULE, LPMODULEINFO, DWORD);
+
+    const FEnumProcessModules EnumModules = reinterpret_cast<FEnumProcessModules>(
+        FPlatformProcess::GetDllExport(PsapiHandle, TEXT("EnumProcessModules")));
+    const FGetModuleFileNameExW GetModuleFileNameEx = reinterpret_cast<FGetModuleFileNameExW>(
+        FPlatformProcess::GetDllExport(PsapiHandle, TEXT("GetModuleFileNameExW")));
+    const FGetModuleInformation GetModuleInformation = reinterpret_cast<FGetModuleInformation>(
+        FPlatformProcess::GetDllExport(PsapiHandle, TEXT("GetModuleInformation")));
+    if (EnumModules == nullptr || GetModuleFileNameEx == nullptr || GetModuleInformation == nullptr)
     {
-        return A.Samples != B.Samples ? A.Samples > B.Samples : A.Key < B.Key;
+        OutError = TEXT("PSAPI exports needed for module enumeration are unavailable");
+        FPlatformProcess::FreeDllHandle(PsapiHandle);
+        return false;
+    }
+
+    DWORD BytesRequired = 0;
+    EnumModules(GetCurrentProcess(), nullptr, 0, &BytesRequired);
+    if (BytesRequired == 0)
+    {
+        OutError = TEXT("EnumProcessModules returned no module bytes");
+        FPlatformProcess::FreeDllHandle(PsapiHandle);
+        return false;
+    }
+
+    TArray<HMODULE> Modules;
+    Modules.SetNumUninitialized(
+        FMath::Max<int32>(1, static_cast<int32>(BytesRequired / sizeof(HMODULE) + 1)));
+    DWORD BytesWritten = 0;
+    if (!EnumModules(
+            GetCurrentProcess(), Modules.GetData(),
+            static_cast<DWORD>(Modules.Num() * sizeof(HMODULE)), &BytesWritten))
+    {
+        OutError = TEXT("EnumProcessModules failed");
+        FPlatformProcess::FreeDllHandle(PsapiHandle);
+        return false;
+    }
+
+    const int32 ModuleCount = FMath::Min<int32>(
+        Modules.Num(), static_cast<int32>(BytesWritten / sizeof(HMODULE)));
+    for (int32 Index = 0; Index < ModuleCount; ++Index)
+    {
+        MODULEINFO ModuleInfo{};
+        if (!GetModuleInformation(
+                GetCurrentProcess(), Modules[Index], &ModuleInfo, sizeof(ModuleInfo)))
+        {
+            continue;
+        }
+
+        WCHAR ImagePath[32768] = {};
+        const DWORD PathLength = GetModuleFileNameEx(
+            GetCurrentProcess(), Modules[Index], ImagePath, UE_ARRAY_COUNT(ImagePath));
+        if (PathLength == 0)
+        {
+            continue;
+        }
+
+        FModuleMapRecord Record;
+        Record.Path = FString(ImagePath, static_cast<int32>(PathLength));
+        Record.LoadBase = reinterpret_cast<uint64>(ModuleInfo.lpBaseOfDll);
+        Record.ImageSize = static_cast<uint32>(ModuleInfo.SizeOfImage);
+
+        WIN32_FILE_ATTRIBUTE_DATA FileData{};
+        if (GetFileAttributesExW(*Record.Path, GetFileExInfoStandard, &FileData))
+        {
+            ULARGE_INTEGER FileSize;
+            FileSize.HighPart = FileData.nFileSizeHigh;
+            FileSize.LowPart = FileData.nFileSizeLow;
+            Record.FileSize = FileSize.QuadPart;
+            ULARGE_INTEGER LastWrite;
+            LastWrite.HighPart = FileData.ftLastWriteTime.dwHighDateTime;
+            LastWrite.LowPart = FileData.ftLastWriteTime.dwLowDateTime;
+            Record.LastWriteFileTime = LastWrite.QuadPart;
+        }
+
+        ReadModuleCodeViewIdentity(
+            Record, reinterpret_cast<const uint8*>(ModuleInfo.lpBaseOfDll), Record.ImageSize);
+        OutRecords.Add(MoveTemp(Record));
+    }
+
+    OutRecords.Sort([](const FModuleMapRecord& A, const FModuleMapRecord& B)
+    {
+        return A.LoadBase < B.LoadBase;
     });
-    return Rows;
+    FPlatformProcess::FreeDllHandle(PsapiHandle);
+    return OutRecords.Num() > 0;
 }
+#endif
 
-void AppendRows(
-    FString& Out,
-    const TCHAR* Title,
-    const TMap<FString, FProfileRow>& InRows,
-    uint64 Denominator,
-    int32 MaxRows)
-{
-    Out += TEXT("\n");
-    Out += Title;
-    Out += TEXT("\nrank\tsamples\tpercent\tlabel\tfunction\tmodule\tfile\tline\n");
-    const TArray<FProfileRow> Rows = SortedRows(InRows);
-    const int32 Count = FMath::Min(MaxRows, Rows.Num());
-    for (int32 Index = 0; Index < Count; ++Index)
-    {
-        const FProfileRow& Row = Rows[Index];
-        const double Percent = Denominator > 0
-            ? static_cast<double>(Row.Samples) * 100.0 / static_cast<double>(Denominator)
-            : 0.0;
-        Out.Appendf(
-            TEXT("%d\t%llu\t%.4f\t%s\t%s\t%s\t%s\t%d\n"),
-            Index + 1,
-            static_cast<unsigned long long>(Row.Samples),
-            Percent,
-            *Row.Label,
-            *Row.Function,
-            *Row.Module,
-            *Row.File,
-            Row.Line);
-    }
-    if (Rows.Num() == 0)
-    {
-        Out += TEXT("(no rows)\n");
-    }
-}
 }
 
 struct FVoxelStackSampler::FImpl final : public FRunnable
@@ -322,6 +324,7 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
     FString RunLabel;
     FString OutputDirectory;
     FString RawSamplesPath;
+    FString ModuleMapPath;
     FString SummaryPath;
     double StartSeconds = 0.0;
     std::atomic<bool> bStop{false};
@@ -360,6 +363,9 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
         RawSamplesPath = FPaths::Combine(
             OutputDirectory,
             FString::Printf(TEXT("VoxelStackSamples_%s_%u.csv"), *SafeLabel, ProcessId));
+        ModuleMapPath = FPaths::Combine(
+            OutputDirectory,
+            FString::Printf(TEXT("VoxelStackModules_%s_%u.tsv"), *SafeLabel, ProcessId));
         SummaryPath = FPaths::Combine(
             OutputDirectory,
             FString::Printf(TEXT("VoxelStackSummary_%s_%u.txt"), *SafeLabel, ProcessId));
@@ -622,10 +628,12 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
         Result.MaxActiveRegisteredThreads = MaxActiveRegisteredThreads;
         Result.RunLabel = RunLabel;
         Result.RawSamplesPath = RawSamplesPath;
+        Result.ModuleMapPath = ModuleMapPath;
         Result.SummaryPath = SummaryPath;
         Result.RunSeconds = FPlatformTime::Seconds() - StartSeconds;
 
         WriteRawSamples(Result);
+        WriteModuleMap(Result);
         // Do not call the DbgHelp-backed symbolizer from the measured process. DbgHelp is a
         // process-global state machine and can fault during shutdown even after the sampler
         // thread has joined. The raw PCs remain available for a separate offline pass.
@@ -672,6 +680,48 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
         Result.bOutputWritten = true;
     }
 
+    void WriteModuleMap(FSummary& Result)
+    {
+#if PLATFORM_WINDOWS
+        TArray<FModuleMapRecord> Records;
+        FString CollectionError;
+        const bool bCollected = CollectProcessModuleMap(Records, CollectionError);
+
+        FArchive* Archive = IFileManager::Get().CreateFileWriter(*ModuleMapPath);
+        if (Archive == nullptr)
+        {
+            return;
+        }
+
+        WriteUtf8(*Archive, TEXT("# VoxelForge module map v1\n"));
+        WriteUtf8(*Archive, TEXT("# DbgHelp is not initialized by this artifact writer.\n"));
+        WriteUtf8(*Archive, TEXT("module_path\tload_base_hex\timage_size\tfile_size\tfile_last_write_filetime\tpdb_guid\tpdb_age\tpdb_path\n"));
+        if (!bCollected)
+        {
+            WriteUtf8(*Archive, FString::Printf(TEXT("# collection_error\t%s\n"), *CollectionError));
+        }
+        for (const FModuleMapRecord& Record : Records)
+        {
+            const FString Line = FString::Printf(
+                TEXT("%s\t0x%016llX\t%u\t%llu\t%llu\t%s\t%u\t%s\n"),
+                *ModuleMapField(Record.Path),
+                static_cast<unsigned long long>(Record.LoadBase),
+                Record.ImageSize,
+                static_cast<unsigned long long>(Record.FileSize),
+                static_cast<unsigned long long>(Record.LastWriteFileTime),
+                *ModuleMapField(Record.PdbGuid),
+                Record.PdbAge,
+                *ModuleMapField(Record.PdbPath));
+            WriteUtf8(*Archive, Line);
+        }
+        delete Archive;
+        Result.ModuleCount = static_cast<uint64>(Records.Num());
+        Result.bModuleMapWritten = true;
+#else
+        (void)Result;
+#endif
+    }
+
     void WriteRawOnlySummary(FSummary& Result)
     {
         uint64 SamplesWithStack = 0;
@@ -691,6 +741,10 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
         Summary += TEXT("raw_only: yes\n");
         Summary += TEXT("symbolization: deferred\n");
         Summary += TEXT("dbghelp_in_measured_process: no\n");
+        Summary.Appendf(TEXT("module_map_written: %s\n"),
+            Result.bModuleMapWritten ? TEXT("yes") : TEXT("no"));
+        Summary.Appendf(TEXT("module_count: %llu\n"),
+            static_cast<unsigned long long>(Result.ModuleCount));
         Summary.Appendf(TEXT("interval_us: %u\n"), IntervalUs);
         Summary.Appendf(TEXT("max_stack_depth: %u\n"), MaxStackDepth);
         Summary.Appendf(TEXT("max_stored_samples: %u\n"), MaxStoredSamples);
@@ -716,6 +770,7 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
             static_cast<unsigned long long>(MaxActiveRegisteredThreads));
         Summary.Appendf(TEXT("run_seconds: %.6f\n"), Result.RunSeconds);
         Summary.Appendf(TEXT("raw_samples_path: %s\n"), *RawSamplesPath);
+        Summary.Appendf(TEXT("module_map_path: %s\n"), *ModuleMapPath);
         Summary += TEXT("\nThe target process records bounded raw PCs only; resolve symbols after the process exits.\n");
 
         if (FFileHelper::SaveStringToFile(
@@ -727,300 +782,7 @@ struct FVoxelStackSampler::FImpl final : public FRunnable
         }
     }
 
-    void ResolveProgramCounter(
-        uint64 ProgramCounter,
-        TMap<uint64, FResolvedProgramCounter>& SymbolCache,
-        FSummary& Result)
-    {
-        FResolvedProgramCounter& Entry = SymbolCache.FindOrAdd(ProgramCounter);
-        if (Entry.bAttempted)
-        {
-            return;
-        }
-        Entry.bAttempted = true;
 
-#if PLATFORM_WINDOWS
-        FPlatformStackWalk::EnumerateSymbolInfosForProgramCounter(
-            ProgramCounter,
-            true,
-            [&Entry, &Result](FProgramCounterSymbolInfo& Info)
-            {
-                FResolvedSymbol Symbol;
-                Symbol.Module = FString(ANSI_TO_TCHAR(Info.ModuleName));
-                Symbol.Function = FString(ANSI_TO_TCHAR(Info.FunctionName));
-                Symbol.File = FString(ANSI_TO_TCHAR(Info.Filename));
-                Symbol.Line = Info.LineNumber;
-                Symbol.bInline = Symbol.Function.StartsWith(TEXT("[Inline Frame]"));
-                if (Symbol.bInline)
-                {
-                    ++Result.InlineSymbols;
-                }
-                Entry.Symbols.Add(MoveTemp(Symbol));
-            });
-        // DbgHelp can return source-only inline records for a PC. Ask the ordinary resolver as
-        // well when none of the enumerated records has a function name, so an unresolved frame
-        // does not hide an available outer function symbol.
-        if (Entry.Symbols.Num() == 0 || FirstFunctionSymbol(Entry) == nullptr)
-        {
-            FProgramCounterSymbolInfo Info;
-            FPlatformStackWalk::ProgramCounterToSymbolInfo(ProgramCounter, Info);
-            FResolvedSymbol Symbol;
-            Symbol.Module = FString(ANSI_TO_TCHAR(Info.ModuleName));
-            Symbol.Function = FString(ANSI_TO_TCHAR(Info.FunctionName));
-            Symbol.File = FString(ANSI_TO_TCHAR(Info.Filename));
-            Symbol.Line = Info.LineNumber;
-            Entry.Symbols.Add(MoveTemp(Symbol));
-        }
-#else
-        (void)ProgramCounter;
-        (void)Result;
-#endif
-    }
-
-    void SymbolizeAndWriteSummary(FSummary& Result)
-    {
-        TMap<uint64, FResolvedProgramCounter> SymbolCache;
-        FProfileAggregateSet AllAggregates;
-        FProfileAggregateSet Lod0Aggregates;
-        FProfileAggregateSet Lod1PlusAggregates;
-        TSet<FString> SeenFunctions;
-        uint64 ResolvedFrames = 0;
-        uint64 UnknownFrames = 0;
-        uint64 WaitLikeFrames = 0;
-        uint64 SamplesWithResolvedLeaf = 0;
-        uint64 SamplesWithWaitLikeFrame = 0;
-        uint64 SamplesWithStack = 0;
-        uint64 UntaggedSamples = 0;
-
-        auto AddUnknownExclusiveRow = [](FProfileAggregateSet& Aggregate)
-        {
-            const FString UnknownKey = TEXT("unknown\x1f<unknown>");
-            FProfileRow& UnknownRow = Aggregate.ExclusiveFunctions.FindOrAdd(UnknownKey);
-            if (UnknownRow.Key.IsEmpty())
-            {
-                UnknownRow.Key = UnknownKey;
-                UnknownRow.Function = TEXT("<unknown>");
-                UnknownRow.Module = TEXT("<unknown>");
-                UnknownRow.File = TEXT("<unknown>");
-                UnknownRow.Label = TEXT("unknown");
-            }
-            ++UnknownRow.Samples;
-        };
-
-        for (uint32 SampleIndex = 0; SampleIndex < StoredSampleCount; ++SampleIndex)
-        {
-            const FStoredSample& Sample = Samples[SampleIndex];
-            if (Sample.Depth == 0)
-            {
-                continue;
-            }
-            ++SamplesWithStack;
-            SeenFunctions.Reset();
-            TArray<FResolvedSymbol> SampleFunctions;
-
-            const FResolvedProgramCounter* LeafEntry = nullptr;
-            const FResolvedSymbol* LeafFunction = nullptr;
-            const FResolvedSymbol* LeafSource = nullptr;
-            uint64 LeafProgramCounter = 0;
-            bool bHasLeafProgramCounter = false;
-            bool bSampleHasResolvedLeaf = false;
-            bool bSampleHasWaitLike = false;
-
-            for (uint32 FrameIndex = 0; FrameIndex < Sample.Depth; ++FrameIndex)
-            {
-                const uint64 ProgramCounter = Sample.ProgramCounters[FrameIndex];
-                ResolveProgramCounter(ProgramCounter, SymbolCache, Result);
-                const FResolvedProgramCounter* Entry = SymbolCache.Find(ProgramCounter);
-                const FResolvedSymbol* FrameFunction = Entry != nullptr
-                    ? FirstFunctionSymbol(*Entry) : nullptr;
-                if (FrameFunction != nullptr)
-                {
-                    ++ResolvedFrames;
-                    if (IsWaitLike(*FrameFunction))
-                    {
-                        ++WaitLikeFrames;
-                        bSampleHasWaitLike = true;
-                    }
-                    if (FrameIndex == 0)
-                    {
-                        LeafProgramCounter = ProgramCounter;
-                        bHasLeafProgramCounter = true;
-                        bSampleHasResolvedLeaf = true;
-                    }
-                }
-                else
-                {
-                    ++UnknownFrames;
-                }
-
-                if (Entry != nullptr)
-                {
-                    if (FrameIndex == 0)
-                    {
-                        LeafProgramCounter = ProgramCounter;
-                        bHasLeafProgramCounter = true;
-                    }
-                    for (const FResolvedSymbol& Symbol : Entry->Symbols)
-                    {
-                        if (Symbol.Function.IsEmpty())
-                        {
-                            continue;
-                        }
-                        const FString Key = FunctionKey(Symbol);
-                        if (!SeenFunctions.Contains(Key))
-                        {
-                            SeenFunctions.Add(Key);
-                            SampleFunctions.Add(Symbol);
-                        }
-                    }
-                }
-            }
-
-            // SymbolCache is a TMap. FindOrAdd while resolving later frames may rehash it, so
-            // pointers captured during the loop are not stable. Re-find the leaf only after all
-            // PCs for this sample have been inserted.
-            if (bHasLeafProgramCounter)
-            {
-                LeafEntry = SymbolCache.Find(LeafProgramCounter);
-                if (LeafEntry != nullptr)
-                {
-                    LeafFunction = FirstFunctionSymbol(*LeafEntry);
-                    LeafSource = FirstSourceSymbol(*LeafEntry);
-                }
-            }
-
-            auto AddToAggregate = [&](FProfileAggregateSet& Aggregate)
-            {
-                ++Aggregate.SamplesWithStack;
-                if (bSampleHasResolvedLeaf)
-                {
-                    AddFunctionRow(Aggregate.ExclusiveFunctions, LeafFunction, 1);
-                }
-                else
-                {
-                    AddUnknownExclusiveRow(Aggregate);
-                }
-                for (const FResolvedSymbol& Symbol : SampleFunctions)
-                {
-                    AddFunctionRow(Aggregate.InclusiveFunctions, &Symbol, 1);
-                }
-                AddSourceRow(Aggregate.ExclusiveLines, LeafFunction, LeafSource);
-            };
-
-            AddToAggregate(AllAggregates);
-            if (Sample.LODLevel == 0)
-            {
-                AddToAggregate(Lod0Aggregates);
-            }
-            else if (Sample.LODLevel >= 1)
-            {
-                AddToAggregate(Lod1PlusAggregates);
-            }
-            else
-            {
-                ++UntaggedSamples;
-            }
-
-            if (bSampleHasResolvedLeaf)
-            {
-                ++SamplesWithResolvedLeaf;
-            }
-            if (bSampleHasWaitLike)
-            {
-                ++SamplesWithWaitLikeFrame;
-            }
-        }
-
-        Result.UniqueProgramCounters = SymbolCache.Num();
-        Result.ResolvedFrames = ResolvedFrames;
-        Result.UnknownFrames = UnknownFrames;
-        Result.WaitLikeFrames = WaitLikeFrames;
-        Result.SamplesWithResolvedLeaf = SamplesWithResolvedLeaf;
-        Result.SamplesWithWaitLikeFrame = SamplesWithWaitLikeFrame;
-
-        FString Summary;
-        Summary += TEXT("VoxelForge in-process stack sampler\n");
-        Summary += TEXT("==================================\n");
-        Summary.Appendf(TEXT("run_label: %s\n"), *RunLabel);
-        Summary.Appendf(TEXT("supported: %s\n"), Result.bSupported ? TEXT("yes") : TEXT("no"));
-        Summary.Appendf(TEXT("stack_walking_initialized: %s\n"),
-            Result.bStackWalkingInitialized ? TEXT("yes") : TEXT("no"));
-        Summary.Appendf(TEXT("interval_us: %u\n"), IntervalUs);
-        Summary.Appendf(TEXT("max_stack_depth: %u\n"), MaxStackDepth);
-        Summary.Appendf(TEXT("max_stored_samples: %u\n"), MaxStoredSamples);
-        Summary.Appendf(TEXT("sampler_ticks: %llu\n"),
-            static_cast<unsigned long long>(SamplerTicks));
-        Summary.Appendf(TEXT("capture_attempts: %llu\n"),
-            static_cast<unsigned long long>(CaptureAttempts));
-        Summary.Appendf(TEXT("registered_thread_samples: %llu\n"),
-            static_cast<unsigned long long>(RegisteredThreadSamples));
-        Summary.Appendf(TEXT("registration_race_drops: %llu\n"),
-            static_cast<unsigned long long>(RegistrationRaceDrops));
-        Summary.Appendf(TEXT("capture_failures: %llu\n"),
-            static_cast<unsigned long long>(CaptureFailures));
-        Summary.Appendf(TEXT("retained_samples: %llu\n"),
-            static_cast<unsigned long long>(StoredSampleCount));
-        Summary.Appendf(TEXT("dropped_samples_after_bound: %llu\n"),
-            static_cast<unsigned long long>(DroppedSamples));
-        Summary.Appendf(TEXT("samples_with_stack: %llu\n"),
-            static_cast<unsigned long long>(SamplesWithStack));
-        Summary.Appendf(TEXT("lod0_samples_with_stack: %llu\n"),
-            static_cast<unsigned long long>(Lod0Aggregates.SamplesWithStack));
-        Summary.Appendf(TEXT("lod1plus_samples_with_stack: %llu\n"),
-            static_cast<unsigned long long>(Lod1PlusAggregates.SamplesWithStack));
-        Summary.Appendf(TEXT("untagged_samples: %llu\n"),
-            static_cast<unsigned long long>(UntaggedSamples));
-        Summary.Appendf(TEXT("total_frames: %llu\n"),
-            static_cast<unsigned long long>(TotalFrames));
-        Summary.Appendf(TEXT("resolved_frames: %llu\n"),
-            static_cast<unsigned long long>(ResolvedFrames));
-        Summary.Appendf(TEXT("unknown_frames: %llu\n"),
-            static_cast<unsigned long long>(UnknownFrames));
-        Summary.Appendf(TEXT("wait_like_frames: %llu\n"),
-            static_cast<unsigned long long>(WaitLikeFrames));
-        Summary.Appendf(TEXT("samples_with_resolved_leaf: %llu\n"),
-            static_cast<unsigned long long>(SamplesWithResolvedLeaf));
-        Summary.Appendf(TEXT("samples_with_wait_like_frame: %llu\n"),
-            static_cast<unsigned long long>(SamplesWithWaitLikeFrame));
-        Summary.Appendf(TEXT("unique_program_counters: %llu\n"),
-            static_cast<unsigned long long>(Result.UniqueProgramCounters));
-        Summary.Appendf(TEXT("inline_symbols: %llu\n"),
-            static_cast<unsigned long long>(Result.InlineSymbols));
-        Summary.Appendf(TEXT("max_active_registered_threads: %llu\n"),
-            static_cast<unsigned long long>(MaxActiveRegisteredThreads));
-        Summary.Appendf(TEXT("run_seconds: %.6f\n"), Result.RunSeconds);
-        Summary += TEXT("\nClosure uses stable registration snapshots. Top-table percentages use retained samples with a non-empty stack; the raw CSV includes zero-depth captures.\n");
-        Summary.Appendf(TEXT("resolved_frame_fraction: %.6f\n"), TotalFrames > 0
-            ? static_cast<double>(ResolvedFrames) / static_cast<double>(TotalFrames) : 0.0);
-        Summary.Appendf(TEXT("unknown_frame_fraction: %.6f\n"), TotalFrames > 0
-            ? static_cast<double>(UnknownFrames) / static_cast<double>(TotalFrames) : 0.0);
-        Summary.Appendf(TEXT("wait_like_frame_fraction: %.6f\n"), TotalFrames > 0
-            ? static_cast<double>(WaitLikeFrames) / static_cast<double>(TotalFrames) : 0.0);
-        Summary.Appendf(TEXT("resolved_leaf_fraction: %.6f\n"), SamplesWithStack > 0
-            ? static_cast<double>(SamplesWithResolvedLeaf) / static_cast<double>(SamplesWithStack) : 0.0);
-        Summary.Appendf(TEXT("wait_like_sample_fraction: %.6f\n"), SamplesWithStack > 0
-            ? static_cast<double>(SamplesWithWaitLikeFrame) / static_cast<double>(SamplesWithStack) : 0.0);
-        Summary += TEXT("\nLabels: plugin = VoxelForge, engine = Unreal/Engine, std = std:: frames, other = other resolved modules, unknown = no function symbol. Inline symbol callbacks were requested through DbgHelp when available.\n");
-        AppendRows(Summary, TEXT("Top 30 exclusive functions (leaf)"), AllAggregates.ExclusiveFunctions, SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("Top 30 inclusive functions (once per sample)"), AllAggregates.InclusiveFunctions, SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("Top 30 exclusive source lines (leaf source)"), AllAggregates.ExclusiveLines, SamplesWithStack, 30);
-        Summary += TEXT("\nLOD0 tables (floor)\n");
-        AppendRows(Summary, TEXT("LOD0 top 30 exclusive functions (leaf)"), Lod0Aggregates.ExclusiveFunctions, Lod0Aggregates.SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("LOD0 top 30 inclusive functions (once per sample)"), Lod0Aggregates.InclusiveFunctions, Lod0Aggregates.SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("LOD0 top 30 exclusive source lines (leaf source)"), Lod0Aggregates.ExclusiveLines, Lod0Aggregates.SamplesWithStack, 30);
-        Summary += TEXT("\nLOD1+ tables (coarse/background)\n");
-        AppendRows(Summary, TEXT("LOD1+ top 30 exclusive functions (leaf)"), Lod1PlusAggregates.ExclusiveFunctions, Lod1PlusAggregates.SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("LOD1+ top 30 inclusive functions (once per sample)"), Lod1PlusAggregates.InclusiveFunctions, Lod1PlusAggregates.SamplesWithStack, 30);
-        AppendRows(Summary, TEXT("LOD1+ top 30 exclusive source lines (leaf source)"), Lod1PlusAggregates.ExclusiveLines, Lod1PlusAggregates.SamplesWithStack, 30);
-
-        if (FFileHelper::SaveStringToFile(
-                Summary,
-                *SummaryPath,
-                FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-        {
-            Result.bOutputWritten = true;
-        }
-    }
 };
 
 FVoxelStackSampler& FVoxelStackSampler::Get()
@@ -1060,8 +822,9 @@ bool FVoxelStackSampler::Start(
     Impl = NewImpl;
     GVoxelStackSamplerEnabled.store(true, std::memory_order_release);
     UE_LOG(LogTemp, Display,
-        TEXT("[VoxelStackSampler] started label=%s interval_us=%u raw=%s summary=%s"),
-        *RunLabel, NewImpl->IntervalUs, *NewImpl->RawSamplesPath, *NewImpl->SummaryPath);
+        TEXT("[VoxelStackSampler] started label=%s interval_us=%u raw=%s modules=%s summary=%s"),
+        *RunLabel, NewImpl->IntervalUs, *NewImpl->RawSamplesPath,
+        *NewImpl->ModuleMapPath, *NewImpl->SummaryPath);
     return true;
 #endif
 }
@@ -1081,16 +844,14 @@ FVoxelStackSampler::FSummary FVoxelStackSampler::StopAndWrite()
     Result = StoppedImpl->Finalize();
     UE_LOG(LogTemp, Display,
         TEXT("[VoxelStackSampler] stopped label=%s ticks=%llu registered_samples=%llu "
-             "retained=%llu dropped=%llu resolved_fraction=%.4f raw=%s summary=%s"),
+             "retained=%llu dropped=%llu raw=%s module_map=%s summary=%s"),
         *Result.RunLabel,
         static_cast<unsigned long long>(Result.SamplerTicks),
         static_cast<unsigned long long>(Result.RegisteredThreadSamples),
         static_cast<unsigned long long>(Result.RetainedSamples),
         static_cast<unsigned long long>(Result.DroppedSamples),
-        Result.TotalFrames > 0
-            ? static_cast<double>(Result.ResolvedFrames) / static_cast<double>(Result.TotalFrames)
-            : 0.0,
         *Result.RawSamplesPath,
+        *Result.ModuleMapPath,
         *Result.SummaryPath);
     delete StoppedImpl;
     Impl = nullptr;

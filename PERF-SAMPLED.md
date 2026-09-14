@@ -1100,3 +1100,341 @@ DDC graph; retried successfully), `TakeoverFinalMovingSamplerOnHost_20260913` (c
 `...Host2` retry succeeded), `Final3MovingSamplerOn_20260913` (fatal shutdown), and
 `IsFiniteExact_20260913` (no writable DDC graph). No CrashReportClient crash occurred in the
 worm-round launches above.
+
+## Final worms round — real off switch, cheap field, and offline stacks (2026-09-14)
+
+This addendum covers the implementation and the final hardening runs after the block-skip round
+above. Existing historical measurements are retained. Scope stayed inside
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge`; no `.uasset` content was edited and nothing was
+committed, pushed, or stashed.
+
+### Final build
+
+The prescribed UE 5.7 UBT command in this report was used throughout. Three intermediate staged
+builds failed before the final game runs: the first had stale-source compile errors (`Tunnel` not
+found, missing `FGuid`, and the offline module record missing `PdbAge`); the second exposed a
+linker error from editor access to unexported tile-context TLS; the third cleanup build exposed a
+missing anonymous-namespace close after removing the in-process resolver. Each failure was fixed;
+none left an Unreal process running.
+
+The final hardening build succeeded in
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_FinalHardening.log`
+(`Result: Succeeded`, 9.11 s). The subsequent benchmark-only force-off wiring rebuild also
+succeeded in
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_FinalForceOff.log`
+(`Result: Succeeded`, 81.89 s). The final off/on game runs below use that latter staged build.
+Its loaded staged DLLs were verified as:
+
+- runtime: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Binaries\Win64\UnrealEditor-VoxelForge.dll`, SHA-256 `5A79B6FBDE2944D66C762EDB2D099E634B2BE84C08808D48C8CB7A3897E233FD`;
+- editor: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Binaries\Win64\UnrealEditor-VoxelForgeEditor.dll`, SHA-256 `AB20BE8A2CBAF5FA4D9D2545AA7CC9DC058085741EA18B9FEAB26669A92F9F77`.
+
+After the performance runs, the cache-key-only hardening described below was rebuilt in
+`E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_FinalFingerprint.log`
+(`Result: Succeeded`, 8.87 s). Its runtime hash is
+`19190CB64AB894097A49C37B8DC5D43B67018A1BD624253473D4F710FBECB532` (the editor hash is
+unchanged). `WormFinalFingerprintSmoke_20260914` then loaded that exact staged runtime, used the
+plugin DDC, and exited cleanly; the acceptance tables below remain measurements from the force-off
+build above, while this smoke verifies the final source tree after the key hardening.
+
+### Part 0 — module map and offline symbolizer
+
+`FVoxelStackSampler::StopAndWrite` now joins the sampler first, writes the bounded raw CSV, then
+enumerates the current process with PSAPI (`EnumProcessModules`, `GetModuleInformation`, and
+`GetModuleFileNameExW`). The sibling
+`VoxelStackModules_<label>_<pid>.tsv` records module path, load base, image size, file size, last
+write FILETIME, and the CodeView PDB GUID/age/path when the loaded image exposes an RSDS record.
+The image identity read is a bounded PE-header read; the measured process does not initialize or
+call DbgHelp. The raw summary explicitly says `symbolization: deferred` and
+`dbghelp_in_measured_process: no`.
+
+`-run=VoxelForgeExplore -symbolizestacks=<csv>` is now an editor-only post-exit commandlet. It
+loads the sibling module map, checks recorded file size and timestamp, maps each PC to module and
+RVA, loads only the modules needed by the CSV into DbgHelp, resolves functions and source lines,
+and queries inline frames. It writes a resolved-PC TSV and the former all-LOD, LOD0, and LOD1+
+exclusive-function, inclusive-function, and source-line tables. DbgHelp is linked by
+`VoxelForgeEditor` only.
+
+The fresh final cheap moving sampler run was
+`WormFinalForceOffBuildSamplerOnMoving_20260914`. It completed cleanly with 1,521 LOD0 samples,
+request-to-ready p50/p95 `0.062287 / 0.135633 s`, generation p50/p95 `0.054268 / 0.106542 s`,
+and `113.578722` worker seconds. Its artifacts are:
+
+- raw CSV: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSamples_game_26772.csv`;
+- module map: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackModules_game_26772.tsv`;
+- raw summary: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSummary_game_26772.txt`;
+- resolved PCs: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackResolved_game_26772.tsv`;
+- offline summary: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSummaryOffline_game_26772.txt`.
+
+The offline pass completed with 733 recorded modules, 10 needed and loaded, zero identity
+mismatches, 109,593 samples (70,968 LOD0 and 38,625 LOD1+), 1,879,380 frame slots, 993,473
+resolved frames, 6,714 inline symbols, 7,795 mapped unique PCs, and zero unmapped PCs. The
+unknown-frame count is 885,907 and is retained as an explicit table row. The exact moving proof
+(`WormFinalMovingSamplerExactProof_20260914` plus its offline pass) independently completed with
+zero identity mismatches as well. The post-exit retry was
+`WormFinalForceOffBuildSamplerOfflineRetry_20260914`; its first direct attempt is recorded as a
+failed launch below because it omitted the writable local DDC arguments.
+
+The LOD0 exclusive identities in the fresh offline table match the old in-process exact
+configuration: `GetDensityWithParams`, `GetDensityAt`, `Sqrt`, `SmoothMin`,
+`FChunkSDFSpatialIndex::GetRange`, `VF_ProjectNativePassageFloorUncached`,
+`VF_ProjectTunnelSegmentXY`, `VF_EvaluateSweptTunnelChain`, `EvaluateTunnelCoreWorld`, and
+`ProjectWalkableTunnelFloor`. Counts differ because these are separate moving reservoirs; the
+function/source identities and table shape are the comparison.
+
+The planted-cost proof used `WormSamplerPlantGenerator_20260914` and
+`WormSamplerPlantGeneratorOffline_20260914`. The post-exit map for `game_22152` contained five
+resolved `VoxelWormField::RunSampleStacksPlant()` rows, all module identities matched, and all
+planted PCs mapped. The two earlier plant attempts (`WormSamplerPlantOffline_20260914` and
+`WormSamplerPlantLongOffline_20260914`) completed but were inconclusive because the hook was
+placed where it was optimized away from the captured stack. The plant was then removed; a source
+and harness search has no `RunSampleStacksPlant` or `SampleStacksPlant` match.
+
+The final disabled sampler proof used `WormFinalOffSampler_20260914` followed by
+`WormFinalOffSymbolize_20260914`. It produced 1,992 untagged commandlet samples (the commandlet
+has no generation-task LOD tag) and zero resolved rows containing `Worm`, which is the required
+zero-worm-frame result for the disabled configuration.
+
+### Part 1 — asset-owned off switch
+
+`UVoxelStrateDefinition` now has `bEnableWorms`, defaulting to `true`, so existing assets retain
+their current behavior. It is deliberately not a member of `FStrateGenerationParams`; the
+`VF_STRATE_PARAM_FIELDS` list and its static assertions remain at 83 fields plus 8 bytes of
+padding. The manager resolves the asset switch after composer candidates, season vectors, and
+boundary blending, and the generation-parameter fingerprint includes the switch. Composer
+runtime overrides are also clamped before publication, so a roll cannot re-enable a disabled
+asset.
+
+`voxel.WormsForceOff=1` is present only as a development measurement override for the game
+harness: `0` uses the asset-owned value and `1` forces all resolved worm strengths to zero. It is
+resolved once per process, included in the generation fingerprint, and explicitly documented as
+world-changing; it is not the per-strate switch and must never vary between multiplayer peers or
+world regenerations.
+
+With the resolved strength at zero, the fused evaluator does not enter the worm block or its
+timer; the op-stack builder omits the worm source, an already-materialized source returns exact
+identity and zero carve bounds, and the interval/classifier paths do no worm evaluation. The
+same gate is applied to the recipe materializer and the composer override path.
+
+The final post-hardening geometry proof is exact:
+
+| configuration | geometry hash | triangles | player-fit | walk-reachable | connectivity |
+|---|---:|---:|---:|---:|---|
+| `WormPostHardeningOff_20260914` (`-wormsenabled=0`) | `70D310A4` | 74,672 | 20,856 | 10,917 | Connected |
+| `WormPostHardeningZeroed_20260914` (`-wormstrength=0`) | `70D310A4` | 74,672 | 20,856 | 10,917 | Connected |
+
+Both runs also reported `canonical_repeat_equal=true`. The disabled asset path therefore matches
+the hand-zeroed control byte-for-byte at the exported geometry hash, while exceeding the required
+20,830 / 10,909 capability gate.
+
+### Part 2 — measured cheap field
+
+The selected field is `voxel.WormNoiseMode=1`: a deterministic scalar value-noise evaluation
+using the same worm coordinate mapping, threshold, N1 short-circuit, N2 offset, and strength
+contract. The code default is mode 1. Mode 0 remains the legacy gradient-Perlin exact control.
+`voxel.WormNoiseMode` and `voxel.WormLatticeStep` are documented development-only,
+world-changing experiments; they are not the multiplayer off switch and must be identical on
+all peers and on every regeneration of a world.
+
+The coarser lattice was measured rather than assumed. The first lattice implementation was much
+slower because of cache churn; after the fixed tile-window cache, it returned to roughly the
+exact cost but did not improve it. Representative static worker seconds were exact 33.10,
+lattice-2 initial 160.86, lattice-2 cache-fixed 33.78, lattice-4 cache-fixed 33.25, and exact
+block-skip 33.10. The lattice path is retained as a bounded experiment, but is not the selected
+production mode. The exact block skip is also retained as a fail-closed exact-mode diagnostic;
+it is not used as a correctness or performance claim for value noise because its Perlin proof
+does not cover the changed field.
+
+The capability and geometry candidates were:
+
+| candidate | mode | geometry hash | triangles | player-fit / reach | result |
+|---|---|---:|---:|---:|---|
+| `WormExactCurrentExplore_20260914` | exact, lattice 0 | `311CA42C` | 75,482 | 20,830 / 10,909 | accepted control |
+| `WormLedgerLattice2_20260914` | exact, lattice 2 | `5C9E0858` | 74,932 | 20,856 / 10,917 | capability pass; no speed gain |
+| `WormLedgerLattice4_20260914` | exact, lattice 4 | `E3EC3FAF` | 74,708 | 20,857 / 10,917 | capability pass; no speed gain |
+| `WormCheapValue_20260914` | value, lattice 0 | — | — | 20,826 / 10,917 | rejected: fit short by 4 |
+| `WormCheapValueLattice2Explore_20260914` | value, lattice 2 | `C47567A2` | 75,132 | 20,857 / 10,917 | pass; no speed gain |
+| `WormCheapFastHashExplore_20260914` | value, lattice 0 | `6204C7E6` | 75,956 | 20,851 / 10,917 | selected |
+
+The selected mode changes the field, but the measured full-game gain is small rather than a
+claim of a dramatic speedup. In two interleaved static pairs, exact averaged 0.087128 / 0.148415
+s request-to-ready p50/p95, 0.063042 / 0.105080 s generation p50/p95, and 33.213871 worker s;
+cheap averaged 0.087761 / 0.145897 s, 0.062863 / 0.106258 s, and 33.083774 worker s. In two
+interleaved moving pairs at 800 cm/s, exact averaged 0.060116 / 0.131752 s request-to-ready,
+0.050910 / 0.104262 s generation, and 109.165600 worker s; cheap averaged 0.061533 /
+0.133272 s, 0.052125 / 0.105495 s, and 111.492032 worker s. Thus cheap is a small static worker
+improvement and within noise there, but approximately 2.1% worse in moving worker seconds. That
+is the measured tradeoff for the field change, not an overclaim.
+
+The explicit game-path switch-off/on measurement requested for Part 2 used the force-off override,
+with value-noise mode and no sampler. Static on averaged 0.085736 / 0.143135 s request-to-ready
+p50/p95, 0.062793 / 0.104333 s generation p50/p95, and 33.022549 worker s. Static off averaged
+0.084559 / 0.136829 s, 0.061727 / 0.099843 s, and 32.218070 worker s. Moving on averaged
+0.059974 / 0.132163 s request-to-ready, 0.051983 / 0.102972 s generation, and 109.244366
+worker s; moving off averaged 0.058397 / 0.126581 s, 0.050210 / 0.098518 s, and 105.648779
+worker s. These are two interleaved A/B runs per side, 343 static and 1,521 moving LOD0 samples
+per run, and all four had zero obsolete-tile aborts. Enabled worms therefore cost about 2.5%
+static and 3.4% moving worker time in this harness, while the selected cheap field's exact-versus-
+cheap comparison above measures the cost of changing the enabled field itself.
+
+The final deterministic tile ledger used 64 tiles in `z_then_y_then_x` order. Exact A/B and cheap
+A/B each had zero per-tile triangle-count/hash differences. Exact versus selected cheap changed
+29/64 tile hashes/counts (45.3125%); the changed tiles contained 69,625/75,482 exact triangles
+(92.2405%) and 70,099/75,956 cheap triangles (92.2890%), with a signed total of +474 triangles
+and an absolute per-tile triangle-count delta of 1,822. The triangle percentages are explicitly
+changed-tile coverage, not an assertion that individual triangles were matched across changed
+topologies.
+
+The four final deterministic/acceptance exports were:
+
+| run pair | per-tile differences | hash / triangles | player-fit / reach | connectivity |
+|---|---:|---|---:|---|
+| `WormFinalExactDetA_20260914` / `WormFinalExactDetB_20260914` | 0 / 64 | `311CA42C` / 75,482 | 20,830 / 10,909 | Connected |
+| `WormFinalCheapDetA_20260914` / `WormFinalCheapDetB_20260914` | 0 / 64 | `6204C7E6` / 75,956 | 20,851 / 10,917 | Connected |
+
+The final fixed-camera LOD0 renders are 512×288 at
+`-89.4815216,-104.9037323,-163.272038`:
+
+- exact before: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\WormPostHardeningRenderBefore_20260914Out\render_02.png`;
+- cheap after: `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\WormPostHardeningRenderAfter_20260914Out\render_02.png`.
+
+They show the same worm-rich passage with only small local wall/relief changes, consistent with
+the tile ledger. The preliminary final static pair
+`WormFinalPerfStaticOffA_20260914` / `WormFinalPerfStaticOnA_20260914` also completed, but both
+were accidentally launched with mode 1 and are excluded from the exact-versus-cheap averages.
+
+### Fresh moving sampler LOD0 top 20
+
+The final post-hardening moving cheap run had 1,521 LOD0 samples, no obsolete tile aborts, and
+the following offline-resolved exclusive leaf table. Percentages use the 71,427 LOD0 samples in
+the offline reservoir:
+
+| # | samples | percent | function |
+|---:|---:|---:|---|
+| 1 | 13,250 | 18.6704 | `GetDensityWithParams` |
+| 2 | 3,632 | 5.1178 | `GetDensityAt` |
+| 3 | 3,351 | 4.7218 | unknown |
+| 4 | 2,750 | 3.8750 | `Sqrt` |
+| 5 | 2,266 | 3.1930 | `SmoothMin` |
+| 6 | 2,066 | 2.9112 | `FChunkSDFSpatialIndex::GetRange` |
+| 7 | 1,708 | 2.4067 | `VF_ProjectNativePassageFloorUncached` |
+| 8 | 1,678 | 2.3644 | `VF_ProjectTunnelSegmentXY` |
+| 9 | 1,540 | 2.1700 | `VF_EvaluateSweptTunnelChain` |
+| 10 | 1,360 | 1.9164 | `EvaluateTunnelCoreWorld` lambda |
+| 11 | 1,267 | 1.7853 | `ProjectWalkableTunnelFloor` |
+| 12 | 1,120 | 1.5782 | `EvaluateSDFCached` lambda |
+| 13 | 1,116 | 1.5725 | swept-chain lambda |
+| 14 | 1,035 | 1.4584 | `IsFiniteFast` |
+| 15 | 875 | 1.2330 | `IsFinite` |
+| 16 | 874 | 1.2315 | `GenerateMesh` |
+| 17 | 842 | 1.1865 | `EvaluateModifierSDF` |
+| 18 | 832 | 1.1724 | `DistanceSquaredToAabb` |
+| 19 | 819 | 1.1540 | `FScopedTimer::End` |
+| 20 | 789 | 1.1118 | `UsesOperatorStackForChunk` |
+
+### Complete current-round launch ledger
+
+The existing block-skip ledger above remains the record for the earlier `WormSkip*` launches.
+This table adds the harness validation and every launch made for this off-switch/cheap-field
+round, including invalidated, inconclusive, failed, and retried launches. A `PASS` here means the
+process exited cleanly and produced its stated artifact; a candidate can still be rejected by a
+capability or comparison gate.
+
+| launch | outcome |
+|---|---|
+| `HarnessFixBuild_20260914` | PASS; harness/build validation completed. |
+| `HarnessFixSamplerSmoke_20260914` | PASS; sampler-on static smoke, clean exit. |
+| `HarnessFixSamplerSmokeRetry_20260914` | PASS; sampler-on static retry, clean exit. |
+| `HarnessFixSamplerSmokeFinal_20260914` | PASS; sampler-on static final smoke, clean exit. |
+| `HarnessFix01SamplerOnStatic.log` | PASS; sampler-on static. |
+| `HarnessFix02SamplerOnMoving.log` | PASS; sampler-on moving, 64 m movement. |
+| `HarnessFix03SamplerOnStatic.log` | PASS; sampler-on static. |
+| `HarnessFix04SamplerOnMoving.log` | PASS; sampler-on moving, 64 m movement. |
+| `HarnessFix05SamplerOnStatic.log` | PASS; sampler-on static. |
+| `HarnessFix06SamplerOffMoving.log` | PASS; sampler-off moving; one obsolete-tile abort was recorded by the stress session. |
+| `HarnessFix07SamplerOffStatic.log` | PASS; sampler-off static. |
+| `HarnessFix08SamplerOnMoving.log` | PASS; sampler-on moving. |
+| `HarnessFix09SamplerOffMoving.log` | PASS; sampler-off moving; nine obsolete-tile aborts were recorded by the stress session. |
+| `HarnessFix10SamplerOnStatic.log` | PASS; sampler-on static. |
+| `HarnessFixExport_20260914` | PASS; export commandlet exited 0. |
+| `WormOnExact_20260914` | PASS; exact export-only baseline, hash `07C14005`, 153,346 triangles. |
+| `WormOffSwitch_20260914` | PASS; disabled switch, hash `70D310A4`, 74,672 triangles, 20,856 / 10,917, Connected. |
+| `WormZeroedControl_20260914` | PASS; hand-zeroed control, same hash `70D310A4`, 74,672 triangles. |
+| `WormOfflineSamplerOn_20260914` | PASS; fresh exact sampler-on game run. |
+| `OfflineSymbolizeWormSampler_20260914` | PASS; post-exit exact CSV resolved; 733 modules, zero identity mismatches. |
+| `WormLedgerExact_20260914` | PASS; exact ledger candidate, 20,830 / 10,909, Connected. |
+| `WormLedgerLattice2_20260914` | PASS; exact lattice-2 candidate. |
+| `WormLedgerLattice4_20260914` | PASS; exact lattice-4 candidate. |
+| `WormLatticeExactStaticA_20260914` | PASS; 343 LOD0 samples, worker 33.102516 s. |
+| `WormLattice2StaticA_20260914` | PASS process; invalidated as a candidate after 160.860434 worker s and p95 generation 1.036767 s. |
+| `WormLattice2StaticCacheFixA_20260914` | PASS process; invalidated partial cache experiment, 189 samples and 209.142420 worker s. |
+| `WormLattice2StaticCacheFixB_20260914` | PASS; cache-fixed lattice-2 rerun, worker 33.779886 s. |
+| `WormLattice4StaticCacheFixA_20260914` | PASS; cache-fixed lattice-4, worker 33.252895 s. |
+| `WormLattice2StaticN2CacheA_20260914` | PASS; N2-cache experiment, worker 33.226479 s. |
+| `WormBlockSkipStaticProbe_20260914` | PASS; exact block-skip probe, worker 33.099186 s. |
+| `WormLattice2StaticN1CacheA_20260914` | PASS; N1-cache experiment, worker 33.618430 s. |
+| `WormLedgerN1Exact_20260914` | PASS; exact N1 ledger candidate. |
+| `WormLedgerN1Lattice2_20260914` | PASS; lattice-2 N1 ledger candidate. |
+| `WormCheapValue_20260914` | PASS process; candidate rejected because player-fit was 20,826. |
+| `WormCheapValueStaticA_20260914` | PASS; value-noise static profile, worker 32.551710 s. |
+| `WormCheapValueLattice2StaticA_20260914` | PASS; value-noise lattice-2 profile, worker 33.814655 s. |
+| `WormCheapValueLattice2Explore_20260914` | PASS; capability 20,857 / 10,917, Connected. |
+| `WormCheapValue098Explore_20260914` | PASS process; candidate fit 20,821, rejected. |
+| `WormCheapValue102Explore_20260914` | PASS process; candidate fit 20,827, rejected. |
+| `WormCheapValue110Explore_20260914` | PASS process; candidate fit 20,828, rejected. |
+| `WormCheapFastHashExplore_20260914` | PASS; selected cheap field, hash `6204C7E6`, 75,956 triangles, 20,851 / 10,917, Connected. |
+| `WormExactCurrentExplore_20260914` | PASS; selected exact control, hash `311CA42C`, 75,482 triangles, 20,830 / 10,909, Connected. |
+| `WormPerfStaticExactA_20260914` | PASS; preliminary exact static A. |
+| `WormPerfStaticCheapA_20260914` | PASS; preliminary cheap static A. |
+| `WormPerfStaticExactB_20260914` | PASS; preliminary exact static B. |
+| `WormPerfStaticCheapB_20260914` | PASS; preliminary cheap static B. |
+| `WormSamplerPlant_20260914` | PASS process; first planted profile, proof inconclusive. |
+| `WormSamplerPlantOffline_20260914` | PASS process; first offline planted pass, no named plant row. |
+| `WormSamplerPlantLong_20260914` | PASS process; longer planted profile, proof inconclusive. |
+| `WormSamplerPlantLongOffline_20260914` | PASS process; longer offline pass, no named plant row. |
+| `WormSamplerPlantGenerator_20260914` | PASS; generator-level planted profile. |
+| `WormSamplerPlantGeneratorOffline_20260914` | PASS; five named plant rows resolved; proof accepted before plant removal. |
+| `WormFinalOffSampler_20260914` | PASS; disabled sampler-on commandlet, zero worm rows after symbolization. |
+| `WormFinalOffSymbolize_20260914` | PASS; post-exit disabled CSV resolved. |
+| `WormFinalOffSwitch_20260914` | PASS; disabled geometry/capability proof. |
+| `WormFinalZeroedControl_20260914` | PASS; zeroed-parameter control, exact geometry match. |
+| `WormFinalExactDetA_20260914` | PASS; exact determinism A. |
+| `WormFinalExactDetB_20260914` | PASS; exact determinism B. |
+| `WormFinalCheapDetA_20260914` | PASS; cheap determinism A. |
+| `WormFinalCheapDetB_20260914` | PASS; cheap determinism B. |
+| `WormFinalPerfStaticOffA_20260914` | PASS process; preliminary pair member, but launched with cheap mode. |
+| `WormFinalPerfStaticOnA_20260914` | PASS process; preliminary pair member, also cheap mode, excluded from comparison. |
+| `WormFinalPerfStaticWormsOnA_20260914` | PASS; explicit game-path worms-on static A (`WormsForceOff=0`). |
+| `WormFinalPerfStaticWormsOffA_20260914` | PASS; explicit game-path worms-off static A (`WormsForceOff=1`). |
+| `WormFinalPerfStaticWormsOnB_20260914` | PASS; explicit game-path worms-on static B (`WormsForceOff=0`). |
+| `WormFinalPerfStaticWormsOffB_20260914` | PASS; explicit game-path worms-off static B (`WormsForceOff=1`). |
+| `WormFinalPerfStaticExactA_20260914` | PASS; final exact static A. |
+| `WormFinalPerfStaticCheapA_20260914` | PASS; final cheap static A. |
+| `WormFinalPerfStaticExactB_20260914` | PASS; final exact static B. |
+| `WormFinalPerfStaticCheapB_20260914` | PASS; final cheap static B. |
+| initial `WormFinalPerfMovingExactA_20260914` wrapper launch | FAILED harness shutdown after the graceful-close timeout; no crash folder or reporter, and the preserved backup log is `WormFinalPerfMovingExactA_20260914-backup-2026.09.14-05.14.32.log`. |
+| retried `WormFinalPerfMovingExactA_20260914` | PASS; rerun used the runtime movement/exit path, 1,521 LOD0 samples. |
+| `WormFinalPerfMovingCheapA_20260914` | PASS; final cheap moving A. |
+| `WormFinalPerfMovingExactB_20260914` | PASS; final exact moving B. |
+| `WormFinalPerfMovingCheapB_20260914` | PASS; final cheap moving B. |
+| `WormFinalPerfMovingWormsOnA_20260914` | PASS; explicit game-path worms-on moving A (`WormsForceOff=0`). |
+| `WormFinalPerfMovingWormsOffA_20260914` | PASS; explicit game-path worms-off moving A (`WormsForceOff=1`). |
+| `WormFinalPerfMovingWormsOnB_20260914` | PASS; explicit game-path worms-on moving B (`WormsForceOff=0`). |
+| `WormFinalPerfMovingWormsOffB_20260914` | PASS; explicit game-path worms-off moving B (`WormsForceOff=1`). |
+| `WormFinalMovingSamplerOn_20260914` | PASS; pre-hardening cheap sampler-on moving profile. |
+| `WormFinalMovingSamplerOffline_20260914` | PASS; pre-hardening post-exit symbolization. |
+| `WormFinalRenderBefore_20260914` | PASS; exact fixed-camera render. |
+| `WormFinalRenderAfter_20260914` | PASS; cheap fixed-camera render. |
+| `WormPostHardeningOff_20260914` | PASS; final disabled geometry proof. |
+| `WormPostHardeningZeroed_20260914` | PASS; final zeroed-control geometry proof. |
+| `WormFinalMovingSamplerOnPostHardening_20260914` | PASS; final cheap sampler-on moving profile, 1,521 LOD0 samples, 800 cm/s, no obsolete aborts. |
+| `WormFinalMovingSamplerOfflinePostHardening_20260914` | PASS; final cheap offline symbolization, zero module identity mismatches. |
+| `WormFinalMovingSamplerExactProof_20260914` | PASS; final exact sampler-on comparison profile. |
+| `WormFinalMovingSamplerExactProofOffline_20260914` | PASS; final exact offline symbolization, zero module identity mismatches. |
+| `WormPostHardeningRenderBefore_20260914` | PASS; final exact render refresh. |
+| `WormPostHardeningRenderAfter_20260914` | PASS; final cheap render refresh. |
+| `PerfSampledBuild_FinalForceOff.log` | PASS; final force-off wiring build, Result: Succeeded. |
+| `WormFinalForceOffBuildSamplerOnMoving_20260914` | PASS; final sampler-on moving run on the force-off build, 1,521 LOD0 samples, no obsolete aborts. |
+| `WormFinalForceOffBuildSamplerOffline_20260914` | FAILED; first direct post-exit symbolizer attempt stopped on UE 5.7's fatal no-writable-cache-graph DDC configuration; preserved log/output, no code failure. |
+| `WormFinalForceOffBuildSamplerOfflineRetry_20260914` | PASS; retried with writable `Saved\ZenData`/`Saved\DDC`, 733 modules, 10 loaded, zero identity mismatches, all 7,795 unique PCs mapped. |
+| `PerfSampledBuild_FinalFingerprint.log` | PASS; final cache-key hardening rebuild, Result: Succeeded. |
+| `WormFinalFingerprintSmoke_20260914` | PASS; post-hardening clean game smoke, exact staged runtime verified, writable DDC, zero crash folders/reporters. |
