@@ -170,6 +170,44 @@ before the always-on LOD0 changes.
 chain, passage landing/floor checks and `GetDensityAt`. An inline bit test is exactly the same
 predicate, so it changes no field.
 
+## State after 2026-09-14 (HEAD `7a972f5`)
+
+**In-game generation since the start of 2026-09-13**, headless game path (static = 841 tiles;
+moving = 160 m at 8 m/s):
+```
+                                   worker CPU static   LOD0 generation p50 static
+c65b015  classifier off            ~184 s              ~75 ms
+2990009  player-fit memo             48 s                73 ms
+cfad3d1  tile cache window (LOD3+)   39 s                77 ms
+ab4bbe3  field-exact LOD0 overhead   33 s                66 ms
+5489b5e  inline exact IsFinite       ~31-34 s            ~62-66 ms
+7a972f5  (current)                   ~34 s               ~66 ms
+```
+The later rounds' absolute figures come from slightly different harness settings. Compare within a
+round.
+
+**Measured, not guessed: what each component costs** (`6ccf371`, remove-one ablation, static worker
+saving): tunnel SDF 11.4% (and it owns the LOD0 p95 tail), cave warp 10.3%, passage carving 10.1%,
+landing posts 9.9%, structural posts 5.6%, worms 2.4%, everything else <= 2.2%. Ablations change
+the field, so these mix computation cost with the cost of the geometry each component creates.
+
+**Tried and not kept:**
+- the exact worm block skip: 4% skip rate, neutral, off by default;
+- value-noise / lattice worms: no gain, removed;
+- exact culling (SmoothMin cutoff, tile candidates, post early-outs): the build was 23% slower even
+  with every switch off, parked on local branch `wip/exact-cull-20260914`. Only the tunnel-core
+  ablation gate fix was ported.
+
+**Measurement lessons**, recorded because each cost a round:
+- line-level sampler attribution of inlined code is a hint; confirm it with an ablation;
+- a switch-off A/B inside a new build cannot see always-on cost; always compare the final default
+  build against the committed tip's DLL, with a fixed command line;
+- launch Unreal serially (it is a GUI exe that returns at once), and reap crash reporters.
+
+**Next candidates:** a cheaper cave warp (field-changing: coarse warp lattice); the tunnel SDF (field-
+changing merge of the warped SDF and the world-space core); a real per-tile candidate filter
+designed to cost nothing per sample; the cold read-only audit's findings.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
