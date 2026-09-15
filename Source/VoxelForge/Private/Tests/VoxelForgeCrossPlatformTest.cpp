@@ -163,15 +163,10 @@ bool FVoxelForgeCrossPlatformTest::RunTest(const FString& Parameters)
     // que ça rendait cette mesure caduque. **C'est faux, et il a fallu vérifier plutôt que
     // supposer.**
     //
-    // Il reste `FMath::Sin` / `FMath::Cos`, présents partout dans le chemin de densité (lignes de
-    // strates, nervures, placement des salles, rotations). **`sinf`/`cosf` ne sont PAS spécifiés
-    // par IEEE-754** : le CRT de MSVC et la libm de la glibc ont parfaitement le droit de rendre
-    // des résultats différents (typiquement ≤ 1 ULP, mais différents). `FPSemantics` a donc fermé
-    // la moitié COMPILATEUR de §C9 et laissé ouverte la moitié BIBLIOTHÈQUE.
-    //
-    // FPSemantics = Precise removed the float-MODEL difference, but sinf/cosf are not IEEE-754
-    // specified, so MSVC's CRT and glibc's libm may still differ. The compiler half of C9 is closed;
-    // the library half is not.
+    // The world path now owns its sine/cosine range reduction and polynomial in VoxelMath. Before
+    // that replacement, `sinf`/`cosf` were not specified by IEEE-754: MSVC's CRT and glibc's libm
+    // could return different results (typically <= 1 ULP). `FPSemantics` closed the compiler half
+    // of §C9; DetSin/DetCos close the library half as well.
     //
     // D'où trois bandes au lieu d'une : une bande unique à 1e-4 est **100× trop large** pour un
     // écart de libm (~1e-6 en absolu sur des densités de magnitude ~10), donc elle sur-estime
@@ -223,37 +218,30 @@ bool FVoxelForgeCrossPlatformTest::RunTest(const FString& Parameters)
     AddInfo(FString::Printf(
         TEXT("CROSS-PLATFORM DIGEST (seed %d, %d samples, step %d/%d)\n")
         TEXT("    SHAPE digest : 0x%016llX   <- must match across Windows/Linux. This is the world.\n")
-        TEXT("    FIELD digest : 0x%016llX   <- bit-for-bit. May differ; see NearIso below.\n")
+        TEXT("    FIELD digest : 0x%016llX   <- expected bit-for-bit after DetSin/DetCos.\n")
         TEXT("    solid %d / air %d / NaN %d"),
         World.Settings->Seed, NumSamples, XYStep, ZStep,
         ShapeDigest, FieldDigest, NumSolid, NumSamples - NumSolid, NumNaN));
 
-    // Le PROFIL de proximité à l'isosurface, plutôt qu'un seul seuil binaire.
+    // Le PROFIL de proximité à l'isosurface reste utile pour visualiser la marge géométrique,
+    // mais il ne mesure plus une divergence CRT : the world trig path is deterministic now.
     AddInfo(FString::Printf(
         TEXT("NearIso profile over %d samples: %d within 1e-4, %d within 1e-5, %d within 1e-6. ")
-        TEXT("Only the LAST number is the cross-platform risk: FPSemantics = Precise removed the ")
-        TEXT("float-MODEL difference, so what remains is that sinf/cosf are not IEEE-754 specified ")
-        TEXT("and MSVC's CRT may differ from glibc's libm by ~1 ULP. On densities of magnitude ~10 ")
-        TEXT("that is ~1e-6 absolute, which is why the wide band over-states the risk ~100x."),
+        TEXT("This is a geometric margin profile; DetSin/DetCos removes the prior CRT/libm source ")
+        TEXT("of cross-platform variation."),
         NumSamples, NumNearWide, NumNearMid, NumNearTight));
 
     if (NumNearTight > 0)
     {
-        AddWarning(FString::Printf(
-            TEXT("%d of %d samples sit within 1e-6 of the isosurface -- tight enough that a libm ")
-            TEXT("difference between MSVC and glibc could flip their SIGN, i.e. one voxel solid for ")
-            TEXT("a Windows host and air for a Linux client. FMath::Sin/Cos are used throughout the ")
-            TEXT("density path (layer lines, ribs, room placement, rotations), so this is the ")
-            TEXT("REMAINING half of AUDIT C9 -- the compiler half is fixed, the library half is not. ")
-            TEXT("If this must be zero, the fix is a deterministic in-house sin/cos in the density ")
-            TEXT("path (one more world re-tune), not another build flag."),
+        AddInfo(FString::Printf(
+            TEXT("%d of %d samples sit within 1e-6 of the isosurface. The proximity is worth ")
+            TEXT("recording, but it is no longer a CRT/libm cross-platform risk because the production ")
+            TEXT("world path uses deterministic VoxelMath::DetSin/DetCos."),
             NumNearTight, NumSamples));
     }
     else
     {
-        AddInfo(TEXT("No sample sits within 1e-6 of the isosurface, so no sampled voxel is close ")
-                TEXT("enough for a libm difference to flip its side. Evidence, not proof: it covers ")
-                TEXT("this grid, not every voxel of a world."));
+        AddInfo(TEXT("No sample sits within 1e-6 of the isosurface on this grid."));
     }
 
     TestEqual(TEXT("no sample produced NaN"), NumNaN, 0);

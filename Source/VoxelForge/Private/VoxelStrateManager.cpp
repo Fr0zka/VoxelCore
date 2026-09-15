@@ -1827,8 +1827,10 @@ void UVoxelStrateManager::GeneratePassages()
             // surface shaft, while this passage opens a separate room in the strate network.
             const float Angle = PassageRandom01(PassageSaltAngle) * (2.0f * PI);
             const float Distance = PassageRandomRange(PlacementLo, PlacementHi, PassageSaltDistance);
-            const float PX = FMath::Cos(Angle) * Distance;
-            const float PY = FMath::Sin(Angle) * Distance;
+            float SinAngle = 0.0f, CosAngle = 0.0f;
+            VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+            const float PX = CosAngle * Distance;
+            const float PY = SinAngle * Distance;
 
             ++TotalPassages;
 
@@ -1990,7 +1992,7 @@ void UVoxelStrateManager::GeneratePassages()
             Passage.ControlRadii.Reserve(Segments + 1);
 
             // WIDTH profile: mouth radius at the ends, mid radius in the centre (taper/bulge).
-            auto RadiusAt = [&](float t) { return FMath::Lerp(Cfg.MouthRadius, Cfg.MidRadius, FMath::Sin(t * PI)); };
+            auto RadiusAt = [&](float t) { return FMath::Lerp(Cfg.MouthRadius, Cfg.MidRadius, VoxelMath::DetSin(t * PI)); };
 
             // Per-passage shape seeds.
             const float WormFreq = PassageRandomRange(0.8f, 1.8f, PassageSaltWormFreq);   // (vertical wobble only)
@@ -2005,7 +2007,7 @@ void UVoxelStrateManager::GeneratePassages()
             {
                 const float T = (float)s / (float)Segments;
                 float Z = FMath::Lerp(TopZ, BottomZ, T);
-                const float Env = FMath::Sin(T * PI);  // 0 at both ends → mouths stay anchored
+                const float Env = VoxelMath::DetSin(T * PI);  // 0 at both ends → mouths stay anchored
                 float OX = 0.0f, OY = 0.0f;
 
                 switch (Cfg.Style)
@@ -2018,8 +2020,10 @@ void UVoxelStrateManager::GeneratePassages()
                 case EVoxelPassageStyle::Spiral:
                 {
                     const float Ang = PhaseA + T * Cfg.SpiralTurns * 2.0f * PI;
-                    OX = FMath::Cos(Ang) * Cfg.SpiralRadius * Env;
-                    OY = FMath::Sin(Ang) * Cfg.SpiralRadius * Env;
+                    float SinAng = 0.0f, CosAng = 0.0f;
+                    VoxelMath::DetSinCos(SinAng, CosAng, Ang);
+                    OX = CosAng * Cfg.SpiralRadius * Env;
+                    OY = SinAng * Cfg.SpiralRadius * Env;
                     break;
                 }
 
@@ -2029,8 +2033,10 @@ void UVoxelStrateManager::GeneratePassages()
                     const int32 Steps = FMath::Clamp(Cfg.CascadeSteps, 1, 16);
                     const int32 Idx = FMath::Min((int32)(T * Steps), Steps - 1);
                     const float SA = PhaseA + (float)Idx * 2.39996f;  // golden-angle spread
-                    OX = FMath::Cos(SA) * Cfg.CascadeLedge * Env;
-                    OY = FMath::Sin(SA) * Cfg.CascadeLedge * Env;
+                    float SinSA = 0.0f, CosSA = 0.0f;
+                    VoxelMath::DetSinCos(SinSA, CosSA, SA);
+                    OX = CosSA * Cfg.CascadeLedge * Env;
+                    OY = SinSA * Cfg.CascadeLedge * Env;
                     break;
                 }
 
@@ -2042,7 +2048,7 @@ void UVoxelStrateManager::GeneratePassages()
                     // 2D organic wander — it curls and meanders "here and there" rather than
                     // oscillating along one line (zig-zag) or orbiting the axis (spiral).
                     // Flat-top envelope keeps full motion along the length but anchors the mouths.
-                    const float WormEnv = FMath::Clamp(FMath::Sin(T * PI) * 3.0f, 0.0f, 1.0f);
+                    const float WormEnv = FMath::Clamp(VoxelMath::DetSin(T * PI) * 3.0f, 0.0f, 1.0f);
                     OX = PassageFBM(T * BendFreq, NSeedX)         * VOXEL_NOISE_SCALE * Cfg.Wander * WormEnv;
                     OY = PassageFBM(T * BendFreq, NSeedY + 53.0f) * VOXEL_NOISE_SCALE * Cfg.Wander * WormEnv;
                     break;
@@ -2084,7 +2090,9 @@ void UVoxelStrateManager::GeneratePassages()
                 FVector Direction(Delta.X, Delta.Y, 0.0f);
                 if (!Direction.Normalize())
                 {
-                    Direction = FVector(FMath::Cos(Angle), FMath::Sin(Angle), 0.0f);
+                    float SinAngle = 0.0f, CosAngle = 0.0f;
+                    VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+                    Direction = FVector(CosAngle, SinAngle, 0.0f);
                     if (!Direction.Normalize())
                     {
                         Direction = FVector(1.0f, 0.0f, 0.0f);
@@ -2138,8 +2146,9 @@ void UVoxelStrateManager::GeneratePassages()
                 // This is deliberately a construction rule, not a seed-dependent observation.
                 const float SwitchbackAngle =
                     PassageRandom01(PassageSaltUpperDoor) * 2.0f * PI;
-                FVector2D SwitchbackDirection(
-                    FMath::Cos(SwitchbackAngle), FMath::Sin(SwitchbackAngle));
+                float SinSwitchback = 0.0f, CosSwitchback = 0.0f;
+                VoxelMath::DetSinCos(SinSwitchback, CosSwitchback, SwitchbackAngle);
+                FVector2D SwitchbackDirection(CosSwitchback, SinSwitchback);
                 if (!SwitchbackDirection.Normalize())
                 {
                     SwitchbackDirection = FVector2D(1.0f, 0.0f);

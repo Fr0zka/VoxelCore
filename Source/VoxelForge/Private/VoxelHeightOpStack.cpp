@@ -229,7 +229,7 @@ namespace
             if (P.LayerLineDepth <= 0.0f || P.LayerLineSpacing <= 0.0f) { return; }
 
             const float Phase = InOut.Height * (2.0f * PI / P.LayerLineSpacing);
-            InOut.Height -= FMath::Sin(Phase) * P.LayerLineDepth;
+            InOut.Height -= VoxelMath::DetSin(Phase) * P.LayerLineDepth;
         }
 
         // `sin` ∈ [-1,1] ⇒ borne exacte.

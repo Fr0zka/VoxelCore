@@ -2928,7 +2928,7 @@ namespace
         const int32 MaxDownwardSearchCells = FMath::CeilToInt(
             static_cast<float>(MaxStepHeightVoxelsReal));
         const float MaxStepHeightVoxels = static_cast<float>(MaxStepHeightVoxelsReal);
-        const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+        const float MinimumWalkableNormalZ = VoxelMath::DetCos(FMath::DegreesToRadians(
             Settings.PlayerWalkableFloorAngleDegrees));
 
         TArray<float> SupportHeights;
@@ -3263,7 +3263,9 @@ namespace
             const float DirectionAngle = VoxelHash::ToFloat01(
                 VoxelHash::Mix(Site.Hash ^ 0xCAFEBABEu)) * 2.0f * PI;
             const float StretchDistance = Site.RadiusXY * 0.7f;
-            const FVector Direction(FMath::Cos(DirectionAngle), FMath::Sin(DirectionAngle), 0.0f);
+            float SinDirection = 0.0f, CosDirection = 0.0f;
+            VoxelMath::DetSinCos(SinDirection, CosDirection, DirectionAngle);
+            const FVector Direction(CosDirection, SinDirection, 0.0f);
             RoomSDF = VoxelSDF::Capsule(
                 Position,
                 Site.Center + Direction * StretchDistance,
@@ -6823,7 +6825,7 @@ void VoxelCaveMorphology::BuildChunkCache(
                 {
                     const float T = static_cast<float>(ControlIndex)
                         / static_cast<float>(WanderSegments);
-                    const float Envelope = FMath::Sin(T * PI);
+                    const float Envelope = VoxelMath::DetSin(T * PI);
                     FVector WorldControlPoint = FMath::Lerp(WorldEndA, WorldEndB, T);
                     const float RadiusBase = FMath::Lerp(RadA, RadB, T);
                     float ControlRadius = RadiusBase;
@@ -6840,7 +6842,7 @@ void VoxelCaveMorphology::BuildChunkCache(
                         // serpentine route without moving either mouth.
                         const float Side = RawSide * 0.65f + PreviousSide * 0.35f;
                         const float WindWave = bNeedsWind
-                            ? FMath::Sin(static_cast<float>(WindWaves) * PI * T)
+                            ? VoxelMath::DetSin(static_cast<float>(WindWaves) * PI * T)
                                 * WindAmplitude * Envelope
                                 * ((LedgeChoiceHash & 1u) != 0u ? 1.0f : -1.0f)
                             : 0.0f;
@@ -7364,7 +7366,9 @@ void VoxelCaveMorphology::BuildChunkCache(
                 CR.ShapeType = 2;
                 const float DirAngle = VoxelHash::ToFloat01(VoxelHash::Mix(CR.Hash ^ 0xCAFEBABEu)) * 2.0f * PI;
                 const float StretchDist = CR.RadiusXY * 0.7f;
-                const FVector Dir(FMath::Cos(DirAngle), FMath::Sin(DirAngle), 0.0f);
+                float SinDir = 0.0f, CosDir = 0.0f;
+                VoxelMath::DetSinCos(SinDir, CosDir, DirAngle);
+                const FVector Dir(CosDir, SinDir, 0.0f);
                 CR.ShapeA = CR.Center + Dir * StretchDist;
                 CR.ShapeB = CR.Center - Dir * StretchDist;
                 CR.ShapeR = FMath::Min(CR.RadiusXY * 0.6f, CR.RadiusZ);
@@ -7484,8 +7488,8 @@ void VoxelCaveMorphology::BuildChunkCache(
                 const float Angle = VoxelHash::ToFloat01(AH4) * PI;
                 const float HalfSpan = CR.RadiusXY
                     * (0.5f + VoxelHash::ToFloat01(VoxelHash::Mix(AH4)) * 0.35f);
-                const float CosA = FMath::Cos(Angle);
-                const float SinA = FMath::Sin(Angle);
+                float SinA = 0.0f, CosA = 0.0f;
+                VoxelMath::DetSinCos(SinA, CosA, Angle);
                 FCachedArch& Arch = CR.Arches[i];
                 Arch.bActive = true;
                 Arch.EndpointA = FVector(ArcCX - CosA * HalfSpan,
@@ -7517,8 +7521,7 @@ void VoxelCaveMorphology::BuildChunkCache(
                 Pinch.CenterX = PnX;
                 Pinch.CenterY = PnY;
                 Pinch.CenterZ = PnZ;
-                Pinch.CosAngle = FMath::Cos(PnAngle);
-                Pinch.SinAngle = FMath::Sin(PnAngle);
+                VoxelMath::DetSinCos(Pinch.SinAngle, Pinch.CosAngle, PnAngle);
                 Pinch.MaxExtent = FMath::Max(
                     FeatureParams.PinchLength, FeatureParams.PinchStrength) + 5.0f;
                 Pinch.HalfLength = FeatureParams.PinchLength * 0.5f;

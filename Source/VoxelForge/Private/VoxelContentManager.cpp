@@ -501,9 +501,9 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
     for (int32 e = 0; e < Entries.Num(); ++e)
     {
         CosMaxSlope[e] = (Entries[e].Profile.MaxSlopeAngle < 89.99f)
-            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].Profile.MaxSlopeAngle)) : -1.0f;
+            ? VoxelMath::DetCos(FMath::DegreesToRadians(Entries[e].Profile.MaxSlopeAngle)) : -1.0f;
         CosMinSlope[e] = (Entries[e].Profile.MinSlopeAngle > 0.01f)
-            ? FMath::Cos(FMath::DegreesToRadians(Entries[e].Profile.MinSlopeAngle)) : -1.0f;
+            ? VoxelMath::DetCos(FMath::DegreesToRadians(Entries[e].Profile.MinSlopeAngle)) : -1.0f;
     }
 
     // Per-COLUMN biome cache: ResolveBiomeSampleAt's noise-heavy cell classification is box-validated
@@ -647,8 +647,10 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                     const float Ang    = VoxelHash::ToFloat01(IH) * 2.0f * PI;
                     const float RadVox = FMath::Lerp(Comp.RadiusMinVox, Comp.RadiusMaxVox,
                                                      VoxelHash::ToFloat01(VoxelHash::Mix(IH ^ 0x77u)));
-                    const float SatVX = VX + FMath::Cos(Ang) * RadVox;   // voxel, actor-local
-                    const float SatVY = VY + FMath::Sin(Ang) * RadVox;
+                    float SinAng = 0.0f, CosAng = 0.0f;
+                    VoxelMath::DetSinCos(SinAng, CosAng, Ang);
+                    const float SatVX = VX + CosAng * RadVox;   // voxel, actor-local
+                    const float SatVY = VY + SinAng * RadVox;
 
                     // Optional per-satellite gating (relief/moisture/biome-border at ITS own XY).
                     if (Comp.Profile.Conditions.Num() > 0 &&
@@ -693,8 +695,10 @@ void UVoxelContentManager::BuildCellSpawns(const UVoxelGenerator* Gen, const FTr
                             const float SAng    = VoxelHash::ToFloat01(JH) * 2.0f * PI;
                             const float SRadVox = FMath::Lerp(Sub.RadiusMinVox, Sub.RadiusMaxVox,
                                                               VoxelHash::ToFloat01(VoxelHash::Mix(JH ^ 0x77u)));
-                            const float SubVX = SatVX + FMath::Cos(SAng) * SRadVox;
-                            const float SubVY = SatVY + FMath::Sin(SAng) * SRadVox;
+                            float SinSAng = 0.0f, CosSAng = 0.0f;
+                            VoxelMath::DetSinCos(SinSAng, CosSAng, SAng);
+                            const float SubVX = SatVX + CosSAng * SRadVox;
+                            const float SubVY = SatVY + SinSAng * SRadVox;
 
                             if (Sub.Profile.Conditions.Num() > 0 &&
                                 !Gen->EvaluateTerrainConditions(Sub.Profile.Conditions, SubVX, SubVY, Ctx.BiomeCtx)) continue;
@@ -1230,9 +1234,9 @@ bool UVoxelContentManager::SpawnFromProfile(const FPlacementProfile& P, uint32 H
 
     // Surface-tilt gates (acos(|N.Z|); guarded so defaults cost no trig).
     if (P.MaxSlopeAngle < 89.99f &&
-        FMath::Abs(N.Z) < FMath::Cos(FMath::DegreesToRadians(P.MaxSlopeAngle))) return false;
+        FMath::Abs(N.Z) < VoxelMath::DetCos(FMath::DegreesToRadians(P.MaxSlopeAngle))) return false;
     if (P.MinSlopeAngle > 0.01f &&
-        FMath::Abs(N.Z) > FMath::Cos(FMath::DegreesToRadians(P.MinSlopeAngle))) return false;
+        FMath::Abs(N.Z) > VoxelMath::DetCos(FMath::DegreesToRadians(P.MinSlopeAngle))) return false;
 
     const FVector LocalPos(LocalX, LocalY, ZC * VOXEL_SIZE);
     if (P.bRequireWaterRelative && Ctx.bHasWater)

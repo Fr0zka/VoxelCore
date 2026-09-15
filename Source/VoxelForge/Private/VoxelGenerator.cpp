@@ -857,9 +857,18 @@ void VoxelGenLOD::SetThreadSampleStep(int32 Value)
     SampleStep = Value;
 }
 
+void VoxelGenLOD::InitializeConsoleSwitches()
+{
+    VF_ParseFastIsFiniteSwitch();
+    VF_ParseFusedEvaluatorSwitch();
+    VF_ParseWormBlockSkipSwitch();
+    VF_ParseTileCacheWindowSwitch();
+    VF_ParseSpatialIndexSwitch();
+    VF_ParseChunkRoutingCacheSwitch();
+}
+
 bool VoxelGenLOD::IsTileCacheWindowEnabled(bool bFusedPath)
 {
-    VF_ParseTileCacheWindowSwitch();
     if (GVoxelForgeTileCacheWindow == 0)
     {
         return false;
@@ -900,7 +909,6 @@ void VoxelGenLOD::SetThreadTileContext(
 
 bool VoxelGenLOD::ShouldUseSpatialIndex(bool bFusedPath)
 {
-    VF_ParseSpatialIndexSwitch();
     if (GVoxelForgeSpatialIndex >= 0)
     {
         return GVoxelForgeSpatialIndex != 0;
@@ -1126,7 +1134,9 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
                 const float zc = FMath::Lerp(InnerBot + 8.0f, InnerTop - 8.0f,
                                              VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB1u)));
                 const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0xB2u)) * PI;
-                const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
+                float sinAng = 0.0f, cosAng = 0.0f;
+                VoxelMath::DetSinCos(sinAng, cosAng, ang);
+                const float dxu = cosAng, dyu = sinAng;
                 const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
                 const float half = Sp * 0.6f;
                 Bridges.Add({ FVector(bx - dxu * half, by - dyu * half, zc),
@@ -1175,7 +1185,9 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
                     const uint32 h = VoxelHash::Cell(nx, ny, Seed ^ 0x52470001u);
                     if (VoxelHash::ToFloat01(h) > D.RidgeDensity) continue;
                     const float ang = VoxelHash::ToFloat01(VoxelHash::Mix(h ^ 0x9001u)) * PI;
-                    const float dxu = FMath::Cos(ang), dyu = FMath::Sin(ang);
+                    float sinAng = 0.0f, cosAng = 0.0f;
+                    VoxelMath::DetSinCos(sinAng, cosAng, ang);
+                    const float dxu = cosAng, dyu = sinAng;
                     const float bx = (nx + 0.5f) * Sp, by = (ny + 0.5f) * Sp;
                     const float half = Sp * 0.45f;
                     Ridges.Add({ bx - dxu * half, by - dyu * half, bx + dxu * half, by + dyu * half });
@@ -1374,7 +1386,9 @@ static bool VF_AnyBridgeCanTouchLattice(
                 InnerBot + 8.0f, InnerTop - 8.0f,
                 VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB1u)));
             const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB2u)) * PI;
-            const float DXU = FMath::Cos(Angle), DYU = FMath::Sin(Angle);
+            float SinAngle = 0.0f, CosAngle = 0.0f;
+            VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+            const float DXU = CosAngle, DYU = SinAngle;
             const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
             const float Half = Spacing * 0.6f;
             const float HorizontalSq = VF_DistanceSquaredToXYSegment(
@@ -1453,7 +1467,9 @@ static bool VF_AnyRidgeCanTouchLattice(
                 continue;
             }
             const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9001u)) * PI;
-            const float DXU = FMath::Cos(Angle), DYU = FMath::Sin(Angle);
+            float SinAngle = 0.0f, CosAngle = 0.0f;
+            VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+            const float DXU = CosAngle, DYU = SinAngle;
             const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
             const float Half = Spacing * 0.45f;
             if (VF_DistanceSquaredToXYSegment(
@@ -1554,7 +1570,9 @@ static bool VF_AnyBridgeCanTouchBox(
             InnerBot + 8.0f, InnerTop - 8.0f,
             VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB1u)));
         const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xB2u)) * PI;
-        const float DX = FMath::Cos(Angle), DY = FMath::Sin(Angle);
+        float SinAngle = 0.0f, CosAngle = 0.0f;
+        VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+        const float DX = CosAngle, DY = SinAngle;
         const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
         const float Half = Spacing * 0.6f;
         const FVector A(BX - DX * Half, BY - DY * Half, ZC);
@@ -1609,7 +1627,9 @@ static bool VF_AnyRidgeCanTouchBox(
             continue;
         }
         const float Angle = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9001u)) * PI;
-        const float DX = FMath::Cos(Angle), DY = FMath::Sin(Angle);
+        float SinAngle = 0.0f, CosAngle = 0.0f;
+        VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+        const float DX = CosAngle, DY = SinAngle;
         const float BX = (NX + 0.5f) * Spacing, BY = (NY + 0.5f) * Spacing;
         const float Half = Spacing * 0.45f;
         const FVector A(BX - DX * Half, BY - DY * Half, InnerBot);
@@ -2776,7 +2796,6 @@ UVoxelGenerator::UVoxelGenerator()
 
 void UVoxelGenerator::InitializeSettings(const UVoxelSettings* Settings)
 {
-    VF_ParseFastIsFiniteSwitch();
     // Les paramètres globaux sont copiés ici une seule fois : le chemin voxel ne doit pas
     // déréférencer l'asset de settings.
     Seed = Settings ? Settings->GetEffectiveWorldSeed() : 0;
@@ -2817,10 +2836,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
     }
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
-    VF_ParseFastIsFiniteSwitch();
-    VF_ParseFusedEvaluatorSwitch();
-    VF_ParseWormBlockSkipSwitch();
-    VF_ParseChunkRoutingCacheSwitch();
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
@@ -3164,9 +3179,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_Tunnel  = StrateManager->GetGenerationParams(ChunkCoord);
                 // AUDIT §C2 — l'empreinte est calculée ICI, une fois par chunk, au seul endroit où
                 // les params changent. `FStrateGenerationParams` est du POD pur (aucun TArray /
-                // FString / pointeur), donc une CRC mémoire ne peut pas donner de FAUX POSITIF ; au
-                // pire un octet de padding donne un faux MANQUE, c'est-à-dire une reconstruction de
-                // cache. On se trompe du côté du CPU, jamais du côté d'une salle fausse.
+                // FString / pointeur), donc une CRC mémoire peut donner un FAUX POSITIF par
+                // collision CRC32 ; au pire un octet de padding donne aussi un faux MANQUE, c'est-
+                // à-dire une reconstruction de cache. Le risque pratique est une collision, jamais
+                // une salle fausse créée par la seule différence de padding.
                 CP_TunnelFP = FCrc::MemCrc32(&CP_Tunnel, sizeof(CP_Tunnel));
                 break;
             }
@@ -4705,7 +4721,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             // Sine wave along Z: peaks at each line position
             float LinePhase = WorldZ * (2.0f * PI) / Params.LayerLineSpacing;
-            float LineValue = FMath::Sin(LinePhase);
+            float LineValue = VoxelMath::DetSin(LinePhase);
 
             // Sharpen to thin grooves: only carve where sine > 0, then cube it.
             // sin → max(sin, 0) → pow(_, 3) turns broad sine humps into thin spikes
@@ -4735,7 +4751,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         {
             // Sine wave along Z, offset by half-period from layer lines
             float RibPhase = WorldZ * (2.0f * PI) / Params.RibbingSpacing + PI * 0.5f;
-            float RibValue = FMath::Sin(RibPhase);
+            float RibValue = VoxelMath::DetSin(RibPhase);
 
             // Half-wave rectify (only positive → ribs, not grooves) then smooth
             RibValue = FMath::Max(RibValue, 0.0f);
@@ -5720,7 +5736,7 @@ float UVoxelGenerator::ComputeSurfaceTerrainZ(float WorldX, float WorldY,
     if (Params.LayerLineDepth > 0.0f && Params.LayerLineSpacing > 0.0f)
     {
         const float Phase = Terrain * (2.0f * PI / Params.LayerLineSpacing);
-        Terrain -= FMath::Sin(Phase) * Params.LayerLineDepth;
+        Terrain -= VoxelMath::DetSin(Phase) * Params.LayerLineDepth;
     }
 
     // Beach: flatten terrain toward the water line within BeachWidth. (Water level is

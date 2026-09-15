@@ -51,6 +51,148 @@ namespace VoxelMath
     {
         return GFastIsFinite != 0 ? IsFiniteFast(Value) : FMath::IsFinite(Value);
     }
+
+    // Deterministic trigonometry for world decisions.
+    //
+    // The implementation deliberately owns both the range reduction and the polynomial.  It
+    // does not call the CRT, FMath, or a platform vector intrinsic: the same finite float is
+    // reduced by the same constants and evaluated by the same scalar arithmetic on every host.
+    // The reduction is done in double so world-coordinate phases do not lose all low bits before
+    // the period is removed.  The polynomial itself is float arithmetic, matching the values
+    // consumed by the density field and keeping the hot path small.
+    FORCEINLINE void DetSinCos(float& OutSin, float& OutCos, float Value)
+    {
+        if (!IsFiniteFast(Value))
+        {
+            // Non-finite values are outside the world contract.  Preserve the input rather than
+            // entering an undefined integer conversion during range reduction.
+            OutSin = Value;
+            OutCos = Value;
+            return;
+        }
+
+        constexpr double TwoPi = 6.283185307179586476925286766559;
+        constexpr double HalfPi = 1.57079632679489661923132169164;
+
+        // Round the number of complete periods toward the nearest integer.  All measured world
+        // phases are many orders of magnitude below INT64_MAX.  For a pathological finite input
+        // whose period count does not fit in int64, use the exact integer significand from the
+        // float representation and reduce it by fixed binary doubling instead of converting an
+        // out-of-range quotient.
+        const double PeriodsReal = static_cast<double>(Value) / TwoPi;
+        constexpr double MaxSafeInt64 = 9223372036854774784.0;
+        double Reduced = 0.0;
+        if (PeriodsReal >= MaxSafeInt64 || PeriodsReal <= -MaxSafeInt64)
+        {
+            uint32 ValueBits = 0;
+            FMemory::Memcpy(&ValueBits, &Value, sizeof(ValueBits));
+            const uint32 MagnitudeBits = ValueBits & 0x7FFFFFFFu;
+            const uint32 ExponentBits = (MagnitudeBits >> 23) & 0xFFu;
+            const uint32 Significand = (MagnitudeBits & 0x007FFFFFu) | 0x00800000u;
+            const int32 BinaryExponent = static_cast<int32>(ExponentBits) - 127 - 23;
+
+            double ReducedInteger = 0.0;
+            for (int32 Bit = 23; Bit >= 0; --Bit)
+            {
+                ReducedInteger *= 2.0;
+                ReducedInteger += static_cast<double>((Significand >> Bit) & 1u);
+                if (ReducedInteger >= TwoPi)
+                {
+                    ReducedInteger -= TwoPi;
+                }
+            }
+            for (int32 Shift = 0; Shift < BinaryExponent; ++Shift)
+            {
+                ReducedInteger *= 2.0;
+                if (ReducedInteger >= TwoPi)
+                {
+                    ReducedInteger -= TwoPi;
+                }
+            }
+            Reduced = (ValueBits & 0x80000000u) != 0u ? -ReducedInteger : ReducedInteger;
+        }
+        else
+        {
+            int64 Periods = 0;
+            if (PeriodsReal >= 0.0)
+            {
+                Periods = static_cast<int64>(PeriodsReal + 0.5);
+            }
+            else
+            {
+                Periods = static_cast<int64>(PeriodsReal - 0.5);
+            }
+
+            Reduced = static_cast<double>(Value)
+                - static_cast<double>(Periods) * TwoPi;
+        }
+
+        // Reduce the remaining angle to [-pi/4, pi/4].  Both reduction branches above keep
+        // Reduced bounded by one period, so this quadrant conversion is always in int32 range.
+        const double QuadrantReal = Reduced / HalfPi;
+        int32 Quadrant = 0;
+        if (QuadrantReal >= 0.0)
+        {
+            Quadrant = static_cast<int32>(QuadrantReal + 0.5);
+        }
+        else
+        {
+            Quadrant = static_cast<int32>(QuadrantReal - 0.5);
+        }
+        Reduced -= static_cast<double>(Quadrant) * HalfPi;
+        const float Y = static_cast<float>(Reduced);
+        const float Y2 = Y * Y;
+
+        // Fixed minimax polynomials, the same degree as UE's scalar SinCos implementation.  The
+        // quarter-period reduction gives them a smaller interval than UE's [-pi/2, pi/2] path.
+        const float SinP = (((((-2.3889859e-08f * Y2 + 2.7525562e-06f) * Y2
+            - 0.00019840874f) * Y2 + 0.0083333310f) * Y2
+            - 0.16666667f) * Y2 + 1.0f) * Y;
+        const float CosP = (((((-2.6051615e-07f * Y2 + 2.4760495e-05f) * Y2
+            - 0.0013888378f) * Y2 + 0.041666638f) * Y2
+            - 0.5f) * Y2 + 1.0f);
+
+        int32 QuadrantMod = Quadrant % 4;
+        if (QuadrantMod < 0)
+        {
+            QuadrantMod += 4;
+        }
+        switch (QuadrantMod)
+        {
+            case 0:
+                OutSin = SinP;
+                OutCos = CosP;
+                break;
+            case 1:
+                OutSin = CosP;
+                OutCos = -SinP;
+                break;
+            case 2:
+                OutSin = -SinP;
+                OutCos = -CosP;
+                break;
+            default:
+                OutSin = -CosP;
+                OutCos = SinP;
+                break;
+        }
+    }
+
+    FORCEINLINE float DetSin(float Value)
+    {
+        float SinValue = 0.0f;
+        float CosValue = 0.0f;
+        DetSinCos(SinValue, CosValue, Value);
+        return SinValue;
+    }
+
+    FORCEINLINE float DetCos(float Value)
+    {
+        float SinValue = 0.0f;
+        float CosValue = 0.0f;
+        DetSinCos(SinValue, CosValue, Value);
+        return CosValue;
+    }
 }
 
 //=============================================================================

@@ -1405,7 +1405,7 @@ namespace VoxelStrateMeasurePrivate
         const int32 MaxDownwardSearchCells = static_cast<int32>(
             FMath::CeilToDouble(MaxStepHeightVoxelsReal));
         const float MaxStepHeightVoxels = static_cast<float>(MaxStepHeightVoxelsReal);
-        const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+        const float MinimumWalkableNormalZ = VoxelMath::DetCos(FMath::DegreesToRadians(
             Settings.PlayerWalkableFloorAngleDegrees));
 
         TArray<FIntPoint> SupportOffsets;

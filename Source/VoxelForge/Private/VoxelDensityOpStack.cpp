@@ -7504,7 +7504,7 @@ namespace
             if (!(DistFromSurface < LineRange)) { return; }
 
             const float LinePhase = WorldZ * (2.0f * PI) / LP.LayerLineSpacing;
-            float LineValue = FMath::Sin(LinePhase);
+            float LineValue = VoxelMath::DetSin(LinePhase);
 
             LineValue = FMath::Max(LineValue, 0.0f);
             LineValue = LineValue * LineValue * LineValue;   // affûtage cubique
@@ -7606,7 +7606,7 @@ namespace
             if (!(DistFromSurface < RibRange)) { return; }
 
             const float RibPhase = WorldZ * (2.0f * PI) / LP.RibbingSpacing + PI * 0.5f;
-            float RibValue = FMath::Sin(RibPhase);
+            float RibValue = VoxelMath::DetSin(RibPhase);
 
             RibValue = FMath::Max(RibValue, 0.0f);
             RibValue = RibValue * RibValue;   // profil de bosse arrondi

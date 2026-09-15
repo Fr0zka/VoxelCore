@@ -990,7 +990,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    const float MinimumWalkableNormalZ = FMath::Cos(FMath::DegreesToRadians(
+    const float MinimumWalkableNormalZ = VoxelMath::DetCos(FMath::DegreesToRadians(
         CharacterFitSettings.PlayerWalkableFloorAngleDegrees));
     const int32 SupportFootprintColumns = VF_CountSupportFootprintColumns(
         CharacterFitSettings.PlayerCapsuleRadiusVoxels);

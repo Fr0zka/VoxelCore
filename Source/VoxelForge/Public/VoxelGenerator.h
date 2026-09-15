@@ -9,6 +9,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "UObject/Object.h"
 #include "VoxelTypes.h"
 #include "VoxelStrateTypes.h"
 #include "VoxelBiomeTypes.h"
@@ -73,6 +74,8 @@ namespace VoxelGenLOD
     VOXELFORGE_API void SetThreadOctaveBias(int32 Value);
     VOXELFORGE_API int32 GetThreadSampleStep();
     VOXELFORGE_API void SetThreadSampleStep(int32 Value);
+    // Called by the module's game-thread startup before any worker can enter GetDensityAt.
+    VOXELFORGE_API void InitializeConsoleSwitches();
     VOXELFORGE_API bool IsTileCacheWindowEnabled(bool bFusedPath = true);
     VOXELFORGE_API bool GetThreadTileCacheWindow(
         FIntVector& OutOriginVoxels, int32& OutStep, int32& OutCellsPerAxis);

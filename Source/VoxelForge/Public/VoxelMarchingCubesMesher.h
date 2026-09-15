@@ -44,6 +44,10 @@ class VOXELFORGE_API UVoxelMarchingCubesMesher : public UObject
     GENERATED_BODY()
 
 public:
+    // Parse command-line switches on the module's game-thread startup.  GenerateMesh is a worker
+    // entry point and therefore only reads the resulting values.
+    static void InitializeConsoleSwitches();
+
     /**
      * Génère le mesh d'une TUILE de clipmap (voir FVoxelTileKey).
      *

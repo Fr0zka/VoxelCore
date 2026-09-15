@@ -82,6 +82,12 @@ namespace
     }
 }
 
+void UVoxelMarchingCubesMesher::InitializeConsoleSwitches()
+{
+    VF_ParseOperatorBlockSwitch();
+    VF_ParseTilePostReachSwitches();
+}
+
 //=============================================================================
 // MAIN ALGORITHM
 //=============================================================================
@@ -94,8 +100,6 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                                                        int64* OutDensitySampleCount)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_MesherGenerateMesh);
-    VF_ParseOperatorBlockSwitch();
-    VF_ParseTilePostReachSwitches();
     FVoxelMeshData MeshData;
     if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (OutDensitySampleCount) { *OutDensitySampleCount = 0; }

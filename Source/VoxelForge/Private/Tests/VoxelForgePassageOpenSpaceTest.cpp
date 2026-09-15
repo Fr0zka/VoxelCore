@@ -963,8 +963,10 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         for (int32 RingSample = 0; RingSample < RingSampleCount; ++RingSample)
         {
             const float Angle = 2.0f * PI * (float)RingSample / (float)RingSampleCount;
-            const float SampleX = Passage.LowerPoint.X + FMath::Cos(Angle) * RingRadius;
-            const float SampleY = Passage.LowerPoint.Y + FMath::Sin(Angle) * RingRadius;
+            float SinAngle = 0.0f, CosAngle = 0.0f;
+            VoxelMath::DetSinCos(SinAngle, CosAngle, Angle);
+            const float SampleX = Passage.LowerPoint.X + CosAngle * RingRadius;
+            const float SampleY = Passage.LowerPoint.Y + SinAngle * RingRadius;
             const float Density = World.Generator->GetDensityAt(
                 SampleX,
                 SampleY,
@@ -1115,7 +1117,7 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                 LandingGradient = MaxGradient;
                 WorstLandingFloorGradient = FMath::Max(WorstLandingFloorGradient, MaxGradient);
                 const float NormalZ = 1.0f / FMath::Sqrt(1.0f + MaxGradient * MaxGradient);
-                bFloorPassed = NormalZ + KINDA_SMALL_NUMBER >= FMath::Cos(
+                bFloorPassed = NormalZ + KINDA_SMALL_NUMBER >= VoxelMath::DetCos(
                     FMath::DegreesToRadians(LandingWalkableAngleDegrees));
             }
 
