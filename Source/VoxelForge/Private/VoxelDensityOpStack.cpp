@@ -6410,7 +6410,7 @@ namespace
                     uint8 Result = 0u;
                     auto AddSegment = [&](const FVector& A, const FVector& BPoint,
                                            float RadiusA, float RadiusB,
-                                           bool bWorldChain)
+                                           bool bWorldChain, int32 SegmentIndex)
                     {
                         if (!Finite((float)A.X) || !Finite((float)A.Y)
                             || !Finite((float)A.Z) || !Finite((float)BPoint.X)
@@ -6438,14 +6438,33 @@ namespace
 
                         if (bWorldChain)
                         {
-                            const float FloorA = VoxelPassageGeometry::TunnelFloorZ(
+                            const float NaturalFloorA = VoxelPassageGeometry::TunnelFloorZ(
                                 A, SafeRadiusA);
-                            const float FloorB = VoxelPassageGeometry::TunnelFloorZ(
+                            const float NaturalFloorB = VoxelPassageGeometry::TunnelFloorZ(
                                 BPoint, SafeRadiusB);
+                            float FloorMin = FMath::Min(NaturalFloorA, NaturalFloorB);
+                            float FloorMax = FMath::Max(NaturalFloorA, NaturalFloorB);
+                            const TArray<FTunnelFloorSegmentProfile>* FloorProfiles =
+                                &Tunnel.WorldFloorProfiles;
+                            if (FloorProfiles->Num() == Tunnel.WorldControlPoints.Num() - 1
+                                && SegmentIndex >= 0
+                                && SegmentIndex < FloorProfiles->Num())
+                            {
+                                // The interval proof must include an explicit ledge's vertical
+                                // riser.  The profile transition is evaluated at the segment
+                                // boundary, so its endpoint interval is a conservative superset
+                                // of both plateau sides and remains valid for the lattice proof.
+                                const FTunnelFloorSegmentProfile& Profile =
+                                    (*FloorProfiles)[SegmentIndex];
+                                FloorMin = FMath::Min(FloorMin, FMath::Min(
+                                    Profile.StartFloorZ, Profile.EndFloorZ));
+                                FloorMax = FMath::Max(FloorMax, FMath::Max(
+                                    Profile.StartFloorZ, Profile.EndFloorZ));
+                            }
                             const float SupportRadius = FMath::Max(
                                 FMath::Min(SafeRadiusA, SafeRadiusB) - 0.5f,
                                 VoxelPassageGeometry::PlayerRadiusVoxels);
-                            if (!Finite(FloorA) || !Finite(FloorB)
+                            if (!Finite(FloorMin) || !Finite(FloorMax)
                                 || !Finite(SupportRadius))
                             {
                                 Result = 3u;
@@ -6456,10 +6475,10 @@ namespace
                                     FMath::Max(A.X, BPoint.X) + SupportRadius,
                                     FMath::Min(A.Y, BPoint.Y) - SupportRadius,
                                     FMath::Max(A.Y, BPoint.Y) + SupportRadius,
-                                    FMath::Min(FloorA, FloorB)
-                                        - VoxelPassageGeometry::LandingFloorThicknessVoxels,
-                                    FMath::Max(FloorA, FloorB)
-                                        + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels))
+                                     FloorMin
+                                         - VoxelPassageGeometry::LandingFloorThicknessVoxels,
+                                     FloorMax
+                                         + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels))
                             {
                                 Result |= 2u;
                             }
@@ -6476,7 +6495,7 @@ namespace
                                 Tunnel.WorldControlPoints[SegmentIndex],
                                 Tunnel.WorldControlPoints[SegmentIndex + 1],
                                 Tunnel.WorldControlRadii[SegmentIndex],
-                                Tunnel.WorldControlRadii[SegmentIndex + 1], true);
+                                Tunnel.WorldControlRadii[SegmentIndex + 1], true, SegmentIndex);
                             if (Result == 3u) { return Result; }
                         }
                     }
@@ -6491,21 +6510,21 @@ namespace
                                 Tunnel.ControlPoints[SegmentIndex],
                                 Tunnel.ControlPoints[SegmentIndex + 1],
                                 Tunnel.ControlRadii[SegmentIndex],
-                                Tunnel.ControlRadii[SegmentIndex + 1], false);
+                                Tunnel.ControlRadii[SegmentIndex + 1], false, SegmentIndex);
                             if (Result == 3u) { return Result; }
                         }
                     }
                     else if (Tunnel.bHasMidpoint)
                     {
                         AddSegment(Tunnel.EndpointA, Tunnel.Midpoint,
-                                   Tunnel.RadiusA, Tunnel.RadiusMid, false);
+                                   Tunnel.RadiusA, Tunnel.RadiusMid, false, INDEX_NONE);
                         AddSegment(Tunnel.Midpoint, Tunnel.EndpointB,
-                                   Tunnel.RadiusMid, Tunnel.RadiusB, false);
+                                   Tunnel.RadiusMid, Tunnel.RadiusB, false, INDEX_NONE);
                     }
                     else
                     {
                         AddSegment(Tunnel.EndpointA, Tunnel.EndpointB,
-                                   Tunnel.RadiusA, Tunnel.RadiusB, false);
+                                   Tunnel.RadiusA, Tunnel.RadiusB, false, INDEX_NONE);
                     }
                     return Result;
                 }

@@ -692,14 +692,13 @@ struct VOXELFORGE_API FStrateGenerationParams
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor")
     bool bTunnelFloorEnabled = true;
 
-    // Enables the floor profile's terrace decisions. With the default legacy ledge preference of
-    // zero, this preserves the existing per-segment walkable staircase. A positive preference
-    // selects the build-time whole-chain ledge policy.
+    // Enables deterministic selection of a few dramatic ledges on steep graph-redundant or leaf
+    // tunnels. It never enables staircase quantisation: walk-critical steep edges wind instead.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor")
     bool bTunnelFloorTerracingEnabled = true;
 
-    // Maximum riser height used by the compatibility/per-segment profile, in voxels. The default
-    // is the previous 1.8 voxel step with its 0.95 safety margin (1.71 voxels).
+    // Retained for serialized asset compatibility. It is no longer used to quantise a tunnel into
+    // per-segment steps; ledge height is controlled by TunnelFloorMaxLedgeHeight.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
         meta = (ClampMin = "0.0"))
     float TunnelFloorTerraceStepHeight = 1.71f;
@@ -710,20 +709,22 @@ struct VOXELFORGE_API FStrateGenerationParams
         meta = (ClampMin = "0.0"))
     float TunnelFloorMaxLedgeHeight = 12.0f;
 
-    // Whole-chain floor gradient below which the tunnel descends continuously instead of placing
-    // ledges. The default is tan(44 degrees), matching the walkable-floor bound.
+    // Floor gradient threshold for a direct route. At or below it, the floor is a smooth ramp. A
+    // steeper walk-critical edge receives a longer winding route; an eligible edge may receive
+    // deterministic dramatic ledges instead. The default is tan(44 degrees).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
         meta = (ClampMin = "0.0"))
     float TunnelFloorGentleSlopeThreshold = 0.9656888f;
 
-    // Preferred number of large ledges for a steep whole-chain floor. Zero is the compatibility
-    // mode (the old per-segment step-count rule); positive values request that many transitions,
-    // subject to the max-height and available control-segment constraints.
+    // Preferred number of large ledges for a steep eligible floor. Zero selects the deterministic
+    // height-driven count; positive values request at least that many transitions, subject to the
+    // max-height and available control-segment constraints. This field never requests stairs.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
         meta = (ClampMin = "0", ClampMax = "32"))
     int32 TunnelFloorLedgeCountPreference = 0;
 
-    // Safety bound on the number of transitions emitted by either floor profile.
+    // Safety bound on the number of dramatic transitions emitted by a floor profile. The runtime
+    // also caps the actual chain to a small finite number of broad ledges.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
         meta = (ClampMin = "1", ClampMax = "4096"))
     int32 TunnelFloorMaxLedges = 4096;

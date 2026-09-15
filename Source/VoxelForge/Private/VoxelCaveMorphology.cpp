@@ -336,52 +336,14 @@ namespace
             * Envelope * ReliefScale;
     }
 
-    FORCEINLINE bool VF_TunnelFloorNeedsTerrace(
-        const FVector& A, float RadiusA,
-        const FVector& B, float RadiusB)
-    {
-        const float HorizontalRun = FVector2D(
-            static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
-        const float FloorDelta = FMath::Abs(
-            VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB))
-            - VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)));
-        return HorizontalRun > KINDA_SMALL_NUMBER
-            && FloorDelta > HorizontalRun
-                * VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
-    }
-
     FORCEINLINE float VF_TunnelFloorProfileT(
         const FVector& A, float RadiusA,
         const FVector& B, float RadiusB,
         float T)
     {
-        const float FloorA = VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA));
-        const float FloorB = VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB));
-        const float HorizontalRun = FVector2D(
-            static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
-        const float FloorDelta = FloorB - FloorA;
-        if (VF_TunnelFloorNeedsTerrace(A, RadiusA, B, RadiusB))
-        {
-            // A steep room-to-room change is a staircase, not a steep walking ramp.  Every
-            // vertical riser is at most the authored 45 cm player step; climbing systems may
-            // still choose to treat those risers as explicit climb surfaces later.
-            // Leave a small deterministic margin for floating-point evaluation at the riser. The
-            // terrace has no relief (see VF_TunnelFloorReliefScale), so this is the complete
-            // adjacent-column step budget rather than a visual tuning constant.
-            constexpr float TerraceStepSafety = 0.95f;
-            const float SafeStepHeight =
-                VoxelPassageGeometry::MaxStepHeightVoxels * TerraceStepSafety;
-            const int32 NumSteps = FMath::Clamp(
-                FMath::CeilToInt(FMath::Abs(FloorDelta)
-                    / SafeStepHeight),
-                1, 4096);
-            const float ClampedT = FMath::Clamp(T, 0.0f, 1.0f);
-            const float StairT = ClampedT >= 1.0f
-                ? 1.0f
-                : FMath::FloorToFloat(ClampedT * static_cast<float>(NumSteps))
-                    / static_cast<float>(NumSteps);
-            return StairT;
-        }
+        // Legacy/cache fallback is deliberately continuous.  A malformed or old cache may no
+        // longer manufacture a staircase from a per-sample step count; safe callers either use
+        // the authored profile or retain the smooth tapered-capsule floor.
         return FMath::Clamp(T, 0.0f, 1.0f);
     }
 
@@ -398,14 +360,6 @@ namespace
             return 0.0f;
         }
 
-        // A terrace already consumes the available vertical step at its risers.  Keeping the
-        // terrace segments level and relief-free makes the adjacent-column step bound exact;
-        // gentle segments retain the bounded authored relief below.
-        if (VF_TunnelFloorNeedsTerrace(A, RadiusA, B, RadiusB))
-        {
-            return 0.0f;
-        }
-
         const float HorizontalRun = FVector2D(
             static_cast<float>(B.X - A.X), static_cast<float>(B.Y - A.Y)).Size();
         if (!(HorizontalRun > KINDA_SMALL_NUMBER))
@@ -416,11 +370,12 @@ namespace
         const float FloorDelta = FMath::Abs(
             VoxelPassageGeometry::TunnelFloorZ(B, FMath::Abs(RadiusB))
             - VoxelPassageGeometry::TunnelFloorZ(A, FMath::Abs(RadiusA)));
-        const float BaseGradient = VF_TunnelFloorNeedsTerrace(
-            A, RadiusA, B, RadiusB)
-            ? 0.0f : FloorDelta / HorizontalRun;
-        const float AvailableGradient =
-            VoxelPassageGeometry::PlayerWalkableFloorMaxGradient - BaseGradient;
+        const float BaseGradient = FloorDelta / HorizontalRun;
+        const float GentleThreshold = VoxelMath::IsFinite(
+                Tunnel.TunnelFloorGentleSlopeThreshold)
+            ? FMath::Max(Tunnel.TunnelFloorGentleSlopeThreshold, 0.0f)
+            : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
+        const float AvailableGradient = GentleThreshold - BaseGradient;
         if (!(AvailableGradient > 0.0f))
         {
             return 0.0f;
@@ -478,8 +433,11 @@ namespace
             return 0.0f;
         }
 
-        const float AvailableGradient =
-            VoxelPassageGeometry::PlayerWalkableFloorMaxGradient - BaseGradient;
+        const float GentleThreshold = VoxelMath::IsFinite(
+                Tunnel.TunnelFloorGentleSlopeThreshold)
+            ? FMath::Max(Tunnel.TunnelFloorGentleSlopeThreshold, 0.0f)
+            : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
+        const float AvailableGradient = GentleThreshold - BaseGradient;
         if (!(AvailableGradient > 0.0f))
         {
             return 0.0f;
@@ -518,6 +476,7 @@ namespace
         const TArray<FVector>& ControlPoints,
         const TArray<float>& ControlRadii,
         const FCachedTunnel& Tunnel,
+        const TArray<int32>* FloorLedgeLevels,
         TArray<FTunnelFloorSegmentProfile>& OutProfiles)
     {
         OutProfiles.Reset();
@@ -537,49 +496,15 @@ namespace
                 ControlPoints[Index], FMath::Abs(ControlRadii[Index]));
         }
 
-        const float GentleThreshold = VoxelMath::IsFinite(
-                Tunnel.TunnelFloorGentleSlopeThreshold)
-            ? FMath::Max(Tunnel.TunnelFloorGentleSlopeThreshold, 0.0f)
-            : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
-        const float LegacyStepHeight = VoxelMath::IsFinite(
-                Tunnel.TunnelFloorTerraceStepHeight)
-            ? FMath::Max(Tunnel.TunnelFloorTerraceStepHeight, 0.0f)
-            : 0.0f;
-        const int32 MaxLedges = FMath::Clamp(
-            Tunnel.TunnelFloorMaxLedges, 1, 4096);
-        const int32 PreferredLedges = FMath::Max(
-            Tunnel.TunnelFloorLedgeCountPreference, 0);
-
-        bool bGlobalTerrace = false;
-        int32 GlobalLedgeCount = 0;
-        if (Tunnel.bTunnelFloorTerracingEnabled && PreferredLedges > 0)
-        {
-            float TotalHorizontalRun = 0.0f;
-            for (int32 SegmentIndex = 0; SegmentIndex < NumSegments; ++SegmentIndex)
-            {
-                TotalHorizontalRun += FVector2D(
-                    static_cast<float>(ControlPoints[SegmentIndex + 1].X
-                        - ControlPoints[SegmentIndex].X),
-                    static_cast<float>(ControlPoints[SegmentIndex + 1].Y
-                        - ControlPoints[SegmentIndex].Y)).Size();
-            }
-            const float TotalFloorDelta = FMath::Abs(
-                FloorAtControl.Last() - FloorAtControl[0]);
-            bGlobalTerrace = TotalHorizontalRun > KINDA_SMALL_NUMBER
-                && TotalFloorDelta > TotalHorizontalRun * GentleThreshold;
-            if (bGlobalTerrace)
-            {
-                const float MaxLedgeHeight = VoxelMath::IsFinite(
-                        Tunnel.TunnelFloorMaxLedgeHeight)
-                    ? FMath::Max(Tunnel.TunnelFloorMaxLedgeHeight, KINDA_SMALL_NUMBER)
-                    : KINDA_SMALL_NUMBER;
-                const int32 HeightDrivenCount = FMath::CeilToInt(
-                    TotalFloorDelta / MaxLedgeHeight);
-                GlobalLedgeCount = FMath::Clamp(
-                    FMath::Max(PreferredLedges, HeightDrivenCount),
-                    1, FMath::Min(MaxLedges, NumSegments));
-            }
-        }
+        const int32 MaxLedges = FMath::Clamp(Tunnel.TunnelFloorMaxLedges, 1, 4096);
+        const int32 AuthoredLedgeCount = FMath::Clamp(
+            Tunnel.TunnelFloorAuthoredLedgeCount, 1,
+            FMath::Min(MaxLedges, FMath::Max(1, NumSegments)));
+        const bool bHasLedgeLevels = Tunnel.bDramaticLedge
+            && AuthoredLedgeCount > 0
+            && FloorLedgeLevels != nullptr
+            && FloorLedgeLevels->Num() == ControlPoints.Num();
+        const float TotalFloorDelta = FloorAtControl.Last() - FloorAtControl[0];
 
         for (int32 SegmentIndex = 0; SegmentIndex < NumSegments; ++SegmentIndex)
         {
@@ -595,45 +520,28 @@ namespace
             Profile.EndFloorZ = FloorB;
             Profile.NaturalStartFloorZ = FloorA;
             Profile.NaturalEndFloorZ = FloorB;
+            Profile.bLedgeTransition = false;
             Profile.NumSteps = 0;
 
-            if (bGlobalTerrace && GlobalLedgeCount > 0)
+            if (bHasLedgeLevels)
             {
-                // Place at most one transition at a control-point boundary. Rounding the
-                // normalized control index distributes the few requested ledges over the full
-                // chain and, because the count is capped by NumSegments, never skips a level.
-                const int32 StartLevel = FMath::RoundToInt(
-                    static_cast<float>(SegmentIndex * GlobalLedgeCount)
-                        / static_cast<float>(NumSegments));
-                const int32 EndLevel = FMath::RoundToInt(
-                    static_cast<float>((SegmentIndex + 1) * GlobalLedgeCount)
-                        / static_cast<float>(NumSegments));
-                const float TotalDelta = FloorAtControl.Last() - FloorAtControl[0];
+                // The graph builder has already selected the few boundaries. The profile records
+                // one explicit vertical transition there; it never quantises samples inside the
+                // segment, so a steep edge cannot turn into a staircase.
+                const int32 StartLevel = FMath::Clamp(
+                    (*FloorLedgeLevels)[SegmentIndex], 0, AuthoredLedgeCount);
+                const int32 EndLevel = FMath::Clamp(
+                    (*FloorLedgeLevels)[SegmentIndex + 1], 0, AuthoredLedgeCount);
                 Profile.StartFloorZ = FloorAtControl[0]
-                    + TotalDelta * static_cast<float>(StartLevel)
-                        / static_cast<float>(GlobalLedgeCount);
+                    + TotalFloorDelta * static_cast<float>(StartLevel)
+                        / static_cast<float>(AuthoredLedgeCount);
                 Profile.EndFloorZ = FloorAtControl[0]
-                    + TotalDelta * static_cast<float>(EndLevel)
-                        / static_cast<float>(GlobalLedgeCount);
-                // A ledge is a level transition in either direction.  The old one-sided test
-                // accidentally left descending tunnels as a ramp, which is the exact opposite
-                // of the authored "few large drops" policy.
-                Profile.NumSteps = EndLevel != StartLevel ? 1 : 0;
-            }
-            else if (Tunnel.bTunnelFloorTerracingEnabled
-                && PreferredLedges == 0
-                && HorizontalRun > KINDA_SMALL_NUMBER
-                && LegacyStepHeight > KINDA_SMALL_NUMBER
-                && FMath::Abs(FloorB - FloorA)
-                    > HorizontalRun * GentleThreshold)
-            {
-                Profile.NumSteps = FMath::Clamp(
-                    FMath::CeilToInt(FMath::Abs(FloorB - FloorA)
-                        / LegacyStepHeight),
-                    1, MaxLedges);
+                    + TotalFloorDelta * static_cast<float>(EndLevel)
+                        / static_cast<float>(AuthoredLedgeCount);
+                Profile.bLedgeTransition = EndLevel != StartLevel;
             }
 
-            const bool bTransition = Profile.NumSteps > 0
+            const bool bTransition = Profile.bLedgeTransition
                 && !FMath::IsNearlyEqual(Profile.StartFloorZ, Profile.EndFloorZ);
             const float ProfileGradient = (!bTransition && HorizontalRun > KINDA_SMALL_NUMBER)
                 ? FMath::Abs(Profile.EndFloorZ - Profile.StartFloorZ) / HorizontalRun
@@ -652,20 +560,14 @@ namespace
             uint64 Ledges8Plus = 0;
             for (const FTunnelFloorSegmentProfile& Profile : OutProfiles)
             {
-                if (Profile.NumSteps > 0)
+                if (Profile.bLedgeTransition)
                 {
-                    // In whole-chain mode NumSteps is a transition marker. Compatibility mode
-                    // retains the old per-segment count, so report the actual authored step count
-                    // in both cases.
-                    AuthoredLedges += bGlobalTerrace
-                        ? 1u : static_cast<uint64>(Profile.NumSteps);
-                    const float HeightPerLedge = FMath::Abs(
-                        Profile.EndFloorZ - Profile.StartFloorZ)
-                        / static_cast<float>(bGlobalTerrace
-                            ? 1 : FMath::Max(Profile.NumSteps, 1));
-                    if (HeightPerLedge < 2.0f) { ++LedgesBelow2; }
-                    else if (HeightPerLedge < 4.0f) { ++Ledges2To4; }
-                    else if (HeightPerLedge < 8.0f) { ++Ledges4To8; }
+                    ++AuthoredLedges;
+                    const float LedgeHeight = FMath::Abs(
+                        Profile.EndFloorZ - Profile.StartFloorZ);
+                    if (LedgeHeight < 2.0f) { ++LedgesBelow2; }
+                    else if (LedgeHeight < 4.0f) { ++Ledges2To4; }
+                    else if (LedgeHeight < 8.0f) { ++Ledges4To8; }
                     else { ++Ledges8Plus; }
                 }
             }
@@ -827,12 +729,10 @@ namespace
         if (FloorProfile != nullptr)
         {
             const float ClampedT = FMath::Clamp(T, 0.0f, 1.0f);
-            const float ProfileT = FloorProfile->NumSteps > 0
+            const float ProfileT = FloorProfile->bLedgeTransition
                 ? (ClampedT >= 1.0f
                     ? 1.0f
-                    : FMath::FloorToFloat(ClampedT
-                        * static_cast<float>(FloorProfile->NumSteps))
-                        / static_cast<float>(FloorProfile->NumSteps))
+                    : 0.0f)
                 : ClampedT;
             Terms.BaseFloorZ = FMath::Lerp(
                 FloorProfile->StartFloorZ, FloorProfile->EndFloorZ, ProfileT);
@@ -1056,13 +956,15 @@ namespace
             // the original call, preserving the natural path exactly.  The provisional shift
             // excludes relief only long enough to decide whether the bounded relief can matter;
             // the final shift below includes the actual cached column value.
-            // Preference 0 is the compatibility profile: keep its established floor field and
-            // its established capsule so the default archetype does not silently change.  A
-            // positive ledge preference is an explicit authored-shape opt-in; there the baked
-            // profile owns both the floor and the arch and the capsule follows it at evaluation.
+            // Every complete build-time profile owns the floor.  A route that was deliberately
+            // wound, or that contains an explicit ledge transition, also moves the swept capsule
+            // with that authored floor.  A direct smooth ramp keeps the established natural arch
+            // and lets the SmoothMax floor cut provide the walkable D-floor; this avoids changing
+            // headroom in every gentle tunnel merely because a profile is now always present.
             const bool bUseAuthoredProfile = bApplyFloorCut
                 && Profile != nullptr
-                && Tunnel.TunnelFloorLedgeCountPreference > 0;
+                && Tunnel.bTunnelFloorEnabled
+                && (Tunnel.bFloorRouteWasWound || Tunnel.bDramaticLedge);
             const bool bAnchorCapsule = bUseAuthoredProfile
                 && VoxelMath::IsFinite(NaturalFloorZ);
             const auto EvaluateAnchoredCapsule = [
@@ -1682,6 +1584,7 @@ void FChunkSDFCache::Reset()
     RoomFloorJoins.Reset();
     for (FCachedTunnel& Tunnel : Tunnels)
     {
+        Tunnel.FloorLedgeLevels.Reset();
         Tunnel.FloorProfiles.Reset();
         Tunnel.WorldFloorProfiles.Reset();
     }
@@ -1765,6 +1668,7 @@ VoxelDensityProfile::FCacheMemoryBreakdown FChunkSDFCache::GetAllocatedSizeBreak
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.ControlRadii);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlPoints);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldControlRadii);
+        Breakdown.TunnelsBytes += ArrayBytes(Tunnel.FloorLedgeLevels);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.FloorProfiles);
         Breakdown.TunnelsBytes += ArrayBytes(Tunnel.WorldFloorProfiles);
     }
@@ -2175,6 +2079,9 @@ static bool VF_ComputeRoomGraphReach(
         Params.TunnelWarpStrength,
         Params.TunnelHorizontalBias,
         Params.TunnelEndpointZOffset,
+        Params.TunnelFloorTerraceStepHeight,
+        Params.TunnelFloorMaxLedgeHeight,
+        Params.TunnelFloorGentleSlopeThreshold,
         Params.SDFBlendRadius,
         Params.CaveWarpStrength,
         Params.CaveWarpFrequency,
@@ -2199,6 +2106,9 @@ static bool VF_ComputeRoomGraphReach(
         || Params.TunnelMinRadius < 0.0f
         || Params.TunnelMaxRadius < 0.0f
         || Params.SDFBlendRadius < 0.0f
+        || Params.TunnelFloorTerraceStepHeight < 0.0f
+        || Params.TunnelFloorMaxLedgeHeight < 0.0f
+        || Params.TunnelFloorGentleSlopeThreshold < 0.0f
         || FMath::Abs(Params.FloorReliefStrength) > 1000000.0f
         || FMath::Abs(Params.CaveWarpStrength) > 1000000.0f
         || FMath::Abs(Params.RoomFloorCutMin) > 1000000.0f
@@ -2251,9 +2161,10 @@ static bool VF_ComputeRoomGraphReach(
     const float MaxInfluence = FMath::Max(DirectRoomReach, TunnelInfluence);
 
     // A fitted tunnel mouth may move by one bounded cave-warp displacement in
-    // each XY axis. The chain then wanders by at most 25.5% of its authored
-    // length. Bound the endpoint's possible Z correction too, because that
-    // length controls the lateral wander even though the preflight is XY-only.
+    // each XY axis. The chain may also grow a deterministic switchback when a
+    // direct room-floor route exceeds the gentle-slope limit. Bound the
+    // endpoint's possible Z correction too, because it controls the required
+    // route length even though the preflight is XY-only.
     const float CaveWarpRaw = FMath::Abs(Params.CaveWarpStrength)
         * VOXEL_NOISE_SCALE;
     const float CaveWarpEnvelope = CaveWarpRaw * 1.5f;
@@ -2285,8 +2196,22 @@ static bool VF_ComputeRoomGraphReach(
     const float TunnelTubeReach = TunnelRadiusEnvelope
         + WorldFloorPad + BlendEnvelope * 3.0f
         + CaveWarpEnvelope + 2.0f;
+    // A steep room-floor delta is now solved by a deterministic lateral route rather than by
+    // quantising the floor into small risers.  Bound the route's possible lateral amplitude with
+    // the same finite endpoint envelope used above.  This is intentionally conservative: the
+    // actual chain uses a handful of switchback waves and never exceeds this reach.
+    const float GentleSlopeThreshold = FMath::Max(
+        Params.TunnelFloorGentleSlopeThreshold, KINDA_SMALL_NUMBER);
+    const float MaxFloorDeltaEnvelope = 2.0f * EndpointVertical;
+    const float RequiredRouteRunEnvelope = MaxFloorDeltaEnvelope
+        / GentleSlopeThreshold;
+    const float OrganicLateralEnvelope = FMath::Min(
+        FMath::Abs(Params.TunnelWarpStrength), TunnelLengthBound * 0.25f);
+    const float RouteLateralEnvelope = FMath::Max(
+        8.0f,
+        OrganicLateralEnvelope + RequiredRouteRunEnvelope);
     const float PairAabbReach = EndpointXY
-        + TunnelLengthBound * 0.255f
+        + RouteLateralEnvelope
         + FMath::Max(MaxInfluence, TunnelTubeReach);
     const float PairZReach = EndpointVertical + TunnelTubeReach;
     // A stored feature can depend on a nearest-neighbour candidate two graph hops away: A's
@@ -6189,6 +6114,13 @@ void VoxelCaveMorphology::BuildChunkCache(
     auto PossibleTunnelTouchesSearchXY = [&](const FBuildRoom& RoomA,
                                              const FBuildRoom& RoomB) -> bool
     {
+        // If the finite reach proof declined the authored parameter envelope, do not use a
+        // hand-written approximation here. Building the edge is the safe fallback and preserves
+        // the malformed-input behavior of the old path.
+        if (!bHasFeatureReach)
+        {
+            return true;
+        }
         const float RadiusA = FMath::Abs(RoomA.RadiusXY);
         const float RadiusB = FMath::Abs(RoomB.RadiusXY);
         const float RoomEndpointShift = FMath::Max(
@@ -6197,12 +6129,11 @@ void VoxelCaveMorphology::BuildChunkCache(
             0.5f,
             FMath::Max(FMath::Abs(Params.TunnelMinRadius),
                        FMath::Abs(Params.TunnelMaxRadius)) * 1.18f);
-        const float ChainReach = RoomEndpointShift
-            + FMath::Abs(Params.TunnelWarpStrength)
-            + TunnelRadius
-            + FMath::Max(
+        const float ChainReach = FMath::Max(
+            FeatureReach.PairAabbReach,
+            RoomEndpointShift + TunnelRadius + FMath::Max(
                 FMath::Max(Params.SDFBlendRadius, 0.0f) * 3.0f,
-                VoxelPassageGeometry::LandingFloorThicknessVoxels);
+                VoxelPassageGeometry::LandingFloorThicknessVoxels));
         if (!VoxelMath::IsFinite(CaveWarpBound)
             || !VoxelMath::IsFinite(ChainReach)
             || ChainReach < 0.0f
@@ -6473,6 +6404,171 @@ void VoxelCaveMorphology::BuildChunkCache(
     RoomConnected.Init(false, NumRooms);
     TArray<FBuildRoomMouthRise, TInlineAllocator<64>> RoomMouthRises;
 
+    struct FResolvedGraphEdge
+    {
+        int32 RoomA = INDEX_NONE;
+        int32 RoomB = INDEX_NONE;
+        bool bBackbone = false;
+        bool bRedundant = false;
+        bool bLeaf = false;
+        bool bWalkForestEdge = false;
+    };
+
+    // Resolve the complete graph before emitting any geometry.  Ledge eligibility is a graph
+    // property, not a chunk-window property: an edge may drop only when it is incident to a leaf or
+    // when removing it leaves another route between its endpoints.  All other edges must wind.
+    // The collect region contains the complete candidate neighbourhood for every stored edge, so
+    // this bridge test is also window-invariant.
+    TArray<FResolvedGraphEdge, TInlineAllocator<128>> GraphEdges;
+    TArray<int32, TInlineAllocator<64>> GraphDegrees;
+    GraphDegrees.Init(0, NumRooms);
+    for (int32 I = 0; I < NumRooms; ++I)
+    {
+        for (int32 J = I + 1; J < NumRooms; ++J)
+        {
+            const FBuildRoom& RoomA = BuildRooms[I];
+            const FBuildRoom& RoomB = BuildRooms[J];
+            bool bBackbone = (NearestNeighbor[I] == J) || (NearestNeighbor[J] == I);
+
+            if (bBackbone && (RoomA.bIsOrigin || RoomB.bIsOrigin))
+            {
+                const int32 Other = RoomA.bIsOrigin ? J : I;
+                if (OriginDowngraded.Contains(Other))
+                {
+                    bBackbone = false;
+                }
+            }
+
+            const float EuclidDist = FVector::Dist(RoomA.Center, RoomB.Center);
+            float CheckDist = EuclidDist;
+            if (!bBackbone && Params.TunnelHorizontalBias > 0.0f)
+            {
+                const float VertSep = FMath::Abs(RoomA.Center.Z - RoomB.Center.Z);
+                CheckDist += VertSep * Params.TunnelHorizontalBias * 5.0f;
+            }
+            if (CheckDist > Params.MaxTunnelLength)
+            {
+                continue;
+            }
+
+            if (!bBackbone)
+            {
+                const uint32 PairHash = VoxelHash::Pair(
+                    RoomA.CellX, RoomA.CellY,
+                    RoomB.CellX, RoomB.CellY,
+                    StrateSeed);
+                if (VoxelHash::ToFloat01(PairHash) >= Params.TunnelDensity)
+                {
+                    continue;
+                }
+            }
+
+            FResolvedGraphEdge& Edge = GraphEdges.Emplace_GetRef();
+            Edge.RoomA = I;
+            Edge.RoomB = J;
+            Edge.bBackbone = bBackbone;
+            RoomConnected[I] = true;
+            RoomConnected[J] = true;
+            ++GraphDegrees[I];
+            ++GraphDegrees[J];
+        }
+    }
+
+    TArray<TArray<int32>, TInlineAllocator<64>> GraphAdjacency;
+    GraphAdjacency.SetNum(NumRooms);
+    for (int32 EdgeIndex = 0; EdgeIndex < GraphEdges.Num(); ++EdgeIndex)
+    {
+        const FResolvedGraphEdge& Edge = GraphEdges[EdgeIndex];
+        GraphAdjacency[Edge.RoomA].Add(EdgeIndex);
+        GraphAdjacency[Edge.RoomB].Add(EdgeIndex);
+    }
+    TArray<int32, TInlineAllocator<64>> GraphDiscovery;
+    TArray<int32, TInlineAllocator<64>> GraphLowLink;
+    TArray<uint8, TInlineAllocator<128>> GraphBridges;
+    GraphDiscovery.Init(INDEX_NONE, NumRooms);
+    GraphLowLink.Init(INDEX_NONE, NumRooms);
+    GraphBridges.Init(0u, GraphEdges.Num());
+    int32 GraphDiscoveryTime = 0;
+    TFunction<void(int32, int32)> VisitGraph = [&](int32 Node, int32 ParentEdge)
+    {
+        GraphDiscovery[Node] = GraphDiscoveryTime;
+        GraphLowLink[Node] = GraphDiscoveryTime;
+        ++GraphDiscoveryTime;
+        for (const int32 EdgeIndex : GraphAdjacency[Node])
+        {
+            if (EdgeIndex == ParentEdge)
+            {
+                continue;
+            }
+            const FResolvedGraphEdge& Edge = GraphEdges[EdgeIndex];
+            const int32 Other = Edge.RoomA == Node ? Edge.RoomB : Edge.RoomA;
+            if (GraphDiscovery[Other] == INDEX_NONE)
+            {
+                VisitGraph(Other, EdgeIndex);
+                GraphLowLink[Node] = FMath::Min(
+                    GraphLowLink[Node], GraphLowLink[Other]);
+                if (GraphLowLink[Other] > GraphDiscovery[Node])
+                {
+                    GraphBridges[EdgeIndex] = 1u;
+                }
+            }
+            else
+            {
+                GraphLowLink[Node] = FMath::Min(
+                    GraphLowLink[Node], GraphDiscovery[Other]);
+            }
+        }
+    };
+    for (int32 Node = 0; Node < NumRooms; ++Node)
+    {
+        if (GraphDiscovery[Node] == INDEX_NONE)
+        {
+            VisitGraph(Node, INDEX_NONE);
+        }
+    }
+    for (int32 EdgeIndex = 0; EdgeIndex < GraphEdges.Num(); ++EdgeIndex)
+    {
+        FResolvedGraphEdge& Edge = GraphEdges[EdgeIndex];
+        Edge.bRedundant = GraphBridges[EdgeIndex] == 0u;
+        Edge.bLeaf = GraphDegrees[Edge.RoomA] <= 1
+            || GraphDegrees[Edge.RoomB] <= 1;
+    }
+
+    // Independent bridge tests are not enough for a batch of drops: two non-bridge edges from the
+    // same cycle can become a cut when selected together. Reserve a deterministic spanning forest
+    // before the hash choice so every non-leaf room remains connected by walkable edges even when
+    // several redundant edges receive ledges. Leaf edges are still allowed to drop by policy.
+    TArray<uint8, TInlineAllocator<128>> GraphForestVisited;
+    TArray<uint8, TInlineAllocator<128>> GraphForestEdges;
+    GraphForestVisited.Init(0u, NumRooms);
+    GraphForestEdges.Init(0u, GraphEdges.Num());
+    TFunction<void(int32)> VisitWalkForest = [&](int32 Node)
+    {
+        GraphForestVisited[Node] = 1u;
+        for (const int32 EdgeIndex : GraphAdjacency[Node])
+        {
+            const FResolvedGraphEdge& Edge = GraphEdges[EdgeIndex];
+            const int32 Other = Edge.RoomA == Node ? Edge.RoomB : Edge.RoomA;
+            if (GraphForestVisited[Other] != 0u)
+            {
+                continue;
+            }
+            GraphForestEdges[EdgeIndex] = 1u;
+            VisitWalkForest(Other);
+        }
+    };
+    for (int32 Node = 0; Node < NumRooms; ++Node)
+    {
+        if (GraphForestVisited[Node] == 0u)
+        {
+            VisitWalkForest(Node);
+        }
+    }
+    for (int32 EdgeIndex = 0; EdgeIndex < GraphEdges.Num(); ++EdgeIndex)
+    {
+        GraphEdges[EdgeIndex].bWalkForestEdge = GraphForestEdges[EdgeIndex] != 0u;
+    }
+
     const auto ResolvePlayerFitPoint = [](FBuildRoom& Room, const FStrateGenerationParams& InParams,
                                           uint32 InWorldSeed) -> bool
     {
@@ -6501,52 +6597,12 @@ void VoxelCaveMorphology::BuildChunkCache(
         return Room.bHasPlayerFitPoint;
     };
 
-    for (int32 I = 0; I < NumRooms; I++)
+    for (const FResolvedGraphEdge& GraphEdge : GraphEdges)
     {
-        for (int32 J = I + 1; J < NumRooms; J++)
-        {
+            const int32 I = GraphEdge.RoomA;
+            const int32 J = GraphEdge.RoomB;
             const FBuildRoom& RoomA = BuildRooms[I];
             const FBuildRoom& RoomB = BuildRooms[J];
-            bool bBackbone = (NearestNeighbor[I] == J) || (NearestNeighbor[J] == I);
-
-            // Origin cap: downgrade backbone links beyond the deterministic top-N.
-            if (bBackbone && (RoomA.bIsOrigin || RoomB.bIsOrigin))
-            {
-                const int32 Other = RoomA.bIsOrigin ? J : I;
-                if (OriginDowngraded.Contains(Other))
-                {
-                    bBackbone = false;  // Let TunnelDensity decide instead
-                }
-            }
-
-            // --- DISTANCE CHECK ---
-            const float EuclidDist = FVector::Dist(RoomA.Center, RoomB.Center);
-            float CheckDist = EuclidDist;
-
-            // Horizontal bias: penalize vertical separation for non-backbone tunnels
-            if (!bBackbone && Params.TunnelHorizontalBias > 0.0f)
-            {
-                const float VertSep = FMath::Abs(RoomA.Center.Z - RoomB.Center.Z);
-                CheckDist += VertSep * Params.TunnelHorizontalBias * 5.0f;
-            }
-
-            if (CheckDist > Params.MaxTunnelLength) continue;
-
-            // --- CONNECTION DECISION ---
-            if (!bBackbone)
-            {
-                const uint32 PairHash = VoxelHash::Pair(
-                    RoomA.CellX, RoomA.CellY,
-                    RoomB.CellX, RoomB.CellY,
-                    StrateSeed
-                );
-                const float ConnectChance = VoxelHash::ToFloat01(PairHash);
-                if (ConnectChance >= Params.TunnelDensity) continue;
-            }
-
-            // Connection DECIDED (backbone or density roll) — both rooms are reachable.
-            RoomConnected[I] = true;
-            RoomConnected[J] = true;
 
             if (!PossibleTunnelTouchesSearchXY(RoomA, RoomB))
             {
@@ -6650,24 +6706,95 @@ void VoxelCaveMorphology::BuildChunkCache(
             // chain of hash-jittered control points instead. The chain is keyed only by the pair
             // hash, so every chunk that collects this edge reconstructs the same path; the wide
             // collect region above keeps that topology seam-safe. The envelope is zero at both
-            // mouths so the room/tunnel join remains anchored, while the interior is allowed to
-            // wander in the horizontal plane perpendicular to the tunnel axis.
+            // mouths so the room/tunnel join remains anchored.
             //
-            // The cache stores the graph in SDF coordinates, but the player walks in world
-            // coordinates. Building the chain directly in SDF space made the non-linear cave warp
-            // bend the floor and could turn a modest authored slope into a vertical severance.
-            // Pick the exact world-space mouth anchors by inversion, lay out the wandering chain
-            // there, then map each control point back into SDF space. This keeps the generated
-            // route deterministic and seam-safe while making its walkable floor the authored
-            // world-space interpolation between the two room floors.
+            // A direct room-floor delta beyond the strate's gentle threshold is solved in one of
+            // two ways. A walk-critical edge gets a sinusoidal switchback whose horizontal length
+            // is chosen from the actual floor delta. A graph-redundant or leaf edge may instead
+            // receive a deterministic handful of explicit ledge transitions. Both decisions are
+            // made before the SDF chain is derived, so the world chain is the authoritative
+            // walkability route and the warped chain remains an exact representation of it.
+            const float WorldFloorA = static_cast<float>(WorldEndA.Z)
+                - FMath::Abs(RadA);
+            const float WorldFloorB = static_cast<float>(WorldEndB.Z)
+                - FMath::Abs(RadB);
+            const float FloorDelta = WorldFloorB - WorldFloorA;
+            const float DirectHorizontalRun = FVector2D(
+                static_cast<float>(WorldEndB.X - WorldEndA.X),
+                static_cast<float>(WorldEndB.Y - WorldEndA.Y)).Size();
+            const float GentleThreshold = VoxelMath::IsFinite(
+                    Params.TunnelFloorGentleSlopeThreshold)
+                ? FMath::Max(Params.TunnelFloorGentleSlopeThreshold, 0.0f)
+                : VoxelPassageGeometry::PlayerWalkableFloorMaxGradient;
+            const float SafeGentleThreshold = FMath::Max(
+                GentleThreshold, KINDA_SMALL_NUMBER);
+            const bool bDirectSteep = VoxelMath::IsFinite(WorldFloorA)
+                && VoxelMath::IsFinite(WorldFloorB)
+                && FMath::Abs(FloorDelta)
+                    > FMath::Max(DirectHorizontalRun, KINDA_SMALL_NUMBER)
+                        * SafeGentleThreshold;
+            const bool bGraphLedgeEligible = GraphEdge.bLeaf
+                || (GraphEdge.bRedundant && !GraphEdge.bWalkForestEdge);
+            const uint32 LedgeChoiceHash = VoxelHash::Mix(
+                TunnelHash ^ 0xC1A0E5EDu);
+            constexpr float DramaticLedgeChance = 0.35f;
+            const bool bDramaticLedge = Params.bTunnelFloorEnabled
+                && Params.bTunnelFloorTerracingEnabled
+                && bDirectSteep
+                && bGraphLedgeEligible
+                && VoxelHash::ToFloat01(LedgeChoiceHash) < DramaticLedgeChance;
+            CT.bLedgeGraphEligible = bGraphLedgeEligible;
+            CT.bDramaticLedge = bDramaticLedge;
+
+            const int32 MaxLedges = FMath::Clamp(
+                Params.TunnelFloorMaxLedges, 1, 4096);
+            const int32 PreferredLedges = FMath::Max(
+                Params.TunnelFloorLedgeCountPreference, 0);
+            const float MaxLedgeHeight = VoxelMath::IsFinite(
+                    Params.TunnelFloorMaxLedgeHeight)
+                ? FMath::Max(Params.TunnelFloorMaxLedgeHeight, KINDA_SMALL_NUMBER)
+                : KINDA_SMALL_NUMBER;
+            const int32 HeightDrivenLedges = FMath::Max(
+                1, FMath::CeilToInt(FMath::Abs(FloorDelta) / MaxLedgeHeight));
+            const int32 RequestedLedges = FMath::Max(
+                PreferredLedges, HeightDrivenLedges);
+            // The chain deliberately has a finite number of broad control spans. Even an authored
+            // max of 4096 cannot turn into a thin staircase; a long change is represented by at
+            // most sixteen large drops separated by walkable spans.
+            const int32 ChainLedgeCount = bDramaticLedge
+                ? FMath::Clamp(RequestedLedges, 1, FMath::Min(MaxLedges, 16))
+                : 0;
+            CT.TunnelFloorAuthoredLedgeCount = ChainLedgeCount;
+
             const float TunnelLength = FVector::Dist(WorldEndA, WorldEndB);
-            const int32 WanderSegments = TunnelLength > 1.0f
-                ? FMath::Clamp(FMath::CeilToInt(TunnelLength / 48.0f), 3, 12)
+            const int32 BaseSegmentDivisor = bDirectSteep ? 40 : 48;
+            const int32 BaseSegmentMin = bDirectSteep ? 4 : 3;
+            const int32 BaseSegmentMax = bDirectSteep ? 16 : 12;
+            const int32 BaseSegments = TunnelLength > 1.0f
+                ? FMath::Clamp(
+                    FMath::CeilToInt(TunnelLength / static_cast<float>(BaseSegmentDivisor)),
+                    BaseSegmentMin, BaseSegmentMax)
                 : 1;
-            CT.ControlPoints.Reserve(WanderSegments + 1);
-            CT.ControlRadii.Reserve(WanderSegments + 1);
-            CT.WorldControlPoints.Reserve(WanderSegments + 1);
-            CT.WorldControlRadii.Reserve(WanderSegments + 1);
+            const int32 MinSegmentsForLedges = ChainLedgeCount > 0
+                ? FMath::Max(3, ChainLedgeCount * 2)
+                : 1;
+            const int32 WanderSegments = FMath::Clamp(
+                FMath::Max(BaseSegments, MinSegmentsForLedges),
+                1, 32);
+
+            const bool bNeedsWind = bDirectSteep
+                && !bDramaticLedge
+                && GentleThreshold > KINDA_SMALL_NUMBER;
+            CT.bFloorRouteWasWound = bNeedsWind;
+            const float RequiredHorizontalRun = bNeedsWind
+                ? FMath::Abs(FloorDelta) / SafeGentleThreshold
+                : DirectHorizontalRun;
+            const int32 WindWaves = bNeedsWind
+                ? FMath::Clamp(
+                    FMath::CeilToInt(RequiredHorizontalRun
+                        / FMath::Max(DirectHorizontalRun, 16.0f)),
+                    1, 6)
+                : 0;
 
             FVector HorizontalAxis(
                 WorldEndB.X - WorldEndA.X, WorldEndB.Y - WorldEndA.Y, 0.0f);
@@ -6681,75 +6808,222 @@ void VoxelCaveMorphology::BuildChunkCache(
                 PerpA = FVector::RightVector;
             }
 
+            CT.WorldControlPoints.SetNum(WanderSegments + 1);
+            CT.WorldControlRadii.SetNum(WanderSegments + 1);
             const float MaxWander = FMath::Min(
-                FMath::Max(Params.TunnelWarpStrength, 0.0f), TunnelLength * 0.25f);
+                FMath::Max(Params.TunnelWarpStrength, 0.0f),
+                FMath::Max(TunnelLength, DirectHorizontalRun) * 0.25f);
             const float MaxRadiusVariation = 0.18f;
-            float PreviousSide = 0.0f;
+            auto PopulateWorldChain = [&](float WindAmplitude)
+            {
+                float PreviousSide = 0.0f;
+                for (int32 ControlIndex = 0;
+                     ControlIndex <= WanderSegments;
+                     ++ControlIndex)
+                {
+                    const float T = static_cast<float>(ControlIndex)
+                        / static_cast<float>(WanderSegments);
+                    const float Envelope = FMath::Sin(T * PI);
+                    FVector WorldControlPoint = FMath::Lerp(WorldEndA, WorldEndB, T);
+                    const float RadiusBase = FMath::Lerp(RadA, RadB, T);
+                    float ControlRadius = RadiusBase;
+
+                    if (ControlIndex > 0 && ControlIndex < WanderSegments)
+                    {
+                        const uint32 PointHash = VoxelHash::Mix(
+                            TunnelHash ^ (0xBADC0DEu
+                                + static_cast<uint32>(ControlIndex) * 0x9E3779B9u));
+                        const float RawSide = VoxelHash::ToFloatSigned(
+                            VoxelHash::Mix(PointHash ^ 0x13579BDFu));
+                        // The original low-pass remains the organic baseline. Wind is a separate
+                        // deterministic alternating wave, which gives critical edges a visible
+                        // serpentine route without moving either mouth.
+                        const float Side = RawSide * 0.65f + PreviousSide * 0.35f;
+                        const float WindWave = bNeedsWind
+                            ? FMath::Sin(static_cast<float>(WindWaves) * PI * T)
+                                * WindAmplitude * Envelope
+                                * ((LedgeChoiceHash & 1u) != 0u ? 1.0f : -1.0f)
+                            : 0.0f;
+                        WorldControlPoint += PerpA * (
+                            Side * MaxWander * Envelope + WindWave);
+                        PreviousSide = Side;
+
+                        const float RadiusNoise = VoxelHash::ToFloatSigned(
+                            VoxelHash::Mix(PointHash ^ 0x5A17EADu));
+                        ControlRadius = FMath::Max(
+                            0.5f,
+                            RadiusBase * (1.0f + RadiusNoise * MaxRadiusVariation * Envelope));
+                    }
+                    else if (ControlIndex == 0)
+                    {
+                        PreviousSide = 0.0f;
+                    }
+
+                    // Pin the endpoints after all arithmetic. This is the seam and room-mouth
+                    // contract: no residual sin(PI) or interpolation rounding moves a mouth.
+                    if (ControlIndex == 0)
+                    {
+                        WorldControlPoint = WorldEndA;
+                        ControlRadius = RadA;
+                    }
+                    else if (ControlIndex == WanderSegments)
+                    {
+                        WorldControlPoint = WorldEndB;
+                        ControlRadius = RadB;
+                    }
+                    CT.WorldControlPoints[ControlIndex] = WorldControlPoint;
+                    CT.WorldControlRadii[ControlIndex] = ControlRadius;
+                }
+            };
+            auto HorizontalPolylineLength = [&]() -> float
+            {
+                float Length = 0.0f;
+                for (int32 Index = 0; Index < WanderSegments; ++Index)
+                {
+                    const FVector& A = CT.WorldControlPoints[Index];
+                    const FVector& B = CT.WorldControlPoints[Index + 1];
+                    Length += FVector2D(
+                        static_cast<float>(B.X - A.X),
+                        static_cast<float>(B.Y - A.Y)).Size();
+                }
+                return Length;
+            };
+
+            PopulateWorldChain(0.0f);
+            if (bNeedsWind)
+            {
+                const float TargetRun = FMath::Max(
+                    RequiredHorizontalRun, DirectHorizontalRun);
+                float LowAmplitude = 0.0f;
+                float HighAmplitude = FMath::Max(
+                    8.0f, TargetRun - DirectHorizontalRun);
+                PopulateWorldChain(HighAmplitude);
+                for (int32 Expand = 0;
+                     Expand < 8 && HorizontalPolylineLength() < TargetRun;
+                     ++Expand)
+                {
+                    HighAmplitude = FMath::Max(
+                        HighAmplitude * 2.0f, TargetRun);
+                    PopulateWorldChain(HighAmplitude);
+                }
+                for (int32 Iteration = 0; Iteration < 12; ++Iteration)
+                {
+                    const float MidAmplitude = (LowAmplitude + HighAmplitude) * 0.5f;
+                    PopulateWorldChain(MidAmplitude);
+                    if (HorizontalPolylineLength() < TargetRun)
+                    {
+                        LowAmplitude = MidAmplitude;
+                    }
+                    else
+                    {
+                        HighAmplitude = MidAmplitude;
+                    }
+                }
+                PopulateWorldChain(HighAmplitude);
+            }
+
+            TArray<float, TInlineAllocator<32>> CumulativeHorizontal;
+            CumulativeHorizontal.SetNumZeroed(WanderSegments + 1);
+            for (int32 Index = 0; Index < WanderSegments; ++Index)
+            {
+                const FVector& A = CT.WorldControlPoints[Index];
+                const FVector& B = CT.WorldControlPoints[Index + 1];
+                CumulativeHorizontal[Index + 1] = CumulativeHorizontal[Index]
+                    + FVector2D(
+                        static_cast<float>(B.X - A.X),
+                        static_cast<float>(B.Y - A.Y)).Size();
+            }
+            const float TotalHorizontalRun = CumulativeHorizontal.Last();
+            CT.FloorLedgeLevels.Reset();
+            if (ChainLedgeCount > 0)
+            {
+                CT.FloorLedgeLevels.SetNum(WanderSegments + 1);
+            }
             for (int32 ControlIndex = 0;
                  ControlIndex <= WanderSegments;
                  ++ControlIndex)
             {
-                const float T = static_cast<float>(ControlIndex)
-                    / static_cast<float>(WanderSegments);
-                const float Envelope = FMath::Sin(T * PI);
-                FVector WorldControlPoint = FMath::Lerp(WorldEndA, WorldEndB, T);
-                const float RadiusBase = FMath::Lerp(RadA, RadB, T);
-                float ControlRadius = RadiusBase;
+                const float ArcLengthAlpha = TotalHorizontalRun > KINDA_SMALL_NUMBER
+                    ? CumulativeHorizontal[ControlIndex] / TotalHorizontalRun
+                    : static_cast<float>(ControlIndex)
+                        / static_cast<float>(WanderSegments);
+                // Direct gentle tunnels retain their established parameter-linear chain. A
+                // winding route needs horizontal arc length for its slope budget, and a ledge
+                // route needs it to distribute the few explicit transitions along the route.
+                const float RouteAlpha = (bNeedsWind || ChainLedgeCount > 0)
+                    ? ArcLengthAlpha
+                    : static_cast<float>(ControlIndex)
+                        / static_cast<float>(WanderSegments);
+                const int32 LedgeLevel = ChainLedgeCount > 0
+                    ? FMath::Clamp(FMath::RoundToInt(
+                        RouteAlpha * static_cast<float>(ChainLedgeCount)),
+                        0, ChainLedgeCount)
+                    : 0;
+                if (ChainLedgeCount > 0)
+                {
+                    CT.FloorLedgeLevels[ControlIndex] = LedgeLevel;
+                }
+                const float AuthoredFloor = ChainLedgeCount > 0
+                    ? WorldFloorA + FloorDelta * static_cast<float>(LedgeLevel)
+                        / static_cast<float>(ChainLedgeCount)
+                    : WorldFloorA + FloorDelta * RouteAlpha;
+                CT.WorldControlPoints[ControlIndex].Z = (bNeedsWind || ChainLedgeCount > 0)
+                    ? AuthoredFloor + FMath::Abs(CT.WorldControlRadii[ControlIndex])
+                    : FMath::Lerp(WorldEndA.Z, WorldEndB.Z,
+                        static_cast<float>(ControlIndex)
+                            / static_cast<float>(WanderSegments));
+            }
+            // Pin Z as well as XY after the arc-length floor assignment. The profile starts and
+            // ends at the exact room-mouth feet planes even when the route has no horizontal run.
+            CT.WorldControlPoints[0] = WorldEndA;
+            CT.WorldControlPoints.Last() = WorldEndB;
 
-                if (ControlIndex > 0 && ControlIndex < WanderSegments)
-                {
-                    const uint32 PointHash = VoxelHash::Mix(
-                        TunnelHash ^ (0xBADC0DEu
-                            + static_cast<uint32>(ControlIndex) * 0x9E3779B9u));
-                    const float RawSide = VoxelHash::ToFloatSigned(
-                        VoxelHash::Mix(PointHash ^ 0x13579BDFu));
-                    // A short deterministic low-pass keeps the chain organic instead of making
-                    // every control point a sharp alternating zig-zag.
-                    const float Side = RawSide * 0.65f + PreviousSide * 0.35f;
-                    WorldControlPoint += PerpA * (Side * MaxWander * Envelope);
-                    PreviousSide = Side;
-
-                    const float RadiusNoise = VoxelHash::ToFloatSigned(
-                        VoxelHash::Mix(PointHash ^ 0x5A17EADu));
-                    ControlRadius = FMath::Max(
-                        0.5f,
-                        RadiusBase * (1.0f + RadiusNoise * MaxRadiusVariation * Envelope));
-                }
-                else if (ControlIndex == 0)
-                {
-                    PreviousSide = 0.0f;
-                }
-
-                // Pin the endpoints after all arithmetic. This is the seam and room-mouth
-                // contract: no residual sin(PI) or interpolation rounding moves a mouth.
-                if (ControlIndex == 0)
-                {
-                    WorldControlPoint = WorldEndA;
-                    ControlRadius = RadA;
-                }
-                else if (ControlIndex == WanderSegments)
-                {
-                    WorldControlPoint = WorldEndB;
-                    ControlRadius = RadB;
-                }
-                CT.WorldControlPoints.Add(WorldControlPoint);
-                CT.WorldControlRadii.Add(ControlRadius);
+            CT.ControlPoints.Reserve(WanderSegments + 1);
+            CT.ControlRadii.Reserve(WanderSegments + 1);
+            for (int32 ControlIndex = 0;
+                 ControlIndex <= WanderSegments;
+                 ++ControlIndex)
+            {
+                const FVector& WorldControlPoint = CT.WorldControlPoints[ControlIndex];
                 const FVector ControlPoint = (ControlIndex == 0)
                     ? EndA
                     : ((ControlIndex == WanderSegments)
                         ? EndB
                         : VF_ApplyCaveWarp(WorldControlPoint, Params, Seed));
                 CT.ControlPoints.Add(ControlPoint);
-                CT.ControlRadii.Add(ControlRadius);
+                CT.ControlRadii.Add(CT.WorldControlRadii[ControlIndex]);
+            }
+
+            if (VoxelDensityProfile::AreCountersEnabled())
+            {
+                if (bDirectSteep)
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelFloorSteepEdges);
+                }
+                if (bNeedsWind)
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelFloorWindingEdges);
+                }
+                if (bDramaticLedge)
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::TunnelFloorDropEdges);
+                }
+                VoxelDensityProfile::AddCounter(
+                    VoxelDensityProfile::ECounter::TunnelFloorMultiStepEdges, 0);
             }
 
             // Author the complete floor profile once, after both representations of the chain
             // are known. Evaluation now only projects onto this immutable profile; no sample can
             // independently decide how many terraces the tunnel needs.
             VF_BuildTunnelFloorProfile(
-                CT.ControlPoints, CT.ControlRadii, CT, CT.FloorProfiles);
+                CT.ControlPoints, CT.ControlRadii, CT, &CT.FloorLedgeLevels,
+                CT.FloorProfiles);
             VF_BuildTunnelFloorProfile(
-                CT.WorldControlPoints, CT.WorldControlRadii, CT, CT.WorldFloorProfiles);
+                CT.WorldControlPoints, CT.WorldControlRadii, CT, &CT.FloorLedgeLevels,
+                CT.WorldFloorProfiles);
             CT.bHasCompleteFloorProfile = CT.FloorProfiles.Num() == CT.ControlPoints.Num() - 1
                 && CT.FloorProfiles.Num() > 0;
             CT.bHasCompleteWorldFloorProfile = CT.WorldFloorProfiles.Num()
@@ -6903,7 +7177,6 @@ void VoxelCaveMorphology::BuildChunkCache(
             {
                 OutCache.Tunnels.Add(CT);
             }
-        }
     }
 
     //==========================================================================

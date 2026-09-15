@@ -635,10 +635,12 @@ struct FCachedRoomFloorJoin
     float BoundRadiusSq = 0.0f;
 };
 
-// One immutable floor segment authored while the tunnel chain is built. NumSteps == 0 is a
-// continuous segment; a positive value quantizes the interpolation to that many whole-chain
-// ledge intervals. ReliefScale is baked with the same derivative bound as the old evaluator, so
-// evaluation only reads this profile and never decides terrace count per voxel.
+// One immutable floor segment authored while the tunnel chain is built. The floor is continuous
+// unless bLedgeTransition is set; that marker means the segment terminates at a deliberate
+// dramatic ledge and the vertical riser is placed at the next control-point boundary. NumSteps is
+// retained as a compatibility/diagnostic field and is always zero for newly authored tunnels: a
+// steep floor is never quantised into a staircase. ReliefScale is baked with a derivative bound,
+// so evaluation only reads this profile and never decides a floor shape per voxel.
 struct FTunnelFloorSegmentProfile
 {
     float StartFloorZ = 0.0f;
@@ -649,6 +651,9 @@ struct FTunnelFloorSegmentProfile
     float NaturalStartFloorZ = 0.0f;
     float NaturalEndFloorZ = 0.0f;
     float ReliefScale = 0.0f;
+    bool bLedgeTransition = false;
+    // Deprecated staircase count. New profiles leave this at zero; keep the member so old
+    // diagnostic consumers can still compile while the authored representation has one meaning.
     int32 NumSteps = 0;
 };
 
@@ -676,6 +681,10 @@ struct FCachedTunnel
     // malformed/legacy caches fall back to the old local evaluator.
     TArray<FTunnelFloorSegmentProfile> FloorProfiles;
     TArray<FTunnelFloorSegmentProfile> WorldFloorProfiles;
+    // For a dramatic ledge, these monotonic levels identify the control-point boundaries at which
+    // the few large drops occur. Both SDF and world profiles share the boundaries, while each
+    // coordinate space supplies its own endpoint heights.
+    TArray<int32> FloorLedgeLevels;
     bool bHasCompleteFloorProfile = false;
     bool bHasCompleteWorldFloorProfile = false;
     // The corridor floor is a swept SmoothMax cut, not a later slab.  These are copied from the
@@ -710,6 +719,10 @@ struct FCachedTunnel
     float TunnelFloorGentleSlopeThreshold = 0.9656888f;
     int32 TunnelFloorLedgeCountPreference = 0;
     int32 TunnelFloorMaxLedges = 4096;
+    bool bDramaticLedge = false;
+    bool bLedgeGraphEligible = false;
+    bool bFloorRouteWasWound = false;
+    int32 TunnelFloorAuthoredLedgeCount = 0;
     FVector WorldBoundCenter = FVector::ZeroVector;
     float WorldBoundRadiusSq = 0.0f;
     // Centerline AABBs and scalar influence radii used by the immutable broad phase.  The

@@ -136,6 +136,12 @@ namespace VoxelDensityProfile
         TunnelFloorProfileLedges2To4Voxels,
         TunnelFloorProfileLedges4To8Voxels,
         TunnelFloorProfileLedges8PlusVoxels,
+        // One count per authored graph edge.  MultiStepEdges is an invariant guard: it must stay
+        // zero now that old per-segment staircase quantisation is removed.
+        TunnelFloorSteepEdges,
+        TunnelFloorWindingEdges,
+        TunnelFloorDropEdges,
+        TunnelFloorMultiStepEdges,
         PassageSupportFloorBackstopFires,
         PassageNativeFloorCompositions,
         PassageCandidates,
