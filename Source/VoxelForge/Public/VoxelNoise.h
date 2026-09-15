@@ -357,6 +357,33 @@ FORCEINLINE void Perlin3D_x4(const float* Xs, const float* Ys, const float* Zs, 
 }
 #endif
 
+// Three independent channels are the hot cave-warp shape.  On x86, evaluate them as three lanes
+// of the existing four-wide implementation; the unused fourth lane is deliberate.  The scalar
+// fallback keeps the exact three-call behavior on platforms without the SIMD path.  This helper is
+// the owner of the cave-warp channel evaluation so generator, op-stack, and room-fit callers cannot
+// drift into different noise formulas or channel offsets.
+FORCEINLINE void Perlin3D_x3(
+    float X0, float Y0, float Z0,
+    float X1, float Y1, float Z1,
+    float X2, float Y2, float Z2,
+    float& Out0, float& Out1, float& Out2)
+{
+#if VF_NOISE_USE_SIMD
+    const float Xs[4] = { X0, X1, X2, X0 };
+    const float Ys[4] = { Y0, Y1, Y2, Y0 };
+    const float Zs[4] = { Z0, Z1, Z2, Z0 };
+    float Out[4];
+    Perlin3D_x4(Xs, Ys, Zs, Out);
+    Out0 = Out[0];
+    Out1 = Out[1];
+    Out2 = Out[2];
+#else
+    Out0 = Perlin3D(X0, Y0, Z0);
+    Out1 = Perlin3D(X1, Y1, Z1);
+    Out2 = Perlin3D(X2, Y2, Z2);
+#endif
+}
+
 //=============================================================================
 // fBm / Ridged — octaves evaluated 4 at a time through Perlin3D_x4.
 // Accumulation stays scalar in octave order, so the result is independent of

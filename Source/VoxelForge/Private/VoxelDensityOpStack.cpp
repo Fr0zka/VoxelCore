@@ -4121,18 +4121,21 @@ namespace
             {
                 const float WF = P.CaveWarpFrequency;
                 const float WS = P.CaveWarpStrength;
-                WarpedX += VoxelNoise::Perlin3D(FVector3f(
+                float WarpX, WarpY, WarpZ;
+                VoxelNoise::Perlin3D_x3(
                     WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
                     WorldY * WF + 1.3f,
-                    EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
-                WarpedY += VoxelNoise::Perlin3D(FVector3f(
+                    EffectiveZ * WF + 5.7f,
                     WorldX * WF + 7.1f,
                     WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
-                    EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
-                WarpedZ += VoxelNoise::Perlin3D(FVector3f(
+                    EffectiveZ * WF + 2.3f,
                     WorldX * WF + 11.3f,
                     WorldY * WF + 9.7f,
-                    EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
+                    EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f),
+                    WarpX, WarpY, WarpZ);
+                WarpedX += WarpX * VOXEL_NOISE_SCALE * WS;
+                WarpedY += WarpY * VOXEL_NOISE_SCALE * WS;
+                WarpedZ += WarpZ * VOXEL_NOISE_SCALE * WS;
             }
             S.LastWarpedPosition = FVector(WarpedX, WarpedY, WarpedZ);
 
@@ -5475,19 +5478,21 @@ namespace
             if (!VoxelDensityAblation::IsCaveWarpOff() && P.CaveWarpStrength > 0.0f)
                         {
                             const float Frequency = P.CaveWarpFrequency;
-                            Query.X += VoxelNoise::Perlin3D(
+                            float WarpX, WarpY, WarpZ;
+                            VoxelNoise::Perlin3D_x3(
                                 WorldX * Frequency + VoxelHash::SeedOffset(SeedU, 0.37f),
                                 WorldY * Frequency + 1.3f,
-                                EffectiveZ * Frequency + 5.7f) * WarpAmplitude;
-                            Query.Y += VoxelNoise::Perlin3D(
+                                EffectiveZ * Frequency + 5.7f,
                                 WorldX * Frequency + 7.1f,
                                 WorldY * Frequency + VoxelHash::SeedOffset(SeedU, 0.59f),
-                                EffectiveZ * Frequency + 2.3f) * WarpAmplitude;
-                            Query.Z += VoxelNoise::Perlin3D(
+                                EffectiveZ * Frequency + 2.3f,
                                 WorldX * Frequency + 11.3f,
                                 WorldY * Frequency + 9.7f,
-                                EffectiveZ * Frequency + VoxelHash::SeedOffset(SeedU, 0.41f))
-                                * WarpAmplitude;
+                                EffectiveZ * Frequency + VoxelHash::SeedOffset(SeedU, 0.41f),
+                                WarpX, WarpY, WarpZ);
+                            Query.X += WarpX * WarpAmplitude;
+                            Query.Y += WarpY * WarpAmplitude;
+                            Query.Z += WarpZ * WarpAmplitude;
                         }
                         return Query;
                     };

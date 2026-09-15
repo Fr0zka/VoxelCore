@@ -3110,21 +3110,21 @@ namespace
 
         const float Frequency = Params.CaveWarpFrequency;
         const float Strength = Params.CaveWarpStrength;
-        Warped.X += VoxelNoise::Perlin3D(
+        float WarpX, WarpY, WarpZ;
+        VoxelNoise::Perlin3D_x3(
             WorldPoint.X * Frequency + VoxelHash::SeedOffset(Seed, 0.37f),
             WorldPoint.Y * Frequency + 1.3f,
-            EffectiveZ * Frequency + 5.7f)
-            * VOXEL_NOISE_SCALE * Strength;
-        Warped.Y += VoxelNoise::Perlin3D(
+            EffectiveZ * Frequency + 5.7f,
             WorldPoint.X * Frequency + 7.1f,
             WorldPoint.Y * Frequency + VoxelHash::SeedOffset(Seed, 0.59f),
-            EffectiveZ * Frequency + 2.3f)
-            * VOXEL_NOISE_SCALE * Strength;
-        Warped.Z += VoxelNoise::Perlin3D(
+            EffectiveZ * Frequency + 2.3f,
             WorldPoint.X * Frequency + 11.3f,
             WorldPoint.Y * Frequency + 9.7f,
-            EffectiveZ * Frequency + VoxelHash::SeedOffset(Seed, 0.41f))
-            * VOXEL_NOISE_SCALE * Strength;
+            EffectiveZ * Frequency + VoxelHash::SeedOffset(Seed, 0.41f),
+            WarpX, WarpY, WarpZ);
+        Warped.X += WarpX * VOXEL_NOISE_SCALE * Strength;
+        Warped.Y += WarpY * VOXEL_NOISE_SCALE * Strength;
+        Warped.Z += WarpZ * VOXEL_NOISE_SCALE * Strength;
         return Warped;
     }
 

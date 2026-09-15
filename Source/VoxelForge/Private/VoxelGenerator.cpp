@@ -3841,21 +3841,24 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         const float WF = Params.CaveWarpFrequency;
         const float WS = Params.CaveWarpStrength;
 
-        // Three independent Perlin fields offset by irrational-ish numbers
-        // so the X/Y/Z warp channels don't correlate with each other.
-        // Single octave to keep per-voxel cost low (3 Perlin calls total).
-        WarpedX += VoxelNoise::Perlin3D(FVector3f(
+        // Three independent Perlin fields offset by irrational-ish numbers keep the X/Y/Z warp
+        // channels decorrelated.  Perlin3D_x3 evaluates these same three scalar channels in one
+        // SIMD batch on x86; its non-SIMD fallback is the original three-call expression.
+        float WarpX, WarpY, WarpZ;
+        VoxelNoise::Perlin3D_x3(
             WorldX * WF + VoxelHash::SeedOffset(SeedU, 0.37f),
             WorldY * WF + 1.3f,
-            EffectiveZ * WF + 5.7f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedY += VoxelNoise::Perlin3D(FVector3f(
+            EffectiveZ * WF + 5.7f,
             WorldX * WF + 7.1f,
             WorldY * WF + VoxelHash::SeedOffset(SeedU, 0.59f),
-            EffectiveZ * WF + 2.3f)) * VOXEL_NOISE_SCALE * WS;
-        WarpedZ += VoxelNoise::Perlin3D(FVector3f(
+            EffectiveZ * WF + 2.3f,
             WorldX * WF + 11.3f,
             WorldY * WF + 9.7f,
-            EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f))) * VOXEL_NOISE_SCALE * WS;
+            EffectiveZ * WF + VoxelHash::SeedOffset(SeedU, 0.41f),
+            WarpX, WarpY, WarpZ);
+        WarpedX += WarpX * VOXEL_NOISE_SCALE * WS;
+        WarpedY += WarpY * VOXEL_NOISE_SCALE * WS;
+        WarpedZ += WarpZ * VOXEL_NOISE_SCALE * WS;
     }
 
     //=========================================================================
