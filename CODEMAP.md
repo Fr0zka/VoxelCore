@@ -126,6 +126,8 @@ remains `0`, and lateral regions remain gated off.
 | `EVoxelFace` enum + `GetFaceDirection` / `GetFaceNormal` | 33-61 | 6 cube faces. |
 | `WorldToChunkCoord` / `WorldToLocalCoord` / `ChunkToWorldPos` | 74-104 | Coord-space conversions (handle negatives via floor/positive-modulo). |
 | `LocalToIndex` / `IndexToLocal` / `IsValidLocalCoord` | 107-131 | Flat-array 3D↔1D indexing. |
+| `VoxelMath::IsFiniteFast` / `IsFinite` | ~24-53 | Exact IEEE bit test (`voxel.FastIsFinite` A/B switch). |
+| `VoxelMath::DetSinCos` / `DetSin` / `DetCos` | ~63-195 | **The only sin/cos allowed where the world is decided** (2026-09-16, `10fd0b6`). Fixed double period reduction and float polynomial, no CRT: `FMath::Sin/Cos` are CRT `sinf/cosf`, whose FMA3 variant is picked by CPU. Pinned by `VoxelForge.Determinism.DetSinCos`; `-voxel.CrtFma3=0` flips the CRT path to prove it. |
 | `SmoothStep01` | 140 | 3x²-2x³ — used everywhere for blends. |
 | `VOXEL_NOISE_SCALE` (1.25f) | 147 | Rescales UE PerlinNoise3D to ~[-1,1]. |
 | `EVoxelTileClass` enum (`Mixed`/`AllSolid`/`AllAir`) | — | T1.d verdict. **MOVED here from `VoxelGenerator.h` 2026-07-27** so `VoxelDensityOp.h` can share it without a UCLASS dependency. A false `AllSolid`/`AllAir` is a HOLE; a false `Mixed` only costs CPU. |

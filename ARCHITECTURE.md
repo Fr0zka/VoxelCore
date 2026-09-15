@@ -517,7 +517,14 @@ historical random reach and are reported diagnostically.
 
 The source query proves only a local pose; it does not flood-fill the live network. Therefore every
 inter-strate end also receives an explicit `FVoxelPassageLanding`: a rounded chamber with a hard
-flat floor and a deterministic connector to that strate's finite origin landing room at `(0,0)`.
+flat floor. **There is no connector to the origin landing room at `(0,0)`.** The owner deleted
+those radial roads after a playtest (`d97373c`, 2026-09-08: they cut straight through everything);
+room joins are flattened to walkable height instead. A source-fit landing therefore stays local to
+the room it was fitted into (`GeneratePassages`, the `VF_BuildPassageLanding` calls).
+⚠️ Open gap (Sol's code review, `DESIGN-SOL-2026-09-15-CODE.md` §1.3/§2.4): when the footing query
+declines, the landing falls back to the historical random reach, and nothing proves that pose joins
+the walk network. The canonical capability gate covers one scenario, not every seed or mix.
+Proposed fix, not built: retry deterministically at other candidate spots instead of falling back.
 This is the join guarantee, including for a source-fit answer — it is not a probability claim about
 a nearby room. The connector is a swept flat-floor corridor with a 5-voxel (1.25 m) radius / 2.5 m
 clear width and a 12-voxel (3 m) clear height. Its 4.5-voxel support inset is enough for the

@@ -247,6 +247,41 @@ costs (tunnel core ~20%, tunnel SDF ~13%) are the geometry itself, so the exact-
 reached diminishing returns. The reach proofs are now guarded by
 `VoxelForge.Correctness.TilePostReachProof`.
 
+## State after 2026-09-16: Sol's design review, deterministic maths (`10fd0b6`)
+
+**Reframe.** Local "find the hot spot" rounds had reached diminishing returns, so, on the owner's
+idea, Sol High was asked how it would build the project from scratch (`DESIGN-SOL-2026-09-15.md`),
+then read the code and said what could reasonably change (`DESIGN-SOL-2026-09-15-CODE.md`). Its
+verdict: don't rebuild. There are two performance bets, each with instrumentation-only first steps
+and kill criteria, plus one determinism hole. Owner's rule: each idea gets its own branch and is
+dropped if it doesn't hold capability and performance.
+
+**Done: `sol/deterministic-math`, merged.** On Win64, `FMath::Sin/Cos` were CRT `sinf/cosf`, and the
+UCRT picks an FMA3 variant by CPU at start-up. Now `VoxelMath::DetSinCos` (fixed reduction and
+polynomial, max error 5.96e-8) is used on every world-deciding site; `-voxel.CrtFma3=0` forces the
+CRT's other path, and exports are byte-identical either way. Before the fix, the two paths also
+matched on this Ryzen, so the hole was real but not observed here. Capability is exact;
+static/moving worker time is -3.6%/-3.5% vs the tip DLL. Order-independent vertex distance is at
+most 8.7 micrometres (a line-by-line OBJ diff reported "11.4 m", a line-order artefact: compare
+meshes by nearest vertex, not by line).
+
+**New canonical hashes (the world changed once, by design):**
+- export-only OBJ SHA-256 `CBB8AE185E949B33CF2656441BA4AB17398975A098967870DFD45B435A37906F`
+  (geometry `B9EF84AC`), was `b3e5f4c3..9b377`;
+- worms/capability region `9242C093`, was `311CA42C` (walk OBJ `20CCF7BD..0100`);
+- field digest (cross-platform test grid) shape `0x767FB0650936435D`, field `0x2AE570A5A1A9C5CE`;
+- capability unchanged: 20,830 / 10,909, connected.
+
+**Next, in order (each on its own branch, owner-approved):**
+1. Bet A rung 1 + bet B rung 1 (counters and trace only, no field change):
+   - how much per-sample candidate work a tile-wide, feature-major tunnel evaluator would save;
+   - how many density samples adjacent tiles duplicate and could donate in time.
+2. Only if a rung-1 kill criterion is cleared: the rung-2 prototype behind a switch.
+3. Landing gap (ARCHITECTURE, passage landings): replace the random-reach fallback with a
+   deterministic retry.
+Smaller hardening noted by Sol, not scheduled: field-wise cache hashing instead of raw-memory
+CRC32; an integer-lattice mesher entry point; server-sequenced edit order once networking exists.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
