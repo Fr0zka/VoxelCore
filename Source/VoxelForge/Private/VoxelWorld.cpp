@@ -19,6 +19,7 @@
 #include "VoxelStats.h"
 #include "VoxelCaveMorphology.h"
 #include "VoxelPassageGeometry.h"
+#include "VoxelTilePostReach.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
 // complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
@@ -1132,6 +1133,98 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
     VoxelCaveMorphology::LogPlayerFitMemoStats();
     LogStreamingLatencySummary();
+    const uint64 TilePostReachDifferences =
+        VoxelGenLOD::GSkippedPostDifferences.load(std::memory_order_relaxed);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTilePostReach] tiles=%llu origin_reachable=%llu origin_skipped=%llu "
+             "passage_landing_reachable=%llu passage_landing_skipped=%llu "
+             "passage_structural_reachable=%llu passage_structural_skipped=%llu "
+             "debug=%d comparisons=%llu differences=%llu"),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GTilePostReachTileCount.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GOriginLandingReachableTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GOriginLandingSkippedTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GPassageLandingReachableTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GPassageLandingSkippedTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GPassageStructuralReachableTiles.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GPassageStructuralSkippedTiles.load(std::memory_order_relaxed)),
+        VoxelGenLOD::GTilePostReachDebugEnabled.load(std::memory_order_relaxed) ? 1 : 0,
+        static_cast<unsigned long long>(
+            VoxelGenLOD::GSkippedPostComparisons.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(TilePostReachDifferences));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTilePostReachKinds] comparisons="
+             "origin_air=%llu/origin_floor=%llu/passage_sdf=%llu/landing_air=%llu/"
+             "tunnel_air=%llu/landing_floor=%llu/structural=%llu/native_floor=%llu/room_floor=%llu "
+             "differences=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingSDF)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageTunnelAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageStructuralPosts)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageNativeFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingRoomFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingSDF)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageTunnelAir)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageStructuralPosts)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageNativeFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingRoomFloor)].load(
+                std::memory_order_relaxed)));
+    if (VoxelGenLOD::GTilePostReachDebugEnabled.load(std::memory_order_relaxed)
+        && TilePostReachDifferences != 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeTilePostReach] soundness failure: skipped post changed the field."));
+        FPlatformMisc::RequestExitWithStatus(
+            false, 1, TEXT("VoxelForge tile post reach soundness failure"));
+    }
     PendingTiles.Empty();
     PendingTileCancellation.Empty();
     PendingUnload.Empty();

@@ -28,6 +28,7 @@
 #include "VoxelTypes.h"   // SmoothStep01
 #include "VoxelPassageGeometry.h" // shared body-sized landing/tunnel geometry
 #include "VoxelDensityAblation.h" // development-only world-changing measurements
+#include "VoxelTilePostReach.h" // worker-local landing/structural post reach bits
 
 //=============================================================================
 // SEAL DE FRONTIÈRE / BOUNDARY SEAL
@@ -193,6 +194,17 @@ FORCEINLINE void VF_ApplyOriginLandingAirMC(float& Density,
     float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
+    if (!VoxelGenLOD::IsOriginLandingReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            VF_ApplyOriginLandingAirMC(
+                Density, WorldX, WorldY, WorldZ,
+                StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
+        }, VoxelGenLOD::ETilePostComparisonKind::OriginAir);
+        return;
+    }
     float InternalDensity = -Density;
     VF_ApplyOriginLandingAir(InternalDensity, WorldX, WorldY, WorldZ,
         StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
@@ -204,6 +216,17 @@ FORCEINLINE void VF_ApplyOriginLandingFloorMC(float& Density,
     float WorldX, float WorldY, float WorldZ,
     float StrateTopZ, float StrateBottomZ, float SealThickness, float BaseDensity, float Radius)
 {
+    if (!VoxelGenLOD::IsOriginLandingReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            VF_ApplyOriginLandingFloorMC(
+                Density, WorldX, WorldY, WorldZ,
+                StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);
+        }, VoxelGenLOD::ETilePostComparisonKind::OriginFloor);
+        return;
+    }
     float InternalDensity = -Density;
     VF_ApplyOriginLandingFloor(InternalDensity, WorldX, WorldY, WorldZ,
         StrateTopZ, StrateBottomZ, SealThickness, BaseDensity, Radius);

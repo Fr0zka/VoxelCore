@@ -2511,6 +2511,12 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         return FLT_MAX;
     }
 
+    // The landing terms are part of the passage modifier, so their reach proof is deliberately
+    // wider than the direct post's four-voxel blend: SmoothMin can lower a finite term by K/6 at
+    // each later combine.  Outside that padded room domain, omitting the two landing evaluations
+    // is an identity for VF_ApplyPassageCarving.
+    const bool bEvaluateLandingSDF = VoxelGenLOD::IsPassageLandingReachable()
+        || VoxelGenLOD::IsTilePostReachBypassActive();
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
         FMath::FloorToInt(WorldY / (float)CHUNK_SIZE),
@@ -2602,10 +2608,13 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
         // A landing is a real room with a hard flat-floor half-space, not a sphere around the
         // tube endpoint. It is the same fixed SDF geometry selected during GeneratePassages; it
         // never performs a source query here and does not synthesize a radial root connector.
-        const float UpperLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.UpperLanding);
-        const float LowerLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.LowerLanding);
-        MinSDF = VoxelSDF::SmoothMin(MinSDF, UpperLandingSDF, BlendK);
-        MinSDF = VoxelSDF::SmoothMin(MinSDF, LowerLandingSDF, BlendK);
+        if (bEvaluateLandingSDF)
+        {
+            const float UpperLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.UpperLanding);
+            const float LowerLandingSDF = VF_EvaluatePassageLandingSDF(Pos, P.LowerLanding);
+            MinSDF = VoxelSDF::SmoothMin(MinSDF, UpperLandingSDF, BlendK);
+            MinSDF = VoxelSDF::SmoothMin(MinSDF, LowerLandingSDF, BlendK);
+        }
     }
 
     return MinSDF;
@@ -2617,12 +2626,40 @@ void UVoxelStrateManager::ApplyPassageModifier(
 {
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageModifier);
+    const bool bBypass = VoxelGenLOD::IsTilePostReachBypassActive();
+    const bool bCompareLandingModifier = VoxelGenLOD::bTilePostReachDebug
+        && !VoxelGenLOD::IsPassageLandingReachable() && !bBypass;
+    float CanonicalModifierDensity = Density;
+    if (bCompareLandingModifier)
+    {
+        const bool PreviousBypass = VoxelGenLOD::bTilePostReachBypass;
+        VoxelGenLOD::bTilePostReachBypass = true;
+        const float CanonicalSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
+        VF_ApplyPassageCarving(
+            CanonicalModifierDensity, CanonicalSDF, BaseDensity, SealThickness);
+        VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
+    }
     if (!VoxelDensityAblation::IsPassageCarvingOff())
     {
         const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
         VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
     }
+    if (bCompareLandingModifier)
+    {
+        VoxelGenLOD::RecordSkippedPostComparison(
+            VoxelGenLOD::ETilePostComparisonKind::PassageLandingSDF,
+            !VoxelGenLOD::SameFloatBits(Density, CanonicalModifierDensity));
+    }
     ApplyPassageLandingAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+
+    const bool bLandingReachable = VoxelGenLOD::IsPassageLandingReachable()
+        || VoxelGenLOD::IsTilePostReachBypassActive();
+    const bool bStructuralReachable = VoxelGenLOD::IsPassageStructuralReachable()
+        || VoxelGenLOD::IsTilePostReachBypassActive();
+    if (!bLandingReachable && !bStructuralReachable)
+    {
+        return;
+    }
 
     const FIntVector ChunkCoord(
         FMath::FloorToInt(WorldX / (float)CHUNK_SIZE),
@@ -2634,10 +2671,12 @@ void UVoxelStrateManager::ApplyPassageModifier(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = PassageData[PassageIndex];
-        const bool bLandingFloor = !VoxelDensityAblation::IsLandingPostsOff()
+        const bool bLandingFloor = bLandingReachable
+            && !VoxelDensityAblation::IsLandingPostsOff()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding));
-        const bool bLegacySupportFloor = !VoxelDensityAblation::IsPassageStructuralPostsOff()
+        const bool bLegacySupportFloor = bStructuralReachable
+            && !VoxelDensityAblation::IsPassageStructuralPostsOff()
             && bPassageSupportFloorWritesEnabled
             && !Passage.bNativeFloorEnabled
             && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
@@ -2656,7 +2695,10 @@ void UVoxelStrateManager::ApplyPassageModifier(
     // the current walkable tunnel.  Reassert tunnel air after all floor posts so overlap cannot
     // turn a valid route into a solid plug.  At the tunnel's own floor the air predicate is false,
     // so the support plane remains solid.
-    ApplyPassageTunnelAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+    if (bStructuralReachable)
+    {
+        ApplyPassageTunnelAir(Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+    }
 }
 
 void UVoxelStrateManager::ApplyPassageCarvingOnly(
@@ -2669,8 +2711,27 @@ void UVoxelStrateManager::ApplyPassageCarvingOnly(
     }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageModifier);
+    const bool bBypass = VoxelGenLOD::IsTilePostReachBypassActive();
+    const bool bCompareLandingModifier = VoxelGenLOD::bTilePostReachDebug
+        && !VoxelGenLOD::IsPassageLandingReachable() && !bBypass;
+    float CanonicalModifierDensity = Density;
+    if (bCompareLandingModifier)
+    {
+        const bool PreviousBypass = VoxelGenLOD::bTilePostReachBypass;
+        VoxelGenLOD::bTilePostReachBypass = true;
+        const float CanonicalSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
+        VF_ApplyPassageCarving(
+            CanonicalModifierDensity, CanonicalSDF, BaseDensity, SealThickness);
+        VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
+    }
     const float ModSDF = EvaluateModifierSDF(WorldX, WorldY, WorldZ);
     VF_ApplyPassageCarving(Density, ModSDF, BaseDensity, SealThickness);
+    if (bCompareLandingModifier)
+    {
+        VoxelGenLOD::RecordSkippedPostComparison(
+            VoxelGenLOD::ETilePostComparisonKind::PassageLandingSDF,
+            !VoxelGenLOD::SameFloatBits(Density, CanonicalModifierDensity));
+    }
 }
 
 void UVoxelStrateManager::ApplyPassageLandingAir(
@@ -2679,6 +2740,16 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
 {
     if (VoxelDensityAblation::IsLandingPostsOff())
     {
+        return;
+    }
+    if (!VoxelGenLOD::IsPassageLandingReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            ApplyPassageLandingAir(
+                Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+        }, VoxelGenLOD::ETilePostComparisonKind::PassageLandingAir);
         return;
     }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
@@ -2749,6 +2820,16 @@ void UVoxelStrateManager::ApplyPassageTunnelAir(
     {
         return;
     }
+    if (!VoxelGenLOD::IsPassageStructuralReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            ApplyPassageTunnelAir(
+                Density, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
+        }, VoxelGenLOD::ETilePostComparisonKind::PassageTunnelAir);
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageTunnelAir);
     const FVector Position(WorldX, WorldY, WorldZ);
@@ -2784,6 +2865,30 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     {
         return;
     }
+    const bool bBypass = VoxelGenLOD::IsTilePostReachBypassActive();
+    const bool bLandingReachable = VoxelGenLOD::IsPassageLandingReachable() || bBypass;
+    const bool bStructuralReachable = VoxelGenLOD::IsPassageStructuralReachable() || bBypass;
+    const bool bCompareLanding = VoxelGenLOD::bTilePostReachDebug
+        && !bLandingReachable && !bBypass;
+    float CanonicalDensity = Density;
+    if (bCompareLanding)
+    {
+        const bool PreviousBypass = VoxelGenLOD::bTilePostReachBypass;
+        VoxelGenLOD::bTilePostReachBypass = true;
+        ApplyPassageLandingFloorMC(
+            CanonicalDensity, WorldX, WorldY, WorldZ, BaseDensity);
+        VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
+    }
+    if (!bLandingReachable && !bStructuralReachable)
+    {
+        if (bCompareLanding)
+        {
+            VoxelGenLOD::RecordSkippedPostComparison(
+                VoxelGenLOD::ETilePostComparisonKind::PassageLandingFloor,
+                !VoxelGenLOD::SameFloatBits(Density, CanonicalDensity));
+        }
+        return;
+    }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageLandingFloor);
     const FIntVector ChunkCoord(
@@ -2796,10 +2901,12 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
     for (const int32 PassageIndex : Nearby)
     {
         const FVoxelPassage& Passage = PassageData[PassageIndex];
-        const bool bLandingFloor = !VoxelDensityAblation::IsLandingPostsOff()
+        const bool bLandingFloor = bLandingReachable
+            && !VoxelDensityAblation::IsLandingPostsOff()
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding));
-        const bool bLegacySupportFloor = !VoxelDensityAblation::IsPassageStructuralPostsOff()
+        const bool bLegacySupportFloor = bStructuralReachable
+            && !VoxelDensityAblation::IsPassageStructuralPostsOff()
             && bPassageSupportFloorWritesEnabled
             && !Passage.bNativeFloorEnabled
             && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
@@ -2811,6 +2918,12 @@ void UVoxelStrateManager::ApplyPassageLandingFloorMC(
             Density = FMath::Min(Density, -BaseDensity);
             break;
         }
+    }
+    if (bCompareLanding)
+    {
+        VoxelGenLOD::RecordSkippedPostComparison(
+            VoxelGenLOD::ETilePostComparisonKind::PassageLandingFloor,
+            !VoxelGenLOD::SameFloatBits(Density, CanonicalDensity));
     }
 }
 
@@ -2844,6 +2957,32 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         return;
     }
 
+    const bool bBypass = VoxelGenLOD::IsTilePostReachBypassActive();
+    const bool bLandingReachable = VoxelGenLOD::IsPassageLandingReachable() || bBypass;
+    const bool bStructuralReachable = VoxelGenLOD::IsPassageStructuralReachable() || bBypass;
+    const bool bCompareLanding = VoxelGenLOD::bTilePostReachDebug
+        && !bLandingReachable && !bBypass;
+    float CanonicalDensity = Density;
+    if (bCompareLanding)
+    {
+        const bool PreviousBypass = VoxelGenLOD::bTilePostReachBypass;
+        VoxelGenLOD::bTilePostReachBypass = true;
+        ApplyPassageStructuralPostsMC(
+            CanonicalDensity, WorldX, WorldY, WorldZ,
+            BaseDensity, SealThickness, bProtectAuthoredTunnelFloor);
+        VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
+    }
+    if (!bLandingReachable && !bStructuralReachable)
+    {
+        if (bCompareLanding)
+        {
+            VoxelGenLOD::RecordSkippedPostComparison(
+                VoxelGenLOD::ETilePostComparisonKind::PassageStructuralPosts,
+                !VoxelGenLOD::SameFloatBits(Density, CanonicalDensity));
+        }
+        return;
+    }
+
     VoxelDensityProfile::FScopedTimer ProfileTimer(
         VoxelDensityProfile::EBucket::PassageStructuralPosts);
 
@@ -2873,36 +3012,37 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         const FVoxelPassage& Passage = PassageData[PassageIndex];
 
         const bool bTunnelSupportFloor =
-            !bDisableStructuralPosts
+            bStructuralReachable && !bDisableStructuralPosts
             && bPassageSupportFloorWritesEnabled
             && !Passage.bNativeFloorEnabled
             && VF_IsWalkableTunnelFloor(Passage, Position, this, PassageIndex);
-        if (!bSuppressFloor && !bDisableLandingPosts
+        if (!bSuppressFloor && bLandingReachable && !bDisableLandingPosts
             && (VF_IsPassageLandingFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageLandingFloor(Position, Passage.LowerLanding)))
         {
             bAnyLandingFloor = true;
         }
-        if (!bSuppressFloor && !bDisableStructuralPosts && bTunnelSupportFloor)
+        if (!bSuppressFloor && bStructuralReachable
+            && !bDisableStructuralPosts && bTunnelSupportFloor)
         {
             bLegacyTunnelSupportFloor = true;
         }
 
-        if (!bSuppressFloor && !bDisableLandingPosts
+        if (!bSuppressFloor && bLandingReachable && !bDisableLandingPosts
             && (VF_IsPassageRoomFloor(Position, Passage.UpperLanding)
                 || VF_IsPassageRoomFloor(Position, Passage.LowerLanding)))
         {
             bAnyRoomFloor = true;
         }
 
-        if (!bDisableStructuralPosts && !bWalkableAir
+        if (bStructuralReachable && !bDisableStructuralPosts && !bWalkableAir
             && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq
             && VF_IsWalkableTunnelAir(Passage, Position, this, PassageIndex))
         {
             bWalkableAir = true;
         }
 
-        if (!bDisableLandingPosts
+        if (bLandingReachable && !bDisableLandingPosts
             && FVector::DistSquared(Position, Passage.BoundCenter) <= Passage.BoundRadiusSq)
         {
             const FVoxelPassageLanding* Landings[] = {
@@ -2950,6 +3090,12 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         VoxelDensityProfile::AddCounter(
             VoxelDensityProfile::ECounter::PassageSupportFloorBackstopFires);
     }
+    if (bCompareLanding)
+    {
+        VoxelGenLOD::RecordSkippedPostComparison(
+            VoxelGenLOD::ETilePostComparisonKind::PassageStructuralPosts,
+            !VoxelGenLOD::SameFloatBits(Density, CanonicalDensity));
+    }
 }
 
 void UVoxelStrateManager::ApplyPassageNativeFloorMC(
@@ -2958,6 +3104,15 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
 {
     if (VoxelDensityAblation::IsNativeFloorOff())
     {
+        return;
+    }
+    if (!VoxelGenLOD::IsPassageStructuralReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            ApplyPassageNativeFloorMC(Density, WorldX, WorldY, WorldZ, BaseDensity);
+        }, VoxelGenLOD::ETilePostComparisonKind::PassageNativeFloor);
         return;
     }
     const FIntVector ChunkCoord(
@@ -3016,6 +3171,16 @@ void UVoxelStrateManager::ApplyPassageLandingRoomFloorMC(
 {
     if (VoxelDensityAblation::IsLandingPostsOff())
     {
+        return;
+    }
+    if (!VoxelGenLOD::IsPassageLandingReachable()
+        && !VoxelGenLOD::IsTilePostReachBypassActive())
+    {
+        VoxelGenLOD::CompareSkippedPost(Density, [&]()
+        {
+            ApplyPassageLandingRoomFloorMC(
+                Density, WorldX, WorldY, WorldZ, BaseDensity);
+        }, VoxelGenLOD::ETilePostComparisonKind::PassageLandingRoomFloor);
         return;
     }
     VoxelDensityProfile::FScopedTimer ProfileTimer(
@@ -3912,6 +4077,22 @@ namespace
                    FMath::Min((float)Box.Max.Z, MaxZ),
                    (float)Origin.Z, Step);
     }
+
+    static bool VF_LatticeBoxTouchesSphere(
+        const FBox& Box, const FVector& Center, float Radius)
+    {
+        if (!Box.IsValid || !VoxelMath::IsFinite(Center.X)
+            || !VoxelMath::IsFinite(Center.Y) || !VoxelMath::IsFinite(Center.Z)
+            || !VoxelMath::IsFinite(Radius) || Radius < 0.0f)
+        {
+            return true;
+        }
+        const FVector Closest(
+            FMath::Clamp(Center.X, (float)Box.Min.X, (float)Box.Max.X),
+            FMath::Clamp(Center.Y, (float)Box.Min.Y, (float)Box.Max.Y),
+            FMath::Clamp(Center.Z, (float)Box.Min.Z, (float)Box.Max.Z));
+        return FVector::DistSquared(Closest, Center) <= Radius * Radius;
+    }
 }
 
 bool UVoxelStrateManager::AnyPassageNearLattice(
@@ -4768,6 +4949,189 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
     return false;
 }
 
+bool UVoxelStrateManager::AnyPassageLandingNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float ReachScale) const
+{
+    if (Step <= 0 || !VoxelBox.IsValid
+        || !VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+    {
+        return true;
+    }
+
+    // VF_ApplyPassageCarving has a hard no-op band at ModSDF >= 4.  A landing term outside the
+    // rounded-room AABB by 4 + K (K=3) is either saturated out of SmoothMin when the tube is
+    // inside the carve band, or leaves the folded result >= 4 when the tube is outside it.  That
+    // proves the landing term cannot change the field; the direct landing/floor posts use their
+    // smaller, operation-specific pads below.
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (!VoxelMath::IsFinite(Passage.BoundCenter.X)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Y)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Z)
+            || !VoxelMath::IsFinite(Passage.BoundRadius)
+            || !VoxelMath::IsFinite(Passage.BoundRadiusSq)
+            || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+        {
+            return true;
+        }
+
+        if (Passage.ControlPoints.Num() >= 2)
+        {
+            if (Passage.ControlPoints.Num() > 4096)
+            {
+                return true;
+            }
+            const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+            if (!bTaper && !VoxelMath::IsFinite(Passage.Radius))
+            {
+                return true;
+            }
+            for (int32 PointIndex = 0;
+                 PointIndex < Passage.ControlPoints.Num(); ++PointIndex)
+            {
+                const FVector& Point = Passage.ControlPoints[PointIndex];
+                if (!VoxelMath::IsFinite(Point.X) || !VoxelMath::IsFinite(Point.Y)
+                    || !VoxelMath::IsFinite(Point.Z)
+                    || (bTaper && !VoxelMath::IsFinite(Passage.ControlRadii[PointIndex])))
+                {
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            if (!VoxelMath::IsFinite(Passage.UpperPoint.X)
+                || !VoxelMath::IsFinite(Passage.UpperPoint.Y)
+                || !VoxelMath::IsFinite(Passage.UpperPoint.Z)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.X)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.Y)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.Z)
+                || !VoxelMath::IsFinite(Passage.Radius))
+            {
+                return true;
+            }
+        }
+
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (!VoxelMath::IsFinite(Landing->StandingPoint.X)
+                || !VoxelMath::IsFinite(Landing->StandingPoint.Y)
+                || !VoxelMath::IsFinite(Landing->FloorZ)
+                || !VoxelMath::IsFinite(Landing->CeilingZ)
+                || !VoxelMath::IsFinite(Landing->HalfWidth)
+                || !VoxelMath::IsFinite(Landing->FloorThickness))
+            {
+                return true;
+            }
+
+            if (Landing->HalfWidth > 0.0f
+                && Landing->FloorThickness > 0.0f
+                && VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    Landing->StandingPoint.X - FMath::Max(Landing->HalfWidth - 1.0f, 0.0f)
+                        - ReachScale,
+                    Landing->StandingPoint.X + FMath::Max(Landing->HalfWidth - 1.0f, 0.0f)
+                        + ReachScale,
+                    Landing->StandingPoint.Y - FMath::Max(Landing->HalfWidth - 1.0f, 0.0f)
+                        - ReachScale,
+                    Landing->StandingPoint.Y + FMath::Max(Landing->HalfWidth - 1.0f, 0.0f)
+                        + ReachScale,
+                    Landing->FloorZ - Landing->FloorThickness - ReachScale,
+                    Landing->FloorZ + ReachScale))
+            {
+                return true;
+            }
+
+            if (Landing->HalfWidth <= 0.0f || Landing->CeilingZ <= Landing->FloorZ)
+            {
+                // VF_EvaluatePassageLandingSDF returns FLT_MAX for this descriptor.  The floor
+                // test above has already handled the only remaining possible writer.
+                continue;
+            }
+
+        }
+    }
+
+    constexpr float SmoothMinK = 3.0f;
+    const float RoomPad = (VoxelPassageGeometry::LandingCarveBlendVoxels + SmoothMinK)
+        * ReachScale;
+    if (!VoxelMath::IsFinite(RoomPad) || RoomPad < 0.0f)
+    {
+        return true;
+    }
+
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (Landing->HalfWidth <= 0.0f || Landing->CeilingZ <= Landing->FloorZ)
+            {
+                continue;
+            }
+            constexpr float RoomRounding = 1.5f;
+            const float Height = Landing->CeilingZ - Landing->FloorZ;
+            const float HalfX = FMath::Max(Landing->HalfWidth - RoomRounding, 0.25f);
+            const float HalfZ = FMath::Max(Height * 0.5f - RoomRounding, 0.25f);
+            const float CenterZ = (Landing->FloorZ + Landing->CeilingZ) * 0.5f;
+            if (VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    Landing->StandingPoint.X - HalfX - RoomRounding - RoomPad,
+                    Landing->StandingPoint.X + HalfX + RoomRounding + RoomPad,
+                    Landing->StandingPoint.Y - HalfX - RoomRounding - RoomPad,
+                    Landing->StandingPoint.Y + HalfX + RoomRounding + RoomPad,
+                    FMath::Min(Landing->FloorZ,
+                               CenterZ - HalfZ - RoomRounding) - RoomPad,
+                    FMath::Max(Landing->CeilingZ,
+                               CenterZ + HalfZ + RoomRounding) + RoomPad))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyPassageStructuralPostNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float ReachScale) const
+{
+    (void)LatticeOrigin;
+    (void)Step;
+    if (Step <= 0 || !VoxelBox.IsValid
+        || !VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+    {
+        return true;
+    }
+
+    // The construction-time BoundRadius encloses every tube, landing room, floor band, and its
+    // four-voxel carve margin.  All structural writers below are subsets of that sphere, so a
+    // sphere/AABB miss proves identity without doing a per-sample chunk-shortlist lookup.
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (!VoxelMath::IsFinite(Passage.BoundCenter.X)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Y)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Z)
+            || !VoxelMath::IsFinite(Passage.BoundRadius)
+            || !VoxelMath::IsFinite(Passage.BoundRadiusSq)
+            || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+        {
+            return true;
+        }
+        const float Reach = (Passage.BoundRadius + 1.0f) * ReachScale;
+        if (!VoxelMath::IsFinite(Reach)
+            || VF_LatticeBoxTouchesSphere(VoxelBox, Passage.BoundCenter, Reach))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool UVoxelStrateManager::AnyLandingFloorAtLattice(
     const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
 {
@@ -5013,9 +5377,14 @@ bool UVoxelStrateManager::AnyOriginLandingFloorNearBox(
 }
 
 bool UVoxelStrateManager::AnyOriginLandingNearLattice(
-    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step) const
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float ReachScale) const
 {
     if (OriginSpineRadius <= 0.0f) return false;
+    if (!VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+    {
+        return true;
+    }
     for (const FStrateSlot& Slot : StrateLayout)
     {
         if (Slot.Definition == nullptr) continue;
@@ -5023,7 +5392,8 @@ bool UVoxelStrateManager::AnyOriginLandingNearLattice(
         const float BottomZ = static_cast<float>(Slot.BottomChunkZ) * CHUNK_SIZE;
         const float Seal = VF_BoundarySealThicknessForDefinition(*Slot.Definition);
         if (VoxelPassageGeometry::OriginLandingRoomTouchesLattice(
-                VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius))
+                VoxelBox, LatticeOrigin, Step, TopZ, BottomZ, Seal, OriginSpineRadius,
+                ReachScale))
         {
             return true;
         }

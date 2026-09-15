@@ -472,6 +472,14 @@ public:
                                       float BaseDensity, float SealThickness) const;
     bool AnyPassageLandingFloorNearLattice(const FBox& VoxelBox,
                                            const FIntVector& LatticeOrigin, int32 Step) const;
+    /** Conservative landing-room plus floor reach for the exact MC lattice and its halo. */
+    bool AnyPassageLandingNearLattice(const FBox& VoxelBox,
+                                      const FIntVector& LatticeOrigin, int32 Step,
+                                      float ReachScale = 1.0f) const;
+    /** Conservative sphere guard for all passage-owned structural posts and native D-floors. */
+    bool AnyPassageStructuralPostNearLattice(const FBox& VoxelBox,
+                                             const FIntVector& LatticeOrigin, int32 Step,
+                                             float ReachScale = 1.0f) const;
     /** Exact presence test for a structural floor write on the MC lattice. */
     bool AnyLandingFloorAtLattice(const FBox& VoxelBox,
                                   const FIntVector& LatticeOrigin, int32 Step) const;
@@ -481,7 +489,8 @@ public:
     bool AnyOriginLandingFloorNearBox(const FVector& MinVoxel, const FVector& MaxVoxel) const;
 
     bool AnyOriginLandingNearLattice(const FBox& VoxelBox,
-                                     const FIntVector& LatticeOrigin, int32 Step) const;
+                                     const FIntVector& LatticeOrigin, int32 Step,
+                                     float ReachScale = 1.0f) const;
     /** Exact conservative candidate for the post-disturbance origin-room air reassertion. */
     bool AnyOriginLandingAirNearLattice(const FBox& VoxelBox,
                                         const FIntVector& LatticeOrigin, int32 Step,

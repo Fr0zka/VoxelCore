@@ -4,6 +4,8 @@
 #include "VoxelMarchingCubesMesher.h"
 #include "MarchingCubesTables.h"
 #include "VoxelDensityProfile.h"
+#include "VoxelStrateManager.h"
+#include "VoxelTilePostReach.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
@@ -16,6 +18,45 @@ namespace
         GVoxelForgeUseOperatorBlock,
         TEXT("Use the operator-major density block path for non-shared mesher grids."));
     bool GVoxelForgeBlockSwitchParsed = false;
+
+    int32 GVoxelForgeTilePostReachDebug = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeTilePostReachDebug(
+        TEXT("voxel.TilePostReachDebug"),
+        GVoxelForgeTilePostReachDebug,
+        TEXT("Run skipped landing/structural posts in a bypass and compare their exact result; "
+             "a nonzero difference fails the debug run."));
+
+    float GVoxelForgeTilePostReachScale = 1.0f;
+    FAutoConsoleVariableRef CVarVoxelForgeTilePostReachScale(
+        TEXT("voxel.TilePostReachScale"),
+        GVoxelForgeTilePostReachScale,
+        TEXT("Scale the per-tile post reach for deliberate soundness tests. Default 1.0 is exact; "
+             "values below 1 intentionally shrink the guard."));
+
+    bool GVoxelForgeTilePostReachSwitchesParsed = false;
+
+    void VF_ParseTilePostReachSwitches()
+    {
+        if (GVoxelForgeTilePostReachSwitchesParsed)
+        {
+            return;
+        }
+        GVoxelForgeTilePostReachSwitchesParsed = true;
+        int32 DebugValue = GVoxelForgeTilePostReachDebug;
+        float ScaleValue = GVoxelForgeTilePostReachScale;
+        FParse::Value(
+            FCommandLine::Get(), TEXT("voxel.TilePostReachDebug="), DebugValue);
+        FParse::Value(
+            FCommandLine::Get(), TEXT("voxel.TilePostReachScale="), ScaleValue);
+        GVoxelForgeTilePostReachDebug = DebugValue != 0 ? 1 : 0;
+        if (!VoxelMath::IsFinite(ScaleValue) || ScaleValue <= 0.0f)
+        {
+            ScaleValue = 1.0f;
+        }
+        GVoxelForgeTilePostReachScale = FMath::Min(ScaleValue, 1.0f);
+        VoxelGenLOD::GTilePostReachDebugEnabled.store(
+            GVoxelForgeTilePostReachDebug != 0, std::memory_order_relaxed);
+    }
 
     void VF_ParseOperatorBlockSwitch()
     {
@@ -42,6 +83,7 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_MesherGenerateMesh);
     VF_ParseOperatorBlockSwitch();
+    VF_ParseTilePostReachSwitches();
     FVoxelMeshData MeshData;
     if (OutCaptureGrid) { OutCaptureGrid->Reset(); }
     if (OutDensitySampleCount) { *OutDensitySampleCount = 0; }
@@ -233,6 +275,49 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         VoxelGenLOD::TileOriginVoxels, OriginVoxels);
     TGuardValue<int32> TileCellsGuard(
         VoxelGenLOD::TileCellsPerAxis, CellsPerAxis);
+
+    // Every density sample in this tile sees the same post-reach decision.  The one-point halo
+    // matches the actual grid fill below (gx/gy/gz = -1..GridDim), so a false bit proves that no
+    // landing or passage structural writer can reach any sample used by meshing or gradients.
+    TGuardValue<bool> TilePostReachDebugGuard(
+        VoxelGenLOD::bTilePostReachDebug,
+        GVoxelForgeTilePostReachDebug != 0);
+    TGuardValue<bool> TilePostReachBypassGuard(
+        VoxelGenLOD::bTilePostReachBypass, false);
+    uint8 TilePostReachFlags = VoxelGenLOD::AllTilePostReach;
+    if (Generator->StrateManager != nullptr)
+    {
+        const int64 Extent = static_cast<int64>(CellsPerAxis + 1) * Step;
+        const FBox LatticeWithHalo(
+            FVector(
+                static_cast<float>(static_cast<int64>(OriginVoxels.X) - Step),
+                static_cast<float>(static_cast<int64>(OriginVoxels.Y) - Step),
+                static_cast<float>(static_cast<int64>(OriginVoxels.Z) - Step)),
+            FVector(
+                static_cast<float>(static_cast<int64>(OriginVoxels.X) + Extent),
+                static_cast<float>(static_cast<int64>(OriginVoxels.Y) + Extent),
+                static_cast<float>(static_cast<int64>(OriginVoxels.Z) + Extent)));
+        const float ReachScale = GVoxelForgeTilePostReachScale;
+        TilePostReachFlags = 0;
+        if (Generator->StrateManager->AnyOriginLandingNearLattice(
+                LatticeWithHalo, OriginVoxels, Step, ReachScale))
+        {
+            TilePostReachFlags |= VoxelGenLOD::OriginLandingReachable;
+        }
+        if (Generator->StrateManager->AnyPassageLandingNearLattice(
+                LatticeWithHalo, OriginVoxels, Step, ReachScale))
+        {
+            TilePostReachFlags |= VoxelGenLOD::PassageLandingReachable;
+        }
+        if (Generator->StrateManager->AnyPassageStructuralPostNearLattice(
+                LatticeWithHalo, OriginVoxels, Step, ReachScale))
+        {
+            TilePostReachFlags |= VoxelGenLOD::PassageStructuralReachable;
+        }
+    }
+    TGuardValue<uint8> TilePostReachFlagsGuard(
+        VoxelGenLOD::TilePostReachFlags, TilePostReachFlags);
+    VoxelGenLOD::RecordTileReachMask(TilePostReachFlags);
     // COUPE DE CONTENU PAR STRATE — restreint le maillage (et l'échantillonnage) aux cellules
     // dont l'intervalle Z chevauche la bande [BandZMinVox, BandZMaxVox] (voxels inclusifs).
     // Les tuiles à capture ne sont jamais bandées (niveau 0 — garde-fou ci-dessous).

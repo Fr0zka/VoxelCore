@@ -471,13 +471,20 @@ namespace VoxelPassageGeometry
 
     FORCEINLINE bool OriginLandingRoomTouchesLattice(
         const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
-        float StrateTopZ, float StrateBottomZ, float SealThickness, float OriginRadius)
+        float StrateTopZ, float StrateBottomZ, float SealThickness, float OriginRadius,
+        float ReachScale = 1.0f)
     {
         if (!VoxelBox.IsValid) return false;
+        if (!VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+        {
+            // This is an invalid proof request, not an empty room.  The manager treats a
+            // malformed scale as conservative/unknown before calling this helper.
+            return true;
+        }
         const FOriginLandingGeometry Geometry = BuildOriginLandingGeometry(
             StrateTopZ, StrateBottomZ, SealThickness, OriginRadius);
         if (!Geometry.bValid) return false;
-        const float Pad = LandingCarveBlendVoxels;
+        const float Pad = LandingCarveBlendVoxels * ReachScale;
         return LatticeAxisHasSampleInInterval(
                    FMath::Max((float)VoxelBox.Min.X, -Geometry.HalfWidth - Pad),
                    FMath::Min((float)VoxelBox.Max.X, Geometry.HalfWidth + Pad),
