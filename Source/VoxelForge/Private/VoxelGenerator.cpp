@@ -2370,6 +2370,49 @@ namespace
         return static_cast<int32>(Hash & (TunnelDensityCacheSlotCount - 1));
     }
 
+    static void UpdateTunnelCoreTileReach(
+        const FChunkSDFCache& Cache,
+        bool bUseTileCacheWindow)
+    {
+        if (!bUseTileCacheWindow
+            || !VoxelGenLOD::bTileReachDiagnosticTile
+            || VoxelGenLOD::TileCellsPerAxis <= 0)
+        {
+            return;
+        }
+
+        const int32 Step = FMath::Max(VoxelGenLOD::GetThreadSampleStep(), 1);
+        const int64 Extent = static_cast<int64>(VoxelGenLOD::TileCellsPerAxis + 1)
+            * static_cast<int64>(Step);
+        if (Extent <= 0 || Extent > MAX_int32)
+        {
+            VoxelGenLOD::RecordTunnelCoreReachDecision(true);
+            return;
+        }
+        const FIntVector& Origin = VoxelGenLOD::TileOriginVoxels;
+        const FBox LatticeWithHalo(
+            FVector(
+                static_cast<float>(static_cast<int64>(Origin.X) - Step),
+                static_cast<float>(static_cast<int64>(Origin.Y) - Step),
+                static_cast<float>(static_cast<int64>(Origin.Z) - Step)),
+            FVector(
+                static_cast<float>(static_cast<int64>(Origin.X) + Extent),
+                static_cast<float>(static_cast<int64>(Origin.Y) + Extent),
+                static_cast<float>(static_cast<int64>(Origin.Z) + Extent)));
+        const bool bNear = VoxelCaveMorphology::AnyTunnelCoreWorldNearLattice(
+            Cache, LatticeWithHalo, VoxelGenLOD::TileReachScale);
+        if (bNear)
+        {
+            VoxelGenLOD::TilePostReachFlags |= VoxelGenLOD::TunnelCoreReachable;
+        }
+        else
+        {
+            VoxelGenLOD::TilePostReachFlags &= ~VoxelGenLOD::TunnelCoreReachable;
+        }
+        VoxelGenLOD::bTileCoreReachProofEnabled = true;
+        VoxelGenLOD::RecordTunnelCoreReachDecision(bNear);
+    }
+
     void PrepareTunnelCoreCache(
         const UVoxelStrateManager& Manager,
         const FIntVector& ChunkCoord,
@@ -2397,6 +2440,14 @@ namespace
             (static_cast<float>(ChunkCoord.Z) + 0.5f)
             * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
         const uint32 WorldSeed = static_cast<uint32>(Manager.GetWorldSeed());
+
+        // A tile-window cache contains the complete graph reach for this tile.  Chunk-local
+        // caches deliberately leave the core bit conservative; updating it there would make the
+        // first chunk's false result hide a tunnel that enters through a later cache window.
+        if (bUseTileCacheWindow && OutState.bValid)
+        {
+            UpdateTunnelCoreTileReach(OutState.Cache, bUseTileCacheWindow);
+        }
 
         const bool bSameGraphWindow = OutState.bValid
             && OutState.OwnerId == OwnerId
@@ -2457,6 +2508,7 @@ namespace
             Params, WorldSeed,
             StrateIndex, nullptr,
             ERoomGraphBuildSite::GeneratorTunnelCore);
+        UpdateTunnelCoreTileReach(OutState.Cache, bUseTileCacheWindow);
         BuildTunnelSupportColumnsForChunk(
             OutState.Cache, ChunkCoord, bUseSpatialIndex);
         OutState.OwnerId = OwnerId;
@@ -2723,6 +2775,24 @@ void UVoxelGenerator::EndDensityBlock() const
 
 float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) const
 {
+    // Soundness mode: for a sample in a block whose core or passage-carving reach bit is clear,
+    // evaluate the complete canonical field once with the bypass bit set.  The normal call then
+    // takes the fast path below and compares the final MC field after the boundary seal and diff
+    // layer—not an intermediate SDF.  This is deliberately debug-only; production pays no
+    // recursive call and only the evaluator/tail flag reads.
+    const bool bCompareFinalField = VoxelGenLOD::bTilePostReachDebug
+        && !VoxelGenLOD::IsTilePostReachBypassActive()
+        && VoxelGenLOD::bTileReachDiagnosticTile
+        && (!VoxelGenLOD::IsTunnelCoreReachable()
+            || !VoxelGenLOD::IsPassageCarvingReachable());
+    float CanonicalFinalField = 0.0f;
+    if (bCompareFinalField)
+    {
+        const bool PreviousBypass = VoxelGenLOD::bTilePostReachBypass;
+        VoxelGenLOD::bTilePostReachBypass = true;
+        CanonicalFinalField = GetDensityAt(WorldX, WorldY, WorldZ);
+        VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
+    }
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GetDensityAt);
     VF_ParseFastIsFiniteSwitch();
     VF_ParseFusedEvaluatorSwitch();
@@ -3542,16 +3612,52 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
         // solid floor writer but before the global XY seal. This cache is built once per chunk,
         // never once per voxel.
+        VoxelGenLOD::FScopedReachCost TunnelCoreTailReachCost(
+            VoxelGenLOD::ETileReachCostKind::TunnelCoreTail);
+        const bool bTunnelCoreReachable = VoxelGenLOD::IsTunnelCoreReachable();
+        const bool bTunnelCoreBypass = VoxelGenLOD::IsTilePostReachBypassActive();
+        auto ApplyGraphLandingFloors = [&]()
+        {
+            // These are passage/origin landing posts, not tunnel-core writes. Keep them alive when
+            // the core bit is clear because their own per-tile reach bits may still be set.
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(
+                    VoxelDensityProfile::EBucket::PassageLandingFloor);
+                VF_ApplyOriginLandingFloorMC(
+                    Result, WorldX, WorldY, WorldZ,
+                    CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
+                    CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
+            }
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(
+                    VoxelDensityProfile::EBucket::PassageLandingFloor);
+                StrateManager->ApplyPassageLandingFloorMC(
+                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+            }
+            {
+                VoxelDensityProfile::FScopedTimer ProfileTimer(
+                    VoxelDensityProfile::EBucket::PassageLandingRoomFloor);
+                StrateManager->ApplyPassageLandingRoomFloorMC(
+                    Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
+            }
+        };
         if (!VoxelDensityAblation::IsTunnelCoreOff()
             && (ActiveTunnelCoreCache->bValid || CP_UseOpStack))
         {
             FTunnelCoreWorldEvaluation TunnelCore;
             bool bHaveTunnelCore = bHavePreDisturbanceTunnelCore;
+            if (!bTunnelCoreReachable && !bTunnelCoreBypass)
+            {
+                // The fused/source hand-off is also empty on the skipped path. Do not let the
+                // default object turn this into a second tail evaluation.
+                bHaveTunnelCore = false;
+            }
             if (bHaveTunnelCore)
             {
                 TunnelCore = PreDisturbanceTunnelCore;
             }
-            if (!bHaveTunnelCore && ActiveTunnelCoreCache->bValid)
+            if (!bHaveTunnelCore && ActiveTunnelCoreCache->bValid
+                && (bTunnelCoreReachable || bTunnelCoreBypass))
             {
                 const FTunnelSupportFloorColumn* SupportColumn = nullptr;
                 FTunnelSupportFloorColumn EmptySupportColumn;
@@ -3631,30 +3737,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                         FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
                 }
 
-                // The graph tunnel can overlap an inter-strate landing at a room mouth. Its air
-                // backstop is allowed to reopen the tunnel, but the landing's proved support floor
-                // must own the final floor band; otherwise the graph post can erase the only support
-                // surface at the mouth and leave the player-fit graph with a disconnected pocket.
-                {
-                    VoxelDensityProfile::FScopedTimer ProfileTimer(
-                        VoxelDensityProfile::EBucket::PassageLandingFloor);
-                    VF_ApplyOriginLandingFloorMC(
-                        Result, WorldX, WorldY, WorldZ,
-                        CP_Dist.StrateTopWorldZ, CP_Dist.StrateBottomWorldZ,
-                        CP_Dist.BoundarySealThickness, LandingBaseDensity, OriginSpineRadius);
-                }
-                {
-                    VoxelDensityProfile::FScopedTimer ProfileTimer(
-                        VoxelDensityProfile::EBucket::PassageLandingFloor);
-                    StrateManager->ApplyPassageLandingFloorMC(
-                        Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
-                }
-                {
-                    VoxelDensityProfile::FScopedTimer ProfileTimer(
-                        VoxelDensityProfile::EBucket::PassageLandingRoomFloor);
-                    StrateManager->ApplyPassageLandingRoomFloorMC(
-                        Result, WorldX, WorldY, WorldZ, LandingBaseDensity);
-                }
+            }
+            if (bHaveTunnelCore || (!bTunnelCoreReachable && !bTunnelCoreBypass))
+            {
+                ApplyGraphLandingFloors();
             }
         }
         // Inter-strate passages own the same final D-floor contract as graph tunnels.  This is
@@ -3750,6 +3836,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     VoxelDensityProfile::FScopedTimer DensityTailTimer(
         VoxelDensityProfile::EBucket::DensityTail);
     VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+    if (bCompareFinalField)
+    {
+        const bool bFinalFieldDifferent =
+            !VoxelGenLOD::SameFloatBits(Result, CanonicalFinalField);
+        VoxelGenLOD::RecordSkippedPostComparison(
+            VoxelGenLOD::ETilePostComparisonKind::FinalField,
+            bFinalFieldDifferent);
+    }
     return Result;
 }
 
@@ -4089,6 +4183,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                 TerrainOps,
                 ERoomGraphBuildSite::GeneratorTile
             );
+            UpdateTunnelCoreTileReach(SDFCache, bUseTileCacheWindow);
 
             CachedSMinX = SMinX; CachedSMaxX = SMaxX;
             CachedSMinY = SMinY; CachedSMaxY = SMaxY;

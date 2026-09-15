@@ -476,6 +476,10 @@ public:
     bool AnyPassageLandingNearLattice(const FBox& VoxelBox,
                                       const FIntVector& LatticeOrigin, int32 Step,
                                       float ReachScale = 1.0f) const;
+    /** Per-tile reach for the modifier itself: capsule chain, landing terms, and carve blend. */
+    bool AnyPassageCarvingNearLattice(const FBox& VoxelBox,
+                                      const FIntVector& LatticeOrigin, int32 Step,
+                                      float ReachScale = 1.0f) const;
     /** Conservative sphere guard for all passage-owned structural posts and native D-floors. */
     bool AnyPassageStructuralPostNearLattice(const FBox& VoxelBox,
                                              const FIntVector& LatticeOrigin, int32 Step,

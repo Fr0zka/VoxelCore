@@ -2506,7 +2506,18 @@ void UVoxelStrateManager::GeneratePassages()
 
 float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float WorldZ) const
 {
+    VoxelGenLOD::FScopedReachCost ReachCost(
+        VoxelGenLOD::ETileReachCostKind::PassageCarving);
     if (VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        return FLT_MAX;
+    }
+    // GenerateMesh installs this once per tile/block.  Outside the mesher the TLS defaults to
+    // the canonical all-reachable state, and debug canonical calls set the bypass bit explicitly.
+    // A miss is an identity for VF_ApplyPassageCarving, so do not even enter the spatial shortlist
+    // or capsule chain on a proven-far sample.
+    if (!VoxelGenLOD::IsTilePostReachBypassActive()
+        && !VoxelGenLOD::IsPassageCarvingReachable())
     {
         return FLT_MAX;
     }
@@ -5091,6 +5102,224 @@ bool UVoxelStrateManager::AnyPassageLandingNearLattice(
             {
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+bool UVoxelStrateManager::AnyPassageCarvingNearLattice(
+    const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step,
+    float ReachScale) const
+{
+    if (VoxelDensityAblation::IsPassageCarvingOff())
+    {
+        return false;
+    }
+    if (Step <= 0 || !VoxelBox.IsValid
+        || !VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+    {
+        return true;
+    }
+
+    // BoundRadius is built around every capsule control point and both landing rooms.  The
+    // construction already adds the ModSDF<4 carve band.  SmoothMin can lower a chain of
+    // otherwise-far finite terms by at most K/6 per combine, so include that finite morphology
+    // loss as well.  A miss of this sphere proves every capsule/landing term folds to the hard
+    // no-op band before VF_ApplyPassageCarving; malformed descriptors remain candidates.
+    int32 SmoothMinCombines = 0;
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        if (!VoxelMath::IsFinite(Passage.BoundCenter.X)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Y)
+            || !VoxelMath::IsFinite(Passage.BoundCenter.Z)
+            || !VoxelMath::IsFinite(Passage.BoundRadius)
+            || !VoxelMath::IsFinite(Passage.BoundRadiusSq)
+            || Passage.BoundRadius < 0.0f || Passage.BoundRadiusSq < 0.0f)
+        {
+            return true;
+        }
+        if (Passage.ControlPoints.Num() >= 2)
+        {
+            if (Passage.ControlPoints.Num() > 4096)
+            {
+                return true;
+            }
+            const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+            if (!bTaper && !VoxelMath::IsFinite(Passage.Radius))
+            {
+                return true;
+            }
+            for (int32 Index = 0; Index < Passage.ControlPoints.Num(); ++Index)
+            {
+                const FVector& Point = Passage.ControlPoints[Index];
+                if (!VoxelMath::IsFinite(Point.X) || !VoxelMath::IsFinite(Point.Y)
+                    || !VoxelMath::IsFinite(Point.Z)
+                    || (bTaper && !VoxelMath::IsFinite(Passage.ControlRadii[Index])))
+                {
+                    return true;
+                }
+            }
+            SmoothMinCombines += FMath::Max(Passage.ControlPoints.Num() - 2, 0);
+        }
+        else
+        {
+            if (!VoxelMath::IsFinite(Passage.UpperPoint.X)
+                || !VoxelMath::IsFinite(Passage.UpperPoint.Y)
+                || !VoxelMath::IsFinite(Passage.UpperPoint.Z)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.X)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.Y)
+                || !VoxelMath::IsFinite(Passage.LowerPoint.Z)
+                || !VoxelMath::IsFinite(Passage.Radius))
+            {
+                return true;
+            }
+        }
+
+        if (Passage.bNativeFloorEnabled)
+        {
+            ++SmoothMinCombines; // SmoothMax is the same K/6 polynomial bound.
+        }
+        SmoothMinCombines += 3; // passage union plus its two landing terms
+        const FVoxelPassageLanding* Landings[] = {
+            &Passage.UpperLanding, &Passage.LowerLanding };
+        for (const FVoxelPassageLanding* Landing : Landings)
+        {
+            if (!VoxelMath::IsFinite(Landing->StandingPoint.X)
+                || !VoxelMath::IsFinite(Landing->StandingPoint.Y)
+                || !VoxelMath::IsFinite(Landing->FloorZ)
+                || !VoxelMath::IsFinite(Landing->CeilingZ)
+                || !VoxelMath::IsFinite(Landing->HalfWidth)
+                || !VoxelMath::IsFinite(Landing->FloorThickness))
+            {
+                return true;
+            }
+        }
+    }
+
+    constexpr float CarveThreshold = 4.0f;
+    constexpr float BlendK = 3.0f;
+    const float MorphologyPad = CarveThreshold
+        + BlendK * static_cast<float>(FMath::Max(SmoothMinCombines, 0)) / 6.0f;
+    if (!VoxelMath::IsFinite(MorphologyPad) || MorphologyPad < 0.0f)
+    {
+        return true;
+    }
+    for (const FVoxelPassage& Passage : Passages)
+    {
+        bool bHasTightGeometry = false;
+        bool bTightTouch = false;
+        const float PassagePad = MorphologyPad * ReachScale;
+        if (!VoxelMath::IsFinite(PassagePad) || PassagePad < 0.0f)
+        {
+            return true;
+        }
+        if (Passage.ControlPoints.Num() >= 2)
+        {
+            bHasTightGeometry = Passage.ControlPoints.Num() <= 4096;
+            const bool bTaper = Passage.ControlRadii.Num() == Passage.ControlPoints.Num();
+            const float MaxRadius = bTaper
+                ? [&Passage]()
+                {
+                    float Result = 0.0f;
+                    for (const float Radius : Passage.ControlRadii)
+                    {
+                        Result = FMath::Max(Result, FMath::Abs(Radius));
+                    }
+                    return Result;
+                }()
+                : FMath::Abs(Passage.Radius);
+            if (!VoxelMath::IsFinite(MaxRadius))
+            {
+                return true;
+            }
+            const float SegmentPad = (MaxRadius
+                + (Passage.bNativeFloorEnabled
+                    ? VoxelPassageGeometry::LandingFloorThicknessVoxels : 0.0f)
+                + PassagePad);
+            if (!VoxelMath::IsFinite(SegmentPad))
+            {
+                return true;
+            }
+            for (int32 SegmentIndex = 0;
+                 bHasTightGeometry && SegmentIndex + 1 < Passage.ControlPoints.Num();
+                 ++SegmentIndex)
+            {
+                const FVector& A = Passage.ControlPoints[SegmentIndex];
+                const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                if (VF_LatticeBoxTouchesAABB(
+                        VoxelBox, LatticeOrigin, Step,
+                        FMath::Min(A.X, B.X) - SegmentPad,
+                        FMath::Max(A.X, B.X) + SegmentPad,
+                        FMath::Min(A.Y, B.Y) - SegmentPad,
+                        FMath::Max(A.Y, B.Y) + SegmentPad,
+                        FMath::Min(A.Z, B.Z) - SegmentPad,
+                        FMath::Max(A.Z, B.Z) + SegmentPad))
+                {
+                    bTightTouch = true;
+                }
+            }
+        }
+        else
+        {
+            bHasTightGeometry = true;
+            const float SegmentPad = FMath::Abs(Passage.Radius)
+                + (Passage.bNativeFloorEnabled
+                    ? VoxelPassageGeometry::LandingFloorThicknessVoxels : 0.0f)
+                + PassagePad;
+            if (!VoxelMath::IsFinite(SegmentPad))
+            {
+                return true;
+            }
+            if (VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    FMath::Min(Passage.UpperPoint.X, Passage.LowerPoint.X) - SegmentPad,
+                    FMath::Max(Passage.UpperPoint.X, Passage.LowerPoint.X) + SegmentPad,
+                    FMath::Min(Passage.UpperPoint.Y, Passage.LowerPoint.Y) - SegmentPad,
+                    FMath::Max(Passage.UpperPoint.Y, Passage.LowerPoint.Y) + SegmentPad,
+                    FMath::Min(Passage.UpperPoint.Z, Passage.LowerPoint.Z) - SegmentPad,
+                    FMath::Max(Passage.UpperPoint.Z, Passage.LowerPoint.Z) + SegmentPad))
+            {
+                bTightTouch = true;
+            }
+        }
+
+        const float RoomPad = PassagePad;
+        for (const FVoxelPassageLanding* Landing : {
+                 &Passage.UpperLanding, &Passage.LowerLanding })
+        {
+            if (Landing->HalfWidth <= 0.0f || Landing->CeilingZ <= Landing->FloorZ)
+            {
+                continue;
+            }
+            constexpr float RoomRounding = 1.5f;
+            const float Height = Landing->CeilingZ - Landing->FloorZ;
+            const float HalfX = FMath::Max(Landing->HalfWidth - RoomRounding, 0.25f);
+            const float HalfZ = FMath::Max(Height * 0.5f - RoomRounding, 0.25f);
+            const float CenterZ = (Landing->FloorZ + Landing->CeilingZ) * 0.5f;
+            if (VF_LatticeBoxTouchesAABB(
+                    VoxelBox, LatticeOrigin, Step,
+                    Landing->StandingPoint.X - HalfX - RoomRounding - RoomPad,
+                    Landing->StandingPoint.X + HalfX + RoomRounding + RoomPad,
+                    Landing->StandingPoint.Y - HalfX - RoomRounding - RoomPad,
+                    Landing->StandingPoint.Y + HalfX + RoomRounding + RoomPad,
+                    FMath::Min(Landing->FloorZ,
+                               CenterZ - HalfZ - RoomRounding) - RoomPad,
+                    FMath::Max(Landing->CeilingZ,
+                               CenterZ + HalfZ + RoomRounding) + RoomPad))
+            {
+                bTightTouch = true;
+            }
+        }
+
+        if (bHasTightGeometry && !bTightTouch)
+        {
+            continue;
+        }
+        const float Reach = (Passage.BoundRadius + MorphologyPad) * ReachScale;
+        if (!VoxelMath::IsFinite(Reach)
+            || VF_LatticeBoxTouchesSphere(VoxelBox, Passage.BoundCenter, Reach))
+        {
+            return true;
         }
     }
     return false;

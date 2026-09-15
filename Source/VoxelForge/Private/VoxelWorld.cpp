@@ -1162,7 +1162,7 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         TEXT("[VoxelForgeTilePostReachKinds] comparisons="
              "origin_air=%llu/origin_floor=%llu/passage_sdf=%llu/landing_air=%llu/"
              "tunnel_air=%llu/landing_floor=%llu/structural=%llu/native_floor=%llu/room_floor=%llu "
-             "differences=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu"),
+             "final_field=%llu differences=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu"),
         static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
             static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginAir)].load(
                 std::memory_order_relaxed)),
@@ -1190,6 +1190,9 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
             static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingRoomFloor)].load(
                 std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostComparisonsByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::FinalField)].load(
+                std::memory_order_relaxed)),
         static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
             static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::OriginAir)].load(
                 std::memory_order_relaxed)),
@@ -1216,6 +1219,106 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
                 std::memory_order_relaxed)),
         static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
             static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::PassageLandingRoomFloor)].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GSkippedPostDifferencesByKind[
+            static_cast<uint8>(VoxelGenLOD::ETilePostComparisonKind::FinalField)].load(
+                std::memory_order_relaxed)));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileReachDecisions] core_reachable=%llu core_skipped=%llu "
+             "passage_carving_reachable=%llu passage_carving_skipped=%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GTunnelCoreReachableTiles.load(
+            std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTunnelCoreSkippedTiles.load(
+            std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GPassageCarvingReachableTiles.load(
+            std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GPassageCarvingSkippedTiles.load(
+            std::memory_order_relaxed)));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileReachCost] core_world_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][1].load(
+                std::memory_order_relaxed)));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileReachCost] core_tail_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][1].load(
+                std::memory_order_relaxed)));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileReachCost] passage_carving_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][1].load(
+                std::memory_order_relaxed)));
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTileBlockReachCost] core_world_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu; core_tail_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu; passage_far_calls=%llu far_cycles=%llu "
+             "near_calls=%llu near_cycles=%llu"),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::TunnelCoreTail)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][0].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCalls[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][1].load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(VoxelGenLOD::GTileReachBlockCostCycles[
+            static_cast<uint8>(VoxelGenLOD::ETileReachCostKind::PassageCarving)][1].load(
                 std::memory_order_relaxed)));
     if (VoxelGenLOD::GTilePostReachDebugEnabled.load(std::memory_order_relaxed)
         && TilePostReachDifferences != 0)

@@ -33,6 +33,12 @@ namespace
         TEXT("Scale the per-tile post reach for deliberate soundness tests. Default 1.0 is exact; "
              "values below 1 intentionally shrink the guard."));
 
+    int32 GVoxelForgeTileReachCostDiagnostics = 0;
+    FAutoConsoleVariableRef CVarVoxelForgeTileReachCostDiagnostics(
+        TEXT("voxel.TileReachCostDiagnostics"),
+        GVoxelForgeTileReachCostDiagnostics,
+        TEXT("Measure core/passage density cost split by tile reach; no field gate."));
+
     bool GVoxelForgeTilePostReachSwitchesParsed = false;
 
     void VF_ParseTilePostReachSwitches()
@@ -44,18 +50,24 @@ namespace
         GVoxelForgeTilePostReachSwitchesParsed = true;
         int32 DebugValue = GVoxelForgeTilePostReachDebug;
         float ScaleValue = GVoxelForgeTilePostReachScale;
+        int32 CostDiagnosticsValue = GVoxelForgeTileReachCostDiagnostics;
         FParse::Value(
             FCommandLine::Get(), TEXT("voxel.TilePostReachDebug="), DebugValue);
         FParse::Value(
             FCommandLine::Get(), TEXT("voxel.TilePostReachScale="), ScaleValue);
+        FParse::Value(
+            FCommandLine::Get(), TEXT("voxel.TileReachCostDiagnostics="), CostDiagnosticsValue);
         GVoxelForgeTilePostReachDebug = DebugValue != 0 ? 1 : 0;
         if (!VoxelMath::IsFinite(ScaleValue) || ScaleValue <= 0.0f)
         {
             ScaleValue = 1.0f;
         }
         GVoxelForgeTilePostReachScale = FMath::Min(ScaleValue, 1.0f);
+        GVoxelForgeTileReachCostDiagnostics = CostDiagnosticsValue != 0 ? 1 : 0;
         VoxelGenLOD::GTilePostReachDebugEnabled.store(
             GVoxelForgeTilePostReachDebug != 0, std::memory_order_relaxed);
+        VoxelGenLOD::GTileReachCostDiagnosticsEnabled.store(
+            GVoxelForgeTileReachCostDiagnostics != 0, std::memory_order_relaxed);
     }
 
     void VF_ParseOperatorBlockSwitch()
@@ -284,6 +296,23 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         GVoxelForgeTilePostReachDebug != 0);
     TGuardValue<bool> TilePostReachBypassGuard(
         VoxelGenLOD::bTilePostReachBypass, false);
+    TGuardValue<bool> TileReachDiagnosticGuard(
+        VoxelGenLOD::bTileReachDiagnosticTile, true);
+    TGuardValue<bool> TileCoreReachProofGuard(
+        VoxelGenLOD::bTileCoreReachProofEnabled, false);
+    TGuardValue<bool> TileCoreReachDecisionGuard(
+        VoxelGenLOD::bTileCoreReachDecisionRecorded, false);
+    TGuardValue<float> TileReachScaleGuard(
+        VoxelGenLOD::TileReachScale, GVoxelForgeTilePostReachScale);
+    const float ReachScale = GVoxelForgeTilePostReachScale;
+    const int32 ReachBlocksPerAxis = FMath::DivideAndRoundUp(
+        CellsPerAxis, VoxelGenLOD::TileReachBlockCells);
+    TGuardValue<int32> TileReachBlocksGuard(
+        VoxelGenLOD::TileReachBlocksPerAxis, ReachBlocksPerAxis);
+    TGuardValue<int32> TileReachBlockIndexGuard(
+        VoxelGenLOD::TileReachBlockIndex, INDEX_NONE);
+    TGuardValue<bool> TileBlockReachValidGuard(
+        VoxelGenLOD::bTileBlockReachValid, false);
     uint8 TilePostReachFlags = VoxelGenLOD::AllTilePostReach;
     if (Generator->StrateManager != nullptr)
     {
@@ -297,8 +326,9 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                 static_cast<float>(static_cast<int64>(OriginVoxels.X) + Extent),
                 static_cast<float>(static_cast<int64>(OriginVoxels.Y) + Extent),
                 static_cast<float>(static_cast<int64>(OriginVoxels.Z) + Extent)));
-        const float ReachScale = GVoxelForgeTilePostReachScale;
-        TilePostReachFlags = 0;
+        // Core stays conservative until the tile-window tunnel cache is built.  Passage carving
+        // is manager-owned and can be decided immediately from the same lattice+halo box.
+        TilePostReachFlags = VoxelGenLOD::TunnelCoreReachable;
         if (Generator->StrateManager->AnyOriginLandingNearLattice(
                 LatticeWithHalo, OriginVoxels, Step, ReachScale))
         {
@@ -309,6 +339,11 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
         {
             TilePostReachFlags |= VoxelGenLOD::PassageLandingReachable;
         }
+        if (Generator->StrateManager->AnyPassageCarvingNearLattice(
+                LatticeWithHalo, OriginVoxels, Step, ReachScale))
+        {
+            TilePostReachFlags |= VoxelGenLOD::PassageCarvingReachable;
+        }
         if (Generator->StrateManager->AnyPassageStructuralPostNearLattice(
                 LatticeWithHalo, OriginVoxels, Step, ReachScale))
         {
@@ -317,6 +352,30 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     }
     TGuardValue<uint8> TilePostReachFlagsGuard(
         VoxelGenLOD::TilePostReachFlags, TilePostReachFlags);
+    for (int32 BlockZ = 0; BlockZ < ReachBlocksPerAxis; ++BlockZ)
+    {
+        for (int32 BlockY = 0; BlockY < ReachBlocksPerAxis; ++BlockY)
+        {
+            for (int32 BlockX = 0; BlockX < ReachBlocksPerAxis; ++BlockX)
+            {
+                const int32 BlockIndex =
+                    ((BlockZ * ReachBlocksPerAxis) + BlockY) * ReachBlocksPerAxis + BlockX;
+                uint8 BlockFlags = TilePostReachFlags;
+                if (Generator->StrateManager != nullptr
+                    && (TilePostReachFlags & VoxelGenLOD::PassageCarvingReachable) != 0
+                    && !Generator->StrateManager->AnyPassageCarvingNearLattice(
+                        VoxelGenLOD::MakeTileReachBlockBox(
+                            OriginVoxels, Step, CellsPerAxis,
+                            BlockX, BlockY, BlockZ),
+                        OriginVoxels, Step, ReachScale))
+                {
+                    BlockFlags &= ~VoxelGenLOD::PassageCarvingReachable;
+                }
+                VoxelGenLOD::TileBlockReachFlags[BlockIndex] = BlockFlags;
+            }
+        }
+    }
+    VoxelGenLOD::bTileBlockReachValid = true;
     VoxelGenLOD::RecordTileReachMask(TilePostReachFlags);
     // COUPE DE CONTENU PAR STRATE — restreint le maillage (et l'échantillonnage) aux cellules
     // dont l'intervalle Z chevauche la bande [BandZMinVox, BandZMaxVox] (voxels inclusifs).
@@ -660,6 +719,15 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
                 else
                 {
                     // World voxel = tile origin + grid offset scaled by the cell size (Step).
+                    const int32 ReachBlockX = FMath::Clamp(gx, 0, CellsPerAxis - 1)
+                        / VoxelGenLOD::TileReachBlockCells;
+                    const int32 ReachBlockY = FMath::Clamp(gy, 0, CellsPerAxis - 1)
+                        / VoxelGenLOD::TileReachBlockCells;
+                    const int32 ReachBlockZ = FMath::Clamp(gz, 0, CellsPerAxis - 1)
+                        / VoxelGenLOD::TileReachBlockCells;
+                    VoxelGenLOD::TileReachBlockIndex =
+                        ((ReachBlockZ * ReachBlocksPerAxis) + ReachBlockY)
+                            * ReachBlocksPerAxis + ReachBlockX;
                     DensityGrid[LocalIndex] = Generator->GetDensityAt(
                         OriginVoxels.X + gx * Step,
                         OriginVoxels.Y + gy * Step,

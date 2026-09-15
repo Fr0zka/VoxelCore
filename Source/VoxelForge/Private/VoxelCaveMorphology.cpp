@@ -7914,7 +7914,17 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     const FTunnelSupportFloorColumn* SupportColumn,
     bool bUseSpatialIndex)
 {
+    VoxelGenLOD::FScopedReachCost ReachCost(
+        VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld);
     if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        return FTunnelCoreWorldEvaluation();
+    }
+    // GenerateMesh installs the exact tile/block reach mask after building the complete tile
+    // cache. Point queries retain the canonical all-reachable TLS default; debug proof calls set
+    // the bypass bit so the same sample can be evaluated as the reference field.
+    if (!VoxelGenLOD::IsTilePostReachBypassActive()
+        && !VoxelGenLOD::IsTunnelCoreReachable())
     {
         return FTunnelCoreWorldEvaluation();
     }
@@ -8040,6 +8050,318 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     }
 
     return Result;
+}
+
+bool VoxelCaveMorphology::AnyTunnelCoreWorldNearLattice(
+    const FChunkSDFCache& Cache,
+    const FBox& VoxelBox,
+    float ReachScale)
+{
+    if (VoxelDensityAblation::IsTunnelCoreOff())
+    {
+        return false;
+    }
+    if (!VoxelBox.IsValid
+        || !VoxelMath::IsFinite(ReachScale) || ReachScale <= 0.0f)
+    {
+        return true;
+    }
+
+    const auto TouchesSphere = [&VoxelBox](const FVector& Center, float Radius) -> bool
+    {
+        if (!VoxelMath::IsFinite(Center.X)
+            || !VoxelMath::IsFinite(Center.Y)
+            || !VoxelMath::IsFinite(Center.Z)
+            || !VoxelMath::IsFinite(Radius) || Radius < 0.0f)
+        {
+            return true;
+        }
+        const FVector Closest(
+            FMath::Clamp(Center.X, (float)VoxelBox.Min.X, (float)VoxelBox.Max.X),
+            FMath::Clamp(Center.Y, (float)VoxelBox.Min.Y, (float)VoxelBox.Max.Y),
+            FMath::Clamp(Center.Z, (float)VoxelBox.Min.Z, (float)VoxelBox.Max.Z));
+        return FVector::DistSquared(Closest, Center) <= Radius * Radius;
+    };
+
+    const auto TouchesExpandedAabb = [&VoxelBox](
+        const FVector& Min, const FVector& Max, float Pad) -> bool
+    {
+        if (!VoxelMath::IsFinite(Min.X) || !VoxelMath::IsFinite(Min.Y)
+            || !VoxelMath::IsFinite(Min.Z) || !VoxelMath::IsFinite(Max.X)
+            || !VoxelMath::IsFinite(Max.Y) || !VoxelMath::IsFinite(Max.Z)
+            || !VoxelMath::IsFinite(Pad) || Pad < 0.0f)
+        {
+            return true;
+        }
+        const float DX = FMath::Max3(
+            static_cast<float>(VoxelBox.Min.X) - static_cast<float>(Max.X),
+            static_cast<float>(Min.X) - static_cast<float>(VoxelBox.Max.X), 0.0f);
+        const float DY = FMath::Max3(
+            static_cast<float>(VoxelBox.Min.Y) - static_cast<float>(Max.Y),
+            static_cast<float>(Min.Y) - static_cast<float>(VoxelBox.Max.Y), 0.0f);
+        const float DZ = FMath::Max3(
+            static_cast<float>(VoxelBox.Min.Z) - static_cast<float>(Max.Z),
+            static_cast<float>(Min.Z) - static_cast<float>(VoxelBox.Max.Z), 0.0f);
+        return DX <= Pad && DY <= Pad && DZ <= Pad;
+    };
+
+    const float Fade = FMath::Max(Cache.SDFBlendRadius, 0.0f) * 0.35f;
+    if (!VoxelMath::IsFinite(Fade))
+    {
+        return true;
+    }
+
+    for (const FCachedTunnel& Tunnel : Cache.Tunnels)
+    {
+        const bool bHasWorldChain = Tunnel.WorldControlPoints.Num() >= 2
+            && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num();
+        const FVector& BoundCenter = bHasWorldChain
+            ? Tunnel.WorldBoundCenter : Tunnel.BoundCenter;
+        const float BoundRadiusSq = bHasWorldChain
+            ? Tunnel.WorldBoundRadiusSq : Tunnel.BoundRadiusSq;
+        const float InfluenceRadius = bHasWorldChain
+            ? Tunnel.WorldInfluenceRadius : Tunnel.SDFInfluenceRadius;
+        const FVector& CenterlineMin = bHasWorldChain
+            ? Tunnel.WorldCenterlineMin : Tunnel.SDFCenterlineMin;
+        const FVector& CenterlineMax = bHasWorldChain
+            ? Tunnel.WorldCenterlineMax : Tunnel.SDFCenterlineMax;
+
+        if (!VoxelMath::IsFinite(BoundCenter.X)
+            || !VoxelMath::IsFinite(BoundCenter.Y)
+            || !VoxelMath::IsFinite(BoundCenter.Z)
+            || !VoxelMath::IsFinite(BoundRadiusSq) || BoundRadiusSq < 0.0f
+            || !VoxelMath::IsFinite(InfluenceRadius) || InfluenceRadius < 0.0f
+            || !VoxelMath::IsFinite(CenterlineMin.X)
+            || !VoxelMath::IsFinite(CenterlineMin.Y)
+            || !VoxelMath::IsFinite(CenterlineMin.Z)
+            || !VoxelMath::IsFinite(CenterlineMax.X)
+            || !VoxelMath::IsFinite(CenterlineMax.Y)
+            || !VoxelMath::IsFinite(CenterlineMax.Z))
+        {
+            return true;
+        }
+        if (bHasWorldChain)
+        {
+            for (int32 Index = 0; Index < Tunnel.WorldControlPoints.Num(); ++Index)
+            {
+                const FVector& Point = Tunnel.WorldControlPoints[Index];
+                if (!VoxelMath::IsFinite(Point.X) || !VoxelMath::IsFinite(Point.Y)
+                    || !VoxelMath::IsFinite(Point.Z)
+                    || !VoxelMath::IsFinite(Tunnel.WorldControlRadii[Index]))
+                {
+                    return true;
+                }
+            }
+        }
+
+        // VF_TunnelFloorRelief uses the same bounded noise as the floor profile.  Use the
+        // profile-independent maximum scale (1.0) here: the normal authored scale is <= .20,
+        // but this remains sound for an old or malformed profile that bypassed that clamp.
+        float ReliefBound = 0.0f;
+        if (Tunnel.FloorReliefStrength > 0.0f)
+        {
+            if (!VoxelMath::IsFinite(Tunnel.FloorReliefStrength)
+                || !VoxelMath::IsFinite(Tunnel.FloorReliefFrequency))
+            {
+                return true;
+            }
+            ReliefBound = FMath::Abs(Tunnel.FloorReliefStrength)
+                * VOXEL_NOISE_SCALE * 1.01f;
+            if (!VoxelMath::IsFinite(ReliefBound))
+            {
+                return true;
+            }
+        }
+
+        float MouthReach = 0.0f;
+        float MouthFloorDelta = 0.0f;
+        if (bHasWorldChain && Tunnel.bHasFloorRoomOwnership)
+        {
+            MouthReach = FMath::Max(
+                FMath::Max(Tunnel.WorldMouthBlendRadiusA, Tunnel.WorldMouthBlendRadiusB),
+                0.0f) + Fade + 1.0f;
+            if (!VoxelMath::IsFinite(MouthReach))
+            {
+                return true;
+            }
+            const float NaturalA = static_cast<float>(Tunnel.WorldControlPoints[0].Z)
+                - FMath::Abs(Tunnel.WorldControlRadii[0]);
+            const int32 Last = Tunnel.WorldControlPoints.Num() - 1;
+            const float NaturalB = static_cast<float>(Tunnel.WorldControlPoints[Last].Z)
+                - FMath::Abs(Tunnel.WorldControlRadii[Last]);
+            if (!VoxelMath::IsFinite(NaturalA) || !VoxelMath::IsFinite(NaturalB))
+            {
+                return true;
+            }
+            if (Tunnel.WorldMouthFloorZA > -FLT_MAX
+                && !VoxelMath::IsFinite(Tunnel.WorldMouthFloorZA))
+            {
+                return true;
+            }
+            if (Tunnel.WorldMouthFloorZB > -FLT_MAX
+                && !VoxelMath::IsFinite(Tunnel.WorldMouthFloorZB))
+            {
+                return true;
+            }
+            if (Tunnel.WorldMouthFloorZA > -FLT_MAX)
+            {
+                MouthFloorDelta = FMath::Max(
+                    MouthFloorDelta, FMath::Abs(Tunnel.WorldMouthFloorZA - NaturalA));
+            }
+            if (Tunnel.WorldMouthFloorZB > -FLT_MAX)
+            {
+                MouthFloorDelta = FMath::Max(
+                    MouthFloorDelta, FMath::Abs(Tunnel.WorldMouthFloorZB - NaturalB));
+            }
+        }
+
+        // Tighten the construction sphere to the actual swept chain before falling back to the
+        // legacy bound.  The evaluator tests a capsule segment, not the sphere around the whole
+        // wandering chain; using segment AABBs removes the long-chain false near result while
+        // retaining a conservative pad for radius, floor band, relief, and SmoothMax blend.
+        const TArray<FVector>& ChainPoints = bHasWorldChain
+            ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
+        const TArray<float>& ChainRadii = bHasWorldChain
+            ? Tunnel.WorldControlRadii : Tunnel.ControlRadii;
+        bool bHasTightChain = ChainPoints.Num() >= 2
+            && ChainRadii.Num() == ChainPoints.Num();
+        bool bTightTouch = false;
+        if (bHasTightChain)
+        {
+            float MaxRadius = 0.0f;
+            for (int32 Index = 0; Index < ChainPoints.Num(); ++Index)
+            {
+                const FVector& Point = ChainPoints[Index];
+                if (!VoxelMath::IsFinite(Point.X) || !VoxelMath::IsFinite(Point.Y)
+                    || !VoxelMath::IsFinite(Point.Z)
+                    || !VoxelMath::IsFinite(ChainRadii[Index]))
+                {
+                    bHasTightChain = false;
+                    break;
+                }
+                MaxRadius = FMath::Max(MaxRadius, FMath::Abs(ChainRadii[Index]));
+            }
+            if (bHasTightChain)
+            {
+                float ProfileFloorDelta = 0.0f;
+                const TArray<FTunnelFloorSegmentProfile>& Profiles = bHasWorldChain
+                    ? Tunnel.WorldFloorProfiles : Tunnel.FloorProfiles;
+                if (Tunnel.bTunnelFloorEnabled
+                    && Profiles.Num() == ChainPoints.Num() - 1)
+                {
+                    for (int32 SegmentIndex = 0;
+                         SegmentIndex < Profiles.Num(); ++SegmentIndex)
+                    {
+                        const FTunnelFloorSegmentProfile& Profile = Profiles[SegmentIndex];
+                        if (!VoxelMath::IsFinite(Profile.StartFloorZ)
+                            || !VoxelMath::IsFinite(Profile.EndFloorZ))
+                        {
+                            bHasTightChain = false;
+                            break;
+                        }
+                        const float NaturalA = static_cast<float>(
+                            ChainPoints[SegmentIndex].Z)
+                            - FMath::Abs(ChainRadii[SegmentIndex]);
+                        const float NaturalB = static_cast<float>(
+                            ChainPoints[SegmentIndex + 1].Z)
+                            - FMath::Abs(ChainRadii[SegmentIndex + 1]);
+                        ProfileFloorDelta = FMath::Max(
+                            ProfileFloorDelta,
+                            FMath::Max(
+                                FMath::Abs(Profile.StartFloorZ - NaturalA),
+                                FMath::Abs(Profile.EndFloorZ - NaturalB)));
+                    }
+                }
+                if (bHasTightChain)
+                {
+                    const float FloorPad = Tunnel.bTunnelFloorEnabled
+                        ? FMath::Max(
+                            VoxelPassageGeometry::LandingFloorThicknessVoxels,
+                            FMath::Max(Cache.SDFBlendRadius, 0.0f) * 0.35f)
+                        : 0.0f;
+                    const float SegmentPad = MaxRadius + FloorPad
+                        + ProfileFloorDelta + ReliefBound;
+                    if (!VoxelMath::IsFinite(SegmentPad))
+                    {
+                        return true;
+                    }
+                    for (int32 SegmentIndex = 0;
+                         SegmentIndex + 1 < ChainPoints.Num(); ++SegmentIndex)
+                    {
+                        const FVector Min(
+                            FMath::Min(ChainPoints[SegmentIndex].X,
+                                       ChainPoints[SegmentIndex + 1].X),
+                            FMath::Min(ChainPoints[SegmentIndex].Y,
+                                       ChainPoints[SegmentIndex + 1].Y),
+                            FMath::Min(ChainPoints[SegmentIndex].Z,
+                                       ChainPoints[SegmentIndex + 1].Z));
+                        const FVector Max(
+                            FMath::Max(ChainPoints[SegmentIndex].X,
+                                       ChainPoints[SegmentIndex + 1].X),
+                            FMath::Max(ChainPoints[SegmentIndex].Y,
+                                       ChainPoints[SegmentIndex + 1].Y),
+                            FMath::Max(ChainPoints[SegmentIndex].Z,
+                                       ChainPoints[SegmentIndex + 1].Z));
+                        if (TouchesExpandedAabb(Min, Max, SegmentPad * ReachScale))
+                        {
+                            bTightTouch = true;
+                            break;
+                        }
+                    }
+
+                    if (!bTightTouch && Tunnel.bTunnelFloorEnabled
+                        && bHasWorldChain && Tunnel.bHasFloorRoomOwnership)
+                    {
+                        const float MouthHorizontal = MouthReach;
+                        const float MouthVertical = FMath::Max(
+                            MaxRadius + VoxelPassageGeometry::LandingFloorThicknessVoxels
+                                + ReliefBound,
+                            MouthFloorDelta + VoxelPassageGeometry::LandingFloorThicknessVoxels
+                                + ReliefBound);
+                        const float ScaledHorizontal = MouthHorizontal * ReachScale;
+                        const float ScaledVertical = MouthVertical * ReachScale;
+                        for (int32 Endpoint : {0, ChainPoints.Num() - 1})
+                        {
+                            const FVector& Point = ChainPoints[Endpoint];
+                            if (TouchesExpandedAabb(
+                                    FVector(
+                                        static_cast<float>(Point.X) - ScaledHorizontal,
+                                        static_cast<float>(Point.Y) - ScaledHorizontal,
+                                        static_cast<float>(Point.Z) - ScaledVertical),
+                                    FVector(
+                                        static_cast<float>(Point.X) + ScaledHorizontal,
+                                        static_cast<float>(Point.Y) + ScaledHorizontal,
+                                        static_cast<float>(Point.Z) + ScaledVertical),
+                                    0.0f))
+                            {
+                                bTightTouch = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (bHasTightChain && !bTightTouch)
+        {
+            continue;
+        }
+
+        // The broad sphere already encloses the swept radius and finite floor band.  Add the
+        // vertical relief and room-mouth ownership envelopes before asking whether the lattice
+        // box can touch it.  A miss is therefore an identity proof for the core evaluator and
+        // its support/room-floor tail; its only field writes are bSupportFloor, bRoomFloor, or
+        // CoreSDF < -inset, all of which are inside this envelope.
+        const float Reach = (
+            FMath::Sqrt(FMath::Max(BoundRadiusSq, 0.0f))
+            + ReliefBound + MouthReach + MouthFloorDelta) * ReachScale;
+        if (!VoxelMath::IsFinite(Reach)
+            || TouchesSphere(BoundCenter, Reach))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(

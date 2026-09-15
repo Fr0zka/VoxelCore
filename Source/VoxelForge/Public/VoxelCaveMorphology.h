@@ -1081,6 +1081,14 @@ namespace VoxelCaveMorphology
         bool bUseSpatialIndex = true
     );
 
+    // Per-tile broad reach for the world-space core/floor post.  The bound includes the swept
+    // chain, floor band, relief envelope, and the finite room-mouth ownership apron.
+    VOXELFORGE_API bool AnyTunnelCoreWorldNearLattice(
+        const FChunkSDFCache& Cache,
+        const FBox& VoxelBox,
+        float ReachScale = 1.0f
+    );
+
     // True for the finite support slab beneath a world-space graph tunnel. The native density
     // path and the operator stack use this same predicate before reopening the air core, keeping
     // the rounded capsule's bottom from becoming an unsupported point.
