@@ -576,3 +576,5 @@ GPU occlusion and meshlet culling help rendering, but avoiding CPU generation of
    Predict reachable motion including falls, prefetch passages and shafts, prioritize collision independently, invalidate only edit dependencies, and retain a conservative collision/admission fallback. This turns streaming from “usually fast enough” into an enforceable gameplay contract.
 
 My first production choice would be Architecture B, while retaining Architecture A’s immutable operator language as the authoring and compilation input. In other words: compose with procedural operators, but execute them into sparse bricks feature-by-feature. It gives up a little theoretical elegance in exchange for much more controllable frame time, edit latency, collision readiness, and debugging.
+
+> Round two, with the code: see `DESIGN-SOL-2026-09-15-CODE.md`. Sol corrected two of the notes above: per-sample lookup is ~5% exclusive (not the main cost), and coarse LOD from fine data is excluded by the clipmap design, not a gap.
