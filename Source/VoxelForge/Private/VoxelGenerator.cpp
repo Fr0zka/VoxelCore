@@ -194,6 +194,29 @@ namespace
         GVoxelForgeSpatialIndex = FMath::Clamp(GVoxelForgeSpatialIndex, -1, 1);
     }
 
+    int32 GVoxelForgeChunkRoutingCache = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeChunkRoutingCache(
+        TEXT("voxel.ChunkRoutingCache"),
+        GVoxelForgeChunkRoutingCache,
+        TEXT("Memoize chunk-Z gap/generator/operator-stack routing for density samples."));
+    bool GVoxelForgeChunkRoutingCacheSwitchParsed = false;
+
+    void VF_ParseChunkRoutingCacheSwitch()
+    {
+        if (GVoxelForgeChunkRoutingCacheSwitchParsed)
+        {
+            return;
+        }
+        GVoxelForgeChunkRoutingCacheSwitchParsed = true;
+        int32 CommandLineValue = GVoxelForgeChunkRoutingCache;
+        if (FParse::Value(
+                FCommandLine::Get(), TEXT("voxel.ChunkRoutingCache="), CommandLineValue))
+        {
+            GVoxelForgeChunkRoutingCache = CommandLineValue;
+        }
+        GVoxelForgeChunkRoutingCache = GVoxelForgeChunkRoutingCache != 0 ? 1 : 0;
+    }
+
 }
 
 //=============================================================================
@@ -2797,6 +2820,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
     VF_ParseFastIsFiniteSwitch();
     VF_ParseFusedEvaluatorSwitch();
     VF_ParseWormBlockSkipSwitch();
+    VF_ParseChunkRoutingCacheSwitch();
     VoxelDensityProfile::FScopedTimer DensityProfileTimer(
         VoxelDensityProfile::EBucket::GetDensityAt);
     VoxelDensityProfile::FScopedTimer DensityPrologueTimer(
@@ -2815,7 +2839,45 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         FMath::FloorToInt(WorldZ / CHUNK_SIZE)
     );
 
-    const bool bIsGapChunk = StrateManager && StrateManager->IsGapChunk(ChunkCoord);
+    const bool bUseChunkRoutingCache = GVoxelForgeChunkRoutingCache != 0;
+    thread_local uint64 CP_RouteGeneratorOwnerId = 0;
+    thread_local const UVoxelStrateManager* CP_RouteManager = nullptr;
+    thread_local uint64 CP_RouteManagerLifetimeId = 0;
+    thread_local uint32 CP_RouteLayoutVersion = 0xFFFFFFFFu;
+    thread_local FIntVector CP_RouteChunk(INT32_MAX, INT32_MAX, INT32_MAX);
+    thread_local bool CP_RouteIsGapChunk = false;
+    thread_local ECaveGeneratorType CP_RouteGeneratorType = ECaveGeneratorType::TunnelNetwork;
+    thread_local bool CP_RouteUsesOperatorStack = false;
+    uint32 RouteLayoutVersion = 0;
+    uint64 RouteManagerLifetimeId = 0;
+    bool bIsGapChunk = false;
+    if (StrateManager && bUseChunkRoutingCache)
+    {
+        RouteLayoutVersion = StrateManager->GetLayoutVersion();
+        RouteManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+        const bool bRouteKeyChanged = CP_RouteGeneratorOwnerId != DensityCacheOwnerId
+            || CP_RouteManager != StrateManager
+            || CP_RouteManagerLifetimeId != RouteManagerLifetimeId
+            || CP_RouteLayoutVersion != RouteLayoutVersion
+            || CP_RouteChunk != ChunkCoord;
+        if (bRouteKeyChanged)
+        {
+            CP_RouteGeneratorOwnerId = DensityCacheOwnerId;
+            CP_RouteManager = StrateManager;
+            CP_RouteManagerLifetimeId = RouteManagerLifetimeId;
+            CP_RouteLayoutVersion = RouteLayoutVersion;
+            CP_RouteChunk = ChunkCoord;
+            CP_RouteIsGapChunk = StrateManager->IsGapChunk(ChunkCoord);
+            CP_RouteGeneratorType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
+            CP_RouteUsesOperatorStack =
+                StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+        }
+        bIsGapChunk = CP_RouteIsGapChunk;
+    }
+    else if (StrateManager)
+    {
+        bIsGapChunk = StrateManager->IsGapChunk(ChunkCoord);
+    }
 
     if (StrateManager && bIsGapChunk)
     {
@@ -2908,20 +2970,25 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FVoxelStrateRegionManifest CP_ComposerRegions;
 #endif
 
-        const uint32 LayoutVersion = StrateManager->GetLayoutVersion();
-        const uint64 ManagerLifetimeId = StrateManager->GetCacheLifetimeId();
+        const uint32 LayoutVersion = bUseChunkRoutingCache
+            ? RouteLayoutVersion : StrateManager->GetLayoutVersion();
+        const uint64 ManagerLifetimeId = bUseChunkRoutingCache
+            ? RouteManagerLifetimeId : StrateManager->GetCacheLifetimeId();
         // TunnelNetwork/Underwater operator-stack parameters are selected from chunk Z only.
         // A coarse tile samples thousands of exact XY chunk keys, but those keys describe the
         // same immutable stack whenever the selected archetype is operator-stack backed.  Share
         // that prepared state by Z; the stack still queries the actual world position, and its
         // room-graph cache remains keyed by the real XY search window.  Legacy tunnel states keep
         // the full XYZ key because their native cache is built for one XY window.
-        const ECaveGeneratorType QueryGeneratorType =
-            StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
+        const ECaveGeneratorType QueryGeneratorType = bUseChunkRoutingCache
+            ? CP_RouteGeneratorType
+            : StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
         const bool bShareTunnelStackByZ = !bIsGapChunk
             && (QueryGeneratorType == ECaveGeneratorType::TunnelNetwork
                 || QueryGeneratorType == ECaveGeneratorType::Underwater)
-            && StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+            && (bUseChunkRoutingCache
+                ? CP_RouteUsesOperatorStack
+                : StrateManager->UsesOperatorStackForChunk(ChunkCoord));
         const FIntVector TunnelCacheKey = bShareTunnelStackByZ
             ? FIntVector(0, 0, ChunkCoord.Z) : ChunkCoord;
         FIntVector RequestedTileOrigin = FIntVector::ZeroValue;
@@ -3052,7 +3119,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             CP_Version = LayoutVersion;
             CP_Chunk   = ChunkCoord;
             CP_UsesTileCacheWindow = bTileCacheContext;
-            CP_GenType = StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
+            CP_GenType = bUseChunkRoutingCache
+                ? CP_RouteGeneratorType
+                : StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
             CP_UseCustomRecipe = false;
             bool bAllowCustomRecipe = true;
 #if WITH_EDITOR
@@ -3106,7 +3175,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             // ── OPSTACK Phase 1 : (re)construire la pile si cette strate l'a demandée. ──
             // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
             // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
-            CP_UseOpStack = StrateManager->UsesOperatorStackForChunk(ChunkCoord);
+            CP_UseOpStack = bUseChunkRoutingCache
+                ? CP_RouteUsesOperatorStack
+                : StrateManager->UsesOperatorStackForChunk(ChunkCoord);
             CP_UseOpStack = CP_UseOpStack || CP_UseCustomRecipe;
 #if WITH_EDITOR
             // A composer override is already an explicit, validated stack description.  It must
