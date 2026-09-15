@@ -129,6 +129,44 @@ namespace VoxelGenLOD
     inline std::atomic<uint64> GTileReachBlockCostCycles[
         static_cast<uint8>(ETileReachCostKind::Count)][2]{};
 
+    // Automation tests deliberately run the real mesher twice (full reach and a shrunken reach)
+    // in one process. Keep the reset in the reach owner so a test cannot accidentally omit one
+    // of the per-kind counters and accept a vacuous proof.
+    FORCEINLINE void ResetTilePostReachDiagnostics()
+    {
+        GTilePostReachDebugEnabled.store(false, std::memory_order_relaxed);
+        GTilePostReachTileCount.store(0, std::memory_order_relaxed);
+        GOriginLandingReachableTiles.store(0, std::memory_order_relaxed);
+        GPassageLandingReachableTiles.store(0, std::memory_order_relaxed);
+        GPassageStructuralReachableTiles.store(0, std::memory_order_relaxed);
+        GOriginLandingSkippedTiles.store(0, std::memory_order_relaxed);
+        GPassageLandingSkippedTiles.store(0, std::memory_order_relaxed);
+        GPassageStructuralSkippedTiles.store(0, std::memory_order_relaxed);
+        GTunnelCoreReachableTiles.store(0, std::memory_order_relaxed);
+        GTunnelCoreSkippedTiles.store(0, std::memory_order_relaxed);
+        GPassageCarvingReachableTiles.store(0, std::memory_order_relaxed);
+        GPassageCarvingSkippedTiles.store(0, std::memory_order_relaxed);
+        GSkippedPostComparisons.store(0, std::memory_order_relaxed);
+        GSkippedPostDifferences.store(0, std::memory_order_relaxed);
+        for (uint8 Index = 0;
+             Index < static_cast<uint8>(ETilePostComparisonKind::Count); ++Index)
+        {
+            GSkippedPostComparisonsByKind[Index].store(0, std::memory_order_relaxed);
+            GSkippedPostDifferencesByKind[Index].store(0, std::memory_order_relaxed);
+        }
+        GTileReachCostDiagnosticsEnabled.store(false, std::memory_order_relaxed);
+        for (uint8 Kind = 0; Kind < static_cast<uint8>(ETileReachCostKind::Count); ++Kind)
+        {
+            for (uint8 Reach = 0; Reach < 2; ++Reach)
+            {
+                GTileReachCostCalls[Kind][Reach].store(0, std::memory_order_relaxed);
+                GTileReachCostCycles[Kind][Reach].store(0, std::memory_order_relaxed);
+                GTileReachBlockCostCalls[Kind][Reach].store(0, std::memory_order_relaxed);
+                GTileReachBlockCostCycles[Kind][Reach].store(0, std::memory_order_relaxed);
+            }
+        }
+    }
+
     FORCEINLINE bool IsTilePostReachable(uint8 Bit)
     {
         return (TilePostReachFlags & Bit) != 0;

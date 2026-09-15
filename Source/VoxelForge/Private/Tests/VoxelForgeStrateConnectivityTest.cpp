@@ -1387,6 +1387,12 @@ bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)
         return false;
     }
 
+    // The two density-sign/coarse-lie controls below deliberately use boxes up to 256 voxels
+    // wide.  That is larger than the player-facing DiffLayer default radius cap; this test is
+    // validating the measurement field, not the gameplay brush budget.  Keep the fixture budget
+    // unlimited so a rejected control cannot masquerade as a density or connectivity failure.
+    World.DiffLayer->SetBudget(/*MaxMods=*/0, /*MaxRadius=*/0.0f, /*MaxVolume=*/0.0f);
+
     FVoxelStrateMeasureSettings Settings;
     Settings.SampleStep = 4;
     Settings.RadiusInVoxels = 256;
