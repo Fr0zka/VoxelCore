@@ -239,6 +239,14 @@ test for the reach proofs.
 **Parked:** `wip/exact-cull-20260914` (per-sample culls, a 23% always-on regression; only its gate
 fix was ported).
 
+**CLOSED 2026-09-15: the tunnel SDF/core merge. Do not re-propose it without a new idea.** The
+world-space core is load-bearing: `WorldControlPoints` keep the authored room-floor anchors and
+walkable routes before cave warp (`8e42d6d`, `cf2b2ad`). Replacing it cost 1,146 fit / 975
+walk-reachable cells; the exact shared-segment variant was 5.6-12.6% SLOWER. The remaining big
+costs (tunnel core ~20%, tunnel SDF ~13%) are the geometry itself, so the exact-skip perf push has
+reached diminishing returns. The reach proofs are now guarded by
+`VoxelForge.Correctness.TilePostReachProof`.
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
