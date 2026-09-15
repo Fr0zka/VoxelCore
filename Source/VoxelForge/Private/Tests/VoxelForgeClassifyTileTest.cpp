@@ -19,13 +19,15 @@
 // Cette fonction a DÉJÀ produit cette panne : la v1 de T1.d a été revertée le 2026-06-26 pour une
 // borne de plafond pas assez conservative. Jusqu'ici elle n'est validée que par raisonnement.
 // Ce test la valide par la force brute : pour chaque tuile jugée non-Mixed, on échantillonne le
-// treillis EXACT que le mesher aurait échantillonné (marge ±1 incluse) et on vérifie que chaque
-// point est bien du côté annoncé.
+// treillis des sommets de cellules que ClassifyTile couvre réellement (g = 0..CPA) et on vérifie
+// que chaque point est bien du côté annoncé. La marge extérieure du mesher sert aux normales, pas
+// au verdict uniforme.
 //
 // This function has ALREADY produced that failure: T1.d v1 was reverted on 2026-06-26 over a
 // non-conservative ceiling bound. Until now it was validated by reasoning only. This test
-// validates it by brute force: for every tile judged non-Mixed, sample the EXACT lattice the
-// mesher would have sampled (±1 margin included) and assert every point is on the claimed side.
+// validates it by brute force: for every tile judged non-Mixed, sample the exact cell-vertex
+// lattice covered by ClassifyTile (g = 0..CPA) and assert every point is on the claimed side. The
+// mesher's outer normal halo is deliberately outside the classifier's uniformity contract.
 //
 // CONVENTION (VoxelMarchingCubesMesher.cpp:309, IsoLevel == 0):
 //     D >= 0  ⇒ côté AIR   / air side
@@ -166,8 +168,10 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    // ── Vérification par force brute, sur le treillis EXACT du mesher. ──
-    // Les bornes reproduisent ClassifyTile / GenerateMesh : g ∈ [-1, Cells+1] par axe.
+    // ── Vérification par force brute du contrat de ClassifyTile. ──
+    // ClassifyTile covers actual cell vertices only: g ∈ [0, CPA]. GenerateMesh may sample a
+    // one-vertex outer halo for central-difference normals, but that halo cannot create a cell and
+    // is intentionally not part of the uniform verdict.
     int32 NumHoles = 0;
     for (const FTileSpec& Spec : ToVerify)
     {
@@ -175,13 +179,13 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
         if (Verdict == EVoxelTileClass::Mixed) { continue; }   // verdict instable ⇒ rien à prouver
 
         const int32 CPA     = FMath::Clamp(Spec.Cells, 2, CHUNK_SIZE);
-        const int32 GridDim = CPA + 1;
+        const int32 VertexCount = CPA + 1;
         const bool  bClaimsSolid = (Verdict == EVoxelTileClass::AllSolid);
 
         bool bTileBad = false;
-        for (int32 gz = -1; gz <= GridDim && !bTileBad; ++gz)
-        for (int32 gy = -1; gy <= GridDim && !bTileBad; ++gy)
-        for (int32 gx = -1; gx <= GridDim && !bTileBad; ++gx)
+        for (int32 gz = 0; gz < VertexCount && !bTileBad; ++gz)
+        for (int32 gy = 0; gy < VertexCount && !bTileBad; ++gy)
+        for (int32 gx = 0; gx < VertexCount && !bTileBad; ++gx)
         {
             const float X = (float)(Spec.Origin.X + gx * Spec.Step);
             const float Y = (float)(Spec.Origin.Y + gy * Spec.Step);
@@ -199,8 +203,8 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
                     TEXT("HOLE: ClassifyTile said %s for tile origin (%d,%d,%d) Step=%d Cells=%d, ")
                     TEXT("but GetDensityAt(%.0f, %.0f, %.0f) = %.6g is on the %s side. This tile ")
                     TEXT("would be skipped by the mesher: no triangles and NO COLLISION where there ")
-                    TEXT("should be a surface. Find which guard in ClassifyTile failed to fire for ")
-                    TEXT("the feature at that point."),
+                    TEXT("should be a surface. This point is inside ClassifyTile's actual cell ")
+                    TEXT("lattice, so find which classifier guard failed to fire for the feature."),
                     bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
                     Spec.Origin.X, Spec.Origin.Y, Spec.Origin.Z, Spec.Step, Spec.Cells,
                     X, Y, Z, D, (D >= 0.0f) ? TEXT("AIR") : TEXT("SOLID")));
@@ -336,13 +340,13 @@ bool FVoxelForgeOpStackClassifyTileTest::RunTest(const FString& Parameters)
         if (Verdict == EVoxelTileClass::Mixed) { continue; }
 
         const int32 CPA     = FMath::Clamp(Spec.Cells, 2, CHUNK_SIZE);
-        const int32 GridDim = CPA + 1;
+        const int32 VertexCount = CPA + 1;
         const bool  bClaimsSolid = (Verdict == EVoxelTileClass::AllSolid);
 
         bool bTileBad = false;
-        for (int32 gz = -1; gz <= GridDim && !bTileBad; ++gz)
-        for (int32 gy = -1; gy <= GridDim && !bTileBad; ++gy)
-        for (int32 gx = -1; gx <= GridDim && !bTileBad; ++gx)
+        for (int32 gz = 0; gz < VertexCount && !bTileBad; ++gz)
+        for (int32 gy = 0; gy < VertexCount && !bTileBad; ++gy)
+        for (int32 gx = 0; gx < VertexCount && !bTileBad; ++gx)
         {
             const float X = (float)(Spec.Origin.X + gx * Spec.Step);
             const float Y = (float)(Spec.Origin.Y + gy * Spec.Step);

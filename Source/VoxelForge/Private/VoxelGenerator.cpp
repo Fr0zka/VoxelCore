@@ -2760,8 +2760,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         float Density = 8.0f;  // bedrock solidity (positive = solid)
         StrateManager->ApplyPassageModifier(
             Density, WorldX, WorldY, WorldZ, 8.0f, 0.0f);
-        VF_ApplyXYEdgeSeal(Density, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
+        // Gap chunks use the compact bedrock path above instead of the ordinary strate tail.
+        // Native walkable passages still cross those chunks, so compose their build-authored
+        // D-floor here as well; otherwise the floor disappears exactly at the gap/strate seam.
         Result = -Density;
+        StrateManager->ApplyPassageNativeFloorMC(
+            Result, WorldX, WorldY, WorldZ, 8.0f);
+        VF_ApplyXYEdgeSealMC(
+            Result, WorldX, WorldY, WorldRadiusVoxels, EdgeSealThickness, 8.0f);
     }
     else if (StrateManager)
     {

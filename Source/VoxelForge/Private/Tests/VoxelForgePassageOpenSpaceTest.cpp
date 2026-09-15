@@ -178,11 +178,119 @@ namespace
         return true;
     }
 
+    class FGraphReservedFloorOracle
+    {
+    public:
+        explicit FGraphReservedFloorOracle(const UVoxelStrateManager& InManager)
+            : Manager(InManager)
+        {
+        }
+
+        bool IsReservedFloor(const FVector& Point)
+        {
+            const FIntVector ChunkCoord(
+                FMath::FloorToInt(Point.X / static_cast<float>(CHUNK_SIZE)),
+                FMath::FloorToInt(Point.Y / static_cast<float>(CHUNK_SIZE)),
+                FMath::FloorToInt(Point.Z / static_cast<float>(CHUNK_SIZE)));
+            if (Manager.IsGapChunk(ChunkCoord))
+            {
+                return false;
+            }
+
+            const ECaveGeneratorType GeneratorType =
+                Manager.GetGeneratorTypeForChunk(ChunkCoord);
+            if (GeneratorType != ECaveGeneratorType::TunnelNetwork
+                && GeneratorType != ECaveGeneratorType::Underwater)
+            {
+                return false;
+            }
+
+            FChunkSDFCache* Cache = CacheFor(ChunkCoord);
+            if (Cache == nullptr)
+            {
+                return false;
+            }
+
+            FTunnelSupportFloorColumn SupportColumn;
+            const FTunnelSupportFloorColumn* SupportColumnPtr = nullptr;
+            const bool bIntegerXY =
+                Point.X == FMath::FloorToFloat(Point.X)
+                && Point.Y == FMath::FloorToFloat(Point.Y);
+            if (bIntegerXY)
+            {
+                VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
+                    Point.X, Point.Y, *Cache, SupportColumn, /*bUseSpatialIndex=*/false);
+                SupportColumnPtr = &SupportColumn;
+            }
+
+            // This is the same public morphology query used by the generator's structural
+            // protection bit. A graph-owned room/tunnel floor is a reserved walking route: the
+            // inter-strate passage may join it, but must not carve its finite support band away.
+            const FTunnelCoreWorldEvaluation Evaluation =
+                VoxelCaveMorphology::EvaluateTunnelCoreWorld(
+                    Point.X, Point.Y, Point.Z, *Cache, SupportColumnPtr,
+                    /*bUseSpatialIndex=*/false);
+            return Evaluation.bSupportFloor || Evaluation.bRoomFloor;
+        }
+
+    private:
+        struct FCacheEntry
+        {
+            FIntVector Chunk = FIntVector::ZeroValue;
+            FChunkSDFCache Cache;
+        };
+
+        FChunkSDFCache* CacheFor(const FIntVector& ChunkCoord)
+        {
+            for (FCacheEntry& Entry : Caches)
+            {
+                if (Entry.Chunk == ChunkCoord)
+                {
+                    return &Entry.Cache;
+                }
+            }
+
+            UVoxelStrateDefinition* Definition = Manager.GetStrateForChunk(ChunkCoord);
+            if (Definition == nullptr)
+            {
+                return nullptr;
+            }
+
+            const FStrateGenerationParams Params = Manager.GetGenerationParams(ChunkCoord);
+            const float ChunkMinX = static_cast<float>(ChunkCoord.X * CHUNK_SIZE);
+            const float ChunkMinY = static_cast<float>(ChunkCoord.Y * CHUNK_SIZE);
+            const float ChunkMaxX = ChunkMinX + static_cast<float>(CHUNK_SIZE);
+            const float ChunkMaxY = ChunkMinY + static_cast<float>(CHUNK_SIZE);
+            const float Expansion = FMath::Abs(Params.CaveWarpStrength)
+                * VOXEL_NOISE_SCALE * 1.5f + 2.0f;
+            const int32 StrateIndex = Manager.GetStrateIndex(
+                (static_cast<float>(ChunkCoord.Z) + 0.5f)
+                * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
+
+            FCacheEntry& NewEntry = Caches.Emplace_GetRef();
+            NewEntry.Chunk = ChunkCoord;
+            VoxelCaveMorphology::BuildChunkCache(
+                NewEntry.Cache,
+                ChunkMinX - Expansion, ChunkMinY - Expansion,
+                ChunkMaxX + Expansion, ChunkMaxY + Expansion,
+                Params, static_cast<uint32>(Manager.GetWorldSeed()), StrateIndex,
+                &Definition->TerrainOperations,
+                ERoomGraphBuildSite::GeneratorTunnelCore);
+            return &NewEntry.Cache;
+        }
+
+        const UVoxelStrateManager& Manager;
+        TArray<FCacheEntry> Caches;
+    };
+
     bool FinalDensityCapsuleFits(
         const UVoxelGenerator& Generator,
         const FVector& Centreline,
-        float SupportFloorZ)
+        float SupportFloorZ,
+        FGraphReservedFloorOracle* GraphFloorOracle,
+        int32& OutReservedGraphFloorSamples)
     {
+        OutReservedGraphFloorSamples = 0;
         constexpr float Radius = VoxelPassageGeometry::PlayerRadiusVoxels;
         constexpr float HalfHeight = VoxelPassageGeometry::PlayerHalfHeightVoxels;
         constexpr int32 MaxHorizontalOffset = 2;
@@ -213,9 +321,22 @@ namespace
                         Centreline.X + static_cast<float>(OffsetX),
                         Centreline.Y + static_cast<float>(OffsetY),
                         SupportFloorZ + static_cast<float>(Row) + 0.5f);
-                    if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                    if (!FMath::IsFinite(Density))
                     {
                         return false;
+                    }
+                    if (!(Density > 0.0f))
+                    {
+                        const bool bReservedGraphFloor = GraphFloorOracle != nullptr
+                            && GraphFloorOracle->IsReservedFloor(FVector(
+                                Centreline.X + static_cast<float>(OffsetX),
+                                Centreline.Y + static_cast<float>(OffsetY),
+                                SupportFloorZ + static_cast<float>(Row) + 0.5f));
+                        if (!bReservedGraphFloor)
+                        {
+                            return false;
+                        }
+                        ++OutReservedGraphFloorSamples;
                     }
                 }
             }
@@ -226,9 +347,21 @@ namespace
                 const float Density = Generator.GetDensityAt(
                     Centreline.X, Centreline.Y,
                     SupportFloorZ + static_cast<float>(Row) + 0.5f);
-                if (!FMath::IsFinite(Density) || !(Density > 0.0f))
+                if (!FMath::IsFinite(Density))
                 {
                     return false;
+                }
+                if (!(Density > 0.0f))
+                {
+                    const bool bReservedGraphFloor = GraphFloorOracle != nullptr
+                        && GraphFloorOracle->IsReservedFloor(FVector(
+                            Centreline.X, Centreline.Y,
+                            SupportFloorZ + static_cast<float>(Row) + 0.5f));
+                    if (!bReservedGraphFloor)
+                    {
+                        return false;
+                    }
+                    ++OutReservedGraphFloorSamples;
                 }
             }
         }
@@ -246,6 +379,7 @@ namespace
         int32 RouteGradientFailures = 0;
         int32 FloorFailures = 0;
         int32 CapsuleFailures = 0;
+        int32 ReservedGraphFloorSamples = 0;
         float WorstGradient = 0.0f;
         float WorstGeometricGradient = 0.0f;
         float WorstPatchGradient = 0.0f;
@@ -264,6 +398,7 @@ namespace
     void AuditWalkableTunnel(
         const UVoxelGenerator& Generator,
         const FVoxelPassage& Passage,
+        FGraphReservedFloorOracle& GraphFloorOracle,
         FWalkableTunnelAudit& InOutAudit)
     {
         ++InOutAudit.Contracts;
@@ -400,8 +535,10 @@ namespace
                 const float FinalSupportFloor = FMath::Max(
                     SupportFloor, SupportFloorWithY);
                 ++InOutAudit.CapsuleSamples;
+                int32 ReservedGraphFloorSamples = 0;
                 if (!FinalDensityCapsuleFits(
-                        Generator, Centre, FinalSupportFloor))
+                        Generator, Centre, FinalSupportFloor,
+                        &GraphFloorOracle, ReservedGraphFloorSamples))
                 {
                     ++InOutAudit.CapsuleFailures;
                     RecordTunnelFailure(InOutAudit, FString::Printf(
@@ -409,6 +546,7 @@ namespace
                         Passage.UpperStrateIndex, Passage.LowerStrateIndex,
                         SegmentIndex, SampleIndex));
                 }
+                InOutAudit.ReservedGraphFloorSamples += ReservedGraphFloorSamples;
                 if (bHavePrevious)
                 {
                     const float RouteHorizontal = FVector2D(
@@ -554,8 +692,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         }
 
         // The upper mouth has its own source query too. This is deliberately evaluated from the
-        // upper strate's definition, seed, bounds, and requested XY; it must never inherit the
-        // lower mouth's answer or become an implicit passage chain.
+        // upper strate's definition, room seed, production world/warp seed, bounds, and requested
+        // XY; it must never inherit the lower mouth's answer or become an implicit passage chain.
         const float SourceTopZ = (float)(Source.TopChunkZ + 1) * CHUNK_SIZE;
         const float SourceBottomZ = (float)Source.BottomChunkZ * CHUNK_SIZE;
         const int32 SourceQuerySeed = OpenPointSeedFor(
@@ -575,7 +713,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
             Passage.RequestedUpperPoint.X,
             Passage.RequestedUpperPoint.Y,
             SourceMaxLateralSnap,
-            SuggestedUpperPoint);
+            SuggestedUpperPoint,
+            WorldSeed);
         if (!bCanAnswerUpper)
         {
             ++NumUpperQueryFalse;
@@ -652,7 +791,8 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
             DesiredPoint.X,
             DesiredPoint.Y,
             MaxLateralSnap,
-            SuggestedPoint);
+            SuggestedPoint,
+            WorldSeed);
 
         if (!bCanAnswer)
         {
@@ -1087,14 +1227,19 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
     // The landing checks above prove the two endpoints. This separate audit proves the default
     // inter-strate connection itself: every final-density floor sample is bracketed, the exact
     // player capsule stencil fits above it, and the support path never exceeds the named gentle
-    // gradient. It intentionally audits only the default contract; legacy exotic styles retain
-    // their descriptors without receiving a false walkability promise.
+    // gradient. A capsule sample may overlap the graph's finite, build-authored support floor;
+    // that is an intentional reserved-walk hand-off, not a passage hole. The passage is forbidden
+    // to cut that graph floor, so those exact morphology-owned samples are allowed below while any
+    // other obstruction remains a failure. Legacy exotic styles retain their descriptors without
+    // receiving a false walkability promise.
+    FGraphReservedFloorOracle GraphFloorOracle(*World.StrateManager);
     for (const FVoxelPassage& Passage : Passages)
     {
         if (Passage.UpperStrateIndex != Passage.LowerStrateIndex
             && Passage.bWalkableTunnelContract)
         {
-        AuditWalkableTunnel(*World.Generator, Passage, TunnelAudit);
+            AuditWalkableTunnel(
+                *World.Generator, Passage, GraphFloorOracle, TunnelAudit);
         }
     }
 
@@ -1187,7 +1332,7 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         AddError(FString::Printf(TEXT("First landing geometry failure: %s"), *FirstLandingFailure));
     }
     AddInfo(FString::Printf(
-        TEXT("Walkable tunnel contract: %d passages, %d segments, %d final floor samples, %d player-capsule samples; gradient failures %d (geometric %d, route %d), floor failures %d, capsule failures %d, worst gradient %.6f (geometric %.6f, route %.6f; cross-section diagnostic %.6f; limit %.6f / %.1f degrees)."),
+        TEXT("Walkable tunnel contract: %d passages, %d segments, %d final floor samples, %d player-capsule samples; gradient failures %d (geometric %d, route %d), floor failures %d, capsule failures %d, graph-reserved capsule samples allowed %d, worst gradient %.6f (geometric %.6f, route %.6f; cross-section diagnostic %.6f; limit %.6f / %.1f degrees)."),
         TunnelAudit.Contracts,
         TunnelAudit.Segments,
         TunnelAudit.FloorSamples,
@@ -1197,6 +1342,7 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
         TunnelAudit.RouteGradientFailures,
         TunnelAudit.FloorFailures,
         TunnelAudit.CapsuleFailures,
+        TunnelAudit.ReservedGraphFloorSamples,
         TunnelAudit.WorstGradient,
         TunnelAudit.WorstGeometricGradient,
         TunnelAudit.WorstRouteGradient,
