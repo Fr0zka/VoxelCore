@@ -208,6 +208,37 @@ the field, so these mix computation cost with the cost of the geometry each comp
 changing merge of the warped SDF and the world-space core); a real per-tile candidate filter
 designed to cost nothing per sample; the cold read-only audit's findings.
 
+## State after 2026-09-15 (HEAD `a668833`)
+
+**Gameplay fixes, from the owner's playtest:**
+- `4c8d06f` the player can walk from one strate into the next. `StrateContentCutMinLevel`
+  defaulted to 0, which content-cut the LOD0 collision tiles, so the collision gate blocked the
+  passage: a deadlock. Regression test `-voxel.TestStrateCrossing=1`.
+- `39c306b` its +29% cost recovered by an exact sealed-rock proof (`TryProveSealedSolidTile`).
+- `cf2b2ad` tunnel floors, option B (the owner's choice): no staircases; steep tunnels WIND
+  (walk-critical, a reserved spanning forest) or get a few big climbable DROPS (only leaf/redundant
+  edges). Visual acceptance is the owner's in-game check; the renders did not show it.
+- `9260775` passage D-floors were missing inside gap chunks (a real bug since `adb34df`), plus
+  two stale tests corrected.
+
+**Correctness:** `8879045` fixed the cold audit's findings (`AUDIT-COLD-2026-09-14.md`), including
+a determinism bug introduced by the tile-cache work (a moved-from operator stack could be evaluated
+on a cache miss), plus cache world-identity, lifetimes and input guards.
+
+**Performance since `7ece3ce`** (each measured against the committed tip's DLL, exact field):
+`ce4d878` landing/structural reach -12%; `1d824aa` cave warp SIMD batching -4%; `a668833`
+tunnel-core tile reach + passage-carving 8^3 reach -1.3 to -2.6%. Static worker time is now ~28 s,
+from ~184 s at the start of the push, with the same world and capability.
+
+**Current cost map** (`0208e93`, remove-one, static): tunnel core 20.8%, tunnel SDF 12.6%, passage
+carving 9.1%, cave warp 6.7%, structural posts 6.6%, unattributed ~28%. The tunnel core is
+near-dominated (~99% of its cycles are in tiles near tunnels), so exact skips cannot remove it. The
+next lever is the field-changing SDF/core merge (in progress), which will also add an automation
+test for the reach proofs.
+
+**Parked:** `wip/exact-cull-20260914` (per-sample culls, a 23% always-on regression; only its gate
+fix was ported).
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
