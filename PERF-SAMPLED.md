@@ -1665,3 +1665,279 @@ memory was approximately 1.54–1.60 GiB per process, with no runaway growth.
 
 No .uasset was edited. Engine source and binaries were not modified. No commit, push, or stash was
 performed.
+
+## Current-tip cost re-rank — 2026-09-15 (1d824aa)
+
+This is a measurement-only round on the committed experimental tip. Generation source,
+configuration assets, and .uasset files were not edited. The ignored staged host outputs under
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost were rebuilt as part of the measurement;
+no commit, push, or stash was performed.
+
+### Build and loaded runtime
+
+The owner/editor check was clear before the build and before every Unreal launch. The prescribed
+build completed successfully:
+
+    dotnet "E:\Program Files\Epic Games\UE_5.7\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll" UnrealEditor Win64 Development "-Project=E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\HostProject.uproject" -WaitMutex -FromMsBuild -architecture=x64 -NoUBA "-Log=E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_ReRank_20260915.log"
+    Result: Succeeded; Target is up to date; total execution time 1.31 s.
+
+The runtime loaded by every game and commandlet process was
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Binaries\Win64\UnrealEditor-VoxelForge.dll,
+SHA-256 70F5F69DCCBCE28AA0C1AC89E92040EBDB78FBC58F1F5FE07BD958F3C38DF0B4. The editor module
+built alongside it was SHA-256 C2081DB9B14D7E43A31A218200064FA941643E40DEAA9372E9067E72B6D966C6.
+Each launched process observed the runtime module at that staged path and matched the runtime
+hash. The build log is
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\PerfSampledBuild_ReRank_20260915.log.
+
+### Method and current static table
+
+The game command line was the same as the 6ccf371 ablation method: staged HostProject, -nullrhi,
+operator block on, fused evaluator on, outer classifier off, tile cache and spatial index on,
+-voxel.TestExitSeconds=15, sampler off, writable
+E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\DDC and Saved\ZenData, and an absolute
+-abslog= path. Static sessions generated 343 LOD0 samples and 841 applied tiles with zero
+obsolete aborts. The two all-on static baselines were shared by every row and were run before the
+remove-one pairs: 29.368018 s and 29.229716 s worker time, mean 29.298867 s; baseline generation
+p50/p95 was 0.053218 / 0.095652 s.
+
+The table reports the mean of two off runs, the saving against that shared all-on mean, and the
+changed-field triangle total. The percentage is the signed standalone worker saving share; rows
+are not additive, and a field-changing ablation is not a production speedup claim.
+
+| component removed | control | off worker s | saving s (%) | off generation p50/p95 s | triangles A/B |
+|---|---|---:|---:|---:|---:|
+| tunnel SDF | 0x0008 | 25.595623 | 3.703244 (12.64%) | 0.050373 / 0.073456 | 643424 / 643424 |
+| cave warp | 0x0001 | 27.340968 | 1.957899 (6.68%) | 0.048299 / 0.092184 | 655734 / 655734 |
+| passage carving | 0x0020 | 26.639516 | 2.659351 (9.08%) | 0.046557 / 0.090078 | 655000 / 655000 |
+| landing posts | 0x0800 | 29.047863 | 0.251005 (0.86%) | 0.052757 / 0.095932 | 669902 / 669902 |
+| passage structural posts | 0x0040 | 27.352201 | 1.946666 (6.64%) | 0.048393 / 0.089721 | 669902 / 669902 |
+| worms | voxel.WormsForceOff=1 | 28.242978 | 1.055889 (3.60%) | 0.052127 / 0.091638 | 662342 / 662342 |
+| native floor | 0x0080 | 28.302872 | 0.995995 (3.40%) | 0.051091 / 0.093253 | 671138 / 671138 |
+| origin spine | 0x0200 | 28.857599 | 0.441268 (1.51%) | 0.051791 / 0.095496 | 670350 / 670350 |
+| room SDF | 0x0004 | 28.055889 | 1.242978 (4.24%) | 0.050986 / 0.090057 | 535220 / 535220 |
+| pit/chimney SDF | 0x2000 | 29.146807 | 0.152060 (0.52%) | 0.052071 / 0.098243 | 669902 / 669902 |
+| boundary seal | 0x0400 | 29.447356 | -0.148489 (-0.51%) | 0.052806 / 0.094607 | 669902 / 669902 |
+| detail ops | 0x0002 | 29.957673 | -0.658805 (-2.25%) | 0.054265 / 0.095532 | 666972 / 666972 |
+| XY edge seal | 0x1000 | 29.071525 | 0.227342 (0.78%) | 0.052822 / 0.097379 | 669902 / 669902 |
+| disturbances | 0x0100 | 28.832774 | 0.466093 (1.59%) | 0.052326 / 0.094430 | 669902 / 669902 |
+| tunnel core | 0x0010 | 23.192249 | 6.106618 (20.84%) | 0.046526 / 0.068197 | 655666 / 655666 |
+
+All 14 voxel.TunnelAblate* bits were run twice. The extra worms row is included so this table
+remains row-comparable with the 6ccf371 table; worms is controlled by voxel.WormsForceOff, not by
+a TunnelAblate* bit. The current all-on field is 669902 triangles in this window. Different
+triangle counts show that these overrides are field-changing; equal triangle totals do not prove
+field identity.
+
+### Static share against 6ccf371
+
+These are standalone remove-one saving shares, not inclusive profiler shares. Now uses the
+29.298867 s current all-on mean above. The historical column is copied from the 6ccf371
+remove-one table, whose all-on mean was 33.064458 s. Change is percentage points.
+
+| component | share now | share at 6ccf371 | change |
+|---|---:|---:|---:|
+| tunnel SDF | 12.64% | 11.37% | +1.27 pp |
+| cave warp | 6.68% | 10.31% | -3.63 pp |
+| passage carving | 9.08% | 10.08% | -1.00 pp |
+| landing posts | 0.86% | 9.87% | -9.01 pp |
+| passage structural posts | 6.64% | 5.62% | +1.02 pp |
+| worms | 3.60% | 2.42% | +1.18 pp |
+| native floor | 3.40% | 2.17% | +1.23 pp |
+| origin spine | 1.51% | 1.62% | -0.11 pp |
+| room SDF | 4.24% | 1.58% | +2.66 pp |
+| pit/chimney SDF | 0.52% | 1.13% | -0.61 pp |
+| boundary seal | -0.51% | 0.76% | -1.27 pp |
+| detail ops | -2.25% | 0.69% | -2.94 pp |
+| XY edge seal | 0.78% | 0.49% | +0.29 pp |
+| disturbances | 1.59% | -0.43% | +2.02 pp |
+| tunnel core | 20.84% | -188.73% | +209.57 pp |
+
+The old tunnel-core row was a changed-field regression and is not a valid old cost estimate. The
+current tunnel-core saving is likewise a changed-field diagnostic, not permission to remove the
+stage. Summing only positive current standalone savings gives 21.206406 worker seconds, or
+72.3796% of the current static baseline. The remaining 27.6204%, 8.092461 s, is the current
+unattributed/shared cost in this ablation accounting. The signed rows are not a combined speedup
+forecast.
+
+### Moving confirmation for the current top five
+
+Moving sessions used the same switches, began at 3 s, ran at 800 cm/s, and produced 882 LOD0
+samples and 1680 applied tiles per process with zero obsolete aborts. Each row has two fresh
+all-on baselines interleaved with two remove-one runs. The worker-share column is against that
+row's own all-on mean.
+
+| component removed | all-on worker s | off worker s | saving s (%) | all-on gen p50/p95 s | off gen p50/p95 s | off triangles |
+|---|---:|---:|---:|---:|---:|---:|
+| tunnel core | 62.803210 | 50.841671 | 11.961539 (19.05%) | 0.051890 / 0.094224 | 0.045179 / 0.071081 | 1310998 / 1310998 |
+| tunnel SDF | 62.793729 | 54.886260 | 7.907468 (12.59%) | 0.051844 / 0.095083 | 0.049000 / 0.074435 | 1274742 / 1274742 |
+| passage carving | 63.103260 | 56.867475 | 6.235784 (9.88%) | 0.051921 / 0.094814 | 0.045053 / 0.089081 | 1315772 / 1315772 |
+| cave warp | 63.121345 | 59.108887 | 4.012458 (6.36%) | 0.052307 / 0.094549 | 0.048029 / 0.091797 | 1354749 / 1354749 |
+| passage structural posts | 63.000096 | 59.544697 | 3.455399 (5.48%) | 0.052444 / 0.095416 | 0.048040 / 0.090804 | 1331550 / 1331550 |
+
+The moving table confirms the current top five. Cave warp is materially below its old 10.71%
+moving share after the exact SIMD batching in 1d824aa; landing posts no longer belongs in the top
+five after the near-free reach-gated structural path.
+
+### Sampler-on moving hint and offline symbolization
+
+One sampler-on moving run used -voxel.SampleStacks=1000, a 30 s session beginning at 5 s,
+800 cm/s movement, and the same clean NullRHI command line. Its process result was 1521 LOD0
+samples, 2807 applied tiles, 2315204 triangles, and 101.786811 worker seconds. The raw and
+offline artifacts are:
+
+- E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackSamples_game_21444.csv
+- E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\VoxelStackModules_game_21444.tsv
+- E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\BuildHost\HostProject\Plugins\VoxelForge\Saved\ReRankSamplerMovingOffline_20260915.txt
+- E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\ReRankSamplerMovingOn_20260915.log
+- E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\ReRankSamplerMovingOffline_20260915.log
+
+The offline summary has 95308 samples with stacks: 62031 LOD0 and 33277 LOD1+. It loaded
+9/9 needed modules, has zero module-identity mismatches, maps 7335/7335 PCs, and has zero
+untagged samples. The inclusive top 20s below are a hint only. The engine task wrappers dominate
+the top ranks; component claims are taken from the ablations above, not inferred from one source
+line.
+
+#### All LOD inclusive top 20
+
+| rank | samples | share | label | function | source |
+|---:|---:|---:|---|---|---|
+| 1 | 95306 | 99.9979% | engine | [Inline] Invoke() | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Templates\Invoke.h:47 |
+| 2 | 95306 | 99.9979% | engine | [Inline] LowLevelTasks::FTask::Init lambda | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\Task.h:499 |
+| 3 | 95306 | 99.9979% | engine | [Inline] TTaskDelegate::Call | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\TaskDelegate.h:162 |
+| 4 | 95306 | 99.9979% | engine | [Inline] FTaskBase::Init lambda | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:180 |
+| 5 | 95306 | 99.9979% | engine | TTaskDelegate::CallAndMove | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\TaskDelegate.h:171 |
+| 6 | 95306 | 99.9979% | engine | FTaskBase::TryExecuteTask | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:518 |
+| 7 | 95306 | 99.9979% | engine | TExecutableTaskBase::ExecuteTask | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:898 |
+| 8 | 95306 | 99.9979% | plugin | AVoxelWorld::LoadTile lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelWorld.cpp:4752 |
+| 9 | 95305 | 99.9969% | plugin | AVoxelWorld::GenerateTileResult() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelWorld.cpp:5159 |
+| 10 | 95094 | 99.7755% | plugin | UVoxelMarchingCubesMesher::GenerateMesh() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelMarchingCubesMesher.cpp:663 |
+| 11 | 92346 | 96.8922% | plugin | UVoxelGenerator::GetDensityAt() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelGenerator.cpp:3263 |
+| 12 | 58256 | 61.1239% | plugin | UVoxelGenerator::GetDensityWithParams() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelGenerator.cpp:4093 |
+| 13 | 26070 | 27.3534% | plugin | VF_ForEachSpatialCandidate | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:1473 |
+| 14 | 16321 | 17.1245% | plugin | VoxelCaveMorphology::EvaluateSDFCached() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:7847 |
+| 15 | 12382 | 12.9916% | plugin | VF_EvaluateSweptTunnel() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:1070 |
+| 16 | 12044 | 12.6369% | plugin | VoxelCaveMorphology::EvaluateTunnelCoreWorld() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:8032 |
+| 17 | 11862 | 12.4460% | plugin | VF_EvaluateSweptTunnelChain() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:986 |
+| 18 | 10781 | 11.3117% | plugin | EvaluateSDFCached lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelCaveMorphology.cpp:7836 |
+| 19 | 10562 | 11.0820% | plugin | UVoxelStrateManager::ApplyPassageCarvingOnly() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelStrateManager.cpp:2727 |
+| 20 | 9904 | 10.3916% | plugin | EvaluateTunnelCoreWorld lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelCaveMorphology.cpp:8025 |
+
+#### LOD0 inclusive top 20
+
+| rank | samples | share | label | function | source |
+|---:|---:|---:|---|---|---|
+| 1 | 62029 | 99.9968% | engine | [Inline] Invoke() | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Templates\Invoke.h:47 |
+| 2 | 62029 | 99.9968% | engine | [Inline] FTask::Init lambda | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\Task.h:499 |
+| 3 | 62029 | 99.9968% | engine | [Inline] TTaskDelegate::Call | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\TaskDelegate.h:162 |
+| 4 | 62029 | 99.9968% | engine | [Inline] FTaskBase::Init lambda | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:180 |
+| 5 | 62029 | 99.9968% | engine | TTaskDelegate::CallAndMove | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Async\Fundamental\TaskDelegate.h:171 |
+| 6 | 62029 | 99.9968% | engine | FTaskBase::TryExecuteTask | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:518 |
+| 7 | 62029 | 99.9968% | engine | TExecutableTaskBase::ExecuteTask | E:\Program Files\Epic Games\UE_5.7\Engine\Source\Runtime\Core\Public\Tasks\TaskPrivate.h:898 |
+| 8 | 62029 | 99.9968% | plugin | AVoxelWorld::LoadTile lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelWorld.cpp:4752 |
+| 9 | 62028 | 99.9952% | plugin | AVoxelWorld::GenerateTileResult() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelWorld.cpp:5159 |
+| 10 | 61915 | 99.8130% | plugin | UVoxelMarchingCubesMesher::GenerateMesh() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelMarchingCubesMesher.cpp:663 |
+| 11 | 60168 | 96.9967% | plugin | UVoxelGenerator::GetDensityAt() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelGenerator.cpp:3263 |
+| 12 | 39193 | 63.1829% | plugin | UVoxelGenerator::GetDensityWithParams() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelGenerator.cpp:4093 |
+| 13 | 17762 | 28.6341% | plugin | VF_ForEachSpatialCandidate | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:1473 |
+| 14 | 11212 | 18.0748% | plugin | VoxelCaveMorphology::EvaluateSDFCached() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:7847 |
+| 15 | 8730 | 14.0736% | plugin | VF_EvaluateSweptTunnel() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:1070 |
+| 16 | 8379 | 13.5078% | plugin | VF_EvaluateSweptTunnelChain() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelCaveMorphology.cpp:986 |
+| 17 | 8346 | 13.4546% | plugin | VoxelCaveMorphology::EvaluateTunnelCoreWorld() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:8032 |
+| 18 | 7523 | 12.1278% | plugin | EvaluateSDFCached lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelCaveMorphology.cpp:7836 |
+| 19 | 7135 | 11.5023% | plugin | UVoxelStrateManager::ApplyPassageCarvingOnly() | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelStrateManager.cpp:2727 |
+| 20 | 6937 | 11.1831% | plugin | EvaluateTunnelCoreWorld lambda | E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Source\VoxelForge\Private\VoxelCaveMorphology.cpp:8025 |
+
+The symbolizer is not an attribution instrument: inclusive rows overlap, and the sampler itself
+adds overhead. It supports the same shape as the ablation result (SDF, swept tunnel, core, and
+passage carving are visible), but any line-level statement must be confirmed by a remove-one row.
+
+### Next three targets
+
+1. **Warped tunnel SDF + world-space tunnel core merge — field-changing.** The current tunnel-core
+   remove-one is the largest standalone result (20.84% static, 19.05% moving), and tunnel SDF is
+   independently 12.64% / 12.59%. A plausible form is one warped tunnel/core representation that
+   supplies the final density and core/floor metadata once. This changes the world-space core
+   semantics, so it requires the capability/export gates (player-fit 20,830; walk-reachable
+   10,909), render review, and determinism checks. The two tunnel rows are not additive and are
+   not a 33% forecast.
+2. **Passage carving reuse — exact.** The measured share is 9.08% static and 9.88% moving. A
+   cheaper exact form is per-tile reuse of the existing passage candidate list and modifier-SDF
+   result across EvaluateModifierSDF, carving, and floor/structural queries, preserving the
+   current values and evaluation order. Any changed carving geometry or threshold is
+   field-changing instead.
+3. **Cave warp — exact.** The remaining share is 6.68% static and 6.36% moving after the exact
+   three-channel SIMD batch in 1d824aa. The next exact form is reuse of the already computed warp
+   coordinates/results across the evaluator, cached graph, and operator-stack paths. A frequency,
+   hash, or approximation change is field-changing. Passage structural posts are the next
+   measured moving target at 5.48%, but their static worker share is 6.64% and remains a
+   secondary option.
+
+### Complete launch ledger
+
+Every actual launch below had an owner/editor check of zero before start, ran serially, streamed
+the log while active, exited 0, and loaded the expected runtime DLL unless stated otherwise. No
+log or generated artifact was deleted. The two wrapper-report errors after the sampler processes
+exited did not invalidate their already-written artifacts; the initial worms wrapper error did
+not start an Unreal process.
+
+| launch | outcome |
+|---|---|
+| PerfSampledBuild_ReRank_20260915 | PASS; UBT result succeeded, target up to date. |
+| ReRankStaticBaseA_20260915 | PASS; mask 0x00000000, 29.368018 worker s. |
+| ReRankStaticBaseB_20260915 | PASS; mask 0x00000000, 29.229716 worker s. |
+| ReRankStaticCaveWarpA_20260915 | PASS; mask 0x00000001. |
+| ReRankStaticCaveWarpB_20260915 | PASS; mask 0x00000001. |
+| ReRankStaticDetailOpsA_20260915 | PASS; mask 0x00000002. |
+| ReRankStaticDetailOpsB_20260915 | PASS; mask 0x00000002. |
+| ReRankStaticRoomSDFA_20260915 | PASS; mask 0x00000004. |
+| ReRankStaticRoomSDFB_20260915 | PASS; mask 0x00000004. |
+| ReRankStaticTunnelSDFA_20260915 | PASS; mask 0x00000008. |
+| ReRankStaticTunnelSDFB_20260915 | PASS; mask 0x00000008. |
+| ReRankStaticTunnelCoreA_20260915 | PASS; mask 0x00000010. |
+| ReRankStaticTunnelCoreB_20260915 | PASS; mask 0x00000010. |
+| ReRankStaticPassageCarvingA_20260915 | PASS; mask 0x00000020. |
+| ReRankStaticPassageCarvingB_20260915 | PASS; mask 0x00000020. |
+| ReRankStaticPassageStructuralPostsA_20260915 | PASS; mask 0x00000040. |
+| ReRankStaticPassageStructuralPostsB_20260915 | PASS; mask 0x00000040. |
+| ReRankStaticNativeFloorA_20260915 | PASS; mask 0x00000080. |
+| ReRankStaticNativeFloorB_20260915 | PASS; mask 0x00000080. |
+| ReRankStaticDisturbancesA_20260915 | PASS; mask 0x00000100. |
+| ReRankStaticDisturbancesB_20260915 | PASS; mask 0x00000100. |
+| ReRankStaticOriginSpineA_20260915 | PASS; mask 0x00000200. |
+| ReRankStaticOriginSpineB_20260915 | PASS; mask 0x00000200. |
+| ReRankStaticBoundarySealA_20260915 | PASS; mask 0x00000400. |
+| ReRankStaticBoundarySealB_20260915 | PASS; mask 0x00000400. |
+| ReRankStaticLandingPostsA_20260915 | PASS; mask 0x00000800. |
+| ReRankStaticLandingPostsB_20260915 | PASS; mask 0x00000800. |
+| ReRankStaticXYEdgeSealA_20260915 | PASS; mask 0x00001000. |
+| ReRankStaticXYEdgeSealB_20260915 | PASS; mask 0x00001000. |
+| ReRankStaticPitChimneySDFA_20260915 | PASS; mask 0x00002000. |
+| ReRankStaticPitChimneySDFB_20260915 | PASS; mask 0x00002000. |
+| ReRankStaticWormsOffA_20260915 | PASS; WormsForceOff=1, mask 0x00000000. |
+| ReRankStaticWormsOffB_20260915 | PASS; WormsForceOff=1, mask 0x00000000. |
+| ReRankMovingTunnelCoreBaseA_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingTunnelCoreA_20260915 | PASS; mask 0x00000010. |
+| ReRankMovingTunnelCoreBaseB_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingTunnelCoreB_20260915 | PASS; mask 0x00000010. |
+| ReRankMovingTunnelSDFBaseA_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingTunnelSDFA_20260915 | PASS; mask 0x00000008. |
+| ReRankMovingTunnelSDFBaseB_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingTunnelSDFB_20260915 | PASS; mask 0x00000008. |
+| ReRankMovingPassageCarvingBaseA_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingPassageCarvingA_20260915 | PASS; mask 0x00000020. |
+| ReRankMovingPassageCarvingBaseB_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingPassageCarvingB_20260915 | PASS; mask 0x00000020. |
+| ReRankMovingCaveWarpBaseA_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingCaveWarpA_20260915 | PASS; mask 0x00000001. |
+| ReRankMovingCaveWarpBaseB_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingCaveWarpB_20260915 | PASS; mask 0x00000001. |
+| ReRankMovingPassageStructuralPostsBaseA_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingPassageStructuralPostsA_20260915 | PASS; mask 0x00000040. |
+| ReRankMovingPassageStructuralPostsBaseB_20260915 | PASS; all-on moving baseline. |
+| ReRankMovingPassageStructuralPostsB_20260915 | PASS; mask 0x00000040. |
+| ReRankSamplerMovingOn_20260915 | PASS process; exit 0, sampler stopped, expected DLL, raw CSV written. Wrapper status print failed after exit on an invalid inline if expression; artifact was independently verified. |
+| ReRankSamplerMovingOffline_20260915 | PASS process; exit 0, symbolization completed, expected DLL, summary written. Wrapper post-check made the same invalid inline if mistake; summary was independently verified. |
+| initial worms wrapper attempt | FAILED before process start due orchestration-string interpolation; no Unreal process and no measurement. |
+
+All measured sessions were under 30 minutes. No editor was touched. The final checkout remains
+without tracked source or asset changes; no commit, push, or stash was performed.
