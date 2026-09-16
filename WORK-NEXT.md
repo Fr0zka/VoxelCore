@@ -272,13 +272,28 @@ meshes by nearest vertex, not by line).
 - field digest (cross-platform test grid) shape `0x767FB0650936435D`, field `0x2AE570A5A1A9C5CE`;
 - capability unchanged: 20,830 / 10,909, connected.
 
-**Next, in order (each on its own branch, owner-approved):**
-1. Bet A rung 1 + bet B rung 1 (counters and trace only, no field change):
-   - how much per-sample candidate work a tile-wide, feature-major tunnel evaluator would save;
-   - how many density samples adjacent tiles duplicate and could donate in time.
-2. Only if a rung-1 kill criterion is cleared: the rung-2 prototype behind a switch.
-3. Landing gap (ARCHITECTURE, passage landings): replace the random-reach fallback with a
-   deterministic retry.
+**Rung 1 done (`b003bee`, `ba7a083`, branch `sol/perf-probes`, probes off by default):**
+- ⛔ **Bet A (tile-wide feature-major tunnel evaluation) is KILLED. Do not re-propose it without a
+  new idea.** The per-sample lookup it removes is only 5.1-6.1% exclusive, and feature-major
+  visiting would touch **5.2-6.6x more lattice points** than the current code evaluates (static
+  LOD0: 49.3M predicted vs 9.5M expensive evaluations), because the cheap AABB/sphere rejection
+  (63M of 80M visits) is exactly what it throws away. The swept kernel is branch-divergent
+  (per-sample segment choice, ownership and support branches), so no low-risk X-lane SIMD.
+- ✅ **Bet B (cross-tile density reuse) cleared every gate**, and the orchestrator re-derived it
+  from the raw trace independently (`scratchpad/dupcheck.py`): static LOD0 20.04% of density calls
+  are exact duplicates, 80.6% with a donor already finished (~2.96 s of 18.3 s); moving 20.70%,
+  63.3% (~5.94 s of 45.3 s). Ceiling ~16% static / ~13% moving of worker CPU.
+
+**Rung 2 (`sol/tile-sample-reuse`, WIP `9a67452`): INTERRUPTED by the Codex usage limit**
+(2026-09-16 02:07, resets 19 Sep 12:44). The slab cache, its key test, mesher donor views and
+`VoxelWorld` plumbing are committed **UNVALIDATED: never compiled, run or measured** (zero Unreal
+launches that round). Resume brief: `scratchpad/tile-sample-reuse-resume.md`. Acceptance unchanged:
+byte-identical canonical export, capability 20,830 / 10,909, >=6% worker CPU in both scenarios vs
+the tip; kill under 4%. Also still owed: a same-session switch-off A/B, because rung 1's probes-off
+static (28.18 s) sits above the maths round's (27.41 s) for the same code.
+
+**Then:** landing gap (ARCHITECTURE, passage landings): replace the random-reach fallback with a
+deterministic retry.
 Smaller hardening noted by Sol, not scheduled: field-wise cache hashing instead of raw-memory
 CRC32; an integer-lattice mesher entry point; server-sequenced edit order once networking exists.
 
