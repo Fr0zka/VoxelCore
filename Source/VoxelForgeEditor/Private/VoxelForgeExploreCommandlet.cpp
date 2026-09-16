@@ -34,6 +34,7 @@
 #include "VoxelGenerator.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
+#include "VoxelPassageGeometry.h"
 #include "VoxelSettings.h"
 #include "VoxelStackSampler.h"
 #include "VoxelStrateDefinition.h"
@@ -213,6 +214,49 @@ bool ParseRenderCamera(const FString& Text, FVector& OutCamera)
     return true;
 }
 
+bool ParseDensitySlice(
+    const FString& Text,
+    FVector& OutOrigin,
+    FVector& OutDirection,
+    int32& OutSamples,
+    float& OutStep)
+{
+    TArray<FString> Components;
+    Text.ParseIntoArray(Components, TEXT(","), true);
+    if (Components.Num() != 8)
+    {
+        return false;
+    }
+
+    const float OriginX = FCString::Atof(*Components[0]);
+    const float OriginY = FCString::Atof(*Components[1]);
+    const float OriginZ = FCString::Atof(*Components[2]);
+    const float DirectionX = FCString::Atof(*Components[3]);
+    const float DirectionY = FCString::Atof(*Components[4]);
+    const float DirectionZ = FCString::Atof(*Components[5]);
+    const int32 Samples = FCString::Atoi(*Components[6]);
+    const float Step = FCString::Atof(*Components[7]);
+    if (!FMath::IsFinite(OriginX) || !FMath::IsFinite(OriginY)
+        || !FMath::IsFinite(OriginZ) || !FMath::IsFinite(DirectionX)
+        || !FMath::IsFinite(DirectionY) || !FMath::IsFinite(DirectionZ)
+        || !FMath::IsFinite(Step) || Samples < 2 || Samples > 4096
+        || Step <= 0.0f)
+    {
+        return false;
+    }
+
+    FVector Direction(DirectionX, DirectionY, DirectionZ);
+    if (!Direction.Normalize())
+    {
+        return false;
+    }
+    OutOrigin = FVector(OriginX, OriginY, OriginZ);
+    OutDirection = Direction;
+    OutSamples = Samples;
+    OutStep = Step;
+    return true;
+}
+
 bool NeedsOriginInWindow(ECaveGeneratorType Archetype)
 {
     // This is the same topology policy as VoxelForgePlayerFitWindow.h. That header is test-only,
@@ -261,8 +305,11 @@ float BoundarySealForArchetype(
 struct FExploreArguments
 {
     int32 Seed = 0;
+    bool bSeedOverride = false;
     ECaveGeneratorType Archetype = ECaveGeneratorType::Maze;
     int32 Slot = 4;
+    FString StrateReference;
+    FString SettingsReference;
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
@@ -296,6 +343,8 @@ struct FExploreArguments
     float BudgetMinutes = DefaultBudgetMinutes;
     bool bSurfaceRoughnessOverride = false;
     float SurfaceRoughness = 0.0f;
+    bool bTunnelWarpStrengthOverride = false;
+    float TunnelWarpStrength = 0.0f;
     bool bRoughnessNoiseTypeOverride = false;
     EVoxelNoiseType RoughnessNoiseType = EVoxelNoiseType::FBM;
     bool bRoughnessFrequencyOverride = false;
@@ -322,6 +371,13 @@ struct FExploreArguments
     int32 PassageFloorWrites = 1;
     bool bRenderCameraOverride = false;
     FVector RenderCamera = FVector::ZeroVector;
+    bool bRenderTargetOverride = false;
+    FVector RenderTarget = FVector::ZeroVector;
+    bool bDensitySlice = false;
+    FVector DensitySliceOrigin = FVector::ZeroVector;
+    FVector DensitySliceDirection = FVector::ForwardVector;
+    int32 DensitySliceSamples = 257;
+    float DensitySliceStep = 0.5f;
 
     bool IsDensityProfilingEnabled() const
     {
@@ -349,9 +405,11 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     FString ModesText = TEXT("render,walk,export");
     FString OutText;
 
-    FParse::Value(*Params, TEXT("seed="), OutArguments.Seed);
+    OutArguments.bSeedOverride = FParse::Value(*Params, TEXT("seed="), OutArguments.Seed);
     FParse::Value(*Params, TEXT("archetype="), ArchetypeText);
     FParse::Value(*Params, TEXT("slot="), OutArguments.Slot);
+    FParse::Value(*Params, TEXT("strateref="), OutArguments.StrateReference);
+    FParse::Value(*Params, TEXT("settingsref="), OutArguments.SettingsReference);
     FParse::Value(*Params, TEXT("modes="), ModesText);
     // FParse::Value treats a comma as a command-line separator in some UE commandlet
     // launch paths. Recover the complete token so both -modes=walk,export and the
@@ -427,6 +485,11 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     const bool bSurfaceRoughnessParsed = FParse::Value(
         *Params, TEXT("surfaceroughness="), OutArguments.SurfaceRoughness);
     OutArguments.bSurfaceRoughnessOverride = bSurfaceRoughnessSpecified;
+    const bool bTunnelWarpStrengthSpecified = Params.Contains(
+        TEXT("tunnelwarp="), ESearchCase::IgnoreCase);
+    const bool bTunnelWarpStrengthParsed = FParse::Value(
+        *Params, TEXT("tunnelwarp="), OutArguments.TunnelWarpStrength);
+    OutArguments.bTunnelWarpStrengthOverride = bTunnelWarpStrengthSpecified;
     FString RoughnessNoiseTypeText;
     const bool bRoughnessNoiseTypeSpecified = Params.Contains(
         TEXT("roughnesstype="), ESearchCase::IgnoreCase);
@@ -510,6 +573,53 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         }
     }
     OutArguments.bRenderCameraOverride = bRenderCameraSpecified;
+
+    FString RenderTargetText;
+    const bool bRenderTargetSpecified = Params.Contains(
+        TEXT("rendertarget="), ESearchCase::IgnoreCase);
+    bool bRenderTargetParsed = false;
+    if (bRenderTargetSpecified)
+    {
+        const int32 TargetOffset = Params.Find(TEXT("rendertarget="), ESearchCase::IgnoreCase);
+        if (TargetOffset != INDEX_NONE)
+        {
+            RenderTargetText = Params.Mid(TargetOffset + 13);
+            const int32 TargetEnd = RenderTargetText.Find(TEXT(" "));
+            if (TargetEnd != INDEX_NONE)
+            {
+                RenderTargetText.LeftInline(TargetEnd);
+            }
+            RenderTargetText.TrimQuotesInline();
+            bRenderTargetParsed = ParseRenderCamera(RenderTargetText, OutArguments.RenderTarget);
+        }
+    }
+    OutArguments.bRenderTargetOverride = bRenderTargetSpecified;
+
+    FString DensitySliceText;
+    const bool bDensitySliceSpecified = Params.Contains(
+        TEXT("densityslice="), ESearchCase::IgnoreCase);
+    bool bDensitySliceParsed = false;
+    if (bDensitySliceSpecified)
+    {
+        const int32 SliceOffset = Params.Find(TEXT("densityslice="), ESearchCase::IgnoreCase);
+        if (SliceOffset != INDEX_NONE)
+        {
+            DensitySliceText = Params.Mid(SliceOffset + 13);
+            const int32 SliceEnd = DensitySliceText.Find(TEXT(" "));
+            if (SliceEnd != INDEX_NONE)
+            {
+                DensitySliceText.LeftInline(SliceEnd);
+            }
+            DensitySliceText.TrimQuotesInline();
+            bDensitySliceParsed = ParseDensitySlice(
+                DensitySliceText,
+                OutArguments.DensitySliceOrigin,
+                OutArguments.DensitySliceDirection,
+                OutArguments.DensitySliceSamples,
+                OutArguments.DensitySliceStep);
+        }
+    }
+    OutArguments.bDensitySlice = bDensitySliceSpecified;
     int32 FailureFocusRender = 0;
     FParse::Value(*Params, TEXT("failurefocus="), FailureFocusRender);
     OutArguments.bFailureFocusRender = FailureFocusRender != 0;
@@ -656,6 +766,14 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         OutError = TEXT("surfaceroughness must be finite and greater than or equal to zero.");
         return false;
     }
+    if (OutArguments.bTunnelWarpStrengthOverride
+        && (!bTunnelWarpStrengthParsed
+            || !FMath::IsFinite(OutArguments.TunnelWarpStrength)
+            || OutArguments.TunnelWarpStrength < 0.0f))
+    {
+        OutError = TEXT("tunnelwarp must be finite and greater than or equal to zero.");
+        return false;
+    }
     if (OutArguments.bRoughnessNoiseTypeOverride && !bRoughnessNoiseTypeParsed)
     {
         OutError = TEXT("roughnesstype must be FBM, Ridged, Mixed, or Cellular.");
@@ -704,9 +822,11 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     if (OutArguments.bTunnelFloorGentleOverride
         && (!bTunnelFloorGentleParsed
             || !FMath::IsFinite(OutArguments.TunnelFloorGentle)
-            || OutArguments.TunnelFloorGentle < 0.0f))
+            || OutArguments.TunnelFloorGentle < 0.0f
+            || OutArguments.TunnelFloorGentle
+                > VoxelPassageGeometry::TunnelFloorGentleSlopeMaximumDegrees))
     {
-        OutError = TEXT("tunnelfloorgentle must be finite and non-negative.");
+        OutError = TEXT("tunnelfloorgentle must be finite degrees in [0,90].");
         return false;
     }
     if (OutArguments.bTunnelFloorLedgesOverride
@@ -754,6 +874,17 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     if (OutArguments.bRenderCameraOverride && !bRenderCameraParsed)
     {
         OutError = TEXT("rendercamera must be three finite comma-separated voxel coordinates.");
+        return false;
+    }
+    if (OutArguments.bRenderTargetOverride && !bRenderTargetParsed)
+    {
+        OutError = TEXT("rendertarget must be three finite comma-separated voxel coordinates.");
+        return false;
+    }
+    if (OutArguments.bDensitySlice && !bDensitySliceParsed)
+    {
+        OutError = TEXT(
+            "densityslice must be origin x,y,z, direction x,y,z, sample count, and positive step.");
         return false;
     }
 
@@ -946,62 +1077,240 @@ struct FExploreWorld
 
     bool Build(const FExploreArguments& Arguments, FString& OutError)
     {
-        const int32 NumStrates = Arguments.Slot + 2;
+        const bool bUseAuthoredSettings = !Arguments.SettingsReference.IsEmpty();
+        const bool bUseAuthoredStrate = !Arguments.StrateReference.IsEmpty();
+        UVoxelStrateDefinition* AuthoredDefinition = nullptr;
+        if (bUseAuthoredStrate)
+        {
+            AuthoredDefinition = LoadObject<UVoxelStrateDefinition>(
+                nullptr, *Arguments.StrateReference);
+            if (AuthoredDefinition == nullptr)
+            {
+                OutError = FString::Printf(
+                    TEXT("Could not load staged strate asset '%s'."),
+                    *Arguments.StrateReference);
+                return false;
+            }
+        }
+
+        if (bUseAuthoredSettings)
+        {
+            UVoxelSettings* AuthoredSettings = LoadObject<UVoxelSettings>(
+                nullptr, *Arguments.SettingsReference);
+            if (AuthoredSettings == nullptr)
+            {
+                OutError = FString::Printf(
+                    TEXT("Could not load staged settings asset '%s'."),
+                    *Arguments.SettingsReference);
+                return false;
+            }
+            Settings = TStrongObjectPtr<UVoxelSettings>(
+                DuplicateObject<UVoxelSettings>(AuthoredSettings, GetTransientPackage()));
+            if (!Settings.IsValid())
+            {
+                OutError = TEXT("Could not duplicate the staged settings asset into the transient package.");
+                return false;
+            }
+        }
+        else
+        {
+            Settings = TStrongObjectPtr<UVoxelSettings>(
+                NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
+        }
+
+        const int32 NumStrates = bUseAuthoredSettings
+            ? FMath::Max(Settings->TotalStrates, Arguments.Slot + 2)
+            : Arguments.Slot + 2;
         if (NumStrates > MaxSyntheticStrates)
         {
             OutError = TEXT("The synthetic layout would exceed the commandlet strate cap.");
             return false;
         }
 
-        Settings = TStrongObjectPtr<UVoxelSettings>(
-            NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
-        Settings->Seed = Arguments.Seed;
+        if (!bUseAuthoredSettings)
+        {
+            Settings->Seed = Arguments.Seed;
+            Settings->TotalStrates = NumStrates;
+            Settings->InterStrateGapChunks = 0;
+            Settings->WorldRadiusVoxels = 0.0f;
+            Settings->EdgeSealThickness = 64.0f;
+            Settings->OriginSpineRadius = 14.0f;
+            Settings->bOpenSurfaceEntry = true;
+        }
+        else if (Arguments.bSeedOverride)
+        {
+            Settings->Seed = Arguments.Seed;
+        }
+        // The transient fixed-definition layout may need to extend an authored settings asset
+        // for a requested interior slot. Keep that duplicate's advertised count consistent; the
+        // loaded package remains untouched.
         Settings->TotalStrates = NumStrates;
-        Settings->InterStrateGapChunks = 0;
-        Settings->WorldRadiusVoxels = 0.0f;
-        Settings->EdgeSealThickness = 64.0f;
-        Settings->OriginSpineRadius = 14.0f;
-        Settings->bOpenSurfaceEntry = true;
 
+        if (bUseAuthoredStrate)
+        {
+            // The owner’s snapshot states that every slot uses DA_Strate3. Clone it per slot so
+            // commandlet overrides never mutate a loaded package or leak between slots.
+            Settings->StratePool.Reset();
+            Settings->FixedStrates.Reset();
+        }
         Definitions.Reserve(NumStrates);
         for (int32 Index = 0; Index < NumStrates; ++Index)
         {
-            UVoxelStrateDefinition* Definition = NewObject<UVoxelStrateDefinition>(
-                GetTransientPackage(), NAME_None, RF_Transient);
-            Definition->StrateName = FText::FromString(FString::Printf(
-                TEXT("VoxelForgeExplore_%s_slot%d"),
-                ArchetypeName(Index == Arguments.Slot
-                    ? Arguments.Archetype
-                    : ECaveGeneratorType::TunnelNetwork),
-                Index));
-            Definition->StrateDescription = FText::FromString(
-                TEXT("Transient, deterministic commandlet definition."));
-            // The commandlet's acceptance sweep uses the owner-facing base spacing:
-            // 4 chunks * 32 voxels * 0.25 m = 32 m per strate. Production assets may be taller;
-            // this keeps the measured tunnel arithmetic tied to the stated ~32 m descent.
-            Definition->StrateHeightInChunks = 4;
-            Definition->TransitionType = EVoxelStrateTransition::Hard;
-            Definition->GeneratorType = Index == Arguments.Slot
-                ? Arguments.Archetype
-                : ECaveGeneratorType::TunnelNetwork;
-            // Explicitly select the production switch so the same synthetic layout, seed and
-            // mesher invocation can be measured through both density branches.
-            Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
-            if (Arguments.bWormsEnabledOverride)
+            UVoxelStrateDefinition* Definition = bUseAuthoredStrate
+                ? DuplicateObject<UVoxelStrateDefinition>(
+                    AuthoredDefinition, GetTransientPackage())
+                : NewObject<UVoxelStrateDefinition>(
+                    GetTransientPackage(), NAME_None, RF_Transient);
+            if (Definition == nullptr)
             {
-                Definition->bEnableWorms = Arguments.bWormsEnabled;
+                OutError = FString::Printf(
+                    TEXT("Could not create transient strate definition for slot %d."), Index);
+                return false;
             }
-            if (Arguments.bWormStrengthOverride
-                && (Definition->GeneratorType == ECaveGeneratorType::TunnelNetwork
-                    || Definition->GeneratorType == ECaveGeneratorType::Underwater))
+            if (!bUseAuthoredStrate)
             {
-                Definition->GenerationParams.WormStrength = Arguments.WormStrength;
+                Definition->StrateName = FText::FromString(FString::Printf(
+                    TEXT("VoxelForgeExplore_%s_slot%d"),
+                    ArchetypeName(Index == Arguments.Slot
+                        ? Arguments.Archetype
+                        : ECaveGeneratorType::TunnelNetwork),
+                    Index));
+                Definition->StrateDescription = FText::FromString(
+                    TEXT("Transient, deterministic commandlet definition."));
+                // The commandlet's acceptance sweep uses the owner-facing base spacing:
+                // 4 chunks * 32 voxels * 0.25 m = 32 m per strate. Production assets may be taller;
+                // this keeps the measured tunnel arithmetic tied to the stated ~32 m descent.
+                Definition->StrateHeightInChunks = 4;
+                Definition->TransitionType = EVoxelStrateTransition::Hard;
+                Definition->GeneratorType = Index == Arguments.Slot
+                    ? Arguments.Archetype
+                    : ECaveGeneratorType::TunnelNetwork;
+                // Explicitly select the production switch so the same synthetic layout, seed and
+                // mesher invocation can be measured through both density branches.
+                Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
+                if (Arguments.bWormsEnabledOverride)
+                {
+                    Definition->bEnableWorms = Arguments.bWormsEnabled;
+                }
+                if (Arguments.bWormStrengthOverride
+                    && (Definition->GeneratorType == ECaveGeneratorType::TunnelNetwork
+                        || Definition->GeneratorType == ECaveGeneratorType::Underwater))
+                {
+                    Definition->GenerationParams.WormStrength = Arguments.WormStrength;
+                }
             }
 
             const TSoftObjectPtr<UVoxelStrateDefinition> SoftDefinition(Definition);
             Settings->FixedStrates.Add(Index, SoftDefinition);
-            Settings->StratePool.Add(SoftDefinition);
+            if (!bUseAuthoredStrate)
+            {
+                Settings->StratePool.Add(SoftDefinition);
+            }
             Definitions.Add(TStrongObjectPtr<UVoxelStrateDefinition>(Definition));
+        }
+
+        auto ApplyTargetOverrides = [&Arguments](UVoxelStrateDefinition* Definition) -> bool
+        {
+            if (Definition == nullptr) { return false; }
+            const ECaveGeneratorType TargetArchetype = Definition->GeneratorType;
+            if (Arguments.bSurfaceRoughnessOverride)
+            {
+                switch (TargetArchetype)
+                {
+                case ECaveGeneratorType::FlatPlain:
+                case ECaveGeneratorType::CrystalChamber:
+                    Definition->SlabParams.FloorRoughness = Arguments.SurfaceRoughness;
+                    Definition->SlabParams.CeilingRoughness = Arguments.SurfaceRoughness;
+                    break;
+                case ECaveGeneratorType::Maze:
+                    Definition->MazeParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                    break;
+                case ECaveGeneratorType::SurfaceWorld:
+                    Definition->SurfaceParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                    break;
+                case ECaveGeneratorType::VerticalShafts:
+                    Definition->VerticalShaftParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                    break;
+                case ECaveGeneratorType::FloatingIslands:
+                    Definition->FloatingIslandParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                    break;
+                case ECaveGeneratorType::TunnelNetwork:
+                case ECaveGeneratorType::Underwater:
+                default:
+                    Definition->GenerationParams.SurfaceRoughness = Arguments.SurfaceRoughness;
+                    break;
+                }
+            }
+            if (Arguments.bRoughnessNoiseTypeOverride
+                || Arguments.bRoughnessFrequencyOverride)
+            {
+                if (TargetArchetype != ECaveGeneratorType::TunnelNetwork
+                    && TargetArchetype != ECaveGeneratorType::Underwater)
+                {
+                    return false;
+                }
+                if (Arguments.bRoughnessNoiseTypeOverride)
+                {
+                    Definition->GenerationParams.RoughnessNoiseType = Arguments.RoughnessNoiseType;
+                }
+                if (Arguments.bRoughnessFrequencyOverride)
+                {
+                    Definition->GenerationParams.RoughnessFrequency = Arguments.RoughnessFrequency;
+                }
+            }
+            FStrateGenerationParams& TunnelParams = Definition->GenerationParams;
+            if (Arguments.bTunnelWarpStrengthOverride)
+            {
+                if (TargetArchetype != ECaveGeneratorType::TunnelNetwork
+                    && TargetArchetype != ECaveGeneratorType::Underwater)
+                {
+                    return false;
+                }
+                TunnelParams.TunnelWarpStrength = Arguments.TunnelWarpStrength;
+            }
+            if (Arguments.bTunnelFloorEnabledOverride)
+            {
+                TunnelParams.bTunnelFloorEnabled = Arguments.TunnelFloorEnabled != 0;
+            }
+            if (Arguments.bTunnelFloorTerracingOverride)
+            {
+                TunnelParams.bTunnelFloorTerracingEnabled = Arguments.TunnelFloorTerracing != 0;
+            }
+            if (Arguments.bTunnelFloorStepOverride)
+            {
+                TunnelParams.TunnelFloorTerraceStepHeight = Arguments.TunnelFloorStep;
+            }
+            if (Arguments.bTunnelFloorMaxLedgeOverride)
+            {
+                TunnelParams.TunnelFloorMaxLedgeHeight = Arguments.TunnelFloorMaxLedge;
+            }
+            if (Arguments.bTunnelFloorGentleOverride)
+            {
+                TunnelParams.TunnelFloorGentleSlopeThreshold = Arguments.TunnelFloorGentle;
+            }
+            if (Arguments.bTunnelFloorLedgesOverride)
+            {
+                TunnelParams.TunnelFloorLedgeCountPreference = Arguments.TunnelFloorLedges;
+            }
+            if (Arguments.bTunnelFloorMaxLedgesOverride)
+            {
+                TunnelParams.TunnelFloorMaxLedges = Arguments.TunnelFloorMaxLedges;
+            }
+            if (Arguments.bRoomMouthRiseOverride)
+            {
+                TunnelParams.RoomMouthRiseStrength = Arguments.RoomMouthRise;
+            }
+            if (Arguments.bRoomMouthRiseBlendOverride)
+            {
+                TunnelParams.RoomMouthRiseBlendVoxels = Arguments.RoomMouthRiseBlend;
+            }
+            return true;
+        };
+        if (!Definitions.IsValidIndex(Arguments.Slot)
+            || !ApplyTargetOverrides(Definitions[Arguments.Slot].Get()))
+        {
+            OutError = TEXT("The target definition rejected a commandlet override.");
+            return false;
         }
 
         Manager = TStrongObjectPtr<UVoxelStrateManager>(
@@ -1028,104 +1337,40 @@ struct FExploreWorld
             OutError = TEXT("The requested target slot has no resolved definition.");
             return false;
         }
-        if (Arguments.bSurfaceRoughnessOverride)
-        {
-            // This is deliberately applied after layout construction and only to the target slot's
-            // resolved definition. Passage placement and every neighbouring strate retain their
-            // authored/default values; only the sampled target field gets the experiment knob.
-            switch (Arguments.Archetype)
-            {
-            case ECaveGeneratorType::FlatPlain:
-            case ECaveGeneratorType::CrystalChamber:
-                Target.Definition->SlabParams.FloorRoughness = Arguments.SurfaceRoughness;
-                Target.Definition->SlabParams.CeilingRoughness = Arguments.SurfaceRoughness;
-                break;
-            case ECaveGeneratorType::Maze:
-                Target.Definition->MazeParams.SurfaceRoughness = Arguments.SurfaceRoughness;
-                break;
-            case ECaveGeneratorType::SurfaceWorld:
-                Target.Definition->SurfaceParams.SurfaceRoughness = Arguments.SurfaceRoughness;
-                break;
-            case ECaveGeneratorType::VerticalShafts:
-                Target.Definition->VerticalShaftParams.SurfaceRoughness = Arguments.SurfaceRoughness;
-                break;
-            case ECaveGeneratorType::FloatingIslands:
-                Target.Definition->FloatingIslandParams.SurfaceRoughness = Arguments.SurfaceRoughness;
-                break;
-            case ECaveGeneratorType::TunnelNetwork:
-            case ECaveGeneratorType::Underwater:
-            default:
-                Target.Definition->GenerationParams.SurfaceRoughness = Arguments.SurfaceRoughness;
-                break;
-            }
-        }
-        if (Arguments.bRoughnessNoiseTypeOverride
-            || Arguments.bRoughnessFrequencyOverride)
-        {
-            if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork
-                && Arguments.Archetype != ECaveGeneratorType::Underwater)
-            {
-                OutError = TEXT(
-                    "roughnesstype/roughnessfrequency are only supported by TunnelNetwork or Underwater.");
-                return false;
-            }
-            if (Arguments.bRoughnessNoiseTypeOverride)
-            {
-                Target.Definition->GenerationParams.RoughnessNoiseType =
-                    Arguments.RoughnessNoiseType;
-            }
-            if (Arguments.bRoughnessFrequencyOverride)
-            {
-                Target.Definition->GenerationParams.RoughnessFrequency =
-                    Arguments.RoughnessFrequency;
-            }
-        }
-        // Floor controls are applied only to the requested target definition.  They are
-        // commandlet overrides for measured archetype comparisons; authored assets still carry
-        // the defaults/rolled values in FStrateGenerationParams.
-        FStrateGenerationParams& TargetTunnelParams = Target.Definition->GenerationParams;
-        if (Arguments.bTunnelFloorEnabledOverride)
-        {
-            TargetTunnelParams.bTunnelFloorEnabled =
-                Arguments.TunnelFloorEnabled != 0;
-        }
-        if (Arguments.bTunnelFloorTerracingOverride)
-        {
-            TargetTunnelParams.bTunnelFloorTerracingEnabled =
-                Arguments.TunnelFloorTerracing != 0;
-        }
-        if (Arguments.bTunnelFloorStepOverride)
-        {
-            TargetTunnelParams.TunnelFloorTerraceStepHeight = Arguments.TunnelFloorStep;
-        }
-        if (Arguments.bTunnelFloorMaxLedgeOverride)
-        {
-            TargetTunnelParams.TunnelFloorMaxLedgeHeight = Arguments.TunnelFloorMaxLedge;
-        }
-        if (Arguments.bTunnelFloorGentleOverride)
-        {
-            TargetTunnelParams.TunnelFloorGentleSlopeThreshold = Arguments.TunnelFloorGentle;
-        }
-        if (Arguments.bTunnelFloorLedgesOverride)
-        {
-            TargetTunnelParams.TunnelFloorLedgeCountPreference = Arguments.TunnelFloorLedges;
-        }
-        if (Arguments.bTunnelFloorMaxLedgesOverride)
-        {
-            TargetTunnelParams.TunnelFloorMaxLedges = Arguments.TunnelFloorMaxLedges;
-        }
-        if (Arguments.bRoomMouthRiseOverride)
-        {
-            TargetTunnelParams.RoomMouthRiseStrength = Arguments.RoomMouthRise;
-        }
-        if (Arguments.bRoomMouthRiseBlendOverride)
-        {
-            TargetTunnelParams.RoomMouthRiseBlendVoxels = Arguments.RoomMouthRiseBlend;
-        }
+        const ECaveGeneratorType TargetArchetype = Target.Definition->GeneratorType;
+        const FStrateGenerationParams& ReportParams = Target.Definition->GenerationParams;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeExplore][OwnerAssets] strate=%s settings=%s slot=%d "
+                 "seed=%d height_chunks=%d archetype=%s opstack=%d "
+                 "floor_enabled=%d floor_terracing=%d floor_step=%.9g max_ledge=%.9g "
+                 "gentle_slope_degrees=%.9g gentle_gradient=%.9g route_cap=%.9g "
+                 "wind_wave_cap=%d "
+                 "ledge_preference=%d max_ledges=%d tunnel_warp=%.9g terrain_ops=%d terrace_step=%.9g "
+                 "layer_spacing=%.9g rib_spacing=%.9g"),
+            bUseAuthoredStrate ? *Arguments.StrateReference : TEXT("synthetic"),
+            bUseAuthoredSettings ? *Arguments.SettingsReference : TEXT("synthetic"),
+            Arguments.Slot, Settings->Seed, Target.Definition->StrateHeightInChunks,
+            ArchetypeName(TargetArchetype), Target.Definition->bUseOperatorStack ? 1 : 0,
+            ReportParams.bTunnelFloorEnabled ? 1 : 0,
+            ReportParams.bTunnelFloorTerracingEnabled ? 1 : 0,
+            ReportParams.TunnelFloorTerraceStepHeight,
+            ReportParams.TunnelFloorMaxLedgeHeight,
+            ReportParams.TunnelFloorGentleSlopeThreshold,
+            VoxelPassageGeometry::TunnelFloorGradientFromDegrees(
+                ReportParams.TunnelFloorGentleSlopeThreshold),
+            VoxelPassageGeometry::TunnelFloorMaximumRouteLengthVoxels,
+            VoxelPassageGeometry::TunnelFloorMaximumWindWaves,
+            ReportParams.TunnelFloorLedgeCountPreference,
+            ReportParams.TunnelFloorMaxLedges,
+            ReportParams.TunnelWarpStrength,
+            Target.Definition->TerrainOperations.Num(),
+            ReportParams.TerraceStepHeight,
+            ReportParams.LayerLineSpacing,
+            ReportParams.RibbingSpacing);
         TargetBottomWorldZ = Target.BottomChunkZ * CHUNK_SIZE;
         TargetTopWorldZ = (Target.TopChunkZ + 1) * CHUNK_SIZE;
         TargetBoundarySealThickness = BoundarySealForArchetype(
-            *Target.Definition, Arguments.Archetype);
+            *Target.Definition, TargetArchetype);
         if (TargetTopWorldZ <= TargetBottomWorldZ)
         {
             OutError = TEXT("The target strate has no positive voxel-space height.");
@@ -1315,6 +1560,22 @@ struct FExploreExportOutput
     bool bTruncated = false;
 };
 
+struct FExploreDensitySliceOutput
+{
+    FString Status;
+    FString RefusalReason;
+    FString FileName;
+    int32 SampleCount = 0;
+    int32 FiniteSampleCount = 0;
+    int32 NonFiniteSampleCount = 0;
+    int32 ZeroCrossingCount = 0;
+    int32 SaturatedSampleCount = 0;
+    float MinDensity = 0.0f;
+    float MaxDensity = 0.0f;
+    float MaxAbsDensity = 0.0f;
+    double Seconds = 0.0;
+};
+
 struct FExploreProfilerComparison
 {
     bool bAvailable = false;
@@ -1335,6 +1596,7 @@ struct FExploreRunOutput
     FExploreRenderOutput Render;
     FExploreWalkOutput Walk;
     FExploreExportOutput Export;
+    FExploreDensitySliceOutput DensitySlice;
     double BudgetSeconds = 0.0;
     double ElapsedSeconds = 0.0;
     double WalkSeconds = 0.0;
@@ -2776,7 +3038,12 @@ bool RunRender(
     OutOutput.bAllCamerasPlayerFit = true;
     FVector RouteFocus = FVector::ZeroVector;
     int32 RouteFocusCount = 0;
-    if (CameraSeedWalk.bHasArrival)
+    if (Arguments.bRenderTargetOverride)
+    {
+        RouteFocus = Arguments.RenderTarget;
+        RouteFocusCount = 1;
+    }
+    else if (CameraSeedWalk.bHasArrival)
     {
         RouteFocus += CameraSeedWalk.ArrivalVoxels;
         ++RouteFocusCount;
@@ -4136,6 +4403,7 @@ void WriteTunnelFloorOverrides(
     {
         Writer.WriteValue(TEXT("gentle_slope"),
             static_cast<double>(Arguments.TunnelFloorGentle));
+        Writer.WriteValue(TEXT("gentle_slope_units"), TEXT("degrees"));
     }
     Writer.WriteValue(TEXT("ledge_count_override"), Arguments.bTunnelFloorLedgesOverride);
     if (Arguments.bTunnelFloorLedgesOverride)
@@ -4434,6 +4702,100 @@ bool RunExport(
     return !OutOutput.bTruncated;
 }
 
+bool RunDensitySlice(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    FExploreDensitySliceOutput& OutOutput,
+    FExploreBudget& Budget)
+{
+    OutOutput = FExploreDensitySliceOutput();
+    OutOutput.FileName = TEXT("density_slice.csv");
+    OutOutput.SampleCount = Arguments.DensitySliceSamples;
+    const double StartSeconds = FPlatformTime::Seconds();
+    FString Csv;
+    Csv.Reserve(Arguments.DensitySliceSamples * 96);
+    Csv += TEXT("index,x_voxels,y_voxels,z_voxels,density\r\n");
+
+    float PreviousDensity = 0.0f;
+    bool bHavePreviousDensity = false;
+    float MinDensity = TNumericLimits<float>::Max();
+    float MaxDensity = -TNumericLimits<float>::Max();
+    float MaxAbsDensity = 0.0f;
+    for (int32 Index = 0; Index < Arguments.DensitySliceSamples; ++Index)
+    {
+        if ((Index & 127) == 0 && Budget.ShouldStop(TEXT("density-slice")))
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.RefusalReason = TEXT("The wall-clock budget stopped the density slice.");
+            OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+            return false;
+        }
+
+        const FVector Position = Arguments.DensitySliceOrigin
+            + Arguments.DensitySliceDirection
+                * (Arguments.DensitySliceStep * static_cast<float>(Index));
+        const float Density = World.Generator->GetDensityAt(
+            Position.X, Position.Y, Position.Z);
+        Csv += FString::Printf(
+            TEXT("%d,%.9g,%.9g,%.9g,%.9g\r\n"),
+            Index, Position.X, Position.Y, Position.Z, Density);
+
+        if (!FMath::IsFinite(Density))
+        {
+            ++OutOutput.NonFiniteSampleCount;
+            bHavePreviousDensity = false;
+            continue;
+        }
+        ++OutOutput.FiniteSampleCount;
+        MinDensity = FMath::Min(MinDensity, Density);
+        MaxDensity = FMath::Max(MaxDensity, Density);
+        MaxAbsDensity = FMath::Max(MaxAbsDensity, FMath::Abs(Density));
+        if (FMath::Abs(Density) >= 0.999f)
+        {
+            ++OutOutput.SaturatedSampleCount;
+        }
+        if (bHavePreviousDensity
+            && ((PreviousDensity < 0.0f && Density > 0.0f)
+                || (PreviousDensity > 0.0f && Density < 0.0f)))
+        {
+            ++OutOutput.ZeroCrossingCount;
+        }
+        PreviousDensity = Density;
+        bHavePreviousDensity = true;
+    }
+
+    if (OutOutput.FiniteSampleCount > 0)
+    {
+        OutOutput.MinDensity = MinDensity;
+        OutOutput.MaxDensity = MaxDensity;
+        OutOutput.MaxAbsDensity = MaxAbsDensity;
+    }
+    const FString Path = FPaths::Combine(Arguments.OutDirectory, OutOutput.FileName);
+    if (!FFileHelper::SaveStringToFile(
+            Csv, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = TEXT("Could not write density_slice.csv.");
+        OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+        return false;
+    }
+    OutOutput.Status = TEXT("ok");
+    OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeDensitySlice] file=%s samples=%d finite=%d non_finite=%d "
+             "zero_crossings=%d saturated=%d min=%.9g max=%.9g max_abs=%.9g "
+             "origin=(%.3f,%.3f,%.3f) direction=(%.6f,%.6f,%.6f) step=%.6g"),
+        *Path, OutOutput.SampleCount, OutOutput.FiniteSampleCount,
+        OutOutput.NonFiniteSampleCount, OutOutput.ZeroCrossingCount,
+        OutOutput.SaturatedSampleCount, OutOutput.MinDensity,
+        OutOutput.MaxDensity, OutOutput.MaxAbsDensity,
+        Arguments.DensitySliceOrigin.X, Arguments.DensitySliceOrigin.Y,
+        Arguments.DensitySliceOrigin.Z, Arguments.DensitySliceDirection.X,
+        Arguments.DensitySliceDirection.Y, Arguments.DensitySliceDirection.Z,
+        Arguments.DensitySliceStep);
+    return true;
+}
+
 void WritePlayerDimensions(FExploreJsonWriter& Writer, const TCHAR* Key)
 {
     Writer.WriteObjectStart(Key);
@@ -4459,7 +4821,7 @@ FString BuildExploreJson(
     TSharedRef<FExploreJsonWriter> Writer =
     TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
     Writer->WriteObjectStart();
-    Writer->WriteValue(TEXT("schema_version"), 6);
+    Writer->WriteValue(TEXT("schema_version"), 7);
     Writer->WriteValue(TEXT("tool"), TEXT("VoxelForgeExplore"));
     Writer->WriteValue(TEXT("read_only_generation"), true);
 
@@ -4534,6 +4896,12 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("sample_stacks_interval_us"),
         static_cast<double>(Arguments.SampleStacksIntervalUs));
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
+    Writer->WriteValue(TEXT("density_slice_requested"), Arguments.bDensitySlice);
+    Writer->WriteValue(TEXT("render_target_override"), Arguments.bRenderTargetOverride);
+    if (Arguments.bRenderTargetOverride)
+    {
+        WriteJsonVector(*Writer, TEXT("render_target_voxels"), Arguments.RenderTarget, 1.0f);
+    }
     Writer->WriteValue(TEXT("op_bounds"), Arguments.bOpBounds);
     Writer->WriteValue(TEXT("budget_minutes"), static_cast<double>(Arguments.BudgetMinutes));
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
@@ -4547,6 +4915,27 @@ FString BuildExploreJson(
         Arguments.bUseOperatorStack ? 1 : 0,
         *Arguments.CanonicalModes(),
         Arguments.bBlockEarlyOut ? 1 : 0));
+    Writer->WriteObjectEnd();
+
+    Writer->WriteObjectStart(TEXT("density_slice"));
+    Writer->WriteValue(TEXT("status"), Output.DensitySlice.Status);
+    Writer->WriteValue(TEXT("file"), Output.DensitySlice.FileName);
+    Writer->WriteValue(TEXT("refusal_or_error"), Output.DensitySlice.RefusalReason);
+    Writer->WriteValue(TEXT("sample_count"), Output.DensitySlice.SampleCount);
+    Writer->WriteValue(TEXT("finite_sample_count"), Output.DensitySlice.FiniteSampleCount);
+    Writer->WriteValue(TEXT("non_finite_sample_count"), Output.DensitySlice.NonFiniteSampleCount);
+    Writer->WriteValue(TEXT("zero_crossing_count"), Output.DensitySlice.ZeroCrossingCount);
+    Writer->WriteValue(TEXT("saturated_sample_count"), Output.DensitySlice.SaturatedSampleCount);
+    Writer->WriteValue(TEXT("min_density"), static_cast<double>(Output.DensitySlice.MinDensity));
+    Writer->WriteValue(TEXT("max_density"), static_cast<double>(Output.DensitySlice.MaxDensity));
+    Writer->WriteValue(TEXT("max_abs_density"), static_cast<double>(Output.DensitySlice.MaxAbsDensity));
+    Writer->WriteValue(TEXT("seconds"), Output.DensitySlice.Seconds);
+    if (Arguments.bDensitySlice)
+    {
+        WriteJsonVector(*Writer, TEXT("origin_voxels"), Arguments.DensitySliceOrigin, 1.0f);
+        WriteJsonVector(*Writer, TEXT("direction"), Arguments.DensitySliceDirection, 1.0f);
+        Writer->WriteValue(TEXT("step_voxels"), static_cast<double>(Arguments.DensitySliceStep));
+    }
     Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("summary"));
@@ -4615,6 +5004,13 @@ FString BuildExploreJson(
     Writer->WriteObjectStart(TEXT("tile_ledger"));
     Writer->WriteValue(TEXT("order"), TEXT("z_then_y_then_x"));
     Writer->WriteValue(TEXT("tile_cells"), CHUNK_SIZE);
+    int32 TileLod = 0;
+    for (int32 SampleStep = Arguments.ExportStep; SampleStep > 1; SampleStep >>= 1)
+    {
+        ++TileLod;
+    }
+    Writer->WriteValue(TEXT("sample_step"), Arguments.ExportStep);
+    Writer->WriteValue(TEXT("lod"), TileLod);
     Writer->WriteValue(TEXT("tile_count"), World.ExploreMeshTileCount);
     Writer->WriteValue(TEXT("completed_tiles"), World.ExploreMeshTilesCompleted);
     Writer->WriteArrayStart(TEXT("tiles"));
@@ -4629,6 +5025,8 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("x"), TileX);
         Writer->WriteValue(TEXT("y"), TileY);
         Writer->WriteValue(TEXT("z"), TileZ);
+        Writer->WriteValue(TEXT("sample_step"), Arguments.ExportStep);
+        Writer->WriteValue(TEXT("lod"), TileLod);
         Writer->WriteValue(TEXT("triangle_count"), World.ExploreTileTriangleCounts[TileIndex]);
         Writer->WriteValue(TEXT("geometry_hash"), World.ExploreTileGeometryHashes[TileIndex]);
         Writer->WriteObjectEnd();
@@ -5750,7 +6148,26 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         return 1;
     }
 
+    FExploreRunOutput Output;
     bool bRequestedModeFailed = false;
+    if (Arguments.bDensitySlice)
+    {
+        const double Start = FPlatformTime::Seconds();
+        const bool bDensitySliceOk = !Budget.bTruncated
+            && RunDensitySlice(Arguments, World, Output.DensitySlice, Budget);
+        if (!bDensitySliceOk && !Budget.bTruncated)
+        {
+            bRequestedModeFailed = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeExplore] density slice failed: %s"),
+                *Output.DensitySlice.RefusalReason);
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeExplore] density slice %.3fs (%s)"),
+            FPlatformTime::Seconds() - Start,
+            bDensitySliceOk ? TEXT("ok")
+                : (Budget.bTruncated ? TEXT("truncated") : TEXT("error")));
+    }
     if (Arguments.bOpBounds)
     {
         const double Start = FPlatformTime::Seconds();
@@ -5837,7 +6254,6 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
         }
     }
 
-    FExploreRunOutput Output;
     if (Budget.ShouldStop(TEXT("setup")))
     {
         UE_LOG(LogTemp, Warning,

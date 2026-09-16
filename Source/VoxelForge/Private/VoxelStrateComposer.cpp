@@ -1139,7 +1139,7 @@ namespace
             if (FieldName == TEXT("TunnelEndpointZOffset")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("TunnelFloorTerraceStepHeight")) return Set(0.25f, FMath::Max(2.0f, HQuarter));
             if (FieldName == TEXT("TunnelFloorMaxLedgeHeight")) return Set(1.0f, FMath::Max(4.0f, HQuarter));
-            if (FieldName == TEXT("TunnelFloorGentleSlopeThreshold")) return Set(0.0f, 1.5f);
+            if (FieldName == TEXT("TunnelFloorGentleSlopeThreshold")) return Set(0.0f, 90.0f);
             if (FieldName == TEXT("SDFBlendRadius")) return Set(2.0f, FMath::Max(4.0f, H * 0.15f));
             if (FieldName == TEXT("WaterLevelRelative")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("CaveWarpStrength")) return Set(0.0f, HHalf);

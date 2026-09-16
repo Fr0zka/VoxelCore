@@ -54,6 +54,47 @@ namespace VoxelPassageGeometry
     // fallback threshold at which a room-to-room floor must become a terrace.
     constexpr float PlayerWalkableFloorMaxGradient = 0.9656887748070738f; // tan(44 degrees)
 
+    // TunnelFloorGentleSlopeThreshold is authored as degrees.  Zero is still a legal UI value,
+    // but the construction path uses this small positive floor so a malformed/overly strict
+    // value cannot turn the graph collect window into an unbounded switchback search.
+    constexpr float TunnelFloorGentleSlopeMinimumDegrees = 1.0f;
+    constexpr float TunnelFloorGentleSlopeMaximumDegrees = 90.0f;
+    // The route solver uses at most six half-waves. The canonical tunnel envelope is the default
+    // 360-voxel tunnel reach plus its endpoint correction; round that direct-run envelope up to
+    // 640 voxels, then derive the total cap from the same wave limit. This leaves room above the
+    // proven canonical route while keeping the 0.1-degree collect window finite and bounded.
+    constexpr int32 TunnelFloorMaximumWindWaves = 6;
+    constexpr float TunnelFloorMaximumSingleWaveRunVoxels = 640.0f;
+    constexpr float TunnelFloorMaximumRouteLengthVoxels =
+        static_cast<float>(TunnelFloorMaximumWindWaves)
+        * TunnelFloorMaximumSingleWaveRunVoxels;
+
+    FORCEINLINE float EffectiveTunnelFloorGentleSlopeDegrees(float AuthoredDegrees)
+    {
+        if (!VoxelMath::IsFinite(AuthoredDegrees))
+        {
+            return 44.0f;
+        }
+        return FMath::Clamp(
+            FMath::Max(AuthoredDegrees, TunnelFloorGentleSlopeMinimumDegrees),
+            TunnelFloorGentleSlopeMinimumDegrees,
+            TunnelFloorGentleSlopeMaximumDegrees);
+    }
+
+    FORCEINLINE float TunnelFloorGradientFromDegrees(float AuthoredDegrees)
+    {
+        const float Degrees = EffectiveTunnelFloorGentleSlopeDegrees(AuthoredDegrees);
+        float SinValue = 0.0f;
+        float CosValue = 0.0f;
+        VoxelMath::DetSinCos(
+            SinValue, CosValue, Degrees * (PI / 180.0f));
+        // At 90 degrees the mathematical tangent is unbounded.  The route solver only needs a
+        // finite comparison, so preserve the ordering while keeping every downstream bound finite.
+        return FMath::Min(
+            FMath::Abs(SinValue) / FMath::Max(FMath::Abs(CosValue), 1.0e-3f),
+            4096.0f);
+    }
+
     // The walkability contract is about the floor carried by the tube, not only its centreline.
     // A tapered tube changes that floor by the radius delta, so the construction and the audit
     // use this same conservative floor delta.

@@ -709,12 +709,13 @@ struct VOXELFORGE_API FStrateGenerationParams
         meta = (ClampMin = "0.0"))
     float TunnelFloorMaxLedgeHeight = 12.0f;
 
-    // Floor gradient threshold for a direct route. At or below it, the floor is a smooth ramp. A
-    // steeper walk-critical edge receives a longer winding route; an eligible edge may receive
-    // deterministic dramatic ledges instead. The default is tan(44 degrees).
+    // Floor gradient threshold in degrees for a direct route. At or below it, the floor is a
+    // smooth ramp. A steeper walk-critical edge receives a longer winding route; an eligible edge
+    // may receive deterministic dramatic ledges instead. Internally this is converted with
+    // VoxelMath::DetSinCos; the old serialized tangent value is migrated on asset load.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor",
-        meta = (ClampMin = "0.0"))
-    float TunnelFloorGentleSlopeThreshold = 0.9656888f;
+        meta = (ClampMin = "0.0", ClampMax = "90.0", DisplayName = "Gentle Slope Threshold (degrees)"))
+    float TunnelFloorGentleSlopeThreshold = 44.0f;
 
     // Preferred number of large ledges for a steep eligible floor. Zero selects the deterministic
     // height-driven count; positive values request at least that many transitions, subject to the

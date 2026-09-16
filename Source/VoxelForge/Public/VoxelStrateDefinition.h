@@ -48,6 +48,8 @@ class VOXELFORGE_API UVoxelStrateDefinition : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
+    virtual void PostLoad() override;
+
     //=========================================================================
     // IDENTIFICATION
     //=========================================================================

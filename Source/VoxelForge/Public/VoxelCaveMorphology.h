@@ -716,7 +716,8 @@ struct FCachedTunnel
     bool bTunnelFloorTerracingEnabled = true;
     float TunnelFloorTerraceStepHeight = 1.71f;
     float TunnelFloorMaxLedgeHeight = 12.0f;
-    float TunnelFloorGentleSlopeThreshold = 0.9656888f;
+    // Cached internal gradient derived from the authored degree value. This is not serialized.
+    float TunnelFloorGentleSlopeGradient = 0.9656888f;
     int32 TunnelFloorLedgeCountPreference = 0;
     int32 TunnelFloorMaxLedges = 4096;
     bool bDramaticLedge = false;
