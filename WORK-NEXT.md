@@ -328,6 +328,37 @@ Canonical walk: Connected, player-fit 41,184, walk-only 13,879 (was 20,830 / 10,
 +2.7% static / +4.2% moving vs `bf9384a`, to be re-measured. Not merged: waiting for the owner's
 in-game look.
 
+## State after 2026-09-18 night: room wins over tunnels (branch `fix/tunnel-mouths`, `d01af46`)
+
+The owner played the merged rib fix: *"the tunnels do look better now"*, performance on par. Then he
+reported a rock shelf spanning a room, ripple rings around tunnel mouths, and tunnels still running
+into rooms.
+
+- **Cause of the shelf:** the tunnel core reasserted solid below its own floor **inside room
+  volumes**, plus the landing-floor post. Measured as tunnel-attributed solid inside rooms:
+  `469 → 0`. A matched re-render of his room shows the slab gone.
+- **Room ownership is now enforced in every tunnel path** (generic tunnel SDF, core evaluator, both
+  native fallbacks): a room suppresses the tunnel bottom inside itself, while a short fade keeps the
+  exterior mouth fillet.
+- **Mouth trim is now ON by default** (`voxel.TunnelMouthTrim`, dev-only cvar, shipping constant
+  true). It broke walkability before; it no longer does, because trimmed endpoints take their height
+  from the room's own vertical zero crossing (join offsets `-2.08/+0.40 → -1.13/-0.71` voxels).
+- **Mouth ripples:** periodic amplitude `1.49 cm` floor / `0 cm` wall (degree-six trend removal;
+  raw local-median `6.19 cm` kept as audit). ⚠️ Instrument lesson: a broad room-floor bowl reads as a
+  6 cm "period" unless the slow trend is removed first.
+- Canonical walk `Connected`, `42,870` fit / `17,413` walk-reachable (was 41,184 / 13,879); export
+  identical with `-voxel.CrtFma3=0`; `TilePostReachProof` and `DetSinCos` pass.
+- Left when the owner reclaimed his PC: strate crossing and the perf pair.
+
+**Harness notes (they cost real rounds):**
+- `-run=VoxelForgeExplore` belongs to explore/export/probe launches ONLY. With it, automation tests
+  and `-game` runs silently run the commandlet instead.
+- The staged host's `Content` lost `/Game/Untitled`; the crossing test needs that level (it carries
+  the `AVoxelWorld` actor), else Unreal fails the map load and crashes on the empty world.
+- Codex's headless runs deleted the owner's `%LOCALAPPDATA%\...\EditorSettings.ini` on 17 Sep (a
+  failed cross-volume move, error 5). Runs now use isolated user/config dirs; verify that file's
+  hash before and after a round.
+
 **Queued, waiting for the owner's go:**
 1. Terracing he can target: rooms / tunnels / terrain, and floors / walls / ceilings (brief ready:
    scratchpad `terrace-targets.md`).
