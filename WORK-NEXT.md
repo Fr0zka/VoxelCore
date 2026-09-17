@@ -297,6 +297,44 @@ deterministic retry.
 Smaller hardening noted by Sol, not scheduled: field-wise cache hashing instead of raw-memory
 CRC32; an integer-lattice mesher entry point; server-sequenced edit order once networking exists.
 
+## State after 2026-09-17 night: tunnels from the owner's playtest (branch `fix/tunnel-shape`)
+
+**Found in play, not in harness:**
+- His editor had been running a 14 Sep build (no crossing fix: `CutMinLevel=0`).
+- A gentle slope of 0.1 froze world loading.
+- Tunnels were ribbed on floor, walls and ceiling with every terrace setting at 0.
+- Tunnels poke into rooms.
+
+The harness uses plugin defaults, not his `DA_Strate3`/`DA_Settings`. **Reproduce owner reports with
+his assets staged into `Saved\BuildHost`.**
+
+**Cause of the ribs (`4fa3931`), proven in game by the owner.** `voxel.TunnelAblateTunnelCore=1`
+removes them. That switch is read ONCE per process, at the first Play: set it before pressing Play,
+and check `[VoxelForgeTunnelAblation] resolved mask`. The tunnel core's final reassertion replaced
+interior samples with a fixed +16 air density, so the field lost its distance gradient and marching
+cubes snapped the surface to the voxel grid. It now reasserts the continuous `-Core.SDF`. The
+periodic amplitude along a tunnel is now under 1.1 cm (was up to 16.9 cm on walls).
+- ⛔ The first attempt (`0231072`, a Catmull-Rom centreline) was wrong, cost 18-30% CPU, and is
+  reverted. It was "verified" by small, unmatched renders. **Use a quantitative instrument**, e.g. the
+  surface-position oscillation along the axis (`tunnelcoreprobe` mode in the explore commandlet).
+
+**Owner decisions implemented:**
+- no authored tunnel floor: `bTunnelFloorEnabled` is ignored and the slab/support-floor paths are
+  detached;
+- slope in degrees (0-90, migrated from tangents, 3840-voxel route cap);
+- winding and ledges independent of any floor switch.
+
+Canonical walk: Connected, player-fit 41,184, walk-only 13,879 (was 20,830 / 10,909). One perf pair:
++2.7% static / +4.2% moving vs `bf9384a`, to be re-measured. Not merged: waiting for the owner's
+in-game look.
+
+**Queued, waiting for the owner's go:**
+1. Terracing he can target: rooms / tunnels / terrain, and floors / walls / ceilings (brief ready:
+   scratchpad `terrace-targets.md`).
+2. Tunnel mouths trimmed at room walls (`voxel.TunnelMouthTrim`, default off: 36 m walk gap when on).
+3. The landing random-reach fallback.
+4. Bet B rung 2 (paused).
+
 ### Open design questions for the owner
 - All five strate slots resolve to `DA_Strate3`. Intended?
 - Should a composer roll be allowed to overwrite an explicitly authored value?
