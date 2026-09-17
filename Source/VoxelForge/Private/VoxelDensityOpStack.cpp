@@ -3826,7 +3826,8 @@ namespace
                 const FVector& Position = S.LastWorldPosition;
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     Position.X, Position.Y, Position.Z, GetCache(), nullptr,
-                    VoxelGenLOD::ShouldUseSpatialIndex(false));
+                    VoxelGenLOD::ShouldUseSpatialIndex(false),
+                    &S.LastWarpedPosition);
                 S.LastTunnelCoreEvaluationPosition = Position;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
             }
@@ -4274,16 +4275,18 @@ namespace
             {
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, GetCache(), nullptr,
-                    bUseSpatialIndex);
+                    bUseSpatialIndex, &S.LastWarpedPosition);
                 S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
 
-                // Keep the hand-off for block evaluation compatibility.  Both floor flags are
-                // permanently false; the authored floor is part of the tunnel shape itself.
+                // Keep the room-owned bottom hand-off for block evaluation compatibility. The
+                // authored floor remains part of the tunnel shape, but it must not win inside a
+                // room's own volume.
                 InOut.bHasTunnelCoreWorldEvaluation = true;
                 InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
                 InOut.bTunnelCoreSupportFloor = false;
-                InOut.bTunnelCoreRoomFloor = false;
+                InOut.bTunnelCoreRoomFloor =
+                    S.LastTunnelCoreWorldEvaluation.bRoomFloor;
                 InOut.bHasTunnelCoreSweptFloor =
                     S.LastTunnelCoreWorldEvaluation.bHasSweptFloor;
                 InOut.TunnelCoreSweptFloorZ =

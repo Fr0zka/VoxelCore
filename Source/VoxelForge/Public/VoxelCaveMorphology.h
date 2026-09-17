@@ -940,7 +940,9 @@ struct FTunnelCoreWorldEvaluation
     float SDF = FLT_MAX;
     // Deprecated compatibility output. The separate graph-tunnel support slab was removed.
     bool bSupportFloor = false;
-    // Deprecated compatibility output. Room/landing floors are composed by their own posts.
+    // Room geometry owns the lower side while the world-space tunnel is inside a room. The
+    // tunnel SDF may still reopen air there, but its swept bottom must not turn that room air back
+    // into a shelf or wall.
     bool bRoomFloor = false;
     // Shape-level floor ownership. This is not an authored slab: it identifies the bottom side
     // of the swept tunnel SDF so a room that is already air cannot erase the tunnel's own floor.
@@ -1081,7 +1083,11 @@ namespace VoxelCaveMorphology
         const FChunkSDFCache& Cache,
         // Deprecated legacy argument; graph-tunnel evaluation ignores the old support column.
         const FTunnelSupportFloorColumn* SupportColumn = nullptr,
-        bool bUseSpatialIndex = true
+        bool bUseSpatialIndex = true,
+        // The room graph is evaluated in warped coordinates while the tunnel core is evaluated in
+        // the authored world frame. Pass the former when available so room ownership is tested in
+        // the same domain as the generic room field.
+        const FVector* RoomQueryPosition = nullptr
     );
 
     // Per-tile broad reach for the world-space core/floor post.  The bound includes the swept

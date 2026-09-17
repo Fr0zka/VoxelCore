@@ -125,8 +125,8 @@ namespace
 #if !UE_BUILD_SHIPPING
     static TAutoConsoleVariable<int32> CVarVoxelForgeTunnelMouthTrim(
         TEXT("voxel.TunnelMouthTrim"),
-        0,
-        TEXT("Development-only room-wall tunnel-mouth trim; 0 keeps the legacy room endpoint."),
+        1,
+        TEXT("Development-only room-wall tunnel-mouth trim; 1 makes the room own the mouth by default."),
         ECVF_Default);
 #endif
 
@@ -672,16 +672,16 @@ namespace
             const float BlendRadius = FMath::Max(
                 Endpoint == 0 ? MouthBlendRadiusA : MouthBlendRadiusB,
                 0.0f);
+            const float EndpointRadius = FMath::Abs(ControlRadiusData[ControlIndex]);
+            const float BottomHandoffRadius = BlendRadius
+                + VF_TunnelMouthPlayerFitOverlapVoxels
+                + EndpointRadius;
             const float RelativeDistance = Distance - BlendRadius;
             const float Weight = RelativeDistance <= 0.0f
                 ? 1.0f
                 : (RelativeDistance < Fade
                     ? 1.0f - SmoothStep01(RelativeDistance / Fade)
                     : 0.0f);
-            const float EndpointRadius = FMath::Abs(ControlRadiusData[ControlIndex]);
-            const float BottomHandoffRadius = BlendRadius
-                + VF_TunnelMouthPlayerFitOverlapVoxels
-                + EndpointRadius;
             const bool bInBottomHandoff = VoxelMath::IsFinite(BottomHandoffRadius)
                 && Distance <= BottomHandoffRadius;
             if (!(Weight > 0.0f) && !bInBottomHandoff)
@@ -1537,6 +1537,52 @@ namespace
         return VF_SetSpatialBounds(
             static_cast<float>(Room.Center.X), static_cast<float>(Room.Center.Y),
             FMath::Sqrt(FMath::Max(Room.CullRadiusSq, 0.0f)), OutBounds);
+    }
+
+    static float VF_CachedRoomShapeSDF(
+        const FCachedRoom& Room, const FVector& Position)
+    {
+        switch (Room.ShapeType)
+        {
+        case 1:
+            return VoxelSDF::RoundedBox(
+                Position, Room.Center, Room.ShapeA, Room.ShapeR);
+        case 2:
+            return VoxelSDF::Capsule(
+                Position, Room.ShapeA, Room.ShapeB, Room.ShapeR);
+        default:
+            return VoxelSDF::Ellipsoid(Position, Room.Center, Room.ShapeA);
+        }
+    }
+
+    static bool VF_IsInsideCachedRoomShape(
+        const FVector& Position,
+        const FChunkSDFCache& Cache,
+        bool bUseSpatialIndex)
+    {
+        bool bInside = false;
+        auto VisitRoom = [&](int32 RoomIndex)
+        {
+            if (bInside || !Cache.Rooms.IsValidIndex(RoomIndex))
+            {
+                return;
+            }
+            const FCachedRoom& Room = Cache.Rooms[RoomIndex];
+            if (VF_FloatDistSquared(
+                    static_cast<float>(Position.X),
+                    static_cast<float>(Position.Y),
+                    static_cast<float>(Position.Z),
+                    Room.Center) > Room.CullRadiusSq)
+            {
+                return;
+            }
+            bInside = VF_CachedRoomShapeSDF(Room, Position) < 0.0f;
+        };
+        VF_ForEachSpatialCandidate(
+            Cache.RoomSpatialIndex, Cache.Rooms.Num(),
+            static_cast<float>(Position.X), static_cast<float>(Position.Y),
+            VisitRoom, bUseSpatialIndex);
+        return bInside;
     }
 
     static bool VF_GetJoinSpatialBounds(
@@ -3173,8 +3219,8 @@ namespace
         }
 
         // The default warp is a contraction at its authored frequency. A fixed eight-step
-        // Newton/Picard correction is enough to put a world landing back on the exact cached SDF
-        // point, while keeping the query allocation-free and deterministic.
+        // correction is enough to put a world landing back on the cached SDF point while keeping
+        // the construction path allocation-free and deterministic.
         for (int32 Iteration = 0; Iteration < 8; ++Iteration)
         {
             const FVector Mapped = VF_ApplyCaveWarp(WorldPoint, Params, Seed);
@@ -3360,6 +3406,108 @@ namespace
             Params.BoundarySealThickness, 1.0f);
         // Query-facing density uses the same MC polarity as the measurement: positive is air.
         return -InternalDensity;
+    }
+
+    static bool VF_FindRoomFloorCrossingWorld(
+        const FVFRoomLandingSite& Site,
+        const FStrateGenerationParams& Params,
+        uint32 Seed,
+        float StrateTopZ,
+        float StrateBottomZ,
+        const FVector& WorldMouthXY,
+        float& OutFloorZ)
+    {
+        OutFloorZ = -FLT_MAX;
+        if (!VoxelMath::IsFinite(WorldMouthXY.X)
+            || !VoxelMath::IsFinite(WorldMouthXY.Y)
+            || !VoxelMath::IsFinite(Site.Center.Z)
+            || !VoxelMath::IsFinite(Site.RadiusZ))
+        {
+            return false;
+        }
+
+        // BuildRoomMouth receives a world-space point from the boundary search. Find the
+        // crossing in that same space instead of reusing the SDF-space floor estimate. This is
+        // deliberately a vertical room query: the room owns the floor height at the mouth, and
+        // the tunnel endpoint is then placed one tunnel radius above that exact crossing.
+        const float ReliefBound = FMath::Abs(Params.FloorReliefStrength)
+            * VOXEL_NOISE_SCALE * 1.5f;
+        const float MinZ = Site.Center.Z - FMath::Abs(Site.RadiusZ)
+            - ReliefBound - 16.0f;
+        const float MaxZ = Site.Center.Z + FMath::Abs(Site.RadiusZ)
+            + ReliefBound + 16.0f;
+        constexpr float SearchStep = 1.0f;
+        if (!VoxelMath::IsFinite(MinZ) || !VoxelMath::IsFinite(MaxZ) || MaxZ <= MinZ)
+        {
+            return false;
+        }
+
+        auto Evaluate = [&](float Z) -> float
+        {
+            return VF_EvaluateRoomLandingDensity(
+                Site, Params, Seed, StrateTopZ, StrateBottomZ,
+                WorldMouthXY.X, WorldMouthXY.Y, Z);
+        };
+
+        float Low = MinZ;
+        float LowValue = Evaluate(Low);
+        if (!VoxelMath::IsFinite(LowValue))
+        {
+            return false;
+        }
+        const int32 Steps = FMath::CeilToInt((MaxZ - MinZ) / SearchStep);
+        for (int32 StepIndex = 1; StepIndex <= Steps; ++StepIndex)
+        {
+            const float High = FMath::Min(
+                MaxZ, MinZ + static_cast<float>(StepIndex) * SearchStep);
+            const float HighValue = Evaluate(High);
+            if (!VoxelMath::IsFinite(HighValue))
+            {
+                Low = High;
+                LowValue = HighValue;
+                continue;
+            }
+            if (FMath::Abs(LowValue) <= KINDA_SMALL_NUMBER)
+            {
+                OutFloorZ = Low;
+                return true;
+            }
+            if (LowValue <= 0.0f && HighValue >= 0.0f)
+            {
+                float BracketLow = Low;
+                float BracketHigh = High;
+                float BracketLowValue = LowValue;
+                for (int32 Iteration = 0; Iteration < 24; ++Iteration)
+                {
+                    const float Mid = (BracketLow + BracketHigh) * 0.5f;
+                    const float MidValue = Evaluate(Mid);
+                    if (!VoxelMath::IsFinite(MidValue))
+                    {
+                        break;
+                    }
+                    if (FMath::Abs(MidValue) <= 1.0e-5f)
+                    {
+                        BracketLow = Mid;
+                        BracketHigh = Mid;
+                        break;
+                    }
+                    if (BracketLowValue <= 0.0f && MidValue < 0.0f)
+                    {
+                        BracketLow = Mid;
+                        BracketLowValue = MidValue;
+                    }
+                    else
+                    {
+                        BracketHigh = Mid;
+                    }
+                }
+                OutFloorZ = (BracketLow + BracketHigh) * 0.5f;
+                return VoxelMath::IsFinite(OutFloorZ);
+            }
+            Low = High;
+            LowValue = HighValue;
+        }
+        return false;
     }
 
     static bool VF_FindRoomMouthBoundary(
@@ -6723,11 +6871,11 @@ void VoxelCaveMorphology::BuildChunkCache(
         return Room.bHasPlayerFitPoint;
     };
 
-    #if !UE_BUILD_SHIPPING
+#if !UE_BUILD_SHIPPING
     const bool bTrimRoomMouth = CVarVoxelForgeTunnelMouthTrim.GetValueOnAnyThread() != 0;
-    #else
-    constexpr bool bTrimRoomMouth = false;
-    #endif
+#else
+    constexpr bool bTrimRoomMouth = true;
+#endif
     const auto BuildRoomMouth = [
         &BuildRooms, &ResolvePlayerFitPoint, &RoomFloorZFor,
         &Params, Seed, BlendK, bTrimRoomMouth](int32 RoomIndex, const FVector& Towards,
@@ -6799,8 +6947,26 @@ void VoxelCaveMorphology::BuildChunkCache(
         {
             MouthFloorZ = Room.Center.Z - Room.RadiusZ;
         }
-        return FVector(
-            MouthXY.X, MouthXY.Y, MouthFloorZ + FMath::Abs(TunnelRadius));
+        float WorldFloorZ = -FLT_MAX;
+        const bool bFoundWorldFloor = VF_FindRoomFloorCrossingWorld(
+            Site, Params, Seed,
+            Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
+            MouthXY, WorldFloorZ);
+        if (bFoundWorldFloor)
+        {
+            // The boundary search returns world XY. Put the endpoint directly on the room's
+            // world-space floor crossing; the later VF_ApplyCaveWarp call creates the matching
+            // SDF-chain endpoint. This makes the room/tunnel floor join exact by construction.
+            return FVector(
+                MouthXY.X, MouthXY.Y, WorldFloorZ + FMath::Abs(TunnelRadius));
+        }
+
+        // Malformed/unsupported room data keeps the bounded fallback. The outer construction
+        // path applies VF_ApplyCaveWarp when it creates the SDF-chain endpoint, so invert that
+        // warp here just as the legacy endpoint path does.
+        return VF_UnwarpCavePoint(
+            FVector(MouthXY.X, MouthXY.Y, MouthFloorZ + FMath::Abs(TunnelRadius)),
+            Params, Seed);
     };
 
     for (const FResolvedGraphEdge& GraphEdge : GraphEdges)
@@ -7987,6 +8153,12 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     // differently-shaped surface around the route.
     const bool bUseWorldTunnel = WorldTunnelPosition != nullptr;
     const FVector TunnelPosition = bUseWorldTunnel ? *WorldTunnelPosition : Pos;
+    // A room owns every point inside its authored body. The short mouth ownership fade below
+    // handles the fillet outside the wall; this broader test is the hard A > B rule for the room
+    // interior. In particular, do not let a tunnel's swept bottom reassert a shelf in an already
+    // open room just because the world-chain query is still near the tunnel centerline.
+    const bool bRoomOwnsBottom = !VoxelDensityAblation::IsRoomSDFOff()
+        && VF_IsInsideCachedRoomShape(Pos, Cache, bUseSpatialIndex);
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
         const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
@@ -8031,7 +8203,8 @@ float VoxelCaveMorphology::EvaluateSDFCached(
             : VF_FindSDFTunnelMouthOwnership(Pos, Tunnel, BlendK);
         const float TunnelSDF = VF_EvaluateSweptTunnel(
             QueryPosition, Tunnel, bUseWorldChain, BlendK,
-            /*bApplyFloorCut=*/true, &Cache, TunnelIdx,
+            /*bApplyFloorCut=*/!(bRoomOwnsBottom || RoomMouthOwnership.bSuppressTunnelBottom),
+            &Cache, TunnelIdx,
             &RoomMouthOwnership).SDF;
 
         MinSDF = VoxelSDF::SmoothMin(MinSDF, TunnelSDF, BlendK);
@@ -8109,7 +8282,8 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache,
     const FTunnelSupportFloorColumn* SupportColumn,
-    bool bUseSpatialIndex)
+    bool bUseSpatialIndex,
+    const FVector* RoomQueryPosition)
 {
     VoxelGenLOD::FScopedReachCost ReachCost(
         VoxelGenLOD::ETileReachCostKind::TunnelCoreWorld);
@@ -8137,6 +8311,10 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     const FVector Pos(WorldX, WorldY, WorldZ);
     FTunnelCoreWorldEvaluation Result;
     const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
+    const FVector& RoomPosition = RoomQueryPosition != nullptr
+        ? *RoomQueryPosition : Pos;
+    const bool bRoomOwnsBottom = VF_IsInsideCachedRoomShape(
+        RoomPosition, Cache, bUseSpatialIndex);
 
     if (SupportColumn != nullptr && VoxelDensityProfile::AreCountersEnabled())
     {
@@ -8203,11 +8381,13 @@ FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
 
         const FVFTunnelShapeEvaluation TunnelShape = VF_EvaluateSweptTunnel(
             Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true,
+            /*bApplyFloorCut=*/!(bRoomOwnsBottom || RoomMouthOwnership.bSuppressTunnelBottom),
             &Cache, TunnelIdx, &RoomMouthOwnership);
         if (TunnelShape.SDF < Result.SDF)
         {
             Result.SDF = TunnelShape.SDF;
+            Result.bRoomFloor = bRoomOwnsBottom
+                || RoomMouthOwnership.bSuppressTunnelBottom;
             Result.bHasSweptFloor = TunnelShape.bHasSweptFloor;
             Result.SweptFloorZ = TunnelShape.SweptFloorZ;
             Result.SweptFloorRadius = TunnelShape.SweptFloorRadius;

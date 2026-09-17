@@ -1608,6 +1608,61 @@ struct FExploreTunnelCoreProbeAxis
     TArray<float> FinalCrossingsVoxels;
 };
 
+struct FExploreTunnelMouthProbeAxis
+{
+    FString Name;
+    int32 ValidCrossings = 0;
+    float MeanCrossingVoxels = 0.0f;
+    float MinCrossingVoxels = 0.0f;
+    float MaxCrossingVoxels = 0.0f;
+    float PeriodicAmplitudeVoxels = 0.0f;
+    float PeriodicPeriodVoxels = 0.0f;
+    int32 PeriodicMeasuredSamples = 0;
+    float PeriodicMeasuredLengthVoxels = 0.0f;
+    // Audit value from the core probe's local-median detrend. Mouth surfaces can carry a broad
+    // room-floor bowl over the +/-2R window, so the accepted mouth value below uses a degree-six
+    // slow trend while retaining this legacy value for before/after diagnosis.
+    float LocalMedianPeriodicAmplitudeVoxels = 0.0f;
+    float LocalMedianPeriodicPeriodVoxels = 0.0f;
+    TArray<float> CrossingsVoxels;
+};
+
+struct FExploreTunnelMouthProbeEndpoint
+{
+    FString Name;
+    uint32 RoomHash = 0;
+    FVector Mouth = FVector::ZeroVector;
+    float RadiusVoxels = 0.0f;
+    float TunnelFloorZ = -FLT_MAX;
+    float RoomFloorCrossingZ = -FLT_MAX;
+    float FloorJoinDeltaVoxels = 0.0f;
+    FExploreTunnelMouthProbeAxis Wall;
+    FExploreTunnelMouthProbeAxis Floor;
+};
+
+struct FExploreTunnelMouthProbeOutput
+{
+    FString Status;
+    FString RefusalReason;
+    FString FileName;
+    int32 EndpointCount = 0;
+    int32 LateralSampleCount = 0;
+    float LateralStepVoxels = 0.25f;
+    float LateralWindowVoxels = 0.0f;
+    int32 RoomSampleStepVoxels = 2;
+    int64 RoomVolumeSampleCount = 0;
+    int64 RoomAirSampleCount = 0;
+    int64 CoreBottomSampleCount = 0;
+    int64 FinalSolidSampleCount = 0;
+    int64 CoreInducedSolidSampleCount = 0;
+    float MaxWallPeriodicAmplitudeVoxels = 0.0f;
+    float MaxFloorPeriodicAmplitudeVoxels = 0.0f;
+    float MaxLocalMedianWallPeriodicAmplitudeVoxels = 0.0f;
+    float MaxLocalMedianFloorPeriodicAmplitudeVoxels = 0.0f;
+    double Seconds = 0.0;
+    TArray<FExploreTunnelMouthProbeEndpoint> Endpoints;
+};
+
 struct FExploreTunnelCoreProbeOutput
 {
     FString Status;
@@ -1634,6 +1689,7 @@ struct FExploreTunnelCoreProbeOutput
     FExploreTunnelCoreProbeAxis Floor;
     FExploreTunnelCoreProbeAxis Wall;
     FExploreTunnelCoreProbeAxis Ceiling;
+    FExploreTunnelMouthProbeOutput Mouth;
     double Seconds = 0.0;
 };
 
@@ -4869,7 +4925,8 @@ void ComputeTunnelCoreProbeMetrics(
     float& OutPeriodicAmplitudeVoxels,
     float& OutPeriodicPeriodVoxels,
     int32& OutPeriodicMeasuredSamples,
-    float& OutPeriodicMeasuredLengthVoxels)
+    float& OutPeriodicMeasuredLengthVoxels,
+    bool bPolynomialTrend = false)
 {
     OutValidCount = 0;
     OutMean = 0.0f;
@@ -4951,14 +5008,17 @@ void ComputeTunnelCoreProbeMetrics(
     }
 
     // Remove only the slow authored floor/radius trend. A 32-voxel median window is wider than
-    // the 1..16 voxel rib band, so a genuine rib train survives while a single mouth transition
-    // or route slope follows the local baseline. Discarding the half-window at each edge keeps
-    // the asymmetric endpoint windows out of the spectral result.
+    // the 1..16 voxel rib band, so a genuine rib train survives while a single tunnel transition
+    // or route slope follows the local baseline. The mouth probe uses a degree-six fit instead: the
+    // room-side +/-2R window can contain one broad floor bowl, which a local median would turn
+    // into a false short-period peak when only the middle 21.5 voxels remain.
     constexpr float TrendWindowVoxels = 32.0f;
     const int32 HalfWindowSamples = FMath::Max(
         1, FMath::RoundToInt(0.5f * TrendWindowVoxels / StepVoxels));
-    const int32 AnalysisStart = BestRunStart + HalfWindowSamples;
-    const int32 AnalysisEnd = BestRunEnd - HalfWindowSamples;
+    const int32 AnalysisStart = bPolynomialTrend
+        ? BestRunStart : BestRunStart + HalfWindowSamples;
+    const int32 AnalysisEnd = bPolynomialTrend
+        ? BestRunEnd : BestRunEnd - HalfWindowSamples;
     const int32 AnalysisCount = AnalysisEnd - AnalysisStart + 1;
     if (AnalysisCount < 4)
     {
@@ -4967,6 +5027,110 @@ void ComputeTunnelCoreProbeMetrics(
 
     OutPeriodicMeasuredSamples = AnalysisCount;
     OutPeriodicMeasuredLengthVoxels = static_cast<float>(AnalysisCount - 1) * StepVoxels;
+
+    TArray<float, TInlineAllocator<257>> Residuals;
+    Residuals.SetNumZeroed(AnalysisCount);
+    bool bHavePolynomialTrend = false;
+    if (bPolynomialTrend)
+    {
+        // Fit a normalized degree-six smooth trend over the complete contiguous surface run. The
+        // room-side +/-2R sample can contain a broad, asymmetric floor bowl; a cubic leaves that
+        // endpoint curvature in the rib-band DFT. Degree six follows that slow authored shape but
+        // cannot reproduce a repeated <=16-voxel train across the full run. Keep the legacy
+        // local-median measurement separately as an audit of the conservative raw instrument.
+        constexpr int32 PolynomialDegree = 6;
+        double Matrix[PolynomialDegree + 1][PolynomialDegree + 1] = {};
+        double RightHandSide[PolynomialDegree + 1] = {};
+        const double Denominator = static_cast<double>(FMath::Max(
+            BestRunLength - 1, 1));
+        for (int32 Index = BestRunStart; Index <= BestRunEnd; ++Index)
+        {
+            const double NormalizedX = -1.0
+                + 2.0 * static_cast<double>(Index - BestRunStart) / Denominator;
+            double Basis[PolynomialDegree + 1];
+            Basis[0] = 1.0;
+            for (int32 Power = 1; Power <= PolynomialDegree; ++Power)
+            {
+                Basis[Power] = Basis[Power - 1] * NormalizedX;
+            }
+            const double Value = static_cast<double>(Samples[Index]);
+            for (int32 Row = 0; Row <= PolynomialDegree; ++Row)
+            {
+                RightHandSide[Row] += Basis[Row] * Value;
+                for (int32 Column = 0; Column <= PolynomialDegree; ++Column)
+                {
+                    Matrix[Row][Column] += Basis[Row] * Basis[Column];
+                }
+            }
+        }
+
+        double Coefficients[PolynomialDegree + 1] = {};
+        bHavePolynomialTrend = true;
+        for (int32 PivotIndex = 0; PivotIndex <= PolynomialDegree; ++PivotIndex)
+        {
+            int32 PivotRow = PivotIndex;
+            for (int32 Row = PivotIndex + 1; Row <= PolynomialDegree; ++Row)
+            {
+                if (FMath::Abs(Matrix[Row][PivotIndex])
+                    > FMath::Abs(Matrix[PivotRow][PivotIndex]))
+                {
+                    PivotRow = Row;
+                }
+            }
+            if (FMath::Abs(Matrix[PivotRow][PivotIndex]) <= 1.0e-12)
+            {
+                bHavePolynomialTrend = false;
+                break;
+            }
+            if (PivotRow != PivotIndex)
+            {
+                for (int32 Column = PivotIndex;
+                     Column <= PolynomialDegree; ++Column)
+                {
+                    Swap(Matrix[PivotIndex][Column], Matrix[PivotRow][Column]);
+                }
+                Swap(RightHandSide[PivotIndex], RightHandSide[PivotRow]);
+            }
+            for (int32 Row = PivotIndex + 1; Row <= PolynomialDegree; ++Row)
+            {
+                const double Factor = Matrix[Row][PivotIndex]
+                    / Matrix[PivotIndex][PivotIndex];
+                for (int32 Column = PivotIndex;
+                     Column <= PolynomialDegree; ++Column)
+                {
+                    Matrix[Row][Column] -= Factor * Matrix[PivotIndex][Column];
+                }
+                RightHandSide[Row] -= Factor * RightHandSide[PivotIndex];
+            }
+        }
+        if (bHavePolynomialTrend)
+        {
+            for (int32 Row = PolynomialDegree; Row >= 0; --Row)
+            {
+                double Value = RightHandSide[Row];
+                for (int32 Column = Row + 1;
+                     Column <= PolynomialDegree; ++Column)
+                {
+                    Value -= Matrix[Row][Column] * Coefficients[Column];
+                }
+                Coefficients[Row] = Value / Matrix[Row][Row];
+            }
+            for (int32 Index = AnalysisStart; Index <= AnalysisEnd; ++Index)
+            {
+                const double NormalizedX = -1.0
+                    + 2.0 * static_cast<double>(Index - BestRunStart) / Denominator;
+                double Basis = 1.0;
+                double Trend = 0.0;
+                for (int32 Power = 0; Power <= PolynomialDegree; ++Power)
+                {
+                    Trend += Coefficients[Power] * Basis;
+                    Basis *= NormalizedX;
+                }
+                Residuals[Index - AnalysisStart] =
+                    static_cast<float>(static_cast<double>(Samples[Index]) - Trend);
+            }
+        }
+    }
 
     constexpr float MaxRibPeriodVoxels = 16.0f;
     const int32 MinRibFrequency = FMath::Max(
@@ -4981,22 +5145,27 @@ void ComputeTunnelCoreProbeMetrics(
         double Imaginary = 0.0;
         for (int32 Index = AnalysisStart; Index <= AnalysisEnd; ++Index)
         {
-            TArray<float, TInlineAllocator<129>> Window;
-            const int32 WindowStart = FMath::Max(BestRunStart, Index - HalfWindowSamples);
-            const int32 WindowEnd = FMath::Min(BestRunEnd, Index + HalfWindowSamples);
-            Window.Reserve(WindowEnd - WindowStart + 1);
-            for (int32 WindowIndex = WindowStart; WindowIndex <= WindowEnd; ++WindowIndex)
-            {
-                Window.Add(Samples[WindowIndex]);
-            }
-            Window.Sort();
-            const int32 Middle = Window.Num() / 2;
-            const double Median = (Window.Num() & 1) != 0
-                ? static_cast<double>(Window[Middle])
-                : 0.5 * (static_cast<double>(Window[Middle - 1])
-                    + static_cast<double>(Window[Middle]));
-            const double Residual = static_cast<double>(Samples[Index]) - Median;
             const int32 AnalysisIndex = Index - AnalysisStart;
+            if (!bHavePolynomialTrend)
+            {
+                TArray<float, TInlineAllocator<129>> Window;
+                const int32 WindowStart = FMath::Max(BestRunStart, Index - HalfWindowSamples);
+                const int32 WindowEnd = FMath::Min(BestRunEnd, Index + HalfWindowSamples);
+                Window.Reserve(WindowEnd - WindowStart + 1);
+                for (int32 WindowIndex = WindowStart; WindowIndex <= WindowEnd; ++WindowIndex)
+                {
+                    Window.Add(Samples[WindowIndex]);
+                }
+                Window.Sort();
+                const int32 Middle = Window.Num() / 2;
+                const double Median = (Window.Num() & 1) != 0
+                    ? static_cast<double>(Window[Middle])
+                    : 0.5 * (static_cast<double>(Window[Middle - 1])
+                        + static_cast<double>(Window[Middle]));
+                Residuals[AnalysisIndex] = static_cast<float>(
+                    static_cast<double>(Samples[Index]) - Median);
+            }
+            const double Residual = static_cast<double>(Residuals[AnalysisIndex]);
             const double Angle = 2.0 * PI * static_cast<double>(Frequency)
                 * static_cast<double>(AnalysisIndex) / static_cast<double>(AnalysisCount);
             Real += Residual * FMath::Cos(static_cast<float>(Angle));
@@ -5015,6 +5184,31 @@ void ComputeTunnelCoreProbeMetrics(
         ? StepVoxels * static_cast<float>(AnalysisCount)
             / static_cast<float>(BestFrequency)
         : 0.0f;
+}
+
+void ComputeTunnelMouthProbeMetrics(
+    FExploreTunnelMouthProbeAxis& Axis,
+    float StepVoxels)
+{
+    int32 LegacyValid = 0;
+    float LegacyMean = 0.0f;
+    float LegacyMin = 0.0f;
+    float LegacyMax = 0.0f;
+    int32 LegacyMeasuredSamples = 0;
+    float LegacyMeasuredLength = 0.0f;
+    ComputeTunnelCoreProbeMetrics(
+        Axis.CrossingsVoxels, StepVoxels,
+        Axis.ValidCrossings, Axis.MeanCrossingVoxels,
+        Axis.MinCrossingVoxels, Axis.MaxCrossingVoxels,
+        Axis.LocalMedianPeriodicAmplitudeVoxels,
+        Axis.LocalMedianPeriodicPeriodVoxels,
+        LegacyMeasuredSamples, LegacyMeasuredLength);
+    ComputeTunnelCoreProbeMetrics(
+        Axis.CrossingsVoxels, StepVoxels,
+        LegacyValid, LegacyMean, LegacyMin, LegacyMax,
+        Axis.PeriodicAmplitudeVoxels, Axis.PeriodicPeriodVoxels,
+        Axis.PeriodicMeasuredSamples, Axis.PeriodicMeasuredLengthVoxels,
+        /*bPolynomialTrend=*/true);
 }
 
 bool RunTunnelCoreProbe(
@@ -5661,7 +5855,301 @@ bool RunTunnelCoreProbe(
             Axis->ValidCoreCrossings, Axis->CorePeriodicAmplitudeVoxels,
             Axis->CorePeriodicAmplitudeVoxels * 25.0f,
             Axis->CorePeriodicPeriodVoxels,
-            Axis->CorePeriodicMeasuredLengthVoxels, Axis->CorePeriodicMeasuredSamples);
+             Axis->CorePeriodicMeasuredLengthVoxels, Axis->CorePeriodicMeasuredSamples);
+    }
+
+    // Mouth probe: measure the two surfaces that meet at each room endpoint over a lateral
+    // window of approximately +/-2 tunnel radii.  The wall ray starts in room air and points
+    // toward the tunnel; the floor ray starts below the same room-side patch and points up.
+    // Both use the final MC-facing density, so this catches a ring/fillet handoff rather than
+    // merely comparing two independent source SDFs.  Keep this in the same owner-value process
+    // and cache selection as the core probe so the before/after numbers are directly comparable.
+    {
+        FExploreTunnelMouthProbeOutput& Mouth = OutOutput.Mouth;
+        Mouth = FExploreTunnelMouthProbeOutput();
+        Mouth.FileName = TEXT("tunnel_mouth_probe.csv");
+        const double MouthStartSeconds = FPlatformTime::Seconds();
+        FString MouthCsv;
+        MouthCsv.Reserve(8192);
+        MouthCsv += TEXT(
+            "endpoint,lateral_offset_voxels,wall_surface_distance_voxels,"
+            "floor_surface_height_voxels\r\n");
+
+        const TArray<float>& MouthRadii = Radii;
+        const TArray<FVector>& MouthPoints = Points;
+        const int32 MouthPointCount = MouthPoints.Num();
+        const uint32 RoomHashes[2] = {
+            BestTunnel->FloorRoomHashA, BestTunnel->FloorRoomHashB };
+        const int32 EndpointPointIndices[2] = { 0, MouthPointCount - 1 };
+        const int32 InteriorPointIndices[2] = { 1, MouthPointCount - 2 };
+        TSet<uint32> CountedRoomHashes;
+
+        auto CachedRoomRawSDF = [](const FCachedRoom& Room, const FVector& Position) -> float
+        {
+            switch (Room.ShapeType)
+            {
+            case 1:
+                return VoxelSDF::RoundedBox(
+                    Position, Room.Center, Room.ShapeA, Room.ShapeR);
+            case 2:
+                return VoxelSDF::Capsule(
+                    Position, Room.ShapeA, Room.ShapeB, Room.ShapeR);
+            default:
+                return VoxelSDF::Ellipsoid(Position, Room.Center, Room.ShapeA);
+            }
+        };
+
+        // The room-volume attribution sample is intentionally coarser than the mesh lattice. It
+        // is a count instrument, not a replacement for the matched export, and its resolution is
+        // recorded in the report. A core-induced solid must still be zero at this resolution.
+        const int32 RoomSampleStep = Mouth.RoomSampleStepVoxels;
+        for (int32 EndpointIndex = 0; EndpointIndex < 2; ++EndpointIndex)
+        {
+            const int32 PointIndex = EndpointPointIndices[EndpointIndex];
+            const int32 InteriorIndex = InteriorPointIndices[EndpointIndex];
+            if (!MouthPoints.IsValidIndex(PointIndex)
+                || !MouthPoints.IsValidIndex(InteriorIndex)
+                || !MouthRadii.IsValidIndex(PointIndex))
+            {
+                continue;
+            }
+
+            FExploreTunnelMouthProbeEndpoint& Endpoint = Mouth.Endpoints.AddDefaulted_GetRef();
+            Endpoint.Name = EndpointIndex == 0 ? TEXT("A") : TEXT("B");
+            Endpoint.RoomHash = RoomHashes[EndpointIndex];
+            Endpoint.Mouth = MouthPoints[PointIndex];
+            Endpoint.RadiusVoxels = FMath::Abs(MouthRadii[PointIndex]);
+            Endpoint.TunnelFloorZ = EndpointIndex == 0
+                ? BestTunnel->WorldMouthFloorZA : BestTunnel->WorldMouthFloorZB;
+            if (!FMath::IsFinite(Endpoint.TunnelFloorZ))
+            {
+                Endpoint.TunnelFloorZ = static_cast<float>(Endpoint.Mouth.Z)
+                    - Endpoint.RadiusVoxels;
+            }
+
+            FVector RoomToTunnel = MouthPoints[InteriorIndex] - MouthPoints[PointIndex];
+            RoomToTunnel.Z = 0.0f;
+            if (!RoomToTunnel.Normalize())
+            {
+                RoomToTunnel = EndpointIndex == 0
+                    ? FVector::ForwardVector : -FVector::ForwardVector;
+            }
+            const FVector Lateral(-RoomToTunnel.Y, RoomToTunnel.X, 0.0f);
+            const float MaxMouthRadius = FMath::Max(MaxRadius, Endpoint.RadiusVoxels);
+            const float MouthRayReach = FMath::Max(MaxMouthRadius + 12.0f, 16.0f);
+            const float LateralHalfWidth = FMath::Max(
+                Endpoint.RadiusVoxels * 2.0f, 8.0f);
+            const float LateralStep = 0.25f;
+            const int32 LateralSamples = FMath::Max(
+                5, FMath::FloorToInt(
+                    (2.0f * LateralHalfWidth) / LateralStep) + 1);
+            const float ActualHalfWidth =
+                0.5f * static_cast<float>(LateralSamples - 1) * LateralStep;
+            Mouth.LateralSampleCount = FMath::Max(Mouth.LateralSampleCount, LateralSamples);
+            Mouth.LateralWindowVoxels = FMath::Max(
+                Mouth.LateralWindowVoxels, 2.0f * ActualHalfWidth);
+
+            Endpoint.Wall.Name = TEXT("wall");
+            Endpoint.Floor.Name = TEXT("floor");
+            Endpoint.Wall.CrossingsVoxels.Reserve(LateralSamples);
+            Endpoint.Floor.CrossingsVoxels.Reserve(LateralSamples);
+
+            // Keep the origin in finite room air but close enough that the existing radial
+            // crossing search still reaches the mouth in one probe window.
+            const float WallInteriorDepth = FMath::Min(
+                FMath::Max(4.0f * Endpoint.RadiusVoxels, 12.0f),
+                0.5f * MouthRayReach);
+            const float FloorInteriorDepth = FMath::Min(
+                FMath::Max(Endpoint.RadiusVoxels, 4.0f),
+                0.25f * MouthRayReach);
+            const float FloorOriginZ = static_cast<float>(Endpoint.Mouth.Z)
+                - Endpoint.RadiusVoxels - 8.0f;
+
+            for (int32 SampleIndex = 0; SampleIndex < LateralSamples; ++SampleIndex)
+            {
+                const float LateralOffset = -ActualHalfWidth
+                    + static_cast<float>(SampleIndex) * LateralStep;
+                const FVector LateralOffsetVector = Lateral * LateralOffset;
+                const FVector WallOrigin = Endpoint.Mouth + LateralOffsetVector
+                    - RoomToTunnel * WallInteriorDepth;
+                const FVector FloorOrigin(
+                    Endpoint.Mouth.X + LateralOffsetVector.X
+                        - RoomToTunnel.X * FloorInteriorDepth,
+                    Endpoint.Mouth.Y + LateralOffsetVector.Y
+                        - RoomToTunnel.Y * FloorInteriorDepth,
+                    FloorOriginZ);
+                float WallCrossing = std::numeric_limits<float>::quiet_NaN();
+                float FloorCrossing = std::numeric_limits<float>::quiet_NaN();
+                FindZeroCrossing(
+                    WallOrigin, RoomToTunnel, false, WallCrossing);
+                FindZeroCrossing(
+                    FloorOrigin, FVector::UpVector, false, FloorCrossing);
+                Endpoint.Wall.CrossingsVoxels.Add(WallCrossing);
+                Endpoint.Floor.CrossingsVoxels.Add(FloorCrossing);
+                MouthCsv += FString::Printf(
+                    TEXT("%s,%.9g,%.9g,%.9g\r\n"),
+                    *Endpoint.Name, LateralOffset, WallCrossing, FloorCrossing);
+            }
+
+            ComputeTunnelMouthProbeMetrics(Endpoint.Wall, LateralStep);
+            ComputeTunnelMouthProbeMetrics(Endpoint.Floor, LateralStep);
+            Mouth.MaxWallPeriodicAmplitudeVoxels = FMath::Max(
+                Mouth.MaxWallPeriodicAmplitudeVoxels,
+                Endpoint.Wall.PeriodicAmplitudeVoxels);
+            Mouth.MaxFloorPeriodicAmplitudeVoxels = FMath::Max(
+                Mouth.MaxFloorPeriodicAmplitudeVoxels,
+                Endpoint.Floor.PeriodicAmplitudeVoxels);
+            Mouth.MaxLocalMedianWallPeriodicAmplitudeVoxels = FMath::Max(
+                Mouth.MaxLocalMedianWallPeriodicAmplitudeVoxels,
+                Endpoint.Wall.LocalMedianPeriodicAmplitudeVoxels);
+            Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels = FMath::Max(
+                Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels,
+                Endpoint.Floor.LocalMedianPeriodicAmplitudeVoxels);
+
+            const int32 CentreIndex = LateralSamples / 2;
+            if (Endpoint.Floor.CrossingsVoxels.IsValidIndex(CentreIndex)
+                && FMath::IsFinite(Endpoint.Floor.CrossingsVoxels[CentreIndex]))
+            {
+                Endpoint.RoomFloorCrossingZ = FloorOriginZ
+                    + Endpoint.Floor.CrossingsVoxels[CentreIndex];
+                Endpoint.FloorJoinDeltaVoxels = Endpoint.RoomFloorCrossingZ
+                    - Endpoint.TunnelFloorZ;
+            }
+
+            // Count the room-volume samples once per endpoint room. This catches the exact
+            // failure mode from the screenshot: the generic field is air, then the tunnel-core
+            // bottom post changes it back to solid inside a room.
+            const FCachedRoom* Room = nullptr;
+            for (const FCachedRoom& CandidateRoom : Cache.Rooms)
+            {
+                if (CandidateRoom.Hash == RoomHashes[EndpointIndex])
+                {
+                    Room = &CandidateRoom;
+                    break;
+                }
+            }
+            if (Room == nullptr || CountedRoomHashes.Contains(Room->Hash))
+            {
+                continue;
+            }
+            CountedRoomHashes.Add(Room->Hash);
+
+            FVector ShapeExtentVector(
+                FMath::Abs(Room->ShapeA.X),
+                FMath::Abs(Room->ShapeA.Y),
+                FMath::Abs(Room->ShapeA.Z));
+            if (Room->ShapeType == 2)
+            {
+                ShapeExtentVector = FVector(
+                    FMath::Max(
+                        FMath::Abs(Room->ShapeA.X - Room->Center.X),
+                        FMath::Abs(Room->ShapeB.X - Room->Center.X)),
+                    FMath::Max(
+                        FMath::Abs(Room->ShapeA.Y - Room->Center.Y),
+                        FMath::Abs(Room->ShapeB.Y - Room->Center.Y)),
+                    FMath::Max(
+                        FMath::Abs(Room->ShapeA.Z - Room->Center.Z),
+                        FMath::Abs(Room->ShapeB.Z - Room->Center.Z)));
+            }
+            const float ShapeExtent = FMath::Max3(
+                ShapeExtentVector.X, ShapeExtentVector.Y, ShapeExtentVector.Z)
+                + FMath::Abs(Room->ShapeR) + 2.0f;
+            const int32 MinX = FMath::FloorToInt(Room->Center.X - ShapeExtent);
+            const int32 MinY = FMath::FloorToInt(Room->Center.Y - ShapeExtent);
+            const int32 MinZ = FMath::FloorToInt(Room->Center.Z - ShapeExtent);
+            const int32 MaxX = FMath::CeilToInt(Room->Center.X + ShapeExtent);
+            const int32 MaxY = FMath::CeilToInt(Room->Center.Y + ShapeExtent);
+            const int32 MaxZ = FMath::CeilToInt(Room->Center.Z + ShapeExtent);
+            for (int32 Z = MinZ; Z <= MaxZ; Z += RoomSampleStep)
+            {
+                for (int32 Y = MinY; Y <= MaxY; Y += RoomSampleStep)
+                {
+                    for (int32 X = MinX; X <= MaxX; X += RoomSampleStep)
+                    {
+                        const FVector Position(
+                            static_cast<float>(X), static_cast<float>(Y), static_cast<float>(Z));
+                        if (!(CachedRoomRawSDF(*Room, Position) < 0.0f))
+                        {
+                            continue;
+                        }
+                        ++Mouth.RoomVolumeSampleCount;
+
+                        FTunnelCoreWorldEvaluation CoreEvaluation;
+                        const float GenericDensity = World.Generator->GetDensityWithParams(
+                            Position.X, Position.Y, Position.Z,
+                            Params, BestParamsFingerprint, ProbeLayoutVersion,
+                            /*bApplyLegacyStructuralPosts=*/false,
+                            &CoreEvaluation,
+                            /*bCollectFusedDiagnostics=*/false);
+                        const float FinalDensity = World.Generator->GetDensityAt(
+                            Position.X, Position.Y, Position.Z);
+                        if (!FMath::IsFinite(GenericDensity)
+                            || !FMath::IsFinite(FinalDensity))
+                        {
+                            continue;
+                        }
+                        if (GenericDensity > 0.0f)
+                        {
+                            ++Mouth.RoomAirSampleCount;
+                        }
+                        if (FinalDensity <= 0.0f)
+                        {
+                            ++Mouth.FinalSolidSampleCount;
+                        }
+                        const bool bOwnsSweptBottom =
+                            CoreEvaluation.bHasSweptFloor
+                            && FMath::IsFinite(CoreEvaluation.SweptFloorZ)
+                            && FMath::IsFinite(CoreEvaluation.SweptFloorRadius)
+                            && Position.Z <= CoreEvaluation.SweptFloorZ
+                                + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels;
+                        if (bOwnsSweptBottom)
+                        {
+                            ++Mouth.CoreBottomSampleCount;
+                            if (GenericDensity > 0.0f && FinalDensity <= 0.0f)
+                            {
+                                ++Mouth.CoreInducedSolidSampleCount;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Mouth.EndpointCount = Mouth.Endpoints.Num();
+        const FString MouthPath = FPaths::Combine(Arguments.OutDirectory, Mouth.FileName);
+        if (!FFileHelper::SaveStringToFile(
+                MouthCsv, *MouthPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+        {
+            Mouth.Status = TEXT("error");
+            Mouth.RefusalReason = TEXT("Could not write tunnel_mouth_probe.csv.");
+        }
+        else if (Mouth.EndpointCount < 2)
+        {
+            Mouth.Status = TEXT("error");
+            Mouth.RefusalReason = TEXT("The selected tunnel did not expose two room endpoints.");
+        }
+        else
+        {
+            Mouth.Status = TEXT("ok");
+        }
+        Mouth.Seconds = FPlatformTime::Seconds() - MouthStartSeconds;
+        UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTunnelMouthProbe] endpoints=%d room_samples=%lld room_air=%lld "
+             "core_bottom=%lld final_solid=%lld core_induced_solid=%lld "
+             "wall_periodic=%.6g_voxels=%.6g_cm floor_periodic=%.6g_voxels=%.6g_cm "
+             "legacy_floor_periodic=%.6g_voxels=%.6g_cm "
+             "lateral_window=%.3f step=%.3f file=%s"),
+            Mouth.EndpointCount,
+            Mouth.RoomVolumeSampleCount, Mouth.RoomAirSampleCount,
+            Mouth.CoreBottomSampleCount, Mouth.FinalSolidSampleCount,
+            Mouth.CoreInducedSolidSampleCount,
+            Mouth.MaxWallPeriodicAmplitudeVoxels,
+             Mouth.MaxWallPeriodicAmplitudeVoxels * 25.0f,
+             Mouth.MaxFloorPeriodicAmplitudeVoxels,
+             Mouth.MaxFloorPeriodicAmplitudeVoxels * 25.0f,
+             Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels,
+             Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels * 25.0f,
+             Mouth.LateralWindowVoxels, Mouth.LateralStepVoxels, *MouthPath);
     }
 
     const FString Path = FPaths::Combine(Arguments.OutDirectory, OutOutput.FileName);
@@ -5715,6 +6203,27 @@ void WriteTunnelCoreProbeAxis(
     Writer.WriteValue(TEXT("final_periodic_period_voxels"), static_cast<double>(Axis.FinalPeriodicPeriodVoxels));
     Writer.WriteValue(TEXT("final_periodic_measured_samples"), Axis.FinalPeriodicMeasuredSamples);
     Writer.WriteValue(TEXT("final_periodic_measured_length_voxels"), static_cast<double>(Axis.FinalPeriodicMeasuredLengthVoxels));
+    Writer.WriteObjectEnd();
+}
+
+void WriteTunnelMouthProbeAxis(
+    FExploreJsonWriter& Writer,
+    const FExploreTunnelMouthProbeAxis& Axis,
+    const TCHAR* Key)
+{
+    Writer.WriteObjectStart(Key);
+    Writer.WriteValue(TEXT("valid_crossings"), Axis.ValidCrossings);
+    Writer.WriteValue(TEXT("mean_crossing_voxels"), static_cast<double>(Axis.MeanCrossingVoxels));
+    Writer.WriteValue(TEXT("min_crossing_voxels"), static_cast<double>(Axis.MinCrossingVoxels));
+    Writer.WriteValue(TEXT("max_crossing_voxels"), static_cast<double>(Axis.MaxCrossingVoxels));
+    Writer.WriteValue(TEXT("periodic_amplitude_voxels"), static_cast<double>(Axis.PeriodicAmplitudeVoxels));
+    Writer.WriteValue(TEXT("periodic_amplitude_cm"), static_cast<double>(Axis.PeriodicAmplitudeVoxels) * 25.0);
+    Writer.WriteValue(TEXT("periodic_period_voxels"), static_cast<double>(Axis.PeriodicPeriodVoxels));
+    Writer.WriteValue(TEXT("periodic_measured_samples"), Axis.PeriodicMeasuredSamples);
+    Writer.WriteValue(TEXT("periodic_measured_length_voxels"), static_cast<double>(Axis.PeriodicMeasuredLengthVoxels));
+    Writer.WriteValue(TEXT("local_median_periodic_amplitude_voxels"), static_cast<double>(Axis.LocalMedianPeriodicAmplitudeVoxels));
+    Writer.WriteValue(TEXT("local_median_periodic_amplitude_cm"), static_cast<double>(Axis.LocalMedianPeriodicAmplitudeVoxels) * 25.0);
+    Writer.WriteValue(TEXT("local_median_periodic_period_voxels"), static_cast<double>(Axis.LocalMedianPeriodicPeriodVoxels));
     Writer.WriteObjectEnd();
 }
 
@@ -5884,10 +6393,55 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("final_center_min"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMin));
     Writer->WriteValue(TEXT("final_center_max"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMax));
     Writer->WriteValue(TEXT("final_center_max_abs"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMaxAbs));
-    Writer->WriteValue(TEXT("periodic_method"), TEXT("32-voxel local-median detrend over the longest contiguous >=40-voxel run, single-sided DFT peak in the <=16-voxel band; amplitudes are sinusoid amplitudes"));
+    Writer->WriteValue(TEXT("periodic_method"), TEXT("Tunnel-core axes: 32-voxel local-median detrend. Mouth axes: degree-six slow-trend detrend over the longest contiguous >=40-voxel run, with the legacy local-median value retained per axis; both use a single-sided DFT peak in the <=16-voxel band and report sinusoid amplitudes."));
     WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Floor, TEXT("floor"));
     WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Wall, TEXT("wall"));
     WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Ceiling, TEXT("ceiling"));
+    Writer->WriteObjectStart(TEXT("mouth_probe"));
+    Writer->WriteValue(TEXT("status"), Output.TunnelCoreProbe.Mouth.Status);
+    Writer->WriteValue(TEXT("file"), Output.TunnelCoreProbe.Mouth.FileName);
+    Writer->WriteValue(TEXT("refusal_or_error"), Output.TunnelCoreProbe.Mouth.RefusalReason);
+    Writer->WriteValue(TEXT("endpoint_count"), Output.TunnelCoreProbe.Mouth.EndpointCount);
+    Writer->WriteValue(TEXT("lateral_sample_count"), Output.TunnelCoreProbe.Mouth.LateralSampleCount);
+    Writer->WriteValue(TEXT("lateral_step_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.LateralStepVoxels));
+    Writer->WriteValue(TEXT("lateral_window_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.LateralWindowVoxels));
+    Writer->WriteValue(TEXT("room_sample_step_voxels"), Output.TunnelCoreProbe.Mouth.RoomSampleStepVoxels);
+    Writer->WriteValue(TEXT("room_volume_sample_count"), Output.TunnelCoreProbe.Mouth.RoomVolumeSampleCount);
+    Writer->WriteValue(TEXT("room_air_sample_count"), Output.TunnelCoreProbe.Mouth.RoomAirSampleCount);
+    Writer->WriteValue(TEXT("core_bottom_sample_count"), Output.TunnelCoreProbe.Mouth.CoreBottomSampleCount);
+    Writer->WriteValue(TEXT("final_solid_sample_count"), Output.TunnelCoreProbe.Mouth.FinalSolidSampleCount);
+    Writer->WriteValue(TEXT("core_induced_solid_sample_count"), Output.TunnelCoreProbe.Mouth.CoreInducedSolidSampleCount);
+    Writer->WriteValue(TEXT("max_wall_periodic_amplitude_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxWallPeriodicAmplitudeVoxels));
+    Writer->WriteValue(TEXT("max_wall_periodic_amplitude_cm"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxWallPeriodicAmplitudeVoxels) * 25.0);
+    Writer->WriteValue(TEXT("max_floor_periodic_amplitude_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxFloorPeriodicAmplitudeVoxels));
+    Writer->WriteValue(TEXT("max_floor_periodic_amplitude_cm"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxFloorPeriodicAmplitudeVoxels) * 25.0);
+    Writer->WriteValue(TEXT("max_local_median_wall_periodic_amplitude_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxLocalMedianWallPeriodicAmplitudeVoxels));
+    Writer->WriteValue(TEXT("max_local_median_wall_periodic_amplitude_cm"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxLocalMedianWallPeriodicAmplitudeVoxels) * 25.0);
+    Writer->WriteValue(TEXT("max_local_median_floor_periodic_amplitude_voxels"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels));
+    Writer->WriteValue(TEXT("max_local_median_floor_periodic_amplitude_cm"), static_cast<double>(Output.TunnelCoreProbe.Mouth.MaxLocalMedianFloorPeriodicAmplitudeVoxels) * 25.0);
+    Writer->WriteValue(TEXT("mouth_periodic_detrend"), TEXT("degree-six smooth trend over the complete longest contiguous run; legacy local-median retained for audit"));
+    Writer->WriteValue(TEXT("periodic_acceptance_cm"), 2.0);
+    Writer->WriteValue(TEXT("periodic_acceptance_pass"),
+        Output.TunnelCoreProbe.Mouth.MaxWallPeriodicAmplitudeVoxels * 25.0f <= 2.0f
+        && Output.TunnelCoreProbe.Mouth.MaxFloorPeriodicAmplitudeVoxels * 25.0f <= 2.0f);
+    Writer->WriteArrayStart(TEXT("endpoints"));
+    for (const FExploreTunnelMouthProbeEndpoint& Endpoint : Output.TunnelCoreProbe.Mouth.Endpoints)
+    {
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("name"), Endpoint.Name);
+        Writer->WriteValue(TEXT("room_hash"), static_cast<int64>(Endpoint.RoomHash));
+        WriteJsonVector(*Writer, TEXT("mouth_voxels"), Endpoint.Mouth, 1.0f);
+        Writer->WriteValue(TEXT("radius_voxels"), static_cast<double>(Endpoint.RadiusVoxels));
+        Writer->WriteValue(TEXT("tunnel_floor_z"), static_cast<double>(Endpoint.TunnelFloorZ));
+        Writer->WriteValue(TEXT("room_floor_crossing_z"), static_cast<double>(Endpoint.RoomFloorCrossingZ));
+        Writer->WriteValue(TEXT("floor_join_delta_voxels"), static_cast<double>(Endpoint.FloorJoinDeltaVoxels));
+        WriteTunnelMouthProbeAxis(*Writer, Endpoint.Wall, TEXT("wall"));
+        WriteTunnelMouthProbeAxis(*Writer, Endpoint.Floor, TEXT("floor"));
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteArrayEnd();
+    Writer->WriteValue(TEXT("seconds"), Output.TunnelCoreProbe.Mouth.Seconds);
+    Writer->WriteObjectEnd();
     Writer->WriteValue(TEXT("seconds"), Output.TunnelCoreProbe.Seconds);
     Writer->WriteObjectEnd();
 

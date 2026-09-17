@@ -3475,10 +3475,18 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         {
             VoxelDensityProfile::FScopedTimer ProfileTimer(
                 VoxelDensityProfile::EBucket::TunnelCorePosts);
+            FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+            if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+            {
+                RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+            }
+            RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
             PreDisturbanceTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, nullptr,
                 VoxelGenLOD::ShouldUseSpatialIndex(
-                    CP_UseOpStack ? bUsedFusedEvaluator : true));
+                    CP_UseOpStack ? bUsedFusedEvaluator : true),
+                &RoomQueryPosition);
             bHavePreDisturbanceTunnelCore = true;
         }
 
@@ -3573,6 +3581,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 return;
             }
             const bool bOwnsSweptBottom =
+                !Core.bRoomFloor
+                &&
                 Core.bHasSweptFloor
                 && VoxelMath::IsFinite(Core.SweptFloorZ)
                 && VoxelMath::IsFinite(Core.SweptFloorRadius)
@@ -3669,11 +3679,19 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
+                FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+                {
+                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+                }
+                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
                     nullptr,
                     VoxelGenLOD::ShouldUseSpatialIndex(
-                        CP_UseOpStack ? bUsedFusedEvaluator : true));
+                        CP_UseOpStack ? bUsedFusedEvaluator : true),
+                    &RoomQueryPosition);
                 bHaveTunnelCore = true;
             }
             if (bHaveTunnelCore)
@@ -3689,7 +3707,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 ApplyTunnelCoreShape(TunnelCore);
 
             }
-            if (bHaveTunnelCore || (!bTunnelCoreReachable && !bTunnelCoreBypass))
+            if (bHaveTunnelCore)
+            {
+                if (!TunnelCore.bRoomFloor)
+                {
+                    ApplyGraphLandingFloors();
+                }
+            }
+            else if (!bTunnelCoreReachable && !bTunnelCoreBypass)
             {
                 ApplyGraphLandingFloors();
             }
@@ -4279,8 +4304,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // floor projection for the current point without eagerly materialising a whole XY table.
         // The interpreted source has a lazy worker LRU for block evaluation; building that table
         // here would turn a cache-window change into hundreds of unnecessary column builds.
+        const FVector RoomQueryPosition(WarpedX, WarpedY, WarpedZ);
         *OutTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-            WorldX, WorldY, WorldZ, SDFCache, nullptr, bUseSpatialIndex);
+            WorldX, WorldY, WorldZ, SDFCache, nullptr, bUseSpatialIndex,
+            &RoomQueryPosition);
     }
 
     //=========================================================================
