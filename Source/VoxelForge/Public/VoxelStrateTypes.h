@@ -285,7 +285,6 @@ enum class EVoxelStrateTransition : uint8
     LERPF(TunnelHorizontalBias) \
     SNAPF(bTunnelsFlowTowardOrigin) \
     LERPF(TunnelEndpointZOffset) \
-    SNAPF(bTunnelFloorEnabled) \
     SNAPF(bTunnelFloorTerracingEnabled) \
     LERPF(TunnelFloorTerraceStepHeight) \
     LERPF(TunnelFloorMaxLedgeHeight) \
@@ -686,10 +685,10 @@ struct VOXELFORGE_API FStrateGenerationParams
     // terraces walls after morphology, while these fields describe the tunnel's own floor profile.
     // FloorReliefStrength/Frequency above are shared with room floors and are reused here.
 
-    // Whether the swept tunnel receives its authored floor cut. Disable only for an archetype that
-    // deliberately wants the bare capsule; the structural support backstop remains a measured
-    // fallback for malformed/legacy caches and is not a replacement for this shape.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cave Morphology|Tunnels|Floor")
+    // Deprecated compatibility field.  The tunnel's carved geometry always owns its floor;
+    // serialized values continue to load but are deliberately ignored.
+    UPROPERTY(meta = (DeprecatedProperty,
+        DeprecationMessage = "Ignored; tunnel floor is always authored by tunnel geometry."))
     bool bTunnelFloorEnabled = true;
 
     // Enables deterministic selection of a few dramatic ledges on steep graph-redundant or leaf
@@ -1137,10 +1136,10 @@ constexpr int32 VF_StrateParamListedFieldCount =
 #undef VF_STRATE_PARAM_COUNT_FIELD
 
 static_assert(
-    VF_StrateParamListedFieldCount == 83,
+    VF_StrateParamListedFieldCount == 82,
     "FStrateGenerationParams field count changed; update the struct and VF_STRATE_PARAM_FIELDS together.");
 static_assert(
-    sizeof(FStrateGenerationParams) == VF_StrateParamListedBytes + 8,
+    sizeof(FStrateGenerationParams) == VF_StrateParamListedBytes + 9,
     "FStrateGenerationParams and VF_STRATE_PARAM_FIELDS disagree; update both places and recheck the expected padding.");
 
 //=============================================================================

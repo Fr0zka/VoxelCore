@@ -337,10 +337,8 @@ struct FVoxelOpSample
     // FLT_MAX = "no surface nearby" — the initial state, and the early-out placed sources use.
     float Sdf = FLT_MAX;
 
-    // The room-graph source can author a finite tunnel/room floor band while it is building the
-    // shape. This structural metadata is not a third composable field: it tells the stack that
-    // later detail operators must not turn the already-authored support back into air. Carrying it
-    // with the sample keeps the rule true even when a detail op is unaware of the room graph.
+    // Deprecated structural-floor compatibility fields. Graph tunnels now carry their floor in
+    // the swept shape itself; the production stack does not use these fields to write a slab.
     bool bProtectedStructuralFloor = false;
     float StructuralFloorMinimumDensity = 0.0f;
 
@@ -350,14 +348,16 @@ struct FVoxelOpSample
     const FChunkSDFCache* RoomCache = nullptr;
     int32 NearestRoomIndex = INDEX_NONE;
 
-    // The common generator tail consumes these values after the block has left the stack.  They
-    // are the small, exact subset of FTunnelCoreWorldEvaluation that the tail needs; keeping them
-    // in the sample avoids re-running the world-space tunnel scan or consulting a last-sample TLS
-    // value after an op-major evaluation.
+    // The common generator tail consumes the continuous swept-shape metadata after the block has
+    // left the stack. Keeping it in the sample avoids re-running the world-space tunnel scan or
+    // consulting a last-sample TLS value after an op-major evaluation.
     bool bHasTunnelCoreWorldEvaluation = false;
     float TunnelCoreWorldSDF = FLT_MAX;
     bool bTunnelCoreSupportFloor = false;
     bool bTunnelCoreRoomFloor = false;
+    bool bHasTunnelCoreSweptFloor = false;
+    float TunnelCoreSweptFloorZ = -FLT_MAX;
+    float TunnelCoreSweptFloorRadius = 0.0f;
 };
 
 /**

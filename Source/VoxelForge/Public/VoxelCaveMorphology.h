@@ -712,7 +712,6 @@ struct FCachedTunnel
     float SDFMouthFloorZB = -FLT_MAX;
     float WorldMouthFloorZA = -FLT_MAX;
     float WorldMouthFloorZB = -FLT_MAX;
-    bool bTunnelFloorEnabled = true;
     bool bTunnelFloorTerracingEnabled = true;
     float TunnelFloorTerraceStepHeight = 1.71f;
     float TunnelFloorMaxLedgeHeight = 12.0f;
@@ -915,17 +914,8 @@ struct FChunkSDFCache
     FChunkSDFSpatialIndex ChimneySpatialIndex;
     FChunkSDFSpatialIndex ColumnSpatialIndex;
 
-    // Sparse immutable support-column table. SupportColumnEntries is a dense
-    // integer-XY slot map whose values index only non-empty SupportColumns.
-    int32 SupportColumnMinX = 0;
-    int32 SupportColumnMinY = 0;
-    int32 SupportColumnCellsX = 0;
-    int32 SupportColumnCellsY = 0;
-    TArray<int32> SupportColumnEntries;
-    TArray<FTunnelSupportFloorColumn> SupportColumns;
-
     // Kept with the cache because the world-space structural evaluator has no params argument.
-    // A zero value is a valid hard-intersection fallback for legacy/empty caches.
+    // A zero value is a valid fallback for legacy/empty caches.
     float SDFBlendRadius = 0.0f;
 
     // Allocator-backed bytes owned by this cache, including the nested tunnel chains. The returned
@@ -943,14 +933,20 @@ struct FChunkSDFCache
     VoxelDensityProfile::FCacheMemoryBreakdown GetAllocatedSizeBreakdown() const;
 };
 
-/** Combined world-space tunnel post query; one cache scan supplies both support and air tests. */
+/** World-space tunnel shape query. Legacy support-floor fields remain source-compatible but are
+ * no longer produced or consumed by the graph-tunnel generation path. */
 struct FTunnelCoreWorldEvaluation
 {
     float SDF = FLT_MAX;
+    // Deprecated compatibility output. The separate graph-tunnel support slab was removed.
     bool bSupportFloor = false;
-    // The room floor owns the overlap band. The common post uses this marker to restore
-    // the room's support after the raw tunnel-air backstop has run.
+    // Deprecated compatibility output. Room/landing floors are composed by their own posts.
     bool bRoomFloor = false;
+    // Shape-level floor ownership. This is not an authored slab: it identifies the bottom side
+    // of the swept tunnel SDF so a room that is already air cannot erase the tunnel's own floor.
+    bool bHasSweptFloor = false;
+    float SweptFloorZ = -FLT_MAX;
+    float SweptFloorRadius = 0.0f;
 };
 
 //=============================================================================
@@ -1040,13 +1036,17 @@ namespace VoxelCaveMorphology
     // SmoothMin. Includes per-room/tunnel distance culling to skip primitives
     // that are too far to contribute.
     //
-    // @param WorldX, WorldY, WorldZ  — position in voxel coordinates (may be warped)
+    // @param WorldX, WorldY, WorldZ  — room/query position in voxel coordinates (may be warped)
     // @param Cache                   — pre-built cache from BuildChunkCache
     // @param SDFBlendRadius          — SmoothMin blend radius (from Params.SDFBlendRadius)
     // @param OutNearestRoomIdx       — optional out: index of the room with minimum SDF
     //                                  contribution. -1 if no room passed the cull test.
     //                                  Used by the terrain ops system to look up the
     //                                  per-room terrain op assigned to this voxel's room.
+    // @param WorldTunnelPosition    — optional unwarped position for the tunnel primitive. When
+    //                                  supplied, rooms remain at the query position but the tunnel
+    //                                  uses its authored world chain. Null preserves the legacy
+    //                                  all-query behavior.
     // (Room shape variety is baked into FCachedRoom by BuildChunkCache — no per-voxel roll.)
     // @return negative = inside cave, positive = solid rock
     VOXELFORGE_API float EvaluateSDFCached(
@@ -1054,7 +1054,8 @@ namespace VoxelCaveMorphology
         const FChunkSDFCache& Cache,
         float SDFBlendRadius,
         int32* OutNearestRoomIdx = nullptr,
-        bool bUseSpatialIndex = true
+        bool bUseSpatialIndex = true,
+        const FVector* WorldTunnelPosition = nullptr
     );
 
     // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
@@ -1078,6 +1079,7 @@ namespace VoxelCaveMorphology
     VOXELFORGE_API FTunnelCoreWorldEvaluation EvaluateTunnelCoreWorld(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
+        // Deprecated legacy argument; graph-tunnel evaluation ignores the old support column.
         const FTunnelSupportFloorColumn* SupportColumn = nullptr,
         bool bUseSpatialIndex = true
     );
@@ -1090,18 +1092,16 @@ namespace VoxelCaveMorphology
         float ReachScale = 1.0f
     );
 
-    // True for the finite support slab beneath a world-space graph tunnel. The native density
-    // path and the operator stack use this same predicate before reopening the air core, keeping
-    // the rounded capsule's bottom from becoming an unsupported point.
+    // Deprecated compatibility query for the removed graph-tunnel support slab. Production
+    // generation does not call this predicate; the tunnel's own swept shape owns its floor.
     VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
         float WorldX, float WorldY, float WorldZ,
         const FChunkSDFCache& Cache,
         bool bUseSpatialIndex = true
     );
 
-    // Build/query the same support-floor predicate at column granularity. The column stores its
-    // finite support interval, so every Z sample in a chunk reuses the same deterministic
-    // projection and never re-runs a natural-floor validator.
+    // Deprecated compatibility helper for callers that still inspect the old support-band
+    // diagnostic. It is detached from production density generation.
     VOXELFORGE_API void BuildTunnelSupportFloorColumn(
         float WorldX, float WorldY,
         const FChunkSDFCache& Cache,
@@ -1114,9 +1114,8 @@ namespace VoxelCaveMorphology
         const FTunnelSupportFloorColumn& Column
     );
 
-    // Returns the exact projected floor band for one tunnel at this XY column.
-    // The world evaluator uses FloorZ for its per-tunnel air ownership rule and
-    // Min/Max for the support slab itself.
+    // Returns the legacy projected band for one tunnel at this XY column. The world evaluator no
+    // longer uses it to write a support slab.
     VOXELFORGE_API bool GetTunnelSupportFloorColumnBand(
         int32 TunnelIndex,
         const FTunnelSupportFloorColumn& Column,

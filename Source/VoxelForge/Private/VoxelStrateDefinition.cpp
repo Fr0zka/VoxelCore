@@ -62,6 +62,11 @@ void UVoxelStrateDefinition::PostLoad()
 {
     Super::PostLoad();
 
+    // The field remains reflected solely so old packages deserialize without shifting the
+    // following members.  Tunnel geometry owns the floor now, so every serialized legacy value
+    // is normalized to the ignored compatibility default before any runtime copy is made.
+    GenerationParams.bTunnelFloorEnabled = true;
+
     if (GetLinkerCustomVersion(GVoxelForgeStrateSerializationVersion)
         >= GVoxelForgeStrateGentleSlopeDegreesVersion)
     {

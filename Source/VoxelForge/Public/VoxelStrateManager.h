@@ -429,8 +429,7 @@ public:
 
     /** Apply the landing/tunnel MC post in one cached passage scan after disturbances. */
     void ApplyPassageStructuralPostsMC(float& Density, float WorldX, float WorldY, float WorldZ,
-                                       float BaseDensity, float SealThickness,
-                                       bool bProtectAuthoredTunnelFloor = false) const;
+                                       float BaseDensity, float SealThickness) const;
 
     /**
      * Compose the build-authored passage D-floor after generic MC writers.  This is the native

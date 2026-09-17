@@ -2967,8 +2967,7 @@ static bool VF_IsPassageRoomFloor(
 
 void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
     float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness,
-    bool bProtectAuthoredTunnelFloor) const
+    float BaseDensity, float SealThickness) const
 {
     const bool bDisableStructuralPosts = VoxelDensityAblation::IsPassageStructuralPostsOff();
     const bool bDisableLandingPosts = VoxelDensityAblation::IsLandingPostsOff();
@@ -2989,7 +2988,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         VoxelGenLOD::bTilePostReachBypass = true;
         ApplyPassageStructuralPostsMC(
             CanonicalDensity, WorldX, WorldY, WorldZ,
-            BaseDensity, SealThickness, bProtectAuthoredTunnelFloor);
+            BaseDensity, SealThickness);
         VoxelGenLOD::bTilePostReachBypass = PreviousBypass;
     }
     if (!bLandingReachable && !bStructuralReachable)
@@ -3076,11 +3075,9 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         }
     }
 
-    // A graph tunnel floor is authored by the room-graph source with its complete clearance
-    // budget. A neighbouring inter-strate landing must not reopen that finite support band; its
-    // carve remains valid everywhere else. Legacy callers leave this false and retain the old
-    // passage-owned behavior.
-    if (!bDisableLandingPosts && !bProtectAuthoredTunnelFloor
+    // The graph tunnel no longer exposes a separate support slab.  Inter-strate landing carving
+    // remains independent and is still composed here when its own reach proof allows it.
+    if (!bDisableLandingPosts
         && !bAnyLandingFloor && !bLegacyTunnelSupportFloor && MinLandingSDF < FLT_MAX)
     {
         float InternalDensity = -Density;
@@ -3094,7 +3091,7 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         Density = FMath::Min(Density, -BaseDensity);
     }
 
-    if (bWalkableAir && !bProtectAuthoredTunnelFloor)
+    if (bWalkableAir)
     {
         Density = FMath::Max(
             Density, BaseDensity * 2.0f + SealThickness + 4.0f);

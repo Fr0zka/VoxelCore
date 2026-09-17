@@ -1021,8 +1021,7 @@ static FORCEINLINE void ApplyOriginLandingFloor(float& Density,
 // it works uniformly for every generator type. Stays inside the seal bands so it can
 // never breach a strate boundary. All features are hash-placed and deterministic.
 static void ApplyDisturbances(float& MC, float X, float Y, float Z,
-    const FStrateDisturbanceParams& D, uint32 Seed, bool bProtectVerticalShaftAir,
-    bool bProtectAuthoredTunnelFloor)
+    const FStrateDisturbanceParams& D, uint32 Seed, bool bProtectVerticalShaftAir)
 {
     if (VoxelDensityAblation::IsDisturbancesOff())
     {
@@ -1033,20 +1032,6 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     const float InnerTop = D.StrateTopWorldZ - D.BoundarySealThickness;
     const float InnerBot = D.StrateBottomWorldZ + D.BoundarySealThickness;
     if (Z <= InnerBot || Z >= InnerTop) return;
-
-    // A tunnel floor is now authored into the cached shape with its clearance budget. The generic
-    // disturbance layer is deliberately outside that shape, so it must not reopen or bridge the
-    // finite support band after the shape has proved it. This is an ownership hand-off, not a
-    // per-sample natural-floor validation.
-    if (bProtectAuthoredTunnelFloor)
-    {
-        if (VoxelDensityProfile::AreCountersEnabled())
-        {
-            VoxelDensityProfile::AddCounter(
-                VoxelDensityProfile::ECounter::TunnelAuthoredFloorDisturbanceSkips);
-        }
-        return;
-    }
 
     const float Solid = D.BaseDensity * 2.0f;
     const float Blend = 3.0f;
@@ -2301,7 +2286,6 @@ namespace
         uint64 ManagerLifetimeId = 0;
         FIntVector Chunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         FIntVector TileOrigin = FIntVector::ZeroValue;
-        FIntVector SupportChunk = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
         int32 TileStep = 0;
         int32 TileCells = 0;
         int32 StrateIndex = INT32_MIN;
@@ -2313,17 +2297,6 @@ namespace
     };
 
     static thread_local FTunnelCoreCacheState GTunnelCoreCache;
-
-    static void BuildTunnelSupportColumnsForChunk(
-        FChunkSDFCache& Cache,
-        const FIntVector& ChunkCoord,
-        bool bUseSpatialIndex);
-
-    static const FTunnelSupportFloorColumn* FindTunnelSupportColumn(
-        const FChunkSDFCache& Cache,
-        int32 X,
-        int32 Y,
-        const FTunnelSupportFloorColumn& EmptyColumn);
 
     // A mesher tile samples an expanded grid (-1..Cells+1), so one worker visits several exact
     // chunk coordinates even while it is generating one tile. The old CP_* cache retained only
@@ -2507,15 +2480,6 @@ namespace
                     && OutState.TileCells == RequestedTileCells));
         if (bSameGraphWindow)
         {
-            // The graph is shared by the whole tile, but the sparse support table is deliberately
-            // kept for the currently queried exact chunk. Rebuild only that small table when the
-            // density cursor crosses a chunk; the room/tunnel graph itself is not rebuilt.
-            if (OutState.SupportChunk != ChunkCoord)
-            {
-                BuildTunnelSupportColumnsForChunk(
-                    OutState.Cache, ChunkCoord, bUseSpatialIndex);
-                OutState.SupportChunk = ChunkCoord;
-            }
             OutState.Chunk = ChunkCoord;
             return;
         }
@@ -2552,8 +2516,6 @@ namespace
             StrateIndex, nullptr,
             ERoomGraphBuildSite::GeneratorTunnelCore);
         UpdateTunnelCoreTileReach(OutState.Cache, bUseTileCacheWindow);
-        BuildTunnelSupportColumnsForChunk(
-            OutState.Cache, ChunkCoord, bUseSpatialIndex);
         OutState.OwnerId = OwnerId;
         OutState.ManagerLifetimeId = ManagerLifetimeId;
         OutState.Chunk = ChunkCoord;
@@ -2561,76 +2523,12 @@ namespace
             ? RequestedTileOrigin : FIntVector::ZeroValue;
         OutState.TileStep = bUseTileCacheWindow ? RequestedTileStep : 0;
         OutState.TileCells = bUseTileCacheWindow ? RequestedTileCells : 0;
-        OutState.SupportChunk = ChunkCoord;
         OutState.StrateIndex = StrateIndex;
         OutState.WorldSeed = WorldSeed;
         OutState.ParamsFingerprint = ParamsFingerprint;
         OutState.LayoutVersion = LayoutVersion;
         OutState.bUsesTileCacheWindow = bUseTileCacheWindow;
         OutState.bValid = true;
-    }
-
-    static void BuildTunnelSupportColumnsForChunk(
-        FChunkSDFCache& Cache,
-        const FIntVector& ChunkCoord,
-        bool bUseSpatialIndex)
-    {
-        const int32 MinX = ChunkCoord.X * CHUNK_SIZE - 1;
-        const int32 MinY = ChunkCoord.Y * CHUNK_SIZE - 1;
-        const int32 Cells = CHUNK_SIZE + 2;
-        Cache.SupportColumnMinX = MinX;
-        Cache.SupportColumnMinY = MinY;
-        Cache.SupportColumnCellsX = Cells;
-        Cache.SupportColumnCellsY = Cells;
-        Cache.SupportColumnEntries.Init(INDEX_NONE, Cells * Cells);
-        Cache.SupportColumns.Reset();
-
-        // Empty columns are represented only by INDEX_NONE in the slot map, so
-        // each stored column retains the inline bands for actual graph tubes.
-        for (int32 Y = 0; Y < Cells; ++Y)
-        {
-            for (int32 X = 0; X < Cells; ++X)
-            {
-                FTunnelSupportFloorColumn Column;
-                VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                    static_cast<float>(MinX + X),
-                    static_cast<float>(MinY + Y),
-                    Cache,
-                    Column,
-                    bUseSpatialIndex);
-                if (Column.Intervals.Num() == 0)
-                {
-                    continue;
-                }
-
-                const int32 EntryIndex = Cache.SupportColumns.Add(MoveTemp(Column));
-                Cache.SupportColumnEntries[Y * Cells + X] = EntryIndex;
-            }
-        }
-    }
-
-    static const FTunnelSupportFloorColumn* FindTunnelSupportColumn(
-        const FChunkSDFCache& Cache,
-        int32 X,
-        int32 Y,
-        const FTunnelSupportFloorColumn& EmptyColumn)
-    {
-        if (Cache.SupportColumnCellsX <= 0
-            || X < Cache.SupportColumnMinX
-            || X >= Cache.SupportColumnMinX + Cache.SupportColumnCellsX
-            || Y < Cache.SupportColumnMinY
-            || Y >= Cache.SupportColumnMinY + Cache.SupportColumnCellsY)
-        {
-            return nullptr;
-        }
-
-        const int32 Slot =
-            (Y - Cache.SupportColumnMinY) * Cache.SupportColumnCellsX
-            + (X - Cache.SupportColumnMinX);
-        const int32 EntryIndex = Cache.SupportColumnEntries[Slot];
-        return EntryIndex == INDEX_NONE
-            ? &EmptyColumn
-            : &Cache.SupportColumns[EntryIndex];
     }
 
     struct FVoxelStackParamRefs
@@ -2842,7 +2740,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         VoxelDensityProfile::EBucket::DensityPrologue);
     // ── STRATE SYSTEM ──
     // Query per-chunk params from the manager so each strate has different caves.
-    float Result;
+    float Result = 0.0f;
 
     // A vertical tree connector may need to stay open through the shared disturbance and
     // structural-post tail below. This is one bit for this density call, not cached voxel data.
@@ -3391,6 +3289,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         float BlockTunnelCoreSDF = FLT_MAX;
         bool bBlockTunnelCoreSupportFloor = false;
         bool bBlockTunnelCoreRoomFloor = false;
+        bool bBlockHasTunnelCoreSweptFloor = false;
+        float BlockTunnelCoreSweptFloorZ = -FLT_MAX;
+        float BlockTunnelCoreSweptFloorRadius = 0.0f;
         bool bUsedFusedEvaluator = false;
         FTunnelCoreWorldEvaluation FusedTunnelCore;
 
@@ -3457,6 +3358,12 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     BlockTunnelCoreSDF = BlockCoreSample.TunnelCoreWorldSDF;
                     bBlockTunnelCoreSupportFloor = BlockCoreSample.bTunnelCoreSupportFloor;
                     bBlockTunnelCoreRoomFloor = BlockCoreSample.bTunnelCoreRoomFloor;
+                    bBlockHasTunnelCoreSweptFloor =
+                        BlockCoreSample.bHasTunnelCoreSweptFloor;
+                    BlockTunnelCoreSweptFloorZ =
+                        BlockCoreSample.TunnelCoreSweptFloorZ;
+                    BlockTunnelCoreSweptFloorRadius =
+                        BlockCoreSample.TunnelCoreSweptFloorRadius;
                 }
             }
             if (!bUsedFusedEvaluator)
@@ -3550,41 +3457,30 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 PreDisturbanceTunnelCore.SDF = BlockTunnelCoreSDF;
                 PreDisturbanceTunnelCore.bSupportFloor = bBlockTunnelCoreSupportFloor;
                 PreDisturbanceTunnelCore.bRoomFloor = bBlockTunnelCoreRoomFloor;
+                PreDisturbanceTunnelCore.bHasSweptFloor =
+                    bBlockHasTunnelCoreSweptFloor;
+                PreDisturbanceTunnelCore.SweptFloorZ = BlockTunnelCoreSweptFloorZ;
+                PreDisturbanceTunnelCore.SweptFloorRadius =
+                    BlockTunnelCoreSweptFloorRadius;
                 bHavePreDisturbanceTunnelCore = true;
             }
             else
             {
-                bHavePreDisturbanceTunnelCore = ActiveOpStack->TryGetLastTunnelCoreWorldEvaluation(
+            bHavePreDisturbanceTunnelCore = ActiveOpStack->TryGetLastTunnelCoreWorldEvaluation(
                     PreDisturbanceTunnelCore);
             }
         }
         if (!VoxelDensityAblation::IsTunnelCoreOff()
             && !bHavePreDisturbanceTunnelCore && ActiveTunnelCoreCache->bValid)
         {
-            const FTunnelSupportFloorColumn* SupportColumn = nullptr;
-            FTunnelSupportFloorColumn EmptySupportColumn;
-            const bool bIntegerXY =
-                WorldX == FMath::FloorToFloat(WorldX)
-                && WorldY == FMath::FloorToFloat(WorldY);
-            if (bIntegerXY)
-            {
-                const int32 IX = FMath::FloorToInt(WorldX);
-                const int32 IY = FMath::FloorToInt(WorldY);
-                SupportColumn = FindTunnelSupportColumn(
-                    ActiveTunnelCoreCache->Cache, IX, IY, EmptySupportColumn);
-            }
-
             VoxelDensityProfile::FScopedTimer ProfileTimer(
                 VoxelDensityProfile::EBucket::TunnelCorePosts);
             PreDisturbanceTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, SupportColumn,
+                WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, nullptr,
                 VoxelGenLOD::ShouldUseSpatialIndex(
                     CP_UseOpStack ? bUsedFusedEvaluator : true));
             bHavePreDisturbanceTunnelCore = true;
         }
-        const bool bProtectAuthoredTunnelFloor = bHavePreDisturbanceTunnelCore
-            && (PreDisturbanceTunnelCore.bSupportFloor
-                || PreDisturbanceTunnelCore.bRoomFloor);
 
         // Disturbance layer (the "wow" post-process) — cached params, MC convention. The
         // vertical shaft tree opens a walkable route before this shared pass, so a bridge/ridge
@@ -3594,7 +3490,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         const bool bProtectVerticalShaftAir =
             VoxelPassageGeometry::VerticalShaftConnectorAirMarker();
         ApplyDisturbances(Result, WorldX, WorldY, WorldZ, CP_Dist, (uint32)Seed,
-            bProtectVerticalShaftAir, bProtectAuthoredTunnelFloor);
+            bProtectVerticalShaftAir);
         DensityDisturbancesTimer.End();
 
         // A disturbance is allowed to add visual detail, but it must not refill the landing's
@@ -3670,6 +3566,27 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 break;
             }
         }
+        auto ApplyTunnelCoreShape = [&](const FTunnelCoreWorldEvaluation& Core)
+        {
+            if (!VoxelMath::IsFinite(Core.SDF))
+            {
+                return;
+            }
+            const bool bOwnsSweptBottom =
+                Core.bHasSweptFloor
+                && VoxelMath::IsFinite(Core.SweptFloorZ)
+                && VoxelMath::IsFinite(Core.SweptFloorRadius)
+                && WorldZ <= Core.SweptFloorZ
+                    + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels;
+            if (bOwnsSweptBottom)
+            {
+                Result = FMath::Min(Result, -Core.SDF);
+            }
+            else if (Core.SDF < 0.0f)
+            {
+                Result = FMath::Max(Result, -Core.SDF);
+            }
+        };
         // Origin rooms are structural too. Reassert their air before either support writer so a
         // bridge/ridge cannot plug a landing, while the two floor writers remain last.
         {
@@ -3693,7 +3610,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 VoxelDensityProfile::EBucket::PassageStructuralPosts);
             StrateManager->ApplyPassageStructuralPostsMC(
                 Result, WorldX, WorldY, WorldZ, LandingBaseDensity,
-                CP_Dist.BoundarySealThickness, bProtectAuthoredTunnelFloor);
+                CP_Dist.BoundarySealThickness);
         }
         // Disturbance features are authored as a generic MC-space post and may add a ridge or
         // bridge over a graph tunnel. Reassert the native cached tunnel core here, after every
@@ -3705,8 +3622,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         const bool bTunnelCoreBypass = VoxelGenLOD::IsTilePostReachBypassActive();
         auto ApplyGraphLandingFloors = [&]()
         {
-            // These are passage/origin landing posts, not tunnel-core writes. Keep them alive when
-            // the core bit is clear because their own per-tile reach bits may still be set.
+            // These are passage/origin landing posts, not tunnel-core writes. Their air and
+            // structural post already ran before disturbances; the tunnel shape below reopens
+            // its own continuous interior after the disturbance pass. Keep only the floor
+            // reassertions here, in the existing order.
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::PassageLandingFloor);
@@ -3733,7 +3652,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         {
             FTunnelCoreWorldEvaluation TunnelCore;
             bool bHaveTunnelCore = bHavePreDisturbanceTunnelCore;
-            if (!bTunnelCoreReachable && !bTunnelCoreBypass)
+            if (VoxelGenLOD::bTileCoreReachProofEnabled
+                && VoxelGenLOD::bTileReachDiagnosticTile
+                && !bTunnelCoreReachable && !bTunnelCoreBypass)
             {
                 // The fused/source hand-off is also empty on the skipped path. Do not let the
                 // default object turn this into a second tail evaluation.
@@ -3746,83 +3667,26 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             if (!bHaveTunnelCore && ActiveTunnelCoreCache->bValid
                 && (bTunnelCoreReachable || bTunnelCoreBypass))
             {
-                const FTunnelSupportFloorColumn* SupportColumn = nullptr;
-                FTunnelSupportFloorColumn EmptySupportColumn;
-                const bool bIntegerXY =
-                    WorldX == FMath::FloorToFloat(WorldX)
-                    && WorldY == FMath::FloorToFloat(WorldY);
-                if (bIntegerXY)
-                {
-                    const int32 IX = FMath::FloorToInt(WorldX);
-                    const int32 IY = FMath::FloorToInt(WorldY);
-                    SupportColumn = FindTunnelSupportColumn(
-                        ActiveTunnelCoreCache->Cache, IX, IY, EmptySupportColumn);
-                }
-
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
-                    SupportColumn,
+                    nullptr,
                     VoxelGenLOD::ShouldUseSpatialIndex(
                         CP_UseOpStack ? bUsedFusedEvaluator : true));
                 bHaveTunnelCore = true;
             }
             if (bHaveTunnelCore)
             {
-                const bool bTunnelSupportFloor = TunnelCore.bSupportFloor;
-                // The graph floor is now composed here, after disturbances and passage writers.
-                // The source has already baked the floor profile and published the exact same
-                // core result; this final ownership step only changes an actually-air sample.
-                // Previously the operator stack raised every authored floor sample to a strong
-                // internal density before those writers ran, which made the protection counter
-                // fire for solid samples as well as genuine breaches.
-                if (TunnelCore.bRoomFloor)
-                {
-                    const float StructuralSolidDensity =
-                        -FMath::Max(LandingBaseDensity * 2.0f, 1.0f);
-                    if (VoxelDensityProfile::AreCountersEnabled())
-                    {
-                        if (Result > 0.0f)
-                        {
-                            VoxelDensityProfile::AddCounter(
-                                VoxelDensityProfile::ECounter::TunnelRoomFloorBackstopFires);
-                        }
-                    }
-                    // A tunnel that penetrates a room cannot reassert its own floor through the
-                    // room's floor. The morphology query marks only the finite room support band;
-                    // preserve it after every generic post-disturbance writer.
-                    Result = FMath::Min(
-                        Result,
-                        StructuralSolidDensity);
-                }
-                // The swept capsule owns the relief profile. This finite support band is now the
-                // final composition of that authored shape, after every writer, rather than a
-                // pre-disturbance clamp in FVoxelOpStack::EvalSample.
-                if (bTunnelSupportFloor)
-                {
-                    const float StructuralSolidDensity =
-                        -FMath::Max(LandingBaseDensity * 2.0f, 1.0f);
-                    if (VoxelDensityProfile::AreCountersEnabled())
-                    {
-                        if (Result > 0.0f)
-                        {
-                            VoxelDensityProfile::AddCounter(
-                                VoxelDensityProfile::ECounter::TunnelSupportFloorBackstopFires);
-                        }
-                    }
-                    Result = FMath::Min(
-                        Result,
-                        StructuralSolidDensity);
-                }
-                const float CoreSDF = TunnelCore.SDF;
-                if (!bTunnelSupportFloor
-                    && CoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
-                {
-                    Result = FMath::Max(
-                        Result,
-                        FMath::Max(LandingBaseDensity * 2.0f, 1.0f));
-                }
+                // Reassert the actual swept-core field after generic writers. The old tail used a
+                // fixed positive air value once the core was deeper than an inset; that hard
+                // switch discarded the SDF magnitude and made marching-cubes intersections snap
+                // to the sample lattice. The source now contains the same continuous world-chain
+                // tunnel field. Union its interior air back over disturbances, and use the same
+                // signed field only on the bottom side identified by the swept shape itself. This
+                // restores the tunnel's carved floor when the surrounding room is already air,
+                // without adding an authored slab or turning the whole room into tunnel geometry.
+                ApplyTunnelCoreShape(TunnelCore);
 
             }
             if (bHaveTunnelCore || (!bTunnelCoreReachable && !bTunnelCoreBypass))
@@ -4292,11 +4156,13 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         // Also writes NearestRoomIdx — the room with minimum SDF contribution
         // at this voxel's position. Used by terrain ops below to pick per-room params.
         NearestRoomIdx = -1;
+        const FVector WorldTunnelPosition(WorldX, WorldY, WorldZ);
         CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
             WarpedX, WarpedY, WarpedZ,
             SDFCache, Params.SDFBlendRadius,
             &NearestRoomIdx,
-            bUseSpatialIndex
+            bUseSpatialIndex,
+            &WorldTunnelPosition
         );
 
         // ── PIT & CHIMNEY SDF INTEGRATION ──
@@ -4640,12 +4506,14 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             //
             // We use the cached SDF so this costs two extra SDF evaluations per voxel,
             // only when near a surface — the common case is cheap (DistFromSurface > TerraceRange).
+            const FVector WorldTunnelPositionZp1(WorldX, WorldY, WorldZ + 1.0f);
+            const FVector WorldTunnelPositionZm1(WorldX, WorldY, WorldZ - 1.0f);
             float SDF_Zp1 = VoxelCaveMorphology::EvaluateSDFCached(
                 WorldX, WorldY, WorldZ + 1.0f, SDFCache, Params.SDFBlendRadius,
-                nullptr, bUseSpatialIndex);
+                nullptr, bUseSpatialIndex, &WorldTunnelPositionZp1);
             float SDF_Zm1 = VoxelCaveMorphology::EvaluateSDFCached(
                 WorldX, WorldY, WorldZ - 1.0f, SDFCache, Params.SDFBlendRadius,
-                nullptr, bUseSpatialIndex);
+                nullptr, bUseSpatialIndex, &WorldTunnelPositionZm1);
             float GZ = (SDF_Zp1 - SDF_Zm1) * 0.5f;
             // Normalized vertical component: 1 = perfectly horizontal surface (floor/ceiling)
             //                               0 = perfectly vertical surface (wall)
@@ -5208,41 +5076,19 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 
     if (bApplyLegacyStructuralPosts)
     {
-        // Terrain operations and passage support floors are allowed to write solid density, but
-        // the graph's own tunnel floor/core are structural route geometry. Direct callers of
-        // GetDensityWithParams retain this historical tail; GetDensityAt skips it and applies the
-        // same predicates once in its common MC-space post section below both generation paths.
+        // Direct callers retain the legacy structural tail.  The tunnel core itself is still
+        // composed here as a continuous field; it is not converted into a fixed-density slab.
         const bool bTunnelCoreEnabled = !VoxelDensityAblation::IsTunnelCoreOff();
-        const bool bTunnelSupportFloor = bTunnelCoreEnabled
-            && VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-                WorldX, WorldY, WorldZ, SDFCache, bUseSpatialIndex);
-        // Keep the direct legacy entry point capability-safe for callers outside the canonical
-        // operator-stack path; its support band follows the same relieved swept floor.
-        if (bTunnelSupportFloor)
-        {
-            const float StructuralSolidDensity =
-                FMath::Max(Params.BaseDensity * 2.0f, 1.0f);
-            if (VoxelDensityProfile::AreCountersEnabled())
-            {
-                if (Density < 0.0f)
-                {
-                    VoxelDensityProfile::AddCounter(
-                        VoxelDensityProfile::ECounter::TunnelSupportFloorBackstopFires);
-                }
-            }
-            Density = FMath::Max(Density, StructuralSolidDensity);
-        }
         const float TunnelCoreSDF = bTunnelCoreEnabled
             && (Params.RoomDensity > 0.0f && Params.RoomSpacing > 0.0f)
             ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
                 WorldX, WorldY, WorldZ, SDFCache, bUseSpatialIndex)
             : FLT_MAX;
-        if (!bTunnelSupportFloor
-            && TunnelCoreSDF < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels)
+        if (VoxelMath::IsFinite(TunnelCoreSDF) && TunnelCoreSDF < 0.0f)
         {
             Density = FMath::Min(
                 Density,
-                -FMath::Max(Params.BaseDensity * 2.0f, 1.0f));
+                TunnelCoreSDF);
         }
         ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
             Params.StrateTopWorldZ, Params.StrateBottomWorldZ,

@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 
 namespace
 {
@@ -378,6 +379,7 @@ struct FExploreArguments
     FVector DensitySliceDirection = FVector::ForwardVector;
     int32 DensitySliceSamples = 257;
     float DensitySliceStep = 0.5f;
+    bool bTunnelCoreProbe = false;
 
     bool IsDensityProfilingEnabled() const
     {
@@ -391,6 +393,7 @@ struct FExploreArguments
         if (bWalk) Result += TEXT("walk,");
         if (bExport) Result += TEXT("export,");
         if (bOpBounds) Result += TEXT("opbounds,");
+        if (bTunnelCoreProbe) Result += TEXT("tunnelcoreprobe,");
         if (Result.EndsWith(TEXT(",")))
         {
             Result.LeftChopInline(1);
@@ -453,6 +456,7 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     }
     OutArguments.bProfileLod = FParse::Param(*Params, TEXT("profilelod"));
     OutArguments.bOpBounds = FParse::Param(*Params, TEXT("opbounds"));
+    OutArguments.bTunnelCoreProbe = FParse::Param(*Params, TEXT("tunnelcoreprobe"));
     FParse::Value(*Params, TEXT("out="), OutText);
     FParse::Value(*Params, TEXT("renderwidth="), OutArguments.RenderWidth);
     FParse::Value(*Params, TEXT("renderheight="), OutArguments.RenderHeight);
@@ -652,6 +656,10 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         {
             OutArguments.bOpBounds = true;
         }
+        else if (Mode == TEXT("tunnelcoreprobe"))
+        {
+            OutArguments.bTunnelCoreProbe = true;
+        }
         else if (Mode == TEXT("render"))
         {
             OutArguments.bRender = true;
@@ -667,12 +675,12 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         else
         {
             OutError = FString::Printf(
-                TEXT("Unknown mode '%s'. Expected render, walk, export, opbounds, or all."), *Mode);
+                TEXT("Unknown mode '%s'. Expected render, walk, export, opbounds, tunnelcoreprobe, or all."), *Mode);
             return false;
         }
     }
     if (!OutArguments.bRender && !OutArguments.bWalk && !OutArguments.bExport
-        && !OutArguments.bOpBounds)
+        && !OutArguments.bOpBounds && !OutArguments.bTunnelCoreProbe)
     {
         OutError = TEXT("At least one mode must be selected.");
         return false;
@@ -1270,7 +1278,9 @@ struct FExploreWorld
             }
             if (Arguments.bTunnelFloorEnabledOverride)
             {
-                TunnelParams.bTunnelFloorEnabled = Arguments.TunnelFloorEnabled != 0;
+                // Retain the command-line spelling for old probes, but do not feed the removed
+                // floor switch into generation.  The serialized property has the same
+                // compatibility-only treatment in UVoxelStrateDefinition::PostLoad.
             }
             if (Arguments.bTunnelFloorTerracingOverride)
             {
@@ -1342,7 +1352,7 @@ struct FExploreWorld
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeExplore][OwnerAssets] strate=%s settings=%s slot=%d "
                  "seed=%d height_chunks=%d archetype=%s opstack=%d "
-                 "floor_enabled=%d floor_terracing=%d floor_step=%.9g max_ledge=%.9g "
+                 "floor_switch_ignored=1 floor_terracing=%d floor_step=%.9g max_ledge=%.9g "
                  "gentle_slope_degrees=%.9g gentle_gradient=%.9g route_cap=%.9g "
                  "wind_wave_cap=%d "
                  "ledge_preference=%d max_ledges=%d tunnel_warp=%.9g terrain_ops=%d terrace_step=%.9g "
@@ -1351,7 +1361,6 @@ struct FExploreWorld
             bUseAuthoredSettings ? *Arguments.SettingsReference : TEXT("synthetic"),
             Arguments.Slot, Settings->Seed, Target.Definition->StrateHeightInChunks,
             ArchetypeName(TargetArchetype), Target.Definition->bUseOperatorStack ? 1 : 0,
-            ReportParams.bTunnelFloorEnabled ? 1 : 0,
             ReportParams.bTunnelFloorTerracingEnabled ? 1 : 0,
             ReportParams.TunnelFloorTerraceStepHeight,
             ReportParams.TunnelFloorMaxLedgeHeight,
@@ -1576,6 +1585,58 @@ struct FExploreDensitySliceOutput
     double Seconds = 0.0;
 };
 
+struct FExploreTunnelCoreProbeAxis
+{
+    FString Name;
+    int32 ValidCoreCrossings = 0;
+    int32 ValidFinalCrossings = 0;
+    float CoreMeanCrossingVoxels = 0.0f;
+    float FinalMeanCrossingVoxels = 0.0f;
+    float CoreMinCrossingVoxels = 0.0f;
+    float CoreMaxCrossingVoxels = 0.0f;
+    float FinalMinCrossingVoxels = 0.0f;
+    float FinalMaxCrossingVoxels = 0.0f;
+    float CorePeriodicAmplitudeVoxels = 0.0f;
+    float CorePeriodicPeriodVoxels = 0.0f;
+    float FinalPeriodicAmplitudeVoxels = 0.0f;
+    float FinalPeriodicPeriodVoxels = 0.0f;
+    int32 CorePeriodicMeasuredSamples = 0;
+    float CorePeriodicMeasuredLengthVoxels = 0.0f;
+    int32 FinalPeriodicMeasuredSamples = 0;
+    float FinalPeriodicMeasuredLengthVoxels = 0.0f;
+    TArray<float> CoreCrossingsVoxels;
+    TArray<float> FinalCrossingsVoxels;
+};
+
+struct FExploreTunnelCoreProbeOutput
+{
+    FString Status;
+    FString RefusalReason;
+    FString FileName;
+    int32 TunnelIndex = INDEX_NONE;
+    int32 SampleCount = 0;
+    int32 CoreCenterFiniteSampleCount = 0;
+    int32 CoreCenterZeroCrossingCount = 0;
+    int32 FinalCenterFiniteSampleCount = 0;
+    int32 FinalCenterZeroCrossingCount = 0;
+    int32 FinalCenterSaturatedSampleCount = 0;
+    float CoreCenterMin = 0.0f;
+    float CoreCenterMax = 0.0f;
+    float FinalCenterMin = 0.0f;
+    float FinalCenterMax = 0.0f;
+    float FinalCenterMaxAbs = 0.0f;
+    float StepVoxels = 0.25f;
+    float LengthVoxels = 0.0f;
+    FVector AxisStart = FVector::ZeroVector;
+    FVector AxisEnd = FVector::ZeroVector;
+    FVector AxisDirection = FVector::ForwardVector;
+    FVector WallDirection = FVector::RightVector;
+    FExploreTunnelCoreProbeAxis Floor;
+    FExploreTunnelCoreProbeAxis Wall;
+    FExploreTunnelCoreProbeAxis Ceiling;
+    double Seconds = 0.0;
+};
+
 struct FExploreProfilerComparison
 {
     bool bAvailable = false;
@@ -1597,6 +1658,7 @@ struct FExploreRunOutput
     FExploreWalkOutput Walk;
     FExploreExportOutput Export;
     FExploreDensitySliceOutput DensitySlice;
+    FExploreTunnelCoreProbeOutput TunnelCoreProbe;
     double BudgetSeconds = 0.0;
     double ElapsedSeconds = 0.0;
     double WalkSeconds = 0.0;
@@ -4376,11 +4438,12 @@ void WriteTunnelFloorOverrides(
     const FExploreArguments& Arguments)
 {
     Writer.WriteObjectStart(TEXT("tunnel_floor_overrides"));
-    Writer.WriteValue(TEXT("enabled_override"), Arguments.bTunnelFloorEnabledOverride);
+    Writer.WriteValue(TEXT("legacy_enabled_override"), Arguments.bTunnelFloorEnabledOverride);
     if (Arguments.bTunnelFloorEnabledOverride)
     {
-        Writer.WriteValue(TEXT("enabled"), Arguments.TunnelFloorEnabled != 0);
+        Writer.WriteValue(TEXT("legacy_enabled_value"), Arguments.TunnelFloorEnabled != 0);
     }
+    Writer.WriteValue(TEXT("enabled_ignored"), true);
     Writer.WriteValue(TEXT("terracing_override"), Arguments.bTunnelFloorTerracingOverride);
     if (Arguments.bTunnelFloorTerracingOverride)
     {
@@ -4796,6 +4859,865 @@ bool RunDensitySlice(
     return true;
 }
 
+void ComputeTunnelCoreProbeMetrics(
+    const TArray<float>& Samples,
+    float StepVoxels,
+    int32& OutValidCount,
+    float& OutMean,
+    float& OutMin,
+    float& OutMax,
+    float& OutPeriodicAmplitudeVoxels,
+    float& OutPeriodicPeriodVoxels,
+    int32& OutPeriodicMeasuredSamples,
+    float& OutPeriodicMeasuredLengthVoxels)
+{
+    OutValidCount = 0;
+    OutMean = 0.0f;
+    OutMin = 0.0f;
+    OutMax = 0.0f;
+    OutPeriodicAmplitudeVoxels = 0.0f;
+    OutPeriodicPeriodVoxels = 0.0f;
+    OutPeriodicMeasuredSamples = 0;
+    OutPeriodicMeasuredLengthVoxels = 0.0f;
+    if (Samples.Num() < 4 || !FMath::IsFinite(StepVoxels) || StepVoxels <= 0.0f)
+    {
+        return;
+    }
+
+    double Sum = 0.0;
+    for (int32 Index = 0; Index < Samples.Num(); ++Index)
+    {
+        const float Value = Samples[Index];
+        if (!FMath::IsFinite(Value))
+        {
+            continue;
+        }
+        ++OutValidCount;
+        Sum += Value;
+        if (OutValidCount == 1)
+        {
+            OutMin = Value;
+            OutMax = Value;
+        }
+        else
+        {
+            OutMin = FMath::Min(OutMin, Value);
+            OutMax = FMath::Max(OutMax, Value);
+        }
+    }
+    if (OutValidCount < 4)
+    {
+        return;
+    }
+
+    const double Count = static_cast<double>(OutValidCount);
+    OutMean = static_cast<float>(Sum / Count);
+
+    // Find the longest contiguous surface run. A missing radial crossing is not a zero-valued
+    // sample: it is a hole in the measurement and must not be bridged before the spectral pass.
+    int32 BestRunStart = INDEX_NONE;
+    int32 BestRunEnd = INDEX_NONE;
+    int32 RunStart = INDEX_NONE;
+    for (int32 Index = 0; Index <= Samples.Num(); ++Index)
+    {
+        const bool bFinite = Index < Samples.Num() && FMath::IsFinite(Samples[Index]);
+        if (bFinite)
+        {
+            if (RunStart == INDEX_NONE)
+            {
+                RunStart = Index;
+            }
+            continue;
+        }
+        if (RunStart != INDEX_NONE
+            && (BestRunStart == INDEX_NONE
+                || Index - RunStart > BestRunEnd - BestRunStart + 1))
+        {
+            BestRunStart = RunStart;
+            BestRunEnd = Index - 1;
+        }
+        RunStart = INDEX_NONE;
+    }
+    const int32 BestRunLength = BestRunStart != INDEX_NONE
+        ? BestRunEnd - BestRunStart + 1
+        : 0;
+    // The requested acceptance window is at least 40 voxels. Keep the raw crossing statistics
+    // above for shorter runs, but explicitly mark their periodic result as unmeasured.
+    constexpr float RequiredLengthVoxels = 40.0f;
+    const int32 RequiredSampleCount = FMath::CeilToInt(RequiredLengthVoxels / StepVoxels) + 1;
+    if (BestRunLength < FMath::Max(4, RequiredSampleCount))
+    {
+        return;
+    }
+
+    // Remove only the slow authored floor/radius trend. A 32-voxel median window is wider than
+    // the 1..16 voxel rib band, so a genuine rib train survives while a single mouth transition
+    // or route slope follows the local baseline. Discarding the half-window at each edge keeps
+    // the asymmetric endpoint windows out of the spectral result.
+    constexpr float TrendWindowVoxels = 32.0f;
+    const int32 HalfWindowSamples = FMath::Max(
+        1, FMath::RoundToInt(0.5f * TrendWindowVoxels / StepVoxels));
+    const int32 AnalysisStart = BestRunStart + HalfWindowSamples;
+    const int32 AnalysisEnd = BestRunEnd - HalfWindowSamples;
+    const int32 AnalysisCount = AnalysisEnd - AnalysisStart + 1;
+    if (AnalysisCount < 4)
+    {
+        return;
+    }
+
+    OutPeriodicMeasuredSamples = AnalysisCount;
+    OutPeriodicMeasuredLengthVoxels = static_cast<float>(AnalysisCount - 1) * StepVoxels;
+
+    constexpr float MaxRibPeriodVoxels = 16.0f;
+    const int32 MinRibFrequency = FMath::Max(
+        1, FMath::CeilToInt(StepVoxels * static_cast<float>(AnalysisCount)
+            / MaxRibPeriodVoxels));
+    const int32 MaxFrequency = AnalysisCount / 2;
+    double BestAmplitude = 0.0;
+    int32 BestFrequency = 0;
+    for (int32 Frequency = MinRibFrequency; Frequency <= MaxFrequency; ++Frequency)
+    {
+        double Real = 0.0;
+        double Imaginary = 0.0;
+        for (int32 Index = AnalysisStart; Index <= AnalysisEnd; ++Index)
+        {
+            TArray<float, TInlineAllocator<129>> Window;
+            const int32 WindowStart = FMath::Max(BestRunStart, Index - HalfWindowSamples);
+            const int32 WindowEnd = FMath::Min(BestRunEnd, Index + HalfWindowSamples);
+            Window.Reserve(WindowEnd - WindowStart + 1);
+            for (int32 WindowIndex = WindowStart; WindowIndex <= WindowEnd; ++WindowIndex)
+            {
+                Window.Add(Samples[WindowIndex]);
+            }
+            Window.Sort();
+            const int32 Middle = Window.Num() / 2;
+            const double Median = (Window.Num() & 1) != 0
+                ? static_cast<double>(Window[Middle])
+                : 0.5 * (static_cast<double>(Window[Middle - 1])
+                    + static_cast<double>(Window[Middle]));
+            const double Residual = static_cast<double>(Samples[Index]) - Median;
+            const int32 AnalysisIndex = Index - AnalysisStart;
+            const double Angle = 2.0 * PI * static_cast<double>(Frequency)
+                * static_cast<double>(AnalysisIndex) / static_cast<double>(AnalysisCount);
+            Real += Residual * FMath::Cos(static_cast<float>(Angle));
+            Imaginary -= Residual * FMath::Sin(static_cast<float>(Angle));
+        }
+        const double Amplitude = 2.0 * FMath::Sqrt(Real * Real + Imaginary * Imaginary)
+            / static_cast<double>(AnalysisCount);
+        if (Amplitude > BestAmplitude)
+        {
+            BestAmplitude = Amplitude;
+            BestFrequency = Frequency;
+        }
+    }
+    OutPeriodicAmplitudeVoxels = static_cast<float>(BestAmplitude);
+    OutPeriodicPeriodVoxels = BestFrequency > 0
+        ? StepVoxels * static_cast<float>(AnalysisCount)
+            / static_cast<float>(BestFrequency)
+        : 0.0f;
+}
+
+bool RunTunnelCoreProbe(
+    const FExploreArguments& Arguments,
+    FExploreWorld& World,
+    FExploreTunnelCoreProbeOutput& OutOutput,
+    FExploreBudget& Budget)
+{
+    OutOutput = FExploreTunnelCoreProbeOutput();
+    OutOutput.FileName = TEXT("tunnel_core_probe.csv");
+    OutOutput.StepVoxels = 0.25f;
+    const double StartSeconds = FPlatformTime::Seconds();
+
+    if (!World.Manager.IsValid() || !World.Generator.IsValid()
+        || !World.Settings.IsValid()
+        || !World.Definitions.IsValidIndex(Arguments.Slot))
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = TEXT("The owner-value probe has no complete transient world.");
+        return false;
+    }
+
+    const int32 TargetBottomChunkZ = FMath::FloorToInt(
+        static_cast<float>(World.TargetBottomWorldZ) / static_cast<float>(CHUNK_SIZE));
+    const int32 TargetTopChunkZ = FMath::FloorToInt(
+        (static_cast<float>(World.TargetTopWorldZ) - KINDA_SMALL_NUMBER)
+            / static_cast<float>(CHUNK_SIZE));
+    const float TargetMinZ = static_cast<float>(World.TargetBottomWorldZ);
+    const float TargetMaxZ = static_cast<float>(World.TargetTopWorldZ);
+    constexpr float TargetBandPadding = 8.0f;
+    constexpr float RouteParameterCheckStep = 4.0f;
+
+    // The owner path asks GetGenerationParams for the exact (x,y,z) chunk of every sample. A
+    // cache built from an arbitrary interior Z can therefore be a different graph in a boundary
+    // blend band; that was the source of the earlier probe's FLT_MAX/core-only result. Build the
+    // small set of candidate graphs used by the target Z chunks, and retain only a complete chain
+    // whose route and radial measurement band resolve to the same parameter fingerprint that was
+    // used to bake the graph. The field measured below is then the same field the game queries.
+    auto GenerationParamsFingerprint = [](const FStrateGenerationParams& InParams) -> uint32
+    {
+        return FCrc::MemCrc32(&InParams, sizeof(InParams));
+    };
+
+    FChunkSDFCache Cache;
+    FStrateGenerationParams Params;
+    int32 StrateIndex = INDEX_NONE;
+    int32 QueryChunkZ = INDEX_NONE;
+    const FCachedTunnel* BestTunnel = nullptr;
+    float BestLength = 0.0f;
+    int32 BestTunnelIndex = INDEX_NONE;
+    bool bBestTunnelFullyInTargetStrate = false;
+    int32 BestTargetBandPointCount = 0;
+    uint32 BestParamsFingerprint = 0xFFFFFFFFu;
+    const uint32 WorldSeed = static_cast<uint32>(World.Settings->Seed);
+
+    for (int32 CandidateChunkZ = TargetBottomChunkZ;
+         CandidateChunkZ <= TargetTopChunkZ;
+         ++CandidateChunkZ)
+    {
+        if (Budget.ShouldStop(TEXT("tunnel-core-probe-cache")))
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.RefusalReason = TEXT("The wall-clock budget stopped candidate cache construction.");
+            OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+            return false;
+        }
+
+        const FIntVector CandidateChunk(0, 0, CandidateChunkZ);
+        const FStrateGenerationParams CandidateParams =
+            World.Manager->GetGenerationParams(CandidateChunk);
+        const int32 CandidateStrateIndex = World.Manager->GetStrateIndex(
+            (static_cast<float>(CandidateChunk.Z) + 0.5f)
+                * static_cast<float>(CHUNK_SIZE) * VOXEL_SIZE);
+        if (CandidateStrateIndex < 0
+            || !(CandidateParams.RoomDensity > 0.0f)
+            || !(CandidateParams.RoomSpacing > 0.0f))
+        {
+            continue;
+        }
+
+        const UVoxelStrateDefinition* CandidateDefinition =
+            World.Manager->GetStrateForChunk(CandidateChunk);
+        const TArray<FStrateTerrainOpEntry>* CandidateTerrainOps = CandidateDefinition != nullptr
+            ? &CandidateDefinition->TerrainOperations : nullptr;
+        const uint32 CandidateFingerprint = GenerationParamsFingerprint(CandidateParams);
+
+        // The owner render region is centred near the origin. Keep each candidate cache broad
+        // enough for the local graph, exactly like the ordinary point-query cache window.
+        FChunkSDFCache CandidateCache;
+        VoxelCaveMorphology::BuildChunkCache(
+            CandidateCache, -256.0f, -256.0f, 256.0f, 256.0f,
+            CandidateParams, WorldSeed, CandidateStrateIndex,
+            CandidateTerrainOps, ERoomGraphBuildSite::GeneratorTunnelCore);
+
+        int32 CandidateBestTunnelIndex = INDEX_NONE;
+        float CandidateBestLength = 0.0f;
+        int32 CandidateBestTargetSampleCount = 0;
+        for (int32 TunnelIndex = 0; TunnelIndex < CandidateCache.Tunnels.Num(); ++TunnelIndex)
+        {
+            const FCachedTunnel& Tunnel = CandidateCache.Tunnels[TunnelIndex];
+            const TArray<FVector>& Points = Tunnel.WorldControlPoints.Num() >= 2
+                && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num()
+                ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
+            const TArray<float>& Radii = Tunnel.WorldControlRadii.Num() == Points.Num()
+                ? Tunnel.WorldControlRadii : Tunnel.ControlRadii;
+            if (Points.Num() < 2 || Radii.Num() != Points.Num())
+            {
+                continue;
+            }
+
+            TArray<float> CandidateCumulativeLengths;
+            CandidateCumulativeLengths.SetNumZeroed(Points.Num());
+            bool bFinite = true;
+            float Length = 0.0f;
+            float MaxRadius = 0.0f;
+            for (int32 PointIndex = 0; PointIndex + 1 < Points.Num(); ++PointIndex)
+            {
+                const float SegmentLength = FVector::Dist(
+                    Points[PointIndex], Points[PointIndex + 1]);
+                if (!FMath::IsFinite(SegmentLength))
+                {
+                    bFinite = false;
+                    break;
+                }
+                Length += SegmentLength;
+                CandidateCumulativeLengths[PointIndex + 1] = Length;
+                MaxRadius = FMath::Max(MaxRadius, FMath::Abs(Radii[PointIndex]));
+            }
+            if (Points.Num() > 0)
+            {
+                MaxRadius = FMath::Max(MaxRadius, FMath::Abs(Radii.Last()));
+            }
+            if (!bFinite || Length < 40.0f)
+            {
+                continue;
+            }
+
+            auto PointAtCandidateDistance = [&](float Distance) -> FVector
+            {
+                const float ClampedDistance = FMath::Clamp(Distance, 0.0f, Length);
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex + 1 < Points.Num();
+                     ++SegmentIndex)
+                {
+                    if (ClampedDistance <= CandidateCumulativeLengths[SegmentIndex + 1]
+                        || SegmentIndex + 2 == Points.Num())
+                    {
+                        const float SegmentLength = CandidateCumulativeLengths[SegmentIndex + 1]
+                            - CandidateCumulativeLengths[SegmentIndex];
+                        const float Alpha = SegmentLength > KINDA_SMALL_NUMBER
+                            ? (ClampedDistance - CandidateCumulativeLengths[SegmentIndex])
+                                / SegmentLength : 0.0f;
+                        return FMath::Lerp(Points[SegmentIndex], Points[SegmentIndex + 1], Alpha);
+                    }
+                }
+                return Points.Last();
+            };
+
+            const float RadialParameterReach = FMath::Clamp(
+                MaxRadius + 12.0f, 12.0f, 64.0f);
+            bool bHasTargetSample = false;
+            bool bRouteMatchesParams = true;
+            int32 TargetSampleCount = 0;
+            const int32 ParameterSampleCount = FMath::CeilToInt(
+                Length / RouteParameterCheckStep);
+            for (int32 SampleIndex = 0;
+                 SampleIndex <= ParameterSampleCount;
+                 ++SampleIndex)
+            {
+                const float Distance = FMath::Min(
+                    Length, static_cast<float>(SampleIndex) * RouteParameterCheckStep);
+                const FVector Point = PointAtCandidateDistance(Distance);
+                const bool bInTargetBand = Point.Z >= TargetMinZ - TargetBandPadding
+                    && Point.Z <= TargetMaxZ + TargetBandPadding;
+                bHasTargetSample |= bInTargetBand;
+                TargetSampleCount += bInTargetBand ? 1 : 0;
+                if (!bInTargetBand)
+                {
+                    bRouteMatchesParams = false;
+                    break;
+                }
+
+                const FIntVector PointChunk(
+                    FMath::FloorToInt(Point.X / static_cast<float>(CHUNK_SIZE)),
+                    FMath::FloorToInt(Point.Y / static_cast<float>(CHUNK_SIZE)),
+                    FMath::FloorToInt(Point.Z / static_cast<float>(CHUNK_SIZE)));
+                if (GenerationParamsFingerprint(
+                        World.Manager->GetGenerationParams(PointChunk)) != CandidateFingerprint)
+                {
+                    bRouteMatchesParams = false;
+                    break;
+                }
+
+                // The floor, wall and ceiling roots are measured around this same centerline.
+                // Reject a route whose radial band crosses into a different parameter blend; a
+                // single cache cannot represent that discontinuous query context.
+                for (float RadialOffset = -RadialParameterReach;
+                     RadialOffset <= RadialParameterReach + KINDA_SMALL_NUMBER;
+                     RadialOffset += 8.0f)
+                {
+                    const FVector RadialPoint = Point + FVector(0.0f, 0.0f, RadialOffset);
+                    const FIntVector RadialChunk(
+                        FMath::FloorToInt(RadialPoint.X / static_cast<float>(CHUNK_SIZE)),
+                        FMath::FloorToInt(RadialPoint.Y / static_cast<float>(CHUNK_SIZE)),
+                        FMath::FloorToInt(RadialPoint.Z / static_cast<float>(CHUNK_SIZE)));
+                    if (GenerationParamsFingerprint(
+                            World.Manager->GetGenerationParams(RadialChunk))
+                        != CandidateFingerprint)
+                    {
+                        bRouteMatchesParams = false;
+                        break;
+                    }
+                }
+                if (!bRouteMatchesParams)
+                {
+                    break;
+                }
+            }
+
+            if (bHasTargetSample && bRouteMatchesParams
+                && (TargetSampleCount > CandidateBestTargetSampleCount
+                    || (TargetSampleCount == CandidateBestTargetSampleCount
+                        && Length > CandidateBestLength)))
+            {
+                CandidateBestTunnelIndex = TunnelIndex;
+                CandidateBestLength = Length;
+                CandidateBestTargetSampleCount = TargetSampleCount;
+            }
+        }
+
+        if (CandidateBestTunnelIndex != INDEX_NONE
+            && CandidateBestLength > BestLength)
+        {
+            Cache = MoveTemp(CandidateCache);
+            Params = CandidateParams;
+            StrateIndex = CandidateStrateIndex;
+            QueryChunkZ = CandidateChunkZ;
+            BestLength = CandidateBestLength;
+            BestTunnelIndex = CandidateBestTunnelIndex;
+            BestTargetBandPointCount = CandidateBestTargetSampleCount;
+            bBestTunnelFullyInTargetStrate = true;
+            BestParamsFingerprint = CandidateFingerprint;
+        }
+    }
+
+    BestTunnel = Cache.Tunnels.IsValidIndex(BestTunnelIndex)
+        ? &Cache.Tunnels[BestTunnelIndex] : nullptr;
+    if (BestTunnel == nullptr || BestLength < 40.0f)
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = FString::Printf(
+            TEXT("No cached owner tunnel had a 40-voxel span with stable game params "
+                 "and a stable radial band (best=%.3f)."), BestLength);
+        OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+        return false;
+    }
+
+    const TArray<FVector>& Points = BestTunnel->WorldControlPoints.Num() >= 2
+        && BestTunnel->WorldControlRadii.Num() == BestTunnel->WorldControlPoints.Num()
+        ? BestTunnel->WorldControlPoints : BestTunnel->ControlPoints;
+    TArray<float> CumulativeLengths;
+    CumulativeLengths.SetNumZeroed(Points.Num());
+    for (int32 PointIndex = 0; PointIndex + 1 < Points.Num(); ++PointIndex)
+    {
+        CumulativeLengths[PointIndex + 1] = CumulativeLengths[PointIndex]
+            + FVector::Dist(Points[PointIndex], Points[PointIndex + 1]);
+    }
+
+    const float ProbeStep = OutOutput.StepVoxels;
+    const int32 MaxProbeSamples = 4097;
+    float ProbeStart = 0.0f;
+    float ProbeLength = FMath::Min(
+        BestLength, static_cast<float>(MaxProbeSamples - 1) * ProbeStep);
+
+    auto PointAtDistance = [&](float Distance) -> FVector
+    {
+        const float ClampedDistance = FMath::Clamp(Distance, 0.0f, BestLength);
+        for (int32 SegmentIndex = 0; SegmentIndex + 1 < Points.Num(); ++SegmentIndex)
+        {
+            if (ClampedDistance <= CumulativeLengths[SegmentIndex + 1]
+                || SegmentIndex + 2 == Points.Num())
+            {
+                const float SegmentLength = CumulativeLengths[SegmentIndex + 1]
+                    - CumulativeLengths[SegmentIndex];
+                const float Alpha = SegmentLength > KINDA_SMALL_NUMBER
+                    ? (ClampedDistance - CumulativeLengths[SegmentIndex]) / SegmentLength : 0.0f;
+                return FMath::Lerp(Points[SegmentIndex], Points[SegmentIndex + 1], Alpha);
+            }
+        }
+        return Points.Last();
+    };
+
+    // Keep a long, endpoint-inset window on the selected tunnel chain. The DFT is intended to
+    // expose a repeated radial surface displacement, so using the entire wandering chain would
+    // mix mouth overlap and changes in the local frame into that signal. The center window stays
+    // on the same owner-parameter band already validated above and is at least 40 voxels long.
+    const float MaximumWindowLength = static_cast<float>(MaxProbeSamples - 1) * ProbeStep;
+    if (BestLength >= 56.0f)
+    {
+        ProbeLength = FMath::Min(96.0f, FMath::Min(BestLength - 16.0f, MaximumWindowLength));
+        if (ProbeLength >= 40.0f)
+        {
+            ProbeStart = FMath::Clamp(
+                (BestLength - ProbeLength) * 0.5f, 8.0f, BestLength - ProbeLength - 8.0f);
+        }
+    }
+    if (ProbeStart + ProbeLength > BestLength)
+    {
+        ProbeStart = 0.0f;
+        ProbeLength = FMath::Min(BestLength, MaximumWindowLength);
+    }
+    const int32 SampleCount = FMath::FloorToInt(ProbeLength / ProbeStep) + 1;
+    ProbeLength = static_cast<float>(SampleCount - 1) * ProbeStep;
+    OutOutput.TunnelIndex = BestTunnelIndex;
+    OutOutput.SampleCount = SampleCount;
+    OutOutput.LengthVoxels = ProbeLength;
+
+    FVector AxisDirection = PointAtDistance(ProbeStart + ProbeLength)
+        - PointAtDistance(ProbeStart);
+    AxisDirection.Z = 0.0f;
+    if (!AxisDirection.Normalize())
+    {
+        float LongestSegment = 0.0f;
+        for (int32 SegmentIndex = 0; SegmentIndex + 1 < Points.Num(); ++SegmentIndex)
+        {
+            FVector Candidate = Points[SegmentIndex + 1] - Points[SegmentIndex];
+            Candidate.Z = 0.0f;
+            const float SegmentLength = Candidate.Size();
+            if (SegmentLength > LongestSegment)
+            {
+                LongestSegment = SegmentLength;
+                AxisDirection = Candidate / SegmentLength;
+            }
+        }
+    }
+    if (!AxisDirection.Normalize())
+    {
+        AxisDirection = FVector::ForwardVector;
+    }
+    const FVector WallDirection(-AxisDirection.Y, AxisDirection.X, 0.0f);
+    OutOutput.AxisStart = PointAtDistance(ProbeStart);
+    OutOutput.AxisEnd = PointAtDistance(ProbeStart + ProbeLength);
+    OutOutput.AxisDirection = AxisDirection;
+    OutOutput.WallDirection = WallDirection;
+
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTunnelCoreProbe] cache_tunnels=%d strate_index=%d "
+             "query_chunk_z=%d target_z=[%.3f,%.3f] params_z=[%.3f,%.3f] selected=%d "
+             "params_fp=0x%08X window_start=%.3f window_length=%.3f "
+             "selected_fully_in_target=%d target_points=%d"),
+        Cache.Tunnels.Num(), StrateIndex, QueryChunkZ, TargetMinZ, TargetMaxZ,
+        Params.StrateBottomWorldZ, Params.StrateTopWorldZ, BestTunnelIndex,
+        BestParamsFingerprint, ProbeStart, ProbeLength,
+        bBestTunnelFullyInTargetStrate ? 1 : 0, BestTargetBandPointCount);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTunnelCoreProbe] selected_endpoints a=(%.3f,%.3f,%.3f) "
+             "b=(%.3f,%.3f,%.3f) world_min=(%.3f,%.3f,%.3f) "
+             "world_max=(%.3f,%.3f,%.3f) world_radius=%.3f"),
+        BestTunnel->EndpointA.X, BestTunnel->EndpointA.Y, BestTunnel->EndpointA.Z,
+        BestTunnel->EndpointB.X, BestTunnel->EndpointB.Y, BestTunnel->EndpointB.Z,
+        BestTunnel->WorldCenterlineMin.X, BestTunnel->WorldCenterlineMin.Y,
+        BestTunnel->WorldCenterlineMin.Z, BestTunnel->WorldCenterlineMax.X,
+        BestTunnel->WorldCenterlineMax.Y, BestTunnel->WorldCenterlineMax.Z,
+        FMath::Sqrt(FMath::Max(BestTunnel->WorldBoundRadiusSq, 0.0f)));
+
+    float MaxRadius = 0.0f;
+    const TArray<float>& Radii = BestTunnel->WorldControlRadii.Num() == Points.Num()
+        ? BestTunnel->WorldControlRadii : BestTunnel->ControlRadii;
+    for (const float Radius : Radii)
+    {
+        MaxRadius = FMath::Max(MaxRadius, FMath::Abs(Radius));
+    }
+    const float MaxRadialDistance = FMath::Clamp(MaxRadius + 12.0f, 12.0f, 64.0f);
+
+    auto FindZeroCrossing = [&](const FVector& Origin, const FVector& Direction,
+                                bool bCoreSDF, float& OutDistance) -> bool
+    {
+        auto Evaluate = [&](float Distance) -> float
+        {
+            const FVector Position = Origin + Direction * Distance;
+            return bCoreSDF
+                ? VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+                    Position.X, Position.Y, Position.Z, Cache, true)
+                : World.Generator->GetDensityAt(Position.X, Position.Y, Position.Z);
+        };
+        float PreviousDistance = 0.0f;
+        float PreviousValue = Evaluate(0.0f);
+        bool bHavePrevious = FMath::IsFinite(PreviousValue);
+        if (bHavePrevious && FMath::Abs(PreviousValue) <= 1.0e-4f)
+        {
+            OutDistance = 0.0f;
+            return true;
+        }
+        const int32 RadialSteps = FMath::CeilToInt(MaxRadialDistance / ProbeStep);
+        for (int32 StepIndex = 1; StepIndex <= RadialSteps; ++StepIndex)
+        {
+            const float CurrentDistance = FMath::Min(
+                MaxRadialDistance, static_cast<float>(StepIndex) * ProbeStep);
+            const float CurrentValue = Evaluate(CurrentDistance);
+            if (!FMath::IsFinite(CurrentValue))
+            {
+                // A transient invalid query must split the finite run, not poison every
+                // subsequent sample.  The floor ray can cross a chunk/parameter seam where
+                // one exact fractional query is unavailable; later finite samples still form a
+                // valid zero-crossing interval and are deliberately allowed to restart it.
+                bHavePrevious = false;
+                continue;
+            }
+            if (!bHavePrevious)
+            {
+                PreviousDistance = CurrentDistance;
+                PreviousValue = CurrentValue;
+                bHavePrevious = true;
+                if (FMath::Abs(CurrentValue) <= 1.0e-4f)
+                {
+                    OutDistance = CurrentDistance;
+                    return true;
+                }
+                continue;
+            }
+            const bool bCrossed = (PreviousValue < 0.0f && CurrentValue >= 0.0f)
+                || (PreviousValue > 0.0f && CurrentValue <= 0.0f);
+            if (bCrossed)
+            {
+                float Low = PreviousDistance;
+                float High = CurrentDistance;
+                float LowValue = PreviousValue;
+                for (int32 Iteration = 0; Iteration < 24; ++Iteration)
+                {
+                    const float Mid = (Low + High) * 0.5f;
+                    const float MidValue = Evaluate(Mid);
+                    if (!FMath::IsFinite(MidValue))
+                    {
+                        break;
+                    }
+                    if (FMath::Abs(MidValue) <= 1.0e-5f)
+                    {
+                        Low = Mid;
+                        High = Mid;
+                        break;
+                    }
+                    if ((LowValue < 0.0f && MidValue < 0.0f)
+                        || (LowValue > 0.0f && MidValue > 0.0f))
+                    {
+                        Low = Mid;
+                        LowValue = MidValue;
+                    }
+                    else
+                    {
+                        High = Mid;
+                    }
+                }
+                OutDistance = (Low + High) * 0.5f;
+                return true;
+            }
+            PreviousDistance = CurrentDistance;
+            PreviousValue = CurrentValue;
+        }
+        return false;
+    };
+
+    OutOutput.Floor.Name = TEXT("floor");
+    OutOutput.Wall.Name = TEXT("wall");
+    OutOutput.Ceiling.Name = TEXT("ceiling");
+    OutOutput.Floor.CoreCrossingsVoxels.Reserve(SampleCount);
+    OutOutput.Floor.FinalCrossingsVoxels.Reserve(SampleCount);
+    OutOutput.Wall.CoreCrossingsVoxels.Reserve(SampleCount);
+    OutOutput.Wall.FinalCrossingsVoxels.Reserve(SampleCount);
+    OutOutput.Ceiling.CoreCrossingsVoxels.Reserve(SampleCount);
+    OutOutput.Ceiling.FinalCrossingsVoxels.Reserve(SampleCount);
+
+    FString Csv;
+    Csv.Reserve(SampleCount * 180);
+    Csv += TEXT("sample,axis_distance_voxels,center_x,center_y,center_z,core_center_sdf,final_center_density,"
+                "floor_core_zero,floor_final_zero,wall_core_zero,wall_final_zero,"
+                "ceiling_core_zero,ceiling_final_zero\r\n");
+    float PreviousCoreCenter = 0.0f;
+    float PreviousFinalCenter = 0.0f;
+    bool bHavePreviousCoreCenter = false;
+    bool bHavePreviousFinalCenter = false;
+    float MaxGeneratorCoreDelta = 0.0f;
+    int32 GeneratorCoreMismatchCount = 0;
+    const uint32 ProbeLayoutVersion = World.Manager->GetLayoutVersion();
+    for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+    {
+        if ((SampleIndex & 127) == 0 && Budget.ShouldStop(TEXT("tunnel-core-probe")))
+        {
+            OutOutput.Status = TEXT("truncated");
+            OutOutput.RefusalReason = TEXT("The wall-clock budget stopped the tunnel-core probe.");
+            OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+            return false;
+        }
+        const float AxisDistance = static_cast<float>(SampleIndex) * ProbeStep;
+        const FVector Center = PointAtDistance(ProbeStart + AxisDistance);
+        const float CoreCenter = VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+            Center.X, Center.Y, Center.Z, Cache, true);
+        const float FinalCenter = World.Generator->GetDensityAt(Center.X, Center.Y, Center.Z);
+        FTunnelCoreWorldEvaluation GeneratorCoreEvaluation;
+        World.Generator->GetDensityWithParams(
+            Center.X, Center.Y, Center.Z, Params, BestParamsFingerprint, ProbeLayoutVersion,
+            /*bApplyLegacyStructuralPosts=*/false, &GeneratorCoreEvaluation,
+            /*bCollectFusedDiagnostics=*/false);
+        if (FMath::IsFinite(CoreCenter) && FMath::IsFinite(GeneratorCoreEvaluation.SDF))
+        {
+            const float CoreDelta = FMath::Abs(CoreCenter - GeneratorCoreEvaluation.SDF);
+            MaxGeneratorCoreDelta = FMath::Max(MaxGeneratorCoreDelta, CoreDelta);
+            if (CoreDelta > 1.0e-3f)
+            {
+                ++GeneratorCoreMismatchCount;
+            }
+        }
+        if (SampleIndex == 0 || SampleIndex == SampleCount / 2 || SampleIndex + 1 == SampleCount)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTunnelCoreProbe] generator_core_compare sample=%d "
+                     "probe_sdf=%.6g generator_sdf=%.6g generator_mc=%.6g final_mc=%.6g"),
+                SampleIndex, CoreCenter, GeneratorCoreEvaluation.SDF,
+                -GeneratorCoreEvaluation.SDF, FinalCenter);
+        }
+        if (FMath::IsFinite(CoreCenter))
+        {
+            ++OutOutput.CoreCenterFiniteSampleCount;
+            OutOutput.CoreCenterMin = OutOutput.CoreCenterFiniteSampleCount == 1
+                ? CoreCenter : FMath::Min(OutOutput.CoreCenterMin, CoreCenter);
+            OutOutput.CoreCenterMax = OutOutput.CoreCenterFiniteSampleCount == 1
+                ? CoreCenter : FMath::Max(OutOutput.CoreCenterMax, CoreCenter);
+            if (bHavePreviousCoreCenter
+                && ((PreviousCoreCenter < 0.0f && CoreCenter > 0.0f)
+                    || (PreviousCoreCenter > 0.0f && CoreCenter < 0.0f)))
+            {
+                ++OutOutput.CoreCenterZeroCrossingCount;
+            }
+            PreviousCoreCenter = CoreCenter;
+            bHavePreviousCoreCenter = true;
+        }
+        if (FMath::IsFinite(FinalCenter))
+        {
+            ++OutOutput.FinalCenterFiniteSampleCount;
+            OutOutput.FinalCenterMin = OutOutput.FinalCenterFiniteSampleCount == 1
+                ? FinalCenter : FMath::Min(OutOutput.FinalCenterMin, FinalCenter);
+            OutOutput.FinalCenterMax = OutOutput.FinalCenterFiniteSampleCount == 1
+                ? FinalCenter : FMath::Max(OutOutput.FinalCenterMax, FinalCenter);
+            OutOutput.FinalCenterMaxAbs = FMath::Max(
+                OutOutput.FinalCenterMaxAbs, FMath::Abs(FinalCenter));
+            // The old hand-off wrote a fixed MC-air value (normally +16, with the reciprocal
+            // solid plateau at -8 in other definitions).  Do not call every ordinary SDF sample
+            // "saturated"; count only the known clamp plateaus so the probe distinguishes the
+            // old hard switch from the continuous signed field.
+            const bool bKnownClampPlateau =
+                FMath::Abs(FinalCenter - 8.0f) <= 1.0e-3f
+                || FMath::Abs(FinalCenter + 8.0f) <= 1.0e-3f
+                || FMath::Abs(FinalCenter - 16.0f) <= 1.0e-3f
+                || FMath::Abs(FinalCenter + 16.0f) <= 1.0e-3f;
+            if (bKnownClampPlateau)
+            {
+                ++OutOutput.FinalCenterSaturatedSampleCount;
+            }
+            if (bHavePreviousFinalCenter
+                && ((PreviousFinalCenter < 0.0f && FinalCenter > 0.0f)
+                    || (PreviousFinalCenter > 0.0f && FinalCenter < 0.0f)))
+            {
+                ++OutOutput.FinalCenterZeroCrossingCount;
+            }
+            PreviousFinalCenter = FinalCenter;
+            bHavePreviousFinalCenter = true;
+        }
+
+        const FVector RadialDirections[3] = {
+            FVector::DownVector, WallDirection, FVector::UpVector };
+        FExploreTunnelCoreProbeAxis* Axes[3] = {
+            &OutOutput.Floor, &OutOutput.Wall, &OutOutput.Ceiling };
+        float Roots[3][2];
+        for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+        {
+            Roots[AxisIndex][0] = std::numeric_limits<float>::quiet_NaN();
+            Roots[AxisIndex][1] = std::numeric_limits<float>::quiet_NaN();
+            FindZeroCrossing(Center, RadialDirections[AxisIndex], true, Roots[AxisIndex][0]);
+            FindZeroCrossing(Center, RadialDirections[AxisIndex], false, Roots[AxisIndex][1]);
+            Axes[AxisIndex]->CoreCrossingsVoxels.Add(Roots[AxisIndex][0]);
+            Axes[AxisIndex]->FinalCrossingsVoxels.Add(Roots[AxisIndex][1]);
+        }
+        if (SampleIndex == 50 || SampleIndex == 302)
+        {
+            const float DiagnosticDistances[] = { 0.0f, 4.0f, 8.0f, 10.0f, 11.0f,
+                12.0f, 13.0f, 16.0f, 20.0f, 24.0f, 28.0f, 32.0f };
+            for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+            {
+                FString Values;
+                for (const float Distance : DiagnosticDistances)
+                {
+                    const FVector Position = Center + RadialDirections[AxisIndex] * Distance;
+                    const float CoreValue = VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
+                        Position.X, Position.Y, Position.Z, Cache, true);
+                    FTunnelCoreWorldEvaluation GenericCoreEvaluation;
+                    const float GenericValue = World.Generator->GetDensityWithParams(
+                        Position.X, Position.Y, Position.Z, Params, BestParamsFingerprint,
+                        ProbeLayoutVersion, /*bApplyLegacyStructuralPosts=*/false,
+                        &GenericCoreEvaluation, /*bCollectFusedDiagnostics=*/false);
+                    const float FinalValue = World.Generator->GetDensityAt(
+                        Position.X, Position.Y, Position.Z);
+                    Values += FString::Printf(
+                        TEXT(" %.0f:(%.3g,%.3g,%.3g)"), Distance, CoreValue,
+                        GenericValue, FinalValue);
+                }
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeTunnelCoreProbe] radial_diagnostic sample=%d axis=%s "
+                         "distance:(core_sdf,generic_mc,final_mc)%s"),
+                    SampleIndex, *Axes[AxisIndex]->Name, *Values);
+            }
+        }
+        Csv += FString::Printf(
+            TEXT("%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\r\n"),
+            SampleIndex, AxisDistance, Center.X, Center.Y, Center.Z,
+            CoreCenter, FinalCenter,
+            Roots[0][0], Roots[0][1], Roots[1][0], Roots[1][1], Roots[2][0], Roots[2][1]);
+    }
+
+    FExploreTunnelCoreProbeAxis* Axes[3] = {
+        &OutOutput.Floor, &OutOutput.Wall, &OutOutput.Ceiling };
+    for (FExploreTunnelCoreProbeAxis* Axis : Axes)
+    {
+        ComputeTunnelCoreProbeMetrics(
+            Axis->CoreCrossingsVoxels, ProbeStep,
+            Axis->ValidCoreCrossings, Axis->CoreMeanCrossingVoxels,
+            Axis->CoreMinCrossingVoxels, Axis->CoreMaxCrossingVoxels,
+            Axis->CorePeriodicAmplitudeVoxels, Axis->CorePeriodicPeriodVoxels,
+            Axis->CorePeriodicMeasuredSamples, Axis->CorePeriodicMeasuredLengthVoxels);
+        ComputeTunnelCoreProbeMetrics(
+            Axis->FinalCrossingsVoxels, ProbeStep,
+            Axis->ValidFinalCrossings, Axis->FinalMeanCrossingVoxels,
+            Axis->FinalMinCrossingVoxels, Axis->FinalMaxCrossingVoxels,
+            Axis->FinalPeriodicAmplitudeVoxels, Axis->FinalPeriodicPeriodVoxels,
+            Axis->FinalPeriodicMeasuredSamples, Axis->FinalPeriodicMeasuredLengthVoxels);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeTunnelCoreProbe] axis=%s samples=%d final_valid=%d "
+                 "rib_periodic_amplitude=%.6g_voxels=%.6g_cm period=%.6g_voxels "
+                 "measured=%.6g_voxels/%d core_valid=%d core_rib_periodic_amplitude=%.6g_voxels=%.6g_cm period=%.6g_voxels "
+                 "measured=%.6g_voxels/%d"),
+            *Axis->Name, SampleCount, Axis->ValidFinalCrossings,
+            Axis->FinalPeriodicAmplitudeVoxels,
+            Axis->FinalPeriodicAmplitudeVoxels * 25.0f,
+            Axis->FinalPeriodicPeriodVoxels,
+            Axis->FinalPeriodicMeasuredLengthVoxels, Axis->FinalPeriodicMeasuredSamples,
+            Axis->ValidCoreCrossings, Axis->CorePeriodicAmplitudeVoxels,
+            Axis->CorePeriodicAmplitudeVoxels * 25.0f,
+            Axis->CorePeriodicPeriodVoxels,
+            Axis->CorePeriodicMeasuredLengthVoxels, Axis->CorePeriodicMeasuredSamples);
+    }
+
+    const FString Path = FPaths::Combine(Arguments.OutDirectory, OutOutput.FileName);
+    if (!FFileHelper::SaveStringToFile(
+            Csv, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        OutOutput.Status = TEXT("error");
+        OutOutput.RefusalReason = TEXT("Could not write tunnel_core_probe.csv.");
+        OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+        return false;
+    }
+    OutOutput.Status = TEXT("ok");
+    OutOutput.Seconds = FPlatformTime::Seconds() - StartSeconds;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTunnelCoreProbe] tunnel=%d samples=%d step=%.3f length=%.3f "
+             "final_center_finite=%d known_clamp_plateau=%d range=[%.6g,%.6g] "
+             "core_center_finite=%d range=[%.6g,%.6g] file=%s"),
+        OutOutput.TunnelIndex, OutOutput.SampleCount, OutOutput.StepVoxels,
+             OutOutput.LengthVoxels, OutOutput.FinalCenterFiniteSampleCount,
+             OutOutput.FinalCenterSaturatedSampleCount, OutOutput.FinalCenterMin,
+             OutOutput.FinalCenterMax, OutOutput.CoreCenterFiniteSampleCount,
+             OutOutput.CoreCenterMin, OutOutput.CoreCenterMax, *Path);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeTunnelCoreProbe] generator_core_compare_max_abs_delta=%.6g "
+             "mismatched_samples=%d tolerance=0.001"),
+        MaxGeneratorCoreDelta, GeneratorCoreMismatchCount);
+    return true;
+}
+
+void WriteTunnelCoreProbeAxis(
+    FExploreJsonWriter& Writer,
+    const FExploreTunnelCoreProbeAxis& Axis,
+    const TCHAR* Key)
+{
+    Writer.WriteObjectStart(Key);
+    Writer.WriteValue(TEXT("valid_core_crossings"), Axis.ValidCoreCrossings);
+    Writer.WriteValue(TEXT("valid_final_crossings"), Axis.ValidFinalCrossings);
+    Writer.WriteValue(TEXT("core_mean_crossing_voxels"), static_cast<double>(Axis.CoreMeanCrossingVoxels));
+    Writer.WriteValue(TEXT("final_mean_crossing_voxels"), static_cast<double>(Axis.FinalMeanCrossingVoxels));
+    Writer.WriteValue(TEXT("core_min_crossing_voxels"), static_cast<double>(Axis.CoreMinCrossingVoxels));
+    Writer.WriteValue(TEXT("core_max_crossing_voxels"), static_cast<double>(Axis.CoreMaxCrossingVoxels));
+    Writer.WriteValue(TEXT("final_min_crossing_voxels"), static_cast<double>(Axis.FinalMinCrossingVoxels));
+    Writer.WriteValue(TEXT("final_max_crossing_voxels"), static_cast<double>(Axis.FinalMaxCrossingVoxels));
+    Writer.WriteValue(TEXT("core_periodic_amplitude_voxels"), static_cast<double>(Axis.CorePeriodicAmplitudeVoxels));
+    Writer.WriteValue(TEXT("core_periodic_amplitude_cm"), static_cast<double>(Axis.CorePeriodicAmplitudeVoxels) * 25.0);
+    Writer.WriteValue(TEXT("core_periodic_period_voxels"), static_cast<double>(Axis.CorePeriodicPeriodVoxels));
+    Writer.WriteValue(TEXT("core_periodic_measured_samples"), Axis.CorePeriodicMeasuredSamples);
+    Writer.WriteValue(TEXT("core_periodic_measured_length_voxels"), static_cast<double>(Axis.CorePeriodicMeasuredLengthVoxels));
+    Writer.WriteValue(TEXT("final_periodic_amplitude_voxels"), static_cast<double>(Axis.FinalPeriodicAmplitudeVoxels));
+    Writer.WriteValue(TEXT("final_periodic_amplitude_cm"), static_cast<double>(Axis.FinalPeriodicAmplitudeVoxels) * 25.0);
+    Writer.WriteValue(TEXT("final_periodic_period_voxels"), static_cast<double>(Axis.FinalPeriodicPeriodVoxels));
+    Writer.WriteValue(TEXT("final_periodic_measured_samples"), Axis.FinalPeriodicMeasuredSamples);
+    Writer.WriteValue(TEXT("final_periodic_measured_length_voxels"), static_cast<double>(Axis.FinalPeriodicMeasuredLengthVoxels));
+    Writer.WriteObjectEnd();
+}
+
 void WritePlayerDimensions(FExploreJsonWriter& Writer, const TCHAR* Key)
 {
     Writer.WriteObjectStart(Key);
@@ -4881,6 +5803,7 @@ FString BuildExploreJson(
     if (Arguments.bWalk) Writer->WriteValue(TEXT("walk"));
     if (Arguments.bExport) Writer->WriteValue(TEXT("export"));
     if (Arguments.bOpBounds) Writer->WriteValue(TEXT("opbounds"));
+    if (Arguments.bTunnelCoreProbe) Writer->WriteValue(TEXT("tunnelcoreprobe"));
     Writer->WriteArrayEnd();
     Writer->WriteValue(TEXT("failure_focus_render"), Arguments.bFailureFocusRender);
     Writer->WriteValue(TEXT("render_step_voxels"), static_cast<double>(Arguments.RenderStepVoxels));
@@ -4897,6 +5820,7 @@ FString BuildExploreJson(
         static_cast<double>(Arguments.SampleStacksIntervalUs));
     Writer->WriteValue(TEXT("profile_lod"), Arguments.bProfileLod);
     Writer->WriteValue(TEXT("density_slice_requested"), Arguments.bDensitySlice);
+    Writer->WriteValue(TEXT("tunnel_core_probe_requested"), Arguments.bTunnelCoreProbe);
     Writer->WriteValue(TEXT("render_target_override"), Arguments.bRenderTargetOverride);
     if (Arguments.bRenderTargetOverride)
     {
@@ -4936,6 +5860,35 @@ FString BuildExploreJson(
         WriteJsonVector(*Writer, TEXT("direction"), Arguments.DensitySliceDirection, 1.0f);
         Writer->WriteValue(TEXT("step_voxels"), static_cast<double>(Arguments.DensitySliceStep));
     }
+    Writer->WriteObjectEnd();
+
+    Writer->WriteObjectStart(TEXT("tunnel_core_probe"));
+    Writer->WriteValue(TEXT("status"), Output.TunnelCoreProbe.Status);
+    Writer->WriteValue(TEXT("file"), Output.TunnelCoreProbe.FileName);
+    Writer->WriteValue(TEXT("refusal_or_error"), Output.TunnelCoreProbe.RefusalReason);
+    Writer->WriteValue(TEXT("tunnel_index"), Output.TunnelCoreProbe.TunnelIndex);
+    Writer->WriteValue(TEXT("sample_count"), Output.TunnelCoreProbe.SampleCount);
+    Writer->WriteValue(TEXT("step_voxels"), static_cast<double>(Output.TunnelCoreProbe.StepVoxels));
+    Writer->WriteValue(TEXT("length_voxels"), static_cast<double>(Output.TunnelCoreProbe.LengthVoxels));
+    WriteJsonVector(*Writer, TEXT("axis_start_voxels"), Output.TunnelCoreProbe.AxisStart, 1.0f);
+    WriteJsonVector(*Writer, TEXT("axis_end_voxels"), Output.TunnelCoreProbe.AxisEnd, 1.0f);
+    WriteJsonVector(*Writer, TEXT("axis_direction"), Output.TunnelCoreProbe.AxisDirection, 1.0f);
+    WriteJsonVector(*Writer, TEXT("wall_direction"), Output.TunnelCoreProbe.WallDirection, 1.0f);
+    Writer->WriteValue(TEXT("core_center_finite_sample_count"), Output.TunnelCoreProbe.CoreCenterFiniteSampleCount);
+    Writer->WriteValue(TEXT("core_center_zero_crossing_count"), Output.TunnelCoreProbe.CoreCenterZeroCrossingCount);
+    Writer->WriteValue(TEXT("final_center_finite_sample_count"), Output.TunnelCoreProbe.FinalCenterFiniteSampleCount);
+    Writer->WriteValue(TEXT("final_center_zero_crossing_count"), Output.TunnelCoreProbe.FinalCenterZeroCrossingCount);
+    Writer->WriteValue(TEXT("final_center_saturated_sample_count"), Output.TunnelCoreProbe.FinalCenterSaturatedSampleCount);
+    Writer->WriteValue(TEXT("core_center_min"), static_cast<double>(Output.TunnelCoreProbe.CoreCenterMin));
+    Writer->WriteValue(TEXT("core_center_max"), static_cast<double>(Output.TunnelCoreProbe.CoreCenterMax));
+    Writer->WriteValue(TEXT("final_center_min"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMin));
+    Writer->WriteValue(TEXT("final_center_max"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMax));
+    Writer->WriteValue(TEXT("final_center_max_abs"), static_cast<double>(Output.TunnelCoreProbe.FinalCenterMaxAbs));
+    Writer->WriteValue(TEXT("periodic_method"), TEXT("32-voxel local-median detrend over the longest contiguous >=40-voxel run, single-sided DFT peak in the <=16-voxel band; amplitudes are sinusoid amplitudes"));
+    WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Floor, TEXT("floor"));
+    WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Wall, TEXT("wall"));
+    WriteTunnelCoreProbeAxis(*Writer, Output.TunnelCoreProbe.Ceiling, TEXT("ceiling"));
+    Writer->WriteValue(TEXT("seconds"), Output.TunnelCoreProbe.Seconds);
     Writer->WriteObjectEnd();
 
     Writer->WriteObjectStart(TEXT("summary"));
@@ -6150,6 +7103,25 @@ int32 RunExploreCase(const FString& Params, FString* OutJson)
 
     FExploreRunOutput Output;
     bool bRequestedModeFailed = false;
+    if (Arguments.bTunnelCoreProbe)
+    {
+        const double Start = FPlatformTime::Seconds();
+        const bool bProbeOk = !Budget.bTruncated
+            && RunTunnelCoreProbe(Arguments, World, Output.TunnelCoreProbe, Budget);
+        if (!bProbeOk && !Budget.bTruncated)
+        {
+            bRequestedModeFailed = true;
+        }
+        if (bProbeOk && !Budget.bTruncated)
+        {
+            Budget.CompleteMode(TEXT("tunnelcoreprobe"));
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeExplore] tunnel core probe %.3fs (%s)"),
+            FPlatformTime::Seconds() - Start,
+            bProbeOk ? TEXT("ok")
+                : (Budget.bTruncated ? TEXT("truncated") : TEXT("error")));
+    }
     if (Arguments.bDensitySlice)
     {
         const double Start = FPlatformTime::Seconds();

@@ -1371,13 +1371,6 @@ namespace
             Params.bTunnelsFlowTowardOrigin = CategoryRng.FRand() < 0.5f;
             return true;
         }
-        if (FCString::Strcmp(FieldName, TEXT("bTunnelFloorEnabled")) == 0)
-        {
-            // The floor is a capability feature, not a corpus-free variation axis. Keep it on
-            // for every generated candidate so a roll cannot manufacture an invalid bare tube.
-            Params.bTunnelFloorEnabled = true;
-            return true;
-        }
         if (FCString::Strcmp(FieldName, TEXT("bTunnelFloorTerracingEnabled")) == 0)
         {
             Params.bTunnelFloorTerracingEnabled = CategoryRng.FRand() < 0.75f;

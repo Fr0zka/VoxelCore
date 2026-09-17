@@ -3748,110 +3748,6 @@ namespace
             FVector LastTunnelCoreEvaluationPosition = FVector::ZeroVector;
             bool bLastTunnelCoreWorldEvaluationValid = false;
 
-            // Support-floor projection depends only on XY for one immutable SDF cache.  The
-            // mesher traverses Z outside X/Y, so keep a small worker-local LRU of XY boxes rather
-            // than only the immediately previous column; each integer column is then projected
-            // once and both structural posts reuse its interval for every Z sample.
-            struct FSupportColumnBox
-            {
-                static constexpr int32 Halo = CHUNK_SIZE + 8;
-                static constexpr int32 Dim = 2 * Halo + 1;
-
-                const FChunkSDFCache* Cache = nullptr;
-                int32 BaseX = 0;
-                int32 BaseY = 0;
-                uint32 LastUse = 0;
-                bool bValid = false;
-                TArray<int32> SlotToEntry;
-                TArray<FTunnelSupportFloorColumn> Columns;
-
-                void Clear()
-                {
-                    Cache = nullptr;
-                    bValid = false;
-                    LastUse = 0;
-                    SlotToEntry.Reset();
-                    Columns.Reset();
-                }
-
-                FTunnelSupportFloorColumn* AcquireColumn(
-                    int32 X, int32 Y, const FChunkSDFCache* InCache,
-                    uint32 InUse, bool& bOutNew)
-                {
-                    bOutNew = false;
-                    if (!bValid || Cache != InCache
-                        || X < BaseX || X >= BaseX + Dim
-                        || Y < BaseY || Y >= BaseY + Dim)
-                    {
-                        Cache = InCache;
-                        BaseX = X - Halo;
-                        BaseY = Y - Halo;
-                        LastUse = InUse;
-                        bValid = true;
-                        SlotToEntry.Init(INDEX_NONE, Dim * Dim);
-                        Columns.Reset();
-                    }
-                    else
-                    {
-                        LastUse = InUse;
-                    }
-
-                    const int32 Slot = (Y - BaseY) * Dim + (X - BaseX);
-                    int32& EntryIndex = SlotToEntry[Slot];
-                    if (EntryIndex == INDEX_NONE)
-                    {
-                        EntryIndex = Columns.AddDefaulted();
-                        bOutNew = true;
-                    }
-                    return &Columns[EntryIndex];
-                }
-            };
-
-            struct FSupportColumnCache
-            {
-                static constexpr int32 NumBoxes = 4;
-                FSupportColumnBox Boxes[NumBoxes];
-                uint32 Clock = 0;
-
-                void Invalidate()
-                {
-                    for (FSupportColumnBox& Box : Boxes)
-                    {
-                        Box.Clear();
-                    }
-                    Clock = 0;
-                }
-
-                FSupportColumnBox& AcquireBox(
-                    int32 X, int32 Y, const FChunkSDFCache* Cache)
-                {
-                    ++Clock;
-                    for (FSupportColumnBox& Box : Boxes)
-                    {
-                        if (Box.bValid && Box.Cache == Cache
-                            && X >= Box.BaseX && X < Box.BaseX + FSupportColumnBox::Dim
-                            && Y >= Box.BaseY && Y < Box.BaseY + FSupportColumnBox::Dim)
-                        {
-                            Box.LastUse = Clock;
-                            return Box;
-                        }
-                    }
-
-                    FSupportColumnBox* Victim = &Boxes[0];
-                    for (FSupportColumnBox& Box : Boxes)
-                    {
-                        if (!Box.bValid || Box.LastUse < Victim->LastUse)
-                        {
-                            Victim = &Box;
-                        }
-                    }
-                    Victim->Clear();
-                    return *Victim;
-                }
-            } SupportColumns;
-
-            FTunnelSupportFloorColumn FractionalSupportColumn;
-
             /** ÉTAPE C1 — les params de la strate avec l'op de CETTE salle appliqué par-dessus.
              *  Mémo par voxel : invalidé au début de chaque `Eval`, calculé au PREMIER modificateur
              *  qui le demande. C'est ce qui reproduit le coût de l'original (une copie de struct par
@@ -3906,49 +3802,6 @@ namespace
             S.bLocalParamsValid = false;
         }
 
-        void BuildSupportColumn(
-            float WorldX, float WorldY,
-            const FChunkSDFCache& Cache,
-            FTunnelSupportFloorColumn& OutColumn) const
-        {
-            VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                WorldX, WorldY, Cache, OutColumn,
-                VoxelGenLOD::ShouldUseSpatialIndex(false));
-        }
-
-        const FTunnelSupportFloorColumn* GetSupportColumn(const FVector& Position) const
-        {
-            FState& S = State();
-            const bool bIntegerXY =
-                Position.X == FMath::FloorToFloat(static_cast<float>(Position.X))
-                && Position.Y == FMath::FloorToFloat(static_cast<float>(Position.Y));
-            if (bIntegerXY)
-            {
-                const int32 IX = FMath::FloorToInt(static_cast<float>(Position.X));
-                const int32 IY = FMath::FloorToInt(static_cast<float>(Position.Y));
-                const FChunkSDFCache& Cache = GetCache();
-                FState::FSupportColumnBox& Box = S.SupportColumns.AcquireBox(
-                    IX, IY, &Cache);
-                bool bNewColumn = false;
-                FTunnelSupportFloorColumn* Column = Box.AcquireColumn(
-                    IX, IY, &Cache, S.SupportColumns.Clock, bNewColumn);
-                if (bNewColumn)
-                {
-                    BuildSupportColumn(
-                        static_cast<float>(Position.X),
-                        static_cast<float>(Position.Y),
-                        Cache,
-                        *Column);
-                }
-                return Column;
-            }
-
-            BuildSupportColumn(
-                static_cast<float>(Position.X), static_cast<float>(Position.Y),
-                GetCache(), S.FractionalSupportColumn);
-            return &S.FractionalSupportColumn;
-        }
-
         bool TryGetLastTunnelCoreWorldEvaluation(
             FTunnelCoreWorldEvaluation& OutEvaluation) const override
         {
@@ -3971,9 +3824,8 @@ namespace
                 // demand, publish the one combined result here so the tail can reuse it without
                 // building/scanning a second native cache.
                 const FVector& Position = S.LastWorldPosition;
-                const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(Position);
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                    Position.X, Position.Y, Position.Z, GetCache(), SupportColumn,
+                    Position.X, Position.Y, Position.Z, GetCache(), nullptr,
                     VoxelGenLOD::ShouldUseSpatialIndex(false));
                 S.LastTunnelCoreEvaluationPosition = Position;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
@@ -4093,7 +3945,6 @@ namespace
                 S.Cache = FChunkSDFCache();
                 S.SharedCacheEntry.Reset();
                 S.ActiveCache = &S.Cache;
-                S.SupportColumns.Invalidate();
                 InOut.Sdf = FLT_MAX;
                 return;
             }
@@ -4102,7 +3953,6 @@ namespace
             {
                 S.SharedCacheEntry.Reset();
                 S.ActiveCache = &S.Cache;
-                S.SupportColumns.Invalidate();
                 return;   // Sdf reste FLT_MAX
             }
 
@@ -4258,8 +4108,6 @@ namespace
                 + (bUseTileCacheWindow ? static_cast<float>(SampleStep) : 0.0f)
                 + 2.0f;
 
-            const FChunkSDFCache* PreviousActiveCache = S.ActiveCache;
-            bool bRebuiltLocalCache = false;
             if (SampleStep > 1)
             {
                 const bool bSharedCacheMatches =
@@ -4308,7 +4156,6 @@ namespace
                     && LocalCache->RegionSize == RegionSize;
                 if (!bCacheMatches)
                 {
-                    bRebuiltLocalCache = true;
                     LocalCache->bValid = false;
                     LocalCache->Seed = SeedU;
                     LocalCache->StrateIndex = StrateIdx;
@@ -4332,15 +4179,11 @@ namespace
                 }
                 S.ActiveCache = &LocalCache->Cache;
             }
-            if (bRebuiltLocalCache || S.ActiveCache != PreviousActiveCache)
-            {
-                S.SupportColumns.Invalidate();
-            }
-
             const bool bUseSpatialIndex = VoxelGenLOD::ShouldUseSpatialIndex(false);
+            const FVector WorldTunnelPosition(WorldX, WorldY, WorldZ);
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
                 WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius,
-                &S.NearestRoom, bUseSpatialIndex);
+                &S.NearestRoom, bUseSpatialIndex, &WorldTunnelPosition);
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -4424,45 +4267,31 @@ namespace
 
             InOut.Sdf = CaveSDF;
 
-            // The swept floor is part of the cached tunnel shape, but the common structural tail
-            // used to discover the same band only after all detail ops had run. Publish that
-            // build-time ownership now so the stack can preserve the authored support through its
-            // remaining modifiers without a second floor-writing pass. TryGet... below reuses the
-            // exact same cached result for the generator's post-disturbance hand-off.
+            // Publish the same continuous tunnel-core field that the common generator tail will
+            // reassert after generic writers.  The stack does not publish or protect a separate
+            // support slab.
             if (!VoxelDensityAblation::IsTunnelCoreOff())
             {
-                const FTunnelSupportFloorColumn* SupportColumn = GetSupportColumn(
-                    S.LastWorldPosition);
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
-                    WorldX, WorldY, WorldZ, GetCache(), SupportColumn,
+                    WorldX, WorldY, WorldZ, GetCache(), nullptr,
                     bUseSpatialIndex);
                 S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
-                if (S.LastTunnelCoreWorldEvaluation.bSupportFloor
-                    || S.LastTunnelCoreWorldEvaluation.bRoomFloor)
-                {
-                    const float StructuralFloorMinimumDensity =
-                        FMath::Max(P.BaseDensity * 2.0f, 1.0f);
-                    if (VoxelMath::IsFinite(StructuralFloorMinimumDensity)
-                        && StructuralFloorMinimumDensity > 0.0f)
-                    {
-                        InOut.bProtectedStructuralFloor = true;
-                        InOut.StructuralFloorMinimumDensity = StructuralFloorMinimumDensity;
-                        if (VoxelDensityProfile::AreCountersEnabled())
-                        {
-                            VoxelDensityProfile::AddCounter(
-                                VoxelDensityProfile::ECounter::TunnelAuthoredFloorSamples);
-                        }
-                    }
-                }
 
-                // These are the per-sample hand-offs needed by an op-major block.  The scalar path
-                // continues to use FState directly; publishing them here only makes the dependency
-                // explicit for a later modifier and does not alter Density/Sdf.
+                // Keep the hand-off for block evaluation compatibility.  Both floor flags are
+                // permanently false; the authored floor is part of the tunnel shape itself.
                 InOut.bHasTunnelCoreWorldEvaluation = true;
                 InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
-                InOut.bTunnelCoreSupportFloor = S.LastTunnelCoreWorldEvaluation.bSupportFloor;
-                InOut.bTunnelCoreRoomFloor = S.LastTunnelCoreWorldEvaluation.bRoomFloor;
+                InOut.bTunnelCoreSupportFloor = false;
+                InOut.bTunnelCoreRoomFloor = false;
+                InOut.bHasTunnelCoreSweptFloor =
+                    S.LastTunnelCoreWorldEvaluation.bHasSweptFloor;
+                InOut.TunnelCoreSweptFloorZ =
+                    S.LastTunnelCoreWorldEvaluation.SweptFloorZ;
+                InOut.TunnelCoreSweptFloorRadius =
+                    S.LastTunnelCoreWorldEvaluation.SweptFloorRadius;
+                InOut.bProtectedStructuralFloor = false;
+                InOut.StructuralFloorMinimumDensity = 0.0f;
             }
 
             // These cache hand-offs remain valid when tunnel core is off; detail operators still
@@ -6384,8 +6213,8 @@ namespace
                 // A post-air sample must lie within a tapered capsule's maximum radius of one
                 // world-chain segment.  The segment AABB expanded by that radius is a cheap
                 // superset of the exact capsule; unlike the old enclosing sphere it rejects a
-                // long, thin tunnel from most unrelated LOD0 boxes.  Support uses its own
-                // projected-floor AABB, because AllAir is killed by the finite floor band.
+                // long, thin tunnel from most unrelated LOD0 boxes.  The floor is part of this
+                // same continuous field, so no second support-band candidate is needed.
                 if (Ctx.bUseLatticeProof)
                 {
                     const float WorldLatticeOriginX =
@@ -6441,53 +6270,8 @@ namespace
                             Result |= 1u;
                         }
 
-                        if (bWorldChain)
-                        {
-                            const float NaturalFloorA = VoxelPassageGeometry::TunnelFloorZ(
-                                A, SafeRadiusA);
-                            const float NaturalFloorB = VoxelPassageGeometry::TunnelFloorZ(
-                                BPoint, SafeRadiusB);
-                            float FloorMin = FMath::Min(NaturalFloorA, NaturalFloorB);
-                            float FloorMax = FMath::Max(NaturalFloorA, NaturalFloorB);
-                            const TArray<FTunnelFloorSegmentProfile>* FloorProfiles =
-                                &Tunnel.WorldFloorProfiles;
-                            if (FloorProfiles->Num() == Tunnel.WorldControlPoints.Num() - 1
-                                && SegmentIndex >= 0
-                                && SegmentIndex < FloorProfiles->Num())
-                            {
-                                // The interval proof must include an explicit ledge's vertical
-                                // riser.  The profile transition is evaluated at the segment
-                                // boundary, so its endpoint interval is a conservative superset
-                                // of both plateau sides and remains valid for the lattice proof.
-                                const FTunnelFloorSegmentProfile& Profile =
-                                    (*FloorProfiles)[SegmentIndex];
-                                FloorMin = FMath::Min(FloorMin, FMath::Min(
-                                    Profile.StartFloorZ, Profile.EndFloorZ));
-                                FloorMax = FMath::Max(FloorMax, FMath::Max(
-                                    Profile.StartFloorZ, Profile.EndFloorZ));
-                            }
-                            const float SupportRadius = FMath::Max(
-                                FMath::Min(SafeRadiusA, SafeRadiusB) - 0.5f,
-                                VoxelPassageGeometry::PlayerRadiusVoxels);
-                            if (!Finite(FloorMin) || !Finite(FloorMax)
-                                || !Finite(SupportRadius))
-                            {
-                                Result = 3u;
-                                return;
-                            }
-                            if (TouchesLatticeAABB(
-                                    FMath::Min(A.X, BPoint.X) - SupportRadius,
-                                    FMath::Max(A.X, BPoint.X) + SupportRadius,
-                                    FMath::Min(A.Y, BPoint.Y) - SupportRadius,
-                                    FMath::Max(A.Y, BPoint.Y) + SupportRadius,
-                                     FloorMin
-                                         - VoxelPassageGeometry::LandingFloorThicknessVoxels,
-                                     FloorMax
-                                         + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels))
-                            {
-                                Result |= 2u;
-                            }
-                        }
+                        (void)bWorldChain;
+                        (void)SegmentIndex;
                     };
 
                     if (bHasWorldChain)
@@ -6607,8 +6391,6 @@ namespace
                 const uint8 TailMask = MayHaveTunnelCoreTail(Tunnel);
                 B.bMayHaveTunnelCoreAir = B.bMayHaveTunnelCoreAir
                     || (TailMask & 1u) != 0;
-                B.bMayHaveTunnelSupportFloor = B.bMayHaveTunnelSupportFloor
-                    || (TailMask & 2u) != 0;
                 B.bMayHaveTunnelCoreTail = B.bMayHaveTunnelCoreTail
                     || TailMask != 0u;
                 float MaxRadius = FMath::Max(
@@ -6750,18 +6532,15 @@ namespace
                 CountThreshold(TunnelLowerNoWarp, B.HitTunnelsNoWarp);
             }
 
-            if ((B.bMayHaveTunnelCoreAir || B.bMayHaveTunnelSupportFloor)
+            if (B.bMayHaveTunnelCoreAir
                 && bUseLatticeProof
                 && ExactLatticeWorldQueries.Num() > 0)
             {
                 // The bound test above is only a broad candidate.  The actual post is a
-                // discrete writer: it opens a point when the world-core SDF is below the inset
-                // without a support floor, or makes it solid in the support-floor band. Keep the
-                // two polarities separate: an AllSolid box only needs air, while an AllAir box
-                // only needs support. This is still a proof of the final lattice, never a density
-                // shortcut; if an exact query is invalid, keep both conservative candidates.
+                // continuous writer: it opens a point when the world-core SDF is negative. This
+                // is still a proof of the final lattice, never a density shortcut; if an exact
+                // query is invalid, keep the conservative candidate.
                 bool bExactAir = false;
-                bool bExactSupport = false;
                 bool bExactTailUnknown = false;
                 TArray<FBox, TInlineAllocator<16>> ExactTailDomains;
                 bool bExactTailDomainCullSafe = true;
@@ -6799,7 +6578,7 @@ namespace
                     VoxelBox.Min, VoxelBox.Max,
                     [&](const FVector&, const FVector& World)
                 {
-                    if ((bExactAir && bExactSupport) || bExactTailUnknown) return;
+                    if (bExactAir || bExactTailUnknown) return;
                     ++B.ExactTailQueries;
                     if (bExactTailDomainCullSafe && ExactTailDomains.Num() > 0)
                     {
@@ -6853,33 +6632,15 @@ namespace
                         }
                         else
                         {
-                            bExactSupport |= (State & 0x02u) != 0;
                             bExactAir |= (State & 0x01u) != 0;
                         }
                         return;
                     }
 
-                    FTunnelSupportFloorColumn EmptySupportColumn;
-                    const FTunnelSupportFloorColumn* SupportColumn = nullptr;
-                    const bool bIntegerXY =
-                        World.X == FMath::FloorToFloat(static_cast<float>(World.X))
-                        && World.Y == FMath::FloorToFloat(static_cast<float>(World.Y));
-                    if (bIntegerXY)
-                    {
-                        SupportColumn = GetSupportColumn(World);
-                    }
-                    else
-                    {
-                        VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-                            static_cast<float>(World.X), static_cast<float>(World.Y),
-                            GetBoxCache(), EmptySupportColumn,
-                            VoxelGenLOD::ShouldUseSpatialIndex(false));
-                        SupportColumn = &EmptySupportColumn;
-                    }
                     const FTunnelCoreWorldEvaluation Evaluation =
                         VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                             static_cast<float>(World.X), static_cast<float>(World.Y),
-                            static_cast<float>(World.Z), GetBoxCache(), SupportColumn,
+                            static_cast<float>(World.Z), GetBoxCache(), nullptr,
                             VoxelGenLOD::ShouldUseSpatialIndex(false));
                     ++B.ExactTailEvaluated;
                     if (!VoxelMath::IsFinite(Evaluation.SDF))
@@ -6889,15 +6650,12 @@ namespace
                     }
                     else
                     {
-                        const bool bAir = !Evaluation.bSupportFloor
-                            && Evaluation.SDF
-                                < -VoxelPassageGeometry::CaveTunnelAirCoreInsetVoxels;
-                        bExactSupport |= Evaluation.bSupportFloor;
+                        const bool bAir = Evaluation.SDF < 0.0f;
                         bExactAir |= bAir;
                         if (CachedTailState != nullptr)
                         {
                             *CachedTailState = static_cast<uint8>(
-                                0x80u | (Evaluation.bSupportFloor ? 0x02u : 0u)
+                                0x80u
                                 | (bAir ? 0x01u : 0u));
                         }
                     }
@@ -6906,8 +6664,8 @@ namespace
                 if (!bExactTailUnknown)
                 {
                     B.bMayHaveTunnelCoreAir = bExactAir;
-                    B.bMayHaveTunnelSupportFloor = bExactSupport;
-                    B.bMayHaveTunnelCoreTail = bExactAir || bExactSupport;
+                    B.bMayHaveTunnelSupportFloor = false;
+                    B.bMayHaveTunnelCoreTail = bExactAir;
                 }
             }
 
