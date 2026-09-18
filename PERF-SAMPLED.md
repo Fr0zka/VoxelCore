@@ -6,6 +6,23 @@ Measurement-only report for the in-process stack sampler, 2026-09-13. No generat
 
 The sampler is useful: it samples registered generation workers without adding scopes to the density hot path, tags every capture with LOD, finds the planted cost, and exposes the game path's dominant work. It is not yet an acceptance-clean low-overhead instrument at the requested default interval. Static timing and worker CPU move beyond the two-run off baseline; moving worker CPU is within noise, but moving request/generation timing is not.
 
+## Current command entry point
+
+Use the guarded harness at `E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1` for new measurements. It owns the staged host under `Saved\BuildHost`, serializes Unreal launches, uses an isolated `-userdir`, Zen/DDC directory, and log directory under the requested run directory, waits by PID, records crash/`UECC-*` evidence, and writes compact `result.json` plus a ≤40-line `summary.txt`; full logs remain beside them.
+
+All paths passed to `-Out` must be absolute and under the plugin's `Saved` directory. The normal entry forms are:
+
+```powershell
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario canonical -Build -Assets default -Label canonical
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario owner -Assets owner -Label owner
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario probe -Assets owner -Label probe
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario perf -Label perf
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario tests -Label tests
+pwsh -NoLogo -NoProfile -File "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Tools\VoxelForgeTest.ps1" -Scenario parity -Build -Assets owner -Label parity
+```
+
+Optional controls are `-Cvars @{...}`, `-Out "E:\Projet Unreal\VoxelM\Plugins\VoxelForge\Saved\TestHarness\named"`, and `-Label name`. `-Assets owner` stages `DA_Strate3` and `DA_Settings` and records both SHA-256 values. `parity` exports 64 level-0 tiles through `VoxelForgeExplore -gameconfig=1`, runs the headless game's streaming path with the same owner settings, dumps per-tile hashes, and fails on the first missing or differing tile. Do not invent a direct `UnrealEditor` command line: the harness's launch ledger is the reproducible command record.
+
 The headline game result is that LOD0 is not dominated by candidate AABB rejection. It is dominated by the evaluator and its downstream tunnel/floor/core and structural work. Coarse LOD1+ samples are dominated by room-cache/player-fit/room-landing work. The profile supports the suspected swept-tunnel/core duplication, but does not isolate the parameter-copy cost.
 
 ## Instrument and build

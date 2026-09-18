@@ -9,6 +9,10 @@
 !/Source/
 !/Source/**
 
+# The guarded single-entry test harness is source, not generated output.
+!/Tools/
+!/Tools/**
+
 !VoxelForge.uplugin
 
 # Keep every design / doc markdown at any depth (AUDIT P1 — these were untracked)

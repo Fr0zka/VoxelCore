@@ -11,7 +11,6 @@
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Misc/CommandLine.h"
-#include "Misc/Crc.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
@@ -32,6 +31,7 @@
 #include "VoxelDensityAblation.h"
 #include "VoxelDensityProfile.h"
 #include "VoxelGenerator.h"
+#include "VoxelGeometryHash.h"
 #include "VoxelMarchingCubesMesher.h"
 #include "VoxelNoise.h"
 #include "VoxelPassageGeometry.h"
@@ -339,6 +339,9 @@ struct FExploreArguments
     // density_grid_reuse=false to produce a matched wall-clock control.
     bool bReuseDensityGrid = true;
     bool bBlockEarlyOut = false;
+    // Opt-in parity mode: copy the runtime mesher presentation/LOD settings from the authored
+    // settings object.  The default remains the historical bounded export configuration.
+    bool bGameRuntimeConfig = false;
     int32 MeshMinBatchSize = 1;
     int32 MaxWalkCells = DefaultMaxWalkCells;
     float BudgetMinutes = DefaultBudgetMinutes;
@@ -470,6 +473,10 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
     int32 BlockEarlyOut = OutArguments.bBlockEarlyOut ? 1 : 0;
     FParse::Value(*Params, TEXT("blockearlyout="), BlockEarlyOut);
     OutArguments.bBlockEarlyOut = BlockEarlyOut != 0;
+    int32 GameRuntimeConfig = OutArguments.bGameRuntimeConfig ? 1 : 0;
+    FParse::Value(*Params, TEXT("gameconfig="), GameRuntimeConfig);
+    FParse::Value(*Params, TEXT("paritygame="), GameRuntimeConfig);
+    OutArguments.bGameRuntimeConfig = GameRuntimeConfig != 0;
     FParse::Value(*Params, TEXT("meshminbatch="), OutArguments.MeshMinBatchSize);
     OutArguments.MeshMinBatchSize = FMath::Clamp(OutArguments.MeshMinBatchSize, 1, 64);
     int32 Lod = 0;
@@ -686,11 +693,27 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         return false;
     }
 
-    if (OutArguments.Slot < 1 || OutArguments.Slot > MaxSyntheticStrates - 2)
+    // The historical explorer contract needs two adjacent mouths around an interior slot.  A
+    // parity export can instead target the game's authored single-strate layout, which has no
+    // such mouths and is valid for export-only mode.  Build() still validates the slot against
+    // the loaded settings layout.
+    const int32 MinimumSlot = OutArguments.bGameRuntimeConfig ? 0 : 1;
+    const int32 MaximumSlot = OutArguments.bGameRuntimeConfig
+        ? MaxSyntheticStrates - 1 : MaxSyntheticStrates - 2;
+    if (OutArguments.Slot < MinimumSlot || OutArguments.Slot > MaximumSlot)
     {
-        OutError = FString::Printf(
-            TEXT("slot must be an interior slot in [1,%d] so arrival and departure mouths exist."),
-            MaxSyntheticStrates - 2);
+        if (OutArguments.bGameRuntimeConfig)
+        {
+            OutError = FString::Printf(
+                TEXT("slot must be in [0,%d] for game-runtime configuration parity."),
+                MaxSyntheticStrates - 1);
+        }
+        else
+        {
+            OutError = FString::Printf(
+                TEXT("slot must be an interior slot in [1,%d] so arrival and departure mouths exist."),
+                MaxSyntheticStrates - 2);
+        }
         return false;
     }
     if (OutArguments.RenderWidth < 16 || OutArguments.RenderHeight < 16
@@ -1127,7 +1150,9 @@ struct FExploreWorld
         }
 
         const int32 NumStrates = bUseAuthoredSettings
-            ? FMath::Max(Settings->TotalStrates, Arguments.Slot + 2)
+            ? (Arguments.bGameRuntimeConfig
+                ? FMath::Max(Settings->TotalStrates, 1)
+                : FMath::Max(Settings->TotalStrates, Arguments.Slot + 2))
             : Arguments.Slot + 2;
         if (NumStrates > MaxSyntheticStrates)
         {
@@ -1397,6 +1422,12 @@ struct FExploreWorld
             NewObject<UVoxelMarchingCubesMesher>(GetTransientPackage(), NAME_None, RF_Transient));
         Mesher->SetGenerator(Generator.Get());
         Mesher->bUseBlockEarlyOut = Arguments.bBlockEarlyOut;
+        if (Arguments.bGameRuntimeConfig)
+        {
+            Mesher->bGenerateSkirts = Settings->bGenerateSkirts;
+            Mesher->SkirtCells = Settings->SkirtCells;
+            Mesher->LODOctaveDrop = Settings->LODOctaveDrop;
+        }
 
         if (Settings->WorldRadiusVoxels != 0.0f
             || Generator->WorldRadiusVoxels != 0.0f
@@ -2048,47 +2079,7 @@ bool AppendCanonicalMesh(
 
 FString ComputeGeometryHash(const FVoxelMeshData& MeshData)
 {
-    uint32 Crc = 0;
-    const int32 Counts[] = {
-        MeshData.Vertices.Num(),
-        MeshData.Normals.Num(),
-        MeshData.UVs.Num(),
-        MeshData.Colors.Num(),
-        MeshData.Triangles.Num(),
-        MeshData.NumCeilingTriangles,
-    };
-    Crc = FCrc::MemCrc32(Counts, sizeof(Counts), Crc);
-    if (MeshData.Vertices.Num() > 0)
-    {
-        Crc = FCrc::MemCrc32(
-            MeshData.Vertices.GetData(),
-            MeshData.Vertices.Num() * sizeof(FVector), Crc);
-    }
-    if (MeshData.Normals.Num() > 0)
-    {
-        Crc = FCrc::MemCrc32(
-            MeshData.Normals.GetData(),
-            MeshData.Normals.Num() * sizeof(FVector), Crc);
-    }
-    if (MeshData.UVs.Num() > 0)
-    {
-        Crc = FCrc::MemCrc32(
-            MeshData.UVs.GetData(),
-            MeshData.UVs.Num() * sizeof(FVector2D), Crc);
-    }
-    if (MeshData.Colors.Num() > 0)
-    {
-        Crc = FCrc::MemCrc32(
-            MeshData.Colors.GetData(),
-            MeshData.Colors.Num() * sizeof(FColor), Crc);
-    }
-    if (MeshData.Triangles.Num() > 0)
-    {
-        Crc = FCrc::MemCrc32(
-            MeshData.Triangles.GetData(),
-            MeshData.Triangles.Num() * sizeof(int32), Crc);
-    }
-    return FString::Printf(TEXT("%08X"), Crc);
+    return VoxelForgeGeometryHash::Compute(MeshData);
 }
 
 bool EnsureExploreMesh(
@@ -2153,9 +2144,14 @@ bool EnsureExploreMesh(
     }
 
     // This is the same canonical UVoxelMarchingCubesMesher used by export and runtime chunk
-    // generation. Skirts are presentation geometry for LOD seams and would extend outside the
-    // bounded explorer region, so the shared mesh uses the export setting.
-    World.Mesher->bGenerateSkirts = false;
+    // generation.  Historical export deliberately omitted presentation skirts; parity opts into
+    // the authored runtime settings so the requested comparison has the same mesher inputs.
+    World.Mesher->bGenerateSkirts = Arguments.bGameRuntimeConfig
+        ? World.Settings->bGenerateSkirts : false;
+    World.Mesher->SkirtCells = Arguments.bGameRuntimeConfig
+        ? World.Settings->SkirtCells : 2.0f;
+    World.Mesher->LODOctaveDrop = Arguments.bGameRuntimeConfig
+        ? World.Settings->LODOctaveDrop : 0;
 
     const double MeshStartSeconds = FPlatformTime::Seconds();
     if (Budget.ShouldStop(TEXT("mesh")))
@@ -6320,6 +6316,7 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("export_step"), Arguments.ExportStep);
     Writer->WriteValue(TEXT("density_grid_reuse"), Arguments.bReuseDensityGrid);
     Writer->WriteValue(TEXT("block_early_out"), Arguments.bBlockEarlyOut);
+    Writer->WriteValue(TEXT("game_runtime_config"), Arguments.bGameRuntimeConfig);
     Writer->WriteValue(TEXT("mesh_min_batch_size"), Arguments.MeshMinBatchSize);
     Writer->WriteValue(TEXT("profile_density"), Arguments.bProfileDensity);
     Writer->WriteValue(TEXT("profile_density_full"), Arguments.bProfileDensityFull);
@@ -6532,6 +6529,18 @@ FString BuildExploreJson(
         Writer->WriteValue(TEXT("x"), TileX);
         Writer->WriteValue(TEXT("y"), TileY);
         Writer->WriteValue(TEXT("z"), TileZ);
+        Writer->WriteValue(TEXT("absolute_tile_x"),
+            World.ExploreMeshOrigin.X / CHUNK_SIZE + TileX);
+        Writer->WriteValue(TEXT("absolute_tile_y"),
+            World.ExploreMeshOrigin.Y / CHUNK_SIZE + TileY);
+        Writer->WriteValue(TEXT("absolute_tile_z"),
+            World.ExploreMeshOrigin.Z / CHUNK_SIZE + TileZ);
+        Writer->WriteValue(TEXT("origin_x_voxels"),
+            World.ExploreMeshOrigin.X + TileX * CHUNK_SIZE);
+        Writer->WriteValue(TEXT("origin_y_voxels"),
+            World.ExploreMeshOrigin.Y + TileY * CHUNK_SIZE);
+        Writer->WriteValue(TEXT("origin_z_voxels"),
+            World.ExploreMeshOrigin.Z + TileZ * CHUNK_SIZE);
         Writer->WriteValue(TEXT("sample_step"), Arguments.ExportStep);
         Writer->WriteValue(TEXT("lod"), TileLod);
         Writer->WriteValue(TEXT("triangle_count"), World.ExploreTileTriangleCounts[TileIndex]);

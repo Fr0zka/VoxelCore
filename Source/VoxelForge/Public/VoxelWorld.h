@@ -5,6 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "HAL/CriticalSection.h"
 #include <atomic>
 #include "VoxelTypes.h"
 #include "VoxelGenerator.h"
@@ -135,6 +136,21 @@ struct FChunkResult
     // it to UVoxelDensityVolume::IngestTileCapture so the density clipmap reuses the mesher's samples
     // instead of re-sampling. Moved (not copied) through the MPSC queue. See UVoxelDensityVolume.
     TArray<uint8> CaptureGrid;
+};
+
+/** One worker-produced mesh identity emitted only by the explicit parity harness. */
+struct FVoxelTileHashDumpRecord
+{
+    FVoxelTileKey Tile;
+    FIntVector OriginVoxels = FIntVector::ZeroValue;
+    int32 Step = 1;
+    int32 Cells = 0;
+    int32 BandChunkLo = MIN_int32;
+    int32 BandChunkHi = MAX_int32;
+    bool bSheetTile = false;
+    bool bEmpty = true;
+    int32 NumTriangles = 0;
+    FString GeometryHash;
 };
 
 UCLASS()
@@ -512,6 +528,10 @@ private:
     void ObserveHeadlessStrateCrossingTest(const FVector& PlayerPosition, APawn* PlayerPawn);
     void MaybeFinishHeadlessStrateCrossingTest();
     void MaybeFinishHeadlessStreamingTest();
+    void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
+                        int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
+                        bool bSheetTile, const FVoxelMeshData& MeshData);
+    void WriteTileHashDump();
 
     // Packed shader params, recomputed each Tick. ALL meaningful data is in .xyz — a material Vector
     // Parameter only delivers float3 (RGB) into a Custom node (the alpha is dropped), so we never use .w.
@@ -976,6 +996,13 @@ public:
     FVector HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
     double HeadlessStreamingTestBeginSeconds = 0.0;
     double HeadlessStreamingTestLastElapsedSeconds = 0.0;
+
+    // Explicit parity evidence. Workers append under the lock; EndPlay writes the compact JSON
+    // after ActiveTaskCount has reached zero, so the dump is a complete worker-side snapshot.
+    bool bTileHashDumpEnabled = false;
+    FString TileHashDumpPath;
+    FCriticalSection TileHashDumpMutex;
+    TArray<FVoxelTileHashDumpRecord> TileHashDumpRecords;
 
     // Real inter-strate crossing validation. This is enabled only by -voxel.TestStrateCrossing=1;
     // the route is copied from UVoxelStrateManager's generated passage and movement is supplied to

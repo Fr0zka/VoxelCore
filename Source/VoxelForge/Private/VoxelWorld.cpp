@@ -14,6 +14,7 @@
 #include "VoxelDensityVolume.h"
 #include "VoxelDensityOpStack.h"
 #include "VoxelDensityProfile.h"
+#include "VoxelGeometryHash.h"
 #include "VoxelStartupTrace.h"
 #include "VoxelStackSampler.h"
 #include "VoxelStats.h"
@@ -45,8 +46,11 @@
 #include "Misc/FileHelper.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformMisc.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
+#include "Serialization/JsonWriter.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
 #if WITH_EDITOR
@@ -1133,6 +1137,7 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
     VoxelCaveMorphology::LogPlayerFitMemoStats();
     LogStreamingLatencySummary();
+    WriteTileHashDump();
     const uint64 TilePostReachDifferences =
         VoxelGenLOD::GSkippedPostDifferences.load(std::memory_order_relaxed);
     UE_LOG(LogTemp, Display,
@@ -1693,6 +1698,9 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
     HeadlessStreamingTestBeginSeconds = 0.0;
     HeadlessStreamingTestLastElapsedSeconds = 0.0;
+    bTileHashDumpEnabled = false;
+    TileHashDumpPath.Reset();
+    TileHashDumpRecords.Reset();
 
     bHeadlessStrateCrossingTest = false;
     bHeadlessStrateCrossingTestStartPlaced = false;
@@ -1720,6 +1728,25 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessStrateCrossingTestRoute.Reset();
 
     const TCHAR* CommandLine = FCommandLine::Get();
+    FString RequestedTileHashDumpPath;
+    if (FParse::Value(CommandLine, TEXT("voxel.TileHashDump="), RequestedTileHashDumpPath))
+    {
+        RequestedTileHashDumpPath.TrimQuotesInline();
+        if (FPaths::IsRelative(RequestedTileHashDumpPath))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeParity] voxel.TileHashDump must be an absolute path: '%s'."),
+                *RequestedTileHashDumpPath);
+        }
+        else
+        {
+            TileHashDumpPath = FPaths::ConvertRelativePathToFull(RequestedTileHashDumpPath);
+            FPaths::NormalizeFilename(TileHashDumpPath);
+            bTileHashDumpEnabled = true;
+            UE_LOG(LogTemp, Display, TEXT("[VoxelForgeParity] tile_hash_dump_enabled=1 path=%s"),
+                *TileHashDumpPath);
+        }
+    }
     int32 MoveValue = 0;
     const bool bMoveRequested =
         (FParse::Value(CommandLine, TEXT("voxel.TestMove="), MoveValue) && MoveValue != 0)
@@ -1846,6 +1873,109 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
             HeadlessStreamingTestDirection.X,
             HeadlessStreamingTestDirection.Y,
             HeadlessStreamingTestDirection.Z);
+    }
+}
+
+void AVoxelWorld::RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
+                                 int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
+                                 bool bSheetTile, const FVoxelMeshData& MeshData)
+{
+    if (!bTileHashDumpEnabled)
+    {
+        return;
+    }
+
+    FVoxelTileHashDumpRecord Record;
+    Record.Tile = Tile;
+    Record.OriginVoxels = OriginVoxels;
+    Record.Step = Step;
+    Record.Cells = Cells;
+    Record.BandChunkLo = BandChunkLo;
+    Record.BandChunkHi = BandChunkHi;
+    Record.bSheetTile = bSheetTile;
+    Record.bEmpty = MeshData.IsEmpty();
+    Record.NumTriangles = MeshData.Triangles.Num() / 3;
+    Record.GeometryHash = VoxelForgeGeometryHash::Compute(MeshData);
+
+    FScopeLock Lock(&TileHashDumpMutex);
+    TileHashDumpRecords.Add(MoveTemp(Record));
+}
+
+void AVoxelWorld::WriteTileHashDump()
+{
+    if (!bTileHashDumpEnabled || TileHashDumpPath.IsEmpty())
+    {
+        return;
+    }
+
+    TArray<FVoxelTileHashDumpRecord> Records;
+    {
+        FScopeLock Lock(&TileHashDumpMutex);
+        Records = TileHashDumpRecords;
+    }
+    Records.Sort([](const FVoxelTileHashDumpRecord& A, const FVoxelTileHashDumpRecord& B)
+    {
+        if (A.Tile.Level != B.Tile.Level) return A.Tile.Level < B.Tile.Level;
+        if (A.Tile.Coord.Z != B.Tile.Coord.Z) return A.Tile.Coord.Z < B.Tile.Coord.Z;
+        if (A.Tile.Coord.Y != B.Tile.Coord.Y) return A.Tile.Coord.Y < B.Tile.Coord.Y;
+        if (A.Tile.Coord.X != B.Tile.Coord.X) return A.Tile.Coord.X < B.Tile.Coord.X;
+        return A.GeometryHash < B.GeometryHash;
+    });
+
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(TileHashDumpPath), true);
+    FString Json;
+    TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
+    Writer->WriteObjectStart();
+    Writer->WriteValue(TEXT("schema_version"), 1);
+    Writer->WriteValue(TEXT("source"), TEXT("game_streaming_path"));
+    Writer->WriteValue(TEXT("settings_asset"), Settings ? Settings->GetPathName() : FString());
+    if (Settings != nullptr)
+    {
+        Writer->WriteObjectStart(TEXT("runtime_config"));
+        Writer->WriteValue(TEXT("generate_skirts"), Settings->bGenerateSkirts);
+        Writer->WriteValue(TEXT("skirt_cells"), static_cast<double>(Settings->SkirtCells));
+        Writer->WriteValue(TEXT("lod_octave_drop"), Settings->LODOctaveDrop);
+        Writer->WriteValue(TEXT("full_res_clip_levels"), Settings->FullResClipLevels);
+        Writer->WriteValue(TEXT("coarse_tile_cells"), Settings->CoarseTileCells);
+        Writer->WriteValue(TEXT("strate_content_cut_min_level"),
+            Settings->GetEffectiveStrateContentCutMinLevel());
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteValue(TEXT("record_count"), Records.Num());
+    Writer->WriteArrayStart(TEXT("records"));
+    for (const FVoxelTileHashDumpRecord& Record : Records)
+    {
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("tile_x"), Record.Tile.Coord.X);
+        Writer->WriteValue(TEXT("tile_y"), Record.Tile.Coord.Y);
+        Writer->WriteValue(TEXT("tile_z"), Record.Tile.Coord.Z);
+        Writer->WriteValue(TEXT("level"), Record.Tile.Level);
+        Writer->WriteValue(TEXT("origin_x_voxels"), Record.OriginVoxels.X);
+        Writer->WriteValue(TEXT("origin_y_voxels"), Record.OriginVoxels.Y);
+        Writer->WriteValue(TEXT("origin_z_voxels"), Record.OriginVoxels.Z);
+        Writer->WriteValue(TEXT("step"), Record.Step);
+        Writer->WriteValue(TEXT("cells"), Record.Cells);
+        Writer->WriteValue(TEXT("band_chunk_lo"), Record.BandChunkLo);
+        Writer->WriteValue(TEXT("band_chunk_hi"), Record.BandChunkHi);
+        Writer->WriteValue(TEXT("sheet_tile"), Record.bSheetTile);
+        Writer->WriteValue(TEXT("empty"), Record.bEmpty);
+        Writer->WriteValue(TEXT("triangle_count"), Record.NumTriangles);
+        Writer->WriteValue(TEXT("geometry_hash"), Record.GeometryHash);
+        Writer->WriteObjectEnd();
+    }
+    Writer->WriteArrayEnd();
+    Writer->WriteObjectEnd();
+    if (!Writer->Close() || !FFileHelper::SaveStringToFile(Json, *TileHashDumpPath))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VoxelForgeParity] Could not write tile hash dump '%s'."),
+            *TileHashDumpPath);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeParity] tile_hash_dump=%s records=%d"),
+            *TileHashDumpPath, Records.Num());
     }
 }
 
@@ -5307,6 +5437,11 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         Result.bHasCeilingTris = MeshData.NumCeilingTriangles > 0;
         Result.bHasGroundTris  = NumTris > MeshData.NumCeilingTriangles;
     }
+
+    // Parity instrumentation observes the same FVoxelMeshData that the runtime stream builder
+    // consumes. It is intentionally after the abort fence, so a canceled worker cannot publish a
+    // partial identity, and it records empty/proof tiles as well as visible meshes.
+    RecordTileHash(Tile, OriginVoxels, Step, Cells, BandChunkLo, BandChunkHi, bSheetTile, MeshData);
 
     Result.ClassifySeconds = ClassifySeconds;
     Result.MeshSeconds = MeshSeconds;
