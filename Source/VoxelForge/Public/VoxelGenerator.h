@@ -240,7 +240,14 @@ public:
                                FTunnelCoreWorldEvaluation* OutTunnelCore = nullptr,
                                // Diagnostics are opt-in so ordinary/reference calls do not pay
                                // for fused-path counters.
-                               bool bCollectFusedDiagnostics = false) const;
+                               bool bCollectFusedDiagnostics = false,
+                               // Optional same-sample hand-off from EvaluateSDFCached. This is
+                               // only a room-shape ownership bit; it does not alter the scalar
+                               // result and avoids a duplicate room-index query in native paths.
+                               bool* OutRoomOwnsBottom = nullptr,
+                               // Optional same-sample warped position. Native GetDensityAt uses
+                               // this to feed the core post without applying the cave warp twice.
+                               FVector* OutWarpedPosition = nullptr) const;
 
     /**
      * Densité pour une strate Slab (FlatPlain / CrystalChamber).

@@ -3747,6 +3747,8 @@ namespace
             FTunnelCoreWorldEvaluation LastTunnelCoreWorldEvaluation;
             FVector LastTunnelCoreEvaluationPosition = FVector::ZeroVector;
             bool bLastTunnelCoreWorldEvaluationValid = false;
+            bool bLastRoomOwnsBottom = false;
+            bool bLastRoomOwnsBottomValid = false;
 
             /** ÉTAPE C1 — les params de la strate avec l'op de CETTE salle appliqué par-dessus.
              *  Mémo par voxel : invalidé au début de chaque `Eval`, calculé au PREMIER modificateur
@@ -3800,6 +3802,7 @@ namespace
             S.ActiveCache = Sample.RoomCache;
             S.NearestRoom = Sample.NearestRoomIndex;
             S.bLocalParamsValid = false;
+            S.bLastRoomOwnsBottomValid = false;
         }
 
         bool TryGetLastTunnelCoreWorldEvaluation(
@@ -3827,7 +3830,8 @@ namespace
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     Position.X, Position.Y, Position.Z, GetCache(), nullptr,
                     VoxelGenLOD::ShouldUseSpatialIndex(false),
-                    &S.LastWarpedPosition);
+                    &S.LastWarpedPosition,
+                    S.bLastRoomOwnsBottomValid ? &S.bLastRoomOwnsBottom : nullptr);
                 S.LastTunnelCoreEvaluationPosition = Position;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
             }
@@ -3922,6 +3926,7 @@ namespace
             FState& S = State();
             S.LastWorldPosition = FVector(WorldX, WorldY, WorldZ);
             S.bLastTunnelCoreWorldEvaluationValid = false;
+            S.bLastRoomOwnsBottomValid = false;
 
             // ⚠️ REMIS À -1 INCONDITIONNELLEMENT, ce que l'original ne fait pas : chez lui
             // `NearestRoomIdx` est un `thread_local` qui, quand `RoomDensity <= 0`, garde la valeur
@@ -4184,7 +4189,9 @@ namespace
             const FVector WorldTunnelPosition(WorldX, WorldY, WorldZ);
             float CaveSDF = VoxelCaveMorphology::EvaluateSDFCached(
                 WarpedX, WarpedY, WarpedZ, GetCache(), P.SDFBlendRadius,
-                &S.NearestRoom, bUseSpatialIndex, &WorldTunnelPosition);
+                &S.NearestRoom, bUseSpatialIndex, &WorldTunnelPosition,
+                &S.bLastRoomOwnsBottom);
+            S.bLastRoomOwnsBottomValid = true;
 
             //---------------------------------------------------------------
             // PITS & CHEMINÉES — coordonnées RÉELLES, SmoothMin dans le même canal SDF
@@ -4275,7 +4282,8 @@ namespace
             {
                 S.LastTunnelCoreWorldEvaluation = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, GetCache(), nullptr,
-                    bUseSpatialIndex, &S.LastWarpedPosition);
+                    bUseSpatialIndex, &S.LastWarpedPosition,
+                    &S.bLastRoomOwnsBottom);
                 S.LastTunnelCoreEvaluationPosition = S.LastWorldPosition;
                 S.bLastTunnelCoreWorldEvaluationValid = true;
 

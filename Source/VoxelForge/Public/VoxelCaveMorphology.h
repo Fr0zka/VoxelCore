@@ -1049,6 +1049,10 @@ namespace VoxelCaveMorphology
     //                                  supplied, rooms remain at the query position but the tunnel
     //                                  uses its authored world chain. Null preserves the legacy
     //                                  all-query behavior.
+    // @param OutRoomOwnsBottom      — optional out: true when the query position is inside any
+    //                                  cached room's raw authored shape. When the caller evaluates
+    //                                  the tunnel core for this same sample, pass this result back
+    //                                  to EvaluateTunnelCoreWorld to avoid a second room query.
     // (Room shape variety is baked into FCachedRoom by BuildChunkCache — no per-voxel roll.)
     // @return negative = inside cave, positive = solid rock
     VOXELFORGE_API float EvaluateSDFCached(
@@ -1057,7 +1061,8 @@ namespace VoxelCaveMorphology
         float SDFBlendRadius,
         int32* OutNearestRoomIdx = nullptr,
         bool bUseSpatialIndex = true,
-        const FVector* WorldTunnelPosition = nullptr
+        const FVector* WorldTunnelPosition = nullptr,
+        bool* OutRoomOwnsBottom = nullptr
     );
 
     // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
@@ -1087,7 +1092,10 @@ namespace VoxelCaveMorphology
         // The room graph is evaluated in warped coordinates while the tunnel core is evaluated in
         // the authored world frame. Pass the former when available so room ownership is tested in
         // the same domain as the generic room field.
-        const FVector* RoomQueryPosition = nullptr
+        const FVector* RoomQueryPosition = nullptr,
+        // Optional result from EvaluateSDFCached for this exact sample. When supplied, it avoids
+        // repeating the room-shape containment query; null preserves standalone-call behavior.
+        const bool* CachedRoomOwnsBottom = nullptr
     );
 
     // Per-tile broad reach for the world-space core/floor post.  The bound includes the swept

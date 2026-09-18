@@ -3294,6 +3294,10 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         float BlockTunnelCoreSweptFloorRadius = 0.0f;
         bool bUsedFusedEvaluator = false;
         FTunnelCoreWorldEvaluation FusedTunnelCore;
+        bool bRoomOwnsBottom = false;
+        bool bRoomOwnsBottomValid = false;
+        FVector NativeWarpedPosition = FVector::ZeroVector;
+        bool bNativeWarpedPositionValid = false;
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
         // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
@@ -3322,7 +3326,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     WorldX, WorldY, WorldZ, CP_Tunnel, CP_TunnelFP, LayoutVersion,
                     /*bApplyLegacyStructuralPosts=*/false,
                     &FusedTunnelCore,
-                    /*bCollectFusedDiagnostics=*/true);
+                    /*bCollectFusedDiagnostics=*/true,
+                    &bRoomOwnsBottom);
+                bRoomOwnsBottomValid = true;
             }
 
             const bool bIntegerLatticePoint =
@@ -3432,9 +3438,14 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         case ECaveGeneratorType::TunnelNetwork:
         default:
             // Underwater shares tunnel rock (water table is a render-side overlay).
-            Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
+        Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
                                           CP_TunnelFP, LayoutVersion,
-                                          /*bApplyLegacyStructuralPosts=*/false);       break;
+                                          /*bApplyLegacyStructuralPosts=*/false,
+                                          nullptr, false, &bRoomOwnsBottom,
+                                          &NativeWarpedPosition);
+            bRoomOwnsBottomValid = true;
+            bNativeWarpedPositionValid = true;
+            break;
         }
         DensityCoreTimer.End();
 
@@ -3475,18 +3486,27 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         {
             VoxelDensityProfile::FScopedTimer ProfileTimer(
                 VoxelDensityProfile::EBucket::TunnelCorePosts);
-            FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
-            if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+            FVector RoomQueryPosition;
+            if (bNativeWarpedPositionValid)
             {
-                RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+                RoomQueryPosition = NativeWarpedPosition;
             }
-            RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
+            else
+            {
+                RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
+                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+                {
+                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+                }
+                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
+            }
             PreDisturbanceTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, nullptr,
                 VoxelGenLOD::ShouldUseSpatialIndex(
                     CP_UseOpStack ? bUsedFusedEvaluator : true),
-                &RoomQueryPosition);
+                &RoomQueryPosition,
+                bRoomOwnsBottomValid ? &bRoomOwnsBottom : nullptr);
             bHavePreDisturbanceTunnelCore = true;
         }
 
@@ -3679,19 +3699,28 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
-                FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
-                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+                FVector RoomQueryPosition;
+                if (bNativeWarpedPositionValid)
                 {
-                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+                    RoomQueryPosition = NativeWarpedPosition;
                 }
-                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
+                else
+                {
+                    RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
+                    if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
+                    {
+                        RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
+                    }
+                    RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                        RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
+                }
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
                     nullptr,
                     VoxelGenLOD::ShouldUseSpatialIndex(
                         CP_UseOpStack ? bUsedFusedEvaluator : true),
-                    &RoomQueryPosition);
+                    &RoomQueryPosition,
+                    bRoomOwnsBottomValid ? &bRoomOwnsBottom : nullptr);
                 bHaveTunnelCore = true;
             }
             if (bHaveTunnelCore)
@@ -3828,7 +3857,9 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                                              uint32 ParamsFingerprint, uint32 LayoutVersion,
                                              bool bApplyLegacyStructuralPosts,
                                              FTunnelCoreWorldEvaluation* OutTunnelCore,
-                                             bool bCollectFusedDiagnostics) const
+                                             bool bCollectFusedDiagnostics,
+                                             bool* OutRoomOwnsBottom,
+                                             FVector* OutWarpedPosition) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -3858,6 +3889,14 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     if (OutTunnelCore != nullptr)
     {
         *OutTunnelCore = FTunnelCoreWorldEvaluation();
+    }
+    if (OutRoomOwnsBottom != nullptr)
+    {
+        *OutRoomOwnsBottom = false;
+    }
+    if (OutWarpedPosition != nullptr)
+    {
+        *OutWarpedPosition = FVector::ZeroVector;
     }
     if (bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled())
     {
@@ -3929,6 +3968,10 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         WarpedX += WarpX * VOXEL_NOISE_SCALE * WS;
         WarpedY += WarpY * VOXEL_NOISE_SCALE * WS;
         WarpedZ += WarpZ * VOXEL_NOISE_SCALE * WS;
+    }
+    if (OutWarpedPosition != nullptr)
+    {
+        *OutWarpedPosition = FVector(WarpedX, WarpedY, WarpedZ);
     }
 
     //=========================================================================
@@ -4187,7 +4230,8 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
             SDFCache, Params.SDFBlendRadius,
             &NearestRoomIdx,
             bUseSpatialIndex,
-            &WorldTunnelPosition
+            &WorldTunnelPosition,
+            OutRoomOwnsBottom
         );
 
         // ── PIT & CHIMNEY SDF INTEGRATION ──
@@ -4307,7 +4351,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         const FVector RoomQueryPosition(WarpedX, WarpedY, WarpedZ);
         *OutTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
             WorldX, WorldY, WorldZ, SDFCache, nullptr, bUseSpatialIndex,
-            &RoomQueryPosition);
+            &RoomQueryPosition, OutRoomOwnsBottom);
     }
 
     //=========================================================================
