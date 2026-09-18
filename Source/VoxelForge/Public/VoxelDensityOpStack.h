@@ -607,8 +607,9 @@ namespace VoxelDensityOps
                                        bool bAppendStructuralPosts = true);
 
     /**
-     * VerticalShafts — 9 ops, et **TROIS viennent de Maze sans une ligne de changement** :
-     *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge → [structural post ×4]
+     * VerticalShafts — 11 ops, dont les connecteurs air/sol et les quatre structural posts :
+     *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge
+     *   → ShaftConnectorAir → ShaftConnectorFloor → [structural post ×4]
      *
      * C'est la démonstration que `§2.5` promettait : dans le `switch`, Maze et VerticalShafts sont
      * deux fonctions de ~100 lignes sans rien de commun à l'œil ; en opérateurs, ce sont les mêmes

@@ -2495,14 +2495,16 @@ namespace
             thread_local float   VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f,
                                  VS_MaxR = -1.0f, VS_Cross = -1.0f, VS_ConnR = -1.0f,
                                  VS_Rough = -1.0f, VS_SpineR = -1.0f,
-                                 VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX, VS_Seal = -1.0f;
+                                 VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX, VS_Seal = -1.0f,
+                                 VS_LedgeSpacing = -1.0f, VS_LedgeDepth = -1.0f;
 
             if (CX != VS_CX || CY != VS_CY || Salt != VS_Salt || Spacing != VS_Spacing ||
                 P.ShaftDensity != VS_Dens || P.ShaftMinRadius != VS_MinR || P.ShaftMaxRadius != VS_MaxR ||
                 P.CrossConnectChance != VS_Cross || P.ConnectorRadius != VS_ConnR ||
                 P.SurfaceRoughness != VS_Rough || SpineRadius != VS_SpineR ||
                 P.StrateBottomWorldZ != VS_BotZ || P.StrateTopWorldZ != VS_TopZ ||
-                P.BoundarySealThickness != VS_Seal)
+                P.BoundarySealThickness != VS_Seal || P.LedgeSpacing != VS_LedgeSpacing ||
+                P.LedgeDepth != VS_LedgeDepth)
             {
                 VS_CX = CX;  VS_CY = CY;  VS_Salt = Salt;  VS_Spacing = Spacing;
                 VS_Dens = P.ShaftDensity;  VS_MinR = P.ShaftMinRadius;  VS_MaxR = P.ShaftMaxRadius;
@@ -2510,6 +2512,7 @@ namespace
                 VS_Rough = P.SurfaceRoughness;    VS_SpineR = SpineRadius;
                 VS_BotZ = P.StrateBottomWorldZ;  VS_TopZ = P.StrateTopWorldZ;
                 VS_Seal = P.BoundarySealThickness;
+                VS_LedgeSpacing = P.LedgeSpacing; VS_LedgeDepth = P.LedgeDepth;
                 Cache.Shafts.Reset();
                 Cache.Conns.Reset();
 
@@ -6543,6 +6546,18 @@ namespace
                 CountThreshold(TunnelLowerNoWarp, B.HitTunnelsNoWarp);
             }
 
+            // The pointwise air probe above is intentionally narrower than the final generator
+            // tail: a tunnel can write a solid swept floor at lattice points where its core SDF
+            // is not negative.  Use the morphology module's shared broad reach predicate for the
+            // complete world-space core/floor envelope; it is the same bound used by the mesher's
+            // post-reach decision and keeps this diagnostic conservative for both polarities.
+            if (!B.bMayHaveTunnelCoreTail)
+            {
+                B.bMayHaveTunnelCoreTail =
+                    VoxelCaveMorphology::AnyTunnelCoreWorldNearLattice(
+                        GetBoxCache(), VoxelBox, 1.0f);
+            }
+
             if (B.bMayHaveTunnelCoreAir
                 && bUseLatticeProof
                 && ExactLatticeWorldQueries.Num() > 0)
@@ -6676,7 +6691,11 @@ namespace
                 {
                     B.bMayHaveTunnelCoreAir = bExactAir;
                     B.bMayHaveTunnelSupportFloor = false;
-                    B.bMayHaveTunnelCoreTail = bExactAir;
+                    // Keep the broad geometric tail candidate even when the exact lattice has
+                    // no core-air vertex.  The final generator tail writes both polarities:
+                    // it reopens tunnel air, but it can also write a solid swept floor below an
+                    // otherwise-air stack box.  Collapsing this flag to bExactAir erased the
+                    // latter reach and let the classifier certify a false AllAir child.
                 }
             }
 

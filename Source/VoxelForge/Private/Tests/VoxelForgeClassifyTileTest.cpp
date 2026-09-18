@@ -581,15 +581,14 @@ bool FVoxelForgeOpFoldTest::RunTest(const FString& Parameters)
         }
     }
 
-    // 8. Une marge NULLE avec une amplitude NULLE : le carve ne retire rien, mais `0 > 0` est faux,
-    //    donc l'hypothèse meurt quand même. C'est voulu — une marge inconnue reste inconnue, et un
-    //    opérateur qui ne fait rien devrait rendre `Identity`, pas `CarveOnly` d'amplitude 0.
+    // 8. Une amplitude nulle est une identité prouvée : elle ne doit pas détruire une hypothèse
+    //    AllSolid déjà forcée, même si sa marge numérique vaut zéro.
     {
         FVoxelBoxHypotheses H;
         VF_ForceHypotheses(H, EVoxelTileClass::AllSolid, 0.0f);
         VF_FoldEffect(H, EVoxelOpEffect::CarveOnly, 0.0f, 0.0f);
-        TestEqual(TEXT("zero margin dies even to a zero carve -- unknown is not zero"),
-                  (int32)H.Resolve(), (int32)EVoxelTileClass::Mixed);
+        TestEqual(TEXT("a proven zero carve preserves an AllSolid verdict"),
+                  (int32)H.Resolve(), (int32)EVoxelTileClass::AllSolid);
     }
 
     return true;

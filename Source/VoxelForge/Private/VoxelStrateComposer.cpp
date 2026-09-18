@@ -781,11 +781,17 @@ namespace
     void VF_ValidateStructProperties(const TMap<FString, FProperty*>& Properties,
                                      const TSet<FString>& ExpectedNames,
                                      const FString& ParamStructName,
+                                     ECaveGeneratorType Archetype,
                                      bool& bSchemaValid, FString& SchemaError)
     {
         for (const TPair<FString, FProperty*>& Pair : Properties)
         {
-            if (!ExpectedNames.Contains(Pair.Key))
+            // A reflected compatibility property may be intentionally absent from the
+            // tunable-field X-macro. Keep it visible in reflection/serialization, but let the
+            // explicit exclusion list explain why it is not blended or rolled.
+            const bool bExplicitlyExcluded =
+                VF_IsTunnelArchetype(Archetype) && VF_FindExclusion(Pair.Key) != nullptr;
+            if (!ExpectedNames.Contains(Pair.Key) && !bExplicitlyExcluded)
             {
                 bSchemaValid = false;
                 VF_AppendSchemaError(SchemaError,
@@ -1129,6 +1135,8 @@ namespace
             if (FieldName == TEXT("RoomFloorCutMax")) return Set(0.0f, 1.0f);
             if (FieldName == TEXT("FloorReliefStrength")) return Set(0.0f, HQuarter);
             if (FieldName == TEXT("FloorReliefFrequency")) return Set(0.001f, 0.10f);
+            if (FieldName == TEXT("RoomMouthRiseStrength")) return Set(0.0f, 1.0f);
+            if (FieldName == TEXT("RoomMouthRiseBlendVoxels")) return Set(8.0f, 128.0f);
             if (FieldName == TEXT("OriginRoomRadius")) return Set(24.0f, FMath::Max(64.0f, H * 0.75f));
             if (FieldName == TEXT("TunnelMinRadius")) return Set(6.0f, FMath::Max(8.0f, HQuarter));
             if (FieldName == TEXT("TunnelMaxRadius")) return Set(8.0f, FMath::Max(16.0f, H * 0.25f));
@@ -1422,11 +1430,19 @@ namespace
                                   void* Memory,
                                   FRandomStream& ScalarRng,
                                   FRandomStream& CategoryRng,
-                                  float StrateHeightInVoxels)
+                                  float StrateHeightInVoxels,
+                                  FString* OutFailureReason = nullptr)
     {
         UStruct* Struct = VF_GetParamStruct(Archetype);
         if (Struct == nullptr || Memory == nullptr)
         {
+            if (OutFailureReason != nullptr)
+            {
+                *OutFailureReason = Struct == nullptr
+                    ? FString::Printf(TEXT("no reflected parameter struct for archetype %d"),
+                                      static_cast<int32>(Archetype))
+                    : TEXT("reflected parameter memory was null");
+            }
             return false;
         }
 
@@ -1453,6 +1469,11 @@ namespace
             if (!VF_IsScalarProperty(Property))
             {
                 bValid = false;
+                if (OutFailureReason != nullptr && OutFailureReason->IsEmpty())
+                {
+                    *OutFailureReason = FString::Printf(
+                        TEXT("reflected field '%s' is not scalar"), *FieldName);
+                }
                 continue;
             }
 
@@ -1467,6 +1488,11 @@ namespace
                 // No current non-tunnel family has an enum. Keep the failure explicit if one is
                 // added without a legal-value declaration instead of silently writing a default.
                 bValid = false;
+                if (OutFailureReason != nullptr && OutFailureReason->IsEmpty())
+                {
+                    *OutFailureReason = FString::Printf(
+                        TEXT("reflected enum field '%s' has no legal-value sampler"), *FieldName);
+                }
                 continue;
             }
 
@@ -1475,10 +1501,21 @@ namespace
                                        StrateHeightInVoxels, Range))
             {
                 bValid = false;
+                if (OutFailureReason != nullptr && OutFailureReason->IsEmpty())
+                {
+                    *OutFailureReason = FString::Printf(
+                        TEXT("reflected field '%s' has no declared roll range"), *FieldName);
+                }
                 continue;
             }
-            bValid = VF_WritePropertyValue(Property, Memory,
-                VF_RollCorpusFreeFloat(ScalarRng, Range)) && bValid;
+            const bool bWrote = VF_WritePropertyValue(Property, Memory,
+                VF_RollCorpusFreeFloat(ScalarRng, Range));
+            bValid = bWrote && bValid;
+            if (!bWrote && OutFailureReason != nullptr && OutFailureReason->IsEmpty())
+            {
+                *OutFailureReason = FString::Printf(
+                    TEXT("could not write reflected field '%s'"), *FieldName);
+            }
         }
         return bValid;
     }
@@ -1900,6 +1937,7 @@ namespace
             Mode == EVoxelStrateCorpusFreeSamplingMode::ConstraintSampled;
 
         bool bValid = false;
+        FString ReflectionFailure;
         if (VF_IsTunnelArchetype(Archetype))
         {
             bValid = VF_SampleTunnelFields(Params.TunnelNetworkParams, ScalarRng,
@@ -1909,7 +1947,8 @@ namespace
         else
         {
             bValid = VF_SampleReflectedFields(Archetype, VF_GetParamMemory(Params, Archetype),
-                                              ScalarRng, CategoryRng, StrateHeightInVoxels);
+                                              ScalarRng, CategoryRng, StrateHeightInVoxels,
+                                              &ReflectionFailure);
         }
         if (bValid && bConstraintSampled)
         {
@@ -1949,7 +1988,11 @@ namespace
         }
         if (!bValid)
         {
-            Result.FailureReason = TEXT("Corpus-free field schema has no declared roll range.");
+            Result.FailureReason = ReflectionFailure.IsEmpty()
+                ? FString::Printf(TEXT("Corpus-free sampler rejected archetype %d (mode %d) "
+                                   "without a field-specific reason."),
+                                   static_cast<int32>(Archetype), static_cast<int32>(Mode))
+                : ReflectionFailure;
             return Result;
         }
 
@@ -3241,6 +3284,10 @@ const TArray<FVoxelStrateFieldExclusion>& FVoxelStrateCorpus::GetNonTunableField
         VF_AddExclusion(Result, TEXT("ChimneyMaxRadius"), DeadTerrainOpReason);
         VF_AddExclusion(Result, TEXT("ChimneyHeight"), DeadTerrainOpReason);
 
+        VF_AddExclusion(Result, TEXT("bTunnelFloorEnabled"), TEXT(
+            "Deprecated serialized compatibility field: tunnel geometry always owns its floor, "
+            "so this value is ignored and must not be blended or rolled."));
+
         VF_AddExclusion(Result, TEXT("StrateTopWorldZ"), TEXT(
             "Runtime Z bound supplied by UVoxelStrateManager for the active layout slot; not a tunable."));
         VF_AddExclusion(Result, TEXT("StrateBottomWorldZ"), TEXT(
@@ -3324,14 +3371,15 @@ void FVoxelStrateCorpus::RebuildSpreads()
                                    TEXT("StrateBottomWorldZ"), EVoxelStrateFieldKind::Continuous);
         }
 
-        VF_ValidateStructProperties(Properties, ExpectedNames, ParamStructName,
+        VF_ValidateStructProperties(Properties, ExpectedNames, ParamStructName, Archetype,
                                      bSchemaValid, SchemaError);
 
         if (VF_IsTunnelArchetype(Archetype))
         {
             for (const FVoxelStrateFieldExclusion& Exclusion : GetNonTunableFields())
             {
-                if (!ExpectedNames.Contains(Exclusion.FieldName))
+                if (!ExpectedNames.Contains(Exclusion.FieldName)
+                    && !Properties.Contains(Exclusion.FieldName))
                 {
                     bSchemaValid = false;
                     VF_AppendSchemaError(SchemaError,

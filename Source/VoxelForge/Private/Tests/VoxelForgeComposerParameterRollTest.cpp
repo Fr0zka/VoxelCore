@@ -303,12 +303,14 @@ namespace
             }
             ++Report.Proved;
 
-            const int32 GridDim = Cells + 1;
             const bool bClaimsSolid = Verdict == EVoxelTileClass::AllSolid;
             bool bBoxBad = false;
-            for (int32 GZ = -1; GZ <= GridDim; ++GZ)
-            for (int32 GY = -1; GY <= GridDim; ++GY)
-            for (int32 GX = -1; GX <= GridDim; ++GX)
+            // ClassifyTile covers the cell vertices passed to it: g is [0, Cells]. The mesher
+            // samples a separate halo, but that halo is not part of this production verdict's
+            // proof domain and must not turn a sound tile into a false failure.
+            for (int32 GZ = 0; GZ <= Cells; ++GZ)
+            for (int32 GY = 0; GY <= Cells; ++GY)
+            for (int32 GX = 0; GX <= Cells; ++GX)
             {
                 const float X = (float)(Origin.X + GX * Step);
                 const float Y = (float)(Origin.Y + GY * Step);

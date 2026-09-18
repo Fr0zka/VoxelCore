@@ -152,7 +152,7 @@ bool FVoxelForgeOpStackChannelTest::RunTest(const FString& Parameters)
         FVoxelOpStack Stack;
         VoxelDensityOps::BuildVerticalShaftStack(
             Stack, Params, Seed, Generator->OriginSpineRadius, World.StrateManager.Get());
-        Validate(Stack, TEXT("VerticalShafts"), 9);
+        Validate(Stack, TEXT("VerticalShafts"), 11);
     }
 
     if (MidChunkForSlot(FTestWorld::SlotFloatingIsland, TEXT("FloatingIslands"), MidChunkZ))

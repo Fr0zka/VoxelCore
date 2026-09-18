@@ -6246,15 +6246,23 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             && RoomBox.bMayHaveTunnelCoreAir;
         const bool bHasTunnelSupportCandidate = bHasRoomGeometry
             && RoomBox.bMayHaveTunnelSupportFloor;
-        // The tail has two polarities.  A solid-only tail cannot turn a proven solid child into
-        // geometry, and an air-only tail cannot turn a proven air child into geometry.  Keep the
-        // uncertain Mixed parent conservative by descending; at the resolved children only the
-        // polarity that can change the answer is allowed to request a final-field certificate.
+        const bool bHasTunnelCoreTailCandidate = bHasRoomGeometry
+            && RoomBox.bMayHaveTunnelCoreTail;
+        // The final graph tail has two polarities: it can reopen tunnel air and it can write a
+        // solid swept floor below an otherwise-air stack box.  Resolved children use the broad
+        // reach candidate directly.  A Mixed ancestor remains on the cheap interval path until
+        // the leaf-sized refinement, where the same candidate requests an exact final-field
+        // certificate; this avoids paying the final evaluator at every ancestor node.
         const bool bHasTunnelCoreCandidate = Whole == EVoxelTileClass::AllSolid
             ? bHasTunnelAirCandidate
             : Whole == EVoxelTileClass::AllAir
-                ? bHasTunnelSupportCandidate
+                ? (bHasTunnelSupportCandidate
+                    || bHasTunnelAirCandidate
+                    || bHasTunnelCoreTailCandidate)
                 : false;
+        const bool bHasMixedTunnelCoreCandidate = Whole == EVoxelTileClass::Mixed
+            && Depth >= 3
+            && bHasTunnelCoreTailCandidate;
         // FPassageCarveOp and FOriginSpine are already in the stack.  Reusing their broad spatial
         // candidates here was the LOD0 bug: a passage that the stack had already proved to miss
         // the sampled sign still forced a final-field refinement of every mixed parent.  Only the
@@ -6278,25 +6286,32 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             && StructuralManager->AnyOriginLandingAirNearLattice(
                 Box, Context.LatticeOriginVoxels, Context.Step,
                 StructuralBaseDensity, Context.EdgeSealThickness);
-        // Floors only add solid.  They matter when this core box is already AllAir; on a Mixed
-        // parent, descending to its children preserves the proof while avoiding a padded floor
-        // AABB forcing a final-field walk over every mixed ancestor.  Ask the exact lattice floor
-        // predicate only at an AllAir child.  It is conservative on malformed data and never
-        // grants a skip.
+        // Solid structural writers matter not only when the interval is already AllAir: the
+        // refinement may first see Mixed, then prove AllAir with its exact *core* lattice
+        // certificate.  If that child is near a landing/native floor, the core certificate is not
+        // the final MC field and would skip a solid sample.  Keep the query conservative on every
+        // non-AllSolid child; only small children pay the final-field walk below.
         const bool bHasCarveCandidate = bPassageAirCandidate || bOriginAirCandidate;
+        const bool bHasSolidStructuralCandidate = StructuralManager != nullptr
+            && (StructuralManager->AnyLandingFloorAtLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step)
+                // The passage's authored D-floor is a final MC-space writer, not part of the
+                // interpreted stack. It was deliberately left out of the old support-floor query
+                // when the legacy slab was removed; omitting the native-floor reach here lets an
+                // exact core-lattice AllAir claim skip a tile whose final density is solid.
+                || StructuralManager->AnyPassageStructuralPostNearLattice(
+                    Box, Context.LatticeOriginVoxels, Context.Step));
         const bool bHasStructuralCandidate = Whole == EVoxelTileClass::AllSolid
-                ? bHasCarveCandidate
-                : Whole == EVoxelTileClass::AllAir
-                    && (StructuralManager != nullptr
-                    && StructuralManager->AnyLandingFloorAtLattice(
-                        Box, Context.LatticeOriginVoxels, Context.Step));
+            ? bHasCarveCandidate
+            : bHasSolidStructuralCandidate;
         // A resolved core box still needs a finite-lattice certificate when a common MC tail can
         // rewrite it (passage/landing posts or the graph tunnel-core backstop).  Without this,
         // the interval proves the stack's "all solid" field and silently skips a core tunnel
         // that GetDensityAt opens afterwards.  Boxes with no tail candidate retain the cheap
         // interval path.
         const bool bNeedsFinalField = Generator != nullptr
-            && (bHasStructuralCandidate || bHasTunnelCoreCandidate);
+            && (bHasStructuralCandidate || bHasTunnelCoreCandidate
+                || bHasMixedTunnelCoreCandidate);
         if (Stats && bNeedsFinalField)
         {
             ++Stats->NeedsFinalFieldNodes;
@@ -6318,9 +6333,11 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             int32 ExactIX0 = 0, ExactIY0 = 0, ExactIZ0 = 0;
             int32 ExactIX1 = 0, ExactIY1 = 0, ExactIZ1 = 0;
             int64 ExactCount = 0;
-            if (GetLatticeBounds(Box, ExactIX0, ExactIY0, ExactIZ0,
+            const bool bHasExactBounds = GetLatticeBounds(
+                Box, ExactIX0, ExactIY0, ExactIZ0,
                                  ExactIX1, ExactIY1, ExactIZ1, ExactCount)
-                && ExactCount <= 8192)
+                && ExactCount <= 8192;
+            if (bHasExactBounds)
             {
                 bAttemptedExact = true;
                 const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, true);
@@ -6676,7 +6693,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         RecipeStack.PrepareChunk(RecipeContext);
         const EVoxelTileClass RecipeVerdict =
             VF_ClassifyBoxWithWarpRetry(RecipeStack, TileVoxelBox, RecipeContext,
-                                        nullptr, nullptr, 8.0f, OutStats);
+                                        this, StrateManager, 8.0f, OutStats);
         if (RecipeVerdict == EVoxelTileClass::Mixed)
         {
         }
@@ -6771,7 +6788,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         RegionStack.PrepareChunk(RegionContext);
         const EVoxelTileClass RegionVerdict =
             VF_ClassifyBoxWithWarpRetry(RegionStack, TileVoxelBox, RegionContext,
-                                        nullptr, nullptr, 8.0f, OutStats);
+                                        this, StrateManager, 8.0f, OutStats);
         if (RegionVerdict == EVoxelTileClass::Mixed)
         {
         }
@@ -7051,6 +7068,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         if (StrateManager->AnyPassageLandingFloorNearLattice(
                 TileVoxelBox, OriginVoxels, Step)
             || StrateManager->AnyOriginLandingFloorNearLattice(
+                TileVoxelBox, OriginVoxels, Step)
+            || StrateManager->AnyPassageStructuralPostNearLattice(
                 TileVoxelBox, OriginVoxels, Step))
         {
             return EVoxelTileClass::Mixed;
@@ -7065,8 +7084,22 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     {
         bCanSolid = false;
     }
-    if (StrateManager->AnyPassageLandingFloorNearLattice(
-            TileVoxelBox, OriginVoxels, Step))
+    const bool bHasPassageLandingFloorCandidate =
+        StrateManager->AnyPassageLandingFloorNearLattice(
+            TileVoxelBox, OriginVoxels, Step);
+    const bool bHasOriginLandingFloorCandidate =
+        StrateManager->AnyOriginLandingFloorNearLattice(
+            TileVoxelBox, OriginVoxels, Step);
+    // These final solid writers are outside the core operator verdict. Keep their candidate
+    // state after the stack fold too: the AllAir branch below must not re-enable a polarity that
+    // an earlier structural guard already killed.
+    const bool bHasPassageStructuralPostCandidate =
+        StrateManager->AnyPassageStructuralPostNearLattice(
+            TileVoxelBox, OriginVoxels, Step);
+    const bool bHasSolidStructuralCandidate = bHasPassageLandingFloorCandidate
+        || bHasOriginLandingFloorCandidate
+        || bHasPassageStructuralPostCandidate;
+    if (bHasPassageLandingFloorCandidate)
     {
         bCanAir = false;
     }
@@ -7075,8 +7108,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     {
         bCanSolid = false;
     }
-    if (StrateManager->AnyOriginLandingFloorNearLattice(
-            TileVoxelBox, OriginVoxels, Step))
+    if (bHasOriginLandingFloorCandidate)
+    {
+        bCanAir = false;
+    }
+    // Native passage D-floors are authored structural posts applied after the operator stack.
+    // They are not the removed legacy support slab, but they still add solid MC samples and
+    // therefore must kill the AllAir hypothesis before a tile can be skipped.
+    if (bHasPassageStructuralPostCandidate)
     {
         bCanAir = false;
     }
@@ -7306,6 +7345,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         else
         {
             bCanSolid = false;
+        }
+
+        // The stack verdict does not own these final MC-space solid writers. In particular, an
+        // AllAir core result must not restore bCanAir after a native D-floor or landing-floor
+        // candidate has already made the full field potentially solid.
+        if (bHasSolidStructuralCandidate)
+        {
+            bCanAir = false;
         }
 
         // Le verdict cave se plie avec gap=solide, hors-layout=air, seals surface=solide. Si les

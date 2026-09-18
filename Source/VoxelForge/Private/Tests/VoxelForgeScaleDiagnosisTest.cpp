@@ -19,16 +19,9 @@
 namespace
 {
     constexpr int32 DiagnosisSeed = 0;
-    // These are single-region seed-0 identities in the current corpus asset/default set. Keep the
-    // probes on real candidates rather than silently testing fixture defaults when a field changes.
-    constexpr int32 CrystalCandidateIndex = 50;
-    constexpr int32 FlatCandidateIndex = 28;
-    constexpr int32 FloatingCandidateIndex = 4;
-    constexpr int32 MazeCandidateIndex = 9;
-    constexpr int32 SurfaceCandidateIndex = 11;
-    constexpr int32 TunnelCandidateIndex = 20;
-    constexpr int32 UnderwaterCandidateIndex = 6;
-    constexpr int32 ShaftCandidateIndex = 10;
+    // Candidate indices are selected from a bounded deterministic catalogue below. The corpus
+    // membership is allowed to change, but a diagnosis must still use a real single-region roll.
+    constexpr int32 CandidateSearchLimit = 512;
     constexpr int32 RadialSampleMaxVoxels = 48;
     constexpr int32 FineDiagnosisMaxCells = 4000000;
 
@@ -150,6 +143,30 @@ namespace
         Definition->bUseOperatorStack = true;
         Definition->TransitionType = EVoxelStrateTransition::Hard;
         World.Reinitialize();
+    }
+
+    bool VF_FindSingleRegionCandidate(
+        const FVoxelStrateCorpus& Corpus,
+        ECaveGeneratorType Archetype,
+        int32 Seed,
+        int32& OutIndex,
+        FVoxelStrateComposerCandidate& OutCandidate)
+    {
+        for (int32 CandidateIndex = 0; CandidateIndex < CandidateSearchLimit; ++CandidateIndex)
+        {
+            const FVoxelStrateComposerCandidate Candidate = VF_RollStrateCandidate(
+                Corpus, Seed, CandidateIndex, false);
+            if (Candidate.bValid && Candidate.Archetype == Archetype
+                && Candidate.Regions.IsSingleRegion())
+            {
+                OutIndex = CandidateIndex;
+                OutCandidate = Candidate;
+                return true;
+            }
+        }
+        OutIndex = INDEX_NONE;
+        OutCandidate = FVoxelStrateComposerCandidate();
+        return false;
     }
 
     int32 VF_MidChunkZ(const VoxelForgeTest::FTestWorld& World, int32 SlotIndex)
@@ -849,8 +866,8 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    // The corpus asset changed after d97373c; keep the current-corpus identity probes explicit
-    // while the historical H3 rows below remain comparison baselines.
+    // Resolve every probe from the current corpus. This keeps the diagnosis attached to real
+    // single-region candidates without making a corpus asset edit look like a geometry failure.
     FTestWorld World;
     World.Build(DiagnosisSeed, 2, true, 8);
     if (!World.IsValid())
@@ -864,21 +881,68 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("scale diagnosis keeps lateral regions gated off"),
               VF_LateralRegionsAreShippable());
 
-    const FVoxelStrateComposerCandidate MazeCandidate = VF_RollStrateCandidate(
-        Corpus, DiagnosisSeed, MazeCandidateIndex, false);
-    const FVoxelStrateComposerCandidate TunnelCandidate = VF_RollStrateCandidate(
-        Corpus, DiagnosisSeed, TunnelCandidateIndex, false);
-    const FVoxelStrateComposerCandidate ShaftCandidate = VF_RollStrateCandidate(
-        Corpus, DiagnosisSeed, ShaftCandidateIndex, false);
-    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid Maze candidate"),
-                             DiagnosisSeed, MazeCandidateIndex),
-             MazeCandidate.bValid && MazeCandidate.Archetype == ECaveGeneratorType::Maze);
-    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid TunnelNetwork candidate"),
-                             DiagnosisSeed, TunnelCandidateIndex),
-             TunnelCandidate.bValid && TunnelCandidate.Archetype == ECaveGeneratorType::TunnelNetwork);
-    TestTrue(FString::Printf(TEXT("seed %d index %d is a valid VerticalShafts candidate"),
-                             DiagnosisSeed, ShaftCandidateIndex),
-             ShaftCandidate.bValid && ShaftCandidate.Archetype == ECaveGeneratorType::VerticalShafts);
+    int32 MazeCandidateIndex = INDEX_NONE;
+    int32 TunnelCandidateIndex = INDEX_NONE;
+    int32 ShaftCandidateIndex = INDEX_NONE;
+    int32 CrystalCandidateIndex = INDEX_NONE;
+    int32 FlatCandidateIndex = INDEX_NONE;
+    int32 FloatingCandidateIndex = INDEX_NONE;
+    int32 SurfaceCandidateIndex = INDEX_NONE;
+    int32 UnderwaterCandidateIndex = INDEX_NONE;
+    FVoxelStrateComposerCandidate MazeCandidate;
+    FVoxelStrateComposerCandidate TunnelCandidate;
+    FVoxelStrateComposerCandidate ShaftCandidate;
+    FVoxelStrateComposerCandidate CrystalCandidate;
+    FVoxelStrateComposerCandidate FlatCandidate;
+    FVoxelStrateComposerCandidate FloatingCandidate;
+    FVoxelStrateComposerCandidate SurfaceCandidate;
+    FVoxelStrateComposerCandidate UnderwaterCandidate;
+
+    const bool bHaveMazeCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::Maze, DiagnosisSeed, MazeCandidateIndex, MazeCandidate);
+    const bool bHaveTunnelCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::TunnelNetwork, DiagnosisSeed,
+        TunnelCandidateIndex, TunnelCandidate);
+    const bool bHaveShaftCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::VerticalShafts, DiagnosisSeed,
+        ShaftCandidateIndex, ShaftCandidate);
+    const bool bHaveCrystalCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::CrystalChamber, DiagnosisSeed,
+        CrystalCandidateIndex, CrystalCandidate);
+    const bool bHaveFlatCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::FlatPlain, DiagnosisSeed, FlatCandidateIndex, FlatCandidate);
+    const bool bHaveFloatingCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::FloatingIslands, DiagnosisSeed,
+        FloatingCandidateIndex, FloatingCandidate);
+    const bool bHaveSurfaceCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::SurfaceWorld, DiagnosisSeed,
+        SurfaceCandidateIndex, SurfaceCandidate);
+    const bool bHaveUnderwaterCandidate = VF_FindSingleRegionCandidate(
+        Corpus, ECaveGeneratorType::Underwater, DiagnosisSeed,
+        UnderwaterCandidateIndex, UnderwaterCandidate);
+
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region Maze candidate"),
+             bHaveMazeCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region TunnelNetwork candidate"),
+             bHaveTunnelCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region VerticalShafts candidate"),
+             bHaveShaftCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region CrystalChamber candidate"),
+             bHaveCrystalCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region FlatPlain candidate"),
+             bHaveFlatCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region FloatingIslands candidate"),
+             bHaveFloatingCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region SurfaceWorld candidate"),
+             bHaveSurfaceCandidate);
+    TestTrue(TEXT("bounded seed-0 catalogue contains a single-region Underwater candidate"),
+             bHaveUnderwaterCandidate);
+    if (!bHaveMazeCandidate || !bHaveTunnelCandidate || !bHaveShaftCandidate
+        || !bHaveCrystalCandidate || !bHaveFlatCandidate || !bHaveFloatingCandidate
+        || !bHaveSurfaceCandidate || !bHaveUnderwaterCandidate)
+    {
+        return false;
+    }
 
     // H1 — direct GetDensityAt radial crossings. The Maze is the fourth one-based layout slot
     // (FTestWorld uses zero-based SlotMaze == 3), matching the requested "slot 4".
@@ -1224,7 +1288,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
         }
     }
 
-    // H3 — the eight fixed current-corpus identities, measured at step 1 on the topology-aware
+    // H3 — one bounded-catalogue identity per archetype, measured at step 1 on the topology-aware
     // fitted window. Origin-rooted families include (0,0) before the MaxCells refusal check.
     struct FShowcaseSelection
     {

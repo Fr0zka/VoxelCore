@@ -781,9 +781,81 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
         static_cast<float>(TimingSink)));
 
     // The live editor hand-off must activate the region parent even when the authored definition
-    // did not opt into the operator stack. The direct stack above is the oracle for the same
-    // candidate and target slot.
+    // did not opt into the operator stack. The direct stack above is the oracle for points that
+    // are outside the generator's common passage/landing tail; points in those domains are
+    // intentionally not compared because the live owner adds the current MC post there.
     {
+        struct FLivePoint
+        {
+            FVector Position = FVector::ZeroVector;
+            float Before = 0.0f;
+            float After = 0.0f;
+            float Repeat = 0.0f;
+        };
+        TArray<FLivePoint> Points;
+        constexpr int32 RequiredNonTailPoints = 64;
+        constexpr int32 SearchExtent = 2048;
+        constexpr int32 SearchStep = 64;
+        int32 NonTailCandidates = 0;
+        const FVector HalfBox(0.5f, 0.5f, 0.5f);
+        auto HasOwnerTail = [&](const FVector& Position)
+        {
+            return World.StrateManager->AnyPassageNearBox(
+                       Position - HalfBox, Position + HalfBox)
+                || World.StrateManager->AnyPassageLandingFloorNearBox(
+                       Position - HalfBox, Position + HalfBox)
+                || World.StrateManager->AnyOriginLandingFloorNearBox(
+                       Position - HalfBox, Position + HalfBox);
+        };
+
+        // Keep the original local samples as a tail exercise, then search a larger deterministic
+        // lattice for points outside the common passage/landing post-process. The old +/-64 box
+        // was entirely tail in the current authored world, so it could not test the live lateral
+        // hand-off at all.
+        for (int32 ZOffset = -16; ZOffset <= 16; ZOffset += 8)
+        {
+            for (int32 Y = -64; Y <= 64; Y += 16)
+            {
+                for (int32 X = -64; X <= 64; X += 16)
+                {
+                    FLivePoint& Point = Points.AddDefaulted_GetRef();
+                    Point.Position = FVector(static_cast<float>(X), static_cast<float>(Y),
+                                             static_cast<float>(TimingZ + ZOffset));
+                    Point.Before = World.Generator->GetDensityAt(
+                        Point.Position.X, Point.Position.Y, Point.Position.Z);
+                }
+            }
+        }
+        for (int32 ZOffset = -16;
+             ZOffset <= 16 && NonTailCandidates < RequiredNonTailPoints;
+             ZOffset += 8)
+        {
+            for (int32 Y = -SearchExtent;
+                 Y <= SearchExtent && NonTailCandidates < RequiredNonTailPoints;
+                 Y += SearchStep)
+            {
+                for (int32 X = -SearchExtent;
+                     X <= SearchExtent && NonTailCandidates < RequiredNonTailPoints;
+                     X += SearchStep)
+                {
+                    const FVector Position(
+                        static_cast<float>(X), static_cast<float>(Y),
+                        static_cast<float>(TimingZ + ZOffset));
+                    if (HasOwnerTail(Position))
+                    {
+                        continue;
+                    }
+                    FLivePoint& Point = Points.AddDefaulted_GetRef();
+                    Point.Position = Position;
+                    Point.Before = World.Generator->GetDensityAt(
+                        Point.Position.X, Point.Position.Y, Point.Position.Z);
+                    ++NonTailCandidates;
+                }
+            }
+        }
+        TestTrue(TEXT("lateral handoff fixture found non-tail samples"),
+                 NonTailCandidates >= RequiredNonTailPoints);
+
         FString OverrideError;
         const bool bInstalled = World.StrateManager->SetComposerOverrideForStrate(
             TargetStrateIndex, MultiCandidate.Seed, MultiCandidate.Archetype,
@@ -792,28 +864,61 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
         TestTrue(TEXT("multi-region composer override installs"), bInstalled);
         if (bInstalled)
         {
-            bool bLiveEqual = true;
-            for (int32 ZOffset = -16; ZOffset <= 16 && bLiveEqual; ZOffset += 8)
+            int32 ChangedPoints = 0;
+            int32 ComparablePoints = 0;
+            int32 ComparableMismatches = 0;
+            int32 RepeatMismatches = 0;
+            FString FirstMismatch;
+            for (FLivePoint& Point : Points)
             {
-                for (int32 Y = -64; Y <= 64 && bLiveEqual; Y += 16)
+                Point.After = World.Generator->GetDensityAt(
+                    Point.Position.X, Point.Position.Y, Point.Position.Z);
+                Point.Repeat = World.Generator->GetDensityAt(
+                    Point.Position.X, Point.Position.Y, Point.Position.Z);
+                if (!VF_BitEqual(Point.Before, Point.After))
                 {
-                    for (int32 X = -64; X <= 64; X += 16)
+                    ++ChangedPoints;
+                }
+                if (!VF_BitEqual(Point.After, Point.Repeat))
+                {
+                    ++RepeatMismatches;
+                }
+
+                if (HasOwnerTail(Point.Position))
+                {
+                    continue;
+                }
+                ++ComparablePoints;
+                const float Direct = Stack.EvalMC(
+                    Point.Position.X, Point.Position.Y, Point.Position.Z);
+                if (!VF_BitEqual(Direct, Point.After))
+                {
+                    ++ComparableMismatches;
+                    if (FirstMismatch.IsEmpty())
                     {
-                        const float Direct = Stack.EvalMC(static_cast<float>(X),
-                                                          static_cast<float>(Y),
-                                                          static_cast<float>(TimingZ + ZOffset));
-                        const float Live = World.Generator->GetDensityAt(
-                            static_cast<float>(X), static_cast<float>(Y),
-                            static_cast<float>(TimingZ + ZOffset));
-                        if (!VF_BitEqual(Direct, Live))
-                        {
-                            bLiveEqual = false;
-                            break;
-                        }
+                        FirstMismatch = FString::Printf(
+                            TEXT("lateral handoff mismatch at (%.0f,%.0f,%.0f): direct=%.9g live=%.9g"),
+                            Point.Position.X, Point.Position.Y, Point.Position.Z,
+                            Direct, Point.After);
                     }
                 }
             }
-            TestTrue(TEXT("live generator evaluates the installed lateral parent"), bLiveEqual);
+            TestTrue(TEXT("live lateral override changes at least one sampled value"),
+                     ChangedPoints > 0);
+            TestTrue(TEXT("live lateral override leaves a non-tail comparison set"),
+                     ComparablePoints >= 20);
+            TestEqual(TEXT("live lateral override matches its direct stack outside the common tail"),
+                      ComparableMismatches, 0);
+            TestEqual(TEXT("live lateral override is repeatable"), RepeatMismatches, 0);
+            AddInfo(FString::Printf(
+                TEXT("live lateral handoff: changed=%d comparable=%d fixture_non_tail=%d "
+                     "mismatches=%d repeat_mismatches=%d search_extent=%d step=%d"),
+                ChangedPoints, ComparablePoints, NonTailCandidates,
+                ComparableMismatches, RepeatMismatches, SearchExtent, SearchStep));
+            if (!FirstMismatch.IsEmpty())
+            {
+                AddInfo(FirstMismatch);
+            }
             if (!OverrideError.IsEmpty()) { AddInfo(OverrideError); }
         }
     }

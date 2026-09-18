@@ -6,6 +6,7 @@ param(
     [ValidateSet('owner', 'default')]
     [string]$Assets = 'owner',
     [hashtable]$Cvars = @{},
+    [string]$TestFilter,
     [string]$Out,
     [string]$Label
 )
@@ -27,6 +28,9 @@ $EngineRoot = 'E:\Program Files\Epic Games\UE_5.7'
 $EditorExe = Join-Path $EngineRoot 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 $UbtDll = Join-Path $EngineRoot 'Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll'
 $LaunchTimeoutSeconds = 1800
+# The VoxelForge category includes two late, several-minute op-stack sweeps. They remain in
+# the suite; when the serialized aggregate launch reaches this 30-minute guard, validate those
+# named tests with -TestFilter so every test still runs under the standing launch limit.
 # Fresh branch-tip baseline at 1c642fd1824a7e0e4f88a8fc1f42b9e23fdb1821 after a clean staged
 # sync (synthetic canonical, walk+export+probe). This is intentionally asserted so any
 # field-affecting edit makes canonical fail loudly.
@@ -252,13 +256,13 @@ function Get-NewCrashes($Before, [datetime]$StartedUtc) {
 function Wait-OwnedProcess($Process, [int]$TimeoutSeconds) {
     $finished = $Process.WaitForExit($TimeoutSeconds * 1000)
     if ($finished) {
-        $Process.WaitForExit()
+        [void]$Process.WaitForExit()
         return [ordered]@{ timed_out = $false; exit_code = [int]$Process.ExitCode }
     }
     # This PID came from our Start-Process call. Never use a name-based kill or a broad process
     # query here: an owner's editor may be unrelated and must remain untouched.
     try { Stop-Process -Id ([int]$Process.Id) -Force -ErrorAction Stop } catch { }
-    try { $Process.WaitForExit(5000) } catch { }
+    try { [void]$Process.WaitForExit(5000) } catch { }
     return [ordered]@{ timed_out = $true; exit_code = $null }
 }
 
@@ -392,7 +396,10 @@ function Sync-StagedHost {
 
 function Sync-OwnerAssets {
     $rows = [System.Collections.Generic.List[object]]::new()
-    foreach ($assetName in @('DA_Strate3', 'DA_Settings')) {
+    # Composer tests discover the authored strate corpus from the staged asset registry. Keep the
+    # complete owner corpus here; the explore commandlet still selects DA_Strate3 explicitly for
+    # the owner-world scenario below.
+    foreach ($assetName in @('DA_Strate1', 'DA_Strate2', 'DA_Strate3', 'DA_Strate4', 'DA_Settings')) {
         $source = Join-Path $ProjectRoot "Content\VoxelForge\$assetName.uasset"
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
@@ -412,9 +419,40 @@ function Sync-OwnerAssets {
     return @($rows)
 }
 
+function Sync-TestCharacterFixture {
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    # ScaleDiagnosis reads the owner's character CDO for movement limits.  The isolated host
+    # already contains the CDO, but the CDO's animation blueprint loads the complete unarmed
+    # blend-space sample set.  Keep that dependency closure in the harness instead of turning a
+    # missing staged asset into an automation-test error.  These are copies into the host only.
+    $relativeDirectories = @('Characters\Mannequins\Anims\Unarmed')
+    foreach ($relativeDirectory in $relativeDirectories) {
+        $sourceDirectory = Join-Path $ProjectRoot "Content\$relativeDirectory"
+        $targetDirectory = Join-Path $HostRoot "Content\$relativeDirectory"
+        if (-not (Test-Path -LiteralPath $sourceDirectory -PathType Container)) {
+            throw "Test fixture directory is missing: $sourceDirectory"
+        }
+        Copy-DirectoryContents $sourceDirectory $targetDirectory
+        foreach ($source in @(Get-ChildItem -LiteralPath $sourceDirectory -Recurse -File)) {
+            $relativeFile = $source.FullName.Substring($sourceDirectory.Length).TrimStart('\')
+            $target = Join-Path $targetDirectory $relativeFile
+            [void]$rows.Add([ordered]@{
+                name = "TestFixture/$relativeDirectory/$relativeFile"
+                used_by_scenario = $true
+                source_path = $source.FullName
+                source_sha256 = Get-Sha256 $source.FullName
+                staged_path = $target
+                staged_sha256 = Get-Sha256 $target
+            })
+        }
+    }
+    return @($rows)
+}
+
 function Get-AssetEvidence {
     $rows = [System.Collections.Generic.List[object]]::new()
-    foreach ($assetName in @('DA_Strate3', 'DA_Settings')) {
+    foreach ($assetName in @('DA_Strate1', 'DA_Strate2', 'DA_Strate3', 'DA_Strate4', 'DA_Settings')) {
         $source = Join-Path $ProjectRoot "Content\VoxelForge\$assetName.uasset"
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         [void]$rows.Add([ordered]@{
@@ -807,6 +845,9 @@ try {
     } else {
         $AssetEvidence = @(Get-AssetEvidence)
     }
+    if ($Scenario -eq 'tests') {
+        $AssetEvidence += @(Sync-TestCharacterFixture)
+    }
     $DllEvidence.runtime = [ordered]@{
         path = Join-Path $StagePlugin 'Binaries\Win64\UnrealEditor-VoxelForge.dll'
         sha256 = Get-Sha256 (Join-Path $StagePlugin 'Binaries\Win64\UnrealEditor-VoxelForge.dll')
@@ -864,13 +905,14 @@ try {
             $GameMetrics = Get-StreamingMetrics (Join-Path $RunRoot 'Logs\perf.log')
         }
         'tests' {
-            $baseCvars['ExecCmds'] = 'Automation RunTests VoxelForge; Quit'
+            $testPath = if ([string]::IsNullOrWhiteSpace($TestFilter)) { 'VoxelForge' } else { $TestFilter }
+            $baseCvars['ExecCmds'] = "Automation RunTests $testPath; Quit"
             $baseCvars['ReportExportPath'] = (Join-Path $RunRoot 'AutomationReport')
             $args = New-CommonArguments 'tests' (Join-Path $RunRoot 'Logs\tests.log') (Merge-Cvars $baseCvars)
             # ExecCmds is a command-line value, not a cvar; replace the generated -ExecCmds token
             # with the quoted form accepted by Unreal's parser.
             $args = @($args | Where-Object { $_ -notlike '-ExecCmds=*' -and $_ -notlike '-ReportExportPath=*' })
-            $args += '-ExecCmds="Automation RunTests VoxelForge; Quit"'
+            $args += ('-ExecCmds="Automation RunTests {0}; Quit"' -f $testPath)
             $args += ('-ReportExportPath="{0}"' -f (Join-Path $RunRoot 'AutomationReport'))
             $gameLedger = Invoke-UnrealLaunch 'automation-tests' $args `
                 (Join-Path $RunRoot 'Logs\tests.log') (Join-Path $RunRoot 'Logs\tests.stdout.log') (Join-Path $RunRoot 'Logs\tests.stderr.log')

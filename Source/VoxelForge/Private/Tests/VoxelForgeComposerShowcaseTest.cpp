@@ -100,7 +100,16 @@ namespace
 
         float SampleDensity(float WorldX, float WorldY, float WorldZ) const override
         {
-            return Stack.EvalMC(WorldX, WorldY, WorldZ);
+            // EvalMC is the stack core, while the generator owns the surrounding per-query
+            // hand-off.  In particular, a vertical-shaft source publishes a thread-local marker
+            // that the shared passage post consumes later in the same game query.  This standalone
+            // sampler has no downstream post, so it must establish and tear down that boundary
+            // itself; otherwise a previous archetype can suppress a later Maze landing floor on
+            // whichever worker happens to reuse the thread.
+            VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+            const float Density = Stack.EvalMC(WorldX, WorldY, WorldZ);
+            VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+            return Density;
         }
 
     private:

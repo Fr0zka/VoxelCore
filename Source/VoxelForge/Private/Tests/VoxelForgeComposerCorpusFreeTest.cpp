@@ -655,8 +655,9 @@ bool FVoxelForgeComposerCorpusFreeTest::RunTest(const FString& Parameters)
     }
     const double MeasurementSeconds = FPlatformTime::Seconds() - MeasurementStartSeconds;
 
-    // Audit the same declared relations against the 12 current authored corpus vectors. Project
-    // assets carry their own height; the eight C++ defaults use the fixture's 8-chunk height.
+    // Audit the same declared relations against the current authored corpus vectors. The owner
+    // fixture currently carries four project vectors; the eight C++ defaults use the fixture's
+    // 8-chunk height. Keep this audit tied to membership rather than an obsolete asset count.
     int32 AuthoredConstraintViolations = 0;
     FString AuthoredViolationList;
     for (const FVoxelStrateCorpusEntry& Entry : Corpus.GetEntries())

@@ -67,17 +67,19 @@ namespace
 #undef VF_PARAM_NAME
 
     /**
-     * Champs délibérément NON fusionnés. Vide aujourd'hui, et c'est le message : à ce jour, chaque
-     * champ réfléchi de la structure est couvert par la X-macro, sans exception.
+     * Champs délibérément NON fusionnés. Le champ de compatibilité bTunnelFloorEnabled reste
+     * réfléchi pour charger les anciennes données, mais le plancher est désormais toujours
+     * possédé par la géométrie du tunnel et cette valeur est ignorée.
      * Pour en exempter un, l'ajouter ICI avec la raison — l'exemption doit être un choix visible,
      * pas un oubli.
      *
-     * Deliberately UN-blended fields. Empty today, and that is the point: as of now every reflected
-     * field of the struct is covered by the X-macro, with no exceptions. To exempt one, add it HERE
-     * with the reason — an exemption must be a visible decision, never an omission.
+     * Deliberately UN-blended fields. bTunnelFloorEnabled remains reflected so old assets load,
+     * but tunnel geometry now always owns the floor and the value is ignored. To exempt one, add
+     * it HERE with the reason — an exemption must be a visible decision, never an omission.
      */
     const TCHAR* const GExemptFieldNames[] =
     {
+        TEXT("bTunnelFloorEnabled"), // deprecated compatibility field; tunnel geometry owns the floor
         nullptr  // sentinelle : garde le tableau non vide / sentinel: keeps the array non-empty
     };
 }

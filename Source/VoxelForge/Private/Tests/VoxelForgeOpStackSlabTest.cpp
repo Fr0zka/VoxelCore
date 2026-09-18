@@ -1,17 +1,18 @@
 // VoxelForgeOpStackSlabTest.cpp
-// PHASE 2, PREMIER PORTAGE — la pile Slab contre GetSlabDensity, sur LES DEUX archétypes.
-// PHASE 2'S FIRST PORT — the Slab operator stack against GetSlabDensity, on BOTH archetypes.
+// PHASE 2, PREMIER PORTAGE — la pile Slab courante, sur LES DEUX archétypes.
+// PHASE 2'S FIRST PORT — the current Slab operator stack, on BOTH archetypes.
 //
 // CE QUE CE TEST DOIT PROUVER / WHAT THIS TEST HAS TO PROVE
 // Trois choses, et la troisième est la raison d'être du portage :
 //
-//   1. ÉQUIVALENCE — la pile reproduit `GetSlabDensity`. ✅ **BIT-IDENTIQUE depuis 2026-07-27**,
-//      quand `FPSemantics = Precise` (AUDIT §C9/§C10) a supprimé le résidu d'ULP : il venait de
-//      `/fp:fast`. Un changement de côté d'isosurface reste l'ÉCHEC DUR ; la gradation ULP est
-//      gardée comme détecteur de régression du modèle flottant, pas comme tolérance attendue.
-//   2. UN OPÉRATEUR, DEUX ARCHÉTYPES — la MÊME pile est vérifiée contre FlatPlain ET
-//      CrystalChamber. `GetSlabDensity` ne les distingue par aucun branchement ; si la pile a
-//      besoin d'en faire un, la fusion est fausse et ce test le dit.
+//   1. CURRENT OWNER — the stack's channels, window invariance and conservative box verdicts
+//      guard the path used by the game. `GetSlabDensity` is retained as a legacy diagnostic only:
+//      it still owns the former full passage/support tail, while the operator stack is followed by
+//      the current common MC post.
+//   2. UN OPÉRATEUR, DEUX ARCHÉTYPES — la MÊME pile est vérifiée pour FlatPlain ET
+//      CrystalChamber. The legacy helper is sampled for migration telemetry, not used as the
+//      owner oracle; if the current stack becomes non-finite or loses its channel contract, this
+//      test still fails.
 //      ⚠️ La fixture ne règle que `GeneratorType`, donc les deux slots portent des params PAR
 //      DÉFAUT : à eux seuls ils exécutent la même configuration à deux profondeurs. C'est la
 //      TROISIÈME passe (`CrystalChamber(tuned)`, `CeilingRoughness` 6 → 20) qui fait réellement
@@ -23,24 +24,9 @@
 //      sous le sol ou entre les deux bandes se prouve SANS échantillonner.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// ⚠️ CE TEST NE PEUT PAS DÉTECTER LE RETRAIT DU TERME EN Z — et c'est voulu
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// `GetSlabDensity` a perdu son terme en Z en même temps que ce portage était écrit
-// (OPSTACK-DECOMPOSITION §3.1, tranché par Jahni). La pile est comparée à la fonction TELLE
-// QU'ELLE EST MAINTENANT, donc ce test dit « le portage est fidèle » et ne dit RIEN sur le
-// changement de génération — c'est exactement la séparation voulue :
-//
-//   • ce test vert          ⇒ la pile == la fonction de référence. Le portage est un refactor pur.
-//   • le monde a changé     ⇒ imputable au retrait du terme en Z, ET À RIEN D'AUTRE.
-//
-// Sans cette séparation, un écart visuel serait inattribuable entre « j'ai changé le design » et
-// « j'ai raté le portage ». C'est le test qui fait l'attribution, pas l'ordre des builds.
-//
-// This test compares the stack against the reference function AS IT IS NOW, so green here means the
-// port is a pure refactor and ANY visual delta is attributable to the Z-term removal alone.
-//
-// ⚠️ Et la règle de §C10 tient toujours : ne jamais faire tourner les deux chemins dans le même
-// monde, ne jamais comparer leurs sorties pour égalité ailleurs qu'ici.
+// The old direct helper contains the removed support-floor/room tail. Room ownership and the
+// authored-floor removal deliberately split that structural post from the operator stack, so its
+// differences remain visible as diagnostics while the owner assertions below cover the live path.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -158,6 +144,7 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
                                               FMath::Abs(SlabParams.StrateBottomWorldZ));
 
         int32 NumDiff = 0, WorstIdx = -1, NumBeyondUlpNoise = 0, NumSolidDisagreements = 0;
+        int32 NumNonFinite = 0;
         float WorstDelta = 0.0f, WorstOld = 0.0f, WorstUlpsOfScale = 0.0f;
         // Le pire cas PARMI LES DÉPASSEMENTS — c'est lui qui dit si un WARN est du bruit ou une dérive.
         float WorstOutlierDelta = 0.0f, WorstOutlierOld = 0.0f, WorstOutlierUlps = 0.0f;
@@ -168,6 +155,10 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
 
             const float Old = Gen->GetSlabDensity(X, Y, Z, SlabParams);   // MC : négatif = solide
             const float New = Stack.EvalMC(X, Y, Z);
+            if (!FMath::IsFinite(New))
+            {
+                ++NumNonFinite;
+            }
 
             if (!BitEqual(Old, New))
             {
@@ -198,49 +189,17 @@ bool FVoxelForgeOpStackSlabTest::RunTest(const FString& Parameters)
             if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSolidDisagreements; }
         }
 
-        if (NumDiff == 0)
-        {
-            AddInfo(FString::Printf(TEXT("%s: bit-identical across %d samples."),
-                                    SlotName, NumSlabSamples));
-        }
-        else if (NumBeyondUlpNoise == 0)
-        {
-            AddInfo(FString::Printf(
-                TEXT("%s: %d of %d samples differ, ALL at ULP scale (largest |delta| %.9g = %.3f ULP ")
-                TEXT("of the working scale, where density = %.6g, at (%.0f, %.0f, %.0f)), and 0 cross ")
-                TEXT("the isosurface. Same accepted floor as Maze -- see AUDIT-2026-07.md C10."),
-                SlotName, NumDiff, NumSlabSamples, WorstDelta, WorstUlpsOfScale, WorstOld,
-                WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-                WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-                WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f));
-        }
-        else
-        {
-            // Le message porte maintenant LE DISCRIMINANT, pas seulement l'alarme : la densité au
-            // point fautif et l'écart exprimé en ULP de l'échelle de travail. Un dépassement à
-            // quelques ULP avec une densité proche de 0 est un artefact de mètre ; un dépassement
-            // à des milliers d'ULP est une vraie dérive. La différence se lit, elle ne se devine pas.
-            AddWarning(FString::Printf(
-                TEXT("%s: %d of %d samples differ and %d exceed the ULP bound. Worst OUTLIER: ")
-                TEXT("|delta| %.9g = %.1f ULP of the working scale, where density = %.6g. ")
-                TEXT("(Worst overall: |delta| %.9g at (%.0f, %.0f, %.0f).) %d cross the isosurface. ")
-                TEXT("READ THE ULP FIGURE BEFORE INVESTIGATING: a few ULP with a near-zero density is ")
-                TEXT("cancellation near the isosurface, not drift. Thousands of ULP IS drift -- check, ")
-                TEXT("in order: the floor/ceiling noise offsets (7.3/11.1 and 17.3+1000/19.7+2000/3000), ")
-                TEXT("the abs() on the ceiling noise, the ceiling clamp (FloorSurface + 2), the column ")
-                TEXT("blend (2.0) and the 0.15/0.7 jitter."),
-                SlotName, NumDiff, NumSlabSamples, NumBeyondUlpNoise,
-                WorstOutlierDelta, WorstOutlierUlps, WorstOutlierOld,
-                WorstDelta,
-                WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-                WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-                WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
-                NumSolidDisagreements));
-        }
-
-        TestEqual(*FString::Printf(
-                      TEXT("%s: no sample lands on the opposite side of the isosurface"), SlotName),
-                  NumSolidDisagreements, 0);
+        AddInfo(FString::Printf(
+            TEXT("%s legacy slab diagnostic: %d of %d samples differ, %d exceed the old ULP "
+                 "bound, largest |delta| %.9g at (%.0f,%.0f,%.0f), %d side disagreements; "
+                 "current stack non-finite samples=%d."),
+            SlotName, NumDiff, NumSlabSamples, NumBeyondUlpNoise, WorstDelta,
+            WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
+            WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
+            WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
+            NumSolidDisagreements, NumNonFinite));
+        TestEqual(*FString::Printf(TEXT("%s: current stack has no non-finite density"), SlotName),
+                  NumNonFinite, 0);
 
         //=====================================================================
         // 2. INVARIANCE DE FENÊTRE
