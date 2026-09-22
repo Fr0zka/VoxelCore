@@ -2340,27 +2340,6 @@ void AVoxelWorld::AdvanceHeadlessStrateCrossingTest(
         StrateManager->GetPassages()[HeadlessStrateCrossingTestPassageIndex];
     if (!bHeadlessStrateCrossingTestStartPlaced)
     {
-        FVoxelTileKey InitialSupportTile;
-        const TCHAR* InitialSupportUnavailableReason = nullptr;
-        if (!IsPlayerSupportCollisionReady(
-                PlayerPawn, InOutPlayerPosition, &InitialSupportTile,
-                &InitialSupportUnavailableReason))
-        {
-            if (!bHeadlessStrateCrossingTestInitialSupportReported)
-            {
-                UE_LOG(LogTemp, Display,
-                    TEXT("[VoxelForgeStrateCrossingTest] waiting_for_initial_support "
-                         "tile=(%d,%d,%d) reason=%s"),
-                    InitialSupportTile.Coord.X, InitialSupportTile.Coord.Y,
-                    InitialSupportTile.Coord.Z,
-                    InitialSupportUnavailableReason != nullptr
-                        ? InitialSupportUnavailableReason : TEXT("collision_pending"));
-                bHeadlessStrateCrossingTestInitialSupportReported = true;
-            }
-            return;
-        }
-        bHeadlessStrateCrossingTestInitialSupportReported = false;
-
         if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
         {
             if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
@@ -2378,6 +2357,36 @@ void AVoxelWorld::AdvanceHeadlessStrateCrossingTest(
         StartVoxel.Z = Passage.UpperLanding.FloorZ
             + HeadlessStrateCrossingTestPlayerHalfHeightVoxels;
         const FVector StartWorld = LocalVoxelToWorld(StartVoxel);
+
+        // The test pawn starts in the map's default spawn area, but the authored passage can be
+        // many tiles away. Do not teleport the capsule into an unresolved landing floor: ask for
+        // that exact support tile first, then let the pending-floor assertion cover only movement
+        // after the crossing has genuinely begun.
+        // Keep the streamer's centre at the prospective landing while that request is serviced;
+        // the pawn itself remains at the map spawn until the collision is ready.
+        bHeadlessStreamingTestCenterOverride = true;
+        HeadlessStreamingTestCenterVoxel = StartVoxel;
+        FVoxelTileKey StartSupportTile;
+        const TCHAR* StartSupportUnavailableReason = nullptr;
+        if (!IsPlayerSupportCollisionReady(
+                PlayerPawn, StartWorld, &StartSupportTile, &StartSupportUnavailableReason))
+        {
+            RequestCollisionGateSupportTile(StartSupportTile);
+            if (!bHeadlessStrateCrossingTestInitialSupportReported)
+            {
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeStrateCrossingTest] waiting_for_initial_support "
+                         "tile=(%d,%d,%d) reason=%s"),
+                    StartSupportTile.Coord.X, StartSupportTile.Coord.Y,
+                    StartSupportTile.Coord.Z,
+                    StartSupportUnavailableReason != nullptr
+                        ? StartSupportUnavailableReason : TEXT("collision_pending"));
+                bHeadlessStrateCrossingTestInitialSupportReported = true;
+            }
+            return;
+        }
+        bHeadlessStrateCrossingTestInitialSupportReported = false;
+
         const bool bPlaced = PlayerPawn->SetActorLocation(
             StartWorld, false, nullptr, ETeleportType::TeleportPhysics);
         const FVector ActualPosition = PlayerPawn->GetActorLocation();
@@ -2416,6 +2425,10 @@ void AVoxelWorld::AdvanceHeadlessStrateCrossingTest(
             HeadlessStrateCrossingTestPlayerHalfHeightVoxels);
         return;
     }
+
+    // The landing was kept warm for the teleport. From this tick onward the stream follows the
+    // pawn's actual swept movement again.
+    bHeadlessStreamingTestCenterOverride = false;
 
     if (!bHeadlessStrateCrossingTestStarted)
     {
@@ -2899,20 +2912,37 @@ void AVoxelWorld::ObserveHeadlessCollisionGateStressTest(
     }
     bHeadlessCollisionGateStressTestGateWasEngaged = bGateEngaged;
 
-    // At 6000 cm/s a healthy frame advances well beyond one centimetre. A zero horizontal delta
-    // while the collision gate is engaged is therefore a real full stop, not a low-rate sample.
-    const bool bFullStop = bGateEngaged && HorizontalDelta <= 0.01f;
-    if (bFullStop && !bHeadlessCollisionGateStressTestFullStop)
+    // The first sample after engaging any gate can have zero horizontal delta simply because the
+    // world prerequisite ran before CharacterMovementComponent. Require a sustained no-progress
+    // interval before calling it a full stop; a permanent stop still fails through the distance
+    // shortfall check below, while repeated gate holds remain visible in gate_holds/total_s.
+    constexpr double FullStopConfirmationSeconds = 0.05;
+    const bool bNoHorizontalProgress = bGateEngaged && HorizontalDelta <= 0.01f;
+    if (bNoHorizontalProgress)
     {
-        ++HeadlessCollisionGateStressTestFullStopCount;
-        HeadlessCollisionGateStressTestFullStopStartSeconds = Now;
+        if (HeadlessCollisionGateStressTestFullStopStartSeconds <= 0.0)
+        {
+            HeadlessCollisionGateStressTestFullStopStartSeconds = Now;
+        }
+        if (!bHeadlessCollisionGateStressTestFullStop
+            && Now - HeadlessCollisionGateStressTestFullStopStartSeconds
+                >= FullStopConfirmationSeconds)
+        {
+            ++HeadlessCollisionGateStressTestFullStopCount;
+            bHeadlessCollisionGateStressTestFullStop = true;
+        }
     }
-    else if (!bFullStop && bHeadlessCollisionGateStressTestFullStop)
+    else
     {
-        HeadlessCollisionGateStressTestFullStopDurationSeconds += FMath::Max(
-            0.0, Now - HeadlessCollisionGateStressTestFullStopStartSeconds);
+        if (bHeadlessCollisionGateStressTestFullStop
+            && HeadlessCollisionGateStressTestFullStopStartSeconds > 0.0)
+        {
+            HeadlessCollisionGateStressTestFullStopDurationSeconds += FMath::Max(
+                0.0, Now - HeadlessCollisionGateStressTestFullStopStartSeconds);
+        }
+        bHeadlessCollisionGateStressTestFullStop = false;
+        HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
     }
-    bHeadlessCollisionGateStressTestFullStop = bFullStop;
 
     if (Now - HeadlessCollisionGateStressTestStartSeconds
         >= static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds))
@@ -3969,7 +3999,8 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
     }
 
     if (!bPawnGateSupportRequestReported
-        || PawnGateRequestedSupportTile != SupportTile)
+        || PawnGateRequestedSupportTile.Coord != SupportTile.Coord
+        || PawnGateRequestedSupportTile.Level != SupportTile.Level)
     {
         PawnGateRequestedSupportTile = SupportTile;
         bPawnGateSupportRequestReported = false;

@@ -886,7 +886,8 @@ try {
         $buildStdout = Join-Path $RunRoot 'Logs\build.stdout.log'
         $buildError = Join-Path $RunRoot 'Logs\build.err.log'
         $buildArgs = @(('"{0}"' -f $UbtDll), 'UnrealEditor', 'Win64', 'Development', ('-Project="{0}"' -f $HostProject),
-            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', ('-Log="{0}"' -f $buildLog))
+            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', '-MaxParallelActions=4',
+            ('-Log="{0}"' -f $buildLog))
         $BuildRecord = Invoke-BuildProcess $buildArgs $buildLog $buildError $buildStdout
         if ($BuildRecord.status -ne 'passed') { Add-Failure "staged build $($BuildRecord.status)" }
         $runtimeAfter = Get-Sha256 (Join-Path $StagePlugin 'Binaries\Win64\UnrealEditor-VoxelForge.dll')
@@ -979,7 +980,8 @@ try {
                 (Join-Path $RunRoot 'Logs\surface-fall.log') (Join-Path $RunRoot 'Logs\surface-fall.stdout.log') (Join-Path $RunRoot 'Logs\surface-fall.stderr.log')
             $SurfaceFallMetrics = Get-SurfaceFallMetrics (Join-Path $RunRoot 'Logs\surface-fall.log')
             if ($SurfaceFallMetrics.status -ne 'passed') {
-                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $($SurfaceFallMetrics.reason)"
+                $surfaceReason = [string](Get-JsonValue $SurfaceFallMetrics 'reason' '')
+                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $surfaceReason"
             }
         }
         'crossing' {
@@ -995,7 +997,8 @@ try {
                 (Join-Path $RunRoot 'Logs\crossing.log') (Join-Path $RunRoot 'Logs\crossing.stdout.log') (Join-Path $RunRoot 'Logs\crossing.stderr.log')
             $StrateCrossingMetrics = Get-StrateCrossingMetrics (Join-Path $RunRoot 'Logs\crossing.log')
             if ($StrateCrossingMetrics.status -ne 'passed') {
-                Add-Failure "strate-crossing test did not pass: $($StrateCrossingMetrics.status) $($StrateCrossingMetrics.reason)"
+                $crossingReason = [string](Get-JsonValue $StrateCrossingMetrics 'reason' '')
+                Add-Failure "strate-crossing test did not pass: $($StrateCrossingMetrics.status) $crossingReason"
             }
         }
         'gate-stress' {
@@ -1009,7 +1012,8 @@ try {
                 (Join-Path $RunRoot 'Logs\gate-stress.log') (Join-Path $RunRoot 'Logs\gate-stress.stdout.log') (Join-Path $RunRoot 'Logs\gate-stress.stderr.log')
             $CollisionGateStressMetrics = Get-CollisionGateStressMetrics (Join-Path $RunRoot 'Logs\gate-stress.log')
             if ($CollisionGateStressMetrics.status -ne 'passed') {
-                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $($CollisionGateStressMetrics.reason)"
+                $stressReason = [string](Get-JsonValue $CollisionGateStressMetrics 'reason' '')
+                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $stressReason"
             }
         }
         'tests' {
@@ -1048,7 +1052,8 @@ try {
                 (Join-Path $RunRoot 'Logs\surface-fall.log') (Join-Path $RunRoot 'Logs\surface-fall.stdout.log') (Join-Path $RunRoot 'Logs\surface-fall.stderr.log')
             $SurfaceFallMetrics = Get-SurfaceFallMetrics (Join-Path $RunRoot 'Logs\surface-fall.log')
             if ($SurfaceFallMetrics.status -ne 'passed') {
-                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $($SurfaceFallMetrics.reason)"
+                $surfaceReason = [string](Get-JsonValue $SurfaceFallMetrics 'reason' '')
+                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $surfaceReason"
             }
 
             $stressBaseCvars = [ordered]@{
@@ -1063,7 +1068,8 @@ try {
                 (Join-Path $RunRoot 'Logs\gate-stress.log') (Join-Path $RunRoot 'Logs\gate-stress.stdout.log') (Join-Path $RunRoot 'Logs\gate-stress.stderr.log')
             $CollisionGateStressMetrics = Get-CollisionGateStressMetrics (Join-Path $RunRoot 'Logs\gate-stress.log')
             if ($CollisionGateStressMetrics.status -ne 'passed') {
-                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $($CollisionGateStressMetrics.reason)"
+                $stressReason = [string](Get-JsonValue $CollisionGateStressMetrics 'reason' '')
+                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $stressReason"
             }
         }
         'parity' {
