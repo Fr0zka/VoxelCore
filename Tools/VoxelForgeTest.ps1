@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'parity')]
+    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'parity')]
     [string]$Scenario = 'canonical',
     [switch]$Build,
     [ValidateSet('owner', 'default')]
@@ -45,6 +45,7 @@ $CommandletMetrics = [ordered]@{}
 $GameMetrics = [ordered]@{}
 $SurfaceFallMetrics = [ordered]@{ requested = $Scenario -in @('tests', 'surface-fall'); status = 'not_run' }
 $StrateCrossingMetrics = [ordered]@{ requested = $Scenario -eq 'crossing'; status = 'not_run' }
+$CollisionGateStressMetrics = [ordered]@{ requested = $Scenario -in @('tests', 'gate-stress'); status = 'not_run' }
 $TestMetrics = @()
 $ParityEvidence = [ordered]@{ requested = $Scenario -eq 'parity'; status = 'not_run' }
 $DllEvidence = [ordered]@{
@@ -426,7 +427,7 @@ function Sync-OwnerAssets {
         $null = Copy-Item -LiteralPath $source -Destination $target -Force -PassThru
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -474,7 +475,7 @@ function Get-AssetEvidence {
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -685,6 +686,23 @@ function Get-StrateCrossingMetrics([string]$LogPath) {
     $result = [regex]::Match($line, 'result=(?<v>PASS|FAIL)')
     if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
     foreach ($key in @('reason', 'elapsed_s', 'distance_m', 'max_gate_s', 'gate_limit_s', 'gate_total_s', 'min_floor_clearance_vox')) {
+        $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
+        if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
+    }
+    return $metrics
+}
+
+function Get-CollisionGateStressMetrics([string]$LogPath) {
+    $lineMatch = @(Select-String -LiteralPath $LogPath -Pattern '\[VoxelForgeCollisionGateStressTest\] result=' -ErrorAction SilentlyContinue |
+        Select-Object -Last 1)
+    if ($lineMatch.Count -eq 0) { return [ordered]@{ status = 'missing'; log = $LogPath } }
+    $line = [string]$lineMatch[0].Line
+    $metrics = [ordered]@{ status = 'failed'; log = $LogPath; raw = $line }
+    $result = [regex]::Match($line, 'result=(?<v>PASS|FAIL)')
+    if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
+    foreach ($key in @('reason', 'elapsed_s', 'distance_m', 'expected_distance_m', 'speed_cm_s',
+                        'gate_holds', 'gate_total_s', 'max_gate_s', 'full_stops',
+                        'full_stop_total_s', 'collision_gate')) {
         $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
         if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
     }
@@ -980,6 +998,20 @@ try {
                 Add-Failure "strate-crossing test did not pass: $($StrateCrossingMetrics.status) $($StrateCrossingMetrics.reason)"
             }
         }
+        'gate-stress' {
+            $baseCvars['voxel.TestCollisionGateStress'] = 1
+            $baseCvars['voxel.TestCollisionGateStressSpeedCmPerSecond'] = 6000
+            $baseCvars['voxel.TestCollisionGateStressStartDelaySeconds'] = 0.1
+            $baseCvars['voxel.TestCollisionGateStressDurationSeconds'] = 2
+            $baseCvars['voxel.TestCollisionGateStressTimeoutSeconds'] = 30
+            $args = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\gate-stress.log') (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch 'collision-gate-stress-game' $args `
+                (Join-Path $RunRoot 'Logs\gate-stress.log') (Join-Path $RunRoot 'Logs\gate-stress.stdout.log') (Join-Path $RunRoot 'Logs\gate-stress.stderr.log')
+            $CollisionGateStressMetrics = Get-CollisionGateStressMetrics (Join-Path $RunRoot 'Logs\gate-stress.log')
+            if ($CollisionGateStressMetrics.status -ne 'passed') {
+                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $($CollisionGateStressMetrics.reason)"
+            }
+        }
         'tests' {
             $testPath = if ([string]::IsNullOrWhiteSpace($TestFilter)) { 'VoxelForge' } else { $TestFilter }
             $baseCvars['ExecCmds'] = "Automation RunTests $testPath; Quit"
@@ -1017,6 +1049,21 @@ try {
             $SurfaceFallMetrics = Get-SurfaceFallMetrics (Join-Path $RunRoot 'Logs\surface-fall.log')
             if ($SurfaceFallMetrics.status -ne 'passed') {
                 Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $($SurfaceFallMetrics.reason)"
+            }
+
+            $stressBaseCvars = [ordered]@{
+                'voxel.TestCollisionGateStress' = 1
+                'voxel.TestCollisionGateStressSpeedCmPerSecond' = 6000
+                'voxel.TestCollisionGateStressStartDelaySeconds' = 0.1
+                'voxel.TestCollisionGateStressDurationSeconds' = 2
+                'voxel.TestCollisionGateStressTimeoutSeconds' = 30
+            }
+            $stressArgs = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\gate-stress.log') (Merge-Cvars $stressBaseCvars)
+            $stressLedger = Invoke-UnrealLaunch 'collision-gate-stress-game' $stressArgs `
+                (Join-Path $RunRoot 'Logs\gate-stress.log') (Join-Path $RunRoot 'Logs\gate-stress.stdout.log') (Join-Path $RunRoot 'Logs\gate-stress.stderr.log')
+            $CollisionGateStressMetrics = Get-CollisionGateStressMetrics (Join-Path $RunRoot 'Logs\gate-stress.log')
+            if ($CollisionGateStressMetrics.status -ne 'passed') {
+                Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $($CollisionGateStressMetrics.reason)"
             }
         }
         'parity' {
@@ -1110,6 +1157,7 @@ $result = [ordered]@{
     game = $GameMetrics
     surface_fall = $SurfaceFallMetrics
     strate_crossing = $StrateCrossingMetrics
+    collision_gate_stress = $CollisionGateStressMetrics
     worker_seconds = [ordered]@{
         commandlet = if ($CommandletMetrics.Contains('worker_seconds')) { $CommandletMetrics.worker_seconds } else { $null }
         game = if ($GameMetrics.Contains('worker_generation_sum_s')) { $GameMetrics.worker_generation_sum_s } else { $null }
@@ -1141,6 +1189,7 @@ try {
     [void]$summaryLines.Add("obj_sha256=$($result.obj_sha256)")
     [void]$summaryLines.Add("surface_fall=$(ConvertTo-CompactJson $result.surface_fall)")
     [void]$summaryLines.Add("strate_crossing=$(ConvertTo-CompactJson $result.strate_crossing)")
+    [void]$summaryLines.Add("collision_gate_stress=$(ConvertTo-CompactJson $result.collision_gate_stress)")
     [void]$summaryLines.Add("probe_amplitudes=$(ConvertTo-CompactJson $result.probe_amplitudes)")
     [void]$summaryLines.Add("worker_seconds=$(ConvertTo-CompactJson $result.worker_seconds)")
     [void]$summaryLines.Add("p50_p95=$(ConvertTo-CompactJson $result.p50_p95)")

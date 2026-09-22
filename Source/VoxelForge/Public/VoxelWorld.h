@@ -522,6 +522,9 @@ private:
     void ConfigureHeadlessStreamingTest();
     void AdvanceHeadlessStreamingTest(FVector& InOutPlayerPosition,
                                       FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void AdvanceHeadlessCollisionGateStressTest(FVector& InOutPlayerPosition,
+                                                FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void ObserveHeadlessCollisionGateStressTest(const FVector& PlayerPosition, APawn* PlayerPawn);
     void AdvanceHeadlessSurfaceFallTest(FVector& InOutPlayerPosition,
                                         FVector& InOutPlayerHeading, APawn* PlayerPawn);
     void InitializeHeadlessStrateCrossingTest();
@@ -530,6 +533,7 @@ private:
     void ObserveHeadlessStrateCrossingTest(const FVector& PlayerPosition, APawn* PlayerPawn);
     void MaybeFinishHeadlessStrateCrossingTest();
     void MaybeFinishHeadlessSurfaceFallTest();
+    void MaybeFinishHeadlessCollisionGateStressTest();
     void MaybeFinishHeadlessStreamingTest();
     void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                         int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
@@ -835,9 +839,12 @@ public:
     bool IsPlayerSupportCollisionReady(APawn* Pawn, const FVector& PlayerPosition,
                                        FVoxelTileKey* OutSupportTile = nullptr,
                                        const TCHAR** OutUnavailableReason = nullptr) const;
+    bool IsPawnCapsuleOverlappingPendingFloor(APawn* Pawn, const FVector& PlayerPosition,
+                                              FVoxelTileKey* OutPendingTile = nullptr) const;
+    void RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTile);
 
-    /** Gate pawn movement until its current and, when moving, next support tile have a completed
-     *  level-0 RMC collision body. The world tick is installed as the pawn prerequisite in the
+    /** Cancel only downward pawn motion while the tile beneath its feet is unresolved. Horizontal
+     *  input and movement remain live. The world tick is installed as the pawn prerequisite in the
      *  implementation (and directly on its movement component) so this check runs before
      *  CharacterMovementComponent physics. */
     void UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosition, float DeltaTime);
@@ -1004,6 +1011,35 @@ public:
     double HeadlessStreamingTestBeginSeconds = 0.0;
     double HeadlessStreamingTestLastElapsedSeconds = 0.0;
 
+    // Explicit high-speed collision-gate repro. The streamer stays centred at the launch tile while
+    // the character uses ordinary swept movement across the still-pending desired set. The test
+    // distinguishes a gate hold from a full horizontal stop so a fall-only gate can be validated.
+    bool bHeadlessCollisionGateStressTest = false;
+    bool bHeadlessCollisionGateStressTestStartPlaced = false;
+    bool bHeadlessCollisionGateStressTestStarted = false;
+    bool bHeadlessCollisionGateStressTestPassed = false;
+    bool bHeadlessCollisionGateStressTestFailed = false;
+    bool bHeadlessCollisionGateStressTestExitRequested = false;
+    bool bHeadlessCollisionGateStressTestGateWasEngaged = false;
+    bool bHeadlessCollisionGateStressTestFullStop = false;
+    float HeadlessCollisionGateStressTestSpeedCmPerSecond = 6000.0f;
+    float HeadlessCollisionGateStressTestStartDelaySeconds = 0.1f;
+    float HeadlessCollisionGateStressTestDurationSeconds = 2.0f;
+    float HeadlessCollisionGateStressTestTimeoutSeconds = 15.0f;
+    double HeadlessCollisionGateStressTestBeginSeconds = 0.0;
+    double HeadlessCollisionGateStressTestStartSeconds = 0.0;
+    double HeadlessCollisionGateStressTestGateStartSeconds = 0.0;
+    double HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
+    double HeadlessCollisionGateStressTestDistanceCm = 0.0;
+    double HeadlessCollisionGateStressTestTotalGateDurationSeconds = 0.0;
+    double HeadlessCollisionGateStressTestMaxGateDurationSeconds = 0.0;
+    double HeadlessCollisionGateStressTestFullStopDurationSeconds = 0.0;
+    int32 HeadlessCollisionGateStressTestGateHoldCount = 0;
+    int32 HeadlessCollisionGateStressTestFullStopCount = 0;
+    FVector HeadlessCollisionGateStressTestDirection = FVector::XAxisVector;
+    FVector HeadlessCollisionGateStressTestLastActualPosition = FVector::ZeroVector;
+    FString HeadlessCollisionGateStressTestFailureReason;
+
     // Explicit owner-layout collision-gate repro. This is a command-line-only harness path: it
     // places the possessed character above the authored single-strate surface and lets ordinary
     // CharacterMovement gravity carry it to the generated ground.
@@ -1046,6 +1082,7 @@ public:
     bool bHeadlessStrateCrossingTestExitRequested = false;
     bool bHeadlessStrateCrossingTestGateWasEngaged = false;
     bool bHeadlessStrateCrossingTestInitialSupportReported = false;
+    bool bHeadlessStrateCrossingTestPendingFloorOverlap = false;
     int32 HeadlessStrateCrossingTestRequestedPassageIndex = INDEX_NONE;
     int32 HeadlessStrateCrossingTestPassageIndex = INDEX_NONE;
     int32 HeadlessStrateCrossingTestUpperStrateIndex = INDEX_NONE;
@@ -1068,22 +1105,22 @@ public:
     FString HeadlessStrateCrossingTestFailureReason;
     TArray<FVector> HeadlessStrateCrossingTestRoute;
 
-    // PLAYER COLLISION GATE — the pawn is allowed to enter/leave a tile only when the level-0
-    // collision body covering its feet has completed the RMC cook. The movement component state is
-    // saved so a temporary stream wait does not permanently change a character's movement mode.
+    // PLAYER COLLISION GATE — only the downward component is held while the level-0 collision body
+    // beneath the pawn's feet is unresolved. Horizontal movement and player control remain live.
     TWeakObjectPtr<APawn> PawnTickPrerequisite;
     TWeakObjectPtr<UPawnMovementComponent> PawnMovementTickPrerequisite;
     TWeakObjectPtr<APawn> CollisionGatedPawn;
     TWeakObjectPtr<UPawnMovementComponent> CollisionGatedPawnMovement;
     TWeakObjectPtr<UCharacterMovementComponent> CollisionGatedCharacterMovement;
-    uint8 SavedCharacterMovementMode = 0;
-    uint8 SavedCharacterCustomMovementMode = 0;
-    bool bSavedCharacterMovementMode = false;
-    bool bSavedPawnMovementActive = false;
+    bool bCollisionGateEnabled = true;
+    float SavedCharacterGravityScale = 1.0f;
+    bool bSavedCharacterGravityScale = false;
     bool bPawnCollisionGateEngaged = false;
     double PawnGateEngagedAtSeconds = 0.0;
     bool bPawnGateUnavailableReported = false;
     bool bPawnGateUnsupportedReported = false;
+    FVoxelTileKey PawnGateRequestedSupportTile;
+    bool bPawnGateSupportRequestReported = false;
 
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
     // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp

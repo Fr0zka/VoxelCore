@@ -60,6 +60,12 @@
 
 namespace
 {
+    int32 GVoxelForgeCollisionGate = 1;
+    FAutoConsoleVariableRef CVarVoxelForgeCollisionGate(
+        TEXT("voxel.CollisionGate"),
+        GVoxelForgeCollisionGate,
+        TEXT("Protect the pawn from falling through unresolved ground: 0 off, 1 on."));
+
     int32 GVoxelForgeProfileTileGeneration = 0;
     FAutoConsoleVariableRef CVarVoxelForgeProfileTileGeneration(
         TEXT("voxel.ProfileTileGeneration"),
@@ -1436,6 +1442,7 @@ void AVoxelWorld::BeginPlay()
     int32 CommandLineOuterClassifierMode = GVoxelForgeOuterClassifierMode;
     int32 CommandLineSealedSolidProof = GVoxelForgeSealedSolidProof;
     int32 CommandLineSampleStacks = GVoxelForgeSampleStacks;
+    int32 CommandLineCollisionGate = GVoxelForgeCollisionGate;
     if (FParse::Value(FCommandLine::Get(), TEXT("voxel.ProfileDensity="), CommandLineProfile))
     {
         GVoxelForgeProfileDensity = CommandLineProfile;
@@ -1471,6 +1478,10 @@ void AVoxelWorld::BeginPlay()
     {
         GVoxelForgeSampleStacks = CommandLineSampleStacks;
     }
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.CollisionGate="), CommandLineCollisionGate))
+    {
+        GVoxelForgeCollisionGate = CommandLineCollisionGate;
+    }
     GVoxelForgeProfileTileGeneration = GVoxelForgeProfileTileGeneration != 0 ? 1 : 0;
     GVoxelForgeUseBlockEarlyOut = GVoxelForgeUseBlockEarlyOut != 0 ? 1 : 0;
     GVoxelForgeOuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
@@ -1479,6 +1490,11 @@ void AVoxelWorld::BeginPlay()
         GVoxelForgeSampleStacks,
         0,
         static_cast<int32>(FVoxelStackSampler::MaxIntervalUs));
+    GVoxelForgeCollisionGate = GVoxelForgeCollisionGate != 0 ? 1 : 0;
+    bCollisionGateEnabled = GVoxelForgeCollisionGate != 0;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeCollisionGate] startup enabled=%d"),
+        bCollisionGateEnabled ? 1 : 0);
 
     if (GVoxelForgePerfAttribution != 0)
     {
@@ -1744,6 +1760,31 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
     HeadlessStreamingTestBeginSeconds = 0.0;
     HeadlessStreamingTestLastElapsedSeconds = 0.0;
+    bHeadlessCollisionGateStressTest = false;
+    bHeadlessCollisionGateStressTestStartPlaced = false;
+    bHeadlessCollisionGateStressTestStarted = false;
+    bHeadlessCollisionGateStressTestPassed = false;
+    bHeadlessCollisionGateStressTestFailed = false;
+    bHeadlessCollisionGateStressTestExitRequested = false;
+    bHeadlessCollisionGateStressTestGateWasEngaged = false;
+    bHeadlessCollisionGateStressTestFullStop = false;
+    HeadlessCollisionGateStressTestSpeedCmPerSecond = 6000.0f;
+    HeadlessCollisionGateStressTestStartDelaySeconds = 0.1f;
+    HeadlessCollisionGateStressTestDurationSeconds = 2.0f;
+    HeadlessCollisionGateStressTestTimeoutSeconds = 15.0f;
+    HeadlessCollisionGateStressTestBeginSeconds = 0.0;
+    HeadlessCollisionGateStressTestStartSeconds = 0.0;
+    HeadlessCollisionGateStressTestGateStartSeconds = 0.0;
+    HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
+    HeadlessCollisionGateStressTestDistanceCm = 0.0;
+    HeadlessCollisionGateStressTestTotalGateDurationSeconds = 0.0;
+    HeadlessCollisionGateStressTestMaxGateDurationSeconds = 0.0;
+    HeadlessCollisionGateStressTestFullStopDurationSeconds = 0.0;
+    HeadlessCollisionGateStressTestGateHoldCount = 0;
+    HeadlessCollisionGateStressTestFullStopCount = 0;
+    HeadlessCollisionGateStressTestDirection = FVector::XAxisVector;
+    HeadlessCollisionGateStressTestLastActualPosition = FVector::ZeroVector;
+    HeadlessCollisionGateStressTestFailureReason.Reset();
     bHeadlessSurfaceFallTest = false;
     bHeadlessSurfaceFallTestStartPlaced = false;
     bHeadlessSurfaceFallTestPassed = false;
@@ -1776,6 +1817,7 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     bHeadlessStrateCrossingTestExitRequested = false;
     bHeadlessStrateCrossingTestGateWasEngaged = false;
     bHeadlessStrateCrossingTestInitialSupportReported = false;
+    bHeadlessStrateCrossingTestPendingFloorOverlap = false;
     HeadlessStrateCrossingTestRequestedPassageIndex = INDEX_NONE;
     HeadlessStrateCrossingTestPassageIndex = INDEX_NONE;
     HeadlessStrateCrossingTestUpperStrateIndex = INDEX_NONE;
@@ -1975,6 +2017,51 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
             HeadlessStreamingTestDirection.X,
             HeadlessStreamingTestDirection.Y,
             HeadlessStreamingTestDirection.Z);
+    }
+
+    int32 CollisionGateStressValue = 0;
+    bHeadlessCollisionGateStressTest =
+        (FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStress="), CollisionGateStressValue)
+            && CollisionGateStressValue != 0)
+        || FParse::Param(CommandLine, TEXT("voxel.TestCollisionGateStress"));
+    if (bHeadlessCollisionGateStressTest)
+    {
+        if (bHeadlessStrateCrossingTest || bHeadlessSurfaceFallTest)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason = TEXT("conflicting_headless_tests");
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeCollisionGateStressTest] result=FAIL reason=%s"),
+                *HeadlessCollisionGateStressTestFailureReason);
+        }
+        float StressSpeed = HeadlessCollisionGateStressTestSpeedCmPerSecond;
+        float StressStartDelay = HeadlessCollisionGateStressTestStartDelaySeconds;
+        float StressDuration = HeadlessCollisionGateStressTestDurationSeconds;
+        float StressTimeout = HeadlessCollisionGateStressTestTimeoutSeconds;
+        FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressSpeedCmPerSecond="),
+                      StressSpeed);
+        FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressStartDelaySeconds="),
+                      StressStartDelay);
+        FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressDurationSeconds="),
+                      StressDuration);
+        FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressTimeoutSeconds="),
+                      StressTimeout);
+        HeadlessCollisionGateStressTestSpeedCmPerSecond = FMath::Max(StressSpeed, 1.0f);
+        HeadlessCollisionGateStressTestStartDelaySeconds = FMath::Max(StressStartDelay, 0.0f);
+        HeadlessCollisionGateStressTestDurationSeconds = FMath::Max(StressDuration, 0.25f);
+        HeadlessCollisionGateStressTestTimeoutSeconds = FMath::Max(StressTimeout, 1.0f);
+        // The stress path owns movement and keeps the streamer centred at the launch tile. Do
+        // not let the older synthetic TestMove path run in parallel with it.
+        bHeadlessStreamingTestMovement = false;
+        HeadlessStreamingTestExitSeconds = 0.0f;
+        HeadlessCollisionGateStressTestBeginSeconds = 0.0;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] configured=1 speed_cm_s=%.1f "
+                 "start_delay_s=%.3f duration_s=%.3f timeout_s=%.3f"),
+            HeadlessCollisionGateStressTestSpeedCmPerSecond,
+            HeadlessCollisionGateStressTestStartDelaySeconds,
+            HeadlessCollisionGateStressTestDurationSeconds,
+            HeadlessCollisionGateStressTestTimeoutSeconds);
     }
 }
 
@@ -2469,6 +2556,22 @@ void AVoxelWorld::ObserveHeadlessStrateCrossingTest(
     const FVoxelPassage& Passage =
         StrateManager->GetPassages()[HeadlessStrateCrossingTestPassageIndex];
     const FVector LocalPosition = WorldToLocalVoxel(PlayerPosition);
+    FVoxelTileKey PendingFloorTile;
+    if (IsPawnCapsuleOverlappingPendingFloor(
+            PlayerPawn, PlayerPosition, &PendingFloorTile))
+    {
+        bHeadlessStrateCrossingTestPendingFloorOverlap = true;
+        bHeadlessStrateCrossingTestFailed = true;
+        HeadlessStrateCrossingTestFailureReason = TEXT("capsule_overlaps_pending_floor");
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeStrateCrossingTest] assertion_failed=%s tile=(%d,%d,%d) "
+                 "position_vox=(%.2f,%.2f,%.2f) gate=%d"),
+            *HeadlessStrateCrossingTestFailureReason,
+            PendingFloorTile.Coord.X, PendingFloorTile.Coord.Y, PendingFloorTile.Coord.Z,
+            LocalPosition.X, LocalPosition.Y, LocalPosition.Z,
+            bPawnCollisionGateEngaged ? 1 : 0);
+        return;
+    }
     float PassageFloorZ = 0.0f;
     if (VF_ProjectHeadlessPassageFloor(Passage, LocalPosition, PassageFloorZ))
     {
@@ -2570,7 +2673,8 @@ void AVoxelWorld::MaybeFinishHeadlessStrateCrossingTest()
         TEXT("[VoxelForgeStrateCrossingTest] result=%s reason=%s passage=%d upper_strate=%d "
              "lower_strate=%d elapsed_s=%.6f distance_m=%.6f route=%d/%d "
              "max_gate_s=%.6f gate_limit_s=%.3f gate_total_s=%.6f "
-             "min_floor_clearance_vox=%.6f final_position=(%.1f,%.1f,%.1f)"),
+             "min_floor_clearance_vox=%.6f pending_floor_overlap=%d "
+             "final_position=(%.1f,%.1f,%.1f)"),
         bPassed ? TEXT("PASS") : TEXT("FAIL"),
         bPassed ? TEXT("reached_lower_strate") : *HeadlessStrateCrossingTestFailureReason,
         HeadlessStrateCrossingTestPassageIndex,
@@ -2584,6 +2688,7 @@ void AVoxelWorld::MaybeFinishHeadlessStrateCrossingTest()
         HeadlessStrateCrossingTestMaxGateSeconds,
         HeadlessStrateCrossingTestTotalGateDurationSeconds,
         HeadlessStrateCrossingTestMinFloorClearanceVoxels,
+        bHeadlessStrateCrossingTestPendingFloorOverlap ? 1 : 0,
         HeadlessStrateCrossingTestLastActualPosition.X,
         HeadlessStrateCrossingTestLastActualPosition.Y,
         HeadlessStrateCrossingTestLastActualPosition.Z);
@@ -2649,6 +2754,176 @@ void AVoxelWorld::AdvanceHeadlessStreamingTest(
                 CharacterMovement->SetMovementMode(MOVE_None);
             }
         }
+    }
+}
+
+void AVoxelWorld::AdvanceHeadlessCollisionGateStressTest(
+    FVector& InOutPlayerPosition, FVector& InOutPlayerHeading, APawn* PlayerPawn)
+{
+    if (!bHeadlessCollisionGateStressTest || bHeadlessCollisionGateStressTestFailed
+        || bHeadlessCollisionGateStressTestPassed || !IsValid(PlayerPawn))
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    if (!bHeadlessCollisionGateStressTestStartPlaced)
+    {
+        FVoxelTileKey SupportTile;
+        const TCHAR* SupportUnavailableReason = nullptr;
+        const bool bSupportReady = IsPlayerSupportCollisionReady(
+            PlayerPawn, InOutPlayerPosition, &SupportTile, &SupportUnavailableReason);
+
+        const FVector ActualPosition = PlayerPawn->GetActorLocation();
+        const FVector LaunchVoxel = WorldToLocalVoxel(ActualPosition);
+        // Freeze only the streaming centre, not the pawn. This deliberately leaves the desired
+        // clipmap behind the run while the launch support is already ready.
+        bHeadlessStreamingTestCenterOverride = true;
+        HeadlessStreamingTestCenterVoxel = LaunchVoxel;
+        InOutPlayerPosition = ActualPosition;
+        InOutPlayerHeading = FVector::ZeroVector;
+        HeadlessCollisionGateStressTestLastActualPosition = ActualPosition;
+        bHeadlessCollisionGateStressTestStartPlaced = true;
+        HeadlessCollisionGateStressTestStartSeconds = Now;
+
+        if (ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (UCharacterMovementComponent* CharacterMovement =
+                    Character->GetCharacterMovement())
+            {
+                CharacterMovement->MaxWalkSpeed = HeadlessCollisionGateStressTestSpeedCmPerSecond;
+                CharacterMovement->MaxAcceleration = FMath::Max(
+                    CharacterMovement->MaxAcceleration,
+                    HeadlessCollisionGateStressTestSpeedCmPerSecond * 8.0f);
+                CharacterMovement->BrakingDecelerationWalking = FMath::Max(
+                    CharacterMovement->BrakingDecelerationWalking,
+                    HeadlessCollisionGateStressTestSpeedCmPerSecond * 8.0f);
+                CharacterMovement->StopMovementImmediately();
+                CharacterMovement->SetMovementMode(MOVE_Walking);
+            }
+        }
+
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] start_placed support=(%d,%d,%d) ready=%d "
+                 "reason=%s "
+                 "position=(%.1f,%.1f,%.1f) launch_vox=(%.2f,%.2f,%.2f)"),
+            SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z,
+            bSupportReady ? 1 : 0,
+            SupportUnavailableReason != nullptr ? SupportUnavailableReason : TEXT("pending"),
+            ActualPosition.X, ActualPosition.Y, ActualPosition.Z,
+            LaunchVoxel.X, LaunchVoxel.Y, LaunchVoxel.Z);
+        return;
+    }
+
+    const double SinceLaunch = Now - HeadlessCollisionGateStressTestStartSeconds;
+    if (!bHeadlessCollisionGateStressTestStarted
+        && SinceLaunch < static_cast<double>(HeadlessCollisionGateStressTestStartDelaySeconds))
+    {
+        return;
+    }
+    if (!bHeadlessCollisionGateStressTestStarted)
+    {
+        bHeadlessCollisionGateStressTestStarted = true;
+        HeadlessCollisionGateStressTestBeginSeconds = Now;
+        HeadlessCollisionGateStressTestStartSeconds = Now;
+        HeadlessCollisionGateStressTestLastActualPosition = InOutPlayerPosition;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] movement_started speed_cm_s=%.1f"),
+            HeadlessCollisionGateStressTestSpeedCmPerSecond);
+    }
+
+    const FVector WorldDirection = GetActorTransform().TransformVectorNoScale(
+        HeadlessCollisionGateStressTestDirection).GetSafeNormal();
+    if (WorldDirection.IsNearlyZero())
+    {
+        return;
+    }
+
+    if (ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+    {
+        if (UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
+        {
+            // The baseline gate changes MOVE_Walking to MOVE_None. Do not undo that here; the
+            // test must observe the resulting full stop. The fall-only gate keeps this input live.
+            if (!bPawnCollisionGateEngaged
+                && CharacterMovement->MovementMode == MOVE_None)
+            {
+                CharacterMovement->SetMovementMode(MOVE_Walking);
+            }
+            PlayerPawn->AddMovementInput(WorldDirection, 1.0f, false);
+        }
+    }
+    else
+    {
+        PlayerPawn->AddMovementInput(WorldDirection, 1.0f, false);
+    }
+    InOutPlayerHeading = WorldDirection * HeadlessCollisionGateStressTestSpeedCmPerSecond;
+}
+
+void AVoxelWorld::ObserveHeadlessCollisionGateStressTest(
+    const FVector& PlayerPosition, APawn* PlayerPawn)
+{
+    if (!bHeadlessCollisionGateStressTest || !bHeadlessCollisionGateStressTestStarted
+        || !IsValid(PlayerPawn) || bHeadlessCollisionGateStressTestExitRequested)
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    const float HorizontalDelta = FVector::Dist2D(
+        HeadlessCollisionGateStressTestLastActualPosition, PlayerPosition);
+    HeadlessCollisionGateStressTestDistanceCm += HorizontalDelta;
+    HeadlessCollisionGateStressTestLastActualPosition = PlayerPosition;
+
+    const bool bGateEngaged = bPawnCollisionGateEngaged;
+    if (bGateEngaged && !bHeadlessCollisionGateStressTestGateWasEngaged)
+    {
+        ++HeadlessCollisionGateStressTestGateHoldCount;
+        HeadlessCollisionGateStressTestGateStartSeconds = Now;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] gate=engaged elapsed_s=%.6f"),
+            Now - HeadlessCollisionGateStressTestStartSeconds);
+    }
+    else if (!bGateEngaged && bHeadlessCollisionGateStressTestGateWasEngaged)
+    {
+        const double GateDuration = FMath::Max(
+            0.0, Now - HeadlessCollisionGateStressTestGateStartSeconds);
+        HeadlessCollisionGateStressTestTotalGateDurationSeconds += GateDuration;
+        HeadlessCollisionGateStressTestMaxGateDurationSeconds = FMath::Max(
+            HeadlessCollisionGateStressTestMaxGateDurationSeconds, GateDuration);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] gate=released duration_s=%.6f "
+                 "total_s=%.6f"),
+            GateDuration,
+            HeadlessCollisionGateStressTestTotalGateDurationSeconds);
+    }
+    bHeadlessCollisionGateStressTestGateWasEngaged = bGateEngaged;
+
+    // At 6000 cm/s a healthy frame advances well beyond one centimetre. A zero horizontal delta
+    // while the collision gate is engaged is therefore a real full stop, not a low-rate sample.
+    const bool bFullStop = bGateEngaged && HorizontalDelta <= 0.01f;
+    if (bFullStop && !bHeadlessCollisionGateStressTestFullStop)
+    {
+        ++HeadlessCollisionGateStressTestFullStopCount;
+        HeadlessCollisionGateStressTestFullStopStartSeconds = Now;
+    }
+    else if (!bFullStop && bHeadlessCollisionGateStressTestFullStop)
+    {
+        HeadlessCollisionGateStressTestFullStopDurationSeconds += FMath::Max(
+            0.0, Now - HeadlessCollisionGateStressTestFullStopStartSeconds);
+    }
+    bHeadlessCollisionGateStressTestFullStop = bFullStop;
+
+    if (Now - HeadlessCollisionGateStressTestStartSeconds
+        >= static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds))
+    {
+        return;
+    }
+    if (Now - HeadlessCollisionGateStressTestBeginSeconds
+        >= static_cast<double>(HeadlessCollisionGateStressTestTimeoutSeconds))
+    {
+        bHeadlessCollisionGateStressTestFailed = true;
+        HeadlessCollisionGateStressTestFailureReason = TEXT("stress_timeout");
     }
 }
 
@@ -2965,6 +3240,109 @@ void AVoxelWorld::MaybeFinishHeadlessSurfaceFallTest()
         false, bPassed ? 0 : 1, TEXT("VoxelForge surface fall test complete"));
 }
 
+void AVoxelWorld::MaybeFinishHeadlessCollisionGateStressTest()
+{
+    if (!bHeadlessCollisionGateStressTest || bHeadlessCollisionGateStressTestExitRequested
+        || HeadlessCollisionGateStressTestBeginSeconds <= 0.0)
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    const double SinceBegin = Now - HeadlessCollisionGateStressTestBeginSeconds;
+    if (!bHeadlessCollisionGateStressTestStartPlaced
+        && !bHeadlessCollisionGateStressTestPassed
+        && !bHeadlessCollisionGateStressTestFailed
+        && SinceBegin >= static_cast<double>(HeadlessCollisionGateStressTestTimeoutSeconds))
+    {
+        bHeadlessCollisionGateStressTestFailed = true;
+        HeadlessCollisionGateStressTestFailureReason = TEXT("stress_start_not_observed");
+    }
+    else if (bHeadlessCollisionGateStressTestStarted
+        && !bHeadlessCollisionGateStressTestPassed
+        && !bHeadlessCollisionGateStressTestFailed
+        && Now - HeadlessCollisionGateStressTestStartSeconds
+            >= static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds))
+    {
+        const double ExpectedDistanceCm =
+            static_cast<double>(HeadlessCollisionGateStressTestSpeedCmPerSecond)
+            * static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds);
+        if (HeadlessCollisionGateStressTestFullStopCount > 0)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason = TEXT("full_horizontal_stop");
+        }
+        else if (HeadlessCollisionGateStressTestDistanceCm < ExpectedDistanceCm * 0.65)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason = TEXT("horizontal_progress_shortfall");
+        }
+        else
+        {
+            bHeadlessCollisionGateStressTestPassed = true;
+        }
+    }
+    else if (!bHeadlessCollisionGateStressTestPassed
+        && !bHeadlessCollisionGateStressTestFailed
+        && SinceBegin >= static_cast<double>(HeadlessCollisionGateStressTestTimeoutSeconds))
+    {
+        bHeadlessCollisionGateStressTestFailed = true;
+        HeadlessCollisionGateStressTestFailureReason = TEXT("stress_timeout");
+    }
+
+    if (!bHeadlessCollisionGateStressTestPassed && !bHeadlessCollisionGateStressTestFailed)
+    {
+        return;
+    }
+
+    if (bHeadlessCollisionGateStressTestGateWasEngaged
+        && HeadlessCollisionGateStressTestGateStartSeconds > 0.0)
+    {
+        const double GateDuration = FMath::Max(
+            0.0, Now - HeadlessCollisionGateStressTestGateStartSeconds);
+        HeadlessCollisionGateStressTestTotalGateDurationSeconds += GateDuration;
+        HeadlessCollisionGateStressTestMaxGateDurationSeconds = FMath::Max(
+            HeadlessCollisionGateStressTestMaxGateDurationSeconds, GateDuration);
+    }
+    if (bHeadlessCollisionGateStressTestFullStop
+        && HeadlessCollisionGateStressTestFullStopStartSeconds > 0.0)
+    {
+        HeadlessCollisionGateStressTestFullStopDurationSeconds += FMath::Max(
+            0.0, Now - HeadlessCollisionGateStressTestFullStopStartSeconds);
+    }
+
+    bHeadlessCollisionGateStressTestExitRequested = true;
+    const bool bPassed = bHeadlessCollisionGateStressTestPassed
+        && !bHeadlessCollisionGateStressTestFailed;
+    const double ExpectedDistanceCm =
+        static_cast<double>(HeadlessCollisionGateStressTestSpeedCmPerSecond)
+        * static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeCollisionGateStressTest] result=%s reason=%s elapsed_s=%.6f "
+             "distance_m=%.6f expected_distance_m=%.6f speed_cm_s=%.1f "
+             "gate_holds=%d gate_total_s=%.6f max_gate_s=%.6f "
+             "full_stops=%d full_stop_total_s=%.6f collision_gate=%d "
+             "final_position=(%.1f,%.1f,%.1f)"),
+        bPassed ? TEXT("PASS") : TEXT("FAIL"),
+        bPassed ? TEXT("continuous_horizontal_progress")
+                : *HeadlessCollisionGateStressTestFailureReason,
+        Now - HeadlessCollisionGateStressTestBeginSeconds,
+        HeadlessCollisionGateStressTestDistanceCm / 100.0,
+        ExpectedDistanceCm / 100.0,
+        HeadlessCollisionGateStressTestSpeedCmPerSecond,
+        HeadlessCollisionGateStressTestGateHoldCount,
+        HeadlessCollisionGateStressTestTotalGateDurationSeconds,
+        HeadlessCollisionGateStressTestMaxGateDurationSeconds,
+        HeadlessCollisionGateStressTestFullStopCount,
+        HeadlessCollisionGateStressTestFullStopDurationSeconds,
+        bCollisionGateEnabled ? 1 : 0,
+        HeadlessCollisionGateStressTestLastActualPosition.X,
+        HeadlessCollisionGateStressTestLastActualPosition.Y,
+        HeadlessCollisionGateStressTestLastActualPosition.Z);
+    FPlatformMisc::RequestExitWithStatus(
+        false, bPassed ? 0 : 1, TEXT("VoxelForge collision-gate stress test complete"));
+}
+
 void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
 {
     if (bHeadlessStrateCrossingTest)
@@ -2976,6 +3354,12 @@ void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
     if (bHeadlessSurfaceFallTest)
     {
         MaybeFinishHeadlessSurfaceFallTest();
+        return;
+    }
+
+    if (bHeadlessCollisionGateStressTest)
+    {
+        MaybeFinishHeadlessCollisionGateStressTest();
         return;
     }
 
@@ -3018,10 +3402,12 @@ void AVoxelWorld::Tick(float DeltaTime)
         AdvanceHeadlessStreamingTest(PlayerLastPos, PlayerHeading, PlayerPawn);
         AdvanceHeadlessStrateCrossingTest(PlayerLastPos, PlayerHeading, PlayerPawn);
         AdvanceHeadlessSurfaceFallTest(PlayerLastPos, PlayerHeading, PlayerPawn);
+        AdvanceHeadlessCollisionGateStressTest(PlayerLastPos, PlayerHeading, PlayerPawn);
         PeakObservedPawnSpeedCmPerSecond = FMath::Max(
             PeakObservedPawnSpeedCmPerSecond, PlayerHeading.Size2D());
         UpdatePawnCollisionGate(PlayerPawn, PlayerLastPos, DeltaTime);
         ObserveHeadlessStrateCrossingTest(PlayerLastPos, PlayerPawn);
+        ObserveHeadlessCollisionGateStressTest(PlayerLastPos, PlayerPawn);
         const FVector StreamingCenterPosition = bHeadlessStreamingTestCenterOverride
             ? LocalVoxelToWorld(HeadlessStreamingTestCenterVoxel)
             : PlayerLastPos;
@@ -3420,15 +3806,6 @@ bool AVoxelWorld::IsCollisionTileUnavailable(const FVoxelTileKey& Tile,
         }
     }
 
-    // DesiredStamp is zero only during the initial possession/setup tick, before the first
-    // desired set has been built. Do not classify that transient state as "outside desired";
-    // otherwise the initial safety gate could release before streaming has any authority.
-    if (DesiredStamp > 0 && !IsDesired(Tile))
-    {
-        OutReason = TEXT("outside_desired_set");
-        return true;
-    }
-
     return false;
 }
 
@@ -3507,11 +3884,164 @@ bool AVoxelWorld::IsPlayerSupportCollisionReady(APawn* Pawn, const FVector& Play
         CandidateTile, OutSupportTile, OutUnavailableReason);
 }
 
+bool AVoxelWorld::IsPawnCapsuleOverlappingPendingFloor(
+    APawn* Pawn, const FVector& PlayerPosition, FVoxelTileKey* OutPendingTile) const
+{
+    if (OutPendingTile != nullptr)
+    {
+        *OutPendingTile = FVoxelTileKey();
+    }
+    if (!IsValid(Pawn))
+    {
+        return false;
+    }
+
+    FVoxelTileKey SupportTile;
+    const TCHAR* SupportUnavailableReason = nullptr;
+    if (IsPlayerSupportCollisionReady(
+            Pawn, PlayerPosition, &SupportTile, &SupportUnavailableReason)
+        || SupportUnavailableReason != nullptr
+        || SupportTile.Level != 0
+        || CollisionNotRequiredTiles.Contains(SupportTile))
+    {
+        return false;
+    }
+
+    float HalfHeightCm = 0.0f;
+    float RadiusCm = 0.0f;
+    if (const ACharacter* Character = Cast<ACharacter>(Pawn))
+    {
+        if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+        {
+            HalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+            RadiusCm = Capsule->GetScaledCapsuleRadius();
+        }
+    }
+    else
+    {
+        FVector BoundsOrigin = FVector::ZeroVector;
+        FVector BoundsExtent = FVector::ZeroVector;
+        Pawn->GetActorBounds(/*bOnlyCollidingComponents*/ true, BoundsOrigin, BoundsExtent);
+        HalfHeightCm = FMath::Max(0.0f, BoundsExtent.Z);
+        RadiusCm = FMath::Max(BoundsExtent.X, BoundsExtent.Y);
+    }
+    if (!VoxelMath::IsFinite(HalfHeightCm) || !VoxelMath::IsFinite(RadiusCm)
+        || HalfHeightCm <= 0.0f || RadiusCm < 0.0f)
+    {
+        return false;
+    }
+
+    const FVector LocalPosition = WorldToLocalVoxel(PlayerPosition);
+    const float HalfHeightVoxels = HalfHeightCm / VOXEL_SIZE;
+    const float RadiusVoxels = RadiusCm / VOXEL_SIZE;
+    const float TileMinX = static_cast<float>(SupportTile.Coord.X * CHUNK_SIZE);
+    const float TileMaxX = static_cast<float>((SupportTile.Coord.X + 1) * CHUNK_SIZE);
+    const float TileMinY = static_cast<float>(SupportTile.Coord.Y * CHUNK_SIZE);
+    const float TileMaxY = static_cast<float>((SupportTile.Coord.Y + 1) * CHUNK_SIZE);
+    const float TileMinZ = static_cast<float>(SupportTile.Coord.Z * CHUNK_SIZE);
+    const float TileMaxZ = static_cast<float>((SupportTile.Coord.Z + 1) * CHUNK_SIZE);
+    const float CapsuleMinZ = LocalPosition.Z - HalfHeightVoxels;
+    const float CapsuleMaxZ = LocalPosition.Z + HalfHeightVoxels;
+    const bool bHorizontalOverlap = LocalPosition.X + RadiusVoxels > TileMinX
+        && LocalPosition.X - RadiusVoxels < TileMaxX
+        && LocalPosition.Y + RadiusVoxels > TileMinY
+        && LocalPosition.Y - RadiusVoxels < TileMaxY;
+    const bool bVerticalOverlap = CapsuleMaxZ > TileMinZ && CapsuleMinZ < TileMaxZ;
+    if (!bHorizontalOverlap || !bVerticalOverlap)
+    {
+        return false;
+    }
+
+    if (OutPendingTile != nullptr)
+    {
+        *OutPendingTile = SupportTile;
+    }
+    return true;
+}
+
+void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTile)
+{
+    if (SupportTile.Level != 0
+        || IsTileCollisionReady(SupportTile)
+        || CollisionNotRequiredTiles.Contains(SupportTile))
+    {
+        return;
+    }
+
+    if (!bPawnGateSupportRequestReported
+        || PawnGateRequestedSupportTile != SupportTile)
+    {
+        PawnGateRequestedSupportTile = SupportTile;
+        bPawnGateSupportRequestReported = false;
+    }
+
+    // The gate runs before UpdateChunksAroundPosition. If the floor has just moved outside the
+    // old desired stamp, ask that normal rebuild to make it the critical floor request rather than
+    // generating an orphan tile that the streaming policy could immediately cull.
+    if (DesiredStamp == 0 || !IsDesired(SupportTile))
+    {
+        bForceDesiredRebuild = true;
+        if (!bPawnGateSupportRequestReported)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeCollisionGate] support_request_deferred tile=(%d,%d,%d) "
+                     "reason=outside_desired_set"),
+                SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z);
+            bPawnGateSupportRequestReported = true;
+        }
+        return;
+    }
+
+    // Preserve the existing critical floor ordering for the next submit pass, and make an
+    // immediate game-thread request when no mesh/cook is already in flight. LoadTile's true flag
+    // is the established BackgroundHigh streaming priority.
+    CriticalDesiredTiles.Remove(SupportTile);
+    CriticalDesiredTiles.Insert(SupportTile, 0);
+    if (PendingTiles.Contains(SupportTile) || LoadedTiles.Contains(SupportTile))
+    {
+        if (!bPawnGateSupportRequestReported)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeCollisionGate] support_request_present tile=(%d,%d,%d) "
+                     "pending=%d loaded=%d"),
+                SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z,
+                PendingTiles.Contains(SupportTile) ? 1 : 0,
+                LoadedTiles.Contains(SupportTile) ? 1 : 0);
+            bPawnGateSupportRequestReported = true;
+        }
+        return;
+    }
+
+    const int32 PendingBefore = PendingTiles.Num();
+    LoadTile(SupportTile, /*bHighPriority*/ true);
+    if (PendingTiles.Num() > PendingBefore)
+    {
+        bAllChunksLoaded = false;
+    }
+    if (!bPawnGateSupportRequestReported)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGate] support_request tile=(%d,%d,%d) "
+                 "submitted=%d priority=high"),
+            SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z,
+            PendingTiles.Contains(SupportTile) ? 1 : 0);
+        bPawnGateSupportRequestReported = true;
+    }
+}
+
 void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosition,
                                            float DeltaTime)
 {
+    static_cast<void>(DeltaTime);
     if (!IsValid(Pawn) || bShuttingDown.load(std::memory_order_relaxed))
     {
+        return;
+    }
+
+    // This is a startup snapshot of voxel.CollisionGate. The hot path never reads the CVar.
+    if (!bCollisionGateEnabled)
+    {
+        ReleasePawnCollisionGate();
         return;
     }
 
@@ -3554,7 +4084,7 @@ void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosi
         && CollisionGatedCharacterMovement.Get() != CurrentMovement
         && CollisionGatedPawnMovement.Get() != CurrentMovement)
     {
-        // The component was replaced while the pawn was stopped. Restore the old component (if it
+        // The component was replaced while the pawn was held. Restore the old component (if it
         // still exists) and let the normal path engage the replacement against the same readiness
         // decision below.
         ReleasePawnCollisionGate();
@@ -3569,74 +4099,48 @@ void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosi
     const TCHAR* CurrentSupportUnavailableReason = nullptr;
     const bool bCurrentSupportReady = IsPlayerSupportCollisionReady(
         Pawn, PlayerPosition, &CurrentSupportTile, &CurrentSupportUnavailableReason);
-    bool bCanRelease = bCurrentSupportReady;
-    bool bWaitingForPredictedSupport = false;
-    FVoxelTileKey PredictedSupportTile;
-    const TCHAR* PredictedSupportUnavailableReason = nullptr;
-
-    // Check the movement path ahead while the gate is open. Without this, a pawn could leave a
-    // ready tile on this frame and enter an un-cooked tile before the next world tick observes it.
-    if (bCurrentSupportReady && DeltaTime > 0.0f)
-    {
-        const FVector Velocity = Pawn->GetVelocity();
-        if (!Velocity.IsNearlyZero(1.0f))
-        {
-            constexpr float SupportProbeSpacingCm = CHUNK_SIZE * VOXEL_SIZE * 0.5f;
-            constexpr int32 MaxPredictedSupportProbes = 64;
-            const int32 NumPredictedProbes = FMath::Clamp(
-                FMath::CeilToInt(Velocity.Size() * DeltaTime / SupportProbeSpacingCm),
-                1, MaxPredictedSupportProbes);
-            for (int32 ProbeIndex = 1; ProbeIndex <= NumPredictedProbes; ++ProbeIndex)
-            {
-                const float Alpha = static_cast<float>(ProbeIndex)
-                    / static_cast<float>(NumPredictedProbes);
-                const FVector PredictedPosition = PlayerPosition + Velocity * DeltaTime * Alpha;
-                const bool bPredictedSupportReady = IsPlayerSupportCollisionReady(
-                    Pawn, PredictedPosition, &PredictedSupportTile,
-                    &PredictedSupportUnavailableReason);
-                if (!bPredictedSupportReady)
-                {
-                    bCanRelease = false;
-                    bWaitingForPredictedSupport = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    const TCHAR* NonBlockingReason = CurrentSupportUnavailableReason != nullptr
-        ? CurrentSupportUnavailableReason : PredictedSupportUnavailableReason;
-    if (NonBlockingReason != nullptr)
+    if (CurrentSupportUnavailableReason != nullptr)
     {
         if (!bPawnGateUnavailableReported)
         {
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeCollisionGate] nonblocking pawn=%s reason=%s "
-                     "current_reason=%s predicted_reason=%s current_support=(%d,%d,%d) "
-                     "predicted_support=(%d,%d,%d); tile will not be produced, no collision to wait for"),
+                     "support=(%d,%d,%d); tile will not be produced, no collision to wait for"),
                 *Pawn->GetName(),
-                NonBlockingReason,
-                CurrentSupportUnavailableReason != nullptr
-                    ? CurrentSupportUnavailableReason : TEXT("none"),
-                PredictedSupportUnavailableReason != nullptr
-                    ? PredictedSupportUnavailableReason : TEXT("none"),
+                CurrentSupportUnavailableReason,
                 CurrentSupportTile.Coord.X, CurrentSupportTile.Coord.Y,
-                CurrentSupportTile.Coord.Z,
-                PredictedSupportTile.Coord.X, PredictedSupportTile.Coord.Y,
-                PredictedSupportTile.Coord.Z);
+                CurrentSupportTile.Coord.Z);
         }
         bPawnGateUnavailableReported = true;
+        ReleasePawnCollisionGate();
+        return;
     }
     else
     {
         bPawnGateUnavailableReported = false;
     }
 
-    if (bCanRelease)
+    if (bCurrentSupportReady)
     {
         ReleasePawnCollisionGate();
         return;
     }
+
+    // An unresolved tile above the pawn is not a landing hazard. Let upward movement continue;
+    // only a downward/standing pawn needs its fall cancelled until the current support resolves.
+    if (const ACharacter* Character = Cast<ACharacter>(Pawn))
+    {
+        if (const UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
+        {
+            if (CharacterMovement->Velocity.Z > KINDA_SMALL_NUMBER)
+            {
+                ReleasePawnCollisionGate();
+                return;
+            }
+        }
+    }
+
+    RequestCollisionGateSupportTile(CurrentSupportTile);
 
     constexpr double MaxCollisionGateWaitSeconds = 2.0;
     if (bPawnCollisionGateEngaged && PawnGateEngagedAtSeconds > 0.0)
@@ -3646,16 +4150,12 @@ void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosi
         {
             UE_LOG(LogTemp, Warning,
                 TEXT("[VoxelForgeCollisionGate] wait_timeout pawn=%s waited_s=%.3f "
-                     "current_ready=%d predicted_wait=%d current_support=(%d,%d,%d) "
-                     "predicted_support=(%d,%d,%d); releasing safety gate"),
+                     "current_ready=%d support=(%d,%d,%d); releasing safety gate"),
                 *Pawn->GetName(),
                 WaitSeconds,
                 bCurrentSupportReady ? 1 : 0,
-                bWaitingForPredictedSupport ? 1 : 0,
                 CurrentSupportTile.Coord.X, CurrentSupportTile.Coord.Y,
-                CurrentSupportTile.Coord.Z,
-                PredictedSupportTile.Coord.X, PredictedSupportTile.Coord.Y,
-                PredictedSupportTile.Coord.Z);
+                CurrentSupportTile.Coord.Z);
             ReleasePawnCollisionGate();
             return;
         }
@@ -3665,11 +4165,10 @@ void AVoxelWorld::UpdatePawnCollisionGate(APawn* Pawn, const FVector& PlayerPosi
     {
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeCollisionGate] waiting pawn=%s current_support=(%d,%d,%d) ready=%d "
-                 "predicted_wait=%d"),
+                 "hold_fall=1"),
             *Pawn->GetName(),
             CurrentSupportTile.Coord.X, CurrentSupportTile.Coord.Y, CurrentSupportTile.Coord.Z,
-            bCurrentSupportReady ? 1 : 0,
-            bWaitingForPredictedSupport ? 1 : 0);
+            bCurrentSupportReady ? 1 : 0);
     }
     EngagePawnCollisionGate(Pawn);
 }
@@ -3682,6 +4181,29 @@ void AVoxelWorld::EngagePawnCollisionGate(APawn* Pawn)
     }
     if (bPawnCollisionGateEngaged)
     {
+        // Re-apply the vertical hold every game-thread sample. Movement input and horizontal
+        // velocity are intentionally untouched.
+        if (UCharacterMovementComponent* CharacterMovement =
+                CollisionGatedCharacterMovement.Get())
+        {
+            FVector Velocity = CharacterMovement->Velocity;
+            if (Velocity.Z < 0.0f)
+            {
+                Velocity.Z = 0.0f;
+                CharacterMovement->Velocity = Velocity;
+                CharacterMovement->UpdateComponentVelocity();
+            }
+        }
+        else if (UPawnMovementComponent* PawnMovement = CollisionGatedPawnMovement.Get())
+        {
+            FVector Velocity = PawnMovement->Velocity;
+            if (Velocity.Z < 0.0f)
+            {
+                Velocity.Z = 0.0f;
+                PawnMovement->Velocity = Velocity;
+                PawnMovement->UpdateComponentVelocity();
+            }
+        }
         return;
     }
 
@@ -3692,12 +4214,17 @@ void AVoxelWorld::EngagePawnCollisionGate(APawn* Pawn)
         if (UCharacterMovementComponent* CharacterMovement = Character->GetCharacterMovement())
         {
             CollisionGatedCharacterMovement = CharacterMovement;
-            SavedCharacterMovementMode = static_cast<uint8>(CharacterMovement->MovementMode);
-            SavedCharacterCustomMovementMode = CharacterMovement->CustomMovementMode;
-            bSavedCharacterMovementMode = true;
+            SavedCharacterGravityScale = CharacterMovement->GravityScale;
+            bSavedCharacterGravityScale = true;
 
-            CharacterMovement->StopMovementImmediately();
-            CharacterMovement->SetMovementMode(MOVE_None);
+            FVector Velocity = CharacterMovement->Velocity;
+            if (Velocity.Z < 0.0f)
+            {
+                Velocity.Z = 0.0f;
+                CharacterMovement->Velocity = Velocity;
+            }
+            CharacterMovement->GravityScale = 0.0f;
+            CharacterMovement->UpdateComponentVelocity();
             bPawnCollisionGateEngaged = true;
             PawnGateEngagedAtSeconds = FPlatformTime::Seconds();
             return;
@@ -3707,9 +4234,13 @@ void AVoxelWorld::EngagePawnCollisionGate(APawn* Pawn)
     if (UPawnMovementComponent* PawnMovement = Pawn->GetMovementComponent())
     {
         CollisionGatedPawnMovement = PawnMovement;
-        bSavedPawnMovementActive = PawnMovement->IsActive();
-        PawnMovement->StopMovementImmediately();
-        PawnMovement->Deactivate();
+        FVector Velocity = PawnMovement->Velocity;
+        if (Velocity.Z < 0.0f)
+        {
+            Velocity.Z = 0.0f;
+            PawnMovement->Velocity = Velocity;
+            PawnMovement->UpdateComponentVelocity();
+        }
         bPawnCollisionGateEngaged = true;
         PawnGateEngagedAtSeconds = FPlatformTime::Seconds();
         return;
@@ -3732,44 +4263,37 @@ void AVoxelWorld::ReleasePawnCollisionGate()
         CollisionGatedPawn.Reset();
         CollisionGatedPawnMovement.Reset();
         CollisionGatedCharacterMovement.Reset();
-        bSavedCharacterMovementMode = false;
-        bSavedPawnMovementActive = false;
+        bSavedCharacterGravityScale = false;
+        bPawnGateSupportRequestReported = false;
         PawnGateEngagedAtSeconds = 0.0;
         return;
     }
 
     if (UCharacterMovementComponent* CharacterMovement = CollisionGatedCharacterMovement.Get())
     {
-        if (bSavedCharacterMovementMode)
+        if (bSavedCharacterGravityScale)
         {
-            CharacterMovement->SetMovementMode(
-                static_cast<EMovementMode>(SavedCharacterMovementMode),
-                SavedCharacterCustomMovementMode);
-        }
-    }
-    else if (UPawnMovementComponent* PawnMovement = CollisionGatedPawnMovement.Get())
-    {
-        if (bSavedPawnMovementActive)
-        {
-            PawnMovement->Activate(true);
-        }
-        else
-        {
-            PawnMovement->Deactivate();
+            CharacterMovement->GravityScale = SavedCharacterGravityScale;
+            CharacterMovement->UpdateComponentVelocity();
         }
     }
 
     if (APawn* Pawn = CollisionGatedPawn.Get())
     {
-        UE_LOG(LogTemp, Display, TEXT("[VoxelForgeCollisionGate] released pawn=%s"), *Pawn->GetName());
+        const double HoldSeconds = PawnGateEngagedAtSeconds > 0.0
+            ? FMath::Max(0.0, FPlatformTime::Seconds() - PawnGateEngagedAtSeconds)
+            : 0.0;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGate] released pawn=%s hold_s=%.6f"),
+            *Pawn->GetName(), HoldSeconds);
     }
     CollisionGatedPawn.Reset();
     CollisionGatedPawnMovement.Reset();
     CollisionGatedCharacterMovement.Reset();
-    bSavedCharacterMovementMode = false;
-    bSavedPawnMovementActive = false;
+    bSavedCharacterGravityScale = false;
     bPawnCollisionGateEngaged = false;
     PawnGateEngagedAtSeconds = 0.0;
+    bPawnGateSupportRequestReported = false;
 }
 
 void AVoxelWorld::BindRealtimeMeshCollisionEvent(URealtimeMesh* Mesh)
