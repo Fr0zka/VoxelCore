@@ -43,9 +43,17 @@ $BuildRecord = [ordered]@{ requested = [bool]$Build; status = 'not_requested' }
 $AssetEvidence = @()
 $CommandletMetrics = [ordered]@{}
 $GameMetrics = [ordered]@{}
-$SurfaceFallMetrics = [ordered]@{ requested = $Scenario -in @('tests', 'surface-fall'); status = 'not_run' }
+$SurfaceFallMetrics = [ordered]@{
+    requested = $Scenario -eq 'surface-fall' -or
+        ($Scenario -eq 'tests' -and [string]::IsNullOrWhiteSpace($TestFilter))
+    status = 'not_run'
+}
 $StrateCrossingMetrics = [ordered]@{ requested = $Scenario -eq 'crossing'; status = 'not_run' }
-$CollisionGateStressMetrics = [ordered]@{ requested = $Scenario -in @('tests', 'gate-stress'); status = 'not_run' }
+$CollisionGateStressMetrics = [ordered]@{
+    requested = $Scenario -eq 'gate-stress' -or
+        ($Scenario -eq 'tests' -and [string]::IsNullOrWhiteSpace($TestFilter))
+    status = 'not_run'
+}
 $TestMetrics = @()
 $ParityEvidence = [ordered]@{ requested = $Scenario -eq 'parity'; status = 'not_run' }
 $DllEvidence = [ordered]@{
@@ -1038,9 +1046,9 @@ try {
                 Add-Failure "automation tests failed: $failedNames"
             }
 
-            # The runtime collision-gate repro is part of the tests scenario as an integration
-            # test alongside the 44 pure automation tests. It uses the same isolated host/assets
-            # and gets its own launch ledger entry and log.
+            if ([string]::IsNullOrWhiteSpace($TestFilter)) {
+            # The unfiltered suite includes its collision integration repros. A filtered run is
+            # bounded to its named automation tests and does not launch unrelated scenarios.
             $surfaceBaseCvars = [ordered]@{
                 'voxel.TestSurfaceFall' = 1
                 'voxel.TestSurfaceFallSpawnHeightVoxels' = 20
@@ -1070,6 +1078,7 @@ try {
             if ($CollisionGateStressMetrics.status -ne 'passed') {
                 $stressReason = [string](Get-JsonValue $CollisionGateStressMetrics 'reason' '')
                 Add-Failure "collision-gate stress repro did not pass: $($CollisionGateStressMetrics.status) $stressReason"
+            }
             }
         }
         'parity' {

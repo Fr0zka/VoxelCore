@@ -21,6 +21,7 @@
 #include "VoxelCaveMorphology.h"
 #include "VoxelPassageGeometry.h"
 #include "VoxelTilePostReach.h"
+#include "VoxelClipmapDesiredTiles.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
 // APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
 // complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
@@ -52,6 +53,8 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonWriter.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
+
+static int32 VF_MaxMarchingCubesLevel(const UVoxelSettings* Settings);
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -3580,7 +3583,7 @@ void AVoxelWorld::Tick(float DeltaTime)
                 Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z,
                 *FString::SanitizeFloat(TileExtentMetres),
                 *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
-                Settings && Level > Settings->MaxClipLevel ? 1 : 0));
+                Settings && Level > VF_MaxMarchingCubesLevel(Settings) ? 1 : 0));
         }
         VoxelForgeStartupTrace::Finish(TEXT("desired_set_satisfied_and_queue_drained"));
     }
@@ -5031,30 +5034,28 @@ static FORCEINLINE FIntVector VF_FloorDiv(const FIntVector& V, int32 D)
     return FIntVector(VF_FloorDiv(V.X, D), VF_FloorDiv(V.Y, D), VF_FloorDiv(V.Z, D));
 }
 
-// RENDER DISTANCE — rayon (en tuiles niveau-MaxLevel) de la coquille EXTERNE : ClipRadius, élargi
-// si `RenderDistanceChunks` demande une portée horizontale au-delà du naturel R·2^MaxLevel. Partagé
-// par BuildDesiredTiles (le desired set) et IsTileInClipRange (le même horizon pour le cull).
-static FORCEINLINE int32 VF_OuterShellRadius(const UVoxelSettings* Settings, int32 R, int32 MaxLevel)
-{
-    const int32 Dist = Settings ? Settings->RenderDistanceChunks : 0;
-    if (Dist <= 0) return R;
-    return FMath::Max(R, (Dist + (1 << MaxLevel) - 1) >> MaxLevel);   // ceil(Dist / 2^MaxLevel)
-}
-
-// F18 — la coquille LA PLUS EXTERNE : niveau + rayon. Sans anneau feuille = (MaxLevel, rayon
-// render-distance). Avec (`bFarSheetRing` et distance > portée naturelle) = l'anneau FEUILLE :
-// niveau MaxLevel + FarSheetSpanLevels (une feuille couvre 2^span empreintes MC par axe), rayon
-// re-dérivé à ce niveau. Partagé par BuildDesiredTiles et IsTileInClipRange (même horizon).
+// F18 — the outer shell is either the MC render-distance level or the larger sheet ring. When
+// the sheet span skips levels, VF_MaxMarchingCubesLevel fills them with MC bridge shells.
+// Shared by desired selection and range culling so both use the same outer horizon.
 static FORCEINLINE void VF_OuterShell(const UVoxelSettings* Settings, int32 R, int32 MaxLevel,
                                       int32& OutLevel, int32& OutRadius)
 {
-    OutLevel  = MaxLevel;
-    OutRadius = VF_OuterShellRadius(Settings, R, MaxLevel);
-    if (Settings && Settings->bFarSheetRing && OutRadius > R)
-    {
-        OutLevel  = MaxLevel + FMath::Clamp(Settings->FarSheetSpanLevels, 1, 4);
-        OutRadius = FMath::Max(1, (Settings->RenderDistanceChunks + (1 << OutLevel) - 1) >> OutLevel);
-    }
+    VoxelClipmapDesiredTiles::FParameters Parameters;
+    Parameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
+    Parameters.bFarSheetRing = Settings && Settings->bFarSheetRing;
+    Parameters.FarSheetSpanLevels = Settings ? Settings->FarSheetSpanLevels : 2;
+    VoxelClipmapDesiredTiles::OuterShell(Parameters, R, MaxLevel, OutLevel, OutRadius);
+}
+
+// When an expanded sheet ring skips LOD levels, keep an MC bridge at every intervening level.
+static int32 VF_MaxMarchingCubesLevel(const UVoxelSettings* Settings)
+{
+    const int32 Radius = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
+    const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+    int32 OuterLevel = MaxLevel, OuterRadius = Radius;
+    VF_OuterShell(Settings, Radius, MaxLevel, OuterLevel, OuterRadius);
+    (void)OuterRadius;
+    return OuterLevel > MaxLevel ? OuterLevel - 1 : MaxLevel;
 }
 
 void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& PlayerPosition,
@@ -5072,128 +5073,37 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
     const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
 
-    // RENDER DISTANCE (`RenderDistanceChunks`) : la coquille EXTERNE continue au-delà du rayon
-    // naturel jusqu'à couvrir la distance demandée — en tuiles MC niveau-MaxClipLevel, ou (F18,
-    // `bFarSheetRing`) en tuiles FEUILLE plus grandes (niveau MaxLevel+span, deux heightfields
-    // sol/cap au lieu de marching cubes — cf. GenerateSheetMesh). IsTileInClipRange partage
-    // VF_OuterShell pour que le cull voie le même horizon.
-    const int32 ROuter = VF_OuterShellRadius(Settings, R, MaxLevel);
-    int32 SheetLevel = MaxLevel, RSheet = ROuter;
-    VF_OuterShell(Settings, R, MaxLevel, SheetLevel, RSheet);
-    const bool bSheetRing = SheetLevel > MaxLevel;
+    // Render-distance tiles expand horizontally. The sheet ring retains its configured span;
+    // intermediate levels are emitted as marching-cubes bridge shells below it.
+    // IsTileInClipRange shares the outer-shell calculation so culling sees this same horizon.
+    int32 StrateTopZ = 0, StrateBottomZ = 0;
+    bool bHasStrate = false;
+    if (StrateManager)
+    {
+        bHasStrate = StrateManager->GetStrateChunkZBounds(Center.Z, StrateTopZ, StrateBottomZ);
+    }
 
-    // Strate-aware VERTICAL band (in level-0 chunk-Z). Without this the clipmap generates the
-    // occluded volume above/below (sealed strates are light-tight, §8.7) AND the full underground
-    // depth — a huge column of invisible solid rock = the gen lag. So clamp the vertical reach to
-    // the player's strate ± margin (open-ceiling strates extend UP to the sky-cap). The clipmap
-    // stays full-reach HORIZONTALLY (the horizon) but limited vertically. ZLo/ZHi span ⇒ no clamp.
+    // Keep the clamp enabled, but cover the player's complete current strate plus its margin.
+    // Only when no strate bounds exist (the inter-strate gap) does the small player window apply.
     int32 ZLo = MIN_int32, ZHi = MAX_int32;
-    if (Settings && Settings->bClampViewToStrate && StrateManager)
+    VoxelClipmapDesiredTiles::ResolveVerticalBounds(
+        Center.Z,
+        Settings ? Settings->ViewDistanceUp : 5,
+        Settings ? Settings->ViewDistanceDown : 5,
+        Settings ? Settings->StrateViewMarginChunks : 3,
+        Settings && Settings->bClampViewToStrate,
+        bHasStrate, StrateTopZ, StrateBottomZ, ZLo, ZHi);
+
+    VoxelClipmapDesiredTiles::FParameters TileParameters;
+    TileParameters.ClipRadius = R;
+    TileParameters.MaxClipLevel = MaxLevel;
+    TileParameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
+    TileParameters.bFarSheetRing = Settings && Settings->bFarSheetRing;
+    TileParameters.FarSheetSpanLevels = Settings ? Settings->FarSheetSpanLevels : 2;
+    VoxelClipmapDesiredTiles::Build(Center, ZLo, ZHi, TileParameters, DesiredSorted);
+    for (const FVoxelTileKey& Key : DesiredSorted)
     {
-        const int32 Margin = Settings->StrateViewMarginChunks;
-        ZLo = Center.Z - Settings->ViewDistanceDown;
-        ZHi = Center.Z + Settings->ViewDistanceUp;
-        int32 StrTopZ = 0, StrBotZ = 0;
-        if (StrateManager->GetStrateChunkZBounds(Center.Z, StrTopZ, StrBotZ))
-        {
-            const ECaveGeneratorType GenType = StrateManager->GetGeneratorTypeForChunk(Center);
-            const bool bOpen = (GenType == ECaveGeneratorType::SurfaceWorld
-                             || GenType == ECaveGeneratorType::FloatingIslands);
-            ZLo = FMath::Max(ZLo, StrBotZ - Margin);
-            ZHi = bOpen ? (StrTopZ + Margin) : FMath::Min(ZHi, StrTopZ + Margin);
-        }
-        // else: in the bedrock gap → keep the player window (see both sides while descending).
-    }
-
-    // Concentric shells: level 0 near the player, each coarser level a 2× larger shell beyond.
-    // A level-L tile is dropped if it's fully covered by the finer (L-1) level's box — that's
-    // the inner hole, so the shells tile space without big gaps.
-    for (int32 L = 0; L <= MaxLevel; ++L)
-    {
-        const int32 Pow   = 1 << L;                       // level-L tile = 2^L chunks
-        const FIntVector CL = VF_FloorDiv(Center, Pow);   // player's level-L tile coord
-        const FIntVector CF = (L > 0) ? VF_FloorDiv(Center, Pow >> 1) : FIntVector::ZeroValue;
-
-        // Rayon de CE niveau : R partout, sauf la coquille externe (render distance) — qui, si
-        // l'anneau FEUILLE est actif (F18), est émise à part plus bas (le niveau MaxLevel reste
-        // alors à R). Le test "covered by finer" garde R (le niveau plus fin n'est jamais étendu).
-        const int32 RL = (L == MaxLevel && !bSheetRing) ? ROuter : R;
-
-        // Anneau étendu : le balayage naïf serait (2·RL+1)³ — on restreint dz à la fenêtre de la
-        // clamp verticale AVANT la boucle (mêmes tuiles retenues : le `continue` Z ci-dessous
-        // rejetterait tout le reste). Sentinelles MIN/MAX (pas de clamp) ⇒ balayage plein.
-        int32 DzMin = -RL, DzMax = RL;
-        if (RL > R && ZLo != MIN_int32)
-        {
-            DzMin = FMath::Max(DzMin, VF_FloorDiv(ZLo, Pow) - CL.Z);
-            DzMax = FMath::Min(DzMax, VF_FloorDiv(ZHi, Pow) - CL.Z);
-        }
-
-        for (int32 dz = DzMin; dz <= DzMax; ++dz)
-        for (int32 dy = -RL; dy <= RL; ++dy)
-        for (int32 dx = -RL; dx <= RL; ++dx)
-        {
-            const FIntVector T = CL + FIntVector(dx, dy, dz);
-
-            // Strate-aware vertical clamp: drop tiles whose level-0 chunk-Z footprint doesn't
-            // overlap [ZLo, ZHi] (the occluded strate above/below / deep underground).
-            const int32 TZLo = T.Z << L;
-            const int32 TZHi = ((T.Z + 1) << L) - 1;
-            if (TZHi < ZLo || TZLo > ZHi) continue;
-
-            if (L > 0)
-            {
-                // Covered by the finer level iff the level-(L-1) tiles 2T..2T+1 (per axis)
-                // all lie inside the finer box [CF-R, CF+R].
-                const bool bCovered =
-                    (2 * T.X     >= CF.X - R) && (2 * T.X + 1 <= CF.X + R) &&
-                    (2 * T.Y     >= CF.Y - R) && (2 * T.Y + 1 <= CF.Y + R) &&
-                    (2 * T.Z     >= CF.Z - R) && (2 * T.Z + 1 <= CF.Z + R);
-                if (bCovered) continue;
-            }
-            const FVoxelTileKey Key(T, L);
-            DesiredSorted.Add(Key);
-            DesiredStamped.FindOrAdd(Key) = DesiredStamp;
-        }
-    }
-
-    // F18 — ANNEAU FEUILLE : la portée render-distance est couverte par des tuiles feuille
-    // (niveau SheetLevel > MaxLevel, LoadTile route niveau > MaxClipLevel vers GenerateSheetMesh).
-    // Trou intérieur = la boîte MC niveau-MaxLevel (rayon R), pas le niveau SheetLevel−1.
-    if (bSheetRing)
-    {
-        const int32 SPow = 1 << SheetLevel;
-        const FIntVector CS = VF_FloorDiv(Center, SPow);
-        const FIntVector CM = VF_FloorDiv(Center, 1 << MaxLevel);
-        const int32 K = SheetLevel - MaxLevel;   // 1 feuille = 2^K tuiles MC par axe
-
-        int32 DzMin = -RSheet, DzMax = RSheet;
-        if (ZLo != MIN_int32)
-        {
-            DzMin = FMath::Max(DzMin, VF_FloorDiv(ZLo, SPow) - CS.Z);
-            DzMax = FMath::Min(DzMax, VF_FloorDiv(ZHi, SPow) - CS.Z);
-        }
-
-        for (int32 dz = DzMin; dz <= DzMax; ++dz)
-        for (int32 dy = -RSheet; dy <= RSheet; ++dy)
-        for (int32 dx = -RSheet; dx <= RSheet; ++dx)
-        {
-            const FIntVector T = CS + FIntVector(dx, dy, dz);
-            const int32 TZLo = T.Z << SheetLevel;
-            const int32 TZHi = ((T.Z + 1) << SheetLevel) - 1;
-            if (TZHi < ZLo || TZLo > ZHi) continue;
-
-            // Couverte par la boîte MC (empreinte entièrement dans [CM−R, CM+R] au niveau MaxLevel).
-            const bool bCovered =
-                ((T.X << K) >= CM.X - R) && ((((T.X + 1) << K) - 1) <= CM.X + R) &&
-                ((T.Y << K) >= CM.Y - R) && ((((T.Y + 1) << K) - 1) <= CM.Y + R) &&
-                ((T.Z << K) >= CM.Z - R) && ((((T.Z + 1) << K) - 1) <= CM.Z + R);
-            if (bCovered) continue;
-
-            const FVoxelTileKey Key(T, SheetLevel);
-            DesiredSorted.Add(Key);
-            DesiredStamped.FindOrAdd(Key) = DesiredStamp;
-        }
+        DesiredStamped.FindOrAdd(Key) = DesiredStamp;
     }
 
     // Streaming anchors (AI / remote players, §9.3): fold each one's small level-0 box into the SAME
@@ -5604,10 +5514,10 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                          "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s],\"sheet\":%d"),
                     Summary.Level, Summary.Count,
                     Summary.Min.X, Summary.Min.Y, Summary.Min.Z,
-                    Summary.Max.X, Summary.Max.Y, Summary.Max.Z,
-                    *FString::SanitizeFloat(TileExtentMetres),
-                    *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
-                    Settings && Summary.Level > Settings->MaxClipLevel ? 1 : 0));
+                Summary.Max.X, Summary.Max.Y, Summary.Max.Z,
+                *FString::SanitizeFloat(TileExtentMetres),
+                *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
+                    Settings && Summary.Level > VF_MaxMarchingCubesLevel(Settings) ? 1 : 0));
             }
             bStartupTraceDesiredRecorded = true;
         }
@@ -5628,7 +5538,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
             // dès que les feuilles sont actives, même si la coupe de contenu MC est désactivée.
             const bool bSheetsWantBand = Settings && Settings->bFarSheetRing
                                       && Settings->RenderDistanceChunks > 0;
-            const int32 TopMC = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+            const int32 TopMC = VF_MaxMarchingCubesLevel(Settings);
             int32 NewLo = MIN_int32, NewHi = MAX_int32;
             if ((CutMin <= 8 || bSheetsWantBand) && StrateManager)
             {
@@ -5649,7 +5559,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                     NewLo, NewHi, MeshBandChunkLo, MeshBandChunkHi, CutMin, CenterChunk.Z);
                 for (const FVoxelTileKey& T : LoadedTiles)
                 {
-                    // Feuilles (niveau > MaxClipLevel) : toujours dépendantes de la bande.
+                    // Sheets (above the last MC bridge level) always depend on the strate band.
                     if (T.Level < CutMin && T.Level <= TopMC) continue;
                     const int32 CLo = T.Coord.Z << T.Level;
                     const int32 CHi = ((T.Coord.Z + 1) << T.Level) - 1;
@@ -5667,17 +5577,13 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
             }
         }
 
-        // F18 — TROU XY de l'anneau feuille (voir VoxelWorld.h) : boîte MC niveau-MaxClipLevel
-        // autour du joueur, rétrécie d'UNE tuile — le raccord feuille↔anneau MC garde une tuile
-        // MC pleine de recouvrement (même pas d'échantillonnage des deux côtés → discret), et en
-        // avançant, les tuiles MC de la zone nouvellement découpée étaient déjà desired au
-        // crossing précédent (chargées avant que le trou ne les découvre). Changement (crossing
-        // de tuile MaxClipLevel, ~tous les 2^L chunks) ⇒ re-queue des feuilles chevauchant
-        // l'ancien OU le nouveau trou.
+        // The sheet XY hole follows the outermost MC bridge level and shrinks by one tile, leaving
+        // an overlap at the mesh transition. Requeue sheets overlapping either the old or new hole
+        // when the player crosses a bridge-level tile.
         {
             int32 NewMinX = MAX_int32, NewMinY = MAX_int32;
             int32 NewMaxX = MIN_int32, NewMaxY = MIN_int32;
-            const int32 TopMCLvl = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+            const int32 TopMCLvl = VF_MaxMarchingCubesLevel(Settings);
             if (Settings && Settings->bFarSheetRing && Settings->RenderDistanceChunks > 0)
             {
                 const int32 RClip  = FMath::Max(1, Settings->ClipRadius);
@@ -5926,11 +5832,10 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     const int32 FullRes = Settings ? FMath::Max(1, Settings->FullResClipLevels) : 2;
     const int32 Extent  = CHUNK_SIZE << Tile.Level;
 
-    // F18 — tuile FEUILLE : BuildDesiredTiles n'émet des clés au-delà de MaxClipLevel que pour
-    // l'anneau feuille (render distance) — elles se maillent en deux heightfields (GenerateSheetMesh),
-    // pas en marching cubes. Densité d'échantillonnage = celle de l'anneau MC niveau-MaxClipLevel
-    // (le nombre de cellules grandit avec la feuille, plafonné à 128/axe — au-delà le pas grossit).
-    const int32 TopMC = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
+    // F18 — sheet-ring keys follow the last MC bridge level and mesh as two heightfields
+    // (GenerateSheetMesh). Their sampling step matches that MC level; cells grow with sheet extent
+    // up to 128 per axis, after which the step increases.
+    const int32 TopMC = VF_MaxMarchingCubesLevel(Settings);
     const bool bSheetTile = Tile.Level > TopMC;
 
     int32 Cells = (Tile.Level < FullRes)
