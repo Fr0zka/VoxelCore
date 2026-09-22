@@ -522,11 +522,14 @@ private:
     void ConfigureHeadlessStreamingTest();
     void AdvanceHeadlessStreamingTest(FVector& InOutPlayerPosition,
                                       FVector& InOutPlayerHeading, APawn* PlayerPawn);
+    void AdvanceHeadlessSurfaceFallTest(FVector& InOutPlayerPosition,
+                                        FVector& InOutPlayerHeading, APawn* PlayerPawn);
     void InitializeHeadlessStrateCrossingTest();
     void AdvanceHeadlessStrateCrossingTest(FVector& InOutPlayerPosition,
                                             FVector& InOutPlayerHeading, APawn* PlayerPawn);
     void ObserveHeadlessStrateCrossingTest(const FVector& PlayerPosition, APawn* PlayerPawn);
     void MaybeFinishHeadlessStrateCrossingTest();
+    void MaybeFinishHeadlessSurfaceFallTest();
     void MaybeFinishHeadlessStreamingTest();
     void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                         int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
@@ -824,10 +827,14 @@ public:
                               FVoxelTileKey& OutSupportTile) const;
 
     bool IsTileCollisionReady(const FVoxelTileKey& Tile) const;
+    bool IsCollisionTileUnavailable(const FVoxelTileKey& Tile,
+                                    const TCHAR*& OutReason) const;
     bool IsCollisionReadyFromSupportTile(const FVoxelTileKey& CandidateTile,
-                                         FVoxelTileKey* OutSupportTile = nullptr) const;
+                                         FVoxelTileKey* OutSupportTile = nullptr,
+                                         const TCHAR** OutUnavailableReason = nullptr) const;
     bool IsPlayerSupportCollisionReady(APawn* Pawn, const FVector& PlayerPosition,
-                                       FVoxelTileKey* OutSupportTile = nullptr) const;
+                                       FVoxelTileKey* OutSupportTile = nullptr,
+                                       const TCHAR** OutUnavailableReason = nullptr) const;
 
     /** Gate pawn movement until its current and, when moving, next support tile have a completed
      *  level-0 RMC collision body. The world tick is installed as the pawn prerequisite in the
@@ -997,6 +1004,29 @@ public:
     double HeadlessStreamingTestBeginSeconds = 0.0;
     double HeadlessStreamingTestLastElapsedSeconds = 0.0;
 
+    // Explicit owner-layout collision-gate repro. This is a command-line-only harness path: it
+    // places the possessed character above the authored single-strate surface and lets ordinary
+    // CharacterMovement gravity carry it to the generated ground.
+    bool bHeadlessSurfaceFallTest = false;
+    bool bHeadlessSurfaceFallTestStartPlaced = false;
+    bool bHeadlessSurfaceFallTestPassed = false;
+    bool bHeadlessSurfaceFallTestFailed = false;
+    bool bHeadlessSurfaceFallTestExitRequested = false;
+    bool bHeadlessSurfaceFallTestPredictionProbeInjected = false;
+    bool bHeadlessSurfaceFallTestPredictionProbeCleared = false;
+    float HeadlessSurfaceFallTestSpawnHeightVoxels = 20.0f;
+    float HeadlessSurfaceFallTestGroundToleranceVoxels = 4.0f;
+    float HeadlessSurfaceFallTestTimeoutSeconds = 8.0f;
+    float HeadlessSurfaceFallTestPlayerHalfHeightVoxels = 3.52f;
+    float HeadlessSurfaceFallTestTerrainZ = 0.0f;
+    double HeadlessSurfaceFallTestBeginSeconds = 0.0;
+    double HeadlessSurfaceFallTestStartSeconds = 0.0;
+    double HeadlessSurfaceFallTestDistanceCm = 0.0;
+    FVector HeadlessSurfaceFallTestStartPosition = FVector::ZeroVector;
+    FVector HeadlessSurfaceFallTestLastActualPosition = FVector::ZeroVector;
+    FVector HeadlessSurfaceFallTestPredictionProbePosition = FVector::ZeroVector;
+    FString HeadlessSurfaceFallTestFailureReason;
+
     // Explicit parity evidence. Workers append under the lock; EndPlay writes the compact JSON
     // after ActiveTaskCount has reached zero, so the dump is a complete worker-side snapshot.
     bool bTileHashDumpEnabled = false;
@@ -1015,6 +1045,7 @@ public:
     bool bHeadlessStrateCrossingTestFailed = false;
     bool bHeadlessStrateCrossingTestExitRequested = false;
     bool bHeadlessStrateCrossingTestGateWasEngaged = false;
+    bool bHeadlessStrateCrossingTestInitialSupportReported = false;
     int32 HeadlessStrateCrossingTestRequestedPassageIndex = INDEX_NONE;
     int32 HeadlessStrateCrossingTestPassageIndex = INDEX_NONE;
     int32 HeadlessStrateCrossingTestUpperStrateIndex = INDEX_NONE;
@@ -1050,8 +1081,8 @@ public:
     bool bSavedCharacterMovementMode = false;
     bool bSavedPawnMovementActive = false;
     bool bPawnCollisionGateEngaged = false;
-    bool bPawnGateWaitingForPredictedSupport = false;
-    FVoxelTileKey PawnGatePredictedSupportTile;
+    double PawnGateEngagedAtSeconds = 0.0;
+    bool bPawnGateUnavailableReported = false;
     bool bPawnGateUnsupportedReported = false;
 
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.

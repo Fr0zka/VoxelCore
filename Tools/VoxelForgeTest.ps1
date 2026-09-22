@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'parity')]
+    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'parity')]
     [string]$Scenario = 'canonical',
     [switch]$Build,
     [ValidateSet('owner', 'default')]
@@ -43,6 +43,8 @@ $BuildRecord = [ordered]@{ requested = [bool]$Build; status = 'not_requested' }
 $AssetEvidence = @()
 $CommandletMetrics = [ordered]@{}
 $GameMetrics = [ordered]@{}
+$SurfaceFallMetrics = [ordered]@{ requested = $Scenario -in @('tests', 'surface-fall'); status = 'not_run' }
+$StrateCrossingMetrics = [ordered]@{ requested = $Scenario -eq 'crossing'; status = 'not_run' }
 $TestMetrics = @()
 $ParityEvidence = [ordered]@{ requested = $Scenario -eq 'parity'; status = 'not_run' }
 $DllEvidence = [ordered]@{
@@ -290,7 +292,13 @@ function Invoke-UnrealLaunch([string]$Kind, [string[]]$Arguments, [string]$LogPa
         arguments = @($Arguments)
         status = 'not_started'
     }
+    $isolatedLocalAppData = Join-Path $RunRoot 'LocalAppData'
+    Ensure-Directory $isolatedLocalAppData
+    $oldLocalAppData = $env:LOCALAPPDATA
     try {
+        # Unreal resolves several engine-wide stores from LOCALAPPDATA even when -userdir and
+        # -LocalDataCachePath are supplied. Keep this child process inside the run directory.
+        $env:LOCALAPPDATA = $isolatedLocalAppData
         $process = Start-Process -FilePath $EditorExe -ArgumentList $Arguments -WorkingDirectory $HostRoot `
             -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -WindowStyle Hidden -PassThru
         $ledger.pid = [int]$process.Id
@@ -301,7 +309,10 @@ function Invoke-UnrealLaunch([string]$Kind, [string[]]$Arguments, [string]$LogPa
     } catch {
         $ledger.status = 'launch_error'
         $ledger.error = $_.Exception.Message
+    } finally {
+        if ($null -eq $oldLocalAppData) { Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue } else { $env:LOCALAPPDATA = $oldLocalAppData }
     }
+    $ledger.isolated_local_app_data = $isolatedLocalAppData
     $ledger.ended_utc = [datetime]::UtcNow.ToString('o')
     $ledger.crash_reporters_reaped = @(Reap-OwnCrashReporters $reportersBefore $startedUtc $LogPath)
     $ledger.new_crashes = @(Get-NewCrashes $crashesBefore $startedUtc)
@@ -325,12 +336,16 @@ function Invoke-BuildProcess([string[]]$Arguments, [string]$LogPath, [string]$Er
     $oldDotnetCliHome = $env:DOTNET_CLI_HOME
     $oldDotnetFirstUse = $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE
     $oldDotnetNoLogo = $env:DOTNET_NOLOGO
+    $isolatedLocalAppData = Join-Path $RunRoot 'LocalAppData'
+    Ensure-Directory $isolatedLocalAppData
+    $oldLocalAppData = $env:LOCALAPPDATA
     try {
         # Keep the build tool's first-use sentinel and package metadata inside this run. This is
         # separate from Unreal's LocalAppData guard and avoids touching the owner's profile.
         $env:DOTNET_CLI_HOME = $dotnetHome
         $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
         $env:DOTNET_NOLOGO = '1'
+        $env:LOCALAPPDATA = $isolatedLocalAppData
         $process = Start-Process -FilePath $dotnet -ArgumentList $Arguments -WorkingDirectory $PluginRoot `
             -RedirectStandardOutput $StdoutPath -RedirectStandardError $ErrorPath -WindowStyle Hidden -PassThru
         $wait = Wait-OwnedProcess $process $LaunchTimeoutSeconds
@@ -338,6 +353,7 @@ function Invoke-BuildProcess([string[]]$Arguments, [string]$LogPath, [string]$Er
         if ($null -eq $oldDotnetCliHome) { Remove-Item Env:DOTNET_CLI_HOME -ErrorAction SilentlyContinue } else { $env:DOTNET_CLI_HOME = $oldDotnetCliHome }
         if ($null -eq $oldDotnetFirstUse) { Remove-Item Env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE -ErrorAction SilentlyContinue } else { $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = $oldDotnetFirstUse }
         if ($null -eq $oldDotnetNoLogo) { Remove-Item Env:DOTNET_NOLOGO -ErrorAction SilentlyContinue } else { $env:DOTNET_NOLOGO = $oldDotnetNoLogo }
+        if ($null -eq $oldLocalAppData) { Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue } else { $env:LOCALAPPDATA = $oldLocalAppData }
     }
     return [ordered]@{
         tool = $dotnet
@@ -350,6 +366,7 @@ function Invoke-BuildProcess([string[]]$Arguments, [string]$LogPath, [string]$Er
         stdout = $StdoutPath
         error_log = $ErrorPath
         arguments = @($Arguments)
+        isolated_local_app_data = $isolatedLocalAppData
         status = if ($wait.timed_out) { 'timeout' } elseif ($wait.exit_code -eq 0) { 'passed' } else { 'failed' }
     }
 }
@@ -409,7 +426,7 @@ function Sync-OwnerAssets {
         $null = Copy-Item -LiteralPath $source -Destination $target -Force -PassThru
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -457,7 +474,7 @@ function Get-AssetEvidence {
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -640,6 +657,36 @@ function Get-StreamingMetrics([string]$LogPath) {
         request_to_ready = [ordered]@{ p50 = $metrics['request_to_ready_p50']; p95 = $metrics['request_to_ready_p95'] }
         queue_wait = [ordered]@{ p50 = $metrics['queue_wait_p50']; p95 = $metrics['queue_wait_p95'] }
         generation = [ordered]@{ p50 = $metrics['generation_p50']; p95 = $metrics['generation_p95'] }
+    }
+    return $metrics
+}
+
+function Get-SurfaceFallMetrics([string]$LogPath) {
+    $lineMatch = @(Select-String -LiteralPath $LogPath -Pattern '\[VoxelForgeSurfaceFallTest\] result=' -ErrorAction SilentlyContinue |
+        Select-Object -Last 1)
+    if ($lineMatch.Count -eq 0) { return [ordered]@{ status = 'missing'; log = $LogPath } }
+    $line = [string]$lineMatch[0].Line
+    $metrics = [ordered]@{ status = 'failed'; log = $LogPath; raw = $line }
+    $result = [regex]::Match($line, 'result=(?<v>PASS|FAIL)')
+    if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
+    foreach ($key in @('reason', 'elapsed_s', 'distance_m', 'terrain_vox')) {
+        $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
+        if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
+    }
+    return $metrics
+}
+
+function Get-StrateCrossingMetrics([string]$LogPath) {
+    $lineMatch = @(Select-String -LiteralPath $LogPath -Pattern '\[VoxelForgeStrateCrossingTest\] result=' -ErrorAction SilentlyContinue |
+        Select-Object -Last 1)
+    if ($lineMatch.Count -eq 0) { return [ordered]@{ status = 'missing'; log = $LogPath } }
+    $line = [string]$lineMatch[0].Line
+    $metrics = [ordered]@{ status = 'failed'; log = $LogPath; raw = $line }
+    $result = [regex]::Match($line, 'result=(?<v>PASS|FAIL)')
+    if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
+    foreach ($key in @('reason', 'elapsed_s', 'distance_m', 'max_gate_s', 'gate_limit_s', 'gate_total_s', 'min_floor_clearance_vox')) {
+        $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
+        if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
     }
     return $metrics
 }
@@ -904,6 +951,35 @@ try {
                 (Join-Path $RunRoot 'Logs\perf.log') (Join-Path $RunRoot 'Logs\perf.stdout.log') (Join-Path $RunRoot 'Logs\perf.stderr.log')
             $GameMetrics = Get-StreamingMetrics (Join-Path $RunRoot 'Logs\perf.log')
         }
+        'surface-fall' {
+            $baseCvars['voxel.TestSurfaceFall'] = 1
+            $baseCvars['voxel.TestSurfaceFallSpawnHeightVoxels'] = 20
+            $baseCvars['voxel.TestSurfaceFallGroundToleranceVoxels'] = 4
+            $baseCvars['voxel.TestSurfaceFallTimeoutSeconds'] = 8
+            $args = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\surface-fall.log') (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch 'surface-fall-game' $args `
+                (Join-Path $RunRoot 'Logs\surface-fall.log') (Join-Path $RunRoot 'Logs\surface-fall.stdout.log') (Join-Path $RunRoot 'Logs\surface-fall.stderr.log')
+            $SurfaceFallMetrics = Get-SurfaceFallMetrics (Join-Path $RunRoot 'Logs\surface-fall.log')
+            if ($SurfaceFallMetrics.status -ne 'passed') {
+                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $($SurfaceFallMetrics.reason)"
+            }
+        }
+        'crossing' {
+            $baseCvars['voxel.TestStrateCrossing'] = 1
+            # The authored four-strate route is a real switchback whose vertical drop is hundreds
+            # of metres. Use a fixed diagnostic speed and enough wall time for initial collision
+            # cooking; the game code still uses swept character movement and the collision gate.
+            $baseCvars['voxel.TestStrateCrossingSpeedCmPerSecond'] = 2000
+            $baseCvars['voxel.TestStrateCrossingTimeoutSeconds'] = 360
+            $baseCvars['voxel.TestStrateCrossingMaxGateSeconds'] = 10
+            $args = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\crossing.log') (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch 'strate-crossing-game' $args `
+                (Join-Path $RunRoot 'Logs\crossing.log') (Join-Path $RunRoot 'Logs\crossing.stdout.log') (Join-Path $RunRoot 'Logs\crossing.stderr.log')
+            $StrateCrossingMetrics = Get-StrateCrossingMetrics (Join-Path $RunRoot 'Logs\crossing.log')
+            if ($StrateCrossingMetrics.status -ne 'passed') {
+                Add-Failure "strate-crossing test did not pass: $($StrateCrossingMetrics.status) $($StrateCrossingMetrics.reason)"
+            }
+        }
         'tests' {
             $testPath = if ([string]::IsNullOrWhiteSpace($TestFilter)) { 'VoxelForge' } else { $TestFilter }
             $baseCvars['ExecCmds'] = "Automation RunTests $testPath; Quit"
@@ -924,6 +1000,23 @@ try {
             if ($failedTests.Count -gt 0) {
                 $failedNames = ($failedTests | ForEach-Object { $_.path }) -join ', '
                 Add-Failure "automation tests failed: $failedNames"
+            }
+
+            # The runtime collision-gate repro is part of the tests scenario as an integration
+            # test alongside the 44 pure automation tests. It uses the same isolated host/assets
+            # and gets its own launch ledger entry and log.
+            $surfaceBaseCvars = [ordered]@{
+                'voxel.TestSurfaceFall' = 1
+                'voxel.TestSurfaceFallSpawnHeightVoxels' = 20
+                'voxel.TestSurfaceFallGroundToleranceVoxels' = 4
+                'voxel.TestSurfaceFallTimeoutSeconds' = 8
+            }
+            $surfaceArgs = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\surface-fall.log') (Merge-Cvars $surfaceBaseCvars)
+            $surfaceFallLedger = Invoke-UnrealLaunch 'surface-fall-game' $surfaceArgs `
+                (Join-Path $RunRoot 'Logs\surface-fall.log') (Join-Path $RunRoot 'Logs\surface-fall.stdout.log') (Join-Path $RunRoot 'Logs\surface-fall.stderr.log')
+            $SurfaceFallMetrics = Get-SurfaceFallMetrics (Join-Path $RunRoot 'Logs\surface-fall.log')
+            if ($SurfaceFallMetrics.status -ne 'passed') {
+                Add-Failure "surface-fall repro did not pass: $($SurfaceFallMetrics.status) $($SurfaceFallMetrics.reason)"
             }
         }
         'parity' {
@@ -1015,6 +1108,8 @@ $result = [ordered]@{
     probe_amplitudes = if ($CommandletMetrics.Contains('probe_amplitudes')) { $CommandletMetrics.probe_amplitudes } else { [ordered]@{} }
     commandlet = $CommandletMetrics
     game = $GameMetrics
+    surface_fall = $SurfaceFallMetrics
+    strate_crossing = $StrateCrossingMetrics
     worker_seconds = [ordered]@{
         commandlet = if ($CommandletMetrics.Contains('worker_seconds')) { $CommandletMetrics.worker_seconds } else { $null }
         game = if ($GameMetrics.Contains('worker_generation_sum_s')) { $GameMetrics.worker_generation_sum_s } else { $null }
@@ -1044,6 +1139,8 @@ try {
     [void]$summaryLines.Add("connectivity=$(ConvertTo-CompactJson $result.connectivity)")
     [void]$summaryLines.Add("geometry_hash=$($result.geometry_hash)")
     [void]$summaryLines.Add("obj_sha256=$($result.obj_sha256)")
+    [void]$summaryLines.Add("surface_fall=$(ConvertTo-CompactJson $result.surface_fall)")
+    [void]$summaryLines.Add("strate_crossing=$(ConvertTo-CompactJson $result.strate_crossing)")
     [void]$summaryLines.Add("probe_amplitudes=$(ConvertTo-CompactJson $result.probe_amplitudes)")
     [void]$summaryLines.Add("worker_seconds=$(ConvertTo-CompactJson $result.worker_seconds)")
     [void]$summaryLines.Add("p50_p95=$(ConvertTo-CompactJson $result.p50_p95)")
