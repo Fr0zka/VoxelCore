@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'parity', 'horizon', 'horizon-render', 'determinism')]
+    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'visual-edit', 'visual-lod', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'parity', 'horizon', 'horizon-render', 'determinism')]
     [string]$Scenario = 'canonical',
     [switch]$Build,
     [ValidateSet('owner', 'default')]
@@ -64,6 +64,10 @@ $SurfaceFallMetrics = [ordered]@{
     status = 'not_run'
 }
 $StrateCrossingMetrics = [ordered]@{ requested = $Scenario -eq 'crossing'; status = 'not_run' }
+$VisualStalenessMetrics = [ordered]@{
+    requested = $Scenario -in @('visual-edit', 'visual-lod')
+    status = 'not_run'
+}
 $CollisionGateStressMetrics = [ordered]@{
     requested = $Scenario -eq 'gate-stress' -or
         ($Scenario -eq 'tests' -and [string]::IsNullOrWhiteSpace($TestFilter))
@@ -500,7 +504,7 @@ function Sync-OwnerAssets {
         $null = Copy-Item -LiteralPath $source -Destination $target -Force -PassThru
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'horizon', 'horizon-render', 'determinism')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'visual-edit', 'visual-lod', 'horizon', 'horizon-render', 'determinism')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -548,7 +552,7 @@ function Get-AssetEvidence {
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'horizon', 'horizon-render', 'determinism')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'visual-edit', 'visual-lod', 'horizon', 'horizon-render', 'determinism')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -595,6 +599,7 @@ function New-CommonArguments([string]$Kind, [string]$LogPath, $CvarMap, [bool]$E
     [void]$args.Add('-FullStdOutLogOutput')
     [void]$args.Add('-forcelogflush')
     [void]$args.Add('-NoZenAutoLaunch')
+    [void]$args.Add('-notraceserver')
     [void]$args.Add('-nocrashreports')
     [void]$args.Add('-WindowsPlatformCrashContext.ForceCrashReportDialogOff=1')
     [void]$args.Add("-enginesaveddirsuffix=VoxelForgeTest_$safeLabel")
@@ -613,7 +618,7 @@ function New-CommonArguments([string]$Kind, [string]$LogPath, $CvarMap, [bool]$E
         $switch = [string]$key
         if (-not $switch.StartsWith('-')) { $switch = "-$switch" }
         $value = Get-ValueText $CvarMap[$key]
-        if ($value -match '\s') {
+        if ($value -match '\s' -or $value.Contains(',')) {
             [void]$args.Add(('{0}="{1}"' -f $switch, $value))
         } else {
             [void]$args.Add("$switch=$value")
@@ -994,6 +999,29 @@ function Get-CollisionGateStressMetrics([string]$LogPath) {
     return $metrics
 }
 
+function Get-VisualStalenessMetrics([string]$LogPath) {
+    $lineMatch = @(Select-String -LiteralPath $LogPath -Pattern '\[VoxelForgeVisualStaleness\] result=' -ErrorAction SilentlyContinue |
+        Select-Object -Last 1)
+    if ($lineMatch.Count -eq 0) { return [ordered]@{ status = 'missing'; log = $LogPath } }
+    $line = [string]$lineMatch[0].Line
+    $metrics = [ordered]@{ status = 'failed'; log = $LogPath; raw = $line }
+    $result = [regex]::Match($line, 'result=(?<v>PASS|FAIL)')
+    if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
+    foreach ($key in @('mode', 'edit_applied', 'edit_resolved', 'edit_stale_duration_s',
+                        'edit_stale_tiles_max', 'lod_overlap_max_s', 'lod_overlap_events',
+                        'lod_overlap_pairs_max')) {
+        $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
+        if (-not $match.Success) { continue }
+        if ($key -in @('mode', 'edit_applied', 'edit_resolved', 'edit_stale_tiles_max',
+                       'lod_overlap_events', 'lod_overlap_pairs_max')) {
+            $metrics[$key] = [int]$match.Groups['v'].Value
+        } else {
+            $metrics[$key] = [double]$match.Groups['v'].Value
+        }
+    }
+    return $metrics
+}
+
 function Get-TestMetrics($Ledger) {
     if ($null -eq $Ledger) { return @() }
     $logPaths = @($Ledger.log, $Ledger.stdout, $Ledger.stderr) | Where-Object {
@@ -1353,6 +1381,40 @@ try {
                 (Join-Path $RunRoot 'Logs\perf.log') (Join-Path $RunRoot 'Logs\perf.stdout.log') (Join-Path $RunRoot 'Logs\perf.stderr.log')
             $GameMetrics = Get-StreamingMetrics (Join-Path $RunRoot 'Logs\perf.log')
         }
+        'visual-edit' {
+            $baseCvars['voxel.TestVisualStaleness'] = 1
+            $baseCvars['voxel.TestModification'] = 1
+            $baseCvars['voxel.TestModificationTarget'] = 'loaded-geometry'
+            $baseCvars['voxel.TestExitSeconds'] = 45
+            $baseCvars['voxel.TestMaxClipLevel'] = 5
+            $baseCvars['voxel.OuterClassifierMode'] = 0
+            $visualLog = Join-Path $RunRoot 'Logs\visual-edit.log'
+            $args = New-CommonArguments 'game' $visualLog (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch 'visual-edit-game' $args `
+                $visualLog (Join-Path $RunRoot 'Logs\visual-edit.stdout.log') (Join-Path $RunRoot 'Logs\visual-edit.stderr.log')
+            $VisualStalenessMetrics = Get-VisualStalenessMetrics $visualLog
+            if ($VisualStalenessMetrics.status -ne 'passed') {
+                Add-Failure "visual edit repro did not pass: $($VisualStalenessMetrics.status)"
+            }
+        }
+        'visual-lod' {
+            $baseCvars['voxel.TestVisualStaleness'] = 2
+            $baseCvars['voxel.TestMove'] = 1
+            $baseCvars['voxel.TestMoveSpeedCmPerSecond'] = 6000
+            $baseCvars['voxel.TestMoveStartSeconds'] = 25
+            $baseCvars['voxel.TestMoveDirection'] = '1, 0, 0.15'
+            $baseCvars['voxel.TestExitSeconds'] = 45
+            $baseCvars['voxel.TestMaxClipLevel'] = 5
+            $baseCvars['voxel.OuterClassifierMode'] = 0
+            $visualLog = Join-Path $RunRoot 'Logs\visual-lod.log'
+            $args = New-CommonArguments 'game' $visualLog (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch 'visual-lod-game' $args `
+                $visualLog (Join-Path $RunRoot 'Logs\visual-lod.stdout.log') (Join-Path $RunRoot 'Logs\visual-lod.stderr.log')
+            $VisualStalenessMetrics = Get-VisualStalenessMetrics $visualLog
+            if ($VisualStalenessMetrics.status -ne 'passed') {
+                Add-Failure "visual LOD repro did not pass: $($VisualStalenessMetrics.status)"
+            }
+        }
         'surface-fall' {
             $baseCvars['voxel.TestSurfaceFall'] = 1
             $baseCvars['voxel.TestSurfaceFallSpawnHeightVoxels'] = 20
@@ -1551,6 +1613,7 @@ $result = [ordered]@{
     determinism = $DeterminismEvidence
     surface_fall = $SurfaceFallMetrics
     strate_crossing = $StrateCrossingMetrics
+    visual_staleness = $VisualStalenessMetrics
     collision_gate_stress = $CollisionGateStressMetrics
     worker_seconds = [ordered]@{
         commandlet = if ($CommandletMetrics.Contains('worker_seconds')) { $CommandletMetrics.worker_seconds } else { $null }
@@ -1584,6 +1647,7 @@ try {
     [void]$summaryLines.Add("obj_sha256=$($result.obj_sha256)")
     [void]$summaryLines.Add("surface_fall=$(ConvertTo-CompactJson $result.surface_fall)")
     [void]$summaryLines.Add("strate_crossing=$(ConvertTo-CompactJson $result.strate_crossing)")
+    [void]$summaryLines.Add("visual_staleness=$(ConvertTo-CompactJson $result.visual_staleness)")
     [void]$summaryLines.Add("collision_gate_stress=$(ConvertTo-CompactJson $result.collision_gate_stress)")
     [void]$summaryLines.Add("probe_amplitudes=$(ConvertTo-CompactJson $result.probe_amplitudes)")
     [void]$summaryLines.Add("worker_seconds=$(ConvertTo-CompactJson $result.worker_seconds)")

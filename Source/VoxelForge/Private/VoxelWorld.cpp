@@ -59,6 +59,9 @@
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
 static int32 VF_MaxMarchingCubesLevel(const UVoxelSettings* Settings);
+static bool VF_TileOverlapsVoxelBounds(const FVoxelTileKey& Tile,
+                                       const FVector& BoundsMin, const FVector& BoundsMax);
+static bool VF_TileFootprintsOverlap(const FVoxelTileKey& A, const FVoxelTileKey& B);
 
 #if WITH_EDITOR
 #include "VoxelStrateComposer.h"
@@ -132,6 +135,7 @@ namespace
     float GVoxelForgePendingModificationRadius = 3.0f;
     float GVoxelForgePendingModificationStrength = 10.0f;
     bool GVoxelForgeTestModificationLoadedProofTarget = false;
+    bool GVoxelForgeTestModificationLoadedGeometryTarget = false;
     bool GVoxelForgeTestModificationCommandLineConsumed = false;
     bool GVoxelForgeStreamingBudgetReported = false;
     bool GVoxelForgeGenerationCapHitReported = false;
@@ -538,6 +542,11 @@ void AVoxelWorld::RegenerateAllChunks()
     TileComponents.Empty();
     LoadedTiles.Empty();
     LoadedTileGeometry.Reset();
+    ModificationEpoch = 0;
+    LastModificationMinVoxel = FVector::ZeroVector;
+    LastModificationMaxVoxel = FVector::ZeroVector;
+    ModificationRevisions.Reset();
+    AppliedModificationEpoch.Reset();
     CollisionReadyTiles.Empty();
     CollisionNotRequiredTiles.Empty();
     CollisionSolidTiles.Empty();
@@ -1935,7 +1944,32 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessStrateCrossingTestFailureReason.Reset();
     HeadlessStrateCrossingTestRoute.Reset();
 
+    bVisualStalenessAudit = false;
+    VisualStalenessAuditMode = 0;
+    bVisualStalenessAuditExitLogged = false;
+    VisualAuditEditEpoch = 0;
+    VisualAuditEditMinVoxel = FVector::ZeroVector;
+    VisualAuditEditMaxVoxel = FVector::ZeroVector;
+    VisualAuditEditBeginSeconds = 0.0;
+    VisualAuditEditStaleDurationSeconds = -1.0;
+    VisualAuditEditMaxStaleTiles = 0;
+    bVisualAuditEditSawStale = false;
+    bVisualAuditEditResolved = false;
+    VisualAuditLODOverlapStartSeconds = 0.0;
+    VisualAuditLODOverlapMaxSeconds = 0.0;
+    VisualAuditLODOverlapEvents = 0;
+    VisualAuditLODOverlapMaxPairs = 0;
+
     const TCHAR* CommandLine = FCommandLine::Get();
+    int32 VisualAuditValue = 0;
+    if (FParse::Value(CommandLine, TEXT("voxel.TestVisualStaleness="), VisualAuditValue))
+    {
+        VisualStalenessAuditMode = FMath::Clamp(VisualAuditValue, 0, 2);
+        bVisualStalenessAudit = VisualStalenessAuditMode != 0;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeVisualStaleness] configured=1 mode=%d"),
+            VisualStalenessAuditMode);
+    }
     FString RequestedTileHashDumpPath;
     if (FParse::Value(CommandLine, TEXT("voxel.TileHashDump="), RequestedTileHashDumpPath))
     {
@@ -3513,6 +3547,7 @@ void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
     }
 
     bHeadlessStreamingTestExitRequested = true;
+    LogVisualStalenessAudit();
     UE_LOG(LogTemp, Display,
         TEXT("[VoxelForgeStreamingTest] complete; moves=%d distance_m=%.6f last_position=(%.1f,%.1f,%.1f); requesting graceful exit after clean session"),
         HeadlessStreamingTestMoveAttempts,
@@ -3521,6 +3556,172 @@ void AVoxelWorld::MaybeFinishHeadlessStreamingTest()
         HeadlessStreamingTestLastActualPosition.Y,
         HeadlessStreamingTestLastActualPosition.Z);
     FPlatformMisc::RequestExit(false, TEXT("VoxelForge headless streaming test complete"));
+}
+
+static bool VF_TileOverlapsVoxelBounds(const FVoxelTileKey& Tile,
+                                       const FVector& BoundsMin, const FVector& BoundsMax)
+{
+    const FIntVector Origin = Tile.OriginVoxels();
+    const FVector TileMin(
+        static_cast<float>(Origin.X), static_cast<float>(Origin.Y), static_cast<float>(Origin.Z));
+    const FVector TileMax = TileMin + FVector(static_cast<float>(Tile.ExtentVoxels()));
+    return TileMin.X < BoundsMax.X && TileMax.X > BoundsMin.X
+        && TileMin.Y < BoundsMax.Y && TileMax.Y > BoundsMin.Y
+        && TileMin.Z < BoundsMax.Z && TileMax.Z > BoundsMin.Z;
+}
+
+static bool VF_TileFootprintsOverlap(const FVoxelTileKey& A, const FVoxelTileKey& B)
+{
+    const FIntVector AOrigin = A.OriginVoxels();
+    const FIntVector BOrigin = B.OriginVoxels();
+    const FVector AMin(
+        static_cast<float>(AOrigin.X), static_cast<float>(AOrigin.Y), static_cast<float>(AOrigin.Z));
+    const FVector BMin(
+        static_cast<float>(BOrigin.X), static_cast<float>(BOrigin.Y), static_cast<float>(BOrigin.Z));
+    const float AExtent = static_cast<float>(A.ExtentVoxels());
+    const float BExtent = static_cast<float>(B.ExtentVoxels());
+    return AMin.X < BMin.X + BExtent && BMin.X < AMin.X + AExtent
+        && AMin.Y < BMin.Y + BExtent && BMin.Y < AMin.Y + AExtent
+        && AMin.Z < BMin.Z + BExtent && BMin.Z < AMin.Z + AExtent;
+}
+
+void AVoxelWorld::UpdateVisualStalenessAudit()
+{
+    if (!bVisualStalenessAudit)
+    {
+        return;
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    if (VisualStalenessAuditMode == 1 && VisualAuditEditEpoch != 0
+        && VisualAuditEditBeginSeconds > 0.0)
+    {
+        int32 StaleVisibleTiles = 0;
+        for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+        {
+            if (!Pair.Value || !Pair.Value->IsVisible()
+                || !VF_TileOverlapsVoxelBounds(
+                    Pair.Key, VisualAuditEditMinVoxel, VisualAuditEditMaxVoxel))
+            {
+                continue;
+            }
+            if (AppliedModificationEpoch.FindRef(Pair.Key) != VisualAuditEditEpoch)
+            {
+                ++StaleVisibleTiles;
+            }
+        }
+
+        if (StaleVisibleTiles > 0)
+        {
+            bVisualAuditEditSawStale = true;
+            VisualAuditEditMaxStaleTiles = FMath::Max(
+                VisualAuditEditMaxStaleTiles, StaleVisibleTiles);
+        }
+        else if (!bVisualAuditEditResolved)
+        {
+            bVisualAuditEditResolved = true;
+            VisualAuditEditStaleDurationSeconds = FMath::Max(
+                0.0, Now - VisualAuditEditBeginSeconds);
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeVisualStaleness] edit_resolved=1 duration_s=%.6f stale_tiles_max=%d"),
+                VisualAuditEditStaleDurationSeconds, VisualAuditEditMaxStaleTiles);
+        }
+    }
+
+    if (VisualStalenessAuditMode == 2 && bHeadlessStreamingTestMovement
+        && HeadlessStreamingTestBeginSeconds > 0.0
+        && Now - HeadlessStreamingTestBeginSeconds
+            >= static_cast<double>(HeadlessStreamingTestStartSeconds))
+    {
+        TArray<FVoxelTileKey> VisibleTiles;
+        VisibleTiles.Reserve(TileComponents.Num());
+        for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+        {
+            if (Pair.Value && Pair.Value->IsVisible())
+            {
+                VisibleTiles.Add(Pair.Key);
+            }
+        }
+
+        int32 OverlapPairs = 0;
+        for (int32 OldIndex = 0; OldIndex < VisibleTiles.Num(); ++OldIndex)
+        {
+            const FVoxelTileKey& OldTile = VisibleTiles[OldIndex];
+            if (IsDesired(OldTile))
+            {
+                continue;
+            }
+            for (int32 NewIndex = 0; NewIndex < VisibleTiles.Num(); ++NewIndex)
+            {
+                const FVoxelTileKey& NewTile = VisibleTiles[NewIndex];
+                if (OldTile.Level == NewTile.Level || !IsDesired(NewTile)
+                    || !VF_TileFootprintsOverlap(OldTile, NewTile))
+                {
+                    continue;
+                }
+                ++OverlapPairs;
+            }
+        }
+
+        if (OverlapPairs > 0)
+        {
+            if (VisualAuditLODOverlapStartSeconds <= 0.0)
+            {
+                VisualAuditLODOverlapStartSeconds = Now;
+                ++VisualAuditLODOverlapEvents;
+            }
+            VisualAuditLODOverlapMaxPairs = FMath::Max(
+                VisualAuditLODOverlapMaxPairs, OverlapPairs);
+        }
+        else if (VisualAuditLODOverlapStartSeconds > 0.0)
+        {
+            VisualAuditLODOverlapMaxSeconds = FMath::Max(
+                VisualAuditLODOverlapMaxSeconds,
+                FMath::Max(0.0, Now - VisualAuditLODOverlapStartSeconds));
+            VisualAuditLODOverlapStartSeconds = 0.0;
+        }
+    }
+}
+
+void AVoxelWorld::LogVisualStalenessAudit()
+{
+    if (!bVisualStalenessAudit || bVisualStalenessAuditExitLogged)
+    {
+        return;
+    }
+    bVisualStalenessAuditExitLogged = true;
+
+    const double Now = FPlatformTime::Seconds();
+    if (VisualAuditLODOverlapStartSeconds > 0.0)
+    {
+        VisualAuditLODOverlapMaxSeconds = FMath::Max(
+            VisualAuditLODOverlapMaxSeconds,
+            FMath::Max(0.0, Now - VisualAuditLODOverlapStartSeconds));
+        VisualAuditLODOverlapStartSeconds = 0.0;
+    }
+    if (VisualAuditEditEpoch != 0 && VisualAuditEditBeginSeconds > 0.0
+        && !bVisualAuditEditResolved)
+    {
+        VisualAuditEditStaleDurationSeconds = FMath::Max(
+            0.0, Now - VisualAuditEditBeginSeconds);
+    }
+
+    const bool bPassed = VisualStalenessAuditMode == 1
+        ? (VisualAuditEditEpoch != 0 && bVisualAuditEditResolved)
+        : (VisualStalenessAuditMode == 2 && VisualAuditLODOverlapMaxSeconds <= 0.050);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeVisualStaleness] result=%s mode=%d "
+             "edit_applied=%d edit_resolved=%d edit_stale_duration_s=%.6f "
+             "edit_stale_tiles_max=%d lod_overlap_max_s=%.6f "
+             "lod_overlap_events=%d lod_overlap_pairs_max=%d"),
+        bPassed ? TEXT("PASS") : TEXT("FAIL"), VisualStalenessAuditMode,
+        VisualAuditEditEpoch != 0 ? 1 : 0,
+        bVisualAuditEditResolved ? 1 : 0,
+        VisualAuditEditStaleDurationSeconds,
+        VisualAuditEditMaxStaleTiles,
+        VisualAuditLODOverlapMaxSeconds,
+        VisualAuditLODOverlapEvents,
+        VisualAuditLODOverlapMaxPairs);
 }
 
 void AVoxelWorld::Tick(float DeltaTime)
@@ -3612,15 +3813,22 @@ void AVoxelWorld::Tick(float DeltaTime)
             {
                 GVoxelForgeTestModificationLoadedProofTarget = true;
             }
+            else if (ModificationTarget.Equals(TEXT("loaded-geometry"), ESearchCase::IgnoreCase))
+            {
+                GVoxelForgeTestModificationLoadedGeometryTarget = true;
+            }
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTestModification] queued radius=%.2f strength=%.2f target=%s"),
                 GVoxelForgePendingModificationRadius,
                 GVoxelForgePendingModificationStrength,
-                GVoxelForgeTestModificationLoadedProofTarget ? TEXT("loaded-proof") : TEXT("player"));
+                GVoxelForgeTestModificationLoadedProofTarget ? TEXT("loaded-proof")
+                    : (GVoxelForgeTestModificationLoadedGeometryTarget
+                        ? TEXT("loaded-geometry") : TEXT("player")));
             GVoxelForgePendingTestModification = 1;
         }
     }
     ProcessPendingChunks();
+    ReconcileReadyTransitionVisibility();
     // Near-field evidence is independent of the full horizon settle point. Record one completion
     // for each desired-set epoch after this frame's result drain, including moving crossings.
     RecordLOD0RingReadyIfComplete();
@@ -3733,7 +3941,8 @@ void AVoxelWorld::Tick(float DeltaTime)
         WorldToChunkCoord(WorldToLocalCm(ModificationPosition)), 0);
     bool bModificationTargetSelected = false;
     if (GVoxelForgePendingTestModification != 0
-        && GVoxelForgeTestModificationLoadedProofTarget
+        && (GVoxelForgeTestModificationLoadedProofTarget
+            || GVoxelForgeTestModificationLoadedGeometryTarget)
         && Generator)
     {
         // The diagnostic target is deliberately selected from the applied set.  That makes the
@@ -3746,11 +3955,34 @@ void AVoxelWorld::Tick(float DeltaTime)
             {
                 continue;
             }
+            if (GVoxelForgeTestModificationLoadedGeometryTarget
+                && !LoadedTileGeometry.Contains(CandidateTile))
+            {
+                continue;
+            }
+            if (GVoxelForgeTestModificationLoadedGeometryTarget)
+            {
+                bool bHasVisibleCoarseOverlay = false;
+                for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+                {
+                    if (Pair.Key.Level > 0 && Pair.Value && Pair.Value->IsVisible()
+                        && VF_TileFootprintsOverlap(CandidateTile, Pair.Key))
+                    {
+                        bHasVisibleCoarseOverlay = true;
+                        break;
+                    }
+                }
+                if (!bHasVisibleCoarseOverlay)
+                {
+                    continue;
+                }
+            }
             const FIntVector CandidateOrigin(
                 CandidateTile.Coord.X * CHUNK_SIZE,
                 CandidateTile.Coord.Y * CHUNK_SIZE,
                 CandidateTile.Coord.Z * CHUNK_SIZE);
-            if (!Generator->TryProveSealedSolidTile(CandidateOrigin, 1, CHUNK_SIZE))
+            if (GVoxelForgeTestModificationLoadedProofTarget
+                && !Generator->TryProveSealedSolidTile(CandidateOrigin, 1, CHUNK_SIZE))
             {
                 continue;
             }
@@ -3764,15 +3996,18 @@ void AVoxelWorld::Tick(float DeltaTime)
             bModificationTargetSelected = true;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTestModification] player_mine_target tile=(%d,%d,%d) "
-                     "local_center=(%d,%d,%d) before_proof=1"),
+                     "local_center=(%d,%d,%d) before_proof=%d"),
                 CandidateTile.Coord.X, CandidateTile.Coord.Y, CandidateTile.Coord.Z,
-                CandidateCenter.X, CandidateCenter.Y, CandidateCenter.Z);
+                CandidateCenter.X, CandidateCenter.Y, CandidateCenter.Z,
+                GVoxelForgeTestModificationLoadedProofTarget ? 1 : 0);
             break;
         }
     }
     if (GVoxelForgePendingTestModification != 0
         && DiffLayer
-        && (!GVoxelForgeTestModificationLoadedProofTarget || bModificationTargetSelected)
+        && ((!GVoxelForgeTestModificationLoadedProofTarget
+                && !GVoxelForgeTestModificationLoadedGeometryTarget)
+            || bModificationTargetSelected)
         && LoadedTiles.Contains(ModificationCenterTile)
         && !PendingTiles.Contains(ModificationCenterTile))
     {
@@ -3800,6 +4035,7 @@ void AVoxelWorld::Tick(float DeltaTime)
             ModificationCenterTile.Coord.Z, bProofSurvivedCarve ? 1 : 0);
     }
     ProcessUnloadQueue();
+    UpdateVisualStalenessAudit();
     MaybeFinishHeadlessStreamingTest();
 
     if (bTestCeilingViewEnabled)
@@ -5007,6 +5243,31 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
 
+    // A worker may have captured the density field before one or more edits. Do not let that
+    // result overwrite the current visual/collision state when any later revision touches this
+    // tile's footprint. Keep the old state in place and admit one post-edit request through the
+    // normal budgeted edited queue; this is the edit equivalent of load-before-unload.
+    if (Result.ModificationEpoch < ModificationEpoch)
+    {
+        bool bAffectedByLaterEdit = false;
+        for (const FModificationRevision& Revision : ModificationRevisions)
+        {
+            if (Revision.Epoch > Result.ModificationEpoch
+                && VF_TileOverlapsVoxelBounds(
+                    Result.Tile, Revision.MinVoxel, Revision.MaxVoxel))
+            {
+                bAffectedByLaterEdit = true;
+                break;
+            }
+        }
+        if (bAffectedByLaterEdit)
+        {
+            DirtyRemeshQueue.Add(Result.Tile);
+            bAllChunksLoaded = false;
+            return false;
+        }
+    }
+
     // Applied is emitted after the game-thread submission, not when the worker result is dequeued.
     // It deliberately does NOT mean collision-ready: RMC's cook future records that later boundary
     // in HandleTileCollisionCookComplete.
@@ -5143,6 +5404,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
         }
         LoadedTiles.Add(Result.Tile);
+        AppliedModificationEpoch.Add(Result.Tile, Result.ModificationEpoch);
         LoadedTileGeometry.Remove(Result.Tile);
         LogTileApplied();
         if (Result.Tile.Level == 0 && Result.bRecordStreamingLatency)
@@ -5172,6 +5434,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         return false;
     }
     LoadedTiles.Add(Result.Tile);
+    AppliedModificationEpoch.Add(Result.Tile, Result.ModificationEpoch);
     LoadedTileGeometry.Add(Result.Tile, FLoadedTileGeometryStats{
         static_cast<uint64>(FMath::Max(0, Result.NumVertices)),
         static_cast<uint64>(FMath::Max(0, Result.NumTriangles)),
@@ -5209,6 +5472,7 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
 
     FChunkResult Result;
     Result.DesiredEpoch = DesiredEpoch;
+    Result.ModificationEpoch = ModificationEpoch;
     Result.bRecordStreamingLatency = false;
     Result.RequestStartCycles = bProfileModification
         ? FPlatformTime::Cycles64() : 0;
@@ -5261,6 +5525,10 @@ void AVoxelWorld::ProcessUnloadQueue()
         {
             // Re-desired before its turn (player reversed) — keep it; it's still loaded, just drop
             // it from the queue. Doesn't count against the destroy budget.
+            if (URealtimeMeshComponent* Comp = TileComponents.FindRef(T))
+            {
+                Comp->SetVisibility(!CollisionOnlyTiles.Contains(T));
+            }
             Dequeued.Add(T);
             continue;
         }
@@ -5269,6 +5537,132 @@ void AVoxelWorld::ProcessUnloadQueue()
         if (--DestroyBudget <= 0) break;
     }
     for (const FVoxelTileKey& T : Dequeued) PendingUnload.Remove(T);
+}
+
+void AVoxelWorld::QueuePendingUnload(const FVoxelTileKey& Tile)
+{
+    if (IsDesired(Tile))
+    {
+        return;
+    }
+
+    HideOverlappingDesiredVisuals(Tile);
+    PendingUnload.Add(Tile);
+    TransitionHold.Remove(Tile);
+    // Teardown remains budgeted in ProcessUnloadQueue. Hiding here is the cheap, same-frame visual
+    // handoff; collision is deliberately left untouched until UnloadTile drains the queue.
+    if (URealtimeMeshComponent* Comp = TileComponents.FindRef(Tile))
+    {
+        Comp->SetVisibility(false);
+    }
+}
+
+void AVoxelWorld::HideOverlappingDesiredVisuals(const FVoxelTileKey& RetiredTile)
+{
+    for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+    {
+        if (Pair.Key == RetiredTile || !Pair.Value || !IsDesired(Pair.Key)
+            || CollisionOnlyTiles.Contains(Pair.Key))
+        {
+            continue;
+        }
+        if (VF_TileFootprintsOverlap(RetiredTile, Pair.Key))
+        {
+            Pair.Value->SetVisibility(false);
+        }
+    }
+}
+
+void AVoxelWorld::ReconcileReadyTransitionVisibility()
+{
+    if (bAllChunksLoaded && TransitionHold.Num() == 0 && PendingUnload.Num() == 0)
+    {
+        return;
+    }
+    if (DesiredSorted.Num() == 0 || TileComponents.Num() == 0)
+    {
+        return;
+    }
+
+    // This is a visibility-only pass. It runs while streaming is unsettled and after result
+    // application, so an old component is hidden in the same game-thread turn in which the full
+    // desired covering set becomes loaded. Destruction and collision removal stay in the budgeted
+    // queue below.
+    TArray<FVoxelTileKey> ReadyToHide;
+    ReadyToHide.Reserve(TileComponents.Num());
+    for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+    {
+        const FVoxelTileKey& OldTile = Pair.Key;
+        if (!Pair.Value || IsDesired(OldTile) || PendingUnload.Contains(OldTile))
+        {
+            continue;
+        }
+
+        if (!IsTileInClipRange(OldTile, CurrentCenterChunk))
+        {
+            ReadyToHide.Add(OldTile);
+            continue;
+        }
+
+        bool bHasReplacement = false;
+        bool bAllReplacementsLoaded = true;
+        for (const FVoxelTileKey& NewTile : DesiredSorted)
+        {
+            if (!VF_TileFootprintsOverlap(OldTile, NewTile))
+            {
+                continue;
+            }
+            bHasReplacement = true;
+            if (!LoadedTiles.Contains(NewTile))
+            {
+                bAllReplacementsLoaded = false;
+                break;
+            }
+        }
+        if (bHasReplacement && bAllReplacementsLoaded)
+        {
+            ReadyToHide.Add(OldTile);
+        }
+    }
+
+    for (const FVoxelTileKey& Tile : ReadyToHide)
+    {
+        QueuePendingUnload(Tile);
+    }
+
+    // Replacement components may have been uploaded hidden while a retired tile still covered
+    // only part of the transition. Reveal them only after every overlapping retired component has
+    // entered PendingUnload (and was therefore hidden above). Collision visibility is independent:
+    // the component remains queryable until the budgeted UnloadTile call.
+    for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& NewPair : TileComponents)
+    {
+        const FVoxelTileKey& NewTile = NewPair.Key;
+        URealtimeMeshComponent* NewComp = NewPair.Value;
+        if (!NewComp || !IsDesired(NewTile) || CollisionOnlyTiles.Contains(NewTile))
+        {
+            continue;
+        }
+
+        bool bBlockedByVisibleRetiredTile = false;
+        for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& OldPair : TileComponents)
+        {
+            const FVoxelTileKey& OldTile = OldPair.Key;
+            if (IsDesired(OldTile) || PendingUnload.Contains(OldTile)
+                || !OldPair.Value || !OldPair.Value->IsVisible())
+            {
+                continue;
+            }
+            if (VF_TileFootprintsOverlap(NewTile, OldTile))
+            {
+                bBlockedByVisibleRetiredTile = true;
+                break;
+            }
+        }
+        if (!bBlockedByVisibleRetiredTile)
+        {
+            NewComp->SetVisibility(true);
+        }
+    }
 }
 
 // Integer floor-division (correct for negatives), scalar + vector.
@@ -5938,7 +6332,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 }
                 if (!IsTileInClipRange(T, CenterChunk))   // left the view → cull now
                 {
-                    PendingUnload.Add(T);
+                    QueuePendingUnload(T);
                     return false;
                 }
                 // In-range transition. Quand le backlog est gros (sprint), sauter le test de
@@ -5946,9 +6340,10 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 EnsurePending();
                 if (DesiredPending.Num() <= 48 && ReplacementsReady(T))
                 {
-                    PendingUnload.Add(T);
+                    QueuePendingUnload(T);
                     return false;
                 }
+                HideOverlappingDesiredVisuals(T);
                 return true;
             };
 
@@ -6015,7 +6410,6 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         {
             if (PendingTiles.Num() >= MaxTasks) break;
             const FVoxelTileKey T = *It;
-            if (!LoadedTiles.Contains(T)) { It.RemoveCurrent(); continue; }  // unloaded — drop
             if (!IsDesired(T)) { It.RemoveCurrent(); continue; }             // obsolete — drop
             if (PendingTiles.Contains(T)) { continue; }                     // in flight — retry after it lands
             It.RemoveCurrent();
@@ -6095,9 +6489,9 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
             // deferred (in-range, not-desired) transition tiles now. No holes. Full scan —
             // rare (once per settle), and the safety net behind the delta cull above.
             for (const auto& Pair : TileComponents)
-                if (!IsDesired(Pair.Key)) PendingUnload.Add(Pair.Key);
+                if (!IsDesired(Pair.Key)) QueuePendingUnload(Pair.Key);
             for (const FVoxelTileKey& T : LoadedTiles)
-                if (!IsDesired(T) && !TileComponents.Contains(T)) PendingUnload.Add(T);
+                if (!IsDesired(T) && !TileComponents.Contains(T)) QueuePendingUnload(T);
             // Teardown is drained by ProcessUnloadQueue (budgeted) — single spike-free path.
 
             bAllChunksLoaded = true;
@@ -6156,6 +6550,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
     const int32 Step    = FMath::Max(1, Extent / Cells);
     const uint32 TaskEpoch = GenerationEpoch;
     const uint32 TaskDesiredEpoch = DesiredEpoch;
+    const uint32 TaskModificationEpoch = ModificationEpoch;
 
     // CAPTURE-DURING-MESHING: only level-0 full-res tiles map 1:1 onto a density-clipmap level
     // (Step == 1<<Level, Cells == CHUNK_SIZE). When the density volume is active, ask the mesher to
@@ -6184,6 +6579,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
             Empty.Tile  = Tile;
             Empty.Epoch = TaskEpoch;
             Empty.DesiredEpoch = TaskDesiredEpoch;
+            Empty.ModificationEpoch = TaskModificationEpoch;
             Empty.RequestStartCycles = RequestStartCycles;
             Empty.WorkPriority = WorkPriority;
             if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
@@ -6223,6 +6619,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
             Empty.Tile        = Tile;
             Empty.Epoch       = TaskEpoch;
             Empty.DesiredEpoch = TaskDesiredEpoch;
+            Empty.ModificationEpoch = TaskModificationEpoch;
             Empty.RequestStartCycles = RequestStartCycles;
             Empty.BandChunkLo = BandChunkLo;
             Empty.BandChunkHi = BandChunkHi;
@@ -6258,7 +6655,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                                           BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
-                                          RequestStartCycles, TaskDesiredEpoch, Cancellation,
+                                          RequestStartCycles, TaskDesiredEpoch, TaskModificationEpoch, Cancellation,
                                           WorkPriority]()
     {
         // RAII: decrement the counter on every exit path.
@@ -6279,6 +6676,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
             Canceled.Tile = Tile;
             Canceled.Epoch = TaskEpoch;
             Canceled.DesiredEpoch = TaskDesiredEpoch;
+            Canceled.ModificationEpoch = TaskModificationEpoch;
             Canceled.RequestStartCycles = RequestStartCycles;
             Canceled.WorkPriority = WorkPriority;
             Canceled.bAborted = true;
@@ -6303,6 +6701,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
         FScopedVoxelStackRegistration StackRegistration(Tile.Level);
         FChunkResult Result;
         Result.DesiredEpoch = TaskDesiredEpoch;
+        Result.ModificationEpoch = TaskModificationEpoch;
         Result.WorkPriority = WorkPriority;
         const uint64 GenerationStartCycles = FPlatformTime::Cycles64();
         Result.GenerationStartCycles = GenerationStartCycles;
@@ -6908,6 +7307,7 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
         TileComponents.Remove(Tile);
     }
     LoadedTiles.Remove(Tile);
+    AppliedModificationEpoch.Remove(Tile);
     LoadedTileGeometry.Remove(Tile);
     TransitionHold.Remove(Tile);   // couvre aussi le settled cull (qui ne tient pas la hold à jour)
 }
@@ -7025,7 +7425,28 @@ bool AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     // §9.4 RENDER-SKIP — a tile only a CollisionOnly anchor wants (not the player clipmap) cooks its
     // collision below but is hidden (no draw / VSM). Set every apply (overrides the pool's default-
     // visible state); ReconcileAnchorTileVisibility handles later flips on already-loaded tiles.
-    MeshComp->SetVisibility(!CollisionOnlyTiles.Contains(Tile));
+    // During an LOD handoff, keep a newly loaded replacement hidden until the complete covering set
+    // is ready. ReconcileReadyTransitionVisibility then hides the retired component and reveals the
+    // replacement set in the same game-thread turn, so old and new levels are never drawn together.
+    bool bDeferTransitionVisibility = false;
+    if (!CollisionOnlyTiles.Contains(Tile) && IsDesired(Tile))
+    {
+        for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+        {
+            if (Pair.Key == Tile || !Pair.Value || IsDesired(Pair.Key)
+                || !Pair.Value->IsVisible())
+            {
+                continue;
+            }
+            if (VF_TileFootprintsOverlap(Tile, Pair.Key))
+            {
+                bDeferTransitionVisibility = true;
+                break;
+            }
+        }
+    }
+    MeshComp->SetVisibility(
+        !CollisionOnlyTiles.Contains(Tile) && !bDeferTransitionVisibility);
     MeshComp->SetCollisionEnabled(
         bLevel0 ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
 
@@ -7273,6 +7694,34 @@ void AVoxelWorld::ApplyModification(const FVoxelModification& Modification)
     const double DiffSeconds = bProfileModification
         ? FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - DiffStartCycles)
         : 0.0;
+
+    if (AffectedChunks.Num() > 0)
+    {
+        ++ModificationEpoch;
+        Modification.GetWorldBounds(LastModificationMinVoxel, LastModificationMaxVoxel);
+        FModificationRevision Revision;
+        Revision.Epoch = ModificationEpoch;
+        Revision.MinVoxel = LastModificationMinVoxel;
+        Revision.MaxVoxel = LastModificationMaxVoxel;
+        ModificationRevisions.Add(Revision);
+        if (bVisualStalenessAudit && VisualStalenessAuditMode == 1)
+        {
+            VisualAuditEditEpoch = ModificationEpoch;
+            VisualAuditEditMinVoxel = LastModificationMinVoxel;
+            VisualAuditEditMaxVoxel = LastModificationMaxVoxel;
+            VisualAuditEditBeginSeconds = FPlatformTime::Seconds();
+            VisualAuditEditStaleDurationSeconds = -1.0;
+            VisualAuditEditMaxStaleTiles = 0;
+            bVisualAuditEditSawStale = false;
+            bVisualAuditEditResolved = false;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeVisualStaleness] edit_begin=1 epoch=%u bounds_min=(%.2f,%.2f,%.2f) "
+                     "bounds_max=(%.2f,%.2f,%.2f)"),
+                VisualAuditEditEpoch,
+                VisualAuditEditMinVoxel.X, VisualAuditEditMinVoxel.Y, VisualAuditEditMinVoxel.Z,
+                VisualAuditEditMaxVoxel.X, VisualAuditEditMaxVoxel.Y, VisualAuditEditMaxVoxel.Z);
+        }
+    }
 
     // INSTANT DIG FEEL — synchronously re-mesh the level-0 tile the brush CENTRE sits in, so the hole
     // appears THIS frame right where the player is looking. Neighbour tiles (brush edge) re-mesh async
@@ -7607,24 +8056,50 @@ FString AVoxelWorld::GetCurrentSeasonContentHash() const
 
 void AVoxelWorld::RemeshDirtyChunks(const TArray<FIntVector>& DirtyCoords, const FVoxelTileKey* ExcludeTile)
 {
-    // Edits only affect LEVEL-0 tiles (collision + visible detail are full-res near the player;
-    // coarse far tiles sample too sparsely to show small carves, and pick up the diff naturally
-    // when they next stream). Queue each loaded level-0 dirty tile onto DirtyRemeshQueue — drained
-    // FIRST in the submit loop and launched at BackgroundHigh (ahead of streaming), so a dig never
-    // waits behind a shell of streaming tasks. LoadTile re-runs gen (density includes the DiffLayer
-    // via GetDensityAt) and ProcessPendingChunks updates the existing component in place (old mesh
-    // stays visible until then, no pop).
-    //
-    // Tiles that are currently mid-gen are STILL queued (not skipped): their in-flight result was
-    // sampled BEFORE this carve, so it lands with no hole — keeping the tile queued re-gens it once
-    // that stale result drains. (The old inline path dropped both over-budget and in-flight tiles,
-    // which is why a dig could show up a beat late or not until the player moved.)
-    for (const FIntVector& Coord : DirtyCoords)
+    // An edit changes every tile whose footprint intersects its affected level-0 chunks, including
+    // coarse render tiles. Re-meshing only level 0 leaves a pre-edit coarse component covering the
+    // same volume until a later LOD transition. The queue is drained FIRST and launched at
+    // BackgroundHigh; the old component remains visible until its post-edit replacement is applied.
+    auto TileCoversDirtyCoord = [&DirtyCoords](const FVoxelTileKey& Tile) -> bool
     {
-        const FVoxelTileKey Tile(Coord, 0);
+        const int32 Span = 1 << Tile.Level;
+        const FIntVector MinChunk = Tile.Coord * Span;
+        const FIntVector MaxChunk = MinChunk + FIntVector(Span, Span, Span);
+        for (const FIntVector& Coord : DirtyCoords)
+        {
+            if (Coord.X >= MinChunk.X && Coord.X < MaxChunk.X
+                && Coord.Y >= MinChunk.Y && Coord.Y < MaxChunk.Y
+                && Coord.Z >= MinChunk.Z && Coord.Z < MaxChunk.Z)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const FVoxelTileKey& Tile : LoadedTiles)
+    {
         if (ExcludeTile && Tile == *ExcludeTile) continue;  // handled synchronously this frame
-        if (!LoadedTiles.Contains(Tile)) continue;          // only re-mesh loaded full-res tiles
+        if (IsDesired(Tile) && TileCoversDirtyCoord(Tile))
+        {
+            DirtyRemeshQueue.Add(Tile);
+        }
+    }
+
+    // A pending worker captured the pre-edit field. Mark its token obsolete so its result drains
+    // without publishing; keep the key in DirtyRemeshQueue so the submit budget requests it again.
+    for (const FVoxelTileKey& Tile : PendingTiles)
+    {
+        if (!IsDesired(Tile) || !TileCoversDirtyCoord(Tile)) continue;
         DirtyRemeshQueue.Add(Tile);
+        if (TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe>* Cancellation =
+                PendingTileCancellation.Find(Tile))
+        {
+            if (*Cancellation)
+            {
+                (*Cancellation)->bObsolete.store(true, std::memory_order_release);
+            }
+        }
     }
     if (DirtyRemeshQueue.Num() > 0)
     {

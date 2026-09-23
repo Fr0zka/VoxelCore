@@ -129,6 +129,7 @@ struct FChunkResult
     bool bAborted = false;    // Worker observed shutdown or cancellation; never mark this tile loaded
     bool bObsolete = false;   // Worker observed per-tile desired-set cancellation
     uint32 DesiredEpoch = 0;  // Desired-set epoch captured at request time
+    uint32 ModificationEpoch = 0; // Diff-layer revision captured at request time
     bool bRecordStreamingLatency = true;
     bool bEmpty = true;       // true ⇒ no surface (uniform all-air/all-solid or empty band); still loaded
     // F17 — the mesher classifies every triangle semantically (sky-cap = down-facing near the
@@ -557,6 +558,8 @@ private:
     void MaybeFinishHeadlessSurfaceFallTest();
     void MaybeFinishHeadlessCollisionGateStressTest();
     void MaybeFinishHeadlessStreamingTest();
+    void UpdateVisualStalenessAudit();
+    void LogVisualStalenessAudit();
     void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                         int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
                         bool bSheetTile, const FVoxelMeshData& MeshData);
@@ -918,12 +921,11 @@ public:
     int32 MeshBandChunkHi = MAX_int32;
     TSet<FVoxelTileKey> BandRemeshQueue;
 
-    // DIG RESPONSIVENESS — loaded level-0 tiles touched by a player carve/fill that still need an
-    // async re-mesh (the neighbours of the synchronously-remeshed centre tile, plus any tile that was
-    // mid-gen at carve time). Drained FIRST in the submit loop (ahead of streaming + band) and launched
-    // at BackgroundHigh so a dig never waits behind streaming. Unlike the old inline RemeshDirtyChunks,
-    // a tile that's in flight is KEPT queued (not dropped) so the stale pre-carve result is corrected
-    // once it lands — the source of "the hole shows up a beat late, or not until I move".
+    // DIG RESPONSIVENESS — tiles at every LOD touched by a player carve/fill that still need an
+    // async re-mesh (the synchronously-remeshed centre tile is excluded). Drained FIRST in the submit
+    // loop (ahead of streaming + band) and launched at BackgroundHigh so a dig never waits behind
+    // streaming. A tile that's in flight is marked obsolete and KEPT queued so a stale pre-carve
+    // result cannot publish and the post-carve result is admitted immediately.
     TSet<FVoxelTileKey> DirtyRemeshQueue;
 
     // F18 — TROU XY de l'anneau feuille (voxels ; Max EXCLUSIF ; sentinelles MAX/MIN = pas de
@@ -1015,6 +1017,21 @@ public:
     uint64 AppliedTriangleCountByLevel[TrackedClassifierLODCount]{};
     uint64 AppliedBandTileCountByLevel[TrackedClassifierLODCount]{};
     TMap<FVoxelTileKey, FLoadedTileGeometryStats> LoadedTileGeometry;
+
+    // Diff revision captured by tile requests. A result from before an edit is never allowed to
+    // replace a tile whose footprint intersects that edit; the old visual/collision state remains
+    // until a post-edit result is applied.
+    struct FModificationRevision
+    {
+        uint32 Epoch = 0;
+        FVector MinVoxel = FVector::ZeroVector;
+        FVector MaxVoxel = FVector::ZeroVector;
+    };
+    uint32 ModificationEpoch = 0;
+    FVector LastModificationMinVoxel = FVector::ZeroVector;
+    FVector LastModificationMaxVoxel = FVector::ZeroVector;
+    TArray<FModificationRevision> ModificationRevisions;
+    TMap<FVoxelTileKey, uint32> AppliedModificationEpoch;
 
     struct FStreamingLatencySample
     {
@@ -1154,6 +1171,24 @@ public:
     FString HeadlessStrateCrossingTestFailureReason;
     TArray<FVector> HeadlessStrateCrossingTestRoute;
 
+    // Explicit visual-staleness evidence. Mode 1 audits an edit; mode 2 audits an LOD transition.
+    // These fields are command-line-only diagnostics and are inert in ordinary gameplay.
+    bool bVisualStalenessAudit = false;
+    int32 VisualStalenessAuditMode = 0;
+    bool bVisualStalenessAuditExitLogged = false;
+    uint32 VisualAuditEditEpoch = 0;
+    FVector VisualAuditEditMinVoxel = FVector::ZeroVector;
+    FVector VisualAuditEditMaxVoxel = FVector::ZeroVector;
+    double VisualAuditEditBeginSeconds = 0.0;
+    double VisualAuditEditStaleDurationSeconds = -1.0;
+    int32 VisualAuditEditMaxStaleTiles = 0;
+    bool bVisualAuditEditSawStale = false;
+    bool bVisualAuditEditResolved = false;
+    double VisualAuditLODOverlapStartSeconds = 0.0;
+    double VisualAuditLODOverlapMaxSeconds = 0.0;
+    int32 VisualAuditLODOverlapEvents = 0;
+    int32 VisualAuditLODOverlapMaxPairs = 0;
+
     // PLAYER COLLISION GATE — only the downward component is held while the level-0 collision body
     // beneath the pawn's feet is unresolved. Horizontal movement and player control remain live.
     TWeakObjectPtr<APawn> PawnTickPrerequisite;
@@ -1208,6 +1243,9 @@ public:
 
     void ProcessPendingChunks();
     void ProcessUnloadQueue();   // budgeted teardown drain (see PendingUnload)
+    void QueuePendingUnload(const FVoxelTileKey& Tile);
+    void HideOverlappingDesiredVisuals(const FVoxelTileKey& RetiredTile);
+    void ReconcileReadyTransitionVisibility();
 
     /**
      * Re-queue loaded chunks for async re-generation + re-meshing.
