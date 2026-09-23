@@ -6328,6 +6328,34 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             static_cast<float>(Box.Max.Z - Box.Min.Z));
         const bool bSmallFinalFieldBox = bNeedsFinalField
             && FinalFieldBoxExtent <= 8.0f;
+
+        // A room-graph SDF interval can be conservative at the parent while a fine child still
+        // resolves uniformly through a state-aware SDF writer (for example the worm mask). Before
+        // using that fine interval to skip geometry, certify the exact MC lattice in the child.
+        // This runs only after a mixed parent has been refined to a small room-graph child; clear
+        // uniform roots and all non-room stacks keep the interval-only fast path.
+        const bool bNeedsExactRoomIntervalCheck = bHasRoomGeometry
+            && Context.bUseLatticeProof && Context.bTightenWarpProof
+            && !bNeedsFinalField && Whole != EVoxelTileClass::Mixed
+            && Depth >= 3 && FinalFieldBoxExtent <= 8.0f;
+        if (bNeedsExactRoomIntervalCheck)
+        {
+            int32 ExactIX0 = 0, ExactIY0 = 0, ExactIZ0 = 0;
+            int32 ExactIX1 = 0, ExactIY1 = 0, ExactIZ1 = 0;
+            int64 ExactCount = 0;
+            if (GetLatticeBounds(Box, ExactIX0, ExactIY0, ExactIZ0,
+                                 ExactIX1, ExactIY1, ExactIZ1, ExactCount)
+                && ExactCount <= 8192)
+            {
+                if (Stats) { ++Stats->ExactCoreIntervalChecks; }
+                const EVoxelTileClass Exact = ClassifyExactLatticeLeaf(Box, false);
+                if (Exact != Whole && Stats)
+                {
+                    ++Stats->ExactCoreIntervalDisagreements;
+                }
+                return Exact;
+            }
+        }
         if (bSmallFinalFieldBox)
         {
             int32 ExactIX0 = 0, ExactIY0 = 0, ExactIZ0 = 0;

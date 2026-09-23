@@ -28,6 +28,7 @@ $EngineRoot = 'E:\Program Files\Epic Games\UE_5.7'
 $EditorExe = Join-Path $EngineRoot 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 $UbtDll = Join-Path $EngineRoot 'Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll'
 $LaunchTimeoutSeconds = 1800
+$UnrealPrivateMemoryLimitBytes = 6GB
 # The VoxelForge category includes two late, several-minute op-stack sweeps. They remain in
 # the suite; when the serialized aggregate launch reaches this 30-minute guard, validate those
 # named tests with -TestFilter so every test still runs under the standing launch limit.
@@ -264,17 +265,48 @@ function Get-NewCrashes($Before, [datetime]$StartedUtc) {
     return @($new)
 }
 
-function Wait-OwnedProcess($Process, [int]$TimeoutSeconds) {
-    $finished = $Process.WaitForExit($TimeoutSeconds * 1000)
-    if ($finished) {
-        [void]$Process.WaitForExit()
-        return [ordered]@{ timed_out = $false; exit_code = [int]$Process.ExitCode }
+function Wait-OwnedProcess($Process, [int]$TimeoutSeconds, [switch]$EnforceMemoryLimit) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $peakPrivateBytes = 0L
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        if ($Process.HasExited) {
+            [void]$Process.WaitForExit()
+            return [ordered]@{
+                timed_out = $false
+                memory_limit_hit = $false
+                peak_private_bytes = $peakPrivateBytes
+                exit_code = [int]$Process.ExitCode
+            }
+        }
+        if ($EnforceMemoryLimit) {
+            $owned = Get-Process -Id ([int]$Process.Id) -ErrorAction SilentlyContinue
+            if ($null -ne $owned) {
+                $peakPrivateBytes = [Math]::Max($peakPrivateBytes, [int64]$owned.PrivateMemorySize64)
+                if ([int64]$owned.PrivateMemorySize64 -gt $UnrealPrivateMemoryLimitBytes) {
+                    # This PID came from our Start-Process call. Do not use a name-wide kill here.
+                    try { Stop-Process -Id ([int]$Process.Id) -Force -ErrorAction Stop } catch { }
+                    try { [void]$Process.WaitForExit(5000) } catch { }
+                    return [ordered]@{
+                        timed_out = $false
+                        memory_limit_hit = $true
+                        peak_private_bytes = $peakPrivateBytes
+                        exit_code = $null
+                    }
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 1000
     }
     # This PID came from our Start-Process call. Never use a name-based kill or a broad process
     # query here: an owner's editor may be unrelated and must remain untouched.
     try { Stop-Process -Id ([int]$Process.Id) -Force -ErrorAction Stop } catch { }
     try { [void]$Process.WaitForExit(5000) } catch { }
-    return [ordered]@{ timed_out = $true; exit_code = $null }
+    return [ordered]@{
+        timed_out = $true
+        memory_limit_hit = $false
+        peak_private_bytes = $peakPrivateBytes
+        exit_code = $null
+    }
 }
 
 function Invoke-UnrealLaunch([string]$Kind, [string[]]$Arguments, [string]$LogPath,
@@ -293,6 +325,8 @@ function Invoke-UnrealLaunch([string]$Kind, [string[]]$Arguments, [string]$LogPa
         ended_utc = $null
         exit_code = $null
         timed_out = $false
+        memory_limit_hit = $false
+        peak_private_bytes = 0L
         crash_reporters_reaped = @()
         new_crashes = @()
         log = $LogPath
@@ -309,12 +343,22 @@ function Invoke-UnrealLaunch([string]$Kind, [string[]]$Arguments, [string]$LogPa
         # -LocalDataCachePath are supplied. Keep this child process inside the run directory.
         $env:LOCALAPPDATA = $isolatedLocalAppData
         $process = Start-Process -FilePath $EditorExe -ArgumentList $Arguments -WorkingDirectory $HostRoot `
-            -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -WindowStyle Hidden -PassThru
+            -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -WindowStyle Hidden `
+            -PassThru
+        try { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal }
+        catch {
+            try { Stop-Process -Id ([int]$process.Id) -Force -ErrorAction Stop } catch { }
+            throw "Could not lower owned Unreal PID $($process.Id) to BelowNormal: $($_.Exception.Message)"
+        }
         $ledger.pid = [int]$process.Id
-        $wait = Wait-OwnedProcess $process $LaunchTimeoutSeconds
+        $wait = Wait-OwnedProcess $process $LaunchTimeoutSeconds -EnforceMemoryLimit
         $ledger.timed_out = [bool]$wait.timed_out
+        $ledger.memory_limit_hit = [bool]$wait.memory_limit_hit
+        $ledger.peak_private_bytes = [int64]$wait.peak_private_bytes
         $ledger.exit_code = $wait.exit_code
-        $ledger.status = if ($ledger.timed_out) { 'timeout' } elseif ($ledger.exit_code -eq 0) { 'passed' } else { 'failed' }
+        $ledger.status = if ($ledger.timed_out) { 'timeout' }
+            elseif ($ledger.memory_limit_hit) { 'memory_limit' }
+            elseif ($ledger.exit_code -eq 0) { 'passed' } else { 'failed' }
     } catch {
         $ledger.status = 'launch_error'
         $ledger.error = $_.Exception.Message
@@ -356,7 +400,13 @@ function Invoke-BuildProcess([string[]]$Arguments, [string]$LogPath, [string]$Er
         $env:DOTNET_NOLOGO = '1'
         $env:LOCALAPPDATA = $isolatedLocalAppData
         $process = Start-Process -FilePath $dotnet -ArgumentList $Arguments -WorkingDirectory $PluginRoot `
-            -RedirectStandardOutput $StdoutPath -RedirectStandardError $ErrorPath -WindowStyle Hidden -PassThru
+            -RedirectStandardOutput $StdoutPath -RedirectStandardError $ErrorPath -WindowStyle Hidden `
+            -PassThru
+        try { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal }
+        catch {
+            try { Stop-Process -Id ([int]$process.Id) -Force -ErrorAction Stop } catch { }
+            throw "Could not lower owned build PID $($process.Id) to BelowNormal: $($_.Exception.Message)"
+        }
         $wait = Wait-OwnedProcess $process $LaunchTimeoutSeconds
     } finally {
         if ($null -eq $oldDotnetCliHome) { Remove-Item Env:DOTNET_CLI_HOME -ErrorAction SilentlyContinue } else { $env:DOTNET_CLI_HOME = $oldDotnetCliHome }
@@ -894,7 +944,7 @@ try {
         $buildStdout = Join-Path $RunRoot 'Logs\build.stdout.log'
         $buildError = Join-Path $RunRoot 'Logs\build.err.log'
         $buildArgs = @(('"{0}"' -f $UbtDll), 'UnrealEditor', 'Win64', 'Development', ('-Project="{0}"' -f $HostProject),
-            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', '-MaxParallelActions=4',
+            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', '-MaxParallelActions=2',
             ('-Log="{0}"' -f $buildLog))
         $BuildRecord = Invoke-BuildProcess $buildArgs $buildLog $buildError $buildStdout
         if ($BuildRecord.status -ne 'passed') { Add-Failure "staged build $($BuildRecord.status)" }

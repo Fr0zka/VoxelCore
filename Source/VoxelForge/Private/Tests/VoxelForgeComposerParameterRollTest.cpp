@@ -13,6 +13,7 @@
 #include "VoxelStrateComposer.h"
 #include "VoxelStrateMeasure.h"
 #include "VoxelTerrainOpDefinition.h"
+#include "VoxelDensityOpStack.h"
 
 namespace
 {
@@ -238,8 +239,11 @@ namespace
         int32 AllAir = 0;
         int32 Proved = 0;
         int64 CheckedVoxels = 0;
+        int64 ExactIntervalChecks = 0;
+        int64 ExactIntervalDisagreements = 0;
         int32 Violations = 0;
         FString FirstViolation;
+        TArray<FString> ViolationDetails;
     };
 
     /**
@@ -248,7 +252,8 @@ namespace
      * to expose. The report is aggregate: there is no per-sample logging.
      */
     FBoxVerdictReport VF_CheckRolledBoxVerdicts(
-        const VoxelForgeTest::FTestWorld& World, int32 CandidateIndex, int32 StrateIndex)
+        const VoxelForgeTest::FTestWorld& World, int32 CandidateIndex, int32 StrateIndex,
+        const FVoxelStrateRollInfo& Roll)
     {
         FBoxVerdictReport Report;
         const UVoxelGenerator* Generator = World.Generator.Get();
@@ -286,8 +291,18 @@ namespace
                         (float)(Origin.Y + (Cells + 1) * Step),
                         (float)(Origin.Z + (Cells + 1) * Step)));
             (void)Box; // The production API receives the equivalent origin/step/cell box.
+            const FBox ClassifierBox(
+                FVector(static_cast<float>(Origin.X), static_cast<float>(Origin.Y),
+                        static_cast<float>(Origin.Z)),
+                FVector(static_cast<float>(Origin.X + Cells * Step),
+                        static_cast<float>(Origin.Y + Cells * Step),
+                        static_cast<float>(Origin.Z + Cells * Step)));
 
-            const EVoxelTileClass Verdict = Generator->ClassifyTile(Origin, Step, Cells);
+            FVoxelTileClassificationStats ClassifyStats;
+            const EVoxelTileClass Verdict = Generator->ClassifyTile(
+                Origin, Step, Cells, &ClassifyStats);
+            Report.ExactIntervalChecks += ClassifyStats.ExactCoreIntervalChecks;
+            Report.ExactIntervalDisagreements += ClassifyStats.ExactCoreIntervalDisagreements;
             if (Verdict == EVoxelTileClass::Mixed)
             {
                 ++Report.Mixed;
@@ -305,6 +320,15 @@ namespace
 
             const bool bClaimsSolid = Verdict == EVoxelTileClass::AllSolid;
             bool bBoxBad = false;
+            bool bDiagnosticStackReady = false;
+            bool bDiagnosticStackBuilt = false;
+            FVoxelOpStack DiagnosticStack;
+            FVoxelOpContext DiagnosticContext;
+            EVoxelTileClass DiagnosticStackVerdict = EVoxelTileClass::Mixed;
+            int32 DiagnosticSolidKiller = INDEX_NONE;
+            int32 DiagnosticAirKiller = INDEX_NONE;
+            TArray<FVoxelOpStack::FOpBoxDiagnostic> OpDiagnostics;
+            FString WriterRouteDetails;
             // ClassifyTile covers the cell vertices passed to it: g is [0, Cells]. The mesher
             // samples a separate halo, but that halo is not part of this production verdict's
             // proof domain and must not turn a sound tile into a false failure.
@@ -325,6 +349,173 @@ namespace
                 {
                     ++Report.Violations;
                     bBoxBad = true;
+                    if (!bDiagnosticStackReady)
+                    {
+                        bDiagnosticStackReady = true;
+                        int32 SlotTop = 0, SlotBottom = 0;
+                        FVoxelStrateArchetypeParams RuntimeParams = Roll.ArchetypeParams;
+                        bDiagnosticStackBuilt = World.GetSlotVoxelZRange(
+                            StrateIndex, SlotTop, SlotBottom);
+                        if (bDiagnosticStackBuilt)
+                        {
+                            VF_SetStrateArchetypeRuntimeBounds(
+                                RuntimeParams, static_cast<float>(SlotTop) + 1.0f,
+                                static_cast<float>(SlotBottom));
+                            bDiagnosticStackBuilt = VF_BuildNativeStrateStackForCandidate(
+                                Roll.Archetype, RuntimeParams, World.Settings->Seed,
+                                World.Generator->OriginSpineRadius,
+                                World.Generator->WorldRadiusVoxels,
+                                World.Generator->EdgeSealThickness,
+                                World.StrateManager.Get(), DiagnosticStack, DiagnosticContext);
+                        }
+                        if (bDiagnosticStackBuilt)
+                        {
+                            DiagnosticContext.ChunkCoord = FIntVector(
+                                0, 0, VF_FloorDiv(Origin.Z, CHUNK_SIZE));
+                            DiagnosticContext.Step = Step;
+                            DiagnosticContext.LayoutVersion =
+                                World.StrateManager->GetLayoutVersion();
+                            DiagnosticContext.WorldRadiusVoxels =
+                                World.Generator->WorldRadiusVoxels;
+                            DiagnosticContext.EdgeSealThickness =
+                                World.Generator->EdgeSealThickness;
+                            DiagnosticContext.bUseLatticeProof = true;
+                            DiagnosticContext.bTightenWarpProof = Step <= 2;
+                            DiagnosticContext.LatticeOriginVoxels = Origin;
+                            DiagnosticStack.PrepareChunk(DiagnosticContext);
+                            DiagnosticStackVerdict = DiagnosticStack.ClassifyBoxAttributed(
+                                ClassifierBox, DiagnosticContext,
+                                DiagnosticSolidKiller, DiagnosticAirKiller);
+                            DiagnosticStack.DiagnoseBox(
+                                ClassifierBox, DiagnosticContext, Step, OpDiagnostics,
+                                &DiagnosticStackVerdict);
+                        }
+                    }
+                    if (WriterRouteDetails.IsEmpty())
+                    {
+                        const FIntVector SampleChunk(
+                            VF_FloorDiv(static_cast<int32>(X), CHUNK_SIZE),
+                            VF_FloorDiv(static_cast<int32>(Y), CHUNK_SIZE),
+                            VF_FloorDiv(static_cast<int32>(Z), CHUNK_SIZE));
+                        int32 SampleSlotTop = 0;
+                        int32 SampleSlotBottom = 0;
+                        int32 RecipeSeedAtSample = 0;
+                        ECaveGeneratorType RecipeArchetypeAtSample = ECaveGeneratorType::TunnelNetwork;
+                        FVoxelStrateArchetypeParams RecipeParamsAtSample;
+                        FVoxelOpStackRecipe RecipeAtSample;
+                        const bool bSampleHasSlot = World.StrateManager->GetStrateChunkZBounds(
+                            SampleChunk.Z, SampleSlotTop, SampleSlotBottom);
+                        const bool bSampleHasRecipe = World.StrateManager->GetRecipeForChunk(
+                            SampleChunk, RecipeSeedAtSample, RecipeArchetypeAtSample,
+                            RecipeParamsAtSample, RecipeAtSample);
+                        const float PassageSdf = World.StrateManager->EvaluateModifierSDF(X, Y, Z);
+                        const float MaxPassageCarve =
+                            World.StrateManager->MaxPassageCarveFactorNearLattice(
+                                ClassifierBox, Origin, Step);
+                        const bool bPassageNear = World.StrateManager->AnyPassageNearLattice(
+                            ClassifierBox, Origin, Step);
+                        const bool bPassageAirPostNear = World.StrateManager->AnyPassageAirPostNearLattice(
+                            ClassifierBox, Origin, Step, 8.0f, World.Generator->EdgeSealThickness);
+                        const bool bLandingFloorNear =
+                            World.StrateManager->AnyPassageLandingFloorNearLattice(
+                                ClassifierBox, Origin, Step);
+                        const bool bStructuralPostNear =
+                            World.StrateManager->AnyPassageStructuralPostNearLattice(
+                                ClassifierBox, Origin, Step);
+                        WriterRouteDetails = FString::Printf(
+                            TEXT("sample_chunk=(%d,%d,%d) gap=%d slot_bounds=%d:[%d..%d] "
+                                 "generator=%s operator_stack=%d recipe=%d world_radius=%.6g "
+                                 "passage_sdf=%.9g passage_max_carve=%.9g "
+                                 "passage_near=%d passage_air_post=%d landing_floor=%d structural_post=%d"),
+                            SampleChunk.X, SampleChunk.Y, SampleChunk.Z,
+                            World.StrateManager->IsGapChunk(SampleChunk) ? 1 : 0,
+                            bSampleHasSlot ? 1 : 0, SampleSlotTop, SampleSlotBottom,
+                            VF_GetStrateArchetypeName(
+                                World.StrateManager->GetGeneratorTypeForChunk(SampleChunk)),
+                            World.StrateManager->UsesOperatorStackForChunk(SampleChunk) ? 1 : 0,
+                            bSampleHasRecipe ? 1 : 0, World.Generator->WorldRadiusVoxels,
+                            PassageSdf, MaxPassageCarve, bPassageNear ? 1 : 0,
+                            bPassageAirPostNear ? 1 : 0, bLandingFloorNear ? 1 : 0,
+                            bStructuralPostNear ? 1 : 0);
+                    }
+                    float StackDensity = FLT_MAX;
+                    FString StackAttribution = TEXT("stack diagnostic unavailable");
+                    if (bDiagnosticStackBuilt)
+                    {
+                        StackDensity = DiagnosticStack.EvalMC(X, Y, Z);
+                        FString BoundViolations;
+                        FString SdfIntervalViolations;
+                        FString OperatorIntervals;
+                        for (const FVoxelOpStack::FOpBoxDiagnostic& OpDiagnostic : OpDiagnostics)
+                        {
+                            if (OpDiagnostic.ForcedVerdict != EVoxelTileClass::Mixed
+                                || OpDiagnostic.bHasDensityDelta
+                                || OpDiagnostic.bHasSdfValue)
+                            {
+                                if (!OperatorIntervals.IsEmpty()) { OperatorIntervals += TEXT("; "); }
+                                OperatorIntervals += FString::Printf(
+                                    TEXT("%s(forced=%d,effect=%d,carve=%.6g,fill=%.6g,delta=[%.6g,%.6g],sdf_bound=[%.6g,%.6g],sdf_actual=[%.6g,%.6g])"),
+                                    *OpDiagnostic.Name,
+                                    static_cast<int32>(OpDiagnostic.ForcedVerdict),
+                                    static_cast<int32>(OpDiagnostic.Effect),
+                                    OpDiagnostic.MaxCarve, OpDiagnostic.MaxFill,
+                                    OpDiagnostic.ActualDensityDeltaMin,
+                                    OpDiagnostic.ActualDensityDeltaMax,
+                                    OpDiagnostic.SdfBoundMin, OpDiagnostic.SdfBoundMax,
+                                    OpDiagnostic.ActualSdfMin, OpDiagnostic.ActualSdfMax);
+                            }
+                            if (OpDiagnostic.bCarveBoundViolated
+                                || OpDiagnostic.bFillBoundViolated)
+                            {
+                                if (!BoundViolations.IsEmpty()) { BoundViolations += TEXT(", "); }
+                                BoundViolations += FString::Printf(
+                                    TEXT("%s(carve=%d,fill=%d,delta=[%.6g,%.6g])"),
+                                    *OpDiagnostic.Name,
+                                    OpDiagnostic.bCarveBoundViolated ? 1 : 0,
+                                    OpDiagnostic.bFillBoundViolated ? 1 : 0,
+                                    OpDiagnostic.ActualDensityDeltaMin,
+                                    OpDiagnostic.ActualDensityDeltaMax);
+                            }
+                            if (OpDiagnostic.bHasSdfBound && OpDiagnostic.bHasSdfValue
+                                && (OpDiagnostic.ActualSdfMin < OpDiagnostic.SdfBoundMin - 1.0e-4f
+                                    || OpDiagnostic.ActualSdfMax > OpDiagnostic.SdfBoundMax + 1.0e-4f))
+                            {
+                                if (!SdfIntervalViolations.IsEmpty())
+                                {
+                                    SdfIntervalViolations += TEXT(", ");
+                                }
+                                SdfIntervalViolations += FString::Printf(
+                                    TEXT("%s(bound=[%.6g,%.6g],actual=[%.6g,%.6g])"),
+                                    *OpDiagnostic.Name, OpDiagnostic.SdfBoundMin,
+                                    OpDiagnostic.SdfBoundMax, OpDiagnostic.ActualSdfMin,
+                                    OpDiagnostic.ActualSdfMax);
+                            }
+                        }
+                        StackAttribution = FString::Printf(
+                            TEXT("stack_verdict=%s solid_killer=%s air_killer=%s stack_density=%.9g "
+                                 "operator_bound_violations=[%s] sdf_interval_violations=[%s] "
+                                 "op_intervals=[%s] "
+                                 "refine_nodes=%u depth=%u exact_core_samples=%u exact_final_samples=%u "
+                                 "post_nodes=%u"),
+                            DiagnosticStackVerdict == EVoxelTileClass::AllSolid ? TEXT("AllSolid")
+                                : DiagnosticStackVerdict == EVoxelTileClass::AllAir ? TEXT("AllAir")
+                                : TEXT("Mixed"),
+                            DiagnosticStack.GetOpDebugName(DiagnosticSolidKiller),
+                            DiagnosticStack.GetOpDebugName(DiagnosticAirKiller),
+                            StackDensity,
+                            BoundViolations.IsEmpty() ? TEXT("none") : *BoundViolations,
+                            SdfIntervalViolations.IsEmpty() ? TEXT("none") : *SdfIntervalViolations,
+                            OperatorIntervals.IsEmpty() ? TEXT("none") : *OperatorIntervals,
+                            ClassifyStats.RefineNodes, ClassifyStats.MaxRefinementDepth,
+                            ClassifyStats.ExactCoreSamples, ClassifyStats.ExactFinalSamples,
+                            ClassifyStats.NeedsFinalFieldNodes);
+                    }
+                    Report.ViolationDetails.Add(FString::Printf(
+                        TEXT("candidate %d box %d origin (%d,%d,%d) said %s; final density at "
+                             "(%0.f,%0.f,%0.f) = %.9g; %s; %s"),
+                        CandidateIndex, BoxIndex, Origin.X, Origin.Y, Origin.Z,
+                        bClaimsSolid ? TEXT("AllSolid") : TEXT("AllAir"),
+                        X, Y, Z, Density, *WriterRouteDetails, *StackAttribution));
                     if (Report.FirstViolation.IsEmpty())
                     {
                         Report.FirstViolation = FString::Printf(
@@ -801,6 +992,8 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     int32 TotalBoxAllAir = 0;
     int32 TotalBoxProved = 0;
     int64 TotalBoxCheckedVoxels = 0;
+    int64 TotalExactIntervalChecks = 0;
+    int64 TotalExactIntervalDisagreements = 0;
     int32 TotalBoxViolations = 0;
     int32 NumTunnelLikeCandidates = 0;
     int32 NumCandidatesWithLiveDetail = 0;
@@ -996,16 +1189,23 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         }
 
         const FBoxVerdictReport BoxReport = VF_CheckRolledBoxVerdicts(
-            World, CandidateIndex, CandidateStrateIndex);
+            World, CandidateIndex, CandidateStrateIndex, Roll);
         TotalBoxMixed += BoxReport.Mixed;
         TotalBoxAllSolid += BoxReport.AllSolid;
         TotalBoxAllAir += BoxReport.AllAir;
         TotalBoxProved += BoxReport.Proved;
         TotalBoxCheckedVoxels += BoxReport.CheckedVoxels;
+        TotalExactIntervalChecks += BoxReport.ExactIntervalChecks;
+        TotalExactIntervalDisagreements += BoxReport.ExactIntervalDisagreements;
         TotalBoxViolations += BoxReport.Violations;
         if (BoxReport.Violations > 0)
         {
             BoxViolationCandidates.Add(CandidateIndex);
+            for (const FString& ViolationDetail : BoxReport.ViolationDetails)
+            {
+                AddInfo(FString::Printf(TEXT("ROLLED BOX-VERDICT COUNTEREXAMPLE: %s"),
+                                        *ViolationDetail));
+            }
             if (FirstBoxViolation.IsEmpty())
             {
                 FirstBoxViolation = BoxReport.FirstViolation;
@@ -1098,6 +1298,10 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         TotalBoxMixed, TotalBoxAllSolid, TotalBoxAllAir, TotalBoxProved,
         TotalBoxCheckedVoxels, TotalBoxViolations,
         BoxViolationCandidates.Num() == 0 ? TEXT("none") : TEXT("see first violation below")));
+    AddInfo(FString::Printf(
+        TEXT("Fine room-graph interval checks: %lld exact lattice leaves; %lld interval verdicts "
+             "disagreed with the exact child samples."),
+        TotalExactIntervalChecks, TotalExactIntervalDisagreements));
     if (!BoxViolationCandidates.IsEmpty())
     {
         AddError(FString::Printf(

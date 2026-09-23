@@ -39,6 +39,8 @@
 #include "Materials/MaterialParameterCollection.h"
 #include "Kismet/KismetMaterialLibrary.h"
 #include "Engine/VolumeTexture.h"
+#include "Engine/Engine.h"
+#include "Camera/CameraActor.h"
 #include "VoxelAtmosphereManager.h"
 #include "DrawDebugHelpers.h"
 #include "IImageWrapper.h"
@@ -1531,6 +1533,55 @@ void AVoxelWorld::BeginPlay()
     {
         UE_LOG(LogTemp, Error, TEXT("[VoxelWorld] No Settings assigned — world won't generate."));
         return;
+    }
+
+    int32 TestRenderDistanceChunks = 0;
+    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.TestRenderDistanceChunks="),
+                      TestRenderDistanceChunks)
+        && TestRenderDistanceChunks > 0)
+    {
+        if (UVoxelSettings* TestSettings = DuplicateObject<UVoxelSettings>(Settings, this))
+        {
+            const int32 AuthoredRenderDistance = Settings->RenderDistanceChunks;
+            TestSettings->RenderDistanceChunks = TestRenderDistanceChunks;
+            Settings = TestSettings;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTestCeiling] transient_render_distance_chunks=%d authored=%d"),
+                TestRenderDistanceChunks, AuthoredRenderDistance);
+        }
+    }
+
+    int32 TestCeilingView = 0;
+    FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingView="), TestCeilingView);
+    bTestCeilingViewEnabled = TestCeilingView != 0;
+    if (bTestCeilingViewEnabled)
+    {
+        TestCeilingCameraWorldPosition = FVector(10583.003176, 20477.525456, -38442.958976);
+        TestCeilingCameraRotation = FRotator(78.399901, 255.200004, 0.0);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCameraX="),
+                      TestCeilingCameraWorldPosition.X);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCameraY="),
+                      TestCeilingCameraWorldPosition.Y);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCameraZ="),
+                      TestCeilingCameraWorldPosition.Z);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCameraPitch="),
+                      TestCeilingCameraRotation.Pitch);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCameraYaw="),
+                      TestCeilingCameraRotation.Yaw);
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestCeilingCaptureDelaySeconds="),
+                      TestCeilingCaptureDelaySeconds);
+        TestCeilingCaptureDelaySeconds = FMath::Max(TestCeilingCaptureDelaySeconds, 1.0f);
+        TestCeilingViewBeginSeconds = FPlatformTime::Seconds();
+        bHeadlessStreamingTestCenterOverride = true;
+        HeadlessStreamingTestCenterVoxel = WorldToLocalVoxel(TestCeilingCameraWorldPosition);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeTestCeiling] camera_world_cm=(%.3f,%.3f,%.3f) "
+                 "camera_rotation=(%.3f,%.3f,%.3f) center_vox=(%.3f,%.3f,%.3f) capture_delay_s=%.1f"),
+            TestCeilingCameraWorldPosition.X, TestCeilingCameraWorldPosition.Y,
+            TestCeilingCameraWorldPosition.Z, TestCeilingCameraRotation.Pitch,
+            TestCeilingCameraRotation.Yaw, TestCeilingCameraRotation.Roll,
+            HeadlessStreamingTestCenterVoxel.X, HeadlessStreamingTestCenterVoxel.Y,
+            HeadlessStreamingTestCenterVoxel.Z, TestCeilingCaptureDelaySeconds);
     }
 
     // The owner's current DA_Settings is intentionally a one-strate surface layout, so it cannot
@@ -3666,6 +3717,45 @@ void AVoxelWorld::Tick(float DeltaTime)
     }
     ProcessUnloadQueue();
     MaybeFinishHeadlessStreamingTest();
+
+    if (bTestCeilingViewEnabled)
+    {
+        UWorld* World = GetWorld();
+        APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+        if (PC && !TestCeilingCamera.IsValid())
+        {
+            FActorSpawnParameters SpawnParams;
+            SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+            ACameraActor* Camera = World->SpawnActor<ACameraActor>(
+                ACameraActor::StaticClass(), TestCeilingCameraWorldPosition,
+                TestCeilingCameraRotation, SpawnParams);
+            if (IsValid(Camera))
+            {
+                TestCeilingCamera = Camera;
+                PC->SetViewTarget(Camera);
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeTestCeiling] camera_installed=1 applied_visible_tiles=%llu"),
+                    static_cast<unsigned long long>(AppliedVisibleTileCount));
+            }
+        }
+
+        if (TestCeilingCamera.IsValid() && !bTestCeilingCaptureRequested
+            && AppliedVisibleTileCount >= 16
+            && FPlatformTime::Seconds() - TestCeilingViewBeginSeconds
+                >= static_cast<double>(TestCeilingCaptureDelaySeconds))
+        {
+            bTestCeilingCaptureRequested = true;
+            const bool bExecSucceeded = GEngine
+                && GEngine->Exec(World, TEXT("HighResShot 1"));
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeTestCeiling] capture_requested=%d elapsed_s=%.3f "
+                     "visible_tiles=%llu triangles=%llu"),
+                bExecSucceeded ? 1 : 0,
+                FPlatformTime::Seconds() - TestCeilingViewBeginSeconds,
+                static_cast<unsigned long long>(AppliedVisibleTileCount),
+                static_cast<unsigned long long>(AppliedTriangleCount));
+        }
+    }
 
 #if ENABLE_DRAW_DEBUG
     // Density-volume overlay (step 1a): cyan boxes for solid level-0 cells near the player.
@@ -6068,7 +6158,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                     / static_cast<double>(WormEligibleSamples)
                 : 0.0;
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d triangles=%d "
+                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d triangles=%d ceiling_triangles=%d "
                      "band=(%d,%d) "
                      "verdict=%d proof=%d air_proof=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
                      "cache_build=%.6f evaluation=%.6f "
@@ -6089,7 +6179,8 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "worm_skip_rate=%.6f"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
                 bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
-                Result.bEmpty ? 1 : 0, Result.NumTriangles, BandChunkLo, BandChunkHi,
+                Result.bEmpty ? 1 : 0, Result.NumTriangles, Result.NumCeilingTriangles,
+                BandChunkLo, BandChunkHi,
                 ClassifyVerdict, Result.bSealedSolidProof ? 1 : 0,
                 Result.bOutOfLayoutAirProof ? 1 : 0,
                 ClassifySeconds, MeshSeconds, StreamSeconds,
@@ -6428,6 +6519,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         // AND cap in one tile — entirely with the winner's material.)
         const int32 NumTris = MeshData.Triangles.Num() / 3;
         Result.NumTriangles = NumTris;
+        Result.NumCeilingTriangles = MeshData.NumCeilingTriangles;
         Result.bHasCeilingTris = MeshData.NumCeilingTriangles > 0;
         Result.bHasGroundTris  = NumTris > MeshData.NumCeilingTriangles;
     }

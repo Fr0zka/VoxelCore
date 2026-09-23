@@ -32,6 +32,7 @@ class UVolumeTexture;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class FScopedGenerationPause;
+class ACameraActor;
 namespace RealtimeMesh { struct FRealtimeMeshStreamSet; }   // T1.f — worker-built geometry buffers
 
 /** Per-request cancellation state. The game thread flips the flag when a pending tile leaves the
@@ -107,7 +108,7 @@ struct FChunkResult
     uint64 GenerationStartCycles = 0;
     uint64 GenerationEndCycles = 0;
     uint64 ApplyStartCycles = 0;
-    int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0;
+    int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0; int32 NumCeilingTriangles = 0;
     bool bSealedSolidProof = false; // true when the cheap gap/seal proof skipped meshing
     bool bOutOfLayoutAirProof = false; // true when the exact constant-air guard skipped meshing
     // Clean, low-overhead work counters. These are carried with the result so the worker can
@@ -1010,6 +1011,16 @@ public:
     FVector HeadlessStreamingTestLastActualPosition = FVector::ZeroVector;
     double HeadlessStreamingTestBeginSeconds = 0.0;
     double HeadlessStreamingTestLastElapsedSeconds = 0.0;
+
+    // Transient owner-view render hook. Enabled only by explicit voxel.TestCeilingView arguments;
+    // the camera and smaller test radius are held in memory and never saved to a package.
+    bool bTestCeilingViewEnabled = false;
+    bool bTestCeilingCaptureRequested = false;
+    TWeakObjectPtr<ACameraActor> TestCeilingCamera;
+    FVector TestCeilingCameraWorldPosition = FVector::ZeroVector;
+    FRotator TestCeilingCameraRotation = FRotator::ZeroRotator;
+    double TestCeilingViewBeginSeconds = 0.0;
+    float TestCeilingCaptureDelaySeconds = 18.0f;
 
     // Explicit high-speed collision-gate repro. The streamer stays centred at the launch tile while
     // the character uses ordinary swept movement across the still-pending desired set. The test

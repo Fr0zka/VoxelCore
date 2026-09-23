@@ -504,6 +504,8 @@ struct FVoxelTileClassificationStats
     uint32 MaxRefinementDepth = 0;
     uint32 ExactCoreSamples = 0;
     uint32 ExactFinalSamples = 0;
+    uint32 ExactCoreIntervalChecks = 0;
+    uint32 ExactCoreIntervalDisagreements = 0;
     uint32 ExactCoreCacheHits = 0;
     uint32 ExactFinalCacheHits = 0;
     uint32 ExactCoreLeaves = 0;

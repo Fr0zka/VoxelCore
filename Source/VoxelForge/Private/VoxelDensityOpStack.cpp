@@ -6753,7 +6753,12 @@ namespace
             FVoxelBoxSdfInterval Own;
             if (bUseExactLatticeWarp)
             {
-                Own.Set(ExactSdfLower, FLT_MAX);
+                // Exact per-primitive scans are a tightening only.  Their candidate-domain
+                // filters can miss a warped lattice query near a primitive, so retain the
+                // broad lower bound over the AABB that contains every warped sample.  The
+                // minimum stays useful when both agree and remains safe when an exact scan is
+                // incomplete.
+                Own.Set(FMath::Min(ExactSdfLower, CheapSdfLower), FLT_MAX);
             }
             else if (!bAnyPrimitive)
             {
