@@ -98,7 +98,9 @@ namespace
         int32 AllAir = 0;
         int32 AllSolid = 0;
         int32 Mixed = 0;
+        int64 Vertices = 0;
         int64 Triangles = 0;
+        uint64 GeometryBytes = 0;
 
         for (const FTileSample& Sample : Samples)
         {
@@ -108,7 +110,9 @@ namespace
             if (Sample.Verdict == 0) ++Mixed;
             else if (Sample.Verdict == 1) ++AllSolid;
             else if (Sample.Verdict == 2) ++AllAir;
+            Vertices += Sample.Vertices;
             Triangles += Sample.Triangles;
+            GeometryBytes += Sample.GeometryBytes;
             Request.Add(Sample.RequestToApplySeconds);
             Queue.Add(Sample.QueueWaitSeconds);
             Generation.Add(Sample.GenerationSeconds);
@@ -118,14 +122,16 @@ namespace
         }
 
         return FString::Printf(
-            TEXT("{\"count\":%d,\"empty\":%d,\"all_air\":%d,\"all_solid\":%d,\"mixed\":%d,\"triangles\":%lld,"
+            TEXT("{\"count\":%d,\"empty\":%d,\"all_air\":%d,\"all_solid\":%d,\"mixed\":%d,\"vertices\":%lld,\"triangles\":%lld,\"geometry_bytes\":%llu,"
                  "\"request_apply_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"queue_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"generation_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"classify_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"mesh_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s},"
                  "\"apply_s\":{\"p50\":%s,\"p95\":%s,\"max\":%s}}"),
-            Count, Empty, AllAir, AllSolid, Mixed, static_cast<long long>(Triangles),
+            Count, Empty, AllAir, AllSolid, Mixed,
+            static_cast<long long>(Vertices), static_cast<long long>(Triangles),
+            static_cast<unsigned long long>(GeometryBytes),
             *Number(Percentile(Request, 0.50)), *Number(Percentile(Request, 0.95)), *Number(Maximum(Request)),
             *Number(Percentile(Queue, 0.50)), *Number(Percentile(Queue, 0.95)), *Number(Maximum(Queue)),
             *Number(Percentile(Generation, 0.50)), *Number(Percentile(Generation, 0.95)), *Number(Maximum(Generation)),
@@ -260,12 +266,13 @@ void RecordTile(const FTileSample& Sample)
     GState->Samples.Add(Sample);
     ++GState->TileRecordsWritten;
     WriteEventLocked(*GState, TEXT("tile"), FString::Printf(
-        TEXT("\"tile\":[%d,%d,%d],\"level\":%d,\"verdict\":%d,\"proof\":%d,\"empty\":%d,\"triangles\":%d,"
+        TEXT("\"tile\":[%d,%d,%d],\"level\":%d,\"verdict\":%d,\"proof\":%d,\"empty\":%d,\"vertices\":%d,\"triangles\":%d,\"geometry_bytes\":%llu,"
              "\"request_to_apply_s\":%s,\"queue_wait_s\":%s,\"worker_queue_s\":%s,\"result_queue_s\":%s,"
              "\"generation_s\":%s,\"classify_s\":%s,\"mesh_s\":%s,\"stream_s\":%s,\"apply_s\":%s"),
         Sample.TileX, Sample.TileY, Sample.TileZ,
         Sample.Level, Sample.Verdict, Sample.bSealedSolidProof ? 1 : 0,
-        Sample.bEmpty ? 1 : 0, Sample.Triangles,
+        Sample.bEmpty ? 1 : 0, Sample.Vertices, Sample.Triangles,
+        static_cast<unsigned long long>(Sample.GeometryBytes),
         *Number(Sample.RequestToApplySeconds), *Number(Sample.QueueWaitSeconds),
         *Number(Sample.WorkerQueueSeconds), *Number(Sample.ResultQueueSeconds),
         *Number(Sample.GenerationSeconds), *Number(Sample.ClassifySeconds),

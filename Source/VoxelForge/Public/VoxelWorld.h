@@ -109,6 +109,8 @@ struct FChunkResult
     uint64 GenerationEndCycles = 0;
     uint64 ApplyStartCycles = 0;
     int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0; int32 NumCeilingTriangles = 0;
+    int32 NumVertices = 0;
+    uint64 GeometryBytes = 0;
     bool bSealedSolidProof = false; // true when the cheap gap/seal proof skipped meshing
     bool bOutOfLayoutAirProof = false; // true when the exact constant-air guard skipped meshing
     // Clean, low-overhead work counters. These are carried with the result so the worker can
@@ -152,6 +154,14 @@ struct FVoxelTileHashDumpRecord
     bool bEmpty = true;
     int32 NumTriangles = 0;
     FString GeometryHash;
+};
+
+/** Resident CPU geometry payload associated with one currently loaded tile. */
+struct FLoadedTileGeometryStats
+{
+    uint64 Vertices = 0;
+    uint64 Triangles = 0;
+    uint64 GeometryBytes = 0;
 };
 
 UCLASS()
@@ -985,6 +995,7 @@ public:
     uint64 AppliedVisibleTileCountByLevel[TrackedClassifierLODCount]{};
     uint64 AppliedTriangleCountByLevel[TrackedClassifierLODCount]{};
     uint64 AppliedBandTileCountByLevel[TrackedClassifierLODCount]{};
+    TMap<FVoxelTileKey, FLoadedTileGeometryStats> LoadedTileGeometry;
 
     struct FStreamingLatencySample
     {
@@ -998,6 +1009,7 @@ public:
     // Headless validation hook. These are intentionally non-UPROPERTY state and are enabled only
     // by explicit command-line switches; they do not alter ordinary player movement or streaming.
     bool bHeadlessStreamingTestMovement = false;
+    bool bHeadlessStreamingTestExitOnSteady = false;
     bool bHeadlessStreamingTestExitRequested = false;
     bool bStartupTraceThroughCrossing = false;
     bool bHeadlessStreamingTestCenterOverride = false;

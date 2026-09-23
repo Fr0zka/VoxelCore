@@ -40,6 +40,8 @@
 #include "Kismet/KismetMaterialLibrary.h"
 #include "Engine/VolumeTexture.h"
 #include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
+#include "Slate/SceneViewport.h"
 #include "Camera/CameraActor.h"
 #include "VoxelAtmosphereManager.h"
 #include "DrawDebugHelpers.h"
@@ -535,6 +537,7 @@ void AVoxelWorld::RegenerateAllChunks()
     for (auto& Pair : TileComponents) { if (Pair.Value) ReleaseTileComponent(Pair.Value); }
     TileComponents.Empty();
     LoadedTiles.Empty();
+    LoadedTileGeometry.Reset();
     CollisionReadyTiles.Empty();
     CollisionNotRequiredTiles.Empty();
     CollisionSolidTiles.Empty();
@@ -1420,6 +1423,7 @@ void AVoxelWorld::BeginPlay()
     AppliedTileCount = 0;
     AppliedVisibleTileCount = 0;
     AppliedTriangleCount = 0;
+    LoadedTileGeometry.Reset();
     for (int32 LOD = 0; LOD < TrackedClassifierLODCount; ++LOD)
     {
         AppliedVisibleTileCountByLevel[LOD] = 0;
@@ -1536,18 +1540,43 @@ void AVoxelWorld::BeginPlay()
     }
 
     int32 TestRenderDistanceChunks = 0;
-    if (FParse::Value(FCommandLine::Get(), TEXT("voxel.TestRenderDistanceChunks="),
+    const bool bTestRenderDistance =
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestRenderDistanceChunks="),
                       TestRenderDistanceChunks)
-        && TestRenderDistanceChunks > 0)
+        && TestRenderDistanceChunks > 0;
+    int32 TestMaxClipLevel = -1;
+    const bool bTestMaxClipLevel =
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestMaxClipLevel="), TestMaxClipLevel);
+    int32 TestFarSheetRing = -1;
+    const bool bTestFarSheetRing =
+        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestFarSheetRing="), TestFarSheetRing);
+    if (bTestRenderDistance || bTestMaxClipLevel || bTestFarSheetRing)
     {
         if (UVoxelSettings* TestSettings = DuplicateObject<UVoxelSettings>(Settings, this))
         {
             const int32 AuthoredRenderDistance = Settings->RenderDistanceChunks;
-            TestSettings->RenderDistanceChunks = TestRenderDistanceChunks;
+            const int32 AuthoredMaxClipLevel = Settings->MaxClipLevel;
+            const bool bAuthoredFarSheetRing = Settings->bFarSheetRing;
+            if (bTestRenderDistance)
+            {
+                TestSettings->RenderDistanceChunks = TestRenderDistanceChunks;
+            }
+            if (bTestMaxClipLevel)
+            {
+                TestSettings->MaxClipLevel = FMath::Clamp(TestMaxClipLevel, 0, 8);
+            }
+            if (bTestFarSheetRing)
+            {
+                TestSettings->bFarSheetRing = TestFarSheetRing != 0;
+            }
             Settings = TestSettings;
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTestCeiling] transient_render_distance_chunks=%d authored=%d"),
-                TestRenderDistanceChunks, AuthoredRenderDistance);
+                TEXT("[VoxelForgeHorizonMeasure] transient_settings=1 "
+                     "render_distance_chunks=%d authored=%d max_clip_level=%d authored=%d "
+                     "far_sheet_ring=%d authored=%d"),
+                Settings->RenderDistanceChunks, AuthoredRenderDistance,
+                Settings->MaxClipLevel, AuthoredMaxClipLevel,
+                Settings->bFarSheetRing ? 1 : 0, bAuthoredFarSheetRing ? 1 : 0);
         }
     }
 
@@ -1801,6 +1830,7 @@ void AVoxelWorld::BeginPlay()
 void AVoxelWorld::ConfigureHeadlessStreamingTest()
 {
     bHeadlessStreamingTestMovement = false;
+    bHeadlessStreamingTestExitOnSteady = false;
     bHeadlessStreamingTestExitRequested = false;
     bStartupTraceThroughCrossing = false;
     bHeadlessStreamingTestCenterOverride = false;
@@ -1917,9 +1947,14 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     float Speed = 800.0f;
     float StartSeconds = 20.0f;
     float ExitSeconds = 0.0f;
+    int32 ExitOnSteadyValue = 0;
     FParse::Value(CommandLine, TEXT("voxel.TestMoveSpeedCmPerSecond="), Speed);
     FParse::Value(CommandLine, TEXT("voxel.TestMoveStartSeconds="), StartSeconds);
     FParse::Value(CommandLine, TEXT("voxel.TestExitSeconds="), ExitSeconds);
+    if (FParse::Value(CommandLine, TEXT("voxel.TestExitOnSteady="), ExitOnSteadyValue))
+    {
+        bHeadlessStreamingTestExitOnSteady = ExitOnSteadyValue != 0;
+    }
 
     int32 CrossingValue = 0;
     bHeadlessStrateCrossingTest =
@@ -2181,6 +2216,9 @@ void AVoxelWorld::WriteTileHashDump()
         Writer->WriteValue(TEXT("lod_octave_drop"), Settings->LODOctaveDrop);
         Writer->WriteValue(TEXT("full_res_clip_levels"), Settings->FullResClipLevels);
         Writer->WriteValue(TEXT("coarse_tile_cells"), Settings->CoarseTileCells);
+        Writer->WriteValue(TEXT("max_clip_level"), Settings->MaxClipLevel);
+        Writer->WriteValue(TEXT("render_distance_chunks"), Settings->RenderDistanceChunks);
+        Writer->WriteValue(TEXT("far_sheet_ring"), Settings->bFarSheetRing);
         Writer->WriteValue(TEXT("strate_content_cut_min_level"),
             Settings->GetEffectiveStrateContentCutMinLevel());
         Writer->WriteObjectEnd();
@@ -3592,6 +3630,10 @@ void AVoxelWorld::Tick(float DeltaTime)
         TMap<int32, int32> SteadyLevelCounts;
         TMap<int32, FIntVector> SteadyLevelMins;
         TMap<int32, FIntVector> SteadyLevelMaxs;
+        TMap<int32, int32> LoadedLevelCounts;
+        TMap<int32, uint64> LoadedLevelVertices;
+        TMap<int32, uint64> LoadedLevelTriangles;
+        TMap<int32, uint64> LoadedLevelGeometryBytes;
         for (const FVoxelTileKey& Key : DesiredSorted)
         {
             ++SteadyLevelCounts.FindOrAdd(Key.Level);
@@ -3603,6 +3645,16 @@ void AVoxelWorld::Tick(float DeltaTime)
             Max.X = FMath::Max(Max.X, Key.Coord.X);
             Max.Y = FMath::Max(Max.Y, Key.Coord.Y);
             Max.Z = FMath::Max(Max.Z, Key.Coord.Z);
+        }
+        for (const FVoxelTileKey& Key : LoadedTiles)
+        {
+            ++LoadedLevelCounts.FindOrAdd(Key.Level);
+            if (const FLoadedTileGeometryStats* Geometry = LoadedTileGeometry.Find(Key))
+            {
+                LoadedLevelVertices.FindOrAdd(Key.Level) += Geometry->Vertices;
+                LoadedLevelTriangles.FindOrAdd(Key.Level) += Geometry->Triangles;
+                LoadedLevelGeometryBytes.FindOrAdd(Key.Level) += Geometry->GeometryBytes;
+            }
         }
         VoxelForgeStartupTrace::RecordEvent(TEXT("steady_state"), FString::Printf(
              TEXT("\"desired_tiles\":%d,\"loaded_tiles\":%d,\"collision_ready_tiles\":%d,"
@@ -3635,8 +3687,22 @@ void AVoxelWorld::Tick(float DeltaTime)
                 *FString::SanitizeFloat(TileExtentMetres),
                 *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
                 Settings && Level > VF_MaxMarchingCubesLevel(Settings) ? 1 : 0));
+            VoxelForgeStartupTrace::RecordEvent(TEXT("steady_loaded_level"), FString::Printf(
+                TEXT("\"level\":%d,\"tiles\":%d,\"vertices\":%llu,\"triangles\":%llu,\"geometry_bytes\":%llu"),
+                Level, LoadedLevelCounts.FindRef(Level),
+                static_cast<unsigned long long>(LoadedLevelVertices.FindRef(Level)),
+                static_cast<unsigned long long>(LoadedLevelTriangles.FindRef(Level)),
+                static_cast<unsigned long long>(LoadedLevelGeometryBytes.FindRef(Level))));
         }
+        const bool bExitOnSteady = bHeadlessStreamingTestExitOnSteady;
         VoxelForgeStartupTrace::Finish(TEXT("desired_set_satisfied_and_queue_drained"));
+        if (bExitOnSteady && !bHeadlessStreamingTestExitRequested)
+        {
+            bHeadlessStreamingTestExitRequested = true;
+            UE_LOG(LogTemp, Display,
+                TEXT("[VoxelForgeStreamingTest] steady_exit_requested=1"));
+            FPlatformMisc::RequestExit(false, TEXT("VoxelForge steady streaming measurement complete"));
+        }
     }
 
     // Complete the one-shot diagnostic request only after the player's level-0 centre tile is
@@ -3745,12 +3811,17 @@ void AVoxelWorld::Tick(float DeltaTime)
                 >= static_cast<double>(TestCeilingCaptureDelaySeconds))
         {
             bTestCeilingCaptureRequested = true;
-            const bool bExecSucceeded = GEngine
-                && GEngine->Exec(World, TEXT("HighResShot 1"));
+            // UEngine::Exec is not routed through the game viewport in the command-line game
+            // target, so HighResShot returns false there even with a live render viewport. Call
+            // the viewport API directly; it schedules the same one-frame high-res capture.
+            const bool bCaptureAccepted = GEngine
+                && GEngine->GameViewport
+                && GEngine->GameViewport->GetGameViewport()
+                && GEngine->GameViewport->GetGameViewport()->TakeHighResScreenShot();
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeTestCeiling] capture_requested=%d elapsed_s=%.3f "
                      "visible_tiles=%llu triangles=%llu"),
-                bExecSucceeded ? 1 : 0,
+                bCaptureAccepted ? 1 : 0,
                 FPlatformTime::Seconds() - TestCeilingViewBeginSeconds,
                 static_cast<unsigned long long>(AppliedVisibleTileCount),
                 static_cast<unsigned long long>(AppliedTriangleCount));
@@ -4680,6 +4751,7 @@ void AVoxelWorld::HandleTileCollisionCookComplete(
         // A failed/ignored current cook is not a loaded guarantee. Leaving the tile unloaded makes
         // the normal submit loop retry it while the pawn remains gated.
         LoadedTiles.Remove(Tile);
+        LoadedTileGeometry.Remove(Tile);
         bAllChunksLoaded = false;
     }
 
@@ -4927,7 +4999,9 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 Sample.Verdict = Result.ClassifyVerdict;
                 Sample.bSealedSolidProof = Result.bSealedSolidProof;
                 Sample.bEmpty = bResultEmpty;
+                Sample.Vertices = Result.NumVertices;
                 Sample.Triangles = Result.NumTriangles;
+                Sample.GeometryBytes = Result.GeometryBytes;
                 Sample.RequestToApplySeconds = RequestToApply;
                 Sample.WorkerQueueSeconds = WorkerQueueSeconds;
                 Sample.ResultQueueSeconds = ResultQueueSeconds;
@@ -4992,6 +5066,7 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
                 FPlatformTime::Cycles64() - EmptyReleaseStartCycles));
         }
         LoadedTiles.Add(Result.Tile);
+        LoadedTileGeometry.Remove(Result.Tile);
         LogTileApplied();
         if (Result.Tile.Level == 0 && Result.bRecordStreamingLatency)
         {
@@ -5014,11 +5089,16 @@ bool AVoxelWorld::ApplyTileResult(FChunkResult& Result)
         CollisionSolidTiles.Remove(Result.Tile);
         PendingCollisionCooks.Remove(Result.Tile);
         LoadedTiles.Remove(Result.Tile);
+        LoadedTileGeometry.Remove(Result.Tile);
         bAllChunksLoaded = false;
         LogTileApplied();
         return false;
     }
     LoadedTiles.Add(Result.Tile);
+    LoadedTileGeometry.Add(Result.Tile, FLoadedTileGeometryStats{
+        static_cast<uint64>(FMath::Max(0, Result.NumVertices)),
+        static_cast<uint64>(FMath::Max(0, Result.NumTriangles)),
+        Result.GeometryBytes});
     LogTileApplied();
     return true;
 }
@@ -6503,6 +6583,12 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         VoxelDensityProfile::FScopedTimer RuntimeStreamTimer(
             VoxelDensityProfile::EBucket::RuntimeStreamBuilding);
         BuildTileStreamSet(*Result.Streams, MeshData);
+        Result.NumVertices = MeshData.Vertices.Num();
+        Result.GeometryBytes = 0;
+        Result.Streams->ForEach([&](const RealtimeMesh::FRealtimeMeshStream& Stream)
+        {
+            Result.GeometryBytes += static_cast<uint64>(Stream.GetAllocatedSize());
+        });
         StreamSeconds = bMeasureTile ? FPlatformTime::Seconds() - StreamStartSeconds : 0.0;
         if (ShouldAbortWork(ObsoleteFlag))
         {
@@ -6651,6 +6737,7 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
         TileComponents.Remove(Tile);
     }
     LoadedTiles.Remove(Tile);
+    LoadedTileGeometry.Remove(Tile);
     TransitionHold.Remove(Tile);   // couvre aussi le settled cull (qui ne tient pas la hold à jour)
 }
 

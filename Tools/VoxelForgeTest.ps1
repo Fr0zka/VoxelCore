@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'parity')]
+    [ValidateSet('canonical', 'owner', 'probe', 'perf', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'parity', 'horizon', 'horizon-render', 'determinism')]
     [string]$Scenario = 'canonical',
     [switch]$Build,
     [ValidateSet('owner', 'default')]
@@ -8,7 +8,12 @@ param(
     [hashtable]$Cvars = @{},
     [string]$TestFilter,
     [string]$Out,
-    [string]$Label
+    [string]$Label,
+    [ValidateRange(0, 8)]
+    [int]$HorizonLevel = 5,
+    [ValidateRange(1, 100000)]
+    [int]$HorizonRenderDistanceChunks = 768,
+    [string]$SharedDDC
 )
 
 # One guarded entry point for all VoxelForge measurements.  It intentionally keeps the Unreal
@@ -28,7 +33,7 @@ $EngineRoot = 'E:\Program Files\Epic Games\UE_5.7'
 $EditorExe = Join-Path $EngineRoot 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 $UbtDll = Join-Path $EngineRoot 'Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll'
 $LaunchTimeoutSeconds = 1800
-$UnrealPrivateMemoryLimitBytes = 6GB
+$UnrealPrivateMemoryLimitBytes = 8GB
 # The VoxelForge category includes two late, several-minute op-stack sweeps. They remain in
 # the suite; when the serialized aggregate launch reaches this 30-minute guard, validate those
 # named tests with -TestFilter so every test still runs under the standing launch limit.
@@ -44,6 +49,15 @@ $BuildRecord = [ordered]@{ requested = [bool]$Build; status = 'not_requested' }
 $AssetEvidence = @()
 $CommandletMetrics = [ordered]@{}
 $GameMetrics = [ordered]@{}
+$HorizonMetrics = [ordered]@{
+    requested = $Scenario -in @('horizon', 'horizon-render')
+    status = 'not_run'
+    level = $HorizonLevel
+    render_distance_chunks = $HorizonRenderDistanceChunks
+    far_sheet_ring = $false
+}
+$HorizonRenderMetrics = [ordered]@{ requested = $Scenario -eq 'horizon-render'; status = 'not_run' }
+$DeterminismEvidence = [ordered]@{ requested = $Scenario -eq 'determinism'; status = 'not_run' }
 $SurfaceFallMetrics = [ordered]@{
     requested = $Scenario -eq 'surface-fall' -or
         ($Scenario -eq 'tests' -and [string]::IsNullOrWhiteSpace($TestFilter))
@@ -66,6 +80,7 @@ $LocalAppDataRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationDat
 $RunRoot = $null
 $ResultPath = $null
 $SummaryPath = $null
+$DDCPath = $null
 
 function Add-Failure([string]$Reason) {
     if ([string]::IsNullOrWhiteSpace($Reason)) { return }
@@ -485,7 +500,7 @@ function Sync-OwnerAssets {
         $null = Copy-Item -LiteralPath $source -Destination $target -Force -PassThru
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'horizon', 'horizon-render', 'determinism')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -533,7 +548,7 @@ function Get-AssetEvidence {
         $target = Join-Path $HostRoot "Content\VoxelForge\$assetName.uasset"
         [void]$rows.Add([ordered]@{
             name = $assetName
-            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress')
+            used_by_scenario = $Scenario -in @('owner', 'probe', 'parity', 'tests', 'surface-fall', 'crossing', 'gate-stress', 'horizon', 'horizon-render', 'determinism')
             source_path = $source
             source_sha256 = Get-Sha256 $source
             staged_path = $target
@@ -558,13 +573,19 @@ function Merge-Cvars([System.Collections.IDictionary]$Base) {
     return $merged
 }
 
-function New-CommonArguments([string]$Kind, [string]$LogPath, $CvarMap) {
+function New-CommonArguments([string]$Kind, [string]$LogPath, $CvarMap, [bool]$EnableRender = $false) {
     $safeLabel = ($Label -replace '[^A-Za-z0-9_.-]', '_')
     $args = [System.Collections.Generic.List[string]]::new()
     # Quoting the whole -project= token is intentional: this is the failure mode that used to
     # swallow every argument after "Projet Unreal".
     [void]$args.Add(('-project="{0}"' -f $HostProject))
-    [void]$args.Add('-nullrhi')
+    if ($EnableRender) {
+        [void]$args.Add('-RenderOffscreen')
+        [void]$args.Add('-ResX=1280')
+        [void]$args.Add('-ResY=720')
+    } else {
+        [void]$args.Add('-nullrhi')
+    }
     [void]$args.Add('-DDC-ForceMemoryCache')
     [void]$args.Add('-unattended')
     [void]$args.Add('-nop4')
@@ -580,7 +601,7 @@ function New-CommonArguments([string]$Kind, [string]$LogPath, $CvarMap) {
     [void]$args.Add(('-userdir="{0}"' -f (Join-Path $RunRoot 'User')))
     [void]$args.Add(('-ZenDataPath="{0}"' -f (Join-Path $RunRoot 'ZenData')))
     [void]$args.Add('-ddc=NoZenLocalFallback')
-    [void]$args.Add(('-LocalDataCachePath="{0}"' -f (Join-Path $RunRoot 'DDC')))
+    [void]$args.Add(('-LocalDataCachePath="{0}"' -f $DDCPath))
     [void]$args.Add(('-abslog="{0}"' -f $LogPath))
     if ($Kind -eq 'commandlet') {
         [void]$args.Add('-run=VoxelForgeExplore')
@@ -718,6 +739,212 @@ function Get-StreamingMetrics([string]$LogPath) {
         generation = [ordered]@{ p50 = $metrics['generation_p50']; p95 = $metrics['generation_p95'] }
     }
     return $metrics
+}
+
+function Get-HorizonMetrics([string]$TracePath, $Ledger, $LatencyMetrics) {
+    $metrics = [ordered]@{
+        status = 'missing'
+        trace = $TracePath
+        desired_tiles_by_level = [ordered]@{}
+        loaded_tiles_by_level = [ordered]@{}
+        vertices_by_level = [ordered]@{}
+        triangles_by_level = [ordered]@{}
+        geometry_memory_bytes_by_level = [ordered]@{}
+        geometry_memory_mib_by_level = [ordered]@{}
+        desired_tiles_total = 0
+        loaded_tiles_total = 0
+        vertices_total = 0
+        triangles_total = 0
+        geometry_memory_bytes_total = 0
+        geometry_memory_mib_total = 0.0
+        worker_generation_seconds = if ($null -ne $LatencyMetrics) {
+            Get-JsonValue $LatencyMetrics 'worker_generation_sum_s' $null
+        } else { $null }
+        settled_trace_seconds = $null
+        trace_summary_wall_seconds = $null
+        process_wall_seconds = $null
+        peak_private_bytes = if ($null -ne $Ledger) {
+            [int64](Get-JsonValue $Ledger 'peak_private_bytes' 0)
+        } else { 0L }
+        peak_private_gib = 0.0
+        trace_records_seen = $null
+        trace_records_written = $null
+        trace_records_suppressed = $null
+    }
+    $metrics.peak_private_gib = [Math]::Round($metrics.peak_private_bytes / 1GB, 3)
+
+    if (-not (Test-Path -LiteralPath $TracePath -PathType Leaf)) { return $metrics }
+    $events = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in @(Get-Content -LiteralPath $TracePath -ErrorAction SilentlyContinue)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { [void]$events.Add(($line | ConvertFrom-Json -ErrorAction Stop)) } catch { }
+    }
+    $steady = @($events | Where-Object { [string](Get-JsonValue $_ 'type' '') -eq 'steady_state' } | Select-Object -Last 1)
+    $summary = @($events | Where-Object { [string](Get-JsonValue $_ 'type' '') -eq 'summary' } | Select-Object -Last 1)
+    $desiredEvents = @($events | Where-Object { [string](Get-JsonValue $_ 'type' '') -eq 'steady_desired_level' })
+    $loadedEvents = @($events | Where-Object { [string](Get-JsonValue $_ 'type' '') -eq 'steady_loaded_level' })
+    if ($steady.Count -eq 0 -or $summary.Count -eq 0 -or $desiredEvents.Count -eq 0) {
+        return $metrics
+    }
+
+    foreach ($event in $desiredEvents) {
+        $level = [string][int](Get-JsonValue $event 'level' -1)
+        $metrics.desired_tiles_by_level[$level] = [int](Get-JsonValue $event 'tiles' 0)
+    }
+    foreach ($event in $loadedEvents) {
+        $level = [string][int](Get-JsonValue $event 'level' -1)
+        $metrics.loaded_tiles_by_level[$level] = [int](Get-JsonValue $event 'tiles' 0)
+        $metrics.vertices_by_level[$level] = [int64](Get-JsonValue $event 'vertices' 0)
+        $metrics.triangles_by_level[$level] = [int64](Get-JsonValue $event 'triangles' 0)
+        $bytes = [int64](Get-JsonValue $event 'geometry_bytes' 0)
+        $metrics.geometry_memory_bytes_by_level[$level] = $bytes
+        $metrics.geometry_memory_mib_by_level[$level] = [Math]::Round($bytes / 1MB, 3)
+    }
+    foreach ($value in $metrics.desired_tiles_by_level.Values) { $metrics.desired_tiles_total += [int64]$value }
+    foreach ($value in $metrics.loaded_tiles_by_level.Values) { $metrics.loaded_tiles_total += [int64]$value }
+    foreach ($value in $metrics.vertices_by_level.Values) { $metrics.vertices_total += [int64]$value }
+    foreach ($value in $metrics.triangles_by_level.Values) { $metrics.triangles_total += [int64]$value }
+    foreach ($value in $metrics.geometry_memory_bytes_by_level.Values) { $metrics.geometry_memory_bytes_total += [int64]$value }
+    $metrics.geometry_memory_mib_total = [Math]::Round($metrics.geometry_memory_bytes_total / 1MB, 3)
+    $metrics.settled_trace_seconds = [double](Get-JsonValue $steady[0] 't_s' 0.0)
+    $metrics.trace_summary_wall_seconds = [double](Get-JsonValue $summary[0] 'wall_s' 0.0)
+    $metrics.trace_records_seen = [int](Get-JsonValue $summary[0] 'tile_records_seen' 0)
+    $metrics.trace_records_written = [int](Get-JsonValue $summary[0] 'tile_records_written' 0)
+    $metrics.trace_records_suppressed = [int](Get-JsonValue $summary[0] 'tile_records_suppressed' 0)
+    if ($null -ne $Ledger) {
+        $started = [datetime]::Parse([string](Get-JsonValue $Ledger 'started_utc' ''))
+        $ended = [datetime]::Parse([string](Get-JsonValue $Ledger 'ended_utc' ''))
+        $metrics.process_wall_seconds = [Math]::Round(($ended.ToUniversalTime() - $started.ToUniversalTime()).TotalSeconds, 3)
+    }
+    $metrics.status = 'ok'
+    return $metrics
+}
+
+function Get-HorizonRenderMetrics($Ledger, [string]$LogPath) {
+    $metrics = [ordered]@{
+        status = 'failed'
+        log = $LogPath
+        capture_requested = $null
+        capture_elapsed_seconds = $null
+        capture_visible_tiles = $null
+        capture_triangles = $null
+        images = @()
+    }
+    $lines = @(Select-String -LiteralPath $LogPath -Pattern '\[VoxelForgeTestCeiling\] capture_requested=' -ErrorAction SilentlyContinue)
+    if ($lines.Count -gt 0) {
+        $line = [string]$lines[-1].Line
+        $metrics.raw = $line
+        foreach ($key in @('capture_requested', 'elapsed_s', 'visible_tiles', 'triangles')) {
+            $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
+            if ($match.Success) {
+                if ($key -eq 'elapsed_s') { $metrics.capture_elapsed_seconds = [double]$match.Groups['v'].Value }
+                elseif ($key -eq 'visible_tiles') { $metrics.capture_visible_tiles = [int64]$match.Groups['v'].Value }
+                elseif ($key -eq 'triangles') { $metrics.capture_triangles = [int64]$match.Groups['v'].Value }
+                else { $metrics.capture_requested = [int]$match.Groups['v'].Value }
+            }
+        }
+    }
+    $started = if ($null -ne $Ledger) {
+        [datetime]::Parse([string](Get-JsonValue $Ledger 'started_utc' ''))
+    } else { [datetime]::MinValue }
+    $roots = @(
+        (Join-Path $HostRoot 'Saved'),
+        $RunRoot,
+        (Join-Path $RunRoot 'User'))
+    $images = [System.Collections.Generic.List[object]]::new()
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($image in @(Get-ChildItem -LiteralPath $root -Filter '*.png' -File -Recurse -ErrorAction SilentlyContinue)) {
+            if ($image.LastWriteTimeUtc -lt $started.ToUniversalTime().AddSeconds(-2)) { continue }
+            [void]$images.Add([ordered]@{
+                path = $image.FullName
+                bytes = [int64]$image.Length
+                modified_utc = $image.LastWriteTimeUtc.ToString('o')
+            })
+        }
+    }
+    $metrics.images = @($images | Sort-Object path -Unique)
+    if ($metrics.capture_requested -eq 1 -and $metrics.images.Count -gt 0) {
+        $metrics.status = 'passed'
+    } elseif ($null -eq $Ledger -or (Get-JsonValue $Ledger 'status' 'failed') -ne 'passed') {
+        $metrics.status = 'not_run'
+    }
+    return $metrics
+}
+
+function Compare-DeterminismDumps([string]$DefaultPath, [string]$CrtFma3OffPath) {
+    $defaultJson = Read-JsonFile $DefaultPath
+    $fmaJson = Read-JsonFile $CrtFma3OffPath
+    $evidence = [ordered]@{
+        status = 'failed'
+        default_dump = $DefaultPath
+        crt_fma3_off_dump = $CrtFma3OffPath
+        default_record_count = 0
+        crt_fma3_off_record_count = 0
+        compared_tile_count = 0
+        first_differences = @()
+    }
+    if ($null -eq $defaultJson -or $null -eq $fmaJson) {
+        $evidence.reason = 'one or both tile hash dumps are missing'
+        return $evidence
+    }
+    $defaultRecords = @((Get-JsonValue $defaultJson 'records' @()))
+    $fmaRecords = @((Get-JsonValue $fmaJson 'records' @()))
+    $evidence.default_record_count = $defaultRecords.Count
+    $evidence.crt_fma3_off_record_count = $fmaRecords.Count
+    $defaultByKey = @{}
+    $fmaByKey = @{}
+    foreach ($record in $defaultRecords) {
+        $key = "$($record.tile_x):$($record.tile_y):$($record.tile_z):$($record.level)"
+        $defaultByKey[$key] = $record
+    }
+    foreach ($record in $fmaRecords) {
+        $key = "$($record.tile_x):$($record.tile_y):$($record.tile_z):$($record.level)"
+        $fmaByKey[$key] = $record
+    }
+    $differences = [System.Collections.Generic.List[object]]::new()
+    $keys = @($defaultByKey.Keys) + @($fmaByKey.Keys) | Sort-Object -Unique
+    foreach ($key in $keys) {
+        if (-not $defaultByKey.ContainsKey($key)) {
+            [void]$differences.Add([ordered]@{ tile = $key; reason = 'missing_from_default' })
+            continue
+        }
+        if (-not $fmaByKey.ContainsKey($key)) {
+            [void]$differences.Add([ordered]@{ tile = $key; reason = 'missing_from_crt_fma3_off' })
+            continue
+        }
+        $left = $defaultByKey[$key]
+        $right = $fmaByKey[$key]
+        foreach ($property in @('origin_x_voxels', 'origin_y_voxels', 'origin_z_voxels',
+                                'step', 'cells', 'band_chunk_lo', 'band_chunk_hi',
+                                'sheet_tile', 'empty', 'triangle_count', 'geometry_hash')) {
+            if ([string](Get-JsonValue $left $property '') -ne [string](Get-JsonValue $right $property '')) {
+                [void]$differences.Add([ordered]@{
+                    tile = $key
+                    reason = "property_mismatch:$property"
+                    default = Get-JsonValue $left $property $null
+                    crt_fma3_off = Get-JsonValue $right $property $null
+                })
+                break
+            }
+        }
+    }
+    $evidence.compared_tile_count = [Math]::Min($defaultByKey.Count, $fmaByKey.Count)
+    $evidence.first_differences = @($differences | Select-Object -First 10)
+    $leftConfig = Get-JsonValue $defaultJson 'runtime_config' $null
+    $rightConfig = Get-JsonValue $fmaJson 'runtime_config' $null
+    $evidence.runtime_config_match = (ConvertTo-CompactJson $leftConfig) -eq (ConvertTo-CompactJson $rightConfig)
+    $evidence.default_runtime_config = $leftConfig
+    $evidence.crt_fma3_off_runtime_config = $rightConfig
+    if ($differences.Count -eq 0 -and $evidence.runtime_config_match -and
+        $defaultByKey.Count -eq $fmaByKey.Count) {
+        $evidence.status = 'passed'
+    } else {
+        $evidence.reason = if ($differences.Count -gt 0) { 'per-tile geometry differs' }
+            elseif (-not $evidence.runtime_config_match) { 'runtime configuration differs' }
+            else { 'tile record counts differ' }
+    }
+    return $evidence
 }
 
 function Get-SurfaceFallMetrics([string]$LogPath) {
@@ -926,7 +1153,17 @@ try {
     Ensure-Directory (Join-Path $RunRoot 'Logs')
     Ensure-Directory (Join-Path $RunRoot 'User')
     Ensure-Directory (Join-Path $RunRoot 'ZenData')
-    Ensure-Directory (Join-Path $RunRoot 'DDC')
+    $DDCPath = Join-Path $RunRoot 'DDC'
+    if (-not [string]::IsNullOrWhiteSpace($SharedDDC)) {
+        if (-not [IO.Path]::IsPathRooted($SharedDDC)) {
+            throw "-SharedDDC must be an absolute path: $SharedDDC"
+        }
+        $DDCPath = Get-FullPath $SharedDDC
+        if (-not (Test-UnderPath $DDCPath (Join-Path $PluginRoot 'Saved'))) {
+            throw "-SharedDDC must stay under the plugin Saved directory: $DDCPath"
+        }
+    }
+    Ensure-Directory $DDCPath
     $localBefore = Get-StateSnapshot $LocalAppDataRoot
 
     foreach ($required in @($EditorExe, $UbtDll, $HostProject, $ProjectFile)) {
@@ -944,7 +1181,7 @@ try {
         $buildStdout = Join-Path $RunRoot 'Logs\build.stdout.log'
         $buildError = Join-Path $RunRoot 'Logs\build.err.log'
         $buildArgs = @(('"{0}"' -f $UbtDll), 'UnrealEditor', 'Win64', 'Development', ('-Project="{0}"' -f $HostProject),
-            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', '-MaxParallelActions=2',
+            '-WaitMutex', '-FromMsBuild', '-architecture=x64', '-NoUBA', '-MaxParallelActions=4',
             ('-Log="{0}"' -f $buildLog))
         $BuildRecord = Invoke-BuildProcess $buildArgs $buildLog $buildError $buildStdout
         if ($BuildRecord.status -ne 'passed') { Add-Failure "staged build $($BuildRecord.status)" }
@@ -1016,6 +1253,94 @@ try {
             $commandletLedger = Invoke-UnrealLaunch 'probe-commandlet' $args `
                 (Join-Path $RunRoot 'Logs\probe.log') (Join-Path $RunRoot 'Logs\probe.stdout.log') (Join-Path $RunRoot 'Logs\probe.stderr.log')
             $CommandletMetrics = Get-CommandletMetrics $commandletOut 'owner probe'
+        }
+        'horizon' {
+            $tracePath = Join-Path $RunRoot 'horizon_trace.jsonl'
+            $baseCvars['voxel.TestRenderDistanceChunks'] = $HorizonRenderDistanceChunks
+            $baseCvars['voxel.TestMaxClipLevel'] = $HorizonLevel
+            $baseCvars['voxel.TestFarSheetRing'] = 0
+            $baseCvars['voxel.StartupTraceFile'] = $tracePath
+            $baseCvars['voxel.StartupTraceMaxTiles'] = 16384
+            $baseCvars['voxel.TestExitOnSteady'] = 1
+            $baseCvars['voxel.OuterClassifierMode'] = 0
+            $args = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\horizon.log') (Merge-Cvars $baseCvars)
+            $gameLedger = Invoke-UnrealLaunch "horizon-l$($HorizonLevel)-$($HorizonRenderDistanceChunks)-game" $args `
+                (Join-Path $RunRoot 'Logs\horizon.log') (Join-Path $RunRoot 'Logs\horizon.stdout.log') (Join-Path $RunRoot 'Logs\horizon.stderr.log')
+            $GameMetrics = Get-StreamingMetrics (Join-Path $RunRoot 'Logs\horizon.log')
+            $HorizonMetrics = Get-HorizonMetrics $tracePath $gameLedger $GameMetrics
+            if ($HorizonMetrics.status -ne 'ok') {
+                Add-Failure "horizon measurement trace did not settle: $($HorizonMetrics.status)"
+            }
+        }
+        'horizon-render' {
+            $tracePath = Join-Path $RunRoot 'horizon_render_trace.jsonl'
+            $baseCvars['voxel.TestRenderDistanceChunks'] = $HorizonRenderDistanceChunks
+            $baseCvars['voxel.TestMaxClipLevel'] = $HorizonLevel
+            $baseCvars['voxel.TestFarSheetRing'] = 0
+            $baseCvars['voxel.StartupTraceFile'] = $tracePath
+            $baseCvars['voxel.StartupTraceMaxTiles'] = 16384
+            $baseCvars['voxel.TestCeilingView'] = 1
+            $baseCvars['voxel.TestCeilingCaptureDelaySeconds'] = 90
+            $baseCvars['voxel.TestExitSeconds'] = 180
+            $baseCvars['voxel.OuterClassifierMode'] = 0
+            $renderLog = Join-Path $RunRoot 'Logs\horizon-render.log'
+            $args = New-CommonArguments 'game' $renderLog (Merge-Cvars $baseCvars) $true
+            $gameLedger = Invoke-UnrealLaunch "horizon-l$($HorizonLevel)-$($HorizonRenderDistanceChunks)-render" $args `
+                $renderLog (Join-Path $RunRoot 'Logs\horizon-render.stdout.log') (Join-Path $RunRoot 'Logs\horizon-render.stderr.log')
+            $GameMetrics = Get-StreamingMetrics $renderLog
+            $HorizonMetrics = Get-HorizonMetrics $tracePath $gameLedger $GameMetrics
+            $HorizonRenderMetrics = Get-HorizonRenderMetrics $gameLedger $renderLog
+            if ($HorizonMetrics.status -ne 'ok') {
+                Add-Failure "horizon render trace did not settle: $($HorizonMetrics.status)"
+            }
+            if ($HorizonRenderMetrics.status -ne 'passed') {
+                Add-Failure "horizon render did not produce a capture: $($HorizonRenderMetrics.status)"
+            }
+        }
+        'determinism' {
+            $defaultDump = Join-Path $RunRoot 'tile_hashes_default.json'
+            $crtFma3OffDump = Join-Path $RunRoot 'tile_hashes_crt_fma3_off.json'
+            $defaultTrace = Join-Path $RunRoot 'determinism_default_trace.jsonl'
+            $crtFma3OffTrace = Join-Path $RunRoot 'determinism_crt_fma3_off_trace.jsonl'
+            $determinismBase = [ordered]@{
+                'voxel.TestRenderDistanceChunks' = $HorizonRenderDistanceChunks
+                'voxel.TestMaxClipLevel' = $HorizonLevel
+                'voxel.TestFarSheetRing' = 0
+                'voxel.TestExitOnSteady' = 1
+                'voxel.StartupTraceMaxTiles' = 16384
+                'voxel.OuterClassifierMode' = 0
+            }
+            $defaultCvars = [ordered]@{}
+            foreach ($key in $determinismBase.Keys) { $defaultCvars[$key] = $determinismBase[$key] }
+            $defaultCvars['voxel.StartupTraceFile'] = $defaultTrace
+            $defaultCvars['voxel.TileHashDump'] = $defaultDump
+            $defaultLog = Join-Path $RunRoot 'Logs\determinism-default.log'
+            $defaultArgs = New-CommonArguments 'game' $defaultLog (Merge-Cvars $defaultCvars)
+            $defaultLedger = Invoke-UnrealLaunch "determinism-default-l$($HorizonLevel)-$($HorizonRenderDistanceChunks)" $defaultArgs `
+                $defaultLog (Join-Path $RunRoot 'Logs\determinism-default.stdout.log') (Join-Path $RunRoot 'Logs\determinism-default.stderr.log')
+            $defaultMetrics = Get-HorizonMetrics $defaultTrace $defaultLedger (Get-StreamingMetrics $defaultLog)
+
+            $crtFma3OffCvars = [ordered]@{}
+            foreach ($key in $determinismBase.Keys) { $crtFma3OffCvars[$key] = $determinismBase[$key] }
+            $crtFma3OffCvars['voxel.StartupTraceFile'] = $crtFma3OffTrace
+            $crtFma3OffCvars['voxel.TileHashDump'] = $crtFma3OffDump
+            $crtFma3OffCvars['voxel.CrtFma3'] = 0
+            $crtFma3OffLog = Join-Path $RunRoot 'Logs\determinism-crt-fma3-off.log'
+            $crtFma3OffArgs = New-CommonArguments 'game' $crtFma3OffLog (Merge-Cvars $crtFma3OffCvars)
+            $crtFma3OffLedger = Invoke-UnrealLaunch "determinism-crt-fma3-off-l$($HorizonLevel)-$($HorizonRenderDistanceChunks)" $crtFma3OffArgs `
+                $crtFma3OffLog (Join-Path $RunRoot 'Logs\determinism-crt-fma3-off.stdout.log') (Join-Path $RunRoot 'Logs\determinism-crt-fma3-off.stderr.log')
+            $crtFma3OffMetrics = Get-HorizonMetrics $crtFma3OffTrace $crtFma3OffLedger (Get-StreamingMetrics $crtFma3OffLog)
+
+            $DeterminismEvidence = Compare-DeterminismDumps $defaultDump $crtFma3OffDump
+            $DeterminismEvidence.level = $HorizonLevel
+            $DeterminismEvidence.render_distance_chunks = $HorizonRenderDistanceChunks
+            $DeterminismEvidence.far_sheet_ring = $false
+            $DeterminismEvidence.default_measurement = $defaultMetrics
+            $DeterminismEvidence.crt_fma3_off_measurement = $crtFma3OffMetrics
+            $GameMetrics = $crtFma3OffMetrics
+            if ($DeterminismEvidence.status -ne 'passed') {
+                Add-Failure "determinism comparison failed: $(Get-JsonValue $DeterminismEvidence 'reason' 'unknown difference')"
+            }
         }
         'perf' {
             $baseCvars['voxel.TestExitSeconds'] = 15
@@ -1201,6 +1526,7 @@ $result = [ordered]@{
     scenario = $Scenario
     label = $Label
     run_directory = $RunRoot
+    ddc_path = $DDCPath
     project = $ProjectFile
     staged_host = $HostProject
     assets_mode = $Assets
@@ -1220,6 +1546,9 @@ $result = [ordered]@{
     probe_amplitudes = if ($CommandletMetrics.Contains('probe_amplitudes')) { $CommandletMetrics.probe_amplitudes } else { [ordered]@{} }
     commandlet = $CommandletMetrics
     game = $GameMetrics
+    horizon = $HorizonMetrics
+    horizon_render = $HorizonRenderMetrics
+    determinism = $DeterminismEvidence
     surface_fall = $SurfaceFallMetrics
     strate_crossing = $StrateCrossingMetrics
     collision_gate_stress = $CollisionGateStressMetrics
@@ -1246,6 +1575,7 @@ try {
     [void]$summaryLines.Add("$(if ($pass) { 'PASS' } else { 'FAIL' }) $reason")
     [void]$summaryLines.Add("scenario=$Scenario label=$Label")
     [void]$summaryLines.Add("run_directory=$RunRoot")
+    [void]$summaryLines.Add("ddc_path=$DDCPath")
     [void]$summaryLines.Add("assets=$Assets")
     [void]$summaryLines.Add("canonical_baseline=$(ConvertTo-CompactJson $result.canonical_baseline)")
     [void]$summaryLines.Add("capability_counts=$(ConvertTo-CompactJson $result.capability_counts)")
@@ -1257,6 +1587,9 @@ try {
     [void]$summaryLines.Add("collision_gate_stress=$(ConvertTo-CompactJson $result.collision_gate_stress)")
     [void]$summaryLines.Add("probe_amplitudes=$(ConvertTo-CompactJson $result.probe_amplitudes)")
     [void]$summaryLines.Add("worker_seconds=$(ConvertTo-CompactJson $result.worker_seconds)")
+    [void]$summaryLines.Add("horizon=$(ConvertTo-CompactJson $result.horizon)")
+    [void]$summaryLines.Add("horizon_render=$(ConvertTo-CompactJson $result.horizon_render)")
+    [void]$summaryLines.Add("determinism=$(ConvertTo-CompactJson $result.determinism)")
     [void]$summaryLines.Add("p50_p95=$(ConvertTo-CompactJson $result.p50_p95)")
     [void]$summaryLines.Add("tests=$(ConvertTo-CompactJson $result.tests)")
     [void]$summaryLines.Add("parity=$(ConvertTo-CompactJson $result.parity)")

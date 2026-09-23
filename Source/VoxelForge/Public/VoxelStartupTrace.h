@@ -16,7 +16,9 @@ namespace VoxelForgeStartupTrace
         int32 Verdict = -1; // Mixed=0, AllSolid=1, AllAir=2, -1=not classified (sheet/early path)
         bool bSealedSolidProof = false;
         bool bEmpty = true;
+        int32 Vertices = 0;
         int32 Triangles = 0;
+        uint64 GeometryBytes = 0;
         // This is worker-result -> game-thread mesh submission. Collision readiness is a later
         // per-tile RMC completion event recorded separately as collision_ready.
         double RequestToApplySeconds = 0.0;

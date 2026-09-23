@@ -148,8 +148,9 @@ public:
 
 	// Coarsest LOD level. 0 = full-res only (no clipmap). Each level up doubles tile size &
 	// reach at ~constant cost — raise this to see much farther for cheap. (Level L step = 2^L.)
+	// Ship default: level 5, the measured horizon-distance balance at 768 chunks.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0", ClampMax = "8"))
-	int32 MaxClipLevel = 4;
+	int32 MaxClipLevel = 5;
 
 	// How many near levels mesh at FULL resolution (CHUNK_SIZE cells). Levels at or above this
 	// use the cheaper CoarseTileCells → MUCH faster gen for the far field (it's far, so the
@@ -171,9 +172,9 @@ public:
 	// cell must fit inside a strate band — level ≥7 blanks via the too-coarse skip) and buy the
 	// remaining horizon here. Cost: the extra ring is all same-level tiles — tile/draw/gen count
 	// grows with (distance / 2^MaxClipLevel)², so each MaxClipLevel step down quadruples the ring.
-	// 0 = off (natural reach, byte-identical streaming).
+	// Ship default: 768 chunks (about 6.1 km at 8 m/chunk). 0 = off (natural reach).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0"))
-	int32 RenderDistanceChunks = 0;
+	int32 RenderDistanceChunks = 768;
 
 	// F18 — the render-distance ring streams per-surface SHEETS instead of MC tiles: in an open
 	// strate the far field is exactly two heightfields (TerrainZ + sky-cap CeilSurf, both already
@@ -182,10 +183,11 @@ public:
 	// sheet spans 2^FarSheetSpanLevels MC-tile footprints per axis). Non-open strates produce
 	// empty sheets (their far ring was enclosed rock anyway). Carved features (passages, chasms,
 	// spine) don't show at sheet distance. Needs the strate band armed (StrateContentCutMinLevel
-	// active); in the inter-strate gap the sheet ring blanks until you land. Off = the ring stays
-	// MC tiles at level MaxClipLevel (pre-F18 behaviour). Only matters when RenderDistanceChunks > 0.
+	// active); in the inter-strate gap the sheet ring blanks until you land. The ship default is OFF:
+	// the ring stays real MC tiles at level MaxClipLevel (pre-F18 behaviour). Only matters when
+	// RenderDistanceChunks > 0.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap")
-	bool bFarSheetRing = true;
+	bool bFarSheetRing = false;
 
 	// Sheet tile size = MaxClipLevel + this many levels (2 → one sheet covers 4×4 MC-tile
 	// footprints → ~16× fewer far components). Sampling density stays that of the MaxClipLevel
