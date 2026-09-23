@@ -561,6 +561,9 @@ void AVoxelWorld::RegenerateAllChunks()
     if (ActiveTaskCount.load(std::memory_order_relaxed) == 0)
     {
         FChunkResult StaleResult;
+        while (CriticalProcessQueue.Dequeue(StaleResult)) {}
+        while (EditedProcessQueue.Dequeue(StaleResult)) {}
+        while (NearProcessQueue.Dequeue(StaleResult)) {}
         while (ProcessQueue.Dequeue(StaleResult)) {}
         PendingTiles.Empty();
         PendingTileCancellation.Empty();
@@ -1138,6 +1141,18 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
     // Drain any queued results
     FChunkResult Discard;
+    while (CriticalProcessQueue.Dequeue(Discard))
+    {
+        if (Discard.bObsolete) { ++ObsoleteTileAbortCount; }
+    }
+    while (EditedProcessQueue.Dequeue(Discard))
+    {
+        if (Discard.bObsolete) { ++ObsoleteTileAbortCount; }
+    }
+    while (NearProcessQueue.Dequeue(Discard))
+    {
+        if (Discard.bObsolete) { ++ObsoleteTileAbortCount; }
+    }
     while (ProcessQueue.Dequeue(Discard))
     {
         if (Discard.bObsolete) { ++ObsoleteTileAbortCount; }
@@ -3606,6 +3621,9 @@ void AVoxelWorld::Tick(float DeltaTime)
         }
     }
     ProcessPendingChunks();
+    // Near-field evidence is independent of the full horizon settle point. Record one completion
+    // for each desired-set epoch after this frame's result drain, including moving crossings.
+    RecordLOD0RingReadyIfComplete();
 
     // The startup trace stops at the same point the streaming policy declares itself settled:
     // every desired key is loaded, no generation task remains, and the game-thread result drain
@@ -4188,8 +4206,8 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
     }
 
     // Preserve the existing critical floor ordering for the next submit pass, and make an
-    // immediate game-thread request when no mesh/cook is already in flight. LoadTile's true flag
-    // is the established BackgroundHigh streaming priority.
+    // immediate game-thread request when no mesh/cook is already in flight. The critical work
+    // class uses the established BackgroundHigh streaming priority.
     CriticalDesiredTiles.Remove(SupportTile);
     CriticalDesiredTiles.Insert(SupportTile, 0);
     if (PendingTiles.Contains(SupportTile) || LoadedTiles.Contains(SupportTile))
@@ -4208,7 +4226,7 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
     }
 
     const int32 PendingBefore = PendingTiles.Num();
-    LoadTile(SupportTile, /*bHighPriority*/ true);
+    LoadTile(SupportTile, EVoxelTileWorkPriority::CollisionCritical);
     if (PendingTiles.Num() > PendingBefore)
     {
         bAllChunksLoaded = false;
@@ -4570,6 +4588,56 @@ void AVoxelWorld::RecordLOD0ReadySample(
     LOD0ReadySamples.Add(Sample);
 }
 
+void AVoxelWorld::RecordLOD0RingReadyIfComplete()
+{
+    if (!VoxelForgeStartupTrace::IsActive()
+        || DesiredEpoch == 0
+        || LastLOD0RingReadyEpoch == DesiredEpoch)
+    {
+        return;
+    }
+
+    int32 DesiredLOD0Count = 0;
+    for (const FVoxelTileKey& Key : DesiredSorted)
+    {
+        if (Key.Level != 0) continue;
+        ++DesiredLOD0Count;
+        if (!LoadedTiles.Contains(Key))
+        {
+            return;
+        }
+    }
+    if (DesiredLOD0Count == 0)
+    {
+        return;
+    }
+
+    // LoadedTiles remains populated during an async remesh, so also require that no current
+    // level-0 request is still in flight. Obsolete requests from an older desired epoch do not
+    // hold the current ring back; their cancellation/epoch fence is handled by the normal drain.
+    for (const FVoxelTileKey& Key : PendingTiles)
+    {
+        if (Key.Level == 0 && IsDesired(Key))
+        {
+            return;
+        }
+    }
+
+    LastLOD0RingReadyEpoch = DesiredEpoch;
+    const uint64 ReadyCycles = FPlatformTime::Cycles64();
+    const double DurationSeconds = DesiredEpochStartCycles != 0
+        && ReadyCycles >= DesiredEpochStartCycles
+        ? FPlatformTime::ToSeconds64(ReadyCycles - DesiredEpochStartCycles)
+        : 0.0;
+    VoxelForgeStartupTrace::RecordEvent(TEXT("lod0_ring_ready"), FString::Printf(
+        TEXT("\"desired_epoch\":%u,\"center_chunk\":[%d,%d,%d],\"lod0_tiles\":%d,"
+             "\"duration_s\":%s"),
+        DesiredEpoch,
+        DesiredEpochCenterChunk.X, DesiredEpochCenterChunk.Y, DesiredEpochCenterChunk.Z,
+        DesiredLOD0Count,
+        *FString::SanitizeFloat(DurationSeconds)));
+}
+
 void AVoxelWorld::LogStreamingLatencySummary() const
 {
     TArray<double> RequestToReady;
@@ -4854,7 +4922,16 @@ void AVoxelWorld::ProcessPendingChunks()
     int32 ResultsDrained = 0;
     bool bTimeBudgetHit = false;
     FChunkResult DequeuedChunk;
-    while (ProcessQueue.Dequeue(DequeuedChunk))
+    const auto DequeueNextResult = [&]() -> bool
+    {
+        // Mirror the admission order. A horizon result that completed earlier must not consume
+        // the game-thread apply budget ahead of collision support, an edit, or ordinary LOD0.
+        return CriticalProcessQueue.Dequeue(DequeuedChunk)
+            || EditedProcessQueue.Dequeue(DequeuedChunk)
+            || NearProcessQueue.Dequeue(DequeuedChunk)
+            || ProcessQueue.Dequeue(DequeuedChunk);
+    };
+    while (DequeueNextResult())
     {
         ++ResultsDrained;
         const TSharedPtr<FVoxelTileCancellationState, ESPMode::ThreadSafe> Cancellation =
@@ -5239,6 +5316,8 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
     CollisionOnlyTiles.Reset();   // §9.4 — rebuilt by AddAnchorDesiredTiles below
     ++DesiredStamp;   // les upserts ci-dessous marquent le crossing courant
     ++DesiredEpoch;
+    DesiredEpochStartCycles = FPlatformTime::Cycles64();
+    DesiredEpochCenterChunk = Center;
 
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
     const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
@@ -5380,6 +5459,18 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
             DesiredSorted.RemoveAt(ExistingIndex, 1, EAllowShrinking::No);
             DesiredSorted.Insert(Key, 0);
         }
+    }
+
+    if (VoxelForgeStartupTrace::IsActive())
+    {
+        int32 LOD0Count = 0;
+        for (const FVoxelTileKey& Key : DesiredSorted)
+        {
+            if (Key.Level == 0) ++LOD0Count;
+        }
+        VoxelForgeStartupTrace::RecordEvent(TEXT("lod0_ring_begin"), FString::Printf(
+            TEXT("\"desired_epoch\":%u,\"center_chunk\":[%d,%d,%d],\"lod0_tiles\":%d"),
+            DesiredEpoch, Center.X, Center.Y, Center.Z, LOD0Count));
     }
 }
 
@@ -5550,11 +5641,21 @@ int32 AVoxelWorld::GetMaxConcurrentTasks() const
     return FMath::Clamp(Asset, 1, CoreCap);
 }
 
+int32 AVoxelWorld::GetNearTaskReserve(int32 MaxTasks) const
+{
+    const int32 AuthoredReserve = Settings ? Settings->NearTaskReserve : 4;
+    // Keep at least one slot usable by coarse work even when an authored reserve is larger than
+    // the effective task budget. A one-slot budget has no meaningful reservation to make.
+    return FMath::Clamp(AuthoredReserve, 0, FMath::Max(0, MaxTasks - 1));
+}
+
 void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APawn* PlayerPawn,
                                              const FVector& PlayerHeading)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_UpdateChunks);
     const int32 MaxTasks = GetMaxConcurrentTasks();
+    const int32 NearTaskReserve = GetNearTaskReserve(MaxTasks);
+    const int32 CoarseTaskCap = FMath::Max(1, MaxTasks - NearTaskReserve);
     if (GVoxelForgeProfileTileGeneration != 0
         && !GVoxelForgeStreamingBudgetReported)
     {
@@ -5566,12 +5667,15 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeStreamingBudget] logical_cores=%d automatic_core_cap=%d "
                  "authored_core_cap=%d asset_task_cap=%d effective_generation_cap=%d "
+                 "near_task_reserve=%d coarse_task_cap=%d "
                  "max_mesh_applies=%d max_apply_ms=%.3f max_unloads=%d"),
             LogicalCores,
             AutomaticCap,
             AuthoredCoreCap,
             AssetCap,
             MaxTasks,
+            NearTaskReserve,
+            CoarseTaskCap,
             Settings ? Settings->MaxMeshAppliesPerFrame : 4,
             Settings ? Settings->MaxMeshApplyMilliseconds : 2.0f,
             Settings ? Settings->MaxUnloadsPerFrame : 6);
@@ -5885,8 +5989,9 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
     }
 
     //=========================================================================
-    // Submit pending work (budgeted, critical floor prefix then nearest-first). Once everything desired is loaded,
-    // do the "settled" cull of the deferred LOD-transition tiles, then go idle.
+    // Submit pending work (budgeted, collision-critical -> edits -> LOD0 -> ascending coarse
+    // levels). Coarse work is capped below the full task budget so a later near request always
+    // has reserved admission; far work still runs continuously in the remaining slots.
     //=========================================================================
     if (!bAllChunksLoaded)
     {
@@ -5900,7 +6005,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         {
             if (PendingTiles.Num() >= MaxTasks) break;
             if (PendingTiles.Contains(T) || LoadedTiles.Contains(T)) continue;
-            LoadTile(T, /*bHighPriority*/ true);
+            LoadTile(T, EVoxelTileWorkPriority::CollisionCritical);
             ++Submitted;
         }
 
@@ -5914,24 +6019,50 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
             if (!IsDesired(T)) { It.RemoveCurrent(); continue; }             // obsolete — drop
             if (PendingTiles.Contains(T)) { continue; }                     // in flight — retry after it lands
             It.RemoveCurrent();
-            LoadTile(T, /*bHighPriority*/ true);
+            LoadTile(T, EVoxelTileWorkPriority::Edited);
             ++Submitted;
         }
 
+        // NEAR TERRAIN — all ordinary level-0 work is promoted after the absolute support/edit
+        // prefixes. It uses the near queue and BackgroundHigh so both worker execution and result
+        // application stay ahead of a completed horizon backlog.
         for (const FVoxelTileKey& T : DesiredSorted)
         {
+            if (T.Level != 0) continue;
             if (PendingTiles.Num() >= MaxTasks) break;
             if (PendingTiles.Contains(T)) continue;   // in flight
             if (LoadedTiles.Contains(T)) continue;    // already loaded (level is in the key — no LOD remesh)
-            LoadTile(T);
+            LoadTile(T, EVoxelTileWorkPriority::LOD0);
             ++Submitted;
+        }
+
+        // FAR FIELD — preserve the clipmap's level ordering explicitly. DesiredSorted is
+        // distance-sorted for the critical/near work, but a level pass prevents a level-5 horizon
+        // tile from being admitted ahead of an unfinished level-1/2 bridge tile.
+        int32 MaxDesiredLevel = 0;
+        for (const FVoxelTileKey& T : DesiredSorted)
+        {
+            MaxDesiredLevel = FMath::Max(MaxDesiredLevel, T.Level);
+        }
+        for (int32 Level = 1; Level <= MaxDesiredLevel; ++Level)
+        {
+            for (const FVoxelTileKey& T : DesiredSorted)
+            {
+                if (T.Level != Level) continue;
+                if (PendingTiles.Num() >= CoarseTaskCap) break;
+                if (PendingTiles.Contains(T)) continue;   // in flight
+                if (LoadedTiles.Contains(T)) continue;    // already loaded
+                LoadTile(T);
+                ++Submitted;
+            }
+            if (PendingTiles.Num() >= CoarseTaskCap) break;
         }
 
         // Bande de strate changée : re-gen budgétée des tuiles grossières concernées (le vieux
         // mesh reste visible jusqu'au résultat — même schéma que RemeshDirtyChunks).
         for (auto It = BandRemeshQueue.CreateIterator(); It; ++It)
         {
-            if (PendingTiles.Num() >= MaxTasks) break;
+            if (PendingTiles.Num() >= CoarseTaskCap) break;
             const FVoxelTileKey T = *It;
             It.RemoveCurrent();
             if (!IsDesired(T) || PendingTiles.Contains(T) || !LoadedTiles.Contains(T)) continue;
@@ -5948,12 +6079,13 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 GVoxelForgeMaxPendingTilesObserved, MaxTasks, Submitted);
         }
         if (GVoxelForgeProfileTileGeneration != 0
-            && PendingTiles.Num() >= MaxTasks
+            && PendingTiles.Num() >= CoarseTaskCap
             && !GVoxelForgeGenerationCapHitReported)
         {
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeStreamingBudget] generation_cap_hit=1 pending=%d effective=%d"),
-                PendingTiles.Num(), MaxTasks);
+                TEXT("[VoxelForgeStreamingBudget] coarse_generation_cap_hit=1 pending=%d "
+                     "coarse_cap=%d effective=%d near_reserve=%d"),
+                PendingTiles.Num(), CoarseTaskCap, MaxTasks, NearTaskReserve);
             GVoxelForgeGenerationCapHitReported = true;
         }
 
@@ -5973,19 +6105,24 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
     }
 }
 
-void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
+void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority WorkPriority)
 {
     if (PendingTiles.Contains(Tile)) return;
 
     const int32 MaxTasks = GetMaxConcurrentTasks();   // T2.d — core-clamped
-    if (PendingTiles.Num() >= MaxTasks)
+    const bool bNearPriority = WorkPriority != EVoxelTileWorkPriority::Horizon;
+    const int32 CoarseTaskCap = FMath::Max(1, MaxTasks - GetNearTaskReserve(MaxTasks));
+    const int32 AdmissionCap = WorkPriority == EVoxelTileWorkPriority::Horizon
+        ? CoarseTaskCap : MaxTasks;
+    if (PendingTiles.Num() >= AdmissionCap)
     {
         if (GVoxelForgeProfileTileGeneration != 0
             && !GVoxelForgeGenerationCapHitReported)
         {
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeStreamingBudget] generation_cap_hit=1 pending=%d effective=%d"),
-                PendingTiles.Num(), MaxTasks);
+                TEXT("[VoxelForgeStreamingBudget] generation_cap_hit=1 pending=%d admission=%d "
+                     "effective=%d near_reserve=%d tile_level=%d"),
+                PendingTiles.Num(), AdmissionCap, MaxTasks, GetNearTaskReserve(MaxTasks), Tile.Level);
             GVoxelForgeGenerationCapHitReported = true;
         }
         return;  // Budget full — wait for a task to finish.
@@ -6048,7 +6185,15 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             Empty.Epoch = TaskEpoch;
             Empty.DesiredEpoch = TaskDesiredEpoch;
             Empty.RequestStartCycles = RequestStartCycles;
-            ProcessQueue.Enqueue(MoveTemp(Empty));
+            Empty.WorkPriority = WorkPriority;
+            if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
+                CriticalProcessQueue.Enqueue(MoveTemp(Empty));
+            else if (WorkPriority == EVoxelTileWorkPriority::Edited)
+                EditedProcessQueue.Enqueue(MoveTemp(Empty));
+            else if (WorkPriority == EVoxelTileWorkPriority::LOD0)
+                NearProcessQueue.Enqueue(MoveTemp(Empty));
+            else
+                ProcessQueue.Enqueue(MoveTemp(Empty));
             return;
         }
         BandChunkLo = MeshBandChunkLo;   // pour la résolution matériaux sol/cap dans ApplyMeshToTile
@@ -6081,7 +6226,15 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             Empty.RequestStartCycles = RequestStartCycles;
             Empty.BandChunkLo = BandChunkLo;
             Empty.BandChunkHi = BandChunkHi;
-            ProcessQueue.Enqueue(MoveTemp(Empty));
+            Empty.WorkPriority = WorkPriority;
+            if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
+                CriticalProcessQueue.Enqueue(MoveTemp(Empty));
+            else if (WorkPriority == EVoxelTileWorkPriority::Edited)
+                EditedProcessQueue.Enqueue(MoveTemp(Empty));
+            else if (WorkPriority == EVoxelTileWorkPriority::LOD0)
+                NearProcessQueue.Enqueue(MoveTemp(Empty));
+            else
+                ProcessQueue.Enqueue(MoveTemp(Empty));
             return;
         }
     }
@@ -6091,20 +6244,22 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
     PendingTileCancellation.Add(Tile, Cancellation);
     ActiveTaskCount.fetch_add(1, std::memory_order_relaxed);
 
-    // BackgroundNormal priority: gen runs on background workers that YIELD to foreground
+    // BackgroundNormal priority: coarse gen runs on background workers that YIELD to foreground
     // (game/render-thread) tasks. Without this, raising MaxConcurrentTasks past the spare
     // core count saturates the scheduler and starves the frame (the "over 12 = lag" symptom).
     // At background priority the frame keeps its cores; gen just fills in around it.
-    // FLOOR/DIG RESPONSIVENESS: critical support requests and player carves launch at BackgroundHigh
-    // (bHighPriority) — still a background worker (yields to the frame, keeps the invariant) but
-    // jumps AHEAD of ordinary pending streaming gen.
-    const UE::Tasks::ETaskPriority TaskPriority = bHighPriority
+    // NEAR RESPONSIVENESS: collision support, edits, and every level-0 tile launch at
+    // BackgroundHigh — still a background worker (yields to the frame, keeps the invariant) but
+    // jumps AHEAD of ordinary pending streaming gen. Admission reserves slots for this class and
+    // the result queues apply it in collision -> edit -> LOD0 order.
+    const UE::Tasks::ETaskPriority TaskPriority = bNearPriority
         ? UE::Tasks::ETaskPriority::BackgroundHigh
         : UE::Tasks::ETaskPriority::BackgroundNormal;
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                                           BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
                                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
-                                          RequestStartCycles, TaskDesiredEpoch, Cancellation]()
+                                          RequestStartCycles, TaskDesiredEpoch, Cancellation,
+                                          WorkPriority]()
     {
         // RAII: decrement the counter on every exit path.
         struct FTaskGuard
@@ -6125,9 +6280,17 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
             Canceled.Epoch = TaskEpoch;
             Canceled.DesiredEpoch = TaskDesiredEpoch;
             Canceled.RequestStartCycles = RequestStartCycles;
+            Canceled.WorkPriority = WorkPriority;
             Canceled.bAborted = true;
             Canceled.bObsolete = true;
-            ProcessQueue.Enqueue(MoveTemp(Canceled));
+            if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
+                CriticalProcessQueue.Enqueue(MoveTemp(Canceled));
+            else if (WorkPriority == EVoxelTileWorkPriority::Edited)
+                EditedProcessQueue.Enqueue(MoveTemp(Canceled));
+            else if (WorkPriority == EVoxelTileWorkPriority::LOD0)
+                NearProcessQueue.Enqueue(MoveTemp(Canceled));
+            else
+                ProcessQueue.Enqueue(MoveTemp(Canceled));
         };
 
         if (ShouldAbortWork()) return;
@@ -6140,6 +6303,7 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
         FScopedVoxelStackRegistration StackRegistration(Tile.Level);
         FChunkResult Result;
         Result.DesiredEpoch = TaskDesiredEpoch;
+        Result.WorkPriority = WorkPriority;
         const uint64 GenerationStartCycles = FPlatformTime::Cycles64();
         Result.GenerationStartCycles = GenerationStartCycles;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
@@ -6173,7 +6337,14 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, bool bHighPriority)
 
         if (!ShouldAbortWork())
         {
-            ProcessQueue.Enqueue(MoveTemp(Result));   // move: don't copy the geometry payload
+            if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
+                CriticalProcessQueue.Enqueue(MoveTemp(Result));
+            else if (WorkPriority == EVoxelTileWorkPriority::Edited)
+                EditedProcessQueue.Enqueue(MoveTemp(Result));
+            else if (WorkPriority == EVoxelTileWorkPriority::LOD0)
+                NearProcessQueue.Enqueue(MoveTemp(Result));
+            else
+                ProcessQueue.Enqueue(MoveTemp(Result));   // move: don't copy the geometry payload
         }
     }, TaskPriority);
 }

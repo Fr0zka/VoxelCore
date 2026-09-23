@@ -88,6 +88,14 @@ struct FVoxelStreamingAnchor
  * - BeginPlay: Initialize generator, mesher
  * - Tick: Update chunks around player position
  */
+enum class EVoxelTileWorkPriority : uint8
+{
+    Horizon = 0,
+    LOD0 = 1,
+    Edited = 2,
+    CollisionCritical = 3
+};
+
 struct FChunkResult
 {
     FVoxelTileKey Tile;       // which clipmap tile this mesh is for (carries coord + level)
@@ -108,6 +116,7 @@ struct FChunkResult
     uint64 GenerationStartCycles = 0;
     uint64 GenerationEndCycles = 0;
     uint64 ApplyStartCycles = 0;
+    EVoxelTileWorkPriority WorkPriority = EVoxelTileWorkPriority::Horizon;
     int32 ClassifyVerdict = -1; double ClassifySeconds = 0.0; double MeshSeconds = 0.0; double StreamSeconds = 0.0; int32 NumTriangles = 0; int32 NumCeilingTriangles = 0;
     int32 NumVertices = 0;
     uint64 GeometryBytes = 0;
@@ -313,6 +322,8 @@ public:
      *  capped to (logical cores − 2) so small CPUs don't thrash on a flat 16 (background
      *  priority stops frame starvation, not the context-switch overhead). */
     int32 GetMaxConcurrentTasks() const;
+    /** Reserve task slots for collision-critical/edit/LOD0 work; far work uses the remainder. */
+    int32 GetNearTaskReserve(int32 MaxTasks) const;
 
     //=========================================================================
     // TERRAIN MODIFICATION (player carving & filling)
@@ -738,7 +749,8 @@ public:
      *
      * @param ChunkCoord - Which chunk to load
      */
-    void LoadTile(const FVoxelTileKey& Tile, bool bHighPriority = false);
+    void LoadTile(const FVoxelTileKey& Tile,
+                  EVoxelTileWorkPriority WorkPriority = EVoxelTileWorkPriority::Horizon);
 
     /**
      * Worker-side gen for one tile: classify → GenerateMesh/GenerateSheetMesh → BuildTileStreamSet.
@@ -871,6 +883,7 @@ public:
     void RecordLOD0ReadySample(uint64 RequestStartCycles, uint64 GenerationStartCycles,
                                uint64 GenerationEndCycles, uint64 ApplyStartCycles,
                                uint64 ReadyCycles, uint64 CollisionSubmittedCycles);
+    void RecordLOD0RingReadyIfComplete();
     void LogStreamingLatencySummary() const;
 
     // (GetLODForChunk / LODToStep / IsChunkInRange removed — dead since the clipmap
@@ -884,6 +897,12 @@ public:
     // mode is NOT safe for multiple producers — concurrent Enqueues race on the tail
     // link and silently drop results, which leaks PendingChunkCoord slots until the
     // budget is exhausted and streaming stalls permanently. Mpsc guards the producer side.
+    // Result queues mirror the scheduling order: collision support first, then edited tiles,
+    // then ordinary LOD0, then the horizon. This keeps a support result from waiting behind a
+    // completed near-field backlog while preserving one consumer on the game thread.
+    TQueue<FChunkResult, EQueueMode::Mpsc> CriticalProcessQueue;
+    TQueue<FChunkResult, EQueueMode::Mpsc> EditedProcessQueue;
+    TQueue<FChunkResult, EQueueMode::Mpsc> NearProcessQueue;
     TQueue<FChunkResult, EQueueMode::Mpsc> ProcessQueue;
     TSet<FVoxelTileKey> PendingTiles;   // tiles with a gen task in flight
     // Game-thread-owned map; workers retain the shared token and only read its atomic flag.
@@ -1005,6 +1024,13 @@ public:
         double CollisionCookSeconds = 0.0;
     };
     TArray<FStreamingLatencySample> LOD0ReadySamples;
+    // Trace-only ring timing: each desired-set rebuild starts a new epoch. A ring is complete
+    // when every current desired level-0 key has reached LoadedTiles and no level-0 request for
+    // that epoch remains pending. This measures visible near-field readiness independently of the
+    // much larger horizon settle point.
+    uint64 DesiredEpochStartCycles = 0;
+    FIntVector DesiredEpochCenterChunk = FIntVector::ZeroValue;
+    uint32 LastLOD0RingReadyEpoch = MAX_uint32;
 
     // Headless validation hook. These are intentionally non-UPROPERTY state and are enabled only
     // by explicit command-line switches; they do not alter ordinary player movement or streaming.

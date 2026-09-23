@@ -53,6 +53,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0"))
 	int32 MaxGenerationWorkerCores = 0;
 
+	// Keep this many task slots available for collision-critical, edited, and level-0 terrain while
+	// coarse horizon work is in flight. A positive reserve prevents a full far-field queue from
+	// delaying a new near tile because running tasks cannot be preempted. The runtime clamps the
+	// value below the effective task budget; 4 is the conservative default for the ship settings.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "0", ClampMax = "16"))
+	int32 NearTaskReserve = 4;
+
 	// Nombre max de meshes appliqués (upload GPU) par frame. Seuls les vrais applies
 	// comptent (chunks vides/périmés se vident gratuitement). À 32³ chaque apply est léger
 	// (~0.1 ms) — tunable en live sur l'asset : montez (8-16) si le remplissage traîne,
