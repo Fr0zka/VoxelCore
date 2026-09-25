@@ -571,111 +571,107 @@ namespace
             0.0f, VF_PassageMaxReliefScale);
     }
 
-    static bool VF_ProjectNativePassageFloorUncached(
-        const FVoxelPassage& Passage, const FVector& Position,
-        float& OutFloorZ, float& OutSupportRadius,
+    static bool VF_ProjectNativePassageFloorSegment(
+        const FVoxelPassage& Passage, int32 SegmentIndex,
+        const FVector& Position, float& OutFloorZ, float& OutSupportRadius,
+        float& OutDistanceSquared, float& OutHorizontalDistanceSquared,
         const UVoxelStrateManager* Manager = nullptr,
         int32 PassageIndex = INDEX_NONE)
     {
         const int32 ControlPointCount = Passage.ControlPoints.Num();
         if (!Passage.bNativeFloorEnabled
-            || ControlPointCount < 2
+            || SegmentIndex < 0
+            || SegmentIndex + 1 >= ControlPointCount
             || Passage.ControlRadii.Num() != ControlPointCount
             || Passage.NativeFloorProfileZ.Num() != ControlPointCount)
         {
             return false;
         }
 
-        const FVector* ControlPointData = Passage.ControlPoints.GetData();
-        const float* ControlRadiusData = Passage.ControlRadii.GetData();
-        const float* NativeFloorProfileData = Passage.NativeFloorProfileZ.GetData();
+        const FVector& A = Passage.ControlPoints[SegmentIndex];
+        const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+        const float StartRadius = FMath::Abs(Passage.ControlRadii[SegmentIndex]);
+        const float EndRadius = FMath::Abs(Passage.ControlRadii[SegmentIndex + 1]);
         const double QueryX = static_cast<double>(static_cast<float>(Position.X));
         const double QueryY = static_cast<double>(static_cast<float>(Position.Y));
-        float BestDistanceSquared = FLT_MAX;
-        int32 BestSegment = INDEX_NONE;
-        float BestT = 0.0f;
-        float BestSupportRadius = 0.0f;
-        for (int32 SegmentIndex = 0;
-             SegmentIndex + 1 < ControlPointCount;
-             ++SegmentIndex)
-        {
-            const FVector& A = ControlPointData[SegmentIndex];
-            const FVector& B = ControlPointData[SegmentIndex + 1];
-            const double AXY_X = static_cast<double>(static_cast<float>(A.X));
-            const double AXY_Y = static_cast<double>(static_cast<float>(A.Y));
-            const double DeltaX = static_cast<double>(static_cast<float>(B.X - A.X));
-            const double DeltaY = static_cast<double>(static_cast<float>(B.Y - A.Y));
-            const float LengthSquared = static_cast<float>(
-                DeltaX * DeltaX + DeltaY * DeltaY);
-            if (!(LengthSquared > KINDA_SMALL_NUMBER))
-            {
-                continue;
-            }
-
-            const double Dot = (QueryX - AXY_X) * DeltaX
-                + (QueryY - AXY_Y) * DeltaY;
-            const float T = FMath::Clamp(
-                Dot / LengthSquared,
-                0.0f, 1.0f);
-            const double ClosestX = AXY_X + DeltaX * T;
-            const double ClosestY = AXY_Y + DeltaY * T;
-            const double DistanceX = QueryX - ClosestX;
-            const double DistanceY = QueryY - ClosestY;
-            const float DistanceSquared = static_cast<float>(
-                DistanceX * DistanceX + DistanceY * DistanceY);
-            if (DistanceSquared >= BestDistanceSquared)
-            {
-                continue;
-            }
-
-            BestDistanceSquared = DistanceSquared;
-            BestSegment = SegmentIndex;
-            BestT = T;
-            BestSupportRadius = FMath::Max(
-                FMath::Min(
-                    FMath::Abs(ControlRadiusData[SegmentIndex]),
-                    FMath::Abs(ControlRadiusData[SegmentIndex + 1])) - 0.5f,
-                VoxelPassageGeometry::PlayerRadiusVoxels);
-        }
-
-        if (BestSegment == INDEX_NONE
-            || BestDistanceSquared > FMath::Square(BestSupportRadius))
+        const double AXY_X = static_cast<double>(static_cast<float>(A.X));
+        const double AXY_Y = static_cast<double>(static_cast<float>(A.Y));
+        const double DeltaX = static_cast<double>(static_cast<float>(B.X - A.X));
+        const double DeltaY = static_cast<double>(static_cast<float>(B.Y - A.Y));
+        const float HorizontalLengthSquared = static_cast<float>(
+            DeltaX * DeltaX + DeltaY * DeltaY);
+        if (!(HorizontalLengthSquared > KINDA_SMALL_NUMBER))
         {
             return false;
         }
 
-        const float ClampedT = FMath::Clamp(BestT, 0.0f, 1.0f);
-        OutFloorZ = FMath::Lerp(
-            NativeFloorProfileData[BestSegment],
-            NativeFloorProfileData[BestSegment + 1],
-            ClampedT);
-
-        float ReliefScale = 0.0f;
-        const int32 ReliefScaleCount = Passage.NativeFloorReliefScales.Num();
-        if (BestSegment >= 0 && BestSegment < ReliefScaleCount)
+        const double HorizontalDot = (QueryX - AXY_X) * DeltaX
+            + (QueryY - AXY_Y) * DeltaY;
+        const float HorizontalT = FMath::Clamp(
+            HorizontalDot / HorizontalLengthSquared,
+            0.0f, 1.0f);
+        const double HorizontalClosestX = AXY_X + DeltaX * HorizontalT;
+        const double HorizontalClosestY = AXY_Y + DeltaY * HorizontalT;
+        const double HorizontalDistanceX = QueryX - HorizontalClosestX;
+        const double HorizontalDistanceY = QueryY - HorizontalClosestY;
+        const float HorizontalDistanceSquared = static_cast<float>(
+            HorizontalDistanceX * HorizontalDistanceX
+            + HorizontalDistanceY * HorizontalDistanceY);
+        OutHorizontalDistanceSquared = HorizontalDistanceSquared;
+        const float SegmentSupportRadius =
+            VoxelPassageGeometry::NativePassageFloorSupportRadius(
+                StartRadius, EndRadius);
+        if (HorizontalDistanceSquared > FMath::Square(SegmentSupportRadius))
         {
-            ReliefScale = Passage.NativeFloorReliefScales.GetData()[BestSegment];
+            return false;
+        }
+
+        const float FloorA = Passage.NativeFloorProfileZ[SegmentIndex];
+        const float FloorB = Passage.NativeFloorProfileZ[SegmentIndex + 1];
+        const float FloorDeltaZ = FloorB - FloorA;
+        const float FullLengthSquared = HorizontalLengthSquared
+            + FMath::Square(FloorDeltaZ);
+        if (!(FullLengthSquared > KINDA_SMALL_NUMBER))
+        {
+            return false;
+        }
+        const double FullDot = HorizontalDot
+            + (static_cast<double>(static_cast<float>(Position.Z)) - FloorA)
+                * FloorDeltaZ;
+        const float SpatialT = FMath::Clamp(
+            FullDot / FullLengthSquared,
+            0.0f, 1.0f);
+        const double SpatialX = AXY_X + DeltaX * SpatialT;
+        const double SpatialY = AXY_Y + DeltaY * SpatialT;
+        const double SpatialZ = FloorA + FloorDeltaZ * SpatialT;
+        const double SpatialDistanceX = QueryX - SpatialX;
+        const double SpatialDistanceY = QueryY - SpatialY;
+        const double SpatialDistanceZ =
+            static_cast<double>(static_cast<float>(Position.Z)) - SpatialZ;
+        OutDistanceSquared = static_cast<float>(
+            SpatialDistanceX * SpatialDistanceX
+            + SpatialDistanceY * SpatialDistanceY
+            + SpatialDistanceZ * SpatialDistanceZ);
+
+        OutFloorZ = FMath::Lerp(FloorA, FloorB, HorizontalT);
+        float ReliefScale = 0.0f;
+        if (Passage.NativeFloorReliefScales.IsValidIndex(SegmentIndex))
+        {
+            ReliefScale = Passage.NativeFloorReliefScales[SegmentIndex];
         }
         float Envelope = 1.0f;
-        const FVector& BestA = ControlPointData[BestSegment];
-        const FVector& BestB = ControlPointData[BestSegment + 1];
-        const double BestDeltaX = static_cast<double>(static_cast<float>(
-            BestB.X - BestA.X));
-        const double BestDeltaY = static_cast<double>(static_cast<float>(
-            BestB.Y - BestA.Y));
-        const float HorizontalRun = static_cast<float>(FMath::Sqrt(
-            BestDeltaX * BestDeltaX + BestDeltaY * BestDeltaY));
-        if (BestSegment == 0)
+        const float HorizontalRun = FMath::Sqrt(HorizontalLengthSquared);
+        if (SegmentIndex == 0)
         {
             Envelope *= SmoothStep01(FMath::Clamp(
-                (ClampedT * HorizontalRun)
+                (HorizontalT * HorizontalRun)
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
-        if (BestSegment + 1 == ControlPointCount - 1)
+        if (SegmentIndex + 1 == ControlPointCount - 1)
         {
             Envelope *= SmoothStep01(FMath::Clamp(
-                ((1.0f - ClampedT) * HorizontalRun)
+                ((1.0f - HorizontalT) * HorizontalRun)
                     / VoxelPassageGeometry::WalkableTunnelLandingApronVoxels,
                 0.0f, 1.0f));
         }
@@ -684,10 +680,51 @@ namespace
             static_cast<double>(Position.X), static_cast<double>(Position.Y))
             * VOXEL_NOISE_SCALE * Passage.NativeFloorReliefStrength
             * Envelope * ReliefScale;
-        OutSupportRadius = BestSupportRadius;
+        OutSupportRadius = SegmentSupportRadius;
         return VoxelMath::IsFinite(OutFloorZ)
             && VoxelMath::IsFinite(OutSupportRadius)
+            && VoxelMath::IsFinite(OutDistanceSquared)
             && OutSupportRadius > 0.0f;
+    }
+
+    static bool VF_ProjectNativePassageFloorUncached(
+        const FVoxelPassage& Passage, const FVector& Position,
+        float& OutFloorZ, float& OutSupportRadius,
+        const UVoxelStrateManager* Manager = nullptr,
+        int32 PassageIndex = INDEX_NONE)
+    {
+        const int32 SegmentCount = Passage.ControlPoints.Num() - 1;
+        float BestDistanceSquared = FLT_MAX;
+        float BestFloorZ = 0.0f;
+        float BestSupportRadius = 0.0f;
+        bool bFoundSegment = false;
+        for (int32 SegmentIndex = 0; SegmentIndex < SegmentCount; ++SegmentIndex)
+        {
+            float FloorZ = 0.0f;
+            float SupportRadius = 0.0f;
+            float DistanceSquared = FLT_MAX;
+            float HorizontalDistanceSquared = FLT_MAX;
+            if (!VF_ProjectNativePassageFloorSegment(
+                    Passage, SegmentIndex, Position,
+                    FloorZ, SupportRadius, DistanceSquared,
+                    HorizontalDistanceSquared,
+                    Manager, PassageIndex)
+                || DistanceSquared >= BestDistanceSquared)
+            {
+                continue;
+            }
+            BestDistanceSquared = DistanceSquared;
+            BestFloorZ = FloorZ;
+            BestSupportRadius = SupportRadius;
+            bFoundSegment = true;
+        }
+        if (!bFoundSegment)
+        {
+            return false;
+        }
+        OutFloorZ = BestFloorZ;
+        OutSupportRadius = BestSupportRadius;
+        return true;
     }
 
     static bool VF_ProjectNativePassageFloor(
@@ -2157,10 +2194,10 @@ void UVoxelStrateManager::GeneratePassages()
                 const FVector DoorDirection(
                     SwitchbackDirection.X, SwitchbackDirection.Y, 0.0f);
                 Passage.UpperLanding.DoorDirection = DoorDirection;
-                // A real switchback turns around: the lower doorway faces back toward the upper
-                // leg. Keeping both doors on the same side would make the two sloped legs retrace
-                // one XY line at different heights, leaving the floor projection ambiguous.
-                const FVector TunnelLowerDoorDirection = -DoorDirection;
+                // Keep both door approaches on the same outward side so each sloped leg reaches
+                // its own apron before entering the room. Separate their turn-side floor branches
+                // below so the two projections do not retrace one XY line at different heights.
+                const FVector TunnelLowerDoorDirection = DoorDirection;
                 Passage.LowerLanding.DoorDirection = TunnelLowerDoorDirection;
                 const float UpperDoorOffset = FMath::Max(
                     Passage.UpperLanding.HalfWidth - 1.0f, 0.0f);
@@ -2204,27 +2241,9 @@ void UVoxelStrateManager::GeneratePassages()
                 const float LowerFloorZ = VoxelPassageGeometry::TunnelFloorZ(
                     LowerDoor, Cfg.MouthRadius);
                 const float MidFloorZ = 0.5f * (UpperFloorZ + LowerFloorZ);
-                const FVector2D RampStartMid(
-                    0.5f * (UpperApronEnd.X + LowerApronBegin.X),
-                    0.5f * (UpperApronEnd.Y + LowerApronBegin.Y));
-                // The turn offset must be perpendicular to the actual two-apron endpoint chord,
-                // not merely perpendicular to the standing-point chord.  Opposite-facing doors
-                // add their offsets to that chord; using the old direction could make the two
-                // sloped legs nearly collinear and bring the lower leg back beside the upper door.
-                FVector2D TurnDirection(
-                    LowerApronBegin.Y - UpperApronEnd.Y,
-                    -(LowerApronBegin.X - UpperApronEnd.X));
-                if (!TurnDirection.Normalize())
-                {
-                    TurnDirection = FVector2D(-DoorDirection.Y, DoorDirection.X);
-                    if (!TurnDirection.Normalize())
-                    {
-                        TurnDirection = FVector2D(0.0f, 1.0f);
-                    }
-                }
-                // There are two sides on which the switchback can turn. Choose the side whose
-                // two sloped legs initially move away from their own landing rooms; the old fixed
-                // sign could send a slope back through a room floor before reaching open space.
+                // Each ramp must leave its own landing on the outward side. The two doors face
+                // that same direction; orient the shared level turn along it, then split the lower
+                // floor branch laterally so the ramp projections remain unambiguous.
                 FVector2D UpperOutward(
                     UpperApronEnd.X - Passage.UpperLanding.StandingPoint.X,
                     UpperApronEnd.Y - Passage.UpperLanding.StandingPoint.Y);
@@ -2233,32 +2252,6 @@ void UVoxelStrateManager::GeneratePassages()
                     LowerApronBegin.Y - Passage.LowerLanding.StandingPoint.Y);
                 UpperOutward.Normalize();
                 LowerOutward.Normalize();
-                const float TurnOffsetForScore =
-                    0.5f * VoxelPassageGeometry::RequiredHorizontalRunForFloorDrop(
-                        UpperFloorZ - 0.5f * (UpperFloorZ + LowerFloorZ),
-                        0.5f * (UpperFloorZ + LowerFloorZ) - LowerFloorZ)
-                    + VoxelPassageGeometry::WalkableTunnelTurnTransitionVoxels;
-                const FVector2D TurnMidPlus(
-                    RampStartMid.X + TurnDirection.X * TurnOffsetForScore,
-                    RampStartMid.Y + TurnDirection.Y * TurnOffsetForScore);
-                const FVector2D TurnMidMinus(
-                    RampStartMid.X - TurnDirection.X * TurnOffsetForScore,
-                    RampStartMid.Y - TurnDirection.Y * TurnOffsetForScore);
-                const auto OutwardTurnScore = [
-                    &UpperOutward, &LowerOutward, &UpperApronEnd, &LowerApronBegin]
-                    (const FVector2D& Candidate) -> float
-                {
-                    return FVector2D::DotProduct(
-                               Candidate - FVector2D(
-                                   UpperApronEnd.X, UpperApronEnd.Y), UpperOutward)
-                        + FVector2D::DotProduct(
-                               FVector2D(LowerApronBegin.X, LowerApronBegin.Y) - Candidate,
-                               LowerOutward);
-                };
-                if (OutwardTurnScore(TurnMidMinus) > OutwardTurnScore(TurnMidPlus))
-                {
-                    TurnDirection *= -1.0f;
-                }
                 const float UpperFloorDrop = UpperFloorZ - MidFloorZ;
                 const float LowerFloorDrop = MidFloorZ - LowerFloorZ;
                 const float RequiredHorizontalRun =
@@ -2271,22 +2264,46 @@ void UVoxelStrateManager::GeneratePassages()
                     VoxelPassageGeometry::WalkableTunnelTurnTransitionVoxels;
                 const float TurnOffset =
                     0.5f * RequiredHorizontalRun + TurnTransition;
-                const FVector2D FloorSafeDoorMid(
-                    RampStartMid.X
-                        + TurnDirection.X * TurnOffset,
-                    RampStartMid.Y
-                        + TurnDirection.Y * TurnOffset);
+                FVector2D TurnDirection(
+                    UpperOutward.X + LowerOutward.X,
+                    UpperOutward.Y + LowerOutward.Y);
+                if (!TurnDirection.Normalize())
+                {
+                    TurnDirection = UpperOutward;
+                }
+                const FVector2D ApronChord(
+                    LowerApronBegin.X - UpperApronEnd.X,
+                    LowerApronBegin.Y - UpperApronEnd.Y);
+                const float LowerApronAlong = FVector2D::DotProduct(
+                    ApronChord, TurnDirection);
+                const float SharedTurnOffset = TurnOffset
+                    + FMath::Max(LowerApronAlong, 0.0f);
+                const FVector2D SharedTurnMid(
+                    UpperApronEnd.X + TurnDirection.X * SharedTurnOffset,
+                    UpperApronEnd.Y + TurnDirection.Y * SharedTurnOffset);
+                const float TurnLegSeparation =
+                    VoxelPassageGeometry::WalkableTunnelTurnLegSeparation(
+                        Cfg.MidRadius, Cfg.MouthRadius);
+                FVector2D TurnLegSideDirection(-TurnDirection.Y, TurnDirection.X);
+                if (FVector2D::DotProduct(ApronChord, TurnLegSideDirection) < 0.0f)
+                {
+                    TurnLegSideDirection *= -1.0f;
+                }
+                const FVector2D UpperTurnMid = SharedTurnMid;
+                const FVector2D LowerTurnMid(
+                    SharedTurnMid.X + TurnLegSideDirection.X * TurnLegSeparation,
+                    SharedTurnMid.Y + TurnLegSideDirection.Y * TurnLegSeparation);
                 FVector2D UpperSlopeDirection(
-                    FloorSafeDoorMid.X - UpperApronEnd.X,
-                    FloorSafeDoorMid.Y - UpperApronEnd.Y);
+                    UpperTurnMid.X - UpperApronEnd.X,
+                    UpperTurnMid.Y - UpperApronEnd.Y);
                 if (!UpperSlopeDirection.Normalize())
                 {
                     UpperSlopeDirection = FVector2D(
                         DoorDirection.X, DoorDirection.Y);
                 }
                 FVector2D LowerSlopeDirection(
-                    LowerApronBegin.X - FloorSafeDoorMid.X,
-                    LowerApronBegin.Y - FloorSafeDoorMid.Y);
+                    LowerApronBegin.X - LowerTurnMid.X,
+                    LowerApronBegin.Y - LowerTurnMid.Y);
                 if (!LowerSlopeDirection.Normalize())
                 {
                     LowerSlopeDirection = -UpperSlopeDirection;
@@ -2304,7 +2321,10 @@ void UVoxelStrateManager::GeneratePassages()
                     UpperSlopeStartXY.X, UpperSlopeStartXY.Y,
                     UpperFloorZ + FMath::Abs(Cfg.MouthRadius));
                 const FVector MidPoint(
-                    FloorSafeDoorMid.X, FloorSafeDoorMid.Y,
+                    UpperTurnMid.X, UpperTurnMid.Y,
+                    MidFloorZ + FMath::Abs(Cfg.MidRadius));
+                const FVector LowerTurnPoint(
+                    LowerTurnMid.X, LowerTurnMid.Y,
                     MidFloorZ + FMath::Abs(Cfg.MidRadius));
                 const FVector LowerSlopeEnd(
                     LowerSlopeEndXY.X, LowerSlopeEndXY.Y,
@@ -2313,18 +2333,20 @@ void UVoxelStrateManager::GeneratePassages()
                     LowerApronBegin.X, LowerApronBegin.Y,
                     LowerFloorZ + FMath::Abs(Cfg.MouthRadius));
 
-                Passage.ControlPoints.Reset(7);
-                Passage.ControlRadii.Reset(7);
+                Passage.ControlPoints.Reset(8);
+                Passage.ControlRadii.Reset(8);
                 Passage.ControlPoints.Add(UpperDoor);
                 Passage.ControlPoints.Add(UpperApronEndPoint);
                 Passage.ControlPoints.Add(UpperSlopeStart);
                 Passage.ControlPoints.Add(MidPoint);
+                Passage.ControlPoints.Add(LowerTurnPoint);
                 Passage.ControlPoints.Add(LowerSlopeEnd);
                 Passage.ControlPoints.Add(LowerApronBeginPoint);
                 Passage.ControlPoints.Add(LowerDoor);
                 Passage.ControlRadii.Add(Cfg.MouthRadius);
                 Passage.ControlRadii.Add(Cfg.MouthRadius);
                 Passage.ControlRadii.Add(Cfg.MouthRadius);
+                Passage.ControlRadii.Add(Cfg.MidRadius);
                 Passage.ControlRadii.Add(Cfg.MidRadius);
                 Passage.ControlRadii.Add(Cfg.MouthRadius);
                 Passage.ControlRadii.Add(Cfg.MouthRadius);
@@ -2592,29 +2614,31 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
             {
                 const float rA = bTaper ? ControlRadiusData[j]     : P.Radius;
                 const float rB = bTaper ? ControlRadiusData[j + 1] : P.Radius;
-                const float SegSDF = VoxelSDF::TaperedCapsule(
+                float SegmentSDF = VoxelSDF::TaperedCapsule(
                     Pos, ControlPointData[j], ControlPointData[j + 1], rA, rB);
-                PassageSDF = VoxelSDF::SmoothMin(PassageSDF, SegSDF, BlendK);
-            }
 
-            // A walkable inter-strate passage is a D-shaped primitive, not a capsule followed
-            // by a slab.  The profile and its bounded relief were authored in GeneratePassages;
-            // projecting once here selects the nearest immutable floor segment for this sample.
-            // Unknown/malformed descriptors deliberately retain the bare capsule and the legacy
-            // diagnostic backstop remains available.
-            if (P.bNativeFloorEnabled && !VoxelDensityAblation::IsNativeFloorOff())
-            {
-                float NativeFloorZ = 0.0f;
-                float NativeSupportRadius = 0.0f;
-                if (VF_ProjectNativePassageFloor(
-                        P, Pos, NativeFloorZ, NativeSupportRadius,
-                        this, PIdx))
+                // Clip each capsule against its own floor profile before the route segments are
+                // unioned. A single nearest-floor projection after the union can select the
+                // neighboring leg of a switchback and leave a solid post in this segment.
+                if (P.bNativeFloorEnabled && !VoxelDensityAblation::IsNativeFloorOff())
                 {
-                    PassageSDF = VoxelSDF::SmoothMax(
-                        PassageSDF,
-                        NativeFloorZ - static_cast<float>(Pos.Z),
-                        BlendK * 0.35f);
+                    float NativeFloorZ = 0.0f;
+                    float NativeSupportRadius = 0.0f;
+                    float FloorDistanceSquared = FLT_MAX;
+                    float FloorHorizontalDistanceSquared = FLT_MAX;
+                    if (VF_ProjectNativePassageFloorSegment(
+                            P, j, Pos, NativeFloorZ, NativeSupportRadius,
+                            FloorDistanceSquared, FloorHorizontalDistanceSquared,
+                            this, PIdx))
+                    {
+                        SegmentSDF = VoxelSDF::SmoothMax(
+                            SegmentSDF,
+                            NativeFloorZ - static_cast<float>(Pos.Z),
+                            BlendK * 0.35f);
+                    }
                 }
+
+                PassageSDF = VoxelSDF::SmoothMin(PassageSDF, SegmentSDF, BlendK);
             }
             MinSDF = VoxelSDF::SmoothMin(MinSDF, PassageSDF, BlendK);
         }
@@ -3145,6 +3169,30 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
 
     const FVoxelPassage* PassageData = Passages.GetData();
     const FVector Position(WorldX, WorldY, WorldZ);
+    bool bRoomOwnershipChecked = false;
+    bool bInsidePassageRoom = false;
+    const auto IsInsidePassageRoom = [&]()
+    {
+        if (!bRoomOwnershipChecked)
+        {
+            bRoomOwnershipChecked = true;
+            for (const int32 PassageIndex : Nearby)
+            {
+                if (!Passages.IsValidIndex(PassageIndex))
+                {
+                    continue;
+                }
+                const FVoxelPassage& Passage = PassageData[PassageIndex];
+                if (VF_EvaluatePassageLandingSDF(Position, Passage.UpperLanding) <= 0.0f
+                    || VF_EvaluatePassageLandingSDF(Position, Passage.LowerLanding) <= 0.0f)
+                {
+                    bInsidePassageRoom = true;
+                    break;
+                }
+            }
+        }
+        return bInsidePassageRoom;
+    };
     for (const int32 PassageIndex : Nearby)
     {
         if (!Passages.IsValidIndex(PassageIndex))
@@ -3159,25 +3207,122 @@ void UVoxelStrateManager::ApplyPassageNativeFloorMC(
 
         float FloorZ = 0.0f;
         float SupportRadius = 0.0f;
-        if (!VF_ProjectNativePassageFloor(
-                Passage, Position, FloorZ, SupportRadius,
-                this, PassageIndex))
+        if (VF_ProjectNativePassageFloor(
+                Passage, Position, FloorZ, SupportRadius, this, PassageIndex)
+            && Position.Z <= FloorZ + KINDA_SMALL_NUMBER
+            && Position.Z > FloorZ
+                - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+        {
+            // Room geometry is strate A and owns every overlap. A tunnel's native post must not
+            // put a floor patch through a landing room; its own room-floor writer owns support.
+            if (!IsInsidePassageRoom())
+            {
+                // Keep the existing narrow floor surface on the segment selected by the passage's
+                // full 3D centerline, so a switchback's XY-near neighbor cannot add a second post.
+                Density = FMath::Min(Density, -FMath::Max(BaseDensity, 1.0f));
+                if (VoxelDensityProfile::AreCountersEnabled())
+                {
+                    VoxelDensityProfile::AddCounter(
+                        VoxelDensityProfile::ECounter::PassageNativeFloorCompositions);
+                }
+            }
+            break;
+        }
+    }
+
+    // Eval, terrain operations, and disturbance writers have all run before this MC-facing
+    // composition point. Reassert the walkable passage's swept body volume here so their solid
+    // features cannot put a rib or a neighboring floor post back through the through-route.
+    // The profile is evaluated per route segment: switchback legs keep their own floor branch.
+    // Room interiors stay owned by the room SDF, and the floor band remains untouched below the
+    // maximum legal step. This is an air carve over the tunnel's own shape, not a support slab.
+    const float CorridorHalfWidth =
+        0.5f * VoxelPassageGeometry::WalkCorridorPlayerWidthVoxels
+        + VoxelPassageGeometry::WalkCorridorLatticeMarginVoxels;
+    const float CorridorBottom = VoxelPassageGeometry::MaxStepHeightVoxels;
+    const float CorridorTop = CorridorBottom
+        + VoxelPassageGeometry::WalkCorridorPlayerHeightVoxels;
+    bool bInsideWalkCorridor = false;
+    for (const int32 PassageIndex : Nearby)
+    {
+        if (!Passages.IsValidIndex(PassageIndex))
         {
             continue;
         }
-        if (Position.Z <= FloorZ + KINDA_SMALL_NUMBER
-            && Position.Z > FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels)
+        const FVoxelPassage& Passage = PassageData[PassageIndex];
+        if (!Passage.bWalkableTunnelContract || !Passage.bNativeFloorEnabled)
         {
-            // The old support slab is now disabled in the A/B run.  This final write is the
-            // D-shaped primitive's floor ownership, derived from its build-time profile; it is
-            // intentionally not controlled by bPassageSupportFloorWritesEnabled.
-            Density = FMath::Min(Density, -FMath::Max(BaseDensity, 1.0f));
-            if (VoxelDensityProfile::AreCountersEnabled())
+            continue;
+        }
+
+        const int32 NumSegments = Passage.ControlPoints.Num() - 1;
+        for (int32 SegmentIndex = 0; SegmentIndex < NumSegments; ++SegmentIndex)
+        {
+            float FloorZ = 0.0f;
+            float SupportRadius = 0.0f;
+            float DistanceSquared = FLT_MAX;
+            float HorizontalDistanceSquared = FLT_MAX;
+            if (!VF_ProjectNativePassageFloorSegment(
+                    Passage, SegmentIndex, Position,
+                    FloorZ, SupportRadius, DistanceSquared,
+                    HorizontalDistanceSquared, this, PassageIndex)
+                || HorizontalDistanceSquared > FMath::Square(CorridorHalfWidth))
             {
-                VoxelDensityProfile::AddCounter(
-                    VoxelDensityProfile::ECounter::PassageNativeFloorCompositions);
+                continue;
             }
+
+            const float HeightAboveFloor = Position.Z - FloorZ;
+            if (HeightAboveFloor >= CorridorBottom
+                && HeightAboveFloor <= CorridorTop)
+            {
+                bInsideWalkCorridor = true;
+                break;
+            }
+        }
+
+        // The audited A-to-B path continues from each mouth to the landing's standing point.
+        // Cover those short approach lines too, while letting the actual landing room retain A
+        // ownership wherever its room SDF contains the query.
+        const auto IsInsideLandingApproach = [&](const FVoxelPassageLanding& Landing)
+        {
+            const FVector2D Start(Landing.DoorPoint.X, Landing.DoorPoint.Y);
+            const FVector2D End(Landing.StandingPoint.X, Landing.StandingPoint.Y);
+            const FVector2D Delta = End - Start;
+            const float LengthSquared = Delta.SizeSquared();
+            if (!(LengthSquared > KINDA_SMALL_NUMBER))
+            {
+                return false;
+            }
+            const FVector2D Query(Position.X, Position.Y);
+            const float T = FMath::Clamp(
+                FVector2D::DotProduct(Query - Start, Delta) / LengthSquared,
+                0.0f, 1.0f);
+            const FVector2D Closest = Start + Delta * T;
+            if (FVector2D::DistSquared(Query, Closest)
+                > FMath::Square(CorridorHalfWidth))
+            {
+                return false;
+            }
+            const float HeightAboveFloor = Position.Z - Landing.FloorZ;
+            return HeightAboveFloor >= CorridorBottom
+                && HeightAboveFloor <= CorridorTop;
+        };
+        if (!bInsideWalkCorridor
+            && (IsInsideLandingApproach(Passage.UpperLanding)
+                || IsInsideLandingApproach(Passage.LowerLanding)))
+        {
+            bInsideWalkCorridor = true;
+        }
+        if (bInsideWalkCorridor)
+        {
             break;
+        }
+    }
+    if (bInsideWalkCorridor)
+    {
+        if (!IsInsidePassageRoom())
+        {
+            Density = FMath::Max(Density, FMath::Max(BaseDensity, 1.0f));
         }
     }
 }

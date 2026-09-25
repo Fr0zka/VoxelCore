@@ -23,6 +23,11 @@ namespace VoxelPassageGeometry
     constexpr float MinimumRoomHeightVoxels = 12.0f;       // 3 m
     constexpr float LandingFloorThicknessVoxels = 3.0f;
     constexpr float MaxStepHeightVoxels = 1.8f;              // 45 cm at 25 cm/voxel
+    // The A-to-B walk corridor is budgeted as a full player-width rectangle. Its vertical
+    // envelope starts above the legal step and extends one player height above that raised floor.
+    constexpr float WalkCorridorPlayerWidthVoxels = 1.36f;
+    constexpr float WalkCorridorPlayerHeightVoxels = 7.0f;
+    constexpr float WalkCorridorLatticeMarginVoxels = 1.0f;
     constexpr float SealSafetyMarginVoxels = 4.0f;
     constexpr float RoomRoundingVoxels = 1.5f;
     constexpr float LandingCarveBlendVoxels = 4.0f;
@@ -101,6 +106,25 @@ namespace VoxelPassageGeometry
     FORCEINLINE float TunnelFloorZ(const FVector& Centreline, float Radius)
     {
         return Centreline.Z - FMath::Abs(Radius);
+    }
+
+    FORCEINLINE float NativePassageFloorSupportRadius(float StartRadius, float EndRadius)
+    {
+        return FMath::Max(
+            FMath::Min(FMath::Abs(StartRadius), FMath::Abs(EndRadius)) - 0.5f,
+            PlayerRadiusVoxels);
+    }
+
+    // Keep two switchback floor branches apart far enough that the upper branch's final floor
+    // post cannot enter the lower player's full-width walk corridor. The one-voxel margin covers
+    // the scalar lattice/interpolation boundary; Eval displacement is already followed by the
+    // MC-facing tunnel and native-floor stages before collision density is returned.
+    FORCEINLINE float WalkableTunnelTurnLegSeparation(
+        float StartRadius, float EndRadius)
+    {
+        return NativePassageFloorSupportRadius(StartRadius, EndRadius)
+            + 0.5f * WalkCorridorPlayerWidthVoxels
+            + WalkCorridorLatticeMarginVoxels;
     }
 
     // Vertical-shaft tree links are round air capsules, but the player-fit graph needs a
@@ -350,6 +374,7 @@ namespace VoxelPassageGeometry
         const FVector* ControlPointData = ControlPoints.GetData();
         const float* ControlRadiusData = ControlRadii.GetData();
         float BestDistanceSquared = FLT_MAX;
+        float BestHorizontalDistanceSquared = FLT_MAX;
         bool bFoundSegment = false;
         for (int32 SegmentIndex = 0;
              SegmentIndex + 1 < ControlPointCount;
@@ -368,28 +393,58 @@ namespace VoxelPassageGeometry
                 continue;
             }
 
-            const double Dot = (QueryX - AXY_X) * DeltaX
+            const double HorizontalDot = (QueryX - AXY_X) * DeltaX
                 + (QueryY - AXY_Y) * DeltaY;
-            const float T = FMath::Clamp(
-                Dot / LengthSquared,
+            const float HorizontalT = FMath::Clamp(
+                HorizontalDot / LengthSquared,
                 0.0f, 1.0f);
-            const double ClosestX = AXY_X + DeltaX * T;
-            const double ClosestY = AXY_Y + DeltaY * T;
+            const double ClosestX = AXY_X + DeltaX * HorizontalT;
+            const double ClosestY = AXY_Y + DeltaY * HorizontalT;
             const double DistanceX = QueryX - ClosestX;
             const double DistanceY = QueryY - ClosestY;
-            const float DistanceSquared = static_cast<float>(
+            const float HorizontalDistanceSquared = static_cast<float>(
                 DistanceX * DistanceX + DistanceY * DistanceY);
+
+            const float StartRadius = FMath::Abs(ControlRadiusData[SegmentIndex]);
+            const float EndRadius = FMath::Abs(ControlRadiusData[SegmentIndex + 1]);
+            const float StartFloorZ = TunnelFloorZ(A, StartRadius);
+            const float EndFloorZ = TunnelFloorZ(B, EndRadius);
+            const double FloorDeltaZ = static_cast<double>(EndFloorZ - StartFloorZ);
+            const double FullLengthSquared =
+                LengthSquared + FloorDeltaZ * FloorDeltaZ;
+            if (!(FullLengthSquared > KINDA_SMALL_NUMBER))
+            {
+                continue;
+            }
+
+            // A switchback may place two different floors at the same XY. Select the segment
+            // nearest to the complete query point on the floor curve, so a lower passage leg
+            // cannot inherit the floor height of a vertically separated upper leg. Keep floor
+            // interpolation horizontal after choosing the branch: FloorZ remains a function of XY.
+            const double FullDot = HorizontalDot
+                + (static_cast<double>(Position.Z) - StartFloorZ) * FloorDeltaZ;
+            const float SpatialT = FMath::Clamp(
+                FullDot / FullLengthSquared,
+                0.0f, 1.0f);
+            const double SpatialX = AXY_X + DeltaX * SpatialT;
+            const double SpatialY = AXY_Y + DeltaY * SpatialT;
+            const double SpatialZ = StartFloorZ + FloorDeltaZ * SpatialT;
+            const double SpatialDistanceX = QueryX - SpatialX;
+            const double SpatialDistanceY = QueryY - SpatialY;
+            const double SpatialDistanceZ = Position.Z - SpatialZ;
+            const float DistanceSquared = static_cast<float>(
+                SpatialDistanceX * SpatialDistanceX
+                + SpatialDistanceY * SpatialDistanceY
+                + SpatialDistanceZ * SpatialDistanceZ);
             if (DistanceSquared >= BestDistanceSquared)
             {
                 continue;
             }
 
-            const float StartRadius = FMath::Abs(ControlRadiusData[SegmentIndex]);
-            const float EndRadius = FMath::Abs(ControlRadiusData[SegmentIndex + 1]);
             OutFloorZ = FMath::Lerp(
-                TunnelFloorZ(A, StartRadius),
-                TunnelFloorZ(B, EndRadius),
-                T);
+                StartFloorZ,
+                EndFloorZ,
+                HorizontalT);
             OutSupportRadius = FMath::Max(
                 FMath::Min(StartRadius, EndRadius) - 0.5f,
                 PlayerRadiusVoxels);
@@ -398,6 +453,7 @@ namespace VoxelPassageGeometry
                 *OutSegmentIndex = SegmentIndex;
             }
             BestDistanceSquared = DistanceSquared;
+            BestHorizontalDistanceSquared = HorizontalDistanceSquared;
             bFoundSegment = true;
         }
 
@@ -405,7 +461,7 @@ namespace VoxelPassageGeometry
             && VoxelMath::IsFinite(OutFloorZ)
             && VoxelMath::IsFinite(OutSupportRadius)
             && OutSupportRadius > 0.0f
-            && BestDistanceSquared <= FMath::Square(OutSupportRadius);
+            && BestHorizontalDistanceSquared <= FMath::Square(OutSupportRadius);
     }
 
     struct FOriginLandingGeometry
