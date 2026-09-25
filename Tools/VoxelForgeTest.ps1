@@ -992,7 +992,9 @@ function Get-CollisionGateStressMetrics([string]$LogPath) {
     if ($result.Success -and $result.Groups['v'].Value -eq 'PASS') { $metrics.status = 'passed' }
     foreach ($key in @('reason', 'elapsed_s', 'distance_m', 'expected_distance_m', 'speed_cm_s',
                         'gate_holds', 'gate_total_s', 'max_gate_s', 'full_stops',
-                        'full_stop_total_s', 'collision_gate')) {
+                        'full_stop_total_s', 'collision_gate', 'gate_progress_m', 'support_tile',
+                        'support_first_check_to_submit_s',
+                        'support_first_check_to_collision_ready_s')) {
         $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
         if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
     }

@@ -1118,6 +1118,7 @@ public:
     double HeadlessCollisionGateStressTestGateStartSeconds = 0.0;
     double HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
     double HeadlessCollisionGateStressTestDistanceCm = 0.0;
+    double HeadlessCollisionGateStressTestGateDistanceCm = 0.0;
     double HeadlessCollisionGateStressTestTotalGateDurationSeconds = 0.0;
     double HeadlessCollisionGateStressTestMaxGateDurationSeconds = 0.0;
     double HeadlessCollisionGateStressTestFullStopDurationSeconds = 0.0;
@@ -1226,6 +1227,14 @@ public:
     bool bPawnGateUnsupportedReported = false;
     FVoxelTileKey PawnGateRequestedSupportTile;
     bool bPawnGateSupportRequestReported = false;
+    // Keep the first unresolved support request's timing for the startup gate repro. This is
+    // intentionally retained after release so the stress-test result can report the bootstrap path.
+    FVoxelTileKey StartupCollisionGateSupportTile;
+    bool bStartupCollisionGateTimingCaptured = false;
+    bool bStartupCollisionGateAdoptionReported = false;
+    double StartupCollisionGateFirstCheckSeconds = 0.0;
+    double StartupCollisionGateSubmittedSeconds = 0.0;
+    double StartupCollisionGateReadySeconds = 0.0;
 
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
     // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp
