@@ -34,6 +34,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Async/Async.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialParameterCollection.h"
@@ -1890,12 +1891,17 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     bHeadlessCollisionGateStressTestExitRequested = false;
     bHeadlessCollisionGateStressTestGateWasEngaged = false;
     bHeadlessCollisionGateStressTestFullStop = false;
+    bHeadlessCollisionGateStressTestStartHeightCrossed = false;
+    bHeadlessCollisionGateStressTestTerrainViolation = false;
+    bHeadlessCollisionGateStressTestTerrainMeasurementMissing = false;
+    bHeadlessCollisionGateStressTestLanded = false;
+    bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured = false;
     HeadlessCollisionGateStressTestSpeedCmPerSecond = 6000.0f;
-    HeadlessCollisionGateStressTestStartDelaySeconds = 0.1f;
     HeadlessCollisionGateStressTestDurationSeconds = 2.0f;
     HeadlessCollisionGateStressTestTimeoutSeconds = 15.0f;
     HeadlessCollisionGateStressTestBeginSeconds = 0.0;
     HeadlessCollisionGateStressTestStartSeconds = 0.0;
+    HeadlessCollisionGateStressTestLandedSeconds = 0.0;
     HeadlessCollisionGateStressTestGateStartSeconds = 0.0;
     HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
     HeadlessCollisionGateStressTestDistanceCm = 0.0;
@@ -1903,10 +1909,21 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
     HeadlessCollisionGateStressTestTotalGateDurationSeconds = 0.0;
     HeadlessCollisionGateStressTestMaxGateDurationSeconds = 0.0;
     HeadlessCollisionGateStressTestFullStopDurationSeconds = 0.0;
+    HeadlessCollisionGateStressTestLaunchSupportCheckSeconds = 0.0;
+    HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = 0.0;
+    HeadlessCollisionGateStressTestLaunchSupportReadySeconds = 0.0;
+    HeadlessCollisionGateStressTestMinClearanceCm = 1.0e30;
+    HeadlessCollisionGateStressTestMinFeetDensity = 0.0f;
+    HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ = 0.0f;
+    HeadlessCollisionGateStressTestTerrainSampleCount = 0;
+    HeadlessCollisionGateStressTestTraceFrame = 0;
     HeadlessCollisionGateStressTestGateHoldCount = 0;
     HeadlessCollisionGateStressTestFullStopCount = 0;
-    HeadlessCollisionGateStressTestDirection = FVector::XAxisVector;
+    HeadlessCollisionGateStressTestDirection = FVector::ZeroVector;
     HeadlessCollisionGateStressTestLastActualPosition = FVector::ZeroVector;
+    HeadlessCollisionGateStressTestStartPosition = FVector::ZeroVector;
+    HeadlessCollisionGateStressTestMinClearancePosition = FVector::ZeroVector;
+    HeadlessCollisionGateStressTestLaunchSupportTile = FVoxelTileKey();
     HeadlessCollisionGateStressTestFailureReason.Reset();
     bHeadlessSurfaceFallTest = false;
     bHeadlessSurfaceFallTestStartPlaced = false;
@@ -2188,19 +2205,15 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
                 *HeadlessCollisionGateStressTestFailureReason);
         }
         float StressSpeed = HeadlessCollisionGateStressTestSpeedCmPerSecond;
-        float StressStartDelay = HeadlessCollisionGateStressTestStartDelaySeconds;
         float StressDuration = HeadlessCollisionGateStressTestDurationSeconds;
         float StressTimeout = HeadlessCollisionGateStressTestTimeoutSeconds;
         FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressSpeedCmPerSecond="),
                       StressSpeed);
-        FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressStartDelaySeconds="),
-                      StressStartDelay);
         FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressDurationSeconds="),
                       StressDuration);
         FParse::Value(CommandLine, TEXT("voxel.TestCollisionGateStressTimeoutSeconds="),
                       StressTimeout);
         HeadlessCollisionGateStressTestSpeedCmPerSecond = FMath::Max(StressSpeed, 1.0f);
-        HeadlessCollisionGateStressTestStartDelaySeconds = FMath::Max(StressStartDelay, 0.0f);
         HeadlessCollisionGateStressTestDurationSeconds = FMath::Max(StressDuration, 0.25f);
         HeadlessCollisionGateStressTestTimeoutSeconds = FMath::Max(StressTimeout, 1.0f);
         // The stress path owns movement and keeps the streamer centred at the launch tile. Do
@@ -2210,9 +2223,8 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
         HeadlessCollisionGateStressTestBeginSeconds = 0.0;
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeCollisionGateStressTest] configured=1 speed_cm_s=%.1f "
-                 "start_delay_s=%.3f duration_s=%.3f timeout_s=%.3f"),
+                 "duration_after_landing_s=%.3f timeout_s=%.3f"),
             HeadlessCollisionGateStressTestSpeedCmPerSecond,
-            HeadlessCollisionGateStressTestStartDelaySeconds,
             HeadlessCollisionGateStressTestDurationSeconds,
             HeadlessCollisionGateStressTestTimeoutSeconds);
     }
@@ -2926,6 +2938,72 @@ void AVoxelWorld::AdvanceHeadlessStreamingTest(
     }
 }
 
+bool AVoxelWorld::MeasureHeadlessCollisionGateStressTerrain(
+    const FVector& WorldPosition, float CapsuleHalfHeightCm,
+    float& OutFeetDensity, float& OutCenterDensity,
+    float& OutSurfaceLocalVoxelZ, float& OutClearanceCm) const
+{
+    OutFeetDensity = 0.0f;
+    OutCenterDensity = 0.0f;
+    OutSurfaceLocalVoxelZ = 0.0f;
+    OutClearanceCm = 0.0f;
+    if (Generator == nullptr || !VoxelMath::IsFinite(CapsuleHalfHeightCm)
+        || CapsuleHalfHeightCm < 0.0f)
+    {
+        return false;
+    }
+
+    const FVector LocalPosition = WorldToLocalVoxel(WorldPosition);
+    const float FeetZ = LocalPosition.Z - CapsuleHalfHeightCm / VOXEL_SIZE;
+    OutCenterDensity = Generator->GetDensityAt(
+        LocalPosition.X, LocalPosition.Y, LocalPosition.Z);
+    OutFeetDensity = Generator->GetDensityAt(
+        LocalPosition.X, LocalPosition.Y, FeetZ);
+    if (!VoxelMath::IsFinite(OutCenterDensity) || !VoxelMath::IsFinite(OutFeetDensity))
+    {
+        return false;
+    }
+
+    // The density field is the authoritative terrain oracle (negative = solid). Find the
+    // nearest air/solid zero crossing adjacent to the capsule's lowest point, then linearly
+    // interpolate it. Searching up when the feet sample is solid reports negative clearance
+    // instead of silently choosing a lower floor after a fall-through.
+    constexpr float SearchStepVoxels = 0.5f;
+    constexpr int32 MaxSearchSteps = 256; // 128 voxels, enough to cover the local landing band.
+    float LastZ = FeetZ;
+    float LastDensity = OutFeetDensity;
+    const bool bSearchDown = OutFeetDensity >= 0.0f;
+    for (int32 Step = 1; Step <= MaxSearchSteps; ++Step)
+    {
+        const float SampleZ = FeetZ + (bSearchDown ? -1.0f : 1.0f)
+            * SearchStepVoxels * static_cast<float>(Step);
+        const float SampleDensity = Generator->GetDensityAt(
+            LocalPosition.X, LocalPosition.Y, SampleZ);
+        if (!VoxelMath::IsFinite(SampleDensity))
+        {
+            return false;
+        }
+
+        const bool bCrossedSurface = bSearchDown
+            ? (LastDensity >= 0.0f && SampleDensity < 0.0f)
+            : (LastDensity <= 0.0f && SampleDensity > 0.0f);
+        if (bCrossedSurface)
+        {
+            const float Denominator = LastDensity - SampleDensity;
+            const float Alpha = FMath::IsNearlyZero(Denominator)
+                ? 0.5f
+                : FMath::Clamp(LastDensity / Denominator, 0.0f, 1.0f);
+            OutSurfaceLocalVoxelZ = FMath::Lerp(LastZ, SampleZ, Alpha);
+            OutClearanceCm = (FeetZ - OutSurfaceLocalVoxelZ) * VOXEL_SIZE;
+            return true;
+        }
+
+        LastZ = SampleZ;
+        LastDensity = SampleDensity;
+    }
+    return false;
+}
+
 void AVoxelWorld::AdvanceHeadlessCollisionGateStressTest(
     FVector& InOutPlayerPosition, FVector& InOutPlayerHeading, APawn* PlayerPawn)
 {
@@ -2938,22 +3016,121 @@ void AVoxelWorld::AdvanceHeadlessCollisionGateStressTest(
     const double Now = FPlatformTime::Seconds();
     if (!bHeadlessCollisionGateStressTestStartPlaced)
     {
-        FVoxelTileKey SupportTile;
-        const TCHAR* SupportUnavailableReason = nullptr;
-        const bool bSupportReady = IsPlayerSupportCollisionReady(
-            PlayerPawn, InOutPlayerPosition, &SupportTile, &SupportUnavailableReason);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] owner_settings clip_radius=%d "
+                 "max_clip_level=%d render_distance_chunks=%d far_sheet_ring=%d"),
+            Settings != nullptr ? Settings->ClipRadius : -1,
+            Settings != nullptr ? Settings->MaxClipLevel : -1,
+            Settings != nullptr ? Settings->RenderDistanceChunks : -1,
+            Settings != nullptr && Settings->bFarSheetRing ? 1 : 0);
+        float CapsuleHalfHeightCm = 0.0f;
+        if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+            {
+                CapsuleHalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+            }
+        }
+
+        // The earlier horizontal route ran through an open origin drop and ended more than a
+        // metre above its floor. Start above the measured density surface at this XY so the pawn
+        // must fall onto a freshly requested level-0 tile before the horizontal diagnostic.
+        constexpr float LaunchLocalVoxelX = 18.2f;
+        constexpr float LaunchLocalVoxelY = 0.0f;
+        constexpr float LaunchHeightAboveGroundVoxels = 10.0f;
+        const FVector SurfaceProbeWorld = LocalVoxelToWorld(
+            FVector(LaunchLocalVoxelX, LaunchLocalVoxelY, 0.0f));
+        float ProbeFeetDensity = 0.0f;
+        float ProbeCenterDensity = 0.0f;
+        float SurfaceLocalVoxelZ = 0.0f;
+        float ProbeClearanceCm = 0.0f;
+        const bool bSurfaceFound = MeasureHeadlessCollisionGateStressTerrain(
+            SurfaceProbeWorld, CapsuleHalfHeightCm, ProbeFeetDensity,
+            ProbeCenterDensity, SurfaceLocalVoxelZ, ProbeClearanceCm);
+        if (!bSurfaceFound)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason =
+                TEXT("stress_launch_surface_unavailable");
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeCollisionGateStressTest] launch_setup_failed "
+                     "reason=stress_launch_surface_unavailable probe=(%.2f,%.2f,%.2f) "
+                     "feet_density=%.6f"),
+                SurfaceProbeWorld.X, SurfaceProbeWorld.Y, SurfaceProbeWorld.Z,
+                ProbeFeetDensity);
+            return;
+        }
+
+        const FVector LaunchVoxel(
+            LaunchLocalVoxelX,
+            LaunchLocalVoxelY,
+            SurfaceLocalVoxelZ + CapsuleHalfHeightCm / VOXEL_SIZE
+                + LaunchHeightAboveGroundVoxels);
+        const FVector RequestedLaunchWorld = LocalVoxelToWorld(LaunchVoxel);
+        const bool bPlaced = PlayerPawn->SetActorLocation(
+            RequestedLaunchWorld, false, nullptr, ETeleportType::TeleportPhysics);
+        if (!bPlaced)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason = TEXT("stress_launch_placement_failed");
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeCollisionGateStressTest] launch_setup_failed "
+                     "reason=stress_launch_placement_failed requested=(%.2f,%.2f,%.2f)"),
+                RequestedLaunchWorld.X, RequestedLaunchWorld.Y, RequestedLaunchWorld.Z);
+            return;
+        }
 
         const FVector ActualPosition = PlayerPawn->GetActorLocation();
-        const FVector LaunchVoxel = WorldToLocalVoxel(ActualPosition);
-        // Freeze only the streaming centre, not the pawn. This deliberately leaves the desired
-        // clipmap behind the run while the launch support is already ready.
+        const FVector ActualLaunchVoxel = WorldToLocalVoxel(ActualPosition);
+        // Keep streaming centred on the launch footprint while the character drops and later
+        // moves horizontally. The support tile below the capsule is still not cooked at launch.
         bHeadlessStreamingTestCenterOverride = true;
-        HeadlessStreamingTestCenterVoxel = LaunchVoxel;
+        HeadlessStreamingTestCenterVoxel = ActualLaunchVoxel;
         InOutPlayerPosition = ActualPosition;
         InOutPlayerHeading = FVector::ZeroVector;
         HeadlessCollisionGateStressTestLastActualPosition = ActualPosition;
+        HeadlessCollisionGateStressTestStartPosition = ActualPosition;
+        HeadlessCollisionGateStressTestDirection = FVector::ZeroVector;
+        bHeadlessCollisionGateStressTestLanded = false;
+
+        FVoxelTileKey FootTile;
+        const bool bHaveFootTile = GetPlayerSupportTile(PlayerPawn, ActualPosition, FootTile);
+        FVoxelTileKey GateSupportTile;
+        const TCHAR* SupportUnavailableReason = nullptr;
+        const bool bSupportReady = IsPlayerSupportCollisionReady(
+            PlayerPawn, ActualPosition, &GateSupportTile, &SupportUnavailableReason);
+        const bool bFootTileReady = bHaveFootTile && IsTileCollisionReady(FootTile);
+        if (!bHaveFootTile)
+        {
+            bHeadlessCollisionGateStressTestFailed = true;
+            HeadlessCollisionGateStressTestFailureReason = TEXT("stress_launch_support_missing");
+            UE_LOG(LogTemp, Error,
+                TEXT("[VoxelForgeCollisionGateStressTest] launch_setup_failed "
+                     "reason=stress_launch_support_missing"));
+            return;
+        }
+        HeadlessCollisionGateStressTestLaunchSupportTile = FootTile;
+        bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured = true;
+        HeadlessCollisionGateStressTestLaunchSupportCheckSeconds = Now;
+        if (bFootTileReady)
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = Now;
+            HeadlessCollisionGateStressTestLaunchSupportReadySeconds = Now;
+        }
+        else if (PendingTiles.Contains(FootTile) || LoadedTiles.Contains(FootTile))
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = Now;
+        }
+
         bHeadlessCollisionGateStressTestStartPlaced = true;
         HeadlessCollisionGateStressTestStartSeconds = Now;
+        HeadlessCollisionGateStressTestBeginSeconds = Now;
+        bHeadlessCollisionGateStressTestStarted = true;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] drop_started position=(%.1f,%.1f,%.1f) "
+                 "support=(%d,%d,%d)"),
+            ActualPosition.X, ActualPosition.Y, ActualPosition.Z,
+            FootTile.Coord.X, FootTile.Coord.Y, FootTile.Coord.Z);
 
         if (ACharacter* Character = Cast<ACharacter>(PlayerPawn))
         {
@@ -2968,43 +3145,73 @@ void AVoxelWorld::AdvanceHeadlessCollisionGateStressTest(
                     CharacterMovement->BrakingDecelerationWalking,
                     HeadlessCollisionGateStressTestSpeedCmPerSecond * 8.0f);
                 CharacterMovement->StopMovementImmediately();
-                CharacterMovement->SetMovementMode(MOVE_Walking);
+                CharacterMovement->SetMovementMode(MOVE_Falling);
+                // Exercise the gate's actual hazard: a pawn descending onto a just-streamed
+                // floor fast enough to cross the surface in one movement frame if uncooked.
+                CharacterMovement->Velocity = FVector(
+                    0.0f, 0.0f, -HeadlessCollisionGateStressTestSpeedCmPerSecond);
+                CharacterMovement->UpdateComponentVelocity();
             }
         }
 
+        float FeetDensity = 0.0f;
+        float CenterDensity = 0.0f;
+        float ActualSurfaceLocalVoxelZ = 0.0f;
+        float ClearanceCm = 0.0f;
+        const bool bLaunchSurfaceFound = MeasureHeadlessCollisionGateStressTerrain(
+            ActualPosition, CapsuleHalfHeightCm, FeetDensity, CenterDensity,
+            ActualSurfaceLocalVoxelZ, ClearanceCm);
+        if (bLaunchSurfaceFound)
+        {
+            HeadlessCollisionGateStressTestMinClearanceCm = ClearanceCm;
+            HeadlessCollisionGateStressTestMinClearancePosition = ActualPosition;
+            HeadlessCollisionGateStressTestMinFeetDensity = FeetDensity;
+            HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ = ActualSurfaceLocalVoxelZ;
+            ++HeadlessCollisionGateStressTestTerrainSampleCount;
+        }
+        else
+        {
+            bHeadlessCollisionGateStressTestTerrainMeasurementMissing = true;
+        }
+
         UE_LOG(LogTemp, Display,
-            TEXT("[VoxelForgeCollisionGateStressTest] start_placed support=(%d,%d,%d) ready=%d "
-                 "reason=%s "
-                 "position=(%.1f,%.1f,%.1f) launch_vox=(%.2f,%.2f,%.2f)"),
-            SupportTile.Coord.X, SupportTile.Coord.Y, SupportTile.Coord.Z,
+            TEXT("[VoxelForgeCollisionGateStressTest] start_placed moved=%d "
+                 "support=(%d,%d,%d) tile_collision_ready=%d gate_support=(%d,%d,%d) "
+                 "gate_support_ready=%d unavailable=%s surface_vox_z=%.4f "
+                 "spawn_height_vox=%.2f position=(%.1f,%.1f,%.1f) "
+                 "launch_vox=(%.3f,%.3f,%.3f)"),
+            bPlaced ? 1 : 0,
+            FootTile.Coord.X, FootTile.Coord.Y, FootTile.Coord.Z,
+            bFootTileReady ? 1 : 0,
+            GateSupportTile.Coord.X, GateSupportTile.Coord.Y, GateSupportTile.Coord.Z,
             bSupportReady ? 1 : 0,
-            SupportUnavailableReason != nullptr ? SupportUnavailableReason : TEXT("pending"),
+            SupportUnavailableReason != nullptr ? SupportUnavailableReason : TEXT("none"),
+            SurfaceLocalVoxelZ, LaunchHeightAboveGroundVoxels,
             ActualPosition.X, ActualPosition.Y, ActualPosition.Z,
-            LaunchVoxel.X, LaunchVoxel.Y, LaunchVoxel.Z);
+            ActualLaunchVoxel.X, ActualLaunchVoxel.Y, ActualLaunchVoxel.Z);
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] start_density feet=%.6f center=%.6f "
+                 "surface_found=%d surface_vox_z=%.4f clearance_cm=%.3f "
+                 "half_height_cm=%.2f probe_feet_density=%.6f"),
+            FeetDensity, CenterDensity, bLaunchSurfaceFound ? 1 : 0,
+            ActualSurfaceLocalVoxelZ, ClearanceCm, CapsuleHalfHeightCm, ProbeFeetDensity);
         return;
     }
 
-    const double SinceLaunch = Now - HeadlessCollisionGateStressTestStartSeconds;
-    if (!bHeadlessCollisionGateStressTestStarted
-        && SinceLaunch < static_cast<double>(HeadlessCollisionGateStressTestStartDelaySeconds))
+    // The measured interval starts with the vertical drop. Horizontal movement begins only after
+    // CharacterMovement reports a landing, so the test observes the entire fall and then checks
+    // that support gating leaves horizontal movement available.
+    if (!bHeadlessCollisionGateStressTestLanded)
     {
+        InOutPlayerHeading = FVector::ZeroVector;
         return;
-    }
-    if (!bHeadlessCollisionGateStressTestStarted)
-    {
-        bHeadlessCollisionGateStressTestStarted = true;
-        HeadlessCollisionGateStressTestBeginSeconds = Now;
-        HeadlessCollisionGateStressTestStartSeconds = Now;
-        HeadlessCollisionGateStressTestLastActualPosition = InOutPlayerPosition;
-        UE_LOG(LogTemp, Display,
-            TEXT("[VoxelForgeCollisionGateStressTest] movement_started speed_cm_s=%.1f"),
-            HeadlessCollisionGateStressTestSpeedCmPerSecond);
     }
 
     const FVector WorldDirection = GetActorTransform().TransformVectorNoScale(
         HeadlessCollisionGateStressTestDirection).GetSafeNormal();
     if (WorldDirection.IsNearlyZero())
     {
+        InOutPlayerHeading = FVector::ZeroVector;
         return;
     }
 
@@ -3033,14 +3240,16 @@ void AVoxelWorld::ObserveHeadlessCollisionGateStressTest(
     const FVector& PlayerPosition, APawn* PlayerPawn)
 {
     if (!bHeadlessCollisionGateStressTest || !bHeadlessCollisionGateStressTestStarted
-        || !IsValid(PlayerPawn) || bHeadlessCollisionGateStressTestExitRequested)
+        || !IsValid(PlayerPawn) || bHeadlessCollisionGateStressTestExitRequested
+        || bHeadlessCollisionGateStressTestFailed)
     {
         return;
     }
 
     const double Now = FPlatformTime::Seconds();
+    const FVector PreviousPosition = HeadlessCollisionGateStressTestLastActualPosition;
     const float HorizontalDelta = FVector::Dist2D(
-        HeadlessCollisionGateStressTestLastActualPosition, PlayerPosition);
+        PreviousPosition, PlayerPosition);
     HeadlessCollisionGateStressTestDistanceCm += HorizontalDelta;
     HeadlessCollisionGateStressTestLastActualPosition = PlayerPosition;
 
@@ -3077,7 +3286,8 @@ void AVoxelWorld::ObserveHeadlessCollisionGateStressTest(
     // interval before calling it a full stop; a permanent stop still fails through the distance
     // shortfall check below, while repeated gate holds remain visible in gate_holds/total_s.
     constexpr double FullStopConfirmationSeconds = 0.05;
-    const bool bNoHorizontalProgress = bGateEngaged && HorizontalDelta <= 0.01f;
+    const bool bNoHorizontalProgress = bGateEngaged
+        && bHeadlessCollisionGateStressTestLanded && HorizontalDelta <= 0.01f;
     if (bNoHorizontalProgress)
     {
         if (HeadlessCollisionGateStressTestFullStopStartSeconds <= 0.0)
@@ -3104,7 +3314,260 @@ void AVoxelWorld::ObserveHeadlessCollisionGateStressTest(
         HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
     }
 
-    if (Now - HeadlessCollisionGateStressTestStartSeconds
+    float CapsuleHalfHeightCm = 0.0f;
+    FVector PawnVelocity = PlayerPawn->GetVelocity();
+    if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+    {
+        if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+        {
+            CapsuleHalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+        }
+        if (const UCharacterMovementComponent* CharacterMovement =
+                Character->GetCharacterMovement())
+        {
+            PawnVelocity = CharacterMovement->Velocity;
+        }
+    }
+
+    const FVoxelTileKey& LaunchSupportTile =
+        HeadlessCollisionGateStressTestLaunchSupportTile;
+    const bool bLaunchTileMatches =
+        bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured
+        && LaunchSupportTile.Level == 0;
+    if (bLaunchTileMatches)
+    {
+        const bool bPending = PendingTiles.Contains(LaunchSupportTile);
+        const bool bLoaded = LoadedTiles.Contains(LaunchSupportTile);
+        if (HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds <= 0.0
+            && (bPending || bLoaded))
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = Now;
+        }
+        if (HeadlessCollisionGateStressTestLaunchSupportReadySeconds <= 0.0
+            && IsTileCollisionReady(LaunchSupportTile))
+        {
+            if (HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds <= 0.0)
+            {
+                HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = Now;
+            }
+            HeadlessCollisionGateStressTestLaunchSupportReadySeconds = Now;
+        }
+    }
+
+    if (!bHeadlessCollisionGateStressTestLanded)
+    {
+        if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
+        {
+            if (const UCharacterMovementComponent* CharacterMovement =
+                    Character->GetCharacterMovement();
+                CharacterMovement != nullptr && CharacterMovement->IsMovingOnGround())
+            {
+                bHeadlessCollisionGateStressTestLanded = true;
+                HeadlessCollisionGateStressTestLandedSeconds = Now;
+                HeadlessCollisionGateStressTestDirection = FVector::XAxisVector;
+                // Follow the character after landing so the horizontal diagnostic exercises the
+                // normal desired-set path while the support gate remains active.
+                bHeadlessStreamingTestCenterOverride = false;
+                UPrimitiveComponent* MovementBase = CharacterMovement->GetMovementBase();
+                const FVector MovementBaseLocation = IsValid(MovementBase)
+                    ? MovementBase->GetComponentLocation() : FVector::ZeroVector;
+                UE_LOG(LogTemp, Display,
+                    TEXT("[VoxelForgeCollisionGateStressTest] landed elapsed_s=%.6f "
+                         "position=(%.2f,%.2f,%.2f) velocity=(%.2f,%.2f,%.2f) "
+                         "movement_mode=%d base=%s base_location=(%.2f,%.2f,%.2f) "
+                         "launch_support_ready=%d"),
+                    Now - HeadlessCollisionGateStressTestBeginSeconds,
+                    PlayerPosition.X, PlayerPosition.Y, PlayerPosition.Z,
+                    PawnVelocity.X, PawnVelocity.Y, PawnVelocity.Z,
+                    static_cast<int32>(CharacterMovement->MovementMode),
+                    *GetNameSafe(MovementBase),
+                    MovementBaseLocation.X, MovementBaseLocation.Y,
+                    MovementBaseLocation.Z,
+                    bLaunchTileMatches && IsTileCollisionReady(LaunchSupportTile) ? 1 : 0);
+            }
+        }
+    }
+
+    float FeetDensity = 0.0f;
+    float CenterDensity = 0.0f;
+    float SurfaceLocalVoxelZ = 0.0f;
+    float ClearanceCm = 0.0f;
+    const bool bSurfaceFound = MeasureHeadlessCollisionGateStressTerrain(
+        PlayerPosition, CapsuleHalfHeightCm, FeetDensity, CenterDensity,
+        SurfaceLocalVoxelZ, ClearanceCm);
+    const FVector LocalPosition = WorldToLocalVoxel(PlayerPosition);
+    FVoxelTileKey FootTile;
+    const bool bHaveFootTile = GetPlayerSupportTile(PlayerPawn, PlayerPosition, FootTile);
+    const bool bFootTileCollisionReady = bHaveFootTile && IsTileCollisionReady(FootTile);
+    FVoxelTileKey GateSupportTile;
+    const TCHAR* GateSupportUnavailableReason = nullptr;
+    const bool bGateSupportReady = IsPlayerSupportCollisionReady(
+        PlayerPawn, PlayerPosition, &GateSupportTile, &GateSupportUnavailableReason);
+
+    if (bSurfaceFound)
+    {
+        ++HeadlessCollisionGateStressTestTerrainSampleCount;
+        if (ClearanceCm < HeadlessCollisionGateStressTestMinClearanceCm)
+        {
+            HeadlessCollisionGateStressTestMinClearanceCm = ClearanceCm;
+            HeadlessCollisionGateStressTestMinClearancePosition = PlayerPosition;
+            HeadlessCollisionGateStressTestMinFeetDensity = FeetDensity;
+            HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ = SurfaceLocalVoxelZ;
+        }
+    }
+    else
+    {
+        bHeadlessCollisionGateStressTestTerrainMeasurementMissing = true;
+    }
+
+    if (!bHeadlessCollisionGateStressTestStartHeightCrossed
+        && PlayerPosition.Z < HeadlessCollisionGateStressTestStartPosition.Z - 0.5f)
+    {
+        bHeadlessCollisionGateStressTestStartHeightCrossed = true;
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeCollisionGateStressTest] start_height_crossed elapsed_s=%.6f "
+                 "position=(%.2f,%.2f,%.2f) velocity=(%.2f,%.2f,%.2f) gate=%d "
+                 "foot_tile=(%d,%d,%d) foot_tile_ready=%d gate_support=(%d,%d,%d) "
+                 "gate_support_ready=%d unavailable=%s feet_density=%.6f "
+                 "surface_found=%d surface_vox_z=%.4f clearance_cm=%.3f"),
+            Now - HeadlessCollisionGateStressTestStartSeconds,
+            PlayerPosition.X, PlayerPosition.Y, PlayerPosition.Z,
+            PawnVelocity.X, PawnVelocity.Y, PawnVelocity.Z,
+            bPawnCollisionGateEngaged ? 1 : 0,
+            FootTile.Coord.X, FootTile.Coord.Y, FootTile.Coord.Z,
+            bFootTileCollisionReady ? 1 : 0,
+            GateSupportTile.Coord.X, GateSupportTile.Coord.Y, GateSupportTile.Coord.Z,
+            bGateSupportReady ? 1 : 0,
+            GateSupportUnavailableReason != nullptr
+                ? GateSupportUnavailableReason : TEXT("none"),
+            FeetDensity, bSurfaceFound ? 1 : 0, SurfaceLocalVoxelZ, ClearanceCm);
+    }
+
+    constexpr double AllowedSurfacePenetrationCm = 5.0;
+    bool bSweptIntoSolid = false;
+    FVector FirstSolidSample = PlayerPosition;
+    float FirstSolidDensity = FeetDensity;
+    const float SegmentLengthCm = FVector::Distance(PreviousPosition, PlayerPosition);
+    const int32 SegmentSamples = FMath::Clamp(
+        FMath::CeilToInt(SegmentLengthCm / (VOXEL_SIZE * 0.5f)), 1, 256);
+    for (int32 SampleIndex = 1; SampleIndex < SegmentSamples; ++SampleIndex)
+    {
+        const float Alpha = static_cast<float>(SampleIndex)
+            / static_cast<float>(SegmentSamples);
+        const FVector SampleWorldPosition = FMath::Lerp(PreviousPosition, PlayerPosition, Alpha);
+        float SampleFeetDensity = 0.0f;
+        float SampleCenterDensity = 0.0f;
+        float SampleSurfaceLocalVoxelZ = 0.0f;
+        float SampleClearanceCm = 0.0f;
+        const bool bSampleSurfaceFound = MeasureHeadlessCollisionGateStressTerrain(
+            SampleWorldPosition, CapsuleHalfHeightCm, SampleFeetDensity,
+            SampleCenterDensity, SampleSurfaceLocalVoxelZ, SampleClearanceCm);
+        if (bSampleSurfaceFound)
+        {
+            ++HeadlessCollisionGateStressTestTerrainSampleCount;
+            if (SampleClearanceCm < HeadlessCollisionGateStressTestMinClearanceCm)
+            {
+                HeadlessCollisionGateStressTestMinClearanceCm = SampleClearanceCm;
+                HeadlessCollisionGateStressTestMinClearancePosition = SampleWorldPosition;
+                HeadlessCollisionGateStressTestMinFeetDensity = SampleFeetDensity;
+                HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ =
+                    SampleSurfaceLocalVoxelZ;
+            }
+        }
+        else
+        {
+            bHeadlessCollisionGateStressTestTerrainMeasurementMissing = true;
+        }
+        if ((bSampleSurfaceFound
+                && SampleClearanceCm < -AllowedSurfacePenetrationCm)
+            || (!bSampleSurfaceFound && SampleFeetDensity < -0.25f))
+        {
+            bSweptIntoSolid = true;
+            FirstSolidSample = SampleWorldPosition;
+            FirstSolidDensity = SampleFeetDensity;
+            break;
+        }
+    }
+
+    const bool bBelowSurface = bSurfaceFound
+        ? ClearanceCm < -AllowedSurfacePenetrationCm
+        : FeetDensity < -0.25f;
+    FVector ViolationPosition = bSweptIntoSolid ? FirstSolidSample : PlayerPosition;
+    float ViolationFeetDensity = bSweptIntoSolid ? FirstSolidDensity : FeetDensity;
+    float ViolationCenterDensity = CenterDensity;
+    float ViolationSurfaceLocalVoxelZ = SurfaceLocalVoxelZ;
+    float ViolationClearanceCm = ClearanceCm;
+    const bool bViolationSurfaceFound = bSweptIntoSolid
+        ? MeasureHeadlessCollisionGateStressTerrain(
+            ViolationPosition, CapsuleHalfHeightCm, ViolationFeetDensity,
+            ViolationCenterDensity, ViolationSurfaceLocalVoxelZ,
+            ViolationClearanceCm)
+        : bSurfaceFound;
+    const bool bSweptPenetrationExceedsTolerance = bSweptIntoSolid
+        && (!bViolationSurfaceFound
+            || ViolationClearanceCm < -AllowedSurfacePenetrationCm);
+    if (bBelowSurface || bSweptPenetrationExceedsTolerance)
+    {
+        if (bViolationSurfaceFound
+            && ViolationClearanceCm < HeadlessCollisionGateStressTestMinClearanceCm)
+        {
+            HeadlessCollisionGateStressTestMinClearanceCm = ViolationClearanceCm;
+            HeadlessCollisionGateStressTestMinClearancePosition = ViolationPosition;
+            HeadlessCollisionGateStressTestMinFeetDensity = ViolationFeetDensity;
+            HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ =
+                ViolationSurfaceLocalVoxelZ;
+        }
+        bHeadlessCollisionGateStressTestTerrainViolation = true;
+        bHeadlessCollisionGateStressTestFailed = true;
+        HeadlessCollisionGateStressTestFailureReason = TEXT("terrain_penetration");
+        FVoxelTileKey ViolationFootTile;
+        const bool bHaveViolationFootTile = GetPlayerSupportTile(
+            PlayerPawn, ViolationPosition, ViolationFootTile);
+        UE_LOG(LogTemp, Error,
+            TEXT("[VoxelForgeCollisionGateStressTest] first_terrain_penetration "
+                 "elapsed_s=%.6f position=(%.2f,%.2f,%.2f) local_vox=(%.3f,%.3f,%.3f) "
+                 "velocity=(%.2f,%.2f,%.2f) gate=%d foot_tile=(%d,%d,%d) "
+                 "foot_tile_ready=%d feet_density=%.6f surface_found=%d "
+                 "surface_vox_z=%.4f clearance_cm=%.3f swept=%d"),
+            Now - HeadlessCollisionGateStressTestStartSeconds,
+            ViolationPosition.X, ViolationPosition.Y, ViolationPosition.Z,
+            WorldToLocalVoxel(ViolationPosition).X,
+            WorldToLocalVoxel(ViolationPosition).Y,
+            WorldToLocalVoxel(ViolationPosition).Z,
+            PawnVelocity.X, PawnVelocity.Y, PawnVelocity.Z,
+            bPawnCollisionGateEngaged ? 1 : 0,
+            ViolationFootTile.Coord.X, ViolationFootTile.Coord.Y,
+            ViolationFootTile.Coord.Z,
+            bHaveViolationFootTile && IsTileCollisionReady(ViolationFootTile) ? 1 : 0,
+            ViolationFeetDensity, bViolationSurfaceFound ? 1 : 0,
+            ViolationSurfaceLocalVoxelZ, ViolationClearanceCm,
+            bSweptIntoSolid ? 1 : 0);
+    }
+
+    ++HeadlessCollisionGateStressTestTraceFrame;
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeCollisionGateStressTest] trace frame=%d elapsed_s=%.6f "
+             "position=(%.2f,%.2f,%.2f) local_vox=(%.3f,%.3f,%.3f) "
+             "velocity=(%.2f,%.2f,%.2f) gate=%d foot_tile=(%d,%d,%d) "
+             "foot_tile_ready=%d gate_support=(%d,%d,%d) gate_support_ready=%d "
+             "feet_density=%.6f center_density=%.6f surface_found=%d "
+             "surface_vox_z=%.4f clearance_cm=%.3f landed=%d segment_cm=%.2f"),
+        HeadlessCollisionGateStressTestTraceFrame,
+        Now - HeadlessCollisionGateStressTestStartSeconds,
+        PlayerPosition.X, PlayerPosition.Y, PlayerPosition.Z,
+        LocalPosition.X, LocalPosition.Y, LocalPosition.Z,
+        PawnVelocity.X, PawnVelocity.Y, PawnVelocity.Z,
+        bPawnCollisionGateEngaged ? 1 : 0,
+        FootTile.Coord.X, FootTile.Coord.Y, FootTile.Coord.Z,
+        bFootTileCollisionReady ? 1 : 0,
+        GateSupportTile.Coord.X, GateSupportTile.Coord.Y, GateSupportTile.Coord.Z,
+        bGateSupportReady ? 1 : 0,
+        FeetDensity, CenterDensity, bSurfaceFound ? 1 : 0,
+        SurfaceLocalVoxelZ, ClearanceCm,
+        bHeadlessCollisionGateStressTestLanded ? 1 : 0, SegmentLengthCm);
+
+    if (bHeadlessCollisionGateStressTestLanded
+        && Now - HeadlessCollisionGateStressTestLandedSeconds
         >= static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds))
     {
         return;
@@ -3449,37 +3912,28 @@ void AVoxelWorld::MaybeFinishHeadlessCollisionGateStressTest()
         HeadlessCollisionGateStressTestFailureReason = TEXT("stress_start_not_observed");
     }
     else if (bHeadlessCollisionGateStressTestStarted
+        && bHeadlessCollisionGateStressTestLanded
         && !bHeadlessCollisionGateStressTestPassed
         && !bHeadlessCollisionGateStressTestFailed
-        && Now - HeadlessCollisionGateStressTestStartSeconds
+        && Now - HeadlessCollisionGateStressTestLandedSeconds
             >= static_cast<double>(HeadlessCollisionGateStressTestDurationSeconds))
     {
-        // Total travel also reflects authored terrain along this deterministic path. Keep it as
-        // diagnostic output; judge the gate on support readiness and progress during a real hold.
-        if (!bStartupCollisionGateTimingCaptured)
+        // The gate's job is to protect the density surface. Travel, holds, and support timing
+        // stay in the report, but only measured capsule clearance decides PASS/FAIL.
+        if (bHeadlessCollisionGateStressTestTerrainViolation)
         {
-            bHeadlessCollisionGateStressTestFailed = true;
-            HeadlessCollisionGateStressTestFailureReason = TEXT("support_not_requested");
+            // The first penetration was recorded at the sample that observed it.
         }
-        else if (StartupCollisionGateSubmittedSeconds <= 0.0)
+        else if (HeadlessCollisionGateStressTestTerrainSampleCount == 0
+            || bHeadlessCollisionGateStressTestTerrainMeasurementMissing)
         {
             bHeadlessCollisionGateStressTestFailed = true;
-            HeadlessCollisionGateStressTestFailureReason = TEXT("support_not_submitted");
+            HeadlessCollisionGateStressTestFailureReason = TEXT("terrain_surface_unavailable");
         }
-        else if (StartupCollisionGateReadySeconds <= 0.0)
+        else if (HeadlessCollisionGateStressTestMinClearanceCm < -5.0)
         {
             bHeadlessCollisionGateStressTestFailed = true;
-            HeadlessCollisionGateStressTestFailureReason = TEXT("support_never_collision_ready");
-        }
-        else if (HeadlessCollisionGateStressTestGateHoldCount == 0)
-        {
-            bHeadlessCollisionGateStressTestFailed = true;
-            HeadlessCollisionGateStressTestFailureReason = TEXT("gate_not_engaged");
-        }
-        else if (HeadlessCollisionGateStressTestGateDistanceCm < 10.0)
-        {
-            bHeadlessCollisionGateStressTestFailed = true;
-            HeadlessCollisionGateStressTestFailureReason = TEXT("horizontal_progress_during_gate_shortfall");
+            HeadlessCollisionGateStressTestFailureReason = TEXT("terrain_clearance_below_tolerance");
         }
         else
         {
@@ -3531,6 +3985,66 @@ void AVoxelWorld::MaybeFinishHeadlessCollisionGateStressTest()
         ? FMath::Max(0.0, StartupCollisionGateReadySeconds
             - StartupCollisionGateFirstCheckSeconds)
         : -1.0;
+    const double StressSupportSubmitLatencySeconds =
+        bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured
+            && HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds > 0.0
+        ? FMath::Max(0.0,
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds
+                - HeadlessCollisionGateStressTestLaunchSupportCheckSeconds)
+        : -1.0;
+    const double StressSupportReadyLatencySeconds =
+        bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured
+            && HeadlessCollisionGateStressTestLaunchSupportReadySeconds > 0.0
+        ? FMath::Max(0.0,
+            HeadlessCollisionGateStressTestLaunchSupportReadySeconds
+                - HeadlessCollisionGateStressTestLaunchSupportCheckSeconds)
+        : -1.0;
+
+    float FinalFeetDensity = 0.0f;
+    float FinalCenterDensity = 0.0f;
+    float FinalSurfaceLocalVoxelZ = 0.0f;
+    float FinalClearanceCm = 0.0f;
+    float FinalHalfHeightCm = 0.0f;
+    FVector IgnoredCurrentPosition;
+    APawn* StressPawn = nullptr;
+    TryGetPlayerPosition(IgnoredCurrentPosition, &StressPawn);
+    if (const ACharacter* Character = Cast<ACharacter>(StressPawn))
+    {
+        if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+        {
+            FinalHalfHeightCm = Capsule->GetScaledCapsuleHalfHeight();
+        }
+    }
+    const bool bFinalSurfaceFound = MeasureHeadlessCollisionGateStressTerrain(
+        HeadlessCollisionGateStressTestLastActualPosition, FinalHalfHeightCm,
+        FinalFeetDensity, FinalCenterDensity, FinalSurfaceLocalVoxelZ, FinalClearanceCm);
+    const FVector FinalLocalPosition = WorldToLocalVoxel(
+        HeadlessCollisionGateStressTestLastActualPosition);
+    const float ColumnCenterZ = bFinalSurfaceFound
+        ? FinalSurfaceLocalVoxelZ : FinalLocalPosition.Z - FinalHalfHeightCm / VOXEL_SIZE;
+    FString DensityColumnSamples;
+    for (int32 Offset = 12; Offset >= -12; --Offset)
+    {
+        const float SampleZ = ColumnCenterZ + static_cast<float>(Offset);
+        const float Density = Generator != nullptr
+            ? Generator->GetDensityAt(FinalLocalPosition.X, FinalLocalPosition.Y, SampleZ)
+            : 0.0f;
+        if (!DensityColumnSamples.IsEmpty())
+        {
+            DensityColumnSamples += TEXT(",");
+        }
+        DensityColumnSamples += FString::Printf(TEXT("%.2f:%.5f"), SampleZ, Density);
+    }
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeCollisionGateStressTest] density_column world_xy=(%.2f,%.2f) "
+             "local_xy_vox=(%.4f,%.4f) surface_found=%d surface_vox_z=%.4f "
+             "feet_density=%.6f clearance_cm=%.3f samples_zvox_density=%s"),
+        HeadlessCollisionGateStressTestLastActualPosition.X,
+        HeadlessCollisionGateStressTestLastActualPosition.Y,
+        FinalLocalPosition.X, FinalLocalPosition.Y,
+        bFinalSurfaceFound ? 1 : 0, FinalSurfaceLocalVoxelZ,
+        FinalFeetDensity, FinalClearanceCm, *DensityColumnSamples);
+
     UE_LOG(LogTemp, Display,
         TEXT("[VoxelForgeCollisionGateStressTest] result=%s reason=%s elapsed_s=%.6f "
              "distance_m=%.6f expected_distance_m=%.6f speed_cm_s=%.1f "
@@ -3538,9 +4052,15 @@ void AVoxelWorld::MaybeFinishHeadlessCollisionGateStressTest()
              "full_stops=%d full_stop_total_s=%.6f collision_gate=%d "
              "support_tile=(%d,%d,%d) support_first_check_to_submit_s=%.6f "
              "support_first_check_to_collision_ready_s=%.6f "
-             "final_position=(%.1f,%.1f,%.1f)"),
+             "test_support_tile=(%d,%d,%d) "
+             "test_support_first_check_to_submit_s=%.6f "
+             "test_support_first_check_to_collision_ready_s=%.6f landed=%d "
+             "terrain_samples=%d terrain_measurement_missing=%d "
+             "start_height_crossed=%d min_clearance_cm=%.3f "
+             "min_clearance_position=(%.2f,%.2f,%.2f) min_feet_density=%.6f "
+             "min_surface_vox_z=%.4f final_position=(%.1f,%.1f,%.1f)"),
         bPassed ? TEXT("PASS") : TEXT("FAIL"),
-        bPassed ? TEXT("continuous_horizontal_progress")
+        bPassed ? TEXT("capsule_never_below_density_surface")
                 : *HeadlessCollisionGateStressTestFailureReason,
         Now - HeadlessCollisionGateStressTestBeginSeconds,
         HeadlessCollisionGateStressTestDistanceCm / 100.0,
@@ -3558,6 +4078,21 @@ void AVoxelWorld::MaybeFinishHeadlessCollisionGateStressTest()
         StartupCollisionGateSupportTile.Coord.Z,
         SupportSubmitLatencySeconds,
         SupportReadyLatencySeconds,
+        HeadlessCollisionGateStressTestLaunchSupportTile.Coord.X,
+        HeadlessCollisionGateStressTestLaunchSupportTile.Coord.Y,
+        HeadlessCollisionGateStressTestLaunchSupportTile.Coord.Z,
+        StressSupportSubmitLatencySeconds,
+        StressSupportReadyLatencySeconds,
+        bHeadlessCollisionGateStressTestLanded ? 1 : 0,
+        HeadlessCollisionGateStressTestTerrainSampleCount,
+        bHeadlessCollisionGateStressTestTerrainMeasurementMissing ? 1 : 0,
+        bHeadlessCollisionGateStressTestStartHeightCrossed ? 1 : 0,
+        HeadlessCollisionGateStressTestMinClearanceCm,
+        HeadlessCollisionGateStressTestMinClearancePosition.X,
+        HeadlessCollisionGateStressTestMinClearancePosition.Y,
+        HeadlessCollisionGateStressTestMinClearancePosition.Z,
+        HeadlessCollisionGateStressTestMinFeetDensity,
+        HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ,
         HeadlessCollisionGateStressTestLastActualPosition.X,
         HeadlessCollisionGateStressTestLastActualPosition.Y,
         HeadlessCollisionGateStressTestLastActualPosition.Z);
@@ -4535,6 +5070,26 @@ bool AVoxelWorld::IsPawnCapsuleOverlappingPendingFloor(
 
 void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTile)
 {
+    const double RequestCheckSeconds = FPlatformTime::Seconds();
+    const bool bIsStressLaunchSupport =
+        bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured
+        && HeadlessCollisionGateStressTestLaunchSupportTile.Coord == SupportTile.Coord
+        && HeadlessCollisionGateStressTestLaunchSupportTile.Level == SupportTile.Level;
+    if (bIsStressLaunchSupport)
+    {
+        const bool bPending = PendingTiles.Contains(SupportTile);
+        const bool bLoaded = LoadedTiles.Contains(SupportTile);
+        if (HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds <= 0.0
+            && (bPending || bLoaded || IsTileCollisionReady(SupportTile)))
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = RequestCheckSeconds;
+        }
+        if (HeadlessCollisionGateStressTestLaunchSupportReadySeconds <= 0.0
+            && IsTileCollisionReady(SupportTile))
+        {
+            HeadlessCollisionGateStressTestLaunchSupportReadySeconds = RequestCheckSeconds;
+        }
+    }
     if (SupportTile.Level != 0
         || IsTileCollisionReady(SupportTile)
         || CollisionNotRequiredTiles.Contains(SupportTile))
@@ -4542,7 +5097,6 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
         return;
     }
 
-    const double RequestCheckSeconds = FPlatformTime::Seconds();
     if (!bStartupCollisionGateTimingCaptured)
     {
         StartupCollisionGateSupportTile = SupportTile;
@@ -4578,6 +5132,11 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
     }
     if (PendingTiles.Contains(SupportTile) || LoadedTiles.Contains(SupportTile))
     {
+        if (bIsStressLaunchSupport
+            && HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds <= 0.0)
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = RequestCheckSeconds;
+        }
         if (bStartupCollisionGateTimingCaptured
             && StartupCollisionGateSupportTile.Coord == SupportTile.Coord
             && StartupCollisionGateSupportTile.Level == SupportTile.Level
@@ -4615,6 +5174,12 @@ void AVoxelWorld::RequestCollisionGateSupportTile(const FVoxelTileKey& SupportTi
     if (bSubmitted)
     {
         bAllChunksLoaded = false;
+        if (bIsStressLaunchSupport
+            && HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds <= 0.0)
+        {
+            HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds =
+                FPlatformTime::Seconds();
+        }
     }
     if (!bPawnGateSupportRequestReported || bSubmitted)
     {

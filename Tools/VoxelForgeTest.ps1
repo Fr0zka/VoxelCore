@@ -994,7 +994,12 @@ function Get-CollisionGateStressMetrics([string]$LogPath) {
                         'gate_holds', 'gate_total_s', 'max_gate_s', 'full_stops',
                         'full_stop_total_s', 'collision_gate', 'gate_progress_m', 'support_tile',
                         'support_first_check_to_submit_s',
-                        'support_first_check_to_collision_ready_s')) {
+                        'support_first_check_to_collision_ready_s', 'test_support_tile',
+                        'test_support_first_check_to_submit_s',
+                        'test_support_first_check_to_collision_ready_s', 'landed', 'terrain_samples',
+                        'terrain_measurement_missing', 'start_height_crossed',
+                        'min_clearance_cm', 'min_clearance_position', 'min_feet_density',
+                        'min_surface_vox_z', 'final_position')) {
         $match = [regex]::Match($line, ('{0}=(?<v>[^ ]+)' -f $key))
         if ($match.Success) { $metrics[$key] = $match.Groups['v'].Value }
     }
@@ -1451,7 +1456,6 @@ try {
         'gate-stress' {
             $baseCvars['voxel.TestCollisionGateStress'] = 1
             $baseCvars['voxel.TestCollisionGateStressSpeedCmPerSecond'] = 6000
-            $baseCvars['voxel.TestCollisionGateStressStartDelaySeconds'] = 0.1
             $baseCvars['voxel.TestCollisionGateStressDurationSeconds'] = 2
             $baseCvars['voxel.TestCollisionGateStressTimeoutSeconds'] = 30
             $args = New-CommonArguments 'game' (Join-Path $RunRoot 'Logs\gate-stress.log') (Merge-Cvars $baseCvars)
@@ -1506,7 +1510,6 @@ try {
             $stressBaseCvars = [ordered]@{
                 'voxel.TestCollisionGateStress' = 1
                 'voxel.TestCollisionGateStressSpeedCmPerSecond' = 6000
-                'voxel.TestCollisionGateStressStartDelaySeconds' = 0.1
                 'voxel.TestCollisionGateStressDurationSeconds' = 2
                 'voxel.TestCollisionGateStressTimeoutSeconds' = 30
             }

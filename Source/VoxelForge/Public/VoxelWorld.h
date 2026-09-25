@@ -548,6 +548,10 @@ private:
     void AdvanceHeadlessCollisionGateStressTest(FVector& InOutPlayerPosition,
                                                 FVector& InOutPlayerHeading, APawn* PlayerPawn);
     void ObserveHeadlessCollisionGateStressTest(const FVector& PlayerPosition, APawn* PlayerPawn);
+    bool MeasureHeadlessCollisionGateStressTerrain(
+        const FVector& WorldPosition, float CapsuleHalfHeightCm,
+        float& OutFeetDensity, float& OutCenterDensity,
+        float& OutSurfaceLocalVoxelZ, float& OutClearanceCm) const;
     void AdvanceHeadlessSurfaceFallTest(FVector& InOutPlayerPosition,
                                         FVector& InOutPlayerHeading, APawn* PlayerPawn);
     void InitializeHeadlessStrateCrossingTest();
@@ -1109,12 +1113,17 @@ public:
     bool bHeadlessCollisionGateStressTestExitRequested = false;
     bool bHeadlessCollisionGateStressTestGateWasEngaged = false;
     bool bHeadlessCollisionGateStressTestFullStop = false;
+    bool bHeadlessCollisionGateStressTestStartHeightCrossed = false;
+    bool bHeadlessCollisionGateStressTestTerrainViolation = false;
+    bool bHeadlessCollisionGateStressTestTerrainMeasurementMissing = false;
+    bool bHeadlessCollisionGateStressTestLanded = false;
+    bool bHeadlessCollisionGateStressTestLaunchSupportTimingCaptured = false;
     float HeadlessCollisionGateStressTestSpeedCmPerSecond = 6000.0f;
-    float HeadlessCollisionGateStressTestStartDelaySeconds = 0.1f;
     float HeadlessCollisionGateStressTestDurationSeconds = 2.0f;
     float HeadlessCollisionGateStressTestTimeoutSeconds = 15.0f;
     double HeadlessCollisionGateStressTestBeginSeconds = 0.0;
     double HeadlessCollisionGateStressTestStartSeconds = 0.0;
+    double HeadlessCollisionGateStressTestLandedSeconds = 0.0;
     double HeadlessCollisionGateStressTestGateStartSeconds = 0.0;
     double HeadlessCollisionGateStressTestFullStopStartSeconds = 0.0;
     double HeadlessCollisionGateStressTestDistanceCm = 0.0;
@@ -1122,10 +1131,21 @@ public:
     double HeadlessCollisionGateStressTestTotalGateDurationSeconds = 0.0;
     double HeadlessCollisionGateStressTestMaxGateDurationSeconds = 0.0;
     double HeadlessCollisionGateStressTestFullStopDurationSeconds = 0.0;
+    double HeadlessCollisionGateStressTestLaunchSupportCheckSeconds = 0.0;
+    double HeadlessCollisionGateStressTestLaunchSupportSubmittedSeconds = 0.0;
+    double HeadlessCollisionGateStressTestLaunchSupportReadySeconds = 0.0;
+    double HeadlessCollisionGateStressTestMinClearanceCm = 1.0e30;
+    float HeadlessCollisionGateStressTestMinFeetDensity = 0.0f;
+    float HeadlessCollisionGateStressTestMinSurfaceLocalVoxelZ = 0.0f;
+    int32 HeadlessCollisionGateStressTestTerrainSampleCount = 0;
+    int32 HeadlessCollisionGateStressTestTraceFrame = 0;
     int32 HeadlessCollisionGateStressTestGateHoldCount = 0;
     int32 HeadlessCollisionGateStressTestFullStopCount = 0;
     FVector HeadlessCollisionGateStressTestDirection = FVector::XAxisVector;
     FVector HeadlessCollisionGateStressTestLastActualPosition = FVector::ZeroVector;
+    FVector HeadlessCollisionGateStressTestStartPosition = FVector::ZeroVector;
+    FVector HeadlessCollisionGateStressTestMinClearancePosition = FVector::ZeroVector;
+    FVoxelTileKey HeadlessCollisionGateStressTestLaunchSupportTile;
     FString HeadlessCollisionGateStressTestFailureReason;
 
     // Explicit owner-layout collision-gate repro. This is a command-line-only harness path: it
