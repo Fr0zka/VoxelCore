@@ -560,6 +560,7 @@ private:
     void MaybeFinishHeadlessStreamingTest();
     void UpdateVisualStalenessAudit();
     void LogVisualStalenessAudit();
+    void LogReadyTransitionVisibilityMeasure();
     void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                         int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
                         bool bSheetTile, const FVoxelMeshData& MeshData);
@@ -989,9 +990,29 @@ public:
     bool bSampleStacksStarted = false;
     TArray<FVoxelTileKey> DesiredSorted;   // critical floor prefix, then true-pawn distance-first
     TArray<FVoxelTileKey> CriticalDesiredTiles; // occupied/support tile, then heading tile
+    // Ancestor -> desired descendants, rebuilt with DesiredSorted. Reconciliation uses this
+    // index to test transition coverage without rescanning the full desired set per old tile.
+    TMap<FVoxelTileKey, TArray<FVoxelTileKey>> DesiredTransitionDescendants;
+    int32 DesiredTransitionMaxLevel = 0;
     uint32 DesiredEpoch = 0;               // increments whenever DesiredStamped is rebuilt
     int32 ObsoleteTileAbortCount = 0;      // cumulative per-world moving-session cancellation count
     float PeakObservedPawnSpeedCmPerSecond = 0.0f;
+
+    struct FReadyTransitionVisibilitySample
+    {
+        uint64 Cycles = 0;
+        int32 TileComponentCount = 0;
+        int32 DesiredTileCount = 0;
+    };
+    struct FFarFieldSubmitSample
+    {
+        uint64 Cycles = 0;
+        int32 DesiredTileCount = 0;
+        int32 MaxDesiredLevel = 0;
+    };
+    bool bMeasureReadyTransitionVisibility = false;
+    TArray<FReadyTransitionVisibilitySample> ReadyTransitionVisibilitySamples;
+    TArray<FFarFieldSubmitSample> FarFieldSubmitSamples;
 
     // Clean performance accounting. LOD 0..8 covers every marching-cubes clip level; sheet tiles
     // above the configured MC range never enter the outer classifier.

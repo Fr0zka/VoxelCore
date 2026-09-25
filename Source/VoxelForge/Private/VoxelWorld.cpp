@@ -592,6 +592,8 @@ void AVoxelWorld::RegenerateAllChunks()
     bAllChunksLoaded = false;
     DesiredSorted.Reset();
     CriticalDesiredTiles.Reset();
+    DesiredTransitionDescendants.Reset();
+    DesiredTransitionMaxLevel = 0;
     DesiredStamped.Reset();
     ++DesiredEpoch;
     TransitionHold.Reset();
@@ -1421,6 +1423,7 @@ void AVoxelWorld::EndPlay(const EEndPlayReason::Type EndPlayReason)
         VoxelForgeStartupTrace::Finish(TEXT("end_play_before_steady_state"));
     }
 
+    LogReadyTransitionVisibilityMeasure();
     Super::EndPlay(EndPlayReason);
 }
 
@@ -1429,6 +1432,17 @@ void AVoxelWorld::BeginPlay()
     VoxelForgeStartupTrace::BeginFromCommandLine();
     VoxelForgeStartupTrace::FStageScope StartupTraceStage(TEXT("BeginPlay"));
     Super::BeginPlay();
+    int32 MeasureReadyTransitionVisibility = 0;
+    FParse::Value(FCommandLine::Get(),
+        TEXT("voxel.MeasureReadyTransitionVisibility="), MeasureReadyTransitionVisibility);
+    bMeasureReadyTransitionVisibility = MeasureReadyTransitionVisibility != 0;
+    ReadyTransitionVisibilitySamples.Reset();
+    FarFieldSubmitSamples.Reset();
+    if (bMeasureReadyTransitionVisibility)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeReadyVisibilityMeasure] enabled=1 instrumentation=command_line"));
+    }
     VoxelCaveMorphology::ConfigurePlayerFitMemoFromCommandLine();
     VoxelCaveMorphology::ResetPlayerFitMemoStats();
     bShuttingDown.store(false, std::memory_order_relaxed);
@@ -3724,6 +3738,90 @@ void AVoxelWorld::LogVisualStalenessAudit()
         VisualAuditLODOverlapMaxPairs);
 }
 
+void AVoxelWorld::LogReadyTransitionVisibilityMeasure()
+{
+    if (!bMeasureReadyTransitionVisibility)
+    {
+        return;
+    }
+
+    if (!ReadyTransitionVisibilitySamples.IsEmpty())
+    {
+        TArray<FReadyTransitionVisibilitySample> Sorted = ReadyTransitionVisibilitySamples;
+        Sorted.Sort([](const FReadyTransitionVisibilitySample& A,
+                       const FReadyTransitionVisibilitySample& B)
+        {
+            return A.Cycles < B.Cycles;
+        });
+        const int32 P50Index = Sorted.Num() / 2;
+        const int32 P95Index = FMath::Clamp(
+            FMath::CeilToInt(static_cast<float>(Sorted.Num()) * 0.95f) - 1,
+            0, Sorted.Num() - 1);
+        const FReadyTransitionVisibilitySample& P95 = Sorted[P95Index];
+        const FReadyTransitionVisibilitySample& Max = Sorted.Last();
+
+        int32 MinComponents = MAX_int32, MaxComponents = 0;
+        int32 MinDesired = MAX_int32, MaxDesired = 0;
+        int64 TotalComponents = 0, TotalDesired = 0;
+        for (const FReadyTransitionVisibilitySample& Sample : Sorted)
+        {
+            MinComponents = FMath::Min(MinComponents, Sample.TileComponentCount);
+            MaxComponents = FMath::Max(MaxComponents, Sample.TileComponentCount);
+            MinDesired = FMath::Min(MinDesired, Sample.DesiredTileCount);
+            MaxDesired = FMath::Max(MaxDesired, Sample.DesiredTileCount);
+            TotalComponents += Sample.TileComponentCount;
+            TotalDesired += Sample.DesiredTileCount;
+        }
+
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeReadyVisibilityMeasure] samples=%d p50_ms=%.6f p95_ms=%.6f max_ms=%.6f "
+                 "p95_components=%d p95_desired=%d components_range=%d..%d desired_range=%d..%d "
+                 "components_mean=%.1f desired_mean=%.1f"),
+            Sorted.Num(),
+            FPlatformTime::ToSeconds64(Sorted[P50Index].Cycles) * 1000.0,
+            FPlatformTime::ToSeconds64(P95.Cycles) * 1000.0,
+            FPlatformTime::ToSeconds64(Max.Cycles) * 1000.0,
+            P95.TileComponentCount, P95.DesiredTileCount,
+            MinComponents, MaxComponents, MinDesired, MaxDesired,
+            static_cast<double>(TotalComponents) / Sorted.Num(),
+            static_cast<double>(TotalDesired) / Sorted.Num());
+    }
+
+    if (!FarFieldSubmitSamples.IsEmpty())
+    {
+        TArray<FFarFieldSubmitSample> Sorted = FarFieldSubmitSamples;
+        Sorted.Sort([](const FFarFieldSubmitSample& A, const FFarFieldSubmitSample& B)
+        {
+            return A.Cycles < B.Cycles;
+        });
+        const int32 P50Index = Sorted.Num() / 2;
+        const int32 P95Index = FMath::Clamp(
+            FMath::CeilToInt(static_cast<float>(Sorted.Num()) * 0.95f) - 1,
+            0, Sorted.Num() - 1);
+        const FFarFieldSubmitSample& P95 = Sorted[P95Index];
+        const FFarFieldSubmitSample& Max = Sorted.Last();
+
+        int32 MinDesired = MAX_int32, MaxDesired = 0;
+        int32 MinLevel = MAX_int32, MaxLevel = 0;
+        for (const FFarFieldSubmitSample& Sample : Sorted)
+        {
+            MinDesired = FMath::Min(MinDesired, Sample.DesiredTileCount);
+            MaxDesired = FMath::Max(MaxDesired, Sample.DesiredTileCount);
+            MinLevel = FMath::Min(MinLevel, Sample.MaxDesiredLevel);
+            MaxLevel = FMath::Max(MaxLevel, Sample.MaxDesiredLevel);
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("[VoxelForgeFarFieldSubmitMeasure] samples=%d p50_ms=%.6f p95_ms=%.6f max_ms=%.6f "
+                 "p95_desired=%d p95_max_level=%d desired_range=%d..%d levels=%d..%d"),
+            Sorted.Num(),
+            FPlatformTime::ToSeconds64(Sorted[P50Index].Cycles) * 1000.0,
+            FPlatformTime::ToSeconds64(P95.Cycles) * 1000.0,
+            FPlatformTime::ToSeconds64(Max.Cycles) * 1000.0,
+            P95.DesiredTileCount, P95.MaxDesiredLevel,
+            MinDesired, MaxDesired, MinLevel, MaxLevel);
+    }
+}
+
 void AVoxelWorld::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
@@ -3932,9 +4030,9 @@ void AVoxelWorld::Tick(float DeltaTime)
     }
 
     // Complete the one-shot diagnostic request only after the player's level-0 centre tile is
-    // loaded and idle. Waiting for any coarse tile would take the async-neighbour branch and would
-    // not measure the normal synchronous centre remesh that makes a local edit feel expensive.
-    // No pawn is a distinct state from a pawn at (0,0,0); keep the diagnostic fallback for
+    // loaded and idle. The edit fixture selects an already-visible level-0 geometry tile, so it
+    // measures the normal synchronous centre remesh without depending on a coarse overlay being
+    // visible. No pawn is distinct from a pawn at (0,0,0); retain the actor-location fallback for
     // headless/editor use without making the world-origin pawn skip streaming.
     FVector ModificationPosition = bHasPlayer ? PlayerLastPos : GetActorLocation();
     FVoxelTileKey ModificationCenterTile(
@@ -3962,17 +4060,8 @@ void AVoxelWorld::Tick(float DeltaTime)
             }
             if (GVoxelForgeTestModificationLoadedGeometryTarget)
             {
-                bool bHasVisibleCoarseOverlay = false;
-                for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
-                {
-                    if (Pair.Key.Level > 0 && Pair.Value && Pair.Value->IsVisible()
-                        && VF_TileFootprintsOverlap(CandidateTile, Pair.Key))
-                    {
-                        bHasVisibleCoarseOverlay = true;
-                        break;
-                    }
-                }
-                if (!bHasVisibleCoarseOverlay)
+                URealtimeMeshComponent* CandidateComponent = TileComponents.FindRef(CandidateTile);
+                if (!CandidateComponent || !CandidateComponent->IsVisible())
                 {
                     continue;
                 }
@@ -5575,12 +5664,32 @@ void AVoxelWorld::HideOverlappingDesiredVisuals(const FVoxelTileKey& RetiredTile
 
 void AVoxelWorld::ReconcileReadyTransitionVisibility()
 {
+    const bool bMeasure = bMeasureReadyTransitionVisibility;
+    const uint64 MeasureStartCycles = bMeasure ? FPlatformTime::Cycles64() : 0;
+    const int32 ComponentCountAtStart = bMeasure ? TileComponents.Num() : 0;
+    const int32 DesiredCountAtStart = bMeasure ? DesiredSorted.Num() : 0;
+    const auto RecordMeasure = [this, bMeasure, MeasureStartCycles,
+                                ComponentCountAtStart, DesiredCountAtStart]()
+    {
+        if (!bMeasure)
+        {
+            return;
+        }
+        FReadyTransitionVisibilitySample& Sample =
+            ReadyTransitionVisibilitySamples.AddDefaulted_GetRef();
+        Sample.Cycles = FPlatformTime::Cycles64() - MeasureStartCycles;
+        Sample.TileComponentCount = ComponentCountAtStart;
+        Sample.DesiredTileCount = DesiredCountAtStart;
+    };
+
     if (bAllChunksLoaded && TransitionHold.Num() == 0 && PendingUnload.Num() == 0)
     {
+        RecordMeasure();
         return;
     }
     if (DesiredSorted.Num() == 0 || TileComponents.Num() == 0)
     {
+        RecordMeasure();
         return;
     }
 
@@ -5590,6 +5699,11 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
     // queue below.
     TArray<FVoxelTileKey> ReadyToHide;
     ReadyToHide.Reserve(TileComponents.Num());
+    auto GetAncestorAtLevel = [](const FVoxelTileKey& Tile, int32 AncestorLevel)
+    {
+        const int32 Divisor = 1 << (AncestorLevel - Tile.Level);
+        return FVoxelTileKey(VoxelClipmapDesiredTiles::FloorDiv(Tile.Coord, Divisor), AncestorLevel);
+    };
     for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
     {
         const FVoxelTileKey& OldTile = Pair.Key;
@@ -5606,9 +5720,12 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
 
         bool bHasReplacement = false;
         bool bAllReplacementsLoaded = true;
-        for (const FVoxelTileKey& NewTile : DesiredSorted)
+        // A coarser desired tile can only overlap this tile by containing it. Test those exact
+        // ancestors directly, then test desired finer tiles from the prebuilt ancestor index.
+        for (int32 Level = OldTile.Level + 1; Level <= DesiredTransitionMaxLevel; ++Level)
         {
-            if (!VF_TileFootprintsOverlap(OldTile, NewTile))
+            const FVoxelTileKey NewTile = GetAncestorAtLevel(OldTile, Level);
+            if (!IsDesired(NewTile))
             {
                 continue;
             }
@@ -5617,6 +5734,21 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
             {
                 bAllReplacementsLoaded = false;
                 break;
+            }
+        }
+        if (bAllReplacementsLoaded)
+        {
+            if (const TArray<FVoxelTileKey>* NewDescendants = DesiredTransitionDescendants.Find(OldTile))
+            {
+                for (const FVoxelTileKey& NewTile : *NewDescendants)
+                {
+                    bHasReplacement = true;
+                    if (!LoadedTiles.Contains(NewTile))
+                    {
+                        bAllReplacementsLoaded = false;
+                        break;
+                    }
+                }
             }
         }
         if (bHasReplacement && bAllReplacementsLoaded)
@@ -5634,6 +5766,26 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
     // only part of the transition. Reveal them only after every overlapping retired component has
     // entered PendingUnload (and was therefore hidden above). Collision visibility is independent:
     // the component remains queryable until the budgeted UnloadTile call.
+    TSet<FVoxelTileKey> VisibleRetiredTiles;
+    TSet<FVoxelTileKey> VisibleRetiredAncestors;
+    int32 MaxVisibleRetiredLevel = DesiredTransitionMaxLevel;
+    for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& OldPair : TileComponents)
+    {
+        const FVoxelTileKey& OldTile = OldPair.Key;
+        URealtimeMeshComponent* OldComp = OldPair.Value;
+        if (IsDesired(OldTile) || PendingUnload.Contains(OldTile)
+            || !OldComp || !OldComp->IsVisible())
+        {
+            continue;
+        }
+        VisibleRetiredTiles.Add(OldTile);
+        MaxVisibleRetiredLevel = FMath::Max(MaxVisibleRetiredLevel, OldTile.Level);
+        for (int32 Level = OldTile.Level + 1; Level <= DesiredTransitionMaxLevel; ++Level)
+        {
+            VisibleRetiredAncestors.Add(GetAncestorAtLevel(OldTile, Level));
+        }
+    }
+
     for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& NewPair : TileComponents)
     {
         const FVoxelTileKey& NewTile = NewPair.Key;
@@ -5643,19 +5795,13 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
             continue;
         }
 
-        bool bBlockedByVisibleRetiredTile = false;
-        for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& OldPair : TileComponents)
+        bool bBlockedByVisibleRetiredTile = VisibleRetiredAncestors.Contains(NewTile);
+        for (int32 Level = NewTile.Level + 1;
+             !bBlockedByVisibleRetiredTile && Level <= MaxVisibleRetiredLevel; ++Level)
         {
-            const FVoxelTileKey& OldTile = OldPair.Key;
-            if (IsDesired(OldTile) || PendingUnload.Contains(OldTile)
-                || !OldPair.Value || !OldPair.Value->IsVisible())
-            {
-                continue;
-            }
-            if (VF_TileFootprintsOverlap(NewTile, OldTile))
+            if (VisibleRetiredTiles.Contains(GetAncestorAtLevel(NewTile, Level)))
             {
                 bBlockedByVisibleRetiredTile = true;
-                break;
             }
         }
         if (!bBlockedByVisibleRetiredTile)
@@ -5663,6 +5809,8 @@ void AVoxelWorld::ReconcileReadyTransitionVisibility()
             NewComp->SetVisibility(true);
         }
     }
+
+    RecordMeasure();
 }
 
 // Integer floor-division (correct for negatives), scalar + vector.
@@ -5852,6 +6000,36 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
             const FVoxelTileKey Key = DesiredSorted[ExistingIndex];
             DesiredSorted.RemoveAt(ExistingIndex, 1, EAllowShrinking::No);
             DesiredSorted.Insert(Key, 0);
+        }
+    }
+
+    // Build a dyadic ancestor index once per desired-set epoch. Different-level tile overlap is
+    // containment because every tile footprint is power-of-two aligned. This lets the per-frame
+    // transition pass inspect only actual overlapping candidates.
+    DesiredTransitionDescendants.Reset();
+    DesiredTransitionMaxLevel = 0;
+    for (const FVoxelTileKey& Key : DesiredSorted)
+    {
+        DesiredTransitionMaxLevel = FMath::Max(DesiredTransitionMaxLevel, Key.Level);
+    }
+    for (const TPair<FVoxelTileKey, URealtimeMeshComponent*>& Pair : TileComponents)
+    {
+        DesiredTransitionMaxLevel = FMath::Max(DesiredTransitionMaxLevel, Pair.Key.Level);
+    }
+    // A worker from the previous desired epoch can finish late with a component at a level no
+    // longer present in TileComponents when this index is built. Index through the supported
+    // maximum sheet level (MaxClipLevel 8 + FarSheetSpanLevels 4) so that such a retired tile still
+    // finds all of its desired descendants when the result is reconciled.
+    constexpr int32 MaxSupportedTileLevel = 12;
+    const int32 DescendantIndexMaxLevel = FMath::Max(
+        DesiredTransitionMaxLevel, MaxSupportedTileLevel);
+    for (const FVoxelTileKey& Key : DesiredSorted)
+    {
+        for (int32 Level = Key.Level + 1; Level <= DescendantIndexMaxLevel; ++Level)
+        {
+            const int32 Divisor = 1 << (Level - Key.Level);
+            const FVoxelTileKey Ancestor(VF_FloorDiv(Key.Coord, Divisor), Level);
+            DesiredTransitionDescendants.FindOrAdd(Ancestor).Add(Key);
         }
     }
 
@@ -6433,6 +6611,8 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         // FAR FIELD — preserve the clipmap's level ordering explicitly. DesiredSorted is
         // distance-sorted for the critical/near work, but a level pass prevents a level-5 horizon
         // tile from being admitted ahead of an unfinished level-1/2 bridge tile.
+        const uint64 FarFieldMeasureStartCycles = bMeasureReadyTransitionVisibility
+            ? FPlatformTime::Cycles64() : 0;
         int32 MaxDesiredLevel = 0;
         for (const FVoxelTileKey& T : DesiredSorted)
         {
@@ -6450,6 +6630,13 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 ++Submitted;
             }
             if (PendingTiles.Num() >= CoarseTaskCap) break;
+        }
+        if (bMeasureReadyTransitionVisibility)
+        {
+            FFarFieldSubmitSample& Sample = FarFieldSubmitSamples.AddDefaulted_GetRef();
+            Sample.Cycles = FPlatformTime::Cycles64() - FarFieldMeasureStartCycles;
+            Sample.DesiredTileCount = DesiredSorted.Num();
+            Sample.MaxDesiredLevel = MaxDesiredLevel;
         }
 
         // Bande de strate changée : re-gen budgétée des tuiles grossières concernées (le vieux

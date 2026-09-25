@@ -3407,6 +3407,16 @@ namespace
     // unknown/evicted proof data therefore falls back to sampling and cannot change the mesh.
     constexpr uint64 SharedRoomGraphCacheBudgetBytes = 256ull * 1024ull * 1024ull;
 
+    static TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe>
+    SnapshotSharedRoomGraphCache(
+        const TSharedPtr<FSharedRoomGraphCacheEntry, ESPMode::ThreadSafe>& Entry)
+    {
+        FScopeLock Lock(&GSharedRoomGraphCacheMutex);
+        return Entry.IsValid()
+            ? Entry->Cache
+            : TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe>();
+    }
+
     int32 SharedRoomGraphCacheBuildBank(int32 RegionSize)
     {
         return RegionSize <= 2 * CHUNK_SIZE ? 0 : 1;
@@ -3593,7 +3603,10 @@ namespace
                     Entry->RegionSize = RegionSize;
                     Entry->LastUse = 0;
                     Entry->AllocatedBytes = AllocatedBytes;
-                    Entry->Cache = BuiltCache;
+                    {
+                        FScopeLock Lock(&GSharedRoomGraphCacheMutex);
+                        Entry->Cache = BuiltCache;
+                    }
                 }
                 else
                 {
@@ -3647,7 +3660,7 @@ namespace
                 return Entry;
             }
 
-            if (Entry->Cache.IsValid())
+            if (SnapshotSharedRoomGraphCache(Entry).IsValid())
             {
                 return Entry;
             }
@@ -4119,9 +4132,13 @@ namespace
 
             if (SampleStep > 1)
             {
+                TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe> SharedRoomGraphCache =
+                    S.SharedCacheEntry.IsValid()
+                        ? SnapshotSharedRoomGraphCache(S.SharedCacheEntry)
+                        : TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe>();
                 const bool bSharedCacheMatches =
                     S.SharedCacheEntry.IsValid()
-                    && S.SharedCacheEntry->Cache.IsValid()
+                    && SharedRoomGraphCache.IsValid()
                     && S.SharedCacheEntry->Seed == SeedU
                     && S.SharedCacheEntry->StrateIndex == StrateIdx
                     && S.SharedCacheEntry->ParamsFingerprint == ParamsFingerprint
@@ -4143,8 +4160,9 @@ namespace
                         (float)(RegionMinY + RegionSize) + CacheExpansion,
                         P,
                         ERoomGraphBuildSite::OpShared);
+                    SharedRoomGraphCache = SnapshotSharedRoomGraphCache(S.SharedCacheEntry);
                 }
-                S.ActiveCache = S.SharedCacheEntry->Cache.Get();
+                S.ActiveCache = SharedRoomGraphCache.Get();
             }
             else
             {
@@ -5109,7 +5127,9 @@ namespace
                                             * VOXEL_NOISE_SCALE * VF_PerlinAbsBound + 2.0f),
                                 P,
                                 ERoomGraphBuildSite::ClassifierShared);
-                        B.ActiveCache = SharedCache->Cache.Get();
+                        const TSharedPtr<const FChunkSDFCache, ESPMode::ThreadSafe>
+                            SharedRoomGraphCache = SnapshotSharedRoomGraphCache(SharedCache);
+                        B.ActiveCache = SharedRoomGraphCache.Get();
                         B.CacheWindowSharedEntry = SharedCache;
                         B.CacheWindowSharedRegionMinX = SharedRegionMinX;
                         B.CacheWindowSharedRegionMinY = SharedRegionMinY;
@@ -5165,7 +5185,8 @@ namespace
             }
             else if (B.bCacheWindowUsesShared)
             {
-                B.ActiveCache = B.CacheWindowSharedEntry->Cache.Get();
+                B.ActiveCache = SnapshotSharedRoomGraphCache(
+                    B.CacheWindowSharedEntry).Get();
             }
             // Large root boxes are only a cache warm-up.  Their interval is intentionally still
             // unknown; proof resumes at bounded descendants where all bounds below are finite.
