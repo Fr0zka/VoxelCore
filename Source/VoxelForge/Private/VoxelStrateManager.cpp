@@ -3023,20 +3023,6 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     VF_ApplyPassageLandingCarving(Density, MinLandingSDF, BaseDensity, SealThickness);
 }
 
-void UVoxelStrateManager::ApplyPassageLandingAirMC(
-    float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness) const
-{
-    // ApplyDisturbances is deliberately an MC-space post-process and can add a bridge or ridge
-    // on top of the structural passage. Reassert only landing air here; the support slab is
-    // restored by ApplyPassageLandingFloorMC immediately afterwards. This stays on the same
-    // thread-local passage shortlist as the hot voxel path and performs no source/topology work.
-    float InternalDensity = -Density;
-    ApplyPassageLandingAir(
-        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
-    Density = -InternalDensity;
-}
-
 void UVoxelStrateManager::ApplyPassageTunnelAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
@@ -3068,18 +3054,6 @@ void UVoxelStrateManager::ApplyPassageTunnelAir(
         const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
         Density = FMath::Min(Density, AirTarget);
     }
-}
-
-void UVoxelStrateManager::ApplyPassageTunnelAirMC(
-    float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness) const
-{
-    // The disturbance layer uses MC polarity (negative = solid), so reuse the exact internal
-    // tunnel-air operation rather than maintaining a second polarity-specific formula.
-    float InternalDensity = -Density;
-    ApplyPassageTunnelAir(
-        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
-    Density = -InternalDensity;
 }
 
 void UVoxelStrateManager::ApplyPassageLandingFloorMC(
@@ -6712,7 +6686,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     // Three transition styles:
     //
     //   GRADIENT (default):
-    //     Classic linear lerp of all params across BlendChunks. Smooth,
+    //     Classic linear lerp of all params across TransitionBlendChunks. Smooth,
     //     invisible boundary. Cave shape morphs gradually from one strate
     //     to the next over several chunks.
     //
@@ -6720,7 +6694,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     //     No blending at all — params switch instantly at the boundary.
     //     The abrupt change in density, room size, roughness, etc. creates
     //     a natural cliff, ledge, or visible material discontinuity.
-    //     BlendChunks is ignored (effectively 0).
+    //     TransitionBlendChunks is ignored (effectively 0).
     //
     //   INTERLEAVED:
     //     3D Perlin noise warps the effective boundary Z position per XY column.
@@ -6740,7 +6714,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     // CHECK BOTTOM BOUNDARY (transitioning to strate below)
     //---------------------------------------------------------------------
     // DistFromBottom = how many chunks above the bottom edge of this strate.
-    // When 0, we're right at the boundary. When == BlendChunks, we're at
+    // When 0, we're right at the boundary. When == TransitionBlendChunks, we're at
     // the outer edge of the transition zone.
     int32 DistFromBottom = ChunkCoord.Z - Slot.BottomChunkZ;
 
@@ -6749,7 +6723,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         // The upper strate (this one) controls the transition type at its lower edge
         const EVoxelStrateTransition TransType = Slot.Definition->TransitionType;
 
-        // Per-definition blend distance (overrides the manager's default BlendChunks)
+        // Per-definition blend distance.
         const int32 EffectiveBlend = Slot.Definition->TransitionBlendChunks;
 
         // Prepare the neighbor's params (only used for Gradient and Interleaved)
@@ -6952,93 +6926,3 @@ FStrateGenerationParams UVoxelStrateManager::BuildParamsFromDefinition(const UVo
     return Result;
 }
 
-uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
-{
-    // The diagnostic command-line override changes density inputs without changing an asset.  Do
-    // not let a verdict from the unoverridden layout survive into an overridden session (or vice
-    // versa); a zero fingerprint conservatively disables persistence for that session.
-    const FRuntimeRoughnessOverrides& RoughnessOverrides = VF_GetRuntimeRoughnessOverrides();
-    if (RoughnessOverrides.bSurfaceRoughness
-        || RoughnessOverrides.bFrequency
-        || RoughnessOverrides.bNoiseType)
-    {
-        return 0;
-    }
-
-    // The session cache is deliberately conservative.  These inputs are valid density inputs but
-    // are not represented by the fixed-size hash below, so returning zero disables verdict reuse
-    // instead of pretending that a partial key is complete.
-    if (IsUsingSeason())
-    {
-        return 0;
-    }
-#if WITH_EDITOR
-    if (ComposerOverrides.Num() > 0)
-    {
-        return 0;
-    }
-#endif
-
-    uint32 A = 0x9E3779B9u;
-    uint32 B = 0x85EBCA6Bu;
-    auto HashBytes = [&A, &B](const void* Data, int32 Size)
-    {
-        A = FCrc::MemCrc32(Data, Size, A);
-        B = FCrc::MemCrc32(Data, Size, B ^ 0xA511E9B3u);
-    };
-    auto HashValue = [&HashBytes](const auto& Value)
-    {
-        HashBytes(&Value, sizeof(Value));
-    };
-
-    HashValue(CachedSeed);
-    HashValue(bOpenSurfaceEntry);
-    HashValue(OriginSpineRadius);
-    HashValue(InterStrateGapChunks);
-    const int32 LayoutCount = StrateLayout.Num();
-    HashValue(LayoutCount);
-
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        if (Slot.Definition == nullptr)
-        {
-            return 0;
-        }
-
-        // BuildChunkCache resolves these arrays into the room cache.  Hashing UObject pointers or
-        // asset names would not prove the asset contents, so dynamic operation/biome layouts
-        // conservatively opt out.  The normal synthetic/runtime profile has neither array.
-        if (Slot.Definition->TerrainOperations.Num() > 0
-            || Slot.Definition->Biomes.Num() > 0)
-        {
-            return 0;
-        }
-
-        HashValue(Slot.StrateIndex);
-        HashValue(Slot.TopChunkZ);
-        HashValue(Slot.BottomChunkZ);
-        HashValue(Slot.HeightInChunks);
-        HashValue(Slot.Definition->GeneratorType);
-        HashValue(Slot.Definition->bUseOperatorStack);
-        HashValue(Slot.Definition->bEnableWorms);
-        HashValue(VF_WormsForceOff());
-        // Development-only stage ablations change the field and therefore belong in every
-        // persistent/verdict key even though they are not authored generation parameters.
-        HashValue(VoxelDensityAblation::GetResolvedMask());
-        HashValue(Slot.Definition->StrateHeightInChunks);
-        HashValue(Slot.Definition->TransitionType);
-        HashValue(Slot.Definition->TransitionBlendChunks);
-        HashValue(Slot.Definition->GenerationParams);
-        HashValue(Slot.Definition->SlabParams);
-        HashValue(Slot.Definition->MazeParams);
-        HashValue(Slot.Definition->SurfaceParams);
-        HashValue(Slot.Definition->VerticalShaftParams);
-        HashValue(Slot.Definition->FloatingIslandParams);
-        HashValue(Slot.Definition->PassageConfig);
-        HashValue(Slot.Definition->bHasWater);
-        HashValue(Slot.Definition->BiomeMapParams);
-    }
-
-    const uint64 Result = (static_cast<uint64>(B) << 32) | static_cast<uint64>(A);
-    return Result != 0 ? Result : 1;
-}

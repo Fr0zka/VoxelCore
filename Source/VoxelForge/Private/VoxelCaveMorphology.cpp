@@ -81,7 +81,6 @@ namespace
     struct FVFTunnelShapeEvaluation
     {
         float SDF = FLT_MAX;
-        bool bSupportFloor = false;
         bool bHasSweptFloor = false;
         float SweptFloorZ = -FLT_MAX;
         float SweptFloorRadius = 0.0f;
@@ -548,7 +547,6 @@ namespace
             Profile.NaturalStartFloorZ = FloorA;
             Profile.NaturalEndFloorZ = FloorB;
             Profile.bLedgeTransition = false;
-            Profile.NumSteps = 0;
 
             if (bHasLedgeLevels)
             {
@@ -934,27 +932,6 @@ namespace
         return FloorZ;
     }
 
-    FORCEINLINE float VF_TunnelFloorAtSegment(
-        const FVector& A, float RadiusA,
-        const FVector& B, float RadiusB,
-        float T, int32 SegmentIndex, int32 NumSegments,
-        const FVector& Position,
-        const FCachedTunnel& Tunnel,
-        const void* CacheIdentity, int32 TunnelIndex,
-        bool bEvaluateRelief,
-        const FVFFloorReliefColumnKey& Column,
-        const FTunnelFloorSegmentProfile* FloorProfile,
-        const FVFRoomFloorOwnership* RoomFloorOwnership)
-    {
-        const FVFTunnelFloorTerms Terms = VF_TunnelFloorTerms(
-            A, RadiusA, B, RadiusB,
-            T, SegmentIndex, NumSegments, Tunnel, FloorProfile,
-            RoomFloorOwnership);
-        return VF_TunnelFloorFromTerms(
-            Position, Tunnel, Terms,
-            CacheIdentity, TunnelIndex, bEvaluateRelief, Column);
-    }
-
     FORCEINLINE bool VF_ProjectTunnelSegmentXY(
         const FVector& Position, const FVector& A, const FVector& B,
         float& OutT, float& OutDistanceSquared)
@@ -1227,76 +1204,6 @@ namespace
             CacheIdentity, TunnelIndex, ReliefColumn,
             bWorldChain ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles,
             RoomFloorOwnership);
-    }
-
-    static bool VF_ProjectSweptTunnelFloor(
-        const FVector& Position,
-        const FCachedTunnel& Tunnel,
-        bool bWorldChain,
-        float& OutFloorZ,
-        float& OutSupportRadius,
-        const void* CacheIdentity, int32 TunnelIndex,
-        const FVFRoomFloorOwnership* RoomFloorOwnership = nullptr)
-    {
-        const FVFFloorReliefColumnKey ReliefColumn =
-            VF_MakeFloorReliefColumnKey(
-                static_cast<float>(Position.X), static_cast<float>(Position.Y));
-        const TArray<FVector>& ControlPoints = bWorldChain
-            ? Tunnel.WorldControlPoints : Tunnel.ControlPoints;
-        const TArray<float>& ControlRadii = bWorldChain
-            ? Tunnel.WorldControlRadii : Tunnel.ControlRadii;
-        if (ControlPoints.Num() < 2
-            || ControlRadii.Num() != ControlPoints.Num())
-        {
-            return false;
-        }
-
-        const int32 ControlPointCount = ControlPoints.Num();
-        const int32 NumSegments = ControlPointCount - 1;
-        const FVector* ControlPointData = ControlPoints.GetData();
-        const float* ControlRadiusData = ControlRadii.GetData();
-        const TArray<FTunnelFloorSegmentProfile>* FloorProfiles = bWorldChain
-            ? &Tunnel.WorldFloorProfiles : &Tunnel.FloorProfiles;
-        const FTunnelFloorSegmentProfile* FloorProfileData =
-            FloorProfiles->Num() == NumSegments ? FloorProfiles->GetData() : nullptr;
-        float BestDistanceSquared = FLT_MAX;
-        bool bFound = false;
-        for (int32 SegmentIndex = 0;
-             SegmentIndex < NumSegments;
-             ++SegmentIndex)
-        {
-            float T = 0.0f;
-            float DistanceSquared = FLT_MAX;
-            if (!VF_ProjectTunnelSegmentXY(
-                    Position,
-                    ControlPointData[SegmentIndex], ControlPointData[SegmentIndex + 1],
-                    T, DistanceSquared)
-                || DistanceSquared >= BestDistanceSquared)
-            {
-                continue;
-            }
-
-            const float RadiusA = ControlRadiusData[SegmentIndex];
-            const float RadiusB = ControlRadiusData[SegmentIndex + 1];
-            OutFloorZ = VF_TunnelFloorAtSegment(
-                ControlPointData[SegmentIndex], RadiusA,
-                ControlPointData[SegmentIndex + 1], RadiusB,
-                T, SegmentIndex, NumSegments, Position, Tunnel,
-                CacheIdentity, TunnelIndex, /*bEvaluateRelief=*/true,
-                ReliefColumn,
-                FloorProfileData != nullptr ? FloorProfileData + SegmentIndex : nullptr,
-                RoomFloorOwnership);
-            OutSupportRadius = FMath::Max(
-                FMath::Min(FMath::Abs(RadiusA), FMath::Abs(RadiusB)) - 0.5f,
-                VoxelPassageGeometry::PlayerRadiusVoxels);
-            BestDistanceSquared = DistanceSquared;
-            bFound = true;
-        }
-
-        return bFound
-            && VoxelMath::IsFinite(OutFloorZ)
-            && VoxelMath::IsFinite(OutSupportRadius)
-            && BestDistanceSquared <= FMath::Square(OutSupportRadius);
     }
 
 }
@@ -8960,50 +8867,6 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     return MinSDF;
 }
 
-float VoxelCaveMorphology::EvaluateTunnelCoreSDF(
-    float WorldX, float WorldY, float WorldZ,
-    const FChunkSDFCache& Cache,
-    bool bUseSpatialIndex)
-{
-    if (VoxelDensityAblation::IsTunnelCoreOff())
-    {
-        return FLT_MAX;
-    }
-    const FVector Pos(WorldX, WorldY, WorldZ);
-    float MinSDF = FLT_MAX;
-    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
-
-    auto EvaluateTunnel = [&](int32 TunnelIdx)
-    {
-        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
-        if (Tunnel.SDFInfluenceRadius > 0.0f
-            && VF_DistanceSquaredToAabb(
-                WorldX, WorldY, WorldZ,
-                Tunnel.SDFCenterlineMin, Tunnel.SDFCenterlineMax)
-                > FMath::Square(Tunnel.SDFInfluenceRadius))
-        {
-            return;
-        }
-        if (VF_FloatDistSquared(WorldX, WorldY, WorldZ, Tunnel.BoundCenter)
-            > Tunnel.BoundRadiusSq)
-        {
-            return;
-        }
-
-        MinSDF = FMath::Min(
-            MinSDF,
-            VF_EvaluateSweptTunnel(
-                Pos, Tunnel, /*bWorldChain=*/false, Cache.SDFBlendRadius,
-                /*bApplyFloorCut=*/false, &Cache, TunnelIdx).SDF);
-    };
-
-    VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
-        bUseSpatialIndex);
-
-    return MinSDF;
-}
-
 FTunnelCoreWorldEvaluation VoxelCaveMorphology::EvaluateTunnelCoreWorld(
     float WorldX, float WorldY, float WorldZ,
     const FChunkSDFCache& Cache,
@@ -9454,7 +9317,7 @@ bool VoxelCaveMorphology::AnyTunnelCoreWorldNearLattice(
         // The broad sphere already encloses the swept radius and finite floor band.  Add the
         // vertical relief and room-mouth ownership envelopes before asking whether the lattice
         // box can touch it.  A miss is therefore an identity proof for the core evaluator and
-        // its support/room-floor tail; its only field writes are bSupportFloor, bRoomFloor, or
+        // its support/room-floor tail; its only field writes are bRoomFloor or
         // CoreSDF < -inset, all of which are inside this envelope.
         const float Reach = (
             FMath::Sqrt(FMath::Max(BoundRadiusSq, 0.0f))
@@ -9477,254 +9340,6 @@ float VoxelCaveMorphology::EvaluateTunnelCoreWorldSDF(
         WorldX, WorldY, WorldZ, Cache, nullptr, bUseSpatialIndex).SDF;
 }
 
-bool VoxelCaveMorphology::IsTunnelSupportFloorWorldPoint(
-    float WorldX, float WorldY, float WorldZ,
-    const FChunkSDFCache& Cache,
-    bool bUseSpatialIndex)
-{
-    if (VoxelDensityAblation::IsTunnelCoreOff())
-    {
-        return false;
-    }
-    const FVector Pos(WorldX, WorldY, WorldZ);
-    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
-
-    auto TestTunnel = [&](int32 TunnelIdx) -> bool
-    {
-        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
-        const bool bHasWorldChain = Tunnel.WorldControlPoints.Num() >= 2
-            && Tunnel.WorldControlRadii.Num() == Tunnel.WorldControlPoints.Num();
-        const FVector& CenterlineMin = bHasWorldChain
-            ? Tunnel.WorldCenterlineMin : Tunnel.SDFCenterlineMin;
-        const FVector& CenterlineMax = bHasWorldChain
-            ? Tunnel.WorldCenterlineMax : Tunnel.SDFCenterlineMax;
-        const float InfluenceRadius = bHasWorldChain
-            ? Tunnel.WorldInfluenceRadius : Tunnel.SDFInfluenceRadius;
-        if (InfluenceRadius > 0.0f
-            && VF_DistanceSquaredToAabb(
-                WorldX, WorldY, WorldZ, CenterlineMin, CenterlineMax)
-                > FMath::Square(InfluenceRadius))
-        {
-            return false;
-        }
-
-        const FVector& BoundCenter = bHasWorldChain
-            ? Tunnel.WorldBoundCenter : Tunnel.BoundCenter;
-        const float BoundRadiusSq = bHasWorldChain
-            ? Tunnel.WorldBoundRadiusSq : Tunnel.BoundRadiusSq;
-        if (BoundRadiusSq > 0.0f
-            && VF_FloatDistSquared(WorldX, WorldY, WorldZ, BoundCenter) > BoundRadiusSq)
-        {
-            return false;
-        }
-
-        const FVFRoomFloorOwnership RoomMouthOwnership =
-            VF_FindWorldTunnelMouthOwnership(Pos, Tunnel, Cache.SDFBlendRadius);
-        if (RoomMouthOwnership.bValid)
-        {
-            float ProjectedFloorZ = 0.0f;
-            float SupportRadius = 0.0f;
-            if (VF_ProjectSweptTunnelFloor(
-                    Pos, Tunnel, bHasWorldChain, ProjectedFloorZ, SupportRadius,
-                    &Cache, TunnelIdx, &RoomMouthOwnership)
-                && ProjectedFloorZ > RoomMouthOwnership.FloorZ + KINDA_SMALL_NUMBER)
-            {
-                // Only a raised tunnel apron is clipped. If the tunnel is lower, the room's
-                // SmoothMax floor already wins naturally and retaining this support band is
-                // capability-safe for legacy callers.
-                return false;
-            }
-        }
-
-        return VF_EvaluateSweptTunnel(
-            Pos, Tunnel, bHasWorldChain, Cache.SDFBlendRadius,
-            /*bApplyFloorCut=*/true, &Cache, TunnelIdx,
-            &RoomMouthOwnership).bSupportFloor;
-    };
-
-    bool bSupport = false;
-    int32 CandidateCount = 0;
-    auto TestRange = [&](int32 Begin, int32 End)
-    {
-        const int32* ItemIndexData = Cache.TunnelSpatialIndex.ItemIndices.GetData();
-        for (int32 Cursor = Begin; Cursor < End; ++Cursor)
-        {
-            const int32 TunnelIdx = ItemIndexData[Cursor];
-            if (!Cache.Tunnels.IsValidIndex(TunnelIdx))
-            {
-                continue;
-            }
-            ++CandidateCount;
-            if (TestTunnel(TunnelIdx))
-            {
-                bSupport = true;
-                if (VoxelDensityProfile::AreCountersEnabled())
-                {
-                    VoxelDensityProfile::AddCounter(
-                        VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
-                }
-                break;
-            }
-        }
-    };
-
-    int32 Begin = 0;
-    int32 End = 0;
-    if (bUseSpatialIndex && Cache.TunnelSpatialIndex.GetRange(WorldX, WorldY, Begin, End))
-    {
-        TestRange(Begin, End);
-    }
-    else
-    {
-        for (int32 TunnelIdx = 0; TunnelIdx < Cache.Tunnels.Num() && !bSupport; ++TunnelIdx)
-        {
-            ++CandidateCount;
-            if (TestTunnel(TunnelIdx))
-            {
-                bSupport = true;
-                if (VoxelDensityProfile::AreCountersEnabled())
-                {
-                    VoxelDensityProfile::AddCounter(
-                        VoxelDensityProfile::ECounter::TunnelCoreEvaluated);
-                }
-            }
-        }
-    }
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelCoreCandidates,
-            static_cast<uint64>(CandidateCount));
-    }
-    return bSupport;
-}
-
-void VoxelCaveMorphology::BuildTunnelSupportFloorColumn(
-    float WorldX, float WorldY,
-    const FChunkSDFCache& Cache,
-    FTunnelSupportFloorColumn& OutColumn,
-    bool bUseSpatialIndex)
-{
-    if (VoxelDensityAblation::IsTunnelCoreOff())
-    {
-        OutColumn.Reset();
-        return;
-    }
-    VoxelDensityProfile::FScopedTimer ProfileTimer(
-        VoxelDensityProfile::EBucket::TunnelCoreSupport);
-    OutColumn.Reset();
-
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelSupportColumnBuilds);
-    }
-
-    const FVector ColumnPosition(WorldX, WorldY, 0.0f);
-    const FCachedTunnel* TunnelData = Cache.Tunnels.GetData();
-
-    auto EvaluateTunnel = [&](int32 TunnelIdx)
-    {
-        const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];
-        const FVFRoomFloorOwnership RoomMouthOwnership =
-            VF_FindWorldTunnelMouthOwnership(ColumnPosition, Tunnel, Cache.SDFBlendRadius);
-        float FloorZ = 0.0f;
-        float SupportRadius = 0.0f;
-        if (!VF_ProjectSweptTunnelFloor(
-                ColumnPosition, Tunnel, /*bWorldChain=*/true,
-                FloorZ, SupportRadius, &Cache, TunnelIdx, &RoomMouthOwnership))
-        {
-            return;
-        }
-
-        float MinZ = FloorZ - VoxelPassageGeometry::LandingFloorThicknessVoxels;
-        float MaxZ = FloorZ + VoxelPassageGeometry::WalkableTunnelFloorAirClearanceVoxels;
-
-        // Preserve the public point predicate's world bounding sphere exactly, while resolving
-        // its Z interval once. The XY projection already proves the support-radius condition.
-        if (Tunnel.WorldBoundRadiusSq > 0.0f)
-        {
-            const float DX = WorldX - static_cast<float>(Tunnel.WorldBoundCenter.X);
-            const float DY = WorldY - static_cast<float>(Tunnel.WorldBoundCenter.Y);
-            const float Remaining = Tunnel.WorldBoundRadiusSq - (DX * DX + DY * DY);
-            if (Remaining < 0.0f)
-            {
-                return;
-            }
-            const float HalfZ = FMath::Sqrt(Remaining);
-            MinZ = FMath::Max(MinZ, static_cast<float>(Tunnel.WorldBoundCenter.Z) - HalfZ);
-            MaxZ = FMath::Min(MaxZ, static_cast<float>(Tunnel.WorldBoundCenter.Z) + HalfZ);
-        }
-
-        if (MinZ <= MaxZ)
-        {
-            FTunnelSupportFloorInterval& Interval =
-                OutColumn.Intervals.Emplace_GetRef();
-            Interval.TunnelIndex = TunnelIdx;
-            Interval.FloorZ = FloorZ;
-            Interval.MinZ = MinZ;
-            Interval.MaxZ = MaxZ;
-        }
-    };
-    const int32 CandidateCount = VF_ForEachSpatialCandidate(
-        Cache.TunnelSpatialIndex, Cache.Tunnels.Num(), WorldX, WorldY, EvaluateTunnel,
-        bUseSpatialIndex);
-    if (VoxelDensityProfile::AreCountersEnabled())
-    {
-        VoxelDensityProfile::AddCounter(
-            VoxelDensityProfile::ECounter::TunnelSupportColumnCandidates,
-            static_cast<uint64>(CandidateCount));
-    }
-
-    // Candidate IDs are deterministic and allow the world evaluator to find a
-    // tunnel's own band without re-running the XY projection. The public union
-    // query below simply tests every band; graph columns normally contain only a
-    // handful of candidates.
-    OutColumn.Intervals.Sort(
-        [](const FTunnelSupportFloorInterval& A,
-           const FTunnelSupportFloorInterval& B)
-        {
-            return A.TunnelIndex < B.TunnelIndex;
-        });
-}
-
-bool VoxelCaveMorphology::IsTunnelSupportFloorColumnZ(
-    float WorldZ,
-    const FTunnelSupportFloorColumn& Column)
-{
-    for (const FTunnelSupportFloorInterval& Interval : Column.Intervals)
-    {
-        if (WorldZ <= Interval.MaxZ)
-        {
-            if (WorldZ >= Interval.MinZ)
-            {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool VoxelCaveMorphology::GetTunnelSupportFloorColumnBand(
-    int32 TunnelIndex,
-    const FTunnelSupportFloorColumn& Column,
-    float& OutFloorZ,
-    float& OutMinZ,
-    float& OutMaxZ)
-{
-    for (const FTunnelSupportFloorInterval& Interval : Column.Intervals)
-    {
-        if (Interval.TunnelIndex == TunnelIndex)
-        {
-            OutFloorZ = Interval.FloorZ;
-            OutMinZ = Interval.MinZ;
-            OutMaxZ = Interval.MaxZ;
-            return true;
-        }
-    }
-    return false;
-}
-
 //=============================================================================
 // CONVENIENCE WRAPPER (backward compatible)
 //=============================================================================
@@ -9734,35 +9349,3 @@ bool VoxelCaveMorphology::GetTunnelSupportFloorColumnBand(
 // internally widens the COLLECT region to (2*MaxTunnelLength + MaxInfluence) so the
 // graph it builds is the same one the chunk path would build at this point.
 
-float VoxelCaveMorphology::EvaluateSDF(
-    float WorldX, float WorldY, float WorldZ,
-    const FStrateGenerationParams& Params,
-    uint32 Seed, int32 StrateIndex)
-{
-    const float RoomRadiusEnvelope = FMath::Max(
-        FMath::Abs(Params.MinRoomRadius), FMath::Abs(Params.MaxRoomRadius));
-    const float TunnelRadiusEnvelope = FMath::Max(
-        0.5f,
-        FMath::Max(FMath::Abs(Params.TunnelMinRadius), FMath::Abs(Params.TunnelMaxRadius))
-            * 1.18f);
-    const float FloorReliefEnvelope = FMath::Abs(Params.FloorReliefStrength)
-        * VOXEL_NOISE_SCALE * 1.5f;
-    const float BlendEnvelope = FMath::Max(Params.SDFBlendRadius, 0.0f);
-    const float Margin = FMath::Max(
-        RoomRadiusEnvelope + FloorReliefEnvelope,
-        FMath::Abs(Params.TunnelWarpStrength) + TunnelRadiusEnvelope
-    ) + BlendEnvelope * 3.0f;
-
-    FChunkSDFCache TempCache;
-    BuildChunkCache(
-        TempCache,
-        WorldX - Margin, WorldY - Margin,
-        WorldX + Margin, WorldY + Margin,
-        Params, Seed, StrateIndex
-    );
-
-    return EvaluateSDFCached(
-        WorldX, WorldY, WorldZ,
-        TempCache, Params.SDFBlendRadius
-    );
-}

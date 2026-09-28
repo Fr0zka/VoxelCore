@@ -312,7 +312,6 @@ namespace VoxelDensityProfile
         FCacheMemoryBreakdown RoomGraphCacheBreakdown;
     };
 
-    VOXELFORGE_API void SetEnabled(bool bEnabled);
     VOXELFORGE_API void SetMode(EMode Mode, uint32 SampleInterval = DefaultSampleInterval);
     // Counters are collected only while a diagnostic mode is enabled.  In the ordinary clean
     // path this is a single relaxed load, so the measurement hooks stay dormant.

@@ -3287,7 +3287,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         float BlockDensity = 0.f;
         bool bBlockHasTunnelCore = false;
         float BlockTunnelCoreSDF = FLT_MAX;
-        bool bBlockTunnelCoreSupportFloor = false;
         bool bBlockTunnelCoreRoomFloor = false;
         bool bBlockHasTunnelCoreSweptFloor = false;
         float BlockTunnelCoreSweptFloorZ = -FLT_MAX;
@@ -3362,7 +3361,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     BlockDensity = BlockCoreSample.Density;
                     bBlockHasTunnelCore = BlockCoreSample.bHasTunnelCoreWorldEvaluation;
                     BlockTunnelCoreSDF = BlockCoreSample.TunnelCoreWorldSDF;
-                    bBlockTunnelCoreSupportFloor = BlockCoreSample.bTunnelCoreSupportFloor;
                     bBlockTunnelCoreRoomFloor = BlockCoreSample.bTunnelCoreRoomFloor;
                     bBlockHasTunnelCoreSweptFloor =
                         BlockCoreSample.bHasTunnelCoreSweptFloor;
@@ -3466,7 +3464,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             else if (bUsedOpBlockSample && bBlockHasTunnelCore)
             {
                 PreDisturbanceTunnelCore.SDF = BlockTunnelCoreSDF;
-                PreDisturbanceTunnelCore.bSupportFloor = bBlockTunnelCoreSupportFloor;
                 PreDisturbanceTunnelCore.bRoomFloor = bBlockTunnelCoreRoomFloor;
                 PreDisturbanceTunnelCore.bHasSweptFloor =
                     bBlockHasTunnelCoreSweptFloor;

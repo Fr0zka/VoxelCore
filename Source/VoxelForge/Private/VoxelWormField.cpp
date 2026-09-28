@@ -76,16 +76,6 @@ namespace
 
 namespace VoxelWormField
 {
-    float EvaluateExact(
-        float WorldX,
-        float WorldY,
-        float WorldZ,
-        float Threshold,
-        const FParameters& Parameters)
-    {
-        return EvaluateExactField(WorldX, WorldY, WorldZ, Threshold, Parameters);
-    }
-
     float Evaluate(
         float WorldX,
         float WorldY,

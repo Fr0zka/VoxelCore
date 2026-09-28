@@ -1410,59 +1410,6 @@ namespace VoxelSeasonManifestPrivate
         return bValid;
     }
 
-    bool SaveJson(const FString& FilePath, const TSharedPtr<FJsonObject>& Root,
-                  FString& OutReport)
-    {
-        const FString Directory = FPaths::GetPath(FilePath);
-        if (!Directory.IsEmpty() && !IFileManager::Get().MakeDirectory(*Directory, true))
-        {
-            OutReport = FString::Printf(TEXT("could not create manifest directory %s"), *Directory);
-            return false;
-        }
-        FString JsonText;
-        TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
-            TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonText);
-        if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer) || !Writer->Close()
-            || !FFileHelper::SaveStringToFile(JsonText, *FilePath))
-        {
-            OutReport = FString::Printf(TEXT("could not write season manifest %s"), *FilePath);
-            return false;
-        }
-        return true;
-    }
-
-    bool LoadJson(const FString& FilePath, TSharedPtr<FJsonObject>& OutRoot,
-                  FString& OutReport, FString* OutJsonText = nullptr)
-    {
-        FString JsonText;
-        if (!FFileHelper::LoadFileToString(JsonText, *FilePath))
-        {
-            OutReport = FString::Printf(TEXT("could not read season manifest %s"), *FilePath);
-            return false;
-        }
-        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
-        if (!FJsonSerializer::Deserialize(Reader, OutRoot) || !OutRoot.IsValid())
-        {
-            OutReport = FString::Printf(TEXT("invalid JSON in season manifest %s"), *FilePath);
-            return false;
-        }
-        if (OutJsonText != nullptr)
-        {
-            *OutJsonText = MoveTemp(JsonText);
-        }
-        return true;
-    }
-}
-
-const TCHAR* VF_GetVoxelSeasonSelectionReasonName(EVoxelSeasonSelectionReason Reason)
-{
-    switch (Reason)
-    {
-    case EVoxelSeasonSelectionReason::Grounded: return TEXT("grounded");
-    case EVoxelSeasonSelectionReason::Outlier: return TEXT("outlier");
-    case EVoxelSeasonSelectionReason::Fixed: return TEXT("fixed");
-    }
-    return TEXT("unknown");
 }
 
 namespace

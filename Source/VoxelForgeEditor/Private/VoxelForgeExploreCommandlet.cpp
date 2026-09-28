@@ -4243,76 +4243,6 @@ bool WriteObjHeader(FArchive& Archive)
     return bOk && !Archive.IsError();
 }
 
-bool WriteObjTile(
-    FArchive& Archive,
-    const FVoxelMeshData& MeshData,
-    int32 VertexOffset,
-    FString& OutError)
-{
-    if (!ValidateCanonicalTile(MeshData, OutError))
-    {
-        return false;
-    }
-    bool bOk = true;
-    for (const FVector& Vertex : MeshData.Vertices)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("v %.9f %.9f %.9f\n"),
-            Vertex.X / 100.0,
-            Vertex.Y / 100.0,
-            Vertex.Z / 100.0));
-    }
-    for (const FVector2D& UV : MeshData.UVs)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("vt %.9f %.9f\n"), UV.X, UV.Y));
-    }
-    for (const FVector& Normal : MeshData.Normals)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("vn %.9f %.9f %.9f\n"), Normal.X, Normal.Y, Normal.Z));
-    }
-
-    const int32 NumTriangles = MeshData.Triangles.Num() / 3;
-    const int32 FirstCeilingTriangle = FMath::Clamp(
-        NumTriangles - MeshData.NumCeilingTriangles, 0, NumTriangles);
-    if (NumTriangles > 0)
-    {
-        bOk = bOk && WriteUtf8(Archive, TEXT("usemtl VoxelGround\n"));
-    }
-    for (int32 Triangle = 0; Triangle < NumTriangles; ++Triangle)
-    {
-        if (Triangle == FirstCeilingTriangle)
-        {
-            bOk = bOk && WriteUtf8(Archive, TEXT("usemtl VoxelCeiling\n"));
-        }
-        const int32 Base = Triangle * 3;
-        const int32 SourceA = MeshData.Triangles[Base];
-        const int32 SourceB = MeshData.Triangles[Base + 1];
-        const int32 SourceC = MeshData.Triangles[Base + 2];
-        if (SourceA < 0 || SourceB < 0 || SourceC < 0
-            || SourceA >= MeshData.Vertices.Num()
-            || SourceB >= MeshData.Vertices.Num()
-            || SourceC >= MeshData.Vertices.Num())
-        {
-            OutError = TEXT("Canonical mesher returned an out-of-range triangle index.");
-            return false;
-        }
-        const int32 A = SourceA + 1 + VertexOffset;
-        const int32 B = SourceB + 1 + VertexOffset;
-        const int32 C = SourceC + 1 + VertexOffset;
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("f %d/%d/%d %d/%d/%d %d/%d/%d\n"),
-            A, A, A, B, B, B, C, C, C));
-    }
-    if (!bOk || Archive.IsError())
-    {
-        OutError = TEXT("Could not write a canonical OBJ tile.");
-        return false;
-    }
-    return true;
-}
-
 bool WriteObjMesh(
     FArchive& Archive,
     const FVoxelMeshData& MeshData,
@@ -7089,29 +7019,6 @@ FString BuildExploreJson(
     Writer->WriteObjectEnd();
     Writer->WriteObjectEnd();
     return Writer->Close() ? Json : FString();
-}
-
-const TCHAR* ExploreEffectName(EVoxelOpEffect Effect)
-{
-    switch (Effect)
-    {
-    case EVoxelOpEffect::Identity:  return TEXT("Identity");
-    case EVoxelOpEffect::CarveOnly: return TEXT("CarveOnly");
-    case EVoxelOpEffect::FillOnly:  return TEXT("FillOnly");
-    case EVoxelOpEffect::Both:      return TEXT("Both");
-    default:                        return TEXT("Unknown");
-    }
-}
-
-const TCHAR* ExploreTileClassName(EVoxelTileClass Class)
-{
-    switch (Class)
-    {
-    case EVoxelTileClass::AllSolid: return TEXT("AllSolid");
-    case EVoxelTileClass::AllAir:   return TEXT("AllAir");
-    case EVoxelTileClass::Mixed:    return TEXT("Mixed");
-    default:                        return TEXT("Unknown");
-    }
 }
 
 // Density-bound APIs use FLT_MAX as the documented "unknown/unbounded" sentinel.  It is finite

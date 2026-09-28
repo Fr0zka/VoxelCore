@@ -637,9 +637,8 @@ struct FCachedRoomFloorJoin
 
 // One immutable floor segment authored while the tunnel chain is built. The floor is continuous
 // unless bLedgeTransition is set; that marker means the segment terminates at a deliberate
-// dramatic ledge and the vertical riser is placed at the next control-point boundary. NumSteps is
-// retained as a compatibility/diagnostic field and is always zero for newly authored tunnels: a
-// steep floor is never quantised into a staircase. ReliefScale is baked with a derivative bound,
+// dramatic ledge and the vertical riser is placed at the next control-point boundary. A steep
+// floor is never quantised into a staircase. ReliefScale is baked with a derivative bound,
 // so evaluation only reads this profile and never decides a floor shape per voxel.
 struct FTunnelFloorSegmentProfile
 {
@@ -652,9 +651,6 @@ struct FTunnelFloorSegmentProfile
     float NaturalEndFloorZ = 0.0f;
     float ReliefScale = 0.0f;
     bool bLedgeTransition = false;
-    // Deprecated staircase count. New profiles leave this at zero; keep the member so old
-    // diagnostic consumers can still compile while the authored representation has one meaning.
-    int32 NumSteps = 0;
 };
 
 // A pre-computed wandering tunnel chain — all connection decisions and hash-derived properties
@@ -938,8 +934,6 @@ struct FChunkSDFCache
 struct FTunnelCoreWorldEvaluation
 {
     float SDF = FLT_MAX;
-    // Deprecated compatibility output. The separate graph-tunnel support slab was removed.
-    bool bSupportFloor = false;
     // Room geometry owns the lower side while the world-space tunnel is inside a room. The
     // tunnel SDF may still reopen air there, but its swept bottom must not turn that room air back
     // into a shelf or wall.
@@ -1065,15 +1059,6 @@ namespace VoxelCaveMorphology
         bool* OutRoomOwnsBottom = nullptr
     );
 
-    // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
-    // the SmoothMin morphology: the generator uses it after terrain/passage posts to reassert the
-    // tunnel's walkable air core without reintroducing a connector or changing room ownership.
-    VOXELFORGE_API float EvaluateTunnelCoreSDF(
-        float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache,
-        bool bUseSpatialIndex = true
-    );
-
     // Evaluate the final structural air contract against the world-space wandering chain. Room
     // SDFs remain evaluated in warped coordinates; only this post uses world coordinates so its
     // walkable floor follows the authored chain exactly.
@@ -1106,46 +1091,6 @@ namespace VoxelCaveMorphology
         float ReachScale = 1.0f
     );
 
-    // Deprecated compatibility query for the removed graph-tunnel support slab. Production
-    // generation does not call this predicate; the tunnel's own swept shape owns its floor.
-    VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
-        float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache,
-        bool bUseSpatialIndex = true
-    );
-
-    // Deprecated compatibility helper for callers that still inspect the old support-band
-    // diagnostic. It is detached from production density generation.
-    VOXELFORGE_API void BuildTunnelSupportFloorColumn(
-        float WorldX, float WorldY,
-        const FChunkSDFCache& Cache,
-        FTunnelSupportFloorColumn& OutColumn,
-        bool bUseSpatialIndex = true
-    );
-
-    VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(
-        float WorldZ,
-        const FTunnelSupportFloorColumn& Column
-    );
-
-    // Returns the legacy projected band for one tunnel at this XY column. The world evaluator no
-    // longer uses it to write a support slab.
-    VOXELFORGE_API bool GetTunnelSupportFloorColumnBand(
-        int32 TunnelIndex,
-        const FTunnelSupportFloorColumn& Column,
-        float& OutFloorZ,
-        float& OutMinZ,
-        float& OutMaxZ
-    );
-
-    // CONVENIENCE WRAPPER: builds a temporary cache and evaluates in one call.
-    // Use this for one-off queries (debug visualization, single-point sampling).
-    // For chunk generation, use BuildChunkCache + EvaluateSDFCached instead.
-    float EvaluateSDF(
-        float WorldX, float WorldY, float WorldZ,
-        const FStrateGenerationParams& Params,
-        uint32 Seed, int32 StrateIndex
-    );
 }
 
 /**

@@ -361,33 +361,6 @@ namespace
     // STAGE B5 DECISION: repeated early-out in each op, NOT a scoping container — the stack is a flat
     // list that ClassifyBox folds op by op, and an op that only exists inside a container is not
     // composable. Cost stated honestly: twelve predictable compares instead of one branch.
-    /** Distance d'un point à un SEGMENT (pas à une droite). Écrite ici plutôt que prise dans
-     *  `FMath` : cinq lignes, aucune ambiguïté d'API, et elle sert une borne de correction — le
-     *  genre d'endroit où « je crois que cette fonction fait ça » n'est pas suffisant. */
-    FORCEINLINE float VF_DistPointSegment(const FVector& P, const FVector& A, const FVector& B)
-    {
-        const FVector AB = B - A;
-        const double LenSq = FVector::DotProduct(AB, AB);
-        const double T = (LenSq > KINDA_SMALL_NUMBER)
-                       ? FMath::Clamp(FVector::DotProduct(P - A, AB) / LenSq, 0.0, 1.0)
-                       : 0.0;
-        return (float)FVector::Dist(P, A + AB * T);
-    }
-
-    /** La même chose en 2D, pour les connecteurs de puits : ce sont des capsules HORIZONTALES, donc
-     *  Z se teste exactement et seul XY demande une distance point-segment. */
-    FORCEINLINE float VF_DistPointSegment2D(const FVector2D& P, const FVector2D& A, const FVector2D& B)
-    {
-        const FVector2D AB = B - A;
-        const double LenSq = (double)AB.X * AB.X + (double)AB.Y * AB.Y;
-        const double T = (LenSq > KINDA_SMALL_NUMBER)
-                       ? FMath::Clamp(((double)(P.X - A.X) * AB.X + (double)(P.Y - A.Y) * AB.Y) / LenSq, 0.0, 1.0)
-                       : 0.0;
-        const double DX = (double)P.X - ((double)A.X + AB.X * T);
-        const double DY = (double)P.Y - ((double)A.Y + AB.Y * T);
-        return (float)FMath::Sqrt(DX * DX + DY * DY);
-    }
-
     FORCEINLINE bool VF_NearCaveSurface(float Sdf, float SDFBlendRadius)
     {
         // Transcrit tel quel, ordre des comparaisons compris :
@@ -795,16 +768,6 @@ namespace
             return FVector((X + 0.5f) * CellSize, (Y + 0.5f) * CellSize, (Z + 0.5f) * CellSize);
         }
 
-        // Sur-approximation volontaire : boîte englobante du segment contre la boîte élargie.
-        // Un test capsule/AABB exact serait plus serré ; il coûterait plus cher pour un gain nul
-        // ici, car la réponse ne sert qu'à un rejet grossier par tuile.
-        static bool SegmentHitsBox(const FVector& A, const FVector& B, const FVector& Min, const FVector& Max)
-        {
-            return FMath::Min(A.X, B.X) <= Max.X && FMath::Max(A.X, B.X) >= Min.X
-                && FMath::Min(A.Y, B.Y) <= Max.Y && FMath::Max(A.Y, B.Y) >= Min.Y
-                && FMath::Min(A.Z, B.Z) <= Max.Z && FMath::Max(A.Z, B.Z) >= Min.Z;
-        }
-
         /**
          * Le cache par CELLULE, partagé avec le même contrat que GetMazeDensity. Il est `thread_local` et non
          * membre parce que la pile est PARTAGÉE entre workers en lecture — un membre mutable serait
@@ -1120,12 +1083,6 @@ namespace
             }
         }
 
-        /** Sans biomes — délègue, pour qu'il n'existe qu'UN corps de construction et UN compteur
-         *  d'identité. Deux constructeurs qui s'initialisent chacun de leur côté, c'est deux
-         *  endroits où oublier un membre. */
-        FSurfaceColumnSource(const FSurfaceGenerationParams& InP, int32 Seed)
-            : FSurfaceColumnSource(InP, Seed, TArray<FSurfaceGenerationParams>(), nullptr) {}
-
         void BuildSingleBiome(const FSurfaceGenerationParams& InP, int32 Seed)
         {
             // Construite à la main (pas via BuildSurfaceHeightStack) pour GARDER le pointeur vers la
@@ -1341,8 +1298,6 @@ namespace
             Src->Eval(WorldX, WorldY, S);
             return S.Height;
         }
-
-        const FSurfaceGenerationParams& GetParams() const { return P; }
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
         EVoxelOpChannelMask ChannelReads() const override { return VoxelOpChannels::None; }
@@ -4313,7 +4268,6 @@ namespace
                 // room's own volume.
                 InOut.bHasTunnelCoreWorldEvaluation = true;
                 InOut.TunnelCoreWorldSDF = S.LastTunnelCoreWorldEvaluation.SDF;
-                InOut.bTunnelCoreSupportFloor = false;
                 InOut.bTunnelCoreRoomFloor =
                     S.LastTunnelCoreWorldEvaluation.bRoomFloor;
                 InOut.bHasTunnelCoreSweptFloor =
@@ -4322,8 +4276,6 @@ namespace
                     S.LastTunnelCoreWorldEvaluation.SweptFloorZ;
                 InOut.TunnelCoreSweptFloorRadius =
                     S.LastTunnelCoreWorldEvaluation.SweptFloorRadius;
-                InOut.bProtectedStructuralFloor = false;
-                InOut.StructuralFloorMinimumDensity = 0.0f;
             }
 
             // These cache hand-offs remain valid when tunnel core is off; detail operators still
@@ -4445,7 +4397,6 @@ namespace
             bool bMayHaveTunnelCoreTail = false;
             uint32 ExactTailQueries = 0;
             uint32 ExactTailEvaluated = 0;
-            uint32 ExactTailCacheHits = 0;
             uint64 ExactTailCycles = 0;
             uint64 PropagateCycles = 0;
             uint64 ExactPrimitiveCycles = 0;
@@ -4532,12 +4483,6 @@ namespace
                 if (Room.RoomOp != nullptr) { return true; }
             }
             return false;
-        }
-
-        bool HasRoomColumnsForLastBox() const
-        {
-            const FBoxState& B = BoxState();
-            return !B.bValid || GetBoxCache().Columns.Num() > 0;
         }
 
         float RoomColumnFillSupremumForLastBox() const
@@ -5621,18 +5566,6 @@ namespace
                         ExactLatticeWarpedQueries[FlatIndex],
                         ExactLatticeWorldQueries[FlatIndex]);
                 }
-            };
-
-            auto EffectiveZRangeToWorld = [&](float MinEffectiveZ,
-                                               float MaxEffectiveZ) -> FVector2D
-            {
-                if (P.VerticalScale > 0.0f && P.VerticalScale != 1.0f)
-                {
-                    const float WorldA = MinEffectiveZ * P.VerticalScale;
-                    const float WorldB = MaxEffectiveZ * P.VerticalScale;
-                    return FVector2D(FMath::Min(WorldA, WorldB), FMath::Max(WorldA, WorldB));
-                }
-                return FVector2D(MinEffectiveZ, MaxEffectiveZ);
             };
 
             auto DistanceBlockToInfiniteLineLower = [&](const FExactLatticeBlock& Block,
@@ -9461,11 +9394,6 @@ namespace VoxelDensityOps
     TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed)
     {
         return MakeUnique<FGridColumnMod>(P, Seed);
-    }
-
-    TUniquePtr<IVoxelDensityOp> MakeSurfaceColumnSource(const FSurfaceGenerationParams& P, int32 Seed)
-    {
-        return MakeUnique<FSurfaceColumnSource>(P, Seed);
     }
 
     void BuildSurfaceStack(FVoxelOpStack& OutStack, const FSurfaceGenerationParams& P,

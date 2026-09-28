@@ -337,11 +337,6 @@ struct FVoxelOpSample
     // FLT_MAX = "no surface nearby" — the initial state, and the early-out placed sources use.
     float Sdf = FLT_MAX;
 
-    // Deprecated structural-floor compatibility fields. Graph tunnels now carry their floor in
-    // the swept shape itself; the production stack does not use these fields to write a slab.
-    bool bProtectedStructuralFloor = false;
-    float StructuralFloorMinimumDensity = 0.0f;
-
     // Block evaluation keeps the room source's per-sample selection explicit.  The scalar path
     // still uses the source's worker-local state, but a later block-capable modifier must never
     // observe the state belonging to the last sample of the preceding operator.
@@ -353,7 +348,6 @@ struct FVoxelOpSample
     // consulting a last-sample TLS value after an op-major evaluation.
     bool bHasTunnelCoreWorldEvaluation = false;
     float TunnelCoreWorldSDF = FLT_MAX;
-    bool bTunnelCoreSupportFloor = false;
     bool bTunnelCoreRoomFloor = false;
     bool bHasTunnelCoreSweptFloor = false;
     float TunnelCoreSweptFloorZ = -FLT_MAX;

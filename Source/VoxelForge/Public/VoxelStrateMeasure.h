@@ -510,23 +510,6 @@ VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
     const FVector& BVoxel,
     const FVoxelStrateMeasureSettings& Settings);
 
-/**
- * Player-fit connectivity over a custom stack. This is deliberately a separate API from the
- * legacy air route: it refuses unless Settings.SampleStep == 1, resolves endpoints against the
- * direct capsule-occupancy/floor mask, and flood-fills/routes only through player-fit cells.
- */
-VOXELFORGE_API EVoxelConnectivityResult VF_ArePlayerFitConnectedWithSampler(
-    const IVoxelStrateDensitySampler& Sampler,
-    int32 StrateBottomWorldZ,
-    int32 StrateTopWorldZ,
-    float BoundarySealThickness,
-    const FVector& AVoxel,
-    const FVector& BVoxel,
-    const FVoxelStrateMeasureSettings& Settings,
-    bool& bOutStartSnapped,
-    bool& bOutGoalSnapped,
-    FVoxelConnectivityDiagnostics* OutDiagnostics = nullptr);
-
 /** Full diagnostics variant for the player-fit custom-stack route. */
 VOXELFORGE_API FVoxelConnectivityDiagnostics VF_DiagnosePlayerFitConnectivityWithSampler(
     const IVoxelStrateDensitySampler& Sampler,

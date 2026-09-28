@@ -300,7 +300,6 @@ FORCEINLINE void VF_ApplyXYEdgeSealMC(float& Density, float WorldX, float WorldY
 // mathematical inner edge the helper is a true no-op, so claiming AllSolid there would be false.
 namespace VoxelDensityReach
 {
-    constexpr float SpineBlend        = 3.0f;
     constexpr float PassageBlend      = 4.0f;
     constexpr float EdgeProofMargin   = 1.0f;
 }

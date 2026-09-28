@@ -218,11 +218,6 @@ namespace VoxelDensityProfile
         }
     }
 
-    void SetEnabled(bool bEnabled)
-    {
-        SetMode(bEnabled ? EMode::Sampled : EMode::Disabled, DefaultSampleInterval);
-    }
-
     void SetMode(EMode Mode, uint32 SampleInterval)
     {
         if (SampleInterval == 0)

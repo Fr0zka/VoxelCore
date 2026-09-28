@@ -2973,24 +2973,6 @@ namespace VoxelStrateMeasurePrivate
         return Result;
     }
 
-    int32 GetSixNeighbour(const FSampleGrid& Grid, int32 Cell, int32 Direction)
-    {
-        int32 X = 0;
-        int32 Y = 0;
-        int32 Z = 0;
-        DecodeIndex(Grid, Cell, X, Y, Z);
-        switch (Direction)
-        {
-        case 0: return X + 1 < Grid.NumX ? Grid.Index(X + 1, Y, Z) : INDEX_NONE;
-        case 1: return X > 0 ? Grid.Index(X - 1, Y, Z) : INDEX_NONE;
-        case 2: return Y + 1 < Grid.NumY ? Grid.Index(X, Y + 1, Z) : INDEX_NONE;
-        case 3: return Y > 0 ? Grid.Index(X, Y - 1, Z) : INDEX_NONE;
-        case 4: return Z + 1 < Grid.NumZ ? Grid.Index(X, Y, Z + 1) : INDEX_NONE;
-        case 5: return Z > 0 ? Grid.Index(X, Y, Z - 1) : INDEX_NONE;
-        default: return INDEX_NONE;
-        }
-    }
-
     int32 CountPlayerFitNeighbours(
         const FSampleGrid& Grid,
         const TArray<uint8>& PlayerFitMask,
@@ -3456,26 +3438,6 @@ FVoxelConnectivityDiagnostics VF_DiagnoseConnectivityWithSampler(
                                 BoundarySealThickness, AVoxel, BVoxel, Settings,
                                 Result.bStartSnapped, Result.bGoalSnapped, &Result);
     return Result;
-}
-
-EVoxelConnectivityResult VF_ArePlayerFitConnectedWithSampler(
-    const IVoxelStrateDensitySampler& Sampler,
-    int32 StrateBottomWorldZ,
-    int32 StrateTopWorldZ,
-    float BoundarySealThickness,
-    const FVector& AVoxel,
-    const FVector& BVoxel,
-    const FVoxelStrateMeasureSettings& Settings,
-    bool& bOutStartSnapped,
-    bool& bOutGoalSnapped,
-    FVoxelConnectivityDiagnostics* OutDiagnostics)
-{
-    int32 NumRouteRetries = 0;
-    return VoxelStrateMeasurePrivate::QueryConnectivity(
-        nullptr, nullptr, &Sampler, INDEX_NONE,
-        StrateBottomWorldZ, StrateTopWorldZ, BoundarySealThickness, true,
-        AVoxel, BVoxel, Settings, bOutStartSnapped, bOutGoalSnapped,
-        NumRouteRetries, OutDiagnostics, true, nullptr);
 }
 
 FVoxelConnectivityDiagnostics VF_DiagnosePlayerFitConnectivityWithSampler(

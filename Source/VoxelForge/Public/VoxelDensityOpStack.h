@@ -568,12 +568,6 @@ namespace VoxelDensityOps
      *  `FillOnly` quand une colonne atteint la boîte, `Identity` (le cas courant) sinon. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed);
 
-    /** Rôle 1 — le pont entre les deux espaces : consomme les piles de HAUTEUR (sol + voûte,
-     *  `VoxelHeightOp.h`) et en fait une densité. `IsXYPure()` est **false** — les hauteurs sont
-     *  pures en XY, la densité est une distance à celles-ci et ne peut pas l'être. */
-    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSurfaceColumnSource(const FSurfaceGenerationParams& P,
-                                                                       int32 Seed);
-
     /**
      * SurfaceWorld, COMPLET : colonne (sol + voûte) → densité, overhang 3D, post structurel, et le
      * mélange de biomes quand `PerBiomeParams` est non vide.
