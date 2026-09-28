@@ -414,7 +414,7 @@ public:
      *
      * GAP (bedrock), hors-layout (air constant) et SurfaceWorld plient leurs hypothèses par Z ;
      * SurfaceWorld évalue ses colonnes terrain/plafond avec le MÊME ComputeSurfaceColumn que le
-     * chemin densité. Un unique slot cave opt-in peut ajouter le verdict conservatif de sa pile,
+     * chemin densité. Un unique slot cave peut ajouter le verdict conservatif de sa pile,
      * sous gardes d'archétype et de params bit-identiques. Spine/passages/disturbances/diff restent
      * des gardes conservatrices. Worker-safe (lecture seule + caches thread_local partagés avec
      * GetDensityAt — un verdict Mixed laisse les colonnes chaudes pour la génération qui suit).

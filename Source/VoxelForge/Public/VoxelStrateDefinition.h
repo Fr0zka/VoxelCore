@@ -116,29 +116,6 @@ public:
     ECaveGeneratorType GeneratorType = ECaveGeneratorType::TunnelNetwork;
 
     /**
-     * OPERATOR STACK (experimental) — generate this strate through the composable density operator
-     * stack instead of the hardcoded archetype switch. Same world, different machinery.
-     *
-     * This is the A/B switch for `OPSTACK-PLAN §2.6`'s acceptance bar: flip it, regenerate, and
-     * judge on a screenshot that it is recognisably the same place. Both systems coexist
-     * indefinitely — the switch is not going away until every archetype is ported.
-     *
-     * ⚠️ ONLY `Maze` IS PORTED SO FAR. On any other GeneratorType this flag is ignored and the
-     * switch runs as before, so setting it is harmless but does nothing yet.
-     *
-     * ⚠️ Do NOT flip this on a strate mid-session and expect the old and new geometry to agree to
-     * the bit — they differ by ~1-2 ULP with ZERO isosurface crossings, so the shape is identical
-     * but the floats are not (`Docs/archive/AUDIT-2026-07.md §C10`). Regenerate the world after changing it
-     * rather than letting old and new tiles sit side by side.
-     *
-     * Pile d'opérateurs (expérimental) : génère cette strate via la pile composable au lieu du
-     * `switch` d'archétype. Seul `Maze` est porté ; ailleurs le drapeau est ignoré.
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strate|Generation",
-        meta = (DisplayName = "Use Operator Stack (experimental)"))
-    bool bUseOperatorStack = false;
-
-    /**
      * Authoritative per-strate worm switch. Existing assets default to enabled. The manager
      * resolves a disabled strate to WormStrength == 0 before any fused, stack, composer, or
      * interval path sees its parameters, so this is a geometry switch rather than a local CVar.

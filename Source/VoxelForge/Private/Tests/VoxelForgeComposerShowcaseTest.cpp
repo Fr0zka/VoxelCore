@@ -1590,7 +1590,7 @@ bool FVoxelForgeComposerShowcaseTest::RunTest(const FString& Parameters)
     FTestWorld World;
     // The shared fixture defaults to a bounded 4-chunk volume for fast density tests. The
     // owner-facing scale audit must exercise the production/default 8-chunk envelope.
-    World.Build(BaseComposerSeed, 2, true, 8);
+    World.Build(BaseComposerSeed, 2, 8);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

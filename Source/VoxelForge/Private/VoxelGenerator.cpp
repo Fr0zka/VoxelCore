@@ -16,7 +16,7 @@
 #include "VoxelWormField.h"
 #include "VoxelDensityAblation.h" // fingerprinted development-only stage measurements
 #include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
-#include "VoxelDensityOpStack.h"      // the opt-in per-strate operator stack
+#include "VoxelDensityOpStack.h"      // the per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 #include "VoxelDensityProfile.h"
@@ -669,9 +669,9 @@ struct FVoxelDensityBlockSession
             return;
         }
 
-        // Allocate lazily on the first operator-stack sample.  Legacy archetypes still use the
-        // ordinary scalar generator and should not pay for a block scratch lattice merely because
-        // the mesher opened the scoped hand-off.
+        // Allocate lazily on the first operator-stack sample.  Chunks that never reach a stack
+        // (gaps, out-of-layout, degenerate strates) use the ordinary scalar path and should not
+        // pay for a block scratch lattice merely because the mesher opened the scoped hand-off.
         BlockScratch.Reset();
     }
 
@@ -2549,12 +2549,11 @@ namespace
     /**
      * Construit la pile de cet archétype dans `OutStack` et remplit les bornes Z de `OutCtx`.
      *
-     * @return false quand la pile NE DOIT PAS être utilisée — archétype non porté, params absents,
-     *         ou **strate dégénérée**. Ce dernier cas n'est pas de la prudence : cinq fonctions
-     *         d'archétype court-circuitent sur `return 1.0f` (= air) quand la hauteur est nulle,
-     *         et la pile n'a pas cet early-out, par conception. L'appelant retombe sur le `switch`,
-     *         qui EST le comportement de référence. (`GetDensityWithParams`, lui, n'a aucun
-     *         early-out de ce genre : TunnelNetwork/Underwater n'ont donc pas cette garde.)
+     * @return false quand la pile NE DOIT PAS être utilisée — archétype inconnu, params absents,
+     *         ou **strate dégénérée** (hauteur nulle). La pile n'a pas d'early-out pour ce dernier
+     *         cas, par conception : l'appelant rend de l'air (`GetDensityAt`) ou refuse de prouver
+     *         la tuile (`ClassifyTile`). (`GetDensityWithParams` n'a aucun early-out de ce genre :
+     *         TunnelNetwork/Underwater n'ont donc pas cette garde.)
      */
     bool VF_BuildOpStackForChunk(ECaveGeneratorType Type, FVoxelStackParamRefs& Refs,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* SM,
@@ -2572,8 +2571,8 @@ namespace
 
         case ECaveGeneratorType::FlatPlain:
         case ECaveGeneratorType::CrystalChamber:
-            // UN SEUL cas pour les deux, comme le `switch` de production : `GetSlabDensity` ne les
-            // distingue pas non plus. Voir BuildSlabStack.
+            // UN SEUL cas pour les deux : ils ne diffèrent que par leurs valeurs par défaut.
+            // Voir BuildSlabStack.
             if (!Refs.Slab) { return false; }
             if (Refs.Slab->StrateTopWorldZ - Refs.Slab->StrateBottomWorldZ <= 0.0f) { return false; }
             OutCtx.StrateTopWorldZ    = Refs.Slab->StrateTopWorldZ;
@@ -2621,9 +2620,8 @@ namespace
             return true;
 
         default:
-            // `UsesOperatorStackForChunk` ne rend true que pour les archétypes portés (les 8), donc
-            // on ne devrait jamais arriver ici. Si ça arrive : retomber sur le `switch` plutôt que
-            // générer du vide — un monde faux est pire qu'un monde non porté.
+            // `UsesOperatorStackForChunk` ne rend true que pour les 8 archétypes, donc on ne devrait
+            // jamais arriver ici (valeur d'enum invalide).
             return false;
         }
     }
@@ -2842,11 +2840,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FBiomeContext            CP_BiomeCtx;
         thread_local FChunkBiomeCache         CP_BiomeCache;
         thread_local TArray<FSurfaceGenerationParams> CP_SurfaceBiomeParams;
-        // T1.a per-column surface cache: GSurfColCache (file-scope, shared with ClassifyTile).
-        // Discriminates the surface cache by strate: same strate ⇒ identical heightfield params ⇒ columns
-        // are shareable across the whole vertical chunk stack. Taken from the params themselves
-        // (StrateBottomWorldZ is unique per stacked strate) so the key can never disagree with CP_Surface.
-        thread_local int32                    CP_StrateKey = MIN_int32;
         // AUDIT C2 — la clé DOIT contenir la version de layout, pas seulement le chunk. Après un
         // RebuildStrates / une édition à chaud, StrateManager reconstruit le layout et bumpe la
         // version ; un worker dont CP_Chunk vaut encore ce chunk sauterait le refetch et
@@ -2860,8 +2853,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // when the other context misses, this bit must force the rebuild guard below to run.
         thread_local bool                      CP_UsesTileCacheWindow = false;
         // OPSTACK — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
-        // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide tant que
-        // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
+        // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide
+        // seulement pour une strate dégénérée (hauteur nulle).
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
         thread_local uint64                    CP_ManagerLifetimeId = 0;
@@ -2890,8 +2883,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // A coarse tile samples thousands of exact XY chunk keys, but those keys describe the
         // same immutable stack whenever the selected archetype is operator-stack backed.  Share
         // that prepared state by Z; the stack still queries the actual world position, and its
-        // room-graph cache remains keyed by the real XY search window.  Legacy tunnel states keep
-        // the full XYZ key because their native cache is built for one XY window.
+        // room-graph cache remains keyed by the real XY search window.  Chunks outside the strate
+        // layout (constant air) keep the full XYZ key.
         const ECaveGeneratorType QueryGeneratorType = bUseChunkRoutingCache
             ? CP_RouteGeneratorType
             : StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
@@ -3066,7 +3059,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_Maze    = StrateManager->GetMazeParamsForChunk(ChunkCoord);            break;
             case ECaveGeneratorType::SurfaceWorld:
                 ResolveSurfaceChunkParams(ChunkCoord, CP_Surface, CP_BiomeCtx, CP_SurfaceBiomeParams);
-                CP_StrateKey = FMath::RoundToInt(CP_Surface.StrateBottomWorldZ);
                 break;
             case ECaveGeneratorType::VerticalShafts:
                 CP_Vert    = StrateManager->GetVerticalShaftParamsForChunk(ChunkCoord);   break;
@@ -3085,131 +3077,112 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             }
             CP_Dist = StrateManager->GetDisturbanceParamsForChunk(ChunkCoord);
 
-            // ── OPSTACK : (re)construire la pile si cette strate l'a demandée. ──
-            // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
-            // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
-            CP_UseOpStack = bUseChunkRoutingCache
-                ? CP_RouteUsesOperatorStack
-                : StrateManager->UsesOperatorStackForChunk(ChunkCoord);
-            CP_UseOpStack = CP_UseOpStack || CP_UseCustomRecipe;
+            // ── OPSTACK : (re)construire la pile de ce chunk. ──
+            // Toute strate est générée par une pile d'opérateurs. La construction est par chunk
+            // (comme le refetch de params juste au-dessus), jamais par voxel.
+            // Every strate is generated by an operator stack. An editor composer candidate or a
+            // cooked-season recipe supplies its own stack; otherwise — or if that stack cannot be
+            // built — the archetype's native stack is used.
+            CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
+            CP_UseOpStack = false;
 #if WITH_EDITOR
-            // A composer override is already an explicit, validated stack description.  It must
-            // be evaluated even when the authored definition had the normal operator-stack opt-in
-            // disabled; otherwise a multi-region candidate would be installed in the manager but
-            // silently fall back to the old one-archetype switch.
-            CP_UseOpStack = CP_UseOpStack || CP_UseComposerRegions;
-#endif
-            if (CP_UseOpStack)
+            if (CP_UseComposerRegions)
             {
-                CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
-                bool bBuiltSpecialStack = false;
-#if WITH_EDITOR
-                if (CP_UseComposerRegions)
+                FVoxelOpContext RegionContext;
+                if (VF_BuildStrateRegionStack(
+                    CP_ComposerRegions, OriginSpineRadius, StrateManager,
+                    CP_OpStack, RegionContext, nullptr))
                 {
-                    bBuiltSpecialStack = true;
-                    FVoxelOpContext RegionContext;
-                    if (VF_BuildStrateRegionStack(
-                        CP_ComposerRegions, OriginSpineRadius, StrateManager,
-                        CP_OpStack, RegionContext, nullptr))
-                    {
-                        RegionContext.ChunkCoord = ChunkCoord;
-                        RegionContext.Step = 1;
-                        RegionContext.LayoutVersion = LayoutVersion;
-                        RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
-                        RegionContext.EdgeSealThickness = EdgeSealThickness;
-                        CP_OpStack.PrepareChunk(RegionContext);
-                    }
-                    else
-                    {
-                        CP_UseOpStack = false;
-                    }
+                    RegionContext.ChunkCoord = ChunkCoord;
+                    RegionContext.Step = 1;
+                    RegionContext.LayoutVersion = LayoutVersion;
+                    RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                    RegionContext.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack.PrepareChunk(RegionContext);
+                    CP_UseOpStack = true;
                 }
-#endif
-                if (!bBuiltSpecialStack)
+                else
                 {
-                    if (CP_UseCustomRecipe)
-                    {
-                        FVoxelOpContext RecipeContext;
-                        if (VF_BuildStackFromRecipe(
-                            CP_CustomRecipe, CP_CustomParams, CP_CustomRecipeSeed,
-                            OriginSpineRadius, StrateManager, CP_OpStack, RecipeContext, nullptr))
-                        {
-                            RecipeContext.ChunkCoord = ChunkCoord;
-                            RecipeContext.Step = 1;
-                            RecipeContext.LayoutVersion = LayoutVersion;
-                            // The recipe builder supplies the candidate's vertical seal to the
-                            // structural post. The XY edge seal is global and uses live settings.
-                            RecipeContext.WorldRadiusVoxels = WorldRadiusVoxels;
-                            RecipeContext.EdgeSealThickness = EdgeSealThickness;
-                            CP_OpStack.PrepareChunk(RecipeContext);
-                        }
-                        else
-                        {
-                            // Import/load validates recipes before a season becomes active. Keep
-                            // the fallback hole-safe if a future schema changes underneath it.
-                            CP_UseOpStack = false;
-                        }
-                    }
-                    else
-                    {
-                        FVoxelOpContext OpCtx;
-                        OpCtx.ChunkCoord    = ChunkCoord;
-                        OpCtx.Seed          = (uint32)Seed;
-                        OpCtx.LayoutVersion = LayoutVersion;
-                        OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
-                        OpCtx.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack = FVoxelOpStack();
+                    CP_UseComposerRegions = false;
+                }
+            }
+#endif
+            if (!CP_UseOpStack && CP_UseCustomRecipe)
+            {
+                FVoxelOpContext RecipeContext;
+                if (VF_BuildStackFromRecipe(
+                    CP_CustomRecipe, CP_CustomParams, CP_CustomRecipeSeed,
+                    OriginSpineRadius, StrateManager, CP_OpStack, RecipeContext, nullptr))
+                {
+                    RecipeContext.ChunkCoord = ChunkCoord;
+                    RecipeContext.Step = 1;
+                    RecipeContext.LayoutVersion = LayoutVersion;
+                    // The recipe builder supplies the candidate's vertical seal to the
+                    // structural post. The XY edge seal is global and uses live settings.
+                    RecipeContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                    RecipeContext.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack.PrepareChunk(RecipeContext);
+                    CP_UseOpStack = true;
+                }
+                else
+                {
+                    // Import/load validates recipes before a season becomes active. If a future
+                    // schema still fails here, fall back to the archetype's native stack below.
+                    CP_OpStack = FVoxelOpStack();
+                    CP_UseCustomRecipe = false;
+                }
+            }
+            if (!CP_UseOpStack)
+            {
+                FVoxelOpContext OpCtx;
+                OpCtx.ChunkCoord    = ChunkCoord;
+                OpCtx.Seed          = (uint32)Seed;
+                OpCtx.LayoutVersion = LayoutVersion;
+                OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
+                OpCtx.EdgeSealThickness = EdgeSealThickness;
 
                 // ⚠️ LE MAPPING VIT DANS `VF_BuildOpStackForChunk` (haut de ce fichier) ET NULLE
                 // PART AILLEURS — `ClassifyTile` appelle la MÊME fabrique. Un verdict de tuile issu
                 // d'une pile construite autrement serait un trou. Ici on ne fait que fournir les
                 // params déjà cherchés juste au-dessus.
-                        FVoxelStackParamRefs Refs;
-                        Refs.Slab   = &CP_Slab;
-                        Refs.Maze   = &CP_Maze;
-                        Refs.Vert   = &CP_Vert;
-                        Refs.Float  = &CP_Float;
-                        Refs.Tunnel = &CP_Tunnel;
+                FVoxelStackParamRefs Refs;
+                Refs.Slab   = &CP_Slab;
+                Refs.Maze   = &CP_Maze;
+                Refs.Vert   = &CP_Vert;
+                Refs.Float  = &CP_Float;
+                Refs.Tunnel = &CP_Tunnel;
 
                 // SurfaceWorld : le champ de biomes est fabriqué ICI, du côté qui connaît le
                 // générateur, et TRANSFÉRÉ à la pile. L'opérateur ne voit qu'une `IVoxelBiomeField`,
                 // ce qui lui permet de devenir un asset en Phase 3 sans traîner le générateur.
-                        TArray<FSurfaceGenerationParams> PerBiome;
-                        if (CP_GenType == ECaveGeneratorType::SurfaceWorld)
-                        {
-                            Refs.Surface = &CP_Surface;
-                            if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
-                            {
-                                PerBiome = CP_SurfaceBiomeParams;
-                                Refs.SurfaceBiomeParams = &PerBiome;
-                                Refs.BiomeField = MakeUnique<FGeneratorBiomeField>(
-                                    this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
-                            }
-                        }
-
-                        CP_UseOpStack = VF_BuildOpStackForChunk(
-                            CP_GenType, Refs, Seed, OriginSpineRadius,
-                            StrateManager, CP_OpStack, OpCtx);
-
-                // Le test appelle PrepareChunk, pas la production : c'est exactement la divergence
-                // qui rend un opérateur vert en test et faux en jeu. Les sept `PrepareChunk`
-                // actuels sont vides, donc ceci ne change RIEN aujourd'hui — c'est le point : le
-                // premier opérateur qui hisse vraiment du travail par chunk doit trouver l'appel
-                // déjà là. `Step` reste 1 : GetDensityAt ne connaît pas le pas d'échantillonnage
-                // du mesher (voir le contrat T2.b dans VoxelDensityOp.h).
-                // The test calls PrepareChunk and production did not — the exact divergence that
-                // makes an op green in test and wrong in game. All seven bodies are empty today,
-                // which is the point: the first op that hoists real per-chunk work must find the
-                // call already here.
-                        if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
+                TArray<FSurfaceGenerationParams> PerBiome;
+                if (CP_GenType == ECaveGeneratorType::SurfaceWorld)
+                {
+                    Refs.Surface = &CP_Surface;
+                    if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
+                    {
+                        PerBiome = CP_SurfaceBiomeParams;
+                        Refs.SurfaceBiomeParams = &PerBiome;
+                        Refs.BiomeField = MakeUnique<FGeneratorBiomeField>(
+                            this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
                     }
                 }
+
+                CP_UseOpStack = VF_BuildOpStackForChunk(
+                    CP_GenType, Refs, Seed, OriginSpineRadius,
+                    StrateManager, CP_OpStack, OpCtx);
+
+                // PrepareChunk runs here exactly as in the tests, so an op that hoists real
+                // per-chunk work behaves the same in game. `Step` reste 1 : GetDensityAt ne connaît
+                // pas le pas d'échantillonnage du mesher (voir le contrat T2.b dans VoxelDensityOp.h).
+                if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
             }
 
-            // The legacy path needs its prepared native tunnel-core cache.  An operator-stack
-            // tunnel source publishes the same world-space result after EvalMC, so preparing a
-            // second full graph/core cache here would only duplicate the work that made coarse
-            // streaming expensive in the first place.  Custom/composer paths retain the legacy
-            // cache unless their own stack supplies the hand-off.
+            // An operator-stack tunnel source publishes the world-space core after EvalMC, so
+            // preparing a second full graph/core cache here would only duplicate the work that made
+            // coarse streaming expensive in the first place. Only an editor composer region stack,
+            // which does not publish that hand-off, still gets the prepared native core.
             const bool bNativeTunnelCore = !CP_UseCustomRecipe
                 && (CP_GenType == ECaveGeneratorType::TunnelNetwork
                     || CP_GenType == ECaveGeneratorType::Underwater);
@@ -3294,12 +3267,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         FTunnelCoreWorldEvaluation FusedTunnelCore;
         bool bRoomOwnsBottom = false;
         bool bRoomOwnsBottomValid = false;
-        FVector NativeWarpedPosition = FVector::ZeroVector;
-        bool bNativeWarpedPositionValid = false;
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
-        // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
-        // de diff qui suivent ne voient aucune différence.
+        // MC (négatif = solide), que les disturbances et la couche de diff qui suivent attendent.
         if (CP_UseOpStack)
         {
             const bool bCanUseFusedEvaluator =
@@ -3383,66 +3353,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 }
             }
         }
-        else switch (CP_GenType)
+        else
         {
-        case ECaveGeneratorType::FlatPlain:
-        case ECaveGeneratorType::CrystalChamber:
-            Result = GetSlabDensity(WorldX, WorldY, WorldZ, CP_Slab);                 break;
-        case ECaveGeneratorType::Maze:
-            Result = GetMazeDensity(WorldX, WorldY, WorldZ, CP_Maze);                 break;
-        case ECaveGeneratorType::SurfaceWorld:
-        {
-            // Integer XY (the density grid) → reuse the column down its whole Z extent (T1.a).
-            // Fractional XY (gradient-normal samples) → compute directly (no cache key).
-            if (WorldX == FMath::FloorToFloat(WorldX) && WorldY == FMath::FloorToFloat(WorldY))
-            {
-                const int32 IX = (int32)WorldX, IY = (int32)WorldY;
-                // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
-                // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
-                FSurfaceColumnBox& Box = GSurfColCache.Acquire(
-                    IX, IY, CP_StrateKey, Seed, LayoutVersion,
-                    DensityCacheOwnerId, ManagerLifetimeId);
-                const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
-                if (!Box.Computed[CI])
-                {
-                    ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                        CP_SurfaceBiomeParams, CP_BiomeCache,
-                        Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf,
-                        Box.Cols[CI].OverhangAmp, Box.Cols[CI].DirX, Box.Cols[CI].DirY);
-                    Box.Computed[CI] = true;
-                }
-                const FSurfaceColumn& Col = Box.Cols[CI];
-                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
-                    Col.TerrainZ, Col.CeilSurf, Col.OverhangAmp,
-                    Col.DirX, Col.DirY, CP_Surface);
-            }
-            else
-            {
-                float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY;
-                ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                    CP_SurfaceBiomeParams, CP_BiomeCache, TerrainZ, CeilSurf,
-                    OverhangAmp, DirX, DirY);
-                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
-                    TerrainZ, CeilSurf, OverhangAmp, DirX, DirY, CP_Surface);
-            }
-            break;
-        }
-        case ECaveGeneratorType::VerticalShafts:
-            Result = GetVerticalShaftDensity(WorldX, WorldY, WorldZ, CP_Vert);        break;
-        case ECaveGeneratorType::FloatingIslands:
-            Result = GetFloatingIslandDensity(WorldX, WorldY, WorldZ, CP_Float);      break;
-        case ECaveGeneratorType::Underwater:
-        case ECaveGeneratorType::TunnelNetwork:
-        default:
-            // Underwater shares tunnel rock (water table is a render-side overlay).
-        Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
-                                          CP_TunnelFP, LayoutVersion,
-                                          /*bApplyLegacyStructuralPosts=*/false,
-                                          nullptr, false, &bRoomOwnsBottom,
-                                          &NativeWarpedPosition);
-            bRoomOwnsBottomValid = true;
-            bNativeWarpedPositionValid = true;
-            break;
+            // Only a degenerate strate (zero height) has no stack. It is open air, like the
+            // archetype functions the stack replaced.
+            Result = 1.0f;
         }
         DensityCoreTimer.End();
 
@@ -3482,21 +3397,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         {
             VoxelDensityProfile::FScopedTimer ProfileTimer(
                 VoxelDensityProfile::EBucket::TunnelCorePosts);
-            FVector RoomQueryPosition;
-            if (bNativeWarpedPositionValid)
+            FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+            if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
             {
-                RoomQueryPosition = NativeWarpedPosition;
+                RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
             }
-            else
-            {
-                RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
-                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
-                {
-                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
-                }
-                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
-            }
+            RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
             PreDisturbanceTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, nullptr,
                 VoxelGenLOD::ShouldUseSpatialIndex(
@@ -3520,7 +3427,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // A disturbance is allowed to add visual detail, but it must not refill the landing's
         // measured air volume or turn its support slab back into a hole. Reassert the landing
         // air first, then the structural floor, in MC space before the final XY seal. The two
-        // calls use the same landing geometry already evaluated by the legacy and op-stack post.
+        // calls use the same landing geometry already evaluated by the op-stack structural post.
         VoxelDensityProfile::FScopedTimer DensityStructuralPostsTimer(
             VoxelDensityProfile::EBucket::DensityStructuralPosts);
         VoxelDensityProfile::FScopedTimer StructuralTailTimer(
@@ -3695,21 +3602,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
-                FVector RoomQueryPosition;
-                if (bNativeWarpedPositionValid)
+                FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
                 {
-                    RoomQueryPosition = NativeWarpedPosition;
+                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
                 }
-                else
-                {
-                    RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
-                    if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
-                    {
-                        RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
-                    }
-                    RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                        RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
-                }
+                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
                     nullptr,
@@ -6823,7 +6722,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
     bool bCanAir   = true;   // "tout le treillis est air" encore prouvable
     // ── Catégorisation par Z du treillis : gap bedrock = solide ; hors layout = air constant ;
-    //    SurfaceWorld = test colonne ; un slot cave opt-in = verdict de pile sur sa sous-boîte. ──
+    //    SurfaceWorld = test colonne ; un slot cave = verdict de pile sur sa sous-boîte. ──
     struct FSurfSlot
     {
         int32 BotChunkZ = INT32_MAX;   // identité du slot (borne basse de la strate, en chunks)
@@ -6904,7 +6803,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
             // EST FAUX) et `IsGapChunk` rend false au-dessus du sommet (« open air, NOT a gap »).
             // Résultat : chaque tuile touchant l'air libre au-dessus du monde entrait dans la
             // BRANCHE DE CAVE, n'y trouvait aucun slot, et abandonnait — mesuré en jeu à 83 % des
-            // tuiles classées (`Cave Bail Not Op Stack No Layout` = 1.58 / 1.90).
+            // tuiles classées.
             //
             // La vérité est dans `GetGenerationParams` : hors layout il rend `BaseDensity = -1`,
             // `RoomDensity = 0`, `WormStrength = 0` — un champ CONSTANT, donc de l'air, sans salle
@@ -6987,38 +6886,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
                 // le pliage générique de la pile — mais SEULEMENT sous des conditions vérifiables,
                 // parce qu'un faux verdict ici est un trou (pas de géométrie, pas de collision).
                 //
-                // Condition 1 : la strate doit RÉELLEMENT être générée par la pile. Sinon on
-                // classerait un champ que le mesher ne produira pas. C'est le même drapeau, lu au
-                // même endroit, que `GetDensityAt`.
+                // Condition 1 : le slot doit avoir une pile (une définition d'archétype connue).
+                // Sinon on classerait un champ que le mesher ne produira pas.
                 if (!StrateManager->UsesOperatorStackForChunk(CC))
                 {
-                    // Attribution DIAGNOSTIQUE uniquement : distingue une strate cave entièrement
-                    // désactivée d'une tuile de frontière qui a rencontré un slot désactivé avant
-                    // la garde « slot différent » ci-dessous.
-                    // On résout les bornes APRÈS l'échec du même prédicat ; elles ne changent ni
-                    // la condition, ni le point de retour, ni le verdict.
-                    // Diagnostic attribution only: separates a wholly disabled cave slot from a
-                    // boundary tile that met a disabled slot before the different-slot guard
-                    // below. Resolve bounds only after the same predicate fails; classification
-                    // control flow and return value stay unchanged.
-                    int32 FailedTopCZ = 0, FailedBotCZ = 0;
-                    if (!StrateManager->GetStrateChunkZBounds(ChunkZ, FailedTopCZ, FailedBotCZ))
-                    {
-                        INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackNoLayout);
-                    }
-                    else
-                    {
-                        const int32 TileMinCZ = FloorDivC(MinZ, CHUNK_SIZE);
-                        const int32 TileMaxCZ = FloorDivC(MaxZ, CHUNK_SIZE);
-                        if (TileMinCZ >= FailedBotCZ && TileMaxCZ <= FailedTopCZ)
-                        {
-                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackSoleSlot);
-                        }
-                        else
-                        {
-                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackBoundaryTile);
-                        }
-                    }
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
                     return EVoxelTileClass::Mixed;
                 }
 
@@ -7223,16 +7095,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
                 return EVoxelTileClass::Mixed;   // la boîte déborde sur un autre archétype
             }
 
-            // Le drapeau doit tenir sur TOUS les chunks de la boîte, pas seulement sur celui qui a
-            // déclenché la tentative : un seul chunk hors pile invaliderait le verdict.
+            // Every chunk of the box must have a stack, not only the one that triggered the
+            // attempt (redundant with the Z pass today, kept hole-safe).
             if (!StrateManager->UsesOperatorStackForChunk(CC))
             {
-                // Le passage Z précédent a déjà accepté l'unique slot cave. Avec le layout actuel
-                // (prédicat indépendant de X/Y), ce recheck est redondant ; un hit nomme donc
-                // précisément cette garde tardive au lieu d'être agrégé aux opt-ins désactivés.
-                // The prior Z pass already accepted the sole cave slot. With the current X/Y-
-                // independent predicate this recheck is redundant, so attribute it separately.
-                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackRecheck);
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
                 return EVoxelTileClass::Mixed;
             }
 
@@ -7331,8 +7198,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
                                      StrateManager, TileStack, OpCtx))
         {
-            // Strate dégénérée ou archétype non porté : `GetDensityAt` retomberait sur le `switch`,
-            // donc la pile ne décrit pas ce que le mesher verra. Aucun verdict.
+            // Strate dégénérée : `GetDensityAt` y rend de l'air sans pile, donc la pile ne décrit
+            // pas ce que le mesher verra. Aucun verdict.
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
             return EVoxelTileClass::Mixed;
         }

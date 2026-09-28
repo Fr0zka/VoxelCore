@@ -2,7 +2,6 @@
 // Runtime strate layout generation and queries.
 
 #include "VoxelStrateManager.h"
-#include "CoreGlobals.h"  // GIsAutomationTesting — the opt-in diagnostic stays quiet under tests
 #include "VoxelSettings.h"
 #include "VoxelSeasonAsset.h"
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
@@ -1334,7 +1333,6 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             }
 
             Slot.Definition->GeneratorType = SeasonStrate.Archetype;
-            Slot.Definition->bUseOperatorStack = SeasonStrate.bUsesRecipe;
             Slot.Definition->StrateHeightInChunks = SeasonStrate.HeightInChunks;
             Slot.Definition->GenerationParams = SeasonStrate.Params.TunnelNetworkParams;
             Slot.Definition->SlabParams = SeasonStrate.Params.SlabParams;
@@ -1401,10 +1399,9 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
                 : FString::Printf(TEXT("Value_%d"), static_cast<int32>(Slot.Definition->GeneratorType));
             VoxelForgeStartupTrace::RecordEvent(TEXT("strate_slot"), FString::Printf(
                 TEXT("\"index\":%d,\"definition\":\"%s\",\"archetype\":\"%s\",\"top_chunk_z\":%d,"
-                     "\"bottom_chunk_z\":%d,\"height_chunks\":%d,\"operator_stack\":%d"),
+                     "\"bottom_chunk_z\":%d,\"height_chunks\":%d"),
                 Slot.StrateIndex, *DefinitionPath, *ArchetypeName,
-                Slot.TopChunkZ, Slot.BottomChunkZ, Slot.HeightInChunks,
-                Slot.Definition->bUseOperatorStack ? 1 : 0));
+                Slot.TopChunkZ, Slot.BottomChunkZ, Slot.HeightInChunks));
         }
 
         UE_LOG(LogTemp, Log, TEXT("[StrateManager] Strate %d: '%s' | Z chunks [%d to %d] | %d chunks tall"),
@@ -1413,79 +1410,6 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             Slot.TopChunkZ,
             Slot.BottomChunkZ,
             Slot.HeightInChunks);
-    }
-
-    // Diagnostic de configuration, une seule fois par construction de layout. SurfaceWorld est
-    // volontairement exclu : son chemin T1.d exact-lattice ne dépend pas de ce drapeau.
-    // Configuration diagnostic once per layout build. SurfaceWorld is deliberately excluded:
-    // its exact-lattice T1.d path does not depend on this flag.
-    int32 NumCaveSlots = 0;
-    int32 NumOperatorStackDisabledCaves = 0;
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        const ECaveGeneratorType SlotArchetype = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
-        if (!Slot.Definition || SlotArchetype == ECaveGeneratorType::SurfaceWorld)
-        {
-            continue;
-        }
-
-        ++NumCaveSlots;
-        const bool bUsesStack = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].bUsesRecipe : Slot.Definition->bUseOperatorStack;
-        if (!bUsesStack)
-        {
-            ++NumOperatorStackDisabledCaves;
-        }
-    }
-
-    // ⚠️ WARNING EN ÉDITEUR/JEU, JAMAIS EN TEST. Les tests `Determinism.*` construisent
-    // DÉLIBÉRÉMENT un monde non opt-in — c'est leur oracle de comparaison — et le framework
-    // d'automatisation compte un Warning comme un échec. Un diagnostic ne doit pas casser la suite
-    // qu'il est censé éclairer. Le message reste écrit UNE fois : seule la verbosité change.
-    // Warning in editor/game where it is actionable, never in tests: the Determinism.* tests build
-    // a non-opted-in world ON PURPOSE as their comparison oracle, and the automation framework
-    // treats a Warning as a failure. One message, two verbosities.
-    const bool bQuietDiagnostic = GIsAutomationTesting;
-
-    if (NumOperatorStackDisabledCaves > 0)
-    {
-        const FString Summary = FString::Printf(
-            TEXT("[StrateManager] Operator-stack opt-in: %d/%d cave layout slots have Use Operator Stack disabled. These slots cannot use operator-stack ClassifyBox/T1.d; enable the asset setting on the listed definitions if that is intended."),
-            NumOperatorStackDisabledCaves, NumCaveSlots);
-
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Summary); }
-        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Summary); }
-    }
-    else
-    {
-        UE_LOG(LogTemp, Log,
-            TEXT("[StrateManager] Operator-stack opt-in: all %d cave layout slots have Use Operator Stack enabled."),
-            NumCaveSlots);
-    }
-
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        const bool bSeasonStack = bUseSeason
-            && SeasonStrates[Slot.StrateIndex].bUsesRecipe;
-        const ECaveGeneratorType SlotArchetype = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
-        if (!Slot.Definition
-            || SlotArchetype == ECaveGeneratorType::SurfaceWorld
-            || (bUseSeason ? bSeasonStack : Slot.Definition->bUseOperatorStack))
-        {
-            continue;
-        }
-
-        const FString Line = FString::Printf(
-            TEXT("[StrateManager]   cave slot=%d name='%s' Z chunks=[%d to %d] bUseOperatorStack=false"),
-            Slot.StrateIndex,
-            *Slot.Definition->StrateName.ToString(),
-            Slot.TopChunkZ,
-            Slot.BottomChunkZ);
-
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Line); }
-        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Line); }
     }
 
     CachedSeed = WorldSeed;
@@ -6281,30 +6205,13 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
     const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
     if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) { return false; }
 
-    if (SeasonStrates.IsValidIndex(SlotIdx))
-    {
-        // A recipe is an explicit stack opt-in. Native fixed entries retain the authored/switch
-        // route while still reading their season parameter vector.
-        return SeasonStrates[SlotIdx].bUsesRecipe;
-    }
-
-#if WITH_EDITOR
-    if (FindComposerOverride(StrateLayout[SlotIdx].StrateIndex) != nullptr)
-    {
-        // Temporary composer candidates are measured through the stack path. Do not inherit an
-        // unrelated asset flag from the slot being replaced.
-        return true;
-    }
-#endif
-
+    // Every strate is generated by the operator stack: authored definitions, cooked-season entries
+    // (recipe or native) and editor composer candidates alike. The slot definition carries the
+    // archetype in every case.
     const UVoxelStrateDefinition* Def = StrateLayout[SlotIdx].Definition;
-    if (!Def->bUseOperatorStack) { return false; }
 
-    // LA LISTE DES ARCHÉTYPES PORTÉS — le seul endroit où elle est écrite. Un archétype non porté
-    // ignore le drapeau et retombe sur le `switch`, pour qu'on puisse cocher la case sur n'importe
-    // quelle strate sans rien casser en attendant son portage.
-    // THE PORTED-ARCHETYPE LIST, written down exactly once. An unported archetype ignores the flag
-    // and falls back to the switch, so the box can be ticked anywhere without breaking anything.
+    // LA LISTE DES ARCHÉTYPES — le seul endroit où elle est écrite.
+    // THE ARCHETYPE LIST, written down exactly once.
     switch (Def->GeneratorType)
     {
     case ECaveGeneratorType::Maze:            return true;
@@ -6327,16 +6234,13 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
 
     case ECaveGeneratorType::Underwater:
         // ⚠️ AUCUNE PILE À ELLE : `Underwater` EST `TunnelNetwork` plus un drapeau d'eau consommé
-        // côté rendu. `GetDensityAt` les met dans le même `case`, et `WaterLevelRelative` n'est lu
+        // côté rendu. `VF_BuildOpStackForChunk` les met dans le même `case`, et `WaterLevelRelative` n'est lu
         // que par `GetWaterLevel*` de ce manager — jamais par la densité (vérifié, pas supposé).
     case ECaveGeneratorType::TunnelNetwork:
         // Le plus gros : squelette SDF → douze modificateurs de détail → override d'op par salle,
         // 19 opérateurs, dont `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached`
         // au lieu de les transcrire — c'est là que vit la discipline d'invariance de fenêtre
         // d'ARCHITECTURE §8.4 ; en forker une copie la casserait.
-        //
-        // **8 SUR 8.** Le `switch` d'archétypes a un jumeau en pile d'opérateurs, opt-in par
-        // strate, chacun vérifié par un test d'équivalence bit à bit contre sa fonction d'origine.
         return true;
 
     default:                                  return false;

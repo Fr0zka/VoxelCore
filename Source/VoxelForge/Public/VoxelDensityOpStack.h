@@ -2,33 +2,21 @@
 // La PILE : un conteneur ordonné d'opérateurs, plus les fabriques d'opérateurs concrets.
 // The STACK: an ordered container of operators, plus the concrete-operator factories.
 //
-// ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN.
-// `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
-// UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
-// strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés :
+// ⚠️ CECI EST LE CHEMIN DE GÉNÉRATION DU JEU.
+// `UVoxelGenerator::GetDensityAt` construit la pile par chunk pour chaque strate :
 // **Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork,
-// Underwater (8 sur 8)**.
-// Toute autre strate passe encore par le `switch`, inchangé.
-// `ClassifyTile` est branché pour les archétypes de cave opt-in : il construit la même pile et
-// plie `ClassifyBox`; les gaps et SurfaceWorld gardent leurs preuves exactes dédiées.
+// Underwater (8 sur 8)**. `ClassifyTile` construit la même pile pour les archétypes de cave et plie
+// `ClassifyBox`; les gaps et SurfaceWorld gardent leurs preuves exactes dédiées.
 //
-// THIS FEEDS THE GAME, BUT ONLY BEHIND AN OPT-IN. GetDensityAt builds the stack per chunk and
-// evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate ticked
-// bUseOperatorStack AND its archetype is ported — all 8). ClassifyTile uses the same stack for cave
-// archetypes; gaps and SurfaceWorld retain their exact hand-written proofs.
-//
-// ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde.
-// ⚠️ EN REVANCHE, LES COMPARER EST LÉGITIME. `AUDIT §C10` (le résidu ~1 ULP) est clos par
-// `FPSemantics = Precise` : les cinq tests d'équivalence comparent bit à bit. Ce ne sont pas des
-// contrôles de FIDÉLITÉ (la barre `§2.6.1` n'exige aucune ressemblance avec l'ancien monde) mais
-// des oracles de CORRECTION DE PORTAGE — une faute de transcription reste un vrai bug, et l'ancienne fonction est
-// le moyen le moins cher de l'attraper.
+// THIS IS THE GAME'S GENERATION PATH. GetDensityAt builds the stack per chunk for every strate.
+// ClassifyTile uses the same stack for cave archetypes; gaps and SurfaceWorld retain their exact
+// hand-written proofs.
 //
 // POURQUOI CETTE FORME / WHY THIS SHAPE
 // La question à laquelle cette forme répond n'est pas « est-ce que ça marche ? » mais
 // **« est-ce que la séparation source / modifier tombe naturellement du code existant ? »**
-// (OPSTACK-PLAN §4). Chaque archétype porté est comparé bit à bit à l'original : la réponse est
-// MESURÉE plutôt qu'une opinion.
+// (OPSTACK-PLAN §4). Chaque archétype a été porté puis comparé bit à bit à sa fonction
+// d'origine avant qu'elle ne soit retirée : la réponse a été MESURÉE plutôt qu'une opinion.
 
 #pragma once
 

@@ -633,7 +633,6 @@ function New-CommandletArguments([string]$CommandletOut, [string]$Modes, [bool]$
     [void]$args.Add('-seed=0')
     [void]$args.Add('-archetype=TunnelNetwork')
     [void]$args.Add("-slot=$Slot")
-    [void]$args.Add('-opstack=1')
     [void]$args.Add(('-modes="{0}"' -f $Modes))
     [void]$args.Add('-blockearlyout=0')
     [void]$args.Add('-densitygridreuse=1')

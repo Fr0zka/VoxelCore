@@ -314,7 +314,6 @@ struct FExploreArguments
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
-    bool bUseOperatorStack = true;
     bool bWormsEnabledOverride = false;
     bool bWormsEnabled = true;
     bool bWormStrengthOverride = false;
@@ -431,9 +430,6 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         }
         ModesText.TrimQuotesInline();
     }
-    int32 UseOperatorStack = 1;
-    FParse::Value(*Params, TEXT("opstack="), UseOperatorStack);
-    OutArguments.bUseOperatorStack = UseOperatorStack != 0;
     int32 WormsEnabled = 1;
     if (FParse::Value(*Params, TEXT("wormsenabled="), WormsEnabled))
     {
@@ -1218,9 +1214,6 @@ struct FExploreWorld
                 Definition->GeneratorType = Index == Arguments.Slot
                     ? Arguments.Archetype
                     : ECaveGeneratorType::TunnelNetwork;
-                // Explicitly select the production switch so the same synthetic layout, seed and
-                // mesher invocation can be measured through both density branches.
-                Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
                 if (Arguments.bWormsEnabledOverride)
                 {
                     Definition->bEnableWorms = Arguments.bWormsEnabled;
@@ -1376,7 +1369,7 @@ struct FExploreWorld
         const FStrateGenerationParams& ReportParams = Target.Definition->GenerationParams;
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeExplore][OwnerAssets] strate=%s settings=%s slot=%d "
-                 "seed=%d height_chunks=%d archetype=%s opstack=%d "
+                 "seed=%d height_chunks=%d archetype=%s "
                  "floor_switch_ignored=1 floor_terracing=%d floor_step=%.9g max_ledge=%.9g "
                  "gentle_slope_degrees=%.9g gentle_gradient=%.9g route_cap=%.9g "
                  "wind_wave_cap=%d "
@@ -1385,7 +1378,7 @@ struct FExploreWorld
             bUseAuthoredStrate ? *Arguments.StrateReference : TEXT("synthetic"),
             bUseAuthoredSettings ? *Arguments.SettingsReference : TEXT("synthetic"),
             Arguments.Slot, Settings->Seed, Target.Definition->StrateHeightInChunks,
-            ArchetypeName(TargetArchetype), Target.Definition->bUseOperatorStack ? 1 : 0,
+            ArchetypeName(TargetArchetype),
             ReportParams.bTunnelFloorTerracingEnabled ? 1 : 0,
             ReportParams.TunnelFloorTerraceStepHeight,
             ReportParams.TunnelFloorMaxLedgeHeight,
@@ -4453,7 +4446,6 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
     if (Arguments.bWormsEnabledOverride)
     {
@@ -6135,7 +6127,6 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
     if (Arguments.bWormsEnabledOverride)
     {
@@ -6216,12 +6207,11 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
-             "-slot=%d -opstack=%d -modes=%s -blockearlyout=%d "
+             "-slot=%d -modes=%s -blockearlyout=%d "
              "-out=<ABSOLUTE_PLUGIN_SAVED_PATH>"),
         Arguments.Seed,
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
-        Arguments.bUseOperatorStack ? 1 : 0,
         *Arguments.CanonicalModes(),
         Arguments.bBlockEarlyOut ? 1 : 0));
     Writer->WriteObjectEnd();
@@ -7203,7 +7193,6 @@ bool WriteExploreOpBoundsReport(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("sample_step"), 1);
     Writer->WriteValue(TEXT("block_cells"), 8);
     Writer->WriteValue(TEXT("classifier_blocks_tested"), BlocksTested);
@@ -7311,10 +7300,9 @@ bool RunOpBounds(
     FExploreBudget& Budget,
     FString& OutError)
 {
-    if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork
-        || !Arguments.bUseOperatorStack)
+    if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork)
     {
-        OutError = TEXT("opbounds requires archetype=TunnelNetwork and opstack=1.");
+        OutError = TEXT("opbounds requires archetype=TunnelNetwork.");
         return false;
     }
 
@@ -8262,8 +8250,6 @@ bool BuildBatchCaseParams(
 
     FString Modes = TEXT("export");
     JsonString(Case, TEXT("modes"), Modes);
-    bool bOperatorStack = true;
-    JsonBool(Case, TEXT("operator_stack"), bOperatorStack);
     bool bProfileDensity = false;
     JsonBool(Case, TEXT("profile_density"), bProfileDensity);
     bool bProfileDensityFull = false;
@@ -8293,11 +8279,11 @@ bool BuildBatchCaseParams(
         Case, TEXT("tunnel_floor_terracing"), bTunnelFloorTerracing);
 
     OutParams = FString::Printf(
-        TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
+        TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s "
              "-exportsize=%d -exportstep=%d -densitygridreuse=%d "
              "-blockearlyout=%d -meshminbatch=%d "
              "-failurefocus=%d -out=\"%s\""),
-        Seed, *Archetype, Slot, *Modes, bOperatorStack ? 1 : 0,
+        Seed, *Archetype, Slot, *Modes,
         ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0,
         bBlockEarlyOut ? 1 : 0, MeshMinBatchSize,
         bFailureFocus ? 1 : 0, *CaseOutDirectory);

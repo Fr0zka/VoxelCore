@@ -348,7 +348,7 @@ bool FVoxelForgeDensityBlockEquivalenceTest::RunTest(const FString& Parameters)
     for (int32 SeedIndex = 0; SeedIndex < UE_ARRAY_COUNT(Seeds); ++SeedIndex)
     {
         VoxelForgeTest::FTestWorld World;
-        World.Build(Seeds[SeedIndex], /*gap chunks=*/2, /*operator stack=*/true);
+        World.Build(Seeds[SeedIndex], /*gap chunks=*/2);
         if (!World.IsValid())
         {
             AddError(World.WhyInvalid());
@@ -470,8 +470,8 @@ bool FVoxelForgeDensityBlockEquivalenceTest::RunTest(const FString& Parameters)
 
         // No-edit grids. In the two canonical network archetypes this enters the actual worker
         // block session, which partitions each mesher grid by resolved chunk before running the
-        // active operator list. The six legacy density routes still run their production scalar
-        // evaluator, as they do outside the block-safe network branch.
+        // active operator list. The six other archetypes run the scalar stack evaluator, as they
+        // do in production outside the block-safe network branch.
         for (int32 GridIndex = 0; GridIndex < GridSetCount; ++GridIndex)
         {
             BaseResults[GridIndex] = CompareGeneratorBlockWithScalar(

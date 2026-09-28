@@ -64,8 +64,7 @@ bool FVoxelForgeSealedSolidProofTest::RunTest(const FString& Parameters)
     // Forty voxels makes a complete 32-cell level-0 tile fit inside a bottom boundary seal.  The
     // production asset remains untouched; this is a transient proof-only fixture configuration.
     FTestWorld World;
-    World.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/false,
-                /*InStrateHeightInChunks*/8);
+    World.Build(/*Seed*/1337, /*GapChunks*/2, /*InStrateHeightInChunks*/8);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

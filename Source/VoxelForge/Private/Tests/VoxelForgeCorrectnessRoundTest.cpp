@@ -132,7 +132,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FVoxelForgeTileCacheContextDeterminismTest::RunTest(const FString& Parameters)
 {
     FTestWorld World;
-    World.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    World.Build(/*Seed*/1337, /*GapChunks*/2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -208,8 +208,8 @@ bool FVoxelForgeTileCacheContextDeterminismTest::RunTest(const FString& Paramete
     // level-0 tile at the same origin is compared with a fresh world's level-0 output.
     FTestWorld WarmWorld;
     FTestWorld FreshWorld;
-    WarmWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
-    FreshWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    WarmWorld.Build(/*Seed*/1337, /*GapChunks*/2);
+    FreshWorld.Build(/*Seed*/1337, /*GapChunks*/2);
     if (!WarmWorld.IsValid() || !FreshWorld.IsValid())
     {
         AddError(WarmWorld.IsValid() && FreshWorld.IsValid()

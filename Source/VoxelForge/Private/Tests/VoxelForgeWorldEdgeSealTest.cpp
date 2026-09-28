@@ -67,26 +67,20 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         FailureKinds += Kind;
     };
 
-    // The ordinary fixture deliberately uses the requested default, so existing op-stack and
-    // legacy tests exercise the setting without having to know about the new post.
-    FTestWorld Legacy;
-    Legacy.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/false);
-    FTestWorld StackWorld;
-    StackWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    // The ordinary fixture deliberately uses the requested default, so the other tests exercise
+    // the setting without having to know about the new post.
+    FTestWorld Bounded;
+    Bounded.Build(/*Seed*/1337, /*GapChunks*/2);
     FTestWorld Unbounded;
-    Unbounded.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/false);
+    Unbounded.Build(/*Seed*/1337, /*GapChunks*/2);
 
-    if (!Legacy.IsValid() || !StackWorld.IsValid() || !Unbounded.IsValid())
+    if (!Bounded.IsValid() || !Unbounded.IsValid())
     {
-        AddError(Legacy.IsValid() && StackWorld.IsValid() && Unbounded.IsValid()
-            ? TEXT("Unexpected edge-seal fixture state")
-            : (!Legacy.IsValid() ? Legacy.WhyInvalid()
-               : (!StackWorld.IsValid() ? StackWorld.WhyInvalid() : Unbounded.WhyInvalid())));
+        AddError(!Bounded.IsValid() ? Bounded.WhyInvalid() : Unbounded.WhyInvalid());
         return false;
     }
 
-    SetEdgeSettings(Legacy, TestWorldRadius);
-    SetEdgeSettings(StackWorld, TestWorldRadius);
+    SetEdgeSettings(Bounded, TestWorldRadius);
     SetEdgeSettings(Unbounded, 0.0f);
 
     //==========================================================================
@@ -103,12 +97,12 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
     for (int32 Slot = 0; Slot < 8; ++Slot)
     {
         int32 TopZ = 0, BottomZ = 0;
-        if (Legacy.GetSlotVoxelZRange(Slot, TopZ, BottomZ))
+        if (Bounded.GetSlotVoxelZRange(Slot, TopZ, BottomZ))
         {
             StrateZ.Add((float)((TopZ + BottomZ) / 2));
         }
     }
-    StrateZ.Add(Legacy.MidVoxelZ());
+    StrateZ.Add(Bounded.MidVoxelZ());
 
     int32 NumPositiveSamples = 0;
     for (const FVector& XY : FarXY)
@@ -117,8 +111,7 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         {
             const FVector P(XY.X, XY.Y, Z);
             ++NumPositiveSamples;
-            if (!IsSolidMC(*Legacy.Generator, P)) Fail(TEXT("positive-legacy"));
-            if (!IsSolidMC(*StackWorld.Generator, P)) Fail(TEXT("positive-opstack"));
+            if (!IsSolidMC(*Bounded.Generator, P)) Fail(TEXT("positive"));
         }
     }
 
@@ -138,7 +131,7 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         for (const float Z : StrateZ)
         {
             const FVector P(XY.X, XY.Y, Z);
-            const float BoundedD = Legacy.Generator->GetDensityAt(P.X, P.Y, P.Z);
+            const float BoundedD = Bounded.Generator->GetDensityAt(P.X, P.Y, P.Z);
             const float UnboundedD = Unbounded.Generator->GetDensityAt(P.X, P.Y, P.Z);
             ++NumInteriorComparisons;
             if (!BitEqual(BoundedD, UnboundedD)) Fail(TEXT("interior-not-no-op"));
@@ -193,7 +186,7 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
     // CLASSIFYBOX — force boxes in the ramp and beyond the radius, then brute-force every voxel.
     //==========================================================================
     int32 TopShaftZ = 0, BottomShaftZ = 0;
-    if (!StackWorld.GetSlotVoxelZRange(FTestWorld::SlotVerticalShafts, TopShaftZ, BottomShaftZ))
+    if (!Bounded.GetSlotVoxelZRange(FTestWorld::SlotVerticalShafts, TopShaftZ, BottomShaftZ))
     {
         Fail(TEXT("missing-shaft-slot"));
     }
@@ -218,17 +211,17 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         };
 
         const int32 MidChunkZ = FMath::FloorToInt((BoxZ0 + BoxZ1) * 0.5f / CHUNK_SIZE);
-        const FVerticalShaftParams ShaftParams = StackWorld.StrateManager->GetVerticalShaftParamsForChunk(
+        const FVerticalShaftParams ShaftParams = Bounded.StrateManager->GetVerticalShaftParamsForChunk(
             FIntVector(0, 0, MidChunkZ));
         FVoxelOpStack Stack;
         VoxelDensityOps::BuildVerticalShaftStack(
-            Stack, ShaftParams, StackWorld.Settings->Seed,
-            StackWorld.Generator->OriginSpineRadius, StackWorld.StrateManager.Get());
+            Stack, ShaftParams, Bounded.Settings->Seed,
+            Bounded.Generator->OriginSpineRadius, Bounded.StrateManager.Get());
 
         FVoxelOpContext Ctx;
         Ctx.ChunkCoord = FIntVector(0, 0, MidChunkZ);
-        Ctx.Seed = (uint32)StackWorld.Settings->Seed;
-        Ctx.LayoutVersion = StackWorld.StrateManager->GetLayoutVersion();
+        Ctx.Seed = (uint32)Bounded.Settings->Seed;
+        Ctx.LayoutVersion = Bounded.StrateManager->GetLayoutVersion();
         Ctx.StrateTopWorldZ = ShaftParams.StrateTopWorldZ;
         Ctx.StrateBottomWorldZ = ShaftParams.StrateBottomWorldZ;
         Ctx.WorldRadiusVoxels = TestWorldRadius;
@@ -255,14 +248,14 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
             for (int32 X = X0; X <= X1; ++X)
             {
                 ++NumVoxelsChecked;
-                if (!IsSolidMC(*StackWorld.Generator, FVector((float)X, (float)Y, (float)Z)))
+                if (!IsSolidMC(*Bounded.Generator, FVector((float)X, (float)Y, (float)Z)))
                     Fail(TEXT("classifybox-false-allsolid"));
             }
         }
     }
 
     // The T1.d path must be able to skip an edge tile without knowing which Z category it hits.
-    const EVoxelTileClass EdgeTile = StackWorld.Generator->ClassifyTile(
+    const EVoxelTileClass EdgeTile = Bounded.Generator->ClassifyTile(
         FIntVector(320, 0, BottomShaftZ + 8), 1, 8);
     int32 NumTilesProved = (EdgeTile == EVoxelTileClass::AllSolid) ? 1 : 0;
     if (EdgeTile != EVoxelTileClass::AllSolid) Fail(TEXT("classifytile-missed-edge"));
@@ -283,9 +276,7 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
     // coverage only: the synthetic helper case above is the hard assertion even if landing-site
     // adjustment moves every generated mouth out of this small test rim.
     FTestWorld GeneratedPassageWorld;
-    GeneratedPassageWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/false);
-    FTestWorld GeneratedPassageStackWorld;
-    GeneratedPassageStackWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    GeneratedPassageWorld.Build(/*Seed*/1337, /*GapChunks*/2);
     auto CheckGeneratedPassages = [&](FTestWorld& World, const TCHAR* FailureKind)
     {
         if (!World.IsValid())
@@ -310,7 +301,6 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         }
     };
     CheckGeneratedPassages(GeneratedPassageWorld, TEXT("generated-passage-breaches-rim"));
-    CheckGeneratedPassages(GeneratedPassageStackWorld, TEXT("generated-opstack-passage-breaches-rim"));
 
     // One sorted summary block; individual samples intentionally never log.
     AddInfo(FString::Printf(
@@ -319,7 +309,7 @@ bool FVoxelForgeWorldEdgeSealTest::RunTest(const FString& Parameters)
         TEXT("  classify_tile_proved=%d\n")
         TEXT("  interior_comparisons=%d\n")
         TEXT("  near_rim_passage_checks=%d\n")
-        TEXT("  positive_sample_points=%d (checked in both paths)\n")
+        TEXT("  positive_sample_points=%d\n")
         TEXT("  rim_directions=%d\n")
         TEXT("  rim_max_adjacent_solidness_jump=%.6f (threshold=%.6f)\n")
         TEXT("  voxels_checked=%lld\n")

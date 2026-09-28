@@ -6,9 +6,9 @@
 // ---------------
 // The interesting invariants (density purity across worker threads, ClassifyTile soundness)
 // only fire on the REAL path — UVoxelGenerator::GetDensityAt — because that is where the
-// thread_local per-chunk caches live (CP_*, GSurfColCache, the diff slots, the SDF cache).
-// Calling GetSurfaceDensity / GetMazeDensity directly bypasses every one of them and would
-// test almost nothing. GetDensityAt in turn needs a live UVoxelStrateManager, whose only
+// thread_local per-chunk caches live (CP_*, the prepared stacks, the diff slots, the SDF cache).
+// Evaluating a stack directly bypasses every one of them and would test almost nothing.
+// GetDensityAt in turn needs a live UVoxelStrateManager, whose only
 // entry point is Initialize(UVoxelSettings*, int32) reading TSoftObjectPtr pools.
 //
 // So the fixture builds a whole synthetic world in memory: transient strate definitions →
@@ -46,7 +46,7 @@ namespace VoxelForgeTest
      * generator + diff layer. No AActor, no UWorld, no PIE.
      *
      * The default layout stacks one strate of EVERY archetype (in ECaveGeneratorType order),
-     * so a single fixture exercises all eight density functions and their per-chunk caches,
+     * so a single fixture exercises all eight archetype stacks and their per-chunk caches,
      * plus the gap-bedrock path when InterStrateGapChunks > 0.
      */
     struct FTestWorld
@@ -73,8 +73,7 @@ namespace VoxelForgeTest
          * dangerous — and `VoxelForge.Determinism.LargeSeedSurvives` deliberately passes big ones
          * (up to 2e9) to prove it stays that way.
          */
-        void Build(int32 InSeed = 1337, int32 InGapChunks = 2, bool bUseOperatorStack = false,
-                   int32 InStrateHeightInChunks = 4)
+        void Build(int32 InSeed = 1337, int32 InGapChunks = 2, int32 InStrateHeightInChunks = 4)
         {
             Settings = TStrongObjectPtr<UVoxelSettings>(
                 NewObject<UVoxelSettings>(GetTransientPackage(), NAME_None, RF_Transient));
@@ -111,10 +110,6 @@ namespace VoxelForgeTest
                 // refinement and roll tests use the smaller synthetic volume as a bounded memory
                 // control; the owner-facing showcase opts into 8 chunks below.
                 Def->StrateHeightInChunks = FMath::Max(1, InStrateHeightInChunks);
-                // L'OPT-IN de la pile d'opérateurs. Faux par défaut : les treize tests existants
-                // doivent continuer à exercer le `switch`, qui reste le comportement de référence.
-                // Seul le test de solidité de ClassifyTie côté pile le passe à vrai.
-                Def->bUseOperatorStack = bUseOperatorStack;
                 // Hard transitions: param blending across a boundary would make "which archetype
                 // owns this chunk" ambiguous, and these tests want an unambiguous mapping.
                 Def->TransitionType = EVoxelStrateTransition::Hard;

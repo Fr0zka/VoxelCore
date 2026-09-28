@@ -294,7 +294,7 @@ public:
      *
      * Returns TunnelNetwork if the chunk is outside all strates or if the
      * strate definition is null. The generator uses this to pick which
-     * density function to call (GetDensityWithParams vs GetSlabDensity).
+     * operator stack to build for the chunk.
      *
      * @param ChunkCoord - The chunk position
      * @return The ECaveGeneratorType for the strate containing this chunk
@@ -302,12 +302,9 @@ public:
     ECaveGeneratorType GetGeneratorTypeForChunk(const FIntVector& ChunkCoord) const;
 
     /**
-     * True when this chunk's strate opts into the density OPERATOR STACK instead of the hardcoded
-     * archetype switch (`UVoxelStrateDefinition::bUseOperatorStack`).
-     *
-     * Returns false for archetypes that have no port yet, so the flag can be set on any strate
-     * without changing its output until that archetype lands. Only `Maze` is ported today — this
-     * predicate is where that list grows, and it is deliberately the ONLY place it is written down.
+     * True when this chunk lies in a strate slot whose archetype has an operator stack (all eight
+     * do). False outside the layout or for a slot without a definition. This predicate is the ONLY
+     * place the archetype list is written down.
      */
     bool UsesOperatorStackForChunk(const FIntVector& ChunkCoord) const;
 

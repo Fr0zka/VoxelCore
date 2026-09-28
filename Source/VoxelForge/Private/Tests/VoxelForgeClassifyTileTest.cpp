@@ -39,12 +39,8 @@
 #include "Misc/AutomationTest.h"
 
 #include "VoxelForgeTestFixture.h"
-// Inclus ici DÉLIBÉRÉMENT : VoxelDensityOp.h n'est encore inclus par aucun .cpp, donc le
-// compilateur ne le verrait jamais. Le fold qu'il définit prétend reproduire ClassifyTile — ce
-// fichier est l'endroit naturel pour que cette prétention soit à la fois COMPILÉE et TESTÉE.
-// Deliberately included here: VoxelDensityOp.h is not yet included by any .cpp, so the compiler
-// would never see it. Its fold claims to reproduce ClassifyTile, so this is the natural place for
-// that claim to be both compiled and tested.
+// Le fold défini par VoxelDensityOp.h prétend reproduire ClassifyTile : ce fichier le teste.
+// The fold defined in VoxelDensityOp.h claims to reproduce ClassifyTile; this file tests it.
 #include "VoxelDensityOp.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -153,7 +149,7 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
 
     AddInfo(FString::Printf(
         TEXT("ClassifyTile verdicts over %d scanned tiles: Mixed %d, AllSolid %d, AllAir %d ")
-        TEXT("(brute-forcing %d of them). Cave archetypes now use the opt-in operator-stack ")
+        TEXT("(brute-forcing %d of them). Cave archetypes use the operator-stack ")
         TEXT("ClassifyBox fold; the global XY edge proof also skips proven outer-shell tiles. A low ")
         TEXT("non-Mixed count is expected: every uncertain case remains Mixed for safety."),
         NumTilesScanned, NumMixed, NumAllSolid, NumAllAir, ToVerify.Num()));
@@ -237,25 +233,24 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
 }
 
 //=============================================================================
-// LE CHEMIN PILE D'OPÉRATEURS DE ClassifyTile — MÊME FORCE BRUTE, MONDE OPT-IN
+// LE CHEMIN PILE D'OPÉRATEURS DE ClassifyTile — MÊME FORCE BRUTE, STRATES DE CAVE
 //=============================================================================
-// `ClassifyTile` rendait `Mixed` sans appel pour tout archétype de CAVE. Il consulte désormais
-// `FVoxelOpStack::ClassifyBox` quand la strate a coché `bUseOperatorStack` — donc **un tout nouveau
-// chemin peut faire sauter le maillage d'une tuile**, et son erreur est un TROU : pas de triangles,
-// pas de collision, invisible jusqu'à ce qu'un joueur tombe au travers.
+// Pour un slot de CAVE, `ClassifyTile` consulte `FVoxelOpStack::ClassifyBox` — donc **la pile peut
+// faire sauter le maillage d'une tuile**, et son erreur est un TROU : pas de triangles, pas de
+// collision, invisible jusqu'à ce qu'un joueur tombe au travers.
 //
-// Ce test est le même oracle par force brute que `ClassifyTileSoundness`, sur un monde dont TOUTES
-// les strates ont coché la case. Il ne vérifie pas le pliage (c'est `BoxVerdictFold`) ni les
-// opérateurs (ce sont les huit tests d'équivalence) : il vérifie le **câblage** — que la pile
-// interrogée par le classifieur est bien celle qui produit la densité, params, drapeau et
-// disturbances compris.
+// Ce test est le même oracle par force brute que `ClassifyTileSoundness`, avec un tirage uniforme
+// sur tout le layout. Il ne vérifie pas le pliage (c'est `BoxVerdictFold`) ni les opérateurs : il
+// vérifie le **câblage** — que la pile interrogée par le classifieur est bien celle qui produit la
+// densité, params et disturbances compris.
 //
 // ⚠️ LE COMPTEUR À LIRE EN PREMIER est le nombre de tuiles réellement brute-forcées. Un run vert
 // avec zéro verdict non-Mixed ne prouverait RIEN — exactement le piège que ce fichier documente
 // depuis sa première version, et la raison pour laquelle l'absence de verdict est une ERREUR ici.
 //
-// Same brute-force oracle as ClassifyTileSoundness, on a world where every strate has opted in.
-// It checks the WIRING, not the fold and not the operators.
+// Same brute-force oracle as ClassifyTileSoundness, drawn uniformly over the whole layout so cave
+// slots (which classify through their stack) dominate. It checks the WIRING, not the fold and not
+// the operators.
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FVoxelForgeOpStackClassifyTileTest,
@@ -266,11 +261,10 @@ bool FVoxelForgeOpStackClassifyTileTest::RunTest(const FString& Parameters)
 {
     using namespace VoxelForgeTest;
 
-    // ⚠️ `bUseOperatorStack = true` sur toutes les strates : c'est LE point du test. La fixture
-    // donne à ce monde une `LayoutVersion` unique dans le processus, sans quoi les caches par chunk
-    // de `GetDensityAt` — dont `CP_UseOpStack` — pourraient encore porter ceux d'un autre test.
+    // La fixture donne à ce monde une `LayoutVersion` unique dans le processus, sans quoi les caches
+    // par chunk de `GetDensityAt` — dont `CP_UseOpStack` — pourraient encore porter ceux d'un autre test.
     FTestWorld World;
-    World.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
+    World.Build(/*Seed*/1337, /*GapChunks*/2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -287,8 +281,8 @@ bool FVoxelForgeOpStackClassifyTileTest::RunTest(const FString& Parameters)
     const int32 BottomVoxelZ = World.BottomChunkZ * CHUNK_SIZE;
 
     // Tirage uniforme sur tout le layout, PAS biaisé vers SurfaceWorld comme l'autre test : ici ce
-    // sont précisément les strates de cave qui intéressent, puisque ce sont elles qui passent par le
-    // nouveau chemin. SurfaceWorld continue d'être prouvé par le code écrit à la main.
+    // sont précisément les strates de cave qui intéressent, puisque ce sont elles que ClassifyTile
+    // juge par leur pile. SurfaceWorld est prouvé par le test colonne écrit à la main.
     for (int32 t = 0; t < NumTilesScanned; ++t)
     {
         FTileSpec Spec;
@@ -316,20 +310,17 @@ bool FVoxelForgeOpStackClassifyTileTest::RunTest(const FString& Parameters)
 
     AddInfo(FString::Printf(
         TEXT("ClassifyTile ON THE OPERATOR-STACK PATH, %d scanned tiles: Mixed %d, AllSolid %d, ")
-        TEXT("AllAir %d (brute-forcing %d). Compare with VoxelForge.Determinism.ClassifyTileSoundness, ")
-        TEXT("which runs the SAME scan on a world that has NOT opted in: every verdict beyond what ")
-        TEXT("that test reports is a tile the mesher now skips and did not before. That difference ")
-        TEXT("IS the T1.d prize OPSTACK-PLAN has been aiming at -- and every one of those tiles is a ")
-        TEXT("hole if the wiring is wrong, which is what the brute force below is for."),
+        TEXT("AllAir %d (brute-forcing %d). Every cave-slot verdict is a tile the mesher skips on ")
+        TEXT("the strength of the stack's ClassifyBox fold -- and a hole if the wiring is wrong, ")
+        TEXT("which is what the brute force below is for."),
         NumTilesScanned, NumMixed, NumAllSolid, NumAllAir, ToVerify.Num()));
 
     if (ToVerify.Num() == 0)
     {
         AddError(TEXT("VACUOUS: not one tile got a non-Mixed verdict on the operator-stack path, so ")
-                 TEXT("this test verified NOTHING about the new wiring. Either no strate actually ")
-                 TEXT("opted in (check FTestWorld::Build's bUseOperatorStack), or every guard in the ")
-                 TEXT("cave branch of ClassifyTile bailed to Mixed -- the params-identical check and ")
-                 TEXT("the 27-chunk-coord cap are the likeliest. Do NOT read a green run as proof."));
+                 TEXT("this test verified NOTHING about the wiring. Every guard in the cave branch ")
+                 TEXT("of ClassifyTile bailed to Mixed -- the params-identical check and the ")
+                 TEXT("27-chunk-coord cap are the likeliest. Do NOT read a green run as proof."));
         return false;
     }
 
