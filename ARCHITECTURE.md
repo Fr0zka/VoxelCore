@@ -36,7 +36,7 @@ radius, **0.300** against the Maze corridor radius, **0.469/0.625** against shaf
 **0.234** against the minimum island radius (**0.484** including its 6-voxel blend), and
 **0.625/0.938** against slab column radius for floor/ceiling roughness. SurfaceWorld is a
 heightfield, so its **0.047** ratio is against its 80-voxel relief scale, not a fictitious radial
-feature. FlatPlain and CrystalChamber intentionally share `GetSlabDensity` and the same slab
+feature. FlatPlain and CrystalChamber intentionally share `BuildSlabStack` and the same slab
 parameter block; they cannot acquire separate scale geometry without a generator change.
 
 This scale contract is informed by [Epic's Unreal level-blockout guidance](https://dev.epicgames.com/documentation/en-us/unreal-engine/designer-01-project-setup-and-level-blockout-in-unreal-engine), which recommends a player-sized reference and gives 2-3 m hall / 3-4 m height starting guidance. The
@@ -62,22 +62,23 @@ are not landing or box-verdict violations.
 
 ### 8.1 Archetypes (`ECaveGeneratorType`, VoxelStrateTypes.h)
 Each archetype has its own param `USTRUCT` (on `UVoxelStrateDefinition`, EditCondition-gated
-by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispatched by the
-`switch` in `GetDensityAt`.
+by `GeneratorType`) and its own **operator stack** builder in `VoxelDensityOpStack.cpp`, selected per
+chunk by `VF_BuildOpStackForChunk` in `GetDensityAt` (the same factory `ClassifyTile` uses). The stack
+is the only density path; a degenerate (zero-height) strate has none and is open air.
 
-| Archetype | Params struct | Density fn | Idea |
+| Archetype | Params struct | Stack builder | Idea |
 |-----------|---------------|------------|------|
-| TunnelNetwork | `FStrateGenerationParams` | `GetDensityWithParams` | rooms+tunnels (original) |
-| FlatPlain / CrystalChamber | `FSlabGenerationParams` | `GetSlabDensity` | floor/ceiling void (original) |
-| Maze | `FMazeGenerationParams` | `GetMazeDensity` | origin-directed spanning-tree corridors on a 3D lattice, with capped loop edges and a thread-local per-cell capsule cache |
-| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, **F20 heightfield terrain ops** (`Surface|Ops` — all default off ⇒ byte-identical): **Cliff** (slope-gated steepening — where the analytic structural slope > `CliffSlopeThreshold`, push the height away from the local mean by `CliffSharpness` ⇒ gentle slopes become sheer walls/canyon faces that hug real steep ground, gentle areas untouched; 4 structural resamples only when enabled), **Terrace** (relief-gated plateau quantize + `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed) — pure per-column height remaps in the single oracle `ComputeSurfaceTerrainZ` (`SampleSurfaceStructuralZ` = pre-op raw height, re-sampled at an XY offset for Cliff's slope), biome-selected + border-blended for free via each biome's `SurfaceParams` + the height output-lerp; plus **phase-2 Overhang** (the first VOLUMETRIC op — real jutting shelves like a cliff lip): in `SurfaceDensityFromColumn`, for AIR voxels in the window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height and unioned in. Low in the window the shift is ~0 (borrows nearby low rock ⇒ stays air over the void); high up it reaches the far cliff (solid) ⇒ a shelf attached to the cliff, tapering out over the void with air underneath. Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill dir `(DirX,DirY)` are resolved once in `ComputeSurfaceColumn` — the gradient sampled at the REACH scale (`OverhangReach`) so a point out over the void can "see" the cliff to know which way is uphill — and cached on `FSurfaceColumn`. It's genuine 3D (per-voxel structural re-eval), so it's gated hard to steep overhang columns; the union only ADDS rock (never removes), capped at `TerrainZ+OverhangHeight`, so `ClassifyTile` forces Mixed only in `(TerrainZ, TerrainZ+OverhangMargin]` (upward-only; margin = max `OverhangHeight`) — a shelf never holes a trivially-skipped tile, and only the thin cliff-edge band of air tiles is woken (NOT far-field like phase-3 spikes/holes). Overhang undersides classify as ground rock by the F17 rule (down-facing but below `TerrainZ`). Known v1 limit: applies at all LODs (Step-agnostic) — may alias far; gate to fine tiles later. Beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap vs ground is a PER-TRIANGLE surface class (F17), not a per-tile verdict**: the mesher classifies each unique vertex on the **worker** — only down-facing verts (`N.Z<-0.1`) pay a memoized `GetSurfaceHeightAt` column query; nearer `CeilSurf` ⇒ sky-cap, nearer `TerrainZ` ⇒ terrain overhang stays ground (a future SurfaceWorld cave roof — down-facing but below `TerrainZ` — also lands ground by the same rule; non-surface strates always ground). Triangles take the majority class of their 3 verts and are packed as **two contiguous index runs** (ground then cap, `FVoxelMeshData::NumCeilingTriangles`; skirts inherit their source triangle's run) → RMC **polygroups 0/1** → one **section per non-empty group** (`ApplyMeshToTile`, material slot = group index): slot 0 = strate `OverrideMaterial`/default (min-corner chunk), slot 1 = `CeilingMaterial` resolved at the tile's **TOP chunk** (mid as gap fallback, then min; fallback: ground material) — a coarse tile is 2^level chunks tall, so its min corner can sit in a lower strate/gap while the cap belongs to the strate above (this was the "far cap = ground material" residue), so the shadowless overhead rock is tinted separately instead of reading flat/bright. Shadow is **per section** via `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired): ground casts at level≤1, the cap section never casts, so the rock ceiling never shadows the terrain below it. History: v1 was a game-thread centre height-oracle (misclassified coarse far tiles → terrain material on the cap underside); v2 a whole-tile worker normal VOTE — which painted **mixed coarse tiles** (one far tile spanning terrain AND cap) entirely with the winner's material, and put sky material under terrain overhangs. The per-triangle class fixes both and is the identity channel caves/F8 will reuse. |
-| VerticalShafts | `FVerticalShaftParams` | `GetVerticalShaftDensity` | full-height shafts + horizontal connectors + partial ledges |
-| FloatingIslands | `FFloatingIslandParams` | `GetFloatingIslandDensity` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
-| Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
+| TunnelNetwork | `FStrateGenerationParams` | `BuildTunnelNetworkStack` (fused evaluator: `GetDensityWithParams`) | rooms+tunnels (original) |
+| FlatPlain / CrystalChamber | `FSlabGenerationParams` | `BuildSlabStack` | floor/ceiling void (original) |
+| Maze | `FMazeGenerationParams` | `BuildMazeStack` | origin-directed spanning-tree corridors on a 3D lattice, with capped loop edges and a thread-local per-cell capsule cache |
+| SurfaceWorld | `FSurfaceGenerationParams` | `BuildSurfaceStack` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, **F20 heightfield terrain ops** (`Surface|Ops` — all default off ⇒ byte-identical): **Cliff** (slope-gated steepening — where the analytic structural slope > `CliffSlopeThreshold`, push the height away from the local mean by `CliffSharpness` ⇒ gentle slopes become sheer walls/canyon faces that hug real steep ground, gentle areas untouched; 4 structural resamples only when enabled), **Terrace** (relief-gated plateau quantize + `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed) — pure per-column height remaps in the single oracle `ComputeSurfaceTerrainZ` (`SampleSurfaceStructuralZ` = pre-op raw height, re-sampled at an XY offset for Cliff's slope), biome-selected + border-blended for free via each biome's `SurfaceParams` + the height output-lerp; plus **phase-2 Overhang** (the first VOLUMETRIC op — real jutting shelves like a cliff lip): in `FOverhangShelfMod`, for AIR voxels in the window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height and unioned in. Low in the window the shift is ~0 (borrows nearby low rock ⇒ stays air over the void); high up it reaches the far cliff (solid) ⇒ a shelf attached to the cliff, tapering out over the void with air underneath. Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill dir `(DirX,DirY)` are resolved once in `ComputeSurfaceColumn` — the gradient sampled at the REACH scale (`OverhangReach`) so a point out over the void can "see" the cliff to know which way is uphill — and cached on `FSurfaceColumn`. It's genuine 3D (per-voxel structural re-eval), so it's gated hard to steep overhang columns; the union only ADDS rock (never removes), capped at `TerrainZ+OverhangHeight`, so `ClassifyTile` forces Mixed only in `(TerrainZ, TerrainZ+OverhangMargin]` (upward-only; margin = max `OverhangHeight`) — a shelf never holes a trivially-skipped tile, and only the thin cliff-edge band of air tiles is woken (NOT far-field like phase-3 spikes/holes). Overhang undersides classify as ground rock by the F17 rule (down-facing but below `TerrainZ`). Known v1 limit: applies at all LODs (Step-agnostic) — may alias far; gate to fine tiles later. Beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap vs ground is a PER-TRIANGLE surface class (F17), not a per-tile verdict**: the mesher classifies each unique vertex on the **worker** — only down-facing verts (`N.Z<-0.1`) pay a memoized `GetSurfaceHeightAt` column query; nearer `CeilSurf` ⇒ sky-cap, nearer `TerrainZ` ⇒ terrain overhang stays ground (a future SurfaceWorld cave roof — down-facing but below `TerrainZ` — also lands ground by the same rule; non-surface strates always ground). Triangles take the majority class of their 3 verts and are packed as **two contiguous index runs** (ground then cap, `FVoxelMeshData::NumCeilingTriangles`; skirts inherit their source triangle's run) → RMC **polygroups 0/1** → one **section per non-empty group** (`ApplyMeshToTile`, material slot = group index): slot 0 = strate `OverrideMaterial`/default (min-corner chunk), slot 1 = `CeilingMaterial` resolved at the tile's **TOP chunk** (mid as gap fallback, then min; fallback: ground material) — a coarse tile is 2^level chunks tall, so its min corner can sit in a lower strate/gap while the cap belongs to the strate above (this was the "far cap = ground material" residue), so the shadowless overhead rock is tinted separately instead of reading flat/bright. Shadow is **per section** via `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired): ground casts at level≤1, the cap section never casts, so the rock ceiling never shadows the terrain below it. History: v1 was a game-thread centre height-oracle (misclassified coarse far tiles → terrain material on the cap underside); v2 a whole-tile worker normal VOTE — which painted **mixed coarse tiles** (one far tile spanning terrain AND cap) entirely with the winner's material, and put sky material under terrain overhangs. The per-triangle class fixes both and is the identity channel caves/F8 will reuse. |
+| VerticalShafts | `FVerticalShaftParams` | `BuildVerticalShaftStack` | full-height shafts + horizontal connectors + partial ledges |
+| FloatingIslands | `FFloatingIslandParams` | `BuildFloatingIslandStack` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
+| Underwater | `FStrateGenerationParams` + water | (reuses `BuildTunnelNetworkStack`) | tunnel rock + high water table |
 
-All density fns share the convention: internal **positive=solid**, apply origin spine →
-vertical boundary seal → inter-strate passage tube + landing/floor → XY edge seal, then `return -Density` (MC:
-negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
+All stacks share the convention: internal **positive=solid**, and `AppendStructuralPost` ends every
+stack with origin spine → vertical boundary seal → inter-strate passage tube + landing/floor → XY
+edge seal; `EvalMC` negates once (MC: negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
 the global rim cannot be reopened by a post-process; the diff layer remains the explicit player
 override.
 StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/FloatingIslandParamsForChunk`
@@ -127,12 +128,9 @@ threshold** before the law gate. No corridor or threshold tuning was added. The 
 gate is therefore retained as a design blocker; see `COMPOSER-NOTES.md §3.2b` and the validation log
 in §10.
 
-⚠️ **The `switch` above is no longer the only density path.** All 8 archetypes also exist as
-**operator stacks**, selected per strate by
-`bUseOperatorStack` and evaluated instead of the `switch`; each is bit-identical to the function in
-its row. The design lives in `Docs/archive/OPSTACK-PLAN.md` / `Docs/archive/OPSTACK-DECOMPOSITION.md`, the symbol index in
-`CODEMAP §3.2d` — not repeated here. What matters for *this* document: the archetype table describes
-what the world IS, and both paths compute it.
+The operator-stack design lives in `Docs/archive/OPSTACK-PLAN.md` /
+`Docs/archive/OPSTACK-DECOMPOSITION.md`, the symbol index in `CODEMAP §3.2d` — not repeated here.
+What matters for *this* document: the archetype table describes what the world IS.
 
 ### 8.2 (0,0) spine & hybrid connections
 - `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) builds a finite, rounded landing room with
@@ -230,8 +228,8 @@ they are never needed for the connectivity proof.
 
 The evaluation window is exactly the lower nodes in `{-1,0}³`, an 8-node / 2×2×2 local halo. The
 edge predicate checks the adjacent `+1` endpoint's parent locally, so it does not need a wider
-collect region and cannot disagree at a chunk boundary. Both `GetMazeDensity` and
-`MakeLatticeCorridorSource` rebuild those decisions in their thread-local per-cell cache; the
+collect region and cannot disagree at a chunk boundary. `MakeLatticeCorridorSource` rebuilds those
+decisions in its thread-local per-cell cache; the
 voxel loop evaluates only cached capsule SDFs. This is deliberately independent of
 `WorldRadiusVoxels` (which remains `0`) and the still-gated lateral-region system.
 
@@ -557,8 +555,8 @@ The landing is part of the structural post, in the fixed order
 after the passage carve and after MC-space disturbances as a support backstop, still before the
 final XY edge seal. Room/floor Z is clamped inside the vertical seal; the XY edge seal is last and
 wins over every landing or tube near the rim. Thus no landing can breach a strate boundary or the
-world edge. The op-stack `FPassageCarveOp` calls the same manager operation as the legacy path,
-including the floor, and `ClassifyTile` kills both uniform hypotheses around the bidirectional
+world edge. The op-stack `FPassageCarveOp` calls the manager's `ApplyPassageModifier`, including
+the floor, and `ClassifyTile` kills both uniform hypotheses around the bidirectional
 landing floor (`Both` in the stack), so an air proof cannot delete support.
 
 The query remains pure — it does not construct an operator stack, touch a cache, or call back into
@@ -624,8 +622,7 @@ driven by `EditorBrush*` props.
   inner 3×3 shafts and their capsules for the per-voxel loop, while spatial culling selects cached
   connectors. The complete ±2 parent and ±3 fallback windows plus connector reach are contained
   by that halo, so no parent decision depends on the evaluation cell. No cell or pair hash, widened
-  neighbourhood scan, or tree construction may move into the per-voxel loop; the operator-stack
-  source follows the same cache contract.
+  neighbourhood scan, or tree construction may move into the per-voxel loop (`FShaftFieldSource`).
 - **Maze field cache**: parent/loop decisions are rebuilt only when the thread-local cell, seed, or
   loop parameters change. The rebuild evaluates the 24 canonical lower-node/axis edges in the
   local `{-1,0}³` window and emits at most 24 capsules; the per-voxel loop performs no hash,
@@ -687,13 +684,13 @@ driven by `EditorBrush*` props.
   position → seamless across chunk borders (both sides use identical pure samples). NO per-vertex
   `GetDensityAt` (was ~6/vertex, often as costly as the whole grid). `ComputeGradientNormal` is now
   unused. Only NORMALS changed vs the old path; geometry is identical.
-- **Surface column cache (T1.a)** (`FSurfaceColumnCache` = LRU of `FSurfaceColumnBox`, `GetDensityAt`
-  SurfaceWorld branch): the heightfield + sky-cap + biome blend are a PURE function of (XY, seed,
+- **Surface column cache (T1.a)** (density path: the surface stack's `FSurfaceColumnSource` memo;
+  `ClassifyTile`: `FSurfaceColumnCache` = LRU of `FSurfaceColumnBox`): the heightfield + sky-cap + biome blend are a PURE function of (XY, seed,
   strate) — **ZERO Z dependence** (climate/Voronoi are pure-XY; surface params are per-strate constant
   under Hard transitions) — yet sampled ~33× per column (once per Z grid-point). Cached per integer XY
-  (box-valid, like the SDF cache) and reused down the column. **Keyed by (XY box, StrateKey, Seed), NOT
-  ChunkZ** (`StrateKey = round(StrateBottomWorldZ)`, taken from the params so it can't disagree with
-  them) and held as a small **LRU of 6 boxes** so the WHOLE vertical view-distance stack — and XY
+  (box-valid, like the SDF cache) and reused down the column. **Keyed by XY box + strate identity + seed
+  (plus layout version / params fingerprint), NOT ChunkZ** (the strate identity is derived from
+  `StrateBottomWorldZ`, taken from the params so it can't disagree with them) and held as a small **LRU of 6 boxes** so the WHOLE vertical view-distance stack — and XY
   neighbours the scheduler interleaves — share one another's heavy column noise instead of each
   recomputing it ~once per vertical chunk (this was the dominant `GenerateMesh` cost: the same 2D
   heightfield recomputed per altitude). It also makes pure-air / pure-solid chunks cheap (they hit the
@@ -832,9 +829,11 @@ driven by `EditorBrush*` props.
   wasted) and gen throughput had become the felt gameplay limit ("standing waiting for generation").
   **Why v1 failed & how v2 avoids it:** v1 used a GLOBAL analytic ceiling bound — not conservative when
   the cap hangs low (`CeilingRoughness`/`RidgeStrength`) → holes in the roof. v2 makes NO amplitude
-  guesses: it evaluates `ComputeSurfaceColumn` (the SAME function as the density path, via the SHARED
-  `GSurfColCache`) **on the exact lattice the mesher would sample** (margin ring included) — same
-  functions + same inputs ⇒ the same floats ⇒ the verdict is exact at the lattice, not an estimate.
+  guesses: it evaluates `ComputeSurfaceColumn` (cached per thread in `GSurfColCache`) — the column
+  the surface stack's height operators reproduce (ground height pinned bit for bit by
+  `VoxelForge.OpStack.SurfaceHeightEquivalence`) — **on the exact lattice the mesher would sample**
+  (margin ring included) — same inputs ⇒ the same floats ⇒ the verdict is exact at the lattice, not
+  an estimate.
   Per-z rules: gap chunk = solid; surface seal band (ApplyBoundarySeal inequalities, `BaseDensity>0`)
   = solid; surface interior z: air ⇔ `TerrainZ ≤ z ≤ CeilSurf` (MC `D ≥ 0`); ANY other archetype /
   out-of-layout chunkZ ⇒ `Mixed` (cave interiors are not provable in v1 of this classifier — a future
@@ -848,7 +847,7 @@ driven by `EditorBrush*` props.
   A false `Mixed` only costs CPU; the code must NEVER emit a false AllSolid/AllAir (that's a hole).
   Capture tiles (`bWantCapture`, density-volume shadow window) always generate — the volume wants the
   grid even for uniform cells. A sparse ~5×5 column pre-pass exits Mixed fast on surface-crossing
-  tiles; a Mixed verdict leaves its columns warm in `GSurfColCache` for the GenerateMesh that follows.
+  tiles; the columns stay warm in `GSurfColCache` for the full pass and for neighbouring tiles.
 - **Worker-built StreamSet (T1.f)** (`BuildTileStreamSet`, `LoadTile` task → `FChunkResult::Streams`):
   the RMC vertex/index buffers (`FRealtimeMeshStreamSet`) are built ON THE GEN WORKER, not on the game
   thread. The per-vertex builder loop was the dominant game-thread streaming cost (measured: game
@@ -969,9 +968,9 @@ change *anything*, e.g. frequencies, which scalar multipliers couldn't.)
 - **Consumption — SURFACE (output-blend).** Per chunk, `CP_SurfaceBiomeParams[]` holds each biome's
   resolved surface params (its override when `bOverrideTerrain` + GeneratorType matches, else the
   strate's) with **structural fields forced from the strate** (Z bounds, seal, base density, water
-  level). Per voxel: `ResolveBiomeSampleAt` → dominant `PD` (+ neighbour `PN`); `GetSurfaceDensity`
-  computes `ComputeSurfaceTerrainZ` for `PD` and, in the border band, for `PN`, and **lerps the
-  resulting HEIGHTS**. Blending heights (not params) is seamless across *any* difference (frequencies
+  level). Per voxel: `ResolveBiomeSampleAt` → dominant `PD` (+ neighbour `PN`); the surface stack's
+  biome-blend height source (and `ComputeSurfaceColumn`) computes the terrain height for `PD` and, in
+  the border band, for `PN`, and **lerps the resulting HEIGHTS**. Blending heights (not params) is seamless across *any* difference (frequencies
   included) — what per-param blend never could. `PD==PN`, weight 0 ⇒ bit-identical, no biomes.
 - **Consumption — CAVES: structural overrides are NOT applied (determinism).** Rooms/tunnels are
   decided over a wide COLLECT region spanning chunks (§8.4); making room params vary by region would

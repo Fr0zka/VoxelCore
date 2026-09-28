@@ -32,7 +32,8 @@ So: normals can cost as much as the entire density grid; a SurfaceWorld chunk do
 
 ### Tier 1 — high win / low risk / small-medium effort (do these first)
 
-> **STATUS 2026-07-05: Tier 1 COMPLETE.** T1.a ✅ (surface-column cache, now file-scope `GSurfColCache`);
+> **STATUS 2026-07-05: Tier 1 COMPLETE.** T1.a ✅ (surface-column cache; since cleanup/2026-09 the density
+> path's copy is the surface stack's `FSurfaceColumnSource` memo and `GSurfColCache` serves `ClassifyTile` only);
 > T1.b ✅ (grid-based normals inline in `GenerateMesh`);
 > T1.c ✅ (`bShouldCreateCollision` = level 0 only, VoxelWorld.cpp ApplyMeshToTile); T1.d ✅ (v2
 > `ClassifyTile`, trace-verified −44 % worker CPU); T1.e ✅ (`MaxMeshAppliesPerFrame`, default 4);
@@ -160,7 +161,7 @@ Mobs need two things the world didn't give them: (1) to *exist* away from the lo
   mandatory. AI is server-authoritative (§9.6). ★ Build when NPCs actually land.
 
 **F20 — Biome-selected surface terrain ops (terrace / cliff / layer-lines / overhang / spike / hole). SPEC 2026-07-07.**
-Terrain ops are cave-only today (per-room in `GetDensityWithParams`; `GetSurfaceDensity` applies NONE — that's
+Terrain ops were cave-only at the time (per-room in `GetDensityWithParams`; the SurfaceWorld density applied NONE — that's
 the "ops don't work on the surface" report). This brings them to the SURFACE, as a **biome** property,
 **conditioned on local terrain** so they read geological instead of random. (Slots in ahead of the later
 cave-system redo, which will add biome support cave-side reusing this same op→biome model.)

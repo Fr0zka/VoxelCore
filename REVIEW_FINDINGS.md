@@ -119,17 +119,19 @@ and changes that would alter generated terrain.
   `sheet_tile` dump field stays for the parity compare.
 - [x] `UVoxelSettings::CeilingViewMultiplier` / `CeilingBandChunks` / `DensityVolumeMaxTasks` — removed
   (never read).
-- [ ] **Operator stack as the only density path.** Strates without `bUseOperatorStack` (and cooked-season
-  entries without a recipe) still run the per-archetype `switch` in `UVoxelGenerator::GetDensityAt`
-  (`GetSlabDensity`, `GetMazeDensity`, `GetVerticalShaftDensity`, `GetFloatingIslandDensity`, the
-  SurfaceWorld column path, native `GetDensityWithParams`). The tests call those helpers "legacy
-  diagnostic only… not the owner path", and several of them no longer match the stack (e.g.
-  SurfaceWorld, VerticalShafts, TunnelNetwork telemetry). Retiring the switch means: drop the gate in
-  `UVoxelStrateManager::UsesOperatorStackForChunk`, remove the switch (fallback: native stack, then
-  air for a degenerate strate), delete those helpers and the legacy/stack comparisons in ~15 tests, and
-  remove `bUseOperatorStack` (+ commandlet `-opstack`). **It changes terrain for any strate not already
-  opted in**, so it was not done in the cleanup. Related live "legacy" paths that would go with it:
-  the no-strate-manager fallback world (`GetDensityWithParams` with legacy posts).
+- [x] **Operator stack as the only density path** (cleanup/2026-09, owner-approved). Every strate —
+  authored, cooked-season (recipe or native) and editor composer candidate — now generates through its
+  operator stack; a degenerate strate is air. Removed: `UVoxelStrateDefinition::bUseOperatorStack`, the
+  archetype `switch` in `GetDensityAt`, `GetSlabDensity` / `GetMazeDensity` / `GetSurfaceDensity` /
+  `SurfaceDensityFromColumn` / `GetVerticalShaftDensity` / `GetFloatingIslandDensity`, the four
+  `Cave Bail Not Op Stack *` stats, the startup opt-in warning, commandlet `-opstack`, and the
+  legacy-vs-stack comparisons in the tests. **Terrain changes for any strate asset that did not
+  already have the opt-in ticked.**
+- [ ] **No-strate-manager fallback world.** A world whose settings have no season, pool or fixed
+  strates runs `GetDensityAt`'s fallback: default `FStrateGenerationParams` through
+  `GetDensityWithParams` with its direct-caller ("legacy") structural posts. It is the only caller of
+  that post path outside tests/commandlet diagnostics. Decide whether an empty configuration should
+  keep generating generic caves or refuse to generate.
 - [ ] `UVoxelStrateDefinition::WaterColor`, `Creatures`, `AmbientSound`, `Music`, `MusicVolume` and the
   `FStrateCreature` / `FStrateAmbientActor` spawn fields (`SpawnChancePerChunk`, `MaxPerStrate`,
   `SpawnWeight`) — authored data with no consuming system yet (F9 audio, creatures).
