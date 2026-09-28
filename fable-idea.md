@@ -46,7 +46,7 @@ So: normals can cost as much as the entire density grid; a SurfaceWorld chunk do
 
 **T1.d — Chunk classification: skip trivially solid/air chunks before sampling.** ✅ DONE 2026-07-05
 ⛔ **Turned OFF in streaming 2026-09-13.** After the operator stack, it cost more than it saved on the
-game path (WORK-NEXT.md A/B). Do not re-propose tile classification without a design that is
+game path (Docs/archive/WORK-NEXT.md A/B). Do not re-propose tile classification without a design that is
 cheaper than meshing the tile.
 (v2 — `UVoxelGenerator::ClassifyTile`, see ARCHITECTURE §8.10; a 2026-06-26 v1 with a global ceiling
 bound was reverted for roof holes. Trigger: trace showed 84 % of GenerateMesh calls produced empty
@@ -214,7 +214,7 @@ fade with slope ⇒ seamless at biome borders; placement hashes are pure `(seed,
 "ops finally work on the surface" win; **(2)** overhang (3D band, slope-conditioned); **(3)** spike/hole (placed +
 shortlist + ClassifyTile guard) — most cost, do last.
 
-**PHASE 1 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
+**PHASE 1 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `Docs/archive/AUDIT-2026-07.md §0`). Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
 push height from the local mean where steep ⇒ sheer walls; the slope-conditioned one, hugs steep terrain;
 v1 band-snap was too subtle, reformulated to steepening after Jahni's "doesn't change much"), **Terrace** (relief-gated plateau quantize, now with
 `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed). *Design
@@ -231,7 +231,7 @@ height oracle `ComputeSurfaceTerrainZ` (new `SampleSurfaceStructuralZ` helper = 
 an XY offset for Cliff's slope) so MC/sheets/ClassifyTile/deco/BP-bridge all agree, no T1.d interference. Revisit
 the array+condition model for **phase 2 (overhangs)** where per-entry slope-gating earns its keep.
 
-**PHASE 2 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Overhang (first VOLUMETRIC op) as
+**PHASE 2 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `Docs/archive/AUDIT-2026-07.md §0`). Overhang (first VOLUMETRIC op) as
 `FSurfaceGenerationParams` fields (`OverhangStrength/Reach/Height/Frequency/ZScale/SlopeThreshold`, default
 off). **Design NOTE — v1 additive-noise-band was WRONG (Jahni: "does nothing" + sketch of a real cliff lip):
 band-additive noise can only bump the surface where it already is, never make rock jut OUT over a void.**

@@ -128,7 +128,7 @@ public:
      *
      * ⚠️ Do NOT flip this on a strate mid-session and expect the old and new geometry to agree to
      * the bit — they differ by ~1-2 ULP with ZERO isosurface crossings, so the shape is identical
-     * but the floats are not (`AUDIT-2026-07.md §C10`). Regenerate the world after changing it
+     * but the floats are not (`Docs/archive/AUDIT-2026-07.md §C10`). Regenerate the world after changing it
      * rather than letting old and new tiles sit side by side.
      *
      * Pile d'opérateurs (expérimental) : génère cette strate via la pile composable au lieu du

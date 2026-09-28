@@ -12,8 +12,13 @@
 # The guarded single-entry test harness is source, not generated output.
 !/Tools/
 !/Tools/**
+/Tools/**/__pycache__/
+
+# Closed / historical documents.
+!/Docs/
+!/Docs/**
 
 !VoxelForge.uplugin
 
-# Keep every design / doc markdown at any depth (AUDIT P1 — these were untracked)
+# Keep every design / doc markdown at any depth
 !*.md

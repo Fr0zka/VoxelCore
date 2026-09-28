@@ -36,7 +36,7 @@ composer fills in; nobody opens it in the editor any more.
 
 ### This is op-stack "Phase 3", and it is REOPENED
 
-The 2026-08-16 `OPSTACK-HANDOFF.md` says in bold *"Do not start Phase 3."* **That is superseded.**
+The 2026-08-16 `Docs/archive/OPSTACK-HANDOFF.md` says in bold *"Do not start Phase 3."* **That is superseded.**
 Asked what the world was missing, Jahni described exactly Phase 3 plus a composer above it.
 
 It is **not** a restart of the refactor. The eight operators are live, composable, and production. What
@@ -1490,7 +1490,7 @@ roughness and should stay late in the stack.
 
 Kept because each cost real time or would otherwise be repeated.
 
-- ⛔ **"Do not start Phase 3" is SUPERSEDED.** `OPSTACK-HANDOFF.md` still says it; believe this file.
+- ⛔ **"Do not start Phase 3" is SUPERSEDED.** `Docs/archive/OPSTACK-HANDOFF.md` still says it; believe this file.
 - ⛔ **Jahni does not want to author strates either.** The composer must invent them. An earlier reading
   had him authoring strates while the system arranged them — one level too shallow, and it shaped a
   whole afternoon of wrong design.
@@ -1553,7 +1553,7 @@ build succeeded (14 actions). The full headless suite reported **22 succeeded, 0
 determinism, box-verdict, and connectivity checks stayed green. The 4b→4h fuse was deliberately
 not applied after the intervening-channel audit above.
 
-**⭐ This closes the pending-verification thread opened by `OPSTACK-HANDOFF.md`.** That file flagged
+**⭐ This closes the pending-verification thread opened by `Docs/archive/OPSTACK-HANDOFF.md`.** That file flagged
 commits `4d33321` (Sol's boundary fold) and `91585ea` as *built but NOT re-verified*, with two
 acceptance conditions. Both now met:
 - **`violations` = 0** everywhere. Measured: TunnelNetwork at production defaults **12 of 40 tiles

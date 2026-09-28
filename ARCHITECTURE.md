@@ -130,7 +130,7 @@ in §10.
 ⚠️ **The `switch` above is no longer the only density path.** All 8 archetypes also exist as
 **operator stacks**, selected per strate by
 `bUseOperatorStack` and evaluated instead of the `switch`; each is bit-identical to the function in
-its row. The design lives in `OPSTACK-PLAN.md` / `OPSTACK-DECOMPOSITION.md`, the symbol index in
+its row. The design lives in `Docs/archive/OPSTACK-PLAN.md` / `Docs/archive/OPSTACK-DECOMPOSITION.md`, the symbol index in
 `CODEMAP §3.2d` — not repeated here. What matters for *this* document: the archetype table describes
 what the world IS, and both paths compute it.
 
@@ -521,7 +521,7 @@ flat floor. **There is no connector to the origin landing room at `(0,0)`.** The
 those radial roads after a playtest (`d97373c`, 2026-09-08: they cut straight through everything);
 room joins are flattened to walkable height instead. A source-fit landing therefore stays local to
 the room it was fitted into (`GeneratePassages`, the `VF_BuildPassageLanding` calls).
-⚠️ Open gap (Sol's code review, `DESIGN-SOL-2026-09-15-CODE.md` §1.3/§2.4): when the footing query
+⚠️ Open gap (Sol's code review, `Docs/archive/DESIGN-SOL-2026-09-15-CODE.md` §1.3/§2.4): when the footing query
 declines, the landing falls back to the historical random reach, and nothing proves that pose joins
 the walk network. The canonical capability gate covers one scenario, not every seed or mix.
 Proposed fix, not built: retry deterministically at other candidate spots instead of falling back.
@@ -833,7 +833,7 @@ driven by `EditorBrush*` props.
   = 0; `=1` restores it as an A/B instrument). Measured on the headless game path with nested
   refinement off, the classifier plus its exact validation cost more than they saved. Mode 0 had
   ready p95 182 vs 190-195 ms, generation p95 125-127 vs 139-141 ms, and 18% fewer density calls,
-  with 841/841 tiles triangle-identical (WORK-NEXT.md). Proving a 33³ core uniform costs almost
+  with 841/841 tiles triangle-identical (Docs/archive/WORK-NEXT.md). Proving a 33³ core uniform costs almost
   as much as meshing 35³. The history below explains why it existed. Its soundness tests still
   guard it.
 - **Trivial-empty tile reject (T1.d) — v2 SHIPPED (2026-07-05); v1 was reverted 2026-06-26.**

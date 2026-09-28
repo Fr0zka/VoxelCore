@@ -138,7 +138,7 @@ remains `0`, and lateral regions remain gated off.
 ### 3.2b Density operator stack contract — `Public/VoxelDensityOp.h` (plain C++, no UHT)
 **Production path behind a per-strate opt-in** — the stack is built/evaluated by `GetDensityAt` for
 all eight archetypes when `bUseOperatorStack` is enabled, while the legacy `switch` remains the
-reference path for opt-out strates. See [OPSTACK-PLAN.md](OPSTACK-PLAN.md) for the decomposition.
+reference path for opt-out strates. See [Docs/archive/OPSTACK-PLAN.md](Docs/archive/OPSTACK-PLAN.md) for the decomposition.
 
 | Symbol | Notes |
 |--------|-------|
@@ -711,7 +711,7 @@ Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs ed
 ---
 
 ### 3.12 Automation tests — `Private/Tests/` (added 2026-07-27, `#if WITH_DEV_AUTOMATION_TESTS`)
-The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor's
+The plugin's first tests (`Docs/archive/OPSTACK-PLAN.md` Phase 0.5). Run them from the editor's
 **Session Frontend → Automation**, filter `VoxelForge`.
 
 | File | Test name | What it proves |
