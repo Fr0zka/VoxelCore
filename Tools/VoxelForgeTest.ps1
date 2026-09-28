@@ -54,7 +54,6 @@ $HorizonMetrics = [ordered]@{
     status = 'not_run'
     level = $HorizonLevel
     render_distance_chunks = $HorizonRenderDistanceChunks
-    far_sheet_ring = $false
 }
 $HorizonRenderMetrics = [ordered]@{ requested = $Scenario -eq 'horizon-render'; status = 'not_run' }
 $DeterminismEvidence = [ordered]@{ requested = $Scenario -eq 'determinism'; status = 'not_run' }
@@ -1293,7 +1292,6 @@ try {
             $tracePath = Join-Path $RunRoot 'horizon_trace.jsonl'
             $baseCvars['voxel.TestRenderDistanceChunks'] = $HorizonRenderDistanceChunks
             $baseCvars['voxel.TestMaxClipLevel'] = $HorizonLevel
-            $baseCvars['voxel.TestFarSheetRing'] = 0
             $baseCvars['voxel.StartupTraceFile'] = $tracePath
             $baseCvars['voxel.StartupTraceMaxTiles'] = 16384
             $baseCvars['voxel.TestExitOnSteady'] = 1
@@ -1311,7 +1309,6 @@ try {
             $tracePath = Join-Path $RunRoot 'horizon_render_trace.jsonl'
             $baseCvars['voxel.TestRenderDistanceChunks'] = $HorizonRenderDistanceChunks
             $baseCvars['voxel.TestMaxClipLevel'] = $HorizonLevel
-            $baseCvars['voxel.TestFarSheetRing'] = 0
             $baseCvars['voxel.StartupTraceFile'] = $tracePath
             $baseCvars['voxel.StartupTraceMaxTiles'] = 16384
             $baseCvars['voxel.TestCeilingView'] = 1
@@ -1340,7 +1337,6 @@ try {
             $determinismBase = [ordered]@{
                 'voxel.TestRenderDistanceChunks' = $HorizonRenderDistanceChunks
                 'voxel.TestMaxClipLevel' = $HorizonLevel
-                'voxel.TestFarSheetRing' = 0
                 'voxel.TestExitOnSteady' = 1
                 'voxel.StartupTraceMaxTiles' = 16384
                 'voxel.OuterClassifierMode' = 0
@@ -1369,7 +1365,6 @@ try {
             $DeterminismEvidence = Compare-DeterminismDumps $defaultDump $crtFma3OffDump
             $DeterminismEvidence.level = $HorizonLevel
             $DeterminismEvidence.render_distance_chunks = $HorizonRenderDistanceChunks
-            $DeterminismEvidence.far_sheet_ring = $false
             $DeterminismEvidence.default_measurement = $defaultMetrics
             $DeterminismEvidence.crt_fma3_off_measurement = $crtFma3OffMetrics
             $GameMetrics = $crtFma3OffMetrics

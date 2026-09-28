@@ -1584,16 +1584,12 @@ void AVoxelWorld::BeginPlay()
     int32 TestMaxClipLevel = -1;
     const bool bTestMaxClipLevel =
         FParse::Value(FCommandLine::Get(), TEXT("voxel.TestMaxClipLevel="), TestMaxClipLevel);
-    int32 TestFarSheetRing = -1;
-    const bool bTestFarSheetRing =
-        FParse::Value(FCommandLine::Get(), TEXT("voxel.TestFarSheetRing="), TestFarSheetRing);
-    if (bTestRenderDistance || bTestMaxClipLevel || bTestFarSheetRing)
+    if (bTestRenderDistance || bTestMaxClipLevel)
     {
         if (UVoxelSettings* TestSettings = DuplicateObject<UVoxelSettings>(Settings, this))
         {
             const int32 AuthoredRenderDistance = Settings->RenderDistanceChunks;
             const int32 AuthoredMaxClipLevel = Settings->MaxClipLevel;
-            const bool bAuthoredFarSheetRing = Settings->bFarSheetRing;
             if (bTestRenderDistance)
             {
                 TestSettings->RenderDistanceChunks = TestRenderDistanceChunks;
@@ -1602,18 +1598,12 @@ void AVoxelWorld::BeginPlay()
             {
                 TestSettings->MaxClipLevel = FMath::Clamp(TestMaxClipLevel, 0, 8);
             }
-            if (bTestFarSheetRing)
-            {
-                TestSettings->bFarSheetRing = TestFarSheetRing != 0;
-            }
             Settings = TestSettings;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeHorizonMeasure] transient_settings=1 "
-                     "render_distance_chunks=%d authored=%d max_clip_level=%d authored=%d "
-                     "far_sheet_ring=%d authored=%d"),
+                     "render_distance_chunks=%d authored=%d max_clip_level=%d authored=%d"),
                 Settings->RenderDistanceChunks, AuthoredRenderDistance,
-                Settings->MaxClipLevel, AuthoredMaxClipLevel,
-                Settings->bFarSheetRing ? 1 : 0, bAuthoredFarSheetRing ? 1 : 0);
+                Settings->MaxClipLevel, AuthoredMaxClipLevel);
         }
     }
 
@@ -1705,18 +1695,17 @@ void AVoxelWorld::BeginPlay()
             TEXT("\"asset\":\"%s\",\"seed\":%d,\"total_strates\":%d,\"inter_strate_gap_chunks\":%d,"
                  "\"strate_pool\":%d,\"strate_content_cut_min_level\":%d,"
                  "\"effective_strate_content_cut_min_level\":%d,\"max_clip_level\":%d,\"clip_radius\":%d,"
-                 "\"render_distance_chunks\":%d,\"far_sheet_ring\":%d,\"far_sheet_span_levels\":%d,"
+                 "\"render_distance_chunks\":%d,"
                  "\"enable_density_volume\":%d,\"density_volume_resolution\":%d,\"density_volume_levels\":%d,"
-                 "\"density_volume_max_tasks\":%d,\"density_volume_gpu_upload\":%d"),
+                 "\"density_volume_gpu_upload\":%d"),
             *SettingsPath,
             Settings->GetEffectiveWorldSeed(), Settings->TotalStrates,
             Settings->InterStrateGapChunks, Settings->StratePool.Num(),
             Settings->StrateContentCutMinLevel,
             Settings->GetEffectiveStrateContentCutMinLevel(), Settings->MaxClipLevel,
             Settings->ClipRadius, Settings->RenderDistanceChunks,
-            Settings->bFarSheetRing ? 1 : 0, Settings->FarSheetSpanLevels,
             Settings->bEnableDensityVolume ? 1 : 0, Settings->DensityVolumeResolution,
-            Settings->DensityVolumeLevels, Settings->DensityVolumeMaxTasks,
+            Settings->DensityVolumeLevels,
             Settings->bDensityVolumeGPUUpload ? 1 : 0));
     }
 
@@ -2291,7 +2280,6 @@ void AVoxelWorld::WriteTileHashDump()
         Writer->WriteValue(TEXT("coarse_tile_cells"), Settings->CoarseTileCells);
         Writer->WriteValue(TEXT("max_clip_level"), Settings->MaxClipLevel);
         Writer->WriteValue(TEXT("render_distance_chunks"), Settings->RenderDistanceChunks);
-        Writer->WriteValue(TEXT("far_sheet_ring"), Settings->bFarSheetRing);
         Writer->WriteValue(TEXT("strate_content_cut_min_level"),
             Settings->GetEffectiveStrateContentCutMinLevel());
         Writer->WriteObjectEnd();
@@ -3016,11 +3004,10 @@ void AVoxelWorld::AdvanceHeadlessCollisionGateStressTest(
     {
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeCollisionGateStressTest] owner_settings clip_radius=%d "
-                 "max_clip_level=%d render_distance_chunks=%d far_sheet_ring=%d"),
+                 "max_clip_level=%d render_distance_chunks=%d"),
             Settings != nullptr ? Settings->ClipRadius : -1,
             Settings != nullptr ? Settings->MaxClipLevel : -1,
-            Settings != nullptr ? Settings->RenderDistanceChunks : -1,
-            Settings != nullptr && Settings->bFarSheetRing ? 1 : 0);
+            Settings != nullptr ? Settings->RenderDistanceChunks : -1);
         float CapsuleHalfHeightCm = 0.0f;
         if (const ACharacter* Character = Cast<ACharacter>(PlayerPawn))
         {
@@ -6468,14 +6455,12 @@ static FORCEINLINE FIntVector VF_FloorDiv(const FIntVector& V, int32 D)
 }
 
 // The outer shell is the MaxClipLevel ring stretched to RenderDistanceChunks. Shared by desired
-// selection and range culling so both use the same outer horizon. The selector's far sheet ring
-// is not part of the runtime, so it is always switched off here.
+// selection and range culling so both use the same outer horizon.
 static FORCEINLINE void VF_OuterShell(const UVoxelSettings* Settings, int32 R, int32 MaxLevel,
                                       int32& OutLevel, int32& OutRadius)
 {
     VoxelClipmapDesiredTiles::FParameters Parameters;
     Parameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
-    Parameters.bFarSheetRing = false;
     VoxelClipmapDesiredTiles::OuterShell(Parameters, R, MaxLevel, OutLevel, OutRadius);
 }
 
@@ -6520,7 +6505,6 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
     TileParameters.ClipRadius = R;
     TileParameters.MaxClipLevel = MaxLevel;
     TileParameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
-    TileParameters.bFarSheetRing = false;
     VoxelClipmapDesiredTiles::Build(Center, ZLo, ZHi, TileParameters, DesiredSorted);
     for (const FVoxelTileKey& Key : DesiredSorted)
     {

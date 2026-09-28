@@ -29,15 +29,13 @@ bool FVoxelForgeVerticalStrateReachTest::RunTest(const FString& Parameters)
     Clipmap.ClipRadius = 3;
     Clipmap.MaxClipLevel = 3;
     Clipmap.RenderDistanceChunks = 768;
-    Clipmap.bFarSheetRing = true;
-    Clipmap.FarSheetSpanLevels = 2;
 
     TArray<FVoxelTileKey> Desired;
     VoxelClipmapDesiredTiles::Build(
         FIntVector(0, 0, PlayerChunkZ), MinChunkZ, MaxChunkZ, Clipmap, Desired);
 
     TArray<int32> CountsByLevel;
-    CountsByLevel.Init(0, 6);
+    CountsByLevel.Init(0, 4);
     for (const FVoxelTileKey& Tile : Desired)
     {
         if (CountsByLevel.IsValidIndex(Tile.Level))
@@ -46,7 +44,9 @@ bool FVoxelForgeVerticalStrateReachTest::RunTest(const FString& Parameters)
         }
     }
 
-    const int32 ExpectedCounts[] = {343, 218, 178, 178, 178, 9586};
+    // Aligned rings (child-pair boundaries) below MaxClipLevel; the MaxClipLevel ring is stretched
+    // to the 768-chunk render distance (radius 96 at level 3) and clamped to the strate's Z band.
+    const int32 ExpectedCounts[] = {512, 320, 272, 372442};
     for (int32 Level = 0; Level < static_cast<int32>(UE_ARRAY_COUNT(ExpectedCounts)); ++Level)
     {
         TestEqual(FString::Printf(TEXT("desired tile count at level %d"), Level),
@@ -63,26 +63,28 @@ bool FVoxelForgeVerticalStrateReachTest::RunTest(const FString& Parameters)
 
     TestTrue(TEXT("level 0 tile around the high pawn is present"),
              HasTile(0, FIntVector(0, 0, 0)));
-    TestTrue(TEXT("level 4 bridge tile covering the ground below the pawn is present"),
-             HasTile(4, FIntVector(0, 0, -3)));
-    TestTrue(TEXT("adjacent level 4 ground tile is present"),
-             HasTile(4, FIntVector(1, 0, -3)));
-    TestTrue(TEXT("outer level 5 sheet reaches the 768-chunk horizon"),
-             HasTile(5, FIntVector(24, 0, 0)));
+    TestTrue(TEXT("level 3 tile covering the ground below the pawn is present"),
+             HasTile(3, FIntVector(0, 0, -8)));
+    TestTrue(TEXT("adjacent level 3 ground tile is present"),
+             HasTile(3, FIntVector(1, 0, -8)));
+    TestTrue(TEXT("the outer level 3 ring reaches the 768-chunk horizon"),
+             HasTile(3, FIntVector(96, 0, 0)));
+    TestFalse(TEXT("the outer ring stops at the 768-chunk horizon"),
+              HasTile(3, FIntVector(97, 0, 0)));
     TestFalse(TEXT("clamping does not request a full hidden LOD0 column"),
               HasTile(0, FIntVector(0, 0, -47)));
 
-    for (int32 Level = 0; Level <= 5; ++Level)
+    for (int32 Level = 0; Level <= 3; ++Level)
     {
         TestTrue(FString::Printf(TEXT("clip level %d is non-empty"), Level),
                  CountsByLevel[Level] > 0);
     }
 
     AddInfo(FString::Printf(
-        TEXT("center_z=%d strate=[%d..%d] view=[%d..%d] levels=[%d,%d,%d,%d,%d,%d] total=%d"),
+        TEXT("center_z=%d strate=[%d..%d] view=[%d..%d] levels=[%d,%d,%d,%d] total=%d"),
         PlayerChunkZ, StrateBottomZ, StrateTopZ, MinChunkZ, MaxChunkZ,
         CountsByLevel[0], CountsByLevel[1], CountsByLevel[2], CountsByLevel[3],
-        CountsByLevel[4], CountsByLevel[5], Desired.Num()));
+        Desired.Num()));
     return true;
 }
 
