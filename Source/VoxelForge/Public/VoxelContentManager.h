@@ -17,7 +17,8 @@
 //    budgeted. The game thread never does decoration density math. Flow (UpdateDecorations each Tick):
 //      - recompute desired cell set on player cell-boundary / strate change
 //      - LaunchDecoTasks: fire async march tasks (capped by MaxConcurrentDecorationTasks)
-//      - ProcessDecoResults: drain finished tasks' results, apply (spawn) budgeted, epoch-guarded
+//      - ProcessDecoResults: drain finished cell results into their region builds (BuildId-guarded),
+//        then apply completed regions (spawn) budgeted
 //    Decorations exist ONLY in the player's current strate (march is strate-bounded) → a strate change
 //    wipes + rebuilds them, and there is no cross-strate light bleed to cull.
 //
