@@ -2806,27 +2806,6 @@ namespace
         {
             if (Field == nullptr) return;
             const FShaftFieldSource::FCells& Cells = Field->GetCellsAt(WorldX, WorldY);
-            static thread_local bool bLoggedTemporaryShaftConnectors = false;
-            if (!bLoggedTemporaryShaftConnectors
-                && FMath::IsNearlyEqual(WorldZ, -700.0f)
-                && WorldX > -180.0f && WorldX < -170.0f
-                && WorldY > -48.0f && WorldY < -38.0f)
-            {
-                bLoggedTemporaryShaftConnectors = true;
-                UE_LOG(LogTemp, Display,
-                    TEXT("[VoxelForgeExplore][TemporaryShaftConnectors] query=(%.3f,%.3f,%.3f) count=%d"),
-                    WorldX, WorldY, WorldZ, Cells.Conns.Num());
-                for (const FShaftFieldSource::FConn& DebugConn : Cells.Conns)
-                {
-                    UE_LOG(LogTemp, Display,
-                        TEXT("[VoxelForgeExplore][TemporaryShaftConnectors] A=(%.3f,%.3f,%.3f) "
-                             "B=(%.3f,%.3f,%.3f) radius=%.3f floor=%.3f walk=%d"),
-                        DebugConn.A.X, DebugConn.A.Y, DebugConn.A.Z,
-                        DebugConn.B.X, DebugConn.B.Y, DebugConn.B.Z,
-                        DebugConn.Radius, DebugConn.FloorZ,
-                        DebugConn.bWalkableFloor ? 1 : 0);
-                }
-            }
             for (const FShaftFieldSource::FConn& Conn : Cells.Conns)
             {
                 if (!Conn.bWalkableFloor) continue;

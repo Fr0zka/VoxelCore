@@ -3610,57 +3610,6 @@ bool RunWalk(
     OutOutput.bHasArrival = true;
     OutOutput.bHasDeparture = true;
 
-    // Temporary seed-14 probe while diagnosing the fitted VerticalShafts junction. This is
-    // intentionally narrow and will be removed after the floor/tree seam is corrected.
-    if (Arguments.Archetype == ECaveGeneratorType::VerticalShafts && Arguments.Seed == 14)
-    {
-        const FVector ProbeA = OutOutput.ArrivalVoxels;
-        const FVector ProbeB(-100.8f, -26.9f, ProbeA.Z);
-        for (int32 Index = 0; Index <= 10; ++Index)
-        {
-            const float T = static_cast<float>(Index) / 10.0f;
-            const FVector P = FMath::Lerp(ProbeA, ProbeB, T);
-            const float Dm704 = World.Generator->GetDensityAt(P.X, P.Y, -704.0f);
-            const float Dm702 = World.Generator->GetDensityAt(P.X, P.Y, -702.0f);
-            const float Dm7005 = World.Generator->GetDensityAt(P.X, P.Y, -700.5f);
-            const float Dm700 = World.Generator->GetDensityAt(P.X, P.Y, -700.0f);
-            const float Dm6995 = World.Generator->GetDensityAt(P.X, P.Y, -699.5f);
-            const float Dm697 = World.Generator->GetDensityAt(P.X, P.Y, -697.0f);
-            float MinBody = FLT_MAX;
-            int32 NumSolidBody = 0;
-            int32 SolidOffsetX = 0;
-            int32 SolidOffsetY = 0;
-            int32 SolidBodyRow = -1;
-            for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
-            {
-                for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
-                {
-                    for (int32 BodyRow = 0; BodyRow < 8; ++BodyRow)
-                    {
-                        const float BodyDensity = World.Generator->GetDensityAt(
-                            P.X + static_cast<float>(OffsetX),
-                            P.Y + static_cast<float>(OffsetY),
-                            -699.5f + static_cast<float>(BodyRow));
-                        if (BodyDensity < MinBody)
-                        {
-                            MinBody = BodyDensity;
-                            SolidOffsetX = OffsetX;
-                            SolidOffsetY = OffsetY;
-                            SolidBodyRow = BodyRow;
-                        }
-                        NumSolidBody += BodyDensity <= 0.0f ? 1 : 0;
-                    }
-                }
-            }
-            UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeExplore][TemporaryShaftProbe] t=%.2f xy=(%.2f,%.2f) "
-                     "d[-704,-702,-700.5,-700,-699.5,-697]=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] "
-                     "bodyMin=%.3f bodySolid=%d/72 firstMinOffset=(%d,%d) row=%d"),
-                T, P.X, P.Y, Dm704, Dm702, Dm7005, Dm700, Dm6995, Dm697,
-                MinBody, NumSolidBody, SolidOffsetX, SolidOffsetY, SolidBodyRow);
-        }
-    }
-
     FVoxelStrateMeasureSettings Settings;
     Settings.SampleStep = 1;
     Settings.MaxCells = Arguments.MaxWalkCells;

@@ -5865,14 +5865,6 @@ namespace
                         SampleShaft,
                         OutPoint))
                 {
-                    if (Seed == 14 && FMath::IsNearlyEqual(StrateBottomZ, -736.0f))
-                    {
-                        UE_LOG(LogTemp, Display,
-                            TEXT("[VoxelForgeExplore][TemporaryVerticalLanding] axis=(%.3f,%.3f) "
-                                 "safeRadius=%.3f candidate=(%.3f,%.3f,%.3f)"),
-                            BestAxisX, BestAxisY, BestSafeRadius,
-                            CandidateFeet.X, CandidateFeet.Y, CandidateFeet.Z);
-                    }
                     return true;
                 }
             }
